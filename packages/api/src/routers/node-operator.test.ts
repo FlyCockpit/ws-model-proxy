@@ -116,6 +116,14 @@ beforeEach(() => {
   mockReset(db);
   db.$transaction.mockImplementation((async (work: (tx: typeof db) => unknown) =>
     work(db)) as never);
+  // The caller's credential and owner are live unless a test says otherwise.
+  db.user.findUnique.mockResolvedValue({
+    banned: false,
+    banExpires: null,
+    deletionRequestedAt: null,
+  } as never);
+  db.agentToken.findFirst.mockResolvedValue({ id: "tok1" } as never);
+  db.mcpGrant.findFirst.mockResolvedValue({ id: "grant1" } as never);
 });
 
 describe("node commands", () => {
@@ -149,6 +157,69 @@ describe("node commands", () => {
       outcome: "failed",
       reason: "start_failed",
     });
+  });
+
+  it("refuses a credential revoked while the command was being recorded, before the node", async () => {
+    const ops = operator();
+    db.node.findFirst.mockResolvedValue(fullNode as never);
+    db.nodeCommand.create.mockResolvedValue(commandRow as never);
+    db.nodeCommand.updateMany.mockResolvedValue({ count: 1 });
+    db.agentToken.findFirst.mockResolvedValue(null);
+    await expect(client(FULL_AGENT, ops).commands.run(runInput)).rejects.toMatchObject({
+      code: "FORBIDDEN",
+    });
+    // Re-read after the row exists, so a later revocation finds the row instead.
+    expect(db.nodeCommand.create.mock.invocationCallOrder[0]).toBeLessThan(
+      db.agentToken.findFirst.mock.invocationCallOrder[0] ?? 0,
+    );
+    expect(db.agentToken.findFirst.mock.calls[0]?.[0]?.where).toMatchObject({
+      id: "tok1",
+      userId: "owner",
+      level: "FULL",
+      revokedAt: null,
+    });
+    expect(ops.startCommand).not.toHaveBeenCalled();
+    expect(db.nodeAuditEvent.create.mock.calls[0]?.[0].data).toMatchObject({
+      outcome: "failed",
+      reason: "token_inactive",
+    });
+  });
+
+  it("refuses a command whose owner was banned while it was being recorded", async () => {
+    const ops = operator();
+    db.node.findFirst.mockResolvedValue(fullNode as never);
+    db.nodeCommand.create.mockResolvedValue(commandRow as never);
+    db.nodeCommand.updateMany.mockResolvedValue({ count: 1 });
+    db.user.findUnique.mockResolvedValue({
+      banned: true,
+      banExpires: null,
+      deletionRequestedAt: null,
+    } as never);
+    await expect(client(PERSON, ops).commands.run(runInput)).rejects.toMatchObject({
+      code: "FORBIDDEN",
+    });
+    expect(ops.startCommand).not.toHaveBeenCalled();
+  });
+
+  it("says a cancel is pending while the node has not ended the command (or is offline)", async () => {
+    const ops = operator();
+    db.nodeCommand.findFirst.mockResolvedValue(commandRow as never);
+    ops.pollCommand.mockResolvedValue(null);
+    await expect(
+      client(FULL_AGENT, ops).commands.get({ commandId: commandRow.id, cancel: true }),
+    ).resolves.toMatchObject({ state: "RUNNING", output: null, cancelRequested: true });
+    expect(ops.pollCommand.mock.calls[0]?.[0]).toMatchObject({
+      cancel: true,
+      endsBy: commandRow.endsBy,
+    });
+    ops.pollCommand.mockResolvedValue({ state: "CANCELLED", output: "bye" });
+    db.nodeCommand.updateMany.mockResolvedValue({ count: 1 });
+    const ended = await client(FULL_AGENT, ops).commands.get({
+      commandId: commandRow.id,
+      cancel: true,
+    });
+    expect(ended).toMatchObject({ state: "CANCELLED" });
+    expect(ended).not.toHaveProperty("cancelRequested");
   });
 
   it("refuses a Read-only agent before anything runs", async () => {
@@ -346,10 +417,16 @@ describe("browser terminals and queued commands", () => {
       sessionId: "sess",
       nodeId: "node1",
     });
-    expect(db.nodeAuditEvent.create.mock.calls[0]?.[0].data).toMatchObject({
-      kind: "browser_terminal",
-      outcome: "opened",
-    });
+    // The terminal is audited when the socket redeems the ticket (apps/server), not at mint.
+    expect(db.nodeAuditEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses a queued command from a person before writing anything", async () => {
+    db.node.findFirst.mockResolvedValue(fullNode as never);
+    await expect(
+      client(PERSON).queued.enqueue({ nodeId: "node1", command: "ls", note: "x" }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(db.queuedNodeCommand.create).not.toHaveBeenCalled();
   });
 
   it("queues a command from a Full agent (not from a Read-only one)", async () => {

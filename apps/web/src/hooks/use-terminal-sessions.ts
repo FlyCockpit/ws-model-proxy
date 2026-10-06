@@ -50,6 +50,7 @@ import {
   type TerminalOrigin,
   type TerminalServerMessage,
   type TerminalWriterLabel,
+  typableCommand,
 } from "@/lib/terminal-protocol";
 import {
   canSendResize,
@@ -78,6 +79,13 @@ const EARLY_FRAME_QUEUE = 64;
 const OUTPUT_BUFFER_EVENTS = 256;
 /** Open a terminal anyway if the relay does not answer a CLI list request. */
 const CLI_LIST_REFRESH_TIMEOUT_MS = 5_000;
+/**
+ * A ticket's command is typed once the shell's output has been quiet this long, so it lands
+ * after the prompt and not inside a login banner or an rc file's output. A heuristic: a shell
+ * that pauses longer mid-startup still gets the text early, which the line discipline buffers
+ * and echoes; the person reads it before pressing Enter either way.
+ */
+const TYPED_COMMAND_QUIET_MS = 300;
 /** Refusals that "Trust new key" can lift. A key swapped mid-handshake cannot. */
 const IDENTITY_RETRY_REASONS = new Set(["identity_changed", "identity_invalid"]);
 /** The CLI refuses a handshake that carries no browser identity with this reason. */
@@ -314,6 +322,14 @@ function newTab(input: {
   };
 }
 
+/** A terminal ticket to open, for the node `cliDeviceId` names. */
+export type OpenTicketInput = {
+  cliDeviceId: string;
+  ticket: string;
+  /** Typed into the shell once it shows output; never with a newline. */
+  typedCommand?: string;
+};
+
 export type UseTerminalSessionsOptions = {
   /** Pinned CLI identity keys. Defaults to IndexedDB. */
   pinStore?: CliPinStore;
@@ -341,8 +357,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   tabs: TerminalTab[];
   activeLocalId: string | null;
   selectTab: (localId: string) => void;
-  /** Refreshes the CLI list first, so a CLI that just came online can open. */
-  openCli: (cliDeviceId: string) => void;
+  /**
+   * Open a terminal from a ticket (`nodes.terminals.openTicket` / `nodes.queued.run`). Refreshes
+   * the CLI list first, so a node that just came online can open. `typedCommand` is typed into
+   * the shell once it shows output, without a newline: the person presses Enter.
+   */
+  openTicket: (input: OpenTicketInput) => void;
   /** Ask the relay for the current CLI list; resolves when it arrives (or times out). */
   refreshClis: () => Promise<void>;
   /** X button: stop viewing. The shell keeps running for other viewers. */
@@ -423,6 +443,17 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const generationRef = useRef(0);
   /** Tabs whose handshake waits for the browser identity to load. */
   const awaitingIdentityRef = useRef(new Set<string>());
+  /**
+   * localId -> the ticket its `open` redeems. Gone once the relay answered the open (`opening`
+   * or a refusal it read): a ticket opens one terminal, so a used one is never sent again.
+   */
+  const ticketsRef = useRef(new Map<string, string>());
+  /** localId -> a command to type (no newline) once the tab's shell shows output. */
+  const typedCommandsRef = useRef(new Map<string, string>());
+  /** localId -> the quiet-period timer before its command is typed. */
+  const typedTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  /** `sendInput`, for the output path defined before it. */
+  const sendInputRef = useRef<(localId: string, data: string) => void>(() => undefined);
   /** `open` frames not yet answered by `opening`, in the order sent. */
   const inflightOpensRef = useRef<{ localId: string; requestId: string }[]>([]);
   /** localId -> request id of the Decline this tab has out (state `sent`). */
@@ -562,6 +593,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       pendingRef.current.delete(localId);
       establishingRef.current.delete(localId);
       declineRequestsRef.current.delete(localId);
+      ticketsRef.current.delete(localId);
+      typedCommandsRef.current.delete(localId);
+      clearTimer(typedTimersRef.current, localId);
       if (tab.terminalId) {
         // A close still owed for it goes on without the tab.
         const intent = closesRef.current.get(tab.terminalId);
@@ -673,6 +707,25 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const emitOutput = useCallback((localId: string, event: TerminalOutputEvent) => {
     // A frame that was mid-decryption when its tab closed has nowhere to go.
     if (!tabsRef.current.some((tab) => tab.localId === localId)) return;
+    if (event.kind === "data" && typedCommandsRef.current.has(localId)) {
+      // The shell is starting: type the command once its output settles (the prompt).
+      const timers = typedTimersRef.current;
+      const previous = timers.get(localId);
+      if (previous) clearTimeout(previous);
+      timers.set(
+        localId,
+        setTimeout(() => {
+          timers.delete(localId);
+          const typed = typedCommandsRef.current.get(localId);
+          const tab = tabsRef.current.find((item) => item.localId === localId);
+          // Not live now (the socket dropped): wait for output after the reattach.
+          if (typed === undefined || !tab?.terminalId || !sessionsRef.current.has(tab.terminalId))
+            return;
+          typedCommandsRef.current.delete(localId);
+          sendInputRef.current(localId, typed);
+        }, TYPED_COMMAND_QUIET_MS),
+      );
+    }
     const listener = listenersRef.current.get(localId);
     if (listener) {
       if (resetBeforeOutputRef.current.delete(localId)) resettersRef.current.get(localId)?.();
@@ -946,6 +999,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       const trust = await ensureTrust(input.cliDeviceId);
       if (stale()) return;
       if (!tabsRef.current.some((tab) => tab.localId === input.localId)) return;
+      if (input.mode === "open" && !ticketsRef.current.has(input.localId)) {
+        // Its ticket was used (the relay read the open): only a new ticket opens a terminal.
+        refuseTab(input.localId, "ticket_invalid");
+        return;
+      }
       const gate = trustAllowsHandshake(trust);
       if (!gate.ok) {
         if (input.mode === "attach") attachingRef.current.delete(input.terminalId);
@@ -985,12 +1043,18 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       // A socket that closed first drops nothing that matters: the next one
       // opens and attaches again. A full queue refused it: start again later.
       if (input.mode === "open") {
+        const ticket = ticketsRef.current.get(input.localId);
+        if (ticket === undefined) {
+          pendingRef.current.delete(input.localId);
+          refuseTab(input.localId, "ticket_invalid");
+          return;
+        }
         const requestId = newId("open");
         inflightOpensRef.current.push({ localId: input.localId, requestId });
         const result = sendRef.current({
           type: "open",
           requestId,
-          cliDeviceId: input.cliDeviceId,
+          ticket,
           cols,
           rows,
           ...shared,
@@ -1285,6 +1349,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         if (index === -1) return;
         const localId = inflight.splice(index, 1)[0]?.localId;
         if (!localId) return;
+        ticketsRef.current.delete(localId);
         if (closedOpensRef.current.delete(localId)) {
           // The tab is gone. Close the shell, or it would hold a slot unseen,
           // until the relay confirms. Its later `pending` / `opened` find no
@@ -1520,6 +1585,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         if (index !== -1 && !message.terminalId) {
           const localId = inflight.splice(index, 1)[0]?.localId;
           if (!localId) return;
+          // Refused unread (rate) keeps the ticket for the retry; any other answer used it.
+          if (message.code !== "rate_limited") ticketsRef.current.delete(localId);
           pendingRef.current.delete(localId);
           establishingRef.current.delete(localId);
           if (closedOpensRef.current.delete(localId)) return;
@@ -1881,7 +1948,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   }, [requestList, socketStatusRef]);
 
   const startOpen = useCallback(
-    (cliDeviceId: string) => {
+    ({ cliDeviceId, ticket, typedCommand }: OpenTicketInput) => {
       if (!readyRef.current) return;
       const tab = newTab({
         localId: newId("local"),
@@ -1893,6 +1960,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         viewerCount: 1,
       });
       viewRef.current.set(tab.localId, { writer: tab.writer });
+      ticketsRef.current.set(tab.localId, ticket);
+      if (typedCommand !== undefined && typableCommand(typedCommand)) {
+        typedCommandsRef.current.set(tab.localId, typedCommand);
+      }
       tabsRef.current = [...tabsRef.current, tab];
       setTabs((current) => [...current, tab]);
       setActiveLocalId(tab.localId);
@@ -1908,12 +1979,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     [beginHandshake],
   );
 
-  const openCli = useCallback(
-    (cliDeviceId: string) => {
+  const openTicket = useCallback(
+    (input: OpenTicketInput) => {
       if (!readyRef.current) return;
       // The relay does not push CLI changes. A CLI that came online after the
       // last list is missing from it, and its handshake would fail as offline.
-      void refreshClis().then(() => startOpen(cliDeviceId));
+      void refreshClis().then(() => startOpen(input));
     },
     [refreshClis, startOpen],
   );
@@ -2046,6 +2117,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     },
     [clearTimer, flushInput, sendPlaintext, setView, viewOf],
   );
+  // `emitOutput` types a ticket's command through it; it is defined before `sendInput`.
+  useLayoutEffect(() => {
+    sendInputRef.current = sendInput;
+  }, [sendInput]);
 
   const sendResize = useCallback(
     (localId: string, cols: number, rows: number) => {
@@ -2122,7 +2197,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     tabs,
     activeLocalId,
     selectTab,
-    openCli,
+    openTicket,
     refreshClis,
     detachTab,
     endSession,

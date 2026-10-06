@@ -7,10 +7,10 @@ import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./relay/node-commands.js", () => ({
-  startNodeCommand: vi.fn(),
-  cancelNodeCommandsForToken: vi.fn(),
+  nodeCommandTracker: {},
+  cancelNodeCommandsForCredentials: vi.fn(async () => 0),
   cancelNodeCommandsForUser: vi.fn(),
-  sweepExpiredNodeCommands: vi.fn(() => 0),
+  sweepExpiredNodeCommands: vi.fn(async () => 0),
 }));
 vi.mock("./relay/node-file-ops.js", () => ({
   runFileOp: vi.fn(),

@@ -1,7 +1,9 @@
 import { auth, type Session } from "@ws-model-proxy/auth";
 import { cookieSessionHeaders } from "@ws-model-proxy/auth/cookie-session";
 import type { Context as HonoContext } from "hono";
+import type { z } from "zod";
 import type { AnonymousAuth, CallerAuth } from "./contracts/auth-context";
+import type { modelsContract } from "./contracts/models";
 import type { NodeRelayServices } from "./lib/node-relay-services";
 
 export type CreateContextOptions = {
@@ -51,8 +53,51 @@ export type ContextServices = {
    * next lookup (every lookup reads `revokedAt`).
    */
   onAccessRevoked?: (event: AccessRevokedEvent) => Promise<void>;
+  /** Charges one public invite lookup to the caller's address; false: over its budget. */
+  limitInviteLookup?: () => Promise<boolean>;
   /** Lane D (terminals, node commands): the relay surfaces these procedures need. */
   nodeOperator?: NodeOperatorServices;
+  /**
+   * `models.test`: send the test through the production admission and routing path as source
+   * `AGENT_TEST`. The procedure has already checked that the caller may use the target (and,
+   * for a bench, owns it) and resolved it. Absent: the procedure answers SERVICE_UNAVAILABLE.
+   */
+  modelTest?: (input: ModelTestServiceInput) => Promise<ModelTestServiceOutput>;
+};
+
+type ModelTestInput = z.infer<typeof modelsContract.test.input>;
+export type ModelTestServiceOutput = z.infer<typeof modelsContract.test.output>;
+export type ModelTestKind = NonNullable<ModelTestInput["kind"]>;
+export type ModelTestBench = NonNullable<ModelTestInput["bench"]>;
+
+/** A `models.test` target the procedure resolved and checked the caller may use. */
+export type ModelTestServiceTarget =
+  | {
+      kind: "pool";
+      poolId: string;
+      /** `owner/pool` (`:external` cannot be tested), exactly as an API caller would send it. */
+      callableId: string;
+    }
+  | {
+      kind: "runtime";
+      runtimeId: string;
+      runtimeModelId: string;
+      /** The upstream model id the runtime serves. */
+      model: string;
+      /** Pin the test to this instance (the caller's); null lets routing pick one. */
+      instanceId: string | null;
+    };
+
+export type ModelTestServiceInput = {
+  userId: string;
+  /** The verified caller (cookie session or MCP token); the server reads it for bench limits. */
+  auth: CallerAuth;
+  target: ModelTestServiceTarget;
+  kind: ModelTestKind;
+  prompt?: string;
+  maxTokens?: number;
+  bench?: ModelTestBench;
+  signal?: AbortSignal;
 };
 
 export type AccessRevokedEvent =
@@ -84,6 +129,8 @@ export type NodeOperatorServices = {
   openTerminalTicket(args: {
     userId: string;
     sessionId: string;
+    /** The admin acting through an impersonation session (revoking that admin drops it). */
+    impersonatedBy?: string | null;
     nodeId: string;
     cols: number;
     rows: number;
@@ -107,7 +154,13 @@ export type NodeOperatorServices = {
     nodeId: string;
     commandId: string;
     waitMs: number;
+    /**
+     * Recorded before the node is reached: an offline node gets the cancel when it reconnects.
+     * The answer is then null (offline) or the state before the end, until the node reports it.
+     */
     cancel: boolean;
+    /** The command's stored end time (bounds how long a pending cancel is remembered). */
+    endsBy?: Date;
   }): Promise<NodeCommandLiveStatus | null>;
 };
 

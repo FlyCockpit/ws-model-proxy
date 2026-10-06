@@ -24,12 +24,13 @@ import { onUserDeleted, onUserDeletionMarked } from "@ws-model-proxy/auth/user-d
 import { THEME_INIT_SCRIPT } from "@ws-model-proxy/config/theme-init";
 import prismaDefault from "@ws-model-proxy/db";
 import { env as defaultEnv } from "@ws-model-proxy/env/server";
-import { Hono } from "hono";
+import { Hono, type Context as HonoContext } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { endAgentWork, handleAccessRevoked } from "./access-revocation.js";
 import { betterAuthAdminGate } from "./better-auth-admin-gate.js";
+import { resolveClientIp } from "./client-ip.js";
 import { CORS_ALLOW_HEADERS } from "./cors-headers.js";
 import {
   EMAIL_RECIPIENT_PATHS,
@@ -88,6 +89,7 @@ import {
   createModelApiFileUploadHandler,
 } from "./model-api/files.js";
 import { MODEL_API_MAX_REQUEST_BODY_BYTES } from "./model-api/limits.js";
+import { runModelTest } from "./model-api/model-test.js";
 import { openAiErrorBody } from "./model-api/openai-errors.js";
 import { createPoolMemberTestRoutes } from "./model-api/pool-member-test.js";
 import {
@@ -107,6 +109,7 @@ import { registerNodeHttpRoutes } from "./node-http.js";
 import { logOrpcError, sensitiveProcedureErrors } from "./orpc-error-log.js";
 import {
   authLimiter,
+  consumeInviteLookup,
   createRateLimiterMiddleware,
   emailRecipientLimiter,
   mcpClientRegistrationLimiter,
@@ -116,8 +119,14 @@ import {
   signupRecipientLimiter,
 } from "./rate-limit.js";
 import { readinessResponse } from "./readiness.js";
+import { cancelNodeCommandsForCredentials } from "./relay/node-commands.js";
 import type { NodeIdentity } from "./relay/node-credential-auth.js";
-import { nodeServices, pushRuntimeDefinitions } from "./relay/node-wiring.js";
+import {
+  dispatchRuntimeOperation,
+  nodeOperatorServices,
+  nodeServices,
+  pushRuntimeDefinitions,
+} from "./relay/node-wiring.js";
 import { relaySessionManager } from "./relay/session-manager.js";
 import {
   createTerminalWebsocketMiddleware,
@@ -258,19 +267,32 @@ onUserBanned((userId) => realtimeSessionRegistry.terminateForUser(userId));
  * push; the lanes add theirs (credential revocation, relay pushes, live node state) next to
  * the procedures that need them.
  */
-function contextServices(): ContextServices {
+/**
+ * `request`: the HTTP request the procedures serve (per-request services such as the invite
+ * lookup limit need its client address); null for MCP, whose services are built once (no MCP
+ * tool reaches those procedures, and they fail closed without the service).
+ */
+function contextServices(request: HonoContext | null): ContextServices {
   return {
+    // Public invite lookups are charged to the caller's address (like sign-in).
+    ...(request ? { limitInviteLookup: () => consumeInviteLookup(resolveClientIp(request)) } : {}),
     onPoolRoutingRulesChanged: (poolId: string) =>
       relaySessionManager.onPoolRoutingRulesChanged(poolId),
     nodes: nodeServices,
     pushRuntimeDefinitions,
+    dispatchRuntimeOperation,
+    nodeOperator: nodeOperatorServices,
+    modelTest: runModelTest,
     onAccessRevoked: (event) =>
       handleAccessRevoked(event, {
         terminateRealtimeForApiKey: (apiKeyId) =>
           realtimeSessionRegistry.terminateForToken(apiKeyId),
         cancelMcpToolCalls: (id) => cancelMcpToolCallsForToken(id),
         recheckRealtime: (userId) => realtimeSessionRegistry.recheckForUser(userId),
-        endAgentWork: (input) => endAgentWork(input),
+        endAgentWork: async (input) => {
+          await endAgentWork(input);
+          await cancelNodeCommandsForCredentials(input);
+        },
       }),
   };
 }
@@ -602,7 +624,7 @@ export async function createApp(options: CreateAppOptions = {}) {
       prisma,
       isForceTwoFactorRequired,
       admissionGate: mcpAdmissionGate,
-      services: contextServices(),
+      services: contextServices(null),
       // Phase 5 tool dispatch binding: after every admission check passes,
       // the verified AuthInfo (passed VERBATIM by the SDK into the transport
       // factory's request context) is bound to the per-request oRPC context,
@@ -706,16 +728,18 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.use("/api/dashboard/terminal/ws", createTerminalWebsocketMiddleware());
   app.get("/api/dashboard/terminal/ws", terminalUpgradeHandler());
 
-  // Signup kill-switch — reject email/password signup before it reaches
-  // Better-Auth when runtime signup is disabled. Production bootstrap requires
-  // the configured canonical ADMIN_EMAIL; local and test retain first-user
-  // bootstrap. The auth database hook repeats the authorization boundary.
-  app.use("/api/auth/sign-up/*", signupAccessGate);
-
   // Signup-specific rate limiter — stricter than the general auth limiter.
   // Must be mounted BEFORE the general authLimiter so signup traffic is throttled
-  // at the tighter limit first.
+  // at the tighter limit first, and before the kill-switch below, whose invite
+  // token lookup reads the database.
   app.use("/api/auth/sign-up/*", createRateLimiterMiddleware(signupLimiter));
+
+  // Signup kill-switch — reject email/password signup before it reaches
+  // Better-Auth when runtime signup is disabled (an invite link's pending token
+  // lets its sign-up through). Production bootstrap requires the configured
+  // canonical ADMIN_EMAIL; local and test retain first-user bootstrap. The auth
+  // database hook repeats the authorization boundary.
+  app.use("/api/auth/sign-up/*", signupAccessGate);
 
   // `get-session` is a benign, cookie-authenticated read that the SPA polls on
   // navigation/focus — many calls per minute under normal use. It must NOT be
@@ -958,7 +982,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   });
 
   app.use("/*", async (c, next) => {
-    const context = await createContext({ context: c, services: contextServices() });
+    const context = await createContext({ context: c, services: contextServices(c) });
 
     const rpcResult = await rpcHandler.handle(c.req.raw, {
       prefix: "/rpc",

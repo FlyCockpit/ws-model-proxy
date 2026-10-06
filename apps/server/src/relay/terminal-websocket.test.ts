@@ -49,6 +49,12 @@ vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
   isForceTwoFactorRequired: twoFactorPolicy.required,
 }));
 
+const audit = vi.hoisted(() => ({ record: vi.fn() }));
+vi.mock("./node-audit.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./node-audit.js")>()),
+  recordNodeAuditEvent: audit.record,
+}));
+
 vi.mock("../rate-limit.js", () => ({
   rpcLimiter: {},
   createRateLimiterMiddleware:
@@ -71,6 +77,12 @@ const {
   terminalSocketEvents,
 } = await import("./terminal-websocket.js");
 const { settleSocketHandler } = await import("./socket-handler.js");
+const { terminalTicketStore } = await import("./terminal-tickets.js");
+
+/** A ticket as `nodes.terminals.openTicket` mints it (for the test browser's session). */
+function ticketFor(nodeId: string, userId = "user-id", sessionId = "session-id"): string {
+  return terminalTicketStore.mint({ userId, sessionId, nodeId }).ticket;
+}
 
 const db = prisma as unknown as {
   $transaction: MockInstance;
@@ -477,7 +489,7 @@ describe("terminal browser hub", () => {
       browser,
       JSON.stringify({
         type: "open",
-        cliDeviceId,
+        ticket: ticketFor(cliDeviceId),
         cols: 80,
         rows: 24,
         publicKey: uncompressedKey(),
@@ -485,6 +497,100 @@ describe("terminal browser hub", () => {
       }),
     );
   }
+
+  function openFrame(ticket: string, requestId = "open_1") {
+    return JSON.stringify({
+      type: "open",
+      requestId,
+      ticket,
+      cols: 80,
+      rows: 24,
+      publicKey: uncompressedKey(),
+      nonce: nonce(),
+    });
+  }
+
+  it("opens the ticket's terminal id on the ticket's node, once", async () => {
+    const cli = await connectCli("one");
+    const browser = attachBrowser();
+    const minted = terminalTicketStore.mint({
+      userId: "user-id",
+      sessionId: "session-id",
+      nodeId: "one",
+    });
+    await terminalBrowserHub.handleText(browser, openFrame(minted.ticket));
+    expect(browser.jsonSends()[0]).toMatchObject({
+      type: "opening",
+      terminalId: minted.terminalId,
+      requestId: "open_1",
+    });
+    const opens = cli.jsonSends().filter((message) => message.type === "term.open");
+    expect(opens).toEqual([expect.objectContaining({ terminalId: minted.terminalId })]);
+    // Audited once the ticket became a terminal (not when it was minted).
+    expect(audit.record.mock.calls.map(([event]) => event)).toEqual([
+      expect.objectContaining({
+        userId: "user-id",
+        nodeId: "one",
+        actor: "USER",
+        kind: "browser_terminal",
+        subject: `terminal:${minted.terminalId}`,
+        outcome: "opened",
+      }),
+    ]);
+    // The same ticket again: used up, nothing reaches the node.
+    await terminalBrowserHub.handleText(browser, openFrame(minted.ticket, "open_2"));
+    expect(browser.jsonSends().at(-1)).toMatchObject({
+      type: "error",
+      code: "ticket_invalid",
+      requestId: "open_2",
+    });
+    expect(cli.jsonSends().filter((message) => message.type === "term.open")).toHaveLength(1);
+  });
+
+  it("refuses a ticket of another user or another session, and burns it", async () => {
+    const cli = await connectCli("one");
+    const browser = attachBrowser();
+    const otherSession = ticketFor("one", "user-id", "session-other");
+    const otherUser = ticketFor("one", "user-other", "session-id");
+    await terminalBrowserHub.handleText(browser, openFrame(otherSession, "open_session"));
+    await terminalBrowserHub.handleText(browser, openFrame(otherUser, "open_user"));
+    await terminalBrowserHub.handleText(browser, openFrame("x".repeat(43), "open_unknown"));
+    const errors = browser.jsonSends().filter((message) => message.type === "error");
+    expect(errors.map((error) => [error.code, error.requestId])).toEqual([
+      ["ticket_invalid", "open_session"],
+      ["ticket_invalid", "open_user"],
+      ["ticket_invalid", "open_unknown"],
+    ]);
+    expect(browser.jsonSends().some((message) => message.type === "opening")).toBe(false);
+    expect(cli.jsonSends().some((message) => message.type === "term.open")).toBe(false);
+    expect(audit.record).not.toHaveBeenCalled();
+    // Shown once to the wrong session, the ticket is gone for the right one too.
+    const owner = new FakeSocket();
+    terminalBrowserHub.accept({ socket: owner, userId: "user-id", sessionId: "session-other" });
+    await terminalBrowserHub.handleText(owner, openFrame(otherSession));
+    expect(owner.jsonSends().at(-1)).toMatchObject({ code: "ticket_invalid" });
+  });
+
+  it("refuses an open that names a node instead of a ticket", async () => {
+    const browser = attachBrowser();
+    await terminalBrowserHub.handleText(
+      browser,
+      JSON.stringify({
+        type: "open",
+        requestId: "open_node",
+        cliDeviceId: "one",
+        cols: 80,
+        rows: 24,
+        publicKey: uncompressedKey(),
+        nonce: nonce(),
+      }),
+    );
+    expect(browser.jsonSends().at(-1)).toMatchObject({
+      type: "error",
+      code: "invalid",
+      requestId: "open_node",
+    });
+  });
 
   it("returns the same not-found error for an unknown CLI and a foreign CLI", async () => {
     const browser = attachBrowser();
@@ -696,7 +802,7 @@ describe("terminal browser hub", () => {
       browser,
       JSON.stringify({
         type: "open",
-        cliDeviceId: "one",
+        ticket: ticketFor("one"),
         cols: 80,
         rows: 24,
         publicKey: uncompressedKey(),
@@ -1192,7 +1298,7 @@ describe("terminal browser hub", () => {
       {
         type: "open",
         requestId: "open_missing",
-        cliDeviceId: "missing",
+        ticket: ticketFor("missing"),
         cols: 80,
         rows: 24,
         publicKey: uncompressedKey(),
@@ -1222,7 +1328,7 @@ describe("terminal browser hub", () => {
     // An open to a known CLI that is not connected: `offline`, with the request.
     await terminalBrowserHub.handleText(
       offline,
-      JSON.stringify({ ...frames[0], requestId: "open_offline", cliDeviceId: "one" }),
+      JSON.stringify({ ...frames[0], requestId: "open_offline", ticket: ticketFor("one") }),
     );
     expect(offline.jsonSends().at(-1)).toMatchObject({
       type: "error",

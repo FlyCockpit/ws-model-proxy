@@ -13,6 +13,7 @@
 import { randomBytes } from "node:crypto";
 import { ORPCError } from "@orpc/server";
 import prisma from "@ws-model-proxy/db";
+import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import type { z } from "zod";
 import type { Context, NodeCommandLiveStatus, NodeOperatorServices } from "../context";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
@@ -24,6 +25,11 @@ import {
 } from "../contracts/nodes";
 import { callerActor } from "../lib/caller-actor";
 import { commandAuditSubject } from "../lib/command-audit";
+import {
+  type NodeCommandRow,
+  nodeCommandSelect,
+  settleNodeCommand,
+} from "../lib/node-command-settle";
 import { notFound, refuse, refuseAbout } from "../lib/refuse";
 import { NODE_COMMAND_GET_WAIT_MAX_MS, runtimeTextIssue } from "../lib/runtime-spec";
 
@@ -34,13 +40,12 @@ export const QUEUED_COMMANDS_MAX_PER_USER = 50;
 
 type NodeCommandView = z.infer<typeof nodeCommandViewSchema>;
 type QueuedCommandView = z.infer<typeof queuedCommandViewSchema>;
-type CommandState = NodeCommandLiveStatus["state"];
 
 function services(context: Context): NodeOperatorServices {
   const operator = context.services?.nodeOperator;
   if (!operator) {
-    // TODO(server): apps/server provides `services.nodeOperator` (relay 3.0 exec.* and the
-    // terminal ticket store) once its rekey lands.
+    // apps/server provides it (`relay/node-operator-services.ts`); a server without it (tests,
+    // or a build that does not wire it) changes nothing.
     throw new ORPCError("SERVICE_UNAVAILABLE", {
       message: "Terminals and node commands are not available on this server yet.",
     });
@@ -51,8 +56,8 @@ function services(context: Context): NodeOperatorServices {
 /**
  * Agents need a Full token for anything that runs or queues a command, and a browser call must
  * carry the verified CSRF header: a cookie without it is not a person (`agentRulesApply`) and
- * could be a cross-site form post. TODO(contract): list these agent mutations in
- * CSRF_REQUIRED_PROCEDURES so the RPC layer refuses them first.
+ * could be a cross-site form post. The RPC layer refuses those first
+ * (`CSRF_REQUIRED_PROCEDURES`); this is the procedure's own check.
  */
 function assertAgentMayWrite(auth: CallerAuth | { kind: "anonymous" }): void {
   if (auth.kind === "cookie_session" && !auth.csrfVerified) {
@@ -111,36 +116,16 @@ function userIdOf(context: SignedInContext): string {
 
 // ── Node commands ──
 
-type CommandRow = {
-  id: string;
-  nodeId: string;
-  state: CommandState;
-  exitCode: number | null;
-  startedAt: Date;
-  endsBy: Date;
-  finishedAt: Date | null;
-};
-
-const commandSelect = {
-  id: true,
-  nodeId: true,
-  userId: true,
-  actor: true,
-  agentTokenId: true,
-  mcpGrantId: true,
-  subject: true,
-  state: true,
-  exitCode: true,
-  startedAt: true,
-  endsBy: true,
-  finishedAt: true,
-} as const;
-
-function commandView(row: CommandRow, live: NodeCommandLiveStatus | null): NodeCommandView {
+function commandView(
+  row: NodeCommandRow,
+  live: NodeCommandLiveStatus | null,
+  cancelRequested = false,
+): NodeCommandView {
   const exitCode = live?.exitCode ?? row.exitCode;
   const finishedAt = row.finishedAt ?? live?.finishedAt ?? null;
   return {
     commandId: row.id,
+    ...(cancelRequested ? { cancelRequested: true } : {}),
     state: row.state === "RUNNING" && live ? live.state : row.state,
     ...(exitCode !== null && exitCode !== undefined ? { exitCode } : {}),
     output: live ? live.output : null,
@@ -151,89 +136,9 @@ function commandView(row: CommandRow, live: NodeCommandLiveStatus | null): NodeC
   };
 }
 
-const AUDIT_OUTCOME: Record<
-  Exclude<CommandState, "RUNNING">,
-  { outcome: "completed" | "cancelled" | "unknown"; reason: string | null }
-> = {
-  SUCCEEDED: { outcome: "completed", reason: null },
-  FAILED: { outcome: "completed", reason: "exit_nonzero" },
-  CANCELLED: { outcome: "cancelled", reason: "cancelled" },
-  TIMED_OUT: { outcome: "cancelled", reason: "timeout" },
-  INTERRUPTED: { outcome: "unknown", reason: "interrupted" },
-  UNKNOWN: { outcome: "unknown", reason: "unknown_to_node" },
-};
-
-/**
- * Records a command's end once: the row leaves RUNNING (guarded, so concurrent pollers settle
- * it exactly once) and the audit event is appended by whoever settled it.
- */
-async function settleCommand(
-  row: CommandRow & {
-    userId: string;
-    actor: "USER" | "AGENT" | "SYSTEM";
-    agentTokenId: string | null;
-    mcpGrantId: string | null;
-    subject: string;
-  },
-  state: Exclude<CommandState, "RUNNING">,
-  exitCode: number | null | undefined,
-  finishedAtHint: Date | undefined,
-  audit?: { outcome: "failed"; reason: string },
-): Promise<CommandRow> {
-  const finishedAt = new Date(
-    Math.max(row.startedAt.getTime(), (finishedAtHint ?? new Date()).getTime()),
-  );
-  const storedExit =
-    (state === "SUCCEEDED" || state === "FAILED") &&
-    typeof exitCode === "number" &&
-    Number.isInteger(exitCode) &&
-    exitCode >= 0 &&
-    exitCode <= 255
-      ? exitCode
-      : null;
-  // The state change and its audit event commit together, exactly once.
-  const settledHere = await prisma.$transaction(async (tx) => {
-    const settled = await tx.nodeCommand.updateMany({
-      where: { id: row.id, state: "RUNNING" },
-      data: { state, exitCode: storedExit, finishedAt },
-    });
-    if (settled.count !== 1) return false;
-    const { outcome, reason } = audit ?? AUDIT_OUTCOME[state];
-    await tx.nodeAuditEvent.create({
-      data: {
-        userId: row.userId,
-        nodeId: row.nodeId,
-        actor: row.actor,
-        agentTokenId: row.agentTokenId,
-        mcpGrantId: row.mcpGrantId,
-        kind: "command",
-        subject: row.subject,
-        exitCode: storedExit,
-        outcome,
-        reason,
-        startedAt: row.startedAt,
-        finishedAt,
-      },
-    });
-    return true;
-  });
-  if (settledHere) return { ...row, state, exitCode: storedExit, finishedAt };
-  const current = await prisma.nodeCommand.findUnique({
-    where: { id: row.id },
-    select: commandSelect,
-  });
-  return current ?? row;
-}
-
 async function pollAndSettle(
   operator: NodeOperatorServices,
-  row: CommandRow & {
-    userId: string;
-    actor: "USER" | "AGENT" | "SYSTEM";
-    agentTokenId: string | null;
-    mcpGrantId: string | null;
-    subject: string;
-  },
+  row: NodeCommandRow,
   waitMs: number,
   cancel: boolean,
 ): Promise<NodeCommandView> {
@@ -243,12 +148,48 @@ async function pollAndSettle(
     commandId: row.id,
     waitMs,
     cancel,
+    endsBy: row.endsBy,
   });
   if (live && live.state !== "RUNNING" && row.state === "RUNNING") {
-    const settled = await settleCommand(row, live.state, live.exitCode, live.finishedAt);
+    const settled = await settleNodeCommand(row, live.state, live.exitCode, live.finishedAt);
     return commandView(settled, live);
   }
-  return commandView(row, live);
+  // The node has not reported the end yet (or is offline: it gets the cancel when it is back).
+  return commandView(row, live, cancel);
+}
+
+/**
+ * Read again once the command's row exists: the caller's credential (an agent's token or grant,
+ * still Full) and its owner (not banned or marked for deletion). A revocation or ban committed
+ * before this read refuses here; one committed after it finds the row and cancels it
+ * (`apps/server` relay/node-commands.ts), even before the node started it.
+ */
+async function callerStillLive(auth: CallerAuth | { kind: "anonymous" }, userId: string) {
+  const now = new Date();
+  const [owner, credential] = await Promise.all([
+    prisma.user.findUnique({
+      where: { id: userId },
+      select: { banned: true, banExpires: true, deletionRequestedAt: true },
+    }),
+    auth.kind === "agent_token"
+      ? prisma.agentToken.findFirst({
+          where: {
+            id: auth.agentTokenId,
+            userId,
+            level: "FULL",
+            revokedAt: null,
+            OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+          },
+          select: { id: true },
+        })
+      : auth.kind === "oauth_access_token"
+        ? prisma.mcpGrant.findFirst({
+            where: { id: auth.grantId, userId, level: "FULL", revokedAt: null },
+            select: { id: true },
+          })
+        : Promise.resolve({ id: userId }),
+  ]);
+  return owner !== null && !userCredentialAccessBlocked(owner, now) && credential !== null;
 }
 
 const commands = {
@@ -275,8 +216,17 @@ const commands = {
         startedAt,
         endsBy: new Date(startedAt.getTime() + timeoutMs),
       },
-      select: commandSelect,
+      select: nodeCommandSelect,
     });
+    if (!(await callerStillLive(context.auth, userId))) {
+      await settleNodeCommand(row, "FAILED", null, undefined, {
+        outcome: "failed",
+        reason: "token_inactive",
+      });
+      throw new ORPCError("FORBIDDEN", {
+        message: "This credential was revoked or expired, or its account is blocked.",
+      });
+    }
     try {
       await operator.startCommand({
         userId,
@@ -287,7 +237,7 @@ const commands = {
         timeoutMs,
       });
     } catch (error) {
-      await settleCommand(row, "FAILED", null, undefined, {
+      await settleNodeCommand(row, "FAILED", null, undefined, {
         outcome: "failed",
         reason: "start_failed",
       });
@@ -308,7 +258,7 @@ const commands = {
     if (input.cancel) assertAgentMayWrite(context.auth);
     const row = await prisma.nodeCommand.findFirst({
       where: { id: input.commandId, userId },
-      select: commandSelect,
+      select: nodeCommandSelect,
     });
     if (!row) throw notFound("That node or command does not exist.");
     if (input.cancel && row.state !== "RUNNING") {
@@ -365,17 +315,13 @@ const terminals = {
     const ticket = await services(context).openTerminalTicket({
       userId,
       sessionId: context.session.session.id,
+      impersonatedBy: context.session.session.impersonatedBy ?? null,
       nodeId: node.id,
       cols: input.cols,
       rows: input.rows,
     });
-    await appendTerminalAudit({
-      userId,
-      nodeId: node.id,
-      terminalId: ticket.terminalId,
-      kind: "browser_terminal",
-      outcome: "opened",
-    });
+    // Audited as `opened` when the terminal socket redeems the ticket and the node is asked to
+    // open it (apps/server relay/terminal-websocket.ts), not here: a ticket may go unused.
     return {
       ticket: ticket.ticket,
       terminalId: ticket.terminalId,
@@ -495,6 +441,14 @@ const queued = {
   enqueue: contractProcedure(c.queued.enqueue).handler(async ({ context, input }) => {
     assertAgentMayWrite(context.auth);
     const userId = userIdOf(context);
+    // A queued command is always an agent's (one credential per row, hardening CHECK): a person
+    // runs the command in a terminal instead.
+    const { actor, agentTokenId, mcpGrantId } = callerActor(context.auth, userId);
+    if (actor !== "AGENT") {
+      throw new ORPCError("FORBIDDEN", {
+        message: "Only an agent queues a command for a person. Open a terminal to run it.",
+      });
+    }
     const node = await fullControlNode(userId, input.nodeId, { allowOffline: true });
     for (const text of [input.command, input.note]) {
       const issue = runtimeTextIssue(text);
@@ -511,7 +465,6 @@ const queued = {
         "CONFLICT",
       );
     }
-    const { agentTokenId, mcpGrantId } = callerActor(context.auth, userId);
     const row = await prisma.queuedNodeCommand.create({
       data: {
         userId,
@@ -561,6 +514,7 @@ const queued = {
     const ticket = await services(context).openTerminalTicket({
       userId,
       sessionId: context.session.session.id,
+      impersonatedBy: context.session.session.impersonatedBy ?? null,
       nodeId: node.id,
       cols: input.cols,
       rows: input.rows,

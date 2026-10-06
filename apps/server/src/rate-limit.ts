@@ -39,6 +39,8 @@ export const DEFAULTS = {
   mcpRegistration: { points: 60, duration: 60 * 60 },
   enrollmentExchangeIp: { points: 10, duration: 15 * 60 },
   enrollmentExchangeUser: { points: 20, duration: 60 * 60 },
+  /** Public invite lookups (`auth.inviteInfo`), per client IP: like sign-in. */
+  inviteInfo: { points: 10, duration: 60, blockDuration: 15 * 60 },
 } as const;
 
 /** A built-in points budget times `WMP_RATE_LIMIT_SCALE`, rounded, never below 1. */
@@ -143,6 +145,23 @@ export const enrollmentExchangeUserLimiter = new RateLimiterMemory({
   points: scaledPoints(DEFAULTS.enrollmentExchangeUser.points),
   duration: DEFAULTS.enrollmentExchangeUser.duration,
 });
+
+export const inviteInfoLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:invite-info",
+  points: scaledPoints(DEFAULTS.inviteInfo.points),
+  duration: DEFAULTS.inviteInfo.duration,
+  blockDuration: DEFAULTS.inviteInfo.blockDuration,
+});
+
+/** Charges one invite lookup to this client address; false when it is over its budget. */
+export async function consumeInviteLookup(clientIp: string): Promise<boolean> {
+  try {
+    await inviteInfoLimiter.consume(clientIp);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export type ExchangeLimit = { allowed: true } | { allowed: false; retryAfterMs: number };
 

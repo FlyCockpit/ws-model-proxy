@@ -275,6 +275,11 @@ const nodeSecretValueSchema = z
 export const nodeCommandViewSchema = z
   .object({
     commandId: z.string(),
+    /**
+     * Answering a cancel: it was asked for and the node has not reported the end yet (an
+     * offline node gets it when it reconnects). Poll again for the final state.
+     */
+    cancelRequested: z.boolean().optional(),
     state: z.enum(NODE_COMMAND_STATE),
     exitCode: z.number().int().optional(),
     /** Masked end of the output; null when the node is offline. */

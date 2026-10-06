@@ -318,6 +318,7 @@ describe("built-in limits and WMP_RATE_LIMIT_SCALE", () => {
       mcpRegistration: { points: 60, duration: 3600 },
       enrollmentExchangeIp: { points: 10, duration: 900 },
       enrollmentExchangeUser: { points: 20, duration: 3600 },
+      inviteInfo: { points: 10, duration: 60, blockDuration: 900 },
     });
   });
 

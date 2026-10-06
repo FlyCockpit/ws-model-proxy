@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 
 const db = vi.hoisted(() => ({
   queuedNodeCommand: { updateMany: vi.fn(async () => ({ count: 1 })) },
-  nodeCommand: { findMany: vi.fn(async () => [{ id: "cmd-1", nodeId: "node-1" }]) },
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
 
@@ -54,33 +53,19 @@ describe("handleAccessRevoked", () => {
 });
 
 describe("endAgentWork", () => {
-  it("expires queued commands and cancels running ones of the credentials", async () => {
-    const cancel = vi.fn(async () => undefined);
-    await endAgentWork({ userId: "u", credentialIds: ["t1", "g1"] }, cancel);
-    const byCredential = [
-      { agentTokenId: { in: ["t1", "g1"] } },
-      { mcpGrantId: { in: ["t1", "g1"] } },
-    ];
+  it("expires the credentials' queued commands", async () => {
+    await endAgentWork({ userId: "u", credentialIds: ["t1", "g1"] });
     expect(db.queuedNodeCommand.updateMany).toHaveBeenCalledWith({
-      where: { userId: "u", state: "QUEUED", OR: byCredential },
+      where: {
+        userId: "u",
+        state: "QUEUED",
+        OR: [{ agentTokenId: { in: ["t1", "g1"] } }, { mcpGrantId: { in: ["t1", "g1"] } }],
+      },
       data: expect.objectContaining({
         state: "EXPIRED",
         decidedBy: null,
         outcome: "credential_revoked",
       }),
     });
-    expect(db.nodeCommand.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { userId: "u", state: "RUNNING", OR: byCredential } }),
-    );
-    expect(cancel).toHaveBeenCalledWith({ userId: "u", nodeId: "node-1", commandId: "cmd-1" });
-  });
-});
-
-describe("endAgentWork without a node operator", () => {
-  it("only expires the queued commands", async () => {
-    db.nodeCommand.findMany.mockClear();
-    await endAgentWork({ userId: "u", credentialIds: ["t1"] });
-    expect(db.queuedNodeCommand.updateMany).toHaveBeenCalled();
-    expect(db.nodeCommand.findMany).not.toHaveBeenCalled();
   });
 });

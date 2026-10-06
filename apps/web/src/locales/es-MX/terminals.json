@@ -20,5 +20,48 @@
   "copyCommand": "Copiar comando",
   "unknownNode": "un nodo desconocido",
   "noNodes": "Todavía no tienes nodos.",
-  "attachUnavailable": "Las terminales del navegador llegan con la próxima actualización del servidor. Mientras tanto, copia el comando y ejecútalo tú en el nodo."
+  "workspaceTitle": "Terminales abiertas",
+  "workspaceDescription": "La entrada y salida de la terminal se cifran entre este navegador y el nodo. El servidor no puede leerlas ni escribir en ellas.",
+  "workspaceEmpty": "Abre una terminal en un nodo, o ejecuta un comando en espera, y aparecerá aquí.",
+  "socket": {
+    "connecting": "Conectando con el relé…",
+    "closed": "Sin conexión con el relé. Reconectando…",
+    "unauthorized": "Tu sesión terminó. Vuelve a iniciar sesión para usar terminales."
+  },
+  "phase": {
+    "waiting": "En espera",
+    "opening": "Abriendo…",
+    "live": "Conectada",
+    "rejected": "Rechazada",
+    "exited": "Terminada"
+  },
+  "exitedWithCode": "La shell terminó con el código de salida {{code}}.",
+  "exitedPlain": "La shell terminó.",
+  "approvalNeeded": "Aprueba esta terminal en el nodo: {{command}}",
+  "detach": "Dejar de ver",
+  "closeTab": "Cerrar pestaña",
+  "endSession": "Terminar sesión",
+  "ending": "Terminando…",
+  "endFailed": "El relé no pudo terminar esta sesión. Inténtalo de nuevo.",
+  "typedCommandHint": "El comando está escrito en la terminal. Revísalo y presiona Enter para ejecutarlo.",
+  "typedCommandNotTyped": "Este comando tiene más de una línea o caracteres que no son ASCII simple, así que no se escribió. Cópialo de la lista y pégalo en la terminal.",
+  "trustNewKey": "Confiar en la nueva clave",
+  "identityChangedDetail": "La clave de identidad de este nodo cambió (nueva huella {{fingerprint}}). Confía en ella solo si reinstalaste o volviste a inscribir el nodo.",
+  "trustFailed": "La identidad del nodo volvió a cambiar. Revísala antes de confiar en ella.",
+  "rejection": {
+    "identity_changed": "La clave de identidad del nodo cambió desde tu última conexión.",
+    "identity_invalid": "No se pudo verificar la identidad del nodo.",
+    "identity_mismatch": "El nodo respondió con una clave que su identidad no firmó.",
+    "offline": "El nodo está desconectado.",
+    "not_found": "No se encontró el nodo o la terminal.",
+    "not_granted": "Las terminales del navegador necesitan el nodo con control completo.",
+    "unsupported": "Las terminales del navegador no están activadas en este nodo.",
+    "cli_too_old": "Actualiza wsmp en este nodo para usar terminales del navegador.",
+    "limit": "Se alcanzó el límite de terminales. Termina una sesión e inténtalo de nuevo.",
+    "invalid": "El relé rechazó esta solicitud de terminal.",
+    "ticket_invalid": "Este enlace de terminal venció o ya se usó. Vuelve a abrir la terminal.",
+    "declined": "La terminal fue rechazada en el nodo.",
+    "bad_handshake": "Falló el intercambio seguro con el nodo.",
+    "other": "La terminal fue rechazada ({{reason}})."
+  }
 }

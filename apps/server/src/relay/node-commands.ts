@@ -1,42 +1,49 @@
 /**
- * Agent commands on a node (`exec.start` / `exec.poll` / `exec.cancel`, results through
- * `exec.started` / `exec.status` / `exec.rejected`). STUB for lane D3: 0.4.0 commands are
- * output-to-file, admitted by `node-access.ts` (FULL token, node at Full control) and audited
- * as `NodeAuditEvent` kind `command`. Until D3 lands every start is refused before anything is
- * sent, so no command record ever exists and the cancel/sweep entry points only end open
- * admissions. The exec.* node frames go to the session manager's node frame handlers.
+ * The process's node command tracker and the entry points that end commands from outside the
+ * procedures: a ban (`user-ban.ts`), a revoked agent credential (`access-revocation.ts`
+ * `endAgentWork`) and the 60 s maintenance sweep (expired or narrowed credentials).
+ *
+ * Commands are started by `nodes.commands.run` through `node-operator-services.ts`, which
+ * tracks each one here from the moment its `exec.start` is sent.
  */
-import { revokeOpenNodeAgentAccess, revokeOpenNodeAgentAccessForUser } from "./node-access.js";
+import { NodeCommandTracker } from "./node-command-tracker.js";
+import { relaySessionManager } from "./session-manager.js";
 
-export type StartNodeCommandInput = {
+export const nodeCommandTracker = new NodeCommandTracker({
+  sendToNode: (nodeId, frame, guard) => relaySessionManager.sendToNode(nodeId, frame, guard),
+});
+
+/** The class only: an error message could carry query content. */
+function errorName(error: unknown): string {
+  return error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error;
+}
+
+/**
+ * Agent tokens or OAuth grants were revoked (or narrowed) and committed: end the node
+ * commands they started.
+ */
+export function cancelNodeCommandsForCredentials(input: {
   userId: string;
-  tokenId: string;
-  expiresAt: Date | null;
-  nodeId: string;
-  command: string;
-  timeoutMs?: number;
-};
-
-export type StartNodeCommandResult = { ok: false; error: "not_implemented" };
-
-/** Lane D3. Refuses: no frame is sent and nothing is recorded. */
-export async function startNodeCommand(
-  _input: StartNodeCommandInput,
-): Promise<StartNodeCommandResult> {
-  return { ok: false, error: "not_implemented" };
+  credentialIds: readonly string[];
+}): Promise<number> {
+  return nodeCommandTracker.cancelForCredentials(input);
 }
 
-/** A token was revoked or narrowed: refuse its commands still in admission. */
-export function cancelNodeCommandsForToken(tokenId: string): void {
-  revokeOpenNodeAgentAccess(tokenId);
-}
-
-/** A user was banned: refuse their commands still in admission. */
+/**
+ * A user was banned: the commands they own end now. Synchronous for every command this
+ * process tracks; rows from before a restart follow in the background (and at the next sweep).
+ */
 export function cancelNodeCommandsForUser(userId: string): void {
-  revokeOpenNodeAgentAccessForUser(userId);
+  nodeCommandTracker.cancelForUser(userId);
 }
 
-/** Expired tokens end their running commands. No command records exist before lane D3. */
-export function sweepExpiredNodeCommands(_now = Date.now()): number {
-  return 0;
+/**
+ * The 60 s pass: commands whose credential is no longer live or whose owner is blocked end.
+ * Never rejects (the maintenance loop does not await it).
+ */
+export function sweepExpiredNodeCommands(now = Date.now()): Promise<number> {
+  return nodeCommandTracker.sweep(now).catch((error: unknown) => {
+    console.error("[relay] node command sweep failed", errorName(error));
+    return 0;
+  });
 }

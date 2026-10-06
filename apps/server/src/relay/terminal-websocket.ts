@@ -20,6 +20,7 @@ import {
   base64Url16Schema as base64Url16ByteSchema,
   p256PublicKeySchema as uncompressedP256PublicKeySchema,
 } from "./frames.js";
+import { recordNodeAuditEvent } from "./node-audit.js";
 import { encodeRelayBinaryFrame, parseRelayBinaryFrame } from "./protocol.js";
 import {
   type LiveNodeState,
@@ -30,6 +31,11 @@ import {
   terminalLimitReached,
 } from "./session-manager.js";
 import { settleSocketHandler } from "./socket-handler.js";
+import {
+  TERMINAL_TICKET_PATTERN,
+  type TerminalTicketStore,
+  terminalTicketStore,
+} from "./terminal-tickets.js";
 
 const BROWSER_BUFFER_DETACH_BYTES = 4 * 1024 * 1024;
 /**
@@ -104,7 +110,11 @@ const browserClientMessageSchema = z.discriminatedUnion("type", [
     .object({
       type: z.literal("open"),
       ...requestIdField,
-      cliDeviceId: z.string().trim().min(1).max(128),
+      /**
+       * A one-use ticket from `nodes.terminals.openTicket` / `nodes.queued.run`: it names the
+       * node and the terminal id, for this user and this Better Auth session only.
+       */
+      ticket: z.string().regex(TERMINAL_TICKET_PATTERN),
       cols: z.number().int().min(1).max(1000),
       rows: z.number().int().min(1).max(1000),
       publicKey: uncompressedP256PublicKeySchema,
@@ -202,7 +212,9 @@ type TerminalErrorCode =
   | "limit"
   | "invalid"
   | "rate_limited"
-  | "input_dropped";
+  | "input_dropped"
+  /** The open's ticket is unknown, used, expired, or another user's or session's. */
+  | "ticket_invalid";
 
 type BrowserConn = {
   id: string;
@@ -341,6 +353,7 @@ function errorMessage(code: TerminalErrorCode): string {
   if (code === "limit") return "Terminal limit reached.";
   if (code === "input_dropped") return "Terminal input was dropped.";
   if (code === "rate_limited") return "Too many terminal messages; try again shortly.";
+  if (code === "ticket_invalid") return "This terminal ticket expired or was already used.";
   return "Invalid terminal message.";
 }
 
@@ -362,6 +375,8 @@ function utf8ByteLengthExceeds(frame: string, maxBytes: number): boolean {
 }
 
 export class TerminalBrowserHub {
+  constructor(private readonly tickets: TerminalTicketStore = terminalTicketStore) {}
+
   private bySocket = new Map<RelaySocket, BrowserConn>();
   private byId = new Map<string, BrowserConn>();
   private jsonAt = new Map<string, number[]>();
@@ -386,6 +401,7 @@ export class TerminalBrowserHub {
    * marker or the missing session ({@link admitBrowserConnection}).
    */
   revokeTerminalAccessForUser(userId: string) {
+    this.tickets.revokeForUser(userId);
     for (const conn of [...this.bySocket.values()]) {
       if (conn.userId !== userId && conn.impersonatedBy !== userId) continue;
       this.detachAll(conn);
@@ -633,7 +649,18 @@ export class TerminalBrowserHub {
       return;
     }
     if (data.type === "open") {
-      const terminalId = this.allocateTerminalId();
+      // Used up here, whatever follows: a ticket opens at most one terminal.
+      const redeemed = this.tickets.redeem({
+        ticket: data.ticket,
+        userId: conn.userId,
+        sessionId: conn.sessionId,
+      });
+      if (!redeemed || relaySessionManager.hasTerminal(redeemed.terminalId)) {
+        this.sendError(conn, "ticket_invalid", ref);
+        return;
+      }
+      // The id the procedure minted (and audited) with the ticket.
+      const { terminalId, nodeId } = redeemed;
       // A new terminal has no viewers yet, so a fresh id cannot collide.
       const viewerId = randomBytes(16).toString("base64url");
       // From here on the terminal id names this open too.
@@ -644,7 +671,7 @@ export class TerminalBrowserHub {
         viewerId,
         ...(ref.requestId ? { requestId: ref.requestId } : {}),
       });
-      await this.openTerminal(conn, data, terminalId, viewerId, ref);
+      await this.openTerminal(conn, data, nodeId, terminalId, viewerId, ref);
       return;
     }
     if (data.type === "auth") {
@@ -990,14 +1017,6 @@ export class TerminalBrowserHub {
     });
   }
 
-  private allocateTerminalId(): string {
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      const terminalId = randomBytes(16).toString("base64url");
-      if (!relaySessionManager.hasTerminal(terminalId)) return terminalId;
-    }
-    return randomBytes(16).toString("base64url");
-  }
-
   private forwardAuth(conn: BrowserConn, terminalId: string, signature: string, ref: FrameRef) {
     const result = relaySessionManager.forwardTerminalAuth(
       terminalId,
@@ -1011,12 +1030,14 @@ export class TerminalBrowserHub {
   private async openTerminal(
     conn: BrowserConn,
     message: Extract<z.infer<typeof browserClientMessageSchema>, { type: "open" }>,
+    /** The redeemed ticket's node; ownership and availability are checked again here. */
+    nodeId: string,
     terminalId: string,
     viewerId: string,
     /** Names the frame and, since `opening`, the terminal made for it. */
     ref: FrameRef,
   ) {
-    const row = await this.ownedNode(conn.userId, message.cliDeviceId);
+    const row = await this.ownedNode(conn.userId, nodeId);
     // The browser may have gone while the lookup ran. Starting now would leave
     // a shell with a phantom viewer holding a terminal slot.
     if (!this.isLive(conn)) return;
@@ -1049,7 +1070,22 @@ export class TerminalBrowserHub {
       connId: conn.id,
       viewerId,
     });
-    if (!started) this.sendError(conn, "offline", ref);
+    if (!started) {
+      this.sendError(conn, "offline", ref);
+      return;
+    }
+    // The ticket became a terminal: audited here, not when it was minted.
+    const now = new Date();
+    recordNodeAuditEvent({
+      userId: conn.userId,
+      nodeId: row.id,
+      actor: "USER",
+      kind: "browser_terminal",
+      subject: `terminal:${terminalId}`,
+      outcome: "opened",
+      startedAt: now,
+      finishedAt: now,
+    });
   }
 
   private attachTerminal(

@@ -4,7 +4,22 @@ import {
   decodeSealedFrame,
   encodeSealedFrame,
   parseTerminalServerMessage,
+  typableCommand,
 } from "./terminal-protocol";
+
+describe("typableCommand", () => {
+  it("types one line of printable ASCII only", () => {
+    expect(typableCommand("nvidia-smi -L | head -n 2 && echo '~$HOME'")).toBe(true);
+    expect(typableCommand("")).toBe(false);
+    // Past ASCII: readline may read it as Meta keys or strip the high bit (0x8A -> LF).
+    expect(typableCommand("echo 'héllo'")).toBe(false);
+    expect(typableCommand("ls\u008a")).toBe(false);
+    expect(typableCommand("lså")).toBe(false);
+    for (const control of ["\n", "\r", "\t", "\u001b", "\u007f", "\u0085"]) {
+      expect(typableCommand(`ls${control}rm -rf ~`)).toBe(false);
+    }
+  });
+});
 
 function frameWithMetadata(metadata: unknown, body = new Uint8Array([1, 2, 3])): ArrayBuffer {
   const meta = new TextEncoder().encode(JSON.stringify(metadata));

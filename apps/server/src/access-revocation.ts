@@ -48,17 +48,20 @@ export async function handleAccessRevoked(
 }
 
 /**
- * The agent credentials' queued commands expire (`credential_revoked`) and their running node
- * commands are cancelled through `cancelCommand` (the node operator's exec.cancel).
+ * The agent credentials' queued commands expire (`credential_revoked`). Their running node
+ * commands are cancelled by the node command tracker (`cancelNodeCommandsForCredentials`).
  */
-export async function endAgentWork(
-  input: { userId: string; credentialIds: readonly string[] },
-  cancelCommand?: (command: { userId: string; nodeId: string; commandId: string }) => Promise<void>,
-): Promise<void> {
+export async function endAgentWork(input: {
+  userId: string;
+  credentialIds: readonly string[];
+}): Promise<void> {
   const ids = [...input.credentialIds];
-  const byCredential = [{ agentTokenId: { in: ids } }, { mcpGrantId: { in: ids } }];
   await prisma.queuedNodeCommand.updateMany({
-    where: { userId: input.userId, state: "QUEUED", OR: byCredential },
+    where: {
+      userId: input.userId,
+      state: "QUEUED",
+      OR: [{ agentTokenId: { in: ids } }, { mcpGrantId: { in: ids } }],
+    },
     data: {
       state: "EXPIRED",
       decidedAt: new Date(),
@@ -66,15 +69,4 @@ export async function endAgentWork(
       outcome: "credential_revoked",
     },
   });
-  if (!cancelCommand) return;
-  const running = await prisma.nodeCommand.findMany({
-    where: { userId: input.userId, state: "RUNNING", OR: byCredential },
-    select: { id: true, nodeId: true },
-  });
-  // In parallel: one offline node must not hold up the others.
-  await Promise.allSettled(
-    running.map((command) =>
-      cancelCommand({ userId: input.userId, nodeId: command.nodeId, commandId: command.id }),
-    ),
-  );
 }

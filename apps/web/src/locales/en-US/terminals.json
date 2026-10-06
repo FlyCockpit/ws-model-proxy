@@ -20,5 +20,48 @@
   "copyCommand": "Copy command",
   "unknownNode": "an unknown node",
   "noNodes": "You have no nodes yet.",
-  "attachUnavailable": "Browser terminals arrive with the next server update. Until then, copy the command and run it on the node yourself."
+  "workspaceTitle": "Open terminals",
+  "workspaceDescription": "Terminal input and output are encrypted between this browser and the node. The server cannot read them or type into them.",
+  "workspaceEmpty": "Open a terminal on a node, or run a queued command, and it appears here.",
+  "socket": {
+    "connecting": "Connecting to the relay…",
+    "closed": "Not connected to the relay. Reconnecting…",
+    "unauthorized": "Your session ended. Sign in again to use terminals."
+  },
+  "phase": {
+    "waiting": "Waiting",
+    "opening": "Opening…",
+    "live": "Connected",
+    "rejected": "Refused",
+    "exited": "Ended"
+  },
+  "exitedWithCode": "The shell ended with exit code {{code}}.",
+  "exitedPlain": "The shell ended.",
+  "approvalNeeded": "Approve this terminal on the node: {{command}}",
+  "detach": "Stop viewing",
+  "closeTab": "Close tab",
+  "endSession": "End session",
+  "ending": "Ending…",
+  "endFailed": "The relay could not end this session. Try again.",
+  "typedCommandHint": "The command is typed into the terminal. Check it, then press Enter to run it.",
+  "typedCommandNotTyped": "This command has more than one line or characters other than plain ASCII, so it was not typed. Copy it from the queue and paste it into the terminal.",
+  "trustNewKey": "Trust the new key",
+  "identityChangedDetail": "This node's identity key changed (new fingerprint {{fingerprint}}). Trust it only if you reinstalled or re-enrolled the node.",
+  "trustFailed": "The node's identity changed again. Check it before you trust it.",
+  "rejection": {
+    "identity_changed": "The node's identity key changed since you last connected.",
+    "identity_invalid": "The node's identity could not be verified.",
+    "identity_mismatch": "The node answered with a key its identity did not sign.",
+    "offline": "The node is offline.",
+    "not_found": "The node or terminal was not found.",
+    "not_granted": "Browser terminals need the node at Full control.",
+    "unsupported": "Browser terminals are not enabled on this node.",
+    "cli_too_old": "Upgrade wsmp on this node to use browser terminals.",
+    "limit": "Terminal limit reached. End a session and try again.",
+    "invalid": "The relay refused this terminal request.",
+    "ticket_invalid": "This terminal link expired or was already used. Open the terminal again.",
+    "declined": "The terminal was declined on the node.",
+    "bad_handshake": "The secure handshake with the node failed.",
+    "other": "The terminal was refused ({{reason}})."
+  }
 }

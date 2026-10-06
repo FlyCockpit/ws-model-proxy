@@ -97,7 +97,12 @@ export type TerminalClientMessage =
       type: "open";
       /** Echoed by the `opening` answer and by any refusal of this frame. */
       requestId: string;
-      cliDeviceId: string;
+      /**
+       * One-use ticket from `nodes.terminals.openTicket` / `nodes.queued.run`. It names the node
+       * and the terminal id; the relay refuses it (`ticket_invalid`) once used, after 60 s, or
+       * from another session.
+       */
+      ticket: string;
       cols: number;
       rows: number;
       publicKey: string;
@@ -424,6 +429,17 @@ export function parseTerminalServerMessage(value: unknown): TerminalServerMessag
     default:
       return null;
   }
+}
+
+/**
+ * Whether a command can be typed into a shell for a person to confirm: one line of printable
+ * ASCII. A newline would run it (or part of it) before anyone pressed Enter, and a tab or
+ * escape would drive the shell's line editor. Characters past ASCII are refused too: readline
+ * in a C locale reads their bytes as Meta keys (M-C-e is shell-expand-line) or strips the high
+ * bit, which turns 0x8A / 0x8D into LF / CR. Anything else is shown for the person to copy.
+ */
+export function typableCommand(command: string): boolean {
+  return /^[\x20-\x7e]+$/.test(command);
 }
 
 /** Clamp a terminal axis to the protocol range, or reject a non-positive value. */

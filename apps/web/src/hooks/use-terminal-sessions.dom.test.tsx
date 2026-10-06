@@ -77,6 +77,8 @@ vi.mock("@/hooks/use-terminal-crypto", async (importOriginal) => {
 const TERMINAL_ID = "dGVybWluYWwtaWQtMDAwMQ";
 const VIEWER_ID = "dmlld2VyLWlkLTAwMDAwMQ";
 const CLI_ID = "cli-1";
+/** A terminal ticket as `nodes.terminals.openTicket` returns it. */
+const TICKET = "dGlja2V0LXRpY2tldC10aWNrZXQtdGlja2V0LXRpY2s";
 const CLI_SLUG = "desk-01";
 const decoder = new TextDecoder();
 
@@ -111,7 +113,7 @@ function sentOfType<T extends TerminalClientMessage["type"]>(type: T) {
     .filter((entry): entry is Extract<TerminalClientMessage, { type: T }> => entry.type === type);
 }
 
-/** `openCli` first asks for a fresh CLI list; answer it as the relay would. */
+/** `openTicket` first asks for a fresh CLI list; answer it as the relay would. */
 async function openAfterList(open: () => void, clis: ListedCli[]) {
   const before = sentOfType("list").length;
   act(open);
@@ -635,7 +637,10 @@ describe("useTerminalSessions End session until the relay confirms", () => {
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     const listed = await listedCli(currentCli);
     message({ type: "terminals", clis: [listed], terminals: [] });
-    await openAfterList(() => view.result.current.openCli(CLI_ID), [listed]);
+    await openAfterList(
+      () => view.result.current.openTicket({ cliDeviceId: CLI_ID, ticket: TICKET }),
+      [listed],
+    );
     await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
     const open = sentOfType("open")[0];
     message({
@@ -665,7 +670,10 @@ describe("useTerminalSessions End session until the relay confirms", () => {
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     const listed = await listedCli(currentCli);
     message({ type: "terminals", clis: [listed], terminals: [] });
-    await openAfterList(() => view.result.current.openCli(CLI_ID), [listed]);
+    await openAfterList(
+      () => view.result.current.openTicket({ cliDeviceId: CLI_ID, ticket: TICKET }),
+      [listed],
+    );
     await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
     message({
       type: "opening",
@@ -694,7 +702,10 @@ describe("useTerminalSessions End session until the relay confirms", () => {
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     const listed = await listedCli(currentCli);
     message({ type: "terminals", clis: [listed], terminals: [] });
-    await openAfterList(() => view.result.current.openCli(CLI_ID), [listed]);
+    await openAfterList(
+      () => view.result.current.openTicket({ cliDeviceId: CLI_ID, ticket: TICKET }),
+      [listed],
+    );
     await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
     message({
       type: "opening",
@@ -731,9 +742,15 @@ describe("useTerminalSessions open refused before the relay read it", () => {
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     const listed = await listedCli(currentCli);
     message({ type: "terminals", clis: [listed], terminals: [] });
-    await openAfterList(() => view.result.current.openCli(CLI_ID), [listed]);
+    await openAfterList(
+      () => view.result.current.openTicket({ cliDeviceId: CLI_ID, ticket: TICKET }),
+      [listed],
+    );
     await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
-    await openAfterList(() => view.result.current.openCli(CLI_ID), [listed]);
+    await openAfterList(
+      () => view.result.current.openTicket({ cliDeviceId: CLI_ID, ticket: TICKET }),
+      [listed],
+    );
     await waitFor(() => expect(sentOfType("open")).toHaveLength(2));
     const [refused, kept] = view.result.current.tabs;
     if (!refused || !kept) throw new Error("no tabs");
@@ -762,6 +779,8 @@ describe("useTerminalSessions open refused before the relay read it", () => {
     await waitFor(() => expect(sentOfType("open")).toHaveLength(3), { timeout: 3000 });
     const third = sentOfType("open")[2];
     expect(third?.requestId).not.toBe(first?.requestId);
+    // Refused unread, the ticket was not used: the retry sends it again.
+    expect(third?.ticket).toBe(TICKET);
     // An open refused as invalid rejects its tab instead.
     message({
       type: "error",
@@ -789,7 +808,10 @@ describe("useTerminalSessions frames a full socket queue refused", () => {
       if (refuse && (entry.type === "open" || entry.type === "attach")) return "full";
       return "sent";
     });
-    await openAfterList(() => view.result.current.openCli(CLI_ID), [listed]);
+    await openAfterList(
+      () => view.result.current.openTicket({ cliDeviceId: CLI_ID, ticket: TICKET }),
+      [listed],
+    );
     await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
     expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening", terminalId: null });
     refuse = false;
@@ -833,9 +855,15 @@ describe("useTerminalSessions open closed before its acknowledgement", () => {
     message({ type: "terminals", clis: [listed], terminals: [] });
     // Acks match opens in send order, and key generation can finish in either
     // order, so send the first open before starting the second.
-    await openAfterList(() => view.result.current.openCli(CLI_ID), [listed]);
+    await openAfterList(
+      () => view.result.current.openTicket({ cliDeviceId: CLI_ID, ticket: TICKET }),
+      [listed],
+    );
     await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
-    await openAfterList(() => view.result.current.openCli(CLI_ID), [listed]);
+    await openAfterList(
+      () => view.result.current.openTicket({ cliDeviceId: CLI_ID, ticket: TICKET }),
+      [listed],
+    );
     await waitFor(() => expect(sentOfType("open")).toHaveLength(2));
     const [closed, kept] = view.result.current.tabs;
     if (!closed || !kept) throw new Error("no tabs");
@@ -1313,7 +1341,10 @@ describe("useTerminalSessions terminals gone while disconnected", () => {
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     act(() => handlers().onOpen?.());
     message({ type: "terminals", clis: [listed], terminals: [] });
-    await openAfterList(() => view.result.current.openCli(CLI_ID), [listed]);
+    await openAfterList(
+      () => view.result.current.openTicket({ cliDeviceId: CLI_ID, ticket: TICKET }),
+      [listed],
+    );
     await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
 
     // A new socket asks for the list, then the relay acknowledges the open.
@@ -1337,7 +1368,7 @@ describe("useTerminalSessions CLI list refresh", () => {
     // Connected before the CLI came online: the relay listed no CLIs.
     message({ type: "terminals", clis: [], terminals: [] });
 
-    act(() => view.result.current.openCli(CLI_ID));
+    act(() => view.result.current.openTicket({ cliDeviceId: CLI_ID, ticket: TICKET }));
     await waitFor(() => expect(sentOfType("list")).toHaveLength(1));
     // Nothing opens until the fresh list arrives.
     expect(sentOfType("open")).toEqual([]);
@@ -1826,5 +1857,134 @@ describe("useTerminalSessions (agent requests)", () => {
     act(() => view.result.current.detachTab(localId));
     expect(sentOfType("detach")).toHaveLength(1);
     expect(view.result.current.tabs[0]).toMatchObject({ localId, phase: "waiting" });
+  });
+});
+
+describe("useTerminalSessions terminal tickets", () => {
+  /** Plays the relay and CLI side of an open: `opening`, then `opened` with derived keys. */
+  async function openAsCli(): Promise<Cli> {
+    const open = await waitFor(() => {
+      const entry = sentOfType("open")[0];
+      if (!entry) throw new Error("no open");
+      return entry;
+    });
+    message({
+      type: "opening",
+      terminalId: TERMINAL_ID,
+      viewerId: VIEWER_ID,
+      requestId: open.requestId,
+    });
+    const cli = requireCli().ecdh;
+    const cliNonce = crypto.getRandomValues(new Uint8Array(16));
+    const browserPublicRaw = base64UrlToBytes(open.publicKey);
+    const keys = await deriveTerminalSessionKeysV2({
+      browserPrivateKey: cli.privateKey,
+      cliPublicKey: await importEcdhPublicRaw(browserPublicRaw),
+      browserNonce: base64UrlToBytes(open.nonce),
+      cliNonce,
+      terminalId: TERMINAL_ID,
+      cliPublicRaw: cli.publicKeyRaw,
+      browserPublicRaw,
+      viewerId: VIEWER_ID,
+    });
+    message({
+      type: "opened",
+      terminalId: TERMINAL_ID,
+      cliPublicKey: bytesToBase64Url(cli.publicKeyRaw),
+      cliNonce: bytesToBase64Url(cliNonce),
+    });
+    return { keys, unicastSeq: 0n, viewerId: VIEWER_ID };
+  }
+
+  async function openWith(typedCommand?: string) {
+    currentCli = await fakeCli();
+    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+    const listed = await listedCli(currentCli);
+    message({ type: "terminals", clis: [listed], terminals: [] });
+    await openAfterList(
+      () =>
+        view.result.current.openTicket({
+          cliDeviceId: CLI_ID,
+          ticket: TICKET,
+          ...(typedCommand !== undefined ? { typedCommand } : {}),
+        }),
+      [listed],
+    );
+    return view;
+  }
+
+  it("redeems the ticket in its open instead of naming the node", async () => {
+    await openWith();
+    await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
+    const [open] = sentOfType("open");
+    expect(open).toMatchObject({ type: "open", ticket: TICKET });
+    expect(open).not.toHaveProperty("cliDeviceId");
+  });
+
+  it("types the queued command once the shell shows output, without a newline, once", async () => {
+    const view = await openWith("nvidia-smi -L");
+    const cli = await openAsCli();
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    // Nothing is typed before the shell printed anything.
+    await settle();
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+    await unicast(cli, text("$ "));
+    await waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(1));
+    await unicast(cli, text("more output"));
+    await settle();
+    expect(await browserFrames(cli)).toEqual([{ seq: 1, data: "nvidia-smi -L" }]);
+  });
+
+  it("types only once the shell's output has been quiet for a moment", async () => {
+    const view = await openWith("nvidia-smi -L");
+    const cli = await openAsCli();
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    useFakeClock();
+    await unicast(cli, text("Welcome to desk-01\n"));
+    await settle();
+    await advanceClock(200);
+    // More output restarts the quiet period.
+    await unicast(cli, text("$ "));
+    await settle();
+    await advanceClock(200);
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+    await advanceClock(150);
+    await vi.waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(1));
+    expect(await browserFrames(cli)).toEqual([{ seq: 1, data: "nvidia-smi -L" }]);
+  });
+
+  it.each([
+    ["a newline", "echo one\nrm -rf ~/scratch"],
+    ["a tab", "ls\t-la"],
+    ["text past ASCII", "echo 'héllo'"],
+  ])("never types a command that holds %s", async (_label, command) => {
+    const view = await openWith(command);
+    const cli = await openAsCli();
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    useFakeClock();
+    await unicast(cli, text("$ "));
+    await settle();
+    await advanceClock(1_000);
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+  });
+
+  it("rejects the tab when the relay refuses its ticket, and never sends it again", async () => {
+    const view = await openWith();
+    await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
+    message({
+      type: "error",
+      terminalId: null,
+      requestId: sentOfType("open")[0]?.requestId,
+      code: "ticket_invalid",
+      message: "",
+    });
+    expect(view.result.current.tabs[0]).toMatchObject({
+      phase: "rejected",
+      rejectionReason: "ticket_invalid",
+    });
+    // A new socket restarts pending opens; this one has no ticket left to send.
+    act(() => handlers().onOpen?.());
+    await settle();
+    expect(sentOfType("open")).toHaveLength(1);
   });
 });
