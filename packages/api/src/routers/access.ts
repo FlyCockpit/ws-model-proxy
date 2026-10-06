@@ -26,6 +26,7 @@ import { env } from "@ws-model-proxy/env/server";
 import type { Context } from "../context";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import { accessContract as c } from "../contracts/access";
+import { runAccessTransaction } from "../lib/access-transaction";
 import {
   agentTokenSelect,
   agentTokenView,
@@ -44,7 +45,9 @@ import { runSerializableTransaction } from "../lib/serializable-transaction";
 import {
   generateShareInviteToken,
   pendingInviteWhere,
+  SHARE_INVITE_MAX_LIFETIME_MS,
   SHARE_INVITE_MAX_PENDING_PER_OWNER,
+  SHARE_INVITE_RESEND_COOLDOWN_MS,
   SHARE_INVITE_TTL_MS,
   sendShareInviteEmail,
   shareInviteDigest,
@@ -153,7 +156,16 @@ const apiKeys = {
     const expiresAt = parseFutureExpiry(input.expiresAt, now, API_KEY_MAX_TTL_MS);
     const poolIds = [...new Set(input.poolIds)];
     const secret = generateProductCredentialSecret("apiKey");
-    const row = await runSerializableTransaction(async (tx) => {
+    // api_key_pool rows need the fence of each pool's owner too (shared pools).
+    const poolOwners =
+      input.scope === "SELECTED_POOLS"
+        ? await prisma.pool.findMany({
+            where: { id: { in: poolIds } },
+            select: { userId: true },
+          })
+        : [];
+    const owners = [userId, ...poolOwners.map((pool) => pool.userId)];
+    const row = await runAccessTransaction({ owners }, async (tx) => {
       const active = await tx.apiKey.count({ where: { userId, ...activeWhere(now) } });
       if (active >= API_KEY_MAX_ACTIVE_PER_USER) {
         throw new ORPCError("CONFLICT", {
@@ -434,11 +446,30 @@ async function writeInvite(
   const token = generateShareInviteToken();
   const tokenDigest = shareInviteDigest(token);
   const expiresAt = new Date(now.getTime() + SHARE_INVITE_TTL_MS);
-  const row = await runSerializableTransaction(async (tx) => {
+  const row = await runAccessTransaction({ owners: [args.ownerUserId] }, async (tx) => {
     if (args.mode === "resend") {
+      const invite = await tx.shareInvite.findFirst({
+        where: { id: args.inviteId, ownerUserId: args.ownerUserId, ...pendingInviteWhere(now) },
+        select: { createdAt: true, updatedAt: true },
+      });
+      if (!invite) throw notFound();
+      if (now.getTime() - invite.updatedAt.getTime() < SHARE_INVITE_RESEND_COOLDOWN_MS) {
+        throw new ORPCError("CONFLICT", {
+          message: "This invite was just sent. Wait a minute before sending it again.",
+          data: { reason: "rate_limited" },
+        });
+      }
+      // An invite lives at most 30 days from its creation (share_invite_shape).
+      const latest = invite.createdAt.getTime() + SHARE_INVITE_MAX_LIFETIME_MS;
+      const rotatedExpiry = new Date(Math.min(expiresAt.getTime(), latest));
+      if (rotatedExpiry.getTime() - now.getTime() < 86_400_000) {
+        throw new ORPCError("CONFLICT", {
+          message: "This invite is too old to resend. Withdraw it and invite again.",
+        });
+      }
       const rotated = await tx.shareInvite.updateMany({
         where: { id: args.inviteId, ownerUserId: args.ownerUserId, ...pendingInviteWhere(now) },
-        data: { tokenDigest, expiresAt, emailSentAt: null },
+        data: { tokenDigest, expiresAt: rotatedExpiry, emailSentAt: null },
       });
       if (rotated.count !== 1) throw notFound();
       return tx.shareInvite.findUniqueOrThrow({
@@ -463,21 +494,32 @@ async function writeInvite(
         message: "Too many pending invites. Withdraw some before inviting more people.",
       });
     }
-    return tx.shareInvite.create({
-      data: {
-        poolId: args.poolId,
-        ownerUserId: args.ownerUserId,
-        email: args.email,
-        tokenDigest,
-        canUse: args.settings.canUse,
-        canContribute: args.settings.canContribute,
-        priorityClass: args.settings.priorityClass,
-        expiresAt,
-      },
-      select: shareInviteSelect,
-    });
+    return tx.shareInvite
+      .create({
+        data: {
+          poolId: args.poolId,
+          ownerUserId: args.ownerUserId,
+          email: args.email,
+          tokenDigest,
+          canUse: args.settings.canUse,
+          canContribute: args.settings.canContribute,
+          priorityClass: args.settings.priorityClass,
+          expiresAt,
+        },
+        select: shareInviteSelect,
+      })
+      .catch((error: unknown) => {
+        // Until pending-only uniqueness lands, an earlier accepted/revoked/expired row for
+        // the same pool and e-mail blocks a new invite.
+        if (isUniqueViolation(error)) {
+          throw new ORPCError("CONFLICT", {
+            message: "This e-mail was invited to this pool before. Try again later.",
+          });
+        }
+        throw error;
+      });
   });
-  return { row, token, expiresAt };
+  return { row, token, expiresAt: row.expiresAt };
 }
 
 /** E-mails the invite; returns the view and, only when no e-mail went out, the link. */
@@ -549,10 +591,13 @@ const shares = {
     if (email === context.session.user.email.trim().toLowerCase()) {
       throw badRequest("You already own this pool.");
     }
-    const grantee = await prisma.user.findFirst({
+    const account = await prisma.user.findFirst({
       where: { email: { equals: email, mode: "insensitive" } },
-      select: { id: true },
+      select: { id: true, emailVerified: true },
     });
+    // Only an account whose e-mail is verified gets the share directly; anyone else proves
+    // the address through the invite (verification or the invite link).
+    const grantee = account?.emailVerified ? account : null;
     if (!grantee) {
       if (input.monthlyCap !== null || input.protectionPercent !== null) {
         throw badRequest(
@@ -579,7 +624,7 @@ const shares = {
     if (grantee.id === ownerUserId) throw badRequest("You already own this pool.");
     let shareId: string;
     try {
-      shareId = await prisma.$transaction(async (tx) => {
+      shareId = await runAccessTransaction({ owners: [ownerUserId, grantee.id] }, async (tx) => {
         const share = await tx.share.create({
           data: {
             poolId: pool.id,
@@ -620,7 +665,15 @@ const shares = {
     const ownerUserId = userIdOf(context);
     const share = await prisma.share.findFirst({
       where: { id: input.shareId, ownerUserId },
-      select: { id: true, canUse: true, canContribute: true, SpendCap: { select: { id: true } } },
+      select: {
+        id: true,
+        poolId: true,
+        granteeUserId: true,
+        canUse: true,
+        canContribute: true,
+        priorityClass: true,
+        SpendCap: { select: { id: true } },
+      },
     });
     if (!share) throw notFound();
     const canUse = input.canUse ?? share.canUse;
@@ -628,7 +681,15 @@ const shares = {
     if (!canUse && !canContribute) {
       throw badRequest("A share needs can use, can contribute, or both. Delete it instead.");
     }
-    await prisma.$transaction(async (tx) => {
+    const policyChanged =
+      canUse !== share.canUse ||
+      canContribute !== share.canContribute ||
+      (input.priorityClass !== undefined && input.priorityClass !== share.priorityClass);
+    const fenced = {
+      owners: [ownerUserId, share.granteeUserId],
+      ...(policyChanged ? { policyPoolId: share.poolId } : {}),
+    };
+    await runAccessTransaction(fenced, async (tx) => {
       await tx.share.update({
         where: { id: share.id },
         data: {
@@ -666,6 +727,14 @@ const shares = {
         }
       }
     });
+    if (share.canUse && !canUse) {
+      await notifyRevoked(context, {
+        kind: "share",
+        ownerUserId,
+        granteeUserId: share.granteeUserId,
+        poolId: share.poolId,
+      });
+    }
     return loadShareView(share.id);
   }),
 
@@ -677,7 +746,9 @@ const shares = {
       select: { id: true, poolId: true, ownerUserId: true, granteeUserId: true },
     });
     if (!share) throw notFound();
-    await prisma.share.deleteMany({ where: { id: share.id } });
+    await runAccessTransaction({ owners: [share.ownerUserId, share.granteeUserId] }, (tx) =>
+      tx.share.deleteMany({ where: { id: share.id } }),
+    );
     await notifyRevoked(context, {
       kind: "share",
       ownerUserId: share.ownerUserId,

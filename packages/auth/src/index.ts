@@ -22,11 +22,18 @@ import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
-import { acceptShareInvitesForVerifiedEmail } from "./share-invite-acceptance";
+import {
+  acceptShareInvitesForVerifiedEmail,
+  isEmailVerificationPath,
+} from "./share-invite-acceptance";
 import { resolveSignupLocale } from "./signup-locale";
 import { getSignupAccessState, resolveBootstrapAdminIdentity } from "./signup-policy";
 import { notifyUserBanned } from "./user-ban-listeners";
-import { resolveUserCreatePolicy, toUserCreatePolicyInput } from "./user-create-policy";
+import {
+  isAdminCreateUserPath,
+  resolveUserCreatePolicy,
+  toUserCreatePolicyInput,
+} from "./user-create-policy";
 import {
   mapSessionRefusalToForbidden,
   refuseAdminRestoreOfDeletingUser,
@@ -379,7 +386,12 @@ export const auth = betterAuth({
           };
         },
         // Pending share invites to this e-mail become shares once the e-mail is proven.
-        after: async (user) => {
+        after: async (user, context) => {
+          // An admin-created account's e-mail is marked verified without proof (the admin
+          // knows its temporary password), so its invites wait for the invite link.
+          if (isAdminCreateUserPath(typeof context?.path === "string" ? context.path : null)) {
+            return;
+          }
           await acceptInvitesQuietly(user);
         },
       },
@@ -389,10 +401,11 @@ export const auth = betterAuth({
         // relay work. Better Auth runs `after` once the update's transaction
         // committed. Any later update of a still-banned user notifies again;
         // the cancel is idempotent. An unban or an expired ban notifies nothing.
-        after: async (user) => {
+        after: async (user, context) => {
           if (!user) return;
-          // Verifying the e-mail (or any later update of a verified account) accepts invites.
-          await acceptInvitesQuietly(user);
+          // Verifying the e-mail accepts the invites sent to it (only on the verification
+          // routes: an admin-created account is "verified" without proof).
+          if (isEmailVerificationPath(context?.path)) await acceptInvitesQuietly(user);
           const row = user as { id: string; banned?: unknown; banExpires?: unknown };
           if (
             isUserBanned(

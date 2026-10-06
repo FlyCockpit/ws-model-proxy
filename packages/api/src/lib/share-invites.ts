@@ -18,6 +18,10 @@ const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 export const SHARE_INVITE_TOKEN_PATTERN = /^wsmp_inv_[A-Z2-7]{26}$/;
 /** How long an invite link works (the hardening allows at most 30 days). */
 export const SHARE_INVITE_TTL_MS = 14 * 86_400_000;
+/** The hardening's bound: an invite expires at most 30 days after it was created. */
+export const SHARE_INVITE_MAX_LIFETIME_MS = 30 * 86_400_000;
+/** One resend per invite per minute (each one can send an e-mail). */
+export const SHARE_INVITE_RESEND_COOLDOWN_MS = 60_000;
 /** Pending invites one owner may have at once (each one can send an e-mail). */
 export const SHARE_INVITE_MAX_PENDING_PER_OWNER = 50;
 

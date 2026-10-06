@@ -9,11 +9,19 @@ const db = vi.hoisted(() => ({
   share: { findUnique: vi.fn(), create: vi.fn() },
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
+const lockOrder = vi.hoisted(() => ({
+  fenceOwners: vi.fn(async () => undefined),
+  runCapacityOrderedTransaction: vi.fn(
+    async (client: unknown, work: (tx: unknown) => Promise<unknown>) => work(client),
+  ),
+}));
+vi.mock("@ws-model-proxy/db/capacity-lock-order", () => lockOrder);
 
 import { credentialDigest } from "@ws-model-proxy/db/node-security";
 import {
   acceptShareInviteByToken,
   acceptShareInvitesForVerifiedEmail,
+  isEmailVerificationPath,
 } from "./share-invite-acceptance";
 
 const invite = {
@@ -50,7 +58,9 @@ describe("accepting share invites", () => {
   });
 
   it("creates the share for a verified e-mail and marks the invite accepted", async () => {
-    db.shareInvite.findMany.mockResolvedValue([invite]);
+    db.shareInvite.findMany
+      .mockResolvedValueOnce([{ ownerUserId: "owner" }])
+      .mockResolvedValueOnce([invite]);
     db.share.findUnique.mockResolvedValue(null);
     db.share.create.mockResolvedValue({ id: "share1" });
     db.shareInvite.updateMany.mockResolvedValue({ count: 1 });
@@ -74,7 +84,9 @@ describe("accepting share invites", () => {
   });
 
   it("rolls back when the invite was revoked meanwhile", async () => {
-    db.shareInvite.findMany.mockResolvedValue([invite]);
+    db.shareInvite.findMany
+      .mockResolvedValueOnce([{ ownerUserId: "owner" }])
+      .mockResolvedValueOnce([invite]);
     db.share.findUnique.mockResolvedValue(null);
     db.share.create.mockResolvedValue({ id: "share1" });
     db.shareInvite.updateMany.mockResolvedValue({ count: 0 });
@@ -92,5 +104,12 @@ describe("accepting share invites", () => {
       email: "friend@example.test",
     });
     await expect(acceptShareInviteByToken(user, "not-a-token")).resolves.toBe(false);
+  });
+
+  it("proves an e-mail only on the verification routes", () => {
+    expect(isEmailVerificationPath("/verify-email")).toBe(true);
+    expect(isEmailVerificationPath("/email-otp/verify-email")).toBe(true);
+    expect(isEmailVerificationPath("/admin/update-user")).toBe(false);
+    expect(isEmailVerificationPath(undefined)).toBe(false);
   });
 });

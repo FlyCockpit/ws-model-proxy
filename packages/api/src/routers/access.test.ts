@@ -111,6 +111,24 @@ const shareRow = {
   _count: { Contributed: 0 },
 };
 
+const inviteRow = {
+  id: "inv1",
+  poolId: "pool1",
+  email: "friend@example.test",
+  canUse: true,
+  canContribute: false,
+  priorityClass: null,
+  createdAt: now,
+  expiresAt: now,
+  emailSentAt: null,
+  Pool: { slug: "chat", User: { slug: "owner" } },
+};
+
+/** Every fence requested through `wsmp_acquire_fences`, in request order. */
+function heldFences(): string[] {
+  return db.$queryRaw.mock.calls.flatMap((call) => (Array.isArray(call[1]) ? call[1] : []));
+}
+
 function inTransaction() {
   db.$transaction.mockImplementation(async (arg: unknown) => {
     if (typeof arg === "function") return (arg as (tx: typeof db) => unknown)(db);
@@ -208,7 +226,7 @@ describe("API keys", () => {
 
   it("refuses pools the caller may not use", async () => {
     db.apiKey.count.mockResolvedValue(0);
-    db.pool.findMany.mockResolvedValue([{ id: "mine" } as never]);
+    db.pool.findMany.mockResolvedValue([{ id: "mine", userId: "owner" } as never]);
     await expect(
       client().apiKeys.create({
         name: "x",
@@ -339,6 +357,28 @@ describe("agent tokens", () => {
   });
 });
 
+describe("OAuth connections", () => {
+  it("never disconnects an agent token's grant or another person's grant", async () => {
+    db.mcpGrant.findFirst.mockResolvedValueOnce({
+      id: "g1",
+      clientId: "pat:tok1",
+      revokedAt: null,
+    } as never);
+    await expect(client().oauthGrants.revoke({ grantId: "g1" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+    db.mcpGrant.findFirst.mockResolvedValueOnce(null);
+    await expect(client().oauthGrants.revoke({ grantId: "theirs" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+    expect(db.mcpGrant.findFirst.mock.calls[1]?.[0]?.where).toEqual({
+      id: "theirs",
+      userId: "owner",
+    });
+    expect(db.mcpGrant.updateMany).not.toHaveBeenCalled();
+  });
+});
+
 describe("shares", () => {
   const input = {
     poolId: "pool1",
@@ -361,9 +401,9 @@ describe("shares", () => {
     expect(db.pool.findFirst.mock.calls[0]?.[0]?.where).toEqual({ id: "pool1", userId: "owner" });
   });
 
-  it("shares directly with an existing account", async () => {
+  it("shares directly with a verified account, under both owners' fences", async () => {
     db.pool.findFirst.mockResolvedValue(pool as never);
-    db.user.findFirst.mockResolvedValue({ id: "friend" } as never);
+    db.user.findFirst.mockResolvedValue({ id: "friend", emailVerified: true } as never);
     db.share.create.mockResolvedValue({ id: "share1" } as never);
     db.share.findUnique.mockResolvedValue(shareRow as never);
     const result = await client().shares.create(input);
@@ -377,6 +417,18 @@ describe("shares", () => {
     expect(db.user.findFirst.mock.calls[0]?.[0]?.where).toEqual({
       email: { equals: "friend@example.test", mode: "insensitive" },
     });
+    expect(heldFences()).toEqual(["00:owner:friend", "00:owner:owner"]);
+  });
+
+  it("invites an unverified account instead of sharing directly", async () => {
+    db.pool.findFirst.mockResolvedValue(pool as never);
+    db.user.findFirst.mockResolvedValue({ id: "squatter", emailVerified: false } as never);
+    db.shareInvite.findFirst.mockResolvedValue(null);
+    db.shareInvite.count.mockResolvedValue(0);
+    db.shareInvite.create.mockResolvedValue(inviteRow as never);
+    const result = await client().shares.create(input);
+    expect(result.kind).toBe("invite");
+    expect(db.share.create).not.toHaveBeenCalled();
   });
 
   it("invites an unknown e-mail: token hashed, link shown once when no e-mail is sent", async () => {
@@ -476,6 +528,10 @@ describe("shares", () => {
 
   it("rotates an invite's token on resend (the old link stops working)", async () => {
     db.user.findUnique.mockResolvedValue({ name: "Owner", locale: "en-US" } as never);
+    db.shareInvite.findFirst.mockResolvedValue({
+      createdAt: new Date(Date.now() - 86_400_000),
+      updatedAt: new Date(Date.now() - 86_400_000),
+    } as never);
     db.shareInvite.updateMany.mockResolvedValue({ count: 1 });
     db.shareInvite.findUniqueOrThrow.mockResolvedValue({
       id: "inv1",
@@ -494,6 +550,101 @@ describe("shares", () => {
     const call = db.shareInvite.updateMany.mock.calls[0]?.[0];
     expect(call?.where).toMatchObject({ id: "inv1", ownerUserId: "owner", acceptedAt: null });
     expect(call?.data).toMatchObject({ tokenDigest: credentialDigest("shareInvite", token) });
+    // Never past 30 days from the invite's creation.
+    const expiry = (call?.data as { expiresAt: Date } | undefined)?.expiresAt.getTime() ?? 0;
+    expect(expiry).toBeLessThanOrEqual(Date.now() - 86_400_000 + 30 * 86_400_000);
+  });
+
+  it("refuses a resend within a minute of the last one", async () => {
+    db.user.findUnique.mockResolvedValue({ name: "Owner", locale: "en-US" } as never);
+    db.shareInvite.findFirst.mockResolvedValue({
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as never);
+    await expect(client().invites.resend({ inviteId: "inv1" })).rejects.toMatchObject({
+      code: "CONFLICT",
+    });
+    expect(db.shareInvite.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("resends and withdraws only the caller's own invites", async () => {
+    db.user.findUnique.mockResolvedValue({ name: "Owner", locale: "en-US" } as never);
+    db.shareInvite.findFirst.mockResolvedValue(null);
+    await expect(client().invites.resend({ inviteId: "theirs" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+    await expect(client().invites.revoke({ inviteId: "theirs" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+    for (const call of db.shareInvite.findFirst.mock.calls)
+      expect(call[0]?.where).toMatchObject({ ownerUserId: "owner" });
+  });
+
+  it("deletes only a share the caller owns or holds", async () => {
+    db.share.findFirst.mockResolvedValue(null);
+    await expect(client().shares.delete({ shareId: "other" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+    expect(db.share.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      id: "other",
+      OR: [{ ownerUserId: "owner" }, { granteeUserId: "owner" }],
+    });
+    expect(db.share.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("sets an own key only from the share holder's own provider models", async () => {
+    db.share.findFirst.mockResolvedValue({
+      id: "share1",
+      ownKeyProtocolAdaptation: false,
+      Pool: { Fallback: { ownKeyEquivalentModel: "openai/gpt" } },
+    } as never);
+    db.providerModel.findFirst.mockResolvedValue(null);
+    await expect(
+      client().shares.setOwnKey({ shareId: "share1", providerModelId: "someone-elses" }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.share.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      id: "share1",
+      granteeUserId: "owner",
+    });
+    expect(db.providerModel.findFirst.mock.calls[0]?.[0]?.where).toMatchObject({
+      id: "someone-elses",
+      userId: "owner",
+    });
+    expect(db.share.update).not.toHaveBeenCalled();
+  });
+
+  it("takes the pool's capacity-policy fences when a permission changes", async () => {
+    db.share.findFirst.mockResolvedValue({
+      id: "share1",
+      poolId: "pool1",
+      granteeUserId: "friend",
+      canUse: true,
+      canContribute: false,
+      priorityClass: null,
+      SpendCap: null,
+    } as never);
+    db.poolMember.findMany.mockResolvedValue([
+      { runtimeModelId: "rm1", providerModelId: null },
+    ] as never);
+    db.executionTarget.findMany.mockResolvedValue([{ id: "target1" }] as never);
+    db.share.findUnique.mockResolvedValue(shareRow as never);
+    const onAccessRevoked = vi.fn(async () => undefined);
+    await client(PERSON, { onAccessRevoked }).shares.update({
+      shareId: "share1",
+      canUse: false,
+      canContribute: true,
+    });
+    expect(heldFences()).toEqual([
+      "00:owner:friend",
+      "00:owner:owner",
+      "06:capacity-policy:target1",
+    ]);
+    expect(onAccessRevoked).toHaveBeenCalledWith({
+      kind: "share",
+      ownerUserId: "owner",
+      granteeUserId: "friend",
+      poolId: "pool1",
+    });
   });
 });
 

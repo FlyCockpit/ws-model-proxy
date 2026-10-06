@@ -11,6 +11,7 @@
  *   this call and lets that sign-up through while open sign-up is off.
  */
 import prisma, { type Prisma } from "@ws-model-proxy/db";
+import { fenceOwners, runCapacityOrderedTransaction } from "@ws-model-proxy/db/capacity-lock-order";
 import { credentialDigest } from "@ws-model-proxy/db/node-security";
 
 type Tx = Prisma.TransactionClient;
@@ -74,9 +75,20 @@ export async function acceptShareInvitesForVerifiedEmail(
   if (!options.emailConfigured || !user.emailVerified) return 0;
   const now = options.now ?? new Date();
   const email = user.email.trim().toLowerCase();
-  return prisma.$transaction(async (tx) => {
+  const where = { email, ...pendingWhere(now) };
+  const owners = await prisma.shareInvite.findMany({
+    where,
+    select: { ownerUserId: true },
+    distinct: ["ownerUserId"],
+  });
+  if (owners.length === 0) return 0;
+  const ownerIds = owners.map((row) => row.ownerUserId);
+  // Share and invite writes need the owner fences of both people, before the first write.
+  return runCapacityOrderedTransaction(prisma, async (tx) => {
+    await fenceOwners(tx, [user.id, ...ownerIds]);
+    // Invites from owners not fenced here (sent meanwhile) wait for the next proof.
     const invites = await tx.shareInvite.findMany({
-      where: { email, ...pendingWhere(now) },
+      where: { ...where, ownerUserId: { in: ownerIds } },
       select: inviteSelect,
     });
     let created = 0;
@@ -96,13 +108,23 @@ export async function acceptShareInviteByToken(
 ): Promise<boolean> {
   if (!/^wsmp_inv_[A-Z2-7]{26}$/.test(token)) return false;
   const email = user.email.trim().toLowerCase();
-  return prisma.$transaction(async (tx) => {
-    const invite = await tx.shareInvite.findFirst({
-      where: { tokenDigest: credentialDigest("shareInvite", token), email, ...pendingWhere(now) },
-      select: inviteSelect,
-    });
+  const where = {
+    tokenDigest: credentialDigest("shareInvite", token),
+    email,
+    ...pendingWhere(now),
+  };
+  const found = await prisma.shareInvite.findFirst({ where, select: { ownerUserId: true } });
+  if (!found) return false;
+  return runCapacityOrderedTransaction(prisma, async (tx) => {
+    await fenceOwners(tx, [user.id, found.ownerUserId]);
+    const invite = await tx.shareInvite.findFirst({ where, select: inviteSelect });
     if (!invite) return false;
     await acceptOne(tx, invite, user.id, now);
     return true;
   });
+}
+
+/** Better Auth routes that prove an e-mail (link verification and the e-mail OTP flow). */
+export function isEmailVerificationPath(path: unknown): boolean {
+  return path === "/verify-email" || path === "/email-otp/verify-email";
 }
