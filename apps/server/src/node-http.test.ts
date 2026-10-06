@@ -3,17 +3,12 @@ import { RateLimiterMemory } from "rate-limiter-flexible";
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
-  // rate-limit.ts builds its limiters at import: any RATE_LIMIT_* key reads as 60.
-  env: new Proxy(
-    { BETTER_AUTH_URL: "https://proxy.example.com/app", NODE_ENV: "test" } as Record<
-      string,
-      unknown
-    >,
-    {
-      get: (target, key) =>
-        typeof key === "string" && key.startsWith("RATE_LIMIT_") ? 60 : target[key as string],
-    },
-  ),
+  // rate-limit.ts builds its limiters at import from the built-in table.
+  env: {
+    BETTER_AUTH_URL: "https://proxy.example.com/app",
+    NODE_ENV: "test",
+    WMP_RATE_LIMIT_SCALE: 1,
+  },
 }));
 vi.mock("@ws-model-proxy/api/nodes/enroll-exchange", () => ({
   exchangeEnrollmentCode: vi.fn(),

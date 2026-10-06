@@ -646,13 +646,10 @@ Optional:
   login work and email verification is off; with SMTP configured, verification
   is required — the MCP login page follows the same behavior because it reuses
   the standard sign-in flow.
-- Rate-limit tuning: `RATE_LIMIT_MCP_POINTS` (default 120),
-  `RATE_LIMIT_MCP_DURATION` (default 60 s), `RATE_LIMIT_MCP_CONSENT_POINTS`
-  (default 30), `RATE_LIMIT_MCP_CONSENT_DURATION` (default 60 s), and the
-  whole-service registration bucket
-  `RATE_LIMIT_MCP_REGISTRATION_POINTS`/`RATE_LIMIT_MCP_REGISTRATION_DURATION`
-  (default 60 requests / 3600 s). See
-  [Rate limits](#rate-limits-process-local).
+- Rate-limit tuning: the limits are built in (`/mcp` 120 requests / 60 s,
+  consent 30 / 60 s, whole-service registration 60 / 3600 s).
+  `WMP_RATE_LIMIT_SCALE` (default 1, range 0.1–100) multiplies every budget;
+  the windows stay fixed. See [Rate limits](#rate-limits-process-local).
 
 The generated `.env.example` files track these keys
 (`pnpm env:sync` / `pnpm env:check`); do not hand-edit them.
@@ -1238,8 +1235,7 @@ minted with CLI commands, like the other CLI tools).
 ## Rate limits (process-local)
 
 - `/mcp`: an unconditional, pre-authentication IP-keyed bucket
-  (`RATE_LIMIT_MCP_POINTS`/`RATE_LIMIT_MCP_DURATION`, default 120 requests /
-  60 s), a 1 MB body cap, then — after token verification — an identity-keyed
+  (120 requests / 60 s, times `WMP_RATE_LIMIT_SCALE`), a 1 MB body cap, then — after token verification — an identity-keyed
   quota on `sub + client_id` with the same budget. Pre-auth buckets are never
   keyed by token bytes.
 - MCP OAuth endpoints (authorize, consent, continue, token, revoke,
@@ -1251,8 +1247,7 @@ minted with CLI commands, like the other CLI tools).
   not both). Small form-body caps run before the limiters. Everything else
   under `/api/auth/*` keeps the general auth limiter.
 - The RFC 7591 register endpoint has its own **whole-service** bucket
-  (`RATE_LIMIT_MCP_REGISTRATION_POINTS`/`RATE_LIMIT_MCP_REGISTRATION_DURATION`,
-  default 60 requests / 3600 s) keyed globally rather than by IP — DCR is
+  (60 requests / 3600 s, times `WMP_RATE_LIMIT_SCALE`) keyed globally rather than by IP — DCR is
   intentionally unauthenticated, so an IP key would let rotating source
   addresses persist unbounded OAuth client rows. It runs before the general
   auth limiter on that path.

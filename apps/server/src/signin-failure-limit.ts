@@ -53,7 +53,7 @@ export function signinFailureLimit(
   limiter: FailureLimiter = signinFailureLimiter,
 ): MiddlewareHandler {
   return async (c: Context, next: Next) => {
-    if (limiter.points <= 0 || c.req.method !== "POST" || !c.req.raw.body) return next();
+    if (c.req.method !== "POST" || !c.req.raw.body) return next();
 
     const parsed = await readEmail(c, FORM_OR_JSON_MEDIA_TYPES);
     if (parsed.kind !== "parsed" || !parsed.email) return next();

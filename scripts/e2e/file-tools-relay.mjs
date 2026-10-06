@@ -140,8 +140,9 @@ try {
       BETTER_AUTH_URL: serverUrl,
       SIGNUP_ENABLED: "false",
       // The supervised scenarios poll `forwarder_cli_command_result`; the default
-      // 120 requests a minute per IP would throttle a test that runs on one address.
-      RATE_LIMIT_MCP_POINTS: "100000",
+      // 120 MCP requests a minute per IP would throttle a test that runs on one
+      // address. The maximum scale lifts it to 12,000.
+      WMP_RATE_LIMIT_SCALE: "100",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

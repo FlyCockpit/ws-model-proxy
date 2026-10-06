@@ -166,7 +166,7 @@ Required production values:
 - `BETTER_AUTH_URL`: public HTTPS app URL.
 - `NODE_ENV=production`.
 
-Optional values include SMTP settings (enables verification, password reset, and email 2FA delivery), rate-limit settings (including per-recipient email caps and failed-password caps), and display/build values such as `VITE_APP_NAME`, `VITE_SERVER_URL`, and `BUILD_VERSION`. If `SIGNUP_ENABLED=false` on a fresh production database, set `ADMIN_EMAIL` to the sole operator address allowed to bootstrap its first admin. Case and surrounding whitespace are canonicalized before account creation. Prefer `pnpm generate:secrets` over hand-editing production env.
+Optional values include SMTP settings (enables verification, password reset, and email 2FA delivery), one rate-limit multiplier (`WMP_RATE_LIMIT_SCALE`, 0.1-100, scaling every built-in budget; the per-recipient email and failed-password caps are always on), and display/build values such as `VITE_APP_NAME`, `VITE_SERVER_URL`, and `BUILD_VERSION`. If `SIGNUP_ENABLED=false` on a fresh production database, set `ADMIN_EMAIL` to the sole operator address allowed to bootstrap its first admin. Case and surrounding whitespace are canonicalized before account creation. Prefer `pnpm generate:secrets` over hand-editing production env.
 
 Schema sync is handled by the server container entrypoint with `APPLY_SCHEMA=off|safe|dangerous`; keep it `off` for normal deploys and use `safe` for additive schema deploys. Each release's notes say which setting it needs; see [`docs/release-notes/`](docs/release-notes/).
 

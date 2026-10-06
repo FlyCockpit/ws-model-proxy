@@ -592,3 +592,12 @@ observed on a real deployment. After deploying:
 - [ ] Both `relay_request` rows reach a terminal state (not `PENDING`), and
       their selected execution target belongs to the pool owner.
 - [ ] Record the result on issue #92.
+
+## 0.4.0 rate limits
+
+The 21 `RATE_LIMIT_*` settings are gone and no longer read (the server warns at
+startup when one is still set). Every limit uses its built-in budget, and one
+setting, `WMP_RATE_LIMIT_SCALE` (default 1, 0.1-100), multiplies every budget;
+windows and block durations stay fixed. The per-recipient email caps and the
+failed-password cap are always on: setting their points to 0 no longer turns
+them off.

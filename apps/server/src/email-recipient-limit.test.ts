@@ -4,11 +4,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { limiter, signupLimiter } = vi.hoisted(() => ({
   limiter: {
-    points: 3,
     consume: vi.fn<(key: string) => Promise<unknown>>(),
   },
   signupLimiter: {
-    points: 6,
     consume: vi.fn<(key: string) => Promise<unknown>>(),
   },
 }));
@@ -50,10 +48,8 @@ function post(app: Hono, body: unknown) {
 }
 
 beforeEach(() => {
-  limiter.points = 3;
   limiter.consume.mockReset();
   limiter.consume.mockResolvedValue({});
-  signupLimiter.points = 6;
   signupLimiter.consume.mockReset();
   signupLimiter.consume.mockResolvedValue({});
 });
@@ -91,20 +87,6 @@ describe("signup recipient limiting", () => {
 
     expect(res.status).toBe(429);
     expect(res.headers.get("Retry-After")).toBe("45");
-  });
-
-  it("is skipped entirely when the signup budget is disabled", async () => {
-    signupLimiter.points = 0;
-    const app = buildSignupApp();
-
-    const res = await app.request(SIGNUP_RECIPIENT_PATH, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: "user@example.com", password: "hunter2" }),
-    });
-
-    expect(res.status).toBe(200);
-    expect(signupLimiter.consume).not.toHaveBeenCalled();
   });
 });
 
@@ -273,16 +255,6 @@ describe("emailRecipientLimit", () => {
 
     expect(res.status).toBe(200);
     expect(downstream()).toEqual({ email: "user@example.com" });
-  });
-
-  it("skips the limiter entirely when POINTS is 0", async () => {
-    const { app } = buildApp();
-    limiter.points = 0;
-
-    const res = await post(app, { email: "user@example.com" });
-
-    expect(res.status).toBe(200);
-    expect(limiter.consume).not.toHaveBeenCalled();
   });
 
   it("covers every anonymous endpoint that mails a caller-supplied address", () => {

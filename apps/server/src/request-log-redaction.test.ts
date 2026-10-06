@@ -16,8 +16,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     BETTER_AUTH_URL: "https://proxy.example.com",
     CORS_ORIGIN: undefined,
-    RATE_LIMIT_MCP_POINTS: 120,
-    RATE_LIMIT_MCP_DURATION: 60,
+    WMP_RATE_LIMIT_SCALE: 1,
   },
 }));
 

@@ -1,8 +1,8 @@
-import { env } from "@ws-model-proxy/env/server";
 import type { Context, MiddlewareHandler, Next } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { RateLimiterMemory } from "rate-limiter-flexible";
 import { resolveClientIp } from "./client-ip.js";
+import { DEFAULTS, scaledPoints } from "./rate-limit.js";
 
 /**
  * /mcp chain PIECES — prepared here and mounted by the /mcp route
@@ -49,20 +49,20 @@ export const MCP_IDENTITY_KEY_PREFIX = "mcp:identity:";
 // ---------------------------------------------------------------------------
 
 /**
- * Unconditional IP-keyed /mcp quota (RATE_LIMIT_MCP_POINTS /
- * RATE_LIMIT_MCP_DURATION, defaults 120/60s). PRE-auth: keyed by connection
+ * Unconditional IP-keyed /mcp quota (`DEFAULTS.mcp`, 120/60s before
+ * `WMP_RATE_LIMIT_SCALE`). PRE-auth: keyed by connection
  * IP only — see the key-domain constraint above.
  */
 export const mcpIpLimiter = new RateLimiterMemory({
   keyPrefix: MCP_IP_KEY_PREFIX,
-  points: env.RATE_LIMIT_MCP_POINTS,
-  duration: env.RATE_LIMIT_MCP_DURATION,
+  points: scaledPoints(DEFAULTS.mcp.points),
+  duration: DEFAULTS.mcp.duration,
 });
 
 /**
  * Post-auth identity-keyed /mcp quota, one bucket per verified
  * `sub + client_id` pair. Same numeric ceiling as the IP bucket
- * (RATE_LIMIT_MCP_POINTS/DURATION) so a single human on a single client
+ * (`DEFAULTS.mcp`) so a single human on a single client
  * cannot exceed the anonymous ceiling; per-identity keying additionally
  * bounds one account rotating IPs and separates concurrent clients of the
  * same user. Consume ONLY with mcpIdentityKey(sub, clientId) built from
@@ -70,8 +70,8 @@ export const mcpIpLimiter = new RateLimiterMemory({
  */
 export const mcpIdentityQuotaLimiter = new RateLimiterMemory({
   keyPrefix: MCP_IDENTITY_KEY_PREFIX,
-  points: env.RATE_LIMIT_MCP_POINTS,
-  duration: env.RATE_LIMIT_MCP_DURATION,
+  points: scaledPoints(DEFAULTS.mcp.points),
+  duration: DEFAULTS.mcp.duration,
 });
 
 // ---------------------------------------------------------------------------

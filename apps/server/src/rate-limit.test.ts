@@ -15,26 +15,11 @@ vi.mock("@ws-model-proxy/auth", () => ({
   },
 }));
 
-vi.mock("@ws-model-proxy/env/server", () => ({
-  env: {
-    RATE_LIMIT_AUTH_POINTS: 3,
-    RATE_LIMIT_AUTH_DURATION: 60,
-    RATE_LIMIT_AUTH_BLOCK_DURATION: 120,
-    RATE_LIMIT_SIGNIN_FAILURE_POINTS: 10,
-    RATE_LIMIT_SIGNIN_FAILURE_DURATION: 900,
-    RATE_LIMIT_SIGNIN_FAILURE_BLOCK_DURATION: 600,
-    RATE_LIMIT_SIGNUP_POINTS: 3,
-    RATE_LIMIT_SIGNUP_DURATION: 3600,
-    RATE_LIMIT_SIGNUP_BLOCK_DURATION: 3600,
-    RATE_LIMIT_RPC_POINTS: 5,
-    RATE_LIMIT_RPC_DURATION: 60,
-    RATE_LIMIT_EMAIL_RECIPIENT_POINTS: 3,
-    RATE_LIMIT_EMAIL_RECIPIENT_DURATION: 3600,
-    RATE_LIMIT_EMAIL_RECIPIENT_BLOCK_DURATION: 0,
-    RATE_LIMIT_SIGNUP_RECIPIENT_POINTS: 6,
-    TRUST_PROXY_HOPS: undefined,
-  },
+const envMock = vi.hoisted(() => ({
+  WMP_RATE_LIMIT_SCALE: 1,
+  TRUST_PROXY_HOPS: undefined,
 }));
+vi.mock("@ws-model-proxy/env/server", () => ({ env: envMock }));
 
 const mockGetConnInfo = vi.fn(() => ({ remote: { address: "10.0.0.1" } }));
 
@@ -54,10 +39,14 @@ vi.mock("rate-limiter-flexible", async (importOriginal) => {
 });
 
 const {
+  authLimiter,
   consumeEnrollmentExchange,
   createRateLimiterMiddleware,
-  ENROLLMENT_EXCHANGE_IP_POINTS,
-  ENROLLMENT_EXCHANGE_USER_POINTS,
+  DEFAULTS,
+  emailRecipientLimiter,
+  enrollmentExchangeIpLimiter,
+  rpcLimiter,
+  scaledPoints,
 } = await import("./rate-limit.js");
 
 // ---------------------------------------------------------------------------
@@ -300,11 +289,58 @@ describe("consumeEnrollmentExchange (node enrollment, lane A1)", () => {
   });
 
   it("leaves room for an installer's retries and a fleet behind one address", () => {
-    expect(ENROLLMENT_EXCHANGE_IP_POINTS).toBeGreaterThanOrEqual(10);
-    expect(ENROLLMENT_EXCHANGE_USER_POINTS).toBeGreaterThanOrEqual(ENROLLMENT_EXCHANGE_IP_POINTS);
+    expect(DEFAULTS.enrollmentExchangeIp.points).toBeGreaterThanOrEqual(10);
+    expect(DEFAULTS.enrollmentExchangeUser.points).toBeGreaterThanOrEqual(
+      DEFAULTS.enrollmentExchangeIp.points,
+    );
   });
 });
 
 function createHashKey(key: string): string {
   return createHash("sha256").update(key).digest("base64url");
 }
+
+describe("built-in limits and WMP_RATE_LIMIT_SCALE", () => {
+  beforeEach(() => {
+    envMock.WMP_RATE_LIMIT_SCALE = 1;
+  });
+
+  it("keeps the documented defaults", () => {
+    expect(DEFAULTS).toEqual({
+      rpc: { points: 100, duration: 60 },
+      auth: { points: 10, duration: 60, blockDuration: 900 },
+      signinFailure: { points: 10, duration: 900, blockDuration: 600 },
+      signup: { points: 3, duration: 3600, blockDuration: 3600 },
+      emailRecipient: { points: 3, duration: 3600, blockDuration: 0 },
+      signupRecipient: { points: 6, duration: 3600, blockDuration: 0 },
+      mcp: { points: 120, duration: 60 },
+      mcpConsent: { points: 30, duration: 60 },
+      mcpRegistration: { points: 60, duration: 3600 },
+      enrollmentExchangeIp: { points: 10, duration: 900 },
+      enrollmentExchangeUser: { points: 20, duration: 3600 },
+    });
+  });
+
+  it("builds every limiter from the table at scale 1", () => {
+    expect(authLimiter.points).toBe(DEFAULTS.auth.points);
+    expect(authLimiter.duration).toBe(DEFAULTS.auth.duration);
+    expect(authLimiter.blockDuration).toBe(DEFAULTS.auth.blockDuration);
+    expect(rpcLimiter.points).toBe(DEFAULTS.rpc.points);
+    expect(emailRecipientLimiter.points).toBe(DEFAULTS.emailRecipient.points);
+    expect(emailRecipientLimiter.blockDuration).toBe(0);
+    expect(enrollmentExchangeIpLimiter.points).toBe(DEFAULTS.enrollmentExchangeIp.points);
+  });
+
+  it.each([
+    [1, 3, 3],
+    [2.5, 10, 25],
+    [1.5, 3, 5],
+    [0.5, 3, 2],
+    [0.1, 3, 1],
+    [0.1, 10, 1],
+    [100, 120, 12_000],
+  ])("scale %s turns %s points into %s (rounded, never below 1)", (scale, points, expected) => {
+    envMock.WMP_RATE_LIMIT_SCALE = scale;
+    expect(scaledPoints(points)).toBe(expected);
+  });
+});

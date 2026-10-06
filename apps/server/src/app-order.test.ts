@@ -37,9 +37,8 @@ vi.mock("./relay/cli-file-ops.js", () => ({
  * control configuration the established suite way: vi.mock the env module
  * with a hoisted MUTABLE object and set `WMP_MCP_ENABLED` before each
  * createApp call (the mcp-authorize-scope-guard.test.ts / client-ip.test.ts
- * pattern). Bucket values (RATE_LIMIT_*) are never mutated: the limiters
- * capture them at import, so mutating them mid-run would recreate exactly
- * the seam inconsistency the L25 regression below exists to detect.
+ * pattern). Bucket sizes come from the built-in table in rate-limit.ts
+ * (mocked below) and are captured at import, never mutated mid-run.
  *
  * The pure unit tests for the matcher/redaction helpers and the forwarder
  * live in mcp-discovery.test.ts / mcp-oauth-rate-limit.test.ts /
@@ -57,27 +56,7 @@ const envMock = vi.hoisted(() => ({
   // CORS_ORIGIN is SET so the cors() middleware is mounted: the OPTIONS probe
   // is only meaningful if a misplaced alias would let CORS answer 204.
   CORS_ORIGIN: "https://app.example.com",
-  RATE_LIMIT_AUTH_POINTS: 500,
-  RATE_LIMIT_AUTH_DURATION: 60,
-  RATE_LIMIT_AUTH_BLOCK_DURATION: 0,
-  RATE_LIMIT_SIGNIN_FAILURE_POINTS: 10,
-  RATE_LIMIT_SIGNIN_FAILURE_DURATION: 900,
-  RATE_LIMIT_SIGNIN_FAILURE_BLOCK_DURATION: 600,
-  RATE_LIMIT_SIGNUP_POINTS: 3,
-  RATE_LIMIT_SIGNUP_DURATION: 3600,
-  RATE_LIMIT_SIGNUP_BLOCK_DURATION: 3600,
-  RATE_LIMIT_RPC_POINTS: 1000,
-  RATE_LIMIT_RPC_DURATION: 60,
-  RATE_LIMIT_EMAIL_RECIPIENT_POINTS: 3,
-  RATE_LIMIT_EMAIL_RECIPIENT_DURATION: 3600,
-  RATE_LIMIT_EMAIL_RECIPIENT_BLOCK_DURATION: 0,
-  RATE_LIMIT_SIGNUP_RECIPIENT_POINTS: 6,
-  RATE_LIMIT_MCP_POINTS: 2,
-  RATE_LIMIT_MCP_DURATION: 60,
-  RATE_LIMIT_MCP_CONSENT_POINTS: 2,
-  RATE_LIMIT_MCP_CONSENT_DURATION: 60,
-  RATE_LIMIT_MCP_REGISTRATION_POINTS: 2,
-  RATE_LIMIT_MCP_REGISTRATION_DURATION: 60,
+  WMP_RATE_LIMIT_SCALE: 1,
   TRUST_PROXY_HOPS: undefined,
   MEDIA_MAX_UPLOAD_BYTES: 5 * 1024 * 1024,
   MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES: 1024 * 1024,
@@ -85,6 +64,31 @@ const envMock = vi.hoisted(() => ({
   SSR_CACHE_TTL_SECONDS: 0,
 }));
 vi.mock("@ws-model-proxy/env/server", () => ({ env: envMock }));
+
+// Bucket sizes that let the contract tests tell the limiters apart by their
+// X-RateLimit-Limit header: a generous general auth bucket (500) and RPC
+// bucket (1000), and small MCP/registration buckets (2) that a few requests
+// exhaust. The MCP limiter modules read the DEFAULTS table at import; the
+// limiters built inside rate-limit.ts itself are replaced as exports.
+vi.mock("./rate-limit.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./rate-limit.js")>();
+  const { RateLimiterMemory } = await import("rate-limiter-flexible");
+  return {
+    ...actual,
+    DEFAULTS: {
+      ...actual.DEFAULTS,
+      mcp: { points: 2, duration: 60 },
+      mcpConsent: { points: 2, duration: 60 },
+    },
+    authLimiter: new RateLimiterMemory({ keyPrefix: "rl:auth", points: 500, duration: 60 }),
+    rpcLimiter: new RateLimiterMemory({ keyPrefix: "rl:rpc", points: 1000, duration: 60 }),
+    mcpClientRegistrationLimiter: new RateLimiterMemory({
+      keyPrefix: "rl:mcp-registration",
+      points: 2,
+      duration: 60,
+    }),
+  };
+});
 
 // Mock @ws-model-proxy/db so importing the full appRouter graph never
 // touches Postgres (same pattern as packages/api/src/routers/index.test.ts).
@@ -415,14 +419,14 @@ describe("createApp configuration consistency — ONE shared env source for ever
   // reach the import-time consumers (limiter buckets) or the request-time
   // readers (authorize guard), so a factory override could contradict the
   // module env (probe: override MCP off + module flag on → guard still 400;
-  // overridden RATE_LIMIT_MCP_* silently ignored). The contract is NARROWED:
+  // overridden MCP bucket sizes silently ignored). The contract is NARROWED:
   // createApp reads the shared env module, and these regressions prove the
   // factory, the authorize guard, BOTH MCP OAuth buckets, and the alias
   // gates all consult the SAME mocked env object in a given mounted app —
   // any future seam reintroduction (one consumer reading a different env
   // than another) makes these assertions disagree and FAIL.
 
-  it("flag ON: guard active, alias gates on, and BOTH MCP buckets match the mocked RATE_LIMIT_MCP_* values in one mounted app", async () => {
+  it("flag ON: guard active, alias gates on, and BOTH MCP buckets match the mocked MCP bucket sizes in one mounted app", async () => {
     const app = await buildApp(true);
 
     // Alias gates: flag-on GET forwards to the installed handler (served).
@@ -433,14 +437,14 @@ describe("createApp configuration consistency — ONE shared env source for ever
 
     // Authorize guard + MCP protocol bucket in ONE request: the guard's
     // local invalid_scope 400 (flag read at request time from the shared
-    // mock) AND the protocol bucket's mocked RATE_LIMIT_MCP_POINTS (2,
+    // mock) AND the protocol bucket's mocked DEFAULTS.mcp.points (2,
     // captured at import from the SAME mock).
     const authorize = await app.request(`${BASE}/api/auth/oauth2/authorize`);
     expect(authorize.status).toBe(400);
     expect(await authorize.json()).toMatchObject({ error: "invalid_scope" });
     expect(authorize.headers.get("x-ratelimit-limit")).toBe("2");
 
-    // MCP consent/continue bucket: mocked RATE_LIMIT_MCP_CONSENT_POINTS (2).
+    // MCP consent/continue bucket: mocked DEFAULTS.mcpConsent.points (2).
     const consent = await app.request(`${BASE}/api/auth/oauth2/consent`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -567,7 +571,7 @@ describe("createApp registration contract — MCP OAuth flag-off 404 gate (Phase
       });
       // L18: the gate compares RAW pathnames only — encoded spellings and
       // prefix near-misses fall through to the general limiter (header 500 =
-      // mocked RATE_LIMIT_AUTH_POINTS) and the provider's own routing.
+      // mocked authLimiter points) and the provider's own routing.
       expect(res.headers.get("x-ratelimit-limit"), path).toBe("500");
     }
   });

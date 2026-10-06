@@ -23,6 +23,30 @@ export type RateLimiter = Pick<RateLimiterMemory, "consume" | "points">;
 // ---------------------------------------------------------------------------
 
 /**
+ * Built-in limits. Durations are seconds. Operators tune only the budget, with
+ * `WMP_RATE_LIMIT_SCALE`: every `points` value goes through `scaledPoints`,
+ * while windows and block durations stay fixed.
+ */
+export const DEFAULTS = {
+  rpc: { points: 100, duration: 60 },
+  auth: { points: 10, duration: 60, blockDuration: 15 * 60 },
+  signinFailure: { points: 10, duration: 15 * 60, blockDuration: 10 * 60 },
+  signup: { points: 3, duration: 60 * 60, blockDuration: 60 * 60 },
+  emailRecipient: { points: 3, duration: 60 * 60, blockDuration: 0 },
+  signupRecipient: { points: 6, duration: 60 * 60, blockDuration: 0 },
+  mcp: { points: 120, duration: 60 },
+  mcpConsent: { points: 30, duration: 60 },
+  mcpRegistration: { points: 60, duration: 60 * 60 },
+  enrollmentExchangeIp: { points: 10, duration: 15 * 60 },
+  enrollmentExchangeUser: { points: 20, duration: 60 * 60 },
+} as const;
+
+/** A built-in points budget times `WMP_RATE_LIMIT_SCALE`, rounded, never below 1. */
+export function scaledPoints(points: number): number {
+  return Math.max(1, Math.round(points * env.WMP_RATE_LIMIT_SCALE));
+}
+
+/**
  * Auth limiter — strict, applied to /api/auth/* to defend against
  * credential-stuffing and account-enumeration attacks.
  *
@@ -30,9 +54,9 @@ export type RateLimiter = Pick<RateLimiterMemory, "consume" | "points">;
  */
 export const authLimiter = new RateLimiterMemory({
   keyPrefix: "rl:auth",
-  points: env.RATE_LIMIT_AUTH_POINTS,
-  duration: env.RATE_LIMIT_AUTH_DURATION,
-  blockDuration: env.RATE_LIMIT_AUTH_BLOCK_DURATION,
+  points: scaledPoints(DEFAULTS.auth.points),
+  duration: DEFAULTS.auth.duration,
+  blockDuration: DEFAULTS.auth.blockDuration,
 });
 
 /**
@@ -45,12 +69,9 @@ export const authLimiter = new RateLimiterMemory({
  */
 export const signinFailureLimiter = new RateLimiterMemory({
   keyPrefix: "rl:signin-fail",
-  // `env` validates these defaults in real processes. Keep the same concrete
-  // defaults here as a defensive construction boundary for focused test
-  // module mocks that predate this limiter and omit the new optional fields.
-  points: env.RATE_LIMIT_SIGNIN_FAILURE_POINTS ?? 10,
-  duration: env.RATE_LIMIT_SIGNIN_FAILURE_DURATION ?? 15 * 60,
-  blockDuration: env.RATE_LIMIT_SIGNIN_FAILURE_BLOCK_DURATION ?? 10 * 60,
+  points: scaledPoints(DEFAULTS.signinFailure.points),
+  duration: DEFAULTS.signinFailure.duration,
+  blockDuration: DEFAULTS.signinFailure.blockDuration,
 });
 
 /**
@@ -61,8 +82,8 @@ export const signinFailureLimiter = new RateLimiterMemory({
  */
 export const mcpClientRegistrationLimiter = new RateLimiterMemory({
   keyPrefix: "rl:mcp-registration",
-  points: env.RATE_LIMIT_MCP_REGISTRATION_POINTS ?? 60,
-  duration: env.RATE_LIMIT_MCP_REGISTRATION_DURATION ?? 60 * 60,
+  points: scaledPoints(DEFAULTS.mcpRegistration.points),
+  duration: DEFAULTS.mcpRegistration.duration,
 });
 
 /**
@@ -74,9 +95,9 @@ export const mcpClientRegistrationLimiter = new RateLimiterMemory({
  */
 export const signupLimiter = new RateLimiterMemory({
   keyPrefix: "rl:signup",
-  points: env.RATE_LIMIT_SIGNUP_POINTS,
-  duration: env.RATE_LIMIT_SIGNUP_DURATION,
-  blockDuration: env.RATE_LIMIT_SIGNUP_BLOCK_DURATION,
+  points: scaledPoints(DEFAULTS.signup.points),
+  duration: DEFAULTS.signup.duration,
+  blockDuration: DEFAULTS.signup.blockDuration,
 });
 
 /**
@@ -86,8 +107,8 @@ export const signupLimiter = new RateLimiterMemory({
  */
 export const rpcLimiter = new RateLimiterMemory({
   keyPrefix: "rl:rpc",
-  points: env.RATE_LIMIT_RPC_POINTS,
-  duration: env.RATE_LIMIT_RPC_DURATION,
+  points: scaledPoints(DEFAULTS.rpc.points),
+  duration: DEFAULTS.rpc.duration,
 });
 
 /**
@@ -108,23 +129,19 @@ export const realtimeUpgradeLimiter = new RateLimiterMemory({
  * pre-approved secret, so a caller guessing codes spends its own IP budget; the exchange also
  * charges the code's owner (per user) once the code is known. No `blockDuration`: an honest
  * installer that retried too fast recovers within one window. Per process, like every limiter
- * here. Budgets from contracts/http.ts: 10 per IP per 15 minutes, 20 per code owner per hour.
+ * here. Budgets from contracts/http.ts: 10 per IP per 15 minutes, 20 per code owner per hour
+ * (before `WMP_RATE_LIMIT_SCALE`).
  */
-export const ENROLLMENT_EXCHANGE_IP_POINTS = 10;
-export const ENROLLMENT_EXCHANGE_IP_DURATION_SECONDS = 15 * 60;
-export const ENROLLMENT_EXCHANGE_USER_POINTS = 20;
-export const ENROLLMENT_EXCHANGE_USER_DURATION_SECONDS = 60 * 60;
-
 export const enrollmentExchangeIpLimiter = new RateLimiterMemory({
   keyPrefix: "rl:enroll-ip",
-  points: ENROLLMENT_EXCHANGE_IP_POINTS,
-  duration: ENROLLMENT_EXCHANGE_IP_DURATION_SECONDS,
+  points: scaledPoints(DEFAULTS.enrollmentExchangeIp.points),
+  duration: DEFAULTS.enrollmentExchangeIp.duration,
 });
 
 export const enrollmentExchangeUserLimiter = new RateLimiterMemory({
   keyPrefix: "rl:enroll-user",
-  points: ENROLLMENT_EXCHANGE_USER_POINTS,
-  duration: ENROLLMENT_EXCHANGE_USER_DURATION_SECONDS,
+  points: scaledPoints(DEFAULTS.enrollmentExchangeUser.points),
+  duration: DEFAULTS.enrollmentExchangeUser.duration,
 });
 
 export type ExchangeLimit = { allowed: true } | { allowed: false; retryAfterMs: number };
@@ -173,16 +190,16 @@ export async function consumeEnrollmentExchange(
  *
  * Other limiters key on client IP (or user id). That bounds one caller, not
  * one mailbox. Rotating IPs multiply the IP ceiling into a victim's inbox.
- * Keyed on normalized recipient (lowercased + trimmed). POINTS=0 disables.
+ * Keyed on normalized recipient (lowercased + trimmed). Always on.
  *
- * `blockDuration` defaults to 0: keying on an attacker-supplied identifier
+ * `blockDuration` is 0: keying on an attacker-supplied identifier
  * must not become an unauthenticated lockout lever on password reset.
  */
 export const emailRecipientLimiter = new RateLimiterMemory({
   keyPrefix: "rl:email-to",
-  points: env.RATE_LIMIT_EMAIL_RECIPIENT_POINTS,
-  duration: env.RATE_LIMIT_EMAIL_RECIPIENT_DURATION,
-  blockDuration: env.RATE_LIMIT_EMAIL_RECIPIENT_BLOCK_DURATION,
+  points: scaledPoints(DEFAULTS.emailRecipient.points),
+  duration: DEFAULTS.emailRecipient.duration,
+  blockDuration: DEFAULTS.emailRecipient.blockDuration,
 });
 
 /**
@@ -191,9 +208,9 @@ export const emailRecipientLimiter = new RateLimiterMemory({
  */
 export const signupRecipientLimiter = new RateLimiterMemory({
   keyPrefix: "rl:signup-to",
-  points: env.RATE_LIMIT_SIGNUP_RECIPIENT_POINTS,
-  duration: env.RATE_LIMIT_EMAIL_RECIPIENT_DURATION,
-  blockDuration: env.RATE_LIMIT_EMAIL_RECIPIENT_BLOCK_DURATION,
+  points: scaledPoints(DEFAULTS.signupRecipient.points),
+  duration: DEFAULTS.signupRecipient.duration,
+  blockDuration: DEFAULTS.signupRecipient.blockDuration,
 });
 
 /**

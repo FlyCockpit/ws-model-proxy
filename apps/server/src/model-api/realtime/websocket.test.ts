@@ -8,14 +8,7 @@ import { dashboardRequester, tokenRequester } from "./requester.js";
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     BETTER_AUTH_URL: "https://proxy.example.test",
-    RATE_LIMIT_AUTH_POINTS: 100,
-    RATE_LIMIT_AUTH_DURATION: 60,
-    RATE_LIMIT_AUTH_BLOCK_DURATION: 60,
-    RATE_LIMIT_SIGNUP_POINTS: 100,
-    RATE_LIMIT_SIGNUP_DURATION: 60,
-    RATE_LIMIT_SIGNUP_BLOCK_DURATION: 60,
-    RATE_LIMIT_RPC_POINTS: 100,
-    RATE_LIMIT_RPC_DURATION: 60,
+    WMP_RATE_LIMIT_SCALE: 1,
     TRUST_PROXY_HOPS: undefined,
   },
 }));
