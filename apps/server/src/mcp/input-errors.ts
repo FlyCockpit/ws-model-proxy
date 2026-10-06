@@ -340,12 +340,14 @@ function hasControlCharacter(value: string): boolean {
   return FORMAT_CHARACTER.test(value);
 }
 
-export function sanitizeArgumentMessage(message: unknown): string | null {
+export function sanitizeArgumentMessage(
+  message: unknown,
+  maxLength: number = MAX_MESSAGE_LENGTH,
+): string | null {
   if (typeof message !== "string") return null;
   const trimmed = message.trim();
   if (trimmed.length === 0 || hasControlCharacter(trimmed)) return null;
-  const capped =
-    trimmed.length > MAX_MESSAGE_LENGTH ? `${trimmed.slice(0, MAX_MESSAGE_LENGTH)}...` : trimmed;
+  const capped = trimmed.length > maxLength ? `${trimmed.slice(0, maxLength)}...` : trimmed;
   const redacted = redactSecrets(capped);
   return typeof redacted === "string" ? redacted : null;
 }

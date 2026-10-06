@@ -44,6 +44,7 @@ import type {
   StandardSchemaWithJSON,
 } from "@modelcontextprotocol/server";
 import { createRouterClient, ORPCError } from "@orpc/server";
+import { isDeploymentRefusalReason } from "@ws-model-proxy/api/lib/deployment-refusal-reasons";
 import { isGuardedPoolCreateFailureReason } from "@ws-model-proxy/api/lib/guarded-pool-create-reasons";
 import { type AppRouterClient, appRouter } from "@ws-model-proxy/api/routers/index";
 import { mcpScopesAllow } from "@ws-model-proxy/auth/mcp-config";
@@ -108,7 +109,9 @@ const MCP_TOOL_OUTPUT_EMITTED_BUDGET_BYTES =
  * Allowlisted oRPC error codes → stable tool-error messages. Codes outside
  * this map (and non-ORPCError failures) become the generic internal error.
  * A procedure message is copied only for an argument-shaped BAD_REQUEST
- * that names declared fields (#200), and only after it is sanitized.
+ * that names declared fields (#200), or for a deployment planning refusal
+ * whose `data.reason` is a known code (its message is fixed planner text),
+ * and only after it is sanitized.
  */
 const ORPC_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   BAD_REQUEST: "Invalid input",
@@ -116,8 +119,22 @@ const ORPC_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   FORBIDDEN: "Forbidden",
   NOT_FOUND: "Not found",
   CONFLICT: "Conflict",
+  PRECONDITION_FAILED: "Precondition failed",
   TOO_MANY_REQUESTS: "Too many requests",
 });
+
+/** Codes a deployment planning refusal may carry. */
+const DEPLOYMENT_REFUSAL_CODES: ReadonlySet<string> = new Set([
+  "BAD_REQUEST",
+  "CONFLICT",
+  "FORBIDDEN",
+  "PRECONDITION_FAILED",
+]);
+/** Planner messages may list skipped nodes, so they get a larger cap. */
+const DEPLOYMENT_REFUSAL_MESSAGE_MAX_LENGTH = 2000;
+const DEPLOYMENT_REFUSAL_MAX_NODES = 64;
+/** Node (CLI device) ids as the planner reports them: never free text. */
+const NODE_ID_SHAPE = /^[A-Za-z0-9_-]{1,128}$/;
 
 const GENERIC_TOOL_ERROR_MESSAGE = "Internal error";
 
@@ -651,6 +668,66 @@ function guardedPoolCreateReasonOf(error: ORPCError<string, unknown>): string | 
   return isGuardedPoolCreateFailureReason(reason) ? reason : null;
 }
 
+function ownData(error: ORPCError<string, unknown>, key: string): unknown {
+  const data: unknown = error.data;
+  if (typeof data !== "object" || data === null || !Object.hasOwn(data, key)) return undefined;
+  return Reflect.get(data, key);
+}
+
+function refusalNodeIds(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const ids = value
+    .filter((id): id is string => typeof id === "string" && NODE_ID_SHAPE.test(id))
+    .slice(0, DEPLOYMENT_REFUSAL_MAX_NODES);
+  return ids.length === 0 ? null : ids;
+}
+
+function refusalSkippedNodes(
+  value: unknown,
+): { nodeId: string; reason: string; message: string }[] | null {
+  if (!Array.isArray(value)) return null;
+  const skipped: { nodeId: string; reason: string; message: string }[] = [];
+  for (const entry of value.slice(0, DEPLOYMENT_REFUSAL_MAX_NODES)) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const nodeId: unknown = Reflect.get(entry, "nodeId");
+    const reason: unknown = Reflect.get(entry, "reason");
+    const message = sanitizeArgumentMessage(Reflect.get(entry, "message"));
+    if (typeof nodeId !== "string" || !NODE_ID_SHAPE.test(nodeId)) continue;
+    if (!isDeploymentRefusalReason(reason) || message === null) continue;
+    skipped.push({ nodeId, reason, message });
+  }
+  return skipped.length === 0 ? null : skipped;
+}
+
+/**
+ * A deployment planning refusal (#15): its fixed message, reason, node ids
+ * and, when the planner picked nodes itself, the skipped nodes with their
+ * reasons. Null when the error is not one.
+ */
+function deploymentRefusalToolError(
+  error: ORPCError<string, unknown>,
+  stable: string,
+  knownKeys: ReadonlySet<string>,
+): ToolResult | null {
+  if (!DEPLOYMENT_REFUSAL_CODES.has(error.code)) return null;
+  const reason = ownData(error, "reason");
+  if (!isDeploymentRefusalReason(reason)) return null;
+  const message = sanitizeArgumentMessage(error.message, DEPLOYMENT_REFUSAL_MESSAGE_MAX_LENGTH);
+  const fields = sanitizeDeclaredFields(error.data, knownKeys);
+  const nodeIds = refusalNodeIds(ownData(error, "nodeIds"));
+  const skippedNodes = refusalSkippedNodes(ownData(error, "skippedNodes"));
+  return toolError(`${stable}: ${message ?? reason}`, {
+    error: {
+      code: error.code === "BAD_REQUEST" ? "invalid_input" : error.code,
+      reason,
+      ...(message === null ? {} : { message }),
+      ...(fields === null ? {} : { fields }),
+      ...(nodeIds === null ? {} : { nodeIds }),
+      ...(skippedNodes === null ? {} : { skippedNodes }),
+    },
+  });
+}
+
 function declaredInputKeys(descriptor: McpToolDescriptor): ReadonlySet<string> {
   let keys = declaredKeysCache.get(descriptor);
   if (keys === undefined) {
@@ -672,6 +749,8 @@ function mapToolError(
     if (Object.hasOwn(ORPC_ERROR_MESSAGES, error.code)) {
       const stable = ORPC_ERROR_MESSAGES[error.code];
       if (stable !== undefined) {
+        const refusal = deploymentRefusalToolError(error, stable, declaredInputKeys(descriptor));
+        if (refusal !== null) return refusal;
         if (error.code === "BAD_REQUEST") {
           // #117 / #200: name the failing field(s). Sanitized issues never
           // carry input values. A procedure rejection whose input was

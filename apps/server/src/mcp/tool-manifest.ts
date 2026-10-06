@@ -489,6 +489,10 @@ function fileToolSpec(name: FileToolName): McpToolSpec {
 const DEPLOYMENT_TOOL_NOTE =
   "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only. Commands marked interactive wait for the owner to run them in an operator terminal on the node; agents cannot answer, reopen or restart them, and instances report needsOperator/operatorSteps while they wait. Planning refuses interactive recipes on nodes without the operator-terminal capability (reason deployment_operator_unavailable).";
 
+/** What a refused plan returns (plan start/stop/apply). */
+const DEPLOYMENT_PLAN_REFUSAL_NOTE =
+  "A refused plan returns error.reason (a stable code: not_enough_nodes, unknown_node, wrong_node_count, label_mismatch, node_offline, cli_upgrade_required, deployments_not_enabled, unsupported_execution, deployment_operator_unavailable, budget_exceeded, resources_held, no_free_ports, commands_off, protected_instance, ...), the planner's message, and error.nodeIds for the nodes involved. Without nodeIds, the planner picks eligible nodes itself; when too few qualify, the reason is not_enough_nodes and error.skippedNodes lists every skipped node with its own reason and message.";
+
 const READ_TOOLS: readonly McpToolSpec[] = [
   {
     name: "deployment_configs_list",
@@ -903,7 +907,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.deployments.planStart),
-    descriptionNote: DEPLOYMENT_TOOL_NOTE,
+    descriptionNote: `${DEPLOYMENT_TOOL_NOTE} ${DEPLOYMENT_PLAN_REFUSAL_NOTE}`,
   },
   {
     name: "deployment_plan_stop",
@@ -912,7 +916,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.deployments.planStop),
-    descriptionNote: DEPLOYMENT_TOOL_NOTE,
+    descriptionNote: `${DEPLOYMENT_TOOL_NOTE} ${DEPLOYMENT_PLAN_REFUSAL_NOTE}`,
   },
   {
     name: "deployment_plan_apply",
@@ -921,7 +925,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     confirmation: "RUN",
     classification: "external",
     invokeProcedure: procedureInvoker((client) => client.deployments.applyPlan),
-    descriptionNote: DEPLOYMENT_TOOL_NOTE,
+    descriptionNote: `${DEPLOYMENT_TOOL_NOTE} ${DEPLOYMENT_PLAN_REFUSAL_NOTE}`,
   },
   {
     name: "inference_contribution_revoke",

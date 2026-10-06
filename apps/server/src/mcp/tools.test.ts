@@ -192,6 +192,16 @@ function buildAuthInfo(scopes: string[]): AuthInfo {
 }
 
 /** Bind a dispatch exactly the way the production `onVerified` wiring does. */
+/** A PAT that may see the deployment write tools (they need the CLI commands option). */
+const DEPLOYMENT_PAT = {
+  kind: "pat",
+  tokenId: "pat-1",
+  allowCliCommands: true,
+  allowCliFileRead: false,
+  scopes: ["mcp:write"],
+  expiresAt: null,
+} as const;
+
 function bindRequest(
   authInfo: AuthInfo,
   requestId = "req-42",
@@ -577,6 +587,106 @@ describe("#117 — real input schemas and named failing fields", () => {
     expect(resultText(body.result ?? {})).toBe(
       "Invalid input: capacityConcurrencyLimit: Effective concurrency limit exceeds physical capacity.",
     );
+  });
+
+  it("a deployment planning refusal crosses with its reason, message, nodes and skipped nodes", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    const message =
+      "This plan needs 2 eligible nodes but 1 qualifies. Skipped: spark-1: Deployments require local opt-in and server grant.";
+    vi.mocked(prisma.$transaction).mockRejectedValueOnce(
+      new ORPCError("PRECONDITION_FAILED", {
+        message,
+        data: {
+          reason: "not_enough_nodes",
+          nodeIds: ["spark-1", "not a node id"],
+          skippedNodes: [
+            {
+              nodeId: "spark-1",
+              reason: "deployments_not_enabled",
+              message: "Deployments require local opt-in and server grant",
+            },
+            { nodeId: "spark-2", reason: "made_up", message: "dropped" },
+          ],
+        },
+      }),
+    );
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo, "req-42", DEPLOYMENT_PAT);
+    const { body } = await callTool(authInfo, "deployment_plan_start", {
+      revisionId: "rev-1",
+      variantKey: "spark",
+    });
+    expect(body.result?.isError).toBe(true);
+    expect(resultText(body.result ?? {})).toBe(`Precondition failed: ${message}`);
+    expect(body.result?.structuredContent).toEqual({
+      error: {
+        code: "PRECONDITION_FAILED",
+        reason: "not_enough_nodes",
+        message,
+        nodeIds: ["spark-1"],
+        skippedNodes: [
+          {
+            nodeId: "spark-1",
+            reason: "deployments_not_enabled",
+            message: "Deployments require local opt-in and server grant",
+          },
+        ],
+      },
+    });
+  });
+
+  it("planner CONFLICT, FORBIDDEN and BAD_REQUEST keep their fixed message; other errors stay generic", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    const cases: [InstanceType<typeof ORPCError>, string, Record<string, unknown>][] = [
+      [
+        new ORPCError("CONFLICT", {
+          message: "Requirements exceed usable budgets on spark-1",
+          data: { reason: "budget_exceeded", nodeIds: ["spark-1"] },
+        }),
+        "Conflict: Requirements exceed usable budgets on spark-1",
+        { code: "CONFLICT", reason: "budget_exceeded", nodeIds: ["spark-1"] },
+      ],
+      [
+        new ORPCError("FORBIDDEN", {
+          message: "Deployment commands are off on an affected node",
+          data: { reason: "commands_off", nodeIds: ["spark-1"] },
+        }),
+        "Forbidden: Deployment commands are off on an affected node",
+        { code: "FORBIDDEN", reason: "commands_off" },
+      ],
+      [
+        new ORPCError("BAD_REQUEST", {
+          message: "Unknown node spark-9",
+          data: { reason: "unknown_node", fields: ["nodeIds"] },
+        }),
+        "Invalid input: Unknown node spark-9",
+        { code: "invalid_input", reason: "unknown_node", fields: ["nodeIds"] },
+      ],
+      // No planner reason: the stable word only, never the message.
+      [
+        new ORPCError("PRECONDITION_FAILED", { message: "SECRET internals" }),
+        "Precondition failed",
+        { code: "PRECONDITION_FAILED" },
+      ],
+      [
+        new ORPCError("CONFLICT", { message: "SECRET internals", data: { reason: "other" } }),
+        "Conflict",
+        { code: "CONFLICT" },
+      ],
+    ];
+    for (const [error, text, structured] of cases) {
+      vi.mocked(prisma.$transaction).mockRejectedValueOnce(error);
+      const authInfo = buildAuthInfo(["mcp:write"]);
+      bindRequest(authInfo, "req-42", DEPLOYMENT_PAT);
+      const { body } = await callTool(authInfo, "deployment_plan_start", {
+        revisionId: "rev-1",
+        variantKey: "spark",
+        nodeIds: ["spark-9"],
+      });
+      expect(resultText(body.result ?? {})).toBe(text);
+      expect(body.result?.structuredContent?.error).toMatchObject(structured);
+      expect(JSON.stringify(body)).not.toContain("SECRET");
+    }
   });
 
   it("a refinement's own message reaches the agent with its field", async () => {
