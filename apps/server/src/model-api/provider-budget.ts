@@ -25,7 +25,7 @@ import { createHash, randomUUID } from "node:crypto";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { runWithDbShutdownPermit } from "@ws-model-proxy/db/shutdown-fence";
-import { providerAccountSpend, shareCapSpend } from "@ws-model-proxy/db/spend";
+import { providerAccountSpend, shareSpend } from "@ws-model-proxy/db/spend";
 import { type ProviderTokenUsage, providerBillableTokens } from "./provider-budget-accounting.js";
 
 export type BudgetMetric = "CONCURRENCY" | "TOKENS" | "SPEND";
@@ -138,9 +138,6 @@ export interface ProviderBudgetTerminal {
 
 export class ProviderBudgetConfigurationError extends Error {}
 
-/** The cap set changed between the unlocked read and its fences: restart the transaction. */
-class SpendCapSetChanged extends Error {}
-
 /** Cloud attempts are fenced by their token; the epoch only names the admitting process. */
 export const PROVIDER_ATTEMPT_OWNER_EPOCH = `cloud:${randomUUID()}`;
 
@@ -148,6 +145,7 @@ const RETRYABLE_TRANSACTION_CODES = new Set(["P2034", "40001", "40P01"]);
 const MAX_TRANSACTION_ATTEMPTS = 5;
 const MAX_SIGNED_BIGINT = 9_223_372_036_854_775_807n;
 const REPAIR_BATCH = 500;
+const REPAIR_MAX_PER_RUN = 5_000;
 
 function decimal(value: string | number | Prisma.Decimal): Prisma.Decimal {
   let result: Prisma.Decimal;
@@ -298,7 +296,6 @@ function terminalPayloadHash(
 }
 
 function retryable(error: unknown): boolean {
-  if (error instanceof SpendCapSetChanged) return true;
   return (
     typeof error === "object" &&
     error !== null &&
@@ -364,15 +361,6 @@ async function readCaps(
   );
 }
 
-function sameCapSet(left: readonly CapRow[], right: readonly CapRow[]): boolean {
-  const ids = (caps: readonly CapRow[]) =>
-    caps
-      .map((cap) => cap.id)
-      .sort()
-      .join(",");
-  return ids(left) === ids(right);
-}
-
 function capDenial(
   cap: CapRow,
   reason: "BUDGET_EXCEEDED" | "CURRENCY_UNAVAILABLE" | "PRICING_UNAVAILABLE",
@@ -421,16 +409,18 @@ export async function admitProviderBudget(
   const priced = liabilitySpend !== undefined;
 
   return serializedSpend(async (tx) => {
-    // Writer class H: the attempt fence, then the cap fences (level 04 sorts after 01), before
-    // any row lock or write.
-    await acquireFences(tx, [fences.spendAttempt(attempt.attemptId)]);
-    const unlockedCaps = await readCaps(tx, attempt);
-    await acquireFences(
-      tx,
-      unlockedCaps.map((cap) => fences.spendCap(cap.id)),
-    );
+    // Writer class H, before any row lock or write: the attempt fence, then the cap SUBJECT
+    // fences (the account, and the share for owner-paid share traffic), taken whether or not a
+    // cap exists. Every admission on the subject serializes here, so the consumption read below
+    // sees every earlier admission's attempt, including one admitted before a cap was created.
+    await acquireFences(tx, [
+      fences.spendAttempt(attempt.attemptId),
+      fences.spendAccount(attempt.providerAccountId),
+      ...(attempt.shareId ? [fences.spendShare(attempt.shareId)] : []),
+    ]);
+    // A cap edit committing concurrently linearizes before or after this admission; either
+    // order is a valid outcome.
     const caps = await readCaps(tx, attempt);
-    if (!sameCapSet(unlockedCaps, caps)) throw new SpendCapSetChanged();
     // The post-wait database clock, not the transaction start.
     const now = await databaseNow(tx);
     if (attempt.expiresAt.getTime() <= now.getTime())
@@ -449,6 +439,7 @@ export async function admitProviderBudget(
         anchor.providerModelId === attempt.providerModelId &&
         anchor.credentialId === (attempt.credentialId ?? null) &&
         anchor.poolId === (attempt.poolId ?? null) &&
+        anchor.shareId === (attempt.shareId ?? null) &&
         anchor.liabilityTokens === (attempt.liability.tokens ?? null) &&
         (anchor.liabilitySpend === null
           ? liabilitySpend === undefined
@@ -514,7 +505,7 @@ export async function admitProviderBudget(
       for (const cap of caps) {
         const usage =
           cap.scope === "SHARE"
-            ? await shareCapSpend(tx, { capId: cap.id, currency, now })
+            ? await shareSpend(tx, { shareId: attempt.shareId ?? "", currency, now })
             : await providerAccountSpend(tx, {
                 providerAccountId: attempt.providerAccountId,
                 currency,
@@ -542,6 +533,7 @@ export async function admitProviderBudget(
         providerAccountId: attempt.providerAccountId,
         providerModelId: attempt.providerModelId,
         credentialId: attempt.credentialId ?? null,
+        shareId: attempt.shareId ?? null,
         requestedSurface: attempt.requestedSurface ?? "unknown",
         liabilityTokens: attempt.liability.tokens ?? null,
         liabilitySpend: liabilitySpend ?? null,
@@ -667,12 +659,15 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
       const anchor = await tx.attempt.findUnique({ where: { id: terminal.attemptId } });
       if (anchor?.kind !== "CLOUD" || anchor.fencingToken !== terminal.fencingToken)
         throw new ProviderBudgetConfigurationError("No admitted provider attempt exists");
+      const now = await databaseNow(tx);
+      // A crash settlement needs the attempt expired by the database clock (not the sweeping
+      // replica's) and not renewed by its heartbeat since the sweep selected it.
       if (
         terminal.reason === "CRASH_RECOVERY" &&
-        terminal.crashExpiredAt &&
-        anchor.expiresAt > terminal.crashExpiredAt
+        (anchor.expiresAt > now ||
+          (terminal.crashExpiredAt !== undefined && anchor.expiresAt > terminal.crashExpiredAt))
       )
-        return; // renewed by its heartbeat after the sweep selected it
+        return;
       if (
         anchor.userId !== terminal.userId ||
         anchor.providerAccountId !== terminal.providerAccountId ||
@@ -682,7 +677,6 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         anchor.requestId !== terminal.requestId
       )
         throw new ProviderBudgetConfigurationError("Terminal attempt identity conflict");
-      const now = await databaseNow(tx);
       const finalize = async () => {
         if (anchor.state !== "ACTIVE") return;
         await tx.attempt.updateMany({
@@ -826,6 +820,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
           providerModelId: terminal.providerModelId,
           credentialId: anchor.credentialId,
           poolId: anchor.poolId,
+          shareId: anchor.shareId,
           requestId: anchor.requestId,
           attemptId: terminal.attemptId,
           fencingToken: terminal.fencingToken,
@@ -887,38 +882,44 @@ export async function repairExpiredProviderBudgets(
 ): Promise<number> {
   if (!Number.isFinite(now.getTime()))
     throw new ProviderBudgetConfigurationError("Invalid repair date");
-  const expired = await prisma.attempt.findMany({
-    where: {
-      kind: "CLOUD",
-      state: "ACTIVE",
-      expiresAt: { lte: now },
-      ...(scope ? { userId: scope.userId, providerAccountId: scope.providerAccountId } : {}),
-    },
-    select: {
-      id: true,
-      userId: true,
-      requestId: true,
-      fencingToken: true,
-      providerAccountId: true,
-      providerModelId: true,
-      credentialId: true,
-      poolId: true,
-    },
-    orderBy: { expiresAt: "asc" },
-    take: REPAIR_BATCH,
-  });
+  // Pages past every attempt it has seen this run (settled, renewed or failing), so a stuck
+  // one never starves newer ones and a renewed one is not revisited.
+  const seen: string[] = [];
   let repaired = 0;
-  for (const row of expired) {
-    if (!row.providerAccountId || !row.providerModelId) continue;
-    try {
-      await repairExpiredAttempt(row, now);
-      repaired += 1;
-    } catch {
-      // One attempt that cannot be settled must not stall the rest; the next run retries it.
-      console.warn("[provider-budget] could not repair an expired cloud attempt");
+  for (;;) {
+    const expired = await prisma.attempt.findMany({
+      where: {
+        kind: "CLOUD",
+        state: "ACTIVE",
+        expiresAt: { lte: now },
+        ...(seen.length > 0 ? { id: { notIn: seen } } : {}),
+        ...(scope ? { userId: scope.userId, providerAccountId: scope.providerAccountId } : {}),
+      },
+      select: {
+        id: true,
+        userId: true,
+        requestId: true,
+        fencingToken: true,
+        providerAccountId: true,
+        providerModelId: true,
+        credentialId: true,
+        poolId: true,
+      },
+      orderBy: { expiresAt: "asc" },
+      take: REPAIR_BATCH,
+    });
+    for (const row of expired) {
+      seen.push(row.id);
+      try {
+        await repairExpiredAttempt(row, now);
+        repaired += 1;
+      } catch {
+        // The next run retries it; this run moves on.
+        console.warn("[provider-budget] could not repair an expired cloud attempt");
+      }
     }
+    if (expired.length < REPAIR_BATCH || seen.length >= REPAIR_MAX_PER_RUN) return repaired;
   }
-  return repaired;
 }
 
 async function repairExpiredAttempt(

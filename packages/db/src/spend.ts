@@ -10,12 +10,11 @@
  *
  * Month attribution: an attempt belongs to the UTC calendar month of its FIRST ledger revision,
  * whole (later corrections included), so a correction never moves cost between months.
- * Share caps attribute by admission month instead (the reservation's window), since the ledger
- * does not name the share.
  *
  * Reserved spend is the liability of cloud attempts still in flight: an ACTIVE `attempt` of kind
  * CLOUD with no ledger revision yet (crash-expired attempts stay ACTIVE, and reserved, until the
- * repair sweep settles them at their liability). Per cap it is the cap's RESERVED reservations.
+ * repair sweep settles them at their liability). Scopes: the provider account, the payer, and
+ * the share (owner-paid share traffic carries `shareId` on its attempt and ledger rows).
  *
  * Invariants the writer (apps/server provider-budget.ts) keeps so nothing is under-counted:
  * - a CLOUD attempt leaves ACTIVE only in the transaction that writes its first ledger revision
@@ -24,7 +23,7 @@
  *   revisions carries a `settledCost` in that currency (the liability itself while the real cost
  *   is unknown);
  * - cap enforcement reads settled and reserved in ONE statement ({@link providerAccountSpend},
- *   {@link shareCapSpend}): under READ COMMITTED two statements could each miss an attempt whose
+ *   {@link shareSpend}): under READ COMMITTED two statements could each miss an attempt whose
  *   settlement commits between them.
  */
 import { Prisma } from "../prisma/generated/client";
@@ -109,40 +108,6 @@ function reservedAttemptSql(scope: Prisma.Sql, currency: string): Prisma.Sql {
        AND NOT EXISTS (
          SELECT 1 FROM usage_ledger l
           WHERE l."attemptId" = a.id AND l."fencingToken" = a."fencingToken")
-  )`;
-}
-
-/** Settled cost (a scalar subquery) of the attempts admitted against one cap in `window`. */
-function capSettledSql(capId: string, currency: string, window: MonthWindow): Prisma.Sql {
-  return Prisma.sql`(
-    WITH attempts AS (
-      SELECT DISTINCT r."attemptId", r."fencingToken"
-        FROM spend_reservation r
-       WHERE r."capId" = ${capId} AND r."windowStart" = ${window.start}
-    ),
-    revisions AS (
-      SELECT l."revisionSequence", l."settledCost", l.currency,
-             MAX(l."revisionSequence") FILTER (WHERE l."revisionKind" = 'SNAPSHOT')
-               OVER (PARTITION BY l."attemptId", l."fencingToken") AS "snapshotSequence"
-        FROM usage_ledger l
-        JOIN attempts a ON a."attemptId" = l."attemptId" AND a."fencingToken" = l."fencingToken"
-    )
-    SELECT COALESCE(SUM(r."settledCost"), 0)::numeric(30, 9)
-      FROM revisions r
-     WHERE r.currency = ${currency}
-       AND r."settledCost" IS NOT NULL
-       AND (r."snapshotSequence" IS NULL OR r."revisionSequence" >= r."snapshotSequence")
-  )`;
-}
-
-/** Liability (a scalar subquery) held by one cap's open reservations, whatever their window. */
-function capReservedSql(capId: string, currency: string): Prisma.Sql {
-  return Prisma.sql`(
-    SELECT COALESCE(SUM(r."reservedValue"), 0)::numeric(30, 9)
-      FROM spend_reservation r
-     WHERE r."capId" = ${capId}
-       AND r.state = 'RESERVED'::"ReservationState"
-       AND r.currency = ${currency}
   )`;
 }
 
@@ -242,36 +207,22 @@ export async function providerAccountSpend(
 }
 
 /**
- * Settled spend this month of the attempts admitted against one cap (by reservation window).
- * Used for share caps, whose subject the ledger does not name.
+ * Owner-paid share traffic (the share's cap): settled this month and reserved now, from one
+ * snapshot. The ledger and the attempt carry the share, so a cap created mid-month, or cleared
+ * and set again, still sees the whole month.
  */
-export async function capSettledSpend(
+export async function shareSpend(
   db: SpendReader,
-  input: { capId: string; currency: string; window?: MonthWindow },
-): Promise<Prisma.Decimal> {
-  return scalar(
-    db,
-    capSettledSql(input.capId, checkedCurrency(input.currency), input.window ?? utcMonthWindow()),
-  );
-}
-
-/** Liability held by one cap's open reservations (every window: an open hold is still owed). */
-export async function capReservedSpend(
-  db: SpendReader,
-  input: { capId: string; currency: string },
-): Promise<Prisma.Decimal> {
-  return scalar(db, capReservedSql(input.capId, checkedCurrency(input.currency)));
-}
-
-/** A share cap's view and consumption: spent this month (admission month) and reserved now. */
-export async function shareCapSpend(
-  db: SpendReader,
-  input: { capId: string; currency: string; now?: Date },
+  input: { shareId: string; currency: string; now?: Date },
 ): Promise<SpendUsage> {
   const currency = checkedCurrency(input.currency);
   return usagePair(
     db,
-    capSettledSql(input.capId, currency, utcMonthWindow(input.now)),
-    capReservedSql(input.capId, currency),
+    settledLedgerSql(
+      Prisma.sql`l."shareId" = ${input.shareId}`,
+      currency,
+      utcMonthWindow(input.now),
+    ),
+    reservedAttemptSql(Prisma.sql`a."shareId" = ${input.shareId}`, currency),
   );
 }

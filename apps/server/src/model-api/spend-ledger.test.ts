@@ -1,12 +1,11 @@
 import { Prisma } from "@ws-model-proxy/db";
 import {
-  capReservedSpend,
-  capSettledSpend,
   providerAccountReservedSpend,
   providerAccountSettledSpend,
   providerAccountSpend,
   type SpendReader,
-  shareCapSpend,
+  shareSpend,
+  userReservedSpend,
   userSettledSpend,
   utcMonthWindow,
 } from "@ws-model-proxy/db/spend";
@@ -110,25 +109,34 @@ describe("spend ledger read model", () => {
     expect(statements[0]?.text).toMatch(/^SELECT \( WITH attempts AS .* AS settled, \( SELECT/);
   });
 
-  it("attributes cap spend by the reservation window and holds open reservations", async () => {
+  it("scopes share spend by the share on the ledger and the in-flight attempt", async () => {
     const { reader, statements } = recordingReader([{ settled: "2.05", reserved: "0.7" }]);
     const now = new Date("2026-10-06T00:00:00Z");
-    await expect(shareCapSpend(reader, { capId: "cap", currency: "USD", now })).resolves.toEqual({
+    await expect(shareSpend(reader, { shareId: "share", currency: "USD", now })).resolves.toEqual({
       spentThisMonth: new Prisma.Decimal("2.05"),
       reservedNow: new Prisma.Decimal("0.7"),
     });
-    expect(statements[0]?.text).toContain(`r."windowStart" =`);
     expect(statements).toHaveLength(1);
-    expect(statements[0]?.values).toEqual(["cap", utcMonthWindow(now).start, "USD", "cap", "USD"]);
-    expect(statements[0]?.text).toContain(`r.state = 'RESERVED'::"ReservationState"`);
+    expect(statements[0]?.text).toContain(`l."shareId" =`);
+    expect(statements[0]?.text).toContain(`a."shareId" =`);
+    const window = utcMonthWindow(now);
+    expect(statements[0]?.values).toEqual([
+      "share",
+      window.start,
+      window.end,
+      window.start,
+      "USD",
+      "share",
+      "USD",
+    ]);
   });
 
   it("refuses a malformed currency before querying", async () => {
     const { reader, statements } = recordingReader([]);
-    await expect(capReservedSpend(reader, { capId: "cap", currency: "usd" })).rejects.toThrow(
+    await expect(userReservedSpend(reader, { userId: "u", currency: "usd" })).rejects.toThrow(
       RangeError,
     );
-    await expect(capSettledSpend(reader, { capId: "cap", currency: "US" })).rejects.toThrow(
+    await expect(shareSpend(reader, { shareId: "share", currency: "US" })).rejects.toThrow(
       RangeError,
     );
     expect(statements).toEqual([]);

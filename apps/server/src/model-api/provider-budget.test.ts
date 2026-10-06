@@ -27,8 +27,6 @@ const state = vi.hoisted(() => {
       currency: string;
       version: number;
     }>,
-    /** Replaces the cap set the next time it is read (a concurrent cap edit). */
-    capsAfterNextRead: undefined as undefined | (() => void),
     models: [] as Array<{ id: string; userId: string; providerAccountId: string }>,
     pricing: [] as Array<{ providerModelId: string; version: string; currency: string }>,
     attempts: new Map<string, Record<string, unknown>>(),
@@ -65,9 +63,6 @@ vi.mock("@ws-model-proxy/db", async () => {
         const rows = state.caps.filter(
           (cap) => cap.userId === where.userId && where.OR.some((clause) => matches(cap, clause)),
         );
-        const change = state.capsAfterNextRead;
-        state.capsAfterNextRead = undefined;
-        change?.();
         return rows.map(({ id, scope, monthlyLimit, currency, version }) => ({
           id,
           scope,
@@ -201,47 +196,41 @@ vi.mock("@ws-model-proxy/db/spend", async () => {
     }
     return total;
   };
+  /** Settled (ledger) plus in-flight (ACTIVE attempts without a ledger row) for a scope. */
+  const usage = (key: "providerAccountId" | "shareId", value: string) => {
+    const settledAttempts = new Set(
+      state.ledger
+        .filter((row) => row[key] === value)
+        .map((row) => `${row.attemptId}|${row.fencingToken}`),
+    );
+    let spentThisMonth = zero();
+    for (const entry of settledAttempts) {
+      const [attemptId, token] = entry.split("|");
+      spentThisMonth = spentThisMonth.plus(attemptTotal(attemptId, BigInt(token ?? "0")));
+    }
+    let reservedNow = zero();
+    for (const attempt of state.attempts.values())
+      if (
+        attempt[key] === value &&
+        attempt.kind === "CLOUD" &&
+        attempt.state === "ACTIVE" &&
+        !state.ledger.some(
+          (row) => row.attemptId === attempt.id && row.fencingToken === attempt.fencingToken,
+        )
+      )
+        reservedNow = reservedNow.plus(
+          (attempt.liabilitySpend as InstanceType<typeof Prisma.Decimal> | null) ?? zero(),
+        );
+    return { spentThisMonth, reservedNow };
+  };
   return {
     providerAccountSpend: async (_db: unknown, input: { providerAccountId: string }) => {
       state.log.push("read:account-usage");
-      const settledAttempts = new Set(
-        state.ledger
-          .filter((row) => row.providerAccountId === input.providerAccountId)
-          .map((row) => `${row.attemptId}|${row.fencingToken}`),
-      );
-      let spentThisMonth = zero();
-      for (const key of settledAttempts) {
-        const [attemptId, token] = key.split("|");
-        spentThisMonth = spentThisMonth.plus(attemptTotal(attemptId, BigInt(token ?? "0")));
-      }
-      let reservedNow = zero();
-      for (const attempt of state.attempts.values())
-        if (
-          attempt.providerAccountId === input.providerAccountId &&
-          attempt.kind === "CLOUD" &&
-          attempt.state === "ACTIVE" &&
-          !settledAttempts.has(`${attempt.id}|${attempt.fencingToken}`)
-        )
-          reservedNow = reservedNow.plus(
-            (attempt.liabilitySpend as InstanceType<typeof Prisma.Decimal> | null) ?? zero(),
-          );
-      return { spentThisMonth, reservedNow };
+      return usage("providerAccountId", input.providerAccountId);
     },
-    shareCapSpend: async (_db: unknown, input: { capId: string }) => {
+    shareSpend: async (_db: unknown, input: { shareId: string }) => {
       state.log.push("read:share-usage");
-      let spentThisMonth = zero();
-      let reservedNow = zero();
-      for (const reservation of state.reservations.filter((row) => row.capId === input.capId)) {
-        if (reservation.state === "RESERVED")
-          reservedNow = reservedNow.plus(
-            reservation.reservedValue as InstanceType<typeof Prisma.Decimal>,
-          );
-        else
-          spentThisMonth = spentThisMonth.plus(
-            attemptTotal(reservation.attemptId, reservation.fencingToken),
-          );
-      }
-      return { spentThisMonth, reservedNow };
+      return usage("shareId", input.shareId);
     },
   };
 });
@@ -321,9 +310,9 @@ function capOnShare(limit: string) {
 }
 
 beforeEach(() => {
+  state.now = new Date("2026-10-06T12:00:00.000Z");
   state.log.length = 0;
   state.caps.length = 0;
-  state.capsAfterNextRead = undefined;
   state.models.splice(0, state.models.length, {
     id: "model",
     userId: "owner",
@@ -469,27 +458,46 @@ describe("spend admission", () => {
     expect(state.reservations.map((row) => row.capId).sort()).toEqual(["cap-account", "cap-share"]);
   });
 
-  it("takes the attempt fence, then the cap fences, before any write", async () => {
+  it("takes the attempt and cap-subject fences before reading caps or writing", async () => {
     capOnAccount("5");
     capOnShare("5");
     await admitProviderBudget(attempt({ shareId: "share", attemptId: "fenced" }));
-    expect(state.log.slice(0, 4)).toEqual([
-      "fences:01:spend-attempt:fenced",
-      "read:caps",
-      "fences:04:spend-cap:cap-account,04:spend-cap:cap-share",
+    expect(state.log.slice(0, 2)).toEqual([
+      "fences:01:spend-attempt:fenced,04:spend-account:account,04:spend-share:share",
       "read:caps",
     ]);
     const firstWrite = state.log.findIndex((entry) => entry.startsWith("write:"));
-    expect(firstWrite).toBeGreaterThan(state.log.indexOf("read:account-usage"));
+    expect(firstWrite).toBeGreaterThan(state.log.indexOf("read:share-usage"));
   });
 
-  it("restarts when a cap appears between the unlocked read and its fence", async () => {
-    state.capsAfterNextRead = () => capOnAccount("0.50");
+  it("serializes on the account even without a cap, so a cap created later counts it", async () => {
+    const early = attempt({ attemptId: "early" });
+    await admitProviderBudget(early);
+    expect(state.log[0]).toBe("fences:01:spend-attempt:early,04:spend-account:account");
+    // A cap appears while `early` is still in flight: its liability is reserved against it.
+    capOnAccount("1.50");
     await expect(admitProviderBudget(attempt())).resolves.toMatchObject({
       admitted: false,
       reason: "BUDGET_EXCEEDED",
     });
-    expect(state.log.filter((entry) => entry.startsWith("fences:01"))).toHaveLength(2);
+  });
+
+  it("counts the whole month of a share's spend when its cap is set mid-month", async () => {
+    const shared = () => attempt({ shareId: "share", granteeUserId: "grantee" });
+    const before = shared();
+    await admitProviderBudget(before);
+    await reconcileProviderBudget({
+      ...terminalFor(before),
+      reason: "COMPLETED",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT",
+    });
+    expect(state.ledger[0]).toMatchObject({ shareId: "share", settledCost: D("1.00") });
+    capOnShare("1.50");
+    await expect(admitProviderBudget(shared())).resolves.toMatchObject({
+      admitted: false,
+      reason: "GRANTEE_BUDGET_EXCEEDED",
+    });
   });
 
   it("enforces a lowered cap (a version bump) on the next admission", async () => {
@@ -710,9 +718,13 @@ describe("crash repair", () => {
     capOnAccount("100");
     const input = attempt();
     await admitProviderBudget(input);
-    await expect(
-      repairExpiredProviderBudgets(new Date(state.now.getTime() + 16 * 60_000)),
-    ).resolves.toBe(1);
+    const later = new Date(state.now.getTime() + 16 * 60_000);
+    // The sweeping replica's clock alone is not enough: the database clock decides.
+    await repairExpiredProviderBudgets(later);
+    expect(state.ledger).toEqual([]);
+    expect(state.attempts.get(input.attemptId)?.state).toBe("ACTIVE");
+    state.now = later;
+    await expect(repairExpiredProviderBudgets(later)).resolves.toBe(1);
     expect(state.ledger[0]).toMatchObject({
       settledCost: D("1.00"),
       terminalReason: "CRASH_RECOVERY",
