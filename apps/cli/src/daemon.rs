@@ -1095,7 +1095,7 @@ fn run_relay_session(
     let (worker_tx, worker_rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
     let mut terminals = TerminalRegistry::new(worker_tx.clone());
     let mut execs = ExecRegistry::new(worker_tx.clone(), DEFAULT_EXEC_TIMEOUT);
-    // 2.11 live speech-to-text sessions; dropping the registry ends them all.
+    // 2.4 live speech-to-text sessions; dropping the registry ends them all.
     let mut stt = crate::stt::SttRegistry::new(worker_tx.clone());
     // 2.8 node file ops run on the daemon's file pool, never on this loop; the
     // relay keeps only the ops it has pending. Dropping it cancels them all.

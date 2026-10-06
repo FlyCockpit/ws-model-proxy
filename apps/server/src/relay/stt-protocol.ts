@@ -10,7 +10,7 @@ import { z } from "zod";
 import { relayFailureSchema } from "./relay-failure.js";
 
 /**
- * Relay 2.11 live speech-to-text frames (`stt.*`), extended in place. A server
+ * Relay 2.4 live speech-to-text frames (`stt.*`), extended in place. A server
  * opens a session on one endpoint that advertises
  * `audio.transcriptions.realtime`, streams raw PCM to it and receives
  * normalized transcription events. Neither side ever sees engine or OpenAI

@@ -1,5 +1,5 @@
 {
-  "protocolVersion": "2.11",
+  "protocolVersion": "2.4",
   "frames": {
     "openVllm": "{\"type\":\"stt.open\",\"sessionId\":\"AAECAwQFBgcICQoLDA0ODw\",\"endpointSlug\":\"inst-voxtral-a1b2c3d4e5f6\",\"upstreamModel\":\"mistralai/Voxtral-Mini-4B-Realtime-2602\",\"adapter\":\"vllm\",\"config\":{},\"maxItemSeconds\":300,\"maxSessionMs\":1800000,\"audioWindowBytes\":262144}",
     "openSegmented": "{\"type\":\"stt.open\",\"sessionId\":\"AAECAwQFBgcICQoLDA0ODw\",\"endpointSlug\":\"inst-voxtral-a1b2c3d4e5f6\",\"upstreamModel\":\"mistralai/Voxtral-Mini-4B-Realtime-2602\",\"adapter\":\"segmented\",\"config\":{\"language\":\"es-MX\",\"prompt\":\"Términos: \\\"WSMP\\\"\\nfin\"},\"maxItemSeconds\":120,\"maxSessionMs\":1000,\"audioWindowBytes\":1048576}",

@@ -1236,7 +1236,7 @@ export type RelayServerControlMessage =
       readGrant: boolean;
     }
   | { type: "file.cancel"; opId: string }
-  /** 2.11: live speech-to-text (`stt-protocol.ts`). */
+  /** 2.4: live speech-to-text (`stt-protocol.ts`). */
   | SttServerControlMessage;
 
 const relayBodyMetadataFields = {
@@ -1294,7 +1294,7 @@ const relayBinaryFrameMetadataSchema = z.discriminatedUnion("type", [
   fileBodyMetadataSchema,
   /** 2.8: a `file.result` text field above the inline 48 KiB, CLI to server. */
   fileDataMetadataSchema,
-  /** 2.11: live speech-to-text PCM, server to CLI. */
+  /** 2.4: live speech-to-text PCM, server to CLI. */
   sttAudioMetadataSchema,
 ]);
 
@@ -1411,7 +1411,7 @@ export function encodeRelayServerControlMessage(message: RelayServerControlMessa
       "deployment.job operator must accompany exactly interactive jobs.",
     );
   }
-  // 2.11 live speech-to-text frames fail closed against the shared golden contract.
+  // 2.4 live speech-to-text frames fail closed against the shared golden contract.
   if (message.type.startsWith("stt.") && !sttServerControlSchema.safeParse(message).success) {
     throw new RelayProtocolError(`${message.type} fails the wire schema.`);
   }

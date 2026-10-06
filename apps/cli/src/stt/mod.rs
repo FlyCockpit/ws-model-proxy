@@ -1,4 +1,4 @@
-//! Live speech-to-text sessions (relay 2.11 `stt.*`), the CLI side.
+//! Live speech-to-text sessions (relay 2.4 `stt.*`), the CLI side.
 //!
 //! The relay loop owns a [`SttRegistry`]. It validates every `stt.open`
 //! against the node's recipe-managed endpoints, enforces the caps, keeps the

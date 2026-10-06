@@ -295,13 +295,13 @@ assignment provenance and automatic concurrency seed columns.
   turn is ended for the client, since there is no voice activity detection;
   `maxSessions` (1–8) caps live sessions per endpoint. Without the block an
   endpoint takes no live sessions. The CLI advertises the block in its
-  transcription capability; this is part of relay protocol 2.11, not a new
+  transcription capability; this is part of relay protocol 2.4, not a new
   version. Live sessions open only on recipe-managed endpoints.
   For a Voxtral realtime model, the whole turn shares one context, so a small
   `--max-model-len` can fail a long turn part-way; keep `maxItemSeconds` well
   inside it (600 s is roughly 7.5k audio tokens). Qwen3-ASR realtime is not
   affected.
-  Version skew (development builds only, since 2.11 is unreleased): upgrade
+  Version skew (development builds only, since 2.4 is unreleased): upgrade
   every CLI before adding a `realtime` block, because an older CLI cannot read
   the job and the start fails only at its deadline (up to 15 minutes). After
   downgrading a CLI that ran one, remove its deployment state file. Do not roll

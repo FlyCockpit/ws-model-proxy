@@ -478,19 +478,19 @@ pub enum ClientControlMessage {
     /// 2.7: live engine load for one endpoint (or one model on it).
     #[serde(rename = "endpoint.load")]
     EndpointLoad(EndpointLoad),
-    /// 2.11: the engine side of a live speech-to-text session is ready.
+    /// 2.4: the engine side of a live speech-to-text session is ready.
     #[serde(rename = "stt.opened")]
     SttOpened { session_id: String },
-    /// 2.11: audio bytes handed to the engine; returns that much credit.
+    /// 2.4: audio bytes handed to the engine; returns that much credit.
     #[serde(rename = "stt.audio.ack")]
     SttAudioAck { session_id: String, bytes: u32 },
-    /// 2.11: one normalized transcription event.
+    /// 2.4: one normalized transcription event.
     #[serde(rename = "stt.event")]
     SttEvent {
         session_id: String,
         event: crate::stt_wire::SttEvent,
     },
-    /// 2.11: the session failed (before or after open); terminal.
+    /// 2.4: the session failed (before or after open); terminal.
     #[serde(rename = "stt.error")]
     SttError {
         session_id: String,
@@ -498,7 +498,7 @@ pub enum ClientControlMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
-    /// 2.11: the answer to `stt.close`.
+    /// 2.4: the answer to `stt.close`.
     #[serde(rename = "stt.closed")]
     SttClosed { session_id: String },
 }
@@ -1484,7 +1484,7 @@ pub enum ServerControlMessage {
     FileCancel {
         op_id: String,
     },
-    /// 2.11: live speech-to-text control.
+    /// 2.4: live speech-to-text control.
     Stt(crate::stt_wire::SttServerMessage),
     Unknown {
         type_name: String,
@@ -1557,7 +1557,7 @@ pub enum RelayBinaryFrameMetadata {
     /// 2.8, CLI to server: a `file.result` text field above the inline 48 KiB.
     #[serde(rename = "file.data")]
     FileData { op_id: String },
-    /// 2.11, server to CLI: live speech-to-text PCM (s16le, 24 kHz mono).
+    /// 2.4, server to CLI: live speech-to-text PCM (s16le, 24 kHz mono).
     #[serde(rename = "stt.audio")]
     SttAudio { session_id: String, seq: u64 },
 }
@@ -2348,11 +2348,11 @@ pub enum FrameFault {
     RejectFile {
         op_id: String,
     },
-    /// 2.11: a malformed `stt.open` that names a session: answer `stt.error`.
+    /// 2.4: a malformed `stt.open` that names a session: answer `stt.error`.
     RejectStt {
         session_id: String,
     },
-    /// 2.11: any other malformed `stt.*` frame (text or `stt.audio`) that
+    /// 2.4: any other malformed `stt.*` frame (text or `stt.audio`) that
     /// names a session: a live session fails, an unknown one is ignored.
     FailStt {
         session_id: String,
@@ -2528,7 +2528,7 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
     if type_name.starts_with("file.") {
         return FrameFault::Ignore;
     }
-    // 2.11 live speech-to-text: a bad frame concerns one session, never the
+    // 2.4 live speech-to-text: a bad frame concerns one session, never the
     // relay. A bad `stt.open` is refused by name so the server can try
     // another node at once; any other bad frame for a live session fails
     // that session (its audio or commands would be lost otherwise).

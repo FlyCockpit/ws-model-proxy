@@ -14,7 +14,7 @@
     "failed": "{\"type\":\"stt.event\",\"sessionId\":\"AAECAwQFBgcICQoLDA0ODw\",\"event\":{\"kind\":\"failed\",\"itemSeq\":4,\"code\":\"upstream_4xx\",\"message\":\"the engine refused the audio\"}}",
     "opened": "{\"type\":\"stt.opened\",\"sessionId\":\"AAECAwQFBgcICQoLDA0ODw\"}"
   },
-  "protocolVersion": "2.11",
+  "protocolVersion": "2.4",
   "rejected": {
     "ackOverWindow": "{\"type\":\"stt.audio.ack\",\"sessionId\":\"AAECAwQFBgcICQoLDA0ODw\",\"bytes\":1048577}",
     "ackZero": "{\"type\":\"stt.audio.ack\",\"sessionId\":\"AAECAwQFBgcICQoLDA0ODw\",\"bytes\":0}",

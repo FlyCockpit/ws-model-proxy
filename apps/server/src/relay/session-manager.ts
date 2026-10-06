@@ -1732,7 +1732,7 @@ export class RelaySessionManager {
       return;
     }
 
-    // 2.11 live speech-to-text. Frames for sessions this CLI does not hold
+    // 2.4 live speech-to-text. Frames for sessions this CLI does not hold
     // (late, or another CLI's) are dropped.
     if (isSttClientMessage(message)) {
       if (session.cliDeviceId) this.stt.handleClientFrame(this.sttLinkFor(session), message);

@@ -1,4 +1,4 @@
-//! Relay 2.11 live speech-to-text frames (`stt.*`), the mirror of
+//! Relay 2.4 live speech-to-text frames (`stt.*`), the mirror of
 //! `apps/server/src/relay/stt-protocol.ts`.
 //!
 //! The server opens a session on one endpoint that advertises
