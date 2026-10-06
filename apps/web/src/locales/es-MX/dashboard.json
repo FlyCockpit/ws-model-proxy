@@ -1892,6 +1892,7 @@
     },
     "allVisible": "Todos los visibles",
     "allowlist": "Lista permitida",
+    "allowlistCount": "Lista permitida ({{count}})",
     "allowlistModels": "Modelos permitidos",
     "cliDescription": "Crea y revoca tokens CLI nativos del producto. Los secretos sin procesar solo se muestran una vez.",
     "cliSecret": "Secreto del token CLI",

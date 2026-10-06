@@ -234,6 +234,19 @@ describe("creating model API tokens", () => {
   });
 });
 
+describe("token list", () => {
+  it("shows the scope column in locale strings, not raw enum values", () => {
+    state.tokens = [
+      token({ id: "all", name: "All", scopeMode: "ALL_VISIBLE" }),
+      token({ id: "some", name: "Some" }),
+    ];
+    mount();
+    expect(screen.getByText("dashboard:tokens.allVisible")).toBeTruthy();
+    expect(screen.getByText("dashboard:tokens.allowlistCount")).toBeTruthy();
+    expect(screen.queryByText(/ALL_VISIBLE|ALLOWLIST/)).toBeNull();
+  });
+});
+
 describe("cloud access dialog", () => {
   it("saves an all-visible token's consent in one call", async () => {
     state.tokens = [token({ scopeMode: "ALL_VISIBLE" })];

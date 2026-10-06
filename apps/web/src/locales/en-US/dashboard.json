@@ -1635,6 +1635,7 @@
     },
     "allVisible": "All visible",
     "allowlist": "Allowlist",
+    "allowlistCount": "Allowlist ({{count}})",
     "allowlistModels": "Allowlisted models",
     "cliDescription": "Create and revoke product-native CLI tokens used to register a relay. These are not model API tokens. Raw secrets are shown only once.",
     "cliSecret": "CLI token secret",
