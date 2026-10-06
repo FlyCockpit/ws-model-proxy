@@ -65,6 +65,7 @@ const REQUIRED_OBJECTS = [
   "node_frozen_fabrics_shape",
   "node_temporary_shape",
   "node_hold_shape",
+  "node_hold_profile_owner",
   "node_command_max_check",
   "node_command_shape",
   "node_command_transition",
@@ -126,6 +127,7 @@ const REQUIRED_OBJECTS = [
   "share_invite_shape",
   "share_invite_transition",
   "share_invite_one_pending",
+  "share_invite_expiry",
   "api_key_pool_access",
   // providers and spend
   "provider_account_shape_check",
@@ -507,9 +509,9 @@ try {
   await client.query(`UPDATE node SET "removeAfterOfflineMs" = 2592000000 WHERE id = 'node-a3'`);
   await client.query(`UPDATE node SET "removeAfterOfflineMs" = NULL WHERE id = 'node-a3'`);
   await expectFailure(
-    "node hold profile foreign key",
+    "node_hold_profile_owner unknown profile",
     `UPDATE node SET "holdAt" = now(), "holdProfileId" = 'no-such-profile' WHERE id = 'node-a3'`,
-    "23503",
+    "23514",
   );
   await expectFailure(
     "node_trust_lower_shape",
@@ -703,6 +705,20 @@ try {
     INSERT INTO profile (id, "userId", slug, name, editor, "editorUserId") VALUES
       ('prof-a', 'owner-a', 'day', 'Day', 'USER', 'owner-a');
     INSERT INTO profile_node ("profileId", "nodeId") VALUES ('prof-a', 'node-a2');`);
+  await client.query(`
+    INSERT INTO profile (id, "userId", slug, name, editor, "editorUserId") VALUES
+      ('prof-b-hold', 'owner-b', 'night', 'Night', 'USER', 'owner-b')`);
+  await expectFailure(
+    "node_hold_profile_owner another owner's profile",
+    `UPDATE node SET "holdAt" = now(), "holdProfileId" = 'prof-b-hold' WHERE id = 'node-a3'`,
+    "23514",
+  );
+  await client.query(
+    `UPDATE node SET "holdAt" = now(), "holdProfileId" = 'prof-a' WHERE id = 'node-a3'`,
+  );
+  await client.query(
+    `UPDATE node SET "holdAt" = NULL, "holdProfileId" = NULL WHERE id = 'node-a3'`,
+  );
   await expectFailure(
     "profile_owner_consistency node",
     `INSERT INTO profile_node ("profileId", "nodeId") VALUES ('prof-a', 'node-b1')`,
@@ -835,6 +851,16 @@ try {
     `INSERT INTO share_invite (id, "poolId", "ownerUserId", email, "tokenDigest", "expiresAt")
      VALUES ('inv-3', 'pool-a', 'owner-a', 'b@example.test', ${HEX("d")}, now() + interval '7 days')`,
     "23505",
+  );
+  await expectFailure(
+    "share_invite_transition expiry without a new link",
+    `UPDATE share_invite SET "expiresAt" = now() + interval '14 days' WHERE id = 'inv-2'`,
+    "55000",
+  );
+  await expectFailure(
+    "share_invite_expiry beyond 30 days",
+    `UPDATE share_invite SET "tokenDigest" = ${HEX("f")}, "expiresAt" = now() + interval '31 days' WHERE id = 'inv-2'`,
+    "23514",
   );
   await client.query(
     `UPDATE share_invite SET "tokenDigest" = ${HEX("e")}, "expiresAt" = now() + interval '14 days' WHERE id = 'inv-2'`,

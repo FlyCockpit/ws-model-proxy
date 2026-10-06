@@ -1258,7 +1258,7 @@ export const serverToNodeControlFrameSchema = z.discriminatedUnion("type", [
         "images",
         "generic",
       ]),
-      method: z.enum(["GET", "POST"]),
+      method: z.enum(["GET", "POST", "DELETE"]),
       /** Checked by the node against the §4.8 allowlist for the runtime's api and model type. */
       path: z.string().min(1).max(2048),
       headers: z.record(headerName, headerValue),

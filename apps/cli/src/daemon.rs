@@ -1144,6 +1144,7 @@ where
                     method: match method {
                         HttpMethod::Get => "GET",
                         HttpMethod::Post => "POST",
+                        HttpMethod::Delete => "DELETE",
                     }
                     .to_string(),
                     path,

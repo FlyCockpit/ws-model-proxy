@@ -1126,6 +1126,9 @@ pub enum HttpMethod {
     Get,
     #[serde(rename = "POST")]
     Post,
+    /// `DELETE /v1/responses/{id}` (stored Responses objects on the engine).
+    #[serde(rename = "DELETE")]
+    Delete,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1986,6 +1989,23 @@ mod tests {
         for ip in list("invalid") {
             assert!(!is_fabric_ip(&ip), "{ip} should be refused");
         }
+    }
+
+    #[test]
+    fn relay_requests_may_delete_stored_responses() {
+        let mut frame: Value = serde_json::from_str(
+            &std::fs::read_to_string(fixtures().join("frames/server-to-node/relay.request.json"))
+                .expect("relay.request fixture"),
+        )
+        .expect("fixture is JSON");
+        frame["method"] = Value::String("DELETE".into());
+        frame["path"] = Value::String("/v1/responses/resp_1".into());
+        let parsed: ServerFrame = serde_json::from_value(frame).expect("DELETE parses");
+        assert!(
+            serde_json::to_string(&parsed)
+                .expect("serializes")
+                .contains("\"DELETE\"")
+        );
     }
 
     #[test]

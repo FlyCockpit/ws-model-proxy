@@ -385,6 +385,46 @@ describe("0.4.0 MCP tool manifest", () => {
       expect(path.startsWith("nodes.secrets."), path).toBe(true);
   });
 
+  it("takes a secret value only in a listed sensitive procedure", () => {
+    /** Property paths of a JSON Schema (objects, arrays, unions). */
+    const paths = (schema: unknown, prefix: string[] = []): string[][] => {
+      if (!schema || typeof schema !== "object") return [];
+      const node = schema as Record<string, unknown>;
+      const out: string[][] = [];
+      for (const [key, child] of Object.entries(
+        (node.properties ?? {}) as Record<string, unknown>,
+      )) {
+        out.push([...prefix, key], ...paths(child, [...prefix, key]));
+      }
+      for (const key of ["items", "additionalProperties"] as const)
+        if (node[key] && typeof node[key] === "object") out.push(...paths(node[key], prefix));
+      for (const key of ["anyOf", "oneOf", "allOf"] as const)
+        for (const branch of (node[key] as unknown[] | undefined) ?? [])
+          out.push(...paths(branch, prefix));
+      return out;
+    };
+    const offenders: string[] = [];
+    for (const [path, procedure] of procedures) {
+      const schema = z.toJSONSchema(procedure.input, { io: "input", unrepresentable: "any" });
+      for (const property of paths(schema)) {
+        const full = [...path.split("."), ...property].join(".");
+        if (
+          property.at(-1) === "value" &&
+          /secret/i.test(full) &&
+          !SENSITIVE_INPUT_PROCEDURES.has(path)
+        )
+          offenders.push(full);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // The rule sees the one procedure that does take a value.
+    const setSchema = z.toJSONSchema(procedures.get("nodes.secrets.set")?.input ?? z.object({}), {
+      io: "input",
+      unrepresentable: "any",
+    });
+    expect(paths(setSchema).map((property) => property.join("."))).toContain("value");
+  });
+
   it("forks return what create returns and take the same settings", () => {
     expect(procedures.get("runtimes.fork")?.output).toBe(procedures.get("runtimes.create")?.output);
     expect(

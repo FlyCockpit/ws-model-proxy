@@ -233,3 +233,18 @@ describe("node secrets and fabrics on the wire", () => {
     expect(nodeFabricsHash(parsed.node.fabrics.sets)).toBe(parsed.node.fabrics.hash);
   });
 });
+
+describe("relay.request methods", () => {
+  it("relays DELETE (stored Responses objects) as well as GET and POST", () => {
+    const frame = JSON.parse(
+      readFileSync(join(FIXTURES, "frames/server-to-node/relay.request.json"), "utf8"),
+    ) as Record<string, unknown>;
+    for (const method of ["GET", "POST", "DELETE"])
+      expect(serverToNodeControlFrameSchema.safeParse({ ...frame, method }).success, method).toBe(
+        true,
+      );
+    expect(serverToNodeControlFrameSchema.safeParse({ ...frame, method: "PUT" }).success).toBe(
+      false,
+    );
+  });
+});

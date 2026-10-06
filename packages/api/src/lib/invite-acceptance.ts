@@ -4,7 +4,7 @@
  *
  * - Through the link (the token matched a pending, unexpired invite): accepted, whatever the
  *   e-mail on the account; the token is the proof.
- * - Without the link: only invites to the account's e-mail, and only when that e-mail is
+ * - Without the link: only invites to the account's e-mail (`inviteEmailKey`), and only when it is
  *   verified. With e-mail verification off (no SMTP), anyone could register the address, so
  *   only the link works (`invite_needs_link`).
  */
@@ -21,6 +21,15 @@ export type InviteAcceptance =
   | { accept: true; inviteIds: string[] }
   | { accept: false; reason: "invite_needs_link" | "none" };
 
+/**
+ * The e-mail key invites are matched by: trimmed, ASCII letters lower-cased only (as SQL
+ * lower() under the C collation stores it). Unicode case folding would let e.g. the Kelvin
+ * sign (U+212A) match "k".
+ */
+export function inviteEmailKey(email: string): string {
+  return email.trim().replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+}
+
 function pending(invite: PendingInvite, now: Date): boolean {
   return invite.acceptedAt === null && invite.revokedAt === null && invite.expiresAt > now;
 }
@@ -35,7 +44,7 @@ export function inviteAcceptance(input: {
 }): InviteAcceptance {
   if (input.linkInvite && pending(input.linkInvite, input.now))
     return { accept: true, inviteIds: [input.linkInvite.id] };
-  const email = input.account.email.trim().toLowerCase();
+  const email = inviteEmailKey(input.account.email);
   const matching = input.emailInvites.filter(
     (invite) => invite.email === email && pending(invite, input.now),
   );

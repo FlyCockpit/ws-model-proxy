@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { inviteAcceptance, type PendingInvite } from "./invite-acceptance";
+import { inviteAcceptance, inviteEmailKey, type PendingInvite } from "./invite-acceptance";
 import { isFabricIp } from "./ip-literal";
 import { planProfileHolds } from "./profile-holds";
 import { fabricIpSchema, runtimeBaseUrlSchema, runtimeSpecWarnings } from "./runtime-spec";
@@ -146,6 +146,19 @@ describe("invite acceptance", () => {
         now,
       }),
     ).toEqual({ accept: false, reason: "invite_needs_link" });
+  });
+
+  it("folds ASCII case only, as SQL lower() does (no Kelvin-sign match)", () => {
+    expect(inviteEmailKey(" A@Example.COM ")).toBe("a@example.com");
+    expect(inviteEmailKey("\u212Aate@example.com")).toBe("\u212Aate@example.com");
+    expect(
+      inviteAcceptance({
+        account: { email: "\u212Aate@example.com", emailVerified: true },
+        linkInvite: null,
+        emailInvites: [invite({ email: "kate@example.com" })],
+        now,
+      }),
+    ).toEqual({ accept: false, reason: "none" });
   });
 
   it("accepts a verified e-mail match, never an expired, revoked or accepted invite", () => {

@@ -213,6 +213,21 @@ ALTER TABLE node ADD CONSTRAINT node_hold_shape CHECK (
   ("holdAt" IS NOT NULL OR ("holdNote" IS NULL AND "holdProfileId" IS NULL))
   AND ("holdNote" IS NULL OR length("holdNote") BETWEEN 1 AND 500)
 );
+-- A profile hold names a profile of the node's owner.
+CREATE OR REPLACE FUNCTION enforce_node_hold_profile_owner()
+RETURNS trigger LANGUAGE plpgsql AS $node_hold_profile_owner$
+BEGIN
+  IF NEW."holdProfileId" IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM profile p WHERE p.id = NEW."holdProfileId" AND p."userId" = NEW."userId"
+  ) THEN
+    RAISE EXCEPTION 'a node hold names a profile of the node''s owner' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$node_hold_profile_owner$;
+DROP TRIGGER IF EXISTS node_hold_profile_owner ON node;
+CREATE TRIGGER node_hold_profile_owner BEFORE INSERT OR UPDATE OF "holdProfileId", "userId" ON node
+FOR EACH ROW EXECUTE FUNCTION enforce_node_hold_profile_owner();
 -- Temporary nodes: removed after 1 min .. 30 days offline (the sweeper deletes them like a
 -- manual delete).
 ALTER TABLE node DROP CONSTRAINT IF EXISTS node_temporary_shape;
@@ -1008,7 +1023,7 @@ ALTER TABLE share_invite ADD CONSTRAINT share_invite_shape CHECK (
   email = lower(btrim(email)) AND length(email) BETWEEN 3 AND 320 AND position('@' in email) > 1
   AND "tokenDigest" ~ '^[0-9a-f]{64}$'
   AND ("canUse" OR "canContribute")
-  AND "expiresAt" > "createdAt" AND "expiresAt" <= "updatedAt" + interval '30 days'
+  AND "expiresAt" > "createdAt"
   AND NOT ("acceptedAt" IS NOT NULL AND "revokedAt" IS NOT NULL)
   AND ("shareId" IS NULL OR "acceptedAt" IS NOT NULL)
 );
@@ -1023,11 +1038,16 @@ BEGIN
                              'expiresAt']::text[]) THEN
     RAISE EXCEPTION 'a share invite keeps its pool and e-mail' USING ERRCODE = '55000';
   END IF;
-  -- Resend rotates the token and the expiry, only while the invite is pending.
+  -- Resend rotates the token and the expiry, only while the invite is pending, and the expiry
+  -- only moves together with a new token (an old link never gets more time).
   IF (OLD."acceptedAt" IS NOT NULL OR OLD."revokedAt" IS NOT NULL)
      AND (NEW."tokenDigest" IS DISTINCT FROM OLD."tokenDigest"
           OR NEW."expiresAt" IS DISTINCT FROM OLD."expiresAt") THEN
     RAISE EXCEPTION 'an accepted or revoked share invite is final' USING ERRCODE = '55000';
+  END IF;
+  IF NEW."expiresAt" IS DISTINCT FROM OLD."expiresAt"
+     AND NEW."tokenDigest" IS NOT DISTINCT FROM OLD."tokenDigest" THEN
+    RAISE EXCEPTION 'a share invite gets a new expiry only with a new link' USING ERRCODE = '55000';
   END IF;
   IF (OLD."acceptedAt" IS NOT NULL OR OLD."revokedAt" IS NOT NULL)
      AND (NEW."acceptedAt" IS DISTINCT FROM OLD."acceptedAt"
@@ -1051,6 +1071,20 @@ $share_invite_transition$;
 DROP TRIGGER IF EXISTS share_invite_transition ON share_invite;
 CREATE TRIGGER share_invite_transition BEFORE UPDATE ON share_invite
 FOR EACH ROW EXECUTE FUNCTION enforce_share_invite_transition();
+-- A link is valid at most 30 days from when it was issued (created or resent).
+CREATE OR REPLACE FUNCTION enforce_share_invite_expiry()
+RETURNS trigger LANGUAGE plpgsql AS $share_invite_expiry$
+BEGIN
+  IF (TG_OP = 'INSERT' OR NEW."expiresAt" IS DISTINCT FROM OLD."expiresAt")
+     AND NEW."expiresAt" > now() + interval '30 days' THEN
+    RAISE EXCEPTION 'a share invite link lasts at most 30 days' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$share_invite_expiry$;
+DROP TRIGGER IF EXISTS share_invite_expiry ON share_invite;
+CREATE TRIGGER share_invite_expiry BEFORE INSERT OR UPDATE OF "expiresAt" ON share_invite
+FOR EACH ROW EXECUTE FUNCTION enforce_share_invite_expiry();
 -- One pending invite per pool and e-mail; accepted and revoked ones are history.
 CREATE UNIQUE INDEX IF NOT EXISTS share_invite_one_pending
   ON share_invite ("poolId", email) WHERE "acceptedAt" IS NULL AND "revokedAt" IS NULL;
