@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+// The server env validates on import; nothing these tests reach reads it, so
+// the strict (empty-env) unit run gets an empty one.
+vi.mock("@ws-model-proxy/env/server", () => ({ env: {} }));
+
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
   return { default: mockDeep() };
