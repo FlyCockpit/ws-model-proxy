@@ -12,6 +12,7 @@ import type {
   nodeSummarySchema,
   queuedCommandViewSchema,
 } from "../contracts/nodes";
+import { nodeFabricsHash, nodeMetricCommandsHash } from "../lib/runtime-launch-hash";
 import {
   declaredHardwareSchema,
   nodeFeaturesSchema,
@@ -248,8 +249,16 @@ export function toQueuedCommandView(row: {
   };
 }
 
-function hashesInSync(server: string | null, held: string | null): boolean {
-  return server === held;
+/**
+ * The server stores null for "no metric commands / fabrics and nothing held"; a node that was
+ * sent the empty list reports the empty list's hash. Both mean the same definition.
+ */
+const EMPTY_METRIC_COMMANDS_HASH = nodeMetricCommandsHash([]);
+const EMPTY_FABRICS_HASH = nodeFabricsHash([]);
+
+/** Also "in sync" for a node never synced while the server has nothing to push. */
+function hashesInSync(server: string | null, held: string | null, empty: string): boolean {
+  return (server ?? empty) === (held ?? empty);
 }
 
 export function toNodeDetail(
@@ -306,9 +315,13 @@ export function toNodeDetail(
     declaredHardware: declared.success ? declared.data : null,
     portRange: [row.portStart, row.portEnd],
     metricCommands: metricCommands.success ? metricCommands.data : [],
-    metricCommandsInSync: hashesInSync(row.metricCommandsHash, row.heldMetricCommandsHash),
+    metricCommandsInSync: hashesInSync(
+      row.metricCommandsHash,
+      row.heldMetricCommandsHash,
+      EMPTY_METRIC_COMMANDS_HASH,
+    ),
     fabrics,
-    fabricsInSync: hashesInSync(row.fabricsHash, row.heldFabricsHash),
+    fabricsInSync: hashesInSync(row.fabricsHash, row.heldFabricsHash, EMPTY_FABRICS_HASH),
     fabricSuggestions: fabricSuggestions(row.nodeInfo, context.otherNodes),
     commandMaxMs: row.commandMaxMs,
     secrets: features.success ? features.data.secrets : [],

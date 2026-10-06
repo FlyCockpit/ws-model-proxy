@@ -112,6 +112,7 @@ import {
 } from "./rate-limit.js";
 import { readinessResponse } from "./readiness.js";
 import type { NodeIdentity } from "./relay/node-credential-auth.js";
+import { nodeServices, pushRuntimeDefinitions } from "./relay/node-wiring.js";
 import { relaySessionManager } from "./relay/session-manager.js";
 import {
   createTerminalWebsocketMiddleware,
@@ -256,6 +257,8 @@ function contextServices(): ContextServices {
   return {
     onPoolRoutingRulesChanged: (poolId: string) =>
       relaySessionManager.onPoolRoutingRulesChanged(poolId),
+    nodes: nodeServices,
+    pushRuntimeDefinitions,
   };
 }
 

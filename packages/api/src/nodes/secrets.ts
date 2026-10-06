@@ -42,7 +42,6 @@ async function secretTarget(context: SignedInContext, nodeId: string) {
     );
   const writeSecrets = context.services?.nodes?.writeSecrets;
   if (!writeSecrets)
-    // TODO(server): wire services.nodes.writeSecrets to the relay `secret.set` frame.
     throw refuseAbout(
       "secret_needs_node",
       node.id,

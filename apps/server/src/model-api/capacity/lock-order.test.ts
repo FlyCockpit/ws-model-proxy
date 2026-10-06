@@ -189,6 +189,10 @@ const GRAPH_WRITERS: Record<string, string> = {
   "apps/server/src/model-api/cache-affinity-generation.ts":
     "H status: bounded capacity generation then endpoint epoch; commits each before optional projection publication, no source/bucket lock overlaps",
   "apps/server/src/relay/registration.ts": "M: relay registration",
+  "apps/server/src/relay/node-services.ts":
+    "H status: node detectedServers for the current connection generation (no fenced column)",
+  "apps/server/src/relay/runtime-sync.ts":
+    "H status: node held definitions and held hashes for the current connection generation (no fenced column)",
   "apps/server/src/model-api/provider-attempt-runtime.ts":
     "H status: provider health and fencing (account -> model)",
   "packages/api/src/lib/runtime-store.ts":
@@ -204,11 +208,11 @@ const GRAPH_WRITERS: Record<string, string> = {
   "packages/api/src/profiles/procedures.ts":
     "M: profile save and apply under graphWrite (owner fence); profile delete under graphDelete (fenceParentDelete)",
   "packages/api/src/routers/access.ts":
-    "M: API keys, agent tokens, shares and invites under runAccessTransaction (sorted owner fences)",
+    "M: API keys, agent tokens, shares, own-key choices and invites under runAccessTransaction (sorted owner fences; a share cap edit then the share's spend fence)",
   "packages/api/src/routers/pools.ts":
-    "M: pools, members, routing and sidecars under graphWrite (owner fence, then pool target policy fences)",
+    "M: pools, members, routing and sidecars under graphWrite (owner fence, then pool target policy fences); an own-key equivalent change also clears the shares' own-key choices under the grantees' owner fences",
   "packages/api/src/routers/providers.ts":
-    "M: provider accounts, keys, models and prices under graphWrite (owner fence, then model target policy fences)",
+    "M: provider accounts, keys, models, prices and caps under graphWrite (owner fence, then the account's spend fence for caps, or model target policy fences); a new or restored model's execution target is inserted under the owner fence alone (provider-targets.ts takes the same owner fence first, and a skipDuplicates insert makes a race with it a no-op)",
   "packages/api/src/routers/runtime-lifecycle.ts":
     "M: start/stop operations, instances and ranks under graphWrite (owner fence, then instance capacity fences)",
   "packages/api/src/routers/runtimes.ts":
@@ -224,7 +228,7 @@ const GRAPH_WRITERS: Record<string, string> = {
   "apps/server/src/model-api/public-overflow.ts":
     "H status: the E0 send claim's credential lastUsedAt, after its owner fences and the credential row FOR UPDATE",
   "apps/server/src/model-api/provider-targets.ts":
-    "M: a provider model's execution target, created on first use under the owner then target-identity fences, account and model rows FOR KEY SHARE first",
+    "M: a provider model's missing execution target (models created before providers.models.create made it), created on first use under the owner then target-identity fences, account and model rows FOR KEY SHARE first",
   "packages/db/src/parent-deletion.ts": "user deletion marker writes (unfenced columns)",
   "packages/db/prisma/schema-hardening.sql": "D: deploy backfills (bypass marker)",
   "packages/db/scripts/verify-schema-hardening.mjs": "D: schema verification",

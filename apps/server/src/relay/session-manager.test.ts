@@ -355,6 +355,83 @@ describe("RelaySessionManager (relay 3.0)", () => {
     expect(manager.sendToNode("node-2", { type: "runtime.detect", id: "d1" })).toBe(false);
   });
 
+  it("pins lane sends to the live session and its Full control", async () => {
+    await connect();
+    const session = manager.nodeSession("node-1");
+    expect(session).toEqual({ connectionGeneration: generation, trust: "full" });
+    const frame = { type: "runtime.detect" as const, id: "d2" };
+    expect(manager.sendToNode("node-1", frame, { connectionGeneration: generation + 1 })).toBe(
+      false,
+    );
+    expect(
+      manager.sendToNode("node-1", frame, {
+        connectionGeneration: generation,
+        requireFullTrust: true,
+      }),
+    ).toBe(true);
+    manager.requestTrustLower("node-1", new Date());
+    expect(manager.sendToNode("node-1", frame, { requireFullTrust: true })).toBe(false);
+    expect(manager.nodeSession("node-1")?.trust).toBe("relay");
+  });
+
+  it("sends no lane frame before hello.ok", async () => {
+    let during: { session: unknown; sent: boolean } | null = null;
+    manager.setNodeFrameHandlers({
+      definitionSync: async () => {
+        during = {
+          session: manager.nodeSession("node-1"),
+          sent: manager.sendToNode("node-1", { type: "runtime.detect", id: "early" }),
+        };
+        return "none";
+      },
+    });
+    const socket = await connect();
+    expect(during).toEqual({ session: null, sent: false });
+    expect(socket.last("hello.ok")).toBeDefined();
+    expect(manager.nodeSession("node-1")).not.toBeNull();
+  });
+
+  it("tells the handlers when the node raises itself back to Full control", async () => {
+    const socket = await connect({ trust: "relay" });
+    const trustRaised = vi.fn();
+    manager.setNodeFrameHandlers({ trustRaised });
+    db.node.findUnique.mockResolvedValue({
+      trust: "RELAY",
+      trustLowerRequestedAt: null,
+      connectionGeneration: generation,
+    });
+    const features = {
+      terminals: { supported: true, max: 4, approvalRequired: false },
+      operatorTerminals: false,
+      files: { roots: ["/home/me"], asRoot: false },
+      runtimeHosts: [],
+      mediaExpand: false,
+      liveStt: false,
+      secrets: [],
+    };
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "node.state", trust: { value: "full", frozen: false }, features }),
+    );
+    expect(trustRaised).toHaveBeenCalledWith(expect.objectContaining({ nodeId: "node-1" }));
+    // A pending person's lowering keeps the node Relay: no raise.
+    trustRaised.mockClear();
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "node.state", trust: { value: "relay", frozen: true }, features }),
+    );
+    db.node.findUnique.mockResolvedValue({
+      trust: "RELAY",
+      trustLowerRequestedAt: new Date(),
+      connectionGeneration: generation,
+    });
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "node.state", trust: { value: "full", frozen: false }, features }),
+    );
+    expect(trustRaised).not.toHaveBeenCalled();
+  });
+
   it("drops runtime.load for a handle that names no instance on the node", async () => {
     const socket = await connect();
     const load = JSON.stringify({

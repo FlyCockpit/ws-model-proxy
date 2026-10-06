@@ -31,6 +31,7 @@ import { flushNodeAudit, stopNodeAuditWriter } from "./relay/node-audit.js";
 import { sweepExpiredNodeCommands } from "./relay/node-commands.js";
 import { sweepExpiredFileOps } from "./relay/node-file-ops.js";
 import { flushNodeMetricsRollup, stopNodeMetricsRollup } from "./relay/node-metrics-rollup.js";
+import { installNodeFrameHandlers } from "./relay/node-wiring.js";
 import { RELAY_WS_MAX_PAYLOAD_BYTES } from "./relay/protocol.js";
 import { flushRuntimeLoadRollup, stopRuntimeLoadRollup } from "./relay/runtime-load-rollup.js";
 import { relaySessionManager } from "./relay/session-manager.js";
@@ -146,9 +147,9 @@ configureHttpServerTimeouts(server as { keepAliveTimeout: number; headersTimeout
 const stopMediaCleanup = startMediaCleanup();
 // Unhealthy-target recovery probes send through the same executor as model requests.
 relaySessionManager.setRelayAttemptStarter((input) => startRelayAttempt(input));
-// Runtime definitions, inventory and jobs (lanes A2/A4) register their node frame handlers
-// with relaySessionManager.setNodeFrameHandlers when they land; until then the manager
-// acknowledges inventory and ignores the rest.
+// Node frame handlers: secret results, detected servers, runtime-definition sync
+// (relay/node-wiring.ts).
+installNodeFrameHandlers();
 const stopCacheAffinityCleanup = startCacheAffinityCleanup();
 const stopAffinityResidencyRepair = startAffinityResidencyRepair();
 const stopAffinityAuthorityMaintenance = startAffinityAuthorityMaintenance();

@@ -11,6 +11,12 @@
     "./lib/runtime-launch-hash": {
       "default": "./src/lib/runtime-launch-hash.ts"
     },
+    "./lib/node-relay-services": {
+      "default": "./src/lib/node-relay-services.ts"
+    },
+    "./nodes/fabrics": {
+      "default": "./src/nodes/fabrics.ts"
+    },
     "./nodes/enroll-exchange": {
       "default": "./src/nodes/enroll-exchange.ts"
     },

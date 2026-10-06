@@ -401,6 +401,8 @@ export type NodeFrameHandlers = {
   nodeReady?(node: NodeSessionRef): void | Promise<void>;
   /** The session that served the node went away (after the durable disconnect). */
   nodeDisconnected?(node: NodeSessionRef): void;
+  /** The node reported Full control again (`wsmp trust full`): its definitions unfreeze. */
+  trustRaised?(node: NodeSessionRef): void | Promise<void>;
   /** A complete inventory snapshot (A2). Its answer is the `runtime.inventory.ok/error` ack. */
   runtimeInventory?(
     node: NodeSessionRef,
@@ -409,6 +411,9 @@ export type NodeFrameHandlers = {
 } & {
   [K in RoutedNodeFrameType]?: (node: NodeSessionRef, frame: NodeFrame<K>) => void | Promise<void>;
 };
+
+/** Optional checks `sendToNode` makes against the live session before sending. */
+export type SendGuard = { connectionGeneration?: number; requireFullTrust?: boolean };
 
 /** How recovery probes reach a node (injected: model-api's relay attempt). */
 export type RelayAttemptStarter = (input: {
@@ -447,6 +452,8 @@ type SessionState = {
    */
   connectionGeneration: number | null;
   registered: boolean;
+  /** `hello.ok` was sent: lane frames (`sendToNode`) may follow; nothing but hello before. */
+  helloAcked: boolean;
   protocolVersion: string | null;
   nodeVersion: string | null;
   trust: NodeTrustWire;
@@ -688,12 +695,25 @@ export class RelaySessionManager {
   /**
    * Sends one control frame to the node's live, registered session. False when there is none,
    * the server is draining, the socket is closing, or the frame fails the 3.0 contract (the
-   * failure is logged by class; nothing is sent).
+   * failure is logged by class; nothing is sent). `guard` pins the session the caller planned
+   * for (its connection generation) and, for Full-control-only frames (`secret.*`,
+   * `runtime.define`), the session's live trust: a lowering that landed meanwhile wins.
    */
-  sendToNode(nodeId: string, frame: ServerToNodeControlFrame): boolean {
+  sendToNode(nodeId: string, frame: ServerToNodeControlFrame, guard: SendGuard = {}): boolean {
     if (this.relayDrain) return false;
     const session = this.sessionsByNodeId.get(nodeId);
-    if (!session?.registered || session.socket.readyState !== WS_READY_STATE_OPEN) return false;
+    if (
+      !session?.registered ||
+      !session.helloAcked ||
+      session.socket.readyState !== WS_READY_STATE_OPEN
+    )
+      return false;
+    if (
+      guard.connectionGeneration !== undefined &&
+      session.connectionGeneration !== guard.connectionGeneration
+    )
+      return false;
+    if (guard.requireFullTrust && session.trust !== "full") return false;
     let encoded: string;
     try {
       encoded = encodeRelayServerControlMessage(frame);
@@ -707,6 +727,14 @@ export class RelaySessionManager {
     } catch {
       return false;
     }
+  }
+
+  /** The live registered session of a node: its generation and trust, or null when offline. */
+  nodeSession(nodeId: string): { connectionGeneration: number; trust: NodeTrustWire } | null {
+    const session = this.sessionsByNodeId.get(nodeId);
+    if (!session?.registered || !session.helloAcked || session.connectionGeneration === null)
+      return null;
+    return { connectionGeneration: session.connectionGeneration, trust: session.trust };
   }
 
   /** A person lowered the node's trust: tell its live session (the node answers `node.state`). */
@@ -760,6 +788,7 @@ export class RelaySessionManager {
       slug: null,
       connectionGeneration: null,
       registered: false,
+      helloAcked: false,
       protocolVersion: null,
       nodeVersion: null,
       trust: "relay",
@@ -1132,6 +1161,7 @@ export class RelaySessionManager {
       nodeId: registration.nodeId,
       definitionSync,
     });
+    session.helloAcked = true;
     if (registration.trustLowerPending) {
       this.sendControl(session, {
         type: "trust.lower",
@@ -1170,10 +1200,19 @@ export class RelaySessionManager {
     }
     if (!this.isCurrent(session)) return;
     session.features = message.features;
+    const before = session.trust;
     // Fail closed: an unconfirmed lowering (or an unknown stored state) keeps the node Relay.
     session.trust = result && !result.trustLowerPending ? message.trust.value : "relay";
     this.reconcileTrust(session);
     this.notifyTerminalListChanged(session.identity.userId);
+    const ref = this.sessionRef(session);
+    if (before !== "full" && session.trust === "full" && ref) {
+      try {
+        await this.frameHandlers.trustRaised?.(ref);
+      } catch (error) {
+        console.error("[relay] trust raised handler failed", errorName(error));
+      }
+    }
   }
 
   /** Ends whatever the node's current trust and features no longer allow. */

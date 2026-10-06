@@ -678,6 +678,11 @@ export const runtimesRouter = {
         );
       throw error;
     }
+    // Nodes drop the deleted versions with their next complete define (not awaited: the answer
+    // does not change this result).
+    void context.services
+      ?.pushRuntimeDefinitions?.({ userId, runtimeId: runtime.id })
+      .catch(() => undefined);
     return { deleted: true as const, removedMembers: members.map((member) => member.id) };
   }),
 
