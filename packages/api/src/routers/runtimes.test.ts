@@ -708,3 +708,34 @@ describe("graph-write fences", () => {
     expect(result.removedMembers).toEqual(["mem-1"]);
   });
 });
+
+describe("runtimes.fork (create-shaped output)", () => {
+  it("copies a shared version, applies the given limits and answers like create", async () => {
+    db.runtimeShare.findFirst.mockResolvedValue({
+      Runtime: { id: "rt-9", kind: "STARTABLE", currentVersionId: "ver-9" },
+    } as never);
+    db.runtimeVersion.findFirst.mockResolvedValue(
+      versionRow({ id: "ver-9", contextLimit: 8_192 }) as never,
+    );
+    db.runtime.create.mockResolvedValue({ id: "rt-1" } as never);
+    db.runtimeVersion.create.mockResolvedValue({ id: "ver-1" } as never);
+    db.runtime.findFirst.mockResolvedValue(runtimeRow({ forkedFromVersionId: "ver-9" }) as never);
+    const result = await client().fork({
+      runtimeId: "rt-9",
+      slug: "mine",
+      name: "Mine",
+      limits: { concurrencyLimit: 4 },
+      note: "trying it",
+    });
+    expect(db.runtimeVersion.create.mock.calls[0]?.[0].data).toMatchObject({
+      concurrencyLimit: 4,
+      contextLimit: 8_192,
+      note: "trying it",
+    });
+    expect(db.runtime.create.mock.calls[0]?.[0].data).toMatchObject({
+      forkedFromVersionId: "ver-9",
+    });
+    expect(result.version.version).toBe(1);
+    expect(result.runtime.forkedFromVersionId).toBe("ver-9");
+  });
+});

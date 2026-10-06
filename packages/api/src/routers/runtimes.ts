@@ -877,17 +877,20 @@ export const runtimesRouter = {
       kind: share.Runtime.kind,
       nodeId: input.nodeId,
       spec: storedSpec(version.spec),
-      limits: {
-        concurrencyLimit: version.concurrencyLimit,
-        contextLimit: version.contextLimit,
-        kvBudgetTokens: version.kvBudgetTokens,
-        kvFullThreshold: version.kvFullThreshold,
-        engineLoadGate: version.engineLoadGate,
-      },
-      advanced: jsonObject(version.advanced),
-      note: null,
+      limits: applyLimitsPatch(
+        {
+          concurrencyLimit: version.concurrencyLimit,
+          contextLimit: version.contextLimit,
+          kvBudgetTokens: version.kvBudgetTokens,
+          kvFullThreshold: version.kvFullThreshold,
+          engineLoadGate: version.engineLoadGate,
+        },
+        input.limits,
+      ),
+      advanced: applyAdvancedPatch(jsonObject(version.advanced), input.advanced),
+      note: input.note ?? null,
       forkedFromVersionId: version.id,
     });
-    return result.runtime;
+    return { ...result, version: result.runtime.currentVersion };
   }),
 };
