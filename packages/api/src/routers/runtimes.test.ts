@@ -4,6 +4,25 @@ import { mockDeep, mockReset } from "vitest-mock-extended";
 import type { PrismaClient } from "../../../db/prisma/generated/client";
 
 vi.mock("@ws-model-proxy/db", () => ({ default: mockDeep<PrismaClient>() }));
+const fenceLog = vi.hoisted(() => ({ held: [] as string[], deletes: [] as unknown[] }));
+vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>();
+  return {
+    ...real,
+    acquireFences: vi.fn(async (_tx: unknown, requested: Iterable<string>) => {
+      fenceLog.held.push(...requested);
+      return true;
+    }),
+    fenceParentDelete: vi.fn(async (_tx: unknown, scope: unknown) => {
+      fenceLog.deletes.push(scope);
+      return [];
+    }),
+    runCapacityOrderedTransaction: vi.fn(
+      (db: { $transaction: (work: unknown) => unknown }, work: (tx: unknown) => unknown) =>
+        db.$transaction(work),
+    ),
+  };
+});
 vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
   isForceTwoFactorRequired: vi.fn(async () => false),
 }));
@@ -111,6 +130,8 @@ async function reasonOf(promise: Promise<unknown>): Promise<string | undefined> 
 
 beforeEach(() => {
   mockReset(db);
+  fenceLog.held.length = 0;
+  fenceLog.deletes.length = 0;
   db.$transaction.mockImplementation(((work: (tx: PrismaClient) => unknown) => work(db)) as never);
 });
 
@@ -610,9 +631,9 @@ describe("review follow-ups", () => {
       id: "rm-x",
       userId: OWNER,
     });
-    db.runtimeShare.deleteMany.mockResolvedValue({ count: 0 });
+    db.runtimeShare.findFirst.mockResolvedValue(null);
     expect(await reasonOf(client().shares.delete({ shareId: "sh-x" }))).toBe("NOT_FOUND");
-    expect(db.runtimeShare.deleteMany.mock.calls[0]?.[0].where).toEqual({
+    expect(db.runtimeShare.findFirst.mock.calls[0]?.[0]?.where).toMatchObject({
       id: "sh-x",
       ownerUserId: OWNER,
     });
@@ -649,5 +670,41 @@ describe("second authz review follow-ups", () => {
       agentTokenId: null,
       label: null,
     });
+  });
+});
+
+describe("graph-write fences", () => {
+  it("a definition update takes the owner fence, then every instance's capacity fence", async () => {
+    db.runtime.findFirst.mockResolvedValue({
+      id: "rt-1",
+      kind: "STARTABLE",
+      Node: null,
+      CurrentVersion: versionRow(),
+    } as never);
+    db.runtimeVersion.findFirst.mockResolvedValue(null);
+    db.runtimeInstance.findMany.mockResolvedValue([
+      {
+        id: "inst-1",
+        desiredState: "RUNNING",
+        LaunchVersion: { launchHash: runtimeLaunchHash(SPEC) },
+        Ranks: [],
+      },
+    ] as never);
+    db.runtimeVersion.create.mockResolvedValue({ id: "ver-2" } as never);
+    db.runtimeVersion.findUniqueOrThrow.mockResolvedValue(
+      versionRow({ id: "ver-2", version: 2 }) as never,
+    );
+    await client().update({ runtimeId: "rt-1", limits: { concurrencyLimit: 4 } });
+    expect(fenceLog.held).toEqual(["00:owner:owner-1", "08:capacity:inst-1"]);
+  });
+
+  it("deleting a runtime goes through the parent-delete fences", async () => {
+    db.runtime.findFirst.mockResolvedValue({ id: "rt-1" } as never);
+    db.runtimeInstance.count.mockResolvedValue(0);
+    db.profileItem.count.mockResolvedValue(0);
+    db.poolMember.findMany.mockResolvedValue([{ id: "mem-1" }] as never);
+    const result = await client().delete({ runtimeId: "rt-1" });
+    expect(fenceLog.deletes).toEqual([{ userId: OWNER, runtimeIds: ["rt-1"] }]);
+    expect(result.removedMembers).toEqual(["mem-1"]);
   });
 });

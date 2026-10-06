@@ -12,6 +12,9 @@ import {
   notFound,
   refusal,
 } from "../lib/caller-actor";
+import { cloudEgressEnabled } from "../lib/cloud-egress";
+import { graphDelete, graphWrite, modelTargetFences, poolTargetFences } from "../lib/graph-write";
+import { invalidatePoolRouting } from "../lib/pool-routing-invalidation";
 import {
   callableIdsFor,
   EMPTY_TRAFFIC,
@@ -90,7 +93,7 @@ async function ownedPoolRow(userId: string, poolId: string): Promise<PoolRow> {
 async function ownedPoolView(userId: string, poolId: string) {
   const pool = await ownedPoolRow(userId, poolId);
   const traffic = await trafficOf(userId, [pool.id]);
-  return poolView(pool, userId, traffic.get(pool.id));
+  return poolView(pool, userId, traffic.get(pool.id), cloudEgressEnabled());
 }
 
 async function audit(
@@ -141,6 +144,24 @@ function assertType(poolType: ModelType, modelType: ModelType, subjectId: string
       "This model's type does not match the pool's type.",
       subjectId,
     );
+}
+
+/** The served-model ids behind member references (plain reads; checked again on write). */
+async function referencedModelIds(db: Tx, userId: string, refs: readonly MemberRef[]) {
+  const byRuntime = refs.filter(
+    (ref): ref is { runtimeId: string; model: string } => "runtimeId" in ref,
+  );
+  const direct = refs.flatMap((ref) => ("runtimeModelId" in ref ? [ref.runtimeModelId] : []));
+  const resolved = byRuntime.length
+    ? await db.runtimeModel.findMany({
+        where: {
+          userId,
+          OR: byRuntime.map((ref) => ({ runtimeId: ref.runtimeId, upstreamModelId: ref.model })),
+        },
+        select: { id: true },
+      })
+    : [];
+  return [...direct, ...resolved.map((model) => model.id)];
 }
 
 async function addOwnMembers(
@@ -204,16 +225,23 @@ async function applySidecars(
     });
     if (target.Sidecars.length > 0 || feeds > 0)
       throw refusal("sidecar_chain", "Sidecar pools cannot be chained.", target.id);
-    const fields = {
-      targetPoolId: target.id,
-      prompt: sidecar.prompt ?? null,
-      timeoutMs: sidecar.timeoutMs ?? null,
-      maxAssets: sidecar.maxAssets ?? null,
+    // Absent keeps the stored value (null clears it).
+    const changes = {
+      ...(sidecar.prompt !== undefined ? { prompt: sidecar.prompt } : {}),
+      ...(sidecar.timeoutMs !== undefined ? { timeoutMs: sidecar.timeoutMs } : {}),
+      ...(sidecar.maxAssets !== undefined ? { maxAssets: sidecar.maxAssets } : {}),
     };
     await db.poolSidecar.upsert({
       where: { poolId_input: { poolId: pool.id, input: sidecar.input } },
-      create: { poolId: pool.id, input: sidecar.input, ...fields },
-      update: fields,
+      create: {
+        poolId: pool.id,
+        input: sidecar.input,
+        targetPoolId: target.id,
+        prompt: sidecar.prompt ?? null,
+        timeoutMs: sidecar.timeoutMs ?? null,
+        maxAssets: sidecar.maxAssets ?? null,
+      },
+      update: { targetPoolId: target.id, ...changes },
     });
   }
 }
@@ -236,6 +264,16 @@ async function applyAdvanced(db: Tx, poolId: string, patch: AdvancedPatch | unde
     const value = patch[key];
     if (value !== undefined) columns[key] = value;
   }
+  const ceiling =
+    columns.contextCeiling !== undefined
+      ? columns.contextCeiling
+      : (stored?.contextCeiling ?? null);
+  const margin =
+    columns.contextMargin !== undefined ? columns.contextMargin : (stored?.contextMargin ?? null);
+  if (ceiling !== null && margin !== null && margin >= ceiling)
+    throw new ORPCError("BAD_REQUEST", {
+      message: "The context margin must be smaller than the context ceiling.",
+    });
   const current = jsonObject(stored?.overrides);
   let overrides = current;
   if (patch.overrides) {
@@ -311,16 +349,55 @@ async function replaceCloudMembers(
       });
     assertType(pool.modelType, model.type, model.id);
   }
-  await db.poolMember.deleteMany({ where: { poolId: pool.id, kind: "CLOUD" } });
-  if (ids.length > 0)
-    await db.poolMember.createMany({
-      data: ids.map((providerModelId, cloudOrder) => ({
-        poolId: pool.id,
-        kind: "CLOUD" as const,
-        providerModelId,
-        cloudOrder,
-      })),
-    });
+  // Keep the rows (and their state) of members that stay; move them in place. The order
+  // index is unique and not deferrable, so a move never lands on an occupied slot.
+  const existing = await db.poolMember.findMany({
+    where: { poolId: pool.id, kind: "CLOUD" },
+    select: { id: true, providerModelId: true, cloudOrder: true },
+  });
+  const wanted = new Set(ids);
+  const dropped = existing.filter((member) => !wanted.has(member.providerModelId ?? ""));
+  if (dropped.length > 0)
+    await db.poolMember.deleteMany({ where: { id: { in: dropped.map((member) => member.id) } } });
+  const kept = existing.filter((member) => wanted.has(member.providerModelId ?? ""));
+  const slotOf = new Map(kept.map((member) => [member.id, member.cloudOrder ?? -1]));
+  const occupant = new Map(kept.map((member) => [member.cloudOrder ?? -1, member.id]));
+  const recreate: string[] = [];
+  const freeSlot = () => {
+    for (let slot = 15; slot >= 0; slot--) if (!occupant.has(slot)) return slot;
+    return null;
+  };
+  for (const [order, providerModelId] of ids.entries()) {
+    const member = kept.find((row) => row.providerModelId === providerModelId);
+    if (member && slotOf.get(member.id) === order) continue;
+    const blocker = occupant.get(order);
+    if (blocker !== undefined) {
+      const slot = freeSlot();
+      occupant.delete(order);
+      if (slot === null) {
+        // All 16 slots taken: the blocker is recreated at its new place below.
+        await db.poolMember.delete({ where: { id: blocker } });
+        recreate.push(blocker);
+        slotOf.delete(blocker);
+      } else {
+        await db.poolMember.update({ where: { id: blocker }, data: { cloudOrder: slot } });
+        occupant.set(slot, blocker);
+        slotOf.set(blocker, slot);
+      }
+    }
+    if (member && !recreate.includes(member.id)) {
+      occupant.delete(slotOf.get(member.id) ?? -1);
+      await db.poolMember.update({ where: { id: member.id }, data: { cloudOrder: order } });
+      slotOf.set(member.id, order);
+    } else {
+      const created = await db.poolMember.create({
+        data: { poolId: pool.id, kind: "CLOUD", providerModelId, cloudOrder: order },
+        select: { id: true },
+      });
+      slotOf.set(created.id, order);
+    }
+    occupant.set(order, member && !recreate.includes(member.id) ? member.id : "new");
+  }
 }
 
 /** Human-only setters (the contract binding refuses everyone else) share this. */
@@ -335,10 +412,14 @@ async function humanSetter(
   const pool = await prisma.pool.findFirst({ where: { id: poolId, userId }, select: { id: true } });
   if (!pool) throw notFound("That pool does not exist.");
   const actor = callerActor(context.auth, userId);
-  await prisma.$transaction(async (tx) => {
-    await write(tx);
-    await audit(tx, { ownerId: userId, actor, poolId, action, after });
-  });
+  await graphWrite(
+    [userId],
+    async (tx) => {
+      await write(tx);
+      await audit(tx, { ownerId: userId, actor, poolId, action, after });
+    },
+    (tx) => poolTargetFences(tx, poolId),
+  );
   return ownedPoolView(userId, poolId);
 }
 
@@ -381,7 +462,9 @@ export const poolsRouter = {
       pools.map((pool) => pool.id),
     );
     return {
-      pools: pools.map((pool) => poolView(pool, userId, traffic.get(pool.id))),
+      pools: pools.map((pool) =>
+        poolView(pool, userId, traffic.get(pool.id), cloudEgressEnabled()),
+      ),
       sharedWithMe: shares.map((share) => ({
         poolId: share.poolId,
         callableIds: share.canUse
@@ -390,6 +473,7 @@ export const poolsRouter = {
               poolSlug: share.Pool.slug,
               mode: share.Pool.Fallback?.mode ?? "OFF",
               callerIsOwner: false,
+              cloudEnabled: cloudEgressEnabled(),
             })
           : [`${share.Pool.User.slug}/${share.Pool.slug}`],
         ownerEmail: share.Owner.email,
@@ -443,30 +527,37 @@ export const poolsRouter = {
     const actor = callerActor(context.auth, userId);
     let poolId: string;
     try {
-      poolId = await prisma.$transaction(async (tx) => {
-        const pool = await tx.pool.create({
-          data: {
-            userId,
-            slug: input.slug,
-            name: input.name,
-            description: input.description || null,
-            modelType: input.type,
-          },
-          select: { id: true, userId: true, modelType: true },
-        });
-        await addOwnMembers(tx, pool, input.members ?? []);
-        await applyRouting(tx, pool.id, input.routing);
-        await applyAdvanced(tx, pool.id, input.advanced);
-        await applySidecars(tx, pool, input.sidecars ?? []);
-        await audit(tx, {
-          ownerId: userId,
-          actor,
-          poolId: pool.id,
-          action: "pool.create",
-          after: { slug: input.slug, type: input.type, note: input.note ?? null },
-        });
-        return pool.id;
-      });
+      poolId = await graphWrite(
+        [userId],
+        async (tx) => {
+          const pool = await tx.pool.create({
+            data: {
+              userId,
+              slug: input.slug,
+              name: input.name,
+              description: input.description || null,
+              modelType: input.type,
+            },
+            select: { id: true, userId: true, modelType: true },
+          });
+          await addOwnMembers(tx, pool, input.members ?? []);
+          await applyRouting(tx, pool.id, input.routing);
+          await applyAdvanced(tx, pool.id, input.advanced);
+          await applySidecars(tx, pool, input.sidecars ?? []);
+          await audit(tx, {
+            ownerId: userId,
+            actor,
+            poolId: pool.id,
+            action: "pool.create",
+            after: { slug: input.slug, type: input.type, note: input.note ?? null },
+          });
+          return pool.id;
+        },
+        async (tx) =>
+          modelTargetFences(tx, {
+            runtimeModelIds: await referencedModelIds(tx, userId, input.members ?? []),
+          }),
+      );
     } catch (error) {
       rethrowSlugTaken(error);
     }
@@ -482,62 +573,105 @@ export const poolsRouter = {
     });
     if (!pool) throw notFound("That pool does not exist.");
     const { rules, ...advancedPatch } = input.advanced ?? {};
+    // Removing a contributed member writes the contributor's graph too (owner fence).
+    const removed = input.members?.remove?.length
+      ? await prisma.poolMember.findMany({
+          where: { id: { in: input.members.remove }, poolId: pool.id },
+          select: { RuntimeModel: { select: { userId: true } } },
+        })
+      : [];
+    const owners = [
+      userId,
+      ...removed.flatMap((member) => (member.RuntimeModel ? [member.RuntimeModel.userId] : [])),
+    ];
     try {
-      await prisma.$transaction(async (tx) => {
-        const fields = {
-          ...(input.name !== undefined ? { name: input.name } : {}),
-          ...(input.slug !== undefined ? { slug: input.slug } : {}),
-          ...(input.description !== undefined ? { description: input.description || null } : {}),
-        };
-        if (Object.keys(fields).length > 0)
-          await tx.pool.update({ where: { id: pool.id }, data: fields });
-        if (input.members?.remove?.length)
-          await tx.poolMember.deleteMany({
-            where: { id: { in: input.members.remove }, poolId: pool.id },
+      await graphWrite(
+        owners,
+        async (tx) => {
+          const fields = {
+            ...(input.name !== undefined ? { name: input.name } : {}),
+            ...(input.slug !== undefined ? { slug: input.slug } : {}),
+            ...(input.description !== undefined ? { description: input.description || null } : {}),
+          };
+          if (Object.keys(fields).length > 0)
+            await tx.pool.update({ where: { id: pool.id }, data: fields });
+          if (input.members?.remove?.length)
+            await tx.poolMember.deleteMany({
+              where: { id: { in: input.members.remove }, poolId: pool.id },
+            });
+          await addOwnMembers(tx, pool, input.members?.add ?? []);
+          for (const set of input.members?.set ?? []) {
+            const updated = await tx.poolMember.updateMany({
+              where: { id: set.memberId, poolId: pool.id },
+              data: {
+                ...(set.weight !== undefined ? { weight: set.weight } : {}),
+                ...(set.state !== undefined ? { state: set.state } : {}),
+              },
+            });
+            if (updated.count === 0) throw notFound("That member is not in this pool.");
+          }
+          if (input.cloudMembers) await replaceCloudMembers(tx, pool, input.cloudMembers);
+          await applyRouting(tx, pool.id, input.routing);
+          if (input.cloud?.embeddingContract !== undefined) {
+            const embeddingContract =
+              input.cloud.embeddingContract === null
+                ? Prisma.DbNull
+                : (input.cloud.embeddingContract as Prisma.InputJsonValue);
+            await tx.poolFallback.upsert({
+              where: { poolId: pool.id },
+              create: { poolId: pool.id, embeddingContract },
+              update: { embeddingContract },
+            });
+          }
+          if (input.advanced) await applyAdvanced(tx, pool.id, advancedPatch);
+          if (rules) await replaceRules(tx, pool.id, rules);
+          await applySidecars(tx, pool, input.sidecars ?? []);
+          const { poolId: _poolId, ...after } = input;
+          await audit(tx, {
+            ownerId: userId,
+            actor,
+            poolId: pool.id,
+            action: "pool.update",
+            after,
           });
-        await addOwnMembers(tx, pool, input.members?.add ?? []);
-        for (const set of input.members?.set ?? []) {
-          const updated = await tx.poolMember.updateMany({
-            where: { id: set.memberId, poolId: pool.id },
-            data: {
-              ...(set.weight !== undefined ? { weight: set.weight } : {}),
-              ...(set.state !== undefined ? { state: set.state } : {}),
-            },
-          });
-          if (updated.count === 0) throw notFound("That member is not in this pool.");
-        }
-        if (input.cloudMembers) await replaceCloudMembers(tx, pool, input.cloudMembers);
-        await applyRouting(tx, pool.id, input.routing);
-        if (input.cloud?.embeddingContract !== undefined) {
-          const embeddingContract =
-            input.cloud.embeddingContract === null
-              ? Prisma.DbNull
-              : (input.cloud.embeddingContract as Prisma.InputJsonValue);
-          await tx.poolFallback.upsert({
-            where: { poolId: pool.id },
-            create: { poolId: pool.id, embeddingContract },
-            update: { embeddingContract },
-          });
-        }
-        if (input.advanced) await applyAdvanced(tx, pool.id, advancedPatch);
-        if (rules) await replaceRules(tx, pool.id, rules);
-        await applySidecars(tx, pool, input.sidecars ?? []);
-        const { poolId: _poolId, ...after } = input;
-        await audit(tx, { ownerId: userId, actor, poolId: pool.id, action: "pool.update", after });
-      });
+        },
+        // Members, routing and advanced limits change the admission views of the pool's
+        // targets, and of the targets of the models and provider models being added.
+        async (tx) => [
+          ...(await poolTargetFences(tx, pool.id)),
+          ...(await modelTargetFences(tx, {
+            runtimeModelIds: await referencedModelIds(tx, userId, input.members?.add ?? []),
+            providerModelIds: (input.cloudMembers ?? []).map((member) => member.providerModelId),
+          })),
+        ],
+      );
     } catch (error) {
       rethrowSlugTaken(error);
     }
-    if (rules) await context.services?.onPoolRoutingRulesChanged?.(pool.id);
+    if (rules || input.members?.remove?.length)
+      await invalidatePoolRouting(context.services, [pool.id]);
     return ownedPoolView(userId, pool.id);
   }),
 
   delete: contractProcedure(c.delete).handler(async ({ input, context }) => {
-    callerActor(context.auth, userIdOf(context));
-    const deleted = await prisma.pool.deleteMany({
-      where: { id: input.poolId, userId: userIdOf(context) },
+    const userId = userIdOf(context);
+    const actor = callerActor(context.auth, userId);
+    const pool = await prisma.pool.findFirst({
+      where: { id: input.poolId, userId },
+      select: { id: true, slug: true },
     });
-    if (deleted.count === 0) throw notFound("That pool does not exist.");
+    if (!pool) throw notFound("That pool does not exist.");
+    // Shares, contributed members, key entries and other owners' sidecars go with it.
+    await graphDelete({ userId, poolIds: [pool.id] }, async (tx) => {
+      await tx.pool.deleteMany({ where: { id: pool.id, userId } });
+      await audit(tx, {
+        ownerId: userId,
+        actor,
+        poolId: pool.id,
+        action: "pool.delete",
+        after: { slug: pool.slug },
+      });
+    });
     return { ok: true as const };
   }),
 
@@ -572,8 +706,15 @@ export const poolsRouter = {
         ),
     ),
     setOwnKeyEquivalent: contractProcedure(c.cloud.setOwnKeyEquivalent).handler(
-      async ({ input, context }) =>
-        humanSetter(
+      async ({ input, context }) => {
+        if (
+          input.model !== null &&
+          (input.model.trim() === "" || input.model.trim() !== input.model)
+        )
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Give the model id without surrounding spaces.",
+          });
+        return humanSetter(
           context,
           input.poolId,
           "pool.fallback.own_key_equivalent",
@@ -584,7 +725,8 @@ export const poolsRouter = {
               update: { ownKeyEquivalentModel: input.model },
             }),
           { model: input.model },
-        ),
+        );
+      },
     ),
   },
 
@@ -650,25 +792,30 @@ export const poolsRouter = {
         const actor = callerActor(context.auth, userId);
         let memberId: string;
         try {
-          memberId = await prisma.$transaction(async (tx) => {
-            const member = await tx.poolMember.create({
-              data: {
+          memberId = await graphWrite(
+            // A contributed member links the owner's and the contributor's graphs.
+            [share.ownerUserId, userId],
+            async (tx) => {
+              const member = await tx.poolMember.create({
+                data: {
+                  poolId: input.poolId,
+                  kind: "LOCAL",
+                  runtimeModelId: model.id,
+                  shareId: share.id,
+                },
+                select: { id: true },
+              });
+              await audit(tx, {
+                ownerId: share.ownerUserId,
+                actor,
                 poolId: input.poolId,
-                kind: "LOCAL",
-                runtimeModelId: model.id,
-                shareId: share.id,
-              },
-              select: { id: true },
-            });
-            await audit(tx, {
-              ownerId: share.ownerUserId,
-              actor,
-              poolId: input.poolId,
-              action: "pool.member.contribute",
-              after: { memberId: member.id, runtimeModelId: model.id, note: input.note ?? null },
-            });
-            return member.id;
-          });
+                action: "pool.member.contribute",
+                after: { memberId: member.id, runtimeModelId: model.id, note: input.note ?? null },
+              });
+              return member.id;
+            },
+            (tx) => modelTargetFences(tx, { runtimeModelIds: [model.id] }),
+          );
         } catch (error) {
           if (isUniqueViolation(error))
             throw new ORPCError("CONFLICT", { message: "This model is already in the pool." });
@@ -696,16 +843,21 @@ export const poolsRouter = {
         });
         if (!member) throw notFound("That contributed member does not exist.");
         const actor = callerActor(context.auth, userId);
-        await prisma.$transaction(async (tx) => {
-          await tx.poolMember.delete({ where: { id: member.id } });
-          await audit(tx, {
-            ownerId: member.Pool.userId,
-            actor,
-            poolId: member.poolId,
-            action: "pool.member.withdraw",
-            after: { memberId: member.id, note: input.note ?? null },
-          });
-        });
+        await graphDelete(
+          { userId: member.Pool.userId, poolMemberIds: [member.id] },
+          async (tx) => {
+            await tx.poolMember.delete({ where: { id: member.id } });
+            await audit(tx, {
+              ownerId: member.Pool.userId,
+              actor,
+              poolId: member.poolId,
+              action: "pool.member.withdraw",
+              after: { memberId: member.id, note: input.note ?? null },
+            });
+          },
+        );
+        // Rules naming the member went with it.
+        await invalidatePoolRouting(context.services, [member.poolId]);
         return { ok: true as const };
       },
     ),
@@ -720,7 +872,7 @@ export const poolsRouter = {
       });
       if (!rule) throw notFound("That rule does not exist.");
       const actor = callerActor(context.auth, userId);
-      await prisma.$transaction(async (tx) => {
+      await graphWrite([userId], async (tx) => {
         await tx.poolRoutingRule.delete({ where: { id: rule.id } });
         await audit(tx, {
           ownerId: userId,
@@ -730,7 +882,7 @@ export const poolsRouter = {
           after: { ruleId: rule.id },
         });
       });
-      await context.services?.onPoolRoutingRulesChanged?.(rule.poolId);
+      await invalidatePoolRouting(context.services, [rule.poolId]);
       return { ok: true as const };
     }),
   },

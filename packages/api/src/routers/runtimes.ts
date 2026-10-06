@@ -10,6 +10,7 @@ import {
   notFound,
   refusal,
 } from "../lib/caller-actor";
+import { graphDelete, graphWrite, runtimeCapacityFences } from "../lib/graph-write";
 import { jsonObject } from "../lib/registry-view";
 import { RUNTIME_PRESET_LIST } from "../lib/runtime-presets";
 import { type RuntimeSpec, runtimeSpecSchema, runtimeSpecWarnings } from "../lib/runtime-spec";
@@ -38,7 +39,6 @@ import {
   versionDetail,
   versionSummary,
 } from "../lib/runtime-views";
-import { runSerializableTransaction } from "../lib/serializable-transaction";
 import { runtimeStart, runtimeStop } from "./runtime-lifecycle";
 
 function userIdOf(context: SignedInContext): string {
@@ -124,7 +124,7 @@ async function createRuntime(context: SignedInContext, input: CreateInput) {
   if (input.nodeId) assertAgentMayUseNode(context, await ownedNode(userId, input.nodeId));
   let created: { runtimeId: string };
   try {
-    created = await prisma.$transaction(async (tx) => {
+    created = await graphWrite([userId], async (tx) => {
       const runtime = await tx.runtime.create({
         data: {
           userId,
@@ -499,120 +499,127 @@ export const runtimesRouter = {
       instanceId: string;
       reason: "launch_changed" | "trust_relay" | "interactive_needs_person";
     }> = [];
-    const { version, operationId } = await runSerializableTransaction(async (tx) => {
-      // Read and classify inside the serializable transaction (trust may change meanwhile).
-      adoptedLive.length = 0;
-      restarted.length = 0;
-      needsRestart.length = 0;
-      const instances = await tx.runtimeInstance.findMany({
-        where: { runtimeId: runtime.id, userId, ...ACTIVE_INSTANCE },
-        select: {
-          id: true,
-          desiredState: true,
-          LaunchVersion: { select: { launchHash: true } },
-          Ranks: {
-            select: {
-              claim: true,
-              Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } },
+    const { version, operationId } = await graphWrite(
+      [userId],
+      async (tx) => {
+        // Read and classify under the owner fence (a trust change waits for it).
+        adoptedLive.length = 0;
+        restarted.length = 0;
+        needsRestart.length = 0;
+        const instances = await tx.runtimeInstance.findMany({
+          where: { runtimeId: runtime.id, userId, ...ACTIVE_INSTANCE },
+          select: {
+            id: true,
+            desiredState: true,
+            LaunchVersion: { select: { launchHash: true } },
+            Ranks: {
+              select: {
+                claim: true,
+                Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } },
+              },
             },
           },
-        },
-      });
-      for (const instance of instances) {
-        // Always-on: the address is the launch; nothing to restart. A started instance adopts
-        // live only when what it launched has the new launch hash (an earlier launch change it
-        // was never restarted for still needs a restart).
-        if (
-          instance.desiredState === null ||
-          instance.LaunchVersion.launchHash === hashes.launchHash
-        )
-          adoptedLive.push(instance.id);
-        else if (
-          !input.restartRunning ||
-          // Released claims (failed, stopped ranks) are re-placed by a start, not here.
-          instance.Ranks.some((rank) => rank.claim !== "HELD")
-        )
-          needsRestart.push({ instanceId: instance.id, reason: "launch_changed" });
-        else if (
-          agent &&
-          instance.Ranks.some((rank) => !rank.Node || effectiveTrust(rank.Node) !== "FULL")
-        )
-          needsRestart.push({ instanceId: instance.id, reason: "trust_relay" });
-        else if (agent && specIsInteractive(spec))
-          needsRestart.push({ instanceId: instance.id, reason: "interactive_needs_person" });
-        else restarted.push(instance.id);
-      }
+        });
+        for (const instance of instances) {
+          // Always-on: the address is the launch; nothing to restart. A started instance adopts
+          // live only when what it launched has the new launch hash (an earlier launch change it
+          // was never restarted for still needs a restart).
+          if (
+            instance.desiredState === null ||
+            instance.LaunchVersion.launchHash === hashes.launchHash
+          )
+            adoptedLive.push(instance.id);
+          else if (
+            !input.restartRunning ||
+            // Released claims (failed, stopped ranks) are re-placed by a start, not here.
+            instance.Ranks.some((rank) => rank.claim !== "HELD")
+          )
+            needsRestart.push({ instanceId: instance.id, reason: "launch_changed" });
+          else if (
+            agent &&
+            instance.Ranks.some((rank) => !rank.Node || effectiveTrust(rank.Node) !== "FULL")
+          )
+            needsRestart.push({ instanceId: instance.id, reason: "trust_relay" });
+          else if (agent && specIsInteractive(spec))
+            needsRestart.push({ instanceId: instance.id, reason: "interactive_needs_person" });
+          else restarted.push(instance.id);
+        }
 
-      const created = await createVersion(tx, {
-        runtimeId: runtime.id,
-        version: current.version + 1,
-        actor,
-        spec,
-        limits,
-        advanced,
-        note: input.note ?? null,
-      });
-      await tx.runtime.update({
-        where: { id: runtime.id },
-        data: {
-          currentVersionId: created.id,
-          ...(input.name !== undefined ? { name: input.name } : {}),
-        },
-      });
-      await syncRuntimeModels(tx, { userId, runtimeId: runtime.id, spec });
-      if (adoptedLive.length > 0) {
-        const alwaysOn = instances
-          .filter((instance) => instance.desiredState === null && adoptedLive.includes(instance.id))
-          .map((instance) => instance.id);
-        await tx.runtimeInstance.updateMany({
-          where: { id: { in: adoptedLive.filter((id) => !alwaysOn.includes(id)) } },
-          data: { versionId: created.id },
+        const created = await createVersion(tx, {
+          runtimeId: runtime.id,
+          version: current.version + 1,
+          actor,
+          spec,
+          limits,
+          advanced,
+          note: input.note ?? null,
         });
-        if (alwaysOn.length > 0)
+        await tx.runtime.update({
+          where: { id: runtime.id },
+          data: {
+            currentVersionId: created.id,
+            ...(input.name !== undefined ? { name: input.name } : {}),
+          },
+        });
+        await syncRuntimeModels(tx, { userId, runtimeId: runtime.id, spec });
+        if (adoptedLive.length > 0) {
+          const alwaysOn = instances
+            .filter(
+              (instance) => instance.desiredState === null && adoptedLive.includes(instance.id),
+            )
+            .map((instance) => instance.id);
           await tx.runtimeInstance.updateMany({
-            where: { id: { in: alwaysOn } },
-            data: { versionId: created.id, launchVersionId: created.id },
+            where: { id: { in: adoptedLive.filter((id) => !alwaysOn.includes(id)) } },
+            data: { versionId: created.id },
           });
-      }
-      let restartOperationId: string | null = null;
-      if (restarted.length > 0) {
-        const operation = await tx.runtimeOperation.create({
-          data: {
-            userId,
-            kind: "RESTART",
-            actor: actor.actor,
-            actorUserId: actor.actorUserId,
-            agentTokenId: actor.agentTokenId,
-            summary: { restarts: restarted, versionId: created.id },
-            fingerprint: hashes.contentHash,
-          },
-          select: { id: true },
+          if (alwaysOn.length > 0)
+            await tx.runtimeInstance.updateMany({
+              where: { id: { in: alwaysOn } },
+              data: { versionId: created.id, launchVersionId: created.id },
+            });
+        }
+        let restartOperationId: string | null = null;
+        if (restarted.length > 0) {
+          const operation = await tx.runtimeOperation.create({
+            data: {
+              userId,
+              kind: "RESTART",
+              actor: actor.actor,
+              actorUserId: actor.actorUserId,
+              agentTokenId: actor.agentTokenId,
+              summary: { restarts: restarted, versionId: created.id },
+              fingerprint: hashes.contentHash,
+            },
+            select: { id: true },
+          });
+          restartOperationId = operation.id;
+          await tx.runtimeInstance.updateMany({
+            where: { id: { in: restarted } },
+            data: {
+              versionId: created.id,
+              launchVersionId: created.id,
+              operationId: operation.id,
+              desiredState: "RUNNING",
+              phase: "STARTING",
+              phaseChangedAt: new Date(),
+              phaseReason: "definition_changed",
+              needsOperator: null,
+              needsOperatorSince: null,
+              restartsInWindow: 0,
+              restartWindowStartedAt: null,
+              nextRestartAt: null,
+            },
+          });
+        }
+        const row = await tx.runtimeVersion.findUniqueOrThrow({
+          where: { id: created.id },
+          select: VERSION_SELECT,
         });
-        restartOperationId = operation.id;
-        await tx.runtimeInstance.updateMany({
-          where: { id: { in: restarted } },
-          data: {
-            versionId: created.id,
-            launchVersionId: created.id,
-            operationId: operation.id,
-            desiredState: "RUNNING",
-            phase: "STARTING",
-            phaseChangedAt: new Date(),
-            phaseReason: "definition_changed",
-            needsOperator: null,
-            needsOperatorSince: null,
-            restartsInWindow: 0,
-            restartWindowStartedAt: null,
-            nextRestartAt: null,
-          },
-        });
-      }
-      const row = await tx.runtimeVersion.findUniqueOrThrow({
-        where: { id: created.id },
-        select: VERSION_SELECT,
-      });
-      return { version: row, operationId: restartOperationId };
-    });
+        return { version: row, operationId: restartOperationId };
+      },
+      // The current version and the adopting instances' versions change admission views.
+      (tx) => runtimeCapacityFences(tx, runtime.id),
+    );
     if (operationId) await context.services?.dispatchRuntimeOperation?.({ userId, operationId });
     const define =
       (await context.services?.pushRuntimeDefinitions?.({ userId, runtimeId: runtime.id })) ?? [];
@@ -656,7 +663,7 @@ export const runtimesRouter = {
       select: { id: true },
     });
     try {
-      await prisma.$transaction(async (tx) => {
+      await graphDelete({ userId, runtimeIds: [runtime.id] }, async (tx) => {
         await tx.runtimeInstance.deleteMany({ where: { runtimeId: runtime.id } });
         await tx.runtime.update({ where: { id: runtime.id }, data: { currentVersionId: null } });
         await tx.runtime.delete({ where: { id: runtime.id } });
@@ -816,19 +823,28 @@ export const runtimesRouter = {
       });
       if (!grantee || grantee.id === userId)
         throw notFound("No other account uses that e-mail address.");
-      const share = await prisma.runtimeShare.upsert({
-        where: { runtimeId_granteeUserId: { runtimeId: runtime.id, granteeUserId: grantee.id } },
-        create: { runtimeId: runtime.id, ownerUserId: userId, granteeUserId: grantee.id },
-        update: {},
-        select: { id: true },
-      });
+      const share = await graphWrite([userId, grantee.id], (tx) =>
+        tx.runtimeShare.upsert({
+          where: {
+            runtimeId_granteeUserId: { runtimeId: runtime.id, granteeUserId: grantee.id },
+          },
+          create: { runtimeId: runtime.id, ownerUserId: userId, granteeUserId: grantee.id },
+          update: {},
+          select: { id: true },
+        }),
+      );
       return { id: share.id };
     }),
     delete: contractProcedure(c.shares.delete).handler(async ({ input, context }) => {
-      const deleted = await prisma.runtimeShare.deleteMany({
-        where: { id: input.shareId, ownerUserId: userIdOf(context) },
+      const userId = userIdOf(context);
+      const share = await prisma.runtimeShare.findFirst({
+        where: { id: input.shareId, ownerUserId: userId },
+        select: { id: true, granteeUserId: true },
       });
-      if (deleted.count === 0) throw notFound("That share does not exist.");
+      if (!share) throw notFound("That share does not exist.");
+      await graphWrite([userId, share.granteeUserId], (tx) =>
+        tx.runtimeShare.deleteMany({ where: { id: share.id, ownerUserId: userId } }),
+      );
       return { ok: true as const };
     }),
   },

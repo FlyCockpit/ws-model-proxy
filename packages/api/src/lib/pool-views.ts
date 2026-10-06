@@ -124,11 +124,17 @@ export function memberView(member: MemberRow): z.infer<typeof poolMemberViewSche
   };
 }
 
-/** Pool status for the Models page: the best of its LOCAL members. */
+/**
+ * Pool status for the Models page: the best of the LOCAL members routing may use (contributed
+ * members are skipped while the owner routes to their own hardware only).
+ */
 export function poolStatus(
-  members: ReadonlyArray<Pick<MemberRow, "kind" | "state" | "RuntimeModel">>,
+  members: ReadonlyArray<Pick<MemberRow, "kind" | "state" | "RuntimeModel" | "shareId">>,
+  ownHardwareOnly = false,
 ): "serving" | "starting" | "unavailable" {
-  const statuses = members.map(memberStatus);
+  const statuses = members
+    .filter((member) => !(ownHardwareOnly && member.shareId))
+    .map(memberStatus);
   if (statuses.includes("serving")) return "serving";
   if (statuses.includes("starting")) return "starting";
   return "unavailable";
@@ -142,10 +148,13 @@ export function callableIdsFor(input: {
   poolSlug: string;
   mode: FallbackMode;
   callerIsOwner: boolean;
+  /** Cloud egress is on for this server (`cloudEgressEnabled`). */
+  cloudEnabled: boolean;
 }): string[] {
   const base = `${input.ownerSlug}/${input.poolSlug}`;
   const covered =
-    input.mode === "OWNER_AND_SHARES" || (input.mode === "OWNER" && input.callerIsOwner);
+    input.cloudEnabled &&
+    (input.mode === "OWNER_AND_SHARES" || (input.mode === "OWNER" && input.callerIsOwner));
   return covered ? [base, `${base}:external`] : [base];
 }
 
@@ -198,6 +207,7 @@ export function poolView(
   pool: PoolRow,
   callerId: string,
   traffic: Traffic = EMPTY_TRAFFIC,
+  cloudEnabled = false,
 ): z.infer<typeof poolViewSchema> {
   const mode = pool.Fallback?.mode ?? "OFF";
   const embedding = embeddingContractSchema.safeParse(pool.Fallback?.embeddingContract);
@@ -243,6 +253,7 @@ export function poolView(
       poolSlug: pool.slug,
       mode,
       callerIsOwner: pool.userId === callerId,
+      cloudEnabled,
     }),
     owner: { userId: pool.userId, slug: pool.User.slug, you: pool.userId === callerId },
     routing: {

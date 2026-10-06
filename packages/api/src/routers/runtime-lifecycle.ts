@@ -21,10 +21,10 @@ import {
 } from "../contracts/runtimes";
 import { callerActor, notFound, refusal } from "../lib/caller-actor";
 import { canonicalJson } from "../lib/canonical-json";
+import { graphWrite, instanceCapacityFences } from "../lib/graph-write";
 import { runtimeSpecWarnings } from "../lib/runtime-spec";
 import { effectiveTrust, specIsInteractive, type Tx } from "../lib/runtime-store";
 import { INSTANCE_INCLUDE, instanceView, storedSpec } from "../lib/runtime-views";
-import { runSerializableTransaction } from "../lib/serializable-transaction";
 
 type StartInput = z.infer<typeof c.start.input>;
 type StartPreview = z.infer<typeof startPreviewSchema>;
@@ -351,79 +351,85 @@ export const runtimeStart = contractProcedure(c.start).handler(async ({ input, c
   if (person && !input.fingerprint)
     throw refusal("preview_required", "Preview the start first, then confirm it.");
   const actor = callerActor(context.auth, userId);
-  const operationId = await runSerializableTransaction(async (tx) => {
-    const computed = await computeStart(tx, context, input);
-    if (input.fingerprint && input.fingerprint !== computed.preview.fingerprint)
-      throw refusal("preview_stale", "Things changed since the preview. Preview again.");
-    throwFirstRefusal(computed.preview.refusals);
-    const operation = await tx.runtimeOperation.create({
-      data: {
-        userId,
-        kind: computed.restart ? "RESTART" : "START",
-        actor: actor.actor,
-        actorUserId: actor.actorUserId,
-        agentTokenId: actor.agentTokenId,
-        summary: computed.preview as unknown as Prisma.InputJsonValue,
-        fingerprint: computed.preview.fingerprint,
-      },
-      select: { id: true },
-    });
-    const now = new Date();
-    for (const start of computed.preview.starts) {
-      if (start.instanceId) {
-        await tx.runtimeInstance.update({
-          where: { id: start.instanceId },
+  const restartId = input.instanceId;
+  const operationId = await graphWrite(
+    [userId],
+    async (tx) => {
+      const computed = await computeStart(tx, context, input);
+      if (input.fingerprint && input.fingerprint !== computed.preview.fingerprint)
+        throw refusal("preview_stale", "Things changed since the preview. Preview again.");
+      throwFirstRefusal(computed.preview.refusals);
+      const operation = await tx.runtimeOperation.create({
+        data: {
+          userId,
+          kind: computed.restart ? "RESTART" : "START",
+          actor: actor.actor,
+          actorUserId: actor.actorUserId,
+          agentTokenId: actor.agentTokenId,
+          summary: computed.preview as unknown as Prisma.InputJsonValue,
+          fingerprint: computed.preview.fingerprint,
+        },
+        select: { id: true },
+      });
+      const now = new Date();
+      for (const start of computed.preview.starts) {
+        if (start.instanceId) {
+          await tx.runtimeInstance.update({
+            where: { id: start.instanceId },
+            data: {
+              versionId: computed.versionId,
+              launchVersionId: computed.versionId,
+              operationId: operation.id,
+              startedBy: actor.actor,
+              desiredState: "RUNNING",
+              phase: "STARTING",
+              phaseChangedAt: now,
+              phaseReason: "restart_requested",
+              needsOperator: null,
+              needsOperatorSince: null,
+              restartsInWindow: 0,
+              restartWindowStartedAt: null,
+              nextRestartAt: null,
+            },
+          });
+          await tx.instanceRank.updateMany({
+            where: { instanceId: start.instanceId, claim: { not: "HELD" } },
+            data: { claim: "HELD", claimChangedAt: now, stoppedAt: null },
+          });
+          continue;
+        }
+        const id = newRowId();
+        const handle = `i-${id.slice(0, 12)}`;
+        await tx.runtimeInstance.create({
           data: {
+            id,
+            userId,
+            runtimeId: computed.runtimeId,
             versionId: computed.versionId,
             launchVersionId: computed.versionId,
+            handle,
             operationId: operation.id,
             startedBy: actor.actor,
             desiredState: "RUNNING",
             phase: "STARTING",
-            phaseChangedAt: now,
-            phaseReason: "restart_requested",
-            needsOperator: null,
-            needsOperatorSince: null,
-            restartsInWindow: 0,
-            restartWindowStartedAt: null,
-            nextRestartAt: null,
+            Ranks: {
+              create: start.placements.map((placement) => ({
+                nodeId: placement.nodeId,
+                rank: placement.nodeNumber - 1,
+                unitName: `wsmp-${handle}-r${placement.nodeNumber - 1}`,
+                port: placement.port,
+                portFixed: false,
+                resources: placement.resources as object,
+              })),
+            },
           },
         });
-        await tx.instanceRank.updateMany({
-          where: { instanceId: start.instanceId, claim: { not: "HELD" } },
-          data: { claim: "HELD", claimChangedAt: now, stoppedAt: null },
-        });
-        continue;
       }
-      const id = newRowId();
-      const handle = `i-${id.slice(0, 12)}`;
-      await tx.runtimeInstance.create({
-        data: {
-          id,
-          userId,
-          runtimeId: computed.runtimeId,
-          versionId: computed.versionId,
-          launchVersionId: computed.versionId,
-          handle,
-          operationId: operation.id,
-          startedBy: actor.actor,
-          desiredState: "RUNNING",
-          phase: "STARTING",
-          Ranks: {
-            create: start.placements.map((placement) => ({
-              nodeId: placement.nodeId,
-              rank: placement.nodeNumber - 1,
-              unitName: `wsmp-${handle}-r${placement.nodeNumber - 1}`,
-              port: placement.port,
-              portFixed: false,
-              resources: placement.resources as object,
-            })),
-          },
-        },
-      });
-    }
-    return operation.id;
-  });
+      return operation.id;
+    },
+    // A restart moves the instance's admission version.
+    restartId ? async () => instanceCapacityFences([restartId]) : undefined,
+  );
   await context.services?.dispatchRuntimeOperation?.({ userId, operationId });
   return { mode: "applied" as const, operation: await operationView(operationId) };
 });
@@ -440,9 +446,9 @@ export const runtimeStop = contractProcedure(c.stop).handler(async ({ input, con
           desiredState: "RUNNING" as const,
           ...(input.nodeId ? { Ranks: { some: { nodeId: input.nodeId } } } : {}),
         };
-  // Read, check and write in one serializable transaction, so a trust lowering that lands
-  // in between cannot let an agent's stop through.
-  const operationId = await runSerializableTransaction(async (tx) => {
+  // Read, check and write under the owner fence, so a trust lowering (an owner write) cannot
+  // land in between and let an agent's stop through.
+  const operationId = await graphWrite([userId], async (tx) => {
     const instances = await tx.runtimeInstance.findMany({
       where,
       select: {

@@ -2,6 +2,7 @@ import prisma from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import { contractProcedure, stub } from "../contract-procedure";
 import { modelsContract as c } from "../contracts/models";
+import { cloudEgressEnabled } from "../lib/cloud-egress";
 import { callableIdsFor, MEMBER_INCLUDE, poolStatus } from "../lib/pool-views";
 
 const POOL_SELECT = {
@@ -11,6 +12,7 @@ const POOL_SELECT = {
   modelType: true,
   User: { select: { slug: true, email: true } },
   Fallback: { select: { mode: true } },
+  Routing: { select: { ownHardwareOnly: true } },
   Members: { include: MEMBER_INCLUDE },
 } as const;
 
@@ -21,6 +23,7 @@ export const modelsRouter = {
    */
   list: contractProcedure(c.list).handler(async ({ context }) => {
     const userId = context.session.user.id;
+    const cloudEnabled = cloudEgressEnabled();
     const pools = await prisma.pool.findMany({
       where: {
         OR: [{ userId }, { Shares: { some: { granteeUserId: userId, canUse: true } } }],
@@ -37,7 +40,7 @@ export const modelsRouter = {
       baseUrl: `${env.BETTER_AUTH_URL.replace(/\/+$/, "")}/v1`,
       models: ordered.flatMap((pool) => {
         const you = pool.userId === userId;
-        const local = poolStatus(pool.Members);
+        const local = poolStatus(pool.Members, pool.Routing?.ownHardwareOnly ?? false);
         const hasCloud = pool.Members.some(
           (member) => member.kind === "CLOUD" && member.state === "ACTIVE",
         );
@@ -46,6 +49,7 @@ export const modelsRouter = {
           poolSlug: pool.slug,
           mode: pool.Fallback?.mode ?? "OFF",
           callerIsOwner: you,
+          cloudEnabled,
         }).map((callableId) => {
           const external = callableId.endsWith(":external");
           return {

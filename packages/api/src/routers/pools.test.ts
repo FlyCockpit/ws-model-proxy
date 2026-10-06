@@ -7,11 +7,34 @@ vi.mock("@ws-model-proxy/db", () => ({
   default: mockDeep<PrismaClient>(),
   Prisma: { DbNull: "DbNull" },
 }));
+const fenceLog = vi.hoisted(() => ({ held: [] as string[], deletes: [] as unknown[] }));
+vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>();
+  return {
+    ...real,
+    acquireFences: vi.fn(async (_tx: unknown, requested: Iterable<string>) => {
+      fenceLog.held.push(...requested);
+      return true;
+    }),
+    fenceParentDelete: vi.fn(async (_tx: unknown, scope: unknown) => {
+      fenceLog.deletes.push(scope);
+      return [];
+    }),
+    runCapacityOrderedTransaction: vi.fn(
+      (db: { $transaction: (work: unknown) => unknown }, work: (tx: unknown) => unknown) =>
+        db.$transaction(work),
+    ),
+  };
+});
 vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
   isForceTwoFactorRequired: vi.fn(async () => false),
 }));
 vi.mock("@ws-model-proxy/env/server", () => ({
-  env: { BETTER_AUTH_URL: "https://proxy.example.test" },
+  env: {
+    BETTER_AUTH_URL: "https://proxy.example.test",
+    WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
+    WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: "configured",
+  },
 }));
 
 import prisma from "@ws-model-proxy/db";
@@ -91,13 +114,20 @@ async function reasonOf(promise: Promise<unknown>): Promise<string | undefined> 
 
 beforeEach(() => {
   mockReset(db);
+  fenceLog.held.length = 0;
+  fenceLog.deletes.length = 0;
   db.$transaction.mockImplementation(((work: (tx: PrismaClient) => unknown) => work(db)) as never);
   db.usageRollupHour.findMany.mockResolvedValue([]);
+  db.executionTarget.findMany.mockResolvedValue([]);
+  db.runtimeModel.findMany.mockResolvedValue([]);
 });
 
 describe("callable ids", () => {
   it("adds :external only where the cloud mode covers the caller", () => {
-    const base = { ownerSlug: "ann", poolSlug: "chat" };
+    const base = { ownerSlug: "ann", poolSlug: "chat", cloudEnabled: true };
+    expect(
+      callableIdsFor({ ...base, cloudEnabled: false, mode: "OWNER", callerIsOwner: true }),
+    ).toEqual(["ann/chat"]);
     expect(callableIdsFor({ ...base, mode: "OFF", callerIsOwner: true })).toEqual(["ann/chat"]);
     expect(callableIdsFor({ ...base, mode: "OWNER", callerIsOwner: true })).toEqual([
       "ann/chat",
@@ -388,5 +418,107 @@ describe("models.list", () => {
     expect(db.pool.findMany.mock.calls[0]?.[0]?.where).toEqual({
       OR: [{ userId: OWNER }, { Shares: { some: { granteeUserId: OWNER, canUse: true } } }],
     });
+  });
+});
+
+describe("graph-write fences and review follow-ups", () => {
+  const owned = { id: "pool-1", userId: OWNER, modelType: "LLM" };
+
+  it("a contribution takes both owners' fences and the model's target fences", async () => {
+    db.share.findFirst.mockResolvedValue({
+      id: "share-1",
+      canContribute: true,
+      ownerUserId: "bob",
+      Pool: { modelType: "LLM", Routing: { ownHardwareOnly: false } },
+    } as never);
+    db.runtimeModel.findFirst.mockResolvedValue({
+      id: "rm-1",
+      type: "LLM",
+      retired: false,
+    } as never);
+    db.executionTarget.findMany.mockResolvedValue([{ id: "t-1" }] as never);
+    db.poolMember.create.mockResolvedValue({ id: "mem-9" } as never);
+    db.poolMember.findUniqueOrThrow.mockResolvedValue(servingMember() as never);
+    await client(CALLERS.fullAgent()).members.addContributed({
+      poolId: "p",
+      runtimeModelId: "rm-1",
+    });
+    expect(fenceLog.held).toEqual(["00:owner:bob", "00:owner:owner-1", "06:capacity-policy:t-1"]);
+  });
+
+  it("removing a contributed member through update fences the contributor too", async () => {
+    db.pool.findFirst.mockResolvedValueOnce(owned as never);
+    db.pool.findFirst.mockResolvedValue(poolRow() as never);
+    db.poolMember.findMany.mockResolvedValue([{ RuntimeModel: { userId: "carol" } }] as never);
+    db.executionTarget.findMany.mockResolvedValue([{ id: "t-2" }] as never);
+    await client().update({ poolId: "pool-1", members: { remove: ["mem-c"] } });
+    expect(fenceLog.held).toEqual(
+      expect.arrayContaining(["00:owner:owner-1", "00:owner:carol", "06:capacity-policy:t-2"]),
+    );
+  });
+
+  it("deleting a pool goes through the parent-delete fences", async () => {
+    db.pool.findFirst.mockResolvedValue({ id: "pool-1", slug: "chat" } as never);
+    await client().delete({ poolId: "pool-1" });
+    expect(fenceLog.deletes).toEqual([{ userId: OWNER, poolIds: ["pool-1"] }]);
+    expect(db.pool.deleteMany).toHaveBeenCalledWith({ where: { id: "pool-1", userId: OWNER } });
+    expect(db.auditEvent.create.mock.calls[0]?.[0]?.data).toMatchObject({ action: "pool.delete" });
+  });
+
+  it("refuses a context margin at or above the ceiling", async () => {
+    db.pool.findFirst.mockResolvedValueOnce(owned as never);
+    db.poolAdvanced.findUnique.mockResolvedValue({
+      poolId: "pool-1",
+      maxWaitMs: null,
+      contextCeiling: 4_096,
+      contextMargin: null,
+      overrides: {},
+    } as never);
+    expect(
+      await reasonOf(client().update({ poolId: "pool-1", advanced: { contextMargin: 4_096 } })),
+    ).toBe("BAD_REQUEST");
+    expect(db.poolAdvanced.upsert).not.toHaveBeenCalled();
+  });
+
+  it("reordering cloud members keeps their rows", async () => {
+    db.pool.findFirst.mockResolvedValueOnce(owned as never);
+    db.pool.findFirst.mockResolvedValue(poolRow() as never);
+    db.providerModel.findMany.mockResolvedValue([
+      { id: "pm-a", type: "LLM" },
+      { id: "pm-b", type: "LLM" },
+    ] as never);
+    db.poolMember.findMany.mockResolvedValue([
+      { id: "m-a", providerModelId: "pm-a", cloudOrder: 0 },
+      { id: "m-b", providerModelId: "pm-b", cloudOrder: 1 },
+    ] as never);
+    await client().update({
+      poolId: "pool-1",
+      cloudMembers: [{ providerModelId: "pm-b" }, { providerModelId: "pm-a" }],
+    });
+    expect(db.poolMember.create).not.toHaveBeenCalled();
+    expect(db.poolMember.deleteMany).not.toHaveBeenCalled();
+    const moves = db.poolMember.update.mock.calls.map((call) => [
+      call[0].where.id,
+      (call[0].data as { cloudOrder: number }).cloudOrder,
+    ]);
+    // m-a moves out of the way, m-b takes 0, m-a takes 1.
+    expect(moves.at(-1)).toEqual(["m-a", 1]);
+    expect(moves).toContainEqual(["m-b", 0]);
+  });
+
+  it("keeps a sidecar's prompt and limits when only the target is re-sent", async () => {
+    db.pool.findFirst.mockResolvedValueOnce(owned as never);
+    db.pool.findFirst.mockResolvedValueOnce({
+      id: "pool-2",
+      modelType: "LLM",
+      Sidecars: [],
+    } as never);
+    db.pool.findFirst.mockResolvedValue(poolRow() as never);
+    db.poolSidecar.count.mockResolvedValue(0);
+    await client().update({
+      poolId: "pool-1",
+      sidecars: [{ input: "IMAGE", targetPoolId: "pool-2" }],
+    });
+    expect(db.poolSidecar.upsert.mock.calls[0]?.[0]?.update).toEqual({ targetPoolId: "pool-2" });
   });
 });
