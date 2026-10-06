@@ -199,7 +199,7 @@ const STARTUP_GRACE_MS = 2 * 60_000;
 const TERMINAL_START_ERRORS: ReadonlySet<string> = new Set([
   "trust_relay",
   "definition_frozen",
-  // No operator terminals on this node (or in this release): a person must run it.
+  // A node built without operator terminals refuses an interactive step the same way every time.
   "interactive_unsupported",
   "operator_terminals_disabled",
 ]);

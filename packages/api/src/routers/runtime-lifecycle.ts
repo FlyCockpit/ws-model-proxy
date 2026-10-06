@@ -23,10 +23,6 @@ import {
 import { callerActor } from "../lib/caller-actor";
 import { canonicalJson } from "../lib/canonical-json";
 import { graphWrite, instanceCapacityFences } from "../lib/graph-write";
-import {
-  INTERACTIVE_STEPS_SUPPORTED,
-  INTERACTIVE_UNSUPPORTED_MESSAGE,
-} from "../lib/interactive-steps";
 import { PlacementPlanner } from "../lib/placement";
 import { loadPlacementContext } from "../lib/placement-load";
 import { previewFingerprint } from "../lib/preview-fingerprint";
@@ -154,12 +150,6 @@ async function computeStart(
     for (let index = 0; index < count; index++) if (!record(null, planner.place(base))) break;
   }
 
-  if (specIsInteractive(spec) && !INTERACTIVE_STEPS_SUPPORTED)
-    refusals.push({
-      reason: "interactive_needs_person",
-      subjectId: input.runtimeId,
-      message: INTERACTIVE_UNSUPPORTED_MESSAGE,
-    });
   if (specIsInteractive(spec))
     warnings.push({
       code: "interactive_needs_person",

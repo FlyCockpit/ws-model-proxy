@@ -96,7 +96,7 @@ describe("profilePlan", () => {
     expect(plan.preview.fingerprint).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it("refuses an interactive item in this preview instead of placing it", () => {
+  it("places an interactive item and warns that a person runs a step", () => {
     const spec = launchSpec({
       management: "service",
       commands: [
@@ -112,10 +112,11 @@ describe("profilePlan", () => {
       ["v-1", { id: "v-1", runtimeId: "rt-1", runtimeSlug: "qwen", currentVersionId: "v-1", spec }],
     ]);
     const plan = profilePlan(input({ versions }));
-    expect(plan.preview.starts).toEqual([]);
-    expect(plan.preview.refusals).toEqual([
-      expect.objectContaining({ reason: "interactive_needs_person", subjectId: "rt-1" }),
-    ]);
+    expect(plan.preview.refusals).toEqual([]);
+    expect(plan.preview.starts).toHaveLength(1);
+    expect(plan.preview.warnings).toEqual(
+      expect.arrayContaining([expect.objectContaining({ code: "interactive_needs_person" })]),
+    );
   });
 
   it("keeps a matching instance and stops everything else on owned nodes", () => {
