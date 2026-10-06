@@ -206,8 +206,13 @@ function CreateApiKeyDialog({
 }) {
   const { t } = useTranslation(["access"]);
   const [secret, setSecret] = useState<string | null>(null);
+  // Owned here so the dialog cannot close while the key is being minted (a late result would
+  // otherwise reveal the secret later); `gcTime: 0` keeps it out of the mutation cache.
+  const create = useMutation({ ...orpc.access.apiKeys.create.mutationOptions(), gcTime: 0 });
   const close = () => {
+    if (create.isPending) return;
     setSecret(null);
+    create.reset();
     onOpenChange(false);
   };
   return (
@@ -220,17 +225,35 @@ function CreateApiKeyDialog({
       {secret ? (
         <SecretReveal value={secret} onDone={close} />
       ) : open ? (
-        <CreateApiKeyForm onCreated={setSecret} />
+        <CreateApiKeyForm
+          create={create.mutateAsync}
+          onCreated={(value) => {
+            setSecret(value);
+            create.reset();
+          }}
+        />
       ) : null}
     </ResponsiveDialog>
   );
 }
 
-function CreateApiKeyForm({ onCreated }: { onCreated: (secret: string) => void }) {
+type CreateApiKey = (input: {
+  name: string;
+  scope: "ALL_POOLS" | "SELECTED_POOLS";
+  poolIds: string[];
+  expiresAt: string | null;
+}) => Promise<{ secret: string }>;
+
+function CreateApiKeyForm({
+  create,
+  onCreated,
+}: {
+  create: CreateApiKey;
+  onCreated: (secret: string) => void;
+}) {
   const { t } = useTranslation(["access", "common"]);
   const queryClient = useQueryClient();
   const pools = useQuery(orpc.pools.list.queryOptions());
-  const create = useMutation(orpc.access.apiKeys.create.mutationOptions());
   const form = useForm({
     defaultValues: {
       name: "",
@@ -241,14 +264,12 @@ function CreateApiKeyForm({ onCreated }: { onCreated: (secret: string) => void }
     validators: { onSubmit: createSchema },
     onSubmit: async ({ value }) => {
       // A failure is toasted by the global mutation error handler.
-      const result = await create
-        .mutateAsync({
-          name: value.name.trim(),
-          scope: value.scope,
-          poolIds: value.scope === "SELECTED_POOLS" ? value.poolIds : [],
-          expiresAt: expiryFromChoice(value.expiry, Date.now()),
-        })
-        .catch(() => null);
+      const result = await create({
+        name: value.name.trim(),
+        scope: value.scope,
+        poolIds: value.scope === "SELECTED_POOLS" ? value.poolIds : [],
+        expiresAt: expiryFromChoice(value.expiry, Date.now()),
+      }).catch(() => null);
       if (!result) return;
       await queryClient.invalidateQueries({ queryKey: orpc.access.apiKeys.list.key() });
       onCreated(result.secret);
@@ -287,7 +308,15 @@ function CreateApiKeyForm({ onCreated }: { onCreated: (secret: string) => void }
               onBlur={field.handleBlur}
               onChange={(event) => field.handleChange(event.target.value)}
               aria-invalid={field.state.meta.errors.length > 0}
+              aria-describedby={
+                field.state.meta.errors.length > 0 ? "api-key-name-error" : undefined
+              }
             />
+            {field.state.meta.errors.length > 0 ? (
+              <p id="api-key-name-error" className="text-sm text-destructive">
+                {t("access:fields.nameRequired")}
+              </p>
+            ) : null}
           </div>
         )}
       </form.Field>

@@ -163,6 +163,7 @@ function ShareByMeRow({ share }: { share: ShareView }) {
   const { t } = useTranslation(["access"]);
   const invalidate = useInvalidateShares();
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [contributeOffOpen, setContributeOffOpen] = useState(false);
   const update = useMutation(
     orpc.access.shares.update.mutationOptions({
       onSuccess: async () => {
@@ -186,6 +187,11 @@ function ShareByMeRow({ share }: { share: ShareView }) {
       toast.error(t("access:shares.needOne"));
       return;
     }
+    // Clearing can contribute removes the person's contributed members: confirm first.
+    if (field === "canContribute" && !next && share.contributedMembers > 0) {
+      setContributeOffOpen(true);
+      return;
+    }
     update.mutate({ shareId: share.id, [field]: next });
   };
   return (
@@ -194,6 +200,11 @@ function ShareByMeRow({ share }: { share: ShareView }) {
         <div className="min-w-0 space-y-0.5">
           <p className="truncate font-medium">{share.granteeEmail}</p>
           <p className="truncate font-mono text-xs text-muted-foreground">{share.callableId}</p>
+          {share.contributedMembers > 0 ? (
+            <p className="text-xs text-muted-foreground">
+              {t("access:shares.contributed", { count: share.contributedMembers })}
+            </p>
+          ) : null}
           <CapLine share={share} />
         </div>
         <Button type="button" variant="outline" size="touch" onClick={() => setConfirmOpen(true)}>
@@ -227,6 +238,25 @@ function ShareByMeRow({ share }: { share: ShareView }) {
         confirmLabel={t("access:shares.remove")}
         isPending={remove.isPending}
         onConfirm={() => remove.mutate({ shareId: share.id })}
+      />
+      <ConfirmAction
+        open={contributeOffOpen}
+        onOpenChange={setContributeOffOpen}
+        title={t("access:shares.contributeOffTitle", {
+          email: share.granteeEmail,
+          pool: share.callableId,
+        })}
+        description={t("access:shares.contributeOffDescription", {
+          count: share.contributedMembers,
+        })}
+        confirmLabel={t("access:shares.contributeOff")}
+        isPending={update.isPending}
+        onConfirm={() =>
+          update.mutate(
+            { shareId: share.id, canContribute: false },
+            { onSettled: () => setContributeOffOpen(false) },
+          )
+        }
       />
     </div>
   );
@@ -307,9 +337,11 @@ function InviteRow({ invite, onLink }: { invite: InviteView; onLink: (link: Invi
       },
     }),
   );
+  const [withdrawOpen, setWithdrawOpen] = useState(false);
   const withdraw = useMutation(
     orpc.access.invites.revoke.mutationOptions({
       onSuccess: async () => {
+        setWithdrawOpen(false);
         toast.success(t("access:shares.withdrawn"));
         await invalidate();
       },
@@ -336,16 +368,19 @@ function InviteRow({ invite, onLink }: { invite: InviteView; onLink: (link: Invi
         >
           {t("access:shares.resend")}
         </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="touch"
-          disabled={withdraw.isPending}
-          onClick={() => withdraw.mutate({ inviteId: invite.id })}
-        >
+        <Button type="button" variant="ghost" size="touch" onClick={() => setWithdrawOpen(true)}>
           {t("access:shares.withdraw")}
         </Button>
       </div>
+      <ConfirmAction
+        open={withdrawOpen}
+        onOpenChange={setWithdrawOpen}
+        title={t("access:shares.withdrawTitle", { email: invite.email })}
+        description={t("access:shares.withdrawDescription")}
+        confirmLabel={t("access:shares.withdraw")}
+        isPending={withdraw.isPending}
+        onConfirm={() => withdraw.mutate({ inviteId: invite.id })}
+      />
     </div>
   );
 }
@@ -481,7 +516,7 @@ function CreateShareForm({ onDone }: { onDone: (link: InviteLink | null) => void
             ) : ownPools.length === 0 ? (
               <p className="text-sm text-muted-foreground">{t("access:shares.noOwnPools")}</p>
             ) : (
-              <div className="flex min-w-0 flex-col" role="radiogroup">
+              <div className="flex min-w-0 flex-col">
                 {ownPools.map((pool) => (
                   <label
                     key={pool.id}

@@ -10,7 +10,8 @@
     "created": "Creada",
     "lastUsed": "Último uso",
     "never": "Nunca",
-    "neverUsed": "Sin usar todavía"
+    "neverUsed": "Sin usar todavía",
+    "nameRequired": "Escribe un nombre (hasta 120 caracteres)."
   },
   "expiry": {
     "d7": "7 días",
@@ -84,7 +85,8 @@
     "disconnect": "Desconectar",
     "disconnectTitle": "¿Desconectar {{name}}?",
     "disconnectDescription": "El agente tendrá que pedir tu aprobación de nuevo para reconectarse.",
-    "disconnected": "Desconectado."
+    "disconnected": "Desconectado.",
+    "mcpOff": "MCP está desactivado en este servidor, así que no se pueden crear tokens de agente."
   },
   "shares": {
     "create": "Compartir un pool",
@@ -136,7 +138,12 @@
     "monthlyCap": "Tope de nube: {{spent}} de {{limit}} {{currency}} este mes",
     "contributed_one": "{{count}} modelo contribuido",
     "contributed_other": "{{count}} modelos contribuidos",
-    "loadFailed": "No se pudieron cargar los compartidos."
+    "loadFailed": "No se pudieron cargar los compartidos.",
+    "contributeOffTitle": "¿Quitar a {{email}} como contribuidor de {{pool}}?",
+    "contributeOffDescription": "Sus {{count}} modelos contribuidos se quitan del pool.",
+    "contributeOff": "Dejar de contribuir",
+    "withdrawTitle": "¿Retirar la invitación a {{email}}?",
+    "withdrawDescription": "El enlace de invitación deja de funcionar."
   },
   "contributions": {
     "empty": "Ningún pool te permite contribuir todavía. El dueño de un pool puede compartirlo contigo con puede contribuir.",
@@ -145,5 +152,10 @@
     "noModels": "Todavía no contribuyes nada a este pool.",
     "ownHardwareOnly": "Por ahora el dueño solo enruta a su propio hardware: tus modelos siguen en la lista pero no reciben tráfico.",
     "addHint": "Agrega uno de tus modelos servidos desde la página del pool."
+  },
+  "modelType": {
+    "LLM": "Modelo de lenguaje",
+    "EMBEDDINGS": "Embeddings",
+    "TRANSCRIPTION": "Transcripción"
   }
 }

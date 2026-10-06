@@ -10,7 +10,8 @@
     "created": "Created",
     "lastUsed": "Last used",
     "never": "Never",
-    "neverUsed": "Not used yet"
+    "neverUsed": "Not used yet",
+    "nameRequired": "Enter a name (up to 120 characters)."
   },
   "expiry": {
     "d7": "7 days",
@@ -84,7 +85,8 @@
     "disconnect": "Disconnect",
     "disconnectTitle": "Disconnect {{name}}?",
     "disconnectDescription": "The agent must ask for your approval again to reconnect.",
-    "disconnected": "Disconnected."
+    "disconnected": "Disconnected.",
+    "mcpOff": "MCP is turned off on this server, so agent tokens cannot be created."
   },
   "shares": {
     "create": "Share a pool",
@@ -136,7 +138,12 @@
     "monthlyCap": "Cloud cap: {{spent}} of {{limit}} {{currency}} this month",
     "contributed_one": "{{count}} contributed model",
     "contributed_other": "{{count}} contributed models",
-    "loadFailed": "Could not load shares."
+    "loadFailed": "Could not load shares.",
+    "contributeOffTitle": "Stop {{email}} contributing to {{pool}}?",
+    "contributeOffDescription": "Their {{count}} contributed models are removed from the pool.",
+    "contributeOff": "Stop contributing",
+    "withdrawTitle": "Withdraw the invite to {{email}}?",
+    "withdrawDescription": "The invite link stops working."
   },
   "contributions": {
     "empty": "No pool lets you contribute yet. A pool's owner can share it with you with can contribute.",
@@ -145,5 +152,10 @@
     "noModels": "You contribute nothing to this pool yet.",
     "ownHardwareOnly": "The owner routes to their own hardware only for now: your models stay listed but get no traffic.",
     "addHint": "Add one of your served models from the pool's page."
+  },
+  "modelType": {
+    "LLM": "Language model",
+    "EMBEDDINGS": "Embeddings",
+    "TRANSCRIPTION": "Transcription"
   }
 }

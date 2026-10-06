@@ -55,6 +55,8 @@ type AgentTokenView = {
 function AccessAgentsPage() {
   const { t } = useTranslation(["access"]);
   const tokens = useQuery(orpc.access.agentTokens.list.queryOptions());
+  const flags = useQuery(orpc.app.flags.queryOptions());
+  const mcpOff = flags.data?.mcpEnabled === false;
   const [createOpen, setCreateOpen] = useState(false);
   return (
     <div className="flex min-w-0 flex-col gap-6">
@@ -76,10 +78,13 @@ function AccessAgentsPage() {
             <CardTitle>{t("access:agents.tokensTitle")}</CardTitle>
             <CardDescription>{t("access:agents.tokensDescription")}</CardDescription>
           </div>
-          <Button type="button" size="touch" onClick={() => setCreateOpen(true)}>
+          <Button type="button" size="touch" disabled={mcpOff} onClick={() => setCreateOpen(true)}>
             <Plus aria-hidden="true" />
             {t("access:agents.create")}
           </Button>
+          {mcpOff ? (
+            <p className="w-full text-sm text-muted-foreground">{t("access:agents.mcpOff")}</p>
+          ) : null}
         </CardHeader>
         <CardContent className="min-w-0">
           {tokens.isPending ? (
@@ -290,8 +295,13 @@ function CreateAgentTokenDialog({
 }) {
   const { t } = useTranslation(["access"]);
   const [secret, setSecret] = useState<string | null>(null);
+  // Owned here so the dialog cannot close while the token is being minted (a late result would
+  // otherwise reveal the secret later); `gcTime: 0` keeps it out of the mutation cache.
+  const create = useMutation({ ...orpc.access.agentTokens.create.mutationOptions(), gcTime: 0 });
   const close = () => {
+    if (create.isPending) return;
     setSecret(null);
+    create.reset();
     onOpenChange(false);
   };
   const config =
@@ -327,17 +337,34 @@ function CreateAgentTokenDialog({
           ) : null}
         </SecretReveal>
       ) : open ? (
-        <CreateAgentTokenForm onCreated={setSecret} />
+        <CreateAgentTokenForm
+          create={create.mutateAsync}
+          onCreated={(value) => {
+            setSecret(value);
+            create.reset();
+          }}
+        />
       ) : null}
     </ResponsiveDialog>
   );
 }
 
-function CreateAgentTokenForm({ onCreated }: { onCreated: (secret: string) => void }) {
+type CreateAgentToken = (input: {
+  name: string;
+  level: AgentLevel;
+  expiresAt: string | null;
+}) => Promise<{ secret: string }>;
+
+function CreateAgentTokenForm({
+  create,
+  onCreated,
+}: {
+  create: CreateAgentToken;
+  onCreated: (secret: string) => void;
+}) {
   const { t } = useTranslation(["access"]);
   const queryClient = useQueryClient();
   const flags = useQuery(orpc.app.flags.queryOptions());
-  const create = useMutation(orpc.access.agentTokens.create.mutationOptions());
   const noExpiryAllowed = flags.data?.agentTokenNoExpiryAllowed === true;
   const choices = EXPIRY_CHOICES.filter((choice) => choice !== "never" || noExpiryAllowed);
   const form = useForm({
@@ -349,13 +376,11 @@ function CreateAgentTokenForm({ onCreated }: { onCreated: (secret: string) => vo
     validators: { onSubmit: createSchema },
     onSubmit: async ({ value }) => {
       // A failure is toasted by the global mutation error handler.
-      const result = await create
-        .mutateAsync({
-          name: value.name.trim(),
-          level: value.level,
-          expiresAt: expiryFromChoice(value.expiry, Date.now()),
-        })
-        .catch(() => null);
+      const result = await create({
+        name: value.name.trim(),
+        level: value.level,
+        expiresAt: expiryFromChoice(value.expiry, Date.now()),
+      }).catch(() => null);
       if (!result) return;
       await queryClient.invalidateQueries({ queryKey: orpc.access.agentTokens.list.key() });
       onCreated(result.secret);
@@ -382,7 +407,15 @@ function CreateAgentTokenForm({ onCreated }: { onCreated: (secret: string) => vo
               onBlur={field.handleBlur}
               onChange={(event) => field.handleChange(event.target.value)}
               aria-invalid={field.state.meta.errors.length > 0}
+              aria-describedby={
+                field.state.meta.errors.length > 0 ? "agent-token-name-error" : undefined
+              }
             />
+            {field.state.meta.errors.length > 0 ? (
+              <p id="agent-token-name-error" className="text-sm text-destructive">
+                {t("access:fields.nameRequired")}
+              </p>
+            ) : null}
           </div>
         )}
       </form.Field>

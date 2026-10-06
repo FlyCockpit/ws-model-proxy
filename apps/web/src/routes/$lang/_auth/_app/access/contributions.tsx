@@ -51,7 +51,8 @@ function AccessContributionsPage() {
                     </Link>
                   </CardTitle>
                   <p className="text-xs text-muted-foreground">
-                    {t("access:shares.from", { email: pool.ownerEmail })} · {pool.modelType}
+                    {t("access:shares.from", { email: pool.ownerEmail })} ·{" "}
+                    {t(`access:modelType.${pool.modelType}`)}
                   </p>
                 </CardHeader>
                 <CardContent className="min-w-0 space-y-2">
