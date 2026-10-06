@@ -137,6 +137,8 @@ model Attempt {
   providerAccountId  String?
   providerModelId    String?
   credentialId       String?
+  /// CLOUD, owner-paid share traffic: the share whose monthly cap it counts against. Plain id.
+  shareId            String?
   requestedSurface   String
   nativeSurface      String?
   adapterMode        String?

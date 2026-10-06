@@ -4461,10 +4461,6 @@ async function relayPool({
     const dispatchExternalTier = async (
       ownKey = false,
     ): Promise<Awaited<ReturnType<typeof dispatchPublicOverflow>>> => {
-      // Provider egress never has a direct-dispatch fallback. Durable global
-      // admission supplies the cross-process concurrency fence; without it a
-      // provider request must fail closed even if legacy configuration exists.
-      if (!capacityRuntime) return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
       const tierRequest: PublicOverflowRequest = ownKey
         ? {
             ...providerRequest,
@@ -4552,10 +4548,34 @@ async function relayPool({
       // permanent "no compatible provider" (which would be a 400 downstream).
       if (compatible.length === 0 && compatibleAll.length > 0)
         return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
-      // An external member is a physical execution target too. Missing
-      // capacity identity is a configuration error, never permission to bypass
-      // durable concurrency and fencing.
-      if (compatible.length === 0 || compatible.some((item) => !item.inferenceCapacityId))
+      if (compatible.length === 0) return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" };
+      // 0.4.0 cloud members have no physical capacity: the provider is the capacity, and the
+      // monthly spend caps (reserved before every send) bound what they may spend. They are
+      // dispatched without a capacity lease; dispatchPublicOverflow walks the ranked members
+      // itself (spend admission, health trial and the E0 send claim per member).
+      if (compatible.every((item) => !item.inferenceCapacityId)) {
+        await releaseProviderCapacity();
+        // The relay deadline bounds the start of external work, as for leased members.
+        if (request.signal.aborted || remainingRelayBudgetMs(relayDeadlineMs) <= 0)
+          return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
+        const previousRoute = routeIdentity;
+        const result = await dispatchPublicOverflow({
+          ...tierRequest,
+          // Only the members this tier found servable (e.g. renderable at this depth).
+          eligibleExecutionTargetIds: compatible.map((item) => item.executionTargetId),
+          retrySingleTargetPrecommit: ownKey,
+          beforeProviderSend: ownKey
+            ? (provider) => persistRouteIdentity(providerRouteIdentity(provider))
+            : undefined,
+        });
+        if (!result.dispatched && ownKey) await persistRouteIdentity(previousRoute);
+        return result;
+      }
+      // A capacity-backed external member is a physical execution target too. Durable global
+      // admission supplies the cross-process concurrency fence; without it, or with a member
+      // missing its capacity identity, a provider request fails closed.
+      if (!capacityRuntime) return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
+      if (compatible.some((item) => !item.inferenceCapacityId))
         return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" };
       await releaseProviderCapacity();
       // Durations only (process monotonic clock): the store turns each
@@ -8683,7 +8703,6 @@ async function relayBoundProviderResponse(input: {
   const dispatchBoundTarget = async (): Promise<
     Awaited<ReturnType<typeof dispatchPublicOverflow>>
   > => {
-    if (!input.capacityRuntime) return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
     const listed = ownKey
       ? await listPublicOverflowTargets(
           input.stickyRoute.visibleTarget.ownerUserId,
@@ -8731,10 +8750,32 @@ async function relayBoundProviderResponse(input: {
     // has a half-open trial in flight: temporarily unavailable (503), not gone.
     if (!exactTarget && listed.coolingDown.some(isBoundTarget))
       return { dispatched: false, reason: "PROVIDER_UNHEALTHY" };
-    // No member matches the binding (or it has no capacity to admit into):
-    // the binding can never be served again (404).
-    if (!exactTarget?.inferenceCapacityId)
-      return { dispatched: false, reason: "BOUND_TARGET_INVALID" };
+    // No member matches the binding: it can never be served again (404).
+    if (!exactTarget) return { dispatched: false, reason: "BOUND_TARGET_INVALID" };
+    const boundBeforeSend = ownKey
+      ? async (provider: PublicProviderTarget) => {
+          const identity: RouteIdentity = {
+            fallbackRoute: "own-key",
+            selectedRuntimeModelId: null,
+            selectedPoolMemberId: null,
+            selectedExecutionTargetId: provider.executionTargetId,
+          };
+          await prisma.relayRequest.update({
+            where: { id: relayRequestId },
+            data: routeIdentityData(identity),
+          });
+          boundRouteIdentity = identity;
+        }
+      : undefined;
+    // 0.4.0 cloud members have no physical capacity (spend caps bound them): no lease.
+    if (!exactTarget.inferenceCapacityId)
+      return dispatchPublicOverflow({
+        ...boundRequest,
+        admittedExecutionTargetId: exactTarget.executionTargetId,
+        forcedPoolMemberId: exactTarget.poolMemberId,
+        beforeProviderSend: boundBeforeSend,
+      });
+    if (!input.capacityRuntime) return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
     const admission = await acquireCapacityWithTelemetry({
       runtime: input.capacityRuntime,
       relayRequestId,
@@ -8773,21 +8814,7 @@ async function relayBoundProviderResponse(input: {
         admittedExecutionTargetId: admission.lease.executionTargetId,
         signal: admission.lease.signal ?? input.request.signal,
         forcedPoolMemberId: exactTarget.poolMemberId,
-        beforeProviderSend: ownKey
-          ? async (provider) => {
-              const identity: RouteIdentity = {
-                fallbackRoute: "own-key",
-                selectedRuntimeModelId: null,
-                selectedPoolMemberId: null,
-                selectedExecutionTargetId: provider.executionTargetId,
-              };
-              await prisma.relayRequest.update({
-                where: { id: relayRequestId },
-                data: routeIdentityData(identity),
-              });
-              boundRouteIdentity = identity;
-            }
-          : undefined,
+        beforeProviderSend: boundBeforeSend,
       });
     } catch (error) {
       await releaseCapacityLeaseWithRetry({ store: input.capacityRuntime, lease: admission.lease });

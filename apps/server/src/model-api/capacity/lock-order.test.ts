@@ -150,6 +150,8 @@ const HOT_PATH_WRITERS: Record<string, string> = {
   "apps/server/src/model-api/routes.ts": "H: relay status, execution telemetry and stickiness",
   "apps/server/src/model-api/public-overflow.ts": "H: external-provider relay status",
   "apps/server/src/model-api/provider-attempt-runtime.ts": "H: provider attempt telemetry",
+  "apps/server/src/model-api/provider-budget.ts":
+    "H: cloud spend admission and accounting (attempt anchor, reservations, settlements, ledger) after the spend-attempt then spend-cap fences; graph rows read without a lock; S: its expired-attempt repair takes the same attempt fence",
   "apps/server/src/model-api/kv-eviction-feedback.ts":
     "H: disposable KV eviction feedback (one owner-guarded single-statement upsert, no fence)",
   "apps/server/src/relay/runtime-load-rollup.ts":
@@ -219,6 +221,10 @@ const GRAPH_WRITERS: Record<string, string> = {
   "packages/api/src/routers/auth.ts": "user profile fields (unfenced columns)",
   "packages/api/src/routers/settings.ts": "user settings (unfenced columns)",
   "packages/db/src/capacity-lock-order.ts": "M: the user delete under owner fences",
+  "apps/server/src/model-api/public-overflow.ts":
+    "H status: the E0 send claim's credential lastUsedAt, after its owner fences and the credential row FOR UPDATE",
+  "apps/server/src/model-api/provider-targets.ts":
+    "M: a provider model's execution target, created on first use under the owner then target-identity fences, account and model rows FOR KEY SHARE first",
   "packages/db/src/parent-deletion.ts": "user deletion marker writes (unfenced columns)",
   "packages/db/prisma/schema-hardening.sql": "D: deploy backfills (bypass marker)",
   "packages/db/scripts/verify-schema-hardening.mjs": "D: schema verification",
@@ -258,6 +264,14 @@ const REVIEWED_SHARE_LOCKS: Record<string, string> = {
     "Same transaction, after the share: the head node row catches unfenced connection/trust status writes (registration, trust lowering). Those writers update one node row and take no fence or graph row afterwards, so waiting on them closes no cycle.",
   "apps/server/src/model-api/local-send.ts:runtime_instance.FOR SHARE":
     "Same transaction, after the node: the instance row catches unfenced lifecycle/phase writes (A4 jobs, health). Those writers take the instance's capacity fence first only for structural changes; status writes touch one row and nothing later, so no cycle.",
+  "apps/server/src/model-api/public-overflow.ts:pool.FOR SHARE":
+    "E0 send claim: after the sorted owner fences of requester, pool owner and payer, before any other row. Pool, then share, api_key, pool_member, then provider account/model (SHARE) and credential (UPDATE), users last. Pool and share writers hold an owner fence this transaction already holds, so they serialize before rows; it writes nothing but the held credential's lastUsedAt and takes no hot-path row or later fence.",
+  "apps/server/src/model-api/public-overflow.ts:share.FOR SHARE":
+    "E0 send claim, after the pool row: the requester's share (canUse, own-key choice). Share writers hold the pool owner's fence, which the claim already holds.",
+  "apps/server/src/model-api/public-overflow.ts:pool_member.FOR SHARE":
+    "E0 send claim, after pool, pool_fallback, share and api_key, before the provider rows: the CLOUD member's state. Member writers need the pool owner's fence (structural and state/weight columns), which the claim already holds, so they serialize before rows; no cycle.",
+  "apps/server/src/model-api/public-overflow.ts:user.FOR SHARE":
+    "E0 send claim, last lock: the sorted requester, pool owner and payer rows catch unfenced Better Auth bans. A ban writer updates one user row and takes nothing afterwards; deletion writers hold an owner fence the claim already holds. No fence or row is taken after it.",
   "apps/server/src/model-api/local-send.ts:user.FOR SHARE":
     "Sorted user SHARE locks after graph owner/target-policy fences and graph rows catch unfenced Better Auth one-user bans. Ban writer updates one user and takes no inference row afterwards. Deletion writers share owner fences, and pool-before-user order matches deletion. No later fence/graph row acquisition.",
   "packages/db/prisma/schema-hardening.sql:user.FOR SHARE":
@@ -293,6 +307,26 @@ function scanShareLocks(): Finding[] {
   return productionSources()
     .filter(({ file }) => !file.endsWith(".sh"))
     .flatMap(({ file, source }) => findSqlLockOrderViolations(file, source));
+}
+
+/** Text of the balanced (...) or {...} group starting at `start` (quotes skipped). */
+function balanced(source: string, start: number): string {
+  const open = source[start];
+  const close = open === "(" ? ")" : "}";
+  let depth = 0;
+  let quote: string | null = null;
+  for (let index = start; index < source.length; index++) {
+    const char = source[index];
+    if (quote) {
+      if (char === "\\") index++;
+      else if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") quote = char;
+    else if (char === open) depth++;
+    else if (char === close && --depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`unbalanced group at ${start}`);
 }
 
 describe("capacity lock order (DL-1 design (d)): writer classes and fences", () => {
@@ -419,6 +453,57 @@ describe("capacity lock order (DL-1 design (d)): writer classes and fences", () 
     expect(check('SELECT 1 FROM "user" WHERE id = 1 FOR KEY SHARE;\n')).toEqual([]);
   });
 
-  // The E0 send claim (cloud credential claim) is a fail-closed stub until the spend lane
-  // (B3/B4) lands; its lock-sequence test returns with that implementation.
+  // E0 send claim (public-overflow.ts): its locks appear in the documented order (fences,
+  // consent rows, member, provider account -> model -> credential, users last), every re-read
+  // follows the last lock, and nothing after the last lock waits or writes anything but the
+  // held credential's lastUsedAt.
+  it("keeps the E0 send claim's lock sequence and lock-free post-lock re-reads", () => {
+    const file = "apps/server/src/model-api/public-overflow.ts";
+    const source = readFileSync(join(repoRoot, file), "utf8");
+    const claimStart = source.indexOf(
+      "export async function claimPublicProviderCredentialForSend(",
+    );
+    expect(claimStart).toBeGreaterThanOrEqual(0);
+    const claim = balanced(
+      source,
+      source.indexOf("{", source.indexOf("): Promise<PublicProviderSendClaim> {", claimStart)),
+    );
+    const position = (needle: string) => {
+      const index = claim.indexOf(needle);
+      expect(index, needle).toBeGreaterThanOrEqual(0);
+      return index;
+    };
+    const sequence = [
+      "set_config('lock_timeout'",
+      "fenceOwners(",
+      "FROM pool WHERE id",
+      "FROM pool_fallback WHERE",
+      "FROM share WHERE id",
+      "FROM api_key WHERE id",
+      "FROM pool_member WHERE id",
+      "FROM provider_account WHERE id",
+      "FROM provider_model WHERE id",
+      "FROM provider_credential WHERE id",
+      'FROM "user" WHERE id IN',
+      "recheckExternalSendTarget(",
+      "providerCredential.update(",
+    ].map(position);
+    expect(sequence).toEqual([...sequence].sort((left, right) => left - right));
+    const recheckStart = source.indexOf("async function recheckExternalSendTarget(");
+    const recheck = balanced(
+      source,
+      source.indexOf("{", source.indexOf("): Promise<", recheckStart)),
+    );
+    expect(recheck).toContain("poolMember.findFirst(");
+    expect(recheck).toContain("providerModel.findFirst(");
+    expect(recheck).not.toMatch(/FOR (NO KEY )?(SHARE|UPDATE)|\$queryRaw|\$executeRaw/);
+    const lockClause = /FOR (NO KEY |KEY )?(SHARE|UPDATE)|NOWAIT|SKIP LOCKED|LOCK TABLE/;
+    const tail = claim.slice(claim.indexOf("// Nothing below waits on a lock."));
+    expect(tail).not.toMatch(lockClause);
+    expect(tail).not.toMatch(/\$queryRaw|\$executeRaw|acquireFences|fenceOwners/);
+    expect(
+      tail.match(/\.(update|updateMany|upsert|create|createMany|delete|deleteMany)\(/g),
+    ).toEqual([".update("]);
+    expect(tail).toContain("tx.providerCredential.update(");
+  });
 });

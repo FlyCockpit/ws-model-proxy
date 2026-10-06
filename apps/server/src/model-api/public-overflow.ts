@@ -4,16 +4,29 @@ import {
   type EmbeddingContract,
   embeddingContractsMatch,
 } from "@ws-model-proxy/api/lib/embedding-contract";
-import { type OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
-import { parseProviderCredentialKeyring } from "@ws-model-proxy/api/lib/provider-credential-crypto";
+import {
+  type OpenAiCompatibleCapabilities,
+  parseOpenAiCompatibleCapabilities,
+} from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import {
+  decryptProviderCredential,
+  parseProviderCredentialKeyring,
+} from "@ws-model-proxy/api/lib/provider-credential-crypto";
 import {
   type ProviderEgressAuth,
   type ProviderProtocol,
   providerHttpsRequest,
 } from "@ws-model-proxy/api/lib/provider-egress";
-import { providerRequestPathname } from "@ws-model-proxy/api/lib/provider-protocol";
-import { resolveExecutionPath } from "@ws-model-proxy/api/lib/surface-capabilities";
+import {
+  providerProtocolForType,
+  providerRequestPathname,
+} from "@ws-model-proxy/api/lib/provider-protocol";
+import {
+  resolveExecutionPath,
+  surfaceAvailabilityMatrix,
+} from "@ws-model-proxy/api/lib/surface-capabilities";
 import prisma, { Prisma } from "@ws-model-proxy/db";
+import { FenceProtocolError, fenceOwners } from "@ws-model-proxy/db/capacity-lock-order";
 import {
   poolOwnerActive,
   userCredentialAccessBlocked,
@@ -34,6 +47,7 @@ import {
   applyOpenRouterDataCollection,
   mapOpenRouterDataPolicyRefusal,
   type OpenRouterDataCollectionPolicy,
+  openRouterDataCollectionPolicy,
 } from "./openrouter-privacy.js";
 import { ADAPTER_VERSION } from "./protocols/canonical.js";
 import { isRequestDepthError, isResponseDepthError } from "./protocols/errors.js";
@@ -58,12 +72,15 @@ import {
   type RawProviderUsage,
   reconcileProviderBudget,
 } from "./provider-budget.js";
+import { providerHealthCoolingDown } from "./provider-health-state.js";
 import {
   calculatedCostForUsage,
   liabilityFromPricing,
   type ProviderPricingSchedule,
   resolveActiveProviderPricing,
 } from "./provider-pricing.js";
+import { ensureProviderExecutionTargets } from "./provider-targets.js";
+import { poolPolicy as routePoolPolicy } from "./resolve.js";
 
 /** Bound accounting observation after a client terminal; an incomplete drain keeps liability. */
 export const POST_TERMINAL_DRAIN_MAX_BYTES = 256 * 1024;
@@ -204,6 +221,11 @@ export interface PublicOverflowRequest {
   chatTestRoutingMode?: "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";
   /** Cookie-authenticated member probe can constrain dispatch to one pool member. */
   forcedPoolMemberId?: string;
+  /**
+   * The members the caller already found servable (e.g. renderable for this request); others
+   * are not tried. Absent: every listed member.
+   */
+  eligibleExecutionTargetIds?: readonly string[];
   /** True only when the operation resolver proves a second attempt is safe. */
   retrySafe: boolean;
   /** The caller admitted one target at a time and has another capacity-fenced
@@ -528,25 +550,107 @@ export type PublicProviderSendClaim =
     };
 
 /**
- * Upper bound on each lock wait of the send-claim transaction (L1b, #64):
- * a transaction-local `lock_timeout`. While the claim waits on the hot
- * `provider_account` row (budget admission, settlement and the provider
- * runtime lock it) it holds the pool, grant, token and allowlist rows FOR
- * SHARE, which blocks their writers. The bound keeps that hold short; a
- * timed-out claim throws (SQLSTATE 55P03), nothing is sent, and the
- * dispatcher settles it as `SEND_CLAIM_FAILED` (transient, 503).
+ * Upper bound on each lock wait of the send-claim transaction (L1b, #64): a transaction-local
+ * `lock_timeout`, fence waits included. While the claim waits on the hot `provider_account` row
+ * (provider health, heartbeats and fence allocation hold it FOR UPDATE briefly) it holds the
+ * owner fences and the pool, pool_fallback, share, API key and member rows FOR SHARE, which
+ * blocks their writers (and, through the owner fences, other sends of the same owners, as the
+ * local send does). The bound keeps that hold short; a timed-out claim throws (SQLSTATE 55P03),
+ * nothing is sent, and the dispatcher settles it as `SEND_CLAIM_FAILED` (transient, 503).
  */
 export const EXTERNAL_SEND_CLAIM_LOCK_TIMEOUT_MS = 2_000;
 
 /**
- * The E0 send boundary: the last step before provider I/O.
+ * E0 send boundary, target part: whether the target listed for this attempt is still current,
+ * read after the claim's last lock wait (the model and member rows are held FOR SHARE, the
+ * account before them). The provider model exists, is not deleted, keeps its account, upstream
+ * model and execution target, and its account keeps the listed endpoint identity and version;
+ * a pool member (pool fallback; own-key has none) is still a CLOUD member of this pool for this
+ * model and ACTIVE. A member, model or endpoint that no longer matches is
+ * `BOUND_TARGET_INVALID` for a stored-response binding or own-key, otherwise
+ * `PROVIDER_UNAVAILABLE`; a disabled model or account is `PROVIDER_UNAVAILABLE`.
+ */
+async function recheckExternalSendTarget(
+  tx: Prisma.TransactionClient,
+  input: {
+    userId: string;
+    target: PublicProviderTarget;
+    consent: ExternalSendConsentIdentity;
+    exactBinding?: boolean;
+    embeddingContract?: EmbeddingContract;
+  },
+  poolEmbeddingContract: Prisma.JsonValue | null,
+): Promise<"BOUND_TARGET_INVALID" | "PROVIDER_UNAVAILABLE" | null> {
+  const ownKey = Boolean(input.consent.ownKeyProviderModelId);
+  const gone = input.exactBinding || ownKey ? "BOUND_TARGET_INVALID" : "PROVIDER_UNAVAILABLE";
+  const [model, member] = await Promise.all([
+    tx.providerModel.findFirst({
+      where: {
+        id: input.target.providerModelId,
+        userId: input.userId,
+        deletedAt: null,
+        providerAccountId: input.target.providerAccountId,
+        upstreamModelId: input.target.upstreamModelId,
+        Target: { is: { id: input.target.executionTargetId } },
+        Account: {
+          userId: input.userId,
+          deletedAt: null,
+          endpointIdentity: input.target.endpointIdentity,
+          endpointVersion: input.target.endpointVersion,
+        },
+      },
+      select: { enabled: true, nativeCapabilities: true, Account: { select: { enabled: true } } },
+    }),
+    ownKey
+      ? Promise.resolve({ id: "" })
+      : tx.poolMember.findFirst({
+          where: {
+            id: input.target.poolMemberId,
+            poolId: input.consent.poolId,
+            kind: "CLOUD",
+            state: "ACTIVE",
+            providerModelId: input.target.providerModelId,
+          },
+          select: { id: true },
+        }),
+  ]);
+  if (!model || !member) return gone;
+  if (!model.enabled || !model.Account.enabled) return "PROVIDER_UNAVAILABLE";
+  if (input.embeddingContract) {
+    const capabilities = parseOpenAiCompatibleCapabilities(model.nativeCapabilities);
+    if (
+      capabilities?.embeddings?.supported !== true ||
+      !embeddingContractsMatch(input.embeddingContract, capabilities.embeddings.contract) ||
+      !embeddingContractsMatch(input.embeddingContract, poolEmbeddingContract)
+    )
+      return "PROVIDER_UNAVAILABLE";
+  }
+  return null;
+}
+
+/**
+ * The E0 send boundary: the last step before provider I/O. One READ COMMITTED transaction,
+ * every lock wait bounded by EXTERNAL_SEND_CLAIM_LOCK_TIMEOUT_MS:
  *
- * S0 stub (fail closed): cloud sends are unavailable until the spend lane lands. The 0.3
- * claim locked the consent rows (pool, grant, token, allowlist), the provider account,
- * model and credential, and the own-key preference, then re-checked the requester and the
- * target before claiming the credential. The 0.4.0 claim (Pool/PoolFallback, Share with
- * ownKeyProviderModelId, ApiKey/ApiKeyPool, SpendCap) is rebuilt with the spend lane;
- * until then nothing is decrypted and nothing is sent.
+ *   1. the owner fences of the requester, the pool owner and the provider owner (management
+ *      writers of pools, shares, keys and providers hold them, so none is mid-write);
+ *   2. the consent rows FOR SHARE: pool and its cloud settings, then the requester's share, then
+ *      the API key; the
+ *      pool's cloud mode (or, own-key, the owner's equivalent-model consent and the share's
+ *      own-key choice) must still cover the requester, and a protected-saturation fallback
+ *      still needs paid warm protection;
+ *   3. the pool member FOR SHARE (pool fallback), then the provider account, model and
+ *      credential rows (account first, as every provider writer and the health runtime);
+ *   4. the requester's and owner's user rows FOR SHARE, sorted (unfenced bans);
+ *
+ * then, with no further lock wait, re-reads the users' validity at a fresh `now`, the API key's
+ * expiry and coverage, and the listed target (recheckExternalSendTarget), and claims the
+ * current credential (`lastUsedAt`, the durable boundary). A withdrawal that commits before
+ * this transaction is observed; one that commits after it cannot cancel a claimed send.
+ * Nothing is sent while the transaction runs: the provider request starts after commit.
+ *
+ * A throw (lock or connection timeout, credential rotated or revoked meanwhile, decrypt
+ * failure) means nothing was sent; the dispatcher settles it without a health verdict.
  */
 export async function claimPublicProviderCredentialForSend(input: {
   userId: string;
@@ -560,12 +664,181 @@ export async function claimPublicProviderCredentialForSend(input: {
 }): Promise<PublicProviderSendClaim> {
   if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
     return { claimed: false, reason: "DEPLOYMENT_GATE_DISABLED" };
-  if (
-    input.consent.ownKeyProviderModelId &&
-    input.target.providerModelId !== input.consent.ownKeyProviderModelId
-  )
+  const consent = input.consent;
+  const ownKey = consent.ownKeyProviderModelId;
+  if (ownKey && input.target.providerModelId !== ownKey)
     return { claimed: false, reason: "OWN_KEY_CONSENT_WITHDRAWN" };
-  return { claimed: false, reason: "PROVIDER_UNAVAILABLE" };
+  // The payer: the pool owner, or the share holder for own-key.
+  if (input.userId !== (ownKey ? consent.requesterUserId : consent.ownerUserId))
+    return { claimed: false, reason: "REQUESTER_NOT_VISIBLE" };
+  const requesterIsOwner = consent.requesterUserId === consent.ownerUserId;
+  if (requesterIsOwner !== (consent.shareId === null))
+    return { claimed: false, reason: "REQUESTER_NOT_VISIBLE" };
+  return prisma.$transaction(
+    async (tx): Promise<PublicProviderSendClaim> => {
+      // First statement: bound every lock wait below. Neither a lock nor a write.
+      await tx.$executeRaw`SELECT set_config('lock_timeout', ${`${EXTERNAL_SEND_CLAIM_LOCK_TIMEOUT_MS}ms`}, true)`;
+      await fenceOwners(tx, [consent.requesterUserId, consent.ownerUserId, input.userId]);
+
+      await tx.$queryRaw`SELECT id FROM pool WHERE id = ${consent.poolId} FOR SHARE`;
+      // The cloud settings row: mode, paid warm protection, own-key consent and the embedding
+      // contract (the contract has no fence; this lock keeps it stable for the target check).
+      await tx.$queryRaw`SELECT "poolId" FROM pool_fallback WHERE "poolId" = ${consent.poolId} FOR SHARE`;
+      const pool = await tx.pool.findFirst({
+        where: { id: consent.poolId, userId: consent.ownerUserId },
+        select: {
+          Fallback: {
+            select: {
+              mode: true,
+              paidWarmProtection: true,
+              embeddingContract: true,
+              ownKeyEquivalentModel: true,
+            },
+          },
+        },
+      });
+      if (!pool) return { claimed: false, reason: "REQUESTER_NOT_VISIBLE" };
+      const mode = pool.Fallback?.mode ?? "OFF";
+      if (consent.shareId !== null) {
+        await tx.$queryRaw`SELECT id FROM share WHERE id = ${consent.shareId} FOR SHARE`;
+        const share = await tx.share.findFirst({
+          where: {
+            id: consent.shareId,
+            poolId: consent.poolId,
+            ownerUserId: consent.ownerUserId,
+            granteeUserId: consent.requesterUserId,
+            canUse: true,
+          },
+          select: { ownKeyProviderModelId: true },
+        });
+        if (!share) return { claimed: false, reason: "REQUESTER_NOT_VISIBLE" };
+        if (
+          ownKey &&
+          (!pool.Fallback?.ownKeyEquivalentModel || share.ownKeyProviderModelId !== ownKey)
+        )
+          return { claimed: false, reason: "OWN_KEY_CONSENT_WITHDRAWN" };
+      } else if (ownKey) return { claimed: false, reason: "OWN_KEY_CONSENT_WITHDRAWN" };
+      if (!ownKey) {
+        if (mode === "OFF") return { claimed: false, reason: "POOL_PRIVATE" };
+        if (!requesterIsOwner && mode !== "OWNER_AND_SHARES")
+          return { claimed: false, reason: "GRANTEE_NOT_COVERED" };
+        if (
+          input.reason === "LOCAL_SATURATED_PROTECTED" &&
+          pool.Fallback?.paidWarmProtection !== true
+        )
+          return { claimed: false, reason: "PROVIDER_UNAVAILABLE" };
+      }
+      if (consent.apiKeyId)
+        await tx.$queryRaw`SELECT id FROM api_key WHERE id = ${consent.apiKeyId} FOR SHARE`;
+      if (!ownKey)
+        await tx.$queryRaw`SELECT id FROM pool_member WHERE id = ${input.target.poolMemberId} FOR SHARE`;
+      // Provider rows: account, then model, then credential (the provider lock order).
+      await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.target.providerAccountId} AND "userId" = ${input.userId} FOR SHARE`;
+      await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${input.target.providerModelId} AND "userId" = ${input.userId} FOR SHARE`;
+      await tx.$queryRaw`SELECT id FROM provider_credential WHERE id = ${input.target.credential.id} AND "userId" = ${input.userId} FOR UPDATE`;
+      // Bans are unfenced one-row user updates: explicit row locks, sorted, last.
+      const users = [
+        ...new Set([consent.requesterUserId, consent.ownerUserId, input.userId]),
+      ].sort();
+      await tx.$queryRaw`SELECT id FROM "user" WHERE id IN (${Prisma.join(users)}) ORDER BY id FOR SHARE`;
+
+      // Nothing below waits on a lock.
+      const now = new Date();
+      const [people, apiKey, account] = await Promise.all([
+        tx.user.findMany({
+          where: { id: { in: users } },
+          select: { id: true, banned: true, banExpires: true, deletionRequestedAt: true },
+        }),
+        consent.apiKeyId
+          ? tx.apiKey.findFirst({
+              where: { id: consent.apiKeyId, userId: consent.requesterUserId, revokedAt: null },
+              select: {
+                expiresAt: true,
+                scope: true,
+                Pools: { where: { poolId: consent.poolId }, select: { poolId: true } },
+              },
+            })
+          : Promise.resolve(null),
+        tx.providerAccount.findFirst({
+          where: { id: input.target.providerAccountId, userId: input.userId, deletedAt: null },
+          select: { providerType: true, allowDataCollection: true },
+        }),
+      ]);
+      const person = (id: string) => people.find((row) => row.id === id);
+      const owner = person(consent.ownerUserId);
+      if (!owner || !poolOwnerActive(owner, now))
+        return { claimed: false, reason: "POOL_OWNER_INACTIVE" };
+      const requester = person(consent.requesterUserId);
+      const payer = person(input.userId);
+      if (
+        !requester ||
+        userCredentialAccessBlocked(requester, now) ||
+        !payer ||
+        userCredentialAccessBlocked(payer, now)
+      )
+        return { claimed: false, reason: "REQUESTER_ACCESS_BLOCKED" };
+      if (consent.apiKeyId) {
+        if (!apiKey || (apiKey.expiresAt && apiKey.expiresAt.getTime() <= now.getTime()))
+          return { claimed: false, reason: "CALLER_CONSENT_WITHDRAWN" };
+        if (apiKey.scope === "SELECTED_POOLS" && apiKey.Pools.length === 0)
+          return { claimed: false, reason: "REQUESTER_NOT_VISIBLE" };
+      }
+      // Target availability, after consent (a consent denial wins).
+      const changed = await recheckExternalSendTarget(
+        tx,
+        input,
+        pool.Fallback?.embeddingContract ?? null,
+      );
+      if (changed) return { claimed: false, reason: changed };
+      if (!account) throw new Error("provider account is no longer available");
+      const current = await tx.providerCredential.findFirst({
+        where: {
+          id: input.target.credential.id,
+          userId: input.userId,
+          providerAccountId: input.target.providerAccountId,
+          status: "ACTIVE",
+          CurrentForAccount: {
+            is: {
+              id: input.target.providerAccountId,
+              enabled: true,
+              deletedAt: null,
+              currentCredentialId: input.target.credential.id,
+            },
+          },
+        },
+      });
+      if (!current) throw new Error("provider credential is no longer current");
+      if (current.algorithm !== "AES-256-GCM")
+        throw new Error("provider credential algorithm is not supported");
+      const secret = decryptProviderCredential(
+        {
+          algorithm: "AES-256-GCM",
+          keyVersion: current.keyVersion,
+          ciphertext: new Uint8Array(current.ciphertext),
+          nonce: new Uint8Array(current.nonce),
+          authTag: new Uint8Array(current.authTag),
+        },
+        {
+          credentialId: current.id,
+          userId: input.userId,
+          providerAccountId: input.target.providerAccountId,
+          credentialType: current.credentialType,
+          aadVersion: current.aadVersion,
+        },
+        input.keyring,
+      );
+      await tx.providerCredential.update({
+        where: { id: current.id },
+        data: { lastUsedAt: new Date() },
+      });
+      return {
+        claimed: true,
+        secret,
+        dataCollectionPolicy: openRouterDataCollectionPolicy(account),
+      };
+    },
+    { isolationLevel: "ReadCommitted", maxWait: 5_000, timeout: 10_000 },
+  );
 }
 
 export function resolvePublicProviderExecution(
@@ -785,13 +1058,126 @@ function inventoryMatchesProtocol(
   );
 }
 
+function nativeProtocols(value: unknown): ProviderProtocol[] {
+  const inventory = parseOpenAiCompatibleCapabilities(value);
+  if (inventory) return [inventory.protocol === "anthropic-compatible" ? "anthropic" : "openai"];
+  if (!value || typeof value !== "object" || !("protocols" in value)) return [];
+  const values = Array.isArray(value.protocols) ? value.protocols : [];
+  return values.filter(
+    (item): item is ProviderProtocol => item === "openai" || item === "anthropic",
+  );
+}
+
+function nativeSurfaces(value: unknown): ProtocolSurface[] {
+  const inventory = parseOpenAiCompatibleCapabilities(value);
+  if (inventory) {
+    const matrix = surfaceAvailabilityMatrix({ capabilities: inventory });
+    return [
+      ...(matrix.OPENAI_CHAT_COMPLETIONS.mode === "native" ? (["openai-chat"] as const) : []),
+      ...(matrix.OPENAI_RESPONSES.mode === "native" ? (["openai-responses"] as const) : []),
+      ...(matrix.ANTHROPIC_MESSAGES.mode === "native" ? (["anthropic-messages"] as const) : []),
+    ];
+  }
+  if (!value || typeof value !== "object" || !("surfaces" in value)) return [];
+  const values = value.surfaces;
+  if (!Array.isArray(values)) return [];
+  return values.filter(
+    (item): item is ProtocolSurface =>
+      item === "openai-chat" || item === "openai-responses" || item === "anthropic-messages",
+  );
+}
+
+function supportsStreaming(value: unknown): boolean {
+  const inventory = parseOpenAiCompatibleCapabilities(value);
+  if (inventory)
+    return Object.values(surfaceAvailabilityMatrix({ capabilities: inventory })).some(
+      (surface) => surface.mode === "native" && surface.streaming,
+    );
+  return Boolean(
+    value && typeof value === "object" && "streaming" in value && value.streaming === true,
+  );
+}
+
+function supportedFeatures(value: unknown): string[] {
+  if (!value || typeof value !== "object" || !("features" in value)) return [];
+  const features = value.features;
+  return Array.isArray(features)
+    ? features.filter((feature): feature is string => typeof feature === "string")
+    : [];
+}
+
 /**
- * Cloud fallback targets of an owned pool, with the pool's fallback flags.
+ * The wire protocol of a provider account. The 0.4.0 provider types are `openrouter` and
+ * `generic` (an OpenAI- or Anthropic-compatible URL): a generic account speaks what its model's
+ * capability inventory declares, OpenAI-compatible when it declares nothing.
+ */
+function cloudProtocol(
+  providerType: string,
+  inventory: OpenAiCompatibleCapabilities | null,
+): ProviderProtocol | null {
+  if (providerType.trim().toLowerCase() !== "generic") return providerProtocolForType(providerType);
+  return inventory?.protocol === "anthropic-compatible" ? "anthropic" : "openai";
+}
+
+/** What a cloud target needs of its provider model (pool member or own-key choice). */
+const providerTargetModelSelect = {
+  id: true,
+  userId: true,
+  providerAccountId: true,
+  upstreamModelId: true,
+  contextWindow: true,
+  maxOutputTokens: true,
+  nativeCapabilities: true,
+  health: true,
+  healthNextRetryAt: true,
+  healthHalfOpenAt: true,
+  enabled: true,
+  deletedAt: true,
+  Target: { select: { id: true } },
+  Account: {
+    select: {
+      id: true,
+      userId: true,
+      providerType: true,
+      providerVersion: true,
+      allowDataCollection: true,
+      baseUrl: true,
+      endpointIdentity: true,
+      endpointVersion: true,
+      authType: true,
+      healthNextRetryAt: true,
+      healthHalfOpenAt: true,
+      enabled: true,
+      deletedAt: true,
+      CurrentCredential: {
+        select: {
+          id: true,
+          credentialType: true,
+          aadVersion: true,
+          algorithm: true,
+          keyVersion: true,
+          ciphertext: true,
+          nonce: true,
+          authTag: true,
+          status: true,
+        },
+      },
+    },
+  },
+} satisfies Prisma.ProviderModelSelect;
+
+type ProviderTargetModel = Prisma.ProviderModelGetPayload<{
+  select: typeof providerTargetModelSelect;
+}>;
+
+/**
+ * Cloud targets of an owned pool, with the pool's cloud flags (`pool_fallback.mode`: OFF,
+ * OWNER, OWNER_AND_SHARES), in the members' `cloudOrder`. With `ownKey`, the share holder's
+ * own provider model instead, while the owner's equivalent-model consent and the share's
+ * own-key choice both hold. Unlocked reads: the send claim re-checks everything under locks.
  *
- * S0 stub: the flags are read from the 0.4.0 pool (PoolFallback.mode, the owner's account,
- * and for own-key the requester's share), but no cloud target is listed yet: CLOUD members
- * have no capacity identity in 0.4.0 and their admission is rebuilt with the spend lane.
- * Callers therefore see "no compatible provider" and serve or fail locally.
+ * Cloud members have no physical capacity (spend caps bound them), so `inferenceCapacityId` is
+ * null and callers dispatch them without a capacity lease.
  */
 export async function listPublicOverflowTargets(
   userId: string,
@@ -801,11 +1187,35 @@ export async function listPublicOverflowTargets(
   const pool = await prisma.pool.findFirst({
     where: { id: poolId, userId },
     select: {
+      id: true,
+      userId: true,
       User: { select: { banned: true, banExpires: true, deletionRequestedAt: true } },
-      Fallback: { select: { mode: true, ownKeyEquivalentModel: true } },
+      Fallback: {
+        select: {
+          mode: true,
+          paidWarmProtection: true,
+          embeddingContract: true,
+          ownKeyEquivalentModel: true,
+        },
+      },
+      Advanced: {
+        select: { maxWaitMs: true, contextCeiling: true, contextMargin: true, overrides: true },
+      },
+      Members: {
+        // Own-key never lists the pool's members (an empty match).
+        where: ownKey
+          ? { id: { in: [] } }
+          : { kind: "CLOUD", state: "ACTIVE", providerModelId: { not: null } },
+        orderBy: [{ cloudOrder: "asc" }, { id: "asc" }],
+        select: {
+          id: true,
+          cloudOrder: true,
+          ProviderModel: { select: providerTargetModelSelect },
+        },
+      },
     },
   });
-  const affinityPolicy: AffinityPolicy = {
+  const disabledAffinity: AffinityPolicy = {
     enabled: false,
     ttlSeconds: 3600,
     maxRecords: 10_000,
@@ -820,13 +1230,16 @@ export async function listPublicOverflowTargets(
       enabled: false,
       ownerActive: false,
       fallbackForGrantees: false,
-      affinityPolicy,
+      affinityPolicy: disabledAffinity,
       targets: [],
       coolingDown: [],
       unavailable: [],
     };
   const mode = pool.Fallback?.mode ?? "OFF";
+  const now = new Date();
   let enabled = mode !== "OFF";
+  let ownKeyAdaptationEnabled = false;
+  let members: Array<{ id: string; order: number; model: ProviderTargetModel }>;
   if (ownKey) {
     const share =
       pool.Fallback?.ownKeyEquivalentModel && ownKey.shareId && ownKey.requesterUserId !== userId
@@ -839,20 +1252,136 @@ export async function listPublicOverflowTargets(
               canUse: true,
               ownKeyProviderModelId: ownKey.providerModelId,
             },
-            select: { id: true },
+            select: {
+              ownKeyProtocolAdaptation: true,
+              OwnKeyModel: { select: providerTargetModelSelect },
+            },
           })
         : null;
     enabled = Boolean(share);
-  }
+    ownKeyAdaptationEnabled = share?.ownKeyProtocolAdaptation === true;
+    members = share?.OwnKeyModel ? [{ id: "", order: 0, model: share.OwnKeyModel }] : [];
+  } else
+    members = pool.Members.flatMap((member) =>
+      member.ProviderModel
+        ? [{ id: member.id, order: member.cloudOrder ?? 0, model: member.ProviderModel }]
+        : [],
+    );
+  const providerOwnerId = ownKey?.requesterUserId ?? userId;
+  // Live models only: a soft-deleted one never gets a target (and is not listed below).
+  const missingTargets = members.filter(
+    (member) =>
+      !member.model.Target &&
+      member.model.userId === providerOwnerId &&
+      !member.model.deletedAt &&
+      !member.model.Account.deletedAt,
+  );
+  let createdTargets = new Map<string, string>();
+  let targetCreationFailed = false;
+  if (missingTargets.length > 0)
+    try {
+      createdTargets = await ensureProviderExecutionTargets(
+        providerOwnerId,
+        missingTargets.map((member) => ({
+          id: member.model.id,
+          providerAccountId: member.model.providerAccountId,
+        })),
+      );
+    } catch (error) {
+      // A fence-protocol error is a programming bug: never hide it.
+      if (error instanceof FenceProtocolError) throw error;
+      // Transient (lock timeout): these members count as cooling down (503, never sent) for
+      // this request; the next one retries.
+      targetCreationFailed = true;
+      console.warn("[public-overflow] could not create a provider execution target");
+    }
+  const unavailable: ListedPublicOverflowTargets["unavailable"] = [];
+  const listed = members.flatMap((member) => {
+    const model = member.model;
+    const account = model.Account;
+    const createdTargetId = model.Target?.id ?? createdTargets.get(model.id);
+    const targetPending = !createdTargetId && targetCreationFailed;
+    // A placeholder identity only ever lands in `coolingDown`, which is never dispatched.
+    const executionTargetId =
+      createdTargetId ?? (targetPending ? `pending:${model.id}` : undefined);
+    const credential = account.CurrentCredential;
+    const capabilityInventory = parseOpenAiCompatibleCapabilities(model.nativeCapabilities);
+    const protocol = cloudProtocol(account.providerType, capabilityInventory);
+    if (
+      !executionTargetId ||
+      !protocol ||
+      !inventoryMatchesProtocol(capabilityInventory, protocol) ||
+      model.userId !== providerOwnerId ||
+      account.userId !== providerOwnerId ||
+      model.deletedAt ||
+      account.deletedAt
+    )
+      return [];
+    // The immutable identity, before readiness filters: a credential can be restored and
+    // enablement toggled without changing a stored-response binding.
+    const identity = {
+      executionTargetId,
+      providerModelId: model.id,
+      upstreamModelId: model.upstreamModelId,
+      protocol,
+      providerAccountId: account.id,
+      endpointIdentity: account.endpointIdentity,
+      endpointVersion: account.endpointVersion,
+      nativeSurfaces: nativeSurfaces(model.nativeCapabilities),
+      capabilityInventory,
+    };
+    if (!model.enabled || !account.enabled || !credential || credential.status !== "ACTIVE") {
+      // A placeholder identity is never a binding's identity.
+      if (!targetPending) unavailable.push(identity);
+      return [];
+    }
+    // The rule claimProviderHealthTrial applies under its locks.
+    const coolingDown =
+      targetPending ||
+      providerHealthCoolingDown(model, now) ||
+      providerHealthCoolingDown(account, now);
+    const target: PublicProviderTarget = {
+      ...identity,
+      ownKey: Boolean(ownKey),
+      ownKeyAdaptationEnabled,
+      poolMemberId: member.id,
+      inferenceCapacityId: null,
+      capacityWaitBudgetMs: null,
+      publicOrder: member.order,
+      contextWindow: model.contextWindow,
+      maxOutputTokens: model.maxOutputTokens,
+      concurrencyLimit: null,
+      providerVersion: account.providerVersion,
+      dataCollectionPolicy: openRouterDataCollectionPolicy(account),
+      baseUrl: account.baseUrl,
+      authType: account.authType,
+      healthStatus: model.health,
+      nativeProtocols: nativeProtocols(model.nativeCapabilities),
+      usageDialect: providerUsageDialect(account.providerType),
+      supportsStreaming: supportsStreaming(model.nativeCapabilities),
+      supportedFeatures: supportedFeatures(model.nativeCapabilities),
+      credential: {
+        id: credential.id,
+        credentialType: credential.credentialType,
+        keyVersion: credential.keyVersion,
+        aadVersion: credential.aadVersion,
+        algorithm: credential.algorithm,
+        ciphertext: new Uint8Array(credential.ciphertext),
+        nonce: new Uint8Array(credential.nonce),
+        authTag: new Uint8Array(credential.authTag),
+      },
+    };
+    return [{ coolingDown, target }];
+  });
   return {
     enabled,
     // Fail closed on a partial row: the owner relation is required.
-    ownerActive: pool.User ? poolOwnerActive(pool.User, new Date()) : false,
+    ownerActive: pool.User ? poolOwnerActive(pool.User, now) : false,
     fallbackForGrantees: ownKey ? true : mode === "OWNER_AND_SHARES",
-    affinityPolicy,
-    targets: [],
-    coolingDown: [],
-    unavailable: [],
+    affinityPolicy: ownKey ? disabledAffinity : routePoolPolicy(pool).affinity,
+    targets: listed.flatMap((item) => (item.coolingDown ? [] : [item.target])),
+    coolingDown: listed.flatMap((item) => (item.coolingDown ? [item.target] : [])),
+    unavailable,
   };
 }
 
@@ -2445,7 +2974,10 @@ export async function dispatchPublicOverflow(
     liability: request.liability,
     contextTokens: 0n,
   };
-  const compatibleTargets = (targets: PublicProviderTarget[]) => {
+  const compatibleTargets = (
+    targets: PublicProviderTarget[],
+    { ignoreEligibility = false }: { ignoreEligibility?: boolean } = {},
+  ) => {
     const memberEligible = targetsForForcedPoolMember(targets, request.forcedPoolMemberId);
     const eligible = binding
       ? memberEligible.filter((target) => matchesExactResponsesBinding(target, binding))
@@ -2461,6 +2993,12 @@ export async function dispatchPublicOverflow(
       if (
         request.admittedExecutionTargetId &&
         target.executionTargetId !== request.admittedExecutionTargetId
+      )
+        return [];
+      if (
+        !ignoreEligibility &&
+        request.eligibleExecutionTargetIds &&
+        !request.eligibleExecutionTargetIds.includes(target.executionTargetId)
       )
         return [];
       const resolvedExecution = resolvePublicProviderExecution(target, compatibilityRequest);
@@ -2488,6 +3026,14 @@ export async function dispatchPublicOverflow(
   // permanently invalid: no retry can make it match again.
   if (compatible.length === 0 && binding)
     return { dispatched: false, reason: "BOUND_TARGET_INVALID" };
+  // The caller's servable set emptied it (a member changed between the caller's listing and
+  // this one): transient, not an incompatible request.
+  if (
+    compatible.length === 0 &&
+    request.eligibleExecutionTargetIds &&
+    compatibleTargets(listed.targets, { ignoreEligibility: true }).length > 0
+  )
+    return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
   if (compatible.length === 0) {
     await Promise.allSettled(
       listed.targets.map((target) =>
@@ -2686,6 +3232,10 @@ export async function dispatchPublicOverflow(
         providerModelId: target.providerModelId,
         credentialId: target.credential.id,
         poolId: request.ownKeyProviderModelId ? undefined : request.poolId,
+        poolMemberId: request.ownKeyProviderModelId ? undefined : target.poolMemberId || undefined,
+        targetId: target.executionTargetId,
+        requestedSurface:
+          request.path === "/v1/embeddings" ? "OPENAI_EMBEDDINGS" : request.requestedSurface,
         shareId:
           request.ownKeyProviderModelId || request.externalConsent.requesterIsOwner
             ? undefined

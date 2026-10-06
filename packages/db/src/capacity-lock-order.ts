@@ -82,7 +82,9 @@
  *   01 admission-attempt:<attempt>          admission (first)
  *      spend-attempt:<attempt>              spend reservation/settlement of one attempt
  *   02 execution-target:<identity>          target creation (M)
- *   04 spend-cap:<cap>                      spend-cap reservations (H) and cap edits (M)
+ *   04 spend-account:<account>              every cloud admission on the account (H), cap writers (M)
+ *      spend-cap:<cap>                      cap edits (M)
+ *      spend-share:<share>                  every owner-paid share admission (H), cap writers (M)
  *   05 provider-pricing:<user>:<model>
  *   06 capacity-policy:<target>             policy writers (M) and admission (H)
  *   07 concurrency:<scope>:<id>             admission-internal
@@ -315,6 +317,10 @@ export const fences = {
   spendAttempt: (attemptId: string) => fence("01", "spend-attempt", attemptId),
   targetIdentity: (identity: string) => fence("02", "execution-target", identity),
   spendCap: (capId: string) => fence("04", "spend-cap", capId),
+  /** Serializes cloud admissions on one provider account, capped or not (cap subject). */
+  spendAccount: (providerAccountId: string) => fence("04", "spend-account", providerAccountId),
+  /** Serializes owner-paid admissions through one share, capped or not (cap subject). */
+  spendShare: (shareId: string) => fence("04", "spend-share", shareId),
   pricing: (userId: string, providerModelId: string) =>
     fence("05", "provider-pricing", `${userId}:${providerModelId}`),
   capacityPolicy: (executionTargetId: string) => fence("06", "capacity-policy", executionTargetId),

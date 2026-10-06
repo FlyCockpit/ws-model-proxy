@@ -217,8 +217,9 @@ export async function recordProviderOutcome(input: {
     if (input.attemptId !== undefined && input.fencingToken !== undefined) {
       const lockedAttempt = await tx.$queryRaw<Array<{ id: string }>>`
         SELECT id
-        FROM provider_attempt
-        WHERE "attemptId" = ${input.attemptId}
+        FROM attempt
+        WHERE id = ${input.attemptId}
+          AND kind = 'CLOUD'::"AttemptKind"
           AND "fencingToken" = ${input.fencingToken}
           AND "userId" = ${input.userId}
           AND "providerAccountId" = ${input.providerAccountId}
@@ -233,13 +234,14 @@ export async function recordProviderOutcome(input: {
       const authoritative = await tx.$queryRaw<Array<{ eligible: boolean }>>`
         SELECT EXISTS (
           SELECT 1
-          FROM provider_attempt
-          WHERE "attemptId" = ${input.attemptId}
+          FROM attempt
+          WHERE id = ${input.attemptId}
+            AND kind = 'CLOUD'::"AttemptKind"
             AND "fencingToken" = ${input.fencingToken}
             AND "userId" = ${input.userId}
             AND "providerAccountId" = ${input.providerAccountId}
             AND "providerModelId" = ${input.providerModelId}
-            AND state = 'ACTIVE'::"ProviderAttemptState"
+            AND state = 'ACTIVE'::"AttemptState"
             AND "expiresAt" > clock_timestamp()
         ) AS eligible
       `;
@@ -290,7 +292,7 @@ export async function recordProviderOutcome(input: {
         : ("DEGRADED" as const);
     const data = input.success
       ? {
-          healthStatus: modelHealth,
+          health: modelHealth,
           healthCheckedAt: now,
           healthFailureCount: 0,
           healthNextRetryAt: null,
@@ -302,7 +304,7 @@ export async function recordProviderOutcome(input: {
             : {}),
         }
       : {
-          healthStatus: modelHealth,
+          health: modelHealth,
           healthCheckedAt: now,
           healthFailureCount: failures,
           healthNextRetryAt: new Date(now.getTime() + backoffMs(failures, input.retryAfterMs)),
@@ -320,7 +322,7 @@ export async function recordProviderOutcome(input: {
     await tx.providerAccount.update({
       where: { id: input.providerAccountId, userId: input.userId },
       data: {
-        healthStatus: input.success ? "HEALTHY" : "DEGRADED",
+        health: input.success ? "HEALTHY" : "DEGRADED",
         healthCheckedAt: now,
         ...(input.success
           ? {

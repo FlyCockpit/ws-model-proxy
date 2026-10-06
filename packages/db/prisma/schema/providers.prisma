@@ -274,6 +274,9 @@ model UsageLedger {
   providerModelId              String
   credentialId                 String?
   poolId                       String?
+  /// Owner-paid share traffic: the share whose monthly cap it counts against (plain id; the
+  /// history outlives the share).
+  shareId                      String?
   requestId                    String
   attemptId                    String
   fencingToken                 BigInt
@@ -313,5 +316,6 @@ model UsageLedger {
   @@unique([attemptId, fencingToken, revisionSequence])
   @@index([userId, createdAt])
   @@index([providerAccountId, createdAt])
+  @@index([shareId, createdAt])
   @@map("usage_ledger")
 }
