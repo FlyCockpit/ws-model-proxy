@@ -635,8 +635,8 @@ try {
     await db
       .query(`DELETE FROM deployment_instance WHERE id = $1`, [ids.instance])
       .catch(() => undefined);
-    await db.query(`DELETE FROM deployment_run WHERE id = $1`, [ids.run]).catch(() => undefined);
-    await db.query(`DELETE FROM deployment_plan WHERE id = $1`, [ids.plan]).catch(() => undefined);
+    await db.query(`DELETE FROM deployment_run WHERE id = $1`, [ids.run]).catch(() => undefined); // policy: bounded-delete -- generated test row only
+    await db.query(`DELETE FROM deployment_plan WHERE id = $1`, [ids.plan]).catch(() => undefined); // policy: bounded-delete -- generated test row only
     await db
       .query(`DELETE FROM deployment_config_revision WHERE id = $1`, [ids.revision])
       .catch(() => undefined);
