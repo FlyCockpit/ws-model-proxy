@@ -230,6 +230,7 @@ pub fn render(
         unit_name: job.unit_name.clone(),
         handle: job.handle.clone(),
         port: job.placeholders.port,
+        gpu_ids: job.placeholders.gpu_ids.clone(),
         host,
         spec: held.spec.clone(),
     })

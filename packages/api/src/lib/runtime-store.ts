@@ -2,6 +2,7 @@
  * Runtime writes shared by `runtimes.create`, `runtimes.detected.add`, `runtimes.fork` and
  * `runtimes.update`: version rows (derived columns, hashes), served-model sync and node trust.
  */
+import { randomBytes } from "node:crypto";
 import { RUNTIME_LIMIT_COLUMNS } from "@ws-model-proxy/config/runtime-defaults";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import type { z } from "zod";
@@ -205,7 +206,7 @@ export async function ownedNode(userId: string, nodeId: string) {
 }
 
 /** Why an instance is told to stop (`RuntimeInstance.phaseReason`). */
-export type StopReason = "stop_requested" | "preempted";
+export type StopReason = "stop_requested" | "preempted" | "profile_apply";
 
 /**
  * The one write that tells running instances to stop (people's and agents' stops, and a start's
@@ -233,4 +234,122 @@ export async function markInstancesStopping(
     },
   });
   return result.count;
+}
+
+/** A cuid2-shaped id (lower-case, starts with a letter) so the handle can be derived from it. */
+export function newInstanceId(): string {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = randomBytes(24);
+  let id = "c";
+  for (let index = 1; index < 24; index++) id += alphabet[(bytes[index] ?? 0) % alphabet.length];
+  return id;
+}
+
+export type PlannedStartWrite = {
+  runtimeId: string;
+  versionId: string;
+  /** A restart of this instance; null: a new instance. */
+  instanceId: string | null;
+  placements: ReadonlyArray<{
+    nodeId: string;
+    nodeNumber: number;
+    port: number;
+    resources: Record<string, unknown>;
+  }>;
+  fabric: { fabricId: string } | null;
+  distPort: number | null;
+};
+
+/**
+ * The one write of planned starts (runtime start/restart and profile apply): instances STARTING
+ * under `operationId` with their claims (port, dist port, resources with the GPUs the planner
+ * picked, the fabric, the instances each start waits for). The lifecycle engine creates the
+ * steps. Callers hold the owner fence and the capacity fences of restarted instances.
+ */
+export async function writePlannedStarts(
+  tx: Tx,
+  input: {
+    userId: string;
+    operationId: string;
+    startedBy: "USER" | "AGENT";
+    starts: readonly PlannedStartWrite[];
+    /** Per start (same order): the stopping instances its new ranks wait for. */
+    blockedBy: ReadonlyArray<readonly string[]>;
+  },
+): Promise<string[]> {
+  const now = new Date();
+  const ids: string[] = [];
+  for (const [index, start] of input.starts.entries()) {
+    const blockedBy = [...(input.blockedBy[index] ?? [])];
+    if (start.instanceId) {
+      await tx.runtimeInstance.update({
+        where: { id: start.instanceId },
+        data: {
+          versionId: start.versionId,
+          launchVersionId: start.versionId,
+          operationId: input.operationId,
+          startedBy: input.startedBy,
+          desiredState: "RUNNING",
+          phase: "STARTING",
+          phaseChangedAt: now,
+          phaseReason: "restart_requested",
+          needsOperator: null,
+          needsOperatorSince: null,
+          restartsInWindow: 0,
+          restartWindowStartedAt: null,
+          nextRestartAt: null,
+          fabricId: start.fabric?.fabricId ?? null,
+        },
+      });
+      // Each rank takes the new version's resources (and the GPUs the plan picked).
+      for (const placement of start.placements)
+        await tx.instanceRank.update({
+          where: {
+            instanceId_rank: { instanceId: start.instanceId, rank: placement.nodeNumber - 1 },
+          },
+          data: {
+            claim: "HELD",
+            claimChangedAt: now,
+            stoppedAt: null,
+            port: placement.port,
+            distPort: start.distPort,
+            resources: placement.resources as Prisma.InputJsonObject,
+            blockedBy,
+          },
+        });
+      ids.push(start.instanceId);
+      continue;
+    }
+    const id = newInstanceId();
+    const handle = `i-${id.slice(0, 12)}`;
+    await tx.runtimeInstance.create({
+      data: {
+        id,
+        userId: input.userId,
+        runtimeId: start.runtimeId,
+        versionId: start.versionId,
+        launchVersionId: start.versionId,
+        handle,
+        operationId: input.operationId,
+        startedBy: input.startedBy,
+        desiredState: "RUNNING",
+        phase: "STARTING",
+        fabricId: start.fabric?.fabricId ?? null,
+        Ranks: {
+          create: start.placements.map((placement) => ({
+            nodeId: placement.nodeId,
+            rank: placement.nodeNumber - 1,
+            unitName: `wsmp-${handle}-r${placement.nodeNumber - 1}`,
+            port: placement.port,
+            distPort: start.distPort,
+            portFixed: false,
+            resources: placement.resources as Prisma.InputJsonObject,
+            blockedBy,
+          })),
+        },
+      },
+    });
+    ids.push(id);
+  }
+  return ids;
 }

@@ -8,7 +8,7 @@
  * transaction, under the owner fence and the capacity fences of every instance it changes.
  */
 
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { ORPCError } from "@orpc/server";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import type { z } from "zod";
@@ -23,6 +23,10 @@ import {
 import { callerActor } from "../lib/caller-actor";
 import { canonicalJson } from "../lib/canonical-json";
 import { graphWrite, instanceCapacityFences } from "../lib/graph-write";
+import {
+  INTERACTIVE_STEPS_SUPPORTED,
+  INTERACTIVE_UNSUPPORTED_MESSAGE,
+} from "../lib/interactive-steps";
 import { PlacementPlanner } from "../lib/placement";
 import { loadPlacementContext } from "../lib/placement-load";
 import { previewFingerprint } from "../lib/preview-fingerprint";
@@ -33,6 +37,7 @@ import {
   markInstancesStopping,
   specIsInteractive,
   type Tx,
+  writePlannedStarts,
 } from "../lib/runtime-store";
 import { INSTANCE_INCLUDE, instanceView, storedSpec } from "../lib/runtime-views";
 
@@ -43,15 +48,6 @@ type Refusal = { reason: RefusalReason; subjectId: string | null; message: strin
 
 const TRUST_RELAY_MESSAGE =
   "This node is Relay only: agents cannot start or stop runtimes there. A person can do it in the browser.";
-
-/** A cuid2-shaped id (lower-case, starts with a letter) so the handle can be derived from it. */
-function newRowId(): string {
-  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
-  const bytes = randomBytes(24);
-  let id = "c";
-  for (let index = 1; index < 24; index++) id += alphabet[(bytes[index] ?? 0) % alphabet.length];
-  return id;
-}
 
 type Computed = {
   preview: StartPreview;
@@ -158,6 +154,12 @@ async function computeStart(
     for (let index = 0; index < count; index++) if (!record(null, planner.place(base))) break;
   }
 
+  if (specIsInteractive(spec) && !INTERACTIVE_STEPS_SUPPORTED)
+    refusals.push({
+      reason: "interactive_needs_person",
+      subjectId: input.runtimeId,
+      message: INTERACTIVE_UNSUPPORTED_MESSAGE,
+    });
   if (specIsInteractive(spec))
     warnings.push({
       code: "interactive_needs_person",
@@ -278,77 +280,13 @@ export const runtimeStart = contractProcedure(c.start).handler(async ({ input, c
       const stopped = await markInstancesStopping(tx, stopIds, operation.id, "preempted");
       if (stopped !== stopIds.length)
         throw refuse("preview_stale", "An instance this start stops changed. Preview again.");
-      const now = new Date();
-      for (const [index, start] of computed.preview.starts.entries()) {
-        const blockedBy = computed.blockedBy[index] ?? [];
-        if (start.instanceId) {
-          await tx.runtimeInstance.update({
-            where: { id: start.instanceId },
-            data: {
-              versionId: computed.versionId,
-              launchVersionId: computed.versionId,
-              operationId: operation.id,
-              startedBy: actor.actor,
-              desiredState: "RUNNING",
-              phase: "STARTING",
-              phaseChangedAt: now,
-              phaseReason: "restart_requested",
-              needsOperator: null,
-              needsOperatorSince: null,
-              restartsInWindow: 0,
-              restartWindowStartedAt: null,
-              nextRestartAt: null,
-              fabricId: start.fabric?.fabricId ?? null,
-            },
-          });
-          // Each rank takes the new version's resources (and the GPUs the plan picked).
-          for (const placement of start.placements)
-            await tx.instanceRank.update({
-              where: {
-                instanceId_rank: { instanceId: start.instanceId, rank: placement.nodeNumber - 1 },
-              },
-              data: {
-                claim: "HELD",
-                claimChangedAt: now,
-                stoppedAt: null,
-                port: placement.port,
-                distPort: start.distPort,
-                resources: placement.resources as object,
-                blockedBy,
-              },
-            });
-          continue;
-        }
-        const id = newRowId();
-        const handle = `i-${id.slice(0, 12)}`;
-        await tx.runtimeInstance.create({
-          data: {
-            id,
-            userId,
-            runtimeId: computed.runtimeId,
-            versionId: computed.versionId,
-            launchVersionId: computed.versionId,
-            handle,
-            operationId: operation.id,
-            startedBy: actor.actor,
-            desiredState: "RUNNING",
-            phase: "STARTING",
-            fabricId: start.fabric?.fabricId ?? null,
-            Ranks: {
-              create: start.placements.map((placement) => ({
-                nodeId: placement.nodeId,
-                rank: placement.nodeNumber - 1,
-                unitName: `wsmp-${handle}-r${placement.nodeNumber - 1}`,
-                port: placement.port,
-                distPort: start.distPort,
-                portFixed: false,
-                resources: placement.resources as object,
-                blockedBy,
-              })),
-            },
-          },
-        });
-      }
+      await writePlannedStarts(tx, {
+        userId,
+        operationId: operation.id,
+        startedBy: actor.actor,
+        starts: computed.preview.starts,
+        blockedBy: computed.blockedBy,
+      });
       return operation.id;
     },
     async (tx) => {

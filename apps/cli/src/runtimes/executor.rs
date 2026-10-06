@@ -53,6 +53,11 @@ pub struct Job {
     pub unit_name: String,
     pub handle: String,
     pub port: u16,
+    /// The GPUs placement gave this rank (`placeholders.gpu_ids`, e.g. `0,3`): every command
+    /// sees only them (`CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES`), so two runtimes on one
+    /// GPU node do not collide even when their commands never name `{{gpu_ids}}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_ids: Option<String>,
     /// Where the engine listens (`127.0.0.1`, or the fabric address).
     pub host: String,
     pub spec: Value,
@@ -907,12 +912,20 @@ fn owned_units(job: &Job) -> [String; 3] {
 /// The environment every runtime command gets on top of the scrubbed
 /// parent environment: the job marker and the definition's node secrets.
 /// Errors name a missing secret, never a value.
+/// The variables that limit a command to the rank's GPUs (NVIDIA CUDA, AMD ROCm/HIP).
+pub const GPU_VISIBILITY_ENV: [&str; 2] = ["CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"];
+
 pub fn command_env(job: &Job) -> Result<Vec<(String, String)>> {
-    let (found, missing) = crate::secrets::values(&job.secrets);
+    let (mut found, missing) = crate::secrets::values(&job.secrets);
     if let Some(name) = missing.first() {
         return Err(fail(JobError::LocalConfigUnavailable)).with_context(|| {
             format!("node secret `{name}` is not set; run `wsmp secret set {name}`")
         });
+    }
+    if let Some(ids) = &job.gpu_ids {
+        for name in GPU_VISIBILITY_ENV {
+            found.push((name.to_string(), ids.clone()));
+        }
     }
     Ok(found)
 }

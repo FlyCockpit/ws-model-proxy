@@ -10,7 +10,7 @@ import { contractProcedure } from "../contract-procedure";
 import { agentRulesApply, isHumanCaller } from "../contracts/auth-context";
 import { profilesContract as c, type profileViewSchema } from "../contracts/profiles";
 import { assertMayWrite, callerActor } from "../lib/caller-actor";
-import { graphDelete, graphWrite } from "../lib/graph-write";
+import { graphDelete, graphWrite, instanceCapacityFences } from "../lib/graph-write";
 import {
   loadPlacementFabrics,
   loadPlacementInstances,
@@ -21,6 +21,7 @@ import { planProfileHolds } from "../lib/profile-holds";
 import { planProfileSave } from "../lib/profile-save";
 import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
 import { runtimeSpecSchema } from "../lib/runtime-spec";
+import { markInstancesStopping, writePlannedStarts } from "../lib/runtime-store";
 import {
   instanceServesItem,
   type PlanInstance,
@@ -93,9 +94,13 @@ type ProfileRow = {
 const ACTIVE_PHASES = ["STARTING", "READY", "UNHEALTHY", "UNAVAILABLE"] as const;
 
 /** STARTABLE instances that should run, with a rank on one of these nodes. */
-async function runningInstancesOn(userId: string, nodeIds: readonly string[]) {
+async function runningInstancesOn(
+  userId: string,
+  nodeIds: readonly string[],
+  db: Prisma.TransactionClient = prisma,
+) {
   if (nodeIds.length === 0) return [];
-  return prisma.runtimeInstance.findMany({
+  return db.runtimeInstance.findMany({
     where: {
       userId,
       Runtime: { kind: "STARTABLE" },
@@ -207,8 +212,13 @@ async function loadProfileView(userId: string, profileId: string): Promise<Profi
 }
 
 /** Everything `profilePlan` needs, read for one profile. */
-async function loadPlanInput(context: Context, userId: string, profileId: string) {
-  const profile = await prisma.profile.findFirst({
+async function loadPlanInput(
+  context: Context,
+  userId: string,
+  profileId: string,
+  db: Prisma.TransactionClient = prisma,
+) {
+  const profile = await db.profile.findFirst({
     where: { id: profileId, userId },
     select: {
       id: true,
@@ -231,11 +241,11 @@ async function loadPlanInput(context: Context, userId: string, profileId: string
   const ownedIds = profile.Nodes.map((node) => node.nodeId);
   const now = new Date();
   const [nodes, versions, instances, claimants, fabrics] = await Promise.all([
-    prisma.node.findMany({
+    db.node.findMany({
       where: { userId, id: { in: ownedIds } },
       select: { ...PLACEMENT_NODE_SELECT, holdProfileId: true },
     }),
-    prisma.runtimeVersion.findMany({
+    db.runtimeVersion.findMany({
       where: {
         id: { in: profile.Items.map((item) => item.versionId) },
         Runtime: { userId },
@@ -247,9 +257,9 @@ async function loadPlanInput(context: Context, userId: string, profileId: string
         Runtime: { select: { slug: true, currentVersionId: true } },
       },
     }),
-    runningInstancesOn(userId, ownedIds),
-    loadPlacementInstances(prisma, ownedIds),
-    loadPlacementFabrics(prisma, userId),
+    runningInstancesOn(userId, ownedIds, db),
+    loadPlacementInstances(db, ownedIds),
+    loadPlacementFabrics(db, userId),
   ]);
 
   const planNodes = new Map<string, PlanNode>();
@@ -267,6 +277,7 @@ async function loadPlanInput(context: Context, userId: string, profileId: string
       memoryGb: placement.memoryGb,
       gpus: placement.gpus,
       liveFreeMemoryGb: placement.liveFreeMemoryGb,
+      frozenFabrics: placement.frozenFabrics,
     });
   }
   const planVersions = new Map<string, PlanVersion>(
@@ -518,110 +529,143 @@ export const profileProcedures = {
   apply: contractProcedure(c.apply).handler(async ({ context, input }) => {
     if (!input.preview) assertMayWrite(context.auth);
     const userId = context.session.user.id;
-    const { profile, input: planInput } = await loadPlanInput(context, userId, input.profileId);
-    const plan = profilePlan(planInput);
-    if (input.preview) return { mode: "preview" as const, preview: plan.preview };
+    if (input.preview) {
+      const { input: planInput } = await loadPlanInput(context, userId, input.profileId);
+      return { mode: "preview" as const, preview: profilePlan(planInput).preview };
+    }
 
     // D13: a person applies exactly the preview they confirmed; agents may omit it.
     if (isHumanCaller(context.auth) && input.fingerprint === undefined)
       throw refuse("preview_required", "Preview the apply and confirm it.");
-    if (input.fingerprint !== undefined && input.fingerprint !== plan.preview.fingerprint)
-      throw refuse("preview_stale", "Something changed since the preview. Preview again.");
-    const [first] = plan.preview.refusals;
-    if (first)
-      throw first.subjectId
-        ? refuseAbout(first.reason, first.subjectId, first.message)
-        : refuse(first.reason, first.message);
 
-    const actor = callerActor(context.auth, userId);
     const now = new Date();
-    const operation = await graphWrite([userId], async (tx) => {
-      const created = await tx.runtimeOperation.create({
-        data: {
-          userId,
-          kind: "PROFILE_APPLY",
-          actor: actor.actor,
-          actorUserId: userId,
-          agentTokenId: actor.agentTokenId,
-          mcpGrantId: actor.mcpGrantId,
-          profileId: profile.id,
-          summary: toJsonValue(plan.preview),
-          fingerprint: plan.preview.fingerprint,
-        },
-        select: { id: true, createdAt: true },
-      });
-      // Holds are planned again on the rows as they are now (planProfileHolds). A hold set
-      // since the plan refuses an agent (node_held); any other change refuses the apply as
-      // stale (preview_stale), for agents too. Every hold write must land as planned.
-      await lockProfileRows(
-        tx,
-        userId,
-        profile.id,
-        planInput.owned.map((line) => line.nodeId),
-      );
-      const lines = await tx.profileNode.findMany({
-        where: { profileId: profile.id },
-        select: { nodeId: true, hold: true, holdNote: true },
-      });
-      const lineKey = (line: { nodeId: string; hold: boolean; holdNote: string | null }) =>
-        `${line.nodeId}\u0000${line.hold}\u0000${line.holdNote ?? ""}`;
-      if (!sameIds(lines.map(lineKey), planInput.owned.map(lineKey)))
-        throw refuse("preview_stale", "The profile changed since the preview. Preview again.");
-      const current = await tx.node.findMany({
-        where: { userId, id: { in: planInput.owned.map((line) => line.nodeId) } },
-        select: { id: true, holdAt: true, holdProfileId: true },
-      });
-      const holds = planProfileHolds({
-        profileId: profile.id,
-        caller: planInput.agentRules ? "agent" : "person",
-        nodes: planInput.owned,
-        current: new Map(current.map((node) => [node.id, node] as const)),
-      });
-      if (!holds.ok)
-        throw refuseAbout(
-          "node_held",
-          holds.nodeIds[0] ?? profile.id,
-          "A person or another profile holds a node this profile owns; agents cannot release it.",
-        );
-      if (
-        !sameIds(
-          holds.hold.map((line) => line.nodeId),
-          plan.holdNodeIds,
-        ) ||
-        !sameIds(holds.release, plan.releaseNodeIds)
-      )
-        throw refuse("preview_stale", "A node's hold changed since the preview. Preview again.");
-      const raced = (nodeId: string) =>
-        planInput.agentRules
-          ? refuseAbout(
-              "node_held",
-              nodeId,
-              "A node's hold changed meanwhile; agents cannot apply here.",
-            )
-          : refuse("preview_stale", "A node's hold changed since the preview. Preview again.");
-      for (const line of holds.hold) {
-        const written = await tx.node.updateMany({
-          where: { id: line.nodeId, userId, OR: [{ holdAt: null }, { holdProfileId: profile.id }] },
-          data: { holdAt: now, holdNote: line.note, holdProfileId: profile.id },
-        });
-        if (written.count !== 1) throw raced(line.nodeId);
-      }
-      for (const nodeId of holds.release) {
-        const was = current.find((node) => node.id === nodeId);
-        const released = await tx.node.updateMany({
-          // Only the hold that was read: a newer one (set meanwhile) stays.
-          where: {
-            id: nodeId,
+    // The plan is made again under the owner fence (no other graph write of this user lands
+    // between plan and write), then the capacity fences of every instance it stops are taken.
+    // The stops and starts are written here, in the same transaction as the operation and the
+    // holds; the lifecycle engine dispatches them (`profileApplied`).
+    let planned: Awaited<ReturnType<typeof loadPlanInput>> | null = null;
+    let plan: ReturnType<typeof profilePlan> | null = null;
+    const operation = await graphWrite(
+      [userId],
+      async (tx) => {
+        if (!planned || !plan) throw new Error("The apply plan runs before its write.");
+        const { profile, input: planInput } = planned;
+        if (input.fingerprint !== undefined && input.fingerprint !== plan.preview.fingerprint)
+          throw refuse("preview_stale", "Something changed since the preview. Preview again.");
+        const [first] = plan.preview.refusals;
+        if (first)
+          throw first.subjectId
+            ? refuseAbout(first.reason, first.subjectId, first.message)
+            : refuse(first.reason, first.message);
+        const actor = callerActor(context.auth, userId);
+        const created = await tx.runtimeOperation.create({
+          data: {
             userId,
-            holdAt: { not: null },
-            holdProfileId: was?.holdProfileId ?? null,
+            kind: "PROFILE_APPLY",
+            actor: actor.actor,
+            actorUserId: userId,
+            agentTokenId: actor.agentTokenId,
+            mcpGrantId: actor.mcpGrantId,
+            profileId: profile.id,
+            summary: toJsonValue(plan.preview),
+            fingerprint: plan.preview.fingerprint,
           },
-          data: { holdAt: null, holdNote: null, holdProfileId: null },
+          select: { id: true, createdAt: true },
         });
-        if (released.count !== 1) throw raced(nodeId);
-      }
-      return created;
-    });
+        // Holds are planned again on the rows as they are now (planProfileHolds). A hold set
+        // since the plan refuses an agent (node_held); any other change refuses the apply as
+        // stale (preview_stale), for agents too. Every hold write must land as planned.
+        await lockProfileRows(
+          tx,
+          userId,
+          profile.id,
+          planInput.owned.map((line) => line.nodeId),
+        );
+        const lines = await tx.profileNode.findMany({
+          where: { profileId: profile.id },
+          select: { nodeId: true, hold: true, holdNote: true },
+        });
+        const lineKey = (line: { nodeId: string; hold: boolean; holdNote: string | null }) =>
+          `${line.nodeId}\u0000${line.hold}\u0000${line.holdNote ?? ""}`;
+        if (!sameIds(lines.map(lineKey), planInput.owned.map(lineKey)))
+          throw refuse("preview_stale", "The profile changed since the preview. Preview again.");
+        const current = await tx.node.findMany({
+          where: { userId, id: { in: planInput.owned.map((line) => line.nodeId) } },
+          select: { id: true, holdAt: true, holdProfileId: true },
+        });
+        const holds = planProfileHolds({
+          profileId: profile.id,
+          caller: planInput.agentRules ? "agent" : "person",
+          nodes: planInput.owned,
+          current: new Map(current.map((node) => [node.id, node] as const)),
+        });
+        if (!holds.ok)
+          throw refuseAbout(
+            "node_held",
+            holds.nodeIds[0] ?? profile.id,
+            "A person or another profile holds a node this profile owns; agents cannot release it.",
+          );
+        if (
+          !sameIds(
+            holds.hold.map((line) => line.nodeId),
+            plan.holdNodeIds,
+          ) ||
+          !sameIds(holds.release, plan.releaseNodeIds)
+        )
+          throw refuse("preview_stale", "A node's hold changed since the preview. Preview again.");
+        const raced = (nodeId: string) =>
+          planInput.agentRules
+            ? refuseAbout(
+                "node_held",
+                nodeId,
+                "A node's hold changed meanwhile; agents cannot apply here.",
+              )
+            : refuse("preview_stale", "A node's hold changed since the preview. Preview again.");
+        for (const line of holds.hold) {
+          const written = await tx.node.updateMany({
+            where: {
+              id: line.nodeId,
+              userId,
+              OR: [{ holdAt: null }, { holdProfileId: profile.id }],
+            },
+            data: { holdAt: now, holdNote: line.note, holdProfileId: profile.id },
+          });
+          if (written.count !== 1) throw raced(line.nodeId);
+        }
+        for (const nodeId of holds.release) {
+          const was = current.find((node) => node.id === nodeId);
+          const released = await tx.node.updateMany({
+            // Only the hold that was read: a newer one (set meanwhile) stays.
+            where: {
+              id: nodeId,
+              userId,
+              holdAt: { not: null },
+              holdProfileId: was?.holdProfileId ?? null,
+            },
+            data: { holdAt: null, holdNote: null, holdProfileId: null },
+          });
+          if (released.count !== 1) throw raced(nodeId);
+        }
+        const stopIds = plan.preview.stops.map((stop) => stop.instanceId);
+        const stopped = await markInstancesStopping(tx, stopIds, created.id, "profile_apply");
+        if (stopped !== stopIds.length)
+          throw refuse("preview_stale", "An instance this apply stops changed. Preview again.");
+        await writePlannedStarts(tx, {
+          userId,
+          operationId: created.id,
+          startedBy: actor.actor,
+          starts: plan.preview.starts,
+          blockedBy: plan.blockedBy,
+        });
+        return { ...created, actor };
+      },
+      async (tx) => {
+        planned = await loadPlanInput(context, userId, input.profileId, tx);
+        plan = profilePlan(planned.input);
+        return instanceCapacityFences(plan.preview.stops.map((stop) => stop.instanceId).sort());
+      },
+    );
+    const { actor } = operation;
     const profileApplied = context.services?.nodes?.profileApplied;
     if (profileApplied) {
       try {

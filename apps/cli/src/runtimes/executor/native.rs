@@ -530,6 +530,7 @@ mod tests {
             unit_name: "wsmp-i-itestitestabc-r0".into(),
             handle: "i-itestitestabc".into(),
             port,
+            gpu_ids: None,
             host: "127.0.0.1".into(),
             spec: serde_json::json!({
                 "api": "openai", "engine": "other", "modelType": "llm",

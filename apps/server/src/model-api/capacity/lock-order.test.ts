@@ -189,6 +189,8 @@ const GRAPH_WRITERS: Record<string, string> = {
   "apps/server/src/model-api/cache-affinity-generation.ts":
     "H status: bounded capacity generation then endpoint epoch; commits each before optional projection publication, no source/bucket lock overlaps",
   "apps/server/src/relay/registration.ts": "M: relay registration",
+  "apps/server/src/runtimes/lifecycle.ts":
+    "M: runtime lifecycle (steps, claims, instance phases) under graphWrite: the owner fence, then the instance's capacity fence; execution targets of a READY instance in the same transaction; always-on phases are status writes",
   "apps/server/src/relay/node-services.ts":
     "H status: node detectedServers for the current connection generation (no fenced column)",
   "apps/server/src/relay/runtime-sync.ts":

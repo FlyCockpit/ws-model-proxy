@@ -48,7 +48,9 @@ const CSRF_LESS: CallerAuth = {
 const client = (auth: CallerAuth = PERSON, services?: Parameters<typeof contextFor>[1]) =>
   createRouterClient(profilesRouter, { context: contextFor(auth, services) });
 
-function planState(options: { trust?: "RELAY" | "FULL"; personHold?: boolean } = {}) {
+function planState(
+  options: { trust?: "RELAY" | "FULL"; personHold?: boolean; running?: boolean } = {},
+) {
   db.profileNode.findMany.mockResolvedValueOnce([{ nodeId: "a", hold: false, holdNote: null }]);
   db.profile.findFirst.mockResolvedValueOnce({
     id: "p-1",
@@ -76,7 +78,20 @@ function planState(options: { trust?: "RELAY" | "FULL"; personHold?: boolean } =
     },
   ] as never);
   db.runtimeVersion.findMany.mockResolvedValueOnce([]);
-  db.runtimeInstance.findMany.mockResolvedValueOnce([]);
+  db.runtimeInstance.findMany.mockResolvedValueOnce(
+    options.running
+      ? ([
+          {
+            id: "i-1",
+            runtimeId: "r-1",
+            launchVersionId: "v-1",
+            desiredState: "RUNNING",
+            phase: "READY",
+            Ranks: [{ nodeId: "a", claim: "HELD" }],
+          },
+        ] as never)
+      : [],
+  );
   db.runtimeInstance.findMany.mockResolvedValueOnce([]); // claimants (placement)
   db.fabric.findMany.mockResolvedValueOnce([]);
 }
@@ -148,6 +163,41 @@ describe("profiles.apply", () => {
     expect(db.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
       db.profileNode.findMany.mock.invocationCallOrder[0] ?? 0,
     );
+  });
+
+  it("stops what the profile does not keep in the apply's own transaction", async () => {
+    planState({ running: true });
+    db.runtimeOperation.create.mockResolvedValueOnce({
+      id: "op-3",
+      createdAt: new Date(),
+    } as never);
+    db.runtimeInstance.updateMany.mockResolvedValueOnce({ count: 1 });
+    await expect(client(FULL_AGENT).apply({ profileId: "p-1" })).resolves.toMatchObject({
+      mode: "applied",
+    });
+    expect(db.runtimeInstance.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ["i-1"] }, desiredState: "RUNNING" },
+      data: expect.objectContaining({
+        desiredState: "STOPPED",
+        phase: "STOPPING",
+        phaseReason: "profile_apply",
+        operationId: "op-3",
+      }),
+    });
+    // The instance it stops is fenced too (its capacity view changes).
+    expect(fenceLog.held.some((fence) => fence.includes("i-1"))).toBe(true);
+  });
+
+  it("refuses as stale when an instance it stops changed meanwhile", async () => {
+    planState({ running: true });
+    db.runtimeOperation.create.mockResolvedValueOnce({
+      id: "op-4",
+      createdAt: new Date(),
+    } as never);
+    db.runtimeInstance.updateMany.mockResolvedValueOnce({ count: 0 });
+    await expect(client(FULL_AGENT).apply({ profileId: "p-1" })).rejects.toMatchObject({
+      data: { reason: "preview_stale" },
+    });
   });
 
   it("lets an agent apply without a fingerprint", async () => {

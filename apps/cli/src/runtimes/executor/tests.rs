@@ -24,6 +24,7 @@ fn job(action: JobPhase) -> Job {
         unit_name: "wsmp-i-abcdefabcdef-r0".into(),
         handle: "i-abcdefabcdef".into(),
         port: 30001,
+        gpu_ids: None,
         host: "127.0.0.1".into(),
         spec: serde_json::json!({
             "api": "openai", "engine": "vllm", "modelType": "llm",
@@ -237,6 +238,26 @@ fn missing_secrets_are_named_never_valued() {
         text.contains("WSMP_SECRET_DEFINITELY_NOT_SET_7F3A"),
         "{text}"
     );
+}
+
+#[test]
+fn commands_see_only_the_ranks_gpus() {
+    let mut placed = job(JobPhase::Start);
+    assert!(command_env(&placed).expect("env").is_empty());
+    placed.gpu_ids = Some("0,3".into());
+    let env = command_env(&placed).expect("env");
+    assert_eq!(
+        env,
+        vec![
+            ("CUDA_VISIBLE_DEVICES".to_string(), "0,3".to_string()),
+            ("HIP_VISIBLE_DEVICES".to_string(), "0,3".to_string()),
+        ]
+    );
+    // Persisted records written before the field still load.
+    let mut stored = serde_json::to_value(job(JobPhase::Start)).expect("json");
+    stored.as_object_mut().expect("object").remove("gpuIds");
+    let loaded: Job = serde_json::from_value(stored).expect("old record");
+    assert_eq!(loaded.gpu_ids, None);
 }
 
 /// A Runtime whose status/health can fail with an error (unknown).
