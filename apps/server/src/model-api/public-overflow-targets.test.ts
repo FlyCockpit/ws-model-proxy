@@ -4,6 +4,7 @@ const world = vi.hoisted(() => ({
   pool: null as Record<string, unknown> | null,
   share: null as Record<string, unknown> | null,
   ensured: [] as Array<{ userId: string; ids: string[] }>,
+  ensureFails: false,
 }));
 
 vi.mock("@ws-model-proxy/db", () => ({
@@ -22,6 +23,7 @@ vi.mock("./provider-targets.js", () => ({
     models: Array<{ id: string; providerAccountId: string }>,
   ) => {
     world.ensured.push({ userId, ids: models.map((model) => model.id) });
+    if (world.ensureFails) throw new Error("lock timeout");
     return new Map(models.map((model) => [model.id, `target-of-${model.id}`]));
   },
 }));
@@ -95,6 +97,7 @@ beforeEach(() => {
   world.pool = null;
   world.share = null;
   world.ensured.length = 0;
+  world.ensureFails = false;
 });
 
 describe("cloud target listing (0.4.0)", () => {
@@ -138,6 +141,29 @@ describe("cloud target listing (0.4.0)", () => {
     const listed = await listPublicOverflowTargets("owner", "pool");
     expect(world.ensured).toEqual([{ userId: "owner", ids: ["a"] }]);
     expect(listed.targets[0]?.executionTargetId).toBe("target-of-a");
+  });
+
+  it("never creates a target for a soft-deleted model", async () => {
+    world.pool = pool("OWNER", [
+      {
+        id: "m1",
+        cloudOrder: 0,
+        ProviderModel: providerModel("a", { Target: null, deletedAt: new Date() }),
+      },
+    ]);
+    const listed = await listPublicOverflowTargets("owner", "pool");
+    expect(world.ensured).toEqual([]);
+    expect([...listed.targets, ...listed.coolingDown, ...listed.unavailable]).toEqual([]);
+  });
+
+  it("counts a member whose target could not be created yet as cooling down (transient)", async () => {
+    world.ensureFails = true;
+    world.pool = pool("OWNER", [
+      { id: "m1", cloudOrder: 0, ProviderModel: providerModel("a", { Target: null }) },
+    ]);
+    const listed = await listPublicOverflowTargets("owner", "pool");
+    expect(listed.targets).toEqual([]);
+    expect(listed.coolingDown.map((target) => target.providerModelId)).toEqual(["a"]);
   });
 
   it("separates cooling-down and unavailable members from sendable ones", async () => {

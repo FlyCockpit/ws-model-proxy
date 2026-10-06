@@ -247,7 +247,7 @@ const REVIEWED_SHARE_LOCKS: Record<string, string> = {
   "apps/server/src/model-api/public-overflow.ts:share.FOR SHARE":
     "E0 send claim, after the pool row: the requester's share (canUse, own-key choice). Share writers hold the pool owner's fence, which the claim already holds.",
   "apps/server/src/model-api/public-overflow.ts:pool_member.FOR SHARE":
-    "E0 send claim, after pool, share and api_key, before the provider rows: the CLOUD member's state. Member state writers take the capacity-policy fence and update one row; the claim holds no fence they wait for and takes no row a member writer holds before its own, so no cycle.",
+    "E0 send claim, after pool, pool_fallback, share and api_key, before the provider rows: the CLOUD member's state. Member writers need the pool owner's fence (structural and state/weight columns), which the claim already holds, so they serialize before rows; no cycle.",
   "apps/server/src/model-api/public-overflow.ts:user.FOR SHARE":
     "E0 send claim, last lock: the sorted requester, pool owner and payer rows catch unfenced Better Auth bans. A ban writer updates one user row and takes nothing afterwards; deletion writers hold an owner fence the claim already holds. No fence or row is taken after it.",
   "apps/server/src/model-api/local-send.ts:user.FOR SHARE":
@@ -455,6 +455,7 @@ describe("capacity lock order (DL-1 design (d)): writer classes and fences", () 
       "set_config('lock_timeout'",
       "fenceOwners(",
       "FROM pool WHERE id",
+      "FROM pool_fallback WHERE",
       "FROM share WHERE id",
       "FROM api_key WHERE id",
       "FROM pool_member WHERE id",

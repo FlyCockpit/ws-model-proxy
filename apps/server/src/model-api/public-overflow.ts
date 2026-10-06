@@ -26,7 +26,7 @@ import {
   surfaceAvailabilityMatrix,
 } from "@ws-model-proxy/api/lib/surface-capabilities";
 import prisma, { Prisma } from "@ws-model-proxy/db";
-import { fenceOwners } from "@ws-model-proxy/db/capacity-lock-order";
+import { FenceProtocolError, fenceOwners } from "@ws-model-proxy/db/capacity-lock-order";
 import {
   poolOwnerActive,
   userCredentialAccessBlocked,
@@ -221,6 +221,11 @@ export interface PublicOverflowRequest {
   chatTestRoutingMode?: "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";
   /** Cookie-authenticated member probe can constrain dispatch to one pool member. */
   forcedPoolMemberId?: string;
+  /**
+   * The members the caller already found servable (e.g. renderable for this request); others
+   * are not tried. Absent: every listed member.
+   */
+  eligibleExecutionTargetIds?: readonly string[];
   /** True only when the operation resolver proves a second attempt is safe. */
   retrySafe: boolean;
   /** The caller admitted one target at a time and has another capacity-fenced
@@ -545,13 +550,13 @@ export type PublicProviderSendClaim =
     };
 
 /**
- * Upper bound on each lock wait of the send-claim transaction (L1b, #64):
- * a transaction-local `lock_timeout`. While the claim waits on the hot
- * `provider_account` row (budget admission, settlement and the provider
- * runtime lock it) it holds the pool, grant, token and allowlist rows FOR
- * SHARE, which blocks their writers. The bound keeps that hold short; a
- * timed-out claim throws (SQLSTATE 55P03), nothing is sent, and the
- * dispatcher settles it as `SEND_CLAIM_FAILED` (transient, 503).
+ * Upper bound on each lock wait of the send-claim transaction (L1b, #64): a transaction-local
+ * `lock_timeout`, fence waits included. While the claim waits on the hot `provider_account` row
+ * (provider health, heartbeats and fence allocation hold it FOR UPDATE briefly) it holds the
+ * owner fences and the pool, pool_fallback, share, API key and member rows FOR SHARE, which
+ * blocks their writers (and, through the owner fences, other sends of the same owners, as the
+ * local send does). The bound keeps that hold short; a timed-out claim throws (SQLSTATE 55P03),
+ * nothing is sent, and the dispatcher settles it as `SEND_CLAIM_FAILED` (transient, 503).
  */
 export const EXTERNAL_SEND_CLAIM_LOCK_TIMEOUT_MS = 2_000;
 
@@ -629,7 +634,8 @@ async function recheckExternalSendTarget(
  *
  *   1. the owner fences of the requester, the pool owner and the provider owner (management
  *      writers of pools, shares, keys and providers hold them, so none is mid-write);
- *   2. the consent rows FOR SHARE: pool, then the requester's share, then the API key; the
+ *   2. the consent rows FOR SHARE: pool and its cloud settings, then the requester's share, then
+ *      the API key; the
  *      pool's cloud mode (or, own-key, the owner's equivalent-model consent and the share's
  *      own-key choice) must still cover the requester, and a protected-saturation fallback
  *      still needs paid warm protection;
@@ -675,6 +681,9 @@ export async function claimPublicProviderCredentialForSend(input: {
       await fenceOwners(tx, [consent.requesterUserId, consent.ownerUserId, input.userId]);
 
       await tx.$queryRaw`SELECT id FROM pool WHERE id = ${consent.poolId} FOR SHARE`;
+      // The cloud settings row: mode, paid warm protection, own-key consent and the embedding
+      // contract (the contract has no fence; this lock keeps it stable for the target check).
+      await tx.$queryRaw`SELECT "poolId" FROM pool_fallback WHERE "poolId" = ${consent.poolId} FOR SHARE`;
       const pool = await tx.pool.findFirst({
         where: { id: consent.poolId, userId: consent.ownerUserId },
         select: {
@@ -1259,24 +1268,42 @@ export async function listPublicOverflowTargets(
         : [],
     );
   const providerOwnerId = ownKey?.requesterUserId ?? userId;
+  // Live models only: a soft-deleted one never gets a target (and is not listed below).
   const missingTargets = members.filter(
-    (member) => !member.model.Target && member.model.userId === providerOwnerId,
+    (member) =>
+      !member.model.Target &&
+      member.model.userId === providerOwnerId &&
+      !member.model.deletedAt &&
+      !member.model.Account.deletedAt,
   );
-  const createdTargets =
-    missingTargets.length > 0
-      ? await ensureProviderExecutionTargets(
-          providerOwnerId,
-          missingTargets.map((member) => ({
-            id: member.model.id,
-            providerAccountId: member.model.providerAccountId,
-          })),
-        ).catch(() => new Map<string, string>())
-      : new Map<string, string>();
+  let createdTargets = new Map<string, string>();
+  let targetCreationFailed = false;
+  if (missingTargets.length > 0)
+    try {
+      createdTargets = await ensureProviderExecutionTargets(
+        providerOwnerId,
+        missingTargets.map((member) => ({
+          id: member.model.id,
+          providerAccountId: member.model.providerAccountId,
+        })),
+      );
+    } catch (error) {
+      // A fence-protocol error is a programming bug: never hide it.
+      if (error instanceof FenceProtocolError) throw error;
+      // Transient (lock timeout): these members count as cooling down (503, never sent) for
+      // this request; the next one retries.
+      targetCreationFailed = true;
+      console.warn("[public-overflow] could not create a provider execution target");
+    }
   const unavailable: ListedPublicOverflowTargets["unavailable"] = [];
   const listed = members.flatMap((member) => {
     const model = member.model;
     const account = model.Account;
-    const executionTargetId = model.Target?.id ?? createdTargets.get(model.id);
+    const createdTargetId = model.Target?.id ?? createdTargets.get(model.id);
+    const targetPending = !createdTargetId && targetCreationFailed;
+    // A placeholder identity only ever lands in `coolingDown`, which is never dispatched.
+    const executionTargetId =
+      createdTargetId ?? (targetPending ? `pending:${model.id}` : undefined);
     const credential = account.CurrentCredential;
     const capabilityInventory = parseOpenAiCompatibleCapabilities(model.nativeCapabilities);
     const protocol = cloudProtocol(account.providerType, capabilityInventory);
@@ -1309,7 +1336,9 @@ export async function listPublicOverflowTargets(
     }
     // The rule claimProviderHealthTrial applies under its locks.
     const coolingDown =
-      providerHealthCoolingDown(model, now) || providerHealthCoolingDown(account, now);
+      targetPending ||
+      providerHealthCoolingDown(model, now) ||
+      providerHealthCoolingDown(account, now);
     const target: PublicProviderTarget = {
       ...identity,
       ownKey: Boolean(ownKey),
@@ -2960,6 +2989,11 @@ export async function dispatchPublicOverflow(
       if (
         request.admittedExecutionTargetId &&
         target.executionTargetId !== request.admittedExecutionTargetId
+      )
+        return [];
+      if (
+        request.eligibleExecutionTargetIds &&
+        !request.eligibleExecutionTargetIds.includes(target.executionTargetId)
       )
         return [];
       const resolvedExecution = resolvePublicProviderExecution(target, compatibilityRequest);

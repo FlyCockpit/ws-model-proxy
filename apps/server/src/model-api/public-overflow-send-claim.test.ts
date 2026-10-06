@@ -237,6 +237,7 @@ describe("E0 cloud send claim", () => {
       "lock_timeout",
       "fences:00:owner:grantee,00:owner:owner",
       "pool",
+      "pool_fallback",
       "share",
       "api_key",
       "pool_member",
@@ -322,6 +323,41 @@ describe("E0 cloud send claim", () => {
     world.credential = null;
     await expect(claim()).rejects.toThrow("no longer current");
     expect(world.credentialUpdates).toBe(0);
+  });
+
+  it("refuses a consent whose owner flag disagrees with its share", async () => {
+    await expect(claim({ ...ownerConsent, shareId: "share" })).resolves.toEqual({
+      claimed: false,
+      reason: "REQUESTER_NOT_VISIBLE",
+    });
+    await expect(claim({ ...granteeConsent, shareId: null })).resolves.toEqual({
+      claimed: false,
+      reason: "REQUESTER_NOT_VISIBLE",
+    });
+    expect(world.statements).toEqual([]);
+  });
+
+  it("lets own-key run while the pool's own cloud mode is off", async () => {
+    world.pool!.Fallback.mode = "OFF";
+    world.pool!.Fallback.ownKeyEquivalentModel = "openai/gpt-oss-120b";
+    world.share = { id: "share", granteeUserId: "grantee", ownKeyProviderModelId: "model" };
+    const sealed = world.credential!;
+    // The share holder pays with their own credential (AAD bound to them).
+    const own = encryptProviderCredential(
+      "sk-grantee",
+      {
+        credentialId: "credential",
+        userId: "grantee",
+        providerAccountId: "account",
+        credentialType: "BEARER",
+        aadVersion: 1,
+      },
+      keyring,
+    );
+    world.credential = { ...sealed, ...own, algorithm: own.algorithm };
+    await expect(
+      claim({ ...granteeConsent, ownKeyProviderModelId: "model" }, { userId: "grantee" }),
+    ).resolves.toMatchObject({ claimed: true, secret: "sk-grantee" });
   });
 
   it("requires the owner's equivalent-model consent and the share's choice for own-key", async () => {

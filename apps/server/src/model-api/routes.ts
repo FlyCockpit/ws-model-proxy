@@ -4555,9 +4555,14 @@ async function relayPool({
       // itself (spend admission, health trial and the E0 send claim per member).
       if (compatible.every((item) => !item.inferenceCapacityId)) {
         await releaseProviderCapacity();
+        // The relay deadline bounds the start of external work, as for leased members.
+        if (request.signal.aborted || remainingRelayBudgetMs(relayDeadlineMs) <= 0)
+          return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
         const previousRoute = routeIdentity;
         const result = await dispatchPublicOverflow({
           ...tierRequest,
+          // Only the members this tier found servable (e.g. renderable at this depth).
+          eligibleExecutionTargetIds: compatible.map((item) => item.executionTargetId),
           retrySingleTargetPrecommit: ownKey,
           beforeProviderSend: ownKey
             ? (provider) => persistRouteIdentity(providerRouteIdentity(provider))

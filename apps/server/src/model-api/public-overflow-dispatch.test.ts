@@ -336,6 +336,15 @@ describe("owner/pool:external dispatch", () => {
     });
   });
 
+  it("tries only the members the caller found servable", async () => {
+    const result = await dispatchPublicOverflow({
+      ...request(),
+      eligibleExecutionTargetIds: ["another-target"],
+    });
+    expect(result).toMatchObject({ dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" });
+    expect(world.calls).toEqual([]);
+  });
+
   it("sends nothing when the spend cap refuses the attempt", async () => {
     world.admission = { admitted: false, reason: "BUDGET_EXCEEDED" };
     const result = await dispatchPublicOverflow(request());
