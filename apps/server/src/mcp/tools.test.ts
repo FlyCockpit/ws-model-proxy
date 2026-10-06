@@ -128,6 +128,7 @@ function toolCallRequest(id: number, tool: string, args: unknown = {}) {
     headers: {
       "content-type": "application/json",
       "mcp-method": "tools/call",
+      "mcp-protocol-version": "2026-07-28",
       "mcp-name": tool,
     },
     body: toolCallBody(tool, args, id),
@@ -147,7 +148,11 @@ function toolCallBody(tool: string, args: unknown, id = 1) {
 function toolsListRequest(id: number) {
   return new Request("http://proxy.example.com/mcp", {
     method: "POST",
-    headers: { "content-type": "application/json", "mcp-method": "tools/list" },
+    headers: {
+      "content-type": "application/json",
+      "mcp-method": "tools/list",
+      "mcp-protocol-version": "2026-07-28",
+    },
     body: JSON.stringify({
       jsonrpc: "2.0",
       id,
@@ -1114,6 +1119,7 @@ describe("full chain — createMcpRequestHandler onVerified binding → tools/ca
       "content-type": "application/json",
       authorization: "Bearer verified-access-token",
       "mcp-method": "tools/call",
+      "mcp-protocol-version": "2026-07-28",
       "mcp-name": "model_api_tokens_list",
     });
     chainHeaders.set("host", "proxy.example.com");

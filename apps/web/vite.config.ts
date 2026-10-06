@@ -55,7 +55,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function getPortlessApiTarget(): string {
   try {
-    const raw = readFileSync(path.resolve(__dirname, "../../portless.json"), "utf-8");
+    const raw = readFileSync(path.resolve(import.meta.dirname, "../../portless.json"), "utf-8");
     const config: unknown = JSON.parse(raw);
     if (!isRecord(config) || !isRecord(config.apps)) return "https://api.ws-model-proxy.localhost";
     const server = config.apps["apps/server"];
@@ -83,7 +83,7 @@ function normalizeProxyTarget(value: string | undefined): { http: string; ws: st
   return { http: url.toString().replace(/\/$/, ""), ws: wsUrl.toString().replace(/\/$/, "") };
 }
 function tanstackPwaBuildPlugin(api: VitePluginPWAAPI): Plugin {
-  const serviceWorkerPath = path.resolve(__dirname, "dist/client/sw.js");
+  const serviceWorkerPath = path.resolve(import.meta.dirname, "dist/client/sw.js");
 
   return {
     name: "ws-model-proxy:build-pwa",
@@ -107,7 +107,7 @@ function tanstackPwaBuildPlugin(api: VitePluginPWAAPI): Plugin {
 export default defineConfig(({ mode }) => {
   // Keep build-time and runtime branding in lockstep by loading the same
   // app-local env files (`apps/web/.env*`) that the client runtime uses.
-  const envDir = __dirname;
+  const envDir = import.meta.dirname;
   const env = loadEnv(mode, envDir, "VITE_");
   const appName = env.VITE_APP_NAME || "WS Model Proxy";
   const devPort = parseDevPort(
@@ -157,7 +157,7 @@ export default defineConfig(({ mode }) => {
     },
     resolve: {
       alias: {
-        "@": path.resolve(__dirname, "./src"),
+        "@": path.resolve(import.meta.dirname, "./src"),
       },
     },
     build: {

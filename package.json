@@ -62,21 +62,21 @@
     "postinstall": "lefthook install"
   },
   "devDependencies": {
-    "@babel/parser": "^8.0.5",
-    "@biomejs/biome": "^2.5.13",
+    "@babel/parser": "^8.0.6",
+    "@biomejs/biome": "^2.5.14",
     "@inquirer/prompts": "^8.7.2",
     "@types/node": "catalog:",
     "@ws-model-proxy/config": "workspace:*",
     "@ws-model-proxy/env": "workspace:*",
     "@ws-model-proxy/i18n-translate": "workspace:*",
     "dotenv": "catalog:",
-    "knip": "^6.35.1",
+    "knip": "^6.38.0",
     "lefthook": "^2.1.14",
     "react-doctor": "^0.9.14",
     "tsx": "catalog:",
-    "turbo": "^2.10.12",
+    "turbo": "^2.11.5",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },
-  "packageManager": "pnpm@11.1.2+sha512.415a1cc25974731e75455c1468371be74c5aa5fb7621b50d4056d222451609f11412f23fd602e6169f1e060466641f798597e1be961a10688836a67b16569499"
+  "packageManager": "pnpm@11.28.2+sha512.755ce2fe3c05bfd7bb412b42aff3c5c55cd38c529c6eca810475497ae36746c571e4b6e1814e6e7e4b97d7ee864b8a0e44673c3b297a50e0ac28771c5ce15d27"
 }

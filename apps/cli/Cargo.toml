@@ -12,7 +12,7 @@ version = "0.4.0"
 edition = "2024"
 publish = false
 # Minimum Supported Rust Version. Edition 2024 requires >= 1.85; tiktoken-rs
-# 0.12.0 uses let chains, which need >= 1.88. The `msrv` CI job is the source
+# 0.12 uses let chains, which need >= 1.88. The `msrv` CI job is the source
 # of truth — if you add a dependency that needs newer, bump this and the job
 # will tell you.
 rust-version = "1.88"
@@ -87,7 +87,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 # A single shared tokenizer makes fallback throughput comparable across
 # heterogeneous upstream models. Pin to the MSRV-compatible release.
-tiktoken-rs = "=0.12.0"
+tiktoken-rs = "=0.12.1"
 # Terminal session crypto. Versions stay on the digest 0.11 line with sha2 0.11.
 hkdf = "0.13"
 aes-gcm = "0.11"
@@ -113,7 +113,7 @@ nix = { version = "0.31", default-features = false, features = ["fs", "dir", "ho
 # so a service manager sees SIGTERM rather than exit status 143. Already in the
 # tree through tokio's `signal` feature (signal-hook-registry); default
 # features (channel, iterator) are not needed.
-signal-hook = { version = "0.3", default-features = false }
+signal-hook = { version = "0.4", default-features = false }
 # Unix PTY. Its unsafe code stays inside the crate (`unsafe_code` is forbid
 # here). Windows v1 reports terminals unsupported and does not link this crate.
 portable-pty = "0.9"

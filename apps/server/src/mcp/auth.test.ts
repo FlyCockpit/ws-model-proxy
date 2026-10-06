@@ -779,6 +779,7 @@ function modernMcpRequest(method = "tools/list") {
     "content-type": "application/json",
     host: "proxy.example.com",
     "mcp-method": method,
+    "mcp-protocol-version": "2026-07-28",
   });
   h.set("authorization", `Bearer ${TOKEN}`);
   return new Request(RESOURCE, {
@@ -1056,6 +1057,7 @@ describe("createMcpRequestHandler — shutdown admission barrier (F8)", () => {
       "content-type": "application/json",
       host: "proxy.example.com",
       "mcp-method": "tools/list",
+      "mcp-protocol-version": "2026-07-28",
     });
     h.set("authorization", `Bearer ${TOKEN}`);
     const request = new Request(RESOURCE, {
@@ -1122,6 +1124,7 @@ describe("createMcpRequestHandler — shutdown admission barrier (F8)", () => {
       "content-type": "application/json",
       host: "proxy.example.com",
       "mcp-method": "tools/list",
+      "mcp-protocol-version": "2026-07-28",
     });
     h.set("authorization", `Bearer ${TOKEN}`);
     const request = new Request(RESOURCE, {

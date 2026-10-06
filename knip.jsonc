@@ -65,24 +65,15 @@
         // Imported only via PostCSS/Tailwind CSS pipeline, not statically.
         "tailwindcss",
         "postcss",
-        // Consumed indirectly via `@orpc/client` + `createORPCClient`.
-        "@orpc/server",
         // Toast primitive re-exported from @ws-model-proxy/ui.
-        "sileo",
-        // Optional peer of h3 2.x (pulled by TanStack Start); pinned here so the
-        // SSR/oRPC stack binds crossws 0.4.x instead of the 0.3.x h3 1.x dedupes
-        // to. No static import in source — it's a build/runtime transitive.
-        "crossws"
+        "sileo"
       ]
-    },
-    "apps/server": {
-      "ignoreDependencies": ["better-auth"]
     },
     "packages/ui": {
       "entry": ["src/components/**/*.tsx", "src/styles/**/*.css"]
     },
     "packages/api": {
-      "ignoreDependencies": ["@orpc/openapi", "@orpc/zod"]
+      "ignoreDependencies": ["@orpc/openapi"]
     },
     "packages/db": {
       "ignoreDependencies": ["@prisma/client", "zod"]

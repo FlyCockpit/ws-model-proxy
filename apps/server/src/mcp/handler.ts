@@ -9,7 +9,7 @@ import { registerMcpTools } from "./tools";
 
 /**
  * MCP HTTP transport (Phase 4 item 4) on the INSTALLED
- * `@modelcontextprotocol/server@2.0.0` API surface:
+ * `@modelcontextprotocol/server@2.2.0` API surface:
  *
  * - ONE module-lifetime handler (`McpHttpHandler`); its FACTORY creates and
  *   registers a fresh `McpServer` for every request/context (verified API:

@@ -497,6 +497,7 @@ describe("G5 — the EMITTED (post-SDK) result respects the cap through the real
         headers: {
           "content-type": "application/json",
           "mcp-method": "tools/call",
+          "mcp-protocol-version": "2026-07-28",
           "mcp-name": "g5_wire",
         },
         body: JSON.stringify({
@@ -543,6 +544,7 @@ describe("G5 — the EMITTED (post-SDK) result respects the cap through the real
         headers: {
           "content-type": "application/json",
           "mcp-method": "tools/call",
+          "mcp-protocol-version": "2026-07-28",
           "mcp-name": "forwarder_chat_completion_test",
         },
         body: JSON.stringify({
@@ -606,6 +608,7 @@ describe("G5 — the EMITTED (post-SDK) result respects the cap through the real
         headers: {
           "content-type": "application/json",
           "mcp-method": "tools/call",
+          "mcp-protocol-version": "2026-07-28",
           "mcp-name": "parity_empty",
         },
         body: JSON.stringify({
@@ -670,6 +673,7 @@ describe("G5 — the EMITTED (post-SDK) result respects the cap through the real
         headers: {
           "content-type": "application/json",
           "mcp-method": "tools/call",
+          "mcp-protocol-version": "2026-07-28",
           "mcp-name": "parity_chat",
         },
         body: JSON.stringify({

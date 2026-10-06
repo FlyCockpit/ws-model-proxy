@@ -545,7 +545,7 @@ export async function deleteOrphanAutoCapacities(
        AND NOT EXISTS (SELECT 1 FROM capacity_lease l WHERE l."capacityId" = c.id AND l.state = 'ACTIVE')
        AND NOT EXISTS (SELECT 1 FROM capacity_waiter w WHERE w."capacityId" = c.id AND w.state = 'WAITING')`
            : Prisma.empty
-}
+       }
   `);
 }
 

@@ -78,7 +78,11 @@ const ENVELOPE = {
 function modernRequest(method: string, id: number, extraParams: object = {}) {
   return new Request("http://proxy.example.com/mcp", {
     method: "POST",
-    headers: { "content-type": "application/json", "mcp-method": method },
+    headers: {
+      "content-type": "application/json",
+      "mcp-method": method,
+      "mcp-protocol-version": "2026-07-28",
+    },
     body: JSON.stringify({
       jsonrpc: "2.0",
       id,
@@ -94,6 +98,7 @@ function toolCallRequest(id: number, tool: string) {
     headers: {
       "content-type": "application/json",
       "mcp-method": "tools/call",
+      "mcp-protocol-version": "2026-07-28",
       "mcp-name": tool,
     },
     body: JSON.stringify({

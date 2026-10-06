@@ -50,6 +50,6 @@ RUN mkdir -p \
     "$PNPM_HOME" "$COREPACK_HOME" "$HOME" \
   && chmod -R a+rwX /app "$PNPM_HOME" "$COREPACK_HOME" "$HOME" \
   && corepack enable --install-directory "$PNPM_HOME" \
-  && corepack prepare pnpm@11.1.2 --activate
+  && corepack prepare pnpm@11.28.2 --activate
 
 WORKDIR /app
