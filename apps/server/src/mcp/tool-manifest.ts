@@ -40,6 +40,7 @@ import {
   adaptCliSupervisedStartInput,
   CLI_AGENT_ACTIVITY_NOTICE,
   CLI_COMMAND_OUTPUT_NOTICE,
+  CLI_HEADLESS_COMMAND_LIFETIME_NOTICE,
   CLI_SUPERVISED_COMMAND_NOTICE,
   runForwarderCliCommand,
   runForwarderCliCommandResult,
@@ -1505,7 +1506,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     scope: "write",
     confirmation: "RUN",
     classification: "external",
-    descriptionNote: CLI_COMMAND_OUTPUT_NOTICE,
+    descriptionNote: `${CLI_HEADLESS_COMMAND_LIFETIME_NOTICE} ${CLI_COMMAND_OUTPUT_NOTICE}`,
     deliverDespiteAbort: true,
     coreShape: {
       cliDeviceId: z.string(),

@@ -69,6 +69,10 @@ export const CLI_AGENT_ACTIVITY_NOTICE =
   "Lists what agents did on the caller's CLI devices (commands, supervised commands and file operations) newest first, as metadata only: kind, outcome, path (for commands a keyed HMAC-SHA256 of the command text plus the program name, never the command text itself), sizes and timestamps. Supervised file audit reasons use <op>:<code> (for example write:completed or edit:conflict); headless file reasons use <code>. File content, diffs and command output are never stored. Rows are kept for 90 days. Optional cliDeviceId, limit (1-100) and cursor (the previous nextCursor).";
 
 /** Shown on the supervised tool: what the agent can and cannot learn. */
+/** Lifetime of a headless command; agents keep trying `nohup server &`. */
+export const CLI_HEADLESS_COMMAND_LIFETIME_NOTICE =
+  "Lifetime: the command keeps running after this tool returns at waitMs (poll forwarder_cli_command_result), but when its shell exits every process still in the command's process group is killed, so `cmd &` and `nohup cmd &` end with the shell (on Windows the whole job tree ends). Everything is killed at the 10-minute cap. Do not start long-lived servers here: run them as a systemd unit or a deployment.";
+
 export const CLI_SUPERVISED_COMMAND_NOTICE =
   "Opens a terminal on the CLI that shows the person your reason and the exact command; nothing runs until they press Enter there, and they may decline. Poll forwarder_cli_command_result with the commandId (statuses: awaiting_user, running, awaiting_output_review, exited, declined, expired, cancelled, rejected; declined, expired and rejected never ran, and an ended request reports started: true, false, or null when not known yet). Output is returned only with shareOutput: true, and the person may review, edit, or redact it first; output.mode says which (shared, reviewed, redacted, private). Waiting for the person expires after 15 minutes.";
 
