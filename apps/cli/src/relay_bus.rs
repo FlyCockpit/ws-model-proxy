@@ -80,6 +80,7 @@ pub(crate) enum FromWorker {
     /// `stt.*` encoder path.
     Stt {
         session_id: String,
-        message: crate::protocol::ClientControlMessage,
+        /// Boxed: control messages are large next to the other variants.
+        message: Box<crate::protocol::ClientControlMessage>,
     },
 }

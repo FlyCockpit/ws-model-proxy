@@ -216,7 +216,7 @@ fn pump(
             session_id,
             message,
         }) = rx.recv_timeout(Duration::from_millis(20))
-            && let Some(message) = registry.outbound(&session_id, message)
+            && let Some(message) = registry.outbound(&session_id, *message)
         {
             sent.push(message);
         }
@@ -274,7 +274,7 @@ fn stream_audio(
                 session_id,
                 message,
             }) = rx.recv_timeout(Duration::from_millis(20))
-                && let Some(message) = registry.outbound(&session_id, message)
+                && let Some(message) = registry.outbound(&session_id, *message)
             {
                 sent.push(message);
             }
@@ -886,7 +886,7 @@ fn a_burst_of_small_frames_within_credit_stalls_instead_of_failing() {
                 message,
             }) = rx.try_recv()
             {
-                let message = registry.outbound(&session_id, message);
+                let message = registry.outbound(&session_id, *message);
                 assert!(
                     !matches!(message, Some(ClientControlMessage::SttError { .. })),
                     "{message:?}"

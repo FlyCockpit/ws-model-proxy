@@ -1609,7 +1609,7 @@ where
                 session_id,
                 message,
             }) => {
-                if let Some(message) = stt.outbound(&session_id, message) {
+                if let Some(message) = stt.outbound(&session_id, *message) {
                     send_stt(socket, stt, message)?;
                 }
             }

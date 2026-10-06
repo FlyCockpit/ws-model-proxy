@@ -740,7 +740,7 @@ fn error(session_id: &str, failure: RelayFailure, message: &str) -> ClientContro
 fn emit(tx: &SyncSender<FromWorker>, session_id: &str, message: ClientControlMessage) -> bool {
     tx.send(FromWorker::Stt {
         session_id: session_id.to_string(),
-        message,
+        message: Box::new(message),
     })
     .is_ok()
 }
