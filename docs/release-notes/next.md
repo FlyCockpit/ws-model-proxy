@@ -328,6 +328,11 @@ assignment provenance and automatic concurrency seed columns.
   needs HTTPS or localhost. Stop ends the session without transcribing the
   turn in progress; use End turn first.
 
+- **Chat Test follows the force-2FA policy.** While two-factor authentication
+  is required, Chat Test requests (`/api/internal/chat-test/*`) from a user who
+  has not enrolled are refused with 403 `two_factor_required`, as the rest of
+  the dashboard already is.
+
 - **Live transcription sessions (`GET /v1/realtime?intent=transcription`).**
   A WebSocket API following the OpenAI Realtime GA transcription events
   (`session.update`, `input_audio_buffer.append/commit/clear`; transcription

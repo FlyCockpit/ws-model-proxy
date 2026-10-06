@@ -234,8 +234,9 @@ export default defineConfig(({ mode }) => {
           changeOrigin: true,
           secure: false,
         },
-        // Chat Test → Live transcription connects to the public realtime socket.
-        "/v1/realtime": {
+        // Chat Test → Live transcription: the dashboard-signed realtime socket.
+        // Listed before `/api` so the upgrade is not swallowed by the HTTP proxy.
+        "/api/internal/chat-test/realtime": {
           target: devProxyTarget.ws,
           ws: true,
           changeOrigin: true,

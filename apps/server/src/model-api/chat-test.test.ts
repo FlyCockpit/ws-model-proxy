@@ -441,6 +441,7 @@ function appWith(
   manager: FakeRelayManager,
   authSession: Session | null = session,
   capacityRuntime: CapacityAdmissionRuntime = admittingCapacityRuntime(),
+  twoFactorRequired: () => Promise<boolean> = async () => false,
 ) {
   const app = new Hono<{ Variables: { session: Session | null } }>();
   app.use("*", async (c, next) => {
@@ -453,6 +454,7 @@ function appWith(
       manager,
       concurrencyLimiter: new ModelApiConcurrencyLimiter(),
       capacityRuntime,
+      twoFactorRequired,
     }),
   );
   return app;
@@ -520,6 +522,72 @@ describe("chat test routes", () => {
 
     expect(response.status).toBe(401);
     expect(mockedTokenAccess.listVisibleModelTargetsForUser).not.toHaveBeenCalled();
+  });
+
+  it.each(["/chat/completions", "/responses", "/messages"])(
+    "refuses %s to an unenrolled user while 2FA is forced, before any work",
+    async (path) => {
+      const manager = new FakeRelayManager();
+      const policy = vi.fn(async () => true);
+      const response = await appWith(manager, session, admittingCapacityRuntime(), policy).request(
+        path,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: directTarget.modelId, messages: [] }),
+        },
+      );
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ error: { code: "two_factor_required" } });
+      expect(policy).toHaveBeenCalled();
+      expect(mockedTokenAccess.listVisibleModelTargetsForUser).not.toHaveBeenCalled();
+      expect(manager.sent).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ["an enrolled user while 2FA is forced", true, true],
+    ["an unenrolled user while the policy is off", false, false],
+  ])("serves %s", async (_label, enrolled, forced) => {
+    const manager = new FakeRelayManager();
+    const user = { ...session, user: { ...session.user, twoFactorEnabled: enrolled } } as Session;
+    const responsePromise = appWith(
+      manager,
+      user,
+      admittingCapacityRuntime(),
+      async () => forced,
+    ).request("/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: directTarget.modelId,
+        stream: true,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+    const response = await responsePromise;
+    manager.body(sent.requestId, "data: {}\n\n");
+    manager.complete(sent.requestId);
+    expect(response.status).toBe(200);
+  });
+
+  it("leaves a missing session to the routes' own 401 without reading the policy", async () => {
+    const policy = vi.fn(async () => true);
+    const response = await appWith(
+      new FakeRelayManager(),
+      null,
+      admittingCapacityRuntime(),
+      policy,
+    ).request("/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: directTarget.modelId, messages: [] }),
+    });
+    expect(response.status).toBe(401);
+    expect(policy).not.toHaveBeenCalled();
   });
 
   it("refuses a final requester revocation after admission without sending any relay request", async () => {

@@ -3,7 +3,7 @@ import type { ModelApiTokenIdentity } from "@ws-model-proxy/api/lib/model-api-to
 import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
-import { tokenRequester } from "./requester.js";
+import { dashboardRequester, tokenRequester } from "./requester.js";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
@@ -331,6 +331,44 @@ describe("realtime socket events", () => {
       expect.objectContaining({ candidate: null, closeCode: null, sentAudioBytes: 0 }),
     );
     expect(meter.opened).not.toHaveBeenCalled();
+  });
+
+  it("attributes a /v1/realtime session to its token and a Chat Test session to no token", () => {
+    const meter = { opened: vi.fn(), itemFinished: vi.fn(), ended: vi.fn() };
+    const createMeter = vi.fn(() => meter);
+    const authorizeOpen = vi.fn(() => async () => ({ ok: true as const }));
+    const t = deps({ createMeter, authorizeOpen });
+    const dashboard = dashboardRequester("user-1", "sess-1");
+    const chatTestAdmission = t.counters.acquire({
+      tokenId: dashboard.limitKey,
+      userId: dashboard.userId,
+    });
+    if (!chatTestAdmission.ok) throw new Error("cap");
+    for (const auth of [
+      admitted(t),
+      { requester: dashboard, admission: chatTestAdmission.admission, model: null },
+    ]) {
+      const events = realtimeSocketEvents(auth, t.deps);
+      const { ws } = fakeWs();
+      events.onOpen?.(new Event("open"), ws);
+      events.onClose?.(new CloseEvent("close"), ws);
+    }
+    expect(createMeter.mock.calls).toEqual([
+      [
+        {
+          userId: TOKEN.userId,
+          source: "API_TOKEN",
+          tokenId: TOKEN.id,
+          tokenLookupPrefix: TOKEN.lookupPrefix,
+        },
+      ],
+      [{ userId: "user-1", source: "CHAT_TEST", tokenId: null, tokenLookupPrefix: null }],
+    ]);
+    expect(authorizeOpen.mock.calls).toEqual([
+      [{ tokenId: TOKEN.id, userId: TOKEN.userId }],
+      [{ tokenId: null, userId: "user-1" }],
+    ]);
+    expect(t.counters.count("server")).toBe(0);
   });
 
   it("gives the admission back when the handshake never opens", () => {

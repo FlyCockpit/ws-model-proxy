@@ -127,8 +127,10 @@ describe("Chat Test realtime upgrade (dashboard login)", () => {
     expect(seen[0]?.model).toBe("owner/asr");
     // The split-origin web app is a dashboard origin too.
     expect((await hono.request(PATH, upgrade({ Origin: WEB }))).status).toBe(200);
-    expect(t.counters.count({ tokenId: "chat-test:user-1" })).toBe(2);
-    expect(t.counters.count({ userId: "user-1" })).toBe(2);
+    // A default port is the same origin.
+    expect((await hono.request(PATH, upgrade({ Origin: `${APP}:443` }))).status).toBe(200);
+    expect(t.counters.count({ tokenId: "chat-test:user-1" })).toBe(3);
+    expect(t.counters.count({ userId: "user-1" })).toBe(3);
   });
 
   it.each([
@@ -136,6 +138,9 @@ describe("Chat Test realtime upgrade (dashboard login)", () => {
     ["a foreign Origin", { Origin: "https://evil.example" }],
     ["a look-alike Origin", { Origin: "https://proxy.example.test.evil.example" }],
     ["a malformed Origin", { Origin: "null" }],
+    ["the app host over another scheme", { Origin: "http://proxy.example.test" }],
+    ["the app host on another port", { Origin: "https://proxy.example.test:8443" }],
+    ["the web host on another port", { Origin: "https://web.example.test:3001" }],
   ])("refuses %s with 403 before reading the session", async (_label, headers) => {
     const t = deps();
     const { hono, checkSession } = app(t.deps);
