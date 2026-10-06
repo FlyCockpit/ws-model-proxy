@@ -3,16 +3,16 @@
 //! The server defines them in the node part of `runtime.define`
 //! (`node.metricCommands`, at most 16, frozen with the rest at Relay only).
 //! There is no local hash approval any more: what the server may define
-//! follows the node's trust. The daemon hands the list to [`Runner`]; the
-//! define handling that fills it lands with the runtime store (C2), so until
-//! then the list is empty.
+//! follows the node's trust. The daemon hands the held (frozen at Relay
+//! only) list to [`Runner`] through the telemetry thread.
 //!
 //! A command runs every `intervalSecs` and prints numbers in one of three
 //! formats: `json` (an object of numbers), `prometheus` (text exposition) or
 //! `lines` (`<name> <number>` per line, or one bare number named after the
-//! command). The per-metric `map` (series selection, aggregation, scaling)
-//! belongs to the runtime metrics reader (`metrics_reader.rs`, C4); until
-//! then every valid series is reported as printed.
+//! command). Without a `map` every valid series is reported as printed; with
+//! one, each mapped metric is read from its series (a JSON pointer for
+//! `json`, a series name with optional labels otherwise), aggregated
+//! (default sum), scaled and optionally divided by another series.
 //!
 //! Every run is bounded: its own process group (killed as a whole on
 //! timeout), stdin closed, stderr discarded (never read, never uploaded),
@@ -34,7 +34,9 @@ use crate::bounded_run::RunError;
 use crate::protocol::frames::{
     CustomMetric, MetricCommandError, MetricCommandState, MetricCommandStatus,
 };
-use crate::protocol::runtime_spec::{MetricCommandFormat, NodeMetricCommand};
+use crate::protocol::runtime_spec::{
+    Aggregate, MetricCommandFormat, NodeMetricCommand, ReaderMapEntry,
+};
 use crate::protocol::{NODE_METRIC_COMMANDS_MAX, NODE_METRICS_CUSTOM_MAX};
 use crate::telemetry::{is_label_key, is_metric_name};
 
@@ -250,7 +252,7 @@ pub fn run_command(
 }
 
 /// A command as the runner sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CommandSpec {
     pub name: String,
     pub command: String,
@@ -258,6 +260,7 @@ pub struct CommandSpec {
     pub timeout_secs: u32,
     pub format: MetricCommandFormat,
     pub command_sha256: String,
+    pub map: Option<BTreeMap<String, ReaderMapEntry>>,
 }
 
 impl CommandSpec {
@@ -277,6 +280,7 @@ impl CommandSpec {
             timeout_secs,
             format: definition.format,
             command_sha256: sha256_hex(definition.command.as_bytes()),
+            map: definition.map.clone(),
         })
     }
 }
@@ -291,7 +295,106 @@ pub fn run_spec(
         Duration::from_secs(u64::from(spec.timeout_secs)),
         cancel,
     )?;
-    parse_output(spec.format, &spec.name, &output)
+    match &spec.map {
+        Some(map) => map_output(spec.format, map, &output),
+        None => parse_output(spec.format, &spec.name, &output),
+    }
+}
+
+fn aggregate(values: &[f64], how: Option<Aggregate>) -> Option<f64> {
+    match how.unwrap_or(Aggregate::Sum) {
+        Aggregate::Sum => (!values.is_empty()).then(|| values.iter().sum()),
+        Aggregate::Max => values.iter().copied().reduce(f64::max),
+        Aggregate::First => values.first().copied(),
+    }
+}
+
+/// Numbers at a JSON pointer: one number (booleans count 1/0), or every
+/// number in an array there.
+fn json_numbers(document: &serde_json::Value, pointer: &str) -> Vec<f64> {
+    let number = |value: &serde_json::Value| match value {
+        serde_json::Value::Bool(flag) => Some(if *flag { 1.0 } else { 0.0 }),
+        other => other.as_f64(),
+    };
+    match document.pointer(pointer) {
+        Some(serde_json::Value::Array(items)) => items.iter().filter_map(number).collect(),
+        Some(value) => number(value).into_iter().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// The values a series selector picks from parsed text series.
+fn series_numbers(
+    parsed: &[Series],
+    name: &str,
+    labels: Option<&BTreeMap<String, String>>,
+) -> Vec<f64> {
+    parsed
+        .iter()
+        .filter(|series| {
+            series.name == name
+                && labels.is_none_or(|wanted| {
+                    wanted
+                        .iter()
+                        .all(|(key, value)| series.labels.get(key) == Some(value))
+                })
+        })
+        .map(|series| series.value)
+        .collect()
+}
+
+/// Picks the numbers a selector (pointer or series name, plus labels) names.
+type SeriesPicker = dyn Fn(&str, Option<&BTreeMap<String, String>>) -> Vec<f64>;
+
+/// Apply a command's `map`: one series per mapped metric that resolved.
+pub fn map_output(
+    format: MetricCommandFormat,
+    map: &BTreeMap<String, ReaderMapEntry>,
+    bytes: &[u8],
+) -> Result<Vec<Series>, MetricCommandError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| MetricCommandError::Parse)?;
+    let pick: Box<SeriesPicker> = match format {
+        MetricCommandFormat::Json => {
+            let document: serde_json::Value =
+                serde_json::from_str(text).map_err(|_| MetricCommandError::Parse)?;
+            Box::new(move |pointer, _| json_numbers(&document, pointer))
+        }
+        MetricCommandFormat::Prometheus => {
+            let parsed = parse_prometheus(text);
+            Box::new(move |name, labels| series_numbers(&parsed, name, labels))
+        }
+        MetricCommandFormat::Lines => {
+            let parsed = parse_lines("value", text)?;
+            Box::new(move |name, labels| series_numbers(&parsed, name, labels))
+        }
+    };
+    let mut out = Vec::new();
+    for (metric, entry) in map {
+        let Some(mut value) =
+            aggregate(&pick(&entry.series, entry.labels.as_ref()), entry.aggregate)
+        else {
+            continue;
+        };
+        if let Some(scale) = entry.scale {
+            value *= scale;
+        }
+        if let Some(divide_by) = &entry.divide_by {
+            let Some(divisor) = aggregate(&pick(divide_by, entry.labels.as_ref()), entry.aggregate)
+            else {
+                continue;
+            };
+            if divisor == 0.0 {
+                continue;
+            }
+            value /= divisor;
+        }
+        out.extend(series(metric, BTreeMap::new(), value));
+    }
+    if out.is_empty() {
+        return Err(MetricCommandError::Parse);
+    }
+    out.truncate(NODE_METRICS_CUSTOM_MAX);
+    Ok(out)
 }
 
 #[derive(Debug)]
@@ -576,6 +679,58 @@ impl Runner {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mapped_metrics_select_aggregate_scale_and_divide() {
+        use crate::protocol::runtime_spec::{Aggregate, ReaderMapEntry};
+        let entry = |series: &str| ReaderMapEntry {
+            series: series.to_string(),
+            labels: None,
+            aggregate: None,
+            scale: None,
+            divide_by: None,
+        };
+        let mut map = BTreeMap::new();
+        map.insert("gpu_busy".to_string(), entry("/gpus"));
+        map.insert(
+            "mem_used_fraction".to_string(),
+            ReaderMapEntry {
+                divide_by: Some("/mem/total".into()),
+                ..entry("/mem/used")
+            },
+        );
+        map.insert(
+            "first_gpu".to_string(),
+            ReaderMapEntry {
+                aggregate: Some(Aggregate::First),
+                scale: Some(0.5),
+                ..entry("/gpus")
+            },
+        );
+        map.insert("missing".to_string(), entry("/nope"));
+        let output = br#"{"gpus":[10,20,true],"mem":{"used":3,"total":4}}"#;
+        let series = map_output(MetricCommandFormat::Json, &map, output).expect("mapped");
+        let value = |name: &str| series.iter().find(|s| s.name == name).map(|s| s.value);
+        assert_eq!(value("gpu_busy"), Some(31.0));
+        assert_eq!(value("mem_used_fraction"), Some(0.75));
+        assert_eq!(value("first_gpu"), Some(5.0));
+        assert_eq!(value("missing"), None);
+
+        let mut prom = BTreeMap::new();
+        prom.insert(
+            "busy".to_string(),
+            ReaderMapEntry {
+                labels: Some([("gpu".to_string(), "1".to_string())].into()),
+                aggregate: Some(Aggregate::Max),
+                ..entry("dcgm_util")
+            },
+        );
+        let text = b"dcgm_util{gpu=\"0\"} 5\ndcgm_util{gpu=\"1\"} 7\n";
+        let series = map_output(MetricCommandFormat::Prometheus, &prom, text).expect("mapped");
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].value, 7.0);
+        assert!(map_output(MetricCommandFormat::Json, &map, b"not json").is_err());
+    }
+
     use super::*;
 
     fn definition(name: &str, command: &str) -> NodeMetricCommand {

@@ -862,6 +862,8 @@ struct Session<'a> {
     runner: Option<crate::runtimes::runner::Runner>,
     /// The newest instance observation applied.
     observed_generation: u64,
+    /// The metric commands hash the telemetry thread runs.
+    metric_commands_applied: Option<String>,
 }
 
 /// What outlives one relay connection: the worker channel and the node
@@ -1011,6 +1013,7 @@ fn run_relay_session(
             })
             .ok(),
         observed_generation: 0,
+        metric_commands_applied: None,
     };
 
     let server_url = config.server_url.as_deref().unwrap_or_default();
@@ -1115,6 +1118,15 @@ fn run_relay_session(
                         &endpoints,
                     ));
                 }
+            }
+            // Node metric commands follow the held (frozen at Relay only)
+            // node definition.
+            let hash = session.runtimes.store.metric_commands_hash();
+            if hash != session.metric_commands_applied
+                && let Some(telemetry) = session.telemetry.as_ref()
+            {
+                telemetry.set_metric_commands(session.runtimes.store.metric_commands().to_vec());
+                session.metric_commands_applied = hash;
             }
             next_telemetry_sync = Instant::now() + TELEMETRY_SYNC_INTERVAL;
         }
