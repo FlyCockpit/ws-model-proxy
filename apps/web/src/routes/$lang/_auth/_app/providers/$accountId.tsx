@@ -146,6 +146,7 @@ function KeyCard({ account }: { account: Account }) {
   const action = useAction();
   const [secret, setSecret] = useState("");
   const [probe, setProbe] = useState<string | null>(null);
+  const [confirmRevoke, setConfirmRevoke] = useState(false);
   const replace = useMutation({
     ...orpc.providers.credentials.replace.mutationOptions(),
     meta: { skipGlobalErrorToast: true },
@@ -179,12 +180,11 @@ function KeyCard({ account }: { account: Account }) {
               onClick={async () => {
                 try {
                   const result = await test.mutateAsync({ accountId: account.id });
+                  const code = result.ok ? "ok" : (result.detail ?? "unexpected_status");
                   setProbe(
-                    result.ok
-                      ? t("dashboard:providers.testOk")
-                      : t("dashboard:providers.testFailed", {
-                          detail: result.detail ?? String(result.status ?? ""),
-                        }),
+                    t(`dashboard:providers.testResult.${code}`, {
+                      defaultValue: t("dashboard:providers.testResult.unexpected_status"),
+                    }),
                   );
                 } catch (error) {
                   toast.error(refusalText(error));
@@ -197,11 +197,41 @@ function KeyCard({ account }: { account: Account }) {
               variant="outline"
               size="touch"
               disabled={revoke.isPending}
-              onClick={() => action(() => revoke.mutateAsync({ credentialId: credential.id }))}
+              onClick={() => setConfirmRevoke(true)}
             >
               {t("dashboard:providers.revoke")}
             </Button>
           </div>
+        ) : null}
+        {credential ? (
+          <ResponsiveDialog
+            open={confirmRevoke}
+            onOpenChange={setConfirmRevoke}
+            title={t("dashboard:providers.revokeTitle")}
+            description={t("dashboard:providers.revokeHint")}
+            footer={
+              <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+                <Button variant="outline" size="touch" onClick={() => setConfirmRevoke(false)}>
+                  {t("common:actions.cancel")}
+                </Button>
+                <Button
+                  variant="destructive"
+                  size="touch"
+                  disabled={revoke.isPending}
+                  onClick={async () => {
+                    if (await action(() => revoke.mutateAsync({ credentialId: credential.id }))) {
+                      setConfirmRevoke(false);
+                      setProbe(null);
+                    }
+                  }}
+                >
+                  {t("dashboard:providers.revoke")}
+                </Button>
+              </div>
+            }
+          >
+            <span />
+          </ResponsiveDialog>
         ) : null}
         {probe ? (
           <p className="text-sm" role="status">
@@ -214,7 +244,10 @@ function KeyCard({ account }: { account: Account }) {
             event.preventDefault();
             if (!secret) return;
             const ok = await action(() => replace.mutateAsync({ accountId: account.id, secret }));
-            if (ok) setSecret("");
+            if (ok) {
+              setSecret("");
+              setProbe(null);
+            }
           }}
         >
           <div className="min-w-0 flex-1 space-y-1.5">

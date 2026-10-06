@@ -243,7 +243,6 @@
     "noKey": "Sin clave. La cuenta no se puede usar hasta que agregues una.",
     "test": "Probar clave",
     "testOk": "El proveedor aceptó la clave.",
-    "testFailed": "La prueba no pasó: {{detail}}.",
     "revoke": "Revocar clave",
     "replaceKey": "Clave nueva",
     "cap": "Límite mensual",
@@ -262,7 +261,20 @@
     "price": "{{input}} / {{output}} {{currency}} por millón de tokens",
     "delete": "Eliminar cuenta",
     "deleteTitle": "¿Eliminar {{name}}?",
-    "deleteHint": "Se revoca su clave y sus modelos salen de todos los pools. El historial de uso se conserva."
+    "deleteHint": "Se revoca su clave y sus modelos salen de todos los pools. El historial de uso se conserva.",
+    "revokeTitle": "¿Revocar esta clave?",
+    "revokeHint": "La cuenta se apaga y deja de funcionar hasta que agregues una clave nueva.",
+    "testResult": {
+      "ok": "El proveedor aceptó la clave.",
+      "no_key": "No hay clave que probar.",
+      "egress_disabled": "Las llamadas a la nube están apagadas en este servidor.",
+      "unsupported_provider": "Este tipo de proveedor no se puede probar.",
+      "unreachable": "No se pudo contactar al proveedor.",
+      "invalid_credential": "El proveedor rechazó la clave.",
+      "insufficient_permission": "No se pudo confirmar: la clave quizá no lista modelos, pero puede funcionar.",
+      "unverified": "No se pudo confirmar: este punto de acceso responde sin revisar claves.",
+      "unexpected_status": "El proveedor dio una respuesta inesperada."
+    }
   },
   "pool": {
     "new": "Nuevo pool",
@@ -363,7 +375,8 @@
       "membersHint": "Se prueban en este orden. Activa modelos de proveedor en",
       "noMembers": "Sin miembros de nube.",
       "add": "Agregar un modelo de proveedor activo",
-      "pickModel": "Elige un modelo de proveedor"
+      "pickModel": "Elige un modelo de proveedor",
+      "noCandidates": "No hay modelos de proveedor activos de este tipo. Activa uno en Proveedores."
     },
     "advanced": {
       "intro": "Estos ajustes son automáticos salvo que se sobrescriban. Los agentes pueden ajustarlos; cada cambio queda en el historial del pool.",
@@ -426,7 +439,23 @@
       "rules": "Reglas de enrutamiento por métricas",
       "rulesHint": "Los agentes las escriben; aquí puedes eliminarlas.",
       "noRules": "Sin reglas.",
-      "deleteRule": "Eliminar regla {{rule}}"
+      "deleteRule": "Eliminar regla {{rule}}",
+      "values": {
+        "tokenizer": "Tokenizador",
+        "template_aware": "Con plantilla",
+        "engine_reported": "Reportado por el motor",
+        "conservative_estimate": "Estimación conservadora",
+        "calibrated_estimate": "Estimación calibrada",
+        "AUTO": "Automático",
+        "ENFORCE": "Aplicar",
+        "OBSERVE": "Solo observar",
+        "equal_share": "Partes iguales",
+        "first_come": "Por orden de llegada",
+        "fixed_percent": "Porcentaje fijo",
+        "openai_chat_completions": "OpenAI Chat Completions",
+        "openai_responses": "OpenAI Responses",
+        "anthropic_messages": "Anthropic Messages"
+      }
     },
     "media": {
       "intro": "Envía imágenes, audio y video primero a otro pool; este pool recibe texto.",
@@ -442,7 +471,8 @@
         "IMAGE": "Un pool LLM describe cada imagen.",
         "AUDIO": "Un pool de transcripción convierte el audio en texto.",
         "VIDEO": "Un pool LLM describe cada video."
-      }
+      },
+      "unavailable": "{{id}} (ya no disponible)"
     }
   },
   "runtime": {

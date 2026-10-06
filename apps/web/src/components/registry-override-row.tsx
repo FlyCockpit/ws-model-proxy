@@ -61,7 +61,11 @@ export function RegistryOverrideRow({
         <span className="text-sm text-muted-foreground">
           {view?.effective === null || view?.effective === undefined
             ? t("dashboard:pool.advanced.unknown")
-            : String(view.effective)}
+            : typeof view.effective === "string"
+              ? t(`dashboard:pool.advanced.values.${view.effective}`, {
+                  defaultValue: view.effective,
+                })
+              : String(view.effective)}
           {"unit" in entry && entry.unit
             ? ` ${t(`dashboard:pool.advanced.units.${entry.unit}`)}`
             : ""}
@@ -78,7 +82,9 @@ export function RegistryOverrideRow({
             <option value="">{t("dashboard:pool.advanced.pick")}</option>
             {(entry.kind === "bool" ? ["true", "false"] : entry.values).map((value) => (
               <option key={value} value={value}>
-                {entry.kind === "bool" ? t(`dashboard:pool.advanced.bool.${value}`) : value}
+                {entry.kind === "bool"
+                  ? t(`dashboard:pool.advanced.bool.${value}`)
+                  : t(`dashboard:pool.advanced.values.${value}`, { defaultValue: value })}
               </option>
             ))}
           </NativeSelect>

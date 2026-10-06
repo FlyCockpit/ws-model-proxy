@@ -138,6 +138,11 @@ function SidecarCard({
               onChange={(event) => setTarget(event.target.value)}
             >
               <option value="">{t("dashboard:pool.media.none")}</option>
+              {current && !targets.some((option) => option.id === current.targetPoolId) ? (
+                <option value={current.targetPoolId}>
+                  {t("dashboard:pool.media.unavailable", { id: current.targetCallableId })}
+                </option>
+              ) : null}
               {targets.map((option) => (
                 <option key={option.id} value={option.id}>
                   {option.label}

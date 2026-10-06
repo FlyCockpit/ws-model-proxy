@@ -139,7 +139,10 @@ function AddAccountDialog({
       onSubmit: z.object({
         providerType: z.enum(["openrouter", "generic"]),
         label: z.string().trim().min(1, t("dashboard:providers.form.labelRequired")).max(120),
-        baseUrl: z.string().url(t("dashboard:providers.form.baseUrlInvalid")),
+        baseUrl: z
+          .string()
+          .url(t("dashboard:providers.form.baseUrlInvalid"))
+          .startsWith("https://", t("dashboard:providers.form.baseUrlInvalid")),
         authType: z.enum(["BEARER", "API_KEY"]),
         secret: z.string().min(1, t("dashboard:providers.form.keyRequired")).max(4_096),
         allowDataCollection: z.boolean(),
@@ -164,7 +167,11 @@ function AddAccountDialog({
   return (
     <ResponsiveDialog
       open={open}
-      onOpenChange={onOpenChange}
+      onOpenChange={(next) => {
+        // Never keep a pasted key around after the dialog closes.
+        if (!next) form.reset();
+        onOpenChange(next);
+      }}
       title={t("dashboard:providers.add")}
       description={t("dashboard:providers.addHint")}
     >
@@ -186,7 +193,17 @@ function AddAccountDialog({
                 onChange={(event) => {
                   const type = event.target.value === "generic" ? "generic" : "openrouter";
                   field.handleChange(type);
-                  if (type === "openrouter") form.setFieldValue("baseUrl", OPENROUTER_BASE_URL);
+                  if (type === "openrouter") {
+                    form.setFieldValue("baseUrl", OPENROUTER_BASE_URL);
+                    if (form.getFieldValue("label") === "")
+                      form.setFieldValue("label", "OpenRouter");
+                  } else {
+                    // Don't leave OpenRouter's defaults on an OpenAI-compatible account.
+                    if (form.getFieldValue("baseUrl") === OPENROUTER_BASE_URL)
+                      form.setFieldValue("baseUrl", "");
+                    if (form.getFieldValue("label") === "OpenRouter")
+                      form.setFieldValue("label", "");
+                  }
                 }}
               >
                 <option value="openrouter">OpenRouter</option>

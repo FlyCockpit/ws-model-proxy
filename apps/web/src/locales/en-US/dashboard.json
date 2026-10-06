@@ -243,7 +243,6 @@
     "noKey": "No key. The account cannot be used until you add one.",
     "test": "Test key",
     "testOk": "The provider accepted the key.",
-    "testFailed": "The test did not pass: {{detail}}.",
     "revoke": "Revoke key",
     "replaceKey": "New key",
     "cap": "Monthly cap",
@@ -262,7 +261,20 @@
     "price": "{{input}} / {{output}} {{currency}} per million tokens",
     "delete": "Delete account",
     "deleteTitle": "Delete {{name}}?",
-    "deleteHint": "Its key is revoked and its models leave every pool. Usage history stays."
+    "deleteHint": "Its key is revoked and its models leave every pool. Usage history stays.",
+    "revokeTitle": "Revoke this key?",
+    "revokeHint": "The account turns off and stops working until you add a new key.",
+    "testResult": {
+      "ok": "The provider accepted the key.",
+      "no_key": "There is no key to test.",
+      "egress_disabled": "Cloud calls are turned off on this server.",
+      "unsupported_provider": "This provider type cannot be tested.",
+      "unreachable": "The provider could not be reached.",
+      "invalid_credential": "The provider refused the key.",
+      "insufficient_permission": "Couldn't confirm: the key may not list models, but it may still work.",
+      "unverified": "Couldn't confirm: this endpoint answers without checking keys.",
+      "unexpected_status": "The provider gave an unexpected answer."
+    }
   },
   "pool": {
     "new": "New pool",
@@ -363,7 +375,8 @@
       "membersHint": "Tried in this order. Enable provider models under",
       "noMembers": "No cloud members.",
       "add": "Add an enabled provider model",
-      "pickModel": "Pick a provider model"
+      "pickModel": "Pick a provider model",
+      "noCandidates": "No enabled provider model of this type. Turn one on under Providers."
     },
     "advanced": {
       "intro": "These settings are automatic unless overridden. Agents may tune them; every change is recorded in the pool history.",
@@ -426,7 +439,23 @@
       "rules": "Metric routing rules",
       "rulesHint": "Agents write these; you can delete them here.",
       "noRules": "No rules.",
-      "deleteRule": "Delete rule {{rule}}"
+      "deleteRule": "Delete rule {{rule}}",
+      "values": {
+        "tokenizer": "Tokenizer",
+        "template_aware": "Template-aware",
+        "engine_reported": "Engine-reported",
+        "conservative_estimate": "Conservative estimate",
+        "calibrated_estimate": "Calibrated estimate",
+        "AUTO": "Automatic",
+        "ENFORCE": "Enforce",
+        "OBSERVE": "Observe only",
+        "equal_share": "Equal share",
+        "first_come": "First come",
+        "fixed_percent": "Fixed percent",
+        "openai_chat_completions": "OpenAI Chat Completions",
+        "openai_responses": "OpenAI Responses",
+        "anthropic_messages": "Anthropic Messages"
+      }
     },
     "media": {
       "intro": "Send images, audio and video to another pool first; this pool then gets text.",
@@ -442,7 +471,8 @@
         "IMAGE": "An LLM pool describes each image.",
         "AUDIO": "A transcription pool turns audio into text.",
         "VIDEO": "An LLM pool describes each video."
-      }
+      },
+      "unavailable": "{{id}} (no longer available)"
     }
   },
   "runtime": {

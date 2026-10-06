@@ -51,14 +51,16 @@ function CloudSettings({ pool }: { pool: PoolView }) {
     ...orpc.pools.cloud.setPaidWarmProtection.mutationOptions(),
     meta: { skipGlobalErrorToast: true },
   });
-  const run = async (work: () => Promise<unknown>) => {
+  const run = async (work: () => Promise<unknown>): Promise<boolean> => {
     try {
       await work();
       await queryClient.invalidateQueries({ queryKey: orpc.pools.key() });
       await queryClient.invalidateQueries({ queryKey: orpc.models.key() });
       toast.success(t("dashboard:pool.saved"));
+      return true;
     } catch (error) {
       toast.error(refusalText(error));
+      return false;
     }
   };
   const cloudMembers = pool.members.filter((member) => member.kind === "CLOUD");
@@ -181,25 +183,42 @@ function CloudSettings({ pool }: { pool: PoolView }) {
                     { providerModelId: choice },
                   ],
                 }),
-              ).then(() => setChoice(""));
+              ).then((ok) => {
+                if (ok) setChoice("");
+              });
             }}
           >
             <div className="min-w-0 flex-1 space-y-1.5">
               <Label htmlFor="cloud-add">{t("dashboard:pool.cloud.add")}</Label>
-              <NativeSelect
-                id="cloud-add"
-                value={choice}
-                onChange={(event) => setChoice(event.target.value)}
-              >
-                <option value="">{t("dashboard:pool.cloud.pickModel")}</option>
-                {candidates.map((model) => (
-                  <option key={model.id} value={model.id}>
-                    {model.displayName ?? model.upstreamModelId}
-                  </option>
-                ))}
-              </NativeSelect>
+              {providerModels.isPending ? (
+                <Skeleton className="h-11 w-full" />
+              ) : providerModels.isError ? (
+                <InlineRetry onRetry={() => providerModels.refetch()} />
+              ) : (
+                <NativeSelect
+                  id="cloud-add"
+                  value={choice}
+                  onChange={(event) => setChoice(event.target.value)}
+                >
+                  <option value="">{t("dashboard:pool.cloud.pickModel")}</option>
+                  {candidates.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {model.displayName ?? model.upstreamModelId}
+                    </option>
+                  ))}
+                </NativeSelect>
+              )}
+              {providerModels.isSuccess && candidates.length === 0 ? (
+                <p className="text-xs text-muted-foreground">
+                  {t("dashboard:pool.cloud.noCandidates")}
+                </p>
+              ) : null}
             </div>
-            <Button type="submit" size="touch" disabled={!choice || updatePool.isPending}>
+            <Button
+              type="submit"
+              size="touch"
+              disabled={!choice || updatePool.isPending || cloudMembers.length >= 16}
+            >
               {t("dashboard:pool.add")}
             </Button>
           </form>
