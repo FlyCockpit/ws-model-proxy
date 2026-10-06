@@ -177,9 +177,10 @@ describe("routing to procedures", () => {
 
 describe("through the bound router", () => {
   it("an agent reaches the stub procedure and gets NOT_IMPLEMENTED", async () => {
-    const result = await runMcpTool(tool("nodes_get"), {
+    // metrics.query is still a stub (lane B5); nodes.list is implemented now.
+    const result = await runMcpTool(tool("metrics_query"), {
       dispatch: testDispatch("READ"),
-      args: {},
+      args: { metrics: ["ttft_p95"], range: "24h", step: "5m", scope: { pool: "p" } },
     });
     expect(result.isError).toBe(true);
     expect(structured(result).error).toEqual({ code: "NOT_IMPLEMENTED" });

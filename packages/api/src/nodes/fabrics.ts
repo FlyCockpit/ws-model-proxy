@@ -166,21 +166,3 @@ export function fabricInUseRefusal() {
     "A running multi-node instance uses this fabric address. Stop it first.",
   );
 }
-
-/** A foreign-key violation (the RESTRICT from `runtime_instance.fabricId` on a fabric delete). */
-export function isForeignKeyViolation(error: unknown): boolean {
-  const seen = new Set<unknown>();
-  const pending: unknown[] = [error];
-  while (pending.length > 0) {
-    const candidate = pending.pop();
-    if (!candidate || typeof candidate !== "object" || seen.has(candidate)) continue;
-    seen.add(candidate);
-    for (const key of ["code", "originalCode"]) {
-      const code = Reflect.get(candidate, key);
-      if (code === "P2003" || code === "23503") return true;
-    }
-    for (const key of ["meta", "cause", "driverAdapterError"])
-      pending.push(Reflect.get(candidate, key));
-  }
-  return false;
-}

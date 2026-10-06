@@ -41,6 +41,7 @@ import {
   shareView,
   utcMonthStart,
 } from "../lib/access-views";
+import { isUniqueViolation, notFound } from "../lib/refuse";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
 import {
   generateShareInviteToken,
@@ -57,10 +58,6 @@ import {
 export const API_KEY_MAX_ACTIVE_PER_USER = 50;
 /** An API key may expire at most this far ahead (or never). */
 export const API_KEY_MAX_TTL_MS = 5 * 365 * 86_400_000;
-
-function notFound(): ORPCError<"NOT_FOUND", unknown> {
-  return new ORPCError("NOT_FOUND", { message: "Not found" });
-}
 
 function badRequest(message: string): ORPCError<"BAD_REQUEST", unknown> {
   return new ORPCError("BAD_REQUEST", { message });
@@ -84,10 +81,6 @@ async function notifyRevoked(
 
 function activeWhere(now: Date) {
   return { revokedAt: null, OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] };
-}
-
-function isUniqueViolation(error: unknown): boolean {
-  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002";
 }
 
 /** The month's spend (settled plus still reserved) per share cap. */
@@ -119,9 +112,9 @@ async function shareViews(rows: readonly ShareRow[]) {
 
 async function loadShareView(shareId: string) {
   const row = await prisma.share.findUnique({ where: { id: shareId }, select: shareSelect });
-  if (!row) throw notFound();
+  if (!row) throw notFound("That key, token, connection, share or invite does not exist.");
   const [view] = await shareViews([row]);
-  if (!view) throw notFound();
+  if (!view) throw notFound("That key, token, connection, share or invite does not exist.");
   return view;
 }
 
@@ -181,7 +174,8 @@ const apiKeys = {
           },
           select: { id: true },
         });
-        if (usable.length !== poolIds.length) throw notFound();
+        if (usable.length !== poolIds.length)
+          throw notFound("That key, token, connection, share or invite does not exist.");
       }
       return tx.apiKey.create({
         data: {
@@ -207,7 +201,7 @@ const apiKeys = {
       where: { id: input.apiKeyId, userId },
       select: { id: true, revokedAt: true },
     });
-    if (!key) throw notFound();
+    if (!key) throw notFound("That key, token, connection, share or invite does not exist.");
     if (!key.revokedAt) {
       await prisma.apiKey.updateMany({
         where: { id: key.id, userId, revokedAt: null },
@@ -301,7 +295,7 @@ const agentTokens = {
       where: { id: input.agentTokenId, userId },
       select: { id: true, grantId: true, revokedAt: true },
     });
-    if (!token) throw notFound();
+    if (!token) throw notFound("That key, token, connection, share or invite does not exist.");
     const now = new Date();
     await prisma.$transaction([
       prisma.agentToken.updateMany({
@@ -376,7 +370,8 @@ const oauthGrants = {
       where: { id: input.grantId, userId },
       select: { id: true, clientId: true, revokedAt: true },
     });
-    if (!grant || isMcpPatClientId(grant.clientId)) throw notFound();
+    if (!grant || isMcpPatClientId(grant.clientId))
+      throw notFound("That key, token, connection, share or invite does not exist.");
     const now = new Date();
     // Revoke every live token this client holds for the person and forget the consent, so
     // reconnecting asks again. TODO(server): pending authorization codes are not swept here
@@ -415,7 +410,7 @@ async function ownedPool(userId: string, poolId: string) {
     where: { id: poolId, userId },
     select: { id: true, slug: true, User: { select: { slug: true, name: true, locale: true } } },
   });
-  if (!pool) throw notFound();
+  if (!pool) throw notFound("That key, token, connection, share or invite does not exist.");
   return pool;
 }
 
@@ -451,7 +446,7 @@ async function writeInvite(
         where: { id: args.inviteId, ownerUserId: args.ownerUserId, ...pendingInviteWhere(now) },
         select: { createdAt: true, updatedAt: true },
       });
-      if (!invite) throw notFound();
+      if (!invite) throw notFound("That key, token, connection, share or invite does not exist.");
       if (now.getTime() - invite.updatedAt.getTime() < SHARE_INVITE_RESEND_COOLDOWN_MS) {
         throw new ORPCError("CONFLICT", {
           message: "This invite was just sent. Wait a minute before sending it again.",
@@ -462,7 +457,8 @@ async function writeInvite(
         where: { id: args.inviteId, ownerUserId: args.ownerUserId, ...pendingInviteWhere(now) },
         data: { tokenDigest, expiresAt, emailSentAt: null },
       });
-      if (rotated.count !== 1) throw notFound();
+      if (rotated.count !== 1)
+        throw notFound("That key, token, connection, share or invite does not exist.");
       return tx.shareInvite.findUniqueOrThrow({
         where: { id: args.inviteId },
         select: shareInviteSelect,
@@ -671,7 +667,7 @@ const shares = {
       where: { id: input.shareId, ownerUserId },
       select: { id: true, poolId: true, granteeUserId: true },
     });
-    if (!found) throw notFound();
+    if (!found) throw notFound("That key, token, connection, share or invite does not exist.");
     const touchesPolicy =
       input.canUse !== undefined ||
       input.canContribute !== undefined ||
@@ -687,7 +683,7 @@ const shares = {
         where: { id: found.id, ownerUserId },
         select: { canUse: true, canContribute: true, SpendCap: { select: { id: true } } },
       });
-      if (!share) throw notFound();
+      if (!share) throw notFound("That key, token, connection, share or invite does not exist.");
       const canUse = input.canUse ?? share.canUse;
       const canContribute = input.canContribute ?? share.canContribute;
       if (!canUse && !canContribute) {
@@ -749,7 +745,7 @@ const shares = {
       where: { id: input.shareId, OR: [{ ownerUserId: userId }, { granteeUserId: userId }] },
       select: { id: true, poolId: true, ownerUserId: true, granteeUserId: true },
     });
-    if (!share) throw notFound();
+    if (!share) throw notFound("That key, token, connection, share or invite does not exist.");
     await runAccessTransaction({ owners: [share.ownerUserId, share.granteeUserId] }, (tx) =>
       tx.share.deleteMany({ where: { id: share.id } }),
     );
@@ -772,7 +768,7 @@ const shares = {
         Pool: { select: { Fallback: { select: { ownKeyEquivalentModel: true } } } },
       },
     });
-    if (!share) throw notFound();
+    if (!share) throw notFound("That key, token, connection, share or invite does not exist.");
     if (input.providerModelId !== null) {
       if (!share.Pool.Fallback?.ownKeyEquivalentModel) {
         throw new ORPCError("FORBIDDEN", {
@@ -783,7 +779,7 @@ const shares = {
         where: { id: input.providerModelId, userId: granteeUserId, deletedAt: null },
         select: { id: true },
       });
-      if (!model) throw notFound();
+      if (!model) throw notFound("That key, token, connection, share or invite does not exist.");
     }
     await prisma.share.update({
       where: { id: share.id },
@@ -806,7 +802,7 @@ const invites = {
       where: { id: ownerUserId },
       select: { name: true, locale: true },
     });
-    if (!owner) throw notFound();
+    if (!owner) throw notFound("That key, token, connection, share or invite does not exist.");
     const written = await writeInvite({ mode: "resend", ownerUserId, inviteId: input.inviteId });
     return deliverInvite({ ...written, owner });
   }),
@@ -817,7 +813,7 @@ const invites = {
       where: { id: input.inviteId, ownerUserId },
       select: { id: true, acceptedAt: true, revokedAt: true },
     });
-    if (!invite) throw notFound();
+    if (!invite) throw notFound("That key, token, connection, share or invite does not exist.");
     if (invite.acceptedAt) {
       throw new ORPCError("CONFLICT", {
         message: "This invite was accepted. Delete the share instead.",

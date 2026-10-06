@@ -9,7 +9,8 @@ import type { Context } from "../context";
 import { contractProcedure } from "../contract-procedure";
 import { agentRulesApply, isHumanCaller } from "../contracts/auth-context";
 import { profilesContract as c, type profileViewSchema } from "../contracts/profiles";
-import { assertMayWrite, callerActor } from "../lib/caller";
+import { assertMayWrite, callerActor } from "../lib/caller-actor";
+import { graphDelete, graphWrite } from "../lib/graph-write";
 import { planProfileHolds } from "../lib/profile-holds";
 import { planProfileSave } from "../lib/profile-save";
 import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
@@ -198,7 +199,7 @@ async function loadProfileViews(userId: string, profileId?: string): Promise<Pro
 
 async function loadProfileView(userId: string, profileId: string): Promise<ProfileView> {
   const [view] = await loadProfileViews(userId, profileId);
-  if (!view) throw notFound("Profile");
+  if (!view) throw notFound("That profile does not exist.");
   return view;
 }
 
@@ -221,7 +222,7 @@ async function loadPlanInput(context: Context, userId: string, profileId: string
       },
     },
   });
-  if (!profile) throw notFound("Profile");
+  if (!profile) throw notFound("That profile does not exist.");
   const ownedIds = profile.Nodes.map((node) => node.nodeId);
   const now = new Date();
   const [nodes, versions, instances, claims, fabrics] = await Promise.all([
@@ -353,7 +354,7 @@ export const profileProcedures = {
   save: contractProcedure(c.save).handler(async ({ context, input }) => {
     assertMayWrite(context.auth);
     const userId = context.session.user.id;
-    const actor = callerActor(context.auth);
+    const actor = callerActor(context.auth, userId);
     const person = isHumanCaller(context.auth);
     const nodeIds = [...new Set(input.nodeIds)];
     if (nodeIds.length !== input.nodeIds.length)
@@ -361,7 +362,7 @@ export const profileProcedures = {
 
     let profileId: string;
     try {
-      profileId = await prisma.$transaction(async (tx) => {
+      profileId = await graphWrite([userId], async (tx) => {
         const owned = await tx.node.findMany({
           where: { userId, id: { in: nodeIds } },
           select: { id: true },
@@ -379,7 +380,7 @@ export const profileProcedures = {
               },
             })
           : null;
-        if (input.profileId && !existing) throw notFound("Profile");
+        if (input.profileId && !existing) throw notFound("That profile does not exist.");
 
         // Hold lines are people's: lib/profile-save.ts is the one rule (security).
         const savePlan = planProfileSave({
@@ -523,13 +524,13 @@ export const profileProcedures = {
   delete: contractProcedure(c.delete).handler(async ({ context, input }) => {
     assertMayWrite(context.auth);
     const userId = context.session.user.id;
-    await prisma.$transaction(async (tx) => {
+    await graphDelete({ userId, profileIds: [input.profileId] }, async (tx) => {
       await lockProfileRows(tx, userId, input.profileId, []);
       const profile = await tx.profile.findFirst({
         where: { id: input.profileId, userId },
         select: { id: true, Nodes: { where: { hold: true }, select: { nodeId: true } } },
       });
-      if (!profile) throw notFound("Profile");
+      if (!profile) throw notFound("That profile does not exist.");
       if (agentRulesApply(context.auth)) {
         // Deleting drops hold lines and releases the holds the profile set: people only.
         const holding = await tx.node.count({ where: { userId, holdProfileId: profile.id } });
@@ -565,9 +566,9 @@ export const profileProcedures = {
         ? refuseAbout(first.reason, first.subjectId, first.message)
         : refuse(first.reason, first.message);
 
-    const actor = callerActor(context.auth);
+    const actor = callerActor(context.auth, userId);
     const now = new Date();
-    const operation = await prisma.$transaction(async (tx) => {
+    const operation = await graphWrite([userId], async (tx) => {
       const created = await tx.runtimeOperation.create({
         data: {
           userId,
@@ -575,6 +576,7 @@ export const profileProcedures = {
           actor: actor.actor,
           actorUserId: userId,
           agentTokenId: actor.agentTokenId,
+          mcpGrantId: actor.mcpGrantId,
           profileId: profile.id,
           summary: toJsonValue(plan.preview),
           fingerprint: plan.preview.fingerprint,

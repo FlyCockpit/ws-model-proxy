@@ -20,10 +20,11 @@ import {
   type previewWarningSchema,
   type startPreviewSchema,
 } from "../contracts/runtimes";
-import { callerActor, notFound, refusal } from "../lib/caller-actor";
+import { callerActor } from "../lib/caller-actor";
 import { canonicalJson } from "../lib/canonical-json";
 import { graphWrite, instanceCapacityFences } from "../lib/graph-write";
 import { previewFingerprint } from "../lib/preview-fingerprint";
+import { notFound, refuse, refuseAbout } from "../lib/refuse";
 import { runtimeSpecWarnings } from "../lib/runtime-spec";
 import { effectiveTrust, specIsInteractive, type Tx } from "../lib/runtime-store";
 import { INSTANCE_INCLUDE, instanceView, storedSpec } from "../lib/runtime-views";
@@ -340,7 +341,7 @@ async function operationView(operationId: string) {
 
 function throwFirstRefusal(refusals: readonly Refusal[]): void {
   const first = refusals[0];
-  if (first) throw refusal(first.reason, first.message, first.subjectId);
+  if (first) throw refuseAbout(first.reason, first.subjectId, first.message);
 }
 
 export const runtimeStart = contractProcedure(c.start).handler(async ({ input, context }) => {
@@ -352,7 +353,7 @@ export const runtimeStart = contractProcedure(c.start).handler(async ({ input, c
   // People apply exactly the preview they saw (D13); agents may omit the fingerprint.
   const person = isHumanCaller(context.auth);
   if (person && !input.fingerprint)
-    throw refusal("preview_required", "Preview the start first, then confirm it.");
+    throw refuse("preview_required", "Preview the start first, then confirm it.");
   const actor = callerActor(context.auth, userId);
   const restartId = input.instanceId;
   const operationId = await graphWrite(
@@ -360,7 +361,7 @@ export const runtimeStart = contractProcedure(c.start).handler(async ({ input, c
     async (tx) => {
       const computed = await computeStart(tx, context, input);
       if (input.fingerprint && input.fingerprint !== computed.preview.fingerprint)
-        throw refusal("preview_stale", "Things changed since the preview. Preview again.");
+        throw refuse("preview_stale", "Things changed since the preview. Preview again.");
       throwFirstRefusal(computed.preview.refusals);
       const operation = await tx.runtimeOperation.create({
         data: {
@@ -369,6 +370,7 @@ export const runtimeStart = contractProcedure(c.start).handler(async ({ input, c
           actor: actor.actor,
           actorUserId: actor.actorUserId,
           agentTokenId: actor.agentTokenId,
+          mcpGrantId: actor.mcpGrantId,
           summary: computed.preview as unknown as Prisma.InputJsonValue,
           fingerprint: computed.preview.fingerprint,
         },
@@ -466,10 +468,10 @@ export const runtimeStop = contractProcedure(c.stop).handler(async ({ input, con
       for (const instance of instances)
         for (const rank of instance.Ranks)
           if (!rank.Node || effectiveTrust(rank.Node) !== "FULL")
-            throw refusal(
+            throw refuseAbout(
               "trust_relay",
-              REFUSAL_MESSAGES.trust_relay ?? "trust_relay",
               rank.Node?.id ?? instance.id,
+              REFUSAL_MESSAGES.trust_relay ?? "trust_relay",
             );
     const ids = instances.map((instance) => instance.id);
     const operation = await tx.runtimeOperation.create({
@@ -479,6 +481,7 @@ export const runtimeStop = contractProcedure(c.stop).handler(async ({ input, con
         actor: actor.actor,
         actorUserId: actor.actorUserId,
         agentTokenId: actor.agentTokenId,
+        mcpGrantId: actor.mcpGrantId,
         summary: { stops: ids },
         fingerprint: createHash("sha256")
           .update(canonicalJson({ stops: ids }), "utf8")

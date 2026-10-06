@@ -189,6 +189,26 @@ const GRAPH_WRITERS: Record<string, string> = {
   "apps/server/src/relay/registration.ts": "M: relay registration",
   "apps/server/src/model-api/provider-attempt-runtime.ts":
     "H status: provider health and fencing (account -> model)",
+  "packages/api/src/lib/runtime-store.ts":
+    "M: runtime versions, written inside lane C's graphWrite (owner fence, then capacity fences of the runtime's instances)",
+  "packages/api/src/lib/share-invite-accept.ts":
+    "M: invite acceptance creates the share under both owners' fences (sorted), then the invite row",
+  "packages/api/src/nodes/fabrics.ts":
+    "M: fabric memberships, written inside nodes.update's graphWrite (owner fence first)",
+  "packages/api/src/nodes/procedures.ts":
+    "M: node definition, trust and fabrics under graphWrite (owner fence); node delete under graphDelete (fenceParentDelete)",
+  "packages/api/src/profiles/procedures.ts":
+    "M: profile save and apply under graphWrite (owner fence); profile delete under graphDelete (fenceParentDelete)",
+  "packages/api/src/routers/access.ts":
+    "M: API keys, agent tokens, shares and invites under runAccessTransaction (sorted owner fences)",
+  "packages/api/src/routers/pools.ts":
+    "M: pools, members, routing and sidecars under graphWrite (owner fence, then pool target policy fences)",
+  "packages/api/src/routers/providers.ts":
+    "M: provider accounts, keys, models and prices under graphWrite (owner fence, then model target policy fences)",
+  "packages/api/src/routers/runtime-lifecycle.ts":
+    "M: start/stop operations, instances and ranks under graphWrite (owner fence, then instance capacity fences)",
+  "packages/api/src/routers/runtimes.ts":
+    "M: runtimes, versions, models and shares under graphWrite / graphDelete",
   "packages/api/src/lib/pool-routing.ts":
     "H status: execution-target health and recovery trials, one row per statement",
   "packages/api/src/lib/engine-facts.ts":

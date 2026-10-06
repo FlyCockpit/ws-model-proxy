@@ -625,6 +625,8 @@ describe("cache affinity", () => {
       expect(overCap.nodes).toEqual([]);
       expect(overCap.parentTipDigest).toBeUndefined();
     },
+    // 100k-key objects are CPU-bound; a full workspace run shares the cores.
+    30_000,
   );
 
   it.each([true, false])(

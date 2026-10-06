@@ -5,13 +5,7 @@ import type { z } from "zod";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import type { poolAdvancedPatchSchema } from "../contracts/advanced";
 import { poolsContract as c, type routingRulesSchema } from "../contracts/pools";
-import {
-  type CallerActor,
-  callerActor,
-  isUniqueViolation,
-  notFound,
-  refusal,
-} from "../lib/caller-actor";
+import { type CallerActor, callerActor } from "../lib/caller-actor";
 import { cloudEgressEnabled } from "../lib/cloud-egress";
 import { graphDelete, graphWrite, modelTargetFences, poolTargetFences } from "../lib/graph-write";
 import { invalidatePoolRouting } from "../lib/pool-routing-invalidation";
@@ -25,6 +19,7 @@ import {
   poolView,
   type Traffic,
 } from "../lib/pool-views";
+import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
 import { applyJsonPatch, jsonObject } from "../lib/registry-view";
 import type { Tx } from "../lib/runtime-store";
 
@@ -112,6 +107,7 @@ async function audit(
       actor: input.actor.actor,
       actorUserId: input.actor.actorUserId,
       agentTokenId: input.actor.agentTokenId,
+      mcpGrantId: input.actor.mcpGrantId,
       action: input.action,
       resourceType: "pool",
       resourceId: input.poolId,
@@ -130,7 +126,7 @@ async function resolveOwnModel(db: Tx, userId: string, ref: MemberRef) {
     select: { id: true, type: true, retired: true },
   });
   if (!model)
-    throw refusal(
+    throw refuse(
       "not_your_runtime",
       "Only your own served models can be added; share holders add theirs with contribute.",
     );
@@ -139,10 +135,10 @@ async function resolveOwnModel(db: Tx, userId: string, ref: MemberRef) {
 
 function assertType(poolType: ModelType, modelType: ModelType, subjectId: string): void {
   if (poolType !== modelType)
-    throw refusal(
+    throw refuseAbout(
       "model_type_mismatch",
-      "This model's type does not match the pool's type.",
       subjectId,
+      "This model's type does not match the pool's type.",
     );
 }
 
@@ -197,7 +193,7 @@ async function applySidecars(
       continue;
     }
     if (sidecar.targetPoolId === pool.id)
-      throw refusal("sidecar_chain", "A pool cannot be its own sidecar.", pool.id);
+      throw refuseAbout("sidecar_chain", pool.id, "A pool cannot be its own sidecar.");
     const target = await db.pool.findFirst({
       where: {
         id: sidecar.targetPoolId,
@@ -214,17 +210,17 @@ async function applySidecars(
     });
     if (!target) throw notFound("That sidecar pool does not exist.");
     if (target.modelType !== SIDECAR_TARGET_TYPE[sidecar.input])
-      throw refusal(
+      throw refuseAbout(
         "model_type_mismatch",
-        "Images and video go to an LLM pool; audio goes to a transcription pool.",
         target.id,
+        "Images and video go to an LLM pool; audio goes to a transcription pool.",
       );
     // No chains: the target has no sidecar for this input, and nothing feeds this pool one.
     const feeds = await db.poolSidecar.count({
       where: { targetPoolId: pool.id, input: sidecar.input },
     });
     if (target.Sidecars.length > 0 || feeds > 0)
-      throw refusal("sidecar_chain", "Sidecar pools cannot be chained.", target.id);
+      throw refuseAbout("sidecar_chain", target.id, "Sidecar pools cannot be chained.");
     // Absent keeps the stored value (null clears it).
     const changes = {
       ...(sidecar.prompt !== undefined ? { prompt: sidecar.prompt } : {}),
@@ -425,7 +421,7 @@ async function humanSetter(
 
 function rethrowSlugTaken(error: unknown): never {
   if (isUniqueViolation(error))
-    throw refusal("slug_taken", "You already have a pool with this slug.");
+    throw refuse("slug_taken", "You already have a pool with this slug.");
   throw error;
 }
 
@@ -763,26 +759,26 @@ export const poolsRouter = {
         });
         if (!share) throw notFound("That pool is not shared with you.");
         if (!share.canContribute)
-          throw refusal(
+          throw refuseAbout(
             "contribute_not_allowed",
-            "This share does not allow contributing.",
             input.poolId,
+            "This share does not allow contributing.",
           );
         if (share.Pool.Routing?.ownHardwareOnly)
-          throw refusal(
+          throw refuseAbout(
             "own_hardware_only",
-            "The owner routes this pool to their own hardware only.",
             input.poolId,
+            "The owner routes this pool to their own hardware only.",
           );
         const model = await prisma.runtimeModel.findFirst({
           where: { id: input.runtimeModelId, userId },
           select: { id: true, type: true, retired: true },
         });
         if (!model)
-          throw refusal(
+          throw refuseAbout(
             "not_your_runtime",
-            "You can contribute only your own served models.",
             input.runtimeModelId,
+            "You can contribute only your own served models.",
           );
         assertType(share.Pool.modelType, model.type, model.id);
         if (model.retired)

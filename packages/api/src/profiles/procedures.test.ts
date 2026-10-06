@@ -7,6 +7,25 @@ vi.mock("@ws-model-proxy/db", () => ({
   default: mockDeep<PrismaClient>(),
   Prisma: { DbNull: "DbNull" },
 }));
+const fenceLog = vi.hoisted(() => ({ held: [] as string[], deletes: [] as unknown[] }));
+vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>();
+  return {
+    ...real,
+    acquireFences: vi.fn(async (_tx: unknown, requested: Iterable<string>) => {
+      fenceLog.held.push(...requested);
+      return true;
+    }),
+    fenceParentDelete: vi.fn(async (_tx: unknown, scope: unknown) => {
+      fenceLog.deletes.push(scope);
+      return [];
+    }),
+    runCapacityOrderedTransaction: vi.fn(
+      (db: { $transaction: (work: unknown) => unknown }, work: (tx: unknown) => unknown) =>
+        db.$transaction(work),
+    ),
+  };
+});
 vi.mock("@ws-model-proxy/env/server", () => ({ env: {} }));
 vi.mock("@ws-model-proxy/auth", () => ({ auth: { api: {} } }));
 vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
@@ -111,6 +130,8 @@ describe("profiles.apply", () => {
       mode: "applied",
       operation: { id: "op-1", kind: "PROFILE_APPLY" },
     });
+    // runtime_operation is a fenced graph table: the owner fence comes first.
+    expect(fenceLog.held.some((fence) => fence.startsWith("00:owner:"))).toBe(true);
     expect(db.runtimeOperation.create.mock.calls[0]?.[0]?.data).toMatchObject({
       kind: "PROFILE_APPLY",
       actor: "USER",
@@ -191,10 +212,11 @@ describe("profiles.save hold lines (people only)", () => {
   ] as const) {
     it(`refuses a ${label} that adds a hold line`, async () => {
       saveState(false);
-      await expect(client(auth).save({ ...base, holds: [{ nodeId: "a" }] })).rejects.toMatchObject({
-        code: "FORBIDDEN",
-        data: { reason: "human_only" },
-      });
+      await expect(client(auth).save({ ...base, holds: [{ nodeId: "a" }] })).rejects.toMatchObject(
+        auth === CSRF_LESS
+          ? { code: "FORBIDDEN" }
+          : { code: "FORBIDDEN", data: { reason: "human_only" } },
+      );
       expect(db.profile.updateMany).not.toHaveBeenCalled();
     });
 
@@ -202,9 +224,9 @@ describe("profiles.save hold lines (people only)", () => {
       saveState(true);
       db.node.findMany.mockReset();
       db.node.findMany.mockResolvedValueOnce([{ id: "b" }] as never);
-      await expect(client(auth).save({ ...base, nodeIds: ["b"] })).rejects.toMatchObject({
-        data: { reason: "human_only" },
-      });
+      await expect(client(auth).save({ ...base, nodeIds: ["b"] })).rejects.toMatchObject(
+        auth === CSRF_LESS ? { code: "FORBIDDEN" } : { data: { reason: "human_only" } },
+      );
     });
   }
 
@@ -349,6 +371,8 @@ describe("profiles.delete", () => {
     db.node.count.mockResolvedValueOnce(0);
     await client(FULL_AGENT).delete({ profileId: "p-1" });
     expect(db.profile.deleteMany).toHaveBeenCalled();
+    // A parent delete under fenceParentDelete (profile_node / profile_item cascade).
+    expect(fenceLog.deletes.at(-1)).toMatchObject({ profileIds: ["p-1"] });
   });
 
   it("refuses a read-only agent", async () => {
@@ -427,9 +451,9 @@ describe("hold writes on apply", () => {
     it(`refuses a ${label} when a person's hold lands after the plan`, async () => {
       heldPlan(false, free);
       db.node.findMany.mockResolvedValueOnce([{ id: "a", ...personHold }] as never);
-      await expect(client(auth).apply({ profileId: "p-1" })).rejects.toMatchObject({
-        data: { reason: "node_held" },
-      });
+      await expect(client(auth).apply({ profileId: "p-1" })).rejects.toMatchObject(
+        auth === CSRF_LESS ? { code: "FORBIDDEN" } : { data: { reason: "node_held" } },
+      );
       expect(db.node.updateMany).not.toHaveBeenCalled();
     });
 
@@ -457,10 +481,12 @@ describe("hold writes on apply", () => {
     });
   });
 
-  it("records a cookie without CSRF as an agent", async () => {
+  it("refuses a cookie without CSRF outright (it is neither a person nor an agent)", async () => {
     heldPlan(false, free);
-    await client(CSRF_LESS).apply({ profileId: "p-1" });
-    expect(db.runtimeOperation.create.mock.calls[0]?.[0]?.data).toMatchObject({ actor: "AGENT" });
+    await expect(client(CSRF_LESS).apply({ profileId: "p-1" })).rejects.toMatchObject({
+      code: "FORBIDDEN",
+    });
+    expect(db.runtimeOperation.create).not.toHaveBeenCalled();
   });
 });
 
@@ -546,7 +572,9 @@ describe("profiles.save races and empty hold lists", () => {
           items: [],
           holds: [],
         }),
-      ).rejects.toMatchObject({ data: { reason: "human_only" } });
+      ).rejects.toMatchObject(
+        auth === CSRF_LESS ? { code: "FORBIDDEN" } : { data: { reason: "human_only" } },
+      );
       expect(db.profileNode.deleteMany).not.toHaveBeenCalled();
       expect(db.profileNode.createMany).not.toHaveBeenCalled();
     });

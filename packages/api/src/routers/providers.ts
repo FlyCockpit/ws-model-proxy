@@ -10,7 +10,7 @@ import { fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { env } from "@ws-model-proxy/env/server";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import { providersContract as c } from "../contracts/providers";
-import { callerActor, isUniqueViolation, notFound } from "../lib/caller-actor";
+import { callerActor } from "../lib/caller-actor";
 import { cloudEgressEnabled } from "../lib/cloud-egress";
 import { graphWrite, modelTargetFences } from "../lib/graph-write";
 import { createProviderCatalog, fetchOpenRouterCatalogJson } from "../lib/provider-catalog";
@@ -40,6 +40,7 @@ import {
   moneyString,
   spendFor,
 } from "../lib/provider-views";
+import { isUniqueViolation, notFound } from "../lib/refuse";
 import type { Tx } from "../lib/runtime-store";
 
 function userIdOf(context: SignedInContext): string {
@@ -94,6 +95,7 @@ async function audit(
       actor: actor.actor,
       actorUserId: actor.actorUserId,
       agentTokenId: actor.agentTokenId,
+      mcpGrantId: actor.mcpGrantId,
       action: input.action,
       resourceType: "provider_account",
       resourceId: input.accountId,

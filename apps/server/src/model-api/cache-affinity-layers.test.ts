@@ -724,6 +724,8 @@ it.each([2, 8192, 100000])(
     // Keep mutation failures small even for the 100k-key object.
     expect(asJson(overCap) === undefined).toBe(true);
   },
+  // 100k-key objects are CPU-bound; a full workspace run shares the cores.
+  30_000,
 );
 
 it("R4 pins the literal affinity depth 128", () => {

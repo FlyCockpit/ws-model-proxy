@@ -6,8 +6,8 @@ import { RUNTIME_LIMIT_COLUMNS } from "@ws-model-proxy/config/runtime-defaults";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import type { z } from "zod";
 import type { runtimeAdvancedPatchSchema, runtimeLimitsPatchSchema } from "../contracts/advanced";
-import type { CallerActor } from "./caller-actor";
-import { refusal } from "./caller-actor";
+import { type CallerActor } from "./caller-actor";
+import { refuseAbout } from "./refuse";
 import { applyJsonPatch } from "./registry-view";
 import { runtimeContentHash, runtimeLaunchHash } from "./runtime-launch-hash";
 import type { RuntimeSpec } from "./runtime-spec";
@@ -134,6 +134,7 @@ export async function createVersion(
       editor: input.actor.actor,
       editorUserId: input.actor.actorUserId,
       agentTokenId: input.actor.agentTokenId,
+      mcpGrantId: input.actor.mcpGrantId,
       note: input.note,
       spec: input.spec as Prisma.InputJsonValue,
       ...derivedColumns(input.spec),
@@ -199,6 +200,6 @@ export async function ownedNode(userId: string, nodeId: string) {
     where: { id: nodeId, userId },
     select: { id: true, slug: true, trust: true, trustLowerRequestedAt: true },
   });
-  if (!node) throw refusal("unknown_node", "That node does not exist.", nodeId);
+  if (!node) throw refuseAbout("unknown_node", nodeId, "That node does not exist.");
   return node;
 }

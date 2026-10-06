@@ -138,7 +138,7 @@ export const enrollmentProcedures = {
             where: { id: input.replaceNodeId, userId },
             select: { id: true },
           });
-          if (!node) throw notFound("Node");
+          if (!node) throw notFound("That node does not exist.");
           // At most one live Replace code per node (`node_enrollment_replace_shape`): a new one
           // supersedes the previous.
           await tx.nodeEnrollmentCode.updateMany({
@@ -185,7 +185,7 @@ export const enrollmentProcedures = {
       where: { id: input.codeId, userId },
       select: { id: true, revokedAt: true },
     });
-    if (!code) throw notFound("Enrollment code");
+    if (!code) throw notFound("That enrollment code does not exist.");
     if (code.revokedAt === null)
       await prisma.nodeEnrollmentCode.updateMany({
         where: { id: code.id, userId, revokedAt: null },
@@ -233,7 +233,7 @@ export const credentialProcedures = {
       where: { id: input.credentialId, userId },
       select: { id: true, nodeId: true, revokedAt: true },
     });
-    if (!credential) throw notFound("Node credential");
+    if (!credential) throw notFound("That node credential does not exist.");
     if (credential.revokedAt === null) {
       await prisma.nodeCredential.updateMany({
         where: { id: credential.id, userId, revokedAt: null },

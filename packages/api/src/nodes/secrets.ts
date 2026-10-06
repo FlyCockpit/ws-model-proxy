@@ -9,7 +9,7 @@ import prisma from "@ws-model-proxy/db";
 import type { Context } from "../context";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import { nodesContract as c } from "../contracts/nodes";
-import { assertMayWrite, callerActor } from "../lib/caller";
+import { assertMayWrite, callerActor } from "../lib/caller-actor";
 import type { NodeSecretWriteResult } from "../lib/node-relay-services";
 import { notFound, refuseAbout } from "../lib/refuse";
 import { isFullControl } from "./trust";
@@ -27,7 +27,7 @@ async function secretTarget(context: SignedInContext, nodeId: string) {
       trustLowerRequestedAt: true,
     },
   });
-  if (!node) throw notFound("Node");
+  if (!node) throw notFound("That node does not exist.");
   if (!isFullControl(node))
     throw refuseAbout(
       "secret_needs_node",
@@ -82,7 +82,7 @@ async function auditSecret(
   subject: string,
   note: string | undefined,
 ): Promise<void> {
-  const actor = callerActor(context.auth);
+  const actor = callerActor(context.auth, userId);
   const now = new Date();
   await prisma.nodeAuditEvent.create({
     data: {
@@ -90,6 +90,7 @@ async function auditSecret(
       nodeId,
       actor: actor.actor,
       agentTokenId: actor.agentTokenId,
+      mcpGrantId: actor.mcpGrantId,
       kind: "node_update",
       subject,
       outcome: "completed",

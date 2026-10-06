@@ -7,6 +7,25 @@ vi.mock("@ws-model-proxy/db", () => ({
   default: mockDeep<PrismaClient>(),
   Prisma: { DbNull: "DbNull" },
 }));
+const fenceLog = vi.hoisted(() => ({ held: [] as string[], deletes: [] as unknown[] }));
+vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>();
+  return {
+    ...real,
+    acquireFences: vi.fn(async (_tx: unknown, requested: Iterable<string>) => {
+      fenceLog.held.push(...requested);
+      return true;
+    }),
+    fenceParentDelete: vi.fn(async (_tx: unknown, scope: unknown) => {
+      fenceLog.deletes.push(scope);
+      return [];
+    }),
+    runCapacityOrderedTransaction: vi.fn(
+      (db: { $transaction: (work: unknown) => unknown }, work: (tx: unknown) => unknown) =>
+        db.$transaction(work),
+    ),
+  };
+});
 vi.mock("@ws-model-proxy/db/node-security", () => ({
   credentialDigest: vi.fn((_purpose: string, secret: string) => `digest(${secret.length})`),
 }));
@@ -205,7 +224,7 @@ describe("nodes.update", () => {
   it("refuses everyone on a Relay-only node (trust_relay)", async () => {
     db.node.findFirst.mockResolvedValueOnce({ ...trustRow, trust: "RELAY" } as never);
     await expect(client().update({ nodeId: "node-1", labels: ["a"] })).rejects.toMatchObject({
-      code: "CONFLICT",
+      code: "FORBIDDEN",
       data: { reason: "trust_relay" },
     });
     expect(db.$transaction).not.toHaveBeenCalled();
@@ -382,6 +401,8 @@ describe("delete", () => {
     expect(out).toEqual({ deleted: true, stoppedInstances: ["i-1", "i-2"] });
     expect(db.node.delete).toHaveBeenCalledWith({ where: { id: "node-1" } });
     expect(disconnect).toHaveBeenCalledWith("node-1", "node_deleted");
+    // A parent delete: the node's whole fence set (fenceParentDelete) before any row.
+    expect(fenceLog.deletes.at(-1)).toMatchObject({ nodeIds: ["node-1"] });
   });
 });
 

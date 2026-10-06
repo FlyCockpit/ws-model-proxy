@@ -3,14 +3,15 @@ import prisma from "@ws-model-proxy/db";
 import { contractProcedure, type SignedInContext, stub } from "../contract-procedure";
 import { agentRulesApply } from "../contracts/auth-context";
 import { runtimesContract as c, runtimeSlugSchema } from "../contracts/runtimes";
+import { callerActor } from "../lib/caller-actor";
+import { graphDelete, graphWrite, runtimeCapacityFences } from "../lib/graph-write";
 import {
-  callerActor,
   isForeignKeyViolation,
   isUniqueViolation,
   notFound,
-  refusal,
-} from "../lib/caller-actor";
-import { graphDelete, graphWrite, runtimeCapacityFences } from "../lib/graph-write";
+  refuse,
+  refuseAbout,
+} from "../lib/refuse";
 import { jsonObject } from "../lib/registry-view";
 import { RUNTIME_PRESET_LIST } from "../lib/runtime-presets";
 import { type RuntimeSpec, runtimeSpecSchema, runtimeSpecWarnings } from "../lib/runtime-spec";
@@ -93,10 +94,10 @@ function assertAgentMayUseNode(
   node: { id: string; trust: "RELAY" | "FULL" | null; trustLowerRequestedAt: Date | null },
 ): void {
   if (agentRulesApply(context.auth) && effectiveTrust(node) !== "FULL")
-    throw refusal(
+    throw refuseAbout(
       "trust_relay",
-      "Agents may only use nodes at Full control. A person can do this in the browser.",
       node.id,
+      "Agents may only use nodes at Full control. A person can do this in the browser.",
     );
 }
 
@@ -170,7 +171,7 @@ async function createRuntime(context: SignedInContext, input: CreateInput) {
     });
   } catch (error) {
     if (isUniqueViolation(error))
-      throw refusal("slug_taken", "You already have a runtime with this slug.");
+      throw refuse("slug_taken", "You already have a runtime with this slug.");
     throw error;
   }
   const define =
@@ -471,10 +472,10 @@ export const runtimesRouter = {
 
     const launchChanged = hashes.launchHash !== current.launchHash;
     if (launchChanged && runtime.Node && effectiveTrust(runtime.Node) !== "FULL")
-      throw refusal(
+      throw refuseAbout(
         "launch_change_on_relay_only",
-        "This node is Relay only, so its always-on definition is frozen. Change it on the node, or raise trust with `wsmp trust full`.",
         runtime.Node.id,
+        "This node is Relay only, so its always-on definition is frozen. Change it on the node, or raise trust with `wsmp trust full`.",
       );
     // A served model that moves to another type would break the pools it is in.
     const nextType = derivedColumns(spec).modelType;
@@ -486,7 +487,7 @@ export const runtimesRouter = {
         },
       });
       if (conflicting > 0)
-        throw refusal(
+        throw refuse(
           "model_type_mismatch",
           "This runtime's models are in pools of another type. Remove them from those pools first.",
         );
@@ -587,6 +588,7 @@ export const runtimesRouter = {
               actor: actor.actor,
               actorUserId: actor.actorUserId,
               agentTokenId: actor.agentTokenId,
+              mcpGrantId: actor.mcpGrantId,
               summary: { restarts: restarted, versionId: created.id },
               fingerprint: hashes.contentHash,
             },
@@ -651,10 +653,10 @@ export const runtimesRouter = {
       },
     });
     if (busy > 0)
-      throw refusal("instances_running", "Stop this runtime's instances before deleting it.");
+      throw refuse("instances_running", "Stop this runtime's instances before deleting it.");
     const pinned = await prisma.profileItem.count({ where: { runtimeId: runtime.id } });
     if (pinned > 0)
-      throw refusal(
+      throw refuse(
         "pinned_by_profile",
         "A profile pins this runtime. Remove it from the profile first.",
       );
@@ -670,7 +672,7 @@ export const runtimesRouter = {
       });
     } catch (error) {
       if (isForeignKeyViolation(error))
-        throw refusal(
+        throw refuse(
           "pinned_by_profile",
           "A profile pins this runtime. Remove it from the profile first.",
         );

@@ -16,7 +16,7 @@ export async function loadNodeSummary(userId: string, nodeId: string, now = new 
     where: { id: nodeId, userId },
     select: nodeSummarySelect,
   });
-  if (!row) throw notFound("Node");
+  if (!row) throw notFound("That node does not exist.");
   return toNodeSummary(row, now);
 }
 
@@ -63,6 +63,6 @@ export async function loadNodeDetail(userId: string, nodeId: string, now = new D
     where: { id: nodeId, userId },
     select: nodeDetailSelect,
   });
-  if (!row) throw notFound("Node");
+  if (!row) throw notFound("That node does not exist.");
   return nodeDetailFromRow(userId, row, now);
 }

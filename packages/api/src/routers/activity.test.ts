@@ -121,13 +121,22 @@ describe("request log", () => {
       code: "FORBIDDEN",
     });
     db.relayRequest.findMany.mockResolvedValue([{ id: "r1" }] as never);
-    db.relayRequest.deleteMany.mockResolvedValue({ count: 1 });
+    db.$transaction.mockImplementation(async (work: unknown) =>
+      (work as (tx: typeof db) => Promise<unknown>)(db),
+    );
+    db.$executeRaw.mockResolvedValue(1);
     await expect(client().requests.delete({ ids: ["r1"] })).resolves.toEqual({ deleted: 1 });
-    expect(db.relayRequest.deleteMany.mock.calls[0]?.[0]?.where).toMatchObject({
+    // Only the caller's own finished rows are picked...
+    expect(db.relayRequest.findMany.mock.calls.at(-1)?.[0]?.where).toMatchObject({
       userId: "owner",
       status: { not: "PENDING" },
       OR: [{ resourceOwnerUserId: "owner" }, { resourceOwnerUserId: null }],
     });
+    // ...and deleted without waiting (SKIP LOCKED, terminal statuses re-checked).
+    const strings = (db.$executeRaw.mock.calls[0]?.[0] ?? []) as unknown as string[];
+    const sql = strings.join("?");
+    expect(sql).toContain("FOR UPDATE SKIP LOCKED");
+    expect(db.relayRequest.deleteMany).not.toHaveBeenCalled();
   });
 });
 

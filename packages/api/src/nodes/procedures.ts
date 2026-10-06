@@ -8,15 +8,21 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import type { Context } from "../context";
 import { contractProcedure } from "../contract-procedure";
 import { nodesContract as c } from "../contracts/nodes";
-import { assertMayWrite, callerActor } from "../lib/caller";
-import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
+import { assertMayWrite, callerActor } from "../lib/caller-actor";
+import { graphDelete, graphWrite } from "../lib/graph-write";
+import {
+  isForeignKeyViolation,
+  isUniqueViolation,
+  notFound,
+  refuse,
+  refuseAbout,
+} from "../lib/refuse";
 import { nodeMetricCommandsHash } from "../lib/runtime-launch-hash";
 import { nodeMetricCommandsSchema } from "../lib/runtime-spec";
 import {
   fabricInUseRefusal,
   fabricMemberNodeIds,
   isFabricMemberInUse,
-  isForeignKeyViolation,
   refreshFabricsHashes,
   replaceNodeFabrics,
 } from "./fabrics";
@@ -79,18 +85,18 @@ export const nodeProcedures = {
         heldMetricCommandsHash: true,
       },
     });
-    if (!node) throw notFound("Node");
+    if (!node) throw notFound("That node does not exist.");
     if (!isFullControl(node)) throw relayOnly(node.id);
     if (input.metricCommands) nodeMetricCommandsSchema.parse(input.metricCommands);
 
     const changed = (
       ["labels", "portRange", "hardware", "metricCommands", "fabrics", "commandMaxMs"] as const
     ).filter((field) => input[field] !== undefined);
-    const actor = callerActor(context.auth);
+    const actor = callerActor(context.auth, userId);
     let pushTo: string[] = [];
 
     try {
-      pushTo = await prisma.$transaction(async (tx) => {
+      pushTo = await graphWrite([userId], async (tx) => {
         const metricCommands = input.metricCommands;
         // Conditional on Full control, so a lower that commits after the read above wins.
         const written = await tx.node.updateMany({
@@ -132,6 +138,7 @@ export const nodeProcedures = {
               nodeId: node.id,
               actor: actor.actor,
               agentTokenId: actor.agentTokenId,
+              mcpGrantId: actor.mcpGrantId,
               kind: "node_update",
               subject: `node:${changed.join(",")}`,
               outcome: "completed",
@@ -172,7 +179,7 @@ export const nodeProcedures = {
         ? { holdAt: new Date(), holdNote: input.note ?? null, holdProfileId: null }
         : { holdAt: null, holdNote: null, holdProfileId: null },
     });
-    if (updated.count === 0) throw notFound("Node");
+    if (updated.count === 0) throw notFound("That node does not exist.");
     return loadNodeSummary(userId, input.nodeId);
   }),
 
@@ -185,7 +192,7 @@ export const nodeProcedures = {
           input.removeAfterOfflineMs === null ? null : BigInt(input.removeAfterOfflineMs),
       },
     });
-    if (updated.count === 0) throw notFound("Node");
+    if (updated.count === 0) throw notFound("That node does not exist.");
     return loadNodeSummary(userId, input.nodeId);
   }),
 
@@ -195,18 +202,18 @@ export const nodeProcedures = {
       where: { id: input.nodeId, userId },
       data: { name: input.name },
     });
-    if (updated.count === 0) throw notFound("Node");
+    if (updated.count === 0) throw notFound("That node does not exist.");
     return loadNodeSummary(userId, input.nodeId);
   }),
 
   delete: contractProcedure(c.delete).handler(async ({ context, input }) => {
     const userId = context.session.user.id;
-    const stopped = await prisma.$transaction(async (tx) => {
+    const stopped = await graphDelete({ userId, nodeIds: [input.nodeId] }, async (tx) => {
       const node = await tx.node.findFirst({
         where: { id: input.nodeId, userId },
         select: { id: true },
       });
-      if (!node) throw notFound("Node");
+      if (!node) throw notFound("That node does not exist.");
       // Its always-on runtimes go with it; a profile pinning one keeps the runtime (NoAction).
       const pinned = await tx.profileItem.findFirst({
         where: { Runtime: { userId, nodeId: node.id } },
@@ -261,7 +268,7 @@ export const nodeProcedures = {
         FabricMembers: { select: { fabricId: true, ip: true, Fabric: { select: { name: true } } } },
       },
     });
-    if (!node) throw notFound("Node");
+    if (!node) throw notFound("That node does not exist.");
     const frozen = await frozenParts(userId, node.id, node.heldDefinitions, node.metricCommands);
     const [openBrowserTerminals, queuedCommandsRefused, runningCommands] = await Promise.all([
       prisma.nodeAuditEvent.count({
@@ -294,7 +301,7 @@ export const nodeProcedures = {
   lowerTrust: contractProcedure(c.lowerTrust).handler(async ({ context, input }) => {
     const userId = context.session.user.id;
     const now = new Date();
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await graphWrite([userId], async (tx) => {
       const node = await tx.node.findFirst({
         where: { id: input.nodeId, userId },
         select: {
@@ -306,7 +313,7 @@ export const nodeProcedures = {
           metricCommands: true,
         },
       });
-      if (!node) throw notFound("Node");
+      if (!node) throw notFound("That node does not exist.");
       let trustColumns = node;
       const requested =
         node.trust !== "RELAY" && node.trustLowerRequestedAt === null
@@ -401,12 +408,12 @@ export const nodeProcedures = {
       const userId = context.session.user.id;
       let members: string[] = [];
       try {
-        members = await prisma.$transaction(async (tx) => {
+        members = await graphWrite([userId], async (tx) => {
           const updated = await tx.fabric.updateMany({
             where: { id: input.fabricId, userId },
             data: { name: input.name },
           });
-          if (updated.count === 0) throw notFound("Fabric");
+          if (updated.count === 0) throw notFound("That fabric does not exist.");
           const nodeIds = await fabricMemberNodeIds(tx, userId, [input.fabricId]);
           await refreshFabricsHashes(tx, userId, nodeIds);
           return nodeIds;
@@ -424,12 +431,12 @@ export const nodeProcedures = {
     delete: contractProcedure(c.fabrics.delete).handler(async ({ context, input }) => {
       const userId = context.session.user.id;
       const members = await mapFabricInUse(() =>
-        prisma.$transaction(async (tx) => {
+        graphWrite([userId], async (tx) => {
           const fabric = await tx.fabric.findFirst({
             where: { id: input.fabricId, userId },
             select: { id: true, Members: { select: { nodeId: true } } },
           });
-          if (!fabric) throw notFound("Fabric");
+          if (!fabric) throw notFound("That fabric does not exist.");
           const nodeIds = fabric.Members.map((member) => member.nodeId);
           // `RuntimeInstance.fabricId` is set while a multi-node instance lives on the fabric.
           if ((await tx.runtimeInstance.count({ where: { userId, fabricId: fabric.id } })) > 0)

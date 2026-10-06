@@ -8,6 +8,7 @@
  */
 import { ORPCError } from "@orpc/server";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
+import { deleteTerminalRelayRequestsWithoutWaiting } from "@ws-model-proxy/db/capacity-lock-order";
 import type { z } from "zod";
 import { contractProcedure, stub } from "../contract-procedure";
 import { activityContract as c, type requestRowSchema } from "../contracts/activity";
@@ -193,10 +194,15 @@ const requests = {
       take: 5_000,
     });
     if (ids.length === 0) return { deleted: 0 };
-    const deleted = await prisma.relayRequest.deleteMany({
-      where: { id: { in: ids.map((row) => row.id) }, ...ownRows },
-    });
-    return { deleted: deleted.count };
+    // Writer class S (capacity-lock-order): terminal rows only, taken with SKIP LOCKED, so a
+    // delete never waits on a row a finalizer holds (a skipped row stays for the next call).
+    const deleted = await prisma.$transaction((tx) =>
+      deleteTerminalRelayRequestsWithoutWaiting(
+        tx,
+        ids.map((row) => row.id),
+      ),
+    );
+    return { deleted };
   }),
 };
 

@@ -22,8 +22,9 @@ import {
   type nodeCommandViewSchema,
   type queuedCommandViewSchema,
 } from "../contracts/nodes";
-import type { RefusalReason } from "../contracts/refusals";
+import { callerActor } from "../lib/caller-actor";
 import { commandAuditSubject } from "../lib/command-audit";
+import { notFound, refuse, refuseAbout } from "../lib/refuse";
 import { NODE_COMMAND_GET_WAIT_MAX_MS, runtimeTextIssue } from "../lib/runtime-spec";
 
 /** How long `commands.run` waits for a quick command before answering `running`. */
@@ -35,19 +36,6 @@ type NodeCommandView = z.infer<typeof nodeCommandViewSchema>;
 type QueuedCommandView = z.infer<typeof queuedCommandViewSchema>;
 type CommandState = NodeCommandLiveStatus["state"];
 
-function refuse(
-  code: "FORBIDDEN" | "CONFLICT",
-  reason: RefusalReason,
-  message: string,
-  subjectId: string | null,
-): ORPCError<string, unknown> {
-  return new ORPCError(code, { message, data: { reason, subjectId } });
-}
-
-function notFound(): ORPCError<"NOT_FOUND", unknown> {
-  return new ORPCError("NOT_FOUND", { message: "Not found" });
-}
-
 function services(context: Context): NodeOperatorServices {
   const operator = context.services?.nodeOperator;
   if (!operator) {
@@ -58,18 +46,6 @@ function services(context: Context): NodeOperatorServices {
     });
   }
   return operator;
-}
-
-/** Who acts: a person, or an agent (its token id; an OAuth agent is recorded by its grant). */
-function actorOf(auth: CallerAuth | { kind: "anonymous" }): {
-  actor: "USER" | "AGENT";
-  agentTokenId: string | null;
-} {
-  if (auth.kind === "agent_token") return { actor: "AGENT", agentTokenId: auth.agentTokenId };
-  // TODO(contract): NodeCommand/NodeAuditEvent have no column for an OAuth grant; its id
-  // stands in for the token id (plain ids, no foreign key).
-  if (auth.kind === "oauth_access_token") return { actor: "AGENT", agentTokenId: auth.grantId };
-  return { actor: "USER", agentTokenId: null };
 }
 
 /**
@@ -114,17 +90,17 @@ async function fullControlNode(
       commandMaxMs: true,
     },
   });
-  if (!node) throw notFound();
+  if (!node) throw notFound("That node or command does not exist.");
   if (node.trust !== "FULL" || node.trustLowerRequestedAt) {
-    throw refuse(
-      "FORBIDDEN",
+    throw refuseAbout(
       "trust_relay",
-      `Node ${node.slug} is Relay only: commands, files and browser terminals need Full control.`,
       node.id,
+      `Node ${node.slug} is Relay only: commands, files and browser terminals need Full control.`,
+      "FORBIDDEN",
     );
   }
   if (!allowOffline && node.connection !== "ONLINE") {
-    throw refuse("CONFLICT", "node_offline", `Node ${node.slug} is offline.`, node.id);
+    throw refuseAbout("node_offline", node.id, `Node ${node.slug} is offline.`, "CONFLICT");
   }
   return node;
 }
@@ -279,7 +255,7 @@ const commands = {
     const operator = services(context);
     const issue = runtimeTextIssue(input.command);
     if (issue) throw new ORPCError("BAD_REQUEST", { message: issue });
-    const { actor, agentTokenId } = actorOf(context.auth);
+    const { actor, agentTokenId, mcpGrantId } = callerActor(context.auth, userId);
     const commandId = randomBytes(16).toString("base64url");
     const timeoutMs = Math.min(input.timeoutMs, node.commandMaxMs);
     const startedAt = new Date();
@@ -290,6 +266,7 @@ const commands = {
         nodeId: node.id,
         actor,
         agentTokenId,
+        mcpGrantId,
         subject: commandAuditSubject(input.command),
         startedAt,
         endsBy: new Date(startedAt.getTime() + timeoutMs),
@@ -312,11 +289,11 @@ const commands = {
       });
       throw error instanceof ORPCError
         ? error
-        : refuse(
-            "CONFLICT",
+        : refuseAbout(
             "node_offline",
-            `Node ${node.slug} did not start the command.`,
             node.id,
+            `Node ${node.slug} did not start the command.`,
+            "CONFLICT",
           );
     }
     return pollAndSettle(operator, row, COMMAND_RUN_ANSWER_MS, false);
@@ -329,13 +306,13 @@ const commands = {
       where: { id: input.commandId, userId },
       select: commandSelect,
     });
-    if (!row) throw notFound();
+    if (!row) throw notFound("That node or command does not exist.");
     if (input.cancel && row.state !== "RUNNING") {
-      throw refuse(
-        "CONFLICT",
+      throw refuseAbout(
         "command_not_running",
-        `Command ${row.id} is not running; there is nothing to cancel.`,
         row.id,
+        `Command ${row.id} is not running; there is nothing to cancel.`,
+        "CONFLICT",
       );
     }
     const operator = context.services?.nodeOperator;
@@ -471,7 +448,7 @@ async function pendingQueued(userId: string, queuedCommandId: string): Promise<Q
     where: { id: queuedCommandId, userId },
     select: queuedSelect,
   });
-  if (!row) throw notFound();
+  if (!row) throw notFound("That node or command does not exist.");
   if (row.state !== "QUEUED") {
     throw new ORPCError("CONFLICT", { message: "This command was already decided." });
   }
@@ -484,7 +461,7 @@ async function pendingQueued(userId: string, queuedCommandId: string): Promise<Q
 
 async function reloadQueued(id: string): Promise<QueuedRow> {
   const row = await prisma.queuedNodeCommand.findUnique({ where: { id }, select: queuedSelect });
-  if (!row) throw notFound();
+  if (!row) throw notFound("That node or command does not exist.");
   return row;
 }
 
@@ -525,18 +502,18 @@ const queued = {
     });
     if (waiting >= QUEUED_COMMANDS_MAX_PER_USER) {
       throw refuse(
-        "CONFLICT",
         "rate_limited",
         "Too many commands are waiting for a person. Let them decide some first.",
-        null,
+        "CONFLICT",
       );
     }
-    const { agentTokenId } = actorOf(context.auth);
+    const { agentTokenId, mcpGrantId } = callerActor(context.auth, userId);
     const row = await prisma.queuedNodeCommand.create({
       data: {
         userId,
         nodeId: node.id,
         agentTokenId,
+        mcpGrantId,
         command: input.command,
         note: input.note,
         expiresAt: new Date(now.getTime() + input.expiresInHours * 3_600_000),

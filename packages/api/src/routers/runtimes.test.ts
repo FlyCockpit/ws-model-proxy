@@ -554,7 +554,8 @@ describe("review follow-ups", () => {
     });
     expect(db.runtimeVersion.create.mock.calls[0]?.[0].data).toMatchObject({
       editor: "AGENT",
-      agentTokenId: "grant-1",
+      agentTokenId: null,
+      mcpGrantId: "grant-1",
     });
   });
 
