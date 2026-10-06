@@ -282,6 +282,7 @@ mod tracked {
 #[cfg(unix)]
 mod unix {
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
     use anyhow::{Context, Result};
@@ -290,6 +291,10 @@ mod unix {
 
     /// Set once tokio's handler is in place for the shutdown signals.
     static INSTALLED: OnceLock<()> = OnceLock::new();
+    /// Set the moment tokio's handler replaces the default action for any
+    /// shutdown signal, before the watcher thread exists: from then on only
+    /// a re-executed image can die from the signal (see [`die_by`]).
+    static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
     /// Start taking shutdown signals. The handlers are registered before
     /// this returns, so a signal that lands later (even before the watcher
@@ -310,9 +315,10 @@ mod unix {
             shutdown_signals()
                 .into_iter()
                 .map(|kind| {
-                    signal(SignalKind::from_raw(kind as i32))
-                        .map(|listener| (kind, listener))
-                        .with_context(|| format!("listening for {}", kind.as_str()))
+                    let listener = signal(SignalKind::from_raw(kind as i32))
+                        .with_context(|| format!("listening for {}", kind.as_str()))?;
+                    HANDLER_INSTALLED.store(true, Ordering::SeqCst);
+                    Ok((kind, listener))
                 })
                 .collect::<Result<Vec<_>>>()?
         };
@@ -396,7 +402,7 @@ mod unix {
     /// new image has the default action back; if `exec` fails the caller
     /// falls back to an exit status.
     pub(super) fn die_by(signal: i32) {
-        if INSTALLED.get().is_some() {
+        if HANDLER_INSTALLED.load(Ordering::SeqCst) {
             reexec_to_raise(signal);
         } else {
             raise_default(signal);

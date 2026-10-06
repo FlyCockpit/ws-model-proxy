@@ -1341,6 +1341,13 @@ fn config_max_terminals_defaults_to_four_and_accepts_one_to_thirty_two() {
         .stderr(predicate::str::contains(
             "`maxTerminals` must be an integer from 1 to 32",
         ));
+    // `config show` flags it rather than presenting it as the limit in effect.
+    cli(&config, &state)
+        .args(["config", "--json", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""maxTerminalsInvalid":true"#))
+        .stderr(predicate::str::contains("the relay will not start"));
 }
 
 #[cfg(unix)]

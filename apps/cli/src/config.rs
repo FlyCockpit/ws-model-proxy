@@ -1584,6 +1584,21 @@ impl Config {
         self.max_terminals.unwrap_or(DEFAULT_MAX_TERMINALS)
     }
 
+    /// `maxTerminals` is unset or within [`MAX_TERMINALS_RANGE`]; the relay
+    /// refuses to start otherwise.
+    pub fn validate_max_terminals(&self) -> Result<()> {
+        if let Some(count) = self.max_terminals
+            && !MAX_TERMINALS_RANGE.contains(&count)
+        {
+            anyhow::bail!(
+                "`maxTerminals` must be an integer from {} to {}",
+                MAX_TERMINALS_RANGE.start(),
+                MAX_TERMINALS_RANGE.end()
+            );
+        }
+        Ok(())
+    }
+
     /// Execute a complete local read-modify-write under the transitional
     /// exclusive lock. Callers must not call `save` from `update`; this method
     /// persists the returned candidate before releasing the lock.
@@ -1685,15 +1700,7 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         validate_file_root_shape(&self.file_roots)?;
-        if let Some(count) = self.max_terminals
-            && !MAX_TERMINALS_RANGE.contains(&count)
-        {
-            anyhow::bail!(
-                "`maxTerminals` must be an integer from {} to {}",
-                MAX_TERMINALS_RANGE.start(),
-                MAX_TERMINALS_RANGE.end()
-            );
-        }
+        self.validate_max_terminals()?;
         if let Some(slug) = &self.cli_slug {
             validate_slug(slug).with_context(|| format!("validating CLI slug `{slug}`"))?;
         }

@@ -184,6 +184,14 @@ pub fn run(args: &Args) -> Result<()> {
             shown["mcpFileRead"] = cfg.mcp_file_read.into();
             shown["fileRoots"] = serde_json::to_value(&cfg.file_roots)?;
             shown["maxTerminals"] = cfg.effective_max_terminals().into();
+            // An out-of-range value is shown as written, but flagged: the
+            // relay refuses to start with it, so no limit is in effect.
+            if let Err(error) = cfg.validate_max_terminals() {
+                shown["maxTerminalsInvalid"] = true.into();
+                output::diagnostic(format!(
+                    "warning: {error}; the relay will not start until it is fixed (`wsmp config set-max-terminals <n>`)"
+                ))?;
+            }
             if args.json {
                 output::json(&shown)?;
             } else {
