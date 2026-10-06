@@ -1,29 +1,737 @@
-import { stub } from "../contract-procedure";
-import { poolsContract as c } from "../contracts/pools";
+import { ORPCError } from "@orpc/server";
+import { POOL_ADVANCED_COLUMNS } from "@ws-model-proxy/config/pool-defaults";
+import prisma, { Prisma } from "@ws-model-proxy/db";
+import type { z } from "zod";
+import { contractProcedure, type SignedInContext } from "../contract-procedure";
+import type { poolAdvancedPatchSchema } from "../contracts/advanced";
+import { poolsContract as c, type routingRulesSchema } from "../contracts/pools";
+import {
+  type CallerActor,
+  callerActor,
+  isUniqueViolation,
+  notFound,
+  refusal,
+} from "../lib/caller-actor";
+import {
+  callableIdsFor,
+  EMPTY_TRAFFIC,
+  MEMBER_INCLUDE,
+  memberView,
+  POOL_INCLUDE,
+  type PoolRow,
+  poolView,
+  type Traffic,
+} from "../lib/pool-views";
+import { applyJsonPatch, jsonObject } from "../lib/registry-view";
+import type { Tx } from "../lib/runtime-store";
 
-/** S0c: bound to the contract with NOT_IMPLEMENTED handlers; implemented in lane B1. */
+type AdvancedPatch = z.infer<typeof poolAdvancedPatchSchema>;
+type RoutingRules = z.infer<typeof routingRulesSchema>;
+type ModelType = "LLM" | "EMBEDDINGS" | "TRANSCRIPTION";
+type MemberRef = { runtimeModelId: string } | { runtimeId: string; model: string };
+type SidecarPatch = {
+  input: "IMAGE" | "AUDIO" | "VIDEO";
+  targetPoolId: string | null;
+  prompt?: string | null;
+  timeoutMs?: number | null;
+  maxAssets?: number | null;
+};
+type RoutingPatch = {
+  priorityClass?: "BACKGROUND" | "NORMAL" | "HIGH";
+  concurrencyLimit?: number | null;
+  keptSlots?: number;
+  borrowKept?: boolean;
+};
+
+function userIdOf(context: SignedInContext): string {
+  return context.session.user.id;
+}
+
+/** Hourly request counts of the last 24 h (agent tests excluded), from the usage rollup. */
+async function trafficOf(ownerId: string, poolIds: string[]): Promise<Map<string, Traffic>> {
+  const result = new Map<string, Traffic>();
+  if (poolIds.length === 0) return result;
+  const hour = 3_600_000;
+  const start = new Date(Math.floor(Date.now() / hour) * hour - 23 * hour);
+  const rows = await prisma.usageRollupHour.findMany({
+    where: {
+      ownerUserId: ownerId,
+      poolId: { in: poolIds },
+      bucketStart: { gte: start },
+      source: { not: "AGENT_TEST" },
+    },
+    select: { poolId: true, bucketStart: true, requests: true, errors: true },
+  });
+  for (const row of rows) {
+    const traffic = result.get(row.poolId) ?? {
+      requests: 0,
+      errors: 0,
+      sparkline: [...EMPTY_TRAFFIC.sparkline],
+    };
+    const index = Math.floor((row.bucketStart.getTime() - start.getTime()) / hour);
+    if (index >= 0 && index < 24)
+      traffic.sparkline[index] = (traffic.sparkline[index] ?? 0) + row.requests;
+    traffic.requests += row.requests;
+    traffic.errors += row.errors;
+    result.set(row.poolId, traffic);
+  }
+  return result;
+}
+
+async function ownedPoolRow(userId: string, poolId: string): Promise<PoolRow> {
+  const pool = await prisma.pool.findFirst({
+    where: { id: poolId, userId },
+    include: POOL_INCLUDE,
+  });
+  if (!pool) throw notFound("That pool does not exist.");
+  return pool;
+}
+
+async function ownedPoolView(userId: string, poolId: string) {
+  const pool = await ownedPoolRow(userId, poolId);
+  const traffic = await trafficOf(userId, [pool.id]);
+  return poolView(pool, userId, traffic.get(pool.id));
+}
+
+async function audit(
+  db: Tx,
+  input: {
+    ownerId: string;
+    actor: CallerActor;
+    poolId: string;
+    action: string;
+    after?: unknown;
+  },
+) {
+  await db.auditEvent.create({
+    data: {
+      userId: input.ownerId,
+      actor: input.actor.actor,
+      actorUserId: input.actor.actorUserId,
+      agentTokenId: input.actor.agentTokenId,
+      action: input.action,
+      resourceType: "pool",
+      resourceId: input.poolId,
+      after: (input.after ?? undefined) as Prisma.InputJsonValue | undefined,
+    },
+  });
+}
+
+/** The pool owner's own served model behind a member reference. */
+async function resolveOwnModel(db: Tx, userId: string, ref: MemberRef) {
+  const model = await db.runtimeModel.findFirst({
+    where:
+      "runtimeModelId" in ref
+        ? { id: ref.runtimeModelId, userId }
+        : { runtimeId: ref.runtimeId, upstreamModelId: ref.model, userId },
+    select: { id: true, type: true, retired: true },
+  });
+  if (!model)
+    throw refusal(
+      "not_your_runtime",
+      "Only your own served models can be added; share holders add theirs with contribute.",
+    );
+  return model;
+}
+
+function assertType(poolType: ModelType, modelType: ModelType, subjectId: string): void {
+  if (poolType !== modelType)
+    throw refusal(
+      "model_type_mismatch",
+      "This model's type does not match the pool's type.",
+      subjectId,
+    );
+}
+
+async function addOwnMembers(
+  db: Tx,
+  pool: { id: string; userId: string; modelType: ModelType },
+  refs: MemberRef[],
+) {
+  for (const ref of refs) {
+    const model = await resolveOwnModel(db, pool.userId, ref);
+    assertType(pool.modelType, model.type, model.id);
+    if (model.retired)
+      throw new ORPCError("BAD_REQUEST", {
+        message: "This model is no longer served by its runtime.",
+      });
+    await db.poolMember.upsert({
+      where: { poolId_runtimeModelId: { poolId: pool.id, runtimeModelId: model.id } },
+      create: { poolId: pool.id, kind: "LOCAL", runtimeModelId: model.id },
+      update: {},
+    });
+  }
+}
+
+const SIDECAR_TARGET_TYPE = { IMAGE: "LLM", VIDEO: "LLM", AUDIO: "TRANSCRIPTION" } as const;
+
+async function applySidecars(
+  db: Tx,
+  pool: { id: string; userId: string },
+  sidecars: SidecarPatch[],
+) {
+  for (const sidecar of sidecars) {
+    if (sidecar.targetPoolId === null) {
+      await db.poolSidecar.deleteMany({ where: { poolId: pool.id, input: sidecar.input } });
+      continue;
+    }
+    if (sidecar.targetPoolId === pool.id)
+      throw refusal("sidecar_chain", "A pool cannot be its own sidecar.", pool.id);
+    const target = await db.pool.findFirst({
+      where: {
+        id: sidecar.targetPoolId,
+        OR: [
+          { userId: pool.userId },
+          { Shares: { some: { granteeUserId: pool.userId, canUse: true } } },
+        ],
+      },
+      select: {
+        id: true,
+        modelType: true,
+        Sidecars: { where: { input: sidecar.input }, select: { id: true } },
+      },
+    });
+    if (!target) throw notFound("That sidecar pool does not exist.");
+    if (target.modelType !== SIDECAR_TARGET_TYPE[sidecar.input])
+      throw refusal(
+        "model_type_mismatch",
+        "Images and video go to an LLM pool; audio goes to a transcription pool.",
+        target.id,
+      );
+    // No chains: the target has no sidecar for this input, and nothing feeds this pool one.
+    const feeds = await db.poolSidecar.count({
+      where: { targetPoolId: pool.id, input: sidecar.input },
+    });
+    if (target.Sidecars.length > 0 || feeds > 0)
+      throw refusal("sidecar_chain", "Sidecar pools cannot be chained.", target.id);
+    const fields = {
+      targetPoolId: target.id,
+      prompt: sidecar.prompt ?? null,
+      timeoutMs: sidecar.timeoutMs ?? null,
+      maxAssets: sidecar.maxAssets ?? null,
+    };
+    await db.poolSidecar.upsert({
+      where: { poolId_input: { poolId: pool.id, input: sidecar.input } },
+      create: { poolId: pool.id, input: sidecar.input, ...fields },
+      update: fields,
+    });
+  }
+}
+
+async function applyRouting(db: Tx, poolId: string, routing: RoutingPatch | undefined) {
+  if (!routing) return;
+  const data = Object.fromEntries(
+    Object.entries(routing).filter(([, value]) => value !== undefined),
+  ) as RoutingPatch;
+  await db.poolRouting.upsert({ where: { poolId }, create: { poolId, ...data }, update: data });
+}
+
+async function applyAdvanced(db: Tx, poolId: string, patch: AdvancedPatch | undefined) {
+  if (!patch) return;
+  const stored = await db.poolAdvanced.findUnique({ where: { poolId } });
+  const columns: Record<string, number | null> = {};
+  for (const key of Object.keys(POOL_ADVANCED_COLUMNS) as Array<
+    keyof typeof POOL_ADVANCED_COLUMNS
+  >) {
+    const value = patch[key];
+    if (value !== undefined) columns[key] = value;
+  }
+  const current = jsonObject(stored?.overrides);
+  let overrides = current;
+  if (patch.overrides) {
+    const { affinity, protection, ...flat } = patch.overrides;
+    overrides = applyJsonPatch(current, flat);
+    for (const [group, groupPatch] of [
+      ["affinity", affinity],
+      ["protection", protection],
+    ] as const) {
+      if (!groupPatch) continue;
+      const merged = applyJsonPatch(jsonObject(current[group]), groupPatch);
+      if (Object.keys(merged).length === 0) delete overrides[group];
+      else overrides[group] = merged;
+    }
+  }
+  const data = { ...columns, overrides: overrides as Prisma.InputJsonValue };
+  await db.poolAdvanced.upsert({ where: { poolId }, create: { poolId, ...data }, update: data });
+}
+
+async function replaceRules(db: Tx, poolId: string, rules: RoutingRules) {
+  const memberIds = [
+    ...new Set(
+      rules
+        .flatMap((rule) => [rule.memberId, rule.excludeMemberId])
+        .filter((id): id is string => typeof id === "string"),
+    ),
+  ];
+  if (memberIds.length > 0) {
+    const members = await db.poolMember.count({
+      where: { id: { in: memberIds }, poolId, kind: "LOCAL" },
+    });
+    if (members !== memberIds.length)
+      throw new ORPCError("BAD_REQUEST", {
+        message: "A rule names a member that is not a local member of this pool.",
+      });
+  }
+  await db.poolRoutingRule.deleteMany({ where: { poolId } });
+  if (rules.length > 0)
+    await db.poolRoutingRule.createMany({
+      data: rules.map((rule, position) => ({
+        poolId,
+        position,
+        metric: rule.metric,
+        labels: (rule.labels ?? undefined) as Prisma.InputJsonValue | undefined,
+        aggregate: rule.aggregate,
+        op: rule.op,
+        threshold: rule.threshold,
+        effect: rule.effect,
+        memberId: rule.excludeMemberId ?? rule.memberId ?? null,
+        exclude: Boolean(rule.excludeMemberId),
+      })),
+    });
+}
+
+async function replaceCloudMembers(
+  db: Tx,
+  pool: { id: string; userId: string; modelType: ModelType },
+  cloudMembers: Array<{ providerModelId: string }>,
+) {
+  const ids = cloudMembers.map((member) => member.providerModelId);
+  if (new Set(ids).size !== ids.length)
+    throw new ORPCError("BAD_REQUEST", { message: "A provider model is listed twice." });
+  const models = await db.providerModel.findMany({
+    where: { id: { in: ids }, userId: pool.userId, enabled: true, deletedAt: null },
+    select: { id: true, type: true },
+  });
+  const byId = new Map(models.map((model) => [model.id, model]));
+  for (const id of ids) {
+    const model = byId.get(id);
+    if (!model)
+      throw new ORPCError("BAD_REQUEST", {
+        message: "Only provider models a person enabled can be cloud members.",
+      });
+    assertType(pool.modelType, model.type, model.id);
+  }
+  await db.poolMember.deleteMany({ where: { poolId: pool.id, kind: "CLOUD" } });
+  if (ids.length > 0)
+    await db.poolMember.createMany({
+      data: ids.map((providerModelId, cloudOrder) => ({
+        poolId: pool.id,
+        kind: "CLOUD" as const,
+        providerModelId,
+        cloudOrder,
+      })),
+    });
+}
+
+/** Human-only setters (the contract binding refuses everyone else) share this. */
+async function humanSetter(
+  context: SignedInContext,
+  poolId: string,
+  action: string,
+  write: (tx: Tx) => Promise<unknown>,
+  after: unknown,
+) {
+  const userId = userIdOf(context);
+  const pool = await prisma.pool.findFirst({ where: { id: poolId, userId }, select: { id: true } });
+  if (!pool) throw notFound("That pool does not exist.");
+  const actor = callerActor(context.auth, userId);
+  await prisma.$transaction(async (tx) => {
+    await write(tx);
+    await audit(tx, { ownerId: userId, actor, poolId, action, after });
+  });
+  return ownedPoolView(userId, poolId);
+}
+
+function rethrowSlugTaken(error: unknown): never {
+  if (isUniqueViolation(error))
+    throw refusal("slug_taken", "You already have a pool with this slug.");
+  throw error;
+}
+
 export const poolsRouter = {
-  list: stub(c.list),
-  get: stub(c.get),
+  list: contractProcedure(c.list).handler(async ({ context }) => {
+    const userId = userIdOf(context);
+    const [pools, shares] = await Promise.all([
+      prisma.pool.findMany({
+        where: { userId },
+        include: POOL_INCLUDE,
+        orderBy: { createdAt: "asc" },
+      }),
+      prisma.share.findMany({
+        where: { granteeUserId: userId },
+        select: {
+          poolId: true,
+          canUse: true,
+          canContribute: true,
+          Owner: { select: { email: true } },
+          Pool: {
+            select: {
+              slug: true,
+              modelType: true,
+              User: { select: { slug: true } },
+              Fallback: { select: { mode: true } },
+            },
+          },
+        },
+        orderBy: { createdAt: "asc" },
+      }),
+    ]);
+    const traffic = await trafficOf(
+      userId,
+      pools.map((pool) => pool.id),
+    );
+    return {
+      pools: pools.map((pool) => poolView(pool, userId, traffic.get(pool.id))),
+      sharedWithMe: shares.map((share) => ({
+        poolId: share.poolId,
+        callableIds: share.canUse
+          ? callableIdsFor({
+              ownerSlug: share.Pool.User.slug,
+              poolSlug: share.Pool.slug,
+              mode: share.Pool.Fallback?.mode ?? "OFF",
+              callerIsOwner: false,
+            })
+          : [`${share.Pool.User.slug}/${share.Pool.slug}`],
+        ownerEmail: share.Owner.email,
+        modelType: share.Pool.modelType,
+        canUse: share.canUse,
+        canContribute: share.canContribute,
+      })),
+    };
+  }),
+
+  get: contractProcedure(c.get).handler(async ({ input, context }) =>
+    ownedPoolView(userIdOf(context), input.poolId),
+  ),
+
   history: {
-    list: stub(c.history.list),
+    list: contractProcedure(c.history.list).handler(async ({ input, context }) => {
+      const userId = userIdOf(context);
+      const pool = await prisma.pool.findFirst({
+        where: { id: input.poolId, userId },
+        select: { id: true },
+      });
+      if (!pool) throw notFound("That pool does not exist.");
+      const rows = await prisma.auditEvent.findMany({
+        where: { userId, resourceType: "pool", resourceId: pool.id },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: input.limit + 1,
+        ...(input.cursor ? { cursor: { id: input.cursor }, skip: 1 } : {}),
+      });
+      const page = rows.slice(0, input.limit);
+      return {
+        items: page.map((row) => ({
+          id: row.id,
+          createdAt: row.createdAt.toISOString(),
+          actor: {
+            actor: row.actor,
+            userId: row.actorUserId,
+            agentTokenId: row.agentTokenId,
+            label: null,
+          },
+          action: row.action,
+          before: row.before,
+          after: row.after,
+        })),
+        nextCursor: rows.length > input.limit ? (page.at(-1)?.id ?? null) : null,
+      };
+    }),
   },
-  create: stub(c.create),
-  update: stub(c.update),
-  delete: stub(c.delete),
+
+  create: contractProcedure(c.create).handler(async ({ input, context }) => {
+    const userId = userIdOf(context);
+    const actor = callerActor(context.auth, userId);
+    let poolId: string;
+    try {
+      poolId = await prisma.$transaction(async (tx) => {
+        const pool = await tx.pool.create({
+          data: {
+            userId,
+            slug: input.slug,
+            name: input.name,
+            description: input.description || null,
+            modelType: input.type,
+          },
+          select: { id: true, userId: true, modelType: true },
+        });
+        await addOwnMembers(tx, pool, input.members ?? []);
+        await applyRouting(tx, pool.id, input.routing);
+        await applyAdvanced(tx, pool.id, input.advanced);
+        await applySidecars(tx, pool, input.sidecars ?? []);
+        await audit(tx, {
+          ownerId: userId,
+          actor,
+          poolId: pool.id,
+          action: "pool.create",
+          after: { slug: input.slug, type: input.type, note: input.note ?? null },
+        });
+        return pool.id;
+      });
+    } catch (error) {
+      rethrowSlugTaken(error);
+    }
+    return ownedPoolView(userId, poolId);
+  }),
+
+  update: contractProcedure(c.update).handler(async ({ input, context }) => {
+    const userId = userIdOf(context);
+    const actor = callerActor(context.auth, userId);
+    const pool = await prisma.pool.findFirst({
+      where: { id: input.poolId, userId },
+      select: { id: true, userId: true, modelType: true },
+    });
+    if (!pool) throw notFound("That pool does not exist.");
+    const { rules, ...advancedPatch } = input.advanced ?? {};
+    try {
+      await prisma.$transaction(async (tx) => {
+        const fields = {
+          ...(input.name !== undefined ? { name: input.name } : {}),
+          ...(input.slug !== undefined ? { slug: input.slug } : {}),
+          ...(input.description !== undefined ? { description: input.description || null } : {}),
+        };
+        if (Object.keys(fields).length > 0)
+          await tx.pool.update({ where: { id: pool.id }, data: fields });
+        if (input.members?.remove?.length)
+          await tx.poolMember.deleteMany({
+            where: { id: { in: input.members.remove }, poolId: pool.id },
+          });
+        await addOwnMembers(tx, pool, input.members?.add ?? []);
+        for (const set of input.members?.set ?? []) {
+          const updated = await tx.poolMember.updateMany({
+            where: { id: set.memberId, poolId: pool.id },
+            data: {
+              ...(set.weight !== undefined ? { weight: set.weight } : {}),
+              ...(set.state !== undefined ? { state: set.state } : {}),
+            },
+          });
+          if (updated.count === 0) throw notFound("That member is not in this pool.");
+        }
+        if (input.cloudMembers) await replaceCloudMembers(tx, pool, input.cloudMembers);
+        await applyRouting(tx, pool.id, input.routing);
+        if (input.cloud?.embeddingContract !== undefined) {
+          const embeddingContract =
+            input.cloud.embeddingContract === null
+              ? Prisma.DbNull
+              : (input.cloud.embeddingContract as Prisma.InputJsonValue);
+          await tx.poolFallback.upsert({
+            where: { poolId: pool.id },
+            create: { poolId: pool.id, embeddingContract },
+            update: { embeddingContract },
+          });
+        }
+        if (input.advanced) await applyAdvanced(tx, pool.id, advancedPatch);
+        if (rules) await replaceRules(tx, pool.id, rules);
+        await applySidecars(tx, pool, input.sidecars ?? []);
+        const { poolId: _poolId, ...after } = input;
+        await audit(tx, { ownerId: userId, actor, poolId: pool.id, action: "pool.update", after });
+      });
+    } catch (error) {
+      rethrowSlugTaken(error);
+    }
+    if (rules) await context.services?.onPoolRoutingRulesChanged?.(pool.id);
+    return ownedPoolView(userId, pool.id);
+  }),
+
+  delete: contractProcedure(c.delete).handler(async ({ input, context }) => {
+    callerActor(context.auth, userIdOf(context));
+    const deleted = await prisma.pool.deleteMany({
+      where: { id: input.poolId, userId: userIdOf(context) },
+    });
+    if (deleted.count === 0) throw notFound("That pool does not exist.");
+    return { ok: true as const };
+  }),
+
   cloud: {
-    setMode: stub(c.cloud.setMode),
-    setPaidWarmProtection: stub(c.cloud.setPaidWarmProtection),
-    setOwnKeyEquivalent: stub(c.cloud.setOwnKeyEquivalent),
+    setMode: contractProcedure(c.cloud.setMode).handler(async ({ input, context }) =>
+      humanSetter(
+        context,
+        input.poolId,
+        "pool.fallback.mode",
+        (tx) =>
+          tx.poolFallback.upsert({
+            where: { poolId: input.poolId },
+            create: { poolId: input.poolId, mode: input.mode },
+            update: { mode: input.mode },
+          }),
+        { mode: input.mode },
+      ),
+    ),
+    setPaidWarmProtection: contractProcedure(c.cloud.setPaidWarmProtection).handler(
+      async ({ input, context }) =>
+        humanSetter(
+          context,
+          input.poolId,
+          "pool.fallback.paid_warm_protection",
+          (tx) =>
+            tx.poolFallback.upsert({
+              where: { poolId: input.poolId },
+              create: { poolId: input.poolId, paidWarmProtection: input.enabled },
+              update: { paidWarmProtection: input.enabled },
+            }),
+          { enabled: input.enabled },
+        ),
+    ),
+    setOwnKeyEquivalent: contractProcedure(c.cloud.setOwnKeyEquivalent).handler(
+      async ({ input, context }) =>
+        humanSetter(
+          context,
+          input.poolId,
+          "pool.fallback.own_key_equivalent",
+          (tx) =>
+            tx.poolFallback.upsert({
+              where: { poolId: input.poolId },
+              create: { poolId: input.poolId, ownKeyEquivalentModel: input.model },
+              update: { ownKeyEquivalentModel: input.model },
+            }),
+          { model: input.model },
+        ),
+    ),
   },
+
   routing: {
-    setOwnHardwareOnly: stub(c.routing.setOwnHardwareOnly),
+    setOwnHardwareOnly: contractProcedure(c.routing.setOwnHardwareOnly).handler(
+      async ({ input, context }) =>
+        humanSetter(
+          context,
+          input.poolId,
+          "pool.routing.own_hardware_only",
+          (tx) =>
+            tx.poolRouting.upsert({
+              where: { poolId: input.poolId },
+              create: { poolId: input.poolId, ownHardwareOnly: input.enabled },
+              update: { ownHardwareOnly: input.enabled },
+            }),
+          { enabled: input.enabled },
+        ),
+    ),
   },
+
   members: {
-    addContributed: stub(c.members.addContributed),
-    removeContributed: stub(c.members.removeContributed),
+    addContributed: contractProcedure(c.members.addContributed).handler(
+      async ({ input, context }) => {
+        const userId = userIdOf(context);
+        const share = await prisma.share.findFirst({
+          where: { poolId: input.poolId, granteeUserId: userId },
+          select: {
+            id: true,
+            canContribute: true,
+            ownerUserId: true,
+            Pool: { select: { modelType: true, Routing: { select: { ownHardwareOnly: true } } } },
+          },
+        });
+        if (!share) throw notFound("That pool is not shared with you.");
+        if (!share.canContribute)
+          throw refusal(
+            "contribute_not_allowed",
+            "This share does not allow contributing.",
+            input.poolId,
+          );
+        if (share.Pool.Routing?.ownHardwareOnly)
+          throw refusal(
+            "own_hardware_only",
+            "The owner routes this pool to their own hardware only.",
+            input.poolId,
+          );
+        const model = await prisma.runtimeModel.findFirst({
+          where: { id: input.runtimeModelId, userId },
+          select: { id: true, type: true, retired: true },
+        });
+        if (!model)
+          throw refusal(
+            "not_your_runtime",
+            "You can contribute only your own served models.",
+            input.runtimeModelId,
+          );
+        assertType(share.Pool.modelType, model.type, model.id);
+        if (model.retired)
+          throw new ORPCError("BAD_REQUEST", {
+            message: "This model is no longer served by its runtime.",
+          });
+        const actor = callerActor(context.auth, userId);
+        let memberId: string;
+        try {
+          memberId = await prisma.$transaction(async (tx) => {
+            const member = await tx.poolMember.create({
+              data: {
+                poolId: input.poolId,
+                kind: "LOCAL",
+                runtimeModelId: model.id,
+                shareId: share.id,
+              },
+              select: { id: true },
+            });
+            await audit(tx, {
+              ownerId: share.ownerUserId,
+              actor,
+              poolId: input.poolId,
+              action: "pool.member.contribute",
+              after: { memberId: member.id, runtimeModelId: model.id, note: input.note ?? null },
+            });
+            return member.id;
+          });
+        } catch (error) {
+          if (isUniqueViolation(error))
+            throw new ORPCError("CONFLICT", { message: "This model is already in the pool." });
+          throw error;
+        }
+        const member = await prisma.poolMember.findUniqueOrThrow({
+          where: { id: memberId },
+          include: MEMBER_INCLUDE,
+        });
+        return memberView(member);
+      },
+    ),
+
+    removeContributed: contractProcedure(c.members.removeContributed).handler(
+      async ({ input, context }) => {
+        const userId = userIdOf(context);
+        // The contributor (own members only) or the pool owner.
+        const member = await prisma.poolMember.findFirst({
+          where: {
+            id: input.memberId,
+            shareId: { not: null },
+            OR: [{ Share: { granteeUserId: userId } }, { Pool: { userId } }],
+          },
+          select: { id: true, poolId: true, Pool: { select: { userId: true } } },
+        });
+        if (!member) throw notFound("That contributed member does not exist.");
+        const actor = callerActor(context.auth, userId);
+        await prisma.$transaction(async (tx) => {
+          await tx.poolMember.delete({ where: { id: member.id } });
+          await audit(tx, {
+            ownerId: member.Pool.userId,
+            actor,
+            poolId: member.poolId,
+            action: "pool.member.withdraw",
+            after: { memberId: member.id, note: input.note ?? null },
+          });
+        });
+        return { ok: true as const };
+      },
+    ),
   },
+
   rules: {
-    delete: stub(c.rules.delete),
+    delete: contractProcedure(c.rules.delete).handler(async ({ input, context }) => {
+      const userId = userIdOf(context);
+      const rule = await prisma.poolRoutingRule.findFirst({
+        where: { id: input.ruleId, Pool: { userId } },
+        select: { id: true, poolId: true },
+      });
+      if (!rule) throw notFound("That rule does not exist.");
+      const actor = callerActor(context.auth, userId);
+      await prisma.$transaction(async (tx) => {
+        await tx.poolRoutingRule.delete({ where: { id: rule.id } });
+        await audit(tx, {
+          ownerId: userId,
+          actor,
+          poolId: rule.poolId,
+          action: "pool.rule.delete",
+          after: { ruleId: rule.id },
+        });
+      });
+      await context.services?.onPoolRoutingRulesChanged?.(rule.poolId);
+      return { ok: true as const };
+    }),
   },
 };
