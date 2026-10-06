@@ -14,6 +14,7 @@ vi.mock("@ws-model-proxy/mailer", () => ({
 const db = vi.hoisted(() => ({
   shareInvite: { findMany: vi.fn(), findFirst: vi.fn(), updateMany: vi.fn() },
   share: { findUnique: vi.fn(), create: vi.fn() },
+  user: { findUnique: vi.fn() },
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
 const lockOrder = vi.hoisted(() => ({
@@ -37,11 +38,7 @@ import {
   claimShareInviteForSignup,
   isPendingShareInvite,
 } from "./share-invite-accept";
-import {
-  pendingInviteWhere as pending,
-  SHARE_INVITE_SIGNUP_CLAIM_MS,
-  unclaimedInviteWhere as unclaimed,
-} from "./share-invites";
+import { pendingInviteWhere as pending, SHARE_INVITE_SIGNUP_CLAIM_MS } from "./share-invites";
 
 const TOKEN = "wsmp_inv_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
@@ -57,8 +54,18 @@ const invite = {
   canUse: true,
   canContribute: true,
   priorityClass: null,
+  signupClaimedAt: null as Date | null,
+  signupClaimedEmail: null as string | null,
 };
 const user = { id: "friend", email: "Friend@Example.test" };
+/** A signed-in or signing-up person whose e-mail is not the invited one. */
+const other = { id: "friend", email: "other@example.test" };
+/** The invite as claimed by a sign-up with `email` at `at`. */
+const claimedBy = (email: string, at: Date = new Date()) => ({
+  ...invite,
+  signupClaimedAt: at,
+  signupClaimedEmail: email,
+});
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -127,7 +134,7 @@ describe("share invite acceptance", () => {
     ).rejects.toThrow();
   });
 
-  it("accepts through the link whatever the account's e-mail, leaving a reserved invite alone", async () => {
+  it("accepts through the link whatever the account's e-mail, guarded on the claim as read", async () => {
     const now = new Date();
     db.shareInvite.findFirst.mockResolvedValue(invite);
     db.share.findUnique.mockResolvedValue(null);
@@ -139,12 +146,12 @@ describe("share invite acceptance", () => {
     expect(lockOrder.fenceOwners).toHaveBeenCalledWith(db, ["friend", "owner"]);
     expect(db.shareInvite.findFirst.mock.calls[0]?.[0]?.where).toEqual({
       tokenDigest: credentialDigest("shareInvite", TOKEN),
-      AND: [pending(now), unclaimed(now)],
+      ...pending(now),
     });
-    // The guarded write repeats the hold: a sign-up claiming meanwhile wins.
+    // The guarded write repeats the claim as read: a sign-up claiming meanwhile wins.
     expect(db.shareInvite.updateMany.mock.calls[0]?.[0]?.where).toEqual({
       id: "inv1",
-      AND: [pending(now), unclaimed(now)],
+      AND: [pending(now), { signupClaimedAt: null, signupClaimedEmail: null }],
     });
   });
 
@@ -159,75 +166,163 @@ describe("share invite acceptance", () => {
     expect(db.share.create).not.toHaveBeenCalled();
   });
 
+  it("answers invalid when it loses the guarded write to a concurrent change", async () => {
+    db.shareInvite.findFirst.mockResolvedValue(invite);
+    db.share.findUnique.mockResolvedValue(null);
+    db.share.create.mockResolvedValue({ id: "share1" });
+    db.shareInvite.updateMany.mockResolvedValue({ count: 0 });
+    await expect(acceptShareInviteByLink(other, TOKEN)).resolves.toBe("invalid");
+  });
+
   it("finds nothing to accept when the invite expired or was revoked after the check", async () => {
-    const claimedAt = new Date();
     // Pending at the first read, gone at the re-read under the fences.
-    db.shareInvite.findFirst.mockResolvedValueOnce(invite).mockResolvedValueOnce(null);
-    await expect(
-      acceptClaimedShareInvite({ id: "friend", email: "other@example.test" }, TOKEN, claimedAt),
-    ).resolves.toBe(false);
+    db.shareInvite.findFirst
+      .mockResolvedValueOnce(claimedBy(other.email))
+      .mockResolvedValueOnce(null);
+    await expect(acceptClaimedShareInvite(other, TOKEN)).resolves.toBe(false);
     expect(db.share.create).not.toHaveBeenCalled();
     expect(db.shareInvite.updateMany).not.toHaveBeenCalled();
   });
 
-  it("accepts the invite a sign-up reserved only under that sign-up's claim", async () => {
-    const claimedAt = new Date(Date.now() - 1_000);
+  it("accepts for the new account only the claim of its own e-mail", async () => {
     const now = new Date();
-    db.shareInvite.findFirst.mockResolvedValue(invite);
+    const claimed = claimedBy("other@example.test", now);
+    db.shareInvite.findFirst.mockResolvedValue(claimed);
     db.share.findUnique.mockResolvedValue(null);
     db.share.create.mockResolvedValue({ id: "share1" });
     db.shareInvite.updateMany.mockResolvedValue({ count: 1 });
+    // Better Auth stores the e-mail lower-cased; the key also trims.
     await expect(
-      acceptClaimedShareInvite(
-        { id: "friend", email: "other@example.test" },
-        TOKEN,
-        claimedAt,
-        now,
-      ),
+      acceptClaimedShareInvite({ id: "friend", email: " Other@example.test" }, TOKEN, now),
     ).resolves.toBe(true);
     expect(db.shareInvite.updateMany.mock.calls[0]?.[0]?.where).toEqual({
       id: "inv1",
-      AND: [pending(now), { signupClaimedAt: claimedAt }],
+      AND: [
+        pending(now),
+        { signupClaimedAt: claimed.signupClaimedAt, signupClaimedEmail: "other@example.test" },
+      ],
     });
+    db.shareInvite.findFirst.mockResolvedValue(claimedBy("someone@example.test", now));
+    await expect(acceptClaimedShareInvite(other, TOKEN, now)).resolves.toBe(false);
+  });
+});
+
+describe("signed-in acceptance against a sign-up claim", () => {
+  const now = new Date();
+  const fresh = new Date(now.getTime() - 60_000);
+  const stale = new Date(now.getTime() - SHARE_INVITE_SIGNUP_CLAIM_MS - 60_000);
+
+  beforeEach(() => {
+    db.share.findUnique.mockResolvedValue(null);
+    db.share.create.mockResolvedValue({ id: "share1" });
+    db.shareInvite.updateMany.mockResolvedValue({ count: 1 });
+  });
+
+  it("leaves a fresh claim of another e-mail to that sign-up", async () => {
+    db.shareInvite.findFirst.mockResolvedValue(claimedBy("someone@example.test", fresh));
+    await expect(acceptShareInviteByLink(other, TOKEN, now)).resolves.toBe("in_use");
+    expect(db.share.create).not.toHaveBeenCalled();
+  });
+
+  it("lets the claimant account recover the invite its sign-up failed to accept", async () => {
+    db.shareInvite.findFirst.mockResolvedValue(claimedBy(other.email, stale));
+    await expect(acceptShareInviteByLink(other, TOKEN, now)).resolves.toBe("accepted");
+  });
+
+  it("keeps a stale claim with the claimant's account, and frees it when there is none", async () => {
+    db.shareInvite.findFirst.mockResolvedValue(claimedBy("someone@example.test", stale));
+    db.user.findUnique.mockResolvedValueOnce({ id: "someone" });
+    await expect(acceptShareInviteByLink(other, TOKEN, now)).resolves.toBe("invalid");
+    expect(db.user.findUnique).toHaveBeenCalledWith({
+      where: { email: "someone@example.test" },
+      select: { id: true },
+    });
+    db.user.findUnique.mockResolvedValueOnce(null);
+    await expect(acceptShareInviteByLink(other, TOKEN, now)).resolves.toBe("accepted");
   });
 });
 
 describe("invite-link sign-up claim", () => {
-  it("reserves a pending, unclaimed (or stale) invite with one guarded update", async () => {
-    const now = new Date();
+  const now = new Date();
+
+  it("claims a free invite for the e-mail with a compare-and-swap on the claim as read", async () => {
+    db.shareInvite.findFirst.mockResolvedValueOnce(invite);
     db.shareInvite.updateMany.mockResolvedValueOnce({ count: 1 });
-    await expect(claimShareInviteForSignup(TOKEN, now)).resolves.toEqual(now);
+    await expect(claimShareInviteForSignup(TOKEN, " Other@example.test", now)).resolves.toBe(
+      "claimed",
+    );
     expect(db.shareInvite.updateMany.mock.calls[0]?.[0]).toEqual({
       where: {
-        tokenDigest: credentialDigest("shareInvite", TOKEN),
-        AND: [
-          pending(now),
-          {
-            OR: [
-              { signupClaimedAt: null },
-              { signupClaimedAt: { lt: new Date(now.getTime() - SHARE_INVITE_SIGNUP_CLAIM_MS) } },
-            ],
-          },
-        ],
+        id: "inv1",
+        AND: [pending(now), { signupClaimedAt: null, signupClaimedEmail: null }],
       },
-      data: { signupClaimedAt: now },
+      data: { signupClaimedAt: now, signupClaimedEmail: "other@example.test" },
     });
   });
 
   it("gives the claim to one of two sign-ups with one token at once", async () => {
-    // The database serializes the two guarded updates: the second sees the fresh claim.
+    // Both read the free invite; the database serializes the two swaps, the second matches no row.
+    db.shareInvite.findFirst.mockResolvedValue(invite);
     db.shareInvite.updateMany
       .mockResolvedValueOnce({ count: 1 })
       .mockResolvedValueOnce({ count: 0 });
-    const [first, second] = await Promise.all([
-      claimShareInviteForSignup(TOKEN),
-      claimShareInviteForSignup(TOKEN),
+    const results = await Promise.all([
+      claimShareInviteForSignup(TOKEN, "a@example.test", now),
+      claimShareInviteForSignup(TOKEN, "b@example.test", now),
     ]);
-    expect([first, second].filter((claim) => claim !== null)).toHaveLength(1);
+    expect(results.sort()).toEqual(["claimed", "in_use"]);
   });
 
-  it("claims nothing for a malformed token", async () => {
-    await expect(claimShareInviteForSignup("wsmp_inv_short")).resolves.toBeNull();
+  it("answers invalid when the swap lost to a revoke, not 'in use'", async () => {
+    db.shareInvite.findFirst.mockResolvedValueOnce(invite).mockResolvedValueOnce(null);
+    db.shareInvite.updateMany.mockResolvedValueOnce({ count: 0 });
+    await expect(claimShareInviteForSignup(TOKEN, "a@example.test", now)).resolves.toBe("invalid");
+  });
+
+  it("lets the same e-mail take over its own fresh claim (a rolled-back sign-up)", async () => {
+    const own = claimedBy("other@example.test", new Date(now.getTime() - 1_000));
+    db.shareInvite.findFirst.mockResolvedValueOnce(own);
+    db.shareInvite.updateMany.mockResolvedValueOnce({ count: 1 });
+    await expect(claimShareInviteForSignup(TOKEN, "other@example.test", now)).resolves.toBe(
+      "claimed",
+    );
+    expect(db.shareInvite.updateMany.mock.calls[0]?.[0]?.where).toEqual({
+      id: "inv1",
+      AND: [
+        pending(now),
+        { signupClaimedAt: own.signupClaimedAt, signupClaimedEmail: "other@example.test" },
+      ],
+    });
+  });
+
+  it("refuses another e-mail inside the window, and after it while the claimant has an account", async () => {
+    db.shareInvite.findFirst.mockResolvedValueOnce(
+      claimedBy("someone@example.test", new Date(now.getTime() - 60_000)),
+    );
+    await expect(claimShareInviteForSignup(TOKEN, "other@example.test", now)).resolves.toBe(
+      "in_use",
+    );
+    const stale = new Date(now.getTime() - SHARE_INVITE_SIGNUP_CLAIM_MS - 1);
+    db.shareInvite.findFirst.mockResolvedValueOnce(claimedBy("someone@example.test", stale));
+    db.user.findUnique.mockResolvedValueOnce({ id: "someone" });
+    await expect(claimShareInviteForSignup(TOKEN, "other@example.test", now)).resolves.toBe(
+      "invalid",
+    );
+    db.shareInvite.findFirst.mockResolvedValueOnce(claimedBy("someone@example.test", stale));
+    db.user.findUnique.mockResolvedValueOnce(null);
+    db.shareInvite.updateMany.mockResolvedValueOnce({ count: 1 });
+    await expect(claimShareInviteForSignup(TOKEN, "other@example.test", now)).resolves.toBe(
+      "claimed",
+    );
+    expect(db.shareInvite.updateMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("claims nothing for a malformed token or an invite that is not pending", async () => {
+    await expect(claimShareInviteForSignup("wsmp_inv_short", "a@example.test")).resolves.toBe(
+      "invalid",
+    );
+    db.shareInvite.findFirst.mockResolvedValueOnce(null);
+    await expect(claimShareInviteForSignup(TOKEN, "a@example.test")).resolves.toBe("invalid");
     expect(db.shareInvite.updateMany).not.toHaveBeenCalled();
   });
 });

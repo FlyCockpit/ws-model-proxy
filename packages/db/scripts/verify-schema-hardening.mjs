@@ -875,6 +875,11 @@ try {
     `UPDATE share_invite SET "tokenDigest" = ${HEX("b")} WHERE id = 'inv-1'`,
     "55000",
   );
+  await expectFailure(
+    "share_invite_transition final sign-up claim",
+    `UPDATE share_invite SET "signupClaimedAt" = now(), "signupClaimedEmail" = 'x@example.test' WHERE id = 'inv-1'`,
+    "55000",
+  );
   // The accepted invite is history: the same e-mail may be invited again, once while pending,
   // and resend rotates the token and expiry of the pending one.
   await client.query(`
@@ -900,8 +905,25 @@ try {
     `UPDATE share_invite SET "tokenDigest" = ${HEX("e")}, "expiresAt" = now() + interval '14 days' WHERE id = 'inv-2'`,
   );
   // An invite-link sign-up reserves the pending invite.
-  await client.query(`UPDATE share_invite SET "signupClaimedAt" = now() WHERE id = 'inv-2'`);
+  await expectFailure(
+    "share_invite_shape claim without its e-mail",
+    `UPDATE share_invite SET "signupClaimedAt" = now() WHERE id = 'inv-2'`,
+    "23514",
+  );
+  await expectFailure(
+    "share_invite_shape claim e-mail not normalized",
+    `UPDATE share_invite SET "signupClaimedAt" = now(), "signupClaimedEmail" = 'X@Example.test' WHERE id = 'inv-2'`,
+    "23514",
+  );
+  await client.query(
+    `UPDATE share_invite SET "signupClaimedAt" = now(), "signupClaimedEmail" = 'x@example.test' WHERE id = 'inv-2'`,
+  );
   await client.query(`UPDATE share_invite SET "revokedAt" = now() WHERE id = 'inv-2'`);
+  await expectFailure(
+    "share_invite_transition final claim release",
+    `UPDATE share_invite SET "signupClaimedAt" = NULL, "signupClaimedEmail" = NULL WHERE id = 'inv-2'`,
+    "55000",
+  );
   await client.query(`
     INSERT INTO share_invite (id, "poolId", "ownerUserId", email, "tokenDigest", "expiresAt")
     VALUES ('inv-3', 'pool-a', 'owner-a', 'b@example.test', ${HEX("d")}, now() + interval '7 days')`);

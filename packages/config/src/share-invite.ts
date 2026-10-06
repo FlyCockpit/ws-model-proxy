@@ -11,6 +11,12 @@ export const SHARE_INVITE_TOKEN_PATTERN = /^wsmp_inv_[A-Z2-7]{26}$/;
 /** Request header of an invite sign-up. Shared with the server's CORS `allowHeaders`. */
 export const SHARE_INVITE_HEADER = "x-wsmp-invite";
 
+/**
+ * Error code of a sign-up refused because another e-mail's sign-up holds the invite link right
+ * now (Better Auth error body `code`); the sign-up page shows its own message for it.
+ */
+export const INVITE_IN_USE_CODE = "INVITE_IN_USE";
+
 /** The value as an invite token when it has the token's shape; otherwise null. */
 export function parseShareInviteToken(value: unknown): string | null {
   return typeof value === "string" && SHARE_INVITE_TOKEN_PATTERN.test(value) ? value : null;

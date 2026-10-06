@@ -2,7 +2,7 @@ import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link, redirect, useNavigate } from "@tanstack/react-router";
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
-import { SHARE_INVITE_HEADER } from "@ws-model-proxy/config/share-invite";
+import { INVITE_IN_USE_CODE, SHARE_INVITE_HEADER } from "@ws-model-proxy/config/share-invite";
 import { Button, buttonVariants } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
@@ -329,7 +329,10 @@ function AcceptInviteCard({
           {result === "invalid" ? t("auth:invite.invalidTitle") : t("auth:invite.title")}
         </CardTitle>
         <CardDescription className="break-words">
-          {refusal ?? t("auth:invite.signedInDescription", { ownerName, callableId })}
+          {refusal ??
+            (result === "in_use"
+              ? t("auth:invite.inUse")
+              : t("auth:invite.signedInDescription", { ownerName, callableId }))}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -387,9 +390,11 @@ function SignUpForm({
       if (result.error) {
         console.error("[signup.signUp]", result.error);
         toast.error(
-          result.error?.status === 409
-            ? t("auth:errors.accountAlreadyRegistered")
-            : friendly(result.error, t("auth:errors.couldNotCreateAccount")),
+          result.error?.code === INVITE_IN_USE_CODE
+            ? t("auth:invite.inUse")
+            : result.error?.status === 409
+              ? t("auth:errors.accountAlreadyRegistered")
+              : friendly(result.error, t("auth:errors.couldNotCreateAccount")),
         );
         return;
       }

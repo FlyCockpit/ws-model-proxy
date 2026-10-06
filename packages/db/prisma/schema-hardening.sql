@@ -1045,6 +1045,11 @@ FOR EACH ROW EXECUTE FUNCTION enforce_api_key_pool_access();
 
 -- Share invites (owner decision round 3): an e-mail without an account yet. The invite keeps
 -- the share's settings; acceptance (sign-up with that e-mail) creates the share and records it.
+-- A claim written before claims named their e-mail (fe5c26f7) is dropped, so the shape check
+-- below applies. The transition trigger (recreated below) would refuse it on a final invite.
+DROP TRIGGER IF EXISTS share_invite_transition ON share_invite;
+UPDATE share_invite SET "signupClaimedAt" = NULL, "signupClaimedEmail" = NULL
+ WHERE ("signupClaimedAt" IS NULL) <> ("signupClaimedEmail" IS NULL);
 ALTER TABLE share_invite DROP CONSTRAINT IF EXISTS share_invite_shape;
 ALTER TABLE share_invite ADD CONSTRAINT share_invite_shape CHECK (
   email = lower(btrim(email)) AND length(email) BETWEEN 3 AND 320 AND position('@' in email) > 1
@@ -1053,16 +1058,19 @@ ALTER TABLE share_invite ADD CONSTRAINT share_invite_shape CHECK (
   AND "expiresAt" > "createdAt"
   AND NOT ("acceptedAt" IS NOT NULL AND "revokedAt" IS NOT NULL)
   AND ("shareId" IS NULL OR "acceptedAt" IS NOT NULL)
+  -- An invite-link sign-up claim names its time and its (normalized) e-mail together.
+  AND (("signupClaimedAt" IS NULL) = ("signupClaimedEmail" IS NULL))
+  AND ("signupClaimedEmail" IS NULL OR "signupClaimedEmail" = lower(btrim("signupClaimedEmail")))
 );
 CREATE OR REPLACE FUNCTION enforce_share_invite_transition()
 RETURNS trigger LANGUAGE plpgsql AS $share_invite_transition$
 BEGIN
   IF (to_jsonb(NEW) - ARRAY['updatedAt', 'emailSentAt', 'acceptedAt', 'shareId', 'revokedAt',
                              'canUse', 'canContribute', 'priorityClass', 'tokenDigest',
-                             'expiresAt', 'signupClaimedAt']::text[])
+                             'expiresAt', 'signupClaimedAt', 'signupClaimedEmail']::text[])
       IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['updatedAt', 'emailSentAt', 'acceptedAt', 'shareId',
                              'revokedAt', 'canUse', 'canContribute', 'priorityClass', 'tokenDigest',
-                             'expiresAt', 'signupClaimedAt']::text[]) THEN
+                             'expiresAt', 'signupClaimedAt', 'signupClaimedEmail']::text[]) THEN
     RAISE EXCEPTION 'a share invite keeps its pool and e-mail' USING ERRCODE = '55000';
   END IF;
   -- Resend rotates the token and the expiry, only while the invite is pending, and the expiry
@@ -1082,6 +1090,8 @@ BEGIN
           OR NEW."canUse" IS DISTINCT FROM OLD."canUse"
           OR NEW."canContribute" IS DISTINCT FROM OLD."canContribute"
           OR NEW."priorityClass" IS DISTINCT FROM OLD."priorityClass"
+          OR NEW."signupClaimedAt" IS DISTINCT FROM OLD."signupClaimedAt"
+          OR NEW."signupClaimedEmail" IS DISTINCT FROM OLD."signupClaimedEmail"
           OR (NEW."shareId" IS NOT NULL AND NEW."shareId" IS DISTINCT FROM OLD."shareId")) THEN
     RAISE EXCEPTION 'an accepted or revoked share invite is final' USING ERRCODE = '55000';
   END IF;

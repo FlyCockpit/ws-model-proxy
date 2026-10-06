@@ -7,8 +7,9 @@
  *   verification routes, with `emailVerified` true only when verification is on.
  * - Invite-link sign-up: the sign-up page sends the `?invite=` token in the `x-wsmp-invite`
  *   header. The server's sign-up gate checks `isPendingShareInvite`; the user-create `before`
- *   hook reserves the invite (`claimShareInviteForSignup`, one sign-up per token) and the create
- *   `after` hook accepts the reserved invite (`acceptClaimedShareInvite`), both via the registry.
+ *   hook reserves the invite for the sign-up's e-mail (`claimShareInviteForSignup`, one e-mail
+ *   per token) and the create `after` hook accepts it (`acceptClaimedShareInvite`), both via the
+ *   registry.
  * - `acceptShareInviteByLink`: a signed-in person opening an invite link (`auth.acceptInvite`).
  *
  * Share and invite writes take the owner fences of both people before the first write.
@@ -16,16 +17,27 @@
 import {
   registerShareInviteAcceptor,
   registerShareInviteLinkAcceptor,
+  type ShareInviteClaimResult,
 } from "@ws-model-proxy/auth/share-invite-acceptance";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { fenceOwners, runCapacityOrderedTransaction } from "@ws-model-proxy/db/capacity-lock-order";
-import { type InviteAcceptance, inviteAcceptance } from "./invite-acceptance";
+import { type InviteAcceptance, inviteAcceptance, inviteEmailKey } from "./invite-acceptance";
 import {
+  claimUnchangedWhere,
   pendingInviteWhere,
+  SHARE_INVITE_SIGNUP_CLAIM_MS,
   SHARE_INVITE_TOKEN_PATTERN,
+  type SignupClaim,
   shareInviteDigest,
-  unclaimedInviteWhere,
 } from "./share-invites";
+
+/** The guarded acceptance write lost to a concurrent accept, revoke or claim (rolled back). */
+class InviteChangedError extends Error {
+  constructor() {
+    super("share invite changed concurrently");
+    this.name = "InviteChangedError";
+  }
+}
 
 type Tx = Prisma.TransactionClient;
 type InviteWhere = Prisma.ShareInviteWhereInput;
@@ -45,7 +57,7 @@ const inviteSelect = {
 type InviteRow = Prisma.ShareInviteGetPayload<{ select: typeof inviteSelect }>;
 
 /** What became of an invite link: accepted (now or already a share), or not. */
-export type LinkAcceptance = "accepted" | "invalid" | "own_pool";
+export type LinkAcceptance = "accepted" | "invalid" | "own_pool" | "in_use";
 
 /** Pending, plus whatever extra condition the caller holds the invite under. */
 function liveInviteWhere(now: Date, guard: InviteWhere): InviteWhere {
@@ -85,7 +97,7 @@ async function acceptOne(
     where: { id: invite.id, ...liveInviteWhere(now, guard) },
     data: { acceptedAt: now, shareId },
   });
-  if (updated.count !== 1) throw new Error("share invite changed concurrently");
+  if (updated.count !== 1) throw new InviteChangedError();
   return !existing;
 }
 
@@ -133,20 +145,53 @@ export async function acceptShareInvitesForProvenEmail(
   return applyAcceptance(user.id, emailInvites, decision, now);
 }
 
-/** The link's invite becomes a share for the user, whatever its e-mail (the token is proof). */
+/**
+ * Who may take an invite against its sign-up claim, for an account or sign-up with `email`:
+ * - `free`: never claimed, or the claim is stale and no account has the claimant e-mail;
+ * - `mine`: claimed by this e-mail (e-mails are unique: the same person, so it may take over
+ *   a fresh claim, e.g. after its sign-up rolled back);
+ * - `in_use`: another e-mail's sign-up claimed it within the claim window;
+ * - `taken`: a stale claim whose claimant now has an account (the invite stays with it; that
+ *   account accepts it signed in).
+ */
+type ClaimHold = "free" | "mine" | "in_use" | "taken";
+
+async function claimHold(claim: SignupClaim, email: string, now: Date): Promise<ClaimHold> {
+  if (claim.signupClaimedAt === null || claim.signupClaimedEmail === null) return "free";
+  if (claim.signupClaimedEmail === email) return "mine";
+  if (claim.signupClaimedAt.getTime() > now.getTime() - SHARE_INVITE_SIGNUP_CLAIM_MS)
+    return "in_use";
+  const claimant = await prisma.user.findUnique({
+    where: { email: claim.signupClaimedEmail },
+    select: { id: true },
+  });
+  return claimant ? "taken" : "free";
+}
+
+const claimSelect = { signupClaimedAt: true, signupClaimedEmail: true } as const;
+
+/**
+ * The link's invite becomes a share for the user, whatever its e-mail (the token is proof).
+ * `signup`: only the sign-up that holds the claim (same e-mail); `signed_in`: anyone the claim
+ * does not keep out. Every write is guarded on the claim being unchanged since it was read.
+ */
 async function acceptLink(
   user: { id: string; email: string },
   token: string,
-  guard: InviteWhere,
+  mode: "signup" | "signed_in",
   now: Date,
 ): Promise<LinkAcceptance> {
   if (!SHARE_INVITE_TOKEN_PATTERN.test(token)) return "invalid";
   const linkInvite = await prisma.shareInvite.findFirst({
-    where: { tokenDigest: shareInviteDigest(token), ...liveInviteWhere(now, guard) },
-    select: inviteSelect,
+    where: { tokenDigest: shareInviteDigest(token), ...pendingInviteWhere(now) },
+    select: { ...inviteSelect, ...claimSelect },
   });
   if (!linkInvite) return "invalid";
   if (linkInvite.ownerUserId === user.id) return "own_pool";
+  const hold = await claimHold(linkInvite, inviteEmailKey(user.email), now);
+  if (mode === "signup" && hold !== "mine") return "invalid";
+  if (hold === "in_use") return "in_use";
+  if (hold === "taken") return "invalid";
   const decision = inviteAcceptance({
     account: { email: user.email, emailVerified: false },
     linkInvite,
@@ -154,39 +199,46 @@ async function acceptLink(
     now,
   });
   if (!decision.accept) return "invalid";
-  return runCapacityOrderedTransaction(prisma, async (tx) => {
-    await fenceOwners(tx, [user.id, linkInvite.ownerUserId]);
-    // Re-read under the fences: a revoke, expiry or other acceptance since wins.
-    const current = await tx.shareInvite.findFirst({
-      where: { id: linkInvite.id, ...liveInviteWhere(now, guard) },
-      select: inviteSelect,
+  const guard = claimUnchangedWhere(linkInvite);
+  try {
+    return await runCapacityOrderedTransaction(prisma, async (tx) => {
+      await fenceOwners(tx, [user.id, linkInvite.ownerUserId]);
+      // Re-read under the fences: a revoke, expiry, other acceptance or new claim since wins.
+      const current = await tx.shareInvite.findFirst({
+        where: { id: linkInvite.id, ...liveInviteWhere(now, guard) },
+        select: inviteSelect,
+      });
+      if (!current) return "invalid";
+      await acceptOne(tx, current, user.id, now, guard);
+      return "accepted";
     });
-    if (!current) return "invalid";
-    await acceptOne(tx, current, user.id, now, guard);
-    return "accepted";
-  });
+  } catch (error) {
+    // Lost the guarded write to a concurrent change: the transaction rolled back.
+    if (error instanceof InviteChangedError) return "invalid";
+    throw error;
+  }
 }
 
 /**
- * A signed-in person accepts an invite link. An invite a sign-up has reserved (within the claim
- * window) is left to that sign-up.
+ * A signed-in person accepts an invite link. A fresh claim by another e-mail's sign-up is left
+ * to it (`in_use`); a claim of this person's own e-mail (a sign-up whose acceptance failed) is
+ * theirs to finish.
  */
 export async function acceptShareInviteByLink(
   user: { id: string; email: string },
   token: string,
   now: Date = new Date(),
 ): Promise<LinkAcceptance> {
-  return acceptLink(user, token, unclaimedInviteWhere(now), now);
+  return acceptLink(user, token, "signed_in", now);
 }
 
-/** The invite this sign-up reserved (`claimedAt`) becomes the new account's share. */
+/** The invite this new account's sign-up claimed (same e-mail) becomes its share. */
 export async function acceptClaimedShareInvite(
   user: { id: string; email: string },
   token: string,
-  claimedAt: Date,
   now: Date = new Date(),
 ): Promise<boolean> {
-  return (await acceptLink(user, token, { signupClaimedAt: claimedAt }, now)) === "accepted";
+  return (await acceptLink(user, token, "signup", now)) === "accepted";
 }
 
 /** Whether the token belongs to a pending, unexpired invite (looked up by its digest). */
@@ -203,29 +255,42 @@ export async function isPendingShareInvite(
 }
 
 /**
- * Reserves the token's pending invite for one sign-up: an atomic guarded update, so of two
- * sign-ups with one token at once only one gets the claim. Returns the claim's time (the
- * after hook accepts the invite under it), or null when the invite is not pending or another
- * sign-up holds it.
+ * Reserves the token's pending invite for one sign-up with `email`. The claim is a
+ * compare-and-swap on the claim as read, so of two sign-ups with one token at once only one
+ * wins. It runs outside Better Auth's sign-up transaction, so it survives a rolled-back
+ * sign-up; the same e-mail may then take it over at once.
  */
 export async function claimShareInviteForSignup(
   token: string,
+  email: string,
   now: Date = new Date(),
-): Promise<Date | null> {
-  if (!SHARE_INVITE_TOKEN_PATTERN.test(token)) return null;
-  const claimed = await prisma.shareInvite.updateMany({
-    where: {
-      tokenDigest: shareInviteDigest(token),
-      ...liveInviteWhere(now, unclaimedInviteWhere(now)),
-    },
-    data: { signupClaimedAt: now },
+): Promise<ShareInviteClaimResult> {
+  if (!SHARE_INVITE_TOKEN_PATTERN.test(token)) return "invalid";
+  const claimant = inviteEmailKey(email);
+  const invite = await prisma.shareInvite.findFirst({
+    where: { tokenDigest: shareInviteDigest(token), ...pendingInviteWhere(now) },
+    select: { id: true, ...claimSelect },
   });
-  return claimed.count === 1 ? now : null;
+  if (!invite) return "invalid";
+  const hold = await claimHold(invite, claimant, now);
+  if (hold === "in_use") return "in_use";
+  if (hold === "taken") return "invalid";
+  const claimed = await prisma.shareInvite.updateMany({
+    where: { id: invite.id, ...liveInviteWhere(now, claimUnchangedWhere(invite)) },
+    data: { signupClaimedAt: now, signupClaimedEmail: claimant },
+  });
+  if (claimed.count === 1) return "claimed";
+  // Lost the swap: to another claim (in use), or the invite was accepted, revoked or expired.
+  const still = await prisma.shareInvite.findFirst({
+    where: { id: invite.id, ...pendingInviteWhere(now) },
+    select: { id: true },
+  });
+  return still ? "in_use" : "invalid";
 }
 
 registerShareInviteAcceptor((user) => acceptShareInvitesForProvenEmail(user));
 registerShareInviteLinkAcceptor({
   isPending: (token) => isPendingShareInvite(token),
-  claim: (token) => claimShareInviteForSignup(token),
-  accept: (user, token, claimedAt) => acceptClaimedShareInvite(user, token, claimedAt),
+  claim: (token, email) => claimShareInviteForSignup(token, email),
+  accept: (user, token) => acceptClaimedShareInvite(user, token),
 });

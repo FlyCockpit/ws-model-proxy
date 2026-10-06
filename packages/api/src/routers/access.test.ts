@@ -591,7 +591,12 @@ describe("shares", () => {
     const token = new URL(result.link ?? "").searchParams.get("invite") ?? "";
     const call = db.shareInvite.updateMany.mock.calls[0]?.[0];
     expect(call?.where).toMatchObject({ id: "inv1", ownerUserId: "owner", acceptedAt: null });
-    expect(call?.data).toMatchObject({ tokenDigest: credentialDigest("shareInvite", token) });
+    expect(call?.data).toMatchObject({
+      tokenDigest: credentialDigest("shareInvite", token),
+      // The new link starts free of the old link's sign-up claim.
+      signupClaimedAt: null,
+      signupClaimedEmail: null,
+    });
     // Never past 30 days from the invite's creation.
     const expiry = (call?.data as { expiresAt: Date } | undefined)?.expiresAt.getTime() ?? 0;
     expect(expiry).toBeLessThanOrEqual(Date.now() - 86_400_000 + 30 * 86_400_000);

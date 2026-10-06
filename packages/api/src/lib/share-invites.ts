@@ -88,17 +88,18 @@ export function pendingInviteWhere(now: Date): Prisma.ShareInviteWhereInput {
 }
 
 /**
- * How long an invite-link sign-up holds its reservation of the invite (`signupClaimedAt`). A
- * sign-up that failed after reserving frees the link again once this has passed.
+ * How long an invite-link sign-up's reservation of the invite (`signupClaimedAt`) keeps other
+ * e-mails out. After that it is released, unless an account with the claimant e-mail exists.
  */
 export const SHARE_INVITE_SIGNUP_CLAIM_MS = 10 * 60_000;
 
-/** No invite-link sign-up holds the invite (never claimed, or the claim is stale). */
-export function unclaimedInviteWhere(now: Date): Prisma.ShareInviteWhereInput {
+/** An invite's sign-up claim, as read. */
+export type SignupClaim = { signupClaimedAt: Date | null; signupClaimedEmail: string | null };
+
+/** Compare-and-swap guard: the claim is still exactly what was read. */
+export function claimUnchangedWhere(claim: SignupClaim): Prisma.ShareInviteWhereInput {
   return {
-    OR: [
-      { signupClaimedAt: null },
-      { signupClaimedAt: { lt: new Date(now.getTime() - SHARE_INVITE_SIGNUP_CLAIM_MS) } },
-    ],
+    signupClaimedAt: claim.signupClaimedAt,
+    signupClaimedEmail: claim.signupClaimedEmail,
   };
 }

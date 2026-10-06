@@ -23,20 +23,19 @@ describe("share invite acceptance registry", () => {
   it("treats no link token as pending and accepts none until the API registers, then delegates", async () => {
     const token = "wsmp_inv_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     const user = { id: "u", email: "other@example.test" };
-    const claimedAt = new Date();
     await expect(isPendingShareInviteToken(token)).resolves.toBe(false);
-    await expect(claimShareInviteToken(token)).resolves.toBeNull();
-    await expect(acceptClaimedShareInviteToken(user, token, claimedAt)).resolves.toBe(false);
+    await expect(claimShareInviteToken(token, user.email)).resolves.toBe("invalid");
+    await expect(acceptClaimedShareInviteToken(user, token)).resolves.toBe(false);
     const isPending = vi.fn(async () => true);
-    const claim = vi.fn(async () => claimedAt);
+    const claim = vi.fn(async () => "claimed" as const);
     const accept = vi.fn(async () => true);
     registerShareInviteLinkAcceptor({ isPending, claim, accept });
     await expect(isPendingShareInviteToken(token)).resolves.toBe(true);
-    await expect(claimShareInviteToken(token)).resolves.toBe(claimedAt);
-    await expect(acceptClaimedShareInviteToken(user, token, claimedAt)).resolves.toBe(true);
+    await expect(claimShareInviteToken(token, user.email)).resolves.toBe("claimed");
+    await expect(acceptClaimedShareInviteToken(user, token)).resolves.toBe(true);
     expect(isPending).toHaveBeenCalledWith(token);
-    expect(claim).toHaveBeenCalledWith(token);
-    expect(accept).toHaveBeenCalledWith(user, token, claimedAt);
+    expect(claim).toHaveBeenCalledWith(token, user.email);
+    expect(accept).toHaveBeenCalledWith(user, token);
   });
 
   it("proves an e-mail only on the verification routes", () => {

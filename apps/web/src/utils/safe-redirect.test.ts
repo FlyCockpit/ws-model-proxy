@@ -23,6 +23,8 @@ describe("safeRedirectTo", () => {
     );
     for (const near of [
       `/en-US/signup?invite=${TOKEN}&redirectTo=https://evil.example`,
+      `/en-US/signup?invite=${TOKEN}&x=1`,
+      `/en-US/signup?invite=${TOKEN}#x`,
       `/en-US/signup?invite=${TOKEN}x`,
       "/en-US/signup?invite=wsmp_inv_short",
       `/en-US/signup?other=1&invite=${TOKEN}`,

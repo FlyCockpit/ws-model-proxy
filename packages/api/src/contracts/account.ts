@@ -95,7 +95,7 @@ export const authContract = {
   acceptInvite: mutation(
     "human",
     z.object({ token: z.string().regex(SHARE_INVITE_TOKEN_PATTERN) }).strict(),
-    z.object({ result: z.enum(["accepted", "invalid", "own_pool"]) }).strict(),
+    z.object({ result: z.enum(["accepted", "invalid", "own_pool", "in_use"]) }).strict(),
     "Accept a pool invite link as the signed-in person, whatever their e-mail (the token is the proof).",
   ),
   verifyEmailTransport: query(

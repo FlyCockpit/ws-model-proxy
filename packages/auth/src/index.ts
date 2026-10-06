@@ -4,7 +4,10 @@ import {
   slugifyForwarderSeed,
   validateForwarderSlug,
 } from "@ws-model-proxy/config/forwarder-identifiers";
-import { shareInviteTokenFromHeaders } from "@ws-model-proxy/config/share-invite";
+import {
+  INVITE_IN_USE_CODE,
+  shareInviteTokenFromHeaders,
+} from "@ws-model-proxy/config/share-invite";
 import prisma from "@ws-model-proxy/db";
 import { deleteUserDurably } from "@ws-model-proxy/db/parent-deletion";
 import { env } from "@ws-model-proxy/env/server";
@@ -16,7 +19,7 @@ import {
 } from "@ws-model-proxy/mailer";
 import { betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
-import { createAuthMiddleware } from "better-auth/api";
+import { APIError, createAuthMiddleware } from "better-auth/api";
 import { admin, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
 import { sanitizedApiErrorLogLine } from "./api-error-logging";
@@ -84,28 +87,30 @@ function signupInviteToken(
   return shareInviteTokenFromHeaders(context?.headers ?? context?.request?.headers);
 }
 
-type InviteClaim = { token: string; claimedAt: Date };
-
 /**
- * The invite each sign-up reserved in the user-create `before` hook, for its `after` hook.
+ * The invite token each sign-up claimed in the user-create `before` hook, for its `after` hook.
  * Better Auth hands both hooks the same endpoint context object.
  */
-const inviteClaims = new WeakMap<object, InviteClaim>();
+const inviteClaims = new WeakMap<object, string>();
+
+/** A second sign-up with an invite link another e-mail's sign-up holds right now. */
+function inviteInUseError(): APIError {
+  return new APIError("CONFLICT", {
+    code: INVITE_IN_USE_CODE,
+    message: "This invite link is in use. Try again shortly.",
+  });
+}
 
 /**
  * The invite link acceptance never fails the sign-up that carried it. A failure is logged with
- * the user id and the error class (never the token); the invite stays reserved until the claim
- * window passes, then the link works again.
+ * the user id and the error class (never the token). The claim stays with this account's
+ * e-mail, so the person can still accept the invite signed in (`auth.acceptInvite`).
  */
-async function acceptClaimedInviteQuietly(user: unknown, claim: InviteClaim): Promise<void> {
+async function acceptClaimedInviteQuietly(user: unknown, token: string): Promise<void> {
   const row = user as { id?: unknown; email?: unknown } | null;
   if (!row || typeof row.id !== "string" || typeof row.email !== "string") return;
   try {
-    const accepted = await acceptClaimedShareInviteToken(
-      { id: row.id, email: row.email },
-      claim.token,
-      claim.claimedAt,
-    );
+    const accepted = await acceptClaimedShareInviteToken({ id: row.id, email: row.email }, token);
     if (!accepted) console.error("share invite link acceptance refused", `user=${row.id}`);
   } catch (error) {
     console.error(
@@ -435,12 +440,15 @@ export const auth = betterAuth({
             name: typeof user.name === "string" ? user.name : undefined,
             email: typeof user.email === "string" ? user.email : undefined,
           });
-          // Reserve the invite for this one sign-up (atomic guarded update), after every other
-          // refusal so a refused request does not hold it. Of two sign-ups with one token only
-          // one gets the claim; the other is refused when the invite is what admits it.
-          if (inviteToken !== null && context) {
-            const claimedAt = await claimShareInviteToken(inviteToken);
-            if (claimedAt) inviteClaims.set(context, { token: inviteToken, claimedAt });
+          // Reserve the invite for this sign-up's e-mail (compare-and-swap), after every other
+          // refusal so a refused request does not hold it. The claim is written outside the
+          // sign-up transaction: if the insert rolls back, the same e-mail can retry at once.
+          // Another e-mail inside the claim window gets "in use"; an invite that is no longer
+          // available refuses the sign-up only when the invite is what admits it.
+          if (inviteToken !== null && context && typeof user.email === "string") {
+            const claim = await claimShareInviteToken(inviteToken, user.email);
+            if (claim === "claimed") inviteClaims.set(context, inviteToken);
+            else if (claim === "in_use") throw inviteInUseError();
             else if (reliesOnInvite) throw new SignupDisabledError();
           }
           const locale = resolveSignupLocale(context?.headers);
@@ -467,10 +475,10 @@ export const auth = betterAuth({
           if (isAdminCreateUserPath(typeof context?.path === "string" ? context.path : null)) {
             return;
           }
-          const claim = context ? inviteClaims.get(context) : undefined;
-          if (context && claim) {
+          const claimedToken = context ? inviteClaims.get(context) : undefined;
+          if (context && claimedToken) {
             inviteClaims.delete(context);
-            await acceptClaimedInviteQuietly(user, claim);
+            await acceptClaimedInviteQuietly(user, claimedToken);
           }
           await acceptInvitesQuietly(user);
         },

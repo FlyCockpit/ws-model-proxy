@@ -19,6 +19,13 @@ describe("parseSignupSearch", () => {
     });
   });
 
+  it("takes the invite back from a redirectTo that carries one (login, then sign up)", () => {
+    const back = encodeURIComponent(`/en-US/signup?invite=${TOKEN}`);
+    expect(fromUrl(`?redirectTo=${back}`)).toEqual({ invite: TOKEN, redirectTo: undefined });
+    const bad = encodeURIComponent(`/en-US/signup?invite=${TOKEN}&x=1`);
+    expect(fromUrl(`?redirectTo=${bad}`).invite).toBeUndefined();
+  });
+
   it("drops a malformed invite", () => {
     for (const bad of [
       "?invite=",
@@ -44,6 +51,12 @@ describe("urlWithoutInvite", () => {
     expect(
       urlWithoutInvite(`https://x.test/en-US/signup?redirectTo=%2Fen-US%2Fpools&invite=${TOKEN}#f`),
     ).toBe("/en-US/signup?redirectTo=%2Fen-US%2Fpools#f");
+  });
+
+  it("drops a login redirectTo that carries an invite, and keeps any other", () => {
+    const back = encodeURIComponent(`/en-US/signup?invite=${TOKEN}`);
+    expect(urlWithoutInvite(`https://x.test/en-US/login?redirectTo=${back}`)).toBe("/en-US/login");
+    expect(urlWithoutInvite("https://x.test/en-US/login?redirectTo=%2Fen-US%2Fpools")).toBeNull();
   });
 
   it("leaves a URL without an invite alone", () => {

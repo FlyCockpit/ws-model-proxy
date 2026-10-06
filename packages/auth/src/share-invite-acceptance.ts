@@ -17,13 +17,15 @@ export type ShareInviteLinkAcceptor = {
   /** Whether the token belongs to a pending, unexpired invite (reserves nothing). */
   isPending: (token: string) => Promise<boolean>;
   /**
-   * Reserves the token's pending invite for one sign-up (atomic): the claim's time, or null
-   * when the invite is not pending or another sign-up holds it.
+   * Reserves the token's pending invite for one sign-up's e-mail (atomic). `in_use`: another
+   * e-mail's sign-up holds it right now; `invalid`: not pending, or kept by another account.
    */
-  claim: (token: string) => Promise<Date | null>;
-  /** Turns the invite reserved at `claimedAt` into the user's share; false when it could not. */
-  accept: (user: { id: string; email: string }, token: string, claimedAt: Date) => Promise<boolean>;
+  claim: (token: string, email: string) => Promise<ShareInviteClaimResult>;
+  /** Turns the invite this user's sign-up claimed into their share; false when it could not. */
+  accept: (user: { id: string; email: string }, token: string) => Promise<boolean>;
 };
+
+export type ShareInviteClaimResult = "claimed" | "in_use" | "invalid";
 
 let acceptor: ShareInviteAcceptor | null = null;
 let linkAcceptor: ShareInviteLinkAcceptor | null = null;
@@ -48,18 +50,20 @@ export async function isPendingShareInviteToken(token: string): Promise<boolean>
   return linkAcceptor ? linkAcceptor.isPending(token) : false;
 }
 
-/** Reserves a link token's invite for one sign-up; null when no link acceptor is registered. */
-export async function claimShareInviteToken(token: string): Promise<Date | null> {
-  return linkAcceptor ? linkAcceptor.claim(token) : null;
+/** Reserves a link token's invite for a sign-up; `invalid` when no link acceptor is registered. */
+export async function claimShareInviteToken(
+  token: string,
+  email: string,
+): Promise<ShareInviteClaimResult> {
+  return linkAcceptor ? linkAcceptor.claim(token, email) : "invalid";
 }
 
-/** Accepts the invite a sign-up reserved; false when no link acceptor is registered. */
+/** Accepts the invite a sign-up claimed; false when no link acceptor is registered. */
 export async function acceptClaimedShareInviteToken(
   user: { id: string; email: string },
   token: string,
-  claimedAt: Date,
 ): Promise<boolean> {
-  return linkAcceptor ? linkAcceptor.accept(user, token, claimedAt) : false;
+  return linkAcceptor ? linkAcceptor.accept(user, token) : false;
 }
 
 /** Better Auth routes that prove an e-mail (link verification and the e-mail OTP flow). */

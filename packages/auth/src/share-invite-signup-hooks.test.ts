@@ -55,39 +55,44 @@ const { auth } = await import("./index");
 
 const TOKEN = "wsmp_inv_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const CLAIM_WINDOW_MS = 10 * 60_000;
+const IN_USE = "This invite link is in use";
 
 /**
- * One invite, held the way the API's guarded updates hold it: a claim succeeds only while the
- * invite is pending and unclaimed (or the claim is stale); acceptance needs that claim.
+ * One invite, held the way the API's compare-and-swap claim holds it: free when unclaimed; the
+ * same e-mail may take over; another e-mail waits out a fresh claim, and a stale claim is
+ * released only if no account has the claimant e-mail. Acceptance needs this e-mail's claim.
  */
 const invite = {
   pending: true,
-  claimedAt: null as Date | null,
+  claimedAt: null as number | null,
+  claimedEmail: null as string | null,
   clock: Date.now(),
   failAccept: false,
+  accounts: new Set<string>(),
 };
 const isPending = vi.fn(async (_token: string) => invite.pending);
-const claim = vi.fn(async (_token: string): Promise<Date | null> => {
-  const now = new Date(invite.clock);
-  const free =
-    invite.claimedAt === null || invite.claimedAt.getTime() < now.getTime() - CLAIM_WINDOW_MS;
-  if (!invite.pending || !free) return null;
-  invite.claimedAt = now;
-  return now;
+const claim = vi.fn(async (_token: string, email: string) => {
+  if (!invite.pending) return "invalid" as const;
+  if (invite.claimedAt !== null && invite.claimedEmail !== email) {
+    if (invite.claimedAt > invite.clock - CLAIM_WINDOW_MS) return "in_use" as const;
+    if (invite.claimedEmail !== null && invite.accounts.has(invite.claimedEmail))
+      return "invalid" as const;
+  }
+  invite.claimedAt = invite.clock;
+  invite.claimedEmail = email;
+  return "claimed" as const;
 });
-const accept = vi.fn(
-  async (_user: { id: string; email: string }, _token: string, claimedAt: Date) => {
-    if (invite.failAccept) throw new RangeError(`boom ${TOKEN}`);
-    if (!invite.pending || invite.claimedAt !== claimedAt) return false;
-    invite.pending = false;
-    return true;
-  },
-);
+const accept = vi.fn(async (user: { id: string; email: string }, _token: string) => {
+  if (invite.failAccept) throw new RangeError(`boom ${TOKEN}`);
+  if (!invite.pending || invite.claimedEmail !== user.email) return false;
+  invite.pending = false;
+  return true;
+});
 const acceptEmail = vi.fn(async () => 0);
 
-const row = (id = "new-user") => ({
+const row = (id = "new-user", email = `${id}@example.test`) => ({
   id,
-  email: "someone-else@example.test",
+  email,
   emailVerified: true,
   name: "New",
   createdAt: new Date(),
@@ -102,16 +107,29 @@ const withToken = (path = "/sign-up/email") => hookContext(path, { "x-wsmp-invit
 const hooks = () => auth.options.databaseHooks?.user?.create;
 const closed = { signupEnabled: false, adminBootstrapSignupEnabled: false, userCount: 3 };
 
-/** One sign-up the way Better Auth runs it: before, then (if admitted) after, one context. */
-async function signUp(context: never, id = "new-user") {
+/**
+ * One sign-up the way Better Auth runs it: before, the insert (the account now exists), then
+ * after, all with one context.
+ */
+async function signUp(id: string, context: never = withToken()) {
   const result = await hooks()?.before?.({ ...row(id), role: "admin" }, context);
+  invite.accounts.add(row(id).email);
   await hooks()?.after?.(row(id), context);
   return result;
 }
+/** A sign-up whose insert rolled back after the claim: before ran, no account, no after. */
+const rolledBackSignUp = (id: string) => hooks()?.before?.(row(id), withToken());
 
 beforeEach(() => {
   vi.clearAllMocks();
-  Object.assign(invite, { pending: true, claimedAt: null, clock: Date.now(), failAccept: false });
+  Object.assign(invite, {
+    pending: true,
+    claimedAt: null,
+    claimedEmail: null,
+    clock: Date.now(),
+    failAccept: false,
+    accounts: new Set<string>(),
+  });
   getSignupAccessState.mockResolvedValue(closed);
   registerShareInviteAcceptor(acceptEmail);
   registerShareInviteLinkAcceptor({ isPending, claim, accept });
@@ -121,20 +139,15 @@ afterEach(() => {
 });
 
 describe("invite-link sign-up with open sign-up off", () => {
-  it("admits a pending token as user, reserves the invite and accepts it for the new account", async () => {
-    const context = withToken();
-    await expect(signUp(context)).resolves.toMatchObject({ data: { role: "user" } });
-    expect(claim).toHaveBeenCalledWith(TOKEN);
-    expect(accept).toHaveBeenCalledWith(
-      { id: "new-user", email: "someone-else@example.test" },
-      TOKEN,
-      invite.claimedAt,
-    );
+  it("admits a pending token as user, claims the invite for the e-mail and accepts it", async () => {
+    await expect(signUp("friend")).resolves.toMatchObject({ data: { role: "user" } });
+    expect(claim).toHaveBeenCalledWith(TOKEN, "friend@example.test");
+    expect(accept).toHaveBeenCalledWith({ id: "friend", email: "friend@example.test" }, TOKEN);
     expect(invite.pending).toBe(false);
     expect(acceptEmail).toHaveBeenCalledTimes(1);
   });
 
-  it("lets one of two sign-ups with one token at once create, and refuses the other", async () => {
+  it("lets one of two sign-ups (two e-mails, one token) at once in; the other hears it is in use", async () => {
     const results = await Promise.allSettled([
       hooks()?.before?.(row("a"), withToken()),
       hooks()?.before?.(row("b"), withToken()),
@@ -142,30 +155,45 @@ describe("invite-link sign-up with open sign-up off", () => {
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     const refused = results.filter((result) => result.status === "rejected");
     expect(refused).toHaveLength(1);
-    expect(String((refused[0] as PromiseRejectedResult).reason)).toContain(SIGNUP_DISABLED_MESSAGE);
+    expect(String((refused[0] as PromiseRejectedResult).reason)).toContain(IN_USE);
   });
 
-  it("refuses the token again within the claim window after a failed acceptance, then frees it", async () => {
+  it("lets the same e-mail retry at once after its sign-up rolled back", async () => {
+    await rolledBackSignUp("friend");
+    invite.clock += 1_000;
+    await expect(signUp("friend")).resolves.toMatchObject({ data: { role: "user" } });
+    expect(invite.pending).toBe(false);
+  });
+
+  it("releases a rolled-back sign-up's claim to another e-mail once the window passed", async () => {
+    await rolledBackSignUp("gone");
+    invite.clock += CLAIM_WINDOW_MS / 2;
+    await expect(hooks()?.before?.(row("other"), withToken())).rejects.toThrow(IN_USE);
+    invite.clock += CLAIM_WINDOW_MS;
+    await expect(signUp("other")).resolves.toMatchObject({ data: { role: "user" } });
+    expect(invite.pending).toBe(false);
+  });
+
+  it("keeps the invite with the account whose acceptance failed, in and after the window", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     invite.failAccept = true;
-    await signUp(withToken(), "first");
+    await signUp("first");
     expect(error).toHaveBeenCalledWith(
       "share invite link acceptance failed",
       "user=first",
       "RangeError",
     );
     expect(JSON.stringify(error.mock.calls)).not.toContain(TOKEN);
-
     invite.failAccept = false;
+
     invite.clock += CLAIM_WINDOW_MS / 2;
-    await expect(hooks()?.before?.(row("second"), withToken())).rejects.toThrow(
+    await expect(hooks()?.before?.(row("second"), withToken())).rejects.toThrow(IN_USE);
+    invite.clock += CLAIM_WINDOW_MS;
+    // The claimant has an account (it accepts signed in, auth.acceptInvite): nobody else may.
+    await expect(hooks()?.before?.(row("third"), withToken())).rejects.toThrow(
       SIGNUP_DISABLED_MESSAGE,
     );
-
-    invite.clock += CLAIM_WINDOW_MS;
-    const context = withToken();
-    await expect(signUp(context, "third")).resolves.toMatchObject({ data: { role: "user" } });
-    expect(invite.pending).toBe(false);
+    expect(invite.claimedEmail).toBe("first@example.test");
   });
 
   it("refuses a token that is not pending, and a sign-up without one", async () => {
@@ -209,13 +237,19 @@ describe("invite-link sign-up with open sign-up off", () => {
 });
 
 describe("invite-link sign-up with open sign-up on", () => {
-  it("still reserves and accepts the invite, and signs up without it when it is taken", async () => {
+  beforeEach(() => {
     getSignupAccessState.mockResolvedValue({ ...closed, signupEnabled: true });
-    await signUp(withToken(), "first");
+  });
+
+  it("still claims and accepts the invite, and signs up without it once it is used", async () => {
+    await signUp("first");
     expect(invite.pending).toBe(false);
-    await expect(signUp(withToken(), "second")).resolves.toMatchObject({
-      data: { role: "user" },
-    });
+    await expect(signUp("second")).resolves.toMatchObject({ data: { role: "user" } });
     expect(accept).toHaveBeenCalledTimes(1);
+  });
+
+  it("says the link is in use rather than signing up without the invite", async () => {
+    await rolledBackSignUp("first");
+    await expect(hooks()?.before?.(row("second"), withToken())).rejects.toThrow(IN_USE);
   });
 });

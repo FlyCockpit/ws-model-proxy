@@ -466,7 +466,14 @@ async function writeInvite(
       }
       const rotated = await tx.shareInvite.updateMany({
         where: { id: args.inviteId, ownerUserId: args.ownerUserId, ...pendingInviteWhere(now) },
-        data: { tokenDigest, expiresAt, emailSentAt: null },
+        // A new link starts free: an old link's sign-up claim does not hold the new one.
+        data: {
+          tokenDigest,
+          expiresAt,
+          emailSentAt: null,
+          signupClaimedAt: null,
+          signupClaimedEmail: null,
+        },
       });
       if (rotated.count !== 1)
         throw notFound("That key, token, connection, share or invite does not exist.");

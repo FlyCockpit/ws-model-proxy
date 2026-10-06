@@ -78,15 +78,9 @@ describe("auth.acceptInvite (signed in)", () => {
     );
   });
 
-  it("answers invalid and own_pool as results", async () => {
-    accept.acceptShareInviteByLink.mockResolvedValueOnce("invalid");
-    await expect(client(signedIn()).acceptInvite({ token: TOKEN })).resolves.toEqual({
-      result: "invalid",
-    });
-    accept.acceptShareInviteByLink.mockResolvedValueOnce("own_pool");
-    await expect(client(signedIn()).acceptInvite({ token: TOKEN })).resolves.toEqual({
-      result: "own_pool",
-    });
+  it.each(["invalid", "own_pool", "in_use"] as const)("answers %s as a result", async (result) => {
+    accept.acceptShareInviteByLink.mockResolvedValueOnce(result);
+    await expect(client(signedIn()).acceptInvite({ token: TOKEN })).resolves.toEqual({ result });
   });
 
   it("refuses over the per-user budget, and fails closed without the limiter", async () => {
