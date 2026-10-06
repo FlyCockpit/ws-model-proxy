@@ -427,6 +427,22 @@
       "rulesHint": "Agents write these; you can delete them here.",
       "noRules": "No rules.",
       "deleteRule": "Delete rule {{rule}}"
+    },
+    "media": {
+      "intro": "Send images, audio and video to another pool first; this pool then gets text.",
+      "target": "Sidecar pool",
+      "none": "None",
+      "prompt": "Instruction for the sidecar",
+      "inputs": {
+        "IMAGE": "Images",
+        "AUDIO": "Audio",
+        "VIDEO": "Video"
+      },
+      "hints": {
+        "IMAGE": "An LLM pool describes each image.",
+        "AUDIO": "A transcription pool turns audio into text.",
+        "VIDEO": "An LLM pool describes each video."
+      }
     }
   },
   "runtime": {
@@ -612,6 +628,31 @@
       "preempted": "{{handle}} (to make room)",
       "profile_owned_node": "{{handle}} (a profile owns the node)"
     },
-    "poolCreated": "Pool created."
+    "poolCreated": "Pool created.",
+    "advanced": {
+      "intro": "Automatic unless overridden. Every change is a new version; running instances adopt it live.",
+      "sections": {
+        "limits": "Limits",
+        "advanced": "Restarts and token counting"
+      },
+      "sectionHints": {
+        "limits": "Per instance. Automatic values come from what the engine reports.",
+        "advanced": "How the server counts tokens and restarts failed instances."
+      },
+      "keys": {
+        "concurrencyLimit": "Concurrent requests",
+        "contextLimit": "Context limit",
+        "kvBudgetTokens": "KV cache budget",
+        "kvFullThreshold": "KV full at (fraction)",
+        "engineLoadGate": "Engine load gate",
+        "countStrategy": "Token counting",
+        "imageTokenAllowance": "Tokens per image",
+        "maxAttachmentBytes": "Max attachment size",
+        "restartBudget": "Automatic restarts allowed",
+        "restartWindowMin": "Restart window",
+        "unhealthyRestartMs": "Restart after unhealthy for",
+        "unavailableStopMs": "Stop other nodes after one is offline for"
+      }
+    }
   }
 }

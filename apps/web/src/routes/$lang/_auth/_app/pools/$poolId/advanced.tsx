@@ -13,17 +13,13 @@ import {
   CardHeader,
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
-import { Input } from "@ws-model-proxy/ui/components/input";
-import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Trash2 } from "lucide-react";
-import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
-import { NativeSelect } from "@/components/native-select";
-import { StatusPill } from "@/components/status-pill";
+import { RegistryOverrideRow } from "@/components/registry-override-row";
 import type { PoolView } from "@/lib/pool-ui";
 import { refusalText } from "@/lib/refusal-text";
 import { orpc } from "@/utils/orpc";
@@ -109,99 +105,29 @@ function AdvancedRow({
   const { t } = useTranslation(["dashboard", "common"]);
   const queryClient = useQueryClient();
   const labelKey = group === "affinity" || group === "protection" ? `${group}.${name}` : name;
-  const id = `advanced-${group}-${name}`;
-  const [draft, setDraft] = useState<string>(
-    view?.source === "override" && view.effective !== null ? String(view.effective) : "",
-  );
   const update = useMutation({
     ...orpc.pools.update.mutationOptions(),
     meta: { skipGlobalErrorToast: true },
   });
-  const save = async (value: Value) => {
-    try {
-      await update.mutateAsync({ poolId: pool.id, advanced: patchFor(group, name, value) });
-      await queryClient.invalidateQueries({ queryKey: orpc.pools.key() });
-      toast.success(t("dashboard:pool.saved"));
-      if (value === null) setDraft("");
-    } catch (error) {
-      toast.error(refusalText(error));
-    }
-  };
-  const parsed = (): Value | undefined => {
-    if (entry.kind === "bool")
-      return draft === "true" ? true : draft === "false" ? false : undefined;
-    if (entry.kind === "enum") return entry.values.includes(draft) ? draft : undefined;
-    const number = Number(draft);
-    if (draft.trim() === "" || !Number.isFinite(number)) return undefined;
-    if (entry.kind === "int" && !Number.isInteger(number)) return undefined;
-    return number >= entry.min && number <= entry.max ? number : undefined;
-  };
-  const next = parsed();
   return (
-    <form
-      className="flex min-w-0 flex-col gap-2 py-3"
-      onSubmit={(event) => {
-        event.preventDefault();
-        if (next !== undefined) save(next);
+    <RegistryOverrideRow
+      id={`advanced-${group}-${name}`}
+      label={t(`dashboard:pool.advanced.keys.${labelKey}`)}
+      entry={entry}
+      view={view}
+      pending={update.isPending}
+      onSave={async (value) => {
+        try {
+          await update.mutateAsync({ poolId: pool.id, advanced: patchFor(group, name, value) });
+          await queryClient.invalidateQueries({ queryKey: orpc.pools.key() });
+          toast.success(t("dashboard:pool.saved"));
+          return true;
+        } catch (error) {
+          toast.error(refusalText(error));
+          return false;
+        }
       }}
-    >
-      <div className="flex min-w-0 flex-wrap items-center gap-2">
-        <Label htmlFor={id} className="font-medium">
-          {t(`dashboard:pool.advanced.keys.${labelKey}`)}
-        </Label>
-        <StatusPill tone={view?.source === "override" ? "info" : "muted"}>
-          {t(`dashboard:pool.advanced.source.${view?.source ?? "default"}`)}
-        </StatusPill>
-        <span className="text-sm text-muted-foreground">
-          {view?.effective === null || view?.effective === undefined
-            ? t("dashboard:pool.advanced.unknown")
-            : String(view.effective)}
-          {"unit" in entry && entry.unit
-            ? ` ${t(`dashboard:pool.advanced.units.${entry.unit}`)}`
-            : ""}
-        </span>
-      </div>
-      <div className="flex min-w-0 flex-col gap-2 sm:flex-row">
-        {entry.kind === "bool" || entry.kind === "enum" ? (
-          <NativeSelect
-            id={id}
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            className="sm:max-w-xs"
-          >
-            <option value="">{t("dashboard:pool.advanced.pick")}</option>
-            {(entry.kind === "bool" ? ["true", "false"] : entry.values).map((value) => (
-              <option key={value} value={value}>
-                {entry.kind === "bool" ? t(`dashboard:pool.advanced.bool.${value}`) : value}
-              </option>
-            ))}
-          </NativeSelect>
-        ) : (
-          <Input
-            id={id}
-            inputMode={entry.kind === "int" ? "numeric" : "decimal"}
-            className="h-11 sm:max-w-xs"
-            placeholder={`${entry.min} – ${entry.max}`}
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-          />
-        )}
-        <Button type="submit" size="touch" disabled={next === undefined || update.isPending}>
-          {t("dashboard:pool.advanced.override")}
-        </Button>
-        {view?.source === "override" ? (
-          <Button
-            type="button"
-            variant="outline"
-            size="touch"
-            disabled={update.isPending}
-            onClick={() => save(null)}
-          >
-            {t("dashboard:pool.advanced.automatic")}
-          </Button>
-        ) : null}
-      </div>
-    </form>
+    />
   );
 }
 

@@ -427,6 +427,22 @@
       "rulesHint": "Los agentes las escriben; aquí puedes eliminarlas.",
       "noRules": "Sin reglas.",
       "deleteRule": "Eliminar regla {{rule}}"
+    },
+    "media": {
+      "intro": "Envía imágenes, audio y video primero a otro pool; este pool recibe texto.",
+      "target": "Pool auxiliar",
+      "none": "Ninguno",
+      "prompt": "Instrucción para el pool auxiliar",
+      "inputs": {
+        "IMAGE": "Imágenes",
+        "AUDIO": "Audio",
+        "VIDEO": "Video"
+      },
+      "hints": {
+        "IMAGE": "Un pool LLM describe cada imagen.",
+        "AUDIO": "Un pool de transcripción convierte el audio en texto.",
+        "VIDEO": "Un pool LLM describe cada video."
+      }
     }
   },
   "runtime": {
@@ -612,6 +628,31 @@
       "preempted": "{{handle}} (para hacer espacio)",
       "profile_owned_node": "{{handle}} (un perfil es dueño del nodo)"
     },
-    "poolCreated": "Pool creado."
+    "poolCreated": "Pool creado.",
+    "advanced": {
+      "intro": "Automático salvo que se sobrescriba. Cada cambio es una versión nueva; las instancias en ejecución la adoptan en vivo.",
+      "sections": {
+        "limits": "Límites",
+        "advanced": "Reinicios y conteo de tokens"
+      },
+      "sectionHints": {
+        "limits": "Por instancia. Los valores automáticos vienen de lo que reporta el motor.",
+        "advanced": "Cómo cuenta tokens el servidor y reinicia instancias con fallas."
+      },
+      "keys": {
+        "concurrencyLimit": "Solicitudes simultáneas",
+        "contextLimit": "Límite de contexto",
+        "kvBudgetTokens": "Presupuesto de caché KV",
+        "kvFullThreshold": "KV lleno a (fracción)",
+        "engineLoadGate": "Control por carga del motor",
+        "countStrategy": "Conteo de tokens",
+        "imageTokenAllowance": "Tokens por imagen",
+        "maxAttachmentBytes": "Tamaño máximo de adjunto",
+        "restartBudget": "Reinicios automáticos permitidos",
+        "restartWindowMin": "Ventana de reinicios",
+        "unhealthyRestartMs": "Reiniciar tras fallar durante",
+        "unavailableStopMs": "Detener los demás nodos si uno está desconectado durante"
+      }
+    }
   }
 }
