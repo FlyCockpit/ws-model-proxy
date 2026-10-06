@@ -262,7 +262,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "model_test",
     description:
-      "Send a test to a callable ID or one of your runtimes and see what served it and how fast; bench repeats it (not against :external).",
+      "Send a test to a callable ID (not :external) or one of your runtimes and see what served it and how fast; bench repeats it on your own pools and runtimes.",
     input: modelsContract.test.input,
     output: modelsContract.test.output,
     procedures: ["models.test"],

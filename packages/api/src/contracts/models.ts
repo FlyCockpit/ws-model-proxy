@@ -19,6 +19,7 @@ export const callableModelSchema = z
   .strict();
 
 export const modelTestTargetSchema = z.union([
+  /** `owner/pool`; `:external` cannot be tested (refused). */
   z.object({ pool: callableIdSchema }).strict(),
   z
     .object({
@@ -102,7 +103,7 @@ export const modelsContract = {
           .optional(),
       })
       .strict(),
-    "Send a test (source AGENT_TEST, counted in metrics). Transcription uses a built-in silent WAV; :external bench is refused.",
+    "Send a test (source AGENT_TEST, counted in metrics). Transcription uses a built-in silent WAV. :external cannot be tested; benches run only on your own pools and runtimes.",
     ["model_test"],
   ),
 } as const;

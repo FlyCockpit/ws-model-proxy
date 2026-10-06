@@ -208,6 +208,7 @@ import {
   resolvePublicProviderExecution,
 } from "./public-overflow.js";
 import { type RelayAttemptTerminal, type startRelayAttempt } from "./relay-executor.js";
+import { reportRelayRequestCreated } from "./relay-request-observer.js";
 import { classifyEngineContextOverflow, shouldRetryRelayOperation } from "./relay-retry-policy.js";
 import {
   LOCAL_RELAY_ATTEMPT_TTL_MS,
@@ -2330,6 +2331,7 @@ async function createRelayMetadata(input: RelayMetadataCreate): Promise<string> 
     },
     select: { id: true },
   });
+  reportRelayRequestCreated(row.id);
   return row.id;
 }
 
@@ -8223,6 +8225,88 @@ export async function chatTestCompletionsHandler({
     limiter,
     capacityRuntime,
   });
+}
+
+const MODEL_TEST_OPERATIONS = {
+  chat: {
+    family: "chat.completions",
+    method: "POST",
+    path: "/v1/chat/completions",
+    capability: "chat.completions",
+    appendTerminalUsage: true,
+  },
+  embeddings: {
+    family: "embeddings",
+    method: "POST",
+    path: "/v1/embeddings",
+    capability: "embeddings",
+  },
+  transcription: {
+    family: "audio",
+    method: "POST",
+    path: "/v1/audio/transcriptions",
+    capability: "audio.transcriptions",
+  },
+} as const satisfies Record<string, Omit<RelayOperation, "stream" | "buildRequest">>;
+
+/**
+ * `models.test` (model-test.ts): one chat, embeddings or transcription request as `userId`
+ * through the same targets, admission and routing as the Test page, tagged `AGENT_TEST`.
+ */
+export async function modelTestHandler({
+  request,
+  userId,
+  kind,
+  manager,
+  limiter,
+  capacityRuntime,
+}: {
+  request: Request;
+  userId: string;
+  kind: keyof typeof MODEL_TEST_OPERATIONS;
+  manager: NonNullable<ModelApiRouteDependencies["manager"]>;
+  limiter: ModelApiConcurrencyLimiter;
+  capacityRuntime: CapacityAdmissionRuntime;
+}): Promise<Response> {
+  const prepared =
+    kind === "transcription"
+      ? await prepareMultipartModeledRequest(request)
+      : await prepareJsonModeledRequest(request);
+  if (prepared instanceof Response) return prepared;
+  // A prepared multipart spool is owned here until routing takes it, and every path may try
+  // to clean it up, so cleanup runs once (as in authenticatedModeledHandler).
+  const originalDispose = prepared.dispose;
+  let disposed = false;
+  prepared.dispose = originalDispose
+    ? async () => {
+        if (disposed) return;
+        disposed = true;
+        await originalDispose();
+      }
+    : undefined;
+  let responseReturned = false;
+  try {
+    const targets = await listCallableTargetsForUser(userId);
+    const response = await relayPreparedModeledRequest({
+      request,
+      // Own limit key (as pool member tests): tests and benches do not use up the person's
+      // Test page slots; the per-user global cap still applies.
+      requester: {
+        ...requesterFromChatTestUser(userId, "AGENT_TEST"),
+        limitKey: `model-test:${userId}`,
+      },
+      targets,
+      prepared,
+      operation: MODEL_TEST_OPERATIONS[kind],
+      manager,
+      limiter,
+      capacityRuntime,
+    });
+    responseReturned = true;
+    return response;
+  } finally {
+    if (!responseReturned) await prepared.dispose?.();
+  }
 }
 
 function responsePathWithQuery(request: Request, path: string): string {
