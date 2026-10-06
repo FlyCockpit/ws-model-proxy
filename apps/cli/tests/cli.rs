@@ -326,10 +326,11 @@ fn connect_without_the_stop_marker_keeps_retrying_a_missing_credential() {
         json!({ "version": 1, "serverUrl": "http://127.0.0.1:9", "endpoints": [] }),
     );
     // A macOS LaunchAgent or detached daemon: exiting would only relaunch.
+    // The generous timeout leaves room for slow CI startup before the warning.
     cli(&config, &state)
         .arg("connect")
         .env_remove("WSMP_STOP_ON_REJECTED_CREDENTIAL")
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(10))
         .assert()
         .interrupted()
         .stderr(predicate::str::contains(
