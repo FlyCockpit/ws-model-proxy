@@ -939,3 +939,64 @@ describe("runtimes.fork (create-shaped output)", () => {
     expect(result.runtime.forkedFromVersionId).toBe("ver-9");
   });
 });
+
+describe("runtimes.instances.forget", () => {
+  const stopping = (claims: Array<"HELD" | "HELD_UNKNOWN" | "RELEASED">, phase = "STOPPING") => ({
+    id: "inst-1",
+    phase,
+    Ranks: claims.map((claim, rank) => ({ id: `rank-${rank}`, rank, claim })),
+  });
+
+  it("is for people only", async () => {
+    for (const auth of [CALLERS.fullAgent(), CALLERS.oauthAgent(), CALLERS.cookieWithoutCsrf()])
+      expect(await reasonOf(client(auth).instances.forget({ instanceId: "inst-1" }))).toBeDefined();
+    expect(db.instanceRank.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("refuses what is not the caller's, not stopping, or has no unproven stop", async () => {
+    db.runtimeInstance.findFirst.mockResolvedValueOnce(null);
+    expect(await reasonOf(client().instances.forget({ instanceId: "inst-1" }))).toBe("NOT_FOUND");
+    db.runtimeInstance.findFirst.mockResolvedValueOnce(stopping(["HELD"], "READY") as never);
+    expect(await reasonOf(client().instances.forget({ instanceId: "inst-1" }))).toBe("CONFLICT");
+    db.runtimeInstance.findFirst.mockResolvedValueOnce(stopping(["RELEASED"]) as never);
+    expect(await reasonOf(client().instances.forget({ instanceId: "inst-1" }))).toBe("CONFLICT");
+    db.runtimeInstance.findFirst.mockResolvedValueOnce(stopping(["HELD", "RELEASED"]) as never);
+    expect(await reasonOf(client().instances.forget({ instanceId: "inst-1", nodeNumber: 2 }))).toBe(
+      "CONFLICT",
+    );
+    expect(db.instanceRank.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("forgets the held ranks under the owner and capacity fences, audited as FORGET", async () => {
+    db.runtimeInstance.findFirst.mockResolvedValueOnce(stopping(["HELD", "HELD"]) as never);
+    db.runtimeOperation.create.mockResolvedValueOnce({ id: "op-f" } as never);
+    db.runtimeInstance.findFirst.mockResolvedValueOnce(null);
+    // The view read after the commit: gone meanwhile is NOT_FOUND, never a 500.
+    expect(await reasonOf(client().instances.forget({ instanceId: "inst-1", nodeNumber: 2 }))).toBe(
+      "NOT_FOUND",
+    );
+    expect(fenceLog.held).toEqual(expect.arrayContaining([expect.stringContaining("inst-1")]));
+    expect(db.runtimeOperation.create.mock.calls[0]?.[0]?.data).toMatchObject({
+      kind: "FORGET",
+      actor: "USER",
+      agentTokenId: null,
+      mcpGrantId: null,
+      summary: { instanceId: "inst-1", ranks: [1] },
+    });
+    expect(db.instanceRank.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ["rank-1"] }, claim: "HELD" },
+      data: expect.objectContaining({ claim: "HELD_UNKNOWN", forgottenBy: OWNER }),
+    });
+    // Only never-sent stops of the forgotten rank are dropped.
+    expect(db.instanceStep.updateMany).toHaveBeenCalledWith({
+      where: {
+        instanceId: "inst-1",
+        rank: { in: [1] },
+        phase: "STOP",
+        state: "PENDING",
+        attempts: 0,
+      },
+      data: { state: "CANCELLED" },
+    });
+  });
+});

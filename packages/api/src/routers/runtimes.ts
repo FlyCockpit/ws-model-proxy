@@ -1,10 +1,17 @@
+import { createHash } from "node:crypto";
 import { ORPCError } from "@orpc/server";
 import prisma from "@ws-model-proxy/db";
 import { contractProcedure, type SignedInContext, stub } from "../contract-procedure";
 import { agentRulesApply } from "../contracts/auth-context";
 import { runtimesContract as c, runtimeSlugSchema } from "../contracts/runtimes";
 import { callerActor } from "../lib/caller-actor";
-import { graphDelete, graphWrite, runtimeCapacityFences } from "../lib/graph-write";
+import { canonicalJson } from "../lib/canonical-json";
+import {
+  graphDelete,
+  graphWrite,
+  instanceCapacityFences,
+  runtimeCapacityFences,
+} from "../lib/graph-write";
 import {
   isForeignKeyViolation,
   isUniqueViolation,
@@ -40,6 +47,7 @@ import {
   versionDetail,
   versionSummary,
 } from "../lib/runtime-views";
+import { normalizeBaseUrl, parseDetectedServers } from "../nodes/views";
 import { runtimeStart, runtimeStop } from "./runtime-lifecycle";
 
 function userIdOf(context: SignedInContext): string {
@@ -697,7 +705,86 @@ export const runtimesRouter = {
     cancel: stub(c.steps.cancel),
   },
   instances: {
-    forget: stub(c.instances.forget),
+    /**
+     * A person gives up proving a stop (node gone or unable to prove it): the rank's claim
+     * becomes HELD_UNKNOWN. Placement keeps counting its resources and port until a status
+     * probe proves the stop; the instance settles STOPPED (spec §3.5). Audited as a FORGET
+     * operation.
+     */
+    forget: contractProcedure(c.instances.forget).handler(async ({ input, context }) => {
+      const userId = userIdOf(context);
+      const actor = callerActor(context.auth, userId);
+      const now = new Date();
+      const operationId = await graphWrite(
+        [userId],
+        async (tx) => {
+          const instance = await tx.runtimeInstance.findFirst({
+            where: { id: input.instanceId, userId },
+            select: {
+              id: true,
+              phase: true,
+              Ranks: { select: { id: true, rank: true, claim: true } },
+            },
+          });
+          if (!instance) throw notFound("That instance does not exist.");
+          const ranks = instance.Ranks.filter(
+            (rank) =>
+              rank.claim === "HELD" &&
+              (input.nodeNumber === undefined || rank.rank === input.nodeNumber - 1),
+          );
+          if (instance.phase !== "STOPPING" || ranks.length === 0)
+            throw new ORPCError("CONFLICT", {
+              message: "Nothing of this instance waits for a stop to be proven.",
+            });
+          const forgotten = ranks.map((rank) => rank.rank);
+          const operation = await tx.runtimeOperation.create({
+            data: {
+              userId,
+              kind: "FORGET",
+              actor: actor.actor,
+              actorUserId: actor.actorUserId,
+              agentTokenId: actor.agentTokenId,
+              mcpGrantId: actor.mcpGrantId,
+              summary: { instanceId: instance.id, ranks: forgotten },
+              fingerprint: createHash("sha256")
+                .update(canonicalJson({ forget: instance.id, ranks: forgotten }), "utf8")
+                .digest("hex"),
+            },
+            select: { id: true },
+          });
+          await tx.instanceRank.updateMany({
+            where: { id: { in: ranks.map((rank) => rank.id) }, claim: "HELD" },
+            data: {
+              claim: "HELD_UNKNOWN",
+              claimChangedAt: now,
+              forgottenAt: now,
+              forgottenBy: userId,
+            },
+          });
+          // Stops not yet sent for those ranks are not needed any more.
+          await tx.instanceStep.updateMany({
+            where: {
+              instanceId: instance.id,
+              rank: { in: forgotten },
+              phase: "STOP",
+              state: "PENDING",
+              attempts: 0,
+            },
+            data: { state: "CANCELLED" },
+          });
+          // The engine recomputes the instance's need (and settles it) on its next pass.
+          return operation.id;
+        },
+        async () => instanceCapacityFences([input.instanceId]),
+      );
+      await context.services?.dispatchRuntimeOperation?.({ userId, operationId });
+      const row = await prisma.runtimeInstance.findFirst({
+        where: { id: input.instanceId, userId },
+        include: INSTANCE_INCLUDE,
+      });
+      if (!row) throw notFound("That instance does not exist.");
+      return instanceView(row);
+    }),
   },
 
   models: {
@@ -726,11 +813,15 @@ export const runtimesRouter = {
         where: { id: node.id },
         select: { detectedServers: true },
       });
-      const servers = Array.isArray(detected.detectedServers) ? detected.detectedServers : [];
-      const match = servers.map(jsonObject).find((server) => server.baseUrl === input.baseUrl);
+      // The column holds the node's wire values (`runtime.detected`); `/v1` and the bare
+      // address name the same server.
+      const wanted = normalizeBaseUrl(input.baseUrl);
+      const match = parseDetectedServers(detected.detectedServers).find(
+        (server) => normalizeBaseUrl(server.baseUrl) === wanted,
+      );
       if (!match) throw notFound("This node did not report a server at that address.");
-      const engine = typeof match.engine === "string" ? match.engine.toLowerCase() : "other";
-      const api = match.api === "ANTHROPIC" ? "anthropic" : "openai";
+      const engine = match.engine;
+      const api = match.api;
       const parsed = runtimeSpecSchema.safeParse({
         api,
         engine,

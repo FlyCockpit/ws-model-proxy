@@ -207,6 +207,14 @@ export function normalizeBaseUrl(url: string): string {
   return url.replace(/\/+$/, "").replace(/\/v1$/, "");
 }
 
+/** The servers a node reported (`runtime.detected`), in their wire values; [] when unreadable. */
+export function parseDetectedServers(
+  value: unknown,
+): Array<z.infer<typeof detectedServerWireSchema>> {
+  const parsed = detectedServersColumnSchema.safeParse(value);
+  return parsed.success ? parsed.data : [];
+}
+
 export function toDetectedServers(
   value: unknown,
   alwaysOnByBaseUrl: ReadonlyMap<string, string>,
