@@ -11,6 +11,7 @@ import { agentRulesApply, isHumanCaller } from "../contracts/auth-context";
 import { profilesContract as c, type profileViewSchema } from "../contracts/profiles";
 import { assertMayWrite, callerActor } from "../lib/caller";
 import { planProfileHolds } from "../lib/profile-holds";
+import { planProfileSave } from "../lib/profile-save";
 import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
 import { runtimeSpecSchema } from "../lib/runtime-spec";
 import { effectiveHardware, liveMetrics } from "../nodes/hardware";
@@ -380,28 +381,32 @@ export const profileProcedures = {
           : null;
         if (input.profileId && !existing) throw notFound("Profile");
 
-        // Hold lines are people's (a hold is a deletion of capacity for everyone).
-        const existingHolds = (existing?.Nodes ?? [])
-          .filter((node) => node.hold)
-          .map((node) => ({ nodeId: node.nodeId, note: node.holdNote ?? undefined }));
-        const holds = input.holds ?? existingHolds;
-        if (!person && input.holds !== undefined && !sameHolds(input.holds, existingHolds))
-          throw refuse("human_only", "Only a person changes a profile's hold lines.", "FORBIDDEN");
-        const holdIds = new Set(holds.map((hold) => hold.nodeId));
-        if (holdIds.size !== holds.length)
-          throw new ORPCError("BAD_REQUEST", { message: "A node has two hold lines." });
-        for (const hold of holds)
-          if (!nodeIds.includes(hold.nodeId)) {
-            if (!person)
-              throw refuse(
-                "human_only",
-                "Keep every hold line's node: only a person removes a hold line.",
-                "FORBIDDEN",
-              );
-            throw new ORPCError("BAD_REQUEST", {
-              message: "A hold line names a node the profile does not own.",
-            });
-          }
+        // Hold lines are people's: lib/profile-save.ts is the one rule (security).
+        const savePlan = planProfileSave({
+          caller: person ? "person" : "agent",
+          before: (existing?.Nodes ?? [])
+            .filter((node) => node.hold)
+            .map((node) => ({ nodeId: node.nodeId, note: node.holdNote })),
+          after: {
+            nodeIds,
+            holds: input.holds?.map((hold) => ({ nodeId: hold.nodeId, note: hold.note ?? null })),
+          },
+        });
+        if (!savePlan.ok) {
+          if (savePlan.reason === "human_only")
+            throw refuse(
+              "human_only",
+              "Only a person adds, changes or removes a profile's hold lines, or drops a held node.",
+              "FORBIDDEN",
+            );
+          throw new ORPCError("BAD_REQUEST", {
+            message:
+              savePlan.reason === "duplicate_hold"
+                ? "A node has two hold lines."
+                : "A hold line names a node the profile does not own.",
+          });
+        }
+        const holds = savePlan.holds;
 
         // Items: runtimes are the caller's STARTABLE runtimes; pins stay unless asked.
         const runtimeIds = [...new Set(input.items.map((item) => item.runtimeId))];
@@ -648,18 +653,6 @@ export const profileProcedures = {
     };
   }),
 };
-
-function sameHolds(
-  a: ReadonlyArray<{ nodeId: string; note?: string }>,
-  b: ReadonlyArray<{ nodeId: string; note?: string }>,
-): boolean {
-  const key = (lines: ReadonlyArray<{ nodeId: string; note?: string }>) =>
-    lines
-      .map((line) => `${line.nodeId}\u0000${line.note ?? ""}`)
-      .sort()
-      .join("\u0001");
-  return key(a) === key(b);
-}
 
 /** A plain-JSON copy for a Json column (the preview has no Dates or class instances). */
 function toJsonValue(value: unknown): Prisma.InputJsonValue {
