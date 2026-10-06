@@ -209,6 +209,10 @@ pub fn run(args: &Args) -> Result<()> {
                     }
                 };
             }
+            // Where this shell looks; a service resolving a different state
+            // directory reads a different device credential.
+            shown["configFile"] = crate::paths::config_file()?.display().to_string().into();
+            shown["stateDir"] = crate::paths::state_dir()?.display().to_string().into();
             // An out-of-range value is shown as written, but flagged: the
             // relay refuses to start with it, so no limit is in effect.
             if let Err(error) = cfg.validate_max_terminals() {

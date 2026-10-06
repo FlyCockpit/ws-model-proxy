@@ -245,7 +245,13 @@ The terminals page shows each CLI's fingerprint: base32 of the first 20 bytes of
 - `wsmp service install` installs a **per-user** systemd unit (Linux) or
   LaunchAgent (macOS). Re-running install rewrites the unit/plist and restarts.
 - **Device credentials** (`wsmp login`) live in the state directory and work
-  under services without extra setup.
+  under services without extra setup. `wsmp service install` pins the config
+  file and state directory it resolved (`WSMP_CONFIG`, `WSMP_STATE_DIR`) into
+  the unit or wrapper, so the service reads the same `device-auth.json` as the
+  installing shell even when that shell set `WSMP_STATE_DIR` or
+  `XDG_STATE_HOME`. Re-run `wsmp service install` after changing either.
+  `wsmp config show` prints `configFile` and `stateDir`, and `wsmp status`
+  prints the state directory in use.
 - **A rejected credential stops the relay.** When the server answers the relay
   handshake with 401 or 403 (the credential was revoked, replaced by a newer
   `wsmp login`, or is invalid), or no credential exists, the relay exits with
