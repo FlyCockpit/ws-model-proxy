@@ -1781,9 +1781,12 @@ mod signal_shutdown {
                 stream
                     .write_all(response.as_bytes())
                     .expect("write handshake");
+                // The CLI signs only its configured server's origin.
                 write_text(
                     &mut stream,
-                    r#"{"type":"hello.challenge","nonce":"AAECAwQFBgcICQoLDA0ODw","origin":"http://127.0.0.1"}"#,
+                    &format!(
+                        r#"{{"type":"hello.challenge","nonce":"AAECAwQFBgcICQoLDA0ODw","origin":"http://{addr}"}}"#
+                    ),
                 );
                 let _ = socket_tx.send(stream.try_clone().expect("clone relay socket"));
                 while let Some((opcode, payload)) = read_frame(&mut stream) {

@@ -1123,6 +1123,7 @@ fn run_relay_session(
         ))
     })?;
     let (nonce, origin) = wait_for_hello_challenge(&mut socket)?;
+    check_hello_origin(&origin, ws_url)?;
     let identity_signature = identity
         .sign_hello(&nonce, cli_slug, &origin)
         .map_err(RelaySessionError::Fatal)?;
@@ -3894,6 +3895,38 @@ fn old_server_upgrade_error() -> RelaySessionError {
     ))
 }
 
+/// Refuses to sign a hello origin other than the server this CLI connected to.
+///
+/// The signature binds the origin so it cannot be replayed to another server.
+/// Signing whatever origin the challenge names would let a relay or a
+/// wrong-URL server that already holds the bearer credential forward a valid
+/// signature to the real server, so the origin must be the configured
+/// server's (the server URL's scheme, host and port).
+fn check_hello_origin(challenge_origin: &str, ws_url: &Url) -> RelaySessionResult<()> {
+    let expected = configured_server_origin(ws_url).map_err(RelaySessionError::Fatal)?;
+    if challenge_origin == expected {
+        return Ok(());
+    }
+    Err(RelaySessionError::Fatal(anyhow::anyhow!(
+        "server hello names origin `{challenge_origin}`, but this CLI connects to `{expected}`; \
+         refusing to sign it. The configured server URL must use the server's public origin \
+         (its BETTER_AUTH_URL); check it with `wsmp config show`"
+    )))
+}
+
+fn configured_server_origin(ws_url: &Url) -> Result<String> {
+    let scheme = match ws_url.scheme() {
+        "wss" => "https",
+        "ws" => "http",
+        other => anyhow::bail!("unsupported relay URL scheme `{other}`"),
+    };
+    let mut server = ws_url.clone();
+    server
+        .set_scheme(scheme)
+        .map_err(|_| anyhow::anyhow!("setting server URL scheme"))?;
+    Ok(server.origin().ascii_serialization())
+}
+
 fn wait_for_hello_challenge<S>(
     socket: &mut tungstenite::WebSocket<S>,
 ) -> RelaySessionResult<(String, String)>
@@ -4809,6 +4842,33 @@ mod tests {
                 "https://example.test".to_string()
             )
         );
+    }
+
+    #[test]
+    fn hello_origin_must_be_the_configured_servers() {
+        let https = websocket_url("https://proxy.example.com/base/").unwrap();
+        assert!(check_hello_origin("https://proxy.example.com", &https).is_ok());
+        let http = websocket_url("http://127.0.0.1:3000").unwrap();
+        assert!(check_hello_origin("http://127.0.0.1:3000", &http).is_ok());
+        let explicit_default_port = websocket_url("https://proxy.example.com:443").unwrap();
+        assert!(check_hello_origin("https://proxy.example.com", &explicit_default_port).is_ok());
+
+        // Another host, scheme or port, or a non-origin value, is never signed.
+        for origin in [
+            "https://other.example.com",
+            "http://proxy.example.com",
+            "https://proxy.example.com:8443",
+            "https://proxy.example.com/",
+            "https://PROXY.example.com",
+            "null",
+        ] {
+            match check_hello_origin(origin, &https) {
+                Err(RelaySessionError::Fatal(error)) => {
+                    assert!(error.to_string().contains("refusing to sign"), "{error}");
+                }
+                _ => panic!("{origin} must be refused as fatal"),
+            }
+        }
     }
 
     /// A malformed `exec.start` / `term.spawn` names a command but cannot be
