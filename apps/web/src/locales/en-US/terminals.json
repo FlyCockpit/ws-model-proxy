@@ -29,7 +29,6 @@
     "unauthorized": "Your session ended. Sign in again to use terminals."
   },
   "phase": {
-    "waiting": "Waiting",
     "opening": "Opening…",
     "live": "Connected",
     "rejected": "Refused",
@@ -60,7 +59,6 @@
     "limit": "Terminal limit reached. End a session and try again.",
     "invalid": "The relay refused this terminal request.",
     "ticket_invalid": "This terminal link expired or was already used. Open the terminal again.",
-    "declined": "The terminal was declined on the node.",
     "bad_handshake": "The secure handshake with the node failed.",
     "other": "The terminal was refused ({{reason}}).",
     "step_detached": "This terminal was disconnected. Open it again from Steps waiting for you."

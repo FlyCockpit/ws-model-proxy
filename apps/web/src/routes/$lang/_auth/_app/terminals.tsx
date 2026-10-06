@@ -54,7 +54,6 @@ const KNOWN_REJECTIONS: ReadonlySet<string> = new Set([
   "limit",
   "invalid",
   "ticket_invalid",
-  "declined",
   "bad_handshake",
   "step_detached",
 ]);

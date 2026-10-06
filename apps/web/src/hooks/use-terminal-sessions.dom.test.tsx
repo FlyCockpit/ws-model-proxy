@@ -35,11 +35,9 @@ import {
 } from "@/lib/terminal-protocol";
 
 import {
-  agentInputAllowed,
   STEP_DETACHED,
   TERMINAL_GONE,
   type TerminalOutputEvent,
-  type TerminalTab,
   useTerminalSessions,
 } from "./use-terminal-sessions";
 
@@ -217,8 +215,6 @@ async function listedCli(cli: FakeCli): Promise<ListedCli> {
 
 function listedTerminal(viewerAttached: boolean) {
   return {
-    origin: "user" as const,
-    supervised: null,
     terminalId: TERMINAL_ID,
     cliDeviceId: CLI_ID,
     cols: 80,
@@ -1413,7 +1409,7 @@ describe("useTerminalSessions CLI list refresh", () => {
   });
 });
 
-describe("useTerminalSessions (agent requests)", () => {
+describe("useTerminalSessions pushed lists", () => {
   beforeEach(async () => {
     // Handshakes of the previous test may still finish on the shared socket mock.
     await settle();
@@ -1421,197 +1417,20 @@ describe("useTerminalSessions (agent requests)", () => {
     socket.sendFrame.mockReset();
   });
 
-  function agentTerminal(status = "awaiting_user", shareOutput = true) {
-    return {
-      ...listedTerminal(false),
-      origin: "agent" as const,
-      supervised: {
-        commandId: "Y29tbWFuZC1pZC0wMDAwMQ",
-        status: status as "awaiting_user",
-        requester: "laptop agent",
-        reason: "needs sudo",
-        command: "sudo true",
-        cwd: "/home/me",
-        shareOutput,
-        createdAt: null,
-        expiresAt: null,
-        exitCode: null,
-        signal: null,
-      },
-    };
-  }
-
-  async function listAgent(status = "awaiting_user", shareOutput = true) {
-    currentCli = await fakeCli();
-    const listed = await listedCli(currentCli);
-    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
-    message({ type: "terminals", clis: [listed], terminals: [agentTerminal(status, shareOutput)] });
-    return { view, listed };
-  }
-
-  async function attachAgent() {
-    const context = await listAgent();
-    const localId = context.view.result.current.tabs[0]?.localId ?? "";
-    act(() => context.view.result.current.selectTab(localId));
-    const cli = await attachAsCli(VIEWER_ID);
-    await waitFor(() => expect(context.view.result.current.tabs[0]?.phase).toBe("live"));
-    const events: TerminalOutputEvent[] = [];
-    act(() => {
-      context.view.result.current.subscribeOutput(localId, (event) => events.push(event));
-    });
-    return { ...context, cli, localId, events };
-  }
-
-  async function rawBrowserPlaintexts(cli: Cli): Promise<Uint8Array[]> {
-    const out: Uint8Array[] = [];
-    for (const [frame] of socket.sendFrame.mock.calls) {
-      const decoded = decodeSealedFrame(frame);
-      out.push(
-        await openTerminalBytesV2({
-          key: cli.keys.browserToCli,
-          terminalId: TERMINAL_ID,
-          viewerId: cli.viewerId ?? "",
-          direction: DIRECTION_BROWSER_TO_CLI,
-          seq: BigInt(decoded.seq),
-          ciphertext: decoded.body,
-        }),
-      );
-    }
-    return out;
-  }
-
-  it("lists an agent request without attaching, and attaches when it is selected", async () => {
-    const { view } = await listAgent();
-    await settle();
-    expect(sentOfType("attach")).toEqual([]);
-    const tab = view.result.current.tabs[0];
-    expect(tab).toMatchObject({ origin: "agent", phase: "waiting" });
-    expect(tab?.supervised?.requester).toBe("laptop agent");
-    // A later list does not attach it either.
-    message({
-      type: "terminals",
-      clis: [await listedCli(requireCli())],
-      terminals: [agentTerminal()],
-    });
-    await settle();
-    expect(sentOfType("attach")).toEqual([]);
-    act(() => view.result.current.selectTab(tab?.localId ?? ""));
-    await waitFor(() => expect(sentOfType("attach")).toHaveLength(1));
-  });
-
-  it("lists a deployment step's terminal without attaching; picking it attaches, closing the tab keeps it listed", async () => {
-    currentCli = await fakeCli();
-    const listed = await listedCli(currentCli);
-    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
-    const deployment = {
-      ...listedTerminal(false),
-      origin: "deployment" as const,
-      supervised: null,
-      deployment: {
-        stepId: "step-1",
-        instanceId: "instance-1",
-        rank: 0,
-        action: "start" as const,
-        state: "awaiting" as const,
-      },
-    };
-    message({ type: "terminals", clis: [listed], terminals: [deployment] });
-    await settle();
-    expect(sentOfType("attach")).toEqual([]);
-    const tab = view.result.current.tabs[0];
-    expect(tab).toMatchObject({
-      origin: "deployment",
-      phase: "waiting",
-      deployment: { stepId: "step-1", action: "start" },
-    });
-    act(() => view.result.current.selectTab(tab?.localId ?? ""));
-    await waitFor(() => expect(sentOfType("attach")).toHaveLength(1));
-    // Closing the tab only stops viewing it: the step's terminal stays listed and waiting.
-    act(() => view.result.current.detachTab(tab?.localId ?? ""));
-    await settle();
-    expect(view.result.current.tabs[0]).toMatchObject({ origin: "deployment", phase: "waiting" });
-    expect(sentOfType("close")).toEqual([]);
-  });
-
-  it("drops keystrokes until the confirm screen has been shown", async () => {
-    const { view, cli, localId, events } = await attachAgent();
-    act(() => view.result.current.sendInput(localId, "\r"));
-    await settle();
-    expect(socket.sendFrame).not.toHaveBeenCalled();
-    const outKey = crypto.getRandomValues(new Uint8Array(32));
-    await unicast(cli, encodeTerminalOutputKey(1, outKey));
-    await unicast(cli, text("Press Enter to run"));
-    await waitFor(() => expect(outputText(events)).toBe("Press Enter to run"));
-    act(() => view.result.current.sendInput(localId, "\r"));
-    // The first keystroke takes over the writer: its size, then the data.
-    await waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(2));
-    const frames = await browserFrames(cli);
-    expect(frames.filter((frame) => "data" in frame)).toEqual([{ seq: 2, data: "\r" }]);
-  });
-
-  it("sends no keystrokes once the command is past running", async () => {
-    const { view, cli, localId, events, listed } = await attachAgent();
-    await unicast(cli, text("screen"));
-    await waitFor(() => expect(outputText(events)).toBe("screen"));
+  it("ends a live tab a pushed snapshot no longer lists", async () => {
+    const { view, localId } = await setup();
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
     message({
       type: "terminals",
       pushed: true,
-      clis: [listed],
-      terminals: [agentTerminal("awaiting_output_review")],
+      clis: [await listedCli(requireCli())],
+      terminals: [],
     });
-    act(() => view.result.current.sendInput(localId, "y\r"));
-    await settle();
-    expect(socket.sendFrame).not.toHaveBeenCalled();
-  });
-
-  it("shows the CLI-reported review flag and sends the toggle over the viewer's keys", async () => {
-    const { view, cli, localId } = await attachAgent();
-    expect(view.result.current.tabs[0]?.reviewOutput).toBeNull();
-    await unicast(cli, Uint8Array.of(0x06, 1));
-    await waitFor(() => expect(view.result.current.tabs[0]?.reviewOutput).toBe(true));
-    act(() => view.result.current.setReviewOutput(localId, false));
-    await waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(1));
-    const [toggle] = await rawBrowserPlaintexts(cli);
-    expect(Array.from(toggle ?? [])).toEqual([0x04, 0]);
-    // Nothing is set locally: the checkbox follows the CLI.
-    expect(view.result.current.tabs[0]?.reviewOutput).toBe(true);
-  });
-
-  it("does not send a review toggle when output is not shared", async () => {
-    const { view, localId } = await (async () => {
-      const context = await listAgent("awaiting_user", false);
-      const id = context.view.result.current.tabs[0]?.localId ?? "";
-      act(() => context.view.result.current.selectTab(id));
-      await attachAsCli(VIEWER_ID);
-      await waitFor(() => expect(context.view.result.current.tabs[0]?.phase).toBe("live"));
-      return { ...context, localId: id };
-    })();
-    act(() => view.result.current.setReviewOutput(localId, true));
-    await settle();
-    expect(socket.sendFrame).not.toHaveBeenCalled();
-  });
-
-  it("keeps a unicast review capture and clears it on request", async () => {
-    const { view, cli, localId } = await attachAgent();
-    const capture = Uint8Array.from([
-      0x05,
-      ...[0, 0, 0, 0, 0, 0, 0, 5],
-      ...[0, 0, 0, 5],
-      ...new TextEncoder().encode("hello"),
-    ]);
-    await unicast(cli, capture);
-    await waitFor(() => expect(view.result.current.tabs[0]?.reviewCapture).not.toBeNull());
-    const kept = view.result.current.tabs[0]?.reviewCapture;
-    expect(kept?.totalBytes).toBe(5);
-    expect(decoder.decode(kept?.head)).toBe("hello");
-    act(() => view.result.current.clearReviewCapture(localId));
-    expect(view.result.current.tabs[0]?.reviewCapture).toBeNull();
-  });
-
-  it("ends an agent tab a pushed snapshot no longer lists, without touching list accounting", async () => {
-    const { view, listed } = await listAgent();
-    message({ type: "terminals", pushed: true, clis: [listed], terminals: [] });
-    expect(view.result.current.tabs[0]).toMatchObject({ phase: "exited", error: TERMINAL_GONE });
+    expect(view.result.current.tabs[0]).toMatchObject({
+      localId,
+      phase: "exited",
+      error: TERMINAL_GONE,
+    });
   });
 
   it("does not end a user terminal that is still attaching when a push omits it", async () => {
@@ -1622,242 +1441,6 @@ describe("useTerminalSessions (agent requests)", () => {
     expect(view.result.current.tabs[0]?.phase).toBe("opening");
     message({ type: "terminals", pushed: true, clis: [listed], terminals: [] });
     expect(view.result.current.tabs[0]?.phase).toBe("opening");
-  });
-
-  it("sends Decline as a decline (never a close), keeps the tab, and stops its keystrokes", async () => {
-    const { view, cli, localId, events } = await attachAgent();
-    await unicast(cli, text("Press Enter to run"));
-    await waitFor(() => expect(outputText(events)).toBe("Press Enter to run"));
-    act(() => view.result.current.declineRequest(localId));
-    expect(sentOfType("decline")).toEqual([
-      { type: "decline", terminalId: TERMINAL_ID, requestId: expect.any(String) },
-    ]);
-    expect(sentOfType("close")).toEqual([]);
-    expect(view.result.current.tabs[0]).toMatchObject({ localId, phase: "live", decline: "sent" });
-    // This tab cannot press Enter after declining.
-    act(() => view.result.current.sendInput(localId, "\r"));
-    await settle();
-    expect(socket.sendFrame).not.toHaveBeenCalled();
-    // A second Decline is not sent again.
-    act(() => view.result.current.declineRequest(localId));
-    expect(sentOfType("decline")).toHaveLength(1);
-  });
-
-  it("shows that an Enter beat this tab's Decline, and lets it type into the running command", async () => {
-    const { view, cli, localId, events } = await attachAgent();
-    await unicast(cli, text("screen"));
-    await waitFor(() => expect(outputText(events)).toBe("screen"));
-    act(() => view.result.current.declineRequest(localId));
-    message({ type: "decline", terminalId: TERMINAL_ID, outcome: "started" });
-    await waitFor(() =>
-      expect(view.result.current.tabs[0]).toMatchObject({
-        decline: "started",
-        phase: "live",
-        supervised: expect.objectContaining({ status: "running" }),
-      }),
-    );
-    act(() => view.result.current.sendInput(localId, "y"));
-    await waitFor(() => expect(socket.sendFrame).toHaveBeenCalled());
-  });
-
-  it("ends a declined tab with the CLI's answer", async () => {
-    // A listed request this tab never viewed: Decline still works, and the
-    // relay sends the exit to the declining socket.
-    const { view } = await listAgent();
-    const waiting = view.result.current.tabs[0];
-    expect(waiting?.phase).toBe("waiting");
-    act(() => view.result.current.declineRequest(waiting?.localId ?? ""));
-    expect(sentOfType("decline")).toHaveLength(1);
-    message({
-      type: "exit",
-      terminalId: TERMINAL_ID,
-      exitCode: null,
-      signal: null,
-      supervisedStatus: "declined",
-    });
-    await waitFor(() =>
-      expect(view.result.current.tabs[0]).toMatchObject({
-        phase: "exited",
-        supervised: expect.objectContaining({ status: "declined" }),
-        // The exit answered it: no Decline is left out.
-        decline: null,
-      }),
-    );
-  });
-
-  it("never claims a Decline was sent while no socket took it, and lets the person retry", async () => {
-    const { view } = await listAgent();
-    const localId = view.result.current.tabs[0]?.localId ?? "";
-    socket.send.mockImplementation(() => "closed");
-    act(() => view.result.current.declineRequest(localId));
-    expect(view.result.current.tabs[0]).toMatchObject({ phase: "waiting", decline: "unsent" });
-    // Retrying while still offline stays unsent; once a socket takes it, it is sent.
-    act(() => view.result.current.declineRequest(localId));
-    expect(view.result.current.tabs[0]?.decline).toBe("unsent");
-    socket.send.mockImplementation(() => "sent");
-    act(() => view.result.current.declineRequest(localId));
-    expect(view.result.current.tabs[0]?.decline).toBe("sent");
-    expect(sentOfType("decline")).toHaveLength(3);
-  });
-
-  it("sends a Decline lost with its socket again when the new socket still lists the request waiting", async () => {
-    const { view, cli, localId, events, listed } = await attachAgent();
-    await unicast(cli, text("screen"));
-    await waitFor(() => expect(outputText(events)).toBe("screen"));
-    act(() => view.result.current.declineRequest(localId));
-    expect(sentOfType("decline")).toHaveLength(1);
-    // The socket drops before the relay answered: the relay forgot this Decline.
-    act(() => handlers().onDisconnect?.());
-    expect(view.result.current.tabs[0]?.decline).toBe("unsent");
-    act(() => handlers().onOpen?.());
-    message({ type: "terminals", clis: [listed], terminals: [agentTerminal()] });
-    expect(sentOfType("decline")).toHaveLength(2);
-    expect(view.result.current.tabs[0]?.decline).toBe("sent");
-    // The new socket is a decliner, so it hears the outcome.
-    message({
-      type: "exit",
-      terminalId: TERMINAL_ID,
-      exitCode: null,
-      signal: null,
-      supervisedStatus: "declined",
-    });
-    await waitFor(() =>
-      expect(view.result.current.tabs[0]).toMatchObject({
-        phase: "exited",
-        supervised: expect.objectContaining({ status: "declined" }),
-      }),
-    );
-  });
-
-  it("learns after a reconnect that an Enter came first, and types again", async () => {
-    const { view, cli, localId, events, listed } = await attachAgent();
-    await unicast(cli, text("screen"));
-    await waitFor(() => expect(outputText(events)).toBe("screen"));
-    act(() => view.result.current.declineRequest(localId));
-    act(() => handlers().onDisconnect?.());
-    act(() => handlers().onOpen?.());
-    message({ type: "terminals", clis: [listed], terminals: [agentTerminal("running")] });
-    // Started: nothing to decline, so nothing is sent again.
-    expect(sentOfType("decline")).toHaveLength(1);
-    expect(view.result.current.tabs[0]).toMatchObject({
-      decline: "started",
-      supervised: expect.objectContaining({ status: "running" }),
-    });
-    expect(
-      agentInputAllowed(
-        { ...(view.result.current.tabs[0] as TerminalTab), phase: "live" },
-        new Set([localId]),
-      ),
-    ).toBe(true);
-  });
-
-  it("ends the tab when the request ended while its Decline's socket was down", async () => {
-    const { view, listed } = await listAgent();
-    const localId = view.result.current.tabs[0]?.localId ?? "";
-    act(() => view.result.current.declineRequest(localId));
-    act(() => handlers().onDisconnect?.());
-    act(() => handlers().onOpen?.());
-    message({ type: "terminals", clis: [listed], terminals: [] });
-    expect(sentOfType("decline")).toHaveLength(1);
-    expect(view.result.current.tabs[0]).toMatchObject({ phase: "exited", error: TERMINAL_GONE });
-  });
-
-  it("frees a Decline the relay answered with an error, and asks for a list on not_found", async () => {
-    const { view } = await listAgent();
-    const localId = view.result.current.tabs[0]?.localId ?? "";
-    act(() => view.result.current.declineRequest(localId));
-    const first = sentOfType("decline")[0]?.requestId;
-    message({
-      type: "error",
-      terminalId: TERMINAL_ID,
-      requestId: first,
-      code: "offline",
-      message: "offline",
-    });
-    expect(view.result.current.tabs[0]?.decline).toBe("failed");
-    act(() => view.result.current.declineRequest(localId));
-    expect(sentOfType("decline")).toHaveLength(2);
-    const second = sentOfType("decline")[1]?.requestId;
-    expect(second).not.toBe(first);
-    expect(view.result.current.tabs[0]?.decline).toBe("sent");
-    const lists = sentOfType("list").length;
-    message({
-      type: "error",
-      terminalId: TERMINAL_ID,
-      requestId: second,
-      code: "not_found",
-      message: "gone",
-    });
-    expect(view.result.current.tabs[0]?.decline).toBe("failed");
-    expect(sentOfType("list")).toHaveLength(lists + 1);
-  });
-
-  it("lets the person retry a Decline the relay refused for rate, with no terminal id", async () => {
-    const { view } = await listAgent();
-    const localId = view.result.current.tabs[0]?.localId ?? "";
-    act(() => view.result.current.declineRequest(localId));
-    const requestId = sentOfType("decline")[0]?.requestId;
-    // The relay's rate-limit refusal is sent before the frame is read for
-    // its terminal; it names the frame by request id only.
-    message({
-      type: "error",
-      terminalId: null,
-      requestId,
-      code: "rate_limited",
-      message: "slow down",
-    });
-    expect(view.result.current.tabs[0]).toMatchObject({ decline: "failed", phase: "waiting" });
-    act(() => view.result.current.declineRequest(localId));
-    expect(sentOfType("decline")).toHaveLength(2);
-    expect(view.result.current.tabs[0]?.decline).toBe("sent");
-  });
-
-  it("keeps a Decline out when an error answers another frame of the same terminal", async () => {
-    const { view } = await listAgent();
-    const localId = view.result.current.tabs[0]?.localId ?? "";
-    act(() => view.result.current.declineRequest(localId));
-    const first = sentOfType("decline")[0]?.requestId;
-    message({
-      type: "error",
-      terminalId: TERMINAL_ID,
-      requestId: first,
-      code: "offline",
-      message: "",
-    });
-    act(() => view.result.current.declineRequest(localId));
-    // Errors without this Decline's id: an older Decline's, and another frame's.
-    message({
-      type: "error",
-      terminalId: TERMINAL_ID,
-      requestId: first,
-      code: "offline",
-      message: "",
-    });
-    message({ type: "error", terminalId: TERMINAL_ID, code: "not_found", message: "" });
-    message({
-      type: "error",
-      terminalId: TERMINAL_ID,
-      requestId: "other",
-      code: "invalid",
-      message: "",
-    });
-    expect(view.result.current.tabs[0]?.decline).toBe("sent");
-    // The exit still ends it.
-    message({
-      type: "exit",
-      terminalId: TERMINAL_ID,
-      exitCode: null,
-      signal: null,
-      supervisedStatus: "declined",
-    });
-    expect(view.result.current.tabs[0]).toMatchObject({ phase: "exited" });
-  });
-
-  it("keeps an agent request listed when its tab stops viewing it", async () => {
-    const { view, localId } = await attachAgent();
-    act(() => view.result.current.detachTab(localId));
-    expect(sentOfType("detach")).toHaveLength(1);
-    expect(view.result.current.tabs[0]).toMatchObject({ localId, phase: "waiting" });
   });
 });
 

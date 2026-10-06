@@ -65,15 +65,15 @@ export function sendTaken(result: TerminalSendResult): boolean {
  */
 const OUTBOX_REDO_LIMIT = 256;
 /**
- * User intents (close, decline, detach) at most this many. There is at most
- * one close per terminal and one Decline per tab out at a time, and a detach
- * needs a click per tab, so this is a safety bound, not a working limit.
+ * User intents (close, detach) at most this many. There is at most one close
+ * per terminal out at a time, and a detach needs a click per tab, so this is a
+ * safety bound, not a working limit.
  */
 const OUTBOX_INTENT_LIMIT = 1024;
 
 /** Frames that carry a person's decision; they leave ahead of redoable ones. */
 function isIntent(message: TerminalClientMessage): boolean {
-  return message.type === "close" || message.type === "decline" || message.type === "detach";
+  return message.type === "close" || message.type === "detach";
 }
 
 /**
@@ -208,8 +208,8 @@ export function useTerminalSocket(
   status: TerminalSocketStatus;
   /**
    * `sent` / `queued`: this socket took the message; it leaves now, or after
-   * the frames ahead of it once the rate budget allows (a close, Decline or
-   * detach goes ahead of lists, opens, attaches and auths). Neither is the
+   * the frames ahead of it once the rate budget allows (a close or detach
+   * goes ahead of lists, opens, attaches and auths). Neither is the
    * relay's answer: frames still waiting when the socket closes are dropped.
    * `closed` / `full`: nothing was kept (no open socket, or the queue is at
    * its bound). See `TerminalSendResult`.
