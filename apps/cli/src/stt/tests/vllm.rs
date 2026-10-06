@@ -316,19 +316,17 @@ fn vllm_profile(
     })
 }
 
-/// An environment variable present in this process whose value is a valid
-/// header value; it stands in for the endpoint's credential (tests never
-/// set variables: the crate forbids `unsafe`).
+/// A node secret standing in for the endpoint's credential.
 fn credential_env() -> (String, String) {
-    std::env::vars()
-        .find(|(name, value)| {
-            !name.is_empty()
-                && (1..=64).contains(&value.len())
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
-        })
-        .expect("a usable environment variable")
+    let pair = (
+        "WSMP_SECRET_STT_TEST".to_string(),
+        "stt-test-token".to_string(),
+    );
+    crate::secrets::test_secrets()
+        .lock()
+        .expect("test secrets")
+        .insert(pair.0.clone(), pair.1.clone());
+    pair
 }
 
 fn vllm_endpoint(base_url: &str, max_item_seconds: Option<u32>) -> EndpointConfig {

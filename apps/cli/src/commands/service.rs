@@ -132,9 +132,6 @@ pub fn restart_hint_after_login() -> Option<String> {
 /// Env var names the relay may need at runtime (CLI token + endpoint headers).
 pub fn required_service_env_names(config: &Config) -> Vec<String> {
     let mut names = Vec::new();
-    if let Some(env) = &config.cli_token_env {
-        names.push(env.clone());
-    }
     for endpoint in &config.endpoints {
         for header in &endpoint.headers {
             if !names.iter().any(|existing| existing == &header.env) {
@@ -415,7 +412,7 @@ fn xml_escape(value: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn install() -> Result<()> {
+pub fn install() -> Result<()> {
     let file = service_file()?;
     let executable = executable()?;
     let env_file = service_env_file()?;
@@ -436,7 +433,7 @@ fn install() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn install() -> Result<()> {
+pub fn install() -> Result<()> {
     let file = service_file()?;
     let executable = executable()?;
     let env_file = service_env_file()?;
@@ -489,7 +486,7 @@ fn install() -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn install() -> Result<()> {
+pub fn install() -> Result<()> {
     let _ = service_file()?;
     unreachable!()
 }
@@ -881,9 +878,8 @@ mod tests {
     }
 
     #[test]
-    fn required_env_names_include_token_and_headers_once() {
+    fn required_env_names_include_headers_once() {
         let config = Config {
-            cli_token_env: Some("WSMP_TOKEN".to_string()),
             endpoints: vec![EndpointConfig {
                 headers: vec![
                     HeaderEnvRef {
@@ -901,7 +897,7 @@ mod tests {
         };
         assert_eq!(
             required_service_env_names(&config),
-            vec!["WSMP_TOKEN".to_string(), "LOCAL_API_KEY".to_string()]
+            vec!["LOCAL_API_KEY".to_string()]
         );
     }
 

@@ -2487,6 +2487,17 @@ impl ExecRegistry {
         frames
     }
 
+    /// Lowering to Relay only: end every running command (its whole process
+    /// tree) and report each `interrupted`. The registry keeps answering polls.
+    pub(crate) fn interrupt_all(&mut self) -> Vec<OutboundFrame> {
+        let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
+        let mut frames = Vec::new();
+        for id in ids {
+            frames.extend(self.finish(&id, EndCause::Interrupted));
+        }
+        frames
+    }
+
     pub(crate) fn start(
         &mut self,
         startup: &TerminalStartup,
@@ -2944,7 +2955,6 @@ fn spawn_exec(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::McpCommandMode;
 
     /// A command lifetime longer than any test.
     const TEST_TIMEOUT_MS: u64 = 600_000;
@@ -2957,7 +2967,7 @@ mod tests {
     fn enabled_startup(approval: bool) -> TerminalStartup {
         let config = Config {
             allow_human_terminal: true,
-            mcp_command_mode: McpCommandMode::Unsupervised,
+            trust: Some(crate::protocol::frames::TrustValue::Full),
             require_terminal_approval: approval,
             ..Config::default()
         };
@@ -3544,7 +3554,7 @@ mod tests {
         assert_eq!(open_until_refused(&enabled_startup(false)), 4);
         let config = Config {
             allow_human_terminal: true,
-            mcp_command_mode: McpCommandMode::Unsupervised,
+            trust: Some(crate::protocol::frames::TrustValue::Full),
             max_terminals: Some(1),
             ..Config::default()
         };

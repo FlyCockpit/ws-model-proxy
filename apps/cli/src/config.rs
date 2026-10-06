@@ -16,9 +16,10 @@ use tempfile::NamedTempFile;
 #[cfg(unix)]
 use nix::fcntl::{Flock, FlockArg};
 
+use crate::protocol::frames::TrustValue;
 use crate::slug::validate_slug;
 
-pub const CONFIG_VERSION: u8 = 1;
+pub const CONFIG_VERSION: u8 = 3;
 
 /// Largest Anthropic thinking budget that remains exactly representable after
 /// the TypeScript encoder reserves 1,024 visible-output tokens.
@@ -211,32 +212,6 @@ impl ConfigLock {
     }
 }
 
-/// The 0.3 command switch, read once when the relay starts. Until config v3
-/// carries `trust` (C1) it decides the node's trust: `unsupervised` is Full
-/// control, anything else is Relay only (see `crate::startup`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum McpCommandMode {
-    #[default]
-    Off,
-    Supervised,
-    Unsupervised,
-}
-
-impl McpCommandMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Supervised => "supervised",
-            Self::Unsupervised => "unsupervised",
-        }
-    }
-
-    pub fn is_off(&self) -> bool {
-        matches!(self, Self::Off)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", from = "ConfigWire")]
 pub struct Config {
@@ -250,7 +225,16 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_origin: Option<String>,
     pub cli_slug: Option<String>,
-    pub cli_token_env: Option<String>,
+    /// The node's trust (`full` or `relay`), the authority for what the
+    /// server may do here. Lowering sticks: only `wsmp trust full` on a TTY
+    /// raises it, and a hot reload of this file never does. Unset means
+    /// Relay only (fail closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<TrustValue>,
+    /// Extra hosts (`ip[:port]`, IP literals only) an always-on runtime the
+    /// server defines may use besides loopback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_hosts: Vec<String>,
     pub endpoints: Vec<EndpointConfig>,
     /// Extra HTTP(S) origins whose signed `/media/{id}` URLs the relay may fetch
     /// and inline when an endpoint enables `expandMedia`. The connected server's
@@ -260,9 +244,6 @@ pub struct Config {
     /// Browser terminal master switch. Read once when the relay starts.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_human_terminal: bool,
-    /// MCP command policy. Read once when the relay starts.
-    #[serde(default, skip_serializing_if = "McpCommandMode::is_off")]
-    pub mcp_command_mode: McpCommandMode,
     /// Require a locally approved browser identity before opening a terminal.
     #[serde(default, skip_serializing_if = "is_false")]
     pub require_terminal_approval: bool,
@@ -276,9 +257,6 @@ pub struct Config {
     /// once when the relay starts; off by default.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_file_tools_as_root: bool,
-    /// Local read grant. Restart applies; off by default.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub mcp_file_read: bool,
     /// Explicit directory allowlist for every file operation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_roots: Vec<PathBuf>,
@@ -430,9 +408,9 @@ pub const DEFAULT_MAX_TERMINALS: u32 = 4;
 /// Accepted `maxTerminals` values (`wsmp config set-max-terminals`).
 pub const MAX_TERMINALS_RANGE: std::ops::RangeInclusive<u32> = 1..=32;
 
-/// The on-disk shape, including the legacy `allowMcpCommands` switch that
-/// older wsmp releases wrote. `true` there loads as `unsupervised`; the key is
-/// never written back.
+/// The on-disk shape. Keys of older releases (`cliTokenEnv`,
+/// `mcpCommandMode`, `allowMcpCommands`, `mcpFileRead`) are ignored and never
+/// written back: trust is the one switch now.
 #[derive(Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct ConfigWire {
@@ -440,16 +418,14 @@ struct ConfigWire {
     server_url: Option<String>,
     public_origin: Option<String>,
     cli_slug: Option<String>,
-    cli_token_env: Option<String>,
+    trust: Option<TrustValue>,
+    runtime_hosts: Vec<String>,
     endpoints: Vec<EndpointConfig>,
     media_trusted_origins: Vec<String>,
     allow_human_terminal: bool,
-    mcp_command_mode: Option<McpCommandMode>,
-    allow_mcp_commands: Option<bool>,
     require_terminal_approval: bool,
     max_terminals: Option<u32>,
     allow_file_tools_as_root: bool,
-    mcp_file_read: bool,
     #[serde(deserialize_with = "deserialize_file_roots")]
     file_roots: Vec<PathBuf>,
 }
@@ -462,16 +438,14 @@ impl Default for ConfigWire {
             server_url: None,
             public_origin: None,
             cli_slug: None,
-            cli_token_env: None,
+            trust: None,
+            runtime_hosts: Vec::new(),
             endpoints: Vec::new(),
             media_trusted_origins: Vec::new(),
             allow_human_terminal: false,
-            mcp_command_mode: None,
-            allow_mcp_commands: None,
             require_terminal_approval: false,
             max_terminals: None,
             allow_file_tools_as_root: false,
-            mcp_file_read: false,
             file_roots: Vec::new(),
         }
     }
@@ -479,26 +453,19 @@ impl Default for ConfigWire {
 
 impl From<ConfigWire> for Config {
     fn from(wire: ConfigWire) -> Self {
-        let mcp_command_mode = wire
-            .mcp_command_mode
-            .unwrap_or(match wire.allow_mcp_commands {
-                Some(true) => McpCommandMode::Unsupervised,
-                _ => McpCommandMode::Off,
-            });
         Self {
             version: wire.version,
             server_url: wire.server_url,
             public_origin: wire.public_origin,
             cli_slug: wire.cli_slug,
-            cli_token_env: wire.cli_token_env,
+            trust: wire.trust,
+            runtime_hosts: wire.runtime_hosts,
             endpoints: wire.endpoints,
             media_trusted_origins: wire.media_trusted_origins,
             allow_human_terminal: wire.allow_human_terminal,
-            mcp_command_mode,
             require_terminal_approval: wire.require_terminal_approval,
             max_terminals: wire.max_terminals,
             allow_file_tools_as_root: wire.allow_file_tools_as_root,
-            mcp_file_read: wire.mcp_file_read,
             file_roots: wire.file_roots,
         }
     }
@@ -511,15 +478,14 @@ impl Default for Config {
             server_url: None,
             public_origin: None,
             cli_slug: None,
-            cli_token_env: None,
+            trust: None,
+            runtime_hosts: Vec::new(),
             endpoints: Vec::new(),
             media_trusted_origins: Vec::new(),
             allow_human_terminal: false,
-            mcp_command_mode: McpCommandMode::Off,
             require_terminal_approval: false,
             max_terminals: None,
             allow_file_tools_as_root: false,
-            mcp_file_read: false,
             file_roots: Vec::new(),
         }
     }
@@ -2130,13 +2096,10 @@ mod tests {
         assert!(file_roots_usable(&good));
         assert!(!file_roots_usable(&[models, alias]));
         let default: Config = serde_json::from_str("{}").expect("default");
-        assert!(!default.mcp_file_read);
         assert!(default.file_roots.is_empty());
         let sparse = serde_json::to_value(&default).expect("serialize");
-        assert!(sparse.get("mcpFileRead").is_none());
         assert!(sparse.get("fileRoots").is_none());
         let enabled = Config {
-            mcp_file_read: true,
             file_roots: good,
             ..Config::default()
         };
@@ -2147,13 +2110,11 @@ mod tests {
         .expect("field order");
         assert_eq!(reordered, enabled);
         let value = serde_json::to_value(&enabled).expect("serialize");
-        assert_eq!(value["mcpFileRead"], true);
         assert_eq!(
             serde_json::from_value::<Config>(value).expect("roundtrip"),
             enabled
         );
         for text in [
-            r#"{"mcpFileRead":"true"}"#,
             r#"{"fileRoots":"/tmp"}"#,
             r#"{"fileRoots":[{"path":"/tmp"}]}"#,
             r#"{"fileRoots":[["/tmp"]]}"#,
@@ -2162,7 +2123,7 @@ mod tests {
             r#"{"fileRoots":["/"]}"#,
             r#"{"fileRoots":["/tmp/../tmp"]}"#,
             r#"{"fileRoots":["/tmp","/tmp/"]}"#,
-            r#"{"mcpFileRead":true,"mcpFileRead":false}"#,
+            r#"{"fileRoots":["/tmp"],"fileRoots":["/tmp"]}"#,
         ] {
             assert!(serde_json::from_str::<Config>(text).is_err(), "{text}");
         }
@@ -2475,33 +2436,31 @@ mod tests {
     }
 
     #[test]
-    fn legacy_allow_mcp_commands_loads_as_a_mode_and_is_not_written_back() {
-        let on: Config =
-            serde_json::from_value(serde_json::json!({ "version": 1, "allowMcpCommands": true }))
-                .expect("legacy on");
-        assert_eq!(on.mcp_command_mode, McpCommandMode::Unsupervised);
-        let written = serde_json::to_value(&on).expect("serialize");
-        assert!(written.get("allowMcpCommands").is_none());
-        assert_eq!(written["mcpCommandMode"], "unsupervised");
-        let off: Config =
-            serde_json::from_value(serde_json::json!({ "version": 1, "allowMcpCommands": false }))
-                .expect("legacy off");
-        assert_eq!(off.mcp_command_mode, McpCommandMode::Off);
-        assert!(
-            serde_json::to_value(&off)
-                .expect("serialize")
-                .get("mcpCommandMode")
-                .is_none()
-        );
-        let explicit: Config = serde_json::from_value(serde_json::json!({
-            "version": 1, "allowMcpCommands": true, "mcpCommandMode": "supervised"
+    fn trust_is_read_and_legacy_switches_are_dropped() {
+        let legacy: Config = serde_json::from_value(serde_json::json!({
+            "version": 1, "allowMcpCommands": true, "mcpCommandMode": "unsupervised",
+            "cliTokenEnv": "WSMP_TOKEN", "mcpFileRead": true
         }))
-        .expect("explicit wins");
-        assert_eq!(explicit.mcp_command_mode, McpCommandMode::Supervised);
-        assert!(
-            serde_json::from_value::<Config>(serde_json::json!({ "mcpCommandMode": "sometimes" }))
-                .is_err()
+        .expect("legacy keys load");
+        assert_eq!(legacy.trust, None);
+        let written = serde_json::to_value(&legacy).expect("serialize");
+        for key in [
+            "allowMcpCommands",
+            "mcpCommandMode",
+            "cliTokenEnv",
+            "mcpFileRead",
+            "trust",
+        ] {
+            assert!(written.get(key).is_none(), "{key}");
+        }
+        let relay: Config =
+            serde_json::from_value(serde_json::json!({ "trust": "relay" })).expect("trust relay");
+        assert_eq!(relay.trust, Some(TrustValue::Relay));
+        assert_eq!(
+            serde_json::to_value(&relay).expect("serialize")["trust"],
+            "relay"
         );
+        assert!(serde_json::from_value::<Config>(serde_json::json!({ "trust": "root" })).is_err());
     }
 
     #[test]

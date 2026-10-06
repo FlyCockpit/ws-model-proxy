@@ -14,6 +14,8 @@ pub mod login;
 pub mod logout;
 pub mod recover;
 pub mod run;
+pub mod secret;
 pub mod service;
 pub mod status;
 pub mod terminal;
+pub mod trust;

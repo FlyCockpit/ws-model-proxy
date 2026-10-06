@@ -47,8 +47,14 @@ pub enum LogFormat {
 /// The subcommands. Add new ones here, then implement them in `src/commands/`.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Start device-code login and store the approved device credential.
+    /// Enroll this machine as a node with a code from the Nodes page.
     Login(crate::commands::login::Args),
+
+    /// Show or set what the server may do on this machine.
+    Trust(crate::commands::trust::Args),
+
+    /// Set, list or remove node secrets (`WSMP_SECRET_*`).
+    Secret(crate::commands::secret::Args),
 
     /// Inspect the configuration file and resolved paths.
     Config(crate::commands::config::Args),
@@ -62,7 +68,7 @@ pub enum Command {
     /// Show whether the relay is running and connected.
     Status(crate::commands::status::Args),
 
-    /// Remove stored local authentication state.
+    /// Forget this node's credential.
     Logout(crate::commands::logout::Args),
 
     /// Generate shell completion scripts.

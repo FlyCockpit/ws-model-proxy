@@ -8,19 +8,12 @@
 //! loop drains, and the server paces request-body frames with credit-based flow
 //! control (`relay.request.body.ack`).
 //!
-//! S0 stubs (the lanes replace them, the frames stay):
-//! - runtime handles resolve against the configured endpoints by slug until
-//!   the runtime store (`runtimes.json`, C2) holds definitions;
-//! - `runtime.define` stores nothing: every version is rejected (`invalid`, or
-//!   `trust_relay` at Relay only) and the held set stays empty;
-//! - `runtime.job` fails before admission (`definition_missing`, or
-//!   `definition_frozen` at Relay only), so the rank is released;
-//! - `runtime.inventory` is one empty snapshot after `hello.ok`;
-//! - `runtime.detect` answers an empty scan (detection lands in C2);
-//! - `trust.lower` latches Relay only for this daemon and persists it through
-//!   the 0.3 command switch (config v3 `trust` lands in C1);
-//! - commands that a daemon restart interrupted are not reported as
-//!   `interrupted` yet (needs a persisted table of running ids, C3).
+//! Runtime handles resolve only through held definitions
+//! (`crate::runtime_store`) and the node's instance records. Trust is the
+//! node's own (`crate::trust`): lowered by `trust.lower`, `wsmp trust relay`
+//! or a hand edit (hot reload), raised only by `wsmp trust full`.
+//!
+//! Not implemented yet: `runtime.detect` answers an empty scan.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
@@ -40,7 +33,7 @@ use tungstenite::{Message, connect};
 use url::Url;
 
 use crate::auth::{join, resolve_credential};
-use crate::config::{Config, ConfigLock, EndpointAuthMode, McpCommandMode};
+use crate::config::{Config, ConfigLock, EndpointAuthMode};
 use crate::control::ControlServer;
 #[cfg(unix)]
 use crate::control::{self, ControlCommand, ControlResponse};
@@ -51,8 +44,8 @@ use crate::media::{
 #[cfg(test)]
 use crate::protocol::decode_binary_frame;
 use crate::protocol::frames::{
-    CountMethod, DefineEntryResult, DefineNodeResult, DefineRejectReason, DefineStatus, HttpMethod,
-    JobError, JobStatus, RelayUsage, SecretRefusal, SecretStatus,
+    CountMethod, HttpMethod, JobError, JobStatus, RelayUsage, SecretRefusal, SecretStatus,
+    TrustValue,
 };
 use crate::protocol::{
     FrameFault, NodeBinaryMetadata, NodeFrame, ProtocolErrorCode,
@@ -62,6 +55,8 @@ use crate::protocol::{
     parse_server_control,
 };
 use crate::relay_bus::{FromWorker, WsFrame};
+use crate::runtime_store::{Defines, Store};
+use crate::runtimes::endpoints::Target;
 use crate::sessions::{
     DEFAULT_COMMAND_MAX, ExecRegistry, OutboundFrame, TermHandshake, TerminalRegistry,
 };
@@ -409,7 +404,7 @@ pub fn connect_foreground() -> Result<()> {
     loop {
         check_shutdown()?;
         let node_slug = ensure_cli_slug(&mut config)?;
-        let credential = match resolve_credential(&config) {
+        let credential = match resolve_credential() {
             Ok(credential) => credential,
             // Definitely no credential: stop only where nothing restarts us in
             // a loop (see `stop_on_unusable_credential`).
@@ -431,14 +426,11 @@ pub fn connect_foreground() -> Result<()> {
                 continue;
             }
         };
-        let secret = match credential {
-            crate::auth::ResolvedCredential::CliToken { secret, .. } => secret,
-            crate::auth::ResolvedCredential::Device { secret } => secret,
-        };
+        let secret = credential;
         let server_url = config
             .server_url
             .clone()
-            .context("server URL is not configured; run `wsmp config set-server <URL>`")?;
+            .context("this node is not enrolled; run `wsmp login <url> --code <code>`")?;
         let ws_url = websocket_url(&server_url)?;
         let auth_value = HeaderValue::from_str(&format!("Bearer {secret}"))
             .context("building websocket authorization header")?;
@@ -490,14 +482,84 @@ pub fn connect_foreground() -> Result<()> {
     }
 }
 
-/// The trust word `wsmp status` shows.
-fn trust_word(startup: &TerminalStartup) -> &'static str {
-    if startup.full_control() {
-        "full"
-    } else {
-        "relay"
+/// What a control request or a hot reload changed, for the live session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeChange {
+    /// Trust went down to Relay only (persisted and frozen already).
+    Lowered,
+    /// Trust went up to Full control (persisted and unfrozen already).
+    Raised,
+    /// Features changed (secrets, runtime hosts): report `node.state`.
+    Features,
+}
+
+/// Lower to Relay only: persist, freeze, latch. Whether it changed.
+fn apply_lower(startup: &TerminalStartup) -> Result<bool> {
+    crate::trust::persist_relay()?;
+    Ok(startup.lower_trust())
+}
+
+/// Hot reload (every 2 s on a changed `config.json`, and on `Reload`):
+/// runtime hosts follow the file; trust only ever goes down. A file that
+/// says `full` while the node is Relay only is written back to `relay`.
+fn reload_config(startup: &TerminalStartup) -> Result<Vec<NodeChange>> {
+    let config = Config::load_required()?;
+    let mut changes = vec![NodeChange::Features];
+    startup.set_runtime_hosts(config.runtime_hosts.clone());
+    let file_trust = crate::trust::configured(&config);
+    match (startup.trust_value(), file_trust) {
+        (TrustValue::Full, TrustValue::Relay) => {
+            if apply_lower(startup)? {
+                tracing::warn!("config.json lowered this node to Relay only");
+                changes.push(NodeChange::Lowered);
+            }
+        }
+        (TrustValue::Relay, TrustValue::Full) => {
+            tracing::warn!(
+                "config.json says `full`, but only `wsmp trust full` raises trust; keeping relay only"
+            );
+            crate::trust::persist_relay()?;
+        }
+        _ => {}
+    }
+    Ok(changes)
+}
+
+/// Polls `config.json` for edits (mtime, every 2 s).
+struct ConfigWatch {
+    seen: Option<SystemTime>,
+    next: Instant,
+}
+
+impl ConfigWatch {
+    fn new() -> Self {
+        Self {
+            seen: Self::mtime(),
+            next: Instant::now() + CONFIG_POLL_INTERVAL,
+        }
+    }
+
+    fn mtime() -> Option<SystemTime> {
+        crate::paths::config_file()
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|meta| meta.modified().ok())
+    }
+
+    /// Whether the file changed since the last look.
+    fn changed(&mut self) -> bool {
+        if Instant::now() < self.next {
+            return false;
+        }
+        self.next = Instant::now() + CONFIG_POLL_INTERVAL;
+        let now = Self::mtime();
+        let changed = now != self.seen;
+        self.seen = now;
+        changed
     }
 }
+
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[cfg(unix)]
 fn status_response<'a>(
@@ -511,26 +573,104 @@ fn status_response<'a>(
         message: None,
         connection: Some(connection),
         node: Some(node_slug),
-        trust: Some(trust_word(startup)),
+        trust: Some(crate::trust::word(startup.trust_value())),
     }
 }
 
-/// Answer `wsmp status` while the relay is connected or reconnecting.
+#[cfg(unix)]
+fn simple_response(ok: bool, state: &str, message: Option<&str>) -> ControlResponse<'static> {
+    let state: &'static str = match state {
+        "changed" => "changed",
+        "unchanged" => "unchanged",
+        _ => "refused",
+    };
+    ControlResponse {
+        ok,
+        state,
+        message: message.map(|text| -> &'static str {
+            match text {
+                "raise" => "a process wsmp started cannot raise trust",
+                _ => "the relay could not apply the change; see its log",
+            }
+        }),
+        connection: None,
+        node: None,
+        trust: None,
+    }
+}
+
+/// Answer local control requests; returns what changed for the session.
 #[cfg(unix)]
 fn answer_control_requests(
     control: &mut ControlServer,
     startup: &TerminalStartup,
     node_slug: &str,
     connection: &str,
-) -> Result<()> {
+) -> Result<Vec<NodeChange>> {
+    let mut changes = Vec::new();
     for pending in control.drain()? {
         match pending.request.command {
             ControlCommand::Status => {
                 let _ = control::respond(pending, &status_response(startup, node_slug, connection));
             }
+            ControlCommand::Reload => {
+                let response = match reload_config(startup) {
+                    Ok(found) => {
+                        changes.extend(found);
+                        simple_response(true, "changed", None)
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), "reloading the config failed");
+                        simple_response(false, "refused", Some("failed"))
+                    }
+                };
+                let _ = control::respond(pending, &response);
+            }
+            ControlCommand::TrustRelay => {
+                let response = match apply_lower(startup) {
+                    Ok(true) => {
+                        tracing::warn!("`wsmp trust relay` lowered this node to Relay only");
+                        changes.push(NodeChange::Lowered);
+                        simple_response(true, "changed", None)
+                    }
+                    Ok(false) => simple_response(true, "unchanged", None),
+                    Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), "lowering trust failed");
+                        simple_response(false, "refused", Some("failed"))
+                    }
+                };
+                let _ = control::respond(pending, &response);
+            }
+            ControlCommand::TrustFull => {
+                let allowed = pending
+                    .peer_pid
+                    .map_or(cfg!(not(target_os = "linux")), |pid| {
+                        crate::trust::peer_may_raise(pid, std::process::id()).is_ok()
+                    });
+                let response = if !allowed {
+                    tracing::warn!("refused a trust raise from a process wsmp started");
+                    simple_response(false, "refused", Some("raise"))
+                } else if startup.full_control() {
+                    simple_response(true, "unchanged", None)
+                } else {
+                    match crate::trust::persist_full() {
+                        Ok(()) => {
+                            startup.raise_trust();
+                            tracing::warn!("`wsmp trust full` raised this node to Full control");
+                            changes.push(NodeChange::Raised);
+                            simple_response(true, "changed", None)
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %format!("{error:#}"), "raising trust failed");
+                            simple_response(false, "refused", Some("failed"))
+                        }
+                    }
+                };
+                let _ = control::respond(pending, &response);
+            }
         }
     }
-    Ok(())
+    Ok(changes)
 }
 
 #[cfg(not(unix))]
@@ -539,8 +679,8 @@ fn answer_control_requests(
     _startup: &TerminalStartup,
     _node_slug: &str,
     _connection: &str,
-) -> Result<()> {
-    Ok(())
+) -> Result<Vec<NodeChange>> {
+    Ok(Vec::new())
 }
 
 fn wait_for_reconnect(
@@ -550,13 +690,47 @@ fn wait_for_reconnect(
     delay: Duration,
 ) -> Result<()> {
     let deadline = Instant::now() + delay;
+    let mut watch = ConfigWatch::new();
     while Instant::now() < deadline {
         check_shutdown()?;
-        answer_control_requests(control, startup, node_slug, "reconnecting")?;
+        // Trust and features changed while disconnected reach the next hello.
+        let _ = answer_control_requests(control, startup, node_slug, "reconnecting")?;
+        if watch.changed()
+            && let Err(error) = reload_config(startup)
+        {
+            tracing::warn!(error = %format!("{error:#}"), "reloading the config failed");
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         thread::sleep(remaining.min(Duration::from_millis(100)));
     }
     Ok(())
+}
+
+/// Held definitions and what their handles reach, for the current trust.
+struct NodeRuntimes {
+    store: Store,
+    targets: BTreeMap<String, Target>,
+}
+
+impl NodeRuntimes {
+    fn load(trust: TrustValue) -> Self {
+        let store = crate::runtime_store::load_for(trust).unwrap_or_else(|error| {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "reading held definitions failed; holding none"
+            );
+            Store::default()
+        });
+        let targets = crate::runtimes::endpoints::always_on_targets(&store);
+        Self { store, targets }
+    }
+
+    fn endpoints(&self) -> Vec<crate::config::EndpointConfig> {
+        self.targets
+            .values()
+            .map(|target| target.endpoint.clone())
+            .collect()
+    }
 }
 
 /// Everything one relay connection owns. Dropping it ends every terminal,
@@ -572,6 +746,8 @@ struct Session {
     files: crate::file_relay::FileRelay,
     registered: bool,
     telemetry: Option<crate::telemetry::Telemetry>,
+    defines: Defines,
+    runtimes: NodeRuntimes,
 }
 
 /// The hello `features`, with the names of the node's secrets.
@@ -579,17 +755,6 @@ fn node_features(startup: &TerminalStartup) -> crate::protocol::runtime_spec::No
     let mut features = startup.features();
     features.secrets = crate::secrets::entries();
     features
-}
-
-/// The endpoints that stand in for runtime handles until the runtime store
-/// lands (C2): enabled endpoints, keyed by slug.
-fn enabled_endpoints(config: &Config) -> Vec<crate::config::EndpointConfig> {
-    config
-        .endpoints
-        .iter()
-        .filter(|endpoint| endpoint.enabled)
-        .cloned()
-        .collect()
 }
 
 fn run_relay_session(
@@ -657,6 +822,8 @@ fn run_relay_session(
         },
         registered: false,
         telemetry: None,
+        defines: Defines::default(),
+        runtimes: NodeRuntimes::load(startup.trust_value()),
     };
 
     let server_url = config.server_url.as_deref().unwrap_or_default();
@@ -677,15 +844,15 @@ fn run_relay_session(
         node: startup.hello_node(node_slug, identity_signature),
         trust: startup.trust(),
         features: node_features(startup),
-        // Nothing is held until the runtime store lands (C2).
-        definitions: Vec::new(),
-        held_metric_commands_hash: None,
-        held_port_range: None,
-        held_fabrics_hash: None,
+        definitions: session.runtimes.store.held_definitions(),
+        held_metric_commands_hash: session.runtimes.store.metric_commands_hash(),
+        held_port_range: session.runtimes.store.port_range(),
+        held_fabrics_hash: session.runtimes.store.fabrics_hash(),
     };
     send_control(&mut socket, &hello, "sending relay hello")?;
 
     let mut next_telemetry_sync = Instant::now();
+    let mut config_watch = ConfigWatch::new();
     let mut next_heartbeat =
         Instant::now() + Duration::from_secs(RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS);
     let result = 'session: loop {
@@ -703,7 +870,8 @@ fn run_relay_session(
         if let Err(error) = send_outbound_frames(&mut socket, session.execs.poll(now)) {
             break Err(error);
         }
-        let stt_frames = session.stt.poll(now, || enabled_endpoints(config));
+        let endpoints = session.runtimes.endpoints();
+        let stt_frames = session.stt.poll(now, || endpoints.clone());
         if let Err(error) = send_stt_frames(&mut socket, &mut session.stt, stt_frames) {
             break Err(error);
         }
@@ -716,11 +884,24 @@ fn run_relay_session(
         } else {
             "registering"
         };
-        if let Err(error) = answer_control_requests(control, startup, node_slug, connection) {
-            break Err(RelaySessionError::Fatal(error));
+        let mut changes = match answer_control_requests(control, startup, node_slug, connection) {
+            Ok(changes) => changes,
+            Err(error) => break Err(RelaySessionError::Fatal(error)),
+        };
+        if config_watch.changed() {
+            match reload_config(startup) {
+                Ok(found) => changes.extend(found),
+                Err(error) => tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "reloading the config failed"
+                ),
+            }
+        }
+        if let Err(error) = apply_node_changes(&mut socket, startup, &mut session, &changes) {
+            break Err(error);
         }
         if session.registered && Instant::now() >= next_telemetry_sync {
-            let endpoints = enabled_endpoints(config);
+            let endpoints = session.runtimes.endpoints();
             match session.telemetry.as_ref() {
                 Some(telemetry) => telemetry.set_endpoints(&endpoints),
                 None => {
@@ -960,7 +1141,7 @@ where
     };
     if let Some(message) = SttServerMessage::from_frame(&frame) {
         let endpoints = if matches!(message, SttServerMessage::Open { .. }) {
-            enabled_endpoints(config)
+            session.runtimes.endpoints()
         } else {
             Vec::new()
         };
@@ -982,18 +1163,7 @@ where
             }
             session.registered = true;
             tracing::info!(id, node_id, ?definition_sync, "relay registration accepted");
-            // One empty snapshot until the runtime store lands (C2).
-            send_control(
-                socket,
-                &NodeFrame::RuntimeInventory {
-                    snapshot_id: next_id("inventory"),
-                    chunk_index: 0,
-                    is_final: true,
-                    always_on: Vec::new(),
-                    instances: Vec::new(),
-                },
-                "sending the runtime inventory",
-            )?;
+            send_inventory(session);
         }
         ServerFrame::HelloChallenge { .. } => {
             return Err(RelaySessionError::Fatal(anyhow::anyhow!(
@@ -1020,19 +1190,32 @@ where
         ServerFrame::TrustLower { id, .. } => {
             lower_trust(socket, startup, session, &id)?;
         }
-        ServerFrame::RuntimeDefine {
-            op_id,
-            chunk_index,
-            is_final,
-            put,
-            node,
-            ..
-        } => {
-            send_control(
-                socket,
-                &define_refusal(startup, op_id, chunk_index, is_final, put, node.is_some()),
-                "answering a runtime definition",
-            )?;
+        ServerFrame::RuntimeDefine { .. } => {
+            let runtime_hosts = startup.runtime_hosts();
+            let busy_ports = BTreeMap::new();
+            let ctx = crate::runtime_store::DefineContext {
+                trust: startup.trust_value(),
+                runtime_hosts: &runtime_hosts,
+                busy_ports: &busy_ports,
+            };
+            let live = crate::runtime_store::live_path().map_err(RelaySessionError::Fatal)?;
+            match session.defines.handle(text, &frame, &ctx, &live) {
+                Ok(outcome) => {
+                    send_control(socket, &outcome.answer, "answering a runtime definition")?;
+                    if outcome.changed {
+                        session.runtimes = NodeRuntimes::load(startup.trust_value());
+                        send_inventory(session);
+                    }
+                }
+                Err(error) => {
+                    // Out-of-order chunks or an unreadable store: the server
+                    // times the operation out and retries it whole.
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "a runtime definition could not be applied"
+                    );
+                }
+            }
         }
         ServerFrame::RuntimeDetect { id } => {
             send_control(
@@ -1136,6 +1319,7 @@ where
             start_relay_request(
                 socket,
                 config,
+                &session.runtimes.targets,
                 &session.worker_tx,
                 &mut session.workers,
                 &session.recent_finished,
@@ -1315,8 +1499,8 @@ where
     Ok(())
 }
 
-/// `trust.lower`: Relay only from now on, persisted, and every Full-only
-/// session ends. Answered with `node.state`.
+/// `trust.lower`: Relay only from now on, persisted and frozen, then the
+/// same effects as any lowering. Answered with `node.state`.
 fn lower_trust<S>(
     socket: &mut tungstenite::WebSocket<S>,
     startup: &TerminalStartup,
@@ -1326,73 +1510,70 @@ fn lower_trust<S>(
 where
     S: std::io::Read + std::io::Write,
 {
-    startup.lower_trust();
-    #[cfg(unix)]
-    session.files.lower_trust();
-    send_outbound_frames(socket, session.terminals.kill_all())?;
-    send_outbound_frames(socket, session.execs.kill_all())?;
-    // The S0 trust bridge: anything but `unsupervised` is Relay only.
-    if let Err(error) = Config::update(true, |config| {
-        config.mcp_command_mode = McpCommandMode::Off;
-        Ok(())
-    }) {
+    if let Err(error) = crate::trust::persist_relay() {
+        // Latch for this daemon anyway; the next start reads the file.
         tracing::warn!(
             error = %format!("{error:#}"),
             "persisting the lowered trust failed; it holds until wsmp restarts"
         );
     }
+    startup.lower_trust();
     tracing::warn!(id, "a person lowered this node to Relay only");
+    apply_node_changes(socket, startup, session, &[NodeChange::Lowered])
+}
+
+/// Session effects of a trust or feature change, then `node.state`.
+/// Lowering ends every Full-only session: commands (whole process tree,
+/// reported `interrupted`), browser terminals and file ops, and switches the
+/// held set to the frozen copy.
+fn apply_node_changes<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    startup: &TerminalStartup,
+    session: &mut Session,
+    changes: &[NodeChange],
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    if changes.is_empty() {
+        return Ok(());
+    }
+    if changes.contains(&NodeChange::Lowered) {
+        #[cfg(unix)]
+        session.files.lower_trust();
+        send_outbound_frames(socket, session.terminals.kill_all())?;
+        send_outbound_frames(socket, session.execs.interrupt_all())?;
+    }
+    if changes.contains(&NodeChange::Raised) {
+        #[cfg(unix)]
+        session.files.raise_trust();
+    }
+    if changes
+        .iter()
+        .any(|change| matches!(change, NodeChange::Lowered | NodeChange::Raised))
+    {
+        session.runtimes = NodeRuntimes::load(startup.trust_value());
+    }
+    if !session.registered {
+        return Ok(());
+    }
     send_control(
         socket,
         &NodeFrame::NodeState {
             trust: startup.trust(),
             features: node_features(startup),
         },
-        "reporting the lowered trust",
+        "reporting the node state",
     )
 }
 
-/// The S0 answer to one `runtime.define` chunk: nothing is stored, every
-/// version is rejected, and the final chunk reports an empty held set.
-fn define_refusal(
-    startup: &TerminalStartup,
-    op_id: String,
-    chunk_index: u32,
-    is_final: bool,
-    put: Option<Vec<crate::protocol::frames::DefinitionEnvelope>>,
-    has_node: bool,
-) -> NodeFrame {
-    let reason = if startup.full_control() {
-        DefineRejectReason::Invalid
-    } else {
-        DefineRejectReason::TrustRelay
-    };
-    let results = put
-        .unwrap_or_default()
-        .into_iter()
-        .map(|envelope| DefineEntryResult {
-            runtime_id: envelope.runtime_id,
-            version_id: envelope.version_id,
-            status: DefineStatus::Rejected,
-            reason: Some(reason),
-            detail: None,
-        })
-        .collect();
-    NodeFrame::RuntimeDefineResult {
-        op_id,
-        chunk_index,
-        is_final,
-        results,
-        node: has_node.then_some(DefineNodeResult {
-            status: DefineStatus::Rejected,
-            reason: Some(reason),
-        }),
-        held: is_final.then(Vec::new),
-        held_metric_commands_hash: is_final.then_some(None),
-        held_port_range: is_final.then_some(None),
-        held_fabrics_hash: is_final.then_some(None),
-        frozen: is_final.then(|| !startup.full_control()),
-    }
+/// Send a fresh `runtime.inventory` (built off this loop).
+fn send_inventory(session: &Session) {
+    crate::runtimes::inventory::spawn(
+        session.worker_tx.clone(),
+        session.runtimes.store.clone(),
+        Vec::new(),
+    );
 }
 
 fn secret_result(
@@ -1433,6 +1614,7 @@ struct RelayRequest {
 fn start_relay_request<S>(
     socket: &mut tungstenite::WebSocket<S>,
     config: &Config,
+    targets: &BTreeMap<String, Target>,
     worker_tx: &SyncSender<FromWorker>,
     workers: &mut BTreeMap<String, WorkerHandle>,
     recent_finished: &RecentlyFinished,
@@ -1469,13 +1651,7 @@ where
         return Ok(());
     }
 
-    // S0: a runtime handle resolves to the enabled endpoint of that slug
-    // (the runtime store replaces this in C2).
-    let Some(endpoint) = config
-        .endpoints
-        .iter()
-        .find(|endpoint| endpoint.enabled && endpoint.slug == handle)
-    else {
+    let Some(endpoint) = targets.get(&handle).map(|target| &target.endpoint) else {
         send_relay_error(
             socket,
             &request_id,
@@ -2021,12 +2197,12 @@ async fn execute_upstream(
         builder = builder.header(name, value);
     }
     for (name, env) in &spec.endpoint_headers {
-        let value = std::env::var(env)
+        let value = crate::secrets::credential(env)
             .with_context(|| format!("reading endpoint header `{name}` from `{env}`"))?;
         builder = builder.header(name, value);
     }
     if let Some((mode, env)) = &spec.endpoint_auth {
-        let value = std::env::var(env).context("reading typed endpoint credential")?;
+        let value = crate::secrets::credential(env).context("reading typed endpoint credential")?;
         builder = match mode {
             EndpointAuthMode::ApiKey => builder.header("x-api-key", value),
             EndpointAuthMode::Bearer => builder.header("authorization", format!("Bearer {value}")),
@@ -3641,6 +3817,7 @@ mod tests {
         let result = start_relay_request(
             &mut socket,
             &config,
+            &BTreeMap::new(),
             &worker_tx,
             &mut workers,
             &recent_finished,
@@ -3681,6 +3858,7 @@ mod tests {
         let result = start_relay_request(
             &mut socket,
             &config,
+            &BTreeMap::new(),
             &worker_tx,
             &mut workers,
             &recent_finished,

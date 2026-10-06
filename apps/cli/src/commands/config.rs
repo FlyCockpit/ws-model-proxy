@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::config::{Config, McpCommandMode, normalize_public_origin, server_url_http_warning};
+use crate::config::{Config, normalize_public_origin, server_url_http_warning};
 use crate::output;
 use crate::slug::validate_slug;
 
@@ -48,14 +48,12 @@ enum Sub {
     SetSlug { slug: String },
     /// Allow browser terminals. Takes effect the next time wsmp starts.
     SetHumanTerminal { state: Switch },
-    /// Choose the node's trust until `wsmp trust` lands: `unsupervised` is
-    /// Full control (commands, file ops, browser terminals and runtime
-    /// definitions); `off` and `supervised` are Relay only. Takes effect the
-    /// next time wsmp starts.
-    SetMcpCommands { mode: McpMode },
-    /// The 0.3 read-only file grant. Relay 3.0 file ops follow the node's
-    /// trust instead; the key goes away with config v3.
-    SetFileRead { state: Switch },
+    /// Extra hosts (`ip` or `ip:port`, IP literals) a server-defined
+    /// always-on runtime may use besides loopback. Applies at once.
+    SetRuntimeHosts {
+        #[arg(num_args = 0..)]
+        hosts: Vec<String>,
+    },
     /// Confine every file tool to these directories. Suggested roots (never
     /// applied automatically): ~/models, ~/deploy, ~/.config/llama-swap,
     /// ~/.local/state/wsmp/logs. Restart wsmp to apply.
@@ -85,23 +83,6 @@ enum Sub {
 enum Switch {
     On,
     Off,
-}
-
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum McpMode {
-    Off,
-    Supervised,
-    Unsupervised,
-}
-
-impl McpMode {
-    fn mode(self) -> McpCommandMode {
-        match self {
-            Self::Off => McpCommandMode::Off,
-            Self::Supervised => McpCommandMode::Supervised,
-            Self::Unsupervised => McpCommandMode::Unsupervised,
-        }
-    }
 }
 
 impl Switch {
@@ -136,7 +117,6 @@ pub fn run(args: &Args) -> Result<()> {
         Sub::Show => {
             let cfg = Config::load_required()?;
             let mut shown = serde_json::to_value(&cfg)?;
-            shown["mcpFileRead"] = cfg.mcp_file_read.into();
             shown["fileRoots"] = serde_json::to_value(&cfg.file_roots)?;
             shown["maxTerminals"] = cfg.effective_max_terminals().into();
             // The origin the relay hello signs (pinned, else the server URL's).
@@ -226,26 +206,23 @@ pub fn run(args: &Args) -> Result<()> {
                 cfg.allow_human_terminal = state.enabled();
             })?;
         }
-        Sub::SetMcpCommands { mode } => {
-            let mode = mode.mode();
+        Sub::SetRuntimeHosts { hosts } => {
+            for host in hosts {
+                anyhow::ensure!(
+                    crate::runtime_store::validate::parse_runtime_host(host).is_some(),
+                    "`{host}` is not an IP literal with an optional port"
+                );
+            }
             Config::update(false, |cfg| {
-                cfg.mcp_command_mode = mode;
+                cfg.runtime_hosts = hosts.clone();
                 Ok(())
             })?;
+            let _ = crate::control::request_if_running(crate::control::ControlCommand::Reload);
             if args.json {
-                output::json(&SetValue {
-                    key: "mcpCommandMode",
-                    value: mode.as_str(),
-                })?;
+                output::json(&serde_json::json!({"key": "runtimeHosts", "value": hosts}))?;
             } else {
-                output::line(format!("set `mcpCommandMode` to `{}`", mode.as_str()))?;
-                output::line("Restart wsmp to apply.")?;
+                output::line("set `runtimeHosts`")?;
             }
-        }
-        Sub::SetFileRead { state } => {
-            set_flag(args.json, "mcpFileRead", state.enabled(), |cfg| {
-                cfg.mcp_file_read = state.enabled()
-            })?;
         }
         Sub::SetFileRoots { paths } => {
             let roots = crate::config::validate_file_roots(paths, dirs::home_dir().as_deref())?;

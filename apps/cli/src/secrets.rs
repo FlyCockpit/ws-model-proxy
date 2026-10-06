@@ -1,11 +1,13 @@
-//! Node secrets (`secret.set` / `secret.delete`, Full control only).
+//! Node secrets (`WSMP_SECRET_*`).
 //!
-//! Values live in `<state dir>/node-secrets.json` (mode 0600 in a 0700
-//! directory, written atomically) and never leave this machine again: the
-//! node reports names and update times only (`features.secrets`), and no
-//! value is ever logged. Runtime commands receive them as environment
-//! variables when their definition names them (C2/C3). The local `wsmp
-//! secret` commands land with config v3 (C1).
+//! Set remotely with `secret.set` / `secret.delete` at Full control only, and
+//! locally with `wsmp secret set|remove` on a terminal at any trust. Values
+//! live in `<state dir>/node-secrets.json` (mode 0600 in a 0700 directory,
+//! written atomically) and never leave this machine again: the node reports
+//! names and update times only (`features.secrets`), and no value is ever
+//! logged. Runtime commands receive the ones their definition names
+//! (`launch.secrets`) as environment variables; always-on runtimes send them
+//! as auth/header values (`address.auth.env`, `address.headers[].env`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -31,6 +33,7 @@ struct SecretsFile {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredSecret {
+    /// Never printed: `StoredSecret` has no `Debug`.
     value: String,
     updated_at: String,
 }
@@ -96,10 +99,76 @@ fn entries_of(file: &SecretsFile) -> Vec<SecretEntry> {
         .collect()
 }
 
+/// One secret's value, for a runtime command or an upstream header. Never
+/// log the result.
+pub fn value(name: &str) -> Option<String> {
+    let path = path().ok()?;
+    load(&path)
+        .ok()?
+        .secrets
+        .remove(name)
+        .map(|secret| secret.value)
+}
+
+/// The value an upstream header or auth names (`address.auth.env`,
+/// `address.headers[].env`): node secrets only, never the process
+/// environment. The error names the secret, never a value.
+pub fn credential(name: &str) -> Result<String> {
+    anyhow::ensure!(
+        is_secret_name(name),
+        "`{name}` is not a node secret name (`WSMP_SECRET_*`)"
+    );
+    #[cfg(test)]
+    if let Some(value) = test_secrets()
+        .lock()
+        .ok()
+        .and_then(|secrets| secrets.get(name).cloned())
+    {
+        return Ok(value);
+    }
+    value(name)
+        .with_context(|| format!("node secret `{name}` is not set; run `wsmp secret set {name}`"))
+}
+
+/// Secrets unit tests provide without touching the state directory.
+#[cfg(test)]
+pub(crate) fn test_secrets() -> &'static std::sync::Mutex<BTreeMap<String, String>> {
+    static SECRETS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, String>>> =
+        std::sync::OnceLock::new();
+    SECRETS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// The named secrets that exist, as `(name, value)` for a child environment.
+/// Missing names are skipped (the caller reports which, never values).
+pub fn values(names: &[String]) -> (Vec<(String, String)>, Vec<String>) {
+    let mut file = path().and_then(|path| load(&path)).unwrap_or_default();
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
+    for name in names {
+        match file.secrets.remove(name) {
+            Some(secret) => found.push((name.clone(), secret.value)),
+            None => missing.push(name.clone()),
+        }
+    }
+    (found, missing)
+}
+
 /// `secret.set`: refused at Relay only.
 pub fn set(full_control: bool, name: &str, value: &str) -> Result<Outcome, SecretRefusal> {
     let path = path().map_err(|_| SecretRefusal::StoreFailed)?;
     set_at(&path, full_control, name, value)
+}
+
+/// `wsmp secret set` on this machine: allowed at any trust.
+pub fn set_local(name: &str, value: &str) -> Result<Outcome, SecretRefusal> {
+    let path = path().map_err(|_| SecretRefusal::StoreFailed)?;
+    set_at(&path, true, name, value)
+}
+
+/// `wsmp secret remove` on this machine: allowed at any trust.
+pub fn delete_local(name: &str) -> Result<Outcome, SecretRefusal> {
+    let path = path().map_err(|_| SecretRefusal::StoreFailed)?;
+    delete_at(&path, true, name)
 }
 
 /// `secret.delete`: refused at Relay only.

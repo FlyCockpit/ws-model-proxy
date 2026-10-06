@@ -133,7 +133,7 @@ fn config_init_and_show_use_explicit_config_file() {
     let mut show = cli(&config, &state);
     show.args(["config", "--json", "show"]);
     let show_value = json_stdout(show);
-    assert_eq!(show_value["version"], 1);
+    assert_eq!(show_value["version"], 3);
     assert!(
         show_value["endpoints"]
             .as_array()
@@ -293,7 +293,7 @@ fn run_persists_generated_slug_before_auth_failure() {
         .timeout(std::time::Duration::from_secs(60))
         .assert()
         .code(4)
-        .stderr(predicate::str::contains("no CLI token env var"));
+        .stderr(predicate::str::contains("not enrolled"));
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     let slug = cfg["cliSlug"].as_str().expect("slug");
     assert!(slug.starts_with("cli-"));
@@ -329,487 +329,258 @@ fn run_without_the_stop_marker_keeps_retrying_a_missing_credential() {
     assert_eq!(output.status.code(), None, "{stderr}");
 }
 
+const CODE: &str = "wsmp_enr_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const IDENTITY_PREFIX: &str = "B";
+
+fn well_known(origin: &str) -> Value {
+    json!({
+        "serverVersion": "0.4.0", "protocolVersion": "3.0", "origin": origin,
+        "installScript": "/install.sh", "enrollPath": "/api/node/enroll"
+    })
+}
+
+fn enrolled(slug: &str) -> Value {
+    json!({
+        "ok": true, "nodeId": "nd1", "slug": slug, "credential": "c".repeat(48),
+        "replaced": null, "trustLowerPending": false
+    })
+}
+
 #[test]
-fn login_rejects_invalid_slug_before_device_authorization_request() {
+fn login_enrolls_with_a_code_and_stores_a_private_credential() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({
-            "version": 1,
-            "serverUrl": "http://127.0.0.1:9"
-        }),
+    // The server announces a public origin other than the URL: it is pinned.
+    let server = TestServer::start(vec![
+        (
+            "/.well-known/wsmp",
+            200,
+            well_known("https://wsmp.example.com"),
+        ),
+        ("/api/node/enroll", 200, enrolled("spark-1")),
+    ]);
+    let mut cmd = cli(&config, &state);
+    cmd.args([
+        "login",
+        &server.base_url,
+        "--code",
+        CODE,
+        "--slug",
+        "spark-1",
+        "--trust",
+        "relay",
+        "--no-service",
+        "--json",
+    ]);
+    let value = json_stdout(cmd);
+    assert_eq!(value["slug"], "spark-1");
+    assert_eq!(value["trust"], "relay");
+    let well_known_request = server.requests.recv().unwrap();
+    assert!(well_known_request.starts_with("GET /.well-known/wsmp "));
+    let enroll_request = server.requests.recv().unwrap();
+    assert!(enroll_request.starts_with("POST /api/node/enroll "));
+    let body: Value =
+        serde_json::from_str(enroll_request.split("\r\n\r\n").nth(1).expect("body")).unwrap();
+    assert_eq!(body["code"], CODE);
+    assert_eq!(body["slug"], "spark-1");
+    assert_eq!(body["replaceConfirmed"], false);
+    assert!(
+        body["identityPublicKey"]
+            .as_str()
+            .unwrap()
+            .starts_with(IDENTITY_PREFIX)
     );
-
-    cli(&config, &state)
-        .args(["login", "--slug", "desk.01"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("validating CLI slug"));
-
+    server.join();
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert!(cfg.get("cliSlug").is_none());
-    assert!(!state.join("device-auth.json").exists());
-}
-
-#[test]
-fn login_rejects_the_removed_name_flag() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({
-            "version": 1,
-            "serverUrl": "http://127.0.0.1:9"
-        }),
-    );
-
-    cli(&config, &state)
-        .args(["login", "--name", "Desk", "--slug", "desk-01"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("--name"));
-}
-
-#[test]
-fn non_interactive_login_defaults_the_slug_from_the_hostname() {
-    let Some(expected) = wsmp::hostname::hostname_slug() else {
-        // No usable hostname here: login must ask for `--slug` instead.
-        let tmp = tempfile::tempdir().unwrap();
-        let config = tmp.path().join("config.json");
-        let state = tmp.path().join("state");
-        write_config(
-            &config,
-            json!({ "version": 1, "serverUrl": "http://127.0.0.1:9" }),
-        );
-        cli(&config, &state)
-            .arg("login")
-            .write_stdin("")
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains("pass `--slug <slug>`"));
-        return;
-    };
-    let server = TestServer::start(vec![
-        (
-            "/api/auth/device/code",
-            200,
-            json!({
-                "device_code": "device-code-1",
-                "user_code": "ABCD-EFGH",
-                "verification_uri": "http://example.test/en-US/device",
-                "expires_in": 30,
-                "interval": 1
-            }),
-        ),
-        (
-            "/rpc/cliCredentials/exchangeDeviceCode",
-            200,
-            json!({
-                "json": {
-                    "credentialId": "credential-1",
-                    "userId": "user-1",
-                    "secret": "wsmp_device_secret_for_test"
-                }
-            }),
-        ),
-    ]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({ "version": 1, "serverUrl": server.base_url }),
-    );
-
-    // assert_cmd gives the child a non-terminal stdin.
-    cli(&config, &state)
-        .arg("login")
-        .write_stdin("")
-        .assert()
-        .success();
-    let start_request = server.requests.recv().unwrap();
-    assert!(start_request.contains("POST /api/auth/device/code"));
-    let exchange_request = server.requests.recv().unwrap();
-    assert!(exchange_request.contains(&format!(r#""cliSlug":"{expected}""#)));
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["cliSlug"], expected.as_str());
-    server.join();
-}
-
-#[test]
-fn login_waits_out_a_short_device_code_rate_limit_once() {
-    let started = json!({
-        "device_code": "device-code-1",
-        "user_code": "ABCD-EFGH",
-        "verification_uri": "http://example.test/en-US/device",
-        "expires_in": 30,
-        "interval": 1
-    });
-    let server = TestServer::start(vec![
-        (
-            "/api/auth/device/code",
-            429,
-            json!({ "error": "Too many attempts." }),
-        ),
-        ("/api/auth/device/code", 200, started),
-        (
-            "/rpc/cliCredentials/exchangeDeviceCode",
-            200,
-            json!({
-                "json": {
-                    "credentialId": "credential-1",
-                    "userId": "user-1",
-                    "secret": "wsmp_device_secret_for_test"
-                }
-            }),
-        ),
-    ]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({ "version": 1, "serverUrl": server.base_url }),
-    );
-    cli(&config, &state)
-        .args(["login", "--slug", "desk-01"])
-        .write_stdin("")
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("rate limited, retry in 1 s"));
-    server.join();
-}
-
-#[test]
-fn login_reports_a_repeated_device_code_rate_limit_with_its_wait() {
-    let server = TestServer::start(vec![
-        (
-            "/api/auth/device/code",
-            429,
-            json!({ "error": "Too many attempts." }),
-        ),
-        (
-            "/api/auth/device/code",
-            429,
-            json!({ "error": "Too many attempts." }),
-        ),
-    ]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({ "version": 1, "serverUrl": server.base_url }),
-    );
-    cli(&config, &state)
-        .args(["login", "--slug", "desk-01"])
-        .write_stdin("")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("rate limited, retry in 1 s"));
-    server.join();
-}
-
-#[test]
-fn login_rejection_does_not_overwrite_local_slug_or_save_credential() {
-    let server = TestServer::start(vec![
-        (
-            "/api/auth/device/code",
-            200,
-            json!({
-                "device_code": "device-code-1",
-                "user_code": "ABCD-EFGH",
-                "verification_uri": "http://example.test/en-US/device",
-                "expires_in": 30,
-                "interval": 1
-            }),
-        ),
-        (
-            "/rpc/cliCredentials/exchangeDeviceCode",
-            400,
-            json!({
-                "json": {
-                    "defined": false,
-                    "code": "BAD_REQUEST",
-                    "status": 400,
-                    "message": "Device authorization was requested for a different CLI slug."
-                }
-            }),
-        ),
-    ]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({
-            "version": 1,
-            "serverUrl": server.base_url,
-            "cliSlug": "existing-cli"
-        }),
-    );
-
-    cli(&config, &state)
-        .args(["login", "--slug", "desk-01"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("different CLI slug"));
-
-    let start_request = server.requests.recv().unwrap();
-    assert!(start_request.contains("POST /api/auth/device/code"));
-    let exchange_request = server.requests.recv().unwrap();
-    assert!(exchange_request.contains(r#""cliSlug":"desk-01""#));
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["cliSlug"], "existing-cli");
-    assert!(!state.join("device-auth.json").exists());
-    server.join();
-}
-
-#[test]
-fn login_untagged_error_fails_fast_even_when_the_message_says_pending() {
-    // Only one exchange response is served. Classifying by message text (it
-    // says "pending") instead of `data.deviceFlowError` would poll again, hit
-    // a closed server, and fail with a transport error instead of this error.
-    let server = TestServer::start(vec![
-        (
-            "/api/auth/device/code",
-            200,
-            json!({
-                "device_code": "device-code-1",
-                "user_code": "ABCD-EFGH",
-                "verification_uri": "http://example.test/en-US/device",
-                "expires_in": 30,
-                "interval": 1
-            }),
-        ),
-        (
-            "/rpc/cliCredentials/exchangeDeviceCode",
-            400,
-            json!({
-                "json": {
-                    "defined": false,
-                    "code": "BAD_REQUEST",
-                    "status": 400,
-                    "message": "Device authorization is pending, but for a different CLI slug."
-                }
-            }),
-        ),
-    ]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({ "version": 1, "serverUrl": server.base_url }),
-    );
-
-    let started = std::time::Instant::now();
-    cli(&config, &state)
-        .args(["login", "--slug", "pending-ci"])
-        .timeout(std::time::Duration::from_secs(10))
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("for a different CLI slug"));
-    // One poll interval (1s), not a poll loop until the 30s expiry.
-    assert!(started.elapsed() < std::time::Duration::from_secs(8));
-    assert!(!state.join("device-auth.json").exists());
-    server.join();
-}
-
-#[test]
-fn relogin_with_the_saved_slug_overwrites_the_device_credential() {
-    let server = TestServer::start(vec![
-        (
-            "/api/auth/device/code",
-            200,
-            json!({
-                "device_code": "device-code-2",
-                "user_code": "WXYZ-2345",
-                "verification_uri": "http://example.test/en-US/device",
-                "expires_in": 30,
-                "interval": 1
-            }),
-        ),
-        (
-            "/rpc/cliCredentials/exchangeDeviceCode",
-            200,
-            json!({
-                "json": {
-                    "credentialId": "credential-2",
-                    "userId": "user-1",
-                    "secret": "wsmp_device_new_secret"
-                }
-            }),
-        ),
-    ]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({ "version": 1, "serverUrl": server.base_url, "cliSlug": "desk-01" }),
-    );
-    fs::create_dir_all(&state).unwrap();
-    fs::write(
-        state.join("device-auth.json"),
-        serde_json::to_string(&json!({
-            "credentialId": "credential-1",
-            "userId": "user-1",
-            "secret": "wsmp_device_old_secret"
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
-    cli(&config, &state)
-        .arg("login")
-        .write_stdin("")
-        .assert()
-        .success();
-
-    // The approval request names the saved slug, so the approver sees which
-    // device this login replaces.
-    let start_request = server.requests.recv().unwrap();
-    assert!(start_request.contains(r#""scope":"cli-slug:desk-01""#));
-    let exchange_request = server.requests.recv().unwrap();
-    assert!(exchange_request.contains(r#""cliSlug":"desk-01""#));
-    let credential_text = fs::read_to_string(state.join("device-auth.json")).unwrap();
-    assert!(credential_text.contains("wsmp_device_new_secret"));
-    assert!(!credential_text.contains("wsmp_device_old_secret"));
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["cliSlug"], "desk-01");
-    server.join();
-}
-
-#[test]
-fn non_interactive_login_defaults_to_the_saved_slug() {
-    let server = TestServer::start(vec![
-        (
-            "/api/auth/device/code",
-            200,
-            json!({
-                "device_code": "device-code-1",
-                "user_code": "ABCD-EFGH",
-                "verification_uri": "http://example.test/en-US/device",
-                "expires_in": 30,
-                "interval": 1
-            }),
-        ),
-        (
-            "/rpc/cliCredentials/exchangeDeviceCode",
-            200,
-            json!({
-                "json": {
-                    "credentialId": "credential-1",
-                    "userId": "user-1",
-                    "secret": "wsmp_device_secret_for_test"
-                }
-            }),
-        ),
-    ]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({ "version": 1, "serverUrl": server.base_url, "cliSlug": "saved-cli" }),
-    );
-
-    cli(&config, &state)
-        .arg("login")
-        .write_stdin("")
-        .assert()
-        .success();
-    let _start_request = server.requests.recv().unwrap();
-    let exchange_request = server.requests.recv().unwrap();
-    assert!(exchange_request.contains(r#""cliSlug":"saved-cli""#));
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["cliSlug"], "saved-cli");
-    server.join();
-}
-
-#[test]
-fn login_writes_device_credential_to_state_dir() {
-    let server = TestServer::start(vec![
-        (
-            "/api/auth/device/code",
-            200,
-            json!({
-                "device_code": "device-code-1",
-                "user_code": "ABCD-EFGH",
-                "verification_uri": "http://example.test/en-US/device",
-                "expires_in": 30,
-                "interval": 1
-            }),
-        ),
-        (
-            "/rpc/cliCredentials/exchangeDeviceCode",
-            400,
-            json!({
-                "json": {
-                    "defined": false,
-                    "code": "BAD_REQUEST",
-                    "status": 400,
-                    "message": "Device authorization is pending.",
-                    "data": { "deviceFlowError": "authorization_pending" }
-                }
-            }),
-        ),
-        (
-            "/rpc/cliCredentials/exchangeDeviceCode",
-            200,
-            json!({
-                "json": {
-                    "credentialId": "credential-1",
-                    "userId": "user-1",
-                    "secret": "wsmp_device_secret_for_test"
-                }
-            }),
-        ),
-    ]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({
-            "version": 1,
-            "serverUrl": server.base_url
-        }),
-    );
-
-    cli(&config, &state)
-        .args(["login", "--slug", "desk-01"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("device login complete"));
-    let start_request = server.requests.recv().unwrap();
-    assert!(start_request.contains("POST /api/auth/device/code"));
-    assert!(start_request.contains(r#""scope":"cli-slug:desk-01""#));
-    let pending_request = server.requests.recv().unwrap();
-    assert!(pending_request.contains(r#""cliSlug":"desk-01""#));
-    // The device's name is dashboard-owned; login sends none.
-    assert!(!pending_request.contains(r#""name""#));
-    let success_request = server.requests.recv().unwrap();
-    assert!(success_request.contains(r#""cliSlug":"desk-01""#));
-    assert!(success_request.contains(r#""identityPublicKey":"#));
-
-    let credential_path = state.join("device-auth.json");
-    let credential_text = fs::read_to_string(&credential_path).unwrap();
-    assert!(credential_text.contains("wsmp_device_secret_for_test"));
-    assert!(!config.parent().unwrap().join("device-auth.json").exists());
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["cliSlug"], "desk-01");
+    assert_eq!(cfg["serverUrl"], value["server"]);
+    assert_eq!(cfg["publicOrigin"], "https://wsmp.example.com");
+    assert_eq!(cfg["cliSlug"], "spark-1");
+    assert_eq!(cfg["trust"], "relay");
+    let credential = state.join("node-credential.json");
+    let saved: Value = serde_json::from_slice(&fs::read(&credential).unwrap()).unwrap();
+    assert_eq!(saved["credential"], "c".repeat(48));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(&credential_path).unwrap().permissions().mode() & 0o777;
+        let mode = fs::metadata(&credential).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
+    // The code never reaches stdout or the config.
+    assert!(!fs::read_to_string(&config).unwrap().contains(CODE));
+}
+
+#[test]
+fn login_refuses_a_malformed_code_before_any_exchange() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let server = TestServer::start(vec![(
+        "/.well-known/wsmp",
+        200,
+        well_known("https://wsmp.example.com"),
+    )]);
+    cli(&config, &state)
+        .args([
+            "login",
+            &server.base_url,
+            "--code",
+            "nope",
+            "--slug",
+            "node-a",
+            "--no-service",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not an enrollment code"));
     server.join();
+    assert!(!state.join("node-credential.json").exists());
+}
+
+#[test]
+fn login_refuses_a_server_on_another_protocol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let mut old = well_known("https://wsmp.example.com");
+    old["protocolVersion"] = json!("2.4");
+    let server = TestServer::start(vec![("/.well-known/wsmp", 200, old)]);
+    cli(&config, &state)
+        .args([
+            "login",
+            &server.base_url,
+            "--code",
+            CODE,
+            "--slug",
+            "node-a",
+            "--no-service",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("upgrade the server"));
+    server.join();
+}
+
+#[test]
+fn login_needs_replace_confirmation_without_a_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let server = TestServer::start(vec![
+        (
+            "/.well-known/wsmp",
+            200,
+            well_known("https://wsmp.example.com"),
+        ),
+        (
+            "/api/node/enroll",
+            409,
+            json!({ "ok": false, "error": "replace_confirmation_required", "replaces": { "slug": "old-1" } }),
+        ),
+    ]);
+    cli(&config, &state)
+        .args([
+            "login",
+            &server.base_url,
+            "--code",
+            CODE,
+            "--slug",
+            "node-a",
+            "--no-service",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("This replaces node old-1"))
+        .stderr(predicate::str::contains("--replace"));
+    server.join();
+    assert!(!state.join("node-credential.json").exists());
+}
+
+#[test]
+fn login_reports_a_taken_slug() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let server = TestServer::start(vec![
+        (
+            "/.well-known/wsmp",
+            200,
+            well_known("https://wsmp.example.com"),
+        ),
+        (
+            "/api/node/enroll",
+            409,
+            json!({ "ok": false, "error": "slug_taken" }),
+        ),
+    ]);
+    cli(&config, &state)
+        .args([
+            "login",
+            &server.base_url,
+            "--code",
+            CODE,
+            "--slug",
+            "node-a",
+            "--no-service",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--slug"));
+    server.join();
+}
+
+#[test]
+fn trust_lowers_without_a_relay_and_refuses_to_raise_without_a_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(&config, json!({ "version": 3, "trust": "full" }));
+    cli(&config, &state)
+        .args(["trust", "relay"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("now relay only"));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["trust"], "relay");
+    assert!(state.join("frozen-definitions.json").exists());
+    // No terminal: refused, and the file still says relay.
+    cli(&config, &state)
+        .args(["trust", "full"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("terminal"));
+    // From a process wsmp started: refused before anything else.
+    cli(&config, &state)
+        .args(["trust", "full"])
+        .env("WSMP_JOB", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot run from a command"));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["trust"], "relay");
+}
+
+#[test]
+fn secrets_need_a_terminal_and_list_names_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args(["secret", "set", "WSMP_SECRET_HF"])
+        .write_stdin("hf_value\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("terminal"));
+    cli(&config, &state)
+        .args(["secret", "set", "HF_TOKEN"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("WSMP_SECRET_"));
+    cli(&config, &state)
+        .args(["secret", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no secrets"));
 }
 
 #[test]
@@ -833,44 +604,50 @@ fn config_terminal_flags_persist_and_ask_for_a_restart() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Restart wsmp to apply."));
-    cli(&config, &state)
-        .args(["config", "--json", "set-mcp-commands", "supervised"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(r#""key":"mcpCommandMode""#))
-        .stdout(predicate::str::contains(r#""value":"supervised""#));
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(cfg["allowHumanTerminal"], true);
-    assert_eq!(cfg["mcpCommandMode"], "supervised");
-    assert!(cfg.get("allowMcpCommands").is_none());
     assert!(cfg.get("requireTerminalApproval").is_none());
+    // The 0.3 command switches are gone: trust is the one switch.
     cli(&config, &state)
-        .args(["config", "set-mcp-commands", "off"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Restart wsmp to apply."));
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert!(cfg.get("mcpCommandMode").is_none());
-    cli(&config, &state)
-        .args(["config", "set-mcp-commands", "on"])
+        .args(["config", "set-mcp-commands", "unsupervised"])
         .assert()
         .failure();
-
-    // A config from an older wsmp keeps its MCP commands switch, as a mode.
-    fs::write(&config, r#"{"version":1,"allowMcpCommands":true}"#).unwrap();
+    // A config from an older wsmp loses its old switches on the next write.
+    fs::write(
+        &config,
+        r#"{"version":1,"allowMcpCommands":true,"mcpCommandMode":"unsupervised"}"#,
+    )
+    .unwrap();
     cli(&config, &state)
         .args(["config", "set-terminal-approval", "on"])
         .assert()
         .success();
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["mcpCommandMode"], "unsupervised");
+    assert!(cfg.get("mcpCommandMode").is_none());
     assert!(cfg.get("allowMcpCommands").is_none());
-
+    assert!(cfg.get("trust").is_none());
     cli(&config, &state)
         .args(["config", "set-terminal-approval", "off"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Restart wsmp to apply."));
+}
+
+#[test]
+fn config_runtime_hosts_take_ip_literals_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args(["config", "set-runtime-hosts", "10.0.0.5:8000", "[fd00::1]"])
+        .assert()
+        .success();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["runtimeHosts"], json!(["10.0.0.5:8000", "[fd00::1]"]));
+    cli(&config, &state)
+        .args(["config", "set-runtime-hosts", "gpu.lan"])
+        .assert()
+        .failure();
 }
 
 #[test]
@@ -1064,8 +841,10 @@ fn service_env_sync_writes_private_file_without_echoing_secret() {
         &config,
         json!({
             "version": 1,
-            "cliTokenEnv": "WSMP_SERVICE_SYNC_TOKEN",
-            "endpoints": []
+            "endpoints": [{
+                "slug": "local", "label": "local", "baseUrl": "http://127.0.0.1:8000",
+                "headers": [{ "name": "Authorization", "env": "WSMP_SERVICE_SYNC_TOKEN" }]
+            }]
         }),
     );
     let secret = "super-secret-service-token-value";
@@ -1158,8 +937,6 @@ mod signal_shutdown {
     use std::path::PathBuf;
     use std::process::{Child, Stdio};
     use std::time::{Duration, Instant};
-
-    const TOKEN_ENV: &str = "WSMP_SIGNAL_TEST_TOKEN";
 
     /// SHA-1, only for the websocket handshake's `Sec-WebSocket-Accept`.
     fn sha1(data: &[u8]) -> [u8; 20] {
@@ -1478,20 +1255,28 @@ mod signal_shutdown {
             "version": 1,
             "serverUrl": relay.server_url,
             "cliSlug": "cli-signal-test",
-            "cliTokenEnv": TOKEN_ENV,
-            "allowMcpCommands": true,
+            "trust": "full",
             "endpoints": []
         });
         if let (Some(base), Some(extra)) = (value.as_object_mut(), extra.as_object()) {
             base.extend(extra.clone());
         }
         write_config(&config, value);
+        fs::create_dir_all(&state).expect("state dir");
+        fs::write(
+            state.join("node-credential.json"),
+            json!({
+                "nodeId": "nd1", "slug": "cli-signal-test", "server": relay.server_url,
+                "credential": "signal-test-token"
+            })
+            .to_string(),
+        )
+        .expect("credential");
         let child = std::process::Command::new(env!("CARGO_BIN_EXE_wsmp"))
             .args(args)
             .env("WSMP_CONFIG", &config)
             .env("WSMP_STATE_DIR", &state)
             .env("HOME", &dir)
-            .env(TOKEN_ENV, "signal-test-token")
             .env_remove("WSMP_LOG")
             .env_remove("RUST_LOG")
             .envs(env.iter().copied())
@@ -1767,6 +1552,197 @@ mod signal_shutdown {
         signal(setup.child.id(), "TERM");
         let _ = wait_for_exit(&mut setup.child);
     }
+
+    /// A one-request HTTP upstream; returns its base URL and the request it saw.
+    fn upstream(body: &'static str) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let request = read_request(&mut stream);
+                let _ = tx.send(request);
+                write_response(&mut stream, 200, body.as_bytes());
+            }
+        });
+        (base, rx)
+    }
+
+    fn hello_ok(socket: &mut TcpStream) {
+        write_text(
+            socket,
+            r#"{"type":"hello.ok","id":"h-1","protocolVersion":"3.0","nodeId":"nd1","definitionSync":"expect"}"#,
+        );
+    }
+
+    fn define_always_on(socket: &mut TcpStream, op: &str, base_url: &str, auth: Option<&str>) {
+        let mut spec = json!({
+            "api": "openai", "engine": "vllm", "modelType": "llm",
+            "models": [{ "id": "tiny" }],
+            "address": { "baseUrl": base_url }
+        });
+        if let Some(env) = auth {
+            spec["address"]["auth"] = json!({ "mode": "bearer", "env": env });
+        }
+        let hash = wsmp::protocol::canonical::launch_hash(&spec).expect("hash");
+        write_text(
+            socket,
+            &json!({
+                "type": "runtime.define", "opId": op, "chunkIndex": 0, "final": true,
+                "put": [{
+                    "runtimeId": "rt1", "versionId": "vr1", "launchHash": hash,
+                    "kind": "always_on", "slug": "tiny", "spec": spec
+                }]
+            })
+            .to_string(),
+        );
+    }
+
+    /// Enrolled node, Full control: the server defines an always-on runtime,
+    /// the node holds it, reports it, and relays a request to it, with the
+    /// node secret as the bearer credential and never in the log.
+    #[test]
+    fn end_to_end_define_hold_and_relay_to_an_always_on_runtime() {
+        let log = tempfile::NamedTempFile::new().expect("log file");
+        let stderr = Stdio::from(log.reopen().expect("reopen log"));
+        let mut setup = start_relay_logged(&["-vv", "run"], json!({}), &[], stderr);
+        let hello = setup.relay.next_text("hello");
+        assert_eq!(hello["trust"]["value"], "full");
+        assert_eq!(hello["definitions"], json!([]));
+        let mut socket = setup
+            .relay
+            .socket
+            .recv_timeout(Duration::from_secs(5))
+            .expect("relay socket");
+        hello_ok(&mut socket);
+        setup.relay.next_text("runtime.inventory");
+        // The secret arrives over the relay; its value must never be logged.
+        const SECRET: &str = "secret-value-7f3a9c";
+        write_text(
+            &mut socket,
+            &json!({ "type": "secret.set", "id": "s1", "name": "WSMP_SECRET_TINY", "value": SECRET })
+                .to_string(),
+        );
+        let result = setup.relay.next_text("secret.result");
+        assert_eq!(result["status"], "set");
+        assert!(!result.to_string().contains(SECRET));
+        let (base, seen) = upstream(r#"{"id":"c1","choices":[]}"#);
+        define_always_on(
+            &mut socket,
+            "op1",
+            &format!("{base}/v1"),
+            Some("WSMP_SECRET_TINY"),
+        );
+        let defined = setup.relay.next_text("runtime.define.result");
+        assert_eq!(defined["results"][0]["status"], "applied", "{defined}");
+        assert_eq!(defined["held"][0]["versionId"], "vr1");
+        let inventory = setup.relay.next_text("runtime.inventory");
+        assert_eq!(inventory["alwaysOn"][0]["slug"], "tiny");
+        assert_eq!(inventory["alwaysOn"][0]["models"][0]["id"], "tiny");
+        write_text(
+            &mut socket,
+            &json!({
+                "type": "relay.request", "requestId": "r1", "family": "chat.completions",
+                "method": "POST", "path": "/v1/chat/completions", "headers": {}, "timeoutMs": 10_000,
+                "handle": "tiny", "expectBody": false
+            })
+            .to_string(),
+        );
+        let headers = setup.relay.next_text("relay.response.headers");
+        assert_eq!(headers["status"], 200);
+        let request = loop {
+            let request = seen
+                .recv_timeout(Duration::from_secs(10))
+                .expect("upstream saw it");
+            if request.starts_with("POST ") {
+                break request;
+            }
+        };
+        assert!(
+            request.starts_with("POST /v1/chat/completions "),
+            "{request}"
+        );
+        assert!(request.contains(&format!("Bearer {SECRET}")));
+        setup.relay.next_text("relay.complete");
+        // An unknown handle is refused without reaching anything.
+        write_text(
+            &mut socket,
+            &json!({
+                "type": "relay.request", "requestId": "r2", "family": "chat.completions",
+                "method": "GET", "path": "/v1/models", "headers": {}, "timeoutMs": 10_000,
+                "handle": "nope", "expectBody": false
+            })
+            .to_string(),
+        );
+        assert_eq!(setup.relay.next_text("relay.error")["requestId"], "r2");
+        signal(setup.child.id(), "TERM");
+        let _ = wait_for_exit(&mut setup.child);
+        let output = fs::read_to_string(log.path()).expect("read log");
+        assert!(
+            !output.contains(SECRET),
+            "the secret reached the log:\n{output}"
+        );
+        // The definition survives a restart: a new relay reports it held.
+        let stored = fs::read_to_string(setup.state.join("runtime-store.json")).expect("store");
+        assert!(stored.contains("vr1"));
+        assert!(!stored.contains(SECRET));
+    }
+
+    /// `trust.lower` sticks: persisted, frozen, reported; defines are refused.
+    #[test]
+    fn trust_lower_persists_freezes_and_refuses_defines() {
+        let mut setup = start_relay(&["run"]);
+        setup.relay.next_text("hello");
+        let mut socket = setup
+            .relay
+            .socket
+            .recv_timeout(Duration::from_secs(5))
+            .expect("relay socket");
+        hello_ok(&mut socket);
+        setup.relay.next_text("runtime.inventory");
+        write_text(
+            &mut socket,
+            r#"{"type":"trust.lower","id":"t1","requestedAt":"2026-10-06T00:00:00Z"}"#,
+        );
+        let state = setup.relay.next_text("node.state");
+        assert_eq!(state["trust"], json!({ "value": "relay", "frozen": true }));
+        let config: Value =
+            serde_json::from_slice(&fs::read(setup.dir.join("config.json")).expect("config"))
+                .expect("json");
+        assert_eq!(config["trust"], "relay");
+        assert!(setup.state.join("frozen-definitions.json").exists());
+        define_always_on(&mut socket, "op1", "http://127.0.0.1:9/v1", None);
+        let refused = setup.relay.next_text("runtime.define.result");
+        assert_eq!(refused["results"][0]["reason"], "trust_relay");
+        assert_eq!(refused["frozen"], true);
+        // Commands are refused at Relay only.
+        write_text(
+            &mut socket,
+            &json!({ "type": "exec.start", "commandId": "c1", "command": "true", "timeoutMs": 60_000 })
+                .to_string(),
+        );
+        assert_eq!(
+            setup.relay.next_text("exec.rejected")["reason"],
+            "trust_relay"
+        );
+        // A hand edit back to `full` does not raise: the daemon writes relay back.
+        let mut edited = config.clone();
+        edited["trust"] = json!("full");
+        write_config(&setup.dir.join("config.json"), edited);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let now: Value =
+                serde_json::from_slice(&fs::read(setup.dir.join("config.json")).expect("config"))
+                    .expect("json");
+            if now["trust"] == "relay" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the hand-edited raise stuck");
+            thread::sleep(Duration::from_millis(100));
+        }
+        signal(setup.child.id(), "TERM");
+        let _ = wait_for_exit(&mut setup.child);
+    }
 }
 
 #[test]
@@ -1783,15 +1759,9 @@ fn config_read_grant_is_explicit_and_roots_are_validated() {
     let mut show = cli(&config, &state);
     show.args(["config", "--json", "show"]);
     let value = json_stdout(show);
-    assert_eq!(value["mcpFileRead"], false);
     assert_eq!(value["fileRoots"], json!([]));
     let disk: Value = serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
-    assert!(disk.get("mcpFileRead").is_none());
     assert!(disk.get("fileRoots").is_none());
-    cli(&config, &state)
-        .args(["config", "set-file-read", "on"])
-        .assert()
-        .success();
     // `~` expands through the platform home directory, which HOME redirects on Unix only.
     let root_arg = if cfg!(unix) {
         "~/models".to_string()
@@ -1804,7 +1774,6 @@ fn config_read_grant_is_explicit_and_roots_are_validated() {
         .assert()
         .success();
     let disk: Value = serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
-    assert_eq!(disk["mcpFileRead"], true);
     assert_eq!(
         disk["fileRoots"],
         json!([fs::canonicalize(&models).expect("root")])
@@ -1813,7 +1782,6 @@ fn config_read_grant_is_explicit_and_roots_are_validated() {
         vec!["config", "set-file-roots"],
         vec!["config", "set-file-roots", "/"],
         vec!["config", "set-file-roots", "relative"],
-        vec!["config", "set-file-read", "maybe"],
     ] {
         cli(&config, &state).args(args).assert().failure();
         let unchanged: Value =
@@ -1832,13 +1800,8 @@ fn config_read_grant_is_explicit_and_roots_are_validated() {
         .args(["config", "clear-file-roots"])
         .assert()
         .success();
-    cli(&config, &state)
-        .args(["config", "set-file-read", "off"])
-        .assert()
-        .success();
     let mut show = cli(&config, &state);
     show.args(["config", "--json", "show"]);
     let value = json_stdout(show);
-    assert_eq!(value["mcpFileRead"], false);
     assert_eq!(value["fileRoots"], json!([]));
 }

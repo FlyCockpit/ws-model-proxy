@@ -108,6 +108,9 @@ pub fn scrub_parent_env(denied_names: &[String]) -> Vec<(String, String)> {
         },
     );
     complete_child_env(&mut env, &HostEnvFacts::current(), is_socket);
+    // Every child the node starts carries the job marker, so `wsmp trust
+    // full` and `wsmp secret` refuse to run from it.
+    env.push((crate::trust::JOB_MARKER_ENV.to_string(), "1".to_string()));
     env
 }
 

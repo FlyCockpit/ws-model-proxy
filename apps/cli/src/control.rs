@@ -41,6 +41,12 @@ const CONTROL_MAX_CLIENTS: usize = 32;
 #[serde(rename_all = "snake_case")]
 pub enum ControlCommand {
     Status,
+    /// Re-read `config.json` and the node secrets now (lower-only for trust).
+    Reload,
+    /// `wsmp trust relay`: lower now (persisted, frozen, reported).
+    TrustRelay,
+    /// `wsmp trust full`: raise, after the peer check (never from the job tree).
+    TrustFull,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -69,6 +75,7 @@ pub struct ControlResponse<'a> {
 #[cfg(unix)]
 struct ControlClient {
     stream: UnixStream,
+    peer_pid: Option<i32>,
     buffer: Vec<u8>,
     deadline: Instant,
 }
@@ -83,6 +90,8 @@ pub struct ControlServer {
 #[cfg(unix)]
 pub struct PendingRequest {
     pub request: ControlRequest,
+    /// The peer's process id where the platform reports it.
+    pub peer_pid: Option<i32>,
     stream: UnixStream,
 }
 
@@ -139,8 +148,10 @@ impl ControlServer {
                         tracing::warn!(error = %error, "rejecting unauthenticated relay control peer");
                     } else {
                         stream.set_nonblocking(true)?;
+                        let peer_pid = peer_pid(&stream);
                         self.clients.push(ControlClient {
                             stream,
+                            peer_pid,
                             buffer: Vec::new(),
                             deadline: Instant::now() + CONTROL_READ_DEADLINE,
                         });
@@ -188,11 +199,27 @@ impl ControlServer {
                 Ok(stream) => stream,
                 Err(_) => return false,
             };
-            requests.push(PendingRequest { request, stream });
+            requests.push(PendingRequest {
+                request,
+                peer_pid: client.peer_pid,
+                stream,
+            });
             false
         });
         Ok(requests)
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_pid(stream: &UnixStream) -> Option<i32> {
+    getsockopt(stream, sockopt::PeerCredentials)
+        .ok()
+        .map(|peer| peer.pid())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn peer_pid(_stream: &UnixStream) -> Option<i32> {
+    None
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -279,13 +306,44 @@ pub fn respond(mut pending: PendingRequest, response: &ControlResponse<'_>) -> R
     pending.stream.shutdown(Shutdown::Both)?;
     Ok(())
 }
+/// Send `command` to the running relay; `None` when no relay runs here.
+#[cfg(unix)]
+pub fn request_if_running(command: ControlCommand) -> Result<Option<serde_json::Value>> {
+    let path = crate::paths::state_dir()?.join("relay-control.sock");
+    match UnixStream::connect(&path) {
+        Ok(stream) => exchange(stream, command).map(Some),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("connecting to relay control socket `{}`", path.display())),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn request_if_running(_command: ControlCommand) -> Result<Option<serde_json::Value>> {
+    Ok(None)
+}
+
 #[cfg(unix)]
 pub fn request(command: ControlCommand) -> Result<serde_json::Value> {
     let path = crate::paths::state_dir()?.join("relay-control.sock");
-    let mut stream = UnixStream::connect(&path)
+    let stream = UnixStream::connect(&path)
         .with_context(|| format!("connecting to relay control socket `{}`", path.display()))?;
+    exchange(stream, command)
+}
+
+#[cfg(unix)]
+fn exchange(mut stream: UnixStream, command: ControlCommand) -> Result<serde_json::Value> {
     let read_timeout = match command {
-        ControlCommand::Status => Duration::from_secs(5),
+        ControlCommand::Status | ControlCommand::Reload => Duration::from_secs(5),
+        // Lowering kills commands and writes files before it answers.
+        ControlCommand::TrustRelay | ControlCommand::TrustFull => Duration::from_secs(30),
     };
     stream.set_read_timeout(Some(read_timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
