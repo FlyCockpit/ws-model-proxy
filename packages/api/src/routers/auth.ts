@@ -1,45 +1,32 @@
-import { SUPPORTED_LOCALES } from "@ws-model-proxy/config/locales";
 import prisma from "@ws-model-proxy/db";
 import { verifyTransport } from "@ws-model-proxy/mailer";
-import { z } from "zod";
-import { protectedProcedure, publicProcedure } from "../index";
+import { contractProcedure, publicContractProcedure, publicStub } from "../contract-procedure";
+import { authContract as c } from "../contracts/account";
 import { canUserChangePassword } from "../lib/password-capabilities";
 
 export const authRouter = {
+  /** The invite sign-up page (lane B2). */
+  inviteInfo: publicStub(c.inviteInfo),
   /**
-   * Delivery-aware preflight for the email-OTP second factor. The login
-   * challenge calls this BEFORE `authClient.twoFactor.sendOtp()` because
-   * Better-Auth's send-otp endpoint swallows `sendOTP` failures and always
-   * returns success — so without this check a user could be told "code sent"
-   * when SMTP is unreachable.
+   * Delivery-aware preflight for the email-OTP second factor. The login challenge calls this
+   * BEFORE `authClient.twoFactor.sendOtp()` because Better Auth's send-otp endpoint swallows
+   * `sendOTP` failures and always returns success.
    *
-   * Public: the caller is mid-2FA (password verified, but no full session yet),
-   * so a protected procedure can't be used. It's rate-limited via the shared
-   * `/rpc` limiter and only triggers a handshake against the app's OWN
-   * configured SMTP host. Returns `{ ok }` rather than throwing so the client
-   * can branch cleanly.
+   * Public: the caller is mid-2FA (password verified, no full session yet). It is rate-limited
+   * by the shared `/rpc` limiter and only handshakes the app's own SMTP host.
    */
-  verifyEmailTransport: publicProcedure.handler(async () => {
+  verifyEmailTransport: publicContractProcedure(c.verifyEmailTransport).handler(async () => {
     return { ok: await verifyTransport() };
   }),
-  /**
-   * Persist the signed-in user's preferred UI locale. Called silently from
-   * the LanguageSwitcher when an authenticated user picks a language so the
-   * choice follows them across devices.
-   *
-   * Authenticated only. The session-derived `user.locale` is consumed by
-   * `useUserLocaleSync()` on the next session refresh.
-   */
-  updateLocale: protectedProcedure
-    .input(z.object({ locale: z.enum(SUPPORTED_LOCALES) }))
-    .handler(async ({ input, context }) => {
-      await prisma.user.update({
-        where: { id: context.session.user.id },
-        data: { locale: input.locale },
-      });
-      return { success: true };
-    }),
-  passwordCapabilities: protectedProcedure.handler(async ({ context }) => {
+  /** Persist the signed-in person's UI locale so it follows them across devices. */
+  updateLocale: contractProcedure(c.updateLocale).handler(async ({ input, context }) => {
+    await prisma.user.update({
+      where: { id: context.session.user.id },
+      data: { locale: input.locale },
+    });
+    return { success: true as const };
+  }),
+  passwordCapabilities: contractProcedure(c.passwordCapabilities).handler(async ({ context }) => {
     return {
       canChangePassword: await canUserChangePassword({
         userId: context.session.user.id,

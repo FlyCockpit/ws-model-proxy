@@ -3,6 +3,7 @@ import {
   idSchema,
   isoDateSchema,
   NODE_TRUST,
+  noInputSchema,
   OPERATOR_NEED,
   pageInputShape,
   pageOf,
@@ -156,7 +157,7 @@ export const activityContract = {
   needsYou: {
     list: query(
       "session",
-      z.object({}).strict(),
+      noInputSchema,
       z.object({ items: z.array(needsYouItemSchema), queuedCommands: z.number().int() }).strict(),
       "Everything waiting for a person: interactive steps, restarts, Forget; queued agent commands.",
     ),

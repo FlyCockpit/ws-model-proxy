@@ -2,10 +2,9 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { HOT_PATH_TABLES } from "@ws-model-proxy/db/capacity-lock-order";
 import {
+  DELETE_ORDER_EDGES,
   type DeletedParentTable,
   HISTORY_DRAIN_EDGES,
-  OWNER_RETAINED_HISTORY_TABLES,
-  RETAINED_HISTORY_EDGES,
   resolveDeletedParents,
   USER_PLAIN_ID_HISTORY_TABLES,
 } from "@ws-model-proxy/db/parent-deletion";
@@ -14,8 +13,8 @@ import { describe, expect, it } from "vitest";
 // The parent-deletion contract against the Prisma schema (DL-1 design (d),
 // #78): a delete cascades only into graph and bounded auxiliary tables (no
 // hot-path table has a foreign key into the graph), every hot-path table is
-// in the user-history contract with real columns, and the preflight covers
-// every RESTRICT edge. A new foreign key into the user's graph fails here
+// in the user-history contract with real columns, and every NoAction/RESTRICT
+// edge is handled by the ordered whole-user delete. A new foreign key into the user's graph fails here
 // until it is classified, so the delete cannot silently grow a
 // traffic-proportional cascade again.
 
@@ -86,45 +85,52 @@ const GRAPH_TABLES: Record<string, string> = {
   session: "browser sessions (expiry sweep)",
   account: "sign-in methods",
   two_factor: "one per user",
-  device_code: "short-lived device-flow codes",
   oauth_client: "registered OAuth clients",
   oauth_client_resource: "per client",
   oauth_consent: "per client",
   oauth_access_token: "OAuth tokens (retention cleanup)",
   oauth_refresh_token: "OAuth tokens (retention cleanup)",
   mcp_grant: "per client grant",
-  mcp_personal_token: "personal tokens",
-  cli_device: "configuration",
-  cli_device_credential: "configuration",
-  cli_token: "configuration",
-  endpoint: "configuration",
-  discovered_model: "configuration",
+  agent_token: "agent tokens",
+  node: "configuration",
+  node_credential: "one active per node",
+  node_enrollment_code: "short-lived codes",
+  node_enrollment_use: "one row per enrolled node",
+  node_command: "node command state, 30-day retention",
+  queued_node_command: "commands queued for a person, expire",
+  fabric: "configuration",
+  fabric_member: "configuration",
+  runtime: "configuration",
+  runtime_version: "immutable configuration versions",
+  runtime_model: "configuration",
+  runtime_share: "two-party configuration",
+  runtime_instance: "running copies; released by the delete",
+  instance_rank: "one per instance node",
+  instance_step: "bounded lifecycle steps per instance",
+  runtime_operation: "bounded operations",
   execution_target: "configuration",
-  inference_capacity: "configuration",
-  model_pool: "configuration",
+  profile: "configuration",
+  profile_node: "configuration",
+  profile_item: "configuration",
+  pool: "configuration",
+  pool_routing: "1:1 with a pool",
+  pool_fallback: "1:1 with a pool",
+  pool_advanced: "1:1 with a pool",
+  pool_sidecar: "at most 3 per pool",
   pool_member: "configuration",
-  inference_contribution: "two-party inference-only configuration",
-  deployment_config: "recipes",
-  deployment_config_revision: "immutable recipe configuration",
-  deployment_plan: "bounded operational plans",
-  deployment_run: "operational runs removed after verified stops",
-  deployment_instance: "operational instances; live claims refuse deletion",
   pool_routing_rule: "configuration: at most 16 rules per pool",
-  pool_grant: "configuration",
-  pool_fallback_preference: "configuration: at most one per exact pool grant",
-  model_api_token: "configuration",
-  model_api_token_allowlist_entry: "configuration",
+  api_key: "configuration",
+  api_key_pool: "configuration",
+  share: "two-party configuration",
+  share_invite: "pending invites",
   provider_account: "configuration",
   provider_model: "configuration",
   provider_credential: "configuration",
-  provider_budget_policy: "configuration",
-  provider_budget_rule: "configuration",
-  capacity_audit_event: "one row per owner policy edit, not per request",
+  provider_pricing_version: "configuration versions",
+  spend_cap: "configuration",
   media_asset: "uploads, deleted at expiry by the media cleanup",
 };
 
-/** Tables whose rows make the delete fail; the preflight refuses first. */
-const RETAINED_TABLES = new Set<string>(OWNER_RETAINED_HISTORY_TABLES);
 const hot = new Set<string>(HOT_PATH_TABLES);
 
 /**
@@ -132,14 +138,12 @@ const hot = new Set<string>(HOT_PATH_TABLES);
  * none of them writes traffic-proportional rows.
  */
 const REACHED_DELETE_TRIGGERS: Record<string, string> = {
-  "deployment_owner_cleanup:user":
-    "refuses live claims then removes stopped operational dependencies",
-  "deployment_device_cleanup:cli_device":
-    "refuses any live group claims then removes stopped operational dependencies",
+  "node_delete_release:node":
+    "releases the node's ranks, stops what had a part there, deletes its always-on instances; bounded by the node's instances",
   "pool_routing_rule_on_member_delete:pool_member":
-    "rewrites at most 16 pool_routing_rule rows (delete targeted, SET NULL exclude to pool-wide); configuration, not per-request",
-  "provider_audit_event_immutable:provider_audit_event":
-    "retained history the preflight refuses; never fires on a delete that proceeds",
+    "rewrites at most 16 pool_routing_rule rows of the pool; configuration, not per-request",
+  "share_delete_cleanup:share":
+    "removes the grantee's API-key entries and sidecar links for the pool; configuration",
   "z_graph_write_fence:user":
     "graph-write fence check (plain reads); the user delete holds the owner fences",
 };
@@ -149,7 +153,9 @@ const REACHED_DELETE_TRIGGERS: Record<string, string> = {
  * never reaches them, so each must be drained (USER_PLAIN_ID_HISTORY_TABLES)
  * or listed here with the reason a user delete may leave the rows.
  */
-const PLAIN_USER_ID_EXEMPT: Record<string, string> = {};
+const PLAIN_USER_ID_EXEMPT: Record<string, string> = {
+  node_enrollment_use: "cascades with its enrollment code (node_enrollment_code → user)",
+};
 
 /** Tables with a plain `userId` column (owner) and no relation on it. */
 function plainUserIdTables(): Array<{ table: string; column: string }> {
@@ -189,20 +195,11 @@ describe("plain user-id tables", () => {
     expect(unclassified).toEqual([]);
   });
 
-  it("drains cli_agent_action_event by its userId column", () => {
-    expect(USER_PLAIN_ID_HISTORY_TABLES.cli_agent_action_event.userColumn).toBe("userId");
-    expect(plainUserIdTables()).toContainEqual({
-      table: "cli_agent_action_event",
-      column: "userId",
-    });
-  });
-
-  it("drains deployment_operator_event by its userId column", () => {
-    expect(USER_PLAIN_ID_HISTORY_TABLES.deployment_operator_event.userColumn).toBe("userId");
-    expect(plainUserIdTables()).toContainEqual({
-      table: "deployment_operator_event",
-      column: "userId",
-    });
+  it("drains node and account audit by their userId column", () => {
+    for (const table of ["node_audit_event", "audit_event"] as const) {
+      expect(USER_PLAIN_ID_HISTORY_TABLES[table].userColumn).toBe("userId");
+      expect(plainUserIdTables()).toContainEqual({ table, column: "userId" });
+    }
   });
 
   it("has no stale classification", () => {
@@ -221,9 +218,7 @@ describe("parent-deletion contract against the Prisma schema", () => {
     for (const edge of edges)
       if (edge.action === "SetNull" && reach.has(edge.parent)) touched.add(edge.child);
     const unclassified = [...touched]
-      .filter(
-        (table) => !history.has(table) && !(table in GRAPH_TABLES) && !RETAINED_TABLES.has(table),
-      )
+      .filter((table) => !history.has(table) && !(table in GRAPH_TABLES))
       .sort();
     expect(unclassified).toEqual([]);
     // No stale classification.
@@ -268,15 +263,17 @@ describe("parent-deletion contract against the Prisma schema", () => {
     // Each delegate answers with its own distinct rows (whatever the filter),
     // so every step of the resolution chain is visible in the result.
     const rows: Record<string, Array<Record<string, string>>> = {
-      cliDevice: [{ id: "device-1" }],
-      endpoint: [{ id: "endpoint-1" }],
-      discoveredModel: [{ id: "model-1" }],
-      executionTarget: [{ id: "target-1", discoveredModelId: "model-of-target" }],
-      modelPool: [{ id: "pool-1" }],
+      node: [{ id: "node-1" }],
+      runtime: [{ id: "runtime-1" }],
+      runtimeModel: [{ id: "model-1" }],
+      runtimeInstance: [{ id: "instance-1" }],
+      runtimeShare: [{ id: "runtime-share-1" }],
+      executionTarget: [{ id: "target-1" }],
+      profile: [{ id: "profile-1" }],
+      pool: [{ id: "pool-1" }],
       poolMember: [{ id: "member-1" }],
-      poolGrant: [{ id: "grant-1" }],
-      inferenceCapacity: [{ id: "capacity-1" }],
-      modelApiToken: [{ id: "token-1" }],
+      share: [{ id: "share-1" }],
+      apiKey: [{ id: "key-1" }],
       providerAccount: [{ id: "provider-account-1" }],
       providerModel: [{ id: "provider-model-1" }],
     };
@@ -285,13 +282,17 @@ describe("parent-deletion contract against the Prisma schema", () => {
     );
     const none: Record<DeletedParentTable, string[]> = {
       user: [],
-      model_pool: [],
-      pool_member: [],
-      pool_grant: [],
-      discovered_model: [],
+      node: [],
+      runtime: [],
+      runtime_model: [],
+      runtime_instance: [],
+      runtime_share: [],
       execution_target: [],
-      inference_capacity: [],
-      model_api_token: [],
+      profile: [],
+      pool: [],
+      pool_member: [],
+      share: [],
+      api_key: [],
       provider_account: [],
       provider_model: [],
     };
@@ -305,76 +306,65 @@ describe("parent-deletion contract against the Prisma schema", () => {
         scope: { userId: "u", wholeUser: true },
         expected: {
           user: ["u"],
-          model_pool: ["pool-1"],
-          pool_member: ["member-1"],
-          pool_grant: ["grant-1"],
-          discovered_model: ["model-1", "model-of-target"],
+          node: ["node-1"],
+          runtime: ["runtime-1"],
+          runtime_model: ["model-1"],
+          runtime_instance: ["instance-1"],
+          runtime_share: ["runtime-share-1"],
           execution_target: ["target-1"],
-          inference_capacity: ["capacity-1"],
-          model_api_token: ["token-1"],
+          profile: ["profile-1"],
+          pool: ["pool-1"],
+          pool_member: ["member-1"],
+          share: ["share-1"],
+          api_key: ["key-1"],
           provider_account: ["provider-account-1"],
           provider_model: ["provider-model-1"],
         },
       },
       {
-        label: "model pool",
+        label: "node (its always-on runtimes go with it)",
+        scope: { userId: "u", nodeIds: ["n"] },
+        expected: {
+          ...none,
+          node: ["n"],
+          runtime: ["runtime-1"],
+          runtime_model: ["model-1"],
+          runtime_instance: ["instance-1"],
+          runtime_share: ["runtime-share-1"],
+          execution_target: ["target-1"],
+          pool_member: ["member-1"],
+        },
+      },
+      {
+        label: "pool",
         scope: { userId: "u", poolIds: ["p"] },
+        expected: { ...none, pool: ["p"], share: ["share-1"], pool_member: ["member-1"] },
+      },
+      {
+        label: "share (its contributed members go)",
+        scope: { userId: "u", shareIds: ["s"] },
+        expected: { ...none, share: ["s"], pool_member: ["member-1"] },
+      },
+      {
+        label: "instance",
+        scope: { userId: "u", instanceIds: ["i"] },
+        expected: { ...none, runtime_instance: ["i"], execution_target: ["target-1"] },
+      },
+      {
+        label: "provider account",
+        scope: { userId: "u", providerAccountIds: ["a"] },
         expected: {
           ...none,
-          model_pool: ["p"],
-          pool_member: ["member-1"],
-          pool_grant: ["grant-1"],
-        },
-      },
-      {
-        label: "pool member",
-        scope: { userId: "u", poolMemberIds: ["m"] },
-        expected: { ...none, pool_member: ["m"] },
-      },
-      {
-        label: "execution target",
-        scope: { userId: "u", executionTargetIds: ["t"] },
-        expected: {
-          ...none,
-          execution_target: ["t"],
-          discovered_model: ["model-of-target"],
-          pool_member: ["member-1"],
-        },
-      },
-      {
-        label: "inference capacity",
-        scope: { userId: "u", capacityIds: ["c"] },
-        expected: { ...none, inference_capacity: ["c"] },
-      },
-      {
-        label: "discovered model",
-        scope: { userId: "u", discoveredModelIds: ["dm"] },
-        expected: {
-          ...none,
-          discovered_model: ["dm", "model-of-target"],
+          provider_account: ["a"],
+          provider_model: ["provider-model-1"],
           execution_target: ["target-1"],
           pool_member: ["member-1"],
         },
       },
       {
-        label: "endpoint",
-        scope: { userId: "u", endpointIds: ["e"] },
-        expected: {
-          ...none,
-          discovered_model: ["model-1", "model-of-target"],
-          execution_target: ["target-1"],
-          pool_member: ["member-1"],
-        },
-      },
-      {
-        label: "cli device",
-        scope: { userId: "u", cliDeviceIds: ["d"] },
-        expected: {
-          ...none,
-          discovered_model: ["model-1", "model-of-target"],
-          execution_target: ["target-1"],
-          pool_member: ["member-1"],
-        },
+        label: "api key",
+        scope: { userId: "u", apiKeyIds: ["k"] },
+        expected: { ...none, api_key: ["k"] },
       },
     ];
     for (const { label, scope, expected } of cases)
@@ -412,7 +402,7 @@ describe("parent-deletion contract against the Prisma schema", () => {
     expect(onReachedTables).toEqual(Object.keys(REACHED_DELETE_TRIGGERS).sort());
   });
 
-  it("covers every RESTRICT edge into the deleted graph with the preflight", () => {
+  it("handles every NoAction/RESTRICT edge inside the deleted graph", () => {
     const restrict = edges
       .filter(
         (edge) =>
@@ -420,13 +410,6 @@ describe("parent-deletion contract against the Prisma schema", () => {
       )
       .map((edge) => `${edge.child}.${edge.column}`)
       .sort();
-    expect(Object.keys(RETAINED_HISTORY_EDGES).sort()).toEqual(restrict);
-    // owner-history edges come only from tables the preflight checks by
-    // owner, plus the rotation link it checks apart.
-    for (const [edge, coverage] of Object.entries(RETAINED_HISTORY_EDGES)) {
-      const table = edge.split(".")[0] ?? "";
-      if (coverage === "owner-history" && edge !== "provider_credential.replacedById")
-        expect(OWNER_RETAINED_HISTORY_TABLES, edge).toContain(table);
-    }
+    expect(Object.keys(DELETE_ORDER_EDGES).sort()).toEqual(restrict);
   });
 });

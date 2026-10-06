@@ -6,6 +6,7 @@ import {
   idSchema,
   isoDateSchema,
   nameSchema,
+  noInputSchema,
   noteSchema,
   okSchema,
   sha256Schema,
@@ -65,7 +66,7 @@ const profileItemInput = z
 export const profilesContract = {
   list: query(
     "agent",
-    z.object({}).strict(),
+    noInputSchema,
     z.object({ profiles: z.array(profileViewSchema) }).strict(),
     "Profiles: owned nodes, pinned items, satisfied now, last apply.",
     ["profiles_get"],

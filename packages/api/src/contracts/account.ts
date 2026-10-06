@@ -2,6 +2,7 @@
  * Account, admin and kept plumbing: `app`, `auth` (kept unchanged), `settings` (per user),
  * `users` (admin, kept), `adminObservability`, `adminSettings`.
  */
+import { SUPPORTED_LOCALES } from "@ws-model-proxy/config/locales";
 import { z } from "zod";
 import {
   emailSchema,
@@ -12,13 +13,14 @@ import {
   NODE_CONNECTION,
   NODE_TRUST,
   nameSchema,
+  noInputSchema,
   REQUEST_STATUS,
   RUNTIME_KIND,
 } from "./common";
 import { mutation, query } from "./procedure";
 
 const successSchema = z.object({ success: z.literal(true) }).strict();
-const localeSchema = z.string().regex(/^[a-z]{2}-[A-Z]{2}$/);
+const localeSchema = z.enum(SUPPORTED_LOCALES);
 
 const adminPageInput = {
   page: z.number().int().min(1).default(1),
@@ -42,7 +44,7 @@ const ownerRefSchema = z
 export const appContract = {
   config: query(
     "public",
-    z.object({}).strict(),
+    noInputSchema,
     z
       .object({
         signupEnabled: z.boolean(),
@@ -54,7 +56,7 @@ export const appContract = {
   ),
   flags: query(
     "session",
-    z.object({}).strict(),
+    noInputSchema,
     z
       .object({
         cloudEnabled: z.boolean(),
@@ -67,7 +69,7 @@ export const appContract = {
   ),
   features: query(
     "admin",
-    z.object({}).strict(),
+    noInputSchema,
     z.record(z.string(), z.unknown()),
     "Admin inventory of server features (was deploymentFeatures; read-only).",
   ),
@@ -90,7 +92,7 @@ export const authContract = {
   ),
   verifyEmailTransport: query(
     "public",
-    z.object({}).strict(),
+    noInputSchema,
     z.object({ ok: z.boolean() }).strict(),
     "Kept: whether email delivery works.",
   ),
@@ -102,7 +104,7 @@ export const authContract = {
   ),
   passwordCapabilities: query(
     "session",
-    z.object({}).strict(),
+    noInputSchema,
     z.object({ canChangePassword: z.boolean() }).strict(),
     "Kept: whether this account can change its password.",
   ),
@@ -121,7 +123,7 @@ export const userSettingsSchema = z
   .strict();
 
 export const settingsContract = {
-  get: query("session", z.object({}).strict(), userSettingsSchema, "Your profile and alerts."),
+  get: query("session", noInputSchema, userSettingsSchema, "Your profile and alerts."),
   update: mutation(
     "human",
     z
@@ -137,7 +139,7 @@ export const settingsContract = {
   onboarding: {
     complete: mutation(
       "human",
-      z.object({}).strict(),
+      noInputSchema,
       userSettingsSchema,
       "Dismiss or finish the getting-started checklist.",
     ),
@@ -171,7 +173,8 @@ export const usersContract = {
         offset: z.number().int().min(0).default(0),
         search: z.string().trim().max(200).optional(),
       })
-      .strict(),
+      .strict()
+      .prefault({}),
     z
       .object({
         users: z.array(adminUserSchema),
@@ -227,7 +230,7 @@ export const usersContract = {
 export const adminObservabilityContract = {
   nodes: query(
     "admin",
-    z.object(adminPageInput).strict(),
+    z.object(adminPageInput).strict().prefault({}),
     adminPageOf(
       z
         .object({
@@ -246,7 +249,7 @@ export const adminObservabilityContract = {
   ),
   runtimes: query(
     "admin",
-    z.object(adminPageInput).strict(),
+    z.object(adminPageInput).strict().prefault({}),
     adminPageOf(
       z
         .object({
@@ -263,7 +266,7 @@ export const adminObservabilityContract = {
   ),
   pools: query(
     "admin",
-    z.object(adminPageInput).strict(),
+    z.object(adminPageInput).strict().prefault({}),
     adminPageOf(
       z
         .object({
@@ -280,7 +283,7 @@ export const adminObservabilityContract = {
   ),
   relay: query(
     "admin",
-    z.object(adminPageInput).strict(),
+    z.object(adminPageInput).strict().prefault({}),
     adminPageOf(
       z
         .object({
@@ -308,7 +311,7 @@ export const serverSettingsSchema = z
   .strict();
 
 export const adminSettingsContract = {
-  get: query("admin", z.object({}).strict(), serverSettingsSchema, "Admin: server settings."),
+  get: query("admin", noInputSchema, serverSettingsSchema, "Admin: server settings."),
   update: mutation(
     "human_admin",
     serverSettingsSchema.partial().strict(),

@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 const FLAGS = [
   "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED",
   "WMP_MCP_ENABLED",
-  "WMP_MCP_PAT_ALLOW_NO_EXPIRY",
+  "WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY",
   "SIGNUP_ENABLED",
   "WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS",
 ] as const;
@@ -33,13 +33,13 @@ describe("egress and MCP kill-switch defaults", () => {
   it("defaults egress and MCP on without opening signup or private networks", () => {
     expect(env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED).toBe(true);
     expect(env.WMP_MCP_ENABLED).toBe(true);
-    expect(env.WMP_MCP_PAT_ALLOW_NO_EXPIRY).toBe(true);
+    expect(env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY).toBe(true);
     expect(env.SIGNUP_ENABLED).toBe(false);
     expect(env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS).toBe(false);
 
     expect(manifestDefault("WMP_PUBLIC_PROVIDER_EGRESS_ENABLED")).toBe("true");
     expect(manifestDefault("WMP_MCP_ENABLED")).toBe("true");
-    expect(manifestDefault("WMP_MCP_PAT_ALLOW_NO_EXPIRY")).toBe("true");
+    expect(manifestDefault("WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY")).toBe("true");
     expect(manifestDefault("SIGNUP_ENABLED")).toBe("false");
     expect(manifestDefault("WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS")).toBe("false");
   });

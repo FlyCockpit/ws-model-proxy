@@ -8,6 +8,7 @@ import {
   MODEL_TYPE,
   moneySchema,
   nameSchema,
+  noInputSchema,
   okSchema,
   PROVIDER_AUTH_TYPE,
   PROVIDER_CREDENTIAL_STATUS,
@@ -103,7 +104,7 @@ export const providersContract = {
   accounts: {
     list: query(
       "agent",
-      z.object({}).strict(),
+      noInputSchema,
       z.object({ accounts: z.array(providerAccountViewSchema) }).strict(),
       "Provider accounts (no secrets), health, this month's spend against the cap.",
       ["providers_get"],

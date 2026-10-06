@@ -46,7 +46,7 @@ vi.mock("@ws-model-proxy/db", () => ({
 const httpsBase = "https://ws-model-proxy.example.com";
 
 describe("resolveMcpPlugins (WMP_MCP_ENABLED decision)", () => {
-  it("is empty while disabled so the plugin list stays exactly admin/twoFactor/deviceAuthorization", () => {
+  it("is empty while disabled so the plugin list stays exactly admin/twoFactor", () => {
     expect(resolveMcpPlugins({ enabled: false, baseUrl: httpsBase })).toEqual([]);
   });
 

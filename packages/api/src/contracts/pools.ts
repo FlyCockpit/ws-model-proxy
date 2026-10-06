@@ -12,6 +12,7 @@ import {
   MEMBER_STATE,
   MODEL_TYPE,
   nameSchema,
+  noInputSchema,
   noteSchema,
   okSchema,
   PRIORITY_CLASS,
@@ -210,7 +211,7 @@ const sidecarPatchSchema = z
 export const poolsContract = {
   list: query(
     "agent",
-    z.object({}).strict(),
+    noInputSchema,
     z
       .object({
         pools: z.array(poolViewSchema),

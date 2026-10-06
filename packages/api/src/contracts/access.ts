@@ -9,6 +9,7 @@ import {
   MODEL_TYPE,
   moneySchema,
   nameSchema,
+  noInputSchema,
   okSchema,
   PRIORITY_CLASS,
 } from "./common";
@@ -106,7 +107,7 @@ export const accessContract = {
   apiKeys: {
     list: query(
       "session",
-      z.object({}).strict(),
+      noInputSchema,
       z.object({ keys: z.array(apiKeyViewSchema), baseUrl: z.string().url() }).strict(),
       "Your API keys (pools only).",
     ),
@@ -137,7 +138,7 @@ export const accessContract = {
   agentTokens: {
     list: query(
       "session",
-      z.object({}).strict(),
+      noInputSchema,
       z.object({ tokens: z.array(agentTokenViewSchema), mcpUrl: z.string().url() }).strict(),
       "Your agent tokens.",
     ),
@@ -164,7 +165,7 @@ export const accessContract = {
   oauthGrants: {
     list: query(
       "session",
-      z.object({}).strict(),
+      noInputSchema,
       z.object({ connections: z.array(oauthConnectionViewSchema) }).strict(),
       "Agents connected with OAuth.",
     ),
@@ -178,7 +179,7 @@ export const accessContract = {
   shares: {
     list: query(
       "session",
-      z.object({}).strict(),
+      noInputSchema,
       z
         .object({
           byMe: z.array(shareViewSchema),
@@ -262,7 +263,7 @@ export const accessContract = {
   contributing: {
     pools: query(
       "session",
-      z.object({}).strict(),
+      noInputSchema,
       z
         .object({
           pools: z.array(

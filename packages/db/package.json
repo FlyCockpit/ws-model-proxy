@@ -5,8 +5,8 @@
     ".": {
       "default": "./src/index.ts"
     },
-    "./forwarder-security": {
-      "default": "./src/forwarder-security.ts"
+    "./node-security": {
+      "default": "./src/node-security.ts"
     },
     "./shutdown-fence": {
       "default": "./src/shutdown-fence.ts"
@@ -34,6 +34,9 @@
     },
     "./user-deletion-access": {
       "default": "./src/user-deletion-access.ts"
+    },
+    "./usage-rollup-requester-drain": {
+      "default": "./src/usage-rollup-requester-drain.ts"
     }
   },
   "scripts": {

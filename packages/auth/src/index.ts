@@ -1,5 +1,4 @@
 import { randomBytes } from "node:crypto";
-import { CLI_DEVICE_CODE_EXPIRES_IN } from "@ws-model-proxy/config/cli-device-login";
 import {
   FORWARDER_SLUG_MAX_LENGTH,
   slugifyForwarderSeed,
@@ -17,14 +16,10 @@ import {
 import { betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
 import { createAuthMiddleware } from "better-auth/api";
-import { admin, deviceAuthorization, twoFactor } from "better-auth/plugins";
+import { admin, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
 import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
-import {
-  DISABLED_DEVICE_AUTHORIZATION_PATHS,
-  requireCliDeviceLoginScope,
-} from "./cli-device-login-scope";
 import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
 import { resolveSignupLocale } from "./signup-locale";
@@ -243,9 +238,6 @@ export const auth = betterAuth({
       ? { sameSite: "none", secure: true, httpOnly: true }
       : { httpOnly: true, secure: env.NODE_ENV === "production" },
   },
-  // The device-flow paths this PR replaces with the atomic claim+approve
-  // procedure; see DISABLED_DEVICE_AUTHORIZATION_PATHS.
-  disabledPaths: [...DISABLED_DEVICE_AUTHORIZATION_PATHS],
   plugins: [
     admin({
       defaultRole: "user",
@@ -292,28 +284,11 @@ export const auth = betterAuth({
           }
         : {}),
     }),
-    // OAuth 2.0 Device Authorization Grant (RFC 8628) for `wsmp login`. The
-    // plugin handles the request and approval steps; the approved code is
-    // redeemed only by `cliCredentials.exchangeDeviceCode` for one device
-    // credential. Its session-minting `/device/token` is disabled above.
-    // The plugin's options schema uses `z.custom(() => true)` for the
-    // `schema` field without `.optional()`, so we have to pass it explicitly
-    // (even as `undefined`) or zod rejects the call at startup.
-    deviceAuthorization({
-      expiresIn: CLI_DEVICE_CODE_EXPIRES_IN,
-      interval: "5s",
-      // Every request names the CLI slug it is for (`cli-slug:<slug>`); the
-      // approval page shows it and the exchange mints for that slug only.
-      onDeviceAuthRequest: requireCliDeviceLoginScope,
-      // The adapter looks up `db.deviceCode` by the schema key `deviceCode`,
-      // and the options-schema parser marks `schema` as nonoptional, so pass
-      // the Prisma model mapping explicitly.
-      schema: { deviceCode: { modelName: "deviceCode" } },
-    }),
+    // Nodes enroll with a one-time code minted in the browser (`nodes.enrollmentCodes`,
+    // plain-HTTP exchange); there is no device-authorization flow in 0.4.0.
     // MCP/OAuth surface. Installed while WMP_MCP_ENABLED is true (the default):
     // jwt/mcp/cimd from Better Auth 1.7.3. The kill switch leaves this spread
-    // empty, so the plugin list above is exactly admin, twoFactor, and
-    // deviceAuthorization.
+    // empty, so the plugin list above is exactly admin and twoFactor.
     ...resolveMcpPlugins({
       enabled: env.WMP_MCP_ENABLED,
       baseUrl: env.BETTER_AUTH_URL,

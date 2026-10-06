@@ -11,10 +11,7 @@
  */
 import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import {
-  POOL_ADVANCED_COLUMNS,
-  POOL_ADVANCED_OVERRIDES,
-} from "../../config/src/pool-defaults.ts";
+import { POOL_ADVANCED_COLUMNS, POOL_ADVANCED_OVERRIDES } from "../../config/src/pool-defaults.ts";
 import { RUNTIME_ADVANCED, RUNTIME_LIMIT_COLUMNS } from "../../config/src/runtime-defaults.ts";
 
 export const BEGIN_MARKER = "-- BEGIN GENERATED registry checks (scripts/registry-checks.mjs)";
@@ -70,7 +67,7 @@ export function registryChecksSql() {
     "ALTER TABLE pool_advanced ADD CONSTRAINT pool_advanced_overrides_check CHECK (",
     `  wsmp_registry_ok(overrides, ${sqlLiteral(registryJson(POOL_ADVANCED_OVERRIDES))})`,
     `  AND ${poolColumns}`,
-    "  AND (\"contextCeiling\" IS NULL OR \"contextMargin\" IS NULL OR \"contextMargin\" < \"contextCeiling\")",
+    '  AND ("contextCeiling" IS NULL OR "contextMargin" IS NULL OR "contextMargin" < "contextCeiling")',
     ");",
     "ALTER TABLE runtime_version DROP CONSTRAINT IF EXISTS runtime_version_advanced_check;",
     "ALTER TABLE runtime_version ADD CONSTRAINT runtime_version_advanced_check CHECK (",

@@ -18,6 +18,7 @@ import {
   MODEL_CAPABILITY,
   MODEL_TYPE,
   nameSchema,
+  noInputSchema,
   noteSchema,
   OPERATION_KIND,
   OPERATOR_NEED,
@@ -291,7 +292,7 @@ const advancedInput = runtimeAdvancedPatchSchema.optional();
 export const runtimesContract = {
   list: query(
     "agent",
-    z.object({}).strict(),
+    noInputSchema,
     z.object({ runtimes: z.array(runtimeSummarySchema) }).strict(),
     "Your runtimes with current version and instance counts.",
     ["runtimes_get"],
@@ -322,7 +323,7 @@ export const runtimesContract = {
   presets: {
     list: query(
       "agent",
-      z.object({}).strict(),
+      noInputSchema,
       z
         .object({
           presets: z.array(

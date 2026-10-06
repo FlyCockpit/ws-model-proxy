@@ -345,12 +345,12 @@ export const ENV_VARS: EnvVar[] = [
     ],
   },
   {
-    key: "WMP_MCP_PAT_ALLOW_NO_EXPIRY",
+    key: "WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY",
     group: "runtime",
     source: "default",
     default: "true",
     comment: [
-      "Allow minting no-expiry (unlimited-lifetime) MCP personal tokens. The product default is 90 days.",
+      "Allow minting no-expiry (unlimited-lifetime) agent tokens. The product default is 90 days.",
       "Turn off to refuse an explicit no-expiry token. Omitting expiry still mints a 90-day token; a chosen expiry must be within MCP_PAT_MAX_TTL_DAYS (365 days).",
     ],
   },

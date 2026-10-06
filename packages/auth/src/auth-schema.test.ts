@@ -25,6 +25,17 @@ import { describe, expect, it } from "vitest";
  * actions, and tables without plugin-derived inventories are not covered.
  */
 const schema = readFileSync(new URL("../../db/prisma/schema/auth.prisma", import.meta.url), "utf8");
+/** McpGrant and AgentToken live with the other access objects in 0.4.0. */
+const accessSchema = readFileSync(
+  new URL("../../db/prisma/schema/access.prisma", import.meta.url),
+  "utf8",
+);
+
+function accessModelBlock(name: string): string {
+  const match = accessSchema.match(new RegExp(`^model ${name} \\{[\\s\\S]*?^\\}`, "m"));
+  if (!match) throw new Error(`model ${name} must exist in access.prisma`);
+  return match[0];
+}
 
 /** Every model declared in auth.prisma, derived from the file itself. */
 const modelNames = [...schema.matchAll(/^model (\w+) \{/gm)].map((match) => match[1]!);
@@ -144,7 +155,7 @@ describe("OAuth/JWKS model set (dormant until WMP_MCP_ENABLED)", () => {
     expect(user).toMatch(/oauthAccessTokens\s+OauthAccessToken\[\]/);
     expect(user).toMatch(/oauthConsents\s+OauthConsent\[\]/);
     expect(user).toMatch(/mcpGrants\s+McpGrant\[\]/);
-    expect(user).toMatch(/mcpPersonalTokens\s+McpPersonalToken\[\]/);
+    expect(user).toMatch(/agentTokens\s+AgentToken\[\]/);
     const session = modelBlock("Session");
     expect(session).toMatch(/oauthRefreshTokens\s+OauthRefreshToken\[\]/);
     expect(session).toMatch(/oauthAccessTokens\s+OauthAccessToken\[\]/);
@@ -152,7 +163,7 @@ describe("OAuth/JWKS model set (dormant until WMP_MCP_ENABLED)", () => {
 });
 
 describe("McpGrant (application-owned)", () => {
-  const grant = modelBlock("McpGrant");
+  const grant = accessModelBlock("McpGrant");
 
   it("enforces unique (userId, clientId, referenceId) generations", () => {
     expect(grant).toContain("@@unique([userId, clientId, referenceId])");
@@ -177,12 +188,12 @@ describe("McpGrant (application-owned)", () => {
   });
 });
 
-describe("McpPersonalToken (application-owned)", () => {
-  const token = modelBlock("McpPersonalToken");
+describe("AgentToken (application-owned, was McpPersonalToken)", () => {
+  const token = accessModelBlock("AgentToken");
 
   it("enforces unique lookup prefix and secret digest", () => {
-    expect(token).toContain("@@unique([lookupPrefix])");
-    expect(token).toContain("@@unique([secretDigest])");
+    expect(token).toMatch(/lookupPrefix\s+String\s+@unique/);
+    expect(token).toMatch(/secretDigest\s+String\s+@unique/);
   });
 
   it("keeps the one-token-per-grant relation unique and cascading", () => {
@@ -198,7 +209,7 @@ describe("McpPersonalToken (application-owned)", () => {
     expect(token).toContain("@@index([userId, revokedAt])");
     expect(token).toContain("@@index([expiresAt])");
     expect(token).toMatch(
-      /user\s+User\s+@relation\("McpPersonalTokenOwner", fields: \[userId\], references: \[id\], onDelete: Cascade\)/,
+      /user\s+User\s+@relation\(fields: \[userId\], references: \[id\], onDelete: Cascade\)/,
     );
   });
 });
@@ -316,7 +327,7 @@ describe("intentional generator deviations are pinned", () => {
 
   // Baseline (non-plugin) models' current timestamp conventions are pinned
   // too — that is intended: any timestamp change anywhere in auth.prisma
-  // must be an explicit, reviewed decision. AppSetting/DeviceCode follow the
+  // must be an explicit, reviewed decision. AppSetting follows the
   // repo-wide createdAt+updatedAt(@updatedAt) convention; OauthClientAssertion
   // alone carries no timestamps (expiresAt is a plain required column).
   const defaultNowSets: Record<string, string[]> = {
@@ -333,10 +344,7 @@ describe("intentional generator deviations are pinned", () => {
     OauthConsent: ["createdAt", "updatedAt"],
     OauthClientAssertion: [],
     Jwks: ["createdAt"],
-    McpGrant: ["createdAt", "updatedAt"],
-    McpPersonalToken: ["createdAt", "updatedAt"],
     AppSetting: ["createdAt", "updatedAt"],
-    DeviceCode: ["createdAt", "updatedAt"],
   };
 
   const updatedAtSets: Record<string, string[]> = {
@@ -353,10 +361,7 @@ describe("intentional generator deviations are pinned", () => {
     OauthConsent: ["updatedAt"],
     OauthClientAssertion: [],
     Jwks: [],
-    McpGrant: ["updatedAt"],
-    McpPersonalToken: ["updatedAt"],
     AppSetting: ["updatedAt"],
-    DeviceCode: ["updatedAt"],
   };
 
   it("pins the exact @default(now()) set for EVERY model in auth.prisma", () => {

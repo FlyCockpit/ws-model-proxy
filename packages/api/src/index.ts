@@ -1,113 +1,91 @@
+/**
+ * oRPC base procedures. Every 0.4.0 procedure is bound to its contract through
+ * `contract-procedure.ts`, which picks the access check from the contract's access tag; the
+ * named bases below are the same checks for code outside the contract tree.
+ */
 import { ORPCError, os } from "@orpc/server";
+import type { Session } from "@ws-model-proxy/auth";
 import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
 import { isAdminRole } from "@ws-model-proxy/auth/roles";
-
 import type { Context } from "./context";
+import { callerMayReach, isHumanCaller } from "./contracts/auth-context";
+import type { ProcedureAccess } from "./contracts/procedure";
 
 const o = os.$context<Context>();
 
 export const publicProcedure = o;
 
-const requireAuth = o.middleware(async ({ context, next }) => {
-  if (!context.session?.user) {
-    throw new ORPCError("UNAUTHORIZED");
+function forbidden(message: string) {
+  return new ORPCError("FORBIDDEN", { message });
+}
+
+function notFound() {
+  return new ORPCError("NOT_FOUND", { message: "Not found" });
+}
+
+async function assertTwoFactorPolicy(session: Session): Promise<void> {
+  if ((await isForceTwoFactorRequired()) && !session.user.twoFactorEnabled) {
+    throw forbidden("Two-factor authentication setup is required.");
   }
-  return next({
-    context: {
-      session: context.session,
-    },
-  });
-});
+}
 
-export const authenticatedProcedure = publicProcedure.use(requireAuth);
-
-const requireRequiredTwoFactor = o.middleware(async ({ context, next }) => {
-  if (!context.session?.user) {
-    throw new ORPCError("UNAUTHORIZED");
-  }
-  if ((await isForceTwoFactorRequired()) && !context.session.user.twoFactorEnabled) {
-    throw new ORPCError("FORBIDDEN", {
-      message: "Two-factor authentication setup is required.",
-    });
-  }
-  return next({
-    context: {
-      session: context.session,
-    },
-  });
-});
-
-export const protectedProcedure = authenticatedProcedure.use(requireRequiredTwoFactor);
-
-const requireHuman = o.middleware(async ({ context, next }) => {
-  // MCP contexts carry a deployment actor; a person's session never does.
-  if (context.services?.deploymentActor)
-    throw new ORPCError("FORBIDDEN", { message: "This action requires a person." });
-  return next();
-});
+function isVerifiedAdmin(session: Session): boolean {
+  return session.user.emailVerified && isAdminRole(session.user.role);
+}
 
 /**
- * A protected procedure only a person may call: consent, credentials and
- * paid-egress switches. Refused in the procedure itself, not only by leaving
- * it out of the MCP tool manifest.
+ * The one access check, by contract access level (`contracts/procedure.ts`). Returns the
+ * signed-in session; every non-public level needs one.
+ *
+ * - `admin` and `human_admin` hide themselves: a caller who is not a verified admin gets
+ *   NOT_FOUND, so the admin surface does not leak.
+ * - `human` is a positive check: a cookie session whose `x-csrf-token` was verified
+ *   (`isHumanCaller`). An MCP token, an OAuth access token or a cookie without the header is
+ *   refused, whatever the transport.
  */
-export const humanProcedure = protectedProcedure.use(requireHuman);
-
-const requireAdmin = o.middleware(async ({ context, next }) => {
-  // `requireAuth` is always chained before this middleware, so session is
-  // non-null at runtime — but the middleware-chain types don't carry that
-  // narrowing through, so repeat the guard for the type checker.
-  if (!context.session?.user) {
+export async function assertAccess(access: ProcedureAccess, context: Context): Promise<Session> {
+  if (access === "public") {
+    throw new Error("assertAccess is not used for public procedures");
+  }
+  const session = context.session;
+  const hidden = access === "admin" || access === "human_admin";
+  if (!session?.user || context.auth.kind === "anonymous") {
+    throw hidden ? notFound() : new ORPCError("UNAUTHORIZED");
+  }
+  if (context.auth.userId !== session.user.id) {
     throw new ORPCError("UNAUTHORIZED");
   }
-  if (!context.session.user.emailVerified) {
-    throw new ORPCError("FORBIDDEN", {
-      message: "Email verification required for admin access.",
-    });
+  if (hidden && !isVerifiedAdmin(session)) {
+    throw notFound();
   }
-  if (!isAdminRole(context.session.user.role)) {
-    throw new ORPCError("FORBIDDEN", {
-      message: "Admin access required.",
-    });
+  if (!callerMayReach(access, context.auth)) {
+    if (access === "admin" || access === "session") throw notFound();
+    throw forbidden("This action requires a person.");
   }
-  if ((await isForceTwoFactorRequired()) && !context.session.user.twoFactorEnabled) {
-    throw new ORPCError("FORBIDDEN", {
-      message: "Two-factor authentication setup is required.",
-    });
-  }
-  return next({
-    context: {
-      session: context.session,
-    },
+  await assertTwoFactorPolicy(session);
+  return session;
+}
+
+function accessMiddleware(access: Exclude<ProcedureAccess, "public">) {
+  return o.middleware(async ({ context, next }) => {
+    const session = await assertAccess(access, context);
+    return next({ context: { session } });
   });
-});
+}
 
-export const adminProcedure = publicProcedure.use(requireAuth).use(requireAdmin);
+/** A signed-in person on `/rpc` (cookie session). */
+export const protectedProcedure = o.use(accessMiddleware("session"));
 
-// `adminOr404Procedure` mirrors the role check in `requireAdmin` but throws
-// NOT_FOUND for every failure mode (missing session, unverified email,
-// non-admin role). Mount it on procedures that back a 404-hidden surface
-// (e.g. the /admin route group) so existence of the endpoint is not leaked
-// to non-admins.
-const requireAdminOr404 = o.middleware(async ({ context, next }) => {
-  const notFound = () => new ORPCError("NOT_FOUND", { message: "Not found" });
-  if (!context.session?.user) {
-    throw notFound();
-  }
-  if (!context.session.user.emailVerified) {
-    throw notFound();
-  }
-  if (!isAdminRole(context.session.user.role)) {
-    throw notFound();
-  }
-  if ((await isForceTwoFactorRequired()) && !context.session.user.twoFactorEnabled) {
-    throw notFound();
-  }
-  return next({
-    context: {
-      session: context.session,
-    },
-  });
-});
+/** A signed-in person, or an MCP agent token whose tool calls this procedure. */
+export const agentProcedure = o.use(accessMiddleware("agent"));
 
-export const adminOr404Procedure = publicProcedure.use(requireAdminOr404);
+/** Only a person: cookie session with a verified CSRF header (§6.3). Never MCP. */
+export const humanProcedure = o.use(accessMiddleware("human"));
+
+/** A verified admin; NOT_FOUND for everyone else. */
+export const adminProcedure = o.use(accessMiddleware("admin"));
+
+/** A verified admin acting as a person (CSRF verified). */
+export const humanAdminProcedure = o.use(accessMiddleware("human_admin"));
+
+export { isHumanCaller };

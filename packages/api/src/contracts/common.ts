@@ -11,6 +11,8 @@ import { z } from "zod";
 
 /** A row id (cuid2) named by a caller: never free text that reaches SQL as-is. */
 export const idSchema = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
+/** Input of a procedure that takes none (clients may send nothing or `{}`). */
+export const noInputSchema = z.object({}).strict().optional();
 export const slugSchema = z.string().regex(/^[a-z](?:[a-z0-9]|-(?=[a-z0-9])){0,40}$/);
 export const nodeSlugSchema = z.string().regex(/^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,62}$/);
 export const nameSchema = z.string().trim().min(1).max(120);

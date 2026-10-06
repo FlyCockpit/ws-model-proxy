@@ -11,7 +11,7 @@ const envMock = {
   WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
   WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: undefined as string | undefined,
   WMP_MCP_ENABLED: true,
-  WMP_MCP_PAT_ALLOW_NO_EXPIRY: true,
+  WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY: true,
   WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: false,
   BETTER_AUTH_URL: "https://proxy.example.com",
 };
@@ -48,10 +48,11 @@ const db = prisma as unknown as {
   user: { count: ReturnType<typeof vi.fn> };
 };
 
-const publicContext: Context = { session: null };
+const publicContext: Context = { session: null, auth: { kind: "anonymous" } };
 
 function sessionContext(role: string): Context {
   return {
+    auth: { kind: "cookie_session", userId: "user", sessionId: "session", csrfVerified: true },
     session: {
       user: {
         id: "user",
@@ -81,14 +82,14 @@ function sessionContext(role: string): Context {
   } as Context;
 }
 
-describe("appConfig", () => {
+describe("app", () => {
   beforeEach(() => {
     envMock.SMTP_HOST = undefined;
     envMock.SIGNUP_ENABLED = true;
     envMock.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
     envMock.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS = undefined;
     envMock.WMP_MCP_ENABLED = true;
-    envMock.WMP_MCP_PAT_ALLOW_NO_EXPIRY = true;
+    envMock.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = true;
     envMock.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS = false;
     db.appSetting.findUnique.mockResolvedValue(null);
     db.user.count.mockResolvedValue(1);
@@ -96,7 +97,7 @@ describe("appConfig", () => {
 
   it("reports emailEnabled=false when SMTP_HOST is unset", async () => {
     const client = createRouterClient(appRouter, { context: publicContext });
-    const config = await client.appConfig();
+    const config = await client.app.config();
 
     expect(config.emailEnabled).toBe(false);
   });
@@ -104,7 +105,7 @@ describe("appConfig", () => {
   it("reports emailEnabled=true when SMTP_HOST is configured", async () => {
     envMock.SMTP_HOST = "smtp.example.com";
     const client = createRouterClient(appRouter, { context: publicContext });
-    const config = await client.appConfig();
+    const config = await client.app.config();
 
     expect(config.emailEnabled).toBe(true);
   });
@@ -114,12 +115,9 @@ describe("appConfig", () => {
     envMock.SMTP_HOST = "smtp.example.com";
 
     const client = createRouterClient(appRouter, { context: publicContext });
-    const config = await client.appConfig();
+    const config = await client.app.config();
 
     expect(config).toEqual({
-      ssoEnabled: false,
-      forceSso: false,
-      ssoProviderName: "SSO",
       signupEnabled: false,
       adminBootstrapSignupEnabled: false,
       emailEnabled: true,
@@ -132,12 +130,12 @@ describe("appConfig", () => {
     const sentinel = "zz-keyring-marker";
     envMock.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS = sentinel;
     const client = createRouterClient(appRouter, { context: publicContext });
-    const config = await client.appConfig();
+    const config = await client.app.config();
     expect(config).not.toHaveProperty("deploymentFeatures");
     expect(config).not.toHaveProperty("providerEgressEnabled");
     expect(JSON.stringify(config)).not.toContain(sentinel);
-    await expect(client.deploymentFeatures()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
-    await expect(client.deploymentFlags()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(client.app.features()).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(client.app.flags()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
   });
 
   it("gives a signed-in user the product gates without the keyring status", async () => {
@@ -146,19 +144,23 @@ describe("appConfig", () => {
     const sentinel = "zz-keyring-marker";
     envMock.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS = sentinel;
     const client = createRouterClient(appRouter, { context: sessionContext("user") });
-    await expect(client.deploymentFlags()).resolves.toEqual({
-      providerEgressEnabled: true,
+    await expect(client.app.flags()).resolves.toEqual({
+      cloudEnabled: true,
       privateNetworksAllowed: true,
+      mcpEnabled: true,
+      agentTokenNoExpiryAllowed: true,
     });
-    expect(JSON.stringify(await client.deploymentFlags())).not.toContain(sentinel);
-    expect(JSON.stringify(await client.deploymentFlags())).not.toContain("keyring");
-    await expect(client.deploymentFeatures()).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(JSON.stringify(await client.app.flags())).not.toContain(sentinel);
+    expect(JSON.stringify(await client.app.flags())).not.toContain("keyring");
+    await expect(client.app.features()).rejects.toMatchObject({ code: "NOT_FOUND" });
 
     envMock.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
     envMock.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS = false;
-    await expect(client.deploymentFlags()).resolves.toEqual({
-      providerEgressEnabled: false,
+    await expect(client.app.flags()).resolves.toEqual({
+      cloudEnabled: false,
       privateNetworksAllowed: false,
+      mcpEnabled: true,
+      agentTokenNoExpiryAllowed: true,
     });
   });
 
@@ -168,20 +170,20 @@ describe("appConfig", () => {
     envMock.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS = true;
     const client = createRouterClient(appRouter, { context: sessionContext("admin") });
 
-    const missingKeyring = await client.deploymentFeatures();
+    const missingKeyring = await client.app.features();
     expect(missingKeyring.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED).toEqual({
       enabled: true,
       keyringConfigured: false,
       ready: false,
     });
     expect(missingKeyring.WMP_MCP_ENABLED).toBe(true);
-    expect(missingKeyring.WMP_MCP_PAT_ALLOW_NO_EXPIRY).toBe(true);
+    expect(missingKeyring.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY).toBe(true);
     expect(missingKeyring.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS).toBe(true);
     expect(JSON.stringify(missingKeyring)).not.toContain("WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS");
 
     const sentinel = "zz-keyring-marker";
     envMock.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS = sentinel;
-    const ready = await client.deploymentFeatures();
+    const ready = await client.app.features();
     expect(ready.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED).toEqual({
       enabled: true,
       keyringConfigured: true,
@@ -195,7 +197,7 @@ describe("appConfig", () => {
     db.appSetting.findUnique.mockResolvedValue({ value: "false" });
 
     const client = createRouterClient(appRouter, { context: publicContext });
-    const config = await client.appConfig();
+    const config = await client.app.config();
 
     expect(config.signupEnabled).toBe(false);
     expect(config.adminBootstrapSignupEnabled).toBe(false);
@@ -206,7 +208,7 @@ describe("appConfig", () => {
     db.appSetting.findUnique.mockResolvedValue({ value: "true" });
 
     const client = createRouterClient(appRouter, { context: publicContext });
-    const config = await client.appConfig();
+    const config = await client.app.config();
 
     expect(config.signupEnabled).toBe(true);
     expect(config.adminBootstrapSignupEnabled).toBe(false);
@@ -218,7 +220,7 @@ describe("appConfig", () => {
     db.user.count.mockResolvedValue(0);
 
     const client = createRouterClient(appRouter, { context: publicContext });
-    const config = await client.appConfig();
+    const config = await client.app.config();
 
     expect(config.adminBootstrapSignupEnabled).toBe(true);
   });

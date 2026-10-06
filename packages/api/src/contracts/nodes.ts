@@ -30,6 +30,7 @@ import {
   NODE_TRUST,
   nameSchema,
   nodeSlugSchema,
+  noInputSchema,
   noteSchema,
   OPERATOR_NEED,
   okSchema,
@@ -363,7 +364,7 @@ export const nodeFileMutationOutputSchema = z
 export const nodesContract = {
   list: query(
     "agent",
-    z.object({}).strict(),
+    noInputSchema,
     z.object({ nodes: z.array(nodeSummarySchema) }).strict(),
     "Your nodes with trust, hardware summary and running counts.",
     ["nodes_get"],
@@ -439,7 +440,7 @@ export const nodesContract = {
   fabrics: {
     list: query(
       "session",
-      z.object({}).strict(),
+      noInputSchema,
       z
         .object({
           fabrics: z.array(
@@ -538,7 +539,7 @@ export const nodesContract = {
   enrollmentCodes: {
     list: query(
       "session",
-      z.object({}).strict(),
+      noInputSchema,
       z.object({ codes: z.array(enrollmentCodeViewSchema) }).strict(),
       "Unexpired and recently used enrollment codes.",
     ),

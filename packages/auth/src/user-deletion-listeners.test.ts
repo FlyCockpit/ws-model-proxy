@@ -21,16 +21,10 @@ const makePrismaStub = (): unknown =>
     },
   });
 vi.mock("@ws-model-proxy/db", () => ({ default: makePrismaStub() }));
-const {
-  deleteUserDurably,
-  findRetainedHistoryBlocker,
-  requestUserDeletion,
-  resolveDeletedParents,
-} = vi.hoisted(() => ({
+const { deleteUserDurably, requestUserDeletion, resolveDeletedParents } = vi.hoisted(() => ({
   deleteUserDurably: vi.fn(
     async (_db: unknown, _userId: string): Promise<"deleted" | "missing" | "pending"> => "deleted",
   ),
-  findRetainedHistoryBlocker: vi.fn(async (): Promise<string | null> => null),
   requestUserDeletion: vi.fn(
     async (): Promise<{ generation: string; created: boolean } | null> => ({
       generation: "generation-1",
@@ -42,7 +36,6 @@ const {
 vi.mock("@ws-model-proxy/db/parent-deletion", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@ws-model-proxy/db/parent-deletion")>()),
   deleteUserDurably,
-  findRetainedHistoryBlocker,
   requestUserDeletion,
   resolveDeletedParents,
 }));
@@ -214,21 +207,18 @@ describe("user deletion listeners", () => {
     expect(listener).not.toHaveBeenCalled();
   });
 
-  it("refuses session and account deletes on a user-delete route when history is retained", async () => {
+  it("marks the user on a user-delete route and never gates other session deletes", async () => {
     const session = auth.options.databaseHooks?.session?.delete?.before;
-    const account = auth.options.databaseHooks?.account?.delete?.before;
     const row = { ...removedUser, userId: "removed-user", token: "t", expiresAt: new Date() };
-    findRetainedHistoryBlocker.mockResolvedValue("capacity lease");
     const route = { path: "/admin/remove-user" } as Parameters<NonNullable<typeof session>>[1];
-    await expect(session?.(row, route)).rejects.toMatchObject({ status: "CONFLICT" });
-    const accountRow = { ...row, providerId: "credential", accountId: "removed-user" };
-    await expect(account?.(accountRow, route)).rejects.toMatchObject({ status: "CONFLICT" });
-    // Sign-out and other session deletes are never gated.
+    requestUserDeletion.mockResolvedValueOnce({ generation: "g", created: true });
+    await expect(session?.(row, route)).resolves.toBeUndefined();
+    expect(requestUserDeletion).toHaveBeenCalledWith(expect.anything(), "removed-user");
     const signOut = { path: "/sign-out" } as Parameters<NonNullable<typeof session>>[1];
+    requestUserDeletion.mockClear();
     await expect(session?.(row, signOut)).resolves.toBeUndefined();
     await expect(session?.(row, null)).resolves.toBeUndefined();
-    findRetainedHistoryBlocker.mockResolvedValue(null);
-    await expect(session?.(row, route)).resolves.toBeUndefined();
+    expect(requestUserDeletion).not.toHaveBeenCalled();
   });
 
   it("the user-delete preflight notifies marked listeners only when it starts the generation", async () => {
@@ -237,7 +227,6 @@ describe("user deletion listeners", () => {
     const session = auth.options.databaseHooks?.session?.delete?.before;
     const row = { ...removedUser, userId: "removed-user", token: "t", expiresAt: new Date() };
     const route = { path: "/admin/remove-user" } as Parameters<NonNullable<typeof session>>[1];
-    findRetainedHistoryBlocker.mockResolvedValue(null);
     requestUserDeletion.mockResolvedValueOnce({ generation: "g", created: true });
     await session?.(row, route);
     expect(marked).toHaveBeenCalledTimes(1);

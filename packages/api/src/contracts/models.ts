@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { idSchema, MODEL_TYPE } from "./common";
+import { idSchema, MODEL_TYPE, noInputSchema } from "./common";
 import { mutation, query } from "./procedure";
 
 /** `owner/pool` or `owner/pool:external`. */
@@ -57,7 +57,7 @@ export const modelTestResultSchema = z
 export const modelsContract = {
   list: query(
     "session",
-    z.object({}).strict(),
+    noInputSchema,
     z
       .object({
         /** Base URL for the OpenAI/Anthropic-compatible API (`/v1`). */
