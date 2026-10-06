@@ -1,0 +1,15 @@
+{
+  "type": "relay.request",
+  "requestId": "req-1",
+  "family": "chat.completions",
+  "method": "POST",
+  "path": "/v1/chat/completions",
+  "headers": {
+    "content-type": "application/json"
+  },
+  "timeoutMs": 600000,
+  "handle": "i-in3k4j5h6g7f",
+  "expectBody": true,
+  "countFirst": true,
+  "countCeiling": 32000
+}

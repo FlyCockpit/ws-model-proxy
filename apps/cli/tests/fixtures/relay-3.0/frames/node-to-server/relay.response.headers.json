@@ -1,0 +1,6 @@
+{
+  "type": "relay.response.headers",
+  "requestId": "req-1",
+  "status": 200,
+  "headers": [["content-type", "text/event-stream"], ["warning", "a"], ["warning", "b"]]
+}

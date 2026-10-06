@@ -1,0 +1,47 @@
+{
+  "type": "hello",
+  "id": "h-2",
+  "protocolVersion": "3.0",
+  "node": {
+    "slug": "spark-2",
+    "identityPublicKey": "BDVaf6TJ7hM4XYKnzPEWO2CFqs_0GT5jiK3S9xxBZouw1fofRGmOs9j9IkdskbbbACVKb5S53gMoTXKXvOEGK1A",
+    "identitySignature": "G0Bliq_U-R5DaI2y1_whRmuQtdr_JEluk7jdAidMcZa74AUqT3SZvuMILVJ3nMHmCzBVep_E6Q4zWH2ix-wRNg",
+    "terminalPublicKey": "BEtwlbrfBClOc5i94gcsUXabwOUKL1R5nsPoDTJXfKHG6xA1Wn-kye4TOF2Cp8zxFjtgharP9Bk-Y4it0vccQWY"
+  },
+  "trust": {
+    "value": "relay",
+    "frozen": true,
+    "frozenPeers": [
+      {
+        "runtimeId": "rt1q8m3k2v9x7c4b6n0z5h1j8",
+        "headAddr": "10.0.0.5",
+        "peers": ["spark-1"]
+      }
+    ]
+  },
+  "features": {
+    "terminals": {
+      "supported": true,
+      "max": 4,
+      "approvalRequired": false
+    },
+    "operatorTerminals": true,
+    "files": {
+      "roots": null,
+      "asRoot": false
+    },
+    "runtimeHosts": [],
+    "mediaExpand": true,
+    "liveStt": true
+  },
+  "definitions": [
+    {
+      "runtimeId": "rt1q8m3k2v9x7c4b6n0z5h1j8",
+      "versionId": "vr1a2b3c4d5e6f7g8h9i0j1k2",
+      "launchHash": "7d80f5e860fb99a08c22b7aefb21407ce26c1d4b6c15d1050d1ff1c043f63b40"
+    }
+  ],
+  "heldMetricCommandsHash": null,
+  "heldPortRange": null,
+  "runtimes": []
+}

@@ -1,0 +1,13 @@
+{
+  "type": "stt.event",
+  "sessionId": "XYKnzPEWO2CFqs_0GT5jiA",
+  "event": {
+    "kind": "completed",
+    "itemSeq": 0,
+    "text": "hello world",
+    "engineUsage": {
+      "inputTokens": 10,
+      "outputTokens": 2
+    }
+  }
+}

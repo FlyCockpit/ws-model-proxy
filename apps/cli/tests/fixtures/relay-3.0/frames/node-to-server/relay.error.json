@@ -1,0 +1,7 @@
+{
+  "type": "relay.error",
+  "requestId": "req-1",
+  "failure": "upstream_5xx",
+  "message": "upstream returned 503",
+  "upstreamStatusCode": 503
+}

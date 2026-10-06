@@ -1,0 +1,6 @@
+{
+  "type": "relay.request.body",
+  "requestId": "req-1",
+  "chunkId": "c-0",
+  "final": true
+}

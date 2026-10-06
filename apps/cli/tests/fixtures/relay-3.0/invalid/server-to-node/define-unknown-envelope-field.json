@@ -1,0 +1,52 @@
+{
+  "type": "runtime.define",
+  "opId": "def-2",
+  "remove": ["rt2p9o8i7u6y5t4r3e2w1q0a9"],
+  "put": [
+    {
+      "runtimeId": "rt2p9o8i7u6y5t4r3e2w1q0a9",
+      "versionId": "vr2z9y8x7w6v5u4t3s2r1q0p9",
+      "launchHash": "cab1dcd89087852aa3ba53595f7406545fcf43c7d0efcd5a3e8316bc76b90960",
+      "kind": "always_on",
+      "slug": "bge",
+      "spec": {
+        "api": "openai",
+        "engine": "llama_cpp",
+        "modelType": "embeddings",
+        "address": {
+          "baseUrl": "http://127.0.0.1:8080/v1",
+          "auth": {
+            "mode": "bearer",
+            "env": "WSMP_ENDPOINT_LLAMA_KEY"
+          }
+        },
+        "models": [
+          {
+            "id": "bge-m3",
+            "embeddingContract": {
+              "model": "BAAI/bge-m3",
+              "revision": "main",
+              "dimensions": 1024,
+              "normalization": "l2",
+              "vectorSpace": "bge-m3"
+            }
+          }
+        ],
+        "metricsReader": {
+          "kind": "route",
+          "route": "/slots",
+          "format": "json",
+          "intervalSecs": 5,
+          "map": {
+            "slotsBusy": {
+              "series": "/0/is_processing",
+              "aggregate": "sum"
+            }
+          }
+        },
+        "expandMedia": false
+      },
+      "contentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "type": "relay.request.body.ack",
+  "requestId": "req-1",
+  "credits": 2
+}

@@ -1,0 +1,80 @@
+{
+  "rules": "see packages/api/src/lib/canonical-json.ts",
+  "launchHashes": {
+    "startable-spec": "7d80f5e860fb99a08c22b7aefb21407ce26c1d4b6c15d1050d1ff1c043f63b40",
+    "always-on-spec": "cab1dcd89087852aa3ba53595f7406545fcf43c7d0efcd5a3e8316bc76b90960",
+    "node-origin-spec": "039468b1d34ebae0307929e4559fa1ef8ca76bc58ba72b569cf04ca192d51be2"
+  },
+  "valid": [
+    {
+      "name": "key-order-code-points",
+      "json": "{\"z\":1,\"é\":2,\"a\":{\"b\":[1,2.5,{\"y\":null,\"x\":true}]},\"｡\":\"halfwidth\",\"😀\":\"emoji\",\"A\":\"upper\"}",
+      "canonical": "{\"A\":\"upper\",\"a\":{\"b\":[1,2.5,{\"x\":true,\"y\":null}]},\"z\":1,\"é\":2,\"｡\":\"halfwidth\",\"😀\":\"emoji\"}",
+      "sha256": "021ccb5b142ca22715b53cd0e68ec4f31fb365a9cbd23e034ff24779df9c486f"
+    },
+    {
+      "name": "whitespace-and-nesting",
+      "json": " { \"b\" : [ 1 , [ ] , { } ] ,\n \"a\" : \"\" } ",
+      "canonical": "{\"a\":\"\",\"b\":[1,[],{}]}",
+      "sha256": "9b4c335a250a420695ac3c1e7230541c2ac5fe75e8d06af4561eda7d5ce25dbd"
+    },
+    {
+      "name": "string-escapes",
+      "json": "{\"s\":\"line\\nbreak\\ttab\\u0001\\u001f\\\"quote\\\\back/slash\\u2028\\u007f\\b\\f\\r\"}",
+      "canonical": "{\"s\":\"line\\nbreak\\ttab\\u0001\\u001f\\\"quote\\\\back/slash \\b\\f\\r\"}",
+      "sha256": "1585b93319eb40b7d6c5da82da45c216b02fbe9dd0bcb595f7f89988e1332e0b"
+    },
+    {
+      "name": "numbers",
+      "json": "[0,-0,1,-1,2.0,0.1,7.5,1e-6,0.000001,123456.789,1e2,9007199254740991,-9007199254740991,99999999999999.5]",
+      "canonical": "[0,0,1,-1,2,0.1,7.5,0.000001,0.000001,123456.789,100,9007199254740991,-9007199254740991,99999999999999.5]",
+      "sha256": "c7077454d32dab97cffc068c0325a7df6303f0c013d493859e9dab37e4ea6ab5"
+    },
+    {
+      "name": "undefined-free-literals",
+      "json": "[true,false,null,\"null\"]",
+      "canonical": "[true,false,null,\"null\"]",
+      "sha256": "dcc895c65f40ce380abe69dfd3d8f4a40924c8fd09ee45b068579279690a0bb8"
+    },
+    {
+      "name": "startable-spec",
+      "json": "{\"api\": \"openai\", \"engine\": \"vllm\", \"modelType\": \"llm\", \"models\": [{\"id\": \"Qwen/Qwen3-32B\", \"capabilities\": [\"text_generation\", \"responses_api\"]}], \"launch\": {\"management\": \"process\", \"groupSize\": 2, \"resources\": [{\"kind\": \"discrete\", \"gpuCount\": 1, \"vramGb\": 79.5, \"vendor\": \"nvidia\"}], \"labels\": [\"h100\"], \"iface\": \"eth0\", \"commands\": [{\"prepare\": \"huggingface-cli download Qwen/Qwen3-32B\", \"start\": \"vllm serve Qwen/Qwen3-32B --port {{port}} --pipeline-parallel-size {{nnodes}} --node-rank {{node_rank}} --master-addr {{head_addr}} --master-port {{dist_port}} --gpu-memory-utilization {{memory_fraction}}\", \"stop\": \"true\", \"timeoutsSec\": {\"prepare\": 86400, \"start\": 1800}}], \"readiness\": {\"path\": \"/health\", \"expectedStatus\": 200, \"timeoutMs\": 1800000}, \"health\": {\"intervalMs\": 30000, \"failureThreshold\": 3, \"successThreshold\": 1}}, \"metricsReader\": {\"kind\": \"builtin\"}}",
+      "canonical": "{\"api\":\"openai\",\"engine\":\"vllm\",\"launch\":{\"commands\":[{\"prepare\":\"huggingface-cli download Qwen/Qwen3-32B\",\"start\":\"vllm serve Qwen/Qwen3-32B --port {{port}} --pipeline-parallel-size {{nnodes}} --node-rank {{node_rank}} --master-addr {{head_addr}} --master-port {{dist_port}} --gpu-memory-utilization {{memory_fraction}}\",\"stop\":\"true\",\"timeoutsSec\":{\"prepare\":86400,\"start\":1800}}],\"groupSize\":2,\"health\":{\"failureThreshold\":3,\"intervalMs\":30000,\"successThreshold\":1},\"iface\":\"eth0\",\"labels\":[\"h100\"],\"management\":\"process\",\"readiness\":{\"expectedStatus\":200,\"path\":\"/health\",\"timeoutMs\":1800000},\"resources\":[{\"gpuCount\":1,\"kind\":\"discrete\",\"vendor\":\"nvidia\",\"vramGb\":79.5}]},\"metricsReader\":{\"kind\":\"builtin\"},\"modelType\":\"llm\",\"models\":[{\"capabilities\":[\"text_generation\",\"responses_api\"],\"id\":\"Qwen/Qwen3-32B\"}]}",
+      "sha256": "7d80f5e860fb99a08c22b7aefb21407ce26c1d4b6c15d1050d1ff1c043f63b40"
+    },
+    {
+      "name": "always-on-spec",
+      "json": "{\"api\": \"openai\", \"engine\": \"llama_cpp\", \"modelType\": \"embeddings\", \"address\": {\"baseUrl\": \"http://127.0.0.1:8080/v1\", \"auth\": {\"mode\": \"bearer\", \"env\": \"WSMP_ENDPOINT_LLAMA_KEY\"}}, \"models\": [{\"id\": \"bge-m3\", \"embeddingContract\": {\"model\": \"BAAI/bge-m3\", \"revision\": \"main\", \"dimensions\": 1024, \"normalization\": \"l2\", \"vectorSpace\": \"bge-m3\"}}], \"metricsReader\": {\"kind\": \"route\", \"route\": \"/slots\", \"format\": \"json\", \"intervalSecs\": 5, \"map\": {\"slotsBusy\": {\"series\": \"/0/is_processing\", \"aggregate\": \"sum\"}}}, \"expandMedia\": false}",
+      "canonical": "{\"address\":{\"auth\":{\"env\":\"WSMP_ENDPOINT_LLAMA_KEY\",\"mode\":\"bearer\"},\"baseUrl\":\"http://127.0.0.1:8080/v1\"},\"api\":\"openai\",\"engine\":\"llama_cpp\",\"expandMedia\":false,\"metricsReader\":{\"format\":\"json\",\"intervalSecs\":5,\"kind\":\"route\",\"map\":{\"slotsBusy\":{\"aggregate\":\"sum\",\"series\":\"/0/is_processing\"}},\"route\":\"/slots\"},\"modelType\":\"embeddings\",\"models\":[{\"embeddingContract\":{\"dimensions\":1024,\"model\":\"BAAI/bge-m3\",\"normalization\":\"l2\",\"revision\":\"main\",\"vectorSpace\":\"bge-m3\"},\"id\":\"bge-m3\"}]}",
+      "sha256": "cab1dcd89087852aa3ba53595f7406545fcf43c7d0efcd5a3e8316bc76b90960"
+    },
+    {
+      "name": "metric-commands",
+      "json": "[{\"name\": \"gpu_power\", \"command\": \"nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits\", \"intervalSecs\": 30, \"timeoutSecs\": 5, \"format\": \"lines\"}]",
+      "canonical": "[{\"command\":\"nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits\",\"format\":\"lines\",\"intervalSecs\":30,\"name\":\"gpu_power\",\"timeoutSecs\":5}]",
+      "sha256": "bab560648992cf2cac00bd361ddee7bf69baab83e9712853ccae40558fae6eca"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "unsafe-integer",
+      "json": "[9007199254740993]"
+    },
+    {
+      "name": "too-small-fraction",
+      "json": "[1e-7]"
+    },
+    {
+      "name": "too-large-fraction",
+      "json": "[2000000000000000.5]"
+    },
+    {
+      "name": "huge-integer-valued-float",
+      "json": "[1e300]"
+    },
+    {
+      "name": "lone-surrogate",
+      "json": "[\"\\ud800\"]"
+    }
+  ]
+}

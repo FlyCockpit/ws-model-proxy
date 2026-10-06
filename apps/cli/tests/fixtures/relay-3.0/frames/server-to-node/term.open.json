@@ -1,0 +1,13 @@
+{
+  "type": "term.open",
+  "terminalId": "MVZ7oMXqDzRZfqPI7RI3XA",
+  "viewerId": "PGGGq9D1Gj9kia7T-B1CZw",
+  "cols": 120,
+  "rows": 40,
+  "browserPublicKey": "BEtwlbrfBClOc5i94gcsUXabwOUKL1R5nsPoDTJXfKHG6xA1Wn-kye4TOF2Cp8zxFjtgharP9Bk-Y4it0vccQWY",
+  "browserNonce": "R2yRttsAJUpvlLneAyhNcg",
+  "identity": {
+    "publicKey": "BDVaf6TJ7hM4XYKnzPEWO2CFqs_0GT5jiK3S9xxBZouw1fofRGmOs9j9IkdskbbbACVKb5S53gMoTXKXvOEGK1A",
+    "signature": "G0Bliq_U-R5DaI2y1_whRmuQtdr_JEluk7jdAidMcZa74AUqT3SZvuMILVJ3nMHmCzBVep_E6Q4zWH2ix-wRNg"
+  }
+}

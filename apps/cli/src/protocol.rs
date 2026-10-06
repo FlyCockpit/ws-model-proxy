@@ -1,4 +1,11 @@
 //! Relay protocol frame helpers matching `apps/server/src/relay/protocol.ts`.
+//!
+//! The relay 3.0 contract (0.4.0) lives in the submodules below; this file's
+//! 2.4 codec is rewritten around them in S0b.
+
+pub mod canonical;
+pub mod frames;
+pub mod runtime_spec;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

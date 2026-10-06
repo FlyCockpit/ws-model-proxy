@@ -1,0 +1,46 @@
+{
+  "type": "node.info",
+  "os": {
+    "name": "Ubuntu",
+    "version": "24.04",
+    "kernel": "6.8.0",
+    "arch": "x86_64"
+  },
+  "cpu": {
+    "model": "AMD Ryzen AI Max+ 395",
+    "cores": 32
+  },
+  "memoryTotalMiB": 131072,
+  "unifiedMemoryMiB": 131072,
+  "acceleratorMemoryMiB": 114688,
+  "gpus": [
+    {
+      "vendor": "amd",
+      "index": 0,
+      "name": "Radeon 8060S",
+      "vramTotalMiB": 512,
+      "gttTotalMiB": 114688,
+      "gfxTarget": "gfx1151",
+      "apu": true,
+      "pciId": "1002:1586"
+    }
+  ],
+  "nodeKind": "unified",
+  "interfaces": [
+    {
+      "name": "eth0",
+      "addresses": ["10.0.0.6"],
+      "linkSpeedMbps": 10000,
+      "mtu": 1500
+    }
+  ],
+  "executionMechanism": "systemd+linger",
+  "version": "0.4.0",
+  "declared": {
+    "kind": "unified",
+    "memoryGb": 128,
+    "acceleratorMemoryGb": 112,
+    "reservedMemoryGb": 8,
+    "labels": ["strix-halo", "rocm"]
+  }
+}

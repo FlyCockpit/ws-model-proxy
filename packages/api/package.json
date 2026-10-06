@@ -8,6 +8,15 @@
     "./lib/deployment-spec": {
       "default": "./src/lib/deployment-spec.ts"
     },
+    "./lib/runtime-spec": {
+      "default": "./src/lib/runtime-spec.ts"
+    },
+    "./lib/canonical-json": {
+      "default": "./src/lib/canonical-json.ts"
+    },
+    "./lib/runtime-launch-hash": {
+      "default": "./src/lib/runtime-launch-hash.ts"
+    },
     "./lib/deployment-operator-notify": {
       "default": "./src/lib/deployment-operator-notify.ts"
     },
