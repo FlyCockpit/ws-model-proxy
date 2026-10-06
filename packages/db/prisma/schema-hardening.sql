@@ -17,7 +17,10 @@ LOCK TABLE "user", session, node, node_credential, node_enrollment_code, node_au
   pool_routing_rule, api_key, api_key_pool, agent_token, share, provider_account, provider_model,
   provider_credential, provider_pricing_version, spend_cap, spend_reservation, spend_settlement,
   usage_ledger, attempt_event, runtime_load_minute, node_metrics_minute, audit_event,
-  media_asset IN ACCESS EXCLUSIVE MODE NOWAIT;
+  media_asset, capacity_scheduler, admission_request, capacity_waiter, capacity_lease,
+  capacity_kv_eviction, cache_affinity_record, cache_affinity_node, cache_affinity_scope,
+  cache_affinity_observer, cache_affinity_residency, cache_affinity_residency_cursor,
+  response_stickiness_record, relay_request IN ACCESS EXCLUSIVE MODE NOWAIT;
 
 -- Deploy writer (class D): every table is locked exclusively, so no fence can be contended. The
 -- graph-write fence triggers accept any write while this transaction-local marker is set; only
@@ -1208,6 +1211,697 @@ ALTER TABLE media_asset DROP CONSTRAINT IF EXISTS media_asset_shape;
 ALTER TABLE media_asset ADD CONSTRAINT media_asset_shape CHECK (
   "sizeBytes" >= 0 AND sha256 ~ '^[0-9a-f]{64}$' AND "expiresAt" > "createdAt"
 );
+
+-- ═══════════════════════════════ hot path (writer class H, S0d) ═══════════════════════════════
+-- No foreign keys to or from the graph (DL-1): these checks are the integrity boundary. They
+-- are plain SELECTs (no row lock) and tolerate a deleted parent: a row that names a pool,
+-- member, target or instance deleted concurrently is an orphan the sweepers terminalize.
+-- capacityId = runtime_instance.id; executionTargetId = execution_target.id.
+
+-- Hot-path rows store a priority class as its rank (scheduler order, limits redesign).
+CREATE OR REPLACE FUNCTION wsmp_priority_class_rank(priority_class "PriorityClass")
+RETURNS integer LANGUAGE sql IMMUTABLE AS $wsmp_priority_class_rank$
+  SELECT CASE priority_class WHEN 'BACKGROUND' THEN 0 WHEN 'NORMAL' THEN 1 WHEN 'HIGH' THEN 2 END
+$wsmp_priority_class_rank$;
+
+-- Scheduler v2: three classes, HIGH first (DRR quanta 1 / 4 / 16).
+ALTER TABLE capacity_scheduler DROP CONSTRAINT IF EXISTS capacity_scheduler_check;
+ALTER TABLE capacity_scheduler ADD CONSTRAINT capacity_scheduler_check CHECK (
+  "schedulerCursor" BETWEEN 0 AND 2
+  AND "schedulerVersion" = 2
+  AND "nextFencingToken" > 0
+  AND jsonb_typeof("schedulerDeficits") = 'array'
+  AND jsonb_array_length("schedulerDeficits") = 3
+);
+
+ALTER TABLE admission_request DROP CONSTRAINT IF EXISTS admission_request_shape_check;
+ALTER TABLE admission_request ADD CONSTRAINT admission_request_shape_check CHECK (
+  "basePriority" BETWEEN 0 AND 2
+  AND "enqueueSequence" >= 0
+  AND (("sourceKind" = 'TEST' AND "poolId" IS NULL AND "testTargetId" IS NOT NULL)
+    OR ("sourceKind" = 'POOL' AND "poolId" IS NOT NULL AND "testTargetId" IS NULL))
+  AND ("deadlineAt" IS NULL OR "deadlineAt" >= "enqueuedAt")
+  AND ((state IN ('CANCELLED', 'EXPIRED', 'TERMINAL') AND "terminalAt" IS NOT NULL)
+    OR (state IN ('WAITING', 'ADMITTED') AND "terminalAt" IS NULL))
+);
+ALTER TABLE admission_request DROP CONSTRAINT IF EXISTS admission_request_priority_share_check;
+ALTER TABLE admission_request ADD CONSTRAINT admission_request_priority_share_check CHECK (
+  "priorityShareId" IS NULL OR "poolId" IS NOT NULL
+);
+ALTER TABLE capacity_waiter DROP CONSTRAINT IF EXISTS capacity_waiter_shape_check;
+ALTER TABLE capacity_waiter ADD CONSTRAINT capacity_waiter_shape_check CHECK (
+  "candidateOrder" >= 0
+  AND "requestId" <> '' AND "attemptId" <> ''
+  AND "enqueueSequence" >= 0
+  AND "effectivePriority" BETWEEN 0 AND 2
+  AND ("effectiveConcurrencyLimit" IS NULL OR "effectiveConcurrencyLimit" > 0)
+  AND ("effectivePoolConcurrencyLimit" IS NULL OR "effectivePoolConcurrencyLimit" > 0)
+  AND "effectiveConcurrencyScope" IN ('TEST', 'POOL')
+  AND "effectiveConcurrencyScopeId" <> ''
+  AND "effectiveReservedSlots" >= 0
+  AND ("notBefore" IS NULL OR "deadlineAt" IS NULL OR "deadlineAt" >= "notBefore")
+  AND (("poolId" IS NULL) = ("poolMemberId" IS NULL))
+);
+ALTER TABLE capacity_lease DROP CONSTRAINT IF EXISTS capacity_lease_shape_check;
+ALTER TABLE capacity_lease ADD CONSTRAINT capacity_lease_shape_check CHECK (
+  priority BETWEEN 0 AND 2
+  AND "reservationClass" BETWEEN 0 AND 2
+  AND "fencingToken" > 0
+  AND "expiresAt" > "acquiredAt"
+  AND (("poolId" IS NULL) = ("poolMemberId" IS NULL))
+  AND ((state = 'ACTIVE' AND "releasedAt" IS NULL) OR (state <> 'ACTIVE' AND "releasedAt" IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS capacity_waiter_one_admitted_winner
+  ON capacity_waiter ("admissionRequestId") WHERE state = 'ADMITTED';
+CREATE UNIQUE INDEX IF NOT EXISTS capacity_waiter_unique_test_candidate
+  ON capacity_waiter ("admissionRequestId", "capacityId", "executionTargetId")
+  WHERE "poolMemberId" IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS capacity_lease_one_live_attempt
+  ON capacity_lease ("admissionRequestId") WHERE state = 'ACTIVE';
+
+-- Admission references: same owner (the pool owner is the principal), waiter/lease capacity =
+-- the target's instance, a pool candidate is a member of the request's pool serving the
+-- target's model, a TEST candidate is the request's own target. A contributed member's target
+-- belongs to its contributor. Waiter policy snapshots equal the pool's routing policy (limits
+-- redesign): the pool's class (or the share's class recorded on the request), the pool cap,
+-- kept slots and borrowing; a contributed member runs BACKGROUND, keeps nothing and may borrow.
+-- TEST candidates run NORMAL with no scope limit (D1: direct targets carry no policy).
+CREATE OR REPLACE FUNCTION enforce_capacity_reference_consistency()
+RETURNS trigger LANGUAGE plpgsql AS $capacity_reference_check$
+DECLARE
+  request_owner TEXT;
+  request_pool TEXT;
+  request_test_target TEXT;
+  request_base_priority INTEGER;
+  request_priority_share TEXT;
+  target_found BOOLEAN := false;
+  target_owner TEXT;
+  target_instance TEXT;
+  target_model TEXT;
+  member_found BOOLEAN := false;
+  member_pool TEXT;
+  member_model TEXT;
+  member_share TEXT;
+  parent_owner TEXT;
+BEGIN
+  IF TG_TABLE_NAME = 'admission_request' THEN
+    IF NEW."poolId" IS NOT NULL THEN
+      SELECT "userId" INTO parent_owner FROM pool WHERE id = NEW."poolId";
+      IF FOUND AND parent_owner IS DISTINCT FROM NEW."userId" THEN
+        RAISE EXCEPTION 'admission request pool must have the same owner' USING ERRCODE = '23514';
+      END IF;
+    END IF;
+    IF NEW."testTargetId" IS NOT NULL THEN
+      SELECT "userId" INTO parent_owner FROM execution_target WHERE id = NEW."testTargetId";
+      IF FOUND AND parent_owner IS DISTINCT FROM NEW."userId" THEN
+        RAISE EXCEPTION 'test admission target must have the same owner' USING ERRCODE = '23514';
+      END IF;
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  SELECT "userId", "poolId", "testTargetId", "basePriority", "priorityShareId"
+    INTO request_owner, request_pool, request_test_target, request_base_priority, request_priority_share
+    FROM admission_request WHERE id = NEW."admissionRequestId";
+  SELECT true, "userId", "instanceId", "runtimeModelId"
+    INTO target_found, target_owner, target_instance, target_model
+    FROM execution_target WHERE id = NEW."executionTargetId";
+  IF NEW."poolMemberId" IS NOT NULL THEN
+    SELECT true, "poolId", "runtimeModelId", "shareId" INTO member_found, member_pool, member_model, member_share
+      FROM pool_member WHERE id = NEW."poolMemberId";
+  END IF;
+  IF request_owner IS NULL OR request_owner <> NEW."userId" THEN
+    RAISE EXCEPTION 'capacity admission references must share their request owner' USING ERRCODE = '23514';
+  END IF;
+  IF target_found AND (target_instance IS DISTINCT FROM NEW."capacityId"
+       OR (target_owner <> NEW."userId" AND NOT (member_found AND member_share IS NOT NULL))) THEN
+    RAISE EXCEPTION 'capacity admission target must be the capacity''s model of the owner or a contributor'
+      USING ERRCODE = '23514';
+  END IF;
+  IF TG_TABLE_NAME IN ('capacity_waiter', 'capacity_lease') AND NOT EXISTS (
+    SELECT 1 FROM admission_request request
+     WHERE request.id = NEW."admissionRequestId"
+       AND request."requestId" = NEW."requestId" AND request."attemptId" = NEW."attemptId"
+  ) THEN
+    RAISE EXCEPTION 'capacity request and attempt identity must match the admission request'
+      USING ERRCODE = '23514';
+  END IF;
+  IF NEW."poolMemberId" IS NOT NULL THEN
+    IF request_pool IS DISTINCT FROM NEW."poolId"
+       OR (member_found AND (member_pool IS DISTINCT FROM NEW."poolId"
+         OR (target_found AND member_model IS DISTINCT FROM target_model))) THEN
+      RAISE EXCEPTION 'capacity admission pool candidate is inconsistent' USING ERRCODE = '23514';
+    END IF;
+  ELSIF request_pool IS NOT NULL THEN
+    RAISE EXCEPTION 'pool admission requires a pool member candidate' USING ERRCODE = '23514';
+  ELSIF request_test_target IS DISTINCT FROM NEW."executionTargetId" THEN
+    RAISE EXCEPTION 'test admission candidate must be its source target' USING ERRCODE = '23514';
+  END IF;
+
+  IF TG_TABLE_NAME = 'capacity_waiter' THEN
+    IF TG_OP = 'UPDATE' AND (NEW."effectivePriority", NEW."effectiveConcurrencyLimit",
+         NEW."effectiveConcurrencyScope", NEW."effectiveConcurrencyScopeId",
+         NEW."effectivePoolConcurrencyLimit", NEW."effectiveReservedSlots", NEW."effectiveBorrowReserved")
+       IS DISTINCT FROM (OLD."effectivePriority", OLD."effectiveConcurrencyLimit",
+         OLD."effectiveConcurrencyScope", OLD."effectiveConcurrencyScopeId",
+         OLD."effectivePoolConcurrencyLimit", OLD."effectiveReservedSlots", OLD."effectiveBorrowReserved") THEN
+      RAISE EXCEPTION 'capacity waiter policy snapshot is immutable' USING ERRCODE = '23514';
+    END IF;
+    IF NEW."poolMemberId" IS NOT NULL AND member_found AND NOT EXISTS (
+      SELECT 1 FROM pool_routing routing
+       WHERE routing."poolId" = NEW."poolId"
+         AND ((member_share IS NOT NULL
+               AND NEW."effectivePriority" = wsmp_priority_class_rank('BACKGROUND')
+               AND NEW."effectiveReservedSlots" = 0
+               AND NEW."effectiveBorrowReserved")
+           OR (member_share IS NULL
+               AND (NEW."effectivePriority" = wsmp_priority_class_rank(routing."priorityClass")
+                 OR (request_priority_share IS NOT NULL AND NEW."effectivePriority" = request_base_priority))
+               AND NEW."effectiveReservedSlots" = routing."keptSlots"
+               AND NEW."effectiveBorrowReserved" = routing."borrowKept"))
+         AND NEW."effectiveConcurrencyLimit" IS NOT DISTINCT FROM routing."concurrencyLimit"
+         AND NEW."effectiveConcurrencyScope" = 'POOL'
+         AND NEW."effectiveConcurrencyScopeId" = NEW."poolId"
+         AND NEW."effectivePoolConcurrencyLimit" IS NULL
+    ) THEN
+      RAISE EXCEPTION 'capacity waiter policy snapshot must match its pool policy' USING ERRCODE = '23514';
+    ELSIF NEW."poolMemberId" IS NULL AND NOT (
+      NEW."effectivePriority" = wsmp_priority_class_rank('NORMAL')
+      AND NEW."effectiveConcurrencyLimit" IS NULL
+      AND NEW."effectiveConcurrencyScope" = 'TEST'
+      AND NEW."effectiveConcurrencyScopeId" = NEW."executionTargetId"
+      AND NEW."effectivePoolConcurrencyLimit" IS NULL
+      AND NEW."effectiveReservedSlots" = 0
+      AND NEW."effectiveBorrowReserved"
+    ) THEN
+      RAISE EXCEPTION 'capacity waiter policy snapshot must match the test policy' USING ERRCODE = '23514';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$capacity_reference_check$;
+DROP TRIGGER IF EXISTS admission_request_reference_consistency ON admission_request;
+CREATE TRIGGER admission_request_reference_consistency
+BEFORE INSERT OR UPDATE OF "userId", "sourceKind", "poolId", "testTargetId" ON admission_request
+FOR EACH ROW EXECUTE FUNCTION enforce_capacity_reference_consistency();
+DROP TRIGGER IF EXISTS capacity_waiter_reference_consistency ON capacity_waiter;
+CREATE TRIGGER capacity_waiter_reference_consistency
+BEFORE INSERT OR UPDATE OF "userId", "admissionRequestId", "requestId", "attemptId", "capacityId",
+  "executionTargetId", "poolId", "poolMemberId", "effectivePriority", "effectiveConcurrencyLimit",
+  "effectiveConcurrencyScope", "effectiveConcurrencyScopeId", "effectivePoolConcurrencyLimit",
+  "effectiveReservedSlots", "effectiveBorrowReserved" ON capacity_waiter
+FOR EACH ROW EXECUTE FUNCTION enforce_capacity_reference_consistency();
+DROP TRIGGER IF EXISTS capacity_lease_reference_consistency ON capacity_lease;
+CREATE TRIGGER capacity_lease_reference_consistency
+BEFORE INSERT OR UPDATE OF "userId", "admissionRequestId", "requestId", "attemptId", "capacityId",
+  "executionTargetId", "poolId", "poolMemberId" ON capacity_lease
+FOR EACH ROW EXECUTE FUNCTION enforce_capacity_reference_consistency();
+
+-- A lease/admission is durable evidence of the exact request it authorized.
+CREATE OR REPLACE FUNCTION enforce_capacity_history_identity()
+RETURNS trigger LANGUAGE plpgsql AS $capacity_history_identity$
+BEGIN
+  IF TG_TABLE_NAME = 'admission_request' THEN
+    IF (NEW.id, NEW."userId", NEW."requestId", NEW."attemptId", NEW."sourceKind", NEW."poolId", NEW."testTargetId")
+       IS DISTINCT FROM
+       (OLD.id, OLD."userId", OLD."requestId", OLD."attemptId", OLD."sourceKind", OLD."poolId", OLD."testTargetId")
+       OR (NEW."relayRequestId" IS DISTINCT FROM OLD."relayRequestId" AND NOT (
+         NEW."relayRequestId" IS NULL AND OLD."relayRequestId" IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM relay_request WHERE id = OLD."relayRequestId"))) THEN
+      RAISE EXCEPTION 'admission historical request identity is immutable' USING ERRCODE = '23514';
+    END IF;
+  ELSIF (NEW.id, NEW."userId", NEW."admissionRequestId", NEW."requestId", NEW."attemptId", NEW."capacityId",
+         NEW."executionTargetId", NEW."poolId", NEW."poolMemberId", NEW."fencingToken")
+        IS DISTINCT FROM
+        (OLD.id, OLD."userId", OLD."admissionRequestId", OLD."requestId", OLD."attemptId", OLD."capacityId",
+         OLD."executionTargetId", OLD."poolId", OLD."poolMemberId", OLD."fencingToken") THEN
+    RAISE EXCEPTION 'capacity lease historical identity is immutable' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$capacity_history_identity$;
+DROP TRIGGER IF EXISTS admission_history_identity ON admission_request;
+CREATE TRIGGER admission_history_identity BEFORE UPDATE ON admission_request
+FOR EACH ROW EXECUTE FUNCTION enforce_capacity_history_identity();
+DROP TRIGGER IF EXISTS capacity_lease_history_identity ON capacity_lease;
+CREATE TRIGGER capacity_lease_history_identity BEFORE UPDATE ON capacity_lease
+FOR EACH ROW EXECUTE FUNCTION enforce_capacity_history_identity();
+
+-- Disposable KV-eviction feedback.
+CREATE OR REPLACE FUNCTION capacity_kv_eviction_session_ids_ok(ids text[])
+RETURNS boolean LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $kv_eviction_ids$
+  SELECT array_position(ids, NULL) IS NULL
+     AND NOT EXISTS (SELECT 1 FROM unnest(ids) AS session_id WHERE length(session_id) NOT BETWEEN 1 AND 128);
+$kv_eviction_ids$;
+ALTER TABLE capacity_kv_eviction DROP CONSTRAINT IF EXISTS capacity_kv_eviction_shape_check;
+ALTER TABLE capacity_kv_eviction ADD CONSTRAINT capacity_kv_eviction_shape_check CHECK (
+  "cutFraction" >= 0 AND "cutFraction" <= 1
+  AND length("capacityId") BETWEEN 1 AND 128
+  AND cardinality("sessionIds") <= 16
+  AND capacity_kv_eviction_session_ids_ok("sessionIds")
+  AND "missCount" >= 0 AND "continuationCount" >= 0 AND "missCount" <= "continuationCount"
+  AND "expiresAt" >= "observedAt"
+);
+
+-- ── Cache affinity (unchanged in shape; generations come from the instance) ──
+
+CREATE UNIQUE INDEX IF NOT EXISTS cache_affinity_conversation_unique
+  ON cache_affinity_record
+    ("tenantUserId", "poolId", "executionTargetId", "targetIdentity", "bindingDigest", "conversationDigest")
+  WHERE "conversationDigest" IS NOT NULL AND "prefixDigest" IS NULL;
+CREATE INDEX IF NOT EXISTS cache_affinity_record_residency
+  ON cache_affinity_record ("userId", "executionTargetId", "expiresAt" DESC, id DESC)
+  WHERE "prefixDigest" IS NULL;
+ALTER TABLE cache_affinity_record DROP CONSTRAINT IF EXISTS cache_affinity_record_shape_check;
+ALTER TABLE cache_affinity_record ADD CONSTRAINT cache_affinity_record_shape_check CHECK (
+  "digestVersion" >= 5
+  AND "prefixDepth" >= 0
+  AND ("estimatedTokens" IS NULL OR "estimatedTokens" >= 0)
+  AND ("reportedTokens" IS NULL OR "reportedTokens" >= 0)
+  AND "expiresAt" > "createdAt"
+  AND length("bindingDigest") BETWEEN 32 AND 128
+  AND (("prefixDigest" IS NOT NULL AND "prefixDepth" > 0 AND "conversationDigest" IS NULL
+        AND length("prefixDigest") BETWEEN 32 AND 128)
+    OR ("prefixDigest" IS NULL AND "prefixDepth" = 0 AND "conversationDigest" IS NOT NULL
+        AND length("conversationDigest") BETWEEN 32 AND 128))
+  AND length("sessionId") BETWEEN 1 AND 128
+  AND length(id) BETWEEN 1 AND 128
+  AND ("sharedWithSessionId" IS NULL OR length("sharedWithSessionId") BETWEEN 1 AND 128)
+  AND length("targetIdentity") BETWEEN 1 AND 2048
+  AND ("sharedPrefixTokens" IS NULL OR "sharedPrefixTokens" >= 0)
+);
+ALTER TABLE cache_affinity_record DROP CONSTRAINT IF EXISTS cache_affinity_record_generation_shape;
+ALTER TABLE cache_affinity_record ADD CONSTRAINT cache_affinity_record_generation_shape CHECK (length("cacheGeneration") <= 128);
+ALTER TABLE cache_affinity_node DROP CONSTRAINT IF EXISTS cache_affinity_node_generation_shape;
+ALTER TABLE cache_affinity_node ADD CONSTRAINT cache_affinity_node_generation_shape CHECK (length("cacheGeneration") <= 128);
+ALTER TABLE cache_affinity_node DROP CONSTRAINT IF EXISTS cache_affinity_node_shape_check;
+ALTER TABLE cache_affinity_node ADD CONSTRAINT cache_affinity_node_shape_check CHECK (
+  depth > 0 AND length("rootDigest") BETWEEN 32 AND 128 AND length("nodeDigest") BETWEEN 32 AND 128
+  AND length("sessionId") BETWEEN 1 AND 128
+  AND ("estimatedTokens" IS NULL OR "estimatedTokens" >= 0)
+  AND ("reportedTokens" IS NULL OR "reportedTokens" >= 0)
+);
+ALTER TABLE cache_affinity_scope DROP CONSTRAINT IF EXISTS cache_affinity_scope_shape;
+ALTER TABLE cache_affinity_scope ADD CONSTRAINT cache_affinity_scope_shape CHECK (
+  length("poolId") BETWEEN 1 AND 128 AND length("userId") BETWEEN 1 AND 128 AND length(generation) = 36
+);
+ALTER TABLE cache_affinity_observer DROP CONSTRAINT IF EXISTS cache_affinity_observer_shape;
+ALTER TABLE cache_affinity_observer ADD CONSTRAINT cache_affinity_observer_shape CHECK (
+  length("capacityId") BETWEEN 1 AND 128 AND length("userId") BETWEEN 1 AND 128
+  AND length("nodeId") BETWEEN 1 AND 128 AND length("instanceHandle") BETWEEN 1 AND 63
+  AND length("managerId") = 36 AND length(version) = 36 AND "connectionGeneration" > 0
+);
+ALTER TABLE cache_affinity_residency_cursor DROP CONSTRAINT IF EXISTS cache_affinity_residency_cursor_singleton;
+ALTER TABLE cache_affinity_residency_cursor ADD CONSTRAINT cache_affinity_residency_cursor_singleton CHECK (id = 1);
+ALTER TABLE cache_affinity_residency DROP CONSTRAINT IF EXISTS cache_affinity_residency_bound;
+ALTER TABLE cache_affinity_residency ADD CONSTRAINT cache_affinity_residency_bound CHECK (
+  length("cacheGeneration") <= 128
+  AND jsonb_typeof(entries) = 'array' AND jsonb_array_length(entries) <= 2000
+  AND octet_length(entries::text) <= 4194304
+  AND NOT jsonb_path_exists(entries, '$[*] ? (!exists(@.poolId))')
+  AND jsonb_typeof("repairEntries") = 'array' AND jsonb_array_length("repairEntries") <= 2000
+  AND octet_length("repairEntries"::text) <= 4194304
+  AND revision >= 0
+);
+CREATE INDEX IF NOT EXISTS cache_affinity_record_residency_repair
+  ON cache_affinity_record ("userId", "executionTargetId", id) WHERE "prefixDigest" IS NULL;
+CREATE INDEX IF NOT EXISTS cache_affinity_record_target_generation_repair
+  ON cache_affinity_record ("executionTargetId", "cacheGeneration", id) WHERE "prefixDigest" IS NULL;
+CREATE INDEX IF NOT EXISTS cache_affinity_record_physical_generation_repair
+  ON cache_affinity_record ("executionTargetId", split_part("cacheGeneration", ':pool:', 1), id)
+  WHERE "prefixDigest" IS NULL;
+CREATE INDEX IF NOT EXISTS cache_affinity_record_scope_reclaim
+  ON cache_affinity_record ("userId", "poolId", split_part("cacheGeneration", ':pool:', 2), id);
+CREATE INDEX IF NOT EXISTS cache_affinity_node_scope_reclaim
+  ON cache_affinity_node ("userId", "poolId", split_part("cacheGeneration", ':pool:', 2), id);
+
+-- The physical cache generation of a target: its instance's KV incarnation plus the head
+-- node's connection generation (a reconnect is a conservative cache boundary). The head node
+-- is the always-on runtime's node, or rank 0's node.
+CREATE OR REPLACE FUNCTION wsmp_affinity_head_node(instance_id text)
+RETURNS text LANGUAGE sql STABLE AS $affinity_head_node$
+  SELECT COALESCE(r."nodeId", (SELECT "nodeId" FROM instance_rank WHERE "instanceId" = i.id AND rank = 0))
+    FROM runtime_instance i JOIN runtime r ON r.id = i."runtimeId"
+   WHERE i.id = instance_id
+$affinity_head_node$;
+CREATE OR REPLACE FUNCTION wsmp_affinity_generation(target_id text)
+RETURNS text LANGUAGE sql STABLE AS $affinity_generation$
+  SELECT COALESCE(i."cacheGeneration", '') ||
+    CASE WHEN COALESCE(n."connectionGeneration", 0) = 0 THEN ''
+      ELSE ':connection:' || n."connectionGeneration"::text END
+    FROM execution_target t
+    LEFT JOIN runtime_instance i ON i.id = t."instanceId"
+    LEFT JOIN node n ON n.id = wsmp_affinity_head_node(i.id)
+   WHERE t.id = target_id
+$affinity_generation$;
+-- Confidence is shared across processes: no live observer may be pending or expired, and the
+-- connected head node must have an observer for its current connection.
+CREATE OR REPLACE FUNCTION wsmp_affinity_generation_ready(target_id text)
+RETURNS boolean LANGUAGE sql STABLE AS $affinity_ready$
+  SELECT NOT EXISTS (
+    SELECT 1 FROM cache_affinity_observer o
+     WHERE o."capacityId" = t."instanceId" AND NOT o.retired
+       AND (o.pending OR o."validUntil" <= statement_timestamp())
+  ) AND NOT EXISTS (
+    SELECT 1 FROM runtime_instance i JOIN node n ON n.id = wsmp_affinity_head_node(i.id)
+     WHERE i.id = t."instanceId" AND n."connectionGeneration" > 0
+       AND NOT EXISTS (
+         SELECT 1 FROM cache_affinity_observer o
+          WHERE o."capacityId" = i.id AND o."nodeId" = n.id AND o."instanceHandle" = i.handle
+            AND o."connectionGeneration" = n."connectionGeneration")
+  ) FROM execution_target t WHERE t.id = target_id
+$affinity_ready$;
+CREATE OR REPLACE FUNCTION wsmp_affinity_scope_generation(target_id text, pool_id text)
+RETURNS text LANGUAGE sql STABLE AS $affinity_scope_generation$
+  SELECT wsmp_affinity_generation(target_id) || COALESCE(
+    (SELECT ':pool:' || generation FROM cache_affinity_scope WHERE "poolId" = pool_id), '')
+$affinity_scope_generation$;
+
+CREATE OR REPLACE FUNCTION enforce_cache_affinity_identity_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $cache_affinity_identity_immutable$
+BEGIN
+  IF (NEW."userId", NEW."tenantUserId", NEW."poolId", NEW."executionTargetId", NEW."cacheGeneration",
+      NEW."targetIdentity", NEW."digestVersion", NEW."bindingDigest", NEW."prefixDigest",
+      NEW."conversationDigest", NEW."prefixDepth")
+     IS DISTINCT FROM
+     (OLD."userId", OLD."tenantUserId", OLD."poolId", OLD."executionTargetId", OLD."cacheGeneration",
+      OLD."targetIdentity", OLD."digestVersion", OLD."bindingDigest", OLD."prefixDigest",
+      OLD."conversationDigest", OLD."prefixDepth") THEN
+    RAISE EXCEPTION 'cache affinity identity and HMAC digests are immutable' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$cache_affinity_identity_immutable$;
+DROP TRIGGER IF EXISTS cache_affinity_identity_immutable ON cache_affinity_record;
+CREATE TRIGGER cache_affinity_identity_immutable BEFORE UPDATE ON cache_affinity_record
+FOR EACH ROW EXECUTE FUNCTION enforce_cache_affinity_identity_immutable();
+
+-- The pool principal owns affinity rows; a target of another owner needs a contributed member
+-- (a can-contribute share) of that pool for the target's served model.
+CREATE OR REPLACE FUNCTION enforce_cache_affinity_owner()
+RETURNS trigger LANGUAGE plpgsql AS $cache_affinity_owner$
+DECLARE
+  parent_owner TEXT;
+  target_model TEXT;
+BEGIN
+  SELECT "userId" INTO parent_owner FROM pool WHERE id = NEW."poolId";
+  IF FOUND AND parent_owner IS DISTINCT FROM NEW."userId" THEN
+    RAISE EXCEPTION 'cache affinity pool must belong to its owner' USING ERRCODE = '23514';
+  END IF;
+  SELECT "userId", "runtimeModelId" INTO parent_owner, target_model
+    FROM execution_target WHERE id = NEW."executionTargetId";
+  IF FOUND AND parent_owner IS DISTINCT FROM NEW."userId" AND NOT EXISTS (
+    SELECT 1 FROM pool_member m JOIN share s ON s.id = m."shareId"
+     WHERE m."poolId" = NEW."poolId" AND m."runtimeModelId" = target_model
+       AND s."canContribute" AND s."granteeUserId" = parent_owner AND s."ownerUserId" = NEW."userId"
+  ) THEN
+    RAISE EXCEPTION 'cache affinity target requires its owner or a contributed member' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$cache_affinity_owner$;
+DROP TRIGGER IF EXISTS cache_affinity_owner ON cache_affinity_record;
+CREATE TRIGGER cache_affinity_owner BEFORE INSERT ON cache_affinity_record
+FOR EACH ROW EXECUTE FUNCTION enforce_cache_affinity_owner();
+DROP TRIGGER IF EXISTS cache_affinity_node_owner ON cache_affinity_node;
+CREATE TRIGGER cache_affinity_node_owner BEFORE INSERT ON cache_affinity_node
+FOR EACH ROW EXECUTE FUNCTION enforce_cache_affinity_owner();
+
+CREATE OR REPLACE FUNCTION enforce_cache_affinity_node_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $cache_affinity_node_immutable$
+BEGIN
+  IF (NEW."userId", NEW."tenantUserId", NEW."poolId", NEW."executionTargetId", NEW."cacheGeneration",
+      NEW."rootDigest", NEW."nodeDigest", NEW.depth, NEW."sessionId") IS DISTINCT FROM
+    (OLD."userId", OLD."tenantUserId", OLD."poolId", OLD."executionTargetId", OLD."cacheGeneration",
+      OLD."rootDigest", OLD."nodeDigest", OLD.depth, OLD."sessionId") THEN
+    RAISE EXCEPTION 'cache affinity node identity is immutable' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$cache_affinity_node_immutable$;
+DROP TRIGGER IF EXISTS cache_affinity_node_immutable ON cache_affinity_node;
+CREATE TRIGGER cache_affinity_node_immutable BEFORE UPDATE ON cache_affinity_node
+FOR EACH ROW EXECUTE FUNCTION enforce_cache_affinity_node_immutable();
+
+-- Each distinct generation of a source statement is checked once against the live graph.
+CREATE OR REPLACE FUNCTION enforce_cache_affinity_generation_statement()
+RETURNS trigger LANGUAGE plpgsql AS $affinity_generation_statement$
+DECLARE source_generation RECORD;
+BEGIN
+  FOR source_generation IN
+    SELECT DISTINCT "executionTargetId", "poolId", "cacheGeneration", "userId", "tenantUserId" FROM generation_rows
+  LOOP
+    IF EXISTS (SELECT 1 FROM "user" u WHERE u.id IN (source_generation."userId", source_generation."tenantUserId")
+         AND u."deletionGeneration" IS NOT NULL)
+       OR wsmp_affinity_generation_ready(source_generation."executionTargetId") = false
+       OR source_generation."cacheGeneration" IS DISTINCT FROM
+         COALESCE(wsmp_affinity_scope_generation(source_generation."executionTargetId", source_generation."poolId"), '') THEN
+      RAISE EXCEPTION 'cache affinity generation has reset' USING ERRCODE = '23514';
+    END IF;
+  END LOOP;
+  RETURN NULL;
+END
+$affinity_generation_statement$;
+DROP TRIGGER IF EXISTS cache_affinity_generation_insert ON cache_affinity_record;
+CREATE TRIGGER cache_affinity_generation_insert AFTER INSERT ON cache_affinity_record
+REFERENCING NEW TABLE AS generation_rows FOR EACH STATEMENT
+EXECUTE FUNCTION enforce_cache_affinity_generation_statement();
+DROP TRIGGER IF EXISTS cache_affinity_generation_update ON cache_affinity_record;
+CREATE TRIGGER cache_affinity_generation_update AFTER UPDATE ON cache_affinity_record
+REFERENCING NEW TABLE AS generation_rows FOR EACH STATEMENT
+EXECUTE FUNCTION enforce_cache_affinity_generation_statement();
+DROP TRIGGER IF EXISTS cache_affinity_generation_insert ON cache_affinity_node;
+CREATE TRIGGER cache_affinity_generation_insert AFTER INSERT ON cache_affinity_node
+REFERENCING NEW TABLE AS generation_rows FOR EACH STATEMENT
+EXECUTE FUNCTION enforce_cache_affinity_generation_statement();
+DROP TRIGGER IF EXISTS cache_affinity_generation_update ON cache_affinity_node;
+CREATE TRIGGER cache_affinity_generation_update AFTER UPDATE ON cache_affinity_node
+REFERENCING NEW TABLE AS generation_rows FOR EACH STATEMENT
+EXECUTE FUNCTION enforce_cache_affinity_generation_statement();
+
+-- Residency: an optional, bounded projection of new-conversation footprints per target.
+CREATE OR REPLACE FUNCTION wsmp_affinity_residency_merge(previous jsonb, added jsonb, removed text[])
+RETURNS jsonb LANGUAGE sql IMMUTABLE AS $residency_merge$
+  SELECT COALESCE(jsonb_agg(e ORDER BY (e->>'expiresAt')::timestamp DESC, e->>'id' DESC), '[]'::jsonb)
+  FROM (
+    SELECT e FROM (
+      SELECT e FROM jsonb_array_elements(previous) e WHERE NOT (e->>'id' = ANY(removed))
+      UNION ALL
+      SELECT e FROM jsonb_array_elements(added) e
+    ) candidates
+    ORDER BY (e->>'expiresAt')::timestamp DESC, e->>'id' DESC LIMIT 2000
+  ) bounded
+$residency_merge$;
+CREATE OR REPLACE FUNCTION wsmp_affinity_residency_change(
+  owner_id text, target_id text, removed text[], added jsonb, invalidated text[]
+) RETURNS void LANGUAGE plpgsql AS $residency_change$
+DECLARE bucket cache_affinity_residency%ROWTYPE; physical_owner text; generation text;
+BEGIN
+  SELECT "userId" INTO physical_owner FROM execution_target WHERE id = target_id;
+  IF physical_owner IS NULL THEN
+    SELECT "userId" INTO physical_owner FROM cache_affinity_residency WHERE "executionTargetId" = target_id;
+  END IF;
+  physical_owner := COALESCE(physical_owner, owner_id);
+  IF NOT pg_try_advisory_xact_lock(hashtextextended('wsmp:residency:' || target_id, 0)) THEN
+    RAISE EXCEPTION 'cache residency target is busy' USING ERRCODE = '55P03';
+  END IF;
+  INSERT INTO cache_affinity_residency ("executionTargetId", "userId")
+    VALUES (target_id, physical_owner) ON CONFLICT ("executionTargetId") DO NOTHING;
+  SELECT * INTO STRICT bucket FROM cache_affinity_residency
+    WHERE "executionTargetId" = target_id FOR UPDATE NOWAIT;
+  IF bucket."userId" IS DISTINCT FROM physical_owner THEN
+    RAISE EXCEPTION 'cache residency target owner mismatch' USING ERRCODE = '23514';
+  END IF;
+  generation := COALESCE(wsmp_affinity_generation(target_id), bucket."cacheGeneration");
+  IF bucket."cacheGeneration" IS DISTINCT FROM generation THEN
+    bucket."cacheGeneration" := generation;
+    bucket.entries := '[]'::jsonb;
+    bucket.complete := true;
+  END IF;
+  IF EXISTS (SELECT 1 FROM jsonb_array_elements(added) e
+    WHERE split_part(COALESCE(e->>'cacheGeneration', ''), ':pool:', 1) IS DISTINCT FROM bucket."cacheGeneration") THEN
+    RAISE EXCEPTION 'cache affinity generation has reset' USING ERRCODE = '23514';
+  END IF;
+  UPDATE cache_affinity_residency SET
+    "cacheGeneration" = bucket."cacheGeneration",
+    entries = wsmp_affinity_residency_merge(bucket.entries, added, removed),
+    complete = bucket.complete AND NOT (
+      jsonb_array_length(bucket.entries) = 2000 AND EXISTS (
+        SELECT 1 FROM jsonb_array_elements(bucket.entries) e WHERE e->>'id' = ANY(invalidated))),
+    revision = bucket.revision + 1,
+    "repairEntries" = '[]'::jsonb, "repairCursor" = NULL,
+    "repairAfter" = clock_timestamp()
+  WHERE "executionTargetId" = target_id;
+END
+$residency_change$;
+CREATE OR REPLACE FUNCTION wsmp_affinity_residency_insert()
+RETURNS trigger LANGUAGE plpgsql AS $residency_insert$
+DECLARE scope record; added jsonb;
+BEGIN
+  FOR scope IN SELECT min("userId") AS "userId", "executionTargetId" FROM new_records
+    WHERE "prefixDigest" IS NULL GROUP BY "executionTargetId" ORDER BY "executionTargetId"
+  LOOP
+    SELECT COALESCE(jsonb_agg(to_jsonb(r)), '[]'::jsonb) INTO added FROM (
+      SELECT id, "expiresAt", "sessionId", "estimatedTokens" AS tokens, "cacheGeneration", "poolId",
+        "sharedWithSessionId", "sharedPrefixTokens"
+      FROM new_records WHERE "prefixDigest" IS NULL AND "executionTargetId" = scope."executionTargetId"
+      ORDER BY "expiresAt" DESC, id DESC LIMIT 2000
+    ) r;
+    PERFORM wsmp_affinity_residency_change(scope."userId", scope."executionTargetId", ARRAY[]::text[], added, ARRAY[]::text[]);
+  END LOOP;
+  RETURN NULL;
+END
+$residency_insert$;
+CREATE OR REPLACE FUNCTION wsmp_affinity_residency_update()
+RETURNS trigger LANGUAGE plpgsql AS $residency_update$
+DECLARE scope record; added jsonb; removed text[]; invalidated text[];
+BEGIN
+  FOR scope IN SELECT min("userId") AS "userId", "executionTargetId" FROM new_records
+    WHERE "prefixDigest" IS NULL GROUP BY "executionTargetId" ORDER BY "executionTargetId"
+  LOOP
+    SELECT array_agg(n.id), COALESCE(array_agg(n.id) FILTER (WHERE n."expiresAt" < o."expiresAt"), ARRAY[]::text[])
+      INTO removed, invalidated FROM new_records n JOIN old_records o USING (id)
+      WHERE n."prefixDigest" IS NULL AND n."executionTargetId" = scope."executionTargetId";
+    SELECT COALESCE(jsonb_agg(to_jsonb(r)), '[]'::jsonb) INTO added FROM (
+      SELECT id, "expiresAt", "sessionId", "estimatedTokens" AS tokens, "cacheGeneration", "poolId",
+        "sharedWithSessionId", "sharedPrefixTokens"
+      FROM new_records WHERE "prefixDigest" IS NULL AND "executionTargetId" = scope."executionTargetId"
+      ORDER BY "expiresAt" DESC, id DESC LIMIT 2000
+    ) r;
+    PERFORM wsmp_affinity_residency_change(scope."userId", scope."executionTargetId", removed, added, invalidated);
+  END LOOP;
+  RETURN NULL;
+END
+$residency_update$;
+CREATE OR REPLACE FUNCTION wsmp_affinity_residency_delete()
+RETURNS trigger LANGUAGE plpgsql AS $residency_delete$
+DECLARE scope record;
+BEGIN
+  FOR scope IN SELECT "executionTargetId" FROM old_records
+    WHERE "prefixDigest" IS NULL GROUP BY "executionTargetId" ORDER BY "executionTargetId"
+  LOOP
+    IF NOT pg_try_advisory_xact_lock(hashtextextended('wsmp:residency:' || scope."executionTargetId", 0)) THEN
+      RAISE EXCEPTION 'cache residency target is busy' USING ERRCODE = '55P03';
+    END IF;
+    PERFORM 1 FROM cache_affinity_residency WHERE "executionTargetId" = scope."executionTargetId" FOR UPDATE NOWAIT;
+  END LOOP;
+  UPDATE cache_affinity_residency SET entries = '[]'::jsonb, complete = false,
+    "repairEntries" = '[]'::jsonb, "repairCursor" = NULL,
+    revision = revision + 1, "repairAfter" = clock_timestamp()
+  WHERE "executionTargetId" IN (SELECT "executionTargetId" FROM old_records WHERE "prefixDigest" IS NULL);
+  RETURN NULL;
+END
+$residency_delete$;
+DROP TRIGGER IF EXISTS cache_affinity_residency_insert ON cache_affinity_record;
+CREATE TRIGGER cache_affinity_residency_insert AFTER INSERT ON cache_affinity_record
+  REFERENCING NEW TABLE AS new_records FOR EACH STATEMENT EXECUTE FUNCTION wsmp_affinity_residency_insert();
+DROP TRIGGER IF EXISTS cache_affinity_residency_update ON cache_affinity_record;
+CREATE TRIGGER cache_affinity_residency_update AFTER UPDATE ON cache_affinity_record
+  REFERENCING OLD TABLE AS old_records NEW TABLE AS new_records FOR EACH STATEMENT EXECUTE FUNCTION wsmp_affinity_residency_update();
+DROP TRIGGER IF EXISTS cache_affinity_residency_delete ON cache_affinity_record;
+CREATE TRIGGER cache_affinity_residency_delete AFTER DELETE ON cache_affinity_record
+  REFERENCING OLD TABLE AS old_records FOR EACH STATEMENT EXECUTE FUNCTION wsmp_affinity_residency_delete();
+
+-- ── Responses stickiness ──
+
+-- A cloud or own-key binding is a complete, immutable provider snapshot; a local one has none.
+ALTER TABLE response_stickiness_record DROP CONSTRAINT IF EXISTS response_stickiness_provider_binding_check;
+ALTER TABLE response_stickiness_record ADD CONSTRAINT response_stickiness_provider_binding_check CHECK (
+  (route IS NULL OR route IN ('local', 'cloud', 'own_key'))
+  AND ((route IS DISTINCT FROM 'cloud' AND route IS DISTINCT FROM 'own_key'
+        AND "providerAccountId" IS NULL AND "providerModelId" IS NULL
+        AND "providerEndpointIdentity" IS NULL AND "providerEndpointVersion" IS NULL
+        AND "providerUpstreamModelId" IS NULL AND "upstreamResponseIdDigest" IS NULL)
+    OR (route IN ('cloud', 'own_key')
+        AND "providerAccountId" IS NOT NULL AND "providerModelId" IS NOT NULL
+        AND "selectedTargetId" IS NOT NULL AND "poolId" IS NOT NULL
+        AND length("providerEndpointIdentity") > 0 AND "providerEndpointVersion" > 0
+        AND length("providerUpstreamModelId") > 0
+        AND "nativeSurface" = 'OPENAI_RESPONSES'
+        AND length("upstreamResponseIdDigest") BETWEEN 32 AND 128))
+  AND (route IS DISTINCT FROM 'own_key' OR "shareId" IS NOT NULL)
+);
+CREATE OR REPLACE FUNCTION enforce_response_stickiness_provider_binding_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $response_stickiness_binding_immutable$
+BEGIN
+  IF (OLD.route IN ('cloud', 'own_key') OR NEW.route IN ('cloud', 'own_key'))
+     AND (NEW."userId", NEW."apiKeyId", NEW."routingKeyDigest", NEW."poolId", NEW."selectedTargetId",
+          NEW."providerAccountId", NEW."providerModelId", NEW."providerEndpointIdentity",
+          NEW."providerEndpointVersion", NEW."providerUpstreamModelId", NEW."shareId",
+          NEW."nativeSurface", NEW."upstreamResponseIdDigest", NEW.route)
+       IS DISTINCT FROM
+         (OLD."userId", OLD."apiKeyId", OLD."routingKeyDigest", OLD."poolId", OLD."selectedTargetId",
+          OLD."providerAccountId", OLD."providerModelId", OLD."providerEndpointIdentity",
+          OLD."providerEndpointVersion", OLD."providerUpstreamModelId", OLD."shareId",
+          OLD."nativeSurface", OLD."upstreamResponseIdDigest", OLD.route) THEN
+    RAISE EXCEPTION 'provider Responses binding is immutable' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$response_stickiness_binding_immutable$;
+DROP TRIGGER IF EXISTS response_stickiness_provider_binding_immutable ON response_stickiness_record;
+CREATE TRIGGER response_stickiness_provider_binding_immutable BEFORE UPDATE ON response_stickiness_record
+FOR EACH ROW EXECUTE FUNCTION enforce_response_stickiness_provider_binding_immutable();
+
+-- ── Request telemetry (trimmed columns; the attempt rules land with B4) ──
+
+ALTER TABLE relay_request DROP CONSTRAINT IF EXISTS relay_request_execution_telemetry_check;
+ALTER TABLE relay_request ADD CONSTRAINT relay_request_execution_telemetry_check CHECK (
+  ("queueWaitMs" IS NULL OR "queueWaitMs" >= 0)
+  AND ("durationMs" IS NULL OR "durationMs" >= 0)
+  AND ("affinityWaitMs" IS NULL OR "affinityWaitMs" >= 0)
+  AND ("sidecarLatencyMs" IS NULL OR "sidecarLatencyMs" >= 0)
+  AND "attemptCount" >= 0
+  AND (route IS NULL OR route IN ('local', 'cloud', 'own_key'))
+  AND (rejection IS NULL OR rejection ~ '^[a-z0-9_]{1,64}$')
+  AND (NOT external OR "poolId" IS NOT NULL)
+  AND ((source = 'SIDECAR') = ("parentRequestId" IS NOT NULL))
+  AND (source <> 'API_KEY' OR ("poolId" IS NOT NULL AND "runtimeModelId" IS NULL))
+  AND (status <> 'PENDING' OR "completedAt" IS NULL)
+);
+-- Usage attribution, derived and pinned: the requested pool's owner, else the served model's
+-- owner (direct tests), else the requester. Never trusted from the writer.
+CREATE OR REPLACE FUNCTION derive_relay_request_resource_owner()
+RETURNS trigger LANGUAGE plpgsql AS $relay_resource_owner$
+DECLARE
+  owner_id TEXT;
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    NEW."resourceOwnerUserId" := OLD."resourceOwnerUserId";
+    RETURN NEW;
+  END IF;
+  IF NEW."poolId" IS NOT NULL THEN
+    SELECT "userId" INTO owner_id FROM pool WHERE id = NEW."poolId";
+  ELSIF NEW."runtimeModelId" IS NOT NULL THEN
+    SELECT "userId" INTO owner_id FROM runtime_model WHERE id = NEW."runtimeModelId";
+  END IF;
+  NEW."resourceOwnerUserId" := COALESCE(owner_id, NEW."userId");
+  RETURN NEW;
+END;
+$relay_resource_owner$;
+DROP TRIGGER IF EXISTS a_relay_request_resource_owner ON relay_request;
+CREATE TRIGGER a_relay_request_resource_owner
+BEFORE INSERT OR UPDATE OF "poolId", "runtimeModelId", "resourceOwnerUserId" ON relay_request
+FOR EACH ROW EXECUTE FUNCTION derive_relay_request_resource_owner();
+-- The selected target, instance, version and node agree while the target exists.
+CREATE OR REPLACE FUNCTION enforce_relay_request_execution_target()
+RETURNS trigger LANGUAGE plpgsql AS $relay_request_target$
+DECLARE
+  target_instance TEXT;
+BEGIN
+  IF NEW."selectedTargetId" IS NOT NULL AND NEW."selectedInstanceId" IS NOT NULL THEN
+    SELECT "instanceId" INTO target_instance FROM execution_target WHERE id = NEW."selectedTargetId";
+    IF FOUND AND target_instance IS DISTINCT FROM NEW."selectedInstanceId" THEN
+      RAISE EXCEPTION 'selected target and instance disagree' USING ERRCODE = '23514';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$relay_request_target$;
+DROP TRIGGER IF EXISTS relay_request_execution_target_consistency ON relay_request;
+CREATE TRIGGER relay_request_execution_target_consistency
+BEFORE INSERT OR UPDATE OF "selectedTargetId", "selectedInstanceId" ON relay_request
+FOR EACH ROW EXECUTE FUNCTION enforce_relay_request_execution_target();
 
 -- ═══════════════════════════════ registry-backed checks ═══════════════════════════════
 

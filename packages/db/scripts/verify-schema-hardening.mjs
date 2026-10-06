@@ -122,6 +122,35 @@ const REQUIRED_OBJECTS = [
   "spend_reservation_transition",
   "spend_settlement_immutable",
   "usage_ledger_immutable",
+  // hot path (S0d)
+  "wsmp_priority_class_rank",
+  "capacity_scheduler_check",
+  "admission_request_shape_check",
+  "admission_request_priority_share_check",
+  "capacity_waiter_shape_check",
+  "capacity_lease_shape_check",
+  "capacity_waiter_one_admitted_winner",
+  "capacity_waiter_unique_test_candidate",
+  "capacity_lease_one_live_attempt",
+  "enforce_capacity_reference_consistency",
+  "admission_history_identity",
+  "capacity_lease_history_identity",
+  "capacity_kv_eviction_shape_check",
+  "cache_affinity_record_shape_check",
+  "cache_affinity_node_shape_check",
+  "cache_affinity_observer_shape",
+  "cache_affinity_residency_bound",
+  "wsmp_affinity_generation",
+  "wsmp_affinity_generation_ready",
+  "cache_affinity_owner",
+  "cache_affinity_identity_immutable",
+  "cache_affinity_generation_insert",
+  "cache_affinity_residency_insert",
+  "response_stickiness_provider_binding_check",
+  "response_stickiness_provider_binding_immutable",
+  "relay_request_execution_telemetry_check",
+  "a_relay_request_resource_owner",
+  "relay_request_execution_target_consistency",
   // telemetry and misc
   "attempt_event_immutable",
   "runtime_load_minute_shape_check",
@@ -652,6 +681,99 @@ try {
   await app.query("SELECT wsmp_acquire_fences(ARRAY['00:owner:owner-a', '06:capacity-policy:t-m'], true)");
   await app.query(`UPDATE pool_routing SET "keptSlots" = 3 WHERE "poolId" = 'pool-a'`);
   await app.query("COMMIT");
+
+  // ── hot path (admission, scheduler, affinity, stickiness, requests) ──
+  const waiterColumns = `(id, "userId", "admissionRequestId", "requestId", "attemptId", "enqueueSequence",
+      "capacityId", "executionTargetId", "poolId", "poolMemberId", "candidateOrder", "effectivePriority",
+      "effectiveConcurrencyLimit", "effectiveConcurrencyScope", "effectiveConcurrencyScopeId",
+      "effectiveReservedSlots", "effectiveBorrowReserved", "effectivePoolConcurrencyLimit")`;
+  await client.query(`
+    INSERT INTO admission_request (id, "userId", "requestId", "attemptId", "sourceKind", "poolId",
+      "basePriority", "enqueueSequence", "connectionOwner", "heartbeatAt")
+    VALUES ('adm-1', 'owner-a', 'req-1', 'att-1', 'POOL', 'pool-a', 1, 1, 'srv', now())`);
+  await expectFailure(
+    "admission_request_shape_check",
+    `INSERT INTO admission_request (id, "userId", "requestId", "attemptId", "sourceKind", "poolId",
+      "testTargetId", "basePriority", "enqueueSequence", "connectionOwner", "heartbeatAt")
+     VALUES ('adm-bad', 'owner-a', 'req-2', 'att-2', 'TEST', 'pool-a', 't-m', 1, 2, 'srv', now())`,
+    "23514",
+  );
+  await expectFailure(
+    "capacity waiter snapshot must match the pool policy",
+    `INSERT INTO capacity_waiter ${waiterColumns} VALUES ('w-bad', 'owner-a', 'adm-1', 'req-1', 'att-1', 1,
+      'inst-m', 't-m', 'pool-a', 'member-a', 0, 2, NULL, 'POOL', 'pool-a', 3, true, NULL)`,
+    "23514",
+  );
+  await expectFailure(
+    "capacity waiter capacity is the target's instance",
+    `INSERT INTO capacity_waiter ${waiterColumns} VALUES ('w-cap', 'owner-a', 'adm-1', 'req-1', 'att-1', 1,
+      'inst-w', 't-m', 'pool-a', 'member-a', 0, 1, NULL, 'POOL', 'pool-a', 3, true, NULL)`,
+    "23514",
+  );
+  await client.query(`
+    INSERT INTO capacity_waiter ${waiterColumns} VALUES ('w-1', 'owner-a', 'adm-1', 'req-1', 'att-1', 1,
+      'inst-m', 't-m', 'pool-a', 'member-a', 0, 1, NULL, 'POOL', 'pool-a', 3, true, NULL)`);
+  await expectFailure(
+    "capacity waiter snapshot is immutable",
+    `UPDATE capacity_waiter SET "effectiveReservedSlots" = 0 WHERE id = 'w-1'`,
+    "23514",
+  );
+  await expectFailure(
+    "capacity_scheduler_check",
+    `INSERT INTO capacity_scheduler ("capacityId", "userId", "schedulerDeficits") VALUES ('inst-m', 'owner-a', '[0,0]')`,
+    "23514",
+  );
+  await expectFailure(
+    "admission_history_identity",
+    `UPDATE admission_request SET "poolId" = 'pool-stt' WHERE id = 'adm-1'`,
+    "23514",
+  );
+  // affinity rows: the pool principal owns them, and the generation must be current
+  await client.query(`INSERT INTO cache_affinity_scope ("poolId", "userId", generation)
+    VALUES ('pool-a', 'owner-a', '00000000-0000-0000-0000-000000000000')`);
+  const affinityColumns = `(id, "expiresAt", "userId", "tenantUserId", "poolId", "executionTargetId",
+      "cacheGeneration", "targetIdentity", "bindingDigest", "conversationDigest", "sessionId", "prefixDepth")`;
+  await expectFailure(
+    "cache_affinity_owner",
+    `INSERT INTO cache_affinity_record ${affinityColumns} VALUES ('ca-bad', now() + interval '1 hour',
+      'owner-b', 'owner-b', 'pool-a', 't-m', '', 'target', repeat('b', 43), repeat('c', 43), 's-1', 0)`,
+    "23514",
+  );
+  await expectFailure(
+    "cache affinity generation has reset",
+    `INSERT INTO cache_affinity_record ${affinityColumns} VALUES ('ca-old', now() + interval '1 hour',
+      'owner-a', 'owner-a', 'pool-a', 't-m', 'stale', 'target', repeat('b', 43), repeat('c', 43), 's-1', 0)`,
+    "23514",
+  );
+  await client.query(`
+    INSERT INTO cache_affinity_record ${affinityColumns} VALUES ('ca-1', now() + interval '1 hour',
+      'owner-a', 'owner-a', 'pool-a', 't-m', wsmp_affinity_scope_generation('t-m', 'pool-a'),
+      'target', repeat('b', 43), repeat('c', 43), 's-1', 0)`);
+  await expectValue(
+    "residency published",
+    `SELECT jsonb_array_length(entries) FROM cache_affinity_residency WHERE "executionTargetId" = 't-m'`,
+    1,
+  );
+  // stickiness and request telemetry
+  await expectFailure(
+    "response_stickiness_provider_binding_check",
+    `INSERT INTO response_stickiness_record (id, "userId", "routingKeyDigest", route)
+     VALUES ('st-bad', 'owner-a', repeat('d', 43), 'cloud')`,
+    "23514",
+  );
+  await expectFailure(
+    "relay_request sidecar needs a parent",
+    `INSERT INTO relay_request (id, "userId", source, "poolId") VALUES ('rr-bad', 'owner-a', 'SIDECAR', 'pool-a')`,
+    "23514",
+  );
+  await client.query(
+    `INSERT INTO relay_request (id, "userId", source, "poolId") VALUES ('rr-1', 'owner-b', 'API_KEY', 'pool-a')`,
+  );
+  await expectValue(
+    "relay request resource owner is the pool owner",
+    `SELECT "resourceOwnerUserId" FROM relay_request WHERE id = 'rr-1'`,
+    "owner-a",
+  );
 
   // ── auth ──
   await client.query(`INSERT INTO "user" (id, name, email, slug, "deletionRequestedAt") VALUES
