@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { agentRulesApply, type CallerAuth, callerMayReach } from "./auth-context";
-import { PRISMA_ENUM_MIRRORS } from "./common";
+import { nodeSlugSchema, PRISMA_ENUM_MIRRORS, RESERVED_NODE_SLUGS } from "./common";
 import {
   apiContract,
   CSRF_REQUIRED_PROCEDURES,
@@ -508,5 +508,27 @@ describe("metrics_query input", () => {
         range: { from: "2026-01-01T00:00:00Z", to: "2026-03-01T00:00:00Z" },
       }).success,
     ).toBe(false);
+  });
+});
+
+describe("node slugs (shared with the CLI)", () => {
+  it("reserves the same names as apps/cli/src/slug.rs", () => {
+    const rust = readFileSync(
+      fileURLToPath(new URL("../../../../apps/cli/src/slug.rs", import.meta.url)),
+      "utf8",
+    );
+    const block = /const RESERVED: &\[&str\] = &\[([^\]]*)\];/.exec(rust)?.[1] ?? "";
+    const names = [...block.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+    expect(names).toEqual([...RESERVED_NODE_SLUGS]);
+  });
+
+  it("takes 3–63 characters and refuses reserved names", () => {
+    expect(nodeSlugSchema.safeParse("desk-01").success).toBe(true);
+    expect(nodeSlugSchema.safeParse("a".repeat(63)).success).toBe(true);
+    expect(nodeSlugSchema.safeParse("ab").success).toBe(false);
+    expect(nodeSlugSchema.safeParse("a".repeat(64)).success).toBe(false);
+    expect(nodeSlugSchema.safeParse("api").success).toBe(false);
+    expect(nodeSlugSchema.safeParse("desk--01").success).toBe(false);
+    expect(nodeSlugSchema.safeParse("-desk").success).toBe(false);
   });
 });

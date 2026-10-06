@@ -247,6 +247,8 @@ pub struct InstanceRecord {
     pub unit_name: String,
     pub port: u16,
     pub handle: String,
+    /// The launch spec's model ids, echoed (never probed): a startable runtime
+    /// serves exactly what its spec lists, and one listing none is a service.
     pub models: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_facts: Option<EngineFacts>,
@@ -1449,7 +1451,8 @@ pub enum ServerFrame {
         /// `complete` only: held versions to keep (by version id).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         keep: Option<Vec<String>>,
-        /// Incremental only: versions to drop (by version id).
+        /// Incremental only: versions to drop (by version id). A version the node does not
+        /// hold is a no-op with no result entry (the final held set is authoritative).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remove: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

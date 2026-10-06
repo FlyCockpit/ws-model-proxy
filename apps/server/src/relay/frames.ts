@@ -121,7 +121,8 @@ export const p256SignatureSchema = z
   .regex(/^[A-Za-z0-9_-]{85}[AQgw]$/)
   .refine((value) => Buffer.from(value, "base64url").length === 64, "Expected 64 bytes.");
 const isoTimeSchema = z.string().datetime();
-const nodeSlugSchema = z.string().regex(/^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,62}$/);
+/** Shape only (3–63); enrollment refuses reserved names and the node row is authoritative. */
+const nodeSlugSchema = z.string().regex(/^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){2,62}$/);
 /**
  * What the node routes by: the runtime slug (always-on) or `i-<id12>` (startable instance).
  * Runtime slugs that look like an instance handle are refused at creation.
@@ -270,6 +271,11 @@ export const instanceRecordSchema = z
     unitName: z.string().regex(UNIT_NAME_PATTERN),
     port: portSchema,
     handle: z.string().regex(INSTANCE_HANDLE_PATTERN),
+    /**
+     * The ids the launch version's spec lists, echoed (never probed). A startable runtime
+     * serves exactly the models its spec lists; one that lists none is a service and serves
+     * none, so there is nothing to detect.
+     */
     models: z.array(z.string().min(1).max(256)).max(64),
     engineFacts: engineFactsSchema.optional(),
   })
@@ -586,8 +592,10 @@ export const runtimeDefineResultFrameSchema = z
     chunkIndex: z.number().int().min(0).max(RUNTIME_DEFINITIONS_MAX),
     final: z.boolean(),
     /**
-     * One entry per `put` and `remove` of the answered chunk (at most 64 together). Versions a
-     * complete operation drops implicitly are not listed: the final `held` set shows them gone.
+     * One entry per `put`, and one per `remove` of a version the node held (at most 64
+     * together). A `remove` naming a version the node does not hold is a no-op with no entry
+     * (it has no runtimeId to report). Versions a complete operation drops implicitly are not
+     * listed either: the final `held` set is authoritative.
      */
     results: z
       .array(

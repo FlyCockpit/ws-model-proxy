@@ -5,6 +5,7 @@
  *
  * Pure module: the web imports these schemas for forms.
  */
+import { RESERVED_FORWARDER_SLUGS } from "@ws-model-proxy/config/forwarder-identifiers";
 import { z } from "zod";
 
 // ── Ids and paging ──
@@ -14,7 +15,22 @@ export const idSchema = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 /** Input of a procedure that takes none (clients may send nothing or `{}`). */
 export const noInputSchema = z.object({}).strict().optional();
 export const slugSchema = z.string().regex(/^[a-z](?:[a-z0-9]|-(?=[a-z0-9])){0,40}$/);
-export const nodeSlugSchema = z.string().regex(/^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,62}$/);
+/**
+ * Node slugs the CLI refuses (`apps/cli/src/slug.rs` RESERVED; `contracts.test.ts` keeps the
+ * lists equal): they collide with routes and old nouns. One list with the forwarder slugs.
+ */
+export const RESERVED_NODE_SLUGS = RESERVED_FORWARDER_SLUGS;
+const reservedNodeSlugs: ReadonlySet<string> = new Set(RESERVED_NODE_SLUGS);
+/**
+ * The shape of a stored node slug (3–63 lowercase letters, digits and single inner hyphens).
+ * Outputs use this: they echo what is stored, which may predate the reserved list.
+ */
+export const nodeSlugShapeSchema = z.string().regex(/^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){2,62}$/);
+/** A node slug a caller chooses: the shape, and not reserved (as the CLI checks). */
+export const nodeSlugSchema = nodeSlugShapeSchema.refine(
+  (slug) => !reservedNodeSlugs.has(slug),
+  "That node name is reserved.",
+);
 export const nameSchema = z.string().trim().min(1).max(120);
 export const descriptionSchema = z.string().trim().max(2_000);
 /** Why (stored on the version / audit event so agent experiments are traceable, G6). */

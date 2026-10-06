@@ -41,6 +41,7 @@ function app(overrides: Parameters<typeof registerNodeHttpRoutes>[1] = {}) {
       credential: `wsmp_node_${"x".repeat(43)}`,
       replaced: null,
       trustLowerPending: false,
+      removeAfterOfflineMs: 3_600_000,
     },
     ownerUserId: "owner-1",
     revokedCredentialIds: ["cred-old"],
@@ -98,7 +99,11 @@ describe("node bootstrap HTTP", () => {
     expect(res.status).toBe(200);
     // The credential is in this body: never cached.
     expect(res.headers.get("cache-control")).toBe("no-store");
-    expect(await res.json()).toMatchObject({ ok: true, nodeId: "node-1" });
+    expect(await res.json()).toMatchObject({
+      ok: true,
+      nodeId: "node-1",
+      removeAfterOfflineMs: 3_600_000,
+    });
     expect(exchange).toHaveBeenCalledWith(
       expect.objectContaining({ code: CODE, slug: "desk-01", replaceConfirmed: false }),
     );

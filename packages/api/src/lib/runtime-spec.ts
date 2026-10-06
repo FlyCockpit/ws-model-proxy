@@ -453,6 +453,15 @@ export const runtimeLaunchSchema = z
         path: ["port"],
         message: "A fixed port needs groupSize 1.",
       });
+    // The node refuses a definition that names a secret twice.
+    launch.secrets?.forEach((name, index) => {
+      if (launch.secrets?.indexOf(name) !== index)
+        ctx.addIssue({
+          code: "custom",
+          path: ["secrets", index],
+          message: "Name each secret once.",
+        });
+    });
     launch.commands.forEach((commands, index) => {
       const path = ["commands", index];
       const interactive = commands.interactive;

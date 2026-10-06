@@ -114,6 +114,7 @@ integration("core flows on PostgreSQL with the schema hardening", () => {
     });
     expect(enrolled.response.ok).toBe(true);
     if (!enrolled.response.ok) throw new Error("enrollment refused");
+    expect(enrolled.response.removeAfterOfflineMs).toBeNull();
     const nodeId = enrolled.response.nodeId;
     // A second exchange of the single-use code is refused by name.
     const again = await modules.enroll.exchangeEnrollmentCode({
@@ -156,6 +157,7 @@ integration("core flows on PostgreSQL with the schema hardening", () => {
       ok: true,
       nodeId,
       replaced: { slug: `desk-${suffix}` },
+      removeAfterOfflineMs: null,
     });
     expect(replaced.revokedCredentialIds).toHaveLength(1);
 

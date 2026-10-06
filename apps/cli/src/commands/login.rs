@@ -73,6 +73,7 @@ struct LoginOutput<'a> {
     server: &'a str,
     trust: &'a str,
     replaced: Option<&'a str>,
+    remove_after_offline_ms: Option<u64>,
     service_installed: bool,
 }
 
@@ -178,6 +179,7 @@ pub fn run(args: &Args) -> Result<()> {
             server: &server_url,
             trust: crate::trust::word(trust),
             replaced: enrolled.replaced.as_ref().map(|node| node.slug.as_str()),
+            remove_after_offline_ms: enrolled.remove_after_offline_ms,
             service_installed,
         });
     }
@@ -195,10 +197,29 @@ pub fn run(args: &Args) -> Result<()> {
             escape_single_line(&node.slug)
         ))?;
     }
+    if let Some(ms) = enrolled.remove_after_offline_ms {
+        output::line(format!(
+            "temporary node: the server removes it after {} offline",
+            offline_window(ms)
+        ))?;
+    }
     if !service_installed {
         output::line("start the relay with `wsmp run` (or `wsmp service install`)")?;
     }
     Ok(())
+}
+
+/// A temporary node's offline window, in the largest whole unit.
+fn offline_window(ms: u64) -> String {
+    let minutes = ms / 60_000;
+    let (count, unit) = if minutes >= 1_440 && minutes.is_multiple_of(1_440) {
+        (minutes / 1_440, "day")
+    } else if minutes >= 60 && minutes.is_multiple_of(60) {
+        (minutes / 60, "hour")
+    } else {
+        (minutes.max(1), "minute")
+    };
+    format!("{count} {unit}{}", if count == 1 { "" } else { "s" })
 }
 
 /// `https://` unless loopback; trailing slash and path dropped.
@@ -341,6 +362,15 @@ fn offer_service(args: &Args) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn offline_windows_read_in_whole_units() {
+        assert_eq!(super::offline_window(3_600_000), "1 hour");
+        assert_eq!(super::offline_window(7_200_000), "2 hours");
+        assert_eq!(super::offline_window(172_800_000), "2 days");
+        assert_eq!(super::offline_window(5_400_000), "90 minutes");
+        assert_eq!(super::offline_window(60_000), "1 minute");
+    }
+
     use super::*;
 
     #[test]

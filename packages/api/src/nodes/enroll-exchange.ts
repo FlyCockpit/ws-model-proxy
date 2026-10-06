@@ -115,7 +115,9 @@ export async function exchangeEnrollmentCode(
           maxUses: true,
           labels: true,
           removeAfterOfflineMs: true,
-          ReplaceNode: { select: { id: true, slug: true, trust: true } },
+          ReplaceNode: {
+            select: { id: true, slug: true, trust: true, removeAfterOfflineMs: true },
+          },
         },
       });
       const state = codeRefusal(code, now);
@@ -125,6 +127,7 @@ export async function exchangeEnrollmentCode(
       let slug: string;
       let replaced: { slug: string } | null = null;
       let trustLowerPending = false;
+      let removeAfterOfflineMs = code.removeAfterOfflineMs;
       if (code.ReplaceNode) {
         if (!request.replaceConfirmed)
           throw new EnrollRefused(
@@ -136,6 +139,7 @@ export async function exchangeEnrollmentCode(
         slug = code.ReplaceNode.slug;
         replaced = { slug };
         trustLowerPending = code.ReplaceNode.trust === "RELAY";
+        removeAfterOfflineMs = code.ReplaceNode.removeAfterOfflineMs;
         if (request.hostname !== undefined)
           await tx.node.update({ where: { id: nodeId }, data: { hostname: request.hostname } });
       } else {
@@ -192,6 +196,7 @@ export async function exchangeEnrollmentCode(
         slug,
         replaced,
         trustLowerPending,
+        removeAfterOfflineMs,
         revokedCredentialIds: previous.map((row) => row.id),
       };
     });
@@ -203,6 +208,8 @@ export async function exchangeEnrollmentCode(
         credential: secret,
         replaced: result.replaced,
         trustLowerPending: result.trustLowerPending,
+        removeAfterOfflineMs:
+          result.removeAfterOfflineMs === null ? null : Number(result.removeAfterOfflineMs),
       },
       ownerUserId: userId,
       revokedCredentialIds: result.revokedCredentialIds,

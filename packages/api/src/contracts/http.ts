@@ -3,7 +3,8 @@
  * `apps/server` (`well-known.ts`, the enrollment route, `install-script.ts`).
  */
 import { z } from "zod";
-import { idSchema, nodeSlugSchema } from "./common";
+import { idSchema, nodeSlugSchema, nodeSlugShapeSchema } from "./common";
+import { removeAfterOfflineMsSchema } from "./nodes";
 
 export const RELAY_PROTOCOL = "3.0";
 
@@ -39,13 +40,18 @@ export const nodeEnrollResponseSchema = z.discriminatedUnion("ok", [
     .object({
       ok: z.literal(true),
       nodeId: idSchema,
-      slug: nodeSlugSchema,
+      slug: nodeSlugShapeSchema,
       /** Shown once; stored in `node-credential.json` (0600). */
       credential: z.string().min(32).max(256),
       /** Set when the code was a Replace code: the node now lives on this identity. */
-      replaced: z.object({ slug: nodeSlugSchema }).strict().nullable(),
+      replaced: z.object({ slug: nodeSlugShapeSchema }).strict().nullable(),
       /** The replaced node was Relay only: this node is lowered on its first hello. */
       trustLowerPending: z.boolean(),
+      /**
+       * Set when the node is temporary: it is deleted after this long offline (a Replace keeps
+       * the replaced node's value).
+       */
+      removeAfterOfflineMs: removeAfterOfflineMsSchema.nullable(),
     })
     .strict(),
   z
@@ -61,7 +67,7 @@ export const nodeEnrollResponseSchema = z.discriminatedUnion("ok", [
         "rate_limited",
       ]),
       /** For `replace_confirmation_required`: the node the code replaces. */
-      replaces: z.object({ slug: nodeSlugSchema }).strict().optional(),
+      replaces: z.object({ slug: nodeSlugShapeSchema }).strict().optional(),
       retryAfterSec: z.number().int().optional(),
     })
     .strict(),

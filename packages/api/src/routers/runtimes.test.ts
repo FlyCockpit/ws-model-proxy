@@ -144,6 +144,29 @@ describe("runtimes.presets", () => {
   });
 });
 
+describe("launch.secrets", () => {
+  const withSecrets = (secrets: string[]) => ({
+    ...SPEC,
+    launch: SPEC.launch && { ...SPEC.launch, secrets },
+  });
+
+  it("refuses a secret named twice, as the node does", () => {
+    const result = runtimeSpecSchema.safeParse(
+      withSecrets(["WSMP_SECRET_HF_TOKEN", "WSMP_SECRET_API_KEY", "WSMP_SECRET_HF_TOKEN"]),
+    );
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.path)).toContainEqual([
+      "launch",
+      "secrets",
+      2,
+    ]);
+    expect(
+      runtimeSpecSchema.safeParse(withSecrets(["WSMP_SECRET_HF_TOKEN", "WSMP_SECRET_API_KEY"]))
+        .success,
+    ).toBe(true);
+  });
+});
+
 describe("runtimes.create", () => {
   it("writes version 1 with derived columns and hashes, and the served models", async () => {
     db.runtime.create.mockResolvedValue({ id: "rt-1" } as never);

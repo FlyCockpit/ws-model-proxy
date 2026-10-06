@@ -29,6 +29,7 @@ import {
   NODE_TRUST,
   nameSchema,
   nodeSlugSchema,
+  nodeSlugShapeSchema,
   noInputSchema,
   noteSchema,
   OPERATOR_NEED,
@@ -129,7 +130,7 @@ export const nodeHoldSchema = z
 export const nodeSummarySchema = z
   .object({
     id: idSchema,
-    slug: nodeSlugSchema,
+    slug: nodeSlugShapeSchema,
     name: z.string().nullable(),
     connection: z.enum(NODE_CONNECTION),
     lastHeartbeatAt: isoDateSchema.nullable(),
@@ -243,7 +244,7 @@ export const enrollmentCodeViewSchema = z
     codePrefix: z.string().length(8),
     createdAt: isoDateSchema,
     expiresAt: isoDateSchema,
-    suggestedSlug: nodeSlugSchema.nullable(),
+    suggestedSlug: nodeSlugShapeSchema.nullable(),
     replaceNodeId: idSchema.nullable(),
     maxUses: z.number().int().min(1).max(50),
     usedCount: z.number().int().min(0),
@@ -261,7 +262,7 @@ export const enrollmentCodeViewSchema = z
   .strict();
 
 /** 1 min .. 30 days offline before a temporary node is deleted. */
-const removeAfterOfflineMsSchema = z.number().int().min(60_000).max(2_592_000_000);
+export const removeAfterOfflineMsSchema = z.number().int().min(60_000).max(2_592_000_000);
 /** A node secret value: 1 byte .. 16 KiB of UTF-8, never stored or shown. */
 const nodeSecretValueSchema = z
   .string()

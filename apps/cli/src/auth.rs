@@ -136,6 +136,10 @@ pub struct Enrolled {
     pub credential: String,
     pub replaced: Option<ReplacedNode>,
     pub trust_lower_pending: bool,
+    /// Set when the node is temporary: the server deletes it after this long
+    /// offline. Absent from older servers.
+    #[serde(default)]
+    pub remove_after_offline_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -291,7 +295,20 @@ mod tests {
             .to_string(),
         )
         .expect("enrolled");
-        assert!(matches!(ok, EnrollOutcome::Enrolled(ref e) if e.slug == "spark-1"));
+        assert!(matches!(ok, EnrollOutcome::Enrolled(ref e)
+            if e.slug == "spark-1" && e.remove_after_offline_ms.is_none()));
+        let temporary = parse_enroll_answer(
+            200,
+            &serde_json::json!({
+                "ok": true, "nodeId": "nd1", "slug": "spark-1",
+                "credential": "c".repeat(40), "replaced": null, "trustLowerPending": false,
+                "removeAfterOfflineMs": 3_600_000
+            })
+            .to_string(),
+        )
+        .expect("enrolled");
+        assert!(matches!(temporary, EnrollOutcome::Enrolled(ref e)
+            if e.remove_after_offline_ms == Some(3_600_000)));
         let refused = parse_enroll_answer(
             409,
             r#"{"ok":false,"error":"replace_confirmation_required","replaces":{"slug":"old-1"}}"#,

@@ -324,8 +324,8 @@ try {
       ('owner-a', 'A', 'a@example.test', 'owner-a'),
       ('owner-b', 'B', 'b@example.test', 'owner-b');
     INSERT INTO node (id, "userId", slug, trust) VALUES
-      ('node-a1', 'owner-a', 'a1', 'FULL'), ('node-a2', 'owner-a', 'a2', 'FULL'),
-      ('node-a3', 'owner-a', 'a3', 'FULL'), ('node-b1', 'owner-b', 'b1', 'FULL');
+      ('node-a1', 'owner-a', 'na1', 'FULL'), ('node-a2', 'owner-a', 'na2', 'FULL'),
+      ('node-a3', 'owner-a', 'na3', 'FULL'), ('node-b1', 'owner-b', 'nb1', 'FULL');
     -- startable runtime with two versions sharing a launch hash, one with another
     INSERT INTO runtime (id, "userId", slug, name, kind, origin) VALUES
       ('rt-s', 'owner-a', 'qwen', 'Qwen', 'STARTABLE', 'SERVER');
