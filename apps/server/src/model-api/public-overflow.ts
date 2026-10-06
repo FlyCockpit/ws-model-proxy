@@ -1097,6 +1097,19 @@ function supportedFeatures(value: unknown): string[] {
     : [];
 }
 
+/**
+ * The wire protocol of a provider account. The 0.4.0 provider types are `openrouter` and
+ * `generic` (an OpenAI- or Anthropic-compatible URL): a generic account speaks what its model's
+ * capability inventory declares, OpenAI-compatible when it declares nothing.
+ */
+function cloudProtocol(
+  providerType: string,
+  inventory: OpenAiCompatibleCapabilities | null,
+): ProviderProtocol | null {
+  if (providerType.trim().toLowerCase() !== "generic") return providerProtocolForType(providerType);
+  return inventory?.protocol === "anthropic-compatible" ? "anthropic" : "openai";
+}
+
 /** What a cloud target needs of its provider model (pool member or own-key choice). */
 const providerTargetModelSelect = {
   id: true,
@@ -1265,8 +1278,8 @@ export async function listPublicOverflowTargets(
     const account = model.Account;
     const executionTargetId = model.Target?.id ?? createdTargets.get(model.id);
     const credential = account.CurrentCredential;
-    const protocol = providerProtocolForType(account.providerType);
     const capabilityInventory = parseOpenAiCompatibleCapabilities(model.nativeCapabilities);
+    const protocol = cloudProtocol(account.providerType, capabilityInventory);
     if (
       !executionTargetId ||
       !protocol ||
