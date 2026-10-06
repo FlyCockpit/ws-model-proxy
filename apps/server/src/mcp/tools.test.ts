@@ -579,6 +579,24 @@ describe("#117 — real input schemas and named failing fields", () => {
     );
   });
 
+  it("a refinement's own message reaches the agent with its field", async () => {
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_pool_member_update", {
+      id: "member-1",
+      capacityConcurrencyMode: "LIMITED",
+    });
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.structuredContent?.error).toMatchObject({
+      code: "invalid_input",
+      fields: ["capacityConcurrencyLimit"],
+      message: "capacityConcurrencyLimit: Limited mode requires a limit",
+    });
+    expect(resultText(body.result ?? {})).toBe(
+      "Invalid input: capacityConcurrencyLimit: Limited mode requires a limit",
+    );
+  });
+
   it("forwards a guarded-pool-create reason next to data.fields", async () => {
     const { ORPCError } = await import("@orpc/server");
     db.modelPool.findUnique.mockRejectedValueOnce(

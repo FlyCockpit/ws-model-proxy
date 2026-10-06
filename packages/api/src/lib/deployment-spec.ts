@@ -67,7 +67,11 @@ const command = deploymentTextSchema(DEPLOYMENT_COMMAND_MAX_BYTES)
   .superRefine((value, ctx) => {
     for (const [, key] of value.matchAll(PLACEHOLDER)) {
       if (!(DEPLOYMENT_PLACEHOLDERS as readonly string[]).includes(key ?? ""))
-        ctx.addIssue({ code: "custom", message: `Unknown placeholder {{${key}}}.` });
+        // Names only the allowed set: refinement messages never echo input.
+        ctx.addIssue({
+          code: "custom",
+          message: `Unknown placeholder; a command may use only ${DEPLOYMENT_PLACEHOLDERS.map((name) => `{{${name}}}`).join(", ")}.`,
+        });
     }
   });
 /**

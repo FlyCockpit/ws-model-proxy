@@ -525,7 +525,7 @@ export async function runManifestTool(
       }
       return toolError(error.message, { error: { code: error.code, ...error.extra } });
     }
-    return mapToolError(error, descriptor, requestId);
+    return mapToolError(error, descriptor, requestId, args);
   }
 }
 
@@ -666,6 +666,7 @@ function mapToolError(
   error: unknown,
   descriptor: McpToolDescriptor,
   requestId: string,
+  callerInput: unknown,
 ): ToolResult {
   if (error instanceof ORPCError) {
     if (Object.hasOwn(ORPC_ERROR_MESSAGES, error.code)) {
@@ -676,7 +677,7 @@ function mapToolError(
           // carry input values. A procedure rejection whose input was
           // schema-valid still names the key via data.fields.
           const knownKeys = declaredInputKeys(descriptor);
-          const issues = sanitizeValidationIssues(error.data, knownKeys);
+          const issues = sanitizeValidationIssues(error.data, knownKeys, callerInput);
           if (issues !== null) return validationToolError("invalid_input", issues);
           const fields = sanitizeDeclaredFields(error.data, knownKeys);
           if (fields !== null) {

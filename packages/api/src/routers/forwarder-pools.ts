@@ -280,6 +280,7 @@ async function transformerCapabilitiesForOwnedModel(
   if (!model.published || !model.Endpoint.published) {
     throw new ORPCError("BAD_REQUEST", {
       message: "Transformer model must be published (model and endpoint).",
+      data: { fields: ["transformerDiscoveredModelId"] },
     });
   }
   const caps = resolveEffectiveCapabilityMetadata({
@@ -306,7 +307,10 @@ function assertTransformerMatchesModalities({
     transformerCaps: caps,
   });
   if (errors.length > 0) {
-    throw new ORPCError("BAD_REQUEST", { message: errors.join(" ") });
+    throw new ORPCError("BAD_REQUEST", {
+      message: errors.join(" "),
+      data: { fields: ["transformerDiscoveredModelId"] },
+    });
   }
 }
 

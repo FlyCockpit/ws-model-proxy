@@ -349,6 +349,7 @@ export const poolMemberProcedures = {
         throw new ORPCError("BAD_REQUEST", {
           message:
             "Provider models can only be external fallback (PUBLIC_OVERFLOW) members; plain pool names never leave the deployment.",
+          data: { fields: ["tier"] },
         });
       const userId = context.session.user.id;
       const attached = await runSerializableCapacityCreationTransaction(async (tx) => {
@@ -400,6 +401,7 @@ export const poolMemberProcedures = {
         if (input.publicOrder === undefined) {
           throw new ORPCError("BAD_REQUEST", {
             message: "Public overflow targets require an explicit order.",
+            data: { fields: ["publicOrder"] },
           });
         }
         const providerModel = await tx.providerModel.findFirst({
@@ -418,7 +420,10 @@ export const poolMemberProcedures = {
           throw new ORPCError("NOT_FOUND", { message: "Provider model not found." });
         }
         if (!providerModel.enabled) {
-          throw new ORPCError("BAD_REQUEST", { message: "Enable the provider model first." });
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Enable the provider model first.",
+            data: { fields: ["providerModelId"] },
+          });
         }
         await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${providerModel.providerAccountId} AND "userId" = ${userId} FOR KEY SHARE`;
         await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${providerModel.id} AND "userId" = ${userId} FOR KEY SHARE`;
@@ -465,6 +470,7 @@ export const poolMemberProcedures = {
           throw new ORPCError("BAD_REQUEST", {
             message:
               "Create and activate an attachment protection policy with explicit LIMITED or UNLIMITED concurrency before adding this overflow target.",
+            data: { fields: ["providerModelId"] },
           });
         }
         const protectionAudit = await tx.providerAuditEvent.findFirst({
@@ -479,6 +485,7 @@ export const poolMemberProcedures = {
         if (!protectionAudit) {
           throw new ORPCError("BAD_REQUEST", {
             message: "The attachment protection policy must have an activation audit trail.",
+            data: { fields: ["providerModelId"] },
           });
         }
         const existingTarget = await tx.executionTarget.findUnique({
@@ -789,7 +796,11 @@ export const poolMemberProcedures = {
           });
 
           if (nextTier === "PUBLIC_OVERFLOW" && member.tier !== "PUBLIC_OVERFLOW") {
-            if (!providerModel) throw new ORPCError("BAD_REQUEST");
+            if (!providerModel)
+              throw new ORPCError("BAD_REQUEST", {
+                message: "Only provider-backed members can move to external fallback.",
+                data: { fields: ["tier"] },
+              });
             const protection = await tx.providerBudgetPolicy.findFirst({
               where: {
                 userId,
@@ -835,6 +846,7 @@ export const poolMemberProcedures = {
               throw new ORPCError("BAD_REQUEST", {
                 message:
                   "Create and activate an audited attachment protection policy before moving this target to overflow.",
+                data: { fields: ["tier"] },
               });
           }
 

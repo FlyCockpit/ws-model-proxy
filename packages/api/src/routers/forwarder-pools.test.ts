@@ -56,6 +56,16 @@ describe("forwarderManagementRouter pools", () => {
     expect(db.$transaction).not.toHaveBeenCalled();
   });
 
+  it("names the failing field on provider attachment refusals", async () => {
+    await expect(
+      client().addProviderPoolMember({
+        poolId: "pool-id",
+        providerModelId: "provider-model",
+        tier: "PRIMARY",
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST", data: { fields: ["tier"] } });
+  });
+
   it("refuses turning pool fallback on with a machine-readable reason when the switch is off", async () => {
     testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
     db.modelPool.findUnique.mockResolvedValueOnce(poolRow({ userId: "user-id" }));
