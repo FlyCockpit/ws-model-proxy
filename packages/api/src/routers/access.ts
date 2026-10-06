@@ -663,38 +663,37 @@ const shares = {
 
   update: contractProcedure(c.shares.update).handler(async ({ context, input }) => {
     const ownerUserId = userIdOf(context);
-    const share = await prisma.share.findFirst({
+    const found = await prisma.share.findFirst({
       where: { id: input.shareId, ownerUserId },
-      select: {
-        id: true,
-        poolId: true,
-        granteeUserId: true,
-        canUse: true,
-        canContribute: true,
-        priorityClass: true,
-        SpendCap: { select: { id: true } },
-      },
+      select: { id: true, poolId: true, granteeUserId: true },
     });
-    if (!share) throw notFound();
-    const canUse = input.canUse ?? share.canUse;
-    const canContribute = input.canContribute ?? share.canContribute;
-    if (!canUse && !canContribute) {
-      throw badRequest("A share needs can use, can contribute, or both. Delete it instead.");
-    }
-    const policyChanged =
-      canUse !== share.canUse ||
-      canContribute !== share.canContribute ||
-      (input.priorityClass !== undefined && input.priorityClass !== share.priorityClass);
+    if (!found) throw notFound();
+    const touchesPolicy =
+      input.canUse !== undefined ||
+      input.canContribute !== undefined ||
+      input.priorityClass !== undefined;
     const fenced = {
-      owners: [ownerUserId, share.granteeUserId],
-      ...(policyChanged ? { policyPoolId: share.poolId } : {}),
+      owners: [ownerUserId, found.granteeUserId],
+      ...(touchesPolicy ? { policyPoolId: found.poolId } : {}),
     };
-    await runAccessTransaction(fenced, async (tx) => {
+    const revokedUse = await runAccessTransaction(fenced, async (tx) => {
+      // Re-read under the fences and write only what the request names, so concurrent edits
+      // of other fields are never undone.
+      const share = await tx.share.findFirst({
+        where: { id: found.id, ownerUserId },
+        select: { canUse: true, canContribute: true, SpendCap: { select: { id: true } } },
+      });
+      if (!share) throw notFound();
+      const canUse = input.canUse ?? share.canUse;
+      const canContribute = input.canContribute ?? share.canContribute;
+      if (!canUse && !canContribute) {
+        throw badRequest("A share needs can use, can contribute, or both. Delete it instead.");
+      }
       await tx.share.update({
-        where: { id: share.id },
+        where: { id: found.id },
         data: {
-          canUse,
-          canContribute,
+          ...(input.canUse !== undefined ? { canUse: input.canUse } : {}),
+          ...(input.canContribute !== undefined ? { canContribute: input.canContribute } : {}),
           ...(input.priorityClass !== undefined ? { priorityClass: input.priorityClass } : {}),
           ...(input.protectionPercent !== undefined
             ? { protectionPercent: input.protectionPercent }
@@ -702,7 +701,7 @@ const shares = {
         },
       });
       if (input.monthlyCap === null && share.SpendCap) {
-        await tx.spendCap.deleteMany({ where: { id: share.SpendCap.id, shareId: share.id } });
+        await tx.spendCap.deleteMany({ where: { id: share.SpendCap.id, shareId: found.id } });
       } else if (input.monthlyCap) {
         const limit = new Prisma.Decimal(input.monthlyCap.limit);
         if (share.SpendCap) {
@@ -719,23 +718,24 @@ const shares = {
             data: {
               userId: ownerUserId,
               scope: "SHARE",
-              shareId: share.id,
+              shareId: found.id,
               monthlyLimit: limit,
               currency: input.monthlyCap.currency,
             },
           });
         }
       }
+      return share.canUse && !canUse;
     });
-    if (share.canUse && !canUse) {
+    if (revokedUse) {
       await notifyRevoked(context, {
         kind: "share",
         ownerUserId,
-        granteeUserId: share.granteeUserId,
-        poolId: share.poolId,
+        granteeUserId: found.granteeUserId,
+        poolId: found.poolId,
       });
     }
-    return loadShareView(share.id);
+    return loadShareView(found.id);
   }),
 
   delete: contractProcedure(c.shares.delete).handler(async ({ context, input }) => {

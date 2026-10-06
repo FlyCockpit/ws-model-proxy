@@ -13,6 +13,7 @@ import prisma, { type Prisma } from "@ws-model-proxy/db";
 import {
   acquireFences,
   CapacityOrderedTransactionTimeoutError,
+  FenceSetChangedError,
   fenceOwners,
   fences,
   isRetryableCapacityTransactionError,
@@ -20,6 +21,23 @@ import {
 } from "@ws-model-proxy/db/capacity-lock-order";
 
 type Tx = Prisma.TransactionClient;
+
+/** `WMPF4`: a write needed a fence this transaction does not hold (see the file comment). */
+function isMissingFence(error: unknown): boolean {
+  const pending: unknown[] = [error];
+  const seen = new Set<object>();
+  while (pending.length > 0) {
+    const candidate = pending.pop();
+    if (!candidate || typeof candidate !== "object" || seen.has(candidate)) continue;
+    seen.add(candidate);
+    for (const key of ["code", "originalCode"]) {
+      if (Reflect.get(candidate, key) === "WMPF4") return true;
+    }
+    for (const key of ["meta", "driverAdapterError", "cause"])
+      pending.push(Reflect.get(candidate, key));
+  }
+  return false;
+}
 
 /** Every execution target a pool's policy feeds (`wsmp_pool_target_ids`). */
 async function poolTargetIds(tx: Tx, poolId: string): Promise<string[]> {
@@ -66,7 +84,14 @@ export async function runAccessTransaction<T>(
           targetIds.map((targetId) => fences.capacityPolicy(targetId)),
         );
       }
-      return work(tx);
+      try {
+        return await work(tx);
+      } catch (error) {
+        // A target appeared after the fence set was read (a contributor's new instance):
+        // roll back and retry with the larger set.
+        if (isMissingFence(error)) throw new FenceSetChangedError();
+        throw error;
+      }
     });
   } catch (error) {
     if (

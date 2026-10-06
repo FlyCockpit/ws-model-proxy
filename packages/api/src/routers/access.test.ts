@@ -143,6 +143,7 @@ beforeEach(() => {
   envMock.env.WMP_MCP_ENABLED = true;
   envMock.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = false;
   inTransaction();
+  db.poolMember.findMany.mockResolvedValue([]);
 });
 
 describe("only a person may mint credentials or grant access", () => {
@@ -517,6 +518,8 @@ describe("shares", () => {
   it("refuses clearing both permissions", async () => {
     db.share.findFirst.mockResolvedValue({
       id: "share1",
+      poolId: "pool1",
+      granteeUserId: "friend",
       canUse: true,
       canContribute: false,
       SpendCap: null,
@@ -611,6 +614,22 @@ describe("shares", () => {
       userId: "owner",
     });
     expect(db.share.update).not.toHaveBeenCalled();
+  });
+
+  it("writes only the fields a share update names", async () => {
+    db.share.findFirst.mockResolvedValue({
+      id: "share1",
+      poolId: "pool1",
+      granteeUserId: "friend",
+      canUse: true,
+      canContribute: true,
+      SpendCap: null,
+    } as never);
+    db.share.findUnique.mockResolvedValue(shareRow as never);
+    await client().shares.update({ shareId: "share1", protectionPercent: 20 });
+    expect(db.share.update.mock.calls[0]?.[0].data).toEqual({ protectionPercent: 20 });
+    // No permission named: no capacity-policy fences.
+    expect(heldFences()).toEqual(["00:owner:friend", "00:owner:owner"]);
   });
 
   it("takes the pool's capacity-policy fences when a permission changes", async () => {
