@@ -76,11 +76,12 @@ impl Resampler24To16 {
             self.push_sample(i16::from_le_bytes([low, high]), out);
             bytes = rest;
         }
-        let mut pairs = bytes.chunks_exact(2);
-        for pair in pairs.by_ref() {
-            self.push_sample(i16::from_le_bytes([pair[0], pair[1]]), out);
+        // `as_chunks` is stable since 1.88, the crate's MSRV.
+        let (pairs, rest) = bytes.as_chunks::<2>();
+        for &pair in pairs {
+            self.push_sample(i16::from_le_bytes(pair), out);
         }
-        if let [low] = pairs.remainder() {
+        if let [low] = rest {
             self.carry = Some(*low);
         }
     }
