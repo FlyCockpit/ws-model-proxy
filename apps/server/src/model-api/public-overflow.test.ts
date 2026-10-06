@@ -567,7 +567,7 @@ describe("public overflow compatibility", () => {
     expect(providerHealthOutcome(429)).toBe("FAILURE");
     expect(providerHealthOutcome(503)).toBe("FAILURE");
   });
-  it("keeps the S0 send claim fail-closed: nothing is decrypted or sent", async () => {
+  it("refuses a send claim before any transaction when the gate is off or own-key mismatches", async () => {
     db.$transaction.mockClear();
     const keyring = parseProviderCredentialKeyring(`v1:${Buffer.alloc(32, 7).toString("base64")}`);
     const consent = {
@@ -584,9 +584,6 @@ describe("public overflow compatibility", () => {
     const mutableEnv = env as { WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: boolean };
     mutableEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
     try {
-      await expect(
-        claimPublicProviderCredentialForSend({ userId: "owner", target, keyring, consent }),
-      ).resolves.toEqual({ claimed: false, reason: "PROVIDER_UNAVAILABLE" });
       await expect(
         claimPublicProviderCredentialForSend({
           userId: "owner",

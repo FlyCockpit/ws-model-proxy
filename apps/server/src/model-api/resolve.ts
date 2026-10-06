@@ -429,7 +429,7 @@ const PROTECTION_SHARES = {
   fixed_percent: "FIXED_PERCENT",
 } as const;
 
-function poolPolicy(pool: {
+export function poolPolicy(pool: {
   id: string;
   userId: string;
   Fallback: {
