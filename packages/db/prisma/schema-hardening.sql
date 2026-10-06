@@ -10,11 +10,13 @@ BEGIN;
 -- never waits on a lock while holding one; a busy table fails the statement at once (55P03) and
 -- apply-schema-hardening.mjs retries the whole transaction. verify-schema-hardening.mjs fails
 -- when a table named anywhere in this file is missing here.
-LOCK TABLE "user", session, node, node_credential, node_enrollment_code, node_audit_event,
+LOCK TABLE "user", session, node, node_credential, node_enrollment_code, node_enrollment_use,
+  fabric, fabric_member, node_command, node_audit_event,
   queued_node_command, runtime, runtime_version, runtime_model, runtime_share, runtime_instance,
   instance_rank, instance_step, runtime_operation, execution_target, profile, profile_node,
   profile_item, pool, pool_routing, pool_fallback, pool_advanced, pool_sidecar, pool_member,
-  pool_routing_rule, api_key, api_key_pool, agent_token, share, provider_account, provider_model,
+  pool_routing_rule, api_key, api_key_pool, agent_token, share, share_invite, provider_account,
+  provider_model,
   provider_credential, provider_pricing_version, spend_cap, spend_reservation, spend_settlement,
   usage_ledger, attempt_event, runtime_load_minute, node_metrics_minute, audit_event,
   media_asset, capacity_scheduler, admission_request, capacity_waiter, capacity_lease,
@@ -161,12 +163,83 @@ ALTER TABLE node DROP CONSTRAINT IF EXISTS node_trust_lower_shape;
 ALTER TABLE node ADD CONSTRAINT node_trust_lower_shape CHECK (
   ("trustLowerRequestedAt" IS NULL) = ("trustLowerRequestedBy" IS NULL)
 );
-ALTER TABLE node DROP CONSTRAINT IF EXISTS node_frozen_peers_shape;
-ALTER TABLE node ADD CONSTRAINT node_frozen_peers_shape CHECK (
-  "frozenPeers" IS NULL
-  OR (trust = 'RELAY' AND jsonb_typeof("frozenPeers") = 'array'
-      AND jsonb_array_length("frozenPeers") <= 128)
+-- Fabrics (owner decision round 3): the frozen fabric memberships exist only at RELAY.
+ALTER TABLE node DROP CONSTRAINT IF EXISTS node_frozen_fabrics_shape;
+ALTER TABLE node ADD CONSTRAINT node_frozen_fabrics_shape CHECK (
+  ("frozenFabrics" IS NULL
+   OR (trust = 'RELAY' AND jsonb_typeof("frozenFabrics") = 'array'
+       AND jsonb_array_length("frozenFabrics") <= 32))
+  AND ("fabricsHash" IS NULL OR "fabricsHash" ~ '^[0-9a-f]{64}$')
+  AND ("heldFabricsHash" IS NULL OR "heldFabricsHash" ~ '^[0-9a-f]{64}$')
 );
+ALTER TABLE node DROP CONSTRAINT IF EXISTS node_command_max_check;
+ALTER TABLE node ADD CONSTRAINT node_command_max_check CHECK (
+  "commandMaxMs" BETWEEN 60000 AND 86400000
+);
+-- Node commands: running ⇔ not finished; an exit code only after the command ended; the
+-- identity and start never change, and a finished command stays finished.
+ALTER TABLE node_command DROP CONSTRAINT IF EXISTS node_command_shape;
+ALTER TABLE node_command ADD CONSTRAINT node_command_shape CHECK (
+  id ~ '^[A-Za-z0-9_-]{22}$'
+  AND length(subject) BETWEEN 1 AND 4096
+  AND (actor = 'AGENT') = ("agentTokenId" IS NOT NULL)
+  AND "endsBy" > "startedAt" AND "endsBy" <= "startedAt" + interval '24 hours'
+  AND (state = 'RUNNING') = ("finishedAt" IS NULL)
+  AND ("finishedAt" IS NULL OR "finishedAt" >= "startedAt")
+  AND ("exitCode" IS NULL OR ("exitCode" BETWEEN 0 AND 255 AND state IN ('SUCCEEDED', 'FAILED')))
+  AND (signal IS NULL OR signal ~ '^[A-Za-z0-9_+.-]{1,32}$')
+);
+CREATE OR REPLACE FUNCTION enforce_node_command_transition()
+RETURNS trigger LANGUAGE plpgsql AS $node_command_transition$
+BEGIN
+  IF (to_jsonb(NEW) - ARRAY['state', 'exitCode', 'signal', 'finishedAt', 'updatedAt']::text[])
+      IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['state', 'exitCode', 'signal', 'finishedAt', 'updatedAt']::text[]) THEN
+    RAISE EXCEPTION 'a node command keeps its identity' USING ERRCODE = '55000';
+  END IF;
+  IF OLD.state <> 'RUNNING' AND (NEW.state, NEW."exitCode", NEW.signal, NEW."finishedAt")
+      IS DISTINCT FROM (OLD.state, OLD."exitCode", OLD.signal, OLD."finishedAt") THEN
+    RAISE EXCEPTION 'a finished node command stays finished' USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END;
+$node_command_transition$;
+DROP TRIGGER IF EXISTS node_command_transition ON node_command;
+CREATE TRIGGER node_command_transition BEFORE UPDATE ON node_command
+FOR EACH ROW EXECUTE FUNCTION enforce_node_command_transition();
+
+-- Node hold: a note or a profile only on a held node.
+ALTER TABLE node DROP CONSTRAINT IF EXISTS node_hold_shape;
+ALTER TABLE node ADD CONSTRAINT node_hold_shape CHECK (
+  ("holdAt" IS NOT NULL OR ("holdNote" IS NULL AND "holdProfileId" IS NULL))
+  AND ("holdNote" IS NULL OR length("holdNote") BETWEEN 1 AND 500)
+);
+-- Temporary nodes: removed after 1 min .. 30 days offline (the sweeper deletes them like a
+-- manual delete).
+ALTER TABLE node DROP CONSTRAINT IF EXISTS node_temporary_shape;
+ALTER TABLE node ADD CONSTRAINT node_temporary_shape CHECK (
+  "removeAfterOfflineMs" IS NULL OR "removeAfterOfflineMs" BETWEEN 60000 AND 2592000000
+);
+
+-- An IP literal (v4 or v6, no prefix length), not the unspecified address.
+CREATE OR REPLACE FUNCTION wsmp_is_ip_literal(value TEXT)
+RETURNS BOOLEAN LANGUAGE plpgsql IMMUTABLE AS $wsmp_is_ip_literal$
+DECLARE
+  parsed inet;
+BEGIN
+  IF value IS NULL OR length(value) > 45 OR value ~ '/' THEN
+    RETURN false;
+  END IF;
+  parsed := value::inet;
+  RETURN host(parsed) = value AND parsed <> '0.0.0.0'::inet AND parsed <> '::'::inet;
+EXCEPTION WHEN invalid_text_representation THEN
+  RETURN false;
+END;
+$wsmp_is_ip_literal$;
+
+ALTER TABLE fabric DROP CONSTRAINT IF EXISTS fabric_shape;
+ALTER TABLE fabric ADD CONSTRAINT fabric_shape CHECK (name ~ '^[a-z][a-z0-9-]{0,62}$');
+ALTER TABLE fabric_member DROP CONSTRAINT IF EXISTS fabric_member_shape;
+ALTER TABLE fabric_member ADD CONSTRAINT fabric_member_shape CHECK (wsmp_is_ip_literal(ip));
 ALTER TABLE node DROP CONSTRAINT IF EXISTS node_metric_commands_shape;
 ALTER TABLE node ADD CONSTRAINT node_metric_commands_shape CHECK (
   jsonb_typeof("metricCommands") = 'array'
@@ -179,42 +252,55 @@ ALTER TABLE node ADD CONSTRAINT node_metric_commands_shape CHECK (
 CREATE UNIQUE INDEX IF NOT EXISTS node_credential_one_active
   ON node_credential ("nodeId") WHERE "revokedAt" IS NULL;
 
--- Not `usedAt ⇒ usedByNodeId`: deleting the node sets usedByNodeId null.
+-- Multi-use codes (owner decision round 3): 1..50 uses, at most 7 days, labels like node
+-- labels; a replace code is single-use and carries no labels.
 ALTER TABLE node_enrollment_code DROP CONSTRAINT IF EXISTS node_enrollment_code_shape;
 ALTER TABLE node_enrollment_code ADD CONSTRAINT node_enrollment_code_shape CHECK (
   "expiresAt" <= "createdAt" + interval '7 days'
   AND "expiresAt" > "createdAt"
   AND length("codePrefix") = 8
   AND "codeDigest" ~ '^[0-9a-f]{64}$'
-  AND ("usedByNodeId" IS NULL OR "usedAt" IS NOT NULL)
+  AND "maxUses" BETWEEN 1 AND 50
+  AND "usedCount" BETWEEN 0 AND "maxUses"
+  AND ("usedCount" = 0) = ("lastUsedAt" IS NULL)
+  AND cardinality(labels) <= 32
+  AND ("replaceNodeId" IS NULL OR ("maxUses" = 1 AND cardinality(labels) = 0))
+  AND ("suggestedSlug" IS NULL OR "maxUses" = 1)
+  AND ("removeAfterOfflineMs" IS NULL OR "removeAfterOfflineMs" BETWEEN 60000 AND 2592000000)
+  AND ("replaceNodeId" IS NULL OR "removeAfterOfflineMs" IS NULL)
 );
--- Single use, and a code only ever binds or replaces nodes of its owner.
+-- A code is created unused, takes one use per exchange (never while revoked or expired), and
+-- only ever binds or replaces nodes of its owner. Everything but the use counter and the
+-- revocation is immutable.
 CREATE OR REPLACE FUNCTION enforce_node_enrollment_code_use()
 RETURNS trigger LANGUAGE plpgsql AS $node_enrollment_code_use$
 BEGIN
-  IF NEW."replaceNodeId" IS NOT NULL
-     AND (TG_OP = 'INSERT' OR NEW."replaceNodeId" IS DISTINCT FROM OLD."replaceNodeId")
-     AND NOT EXISTS (SELECT 1 FROM node WHERE id = NEW."replaceNodeId" AND "userId" = NEW."userId") THEN
-    RAISE EXCEPTION 'a replace code names a node of its owner' USING ERRCODE = '23514';
-  END IF;
   IF TG_OP = 'INSERT' THEN
-    IF NEW."usedAt" IS NOT NULL OR NEW."usedByNodeId" IS NOT NULL THEN
+    IF NEW."usedCount" <> 0 OR NEW."revokedAt" IS NOT NULL THEN
       RAISE EXCEPTION 'an enrollment code is created unused' USING ERRCODE = '23514';
+    END IF;
+    IF NEW."replaceNodeId" IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM node WHERE id = NEW."replaceNodeId" AND "userId" = NEW."userId") THEN
+      RAISE EXCEPTION 'a replace code names a node of its owner' USING ERRCODE = '23514';
     END IF;
     RETURN NEW;
   END IF;
-  IF OLD."usedAt" IS NOT NULL THEN
-    IF NEW."usedAt" IS DISTINCT FROM OLD."usedAt"
-       OR (NEW."usedByNodeId" IS NOT NULL AND NEW."usedByNodeId" IS DISTINCT FROM OLD."usedByNodeId") THEN
-      RAISE EXCEPTION 'an enrollment code is used once' USING ERRCODE = '55000';
+  IF (to_jsonb(NEW) - ARRAY['usedCount', 'lastUsedAt', 'revokedAt', 'replaceNodeId']::text[])
+      IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['usedCount', 'lastUsedAt', 'revokedAt', 'replaceNodeId']::text[])
+     -- deleting the replaced node nulls replaceNodeId (ON DELETE CASCADE removes the code)
+     OR (NEW."replaceNodeId" IS NOT NULL AND NEW."replaceNodeId" IS DISTINCT FROM OLD."replaceNodeId") THEN
+    RAISE EXCEPTION 'an enrollment code is immutable' USING ERRCODE = '55000';
+  END IF;
+  IF OLD."revokedAt" IS NOT NULL AND NEW."revokedAt" IS DISTINCT FROM OLD."revokedAt" THEN
+    RAISE EXCEPTION 'a revoked enrollment code stays revoked' USING ERRCODE = '55000';
+  END IF;
+  IF NEW."usedCount" <> OLD."usedCount" THEN
+    IF NEW."usedCount" <> OLD."usedCount" + 1 THEN
+      RAISE EXCEPTION 'an enrollment code is used one exchange at a time' USING ERRCODE = '55000';
     END IF;
-  ELSIF NEW."usedAt" IS NOT NULL THEN
-    IF NEW."usedByNodeId" IS NULL
-       OR NOT EXISTS (SELECT 1 FROM node WHERE id = NEW."usedByNodeId" AND "userId" = NEW."userId") THEN
-      RAISE EXCEPTION 'a used enrollment code names a node of its owner' USING ERRCODE = '23514';
+    IF OLD."revokedAt" IS NOT NULL OR OLD."expiresAt" <= now() THEN
+      RAISE EXCEPTION 'a revoked or expired enrollment code is not used' USING ERRCODE = '55000';
     END IF;
-  ELSIF NEW."usedByNodeId" IS NOT NULL THEN
-    RAISE EXCEPTION 'usedByNodeId is set with usedAt' USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
 END;
@@ -222,6 +308,29 @@ $node_enrollment_code_use$;
 DROP TRIGGER IF EXISTS node_enrollment_code_use ON node_enrollment_code;
 CREATE TRIGGER node_enrollment_code_use BEFORE INSERT OR UPDATE ON node_enrollment_code
 FOR EACH ROW EXECUTE FUNCTION enforce_node_enrollment_code_use();
+
+-- A use names a code and a node of the same owner; uses are append-only (the node FK may
+-- still null nodeId when the node is deleted).
+CREATE OR REPLACE FUNCTION enforce_node_enrollment_use_shape()
+RETURNS trigger LANGUAGE plpgsql AS $node_enrollment_use_shape$
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    IF NEW."nodeId" IS NULL AND (to_jsonb(NEW) - 'nodeId') = (to_jsonb(OLD) - 'nodeId') THEN
+      RETURN NEW;
+    END IF;
+    RAISE EXCEPTION 'node_enrollment_use is append-only' USING ERRCODE = '55000';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM node_enrollment_code WHERE id = NEW."codeId" AND "userId" = NEW."userId")
+     OR (NEW."nodeId" IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM node WHERE id = NEW."nodeId" AND "userId" = NEW."userId")) THEN
+    RAISE EXCEPTION 'an enrollment use names a code and a node of one owner' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$node_enrollment_use_shape$;
+DROP TRIGGER IF EXISTS node_enrollment_use_shape ON node_enrollment_use;
+CREATE TRIGGER node_enrollment_use_shape BEFORE INSERT OR UPDATE ON node_enrollment_use
+FOR EACH ROW EXECUTE FUNCTION enforce_node_enrollment_use_shape();
 
 -- Deleting a node (spec §3.4/§3.5, item 20): refused with a clear reason while a profile pins
 -- one of its always-on runtimes; otherwise every reservation there is released (proof is
@@ -318,9 +427,12 @@ ALTER TABLE runtime ADD CONSTRAINT runtime_kind_shape_check CHECK (
 ALTER TABLE runtime_version DROP CONSTRAINT IF EXISTS runtime_version_derived_columns;
 ALTER TABLE runtime_version ADD CONSTRAINT runtime_version_derived_columns CHECK (
   jsonb_typeof(spec) = 'object'
-  AND api::text = upper(spec ->> 'api')
-  AND engine::text = upper(spec ->> 'engine')
-  AND "modelType"::text = upper(spec ->> 'modelType')
+  AND api::text IS NOT DISTINCT FROM upper(spec ->> 'api')
+  AND engine::text IS NOT DISTINCT FROM upper(spec ->> 'engine')
+  AND "modelType"::text IS NOT DISTINCT FROM upper(spec ->> 'modelType')
+  -- a service (no api/engine/modelType/models) is startable; a served runtime has all three
+  AND ((api IS NULL) = (engine IS NULL) AND (api IS NULL) = ("modelType" IS NULL))
+  AND (api IS NOT NULL OR (spec ? 'launch' AND NOT spec ? 'models'))
   AND (spec ? 'launch') <> (spec ? 'address')
   AND "launchHash" ~ '^[0-9a-f]{64}$'
   AND "contentHash" ~ '^[0-9a-f]{64}$'
@@ -581,6 +693,11 @@ DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION enforce_profile_owne
 DROP TRIGGER IF EXISTS profile_owner_consistency ON profile_item;
 CREATE CONSTRAINT TRIGGER profile_owner_consistency AFTER INSERT OR UPDATE ON profile_item
 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION enforce_profile_owner_consistency();
+
+ALTER TABLE profile_node DROP CONSTRAINT IF EXISTS profile_node_hold_shape;
+ALTER TABLE profile_node ADD CONSTRAINT profile_node_hold_shape CHECK (
+  (hold OR "holdNote" IS NULL) AND ("holdNote" IS NULL OR length("holdNote") BETWEEN 1 AND 500)
+);
 
 -- ═══════════════════════════════ pools ═══════════════════════════════
 
@@ -846,6 +963,49 @@ $api_key_pool_access$;
 DROP TRIGGER IF EXISTS api_key_pool_access ON api_key_pool;
 CREATE TRIGGER api_key_pool_access BEFORE INSERT OR UPDATE ON api_key_pool
 FOR EACH ROW EXECUTE FUNCTION enforce_api_key_pool_access();
+
+-- Share invites (owner decision round 3): an e-mail without an account yet. The invite keeps
+-- the share's settings; acceptance (sign-up with that e-mail) creates the share and records it.
+ALTER TABLE share_invite DROP CONSTRAINT IF EXISTS share_invite_shape;
+ALTER TABLE share_invite ADD CONSTRAINT share_invite_shape CHECK (
+  email = lower(btrim(email)) AND length(email) BETWEEN 3 AND 320 AND position('@' in email) > 1
+  AND "tokenDigest" ~ '^[0-9a-f]{64}$'
+  AND ("canUse" OR "canContribute")
+  AND "expiresAt" > "createdAt" AND "expiresAt" <= "createdAt" + interval '30 days'
+  AND NOT ("acceptedAt" IS NOT NULL AND "revokedAt" IS NOT NULL)
+  AND ("shareId" IS NULL OR "acceptedAt" IS NOT NULL)
+);
+CREATE OR REPLACE FUNCTION enforce_share_invite_transition()
+RETURNS trigger LANGUAGE plpgsql AS $share_invite_transition$
+BEGIN
+  IF (to_jsonb(NEW) - ARRAY['updatedAt', 'emailSentAt', 'acceptedAt', 'shareId', 'revokedAt',
+                             'canUse', 'canContribute', 'priorityClass']::text[])
+      IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['updatedAt', 'emailSentAt', 'acceptedAt', 'shareId',
+                             'revokedAt', 'canUse', 'canContribute', 'priorityClass']::text[]) THEN
+    RAISE EXCEPTION 'a share invite keeps its pool, e-mail and token' USING ERRCODE = '55000';
+  END IF;
+  IF (OLD."acceptedAt" IS NOT NULL OR OLD."revokedAt" IS NOT NULL)
+     AND (NEW."acceptedAt" IS DISTINCT FROM OLD."acceptedAt"
+          OR NEW."revokedAt" IS DISTINCT FROM OLD."revokedAt"
+          OR NEW."canUse" IS DISTINCT FROM OLD."canUse"
+          OR NEW."canContribute" IS DISTINCT FROM OLD."canContribute"
+          OR NEW."priorityClass" IS DISTINCT FROM OLD."priorityClass"
+          OR (NEW."shareId" IS NOT NULL AND NEW."shareId" IS DISTINCT FROM OLD."shareId")) THEN
+    RAISE EXCEPTION 'an accepted or revoked share invite is final' USING ERRCODE = '55000';
+  END IF;
+  IF NEW."acceptedAt" IS NOT NULL AND OLD."acceptedAt" IS NULL
+     AND (NEW."shareId" IS NULL
+          OR NOT EXISTS (SELECT 1 FROM share s JOIN "user" u ON u.id = s."granteeUserId"
+                          WHERE s.id = NEW."shareId" AND s."poolId" = NEW."poolId"
+                            AND lower(u.email) = NEW.email)) THEN
+    RAISE EXCEPTION 'an accepted invite names the share of its pool and e-mail' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$share_invite_transition$;
+DROP TRIGGER IF EXISTS share_invite_transition ON share_invite;
+CREATE TRIGGER share_invite_transition BEFORE UPDATE ON share_invite
+FOR EACH ROW EXECUTE FUNCTION enforce_share_invite_transition();
 
 -- ═══════════════════════════════ providers ═══════════════════════════════
 
@@ -2032,6 +2192,7 @@ BEGIN
       (SELECT "userId" FROM api_key WHERE id = row_data ->> 'apiKeyId'),
       (SELECT "userId" FROM pool WHERE id = row_data ->> 'poolId')]
     WHEN 'share' THEN ARRAY[row_data ->> 'ownerUserId', row_data ->> 'granteeUserId']
+    WHEN 'share_invite' THEN ARRAY[row_data ->> 'ownerUserId']
     WHEN 'runtime_share' THEN ARRAY[row_data ->> 'ownerUserId', row_data ->> 'granteeUserId']
     ELSE ARRAY[row_data ->> 'userId']
   END;
@@ -2142,6 +2303,8 @@ BEGIN
   FOR spec IN SELECT * FROM (VALUES
     ('user', '', ''),
     ('node', 'id,userId,slug', ''),
+    ('fabric', 'id,userId,name', ''),
+    ('fabric_member', 'id,userId,fabricId,nodeId,ip', ''),
     ('runtime', 'id,userId,slug,kind,nodeId', 'currentVersionId'),
     ('runtime_version', 'id,runtimeId,version', ''),
     ('runtime_model', 'id,userId,runtimeId,upstreamModelId,type', ''),
@@ -2164,6 +2327,7 @@ BEGIN
     ('api_key', 'id,userId,lookupPrefix,secretDigest,scope', ''),
     ('api_key_pool', 'apiKeyId,poolId', ''),
     ('share', 'id,poolId,ownerUserId,granteeUserId', 'priorityClass,canUse,canContribute'),
+    ('share_invite', 'id,poolId,ownerUserId,email,tokenDigest,shareId', ''),
     ('provider_account', 'id,userId,currentCredentialId', ''),
     ('provider_model', 'id,userId,providerAccountId,upstreamModelId', ''),
     ('provider_credential', 'id,userId,providerAccountId,replacedById', ''),

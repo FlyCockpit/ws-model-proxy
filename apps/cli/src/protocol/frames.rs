@@ -16,7 +16,8 @@ use serde_json::Value;
 
 use super::canonical::canonical_json;
 use super::runtime_spec::{
-    DeclaredHardware, EmbeddingContract, Engine, ModelCapability, NODE_METRIC_COMMANDS_MAX_BYTES,
+    DeclaredHardware, EmbeddingContract, Engine, FABRIC_MEMBERS_MAX, ModelCapability,
+    NODE_FABRICS_MAX, NODE_METRIC_COMMANDS_MAX_BYTES,
     NodeFeatures, NodeMetricCommand, RUNTIME_SPEC_MAX_BYTES, ReaderSignal, RuntimeApi, RuntimeKind,
     RuntimeSpec, TranscriptionProfile,
 };
@@ -82,16 +83,6 @@ pub struct TrustState {
     pub value: TrustValue,
     /// True exactly at relay: held definitions and metric commands are frozen.
     pub frozen: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frozen_peers: Option<Vec<FrozenPeerSet>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct FrozenPeerSet {
-    pub runtime_id: String,
-    /// The head IP literal this node last joined for that runtime.
-    pub head_addr: String,
 }
 
 /// One held server-origin definition VERSION: a node keeps every version the
@@ -336,6 +327,9 @@ pub struct NodeInterfaceInfo {
     pub link_speed_mbps: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u32>,
+    /// An RDMA device is bound to this interface (fabric suggestions only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdma: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -617,6 +611,182 @@ pub struct NodeDefinition {
     /// `[start, end]` for the §4.6 port check; frozen at Relay only.
     pub port_range: [u16; 2],
     pub metric_commands: MetricCommandsPush,
+    /// The fabrics this node is in; frozen with the rest at Relay only.
+    pub fabrics: FabricsPush,
+    /// The longest lifetime of one node command.
+    pub command_max_ms: u64,
+}
+
+/// Node command limits (owner decision round 3).
+pub const NODE_COMMAND_MAX_MS: u64 = 86_400_000;
+pub const NODE_COMMAND_MIN_MS: u64 = 60_000;
+pub const NODE_COMMAND_TAIL_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecState {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
+    Interrupted,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecStatus {
+    pub command_id: String,
+    pub state: ExecState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ends_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    /// End of the masked combined output ring buffer (at most 64 KiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_bytes: Option<u64>,
+}
+
+impl ExecStatus {
+    pub fn validate(&self) -> Result<(), FrameRuleError> {
+        rule(
+            (self.state == ExecState::Running) == self.finished_at.is_none(),
+            "finishedAt exactly once the command ended",
+        )?;
+        rule(
+            self.exit_code.is_none()
+                || matches!(self.state, ExecState::Succeeded | ExecState::Failed),
+            "an exit code only for succeeded or failed commands",
+        )?;
+        rule(
+            self.tail
+                .as_ref()
+                .is_none_or(|tail| tail.len() <= NODE_COMMAND_TAIL_MAX_BYTES),
+            "a command output tail is at most 64 KiB",
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FabricsPush {
+    /// sha256 of the canonical `sets` array.
+    pub hash: String,
+    pub sets: Vec<FabricSet>,
+}
+
+/// One fabric this node is in: its own IP and every member's IP (sorted,
+/// including `self_ip`). A multi-node job names the fabric by `fabric_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FabricSet {
+    pub fabric_id: String,
+    pub name: String,
+    pub self_ip: String,
+    pub member_ips: Vec<String>,
+}
+
+/// UTF-8 bytes of one secret value.
+pub const NODE_SECRET_VALUE_MAX_BYTES: usize = 16 * 1024;
+
+/// `secret.set`. `Debug` never prints the value.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecretSet {
+    pub id: String,
+    pub name: String,
+    pub value: String,
+}
+
+impl std::fmt::Debug for SecretSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretSet")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("value", &"[redacted]")
+            .finish()
+    }
+}
+
+impl SecretSet {
+    pub fn validate(&self) -> Result<(), FrameRuleError> {
+        rule(is_secret_name(&self.name), "node secrets are named WSMP_SECRET_*")?;
+        rule(
+            !self.value.is_empty() && self.value.len() <= NODE_SECRET_VALUE_MAX_BYTES,
+            "a secret value is 1 byte to 16 KiB",
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretStatus {
+    Set,
+    Deleted,
+    NotFound,
+    Refused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretRefusal {
+    TrustRelay,
+    Invalid,
+    StoreFailed,
+    Limit,
+}
+
+/// A node secret name: `WSMP_SECRET_` and 1 to 64 of `A-Z0-9_`.
+pub fn is_secret_name(name: &str) -> bool {
+    name.strip_prefix("WSMP_SECRET_").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest.len() <= 64
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    })
+}
+
+/// An IP literal (v4 or v6), never the unspecified address.
+pub fn is_fabric_ip(value: &str) -> bool {
+    value
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| !ip.is_unspecified())
+}
+
+impl FabricsPush {
+    pub fn validate(&self) -> Result<(), FrameRuleError> {
+        rule(
+            self.sets.len() <= NODE_FABRICS_MAX,
+            "a node is in at most 16 fabrics",
+        )?;
+        for set in &self.sets {
+            rule(
+                is_fabric_ip(&set.self_ip) && set.member_ips.iter().all(|ip| is_fabric_ip(ip)),
+                "fabric addresses are IP literals",
+            )?;
+            rule(
+                !set.member_ips.is_empty() && set.member_ips.len() <= FABRIC_MEMBERS_MAX,
+                "a fabric has 1 to 64 members",
+            )?;
+            rule(
+                set.member_ips.contains(&set.self_ip),
+                "memberIps includes selfIp",
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -701,8 +871,6 @@ pub struct JobPlaceholders {
     pub vram_gb: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_fraction: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub iface: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -738,6 +906,10 @@ pub struct RuntimeJob {
     pub handle: String,
     pub unit_name: String,
     pub placeholders: JobPlaceholders,
+    /// Multi-node only: the fabric the instance runs in. The node resolves
+    /// `fabric_ip`, `fabric_iface` and `fabric_rdma_device` from its own IP on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fabric_id: Option<String>,
     pub timeout_ms: u64,
     pub owner_epoch: String,
     pub intent_hash: String,
@@ -925,7 +1097,7 @@ pub enum HttpMethod {
     Post,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SttConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -956,6 +1128,7 @@ pub enum NodeFrame {
         definitions: Vec<HeldDefinition>,
         held_metric_commands_hash: Option<String>,
         held_port_range: Option<[u16; 2]>,
+        held_fabrics_hash: Option<String>,
     },
     #[serde(rename = "heartbeat")]
     Heartbeat {
@@ -1023,8 +1196,25 @@ pub enum NodeFrame {
             with = "double_option"
         )]
         held_port_range: Option<Option<[u16; 2]>>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "double_option"
+        )]
+        held_fabrics_hash: Option<Option<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         frozen: Option<bool>,
+    },
+    /// Answers `secret.set` / `secret.delete` with the name only.
+    #[serde(rename = "secret.result")]
+    SecretResult {
+        id: String,
+        name: String,
+        status: SecretStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<SecretRefusal>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updated_at: Option<String>,
     },
     #[serde(rename = "runtime.detected")]
     RuntimeDetected {
@@ -1130,18 +1320,18 @@ pub enum NodeFrame {
         signal: Option<String>,
     },
     #[serde(rename = "exec.started")]
-    ExecStarted { command_id: String },
+    ExecStarted {
+        command_id: String,
+        started_at: String,
+        /// started_at + min(timeout_ms, the node's command_max_ms).
+        ends_by: String,
+    },
     #[serde(rename = "exec.rejected")]
     ExecRejected { command_id: String, reason: String },
-    #[serde(rename = "exec.done")]
-    ExecDone {
-        command_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        exit_code: Option<u8>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        signal: Option<String>,
-        timed_out: bool,
-    },
+    /// A command's state: unprompted when it ends, in answer to `exec.poll`,
+    /// and after a reconnect for commands a daemon restart interrupted.
+    #[serde(rename = "exec.status")]
+    ExecStatus(ExecStatus),
     /// The result body is checked per op by the server (`file-protocol.ts`).
     #[serde(rename = "file.result")]
     FileResult {
@@ -1207,6 +1397,12 @@ pub enum ServerFrame {
     /// A person lowered trust in the browser. There is no frame that raises it.
     #[serde(rename = "trust.lower")]
     TrustLower { id: String, requested_at: String },
+    /// Full control only (Relay only refuses with `trust_relay`). The value is
+    /// stored 0600 on the node and never logged; `Debug` redacts it.
+    #[serde(rename = "secret.set")]
+    SecretSet(SecretSet),
+    #[serde(rename = "secret.delete")]
+    SecretDelete { id: String, name: String },
     #[serde(rename = "runtime.define")]
     /// One byte-bounded chunk of a define operation; applied after `final`.
     RuntimeDefine {
@@ -1301,7 +1497,12 @@ pub enum ServerFrame {
         command: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+        /// Capped by the node's `command_max_ms`; the node kills the whole
+        /// process tree at the end, on cancel and on daemon shutdown.
+        timeout_ms: u64,
     },
+    #[serde(rename = "exec.poll")]
+    ExecPoll { command_id: String, tail_bytes: u32 },
     #[serde(rename = "exec.cancel")]
     ExecCancel { command_id: String },
     /// 2.4 `file.op` without `mode`/`readGrant`; `args` are checked per op by
@@ -1389,10 +1590,6 @@ pub enum NodeBinaryMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         epoch: Option<u32>,
     },
-    #[serde(rename = "exec.stdout")]
-    ExecStdout { command_id: String, seq: u64 },
-    #[serde(rename = "exec.stderr")]
-    ExecStderr { command_id: String, seq: u64 },
     #[serde(rename = "file.data")]
     FileData { op_id: String },
 }
@@ -1444,10 +1641,6 @@ impl TrustState {
         rule(
             self.frozen == (self.value == TrustValue::Relay),
             "frozen is true exactly at relay",
-        )?;
-        rule(
-            self.value == TrustValue::Relay || self.frozen_peers.is_none(),
-            "only a relay node reports frozen peers",
         )
     }
 }
@@ -1464,6 +1657,27 @@ fn encoded_len<T: Serialize>(value: &T) -> usize {
 impl DefinitionEnvelope {
     pub fn validate(&self) -> Result<(), FrameRuleError> {
         rule(self.spec.kind() == self.kind, "kind must match the spec")?;
+        let secrets = self
+            .spec
+            .launch
+            .iter()
+            .flat_map(|launch| launch.secrets.iter().flatten());
+        let auth = self
+            .spec
+            .address
+            .iter()
+            .flat_map(|address| {
+                address.auth.iter().map(|auth| &auth.env).chain(
+                    address
+                        .headers
+                        .iter()
+                        .flat_map(|headers| headers.iter().map(|header| &header.env)),
+                )
+            });
+        rule(
+            secrets.chain(auth).all(|name| is_secret_name(name)),
+            "node secrets are named WSMP_SECRET_*",
+        )?;
         rule(
             canonical_len(&self.spec).is_some_and(|len| len <= RUNTIME_SPEC_MAX_BYTES),
             "a runtime definition is at most 48 KiB as canonical JSON",
@@ -1474,6 +1688,11 @@ impl DefinitionEnvelope {
 impl RuntimeJob {
     pub fn validate(&self) -> Result<(), FrameRuleError> {
         rule(self.rank < self.nnodes, "rank must be below nnodes")?;
+        rule(
+            (self.nnodes > 1) == self.fabric_id.is_some()
+                && (self.nnodes > 1) == self.placeholders.head_addr.is_some(),
+            "fabricId and head_addr exactly for multi-node jobs",
+        )?;
         rule(
             self.unit_name == runtime_unit_name(&self.handle, self.rank),
             "unitName must be wsmp-<handle>-r<rank>",
@@ -1486,6 +1705,19 @@ impl NodeFrame {
     pub fn validate(&self) -> Result<(), FrameRuleError> {
         match self {
             Self::Hello { trust, .. } | Self::NodeState { trust, .. } => trust.validate(),
+            Self::ExecStatus(status) => status.validate(),
+            Self::SecretResult {
+                name,
+                status,
+                reason,
+                ..
+            } => {
+                rule(is_secret_name(name), "node secrets are named WSMP_SECRET_*")?;
+                rule(
+                    (*status == SecretStatus::Refused) == reason.is_some(),
+                    "reason exactly for refused results",
+                )
+            }
             Self::RuntimeJobResult {
                 status,
                 error,
@@ -1511,6 +1743,7 @@ impl NodeFrame {
                 held,
                 held_metric_commands_hash,
                 held_port_range,
+                held_fabrics_hash,
                 frozen,
                 ..
             } => {
@@ -1519,6 +1752,7 @@ impl NodeFrame {
                         held.is_some(),
                         held_metric_commands_hash.is_some(),
                         held_port_range.is_some(),
+                        held_fabrics_hash.is_some(),
                         frozen.is_some(),
                     ]
                     .iter()
@@ -1547,6 +1781,18 @@ impl ServerFrame {
     pub fn validate(&self) -> Result<(), FrameRuleError> {
         match self {
             Self::RuntimeJob(job) => job.validate(),
+            Self::SecretSet(secret) => secret.validate(),
+            Self::ExecStart { timeout_ms, .. } => rule(
+                (1_000..=NODE_COMMAND_MAX_MS).contains(timeout_ms),
+                "a command lifetime is 1 s to 24 h",
+            ),
+            Self::ExecPoll { tail_bytes, .. } => rule(
+                (*tail_bytes as usize) <= NODE_COMMAND_TAIL_MAX_BYTES,
+                "a poll asks for at most 64 KiB of tail",
+            ),
+            Self::SecretDelete { name, .. } => {
+                rule(is_secret_name(name), "node secrets are named WSMP_SECRET_*")
+            }
             Self::RuntimeDefine {
                 put,
                 keep,
@@ -1567,6 +1813,11 @@ impl ServerFrame {
                         canonical_len(&node.metric_commands.commands)
                             .is_some_and(|len| len <= NODE_METRIC_COMMANDS_MAX_BYTES),
                         "node metric commands are at most 32 KiB together",
+                    )?;
+                    node.fabrics.validate()?;
+                    rule(
+                        (NODE_COMMAND_MIN_MS..=NODE_COMMAND_MAX_MS).contains(&node.command_max_ms),
+                        "commandMaxMs is 1 min to 24 h",
                     )?;
                 }
                 let complete = complete.unwrap_or(false);
@@ -1689,6 +1940,41 @@ mod tests {
     #[test]
     fn server_frames_round_trip() {
         round_trip::<ServerFrame>("frames/server-to-node");
+    }
+
+    #[test]
+    fn secret_values_never_reach_debug_output() {
+        let frames = round_trip::<ServerFrame>("frames/server-to-node");
+        let (_, frame) = frames
+            .iter()
+            .find(|(name, _)| name == "secret.set.json")
+            .expect("secret.set fixture");
+        let ServerFrame::SecretSet(secret) = frame else {
+            panic!("secret.set parses as SecretSet");
+        };
+        let printed = format!("{frame:?}");
+        assert!(!printed.contains(&secret.value), "{printed}");
+        assert!(printed.contains("[redacted]"));
+    }
+
+    #[test]
+    fn fabric_sets_hash_as_sent() {
+        let frames = round_trip::<ServerFrame>("frames/server-to-node");
+        let (_, frame) = frames
+            .iter()
+            .find(|(name, _)| name == "runtime.define.json")
+            .expect("runtime.define fixture");
+        let ServerFrame::RuntimeDefine {
+            node: Some(node), ..
+        } = frame
+        else {
+            panic!("runtime.define carries the node part");
+        };
+        let sets = serde_json::to_value(&node.fabrics.sets).expect("serializes");
+        assert_eq!(
+            canonical_sha256(&sets).expect("canonical"),
+            node.fabrics.hash
+        );
     }
 
     #[test]

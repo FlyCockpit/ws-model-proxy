@@ -1,5 +1,5 @@
 {
-  "type": "exec.stdout",
+  "type": "exec.poll",
   "commandId": "UnecweYLMFV6n8TpDjNYfQ",
-  "seq": 0
+  "tailBytes": 4096
 }

@@ -126,9 +126,10 @@ model RuntimeVersion {
   /// One-line change note (agents should say what they are trying).
   note             String?
   spec             Json
-  api              RuntimeApi
-  engine           Engine
-  modelType        ModelType
+  /// Null exactly for a service (startable, no models, never proxied; owner decision round 3).
+  api              RuntimeApi?
+  engine           Engine?
+  modelType        ModelType?
   // ── physical limits (per instance) ──
   concurrencyLimit Int?
   contextLimit     Int?

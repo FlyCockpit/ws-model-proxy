@@ -1,8 +1,17 @@
 import { z } from "zod";
 import {
   declaredHardwareSchema,
+  fabricNameSchema,
+  NODE_COMMAND_DEFAULT_TIMEOUT_MS,
+  NODE_COMMAND_GET_WAIT_MAX_MS,
+  NODE_COMMAND_MAX_MS,
+  NODE_COMMAND_MIN_MS,
+  NODE_SECRET_VALUE_MAX_BYTES,
+  NODE_SECRETS_MAX,
+  nodeFabricMembershipsSchema,
   nodeFeaturesSchema,
   nodeMetricCommandsSchema,
+  nodeSecretNameSchema,
   portRangeSchema,
   runtimeLabelsSchema,
 } from "../lib/runtime-spec";
@@ -16,6 +25,7 @@ import {
   isoDateSchema,
   NODE_AUDIT_KIND,
   NODE_AUDIT_OUTCOME,
+  NODE_COMMAND_STATE,
   NODE_CONNECTION,
   NODE_TRUST,
   nameSchema,
@@ -106,6 +116,16 @@ export const queuedCommandViewSchema = z
   })
   .strict();
 
+/** A person's hold on a node (owner decision round 3): nothing is placed there. */
+export const nodeHoldSchema = z
+  .object({
+    at: isoDateSchema,
+    note: z.string().nullable(),
+    /** Set by applying this profile (a "hold node" line); null: a person set it here. */
+    profileId: idSchema.nullable(),
+  })
+  .strict();
+
 export const nodeSummarySchema = z
   .object({
     id: idSchema,
@@ -122,6 +142,19 @@ export const nodeSummarySchema = z
     runningInstances: z.number().int(),
     alwaysOnRuntimes: z.number().int(),
     needsYou: z.number().int(),
+    hold: nodeHoldSchema.nullable(),
+    /** Temporary node: deleted after being offline this long. */
+    removeAfterOfflineMs: z.number().int().nullable(),
+  })
+  .strict();
+
+export const nodeFabricViewSchema = z
+  .object({
+    fabricId: idSchema,
+    name: z.string(),
+    ip: z.string(),
+    /** Other nodes in this fabric. */
+    peers: z.array(z.object({ nodeId: idSchema, slug: z.string(), ip: z.string() }).strict()),
   })
   .strict();
 
@@ -149,6 +182,23 @@ export const nodeDetailSchema = nodeSummarySchema
     metricCommands: nodeMetricCommandsSchema,
     /** True when the node holds what the server last pushed. */
     metricCommandsInSync: z.boolean(),
+    fabrics: z.array(nodeFabricViewSchema),
+    fabricsInSync: z.boolean(),
+    /** From node.info: addresses that look like a fast link (only suggestions). */
+    fabricSuggestions: z.array(
+      z
+        .object({
+          ip: z.string(),
+          linkSpeedMbps: z.number().int().nullable(),
+          rdma: z.boolean(),
+          /** Nodes with an address in the same subnet. */
+          peerNodeIds: z.array(idSchema),
+        })
+        .strict(),
+    ),
+    commandMaxMs: z.number().int(),
+    /** Names and when they were set; values never leave the node. */
+    secrets: z.array(z.object({ name: z.string(), updatedAt: isoDateSchema }).strict()),
     heldDefinitions: z.array(
       z
         .object({
@@ -193,9 +243,35 @@ export const enrollmentCodeViewSchema = z
     expiresAt: isoDateSchema,
     suggestedSlug: nodeSlugSchema.nullable(),
     replaceNodeId: idSchema.nullable(),
-    usedAt: isoDateSchema.nullable(),
-    usedByNodeId: idSchema.nullable(),
+    maxUses: z.number().int().min(1).max(50),
+    usedCount: z.number().int().min(0),
+    lastUsedAt: isoDateSchema.nullable(),
+    labels: z.array(z.string()),
+    removeAfterOfflineMs: z.number().int().nullable(),
+    /** Nodes enrolled with this code (null: deleted since). */
+    enrolled: z.array(
+      z
+        .object({ nodeId: idSchema.nullable(), slug: z.string().nullable(), usedAt: isoDateSchema })
+        .strict(),
+    ),
     revokedAt: isoDateSchema.nullable(),
+  })
+  .strict();
+
+/** 1 min .. 30 days offline before a temporary node is deleted. */
+const removeAfterOfflineMsSchema = z.number().int().min(60_000).max(2_592_000_000);
+
+export const nodeCommandViewSchema = z
+  .object({
+    commandId: z.string(),
+    state: z.enum(NODE_COMMAND_STATE),
+    exitCode: z.number().int().optional(),
+    /** Masked end of the output; null when the node is offline. */
+    output: z.string().nullable(),
+    truncated: z.boolean().optional(),
+    startedAt: isoDateSchema,
+    endsBy: isoDateSchema,
+    finishedAt: isoDateSchema.optional(),
   })
   .strict();
 
@@ -309,15 +385,91 @@ export const nodesContract = {
         /** Replaces the browser/agent declaration; null clears it. */
         hardware: declaredHardwareSchema.nullable().optional(),
         metricCommands: nodeMetricCommandsSchema.optional(),
+        /** Replaces this node's fabric memberships (a new name creates the fabric). */
+        fabrics: nodeFabricMembershipsSchema.optional(),
+        commandMaxMs: z.number().int().min(NODE_COMMAND_MIN_MS).max(NODE_COMMAND_MAX_MS).optional(),
+        /** Write-only: values travel to the node and are never stored or shown. */
+        secrets: z
+          .object({
+            set: z
+              .array(
+                z
+                  .object({
+                    name: nodeSecretNameSchema,
+                    value: z
+                      .string()
+                      .min(1)
+                      .refine(
+                        (value) =>
+                          new TextEncoder().encode(value).byteLength <= NODE_SECRET_VALUE_MAX_BYTES,
+                        "At most 16 KiB.",
+                      ),
+                  })
+                  .strict(),
+              )
+              .max(NODE_SECRETS_MAX)
+              .optional(),
+            delete: z.array(nodeSecretNameSchema).max(NODE_SECRETS_MAX).optional(),
+          })
+          .strict()
+          .optional(),
         /** Ask the node to scan for local servers now. */
         rescan: z.boolean().optional(),
         note: noteSchema.optional(),
       })
       .strict(),
     nodeDetailSchema,
-    "Labels, port range, declared hardware, metric commands, rescan. Agents: Full-control nodes only (trust_relay).",
+    "Labels, port range, declared hardware, metric commands, fabrics, command lifetime, secrets (write-only), rescan. Full-control nodes only for everyone (trust_relay); secrets of a Relay-only node are set with `wsmp secret set` on it (secret_needs_node).",
     ["node_update"],
   ),
+  setHold: mutation(
+    "human",
+    z.object({ nodeId: idSchema, hold: z.boolean(), note: noteSchema.optional() }).strict(),
+    nodeSummarySchema,
+    "Hold the node (nothing may be placed there, for anyone) or release it. Holding does not stop what runs; apply a profile with a hold line to switch the node over.",
+  ),
+  setTemporary: mutation(
+    "human",
+    z
+      .object({ nodeId: idSchema, removeAfterOfflineMs: removeAfterOfflineMsSchema.nullable() })
+      .strict(),
+    nodeSummarySchema,
+    "Make a node temporary (deleted, releasing everything, after being offline this long) or keep it (null). People only: a deletion policy.",
+  ),
+  fabrics: {
+    list: query(
+      "session",
+      z.object({}).strict(),
+      z
+        .object({
+          fabrics: z.array(
+            z
+              .object({
+                id: idSchema,
+                name: z.string(),
+                members: z.array(
+                  z.object({ nodeId: idSchema, slug: z.string(), ip: z.string() }).strict(),
+                ),
+              })
+              .strict(),
+          ),
+        })
+        .strict(),
+      "Your fabrics and their members (agents see them in nodes_get).",
+    ),
+    rename: mutation(
+      "human",
+      z.object({ fabricId: idSchema, name: fabricNameSchema }).strict(),
+      okSchema,
+      "Rename a fabric (runtime definitions naming the old name stop matching it).",
+    ),
+    delete: mutation(
+      "human",
+      z.object({ fabricId: idSchema }).strict(),
+      okSchema,
+      "Delete a fabric and its memberships (refused while an instance runs in it).",
+    ),
+  },
   rename: mutation(
     "human",
     z.object({ nodeId: idSchema, name: nameSchema.nullable() }).strict(),
@@ -350,8 +502,12 @@ export const nodesContract = {
         frozenMetricCommands: z.array(
           z.object({ name: z.string(), agentWritten: z.boolean() }).strict(),
         ),
-        /** Multi-node runtimes whose other nodes could not start here afterwards (no frozen peer set). */
-        multiNodeWithoutPeerSet: z.array(idSchema),
+        /** Fabric memberships that freeze with the node (multi-node starts need them). */
+        frozenFabrics: z.array(
+          z.object({ fabricId: idSchema, name: z.string(), ip: z.string() }).strict(),
+        ),
+        /** Secrets can then be set only with `wsmp secret set` on the node. */
+        secretNames: z.array(z.string()),
         /** What stops working: commands, files, browser terminals, definition changes, agent starts/stops. */
         openBrowserTerminals: z.number().int(),
         queuedCommandsRefused: z.number().int(),
@@ -390,13 +546,32 @@ export const nodesContract = {
       "human",
       z
         .object({
+          /** Single-use codes only. */
           suggestedSlug: nodeSlugSchema.optional(),
           /** Default 1 h, at most 7 days. */
           ttlHours: z.number().int().min(1).max(168).default(1),
-          /** "Replace node <slug>": moves that node to the identity that uses the code. */
+          /** "Replace node <slug>": moves that node to the identity that uses the code (single use). */
           replaceNodeId: idSchema.optional(),
+          /** How many nodes may enroll with it (default 1, at most 50). */
+          maxUses: z.number().int().min(1).max(50).default(1),
+          /** Added to every node enrolled with it. */
+          labels: runtimeLabelsSchema.optional(),
+          /** Temporary nodes: removed after being offline this long (1 h when chosen without a value). */
+          removeAfterOfflineMs: removeAfterOfflineMsSchema.optional(),
         })
-        .strict(),
+        .strict()
+        .refine(
+          (input) =>
+            input.maxUses === 1 ||
+            (input.suggestedSlug === undefined && input.replaceNodeId === undefined),
+          { message: "A multi-use code takes no suggested slug and replaces no node." },
+        )
+        .refine(
+          (input) =>
+            input.replaceNodeId === undefined ||
+            (input.labels === undefined && input.removeAfterOfflineMs === undefined),
+          { message: "A replace code keeps the node's labels and policy." },
+        ),
       z
         .object({
           code: enrollmentCodeViewSchema,
@@ -405,13 +580,13 @@ export const nodesContract = {
           installCommand: z.string(),
         })
         .strict(),
-      "Mint a single-use enrollment code (minting is the approval).",
+      "Mint an enrollment code (single-use by default, up to 50 nodes; minting is the approval).",
     ),
     revoke: mutation(
       "human",
       z.object({ codeId: idSchema }).strict(),
       okSchema,
-      "Revoke an unused code.",
+      "Revoke a code (nodes already enrolled stay).",
     ),
   },
   credentials: {
@@ -516,24 +691,34 @@ export const nodesContract = {
           nodeId: idSchema,
           command: commandTextSchema,
           cwd: z.string().min(1).max(4_096).optional(),
-          timeoutSec: z.number().int().min(1).max(600).default(120),
+          /** Default 1 h; capped by the node's commandMaxMs (at most 24 h). */
+          timeoutMs: z
+            .number()
+            .int()
+            .min(1_000)
+            .max(NODE_COMMAND_MAX_MS)
+            .default(NODE_COMMAND_DEFAULT_TIMEOUT_MS),
           confirm: confirmRunSchema,
           note: noteSchema.optional(),
         })
         .strict(),
+      nodeCommandViewSchema,
+      "Run a command on a Full-control node; answers within about 15 s, with state running and the output so far if it is still going. The node kills the whole process tree at the end.",
+      ["node_command_run"],
+    ),
+    get: mutation(
+      "agent",
       z
         .object({
-          exitCode: z.number().int().nullable(),
-          signal: z.string().nullable(),
-          timedOut: z.boolean(),
-          /** Masked and capped. */
-          stdout: z.string(),
-          stderr: z.string(),
-          truncated: z.boolean(),
+          commandId: z.string().regex(/^[A-Za-z0-9_-]{22}$/),
+          /** Wait up to this long for it to finish. */
+          waitMs: z.number().int().min(0).max(NODE_COMMAND_GET_WAIT_MAX_MS).optional(),
+          cancel: z.literal(true).optional(),
         })
         .strict(),
-      "Run a command on a Full-control node; everything it starts dies with it or at 10 min.",
-      ["node_command_run"],
+      nodeCommandViewSchema,
+      "A command's state and output tail; optionally wait for it or cancel it.",
+      ["node_command_get"],
     ),
   },
   files: {

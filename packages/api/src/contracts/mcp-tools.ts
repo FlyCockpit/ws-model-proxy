@@ -1,16 +1,18 @@
 /**
- * The 0.4.0 MCP tool manifest (spec §6): 25 tools, user nouns, no implementations.
- * `apps/server/src/mcp/tool-manifest.ts` registers these in S0c; handlers call the procedures
- * named in `procedures`. READ tokens see the read tools; FULL tokens see all 25. Every write
- * takes an optional `note`. Refusals keep the fleet-fixes passthrough (`data.reason` + valid
- * choices); NOT_FOUND only for things the caller cannot see.
+ * The 0.4.0 MCP tool manifest (spec §6): 26 tools, user nouns, no implementations.
+ * `apps/server/src/mcp/tool-manifest.ts` registers these; handlers call the procedures named in
+ * `procedures`. READ tokens see the read tools; FULL tokens see all. Every write takes an
+ * optional `note`. Refusals carry `data.reason` with a message that says what to do next.
  *
- * Tool and field descriptions follow the glossary (§1.2); `contracts.test.ts` checks the
- * banned words.
+ * Token budget (owner guidance): descriptions are 1–3 short sentences (what it does plus the
+ * one rule an agent must know); long guidance lives in docs/mcp.md and in refusal messages.
+ * Large nested inputs (runtime definitions, pool advanced settings, hardware, metric commands)
+ * are advertised as plain objects (`compactFields`) and validated in full by the procedure;
+ * `contracts.test.ts` fails when `tools/list` grows past its budget.
  */
 import { z } from "zod";
 import { activityContract } from "./activity";
-import { confirmDeleteSchema, idSchema, MODEL_CAPABILITY, okSchema } from "./common";
+import { confirmDeleteSchema, idSchema, MODEL_CAPABILITY, noteSchema, okSchema } from "./common";
 import { modelsContract } from "./models";
 import {
   nodeDetailSchema,
@@ -38,12 +40,18 @@ import { MCP_READ_TOOLS, type McpToolName } from "./tool-names";
 export type McpToolContract = {
   name: McpToolName;
   level: "READ" | "FULL";
-  /** Shown to the agent. Plain language, the user's nouns. */
+  /** Shown to the agent: 1–3 short sentences, the user's nouns. */
   description: string;
   input: z.ZodType;
   output: z.ZodType;
   /** Procedure paths (`router.sub.name`) the handler calls. */
   procedures: readonly string[];
+  /**
+   * Top-level input fields advertised as a plain object with this description instead of their
+   * full JSON Schema (the procedure still validates them in full and its refusal names the
+   * path). Keeps `tools/list` small.
+   */
+  compactFields?: Readonly<Record<string, string>>;
   /** Calls per minute per token, when stricter than the MCP default. */
   rateLimit?: {
     perMinute: number;
@@ -60,9 +68,63 @@ function tool(contract: Omit<McpToolContract, "level">): McpToolContract {
   };
 }
 
-const runtimeUpdateInput = runtimesContract.update.input
-  .extend({
-    /** Override served-model capabilities (null: use what the node detected). */
+type JsonSchema = Record<string, unknown>;
+
+/** The `inputSchema` a tool advertises in `tools/list` (compact fields replaced). */
+export function advertisedInputSchema(contract: McpToolContract): JsonSchema {
+  const schema = z.toJSONSchema(contract.input, { io: "input" }) as JsonSchema;
+  delete schema.$schema;
+  const properties = schema.properties as Record<string, JsonSchema> | undefined;
+  for (const [field, description] of Object.entries(contract.compactFields ?? {}))
+    if (properties?.[field]) properties[field] = { type: "object", description };
+  return schema;
+}
+
+/** What `tools/list` returns for these tools (the budget test measures it). */
+export function advertisedToolList(): Array<{
+  name: string;
+  description: string;
+  inputSchema: JsonSchema;
+}> {
+  return MCP_TOOLS.map((contract) => ({
+    name: contract.name,
+    description: contract.description,
+    inputSchema: advertisedInputSchema(contract),
+  }));
+}
+
+const SPEC = "Runtime definition; shape in docs/mcp.md, start from runtimes_get presets.";
+const LIMITS = "Limit overrides (null: automatic); runtimes_get shows effective values.";
+const ADVANCED = "Advanced settings by key; pools_get / runtimes_get show keys and defaults.";
+
+const runtimeCreateInput = z
+  .object({
+    slug: z.string(),
+    name: z.string(),
+    kind: z.enum(["ALWAYS_ON", "STARTABLE"]).optional(),
+    nodeId: idSchema.optional(),
+    preset: z.string().optional(),
+    spec: z.record(z.string(), z.unknown()).optional(),
+    limits: z.record(z.string(), z.unknown()).optional(),
+    advanced: z.record(z.string(), z.unknown()).optional(),
+    /** Copy a definition shared with you instead of giving spec. */
+    forkFrom: z.object({ runtimeId: idSchema, versionId: idSchema.optional() }).strict().optional(),
+    note: noteSchema.optional(),
+  })
+  .strict()
+  .refine((input) => (input.forkFrom === undefined) === (input.spec !== undefined), {
+    message: "Give spec, or forkFrom to copy a shared definition.",
+  });
+
+const runtimeUpdateInput = z
+  .object({
+    runtimeId: idSchema,
+    name: z.string().optional(),
+    spec: z.record(z.string(), z.unknown()).optional(),
+    limits: z.record(z.string(), z.unknown()).optional(),
+    advanced: z.record(z.string(), z.unknown()).optional(),
+    restartRunning: z.boolean().optional(),
+    /** Per served model; null: what the node detected. */
     modelCapabilities: z
       .array(
         z
@@ -74,6 +136,34 @@ const runtimeUpdateInput = runtimesContract.update.input
       )
       .max(64)
       .optional(),
+    note: noteSchema.optional(),
+  })
+  .strict();
+
+const poolUpdateInput = z
+  .object({
+    poolId: idSchema,
+    name: z.string().optional(),
+    slug: z.string().optional(),
+    description: z.string().nullable().optional(),
+    members: z.record(z.string(), z.unknown()).optional(),
+    cloudMembers: z
+      .array(z.object({ providerModelId: idSchema }).strict())
+      .max(16)
+      .optional(),
+    routing: z.record(z.string(), z.unknown()).optional(),
+    cloud: z.record(z.string(), z.unknown()).optional(),
+    sidecars: z.array(z.record(z.string(), z.unknown())).max(3).optional(),
+    advanced: z.record(z.string(), z.unknown()).optional(),
+    /** In a pool shared with you (can contribute): add or withdraw YOUR served models. */
+    contribute: z
+      .object({
+        add: z.array(idSchema).max(16).optional(),
+        withdraw: z.array(idSchema).max(16).optional(),
+      })
+      .strict()
+      .optional(),
+    note: noteSchema.optional(),
   })
   .strict();
 
@@ -81,7 +171,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "nodes_get",
     description:
-      "List your nodes, or one node in detail: online, trust (Full control or Relay only, a pending lowering, frozen), hardware with where each value comes from (browser, node, detected), reserved and live free memory, labels, port range, node metric commands, held runtime definitions, instances, local servers the node found, and commands queued for you.",
+      "Your nodes, or one in detail: trust, hardware, fabrics, hold, held definitions, instances, found local servers, secret names.",
     input: z.object({ nodeId: idSchema.optional() }).strict(),
     output: z.union([z.object({ nodes: z.array(nodeSummarySchema) }).strict(), nodeDetailSchema]),
     procedures: ["nodes.list", "nodes.get"],
@@ -89,12 +179,14 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "runtimes_get",
     description:
-      "List your runtimes, or one in detail: kind (always-on or startable), node, current version (definition, limits as effective value with source auto/override/default), served models, instances (phase, nodes, needs you, restart window), pools using it, shares and contributions. With versions: the version list with notes and launch hashes; with versionId: that version's full definition.",
+      "Your runtimes, or one in detail (versions: the version list; versionId: one full definition; presets: starting points; shared: definitions shared with you).",
     input: z
       .object({
         runtimeId: idSchema.optional(),
         versions: z.boolean().optional(),
         versionId: idSchema.optional(),
+        presets: z.boolean().optional(),
+        shared: z.boolean().optional(),
       })
       .strict(),
     output: z.union([
@@ -103,6 +195,8 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
       runtimeDetailSchema
         .extend({ versions: z.array(runtimeVersionSummarySchema).optional() })
         .strict(),
+      runtimesContract.presets.list.output,
+      runtimesContract.shares.list.output,
     ]),
     procedures: [
       "runtimes.list",
@@ -110,19 +204,13 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
       "runtimes.versions.list",
       "runtimes.versions.get",
       "runtimes.presets.list",
+      "runtimes.shares.list",
     ],
   }),
   tool({
     name: "pools_get",
-    description:
-      "List your pools (and pools shared with you), or one pool: callable IDs, type, routing, cloud setting (read-only for agents), sidecars, advanced settings with effective values, metric routing rules, members with status and live load, number of shares.",
-    input: z
-      .object({
-        poolId: idSchema.optional(),
-        /** With poolId: also the pool's configuration history (newest first). */
-        history: z.boolean().optional(),
-      })
-      .strict(),
+    description: "Your pools and pools shared with you, or one pool (history: its change log).",
+    input: z.object({ poolId: idSchema.optional(), history: z.boolean().optional() }).strict(),
     output: z.union([
       poolsContract.list.output,
       poolViewSchema.extend({ history: poolsContract.history.list.output.optional() }).strict(),
@@ -131,8 +219,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   }),
   tool({
     name: "profiles_get",
-    description:
-      "List your profiles, or one: the nodes it owns, pinned runtime versions with counts (and whether pins are outdated), whether it is satisfied now, and the last apply.",
+    description: "Your profiles, or one: owned nodes, hold lines, pinned versions, satisfied now.",
     input: z.object({ profileId: idSchema.optional() }).strict(),
     output: z.union([profilesContract.list.output, profileViewSchema]),
     procedures: ["profiles.list", "profiles.get"],
@@ -140,7 +227,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "providers_get",
     description:
-      "Cloud provider accounts (never keys): enabled, health, models (type, context, price) and this month's spend against the monthly cap. Changing providers is for people only.",
+      "Cloud provider accounts and models with this month's spend (never keys). Only people change providers.",
     input: z.object({}).strict(),
     output: z
       .object({
@@ -153,7 +240,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "requests_list",
     description:
-      "Recent requests without prompts: route (local, cloud, own key), what served them, queue wait, time to first token, tokens, refusal reason and error class. Filter by pool, runtime, version, node, status or time.",
+      "Recent requests without prompts: route, what served them, timings, tokens, errors.",
     input: activityContract.requests.list.input,
     output: activityContract.requests.list.output,
     procedures: ["activity.requests.list"],
@@ -161,7 +248,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "metrics_query",
     description:
-      "Metrics for a pool, runtime, version, node or instance over 1h/24h/7d/30d or a custom range, in 1m/5m/1h/1d steps, optionally grouped by runtime, version, node, instance, model, member or source. Request metrics (requests, errors, refusals by reason, TTFT and latency p50/p95, queue wait, decode and prefill tokens per second, tokens, cache hit rate, cloud share), engine load (KV usage, running, waiting, full ratio) and node gauges (CPU, free memory, accelerator memory, GPU use and temperature, custom:<name> from node metric commands). Use it to compare versions after a change.",
+      "Request, engine-load and node metrics for a pool, runtime, version, node or instance over a range, optionally grouped. Use it to compare versions after a change.",
     input: activityContract.metrics.query.input,
     output: activityContract.metrics.query.output,
     procedures: ["activity.metrics.query"],
@@ -169,7 +256,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "model_test",
     description:
-      "Send a test to a callable ID (owner/pool or owner/pool:external) or to one of your runtimes directly, and see what served it, TTFT, latency and tokens. kind chat, embeddings or transcription (a built-in short silent WAV). bench repeats up to 50 requests with up to 8 at once and returns p50/p95; bench traffic counts in metrics as agent tests. No API key needed; bench against :external is refused.",
+      "Send a test to a callable ID or one of your runtimes and see what served it and how fast; bench repeats it (not against :external).",
     input: modelsContract.test.input,
     output: modelsContract.test.output,
     procedures: ["models.test"],
@@ -178,23 +265,33 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "pool_create",
     description:
-      "Create a pool from served models (yours). It starts Local only: cloud fallback stays off until a person turns it on.",
+      "Create a pool from your served models. Cloud fallback stays off until a person turns it on.",
     input: poolsContract.create.input,
     output: poolsContract.create.output,
     procedures: ["pools.create"],
+    compactFields: {
+      advanced: ADVANCED,
+      routing: "Priority class, pool cap, kept slots, borrowing.",
+    },
   }),
   tool({
     name: "pool_update",
     description:
-      "Change a pool: name, slug, members (add, remove, weight, disable), the ordered cloud members (only provider models a person enabled; spend caps apply), routing (priority class, pool cap, kept slots, borrowing), sidecars, and advanced settings (the one max wait, context ceiling and margin, affinity, warm protection, API adaptation, attachments, metric routing rules). Members other people contributed: weight and state only. People only: cloud mode, paid warm protection, own-key consent, only-my-own-hardware.",
-    input: poolsContract.update.input,
+      "Change a pool you own, or contribute/withdraw your own served models in a pool shared with you (can contribute). People only: cloud mode, paid warm protection, own-key consent, only-my-own-hardware.",
+    input: poolUpdateInput,
     output: poolsContract.update.output,
-    procedures: ["pools.update"],
+    procedures: ["pools.update", "pools.members.addContributed", "pools.members.removeContributed"],
+    compactFields: {
+      members: "{add: [{runtimeModelId}], remove: [memberId], set: [{memberId, weight, state}]}.",
+      routing: "Priority class, pool cap, kept slots, borrowing.",
+      cloud: "{embeddingContract}.",
+      advanced: ADVANCED,
+    },
   }),
   tool({
     name: "pool_delete",
     description:
-      'Delete a pool. This also removes its shares, the monthly caps on those shares, members other people contributed, API-key entries and sidecar links from other pools. Requires confirm: "DELETE".',
+      'Delete a pool with its shares, contributed members, API-key entries and sidecar links. confirm: "DELETE".',
     input: z.object({ poolId: idSchema, confirm: confirmDeleteSchema }).strict(),
     output: okSchema,
     procedures: ["pools.delete"],
@@ -202,25 +299,26 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "runtime_create",
     description:
-      "Define a runtime. Always-on: the address of a server already running on a node (preset detected adds one the node found). Startable: commands to start, stop and check it on one or more nodes (presets vllm, sglang, llama_cpp, ollama_service, systemd_unit). Model downloads belong in the prepare command (up to 24 h). The definition is pushed to Full-control nodes only.",
-    input: runtimesContract.create.input,
+      "Define a runtime (a server on a node, or commands that start one), or copy one shared with you (forkFrom). Put model downloads and other setup in an idempotent prepare step so applying a profile on a fresh node fetches weights by itself.",
+    input: runtimeCreateInput,
     output: runtimesContract.create.output,
-    procedures: ["runtimes.create", "runtimes.presets.list"],
+    procedures: ["runtimes.create", "runtimes.presets.list", "runtimes.fork"],
+    compactFields: { spec: SPEC, limits: LIMITS, advanced: ADVANCED },
   }),
   tool({
     name: "runtime_update",
     description:
-      "Save a new version of a runtime (say why in note). Limit and advanced edits keep the launch hash and apply to running instances at once; a changed definition needs a restart (restartRunning restarts instances on Full-control nodes and lists the rest under needsRestart). A definition change to an always-on runtime on a Relay-only node is refused. Also overrides served-model capabilities.",
+      "Save a new version (say why in note); limit edits apply live, a changed definition needs restartRunning. Setup such as model downloads belongs in the idempotent prepare step.",
     input: runtimeUpdateInput,
     output: runtimesContract.update.output.extend({
       models: z.array(runtimeModelViewSchema).optional(),
     }),
     procedures: ["runtimes.update", "runtimes.models.setCapabilities"],
+    compactFields: { spec: SPEC, limits: LIMITS, advanced: ADVANCED },
   }),
   tool({
     name: "runtime_delete",
-    description:
-      'Delete a runtime. Refused while instances run (instances_running) or while a profile pins it (pinned_by_profile). Removes its pool members, including in pools shared with you. Requires confirm: "DELETE".',
+    description: 'Delete a runtime that no instance runs and no profile pins. confirm: "DELETE".',
     input: z.object({ runtimeId: idSchema, confirm: confirmDeleteSchema }).strict(),
     output: runtimesContract.delete.output,
     procedures: ["runtimes.delete"],
@@ -228,7 +326,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "runtime_start",
     description:
-      "Start a runtime on given nodes (or let the server place count instances), or restart an instance with instanceId. preview: true shows placements, what would be stopped to make room, and warnings (such as low free memory) without acting. No confirmation is needed and other startable runtimes may be stopped. Refused on Relay-only nodes (trust_relay): only people start runtimes there.",
+      "Start a runtime on nodes (or count instances placed for you), or restart an instance; preview shows placements and what stops. Refused on Relay-only and held nodes.",
     input: runtimesContract.start.input,
     output: runtimesContract.start.output,
     procedures: ["runtimes.start"],
@@ -236,8 +334,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   }),
   tool({
     name: "runtime_stop",
-    description:
-      "Stop an instance, or every instance of a runtime (optionally on one node). Refused on Relay-only nodes (trust_relay).",
+    description: "Stop an instance, or every instance of a runtime (optionally on one node).",
     input: runtimesContract.stop.input,
     output: runtimesContract.stop.output,
     procedures: ["runtimes.stop"],
@@ -246,7 +343,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "profile_save",
     description:
-      "Create or replace a profile: the nodes it owns and which runtime versions run there (count, optional node subset). Pins move only with updatePins.",
+      "Create or replace a profile: owned nodes and pinned runtime versions. Hold lines are for people.",
     input: profilesContract.save.input,
     output: profilesContract.save.output,
     procedures: ["profiles.save"],
@@ -254,7 +351,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "profile_apply",
     description:
-      "Apply a profile: start its pinned runtimes and stop other startable runtimes on the nodes it owns (always-on runtimes are never touched). preview: true shows starts, stops, kept and warnings. Refused as a whole, with the list, if any owned node is Relay only.",
+      "Apply a profile (preview first if unsure): start its pins, stop other startable runtimes on its nodes. Refused if any owned node is Relay only.",
     input: profilesContract.apply.input,
     output: profilesContract.apply.output,
     procedures: ["profiles.apply"],
@@ -262,7 +359,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   }),
   tool({
     name: "profile_delete",
-    description: 'Delete a profile. Nothing stops. Requires confirm: "DELETE".',
+    description: 'Delete a profile; nothing stops. confirm: "DELETE".',
     input: z.object({ profileId: idSchema, confirm: confirmDeleteSchema }).strict(),
     output: okSchema,
     procedures: ["profiles.delete"],
@@ -270,24 +367,36 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "node_update",
     description:
-      "Change a Full-control node: labels, port range, declared hardware (including memory reserved for things outside wsmp), node metric commands, or rescan for local servers. Trust, renaming and deleting are for people only.",
+      "Change a Full-control node: labels, ports, hardware, metric commands, fabrics, command lifetime, secrets (write-only), rescan.",
     input: nodesContract.update.input,
     output: nodesContract.update.output,
     procedures: ["nodes.update"],
+    compactFields: {
+      hardware: "Declared hardware (null clears); nodes_get shows sources.",
+      metricCommands: "Node metric commands; shape in docs/mcp.md.",
+    },
   }),
   tool({
     name: "node_command_run",
     description:
-      'Run a command on a Full-control node and get its exit code and (masked, capped) output. Everything it starts dies with it or after 10 minutes: servers must be runtimes, and long downloads belong in a runtime\'s prepare command (up to 24 h). Requires confirm: "RUN".',
+      'Run a one-off command (downloads while experimenting, builds, diagnostics, benchmarks) on a Full-control node; answers within ~15 s, then poll with node_command_get. Anything that should keep running or serve traffic must be a runtime: a server started here is invisible to the proxy and dies with the command. confirm: "RUN".',
     input: nodesContract.commands.run.input,
     output: nodesContract.commands.run.output,
     procedures: ["nodes.commands.run"],
     rateLimit: { perMinute: 30, key: "node_command" },
   }),
   tool({
+    name: "node_command_get",
+    description:
+      "State and output tail of a command from node_command_run; waitMs waits for it, cancel stops it and everything it started.",
+    input: nodesContract.commands.get.input,
+    output: nodesContract.commands.get.output,
+    procedures: ["nodes.commands.get"],
+  }),
+  tool({
     name: "node_command_queue_for_user",
     description:
-      "Queue a command for a person (for example one that needs their sudo password). It appears on their Terminals page and runs only when they press Run and then Enter in a browser terminal. Full-control nodes only; expires after expiresInHours (default 24, at most 168). nodes_get shows queued items and outcomes.",
+      "Queue a command a person must run (e.g. it needs their sudo password); it runs only when they press Run and Enter.",
     input: nodesContract.queued.enqueue.input,
     output: nodesContract.queued.enqueue.output,
     procedures: ["nodes.queued.enqueue"],
@@ -295,8 +404,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   }),
   tool({
     name: "node_file_read",
-    description:
-      "Read a file, stat paths, list a folder or search under the node's allowed folders (Full control). Returns an etag for later edits.",
+    description: "Read, stat, list or search under the node's allowed folders; returns an etag.",
     input: nodeFileReadInputSchema,
     output: nodeFileReadOutputSchema,
     procedures: ["nodes.files.read"],
@@ -304,7 +412,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "node_file_write",
     description:
-      "Write a file, make a folder, rename or delete under the node's allowed folders (Full control). Pass ifMatch with the etag you read to avoid overwriting changes.",
+      "Write, mkdir, rename or delete under the node's allowed folders (ifMatch: the etag you read).",
     input: nodeFileWriteInputSchema,
     output: nodeFileMutationOutputSchema,
     procedures: ["nodes.files.write"],
@@ -312,7 +420,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "node_file_edit",
     description:
-      "Replace exact text in a file under the node's allowed folders (Full control); ifMatch is required. Returns the new etag and a diff summary.",
+      "Replace exact text in a file (ifMatch required); returns the new etag and a diff.",
     input: nodeFileEditInputSchema,
     output: nodeFileMutationOutputSchema,
     procedures: ["nodes.files.edit"],
@@ -328,14 +436,15 @@ export const MCP_EXCLUDED_SESSION_PROCEDURES: Readonly<Record<string, string>> =
   "nodes.credentials.list": "Credentials are managed by people.",
   "nodes.activity.list": "Audit history for people (agents see their own results).",
   "nodes.queued.list": "Queued items are shown in nodes_get.",
+  "nodes.fabrics.list": "nodes_get shows each node's fabrics and peers.",
   "runtimes.detected.add": "Agents use runtime_create with preset detected.",
-  "runtimes.shares.list": "Sharing runtime definitions is for people only.",
   "models.list": "Callable IDs are part of pools_get.",
   "access.apiKeys.list": "API keys are managed by people.",
   "access.agentTokens.list": "Agent tokens are managed by people.",
   "access.oauthGrants.list": "Agent connections are managed by people.",
   "access.shares.list": "Sharing is for people only; pools_get shows the count.",
-  "access.contributing.pools": "Contributing to another person's pool is for people only.",
+  "access.contributing.pools":
+    "pools_get lists pools shared with you and whether you may contribute.",
   "providers.accounts.get": "providers_get covers accounts and models.",
   "providers.pricing.list": "providers_get shows the active price.",
   "providers.catalog.search": "Adding provider models is for people only.",

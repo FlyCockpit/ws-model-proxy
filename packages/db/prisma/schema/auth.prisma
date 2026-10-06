@@ -40,6 +40,7 @@ model User {
   nodes               Node[]
   nodeCredentials     NodeCredential[]
   nodeEnrollmentCodes NodeEnrollmentCode[]
+  fabrics             Fabric[]
   runtimes            Runtime[]
   runtimeSharesOut    RuntimeShare[]       @relation("RuntimeShareOwner")
   runtimeSharesIn     RuntimeShare[]       @relation("RuntimeShareGrantee")
@@ -49,6 +50,7 @@ model User {
   apiKeys             ApiKey[]
   sharesOut           Share[]              @relation("ShareOwner")
   sharesIn            Share[]              @relation("ShareGrantee")
+  shareInvites        ShareInvite[]
   providerAccounts    ProviderAccount[]
   providerModels      ProviderModel[]
   providerCredentials ProviderCredential[]

@@ -8,7 +8,7 @@
     {
       "runtimeId": "rt1q8m3k2v9x7c4b6n0z5h1j8",
       "versionId": "vr1a2b3c4d5e6f7g8h9i0j1k2",
-      "launchHash": "7d80f5e860fb99a08c22b7aefb21407ce26c1d4b6c15d1050d1ff1c043f63b40",
+      "launchHash": "c0c00e47e26769d58cf675d378acbd85b35d00a73c45ecee9a9aaa3327d99668",
       "kind": "startable",
       "slug": "qwen3-32b",
       "spec": {
@@ -33,11 +33,11 @@
             }
           ],
           "labels": ["h100"],
-          "iface": "eth0",
+          "fabric": "qsfp-1",
           "commands": [
             {
               "prepare": "huggingface-cli download Qwen/Qwen3-32B",
-              "start": "vllm serve Qwen/Qwen3-32B --port {{port}} --pipeline-parallel-size {{nnodes}} --node-rank {{node_rank}} --master-addr {{head_addr}} --master-port {{dist_port}} --gpu-memory-utilization {{memory_fraction}}",
+              "start": "vllm serve Qwen/Qwen3-32B --port {{port}} --pipeline-parallel-size {{nnodes}} --node-rank {{node_rank}} --master-addr {{head_addr}} --master-port {{dist_port}} --host {{fabric_ip}} --nccl-socket-ifname {{fabric_iface}} --ib-hca {{fabric_rdma_device}} --gpu-memory-utilization {{memory_fraction}}",
               "stop": "true",
               "timeoutsSec": {
                 "prepare": 86400,

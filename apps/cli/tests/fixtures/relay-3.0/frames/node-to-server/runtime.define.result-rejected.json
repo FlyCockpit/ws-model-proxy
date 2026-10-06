@@ -15,5 +15,6 @@
   "held": [],
   "heldMetricCommandsHash": null,
   "heldPortRange": null,
+  "heldFabricsHash": null,
   "frozen": false
 }

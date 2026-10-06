@@ -27,6 +27,10 @@ model Profile {
 model ProfileNode {
   profileId String
   nodeId    String
+  /// "Hold node": applying the profile stops wsmp runtimes here and holds the node (nothing
+  /// may be placed on it) until a profile that owns it without a hold line is applied.
+  hold      Boolean @default(false)
+  holdNote  String?
 
   Profile Profile @relation(fields: [profileId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Node    Node    @relation(fields: [nodeId], references: [id], onDelete: Cascade, onUpdate: Cascade)

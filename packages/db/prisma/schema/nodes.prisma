@@ -55,9 +55,14 @@ model Node {
   /// Node-reported: every runtime version it holds (several per runtime are normal),
   /// [{ runtimeId, versionId, launchHash }]. Frozen while trust is RELAY (no separate flag).
   heldDefinitions         Json           @default("[]")
-  /// Node-reported (RELAY only): [{ runtimeId, headAddr }], the head each frozen multi-node
-  /// runtime last joined. A Relay-only multi-node start is refused in the preview without it.
-  frozenPeers             Json?
+  /// RELAY only: the fabric memberships frozen with the node's definition when trust was
+  /// lowered: [{ fabricId, name, selfIp, memberIps }]. A Relay-only multi-node start needs its
+  /// head's address in the frozen membership of the fabric the instance uses.
+  frozenFabrics           Json?
+  /// Hash of the fabric part of the node's definition as the server last built it, and as the
+  /// node reports holding it (runtime.define node part).
+  fabricsHash             String?
+  heldFabricsHash         String?
   /// Node-reported: hash of the node metric commands it holds.
   heldMetricCommandsHash  String?
   /// Node metric commands: part of the node's definition, edited by people/agents at FULL,
@@ -82,12 +87,25 @@ model Node {
   declaredResourcesAt     DateTime?
   /// Placement labels (people; agents at FULL, audited). Effective = these ∪ node-declared.
   labels                  String[]       @default([])
+  /// Longest lifetime of one node command (`node_command_run` timeoutMs is capped by it).
+  /// Part of the node definition (people; agents at FULL); 1 min .. 24 h.
+  commandMaxMs            Int            @default(86400000)
   /// Port range for started instances (people; agents at FULL, audited).
   portStart               Int            @default(30000)
   portEnd                 Int            @default(30999)
   /// Local servers the node found on common ports (runtime.detected).
   detectedServers         Json?
   detectedServersAt       DateTime?
+  /// Node HOLD (owner decision round 3): while set, the planner places nothing here, for
+  /// anyone (`node_held`). Set by a person, or by applying a profile with a hold line for this
+  /// node (`holdProfileId`); applying a profile that owns the node without a hold line clears it.
+  holdAt                  DateTime?
+  holdNote                String?
+  holdProfileId           String?
+  /// Temporary node (owner decision round 3): deleted by the sweeper once it has been offline
+  /// this long, releasing everything exactly like a manual delete. People only (a deletion
+  /// policy: agents may not change it). Null: kept.
+  removeAfterOfflineMs    Int?
 
   User           User                 @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Credentials    NodeCredential[]
@@ -95,13 +113,16 @@ model Node {
   Ranks          InstanceRank[]
   QueuedCommands QueuedNodeCommand[]
   ProfileNodes   ProfileNode[]
-  EnrolledBy     NodeEnrollmentCode[] @relation("EnrollmentUsedBy")
+  EnrolledBy     NodeEnrollmentUse[]
+  Commands       NodeCommand[]
+  FabricMembers  FabricMember[]
   ReplacedBy     NodeEnrollmentCode[] @relation("EnrollmentReplaces")
 
   @@unique([userId, slug])
   @@unique([id, userId])
   @@index([userId, connection])
   @@index([lastHeartbeatAt])
+  @@index([removeAfterOfflineMs, connection, lastDisconnectedAt])
   @@map("node")
 }
 
@@ -134,30 +155,141 @@ model NodeCredential {
 /// one-liner. Minting it is the person's approval (human-only). Secret: `wsmp_enr_` + 26
 /// base32 chars (130 bits); only sha256 is stored. Default TTL 1 h, max 7 d. Exchange is
 /// rate-limited per IP and per user.
+/// An enrollment code (owner decision round 3: multi-use). Each exchange is one use; the code
+/// stops working at `maxUses`, at `expiresAt` (default 1 h, at most 7 days) or when revoked.
 model NodeEnrollmentCode {
-  id            String    @id @default(cuid(2))
-  createdAt     DateTime  @default(now())
-  userId        String
+  id                   String    @id @default(cuid(2))
+  createdAt            DateTime  @default(now())
+  userId               String
   /// The 8 characters after `wsmp_enr_`, for display.
-  codePrefix    String
-  codeDigest    String    @unique
-  expiresAt     DateTime
-  suggestedSlug String?
+  codePrefix           String
+  codeDigest           String    @unique
+  expiresAt            DateTime
+  /// Only for a single-use code (the CLI may still choose its own slug).
+  suggestedSlug        String?
   /// Set only by an explicit "Replace node <slug>" in the browser: the exchange moves that node
   /// (definitions, instances, traffic) to the new identity key and revokes its old credential.
-  /// Without it, an existing slug with a different key is refused (`slug_taken`).
-  replaceNodeId String?
-  usedAt        DateTime?
-  usedByNodeId  String?
-  revokedAt     DateTime?
+  /// Without it, an existing slug with a different key is refused (`slug_taken`). A replace
+  /// code is single-use.
+  replaceNodeId        String?
+  /// 1..50. Every exchange takes one use in the same transaction as the node it creates.
+  maxUses              Int       @default(1)
+  usedCount            Int       @default(0)
+  lastUsedAt           DateTime?
+  /// Placement labels added to every node enrolled with this code.
+  labels               String[]  @default([])
+  /// Temporary nodes: every node enrolled with this code is removed after being offline this
+  /// long (default 1 h when the option is chosen). Null: kept.
+  removeAfterOfflineMs Int?
+  revokedAt            DateTime?
 
-  User        User  @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  UsedByNode  Node? @relation("EnrollmentUsedBy", fields: [usedByNodeId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  ReplaceNode Node? @relation("EnrollmentReplaces", fields: [replaceNodeId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  User        User                @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ReplaceNode Node?               @relation("EnrollmentReplaces", fields: [replaceNodeId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Uses        NodeEnrollmentUse[]
 
   @@index([userId, expiresAt])
   @@index([expiresAt])
   @@map("node_enrollment_code")
+}
+
+enum NodeCommandState {
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  TIMED_OUT
+  /// The node's daemon restarted while it ran (reported on reconnect).
+  INTERRUPTED
+  /// The node no longer knows the command (its bounded table dropped it).
+  UNKNOWN
+}
+
+/// One command an agent or person ran on a node (`node_command_run`, `node_command_get`). The
+/// node keeps the output (a bounded ring buffer) and a bounded table of recent commands; the
+/// server stores only the state and timing, never output. The append-only `NodeAuditEvent`
+/// records the outcome when it ends. Kept 30 days.
+model NodeCommand {
+  /// The relay commandId (16 random bytes, base64url).
+  id           String           @id
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @default(now()) @updatedAt
+  userId       String
+  nodeId       String
+  actor        Actor
+  agentTokenId String?
+  /// `hmac-sha256:<hex> <program>` (never the command text).
+  subject      String
+  state        NodeCommandState @default(RUNNING)
+  exitCode     Int?
+  signal       String?
+  startedAt    DateTime
+  /// startedAt + min(timeoutMs, Node.commandMaxMs).
+  endsBy       DateTime
+  finishedAt   DateTime?
+
+  Node Node @relation(fields: [nodeId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([nodeId, state])
+  @@index([userId, createdAt])
+  @@index([state, endsBy])
+  @@map("node_command")
+}
+
+/// A named fast network between nodes (owner decision round 3), e.g. a cabled QSFP pair or a
+/// switch. Part of each member node's definition (people; agents at FULL via node_update;
+/// frozen at RELAY): pushed in the runtime.define node part with its hash. A multi-node instance
+/// runs entirely inside one fabric; workers get the head's fabric IP. Detection only suggests.
+model Fabric {
+  id        String   @id @default(cuid(2))
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+  userId    String
+  /// Label pattern (lower-case, digits, dashes); runtime specs name a fabric by it.
+  name      String
+
+  User    User           @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Members FabricMember[]
+
+  @@unique([userId, name])
+  @@unique([id, userId])
+  @@map("fabric")
+}
+
+/// One node's address on a fabric (an IP literal; the node derives its interface and RDMA
+/// device from it, the server never sends interface names).
+model FabricMember {
+  id        String   @id @default(cuid(2))
+  createdAt DateTime @default(now())
+  userId    String
+  fabricId  String
+  nodeId    String
+  ip        String
+
+  Fabric Fabric @relation(fields: [fabricId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Node   Node   @relation(fields: [nodeId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([fabricId, nodeId])
+  @@unique([fabricId, ip])
+  @@index([nodeId])
+  @@map("fabric_member")
+}
+
+/// One exchange of an enrollment code: which node it enrolled (or replaced), and when.
+model NodeEnrollmentUse {
+  id     String   @id @default(cuid(2))
+  usedAt DateTime @default(now())
+  userId String
+  codeId String
+  /// Null after the node was deleted.
+  nodeId String?
+
+  Code NodeEnrollmentCode @relation(fields: [codeId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Node Node?              @relation(fields: [nodeId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([codeId, usedAt])
+  @@index([nodeId])
+  @@index([userId])
+  @@map("node_enrollment_use")
 }
 
 enum NodeAuditKind {

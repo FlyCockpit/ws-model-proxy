@@ -17,7 +17,7 @@
     {
       "runtimeId": "rt1q8m3k2v9x7c4b6n0z5h1j8",
       "versionId": "vr1a2b3c4d5e6f7g8h9i0j1k2",
-      "launchHash": "7d80f5e860fb99a08c22b7aefb21407ce26c1d4b6c15d1050d1ff1c043f63b40"
+      "launchHash": "c0c00e47e26769d58cf675d378acbd85b35d00a73c45ecee9a9aaa3327d99668"
     },
     {
       "runtimeId": "rt1q8m3k2v9x7c4b6n0z5h1j8",
@@ -27,10 +27,11 @@
     {
       "runtimeId": "rt2p9o8i7u6y5t4r3e2w1q0a9",
       "versionId": "vr2z9y8x7w6v5u4t3s2r1q0p9",
-      "launchHash": "cab1dcd89087852aa3ba53595f7406545fcf43c7d0efcd5a3e8316bc76b90960"
+      "launchHash": "d8b3af4568eb3cc97e9e01b12efd48442772061d343ea5b7b98d3ecbc45a405f"
     }
   ],
   "heldMetricCommandsHash": "bab560648992cf2cac00bd361ddee7bf69baab83e9712853ccae40558fae6eca",
   "heldPortRange": [30000, 30999],
+  "heldFabricsHash": "1e5aa34eaf9b94a1606582c936ff2280e53acee41d898c18a842f934acdc60a6",
   "frozen": false
 }

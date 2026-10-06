@@ -19,6 +19,7 @@ export const REFUSAL_REASONS = [
   "definition_frozen",
   "definition_missing",
   "launch_change_on_relay_only",
+  /** Retired with fabrics (owner decision round 3); kept so the value is never reused. */
   "no_frozen_peer_set",
   // Lifecycle and deletion.
   "instances_running",
@@ -49,6 +50,19 @@ export const REFUSAL_REASONS = [
   "cloud_cap_reached",
   "slug_taken",
   "rate_limited",
+  // Owner decisions round 3.
+  /** Not enough free nodes share one fabric (a multi-node instance stays inside one). */
+  "no_shared_fabric",
+  /** Relay only: the head is not in this node's frozen membership of the instance's fabric. */
+  "head_not_in_frozen_fabric",
+  /** A person put the node on hold: nothing is placed there until it is released. */
+  "node_held",
+  /** Agents may only contribute and withdraw their own served models. */
+  "not_your_runtime",
+  /** A node secret is set at Full control remotely, or with `wsmp secret set` on the node. */
+  "secret_needs_node",
+  /** A command finished or is unknown to the node; there is nothing to cancel. */
+  "command_not_running",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

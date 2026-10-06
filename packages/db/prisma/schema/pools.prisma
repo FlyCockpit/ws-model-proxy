@@ -56,6 +56,7 @@ model Pool {
   Members      PoolMember[]
   RoutingRules PoolRoutingRule[]
   Shares       Share[]
+  Invites      ShareInvite[]
   ApiKeys      ApiKeyPool[]
 
   @@unique([userId, slug])

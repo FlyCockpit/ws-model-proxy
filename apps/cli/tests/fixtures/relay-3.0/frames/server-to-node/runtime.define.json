@@ -8,7 +8,7 @@
     {
       "runtimeId": "rt2p9o8i7u6y5t4r3e2w1q0a9",
       "versionId": "vr2z9y8x7w6v5u4t3s2r1q0p9",
-      "launchHash": "cab1dcd89087852aa3ba53595f7406545fcf43c7d0efcd5a3e8316bc76b90960",
+      "launchHash": "d8b3af4568eb3cc97e9e01b12efd48442772061d343ea5b7b98d3ecbc45a405f",
       "kind": "always_on",
       "slug": "bge",
       "spec": {
@@ -19,7 +19,7 @@
           "baseUrl": "http://127.0.0.1:8080/v1",
           "auth": {
             "mode": "bearer",
-            "env": "WSMP_ENDPOINT_LLAMA_KEY"
+            "env": "WSMP_SECRET_LLAMA_KEY"
           }
         },
         "models": [
@@ -64,6 +64,18 @@
           "format": "lines"
         }
       ]
-    }
+    },
+    "fabrics": {
+      "hash": "1e5aa34eaf9b94a1606582c936ff2280e53acee41d898c18a842f934acdc60a6",
+      "sets": [
+        {
+          "fabricId": "fab_qsfp1",
+          "name": "qsfp-1",
+          "selfIp": "10.0.0.6",
+          "memberIps": ["10.0.0.5", "10.0.0.6"]
+        }
+      ]
+    },
+    "commandMaxMs": 86400000
   }
 }

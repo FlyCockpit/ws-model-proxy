@@ -31,16 +31,27 @@
     },
     "runtimeHosts": ["10.0.0.5:8000"],
     "mediaExpand": true,
-    "liveStt": true
+    "liveStt": true,
+    "secrets": [
+      {
+        "name": "WSMP_SECRET_LLAMA_KEY",
+        "updatedAt": "2026-10-01T09:00:00.000Z"
+      },
+      {
+        "name": "WSMP_SECRET_SANDBOX_TOKEN",
+        "updatedAt": "2026-10-05T18:30:00.000Z"
+      }
+    ]
   },
   "definitions": [
     {
       "runtimeId": "rt2p9o8i7u6y5t4r3e2w1q0a9",
       "versionId": "vr2z9y8x7w6v5u4t3s2r1q0p9",
-      "launchHash": "cab1dcd89087852aa3ba53595f7406545fcf43c7d0efcd5a3e8316bc76b90960"
+      "launchHash": "d8b3af4568eb3cc97e9e01b12efd48442772061d343ea5b7b98d3ecbc45a405f"
     }
   ],
   "heldMetricCommandsHash": "bab560648992cf2cac00bd361ddee7bf69baab83e9712853ccae40558fae6eca",
   "heldPortRange": [30000, 30999],
+  "heldFabricsHash": "1e5aa34eaf9b94a1606582c936ff2280e53acee41d898c18a842f934acdc60a6",
   "runtimes": []
 }

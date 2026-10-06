@@ -59,7 +59,12 @@ export const READER_SIGNALS = [
 ] as const;
 export type ReaderSignal = (typeof READER_SIGNALS)[number];
 
-/** Placeholders a command may use; the node types every value (§4.6). */
+/**
+ * Placeholders a command may use; the node types every value (§4.6). `head_addr` is the head
+ * node's IP on the instance's fabric (server-sent). The `fabric_*` values are NODE-derived from
+ * the node's own IP on that fabric (`/sys/class/net`, the InfiniBand device mapping): the
+ * server never sends interface or device names.
+ */
 export const RUNTIME_PLACEHOLDERS = [
   "node_rank",
   "nnodes",
@@ -69,8 +74,10 @@ export const RUNTIME_PLACEHOLDERS = [
   "gpu_ids",
   "vram_gb",
   "memory_fraction",
-  "iface",
   "head_addr",
+  "fabric_ip",
+  "fabric_iface",
+  "fabric_rdma_device",
 ] as const;
 export type RuntimePlaceholder = (typeof RUNTIME_PLACEHOLDERS)[number];
 
@@ -90,8 +97,44 @@ export const RUNTIME_MODELS_MAX = 64;
 export const RUNTIME_LABELS_MAX = 32;
 export const RUNTIME_LABEL_PATTERN = /^[a-z][a-z0-9-]{0,62}$/;
 export const RUNTIME_SLUG_PATTERN = /^[a-z](?:[a-z0-9]|-(?=[a-z0-9])){0,40}$/;
-export const RUNTIME_ENV_PATTERN = /^WSMP_ENDPOINT_[A-Z0-9_]{1,64}$/;
-export const RUNTIME_IFACE_PATTERN = /^[A-Za-z0-9_.:-]{1,15}$/;
+/**
+ * Node-local named secrets (owner decision round 3): one namespace, set only on the node
+ * (`wsmp secret set NAME`, on a TTY), never sent to the server. Definitions reference them by
+ * name (address auth/headers, `launch.secrets` for the commands' environment); agents can
+ * reference names but never read values. The node reports names only.
+ */
+export const NODE_SECRET_PATTERN = /^WSMP_SECRET_[A-Z0-9_]{1,64}$/;
+export const NODE_SECRETS_MAX = 64;
+/**
+ * Node commands (owner decision round 3): the longest lifetime one command may have
+ * (`Node.commandMaxMs`, part of the node definition), the default per-call lifetime, the tail
+ * of output one poll returns, and how long `node_command_run` waits before it answers
+ * "running".
+ */
+export const NODE_COMMAND_MAX_MS = 86_400_000;
+export const NODE_COMMAND_MIN_MS = 60_000;
+export const NODE_COMMAND_DEFAULT_TIMEOUT_MS = 3_600_000;
+export const NODE_COMMAND_TAIL_MAX_BYTES = 64 * 1024;
+export const NODE_COMMAND_RUN_WAIT_MS = 15_000;
+export const NODE_COMMAND_GET_WAIT_MAX_MS = 30_000;
+export const NODE_COMMAND_STATES = [
+  "running",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "timed_out",
+  "interrupted",
+  "unknown",
+] as const;
+export type NodeCommandStateWire = (typeof NODE_COMMAND_STATES)[number];
+/** UTF-8 bytes of one secret value (set remotely at Full control, or `wsmp secret set`). */
+export const NODE_SECRET_VALUE_MAX_BYTES = 16 * 1024;
+/** Fabric names (owner decision round 3): like labels. */
+export const FABRIC_NAME_PATTERN = /^[a-z][a-z0-9-]{0,62}$/;
+/** Fabrics one node belongs to. */
+export const NODE_FABRICS_MAX = 16;
+/** Members of one fabric (a switch fabric of DGX-class nodes fits well inside). */
+export const FABRIC_MEMBERS_MAX = 64;
 /** Step deadlines in seconds (§2.12). Model downloads belong in `prepare`. */
 export const RUNTIME_TIMEOUTS_SEC = {
   prepare: { max: 86_400, default: 3_600 },
@@ -221,7 +264,8 @@ export type RuntimeSpecModel = z.infer<typeof runtimeSpecModelSchema>;
 
 // ── Address (ALWAYS_ON) ──
 
-const envRefSchema = z.string().regex(RUNTIME_ENV_PATTERN);
+export const nodeSecretNameSchema = z.string().regex(NODE_SECRET_PATTERN);
+const envRefSchema = nodeSecretNameSchema;
 
 function isIpLiteral(host: string): boolean {
   if (host.startsWith("[") && host.endsWith("]")) return true; // URL keeps IPv6 bracketed
@@ -368,15 +412,26 @@ export const runtimeLaunchSchema = z
       .object({ fixed: z.number().int().min(1024).max(65_535) })
       .strict()
       .optional(),
-    iface: z.string().regex(RUNTIME_IFACE_PATTERN).optional(),
+    /**
+     * Multi-node only: the fabric every rank must share (by name). Absent: any fabric shared by
+     * enough free nodes. Placement never splits an instance across fabrics (`no_shared_fabric`).
+     */
+    fabric: z.string().regex(FABRIC_NAME_PATTERN).optional(),
     commands: z.array(runtimeCommandsSchema).min(1).max(RUNTIME_GROUP_SIZE_MAX),
+    /** Node secrets exported (by name) to every command of this runtime. */
+    secrets: z.array(nodeSecretNameSchema).max(NODE_SECRETS_MAX).optional(),
+    /**
+     * HTTP readiness on the instance port. Required when the runtime serves models; a service
+     * (no models) may instead prove readiness and health with `status`/`health` commands.
+     */
     readiness: z
       .object({
         path: runtimeRouteSchema,
         expectedStatus: z.number().int().min(200).max(399),
         timeoutMs: z.number().int().min(1_000).max(3_600_000),
       })
-      .strict(),
+      .strict()
+      .optional(),
     health: z
       .object({
         intervalMs: z.number().int().min(5_000).max(300_000),
@@ -394,11 +449,11 @@ export const runtimeLaunchSchema = z
           path: [key],
           message: "Provide one entry for every rank or exactly one per rank.",
         });
-    if (launch.groupSize > 1 && !launch.iface)
+    if (launch.fabric && launch.groupSize === 1)
       ctx.addIssue({
         code: "custom",
-        path: ["iface"],
-        message: "Multi-node runtimes need a network interface.",
+        path: ["fabric"],
+        message: "Only a multi-node runtime names a fabric.",
       });
     if (launch.port && launch.groupSize !== 1)
       ctx.addIssue({
@@ -488,11 +543,17 @@ export type MetricsReader = z.infer<typeof metricsReaderSchema>;
 
 // ── The spec ──
 
+/**
+ * A runtime that serves models has `api`, `engine`, `modelType` and `models`; a SERVICE (owner
+ * decision round 3: "no proxying", e.g. another project's node agent) has none of them. A
+ * service is startable only, claims its declared resources (it may claim a whole node), is
+ * never a pool member and never appears on the Models page.
+ */
 export const runtimeSpecSchema = z
   .object({
-    api: z.enum(RUNTIME_APIS),
-    engine: z.enum(ENGINES),
-    modelType: z.enum(MODEL_TYPES),
+    api: z.enum(RUNTIME_APIS).optional(),
+    engine: z.enum(ENGINES).optional(),
+    modelType: z.enum(MODEL_TYPES).optional(),
     models: z.array(runtimeSpecModelSchema).min(1).max(RUNTIME_MODELS_MAX).optional(),
     address: runtimeAddressSchema.optional(),
     launch: runtimeLaunchSchema.optional(),
@@ -512,11 +573,39 @@ export const runtimeSpecSchema = z
         code: "custom",
         message: "A runtime has exactly one of address (always-on) or launch (startable).",
       });
-    if (spec.launch && !spec.models)
+    // An always-on runtime always serves (its models may be discovered); a startable one
+    // serves exactly when it lists models.
+    const serves = spec.address !== undefined || spec.models !== undefined;
+    for (const key of ["api", "engine", "modelType"] as const)
+      if ((spec[key] !== undefined) !== serves)
+        ctx.addIssue({
+          code: "custom",
+          path: [key],
+          message: serves
+            ? "A runtime that serves models declares api, engine and modelType."
+            : "A service (no models) has no api, engine or modelType.",
+        });
+    if (!serves && (spec.metricsReader || spec.expandMedia !== undefined))
       ctx.addIssue({
         code: "custom",
-        path: ["models"],
-        message: "A startable runtime declares the models it serves.",
+        message: "A service has no metrics reader or media expansion.",
+      });
+    if (spec.launch && serves && !spec.launch.readiness)
+      ctx.addIssue({
+        code: "custom",
+        path: ["launch", "readiness"],
+        message: "A runtime that serves models needs an HTTP readiness check.",
+      });
+    if (
+      spec.launch &&
+      !serves &&
+      !spec.launch.readiness &&
+      !spec.launch.commands.every((commands) => commands.status || commands.health)
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["launch", "readiness"],
+        message: "A service needs an HTTP readiness check or a status/health command per rank.",
       });
     const ids = new Set<string>();
     spec.models?.forEach((model, index) => {
@@ -547,6 +636,11 @@ export type RuntimeSpec = z.infer<typeof runtimeSpecSchema>;
 
 export function runtimeSpecKind(spec: Pick<RuntimeSpec, "launch">): RuntimeKindWire {
   return spec.launch ? "startable" : "always_on";
+}
+
+/** A service: startable, no models, never proxied. */
+export function runtimeSpecIsService(spec: Pick<RuntimeSpec, "models" | "address">): boolean {
+  return spec.models === undefined && spec.address === undefined;
 }
 
 // ── Node definition parts (pushed with `runtime.define.node`) ──
@@ -591,6 +685,67 @@ export const nodeMetricCommandsSchema = z
     const bytes = canonicalBytes(commands);
     return bytes !== null && bytes <= NODE_METRIC_COMMANDS_MAX_BYTES;
   }, `Node metric commands are at most ${NODE_METRIC_COMMANDS_MAX_BYTES} bytes together.`);
+
+// ── Fabrics (part of the node definition; frozen at Relay only) ──
+
+export const fabricNameSchema = z.string().regex(FABRIC_NAME_PATTERN);
+/** An IP literal (v4 or v6), never the unspecified address. */
+export const fabricIpSchema = z
+  .string()
+  .max(45)
+  .refine(
+    (value) => isIpLiteral(value) && value !== "0.0.0.0" && value !== "::",
+    "Expected the node's IP literal on this fabric.",
+  );
+
+/** A node's memberships as people and agents edit them (`nodes.update`). */
+export const nodeFabricMembershipsSchema = z
+  .array(z.object({ name: fabricNameSchema, ip: fabricIpSchema }).strict())
+  .max(NODE_FABRICS_MAX)
+  .refine(
+    (fabrics) => new Set(fabrics.map((fabric) => fabric.name)).size === fabrics.length,
+    "A node joins each fabric once.",
+  );
+
+/**
+ * The fabric part of a node's definition, as pushed in `runtime.define` (node part) and frozen
+ * at Relay only: every fabric the node is in, with its own IP and every member's IP. Sorted by
+ * fabricId; `memberIps` sorted and including `selfIp`. Its hash is `nodeFabricsHash`.
+ */
+export const nodeFabricSetsSchema = z
+  .array(
+    z
+      .object({
+        fabricId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
+        name: fabricNameSchema,
+        selfIp: fabricIpSchema,
+        memberIps: z.array(fabricIpSchema).min(1).max(FABRIC_MEMBERS_MAX),
+      })
+      .strict()
+      .refine((set) => set.memberIps.includes(set.selfIp), "memberIps includes selfIp."),
+  )
+  .max(NODE_FABRICS_MAX);
+export type NodeFabricSets = z.infer<typeof nodeFabricSetsSchema>;
+
+// ── Definition warnings (never refusals) ──
+
+export const RUNTIME_SPEC_WARNINGS = ["binds_all_interfaces"] as const;
+export type RuntimeSpecWarning = (typeof RUNTIME_SPEC_WARNINGS)[number];
+
+const ALL_INTERFACES = /(?:^|[\s=:'"(,])(?:0\.0\.0\.0|\[::\]|::)(?=$|[\s:'"/),])/;
+
+/**
+ * Warnings for a valid spec. `binds_all_interfaces`: a command or address binds 0.0.0.0 or
+ * `::`, which exposes the server beyond the node (single-node presets bind 127.0.0.1; a
+ * multi-node runtime binds the fabric with `{{fabric_ip}}`).
+ */
+export function runtimeSpecWarnings(spec: RuntimeSpec): RuntimeSpecWarning[] {
+  const texts: string[] = [];
+  if (spec.address) texts.push(spec.address.baseUrl);
+  for (const commands of spec.launch?.commands ?? [])
+    for (const value of Object.values(commands)) if (typeof value === "string") texts.push(value);
+  return texts.some((text) => ALL_INTERFACES.test(text)) ? ["binds_all_interfaces"] : [];
+}
 
 /** `[start, end]`, 1024 ≤ start ≤ end ≤ 65535. */
 export const portRangeSchema = z
@@ -665,6 +820,10 @@ export const nodeFeaturesSchema = z
       .max(64),
     mediaExpand: z.boolean(),
     liveStt: z.boolean(),
+    /** The node's secrets: names and when they were last set (never values). */
+    secrets: z
+      .array(z.object({ name: nodeSecretNameSchema, updatedAt: z.iso.datetime() }).strict())
+      .max(NODE_SECRETS_MAX),
   })
   .strict();
 export type NodeFeatures = z.infer<typeof nodeFeaturesSchema>;

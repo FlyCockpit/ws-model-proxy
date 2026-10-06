@@ -25,7 +25,9 @@ const schemaDir = fileURLToPath(new URL("../prisma/schema/", import.meta.url));
 const sql = await readFile(sqlPath, "utf8");
 const prismaSources = (
   await Promise.all(
-    (await readdir(schemaDir))
+    (
+      await readdir(schemaDir)
+    )
       .filter((name) => name.endsWith(".prisma"))
       .map((name) => readFile(`${schemaDir}${name}`, "utf8")),
   )
@@ -60,11 +62,21 @@ const REQUIRED_OBJECTS = [
   "node_shape_check",
   "node_port_range_check",
   "node_trust_lower_shape",
-  "node_frozen_peers_shape",
+  "node_frozen_fabrics_shape",
+  "node_temporary_shape",
+  "node_hold_shape",
+  "node_command_max_check",
+  "node_command_shape",
+  "node_command_transition",
+  "profile_node_hold_shape",
+  "wsmp_is_ip_literal",
+  "fabric_shape",
+  "fabric_member_shape",
   "node_metric_commands_shape",
   "node_credential_one_active",
   "node_enrollment_code_shape",
   "node_enrollment_code_use",
+  "node_enrollment_use_shape",
   "node_delete_release",
   "node_audit_event_shape",
   "node_audit_event_append_only",
@@ -110,6 +122,8 @@ const REQUIRED_OBJECTS = [
   "share_permission_shape",
   "share_consistency",
   "share_delete_cleanup",
+  "share_invite_shape",
+  "share_invite_transition",
   "api_key_pool_access",
   // providers and spend
   "provider_account_shape_check",
@@ -174,7 +188,8 @@ for (const fragment of [
   "SCHEMA_HARDENING_FORCE",
   "wmp_schema_hardening_state",
 ]) {
-  if (!applyScript.includes(fragment)) throw new Error(`Missing schema retry fragment: ${fragment}`);
+  if (!applyScript.includes(fragment))
+    throw new Error(`Missing schema retry fragment: ${fragment}`);
 }
 for (const [name, contents, fragment] of [
   ["package db:push", packageJson, "node scripts/apply-schema-hardening.mjs"],
@@ -200,7 +215,8 @@ const code = stripSqlCommentsAndLiterals(sql);
 const locks = [
   ...code.matchAll(/\bLOCK\s+TABLE\s+([\s\S]*?)\s+IN\s+ACCESS\s+EXCLUSIVE\s+MODE\s+NOWAIT\s*;/gi),
 ];
-if (locks.length !== 1) throw new Error(`expected one LOCK TABLE ... NOWAIT, found ${locks.length}`);
+if (locks.length !== 1)
+  throw new Error(`expected one LOCK TABLE ... NOWAIT, found ${locks.length}`);
 const firstStatement = code.slice(code.search(/\bBEGIN\s*;/i) + 6).trimStart();
 if (!/^LOCK\s+TABLE\b/i.test(firstStatement))
   throw new Error("the LOCK TABLE must be the first statement after BEGIN");
@@ -208,7 +224,8 @@ const locked = new Set(
   (locks[0]?.[1] ?? "").split(",").map((name) => name.trim().replace(/^"|"$/g, "")),
 );
 const missing = tables.filter(
-  (table) => new RegExp(`(?<![A-Za-z0-9_."])"?${table}"?(?![A-Za-z0-9_"])`).test(code) && !locked.has(table),
+  (table) =>
+    new RegExp(`(?<![A-Za-z0-9_."])"?${table}"?(?![A-Za-z0-9_"])`).test(code) && !locked.has(table),
 );
 if (missing.length > 0) throw new Error(`LOCK TABLE misses: ${missing.join(", ")}`);
 for (const table of locked)
@@ -360,15 +377,84 @@ try {
   // pool children exist
   await expectValue(
     "pool_create_children",
-    "SELECT count(*) FROM pool_routing r JOIN pool_fallback f USING (\"poolId\") JOIN pool_advanced a USING (\"poolId\") WHERE \"poolId\" = 'pool-a'",
+    'SELECT count(*) FROM pool_routing r JOIN pool_fallback f USING ("poolId") JOIN pool_advanced a USING ("poolId") WHERE "poolId" = \'pool-a\'',
     1,
   );
 
   // ── nodes ──
-  await expectFailure("node_port_range_check", `UPDATE node SET "portStart" = 80 WHERE id = 'node-a1'`, "23514");
   await expectFailure(
-    "node_frozen_peers_shape",
-    `UPDATE node SET "frozenPeers" = '[]' WHERE id = 'node-a1'`,
+    "node_port_range_check",
+    `UPDATE node SET "portStart" = 80 WHERE id = 'node-a1'`,
+    "23514",
+  );
+  await expectFailure(
+    "node_frozen_fabrics_shape",
+    `UPDATE node SET "frozenFabrics" = '[]' WHERE id = 'node-a1'`,
+    "23514",
+  );
+  await expectFailure(
+    "node_command_max_check",
+    `UPDATE node SET "commandMaxMs" = 90000000 WHERE id = 'node-a1'`,
+    "23514",
+  );
+  await client.query(`
+    INSERT INTO node_command (id, "userId", "nodeId", actor, subject, "startedAt", "endsBy")
+    VALUES ('AAAAAAAAAAAAAAAAAAAAAA', 'owner-a', 'node-a1', 'USER', 'hmac-sha256:00 ls', now(), now() + interval '1 hour')`);
+  await expectFailure(
+    "node_command_shape exit code while running",
+    `UPDATE node_command SET "exitCode" = 0 WHERE id = 'AAAAAAAAAAAAAAAAAAAAAA'`,
+    "23514",
+  );
+  await client.query(`UPDATE node_command SET state = 'SUCCEEDED', "exitCode" = 0, "finishedAt" = now()
+    WHERE id = 'AAAAAAAAAAAAAAAAAAAAAA'`);
+  await expectFailure(
+    "node_command_transition finished stays finished",
+    `UPDATE node_command SET state = 'RUNNING', "exitCode" = NULL, "finishedAt" = NULL WHERE id = 'AAAAAAAAAAAAAAAAAAAAAA'`,
+    "55000",
+  );
+  await expectFailure(
+    "node_command_shape lifetime over 24 h",
+    `INSERT INTO node_command (id, "userId", "nodeId", actor, subject, "startedAt", "endsBy")
+     VALUES ('BBBBBBBBBBBBBBBBBBBBBB', 'owner-a', 'node-a1', 'USER', 'x', now(), now() + interval '25 hours')`,
+    "23514",
+  );
+  await expectFailure(
+    "node_hold_shape",
+    `UPDATE node SET "holdNote" = 'switching to the sandbox agent' WHERE id = 'node-a1'`,
+    "23514",
+  );
+  await client.query(
+    `UPDATE node SET "holdAt" = now(), "holdNote" = 'sandbox agent' WHERE id = 'node-a3'`,
+  );
+  await client.query(`UPDATE node SET "holdAt" = NULL, "holdNote" = NULL WHERE id = 'node-a3'`);
+  await expectFailure(
+    "node_temporary_shape",
+    `UPDATE node SET "removeAfterOfflineMs" = 1000 WHERE id = 'node-a1'`,
+    "23514",
+  );
+  await client.query(`
+    INSERT INTO fabric (id, "userId", name) VALUES ('fab-a', 'owner-a', 'qsfp-1');
+    INSERT INTO fabric_member (id, "userId", "fabricId", "nodeId", ip) VALUES
+      ('fm-1', 'owner-a', 'fab-a', 'node-a1', '10.0.0.1'),
+      ('fm-2', 'owner-a', 'fab-a', 'node-a2', 'fd00::2')`);
+  await expectFailure(
+    "fabric_member_shape not an IP literal",
+    `INSERT INTO fabric_member (id, "userId", "fabricId", "nodeId", ip) VALUES ('fm-x', 'owner-a', 'fab-a', 'node-a3', 'host.local')`,
+    "23514",
+  );
+  await expectFailure(
+    "fabric_member_shape unspecified",
+    `INSERT INTO fabric_member (id, "userId", "fabricId", "nodeId", ip) VALUES ('fm-y', 'owner-a', 'fab-a', 'node-a3', '0.0.0.0')`,
+    "23514",
+  );
+  await expectFailure(
+    "fabric_member other owner's node",
+    `INSERT INTO fabric_member (id, "userId", "fabricId", "nodeId", ip) VALUES ('fm-z', 'owner-a', 'fab-a', 'node-b1', '10.0.0.9')`,
+    "23503",
+  );
+  await expectFailure(
+    "fabric_shape",
+    `INSERT INTO fabric (id, "userId", name) VALUES ('fab-bad', 'owner-a', 'Bad Name')`,
     "23514",
   );
   await expectFailure(
@@ -380,17 +466,43 @@ try {
     INSERT INTO node_enrollment_code (id, "userId", "codePrefix", "codeDigest", "expiresAt") VALUES
       ('code-1', 'owner-a', 'ABCDEFGH', ${HEX("e")}, now() + interval '1 hour')`);
   await expectFailure(
-    "node_enrollment_code_use owner",
-    `UPDATE node_enrollment_code SET "usedAt" = now(), "usedByNodeId" = 'node-b1' WHERE id = 'code-1'`,
+    "node_enrollment_use_shape owner",
+    `INSERT INTO node_enrollment_use (id, "userId", "codeId", "nodeId") VALUES ('use-x', 'owner-a', 'code-1', 'node-b1')`,
     "23514",
   );
-  await client.query(
-    `UPDATE node_enrollment_code SET "usedAt" = now(), "usedByNodeId" = 'node-a1' WHERE id = 'code-1'`,
+  await client.query(`
+    UPDATE node_enrollment_code SET "usedCount" = 1, "lastUsedAt" = now() WHERE id = 'code-1';
+    INSERT INTO node_enrollment_use (id, "userId", "codeId", "nodeId") VALUES ('use-1', 'owner-a', 'code-1', 'node-a1')`);
+  await expectFailure(
+    "node_enrollment_code_shape max uses",
+    `UPDATE node_enrollment_code SET "usedCount" = 2 WHERE id = 'code-1'`,
+    "23514",
+  );
+  await client.query(`
+    INSERT INTO node_enrollment_code (id, "userId", "codePrefix", "codeDigest", "expiresAt", "maxUses", labels) VALUES
+      ('code-m', 'owner-a', 'ABCDEFGH', ${HEX("d")}, now() + interval '1 hour', 3, '{gpu}')`);
+  await expectFailure(
+    "node_enrollment_code_use one at a time",
+    `UPDATE node_enrollment_code SET "usedCount" = 2, "lastUsedAt" = now() WHERE id = 'code-m'`,
+    "55000",
+  );
+  await client.query(`UPDATE node_enrollment_code SET "revokedAt" = now() WHERE id = 'code-m'`);
+  await expectFailure(
+    "node_enrollment_code_use revoked",
+    `UPDATE node_enrollment_code SET "usedCount" = 1, "lastUsedAt" = now() WHERE id = 'code-m'`,
+    "55000",
   );
   await expectFailure(
-    "node_enrollment_code_use single use",
-    `UPDATE node_enrollment_code SET "usedAt" = now() + interval '1 minute' WHERE id = 'code-1'`,
-    "55000",
+    "node_enrollment_code_shape replace is single-use",
+    `INSERT INTO node_enrollment_code (id, "userId", "codePrefix", "codeDigest", "expiresAt", "maxUses", "replaceNodeId") VALUES
+      ('code-r', 'owner-a', 'ABCDEFGH', ${HEX("c")}, now() + interval '1 hour', 2, 'node-a1')`,
+    "23514",
+  );
+  await expectFailure(
+    "node_enrollment_code_shape max 50",
+    `INSERT INTO node_enrollment_code (id, "userId", "codePrefix", "codeDigest", "expiresAt", "maxUses") VALUES
+      ('code-51', 'owner-a', 'ABCDEFGH', ${HEX("b")}, now() + interval '1 hour', 51)`,
+    "23514",
   );
   await expectFailure(
     "node_enrollment_code_shape ttl",
@@ -435,6 +547,20 @@ try {
     `INSERT INTO runtime_version (id, "runtimeId", version, editor, "editorUserId", "contentHash",
       "launchHash", spec, api, engine, "modelType") VALUES
       ('v-bad', 'rt-s', 9, 'USER', 'owner-a', ${HEX("9")}, ${HEX("9")}, ${STARTABLE}, 'OPENAI', 'SGLANG', 'LLM')`,
+    "23514",
+  );
+  // a service: startable, no api/engine/modelType/models
+  await client.query(`
+    INSERT INTO runtime (id, "userId", slug, name, kind, origin) VALUES
+      ('rt-svc', 'owner-a', 'sandbox-agent', 'Sandbox agent', 'STARTABLE', 'SERVER');
+    INSERT INTO runtime_version (id, "runtimeId", version, editor, "editorUserId", "contentHash",
+      "launchHash", spec) VALUES
+      ('v-svc1', 'rt-svc', 1, 'USER', 'owner-a', ${HEX("5")}, ${HEX("5")}, '{"launch":{}}')`);
+  await expectFailure(
+    "runtime_version_derived_columns service with a model type",
+    `INSERT INTO runtime_version (id, "runtimeId", version, editor, "editorUserId", "contentHash",
+      "launchHash", spec, "modelType") VALUES
+      ('v-svc2', 'rt-svc', 2, 'USER', 'owner-a', ${HEX("5")}, ${HEX("5")}, '{"launch":{}}', 'LLM')`,
     "23514",
   );
   await expectFailure(
@@ -590,7 +716,9 @@ try {
       ('m-b-stt', 'pool-a', 'LOCAL', 'rm-b-stt', 'share-b')`,
     "23514",
   );
-  await client.query(`UPDATE pool_routing SET "ownHardwareOnly" = true WHERE "poolId" = 'pool-vision'`);
+  await client.query(
+    `UPDATE pool_routing SET "ownHardwareOnly" = true WHERE "poolId" = 'pool-vision'`,
+  );
   await client.query(`
     INSERT INTO share (id, "poolId", "ownerUserId", "granteeUserId", "canContribute", "canUse")
     VALUES ('share-v', 'pool-vision', 'owner-a', 'owner-b', true, false)`);
@@ -609,6 +737,34 @@ try {
     "share_shape",
     `INSERT INTO share (id, "poolId", "ownerUserId", "granteeUserId") VALUES ('share-self', 'pool-a', 'owner-a', 'owner-a')`,
     "23514",
+  );
+  // share invites
+  await expectFailure(
+    "share_invite_shape e-mail",
+    `INSERT INTO share_invite (id, "poolId", "ownerUserId", email, "tokenDigest", "expiresAt")
+     VALUES ('inv-bad', 'pool-a', 'owner-a', 'New@Example.test', ${HEX("a")}, now() + interval '7 days')`,
+    "23514",
+  );
+  await client.query(`
+    INSERT INTO share_invite (id, "poolId", "ownerUserId", email, "tokenDigest", "expiresAt")
+    VALUES ('inv-1', 'pool-a', 'owner-a', 'b@example.test', ${HEX("a")}, now() + interval '7 days')`);
+  await expectFailure(
+    "share_invite_transition identity",
+    `UPDATE share_invite SET email = 'c@example.test' WHERE id = 'inv-1'`,
+    "55000",
+  );
+  await expectFailure(
+    "share_invite_transition accepted share",
+    `UPDATE share_invite SET "acceptedAt" = now(), "shareId" = 'share-v' WHERE id = 'inv-1'`,
+    "23514",
+  );
+  await client.query(
+    `UPDATE share_invite SET "acceptedAt" = now(), "shareId" = 'share-b' WHERE id = 'inv-1'`,
+  );
+  await expectFailure(
+    "share_invite_transition final",
+    `UPDATE share_invite SET "canContribute" = true WHERE id = 'inv-1'`,
+    "55000",
   );
   // sidecars
   await expectFailure(
@@ -650,7 +806,9 @@ try {
   await app.connect();
   await app.query("SET wsmp.fences = ''");
   try {
-    await app.query(`INSERT INTO pool (id, "userId", slug, name, "modelType") VALUES ('pool-f', 'owner-a', 'f', 'F', 'LLM')`);
+    await app.query(
+      `INSERT INTO pool (id, "userId", slug, name, "modelType") VALUES ('pool-f', 'owner-a', 'f', 'F', 'LLM')`,
+    );
     failures += 1;
     process.stderr.write("✗ graph write without the owner fence succeeded\n");
   } catch (error) {
@@ -661,7 +819,9 @@ try {
   }
   await app.query("BEGIN");
   await app.query("SELECT wsmp_acquire_fences(ARRAY['00:owner:owner-a'], true)");
-  await app.query(`INSERT INTO pool (id, "userId", slug, name, "modelType") VALUES ('pool-f', 'owner-a', 'f', 'F', 'LLM')`);
+  await app.query(
+    `INSERT INTO pool (id, "userId", slug, name, "modelType") VALUES ('pool-f', 'owner-a', 'f', 'F', 'LLM')`,
+  );
   await app.query(`UPDATE pool_routing SET "keptSlots" = 2 WHERE "poolId" = 'pool-f'`);
   await app.query("COMMIT");
   await app.query("BEGIN");
@@ -678,7 +838,9 @@ try {
   }
   await app.query("ROLLBACK");
   await app.query("BEGIN");
-  await app.query("SELECT wsmp_acquire_fences(ARRAY['00:owner:owner-a', '06:capacity-policy:t-m'], true)");
+  await app.query(
+    "SELECT wsmp_acquire_fences(ARRAY['00:owner:owner-a', '06:capacity-policy:t-m'], true)",
+  );
   await app.query(`UPDATE pool_routing SET "keptSlots" = 3 WHERE "poolId" = 'pool-a'`);
   await app.query("COMMIT");
 
@@ -792,35 +954,91 @@ try {
   // ── delete rules (plan cases 1-6) ──
   // 4. a pinned runtime cannot be deleted; a node holding one gives a clean reason.
   await expectFailure("pinned runtime delete", `DELETE FROM runtime WHERE id = 'rt-a'`, "23503");
-  await expectFailure("node delete with a pinned always-on runtime", `DELETE FROM node WHERE id = 'node-a1'`, "WMPP1");
+  await expectFailure(
+    "node delete with a pinned always-on runtime",
+    `DELETE FROM node WHERE id = 'node-a1'`,
+    "WMPP1",
+  );
   await client.query(`DELETE FROM profile_item WHERE id = 'item-a'`);
   // 2. the node holding the head of a multi-node instance (and a worker of nothing else)
   await client.query(`DELETE FROM node WHERE id = 'node-a2'`);
-  await expectValue("head node delete releases its part", `SELECT claim FROM instance_rank WHERE id = 'rank-m0'`, "RELEASED");
-  await expectValue("head node delete keeps the rank row", `SELECT count(*) FROM instance_rank WHERE id = 'rank-m0' AND "nodeId" IS NULL`, 1);
-  await expectValue("head node delete stops the instance", `SELECT phase FROM runtime_instance WHERE id = 'inst-m'`, "STOPPING");
-  await expectValue("surviving worker stays held", `SELECT claim FROM instance_rank WHERE id = 'rank-m1'`, "HELD");
+  await expectValue(
+    "head node delete releases its part",
+    `SELECT claim FROM instance_rank WHERE id = 'rank-m0'`,
+    "RELEASED",
+  );
+  await expectValue(
+    "head node delete keeps the rank row",
+    `SELECT count(*) FROM instance_rank WHERE id = 'rank-m0' AND "nodeId" IS NULL`,
+    1,
+  );
+  await expectValue(
+    "head node delete stops the instance",
+    `SELECT phase FROM runtime_instance WHERE id = 'inst-m'`,
+    "STOPPING",
+  );
+  await expectValue(
+    "surviving worker stays held",
+    `SELECT claim FROM instance_rank WHERE id = 'rank-m1'`,
+    "HELD",
+  );
   // 3. the node holding only workers: its open step ends, its parts are released
   await client.query(`DELETE FROM node WHERE id = 'node-a3'`);
-  await expectValue("worker node delete releases", `SELECT count(*) FROM instance_rank WHERE claim <> 'RELEASED'`, 0);
-  await expectValue("worker node delete ends open steps", `SELECT state FROM instance_step WHERE id = 'step-m1'`, "CANCELLED");
+  await expectValue(
+    "worker node delete releases",
+    `SELECT count(*) FROM instance_rank WHERE claim <> 'RELEASED'`,
+    0,
+  );
+  await expectValue(
+    "worker node delete ends open steps",
+    `SELECT state FROM instance_step WHERE id = 'step-m1'`,
+    "CANCELLED",
+  );
   // always-on runtimes leave with their node (instance first)
   await client.query(`DELETE FROM node WHERE id = 'node-a1'`);
-  await expectValue("always-on runtime removed with its node", `SELECT count(*) FROM runtime WHERE id = 'rt-a'`, 0);
+  await expectValue(
+    "always-on runtime removed with its node",
+    `SELECT count(*) FROM runtime WHERE id = 'rt-a'`,
+    0,
+  );
   // a running runtime cannot be deleted before its instances
-  await expectFailure("runtime delete with instances", `DELETE FROM runtime WHERE id = 'rt-s'`, "23503");
+  await expectFailure(
+    "runtime delete with instances",
+    `DELETE FROM runtime WHERE id = 'rt-s'`,
+    "23503",
+  );
   // 5. a pool used as another pool's sidecar
   await client.query(`DELETE FROM pool WHERE id = 'pool-vision'`);
-  await expectValue("sidecar link removed with its target", `SELECT count(*) FROM pool_sidecar WHERE id = 'sc-img'`, 0);
+  await expectValue(
+    "sidecar link removed with its target",
+    `SELECT count(*) FROM pool_sidecar WHERE id = 'sc-img'`,
+    0,
+  );
   // routing rules follow their member
   await client.query(`DELETE FROM pool_member WHERE id = 'member-a'`);
-  await expectValue("targeted rule removed with its member", `SELECT count(*) FROM pool_routing_rule WHERE id = 'rule-target'`, 0);
-  await expectValue("exclude rule becomes pool-wide", `SELECT count(*) FROM pool_routing_rule WHERE id = 'rule-exclude' AND "memberId" IS NULL AND NOT exclude`, 1);
+  await expectValue(
+    "targeted rule removed with its member",
+    `SELECT count(*) FROM pool_routing_rule WHERE id = 'rule-target'`,
+    0,
+  );
+  await expectValue(
+    "exclude rule becomes pool-wide",
+    `SELECT count(*) FROM pool_routing_rule WHERE id = 'rule-exclude' AND "memberId" IS NULL AND NOT exclude`,
+    1,
+  );
   // 6. clearing can-contribute, then deleting a share
   await client.query(`UPDATE share SET "canContribute" = false WHERE id = 'share-b'`);
-  await expectValue("clearing canContribute removes contributed members", `SELECT count(*) FROM pool_member WHERE "shareId" = 'share-b'`, 0);
+  await expectValue(
+    "clearing canContribute removes contributed members",
+    `SELECT count(*) FROM pool_member WHERE "shareId" = 'share-b'`,
+    0,
+  );
   await client.query(`DELETE FROM share WHERE id = 'share-b'`);
-  await expectValue("share delete removes the grantee's API-key entries", `SELECT count(*) FROM api_key_pool WHERE "apiKeyId" = 'key-b'`, 0);
+  await expectValue(
+    "share delete removes the grantee's API-key entries",
+    `SELECT count(*) FROM api_key_pool WHERE "apiKeyId" = 'key-b'`,
+    0,
+  );
   // 1. a user with running instances: the sweeper's order (instances, profiles, runtimes,
   //    nodes, pools, providers, user) succeeds.
   await client.query(`

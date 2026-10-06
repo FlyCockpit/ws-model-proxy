@@ -75,6 +75,15 @@ export const NODE_AUDIT_OUTCOME = [
   "auto_settled",
 ] as const;
 export const QUEUED_COMMAND_STATE = ["QUEUED", "RUN", "DISMISSED", "EXPIRED", "REFUSED"] as const;
+export const NODE_COMMAND_STATE = [
+  "RUNNING",
+  "SUCCEEDED",
+  "FAILED",
+  "CANCELLED",
+  "TIMED_OUT",
+  "INTERRUPTED",
+  "UNKNOWN",
+] as const;
 export const RUNTIME_KIND = ["ALWAYS_ON", "STARTABLE"] as const;
 export const RUNTIME_ORIGIN = ["NODE", "SERVER"] as const;
 export const RUNTIME_API = ["OPENAI", "ANTHROPIC"] as const;
@@ -147,6 +156,7 @@ export const PRISMA_ENUM_MIRRORS = {
   NodeAuditKind: NODE_AUDIT_KIND,
   NodeAuditOutcome: NODE_AUDIT_OUTCOME,
   QueuedCommandState: QUEUED_COMMAND_STATE,
+  NodeCommandState: NODE_COMMAND_STATE,
   RuntimeKind: RUNTIME_KIND,
   RuntimeOrigin: RUNTIME_ORIGIN,
   RuntimeApi: RUNTIME_API,

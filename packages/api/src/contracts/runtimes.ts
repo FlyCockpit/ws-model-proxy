@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { runtimeSpecSchema } from "../lib/runtime-spec";
+import { RUNTIME_SPEC_WARNINGS, runtimeSpecSchema } from "../lib/runtime-spec";
 import {
   runtimeAdvancedPatchSchema,
   runtimeAdvancedViewSchema,
@@ -169,7 +169,9 @@ export const runtimeSummarySchema = z
     kind: z.enum(RUNTIME_KIND),
     origin: z.enum(RUNTIME_ORIGIN),
     nodeId: idSchema.nullable(),
-    modelType: z.enum(MODEL_TYPE),
+    /** Null for a service (no models, never proxied). */
+    modelType: z.enum(MODEL_TYPE).nullable(),
+    service: z.boolean(),
     currentVersion: runtimeVersionSummarySchema,
     models: z.array(z.string()),
     instances: z
@@ -220,6 +222,7 @@ export const previewWarningSchema = z
       "pins_outdated",
       "interactive_needs_person",
       "definition_not_on_node",
+      "binds_all_interfaces",
     ]),
     nodeId: idSchema.nullable(),
     detail: z.string(),
@@ -252,7 +255,7 @@ export const startPreviewSchema = z
     ),
     kept: z.array(idSchema),
     warnings: z.array(previewWarningSchema),
-    /** Why it cannot run (e.g. trust_relay for an agent, definition_frozen, no_frozen_peer_set). */
+    /** Why it cannot run (e.g. trust_relay for an agent, definition_frozen, no_shared_fabric, node_held). */
     refusals: z.array(refusalSchema),
   })
   .strict();
@@ -372,9 +375,10 @@ export const runtimesContract = {
         runtime: runtimeSummarySchema,
         version: runtimeVersionSummarySchema,
         define: z.array(defineResultSchema),
+        warnings: z.array(z.enum(RUNTIME_SPEC_WARNINGS)),
       })
       .strict(),
-    "Create a runtime (version 1) and push it to the nodes that need it.",
+    "Create a runtime (version 1) and push it to the nodes that need it. Warns (never refuses) when it binds 0.0.0.0 or ::.",
     ["runtime_create"],
   ),
   update: mutation(
@@ -409,6 +413,7 @@ export const runtimesContract = {
         ),
         restarted: z.array(idSchema),
         define: z.array(defineResultSchema),
+        warnings: z.array(z.enum(RUNTIME_SPEC_WARNINGS)),
       })
       .strict(),
     "New version. Same launch hash: adopted live. A launch change to an always-on runtime on a Relay-only node is refused (launch_change_on_relay_only). With MCP capability overrides, the overrides and the new version commit in one transaction or not at all.",
@@ -527,7 +532,7 @@ export const runtimesContract = {
   },
   shares: {
     list: query(
-      "session",
+      "agent",
       z.object({ runtimeId: idSchema.optional() }).strict(),
       z
         .object({
@@ -555,6 +560,7 @@ export const runtimesContract = {
         })
         .strict(),
       "Runtime definitions you share and that are shared with you.",
+      ["runtimes_get"],
     ),
     create: mutation(
       "human",
@@ -570,7 +576,7 @@ export const runtimesContract = {
     ),
   },
   fork: mutation(
-    "human",
+    "agent",
     z
       .object({
         runtimeId: idSchema,
@@ -581,6 +587,7 @@ export const runtimesContract = {
       })
       .strict(),
     runtimeSummarySchema,
-    "Copy a shared definition into your own runtime.",
+    "Copy a definition shared with you into your own runtime (agents: onto your Full-control nodes).",
+    ["runtime_create"],
   ),
 } as const;

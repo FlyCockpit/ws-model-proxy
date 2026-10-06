@@ -87,6 +87,21 @@ const shareSettings = {
   monthlyCap: z.object({ limit: moneySchema, currency: currencySchema }).strict().nullable(),
 };
 
+export const shareInviteViewSchema = z
+  .object({
+    id: idSchema,
+    poolId: idSchema,
+    callableId: z.string(),
+    email: z.string(),
+    canUse: z.boolean(),
+    canContribute: z.boolean(),
+    priorityClass: z.enum(PRIORITY_CLASS).nullable(),
+    createdAt: isoDateSchema,
+    expiresAt: isoDateSchema,
+    emailSentAt: isoDateSchema.nullable(),
+  })
+  .strict();
+
 export const accessContract = {
   apiKeys: {
     list: query(
@@ -168,6 +183,8 @@ export const accessContract = {
         .object({
           byMe: z.array(shareViewSchema),
           withMe: z.array(shareViewSchema),
+          /** Pending invites to e-mails without an account yet. */
+          invites: z.array(shareInviteViewSchema),
         })
         .strict(),
       "Shares of your pools, and pools shared with you.",
@@ -180,8 +197,18 @@ export const accessContract = {
         .refine((input) => input.canUse || input.canContribute, {
           message: "A share needs can use, can contribute, or both.",
         }),
-      shareViewSchema,
-      "Share a pool with a person (can use and/or can contribute).",
+      z.discriminatedUnion("kind", [
+        z.object({ kind: z.literal("share"), share: shareViewSchema }).strict(),
+        z
+          .object({
+            kind: z.literal("invite"),
+            invite: shareInviteViewSchema,
+            /** Shown once, only when no e-mail could be sent: copy it to the person. */
+            link: z.string().nullable(),
+          })
+          .strict(),
+      ]),
+      "Share a pool with a person. An e-mail without an account becomes an invite (e-mailed when SMTP is set up, otherwise a link to copy); the share starts when they sign up, even with open sign-up off.",
     ),
     update: mutation(
       "human",
@@ -216,6 +243,20 @@ export const accessContract = {
         .strict(),
       shareViewSchema,
       "As the share holder: use your own provider key for this pool's cloud fallback.",
+    ),
+  },
+  invites: {
+    resend: mutation(
+      "human",
+      z.object({ inviteId: idSchema }).strict(),
+      z.object({ invite: shareInviteViewSchema, link: z.string().nullable() }).strict(),
+      "Send the invite again with a new link (the old link stops working).",
+    ),
+    revoke: mutation(
+      "human",
+      z.object({ inviteId: idSchema }).strict(),
+      okSchema,
+      "Withdraw an invite.",
     ),
   },
   contributing: {

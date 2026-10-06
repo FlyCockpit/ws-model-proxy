@@ -57,7 +57,11 @@ pub enum RuntimeKind {
 }
 
 /// Placeholders a command may use (§4.6 types every value on the node).
-pub const RUNTIME_PLACEHOLDERS: [&str; 10] = [
+/// `head_addr` is the head's IP on the instance's fabric (server-sent); the
+/// `fabric_*` values are derived by the node from its own IP on that fabric
+/// (`/sys/class/net`, the InfiniBand device mapping). The server never sends
+/// interface or device names.
+pub const RUNTIME_PLACEHOLDERS: [&str; 12] = [
     "node_rank",
     "nnodes",
     "port",
@@ -66,9 +70,14 @@ pub const RUNTIME_PLACEHOLDERS: [&str; 10] = [
     "gpu_ids",
     "vram_gb",
     "memory_fraction",
-    "iface",
     "head_addr",
+    "fabric_ip",
+    "fabric_iface",
+    "fabric_rdma_device",
 ];
+/// Fabrics one node belongs to, and members of one fabric.
+pub const NODE_FABRICS_MAX: usize = 16;
+pub const FABRIC_MEMBERS_MAX: usize = 64;
 pub const RUNTIME_COMMAND_MAX_BYTES: usize = 4096;
 /// Canonical bytes of one spec; below the 64 KiB control cap so one define
 /// envelope always fits one chunk.
@@ -81,9 +90,14 @@ pub const NODE_METRIC_COMMANDS_MAX: usize = 16;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimeSpec {
-    pub api: RuntimeApi,
-    pub engine: Engine,
-    pub model_type: ModelType,
+    /// `api`, `engine`, `model_type` and `models` together: absent on a
+    /// service (startable, never proxied).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<RuntimeApi>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<Engine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_type: Option<ModelType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<Vec<SpecModel>>,
     /// ALWAYS_ON only.
@@ -138,7 +152,7 @@ pub enum EmbeddingNormalization {
     L2,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TranscriptionProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -200,7 +214,7 @@ pub struct AddressAuth {
     pub mode: AuthMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header: Option<String>,
-    /// `WSMP_ENDPOINT_*`; the value never leaves the node.
+    /// A node secret name (`WSMP_SECRET_*`); the value never leaves the node.
     pub env: String,
 }
 
@@ -229,10 +243,17 @@ pub struct Launch {
     pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<FixedPort>,
+    /// Multi-node only: the fabric (by name) every rank shares.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub iface: Option<String>,
+    pub fabric: Option<String>,
     pub commands: Vec<Commands>,
-    pub readiness: Readiness,
+    /// Node secrets (names) exported to every command of this runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<Vec<String>>,
+    /// Required when the runtime serves models; a service may use
+    /// `status`/`health` commands instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<Readiness>,
     pub health: Health,
 }
 
@@ -506,6 +527,15 @@ pub struct NodeFeatures {
     pub runtime_hosts: Vec<String>,
     pub media_expand: bool,
     pub live_stt: bool,
+    /// The node's secrets: names and when they were last set (never values).
+    pub secrets: Vec<SecretEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecretEntry {
+    pub name: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -19,9 +19,16 @@ import { embeddingContractSchema } from "@ws-model-proxy/api/lib/embedding-contr
 import {
   ENGINES,
   MODEL_CAPABILITIES,
+  NODE_COMMAND_MAX_MS,
+  NODE_COMMAND_MIN_MS,
+  NODE_COMMAND_STATES,
+  NODE_COMMAND_TAIL_MAX_BYTES,
+  NODE_SECRET_VALUE_MAX_BYTES,
   nodeDeclaredHardwareSchema,
+  nodeFabricSetsSchema,
   nodeFeaturesSchema,
   nodeMetricCommandsSchema,
+  nodeSecretNameSchema,
   portRangeSchema,
   READER_SIGNALS,
   RUNTIME_APIS,
@@ -146,28 +153,15 @@ const metricName = z.string().regex(/^[A-Za-z0-9_.:-]{1,64}$/);
 export const NODE_TRUST_VALUES = ["full", "relay"] as const;
 export type NodeTrustWire = (typeof NODE_TRUST_VALUES)[number];
 
-/** The peer set of a frozen multi-node definition (§4.4), keyed by runtime. */
-export const frozenPeerSetSchema = z
-  .object({
-    runtimeId: rowIdSchema,
-    /** The head IP literal this node last joined. */
-    headAddr: z.string().regex(/^(?:[0-9.]{7,15}|[0-9A-Fa-f:.]{2,45})$/),
-  })
-  .strict();
-
 export const nodeTrustStateSchema = z
   .object({
     value: z.enum(NODE_TRUST_VALUES),
     /** True exactly while `value` is relay: held definitions and metric commands are frozen. */
     frozen: z.boolean(),
-    frozenPeers: z.array(frozenPeerSetSchema).max(RUNTIME_DEFINITIONS_MAX).optional(),
   })
   .strict()
   .refine((trust) => trust.frozen === (trust.value === "relay"), {
     message: "frozen is true exactly at relay.",
-  })
-  .refine((trust) => trust.value === "relay" || trust.frozenPeers === undefined, {
-    message: "Only a relay node reports frozen peers.",
   });
 
 /**
@@ -339,6 +333,8 @@ export const nodeInfoFrameSchema = z
             addresses: z.array(z.string().min(1).max(64)).max(16).optional(),
             linkSpeedMbps: z.number().int().min(0).max(10_000_000).optional(),
             mtu: z.number().int().min(0).max(1_000_000).optional(),
+            /** An RDMA device is bound to this interface (fabric suggestions only). */
+            rdma: z.boolean().optional(),
           })
           .strict(),
       )
@@ -543,6 +539,14 @@ export const runtimeDefineFrameSchema = z
         metricCommands: z
           .object({ hash: sha256HexSchema, commands: nodeMetricCommandsSchema })
           .strict(),
+        /**
+         * The fabrics this node is in (owner decision round 3): its own IP and every member's
+         * IP per fabric. At Relay only the node keeps its frozen copy, and a multi-node job is
+         * refused unless the head address is a member of the job's fabric in that copy.
+         */
+        fabrics: z.object({ hash: sha256HexSchema, sets: nodeFabricSetsSchema }).strict(),
+        /** The longest lifetime of one node command. */
+        commandMaxMs: z.number().int().min(NODE_COMMAND_MIN_MS).max(NODE_COMMAND_MAX_MS),
       })
       .strict()
       .optional(),
@@ -615,17 +619,23 @@ export const runtimeDefineResultFrameSchema = z
     /** Final only: hash of the metric commands the node holds (null: none received yet). */
     heldMetricCommandsHash: sha256HexSchema.nullable().optional(),
     heldPortRange: portRangeSchema.nullable().optional(),
+    /** Final only: hash of the fabric sets the node holds (null: none received yet). */
+    heldFabricsHash: sha256HexSchema.nullable().optional(),
     frozen: z.boolean().optional(),
   })
   .strict()
   .refine(
     (frame) =>
-      [frame.held, frame.heldMetricCommandsHash, frame.heldPortRange, frame.frozen].every(
-        (field) => (field !== undefined) === frame.final,
-      ),
+      [
+        frame.held,
+        frame.heldMetricCommandsHash,
+        frame.heldPortRange,
+        frame.heldFabricsHash,
+        frame.frozen,
+      ].every((field) => (field !== undefined) === frame.final),
     {
       message:
-        "held, heldMetricCommandsHash, heldPortRange and frozen exactly on the final answer.",
+        "held, heldMetricCommandsHash, heldPortRange, heldFabricsHash and frozen exactly on the final answer.",
     },
   )
   .refine((frame) => encodedBytes(frame) <= CHUNK_BUDGET_BYTES, {
@@ -660,10 +670,6 @@ export const jobPlaceholdersSchema = z
     memory_gb: canonicalDecimalSchema.optional(),
     vram_gb: canonicalDecimalSchema.optional(),
     memory_fraction: canonicalDecimalSchema.optional(),
-    iface: z
-      .string()
-      .regex(/^[A-Za-z0-9_.:-]{1,15}$/)
-      .optional(),
   })
   .strict();
 export type JobPlaceholders = z.infer<typeof jobPlaceholdersSchema>;
@@ -685,6 +691,12 @@ export const runtimeJobFrameSchema = z
     handle: z.string().regex(INSTANCE_HANDLE_PATTERN),
     unitName: z.string().regex(UNIT_NAME_PATTERN),
     placeholders: jobPlaceholdersSchema,
+    /**
+     * Multi-node only: the fabric the instance runs in. The node resolves `fabric_ip`,
+     * `fabric_iface` and `fabric_rdma_device` from its own IP on it; `head_addr` is the head's
+     * IP on it.
+     */
+    fabricId: rowIdSchema.optional(),
     /** Relative step deadline (the server keeps the absolute `InstanceStep.deadline`). */
     timeoutMs: z.number().int().min(1_000).max(86_400_000),
     ownerEpoch: z.string().regex(/^[A-Za-z0-9_:-]{1,128}$/),
@@ -700,6 +712,12 @@ export const runtimeJobFrameSchema = z
   })
   .strict()
   .refine((job) => job.rank < job.nnodes, { message: "rank must be below nnodes." })
+  .refine(
+    (job) =>
+      job.nnodes > 1 === (job.fabricId !== undefined) &&
+      job.nnodes > 1 === (job.placeholders.head_addr !== undefined),
+    { message: "fabricId and head_addr exactly for multi-node jobs." },
+  )
   .refine((job) => job.unitName === runtimeUnitName(job.handle, job.rank), {
     message: "unitName must be wsmp-<handle>-r<rank>.",
   });
@@ -850,10 +868,108 @@ export const helloFrameSchema = z
     definitions: z.array(heldDefinitionSchema).max(RUNTIME_DEFINITIONS_MAX),
     heldMetricCommandsHash: sha256HexSchema.nullable(),
     heldPortRange: portRangeSchema.nullable(),
+    heldFabricsHash: sha256HexSchema.nullable(),
   })
   .strict();
 
+// ── Node secrets (owner decision round 3) ──
+
+/**
+ * Sets one node secret (Full control only; a Relay-only node refuses with `trust_relay`). The
+ * value exists only in this frame and on the node (stored 0600): never logged, never stored in
+ * the database, redacted from audit records and error descriptions
+ * ({@link redactFrameForLog}).
+ */
+export const secretSetFrameSchema = z
+  .object({
+    type: z.literal("secret.set"),
+    id: relayIdSchema,
+    name: nodeSecretNameSchema,
+    value: z
+      .string()
+      .min(1)
+      .refine(
+        (value) => new TextEncoder().encode(value).byteLength <= NODE_SECRET_VALUE_MAX_BYTES,
+        "A secret value is at most 16 KiB.",
+      ),
+  })
+  .strict();
+
+export const SECRET_REFUSALS = ["trust_relay", "invalid", "store_failed", "limit"] as const;
+/** The node's answer: the name only, never the value. */
+export const secretResultFrameSchema = z
+  .object({
+    type: z.literal("secret.result"),
+    id: relayIdSchema,
+    name: nodeSecretNameSchema,
+    status: z.enum(["set", "deleted", "not_found", "refused"]),
+    reason: z.enum(SECRET_REFUSALS).optional(),
+    updatedAt: isoTimeSchema.optional(),
+  })
+  .strict()
+  .refine((frame) => (frame.status === "refused") === (frame.reason !== undefined), {
+    message: "reason exactly for refused results.",
+  });
+
+export const REDACTED_SECRET_VALUE = "[redacted]";
+
+/**
+ * A copy of a frame safe for logs, audit and error text: a `secret.set` value is replaced.
+ * Every log/describe path of the relay goes through this (or never touches the frame).
+ */
+export function redactFrameForLog<T>(frame: T): T {
+  if (
+    frame !== null &&
+    typeof frame === "object" &&
+    "type" in frame &&
+    frame.type === "secret.set" &&
+    "value" in frame
+  )
+    return { ...frame, value: REDACTED_SECRET_VALUE };
+  return frame;
+}
+
+// ── Node commands (owner decision round 3: pollable, node-held output) ──
+
+/**
+ * A command's state as the node holds it. Sent unprompted when a command ends, in answer to
+ * `exec.poll`, and after a reconnect for every command that was running before a daemon
+ * restart (`interrupted`). `tail` is the end of the combined stdout/stderr ring buffer (masked
+ * by the node), at most `tailBytes` of the poll; `truncated` marks a cut start.
+ */
+export const execStatusFrameSchema = z
+  .object({
+    type: z.literal("exec.status"),
+    commandId: base64Url16Schema,
+    state: z.enum(NODE_COMMAND_STATES),
+    exitCode: z.number().int().min(0).max(255).optional(),
+    signal: exitSignalSchema,
+    startedAt: isoTimeSchema.optional(),
+    endsBy: isoTimeSchema.optional(),
+    finishedAt: isoTimeSchema.optional(),
+    tail: z
+      .string()
+      .refine(
+        (tail) => new TextEncoder().encode(tail).byteLength <= NODE_COMMAND_TAIL_MAX_BYTES,
+        "A command output tail is at most 64 KiB.",
+      )
+      .optional(),
+    truncated: z.boolean().optional(),
+    /** Output bytes the command produced so far (the ring buffer may hold less). */
+    outputBytes: byteCounter.optional(),
+  })
+  .strict()
+  .refine((frame) => (frame.state === "running") === (frame.finishedAt === undefined), {
+    message: "finishedAt exactly once the command ended.",
+  })
+  .refine(
+    (frame) =>
+      frame.exitCode === undefined || frame.state === "succeeded" || frame.state === "failed",
+    { message: "An exit code only for succeeded or failed commands." },
+  );
+
 export const nodeToServerControlFrameSchema = z.discriminatedUnion("type", [
+  secretResultFrameSchema,
   helloFrameSchema,
   z
     .object({ type: z.literal("heartbeat"), id: relayIdSchema, sentAt: isoTimeSchema.optional() })
@@ -1037,7 +1153,15 @@ export const nodeToServerControlFrameSchema = z.discriminatedUnion("type", [
       signal: exitSignalSchema,
     })
     .strict(),
-  z.object({ type: z.literal("exec.started"), commandId: base64Url16Schema }).strict(),
+  z
+    .object({
+      type: z.literal("exec.started"),
+      commandId: base64Url16Schema,
+      startedAt: isoTimeSchema,
+      /** startedAt + min(timeoutMs, the node's commandMaxMs). */
+      endsBy: isoTimeSchema,
+    })
+    .strict(),
   z
     .object({
       type: z.literal("exec.rejected"),
@@ -1045,15 +1169,7 @@ export const nodeToServerControlFrameSchema = z.discriminatedUnion("type", [
       reason: z.string().min(1).max(64),
     })
     .strict(),
-  z
-    .object({
-      type: z.literal("exec.done"),
-      commandId: base64Url16Schema,
-      exitCode: z.number().int().min(0).max(255).optional(),
-      signal: exitSignalSchema,
-      timedOut: z.boolean(),
-    })
-    .strict(),
+  execStatusFrameSchema,
   fileResultFrameSchema,
   fileRejectedFrameSchema,
   ...sttClientControlSchemas,
@@ -1109,6 +1225,10 @@ export const serverToNodeControlFrameSchema = z.discriminatedUnion("type", [
   /** A person lowered trust in the browser; the node persists relay and answers `node.state`. */
   z
     .object({ type: z.literal("trust.lower"), id: relayIdSchema, requestedAt: isoTimeSchema })
+    .strict(),
+  secretSetFrameSchema,
+  z
+    .object({ type: z.literal("secret.delete"), id: relayIdSchema, name: nodeSecretNameSchema })
     .strict(),
   runtimeDefineFrameSchema,
   z.object({ type: z.literal("runtime.detect"), id: relayIdSchema }).strict(),
@@ -1201,6 +1321,16 @@ export const serverToNodeControlFrameSchema = z.discriminatedUnion("type", [
       commandId: base64Url16Schema,
       command: z.string().min(1).max(16_384),
       cwd: z.string().min(1).max(4096).optional(),
+      /** Requested lifetime; the node caps it at its commandMaxMs and kills the whole tree. */
+      timeoutMs: z.number().int().min(1_000).max(NODE_COMMAND_MAX_MS),
+    })
+    .strict(),
+  /** Ask for a command's state and output tail; answered with `exec.status`. */
+  z
+    .object({
+      type: z.literal("exec.poll"),
+      commandId: base64Url16Schema,
+      tailBytes: z.number().int().min(0).max(NODE_COMMAND_TAIL_MAX_BYTES),
     })
     .strict(),
   z.object({ type: z.literal("exec.cancel"), commandId: base64Url16Schema }).strict(),
@@ -1295,12 +1425,6 @@ export const serverToNodeBinaryMetadataSchema = z.discriminatedUnion("type", [
 export const nodeToServerBinaryMetadataSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("relay.response.body"), ...relayBodyFields }).strict(),
   termSealedSchema,
-  z
-    .object({ type: z.literal("exec.stdout"), commandId: base64Url16Schema, seq: sealedSeq })
-    .strict(),
-  z
-    .object({ type: z.literal("exec.stderr"), commandId: base64Url16Schema, seq: sealedSeq })
-    .strict(),
   fileDataMetadataSchema,
 ]);
 

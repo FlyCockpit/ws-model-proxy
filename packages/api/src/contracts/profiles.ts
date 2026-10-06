@@ -40,6 +40,8 @@ export const profileViewSchema = z
     editor: actorRefSchema,
     updatedAt: isoDateSchema,
     nodeIds: z.array(idSchema),
+    /** "Hold node" lines: applying stops wsmp runtimes there and holds the node. */
+    holds: z.array(z.object({ nodeId: idSchema, note: z.string().nullable() }).strict()),
     items: z.array(profileItemViewSchema),
     /** Every item runs as pinned and nothing else runs on the owned nodes. */
     satisfied: z.boolean(),
@@ -84,6 +86,14 @@ export const profilesContract = {
         name: nameSchema,
         description: descriptionSchema.optional(),
         nodeIds: z.array(idSchema).min(1).max(64),
+        /**
+         * "Hold node" lines (owned nodes only). People only: an agent's save keeps the existing
+         * hold lines and is refused (human_only) when it changes them.
+         */
+        holds: z
+          .array(z.object({ nodeId: idSchema, note: noteSchema.optional() }).strict())
+          .max(64)
+          .optional(),
         items: z.array(profileItemInput).max(64),
         /** Move every pin to its runtime's current version. */
         updatePins: z.boolean().optional(),
@@ -115,7 +125,7 @@ export const profilesContract = {
       })
       .strict(),
     previewOrOperationSchema,
-    "Apply (or preview): start the pinned items, stop other startable runtimes on the owned nodes. Agents: refused whole if any owned node is Relay only.",
+    "Apply (or preview): start the pinned items, stop other startable runtimes on the owned nodes, hold the nodes with a hold line and release the other owned nodes. Agents: refused whole if any owned node is Relay only.",
     ["profile_apply"],
   ),
 } as const;

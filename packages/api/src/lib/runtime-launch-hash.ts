@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { canonicalJson } from "./canonical-json";
-import type { NodeMetricCommand, RuntimeSpec } from "./runtime-spec";
+import type { NodeFabricSets, NodeMetricCommand, RuntimeSpec } from "./runtime-spec";
 
 function sha256Hex(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
@@ -36,4 +36,9 @@ export function runtimeContentHash(input: {
 /** `Node.metricCommandsHash` and `runtime.define.node.metricCommands.hash`. */
 export function nodeMetricCommandsHash(commands: readonly NodeMetricCommand[]): string {
   return sha256Hex(canonicalJson(commands));
+}
+
+/** `Node.fabricsHash` and `runtime.define.node.fabrics.hash` (sets sorted by fabricId). */
+export function nodeFabricsHash(sets: NodeFabricSets): string {
+  return sha256Hex(canonicalJson(sets));
 }

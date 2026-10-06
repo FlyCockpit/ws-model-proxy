@@ -14,6 +14,7 @@ import {
   MCP_TOOL_NAMES,
   MCP_TOOLS,
 } from "./index";
+import { advertisedToolList } from "./mcp-tools";
 import { metricsQueryInputSchema } from "./metrics";
 
 /** Spec §8.1a, with the decisions recorded in docs/contracts/0.4.0.md. */
@@ -21,6 +22,7 @@ const INVENTORY = [
   "app.config",
   "app.flags",
   "app.features",
+  "auth.inviteInfo",
   "auth.verifyEmailTransport",
   "auth.updateLocale",
   "auth.passwordCapabilities",
@@ -42,6 +44,11 @@ const INVENTORY = [
   "nodes.list",
   "nodes.get",
   "nodes.update",
+  "nodes.setHold",
+  "nodes.setTemporary",
+  "nodes.fabrics.list",
+  "nodes.fabrics.rename",
+  "nodes.fabrics.delete",
   "nodes.rename",
   "nodes.delete",
   "nodes.lowerTrustPreview",
@@ -58,6 +65,7 @@ const INVENTORY = [
   "nodes.queued.run",
   "nodes.queued.dismiss",
   "nodes.commands.run",
+  "nodes.commands.get",
   "nodes.files.read",
   "nodes.files.write",
   "nodes.files.edit",
@@ -114,6 +122,8 @@ const INVENTORY = [
   "access.shares.update",
   "access.shares.delete",
   "access.shares.setOwnKey",
+  "access.invites.resend",
+  "access.invites.revoke",
   "access.contributing.pools",
   "providers.accounts.list",
   "providers.accounts.get",
@@ -285,12 +295,12 @@ describe("caller auth (positive human check)", () => {
 });
 
 describe("0.4.0 MCP tool manifest", () => {
-  it("has the 25 tools in order, 7 of them read-only", () => {
+  it("has the 26 tools in order, 7 of them read-only", () => {
     expect(MCP_TOOLS.map((tool) => tool.name)).toEqual([...MCP_TOOL_NAMES]);
     expect(MCP_TOOLS.filter((tool) => tool.level === "READ").map((tool) => tool.name)).toEqual([
       ...MCP_READ_TOOLS,
     ]);
-    expect(MCP_TOOLS).toHaveLength(25);
+    expect(MCP_TOOLS).toHaveLength(26);
   });
 
   it("calls only agent procedures that name the tool back; read tools only query", () => {
@@ -328,6 +338,29 @@ describe("0.4.0 MCP tool manifest", () => {
         expect(pattern.test(tool.name.replaceAll("_", " ")), `${tool.name}: ${pattern}`).toBe(
           false,
         );
+      }
+  });
+
+  it("keeps tools/list within its token budget (chars / 4)", () => {
+    // Measured 2026-10-06: 13,223 tokens before the owner's token-efficiency pass (25 tools),
+    // 5,506 after it (26 tools). Raise only with a reason in the commit message.
+    const text = JSON.stringify({ tools: advertisedToolList() });
+    expect(Math.ceil(text.length / 4)).toBeLessThanOrEqual(6_500);
+    for (const tool of MCP_TOOLS) {
+      expect(tool.description.length, tool.name).toBeLessThanOrEqual(400);
+      expect(
+        tool.description.split(/[.!?](\s|$)/).filter((part) => part.trim()).length,
+        tool.name,
+      ).toBeLessThanOrEqual(4);
+    }
+  });
+
+  it("advertises compact fields as plain objects that the procedure validates", () => {
+    for (const tool of MCP_TOOLS)
+      for (const field of Object.keys(tool.compactFields ?? {})) {
+        const schema = advertisedToolList().find((entry) => entry.name === tool.name)?.inputSchema;
+        const properties = (schema?.properties ?? {}) as Record<string, { type?: string }>;
+        expect(properties[field]?.type, `${tool.name}.${field}`).toBe("object");
       }
   });
 

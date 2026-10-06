@@ -17,6 +17,16 @@
     },
     "runtimeHosts": ["10.0.0.5:8000"],
     "mediaExpand": true,
-    "liveStt": true
+    "liveStt": true,
+    "secrets": [
+      {
+        "name": "WSMP_SECRET_LLAMA_KEY",
+        "updatedAt": "2026-10-01T09:00:00.000Z"
+      },
+      {
+        "name": "WSMP_SECRET_SANDBOX_TOKEN",
+        "updatedAt": "2026-10-05T18:30:00.000Z"
+      }
+    ]
   }
 }

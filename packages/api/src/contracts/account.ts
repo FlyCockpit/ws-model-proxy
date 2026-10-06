@@ -74,6 +74,20 @@ export const appContract = {
 } as const;
 
 export const authContract = {
+  /** The sign-up page of an invite link (rate-limited like sign-in). */
+  inviteInfo: query(
+    "public",
+    z.object({ token: z.string().regex(/^wsmp_inv_[A-Z2-7]{26}$/) }).strict(),
+    z
+      .object({
+        valid: z.boolean(),
+        email: z.string().nullable(),
+        ownerName: z.string().nullable(),
+        callableId: z.string().nullable(),
+      })
+      .strict(),
+    "Public: who invited this e-mail to which pool (valid false for an unknown, used or expired link).",
+  ),
   verifyEmailTransport: query(
     "public",
     z.object({}).strict(),
@@ -178,10 +192,11 @@ export const usersContract = {
           .string()
           .regex(/^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){2,62}$/)
           .optional(),
+        role: z.enum(["admin", "user"]).default("user"),
       })
       .strict(),
-    z.object({ user: adminUserSchema }).strict(),
-    "Admin: invite a person.",
+    z.object({ userId: idSchema, tempPassword: z.string(), emailSent: z.boolean() }).strict(),
+    "Admin: invite a person (kept: the temporary password is shown once to the admin).",
   ),
   setRole: mutation(
     "human_admin",
@@ -204,7 +219,7 @@ export const usersContract = {
   remove: mutation(
     "human_admin",
     z.object({ userId: idSchema }).strict(),
-    successSchema,
+    z.object({ success: z.literal(true), pending: z.boolean() }).strict(),
     "Admin: delete an account (deletion sweeper finishes it).",
   ),
 } as const;

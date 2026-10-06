@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalJson } from "@ws-model-proxy/api/lib/canonical-json";
 import {
+  nodeFabricsHash,
   nodeMetricCommandsHash,
   runtimeLaunchHash,
 } from "@ws-model-proxy/api/lib/runtime-launch-hash";
@@ -18,7 +19,9 @@ import {
   NODE_TO_SERVER_CONTROL_TYPES,
   nodeToServerBinaryMetadataSchema,
   nodeToServerControlFrameSchema,
+  REDACTED_SECRET_VALUE,
   RELAY_JSON_CONTROL_MAX_BYTES,
+  redactFrameForLog,
   SERVER_TO_NODE_CONTROL_TYPES,
   serverToNodeBinaryMetadataSchema,
   serverToNodeControlFrameSchema,
@@ -201,5 +204,32 @@ describe("canonical JSON vectors", () => {
   it("refuses every invalid vector", () => {
     for (const vector of vectors.invalid)
       expect(() => canonicalJson(JSON.parse(vector.json)), vector.name).toThrow();
+  });
+});
+
+describe("node secrets and fabrics on the wire", () => {
+  const serverToNode = load("frames/server-to-node");
+  const secretSet = serverToNode.find(([name]) => name === "secret.set.json")?.[1];
+
+  it("never logs a secret value", () => {
+    if (!secretSet) throw new Error("missing secret.set fixture");
+    const frame = serverToNodeControlFrameSchema.parse(secretSet);
+    const logged = JSON.stringify(redactFrameForLog(frame));
+    expect(logged).not.toContain(String(secretSet.value));
+    expect(logged).toContain(REDACTED_SECRET_VALUE);
+    // A refused parse describes the path, never the value.
+    const refused = serverToNodeControlFrameSchema.safeParse({ ...secretSet, name: "HOME" });
+    expect(refused.success).toBe(false);
+    expect(JSON.stringify(refused.error?.issues)).not.toContain(String(secretSet.value));
+    // Other frames pass through unchanged.
+    const heartbeat = { type: "heartbeat", id: "hb-1" };
+    expect(redactFrameForLog(heartbeat)).toBe(heartbeat);
+  });
+
+  it("hashes the fabric sets the define frame carries", () => {
+    const define = serverToNode.find(([name]) => name === "runtime.define.json")?.[1];
+    const parsed = serverToNodeControlFrameSchema.parse(define);
+    if (parsed.type !== "runtime.define" || !parsed.node) throw new Error("no node part");
+    expect(nodeFabricsHash(parsed.node.fabrics.sets)).toBe(parsed.node.fabrics.hash);
   });
 });

@@ -10,13 +10,7 @@
   },
   "trust": {
     "value": "relay",
-    "frozen": true,
-    "frozenPeers": [
-      {
-        "runtimeId": "rt1q8m3k2v9x7c4b6n0z5h1j8",
-        "headAddr": "10.0.0.5"
-      }
-    ]
+    "frozen": true
   },
   "features": {
     "terminals": {
@@ -31,15 +25,26 @@
     },
     "runtimeHosts": [],
     "mediaExpand": true,
-    "liveStt": true
+    "liveStt": true,
+    "secrets": [
+      {
+        "name": "WSMP_SECRET_LLAMA_KEY",
+        "updatedAt": "2026-10-01T09:00:00.000Z"
+      },
+      {
+        "name": "WSMP_SECRET_SANDBOX_TOKEN",
+        "updatedAt": "2026-10-05T18:30:00.000Z"
+      }
+    ]
   },
   "definitions": [
     {
       "runtimeId": "rt1q8m3k2v9x7c4b6n0z5h1j8",
       "versionId": "vr1a2b3c4d5e6f7g8h9i0j1k2",
-      "launchHash": "7d80f5e860fb99a08c22b7aefb21407ce26c1d4b6c15d1050d1ff1c043f63b40"
+      "launchHash": "c0c00e47e26769d58cf675d378acbd85b35d00a73c45ecee9a9aaa3327d99668"
     }
   ],
   "heldMetricCommandsHash": null,
-  "heldPortRange": null
+  "heldPortRange": null,
+  "heldFabricsHash": "1e5aa34eaf9b94a1606582c936ff2280e53acee41d898c18a842f934acdc60a6"
 }

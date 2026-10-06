@@ -313,7 +313,7 @@ export const poolsContract = {
       })
       .strict(),
     poolViewSchema,
-    "Edit a pool. Never: cloud mode, paid warm protection, own-key consent, own-hardware-only, adding/removing contributed members (human_only).",
+    "Edit a pool. Never: cloud mode, paid warm protection, own-key consent, own-hardware-only (human_only).",
     ["pool_update"],
   ),
   delete: mutation(
@@ -353,16 +353,20 @@ export const poolsContract = {
   },
   members: {
     addContributed: mutation(
-      "human",
-      z.object({ poolId: idSchema, runtimeModelId: idSchema }).strict(),
+      "agent",
+      z
+        .object({ poolId: idSchema, runtimeModelId: idSchema, note: noteSchema.optional() })
+        .strict(),
       poolMemberViewSchema,
-      "A share holder with can-contribute adds one of their served models.",
+      "A share holder with can-contribute adds one of THEIR OWN served models (anyone else's: not_your_runtime).",
+      ["pool_update"],
     ),
     removeContributed: mutation(
-      "human",
-      z.object({ memberId: idSchema }).strict(),
+      "agent",
+      z.object({ memberId: idSchema, note: noteSchema.optional() }).strict(),
       okSchema,
-      "The contributor or the pool owner removes a contributed member.",
+      "The contributor (own members only) or the pool owner removes a contributed member.",
+      ["pool_update"],
     ),
   },
   rules: {

@@ -16,9 +16,9 @@
     "head_addr": "10.0.0.5",
     "gpu_ids": "0",
     "vram_gb": "79.5",
-    "memory_fraction": "0.9",
-    "iface": "eth0"
+    "memory_fraction": "0.9"
   },
+  "fabricId": "fab_qsfp1",
   "timeoutMs": 1800000,
   "ownerEpoch": "0b0c3a5e-1111-4222-8333-944445555666:7",
   "intentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
