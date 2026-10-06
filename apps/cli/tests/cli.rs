@@ -171,6 +171,66 @@ fn config_set_server_and_slug_write_json() {
 }
 
 #[test]
+fn config_set_server_pins_and_clears_a_public_origin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args(["config", "init"])
+        .assert()
+        .success();
+
+    let mut set = cli(&config, &state);
+    set.args([
+        "config",
+        "--json",
+        "set-server",
+        "http://10.0.0.5:3000",
+        "--public-origin",
+        "https://WSMP.example.com:443/",
+    ]);
+    let value = json_stdout(set);
+    assert_eq!(value["value"], "http://10.0.0.5:3000");
+    // Stored canonical: lowercase host, default port and root path dropped.
+    assert_eq!(value["publicOrigin"], "https://wsmp.example.com");
+    let mut show = cli(&config, &state);
+    show.args(["config", "--json", "show"]);
+    let shown = json_stdout(show);
+    assert_eq!(shown["serverUrl"], "http://10.0.0.5:3000");
+    assert_eq!(shown["publicOrigin"], "https://wsmp.example.com");
+    assert_eq!(shown["helloOrigin"], "https://wsmp.example.com");
+
+    // Not an origin, or http off loopback: refused, config unchanged.
+    for bad in [
+        "https://wsmp.example.com/app",
+        format!("https://{}:{}@wsmp.example.com", "user", "pw").as_str(),
+        "http://wsmp.lan:3000",
+        "ftp://wsmp.example.com",
+        "https://wsmp.example.com/?x=1",
+    ] {
+        cli(&config, &state)
+            .args(["config", "set-server", "http://10.0.0.5:3000"])
+            .args(["--public-origin", bad])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("public origin"));
+    }
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["publicOrigin"], "https://wsmp.example.com");
+
+    // Setting the server again without the flag clears the pin.
+    cli(&config, &state)
+        .args(["config", "set-server", "http://10.0.0.5:3000"])
+        .assert()
+        .success();
+    let mut show = cli(&config, &state);
+    show.args(["config", "--json", "show"]);
+    let shown = json_stdout(show);
+    assert!(shown.get("publicOrigin").is_none());
+    assert_eq!(shown["helloOrigin"], "http://10.0.0.5:3000");
+}
+
+#[test]
 fn token_login_records_env_var_name_not_secret_value() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");

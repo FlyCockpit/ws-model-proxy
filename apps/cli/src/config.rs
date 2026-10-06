@@ -257,6 +257,13 @@ impl McpCommandMode {
 pub struct Config {
     pub version: u8,
     pub server_url: Option<String>,
+    /// The server's public origin, pinned by a person on this machine
+    /// (`wsmp config set-server <URL> --public-origin <origin>`). The relay
+    /// hello signs only this origin, or the server URL's origin when unset.
+    /// Needed when the CLI connects through another address (a LAN IP or an
+    /// internal hostname). Never taken from the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_origin: Option<String>,
     pub cli_slug: Option<String>,
     pub cli_token_env: Option<String>,
     pub endpoints: Vec<EndpointConfig>,
@@ -336,6 +343,57 @@ impl MetricsConfig {
     }
 }
 
+impl Config {
+    /// The origin the relay hello may sign: the pinned public origin, else
+    /// the server URL's origin.
+    pub fn hello_origin(&self) -> Result<String> {
+        if let Some(origin) = &self.public_origin {
+            return normalize_public_origin(origin)
+                .with_context(|| format!("validating public origin `{origin}`"));
+        }
+        let server_url = self
+            .server_url
+            .as_deref()
+            .context("server URL is not configured; run `wsmp config set-server <URL>`")?;
+        let url = url::Url::parse(server_url)
+            .with_context(|| format!("parsing server URL `{server_url}`"))?;
+        match url.scheme() {
+            "http" | "https" => Ok(url.origin().ascii_serialization()),
+            other => anyhow::bail!("unsupported server URL scheme `{other}`"),
+        }
+    }
+}
+
+/// Checks a person-supplied public origin and returns its canonical form
+/// (`scheme://host[:port]`, default port omitted). It must be https, or http
+/// on a loopback host, with no credentials, path, query or fragment.
+pub fn normalize_public_origin(value: &str) -> Result<String> {
+    let url = url::Url::parse(value).context("the public origin is not a valid URL")?;
+    match url.scheme() {
+        "https" => {}
+        "http" if is_loopback_host(&url) => {}
+        "http" => anyhow::bail!("the public origin must use https unless its host is loopback"),
+        other => anyhow::bail!("the public origin uses the unsupported scheme `{other}`"),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("the public origin must not carry credentials");
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("the public origin must be only `scheme://host[:port]`, with no path");
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+/// `localhost`, 127.0.0.0/8 or `::1`.
+pub fn is_loopback_host(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
 /// Browser terminals open at once on one machine when `maxTerminals` is unset.
 /// The server applies its own per-CLI and per-user limits too; the lowest wins.
 pub const DEFAULT_MAX_TERMINALS: u32 = 4;
@@ -374,6 +432,7 @@ pub struct MetricSourceConfig {
 struct ConfigWire {
     version: u8,
     server_url: Option<String>,
+    public_origin: Option<String>,
     cli_slug: Option<String>,
     cli_token_env: Option<String>,
     endpoints: Vec<EndpointConfig>,
@@ -401,6 +460,7 @@ impl Default for ConfigWire {
         Self {
             version: config.version,
             server_url: None,
+            public_origin: None,
             cli_slug: None,
             cli_token_env: None,
             endpoints: Vec::new(),
@@ -434,6 +494,7 @@ impl From<ConfigWire> for Config {
         Self {
             version: wire.version,
             server_url: wire.server_url,
+            public_origin: wire.public_origin,
             cli_slug: wire.cli_slug,
             cli_token_env: wire.cli_token_env,
             endpoints: wire.endpoints,
@@ -460,6 +521,7 @@ impl Default for Config {
         Self {
             version: CONFIG_VERSION,
             server_url: None,
+            public_origin: None,
             cli_slug: None,
             cli_token_env: None,
             endpoints: Vec::new(),
@@ -1700,6 +1762,10 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         validate_file_root_shape(&self.file_roots)?;
+        if let Some(origin) = &self.public_origin {
+            normalize_public_origin(origin)
+                .with_context(|| format!("validating public origin `{origin}`"))?;
+        }
         self.validate_max_terminals()?;
         if let Some(slug) = &self.cli_slug {
             validate_slug(slug).with_context(|| format!("validating CLI slug `{slug}`"))?;
