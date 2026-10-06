@@ -9,16 +9,28 @@ import type { RefusalReason } from "../contracts/refusals";
 export type CallerActor = {
   actor: "USER" | "AGENT";
   actorUserId: string;
-  /** Set for agent tokens only (OAuth grants have no token row). */
+  /**
+   * Set exactly for agents (hardening: `(actor = 'AGENT') = ("agentTokenId" IS NOT NULL)`).
+   * An OAuth grant has no token row, so its grant id stands in (contract gap, reported).
+   */
   agentTokenId: string | null;
 };
 
+/**
+ * The actor of a write. A cookie session without the verified CSRF header is neither a
+ * person (`isHumanCaller`) nor an agent with a token, so it may not write at all: recording it
+ * as USER would show its commands as person-written to whoever reviews them.
+ */
 export function callerActor(auth: CallerAuth | AnonymousAuth, userId: string): CallerActor {
   if (auth.kind === "agent_token")
     return { actor: "AGENT", actorUserId: userId, agentTokenId: auth.agentTokenId };
   if (auth.kind === "oauth_access_token")
-    return { actor: "AGENT", actorUserId: userId, agentTokenId: null };
-  return { actor: "USER", actorUserId: userId, agentTokenId: null };
+    return { actor: "AGENT", actorUserId: userId, agentTokenId: auth.grantId };
+  if (auth.kind === "cookie_session" && auth.csrfVerified)
+    return { actor: "USER", actorUserId: userId, agentTokenId: null };
+  throw new ORPCError("FORBIDDEN", {
+    message: "This change needs the web app's CSRF header or an agent token.",
+  });
 }
 
 /** HTTP-ish status for each refusal family (the reason is what callers read). */

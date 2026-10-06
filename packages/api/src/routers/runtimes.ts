@@ -2,7 +2,7 @@ import { ORPCError } from "@orpc/server";
 import prisma from "@ws-model-proxy/db";
 import { contractProcedure, type SignedInContext, stub } from "../contract-procedure";
 import { agentRulesApply } from "../contracts/auth-context";
-import { runtimesContract as c } from "../contracts/runtimes";
+import { runtimesContract as c, runtimeSlugSchema } from "../contracts/runtimes";
 import {
   callerActor,
   isForeignKeyViolation,
@@ -116,6 +116,10 @@ async function createRuntime(context: SignedInContext, input: CreateInput) {
   const userId = userIdOf(context);
   const actor = callerActor(context.auth, userId);
   assertKindMatchesSpec(input.kind, input.spec);
+  if ((input.kind === "ALWAYS_ON") !== (input.nodeId !== undefined))
+    throw new ORPCError("BAD_REQUEST", {
+      message: "An always-on runtime names its node; a startable one does not.",
+    });
   if (input.nodeId) assertAgentMayUseNode(context, await ownedNode(userId, input.nodeId));
   let created: { runtimeId: string };
   try {
@@ -477,8 +481,12 @@ export const runtimesRouter = {
       select: {
         id: true,
         desiredState: true,
+        LaunchVersion: { select: { launchHash: true } },
         Ranks: {
-          select: { Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } } },
+          select: {
+            claim: true,
+            Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } },
+          },
         },
       },
     });
@@ -490,9 +498,16 @@ export const runtimesRouter = {
       reason: "launch_changed" | "trust_relay" | "interactive_needs_person";
     }> = [];
     for (const instance of instances) {
-      // Always-on: the address is the launch; nothing to restart.
-      if (!launchChanged || instance.desiredState === null) adoptedLive.push(instance.id);
-      else if (!input.restartRunning)
+      // Always-on: the address is the launch; nothing to restart. A started instance adopts
+      // live only when what it launched has the new launch hash (an earlier launch change it
+      // was never restarted for still needs a restart).
+      if (instance.desiredState === null || instance.LaunchVersion.launchHash === hashes.launchHash)
+        adoptedLive.push(instance.id);
+      else if (
+        !input.restartRunning ||
+        // Released claims (failed, stopped ranks) are re-placed by a start, not here.
+        instance.Ranks.some((rank) => rank.claim !== "HELD")
+      )
         needsRestart.push({ instanceId: instance.id, reason: "launch_changed" });
       else if (
         agent &&
@@ -561,6 +576,8 @@ export const runtimesRouter = {
             phase: "STARTING",
             phaseChangedAt: new Date(),
             phaseReason: "definition_changed",
+            needsOperator: null,
+            needsOperatorSince: null,
             restartsInWindow: 0,
             restartWindowStartedAt: null,
             nextRestartAt: null,
@@ -588,6 +605,7 @@ export const runtimesRouter = {
 
   delete: contractProcedure(c.delete).handler(async ({ input, context }) => {
     const userId = userIdOf(context);
+    callerActor(context.auth, userId);
     const runtime = await prisma.runtime.findFirst({
       where: { id: input.runtimeId, userId },
       select: { id: true },
@@ -649,6 +667,7 @@ export const runtimesRouter = {
     setCapabilities: contractProcedure(c.models.setCapabilities).handler(
       async ({ input, context }) => {
         const userId = userIdOf(context);
+        callerActor(context.auth, userId);
         const updated = await prisma.runtimeModel.updateMany({
           where: { id: input.runtimeModelId, userId },
           data:
@@ -683,7 +702,13 @@ export const runtimesRouter = {
       });
       if (!parsed.success)
         throw new ORPCError("BAD_REQUEST", { message: "This address cannot be used as is." });
-      const slug = input.slug ?? `${node.slug}-${engine.replaceAll("_", "-")}`.slice(0, 41);
+      const suggested = `${node.slug}-${engine.replaceAll("_", "-")}`
+        .replace(/[^a-z0-9-]+/g, "-")
+        .replace(/^[^a-z]+/, "")
+        .slice(0, 41)
+        .replace(/-+$/, "");
+      const slug =
+        input.slug ?? (runtimeSlugSchema.safeParse(suggested).success ? suggested : "server");
       const result = await createRuntime(context, {
         slug,
         name: input.name ?? `${engine} on ${node.slug}`,

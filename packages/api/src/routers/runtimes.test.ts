@@ -183,7 +183,8 @@ describe("runtimes.create", () => {
     db.node.findFirst.mockResolvedValue(nodeRow({ trust: "RELAY" }) as never);
     const input = { slug: "srv", name: "S", kind: "ALWAYS_ON" as const, nodeId: "node-1", spec };
     expect(await reasonOf(client(CALLERS.fullAgent()).create(input))).toBe("trust_relay");
-    expect(await reasonOf(client(CALLERS.cookieWithoutCsrf()).create(input))).toBe("trust_relay");
+    // A cookie without the verified CSRF header writes nothing at all.
+    expect(await reasonOf(client(CALLERS.cookieWithoutCsrf()).create(input))).toBe("FORBIDDEN");
     expect(db.runtime.create).not.toHaveBeenCalled();
 
     db.runtime.create.mockResolvedValue({ id: "rt-2" } as never);
@@ -274,7 +275,10 @@ describe("runtimes.update", () => {
         {
           id: "inst-1",
           desiredState: "RUNNING",
-          Ranks: [{ Node: { id: "node-1", trust: "RELAY", trustLowerRequestedAt: null } }],
+          LaunchVersion: { launchHash: runtimeLaunchHash(SPEC) },
+          Ranks: [
+            { claim: "HELD", Node: { id: "node-1", trust: "RELAY", trustLowerRequestedAt: null } },
+          ],
         },
       ] as never);
       db.runtimeVersion.create.mockResolvedValue({ id: "ver-2" } as never);
@@ -446,7 +450,7 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
       "trust_relay",
     );
     expect(await reasonOf(client(CALLERS.cookieWithoutCsrf()).stop({ instanceId: "inst-1" }))).toBe(
-      "trust_relay",
+      "FORBIDDEN",
     );
     expect(db.runtimeInstance.updateMany).not.toHaveBeenCalled();
     const stopped = await client(CALLERS.person()).stop({ instanceId: "inst-1" });
@@ -464,5 +468,153 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
     });
     await agentClient.stop({ runtimeId: "rt-1" });
     expect(dispatch).toHaveBeenCalledWith({ userId: OWNER, operationId: "op-2" });
+  });
+});
+
+describe("review follow-ups", () => {
+  const changed = (flag: string): RuntimeSpec => ({
+    ...SPEC,
+    launch: {
+      ...(SPEC.launch as NonNullable<RuntimeSpec["launch"]>),
+      commands: [
+        { start: `vllm serve qwen --host 127.0.0.1 --port {{port}} ${flag}`, stop: "true" },
+      ],
+    },
+  });
+
+  function setupUpdate(instanceLaunch: RuntimeSpec, current: RuntimeSpec) {
+    db.runtime.findFirst.mockResolvedValue({
+      id: "rt-1",
+      kind: "STARTABLE",
+      Node: null,
+      CurrentVersion: versionRow({ spec: current, launchHash: runtimeLaunchHash(current) }),
+    } as never);
+    db.runtimeVersion.findFirst.mockResolvedValue(null);
+    db.runtimeInstance.findMany.mockResolvedValue([
+      {
+        id: "inst-1",
+        desiredState: "RUNNING",
+        LaunchVersion: { launchHash: runtimeLaunchHash(instanceLaunch) },
+        Ranks: [
+          { claim: "HELD", Node: { id: "node-1", trust: "FULL", trustLowerRequestedAt: null } },
+        ],
+      },
+    ] as never);
+    db.runtimeVersion.create.mockResolvedValue({ id: "ver-3" } as never);
+    db.runtimeVersion.findUniqueOrThrow.mockResolvedValue(
+      versionRow({ id: "ver-3", version: 3 }) as never,
+    );
+  }
+
+  it("a limits-only edit does not adopt an instance still on an older launch", async () => {
+    // v2 changed the launch without a restart; the instance still runs SPEC (v1).
+    setupUpdate(SPEC, changed("--v2"));
+    const result = await client().update({ runtimeId: "rt-1", limits: { concurrencyLimit: 8 } });
+    expect(result.adoptedLive).toEqual([]);
+    expect(result.needsRestart).toEqual([{ instanceId: "inst-1", reason: "launch_changed" }]);
+    expect(db.runtimeInstance.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("an instance on the current launch adopts a limits-only edit live", async () => {
+    setupUpdate(SPEC, SPEC);
+    const result = await client().update({ runtimeId: "rt-1", limits: { concurrencyLimit: 8 } });
+    expect(result.adoptedLive).toEqual(["inst-1"]);
+  });
+
+  it("OAuth agents are recorded as agents with their grant", async () => {
+    db.runtime.create.mockResolvedValue({ id: "rt-1" } as never);
+    db.runtimeVersion.create.mockResolvedValue({ id: "ver-1" } as never);
+    db.runtime.findFirst.mockResolvedValue(runtimeRow() as never);
+    await client(CALLERS.oauthAgent()).create({
+      slug: "qwen",
+      name: "Q",
+      kind: "STARTABLE",
+      spec: SPEC,
+    });
+    expect(db.runtimeVersion.create.mock.calls[0]?.[0].data).toMatchObject({
+      editor: "AGENT",
+      agentTokenId: "grant-1",
+    });
+  });
+
+  it("stop clears a pending operator need", async () => {
+    db.runtimeInstance.findMany.mockResolvedValue([
+      {
+        id: "inst-1",
+        Ranks: [{ Node: { id: "node-1", trust: "FULL", trustLowerRequestedAt: null } }],
+      },
+    ] as never);
+    db.runtimeOperation.create.mockResolvedValue({ id: "op-2" } as never);
+    db.runtimeOperation.findUniqueOrThrow.mockResolvedValue({
+      id: "op-2",
+      kind: "STOP",
+      createdAt: new Date(),
+      actor: "USER",
+      actorUserId: OWNER,
+      agentTokenId: null,
+      Instances: [],
+    } as never);
+    await client().stop({ instanceId: "inst-1" });
+    expect(db.runtimeInstance.updateMany.mock.calls[0]?.[0].data).toMatchObject({
+      needsOperator: null,
+      needsOperatorSince: null,
+    });
+  });
+
+  it("a restart is refused when another claim took its released port", async () => {
+    db.runtime.findFirst.mockResolvedValue({
+      id: "rt-1",
+      kind: "STARTABLE",
+      currentVersionId: "ver-1",
+    } as never);
+    db.runtimeVersion.findFirst.mockResolvedValue({ id: "ver-1", spec: SPEC } as never);
+    db.node.findMany.mockResolvedValue([nodeRow({ Ranks: [{ port: 30000 }] })] as never);
+    db.runtimeInstance.findFirst.mockResolvedValue({
+      id: "inst-1",
+      Ranks: [{ nodeId: "node-1", port: 30000, claim: "RELEASED" }],
+    } as never);
+    const preview = await client().start({
+      runtimeId: "rt-1",
+      instanceId: "inst-1",
+      preview: true,
+    });
+    if (preview.mode !== "preview") throw new Error("expected a preview");
+    expect(preview.preview.refusals.map((r) => r.reason)).toEqual(["port_in_use"]);
+  });
+
+  it("forking an always-on runtime without a node is a bad request, not a crash", async () => {
+    const spec: RuntimeSpec = {
+      api: "openai",
+      engine: "other",
+      modelType: "llm",
+      address: { baseUrl: "http://127.0.0.1:8000/v1" },
+    };
+    db.runtimeShare.findFirst.mockResolvedValue({
+      Runtime: { id: "rt-9", kind: "ALWAYS_ON", currentVersionId: "ver-9" },
+    } as never);
+    db.runtimeVersion.findFirst.mockResolvedValue(versionRow({ id: "ver-9", spec }) as never);
+    expect(await reasonOf(client().fork({ runtimeId: "rt-9", slug: "mine", name: "Mine" }))).toBe(
+      "BAD_REQUEST",
+    );
+    expect(db.runtime.create).not.toHaveBeenCalled();
+  });
+
+  it("another person's served model and share are not found", async () => {
+    db.runtimeModel.updateMany.mockResolvedValue({ count: 0 });
+    expect(
+      await reasonOf(
+        client().models.setCapabilities({ runtimeModelId: "rm-x", capabilities: null }),
+      ),
+    ).toBe("NOT_FOUND");
+    expect(db.runtimeModel.updateMany.mock.calls[0]?.[0].where).toEqual({
+      id: "rm-x",
+      userId: OWNER,
+    });
+    db.runtimeShare.deleteMany.mockResolvedValue({ count: 0 });
+    expect(await reasonOf(client().shares.delete({ shareId: "sh-x" }))).toBe("NOT_FOUND");
+    expect(db.runtimeShare.deleteMany.mock.calls[0]?.[0].where).toEqual({
+      id: "sh-x",
+      ownerUserId: OWNER,
+    });
   });
 });

@@ -183,8 +183,8 @@ async function computeStart(
         return;
       }
       const ownPort = ownPorts?.[rank];
-      const port =
-        ownPort !== undefined ? ownPort : freePort(node, portsOn(node.id), launch.port?.fixed);
+      // A restart keeps its own port; one another claim took meanwhile is refused.
+      const port = freePort(node, portsOn(node.id), ownPort ?? launch.port?.fixed);
       if (typeof port !== "number") {
         refusals.push(refusalOf(port, node.id));
         return;
@@ -482,6 +482,8 @@ export const runtimeStop = contractProcedure(c.stop).handler(async ({ input, con
         phase: "STOPPING",
         phaseChangedAt: new Date(),
         phaseReason: "stop_requested",
+        needsOperator: null,
+        needsOperatorSince: null,
         operationId: operation.id,
       },
     });
