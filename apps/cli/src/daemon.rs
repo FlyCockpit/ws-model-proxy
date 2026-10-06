@@ -539,10 +539,15 @@ fn reload_config(startup: &TerminalStartup) -> Result<Vec<NodeChange>> {
     }
     match (startup.trust_value(), file_trust) {
         (TrustValue::Full, TrustValue::Relay) => {
-            let lowered = apply_lower(startup);
+            // The effects apply even when saving fails (the latch holds).
+            if let Err(error) = apply_lower(startup) {
+                tracing::error!(
+                    error = %format!("{error:#}"),
+                    "persisting the lowered trust failed"
+                );
+            }
             tracing::warn!("config.json lowered this node to Relay only");
             changes.push(NodeChange::Lowered);
-            lowered?;
         }
         (TrustValue::Relay, TrustValue::Full) => {
             tracing::warn!(
@@ -851,6 +856,8 @@ struct Session<'a> {
     terminals: TerminalRegistry,
     /// Node commands outlive a connection (daemon lifetime, `NodeLink`).
     execs: &'a mut ExecRegistry,
+    /// Command statuses held until this connection is registered.
+    deferred: &'a mut Vec<OutboundFrame>,
     stt: crate::stt::SttRegistry,
     #[cfg(unix)]
     files: crate::file_relay::FileRelay,
@@ -864,6 +871,13 @@ struct Session<'a> {
     observed_generation: u64,
     /// The metric commands hash the telemetry thread runs.
     metric_commands_applied: Option<String>,
+}
+
+/// The command lifetime cap the held node definition sets (24 h without one).
+fn command_max(store: &Store) -> Duration {
+    store
+        .command_max_ms()
+        .map_or(DEFAULT_COMMAND_MAX, Duration::from_millis)
 }
 
 /// What outlives one relay connection: the worker channel and the node
@@ -893,9 +907,7 @@ impl NodeLink {
                 "running commands are not recorded"
             ),
         }
-        if let Some(max) = store.command_max_ms() {
-            execs.set_command_max(Duration::from_millis(max));
-        }
+        execs.set_command_max(command_max(store));
         Self {
             worker_tx,
             worker_rx,
@@ -976,13 +988,15 @@ fn run_relay_session(
     // Created before hello so an early `?` still drops (and kills) every child.
     let worker_tx = link.worker_tx.clone();
     let worker_rx = &link.worker_rx;
-    let deferred = &mut link.deferred;
+    // The watch starts before the pre-hello reload: no edit falls between.
+    let mut config_watch = ConfigWatch::new();
     let mut session = Session {
         worker_tx: worker_tx.clone(),
         workers: BTreeMap::new(),
         recent_finished: RecentlyFinished::new(),
         terminals: TerminalRegistry::new(worker_tx.clone()),
         execs: &mut link.execs,
+        deferred: &mut link.deferred,
         // Live speech-to-text sessions; dropping the registry ends them all.
         stt: crate::stt::SttRegistry::new(worker_tx.clone()),
         // Node file ops run on the daemon's file pool, never on this loop;
@@ -1051,16 +1065,16 @@ fn run_relay_session(
     send_control(&mut socket, &hello, "sending relay hello")?;
 
     let mut next_telemetry_sync = Instant::now();
-    let mut config_watch = ConfigWatch::new();
     let mut next_heartbeat =
         Instant::now() + Duration::from_secs(RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS);
     let result = 'session: loop {
         if let Some(signal) = crate::shutdown::requested() {
             break 'session Err(RelaySessionError::Shutdown(signal));
         }
-        if session.registered && !deferred.is_empty() {
+        if session.registered && !session.deferred.is_empty() {
             // Commands that ended (or were interrupted) while disconnected.
-            if let Err(error) = send_outbound_frames(&mut socket, std::mem::take(deferred)) {
+            let pending = std::mem::take(session.deferred);
+            if let Err(error) = send_outbound_frames(&mut socket, pending) {
                 break Err(error);
             }
         }
@@ -1075,8 +1089,14 @@ fn run_relay_session(
         if let Err(error) = send_outbound_frames(&mut socket, session.terminals.poll(now)) {
             break Err(error);
         }
-        if let Err(error) = send_outbound_frames(&mut socket, session.execs.poll(now)) {
-            break Err(error);
+        let ended = session.execs.poll(now);
+        if session.registered {
+            if let Err(error) = send_outbound_frames(&mut socket, ended) {
+                break Err(error);
+            }
+        } else {
+            // Nothing but hello before `hello.ok`.
+            session.deferred.extend(ended);
         }
         let endpoints = session.runtimes.endpoints();
         let stt_frames = session.stt.poll(now, || endpoints.clone());
@@ -1119,15 +1139,7 @@ fn run_relay_session(
                     ));
                 }
             }
-            // Node metric commands follow the held (frozen at Relay only)
-            // node definition.
-            let hash = session.runtimes.store.metric_commands_hash();
-            if hash != session.metric_commands_applied
-                && let Some(telemetry) = session.telemetry.as_ref()
-            {
-                telemetry.set_metric_commands(session.runtimes.store.metric_commands().to_vec());
-                session.metric_commands_applied = hash;
-            }
+            sync_metric_commands(&mut session);
             next_telemetry_sync = Instant::now() + TELEMETRY_SYNC_INTERVAL;
         }
         if session.registered && Instant::now() >= next_heartbeat {
@@ -1423,9 +1435,10 @@ where
                         session
                             .runtimes
                             .reload(startup.trust_value(), &startup.runtime_hosts());
-                        if let Some(max) = session.runtimes.store.command_max_ms() {
-                            session.execs.set_command_max(Duration::from_millis(max));
-                        }
+                        session
+                            .execs
+                            .set_command_max(command_max(&session.runtimes.store));
+                        sync_metric_commands(session);
                         send_inventory(session);
                     }
                 }
@@ -1735,8 +1748,14 @@ where
     if changes.contains(&NodeChange::Lowered) {
         #[cfg(unix)]
         session.files.lower_trust();
-        send_outbound_frames(socket, session.terminals.kill_all())?;
-        send_outbound_frames(socket, session.execs.interrupt_all())?;
+        let interrupted = session.execs.interrupt_all();
+        if session.registered {
+            send_outbound_frames(socket, session.terminals.kill_all())?;
+            send_outbound_frames(socket, interrupted)?;
+        } else {
+            let _ = session.terminals.kill_all();
+            session.deferred.extend(interrupted);
+        }
     }
     if changes.contains(&NodeChange::Raised) {
         #[cfg(unix)]
@@ -1746,6 +1765,10 @@ where
     session
         .runtimes
         .reload(startup.trust_value(), &startup.runtime_hosts());
+    session
+        .execs
+        .set_command_max(command_max(&session.runtimes.store));
+    sync_metric_commands(session);
     if !session.registered {
         return Ok(());
     }
@@ -1827,8 +1850,18 @@ where
             });
         #[cfg(not(unix))]
         let recorded: Option<Job> = None;
+        let interactive = recorded.as_ref().is_some_and(|known| {
+            known.parsed_spec().is_some_and(|spec| {
+                crate::runtimes::render::interactive_phase(&spec, job.rank, job.phase)
+            })
+        });
         if !held && job.phase != JobPhase::Stop {
             Err(refused_with(missing, "launchVersionId"))
+        } else if interactive {
+            Err(crate::runtimes::render::Refusal {
+                error: JobError::InteractiveUnsupported,
+                detail: None,
+            })
         } else if let Some(known) = recorded {
             Ok(Job {
                 step_id: job.step_id.clone(),
@@ -1918,6 +1951,18 @@ where
     #[cfg(not(unix))]
     let _ = (socket, session);
     Ok(())
+}
+
+/// Node metric commands follow the held (frozen at Relay only) node
+/// definition; applied as soon as it changes.
+fn sync_metric_commands(session: &mut Session<'_>) {
+    let hash = session.runtimes.store.metric_commands_hash();
+    if hash != session.metric_commands_applied
+        && let Some(telemetry) = session.telemetry.as_ref()
+    {
+        telemetry.set_metric_commands(session.runtimes.store.metric_commands().to_vec());
+        session.metric_commands_applied = hash;
+    }
 }
 
 /// Send a fresh `runtime.inventory` (built off this loop).

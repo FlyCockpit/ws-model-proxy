@@ -34,7 +34,10 @@ pub const RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS: u64 = 20;
 pub const RELAY_REQUEST_BODY_WINDOW_CHUNKS: usize = 16;
 /// Node telemetry list bounds; they mirror the server's strict schemas
 /// (`apps/server/src/relay/frames.ts`).
-pub const NODE_METRICS_CUSTOM_MAX: usize = 50;
+/// Custom values in one `node.metrics` (16 commands × 16 metrics).
+pub const NODE_METRICS_CUSTOM_MAX: usize = 256;
+/// Values one metric command contributes.
+pub const NODE_METRIC_COMMAND_VALUES_MAX: usize = 16;
 pub const NODE_METRIC_COMMANDS_MAX: usize = 16;
 pub const NODE_GPU_MAX: usize = 32;
 pub const NODE_INTERFACE_MAX: usize = 32;

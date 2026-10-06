@@ -222,6 +222,11 @@ pub fn freeze_now() -> Result<()> {
     Store::load(&live_path()?)?.save(&frozen_path()?)
 }
 
+/// An empty frozen copy (fail closed when the live set cannot be read).
+pub fn freeze_empty() -> Result<()> {
+    Store::default().save(&frozen_path()?)
+}
+
 /// Drop the frozen copy (raising trust).
 pub fn unfreeze() -> Result<()> {
     let path = frozen_path()?;

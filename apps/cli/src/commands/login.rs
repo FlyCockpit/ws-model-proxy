@@ -140,9 +140,6 @@ pub fn run(args: &Args) -> Result<()> {
     {
         let _lock = ConfigLock::exclusive()?;
         let mut config = Config::load()?;
-        config.server_url = Some(server_url.clone());
-        config.public_origin = (public_origin != url_origin).then(|| public_origin.clone());
-        config.cli_slug = Some(enrolled.slug.clone());
         // Never raise a node that is already Relay only (unset counts) or
         // was lowered (a frozen copy exists) through a re-login.
         let enrolled_before = config.server_url.is_some()
@@ -154,11 +151,16 @@ pub fn run(args: &Args) -> Result<()> {
             .map(|path| path.exists())
             .unwrap_or(true)
             || (enrolled_before && crate::trust::configured(&config) == TrustValue::Relay);
-        config.trust = Some(if keep_relay { TrustValue::Relay } else { trust });
-        config.save()?;
-        if config.trust == Some(TrustValue::Relay) {
+        let chosen = if keep_relay { TrustValue::Relay } else { trust };
+        if chosen == TrustValue::Relay {
+            // The marker first, then the config (as every lowering does).
             crate::runtime_store::freeze()?;
         }
+        config.server_url = Some(server_url.clone());
+        config.public_origin = (public_origin != url_origin).then(|| public_origin.clone());
+        config.cli_slug = Some(enrolled.slug.clone());
+        config.trust = Some(chosen);
+        config.save()?;
     }
     save_node_credential(&NodeCredential {
         node_id: enrolled.node_id.clone(),

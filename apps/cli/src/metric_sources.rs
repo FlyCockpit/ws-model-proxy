@@ -37,7 +37,9 @@ use crate::protocol::frames::{
 use crate::protocol::runtime_spec::{
     Aggregate, MetricCommandFormat, NodeMetricCommand, ReaderMapEntry,
 };
-use crate::protocol::{NODE_METRIC_COMMANDS_MAX, NODE_METRICS_CUSTOM_MAX};
+use crate::protocol::{
+    NODE_METRIC_COMMAND_VALUES_MAX, NODE_METRIC_COMMANDS_MAX, NODE_METRICS_CUSTOM_MAX,
+};
 use crate::telemetry::{is_label_key, is_metric_name};
 
 /// Largest stdout a run may print; more is `output_too_large` and no values.
@@ -82,7 +84,7 @@ fn series(name: &str, labels: BTreeMap<String, String>, value: f64) -> Option<Se
         && labels.len() <= LABELS_MAX
         && labels
             .iter()
-            .all(|(key, value)| is_label_key(key) && is_metric_name(value)))
+            .all(|(key, value)| is_label_key(key) && crate::telemetry::is_label_value(value)))
     .then(|| Series {
         name: name.to_string(),
         labels,
@@ -91,7 +93,7 @@ fn series(name: &str, labels: BTreeMap<String, String>, value: f64) -> Option<Se
 }
 
 /// Parse one run's stdout. Invalid series are dropped; output with nothing
-/// usable is a parse error. At most [`NODE_METRICS_CUSTOM_MAX`] series.
+/// usable is a parse error. At most [`NODE_METRIC_COMMAND_VALUES_MAX`] series.
 pub fn parse_output(
     format: MetricCommandFormat,
     command_name: &str,
@@ -106,7 +108,7 @@ pub fn parse_output(
     if parsed.is_empty() {
         return Err(MetricCommandError::Parse);
     }
-    parsed.truncate(NODE_METRICS_CUSTOM_MAX);
+    parsed.truncate(NODE_METRIC_COMMAND_VALUES_MAX);
     Ok(parsed)
 }
 
@@ -353,18 +355,27 @@ pub fn map_output(
     bytes: &[u8],
 ) -> Result<Vec<Series>, MetricCommandError> {
     let text = std::str::from_utf8(bytes).map_err(|_| MetricCommandError::Parse)?;
+    // Input series are read as printed (free-text labels, any name): only
+    // the mapped output names and values must follow the wire rules.
     let pick: Box<SeriesPicker> = match format {
         MetricCommandFormat::Json => {
             let document: serde_json::Value =
                 serde_json::from_str(text).map_err(|_| MetricCommandError::Parse)?;
-            Box::new(move |pointer, _| json_numbers(&document, pointer))
+            Box::new(move |pointer, _| {
+                // A bare name means the top-level key.
+                if pointer.starts_with('/') {
+                    json_numbers(&document, pointer)
+                } else {
+                    json_numbers(&document, &format!("/{pointer}"))
+                }
+            })
         }
         MetricCommandFormat::Prometheus => {
-            let parsed = parse_prometheus(text);
+            let parsed = raw_prometheus(text);
             Box::new(move |name, labels| series_numbers(&parsed, name, labels))
         }
         MetricCommandFormat::Lines => {
-            let parsed = parse_lines("value", text)?;
+            let parsed = raw_lines(text);
             Box::new(move |name, labels| series_numbers(&parsed, name, labels))
         }
     };
@@ -393,8 +404,52 @@ pub fn map_output(
     if out.is_empty() {
         return Err(MetricCommandError::Parse);
     }
-    out.truncate(NODE_METRICS_CUSTOM_MAX);
+    out.truncate(NODE_METRIC_COMMAND_VALUES_MAX);
     Ok(out)
+}
+
+/// Prometheus lines as printed, without the output-name rules.
+fn raw_prometheus(text: &str) -> Vec<Series> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let name_end = line
+                .find(|c: char| c == '{' || c.is_whitespace())
+                .unwrap_or(line.len());
+            let mut rest = &line[name_end..];
+            let mut labels = BTreeMap::new();
+            if let Some(after) = rest.strip_prefix('{') {
+                let (parsed, remaining) = parse_labels(after)?;
+                labels = parsed;
+                rest = remaining;
+            }
+            let value = rest.split_whitespace().next()?.parse::<f64>().ok()?;
+            value.is_finite().then(|| Series {
+                name: line[..name_end].to_string(),
+                labels,
+                value,
+            })
+        })
+        .collect()
+}
+
+/// `<name> <number>` lines as printed.
+fn raw_lines(text: &str) -> Vec<Series> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let name = fields.next()?;
+            let value = fields.next()?.parse::<f64>().ok()?;
+            value.is_finite().then(|| Series {
+                name: name.to_string(),
+                labels: BTreeMap::new(),
+                value,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -729,6 +784,23 @@ mod tests {
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].value, 7.0);
         assert!(map_output(MetricCommandFormat::Json, &map, b"not json").is_err());
+        // Inputs are read as printed: free-text labels and any input name.
+        let mut free = BTreeMap::new();
+        free.insert(
+            "h100_util".to_string(),
+            ReaderMapEntry {
+                labels: Some([("model".to_string(), "NVIDIA H100".to_string())].into()),
+                ..entry("dcgm_util")
+            },
+        );
+        free.insert("busy".to_string(), entry("node.busy"));
+        let text = b"dcgm_util{model=\"NVIDIA H100\"} 9\nnode.busy 3\n";
+        let series = map_output(MetricCommandFormat::Prometheus, &free, text).expect("mapped");
+        assert_eq!(series.len(), 2, "{series:?}");
+        let mut bare = BTreeMap::new();
+        bare.insert("util".to_string(), entry("util"));
+        let series = map_output(MetricCommandFormat::Json, &bare, br#"{"util":3}"#).expect("bare");
+        assert_eq!(series[0].value, 3.0);
     }
 
     use super::*;
@@ -794,7 +866,8 @@ mod tests {
 gpu_temp{gpu="0"} 71
 gpu_temp{gpu="1",slot="a"} 64.5 1700000000000
 up 1
-bad{gpu="has space"} 2
+spaced{gpu="NVIDIA H100"} 2
+bad{gpu="line\nbreak"} 2
 nan_metric NaN
 inf_metric +Inf
 endpoint.running 3
@@ -804,12 +877,18 @@ escaped{v="a\"b"} 1
 "#;
         let parsed =
             parse_output(MetricCommandFormat::Prometheus, "src", text.as_bytes()).expect("ok");
-        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed.len(), 5, "{parsed:?}");
         assert_eq!(parsed[0].name, "gpu_temp");
         assert_eq!(parsed[0].labels.get("gpu").map(String::as_str), Some("0"));
         assert_eq!(parsed[1].labels.len(), 2);
         assert_eq!(parsed[1].value, 64.5);
         assert_eq!(parsed[2].name, "up");
+        // Label values are free text without control characters.
+        assert_eq!(
+            parsed[3].labels.get("gpu").map(String::as_str),
+            Some("NVIDIA H100")
+        );
+        assert_eq!(parsed[4].name, "escaped");
     }
 
     #[test]
@@ -836,7 +915,7 @@ escaped{v="a\"b"} 1
         }
         let parsed =
             parse_output(MetricCommandFormat::Prometheus, "src", text.as_bytes()).expect("ok");
-        assert_eq!(parsed.len(), NODE_METRICS_CUSTOM_MAX);
+        assert_eq!(parsed.len(), NODE_METRIC_COMMAND_VALUES_MAX);
         let labels = (0..17)
             .map(|index| format!("l{index}=\"v\""))
             .collect::<Vec<_>>()

@@ -645,9 +645,13 @@ pub fn validate_metric_commands(commands: &[NodeMetricCommand]) -> Check {
         if let Some(map) = &command.map {
             ensure(
                 map.len() <= 16
-                    && map
-                        .iter()
-                        .all(|(name, entry)| series_name_ok(name) && reader_entry_ok(entry)),
+                    && map.iter().all(|(name, entry)| {
+                        series_name_ok(name)
+                            && !["node.", "endpoint.", "runtime."]
+                                .iter()
+                                .any(|prefix| name.starts_with(prefix))
+                            && reader_entry_ok(entry)
+                    }),
                 || path("map"),
             )?;
         }

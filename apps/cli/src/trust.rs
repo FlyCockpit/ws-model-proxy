@@ -69,7 +69,11 @@ pub fn word(trust: TrustValue) -> &'static str {
 /// is written first (it is the marker that keeps a node lowered), then the
 /// config. Idempotent: an existing frozen copy is kept.
 pub fn persist_relay() -> Result<()> {
-    crate::runtime_store::freeze().context("freezing the held definitions")?;
+    if let Err(error) = crate::runtime_store::freeze() {
+        // Fail closed: an empty frozen copy still marks the node lowered.
+        tracing::error!(error = %format!("{error:#}"), "freezing the held definitions failed; holding none");
+        crate::runtime_store::freeze_empty().context("marking the node lowered")?;
+    }
     Config::update(false, |config| {
         config.trust = Some(TrustValue::Relay);
         Ok(())
@@ -80,8 +84,24 @@ pub fn persist_relay() -> Result<()> {
 /// A Full to Relay change: the frozen copy is today's held set, never an
 /// older copy left behind.
 pub fn persist_lowering() -> Result<()> {
-    crate::runtime_store::freeze_now().context("freezing the held definitions")?;
+    if let Err(error) = crate::runtime_store::freeze_now() {
+        tracing::error!(error = %format!("{error:#}"), "freezing the held definitions failed; holding none");
+        crate::runtime_store::freeze_empty().context("marking the node lowered")?;
+    }
     persist_relay()
+}
+
+/// The trust a node is at, as `wsmp trust` reports it: Relay only whenever
+/// a frozen copy exists or the config does not say `full`.
+pub fn effective(config: &Config) -> TrustValue {
+    let frozen = crate::runtime_store::frozen_path()
+        .map(|path| path.exists())
+        .unwrap_or(true);
+    if frozen {
+        TrustValue::Relay
+    } else {
+        configured(config)
+    }
 }
 
 /// Unfreeze, then persist `trust: full`. Only `wsmp trust full` (directly

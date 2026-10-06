@@ -49,7 +49,7 @@ pub fn run(args: &Args) -> Result<()> {
 
 fn show(json: bool) -> Result<()> {
     let config = Config::load_required()?;
-    let trust = crate::trust::configured(&config);
+    let trust = crate::trust::effective(&config);
     if json {
         return output::json(&TrustOutput {
             trust: crate::trust::word(trust),
@@ -85,11 +85,16 @@ fn answer_ok(response: &serde_json::Value) -> Result<bool> {
 fn lower(json: bool) -> Result<()> {
     // Lowering is always allowed: persist it here first, so it sticks even
     // when the relay is busy or unreachable; then tell the relay.
-    let before = crate::trust::configured(&Config::load_required()?);
-    if before == TrustValue::Full {
-        crate::trust::persist_lowering()?;
+    let before = crate::trust::configured_on_disk();
+    let saved = if before == TrustValue::Full {
+        crate::trust::persist_lowering()
     } else {
-        crate::trust::persist_relay()?;
+        crate::trust::persist_relay()
+    };
+    if let Err(error) = &saved {
+        output::diagnostic(format!(
+            "warning: saving `relay` failed ({error:#}); telling the relay anyway"
+        ))?;
     }
     let running = match control::request_if_running(ControlCommand::TrustRelay) {
         Ok(Some(response)) => {
@@ -108,6 +113,11 @@ fn lower(json: bool) -> Result<()> {
             true
         }
     };
+    if let Err(error) = saved
+        && !running
+    {
+        return Err(error.context("lowering trust"));
+    }
     report(json, TrustValue::Relay, before == TrustValue::Full, running)
 }
 
@@ -120,7 +130,7 @@ fn raise(json: bool) -> Result<()> {
         "`wsmp trust full` needs a person at this machine's terminal"
     );
     let config = Config::load_required()?;
-    if crate::trust::configured(&config) == TrustValue::Full {
+    if crate::trust::effective(&config) == TrustValue::Full {
         return report(json, TrustValue::Full, false, false);
     }
     let server = config.server_url.as_deref().unwrap_or("the server");

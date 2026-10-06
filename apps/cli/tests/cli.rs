@@ -411,6 +411,77 @@ fn login_enrolls_with_a_code_and_stores_a_private_credential() {
 }
 
 #[test]
+fn a_fresh_login_takes_the_chosen_trust_and_a_lowered_node_stays_lowered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let server = TestServer::start(vec![
+        (
+            "/.well-known/wsmp",
+            200,
+            well_known("https://wsmp.example.com"),
+        ),
+        ("/api/node/enroll", 200, enrolled("spark-1")),
+    ]);
+    let mut cmd = cli(&config, &state);
+    cmd.args([
+        "login",
+        &server.base_url,
+        "--code",
+        CODE,
+        "--slug",
+        "spark-1",
+        "--trust",
+        "full",
+        "--no-service",
+        "--json",
+    ]);
+    assert_eq!(json_stdout(cmd)["trust"], "full");
+    server.join();
+    // Lowered, then logged in again asking for full: stays relay.
+    cli(&config, &state)
+        .args(["trust", "relay"])
+        .assert()
+        .success();
+    let server = TestServer::start(vec![
+        (
+            "/.well-known/wsmp",
+            200,
+            well_known("https://wsmp.example.com"),
+        ),
+        ("/api/node/enroll", 200, enrolled("spark-1")),
+    ]);
+    let mut again = cli(&config, &state);
+    again.args([
+        "login",
+        &server.base_url,
+        "--code",
+        CODE,
+        "--slug",
+        "spark-1",
+        "--trust",
+        "full",
+        "--no-service",
+        "--json",
+    ]);
+    assert_eq!(json_stdout(again)["trust"], "relay");
+    server.join();
+    // Not from a process wsmp started.
+    cli(&config, &state)
+        .args([
+            "login",
+            "http://127.0.0.1:9",
+            "--code",
+            CODE,
+            "--no-service",
+        ])
+        .env("WSMP_JOB", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot run from a command"));
+}
+
+#[test]
 fn login_refuses_a_malformed_code_before_any_exchange() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
@@ -1315,6 +1386,7 @@ mod signal_shutdown {
             .socket
             .recv_timeout(Duration::from_secs(5))
             .expect("relay socket");
+        hello_ok(&mut socket);
         let shell_pid = setup.dir.join("shell.pid");
         let grand_pid = setup.dir.join("grand.pid");
         let command = format!(
@@ -1538,6 +1610,7 @@ mod signal_shutdown {
             .socket
             .recv_timeout(Duration::from_secs(5))
             .expect("relay socket");
+        hello_ok(&mut socket);
         write_text(
             &mut socket,
             r#"{"type":"exec.start","commandId":"bad-1","command":"echo \ud800","timeoutMs":60000}"#,
@@ -1854,6 +1927,16 @@ mod signal_shutdown {
             setup.relay.next_text("exec.rejected")["reason"],
             "trust_relay"
         );
+        // Remote secret writes are refused at Relay only (set them on the node).
+        write_text(
+            &mut socket,
+            &json!({ "type": "secret.set", "id": "s9", "name": "WSMP_SECRET_X", "value": "v-123" })
+                .to_string(),
+        );
+        let refused = setup.relay.next_text("secret.result");
+        assert_eq!(refused["status"], "refused");
+        assert_eq!(refused["reason"], "trust_relay");
+        assert!(!setup.state.join("node-secrets.json").exists());
         // A hand edit back to `full` does not raise: the daemon writes relay back.
         let mut edited = config.clone();
         edited["trust"] = json!("full");

@@ -2432,6 +2432,8 @@ struct ExecSession {
     timed_out: bool,
     finished: bool,
     pid: u32,
+    /// Its start time, read once at spawn (the leader may be reaped later).
+    start_ticks: Option<u64>,
     /// Exit status and the instant `try_wait` reaped the direct child.
     reaped: Option<(Option<i32>, Option<i32>, Instant)>,
     _tracked: LiveChildGuard,
@@ -2493,6 +2495,45 @@ fn process_start_ticks(_pid: u32) -> Option<u64> {
     None
 }
 
+/// The leader is gone but members of its process group, started no earlier
+/// than it, remain (a background child of the command).
+#[cfg(target_os = "linux")]
+fn group_outlived_leader(pgid: u32, leader_ticks: u64) -> bool {
+    if std::path::Path::new(&format!("/proc/{pgid}")).exists() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some(rest) = stat.rfind(')').map(|at| &stat[at + 1..]) else {
+            return false;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        // After `pid (comm)`: state ppid pgrp ... starttime is the 20th.
+        fields.get(2).and_then(|pgrp| pgrp.parse::<u32>().ok()) == Some(pgid)
+            && fields
+                .get(19)
+                .and_then(|ticks| ticks.parse::<u64>().ok())
+                .is_some_and(|ticks| ticks >= leader_ticks)
+    })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn group_outlived_leader(_pgid: u32, _leader_ticks: u64) -> bool {
+    false
+}
+
 impl ExecRegistry {
     pub(crate) fn new(tx: SyncSender<FromWorker>, command_max: Duration) -> Self {
         Self {
@@ -2519,8 +2560,9 @@ impl ExecRegistry {
                 continue;
             }
             #[cfg(unix)]
-            if command.start_ticks.is_some()
-                && process_start_ticks(command.pid) == command.start_ticks
+            if let Some(ticks) = command.start_ticks
+                && (process_start_ticks(command.pid) == Some(ticks)
+                    || group_outlived_leader(command.pid, ticks))
             {
                 kill_process_group(command.pid, false);
             }
@@ -2560,21 +2602,29 @@ impl ExecRegistry {
     }
 
     fn save_table(&self) {
-        let Some(path) = &self.table else {
+        if self.shut_down {
+            // `kill_all` wrote the rows the next daemon reports.
             return;
-        };
+        }
         let running: Vec<RunningCommand> = self
             .sessions
             .iter()
             .map(|(id, session)| RunningCommand {
                 command_id: id.clone(),
                 pid: session.pid,
-                start_ticks: process_start_ticks(session.pid),
+                start_ticks: session.start_ticks,
                 started_at: session.started_at.clone(),
                 ends_by: session.ends_by.clone(),
             })
             .collect();
-        let written = serde_json::to_vec(&running)
+        self.write_rows(&running);
+    }
+
+    fn write_rows(&self, running: &[RunningCommand]) {
+        let Some(path) = &self.table else {
+            return;
+        };
+        let written = serde_json::to_vec(running)
             .map_err(anyhow::Error::from)
             .and_then(|bytes| {
                 crate::approvals::write_private_atomic(path, &bytes, "node commands", false)
@@ -2584,16 +2634,32 @@ impl ExecRegistry {
         }
     }
 
+    /// The daemon is shutting down: end every command. Their rows stay in
+    /// the table (without a start time, so nothing is signalled again) and
+    /// the next daemon reports them `interrupted` too, in case this
+    /// connection could not.
     pub(crate) fn kill_all(&mut self) -> Vec<OutboundFrame> {
         if self.shut_down {
             return Vec::new();
         }
         self.shut_down = true;
         let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
+        let rows: Vec<RunningCommand> = self
+            .sessions
+            .iter()
+            .map(|(id, session)| RunningCommand {
+                command_id: id.clone(),
+                pid: session.pid,
+                start_ticks: None,
+                started_at: session.started_at.clone(),
+                ends_by: session.ends_by.clone(),
+            })
+            .collect();
         let mut frames = Vec::new();
         for id in ids {
             frames.extend(self.finish(&id, EndCause::Interrupted));
         }
+        self.write_rows(&rows);
         frames
     }
 
@@ -2889,11 +2955,18 @@ impl ExecRegistry {
         };
         let frame = with_tail(ended.clone(), &session.output, EXEC_END_TAIL_BYTES);
         self.ended.retain(|(id, _)| id != command_id);
+        // A poll reads at most the last 64 KiB: keep only that much.
+        let mut output = std::mem::take(&mut session.output);
+        let excess = output
+            .bytes
+            .len()
+            .saturating_sub(NODE_COMMAND_TAIL_MAX_BYTES);
+        output.bytes.drain(..excess);
         self.ended.push_back((
             command_id.to_string(),
             EndedCommand {
                 status: ended,
-                output: std::mem::take(&mut session.output),
+                output,
             },
         ));
         while self.ended.len() > EXEC_RECENT_MAX {
@@ -3059,6 +3132,7 @@ fn spawn_exec(
         timed_out: false,
         finished: false,
         pid,
+        start_ticks: process_start_ticks(pid),
         reaped: None,
         _tracked: tracked,
     })

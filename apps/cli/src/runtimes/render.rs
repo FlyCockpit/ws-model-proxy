@@ -103,6 +103,17 @@ fn phase_command(commands: &Commands, phase: JobPhase) -> Option<&str> {
     }
 }
 
+/// Whether `phase` of `rank` is an interactive step in `spec`.
+pub fn interactive_phase(spec: &RuntimeSpec, rank: u8, phase: JobPhase) -> bool {
+    spec.launch.as_ref().is_some_and(|launch| {
+        launch
+            .commands
+            .get(usize::from(rank))
+            .or_else(|| (launch.commands.len() == 1).then(|| &launch.commands[0]))
+            .is_some_and(|commands| phase_interactive(commands, phase))
+    })
+}
+
 fn phase_interactive(commands: &Commands, phase: JobPhase) -> bool {
     let Some(flags) = commands.interactive else {
         return false;
