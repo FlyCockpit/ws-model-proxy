@@ -816,7 +816,10 @@ async function deleteUserGraphInOrder(tx: Tx, userId: string): Promise<void> {
   await tx.node.deleteMany({ where: { userId } });
   await tx.pool.deleteMany({ where: { userId } });
   await tx.providerPricingVersion.deleteMany({ where: { userId } });
-  await tx.providerCredential.updateMany({ where: { userId }, data: { replacedById: null } });
+  // Rotated keys first: clearing replacedById on a REPLACED key would break its shape CHECK.
+  // One statement takes the whole chain (NoAction is checked at statement end, and only the
+  // ACTIVE head, which nothing deleted here references, remains for the account cascade).
+  await tx.providerCredential.deleteMany({ where: { userId, replacedById: { not: null } } });
   await tx.providerAccount.deleteMany({ where: { userId } });
 }
 

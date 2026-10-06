@@ -3,7 +3,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { type DeepMockProxy, mockDeep, mockReset } from "vitest-mock-extended";
 import type { PrismaClient } from "../../../db/prisma/generated/client";
 
-vi.mock("@ws-model-proxy/db", () => ({ default: mockDeep<PrismaClient>() }));
+vi.mock("@ws-model-proxy/db", async () => {
+  const actual = await vi.importActual<typeof import("../../../db/prisma/generated/client")>(
+    "../../../db/prisma/generated/client",
+  );
+  return { default: mockDeep<PrismaClient>(), Prisma: actual.Prisma };
+});
 const fenceLog = vi.hoisted(() => ({ held: [] as string[] }));
 vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => {
   const real = await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>();
@@ -19,6 +24,13 @@ vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => {
     ),
   };
 });
+// The revision-correct spend reads (their SQL runs on real Postgres in
+// integration/spend-flows.postgres.integration.test.ts).
+const spend = vi.hoisted(() => ({
+  providerAccountSpend: vi.fn(),
+  providerAccountSpendCurrencies: vi.fn(),
+}));
+vi.mock("@ws-model-proxy/db/spend", () => spend);
 vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
   isForceTwoFactorRequired: vi.fn(async () => false),
 }));
@@ -30,7 +42,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   },
 }));
 
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import type { CallerAuth } from "../contracts/auth-context";
 import { CALLERS, contextFor, OWNER } from "./lane-c-test-helpers";
 import { providersRouter } from "./providers";
@@ -70,12 +82,19 @@ function accountRow(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function usage(spentThisMonth: string, reservedNow: string) {
+  return {
+    spentThisMonth: new Prisma.Decimal(spentThisMonth),
+    reservedNow: new Prisma.Decimal(reservedNow),
+  };
+}
+
 beforeEach(() => {
   mockReset(db);
   fenceLog.held.length = 0;
   db.$transaction.mockImplementation(((work: (tx: PrismaClient) => unknown) => work(db)) as never);
-  db.usageLedger.aggregate.mockResolvedValue({ _sum: { settledCost: null } } as never);
-  db.spendReservation.aggregate.mockResolvedValue({ _sum: { reservedValue: null } } as never);
+  spend.providerAccountSpend.mockResolvedValue(usage("0", "0"));
+  spend.providerAccountSpendCurrencies.mockResolvedValue([]);
   db.providerAccount.findUniqueOrThrow.mockResolvedValue({
     currentCredentialId: "cred-1",
     baseUrl: "https://openrouter.ai/api/v1",
@@ -219,19 +238,100 @@ describe("providers (a person)", () => {
     );
   });
 
-  it("a cap change bumps its version under the spend-cap fence", async () => {
+  it("a cap change bumps its version under the account's spend fence", async () => {
     db.providerAccount.findFirst.mockResolvedValue(
       accountRow({ SpendCap: { id: "cap-1", monthlyLimit: "10", currency: "USD" } }) as never,
     );
-    db.spendCap.findUnique.mockResolvedValue({ id: "cap-1", version: 3 } as never);
-    const spend = await client().spendCaps.set({ accountId: "acc-1", monthlyLimit: "25" });
+    db.spendCap.findUnique.mockResolvedValue({ id: "cap-1", version: 3, currency: "USD" } as never);
+    spend.providerAccountSpend.mockResolvedValue(usage("1.5", "0.25"));
+    const view = await client().spendCaps.set({ accountId: "acc-1", monthlyLimit: "25" });
     expect(db.spendCap.update.mock.calls[0]?.[0]?.data).toEqual({
       monthlyLimit: "25",
       currency: "USD",
       version: 4,
     });
-    expect(fenceLog.held).toEqual(["00:owner:owner-1", "04:spend-cap:cap-1"]);
-    expect(spend.currency).toBe("USD");
+    // The cap subject's fence: every cloud admission on the account holds it.
+    expect(fenceLog.held).toEqual([
+      "00:owner:owner-1",
+      "04:spend-account:acc-1",
+      "04:spend-cap:cap-1",
+    ]);
+    // The view reads the revision-correct month (settled and reserved apart).
+    expect(spend.providerAccountSpend).toHaveBeenLastCalledWith(prisma, {
+      providerAccountId: "acc-1",
+      currency: "USD",
+    });
+    expect(view).toEqual({
+      monthlyLimit: "10",
+      currency: "USD",
+      spentThisMonth: "1.5",
+      reservedNow: "0.25",
+    });
+  });
+
+  it("a cap names only the currency the account has spent in this month", async () => {
+    db.providerAccount.findFirst.mockResolvedValue(
+      accountRow({ SpendCap: { id: "cap-1", monthlyLimit: "10", currency: "USD" } }) as never,
+    );
+    db.spendCap.findUnique.mockResolvedValue({ id: "cap-1", version: 3, currency: "USD" } as never);
+    spend.providerAccountSpendCurrencies.mockResolvedValue(["USD"]);
+    const refused = await client()
+      .spendCaps.set({ accountId: "acc-1", monthlyLimit: "25", currency: "EUR" })
+      .catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(ORPCError);
+    expect((refused as ORPCError<string, { reason: string }>).data).toMatchObject({
+      reason: "cap_currency_has_spend",
+    });
+    // Read inside the fenced transaction.
+    expect(spend.providerAccountSpendCurrencies).toHaveBeenLastCalledWith(db, {
+      providerAccountId: "acc-1",
+    });
+    expect(db.spendCap.update).not.toHaveBeenCalled();
+
+    // No spend this month: the currency changes.
+    spend.providerAccountSpendCurrencies.mockResolvedValue([]);
+    await client().spendCaps.set({ accountId: "acc-1", monthlyLimit: "25", currency: "EUR" });
+    expect(db.spendCap.update.mock.calls[0]?.[0]?.data).toMatchObject({ currency: "EUR" });
+  });
+
+  it("a first cap (or one set again after a clear) is refused in another currency", async () => {
+    db.providerAccount.findFirst.mockResolvedValue(accountRow() as never);
+    db.spendCap.findUnique.mockResolvedValue(null);
+    spend.providerAccountSpendCurrencies.mockResolvedValue(["EUR"]);
+    // Omitted currency on a new cap is USD.
+    await expect(
+      client().spendCaps.set({ accountId: "acc-1", monthlyLimit: "25" }),
+    ).rejects.toMatchObject({ data: { reason: "cap_currency_has_spend" } });
+    expect(db.spendCap.create).not.toHaveBeenCalled();
+    await client().spendCaps.set({ accountId: "acc-1", monthlyLimit: "25", currency: "EUR" });
+    expect(db.spendCap.create.mock.calls[0]?.[0]?.data).toMatchObject({ currency: "EUR" });
+  });
+
+  it("a limit-only edit keeps the cap's currency", async () => {
+    db.providerAccount.findFirst.mockResolvedValue(
+      accountRow({ SpendCap: { id: "cap-1", monthlyLimit: "10", currency: "EUR" } }) as never,
+    );
+    db.spendCap.findUnique.mockResolvedValue({ id: "cap-1", version: 3, currency: "EUR" } as never);
+    spend.providerAccountSpendCurrencies.mockResolvedValue(["EUR"]);
+    await client().spendCaps.set({ accountId: "acc-1", monthlyLimit: "25" });
+    expect(db.spendCap.update.mock.calls[0]?.[0]?.data).toEqual({
+      monthlyLimit: "25",
+      currency: "EUR",
+      version: 4,
+    });
+  });
+
+  it("clearing a cap takes the account's spend fence", async () => {
+    db.providerAccount.findFirst.mockResolvedValue(
+      accountRow({ SpendCap: { id: "cap-1", monthlyLimit: "10", currency: "USD" } }) as never,
+    );
+    await client().spendCaps.clear({ accountId: "acc-1" });
+    expect(db.spendCap.delete).toHaveBeenCalledWith({ where: { id: "cap-1" } });
+    expect(fenceLog.held).toEqual([
+      "00:owner:owner-1",
+      "04:spend-account:acc-1",
+      "04:spend-cap:cap-1",
+    ]);
   });
 
   it("replacing a key revokes, creates, then marks the old one replaced", async () => {
@@ -399,6 +499,41 @@ describe("provider review follow-ups", () => {
     expect(db.providerModel.create).not.toHaveBeenCalled();
     expect(db.providerModel.update.mock.calls[0]?.[0]?.data).toMatchObject({ deletedAt: null });
     expect(view.id).toBe("pm-old");
+    // A restored model keeps (or gets) its execution target.
+    expect(db.executionTarget.createMany).toHaveBeenCalledWith({
+      data: [{ userId: "owner-1", kind: "PROVIDER_MODEL", providerModelId: "pm-old" }],
+      skipDuplicates: true,
+    });
+  });
+
+  it("creates a model's execution target in the same fenced transaction", async () => {
+    db.providerAccount.findFirst.mockResolvedValue(accountRow() as never);
+    db.providerModel.findFirst.mockResolvedValue(null);
+    db.providerModel.create.mockResolvedValue({ id: "pm-new" } as never);
+    db.providerModel.findUniqueOrThrow.mockResolvedValue({
+      id: "pm-new",
+      providerAccountId: "acc-1",
+      upstreamModelId: "m",
+      displayName: null,
+      type: "LLM",
+      enabled: false,
+      health: "UNKNOWN",
+      contextWindow: null,
+      maxOutputTokens: null,
+      PricingVersions: [],
+    } as never);
+    let fencedWhenTargetCreated: string[] = [];
+    db.executionTarget.createMany.mockImplementation((() => {
+      fencedWhenTargetCreated = [...fenceLog.held];
+      return Promise.resolve({ count: 1 });
+    }) as never);
+    await client().models.create({ accountId: "acc-1", upstreamModelId: "m", type: "LLM" });
+    expect(db.$transaction).toHaveBeenCalledTimes(1);
+    expect(db.executionTarget.createMany).toHaveBeenCalledWith({
+      data: [{ userId: "owner-1", kind: "PROVIDER_MODEL", providerModelId: "pm-new" }],
+      skipDuplicates: true,
+    });
+    expect(fencedWhenTargetCreated).toEqual(["00:owner:owner-1"]);
   });
 
   it("another person's key, model and price are not found", async () => {

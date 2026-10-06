@@ -1,6 +1,7 @@
 import { ORPCError } from "@orpc/server";
 import { POOL_ADVANCED_COLUMNS } from "@ws-model-proxy/config/pool-defaults";
 import prisma, { Prisma } from "@ws-model-proxy/db";
+import { FenceSetChangedError } from "@ws-model-proxy/db/capacity-lock-order";
 import type { z } from "zod";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import type { poolAdvancedPatchSchema } from "../contracts/advanced";
@@ -419,6 +420,65 @@ async function humanSetter(
   return ownedPoolView(userId, poolId);
 }
 
+/** Shares of the pool that hold an own-key choice (the grantee's consent to the equivalent). */
+const OWN_KEY_CHOSEN = (poolId: string) => ({
+  poolId,
+  OR: [{ ownKeyProviderModelId: { not: null } }, { ownKeyProtocolAdaptation: true }],
+});
+
+/**
+ * A grantee's own-key choice consents to the equivalent model the owner named when it was
+ * made: a changed (or cleared) equivalent clears every share's choice in the same transaction.
+ * Share writes need the grantees' owner fences too; a choice made between the read of that set
+ * and the fences grows it, and the transaction restarts with the larger set.
+ */
+async function setOwnKeyEquivalent(context: SignedInContext, poolId: string, model: string | null) {
+  const userId = userIdOf(context);
+  const pool = await prisma.pool.findFirst({ where: { id: poolId, userId }, select: { id: true } });
+  if (!pool) throw notFound("That pool does not exist.");
+  const actor = callerActor(context.auth, userId);
+  const granteesOf = async (db: Pick<Tx, "share">) =>
+    (
+      await db.share.findMany({ where: OWN_KEY_CHOSEN(poolId), select: { granteeUserId: true } })
+    ).map((share) => share.granteeUserId);
+  // graphWrite re-reads this list on every attempt.
+  const owners = [userId, ...(await granteesOf(prisma))];
+  await graphWrite(
+    owners,
+    async (tx) => {
+      // Under the pool owner's fence no choice is made (setOwnKey takes it): the set is final.
+      const missing = (await granteesOf(tx)).filter((grantee) => !owners.includes(grantee));
+      if (missing.length > 0) {
+        owners.push(...missing);
+        throw new FenceSetChangedError();
+      }
+      const before = await tx.poolFallback.findUnique({
+        where: { poolId },
+        select: { ownKeyEquivalentModel: true },
+      });
+      await tx.poolFallback.upsert({
+        where: { poolId },
+        create: { poolId, ownKeyEquivalentModel: model },
+        update: { ownKeyEquivalentModel: model },
+      });
+      if ((before?.ownKeyEquivalentModel ?? null) !== model)
+        await tx.share.updateMany({
+          where: OWN_KEY_CHOSEN(poolId),
+          data: { ownKeyProviderModelId: null, ownKeyProtocolAdaptation: false },
+        });
+      await audit(tx, {
+        ownerId: userId,
+        actor,
+        poolId,
+        action: "pool.fallback.own_key_equivalent",
+        after: { model },
+      });
+    },
+    (tx) => poolTargetFences(tx, poolId),
+  );
+  return ownedPoolView(userId, poolId);
+}
+
 function rethrowSlugTaken(error: unknown): never {
   if (isUniqueViolation(error))
     throw refuse("slug_taken", "You already have a pool with this slug.");
@@ -710,18 +770,7 @@ export const poolsRouter = {
           throw new ORPCError("BAD_REQUEST", {
             message: "Give the model id without surrounding spaces.",
           });
-        return humanSetter(
-          context,
-          input.poolId,
-          "pool.fallback.own_key_equivalent",
-          (tx) =>
-            tx.poolFallback.upsert({
-              where: { poolId: input.poolId },
-              create: { poolId: input.poolId, ownKeyEquivalentModel: input.model },
-              update: { ownKeyEquivalentModel: input.model },
-            }),
-          { model: input.model },
-        );
+        return setOwnKeyEquivalent(context, input.poolId, input.model);
       },
     ),
   },

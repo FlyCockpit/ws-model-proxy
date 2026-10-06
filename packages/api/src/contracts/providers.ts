@@ -341,7 +341,8 @@ export const providersContract = {
         .object({
           accountId: idSchema,
           monthlyLimit: moneySchema,
-          currency: currencySchema.default("USD"),
+          /** Omitted: the cap keeps its currency (USD for a new cap). */
+          currency: currencySchema.optional(),
         })
         .strict(),
       spendViewSchema,

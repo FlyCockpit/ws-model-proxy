@@ -522,3 +522,72 @@ describe("graph-write fences and review follow-ups", () => {
     expect(db.poolSidecar.upsert.mock.calls[0]?.[0]?.update).toEqual({ targetPoolId: "pool-2" });
   });
 });
+
+describe("own-key equivalent (the share holders' consent)", () => {
+  const OWN_KEY_CHOSEN = {
+    poolId: "pool-1",
+    OR: [{ ownKeyProviderModelId: { not: null } }, { ownKeyProtocolAdaptation: true }],
+  };
+
+  function owned(equivalent: string | null) {
+    db.pool.findFirst.mockResolvedValueOnce({ id: "pool-1" } as never);
+    db.pool.findFirst.mockResolvedValue(poolRow() as never);
+    db.poolFallback.findUnique.mockResolvedValue({ ownKeyEquivalentModel: equivalent } as never);
+  }
+
+  it("a changed equivalent clears every share's own-key choice under the grantees' fences", async () => {
+    owned("openai/gpt-x");
+    db.share.findMany.mockResolvedValue([{ granteeUserId: "bob" }] as never);
+    await client().cloud.setOwnKeyEquivalent({ poolId: "pool-1", model: "openai/gpt-y" });
+    expect(db.poolFallback.upsert.mock.calls[0]?.[0]?.update).toEqual({
+      ownKeyEquivalentModel: "openai/gpt-y",
+    });
+    expect(db.share.updateMany).toHaveBeenCalledWith({
+      where: OWN_KEY_CHOSEN,
+      data: { ownKeyProviderModelId: null, ownKeyProtocolAdaptation: false },
+    });
+    expect(fenceLog.held).toEqual(["00:owner:owner-1", "00:owner:bob"]);
+  });
+
+  it("clearing the equivalent clears the choices too", async () => {
+    owned("openai/gpt-x");
+    db.share.findMany.mockResolvedValue([]);
+    await client().cloud.setOwnKeyEquivalent({ poolId: "pool-1", model: null });
+    expect(db.share.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: OWN_KEY_CHOSEN }),
+    );
+  });
+
+  it("re-saving the same equivalent keeps the choices", async () => {
+    owned("openai/gpt-x");
+    db.share.findMany.mockResolvedValue([{ granteeUserId: "bob" }] as never);
+    await client().cloud.setOwnKeyEquivalent({ poolId: "pool-1", model: "openai/gpt-x" });
+    expect(db.poolFallback.upsert).toHaveBeenCalled();
+    expect(db.share.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("a choice made before the fences restarts the transaction with that grantee fenced", async () => {
+    owned("openai/gpt-x");
+    // Bob's choice lands between the unfenced read and the owner fence.
+    db.share.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([{ granteeUserId: "bob" }] as never);
+    const { runCapacityOrderedTransaction } = await import(
+      "@ws-model-proxy/db/capacity-lock-order"
+    );
+    vi.mocked(runCapacityOrderedTransaction).mockImplementationOnce(async (runner, work) => {
+      // The real runner retries a FenceSetChangedError (no row was written yet).
+      try {
+        return await runner.$transaction(work);
+      } catch (error) {
+        expect((error as Error).name).toBe("FenceSetChangedError");
+        expect(db.share.updateMany).not.toHaveBeenCalled();
+        return runner.$transaction(work);
+      }
+    });
+    await client().cloud.setOwnKeyEquivalent({ poolId: "pool-1", model: "openai/gpt-y" });
+    // The first attempt fenced only the owner; the retry adds Bob.
+    expect(fenceLog.held).toEqual(["00:owner:owner-1", "00:owner:owner-1", "00:owner:bob"]);
+    expect(db.share.updateMany).toHaveBeenCalledTimes(1);
+  });
+});

@@ -117,7 +117,6 @@ describe("cloud target listing (0.4.0)", () => {
     expect(listed.targets[0]).toMatchObject({
       providerModelId: "a",
       protocol: "openai",
-      inferenceCapacityId: null,
       dataCollectionPolicy: "deny",
       usageDialect: "openrouter",
       endpointVersion: 2,

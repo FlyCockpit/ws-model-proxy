@@ -22,6 +22,7 @@ import {
   credentialLookupPrefix,
   generateProductCredentialSecret,
 } from "@ws-model-proxy/db/node-security";
+import { shareSpendCurrencies, sharesSpend } from "@ws-model-proxy/db/spend";
 import { env } from "@ws-model-proxy/env/server";
 import type { Context } from "../context";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
@@ -39,9 +40,8 @@ import {
   shareInviteView,
   shareSelect,
   shareView,
-  utcMonthStart,
 } from "../lib/access-views";
-import { isUniqueViolation, notFound } from "../lib/refuse";
+import { isUniqueViolation, notFound, refuse } from "../lib/refuse";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
 import {
   generateShareInviteToken,
@@ -83,30 +83,37 @@ function activeWhere(now: Date) {
   return { revokedAt: null, OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] };
 }
 
-/** The month's spend (settled plus still reserved) per share cap. */
-async function spentThisMonthByCap(capIds: readonly string[]): Promise<Map<string, string>> {
-  const spent = new Map<string, string>();
-  if (capIds.length === 0) return spent;
-  const groups = await prisma.spendReservation.groupBy({
-    by: ["capId", "state"],
-    where: { capId: { in: [...capIds] }, windowStart: { gte: utcMonthStart(new Date()) } },
-    _sum: { settledValue: true, reservedValue: true },
-  });
-  const totals = new Map<string, Prisma.Decimal>();
-  for (const group of groups) {
-    const value = group.state === "SETTLED" ? group._sum.settledValue : group._sum.reservedValue;
-    if (!value) continue;
-    const before = totals.get(group.capId);
-    totals.set(group.capId, before ? before.plus(value) : value);
+/**
+ * The month's consumption (settled plus still reserved) of each capped share, keyed by cap id:
+ * the revision-correct read the cap enforcement uses (`@ws-model-proxy/db/spend`), one batched
+ * statement per cap currency.
+ */
+async function spentThisMonthByCap(rows: readonly ShareRow[]): Promise<Map<string, string>> {
+  const byCurrency = new Map<string, Array<{ shareId: string; capId: string }>>();
+  for (const row of rows) {
+    if (!row.SpendCap) continue;
+    const group = byCurrency.get(row.SpendCap.currency) ?? [];
+    group.push({ shareId: row.id, capId: row.SpendCap.id });
+    byCurrency.set(row.SpendCap.currency, group);
   }
-  for (const [capId, total] of totals) spent.set(capId, moneyString(total));
+  const spent = new Map<string, string>();
+  await Promise.all(
+    [...byCurrency].map(async ([currency, capped]) => {
+      const usage = await sharesSpend(prisma, {
+        shareIds: capped.map((entry) => entry.shareId),
+        currency,
+      });
+      for (const { shareId, capId } of capped) {
+        const share = usage.get(shareId);
+        if (share) spent.set(capId, moneyString(share.spentThisMonth.plus(share.reservedNow)));
+      }
+    }),
+  );
   return spent;
 }
 
 async function shareViews(rows: readonly ShareRow[]) {
-  const spent = await spentThisMonthByCap(
-    rows.flatMap((row) => (row.SpendCap ? [row.SpendCap.id] : [])),
-  );
+  const spent = await spentThisMonthByCap(rows);
   return rows.map((row) => shareView(row, spent));
 }
 
@@ -674,6 +681,8 @@ const shares = {
       input.priorityClass !== undefined;
     const fenced = {
       owners: [ownerUserId, found.granteeUserId],
+      // Owner-paid admissions through the share serialize on it: a cap edit linearizes with them.
+      ...(input.monthlyCap !== undefined ? { spendShareId: found.id } : {}),
       ...(touchesPolicy ? { policyPoolId: found.poolId } : {}),
     };
     const revokedUse = await runAccessTransaction(fenced, async (tx) => {
@@ -681,7 +690,11 @@ const shares = {
       // of other fields are never undone.
       const share = await tx.share.findFirst({
         where: { id: found.id, ownerUserId },
-        select: { canUse: true, canContribute: true, SpendCap: { select: { id: true } } },
+        select: {
+          canUse: true,
+          canContribute: true,
+          SpendCap: { select: { id: true, currency: true } },
+        },
       });
       if (!share) throw notFound("That key, token, connection, share or invite does not exist.");
       const canUse = input.canUse ?? share.canUse;
@@ -704,6 +717,16 @@ const shares = {
         await tx.spendCap.deleteMany({ where: { id: share.SpendCap.id, shareId: found.id } });
       } else if (input.monthlyCap) {
         const limit = new Prisma.Decimal(input.monthlyCap.limit);
+        // Any set (a first cap, or one set again after a clear included) names the one
+        // currency the share has spent in this month. Exact under the share's spend fence:
+        // no admission through it runs meanwhile.
+        const spentIn = await shareSpendCurrencies(tx, { shareId: found.id });
+        if (spentIn.some((spent) => spent !== input.monthlyCap?.currency)) {
+          throw refuse(
+            "cap_currency_has_spend",
+            "The cap's currency must be the one this share has spent in this month.",
+          );
+        }
         if (share.SpendCap) {
           await tx.spendCap.update({
             where: { id: share.SpendCap.id },
@@ -762,34 +785,43 @@ const shares = {
     const granteeUserId = userIdOf(context);
     const share = await prisma.share.findFirst({
       where: { id: input.shareId, granteeUserId },
-      select: {
-        id: true,
-        ownKeyProtocolAdaptation: true,
-        Pool: { select: { Fallback: { select: { ownKeyEquivalentModel: true } } } },
-      },
+      select: { id: true, ownerUserId: true },
     });
     if (!share) throw notFound("That key, token, connection, share or invite does not exist.");
-    if (input.providerModelId !== null) {
-      if (!share.Pool.Fallback?.ownKeyEquivalentModel) {
+    // Under the owner's fence the equivalent cannot change meanwhile (a change clears every
+    // choice), so the choice consents to the equivalent read here; under the share holder's,
+    // the chosen model cannot be deleted.
+    await runAccessTransaction({ owners: [share.ownerUserId, granteeUserId] }, async (tx) => {
+      if (input.providerModelId !== null) {
+        const model = await tx.providerModel.findFirst({
+          where: { id: input.providerModelId, userId: granteeUserId, deletedAt: null },
+          select: { id: true },
+        });
+        if (!model) throw notFound("That key, token, connection, share or invite does not exist.");
+      }
+      const current = await tx.share.findFirst({
+        where: { id: share.id, granteeUserId },
+        select: {
+          ownKeyProtocolAdaptation: true,
+          Pool: { select: { Fallback: { select: { ownKeyEquivalentModel: true } } } },
+        },
+      });
+      if (!current) throw notFound("That key, token, connection, share or invite does not exist.");
+      if (input.providerModelId !== null && !current.Pool.Fallback?.ownKeyEquivalentModel) {
         throw new ORPCError("FORBIDDEN", {
           message: "The pool's owner has not allowed using your own provider key for this pool.",
         });
       }
-      const model = await prisma.providerModel.findFirst({
-        where: { id: input.providerModelId, userId: granteeUserId, deletedAt: null },
-        select: { id: true },
+      await tx.share.update({
+        where: { id: share.id },
+        data: {
+          ownKeyProviderModelId: input.providerModelId,
+          ownKeyProtocolAdaptation:
+            input.providerModelId === null
+              ? false
+              : (input.protocolAdaptation ?? current.ownKeyProtocolAdaptation),
+        },
       });
-      if (!model) throw notFound("That key, token, connection, share or invite does not exist.");
-    }
-    await prisma.share.update({
-      where: { id: share.id },
-      data: {
-        ownKeyProviderModelId: input.providerModelId,
-        ownKeyProtocolAdaptation:
-          input.providerModelId === null
-            ? false
-            : (input.protocolAdaptation ?? share.ownKeyProtocolAdaptation),
-      },
     });
     return loadShareView(share.id);
   }),

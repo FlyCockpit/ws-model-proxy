@@ -74,6 +74,9 @@ export const REFUSAL_REASONS = [
   // Lane B contract gaps.
   /** A new node port range leaves out a port a running instance on the node uses. */
   "port_range_in_use",
+  // Lane E integration.
+  /** A cap's currency changes only while its subject has no spend or reservation this month. */
+  "cap_currency_has_spend",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

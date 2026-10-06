@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { ORPCError } from "@orpc/server";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { fences } from "@ws-model-proxy/db/capacity-lock-order";
+import { providerAccountSpendCurrencies } from "@ws-model-proxy/db/spend";
 import { env } from "@ws-model-proxy/env/server";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import { providersContract as c } from "../contracts/providers";
@@ -40,7 +41,7 @@ import {
   moneyString,
   spendFor,
 } from "../lib/provider-views";
-import { isUniqueViolation, notFound } from "../lib/refuse";
+import { isUniqueViolation, notFound, refuse } from "../lib/refuse";
 import type { Tx } from "../lib/runtime-store";
 
 function userIdOf(context: SignedInContext): string {
@@ -439,10 +440,9 @@ export const providersRouter = {
       if (!account) throw notFound("That provider account does not exist.");
       const credential = account.CurrentCredential;
       if (!credential) return { ok: false, status: null, detail: "no_key" };
-      // A generic account speaks the OpenAI-compatible API (contract gap: no protocol field).
-      const protocol =
-        providerProtocolForType(account.providerType) ??
-        (account.providerType === "generic" ? "openai" : null);
+      // A generic account is probed as OpenAI-compatible: a bearer `GET /v1/models`, which
+      // does not prove the key (verifiesCredential is false: a 2xx is only "unverified").
+      const protocol = providerProtocolForType(account.providerType);
       if (!protocol) return { ok: false, status: null, detail: "unsupported_provider" };
       if (!cloudEgressEnabled()) return { ok: false, status: null, detail: "egress_disabled" };
       const secret = decryptProviderCredential(
@@ -568,6 +568,15 @@ export const providersRouter = {
       let modelId: string;
       try {
         modelId = await graphWrite([userId], async (tx) => {
+          // Every live model has its execution target (the identity routes and attempts name),
+          // created with it under the same owner fence. A restored model may still have one.
+          const withTarget = async (providerModelId: string) => {
+            await tx.executionTarget.createMany({
+              data: [{ userId, kind: "PROVIDER_MODEL", providerModelId }],
+              skipDuplicates: true,
+            });
+            return providerModelId;
+          };
           // A model deleted earlier keeps its row (history points at it): bring it back.
           const deleted = await tx.providerModel.findFirst({
             where: {
@@ -592,7 +601,7 @@ export const providersRouter = {
                 maxOutputTokens: input.maxOutputTokens ?? null,
               },
             });
-            return deleted.id;
+            return withTarget(deleted.id);
           }
           const model = await tx.providerModel.create({
             data: {
@@ -612,7 +621,7 @@ export const providersRouter = {
             action: "provider.model.create",
             after: { modelId: model.id, upstreamModelId: input.upstreamModelId },
           });
-          return model.id;
+          return withTarget(model.id);
         });
       } catch (error) {
         if (isUniqueViolation(error))
@@ -912,18 +921,26 @@ export const providersRouter = {
           // Decide under the fences: another tab may have set or cleared it meanwhile.
           const cap = await tx.spendCap.findUnique({
             where: { providerAccountId: account.id },
-            select: { id: true, version: true },
+            select: { id: true, version: true, currency: true },
           });
+          // A limit-only edit keeps the cap's currency; a new cap defaults to USD.
+          const currency = input.currency ?? cap?.currency ?? "USD";
+          // Any set (a first cap, or one set again after a clear included) names the one
+          // currency the account has spent in this month. Exact under the account's spend
+          // fence: no cloud admission on it runs meanwhile.
+          const spentIn = await providerAccountSpendCurrencies(tx, {
+            providerAccountId: account.id,
+          });
+          if (spentIn.some((spent) => spent !== currency))
+            throw refuse(
+              "cap_currency_has_spend",
+              "The cap's currency must be the one this account has spent in this month.",
+            );
           if (cap) {
-            const current = cap;
             // Reservations snapshot the cap version; every limit change bumps it.
             await tx.spendCap.update({
               where: { id: cap.id },
-              data: {
-                monthlyLimit: input.monthlyLimit,
-                currency: input.currency,
-                version: current.version + 1,
-              },
+              data: { monthlyLimit: input.monthlyLimit, currency, version: cap.version + 1 },
             });
           } else
             await tx.spendCap.create({
@@ -932,21 +949,22 @@ export const providersRouter = {
                 scope: "PROVIDER_ACCOUNT",
                 providerAccountId: account.id,
                 monthlyLimit: input.monthlyLimit,
-                currency: input.currency,
+                currency,
               },
             });
           await audit(tx, context, {
             accountId: account.id,
             action: "spend_cap.update",
-            after: { monthlyLimit: input.monthlyLimit, currency: input.currency },
+            after: { monthlyLimit: input.monthlyLimit, currency },
           });
         },
         async (tx) => {
+          // The cap subject: every cloud admission on the account holds it.
           const cap = await tx.spendCap.findUnique({
             where: { providerAccountId: account.id },
             select: { id: true },
           });
-          return cap ? [fences.spendCap(cap.id)] : [];
+          return [fences.spendAccount(account.id), ...(cap ? [fences.spendCap(cap.id)] : [])];
         },
       );
       return spendFor(await ownedAccount(userId, account.id));
@@ -962,7 +980,7 @@ export const providersRouter = {
             await tx.spendCap.delete({ where: { id: cap.id } });
             await audit(tx, context, { accountId: account.id, action: "spend_cap.clear" });
           },
-          async () => [fences.spendCap(cap.id)],
+          async () => [fences.spendAccount(account.id), fences.spendCap(cap.id)],
         );
       return spendFor(await ownedAccount(userId, account.id));
     }),

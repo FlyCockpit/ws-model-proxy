@@ -2,8 +2,8 @@
  * The execution target of a provider model (`execution_target` kind PROVIDER_MODEL): the
  * immutable identity routes, stickiness bindings and attempts name a cloud member by.
  *
- * Provider model creation does not create it yet, so the cloud target listing creates the
- * missing ones on first use (once per model). Writer class M: the owner fence, then the target
+ * Provider model creation creates it in the same transaction (`providers.models.create`); this
+ * fallback creates any still missing (models created before that) on first use, once per model. Writer class M: the owner fence, then the target
  * identity fences, before any row; then the account and model rows FOR KEY SHARE (the insert's
  * foreign key re-enters them), then the insert. Idempotent: a concurrent creator is a no-op.
  */

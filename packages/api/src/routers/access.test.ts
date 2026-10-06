@@ -30,8 +30,12 @@ const mailer = vi.hoisted(() => ({
   verifyTransport: vi.fn(async () => false),
 }));
 vi.mock("@ws-model-proxy/mailer", () => mailer);
+// The revision-correct spend reads (their SQL runs on real Postgres in
+// integration/spend-flows.postgres.integration.test.ts).
+const spend = vi.hoisted(() => ({ sharesSpend: vi.fn(), shareSpendCurrencies: vi.fn() }));
+vi.mock("@ws-model-proxy/db/spend", () => spend);
 
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import { credentialDigest } from "@ws-model-proxy/db/node-security";
 import type { Context } from "../context";
 import type { AnonymousAuth, CallerAuth } from "../contracts/auth-context";
@@ -144,7 +148,23 @@ beforeEach(() => {
   envMock.env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY = false;
   inTransaction();
   db.poolMember.findMany.mockResolvedValue([]);
+  spend.sharesSpend.mockImplementation(
+    async (_db: unknown, input: { shareIds: string[] }) =>
+      new Map(input.shareIds.map((id) => [id, usage("0", "0")])),
+  );
+  spend.shareSpendCurrencies.mockResolvedValue([]);
 });
+
+function capOf(id: string, currency: string) {
+  return { id, monthlyLimit: new Prisma.Decimal("20"), currency };
+}
+
+function usage(spentThisMonth: string, reservedNow: string) {
+  return {
+    spentThisMonth: new Prisma.Decimal(spentThisMonth),
+    reservedNow: new Prisma.Decimal(reservedNow),
+  };
+}
 
 describe("only a person may mint credentials or grant access", () => {
   const mutations: Array<[string, (c: ReturnType<typeof client>) => Promise<unknown>]> = [
@@ -617,6 +637,7 @@ describe("shares", () => {
   it("sets an own key only from the share holder's own provider models", async () => {
     db.share.findFirst.mockResolvedValue({
       id: "share1",
+      ownerUserId: "pool-owner",
       ownKeyProtocolAdaptation: false,
       Pool: { Fallback: { ownKeyEquivalentModel: "openai/gpt" } },
     } as never);
@@ -633,6 +654,119 @@ describe("shares", () => {
       userId: "owner",
     });
     expect(db.share.update).not.toHaveBeenCalled();
+  });
+
+  it("sets an own key under both owners' fences, re-checking the owner's consent there", async () => {
+    db.share.findFirst
+      .mockResolvedValueOnce({ id: "share1", ownerUserId: "pool-owner" } as never)
+      .mockResolvedValueOnce({
+        ownKeyProtocolAdaptation: false,
+        Pool: { Fallback: { ownKeyEquivalentModel: "openai/gpt" } },
+      } as never);
+    db.providerModel.findFirst.mockResolvedValue({ id: "mine" } as never);
+    db.share.findUnique.mockResolvedValue(shareRow as never);
+    await client().shares.setOwnKey({ shareId: "share1", providerModelId: "mine" });
+    expect(heldFences()).toEqual(["00:owner:owner", "00:owner:pool-owner"]);
+    expect(db.share.update.mock.calls[0]?.[0]).toEqual({
+      where: { id: "share1" },
+      data: { ownKeyProviderModelId: "mine", ownKeyProtocolAdaptation: false },
+    });
+
+    // The owner withdrew the equivalent between the read and the fences: refused.
+    db.share.update.mockClear();
+    db.share.findFirst
+      .mockResolvedValueOnce({ id: "share1", ownerUserId: "pool-owner" } as never)
+      .mockResolvedValueOnce({
+        ownKeyProtocolAdaptation: false,
+        Pool: { Fallback: null },
+      } as never);
+    await expect(
+      client().shares.setOwnKey({ shareId: "share1", providerModelId: "mine" }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(db.share.update).not.toHaveBeenCalled();
+  });
+
+  it("shows capped shares' month as settled plus reserved spend, batched per currency", async () => {
+    db.share.findMany
+      .mockResolvedValueOnce([
+        { ...shareRow, id: "s1", SpendCap: capOf("cap1", "EUR") },
+        { ...shareRow, id: "s2", SpendCap: capOf("cap2", "EUR") },
+        { ...shareRow, id: "s3", SpendCap: capOf("cap3", "USD") },
+        { ...shareRow, id: "s4", SpendCap: null },
+      ] as never)
+      .mockResolvedValueOnce([]);
+    db.shareInvite.findMany.mockResolvedValue([]);
+    spend.sharesSpend.mockImplementation(
+      async (_db: unknown, input: { shareIds: string[]; currency: string }) =>
+        new Map(
+          input.shareIds.map((id) => [id, id === "s1" ? usage("1.5", "0.25") : usage("0", "0")]),
+        ),
+    );
+    const listed = await client().shares.list();
+    // One statement per cap currency, never one per share.
+    expect(spend.sharesSpend).toHaveBeenCalledTimes(2);
+    expect(spend.sharesSpend).toHaveBeenCalledWith(prisma, {
+      shareIds: ["s1", "s2"],
+      currency: "EUR",
+    });
+    expect(spend.sharesSpend).toHaveBeenCalledWith(prisma, { shareIds: ["s3"], currency: "USD" });
+    expect(listed.byMe.map((share) => share.monthlyCap?.spentThisMonth ?? null)).toEqual([
+      "1.75",
+      "0",
+      "0",
+      null,
+    ]);
+  });
+
+  it("edits a share cap under the share's spend fence", async () => {
+    db.share.findFirst.mockResolvedValue({
+      id: "share1",
+      poolId: "pool1",
+      granteeUserId: "friend",
+      canUse: true,
+      canContribute: true,
+      SpendCap: { id: "cap1", currency: "USD" },
+    } as never);
+    db.share.findUnique.mockResolvedValue(shareRow as never);
+    spend.shareSpendCurrencies.mockResolvedValue(["USD"]);
+    await client().shares.update({
+      shareId: "share1",
+      monthlyCap: { limit: "30", currency: "USD" },
+    });
+    expect(heldFences()).toEqual(["00:owner:friend", "00:owner:owner", "04:spend-share:share1"]);
+    expect(spend.shareSpendCurrencies).toHaveBeenCalledWith(db, { shareId: "share1" });
+    expect(db.spendCap.update.mock.calls[0]?.[0]?.data).toMatchObject({ currency: "USD" });
+  });
+
+  it("a share cap names only the currency the share has spent in this month", async () => {
+    const found = (SpendCap: unknown) =>
+      db.share.findFirst.mockResolvedValue({
+        id: "share1",
+        poolId: "pool1",
+        granteeUserId: "friend",
+        canUse: true,
+        canContribute: true,
+        SpendCap,
+      } as never);
+    db.share.findUnique.mockResolvedValue(shareRow as never);
+    spend.shareSpendCurrencies.mockResolvedValue(["USD"]);
+    // A currency change, and a first cap (also one set again after a clear).
+    for (const cap of [{ id: "cap1", currency: "USD" }, null]) {
+      found(cap);
+      await expect(
+        client().shares.update({ shareId: "share1", monthlyCap: { limit: "30", currency: "EUR" } }),
+      ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "cap_currency_has_spend" } });
+    }
+    expect(db.spendCap.update).not.toHaveBeenCalled();
+    expect(db.spendCap.create).not.toHaveBeenCalled();
+
+    spend.shareSpendCurrencies.mockResolvedValue([]);
+    found({ id: "cap1", currency: "USD" });
+    await client().shares.update({
+      shareId: "share1",
+      monthlyCap: { limit: "30", currency: "EUR" },
+    });
+    expect(db.spendCap.update.mock.calls[0]?.[0]?.data).toMatchObject({ currency: "EUR" });
   });
 
   it("writes only the fields a share update names", async () => {

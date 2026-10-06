@@ -58,13 +58,12 @@ function amount(value: unknown): Prisma.Decimal {
 }
 
 /**
- * Revision-correct settled cost (a scalar subquery) of the attempts whose ledger rows match
- * `scope` and whose first revision falls in `window`. `scope` filters `usage_ledger l` rows
- * (e.g. by account or payer).
+ * The `revisions` CTE chain: the ledger revisions of the attempts whose ledger rows match
+ * `scope` and whose first revision falls in `window`, each with its attempt's latest SNAPSHOT
+ * sequence. `scope` filters `usage_ledger l` rows (e.g. by account, payer or share).
  */
-function settledLedgerSql(scope: Prisma.Sql, currency: string, window: MonthWindow): Prisma.Sql {
-  return Prisma.sql`(
-    WITH attempts AS (
+function revisionsCte(scope: Prisma.Sql, window: MonthWindow): Prisma.Sql {
+  return Prisma.sql`WITH attempts AS (
       SELECT l."attemptId", l."fencingToken"
         FROM usage_ledger l
        WHERE ${scope}
@@ -81,18 +80,34 @@ function settledLedgerSql(scope: Prisma.Sql, currency: string, window: MonthWind
             AND earlier."createdAt" < ${window.start})
     ),
     revisions AS (
-      SELECT l."revisionSequence", l."settledCost", l.currency,
+      SELECT l."shareId", l."revisionSequence", l."settledCost", l.currency,
              MAX(l."revisionSequence") FILTER (WHERE l."revisionKind" = 'SNAPSHOT')
                OVER (PARTITION BY l."attemptId", l."fencingToken") AS "snapshotSequence"
         FROM usage_ledger l
         JOIN first_in_window f
           ON f."attemptId" = l."attemptId" AND f."fencingToken" = l."fencingToken"
-    )
+    )`;
+}
+
+/** The revisions that count toward an attempt's settled total (its latest SNAPSHOT onward). */
+const COUNTED_REVISION = Prisma.sql`r."settledCost" IS NOT NULL
+       AND (r."snapshotSequence" IS NULL OR r."revisionSequence" >= r."snapshotSequence")`;
+
+/** In-flight cloud attempts: ACTIVE, with no ledger revision yet (`attempt a`). */
+const IN_FLIGHT_ATTEMPT = Prisma.sql`a.kind = 'CLOUD'::"AttemptKind"
+       AND a.state = 'ACTIVE'::"AttemptState"
+       AND NOT EXISTS (
+         SELECT 1 FROM usage_ledger l
+          WHERE l."attemptId" = a.id AND l."fencingToken" = a."fencingToken")`;
+
+/** Revision-correct settled cost (a scalar subquery) of `scope`'s attempts in `window`. */
+function settledLedgerSql(scope: Prisma.Sql, currency: string, window: MonthWindow): Prisma.Sql {
+  return Prisma.sql`(
+    ${revisionsCte(scope, window)}
     SELECT COALESCE(SUM(r."settledCost"), 0)::numeric(30, 9)
       FROM revisions r
      WHERE r.currency = ${currency}
-       AND r."settledCost" IS NOT NULL
-       AND (r."snapshotSequence" IS NULL OR r."revisionSequence" >= r."snapshotSequence")
+       AND ${COUNTED_REVISION}
   )`;
 }
 
@@ -102,13 +117,37 @@ function reservedAttemptSql(scope: Prisma.Sql, currency: string): Prisma.Sql {
     SELECT COALESCE(SUM(a."liabilitySpend"), 0)::numeric(30, 9)
       FROM attempt a
      WHERE ${scope}
-       AND a.kind = 'CLOUD'::"AttemptKind"
-       AND a.state = 'ACTIVE'::"AttemptState"
        AND a."liabilityCurrency" = ${currency}
-       AND NOT EXISTS (
-         SELECT 1 FROM usage_ledger l
-          WHERE l."attemptId" = a.id AND l."fencingToken" = a."fencingToken")
+       AND ${IN_FLIGHT_ATTEMPT}
   )`;
+}
+
+/**
+ * Every currency with settled spend this month or a reservation now in `ledgerScope` /
+ * `attemptScope` (the same subject), sorted. One statement, so both come from one snapshot.
+ */
+async function spendCurrencies(
+  db: SpendReader,
+  ledgerScope: Prisma.Sql,
+  attemptScope: Prisma.Sql,
+  window: MonthWindow,
+): Promise<string[]> {
+  const rows = await db.$queryRaw<Array<{ currency: string }>>`
+    ${revisionsCte(ledgerScope, window)},
+    settled AS (
+      SELECT r.currency FROM revisions r
+       WHERE r.currency IS NOT NULL AND ${COUNTED_REVISION}
+       GROUP BY r.currency
+      HAVING SUM(r."settledCost") > 0
+    ),
+    reserved AS (
+      SELECT a."liabilityCurrency" AS currency FROM attempt a
+       WHERE ${attemptScope} AND a."liabilityCurrency" IS NOT NULL AND ${IN_FLIGHT_ATTEMPT}
+       GROUP BY a."liabilityCurrency"
+      HAVING SUM(a."liabilitySpend") > 0
+    )
+    SELECT currency FROM settled UNION SELECT currency FROM reserved ORDER BY currency`;
+  return rows.map((row) => row.currency);
 }
 
 async function scalar(db: SpendReader, value: Prisma.Sql): Promise<Prisma.Decimal> {
@@ -224,5 +263,72 @@ export async function shareSpend(
       utcMonthWindow(input.now),
     ),
     reservedAttemptSql(Prisma.sql`a."shareId" = ${input.shareId}`, currency),
+  );
+}
+
+/**
+ * {@link shareSpend} for many shares in one statement (share lists), by share id. Every id in
+ * `shareIds` has an entry (zero when it has no spend).
+ */
+export async function sharesSpend(
+  db: SpendReader,
+  input: { shareIds: readonly string[]; currency: string; now?: Date },
+): Promise<Map<string, SpendUsage>> {
+  const currency = checkedCurrency(input.currency);
+  const shareIds = [...new Set(input.shareIds)];
+  if (shareIds.length === 0) return new Map();
+  const rows = await db.$queryRaw<Array<{ shareId: string; settled: unknown; reserved: unknown }>>`
+    ${revisionsCte(Prisma.sql`l."shareId" = ANY(${shareIds}::text[])`, utcMonthWindow(input.now))},
+    settled AS (
+      SELECT r."shareId", SUM(r."settledCost") AS total FROM revisions r
+       WHERE r.currency = ${currency} AND ${COUNTED_REVISION}
+       GROUP BY r."shareId"
+    ),
+    reserved AS (
+      SELECT a."shareId", SUM(a."liabilitySpend") AS total FROM attempt a
+       WHERE a."shareId" = ANY(${shareIds}::text[])
+         AND a."liabilityCurrency" = ${currency} AND ${IN_FLIGHT_ATTEMPT}
+       GROUP BY a."shareId"
+    )
+    SELECT s.id AS "shareId",
+           COALESCE(settled.total, 0)::numeric(30, 9) AS settled,
+           COALESCE(reserved.total, 0)::numeric(30, 9) AS reserved
+      FROM unnest(${shareIds}::text[]) AS s(id)
+      LEFT JOIN settled ON settled."shareId" = s.id
+      LEFT JOIN reserved ON reserved."shareId" = s.id`;
+  return new Map(
+    rows.map((row) => [
+      row.shareId,
+      { spentThisMonth: amount(row.settled), reservedNow: amount(row.reserved) },
+    ]),
+  );
+}
+
+/**
+ * The currencies a provider account has settled spend in this month or reservations in now: a
+ * cap may name only the one currency its subject has spent in this month.
+ */
+export function providerAccountSpendCurrencies(
+  db: SpendReader,
+  input: { providerAccountId: string; now?: Date },
+): Promise<string[]> {
+  return spendCurrencies(
+    db,
+    Prisma.sql`l."providerAccountId" = ${input.providerAccountId}`,
+    Prisma.sql`a."providerAccountId" = ${input.providerAccountId}`,
+    utcMonthWindow(input.now),
+  );
+}
+
+/** {@link providerAccountSpendCurrencies} for owner-paid traffic through one share. */
+export function shareSpendCurrencies(
+  db: SpendReader,
+  input: { shareId: string; now?: Date },
+): Promise<string[]> {
+  return spendCurrencies(
+    db,
+    Prisma.sql`l."shareId" = ${input.shareId}`,
+    Prisma.sql`a."shareId" = ${input.shareId}`,
+    utcMonthWindow(input.now),
   );
 }

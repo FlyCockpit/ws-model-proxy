@@ -3,6 +3,7 @@
  * the database: views carry the credential's status and last four characters only.
  */
 import prisma, { type Prisma } from "@ws-model-proxy/db";
+import { providerAccountSpend } from "@ws-model-proxy/db/spend";
 import type { z } from "zod";
 import type {
   providerAccountViewSchema,
@@ -22,11 +23,6 @@ export function moneyString(
   const normalizedWhole = whole.replace(/^(-?)0+(?=\d)/, "$1");
   const result = trimmed ? `${normalizedWhole}.${trimmed}` : normalizedWhole;
   return result === "-0" ? "0" : result;
-}
-
-/** The first instant of the current UTC calendar month (caps are monthly in UTC). */
-export function utcMonthStart(now = new Date()): Date {
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
 }
 
 export const ACCOUNT_SELECT = {
@@ -49,30 +45,19 @@ export type AccountRow = Prisma.ProviderAccountGetPayload<{ select: typeof ACCOU
 
 type SpendView = z.infer<typeof spendViewSchema>;
 
-/** This month's settled spend and the live reservations against the account's cap. */
+/**
+ * This month's settled spend and the live reservations through the account, in the cap's
+ * currency (USD when uncapped): the revision-correct read the cap enforcement uses
+ * (`@ws-model-proxy/db/spend`), so a superseded ledger snapshot is never counted twice.
+ */
 export async function spendFor(account: Pick<AccountRow, "id" | "SpendCap">): Promise<SpendView> {
   const currency = account.SpendCap?.currency ?? "USD";
-  const [settled, reserved] = await Promise.all([
-    prisma.usageLedger.aggregate({
-      where: {
-        providerAccountId: account.id,
-        createdAt: { gte: utcMonthStart() },
-        currency,
-      },
-      _sum: { settledCost: true },
-    }),
-    account.SpendCap
-      ? prisma.spendReservation.aggregate({
-          where: { capId: account.SpendCap.id, state: "RESERVED" },
-          _sum: { reservedValue: true },
-        })
-      : Promise.resolve(null),
-  ]);
+  const usage = await providerAccountSpend(prisma, { providerAccountId: account.id, currency });
   return {
     monthlyLimit: account.SpendCap ? moneyString(account.SpendCap.monthlyLimit) : null,
     currency,
-    spentThisMonth: moneyString(settled._sum.settledCost),
-    reservedNow: moneyString(reserved?._sum.reservedValue),
+    spentThisMonth: moneyString(usage.spentThisMonth),
+    reservedNow: moneyString(usage.reservedNow),
   };
 }
 

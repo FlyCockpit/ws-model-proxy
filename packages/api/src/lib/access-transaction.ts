@@ -3,7 +3,8 @@
  * spend_cap) need the owner fence of every owner they touch, taken before the first row lock or
  * write (`enforce_graph_write_fence`, WMPF4 otherwise). A change to a share's policy columns
  * (canUse, canContribute, priorityClass) also needs the `06:capacity-policy` fence of every
- * execution target of the pool, since it changes their admission view.
+ * execution target of the pool, since it changes their admission view. A share cap edit takes
+ * the share's `04:spend-share` fence, which every owner-paid admission through it holds.
  *
  * READ COMMITTED (capacity-ordered): reads after the fences see what the previous holder
  * committed, so a count-then-insert under the owner fence is exact.
@@ -65,16 +66,18 @@ async function poolTargetIds(tx: Tx, poolId: string): Promise<string[]> {
 }
 
 /**
- * Runs `work` after taking the owner fences of `owners` and, for `policyPoolId`, the
- * capacity-policy fences of that pool's targets. Contention past the bounds is a CONFLICT.
+ * Runs `work` after taking the owner fences of `owners`, the spend fence of `spendShareId` and,
+ * for `policyPoolId`, the capacity-policy fences of that pool's targets. Contention past the
+ * bounds is a CONFLICT.
  */
 export async function runAccessTransaction<T>(
-  args: { owners: readonly string[]; policyPoolId?: string },
+  args: { owners: readonly string[]; spendShareId?: string; policyPoolId?: string },
   work: (tx: Tx) => Promise<T>,
 ): Promise<T> {
   try {
     return await runCapacityOrderedTransaction(prisma, async (tx) => {
       await fenceOwners(tx, args.owners);
+      if (args.spendShareId) await acquireFences(tx, [fences.spendShare(args.spendShareId)]);
       // Under the pool owner's fence the member set is stable (pool_member writes need it);
       // a plain read takes no row lock, so the higher-level fences may still follow.
       const targetIds = args.policyPoolId ? await poolTargetIds(tx, args.policyPoolId) : [];

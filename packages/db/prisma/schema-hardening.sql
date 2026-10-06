@@ -148,7 +148,7 @@ FOR EACH ROW EXECUTE FUNCTION refuse_user_deletion_marker_clear();
 
 ALTER TABLE node DROP CONSTRAINT IF EXISTS node_shape_check;
 ALTER TABLE node ADD CONSTRAINT node_shape_check CHECK (
-  slug ~ '^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,62}$'
+  slug ~ '^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){2,62}$'
   AND cardinality(labels) <= 32
   AND "connectionGeneration" >= 0
   AND jsonb_typeof("heldDefinitions") = 'array'
@@ -1309,21 +1309,26 @@ DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION enforce_provider_cre
 CREATE OR REPLACE FUNCTION enforce_provider_current_credential_consistency()
 RETURNS trigger LANGUAGE plpgsql AS $provider_current_credential$
 DECLARE credential_owner TEXT; credential_account TEXT; credential_state TEXT; credential_auth TEXT;
+  account RECORD;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM provider_account WHERE id = NEW.id) THEN
+  -- Deferred to commit, where NEW is the row as of its event: check the row as it is now (an
+  -- account is inserted, then given its first credential, in one transaction).
+  SELECT id, "userId", "currentCredentialId", "authType"::text AS "authType" INTO account
+    FROM provider_account WHERE id = NEW.id;
+  IF NOT FOUND THEN
     RETURN NULL;
   END IF;
-  IF NEW."currentCredentialId" IS NOT NULL THEN
+  IF account."currentCredentialId" IS NOT NULL THEN
     SELECT "userId", "providerAccountId", status::text, "credentialType"::text
       INTO credential_owner, credential_account, credential_state, credential_auth
-      FROM provider_credential WHERE id = NEW."currentCredentialId";
-    IF credential_owner IS DISTINCT FROM NEW."userId" OR credential_account IS DISTINCT FROM NEW.id
-       OR credential_state IS DISTINCT FROM 'ACTIVE' OR credential_auth IS DISTINCT FROM NEW."authType"::text THEN
+      FROM provider_credential WHERE id = account."currentCredentialId";
+    IF credential_owner IS DISTINCT FROM account."userId" OR credential_account IS DISTINCT FROM account.id
+       OR credential_state IS DISTINCT FROM 'ACTIVE' OR credential_auth IS DISTINCT FROM account."authType" THEN
       RAISE EXCEPTION 'current provider credential must be active and belong to the account owner' USING ERRCODE = '23514';
     END IF;
   ELSIF EXISTS (
     SELECT 1 FROM provider_credential
-     WHERE "providerAccountId" = NEW.id AND "userId" = NEW."userId" AND status = 'ACTIVE'
+     WHERE "providerAccountId" = account.id AND "userId" = account."userId" AND status = 'ACTIVE'
   ) THEN
     RAISE EXCEPTION 'provider account without a current credential cannot retain an active credential' USING ERRCODE = '23514';
   END IF;

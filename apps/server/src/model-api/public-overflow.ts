@@ -261,8 +261,6 @@ export interface PublicProviderTarget {
   ownKeyAdaptationEnabled?: boolean;
   poolMemberId: string;
   executionTargetId: string;
-  inferenceCapacityId?: string | null;
-  capacityWaitBudgetMs?: number | null;
   publicOrder: number;
   providerModelId: string;
   upstreamModelId: string;
@@ -1176,8 +1174,8 @@ type ProviderTargetModel = Prisma.ProviderModelGetPayload<{
  * own provider model instead, while the owner's equivalent-model consent and the share's
  * own-key choice both hold. Unlocked reads: the send claim re-checks everything under locks.
  *
- * Cloud members have no physical capacity (spend caps bound them), so `inferenceCapacityId` is
- * null and callers dispatch them without a capacity lease.
+ * Cloud members have no physical capacity (spend caps bound them): callers dispatch them without
+ * a capacity lease.
  */
 export async function listPublicOverflowTargets(
   userId: string,
@@ -1345,8 +1343,6 @@ export async function listPublicOverflowTargets(
       ownKey: Boolean(ownKey),
       ownKeyAdaptationEnabled,
       poolMemberId: member.id,
-      inferenceCapacityId: null,
-      capacityWaitBudgetMs: null,
       publicOrder: member.order,
       contextWindow: model.contextWindow,
       maxOutputTokens: model.maxOutputTokens,

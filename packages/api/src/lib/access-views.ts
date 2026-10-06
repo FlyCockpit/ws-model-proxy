@@ -160,8 +160,3 @@ export function shareInviteView(row: ShareInviteRow): z.infer<typeof shareInvite
     emailSentAt: isoOrNull(row.emailSentAt),
   };
 }
-
-/** Start of the current UTC calendar month (spend caps are monthly, UTC). */
-export function utcMonthStart(now: Date): Date {
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
-}

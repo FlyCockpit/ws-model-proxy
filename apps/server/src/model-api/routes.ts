@@ -1222,41 +1222,6 @@ export function localAdmissionWaitBudget(
   return memberBudgetMs === null ? external : Math.min(memberBudgetMs, external);
 }
 
-/**
- * Owner-paid provider-capacity wait cap on a pool that also has local members
- * (saturation S-A, deferred from #56). Without it a null provider budget let
- * the request wait for PROVIDER capacity until the 15-minute relay deadline,
- * outside the local queue and unbounded by externalAfterWaitMs. When the cap
- * expires the external phase reports PROVIDER_SATURATED and the request
- * resumes its remaining local wait.
- */
-export const EXTERNAL_PROVIDER_WAIT_CAP_MS = 10_000;
-
-/**
- * Provider-capacity wait budget for one owner-paid external member: the
- * member budget, bounded by {@link EXTERNAL_PROVIDER_WAIT_CAP_MS} when the pool
- * has local members to return to. Provider-only pools keep the member budget.
- */
-export function providerCapacityWaitBudget(
-  memberBudgetMs: number | null,
-  poolHasLocalMembers: boolean,
-  /**
-   * Time already spent in this external phase: earlier rounds' capacity
-   * waits AND their failed pre-commit dispatches (the cap bounds the whole
-   * phase before the request returns to its local queue).
-   */
-  phaseElapsedMs = 0,
-): number | null {
-  if (!poolHasLocalMembers) return memberBudgetMs;
-  // One cap for the whole external phase: a pre-commit retry on the next
-  // provider member gets only what is left of it, never a fresh 10 s.
-  const capMs = Math.max(
-    0,
-    EXTERNAL_PROVIDER_WAIT_CAP_MS - Math.floor(Math.max(0, phaseElapsedMs)),
-  );
-  return memberBudgetMs === null ? capMs : Math.min(memberBudgetMs, capMs);
-}
-
 function poolAdmissionCandidate(
   member: PoolMemberRelayRow,
   candidateOrder: number,
@@ -3129,14 +3094,6 @@ async function settleRelayCleanup(tasks: readonly (() => unknown | PromiseLike<u
   reportCleanupFailures(results);
 }
 
-/** Settle provider bodies that will never be handed off (best effort, idempotent). */
-async function cancelAbandonedBodies(
-  reason: unknown,
-  ...bodies: (ReadableStream<Uint8Array> | null | undefined)[]
-) {
-  await Promise.allSettled(bodies.map((body) => body?.cancel(reason)));
-}
-
 function rejectedRelayTerminal(failure: ModelApiFailure = "unknown"): RelayAttemptTerminal {
   return {
     ok: false,
@@ -4262,11 +4219,6 @@ async function relayPool({
     }
   >["providerFailure"];
   let ownKeyOutcome = false;
-  // F2-CAP-3: the last external attempt ended because its capacity lease was
-  // lost (a server-side event). Attributed on the relay row, never a cancel.
-  let externalLeaseLost = false;
-  /** Set once the member listing is known: bounds the provider-capacity wait. */
-  let poolHasLocalMembers = false;
   const failPoolRelayMetadata = (input: Parameters<typeof failRelayMetadata>[0]) =>
     failRelayMetadata({ ...input, routeIdentity });
   const updatePoolRelayMetadata = (relayRequestId: string, update: RelayMetadataUpdate) =>
@@ -4447,17 +4399,6 @@ async function relayPool({
           }
         : undefined,
     } satisfies PublicOverflowRequest;
-    let providerCapacityLease:
-      | Extract<
-          Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>>,
-          { state: "ADMITTED" }
-        >["lease"]
-      | undefined;
-    // External members whose capacity lease was already lost in this request's
-    // precommit window. A newer attempt could dispatch again, but as with the
-    // retryable-precommit path the same physical member is never re-admitted
-    // during this tier traversal.
-    const lostExternalExecutionTargetIds = new Set<string>();
     const dispatchExternalTier = async (
       ownKey = false,
     ): Promise<Awaited<ReturnType<typeof dispatchPublicOverflow>>> => {
@@ -4506,9 +4447,6 @@ async function relayPool({
             ? [resolvedTarget]
             : [];
         });
-      // Compatible members whose capacity lease was already lost in this
-      // request's precommit window; the same physical member is never
-      // re-admitted during this tier traversal.
       let providerDepthError: AdapterError | undefined;
       const compatibleAll = compatibleTargets(listed.targets).filter((providerTarget) => {
         const nativeSurface = providerTarget.resolvedExecution?.nativeSurface;
@@ -4533,9 +4471,7 @@ async function relayPool({
       });
       if (providerDepthError && compatibleAll.length === 0) throw providerDepthError;
       const compatible = orderChatTestProviderTargets(
-        compatibleAll.filter(
-          (providerTarget) => !lostExternalExecutionTargetIds.has(providerTarget.executionTargetId),
-        ),
+        compatibleAll,
         requestedSurface,
         testRoutingMode,
       );
@@ -4543,163 +4479,27 @@ async function relayPool({
       // cooldown: a transient 503-class condition, never 400.
       if (compatible.length === 0 && compatibleTargets(listed.coolingDown).length > 0)
         return { dispatched: false, reason: "PROVIDER_UNHEALTHY" };
-      // Every compatible member's capacity lease was lost earlier in this
-      // request's precommit window: a transient server-side condition, never a
-      // permanent "no compatible provider" (which would be a 400 downstream).
-      if (compatible.length === 0 && compatibleAll.length > 0)
-        return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
       if (compatible.length === 0) return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" };
       // 0.4.0 cloud members have no physical capacity: the provider is the capacity, and the
       // monthly spend caps (reserved before every send) bound what they may spend. They are
       // dispatched without a capacity lease; dispatchPublicOverflow walks the ranked members
       // itself (spend admission, health trial and the E0 send claim per member).
-      if (compatible.every((item) => !item.inferenceCapacityId)) {
-        await releaseProviderCapacity();
-        // The relay deadline bounds the start of external work, as for leased members.
-        if (request.signal.aborted || remainingRelayBudgetMs(relayDeadlineMs) <= 0)
-          return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
-        const previousRoute = routeIdentity;
-        const result = await dispatchPublicOverflow({
-          ...tierRequest,
-          // Only the members this tier found servable (e.g. renderable at this depth).
-          eligibleExecutionTargetIds: compatible.map((item) => item.executionTargetId),
-          retrySingleTargetPrecommit: ownKey,
-          beforeProviderSend: ownKey
-            ? (provider) => persistRouteIdentity(providerRouteIdentity(provider))
-            : undefined,
-        });
-        if (!result.dispatched && ownKey) await persistRouteIdentity(previousRoute);
-        return result;
-      }
-      // A capacity-backed external member is a physical execution target too. Durable global
-      // admission supplies the cross-process concurrency fence; without it, or with a member
-      // missing its capacity identity, a provider request fails closed.
-      if (!capacityRuntime) return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
-      if (compatible.some((item) => !item.inferenceCapacityId))
-        return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" };
       await releaseProviderCapacity();
-      // Durations only (process monotonic clock): the store turns each
-      // round's remaining budget into a database-clock deadline. A lock wait
-      // before a round's store transaction can stretch that round's deadline
-      // by the wait (bounded; the anchored schedule is used only for the
-      // `:external` local deadline the issue requires to be exact).
-      const providerPhaseStartMs = performance.now();
-      let remaining = compatible;
-      let lastResult: Awaited<ReturnType<typeof dispatchPublicOverflow>> = {
-        dispatched: false,
-        reason: "PROVIDER_UNAVAILABLE",
-      };
-      let firstAdmission = true;
-      while (
-        remaining.length > 0 &&
-        !request.signal.aborted &&
-        remainingRelayBudgetMs(relayDeadlineMs) > 0
-      ) {
-        if (!firstAdmission) {
-          const withdrawn = flagDenial(await listTier());
-          if (withdrawn) return { dispatched: false, reason: withdrawn };
-        }
-        firstAdmission = false;
-        const admission = await acquireCapacityWithTelemetry({
-          runtime: capacityRuntime,
-          relayRequestId,
-          attempt: {
-            requestId: crypto.randomUUID(),
-            relayRequestId,
-            attemptId: crypto.randomUUID(),
-            ownerId: ownKey ? requester.userId : target.ownerUserId,
-            sourceKind: ownKey ? "TEST" : "POOL",
-            poolId: ownKey ? undefined : target.id,
-            basePriority: 16,
-            // S-C: a grantee's queue priority applies to every pool waiter.
-            priorityShareId: ownKey ? undefined : target.shareId,
-            connectionOwner: "model-api-provider",
-            deadlineAt: new Date(relayDeadlineMs),
-            candidates: remaining.map((providerTarget, candidateOrder) => ({
-              capacityId: providerTarget.inferenceCapacityId!,
-              executionTargetId: providerTarget.executionTargetId,
-              poolMemberId: ownKey ? undefined : providerTarget.poolMemberId,
-              candidateOrder,
-              deadlineAt: new Date(relayDeadlineMs),
-              // Own-key is opportunistic; leave the relay budget for the
-              // independently consented owner-paid tier and local resume.
-              // Owner-paid waits are capped on a pool with local members so
-              // the request returns to its local queue (S-A section 6).
-              waitBudgetMs: ownKey
-                ? 0
-                : providerCapacityWaitBudget(
-                    providerTarget.capacityWaitBudgetMs ?? null,
-                    poolHasLocalMembers,
-                    performance.now() - providerPhaseStartMs,
-                  ),
-            })),
-          },
-          signal: request.signal,
-        });
-        if (admission.state === "LEASE_LOST") {
-          // Lost while confirming ownership, before any provider I/O: exclude
-          // this member and admit the next one (always safe to retry).
-          externalLeaseLost = true;
-          lostExternalExecutionTargetIds.add(admission.executionTargetId);
-          lastResult = { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
-          remaining = remaining.filter(
-            (item) => item.executionTargetId !== admission.executionTargetId,
-          );
-          continue;
-        }
-        if (admission.state !== "ADMITTED")
-          return { dispatched: false, reason: "PROVIDER_SATURATED" };
-        if (!ownKey && !admission.lease.poolMemberId) {
-          await capacityRuntime.release(admission.lease);
-          return { dispatched: false, reason: "PROVIDER_SATURATED" };
-        }
-        const selectedPoolMemberId = ownKey ? "" : admission.lease.poolMemberId;
-        if (!remaining.some((item) => item.poolMemberId === selectedPoolMemberId)) {
-          await capacityRuntime.release(admission.lease);
-          return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
-        }
-        let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
-        const previousRoute = routeIdentity;
-        try {
-          result = await dispatchPublicOverflow({
-            ...tierRequest,
-            admittedExecutionTargetId: admission.lease.executionTargetId,
-            signal: admission.lease.signal ?? request.signal,
-            forcedPoolMemberId: selectedPoolMemberId,
-            retrySingleTargetPrecommit: remaining.length > 1 || ownKey,
-            beforeProviderSend: ownKey
-              ? (provider) => persistRouteIdentity(providerRouteIdentity(provider))
-              : undefined,
-          });
-        } catch (error) {
-          // Admission owns the lease until dispatch commits successfully. A
-          // rejected dispatch must not strand an ACTIVE lease or continue to
-          // another member as though this were a classified precommit result.
-          await capacityRuntime.release(admission.lease);
-          throw error;
-        }
-        if (result.dispatched) {
-          providerCapacityLease = admission.lease;
-          return result;
-        }
-        // A lease lost before commit fails over like any other retryable
-        // precommit failure (subject to retrySafe and the relay deadline).
-        externalLeaseLost = capacityLeaseLostSignal(admission.lease.signal);
-        await capacityRuntime.release(admission.lease);
-        // Also supersede an indeterminate failed intent write: a database
-        // acknowledgement can be lost even if the write committed.
-        if (ownKey) await persistRouteIdentity(previousRoute);
-        lastResult = result;
-        // Consent is request-wide: a denial (at dispatch entry or at the send
-        // boundary) ends the external phase for every member.
-        if (isExternalConsentDenialReason(result.reason)) return result;
-        // A provider attempt that did not commit is retryable only under the
-        // operation's existing exact retry policy. Never re-admit the same
-        // physical member during this tier traversal.
-        if (!providerRequest.retrySafe && (!ownKey || result.providerIoStarted)) return result;
-        remaining = remaining.filter((item) => item.poolMemberId !== selectedPoolMemberId);
-      }
-      return lastResult;
+      // The relay deadline bounds the start of external work.
+      if (request.signal.aborted || remainingRelayBudgetMs(relayDeadlineMs) <= 0)
+        return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
+      const previousRoute = routeIdentity;
+      const result = await dispatchPublicOverflow({
+        ...tierRequest,
+        // Only the members this tier found servable (e.g. renderable at this depth).
+        eligibleExecutionTargetIds: compatible.map((item) => item.executionTargetId),
+        retrySingleTargetPrecommit: ownKey,
+        beforeProviderSend: ownKey
+          ? (provider) => persistRouteIdentity(providerRouteIdentity(provider))
+          : undefined,
+      });
+      if (!result.dispatched && ownKey) await persistRouteIdentity(previousRoute);
+      return result;
     };
     // H1: take (or acquire) the caller's own concurrency lease before any
     // provider work. A caller at its own cap gets 429 exactly as it would for
@@ -4730,21 +4530,9 @@ async function relayPool({
       callerLeaseReleased = true;
       callerLease.release();
     };
-    // Precommit throw on the external path: nothing reached the client, so the
-    // caller lease and the provider-capacity lease are released before the loss
-    // is classified (failover, or the family's 503).
-    const releaseExternalLeasesAfterThrow = async () => {
-      releaseCallerLease();
-      if (providerCapacityLease && capacityRuntime)
-        await releaseCapacityLeaseWithRetry({
-          store: capacityRuntime,
-          lease: providerCapacityLease,
-        });
-    };
     // Terminal transition for a dispatched external attempt. Registered only
     // once the response has actually committed to the client (or when a
-    // non-lease-loss hand-off error ends the request), so a lease-loss failover
-    // never leaves a loser attempt's finalizer racing the winning attempt's.
+    // hand-off error ends the request).
     let externalFinalizationScheduled = false;
     let externalProtocolFailure = false;
     let externalAdaptationCompletion: Promise<"ok" | "protocol_error" | "cancelled"> =
@@ -4761,9 +4549,7 @@ async function relayPool({
         .then(async (terminal) => {
           const adaptationOutcome = await externalAdaptationCompletion;
           externalProtocolFailure ||=
-            adaptationOutcome === "protocol_error" &&
-            !request.signal.aborted &&
-            !capacityLeaseLostSignal(providerCapacityLease?.signal);
+            adaptationOutcome === "protocol_error" && !request.signal.aborted;
           releaseCallerLease();
           const completedAt = new Date();
           const usage = usageFactsFromProviderUsage(terminal.usage);
@@ -4793,9 +4579,7 @@ async function relayPool({
                       ? null
                       : request.signal.aborted
                         ? "cancelled"
-                        : capacityLeaseLostSignal(providerCapacityLease?.signal)
-                          ? "capacity_lease_lost"
-                          : "unknown",
+                        : "unknown",
                   promptTokens: usage.promptTokens,
                   completionTokens: usage.completionTokens,
                   totalTokens: usage.totalTokens,
@@ -4812,172 +4596,95 @@ async function relayPool({
         .catch(metadataUpdateError)
         .finally(releaseCallerLease);
     };
-    let result: Awaited<ReturnType<typeof dispatchPublicOverflow>> | undefined;
     let committed: Extract<
       Awaited<ReturnType<typeof dispatchPublicOverflow>>,
       { dispatched: true }
     > | null = null;
-    // The own-key tier runs once per request: a lease-loss re-entry into the
-    // owner-paid tier must not re-send the requester's own-key traffic.
-    let ownKeyTierRan = false;
-    let ownKeyTierResult: Awaited<ReturnType<typeof dispatchExternalTier>> | undefined;
-    while (true) {
-      let heldByCaller = false;
-      try {
-        if (!ownKeyTierRan && consent.ownKeyProviderModelId && !forcedPoolMemberId) {
-          ownKeyTierRan = true;
-          ownKeyTierResult = await dispatchExternalTier(true);
-        }
-        const ownResult = ownKeyTierResult;
-        // No retry after a response has committed, including an errored stream.
-        // Requester-wide withdrawals end the request; clearing only the own-key
-        // choice still allows independently consented owner-paid fallback.
-        result =
-          ownResult &&
-          (ownResult.dispatched ||
-            (isExternalConsentDenialReason(ownResult.reason) &&
-              ownResult.reason !== "OWN_KEY_CONSENT_WITHDRAWN") ||
-            (!providerRequest.retrySafe && ownResult.providerIoStarted))
-            ? ownResult
-            : await dispatchExternalTier();
-        // An absent or independently forbidden owner-paid plan must not erase
-        // a useful own-key outcome (including the upstream status/Retry-After).
-        if (
-          ownResult &&
-          !ownResult.dispatched &&
-          !result.dispatched &&
-          ["POOL_PRIVATE", "GRANTEE_NOT_COVERED", "NO_COMPATIBLE_PROVIDER"].includes(result.reason)
-        )
-          result = ownResult;
-        ownKeyOutcome = result === ownResult;
-        if (!result.dispatched) {
-          // Hand the caller lease back to the local path that owned it.
-          if (outerCallerLease && !localCapacityReleased) {
-            callerLeaseReleased = true;
-            globalLease = outerCallerLease;
-          } else releaseCallerLease();
-          externalFailure = ownKeyOutcome ? result.providerFailure : undefined;
-          return {
-            dispatched: false,
-            reason: externalFailure?.status === 429 ? "PROVIDER_SATURATED" : result.reason,
-          };
-        }
-        committed = result;
-        heldByCaller = true;
-        // The provider-capacity lease owner is still alive here: the response
-        // wrapper adopts it next, or `releaseExternalLeasesAfterThrow` releases
-        // it. A lease loss at any point before the first client byte surfaces as
-        // a classified precommit throw from one of the body/adaptation reads or
-        // from the hand-off refusal below.
-        return await commitExternalResponse();
-      } catch (error) {
-        if (!heldByCaller && isRequestDepthError(error)) {
-          releaseCallerLease();
-          await settleRelayCleanup([() => releaseProviderCapacity(), () => operation.dispose?.()]);
-          await failPoolRelayMetadata({
-            relayRequestId,
-            startedAt,
-            failure: "unsupported_capability",
-          }).catch(metadataUpdateError);
-          return adapterRequestErrorResponse(requestedSurface, error);
-        }
-        const leaseLost = precommitLeaseLost(error, providerCapacityLease?.signal, request.signal);
-        // A lost lease abandons a provider body that never reached the client:
-        // settle its attempt (a no-op when already read, cancelled or locked).
-        if (heldByCaller && committed && leaseLost)
-          await cancelAbandonedBodies(error, committed.response.body);
-        if (heldByCaller) {
-          // F2-CAP-3: a lease lost after dispatch committed but before the first
-          // client byte is a retryable precommit failure of THIS lease. Fail
-          // over like any other retryable precommit failure, subject to
-          // retrySafe and the relay deadline, instead of escaping as an
-          // unclassified 500. The losing attempt never registered a request
-          // finalizer (scheduleExternalFinalization runs only after a successful
-          // hand-off), so re-entry cannot double claim the relay row; the
-          // caller's lease stays held for the retry.
-          if (leaseLost) {
-            // Record the pre-first-byte loss on the request regardless of
-            // whether a failover target remains; the provider-only 503 path
-            // reads this to attribute `capacity_lease_lost`.
-            externalLeaseLost = true;
-          }
-          if (
-            leaseLost &&
-            result?.dispatched &&
-            providerRequest.retrySafe &&
-            remainingRelayBudgetMs(relayDeadlineMs) > 0
-          ) {
-            // Never re-admit the member whose lease this process just lost.
-            lostExternalExecutionTargetIds.add(result.target.executionTargetId);
-            if (providerCapacityLease && capacityRuntime)
-              await releaseCapacityLeaseWithRetry({
-                store: capacityRuntime,
-                lease: providerCapacityLease,
-              });
-            committed = null;
-            // A lost own-key member is excluded above; the own-key tier may
-            // pick another own-key target. A lost owner-paid member leaves the
-            // own-key outcome as it was.
-            if (result.target.ownKey) {
-              ownKeyTierRan = false;
-              ownKeyTierResult = undefined;
-            }
-            result = undefined;
-            providerCapacityLease = undefined;
-            continue;
-          }
-          // Nothing reached the client: release both leases before answering.
-          await releaseExternalLeasesAfterThrow();
-          if (leaseLost) {
-            // The operation ends here. Attribute the lease loss as its own
-            // server-side failure instead of the generic 500 the unclassified
-            // rethrow produced; other errors keep the existing mapping. The
-            // losing attempt registered no finalizer, so dispose here.
-            await settleRelayCleanup([() => operation.dispose?.()]);
-            await failPoolRelayMetadata({
-              relayRequestId,
-              startedAt,
-              failure: "capacity_lease_lost",
-            }).catch(metadataUpdateError);
-            metadataUpdateError(error);
-            return operationFailureResponse(operation, "capacity_lease_lost");
-          }
-          // A non-lease-loss hand-off error ends the request with this attempt
-          // as its outcome; let its terminal transition claim the row.
-          if (
-            error instanceof AdapterError &&
-            error.code !== "cancelled" &&
-            !request.signal.aborted
-          )
-            externalProtocolFailure = true;
-          if (committed) scheduleExternalFinalization(committed);
-          if (externalProtocolFailure) return operationFailureResponse(operation, "protocol_error");
-          throw error;
-        }
-        // Nothing was dispatched and the error ends the request: release the
-        // caller lease and the local capacity lease exactly once (both are
-        // idempotent here), dispose the operation, and finalize the request so
-        // it never lingers PENDING (R-J).
+    let heldByCaller = false;
+    try {
+      const ownResult =
+        consent.ownKeyProviderModelId && !forcedPoolMemberId
+          ? await dispatchExternalTier(true)
+          : undefined;
+      // No retry after a response has committed, including an errored stream.
+      // Requester-wide withdrawals end the request; clearing only the own-key
+      // choice still allows independently consented owner-paid fallback.
+      let result =
+        ownResult &&
+        (ownResult.dispatched ||
+          (isExternalConsentDenialReason(ownResult.reason) &&
+            ownResult.reason !== "OWN_KEY_CONSENT_WITHDRAWN") ||
+          (!providerRequest.retrySafe && ownResult.providerIoStarted))
+          ? ownResult
+          : await dispatchExternalTier();
+      // An absent or independently forbidden owner-paid plan must not erase
+      // a useful own-key outcome (including the upstream status/Retry-After).
+      if (
+        ownResult &&
+        !ownResult.dispatched &&
+        !result.dispatched &&
+        ["POOL_PRIVATE", "GRANTEE_NOT_COVERED", "NO_COMPATIBLE_PROVIDER"].includes(result.reason)
+      )
+        result = ownResult;
+      ownKeyOutcome = result === ownResult;
+      if (!result.dispatched) {
+        // Hand the caller lease back to the local path that owned it.
+        if (outerCallerLease && !localCapacityReleased) {
+          callerLeaseReleased = true;
+          globalLease = outerCallerLease;
+        } else releaseCallerLease();
+        externalFailure = ownKeyOutcome ? result.providerFailure : undefined;
+        return {
+          dispatched: false,
+          reason: externalFailure?.status === 429 ? "PROVIDER_SATURATED" : result.reason,
+        };
+      }
+      committed = result;
+      heldByCaller = true;
+      return await commitExternalResponse();
+    } catch (error) {
+      if (!heldByCaller && isRequestDepthError(error)) {
         releaseCallerLease();
         await settleRelayCleanup([() => releaseProviderCapacity(), () => operation.dispose?.()]);
-        const failure: ModelApiFailure = request.signal.aborted
-          ? "cancelled"
-          : error instanceof RouteIdentityPersistenceError
-            ? "disconnected"
-            : leaseLost
-              ? "capacity_lease_lost"
-              : "unknown";
         await failPoolRelayMetadata({
           relayRequestId,
           startedAt,
-          failure,
+          failure: "unsupported_capability",
         }).catch(metadataUpdateError);
-        if (error instanceof RouteIdentityPersistenceError || leaseLost) {
-          metadataUpdateError(error);
-          return operationFailureResponse(operation, failure);
-        }
+        return adapterRequestErrorResponse(requestedSurface, error);
+      }
+      if (heldByCaller) {
+        // Nothing reached the client: release the caller lease before answering. A hand-off
+        // error ends the request with this attempt as its outcome; let its terminal
+        // transition claim the row.
+        releaseCallerLease();
+        if (error instanceof AdapterError && error.code !== "cancelled" && !request.signal.aborted)
+          externalProtocolFailure = true;
+        if (committed) scheduleExternalFinalization(committed);
+        if (externalProtocolFailure) return operationFailureResponse(operation, "protocol_error");
         throw error;
       }
+      // Nothing was dispatched and the error ends the request: release the
+      // caller lease and the local capacity lease exactly once (both are
+      // idempotent here), dispose the operation, and finalize the request so
+      // it never lingers PENDING (R-J).
+      releaseCallerLease();
+      await settleRelayCleanup([() => releaseProviderCapacity(), () => operation.dispose?.()]);
+      const failure: ModelApiFailure = request.signal.aborted
+        ? "cancelled"
+        : error instanceof RouteIdentityPersistenceError
+          ? "disconnected"
+          : "unknown";
+      await failPoolRelayMetadata({
+        relayRequestId,
+        startedAt,
+        failure,
+      }).catch(metadataUpdateError);
+      if (error instanceof RouteIdentityPersistenceError) {
+        metadataUpdateError(error);
+        return operationFailureResponse(operation, failure);
+      }
+      throw error;
     }
 
     async function commitExternalResponse() {
@@ -5021,36 +4728,19 @@ async function relayPool({
         [FALLBACK_REASON_HEADER]: externalReason,
         [SERVED_MODEL_HEADER]: committedResult.target.upstreamModelId,
       };
-      // The lease can be lost (heartbeat `false`/watchdog/etc.) at any point
-      // before the first client byte, including while reading a non-streaming
-      // provider body. Re-throwing the classified `CapacityLeaseLostError`
-      // routes the loss into the tier loop's failover/503 handling instead of
-      // leaking a generic 500; legitimate body errors keep their own mapping.
-      // Bodies passed in are provider bodies that will now never be handed
-      // off: cancel them BEFORE throwing so the provider attempt settles
-      // (heartbeat stopped, budget reconciled, terminal resolved) instead of
-      // waiting forever for a reader.
       const adapterLogContext: AdapterLogContext = {
         relayRequestId,
         poolMemberId: committedResult.target.poolMemberId,
         executionTargetId: committedResult.target.executionTargetId,
       };
-      const throwIfExternalLeaseLost = async (
-        ...abandoned: (ReadableStream<Uint8Array> | null | undefined)[]
-      ) => {
-        const leaseSignal = providerCapacityLease?.signal;
-        if (!leaseSignal?.aborted || !capacityLeaseLostSignal(leaseSignal)) return;
-        await cancelAbandonedBodies(leaseSignal.reason, ...abandoned);
-        throw leaseSignal.reason;
-      };
-      const externalBodyRead = async (
+      const externalBodyRead = (
         body: ReadableStream<Uint8Array> | null,
         bodySource: ProtocolSurface,
         bodyTarget: ProtocolSurface,
         status: number,
         headers: Headers,
-      ): Promise<Uint8Array> => {
-        const bytes = await readAdaptedNonstreamBody({
+      ): Promise<Uint8Array> =>
+        readAdaptedNonstreamBody({
           body,
           source: bodySource,
           target: bodyTarget,
@@ -5059,31 +4749,14 @@ async function relayPool({
           signal: request.signal,
           logContext: adapterLogContext,
         });
-        await throwIfExternalLeaseLost();
-        return bytes;
-      };
       // Native response bytes remain opaque. Cross-protocol provider response
       // adaptation is handled by the same strict streaming/non-streaming state
       // machines as local targets. The response `model` is always the provider's
       // served upstream id (adapters copy the source response's model).
       const commitAwareResponse = async (response: Response) => {
-        await throwIfExternalLeaseLost(response.body, committedResult.response.body);
-        const committedResponse = responseWithFirstClientByte(
-          response,
-          committedResult.markFirstClientByte,
-        );
-        const held =
-          providerCapacityLease && capacityRuntime
-            ? await holdOrReleaseCapacityResponse(
-                capacityRuntime,
-                committedResponse,
-                providerCapacityLease,
-                request.signal,
-              )
-            : committedResponse;
+        const held = responseWithFirstClientByte(response, committedResult.markFirstClientByte);
         // The response is now the request's committed outcome: only now may the
-        // request-terminal finalizer claim it (a lease-loss failover would leave
-        // a loser attempt's finalizer racing the winning one).
+        // request-terminal finalizer claim it.
         scheduleExternalFinalization(committedResult);
         return withResponseHeaders(held, routeHeaders);
       };
@@ -5220,7 +4893,6 @@ async function relayPool({
           }),
         );
       }
-      await throwIfExternalLeaseLost(committedResult.response.body);
       const bytes = new Uint8Array(await committedResult.response.arrayBuffer());
       const adapted = await externalBodyRead(
         new ReadableStream({
@@ -5292,7 +4964,6 @@ async function relayPool({
   const providerOnly =
     listedMembers.length === 0 ||
     (forcedPoolMemberId != null && members.length === 0 && external.consent);
-  poolHasLocalMembers = !providerOnly;
   if (!providerOnly) {
     routeIdentity = { ...routeIdentity, fallbackRoute: "local" };
     externalAttempt.localRouteDecided = true;
@@ -5317,9 +4988,7 @@ async function relayPool({
           ? "rate_limited"
           : reason === "CANCELLED"
             ? "cancelled"
-            : externalLeaseLost && !externalFailure
-              ? "capacity_lease_lost"
-              : "disconnected");
+            : "disconnected");
     await operation.dispose?.();
     // Final attribution is telemetry, not permission to send or switch tiers.
     // Write it with the terminal transition; a failure must not change the
@@ -5356,10 +5025,6 @@ async function relayPool({
       if (ownKeyOutcome && reason === "SATURATED") response.headers.set("retry-after", "1");
       return response;
     }
-    // A pre-first-byte lease loss is its own server-side failure with its own
-    // reason, even though no other external member remained to fail over to.
-    if (failure === "capacity_lease_lost")
-      return operationFailureResponse(operation, "capacity_lease_lost");
     return externalRouteErrorResponse(operation.family, {
       code: "external_unavailable",
       message: `No external provider for "${externalModelId(target.modelId)}" is available right now, and the pool has no local members. Try again later.`,
@@ -8690,14 +8355,6 @@ async function relayBoundProviderResponse(input: {
     exactResponsesBinding: input.stickyRoute.binding,
     skipContextValidation: input.contextInput === undefined,
   } satisfies PublicOverflowRequest;
-  let providerCapacityLease:
-    | Extract<
-        Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>>,
-        { state: "ADMITTED" }
-      >["lease"]
-    | undefined;
-  // F2-CAP-3: the bound attempt's capacity lease was lost before commit.
-  let boundLeaseLost = false;
   // A bound follow-up targets exactly the external member that served the
   // original response; there is no failover to other members or tiers.
   const dispatchBoundTarget = async (): Promise<
@@ -8768,65 +8425,12 @@ async function relayBoundProviderResponse(input: {
         }
       : undefined;
     // 0.4.0 cloud members have no physical capacity (spend caps bound them): no lease.
-    if (!exactTarget.inferenceCapacityId)
-      return dispatchPublicOverflow({
-        ...boundRequest,
-        admittedExecutionTargetId: exactTarget.executionTargetId,
-        forcedPoolMemberId: exactTarget.poolMemberId,
-        beforeProviderSend: boundBeforeSend,
-      });
-    if (!input.capacityRuntime) return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
-    const admission = await acquireCapacityWithTelemetry({
-      runtime: input.capacityRuntime,
-      relayRequestId,
-      attempt: {
-        requestId: crypto.randomUUID(),
-        relayRequestId,
-        attemptId: crypto.randomUUID(),
-        ownerId: ownKey ? input.requester.userId : input.stickyRoute.visibleTarget.ownerUserId,
-        sourceKind: ownKey ? "TEST" : "POOL",
-        poolId: ownKey ? undefined : input.stickyRoute.visibleTarget.id,
-        basePriority: 16,
-        priorityShareId: ownKey ? undefined : input.stickyRoute.visibleTarget.shareId,
-        connectionOwner: "model-api-provider-stickiness",
-        deadlineAt: new Date(boundStartedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS),
-        candidates: [
-          {
-            capacityId: exactTarget.inferenceCapacityId,
-            executionTargetId: exactTarget.executionTargetId,
-            poolMemberId: ownKey ? undefined : exactTarget.poolMemberId,
-            candidateOrder: 0,
-            waitBudgetMs: exactTarget.capacityWaitBudgetMs ?? null,
-          },
-        ],
-      },
-      signal: input.request.signal,
+    return dispatchPublicOverflow({
+      ...boundRequest,
+      admittedExecutionTargetId: exactTarget.executionTargetId,
+      forcedPoolMemberId: exactTarget.poolMemberId,
+      beforeProviderSend: boundBeforeSend,
     });
-    if (admission.state === "LEASE_LOST") {
-      boundLeaseLost = true;
-      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
-    }
-    if (admission.state !== "ADMITTED") return { dispatched: false, reason: "PROVIDER_SATURATED" };
-    let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
-    try {
-      result = await dispatchPublicOverflow({
-        ...boundRequest,
-        admittedExecutionTargetId: admission.lease.executionTargetId,
-        signal: admission.lease.signal ?? input.request.signal,
-        forcedPoolMemberId: exactTarget.poolMemberId,
-        beforeProviderSend: boundBeforeSend,
-      });
-    } catch (error) {
-      await releaseCapacityLeaseWithRetry({ store: input.capacityRuntime, lease: admission.lease });
-      throw error;
-    }
-    if (!result.dispatched) {
-      boundLeaseLost = capacityLeaseLostSignal(admission.lease.signal);
-      await releaseCapacityLeaseWithRetry({ store: input.capacityRuntime, lease: admission.lease });
-      return result;
-    }
-    providerCapacityLease = admission.lease;
-    return result;
   };
   let result: Awaited<ReturnType<typeof dispatchBoundTarget>>;
   try {
@@ -8861,9 +8465,7 @@ async function relayBoundProviderResponse(input: {
               result.reason === "REQUESTER_NOT_VISIBLE" ||
               result.reason === "POOL_OWNER_INACTIVE"
             ? "not_found"
-            : boundLeaseLost
-              ? "capacity_lease_lost"
-              : "disconnected";
+            : "disconnected";
     await failRelayMetadata({
       relayRequestId,
       startedAt: boundStartedAt,
@@ -8880,7 +8482,7 @@ async function relayBoundProviderResponse(input: {
       });
     if (failure === "rate_limited" || failure === "cancelled")
       return openAiFailureJsonResponse(failure);
-    if (failure === "disconnected" || failure === "capacity_lease_lost")
+    if (failure === "disconnected")
       return externalRouteErrorResponse("responses", {
         code: "external_unavailable",
         message: "The bound provider Responses target is temporarily unavailable. Try again later.",
@@ -8912,9 +8514,8 @@ async function relayBoundProviderResponse(input: {
     .catch(metadataUpdateError);
   const dispatched = result;
   // Terminal transition for the bound attempt. Scheduled only once the
-  // response is the request's committed outcome (or a non-lease-loss hand-off
-  // error ends the request), so a lease-loss 503 has a single claimant of the
-  // relay row (`failRelayMetadata` below), never a racing success finalizer.
+  // response is the request's committed outcome (or a hand-off error ends the
+  // request).
   let boundFinalizationScheduled = false;
   const scheduleBoundFinalization = () => {
     if (boundFinalizationScheduled) return;
@@ -8943,9 +8544,7 @@ async function relayBoundProviderResponse(input: {
                 ? null
                 : input.request.signal.aborted
                   ? "cancelled"
-                  : capacityLeaseLostSignal(providerCapacityLease?.signal)
-                    ? "capacity_lease_lost"
-                    : "unknown",
+                  : "unknown",
               promptTokens: usage.promptTokens,
               completionTokens: usage.completionTokens,
               totalTokens: usage.totalTokens,
@@ -8962,16 +8561,6 @@ async function relayBoundProviderResponse(input: {
   };
   try {
     let response = result.response;
-    // The bound target never fails over, but a lease lost before the first
-    // client byte must still be classified: re-throw the typed loss so the
-    // catch below answers the bound family's 503 instead of a generic 500.
-    const throwIfBoundLeaseLost = async () => {
-      const leaseSignal = providerCapacityLease?.signal;
-      if (!leaseSignal?.aborted || !capacityLeaseLostSignal(leaseSignal)) return;
-      // The provider body will never be handed off: settle its attempt.
-      await cancelAbandonedBodies(leaseSignal.reason, response.body, dispatched.response.body);
-      throw leaseSignal.reason;
-    };
     if (result.dataPolicyRefusal) {
       await response.body?.cancel().catch(() => undefined);
       response = dataPolicyRefusalResponse("responses");
@@ -8985,7 +8574,6 @@ async function relayBoundProviderResponse(input: {
         signal: input.request.signal,
         logContext: { relayRequestId, executionTargetId: result.target.executionTargetId },
       });
-      await throwIfBoundLeaseLost();
       response = new Response(sanitized, {
         status: response.status >= 400 && response.status <= 599 ? response.status : 502,
         headers: adaptedProviderResponseHeaders(
@@ -9007,17 +8595,7 @@ async function relayBoundProviderResponse(input: {
         terminal: result.terminal,
       });
     }
-    await throwIfBoundLeaseLost();
-    const committed = responseWithFirstClientByte(response, result.markFirstClientByte);
-    const held =
-      providerCapacityLease && input.capacityRuntime
-        ? await holdOrReleaseCapacityResponse(
-            input.capacityRuntime,
-            committed,
-            providerCapacityLease,
-            input.request.signal,
-          )
-        : committed;
+    const held = responseWithFirstClientByte(response, result.markFirstClientByte);
     // The response is now the request's committed outcome.
     scheduleBoundFinalization();
     return withResponseHeaders(held, {
@@ -9025,41 +8603,11 @@ async function relayBoundProviderResponse(input: {
       [SERVED_MODEL_HEADER]: result.target.upstreamModelId,
     });
   } catch (error) {
-    // Classify BEFORE cleanup: releasing the owner also aborts its signal.
-    const leaseLost = precommitLeaseLost(
-      error,
-      providerCapacityLease?.signal,
-      input.request.signal,
-    );
-    if (leaseLost) await cancelAbandonedBodies(error, dispatched.response.body);
-    // Precommit throw: nothing reaches the client, so neither lease may wait
-    // for a terminal that no reader will drive.
+    // Precommit throw: nothing reaches the client, so the caller lease may not
+    // wait for a terminal that no reader will drive. The hand-off error ends
+    // the request with this attempt as its outcome: let its terminal
+    // transition claim the row.
     releaseCallerLease();
-    if (providerCapacityLease && input.capacityRuntime)
-      await releaseCapacityLeaseWithRetry({
-        store: input.capacityRuntime,
-        lease: providerCapacityLease,
-      });
-    if (leaseLost) {
-      // F2-CAP-3: the bound target has no failover (single member by design),
-      // so a pre-first-byte lease loss is answered with the family's 503
-      // envelope here rather than escaping as an unclassified generic 500.
-      // This catch is the attempt's only claimant: no success finalizer was
-      // scheduled for it.
-      metadataUpdateError(error);
-      await failRelayMetadata({
-        relayRequestId,
-        startedAt: boundStartedAt,
-        failure: "capacity_lease_lost",
-        routeIdentity: boundRouteIdentity,
-      }).catch(metadataUpdateError);
-      return externalRouteErrorResponse("responses", {
-        code: "external_unavailable",
-        message: "The bound provider Responses target is temporarily unavailable. Try again later.",
-      });
-    }
-    // A non-lease-loss hand-off error ends the request with this attempt as
-    // its outcome: let its terminal transition claim the row.
     scheduleBoundFinalization();
     throw error;
   }
