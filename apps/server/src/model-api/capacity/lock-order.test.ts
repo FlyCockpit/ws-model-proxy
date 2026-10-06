@@ -150,6 +150,8 @@ const HOT_PATH_WRITERS: Record<string, string> = {
   "apps/server/src/model-api/routes.ts": "H: relay status, execution telemetry and stickiness",
   "apps/server/src/model-api/public-overflow.ts": "H: external-provider relay status",
   "apps/server/src/model-api/provider-attempt-runtime.ts": "H: provider attempt telemetry",
+  "apps/server/src/model-api/provider-budget.ts":
+    "H: cloud spend admission and accounting (attempt anchor, reservations, settlements, ledger) after the spend-attempt then spend-cap fences; graph rows read without a lock; S: its expired-attempt repair takes the same attempt fence",
   "apps/server/src/model-api/kv-eviction-feedback.ts":
     "H: disposable KV eviction feedback (one owner-guarded single-statement upsert, no fence)",
   "apps/server/src/relay/runtime-load-rollup.ts":

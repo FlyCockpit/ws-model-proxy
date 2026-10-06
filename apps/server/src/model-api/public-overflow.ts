@@ -2686,6 +2686,10 @@ export async function dispatchPublicOverflow(
         providerModelId: target.providerModelId,
         credentialId: target.credential.id,
         poolId: request.ownKeyProviderModelId ? undefined : request.poolId,
+        poolMemberId: request.ownKeyProviderModelId ? undefined : target.poolMemberId || undefined,
+        targetId: target.executionTargetId,
+        requestedSurface:
+          request.path === "/v1/embeddings" ? "OPENAI_EMBEDDINGS" : request.requestedSurface,
         shareId:
           request.ownKeyProviderModelId || request.externalConsent.requesterIsOwner
             ? undefined
