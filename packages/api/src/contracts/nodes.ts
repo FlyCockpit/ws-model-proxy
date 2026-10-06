@@ -7,7 +7,6 @@ import {
   NODE_COMMAND_MAX_MS,
   NODE_COMMAND_MIN_MS,
   NODE_SECRET_VALUE_MAX_BYTES,
-  NODE_SECRETS_MAX,
   nodeFabricMembershipsSchema,
   nodeFeaturesSchema,
   nodeMetricCommandsSchema,
@@ -261,6 +260,14 @@ export const enrollmentCodeViewSchema = z
 
 /** 1 min .. 30 days offline before a temporary node is deleted. */
 const removeAfterOfflineMsSchema = z.number().int().min(60_000).max(2_592_000_000);
+/** A node secret value: 1 byte .. 16 KiB of UTF-8, never stored or shown. */
+const nodeSecretValueSchema = z
+  .string()
+  .min(1)
+  .refine(
+    (value) => new TextEncoder().encode(value).byteLength <= NODE_SECRET_VALUE_MAX_BYTES,
+    "At most 16 KiB.",
+  );
 
 export const nodeCommandViewSchema = z
   .object({
@@ -389,40 +396,46 @@ export const nodesContract = {
         /** Replaces this node's fabric memberships (a new name creates the fabric). */
         fabrics: nodeFabricMembershipsSchema.optional(),
         commandMaxMs: z.number().int().min(NODE_COMMAND_MIN_MS).max(NODE_COMMAND_MAX_MS).optional(),
-        /** Write-only: values travel to the node and are never stored or shown. */
-        secrets: z
-          .object({
-            set: z
-              .array(
-                z
-                  .object({
-                    name: nodeSecretNameSchema,
-                    value: z
-                      .string()
-                      .min(1)
-                      .refine(
-                        (value) =>
-                          new TextEncoder().encode(value).byteLength <= NODE_SECRET_VALUE_MAX_BYTES,
-                        "At most 16 KiB.",
-                      ),
-                  })
-                  .strict(),
-              )
-              .max(NODE_SECRETS_MAX)
-              .optional(),
-            delete: z.array(nodeSecretNameSchema).max(NODE_SECRETS_MAX).optional(),
-          })
-          .strict()
-          .optional(),
         /** Ask the node to scan for local servers now. */
         rescan: z.boolean().optional(),
         note: noteSchema.optional(),
       })
       .strict(),
     nodeDetailSchema,
-    "Labels, port range, declared hardware, metric commands, fabrics, command lifetime, secrets (write-only), rescan. Full-control nodes only for everyone (trust_relay); secrets of a Relay-only node are set with `wsmp secret set` on it (secret_needs_node).",
+    "Labels, port range, declared hardware, metric commands, fabrics, command lifetime, rescan. Full-control nodes only for everyone (trust_relay). Changing the address of a node a running multi-node instance uses on that fabric is refused (fabric_in_use). Secrets go through secrets.set / secrets.delete.",
     ["node_update"],
   ),
+  /**
+   * Node secrets (owner decision round 3). Write-only: the value goes to the node in one
+   * `secret.set` frame and is never stored, logged, audited or echoed (these procedures are
+   * excluded from generic input/error logging; the audit records the name only). Full control
+   * only: at Relay only they are set with `wsmp secret set NAME` on the node (secret_needs_node).
+   */
+  secrets: {
+    set: mutation(
+      "agent",
+      z
+        .object({
+          nodeId: idSchema,
+          name: nodeSecretNameSchema,
+          value: nodeSecretValueSchema,
+          note: noteSchema.optional(),
+        })
+        .strict(),
+      z.object({ name: z.string(), updatedAt: isoDateSchema }).strict(),
+      "Set a node secret (write-only, never shown again). Full-control nodes only (secret_needs_node).",
+      ["node_secret_set"],
+    ),
+    delete: mutation(
+      "agent",
+      z
+        .object({ nodeId: idSchema, name: nodeSecretNameSchema, note: noteSchema.optional() })
+        .strict(),
+      okSchema,
+      "Delete a node secret. Full-control nodes only (secret_needs_node).",
+      ["node_secret_set"],
+    ),
+  },
   setHold: mutation(
     "human",
     z.object({ nodeId: idSchema, hold: z.boolean(), note: noteSchema.optional() }).strict(),
@@ -435,7 +448,7 @@ export const nodesContract = {
       .object({ nodeId: idSchema, removeAfterOfflineMs: removeAfterOfflineMsSchema.nullable() })
       .strict(),
     nodeSummarySchema,
-    "Make a node temporary (deleted, releasing everything, after being offline this long) or keep it (null). People only: a deletion policy.",
+    "Make a node temporary (deleted, releasing everything, after being offline this long) or keep it (null). People only: a deletion policy. The sweeper deletes it like a person's delete except that profile items pinning its always-on runtimes are removed first (and recorded in the node activity), never leaving it stuck on pinned_by_profile.",
   ),
   fabrics: {
     list: query(
@@ -468,7 +481,7 @@ export const nodesContract = {
       "human",
       z.object({ fabricId: idSchema }).strict(),
       okSchema,
-      "Delete a fabric and its memberships (refused while an instance runs in it).",
+      "Delete a fabric and its memberships (refused while a multi-node instance runs on it: fabric_in_use).",
     ),
   },
   rename: mutation(
@@ -509,12 +522,18 @@ export const nodesContract = {
         ),
         /** Secrets can then be set only with `wsmp secret set` on the node. */
         secretNames: z.array(z.string()),
+        /**
+         * Node commands still running: the node kills each one's process tree when trust drops
+         * and reports it INTERRUPTED. Their state and output stay readable at Relay (exec.poll),
+         * and exec.cancel still works; exec.start is refused.
+         */
+        runningCommands: z.number().int(),
         /** What stops working: commands, files, browser terminals, definition changes, agent starts/stops. */
         openBrowserTerminals: z.number().int(),
         queuedCommandsRefused: z.number().int(),
       })
       .strict(),
-    "What the Lower dialog lists before the click: definitions and metric commands that freeze (agent-written ones flagged).",
+    "What the Lower dialog lists before the click: definitions and metric commands that freeze (agent-written ones flagged), and running commands that stop.",
   ),
   lowerTrust: mutation(
     "human",
@@ -534,7 +553,7 @@ export const nodesContract = {
         ),
       })
       .strict(),
-    "Lower to Relay only (sticks on the node; only `wsmp trust full` on the node raises it).",
+    "Lower to Relay only (sticks on the node; only `wsmp trust full` on the node raises it). Running node commands are killed with their process trees and marked INTERRUPTED.",
   ),
   enrollmentCodes: {
     list: query(
@@ -557,7 +576,9 @@ export const nodesContract = {
           maxUses: z.number().int().min(1).max(50).default(1),
           /** Added to every node enrolled with it. */
           labels: runtimeLabelsSchema.optional(),
-          /** Temporary nodes: removed after being offline this long (1 h when chosen without a value). */
+          /** Temporary nodes: every node enrolled with it is removed after being offline for an hour (or removeAfterOfflineMs). */
+          temporary: z.boolean().optional(),
+          /** Implies temporary. */
           removeAfterOfflineMs: removeAfterOfflineMsSchema.optional(),
         })
         .strict()
@@ -570,9 +591,14 @@ export const nodesContract = {
         .refine(
           (input) =>
             input.replaceNodeId === undefined ||
-            (input.labels === undefined && input.removeAfterOfflineMs === undefined),
+            (input.labels === undefined &&
+              input.removeAfterOfflineMs === undefined &&
+              input.temporary !== true),
           { message: "A replace code keeps the node's labels and policy." },
-        ),
+        )
+        .refine((input) => input.temporary !== false || input.removeAfterOfflineMs === undefined, {
+          message: "removeAfterOfflineMs makes the code temporary.",
+        }),
       z
         .object({
           code: enrollmentCodeViewSchema,

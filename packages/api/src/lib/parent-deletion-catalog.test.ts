@@ -138,6 +138,8 @@ const hot = new Set<string>(HOT_PATH_TABLES);
  * none of them writes traffic-proportional rows.
  */
 const REACHED_DELETE_TRIGGERS: Record<string, string> = {
+  "fabric_member_in_use:fabric_member":
+    "one indexed instance/rank probe per membership; the user delete removes instances first, so it never refuses",
   "node_delete_release:node":
     "releases the node's ranks, stops what had a part there, deletes its always-on instances; bounded by the node's instances",
   "pool_routing_rule_on_member_delete:pool_member":

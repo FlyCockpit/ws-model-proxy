@@ -148,6 +148,7 @@ export const DELETE_ORDER_EDGES = {
   "runtime_instance.runtimeId": "ordered",
   "runtime_instance.versionId": "ordered",
   "runtime_instance.launchVersionId": "ordered",
+  "runtime_instance.fabricId": "ordered",
   "profile_item.runtimeId": "ordered",
   "profile_item.versionId": "ordered",
   "provider_credential.replacedById": "ordered",

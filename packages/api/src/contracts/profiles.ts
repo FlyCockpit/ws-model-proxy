@@ -126,7 +126,7 @@ export const profilesContract = {
       })
       .strict(),
     previewOrOperationSchema,
-    "Apply (or preview): start the pinned items, stop other startable runtimes on the owned nodes, hold the nodes with a hold line and release the other owned nodes. Agents: refused whole if any owned node is Relay only.",
+    "Apply (or preview): start the pinned items, stop other startable runtimes on the owned nodes, hold the nodes with a hold line and release this profile's own holds on the other owned nodes (planProfileHolds). A hold set by a person or another profile stays; for an agent such a hold on an owned node without a hold line refuses the whole apply (node_held), a person's apply (with the preview) releases it. Agents: refused whole if any owned node is Relay only.",
     ["profile_apply"],
   ),
 } as const;

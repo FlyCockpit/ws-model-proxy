@@ -69,7 +69,8 @@ const REQUIRED_OBJECTS = [
   "node_command_shape",
   "node_command_transition",
   "profile_node_hold_shape",
-  "wsmp_is_ip_literal",
+  "wsmp_is_fabric_ip",
+  "fabric_member_in_use",
   "fabric_shape",
   "fabric_member_shape",
   "node_metric_commands_shape",
@@ -124,6 +125,7 @@ const REQUIRED_OBJECTS = [
   "share_delete_cleanup",
   "share_invite_shape",
   "share_invite_transition",
+  "share_invite_one_pending",
   "api_key_pool_access",
   // providers and spend
   "provider_account_shape_check",
@@ -457,6 +459,58 @@ try {
     `INSERT INTO fabric (id, "userId", name) VALUES ('fab-bad', 'owner-a', 'Bad Name')`,
     "23514",
   );
+  // The shared fabric-IP vectors (TS isFabricIp, Rust is_fabric_ip) agree with the database.
+  const fabricVectors = JSON.parse(
+    await readFile(
+      new URL("../../../apps/cli/tests/fixtures/relay-3.0/rules/fabric-ip.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  for (const [list, expected] of [
+    [fabricVectors.valid, true],
+    [fabricVectors.invalid, false],
+  ])
+    for (const value of list) {
+      const { rows } = await client.query("SELECT wsmp_is_fabric_ip($1) AS ok", [value]);
+      if (rows[0]?.ok !== expected) {
+        failures += 1;
+        process.stderr.write(`✗ wsmp_is_fabric_ip(${JSON.stringify(value)}) is not ${expected}\n`);
+      }
+    }
+  // A running multi-node instance pins its fabric and its members' addresses.
+  await client.query(`UPDATE runtime_instance SET "fabricId" = 'fab-a' WHERE id = 'inst-m'`);
+  await expectFailure(
+    "fabric_member_in_use address",
+    `UPDATE fabric_member SET ip = '10.0.0.22' WHERE id = 'fm-2'`,
+    "WMPP1",
+  );
+  await expectFailure(
+    "fabric_member_in_use leave",
+    `DELETE FROM fabric_member WHERE id = 'fm-2'`,
+    "WMPP1",
+  );
+  await expectFailure(
+    "runtime_instance fabric restrict",
+    `DELETE FROM fabric WHERE id = 'fab-a'`,
+    "WMPP1",
+  );
+  await expectFailure(
+    "runtime_instance_shape fabric while stopped",
+    `UPDATE runtime_instance SET phase = 'STOPPED' WHERE id = 'inst-m'`,
+    "23514",
+  );
+  // A member the instance does not use (no rank of it on node-a1) may change.
+  await client.query(`UPDATE fabric_member SET ip = '10.0.0.11' WHERE id = 'fm-1'`);
+  await client.query(`UPDATE runtime_instance SET "fabricId" = NULL WHERE id = 'inst-m'`);
+  await client.query(`UPDATE fabric_member SET ip = 'fd00::22' WHERE id = 'fm-2'`);
+  // Temporary nodes up to 30 days (beyond int4 milliseconds).
+  await client.query(`UPDATE node SET "removeAfterOfflineMs" = 2592000000 WHERE id = 'node-a3'`);
+  await client.query(`UPDATE node SET "removeAfterOfflineMs" = NULL WHERE id = 'node-a3'`);
+  await expectFailure(
+    "node hold profile foreign key",
+    `UPDATE node SET "holdAt" = now(), "holdProfileId" = 'no-such-profile' WHERE id = 'node-a3'`,
+    "23503",
+  );
   await expectFailure(
     "node_trust_lower_shape",
     `UPDATE node SET "trustLowerRequestedAt" = now() WHERE id = 'node-a1'`,
@@ -766,6 +820,29 @@ try {
     `UPDATE share_invite SET "canContribute" = true WHERE id = 'inv-1'`,
     "55000",
   );
+  await expectFailure(
+    "share_invite_transition final token",
+    `UPDATE share_invite SET "tokenDigest" = ${HEX("b")} WHERE id = 'inv-1'`,
+    "55000",
+  );
+  // The accepted invite is history: the same e-mail may be invited again, once while pending,
+  // and resend rotates the token and expiry of the pending one.
+  await client.query(`
+    INSERT INTO share_invite (id, "poolId", "ownerUserId", email, "tokenDigest", "expiresAt")
+    VALUES ('inv-2', 'pool-a', 'owner-a', 'b@example.test', ${HEX("c")}, now() + interval '7 days')`);
+  await expectFailure(
+    "share_invite_one_pending",
+    `INSERT INTO share_invite (id, "poolId", "ownerUserId", email, "tokenDigest", "expiresAt")
+     VALUES ('inv-3', 'pool-a', 'owner-a', 'b@example.test', ${HEX("d")}, now() + interval '7 days')`,
+    "23505",
+  );
+  await client.query(
+    `UPDATE share_invite SET "tokenDigest" = ${HEX("e")}, "expiresAt" = now() + interval '14 days' WHERE id = 'inv-2'`,
+  );
+  await client.query(`UPDATE share_invite SET "revokedAt" = now() WHERE id = 'inv-2'`);
+  await client.query(`
+    INSERT INTO share_invite (id, "poolId", "ownerUserId", email, "tokenDigest", "expiresAt")
+    VALUES ('inv-3', 'pool-a', 'owner-a', 'b@example.test', ${HEX("d")}, now() + interval '7 days')`);
   // sidecars
   await expectFailure(
     "pool_sidecar_target_check self",

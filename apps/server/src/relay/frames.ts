@@ -18,6 +18,7 @@
 import { embeddingContractSchema } from "@ws-model-proxy/api/lib/embedding-contract";
 import {
   ENGINES,
+  fabricIpSchema,
   MODEL_CAPABILITIES,
   NODE_COMMAND_MAX_MS,
   NODE_COMMAND_MIN_MS,
@@ -659,10 +660,8 @@ export const jobPlaceholdersSchema = z
   .object({
     port: z.number().int().min(1024).max(65_535),
     dist_port: z.number().int().min(1024).max(65_535).optional(),
-    head_addr: z
-      .string()
-      .regex(/^(?:[0-9.]{7,15}|[0-9A-Fa-f:.]{2,45})$/)
-      .optional(),
+    /** The head's IP on the instance's fabric (`fabricIpSchema`, as the node checks it). */
+    head_addr: fabricIpSchema.optional(),
     gpu_ids: z
       .string()
       .regex(/^[0-9]{1,3}(?:,[0-9]{1,3}){0,255}$/)

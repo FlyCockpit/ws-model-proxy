@@ -121,6 +121,58 @@ impl RuntimeSpec {
             RuntimeKind::AlwaysOn
         }
     }
+
+    /// Serves models: always-on, or startable with `models`. Otherwise a
+    /// service (never proxied).
+    pub fn serves(&self) -> bool {
+        self.address.is_some() || self.models.is_some()
+    }
+
+    /// The served/service shape the server's `runtimeSpecSchema` enforces:
+    /// `api`, `engine` and `model_type` exactly when the runtime serves; a
+    /// service has no metrics reader or media expansion; a served startable
+    /// runtime has HTTP readiness, a service HTTP readiness or a
+    /// `status`/`health` command per rank.
+    pub fn validate_shape(&self) -> Result<(), &'static str> {
+        let serves = self.serves();
+        if self.address.is_some() == self.launch.is_some() {
+            return Err("a runtime has exactly one of address or launch");
+        }
+        if [
+            self.api.is_some(),
+            self.engine.is_some(),
+            self.model_type.is_some(),
+        ]
+        .iter()
+        .any(|present| *present != serves)
+        {
+            return Err(if serves {
+                "a runtime that serves models declares api, engine and modelType"
+            } else {
+                "a service has no api, engine or modelType"
+            });
+        }
+        if !serves && (self.metrics_reader.is_some() || self.expand_media.is_some()) {
+            return Err("a service has no metrics reader or media expansion");
+        }
+        if let Some(launch) = &self.launch {
+            if serves && launch.readiness.is_none() {
+                return Err("a runtime that serves models needs an HTTP readiness check");
+            }
+            if !serves
+                && launch.readiness.is_none()
+                && !launch
+                    .commands
+                    .iter()
+                    .all(|commands| commands.status.is_some() || commands.health.is_some())
+            {
+                return Err(
+                    "a service needs an HTTP readiness check or a status/health command per rank",
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

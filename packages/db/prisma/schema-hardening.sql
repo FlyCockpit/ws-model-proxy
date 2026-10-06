@@ -217,29 +217,64 @@ ALTER TABLE node ADD CONSTRAINT node_hold_shape CHECK (
 -- manual delete).
 ALTER TABLE node DROP CONSTRAINT IF EXISTS node_temporary_shape;
 ALTER TABLE node ADD CONSTRAINT node_temporary_shape CHECK (
-  "removeAfterOfflineMs" IS NULL OR "removeAfterOfflineMs" BETWEEN 60000 AND 2592000000
+  "removeAfterOfflineMs" IS NULL OR "removeAfterOfflineMs" BETWEEN 60000 AND 2592000000::bigint
 );
 
--- An IP literal (v4 or v6, no prefix length), not the unspecified address.
-CREATE OR REPLACE FUNCTION wsmp_is_ip_literal(value TEXT)
-RETURNS BOOLEAN LANGUAGE plpgsql IMMUTABLE AS $wsmp_is_ip_literal$
+-- A node's address on a fabric (packages/api/src/lib/ip-literal.ts `isFabricIp`, Rust
+-- `is_fabric_ip`; shared vectors in apps/cli/tests/fixtures/relay-3.0/rules/fabric-ip.json):
+-- the canonical text of one address (PostgreSQL's host() form: dotted quad without leading
+-- zeros, RFC 5952 IPv6), no prefix, zone or brackets, no embedded IPv4 in IPv6, and never
+-- 0.0.0.0/8, loopback, ::/96 (unspecified, ::1, IPv4-compatible) or IPv4-mapped.
+CREATE OR REPLACE FUNCTION wsmp_is_fabric_ip(value TEXT)
+RETURNS BOOLEAN LANGUAGE plpgsql IMMUTABLE AS $wsmp_is_fabric_ip$
 DECLARE
   parsed inet;
 BEGIN
-  IF value IS NULL OR length(value) > 45 OR value ~ '/' THEN
+  IF value IS NULL OR length(value) > 39 OR value !~ '^[0-9a-f.:]+$' THEN
     RETURN false;
   END IF;
   parsed := value::inet;
-  RETURN host(parsed) = value AND parsed <> '0.0.0.0'::inet AND parsed <> '::'::inet;
+  -- (No CASE in an IF condition: PL/pgSQL ends the condition at the first THEN.)
+  IF host(parsed) <> value OR masklen(parsed) <> (32 + 96 * (family(parsed) / 6)) THEN
+    RETURN false;
+  END IF;
+  IF family(parsed) = 4 THEN
+    RETURN NOT parsed <<= '0.0.0.0/8'::inet AND NOT parsed <<= '127.0.0.0/8'::inet;
+  END IF;
+  RETURN position('.' in value) = 0
+    AND NOT parsed <<= '::/96'::inet AND NOT parsed <<= '::ffff:0:0/96'::inet;
 EXCEPTION WHEN invalid_text_representation THEN
   RETURN false;
 END;
-$wsmp_is_ip_literal$;
+$wsmp_is_fabric_ip$;
 
 ALTER TABLE fabric DROP CONSTRAINT IF EXISTS fabric_shape;
 ALTER TABLE fabric ADD CONSTRAINT fabric_shape CHECK (name ~ '^[a-z][a-z0-9-]{0,62}$');
 ALTER TABLE fabric_member DROP CONSTRAINT IF EXISTS fabric_member_shape;
-ALTER TABLE fabric_member ADD CONSTRAINT fabric_member_shape CHECK (wsmp_is_ip_literal(ip));
+ALTER TABLE fabric_member ADD CONSTRAINT fabric_member_shape CHECK (wsmp_is_fabric_ip(ip));
+-- A member that a live multi-node instance on its fabric uses (a rank on this node that is not
+-- released) keeps its IP and membership: the node derives its interface from that IP, so a
+-- change under it would split the instance (`fabric_member_in_use`). Deleting the node itself
+-- first releases its ranks (node_delete_release), so it is never blocked by this.
+CREATE OR REPLACE FUNCTION enforce_fabric_member_in_use()
+RETURNS trigger LANGUAGE plpgsql AS $fabric_member_in_use$
+BEGIN
+  IF TG_OP = 'UPDATE' AND NEW.ip IS NOT DISTINCT FROM OLD.ip THEN
+    RETURN NEW;
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM runtime_instance i JOIN instance_rank k ON k."instanceId" = i.id
+     WHERE i."fabricId" = OLD."fabricId" AND k."nodeId" = OLD."nodeId" AND k.claim <> 'RELEASED'
+  ) THEN
+    RAISE EXCEPTION 'fabric_member_in_use: a running multi-node instance uses this address'
+      USING ERRCODE = 'WMPP1';
+  END IF;
+  RETURN COALESCE(NEW, OLD);
+END;
+$fabric_member_in_use$;
+DROP TRIGGER IF EXISTS fabric_member_in_use ON fabric_member;
+CREATE TRIGGER fabric_member_in_use BEFORE UPDATE OF ip OR DELETE ON fabric_member
+FOR EACH ROW EXECUTE FUNCTION enforce_fabric_member_in_use();
 ALTER TABLE node DROP CONSTRAINT IF EXISTS node_metric_commands_shape;
 ALTER TABLE node ADD CONSTRAINT node_metric_commands_shape CHECK (
   jsonb_typeof("metricCommands") = 'array'
@@ -266,7 +301,7 @@ ALTER TABLE node_enrollment_code ADD CONSTRAINT node_enrollment_code_shape CHECK
   AND cardinality(labels) <= 32
   AND ("replaceNodeId" IS NULL OR ("maxUses" = 1 AND cardinality(labels) = 0))
   AND ("suggestedSlug" IS NULL OR "maxUses" = 1)
-  AND ("removeAfterOfflineMs" IS NULL OR "removeAfterOfflineMs" BETWEEN 60000 AND 2592000000)
+  AND ("removeAfterOfflineMs" IS NULL OR "removeAfterOfflineMs" BETWEEN 60000 AND 2592000000::bigint)
   AND ("replaceNodeId" IS NULL OR "removeAfterOfflineMs" IS NULL)
 );
 -- A code is created unused, takes one use per exchange (never while revoked or expired), and
@@ -511,6 +546,8 @@ ALTER TABLE runtime_instance ADD CONSTRAINT runtime_instance_shape CHECK (
   AND ("observedKvBudgetTokens" IS NULL OR "observedKvBudgetTokens" > 0)
   AND ("maxModelLen" IS NULL OR "maxModelLen" > 0)
   AND ("phaseReason" IS NULL OR "phaseReason" ~ '^[a-z0-9_]{1,64}$')
+  -- A multi-node instance names its fabric until it is down (then the fabric may go).
+  AND ("fabricId" IS NULL OR ("desiredState" IS NOT NULL AND phase NOT IN ('STOPPED', 'FAILED')))
 );
 ALTER TABLE runtime_instance DROP CONSTRAINT IF EXISTS runtime_instance_notify_failures;
 ALTER TABLE runtime_instance ADD CONSTRAINT runtime_instance_notify_failures
@@ -971,7 +1008,7 @@ ALTER TABLE share_invite ADD CONSTRAINT share_invite_shape CHECK (
   email = lower(btrim(email)) AND length(email) BETWEEN 3 AND 320 AND position('@' in email) > 1
   AND "tokenDigest" ~ '^[0-9a-f]{64}$'
   AND ("canUse" OR "canContribute")
-  AND "expiresAt" > "createdAt" AND "expiresAt" <= "createdAt" + interval '30 days'
+  AND "expiresAt" > "createdAt" AND "expiresAt" <= "updatedAt" + interval '30 days'
   AND NOT ("acceptedAt" IS NOT NULL AND "revokedAt" IS NOT NULL)
   AND ("shareId" IS NULL OR "acceptedAt" IS NOT NULL)
 );
@@ -979,10 +1016,18 @@ CREATE OR REPLACE FUNCTION enforce_share_invite_transition()
 RETURNS trigger LANGUAGE plpgsql AS $share_invite_transition$
 BEGIN
   IF (to_jsonb(NEW) - ARRAY['updatedAt', 'emailSentAt', 'acceptedAt', 'shareId', 'revokedAt',
-                             'canUse', 'canContribute', 'priorityClass']::text[])
+                             'canUse', 'canContribute', 'priorityClass', 'tokenDigest',
+                             'expiresAt']::text[])
       IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['updatedAt', 'emailSentAt', 'acceptedAt', 'shareId',
-                             'revokedAt', 'canUse', 'canContribute', 'priorityClass']::text[]) THEN
-    RAISE EXCEPTION 'a share invite keeps its pool, e-mail and token' USING ERRCODE = '55000';
+                             'revokedAt', 'canUse', 'canContribute', 'priorityClass', 'tokenDigest',
+                             'expiresAt']::text[]) THEN
+    RAISE EXCEPTION 'a share invite keeps its pool and e-mail' USING ERRCODE = '55000';
+  END IF;
+  -- Resend rotates the token and the expiry, only while the invite is pending.
+  IF (OLD."acceptedAt" IS NOT NULL OR OLD."revokedAt" IS NOT NULL)
+     AND (NEW."tokenDigest" IS DISTINCT FROM OLD."tokenDigest"
+          OR NEW."expiresAt" IS DISTINCT FROM OLD."expiresAt") THEN
+    RAISE EXCEPTION 'an accepted or revoked share invite is final' USING ERRCODE = '55000';
   END IF;
   IF (OLD."acceptedAt" IS NOT NULL OR OLD."revokedAt" IS NOT NULL)
      AND (NEW."acceptedAt" IS DISTINCT FROM OLD."acceptedAt"
@@ -1006,6 +1051,9 @@ $share_invite_transition$;
 DROP TRIGGER IF EXISTS share_invite_transition ON share_invite;
 CREATE TRIGGER share_invite_transition BEFORE UPDATE ON share_invite
 FOR EACH ROW EXECUTE FUNCTION enforce_share_invite_transition();
+-- One pending invite per pool and e-mail; accepted and revoked ones are history.
+CREATE UNIQUE INDEX IF NOT EXISTS share_invite_one_pending
+  ON share_invite ("poolId", email) WHERE "acceptedAt" IS NULL AND "revokedAt" IS NULL;
 
 -- ═══════════════════════════════ providers ═══════════════════════════════
 

@@ -14,6 +14,7 @@
  */
 import { z } from "zod";
 import { canonicalJson } from "./canonical-json";
+import { isFabricIp, isUrlIpHost } from "./ip-literal";
 import { transcriptionProfileSchema } from "./transcription-profile";
 
 // ── Vocabularies (wire values; Prisma enums are the upper-case forms) ──
@@ -267,15 +268,6 @@ export type RuntimeSpecModel = z.infer<typeof runtimeSpecModelSchema>;
 export const nodeSecretNameSchema = z.string().regex(NODE_SECRET_PATTERN);
 const envRefSchema = nodeSecretNameSchema;
 
-function isIpLiteral(host: string): boolean {
-  if (host.startsWith("[") && host.endsWith("]")) return true; // URL keeps IPv6 bracketed
-  const parts = host.split(".");
-  return (
-    parts.length === 4 &&
-    parts.every((part) => /^(0|[1-9][0-9]{0,2})$/.test(part) && Number(part) <= 255)
-  );
-}
-
 /**
  * `http(s)://host[:port][/prefix]`, no userinfo, query or fragment. The host is `localhost` or
  * an IP literal; hostnames are refused so DNS rebinding cannot redirect a node (§4.3). Whether
@@ -296,7 +288,7 @@ export const runtimeBaseUrlSchema = z
       ctx.addIssue({ code: "custom", message: "Only http and https are allowed." });
     if (url.username || url.password || url.search || url.hash || value.includes("#"))
       ctx.addIssue({ code: "custom", message: "No user info, query or fragment." });
-    if (url.hostname !== "localhost" && !isIpLiteral(url.hostname))
+    if (url.hostname !== "localhost" && !isUrlIpHost(url.hostname))
       ctx.addIssue({ code: "custom", message: "The host must be localhost or an IP literal." });
     // The stored text is the normalized form, so TS and Rust URL parsers cannot disagree
     // (`http://2130706433/`, `/v1/../x`, upper-case schemes are refused, not normalized).
@@ -689,14 +681,14 @@ export const nodeMetricCommandsSchema = z
 // ── Fabrics (part of the node definition; frozen at Relay only) ──
 
 export const fabricNameSchema = z.string().regex(FABRIC_NAME_PATTERN);
-/** An IP literal (v4 or v6), never the unspecified address. */
+/**
+ * The node's address on a fabric: a canonical IP literal, never unspecified, loopback or
+ * IPv4-mapped (`ip-literal.ts`; the node and the database apply the same rule).
+ */
 export const fabricIpSchema = z
   .string()
-  .max(45)
-  .refine(
-    (value) => isIpLiteral(value) && value !== "0.0.0.0" && value !== "::",
-    "Expected the node's IP literal on this fabric.",
-  );
+  .max(39)
+  .refine(isFabricIp, "Expected the node's IP address on this fabric (e.g. 10.0.0.5 or fd00::5).");
 
 /** A node's memberships as people and agents edit them (`nodes.update`). */
 export const nodeFabricMembershipsSchema = z
@@ -732,11 +724,14 @@ export type NodeFabricSets = z.infer<typeof nodeFabricSetsSchema>;
 export const RUNTIME_SPEC_WARNINGS = ["binds_all_interfaces"] as const;
 export type RuntimeSpecWarning = (typeof RUNTIME_SPEC_WARNINGS)[number];
 
-const ALL_INTERFACES = /(?:^|[\s=:'"(,])(?:0\.0\.0\.0|\[::\]|::)(?=$|[\s:'"/),])/;
+const ALL_INTERFACES = /(?:^|[\s=:'"(,/])(?:0\.0\.0\.0|\[::\]|::)(?=$|[\s:'"/),\]])/;
+/** `vllm serve` binds every interface unless told otherwise. */
+const VLLM_SERVE_WITHOUT_HOST = /(?:^|[\s;&|])vllm\s+serve\b(?![^;&|]*--host[\s=])/;
 
 /**
  * Warnings for a valid spec. `binds_all_interfaces`: a command or address binds 0.0.0.0 or
- * `::`, which exposes the server beyond the node (single-node presets bind 127.0.0.1; a
+ * `::` (also `vllm serve` without `--host`, whose default is every interface), which exposes
+ * the server beyond the node (single-node presets bind 127.0.0.1; a
  * multi-node runtime binds the fabric with `{{fabric_ip}}`).
  */
 export function runtimeSpecWarnings(spec: RuntimeSpec): RuntimeSpecWarning[] {
@@ -744,7 +739,9 @@ export function runtimeSpecWarnings(spec: RuntimeSpec): RuntimeSpecWarning[] {
   if (spec.address) texts.push(spec.address.baseUrl);
   for (const commands of spec.launch?.commands ?? [])
     for (const value of Object.values(commands)) if (typeof value === "string") texts.push(value);
-  return texts.some((text) => ALL_INTERFACES.test(text)) ? ["binds_all_interfaces"] : [];
+  return texts.some((text) => ALL_INTERFACES.test(text) || VLLM_SERVE_WITHOUT_HOST.test(text))
+    ? ["binds_all_interfaces"]
+    : [];
 }
 
 /** `[start, end]`, 1024 ≤ start ≤ end ≤ 65535. */

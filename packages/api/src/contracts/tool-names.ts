@@ -1,4 +1,4 @@
-/** The 26 MCP tools of 0.4.0 (spec §6.2 + owner round 3), in manifest order. READ tokens get the first 7. */
+/** The 27 MCP tools of 0.4.0 (spec §6.2 + owner round 3 + review), in manifest order. READ tokens get the first 7. */
 export const MCP_READ_TOOLS = [
   "nodes_get",
   "runtimes_get",
@@ -23,6 +23,7 @@ export const MCP_FULL_TOOLS = [
   "profile_apply",
   "profile_delete",
   "node_update",
+  "node_secret_set",
   "node_command_run",
   "node_command_get",
   "node_command_queue_for_user",

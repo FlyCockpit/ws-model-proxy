@@ -101,13 +101,16 @@ model Node {
   /// node (`holdProfileId`); applying a profile that owns the node without a hold line clears it.
   holdAt                  DateTime?
   holdNote                String?
+  /// The profile whose hold line set the hold; null for a person's own hold. Applying a
+  /// profile releases only its own holds; an agent can never release a person's.
   holdProfileId           String?
   /// Temporary node (owner decision round 3): deleted by the sweeper once it has been offline
   /// this long, releasing everything exactly like a manual delete. People only (a deletion
-  /// policy: agents may not change it). Null: kept.
-  removeAfterOfflineMs    Int?
+  /// policy: agents may not change it). Null: kept. 1 min .. 30 days (BigInt: > 2^31 ms).
+  removeAfterOfflineMs    BigInt?
 
   User           User                 @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  HoldProfile    Profile?             @relation("NodeHoldProfile", fields: [holdProfileId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   Credentials    NodeCredential[]
   Runtimes       Runtime[]
   Ranks          InstanceRank[]
@@ -123,6 +126,7 @@ model Node {
   @@index([userId, connection])
   @@index([lastHeartbeatAt])
   @@index([removeAfterOfflineMs, connection, lastDisconnectedAt])
+  @@index([holdProfileId])
   @@map("node")
 }
 
@@ -180,7 +184,7 @@ model NodeEnrollmentCode {
   labels               String[]  @default([])
   /// Temporary nodes: every node enrolled with this code is removed after being offline this
   /// long (default 1 h when the option is chosen). Null: kept.
-  removeAfterOfflineMs Int?
+  removeAfterOfflineMs BigInt?
   revokedAt            DateTime?
 
   User        User                @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
@@ -247,8 +251,10 @@ model Fabric {
   /// Label pattern (lower-case, digits, dashes); runtime specs name a fabric by it.
   name      String
 
-  User    User           @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Members FabricMember[]
+  User      User              @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Members   FabricMember[]
+  /// Multi-node instances placed on this fabric: it cannot be deleted while one exists.
+  Instances RuntimeInstance[]
 
   @@unique([userId, name])
   @@unique([id, userId])

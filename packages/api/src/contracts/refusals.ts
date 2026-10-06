@@ -63,6 +63,14 @@ export const REFUSAL_REASONS = [
   "secret_needs_node",
   /** A command finished or is unknown to the node; there is nothing to cancel. */
   "command_not_running",
+  // Contract review fixes (round 3).
+  /** A running multi-node instance uses this fabric, or this node's address on it. */
+  "fabric_in_use",
+  /**
+   * An invite is accepted by its link, or by e-mail match only for a verified address (with
+   * e-mail verification off, only the link works).
+   */
+  "invite_needs_link",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

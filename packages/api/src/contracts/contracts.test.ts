@@ -13,6 +13,7 @@ import {
   MCP_READ_TOOLS,
   MCP_TOOL_NAMES,
   MCP_TOOLS,
+  SENSITIVE_INPUT_PROCEDURES,
 } from "./index";
 import { advertisedToolList } from "./mcp-tools";
 import { metricsQueryInputSchema } from "./metrics";
@@ -44,6 +45,8 @@ const INVENTORY = [
   "nodes.list",
   "nodes.get",
   "nodes.update",
+  "nodes.secrets.set",
+  "nodes.secrets.delete",
   "nodes.setHold",
   "nodes.setTemporary",
   "nodes.fabrics.list",
@@ -295,12 +298,12 @@ describe("caller auth (positive human check)", () => {
 });
 
 describe("0.4.0 MCP tool manifest", () => {
-  it("has the 26 tools in order, 7 of them read-only", () => {
+  it("has the 27 tools in order, 7 of them read-only", () => {
     expect(MCP_TOOLS.map((tool) => tool.name)).toEqual([...MCP_TOOL_NAMES]);
     expect(MCP_TOOLS.filter((tool) => tool.level === "READ").map((tool) => tool.name)).toEqual([
       ...MCP_READ_TOOLS,
     ]);
-    expect(MCP_TOOLS).toHaveLength(26);
+    expect(MCP_TOOLS).toHaveLength(27);
   });
 
   it("calls only agent procedures that name the tool back; read tools only query", () => {
@@ -344,6 +347,8 @@ describe("0.4.0 MCP tool manifest", () => {
   it("keeps tools/list within its token budget (chars / 4)", () => {
     // Measured 2026-10-06: 13,223 tokens before the owner's token-efficiency pass (25 tools),
     // 5,506 after it (26 tools). Raise only with a reason in the commit message.
+    // The server's real tools/list (titles, annotations, output schemas) is measured by the
+    // MCP server's own budget test (apps/server/src/mcp).
     const text = JSON.stringify({ tools: advertisedToolList() });
     expect(Math.ceil(text.length / 4)).toBeLessThanOrEqual(6_500);
     for (const tool of MCP_TOOLS) {
@@ -362,6 +367,35 @@ describe("0.4.0 MCP tool manifest", () => {
         const properties = (schema?.properties ?? {}) as Record<string, { type?: string }>;
         expect(properties[field]?.type, `${tool.name}.${field}`).toBe("object");
       }
+  });
+
+  it("keeps secret values out of generic inputs (only the sensitive secret tool takes one)", () => {
+    expect(
+      procedures.get("nodes.update")?.input.safeParse({
+        nodeId: "n",
+        secrets: { set: [{ name: "WSMP_SECRET_X", value: "v" }] },
+      }).success,
+    ).toBe(false);
+    for (const path of SENSITIVE_INPUT_PROCEDURES) expect(procedures.has(path), path).toBe(true);
+    expect(MCP_TOOLS.filter((tool) => tool.sensitiveInput).map((tool) => tool.name)).toEqual([
+      "node_secret_set",
+    ]);
+    const secretTool = MCP_TOOLS.find((tool) => tool.name === "node_secret_set");
+    for (const path of secretTool?.procedures ?? [])
+      expect(path.startsWith("nodes.secrets."), path).toBe(true);
+  });
+
+  it("forks return what create returns and take the same settings", () => {
+    expect(procedures.get("runtimes.fork")?.output).toBe(procedures.get("runtimes.create")?.output);
+    expect(
+      procedures.get("runtimes.fork")?.input.safeParse({
+        runtimeId: "r",
+        slug: "copy",
+        name: "Copy",
+        limits: {},
+        note: "why",
+      }).success,
+    ).toBe(true);
   });
 
   it("converts every tool schema to JSON Schema", () => {

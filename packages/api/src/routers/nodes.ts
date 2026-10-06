@@ -6,6 +6,10 @@ export const nodesRouter = {
   list: stub(c.list),
   get: stub(c.get),
   update: stub(c.update),
+  secrets: {
+    set: stub(c.secrets.set),
+    delete: stub(c.secrets.delete),
+  },
   setHold: stub(c.setHold),
   setTemporary: stub(c.setTemporary),
   fabrics: {

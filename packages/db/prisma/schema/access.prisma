@@ -118,6 +118,7 @@ model Share {
   OwnKeyModel ProviderModel? @relation(fields: [ownKeyProviderModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   SpendCap    SpendCap?
   Contributed PoolMember[]
+  Invites     ShareInvite[]
 
   @@unique([poolId, granteeUserId])
   @@index([granteeUserId])
@@ -139,6 +140,7 @@ model ShareInvite {
   /// Lower-cased, trimmed.
   email         String
   /// sha256 of the invite token (`wsmp_inv_` + 26 base32 characters); the token is shown once.
+  /// Resending rotates it (and `expiresAt`) while the invite is pending.
   tokenDigest   String         @unique
   canUse        Boolean        @default(true)
   canContribute Boolean        @default(false)
@@ -150,10 +152,14 @@ model ShareInvite {
   shareId       String?
   revokedAt     DateTime?
 
-  Pool  Pool @relation(fields: [poolId, ownerUserId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  Owner User @relation(fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Pool  Pool   @relation(fields: [poolId, ownerUserId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Owner User   @relation(fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Share Share? @relation(fields: [shareId], references: [id], onDelete: SetNull, onUpdate: Cascade)
 
-  @@unique([poolId, email])
+  /// One PENDING invite per pool and e-mail (partial unique index in schema-hardening.sql);
+  /// accepted and revoked ones stay as history, so the same e-mail can be invited again.
+  @@index([poolId, email])
+  @@index([shareId])
   @@index([email])
   @@index([ownerUserId])
   @@index([expiresAt])

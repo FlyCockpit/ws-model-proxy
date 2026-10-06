@@ -17,6 +17,7 @@ model Profile {
   Nodes      ProfileNode[]
   Items      ProfileItem[]
   Operations RuntimeOperation[]
+  HeldNodes  Node[]             @relation("NodeHoldProfile")
 
   @@unique([userId, slug])
   @@unique([id, userId])

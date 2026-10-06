@@ -761,11 +761,39 @@ pub fn is_secret_name(name: &str) -> bool {
     })
 }
 
-/// An IP literal (v4 or v6), never the unspecified address.
+/// A node's address on a fabric, exactly as the server and the database
+/// accept it (`packages/api/src/lib/ip-literal.ts`, shared vectors in
+/// `tests/fixtures/relay-3.0/rules/fabric-ip.json`): the canonical text of one
+/// address (dotted quad without leading zeros, RFC 5952 IPv6 without an
+/// embedded IPv4 part), never 0.0.0.0/8, loopback, `::/96` or IPv4-mapped.
 pub fn is_fabric_ip(value: &str) -> bool {
-    value
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| !ip.is_unspecified())
+    match value.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            let first = ip.octets()[0];
+            ip.to_string() == value && first != 0 && first != 127
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            let segments = ip.segments();
+            let first_80_zero = segments[..5].iter().all(|segment| *segment == 0);
+            !value.contains('.')
+                && ip.to_string() == value
+                && !(first_80_zero && (segments[5] == 0 || segments[5] == 0xffff))
+        }
+        Err(_) => false,
+    }
+}
+
+/// A node-derived interface or RDMA device name (`{{fabric_iface}}`,
+/// `{{fabric_rdma_device}}`) is substituted into commands only when it is
+/// plain: letters, digits, `_`, `.`, `:`, `-`, not starting with `-`, at most
+/// 64 bytes. Anything else refuses the start instead of reaching a shell.
+pub fn is_fabric_device_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && !value.starts_with('-')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
 }
 
 impl FabricsPush {
@@ -1677,6 +1705,7 @@ impl DefinitionEnvelope {
             secrets.chain(auth).all(|name| is_secret_name(name)),
             "node secrets are named WSMP_SECRET_*",
         )?;
+        self.spec.validate_shape().map_err(FrameRuleError)?;
         rule(
             canonical_len(&self.spec).is_some_and(|len| len <= RUNTIME_SPEC_MAX_BYTES),
             "a runtime definition is at most 48 KiB as canonical JSON",
@@ -1691,6 +1720,13 @@ impl RuntimeJob {
             (self.nnodes > 1) == self.fabric_id.is_some()
                 && (self.nnodes > 1) == self.placeholders.head_addr.is_some(),
             "fabricId and head_addr exactly for multi-node jobs",
+        )?;
+        rule(
+            self.placeholders
+                .head_addr
+                .as_deref()
+                .is_none_or(is_fabric_ip),
+            "head_addr is the head's fabric IP",
         )?;
         rule(
             self.unit_name == runtime_unit_name(&self.handle, self.rank),
@@ -1929,6 +1965,44 @@ mod tests {
                 (name, frame)
             })
             .collect()
+    }
+
+    #[test]
+    fn fabric_ips_match_the_shared_vectors() {
+        let text = std::fs::read_to_string(fixtures().join("rules/fabric-ip.json"))
+            .expect("fabric-ip vectors");
+        let vectors: Value = serde_json::from_str(&text).expect("vectors are JSON");
+        let list = |key: &str| -> Vec<String> {
+            vectors[key]
+                .as_array()
+                .expect("a list")
+                .iter()
+                .map(|value| value.as_str().expect("a string").to_owned())
+                .collect()
+        };
+        for ip in list("valid") {
+            assert!(is_fabric_ip(&ip), "{ip} should be accepted");
+        }
+        for ip in list("invalid") {
+            assert!(!is_fabric_ip(&ip), "{ip} should be refused");
+        }
+    }
+
+    #[test]
+    fn fabric_device_names_stay_plain() {
+        for name in ["eth0", "enp1s0f0", "ib0", "mlx5_0", "eth0.100", "bond0:1"] {
+            assert!(is_fabric_device_name(name), "{name}");
+        }
+        for name in [
+            "",
+            "-eth0",
+            "eth0;reboot",
+            "$(id)",
+            "eth 0",
+            &"a".repeat(65),
+        ] {
+            assert!(!is_fabric_device_name(name), "{name}");
+        }
     }
 
     #[test]

@@ -289,6 +289,16 @@ const advancedInput = runtimeAdvancedPatchSchema.optional();
 
 // ── Procedures ──
 
+/** What creating a runtime returns, from a spec or a fork. */
+export const runtimeCreateOutputSchema = z
+  .object({
+    runtime: runtimeSummarySchema,
+    version: runtimeVersionSummarySchema,
+    define: z.array(defineResultSchema),
+    warnings: z.array(z.enum(RUNTIME_SPEC_WARNINGS)),
+  })
+  .strict();
+
 export const runtimesContract = {
   list: query(
     "agent",
@@ -371,14 +381,7 @@ export const runtimesContract = {
         message: "A startable runtime has launch; an always-on one has address.",
         path: ["spec"],
       }),
-    z
-      .object({
-        runtime: runtimeSummarySchema,
-        version: runtimeVersionSummarySchema,
-        define: z.array(defineResultSchema),
-        warnings: z.array(z.enum(RUNTIME_SPEC_WARNINGS)),
-      })
-      .strict(),
+    runtimeCreateOutputSchema,
     "Create a runtime (version 1) and push it to the nodes that need it. Warns (never refuses) when it binds 0.0.0.0 or ::.",
     ["runtime_create"],
   ),
@@ -585,10 +588,14 @@ export const runtimesContract = {
         slug: runtimeSlugSchema,
         name: nameSchema,
         nodeId: idSchema.optional(),
+        /** Applied on top of the copied definition, exactly as on create. */
+        limits: limitsInput,
+        advanced: advancedInput,
+        note: noteSchema.optional(),
       })
       .strict(),
-    runtimeSummarySchema,
-    "Copy a definition shared with you into your own runtime (agents: onto your Full-control nodes).",
+    runtimeCreateOutputSchema,
+    "Copy a definition shared with you into your own runtime (version 1; agents: onto your Full-control nodes). Takes limits, advanced and note like create.",
     ["runtime_create"],
   ),
 } as const;

@@ -1,5 +1,5 @@
 /**
- * The 0.4.0 MCP tool manifest (spec §6): 26 tools, user nouns, no implementations.
+ * The 0.4.0 MCP tool manifest (spec §6): 27 tools, user nouns, no implementations.
  * `apps/server/src/mcp/tool-manifest.ts` registers these; handlers call the procedures named in
  * `procedures`. READ tokens see the read tools; FULL tokens see all. Every write takes an
  * optional `note`. Refusals carry `data.reason` with a message that says what to do next.
@@ -11,6 +11,7 @@
  * `contracts.test.ts` fails when `tools/list` grows past its budget.
  */
 import { z } from "zod";
+import { nodeSecretNameSchema } from "../lib/runtime-spec";
 import { activityContract } from "./activity";
 import { confirmDeleteSchema, idSchema, MODEL_CAPABILITY, noteSchema, okSchema } from "./common";
 import { modelsContract } from "./models";
@@ -52,6 +53,11 @@ export type McpToolContract = {
    * path). Keeps `tools/list` small.
    */
   compactFields?: Readonly<Record<string, string>>;
+  /**
+   * The input carries a secret value: the server never logs, audits or echoes it (errors name
+   * the field, never its value).
+   */
+  sensitiveInput?: boolean;
   /** Calls per minute per token, when stricter than the MCP default. */
   rateLimit?: {
     perMinute: number;
@@ -367,7 +373,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "node_update",
     description:
-      "Change a Full-control node: labels, ports, hardware, metric commands, fabrics, command lifetime, secrets (write-only), rescan.",
+      "Change a Full-control node: labels, ports, hardware, metric commands, fabrics, command lifetime, rescan.",
     input: nodesContract.update.input,
     output: nodesContract.update.output,
     procedures: ["nodes.update"],
@@ -375,6 +381,23 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
       hardware: "Declared hardware (null clears); nodes_get shows sources.",
       metricCommands: "Node metric commands; shape in docs/mcp.md.",
     },
+  }),
+  tool({
+    name: "node_secret_set",
+    description:
+      "Set (or with value null delete) a WSMP_SECRET_* on a Full-control node, for runtimes to reference by name. Write-only: never shown again.",
+    input: z
+      .object({
+        nodeId: idSchema,
+        name: nodeSecretNameSchema,
+        value: z.string().nullable(),
+        note: noteSchema.optional(),
+      })
+      .strict(),
+    output: z.object({ name: z.string(), deleted: z.boolean() }).strict(),
+    procedures: ["nodes.secrets.set", "nodes.secrets.delete"],
+    /** The whole input is sensitive: never logged, audited or echoed in errors. */
+    sensitiveInput: true,
   }),
   tool({
     name: "node_command_run",

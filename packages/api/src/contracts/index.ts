@@ -53,6 +53,12 @@ export const CSRF_REQUIRED_PROCEDURES: ReadonlySet<string> = new Set(
     .map(([path]) => path),
 );
 
+/**
+ * Procedures whose input carries a secret value (node secrets). The server never logs, audits
+ * or echoes their input: errors name the field only, the audit records the secret's name.
+ */
+export const SENSITIVE_INPUT_PROCEDURES: ReadonlySet<string> = new Set(["nodes.secrets.set"]);
+
 export * from "./auth-context";
 export { MCP_EXCLUDED_SESSION_PROCEDURES, MCP_TOOLS, type McpToolContract } from "./mcp-tools";
 export * from "./procedure";

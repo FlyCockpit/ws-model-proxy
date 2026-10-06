@@ -284,11 +284,16 @@ model RuntimeInstance {
   loadSignals                 String[]            @default([])
   factsAt                     DateTime?
   loadCounterEpoch            Int?
+  /// The fabric a multi-node instance runs on (null for single-node). Cleared when it reaches
+  /// STOPPED or FAILED; while set the fabric cannot be deleted and its members on this
+  /// instance's nodes keep their IPs (`fabric_member_in_use`).
+  fabricId                    String?
 
   Runtime       Runtime           @relation(fields: [runtimeId, userId], references: [id, userId], onDelete: NoAction, onUpdate: Cascade)
   Version       RuntimeVersion    @relation("InstanceVersion", fields: [versionId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   LaunchVersion RuntimeVersion    @relation("InstanceLaunchVersion", fields: [launchVersionId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   Operation     RuntimeOperation? @relation(fields: [operationId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  Fabric        Fabric?           @relation(fields: [fabricId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
   Ranks         InstanceRank[]
   Steps         InstanceStep[]
   Targets       ExecutionTarget[]
@@ -296,6 +301,7 @@ model RuntimeInstance {
   @@unique([userId, handle])
   @@unique([id, userId])
   @@index([userId, desiredState, phase])
+  @@index([fabricId])
   @@index([runtimeId])
   @@index([versionId])
   @@index([launchVersionId])

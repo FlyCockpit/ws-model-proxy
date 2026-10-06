@@ -209,7 +209,7 @@ export const accessContract = {
           })
           .strict(),
       ]),
-      "Share a pool with a person. An e-mail without an account becomes an invite (e-mailed when SMTP is set up, otherwise a link to copy); the share starts when they sign up, even with open sign-up off.",
+      "Share a pool with a person. An e-mail without an account becomes an invite (e-mailed when SMTP is set up, otherwise a link to copy); the share starts when they sign up through the link, even with open sign-up off. Without the link an invite is accepted only by a verified e-mail address (inviteAcceptance; with verification off, only the link works: invite_needs_link).",
     ),
     update: mutation(
       "human",
@@ -251,7 +251,7 @@ export const accessContract = {
       "human",
       z.object({ inviteId: idSchema }).strict(),
       z.object({ invite: shareInviteViewSchema, link: z.string().nullable() }).strict(),
-      "Send the invite again with a new link (the old link stops working).",
+      "Send the invite again with a new link and expiry (the old link stops working; pending invites only). A revoked or accepted e-mail can be invited again with shares.create.",
     ),
     revoke: mutation(
       "human",
