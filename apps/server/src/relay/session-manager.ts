@@ -63,6 +63,7 @@ import {
 } from "../model-api/cache-affinity-observers.js";
 import { beginAffinityReset } from "../model-api/cache-affinity-residency.js";
 import { resetKvEvictionForEndpoint } from "../model-api/kv-eviction-feedback.js";
+import { PROBE_MAX_TOKENS, probeReasoningFields } from "../model-api/probe-settings.js";
 import { startRelayAttempt } from "../model-api/relay-executor.js";
 import { EngineLoadHistoryStore } from "./engine-load-history.js";
 import { observeEngineLoadRollup } from "./engine-load-rollup.js";
@@ -4961,10 +4962,12 @@ export class RelaySessionManager {
   }
 
   private async probeOwnedPoolMember(member: OwnedRecoveryMember): Promise<boolean | "superseded"> {
-    const surface = suggestedConnectionSurface({
-      capabilities: member.capabilities as OpenAiCompatibleCapabilities | null,
-    });
+    const capabilities = member.capabilities as OpenAiCompatibleCapabilities | null;
+    const surface = suggestedConnectionSurface({ capabilities });
     if (!surface) return false;
+    // Same budget and lowest reasoning level as `pool_member_test`, so a
+    // reasoning model is not cut off before it can answer. Reasoning fields
+    // go on the chat surface only, as in that probe.
     const request =
       surface === "OPENAI_RESPONSES"
         ? {
@@ -4973,7 +4976,7 @@ export class RelaySessionManager {
             body: {
               model: member.upstreamModelId,
               input: "Reply with pong.",
-              max_output_tokens: 8,
+              max_output_tokens: PROBE_MAX_TOKENS,
             },
           }
         : surface === "ANTHROPIC_MESSAGES"
@@ -4982,7 +4985,7 @@ export class RelaySessionManager {
               path: "/v1/messages",
               body: {
                 model: member.upstreamModelId,
-                max_tokens: 8,
+                max_tokens: PROBE_MAX_TOKENS,
                 messages: [{ role: "user", content: "Reply with pong." }],
               },
             }
@@ -4992,7 +4995,8 @@ export class RelaySessionManager {
               body: {
                 model: member.upstreamModelId,
                 stream: false,
-                max_tokens: 8,
+                max_tokens: PROBE_MAX_TOKENS,
+                ...probeReasoningFields(capabilities),
                 messages: [{ role: "user", content: "Reply with pong." }],
               },
             };

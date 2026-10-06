@@ -12,11 +12,6 @@ import {
   resolveEffectiveCapabilityMetadata,
   supportsChatCompletions,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
-import {
-  encodeReasoning,
-  type ReasoningLevel,
-  reasoningLevels,
-} from "@ws-model-proxy/api/lib/reasoning-contract";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { type RelaySessionManager, relaySessionManager } from "../relay/session-manager.js";
 import { PostgresCapacityAdmissionStore } from "./capacity/postgres-store.js";
@@ -28,14 +23,11 @@ import {
 import { splitModelVariant } from "./external-route.js";
 import { type ModelApiConcurrencyLimiter, modelApiConcurrencyLimiter } from "./limits.js";
 import { extractAssistantTextFromChatCompletion, readResponseUtf8 } from "./media-transform.js";
-import { reasoningControlForSurface } from "./protocols/request-controls.js";
+import { PROBE_MAX_TOKENS, probeReasoningFields } from "./probe-settings.js";
 import { chatTestCompletionsHandler, poolMemberDiagnosticHandler } from "./routes.js";
 
 const TEST_TIMEOUT_MS = 20_000;
 const EXPECTED_PROBE_WORD = /\bpong\b/i;
-
-/** Visible-token budget for the member probe (room for a short reasoning preamble). */
-const PROBE_MAX_TOKENS = 64;
 
 export const REASONING_ONLY_PROBE_DETAIL =
   "Member is reachable, but the model spent the probe's token budget on reasoning and returned no visible text.";
@@ -115,39 +107,6 @@ function classifyEmbeddingProbeReply(status: number, raw: string): ChatProbeRepl
       : "failed";
   } catch {
     return "failed";
-  }
-}
-
-/**
- * The lowest reasoning level the member accepts: `none` unless its
- * `supportedLevels` exclude it. Undefined when reasoning is not controllable.
- */
-function probeReasoningLevel(supportedLevels: readonly ReasoningLevel[] | undefined) {
-  if (!supportedLevels) return "none" as const;
-  return reasoningLevels.find((level) => supportedLevels.includes(level));
-}
-
-/**
- * Reasoning control fields for the probe, built from the member's own
- * capability inventory so each encoding (effort field, reasoning object,
- * output_config, ...) is honoured. Empty when the member does not advertise
- * reasoning, or advertises an encoding the chat surface cannot carry.
- */
-export function probeReasoningFields(
-  capabilities: ReturnType<typeof resolveEffectiveCapabilityMetadata>,
-): Record<string, unknown> {
-  const control = reasoningControlForSurface(capabilities, "openai-chat");
-  if (!control.supported) return {};
-  const selection = probeReasoningLevel(control.config?.supportedLevels);
-  if (!selection) return {};
-  try {
-    return encodeReasoning({
-      surface: "OPENAI_CHAT_COMPLETIONS",
-      selection,
-      ...(control.config ? { config: control.config } : {}),
-    });
-  } catch {
-    return {};
   }
 }
 
