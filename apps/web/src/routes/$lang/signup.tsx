@@ -37,8 +37,8 @@ export const Route = createFileRoute("/$lang/signup")({
     if (decision.kind === "redirect-authenticated") {
       throw redirect({ href: safeRedirectTo(search.redirectTo, params.lang) });
     }
-    const cfg = await context.queryClient.ensureQueryData(orpc.appConfig.queryOptions());
-    if (cfg.forceSso || (!cfg.signupEnabled && !cfg.adminBootstrapSignupEnabled)) {
+    const cfg = await context.queryClient.ensureQueryData(orpc.app.config.queryOptions());
+    if (!cfg.signupEnabled && !cfg.adminBootstrapSignupEnabled) {
       throw redirect({ to: "/$lang/login", params: { lang: params.lang }, search });
     }
   },
@@ -49,14 +49,13 @@ function SignupPage() {
   const { lang } = Route.useParams();
   const { redirectTo } = Route.useSearch();
   const { state } = useAuthSession();
-  const config = useQuery(orpc.appConfig.queryOptions());
+  const config = useQuery(orpc.app.config.queryOptions());
   const { t } = useTranslation(["auth", "common"]);
   const [pendingEmail, setPendingEmail] = useState<string | null>(null);
 
   const postAuthRedirect = safeRedirectTo(redirectTo, lang);
-  const forceSso = config.data?.forceSso === true;
   const emailEnabled = config.data?.emailEnabled === true;
-  const canResend = emailEnabled && !forceSso;
+  const canResend = emailEnabled;
 
   if (pendingEmail) {
     return (
@@ -124,29 +123,6 @@ function SignupPage() {
             <Button className="min-h-[44px] w-full" onClick={() => config.refetch()}>
               {t("common:actions.retry")}
             </Button>
-          </CardContent>
-        </Card>
-      </div>
-    );
-  }
-
-  if (forceSso) {
-    return (
-      <div className="flex min-h-[80vh] items-center justify-center px-4">
-        <Card className="w-full max-w-md">
-          <CardHeader className="text-center">
-            <CardTitle className="text-2xl">{t("auth:login.ssoRequiredTitle")}</CardTitle>
-            <CardDescription>{t("auth:login.ssoRequiredDescription")}</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Link
-              to="/$lang/login"
-              params={{ lang }}
-              search={{ redirectTo }}
-              className={cn(buttonVariants(), "min-h-[44px] w-full")}
-            >
-              {t("auth:login.signIn")}
-            </Link>
           </CardContent>
         </Card>
       </div>
@@ -222,8 +198,8 @@ function SignUpForm({
         onAccountCreatedNeedingVerification(value.email);
         return;
       }
-      if (redirectTo === `/${lang}/dashboard`) {
-        navigate({ to: "/$lang/dashboard", params: { lang } });
+      if (redirectTo === `/${lang}/overview`) {
+        navigate({ to: "/$lang/overview", params: { lang } });
       } else {
         window.location.assign(redirectTo);
       }

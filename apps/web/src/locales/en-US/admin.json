@@ -1,33 +1,8 @@
 {
-  "devices": {
-    "title": "Devices",
-    "description": "Device codes created by the OAuth device-authorization flow. Denying a code stops future polling for that code; it does not sign out an already-issued session.",
-    "recentTitle": "Recent device codes",
-    "recentDescription": "Pending entries are awaiting your approval. Approved entries can be marked denied here to prevent further use of the code.",
-    "noCodes": "No device codes yet",
-    "noCodesHint": "When a CLI starts a device-authorization flow, the request shows up here.",
-    "loadFailed": "Couldn't load device codes.",
-    "clientPrefix": "client: {{clientId}} - ",
-    "createdExpires": "created {{created}} - expires {{expires}}",
-    "denyAriaLabel": "Deny device code {{code}}",
-    "denyTitle": "Deny this device code?",
-    "denyDescriptionNamed": "Code {{code}} will be marked denied. The associated session, if any, is not signed out automatically.",
-    "denyDescriptionUnnamed": "The code will be marked denied.",
-    "typeUserCodeToConfirm": "Type the user code to confirm",
-    "copyUserCodeAriaLabel": "Copy user code",
-    "markDenied": "Mark denied",
-    "savingMark": "Saving...",
-    "markedDenied": "Device code marked denied",
-    "denyFailed": "Couldn't deny that code. Try again.",
-    "statusApproved": "Approved",
-    "statusDenied": "Denied",
-    "statusPending": "Pending"
-  },
   "nav": {
     "ariaLabel": "Admin sections",
     "overview": "Overview",
     "users": "Users",
-    "devices": "Devices",
     "observability": "Observability",
     "settings": "Settings"
   },

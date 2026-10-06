@@ -1,33 +1,8 @@
 {
-  "devices": {
-    "title": "Dispositivos",
-    "description": "Codigos de dispositivo creados por el flujo OAuth de autorizacion de dispositivo. Denegar un codigo detiene el polling futuro para ese codigo; no cierra una sesion ya emitida.",
-    "recentTitle": "Codigos recientes",
-    "recentDescription": "Las entradas pendientes esperan tu aprobacion. Las aprobadas se pueden marcar como denegadas aqui para impedir uso futuro del codigo.",
-    "noCodes": "Aun no hay codigos de dispositivo",
-    "noCodesHint": "Cuando una CLI inicia un flujo de autorizacion de dispositivo, la solicitud aparece aqui.",
-    "loadFailed": "No se pudieron cargar los codigos.",
-    "clientPrefix": "cliente: {{clientId}} - ",
-    "createdExpires": "creado {{created}} - expira {{expires}}",
-    "denyAriaLabel": "Denegar codigo {{code}}",
-    "denyTitle": "Denegar este codigo?",
-    "denyDescriptionNamed": "El codigo {{code}} se marcara como denegado. La sesion asociada, si existe, no se cierra automaticamente.",
-    "denyDescriptionUnnamed": "El codigo se marcara como denegado.",
-    "typeUserCodeToConfirm": "Escribe el codigo de usuario para confirmar",
-    "copyUserCodeAriaLabel": "Copiar codigo de usuario",
-    "markDenied": "Marcar denegado",
-    "savingMark": "Guardando...",
-    "markedDenied": "Codigo marcado como denegado",
-    "denyFailed": "No se pudo denegar ese codigo. Intenta de nuevo.",
-    "statusApproved": "Aprobado",
-    "statusDenied": "Denegado",
-    "statusPending": "Pendiente"
-  },
   "nav": {
     "ariaLabel": "Secciones de administracion",
     "overview": "Resumen",
     "users": "Usuarios",
-    "devices": "Dispositivos",
     "observability": "Observabilidad",
     "settings": "Configuracion"
   },

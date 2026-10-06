@@ -1,10 +1,20 @@
 {
   "items": {
-    "about": "About",
-    "cookiePolicy": "Cookie Policy",
-    "dashboard": "Dashboard",
+    "overview": "Overview",
+    "models": "Models",
+    "pools": "Pools",
+    "runtimes": "Runtimes",
+    "profiles": "Profiles",
+    "nodes": "Nodes",
+    "providers": "Providers",
+    "access": "Access",
+    "activity": "Activity",
+    "terminals": "Terminals",
     "settings": "Settings",
-    "admin": "Admin"
+    "admin": "Admin",
+    "more": "More",
+    "about": "About",
+    "cookiePolicy": "Cookie Policy"
   },
   "languageLabel": "Language",
   "mainNav": {
@@ -22,5 +32,19 @@
     "signIn": "Sign In",
     "signUp": "Sign Up",
     "signOut": "Sign Out"
+  },
+  "hints": {
+    "overview": "What is happening and what needs you",
+    "models": "Callable IDs and how to call them",
+    "pools": "Route requests across your runtimes",
+    "runtimes": "Model servers on your nodes",
+    "profiles": "What runs where, in one step",
+    "nodes": "Your machines running wsmp",
+    "providers": "Cloud accounts and spend",
+    "access": "API keys, agents and sharing",
+    "activity": "Metrics and the request log",
+    "terminals": "Terminals and queued commands",
+    "settings": "Your account",
+    "admin": "Server administration"
   }
 }

@@ -4,9 +4,9 @@
  * auth pages themselves). Falls back to the locale's dashboard.
  */
 export function safeRedirectTo(value: unknown, lang: string): string {
-  if (typeof value !== "string") return `/${lang}/dashboard`;
-  if (!value.startsWith(`/${lang}/`)) return `/${lang}/dashboard`;
-  if (value.startsWith(`/${lang}/login`)) return `/${lang}/dashboard`;
-  if (value.startsWith(`/${lang}/signup`)) return `/${lang}/dashboard`;
+  if (typeof value !== "string") return `/${lang}/overview`;
+  if (!value.startsWith(`/${lang}/`)) return `/${lang}/overview`;
+  if (value.startsWith(`/${lang}/login`)) return `/${lang}/overview`;
+  if (value.startsWith(`/${lang}/signup`)) return `/${lang}/overview`;
   return value;
 }

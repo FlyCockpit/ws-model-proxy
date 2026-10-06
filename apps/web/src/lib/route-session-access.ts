@@ -35,7 +35,7 @@ export type AdminRouteDecision =
 export type DeviceRouteDecision =
   | { kind: "allow"; session: RouteSession }
   | { kind: "redirect-to-login" }
-  | { kind: "redirect-to-dashboard" }
+  | { kind: "redirect-to-overview" }
   | { kind: "error" };
 
 export type McpConsentRouteDecision =
@@ -103,7 +103,7 @@ export function decideDeviceRouteAccess(resolution: RouteSessionResolution): Dev
   const user = resolution.session?.user;
   if (!resolution.session) return { kind: "redirect-to-login" };
   if (!user?.emailVerified || !isAdminRole(user.role)) {
-    return { kind: "redirect-to-dashboard" };
+    return { kind: "redirect-to-overview" };
   }
   return { kind: "allow", session: resolution.session };
 }

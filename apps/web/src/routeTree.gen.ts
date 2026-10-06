@@ -14,43 +14,53 @@ import { Route as LangRouteImport } from './routes/$lang'
 import { Route as LangIndexRouteImport } from './routes/$lang/index'
 import { Route as LangAuthRouteImport } from './routes/$lang/_auth'
 import { Route as LangAdminRouteImport } from './routes/$lang/admin'
-import { Route as LangDeviceRouteImport } from './routes/$lang/device'
 import { Route as LangLoginRouteImport } from './routes/$lang/login'
 import { Route as LangMcpConsentRouteImport } from './routes/$lang/mcp-consent'
 import { Route as LangMcpLoginRouteImport } from './routes/$lang/mcp-login'
 import { Route as LangSignupRouteImport } from './routes/$lang/signup'
 import { Route as LangVerifyEmailRouteImport } from './routes/$lang/verify-email'
-import { Route as LangAuthDashboardRouteImport } from './routes/$lang/_auth/dashboard'
-import { Route as LangAuthSettingsRouteImport } from './routes/$lang/_auth/settings'
+import { Route as LangAuthAppRouteImport } from './routes/$lang/_auth/_app'
 import { Route as LangAdminIndexRouteImport } from './routes/$lang/admin/index'
-import { Route as LangAdminDevicesRouteImport } from './routes/$lang/admin/devices'
 import { Route as LangAdminObservabilityRouteImport } from './routes/$lang/admin/observability'
 import { Route as LangAdminSettingsRouteImport } from './routes/$lang/admin/settings'
 import { Route as LangAdminUsersRouteImport } from './routes/$lang/admin/users'
-import { Route as LangAuthDashboardIndexRouteImport } from './routes/$lang/_auth/dashboard/index'
-import { Route as LangAuthDashboardApiTokensRouteImport } from './routes/$lang/_auth/dashboard/api-tokens'
-import { Route as LangAuthDashboardChatTestRouteImport } from './routes/$lang/_auth/dashboard/chat-test'
-import { Route as LangAuthDashboardCliTokensRouteImport } from './routes/$lang/_auth/dashboard/cli-tokens'
-import { Route as LangAuthDashboardClisRouteImport } from './routes/$lang/_auth/dashboard/clis'
-import { Route as LangAuthDashboardCloudProvidersRouteImport } from './routes/$lang/_auth/dashboard/cloud-providers'
-import { Route as LangAuthDashboardDeploymentsRouteImport } from './routes/$lang/_auth/dashboard/deployments'
-import { Route as LangAuthDashboardPoolsRouteImport } from './routes/$lang/_auth/dashboard/pools'
-import { Route as LangAuthDashboardRequestLogRouteImport } from './routes/$lang/_auth/dashboard/request-log'
-import { Route as LangAuthDashboardRuntimesRouteImport } from './routes/$lang/_auth/dashboard/runtimes'
-import { Route as LangAuthDashboardTerminalsRouteImport } from './routes/$lang/_auth/dashboard/terminals'
-import { Route as LangAuthSettingsIndexRouteImport } from './routes/$lang/_auth/settings/index'
-import { Route as LangAuthSettingsMcpRouteImport } from './routes/$lang/_auth/settings/mcp'
-import { Route as LangAuthSettingsSecurityRouteImport } from './routes/$lang/_auth/settings/security'
-import { Route as LangAuthDashboardPoolsIndexRouteImport } from './routes/$lang/_auth/dashboard/pools/index'
-import { Route as LangAuthDashboardPoolsPoolIdRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId'
-import { Route as LangAuthDashboardPoolsNewRouteImport } from './routes/$lang/_auth/dashboard/pools/new'
-import { Route as LangAuthDashboardPoolsPoolIdIndexRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId/index'
-import { Route as LangAuthDashboardPoolsPoolIdFallbackRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId/fallback'
-import { Route as LangAuthDashboardPoolsPoolIdLimitsRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId/limits'
-import { Route as LangAuthDashboardPoolsPoolIdMediaRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId/media'
-import { Route as LangAuthDashboardPoolsPoolIdRoutingRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId/routing'
-import { Route as LangAuthDashboardPoolsPoolIdSettingsRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId/settings'
-import { Route as LangAuthDashboardPoolsPoolIdSharingRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId/sharing'
+import { Route as LangAuthAppAccessRouteImport } from './routes/$lang/_auth/_app/access'
+import { Route as LangAuthAppActivityRouteImport } from './routes/$lang/_auth/_app/activity'
+import { Route as LangAuthAppModelsRouteImport } from './routes/$lang/_auth/_app/models'
+import { Route as LangAuthAppOverviewRouteImport } from './routes/$lang/_auth/_app/overview'
+import { Route as LangAuthAppSettingsRouteImport } from './routes/$lang/_auth/_app/settings'
+import { Route as LangAuthAppTerminalsRouteImport } from './routes/$lang/_auth/_app/terminals'
+import { Route as LangAuthAppTestRouteImport } from './routes/$lang/_auth/_app/test'
+import { Route as LangAuthAppWelcomeRouteImport } from './routes/$lang/_auth/_app/welcome'
+import { Route as LangAuthAppAccessIndexRouteImport } from './routes/$lang/_auth/_app/access/index'
+import { Route as LangAuthAppAccessAgentsRouteImport } from './routes/$lang/_auth/_app/access/agents'
+import { Route as LangAuthAppAccessApiKeysRouteImport } from './routes/$lang/_auth/_app/access/api-keys'
+import { Route as LangAuthAppAccessContributionsRouteImport } from './routes/$lang/_auth/_app/access/contributions'
+import { Route as LangAuthAppAccessSharesRouteImport } from './routes/$lang/_auth/_app/access/shares'
+import { Route as LangAuthAppActivityIndexRouteImport } from './routes/$lang/_auth/_app/activity/index'
+import { Route as LangAuthAppActivityRequestsRouteImport } from './routes/$lang/_auth/_app/activity/requests'
+import { Route as LangAuthAppNodesIndexRouteImport } from './routes/$lang/_auth/_app/nodes/index'
+import { Route as LangAuthAppNodesNodeIdRouteImport } from './routes/$lang/_auth/_app/nodes/$nodeId'
+import { Route as LangAuthAppPoolsIndexRouteImport } from './routes/$lang/_auth/_app/pools/index'
+import { Route as LangAuthAppPoolsPoolIdRouteImport } from './routes/$lang/_auth/_app/pools/$poolId'
+import { Route as LangAuthAppProfilesIndexRouteImport } from './routes/$lang/_auth/_app/profiles/index'
+import { Route as LangAuthAppProfilesProfileIdRouteImport } from './routes/$lang/_auth/_app/profiles/$profileId'
+import { Route as LangAuthAppProvidersIndexRouteImport } from './routes/$lang/_auth/_app/providers/index'
+import { Route as LangAuthAppProvidersAccountIdRouteImport } from './routes/$lang/_auth/_app/providers/$accountId'
+import { Route as LangAuthAppRuntimesIndexRouteImport } from './routes/$lang/_auth/_app/runtimes/index'
+import { Route as LangAuthAppRuntimesRuntimeIdRouteImport } from './routes/$lang/_auth/_app/runtimes/$runtimeId'
+import { Route as LangAuthAppRuntimesNewRouteImport } from './routes/$lang/_auth/_app/runtimes/new'
+import { Route as LangAuthAppSettingsIndexRouteImport } from './routes/$lang/_auth/_app/settings/index'
+import { Route as LangAuthAppSettingsSecurityRouteImport } from './routes/$lang/_auth/_app/settings/security'
+import { Route as LangAuthAppPoolsPoolIdIndexRouteImport } from './routes/$lang/_auth/_app/pools/$poolId/index'
+import { Route as LangAuthAppPoolsPoolIdAdvancedRouteImport } from './routes/$lang/_auth/_app/pools/$poolId/advanced'
+import { Route as LangAuthAppPoolsPoolIdCloudRouteImport } from './routes/$lang/_auth/_app/pools/$poolId/cloud'
+import { Route as LangAuthAppPoolsPoolIdMediaRouteImport } from './routes/$lang/_auth/_app/pools/$poolId/media'
+import { Route as LangAuthAppPoolsPoolIdRoutingRouteImport } from './routes/$lang/_auth/_app/pools/$poolId/routing'
+import { Route as LangAuthAppPoolsPoolIdSharingRouteImport } from './routes/$lang/_auth/_app/pools/$poolId/sharing'
+import { Route as LangAuthAppRuntimesRuntimeIdIndexRouteImport } from './routes/$lang/_auth/_app/runtimes/$runtimeId/index'
+import { Route as LangAuthAppRuntimesRuntimeIdAdvancedRouteImport } from './routes/$lang/_auth/_app/runtimes/$runtimeId/advanced'
+import { Route as LangAuthAppRuntimesRuntimeIdDefinitionRouteImport } from './routes/$lang/_auth/_app/runtimes/$runtimeId/definition'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -74,11 +84,6 @@ const LangAuthRoute = LangAuthRouteImport.update({
 const LangAdminRoute = LangAdminRouteImport.update({
   id: '/admin',
   path: '/admin',
-  getParentRoute: () => LangRoute,
-} as any)
-const LangDeviceRoute = LangDeviceRouteImport.update({
-  id: '/device',
-  path: '/device',
   getParentRoute: () => LangRoute,
 } as any)
 const LangLoginRoute = LangLoginRouteImport.update({
@@ -106,24 +111,13 @@ const LangVerifyEmailRoute = LangVerifyEmailRouteImport.update({
   path: '/verify-email',
   getParentRoute: () => LangRoute,
 } as any)
-const LangAuthDashboardRoute = LangAuthDashboardRouteImport.update({
-  id: '/dashboard',
-  path: '/dashboard',
-  getParentRoute: () => LangAuthRoute,
-} as any)
-const LangAuthSettingsRoute = LangAuthSettingsRouteImport.update({
-  id: '/settings',
-  path: '/settings',
+const LangAuthAppRoute = LangAuthAppRouteImport.update({
+  id: '/_app',
   getParentRoute: () => LangAuthRoute,
 } as any)
 const LangAdminIndexRoute = LangAdminIndexRouteImport.update({
   id: '/',
   path: '/',
-  getParentRoute: () => LangAdminRoute,
-} as any)
-const LangAdminDevicesRoute = LangAdminDevicesRouteImport.update({
-  id: '/devices',
-  path: '/devices',
   getParentRoute: () => LangAdminRoute,
 } as any)
 const LangAdminObservabilityRoute = LangAdminObservabilityRouteImport.update({
@@ -141,225 +135,309 @@ const LangAdminUsersRoute = LangAdminUsersRouteImport.update({
   path: '/users',
   getParentRoute: () => LangAdminRoute,
 } as any)
-const LangAuthDashboardIndexRoute = LangAuthDashboardIndexRouteImport.update({
+const LangAuthAppAccessRoute = LangAuthAppAccessRouteImport.update({
+  id: '/access',
+  path: '/access',
+  getParentRoute: () => LangAuthAppRoute,
+} as any)
+const LangAuthAppActivityRoute = LangAuthAppActivityRouteImport.update({
+  id: '/activity',
+  path: '/activity',
+  getParentRoute: () => LangAuthAppRoute,
+} as any)
+const LangAuthAppModelsRoute = LangAuthAppModelsRouteImport.update({
+  id: '/models',
+  path: '/models',
+  getParentRoute: () => LangAuthAppRoute,
+} as any)
+const LangAuthAppOverviewRoute = LangAuthAppOverviewRouteImport.update({
+  id: '/overview',
+  path: '/overview',
+  getParentRoute: () => LangAuthAppRoute,
+} as any)
+const LangAuthAppSettingsRoute = LangAuthAppSettingsRouteImport.update({
+  id: '/settings',
+  path: '/settings',
+  getParentRoute: () => LangAuthAppRoute,
+} as any)
+const LangAuthAppTerminalsRoute = LangAuthAppTerminalsRouteImport.update({
+  id: '/terminals',
+  path: '/terminals',
+  getParentRoute: () => LangAuthAppRoute,
+} as any)
+const LangAuthAppTestRoute = LangAuthAppTestRouteImport.update({
+  id: '/test',
+  path: '/test',
+  getParentRoute: () => LangAuthAppRoute,
+} as any)
+const LangAuthAppWelcomeRoute = LangAuthAppWelcomeRouteImport.update({
+  id: '/welcome',
+  path: '/welcome',
+  getParentRoute: () => LangAuthAppRoute,
+} as any)
+const LangAuthAppAccessIndexRoute = LangAuthAppAccessIndexRouteImport.update({
   id: '/',
   path: '/',
-  getParentRoute: () => LangAuthDashboardRoute,
+  getParentRoute: () => LangAuthAppAccessRoute,
 } as any)
-const LangAuthDashboardApiTokensRoute =
-  LangAuthDashboardApiTokensRouteImport.update({
-    id: '/api-tokens',
-    path: '/api-tokens',
-    getParentRoute: () => LangAuthDashboardRoute,
-  } as any)
-const LangAuthDashboardChatTestRoute =
-  LangAuthDashboardChatTestRouteImport.update({
-    id: '/chat-test',
-    path: '/chat-test',
-    getParentRoute: () => LangAuthDashboardRoute,
-  } as any)
-const LangAuthDashboardCliTokensRoute =
-  LangAuthDashboardCliTokensRouteImport.update({
-    id: '/cli-tokens',
-    path: '/cli-tokens',
-    getParentRoute: () => LangAuthDashboardRoute,
-  } as any)
-const LangAuthDashboardClisRoute = LangAuthDashboardClisRouteImport.update({
-  id: '/clis',
-  path: '/clis',
-  getParentRoute: () => LangAuthDashboardRoute,
+const LangAuthAppAccessAgentsRoute = LangAuthAppAccessAgentsRouteImport.update({
+  id: '/agents',
+  path: '/agents',
+  getParentRoute: () => LangAuthAppAccessRoute,
 } as any)
-const LangAuthDashboardCloudProvidersRoute =
-  LangAuthDashboardCloudProvidersRouteImport.update({
-    id: '/cloud-providers',
-    path: '/cloud-providers',
-    getParentRoute: () => LangAuthDashboardRoute,
+const LangAuthAppAccessApiKeysRoute =
+  LangAuthAppAccessApiKeysRouteImport.update({
+    id: '/api-keys',
+    path: '/api-keys',
+    getParentRoute: () => LangAuthAppAccessRoute,
   } as any)
-const LangAuthDashboardDeploymentsRoute =
-  LangAuthDashboardDeploymentsRouteImport.update({
-    id: '/deployments',
-    path: '/deployments',
-    getParentRoute: () => LangAuthDashboardRoute,
+const LangAuthAppAccessContributionsRoute =
+  LangAuthAppAccessContributionsRouteImport.update({
+    id: '/contributions',
+    path: '/contributions',
+    getParentRoute: () => LangAuthAppAccessRoute,
   } as any)
-const LangAuthDashboardPoolsRoute = LangAuthDashboardPoolsRouteImport.update({
-  id: '/pools',
-  path: '/pools',
-  getParentRoute: () => LangAuthDashboardRoute,
+const LangAuthAppAccessSharesRoute = LangAuthAppAccessSharesRouteImport.update({
+  id: '/shares',
+  path: '/shares',
+  getParentRoute: () => LangAuthAppAccessRoute,
 } as any)
-const LangAuthDashboardRequestLogRoute =
-  LangAuthDashboardRequestLogRouteImport.update({
-    id: '/request-log',
-    path: '/request-log',
-    getParentRoute: () => LangAuthDashboardRoute,
+const LangAuthAppActivityIndexRoute =
+  LangAuthAppActivityIndexRouteImport.update({
+    id: '/',
+    path: '/',
+    getParentRoute: () => LangAuthAppActivityRoute,
   } as any)
-const LangAuthDashboardRuntimesRoute =
-  LangAuthDashboardRuntimesRouteImport.update({
-    id: '/runtimes',
-    path: '/runtimes',
-    getParentRoute: () => LangAuthDashboardRoute,
+const LangAuthAppActivityRequestsRoute =
+  LangAuthAppActivityRequestsRouteImport.update({
+    id: '/requests',
+    path: '/requests',
+    getParentRoute: () => LangAuthAppActivityRoute,
   } as any)
-const LangAuthDashboardTerminalsRoute =
-  LangAuthDashboardTerminalsRouteImport.update({
-    id: '/terminals',
-    path: '/terminals',
-    getParentRoute: () => LangAuthDashboardRoute,
-  } as any)
-const LangAuthSettingsIndexRoute = LangAuthSettingsIndexRouteImport.update({
-  id: '/',
-  path: '/',
-  getParentRoute: () => LangAuthSettingsRoute,
+const LangAuthAppNodesIndexRoute = LangAuthAppNodesIndexRouteImport.update({
+  id: '/nodes/',
+  path: '/nodes/',
+  getParentRoute: () => LangAuthAppRoute,
 } as any)
-const LangAuthSettingsMcpRoute = LangAuthSettingsMcpRouteImport.update({
-  id: '/mcp',
-  path: '/mcp',
-  getParentRoute: () => LangAuthSettingsRoute,
+const LangAuthAppNodesNodeIdRoute = LangAuthAppNodesNodeIdRouteImport.update({
+  id: '/nodes/$nodeId',
+  path: '/nodes/$nodeId',
+  getParentRoute: () => LangAuthAppRoute,
 } as any)
-const LangAuthSettingsSecurityRoute =
-  LangAuthSettingsSecurityRouteImport.update({
+const LangAuthAppPoolsIndexRoute = LangAuthAppPoolsIndexRouteImport.update({
+  id: '/pools/',
+  path: '/pools/',
+  getParentRoute: () => LangAuthAppRoute,
+} as any)
+const LangAuthAppPoolsPoolIdRoute = LangAuthAppPoolsPoolIdRouteImport.update({
+  id: '/pools/$poolId',
+  path: '/pools/$poolId',
+  getParentRoute: () => LangAuthAppRoute,
+} as any)
+const LangAuthAppProfilesIndexRoute =
+  LangAuthAppProfilesIndexRouteImport.update({
+    id: '/profiles/',
+    path: '/profiles/',
+    getParentRoute: () => LangAuthAppRoute,
+  } as any)
+const LangAuthAppProfilesProfileIdRoute =
+  LangAuthAppProfilesProfileIdRouteImport.update({
+    id: '/profiles/$profileId',
+    path: '/profiles/$profileId',
+    getParentRoute: () => LangAuthAppRoute,
+  } as any)
+const LangAuthAppProvidersIndexRoute =
+  LangAuthAppProvidersIndexRouteImport.update({
+    id: '/providers/',
+    path: '/providers/',
+    getParentRoute: () => LangAuthAppRoute,
+  } as any)
+const LangAuthAppProvidersAccountIdRoute =
+  LangAuthAppProvidersAccountIdRouteImport.update({
+    id: '/providers/$accountId',
+    path: '/providers/$accountId',
+    getParentRoute: () => LangAuthAppRoute,
+  } as any)
+const LangAuthAppRuntimesIndexRoute =
+  LangAuthAppRuntimesIndexRouteImport.update({
+    id: '/runtimes/',
+    path: '/runtimes/',
+    getParentRoute: () => LangAuthAppRoute,
+  } as any)
+const LangAuthAppRuntimesRuntimeIdRoute =
+  LangAuthAppRuntimesRuntimeIdRouteImport.update({
+    id: '/runtimes/$runtimeId',
+    path: '/runtimes/$runtimeId',
+    getParentRoute: () => LangAuthAppRoute,
+  } as any)
+const LangAuthAppRuntimesNewRoute = LangAuthAppRuntimesNewRouteImport.update({
+  id: '/runtimes/new',
+  path: '/runtimes/new',
+  getParentRoute: () => LangAuthAppRoute,
+} as any)
+const LangAuthAppSettingsIndexRoute =
+  LangAuthAppSettingsIndexRouteImport.update({
+    id: '/',
+    path: '/',
+    getParentRoute: () => LangAuthAppSettingsRoute,
+  } as any)
+const LangAuthAppSettingsSecurityRoute =
+  LangAuthAppSettingsSecurityRouteImport.update({
     id: '/security',
     path: '/security',
-    getParentRoute: () => LangAuthSettingsRoute,
+    getParentRoute: () => LangAuthAppSettingsRoute,
   } as any)
-const LangAuthDashboardPoolsIndexRoute =
-  LangAuthDashboardPoolsIndexRouteImport.update({
+const LangAuthAppPoolsPoolIdIndexRoute =
+  LangAuthAppPoolsPoolIdIndexRouteImport.update({
     id: '/',
     path: '/',
-    getParentRoute: () => LangAuthDashboardPoolsRoute,
+    getParentRoute: () => LangAuthAppPoolsPoolIdRoute,
   } as any)
-const LangAuthDashboardPoolsPoolIdRoute =
-  LangAuthDashboardPoolsPoolIdRouteImport.update({
-    id: '/$poolId',
-    path: '/$poolId',
-    getParentRoute: () => LangAuthDashboardPoolsRoute,
+const LangAuthAppPoolsPoolIdAdvancedRoute =
+  LangAuthAppPoolsPoolIdAdvancedRouteImport.update({
+    id: '/advanced',
+    path: '/advanced',
+    getParentRoute: () => LangAuthAppPoolsPoolIdRoute,
   } as any)
-const LangAuthDashboardPoolsNewRoute =
-  LangAuthDashboardPoolsNewRouteImport.update({
-    id: '/new',
-    path: '/new',
-    getParentRoute: () => LangAuthDashboardPoolsRoute,
+const LangAuthAppPoolsPoolIdCloudRoute =
+  LangAuthAppPoolsPoolIdCloudRouteImport.update({
+    id: '/cloud',
+    path: '/cloud',
+    getParentRoute: () => LangAuthAppPoolsPoolIdRoute,
   } as any)
-const LangAuthDashboardPoolsPoolIdIndexRoute =
-  LangAuthDashboardPoolsPoolIdIndexRouteImport.update({
-    id: '/',
-    path: '/',
-    getParentRoute: () => LangAuthDashboardPoolsPoolIdRoute,
-  } as any)
-const LangAuthDashboardPoolsPoolIdFallbackRoute =
-  LangAuthDashboardPoolsPoolIdFallbackRouteImport.update({
-    id: '/fallback',
-    path: '/fallback',
-    getParentRoute: () => LangAuthDashboardPoolsPoolIdRoute,
-  } as any)
-const LangAuthDashboardPoolsPoolIdLimitsRoute =
-  LangAuthDashboardPoolsPoolIdLimitsRouteImport.update({
-    id: '/limits',
-    path: '/limits',
-    getParentRoute: () => LangAuthDashboardPoolsPoolIdRoute,
-  } as any)
-const LangAuthDashboardPoolsPoolIdMediaRoute =
-  LangAuthDashboardPoolsPoolIdMediaRouteImport.update({
+const LangAuthAppPoolsPoolIdMediaRoute =
+  LangAuthAppPoolsPoolIdMediaRouteImport.update({
     id: '/media',
     path: '/media',
-    getParentRoute: () => LangAuthDashboardPoolsPoolIdRoute,
+    getParentRoute: () => LangAuthAppPoolsPoolIdRoute,
   } as any)
-const LangAuthDashboardPoolsPoolIdRoutingRoute =
-  LangAuthDashboardPoolsPoolIdRoutingRouteImport.update({
+const LangAuthAppPoolsPoolIdRoutingRoute =
+  LangAuthAppPoolsPoolIdRoutingRouteImport.update({
     id: '/routing',
     path: '/routing',
-    getParentRoute: () => LangAuthDashboardPoolsPoolIdRoute,
+    getParentRoute: () => LangAuthAppPoolsPoolIdRoute,
   } as any)
-const LangAuthDashboardPoolsPoolIdSettingsRoute =
-  LangAuthDashboardPoolsPoolIdSettingsRouteImport.update({
-    id: '/settings',
-    path: '/settings',
-    getParentRoute: () => LangAuthDashboardPoolsPoolIdRoute,
-  } as any)
-const LangAuthDashboardPoolsPoolIdSharingRoute =
-  LangAuthDashboardPoolsPoolIdSharingRouteImport.update({
+const LangAuthAppPoolsPoolIdSharingRoute =
+  LangAuthAppPoolsPoolIdSharingRouteImport.update({
     id: '/sharing',
     path: '/sharing',
-    getParentRoute: () => LangAuthDashboardPoolsPoolIdRoute,
+    getParentRoute: () => LangAuthAppPoolsPoolIdRoute,
+  } as any)
+const LangAuthAppRuntimesRuntimeIdIndexRoute =
+  LangAuthAppRuntimesRuntimeIdIndexRouteImport.update({
+    id: '/',
+    path: '/',
+    getParentRoute: () => LangAuthAppRuntimesRuntimeIdRoute,
+  } as any)
+const LangAuthAppRuntimesRuntimeIdAdvancedRoute =
+  LangAuthAppRuntimesRuntimeIdAdvancedRouteImport.update({
+    id: '/advanced',
+    path: '/advanced',
+    getParentRoute: () => LangAuthAppRuntimesRuntimeIdRoute,
+  } as any)
+const LangAuthAppRuntimesRuntimeIdDefinitionRoute =
+  LangAuthAppRuntimesRuntimeIdDefinitionRouteImport.update({
+    id: '/definition',
+    path: '/definition',
+    getParentRoute: () => LangAuthAppRuntimesRuntimeIdRoute,
   } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/$lang': typeof LangRouteWithChildren
   '/$lang/admin': typeof LangAdminRouteWithChildren
-  '/$lang/device': typeof LangDeviceRoute
   '/$lang/login': typeof LangLoginRoute
   '/$lang/mcp-consent': typeof LangMcpConsentRoute
   '/$lang/mcp-login': typeof LangMcpLoginRoute
   '/$lang/signup': typeof LangSignupRoute
   '/$lang/verify-email': typeof LangVerifyEmailRoute
   '/$lang/': typeof LangIndexRoute
-  '/$lang/dashboard': typeof LangAuthDashboardRouteWithChildren
-  '/$lang/settings': typeof LangAuthSettingsRouteWithChildren
-  '/$lang/admin/devices': typeof LangAdminDevicesRoute
   '/$lang/admin/observability': typeof LangAdminObservabilityRoute
   '/$lang/admin/settings': typeof LangAdminSettingsRoute
   '/$lang/admin/users': typeof LangAdminUsersRoute
   '/$lang/admin/': typeof LangAdminIndexRoute
-  '/$lang/dashboard/api-tokens': typeof LangAuthDashboardApiTokensRoute
-  '/$lang/dashboard/chat-test': typeof LangAuthDashboardChatTestRoute
-  '/$lang/dashboard/cli-tokens': typeof LangAuthDashboardCliTokensRoute
-  '/$lang/dashboard/clis': typeof LangAuthDashboardClisRoute
-  '/$lang/dashboard/cloud-providers': typeof LangAuthDashboardCloudProvidersRoute
-  '/$lang/dashboard/deployments': typeof LangAuthDashboardDeploymentsRoute
-  '/$lang/dashboard/pools': typeof LangAuthDashboardPoolsRouteWithChildren
-  '/$lang/dashboard/request-log': typeof LangAuthDashboardRequestLogRoute
-  '/$lang/dashboard/runtimes': typeof LangAuthDashboardRuntimesRoute
-  '/$lang/dashboard/terminals': typeof LangAuthDashboardTerminalsRoute
-  '/$lang/settings/mcp': typeof LangAuthSettingsMcpRoute
-  '/$lang/settings/security': typeof LangAuthSettingsSecurityRoute
-  '/$lang/dashboard/': typeof LangAuthDashboardIndexRoute
-  '/$lang/settings/': typeof LangAuthSettingsIndexRoute
-  '/$lang/dashboard/pools/$poolId': typeof LangAuthDashboardPoolsPoolIdRouteWithChildren
-  '/$lang/dashboard/pools/new': typeof LangAuthDashboardPoolsNewRoute
-  '/$lang/dashboard/pools/': typeof LangAuthDashboardPoolsIndexRoute
-  '/$lang/dashboard/pools/$poolId/fallback': typeof LangAuthDashboardPoolsPoolIdFallbackRoute
-  '/$lang/dashboard/pools/$poolId/limits': typeof LangAuthDashboardPoolsPoolIdLimitsRoute
-  '/$lang/dashboard/pools/$poolId/media': typeof LangAuthDashboardPoolsPoolIdMediaRoute
-  '/$lang/dashboard/pools/$poolId/routing': typeof LangAuthDashboardPoolsPoolIdRoutingRoute
-  '/$lang/dashboard/pools/$poolId/settings': typeof LangAuthDashboardPoolsPoolIdSettingsRoute
-  '/$lang/dashboard/pools/$poolId/sharing': typeof LangAuthDashboardPoolsPoolIdSharingRoute
-  '/$lang/dashboard/pools/$poolId/': typeof LangAuthDashboardPoolsPoolIdIndexRoute
+  '/$lang/access': typeof LangAuthAppAccessRouteWithChildren
+  '/$lang/activity': typeof LangAuthAppActivityRouteWithChildren
+  '/$lang/models': typeof LangAuthAppModelsRoute
+  '/$lang/overview': typeof LangAuthAppOverviewRoute
+  '/$lang/settings': typeof LangAuthAppSettingsRouteWithChildren
+  '/$lang/terminals': typeof LangAuthAppTerminalsRoute
+  '/$lang/test': typeof LangAuthAppTestRoute
+  '/$lang/welcome': typeof LangAuthAppWelcomeRoute
+  '/$lang/access/agents': typeof LangAuthAppAccessAgentsRoute
+  '/$lang/access/api-keys': typeof LangAuthAppAccessApiKeysRoute
+  '/$lang/access/contributions': typeof LangAuthAppAccessContributionsRoute
+  '/$lang/access/shares': typeof LangAuthAppAccessSharesRoute
+  '/$lang/activity/requests': typeof LangAuthAppActivityRequestsRoute
+  '/$lang/nodes/$nodeId': typeof LangAuthAppNodesNodeIdRoute
+  '/$lang/pools/$poolId': typeof LangAuthAppPoolsPoolIdRouteWithChildren
+  '/$lang/profiles/$profileId': typeof LangAuthAppProfilesProfileIdRoute
+  '/$lang/providers/$accountId': typeof LangAuthAppProvidersAccountIdRoute
+  '/$lang/runtimes/$runtimeId': typeof LangAuthAppRuntimesRuntimeIdRouteWithChildren
+  '/$lang/runtimes/new': typeof LangAuthAppRuntimesNewRoute
+  '/$lang/settings/security': typeof LangAuthAppSettingsSecurityRoute
+  '/$lang/access/': typeof LangAuthAppAccessIndexRoute
+  '/$lang/activity/': typeof LangAuthAppActivityIndexRoute
+  '/$lang/nodes/': typeof LangAuthAppNodesIndexRoute
+  '/$lang/pools/': typeof LangAuthAppPoolsIndexRoute
+  '/$lang/profiles/': typeof LangAuthAppProfilesIndexRoute
+  '/$lang/providers/': typeof LangAuthAppProvidersIndexRoute
+  '/$lang/runtimes/': typeof LangAuthAppRuntimesIndexRoute
+  '/$lang/settings/': typeof LangAuthAppSettingsIndexRoute
+  '/$lang/pools/$poolId/advanced': typeof LangAuthAppPoolsPoolIdAdvancedRoute
+  '/$lang/pools/$poolId/cloud': typeof LangAuthAppPoolsPoolIdCloudRoute
+  '/$lang/pools/$poolId/media': typeof LangAuthAppPoolsPoolIdMediaRoute
+  '/$lang/pools/$poolId/routing': typeof LangAuthAppPoolsPoolIdRoutingRoute
+  '/$lang/pools/$poolId/sharing': typeof LangAuthAppPoolsPoolIdSharingRoute
+  '/$lang/runtimes/$runtimeId/advanced': typeof LangAuthAppRuntimesRuntimeIdAdvancedRoute
+  '/$lang/runtimes/$runtimeId/definition': typeof LangAuthAppRuntimesRuntimeIdDefinitionRoute
+  '/$lang/pools/$poolId/': typeof LangAuthAppPoolsPoolIdIndexRoute
+  '/$lang/runtimes/$runtimeId/': typeof LangAuthAppRuntimesRuntimeIdIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/$lang': typeof LangIndexRoute
-  '/$lang/device': typeof LangDeviceRoute
   '/$lang/login': typeof LangLoginRoute
   '/$lang/mcp-consent': typeof LangMcpConsentRoute
   '/$lang/mcp-login': typeof LangMcpLoginRoute
   '/$lang/signup': typeof LangSignupRoute
   '/$lang/verify-email': typeof LangVerifyEmailRoute
-  '/$lang/admin/devices': typeof LangAdminDevicesRoute
   '/$lang/admin/observability': typeof LangAdminObservabilityRoute
   '/$lang/admin/settings': typeof LangAdminSettingsRoute
   '/$lang/admin/users': typeof LangAdminUsersRoute
   '/$lang/admin': typeof LangAdminIndexRoute
-  '/$lang/dashboard/api-tokens': typeof LangAuthDashboardApiTokensRoute
-  '/$lang/dashboard/chat-test': typeof LangAuthDashboardChatTestRoute
-  '/$lang/dashboard/cli-tokens': typeof LangAuthDashboardCliTokensRoute
-  '/$lang/dashboard/clis': typeof LangAuthDashboardClisRoute
-  '/$lang/dashboard/cloud-providers': typeof LangAuthDashboardCloudProvidersRoute
-  '/$lang/dashboard/deployments': typeof LangAuthDashboardDeploymentsRoute
-  '/$lang/dashboard/request-log': typeof LangAuthDashboardRequestLogRoute
-  '/$lang/dashboard/runtimes': typeof LangAuthDashboardRuntimesRoute
-  '/$lang/dashboard/terminals': typeof LangAuthDashboardTerminalsRoute
-  '/$lang/settings/mcp': typeof LangAuthSettingsMcpRoute
-  '/$lang/settings/security': typeof LangAuthSettingsSecurityRoute
-  '/$lang/dashboard': typeof LangAuthDashboardIndexRoute
-  '/$lang/settings': typeof LangAuthSettingsIndexRoute
-  '/$lang/dashboard/pools/new': typeof LangAuthDashboardPoolsNewRoute
-  '/$lang/dashboard/pools': typeof LangAuthDashboardPoolsIndexRoute
-  '/$lang/dashboard/pools/$poolId/fallback': typeof LangAuthDashboardPoolsPoolIdFallbackRoute
-  '/$lang/dashboard/pools/$poolId/limits': typeof LangAuthDashboardPoolsPoolIdLimitsRoute
-  '/$lang/dashboard/pools/$poolId/media': typeof LangAuthDashboardPoolsPoolIdMediaRoute
-  '/$lang/dashboard/pools/$poolId/routing': typeof LangAuthDashboardPoolsPoolIdRoutingRoute
-  '/$lang/dashboard/pools/$poolId/settings': typeof LangAuthDashboardPoolsPoolIdSettingsRoute
-  '/$lang/dashboard/pools/$poolId/sharing': typeof LangAuthDashboardPoolsPoolIdSharingRoute
-  '/$lang/dashboard/pools/$poolId': typeof LangAuthDashboardPoolsPoolIdIndexRoute
+  '/$lang/models': typeof LangAuthAppModelsRoute
+  '/$lang/overview': typeof LangAuthAppOverviewRoute
+  '/$lang/terminals': typeof LangAuthAppTerminalsRoute
+  '/$lang/test': typeof LangAuthAppTestRoute
+  '/$lang/welcome': typeof LangAuthAppWelcomeRoute
+  '/$lang/access/agents': typeof LangAuthAppAccessAgentsRoute
+  '/$lang/access/api-keys': typeof LangAuthAppAccessApiKeysRoute
+  '/$lang/access/contributions': typeof LangAuthAppAccessContributionsRoute
+  '/$lang/access/shares': typeof LangAuthAppAccessSharesRoute
+  '/$lang/activity/requests': typeof LangAuthAppActivityRequestsRoute
+  '/$lang/nodes/$nodeId': typeof LangAuthAppNodesNodeIdRoute
+  '/$lang/profiles/$profileId': typeof LangAuthAppProfilesProfileIdRoute
+  '/$lang/providers/$accountId': typeof LangAuthAppProvidersAccountIdRoute
+  '/$lang/runtimes/new': typeof LangAuthAppRuntimesNewRoute
+  '/$lang/settings/security': typeof LangAuthAppSettingsSecurityRoute
+  '/$lang/access': typeof LangAuthAppAccessIndexRoute
+  '/$lang/activity': typeof LangAuthAppActivityIndexRoute
+  '/$lang/nodes': typeof LangAuthAppNodesIndexRoute
+  '/$lang/pools': typeof LangAuthAppPoolsIndexRoute
+  '/$lang/profiles': typeof LangAuthAppProfilesIndexRoute
+  '/$lang/providers': typeof LangAuthAppProvidersIndexRoute
+  '/$lang/runtimes': typeof LangAuthAppRuntimesIndexRoute
+  '/$lang/settings': typeof LangAuthAppSettingsIndexRoute
+  '/$lang/pools/$poolId/advanced': typeof LangAuthAppPoolsPoolIdAdvancedRoute
+  '/$lang/pools/$poolId/cloud': typeof LangAuthAppPoolsPoolIdCloudRoute
+  '/$lang/pools/$poolId/media': typeof LangAuthAppPoolsPoolIdMediaRoute
+  '/$lang/pools/$poolId/routing': typeof LangAuthAppPoolsPoolIdRoutingRoute
+  '/$lang/pools/$poolId/sharing': typeof LangAuthAppPoolsPoolIdSharingRoute
+  '/$lang/runtimes/$runtimeId/advanced': typeof LangAuthAppRuntimesRuntimeIdAdvancedRoute
+  '/$lang/runtimes/$runtimeId/definition': typeof LangAuthAppRuntimesRuntimeIdDefinitionRoute
+  '/$lang/pools/$poolId': typeof LangAuthAppPoolsPoolIdIndexRoute
+  '/$lang/runtimes/$runtimeId': typeof LangAuthAppRuntimesRuntimeIdIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -367,44 +445,54 @@ export interface FileRoutesById {
   '/$lang': typeof LangRouteWithChildren
   '/$lang/_auth': typeof LangAuthRouteWithChildren
   '/$lang/admin': typeof LangAdminRouteWithChildren
-  '/$lang/device': typeof LangDeviceRoute
   '/$lang/login': typeof LangLoginRoute
   '/$lang/mcp-consent': typeof LangMcpConsentRoute
   '/$lang/mcp-login': typeof LangMcpLoginRoute
   '/$lang/signup': typeof LangSignupRoute
   '/$lang/verify-email': typeof LangVerifyEmailRoute
   '/$lang/': typeof LangIndexRoute
-  '/$lang/_auth/dashboard': typeof LangAuthDashboardRouteWithChildren
-  '/$lang/_auth/settings': typeof LangAuthSettingsRouteWithChildren
-  '/$lang/admin/devices': typeof LangAdminDevicesRoute
+  '/$lang/_auth/_app': typeof LangAuthAppRouteWithChildren
   '/$lang/admin/observability': typeof LangAdminObservabilityRoute
   '/$lang/admin/settings': typeof LangAdminSettingsRoute
   '/$lang/admin/users': typeof LangAdminUsersRoute
   '/$lang/admin/': typeof LangAdminIndexRoute
-  '/$lang/_auth/dashboard/api-tokens': typeof LangAuthDashboardApiTokensRoute
-  '/$lang/_auth/dashboard/chat-test': typeof LangAuthDashboardChatTestRoute
-  '/$lang/_auth/dashboard/cli-tokens': typeof LangAuthDashboardCliTokensRoute
-  '/$lang/_auth/dashboard/clis': typeof LangAuthDashboardClisRoute
-  '/$lang/_auth/dashboard/cloud-providers': typeof LangAuthDashboardCloudProvidersRoute
-  '/$lang/_auth/dashboard/deployments': typeof LangAuthDashboardDeploymentsRoute
-  '/$lang/_auth/dashboard/pools': typeof LangAuthDashboardPoolsRouteWithChildren
-  '/$lang/_auth/dashboard/request-log': typeof LangAuthDashboardRequestLogRoute
-  '/$lang/_auth/dashboard/runtimes': typeof LangAuthDashboardRuntimesRoute
-  '/$lang/_auth/dashboard/terminals': typeof LangAuthDashboardTerminalsRoute
-  '/$lang/_auth/settings/mcp': typeof LangAuthSettingsMcpRoute
-  '/$lang/_auth/settings/security': typeof LangAuthSettingsSecurityRoute
-  '/$lang/_auth/dashboard/': typeof LangAuthDashboardIndexRoute
-  '/$lang/_auth/settings/': typeof LangAuthSettingsIndexRoute
-  '/$lang/_auth/dashboard/pools/$poolId': typeof LangAuthDashboardPoolsPoolIdRouteWithChildren
-  '/$lang/_auth/dashboard/pools/new': typeof LangAuthDashboardPoolsNewRoute
-  '/$lang/_auth/dashboard/pools/': typeof LangAuthDashboardPoolsIndexRoute
-  '/$lang/_auth/dashboard/pools/$poolId/fallback': typeof LangAuthDashboardPoolsPoolIdFallbackRoute
-  '/$lang/_auth/dashboard/pools/$poolId/limits': typeof LangAuthDashboardPoolsPoolIdLimitsRoute
-  '/$lang/_auth/dashboard/pools/$poolId/media': typeof LangAuthDashboardPoolsPoolIdMediaRoute
-  '/$lang/_auth/dashboard/pools/$poolId/routing': typeof LangAuthDashboardPoolsPoolIdRoutingRoute
-  '/$lang/_auth/dashboard/pools/$poolId/settings': typeof LangAuthDashboardPoolsPoolIdSettingsRoute
-  '/$lang/_auth/dashboard/pools/$poolId/sharing': typeof LangAuthDashboardPoolsPoolIdSharingRoute
-  '/$lang/_auth/dashboard/pools/$poolId/': typeof LangAuthDashboardPoolsPoolIdIndexRoute
+  '/$lang/_auth/_app/access': typeof LangAuthAppAccessRouteWithChildren
+  '/$lang/_auth/_app/activity': typeof LangAuthAppActivityRouteWithChildren
+  '/$lang/_auth/_app/models': typeof LangAuthAppModelsRoute
+  '/$lang/_auth/_app/overview': typeof LangAuthAppOverviewRoute
+  '/$lang/_auth/_app/settings': typeof LangAuthAppSettingsRouteWithChildren
+  '/$lang/_auth/_app/terminals': typeof LangAuthAppTerminalsRoute
+  '/$lang/_auth/_app/test': typeof LangAuthAppTestRoute
+  '/$lang/_auth/_app/welcome': typeof LangAuthAppWelcomeRoute
+  '/$lang/_auth/_app/access/agents': typeof LangAuthAppAccessAgentsRoute
+  '/$lang/_auth/_app/access/api-keys': typeof LangAuthAppAccessApiKeysRoute
+  '/$lang/_auth/_app/access/contributions': typeof LangAuthAppAccessContributionsRoute
+  '/$lang/_auth/_app/access/shares': typeof LangAuthAppAccessSharesRoute
+  '/$lang/_auth/_app/activity/requests': typeof LangAuthAppActivityRequestsRoute
+  '/$lang/_auth/_app/nodes/$nodeId': typeof LangAuthAppNodesNodeIdRoute
+  '/$lang/_auth/_app/pools/$poolId': typeof LangAuthAppPoolsPoolIdRouteWithChildren
+  '/$lang/_auth/_app/profiles/$profileId': typeof LangAuthAppProfilesProfileIdRoute
+  '/$lang/_auth/_app/providers/$accountId': typeof LangAuthAppProvidersAccountIdRoute
+  '/$lang/_auth/_app/runtimes/$runtimeId': typeof LangAuthAppRuntimesRuntimeIdRouteWithChildren
+  '/$lang/_auth/_app/runtimes/new': typeof LangAuthAppRuntimesNewRoute
+  '/$lang/_auth/_app/settings/security': typeof LangAuthAppSettingsSecurityRoute
+  '/$lang/_auth/_app/access/': typeof LangAuthAppAccessIndexRoute
+  '/$lang/_auth/_app/activity/': typeof LangAuthAppActivityIndexRoute
+  '/$lang/_auth/_app/nodes/': typeof LangAuthAppNodesIndexRoute
+  '/$lang/_auth/_app/pools/': typeof LangAuthAppPoolsIndexRoute
+  '/$lang/_auth/_app/profiles/': typeof LangAuthAppProfilesIndexRoute
+  '/$lang/_auth/_app/providers/': typeof LangAuthAppProvidersIndexRoute
+  '/$lang/_auth/_app/runtimes/': typeof LangAuthAppRuntimesIndexRoute
+  '/$lang/_auth/_app/settings/': typeof LangAuthAppSettingsIndexRoute
+  '/$lang/_auth/_app/pools/$poolId/advanced': typeof LangAuthAppPoolsPoolIdAdvancedRoute
+  '/$lang/_auth/_app/pools/$poolId/cloud': typeof LangAuthAppPoolsPoolIdCloudRoute
+  '/$lang/_auth/_app/pools/$poolId/media': typeof LangAuthAppPoolsPoolIdMediaRoute
+  '/$lang/_auth/_app/pools/$poolId/routing': typeof LangAuthAppPoolsPoolIdRoutingRoute
+  '/$lang/_auth/_app/pools/$poolId/sharing': typeof LangAuthAppPoolsPoolIdSharingRoute
+  '/$lang/_auth/_app/runtimes/$runtimeId/advanced': typeof LangAuthAppRuntimesRuntimeIdAdvancedRoute
+  '/$lang/_auth/_app/runtimes/$runtimeId/definition': typeof LangAuthAppRuntimesRuntimeIdDefinitionRoute
+  '/$lang/_auth/_app/pools/$poolId/': typeof LangAuthAppPoolsPoolIdIndexRoute
+  '/$lang/_auth/_app/runtimes/$runtimeId/': typeof LangAuthAppRuntimesRuntimeIdIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -412,125 +500,152 @@ export interface FileRouteTypes {
     | '/'
     | '/$lang'
     | '/$lang/admin'
-    | '/$lang/device'
     | '/$lang/login'
     | '/$lang/mcp-consent'
     | '/$lang/mcp-login'
     | '/$lang/signup'
     | '/$lang/verify-email'
     | '/$lang/'
-    | '/$lang/dashboard'
-    | '/$lang/settings'
-    | '/$lang/admin/devices'
     | '/$lang/admin/observability'
     | '/$lang/admin/settings'
     | '/$lang/admin/users'
     | '/$lang/admin/'
-    | '/$lang/dashboard/api-tokens'
-    | '/$lang/dashboard/chat-test'
-    | '/$lang/dashboard/cli-tokens'
-    | '/$lang/dashboard/clis'
-    | '/$lang/dashboard/cloud-providers'
-    | '/$lang/dashboard/deployments'
-    | '/$lang/dashboard/pools'
-    | '/$lang/dashboard/request-log'
-    | '/$lang/dashboard/runtimes'
-    | '/$lang/dashboard/terminals'
-    | '/$lang/settings/mcp'
+    | '/$lang/access'
+    | '/$lang/activity'
+    | '/$lang/models'
+    | '/$lang/overview'
+    | '/$lang/settings'
+    | '/$lang/terminals'
+    | '/$lang/test'
+    | '/$lang/welcome'
+    | '/$lang/access/agents'
+    | '/$lang/access/api-keys'
+    | '/$lang/access/contributions'
+    | '/$lang/access/shares'
+    | '/$lang/activity/requests'
+    | '/$lang/nodes/$nodeId'
+    | '/$lang/pools/$poolId'
+    | '/$lang/profiles/$profileId'
+    | '/$lang/providers/$accountId'
+    | '/$lang/runtimes/$runtimeId'
+    | '/$lang/runtimes/new'
     | '/$lang/settings/security'
-    | '/$lang/dashboard/'
+    | '/$lang/access/'
+    | '/$lang/activity/'
+    | '/$lang/nodes/'
+    | '/$lang/pools/'
+    | '/$lang/profiles/'
+    | '/$lang/providers/'
+    | '/$lang/runtimes/'
     | '/$lang/settings/'
-    | '/$lang/dashboard/pools/$poolId'
-    | '/$lang/dashboard/pools/new'
-    | '/$lang/dashboard/pools/'
-    | '/$lang/dashboard/pools/$poolId/fallback'
-    | '/$lang/dashboard/pools/$poolId/limits'
-    | '/$lang/dashboard/pools/$poolId/media'
-    | '/$lang/dashboard/pools/$poolId/routing'
-    | '/$lang/dashboard/pools/$poolId/settings'
-    | '/$lang/dashboard/pools/$poolId/sharing'
-    | '/$lang/dashboard/pools/$poolId/'
+    | '/$lang/pools/$poolId/advanced'
+    | '/$lang/pools/$poolId/cloud'
+    | '/$lang/pools/$poolId/media'
+    | '/$lang/pools/$poolId/routing'
+    | '/$lang/pools/$poolId/sharing'
+    | '/$lang/runtimes/$runtimeId/advanced'
+    | '/$lang/runtimes/$runtimeId/definition'
+    | '/$lang/pools/$poolId/'
+    | '/$lang/runtimes/$runtimeId/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/$lang'
-    | '/$lang/device'
     | '/$lang/login'
     | '/$lang/mcp-consent'
     | '/$lang/mcp-login'
     | '/$lang/signup'
     | '/$lang/verify-email'
-    | '/$lang/admin/devices'
     | '/$lang/admin/observability'
     | '/$lang/admin/settings'
     | '/$lang/admin/users'
     | '/$lang/admin'
-    | '/$lang/dashboard/api-tokens'
-    | '/$lang/dashboard/chat-test'
-    | '/$lang/dashboard/cli-tokens'
-    | '/$lang/dashboard/clis'
-    | '/$lang/dashboard/cloud-providers'
-    | '/$lang/dashboard/deployments'
-    | '/$lang/dashboard/request-log'
-    | '/$lang/dashboard/runtimes'
-    | '/$lang/dashboard/terminals'
-    | '/$lang/settings/mcp'
+    | '/$lang/models'
+    | '/$lang/overview'
+    | '/$lang/terminals'
+    | '/$lang/test'
+    | '/$lang/welcome'
+    | '/$lang/access/agents'
+    | '/$lang/access/api-keys'
+    | '/$lang/access/contributions'
+    | '/$lang/access/shares'
+    | '/$lang/activity/requests'
+    | '/$lang/nodes/$nodeId'
+    | '/$lang/profiles/$profileId'
+    | '/$lang/providers/$accountId'
+    | '/$lang/runtimes/new'
     | '/$lang/settings/security'
-    | '/$lang/dashboard'
+    | '/$lang/access'
+    | '/$lang/activity'
+    | '/$lang/nodes'
+    | '/$lang/pools'
+    | '/$lang/profiles'
+    | '/$lang/providers'
+    | '/$lang/runtimes'
     | '/$lang/settings'
-    | '/$lang/dashboard/pools/new'
-    | '/$lang/dashboard/pools'
-    | '/$lang/dashboard/pools/$poolId/fallback'
-    | '/$lang/dashboard/pools/$poolId/limits'
-    | '/$lang/dashboard/pools/$poolId/media'
-    | '/$lang/dashboard/pools/$poolId/routing'
-    | '/$lang/dashboard/pools/$poolId/settings'
-    | '/$lang/dashboard/pools/$poolId/sharing'
-    | '/$lang/dashboard/pools/$poolId'
+    | '/$lang/pools/$poolId/advanced'
+    | '/$lang/pools/$poolId/cloud'
+    | '/$lang/pools/$poolId/media'
+    | '/$lang/pools/$poolId/routing'
+    | '/$lang/pools/$poolId/sharing'
+    | '/$lang/runtimes/$runtimeId/advanced'
+    | '/$lang/runtimes/$runtimeId/definition'
+    | '/$lang/pools/$poolId'
+    | '/$lang/runtimes/$runtimeId'
   id:
     | '__root__'
     | '/'
     | '/$lang'
     | '/$lang/_auth'
     | '/$lang/admin'
-    | '/$lang/device'
     | '/$lang/login'
     | '/$lang/mcp-consent'
     | '/$lang/mcp-login'
     | '/$lang/signup'
     | '/$lang/verify-email'
     | '/$lang/'
-    | '/$lang/_auth/dashboard'
-    | '/$lang/_auth/settings'
-    | '/$lang/admin/devices'
+    | '/$lang/_auth/_app'
     | '/$lang/admin/observability'
     | '/$lang/admin/settings'
     | '/$lang/admin/users'
     | '/$lang/admin/'
-    | '/$lang/_auth/dashboard/api-tokens'
-    | '/$lang/_auth/dashboard/chat-test'
-    | '/$lang/_auth/dashboard/cli-tokens'
-    | '/$lang/_auth/dashboard/clis'
-    | '/$lang/_auth/dashboard/cloud-providers'
-    | '/$lang/_auth/dashboard/deployments'
-    | '/$lang/_auth/dashboard/pools'
-    | '/$lang/_auth/dashboard/request-log'
-    | '/$lang/_auth/dashboard/runtimes'
-    | '/$lang/_auth/dashboard/terminals'
-    | '/$lang/_auth/settings/mcp'
-    | '/$lang/_auth/settings/security'
-    | '/$lang/_auth/dashboard/'
-    | '/$lang/_auth/settings/'
-    | '/$lang/_auth/dashboard/pools/$poolId'
-    | '/$lang/_auth/dashboard/pools/new'
-    | '/$lang/_auth/dashboard/pools/'
-    | '/$lang/_auth/dashboard/pools/$poolId/fallback'
-    | '/$lang/_auth/dashboard/pools/$poolId/limits'
-    | '/$lang/_auth/dashboard/pools/$poolId/media'
-    | '/$lang/_auth/dashboard/pools/$poolId/routing'
-    | '/$lang/_auth/dashboard/pools/$poolId/settings'
-    | '/$lang/_auth/dashboard/pools/$poolId/sharing'
-    | '/$lang/_auth/dashboard/pools/$poolId/'
+    | '/$lang/_auth/_app/access'
+    | '/$lang/_auth/_app/activity'
+    | '/$lang/_auth/_app/models'
+    | '/$lang/_auth/_app/overview'
+    | '/$lang/_auth/_app/settings'
+    | '/$lang/_auth/_app/terminals'
+    | '/$lang/_auth/_app/test'
+    | '/$lang/_auth/_app/welcome'
+    | '/$lang/_auth/_app/access/agents'
+    | '/$lang/_auth/_app/access/api-keys'
+    | '/$lang/_auth/_app/access/contributions'
+    | '/$lang/_auth/_app/access/shares'
+    | '/$lang/_auth/_app/activity/requests'
+    | '/$lang/_auth/_app/nodes/$nodeId'
+    | '/$lang/_auth/_app/pools/$poolId'
+    | '/$lang/_auth/_app/profiles/$profileId'
+    | '/$lang/_auth/_app/providers/$accountId'
+    | '/$lang/_auth/_app/runtimes/$runtimeId'
+    | '/$lang/_auth/_app/runtimes/new'
+    | '/$lang/_auth/_app/settings/security'
+    | '/$lang/_auth/_app/access/'
+    | '/$lang/_auth/_app/activity/'
+    | '/$lang/_auth/_app/nodes/'
+    | '/$lang/_auth/_app/pools/'
+    | '/$lang/_auth/_app/profiles/'
+    | '/$lang/_auth/_app/providers/'
+    | '/$lang/_auth/_app/runtimes/'
+    | '/$lang/_auth/_app/settings/'
+    | '/$lang/_auth/_app/pools/$poolId/advanced'
+    | '/$lang/_auth/_app/pools/$poolId/cloud'
+    | '/$lang/_auth/_app/pools/$poolId/media'
+    | '/$lang/_auth/_app/pools/$poolId/routing'
+    | '/$lang/_auth/_app/pools/$poolId/sharing'
+    | '/$lang/_auth/_app/runtimes/$runtimeId/advanced'
+    | '/$lang/_auth/_app/runtimes/$runtimeId/definition'
+    | '/$lang/_auth/_app/pools/$poolId/'
+    | '/$lang/_auth/_app/runtimes/$runtimeId/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -575,13 +690,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAdminRouteImport
       parentRoute: typeof LangRoute
     }
-    '/$lang/device': {
-      id: '/$lang/device'
-      path: '/device'
-      fullPath: '/$lang/device'
-      preLoaderRoute: typeof LangDeviceRouteImport
-      parentRoute: typeof LangRoute
-    }
     '/$lang/login': {
       id: '/$lang/login'
       path: '/login'
@@ -617,18 +725,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangVerifyEmailRouteImport
       parentRoute: typeof LangRoute
     }
-    '/$lang/_auth/dashboard': {
-      id: '/$lang/_auth/dashboard'
-      path: '/dashboard'
-      fullPath: '/$lang/dashboard'
-      preLoaderRoute: typeof LangAuthDashboardRouteImport
-      parentRoute: typeof LangAuthRoute
-    }
-    '/$lang/_auth/settings': {
-      id: '/$lang/_auth/settings'
-      path: '/settings'
-      fullPath: '/$lang/settings'
-      preLoaderRoute: typeof LangAuthSettingsRouteImport
+    '/$lang/_auth/_app': {
+      id: '/$lang/_auth/_app'
+      path: ''
+      fullPath: '/$lang'
+      preLoaderRoute: typeof LangAuthAppRouteImport
       parentRoute: typeof LangAuthRoute
     }
     '/$lang/admin/': {
@@ -636,13 +737,6 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/$lang/admin/'
       preLoaderRoute: typeof LangAdminIndexRouteImport
-      parentRoute: typeof LangAdminRoute
-    }
-    '/$lang/admin/devices': {
-      id: '/$lang/admin/devices'
-      path: '/devices'
-      fullPath: '/$lang/admin/devices'
-      preLoaderRoute: typeof LangAdminDevicesRouteImport
       parentRoute: typeof LangAdminRoute
     }
     '/$lang/admin/observability': {
@@ -666,283 +760,413 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAdminUsersRouteImport
       parentRoute: typeof LangAdminRoute
     }
-    '/$lang/_auth/dashboard/': {
-      id: '/$lang/_auth/dashboard/'
-      path: '/'
-      fullPath: '/$lang/dashboard/'
-      preLoaderRoute: typeof LangAuthDashboardIndexRouteImport
-      parentRoute: typeof LangAuthDashboardRoute
+    '/$lang/_auth/_app/access': {
+      id: '/$lang/_auth/_app/access'
+      path: '/access'
+      fullPath: '/$lang/access'
+      preLoaderRoute: typeof LangAuthAppAccessRouteImport
+      parentRoute: typeof LangAuthAppRoute
     }
-    '/$lang/_auth/dashboard/api-tokens': {
-      id: '/$lang/_auth/dashboard/api-tokens'
-      path: '/api-tokens'
-      fullPath: '/$lang/dashboard/api-tokens'
-      preLoaderRoute: typeof LangAuthDashboardApiTokensRouteImport
-      parentRoute: typeof LangAuthDashboardRoute
+    '/$lang/_auth/_app/activity': {
+      id: '/$lang/_auth/_app/activity'
+      path: '/activity'
+      fullPath: '/$lang/activity'
+      preLoaderRoute: typeof LangAuthAppActivityRouteImport
+      parentRoute: typeof LangAuthAppRoute
     }
-    '/$lang/_auth/dashboard/chat-test': {
-      id: '/$lang/_auth/dashboard/chat-test'
-      path: '/chat-test'
-      fullPath: '/$lang/dashboard/chat-test'
-      preLoaderRoute: typeof LangAuthDashboardChatTestRouteImport
-      parentRoute: typeof LangAuthDashboardRoute
+    '/$lang/_auth/_app/models': {
+      id: '/$lang/_auth/_app/models'
+      path: '/models'
+      fullPath: '/$lang/models'
+      preLoaderRoute: typeof LangAuthAppModelsRouteImport
+      parentRoute: typeof LangAuthAppRoute
     }
-    '/$lang/_auth/dashboard/cli-tokens': {
-      id: '/$lang/_auth/dashboard/cli-tokens'
-      path: '/cli-tokens'
-      fullPath: '/$lang/dashboard/cli-tokens'
-      preLoaderRoute: typeof LangAuthDashboardCliTokensRouteImport
-      parentRoute: typeof LangAuthDashboardRoute
+    '/$lang/_auth/_app/overview': {
+      id: '/$lang/_auth/_app/overview'
+      path: '/overview'
+      fullPath: '/$lang/overview'
+      preLoaderRoute: typeof LangAuthAppOverviewRouteImport
+      parentRoute: typeof LangAuthAppRoute
     }
-    '/$lang/_auth/dashboard/clis': {
-      id: '/$lang/_auth/dashboard/clis'
-      path: '/clis'
-      fullPath: '/$lang/dashboard/clis'
-      preLoaderRoute: typeof LangAuthDashboardClisRouteImport
-      parentRoute: typeof LangAuthDashboardRoute
+    '/$lang/_auth/_app/settings': {
+      id: '/$lang/_auth/_app/settings'
+      path: '/settings'
+      fullPath: '/$lang/settings'
+      preLoaderRoute: typeof LangAuthAppSettingsRouteImport
+      parentRoute: typeof LangAuthAppRoute
     }
-    '/$lang/_auth/dashboard/cloud-providers': {
-      id: '/$lang/_auth/dashboard/cloud-providers'
-      path: '/cloud-providers'
-      fullPath: '/$lang/dashboard/cloud-providers'
-      preLoaderRoute: typeof LangAuthDashboardCloudProvidersRouteImport
-      parentRoute: typeof LangAuthDashboardRoute
-    }
-    '/$lang/_auth/dashboard/deployments': {
-      id: '/$lang/_auth/dashboard/deployments'
-      path: '/deployments'
-      fullPath: '/$lang/dashboard/deployments'
-      preLoaderRoute: typeof LangAuthDashboardDeploymentsRouteImport
-      parentRoute: typeof LangAuthDashboardRoute
-    }
-    '/$lang/_auth/dashboard/pools': {
-      id: '/$lang/_auth/dashboard/pools'
-      path: '/pools'
-      fullPath: '/$lang/dashboard/pools'
-      preLoaderRoute: typeof LangAuthDashboardPoolsRouteImport
-      parentRoute: typeof LangAuthDashboardRoute
-    }
-    '/$lang/_auth/dashboard/request-log': {
-      id: '/$lang/_auth/dashboard/request-log'
-      path: '/request-log'
-      fullPath: '/$lang/dashboard/request-log'
-      preLoaderRoute: typeof LangAuthDashboardRequestLogRouteImport
-      parentRoute: typeof LangAuthDashboardRoute
-    }
-    '/$lang/_auth/dashboard/runtimes': {
-      id: '/$lang/_auth/dashboard/runtimes'
-      path: '/runtimes'
-      fullPath: '/$lang/dashboard/runtimes'
-      preLoaderRoute: typeof LangAuthDashboardRuntimesRouteImport
-      parentRoute: typeof LangAuthDashboardRoute
-    }
-    '/$lang/_auth/dashboard/terminals': {
-      id: '/$lang/_auth/dashboard/terminals'
+    '/$lang/_auth/_app/terminals': {
+      id: '/$lang/_auth/_app/terminals'
       path: '/terminals'
-      fullPath: '/$lang/dashboard/terminals'
-      preLoaderRoute: typeof LangAuthDashboardTerminalsRouteImport
-      parentRoute: typeof LangAuthDashboardRoute
+      fullPath: '/$lang/terminals'
+      preLoaderRoute: typeof LangAuthAppTerminalsRouteImport
+      parentRoute: typeof LangAuthAppRoute
     }
-    '/$lang/_auth/settings/': {
-      id: '/$lang/_auth/settings/'
+    '/$lang/_auth/_app/test': {
+      id: '/$lang/_auth/_app/test'
+      path: '/test'
+      fullPath: '/$lang/test'
+      preLoaderRoute: typeof LangAuthAppTestRouteImport
+      parentRoute: typeof LangAuthAppRoute
+    }
+    '/$lang/_auth/_app/welcome': {
+      id: '/$lang/_auth/_app/welcome'
+      path: '/welcome'
+      fullPath: '/$lang/welcome'
+      preLoaderRoute: typeof LangAuthAppWelcomeRouteImport
+      parentRoute: typeof LangAuthAppRoute
+    }
+    '/$lang/_auth/_app/access/': {
+      id: '/$lang/_auth/_app/access/'
+      path: '/'
+      fullPath: '/$lang/access/'
+      preLoaderRoute: typeof LangAuthAppAccessIndexRouteImport
+      parentRoute: typeof LangAuthAppAccessRoute
+    }
+    '/$lang/_auth/_app/access/agents': {
+      id: '/$lang/_auth/_app/access/agents'
+      path: '/agents'
+      fullPath: '/$lang/access/agents'
+      preLoaderRoute: typeof LangAuthAppAccessAgentsRouteImport
+      parentRoute: typeof LangAuthAppAccessRoute
+    }
+    '/$lang/_auth/_app/access/api-keys': {
+      id: '/$lang/_auth/_app/access/api-keys'
+      path: '/api-keys'
+      fullPath: '/$lang/access/api-keys'
+      preLoaderRoute: typeof LangAuthAppAccessApiKeysRouteImport
+      parentRoute: typeof LangAuthAppAccessRoute
+    }
+    '/$lang/_auth/_app/access/contributions': {
+      id: '/$lang/_auth/_app/access/contributions'
+      path: '/contributions'
+      fullPath: '/$lang/access/contributions'
+      preLoaderRoute: typeof LangAuthAppAccessContributionsRouteImport
+      parentRoute: typeof LangAuthAppAccessRoute
+    }
+    '/$lang/_auth/_app/access/shares': {
+      id: '/$lang/_auth/_app/access/shares'
+      path: '/shares'
+      fullPath: '/$lang/access/shares'
+      preLoaderRoute: typeof LangAuthAppAccessSharesRouteImport
+      parentRoute: typeof LangAuthAppAccessRoute
+    }
+    '/$lang/_auth/_app/activity/': {
+      id: '/$lang/_auth/_app/activity/'
+      path: '/'
+      fullPath: '/$lang/activity/'
+      preLoaderRoute: typeof LangAuthAppActivityIndexRouteImport
+      parentRoute: typeof LangAuthAppActivityRoute
+    }
+    '/$lang/_auth/_app/activity/requests': {
+      id: '/$lang/_auth/_app/activity/requests'
+      path: '/requests'
+      fullPath: '/$lang/activity/requests'
+      preLoaderRoute: typeof LangAuthAppActivityRequestsRouteImport
+      parentRoute: typeof LangAuthAppActivityRoute
+    }
+    '/$lang/_auth/_app/nodes/': {
+      id: '/$lang/_auth/_app/nodes/'
+      path: '/nodes'
+      fullPath: '/$lang/nodes/'
+      preLoaderRoute: typeof LangAuthAppNodesIndexRouteImport
+      parentRoute: typeof LangAuthAppRoute
+    }
+    '/$lang/_auth/_app/nodes/$nodeId': {
+      id: '/$lang/_auth/_app/nodes/$nodeId'
+      path: '/nodes/$nodeId'
+      fullPath: '/$lang/nodes/$nodeId'
+      preLoaderRoute: typeof LangAuthAppNodesNodeIdRouteImport
+      parentRoute: typeof LangAuthAppRoute
+    }
+    '/$lang/_auth/_app/pools/': {
+      id: '/$lang/_auth/_app/pools/'
+      path: '/pools'
+      fullPath: '/$lang/pools/'
+      preLoaderRoute: typeof LangAuthAppPoolsIndexRouteImport
+      parentRoute: typeof LangAuthAppRoute
+    }
+    '/$lang/_auth/_app/pools/$poolId': {
+      id: '/$lang/_auth/_app/pools/$poolId'
+      path: '/pools/$poolId'
+      fullPath: '/$lang/pools/$poolId'
+      preLoaderRoute: typeof LangAuthAppPoolsPoolIdRouteImport
+      parentRoute: typeof LangAuthAppRoute
+    }
+    '/$lang/_auth/_app/profiles/': {
+      id: '/$lang/_auth/_app/profiles/'
+      path: '/profiles'
+      fullPath: '/$lang/profiles/'
+      preLoaderRoute: typeof LangAuthAppProfilesIndexRouteImport
+      parentRoute: typeof LangAuthAppRoute
+    }
+    '/$lang/_auth/_app/profiles/$profileId': {
+      id: '/$lang/_auth/_app/profiles/$profileId'
+      path: '/profiles/$profileId'
+      fullPath: '/$lang/profiles/$profileId'
+      preLoaderRoute: typeof LangAuthAppProfilesProfileIdRouteImport
+      parentRoute: typeof LangAuthAppRoute
+    }
+    '/$lang/_auth/_app/providers/': {
+      id: '/$lang/_auth/_app/providers/'
+      path: '/providers'
+      fullPath: '/$lang/providers/'
+      preLoaderRoute: typeof LangAuthAppProvidersIndexRouteImport
+      parentRoute: typeof LangAuthAppRoute
+    }
+    '/$lang/_auth/_app/providers/$accountId': {
+      id: '/$lang/_auth/_app/providers/$accountId'
+      path: '/providers/$accountId'
+      fullPath: '/$lang/providers/$accountId'
+      preLoaderRoute: typeof LangAuthAppProvidersAccountIdRouteImport
+      parentRoute: typeof LangAuthAppRoute
+    }
+    '/$lang/_auth/_app/runtimes/': {
+      id: '/$lang/_auth/_app/runtimes/'
+      path: '/runtimes'
+      fullPath: '/$lang/runtimes/'
+      preLoaderRoute: typeof LangAuthAppRuntimesIndexRouteImport
+      parentRoute: typeof LangAuthAppRoute
+    }
+    '/$lang/_auth/_app/runtimes/$runtimeId': {
+      id: '/$lang/_auth/_app/runtimes/$runtimeId'
+      path: '/runtimes/$runtimeId'
+      fullPath: '/$lang/runtimes/$runtimeId'
+      preLoaderRoute: typeof LangAuthAppRuntimesRuntimeIdRouteImport
+      parentRoute: typeof LangAuthAppRoute
+    }
+    '/$lang/_auth/_app/runtimes/new': {
+      id: '/$lang/_auth/_app/runtimes/new'
+      path: '/runtimes/new'
+      fullPath: '/$lang/runtimes/new'
+      preLoaderRoute: typeof LangAuthAppRuntimesNewRouteImport
+      parentRoute: typeof LangAuthAppRoute
+    }
+    '/$lang/_auth/_app/settings/': {
+      id: '/$lang/_auth/_app/settings/'
       path: '/'
       fullPath: '/$lang/settings/'
-      preLoaderRoute: typeof LangAuthSettingsIndexRouteImport
-      parentRoute: typeof LangAuthSettingsRoute
+      preLoaderRoute: typeof LangAuthAppSettingsIndexRouteImport
+      parentRoute: typeof LangAuthAppSettingsRoute
     }
-    '/$lang/_auth/settings/mcp': {
-      id: '/$lang/_auth/settings/mcp'
-      path: '/mcp'
-      fullPath: '/$lang/settings/mcp'
-      preLoaderRoute: typeof LangAuthSettingsMcpRouteImport
-      parentRoute: typeof LangAuthSettingsRoute
-    }
-    '/$lang/_auth/settings/security': {
-      id: '/$lang/_auth/settings/security'
+    '/$lang/_auth/_app/settings/security': {
+      id: '/$lang/_auth/_app/settings/security'
       path: '/security'
       fullPath: '/$lang/settings/security'
-      preLoaderRoute: typeof LangAuthSettingsSecurityRouteImport
-      parentRoute: typeof LangAuthSettingsRoute
+      preLoaderRoute: typeof LangAuthAppSettingsSecurityRouteImport
+      parentRoute: typeof LangAuthAppSettingsRoute
     }
-    '/$lang/_auth/dashboard/pools/': {
-      id: '/$lang/_auth/dashboard/pools/'
+    '/$lang/_auth/_app/pools/$poolId/': {
+      id: '/$lang/_auth/_app/pools/$poolId/'
       path: '/'
-      fullPath: '/$lang/dashboard/pools/'
-      preLoaderRoute: typeof LangAuthDashboardPoolsIndexRouteImport
-      parentRoute: typeof LangAuthDashboardPoolsRoute
+      fullPath: '/$lang/pools/$poolId/'
+      preLoaderRoute: typeof LangAuthAppPoolsPoolIdIndexRouteImport
+      parentRoute: typeof LangAuthAppPoolsPoolIdRoute
     }
-    '/$lang/_auth/dashboard/pools/$poolId': {
-      id: '/$lang/_auth/dashboard/pools/$poolId'
-      path: '/$poolId'
-      fullPath: '/$lang/dashboard/pools/$poolId'
-      preLoaderRoute: typeof LangAuthDashboardPoolsPoolIdRouteImport
-      parentRoute: typeof LangAuthDashboardPoolsRoute
+    '/$lang/_auth/_app/pools/$poolId/advanced': {
+      id: '/$lang/_auth/_app/pools/$poolId/advanced'
+      path: '/advanced'
+      fullPath: '/$lang/pools/$poolId/advanced'
+      preLoaderRoute: typeof LangAuthAppPoolsPoolIdAdvancedRouteImport
+      parentRoute: typeof LangAuthAppPoolsPoolIdRoute
     }
-    '/$lang/_auth/dashboard/pools/new': {
-      id: '/$lang/_auth/dashboard/pools/new'
-      path: '/new'
-      fullPath: '/$lang/dashboard/pools/new'
-      preLoaderRoute: typeof LangAuthDashboardPoolsNewRouteImport
-      parentRoute: typeof LangAuthDashboardPoolsRoute
+    '/$lang/_auth/_app/pools/$poolId/cloud': {
+      id: '/$lang/_auth/_app/pools/$poolId/cloud'
+      path: '/cloud'
+      fullPath: '/$lang/pools/$poolId/cloud'
+      preLoaderRoute: typeof LangAuthAppPoolsPoolIdCloudRouteImport
+      parentRoute: typeof LangAuthAppPoolsPoolIdRoute
     }
-    '/$lang/_auth/dashboard/pools/$poolId/': {
-      id: '/$lang/_auth/dashboard/pools/$poolId/'
-      path: '/'
-      fullPath: '/$lang/dashboard/pools/$poolId/'
-      preLoaderRoute: typeof LangAuthDashboardPoolsPoolIdIndexRouteImport
-      parentRoute: typeof LangAuthDashboardPoolsPoolIdRoute
-    }
-    '/$lang/_auth/dashboard/pools/$poolId/fallback': {
-      id: '/$lang/_auth/dashboard/pools/$poolId/fallback'
-      path: '/fallback'
-      fullPath: '/$lang/dashboard/pools/$poolId/fallback'
-      preLoaderRoute: typeof LangAuthDashboardPoolsPoolIdFallbackRouteImport
-      parentRoute: typeof LangAuthDashboardPoolsPoolIdRoute
-    }
-    '/$lang/_auth/dashboard/pools/$poolId/limits': {
-      id: '/$lang/_auth/dashboard/pools/$poolId/limits'
-      path: '/limits'
-      fullPath: '/$lang/dashboard/pools/$poolId/limits'
-      preLoaderRoute: typeof LangAuthDashboardPoolsPoolIdLimitsRouteImport
-      parentRoute: typeof LangAuthDashboardPoolsPoolIdRoute
-    }
-    '/$lang/_auth/dashboard/pools/$poolId/media': {
-      id: '/$lang/_auth/dashboard/pools/$poolId/media'
+    '/$lang/_auth/_app/pools/$poolId/media': {
+      id: '/$lang/_auth/_app/pools/$poolId/media'
       path: '/media'
-      fullPath: '/$lang/dashboard/pools/$poolId/media'
-      preLoaderRoute: typeof LangAuthDashboardPoolsPoolIdMediaRouteImport
-      parentRoute: typeof LangAuthDashboardPoolsPoolIdRoute
+      fullPath: '/$lang/pools/$poolId/media'
+      preLoaderRoute: typeof LangAuthAppPoolsPoolIdMediaRouteImport
+      parentRoute: typeof LangAuthAppPoolsPoolIdRoute
     }
-    '/$lang/_auth/dashboard/pools/$poolId/routing': {
-      id: '/$lang/_auth/dashboard/pools/$poolId/routing'
+    '/$lang/_auth/_app/pools/$poolId/routing': {
+      id: '/$lang/_auth/_app/pools/$poolId/routing'
       path: '/routing'
-      fullPath: '/$lang/dashboard/pools/$poolId/routing'
-      preLoaderRoute: typeof LangAuthDashboardPoolsPoolIdRoutingRouteImport
-      parentRoute: typeof LangAuthDashboardPoolsPoolIdRoute
+      fullPath: '/$lang/pools/$poolId/routing'
+      preLoaderRoute: typeof LangAuthAppPoolsPoolIdRoutingRouteImport
+      parentRoute: typeof LangAuthAppPoolsPoolIdRoute
     }
-    '/$lang/_auth/dashboard/pools/$poolId/settings': {
-      id: '/$lang/_auth/dashboard/pools/$poolId/settings'
-      path: '/settings'
-      fullPath: '/$lang/dashboard/pools/$poolId/settings'
-      preLoaderRoute: typeof LangAuthDashboardPoolsPoolIdSettingsRouteImport
-      parentRoute: typeof LangAuthDashboardPoolsPoolIdRoute
-    }
-    '/$lang/_auth/dashboard/pools/$poolId/sharing': {
-      id: '/$lang/_auth/dashboard/pools/$poolId/sharing'
+    '/$lang/_auth/_app/pools/$poolId/sharing': {
+      id: '/$lang/_auth/_app/pools/$poolId/sharing'
       path: '/sharing'
-      fullPath: '/$lang/dashboard/pools/$poolId/sharing'
-      preLoaderRoute: typeof LangAuthDashboardPoolsPoolIdSharingRouteImport
-      parentRoute: typeof LangAuthDashboardPoolsPoolIdRoute
+      fullPath: '/$lang/pools/$poolId/sharing'
+      preLoaderRoute: typeof LangAuthAppPoolsPoolIdSharingRouteImport
+      parentRoute: typeof LangAuthAppPoolsPoolIdRoute
+    }
+    '/$lang/_auth/_app/runtimes/$runtimeId/': {
+      id: '/$lang/_auth/_app/runtimes/$runtimeId/'
+      path: '/'
+      fullPath: '/$lang/runtimes/$runtimeId/'
+      preLoaderRoute: typeof LangAuthAppRuntimesRuntimeIdIndexRouteImport
+      parentRoute: typeof LangAuthAppRuntimesRuntimeIdRoute
+    }
+    '/$lang/_auth/_app/runtimes/$runtimeId/advanced': {
+      id: '/$lang/_auth/_app/runtimes/$runtimeId/advanced'
+      path: '/advanced'
+      fullPath: '/$lang/runtimes/$runtimeId/advanced'
+      preLoaderRoute: typeof LangAuthAppRuntimesRuntimeIdAdvancedRouteImport
+      parentRoute: typeof LangAuthAppRuntimesRuntimeIdRoute
+    }
+    '/$lang/_auth/_app/runtimes/$runtimeId/definition': {
+      id: '/$lang/_auth/_app/runtimes/$runtimeId/definition'
+      path: '/definition'
+      fullPath: '/$lang/runtimes/$runtimeId/definition'
+      preLoaderRoute: typeof LangAuthAppRuntimesRuntimeIdDefinitionRouteImport
+      parentRoute: typeof LangAuthAppRuntimesRuntimeIdRoute
     }
   }
 }
 
-interface LangAuthDashboardPoolsPoolIdRouteChildren {
-  LangAuthDashboardPoolsPoolIdFallbackRoute: typeof LangAuthDashboardPoolsPoolIdFallbackRoute
-  LangAuthDashboardPoolsPoolIdLimitsRoute: typeof LangAuthDashboardPoolsPoolIdLimitsRoute
-  LangAuthDashboardPoolsPoolIdMediaRoute: typeof LangAuthDashboardPoolsPoolIdMediaRoute
-  LangAuthDashboardPoolsPoolIdRoutingRoute: typeof LangAuthDashboardPoolsPoolIdRoutingRoute
-  LangAuthDashboardPoolsPoolIdSettingsRoute: typeof LangAuthDashboardPoolsPoolIdSettingsRoute
-  LangAuthDashboardPoolsPoolIdSharingRoute: typeof LangAuthDashboardPoolsPoolIdSharingRoute
-  LangAuthDashboardPoolsPoolIdIndexRoute: typeof LangAuthDashboardPoolsPoolIdIndexRoute
+interface LangAuthAppAccessRouteChildren {
+  LangAuthAppAccessAgentsRoute: typeof LangAuthAppAccessAgentsRoute
+  LangAuthAppAccessApiKeysRoute: typeof LangAuthAppAccessApiKeysRoute
+  LangAuthAppAccessContributionsRoute: typeof LangAuthAppAccessContributionsRoute
+  LangAuthAppAccessSharesRoute: typeof LangAuthAppAccessSharesRoute
+  LangAuthAppAccessIndexRoute: typeof LangAuthAppAccessIndexRoute
 }
 
-const LangAuthDashboardPoolsPoolIdRouteChildren: LangAuthDashboardPoolsPoolIdRouteChildren =
+const LangAuthAppAccessRouteChildren: LangAuthAppAccessRouteChildren = {
+  LangAuthAppAccessAgentsRoute: LangAuthAppAccessAgentsRoute,
+  LangAuthAppAccessApiKeysRoute: LangAuthAppAccessApiKeysRoute,
+  LangAuthAppAccessContributionsRoute: LangAuthAppAccessContributionsRoute,
+  LangAuthAppAccessSharesRoute: LangAuthAppAccessSharesRoute,
+  LangAuthAppAccessIndexRoute: LangAuthAppAccessIndexRoute,
+}
+
+const LangAuthAppAccessRouteWithChildren =
+  LangAuthAppAccessRoute._addFileChildren(LangAuthAppAccessRouteChildren)
+
+interface LangAuthAppActivityRouteChildren {
+  LangAuthAppActivityRequestsRoute: typeof LangAuthAppActivityRequestsRoute
+  LangAuthAppActivityIndexRoute: typeof LangAuthAppActivityIndexRoute
+}
+
+const LangAuthAppActivityRouteChildren: LangAuthAppActivityRouteChildren = {
+  LangAuthAppActivityRequestsRoute: LangAuthAppActivityRequestsRoute,
+  LangAuthAppActivityIndexRoute: LangAuthAppActivityIndexRoute,
+}
+
+const LangAuthAppActivityRouteWithChildren =
+  LangAuthAppActivityRoute._addFileChildren(LangAuthAppActivityRouteChildren)
+
+interface LangAuthAppSettingsRouteChildren {
+  LangAuthAppSettingsSecurityRoute: typeof LangAuthAppSettingsSecurityRoute
+  LangAuthAppSettingsIndexRoute: typeof LangAuthAppSettingsIndexRoute
+}
+
+const LangAuthAppSettingsRouteChildren: LangAuthAppSettingsRouteChildren = {
+  LangAuthAppSettingsSecurityRoute: LangAuthAppSettingsSecurityRoute,
+  LangAuthAppSettingsIndexRoute: LangAuthAppSettingsIndexRoute,
+}
+
+const LangAuthAppSettingsRouteWithChildren =
+  LangAuthAppSettingsRoute._addFileChildren(LangAuthAppSettingsRouteChildren)
+
+interface LangAuthAppPoolsPoolIdRouteChildren {
+  LangAuthAppPoolsPoolIdAdvancedRoute: typeof LangAuthAppPoolsPoolIdAdvancedRoute
+  LangAuthAppPoolsPoolIdCloudRoute: typeof LangAuthAppPoolsPoolIdCloudRoute
+  LangAuthAppPoolsPoolIdMediaRoute: typeof LangAuthAppPoolsPoolIdMediaRoute
+  LangAuthAppPoolsPoolIdRoutingRoute: typeof LangAuthAppPoolsPoolIdRoutingRoute
+  LangAuthAppPoolsPoolIdSharingRoute: typeof LangAuthAppPoolsPoolIdSharingRoute
+  LangAuthAppPoolsPoolIdIndexRoute: typeof LangAuthAppPoolsPoolIdIndexRoute
+}
+
+const LangAuthAppPoolsPoolIdRouteChildren: LangAuthAppPoolsPoolIdRouteChildren =
   {
-    LangAuthDashboardPoolsPoolIdFallbackRoute:
-      LangAuthDashboardPoolsPoolIdFallbackRoute,
-    LangAuthDashboardPoolsPoolIdLimitsRoute:
-      LangAuthDashboardPoolsPoolIdLimitsRoute,
-    LangAuthDashboardPoolsPoolIdMediaRoute:
-      LangAuthDashboardPoolsPoolIdMediaRoute,
-    LangAuthDashboardPoolsPoolIdRoutingRoute:
-      LangAuthDashboardPoolsPoolIdRoutingRoute,
-    LangAuthDashboardPoolsPoolIdSettingsRoute:
-      LangAuthDashboardPoolsPoolIdSettingsRoute,
-    LangAuthDashboardPoolsPoolIdSharingRoute:
-      LangAuthDashboardPoolsPoolIdSharingRoute,
-    LangAuthDashboardPoolsPoolIdIndexRoute:
-      LangAuthDashboardPoolsPoolIdIndexRoute,
+    LangAuthAppPoolsPoolIdAdvancedRoute: LangAuthAppPoolsPoolIdAdvancedRoute,
+    LangAuthAppPoolsPoolIdCloudRoute: LangAuthAppPoolsPoolIdCloudRoute,
+    LangAuthAppPoolsPoolIdMediaRoute: LangAuthAppPoolsPoolIdMediaRoute,
+    LangAuthAppPoolsPoolIdRoutingRoute: LangAuthAppPoolsPoolIdRoutingRoute,
+    LangAuthAppPoolsPoolIdSharingRoute: LangAuthAppPoolsPoolIdSharingRoute,
+    LangAuthAppPoolsPoolIdIndexRoute: LangAuthAppPoolsPoolIdIndexRoute,
   }
 
-const LangAuthDashboardPoolsPoolIdRouteWithChildren =
-  LangAuthDashboardPoolsPoolIdRoute._addFileChildren(
-    LangAuthDashboardPoolsPoolIdRouteChildren,
+const LangAuthAppPoolsPoolIdRouteWithChildren =
+  LangAuthAppPoolsPoolIdRoute._addFileChildren(
+    LangAuthAppPoolsPoolIdRouteChildren,
   )
 
-interface LangAuthDashboardPoolsRouteChildren {
-  LangAuthDashboardPoolsPoolIdRoute: typeof LangAuthDashboardPoolsPoolIdRouteWithChildren
-  LangAuthDashboardPoolsNewRoute: typeof LangAuthDashboardPoolsNewRoute
-  LangAuthDashboardPoolsIndexRoute: typeof LangAuthDashboardPoolsIndexRoute
+interface LangAuthAppRuntimesRuntimeIdRouteChildren {
+  LangAuthAppRuntimesRuntimeIdAdvancedRoute: typeof LangAuthAppRuntimesRuntimeIdAdvancedRoute
+  LangAuthAppRuntimesRuntimeIdDefinitionRoute: typeof LangAuthAppRuntimesRuntimeIdDefinitionRoute
+  LangAuthAppRuntimesRuntimeIdIndexRoute: typeof LangAuthAppRuntimesRuntimeIdIndexRoute
 }
 
-const LangAuthDashboardPoolsRouteChildren: LangAuthDashboardPoolsRouteChildren =
+const LangAuthAppRuntimesRuntimeIdRouteChildren: LangAuthAppRuntimesRuntimeIdRouteChildren =
   {
-    LangAuthDashboardPoolsPoolIdRoute:
-      LangAuthDashboardPoolsPoolIdRouteWithChildren,
-    LangAuthDashboardPoolsNewRoute: LangAuthDashboardPoolsNewRoute,
-    LangAuthDashboardPoolsIndexRoute: LangAuthDashboardPoolsIndexRoute,
+    LangAuthAppRuntimesRuntimeIdAdvancedRoute:
+      LangAuthAppRuntimesRuntimeIdAdvancedRoute,
+    LangAuthAppRuntimesRuntimeIdDefinitionRoute:
+      LangAuthAppRuntimesRuntimeIdDefinitionRoute,
+    LangAuthAppRuntimesRuntimeIdIndexRoute:
+      LangAuthAppRuntimesRuntimeIdIndexRoute,
   }
 
-const LangAuthDashboardPoolsRouteWithChildren =
-  LangAuthDashboardPoolsRoute._addFileChildren(
-    LangAuthDashboardPoolsRouteChildren,
+const LangAuthAppRuntimesRuntimeIdRouteWithChildren =
+  LangAuthAppRuntimesRuntimeIdRoute._addFileChildren(
+    LangAuthAppRuntimesRuntimeIdRouteChildren,
   )
 
-interface LangAuthDashboardRouteChildren {
-  LangAuthDashboardApiTokensRoute: typeof LangAuthDashboardApiTokensRoute
-  LangAuthDashboardChatTestRoute: typeof LangAuthDashboardChatTestRoute
-  LangAuthDashboardCliTokensRoute: typeof LangAuthDashboardCliTokensRoute
-  LangAuthDashboardClisRoute: typeof LangAuthDashboardClisRoute
-  LangAuthDashboardCloudProvidersRoute: typeof LangAuthDashboardCloudProvidersRoute
-  LangAuthDashboardDeploymentsRoute: typeof LangAuthDashboardDeploymentsRoute
-  LangAuthDashboardPoolsRoute: typeof LangAuthDashboardPoolsRouteWithChildren
-  LangAuthDashboardRequestLogRoute: typeof LangAuthDashboardRequestLogRoute
-  LangAuthDashboardRuntimesRoute: typeof LangAuthDashboardRuntimesRoute
-  LangAuthDashboardTerminalsRoute: typeof LangAuthDashboardTerminalsRoute
-  LangAuthDashboardIndexRoute: typeof LangAuthDashboardIndexRoute
+interface LangAuthAppRouteChildren {
+  LangAuthAppAccessRoute: typeof LangAuthAppAccessRouteWithChildren
+  LangAuthAppActivityRoute: typeof LangAuthAppActivityRouteWithChildren
+  LangAuthAppModelsRoute: typeof LangAuthAppModelsRoute
+  LangAuthAppOverviewRoute: typeof LangAuthAppOverviewRoute
+  LangAuthAppSettingsRoute: typeof LangAuthAppSettingsRouteWithChildren
+  LangAuthAppTerminalsRoute: typeof LangAuthAppTerminalsRoute
+  LangAuthAppTestRoute: typeof LangAuthAppTestRoute
+  LangAuthAppWelcomeRoute: typeof LangAuthAppWelcomeRoute
+  LangAuthAppNodesNodeIdRoute: typeof LangAuthAppNodesNodeIdRoute
+  LangAuthAppPoolsPoolIdRoute: typeof LangAuthAppPoolsPoolIdRouteWithChildren
+  LangAuthAppProfilesProfileIdRoute: typeof LangAuthAppProfilesProfileIdRoute
+  LangAuthAppProvidersAccountIdRoute: typeof LangAuthAppProvidersAccountIdRoute
+  LangAuthAppRuntimesRuntimeIdRoute: typeof LangAuthAppRuntimesRuntimeIdRouteWithChildren
+  LangAuthAppRuntimesNewRoute: typeof LangAuthAppRuntimesNewRoute
+  LangAuthAppNodesIndexRoute: typeof LangAuthAppNodesIndexRoute
+  LangAuthAppPoolsIndexRoute: typeof LangAuthAppPoolsIndexRoute
+  LangAuthAppProfilesIndexRoute: typeof LangAuthAppProfilesIndexRoute
+  LangAuthAppProvidersIndexRoute: typeof LangAuthAppProvidersIndexRoute
+  LangAuthAppRuntimesIndexRoute: typeof LangAuthAppRuntimesIndexRoute
 }
 
-const LangAuthDashboardRouteChildren: LangAuthDashboardRouteChildren = {
-  LangAuthDashboardApiTokensRoute: LangAuthDashboardApiTokensRoute,
-  LangAuthDashboardChatTestRoute: LangAuthDashboardChatTestRoute,
-  LangAuthDashboardCliTokensRoute: LangAuthDashboardCliTokensRoute,
-  LangAuthDashboardClisRoute: LangAuthDashboardClisRoute,
-  LangAuthDashboardCloudProvidersRoute: LangAuthDashboardCloudProvidersRoute,
-  LangAuthDashboardDeploymentsRoute: LangAuthDashboardDeploymentsRoute,
-  LangAuthDashboardPoolsRoute: LangAuthDashboardPoolsRouteWithChildren,
-  LangAuthDashboardRequestLogRoute: LangAuthDashboardRequestLogRoute,
-  LangAuthDashboardRuntimesRoute: LangAuthDashboardRuntimesRoute,
-  LangAuthDashboardTerminalsRoute: LangAuthDashboardTerminalsRoute,
-  LangAuthDashboardIndexRoute: LangAuthDashboardIndexRoute,
+const LangAuthAppRouteChildren: LangAuthAppRouteChildren = {
+  LangAuthAppAccessRoute: LangAuthAppAccessRouteWithChildren,
+  LangAuthAppActivityRoute: LangAuthAppActivityRouteWithChildren,
+  LangAuthAppModelsRoute: LangAuthAppModelsRoute,
+  LangAuthAppOverviewRoute: LangAuthAppOverviewRoute,
+  LangAuthAppSettingsRoute: LangAuthAppSettingsRouteWithChildren,
+  LangAuthAppTerminalsRoute: LangAuthAppTerminalsRoute,
+  LangAuthAppTestRoute: LangAuthAppTestRoute,
+  LangAuthAppWelcomeRoute: LangAuthAppWelcomeRoute,
+  LangAuthAppNodesNodeIdRoute: LangAuthAppNodesNodeIdRoute,
+  LangAuthAppPoolsPoolIdRoute: LangAuthAppPoolsPoolIdRouteWithChildren,
+  LangAuthAppProfilesProfileIdRoute: LangAuthAppProfilesProfileIdRoute,
+  LangAuthAppProvidersAccountIdRoute: LangAuthAppProvidersAccountIdRoute,
+  LangAuthAppRuntimesRuntimeIdRoute:
+    LangAuthAppRuntimesRuntimeIdRouteWithChildren,
+  LangAuthAppRuntimesNewRoute: LangAuthAppRuntimesNewRoute,
+  LangAuthAppNodesIndexRoute: LangAuthAppNodesIndexRoute,
+  LangAuthAppPoolsIndexRoute: LangAuthAppPoolsIndexRoute,
+  LangAuthAppProfilesIndexRoute: LangAuthAppProfilesIndexRoute,
+  LangAuthAppProvidersIndexRoute: LangAuthAppProvidersIndexRoute,
+  LangAuthAppRuntimesIndexRoute: LangAuthAppRuntimesIndexRoute,
 }
 
-const LangAuthDashboardRouteWithChildren =
-  LangAuthDashboardRoute._addFileChildren(LangAuthDashboardRouteChildren)
-
-interface LangAuthSettingsRouteChildren {
-  LangAuthSettingsMcpRoute: typeof LangAuthSettingsMcpRoute
-  LangAuthSettingsSecurityRoute: typeof LangAuthSettingsSecurityRoute
-  LangAuthSettingsIndexRoute: typeof LangAuthSettingsIndexRoute
-}
-
-const LangAuthSettingsRouteChildren: LangAuthSettingsRouteChildren = {
-  LangAuthSettingsMcpRoute: LangAuthSettingsMcpRoute,
-  LangAuthSettingsSecurityRoute: LangAuthSettingsSecurityRoute,
-  LangAuthSettingsIndexRoute: LangAuthSettingsIndexRoute,
-}
-
-const LangAuthSettingsRouteWithChildren =
-  LangAuthSettingsRoute._addFileChildren(LangAuthSettingsRouteChildren)
+const LangAuthAppRouteWithChildren = LangAuthAppRoute._addFileChildren(
+  LangAuthAppRouteChildren,
+)
 
 interface LangAuthRouteChildren {
-  LangAuthDashboardRoute: typeof LangAuthDashboardRouteWithChildren
-  LangAuthSettingsRoute: typeof LangAuthSettingsRouteWithChildren
+  LangAuthAppRoute: typeof LangAuthAppRouteWithChildren
 }
 
 const LangAuthRouteChildren: LangAuthRouteChildren = {
-  LangAuthDashboardRoute: LangAuthDashboardRouteWithChildren,
-  LangAuthSettingsRoute: LangAuthSettingsRouteWithChildren,
+  LangAuthAppRoute: LangAuthAppRouteWithChildren,
 }
 
 const LangAuthRouteWithChildren = LangAuthRoute._addFileChildren(
@@ -950,7 +1174,6 @@ const LangAuthRouteWithChildren = LangAuthRoute._addFileChildren(
 )
 
 interface LangAdminRouteChildren {
-  LangAdminDevicesRoute: typeof LangAdminDevicesRoute
   LangAdminObservabilityRoute: typeof LangAdminObservabilityRoute
   LangAdminSettingsRoute: typeof LangAdminSettingsRoute
   LangAdminUsersRoute: typeof LangAdminUsersRoute
@@ -958,7 +1181,6 @@ interface LangAdminRouteChildren {
 }
 
 const LangAdminRouteChildren: LangAdminRouteChildren = {
-  LangAdminDevicesRoute: LangAdminDevicesRoute,
   LangAdminObservabilityRoute: LangAdminObservabilityRoute,
   LangAdminSettingsRoute: LangAdminSettingsRoute,
   LangAdminUsersRoute: LangAdminUsersRoute,
@@ -972,7 +1194,6 @@ const LangAdminRouteWithChildren = LangAdminRoute._addFileChildren(
 interface LangRouteChildren {
   LangAuthRoute: typeof LangAuthRouteWithChildren
   LangAdminRoute: typeof LangAdminRouteWithChildren
-  LangDeviceRoute: typeof LangDeviceRoute
   LangLoginRoute: typeof LangLoginRoute
   LangMcpConsentRoute: typeof LangMcpConsentRoute
   LangMcpLoginRoute: typeof LangMcpLoginRoute
@@ -984,7 +1205,6 @@ interface LangRouteChildren {
 const LangRouteChildren: LangRouteChildren = {
   LangAuthRoute: LangAuthRouteWithChildren,
   LangAdminRoute: LangAdminRouteWithChildren,
-  LangDeviceRoute: LangDeviceRoute,
   LangLoginRoute: LangLoginRoute,
   LangMcpConsentRoute: LangMcpConsentRoute,
   LangMcpLoginRoute: LangMcpLoginRoute,

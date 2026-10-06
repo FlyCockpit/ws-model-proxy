@@ -95,7 +95,7 @@ describe("route session access decisions", () => {
 
   it("redirects non-admin device approvers to dashboard", () => {
     expect(decideDeviceRouteAccess(resolvedRouteSession(session))).toEqual({
-      kind: "redirect-to-dashboard",
+      kind: "redirect-to-overview",
     });
   });
 
