@@ -118,11 +118,13 @@ describe("human-only procedures (positive check)", () => {
         auth: { kind: "cookie_session", userId: "owner", sessionId: "s", csrfVerified: true },
       } satisfies Context,
     });
-    // A stubbed human procedure gets past the access check and reaches its handler.
+    // A human procedure gets past the access check and reaches its handler (which finds no
+    // such node).
+    vi.mocked(prisma).node.updateMany.mockResolvedValueOnce({ count: 0 });
     await expect(
       procedureAt(client, "nodes.rename")({ nodeId: "n", name: null }),
     ).rejects.toMatchObject({
-      code: "NOT_IMPLEMENTED",
+      code: "NOT_FOUND",
     });
   });
 });
@@ -159,9 +161,8 @@ describe("session, admin and agent procedures", () => {
         auth: { kind: "agent_token", userId: "owner", agentTokenId: "t", level: "FULL" },
       } satisfies Context,
     });
-    await expect(procedureAt(client, "nodes.list")({})).rejects.toMatchObject({
-      code: "NOT_IMPLEMENTED",
-    });
+    vi.mocked(prisma).node.findMany.mockResolvedValueOnce([]);
+    await expect(procedureAt(client, "nodes.list")({})).resolves.toEqual({ nodes: [] });
   });
 
   it("refuses anonymous callers everywhere but public procedures", async () => {
