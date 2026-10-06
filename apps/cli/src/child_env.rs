@@ -6,7 +6,18 @@
 use std::path::{Path, PathBuf};
 
 const ALLOWED_EXACT: &[&str] = &[
-    "PATH", "HOME", "USER", "LOGNAME", "LANG", "SHELL", "TZ", "TERM",
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "SHELL",
+    "TZ",
+    "TERM",
+    // The user session bus and runtime dir, so `systemctl --user`, `podman`
+    // and friends work from headless commands.
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
 ];
 const VALUE_PREFIXES: &[&str] = &["wsmp_model_", "wsmp_cli_", "wsmp_device_", "wsmp_mcp_"];
 
@@ -89,13 +100,161 @@ pub fn scrub_parent_env(denied_names: &[String]) -> Vec<(String, String)> {
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect::<Vec<_>>();
-    scrub_env(
+    let mut env = scrub_env(
         &borrowed,
         &ScrubOptions {
             case_insensitive_names: cfg!(windows),
             denied_names,
         },
-    )
+    );
+    complete_child_env(&mut env, &HostEnvFacts::current(), is_socket);
+    env
+}
+
+/// Facts about this host that complete a child's environment. Read once per
+/// spawn by [`HostEnvFacts::current`]; tests build their own.
+#[derive(Debug, Default)]
+pub struct HostEnvFacts {
+    /// The directory holding the running wsmp binary.
+    pub exe_dir: Option<PathBuf>,
+    /// `/run/user/$UID`, when this is Linux and that directory exists.
+    pub user_runtime_dir: Option<PathBuf>,
+}
+
+impl HostEnvFacts {
+    pub fn current() -> Self {
+        Self {
+            exe_dir: std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(Path::to_path_buf)),
+            user_runtime_dir: user_runtime_dir(),
+        }
+    }
+}
+
+/// `PATH` for a child when the daemon has none: the usual system directories.
+#[cfg(unix)]
+const FALLBACK_PATH: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin"];
+#[cfg(not(unix))]
+const FALLBACK_PATH: &[&str] = &[];
+
+/// The daemon's `PATH` plus the wsmp binary's directory when it is not
+/// already listed (appended, so nothing the daemon resolves changes). A
+/// service manager's default `PATH` rarely holds `~/.local/bin` or
+/// `~/.cargo/bin`, where wsmp is usually installed, so `wsmp ...` from a
+/// headless command would not be found otherwise.
+fn with_exe_dir(path: Option<&str>, exe_dir: &Path) -> Option<String> {
+    // Empty components (`::`, a leading or trailing `:`) mean the working
+    // directory to a shell; never keep or create one.
+    let mut dirs: Vec<PathBuf> = path
+        .map(|path| {
+            std::env::split_paths(path)
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if dirs.is_empty() {
+        dirs = FALLBACK_PATH.iter().map(PathBuf::from).collect();
+    }
+    if dirs.iter().any(|dir| dir == exe_dir) {
+        return None;
+    }
+    dirs.push(exe_dir.to_path_buf());
+    std::env::join_paths(dirs).ok()?.into_string().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn user_runtime_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(format!(
+        "/run/user/{}",
+        nix::unistd::Uid::effective().as_raw()
+    ));
+    dir.is_dir().then_some(dir)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn user_runtime_dir() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
+fn is_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_socket())
+}
+
+#[cfg(not(unix))]
+fn is_socket(_path: &Path) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    env.iter()
+        .find(|(key, _)| names_equal(key, name, cfg!(windows)))
+        .map(|(_, value)| value.as_str())
+}
+
+/// Fill in what a daemon started by a service manager may lack. `PATH` gains
+/// the wsmp binary's directory (see [`with_exe_dir`]). On Linux, when the
+/// daemon has no `XDG_RUNTIME_DIR` and `/run/user/$UID` exists, the child gets
+/// that directory; when it has no `DBUS_SESSION_BUS_ADDRESS` and
+/// `$XDG_RUNTIME_DIR/bus` is a socket, the child gets that bus. Values the
+/// daemon already has are kept as they are.
+pub fn complete_child_env(
+    env: &mut Vec<(String, String)>,
+    facts: &HostEnvFacts,
+    is_socket: impl Fn(&Path) -> bool,
+) {
+    if let Some(exe_dir) = &facts.exe_dir {
+        let index = env
+            .iter()
+            .position(|(name, _)| names_equal(name, "PATH", cfg!(windows)));
+        let current = index
+            .and_then(|index| env.get(index))
+            .map(|(_, value)| value.as_str());
+        if let Some(path) = with_exe_dir(current, exe_dir) {
+            match index.and_then(|index| env.get_mut(index)) {
+                Some(entry) => entry.1 = path,
+                None => env.push(("PATH".to_string(), path)),
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    complete_session_bus(env, facts, is_socket);
+    #[cfg(not(target_os = "linux"))]
+    let _ = is_socket;
+}
+
+/// Linux only: the user runtime dir and session bus (see
+/// [`complete_child_env`]). Other platforms have no `/run/user/$UID`.
+#[cfg(target_os = "linux")]
+fn complete_session_bus(
+    env: &mut Vec<(String, String)>,
+    facts: &HostEnvFacts,
+    is_socket: impl Fn(&Path) -> bool,
+) {
+    let Some(user_runtime_dir) = &facts.user_runtime_dir else {
+        return;
+    };
+    if env_value(env, "XDG_RUNTIME_DIR").is_none()
+        && let Some(dir) = user_runtime_dir.to_str()
+    {
+        env.push(("XDG_RUNTIME_DIR".to_string(), dir.to_string()));
+    }
+    if env_value(env, "DBUS_SESSION_BUS_ADDRESS").is_none()
+        && let Some(runtime) = env_value(env, "XDG_RUNTIME_DIR")
+    {
+        let bus = Path::new(runtime).join("bus");
+        if is_socket(&bus)
+            && let Some(bus) = bus.to_str()
+        {
+            env.push((
+                "DBUS_SESSION_BUS_ADDRESS".to_string(),
+                format!("unix:path={bus}"),
+            ));
+        }
+    }
 }
 
 /// `sh -c` when `sh` exists; Windows otherwise falls back to `cmd /C`.
@@ -251,6 +410,169 @@ mod tests {
                 "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "SHELL", "TZ", "TERM"
             ]
         );
+    }
+
+    #[test]
+    fn keeps_the_user_session_bus_and_runtime_dir() {
+        let kept = scrub(
+            &[
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+            ],
+            &[],
+            false,
+        );
+        assert_eq!(
+            names(&kept),
+            vec!["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"]
+        );
+    }
+
+    #[cfg(unix)]
+    fn owned(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fills_the_runtime_dir_and_bus_when_the_daemon_lacks_them() {
+        let facts = HostEnvFacts {
+            user_runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..HostEnvFacts::default()
+        };
+        let mut env = owned(&[("PATH", "/usr/bin")]);
+        complete_child_env(&mut env, &facts, |path| {
+            path == Path::new("/run/user/1000/bus")
+        });
+        assert_eq!(
+            env,
+            owned(&[
+                ("PATH", "/usr/bin"),
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+            ])
+        );
+
+        // No bus socket: only the runtime dir.
+        let mut env = owned(&[("PATH", "/usr/bin")]);
+        complete_child_env(&mut env, &facts, |_| false);
+        assert_eq!(
+            env,
+            owned(&[("PATH", "/usr/bin"), ("XDG_RUNTIME_DIR", "/run/user/1000")])
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn keeps_what_the_daemon_has_and_fills_nothing_without_a_user_runtime_dir() {
+        let facts = HostEnvFacts {
+            user_runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..HostEnvFacts::default()
+        };
+        let daemon = owned(&[
+            ("XDG_RUNTIME_DIR", "/custom/runtime"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/custom/bus"),
+        ]);
+        let mut env = daemon.clone();
+        complete_child_env(&mut env, &facts, |_| true);
+        assert_eq!(env, daemon);
+
+        // The daemon's own runtime dir locates the bus.
+        let mut env = owned(&[("XDG_RUNTIME_DIR", "/custom/runtime")]);
+        complete_child_env(&mut env, &facts, |path| {
+            path == Path::new("/custom/runtime/bus")
+        });
+        assert_eq!(
+            env,
+            owned(&[
+                ("XDG_RUNTIME_DIR", "/custom/runtime"),
+                ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/custom/runtime/bus"),
+            ])
+        );
+
+        // Not Linux, or no /run/user/$UID: nothing is invented.
+        let mut env = owned(&[("PATH", "/usr/bin")]);
+        complete_child_env(&mut env, &HostEnvFacts::default(), |_| true);
+        assert_eq!(env, owned(&[("PATH", "/usr/bin")]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_gains_the_wsmp_directory_once() {
+        let facts = HostEnvFacts {
+            exe_dir: Some(PathBuf::from("/home/me/.local/bin")),
+            ..HostEnvFacts::default()
+        };
+        let mut env = owned(&[("PATH", "/usr/bin:/bin"), ("HOME", "/home/me")]);
+        complete_child_env(&mut env, &facts, |_| false);
+        assert_eq!(
+            env,
+            owned(&[
+                ("PATH", "/usr/bin:/bin:/home/me/.local/bin"),
+                ("HOME", "/home/me")
+            ])
+        );
+        // Already listed: unchanged, in its original position.
+        let mut env = owned(&[("PATH", "/home/me/.local/bin:/usr/bin")]);
+        complete_child_env(&mut env, &facts, |_| false);
+        assert_eq!(env, owned(&[("PATH", "/home/me/.local/bin:/usr/bin")]));
+        // No daemon PATH: the system directories plus wsmp's.
+        let mut env = owned(&[("HOME", "/home/me")]);
+        complete_child_env(&mut env, &facts, |_| false);
+        assert_eq!(
+            env,
+            owned(&[
+                ("HOME", "/home/me"),
+                ("PATH", "/usr/local/bin:/usr/bin:/bin:/home/me/.local/bin")
+            ])
+        );
+        // An empty PATH (or empty components) never becomes `:<exe_dir>`.
+        let mut env = owned(&[("PATH", "")]);
+        complete_child_env(&mut env, &facts, |_| false);
+        assert_eq!(
+            env,
+            owned(&[("PATH", "/usr/local/bin:/usr/bin:/bin:/home/me/.local/bin")])
+        );
+        let mut env = owned(&[("PATH", ":/usr/bin::")]);
+        complete_child_env(&mut env, &facts, |_| false);
+        assert_eq!(env, owned(&[("PATH", "/usr/bin:/home/me/.local/bin")]));
+        // A directory that cannot be listed in PATH is left out.
+        let odd = HostEnvFacts {
+            exe_dir: Some(PathBuf::from("/opt/a:b")),
+            ..HostEnvFacts::default()
+        };
+        let mut env = owned(&[("PATH", "/usr/bin")]);
+        complete_child_env(&mut env, &odd, |_| false);
+        assert_eq!(env, owned(&[("PATH", "/usr/bin")]));
+    }
+
+    #[test]
+    fn scrubbed_parent_env_reaches_the_running_binary() {
+        let exe = std::env::current_exe().expect("current exe");
+        let dir = exe.parent().expect("exe dir");
+        let env = scrub_parent_env(&[]);
+        let path = env
+            .iter()
+            .find(|(name, _)| names_equal(name, "PATH", cfg!(windows)))
+            .map(|(_, value)| value.clone())
+            .expect("child PATH");
+        assert!(std::env::split_paths(&path).any(|entry| entry == dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_socket_tells_a_socket_from_a_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("bus");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").expect("write");
+        assert!(is_socket(&socket));
+        assert!(!is_socket(&file));
+        assert!(!is_socket(&dir.path().join("missing")));
     }
 
     #[test]

@@ -106,7 +106,9 @@ import {
   authLimiter,
   consumeDeviceCodeExchange,
   createRateLimiterMiddleware,
+  deviceCodeMintLimiter,
   emailRecipientLimiter,
+  isDeviceCodeMintRequest,
   mcpClientRegistrationLimiter,
   rpcLimiter,
   signinFailureLimiter,
@@ -813,12 +815,23 @@ export async function createApp(options: CreateAppOptions = {}) {
     app.use("/api/auth/*", mcpOauthRateLimits);
   }
 
+  // `wsmp login`'s device-code mint gets its own per-IP budget without the
+  // strict limiter's 15-minute block: approval is human, so a minted code
+  // grants nothing by itself (see `deviceCodeMintLimiter`).
+  const deviceCodeMintLimit = createRateLimiterMiddleware(deviceCodeMintLimiter, {
+    resolveKey: resolveClientIp,
+  });
+  app.use("/api/auth/device/code", async (c, next) =>
+    isDeviceCodeMintRequest(c) ? deviceCodeMintLimit(c, next) : next(),
+  );
+
   // Rate limit auth endpoints (credential-stuffing defense), EXCEPT get-session
-  // (handled above) and the flag-on MCP OAuth allowlist (handled by the MCP
-  // OAuth limiters above). Must be mounted BEFORE the auth handler so every auth
-  // request is throttled.
+  // (handled above), the device-code mint (handled above) and the flag-on MCP
+  // OAuth allowlist (handled by the MCP OAuth limiters above). Must be mounted
+  // BEFORE the auth handler so every auth request is throttled.
   app.use("/api/auth/*", async (c, next) => {
     if (c.req.path.endsWith("/get-session")) return next();
+    if (isDeviceCodeMintRequest(c)) return next();
     if (env.WMP_MCP_ENABLED && isMcpOauthRateLimitedRequest(c)) return next();
     return createRateLimiterMiddleware(authLimiter)(c, next);
   });

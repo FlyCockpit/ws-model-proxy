@@ -71,6 +71,9 @@
     "./lib/guarded-pool-create-reasons": {
       "default": "./src/lib/guarded-pool-create-reasons.ts"
     },
+    "./lib/deployment-refusal-reasons": {
+      "default": "./src/lib/deployment-refusal-reasons.ts"
+    },
     "./lib/serializable-transaction": {
       "default": "./src/lib/serializable-transaction.ts"
     },

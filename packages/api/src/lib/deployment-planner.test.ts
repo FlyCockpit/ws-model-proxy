@@ -1,3 +1,4 @@
+import { ORPCError } from "@orpc/server";
 import { DEPLOYMENT_COMMAND_MAX_BYTES } from "@ws-model-proxy/config/deployment-protocol";
 import { describe, expect, it } from "vitest";
 import {
@@ -284,6 +285,64 @@ describe("durable deployment placement policy", () => {
     expect(result.placements.map((p) => p.nodeId)).toEqual(["2", "3"]);
     expect(result.stopIds).toEqual([]);
     expect(result.requiresConfirmation).toBe(false);
+  });
+  it("lists the skipped nodes and their reasons when it picks nodes itself", () => {
+    let thrown: unknown;
+    try {
+      planDeployment({
+        nodes: [
+          node("spark-1"),
+          { ...node("spark-2"), reportedDeployments: false },
+          { ...node("spark-3"), labels: [] },
+        ],
+        existing: [],
+        variant,
+        groupCount: 1,
+        actor: "AGENT",
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(ORPCError);
+    const error = thrown as ORPCError<string, unknown>;
+    expect(error.code).toBe("PRECONDITION_FAILED");
+    expect(error.message).toBe(
+      "This plan needs 2 eligible nodes but 1 qualifies. Skipped: spark-2: Deployments require local opt-in and server grant; spark-3: Does not have every label the recipe requires.",
+    );
+    expect(error.data).toEqual({
+      reason: "not_enough_nodes",
+      nodeIds: ["spark-2", "spark-3"],
+      skippedNodes: [
+        {
+          nodeId: "spark-2",
+          reason: "deployments_not_enabled",
+          message: "Deployments require local opt-in and server grant",
+        },
+        {
+          nodeId: "spark-3",
+          reason: "label_mismatch",
+          message: "Does not have every label the recipe requires",
+        },
+      ],
+    });
+  });
+  it("carries a stable reason and the node on every gate refusal", () => {
+    expect(() => deploymentPermission([{ ...node("1"), online: false }], [], "USER")).toThrow(
+      expect.objectContaining({
+        code: "CONFLICT",
+        message: "Node 1 is offline",
+        data: { reason: "node_offline", nodeIds: ["1"] },
+      }),
+    );
+    expect(() =>
+      deploymentPermission([{ ...node("1"), execution: "systemd-no-linger" }], [], "USER"),
+    ).toThrow(
+      expect.objectContaining({
+        code: "PRECONDITION_FAILED",
+        message: "Unsupported deployment execution on 1; Linux requires user systemd and linger",
+        data: { reason: "unsupported_execution", nodeIds: ["1"] },
+      }),
+    );
   });
   it("requires both opt-in and grant and refuses unsupported mechanisms", () => {
     expect(() =>

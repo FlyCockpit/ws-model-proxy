@@ -6,6 +6,7 @@ import {
   DEPLOYMENT_PROTOCOL_VERSION,
   deploymentCommandBytes,
 } from "@ws-model-proxy/config/deployment-protocol";
+import type { DeploymentRefusalReason, DeploymentSkippedNode } from "./deployment-refusal-reasons";
 import {
   type DeploymentClaim,
   type DeploymentResources,
@@ -19,16 +20,33 @@ import {
   normalizeNodeLabels,
 } from "./node-inventory";
 
+type RefusalCode = "BAD_REQUEST" | "CONFLICT" | "FORBIDDEN" | "PRECONDITION_FAILED";
+
 /**
  * A planning refusal is a policy or input outcome, not a server fault: it must
  * reach the dashboard and MCP agents with its status and message instead of
- * an opaque 500.
+ * an opaque 500. `reason` is the stable code; the message is fixed text that
+ * may name node ids, so MCP copies it (see deployment-refusal-reasons.ts).
  */
 function refusal(
-  code: "BAD_REQUEST" | "CONFLICT" | "FORBIDDEN" | "PRECONDITION_FAILED",
+  code: RefusalCode,
+  reason: DeploymentRefusalReason,
   message: string,
+  extra: {
+    nodeIds?: readonly string[];
+    fields?: readonly string[];
+    skippedNodes?: readonly DeploymentSkippedNode[];
+  } = {},
 ) {
-  return new ORPCError(code, { message });
+  return new ORPCError(code, {
+    message,
+    data: {
+      reason,
+      ...(extra.nodeIds === undefined ? {} : { nodeIds: [...extra.nodeIds] }),
+      ...(extra.fields === undefined ? {} : { fields: [...extra.fields] }),
+      ...(extra.skippedNodes === undefined ? {} : { skippedNodes: [...extra.skippedNodes] }),
+    },
+  });
 }
 
 /**
@@ -159,7 +177,15 @@ function conflicts(node: DeploymentNode, req: DeploymentResources, existing: Exi
   // First choose a concrete assignment against empty capacity. Stop all claims on
   // those conflicting GPU resources; ranks using exclusively other GPUs survive.
   const empty = fit(node, req, []);
-  if (!empty) throw refusal("CONFLICT", `Requirements exceed usable budgets on ${node.id}`);
+  if (!empty)
+    throw refusal(
+      "CONFLICT",
+      "budget_exceeded",
+      `Requirements exceed usable budgets on ${node.id}`,
+      {
+        nodeIds: [node.id],
+      },
+    );
   const assigned = new Set(empty.gpus.map((g) => g.key));
   return ranks
     .filter(
@@ -169,21 +195,43 @@ function conflicts(node: DeploymentNode, req: DeploymentResources, existing: Exi
     )
     .map((r) => r.instance.id);
 }
-function gate(node: DeploymentNode) {
-  if (!node.online) throw refusal("CONFLICT", `Node ${node.id} is offline`);
+type GateFailure = { code: RefusalCode; reason: DeploymentRefusalReason; text: string };
+/** Why a node cannot run deployments, or null. `text` does not name the node. */
+function gateFailure(node: DeploymentNode): GateFailure | null {
+  if (!node.online) return { code: "CONFLICT", reason: "node_offline", text: "Node is offline" };
   if (node.protocolVersion !== DEPLOYMENT_PROTOCOL_VERSION)
-    throw refusal("PRECONDITION_FAILED", `CLI upgrade required on ${node.id}`);
+    return {
+      code: "PRECONDITION_FAILED",
+      reason: "cli_upgrade_required",
+      text: "CLI upgrade required",
+    };
   if (!node.allowDeployments || !node.reportedDeployments)
-    throw refusal(
-      "PRECONDITION_FAILED",
-      `Deployments require local opt-in and server grant on ${node.id}`,
-    );
+    return {
+      code: "PRECONDITION_FAILED",
+      reason: "deployments_not_enabled",
+      text: "Deployments require local opt-in and server grant",
+    };
   if (node.execution !== "systemd+linger" && node.execution !== "macos")
-    throw refusal(
-      "PRECONDITION_FAILED",
-      `Unsupported deployment execution on ${node.id}; Linux requires user systemd and linger`,
-    );
+    return {
+      code: "PRECONDITION_FAILED",
+      reason: "unsupported_execution",
+      text: "Unsupported deployment execution; Linux requires user systemd and linger",
+    };
+  return null;
 }
+function gate(node: DeploymentNode) {
+  const failure = gateFailure(node);
+  if (!failure) return;
+  // Keep the node id where the message always had it.
+  const [head, ...tail] = failure.text.split(";");
+  const message =
+    failure.reason === "node_offline"
+      ? `Node ${node.id} is offline`
+      : `${head} on ${node.id}${tail.length > 0 ? `;${tail.join(";")}` : ""}`;
+  throw refusal(failure.code, failure.reason, message, { nodeIds: [node.id] });
+}
+/** At most this many skipped nodes are spelled out in a refusal message. */
+const SKIPPED_NODES_IN_MESSAGE = 16;
 const modeOrder = { OFF: 0, SUPERVISED: 1, UNSUPERVISED: 2 } as const;
 /**
  * `nodes` run work, so each must pass the deployment gate. Command modes and confirmation are
@@ -199,20 +247,28 @@ export function deploymentPermission(
 ) {
   // No node to read a command mode from must never mean "unsupervised".
   if (actor === "AGENT" && modeNodes.length === 0)
-    throw refusal("FORBIDDEN", "Deployment commands are off on an affected node");
+    throw refusal("FORBIDDEN", "commands_off", "Deployment commands are off on an affected node");
   for (const node of nodes) gate(offlineStops.has(node.id) ? { ...node, online: true } : node);
   const minimum = Math.min(
     ...modeNodes.flatMap((n) => [modeOrder[n.mode], modeOrder[n.localMode ?? "OFF"]]),
   );
   const effectiveMode = minimum === 0 ? "OFF" : minimum === 1 ? "SUPERVISED" : "UNSUPERVISED";
   if (actor === "AGENT" && effectiveMode === "OFF")
-    throw refusal("FORBIDDEN", "Deployment commands are off on an affected node");
+    throw refusal("FORBIDDEN", "commands_off", "Deployment commands are off on an affected node", {
+      nodeIds: modeNodes
+        .filter((n) => modeOrder[n.mode] === 0 || modeOrder[n.localMode ?? "OFF"] === 0)
+        .map((n) => n.id),
+    });
   if (
     actor === "AGENT" &&
     effectiveMode === "UNSUPERVISED" &&
     stops.some((s) => s.startedBy !== "AGENT" && !s.agentsMayPreempt)
   )
-    throw refusal("FORBIDDEN", "Agent cannot stop a protected human instance");
+    throw refusal(
+      "FORBIDDEN",
+      "protected_instance",
+      "Agent cannot stop a protected human instance",
+    );
   return {
     effectiveMode,
     requiresConfirmation: actor === "AGENT" ? effectiveMode === "SUPERVISED" : stops.length > 0,
@@ -233,18 +289,26 @@ export function planDeployment(input: {
   const heldOn = (nodeId: string) =>
     held.filter((h) => h.nodeId === nodeId).map((h) => h.resources);
   const count = variant.groupSize * input.groupCount;
-  if (count > 256 || count < 1) throw refusal("BAD_REQUEST", "A plan supports 1–256 ranks");
-  const byId = new Map(nodes.map((n) => [n.id, n]));
-  const candidates = nodes
-    .filter((n) => nodeHasAllLabels(n.labels, variant.labels))
-    .filter((n) => {
-      try {
-        gate(n);
-        return true;
-      } catch {
-        return false;
-      }
+  if (count > 256 || count < 1)
+    throw refusal("BAD_REQUEST", "invalid_rank_count", "A plan supports 1–256 ranks", {
+      fields: ["groupCount"],
     });
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  // Nodes passed over when the planner picks nodes itself, with the reason.
+  const skipped: DeploymentSkippedNode[] = [];
+  const candidates = nodes.filter((n) => {
+    if (!nodeHasAllLabels(n.labels, variant.labels)) {
+      skipped.push({
+        nodeId: n.id,
+        reason: "label_mismatch",
+        message: "Does not have every label the recipe requires",
+      });
+      return false;
+    }
+    const failure = gateFailure(n);
+    if (failure) skipped.push({ nodeId: n.id, reason: failure.reason, message: failure.text });
+    return failure === null;
+  });
   // Prefer nodes that fit without stopping existing groups; deterministic ties.
   candidates.sort(
     (a, b) =>
@@ -265,19 +329,40 @@ export function planDeployment(input: {
           ]),
         ) || a.id.localeCompare(b.id),
   );
+  if (!input.nodeIds && candidates.length < count) {
+    const listed = skipped
+      .slice(0, SKIPPED_NODES_IN_MESSAGE)
+      .map((s) => `${s.nodeId}: ${s.message}`);
+    if (skipped.length > listed.length) listed.push(`${skipped.length - listed.length} more`);
+    throw refusal(
+      "PRECONDITION_FAILED",
+      "not_enough_nodes",
+      `This plan needs ${count} eligible node${count === 1 ? "" : "s"} but ${candidates.length} qualif${candidates.length === 1 ? "ies" : "y"}.` +
+        (listed.length > 0 ? ` Skipped: ${listed.join("; ")}.` : ""),
+      { nodeIds: skipped.map((s) => s.nodeId), skippedNodes: skipped },
+    );
+  }
   const selected = input.nodeIds
     ? input.nodeIds.map((id) => {
         const n = byId.get(id);
-        if (!n) throw refusal("BAD_REQUEST", `Unknown node ${id}`);
+        if (!n)
+          throw refusal("BAD_REQUEST", "unknown_node", `Unknown node ${id}`, {
+            fields: ["nodeIds"],
+          });
         return n;
       })
     : candidates.slice(0, count);
   if (selected.length !== count || new Set(selected.map((n) => n.id)).size !== count)
-    throw refusal("BAD_REQUEST", `Select exactly ${count} distinct nodes`);
+    throw refusal("BAD_REQUEST", "wrong_node_count", `Select exactly ${count} distinct nodes`, {
+      fields: ["nodeIds"],
+    });
   for (const n of selected) {
     gate(n);
     if (!nodeHasAllLabels(n.labels, variant.labels))
-      throw refusal("BAD_REQUEST", `Node ${n.id} does not match labels`);
+      throw refusal("BAD_REQUEST", "label_mismatch", `Node ${n.id} does not match labels`, {
+        nodeIds: [n.id],
+        fields: ["nodeIds"],
+      });
   }
   const stopIds = new Set<string>();
   // Conflict cascades remove all ranks of selected groups before recalculating fit.
@@ -303,12 +388,19 @@ export function planDeployment(input: {
       ...heldOn(node.id),
     ]);
     if (!resources)
-      throw refusal(
-        "CONFLICT",
-        fit(node, rankValue(variant.resources, rank), claims)
-          ? `Resources on ${node.id} stay held until WS Model Proxy confirms that an earlier service there stopped`
-          : `Requirements exceed usable budgets on ${node.id}`,
-      );
+      throw fit(node, rankValue(variant.resources, rank), claims)
+        ? refusal(
+            "CONFLICT",
+            "resources_held",
+            `Resources on ${node.id} stay held until WS Model Proxy confirms that an earlier service there stopped`,
+            { nodeIds: [node.id] },
+          )
+        : refusal(
+            "CONFLICT",
+            "budget_exceeded",
+            `Requirements exceed usable budgets on ${node.id}`,
+            { nodeIds: [node.id] },
+          );
     // Stopping claims still own ports until confirmed stop: never reuse them now.
     const busy = new Set(
       [...existing.flatMap((i) => i.nodes), ...held]
@@ -323,7 +415,9 @@ export function planDeployment(input: {
     )
       if (!busy.has(p)) ports.push(p);
     if (ports[0] === undefined || (variant.groupSize > 1 && ports[1] === undefined))
-      throw refusal("CONFLICT", `No free deployment ports on ${node.id}`);
+      throw refusal("CONFLICT", "no_free_ports", `No free deployment ports on ${node.id}`, {
+        nodeIds: [node.id],
+      });
     return {
       nodeId: node.id,
       rank,
@@ -342,7 +436,13 @@ export function planDeployment(input: {
   ].sort();
   const affected = affectedNodeIds.map((id) => {
     const n = byId.get(id);
-    if (!n) throw refusal("CONFLICT", `Stopped instance node ${id} is unavailable`);
+    if (!n)
+      throw refusal(
+        "CONFLICT",
+        "stopped_node_unavailable",
+        `Stopped instance node ${id} is unavailable`,
+        { nodeIds: [id] },
+      );
     return n;
   });
   const permission = deploymentPermission(
@@ -357,7 +457,12 @@ export function planDeployment(input: {
       ? "127.0.0.1"
       : deploymentHeadAddress(head?.info.interfaces, variant.iface);
   if (!headAddr)
-    throw refusal("BAD_REQUEST", "Head address is unavailable on the selected interface");
+    throw refusal(
+      "BAD_REQUEST",
+      "head_address_unavailable",
+      "Head address is unavailable on the selected interface",
+      head ? { nodeIds: [head.id] } : {},
+    );
   return {
     placements,
     stopIds: [...stopIds].sort(),
@@ -393,10 +498,15 @@ const PLACEHOLDER_VALUE = /^[A-Za-z0-9_.:,+-]*$/;
 export function renderDeploymentCommand(command: string, values: Record<string, string | number>) {
   const rendered = command.replace(/\{\{([a-z_]+)\}\}/g, (_, key: string) => {
     const value = values[key];
-    if (value === undefined) throw refusal("BAD_REQUEST", `Unknown deployment placeholder ${key}`);
+    if (value === undefined)
+      throw refusal("BAD_REQUEST", "unknown_placeholder", `Unknown deployment placeholder ${key}`);
     const text = String(value);
     if (!PLACEHOLDER_VALUE.test(text))
-      throw refusal("BAD_REQUEST", `Deployment placeholder ${key} has an unsafe value`);
+      throw refusal(
+        "BAD_REQUEST",
+        "unsafe_placeholder_value",
+        `Deployment placeholder ${key} has an unsafe value`,
+      );
     return text;
   });
   // The CLI refuses a longer job command outright; substitution can lengthen a saved command,
@@ -404,6 +514,7 @@ export function renderDeploymentCommand(command: string, values: Record<string, 
   if (deploymentCommandBytes(rendered) > DEPLOYMENT_COMMAND_MAX_BYTES)
     throw refusal(
       "BAD_REQUEST",
+      "command_too_large",
       `A rendered deployment command exceeds ${DEPLOYMENT_COMMAND_MAX_BYTES} bytes`,
     );
   return rendered;

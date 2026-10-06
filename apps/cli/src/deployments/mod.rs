@@ -1721,6 +1721,20 @@ fn manager_until(
     deadline: Deadline,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<String> {
+    manager_output_until(program, args, deadline, cancel, false)
+}
+
+/// Runs a user-manager query with `XDG_RUNTIME_DIR` set. With `any_status`,
+/// stdout is returned whatever the exit status (for commands that report a
+/// state through both, like `systemctl is-system-running`).
+#[cfg(target_os = "linux")]
+fn manager_output_until(
+    program: &str,
+    args: &[String],
+    deadline: Deadline,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    any_status: bool,
+) -> Result<String> {
     deadline.remaining()?;
     let mut invocation = vec![
         format!(
@@ -1730,9 +1744,34 @@ fn manager_until(
         program.to_owned(),
     ];
     invocation.extend_from_slice(args);
-    let bytes = crate::bounded_run::run_until("env", &invocation, deadline.0, 8192, cancel)
+    let run = if any_status {
+        crate::bounded_run::run_until_any_status
+    } else {
+        crate::bounded_run::run_until
+    };
+    let bytes = run("env", &invocation, deadline.0, 8192, cancel)
         .map_err(|_| anyhow::anyhow!("manager unavailable"))?;
     String::from_utf8(bytes).context("manager invalid output")
+}
+
+/// Whether `systemctl --user is-system-running` describes a live user
+/// manager. It exits nonzero for every state but `running`, so the state is
+/// read from stdout: `degraded` (some unit failed) and `starting` (still
+/// booting) managers run user services as well as a `running` one.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn user_manager_live(state: &str) -> bool {
+    matches!(state.trim(), "running" | "degraded" | "starting")
+}
+
+/// Whether `loginctl show-user <uid> -p Linger` says linger is on
+/// (`Linger=yes`), tolerating surrounding whitespace and extra lines.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linger_enabled(output: &str) -> bool {
+    output.lines().any(|line| {
+        line.trim()
+            .split_once('=')
+            .is_some_and(|(key, value)| key.trim() == "Linger" && value.trim() == "yes")
+    })
 }
 
 #[cfg(unix)]
@@ -2292,13 +2331,14 @@ pub fn mechanism_until(
     #[cfg(target_os = "linux")]
     {
         let uid = nix::unistd::Uid::effective().as_raw().to_string();
-        let manager_running = manager_until(
+        let manager_running = manager_output_until(
             "systemctl",
             &["--user".into(), "is-system-running".into()],
             deadline,
             cancel,
+            true,
         )
-        .is_ok();
+        .is_ok_and(|state| user_manager_live(&state));
         if !manager_running {
             return "unsupported";
         }
@@ -2308,7 +2348,7 @@ pub fn mechanism_until(
             deadline,
             cancel,
         )
-        .is_ok_and(|text| text.trim() == "Linger=yes");
+        .is_ok_and(|text| linger_enabled(&text));
         if linger {
             "systemd+linger"
         } else {

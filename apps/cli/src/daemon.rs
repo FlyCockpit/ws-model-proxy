@@ -675,7 +675,33 @@ pub fn connect_foreground() -> Result<()> {
         };
         config = candidate;
         let cli_slug = ensure_cli_slug(&mut config)?;
-        let credential = resolve_credential(&config)?;
+        let credential = match resolve_credential(&config) {
+            Ok(credential) => credential,
+            // Definitely no credential: stop only where nothing restarts us in
+            // a loop (see `stop_on_unusable_credential`).
+            Err(error)
+                if crate::auth::is_missing_credential(&error) && stop_on_unusable_credential() =>
+            {
+                return Err(error.context(crate::exit::CodedError::new(
+                    crate::exit::ExitCode::CredentialRejected,
+                )));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    retry_delay_secs = reconnect_delay.as_secs(),
+                    "relay credential unavailable; retrying"
+                );
+                wait_for_reconnect(
+                    &mut control,
+                    &config,
+                    &last_inventory_revision,
+                    reconnect_delay,
+                )?;
+                reconnect_delay = next_reconnect_delay(reconnect_delay);
+                continue;
+            }
+        };
         let secret = match credential {
             crate::auth::ResolvedCredential::CliToken { secret, .. } => secret,
             crate::auth::ResolvedCredential::Device { secret } => secret,
@@ -1066,11 +1092,8 @@ fn run_relay_session(
         HeaderValue::from_static(RELAY_SUBPROTOCOL),
     );
     request.headers_mut().insert("Authorization", auth_value);
-    let (mut socket, response) =
-        connect(request).map_err(|error| RelaySessionError::Reconnectable {
-            error: anyhow::Error::new(error).context("opening relay websocket"),
-            reset_backoff: false,
-        })?;
+    let (mut socket, response) = connect(request)
+        .map_err(|error| relay_connect_error(error, stop_on_unusable_credential()))?;
     if response
         .headers()
         .get("Sec-WebSocket-Protocol")
@@ -4027,6 +4050,53 @@ where
         .map_err(|error| websocket_session_error(error, context, true))
 }
 
+/// Set by the systemd unit `wsmp service install` writes, which also lists
+/// exit 4 in `RestartPreventExitStatus=`: there, stopping on an unusable
+/// credential cannot turn into a restart loop.
+pub const STOP_ON_REJECTED_CREDENTIAL_ENV: &str = "WSMP_STOP_ON_REJECTED_CREDENTIAL";
+
+/// Whether a missing or rejected credential stops the relay (exit 4) rather
+/// than being retried in-process with the normal backoff (capped at 5 min).
+/// It stops under the systemd unit (which does not restart on exit 4) and in
+/// an interactive terminal (where a person sees the message). Elsewhere, such
+/// as a macOS LaunchAgent (`KeepAlive` relaunches every exit) or a detached
+/// daemon, exiting would only restart or lose the relay, so it keeps retrying
+/// and picks up a new `wsmp login` by itself.
+fn stop_on_unusable_credential() -> bool {
+    use std::io::IsTerminal;
+    std::env::var_os(STOP_ON_REJECTED_CREDENTIAL_ENV).is_some_and(|value| value == "1")
+        || std::io::stderr().is_terminal()
+}
+
+/// Classify a failed relay websocket handshake. A 401 means the server
+/// rejected the credential (revoked, replaced by a newer login, invalid, or
+/// temporarily banned); with `stop` it is fatal and asks for `wsmp login`,
+/// otherwise it is retried with backoff. Everything else, including a 403
+/// from a proxy or firewall in front of the server, 429 and 5xx, reconnects.
+fn relay_connect_error(error: tungstenite::Error, stop: bool) -> RelaySessionError {
+    if let tungstenite::Error::Http(response) = &error
+        && response.status().as_u16() == 401
+    {
+        let rejected = anyhow::anyhow!(
+            "the server rejected this machine's relay credential (HTTP 401); it is revoked or invalid. Run `wsmp login` to sign in again"
+        );
+        return if stop {
+            RelaySessionError::Fatal(rejected.context(crate::exit::CodedError::new(
+                crate::exit::ExitCode::CredentialRejected,
+            )))
+        } else {
+            RelaySessionError::Reconnectable {
+                error: rejected,
+                reset_backoff: false,
+            }
+        };
+    }
+    RelaySessionError::Reconnectable {
+        error: anyhow::Error::new(error).context("opening relay websocket"),
+        reset_backoff: false,
+    }
+}
+
 fn websocket_session_error(
     error: tungstenite::Error,
     context: &'static str,
@@ -5215,6 +5285,49 @@ mod tests {
                 .as_str(),
             "http://localhost:11434/v1/models"
         );
+    }
+
+    #[test]
+    fn rejected_relay_credentials_are_fatal_but_server_trouble_reconnects() {
+        let http = |status: u16| {
+            let response = tungstenite::http::Response::builder()
+                .status(status)
+                .body(None)
+                .expect("response");
+            tungstenite::Error::Http(Box::new(response))
+        };
+        match relay_connect_error(http(401), true) {
+            RelaySessionError::Fatal(error) => {
+                assert_eq!(
+                    crate::exit::code_for(&error),
+                    crate::exit::ExitCode::CredentialRejected
+                );
+                assert!(crate::exit::message_for(&error).contains("`wsmp login`"));
+            }
+            _ => panic!("HTTP 401 must be fatal where stopping is safe"),
+        }
+        // Where exiting would only be relaunched (launchd), 401 is retried.
+        match relay_connect_error(http(401), false) {
+            RelaySessionError::Reconnectable { error, .. } => {
+                assert!(format!("{error:#}").contains("`wsmp login`"));
+            }
+            _ => panic!("HTTP 401 must be retried without the stop marker"),
+        }
+        // 403 can come from a proxy or firewall: never fatal.
+        for status in [403, 429, 500, 502, 503] {
+            for stop in [true, false] {
+                assert!(matches!(
+                    relay_connect_error(http(status), stop),
+                    RelaySessionError::Reconnectable { .. }
+                ));
+            }
+        }
+        let io =
+            tungstenite::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert!(matches!(
+            relay_connect_error(io, true),
+            RelaySessionError::Reconnectable { .. }
+        ));
     }
 
     #[test]

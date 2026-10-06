@@ -7,6 +7,9 @@
 //!   1  generic runtime error (the default for any `anyhow::Error`)
 //!   2  usage error (clap emits this automatically for bad arguments)
 //!   3  the requested resource was not found
+//!   4  the relay has no usable credential (missing, or rejected with 401);
+//!      run `wsmp login`. The systemd unit lists this in
+//!      `RestartPreventExitStatus=` so it does not restart in a loop.
 //!
 //! A relay stopped by SIGHUP, SIGINT, or SIGTERM cleans up and then dies from
 //! that signal (shell status 128 + signal); see `crate::shutdown`.
@@ -29,6 +32,9 @@ pub enum ExitCode {
     Usage = 2,
     /// The requested resource (e.g. an endpoint slug) was not found.
     NotFound = 3,
+    /// The relay credential is missing, revoked, or rejected by the server.
+    /// Retrying cannot fix it; the user must run `wsmp login`.
+    CredentialRejected = 4,
 }
 
 /// Annotate an error to request a specific [`ExitCode`].

@@ -118,7 +118,7 @@ import { resolveMcpPlugins } from "../../../packages/auth/src/mcp-plugins";
 import { createApp } from "./app";
 import { MCP_WELL_KNOWN_PATHS } from "./mcp-discovery";
 import { MCP_OAUTH_RATE_LIMITED_ROUTES } from "./mcp-oauth-route-match";
-import { mcpClientRegistrationLimiter } from "./rate-limit";
+import { authLimiter, deviceCodeMintLimiter, mcpClientRegistrationLimiter } from "./rate-limit";
 import { getUserDeletionSweepHealth, startUserDeletionSweep } from "./user-deletion-sweep";
 
 const prismaMock = prismaDefault as unknown as DeepMockProxy<typeof prismaDefault>;
@@ -749,6 +749,43 @@ describe("createApp registration contract — device-code exchange limiter (CI-2
         json: { code: "BAD_REQUEST", message: CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE },
       });
     }
+  });
+});
+
+describe("createApp registration contract — device-code mint budget", () => {
+  const IP = "10.9.9.9";
+  afterEach(async () => {
+    await deviceCodeMintLimiter.delete(IP);
+    await authLimiter.delete(IP);
+  });
+
+  it("POST /api/auth/device/code has its own per-IP bucket and leaves the strict auth bucket alone", async () => {
+    mockGetConnInfo.mockReturnValue({ remote: { address: IP } });
+    const app = await buildApp(false);
+    const post = (path: string) =>
+      app.request(`${BASE}${path}`, {
+        method: "POST",
+        headers: { ...HOST, "content-type": "application/json" },
+        body: JSON.stringify({ client_id: "ws-model-proxy", scope: "cli-slug:desk-01" }),
+      });
+    for (let call = 0; call < 20; call += 1) {
+      const res = await post("/api/auth/device/code");
+      expect(res.status, `mint ${call}`).not.toBe(429);
+      expect(res.headers.get("x-ratelimit-limit"), `mint ${call}`).toBe("20");
+    }
+    const limited = await post("/api/auth/device/code");
+    expect(limited.status).toBe(429);
+    const retryAfter = Number(limited.headers.get("retry-after"));
+    // No 15-minute block: the wait is at most one 60 s window.
+    expect(retryAfter).toBeGreaterThan(0);
+    expect(retryAfter).toBeLessThanOrEqual(60);
+    // The mints never touched the strict bucket: sign-in from the same IP is its first hit.
+    const signIn = await post("/api/auth/sign-in/email");
+    expect(signIn.headers.get("x-ratelimit-limit")).toBe("500");
+    expect(signIn.headers.get("x-ratelimit-remaining")).toBe("499");
+    // A near-miss spelling keeps the strict limiter.
+    const encoded = await post("/api/%61uth/device/code");
+    expect(encoded.headers.get("x-ratelimit-limit")).toBe("500");
   });
 });
 

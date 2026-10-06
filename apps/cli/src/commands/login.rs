@@ -100,6 +100,9 @@ pub fn run(args: &Args) -> Result<()> {
                 if !args.json {
                     output::line("device login complete")?;
                 }
+                if let Some(hint) = crate::commands::service::restart_hint_after_login() {
+                    output::diagnostic(hint)?;
+                }
                 return Ok(());
             }
             Err(ExchangeError::DeviceFlow(DeviceFlowState::Pending)) => {

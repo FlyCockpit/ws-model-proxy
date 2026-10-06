@@ -220,6 +220,50 @@ describe("sanitizeValidationIssues", () => {
     ]);
   });
 
+  it("passes developer-written refinement messages when they echo no caller text", () => {
+    const caller = { a: "LIMITED", poolId: "pool-1", headers: { Authorization: PLAIN_SECRET } };
+    expect(
+      sanitizeValidationIssues(
+        {
+          issues: [
+            { code: "custom", path: ["a"], message: "Limited mode requires a limit" },
+            { code: "custom", path: ["x"], message: `Unknown pool pool-1.` },
+            { code: "custom", path: ["x"], message: `bad ${PLAIN_SECRET}` },
+            { code: "custom", path: ["x"], message: "header Authorization is wrong" },
+            { code: "custom", path: ["x"], message: "poolId and headers conflict" },
+            { code: "custom", path: ["x"], message: "line\nbreak" },
+            { code: "custom", path: ["x"], message: `leaked ${SECRET}` },
+          ],
+        },
+        KNOWN,
+        caller,
+      )?.map((issue) => issue.message),
+    ).toEqual([
+      "Limited mode requires a limit",
+      // Echoes a caller value or key: fixed text.
+      "Invalid value",
+      "Invalid value",
+      "Invalid value",
+      // Declared property names are schema text, not caller text.
+      "poolId and headers conflict",
+      // Control character: fixed text.
+      "Invalid value",
+      // Credential shape the caller never sent: fixed text.
+      "Invalid value",
+    ]);
+  });
+
+  it("checks refinement messages against every caller input it is given (raw and adapted)", () => {
+    const issues = [{ code: "custom", path: ["a"], message: "bad rendered-value-77" }];
+    expect(
+      sanitizeValidationIssues({ issues }, KNOWN, [{ a: "raw" }, { a: "rendered-value-77" }])?.[0]
+        ?.message,
+    ).toBe("Invalid value");
+    expect(
+      sanitizeValidationIssues({ issues }, KNOWN, [{ a: "raw" }, undefined])?.[0]?.message,
+    ).toBe("bad rendered-value-77");
+  });
+
   it("does not echo unrecognized keys and suggests the nearest declared names", () => {
     const issues = sanitize(
       [

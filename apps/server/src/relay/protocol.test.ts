@@ -375,6 +375,7 @@ describe("current relay protocol minimum", () => {
       `relay protocol ${RELAY_MIN_PROTOCOL_VERSION}`,
     );
     expect(RELAY_UPGRADE_REQUIRED_MESSAGE).toContain("Upgrade wsmp");
+    expect(RELAY_UPGRADE_REQUIRED_MESSAGE).toContain("wsmp 0.4.0 or newer");
   });
 
   it("flags every hello that is not the minimum protocol, and the pre-naming label field", () => {

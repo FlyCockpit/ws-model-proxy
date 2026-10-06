@@ -69,14 +69,23 @@ function rejectPolicy(
   message: string,
   fields: readonly string[],
   reason?: GuardedPoolCreateFailureReason,
+  detail?: { hardLimit: number; poolMemberId?: string },
 ): never {
   throw new ORPCError("BAD_REQUEST", {
     message,
     data: {
       ...(reason === undefined ? {} : { reason }),
       fields: [...fields],
+      ...detail,
     },
   });
+}
+
+/** Which member's physical limit blocks a policy, and what that limit is. */
+function physicalLimitDetail(hardLimit: number, poolMemberId: string | undefined): string {
+  return poolMemberId === undefined
+    ? ` The target allows at most ${hardLimit}.`
+    : ` Pool member ${poolMemberId} uses this limit and its target allows at most ${hardLimit}.`;
 }
 
 export type ModelPoolCapacityPolicyInput = {
@@ -223,6 +232,8 @@ export function assertEffectiveConcurrencyPolicy(
   },
   reasons?: CapacityPolicyFailureReasons,
   fields?: PoolPolicyFieldNames,
+  /** The pool member being checked, named in the message when a pool-wide value blocks it. */
+  poolMemberId?: string,
 ): void {
   const effectiveLimit =
     input.memberMode === "LIMITED"
@@ -240,21 +251,23 @@ export function assertEffectiveConcurrencyPolicy(
   if (input.hardLimit == null) return;
   if (effectiveLimit != null && effectiveLimit > input.hardLimit)
     rejectPolicy(
-      "Effective concurrency limit exceeds physical capacity.",
+      `Effective concurrency limit exceeds physical capacity.${physicalLimitDetail(input.hardLimit, poolMemberId)}`,
       namedPolicyFields(
         ["capacityConcurrencyLimit", "hardConcurrencyLimit", "directConcurrencyLimit"],
         fields,
       ),
       reasons?.concurrencyExceedsPhysical,
+      { hardLimit: input.hardLimit, ...(poolMemberId === undefined ? {} : { poolMemberId }) },
     );
   if (effectiveReserved > input.hardLimit)
     rejectPolicy(
-      "Reserved slots exceed physical concurrency capacity.",
+      `Reserved slots exceed physical concurrency capacity.${physicalLimitDetail(input.hardLimit, poolMemberId)}`,
       namedPolicyFields(
         ["capacityReservedSlots", "hardConcurrencyLimit", "directReservedSlots"],
         fields,
       ),
       reasons?.reservedExceedsPhysical,
+      { hardLimit: input.hardLimit, ...(poolMemberId === undefined ? {} : { poolMemberId }) },
     );
 }
 
@@ -353,6 +366,7 @@ export async function fenceAndValidateModelPoolCapacityPolicy(
       capacityContextMargin: true,
       PoolMembers: {
         select: {
+          id: true,
           capacityConcurrencyMode: true,
           capacityConcurrencyLimit: true,
           capacityReservedSlots: true,
@@ -386,17 +400,22 @@ export async function fenceAndValidateModelPoolCapacityPolicy(
   });
 
   for (const member of pool.PoolMembers) {
-    assertEffectiveConcurrencyPolicy({
-      hardLimit: member.ExecutionTarget?.InferenceCapacity?.hardConcurrencyLimit,
-      poolLimit:
-        input.policy.capacityConcurrencyLimit !== undefined
-          ? input.policy.capacityConcurrencyLimit
-          : pool.capacityConcurrencyLimit,
-      poolReserved: input.policy.capacityReservedSlots ?? pool.capacityReservedSlots,
-      memberMode: member.capacityConcurrencyMode,
-      memberLimit: member.capacityConcurrencyLimit,
-      memberReserved: member.capacityReservedSlots,
-    });
+    assertEffectiveConcurrencyPolicy(
+      {
+        hardLimit: member.ExecutionTarget?.InferenceCapacity?.hardConcurrencyLimit,
+        poolLimit:
+          input.policy.capacityConcurrencyLimit !== undefined
+            ? input.policy.capacityConcurrencyLimit
+            : pool.capacityConcurrencyLimit,
+        poolReserved: input.policy.capacityReservedSlots ?? pool.capacityReservedSlots,
+        memberMode: member.capacityConcurrencyMode,
+        memberLimit: member.capacityConcurrencyLimit,
+        memberReserved: member.capacityReservedSlots,
+      },
+      undefined,
+      undefined,
+      member.id,
+    );
     assertEffectiveContextPolicy({
       physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
       poolCeiling:

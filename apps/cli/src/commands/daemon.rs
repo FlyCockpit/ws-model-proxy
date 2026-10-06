@@ -553,14 +553,20 @@ fn stop() -> Result<()> {
 
 pub fn run_status(json: bool) -> Result<()> {
     match control::request(ControlCommand::Status) {
-        Ok(response) => {
+        Ok(mut response) => {
+            // The control socket lives in the state directory, so the daemon
+            // that answered uses this same state directory and credential.
+            let state_dir = crate::paths::state_dir()?.display().to_string();
             if json {
+                if let Some(fields) = response.as_object_mut() {
+                    fields.insert("stateDir".to_string(), state_dir.into());
+                }
                 return output::json(&response);
             }
             for line in format_live_status(&response) {
                 output::line(line)?;
             }
-            Ok(())
+            output::line(format!("state dir: {state_dir}"))
         }
         Err(control_error) => report_control_status_failure(json, control_error),
     }

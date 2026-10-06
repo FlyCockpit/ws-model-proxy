@@ -248,6 +248,8 @@ export function applyInputOverlay(base: JsonObject, spec: McpInputSchemaSpec): J
   for (const [field, message] of Object.entries(spec.emptyArrayInputs ?? {})) {
     // The item shape is irrelevant (only `[]` passes): drop it to save size.
     properties[field] = { type: "array", maxItems: 0, description: message };
+    // Omitting an empty-only field is the same as `[]`; never require it.
+    required = required.filter((name) => name !== field);
   }
   for (const [field, message] of Object.entries(spec.forbiddenInputs ?? {})) {
     properties[field] = { not: {}, description: message };

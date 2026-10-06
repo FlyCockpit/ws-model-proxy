@@ -56,6 +56,16 @@ describe("forwarderManagementRouter pools", () => {
     expect(db.$transaction).not.toHaveBeenCalled();
   });
 
+  it("names the failing field on provider attachment refusals", async () => {
+    await expect(
+      client().addProviderPoolMember({
+        poolId: "pool-id",
+        providerModelId: "provider-model",
+        tier: "PRIMARY",
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST", data: { fields: ["tier"] } });
+  });
+
   it("refuses turning pool fallback on with a machine-readable reason when the switch is off", async () => {
     testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
     db.modelPool.findUnique.mockResolvedValueOnce(poolRow({ userId: "user-id" }));
@@ -1460,6 +1470,30 @@ describe("forwarderManagementRouter pools", () => {
       weight: 0,
       routingStatus: "DISABLED",
     });
+  });
+
+  it("retries a pool member update after a serialization failure", async () => {
+    db.poolMember.findUnique.mockResolvedValue({
+      id: "member-id",
+      ModelPool: { userId: "user-id" },
+    });
+    db.poolMember.update.mockResolvedValue({
+      id: "member-id",
+      weight: 0,
+      routingStatus: "DISABLED",
+    });
+    db.$transaction.mockRejectedValueOnce(
+      Object.assign(new Error("could not serialize access"), { code: "P2034" }),
+    );
+
+    await expect(
+      client().updatePoolMember({ id: "member-id", routingStatus: "DISABLED" }),
+    ).resolves.toMatchObject({ id: "member-id", routingStatus: "DISABLED" });
+    expect(db.$transaction).toHaveBeenCalledTimes(2);
+    expect(db.$transaction).toHaveBeenLastCalledWith(
+      expect.any(Function),
+      expect.objectContaining({ isolationLevel: "Serializable" }),
+    );
   });
 
   it("uses a fresh-null seed result when the pending inherited member would exceed", async () => {

@@ -509,6 +509,11 @@ describe("MCP-owned overlays", () => {
       MCP_TOOL_MANIFEST.find((tool) => tool.name === "forwarder_guarded_pool_create")!,
     ).properties as Record<string, Json>;
     expect(props.providerModels).toMatchObject({ type: "array", maxItems: 0 });
+    // Field feedback 10b: agents must not have to send `providerModels: []`.
+    expect(
+      advertised(MCP_TOOL_MANIFEST.find((tool) => tool.name === "forwarder_guarded_pool_create")!)
+        .required,
+    ).not.toContain("providerModels");
     expect(props.providerModels?.description).toEqual(
       expect.stringContaining("forwarder_provider_member_add"),
     );

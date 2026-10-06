@@ -115,6 +115,20 @@ fn executable() -> Result<String> {
         .map_err(|_| anyhow::anyhow!("wsmp executable path is not valid UTF-8"))
 }
 
+/// After `wsmp login`, a relay service that stopped on a rejected credential
+/// (exit 4, which systemd does not restart) needs a manual restart.
+pub fn restart_hint_after_login() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if service_file().is_ok_and(|file| file.exists()) {
+            return Some(format!(
+                "if the relay service stopped for lack of a credential, restart it: `systemctl --user restart {LINUX_UNIT}`"
+            ));
+        }
+    }
+    None
+}
+
 /// Env var names the relay may need at runtime (CLI token + endpoint headers).
 pub fn required_service_env_names(config: &Config) -> Vec<String> {
     let mut names = Vec::new();
@@ -192,10 +206,93 @@ pub fn systemd_quote_arg(value: &str) -> String {
     out
 }
 
-/// Render a systemd user unit for the relay.
-pub fn render_systemd_user_unit(executable: &str, env_file: &str) -> String {
+/// Variables `wsmp service install` pins into the service so it resolves the
+/// same config file and state directory (and so the same device credential)
+/// as the shell that installed it, whatever `XDG_*` the service manager sets,
+/// and so commands it starts find the same programs (`PATH`). Paths only: no
+/// secret ever goes into the unit or wrapper.
+pub fn pinned_service_env() -> Result<Vec<(&'static str, String)>> {
+    let pin = |name: &'static str, path: PathBuf| -> Result<(&'static str, String)> {
+        let path = std::path::absolute(&path)
+            .with_context(|| format!("resolving `{}`", path.display()))?;
+        let value = path
+            .into_os_string()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("`{name}` path is not valid UTF-8"))?;
+        Ok((name, value))
+    };
+    let mut pinned = vec![
+        pin("WSMP_CONFIG", crate::paths::config_file()?)?,
+        pin("WSMP_STATE_DIR", crate::paths::state_dir()?)?,
+    ];
+    // The installing shell's PATH, frozen at install time; re-run install to
+    // refresh it. Skipped when unset, not UTF-8, or nothing usable is left.
+    if let Some(path) = std::env::var("PATH")
+        .ok()
+        .and_then(|path| service_path(&path, usable_service_path_dir))
+    {
+        pinned.push(("PATH", path));
+    }
+    Ok(pinned)
+}
+
+/// The installing shell's `PATH` reduced to what a service should search:
+/// absolute directories `keep` accepts, each once, in order. Empty and
+/// relative entries (which would resolve against the service's working
+/// directory) are dropped. None when nothing is left.
+pub fn service_path(path: &str, keep: impl Fn(&Path) -> bool) -> Option<String> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dir in std::env::split_paths(path) {
+        if dir.as_os_str().is_empty() || !dir.is_absolute() || dirs.contains(&dir) || !keep(&dir) {
+            continue;
+        }
+        dirs.push(dir);
+    }
+    if dirs.is_empty() {
+        return None;
+    }
+    std::env::join_paths(dirs).ok()?.into_string().ok()
+}
+
+/// An existing directory that other users cannot write to (a world-writable
+/// directory on the service's PATH would let them plant programs it runs).
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+fn usable_service_path_dir(dir: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(dir) else {
+        return false;
+    };
+    if !metadata.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o002 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Render a systemd user unit for the relay. `pinned` holds non-secret
+/// `Environment=` entries (see [`pinned_service_env`]).
+pub fn render_systemd_user_unit(
+    executable: &str,
+    env_file: &str,
+    pinned: &[(&str, String)],
+) -> String {
     let exec = systemd_quote_arg(executable);
     let env_file = systemd_quote_arg(env_file);
+    let pinned: String = pinned
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "Environment={}\n",
+                systemd_quote_arg(&format!("{name}={value}"))
+            )
+        })
+        .collect();
     format!(
         "[Unit]\n\
          Description=WS Model Proxy relay\n\
@@ -207,6 +304,15 @@ pub fn render_systemd_user_unit(executable: &str, env_file: &str) -> String {
          ExecStart={exec} daemon start --foreground\n\
          Restart=on-failure\n\
          RestartSec=5\n\
+         # Exit 4: the credential is missing or was rejected (HTTP 401, including a\n\
+         # temporary ban); restarting cannot fix it. Run `wsmp login`, then\n\
+         # `systemctl --user restart wsmp.service`.\n\
+         RestartPreventExitStatus=4\n\
+         # Tells the relay it may exit 4 here instead of retrying in-process.\n\
+         Environment=WSMP_STOP_ON_REJECTED_CREDENTIAL=1\n\
+         # The config and state paths `wsmp service install` resolved, so the service\n\
+         # reads the same device credential as the installing shell.\n\
+         {pinned}\
          # Optional: CLI-token / endpoint-header env vars (see `wsmp service env-sync`).\n\
          # The leading `-` means a missing file is not fatal (device credentials still work).\n\
          EnvironmentFile=-{env_file}\n\
@@ -264,7 +370,15 @@ pub fn render_launch_agent_plist(
 }
 
 /// Render the 0700 wrapper that sources the private env file then execs wsmp.
-pub fn render_macos_service_wrapper(executable: &str, env_file: &str) -> String {
+pub fn render_macos_service_wrapper(
+    executable: &str,
+    env_file: &str,
+    pinned: &[(&str, String)],
+) -> String {
+    let pinned: String = pinned
+        .iter()
+        .map(|(name, value)| format!("export {name}='{}'\n", shell_single_quote(value)))
+        .collect();
     // Single-quoted shell paths: reject embedded single quotes rather than
     // inventing complex escaping for a generated path we control.
     format!(
@@ -272,6 +386,7 @@ pub fn render_macos_service_wrapper(executable: &str, env_file: &str) -> String 
          # Generated by `wsmp service install`. Sources the private env file\n\
          # (CLI-token / endpoint-header vars) without storing secrets in the plist.\n\
          set -eu\n\
+         {pinned}\
          ENV_FILE='{env_file}'\n\
          if [ -f \"$ENV_FILE\" ]; then\n\
          \tset -a\n\
@@ -305,7 +420,8 @@ fn install() -> Result<()> {
     let executable = executable()?;
     let env_file = service_env_file()?;
     ensure_service_env_placeholder(&env_file)?;
-    let unit = render_systemd_user_unit(&executable, &env_file.display().to_string());
+    let pinned = pinned_service_env()?;
+    let unit = render_systemd_user_unit(&executable, &env_file.display().to_string(), &pinned);
     write_service_file(&file, &unit)?;
     run_command("systemctl", &["--user", "daemon-reload"])?;
     // enable --now is idempotent enough for reinstall/upgrade: unit path is
@@ -315,7 +431,7 @@ fn install() -> Result<()> {
     let _ = Command::new("systemctl")
         .args(["--user", "restart", LINUX_UNIT])
         .status();
-    print_install_notes(&env_file)?;
+    print_install_notes(&env_file, &pinned)?;
     output::line(format!("installed and started `{}`", file.display()))
 }
 
@@ -331,7 +447,9 @@ fn install() -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("creating `{}`", parent.display()))?;
         set_private_dir(parent)?;
     }
-    let wrapper_body = render_macos_service_wrapper(&executable, &env_file.display().to_string());
+    let pinned = pinned_service_env()?;
+    let wrapper_body =
+        render_macos_service_wrapper(&executable, &env_file.display().to_string(), &pinned);
     write_private_script(&wrapper, wrapper_body.as_bytes())?;
 
     let log_dir = macos_log_dir()?;
@@ -366,7 +484,7 @@ fn install() -> Result<()> {
         .args(["kickstart", "-k", &format!("{domain}/{MACOS_LABEL}")])
         .status();
 
-    print_install_notes(&env_file)?;
+    print_install_notes(&env_file, &pinned)?;
     output::line(format!("installed and started `{}`", file.display()))
 }
 
@@ -508,11 +626,14 @@ fn ensure_service_env_placeholder(path: &Path) -> Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn print_install_notes(env_file: &Path) -> Result<()> {
+fn print_install_notes(env_file: &Path, pinned: &[(&str, String)]) -> Result<()> {
     output::line(format!(
         "service environment file: `{}` (mode 0600; never commit secrets)",
         env_file.display()
     ))?;
+    for (name, value) in pinned {
+        output::line(format!("service pins `{name}` to `{value}`"))?;
+    }
     output::line(
         "device login credentials are read from the CLI state directory and need no env file",
     )?;
@@ -645,12 +766,68 @@ mod tests {
         let unit = render_systemd_user_unit(
             "/opt/ws model/wsmp",
             "/home/user/.config/ws-model-proxy/service.env",
+            &[
+                (
+                    "WSMP_CONFIG",
+                    "/home/user/.config/ws-model-proxy/config.json".to_string(),
+                ),
+                ("WSMP_STATE_DIR", "/srv/wsmp state/100%".to_string()),
+                ("PATH", "/home/user/.local/bin:/usr/bin".to_string()),
+            ],
         );
         assert!(unit.contains("ExecStart=\"/opt/ws model/wsmp\" daemon start --foreground"));
         assert!(unit.contains("EnvironmentFile=-/home/user/.config/ws-model-proxy/service.env"));
         assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains(&format!(
+            "RestartPreventExitStatus={}",
+            crate::exit::ExitCode::CredentialRejected as i32
+        )));
         assert!(unit.contains("WantedBy=default.target"));
-        assert!(!unit.contains("Environment=WSMP_"));
+        assert!(
+            unit.contains(
+                "Environment=WSMP_CONFIG=/home/user/.config/ws-model-proxy/config.json\n"
+            )
+        );
+        assert!(unit.contains("Environment=\"WSMP_STATE_DIR=/srv/wsmp state/100%%\"\n"));
+        assert!(unit.contains("Environment=PATH=/home/user/.local/bin:/usr/bin\n"));
+        assert!(unit.contains(&format!(
+            "Environment={}=1\n",
+            crate::daemon::STOP_ON_REJECTED_CREDENTIAL_ENV
+        )));
+        // Only the pinned paths and the stop marker: no token or header variables.
+        assert_eq!(unit.matches("Environment=").count(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_path_keeps_only_absolute_usable_directories_once() {
+        let keep = |dir: &Path| dir != Path::new("/tmp/open");
+        assert_eq!(
+            service_path(
+                "/usr/bin::relative/bin:./bin:/tmp/open:/usr/bin:/home/me/.local/bin:",
+                keep
+            )
+            .as_deref(),
+            Some("/usr/bin:/home/me/.local/bin")
+        );
+        assert_eq!(service_path("", keep), None);
+        assert_eq!(service_path(":relative", keep), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_path_directories_must_exist_and_not_be_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let private = root.path().join("private");
+        let open = root.path().join("open");
+        fs::create_dir(&private).expect("private");
+        fs::create_dir(&open).expect("open");
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).expect("chmod");
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert!(usable_service_path_dir(&private));
+        assert!(!usable_service_path_dir(&open));
+        assert!(!usable_service_path_dir(&root.path().join("missing")));
     }
 
     #[test]
@@ -690,8 +867,14 @@ mod tests {
         let script = render_macos_service_wrapper(
             "/usr/local/bin/wsmp",
             "/Users/x/.config/ws-model-proxy/service.env",
+            &[
+                ("WSMP_STATE_DIR", "/Users/x/it's state".to_string()),
+                ("PATH", "/Users/x/.cargo/bin:/usr/bin".to_string()),
+            ],
         );
+        assert!(script.contains("export PATH='/Users/x/.cargo/bin:/usr/bin'\n"));
         assert!(script.starts_with("#!/bin/sh\n"));
+        assert!(script.contains("export WSMP_STATE_DIR='/Users/x/it'\"'\"'s state'\n"));
         assert!(script.contains("ENV_FILE='/Users/x/.config/ws-model-proxy/service.env'"));
         assert!(script.contains(". \"$ENV_FILE\""));
         assert!(script.contains("exec '/usr/local/bin/wsmp' daemon start --foreground"));

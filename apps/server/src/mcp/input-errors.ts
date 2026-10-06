@@ -13,11 +13,15 @@
  *     name (and is identifier-shaped, at most {@link MAX_SEGMENT_LENGTH}
  *     chars). Anything else (record keys the caller invented, symbols)
  *     becomes `"?"`, so no caller-chosen text can ride in a path;
- *   - `message`: the zod message ONLY for codes whose message is built from
- *     the schema and the input's TYPE (never its value), capped in length;
- *     `unrecognized_keys` (would echo input key names), `custom`
- *     (author-written, may interpolate the value) and unknown codes get a
- *     fixed text;
+ *   - `message`: the zod message for codes whose message is built from
+ *     the schema and the input's TYPE (never its value), capped in length.
+ *     A `custom` (refinement) message is developer-written and crosses too,
+ *     but only when the caller's arguments are supplied and the message
+ *     contains none of their string values or keys (so a refinement that
+ *     interpolates the value falls back to fixed text), after the control
+ *     character check, length cap and secret redaction of
+ *     {@link sanitizeArgumentMessage}. `unrecognized_keys` (would echo input
+ *     key names) and unknown codes get a fixed text;
  *   - `unknownKeyCount` and `suggestions` for `unrecognized_keys` only.
  *     Suggestions are nearest names the tool already declares. Caller-chosen
  *     key text never leaves;
@@ -92,7 +96,61 @@ function sanitizePath(path: unknown, knownKeys: ReadonlySet<string>): (string | 
   return path.slice(0, MAX_PATH_SEGMENTS).map((segment) => sanitizeSegment(segment, knownKeys));
 }
 
-function sanitizeMessage(code: string, message: unknown): string {
+/** Shortest caller string that counts as echoed when a message contains it. */
+const MIN_ECHO_PROBE_LENGTH = 4;
+const MAX_CALLER_STRINGS = 4096;
+const MAX_CALLER_DEPTH = 32;
+
+/**
+ * Every string value and object key in the caller's arguments (bounded
+ * walk). Keys the tool's schema declares are schema text, not caller text.
+ */
+function callerStrings(input: unknown, knownKeys: ReadonlySet<string>): string[] {
+  const found: string[] = [];
+  const visit = (node: unknown, depth: number): void => {
+    if (found.length >= MAX_CALLER_STRINGS || depth > MAX_CALLER_DEPTH) return;
+    if (typeof node === "string") {
+      if (node.length >= MIN_ECHO_PROBE_LENGTH) found.push(node);
+      return;
+    }
+    if (node === null || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, depth + 1);
+      return;
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (key.length >= MIN_ECHO_PROBE_LENGTH && !knownKeys.has(key)) found.push(key);
+      visit(value, depth + 1);
+    }
+  };
+  visit(input, 0);
+  return found;
+}
+
+/**
+ * A refinement's developer-written message, or null when it might carry
+ * caller text: no caller arguments to check against, a control character,
+ * or any caller string value or key appearing in it.
+ */
+function customRefinementMessage(message: unknown, caller: CallerEcho | undefined): string | null {
+  if (caller === undefined || typeof message !== "string") return null;
+  const safe = sanitizeArgumentMessage(message);
+  // A product credential shape never belongs in a refinement message.
+  if (safe === null || /wsmp_/i.test(safe)) return null;
+  return caller.strings.some((value) => message.includes(value) || safe.includes(value))
+    ? null
+    : safe;
+}
+
+interface CallerEcho {
+  strings: readonly string[];
+}
+
+function sanitizeMessage(code: string, message: unknown, caller?: CallerEcho): string {
+  if (code === "custom") {
+    const custom = customRefinementMessage(message, caller);
+    if (custom !== null) return custom;
+  }
   if (MESSAGE_SAFE_CODES.has(code) && typeof message === "string" && message.length > 0) {
     return message.length > MAX_MESSAGE_LENGTH
       ? `${message.slice(0, MAX_MESSAGE_LENGTH)}...`
@@ -171,16 +229,21 @@ function suggestDeclaredNames(
 /**
  * The sanitized issues of a BAD_REQUEST `data` payload, or `null` when it
  * carries no usable issue list (the caller then keeps the plain error).
+ * `callerInput` is the tool call's own arguments; without it, refinement
+ * (`custom`) messages get fixed text.
  */
 export function sanitizeValidationIssues(
   data: unknown,
   knownKeys: ReadonlySet<string>,
+  callerInput?: unknown,
 ): McpValidationIssue[] | null {
   if (data === null || typeof data !== "object" || !Object.hasOwn(data, "issues")) return null;
   const issues: unknown = Reflect.get(data, "issues");
   if (!Array.isArray(issues) || issues.length === 0) return null;
   const result: McpValidationIssue[] = [];
   const suggestionBudget = { remaining: MAX_SUGGESTION_COMPARISONS };
+  const caller: CallerEcho | undefined =
+    callerInput === undefined ? undefined : { strings: callerStrings(callerInput, knownKeys) };
   for (const issue of issues.slice(0, MAX_ISSUES)) {
     if (issue === null || typeof issue !== "object") continue;
     const code = sanitizeCode(Reflect.get(issue, "code"));
@@ -193,7 +256,7 @@ export function sanitizeValidationIssues(
     result.push({
       path: sanitizePath(Reflect.get(issue, "path"), knownKeys),
       code,
-      message: sanitizeMessage(code, Reflect.get(issue, "message")),
+      message: sanitizeMessage(code, Reflect.get(issue, "message"), caller),
       ...(count === undefined ? {} : { unknownKeyCount: count }),
       ...(suggestions === undefined ? {} : { suggestions }),
     });
@@ -277,12 +340,14 @@ function hasControlCharacter(value: string): boolean {
   return FORMAT_CHARACTER.test(value);
 }
 
-export function sanitizeArgumentMessage(message: unknown): string | null {
+export function sanitizeArgumentMessage(
+  message: unknown,
+  maxLength: number = MAX_MESSAGE_LENGTH,
+): string | null {
   if (typeof message !== "string") return null;
   const trimmed = message.trim();
   if (trimmed.length === 0 || hasControlCharacter(trimmed)) return null;
-  const capped =
-    trimmed.length > MAX_MESSAGE_LENGTH ? `${trimmed.slice(0, MAX_MESSAGE_LENGTH)}...` : trimmed;
+  const capped = trimmed.length > maxLength ? `${trimmed.slice(0, maxLength)}...` : trimmed;
   const redacted = redactSecrets(capped);
   return typeof redacted === "string" ? redacted : null;
 }

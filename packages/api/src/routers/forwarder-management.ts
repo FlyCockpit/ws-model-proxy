@@ -196,7 +196,8 @@ const guardedPoolProcedures = {
                     .optional(),
                 }),
               )
-              .max(32),
+              .max(32)
+              .default([]),
           })
           .superRefine((input, ctx) => {
             if (input.localModelIds.length + input.providerModels.length === 0) {
