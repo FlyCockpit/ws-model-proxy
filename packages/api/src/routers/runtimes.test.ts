@@ -108,7 +108,38 @@ function nodeRow(overrides: Record<string, unknown> = {}) {
     labels: [],
     portStart: 30000,
     portEnd: 30010,
-    Ranks: [],
+    trustChangedAt: null,
+    heldDefinitions: [],
+    declaredResources: { kind: "unified", memoryGb: 66 },
+    nodeInfo: null,
+    nodeMetrics: null,
+    nodeMetricsAt: null,
+    ...overrides,
+  };
+}
+
+/** A running instance (as `loadPlacementInstances` reads it) holding these claims. */
+function claimant(
+  id: string,
+  ranks: Array<{ nodeId?: string; port: number; memoryGb?: number }>,
+  overrides: Record<string, unknown> = {},
+) {
+  return {
+    id,
+    userId: OWNER,
+    runtimeId: `rt-${id}`,
+    desiredState: "RUNNING" as const,
+    Runtime: { kind: "STARTABLE" as const, Models: [] },
+    LaunchVersion: { spec: SPEC },
+    Ranks: ranks.map((rank) => ({
+      nodeId: rank.nodeId ?? "node-1",
+      port: rank.port,
+      distPort: null,
+      resources:
+        rank.memoryGb === undefined
+          ? { kind: "none" }
+          : { kind: "unified", memoryGb: rank.memoryGb },
+    })),
     ...overrides,
   };
 }
@@ -349,7 +380,7 @@ describe("runtimes.delete", () => {
 });
 
 describe("runtimes.start / stop: the agent trust rule and the preview echo", () => {
-  function setupStart(node: ReturnType<typeof nodeRow>) {
+  function setupStart(node: ReturnType<typeof nodeRow>, claims: unknown[] = []) {
     db.runtime.findFirst.mockResolvedValue({
       id: "rt-1",
       kind: "STARTABLE",
@@ -357,6 +388,10 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
     } as never);
     db.runtimeVersion.findFirst.mockResolvedValue({ id: "ver-1", spec: SPEC } as never);
     db.node.findMany.mockResolvedValue([node] as never);
+    db.runtimeInstance.findMany.mockResolvedValue(claims as never);
+    db.fabric.findMany.mockResolvedValue([]);
+    db.runtimeInstance.updateMany.mockResolvedValue({ count: 0 });
+    db.instanceRank.updateMany.mockResolvedValue({ count: 0 });
     db.runtimeOperation.create.mockResolvedValue({ id: "op-1" } as never);
     db.runtimeOperation.findUniqueOrThrow.mockResolvedValue({
       id: "op-1",
@@ -443,10 +478,131 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
   });
 
   it("skips ports already claimed on the node", async () => {
-    setupStart(nodeRow({ Ranks: [{ port: 30000 }, { port: 30001 }] }));
+    setupStart(nodeRow(), [claimant("other", [{ port: 30000 }, { port: 30001 }])]);
     const preview = await client().start({ runtimeId: "rt-1", preview: true });
     if (preview.mode !== "preview") throw new Error("expected a preview");
     expect(preview.preview.starts[0]?.placements[0]?.port).toBe(30002);
+  });
+
+  it("preempts what must stop, shows it in the preview, and writes it fenced in one operation", async () => {
+    // 66 GiB node; "victim" holds 60, the start needs 16.
+    setupStart(nodeRow(), [claimant("victim", [{ port: 30000, memoryGb: 60 }])]);
+    const preview = await client().start({ runtimeId: "rt-1", preview: true });
+    if (preview.mode !== "preview") throw new Error("expected a preview");
+    expect(preview.preview.refusals).toEqual([]);
+    expect(preview.preview.stops).toEqual([
+      { instanceId: "victim", runtimeId: "rt-victim", reason: "preempted" },
+    ]);
+    expect(preview.preview.starts[0]?.placements[0]).toMatchObject({ port: 30001, fabricIp: null });
+    db.runtimeInstance.updateMany.mockResolvedValue({ count: 1 });
+    await client().start({ runtimeId: "rt-1", fingerprint: preview.preview.fingerprint });
+    expect(fenceLog.held).toEqual([`00:owner:${OWNER}`, "08:capacity:victim"]);
+    expect(db.runtimeInstance.updateMany.mock.calls[0]?.[0]).toMatchObject({
+      where: { id: { in: ["victim"] }, desiredState: "RUNNING" },
+      data: {
+        desiredState: "STOPPED",
+        phase: "STOPPING",
+        phaseReason: "preempted",
+        operationId: "op-1",
+      },
+    });
+    expect(db.runtimeInstance.create.mock.calls[0]?.[0].data).toMatchObject({
+      fabricId: null,
+      Ranks: {
+        create: [expect.objectContaining({ port: 30001, blockedBy: ["victim"], distPort: null })],
+      },
+    });
+  });
+
+  it("refuses as stale when a preempted instance stopped meanwhile", async () => {
+    setupStart(nodeRow(), [claimant("victim", [{ port: 30000, memoryGb: 60 }])]);
+    db.runtimeInstance.updateMany.mockResolvedValue({ count: 0 });
+    expect(await reasonOf(client(CALLERS.fullAgent()).start({ runtimeId: "rt-1" }))).toBe(
+      "preview_stale",
+    );
+    expect(db.runtimeInstance.create).not.toHaveBeenCalled();
+  });
+
+  it("an agent never preempts a contributed instance or another user's", async () => {
+    setupStart(nodeRow(), [
+      claimant("contrib", [{ port: 30000, memoryGb: 30 }], {
+        Runtime: { kind: "STARTABLE", Models: [{ id: "rm-1" }] },
+      }),
+      claimant("foreign", [{ port: 30001, memoryGb: 30 }], { userId: "someone-else" }),
+    ]);
+    expect(await reasonOf(client(CALLERS.fullAgent()).start({ runtimeId: "rt-1" }))).toBe(
+      "not_enough_memory",
+    );
+    // A person may stop their own contributed instance (they confirm the stop list).
+    const preview = await client().start({ runtimeId: "rt-1", preview: true });
+    if (preview.mode !== "preview") throw new Error("expected a preview");
+    expect(preview.preview.stops.map((stop) => stop.instanceId)).toEqual(["contrib"]);
+  });
+
+  it("a multi-node start records its fabric, head address and dist port", async () => {
+    const spec: RuntimeSpec = {
+      ...SPEC,
+      launch: { ...(SPEC.launch as NonNullable<RuntimeSpec["launch"]>), groupSize: 2 },
+    };
+    setupStart(nodeRow());
+    db.runtimeVersion.findFirst.mockResolvedValue({ id: "ver-1", spec } as never);
+    db.node.findMany.mockResolvedValue([
+      nodeRow(),
+      nodeRow({ id: "node-2", slug: "box2" }),
+    ] as never);
+    db.fabric.findMany.mockResolvedValue([
+      {
+        id: "fab-1",
+        name: "pair",
+        Members: [
+          { nodeId: "node-1", ip: "10.0.0.1" },
+          { nodeId: "node-2", ip: "10.0.0.2" },
+        ],
+      },
+    ] as never);
+    await client(CALLERS.fullAgent()).start({ runtimeId: "rt-1" });
+    const created = db.runtimeInstance.create.mock.calls[0]?.[0].data;
+    expect(created).toMatchObject({ fabricId: "fab-1" });
+    expect(created?.Ranks).toMatchObject({
+      create: [
+        expect.objectContaining({ nodeId: "node-1", port: 30000, distPort: 30001 }),
+        expect.objectContaining({ nodeId: "node-2", port: 30000, distPort: 30001 }),
+      ],
+    });
+    const summary = db.runtimeOperation.create.mock.calls[0]?.[0].data.summary as {
+      starts: Array<{ fabric: unknown }>;
+    };
+    expect(summary.starts[0]?.fabric).toEqual({
+      fabricId: "fab-1",
+      name: "pair",
+      headAddr: "10.0.0.1",
+    });
+  });
+
+  it("refuses a multi-node start with no shared fabric", async () => {
+    const spec: RuntimeSpec = {
+      ...SPEC,
+      launch: { ...(SPEC.launch as NonNullable<RuntimeSpec["launch"]>), groupSize: 2 },
+    };
+    setupStart(nodeRow());
+    db.runtimeVersion.findFirst.mockResolvedValue({ id: "ver-1", spec } as never);
+    db.node.findMany.mockResolvedValue([
+      nodeRow(),
+      nodeRow({ id: "node-2", slug: "box2" }),
+    ] as never);
+    expect(await reasonOf(client(CALLERS.fullAgent()).start({ runtimeId: "rt-1" }))).toBe(
+      "no_shared_fabric",
+    );
+  });
+
+  it("stop takes the capacity fence of every instance it stops", async () => {
+    setupStop("FULL");
+    await client().stop({ instanceId: "inst-1" });
+    expect(fenceLog.held).toEqual([`00:owner:${OWNER}`, "08:capacity:inst-1"]);
+    expect(db.runtimeInstance.updateMany.mock.calls[0]?.[0].data).toMatchObject({
+      phaseReason: "stop_requested",
+      operationId: "op-2",
+    });
   });
 
   function setupStop(trust: "RELAY" | "FULL") {
@@ -454,6 +610,7 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
       { id: "inst-1", Ranks: [{ Node: { id: "node-1", trust, trustLowerRequestedAt: null } }] },
     ] as never);
     db.runtimeOperation.create.mockResolvedValue({ id: "op-2" } as never);
+    db.runtimeInstance.updateMany.mockResolvedValue({ count: 1 });
     db.runtimeOperation.findUniqueOrThrow.mockResolvedValue({
       id: "op-2",
       kind: "STOP",
@@ -567,6 +724,7 @@ describe("review follow-ups", () => {
       },
     ] as never);
     db.runtimeOperation.create.mockResolvedValue({ id: "op-2" } as never);
+    db.runtimeInstance.updateMany.mockResolvedValue({ count: 1 });
     db.runtimeOperation.findUniqueOrThrow.mockResolvedValue({
       id: "op-2",
       kind: "STOP",
@@ -590,10 +748,13 @@ describe("review follow-ups", () => {
       currentVersionId: "ver-1",
     } as never);
     db.runtimeVersion.findFirst.mockResolvedValue({ id: "ver-1", spec: SPEC } as never);
-    db.node.findMany.mockResolvedValue([nodeRow({ Ranks: [{ port: 30000 }] })] as never);
+    db.node.findMany.mockResolvedValue([nodeRow()] as never);
+    db.fabric.findMany.mockResolvedValue([]);
+    // inst-1's claim is RELEASED (not loaded); "thief" holds its port now.
+    db.runtimeInstance.findMany.mockResolvedValue([claimant("thief", [{ port: 30000 }])] as never);
     db.runtimeInstance.findFirst.mockResolvedValue({
       id: "inst-1",
-      Ranks: [{ nodeId: "node-1", port: 30000, claim: "RELEASED" }],
+      Ranks: [{ nodeId: "node-1", port: 30000, distPort: null }],
     } as never);
     const preview = await client().start({
       runtimeId: "rt-1",

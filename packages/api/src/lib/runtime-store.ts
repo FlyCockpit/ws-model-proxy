@@ -203,3 +203,34 @@ export async function ownedNode(userId: string, nodeId: string) {
   if (!node) throw refuseAbout("unknown_node", nodeId, "That node does not exist.");
   return node;
 }
+
+/** Why an instance is told to stop (`RuntimeInstance.phaseReason`). */
+export type StopReason = "stop_requested" | "preempted";
+
+/**
+ * The one write that tells running instances to stop (people's and agents' stops, and a start's
+ * preemption): desired STOPPED, phase STOPPING, under `operationId`. Dispatch reads these rows.
+ * Callers hold the owner fence and the capacity fences of `instanceIds`. Returns how many rows
+ * changed (an instance that stopped meanwhile is left alone).
+ */
+export async function markInstancesStopping(
+  tx: Tx,
+  instanceIds: readonly string[],
+  operationId: string,
+  reason: StopReason,
+): Promise<number> {
+  if (instanceIds.length === 0) return 0;
+  const result = await tx.runtimeInstance.updateMany({
+    where: { id: { in: [...instanceIds] }, desiredState: "RUNNING" },
+    data: {
+      desiredState: "STOPPED",
+      phase: "STOPPING",
+      phaseChangedAt: new Date(),
+      phaseReason: reason,
+      needsOperator: null,
+      needsOperatorSince: null,
+      operationId,
+    },
+  });
+  return result.count;
+}

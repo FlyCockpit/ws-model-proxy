@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { PlacementInstance } from "../lib/placement";
 import type { RuntimeSpec } from "../lib/runtime-spec";
 import { type PlanInput, type PlanNode, profilePlan } from "./plan";
 
@@ -12,11 +13,23 @@ function node(id: string, overrides: Partial<PlanNode> = {}): PlanNode {
     hold: { holdAt: null, holdProfileId: null },
     portRange: [30000, 30002],
     heldVersionIds: new Set(),
-    usableMemoryGb: 64,
-    usableGpuGb: 0,
-    gpuCount: 0,
+    memoryGb: 64,
+    gpus: [],
     liveFreeMemoryGb: null,
     ...overrides,
+  };
+}
+
+function claimant(id: string, nodeId: string, port: number, resources: unknown): PlacementInstance {
+  return {
+    id,
+    runtimeId: `rt-${id}`,
+    ownerId: "u-1",
+    startable: true,
+    running: true,
+    ranks: [{ nodeId, port, distPort: null, resources }],
+    contributed: false,
+    interactiveStop: false,
   };
 }
 
@@ -66,7 +79,8 @@ function input(overrides: Partial<PlanInput> = {}): PlanInput {
       ],
     ]),
     instances: [],
-    claims: [],
+    claimants: [],
+    callerId: "u-1",
     fabrics: [],
     agentRules: false,
     ...overrides,
@@ -128,15 +142,7 @@ describe("profilePlan", () => {
             rankNodeIds: ["a"],
           },
         ],
-        claims: [
-          {
-            instanceId: "i-other",
-            nodeId: "a",
-            port: 30000,
-            distPort: null,
-            resources: { kind: "unified", memoryGb: 60 },
-          },
-        ],
+        claimants: [claimant("i-other", "a", 30000, { kind: "unified", memoryGb: 60 })],
       }),
     );
     expect(plan.preview.refusals).toEqual([]);
@@ -147,8 +153,8 @@ describe("profilePlan", () => {
     const plan = profilePlan(
       input({
         nodes: new Map([
-          ["a", node("a", { usableMemoryGb: 8 })],
-          ["b", node("b", { usableMemoryGb: 8 })],
+          ["a", node("a", { memoryGb: 8 })],
+          ["b", node("b", { memoryGb: 8 })],
         ]),
       }),
     );
@@ -261,7 +267,19 @@ describe("profilePlan", () => {
     const none = profilePlan(input({ versions }));
     expect(none.preview.refusals[0]?.reason).toBe("no_shared_fabric");
     const ok = profilePlan(
-      input({ versions, fabrics: [{ id: "f-1", name: "qsfp", nodeIds: ["a", "b"] }] }),
+      input({
+        versions,
+        fabrics: [
+          {
+            id: "f-1",
+            name: "qsfp",
+            members: [
+              { nodeId: "a", ip: "10.0.0.1" },
+              { nodeId: "b", ip: "10.0.0.2" },
+            ],
+          },
+        ],
+      }),
     );
     expect(ok.preview.starts[0]?.placements.map((placement) => placement.nodeNumber)).toEqual([
       1, 2,
@@ -299,7 +317,7 @@ describe("profilePlan", () => {
     );
   });
 
-  it("counts GPUs already claimed on a discrete node", () => {
+  it("counts VRAM already claimed on a GPU", () => {
     const spec = launchSpec({ resources: [{ kind: "discrete", gpuCount: 1, vramGb: 10 }] });
     const versions = new Map([
       ["v-1", { id: "v-1", runtimeId: "rt-1", runtimeSlug: "gpu", currentVersionId: "v-1", spec }],
@@ -307,17 +325,11 @@ describe("profilePlan", () => {
     const plan = profilePlan(
       input({
         owned: [{ nodeId: "a", hold: false, holdNote: null }],
-        nodes: new Map([["a", node("a", { usableGpuGb: 48, gpuCount: 1 })]]),
+        nodes: new Map([
+          ["a", node("a", { gpus: [{ key: "nvidia:0", vendor: "nvidia", vramGb: 16 }] })],
+        ]),
         versions,
-        claims: [
-          {
-            instanceId: "i-x",
-            nodeId: "a",
-            port: 30005,
-            distPort: null,
-            resources: { kind: "discrete", gpuCount: 1, vramGb: 10 },
-          },
-        ],
+        claimants: [claimant("i-x", "a", 30005, { kind: "discrete", gpuCount: 1, vramGb: 10 })],
       }),
     );
     expect(plan.preview.refusals[0]?.reason).toBe("not_enough_memory");
@@ -351,5 +363,55 @@ describe("profilePlan", () => {
       }),
     );
     expect(reversed.preview.fingerprint).toBe(profilePlan(input()).preview.fingerprint);
+  });
+
+  it("one click: switches 8 sparks from pairs and singles to one 8-node GLM on the switch", () => {
+    const sparks = ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"];
+    const spec = launchSpec({ groupSize: 8, resources: [{ kind: "unified", memoryGb: 118 }] });
+    const versions = new Map([
+      ["v-1", { id: "v-1", runtimeId: "rt-1", runtimeSlug: "glm", currentVersionId: "v-1", spec }],
+    ]);
+    const running = [
+      { id: "i-pair", nodes: ["s1", "s2"] },
+      { id: "i-q3", nodes: ["s3"] },
+      { id: "i-q4", nodes: ["s4"] },
+    ];
+    const plan = profilePlan(
+      input({
+        owned: sparks.map((nodeId) => ({ nodeId, hold: false, holdNote: null })),
+        nodes: new Map(sparks.map((id) => [id, node(id, { memoryGb: 126 })])),
+        versions,
+        instances: running.map((instance) => ({
+          id: instance.id,
+          runtimeId: "rt-old",
+          launchVersionId: "v-old",
+          desiredRunning: true,
+          rankNodeIds: instance.nodes,
+        })),
+        claimants: running.flatMap((instance) =>
+          instance.nodes.map((nodeId, rank) =>
+            claimant(`${instance.id}`, nodeId, 30000 + rank, { kind: "unified", memoryGb: 100 }),
+          ),
+        ),
+        fabrics: [
+          {
+            id: "f-sw",
+            name: "switch",
+            members: sparks.map((nodeId, index) => ({ nodeId, ip: `10.9.0.${index + 1}` })),
+          },
+        ],
+      }),
+    );
+    expect(plan.preview.refusals).toEqual([]);
+    expect(plan.preview.stops.map((stop) => stop.instanceId).sort()).toEqual([
+      "i-pair",
+      "i-q3",
+      "i-q4",
+    ]);
+    const start = plan.preview.starts[0];
+    expect(start?.placements.map((placement) => placement.nodeId)).toEqual(sparks);
+    expect(start?.fabric).toEqual({ fabricId: "f-sw", name: "switch", headAddr: "10.9.0.1" });
+    expect(start?.distPort).not.toBeNull();
+    expect(plan.blockedBy[0]?.sort()).toEqual(["i-pair", "i-q3", "i-q4"]);
   });
 });

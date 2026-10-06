@@ -77,7 +77,7 @@ function planState(options: { trust?: "RELAY" | "FULL"; personHold?: boolean } =
   ] as never);
   db.runtimeVersion.findMany.mockResolvedValueOnce([]);
   db.runtimeInstance.findMany.mockResolvedValueOnce([]);
-  db.instanceRank.findMany.mockResolvedValueOnce([]);
+  db.runtimeInstance.findMany.mockResolvedValueOnce([]); // claimants (placement)
   db.fabric.findMany.mockResolvedValueOnce([]);
 }
 
@@ -414,7 +414,7 @@ describe("hold writes on apply", () => {
     ] as never);
     db.runtimeVersion.findMany.mockResolvedValueOnce([]);
     db.runtimeInstance.findMany.mockResolvedValueOnce([]);
-    db.instanceRank.findMany.mockResolvedValueOnce([]);
+    db.runtimeInstance.findMany.mockResolvedValueOnce([]); // claimants (placement)
     db.fabric.findMany.mockResolvedValueOnce([]);
     db.runtimeOperation.create.mockResolvedValueOnce({
       id: "op-1",
@@ -520,7 +520,7 @@ describe("apply write checks", () => {
     ] as never);
     db.runtimeVersion.findMany.mockResolvedValueOnce([]);
     db.runtimeInstance.findMany.mockResolvedValueOnce([]);
-    db.instanceRank.findMany.mockResolvedValueOnce([]);
+    db.runtimeInstance.findMany.mockResolvedValueOnce([]); // claimants (placement)
     db.fabric.findMany.mockResolvedValueOnce([]);
     db.runtimeOperation.create.mockResolvedValueOnce({
       id: "op-1",
