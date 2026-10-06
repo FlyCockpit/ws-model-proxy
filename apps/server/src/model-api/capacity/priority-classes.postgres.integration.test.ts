@@ -122,15 +122,19 @@ async function seed(url: string) {
 }
 
 async function cleanup(fixture: Fixture) {
-  const { db, owner, instance } = fixture;
-  // Scoped deletes (WHERE): this run's hot-path rows only. The seeded graph (unique per run)
-  // stays in the disposable test database: a user delete goes through the ordered parent
-  // sweep, which this proof does not exercise.
+  const { db, owner, grantee, instance } = fixture;
+  // Every row this run seeded, children first, each delete scoped (WHERE) to this run.
   try {
     await db.capacityLease.deleteMany({ where: { capacityId: instance.id } });
     await db.capacityWaiter.deleteMany({ where: { capacityId: instance.id } });
     await db.admissionRequest.deleteMany({ where: { userId: owner.id } });
     await db.capacityScheduler.deleteMany({ where: { capacityId: instance.id } });
+    // The instance (its targets cascade), then the pools (members, routing, shares cascade),
+    // then the users (runtime, versions and models cascade).
+    await db.runtimeInstance.deleteMany({ where: { id: instance.id } });
+    await db.pool.deleteMany({ where: { userId: owner.id } });
+    await db.user.deleteMany({ where: { id: { in: [owner.id, grantee.id] } } });
+    expect(await db.runtime.count({ where: { userId: owner.id } })).toBe(0);
   } finally {
     await db.$disconnect();
   }

@@ -95,8 +95,22 @@ integration("placement writes on PostgreSQL", () => {
   });
 
   afterAll(async () => {
-    // Leave the rows for inspection; the database is disposable per run. Just disconnect.
-    await modules?.prisma.$disconnect();
+    // Remove every row this run seeded, children first, each delete scoped to this run's user
+    // (WHERE). The fixture client is for test setup and teardown only.
+    const { createFixturePrismaClient } = await import("@ws-model-proxy/db/test-fixture-client");
+    const fixture = createFixturePrismaClient(databaseUrl ?? "");
+    try {
+      // Operations first: a profile apply's operation must name its profile.
+      await fixture.runtimeOperation.deleteMany({ where: { userId: USER } });
+      await fixture.profile.deleteMany({ where: { userId: USER } });
+      await fixture.runtimeInstance.deleteMany({ where: { userId: USER } });
+      await fixture.user.deleteMany({ where: { id: USER } });
+      expect(await fixture.node.count({ where: { userId: USER } })).toBe(0);
+      expect(await fixture.runtime.count({ where: { userId: USER } })).toBe(0);
+    } finally {
+      await fixture.$disconnect();
+      await modules?.prisma.$disconnect();
+    }
   });
 
   const client = (auth = CALLERS.person(USER)) =>
