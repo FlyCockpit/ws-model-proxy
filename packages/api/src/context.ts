@@ -23,6 +23,24 @@ export type ContextServices = {
    * relay clears the pool's stored verdicts: hot-path rows a management writer must not write.
    */
   onPoolRoutingRulesChanged?: (poolId: string) => Promise<void>;
+  /**
+   * TODO(server, lane C hook): a runtime got a new version (create, update, fork). Push
+   * `runtime.define` to the nodes that need it and answer per node. Absent: the procedures
+   * answer `define: []` and nodes pick the version up on their next definition sync.
+   */
+  pushRuntimeDefinitions?: (input: { userId: string; runtimeId: string }) => Promise<
+    Array<{
+      nodeId: string;
+      status: "applied" | "unchanged" | "rejected" | "pending" | "skipped_trust_relay";
+      reason: string | null;
+    }>
+  >;
+  /**
+   * TODO(server, lane C hook): a start, restart or stop operation was recorded (instances,
+   * ranks and claims written; desired state set). Create and dispatch its steps. Absent: the
+   * rows wait for the server's lifecycle sweep.
+   */
+  dispatchRuntimeOperation?: (input: { userId: string; operationId: string }) => Promise<void>;
 };
 
 /**
