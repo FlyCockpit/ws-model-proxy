@@ -1,7 +1,6 @@
 import {
   listVisibleModelTargetsForUser,
   listVisibleModelTargetsWithExternalPermissionForToken,
-  type ModelApiTokenIdentity,
   type VisibleDirectModelTarget,
   type VisibleModelPoolTarget,
 } from "@ws-model-proxy/api/lib/model-api-token-access";
@@ -351,11 +350,6 @@ export async function directCandidates({
     }),
   ];
 }
-
-export type RealtimeTokenIdentity = Pick<
-  ModelApiTokenIdentity,
-  "id" | "userId" | "scopeMode" | "allowExternal"
->;
 
 /** Which visible target a model name names, for routing and rechecks. */
 export type RealtimeResolvedTarget =

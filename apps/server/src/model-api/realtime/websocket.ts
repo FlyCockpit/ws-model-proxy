@@ -13,11 +13,7 @@ import type { CapacityAdmissionRuntime } from "../capacity/runtime.js";
 import { openAiErrorBody } from "../openai-errors.js";
 import { createRealtimeAuthorizer } from "./authorize.js";
 import { createRealtimeAdmit } from "./capacity.js";
-import {
-  REALTIME_KEY_SUBPROTOCOL_PREFIX,
-  REALTIME_PATH,
-  REALTIME_SUBPROTOCOL,
-} from "./constants.js";
+import { REALTIME_KEY_SUBPROTOCOL_PREFIX, REALTIME_PATH } from "./constants.js";
 import { REALTIME_MODEL_MAX_BYTES } from "./events.js";
 import {
   type RealtimeAdmission,
@@ -67,7 +63,7 @@ import {
  * session when it ends, or here when the handshake never completes.
  */
 
-export { REALTIME_KEY_SUBPROTOCOL_PREFIX, REALTIME_PATH, REALTIME_SUBPROTOCOL };
+export { REALTIME_KEY_SUBPROTOCOL_PREFIX, REALTIME_PATH };
 export const REALTIME_INTENT = "transcription";
 /** WebSocket ping cadence and how long a client may stay silent. */
 export const REALTIME_PING_INTERVAL_MS = 25_000;

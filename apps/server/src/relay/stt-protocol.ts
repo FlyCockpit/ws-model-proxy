@@ -39,7 +39,7 @@ import { relayFailureSchema } from "./relay-failure.js";
 /** One audio frame: about 0.34 s of 24 kHz s16 mono, small for low latency. */
 export const STT_AUDIO_FRAME_MAX_BYTES = 32 * 1024;
 /** Bounds of the per-session audio credit window the server grants in `stt.open`. */
-export const STT_AUDIO_WINDOW_MIN_BYTES = STT_AUDIO_FRAME_MAX_BYTES;
+const STT_AUDIO_WINDOW_MIN_BYTES = STT_AUDIO_FRAME_MAX_BYTES;
 export const STT_AUDIO_WINDOW_MAX_BYTES = 1024 * 1024;
 export const STT_MAX_SESSION_MS_MIN = 1_000;
 export const STT_MAX_SESSION_MS_MAX = 60 * 60 * 1_000;
