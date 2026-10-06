@@ -441,16 +441,31 @@ Fixed in this release:
   Windows it opens through `rundll32 url.dll,FileProtocolHandler`, with no
   shell in between. Any other URL is printed for you to open yourself. Not yet
   run on a real Windows machine.
-- **The CLI signs only its configured server's hello origin (SEC-13).** The
-  hello signature binds the server origin, but the CLI used to sign whatever
-  origin the challenge named. A relay or wrong-URL server that receives the
-  bearer credential could therefore forward a valid signature to the real
-  server. The CLI now stops with an error, without signing, when the
-  challenge origin differs from the configured server URL's origin. **Action:**
-  `wsmp config set-server` must use the server's public origin (the origin of
-  its `BETTER_AUTH_URL`). A CLI that reaches the server through another
-  address, such as a LAN IP or an internal hostname, cannot connect until you
-  change it.
+- **The CLI signs only the hello origin configured on its machine (SEC-13).**
+  The hello signature binds the server origin, but the CLI used to sign
+  whatever origin the challenge named. A relay or wrong-URL server that
+  receives the bearer credential could therefore forward a valid signature to
+  the real server. The CLI now signs only its own expected origin: a public
+  origin pinned with `wsmp config set-server <URL> --public-origin <origin>`,
+  else the server URL's origin. The server never chooses it. On any other
+  origin the relay stops with an error, without signing, and the error names
+  the exact command to run. `wsmp config show` prints the effective
+  `helloOrigin`, and `wsmp login` warns, with the same command, when the
+  server's origin differs from it.
+  **Action for a CLI that reaches the server through another address** (a LAN
+  IP or an internal hostname) than its public URL (the origin of the server's
+  `BETTER_AUTH_URL`): pin the public origin and restart wsmp. No new login is
+  needed. For example:
+  `wsmp config set-server http://10.0.0.5:3000 --public-origin https://wsmp.example.com`.
+  The public origin must be https (http only on a loopback host) with no path.
+  Setting the server again without `--public-origin` clears it. Until it is
+  pinned, the relay exits on each connection attempt, so a service manager
+  keeps restarting it (every 5 seconds under the systemd unit), as with the
+  CLI's other configuration errors.
+- **`wsmp login` prints the server's URL and user code escaped.** A hostile
+  server could otherwise send terminal escape sequences, such as an OSC 8
+  link that shows one URL and opens another. On Windows the browser opener
+  also runs `%SystemRoot%\System32\rundll32.exe` by full path.
 - **Terminal approval codes are never moved to another browser identity
   (SEC-15).** Recording a pending browser identity used to replace any pending
   entry with the same 8-character (40-bit) code, and approving it replaced an
