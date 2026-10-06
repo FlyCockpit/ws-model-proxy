@@ -49,7 +49,16 @@ async function secretTarget(context: SignedInContext, nodeId: string) {
       "This server cannot send secrets to nodes yet: use `wsmp secret set NAME` on the node.",
       "PRECONDITION_FAILED",
     );
-  return { userId, node, writeSecrets };
+  // The relay's own errors never reach the caller or the generic error log: they could
+  // carry the frame (and so the value). A fixed error replaces them.
+  const send: typeof writeSecrets = async (request) => {
+    try {
+      return await writeSecrets(request);
+    } catch {
+      throw new ORPCError("BAD_GATEWAY", { message: "The node did not answer the secret write." });
+    }
+  };
+  return { userId, node, writeSecrets: send };
 }
 
 function failed(result: NodeSecretWriteResult | undefined, nodeId: string): never {
@@ -97,7 +106,7 @@ export const secretProcedures = {
       set: [{ name: input.name, value: input.value }],
       delete: [],
     });
-    if (result?.status !== "set") failed(result, node.id);
+    if (result?.name !== input.name || result.status !== "set") failed(result, node.id);
     await auditSecret(context, userId, node.id, `secret:set:${input.name}`, input.note);
     return { name: input.name, updatedAt: result.updatedAt ?? new Date().toISOString() };
   }),
@@ -105,7 +114,11 @@ export const secretProcedures = {
   delete: contractProcedure(c.secrets.delete).handler(async ({ context, input }) => {
     const { userId, node, writeSecrets } = await secretTarget(context, input.nodeId);
     const [result] = await writeSecrets({ nodeId: node.id, set: [], delete: [input.name] });
-    if (result?.status !== "deleted" && result?.status !== "not_found") failed(result, node.id);
+    if (
+      result?.name !== input.name ||
+      (result.status !== "deleted" && result.status !== "not_found")
+    )
+      failed(result, node.id);
     await auditSecret(context, userId, node.id, `secret:delete:${input.name}`, input.note);
     return { ok: true as const };
   }),

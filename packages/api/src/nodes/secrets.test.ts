@@ -113,4 +113,33 @@ describe("nodes.secrets", () => {
     expect(error).toMatchObject({ code: "CONFLICT" });
     expect(JSON.stringify(error)).not.toContain(SECRET);
   });
+
+  it("never lets a relay error (which could carry the frame) reach the caller", async () => {
+    db.node.findFirst.mockResolvedValueOnce(node() as never);
+    const writeSecrets = vi.fn(async () => {
+      throw new Error(`frame failed: ${SECRET}`);
+    });
+    const error = await client(PERSON, { writeSecrets })
+      .secrets.set({ nodeId: "node-1", name: "WSMP_SECRET_HF", value: SECRET })
+      .catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "BAD_GATEWAY" });
+    expect(String(error)).not.toContain(SECRET);
+    expect(JSON.stringify(error)).not.toContain(SECRET);
+    expect((error as { cause?: unknown }).cause).toBeUndefined();
+  });
+
+  it("refuses an answer that names another secret", async () => {
+    db.node.findFirst.mockResolvedValueOnce(node() as never);
+    const writeSecrets = vi.fn<NonNullable<NodeRelayServices["writeSecrets"]>>(async () => [
+      { name: "WSMP_SECRET_OTHER", status: "set" },
+    ]);
+    await expect(
+      client(PERSON, { writeSecrets }).secrets.set({
+        nodeId: "node-1",
+        name: "WSMP_SECRET_HF",
+        value: SECRET,
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(db.nodeAuditEvent.create).not.toHaveBeenCalled();
+  });
 });

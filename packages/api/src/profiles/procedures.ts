@@ -498,11 +498,13 @@ export const profileProcedures = {
             };
           }),
         });
-        // A node leaving the profile keeps no hold this profile set (no apply could clear it).
-        await tx.node.updateMany({
-          where: { userId, holdProfileId: profile.id, id: { notIn: nodeIds } },
-          data: { holdAt: null, holdNote: null, holdProfileId: null },
-        });
+        // A node a person drops from the profile keeps no hold this profile set (no apply
+        // could clear it). An agent's save never releases a hold (it stays for a person).
+        if (person)
+          await tx.node.updateMany({
+            where: { userId, holdProfileId: profile.id, id: { notIn: nodeIds } },
+            data: { holdAt: null, holdNote: null, holdProfileId: null },
+          });
         await tx.profileItem.deleteMany({ where: { profileId: profile.id } });
         if (items.length > 0)
           await tx.profileItem.createMany({
@@ -537,12 +539,8 @@ export const profileProcedures = {
             "FORBIDDEN",
           );
       }
-      // Release this profile's holds first: the FK would set holdProfileId null, which reads
-      // as a person's hold that nothing but a person could release.
-      await tx.node.updateMany({
-        where: { userId, holdProfileId: profile.id },
-        data: { holdAt: null, holdNote: null, holdProfileId: null },
-      });
+      // Its holds stay: the FK sets holdProfileId null, so they become a person's holds
+      // (docs/contracts/0.4.0.md), released only by a person.
       await tx.profile.deleteMany({ where: { id: profile.id, userId } });
     });
     return { ok: true as const };
@@ -582,8 +580,17 @@ export const profileProcedures = {
         },
         select: { id: true, createdAt: true },
       });
-      // Holds are planned again on the rows as they are now (planProfileHolds): a hold set
-      // since the preview refuses an agent (node_held) and makes a person's preview stale.
+      // Holds are planned again on the rows as they are now (planProfileHolds). A hold set
+      // since the plan refuses an agent (node_held); any other change refuses the apply as
+      // stale (preview_stale), for agents too. Every hold write must land as planned.
+      const lines = await tx.profileNode.findMany({
+        where: { profileId: profile.id },
+        select: { nodeId: true, hold: true, holdNote: true },
+      });
+      const lineKey = (line: { nodeId: string; hold: boolean; holdNote: string | null }) =>
+        `${line.nodeId}\u0000${line.hold}\u0000${line.holdNote ?? ""}`;
+      if (!sameIds(lines.map(lineKey), planInput.owned.map(lineKey)))
+        throw refuse("preview_stale", "The profile changed since the preview. Preview again.");
       const current = await tx.node.findMany({
         where: { userId, id: { in: planInput.owned.map((line) => line.nodeId) } },
         select: { id: true, holdAt: true, holdProfileId: true },
@@ -608,14 +615,24 @@ export const profileProcedures = {
         !sameIds(holds.release, plan.releaseNodeIds)
       )
         throw refuse("preview_stale", "A node's hold changed since the preview. Preview again.");
-      for (const line of holds.hold)
-        await tx.node.updateMany({
+      const raced = (nodeId: string) =>
+        planInput.agentRules
+          ? refuseAbout(
+              "node_held",
+              nodeId,
+              "A node's hold changed meanwhile; agents cannot apply here.",
+            )
+          : refuse("preview_stale", "A node's hold changed since the preview. Preview again.");
+      for (const line of holds.hold) {
+        const written = await tx.node.updateMany({
           where: { id: line.nodeId, userId, OR: [{ holdAt: null }, { holdProfileId: profile.id }] },
           data: { holdAt: now, holdNote: line.note, holdProfileId: profile.id },
         });
+        if (written.count !== 1) throw raced(line.nodeId);
+      }
       for (const nodeId of holds.release) {
         const was = current.find((node) => node.id === nodeId);
-        await tx.node.updateMany({
+        const released = await tx.node.updateMany({
           // Only the hold that was read: a newer one (set meanwhile) stays.
           where: {
             id: nodeId,
@@ -625,6 +642,7 @@ export const profileProcedures = {
           },
           data: { holdAt: null, holdNote: null, holdProfileId: null },
         });
+        if (released.count !== 1) throw raced(nodeId);
       }
       return created;
     });

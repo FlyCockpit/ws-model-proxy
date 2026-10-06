@@ -458,7 +458,13 @@ describe("fabrics", () => {
     db.fabric.findFirst.mockResolvedValueOnce({ id: "f-1", Members: [] } as never);
     db.runtimeInstance.count.mockResolvedValueOnce(0);
     db.fabric.delete.mockRejectedValueOnce(
-      Object.assign(new Error("raw"), { code: "P2010", meta: { code: "WMPP1" } }),
+      Object.assign(
+        new Error("fabric_member_in_use: a running multi-node instance uses this address"),
+        {
+          code: "P2010",
+          meta: { code: "WMPP1" },
+        },
+      ),
     );
     await expect(client().fabrics.delete({ fabricId: "f-1" })).rejects.toMatchObject({
       data: { reason: "fabric_in_use" },

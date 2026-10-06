@@ -16,6 +16,7 @@ import {
   fabricInUseRefusal,
   fabricMemberNodeIds,
   isFabricMemberInUse,
+  isForeignKeyViolation,
   refreshFabricsHashes,
   replaceNodeFabrics,
 } from "./fabrics";
@@ -492,11 +493,12 @@ export const nodeProcedures = {
   },
 };
 
+/** Fabric delete: the member trigger or the instance FK (RESTRICT) both mean fabric_in_use. */
 async function mapFabricInUse<T>(run: () => Promise<T>): Promise<T> {
   try {
     return await run();
   } catch (error) {
-    if (isFabricMemberInUse(error)) throw fabricInUseRefusal();
+    if (isFabricMemberInUse(error) || isForeignKeyViolation(error)) throw fabricInUseRefusal();
     throw error;
   }
 }

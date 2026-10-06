@@ -30,6 +30,7 @@ const client = (auth: CallerAuth = PERSON, services?: Parameters<typeof contextF
   createRouterClient(profilesRouter, { context: contextFor(auth, services) });
 
 function planState(options: { trust?: "RELAY" | "FULL"; personHold?: boolean } = {}) {
+  db.profileNode.findMany.mockResolvedValueOnce([{ nodeId: "a", hold: false, holdNote: null }]);
   db.profile.findFirst.mockResolvedValueOnce({
     id: "p-1",
     Nodes: [{ nodeId: "a", hold: false, holdNote: null }],
@@ -66,6 +67,7 @@ beforeEach(() => {
   db.$transaction.mockImplementation(((fn: (tx: typeof db) => unknown) => fn(db)) as never);
   // The apply transaction re-reads the owned nodes' holds; by default nobody holds them.
   db.node.findMany.mockResolvedValue([]);
+  db.node.updateMany.mockResolvedValue({ count: 1 });
 });
 
 describe("profiles.apply", () => {
@@ -299,7 +301,7 @@ describe("profiles.save validation", () => {
 });
 
 describe("profiles.delete", () => {
-  it("clears the holds the profile set", async () => {
+  it("leaves the profile's holds to become a person's (FK SET NULL), never released", async () => {
     db.profile.findFirst.mockResolvedValueOnce({ id: "p-1", Nodes: [{ nodeId: "a" }] } as never);
     db.profile.deleteMany.mockResolvedValueOnce({ count: 1 });
     await client().delete({ profileId: "p-1" });
@@ -307,10 +309,8 @@ describe("profiles.delete", () => {
       id: "p-1",
       userId: "owner-1",
     });
-    expect(db.node.updateMany.mock.calls[0]?.[0]?.where).toEqual({
-      userId: "owner-1",
-      holdProfileId: "p-1",
-    });
+    expect(db.profile.deleteMany).toHaveBeenCalled();
+    expect(db.node.updateMany).not.toHaveBeenCalled();
   });
 
   for (const [label, auth] of [
@@ -352,6 +352,9 @@ describe("profiles.delete", () => {
 
 describe("hold writes on apply", () => {
   function heldPlan(line: boolean, hold: { holdAt: Date | null; holdProfileId: string | null }) {
+    db.profileNode.findMany.mockResolvedValueOnce([
+      { nodeId: "a", hold: line, holdNote: line ? "games" : null },
+    ]);
     db.profile.findFirst.mockResolvedValueOnce({
       id: "p-1",
       Nodes: [{ nodeId: "a", hold: line, holdNote: line ? "games" : null }],
@@ -449,5 +452,115 @@ describe("hold writes on apply", () => {
     heldPlan(false, free);
     await client(CSRF_LESS).apply({ profileId: "p-1" });
     expect(db.runtimeOperation.create.mock.calls[0]?.[0]?.data).toMatchObject({ actor: "AGENT" });
+  });
+});
+
+describe("apply write checks", () => {
+  it("refuses an agent when a planned hold write lands on nothing (node_held)", async () => {
+    db.profileNode.findMany.mockResolvedValueOnce([{ nodeId: "a", hold: true, holdNote: null }]);
+    db.profile.findFirst.mockResolvedValueOnce({
+      id: "p-1",
+      Nodes: [{ nodeId: "a", hold: true, holdNote: null }],
+      Items: [],
+    } as never);
+    db.node.findMany.mockResolvedValueOnce([
+      {
+        id: "a",
+        slug: "a",
+        connection: "ONLINE",
+        trust: "FULL",
+        trustChangedAt: null,
+        trustLowerRequestedAt: null,
+        labels: [],
+        holdAt: null,
+        holdProfileId: null,
+        portStart: 30000,
+        portEnd: 30010,
+        heldDefinitions: [],
+        declaredResources: null,
+        nodeInfo: null,
+        nodeMetrics: null,
+        nodeMetricsAt: null,
+      },
+    ] as never);
+    db.runtimeVersion.findMany.mockResolvedValueOnce([]);
+    db.runtimeInstance.findMany.mockResolvedValueOnce([]);
+    db.instanceRank.findMany.mockResolvedValueOnce([]);
+    db.fabric.findMany.mockResolvedValueOnce([]);
+    db.runtimeOperation.create.mockResolvedValueOnce({
+      id: "op-1",
+      createdAt: new Date(),
+    } as never);
+    db.node.findMany.mockResolvedValueOnce([
+      { id: "a", holdAt: null, holdProfileId: null },
+    ] as never);
+    db.node.updateMany.mockResolvedValueOnce({ count: 0 });
+    await expect(client(FULL_AGENT).apply({ profileId: "p-1" })).rejects.toMatchObject({
+      data: { reason: "node_held" },
+    });
+  });
+
+  it("refuses as stale when the profile's lines changed after the plan (agents too)", async () => {
+    planState();
+    db.profileNode.findMany.mockReset();
+    db.profileNode.findMany.mockResolvedValueOnce([{ nodeId: "a", hold: true, holdNote: null }]);
+    db.runtimeOperation.create.mockResolvedValueOnce({
+      id: "op-1",
+      createdAt: new Date(),
+    } as never);
+    await expect(client(FULL_AGENT).apply({ profileId: "p-1" })).rejects.toMatchObject({
+      data: { reason: "preview_stale" },
+    });
+    expect(db.node.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("profiles.save races and empty hold lists", () => {
+  for (const [label, auth] of [
+    ["Full agent token", FULL_AGENT],
+    ["cookie without CSRF", CSRF_LESS],
+  ] as const)
+    it(`refuses a ${label} sending holds: [] on a profile with a hold line`, async () => {
+      db.node.findMany.mockResolvedValueOnce([{ id: "a" }] as never);
+      db.profile.findFirst.mockResolvedValueOnce({
+        id: "p-1",
+        updatedAt: new Date(),
+        Nodes: [{ nodeId: "a", hold: true, holdNote: null }],
+        Items: [],
+      } as never);
+      await expect(
+        client(auth).save({
+          profileId: "p-1",
+          slug: "evening",
+          name: "Evening",
+          nodeIds: ["a"],
+          items: [],
+          holds: [],
+        }),
+      ).rejects.toMatchObject({ data: { reason: "human_only" } });
+      expect(db.profileNode.deleteMany).not.toHaveBeenCalled();
+      expect(db.profileNode.createMany).not.toHaveBeenCalled();
+    });
+
+  it("refuses a save that read an older profile (optimistic updatedAt)", async () => {
+    db.node.findMany.mockResolvedValueOnce([{ id: "a" }] as never);
+    db.profile.findFirst.mockResolvedValueOnce({
+      id: "p-1",
+      updatedAt: new Date(),
+      Nodes: [{ nodeId: "a", hold: true, holdNote: null }],
+      Items: [],
+    } as never);
+    db.runtime.findMany.mockResolvedValueOnce([]);
+    db.profile.updateMany.mockResolvedValueOnce({ count: 0 });
+    await expect(
+      client(FULL_AGENT).save({
+        profileId: "p-1",
+        slug: "evening",
+        name: "Evening",
+        nodeIds: ["a"],
+        items: [],
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(db.profileNode.deleteMany).not.toHaveBeenCalled();
   });
 });
