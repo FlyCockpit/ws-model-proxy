@@ -689,6 +689,25 @@ describe("#117 — real input schemas and named failing fields", () => {
     }
   });
 
+  it("only the deployment plan tools pass planner refusals through", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    db.modelPool.findUnique.mockRejectedValueOnce(
+      new ORPCError("CONFLICT", {
+        message: "SECRET Requirements exceed usable budgets on spark-1",
+        data: { reason: "budget_exceeded", nodeIds: ["spark-1"] },
+      }),
+    );
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_model_pool_update", {
+      id: "pool-1",
+      capacityConcurrencyLimit: 8,
+    });
+    expect(resultText(body.result ?? {})).toBe("Conflict");
+    expect(body.result?.structuredContent).toEqual({ error: { code: "CONFLICT" } });
+    expect(JSON.stringify(body)).not.toContain("SECRET");
+  });
+
   it("a refinement's own message reaches the agent with its field", async () => {
     const authInfo = buildAuthInfo(["mcp:write"]);
     bindRequest(authInfo);

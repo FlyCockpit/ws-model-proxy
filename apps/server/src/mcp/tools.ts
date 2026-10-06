@@ -130,6 +130,12 @@ const DEPLOYMENT_REFUSAL_CODES: ReadonlySet<string> = new Set([
   "FORBIDDEN",
   "PRECONDITION_FAILED",
 ]);
+/** The only tools whose errors can be deployment planning refusals. */
+const DEPLOYMENT_PLAN_TOOLS: ReadonlySet<string> = new Set([
+  "deployment_plan_start",
+  "deployment_plan_stop",
+  "deployment_plan_apply",
+]);
 /** Planner messages may list skipped nodes, so they get a larger cap. */
 const DEPLOYMENT_REFUSAL_MESSAGE_MAX_LENGTH = 2000;
 const DEPLOYMENT_REFUSAL_MAX_NODES = 64;
@@ -749,7 +755,9 @@ function mapToolError(
     if (Object.hasOwn(ORPC_ERROR_MESSAGES, error.code)) {
       const stable = ORPC_ERROR_MESSAGES[error.code];
       if (stable !== undefined) {
-        const refusal = deploymentRefusalToolError(error, stable, declaredInputKeys(descriptor));
+        const refusal = DEPLOYMENT_PLAN_TOOLS.has(descriptor.name)
+          ? deploymentRefusalToolError(error, stable, declaredInputKeys(descriptor))
+          : null;
         if (refusal !== null) return refusal;
         if (error.code === "BAD_REQUEST") {
           // #117 / #200: name the failing field(s). Sanitized issues never
