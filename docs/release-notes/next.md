@@ -448,20 +448,26 @@ Fixed in this release:
   the real server. The CLI now signs only its own expected origin: a public
   origin pinned with `wsmp config set-server <URL> --public-origin <origin>`,
   else the server URL's origin. The server never chooses it. On any other
-  origin the relay stops with an error, without signing, and the error names
-  the exact command to run. `wsmp config show` prints the effective
-  `helloOrigin`, and `wsmp login` warns, with the same command, when the
-  server's origin differs from it.
+  origin the relay stops with an error, without signing. `wsmp config show`
+  prints the effective `helloOrigin`, and `wsmp login` warns when the
+  server's origin differs from it. Both the error and the warning suggest the
+  exact command, with its arguments single-quoted (for PowerShell on
+  Windows), but only when the server's origin is itself a valid public
+  origin; otherwise they suggest nothing.
   **Action for a CLI that reaches the server through another address** (a LAN
   IP or an internal hostname) than its public URL (the origin of the server's
   `BETTER_AUTH_URL`): pin the public origin and restart wsmp. No new login is
   needed. For example:
-  `wsmp config set-server http://10.0.0.5:3000 --public-origin https://wsmp.example.com`.
-  The public origin must be https (http only on a loopback host) with no path.
-  Setting the server again without `--public-origin` clears it. Until it is
-  pinned, the relay exits on each connection attempt, so a service manager
-  keeps restarting it (every 5 seconds under the systemd unit), as with the
-  CLI's other configuration errors.
+  `wsmp config set-server 'http://10.0.0.5:3000' --public-origin 'https://wsmp.example.com'`.
+  The public origin is `scheme://host[:port]` with no path or credentials. Its
+  host must be an IP address or a DNS name of ASCII letters, digits and
+  hyphens (internationalized names in punycode), so a server-chosen host with
+  shell characters can never be pinned or suggested. Plain http is accepted,
+  with a warning, for a LAN server whose `BETTER_AUTH_URL` is http. Setting
+  the server again without `--public-origin` clears the pin and says so. Until
+  it is pinned, the relay exits on each connection attempt, so a service
+  manager keeps restarting it (every 5 seconds under the systemd unit), as
+  with the CLI's other configuration errors.
 - **`wsmp login` prints the server's URL and user code escaped.** A hostile
   server could otherwise send terminal escape sequences, such as an OSC 8
   link that shows one URL and opens another. On Windows the browser opener
