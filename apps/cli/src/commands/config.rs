@@ -71,6 +71,14 @@ enum Sub {
     ClearFileRoots,
     /// Require approval before a browser can open a terminal.
     SetTerminalApproval { state: Switch },
+    /// Cap the browser terminals open at once on this machine (1 to 32,
+    /// default 4). The server also caps terminals per CLI and per user; the
+    /// lowest limit applies. Supervised commands and operator terminals have
+    /// their own slots. Takes effect the next time wsmp starts.
+    SetMaxTerminals {
+        #[arg(value_parser = clap::value_parser!(u32).range(1..=32))]
+        count: u32,
+    },
     /// Let the MCP node file tools run when wsmp itself runs as root (they
     /// refuse `unsupported` by default). Takes effect the next time wsmp starts.
     SetFileToolsAsRoot { state: Switch },
@@ -175,6 +183,7 @@ pub fn run(args: &Args) -> Result<()> {
             let mut shown = serde_json::to_value(&cfg)?;
             shown["mcpFileRead"] = cfg.mcp_file_read.into();
             shown["fileRoots"] = serde_json::to_value(&cfg.file_roots)?;
+            shown["maxTerminals"] = cfg.effective_max_terminals().into();
             if args.json {
                 output::json(&shown)?;
             } else {
@@ -275,6 +284,20 @@ pub fn run(args: &Args) -> Result<()> {
                     cfg.require_terminal_approval = state.enabled();
                 },
             )?;
+        }
+        Sub::SetMaxTerminals { count } => {
+            // clap bounds `count` to `MAX_TERMINALS_RANGE`.
+            let count = *count;
+            Config::update(false, |cfg| {
+                cfg.max_terminals = Some(count);
+                Ok(())
+            })?;
+            if args.json {
+                output::json(&serde_json::json!({"key": "maxTerminals", "value": count}))?;
+            } else {
+                output::line(format!("set `maxTerminals` to `{count}`"))?;
+                output::line("Restart wsmp to apply.")?;
+            }
         }
         Sub::SetFileToolsAsRoot { state } => {
             set_flag(args.json, "allowFileToolsAsRoot", state.enabled(), |cfg| {

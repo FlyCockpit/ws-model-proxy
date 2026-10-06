@@ -180,6 +180,13 @@ export const env = createEnv({
     // unaffected. The flag's own default stays true.
     WMP_MCP_PAT_ALLOW_NO_EXPIRY: strictBooleanFlag(true),
     WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: strictBooleanFlag(),
+    // Browser terminals one user may have open at once, across all CLIs.
+    // Supervised and operator terminals have their own limits.
+    WMP_TERMINAL_USER_LIMIT: z.coerce.number().int().min(1).max(64).default(8),
+    // Browser terminals open at once on one CLI, across all users. A backstop:
+    // each CLI also applies its local `wsmp config set-max-terminals` value
+    // (default 4), and the lowest limit wins.
+    WMP_TERMINAL_CLI_LIMIT: z.coerce.number().int().min(1).max(64).default(4),
     WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: z
       .string()
       .min(1)

@@ -19,6 +19,7 @@ pub struct TerminalStartup {
     allow_human_terminal: bool,
     mcp_command_mode: McpCommandMode,
     require_terminal_approval: bool,
+    max_terminals: usize,
     allow_file_tools_as_root: bool,
     mcp_file_read: bool,
     file_roots: Vec<std::path::PathBuf>,
@@ -47,6 +48,7 @@ impl TerminalStartup {
             allow_human_terminal: config.allow_human_terminal,
             mcp_command_mode: config.mcp_command_mode,
             require_terminal_approval: config.require_terminal_approval,
+            max_terminals: usize::try_from(config.effective_max_terminals()).unwrap_or(usize::MAX),
             allow_file_tools_as_root: config.allow_file_tools_as_root,
             mcp_file_read: config.mcp_file_read,
             file_roots: config.file_roots.clone(),
@@ -79,6 +81,11 @@ impl TerminalStartup {
 
     pub fn require_terminal_approval(&self) -> bool {
         self.require_terminal_approval
+    }
+
+    /// Browser terminals this machine keeps open at once (`maxTerminals`).
+    pub fn max_terminals(&self) -> usize {
+        self.max_terminals
     }
 
     /// `allowFileToolsAsRoot` as it was when the relay started.
@@ -260,6 +267,20 @@ mod tests {
             .features
             .mcp_file_read
         );
+    }
+
+    #[test]
+    fn the_terminal_limit_is_the_configured_one_or_four() {
+        let key = || CliTerminalKey::generate().expect("key");
+        assert_eq!(
+            TerminalStartup::from_key(key(), &Config::default()).max_terminals(),
+            4
+        );
+        let config = Config {
+            max_terminals: Some(9),
+            ..Config::default()
+        };
+        assert_eq!(TerminalStartup::from_key(key(), &config).max_terminals(), 9);
     }
 
     #[test]

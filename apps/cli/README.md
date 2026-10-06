@@ -62,6 +62,7 @@ wsmp service install                # install, enable, and start a Linux/macOS u
 wsmp service status                 # inspect the installed user service
 wsmp service env-sync               # copy required env vars into the private service env file
 wsmp terminal fingerprint           # print this CLI's terminal identity fingerprint
+wsmp config set-max-terminals 8     # browser terminals open at once on this machine (1-32, default 4)
 wsmp config set-mcp-commands supervised  # agents may request commands you confirm (off|supervised|unsupervised)
 wsmp metrics list                   # custom metric sources and their state
 wsmp metrics test gpu_fan           # run one source now and print what it reports
@@ -190,6 +191,8 @@ Remote sources are defined over MCP or the API (the dashboard lists them), only 
 Received definitions are stored in `remote-metric-sources.json` in the state directory so `wsmp metrics list` can show them. A local source with the same name wins; the remote one is `refused`.
 
 ### Browser terminal viewers
+
+At most 4 browser terminals are open on one machine at a time. `wsmp config set-max-terminals <n>` (1 to 32; restart wsmp to apply) changes that; `wsmp config show` lists the value in effect as `maxTerminals`. The server has its own limits, per CLI and per user (`WMP_TERMINAL_CLI_LIMIT`, default 4, and `WMP_TERMINAL_USER_LIMIT`, default 8), and the lowest one applies: opening one more terminal than that reports "Terminal limit reached". Supervised commands and operator terminals do not count toward these limits; they have their own slots.
 
 Several browser tabs can view one terminal at once (up to 8, counting tabs waiting for approval). The tab that typed most recently is the writer, and the terminal takes that tab's size; other tabs show the terminal at the writer's size until someone types in them. The CLI encrypts each output frame once under a shared output key, which it sends to each tab under that tab's own end-to-end key and replaces when a tab leaves. Input keys stay separate per tab. With `requireTerminalApproval`, every tab is approved on its own. Closing a tab only stops that tab viewing; "End session" on the terminals page ends the shell for everyone.
 

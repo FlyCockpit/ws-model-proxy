@@ -71,7 +71,6 @@ use crate::terminal_crypto::{
     self, DIR_BROWSER_TO_CLI, DIR_CLI_TO_BROWSER, DirectionKeys, TermPlaintextV2,
 };
 
-const MAX_TERMINALS: usize = 2;
 /// Attached viewers plus pending approvals, per terminal (protocol 2.5).
 const MAX_VIEWERS: usize = 8;
 const MAX_EXECS: usize = 2;
@@ -197,14 +196,21 @@ enum Incoming {
     ReviewToggle(bool),
 }
 
-fn terminal_block_reason(supported: bool, allowed: bool, open: usize) -> Option<&'static str> {
+/// Why a browser terminal cannot open: `open` live browser terminals against
+/// this machine's `maxTerminals` (`max`).
+fn terminal_block_reason(
+    supported: bool,
+    allowed: bool,
+    open: usize,
+    max: usize,
+) -> Option<&'static str> {
     if !supported {
         return Some(REASON_UNSUPPORTED);
     }
     if !allowed {
         return Some(REASON_DISABLED);
     }
-    if open >= MAX_TERMINALS {
+    if open >= max {
         return Some(REASON_LIMIT);
     }
     None
@@ -541,6 +547,7 @@ fn prepare_handshake(
         terminal_supported(),
         startup.allow_human_terminal(),
         counted,
+        startup.max_terminals(),
     ) {
         return Err(handshake_rejected(handshake, reason));
     }
@@ -3151,7 +3158,7 @@ impl TerminalRegistry {
     ) -> Vec<OutboundFrame> {
         let terminal_id = handshake.terminal_id;
         let viewer_id = handshake.viewer_id;
-        if self.human_count() >= MAX_TERMINALS {
+        if self.human_count() >= startup.max_terminals() {
             return vec![*handshake_rejected(handshake, REASON_LIMIT)];
         }
         let home = match user_home() {
@@ -4879,14 +4886,19 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_or_disabled_terminals_are_rejected() {
+    fn unsupported_disabled_or_over_limit_terminals_are_rejected() {
         assert_eq!(
-            terminal_block_reason(false, true, 0),
+            terminal_block_reason(false, true, 0, 4),
             Some(REASON_UNSUPPORTED)
         );
-        assert_eq!(terminal_block_reason(true, false, 0), Some(REASON_DISABLED));
-        assert_eq!(terminal_block_reason(true, true, 2), Some(REASON_LIMIT));
-        assert_eq!(terminal_block_reason(true, true, 1), None);
+        assert_eq!(
+            terminal_block_reason(true, false, 0, 4),
+            Some(REASON_DISABLED)
+        );
+        assert_eq!(terminal_block_reason(true, true, 4, 4), Some(REASON_LIMIT));
+        assert_eq!(terminal_block_reason(true, true, 3, 4), None);
+        assert_eq!(terminal_block_reason(true, true, 1, 1), Some(REASON_LIMIT));
+        assert_eq!(terminal_block_reason(true, true, 31, 32), None);
         assert_eq!(terminal_supported(), cfg!(unix));
     }
 
@@ -5267,9 +5279,9 @@ mod tests {
         drop(rx);
     }
 
+    /// Opens browser terminals until one is refused; returns how many opened.
     #[cfg(unix)]
-    #[test]
-    fn terminal_concurrency_cap_is_two() {
+    fn open_until_refused(startup: &TerminalStartup) -> usize {
         let (tx, rx) = channel();
         let mut terminals = TerminalRegistry::with_shell(
             tx,
@@ -5277,16 +5289,17 @@ mod tests {
             "/bin/sh",
             &["-c", "sleep 30"],
         );
-        let startup = enabled_startup(false);
         let browser = CliTerminalKey::generate().expect("browser");
         let nonce = terminal_crypto::encode_b64url(&[1_u8; 16]);
-        for terminal_id in ["t1", "t2"] {
+        let mut opened = 0;
+        loop {
+            let terminal_id = format!("t{opened}");
             let frames = terminals.open(
-                &startup,
+                startup,
                 &Config::default(),
                 None,
                 TermHandshake {
-                    terminal_id,
+                    terminal_id: &terminal_id,
                     viewer_id: Some("viewer-a"),
                     cols: 80,
                     rows: 24,
@@ -5295,32 +5308,32 @@ mod tests {
                     identity: None,
                 },
             );
-            assert!(matches!(
-                &frames[0],
-                OutboundFrame::Control(ClientControlMessage::TermOpened { .. })
-            ));
+            match &frames[0] {
+                OutboundFrame::Control(ClientControlMessage::TermOpened { .. }) => opened += 1,
+                OutboundFrame::Control(ClientControlMessage::TermRejected { reason, .. }) => {
+                    assert_eq!(reason, REASON_LIMIT);
+                    break;
+                }
+                _ => panic!("unexpected reply to term.open"),
+            }
+            assert!(opened <= 32, "no terminal limit applied");
         }
-        let rejected = terminals.open(
-            &startup,
-            &Config::default(),
-            None,
-            TermHandshake {
-                terminal_id: "t3",
-                viewer_id: Some("viewer-a"),
-                cols: 80,
-                rows: 24,
-                browser_public_key: browser.public_b64url(),
-                browser_nonce: &nonce,
-                identity: None,
-            },
-        );
-        assert!(matches!(
-            &rejected[0],
-            OutboundFrame::Control(ClientControlMessage::TermRejected { reason, .. })
-                if reason == REASON_LIMIT
-        ));
         drop(terminals);
         drop(rx);
+        opened
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_concurrency_cap_is_four_by_default_and_configurable() {
+        assert_eq!(open_until_refused(&enabled_startup(false)), 4);
+        let config = Config {
+            allow_human_terminal: true,
+            max_terminals: Some(1),
+            ..Config::default()
+        };
+        let startup = TerminalStartup::from_key(CliTerminalKey::generate().expect("key"), &config);
+        assert_eq!(open_until_refused(&startup), 1);
     }
 
     #[cfg(unix)]

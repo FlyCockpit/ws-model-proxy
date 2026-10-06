@@ -41,6 +41,8 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
     MODEL_API_TRANSCRIPTION_STALE_SPOOL_MS: 24 * 60 * 60 * 1000,
     BETTER_AUTH_URL: "http://localhost:3000",
+    WMP_TERMINAL_USER_LIMIT: 8,
+    WMP_TERMINAL_CLI_LIMIT: 4,
   },
 }));
 

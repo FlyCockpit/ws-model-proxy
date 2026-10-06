@@ -39,6 +39,12 @@ enable browser shells). Planning refuses an interactive recipe on a node
 without it, naming the setting. A sudoers `NOPASSWD` rule for the exact
 absolute command remains the fully automatic alternative.
 
+Browser terminal limits are configurable and higher by default: 8 open per
+user (`WMP_TERMINAL_USER_LIMIT`, was 4) and 4 per CLI (`WMP_TERMINAL_CLI_LIMIT`,
+was 2), each 1 to 64, and each node caps its own with
+`wsmp config set-max-terminals <n>` (1 to 32, default 4, was 2). The lowest
+limit applies; supervised command and operator terminals are not counted.
+
 Recipe commands are limited to 4,096 UTF-8 bytes when saved and again after
 placeholder substitution, the same limit the CLI enforces, so a long command is
 refused at save or plan time instead of leaving an instance stuck stopping.

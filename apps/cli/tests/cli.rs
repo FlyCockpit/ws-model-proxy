@@ -1295,6 +1295,54 @@ fn config_file_tools_as_root_defaults_off_persists_and_shows() {
         .failure();
 }
 
+#[test]
+fn config_max_terminals_defaults_to_four_and_accepts_one_to_thirty_two() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args(["config", "init"])
+        .assert()
+        .success();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(cfg.get("maxTerminals").is_none());
+    cli(&config, &state)
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""maxTerminals": 4"#));
+    for rejected in ["0", "33", "-1", "many"] {
+        cli(&config, &state)
+            .args(["config", "set-max-terminals", rejected])
+            .assert()
+            .failure();
+    }
+    cli(&config, &state)
+        .args(["config", "--json", "set-max-terminals", "32"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""key":"maxTerminals""#))
+        .stdout(predicate::str::contains(r#""value":32"#));
+    cli(&config, &state)
+        .args(["config", "set-max-terminals", "1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restart wsmp to apply."));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["maxTerminals"], 1);
+    // A hand-edited value outside the range stops the relay before it connects.
+    let mut cfg = cfg;
+    cfg["maxTerminals"] = json!(0);
+    fs::write(&config, serde_json::to_vec(&cfg).unwrap()).unwrap();
+    cli(&config, &state)
+        .args(["connect"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "`maxTerminals` must be an integer from 1 to 32",
+        ));
+}
+
 #[cfg(unix)]
 #[test]
 fn supervised_run_without_the_daemon_env_fails_and_runs_nothing() {
