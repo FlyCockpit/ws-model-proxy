@@ -200,13 +200,15 @@ fn config_set_server_pins_and_clears_a_public_origin() {
     assert_eq!(shown["publicOrigin"], "https://wsmp.example.com");
     assert_eq!(shown["helloOrigin"], "https://wsmp.example.com");
 
-    // Not an origin, or http off loopback: refused, config unchanged.
+    // Not an origin, or a host a shell would interpret: refused, config
+    // unchanged.
     for bad in [
         "https://wsmp.example.com/app",
         format!("https://{}:{}@wsmp.example.com", "user", "pw").as_str(),
-        "http://wsmp.lan:3000",
         "ftp://wsmp.example.com",
         "https://wsmp.example.com/?x=1",
+        "https://a$({touch,pwned}).com",
+        "https://a;id.com",
     ] {
         cli(&config, &state)
             .args(["config", "set-server", "http://10.0.0.5:3000"])
@@ -218,16 +220,33 @@ fn config_set_server_pins_and_clears_a_public_origin() {
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(cfg["publicOrigin"], "https://wsmp.example.com");
 
-    // Setting the server again without the flag clears the pin.
+    // Setting the server again without the flag clears the pin, and says so.
     cli(&config, &state)
         .args(["config", "set-server", "http://10.0.0.5:3000"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains(
+            "cleared the pinned public origin `https://wsmp.example.com`",
+        ));
     let mut show = cli(&config, &state);
     show.args(["config", "--json", "show"]);
     let shown = json_stdout(show);
     assert!(shown.get("publicOrigin").is_none());
     assert_eq!(shown["helloOrigin"], "http://10.0.0.5:3000");
+
+    // A plain-http LAN origin is accepted with a warning; clearing it via
+    // --json names it.
+    cli(&config, &state)
+        .args(["config", "set-server", "http://10.0.0.5:3000"])
+        .args(["--public-origin", "http://wsmp.lan:3000"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("plain http"));
+    let mut clear = cli(&config, &state);
+    clear.args(["config", "--json", "set-server", "http://10.0.0.5:3000"]);
+    let value = json_stdout(clear);
+    assert_eq!(value["clearedPublicOrigin"], "http://wsmp.lan:3000");
+    assert!(value["publicOrigin"].is_null());
 }
 
 #[test]

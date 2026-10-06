@@ -11,7 +11,7 @@ use serde::Serialize;
 use crate::auth::{
     DeviceFlowState, ExchangeError, exchange_device_code, start_device_authorization,
 };
-use crate::config::{Config, is_loopback_host, normalize_public_origin};
+use crate::config::{Config, is_loopback_host, set_server_command};
 use crate::display_escape::escape_single_line;
 use crate::hostname::hostname_slug;
 use crate::output;
@@ -212,13 +212,12 @@ fn public_origin_warning(
         return None;
     }
     let shown = escape_single_line(&origin);
-    let command = normalize_public_origin(&origin)
-        .ok()
-        .filter(|canonical| canonical == &origin)
-        .map(|canonical| {
+    // Only a valid public origin is suggested, quoted for this platform's shell.
+    let command = set_server_command(server_url, &origin)
+        .map(|command| {
             format!(
-                "; if `{canonical}` is your server's public address, run `wsmp config set-server {} --public-origin {canonical}` (no new login is needed)",
-                escape_single_line(server_url)
+                "; if `{shown}` is your server's public address, run `{}` (no new login is needed)",
+                escape_single_line(&command)
             )
         })
         .unwrap_or_default();
@@ -484,7 +483,7 @@ mod tests {
         .expect("warning");
         assert!(
             warning.contains(
-                "run `wsmp config set-server http://10.0.0.5:3000 --public-origin https://wsmp.example.com` (no new login is needed)"
+                "run `wsmp config set-server 'http://10.0.0.5:3000' --public-origin 'https://wsmp.example.com'` (no new login is needed)"
             ),
             "{warning}"
         );
@@ -497,14 +496,17 @@ mod tests {
             )
             .is_none()
         );
-        // An origin that cannot be pinned (http off loopback) gets no command.
-        let warning = public_origin_warning(
-            "http://wsmp.lan:3000/device",
-            "http://10.0.0.5:3000",
-            "http://10.0.0.5:3000",
-        )
-        .expect("warning");
-        assert!(!warning.contains("--public-origin"), "{warning}");
+        // A host a shell would interpret is never put in a command.
+        for hostile in [
+            "https://a$({touch,pwned}).com/device",
+            "https://a$(id).com/device",
+            "https://a`id`.com/device",
+        ] {
+            let warning =
+                public_origin_warning(hostile, "http://10.0.0.5:3000", "http://10.0.0.5:3000")
+                    .expect("warning");
+            assert!(!warning.contains("set-server"), "{warning}");
+        }
     }
 
     #[test]

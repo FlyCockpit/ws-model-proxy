@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::config::{Config, McpCommandMode, normalize_public_origin};
+use crate::config::{Config, McpCommandMode, normalize_public_origin, public_origin_http_warning};
 use crate::output;
 use crate::slug::validate_slug;
 
@@ -57,8 +57,8 @@ enum Sub {
     /// wsmp to apply; no new login is needed.
     SetServer {
         url: String,
-        /// The server's public origin (`https://host[:port]`; http only on
-        /// loopback) when it differs from the URL's origin.
+        /// The server's public origin (`https://host[:port]`) when it differs
+        /// from the URL's origin. Plain http is accepted with a warning.
         #[arg(long)]
         public_origin: Option<String>,
     },
@@ -233,22 +233,33 @@ pub fn run(args: &Args) -> Result<()> {
                         .with_context(|| format!("checking public origin `{origin}`"))
                 })
                 .transpose()?;
-            Config::update(false, |cfg| {
+            // The pin dropped by setting the server again without the flag.
+            let cleared = Config::update(false, |cfg| {
                 cfg.server_url = Some(url.clone());
-                cfg.public_origin = public_origin.clone();
-                Ok(())
+                let previous = std::mem::replace(&mut cfg.public_origin, public_origin.clone());
+                Ok(previous.filter(|_| public_origin.is_none()))
             })?;
+            let http_warning = public_origin
+                .as_deref()
+                .and_then(public_origin_http_warning);
+            if let Some(warning) = &http_warning {
+                output::diagnostic(warning)?;
+            }
             if args.json {
                 output::json(&SetServer {
                     key: "serverUrl",
                     value: url,
                     public_origin: public_origin.as_deref(),
+                    cleared_public_origin: cleared.as_deref(),
                 })?;
             } else {
                 output::line(format!("set server URL to `{url}`"))?;
-                match &public_origin {
-                    Some(origin) => output::line(format!("set public origin to `{origin}`"))?,
-                    None => output::line("public origin: the server URL's origin")?,
+                match (&public_origin, &cleared) {
+                    (Some(origin), _) => output::line(format!("set public origin to `{origin}`"))?,
+                    (None, Some(previous)) => output::line(format!(
+                        "cleared the pinned public origin `{previous}`; the relay now signs the server URL's origin"
+                    ))?,
+                    (None, None) => output::line("public origin: the server URL's origin")?,
                 }
             }
         }
@@ -432,6 +443,9 @@ struct SetServer<'a> {
     key: &'static str,
     value: &'a str,
     public_origin: Option<&'a str>,
+    /// The previously pinned origin this call removed, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cleared_public_origin: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]

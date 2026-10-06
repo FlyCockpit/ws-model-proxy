@@ -364,15 +364,19 @@ impl Config {
     }
 }
 
-/// Checks a person-supplied public origin and returns its canonical form
-/// (`scheme://host[:port]`, default port omitted). It must be https, or http
-/// on a loopback host, with no credentials, path, query or fragment.
+/// Checks a public origin and returns its canonical form
+/// (`scheme://host[:port]`, default port omitted).
+///
+/// It must be http or https with no credentials, path, query or fragment, and
+/// its host an IP literal or a DNS name of ASCII letter, digit and hyphen
+/// labels (after punycode). The URL parser alone accepts hosts such as
+/// `a$(touch,x).com`; refusing them keeps every origin safe to show inside a
+/// suggested shell command. Plain http is accepted (a LAN deployment's
+/// `BETTER_AUTH_URL` can be http); see [`public_origin_http_warning`].
 pub fn normalize_public_origin(value: &str) -> Result<String> {
     let url = url::Url::parse(value).context("the public origin is not a valid URL")?;
     match url.scheme() {
-        "https" => {}
-        "http" if is_loopback_host(&url) => {}
-        "http" => anyhow::bail!("the public origin must use https unless its host is loopback"),
+        "https" | "http" => {}
         other => anyhow::bail!("the public origin uses the unsupported scheme `{other}`"),
     }
     if !url.username().is_empty() || url.password().is_some() {
@@ -381,7 +385,89 @@ pub fn normalize_public_origin(value: &str) -> Result<String> {
     if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
         anyhow::bail!("the public origin must be only `scheme://host[:port]`, with no path");
     }
+    match url.host() {
+        Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)) => {}
+        Some(url::Host::Domain(domain)) if is_plain_dns_name(domain) => {}
+        _ => anyhow::bail!(
+            "the public origin's host must be a DNS name of letters, digits and hyphens, or an IP address"
+        ),
+    }
     Ok(url.origin().ascii_serialization())
+}
+
+/// `a-b.example.com`: non-empty labels of ASCII letters, digits and inner
+/// hyphens, at most 253 bytes.
+fn is_plain_dns_name(domain: &str) -> bool {
+    domain.len() <= 253
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+/// A warning for a plain-http public origin off loopback: the relay hello
+/// signature still binds it, but the connection to it is not encrypted.
+pub fn public_origin_http_warning(origin: &str) -> Option<String> {
+    let url = url::Url::parse(origin).ok()?;
+    (url.scheme() == "http" && !is_loopback_host(&url)).then(|| {
+        format!(
+            "warning: the public origin `{origin}` uses plain http; traffic to it, including the \
+             CLI credential, is not encrypted. Use it only on a network you trust"
+        )
+    })
+}
+
+/// The `wsmp config set-server` command that pins `origin`, with both
+/// arguments single-quoted for the shell this CLI runs under: POSIX shells on
+/// Unix, PowerShell on Windows. `None` when `origin` is not a valid public
+/// origin in canonical form, so nothing unvalidated is ever suggested.
+pub fn set_server_command(server_url: &str, origin: &str) -> Option<String> {
+    let shell = if cfg!(windows) {
+        Shell::PowerShell
+    } else {
+        Shell::Posix
+    };
+    set_server_command_for(shell, server_url, origin)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shell {
+    Posix,
+    PowerShell,
+}
+
+pub fn set_server_command_for(shell: Shell, server_url: &str, origin: &str) -> Option<String> {
+    let canonical = normalize_public_origin(origin).ok()?;
+    if canonical != origin {
+        return None;
+    }
+    let quote = |value: &str| match shell {
+        // POSIX: nothing is special inside '...'; a ' closes, escapes, reopens.
+        Shell::Posix => format!("'{}'", value.replace('\'', r"'\''")),
+        // PowerShell: '...' is verbatim; a ' is doubled. Its typographic
+        // single quotes also delimit, so they are doubled as well.
+        Shell::PowerShell => {
+            let mut quoted = String::from("'");
+            for ch in value.chars() {
+                if matches!(ch, '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}') {
+                    quoted.push(ch);
+                }
+                quoted.push(ch);
+            }
+            quoted.push('\'');
+            quoted
+        }
+    };
+    Some(format!(
+        "wsmp config set-server {} --public-origin {}",
+        quote(server_url),
+        quote(&canonical)
+    ))
 }
 
 /// `localhost`, 127.0.0.0/8 or `::1`.
@@ -1998,6 +2084,109 @@ fn sync_parent_dir(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_origin_hosts_are_plain_dns_names_or_ip_literals() {
+        for (value, canonical) in [
+            ("https://WSMP.example.com:443/", "https://wsmp.example.com"),
+            (
+                "https://wsmp.example.com:8443",
+                "https://wsmp.example.com:8443",
+            ),
+            ("http://wsmp.lan:3000", "http://wsmp.lan:3000"),
+            ("http://10.0.0.5:3000", "http://10.0.0.5:3000"),
+            ("https://[2001:db8::1]", "https://[2001:db8::1]"),
+            (
+                "https://xn--bcher-kva.example",
+                "https://xn--bcher-kva.example",
+            ),
+            (
+                "https://b\u{fc}cher.example",
+                "https://xn--bcher-kva.example",
+            ),
+        ] {
+            assert_eq!(
+                normalize_public_origin(value).unwrap(),
+                canonical,
+                "{value}"
+            );
+        }
+        // Each of these parses as a URL; none may become a pin.
+        for value in [
+            "https://a$({touch,pwned}).com",
+            "https://a$(id).com",
+            "https://a`id`.com",
+            "https://a;id.com",
+            "https://a&calc.com",
+            "https://a'b.com",
+            "https://a\"b.com",
+            "https://a!b.com",
+            "https://a*.com",
+            "https://-a.com",
+            "https://a-.com",
+            "https://a..com",
+            "https://a_b.com",
+            "https://wsmp.example.com/app",
+            format!("https://{}:{}@wsmp.example.com", "user", "pw").as_str(),
+            "ftp://wsmp.example.com",
+        ] {
+            assert!(normalize_public_origin(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn plain_http_public_origins_warn_off_loopback() {
+        assert!(public_origin_http_warning("http://wsmp.lan:3000").is_some());
+        assert!(public_origin_http_warning("http://127.0.0.1:3000").is_none());
+        assert!(public_origin_http_warning("https://wsmp.example.com").is_none());
+    }
+
+    #[test]
+    fn suggested_set_server_commands_quote_both_arguments() {
+        assert_eq!(
+            set_server_command_for(
+                Shell::Posix,
+                "http://10.0.0.5:3000",
+                "https://wsmp.example.com"
+            )
+            .unwrap(),
+            "wsmp config set-server 'http://10.0.0.5:3000' --public-origin 'https://wsmp.example.com'"
+        );
+        // The local server URL is quoted too, even with quotes inside it.
+        assert_eq!(
+            set_server_command_for(
+                Shell::Posix,
+                "http://h/it's $(x)",
+                "https://wsmp.example.com"
+            )
+            .unwrap(),
+            "wsmp config set-server 'http://h/it'\\''s $(x)' --public-origin 'https://wsmp.example.com'"
+        );
+        assert_eq!(
+            set_server_command_for(
+                Shell::PowerShell,
+                "http://h/it's \u{2019}$(x)",
+                "https://wsmp.example.com"
+            )
+            .unwrap(),
+            "wsmp config set-server 'http://h/it''s \u{2019}\u{2019}$(x)' --public-origin 'https://wsmp.example.com'"
+        );
+        // Never for an invalid or non-canonical origin.
+        for origin in [
+            "https://a$({touch,pwned}).com",
+            "https://a'.com",
+            "https://WSMP.example.com",
+            "https://wsmp.example.com/",
+            "null",
+        ] {
+            for shell in [Shell::Posix, Shell::PowerShell] {
+                assert!(
+                    set_server_command_for(shell, "http://10.0.0.5:3000", origin).is_none(),
+                    "{origin}"
+                );
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[test]

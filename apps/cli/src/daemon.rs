@@ -3915,16 +3915,14 @@ fn check_hello_origin(
         return Ok(());
     }
     let shown = crate::display_escape::escape_single_line(challenge_origin);
-    // Suggest the pin only for a value that is itself a valid public origin.
-    let fix = crate::config::normalize_public_origin(challenge_origin)
-        .ok()
-        .filter(|canonical| canonical == challenge_origin)
-        .map(|canonical| {
+    // Suggest the pin only for a value that is itself a valid public origin,
+    // with both arguments quoted for this platform's shell.
+    let fix = crate::config::set_server_command(server_url, challenge_origin)
+        .map(|command| {
             format!(
-                " If `{canonical}` is your server's public address, run \
-                 `wsmp config set-server {} --public-origin {canonical}` and restart wsmp; \
+                " If `{shown}` is your server's public address, run `{}` and restart wsmp; \
                  no new login is needed.",
-                crate::display_escape::escape_single_line(server_url)
+                crate::display_escape::escape_single_line(&command)
             )
         })
         .unwrap_or_else(|| {
@@ -4927,20 +4925,30 @@ mod tests {
         let error = refusal("https://wsmp.example.com", &config);
         assert!(
             error.contains(
-                "run `wsmp config set-server http://10.0.0.5:3000 --public-origin https://wsmp.example.com` and restart wsmp; no new login is needed"
+                "run `wsmp config set-server 'http://10.0.0.5:3000' --public-origin 'https://wsmp.example.com'` and restart wsmp; no new login is needed"
             ),
             "{error}"
         );
-        // A value that is not a valid public origin gets no command, and
-        // terminal control characters are shown escaped.
-        let error = refusal("http://evil.example\u{1b}]8;;x\u{7}", &config);
-        assert!(!error.contains("--public-origin"), "{error}");
-        assert!(!error.chars().any(|ch| ch.is_control()), "{error}");
+        // A plain-http LAN origin can be pinned too.
         let error = refusal("http://wsmp.lan:3000", &config);
         assert!(
-            !error.contains("--public-origin"),
-            "http off loopback: {error}"
+            error.contains("--public-origin 'http://wsmp.lan:3000'"),
+            "{error}"
         );
+        // A host the URL parser accepts but a shell would run gets no command,
+        // and terminal control characters are shown escaped.
+        for hostile in [
+            "https://a$({touch,pwned}).com",
+            "https://a`id`.com",
+            "https://a;id.com",
+            "https://a&calc.com",
+            "http://evil.example\u{1b}]8;;x\u{7}",
+        ] {
+            let error = refusal(hostile, &config);
+            assert!(!error.contains("--public-origin"), "{error}");
+            assert!(!error.contains("set-server"), "{error}");
+            assert!(!error.chars().any(|ch| ch.is_control()), "{error}");
+        }
     }
 
     /// A malformed `exec.start` / `term.spawn` names a command but cannot be

@@ -85,10 +85,14 @@ origin. The server never chooses it. If this machine reaches the server
 through another address than its public URL (a LAN IP or an internal
 hostname), pin the server's public origin (the origin of its
 `BETTER_AUTH_URL`) with `wsmp config set-server <connect URL> --public-origin
-<origin>` and restart wsmp; no new login is needed. The public origin must be
-https (http only on a loopback host) with no path. `wsmp config show` prints
-the effective `helloOrigin`, and `wsmp login` warns when the server's origin
-differs from it.
+<origin>` and restart wsmp; no new login is needed. The public origin is
+`scheme://host[:port]` with no path or credentials, and its host must be an IP
+address or a DNS name of ASCII letters, digits and hyphens. Plain http is
+accepted with a warning, for a LAN server whose `BETTER_AUTH_URL` is http.
+`wsmp config show` prints the effective `helloOrigin`, and `wsmp login` warns
+when the server's origin differs from it. That warning and the relay's refusal
+suggest the exact command, with its arguments single-quoted (for PowerShell on
+Windows), but only when the server's origin is a valid public origin.
 
 ### MCP commands
 
