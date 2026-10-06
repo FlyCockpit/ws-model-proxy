@@ -97,7 +97,8 @@ export function toNodeSummary(row: NodeSummaryRow, now: Date): NodeSummary {
     hold: row.holdAt
       ? { at: row.holdAt.toISOString(), note: row.holdNote, profileId: row.holdProfileId }
       : null,
-    removeAfterOfflineMs: row.removeAfterOfflineMs,
+    removeAfterOfflineMs:
+      row.removeAfterOfflineMs === null ? null : Number(row.removeAfterOfflineMs),
   };
 }
 

@@ -9,6 +9,8 @@ export type NodeSecretWriteResult = {
   name: string;
   status: "set" | "deleted" | "not_found" | "refused";
   reason?: "trust_relay" | "invalid" | "store_failed" | "limit";
+  /** ISO time the node stored it (`secret.result.updatedAt`). */
+  updatedAt?: string;
 };
 
 export type NodeRelayServices = {

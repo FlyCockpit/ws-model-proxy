@@ -9,7 +9,7 @@ function node(id: string, overrides: Partial<PlanNode> = {}): PlanNode {
     online: true,
     trust: "FULL",
     labels: [],
-    hold: null,
+    hold: { holdAt: null, holdProfileId: null },
     portRange: [30000, 30002],
     heldVersionIds: new Set(),
     usableMemoryGb: 64,
@@ -43,8 +43,8 @@ function input(overrides: Partial<PlanInput> = {}): PlanInput {
   return {
     profileId: "p-1",
     owned: [
-      { nodeId: "a", hold: false },
-      { nodeId: "b", hold: false },
+      { nodeId: "a", hold: false, holdNote: null },
+      { nodeId: "b", hold: false, holdNote: null },
     ],
     nodes: new Map([
       ["a", node("a")],
@@ -118,7 +118,7 @@ describe("profilePlan", () => {
   it("frees memory of stopped instances but keeps their ports taken", () => {
     const plan = profilePlan(
       input({
-        owned: [{ nodeId: "a", hold: false }],
+        owned: [{ nodeId: "a", hold: false, holdNote: null }],
         instances: [
           {
             id: "i-other",
@@ -159,8 +159,8 @@ describe("profilePlan", () => {
     const plan = profilePlan(
       input({
         owned: [
-          { nodeId: "a", hold: true },
-          { nodeId: "b", hold: false },
+          { nodeId: "a", hold: true, holdNote: null },
+          { nodeId: "b", hold: false, holdNote: null },
         ],
         instances: [
           {
@@ -178,17 +178,39 @@ describe("profilePlan", () => {
     expect(plan.preview.starts[0]?.placements[0]?.nodeId).toBe("b");
   });
 
-  it("releases only holds this profile set; a person's hold stays and blocks placement", () => {
+  it("a person's apply releases holds on owned nodes without a hold line (planProfileHolds)", () => {
+    const nodes = new Map([
+      ["a", node("a", { hold: { holdAt: new Date(), holdProfileId: "p-1" } })],
+      ["b", node("b", { hold: { holdAt: new Date(), holdProfileId: null } })],
+    ]);
+    const person = profilePlan(input({ nodes }));
+    expect(person.releaseNodeIds).toEqual(["a", "b"]);
+    expect(person.preview.refusals).toEqual([]);
+    const agent = profilePlan(input({ nodes, agentRules: true }));
+    expect(agent.preview.refusals.map((entry) => [entry.reason, entry.subjectId])).toContainEqual([
+      "node_held",
+      "b",
+    ]);
+    expect(agent.releaseNodeIds).toEqual([]);
+  });
+
+  it("keeps someone else's hold on a hold-line node and places nothing there", () => {
     const plan = profilePlan(
       input({
+        owned: [
+          { nodeId: "a", hold: true, holdNote: null },
+          { nodeId: "b", hold: false, holdNote: null },
+        ],
         nodes: new Map([
-          ["a", node("a", { hold: { profileId: "p-1" } })],
-          ["b", node("b", { hold: { profileId: null } })],
+          ["a", node("a", { hold: { holdAt: new Date(), holdProfileId: "p-other" } })],
+          ["b", node("b")],
         ]),
+        agentRules: true,
       }),
     );
-    expect(plan.releaseNodeIds).toEqual(["a"]);
-    expect(plan.preview.starts[0]?.placements[0]?.nodeId).toBe("a");
+    expect(plan.holdNodeIds).toEqual([]);
+    expect(plan.preview.refusals).toEqual([]);
+    expect(plan.preview.starts[0]?.placements[0]?.nodeId).toBe("b");
   });
 
   it("refuses an agent whole when an owned node is Relay only or held by a person", () => {
@@ -197,7 +219,7 @@ describe("profilePlan", () => {
         agentRules: true,
         nodes: new Map([
           ["a", node("a", { trust: "RELAY" })],
-          ["b", node("b", { hold: { profileId: null } })],
+          ["b", node("b", { hold: { holdAt: new Date(), holdProfileId: null } })],
         ]),
       }),
     );
@@ -209,14 +231,14 @@ describe("profilePlan", () => {
   it("lets a person start only a frozen version on a Relay-only node", () => {
     const frozen = profilePlan(
       input({
-        owned: [{ nodeId: "a", hold: false }],
+        owned: [{ nodeId: "a", hold: false, holdNote: null }],
         nodes: new Map([["a", node("a", { trust: "RELAY" })]]),
       }),
     );
     expect(frozen.preview.refusals[0]?.reason).toBe("definition_frozen");
     const held = profilePlan(
       input({
-        owned: [{ nodeId: "a", hold: false }],
+        owned: [{ nodeId: "a", hold: false, holdNote: null }],
         nodes: new Map([["a", node("a", { trust: "RELAY", heldVersionIds: new Set(["v-1"]) })]]),
       }),
     );
@@ -276,7 +298,7 @@ describe("profilePlan", () => {
     ]);
     const plan = profilePlan(
       input({
-        owned: [{ nodeId: "a", hold: false }],
+        owned: [{ nodeId: "a", hold: false, holdNote: null }],
         nodes: new Map([["a", node("a", { usableGpuGb: 48, gpuCount: 1 })]]),
         versions,
         claims: [
@@ -315,8 +337,8 @@ describe("profilePlan", () => {
     const reversed = profilePlan(
       input({
         owned: [
-          { nodeId: "b", hold: false },
-          { nodeId: "a", hold: false },
+          { nodeId: "b", hold: false, holdNote: null },
+          { nodeId: "a", hold: false, holdNote: null },
         ],
       }),
     );

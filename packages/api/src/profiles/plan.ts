@@ -14,6 +14,12 @@ import type { z } from "zod";
 import type { refusalSchema } from "../contracts/refusals";
 import type { previewWarningSchema, startPreviewSchema } from "../contracts/runtimes";
 import { canonicalJson, compareCodePoints } from "../lib/canonical-json";
+import {
+  type NodeHoldState,
+  type ProfileHoldLine,
+  type ProfileHoldPlan,
+  planProfileHolds,
+} from "../lib/profile-holds";
 import type { RuntimeResource, RuntimeSpec } from "../lib/runtime-spec";
 import { runtimeSpecWarnings } from "../lib/runtime-spec";
 
@@ -28,7 +34,8 @@ export type PlanNode = {
   /** Effective trust (a pending lower counts as Relay only). */
   trust: "RELAY" | "FULL";
   labels: readonly string[];
-  hold: { profileId: string | null } | null;
+  /** The node's current hold (`holdAt`, `holdProfileId`). */
+  hold: NodeHoldState;
   portRange: readonly [number, number];
   /** Version ids the node holds (frozen at Relay only). */
   heldVersionIds: ReadonlySet<string>;
@@ -78,7 +85,7 @@ export type PlanVersion = {
 export type PlanInput = {
   profileId: string;
   /** Owned nodes with their hold line (`ProfileNode`). */
-  owned: ReadonlyArray<{ nodeId: string; hold: boolean }>;
+  owned: readonly ProfileHoldLine[];
   nodes: ReadonlyMap<string, PlanNode>;
   items: readonly PlanItem[];
   versions: ReadonlyMap<string, PlanVersion>;
@@ -147,6 +154,18 @@ export function instanceServesItem(
   return instance.rankNodeIds.every((nodeId) => allowed.has(nodeId));
 }
 
+/** The hold changes this apply makes, from the nodes' current holds. */
+export function profileHoldsFor(
+  input: Pick<PlanInput, "profileId" | "owned" | "nodes" | "agentRules">,
+): ProfileHoldPlan {
+  return planProfileHolds({
+    profileId: input.profileId,
+    caller: input.agentRules ? "agent" : "person",
+    nodes: input.owned,
+    current: new Map([...input.nodes.values()].map((node) => [node.id, node.hold] as const)),
+  });
+}
+
 export function profilePlan(input: PlanInput): ProfilePlan {
   const refusals: Refusal[] = [];
   const warnings: Warning[] = [];
@@ -165,24 +184,27 @@ export function profilePlan(input: PlanInput): ProfilePlan {
           `Node ${node.slug} is Relay only; agents cannot apply a profile that owns it.`,
         ),
       );
-    if (input.agentRules && node.hold && node.hold.profileId === null)
-      refusals.push(
-        refusal("node_held", nodeId, `A person holds node ${node.slug}; agents cannot apply here.`),
-      );
   }
 
-  // ── Holds ──
-  const holdNodeIds = ownedIds.filter((id) => holdLines.has(id)).sort(compareCodePoints);
-  const releaseNodeIds = ownedIds
-    .filter((id) => !holdLines.has(id) && input.nodes.get(id)?.hold?.profileId === input.profileId)
-    .sort(compareCodePoints);
-  /** Nodes starts may use: owned, no hold line, and not held by anyone else after apply. */
+  // ── Holds (the contract's one rule: planProfileHolds) ──
+  const holds = profileHoldsFor(input);
+  if (!holds.ok)
+    for (const nodeId of holds.nodeIds)
+      refusals.push(
+        refusal(
+          "node_held",
+          nodeId,
+          `Node ${input.nodes.get(nodeId)?.slug ?? nodeId} is held by a person or another profile; agents cannot release it.`,
+        ),
+      );
+  const holdNodeIds = holds.ok ? holds.hold.map((line) => line.nodeId).sort(compareCodePoints) : [];
+  const releaseNodeIds = holds.ok ? [...holds.release].sort(compareCodePoints) : [];
+  const released = new Set(releaseNodeIds);
+  /** Nodes starts may use: owned, no hold line, and not held by anyone after this apply. */
   const placeable = new Set(
-    ownedIds.filter((id) => {
-      if (holdLines.has(id)) return false;
-      const hold = input.nodes.get(id)?.hold;
-      return !hold || hold.profileId === input.profileId;
-    }),
+    ownedIds.filter(
+      (id) => !holdLines.has(id) && (!input.nodes.get(id)?.hold.holdAt || released.has(id)),
+    ),
   );
 
   // ── Keep or stop what runs on the owned nodes ──

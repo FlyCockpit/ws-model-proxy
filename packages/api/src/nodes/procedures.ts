@@ -12,7 +12,13 @@ import { assertMayWrite, callerActor } from "../lib/caller";
 import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
 import { nodeMetricCommandsHash } from "../lib/runtime-launch-hash";
 import { nodeMetricCommandsSchema } from "../lib/runtime-spec";
-import { fabricMemberNodeIds, refreshFabricsHashes, replaceNodeFabrics } from "./fabrics";
+import {
+  fabricInUseRefusal,
+  fabricMemberNodeIds,
+  isFabricMemberInUse,
+  refreshFabricsHashes,
+  replaceNodeFabrics,
+} from "./fabrics";
 import { loadNodeDetail, loadNodeSummary } from "./load";
 import { isFullControl, nodeTrustView } from "./trust";
 import { nodeSummarySelect, parseHeldDefinitions, toNodeSummary } from "./views";
@@ -73,15 +79,6 @@ export const nodeProcedures = {
       },
     });
     if (!node) throw notFound("Node");
-    if (input.secrets) {
-      // The 0.4.0 contract fix moves secrets to `nodes.secrets.set/delete`; until it lands the
-      // secrets part of an update is refused so no value ever passes through this procedure.
-      throw refuseAbout(
-        "secret_needs_node",
-        node.id,
-        "Set node secrets with `wsmp secret set NAME` on the node.",
-      );
-    }
     if (!isFullControl(node)) throw relayOnly(node.id);
     if (input.metricCommands) nodeMetricCommandsSchema.parse(input.metricCommands);
 
@@ -146,6 +143,7 @@ export const nodeProcedures = {
         return affected;
       });
     } catch (error) {
+      if (isFabricMemberInUse(error)) throw fabricInUseRefusal();
       if (isUniqueViolation(error))
         throw new ORPCError("CONFLICT", {
           message: "Another node already uses that address in the fabric.",
@@ -181,7 +179,10 @@ export const nodeProcedures = {
     const userId = context.session.user.id;
     const updated = await prisma.node.updateMany({
       where: { id: input.nodeId, userId },
-      data: { removeAfterOfflineMs: input.removeAfterOfflineMs },
+      data: {
+        removeAfterOfflineMs:
+          input.removeAfterOfflineMs === null ? null : BigInt(input.removeAfterOfflineMs),
+      },
     });
     if (updated.count === 0) throw notFound("Node");
     return loadNodeSummary(userId, input.nodeId);
@@ -205,6 +206,17 @@ export const nodeProcedures = {
         select: { id: true },
       });
       if (!node) throw notFound("Node");
+      // Its always-on runtimes go with it; a profile pinning one keeps the runtime (NoAction).
+      const pinned = await tx.profileItem.findFirst({
+        where: { Runtime: { userId, nodeId: node.id } },
+        select: { Profile: { select: { id: true } } },
+      });
+      if (pinned)
+        throw refuseAbout(
+          "pinned_by_profile",
+          pinned.Profile.id,
+          "A profile pins a runtime on this node. Remove it from the profile first.",
+        );
       const ranks = await tx.instanceRank.findMany({
         where: {
           nodeId: node.id,
@@ -250,7 +262,7 @@ export const nodeProcedures = {
     });
     if (!node) throw notFound("Node");
     const frozen = await frozenParts(userId, node.id, node.heldDefinitions, node.metricCommands);
-    const [openBrowserTerminals, queuedCommandsRefused] = await Promise.all([
+    const [openBrowserTerminals, queuedCommandsRefused, runningCommands] = await Promise.all([
       prisma.nodeAuditEvent.count({
         where: {
           userId,
@@ -261,6 +273,7 @@ export const nodeProcedures = {
         },
       }),
       prisma.queuedNodeCommand.count({ where: { userId, nodeId: node.id, state: "QUEUED" } }),
+      prisma.nodeCommand.count({ where: { userId, nodeId: node.id, state: "RUNNING" } }),
     ]);
     return {
       frozenRuntimes: frozen.runtimes,
@@ -271,6 +284,7 @@ export const nodeProcedures = {
         ip: member.ip,
       })),
       secretNames: secretNamesOf(node.features),
+      runningCommands,
       openBrowserTerminals,
       queuedCommandsRefused,
     };
@@ -408,23 +422,26 @@ export const nodeProcedures = {
 
     delete: contractProcedure(c.fabrics.delete).handler(async ({ context, input }) => {
       const userId = context.session.user.id;
-      const members = await prisma.$transaction(async (tx) => {
-        const fabric = await tx.fabric.findFirst({
-          where: { id: input.fabricId, userId },
-          select: { id: true, Members: { select: { nodeId: true } } },
-        });
-        if (!fabric) throw notFound("Fabric");
-        const nodeIds = fabric.Members.map((member) => member.nodeId);
-        if (await multiNodeInstanceRunsIn(tx, nodeIds))
-          throw refuseAbout(
-            "instances_running",
-            fabric.id,
-            "A multi-node instance runs in this fabric. Stop it first.",
-          );
-        await tx.fabric.delete({ where: { id: fabric.id } });
-        await refreshFabricsHashes(tx, userId, nodeIds);
-        return nodeIds;
-      });
+      const members = await mapFabricInUse(() =>
+        prisma.$transaction(async (tx) => {
+          const fabric = await tx.fabric.findFirst({
+            where: { id: input.fabricId, userId },
+            select: { id: true, Members: { select: { nodeId: true } } },
+          });
+          if (!fabric) throw notFound("Fabric");
+          const nodeIds = fabric.Members.map((member) => member.nodeId);
+          // `RuntimeInstance.fabricId` is set while a multi-node instance lives on the fabric.
+          if ((await tx.runtimeInstance.count({ where: { userId, fabricId: fabric.id } })) > 0)
+            throw refuseAbout(
+              "fabric_in_use",
+              fabric.id,
+              "A multi-node instance runs on this fabric. Stop it first.",
+            );
+          await tx.fabric.delete({ where: { id: fabric.id } });
+          await refreshFabricsHashes(tx, userId, nodeIds);
+          return nodeIds;
+        }),
+      );
       const definitionChanged = relay(context)?.definitionChanged;
       await afterCommit(definitionChanged && (() => definitionChanged(members)));
       return { ok: true as const };
@@ -475,20 +492,13 @@ export const nodeProcedures = {
   },
 };
 
-/**
- * Whether a multi-node instance with a rank on these nodes still holds its claims.
- * TODO(contract fix): `RuntimeInstance.fabricId` replaces this approximation.
- */
-async function multiNodeInstanceRunsIn(
-  tx: Pick<typeof prisma, "instanceRank">,
-  nodeIds: readonly string[],
-): Promise<boolean> {
-  if (nodeIds.length === 0) return false;
-  const ranks = await tx.instanceRank.findMany({
-    where: { nodeId: { in: [...nodeIds] }, claim: { not: "RELEASED" } },
-    select: { instanceId: true, Instance: { select: { _count: { select: { Ranks: true } } } } },
-  });
-  return ranks.some((rank) => rank.Instance._count.Ranks > 1);
+async function mapFabricInUse<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    if (isFabricMemberInUse(error)) throw fabricInUseRefusal();
+    throw error;
+  }
 }
 
 function secretNamesOf(features: unknown): string[] {

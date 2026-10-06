@@ -2,6 +2,7 @@ import { stub } from "../contract-procedure";
 import { nodesContract as c } from "../contracts/nodes";
 import { credentialProcedures, enrollmentProcedures } from "../nodes/enrollment";
 import { nodeProcedures as n } from "../nodes/procedures";
+import { secretProcedures } from "../nodes/secrets";
 
 /**
  * Lane B implements the node definition, trust, fabrics, enrollment and activity
@@ -11,10 +12,7 @@ export const nodesRouter = {
   list: n.list,
   get: n.get,
   update: n.update,
-  secrets: {
-    set: stub(c.secrets.set),
-    delete: stub(c.secrets.delete),
-  },
+  secrets: secretProcedures,
   setHold: n.setHold,
   setTemporary: n.setTemporary,
   fabrics: n.fabrics,

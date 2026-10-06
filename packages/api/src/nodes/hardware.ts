@@ -5,6 +5,7 @@
  */
 import { z } from "zod";
 import type { effectiveHardwareSchema } from "../contracts/nodes";
+import { isFabricIp } from "../lib/ip-literal";
 import {
   type DeclaredHardware,
   declaredHardwareSchema,
@@ -227,10 +228,10 @@ function ipv4Subnet24(address: string): string | null {
   return parts.slice(0, 3).join(".");
 }
 
+/** Only addresses a fabric membership would accept, and not link-local. */
 function isSuggestible(address: string): boolean {
-  if (address === "127.0.0.1" || address === "::1") return false;
-  if (address.startsWith("169.254.") || address.toLowerCase().startsWith("fe80")) return false;
-  return !address.startsWith("127.");
+  if (!isFabricIp(address)) return false;
+  return !address.startsWith("169.254.") && !address.toLowerCase().startsWith("fe80");
 }
 
 /** A link this fast (or with RDMA) looks like a fabric. */

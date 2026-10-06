@@ -55,7 +55,7 @@ type CodeRow = {
   usedCount: number;
   lastUsedAt: Date | null;
   labels: string[];
-  removeAfterOfflineMs: number | null;
+  removeAfterOfflineMs: bigint | null;
   revokedAt: Date | null;
   Uses: Array<{ nodeId: string | null; usedAt: Date; Node: { slug: string } | null }>;
 };
@@ -72,7 +72,8 @@ export function toEnrollmentCodeView(row: CodeRow): z.infer<typeof enrollmentCod
     usedCount: row.usedCount,
     lastUsedAt: row.lastUsedAt?.toISOString() ?? null,
     labels: row.labels,
-    removeAfterOfflineMs: row.removeAfterOfflineMs,
+    removeAfterOfflineMs:
+      row.removeAfterOfflineMs === null ? null : Number(row.removeAfterOfflineMs),
     enrolled: row.Uses.map((use) => ({
       nodeId: use.nodeId,
       slug: use.Node?.slug ?? null,
@@ -93,6 +94,13 @@ async function mintCode<T>(run: () => Promise<T>): Promise<T> {
       });
     throw error;
   }
+}
+
+/** `temporary: true` alone means one hour offline; removeAfterOfflineMs implies temporary. */
+export const DEFAULT_TEMPORARY_MS = 3_600_000;
+function temporaryMs(input: { temporary?: boolean; removeAfterOfflineMs?: number }): bigint | null {
+  if (input.removeAfterOfflineMs !== undefined) return BigInt(input.removeAfterOfflineMs);
+  return input.temporary ? BigInt(DEFAULT_TEMPORARY_MS) : null;
 }
 
 function liveCodeWhere(userId: string, now: Date) {
@@ -158,7 +166,7 @@ export const enrollmentProcedures = {
             replaceNodeId: input.replaceNodeId ?? null,
             maxUses: input.maxUses,
             labels: input.labels ?? [],
-            removeAfterOfflineMs: input.removeAfterOfflineMs ?? null,
+            removeAfterOfflineMs: temporaryMs(input),
           },
           select: codeSelect,
         });

@@ -10,6 +10,7 @@ import { contractProcedure } from "../contract-procedure";
 import { agentRulesApply, isHumanCaller } from "../contracts/auth-context";
 import { profilesContract as c, type profileViewSchema } from "../contracts/profiles";
 import { assertMayWrite, callerActor } from "../lib/caller";
+import { planProfileHolds } from "../lib/profile-holds";
 import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
 import { runtimeSpecSchema } from "../lib/runtime-spec";
 import { effectiveHardware, liveMetrics } from "../nodes/hardware";
@@ -284,7 +285,7 @@ async function loadPlanInput(context: Context, userId: string, profileId: string
       online: node.connection === "ONLINE",
       trust: nodeTrustView(node).effective,
       labels: node.labels,
-      hold: node.holdAt ? { profileId: node.holdProfileId } : null,
+      hold: { holdAt: node.holdAt, holdProfileId: node.holdProfileId },
       portRange: [node.portStart, node.portEnd],
       heldVersionIds: new Set(parseHeldDefinitions(node.heldDefinitions).map((d) => d.versionId)),
       usableMemoryGb: hardware.usableMemoryGb,
@@ -531,12 +532,13 @@ export const profileProcedures = {
             "FORBIDDEN",
           );
       }
-      await tx.profile.deleteMany({ where: { id: profile.id, userId } });
-      // Holds this profile set would otherwise outlive it (nothing could release them).
+      // Release this profile's holds first: the FK would set holdProfileId null, which reads
+      // as a person's hold that nothing but a person could release.
       await tx.node.updateMany({
-        where: { userId, holdProfileId: input.profileId },
+        where: { userId, holdProfileId: profile.id },
         data: { holdAt: null, holdNote: null, holdProfileId: null },
       });
+      await tx.profile.deleteMany({ where: { id: profile.id, userId } });
     });
     return { ok: true as const };
   }),
@@ -561,7 +563,6 @@ export const profileProcedures = {
 
     const actor = callerActor(context.auth);
     const now = new Date();
-    const holdNotes = new Map(profile.Nodes.map((node) => [node.nodeId, node.holdNote]));
     const operation = await prisma.$transaction(async (tx) => {
       const created = await tx.runtimeOperation.create({
         data: {
@@ -576,43 +577,50 @@ export const profileProcedures = {
         },
         select: { id: true, createdAt: true },
       });
-      if (planInput.agentRules) {
-        // Re-checked at write time: a person's hold set after the plan still refuses an agent.
-        const personHeld = await tx.node.findFirst({
-          where: {
-            userId,
-            id: { in: planInput.owned.map((line) => line.nodeId) },
-            holdAt: { not: null },
-            holdProfileId: null,
-          },
-          select: { id: true },
-        });
-        if (personHeld)
-          throw refuseAbout(
-            "node_held",
-            personHeld.id,
-            "A person holds this node; agents cannot apply here.",
-          );
-      }
-      for (const nodeId of plan.holdNodeIds) {
-        // A person's own hold stays theirs (never converted into a profile hold, note kept).
-        // An agent never takes another profile's hold either.
+      // Holds are planned again on the rows as they are now (planProfileHolds): a hold set
+      // since the preview refuses an agent (node_held) and makes a person's preview stale.
+      const current = await tx.node.findMany({
+        where: { userId, id: { in: planInput.owned.map((line) => line.nodeId) } },
+        select: { id: true, holdAt: true, holdProfileId: true },
+      });
+      const holds = planProfileHolds({
+        profileId: profile.id,
+        caller: planInput.agentRules ? "agent" : "person",
+        nodes: planInput.owned,
+        current: new Map(current.map((node) => [node.id, node] as const)),
+      });
+      if (!holds.ok)
+        throw refuseAbout(
+          "node_held",
+          holds.nodeIds[0] ?? profile.id,
+          "A person or another profile holds a node this profile owns; agents cannot release it.",
+        );
+      if (
+        !sameIds(
+          holds.hold.map((line) => line.nodeId),
+          plan.holdNodeIds,
+        ) ||
+        !sameIds(holds.release, plan.releaseNodeIds)
+      )
+        throw refuse("preview_stale", "A node's hold changed since the preview. Preview again.");
+      for (const line of holds.hold)
         await tx.node.updateMany({
+          where: { id: line.nodeId, userId, OR: [{ holdAt: null }, { holdProfileId: profile.id }] },
+          data: { holdAt: now, holdNote: line.note, holdProfileId: profile.id },
+        });
+      for (const nodeId of holds.release) {
+        const was = current.find((node) => node.id === nodeId);
+        await tx.node.updateMany({
+          // Only the hold that was read: a newer one (set meanwhile) stays.
           where: {
             id: nodeId,
             userId,
-            ...(planInput.agentRules
-              ? { OR: [{ holdAt: null }, { holdProfileId: profile.id }] }
-              : { NOT: { holdAt: { not: null }, holdProfileId: null } }),
+            holdAt: { not: null },
+            holdProfileId: was?.holdProfileId ?? null,
           },
-          data: { holdAt: now, holdNote: holdNotes.get(nodeId) ?? null, holdProfileId: profile.id },
-        });
-      }
-      if (plan.releaseNodeIds.length > 0)
-        await tx.node.updateMany({
-          where: { id: { in: plan.releaseNodeIds }, userId, holdProfileId: profile.id },
           data: { holdAt: null, holdNote: null, holdProfileId: null },
         });
+      }
       return created;
     });
     const profileApplied = context.services?.nodes?.profileApplied;
@@ -656,4 +664,8 @@ function sameHolds(
 /** A plain-JSON copy for a Json column (the preview has no Dates or class instances). */
 function toJsonValue(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
+
+function sameIds(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && [...a].sort().join("\u0000") === [...b].sort().join("\u0000");
 }

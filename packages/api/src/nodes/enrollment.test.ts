@@ -37,7 +37,7 @@ function codeRow(overrides: Record<string, unknown> = {}) {
     usedCount: 1,
     lastUsedAt: new Date("2026-10-06T10:05:00Z"),
     labels: ["lab"],
-    removeAfterOfflineMs: 3_600_000,
+    removeAfterOfflineMs: 3_600_000n,
     revokedAt: null,
     Uses: [{ nodeId: "node-1", usedAt: new Date("2026-10-06T10:05:00Z"), Node: { slug: "box" } }],
     ...overrides,
@@ -77,11 +77,11 @@ describe("nodes.enrollmentCodes.create", () => {
       userId: "owner-1",
       maxUses: 5,
       labels: ["lab"],
-      removeAfterOfflineMs: 3_600_000,
+      removeAfterOfflineMs: 3_600_000n,
       codeDigest: `hmac:enrollmentCode:${out.secret}`,
       codePrefix: out.secret.slice(9, 17),
     });
-    expect(JSON.stringify(data)).not.toContain(`"${out.secret}"`);
+    expect(Object.values(data ?? {})).not.toContain(out.secret);
     const expiresAt = data?.expiresAt as Date;
     const ttl = expiresAt.getTime() - Date.now();
     expect(ttl).toBeGreaterThan(23.9 * 3_600_000);
@@ -92,6 +92,21 @@ describe("nodes.enrollmentCodes.create", () => {
     expect(out.code.enrolled).toEqual([
       { nodeId: "node-1", slug: "box", usedAt: "2026-10-06T10:05:00.000Z" },
     ]);
+  });
+
+  it("makes `temporary: true` alone an hour offline", async () => {
+    db.nodeEnrollmentCode.findMany.mockResolvedValueOnce([]);
+    db.nodeEnrollmentCode.create.mockResolvedValueOnce(codeRow() as never);
+    await client().enrollmentCodes.create({ temporary: true });
+    expect(db.nodeEnrollmentCode.create.mock.calls[0]?.[0]?.data).toMatchObject({
+      removeAfterOfflineMs: 3_600_000n,
+    });
+  });
+
+  it("refuses temporary: false with removeAfterOfflineMs (contract refinement)", async () => {
+    await expect(
+      client().enrollmentCodes.create({ temporary: false, removeAfterOfflineMs: 120_000 }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
   });
 
   it("refuses a multi-use code with a suggested slug (contract refinement)", async () => {

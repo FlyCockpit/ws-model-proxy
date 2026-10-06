@@ -64,6 +64,8 @@ function planState(options: { trust?: "RELAY" | "FULL"; personHold?: boolean } =
 beforeEach(() => {
   mockReset(db);
   db.$transaction.mockImplementation(((fn: (tx: typeof db) => unknown) => fn(db)) as never);
+  // The apply transaction re-reads the owned nodes' holds; by default nobody holds them.
+  db.node.findMany.mockResolvedValue([]);
 });
 
 describe("profiles.apply", () => {
@@ -348,58 +350,11 @@ describe("profiles.delete", () => {
   });
 });
 
-describe("profiles.apply hold race", () => {
-  it("refuses an agent when a person holds a hold-line node by the time it writes", async () => {
-    db.profile.findFirst.mockResolvedValueOnce({
-      id: "p-1",
-      Nodes: [{ nodeId: "a", hold: true, holdNote: null }],
-      Items: [],
-    } as never);
-    db.node.findMany.mockResolvedValueOnce([
-      {
-        id: "a",
-        slug: "a",
-        connection: "ONLINE",
-        trust: "FULL",
-        trustChangedAt: null,
-        trustLowerRequestedAt: null,
-        labels: [],
-        holdAt: null,
-        holdProfileId: null,
-        portStart: 30000,
-        portEnd: 30010,
-        heldDefinitions: [],
-        declaredResources: null,
-        nodeInfo: null,
-        nodeMetrics: null,
-        nodeMetricsAt: null,
-      },
-    ] as never);
-    db.runtimeVersion.findMany.mockResolvedValueOnce([]);
-    db.runtimeInstance.findMany.mockResolvedValueOnce([]);
-    db.instanceRank.findMany.mockResolvedValueOnce([]);
-    db.fabric.findMany.mockResolvedValueOnce([]);
-    db.runtimeOperation.create.mockResolvedValueOnce({
-      id: "op-1",
-      createdAt: new Date(),
-    } as never);
-    db.node.findFirst.mockResolvedValueOnce({ id: "a" } as never);
-    await expect(client(FULL_AGENT).apply({ profileId: "p-1" })).rejects.toMatchObject({
-      data: { reason: "node_held" },
-    });
-    expect(db.node.findFirst.mock.calls[0]?.[0]?.where).toMatchObject({
-      holdAt: { not: null },
-      holdProfileId: null,
-    });
-    expect(db.node.updateMany).not.toHaveBeenCalled();
-  });
-});
-
 describe("hold writes on apply", () => {
-  function heldPlan(holdProfileId: string | null) {
+  function heldPlan(line: boolean, hold: { holdAt: Date | null; holdProfileId: string | null }) {
     db.profile.findFirst.mockResolvedValueOnce({
       id: "p-1",
-      Nodes: [{ nodeId: "a", hold: true, holdNote: "games" }],
+      Nodes: [{ nodeId: "a", hold: line, holdNote: line ? "games" : null }],
       Items: [],
     } as never);
     db.node.findMany.mockResolvedValueOnce([
@@ -411,8 +366,7 @@ describe("hold writes on apply", () => {
         trustChangedAt: null,
         trustLowerRequestedAt: null,
         labels: [],
-        holdAt: new Date(),
-        holdProfileId,
+        ...hold,
         portStart: 30000,
         portEnd: 30010,
         heldDefinitions: [],
@@ -431,30 +385,68 @@ describe("hold writes on apply", () => {
       createdAt: new Date(),
     } as never);
   }
+  const free = { holdAt: null, holdProfileId: null };
+  const personHold = { holdAt: new Date(), holdProfileId: null };
 
-  it("never converts a person's own hold into a profile hold", async () => {
-    heldPlan(null);
-    const preview = await client().apply({ profileId: "p-1", preview: true });
-    if (preview.mode !== "preview") throw new Error("expected a preview");
-    heldPlan(null);
-    await client().apply({ profileId: "p-1", fingerprint: preview.preview.fingerprint });
-    expect(db.node.updateMany.mock.calls[0]?.[0]?.where).toMatchObject({
-      NOT: { holdAt: { not: null }, holdProfileId: null },
+  it("sets this profile's hold on a free hold-line node, only if it is still free or ours", async () => {
+    heldPlan(true, free);
+    db.node.findMany.mockResolvedValueOnce([{ id: "a", ...free }] as never);
+    await client(FULL_AGENT).apply({ profileId: "p-1" });
+    expect(db.node.updateMany.mock.calls[0]?.[0]).toMatchObject({
+      where: { id: "a", userId: "owner-1", OR: [{ holdAt: null }, { holdProfileId: "p-1" }] },
+      data: { holdNote: "games", holdProfileId: "p-1" },
     });
   });
 
-  it("lets an agent set a hold only where no one else holds the node", async () => {
-    heldPlan("p-other");
-    db.node.findFirst.mockResolvedValueOnce(null);
-    await client(FULL_AGENT).apply({ profileId: "p-1" });
-    expect(db.node.updateMany.mock.calls[0]?.[0]?.where).toMatchObject({
-      OR: [{ holdAt: null }, { holdProfileId: "p-1" }],
+  it("keeps a person's hold on a hold-line node as it is (never converted)", async () => {
+    heldPlan(true, personHold);
+    const preview = await client().apply({ profileId: "p-1", preview: true });
+    if (preview.mode !== "preview") throw new Error("expected a preview");
+    heldPlan(true, personHold);
+    db.node.findMany.mockResolvedValueOnce([{ id: "a", ...personHold }] as never);
+    await client().apply({ profileId: "p-1", fingerprint: preview.preview.fingerprint });
+    expect(db.node.updateMany).not.toHaveBeenCalled();
+  });
+
+  for (const [label, auth] of [
+    ["Full agent token", FULL_AGENT],
+    ["cookie without CSRF", CSRF_LESS],
+  ] as const)
+    it(`refuses a ${label} when a person's hold lands after the plan`, async () => {
+      heldPlan(false, free);
+      db.node.findMany.mockResolvedValueOnce([{ id: "a", ...personHold }] as never);
+      await expect(client(auth).apply({ profileId: "p-1" })).rejects.toMatchObject({
+        data: { reason: "node_held" },
+      });
+      expect(db.node.updateMany).not.toHaveBeenCalled();
+    });
+
+  it("makes a person's preview stale when a hold changed since", async () => {
+    heldPlan(false, free);
+    const preview = await client().apply({ profileId: "p-1", preview: true });
+    if (preview.mode !== "preview") throw new Error("expected a preview");
+    heldPlan(false, free);
+    db.node.findMany.mockResolvedValueOnce([{ id: "a", ...personHold }] as never);
+    await expect(
+      client().apply({ profileId: "p-1", fingerprint: preview.preview.fingerprint }),
+    ).rejects.toMatchObject({ data: { reason: "preview_stale" } });
+  });
+
+  it("lets a person release another's hold on an owned node without a hold line", async () => {
+    heldPlan(false, personHold);
+    const preview = await client().apply({ profileId: "p-1", preview: true });
+    if (preview.mode !== "preview") throw new Error("expected a preview");
+    heldPlan(false, personHold);
+    db.node.findMany.mockResolvedValueOnce([{ id: "a", ...personHold }] as never);
+    await client().apply({ profileId: "p-1", fingerprint: preview.preview.fingerprint });
+    expect(db.node.updateMany.mock.calls[0]?.[0]).toMatchObject({
+      where: { id: "a", holdProfileId: null, holdAt: { not: null } },
+      data: { holdAt: null },
     });
   });
 
   it("records a cookie without CSRF as an agent", async () => {
-    heldPlan("p-1");
-    db.node.findFirst.mockResolvedValueOnce(null);
+    heldPlan(false, free);
     await client(CSRF_LESS).apply({ profileId: "p-1" });
     expect(db.runtimeOperation.create.mock.calls[0]?.[0]?.data).toMatchObject({ actor: "AGENT" });
   });

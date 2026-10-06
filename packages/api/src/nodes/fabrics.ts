@@ -5,6 +5,7 @@
  */
 import type { Prisma } from "@ws-model-proxy/db";
 import { compareCodePoints } from "../lib/canonical-json";
+import { refuse, refuseAbout } from "../lib/refuse";
 import { nodeFabricsHash } from "../lib/runtime-launch-hash";
 import type { NodeFabricSets } from "../lib/runtime-spec";
 
@@ -92,6 +93,26 @@ export async function replaceNodeFabrics(
   const wantedByName = new Map(wanted.map((entry) => [entry.name, entry.ip]));
   const touchedFabrics = new Set<string>();
 
+  // A live multi-node instance on a fabric pins this node's address there (fabric_in_use; the
+  // `fabric_member_in_use` trigger enforces the same in the database).
+  const changing = current.filter((member) => wantedByName.get(member.Fabric.name) !== member.ip);
+  if (changing.length > 0) {
+    const inUse = await tx.runtimeInstance.findFirst({
+      where: {
+        userId,
+        fabricId: { in: changing.map((member) => member.fabricId) },
+        Ranks: { some: { nodeId, claim: { not: "RELEASED" } } },
+      },
+      select: { fabricId: true },
+    });
+    if (inUse?.fabricId)
+      throw refuseAbout(
+        "fabric_in_use",
+        inUse.fabricId,
+        "A running multi-node instance uses this node's address on that fabric. Stop it first.",
+      );
+  }
+
   for (const member of current) {
     const ip = wantedByName.get(member.Fabric.name);
     if (ip === undefined) {
@@ -119,4 +140,30 @@ export async function replaceNodeFabrics(
   if (touchedFabrics.size === 0) return [];
   const affected = await fabricMemberNodeIds(tx, userId, [...touchedFabrics]);
   return [...new Set([nodeId, ...affected])];
+}
+
+/** The `fabric_member_in_use` trigger (SQLSTATE WMPP1), read by code or its message tag. */
+export function isFabricMemberInUse(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  const pending: unknown[] = [error];
+  while (pending.length > 0) {
+    const candidate = pending.pop();
+    if (!candidate || typeof candidate !== "object" || seen.has(candidate)) continue;
+    seen.add(candidate);
+    for (const key of ["code", "originalCode"])
+      if (Reflect.get(candidate, key) === "WMPP1") return true;
+    const message = Reflect.get(candidate, "message");
+    if (typeof message === "string" && message.includes("fabric_member_in_use")) return true;
+    for (const key of ["meta", "cause", "driverAdapterError"])
+      pending.push(Reflect.get(candidate, key));
+  }
+  return false;
+}
+
+/** Maps the database's fabric refusal to the contract's. */
+export function fabricInUseRefusal() {
+  return refuse(
+    "fabric_in_use",
+    "A running multi-node instance uses this fabric address. Stop it first.",
+  );
 }

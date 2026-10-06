@@ -228,15 +228,14 @@ describe("nodes.update", () => {
     expect(db.node.findFirst).not.toHaveBeenCalled();
   });
 
-  it("never accepts secret values here (secret_needs_node)", async () => {
-    db.node.findFirst.mockResolvedValueOnce(trustRow as never);
+  it("takes no secrets (they have their own procedures)", async () => {
     await expect(
       client().update({
         nodeId: "node-1",
         secrets: { set: [{ name: "WSMP_SECRET_HF", value: "hf_x" }] },
-      }),
-    ).rejects.toMatchObject({ data: { reason: "secret_needs_node" } });
-    expect(db.$transaction).not.toHaveBeenCalled();
+      } as never),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.node.findFirst).not.toHaveBeenCalled();
   });
 
   it("writes the definition, audits the agent and pushes to the node", async () => {
@@ -319,6 +318,19 @@ describe("nodes.update", () => {
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 
+  it("refuses changing an address a running multi-node instance uses (fabric_in_use)", async () => {
+    db.node.findFirst.mockResolvedValueOnce(trustRow as never);
+    db.node.updateMany.mockResolvedValueOnce({ count: 1 });
+    db.fabricMember.findMany.mockResolvedValueOnce([
+      { id: "m-1", fabricId: "f-1", ip: "10.0.0.1", Fabric: { name: "qsfp" } },
+    ] as never);
+    db.runtimeInstance.findFirst.mockResolvedValueOnce({ fabricId: "f-1" } as never);
+    await expect(
+      client().update({ nodeId: "node-1", fabrics: [{ name: "qsfp", ip: "10.0.0.9" }] }),
+    ).rejects.toMatchObject({ data: { reason: "fabric_in_use" } });
+    expect(db.fabricMember.update).not.toHaveBeenCalled();
+  });
+
   it("maps a duplicate fabric address to CONFLICT", async () => {
     db.node.findFirst.mockResolvedValueOnce(trustRow as never);
     db.$transaction.mockRejectedValueOnce(Object.assign(new Error("dup"), { code: "P2002" }));
@@ -348,6 +360,15 @@ describe("hold, temporary, rename", () => {
 });
 
 describe("delete", () => {
+  it("refuses while a profile pins one of the node's runtimes", async () => {
+    db.node.findFirst.mockResolvedValueOnce({ id: "node-1" } as never);
+    db.profileItem.findFirst.mockResolvedValueOnce({ Profile: { id: "p-1" } } as never);
+    await expect(client().delete({ nodeId: "node-1" })).rejects.toMatchObject({
+      data: { reason: "pinned_by_profile" },
+    });
+    expect(db.node.delete).not.toHaveBeenCalled();
+  });
+
   it("lists the instances that stop and tells the relay", async () => {
     const disconnect = vi.fn(async () => undefined);
     db.node.findFirst.mockResolvedValueOnce({ id: "node-1" } as never);
@@ -417,18 +438,31 @@ describe("trust lowering", () => {
 });
 
 describe("fabrics", () => {
-  it("refuses to delete a fabric a multi-node instance runs in", async () => {
+  it("refuses to delete a fabric a multi-node instance runs on (fabric_in_use)", async () => {
     db.fabric.findFirst.mockResolvedValueOnce({
       id: "f-1",
       Members: [{ nodeId: "node-1" }, { nodeId: "node-2" }],
     } as never);
-    db.instanceRank.findMany.mockResolvedValueOnce([
-      { instanceId: "i-1", Instance: { _count: { Ranks: 2 } } },
-    ] as never);
+    db.runtimeInstance.count.mockResolvedValueOnce(1);
     await expect(client().fabrics.delete({ fabricId: "f-1" })).rejects.toMatchObject({
-      data: { reason: "instances_running" },
+      data: { reason: "fabric_in_use" },
+    });
+    expect(db.runtimeInstance.count.mock.calls[0]?.[0]?.where).toEqual({
+      userId: "owner-1",
+      fabricId: "f-1",
     });
     expect(db.fabric.delete).not.toHaveBeenCalled();
+  });
+
+  it("maps the database's fabric_member_in_use (WMPP1) to fabric_in_use", async () => {
+    db.fabric.findFirst.mockResolvedValueOnce({ id: "f-1", Members: [] } as never);
+    db.runtimeInstance.count.mockResolvedValueOnce(0);
+    db.fabric.delete.mockRejectedValueOnce(
+      Object.assign(new Error("raw"), { code: "P2010", meta: { code: "WMPP1" } }),
+    );
+    await expect(client().fabrics.delete({ fabricId: "f-1" })).rejects.toMatchObject({
+      data: { reason: "fabric_in_use" },
+    });
   });
 
   it("maps a duplicate name on rename to slug_taken", async () => {
