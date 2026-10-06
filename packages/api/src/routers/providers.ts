@@ -15,6 +15,7 @@ import { cloudEgressEnabled } from "../lib/cloud-egress";
 import { graphWrite, modelTargetFences } from "../lib/graph-write";
 import { createProviderCatalog, fetchOpenRouterCatalogJson } from "../lib/provider-catalog";
 import {
+  CATALOG_CHARGE_RULES,
   CATALOG_SEARCH_MAX_LIMIT,
   type CatalogModel,
   searchCatalog,
@@ -228,23 +229,40 @@ export const providersRouter = {
       });
       if (!account) throw notFound("That provider account does not exist.");
       const baseUrl = input.baseUrl === undefined ? undefined : normalizedBaseUrl(input.baseUrl);
-      await graphWrite([userId], async (tx) => {
-        await tx.providerAccount.update({
-          where: { id: account.id },
-          data: {
-            ...(input.label !== undefined ? { label: input.label } : {}),
-            // A new endpoint is a new identity (hardening: atomically bump its version).
-            ...(baseUrl !== undefined && baseUrl !== account.baseUrl
-              ? { baseUrl, endpointIdentity: baseUrl, endpointVersion: account.endpointVersion + 1 }
-              : {}),
-          },
+      try {
+        await graphWrite([userId], async (tx) => {
+          // Read under the owner fence: the endpoint version must be the latest one.
+          const current = await tx.providerAccount.findUniqueOrThrow({
+            where: { id: account.id },
+            select: { baseUrl: true, endpointVersion: true },
+          });
+          await tx.providerAccount.update({
+            where: { id: account.id },
+            data: {
+              ...(input.label !== undefined ? { label: input.label } : {}),
+              // A new endpoint is a new identity (hardening: atomically bump its version).
+              ...(baseUrl !== undefined && baseUrl !== current.baseUrl
+                ? {
+                    baseUrl,
+                    endpointIdentity: baseUrl,
+                    endpointVersion: current.endpointVersion + 1,
+                  }
+                : {}),
+            },
+          });
+          await audit(tx, context, {
+            accountId: account.id,
+            action: "provider.account.update",
+            after: { label: input.label ?? null, baseUrl: baseUrl ?? null },
+          });
         });
-        await audit(tx, context, {
-          accountId: account.id,
-          action: "provider.account.update",
-          after: { label: input.label ?? null, baseUrl: baseUrl ?? null },
-        });
-      });
+      } catch (error) {
+        if (isUniqueViolation(error))
+          throw new ORPCError("CONFLICT", {
+            message: "You already have an account with this label.",
+          });
+        throw error;
+      }
       return accountViewOf(userId, account.id);
     }),
     delete: contractProcedure(c.accounts.delete).handler(async ({ input, context }) => {
@@ -266,7 +284,13 @@ export const providersRouter = {
           });
           await tx.providerAccount.update({
             where: { id: account.id },
-            data: { enabled: false, currentCredentialId: null, deletedAt: new Date() },
+            // The label is unique per person even for deleted accounts: free it.
+            data: {
+              enabled: false,
+              currentCredentialId: null,
+              deletedAt: new Date(),
+              label: `${account.label.slice(0, 80)} (deleted ${account.id.slice(-8)})`,
+            },
           });
           await tx.providerCredential.updateMany({
             where: { providerAccountId: account.id, userId, status: "ACTIVE" },
@@ -281,9 +305,15 @@ export const providersRouter = {
     setEnabled: contractProcedure(c.accounts.setEnabled).handler(async ({ input, context }) => {
       const userId = userIdOf(context);
       const account = await ownedAccount(userId, input.accountId);
-      if (input.enabled && !account.CurrentCredential)
-        throw new ORPCError("BAD_REQUEST", { message: "Add a key before turning the account on." });
       await graphWrite([userId], async (tx) => {
+        const current = await tx.providerAccount.findUniqueOrThrow({
+          where: { id: account.id },
+          select: { currentCredentialId: true },
+        });
+        if (input.enabled && !current.currentCredentialId)
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Add a key before turning the account on.",
+          });
         await tx.providerAccount.update({
           where: { id: account.id },
           data: { enabled: input.enabled },
@@ -327,7 +357,11 @@ export const providersRouter = {
       const sealed = sealCredential(userId, account, input.secret);
       await graphWrite([userId], async (tx) => {
         // One ACTIVE key per account: retire the old one first, then point at the new one.
-        const previous = account.currentCredentialId;
+        // Read under the owner fence so a concurrent replace is seen.
+        const { currentCredentialId: previous } = await tx.providerAccount.findUniqueOrThrow({
+          where: { id: account.id },
+          select: { currentCredentialId: true },
+        });
         if (previous)
           await tx.providerCredential.updateMany({
             where: { id: previous, userId, status: "ACTIVE" },
@@ -403,7 +437,10 @@ export const providersRouter = {
       if (!account) throw notFound("That provider account does not exist.");
       const credential = account.CurrentCredential;
       if (!credential) return { ok: false, status: null, detail: "no_key" };
-      const protocol = providerProtocolForType(account.providerType);
+      // A generic account speaks the OpenAI-compatible API (contract gap: no protocol field).
+      const protocol =
+        providerProtocolForType(account.providerType) ??
+        (account.providerType === "generic" ? "openai" : null);
       if (!protocol) return { ok: false, status: null, detail: "unsupported_provider" };
       if (!cloudEgressEnabled()) return { ok: false, status: null, detail: "egress_disabled" };
       const secret = decryptProviderCredential(
@@ -529,6 +566,32 @@ export const providersRouter = {
       let modelId: string;
       try {
         modelId = await graphWrite([userId], async (tx) => {
+          // A model deleted earlier keeps its row (history points at it): bring it back.
+          const deleted = await tx.providerModel.findFirst({
+            where: {
+              providerAccountId: input.accountId,
+              upstreamModelId: input.upstreamModelId,
+              deletedAt: { not: null },
+            },
+            select: { id: true, type: true },
+          });
+          if (deleted) {
+            if (deleted.type !== input.type)
+              throw new ORPCError("CONFLICT", {
+                message: "This model was used before with another type.",
+              });
+            await tx.providerModel.update({
+              where: { id: deleted.id },
+              data: {
+                deletedAt: null,
+                enabled: false,
+                displayName: input.displayName ?? null,
+                contextWindow: input.contextWindow ?? null,
+                maxOutputTokens: input.maxOutputTokens ?? null,
+              },
+            });
+            return deleted.id;
+          }
           const model = await tx.providerModel.create({
             data: {
               userId,
@@ -639,26 +702,39 @@ export const providersRouter = {
     }),
     create: contractProcedure(c.pricing.create).handler(async ({ input, context }) => {
       const userId = userIdOf(context);
+      if (Object.values(input.pricing).some((value) => value.startsWith("-")))
+        throw new ORPCError("BAD_REQUEST", { message: "Prices cannot be negative." });
+      if (input.pricing.input === undefined || input.pricing.output === undefined)
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Give at least an input and an output price.",
+        });
       const model = await prisma.providerModel.findFirst({
         where: { id: input.modelId, userId, deletedAt: null },
         select: { id: true, providerAccountId: true },
       });
       if (!model) throw notFound("That provider model does not exist.");
       const row = await graphWrite([userId], async (tx) => {
-        const count = await tx.providerPricingVersion.count({
+        const existing = await tx.providerPricingVersion.findMany({
           where: { providerModelId: model.id },
+          select: { version: true },
         });
+        const highest = Math.max(
+          0,
+          ...existing.map((row) => Number.parseInt(row.version.replace(/^v/, ""), 10) || 0),
+        );
         return tx.providerPricingVersion.create({
           data: {
             userId,
             providerAccountId: model.providerAccountId,
             providerModelId: model.id,
-            version: `v${count + 1}`,
+            version: `v${highest + 1}`,
             currency: input.currency,
             status: "DRAFT",
             activatedAt: null,
             confidence: "CALCULATED",
-            pricing: input.pricing,
+            // The shape the server's pricing parser reads (per million tokens, fail closed).
+            pricing: { ratesPerMillion: input.pricing },
+            chargeRules: CATALOG_CHARGE_RULES,
             ...(input.effectiveAt
               ? { effectiveAt: new Date(input.effectiveAt) }
               : { effectiveAt: new Date() }),
@@ -671,22 +747,24 @@ export const providersRouter = {
       const userId = userIdOf(context);
       const draft = await prisma.providerPricingVersion.findFirst({
         where: { id: input.versionId, userId, status: "DRAFT" },
-        select: { id: true, providerModelId: true },
+        select: { id: true, providerModelId: true, effectiveAt: true },
       });
       if (!draft) throw notFound("That draft price does not exist.");
       const row = await graphWrite(
         [userId],
         async (tx) => {
           const now = new Date();
-          // One active price per model: the previous one retires as this one starts.
+          // One active price per model: the previous one retires when this one starts, so a
+          // future draft leaves no gap without a price.
+          const handover = draft.effectiveAt > now ? draft.effectiveAt : now;
           await tx.providerPricingVersion.updateMany({
             where: {
               providerModelId: draft.providerModelId,
               userId,
               status: "ACTIVE",
-              effectiveAt: { lt: now },
+              effectiveAt: { lt: handover },
             },
-            data: { status: "RETIRED", retiredAt: now },
+            data: { status: "RETIRED", retiredAt: handover },
           });
           return tx.providerPricingVersion.update({
             where: { id: draft.id },
@@ -823,16 +901,19 @@ export const providersRouter = {
   spendCaps: {
     set: contractProcedure(c.spendCaps.set).handler(async ({ input, context }) => {
       const userId = userIdOf(context);
+      if (input.monthlyLimit.startsWith("-"))
+        throw new ORPCError("BAD_REQUEST", { message: "A cap cannot be negative." });
       const account = await ownedAccount(userId, input.accountId);
-      const cap = account.SpendCap;
       await graphWrite(
         [userId],
         async (tx) => {
+          // Decide under the fences: another tab may have set or cleared it meanwhile.
+          const cap = await tx.spendCap.findUnique({
+            where: { providerAccountId: account.id },
+            select: { id: true, version: true },
+          });
           if (cap) {
-            const current = await tx.spendCap.findUniqueOrThrow({
-              where: { id: cap.id },
-              select: { version: true },
-            });
+            const current = cap;
             // Reservations snapshot the cap version; every limit change bumps it.
             await tx.spendCap.update({
               where: { id: cap.id },
@@ -858,7 +939,13 @@ export const providersRouter = {
             after: { monthlyLimit: input.monthlyLimit, currency: input.currency },
           });
         },
-        async () => (cap ? [fences.spendCap(cap.id)] : []),
+        async (tx) => {
+          const cap = await tx.spendCap.findUnique({
+            where: { providerAccountId: account.id },
+            select: { id: true },
+          });
+          return cap ? [fences.spendCap(cap.id)] : [];
+        },
       );
       return spendFor(await ownedAccount(userId, account.id));
     }),
@@ -892,10 +979,12 @@ function pricingView(row: {
   activatedAt: Date | null;
   retiredAt: Date | null;
 }) {
-  const pricing =
+  const stored =
     typeof row.pricing === "object" && row.pricing !== null && !Array.isArray(row.pricing)
-      ? row.pricing
-      : {};
+      ? row.pricing.ratesPerMillion
+      : null;
+  const pricing =
+    typeof stored === "object" && stored !== null && !Array.isArray(stored) ? stored : {};
   return {
     id: row.id,
     providerModelId: row.providerModelId,

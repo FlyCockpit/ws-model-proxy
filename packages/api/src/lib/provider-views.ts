@@ -124,7 +124,7 @@ export type ModelRow = Prisma.ProviderModelGetPayload<{ select: typeof MODEL_SEL
 function priceOf(row: ModelRow) {
   const active = row.PricingVersions[0];
   if (!active) return null;
-  const pricing = jsonObject(active.pricing);
+  const pricing = jsonObject(jsonObject(active.pricing).ratesPerMillion);
   const input = pricing.input;
   const output = pricing.output;
   if (typeof input !== "string" || typeof output !== "string") return null;

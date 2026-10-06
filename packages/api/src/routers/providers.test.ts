@@ -76,6 +76,12 @@ beforeEach(() => {
   db.$transaction.mockImplementation(((work: (tx: PrismaClient) => unknown) => work(db)) as never);
   db.usageLedger.aggregate.mockResolvedValue({ _sum: { settledCost: null } } as never);
   db.spendReservation.aggregate.mockResolvedValue({ _sum: { reservedValue: null } } as never);
+  db.providerAccount.findUniqueOrThrow.mockResolvedValue({
+    currentCredentialId: "cred-1",
+    baseUrl: "https://openrouter.ai/api/v1",
+    endpointVersion: 1,
+  } as never);
+  db.spendCap.findUnique.mockResolvedValue(null);
 });
 
 const READ_AGENT: CallerAuth = {
@@ -207,6 +213,7 @@ describe("providers (a person)", () => {
     db.providerAccount.findFirst.mockResolvedValue(
       accountRow({ CurrentCredential: null }) as never,
     );
+    db.providerAccount.findUniqueOrThrow.mockResolvedValue({ currentCredentialId: null } as never);
     expect(await codeOf(client().accounts.setEnabled({ accountId: "acc-1", enabled: true }))).toBe(
       "BAD_REQUEST",
     );
@@ -216,7 +223,7 @@ describe("providers (a person)", () => {
     db.providerAccount.findFirst.mockResolvedValue(
       accountRow({ SpendCap: { id: "cap-1", monthlyLimit: "10", currency: "USD" } }) as never,
     );
-    db.spendCap.findUniqueOrThrow.mockResolvedValue({ version: 3 } as never);
+    db.spendCap.findUnique.mockResolvedValue({ id: "cap-1", version: 3 } as never);
     const spend = await client().spendCaps.set({ accountId: "acc-1", monthlyLimit: "25" });
     expect(db.spendCap.update.mock.calls[0]?.[0]?.data).toEqual({
       monthlyLimit: "25",
@@ -259,6 +266,155 @@ describe("providers (a person)", () => {
       id: "acc-x",
       userId: OWNER,
       deletedAt: null,
+    });
+  });
+});
+
+describe("provider review follow-ups", () => {
+  it("refuses a negative cap and negative prices", async () => {
+    expect(await codeOf(client().spendCaps.set({ accountId: "acc-1", monthlyLimit: "-1" }))).toBe(
+      "BAD_REQUEST",
+    );
+    expect(
+      await codeOf(
+        client().pricing.create({
+          modelId: "pm-1",
+          currency: "USD",
+          pricing: { input: "-1", output: "2" },
+        }),
+      ),
+    ).toBe("BAD_REQUEST");
+    expect(db.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("stores prices in the shape billing reads and never reuses a version name", async () => {
+    db.providerModel.findFirst.mockResolvedValue({
+      id: "pm-1",
+      providerAccountId: "acc-1",
+    } as never);
+    db.providerPricingVersion.findMany.mockResolvedValue([{ version: "v2" }] as never);
+    db.providerPricingVersion.create.mockResolvedValue({
+      id: "pv-3",
+      providerModelId: "pm-1",
+      version: "v3",
+      status: "DRAFT",
+      currency: "USD",
+      confidence: "CALCULATED",
+      pricing: { ratesPerMillion: { input: "0.5", output: "1.5" } },
+      effectiveAt: new Date("2026-10-01T00:00:00Z"),
+      activatedAt: null,
+      retiredAt: null,
+    } as never);
+    const view = await client().pricing.create({
+      modelId: "pm-1",
+      currency: "USD",
+      pricing: { input: "0.5", output: "1.5" },
+    });
+    expect(db.providerPricingVersion.create.mock.calls[0]?.[0]?.data).toMatchObject({
+      version: "v3",
+      pricing: { ratesPerMillion: { input: "0.5", output: "1.5" } },
+      chargeRules: expect.objectContaining({ unknownCategories: "FAIL_CLOSED" }),
+    });
+    expect(view.pricing).toEqual({ input: "0.5", output: "1.5" });
+  });
+
+  it("a future price retires the current one only when it starts", async () => {
+    const start = new Date(Date.now() + 86_400_000);
+    db.providerPricingVersion.findFirst.mockResolvedValue({
+      id: "pv-2",
+      providerModelId: "pm-1",
+      effectiveAt: start,
+    } as never);
+    db.providerPricingVersion.update.mockResolvedValue({
+      id: "pv-2",
+      providerModelId: "pm-1",
+      version: "v2",
+      status: "ACTIVE",
+      currency: "USD",
+      confidence: "CALCULATED",
+      pricing: {},
+      effectiveAt: start,
+      activatedAt: new Date(),
+      retiredAt: null,
+    } as never);
+    await client().pricing.activate({ versionId: "pv-2" });
+    expect(db.providerPricingVersion.updateMany.mock.calls[0]?.[0]?.data).toEqual({
+      status: "RETIRED",
+      retiredAt: start,
+    });
+    expect(fenceLog.held).toEqual(["00:owner:owner-1", "05:provider-pricing:owner-1:pm-1"]);
+  });
+
+  it("a duplicate label on rename is a conflict, not a crash", async () => {
+    db.providerAccount.findFirst.mockResolvedValue({
+      id: "acc-1",
+      baseUrl: "https://openrouter.ai/api/v1",
+      endpointVersion: 1,
+    } as never);
+    db.$transaction.mockRejectedValue(Object.assign(new Error("dup"), { code: "P2002" }));
+    expect(await codeOf(client().accounts.update({ accountId: "acc-1", label: "Taken" }))).toBe(
+      "CONFLICT",
+    );
+  });
+
+  it("a base URL change bumps the endpoint version read under the fence", async () => {
+    db.providerAccount.findFirst.mockResolvedValueOnce({
+      id: "acc-1",
+      baseUrl: "https://a.example.com/v1",
+      endpointVersion: 1,
+    } as never);
+    db.providerAccount.findFirst.mockResolvedValue(accountRow() as never);
+    db.providerAccount.findUniqueOrThrow.mockResolvedValue({
+      baseUrl: "https://a.example.com/v1",
+      endpointVersion: 4,
+    } as never);
+    await client().accounts.update({ accountId: "acc-1", baseUrl: "https://b.example.com/v1" });
+    expect(db.providerAccount.update.mock.calls[0]?.[0]?.data).toEqual({
+      baseUrl: "https://b.example.com/v1",
+      endpointIdentity: "https://b.example.com/v1",
+      endpointVersion: 5,
+    });
+  });
+
+  it("re-adding a deleted model restores its row", async () => {
+    db.providerAccount.findFirst.mockResolvedValue(accountRow() as never);
+    db.providerModel.findFirst.mockResolvedValue({ id: "pm-old", type: "LLM" } as never);
+    db.providerModel.findUniqueOrThrow.mockResolvedValue({
+      id: "pm-old",
+      providerAccountId: "acc-1",
+      upstreamModelId: "m",
+      displayName: null,
+      type: "LLM",
+      enabled: false,
+      health: "UNKNOWN",
+      contextWindow: null,
+      maxOutputTokens: null,
+      PricingVersions: [],
+    } as never);
+    const view = await client().models.create({
+      accountId: "acc-1",
+      upstreamModelId: "m",
+      type: "LLM",
+    });
+    expect(db.providerModel.create).not.toHaveBeenCalled();
+    expect(db.providerModel.update.mock.calls[0]?.[0]?.data).toMatchObject({ deletedAt: null });
+    expect(view.id).toBe("pm-old");
+  });
+
+  it("another person's key, model and price are not found", async () => {
+    db.providerCredential.findFirst.mockResolvedValue(null);
+    db.providerModel.findFirst.mockResolvedValue(null);
+    db.providerPricingVersion.findFirst.mockResolvedValue(null);
+    expect(await codeOf(client().credentials.revoke({ credentialId: "c-x" }))).toBe("NOT_FOUND");
+    expect(await codeOf(client().models.delete({ modelId: "m-x" }))).toBe("NOT_FOUND");
+    expect(await codeOf(client().pricing.activate({ versionId: "v-x" }))).toBe("NOT_FOUND");
+    expect(db.providerCredential.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      id: "c-x",
+      userId: OWNER,
+    });
+    expect(db.providerModel.findFirst.mock.calls[0]?.[0]?.where).toMatchObject({ userId: OWNER });
+    expect(db.providerPricingVersion.findFirst.mock.calls[0]?.[0]?.where).toMatchObject({
+      userId: OWNER,
     });
   });
 });
