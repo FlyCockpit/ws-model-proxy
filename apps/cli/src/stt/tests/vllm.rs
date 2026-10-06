@@ -707,6 +707,34 @@ fn vllm_engine_that_ends_an_item_itself_commits_it_for_the_client() {
 }
 
 #[test]
+fn engine_reads_poll_on_the_socket_they_go_through() {
+    // The session thread polls the engine between relay inputs, so its
+    // reads must time out after READ_POLL. On Windows a duplicated handle
+    // keeps its own receive timeout: setting it only on the shutdown clone
+    // left every read blocking for the handshake time.
+    let engine = FakeVllm::start(Script::default());
+    let endpoint = EngineEndpoint {
+        base_url: engine.base_url.clone(),
+        headers: Vec::new(),
+        auth: None,
+        model: MODEL.into(),
+    };
+    let (mut socket, _handle) = crate::stt::vllm::open_socket(&endpoint).expect("open");
+    let tungstenite::stream::MaybeTlsStream::Plain(tcp) = socket.get_ref() else {
+        panic!("a plain loopback connection");
+    };
+    assert_eq!(
+        tcp.read_timeout().expect("read timeout"),
+        Some(crate::stt::vllm::READ_POLL)
+    );
+    // `session.created`, then a read with nothing pending returns promptly.
+    assert!(matches!(socket.read(), Ok(Message::Text(_))));
+    let started = Instant::now();
+    assert!(socket.read().is_err());
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
 fn vllm_close_hangs_up_on_the_engine_mid_item() {
     let engine = FakeVllm::start(Script::default());
     let (mut registry, rx) = opened(&engine, None);

@@ -52,7 +52,7 @@ use crate::stt_wire::{STT_COMPLETED_TEXT_MAX_BYTES, SttEvent};
 /// Connecting, the WebSocket handshake, and each handshake answer.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// One engine read; relay input is taken between reads.
-const READ_POLL: Duration = Duration::from_millis(25);
+pub(super) const READ_POLL: Duration = Duration::from_millis(25);
 /// A write the engine does not take within this is a dead engine.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// From the final commit to `transcription.done`.
@@ -66,7 +66,7 @@ const INPUTS_PER_PASS: usize = 64;
 /// The event the readiness probe sends; vLLM answers it with an error.
 const PROBE_EVENT: &str = "wsmp.ready_probe";
 
-type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
+pub(super) type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
 /// Why a session ends from inside the thread.
 enum Stop {
@@ -637,11 +637,11 @@ impl Bridge {
     }
 }
 
-type OpenFailure = (RelayFailure, &'static str);
+pub(super) type OpenFailure = (RelayFailure, &'static str);
 
 /// Connects to `/v1/realtime` with the endpoint's headers. Returns the
 /// socket (reading with [`READ_POLL`]) and a handle to shut it down.
-fn open_socket(endpoint: &EngineEndpoint) -> Result<(Socket, TcpStream), OpenFailure> {
+pub(super) fn open_socket(endpoint: &EngineEndpoint) -> Result<(Socket, TcpStream), OpenFailure> {
     let request = realtime_request(endpoint).map_err(|_| {
         (
             RelayFailure::UnsupportedCapability,
@@ -674,7 +674,7 @@ fn open_socket(endpoint: &EngineEndpoint) -> Result<(Socket, TcpStream), OpenFai
     let config = WebSocketConfig::default()
         .max_message_size(Some(ENGINE_MESSAGE_MAX_BYTES))
         .max_frame_size(Some(ENGINE_MESSAGE_MAX_BYTES));
-    let (socket, _) = tungstenite::client_tls_with_config(request, tcp, Some(config), None)
+    let (mut socket, _) = tungstenite::client_tls_with_config(request, tcp, Some(config), None)
         .map_err(|error| match error {
             tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response)) => {
                 match response.status().as_u16() {
@@ -698,7 +698,16 @@ fn open_socket(endpoint: &EngineEndpoint) -> Result<(Socket, TcpStream), OpenFai
                 "the engine WebSocket handshake failed",
             ),
         })?;
-    handle
+    // Set on the socket the reads go through, never on the clone: on Windows
+    // a duplicated socket handle keeps its own receive timeout, so a timeout
+    // set on `handle` would leave every read blocking for the handshake time.
+    let inner = match socket.get_mut() {
+        MaybeTlsStream::Plain(tcp) => Some(tcp),
+        MaybeTlsStream::Rustls(tls) => Some(&mut tls.sock),
+        _ => None,
+    };
+    inner
+        .ok_or((RelayFailure::Transport, "could not connect to the engine"))?
         .set_read_timeout(Some(READ_POLL))
         .map_err(|_| (RelayFailure::Transport, "could not connect to the engine"))?;
     Ok((socket, handle))
