@@ -69,6 +69,8 @@ import {
   type NodeToServerControlFrame,
   type NodeTrustWire,
   RUNTIME_INVENTORY_CHUNK_MAX,
+  RUNTIME_JOB_OPERATOR_STATUSES,
+  type RuntimeJobFrame,
   type ServerToNodeControlFrame,
 } from "./frames.js";
 import { sanitizeRelayRequestHeaders } from "./headers.js";
@@ -79,6 +81,7 @@ import {
   type RoutingEvaluationState,
   type RuntimeLoadReading,
 } from "./metric-routing-evaluator.js";
+import { type NodeAuditOutcome, recordNodeAuditEvent } from "./node-audit.js";
 import type { NodeIdentity } from "./node-credential-auth.js";
 import { observeNodeMetricsRollup } from "./node-metrics-rollup.js";
 import {
@@ -213,7 +216,51 @@ export type TerminalRecord = {
   writerViewerId: string | null;
   phase: "pending" | "opening" | "open";
   createdAt: number;
+  /**
+   * Set for the operator terminal of an interactive runtime step (spec §4.7): opened by the
+   * node for a `runtime.job` this server sent, attached only by a ticket from
+   * `runtimes.steps.attach`, allowed at Relay only too, never listed with the browser shells
+   * and never counted against their limits. Null for a browser shell.
+   */
+  operator: OperatorTerminalInfo | null;
 };
+
+/** What the relay knows about an operator terminal (no command text). */
+export type OperatorTerminalInfo = {
+  stepId: string;
+  instanceId: string;
+  rank: number;
+  /** `spawning` until `awaiting_operator`; `running` once the person pressed Enter. */
+  state: "spawning" | "awaiting" | "running";
+};
+
+/**
+ * One interactive step this session sent with an operator terminal, by step id, from the send
+ * until its final result, `operator_closed`, a replacement or the session's end. It outlives
+ * the terminal record: the node ends the terminal (`term.exit`) before its final result.
+ */
+type OperatorStepTracker = {
+  stepId: string;
+  instanceId: string;
+  rank: number;
+  phase: RuntimeJobFrame["phase"];
+  intentHash: string;
+  ownerEpoch: string;
+  terminalId: string;
+  userId: string;
+  nodeId: string;
+  state: OperatorTerminalInfo["state"];
+  /** `operator_running` was seen for this terminal. */
+  accepted: boolean;
+  /** The server closed the terminal; only the node's answer to that close still routes. */
+  cancelled: boolean;
+};
+
+/**
+ * Interactive steps one session may track at once. The engine opens at most 4 operator
+ * terminals of non-stop steps per node (stops are exempt); the node caps 8.
+ */
+export const OPERATOR_STEPS_PER_SESSION = 16;
 
 export type TerminalWriterLabel = "you" | "other" | "none";
 
@@ -463,6 +510,8 @@ type SessionState = {
   servedHandles: Set<string>;
   inventory: InventoryAssembly | null;
   terminalsById: Map<string, TerminalRecord>;
+  /** Interactive steps sent with an operator terminal, by step id. */
+  operatorSteps: Map<string, OperatorStepTracker>;
   /** In-flight node file ops by op id (answers route only to the session that got the op). */
   filesById: Map<string, TrackedFileOp>;
   unauthenticatedTimer: ReturnType<typeof setTimeout>;
@@ -721,6 +770,8 @@ export class RelaySessionManager {
       console.error("[relay] refused to send a frame", frame.type, errorName(error));
       return false;
     }
+    if (frame.type === "runtime.job" && frame.operator)
+      return this.sendOperatorJob(session, frame, encoded);
     try {
       session.socket.send(encoded);
       return true;
@@ -730,11 +781,344 @@ export class RelaySessionManager {
   }
 
   /** The live registered session of a node: its generation and trust, or null when offline. */
-  nodeSession(nodeId: string): { connectionGeneration: number; trust: NodeTrustWire } | null {
+  nodeSession(
+    nodeId: string,
+  ): { connectionGeneration: number; trust: NodeTrustWire; operatorTerminals: boolean } | null {
     const session = this.sessionsByNodeId.get(nodeId);
     if (!session?.registered || !session.helloAcked || session.connectionGeneration === null)
       return null;
-    return { connectionGeneration: session.connectionGeneration, trust: session.trust };
+    return {
+      connectionGeneration: session.connectionGeneration,
+      trust: session.trust,
+      operatorTerminals: this.operatorTerminalsAllowed(session),
+    };
+  }
+
+  // ── Operator terminals (interactive runtime steps, spec §4.7) ──
+
+  /**
+   * Operator terminals need the node's `operatorTerminals` feature and its terminal key; NOT
+   * Full control (Relay-only nodes run them for their frozen definitions) and not the
+   * browser-shell switch.
+   */
+  private operatorTerminalsAllowed(session: SessionState): boolean {
+    return (
+      session.registered &&
+      session.features?.operatorTerminals === true &&
+      session.terminalPublicKey !== null
+    );
+  }
+
+  /** Whether the node's session can track one more operator terminal. */
+  operatorRoom(nodeId: string): boolean {
+    const session = this.sessionsByNodeId.get(nodeId);
+    if (!session) return false;
+    return (
+      session.operatorSteps.size < OPERATOR_STEPS_PER_SESSION ||
+      [...session.operatorSteps.values()].some((tracker) => tracker.cancelled)
+    );
+  }
+
+  /**
+   * Send an interactive job and register its operator terminal (state `spawning`, attachable
+   * once the node reports `awaiting_operator`). A repeated send of the same terminal for the
+   * same dispatch re-sends the job only. A new terminal for a step replaces the old one (the
+   * node closes it when it takes the new job). Terminal ids are never reused: an id held by
+   * any other terminal refuses the send.
+   */
+  private sendOperatorJob(session: SessionState, job: RuntimeJobFrame, encoded: string): boolean {
+    const operator = job.operator;
+    const nodeId = session.nodeId;
+    if (!operator || !nodeId || !this.operatorTerminalsAllowed(session)) return false;
+    const terminalId = operator.terminalId;
+    const previous = session.operatorSteps.get(job.stepId);
+    const repeat =
+      previous !== undefined &&
+      !previous.cancelled &&
+      previous.terminalId === terminalId &&
+      previous.intentHash === job.intentHash &&
+      previous.ownerEpoch === job.ownerEpoch &&
+      previous.instanceId === job.instanceId &&
+      previous.rank === job.rank &&
+      session.terminalsById.get(terminalId)?.operator?.stepId === job.stepId;
+    let evict: OperatorStepTracker | null = null;
+    if (!repeat) {
+      if (this.hasTerminal(terminalId) || this.operatorTerminalTracked(terminalId)) return false;
+      if (previous === undefined && session.operatorSteps.size >= OPERATOR_STEPS_PER_SESSION) {
+        evict = [...session.operatorSteps.values()].find((tracker) => tracker.cancelled) ?? null;
+        if (evict === null) return false;
+      }
+    }
+    try {
+      session.socket.send(encoded);
+    } catch {
+      return false;
+    }
+    if (repeat) return true;
+    if (evict !== null) session.operatorSteps.delete(evict.stepId);
+    if (previous !== undefined) this.replaceOperatorStep(session, previous);
+    session.operatorSteps.set(job.stepId, {
+      stepId: job.stepId,
+      instanceId: job.instanceId,
+      rank: job.rank,
+      phase: job.phase,
+      intentHash: job.intentHash,
+      ownerEpoch: job.ownerEpoch,
+      terminalId,
+      userId: session.identity.userId,
+      nodeId,
+      state: "spawning",
+      accepted: false,
+      cancelled: false,
+    });
+    session.terminalsById.set(terminalId, {
+      terminalId,
+      userId: session.identity.userId,
+      nodeId,
+      cols: 80,
+      rows: 24,
+      viewers: new Map(),
+      pendingViewers: new Map(),
+      writerViewerId: null,
+      phase: "opening",
+      createdAt: Date.now(),
+      operator: {
+        stepId: job.stepId,
+        instanceId: job.instanceId,
+        rank: job.rank,
+        state: "spawning",
+      },
+    });
+    return true;
+  }
+
+  private operatorTerminalTracked(terminalId: string): boolean {
+    for (const session of this.sessionsByNodeId.values())
+      for (const tracker of session.operatorSteps.values())
+        if (tracker.terminalId === terminalId) return true;
+    return false;
+  }
+
+  private auditOperator(
+    tracker: OperatorStepTracker,
+    outcome: NodeAuditOutcome,
+    options: { actor?: "USER" | "SYSTEM"; exitCode?: number } = {},
+  ) {
+    const now = new Date();
+    recordNodeAuditEvent({
+      userId: tracker.userId,
+      nodeId: tracker.nodeId,
+      actor: options.actor ?? "SYSTEM",
+      kind: "operator_terminal",
+      subject: `step:${tracker.phase}`,
+      instanceId: tracker.instanceId,
+      stepId: tracker.stepId,
+      rank: tracker.rank,
+      ...(options.exitCode !== undefined ? { exitCode: options.exitCode } : {}),
+      outcome,
+      startedAt: now,
+      finishedAt: now,
+    });
+  }
+
+  /**
+   * A new terminal replaced this step's terminal: forget the old one, end its record and close
+   * it on the node (a person's run in it, if any, is left alone there).
+   */
+  private replaceOperatorStep(session: SessionState, tracker: OperatorStepTracker) {
+    if (session.operatorSteps.get(tracker.stepId) === tracker)
+      session.operatorSteps.delete(tracker.stepId);
+    if (tracker.state !== "spawning" && !tracker.cancelled) this.auditOperator(tracker, "closed");
+    const terminal = session.terminalsById.get(tracker.terminalId);
+    if (terminal?.operator) this.closeTerminal(session, terminal, true);
+    else if (!tracker.cancelled)
+      this.sendControl(session, { type: "term.close", terminalId: tracker.terminalId });
+  }
+
+  /**
+   * Operator progress and finals of a tracked interactive step, before the lifecycle engine
+   * sees them. Progress passes on only when it names exactly the terminal this session sent
+   * for that dispatch (id, intent hash, owner epoch, instance, rank); a live terminal nobody
+   * tracks is closed on the node. Finals always pass on (the engine checks the stored
+   * terminal id). Writes the audit rows. Returns whether the result goes on to the engine.
+   */
+  private observeOperatorResult(
+    session: SessionState,
+    result: NodeFrame<"runtime.job.result">,
+  ): boolean {
+    const progress = (RUNTIME_JOB_OPERATOR_STATUSES as readonly string[]).includes(result.status);
+    const terminalId = result.terminalId;
+    if (terminalId === undefined) return !progress;
+    const tracker = session.operatorSteps.get(result.stepId);
+    const matches =
+      tracker !== undefined &&
+      tracker.terminalId === terminalId &&
+      tracker.intentHash === result.intentHash &&
+      tracker.ownerEpoch === result.ownerEpoch &&
+      tracker.instanceId === result.instanceId &&
+      tracker.rank === result.rank;
+    if (!matches || tracker === undefined) {
+      // A terminal this session no longer tracks (replaced, or never sent) must not stay open
+      // on the node. Only this session's state is consulted.
+      if (
+        progress &&
+        result.status !== "operator_closed" &&
+        !session.terminalsById.has(terminalId) &&
+        ![...session.operatorSteps.values()].some((other) => other.terminalId === terminalId)
+      )
+        this.sendControl(session, { type: "term.close", terminalId });
+      return !progress;
+    }
+    const record = session.terminalsById.get(terminalId);
+    const terminal = record?.operator ? record : undefined;
+    if (tracker.cancelled) {
+      // Only the node's answer to the server's own close still matters. A screen that came up
+      // after the close is closed again; a run that won the race is left to finish on the node.
+      if (result.status === "awaiting_operator") {
+        this.sendControl(session, { type: "term.close", terminalId });
+        return false;
+      }
+      if (result.status === "operator_running") return false;
+      if (result.status === "running") return true;
+      session.operatorSteps.delete(tracker.stepId);
+      return true;
+    }
+    switch (result.status) {
+      case "awaiting_operator": {
+        if (tracker.state === "spawning") this.auditOperator(tracker, "opened");
+        // The node shows the confirm screen once per terminal; a repeat re-reports it.
+        if (tracker.state === "running") return false;
+        tracker.state = "awaiting";
+        if (terminal?.operator) {
+          terminal.phase = "open";
+          terminal.operator.state = "awaiting";
+        }
+        return true;
+      }
+      case "operator_running": {
+        if (tracker.state === "spawning") return false;
+        if (tracker.state === "awaiting")
+          this.auditOperator(tracker, "accepted", { actor: "USER" });
+        tracker.state = "running";
+        tracker.accepted = true;
+        if (terminal?.operator) terminal.operator.state = "running";
+        return true;
+      }
+      case "operator_closed": {
+        session.operatorSteps.delete(tracker.stepId);
+        if (tracker.state !== "spawning") {
+          if (result.exitCode !== undefined || tracker.accepted)
+            this.auditOperator(tracker, "closed", {
+              ...(result.exitCode !== undefined ? { exitCode: result.exitCode } : {}),
+            });
+          else this.auditOperator(tracker, "declined", { actor: "USER" });
+        }
+        if (terminal) this.closeTerminal(session, terminal, false);
+        return true;
+      }
+      case "running":
+        return true;
+      default: {
+        session.operatorSteps.delete(tracker.stepId);
+        const outcome: NodeAuditOutcome =
+          result.status === "succeeded"
+            ? tracker.accepted
+              ? "completed"
+              : "auto_settled"
+            : tracker.state === "spawning"
+              ? "refused"
+              : "failed";
+        this.auditOperator(tracker, outcome);
+        // The node ends the terminal before its final answer; a record still here is stale.
+        if (terminal) this.closeTerminal(session, terminal, true);
+        return true;
+      }
+    }
+  }
+
+  /**
+   * Close the operator terminal of a step by step id, on whichever session holds it.
+   * `keepRunning` leaves a terminal whose command already runs alone (answer `running`): a
+   * person's run is never cut off. The node's `operator_closed` still reaches the engine.
+   */
+  closeOperatorStep(
+    stepId: string,
+    options: { keepRunning?: boolean; actor?: "USER" | "SYSTEM" } = {},
+  ): "closed" | "running" | "absent" {
+    for (const session of this.sessionsByNodeId.values()) {
+      const tracker = session.operatorSteps.get(stepId);
+      if (tracker === undefined || tracker.cancelled) continue;
+      if (options.keepRunning === true && tracker.state === "running") return "running";
+      this.cancelOperatorStep(session, tracker, options.actor ?? "SYSTEM");
+      return "closed";
+    }
+    return "absent";
+  }
+
+  /**
+   * Close an operator terminal no step owns any more (the engine dropped an answer naming it):
+   * its tracker is cancelled, or the node is told directly when nothing tracks it.
+   */
+  closeOperatorTerminal(nodeId: string, terminalId: string) {
+    const session = this.sessionsByNodeId.get(nodeId);
+    if (!session) return;
+    const tracker = [...session.operatorSteps.values()].find(
+      (candidate) => candidate.terminalId === terminalId,
+    );
+    if (tracker) {
+      if (!tracker.cancelled) this.cancelOperatorStep(session, tracker, "SYSTEM");
+      return;
+    }
+    const terminal = session.terminalsById.get(terminalId);
+    if (terminal?.operator) this.closeTerminal(session, terminal, true);
+    else if (!terminal) this.sendControl(session, { type: "term.close", terminalId });
+  }
+
+  /** Ban fence: close every operator terminal of this user. */
+  cancelOperatorTerminalsForUser(userId: string) {
+    for (const session of this.sessionsByNodeId.values()) {
+      if (session.identity.userId !== userId) continue;
+      for (const tracker of [...session.operatorSteps.values()])
+        if (!tracker.cancelled) this.cancelOperatorStep(session, tracker, "SYSTEM");
+    }
+  }
+
+  private cancelOperatorStep(
+    session: SessionState,
+    tracker: OperatorStepTracker,
+    actor: "USER" | "SYSTEM",
+  ) {
+    if (tracker.state !== "spawning") this.auditOperator(tracker, "cancelled", { actor });
+    tracker.cancelled = true;
+    const terminal = session.terminalsById.get(tracker.terminalId);
+    if (terminal?.operator) this.closeTerminal(session, terminal, true);
+    else this.sendControl(session, { type: "term.close", terminalId: tracker.terminalId });
+  }
+
+  /**
+   * The open operator terminal of a step the user owns, waiting for its person: what an attach
+   * ticket is bound to. Null while it is not attachable (spawning, closed, ended, cancelled,
+   * or the node can no longer hold operator terminals).
+   */
+  operatorStepTerminal(
+    stepId: string,
+    userId: string,
+  ): { nodeId: string; terminalId: string; state: "awaiting" | "running" } | null {
+    for (const session of this.sessionsByNodeId.values()) {
+      const tracker = session.operatorSteps.get(stepId);
+      if (!tracker || tracker.cancelled || tracker.userId !== userId) continue;
+      if (!this.operatorTerminalsAllowed(session) || this.relayDrain) return null;
+      const terminal = session.terminalsById.get(tracker.terminalId);
+      if (!terminal?.operator || terminal.phase !== "open" || terminal.userId !== userId)
+        return null;
+      if (terminal.operator.state === "spawning") return null;
+      return {
+        nodeId: terminal.nodeId,
+        terminalId: terminal.terminalId,
+        state: terminal.operator.state,
+      };
+    }
+    return null;
   }
 
   /** A person lowered the node's trust: tell its live session (the node answers `node.state`). */
@@ -798,6 +1182,7 @@ export class RelaySessionManager {
       servedHandles: new Set(),
       inventory: null,
       terminalsById: new Map(),
+      operatorSteps: new Map(),
       filesById: new Map(),
       unauthenticatedTimer,
       helloNonce,
@@ -978,9 +1363,12 @@ export class RelaySessionManager {
       case "file.rejected":
         session.filesById.get(message.opId)?.markRejected(message.reason, message.detail);
         return;
+      case "runtime.job.result":
+        if (!this.isCurrent(session) || !this.observeOperatorResult(session, message)) return;
+        await this.routeToHandler(session, message);
+        return;
       case "runtime.define.result":
       case "runtime.detected":
-      case "runtime.job.result":
       case "secret.result":
       case "exec.started":
       case "exec.status":
@@ -1217,8 +1605,14 @@ export class RelaySessionManager {
 
   /** Ends whatever the node's current trust and features no longer allow. */
   private reconcileTrust(session: SessionState) {
+    // Browser shells need Full control; operator terminals only the node's feature.
     if (!this.terminalsAllowed(session)) {
-      this.closeAllTerminals(session, true);
+      for (const terminal of [...session.terminalsById.values()])
+        if (!terminal.operator) this.closeTerminal(session, terminal, true);
+    }
+    if (!this.operatorTerminalsAllowed(session)) {
+      for (const tracker of [...session.operatorSteps.values()])
+        if (!tracker.cancelled) this.cancelOperatorStep(session, tracker, "SYSTEM");
     }
     const roots = session.features?.files.roots ?? null;
     const lost: FileOpLossCause | null =
@@ -2182,7 +2576,8 @@ export class RelaySessionManager {
     let node = 0;
     for (const session of this.sessionsByNodeId.values()) {
       for (const terminal of session.terminalsById.values()) {
-        if (terminal.phase === "pending") continue;
+        // Operator terminals have their own limits (the engine's, per node).
+        if (terminal.phase === "pending" || terminal.operator) continue;
         if (terminal.userId === userId) user += 1;
         if (terminal.nodeId === nodeId) node += 1;
       }
@@ -2216,7 +2611,8 @@ export class RelaySessionManager {
     const terminals: ReturnType<RelaySessionManager["listTerminalsForUser"]> = [];
     for (const session of this.sessionsByNodeId.values()) {
       for (const terminal of session.terminalsById.values()) {
-        if (terminal.userId !== userId) continue;
+        // Operator terminals are reached by step (runtimes.steps.attach), not from this list.
+        if (terminal.userId !== userId || terminal.operator) continue;
         const writer = terminal.writerViewerId;
         const writerConn = writer ? terminal.viewers.get(writer)?.connId : undefined;
         terminals.push({
@@ -2274,6 +2670,7 @@ export class RelaySessionManager {
       writerViewerId: null,
       phase: approvalRequired ? "pending" : "opening",
       createdAt: now,
+      operator: null,
     };
     session.terminalsById.set(terminal.terminalId, terminal);
     this.sendControl(session, {
@@ -2300,8 +2697,52 @@ export class RelaySessionManager {
   }): { ok: true; viewerId: string } | { ok: false; error: "not_found" | "offline" | "limit" } {
     const located = this.terminalForUser(input.terminalId, input.userId);
     if (!located) return { ok: false, error: "not_found" };
-    const { session, terminal } = located;
-    if (!this.canStartTerminal(session)) return { ok: false, error: "offline" };
+    // An operator terminal is attached only through its step's ticket.
+    if (located.terminal.operator) return { ok: false, error: "not_found" };
+    if (!this.canStartTerminal(located.session)) return { ok: false, error: "offline" };
+    return this.addViewer(located.session, located.terminal, input);
+  }
+
+  /**
+   * Attach a browser socket to the operator terminal of an interactive step (the ticket from
+   * `runtimes.steps.attach` named it). Works on Relay-only nodes: the node only needs its
+   * operator-terminal feature.
+   */
+  attachOperatorTerminal(input: {
+    terminalId: string;
+    stepId: string;
+    userId: string;
+    connId: string;
+    browserPublicKey: string;
+    browserNonce: string;
+    identity?: TerminalHandshakeIdentity;
+  }): { ok: true; viewerId: string } | { ok: false; error: "not_found" | "offline" | "limit" } {
+    const located = this.terminalForUser(input.terminalId, input.userId);
+    if (!located?.terminal.operator || located.terminal.operator.stepId !== input.stepId)
+      return { ok: false, error: "not_found" };
+    const { session } = located;
+    if (
+      this.relayDrain ||
+      !this.operatorTerminalsAllowed(session) ||
+      session.socket.readyState !== WS_READY_STATE_OPEN
+    )
+      return { ok: false, error: "offline" };
+    const tracker = session.operatorSteps.get(input.stepId);
+    if (!tracker || tracker.cancelled || tracker.terminalId !== input.terminalId)
+      return { ok: false, error: "not_found" };
+    return this.addViewer(session, located.terminal, input);
+  }
+
+  private addViewer(
+    session: SessionState,
+    terminal: TerminalRecord,
+    input: {
+      connId: string;
+      browserPublicKey: string;
+      browserNonce: string;
+      identity?: TerminalHandshakeIdentity;
+    },
+  ): { ok: true; viewerId: string } | { ok: false; error: "not_found" | "limit" } {
     if (terminal.phase !== "open") return { ok: false, error: "not_found" };
     // A second attach from the same tab replaces that tab's earlier attachment.
     const previous = connViewerIds(terminal, input.connId);
@@ -2335,7 +2776,8 @@ export class RelaySessionManager {
   /** "End session": the owner ends the terminal for everyone. */
   closeTerminalFromBrowser(terminalId: string, userId: string): boolean {
     const located = this.terminalForUser(terminalId, userId);
-    if (!located) return false;
+    // An operator step is closed by its step (`runtimes.steps.cancel`) or answered in it.
+    if (!located || located.terminal.operator) return false;
     this.closeTerminal(located.session, located.terminal, true);
     return true;
   }
@@ -2378,7 +2820,10 @@ export class RelaySessionManager {
     if (!located) return "missing";
     const viewerId = attachedViewerIdForConn(located.terminal, connId);
     if (!viewerId) return "missing";
-    if (!this.terminalsAllowed(located.session)) return "missing";
+    const allowed = located.terminal.operator
+      ? this.operatorTerminalsAllowed(located.session)
+      : this.terminalsAllowed(located.session);
+    if (!allowed) return "missing";
     if (located.session.socket.readyState !== WS_READY_STATE_OPEN) return "missing";
     // A slow node must not grow this process without a bound.
     if ((located.session.socket.bufferedAmount ?? 0) > NODE_SEALED_BUFFER_LIMIT) return "dropped";
@@ -2960,6 +3405,8 @@ export class RelaySessionManager {
       });
       return;
     }
+    // The node opens an operator terminal for its job, never for a browser `term.open`.
+    if (terminal.operator && message.type === "term.opened") return;
     if (message.type === "term.opened" || message.type === "term.attached") {
       if (message.type === "term.opened") {
         if (terminal.phase === "open") return;
@@ -3001,7 +3448,7 @@ export class RelaySessionManager {
     const wasViewer = terminal.viewers.delete(viewerId);
     terminal.pendingViewers.delete(viewerId);
     if (terminal.writerViewerId === viewerId) terminal.writerViewerId = null;
-    if (terminal.phase !== "open") {
+    if (terminal.phase !== "open" && !terminal.operator) {
       // The open itself was refused: nothing spawned.
       session.terminalsById.delete(terminal.terminalId);
     } else if (wasViewer) {

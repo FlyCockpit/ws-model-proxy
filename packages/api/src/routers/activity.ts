@@ -281,8 +281,20 @@ const needsYou = {
           createdAt: true,
           Runtime: { select: { name: true, nodeId: true } },
           Ranks: { where: { rank: 0 }, select: { nodeId: true }, take: 1 },
+          // The step waiting for its person: its terminal (open or closed), a hold, or a
+          // person's run past its timeout.
           Steps: {
-            where: { state: "AWAITING_OPERATOR" },
+            where: {
+              OR: [
+                { state: "AWAITING_OPERATOR" },
+                { state: "PENDING", operatorHold: { not: null } },
+                {
+                  state: "RUNNING",
+                  operatorAcceptedAt: { not: null },
+                  deadline: { lte: now },
+                },
+              ],
+            },
             orderBy: { createdAt: "asc" },
             select: { id: true },
             take: 1,

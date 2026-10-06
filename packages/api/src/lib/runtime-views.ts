@@ -195,7 +195,7 @@ const INTERACTIVE_KEY = {
   STOP: "stop",
 } as const;
 
-function stepView(
+export function stepView(
   step: InstanceRow["Steps"][number],
   spec: RuntimeSpec | null,
   author: "USER" | "AGENT" | "SYSTEM",

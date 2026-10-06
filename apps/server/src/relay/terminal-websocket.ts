@@ -655,6 +655,10 @@ export class TerminalBrowserHub {
         userId: conn.userId,
         sessionId: conn.sessionId,
       });
+      if (redeemed?.kind === "attach") {
+        this.attachOperatorStep(conn, data, redeemed, ref);
+        return;
+      }
       if (!redeemed || relaySessionManager.hasTerminal(redeemed.terminalId)) {
         this.sendError(conn, "ticket_invalid", ref);
         return;
@@ -1085,6 +1089,50 @@ export class TerminalBrowserHub {
       outcome: "opened",
       startedAt: now,
       finishedAt: now,
+    });
+  }
+
+  /**
+   * An attach ticket from `runtimes.steps.attach`: join the operator terminal the node opened
+   * for that step (also on a Relay-only node). The ticket is used up; it still has to name the
+   * step's current terminal, on its node. Answered like an open (`opening`, then `attached`),
+   * so the browser's ticket flow needs nothing else.
+   */
+  private attachOperatorStep(
+    conn: BrowserConn,
+    message: Extract<z.infer<typeof browserClientMessageSchema>, { type: "open" }>,
+    ticket: { nodeId: string; terminalId: string; stepId: string },
+    ref: FrameRef,
+  ) {
+    if (!this.isLive(conn)) return;
+    const current = relaySessionManager.operatorStepTerminal(ticket.stepId, conn.userId);
+    if (current?.terminalId !== ticket.terminalId || current.nodeId !== ticket.nodeId) {
+      this.sendError(conn, "ticket_invalid", ref);
+      return;
+    }
+    const result = relaySessionManager.attachOperatorTerminal({
+      terminalId: ticket.terminalId,
+      stepId: ticket.stepId,
+      userId: conn.userId,
+      connId: conn.id,
+      browserPublicKey: message.publicKey,
+      browserNonce: message.nonce,
+      ...(message.identity ? { identity: message.identity } : {}),
+    });
+    if (!result.ok) {
+      this.sendError(
+        conn,
+        result.error === "limit" ? "limit" : result.error === "offline" ? "offline" : "not_found",
+        ref,
+      );
+      return;
+    }
+    ref.terminalId = ticket.terminalId;
+    this.send(conn, {
+      type: "opening",
+      terminalId: ticket.terminalId,
+      viewerId: result.viewerId,
+      ...(ref.requestId ? { requestId: ref.requestId } : {}),
     });
   }
 

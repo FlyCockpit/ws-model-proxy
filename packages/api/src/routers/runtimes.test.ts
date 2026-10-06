@@ -996,7 +996,7 @@ describe("runtimes.instances.forget", () => {
         state: "PENDING",
         attempts: 0,
       },
-      data: { state: "CANCELLED" },
+      data: { state: "CANCELLED", operatorHold: null },
     });
   });
 });

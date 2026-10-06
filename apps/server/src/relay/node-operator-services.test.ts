@@ -475,7 +475,7 @@ describe("node operator services: terminal tickets", () => {
     });
     expect(
       s.tickets.redeem({ userId: "user-1", sessionId: "session-1", ticket: ticket.ticket }),
-    ).toEqual({ nodeId: "node-1", terminalId: ticket.terminalId });
+    ).toEqual({ kind: "open", nodeId: "node-1", terminalId: ticket.terminalId });
     s.session.trust = "relay";
     await expect(
       s.services.openTerminalTicket({

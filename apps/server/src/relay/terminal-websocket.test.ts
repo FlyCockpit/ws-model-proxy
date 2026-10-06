@@ -154,6 +154,8 @@ type CliFeatures = {
   fullControl?: boolean;
   terminalSupported?: boolean;
   terminalApproval?: boolean;
+  /** The node runs interactive steps in operator terminals. */
+  operatorTerminals?: boolean;
 };
 
 /**
@@ -216,7 +218,7 @@ function hello(socket: FakeSocket, slug: string, kind: CliKind, features?: CliFe
         max: 4,
         approvalRequired: features?.terminalApproval ?? false,
       },
-      operatorTerminals: false,
+      operatorTerminals: features?.operatorTerminals ?? false,
       files: { roots: null, asRoot: false },
       runtimeHosts: [],
       mediaExpand: false,
@@ -545,6 +547,87 @@ describe("terminal browser hub", () => {
       requestId: "open_2",
     });
     expect(cli.jsonSends().filter((message) => message.type === "term.open")).toHaveLength(1);
+  });
+
+  it("attaches a step's ticket to its operator terminal, also on a Relay-only node", async () => {
+    const cli = await connectCli("relay-op", "current", {
+      fullControl: false,
+      operatorTerminals: true,
+    });
+    const terminalId = Buffer.alloc(16, 4).toString("base64url");
+    const step = {
+      stepId: "step-1",
+      instanceId: "inst-1",
+      rank: 0,
+      intentHash: "a".repeat(64),
+      ownerEpoch: "e1:1",
+    };
+    expect(
+      relaySessionManager.sendToNode("relay-op", {
+        type: "runtime.job",
+        ...step,
+        runtimeId: "rt-1",
+        launchVersionId: "v-1",
+        launchHash: "b".repeat(64),
+        generation: 1,
+        nnodes: 1,
+        phase: "start",
+        handle: "i-abcdefabcdef",
+        unitName: "wsmp-i-abcdefabcdef-r0",
+        placeholders: { port: 30_000 },
+        timeoutMs: 60_000,
+        operator: { terminalId, commandAuthor: "agent" },
+      }),
+    ).toBe(true);
+    await relaySessionManager.handleTextFrame(
+      cli,
+      JSON.stringify({
+        type: "runtime.job.result",
+        ...step,
+        status: "awaiting_operator",
+        stopped: false,
+        terminalId,
+      }),
+    );
+    const browser = attachBrowser();
+    // A ticket naming another terminal of the step (an earlier dispatch) is refused.
+    const stale = terminalTicketStore.mint({
+      userId: "user-id",
+      sessionId: "session-id",
+      nodeId: "relay-op",
+      attach: { stepId: "step-1", terminalId: Buffer.alloc(16, 8).toString("base64url") },
+    });
+    await terminalBrowserHub.handleText(browser, openFrame(stale.ticket, "open_stale"));
+    expect(browser.jsonSends().at(-1)).toMatchObject({
+      type: "error",
+      code: "ticket_invalid",
+      requestId: "open_stale",
+    });
+    const minted = terminalTicketStore.mint({
+      userId: "user-id",
+      sessionId: "session-id",
+      nodeId: "relay-op",
+      attach: { stepId: "step-1", terminalId },
+    });
+    await terminalBrowserHub.handleText(browser, openFrame(minted.ticket));
+    expect(browser.jsonSends().at(-1)).toMatchObject({
+      type: "opening",
+      terminalId,
+      requestId: "open_1",
+    });
+    // An attach, never a shell.
+    expect(cli.jsonSends().filter((message) => message.type === "term.open")).toEqual([]);
+    expect(cli.jsonSends().filter((message) => message.type === "term.attach")).toEqual([
+      expect.objectContaining({ terminalId }),
+    ]);
+    // A browser `attach` naming the terminal directly, or a `close`, reaches nothing.
+    await terminalBrowserHub.handleText(
+      browser,
+      JSON.stringify({ type: "close", requestId: "close_1", terminalId }),
+    );
+    expect(browser.jsonSends().at(-1)).toMatchObject({ type: "error", code: "not_found" });
+    await terminalBrowserHub.handleText(browser, openFrame(minted.ticket, "open_again"));
+    expect(browser.jsonSends().at(-1)).toMatchObject({ code: "ticket_invalid" });
   });
 
   it("refuses a ticket of another user or another session, and burns it", async () => {

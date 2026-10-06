@@ -126,6 +126,7 @@ import {
   nodeOperatorServices,
   nodeServices,
   pushRuntimeDefinitions,
+  runtimeStepServices,
 } from "./relay/node-wiring.js";
 import { relaySessionManager } from "./relay/session-manager.js";
 import {
@@ -282,6 +283,7 @@ function contextServices(request: HonoContext | null): ContextServices {
     pushRuntimeDefinitions,
     dispatchRuntimeOperation,
     nodeOperator: nodeOperatorServices,
+    runtimeSteps: runtimeStepServices,
     modelTest: runModelTest,
     onAccessRevoked: (event) =>
       handleAccessRevoked(event, {

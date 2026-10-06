@@ -8,15 +8,22 @@
  * and the instance's capacity fence. One tick at a time per process; conditional updates
  * (`updateMany` on the expected state) arbitrate between replicas and racing results.
  *
- * Not here yet (later chunks): operator terminals for interactive steps (the 0.4.0 node
- * answers `interactive_unsupported` until both sides have them: such a start FAILS, such a stop
- * needs Forget), node-origin always-on runtimes from inventory.
+ * Interactive steps (spec §3.6, §4.7) run in an operator terminal a person answers: each
+ * dispatch mints a fresh terminal id; the node reports `awaiting_operator` (the step waits for
+ * its person, no deadline), `operator_running` (the person pressed Enter: the deadline starts)
+ * and `operator_closed` (the terminal ended without success: the step waits, reopenable). One
+ * interactive start step at a time per instance run, in recipe order; at most
+ * {@link OPERATOR_TERMINALS_PER_NODE} live per node (stops exempt). A person's run is never cut
+ * off: stops of the instance on that node wait behind it.
+ *
+ * Not here yet: node-origin always-on runtimes from inventory.
  */
 import { randomBytes } from "node:crypto";
 import { graphWrite, instanceCapacityFences } from "@ws-model-proxy/api/lib/graph-write";
 import { type RuntimeLaunch, runtimeLaunchSchema } from "@ws-model-proxy/api/lib/runtime-spec";
 import { RUNTIME_ADVANCED } from "@ws-model-proxy/config/runtime-defaults";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
+import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import {
   type NodeToServerControlFrame,
   type NodeTrustWire,
@@ -64,9 +71,28 @@ const DEFINITION_RETRY_MS = 5_000;
 const RESTART_BACKOFF_BASE_MS = 10_000;
 const RESTART_BACKOFF_MAX_MS = 5 * 60_000;
 const RETAKE_RETRY_MS = 30_000;
+/** Live operator terminals of non-stop steps per node; stops are exempt (never starved). */
+export const OPERATOR_TERMINALS_PER_NODE = 4;
+/**
+ * An interactive job whose confirm screen did not come up within the node's budget for it
+ * (status-first check included) plus this grace is sent again with a fresh terminal.
+ */
+const OPERATOR_SPAWN_GRACE_MS = 60_000;
+const OPERATOR_SPAWN_BUDGET_MAX_MS = 15 * 60_000;
+/** Why a PENDING interactive step is held before its claim (`operatorHold`, CHECKed). */
+export const OPERATOR_HOLD = {
+  capabilityMissing: "operator_capability_missing",
+  sessionFull: "operator_session_full",
+  nodeFull: "operator_node_full",
+} as const;
+const OPERATOR_HOLD_CODES: ReadonlySet<string> = new Set(Object.values(OPERATOR_HOLD));
+/** A person gave up on an interactive step (`runtimes.steps.cancel`). */
+export const OPERATOR_CANCELLED = "operator_cancelled";
 
 /** Codes that prove a stop cannot be proven by the node: a person decides (Forget). */
 const UNPROVABLE_STOP = new Set([
+  // A person gave up on an interactive stop: they decide (Forget), nothing is retried.
+  OPERATOR_CANCELLED,
   "definition_missing",
   "definition_frozen",
   "instance_unknown",
@@ -77,10 +103,82 @@ const PRE_ADMISSION: ReadonlySet<string> = new Set(RUNTIME_JOB_PRE_ADMISSION_ERR
 
 export type LifecycleRelay = {
   sendToNode(nodeId: string, frame: ServerToNodeControlFrame, guard?: SendGuard): boolean;
-  nodeSession(nodeId: string): { connectionGeneration: number; trust: NodeTrustWire } | null;
+  nodeSession(nodeId: string): {
+    connectionGeneration: number;
+    trust: NodeTrustWire;
+    /** The node can hold operator terminals (feature and terminal key). */
+    operatorTerminals?: boolean;
+  } | null;
   /** Nodes with a live session here (dispatch looks at their steps only). */
   onlineNodeIds?(): string[];
+  /** The node's session can track one more operator terminal (absent: always). */
+  operatorRoom?(nodeId: string): boolean;
+  /**
+   * Close a step's operator terminal on whichever session holds it. `keepRunning` leaves a
+   * person's run alone (answer `running`).
+   */
+  closeOperatorStep?(
+    stepId: string,
+    options?: { keepRunning?: boolean; actor?: "USER" | "SYSTEM" },
+  ): "closed" | "running" | "absent";
+  /** Close an operator terminal no step owns any more (a stale dispatch's), by its id. */
+  closeOperatorTerminal?(nodeId: string, terminalId: string): void;
 };
+
+/** `runtimes.steps.reopen` / `cancel` refusals (the procedure maps them). */
+export class OperatorStepError extends Error {
+  constructor(
+    readonly code:
+      | "not_found"
+      | "not_interactive"
+      | "not_waiting"
+      | "running"
+      | "superseded"
+      | "trust_relay",
+  ) {
+    super(`The step cannot be changed (${code}).`);
+    this.name = "OperatorStepError";
+  }
+}
+
+type StepRow = Prisma.InstanceStepGetPayload<true>;
+
+/** Columns a step without a live operator dispatch carries (PENDING has none, CHECKed). */
+const NO_OPERATOR = {
+  operatorTerminalId: null,
+  operatorSince: null,
+  operatorAcceptedAt: null,
+  operatorLastExit: null,
+} as const;
+
+function interactiveIntent(intent: Prisma.JsonValue): boolean {
+  const parsed = stepIntentSchema.safeParse(intent);
+  return parsed.success && parsed.data.interactive;
+}
+
+/**
+ * The attempts of an interactive step whose live dispatch the server ends (stop, cancel,
+ * reissue). The dispatch gives its attempt back only while its confirm screen never came up:
+ * nobody can attach before `awaiting_operator`, so nothing ran. Once the screen was up, a person
+ * may have pressed Enter just before the close reached the node, so the attempt counts (the
+ * rank then needs a stop, which the node proves from status when nothing ran).
+ */
+function attemptsAfterServerClose(step: {
+  attempts: number;
+  operatorTerminalId: string | null;
+  operatorSince: Date | null;
+  operatorAcceptedAt: Date | null;
+}): number {
+  return step.operatorTerminalId !== null &&
+    step.operatorSince === null &&
+    step.operatorAcceptedAt === null
+    ? Math.max(0, step.attempts - 1)
+    : step.attempts;
+}
+
+function commandAuthor(editor: "USER" | "AGENT" | "SYSTEM"): "user" | "agent" | "unknown" {
+  return editor === "USER" ? "user" : editor === "AGENT" ? "agent" : "unknown";
+}
 
 /** A step as `afterStep` needs it. */
 type FinishedStep = {
@@ -115,13 +213,13 @@ export type LifecycleOptions = {
 type InstanceRow = Prisma.RuntimeInstanceGetPayload<{
   include: {
     Ranks: true;
-    LaunchVersion: { select: { spec: true; launchHash: true; advanced: true } };
+    LaunchVersion: { select: { spec: true; launchHash: true; advanced: true; editor: true } };
   };
 }>;
 
 const INSTANCE_INCLUDE = {
   Ranks: true,
-  LaunchVersion: { select: { spec: true, launchHash: true, advanced: true } },
+  LaunchVersion: { select: { spec: true, launchHash: true, advanced: true, editor: true } },
 } as const;
 
 function launchOf(instance: InstanceRow): RuntimeLaunch | null {
@@ -433,7 +531,17 @@ export class RuntimeLifecycle {
     const now = this.now();
     const generation = await this.currentGeneration(tx, instance.id);
     // Pending start-phase and health steps never run now. Never-sent ones are CANCELLED (proof
-    // they never ran); a re-queued one (attempts > 0) may have run and is FAILED.
+    // they never ran); a re-queued one (attempts > 0) may have run and is FAILED. A hold's
+    // reason does not outlive the hold.
+    await tx.instanceStep.updateMany({
+      where: {
+        instanceId: instance.id,
+        state: "PENDING",
+        phase: { in: [...START_PHASES, "HEALTH"] },
+        errorCode: { in: [...OPERATOR_HOLD_CODES] },
+      },
+      data: { errorCode: null },
+    });
     await tx.instanceStep.updateMany({
       where: {
         instanceId: instance.id,
@@ -441,7 +549,7 @@ export class RuntimeLifecycle {
         phase: { in: [...START_PHASES, "HEALTH"] },
         attempts: 0,
       },
-      data: { state: "CANCELLED" },
+      data: { state: "CANCELLED", operatorHold: null },
     });
     await tx.instanceStep.updateMany({
       where: {
@@ -449,8 +557,12 @@ export class RuntimeLifecycle {
         state: "PENDING",
         phase: { in: [...START_PHASES, "HEALTH"] },
       },
-      data: { state: "FAILED", errorCode: "stopped" },
+      data: { state: "FAILED", errorCode: "stopped", operatorHold: null },
     });
+    // Interactive start steps still waiting for their person (or whose terminal is still
+    // coming up) never run now: their terminals close. A person's run in progress is left to
+    // answer; the instance's stops wait behind it (dispatch).
+    await this.settleOperatorSteps(tx, instance.id, START_PHASES, "stopped");
     const launch = launchOf(instance);
     const steps = await tx.instanceStep.findMany({
       where: { instanceId: instance.id, generation, phase: { not: "HEALTH" } },
@@ -473,11 +585,15 @@ export class RuntimeLifecycle {
       const leadingStop = mine.find(
         (step) => step.phase === "STOP" && step.sequence === generation * GENERATION_STRIDE,
       );
+      // Attempts count only dispatches that may have run something (a declined operator
+      // terminal, or one ended before its screen came up, gives its attempt back), so a FAILED
+      // step without one never ran.
       const neverRan = starts.every(
         (step) =>
           step.state === "CANCELLED" ||
           (step.state === "PENDING" && step.attempts === 0) ||
-          (step.state === "FAILED" && PRE_ADMISSION.has(step.errorCode ?? "")),
+          (step.state === "FAILED" &&
+            (step.attempts === 0 || PRE_ADMISSION.has(step.errorCode ?? ""))),
       );
       const priorProven = generation <= 1 || leadingStop?.state === "SUCCEEDED";
       if (neverRan && priorProven) {
@@ -530,8 +646,12 @@ export class RuntimeLifecycle {
       await this.settleStopped(tx, instance, now);
       return;
     }
-    // A step waiting for a person keeps its need (operator chunk); otherwise FORGET or none.
-    const need = needsForget ? "FORGET" : instance.needsOperator === "STEP" ? "STEP" : null;
+    // An unprovable stop needs Forget; otherwise a step waiting for its person needs them.
+    const need = needsForget
+      ? "FORGET"
+      : (await this.operatorStepWaiting(tx, instance.id))
+        ? "STEP"
+        : null;
     if (instance.needsOperator !== need)
       await tx.runtimeInstance.update({
         where: { id: instance.id },
@@ -557,14 +677,16 @@ export class RuntimeLifecycle {
 
   /** Every claim is released or forgotten: STOPPED, then the restart rule for RUNNING. */
   private async settleStopped(tx: Tx, instance: InstanceRow, now: Date) {
+    // Interactive stops still waiting for their person have nothing left to stop.
+    await this.settleOperatorSteps(tx, instance.id, ["STOP"], "superseded");
     // Nothing is left to stop: pending stops are not needed any more (re-queued ones fail).
     await tx.instanceStep.updateMany({
       where: { instanceId: instance.id, phase: "STOP", state: "PENDING", attempts: 0 },
-      data: { state: "CANCELLED" },
+      data: { state: "CANCELLED", operatorHold: null },
     });
     await tx.instanceStep.updateMany({
       where: { instanceId: instance.id, phase: "STOP", state: "PENDING" },
-      data: { state: "FAILED", errorCode: "superseded" },
+      data: { state: "FAILED", errorCode: "superseded", operatorHold: null },
     });
     if (instance.desiredState !== "RUNNING") {
       await tx.runtimeInstance.update({
@@ -901,18 +1023,32 @@ export class RuntimeLifecycle {
   // ── Deadlines ──
 
   private async expireSteps() {
+    const now = this.now();
     const rows = await prisma.instanceStep.findMany({
-      where: { state: "RUNNING", deadline: { lte: this.now() } },
+      where: {
+        state: "RUNNING",
+        deadline: { lte: now },
+        OR: [
+          // A person's run is never expired; only its need is raised (once, below).
+          { operatorAcceptedAt: null },
+          { Instance: { needsOperator: null } },
+        ],
+      },
       select: { id: true, instanceId: true, Instance: { select: { userId: true } } },
+      orderBy: { deadline: "asc" },
       take: BATCH,
     });
     for (const row of rows) {
       await this.write(row.Instance.userId, row.instanceId, async (tx) => {
         const step = await tx.instanceStep.findUnique({ where: { id: row.id } });
         if (step?.state !== "RUNNING" || !step.deadline || step.deadline > this.now()) return;
-        const intent = stepIntentSchema.safeParse(step.intent);
-        // A person's run is never cut off (operator terminals, later chunk).
-        if (intent.success && intent.data.interactive && step.operatorAcceptedAt) return;
+        if (interactiveIntent(step.intent)) {
+          // A person's run is never cut off: past its timeout it needs its person again.
+          if (step.operatorAcceptedAt) await this.syncNeedsOperator(tx, step.instanceId);
+          // No confirm screen in time: dispatched again with a fresh terminal.
+          else await this.reissueOperatorStep(tx, step);
+          return;
+        }
         await tx.instanceStep.updateMany({
           where: { id: step.id, state: "RUNNING" },
           data: {
@@ -968,7 +1104,7 @@ export class RuntimeLifecycle {
   private async claimStep(
     tx: Tx,
     stepId: string,
-    session: { connectionGeneration: number; trust: NodeTrustWire },
+    session: { connectionGeneration: number; trust: NodeTrustWire; operatorTerminals?: boolean },
   ) {
     const now = this.now();
     const step = await tx.instanceStep.findUnique({
@@ -999,9 +1135,10 @@ export class RuntimeLifecycle {
           where: { id: step.id, state: "PENDING" },
           data:
             step.attempts === 0
-              ? { state: "CANCELLED" }
-              : { state: "FAILED", errorCode: "released" },
+              ? { state: "CANCELLED", operatorHold: null }
+              : { state: "FAILED", errorCode: "released", operatorHold: null },
         });
+        if (step.operatorHold !== null) await this.syncNeedsOperator(tx, instance.id);
         return null;
       }
     }
@@ -1013,9 +1150,10 @@ export class RuntimeLifecycle {
           where: { id: step.id, state: "PENDING" },
           data:
             step.attempts === 0
-              ? { state: "CANCELLED" }
-              : { state: "FAILED", errorCode: "superseded" },
+              ? { state: "CANCELLED", operatorHold: null }
+              : { state: "FAILED", errorCode: "superseded", operatorHold: null },
         });
+        if (step.operatorHold !== null) await this.syncNeedsOperator(tx, instance.id);
         return null;
       }
       if (instance.desiredState !== "RUNNING") return null;
@@ -1072,6 +1210,28 @@ export class RuntimeLifecycle {
       }
       if (instance.Ranks.some((rank) => rank.claim !== "HELD")) return null;
     }
+    // A stop is never sent over a person's run of this instance: it waits until that run
+    // answers (and is neither failed nor counted meanwhile).
+    if (step.phase === "STOP" && (await this.operatorRunInProgress(tx, step))) return null;
+    const interactive = intent.data.interactive;
+    if (interactive) {
+      // A banned or deleting owner could never answer the terminal: none opens.
+      const owner = await tx.user.findUnique({
+        where: { id: instance.userId },
+        select: { banned: true, banExpires: true, deletionRequestedAt: true },
+      });
+      if (!owner || userCredentialAccessBlocked(owner, now)) return null;
+      const hold = await this.operatorHold(tx, step, session);
+      if (hold === "wait") {
+        // Only its turn is missing now: an earlier hold no longer explains the wait.
+        if (step.operatorHold !== null) await this.clearOperatorHold(tx, step);
+        return null;
+      }
+      if (hold) {
+        await this.recordOperatorHold(tx, step, hold);
+        return null;
+      }
+    }
     let headAddr: string | null = null;
     if (intent.data.nnodes > 1) {
       const head = instance.Ranks.find((rank) => rank.rank === 0);
@@ -1089,7 +1249,21 @@ export class RuntimeLifecycle {
       }
     }
     const ownerEpoch = this.ownerEpoch(session.connectionGeneration);
-    const deadline = new Date(now.getTime() + intent.data.timeoutMs);
+    // A fresh terminal per dispatch (ids are never reused), with who wrote the command.
+    const operator = interactive
+      ? {
+          terminalId: randomBytes(16).toString("base64url"),
+          commandAuthor: commandAuthor(instance.LaunchVersion.editor),
+        }
+      : undefined;
+    // An interactive job's deadline here bounds only its terminal coming up; the person's run
+    // gets the step's timeout from `operator_running`.
+    const deadline = new Date(
+      now.getTime() +
+        (operator
+          ? Math.min(intent.data.timeoutMs, OPERATOR_SPAWN_BUDGET_MAX_MS) + OPERATOR_SPAWN_GRACE_MS
+          : intent.data.timeoutMs),
+    );
     const claimed = await tx.instanceStep.updateMany({
       where: { id: step.id, state: "PENDING" },
       data: {
@@ -1099,9 +1273,14 @@ export class RuntimeLifecycle {
         deadline,
         leaseExpiresAt: deadline,
         notBefore: null,
+        operatorHold: null,
+        ...(operator ? { operatorTerminalId: operator.terminalId } : {}),
+        ...(step.errorCode && OPERATOR_HOLD_CODES.has(step.errorCode) ? { errorCode: null } : {}),
       },
     });
     if (claimed.count === 0) return null;
+    // The claim cleared a hold (CHECK: holds only on PENDING): the need follows.
+    if (step.operatorHold !== null) await this.syncNeedsOperator(tx, instance.id);
     return jobFrame({
       stepId: step.id,
       instanceId: instance.id,
@@ -1111,6 +1290,7 @@ export class RuntimeLifecycle {
       intentHash: step.intentHash,
       ownerEpoch,
       headAddr,
+      ...(operator ? { operator } : {}),
     });
   }
 
@@ -1125,6 +1305,7 @@ export class RuntimeLifecycle {
           deadline: null,
           leaseExpiresAt: null,
           attempts: { decrement: 1 },
+          ...NO_OPERATOR,
         },
       }),
     ).catch((error: unknown) =>
@@ -1135,17 +1316,431 @@ export class RuntimeLifecycle {
   private async failStep(tx: Tx, stepId: string, code: string) {
     await tx.instanceStep.updateMany({
       where: { id: stepId, state: { in: ["PENDING", "RUNNING"] } },
-      data: { state: "FAILED", errorCode: code, deadline: null, leaseExpiresAt: null },
+      data: {
+        state: "FAILED",
+        errorCode: code,
+        deadline: null,
+        leaseExpiresAt: null,
+        operatorHold: null,
+        operatorTerminalId: null,
+      },
     });
+  }
+
+  // ── Operator terminals (interactive steps) ──
+
+  /**
+   * Whether a step of the instance waits for its person: an interactive step AWAITING_OPERATOR
+   * (terminal open or closed), a held one, or a person's run past its timeout.
+   */
+  private async operatorStepWaiting(tx: Tx, instanceId: string): Promise<boolean> {
+    const waiting = await tx.instanceStep.count({
+      where: {
+        instanceId,
+        OR: [
+          { state: "AWAITING_OPERATOR" },
+          { state: "PENDING", operatorHold: { not: null } },
+          { state: "RUNNING", operatorAcceptedAt: { not: null }, deadline: { lte: this.now() } },
+        ],
+      },
+    });
+    return waiting > 0;
+  }
+
+  /**
+   * `needsOperator` STEP while a step waits for its person; it clears when none does. FORGET
+   * (only while STOPPING, see settleStopping) and RESTART are kept.
+   */
+  private async syncNeedsOperator(tx: Tx, instanceId: string) {
+    const instance = await tx.runtimeInstance.findUnique({
+      where: { id: instanceId },
+      select: { needsOperator: true },
+    });
+    // FORGET and RESTART are decided by the stop and restart rules, never by a step.
+    if (!instance || instance.needsOperator === "FORGET" || instance.needsOperator === "RESTART")
+      return;
+    const waiting = await this.operatorStepWaiting(tx, instanceId);
+    const need = waiting
+      ? "STEP"
+      : instance.needsOperator === "STEP"
+        ? null
+        : instance.needsOperator;
+    if (need === instance.needsOperator) return;
+    await tx.runtimeInstance.update({
+      where: { id: instanceId },
+      data: { needsOperator: need, needsOperatorSince: need ? this.now() : null },
+    });
+  }
+
+  /** Record (once) why a PENDING interactive step is held; the instance needs its person. */
+  private async recordOperatorHold(tx: Tx, step: StepRow, reason: string) {
+    const codeChanges =
+      step.errorCode !== reason &&
+      (step.errorCode === null || OPERATOR_HOLD_CODES.has(step.errorCode));
+    if (step.operatorHold === reason && !codeChanges) return;
+    await tx.instanceStep.updateMany({
+      where: { id: step.id, state: "PENDING" },
+      data: { operatorHold: reason, ...(codeChanges ? { errorCode: reason } : {}) },
+    });
+    await this.syncNeedsOperator(tx, step.instanceId);
+  }
+
+  private async clearOperatorHold(tx: Tx, step: StepRow) {
+    await tx.instanceStep.updateMany({
+      where: { id: step.id, state: "PENDING" },
+      data: {
+        operatorHold: null,
+        ...(step.errorCode && OPERATOR_HOLD_CODES.has(step.errorCode) ? { errorCode: null } : {}),
+      },
+    });
+    await this.syncNeedsOperator(tx, step.instanceId);
+  }
+
+  /**
+   * Why an interactive step may not open its terminal now: a hold code (recorded, the person
+   * is told), "wait" (not its turn: another interactive start step of this run is live, or one
+   * of the same sequence has a lower rank; a person answers one terminal at a time, in recipe
+   * order), or null (it may). Stops are exempt from the node cap and the turn.
+   */
+  private async operatorHold(
+    tx: Tx,
+    step: StepRow,
+    session: { operatorTerminals?: boolean },
+  ): Promise<string | null> {
+    if (session.operatorTerminals !== true) return OPERATOR_HOLD.capabilityMissing;
+    if (this.relay.operatorRoom && !this.relay.operatorRoom(step.nodeId))
+      return OPERATOR_HOLD.sessionFull;
+    if (step.phase === "STOP") return null;
+    const live = await tx.instanceStep.count({
+      where: {
+        nodeId: step.nodeId,
+        phase: { not: "STOP" },
+        state: { in: ["RUNNING", "AWAITING_OPERATOR"] },
+        operatorTerminalId: { not: null },
+      },
+    });
+    if (live >= OPERATOR_TERMINALS_PER_NODE) return OPERATOR_HOLD.nodeFull;
+    const others = await tx.instanceStep.findMany({
+      where: {
+        instanceId: step.instanceId,
+        id: { not: step.id },
+        generation: step.generation,
+        phase: { in: [...START_PHASES] },
+        OR: [
+          {
+            state: { in: ["RUNNING", "AWAITING_OPERATOR"] },
+            OR: [{ operatorTerminalId: { not: null } }, { operatorSince: { not: null } }],
+          },
+          { state: "PENDING", sequence: step.sequence, rank: { lt: step.rank } },
+        ],
+      },
+      select: { state: true, intent: true },
+    });
+    return others.some((other) => other.state !== "PENDING" || interactiveIntent(other.intent))
+      ? "wait"
+      : null;
+  }
+
+  /**
+   * End the interactive steps of these phases that wait for their person (AWAITING_OPERATOR, or
+   * RUNNING with a terminal that has not come up yet) and close their terminals. A person's run
+   * in progress is left to answer. A dispatch whose screen never came up gives its attempt back
+   * ({@link attemptsAfterServerClose}), so a step that never ran ends CANCELLED (proof for the
+   * claim's auto-release), else FAILED `code`.
+   */
+  private async settleOperatorSteps(
+    tx: Tx,
+    instanceId: string,
+    phases: readonly StepPhase[],
+    code: string,
+  ): Promise<number> {
+    const steps = await tx.instanceStep.findMany({
+      where: {
+        instanceId,
+        phase: { in: [...phases] },
+        OR: [
+          { state: "AWAITING_OPERATOR" },
+          { state: "RUNNING", operatorTerminalId: { not: null }, operatorAcceptedAt: null },
+        ],
+      },
+    });
+    let settled = 0;
+    for (const step of steps) {
+      if (!interactiveIntent(step.intent)) continue;
+      if (this.relay.closeOperatorStep?.(step.id, { keepRunning: true }) === "running") continue;
+      const attempts = attemptsAfterServerClose(step);
+      const changed = await tx.instanceStep.updateMany({
+        where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
+        data: {
+          state: attempts === 0 ? "CANCELLED" : "FAILED",
+          errorCode: attempts === 0 ? null : code,
+          attempts,
+          deadline: null,
+          leaseExpiresAt: null,
+          operatorTerminalId: null,
+        },
+      });
+      settled += changed.count;
+    }
+    if (settled > 0) await this.syncNeedsOperator(tx, instanceId);
+    return settled;
+  }
+
+  /**
+   * Return an interactive step to PENDING so it is dispatched again with a fresh terminal (the
+   * node checks status first). Its terminal, if any, is closed first by step id; a terminal
+   * whose command already runs is left alone and the step kept, so one step never has two
+   * runs. Only a dispatch whose screen never came up gives its attempt back.
+   */
+  private async reissueOperatorStep(tx: Tx, step: StepRow): Promise<boolean> {
+    if (this.relay.closeOperatorStep?.(step.id, { keepRunning: true }) === "running") return false;
+    const changed = await tx.instanceStep.updateMany({
+      where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
+      data: {
+        state: "PENDING",
+        ownerEpoch: null,
+        deadline: null,
+        leaseExpiresAt: null,
+        ...NO_OPERATOR,
+        attempts: attemptsAfterServerClose(step),
+      },
+    });
+    if (changed.count === 0) return false;
+    await this.syncNeedsOperator(tx, step.instanceId);
+    return true;
+  }
+
+  /**
+   * Operator progress for the current dispatch of an interactive step:
+   * - `awaiting_operator`: the confirm screen is up and waits for its person: AWAITING_OPERATOR,
+   *   no deadline.
+   * - `operator_running`: the person pressed Enter: RUNNING with the step's deadline.
+   * - `operator_closed`: see {@link operatorClosed}.
+   */
+  private async operatorProgress(tx: Tx, step: StepRow, result: JobResult): Promise<void> {
+    if (result.status === "operator_closed") {
+      await this.operatorClosed(tx, step, {
+        ...(result.exitCode !== undefined ? { exitCode: result.exitCode } : {}),
+      });
+      return;
+    }
+    const where = {
+      id: step.id,
+      state: step.state,
+      ownerEpoch: step.ownerEpoch,
+      operatorTerminalId: step.operatorTerminalId,
+    };
+    const now = this.now();
+    if (result.status === "awaiting_operator") {
+      if (step.state === "AWAITING_OPERATOR" || step.operatorAcceptedAt !== null) return;
+      const changed = await tx.instanceStep.updateMany({
+        where,
+        data: {
+          state: "AWAITING_OPERATOR",
+          deadline: null,
+          leaseExpiresAt: null,
+          operatorSince: step.operatorSince ?? now,
+        },
+      });
+      if (changed.count > 0) await this.syncNeedsOperator(tx, step.instanceId);
+      return;
+    }
+    // operator_running: a repeat, or a run reported before its screen, changes nothing.
+    if (step.state !== "AWAITING_OPERATOR") return;
+    const intent = stepIntentSchema.parse(step.intent);
+    const deadline = new Date(now.getTime() + intent.timeoutMs);
+    const changed = await tx.instanceStep.updateMany({
+      where,
+      data: { state: "RUNNING", deadline, leaseExpiresAt: deadline, operatorAcceptedAt: now },
+    });
+    if (changed.count > 0) await this.syncNeedsOperator(tx, step.instanceId);
+  }
+
+  /**
+   * The operator terminal ended without success (declined, closed, the command exited non-zero,
+   * or the node could not hold it: `error`). The step keeps waiting for its person with no
+   * terminal (reopenable, which returns it to PENDING); claims stay held. Nothing is retried
+   * automatically, so a node that cannot open a terminal never loops. A decline (nothing ran in
+   * this terminal) is not an attempt.
+   */
+  private async operatorClosed(
+    tx: Tx,
+    step: StepRow,
+    closed: { exitCode?: number; error?: string },
+  ): Promise<void> {
+    const changed = await tx.instanceStep.updateMany({
+      where: {
+        id: step.id,
+        state: step.state,
+        ownerEpoch: step.ownerEpoch,
+        operatorTerminalId: step.operatorTerminalId,
+      },
+      data: {
+        state: "AWAITING_OPERATOR",
+        deadline: null,
+        leaseExpiresAt: null,
+        operatorTerminalId: null,
+        operatorSince: step.operatorSince ?? this.now(),
+        ...(closed.exitCode !== undefined ? { operatorLastExit: closed.exitCode } : {}),
+        ...(closed.error ? { errorCode: closed.error } : {}),
+        ...(closed.exitCode === undefined && step.operatorAcceptedAt === null
+          ? { attempts: Math.max(0, step.attempts - 1) }
+          : {}),
+      },
+    });
+    if (changed.count > 0) await this.syncNeedsOperator(tx, step.instanceId);
+  }
+
+  /**
+   * Whether the instance on this node has a person's run in progress (`operator_running` seen
+   * and not yet answered). Its stops wait behind it: never sent over it, never failed for it.
+   */
+  private async operatorRunInProgress(tx: Tx, step: StepRow): Promise<boolean> {
+    // Also a terminal still open on the node: its run may have begun before its report (the
+    // node holds a stop behind it too, on the rank's lock).
+    const running = await tx.instanceStep.count({
+      where: {
+        instanceId: step.instanceId,
+        nodeId: step.nodeId,
+        id: { not: step.id },
+        OR: [
+          { state: "RUNNING", operatorAcceptedAt: { not: null } },
+          { state: "AWAITING_OPERATOR", operatorTerminalId: { not: null } },
+        ],
+      },
+    });
+    return running > 0;
+  }
+
+  /** The step a person reopens or cancels: theirs, interactive. */
+  private async ownedOperatorStep(tx: Tx, userId: string, stepId: string) {
+    const step = await tx.instanceStep.findFirst({
+      where: { id: stepId, Instance: { userId } },
+      include: { Instance: { include: INSTANCE_INCLUDE } },
+    });
+    if (!step) throw new OperatorStepError("not_found");
+    if (!interactiveIntent(step.intent)) throw new OperatorStepError("not_interactive");
+    return step;
+  }
+
+  /**
+   * `runtimes.steps.reopen`: a step whose terminal closed without success runs again in a fresh
+   * terminal (PENDING; the next dispatch opens it). Refused while its terminal is still open, or
+   * once the step is no longer the instance's step to run.
+   */
+  async reopenStep(input: { userId: string; stepId: string }): Promise<void> {
+    const instanceId = await prisma.instanceStep
+      .findFirst({
+        where: { id: input.stepId, Instance: { userId: input.userId } },
+        select: { instanceId: true },
+      })
+      .then((row) => row?.instanceId);
+    if (!instanceId) throw new OperatorStepError("not_found");
+    await this.write(input.userId, instanceId, async (tx) => {
+      const step = await this.ownedOperatorStep(tx, input.userId, input.stepId);
+      if (step.state !== "AWAITING_OPERATOR" || step.operatorTerminalId !== null)
+        throw new OperatorStepError("not_waiting");
+      const instance = step.Instance;
+      if (isStartPhase(step.phase)) {
+        const current =
+          step.generation === (await this.currentGeneration(tx, instance.id)) &&
+          instance.desiredState === "RUNNING" &&
+          instance.phase === "STARTING";
+        if (!current) throw new OperatorStepError("superseded");
+        // An agent's start never runs interactively on a Relay-only node: say so now.
+        if (instance.startedBy === "AGENT" && !(await this.nodeFullControl(tx, step.nodeId)))
+          throw new OperatorStepError("trust_relay");
+      }
+      const changed = await tx.instanceStep.updateMany({
+        where: { id: step.id, state: "AWAITING_OPERATOR", operatorTerminalId: null },
+        data: {
+          state: "PENDING",
+          ownerEpoch: null,
+          deadline: null,
+          leaseExpiresAt: null,
+          notBefore: null,
+          ...NO_OPERATOR,
+          ...(step.errorCode === "operator_terminals_disabled" ? { errorCode: null } : {}),
+        },
+      });
+      if (changed.count === 0) throw new OperatorStepError("not_waiting");
+      await this.syncNeedsOperator(tx, instance.id);
+    });
+    this.wake();
+  }
+
+  /**
+   * `runtimes.steps.cancel`: a person gives up on an interactive step that waits for them (or is
+   * held, or whose terminal is coming up). It fails `operator_cancelled` and the instance follows
+   * its rules: a start gang-stops (an interactive start then waits for a person's restart), a
+   * stop needs Forget. A person's run in progress is not cut off (`running`).
+   */
+  async cancelStep(input: { userId: string; stepId: string }): Promise<void> {
+    const instanceId = await prisma.instanceStep
+      .findFirst({
+        where: { id: input.stepId, Instance: { userId: input.userId } },
+        select: { instanceId: true },
+      })
+      .then((row) => row?.instanceId);
+    if (!instanceId) throw new OperatorStepError("not_found");
+    await this.write(input.userId, instanceId, async (tx) => {
+      const step = await this.ownedOperatorStep(tx, input.userId, input.stepId);
+      const waiting =
+        step.state === "AWAITING_OPERATOR" ||
+        step.state === "PENDING" ||
+        (step.state === "RUNNING" && step.operatorAcceptedAt === null);
+      if (step.state === "RUNNING" && step.operatorAcceptedAt !== null)
+        throw new OperatorStepError("running");
+      if (!waiting) throw new OperatorStepError("not_waiting");
+      if (
+        this.relay.closeOperatorStep?.(step.id, { keepRunning: true, actor: "USER" }) === "running"
+      )
+        throw new OperatorStepError("running");
+      const attempts = attemptsAfterServerClose(step);
+      const changed = await tx.instanceStep.updateMany({
+        where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
+        data: {
+          state: "FAILED",
+          errorCode: OPERATOR_CANCELLED,
+          attempts,
+          deadline: null,
+          leaseExpiresAt: null,
+          operatorHold: null,
+          operatorTerminalId: null,
+        },
+      });
+      if (changed.count === 0) throw new OperatorStepError("not_waiting");
+      await this.syncNeedsOperator(tx, instanceId);
+      await this.afterStep(tx, step, false, OPERATOR_CANCELLED);
+    });
+    this.wake();
   }
 
   // ── Results ──
 
+  /** Results of one step apply in the order they arrived (frames are not serialized). */
+  private readonly resultChains = new Map<string, Promise<void>>();
+
   /** `runtime.job.result` from the node's current session. */
-  async handleJobResult(ref: NodeSessionRef, result: JobResult): Promise<void> {
+  handleJobResult(ref: NodeSessionRef, result: JobResult): Promise<void> {
+    const previous = this.resultChains.get(result.stepId) ?? Promise.resolve();
+    const applied = previous.then(() => this.applyJobResult(ref, result));
+    const chained = applied.catch(() => undefined);
+    this.resultChains.set(result.stepId, chained);
+    void chained.finally(() => {
+      if (this.resultChains.get(result.stepId) === chained) this.resultChains.delete(result.stepId);
+    });
+    return applied;
+  }
+
+  private async applyJobResult(ref: NodeSessionRef, result: JobResult): Promise<void> {
     if (result.ownerEpoch !== this.ownerEpoch(ref.connectionGeneration)) return;
-    // Operator progress belongs to the operator chunk.
-    if (result.status !== "succeeded" && result.status !== "failed") return;
+    // Progress never extends the absolute deadline.
+    if (result.status === "running") return;
+    const progress =
+      result.status === "awaiting_operator" ||
+      result.status === "operator_running" ||
+      result.status === "operator_closed";
     const row = await prisma.instanceStep.findFirst({
       where: {
         id: result.stepId,
@@ -1154,15 +1749,64 @@ export class RuntimeLifecycle {
         rank: result.rank,
         intentHash: result.intentHash,
         ownerEpoch: result.ownerEpoch,
-        state: "RUNNING",
+        // A final can overtake its own `operator_running` (or follow the screen at once): a
+        // waiting interactive step accepts it too.
+        state: { in: ["RUNNING", "AWAITING_OPERATOR"] },
         Instance: { userId: ref.userId },
       },
       select: { id: true },
     });
-    if (!row) return;
+    // A terminal that came up (or runs) for a dispatch that is no longer the step's: nobody can
+    // answer it, so it must not hold the node's terminal slots until the session ends.
+    const stale = () => {
+      if (
+        result.terminalId !== undefined &&
+        (result.status === "awaiting_operator" || result.status === "operator_running")
+      )
+        this.relay.closeOperatorTerminal?.(ref.nodeId, result.terminalId);
+    };
+    if (!row) {
+      stale();
+      return;
+    }
+    let dropped = false;
     await this.write(ref.userId, result.instanceId, async (tx) => {
+      dropped = false;
       const step = await tx.instanceStep.findUnique({ where: { id: row.id } });
-      if (step?.state !== "RUNNING" || step.ownerEpoch !== result.ownerEpoch) return;
+      if (!step || step.ownerEpoch !== result.ownerEpoch) {
+        dropped = true;
+        return;
+      }
+      if (step.state !== "RUNNING" && step.state !== "AWAITING_OPERATOR") {
+        dropped = true;
+        return;
+      }
+      const interactive = interactiveIntent(step.intent);
+      // Only an interactive step has operator progress or waits for a person.
+      if (!interactive && (progress || step.state !== "RUNNING")) return;
+      // Every result of an interactive job names the terminal of the dispatch it answers: a
+      // late answer to an earlier dispatch, or after its terminal closed, settles nothing.
+      if (
+        interactive &&
+        (step.operatorTerminalId === null || result.terminalId !== step.operatorTerminalId)
+      ) {
+        dropped = true;
+        return;
+      }
+      if (progress) {
+        await this.operatorProgress(tx, step, result);
+        return;
+      }
+      // The node cannot hold the terminal (switched off, at its cap): the step waits for its
+      // person (closed, reopenable) instead of failing the run or looping.
+      if (
+        interactive &&
+        result.status === "failed" &&
+        result.error === "operator_terminals_disabled"
+      ) {
+        await this.operatorClosed(tx, step, { error: "operator_terminals_disabled" });
+        return;
+      }
       const stopLike = step.phase === "STOP" || step.phase === "STATUS";
       const succeeded = result.status === "succeeded" && (!stopLike || result.stopped);
       let code = succeeded ? null : (result.error ?? (stopLike ? "not_stopped" : "job_failed"));
@@ -1183,7 +1827,7 @@ export class RuntimeLifecycle {
           (code === "definition_missing" && (await this.nodeFullControl(tx, ref.nodeId))));
       if (retry) {
         await tx.instanceStep.updateMany({
-          where: { id: step.id, state: "RUNNING" },
+          where: { id: step.id, state: step.state },
           data: {
             state: "PENDING",
             ownerEpoch: null,
@@ -1191,23 +1835,32 @@ export class RuntimeLifecycle {
             leaseExpiresAt: null,
             attempts: { decrement: 1 },
             notBefore: new Date(this.now().getTime() + DEFINITION_RETRY_MS),
+            ...NO_OPERATOR,
           },
         });
         if (code === "definition_missing") this.options.resyncDefinitions?.(ref.nodeId);
+        if (interactive) await this.syncNeedsOperator(tx, step.instanceId);
         return;
       }
       const changed = await tx.instanceStep.updateMany({
-        where: { id: step.id, state: "RUNNING", ownerEpoch: result.ownerEpoch },
+        where: { id: step.id, state: step.state, ownerEpoch: result.ownerEpoch },
         data: {
           state: succeeded ? "SUCCEEDED" : "FAILED",
           errorCode: code,
           deadline: null,
           leaseExpiresAt: null,
+          operatorTerminalId: null,
+          // A success that overtook its own `operator_running` records the acceptance.
+          ...(succeeded && step.state === "AWAITING_OPERATOR" && step.operatorAcceptedAt === null
+            ? { operatorAcceptedAt: this.now() }
+            : {}),
         },
       });
       if (changed.count === 0) return;
+      if (interactive) await this.syncNeedsOperator(tx, step.instanceId);
       await this.afterStep(tx, step, succeeded, code);
     });
+    if (dropped) stale();
     this.wake();
   }
 
@@ -1404,38 +2057,52 @@ export class RuntimeLifecycle {
    */
   async requeueStale(ref: NodeSessionRef): Promise<void> {
     const current = this.ownerEpoch(ref.connectionGeneration);
-    const rows = await prisma.instanceStep.findMany({
-      where: { nodeId: ref.nodeId, state: "RUNNING", NOT: { ownerEpoch: current } },
-      select: { id: true, instanceId: true, ownerEpoch: true },
-    });
-    for (const row of rows)
-      await this.write(ref.userId, row.instanceId, (tx) =>
-        tx.instanceStep.updateMany({
-          where: { id: row.id, state: "RUNNING", ownerEpoch: row.ownerEpoch },
-          data: { state: "PENDING", ownerEpoch: null, deadline: null, leaseExpiresAt: null },
-        }),
-      ).catch((error: unknown) =>
-        console.error("[lifecycle] re-queuing a stale step failed", errorName(error)),
-      );
-    this.wake();
+    await this.requeueLost(ref, { NOT: { ownerEpoch: current } }, "re-queuing a stale step");
   }
 
   /** The session ended: its RUNNING steps go back to PENDING (the node re-observes them). */
   async nodeDisconnected(ref: NodeSessionRef): Promise<void> {
     const ownerEpoch = this.ownerEpoch(ref.connectionGeneration);
+    await this.requeueLost(ref, { ownerEpoch }, "releasing a lost lease");
+  }
+
+  /**
+   * Steps a lost session held go back to PENDING: RUNNING ones, and interactive steps whose
+   * terminal died with the session (AWAITING_OPERATOR with a terminal; a closed one keeps
+   * waiting for its person to reopen it). An interactive step is reissued with a fresh
+   * terminal; its dispatch counts only if a person's run had started.
+   */
+  private async requeueLost(
+    ref: NodeSessionRef,
+    epoch: Prisma.InstanceStepWhereInput,
+    what: string,
+  ): Promise<void> {
     const rows = await prisma.instanceStep.findMany({
-      where: { nodeId: ref.nodeId, state: "RUNNING", ownerEpoch },
+      where: {
+        nodeId: ref.nodeId,
+        ...epoch,
+        OR: [
+          { state: "RUNNING" },
+          { state: "AWAITING_OPERATOR", operatorTerminalId: { not: null } },
+        ],
+      },
       select: { id: true, instanceId: true },
     });
     for (const row of rows)
-      await this.write(ref.userId, row.instanceId, (tx) =>
-        tx.instanceStep.updateMany({
-          where: { id: row.id, state: "RUNNING", ownerEpoch },
+      await this.write(ref.userId, row.instanceId, async (tx) => {
+        const step = await tx.instanceStep.findFirst({ where: { id: row.id, ...epoch } });
+        if (!step) return;
+        if (interactiveIntent(step.intent)) {
+          if (step.state === "RUNNING" || step.operatorTerminalId !== null)
+            await this.reissueOperatorStep(tx, step);
+          return;
+        }
+        if (step.state !== "RUNNING") return;
+        await tx.instanceStep.updateMany({
+          where: { id: step.id, state: "RUNNING", ownerEpoch: step.ownerEpoch },
           data: { state: "PENDING", ownerEpoch: null, deadline: null, leaseExpiresAt: null },
-        }),
-      ).catch((error: unknown) =>
-        console.error("[lifecycle] releasing a lost lease failed", errorName(error)),
-      );
+        });
+      }).catch((error: unknown) => console.error(`[lifecycle] ${what} failed`, errorName(error)));
     this.wake();
   }
 
@@ -1476,7 +2143,10 @@ export class RuntimeLifecycle {
             generation: await this.currentGeneration(tx, instance.id),
             phase: { in: [...START_PHASES] },
             attempts: { gt: 0 },
-            OR: [{ state: { in: ["RUNNING", "PENDING"] } }, { errorCode: "stopped" }],
+            OR: [
+              { state: { in: ["RUNNING", "PENDING", "AWAITING_OPERATOR"] } },
+              { errorCode: "stopped" },
+            ],
           },
         });
         if (record?.phase === "stopped" && inFlight === 0) {

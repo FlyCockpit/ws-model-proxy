@@ -58,6 +58,11 @@ export type ContextServices = {
   /** Lane D (terminals, node commands): the relay surfaces these procedures need. */
   nodeOperator?: NodeOperatorServices;
   /**
+   * Interactive steps (`runtimes.steps.*`): the lifecycle engine and the relay's operator
+   * terminals. People only; the procedure has checked nothing but the caller.
+   */
+  runtimeSteps?: RuntimeStepServices;
+  /**
    * `models.test`: send the test through the production admission and routing path as source
    * `AGENT_TEST`. The procedure has already checked that the caller may use the target (and,
    * for a bench, owns it) and resolved it. Absent: the procedure answers SERVICE_UNAVAILABLE.
@@ -114,6 +119,40 @@ export type NodeCommandLiveStatus = {
   output: string;
   truncated?: boolean;
   finishedAt?: Date;
+};
+
+/** Why `runtimes.steps.*` refused a step. */
+export type RuntimeStepRefusal =
+  | "not_found"
+  | "not_interactive"
+  /** The step does not wait for its person (finished, or its terminal is still open/closed). */
+  | "not_waiting"
+  /** A person's run is in progress: it is answered in its terminal, never cut off. */
+  | "running"
+  /** The step is no longer the instance's step to run (stopped or restarted meanwhile). */
+  | "superseded"
+  /** The terminal closed: reopen the step first. */
+  | "terminal_closed"
+  /** The terminal is not up on the node (still coming up, or the node is offline). */
+  | "terminal_unavailable"
+  /** An agent started the instance and the node is Relay only: its steps never run there. */
+  | "trust_relay";
+
+export type RuntimeStepResult = { ok: true } | { ok: false; code: RuntimeStepRefusal };
+
+export type RuntimeStepServices = {
+  /** A one-use attach ticket bound to the step's live operator terminal. */
+  attach(args: {
+    userId: string;
+    sessionId: string;
+    impersonatedBy?: string | null;
+    stepId: string;
+  }): Promise<
+    | { ok: true; ticket: string; terminalId: string; expiresAt: Date }
+    | { ok: false; code: RuntimeStepRefusal }
+  >;
+  reopen(args: { userId: string; stepId: string }): Promise<RuntimeStepResult>;
+  cancel(args: { userId: string; stepId: string }): Promise<RuntimeStepResult>;
 };
 
 /**

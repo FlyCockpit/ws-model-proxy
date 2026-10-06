@@ -4,6 +4,7 @@
  * starts the lifecycle engine once the server starts.
  */
 import { RuntimeLifecycle } from "../runtimes/lifecycle.js";
+import { createRuntimeStepServices } from "../runtimes/operator-steps.js";
 import { nodeCommandTracker } from "./node-commands.js";
 import { composeNodeFrameHandlers } from "./node-frame-handlers.js";
 import { createNodeOperatorServices } from "./node-operator-services.js";
@@ -24,12 +25,29 @@ const runtimeSync = createRuntimeSync({
 
 /** Steps, dispatch, results, restarts and health of runtime instances. */
 export const runtimeLifecycle = new RuntimeLifecycle(
-  { ...relay, onlineNodeIds: () => relaySessionManager.getOnlineNodeIds() },
+  {
+    ...relay,
+    onlineNodeIds: () => relaySessionManager.getOnlineNodeIds(),
+    operatorRoom: (nodeId) => relaySessionManager.operatorRoom(nodeId),
+    closeOperatorStep: (stepId, options) => relaySessionManager.closeOperatorStep(stepId, options),
+    closeOperatorTerminal: (nodeId, terminalId) =>
+      relaySessionManager.closeOperatorTerminal(nodeId, terminalId),
+  },
   {
     // A start that found its definition missing: push the node's definitions again.
     resyncDefinitions: (nodeId) => void runtimeSync.syncNode(nodeId),
   },
 );
+
+/** Interactive steps (attach tickets, reopen, cancel): `Context.services.runtimeSteps`. */
+export const runtimeStepServices = createRuntimeStepServices({
+  engine: runtimeLifecycle,
+  relay: {
+    operatorStepTerminal: (stepId, userId) =>
+      relaySessionManager.operatorStepTerminal(stepId, userId),
+  },
+  tickets: terminalTicketStore,
+});
 
 /** Terminal tickets and node commands (exec.*): `Context.services.nodeOperator`. */
 const nodeOperator = createNodeOperatorServices(relay, {

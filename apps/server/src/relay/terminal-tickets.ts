@@ -2,7 +2,9 @@
  * One-use tickets for the browser terminal socket. `nodes.terminals.openTicket` and
  * `nodes.queued.run` mint one for a signed-in person's Better Auth session; the socket's
  * `open` redeems it (`terminal-websocket.ts`), which names the node and the terminal id the
- * procedure already audited.
+ * procedure already audited. `runtimes.steps.attach` mints an attach ticket instead: bound to
+ * one interactive step and the operator terminal the node opened for it, so the socket attaches
+ * to that terminal rather than opening a shell.
  *
  * In memory, single process (the relay sockets live here too). A ticket is bound to its user
  * AND session, expires after {@link TERMINAL_TICKET_TTL_MS} and is gone after its first
@@ -23,8 +25,14 @@ type TicketEntry = {
   impersonatedBy: string | null;
   nodeId: string;
   terminalId: string;
+  /** Set for an attach ticket: the interactive step whose operator terminal it names. */
+  stepId: string | null;
   expiresAt: number;
 };
+
+export type RedeemedTerminalTicket =
+  | { kind: "open"; nodeId: string; terminalId: string }
+  | { kind: "attach"; nodeId: string; terminalId: string; stepId: string };
 
 export type MintedTerminalTicket = { ticket: string; terminalId: string; expiresAt: Date };
 
@@ -46,6 +54,8 @@ export class TerminalTicketStore {
     sessionId: string;
     impersonatedBy?: string | null;
     nodeId: string;
+    /** An attach ticket: the step and its operator terminal (otherwise a new id is minted). */
+    attach?: { stepId: string; terminalId: string };
   }): MintedTerminalTicket {
     const now = this.now();
     this.prune(now);
@@ -54,7 +64,7 @@ export class TerminalTicketStore {
       this.byDigest.delete(key);
     }
     const ticket = randomBytes(32).toString("base64url");
-    const terminalId = randomBytes(16).toString("base64url");
+    const terminalId = input.attach?.terminalId ?? randomBytes(16).toString("base64url");
     const expiresAt = now + this.ttlMs;
     this.byDigest.set(digest(ticket), {
       userId: input.userId,
@@ -62,6 +72,7 @@ export class TerminalTicketStore {
       impersonatedBy: input.impersonatedBy ?? null,
       nodeId: input.nodeId,
       terminalId,
+      stepId: input.attach?.stepId ?? null,
       expiresAt,
     });
     return { ticket, terminalId, expiresAt: new Date(expiresAt) };
@@ -75,7 +86,7 @@ export class TerminalTicketStore {
     ticket: string;
     userId: string;
     sessionId: string;
-  }): { nodeId: string; terminalId: string } | null {
+  }): RedeemedTerminalTicket | null {
     if (!TERMINAL_TICKET_PATTERN.test(input.ticket)) return null;
     const key = digest(input.ticket);
     const entry = this.byDigest.get(key);
@@ -83,7 +94,14 @@ export class TerminalTicketStore {
     this.byDigest.delete(key);
     if (entry.expiresAt <= this.now()) return null;
     if (entry.userId !== input.userId || entry.sessionId !== input.sessionId) return null;
-    return { nodeId: entry.nodeId, terminalId: entry.terminalId };
+    return entry.stepId === null
+      ? { kind: "open", nodeId: entry.nodeId, terminalId: entry.terminalId }
+      : {
+          kind: "attach",
+          nodeId: entry.nodeId,
+          terminalId: entry.terminalId,
+          stepId: entry.stepId,
+        };
   }
 
   /**
