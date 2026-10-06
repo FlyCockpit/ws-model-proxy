@@ -98,7 +98,27 @@ impl FakeVllm {
     }
 }
 
+/// How a fake engine connection ended.
+#[derive(PartialEq, Eq)]
+enum Ended {
+    /// The WebSocket handshake never completed.
+    NeverOpened,
+    /// The script dropped the socket.
+    ByEngine,
+    /// The client closed or reset the connection. A reset can surface on
+    /// the engine's next write rather than its next read (Windows reports
+    /// it on `send` when the client closes with unread data), so a failed
+    /// write counts too: this fake never closes the socket on its own then.
+    ByClient,
+}
+
 fn serve_realtime(stream: TcpStream, script: &Script, seen: &Mutex<VllmSeen>) {
+    if serve_connection(stream, script, seen) == Ended::ByClient {
+        seen.lock().expect("seen").hung_up += 1;
+    }
+}
+
+fn serve_connection(stream: TcpStream, script: &Script, seen: &Mutex<VllmSeen>) -> Ended {
     let authorization = Arc::new(Mutex::new(None));
     let capture = Arc::clone(&authorization);
     // The `Err` type is tungstenite's `Callback` contract, not ours.
@@ -113,7 +133,7 @@ fn serve_realtime(stream: TcpStream, script: &Script, seen: &Mutex<VllmSeen>) {
         Ok(response)
     };
     let Ok(mut socket) = tungstenite::accept_hdr(stream, callback) else {
-        return;
+        return Ended::NeverOpened;
     };
     {
         let mut seen = seen.lock().expect("seen");
@@ -128,7 +148,7 @@ fn serve_realtime(stream: TcpStream, script: &Script, seen: &Mutex<VllmSeen>) {
         &mut socket,
         serde_json::json!({"type": "session.created", "id": "sess-1", "created": 1}),
     ) {
-        return;
+        return Ended::ByClient;
     }
     let mut validated = false;
     // Samples queued before the generation starts belong to it.
@@ -158,8 +178,7 @@ fn serve_realtime(stream: TcpStream, script: &Script, seen: &Mutex<VllmSeen>) {
         let text = match socket.read() {
             Ok(Message::Text(text)) => text,
             Ok(Message::Close(_)) | Err(_) => {
-                seen.lock().expect("seen").hung_up += 1;
-                return;
+                return Ended::ByClient;
             }
             Ok(_) => continue,
         };
@@ -174,7 +193,7 @@ fn serve_realtime(stream: TcpStream, script: &Script, seen: &Mutex<VllmSeen>) {
                     &mut socket,
                     serde_json::json!({"type": "error", "error": "no such model", "code": "model_not_found"}),
                 ) {
-                    return;
+                    return Ended::ByClient;
                 }
             }
             "input_audio_buffer.append" => {
@@ -190,7 +209,7 @@ fn serve_realtime(stream: TcpStream, script: &Script, seen: &Mutex<VllmSeen>) {
                     seen.appends
                 };
                 if script.drop_on_append == Some(appends) {
-                    return;
+                    return Ended::ByEngine;
                 }
                 if script.fail_on_append == Some(appends) {
                     generation = None;
@@ -198,7 +217,7 @@ fn serve_realtime(stream: TcpStream, script: &Script, seen: &Mutex<VllmSeen>) {
                         &mut socket,
                         serde_json::json!({"type": "error", "error": "boom ERRMARKER", "code": "processing_error"}),
                     ) {
-                        return;
+                        return Ended::ByClient;
                     }
                     continue;
                 }
@@ -213,12 +232,12 @@ fn serve_realtime(stream: TcpStream, script: &Script, seen: &Mutex<VllmSeen>) {
                     &mut socket,
                     serde_json::json!({"type": "transcription.delta", "delta": script.delta}),
                 ) {
-                    return;
+                    return Ended::ByClient;
                 }
                 if script.end_after_appends == Some(running.1) {
                     let ended = generation.take().expect("running");
                     if !done(&mut socket, ended) {
-                        return;
+                        return Ended::ByClient;
                     }
                     queued = 0;
                 }
@@ -251,14 +270,13 @@ fn serve_realtime(stream: TcpStream, script: &Script, seen: &Mutex<VllmSeen>) {
                             ) => {}
                         Ok(_) => {}
                         Err(_) => {
-                            seen.lock().expect("seen").hung_up += 1;
-                            return;
+                            return Ended::ByClient;
                         }
                     }
                 }
                 let _ = socket.get_ref().set_read_timeout(None);
                 if !done(&mut socket, ended) {
-                    return;
+                    return Ended::ByClient;
                 }
                 queued = 0;
             }
@@ -268,7 +286,7 @@ fn serve_realtime(stream: TcpStream, script: &Script, seen: &Mutex<VllmSeen>) {
                         &mut socket,
                         serde_json::json!({"type": "error", "error": "not validated", "code": "model_not_validated"}),
                     ) {
-                        return;
+                        return Ended::ByClient;
                     }
                 } else if generation.is_none() {
                     generation = Some((queued, 0, String::new()));
@@ -280,7 +298,7 @@ fn serve_realtime(stream: TcpStream, script: &Script, seen: &Mutex<VllmSeen>) {
                     &mut socket,
                     serde_json::json!({"type": "error", "error": format!("Unknown event type: {other}"), "code": "unknown_event"}),
                 ) {
-                    return;
+                    return Ended::ByClient;
                 }
             }
         }
