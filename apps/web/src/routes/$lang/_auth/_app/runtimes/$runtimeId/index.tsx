@@ -251,6 +251,7 @@ function ServedModelRow({ runtime, model }: { runtime: RuntimeDetail; model: Ser
 
 function InstancesCard({ runtime }: { runtime: RuntimeDetail }) {
   const { t } = useTranslation(["dashboard", "common"]);
+  const { lang } = Route.useParams();
   const invalidate = useRuntimeInvalidation();
   const [starting, setStarting] = useState<{ instanceId?: string } | null>(null);
   const stop = useMutation({
@@ -292,6 +293,15 @@ function InstancesCard({ runtime }: { runtime: RuntimeDetail }) {
                       </StatusPill>
                     ) : null}
                   </p>
+                  {instance.needsOperator === "STEP" ? (
+                    <Link
+                      to="/$lang/terminals"
+                      params={{ lang }}
+                      className="inline-flex min-h-11 items-center text-sm underline underline-offset-4"
+                    >
+                      {t("dashboard:runtime.answerInTerminals")}
+                    </Link>
+                  ) : null}
                   <p className="break-all text-xs text-muted-foreground">
                     v{instance.versionNumber}
                     {instance.ranks.map(

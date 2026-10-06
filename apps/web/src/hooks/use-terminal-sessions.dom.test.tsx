@@ -36,6 +36,7 @@ import {
 
 import {
   agentInputAllowed,
+  STEP_DETACHED,
   TERMINAL_GONE,
   type TerminalOutputEvent,
   type TerminalTab,
@@ -1986,5 +1987,62 @@ describe("useTerminalSessions terminal tickets", () => {
     act(() => handlers().onOpen?.());
     await settle();
     expect(sentOfType("open")).toHaveLength(1);
+  });
+});
+
+describe("useTerminalSessions operator-terminal tabs (runtimes.steps.attach)", () => {
+  async function openStepTab() {
+    currentCli = await fakeCli();
+    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+    const listed = await listedCli(currentCli);
+    message({ type: "terminals", clis: [listed], terminals: [] });
+    await openAfterList(
+      () =>
+        view.result.current.openTicket({ cliDeviceId: CLI_ID, ticket: TICKET, stepId: "step-1" }),
+      [listed],
+    );
+    await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
+    message({
+      type: "opening",
+      terminalId: TERMINAL_ID,
+      viewerId: VIEWER_ID,
+      requestId: sentOfType("open")[0]?.requestId,
+    });
+    const localId = view.result.current.tabs[0]?.localId ?? "";
+    return { view, listed, localId };
+  }
+
+  it("keeps the tab through lists, which never name operator terminals", async () => {
+    const { view, listed } = await openStepTab();
+    expect(view.result.current.tabs[0]?.stepId).toBe("step-1");
+    message({ type: "terminals", pushed: true, clis: [listed], terminals: [] });
+    await act(async () => {
+      const refreshed = view.result.current.refreshClis();
+      handlers().onMessage({ type: "terminals", clis: [listed], terminals: [] });
+      await refreshed;
+    });
+    expect(view.result.current.tabs).toHaveLength(1);
+    expect(view.result.current.tabs[0]?.phase).toBe("opening");
+  });
+
+  it("asks for a fresh attach from the step after a reconnect, never re-attaching by id", async () => {
+    const { view, listed } = await openStepTab();
+    act(() => handlers().onDisconnect?.());
+    act(() => handlers().onOpen?.());
+    message({ type: "terminals", clis: [listed], terminals: [] });
+    await settle();
+    expect(view.result.current.tabs[0]).toMatchObject({
+      phase: "rejected",
+      rejectionReason: STEP_DETACHED,
+    });
+    expect(sentOfType("attach")).toEqual([]);
+  });
+
+  it("detaches with X and never closes an operator terminal", async () => {
+    const { view, localId } = await openStepTab();
+    act(() => view.result.current.detachTab(localId));
+    expect(sentOfType("close")).toEqual([]);
+    expect(sentOfType("detach")).toEqual([{ type: "detach", terminalId: TERMINAL_ID }]);
+    expect(view.result.current.tabs).toEqual([]);
   });
 });

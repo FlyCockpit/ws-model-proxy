@@ -134,6 +134,12 @@ export type TerminalTab = {
   supervised: SupervisedInfo | null;
   /** The recipe step from the relay's list (deployment terminals only). */
   deployment: DeploymentTerminalInfo | null;
+  /**
+   * The interactive runtime step whose operator terminal this tab attached to
+   * (`runtimes.steps.attach`), or null for a shell. An operator terminal ends
+   * with its command; it is cancelled by its step, never by End session.
+   */
+  stepId: string | null;
   /** The CLI-reported output review flag; null until the CLI reports it. */
   reviewOutput: boolean | null;
   /** The capture awaiting this person's review, once the CLI sent it. */
@@ -286,6 +292,9 @@ function patchTab(
   return changed ? next : tabs;
 }
 
+/** A step's operator-terminal tab lost its attachment: attach again from the step. */
+export const STEP_DETACHED = "step_detached";
+
 function newTab(input: {
   localId: string;
   terminalId: string | null;
@@ -297,6 +306,7 @@ function newTab(input: {
   origin?: TerminalOrigin;
   supervised?: SupervisedInfo | null;
   deployment?: DeploymentTerminalInfo | null;
+  stepId?: string | null;
 }): TerminalTab {
   const origin = input.origin ?? "user";
   return {
@@ -304,6 +314,7 @@ function newTab(input: {
     origin,
     supervised: input.supervised ?? null,
     deployment: input.deployment ?? null,
+    stepId: input.stepId ?? null,
     reviewOutput: null,
     reviewCapture: null,
     exitCode: null,
@@ -328,6 +339,8 @@ export type OpenTicketInput = {
   ticket: string;
   /** Typed into the shell once it shows output; never with a newline. */
   typedCommand?: string;
+  /** An attach ticket for this interactive step's operator terminal. */
+  stepId?: string;
 };
 
 export type UseTerminalSessionsOptions = {
@@ -1223,7 +1236,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         // A terminal with a close out is settled by the close's own answers.
         for (const tab of tabsRef.current) {
           const terminalId = tab.terminalId;
-          if (!terminalId || listed.has(terminalId)) continue;
+          // Operator terminals are never listed: their tabs end by exit, never by a list.
+          if (!terminalId || tab.stepId || listed.has(terminalId)) continue;
           if (closesRef.current.has(terminalId)) continue;
           const settled =
             pickedToAttach(tab.origin) || tab.phase === "live" || tab.phase === "waiting";
@@ -1244,7 +1258,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       }
       for (const tab of tabsRef.current) {
         const terminalId = tab.terminalId;
-        if (!terminalId || listed.has(terminalId)) continue;
+        if (!terminalId || tab.stepId || listed.has(terminalId)) continue;
         if (tab.phase === "exited" || tab.phase === "rejected") continue;
         const knownSince = knownSinceRef.current.get(terminalId);
         if (knownSince === undefined || knownSince >= requestedAt) continue;
@@ -1535,6 +1549,16 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         // `self` answers this tab's own detach; the tab is already gone.
         if (message.reason === "self") return;
         dropSession(tab.localId, message.terminalId);
+        if (tab.stepId) {
+          // Re-attaching an operator terminal needs a fresh ticket from its step.
+          patchTabNow(tab.localId, {
+            phase: "rejected",
+            rejectionReason: STEP_DETACHED,
+            error: null,
+            writer: "none",
+          });
+          return;
+        }
         setView(
           tab.localId,
           { writer: "none" },
@@ -1710,6 +1734,18 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         // The relay drops a closed socket's Decline: its answer never comes.
         const decline = tab.decline === "sent" ? ("unsent" as const) : tab.decline;
         if (!tab.terminalId && tab.phase === "opening") return [];
+        // An operator terminal is re-attached only with a fresh ticket from its step.
+        if (tab.stepId && (tab.phase === "live" || tab.phase === "opening")) {
+          return [
+            {
+              ...tab,
+              phase: "rejected" as const,
+              rejectionReason: STEP_DETACHED,
+              error: null,
+              writer: "none" as const,
+            },
+          ];
+        }
         if (tab.phase === "live" || tab.phase === "opening") {
           return [
             {
@@ -1948,12 +1984,13 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   }, [requestList, socketStatusRef]);
 
   const startOpen = useCallback(
-    ({ cliDeviceId, ticket, typedCommand }: OpenTicketInput) => {
+    ({ cliDeviceId, ticket, typedCommand, stepId }: OpenTicketInput) => {
       if (!readyRef.current) return;
       const tab = newTab({
         localId: newId("local"),
         terminalId: null,
         cliDeviceId,
+        stepId: stepId ?? null,
         cols: 80,
         rows: 24,
         opener: true,
@@ -2018,7 +2055,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         return;
       }
       if (tab.terminalId && tab.phase !== "exited" && tab.phase !== "rejected") {
-        if (tab.opener && tab.phase !== "live") {
+        // An operator terminal is never closed from a tab (its step is cancelled instead).
+        if (tab.opener && tab.phase !== "live" && !tab.stepId) {
           // An open that never went live has no other viewers: cancel it
           // outright, and keep at it until the relay confirms.
           requestClose(tab.terminalId, null);

@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
+import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
@@ -16,6 +17,7 @@ import { useTranslation } from "react-i18next";
 import { CodeSnippet } from "@/components/code-snippet";
 import { InlineRetry } from "@/components/inline-retry";
 import { PageHeading } from "@/components/page-stub";
+import { OperatorStepItem } from "@/components/runtimes/operator-step-item";
 import { TerminalPane } from "@/components/terminal-pane";
 import { TimeAgo } from "@/components/time-ago";
 import {
@@ -54,6 +56,7 @@ const KNOWN_REJECTIONS: ReadonlySet<string> = new Set([
   "ticket_invalid",
   "declined",
   "bad_handshake",
+  "step_detached",
 ]);
 
 type Sessions = ReturnType<typeof useTerminalSessions>;
@@ -70,6 +73,7 @@ function TerminalsPage() {
     <div className="flex min-w-0 flex-col gap-6">
       <PageHeading page="terminals" />
       <TerminalWorkspace sessions={sessions} slugOf={slugOf} />
+      <WaitingSteps sessions={sessions} ready={ready} slugOf={slugOf} />
       <QueuedCommands ready={ready} openTerminal={sessions.openTicket} slugOf={slugOf} />
       <TerminalNodes ready={ready} openTerminal={sessions.openTicket} />
     </div>
@@ -192,7 +196,8 @@ function TabStatus({ sessions, tab }: { sessions: Sessions; tab: TerminalTab }) 
                     .join(" · ")}
         </p>
         <div className="flex flex-wrap gap-2">
-          {ended ? null : (
+          {/* An operator terminal ends with its command, or by its step's Cancel. */}
+          {ended || tab.stepId ? null : (
             <Button
               type="button"
               variant="outline"
@@ -308,6 +313,172 @@ function TerminalNodes({ ready, openTerminal }: { ready: boolean; openTerminal: 
         )}
       </CardContent>
     </Card>
+  );
+}
+
+type NeedsYouItem = Awaited<
+  ReturnType<AppRouterClient["activity"]["needsYou"]["list"]>
+>["items"][number];
+
+/** `runtimes.steps.*` refusals with their own copy (the error's `data.code`). */
+const STEP_REFUSALS: ReadonlySet<string> = new Set([
+  "not_interactive",
+  "not_waiting",
+  "running",
+  "superseded",
+  "terminal_closed",
+  "terminal_unavailable",
+]);
+
+function stepRefusalText(error: unknown, t: (key: string) => string): string {
+  const data =
+    typeof error === "object" && error !== null && "data" in error
+      ? (error as { data: unknown }).data
+      : null;
+  const code =
+    typeof data === "object" && data !== null && "code" in data
+      ? (data as { code: unknown }).code
+      : null;
+  return typeof code === "string" && STEP_REFUSALS.has(code)
+    ? t(`terminals:steps.refusal.${code}`)
+    : refusalText(error);
+}
+
+/**
+ * Interactive runtime steps waiting for their person (also on Relay-only nodes): Open terminal
+ * attaches to the operator terminal the node opened for the step; Run again opens a fresh one
+ * after it closed; Cancel step gives up on it.
+ */
+function WaitingSteps({
+  sessions,
+  ready,
+  slugOf,
+}: {
+  sessions: Sessions;
+  ready: boolean;
+  slugOf: (nodeId: string) => string | undefined;
+}) {
+  const { t } = useTranslation(["terminals"]);
+  const needs = useQuery({
+    ...orpc.activity.needsYou.list.queryOptions(),
+    refetchInterval: STEP_REFRESH_MS,
+  });
+  const items = (needs.data?.items ?? []).filter(
+    (item): item is NeedsYouItem & { stepId: string } =>
+      item.need === "STEP" && item.stepId !== null,
+  );
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">{t("terminals:steps.title")}</CardTitle>
+        <CardDescription>{t("terminals:steps.description")}</CardDescription>
+      </CardHeader>
+      <CardContent className="flex min-w-0 flex-col divide-y">
+        {needs.isPending ? (
+          <Skeleton aria-hidden="true" className="h-24 w-full" />
+        ) : needs.isError ? (
+          <InlineRetry message={t("terminals:steps.loadFailed")} onRetry={() => needs.refetch()} />
+        ) : items.length === 0 ? (
+          <p className="text-sm text-muted-foreground">{t("terminals:steps.empty")}</p>
+        ) : (
+          items.map((item) => (
+            <WaitingStep
+              key={item.stepId}
+              item={item}
+              sessions={sessions}
+              ready={ready}
+              slugOf={slugOf}
+            />
+          ))
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+const STEP_REFRESH_MS = 5_000;
+
+function WaitingStep({
+  item,
+  sessions,
+  ready,
+  slugOf,
+}: {
+  item: NeedsYouItem & { stepId: string };
+  sessions: Sessions;
+  ready: boolean;
+  slugOf: (nodeId: string) => string | undefined;
+}) {
+  const { t } = useTranslation(["terminals"]);
+  const queryClient = useQueryClient();
+  const runtime = useQuery({
+    ...orpc.runtimes.get.queryOptions({ input: { runtimeId: item.runtimeId } }),
+    refetchInterval: STEP_REFRESH_MS,
+  });
+  const instance = runtime.data?.instanceList.find((row) => row.id === item.instanceId);
+  const step = instance?.openSteps.find((row) => row.id === item.stepId);
+  // The node of the step's rank: the node whose identity the attach handshake checks.
+  const nodeId = step
+    ? (instance?.ranks.find((rank) => rank.nodeNumber === step.nodeNumber)?.nodeId ?? null)
+    : null;
+  // This page already views the step's terminal: Open terminal shows that tab.
+  const openTab = sessions.tabs.find(
+    (tab) => tab.stepId === item.stepId && tab.phase !== "exited" && tab.phase !== "rejected",
+  );
+  const invalidate = async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: orpc.activity.needsYou.list.key() }),
+      queryClient.invalidateQueries({
+        queryKey: orpc.runtimes.get.key({ input: { runtimeId: item.runtimeId } }),
+      }),
+    ]);
+  };
+  const attach = useMutation(
+    orpc.runtimes.steps.attach.mutationOptions({
+      onSuccess: (data) => {
+        if (nodeId)
+          sessions.openTicket({ cliDeviceId: nodeId, ticket: data.ticket, stepId: item.stepId });
+      },
+      onError: (error) => toast.error(stepRefusalText(error, t)),
+      onSettled: invalidate,
+    }),
+  );
+  const reopen = useMutation(
+    orpc.runtimes.steps.reopen.mutationOptions({
+      onSuccess: () => toast.success(t("terminals:steps.reopened")),
+      onError: (error) => toast.error(stepRefusalText(error, t)),
+      onSettled: invalidate,
+    }),
+  );
+  const cancel = useMutation(
+    orpc.runtimes.steps.cancel.mutationOptions({
+      onSuccess: () => toast.success(t("terminals:steps.cancelled")),
+      onError: (error) => toast.error(stepRefusalText(error, t)),
+      onSettled: invalidate,
+    }),
+  );
+  if (runtime.isPending) return <Skeleton aria-hidden="true" className="my-3 h-24 w-full" />;
+  if (runtime.isError)
+    return (
+      <InlineRetry message={t("terminals:steps.loadFailed")} onRetry={() => runtime.refetch()} />
+    );
+  // The step moved on since the list was read; the next refresh drops it.
+  if (!step) return null;
+  return (
+    <OperatorStepItem
+      step={step}
+      runtimeName={item.runtimeName}
+      nodeLabel={(nodeId ? slugOf(nodeId) : undefined) ?? t("terminals:unknownNode")}
+      since={item.since}
+      ready={ready && nodeId !== null}
+      busy={attach.isPending || reopen.isPending || cancel.isPending}
+      onAttach={() => {
+        if (openTab) sessions.selectTab(openTab.localId);
+        else attach.mutate({ stepId: step.id, ...INITIAL_SIZE });
+      }}
+      onReopen={() => reopen.mutate({ stepId: step.id })}
+      onCancel={() => cancel.mutate({ stepId: step.id })}
+    />
   );
 }
 

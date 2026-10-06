@@ -1122,6 +1122,7 @@
         "unhealthyRestartMs": "Restart after unhealthy for",
         "unavailableStopMs": "Stop other nodes after one is offline for"
       }
-    }
+    },
+    "answerInTerminals": "Answer it on the Terminals page"
   }
 }
