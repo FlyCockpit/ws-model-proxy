@@ -530,9 +530,9 @@ mod tests {
             Some(r"C:"),
             Some(r"C:\Win\..\Temp"),
             Some(r"C:\Temp:stream"),
-            Some("C:\\Win\"dows"),
+            Some("C:\\Win\"x"),
             Some(r"C:\%TEMP%"),
-            Some("C:\\Win\ndows"),
+            Some("C:\\Win\nx"),
         ] {
             assert_eq!(rundll32_path(odd), fallback, "{odd:?}");
         }
