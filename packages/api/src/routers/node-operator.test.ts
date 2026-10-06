@@ -216,6 +216,34 @@ describe("node commands", () => {
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
   });
 
+  it("runs and settles an OAuth agent's command under its grant (one credential per row)", async () => {
+    const oauth: CallerAuth = {
+      kind: "oauth_access_token",
+      userId: FULL_AGENT.userId,
+      grantId: "grant-1",
+      level: "FULL",
+    };
+    const ops = operator();
+    ops.startCommand.mockRejectedValue(new Error("socket closed"));
+    db.node.findFirst.mockResolvedValue(fullNode as never);
+    const oauthRow = { ...commandRow, agentTokenId: null, mcpGrantId: "grant-1" };
+    db.nodeCommand.create.mockResolvedValue(oauthRow as never);
+    db.nodeCommand.updateMany.mockResolvedValue({ count: 1 });
+    await expect(client(oauth, ops).commands.run(runInput)).rejects.toMatchObject({
+      data: { reason: "node_offline" },
+    });
+    expect(db.nodeCommand.create.mock.calls[0]?.[0].data).toMatchObject({
+      actor: "AGENT",
+      agentTokenId: null,
+      mcpGrantId: "grant-1",
+    });
+    expect(db.nodeAuditEvent.create.mock.calls[0]?.[0].data).toMatchObject({
+      actor: "AGENT",
+      agentTokenId: null,
+      mcpGrantId: "grant-1",
+    });
+  });
+
   it("settles a finished command once and appends its audit event", async () => {
     const ops = operator();
     ops.pollCommand.mockResolvedValue({ state: "SUCCEEDED", exitCode: 0, output: "done" });

@@ -170,6 +170,31 @@ describe("command log", () => {
     expect(db.agentToken.findMany.mock.calls[0]?.[0]?.where).toMatchObject({ userId: "owner" });
   });
 
+  it("names an OAuth agent by its client (rows that name the grant)", async () => {
+    db.nodeCommand.findMany.mockResolvedValue([
+      {
+        id: "BBBBBBBBBBBBBBBBBBBBBB",
+        createdAt: t0,
+        nodeId: "node1",
+        actor: "AGENT",
+        agentTokenId: null,
+        mcpGrantId: "grant1",
+        subject: "hmac-sha256:abc ls",
+        state: "SUCCEEDED",
+        exitCode: 0,
+        startedAt: t0,
+        endsBy: new Date(t0.getTime() + 60_000),
+        finishedAt: new Date(t0.getTime() + 5_000),
+        Node: { slug: "box" },
+      },
+    ] as never);
+    db.mcpGrant.findMany.mockResolvedValue([{ id: "grant1", clientId: "cli-x" }] as never);
+    db.oauthClient.findMany.mockResolvedValue([{ clientId: "cli-x", name: "Codex" }] as never);
+    const page = await client().commands.list({ limit: 50 });
+    expect(page.items[0]).toMatchObject({ agentTokenId: null, agentTokenName: "Codex" });
+    expect(db.mcpGrant.findMany.mock.calls[0]?.[0]?.where).toMatchObject({ userId: "owner" });
+  });
+
   it("is a session procedure: no agent tokens", async () => {
     await expect(client(AGENT).commands.list({ limit: 5 })).rejects.toMatchObject({
       code: "NOT_FOUND",

@@ -8,6 +8,7 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import type { Context } from "../context";
 import { contractProcedure } from "../contract-procedure";
 import { nodesContract as c } from "../contracts/nodes";
+import { loadAgentNames } from "../lib/agent-names";
 import { assertMayWrite, callerActor } from "../lib/caller-actor";
 import { graphDelete, graphWrite } from "../lib/graph-write";
 import {
@@ -479,6 +480,7 @@ export const nodeProcedures = {
         ...(input.cursor ? { cursor: { id: input.cursor }, skip: 1 } : {}),
       });
       const page = rows.slice(0, input.limit);
+      const agentName = await loadAgentNames(userId, page);
       return {
         items: page.map((row) => ({
           id: row.id,
@@ -486,6 +488,7 @@ export const nodeProcedures = {
           nodeId: row.nodeId,
           actor: row.actor,
           agentTokenId: row.agentTokenId,
+          agentName: agentName(row),
           kind: row.kind,
           subject: row.subject,
           outcome: row.outcome,

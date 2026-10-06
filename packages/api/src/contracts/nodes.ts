@@ -224,6 +224,8 @@ export const nodeAuditEventSchema = z
     nodeId: idSchema,
     actor: z.enum(ACTOR),
     agentTokenId: idSchema.nullable(),
+    /** The agent token's name, or the OAuth client's name; null for people. */
+    agentName: z.string().nullable(),
     kind: z.enum(NODE_AUDIT_KIND),
     /** File path, `hmac-sha256:<hex> <program>` for commands, `runtime:<id>@<version>`. */
     subject: z.string(),

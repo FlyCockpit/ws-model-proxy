@@ -24,8 +24,6 @@ const SOURCES = ["ALL", "API_KEY", "TEST", "AGENT_TEST", "SIDECAR"] as const;
 type StatusFilter = (typeof STATUSES)[number];
 type SourceFilter = (typeof SOURCES)[number];
 const PAGE = 50;
-/** The server's bound per delete call (`activity.requests.delete`). */
-const CLEAR_BATCH = 5_000;
 const KNOWN_REASONS = new Set([
   "over_capacity",
   "wait_expired",
@@ -73,7 +71,8 @@ function ActivityRequestsPage() {
     }),
   );
   const deleteBatch = useMutation(orpc.activity.requests.delete.mutationOptions());
-  // The server deletes in bounded batches; keep going until a batch comes back short.
+  // The server deletes in bounded batches and skips rows a finalizer holds (a batch can come
+  // back short while more remain), so keep going until a batch deletes nothing.
   // `before` runs a minute ahead so a slow browser clock still covers finished rows (running
   // ones are never deleted).
   const clear = useMutation({
@@ -83,7 +82,7 @@ function ActivityRequestsPage() {
       for (let batch = 0; batch < 100; batch += 1) {
         const { deleted } = await deleteBatch.mutateAsync({ before });
         total += deleted;
-        if (deleted < CLEAR_BATCH) break;
+        if (deleted === 0) break;
       }
       return total;
     },

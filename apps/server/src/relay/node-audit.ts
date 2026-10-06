@@ -80,6 +80,8 @@ export type NodeAuditEventInput = {
   nodeId: string;
   actor: NodeAuditActor;
   agentTokenId?: string | null;
+  /** An OAuth client's grant (at most one of agentTokenId / mcpGrantId; hardening CHECK). */
+  mcpGrantId?: string | null;
   kind: NodeAuditKind;
   /** File path, `hmac-sha256:<hex> <program>` for commands, `runtime:<id>@<version>`, ... */
   subject: string;
@@ -146,6 +148,7 @@ function toRow(event: NodeAuditEventInput): AuditRow | null {
     nodeId: text(event.nodeId, ID_MAX),
     actor: event.actor,
     agentTokenId: optionalText(event.agentTokenId, ID_MAX),
+    mcpGrantId: optionalText(event.mcpGrantId, ID_MAX),
     kind: event.kind,
     subject: text(typeof event.subject === "string" ? event.subject : "", SUBJECT_MAX),
     etagBefore: optionalText(event.etagBefore, ETAG_MAX),

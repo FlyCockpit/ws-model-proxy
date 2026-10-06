@@ -211,6 +211,8 @@ async function loadPlanInput(context: Context, userId: string, profileId: string
       id: true,
       Nodes: { select: { nodeId: true, hold: true, holdNote: true } },
       Items: {
+        // Deterministic: which item a running instance counts toward follows this order.
+        orderBy: { position: "asc" },
         select: {
           id: true,
           position: true,

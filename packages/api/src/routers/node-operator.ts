@@ -127,6 +127,7 @@ const commandSelect = {
   userId: true,
   actor: true,
   agentTokenId: true,
+  mcpGrantId: true,
   subject: true,
   state: true,
   exitCode: true,
@@ -171,6 +172,7 @@ async function settleCommand(
     userId: string;
     actor: "USER" | "AGENT" | "SYSTEM";
     agentTokenId: string | null;
+    mcpGrantId: string | null;
     subject: string;
   },
   state: Exclude<CommandState, "RUNNING">,
@@ -203,6 +205,7 @@ async function settleCommand(
         nodeId: row.nodeId,
         actor: row.actor,
         agentTokenId: row.agentTokenId,
+        mcpGrantId: row.mcpGrantId,
         kind: "command",
         subject: row.subject,
         exitCode: storedExit,
@@ -228,6 +231,7 @@ async function pollAndSettle(
     userId: string;
     actor: "USER" | "AGENT" | "SYSTEM";
     agentTokenId: string | null;
+    mcpGrantId: string | null;
     subject: string;
   },
   waitMs: number,

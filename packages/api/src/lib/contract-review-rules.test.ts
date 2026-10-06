@@ -138,6 +138,16 @@ describe("preview fingerprint", () => {
     ).not.toBe(base);
     expect(previewFingerprint({ ...preview, holds: [] })).not.toBe(base);
   });
+
+  it("ignores warnings (advice, some from live metrics) so a preview stays confirmable", () => {
+    const base = previewFingerprint(preview);
+    expect(
+      previewFingerprint({
+        ...preview,
+        warnings: [{ code: "low_free_memory", nodeId: "x", detail: "4 GB free" }],
+      }),
+    ).toBe(base);
+  });
 });
 
 describe("invite acceptance", () => {

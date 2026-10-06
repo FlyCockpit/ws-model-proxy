@@ -13,6 +13,7 @@ import type { z } from "zod";
 import { contractProcedure, stub } from "../contract-procedure";
 import { activityContract as c, type requestRowSchema } from "../contracts/activity";
 import { callableIdOf } from "../lib/access-views";
+import { loadAgentNames } from "../lib/agent-names";
 import { programOfSubject } from "../lib/command-audit";
 
 type RequestRow = z.infer<typeof requestRowSchema>;
@@ -229,6 +230,7 @@ const commands = {
         nodeId: true,
         actor: true,
         agentTokenId: true,
+        mcpGrantId: true,
         subject: true,
         state: true,
         exitCode: true,
@@ -239,16 +241,8 @@ const commands = {
       },
     });
     const page = rows.slice(0, input.limit);
-    const tokenIds = [
-      ...new Set(page.flatMap((row) => (row.agentTokenId ? [row.agentTokenId] : []))),
-    ];
-    const tokens = tokenIds.length
-      ? await prisma.agentToken.findMany({
-          where: { id: { in: tokenIds }, userId },
-          select: { id: true, name: true },
-        })
-      : [];
-    const tokenName = new Map(tokens.map((token) => [token.id, token.name]));
+    // An agent token's name, or an OAuth client's name for rows that name its grant.
+    const agentName = await loadAgentNames(userId, page);
     const last = page.at(-1);
     return {
       items: page.map((row) => ({
@@ -257,7 +251,7 @@ const commands = {
         nodeSlug: row.Node.slug,
         actor: row.actor,
         agentTokenId: row.agentTokenId,
-        agentTokenName: row.agentTokenId ? (tokenName.get(row.agentTokenId) ?? null) : null,
+        agentTokenName: agentName(row),
         program: programOfSubject(row.subject),
         state: row.state,
         exitCode: row.exitCode,

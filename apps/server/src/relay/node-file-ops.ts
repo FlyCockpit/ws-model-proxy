@@ -186,6 +186,8 @@ export const NODE_AUDIT_UNKNOWN_NODE = "unknown";
 type FileAudit = {
   userId: string;
   tokenId: string;
+  /** Which credential `tokenId` names: an agent token or an OAuth grant. */
+  credentialKind: FileOpCredentialKind;
   nodeId: string;
   kind: NodeAuditKind;
   path: string;
@@ -222,6 +224,7 @@ function newFileAudit(input: RunFileOpInput): FileAudit {
   return {
     userId: input.userId,
     tokenId: input.tokenId,
+    credentialKind: input.credentialKind ?? "agent_token",
     nodeId: input.nodeId,
     kind: FILE_AUDIT_KINDS[input.op],
     path: auditPathOf(input.args),
@@ -275,6 +278,7 @@ function auditOutcomeOf(
 export function auditRefusedFileInput(input: {
   userId: string;
   tokenId: string;
+  credentialKind?: FileOpCredentialKind;
   nodeId: string;
   op: FileOp;
   args: unknown;
@@ -299,7 +303,8 @@ function recordFileAudit(audit: FileAudit, outcome: FileOpOutcome): void {
     userId: audit.userId,
     nodeId: audit.nodeVerified ? audit.nodeId : NODE_AUDIT_UNKNOWN_NODE,
     actor: "AGENT",
-    agentTokenId: audit.tokenId,
+    agentTokenId: audit.credentialKind === "agent_token" ? audit.tokenId : null,
+    mcpGrantId: audit.credentialKind === "oauth_grant" ? audit.tokenId : null,
     kind: audit.kind,
     subject: audit.path,
     etagBefore: audit.etagBefore,
@@ -478,9 +483,13 @@ function newRecord(input: {
   return record;
 }
 
+export type FileOpCredentialKind = "agent_token" | "oauth_grant";
+
 export type RunFileOpInput = {
   userId: string;
+  /** The agent token id, or the OAuth grant id when `credentialKind` is "oauth_grant". */
   tokenId: string;
+  credentialKind?: FileOpCredentialKind;
   expiresAt: Date | null;
   nodeId: string;
   op: FileOp;
