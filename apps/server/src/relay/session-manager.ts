@@ -22,7 +22,6 @@ import {
   ENDPOINT_LOAD_STALE_AFTER_MS,
   parseStoredRemoteMetricSources,
 } from "@ws-model-proxy/api/lib/metric-routing";
-import { suggestedConnectionSurface } from "@ws-model-proxy/api/lib/model-connection-type";
 import {
   disconnectCliDeviceAtGeneration,
   markPoolMembersDueAfterCliReconnect,
@@ -63,7 +62,7 @@ import {
 } from "../model-api/cache-affinity-observers.js";
 import { beginAffinityReset } from "../model-api/cache-affinity-residency.js";
 import { resetKvEvictionForEndpoint } from "../model-api/kv-eviction-feedback.js";
-import { PROBE_MAX_TOKENS, probeReasoningFields } from "../model-api/probe-settings.js";
+import { recoveryProbeRequest } from "../model-api/probe-settings.js";
 import { startRelayAttempt } from "../model-api/relay-executor.js";
 import { EngineLoadHistoryStore } from "./engine-load-history.js";
 import { observeEngineLoadRollup } from "./engine-load-rollup.js";
@@ -4962,46 +4961,15 @@ export class RelaySessionManager {
   }
 
   private async probeOwnedPoolMember(member: OwnedRecoveryMember): Promise<boolean | "superseded"> {
-    const capabilities = member.capabilities as OpenAiCompatibleCapabilities | null;
-    const surface = suggestedConnectionSurface({ capabilities });
-    if (!surface) return false;
     // Same budget and lowest reasoning level as `pool_member_test`, so a
-    // reasoning model is not cut off before it can answer. Reasoning fields
-    // go on the chat surface only, as in that probe.
-    const request =
-      surface === "OPENAI_RESPONSES"
-        ? {
-            family: "responses" as const,
-            path: "/v1/responses",
-            body: {
-              model: member.upstreamModelId,
-              input: "Reply with pong.",
-              max_output_tokens: PROBE_MAX_TOKENS,
-            },
-          }
-        : surface === "ANTHROPIC_MESSAGES"
-          ? {
-              family: "messages" as const,
-              path: "/v1/messages",
-              body: {
-                model: member.upstreamModelId,
-                max_tokens: PROBE_MAX_TOKENS,
-                messages: [{ role: "user", content: "Reply with pong." }],
-              },
-            }
-          : {
-              family: "chat.completions" as const,
-              path: "/v1/chat/completions",
-              body: {
-                model: member.upstreamModelId,
-                stream: false,
-                max_tokens: PROBE_MAX_TOKENS,
-                ...probeReasoningFields(capabilities),
-                messages: [{ role: "user", content: "Reply with pong." }],
-              },
-            };
+    // reasoning model is not cut off before it can answer.
+    const request = recoveryProbeRequest(
+      member.upstreamModelId,
+      member.capabilities as OpenAiCompatibleCapabilities | null,
+    );
+    if (!request) return false;
     const headers = new Headers({ "content-type": "application/json" });
-    if (surface === "ANTHROPIC_MESSAGES") headers.set("anthropic-version", "2023-06-01");
+    if (request.surface === "ANTHROPIC_MESSAGES") headers.set("anthropic-version", "2023-06-01");
     // The probe is only evidence about the connection it was dispatched on. If
     // that session is replaced (a reconnect took over the device id) or lost
     // while it runs, its `disconnected` failure belongs to the old connection,
