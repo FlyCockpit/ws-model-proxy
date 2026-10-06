@@ -180,6 +180,7 @@ fn is_socket(_path: &Path) -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
 fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
     env.iter()
         .find(|(key, _)| names_equal(key, name, cfg!(windows)))
@@ -211,6 +212,20 @@ pub fn complete_child_env(
             }
         }
     }
+    #[cfg(target_os = "linux")]
+    complete_session_bus(env, facts, is_socket);
+    #[cfg(not(target_os = "linux"))]
+    let _ = is_socket;
+}
+
+/// Linux only: the user runtime dir and session bus (see
+/// [`complete_child_env`]). Other platforms have no `/run/user/$UID`.
+#[cfg(target_os = "linux")]
+fn complete_session_bus(
+    env: &mut Vec<(String, String)>,
+    facts: &HostEnvFacts,
+    is_socket: impl Fn(&Path) -> bool,
+) {
     let Some(user_runtime_dir) = &facts.user_runtime_dir else {
         return;
     };
@@ -405,6 +420,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn owned(entries: &[(&str, &str)]) -> Vec<(String, String)> {
         entries
             .iter()
@@ -412,6 +428,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn fills_the_runtime_dir_and_bus_when_the_daemon_lacks_them() {
         let facts = HostEnvFacts {
@@ -440,6 +457,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn keeps_what_the_daemon_has_and_fills_nothing_without_a_user_runtime_dir() {
         let facts = HostEnvFacts {
