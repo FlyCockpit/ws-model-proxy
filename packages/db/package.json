@@ -37,6 +37,9 @@
     },
     "./usage-rollup-requester-drain": {
       "default": "./src/usage-rollup-requester-drain.ts"
+    },
+    "./spend": {
+      "default": "./src/spend.ts"
     }
   },
   "scripts": {
