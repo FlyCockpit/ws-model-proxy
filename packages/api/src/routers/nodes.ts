@@ -1,5 +1,6 @@
 import { stub } from "../contract-procedure";
 import { nodesContract as c } from "../contracts/nodes";
+import { nodeOperatorRouters } from "./node-operator";
 
 /** S0c: bound to the contract with NOT_IMPLEMENTED handlers; implemented in lane A1. */
 export const nodesRouter = {
@@ -33,19 +34,10 @@ export const nodesRouter = {
   activity: {
     list: stub(c.activity.list),
   },
-  terminals: {
-    openTicket: stub(c.terminals.openTicket),
-  },
-  queued: {
-    list: stub(c.queued.list),
-    enqueue: stub(c.queued.enqueue),
-    run: stub(c.queued.run),
-    dismiss: stub(c.queued.dismiss),
-  },
-  commands: {
-    run: stub(c.commands.run),
-    get: stub(c.commands.get),
-  },
+  // Lane D (node-operator.ts): browser terminals, queued commands, node commands.
+  terminals: nodeOperatorRouters.terminals,
+  queued: nodeOperatorRouters.queued,
+  commands: nodeOperatorRouters.commands,
   files: {
     read: stub(c.files.read),
     write: stub(c.files.write),

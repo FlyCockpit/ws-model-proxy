@@ -1,7 +1,9 @@
 import { z } from "zod";
 import {
+  ACTOR,
   idSchema,
   isoDateSchema,
+  NODE_COMMAND_STATE,
   NODE_TRUST,
   noInputSchema,
   OPERATOR_NEED,
@@ -38,6 +40,30 @@ export const requestRowSchema = z
     errorClass: z.string().nullable(),
     httpStatusCode: z.number().int().nullable(),
     attempts: z.number().int(),
+  })
+  .strict();
+
+/**
+ * One row of the command log (lane D, contract addition pending review): a command an agent or
+ * person ran on a node (`NodeCommand`, kept 30 days). No command text and no output here; the
+ * output tail comes live from the node through `nodes.commands.get`.
+ */
+export const commandLogRowSchema = z
+  .object({
+    commandId: z.string(),
+    nodeId: idSchema,
+    nodeSlug: z.string(),
+    actor: z.enum(ACTOR),
+    agentTokenId: idSchema.nullable(),
+    /** Display only: the agent token's name. */
+    agentTokenName: z.string().nullable(),
+    /** The allowlisted program name (`?` when unknown); never the command text. */
+    program: z.string(),
+    state: z.enum(NODE_COMMAND_STATE),
+    exitCode: z.number().int().nullable(),
+    startedAt: isoDateSchema,
+    endsBy: isoDateSchema,
+    finishedAt: isoDateSchema.nullable(),
   })
   .strict();
 
@@ -96,6 +122,20 @@ export const activityContract = {
         }),
       z.object({ deleted: z.number().int() }).strict(),
       "Delete request log rows.",
+    ),
+  },
+  commands: {
+    list: query(
+      "session",
+      z
+        .object({
+          nodeId: idSchema.optional(),
+          state: z.enum(NODE_COMMAND_STATE).optional(),
+          ...pageInputShape,
+        })
+        .strict(),
+      pageOf(commandLogRowSchema),
+      "Command log: commands agents and people ran on your nodes, running ones first by start time (no text, no output).",
     ),
   },
   overview: {
