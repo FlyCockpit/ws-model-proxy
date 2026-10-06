@@ -403,12 +403,16 @@ export async function runManifestTool(
   //    error. NOTHING reaches the installed SDK, whose own catch would
   //    copy `Error.message` verbatim into tool output.
   const deliverDespiteAbort = descriptor.deliverDespiteAbort === true;
+  // Kept outside the try: an error mapping checks refinement messages against
+  // what the procedure actually received, not only the raw arguments.
+  let receivedInput: unknown;
   try {
     if ((!deliverDespiteAbort || descriptor.deliverDespiteAbortWhen) && signal?.aborted)
       throw new McpToolAbortedError();
     const adaptedInput = descriptor.inputAdapter
       ? descriptor.inputAdapter(stripConfirmation(argsRecord))
       : stripConfirmation(argsRecord);
+    receivedInput = adaptedInput;
 
     // Invoke (procedure through the per-request client, or extracted core),
     // raced against the admission signal (G1): abort settles THIS wrapper
@@ -548,7 +552,7 @@ export async function runManifestTool(
       }
       return toolError(error.message, { error: { code: error.code, ...error.extra } });
     }
-    return mapToolError(error, descriptor, requestId, args);
+    return mapToolError(error, descriptor, requestId, [args, receivedInput]);
   }
 }
 

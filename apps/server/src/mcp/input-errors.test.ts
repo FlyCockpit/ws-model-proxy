@@ -253,6 +253,17 @@ describe("sanitizeValidationIssues", () => {
     ]);
   });
 
+  it("checks refinement messages against every caller input it is given (raw and adapted)", () => {
+    const issues = [{ code: "custom", path: ["a"], message: "bad rendered-value-77" }];
+    expect(
+      sanitizeValidationIssues({ issues }, KNOWN, [{ a: "raw" }, { a: "rendered-value-77" }])?.[0]
+        ?.message,
+    ).toBe("Invalid value");
+    expect(
+      sanitizeValidationIssues({ issues }, KNOWN, [{ a: "raw" }, undefined])?.[0]?.message,
+    ).toBe("bad rendered-value-77");
+  });
+
   it("does not echo unrecognized keys and suggests the nearest declared names", () => {
     const issues = sanitize(
       [
