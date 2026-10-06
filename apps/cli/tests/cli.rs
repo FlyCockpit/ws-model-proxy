@@ -234,14 +234,29 @@ fn config_set_server_pins_and_clears_a_public_origin() {
     assert!(shown.get("publicOrigin").is_none());
     assert_eq!(shown["helloOrigin"], "http://10.0.0.5:3000");
 
-    // A plain-http LAN origin is accepted with a warning; clearing it via
-    // --json names it.
+    // The warning is about the connect URL, where the traffic goes: a
+    // plain-http LAN connect URL warns, a plain-http pin alone does not.
     cli(&config, &state)
         .args(["config", "set-server", "http://10.0.0.5:3000"])
         .args(["--public-origin", "http://wsmp.lan:3000"])
         .assert()
         .success()
-        .stderr(predicate::str::contains("plain http"));
+        .stderr(predicate::str::contains(
+            "the server URL `http://10.0.0.5:3000` uses plain http",
+        ));
+    cli(&config, &state)
+        .args(["config", "set-server", "https://wsmp.example.com"])
+        .args(["--public-origin", "http://wsmp.lan:3000"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("plain http").not());
+    cli(&config, &state)
+        .args(["config", "set-server", "http://127.0.0.1:3000"])
+        .args(["--public-origin", "http://wsmp.lan:3000"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("plain http").not());
+    // Clearing the pin via --json names it.
     let mut clear = cli(&config, &state);
     clear.args(["config", "--json", "set-server", "http://10.0.0.5:3000"]);
     let value = json_stdout(clear);

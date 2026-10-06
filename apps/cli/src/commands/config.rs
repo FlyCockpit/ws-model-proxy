@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::config::{Config, McpCommandMode, normalize_public_origin, public_origin_http_warning};
+use crate::config::{Config, McpCommandMode, normalize_public_origin, server_url_http_warning};
 use crate::output;
 use crate::slug::validate_slug;
 
@@ -58,7 +58,7 @@ enum Sub {
     SetServer {
         url: String,
         /// The server's public origin (`https://host[:port]`) when it differs
-        /// from the URL's origin. Plain http is accepted with a warning.
+        /// from the URL's origin. Plain http is accepted.
         #[arg(long)]
         public_origin: Option<String>,
     },
@@ -239,10 +239,9 @@ pub fn run(args: &Args) -> Result<()> {
                 let previous = std::mem::replace(&mut cfg.public_origin, public_origin.clone());
                 Ok(previous.filter(|_| public_origin.is_none()))
             })?;
-            let http_warning = public_origin
-                .as_deref()
-                .and_then(public_origin_http_warning);
-            if let Some(warning) = &http_warning {
+            // The CLI's traffic goes to the connect URL; a plain-http public
+            // origin is only a name and needs no warning.
+            if let Some(warning) = server_url_http_warning(url) {
                 output::diagnostic(warning)?;
             }
             if args.json {

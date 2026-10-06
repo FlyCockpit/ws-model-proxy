@@ -87,8 +87,11 @@ hostname), pin the server's public origin (the origin of its
 `BETTER_AUTH_URL`) with `wsmp config set-server <connect URL> --public-origin
 <origin>` and restart wsmp; no new login is needed. The public origin is
 `scheme://host[:port]` with no path or credentials, and its host must be an IP
-address or a DNS name of ASCII letters, digits and hyphens. Plain http is
-accepted with a warning, for a LAN server whose `BETTER_AUTH_URL` is http.
+address or a DNS name of ASCII letters, digits and hyphens. A plain-http
+origin is accepted, for a LAN server whose `BETTER_AUTH_URL` is http: it is
+only the name the signature binds. `set-server` warns when the connect URL
+itself is plain http off loopback, since the credential and relay traffic go
+there unencrypted.
 `wsmp config show` prints the effective `helloOrigin`, and `wsmp login` warns
 when the server's origin differs from it. That warning and the relay's refusal
 suggest the exact command, with its arguments single-quoted (for PowerShell on

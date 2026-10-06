@@ -462,8 +462,10 @@ Fixed in this release:
   The public origin is `scheme://host[:port]` with no path or credentials. Its
   host must be an IP address or a DNS name of ASCII letters, digits and
   hyphens (internationalized names in punycode), so a server-chosen host with
-  shell characters can never be pinned or suggested. Plain http is accepted,
-  with a warning, for a LAN server whose `BETTER_AUTH_URL` is http. Setting
+  shell characters can never be pinned or suggested. A plain-http origin is
+  accepted, for a LAN server whose `BETTER_AUTH_URL` is http. `set-server`
+  warns when the connect URL is plain http off loopback, since the CLI's
+  credential and relay traffic go there unencrypted. Setting
   the server again without `--public-origin` clears the pin and says so. Until
   it is pinned, the relay exits on each connection attempt, so a service
   manager keeps restarting it (every 5 seconds under the systemd unit), as

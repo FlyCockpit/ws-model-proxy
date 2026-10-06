@@ -371,8 +371,9 @@ impl Config {
 /// its host an IP literal or a DNS name of ASCII letter, digit and hyphen
 /// labels (after punycode). The URL parser alone accepts hosts such as
 /// `a$(touch,x).com`; refusing them keeps every origin safe to show inside a
-/// suggested shell command. Plain http is accepted (a LAN deployment's
-/// `BETTER_AUTH_URL` can be http); see [`public_origin_http_warning`].
+/// suggested shell command. Plain http is accepted: a LAN deployment's
+/// `BETTER_AUTH_URL` can be http, and the pin is only the origin name the
+/// hello signature binds; no traffic goes to it.
 pub fn normalize_public_origin(value: &str) -> Result<String> {
     let url = url::Url::parse(value).context("the public origin is not a valid URL")?;
     match url.scheme() {
@@ -410,14 +411,16 @@ fn is_plain_dns_name(domain: &str) -> bool {
         })
 }
 
-/// A warning for a plain-http public origin off loopback: the relay hello
-/// signature still binds it, but the connection to it is not encrypted.
-pub fn public_origin_http_warning(origin: &str) -> Option<String> {
-    let url = url::Url::parse(origin).ok()?;
+/// A warning for a plain-http server URL off loopback. Every request the CLI
+/// makes goes to this URL, so its credential and relay traffic would cross
+/// the network unencrypted.
+pub fn server_url_http_warning(server_url: &str) -> Option<String> {
+    let url = url::Url::parse(server_url).ok()?;
     (url.scheme() == "http" && !is_loopback_host(&url)).then(|| {
         format!(
-            "warning: the public origin `{origin}` uses plain http; traffic to it, including the \
-             CLI credential, is not encrypted. Use it only on a network you trust"
+            "warning: the server URL `{server_url}` uses plain http, so this CLI's credential \
+             and relay traffic (prompts and responses) cross the network unencrypted. Use it \
+             only on a network you trust"
         )
     })
 }
@@ -2135,10 +2138,12 @@ mod tests {
     }
 
     #[test]
-    fn plain_http_public_origins_warn_off_loopback() {
-        assert!(public_origin_http_warning("http://wsmp.lan:3000").is_some());
-        assert!(public_origin_http_warning("http://127.0.0.1:3000").is_none());
-        assert!(public_origin_http_warning("https://wsmp.example.com").is_none());
+    fn plain_http_server_urls_warn_off_loopback() {
+        assert!(server_url_http_warning("http://10.0.0.5:3000").is_some());
+        assert!(server_url_http_warning("http://wsmp.lan:3000/base").is_some());
+        assert!(server_url_http_warning("http://127.0.0.1:3000").is_none());
+        assert!(server_url_http_warning("http://localhost:3000").is_none());
+        assert!(server_url_http_warning("https://wsmp.example.com").is_none());
     }
 
     #[test]
