@@ -662,308 +662,304 @@ export const poolMemberProcedures = {
     )
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
-      const updatedMember = await prisma.$transaction(
-        async (tx) => {
-          // Writer class M: the owner fence first; it serializes every
-          // tier/order transition with pool attachment and reorder.
-          await fenceOwners(tx, [userId]);
-          const candidate = await tx.poolMember.findUnique({
-            where: { id: input.id },
-            select: {
-              poolId: true,
-              executionTargetId: true,
-              ModelPool: { select: { userId: true } },
-            },
-          });
-          if (!candidate || candidate.ModelPool.userId !== userId)
-            throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
+      // Serializable: retried on serialization failure (P2034 / 40001), and
+      // exhausted retries surface as CONFLICT instead of an internal error.
+      const updatedMember = await runSerializableTransaction(async (tx) => {
+        // Writer class M: the owner fence first; it serializes every
+        // tier/order transition with pool attachment and reorder.
+        await fenceOwners(tx, [userId]);
+        const candidate = await tx.poolMember.findUnique({
+          where: { id: input.id },
+          select: {
+            poolId: true,
+            executionTargetId: true,
+            ModelPool: { select: { userId: true } },
+          },
+        });
+        if (!candidate || candidate.ModelPool.userId !== userId)
+          throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
 
-          // The member's capacity-policy fence, then the pool row. Re-read
-          // all policy inputs after them so pool settings and protection
-          // cannot be revoked concurrently.
-          if (candidate.executionTargetId)
-            await fenceExecutionTargetPolicies(tx, [candidate.executionTargetId]);
-          await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
-          const member = await tx.poolMember.findUnique({
-            where: { id: input.id },
+        // The member's capacity-policy fence, then the pool row. Re-read
+        // all policy inputs after them so pool settings and protection
+        // cannot be revoked concurrently.
+        if (candidate.executionTargetId)
+          await fenceExecutionTargetPolicies(tx, [candidate.executionTargetId]);
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
+        const member = await tx.poolMember.findUnique({
+          where: { id: input.id },
+          select: {
+            id: true,
+            poolId: true,
+            tier: true,
+            publicOrder: true,
+            weight: true,
+            routingStatus: true,
+            capacityConcurrencyMode: true,
+            capacityConcurrencyLimit: true,
+            capacityReservedSlots: true,
+            capacityContextCeilingMode: true,
+            capacityContextCeiling: true,
+            capacityContextMargin: true,
+            ExecutionTarget: {
+              select: {
+                ProviderModel: { select: { id: true, providerAccountId: true } },
+                InferenceCapacity: {
+                  select: { physicalMaxContext: true, hardConcurrencyLimit: true },
+                },
+              },
+            },
+            ModelPool: {
+              select: {
+                userId: true,
+                name: true,
+                fallbackEnabled: true,
+                recommendedSurfaceOverride: true,
+                protocolAdaptationEnabled: true,
+                capacityConcurrencyLimit: true,
+                capacityReservedSlots: true,
+                capacityContextCeiling: true,
+                capacityContextMargin: true,
+              },
+            },
+          },
+        });
+        if (!member || member.ModelPool.userId !== userId)
+          throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
+        const providerModel = member.ExecutionTarget?.ProviderModel;
+        if (providerModel) assertProviderEgressReleaseGate();
+        const nextTier = input.tier ?? member.tier;
+        const nextWeight = input.weight ?? member.weight;
+        const nextRoutingStatus = input.routingStatus ?? member.routingStatus;
+        if (nextTier === "PRIMARY" && nextRoutingStatus === "ACTIVE" && nextWeight <= 0)
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Primary members require a positive routing weight.",
+            data: { fields: ["weight"] },
+          });
+        if (input.tier && !providerModel)
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Only provider-backed members can change tier.",
+            data: { fields: ["tier"] },
+          });
+        // PRIMARY is local-only (also enforced by the schema-hardening tier
+        // trigger): plain pool names never leave the deployment.
+        if (providerModel && nextTier === "PRIMARY")
+          throw new ORPCError("BAD_REQUEST", {
+            message:
+              "Provider models can only be external fallback (PUBLIC_OVERFLOW) members; plain pool names never leave the deployment.",
+            data: { fields: ["tier"] },
+          });
+        const nextConcurrencyMode = input.capacityConcurrencyMode ?? member.capacityConcurrencyMode;
+        const nextConcurrencyLimit =
+          input.capacityConcurrencyLimit !== undefined
+            ? input.capacityConcurrencyLimit
+            : member.capacityConcurrencyLimit;
+        const nextReservedSlots =
+          input.capacityReservedSlots !== undefined
+            ? input.capacityReservedSlots
+            : member.capacityReservedSlots;
+        if (
+          nextConcurrencyMode === "LIMITED" &&
+          nextConcurrencyLimit != null &&
+          nextReservedSlots != null &&
+          nextReservedSlots > nextConcurrencyLimit
+        )
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Reserved slots exceed the member concurrency limit.",
+            data: { fields: ["capacityReservedSlots", "capacityConcurrencyLimit"] },
+          });
+        assertConcurrencyPolicyWithinHardLimit({
+          hardLimit: member.ExecutionTarget?.InferenceCapacity?.hardConcurrencyLimit,
+          poolLimit: member.ModelPool.capacityConcurrencyLimit,
+          poolReserved: member.ModelPool.capacityReservedSlots,
+          memberMode: nextConcurrencyMode,
+          memberLimit: nextConcurrencyLimit,
+          memberReserved: nextReservedSlots,
+        });
+        const nextContextMode =
+          input.capacityContextCeilingMode ?? member.capacityContextCeilingMode;
+        const nextContextCeiling =
+          input.capacityContextCeiling !== undefined
+            ? input.capacityContextCeiling
+            : member.capacityContextCeiling;
+        const nextContextMargin =
+          input.capacityContextMargin !== undefined
+            ? input.capacityContextMargin
+            : member.capacityContextMargin;
+        const physicalMaxContext = member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext;
+        assertEffectiveContextPolicy({
+          physicalMaxContext,
+          poolCeiling: member.ModelPool.capacityContextCeiling,
+          poolMargin: member.ModelPool.capacityContextMargin,
+          memberMode: nextContextMode,
+          memberCeiling: nextContextCeiling,
+          memberMargin: nextContextMargin,
+        });
+
+        if (nextTier === "PUBLIC_OVERFLOW" && member.tier !== "PUBLIC_OVERFLOW") {
+          if (!providerModel)
+            throw new ORPCError("BAD_REQUEST", {
+              message: "Only provider-backed members can move to external fallback.",
+              data: { fields: ["tier"] },
+            });
+          const protection = await tx.providerBudgetPolicy.findFirst({
+            where: {
+              userId,
+              active: true,
+              scopeType: "POOL_PROVIDER_MODEL",
+              poolId: member.poolId,
+              providerModelId: providerModel.id,
+              providerAccountId: providerModel.providerAccountId,
+              activatedAt: { not: null },
+              Rules: {
+                some: { metric: "CONCURRENCY", period: "PER_ATTEMPT" },
+              },
+            },
             select: {
               id: true,
-              poolId: true,
-              tier: true,
-              publicOrder: true,
-              weight: true,
-              routingStatus: true,
-              capacityConcurrencyMode: true,
-              capacityConcurrencyLimit: true,
-              capacityReservedSlots: true,
-              capacityContextCeilingMode: true,
-              capacityContextCeiling: true,
-              capacityContextMargin: true,
-              ExecutionTarget: {
-                select: {
-                  ProviderModel: { select: { id: true, providerAccountId: true } },
-                  InferenceCapacity: {
-                    select: { physicalMaxContext: true, hardConcurrencyLimit: true },
-                  },
-                },
-              },
-              ModelPool: {
-                select: {
-                  userId: true,
-                  name: true,
-                  fallbackEnabled: true,
-                  recommendedSurfaceOverride: true,
-                  protocolAdaptationEnabled: true,
-                  capacityConcurrencyLimit: true,
-                  capacityReservedSlots: true,
-                  capacityContextCeiling: true,
-                  capacityContextMargin: true,
-                },
+              Rules: {
+                where: { metric: "CONCURRENCY", period: "PER_ATTEMPT" },
+                select: { mode: true, limitValue: true },
               },
             },
           });
-          if (!member || member.ModelPool.userId !== userId)
-            throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
-          const providerModel = member.ExecutionTarget?.ProviderModel;
-          if (providerModel) assertProviderEgressReleaseGate();
-          const nextTier = input.tier ?? member.tier;
-          const nextWeight = input.weight ?? member.weight;
-          const nextRoutingStatus = input.routingStatus ?? member.routingStatus;
-          if (nextTier === "PRIMARY" && nextRoutingStatus === "ACTIVE" && nextWeight <= 0)
-            throw new ORPCError("BAD_REQUEST", {
-              message: "Primary members require a positive routing weight.",
-              data: { fields: ["weight"] },
-            });
-          if (input.tier && !providerModel)
-            throw new ORPCError("BAD_REQUEST", {
-              message: "Only provider-backed members can change tier.",
-              data: { fields: ["tier"] },
-            });
-          // PRIMARY is local-only (also enforced by the schema-hardening tier
-          // trigger): plain pool names never leave the deployment.
-          if (providerModel && nextTier === "PRIMARY")
+          const concurrency = protection?.Rules[0];
+          const validProtection =
+            protection &&
+            protection.Rules.length === 1 &&
+            concurrency &&
+            ((concurrency.mode === "LIMITED" &&
+              concurrency.limitValue !== null &&
+              Number(concurrency.limitValue.toString()) > 0) ||
+              (concurrency.mode === "UNLIMITED" && concurrency.limitValue === null));
+          const protectionAudit = protection
+            ? await tx.providerAuditEvent.findFirst({
+                where: {
+                  userId,
+                  providerAccountId: providerModel.providerAccountId,
+                  subjectId: protection.id,
+                  action: { in: ["BUDGET_CREATED", "BUDGET_UPDATED", "BUDGET_ACTIVATED"] },
+                },
+                select: { id: true },
+              })
+            : null;
+          if (!validProtection || !protectionAudit)
             throw new ORPCError("BAD_REQUEST", {
               message:
-                "Provider models can only be external fallback (PUBLIC_OVERFLOW) members; plain pool names never leave the deployment.",
+                "Create and activate an audited attachment protection policy before moving this target to overflow.",
               data: { fields: ["tier"] },
             });
-          const nextConcurrencyMode =
-            input.capacityConcurrencyMode ?? member.capacityConcurrencyMode;
-          const nextConcurrencyLimit =
-            input.capacityConcurrencyLimit !== undefined
-              ? input.capacityConcurrencyLimit
-              : member.capacityConcurrencyLimit;
-          const nextReservedSlots =
-            input.capacityReservedSlots !== undefined
-              ? input.capacityReservedSlots
-              : member.capacityReservedSlots;
-          if (
-            nextConcurrencyMode === "LIMITED" &&
-            nextConcurrencyLimit != null &&
-            nextReservedSlots != null &&
-            nextReservedSlots > nextConcurrencyLimit
-          )
-            throw new ORPCError("BAD_REQUEST", {
-              message: "Reserved slots exceed the member concurrency limit.",
-              data: { fields: ["capacityReservedSlots", "capacityConcurrencyLimit"] },
-            });
-          assertConcurrencyPolicyWithinHardLimit({
-            hardLimit: member.ExecutionTarget?.InferenceCapacity?.hardConcurrencyLimit,
-            poolLimit: member.ModelPool.capacityConcurrencyLimit,
-            poolReserved: member.ModelPool.capacityReservedSlots,
-            memberMode: nextConcurrencyMode,
-            memberLimit: nextConcurrencyLimit,
-            memberReserved: nextReservedSlots,
-          });
-          const nextContextMode =
-            input.capacityContextCeilingMode ?? member.capacityContextCeilingMode;
-          const nextContextCeiling =
-            input.capacityContextCeiling !== undefined
-              ? input.capacityContextCeiling
-              : member.capacityContextCeiling;
-          const nextContextMargin =
-            input.capacityContextMargin !== undefined
-              ? input.capacityContextMargin
-              : member.capacityContextMargin;
-          const physicalMaxContext = member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext;
-          assertEffectiveContextPolicy({
-            physicalMaxContext,
-            poolCeiling: member.ModelPool.capacityContextCeiling,
-            poolMargin: member.ModelPool.capacityContextMargin,
-            memberMode: nextContextMode,
-            memberCeiling: nextContextCeiling,
-            memberMargin: nextContextMargin,
-          });
+        }
 
-          if (nextTier === "PUBLIC_OVERFLOW" && member.tier !== "PUBLIC_OVERFLOW") {
-            if (!providerModel)
-              throw new ORPCError("BAD_REQUEST", {
-                message: "Only provider-backed members can move to external fallback.",
-                data: { fields: ["tier"] },
-              });
-            const protection = await tx.providerBudgetPolicy.findFirst({
-              where: {
-                userId,
-                active: true,
-                scopeType: "POOL_PROVIDER_MODEL",
-                poolId: member.poolId,
-                providerModelId: providerModel.id,
-                providerAccountId: providerModel.providerAccountId,
-                activatedAt: { not: null },
-                Rules: {
-                  some: { metric: "CONCURRENCY", period: "PER_ATTEMPT" },
-                },
-              },
-              select: {
-                id: true,
-                Rules: {
-                  where: { metric: "CONCURRENCY", period: "PER_ATTEMPT" },
-                  select: { mode: true, limitValue: true },
-                },
-              },
-            });
-            const concurrency = protection?.Rules[0];
-            const validProtection =
-              protection &&
-              protection.Rules.length === 1 &&
-              concurrency &&
-              ((concurrency.mode === "LIMITED" &&
-                concurrency.limitValue !== null &&
-                Number(concurrency.limitValue.toString()) > 0) ||
-                (concurrency.mode === "UNLIMITED" && concurrency.limitValue === null));
-            const protectionAudit = protection
-              ? await tx.providerAuditEvent.findFirst({
-                  where: {
-                    userId,
-                    providerAccountId: providerModel.providerAccountId,
-                    subjectId: protection.id,
-                    action: { in: ["BUDGET_CREATED", "BUDGET_UPDATED", "BUDGET_ACTIVATED"] },
-                  },
-                  select: { id: true },
-                })
-              : null;
-            if (!validProtection || !protectionAudit)
-              throw new ORPCError("BAD_REQUEST", {
-                message:
-                  "Create and activate an audited attachment protection policy before moving this target to overflow.",
-                data: { fields: ["tier"] },
-              });
+        const overflow = await tx.poolMember.findMany({
+          where: { poolId: member.poolId, tier: "PUBLIC_OVERFLOW", id: { not: member.id } },
+          orderBy: [{ publicOrder: "asc" }, { id: "asc" }],
+          select: { id: true },
+        });
+        const desiredOrder = Math.min(
+          input.publicOrder ?? member.publicOrder ?? overflow.length,
+          overflow.length,
+        );
+        if (nextTier === "PUBLIC_OVERFLOW") overflow.splice(desiredOrder, 0, { id: member.id });
+
+        // A tier transition re-shapes the primary member set, so the
+        // effective recommended surface must stay servable in the
+        // post-transition state before any write lands. Tier-preserving
+        // updates (weight, policy fields, order) leave the selectability
+        // inputs untouched and stay non-retroactive.
+        if (input.tier !== undefined && input.tier !== member.tier) {
+          const surfaceMembers = await loadPoolSurfaceMembers(tx, member.poolId);
+          for (const surfaceMember of surfaceMembers) {
+            if (surfaceMember.id === member.id) surfaceMember.tier = input.tier;
           }
-
-          const overflow = await tx.poolMember.findMany({
-            where: { poolId: member.poolId, tier: "PUBLIC_OVERFLOW", id: { not: member.id } },
-            orderBy: [{ publicOrder: "asc" }, { id: "asc" }],
-            select: { id: true },
+          assertRecommendedSurfaceServable({
+            override: parseModelApiSurface(member.ModelPool.recommendedSurfaceOverride),
+            members: surfaceMembers,
+            adaptationEnabled: member.ModelPool.protocolAdaptationEnabled,
           });
-          const desiredOrder = Math.min(
-            input.publicOrder ?? member.publicOrder ?? overflow.length,
-            overflow.length,
-          );
-          if (nextTier === "PUBLIC_OVERFLOW") overflow.splice(desiredOrder, 0, { id: member.id });
+        }
 
-          // A tier transition re-shapes the primary member set, so the
-          // effective recommended surface must stay servable in the
-          // post-transition state before any write lands. Tier-preserving
-          // updates (weight, policy fields, order) leave the selectability
-          // inputs untouched and stay non-retroactive.
-          if (input.tier !== undefined && input.tier !== member.tier) {
-            const surfaceMembers = await loadPoolSurfaceMembers(tx, member.poolId);
-            for (const surfaceMember of surfaceMembers) {
-              if (surfaceMember.id === member.id) surfaceMember.tier = input.tier;
-            }
-            assertRecommendedSurfaceServable({
-              override: parseModelApiSurface(member.ModelPool.recommendedSurfaceOverride),
-              members: surfaceMembers,
-              adaptationEnabled: member.ModelPool.protocolAdaptationEnabled,
-            });
-          }
-
-          // Move existing rows out of the unique public-order range before
-          // assigning the normalized contiguous order.
-          if (overflow.length > 0)
-            await tx.poolMember.updateMany({
-              where: { poolId: member.poolId, tier: "PUBLIC_OVERFLOW" },
-              data: { publicOrder: { increment: 20_000 } },
-            });
-          const updated = await tx.poolMember.update({
-            where: { id: member.id },
+        // Move existing rows out of the unique public-order range before
+        // assigning the normalized contiguous order.
+        if (overflow.length > 0)
+          await tx.poolMember.updateMany({
+            where: { poolId: member.poolId, tier: "PUBLIC_OVERFLOW" },
+            data: { publicOrder: { increment: 20_000 } },
+          });
+        const updated = await tx.poolMember.update({
+          where: { id: member.id },
+          data: {
+            ...(input.weight !== undefined || input.tier
+              ? { weight: nextTier === "PUBLIC_OVERFLOW" ? 0 : nextWeight }
+              : {}),
+            ...(input.routingStatus ? { routingStatus: input.routingStatus } : {}),
+            ...(input.tier ? { tier: input.tier } : {}),
+            ...(input.capacityPriority !== undefined
+              ? { capacityPriority: input.capacityPriority }
+              : {}),
+            ...(input.capacityConcurrencyMode
+              ? {
+                  capacityConcurrencyMode: input.capacityConcurrencyMode,
+                  capacityConcurrencyLimit:
+                    input.capacityConcurrencyMode === "LIMITED"
+                      ? input.capacityConcurrencyLimit
+                      : null,
+                }
+              : {}),
+            ...(input.capacityReservedSlots !== undefined
+              ? { capacityReservedSlots: input.capacityReservedSlots }
+              : {}),
+            ...(input.capacityBorrowPolicy !== undefined
+              ? { capacityBorrowPolicy: input.capacityBorrowPolicy }
+              : {}),
+            ...(input.capacityWaitBudgetMode
+              ? {
+                  capacityWaitBudgetMode: input.capacityWaitBudgetMode,
+                  capacityWaitBudgetMs:
+                    input.capacityWaitBudgetMode === "LIMITED" ? input.capacityWaitBudgetMs : null,
+                }
+              : {}),
+            ...(input.capacityContextCeilingMode
+              ? {
+                  capacityContextCeilingMode: input.capacityContextCeilingMode,
+                  capacityContextCeiling:
+                    input.capacityContextCeilingMode === "LIMITED"
+                      ? input.capacityContextCeiling
+                      : null,
+                }
+              : {}),
+            ...(input.capacityContextMargin !== undefined
+              ? { capacityContextMargin: input.capacityContextMargin }
+              : {}),
+            publicOrder: nextTier === "PUBLIC_OVERFLOW" ? desiredOrder + 40_000 : null,
+          },
+          select: { id: true, weight: true, routingStatus: true, tier: true, publicOrder: true },
+        });
+        for (const [publicOrder, orderedMember] of overflow.entries())
+          await tx.poolMember.update({
+            where: { id: orderedMember.id },
+            data: { publicOrder },
+          });
+        if (providerModel && member.tier !== nextTier)
+          await tx.providerAuditEvent.create({
             data: {
-              ...(input.weight !== undefined || input.tier
-                ? { weight: nextTier === "PUBLIC_OVERFLOW" ? 0 : nextWeight }
-                : {}),
-              ...(input.routingStatus ? { routingStatus: input.routingStatus } : {}),
-              ...(input.tier ? { tier: input.tier } : {}),
-              ...(input.capacityPriority !== undefined
-                ? { capacityPriority: input.capacityPriority }
-                : {}),
-              ...(input.capacityConcurrencyMode
-                ? {
-                    capacityConcurrencyMode: input.capacityConcurrencyMode,
-                    capacityConcurrencyLimit:
-                      input.capacityConcurrencyMode === "LIMITED"
-                        ? input.capacityConcurrencyLimit
-                        : null,
-                  }
-                : {}),
-              ...(input.capacityReservedSlots !== undefined
-                ? { capacityReservedSlots: input.capacityReservedSlots }
-                : {}),
-              ...(input.capacityBorrowPolicy !== undefined
-                ? { capacityBorrowPolicy: input.capacityBorrowPolicy }
-                : {}),
-              ...(input.capacityWaitBudgetMode
-                ? {
-                    capacityWaitBudgetMode: input.capacityWaitBudgetMode,
-                    capacityWaitBudgetMs:
-                      input.capacityWaitBudgetMode === "LIMITED"
-                        ? input.capacityWaitBudgetMs
-                        : null,
-                  }
-                : {}),
-              ...(input.capacityContextCeilingMode
-                ? {
-                    capacityContextCeilingMode: input.capacityContextCeilingMode,
-                    capacityContextCeiling:
-                      input.capacityContextCeilingMode === "LIMITED"
-                        ? input.capacityContextCeiling
-                        : null,
-                  }
-                : {}),
-              ...(input.capacityContextMargin !== undefined
-                ? { capacityContextMargin: input.capacityContextMargin }
-                : {}),
-              publicOrder: nextTier === "PUBLIC_OVERFLOW" ? desiredOrder + 40_000 : null,
-            },
-            select: { id: true, weight: true, routingStatus: true, tier: true, publicOrder: true },
-          });
-          for (const [publicOrder, orderedMember] of overflow.entries())
-            await tx.poolMember.update({
-              where: { id: orderedMember.id },
-              data: { publicOrder },
-            });
-          if (providerModel && member.tier !== nextTier)
-            await tx.providerAuditEvent.create({
-              data: {
-                userId,
-                providerAccountId: providerModel.providerAccountId,
-                action: "MODEL_UPDATED",
-                subjectId: providerModel.id,
-                metadata: {
-                  source: "pool_member_tier_transition",
-                  poolId: member.poolId,
-                  poolMemberId: member.id,
-                  fromTier: member.tier,
-                  toTier: nextTier,
-                },
+              userId,
+              providerAccountId: providerModel.providerAccountId,
+              action: "MODEL_UPDATED",
+              subjectId: providerModel.id,
+              metadata: {
+                source: "pool_member_tier_transition",
+                poolId: member.poolId,
+                poolMemberId: member.id,
+                fromTier: member.tier,
+                toTier: nextTier,
               },
-            });
-          const memberResult = Object.hasOwn(updated, "tier")
-            ? { ...updated, publicOrder: nextTier === "PUBLIC_OVERFLOW" ? desiredOrder : null }
-            : updated;
-          return memberResult;
-        },
-        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
-      );
+            },
+          });
+        const memberResult = Object.hasOwn(updated, "tier")
+          ? { ...updated, publicOrder: nextTier === "PUBLIC_OVERFLOW" ? desiredOrder : null }
+          : updated;
+        return memberResult;
+      });
       return updatedMember;
     }),
 

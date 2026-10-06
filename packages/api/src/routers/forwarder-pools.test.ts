@@ -1472,6 +1472,30 @@ describe("forwarderManagementRouter pools", () => {
     });
   });
 
+  it("retries a pool member update after a serialization failure", async () => {
+    db.poolMember.findUnique.mockResolvedValue({
+      id: "member-id",
+      ModelPool: { userId: "user-id" },
+    });
+    db.poolMember.update.mockResolvedValue({
+      id: "member-id",
+      weight: 0,
+      routingStatus: "DISABLED",
+    });
+    db.$transaction.mockRejectedValueOnce(
+      Object.assign(new Error("could not serialize access"), { code: "P2034" }),
+    );
+
+    await expect(
+      client().updatePoolMember({ id: "member-id", routingStatus: "DISABLED" }),
+    ).resolves.toMatchObject({ id: "member-id", routingStatus: "DISABLED" });
+    expect(db.$transaction).toHaveBeenCalledTimes(2);
+    expect(db.$transaction).toHaveBeenLastCalledWith(
+      expect.any(Function),
+      expect.objectContaining({ isolationLevel: "Serializable" }),
+    );
+  });
+
   it("uses a fresh-null seed result when the pending inherited member would exceed", async () => {
     db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
     db.modelPool.findFirst.mockResolvedValue({

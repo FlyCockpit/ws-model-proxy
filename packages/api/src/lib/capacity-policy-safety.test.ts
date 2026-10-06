@@ -307,6 +307,7 @@ describe("capacity policy safety", () => {
       ).data,
     ).toEqual({
       fields: ["capacityConcurrencyLimit", "hardConcurrencyLimit", "directConcurrencyLimit"],
+      hardLimit: 2,
     });
     expect(
       thrownBy(() =>
@@ -319,7 +320,21 @@ describe("capacity policy safety", () => {
       ).data,
     ).toEqual({
       fields: ["capacityReservedSlots", "hardConcurrencyLimit", "directReservedSlots"],
+      hardLimit: 2,
     });
+    // A pool-wide value names the blocking member and its physical limit.
+    const blocked = thrownBy(() =>
+      assertEffectiveConcurrencyPolicy(
+        { hardLimit: 4, poolLimit: 8, poolReserved: 0, memberMode: "INHERIT" },
+        undefined,
+        undefined,
+        "member-7",
+      ),
+    );
+    expect(blocked.message).toBe(
+      "Effective concurrency limit exceeds physical capacity. Pool member member-7 uses this limit and its target allows at most 4.",
+    );
+    expect(blocked.data).toMatchObject({ hardLimit: 4, poolMemberId: "member-7" });
     expect(
       thrownBy(() =>
         assertEffectiveContextPolicy({
