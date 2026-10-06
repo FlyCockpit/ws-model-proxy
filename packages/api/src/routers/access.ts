@@ -74,8 +74,12 @@ async function notifyRevoked(
   // The revocation is committed; a failed cache drop must not turn it into an error.
   try {
     await context.services?.onAccessRevoked?.(event);
-  } catch {
-    // The next lookup reads revokedAt.
+  } catch (error) {
+    // Every credential lookup reads revokedAt; this only ends live work early. The class only.
+    console.error(
+      "[access] ending a revoked credential's live work failed",
+      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+    );
   }
 }
 

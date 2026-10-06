@@ -299,6 +299,18 @@ describe("cancellation", () => {
     expect(cancelMcpToolCallsForToken("revoked-token")).toBe(0);
   });
 
+  it("aborts a call that registers just after its credential was revoked", async () => {
+    cancelMcpToolCallsForToken("late-token");
+    const invoke = vi.fn(async () => ({}));
+    const result = await runMcpTool(tool("nodes_get"), {
+      dispatch: testDispatch("READ", { tokenId: "late-token" }),
+      args: {},
+      invoke,
+    });
+    expect(structured(result).error).toEqual({ code: "REQUEST_ABORTED" });
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
   it("stops when the request's signal aborts", async () => {
     const controller = new AbortController();
     const call = runMcpTool(tool("nodes_get"), {

@@ -10,7 +10,10 @@ import {
   type ContextServices,
   createContext,
 } from "@ws-model-proxy/api/context";
-import { CSRF_REQUIRED_PROCEDURES } from "@ws-model-proxy/api/contracts";
+import {
+  CSRF_REQUIRED_PROCEDURES,
+  SENSITIVE_INPUT_PROCEDURES,
+} from "@ws-model-proxy/api/contracts";
 import { appRouter } from "@ws-model-proxy/api/routers/index";
 import type { Session } from "@ws-model-proxy/auth";
 import { auth as defaultAuth } from "@ws-model-proxy/auth";
@@ -25,6 +28,7 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
+import { endAgentWork, handleAccessRevoked } from "./access-revocation.js";
 import { betterAuthAdminGate } from "./better-auth-admin-gate.js";
 import { CORS_ALLOW_HEADERS } from "./cors-headers.js";
 import {
@@ -37,6 +41,7 @@ import { createMcpAdmissionGate } from "./mcp/admission.js";
 import { createMcpRequestHandler, type McpAuthInstance } from "./mcp/auth.js";
 import { createMcpTransport } from "./mcp/handler.js";
 import { bindMcpToolDispatch } from "./mcp/tool-dispatch.js";
+import { cancelMcpToolCallsForToken } from "./mcp/tools.js";
 import { mcpAuthorizeScopeGuard } from "./mcp-authorize-scope-guard.js";
 import { createMcpDiscoveryForwarder, MCP_WELL_KNOWN_PATHS } from "./mcp-discovery.js";
 import {
@@ -99,7 +104,7 @@ import {
 import { createModelApiRoutes } from "./model-api/routes.js";
 import { transcriptionContentLengthGuard } from "./model-api/transcription-body-guard.js";
 import { registerNodeHttpRoutes } from "./node-http.js";
-import { logOrpcError } from "./orpc-error-log.js";
+import { logOrpcError, sensitiveProcedureErrors } from "./orpc-error-log.js";
 import {
   authLimiter,
   createRateLimiterMiddleware,
@@ -259,6 +264,14 @@ function contextServices(): ContextServices {
       relaySessionManager.onPoolRoutingRulesChanged(poolId),
     nodes: nodeServices,
     pushRuntimeDefinitions,
+    onAccessRevoked: (event) =>
+      handleAccessRevoked(event, {
+        terminateRealtimeForApiKey: (apiKeyId) =>
+          realtimeSessionRegistry.terminateForToken(apiKeyId),
+        cancelMcpToolCalls: (id) => cancelMcpToolCallsForToken(id),
+        recheckRealtime: (userId) => realtimeSessionRegistry.recheckForUser(userId),
+        endAgentWork: (input) => endAgentWork(input),
+      }),
   };
 }
 
@@ -923,6 +936,7 @@ export async function createApp(options: CreateAppOptions = {}) {
     }),
   ];
 
+  const sensitiveErrors = sensitiveProcedureErrors(SENSITIVE_INPUT_PROCEDURES);
   const apiHandler = new OpenAPIHandler(appRouter, {
     plugins: [
       new OpenAPIReferencePlugin({
@@ -931,6 +945,7 @@ export async function createApp(options: CreateAppOptions = {}) {
       ...csrfPlugins,
     ],
     interceptors: [onError(logOrpcError)],
+    clientInterceptors: [sensitiveErrors],
   });
 
   // `maxSize` is an operation-count protocol contract shared with the client via
@@ -939,6 +954,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   const rpcHandler = new RPCHandler(appRouter, {
     plugins: [createRpcBatchHandlerPlugin(), ...csrfPlugins],
     interceptors: [onError(logOrpcError)],
+    clientInterceptors: [sensitiveErrors],
   });
 
   app.use("/*", async (c, next) => {

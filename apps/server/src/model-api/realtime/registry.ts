@@ -46,6 +46,8 @@ type Entry = {
   resolved: RealtimeResolvedTarget | null;
   candidate: RealtimeCandidate | null;
   checking: boolean;
+  /** Asked to recheck while a check was running (it may have read the old state). */
+  again?: boolean;
 };
 
 export type RealtimeRegistration = {
@@ -210,6 +212,21 @@ export class RealtimeSessionRegistry {
     }
   }
 
+  /**
+   * A person's access changed (a share was revoked): recheck their sessions now. A session
+   * mid-check is rechecked once more after it (that check may have read the old state).
+   */
+  async recheckForUser(userId: string): Promise<void> {
+    const mine = [...this.entries].filter((entry) => entry.userId === userId);
+    for (const entry of mine) if (entry.checking) entry.again = true;
+    const pending = mine.filter((entry) => !entry.checking);
+    for (let index = 0; index < pending.length; index += RECHECK_CONCURRENCY) {
+      await Promise.all(
+        pending.slice(index, index + RECHECK_CONCURRENCY).map((entry) => this.recheckOne(entry)),
+      );
+    }
+  }
+
   async recheckSessions(): Promise<void> {
     const pending = [...this.entries].filter((entry) => !entry.checking);
     for (let index = 0; index < pending.length; index += RECHECK_CONCURRENCY) {
@@ -241,8 +258,14 @@ export class RealtimeSessionRegistry {
     } finally {
       entry.checking = false;
     }
-    if (verdict.ok || !this.entries.has(entry)) return;
-    this.end(entry, verdict.reason);
+    if (!verdict.ok && this.entries.has(entry)) {
+      this.end(entry, verdict.reason);
+      return;
+    }
+    if (entry.again && this.entries.has(entry)) {
+      entry.again = false;
+      await this.recheckOne(entry);
+    }
   }
 }
 

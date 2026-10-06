@@ -128,8 +128,35 @@ function credentialId(credential: McpRequestCredential): string {
   return credential.kind === "agent_token" ? credential.tokenId : credential.grantId;
 }
 
+/**
+ * Credentials revoked recently: a call that passed its credential check before the revocation
+ * committed but registers after it (the rate-limit read sits in between) is aborted at once.
+ * Revocation is permanent, so a few minutes covers every request already past its check.
+ * Per process, like `inFlight` (one server instance per deployment).
+ */
+const REVOKED_REMEMBER_MS = 5 * 60_000;
+const recentlyRevoked = new Map<string, number>();
+
+/** Insertion order is expiry order (one window for all): stop at the first live entry. */
+function pruneRevoked(now: number) {
+  for (const [key, until] of recentlyRevoked) {
+    if (until > now) return;
+    recentlyRevoked.delete(key);
+  }
+}
+
+function revokedRecently(id: string, now = Date.now()): boolean {
+  pruneRevoked(now);
+  return (recentlyRevoked.get(id) ?? 0) > now;
+}
+
 /** Aborts every in-flight tool call of one agent token id or OAuth grant id. */
 export function cancelMcpToolCallsForToken(id: string): number {
+  const now = Date.now();
+  pruneRevoked(now);
+  // Re-inserted at the end so the map stays in expiry order.
+  recentlyRevoked.delete(id);
+  recentlyRevoked.set(id, now + REVOKED_REMEMBER_MS);
   const controllers = inFlight.get(id);
   if (!controllers) return 0;
   for (const controller of controllers) controller.abort();
@@ -140,7 +167,7 @@ export function cancelMcpToolCallsForToken(id: string): number {
 function trackCall(credential: McpRequestCredential, parent: AbortSignal | undefined) {
   const controller = new AbortController();
   const onAbort = () => controller.abort();
-  if (parent?.aborted) controller.abort();
+  if (parent?.aborted || revokedRecently(credentialId(credential))) controller.abort();
   else parent?.addEventListener("abort", onAbort, { once: true });
   const id = credentialId(credential);
   const set = inFlight.get(id) ?? new Set<AbortController>();
