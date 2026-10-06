@@ -327,15 +327,22 @@ fn connect_without_the_stop_marker_keeps_retrying_a_missing_credential() {
     );
     // A macOS LaunchAgent or detached daemon: exiting would only relaunch.
     // The generous timeout leaves room for slow CI startup before the warning.
-    cli(&config, &state)
+    let output = cli(&config, &state)
         .arg("connect")
         .env_remove("WSMP_STOP_ON_REJECTED_CREDENTIAL")
         .timeout(std::time::Duration::from_secs(10))
-        .assert()
-        .interrupted()
-        .stderr(predicate::str::contains(
-            "relay credential unavailable; retrying",
-        ));
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("relay credential unavailable; retrying"),
+        "{stderr}"
+    );
+    // Still running when the timeout killed it. Windows reports a killed
+    // process as exit code 1, so only Unix can tell a kill from an exit.
+    assert_ne!(output.status.code(), Some(4), "{stderr}");
+    #[cfg(unix)]
+    assert_eq!(output.status.code(), None, "{stderr}");
 }
 
 #[test]
