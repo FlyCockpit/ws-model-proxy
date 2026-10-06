@@ -12,6 +12,7 @@ use crate::auth::{
     DeviceFlowState, ExchangeError, exchange_device_code, start_device_authorization,
 };
 use crate::config::Config;
+use crate::display_escape::escape_single_line;
 use crate::hostname::hostname_slug;
 use crate::output;
 use crate::slug::validate_slug;
@@ -55,11 +56,15 @@ pub fn run(args: &Args) -> Result<()> {
             interval: started.interval,
         })?;
     } else {
-        // The approval page shows this slug; they must match.
+        // The approval page shows this slug; they must match. The code and
+        // URL come from the server, so they are printed escaped.
         output::line(format!("cli slug: {cli_slug}"))?;
-        output::line(format!("user code: {}", started.user_code))?;
+        output::line(format!(
+            "user code: {}",
+            escape_single_line(&started.user_code)
+        ))?;
         if let Some(url) = &approval_url {
-            output::line(format!("open: {url}"))?;
+            output::line(format!("open: {}", escape_single_line(url)))?;
         }
     }
     offer_browser_open(&started, approval_url.as_deref(), &server_url)?;
@@ -190,21 +195,23 @@ fn offer_browser_open(
     approval_url: Option<&str>,
     server_url: &str,
 ) -> Result<()> {
-    let Some(url) = approval_url else {
+    let Some(raw_url) = approval_url else {
         return Ok(());
     };
     if !interactive_terminal() {
         return Ok(());
     }
+    // Server-supplied text is only ever printed escaped.
+    let url = escape_single_line(raw_url);
+    let user_code = escape_single_line(&started.user_code);
     // The approval URL comes from the server. Only a URL on the configured
     // server's origin reaches the OS opener; anything else is printed for the
     // person to judge.
-    let checked = match browser_url(url, server_url) {
+    let checked = match browser_url(raw_url, server_url) {
         Ok(checked) => checked,
         Err(error) => {
             output::diagnostic(format!(
-                "not opening the browser: {error:#}; open {url} yourself and enter code {} to continue",
-                started.user_code
+                "not opening the browser: {error:#}; open {url} yourself and enter code {user_code} to continue"
             ))?;
             return Ok(());
         }
@@ -216,10 +223,7 @@ fn offer_browser_open(
         .read_line(&mut ignored)
         .context("reading browser-open confirmation from stdin")?;
     if bytes == 0 {
-        output::diagnostic(format!(
-            "open {url} and enter code {} to continue",
-            started.user_code
-        ))?;
+        output::diagnostic(format!("open {url} and enter code {user_code} to continue"))?;
         return Ok(());
     }
 
@@ -227,8 +231,7 @@ fn offer_browser_open(
         Ok(()) => Ok(()),
         Err(error) => {
             output::diagnostic(format!(
-                "could not open browser: {error}; open {url} and enter code {} to continue",
-                started.user_code
+                "could not open browser: {error}; open {url} and enter code {user_code} to continue"
             ))?;
             Ok(())
         }
@@ -302,9 +305,35 @@ fn windows_opener_args(url: &url::Url) -> [&str; 2] {
     ["url.dll,FileProtocolHandler", url.as_str()]
 }
 
+/// `%SystemRoot%\System32\rundll32.exe`, so no `rundll32.exe` planted in the
+/// current directory or on `PATH` runs instead. A missing or odd `SystemRoot`
+/// (not a plain `X:\...` path) falls back to the default Windows directory.
+#[cfg(any(target_os = "windows", test))]
+fn rundll32_path(system_root: Option<&str>) -> String {
+    const FALLBACK: &str = r"C:\Windows\System32\rundll32.exe";
+    let Some(root) = system_root.map(|root| root.trim_end_matches('\\')) else {
+        return FALLBACK.to_string();
+    };
+    let bytes = root.as_bytes();
+    let drive_path =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+    let plain = drive_path
+        && !root[2..].contains(':')
+        && !root.chars().any(|ch| {
+            ch.is_control() || matches!(ch, '"' | '/' | '%' | '*' | '?' | '<' | '>' | '|')
+        })
+        && !root.split('\\').any(|part| part == "..");
+    if plain {
+        format!(r"{root}\System32\rundll32.exe")
+    } else {
+        FALLBACK.to_string()
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn open_browser(url: &url::Url) -> Result<()> {
-    run_opener(Command::new("rundll32.exe").args(windows_opener_args(url)))
+    let system_root = std::env::var("SystemRoot").ok();
+    run_opener(Command::new(rundll32_path(system_root.as_deref())).args(windows_opener_args(url)))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -466,5 +495,34 @@ mod tests {
         assert_eq!(handler, "url.dll,FileProtocolHandler");
         assert!(arg.starts_with("https://wsmp.example.com/device?user_code=AB&calc.exe"));
         assert!(!arg.chars().any(|ch| ch.is_whitespace() || ch == '"'));
+    }
+
+    #[test]
+    fn rundll32_resolves_under_system_root_with_a_safe_fallback() {
+        let fallback = r"C:\Windows\System32\rundll32.exe";
+        assert_eq!(
+            rundll32_path(Some(r"D:\Win")),
+            r"D:\Win\System32\rundll32.exe"
+        );
+        assert_eq!(
+            rundll32_path(Some(r"C:\Windows\")),
+            fallback,
+            "a trailing separator is trimmed"
+        );
+        for odd in [
+            None,
+            Some(""),
+            Some("Windows"),
+            Some(r".\Windows"),
+            Some(r"\\server\share"),
+            Some(r"C:"),
+            Some(r"C:\Win\..\Temp"),
+            Some(r"C:\Temp:stream"),
+            Some("C:\\Win\"dows"),
+            Some(r"C:\%TEMP%"),
+            Some("C:\\Win\ndows"),
+        ] {
+            assert_eq!(rundll32_path(odd), fallback, "{odd:?}");
+        }
     }
 }
