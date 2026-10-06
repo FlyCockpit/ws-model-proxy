@@ -216,8 +216,10 @@ describe("forwarderManagementRouter", () => {
       memberConcurrencyLimit: 1,
       reservedSlots: 0,
       localWaitBudgetMs: 30_000,
-      providerModels: [],
+      // providerModels omitted: a local-only pool defaults it to [].
     });
+
+    expect(db.providerModel.findMany).not.toHaveBeenCalled();
 
     expect(db.modelPool.create).toHaveBeenCalledWith(
       expect.objectContaining({
