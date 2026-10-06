@@ -256,7 +256,8 @@ The terminals page shows each CLI's fingerprint: base32 of the first 20 bytes of
   the unit or wrapper, so the service reads the same `device-auth.json` as the
   installing shell even when that shell set `WSMP_STATE_DIR` or
   `XDG_STATE_HOME`. It also pins the installing shell's `PATH`, so commands
-  the relay starts find the same programs as that shell. Re-run
+  the relay starts find the same programs as that shell; only absolute,
+  existing directories that other users cannot write to are kept, each once. Re-run
   `wsmp service install` after changing any of them.
   `wsmp config show` prints `configFile` and `stateDir`, and `wsmp status`
   prints the state directory in use.

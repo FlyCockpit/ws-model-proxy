@@ -226,11 +226,53 @@ pub fn pinned_service_env() -> Result<Vec<(&'static str, String)>> {
         pin("WSMP_STATE_DIR", crate::paths::state_dir()?)?,
     ];
     // The installing shell's PATH, frozen at install time; re-run install to
-    // refresh it. Skipped when unset, empty or not UTF-8.
-    if let Some(path) = std::env::var("PATH").ok().filter(|path| !path.is_empty()) {
+    // refresh it. Skipped when unset, not UTF-8, or nothing usable is left.
+    if let Some(path) = std::env::var("PATH")
+        .ok()
+        .and_then(|path| service_path(&path, usable_service_path_dir))
+    {
         pinned.push(("PATH", path));
     }
     Ok(pinned)
+}
+
+/// The installing shell's `PATH` reduced to what a service should search:
+/// absolute directories `keep` accepts, each once, in order. Empty and
+/// relative entries (which would resolve against the service's working
+/// directory) are dropped. None when nothing is left.
+pub fn service_path(path: &str, keep: impl Fn(&Path) -> bool) -> Option<String> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dir in std::env::split_paths(path) {
+        if dir.as_os_str().is_empty() || !dir.is_absolute() || dirs.contains(&dir) || !keep(&dir) {
+            continue;
+        }
+        dirs.push(dir);
+    }
+    if dirs.is_empty() {
+        return None;
+    }
+    std::env::join_paths(dirs).ok()?.into_string().ok()
+}
+
+/// An existing directory that other users cannot write to (a world-writable
+/// directory on the service's PATH would let them plant programs it runs).
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+fn usable_service_path_dir(dir: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(dir) else {
+        return false;
+    };
+    if !metadata.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o002 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Render a systemd user unit for the relay. `pinned` holds non-secret
@@ -754,6 +796,38 @@ mod tests {
         )));
         // Only the pinned paths and the stop marker: no token or header variables.
         assert_eq!(unit.matches("Environment=").count(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_path_keeps_only_absolute_usable_directories_once() {
+        let keep = |dir: &Path| dir != Path::new("/tmp/open");
+        assert_eq!(
+            service_path(
+                "/usr/bin::relative/bin:./bin:/tmp/open:/usr/bin:/home/me/.local/bin:",
+                keep
+            )
+            .as_deref(),
+            Some("/usr/bin:/home/me/.local/bin")
+        );
+        assert_eq!(service_path("", keep), None);
+        assert_eq!(service_path(":relative", keep), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_path_directories_must_exist_and_not_be_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let private = root.path().join("private");
+        let open = root.path().join("open");
+        fs::create_dir(&private).expect("private");
+        fs::create_dir(&open).expect("open");
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).expect("chmod");
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert!(usable_service_path_dir(&private));
+        assert!(!usable_service_path_dir(&open));
+        assert!(!usable_service_path_dir(&root.path().join("missing")));
     }
 
     #[test]

@@ -144,10 +144,18 @@ const FALLBACK_PATH: &[&str] = &[];
 /// `~/.cargo/bin`, where wsmp is usually installed, so `wsmp ...` from a
 /// headless command would not be found otherwise.
 fn with_exe_dir(path: Option<&str>, exe_dir: &Path) -> Option<String> {
-    let mut dirs: Vec<PathBuf> = match path {
-        Some(path) => std::env::split_paths(path).collect(),
-        None => FALLBACK_PATH.iter().map(PathBuf::from).collect(),
-    };
+    // Empty components (`::`, a leading or trailing `:`) mean the working
+    // directory to a shell; never keep or create one.
+    let mut dirs: Vec<PathBuf> = path
+        .map(|path| {
+            std::env::split_paths(path)
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if dirs.is_empty() {
+        dirs = FALLBACK_PATH.iter().map(PathBuf::from).collect();
+    }
     if dirs.iter().any(|dir| dir == exe_dir) {
         return None;
     }
@@ -521,6 +529,16 @@ mod tests {
                 ("PATH", "/usr/local/bin:/usr/bin:/bin:/home/me/.local/bin")
             ])
         );
+        // An empty PATH (or empty components) never becomes `:<exe_dir>`.
+        let mut env = owned(&[("PATH", "")]);
+        complete_child_env(&mut env, &facts, |_| false);
+        assert_eq!(
+            env,
+            owned(&[("PATH", "/usr/local/bin:/usr/bin:/bin:/home/me/.local/bin")])
+        );
+        let mut env = owned(&[("PATH", ":/usr/bin::")]);
+        complete_child_env(&mut env, &facts, |_| false);
+        assert_eq!(env, owned(&[("PATH", "/usr/bin:/home/me/.local/bin")]));
         // A directory that cannot be listed in PATH is left out.
         let odd = HostEnvFacts {
             exe_dir: Some(PathBuf::from("/opt/a:b")),
