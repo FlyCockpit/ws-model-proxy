@@ -117,6 +117,8 @@ model RuntimeVersion {
   editor           Actor
   editorUserId     String
   agentTokenId     String?
+  /// The OAuth grant (`McpGrant.id`) when an OAuth client acted; at most one of the two is set.
+  mcpGrantId       String?
   /// Server-only: sha256 of canonical { spec, limit columns, advanced }. Never sent to nodes.
   contentHash      String
   /// THE node-side identity: sha256(canonical(spec)). Used in runtime.define envelopes, the
@@ -427,6 +429,8 @@ model RuntimeOperation {
   actor        Actor
   actorUserId  String
   agentTokenId String?
+  /// The OAuth grant (`McpGrant.id`) when an OAuth client acted; at most one of the two is set.
+  mcpGrantId   String?
   profileId    String?
   /// The preview that was applied: starts, stops (incl. preemptions), kept, warnings.
   summary      Json

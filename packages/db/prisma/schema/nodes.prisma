@@ -221,6 +221,9 @@ model NodeCommand {
   nodeId       String
   actor        Actor
   agentTokenId String?
+  /// The agent's OAuth grant (`McpGrant.id`) when an OAuth client acted; `agentTokenId` when an
+  /// agent token did. At most one is set (plain ids, like the audit).
+  mcpGrantId   String?
   /// `hmac-sha256:<hex> <program>` (never the command text).
   subject      String
   state        NodeCommandState @default(RUNNING)
@@ -346,6 +349,9 @@ model NodeAuditEvent {
   nodeId       String
   actor        Actor
   agentTokenId String?
+  /// The agent's OAuth grant (`McpGrant.id`) when an OAuth client acted; `agentTokenId` when an
+  /// agent token did. At most one is set (plain ids, like the audit).
+  mcpGrantId   String?
   kind         NodeAuditKind
   /// File path, `hmac-sha256:<hex> <program>` for commands, `runtime:<id>@<version>`, etc.
   subject      String
@@ -386,6 +392,9 @@ model QueuedNodeCommand {
   userId       String
   nodeId       String
   agentTokenId String?
+  /// The agent's OAuth grant (`McpGrant.id`) when an OAuth client acted; `agentTokenId` when an
+  /// agent token did. At most one is set (plain ids, like the audit).
+  mcpGrantId   String?
   /// ≤ 16 KiB, deployment text rules (no hidden characters).
   command      String
   note         String?

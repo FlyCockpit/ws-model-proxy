@@ -10,6 +10,8 @@ model AuditEvent {
   actor        Actor
   actorUserId  String
   agentTokenId String?
+  /// The OAuth grant (`McpGrant.id`) when an OAuth client acted; at most one of the two is set.
+  mcpGrantId   String?
   /// e.g. pool.update, pool.fallback.mode, runtime.version.create, share.create,
   /// spend_cap.update, provider.credential.replace, node.trust_lower.
   action       String

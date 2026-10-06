@@ -402,7 +402,7 @@ export const nodesContract = {
       })
       .strict(),
     nodeDetailSchema,
-    "Labels, port range, declared hardware, metric commands, fabrics, command lifetime, rescan. Full-control nodes only for everyone (trust_relay). Changing the address of a node a running multi-node instance uses on that fabric is refused (fabric_in_use). Secrets go through secrets.set / secrets.delete.",
+    "Labels, port range, declared hardware, metric commands, fabrics, command lifetime, rescan. Full-control nodes only for everyone (trust_relay). Changing the address of a node a running multi-node instance uses on that fabric is refused (fabric_in_use); a port range that leaves out a port a running instance there uses is refused (port_range_in_use). Secrets go through secrets.set / secrets.delete.",
     ["node_update"],
   ),
   /**

@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { inviteAcceptance, inviteEmailKey, type PendingInvite } from "./invite-acceptance";
 import { isFabricIp } from "./ip-literal";
+import { previewFingerprint } from "./preview-fingerprint";
 import { planProfileHolds } from "./profile-holds";
 import { fabricIpSchema, runtimeBaseUrlSchema, runtimeSpecWarnings } from "./runtime-spec";
 
@@ -112,6 +113,30 @@ describe("profile apply and node holds", () => {
       ]),
     });
     expect(plan).toEqual({ ok: true, hold: [], release: ["x", "y"], keep: [] });
+  });
+});
+
+describe("preview fingerprint", () => {
+  const preview = {
+    fingerprint: "0".repeat(64),
+    starts: [],
+    stops: [],
+    kept: [],
+    holds: [{ nodeId: "x", change: "hold", heldBy: null, note: null }],
+    warnings: [],
+    refusals: [],
+  };
+  it("covers the hold changes a person confirms, and ignores its own field", () => {
+    const base = previewFingerprint(preview);
+    expect(base).toMatch(/^[0-9a-f]{64}$/);
+    expect(previewFingerprint({ ...preview, fingerprint: base })).toBe(base);
+    expect(
+      previewFingerprint({
+        ...preview,
+        holds: [{ nodeId: "x", change: "release", heldBy: "person", note: null }],
+      }),
+    ).not.toBe(base);
+    expect(previewFingerprint({ ...preview, holds: [] })).not.toBe(base);
   });
 });
 

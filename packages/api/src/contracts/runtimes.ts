@@ -35,7 +35,7 @@ import {
 import { mutation, query } from "./procedure";
 import { refusalReasonSchema, refusalSchema } from "./refusals";
 
-/** Built-in starting points (`packages/config/src/runtime-presets.ts`). */
+/** Built-in starting points (`packages/api/src/lib/runtime-presets.ts`, typed by the runtime spec). */
 export const RUNTIME_PRESETS = [
   "detected",
   "vllm",
@@ -230,9 +230,26 @@ export const previewWarningSchema = z
   })
   .strict();
 
+/**
+ * A hold change a profile apply makes (`planProfileHolds`). Part of what a person confirms:
+ * the fingerprint covers it. Empty for a plain runtime start.
+ */
+export const previewHoldChangeSchema = z
+  .object({
+    nodeId: idSchema,
+    change: z.enum(["hold", "release", "keep"]),
+    /** Who holds it now (before the apply); null when it is not held. */
+    heldBy: z.enum(["this_profile", "person", "other_profile"]).nullable(),
+    note: z.string().nullable(),
+  })
+  .strict();
+
 export const startPreviewSchema = z
   .object({
-    /** Echo it back to apply exactly this preview (people); agents may omit it. */
+    /**
+     * `previewFingerprint` of everything else in the preview (lib/preview-fingerprint.ts):
+     * echo it back to apply exactly this preview (people); agents may omit it.
+     */
     fingerprint: sha256Schema,
     starts: z.array(
       z
@@ -255,6 +272,8 @@ export const startPreviewSchema = z
         .strict(),
     ),
     kept: z.array(idSchema),
+    /** Node holds this apply sets, releases or leaves (profiles only). */
+    holds: z.array(previewHoldChangeSchema),
     warnings: z.array(previewWarningSchema),
     /** Why it cannot run (e.g. trust_relay for an agent, definition_frozen, no_shared_fabric, node_held). */
     refusals: z.array(refusalSchema),

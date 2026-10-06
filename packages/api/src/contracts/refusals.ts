@@ -71,6 +71,9 @@ export const REFUSAL_REASONS = [
    * e-mail verification off, only the link works).
    */
   "invite_needs_link",
+  // Lane B contract gaps.
+  /** A new node port range leaves out a port a running instance on the node uses. */
+  "port_range_in_use",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

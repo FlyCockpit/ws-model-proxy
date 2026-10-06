@@ -45,11 +45,18 @@ export const apiContract = {
 
 /**
  * Procedures whose `/rpc` call must carry a validated `x-csrf-token` header on every deployment
- * shape (the source of `CallerAuth.csrfVerified`): every human and human_admin procedure.
+ * shape (the source of `CallerAuth.csrfVerified`): every human and human_admin procedure, and
+ * every agent-level mutation (a cookie caller reaches those as a person, so a cross-site page
+ * must not be able to fire one).
  */
 export const CSRF_REQUIRED_PROCEDURES: ReadonlySet<string> = new Set(
   flattenContract(apiContract)
-    .filter(([, procedure]) => procedure.access === "human" || procedure.access === "human_admin")
+    .filter(
+      ([, procedure]) =>
+        procedure.access === "human" ||
+        procedure.access === "human_admin" ||
+        (procedure.access === "agent" && procedure.kind === "mutation"),
+    )
     .map(([path]) => path),
 );
 

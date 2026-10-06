@@ -269,11 +269,15 @@ describe("caller auth (positive human check)", () => {
     }
   });
 
-  it("requires the CSRF header on every human procedure, queries included", () => {
+  it("requires the CSRF header on every human procedure (queries included) and agent mutation", () => {
     expect(CSRF_REQUIRED_PROCEDURES.has("nodes.lowerTrustPreview")).toBe(true);
+    expect(CSRF_REQUIRED_PROCEDURES.has("runtimes.start")).toBe(true);
+    expect(CSRF_REQUIRED_PROCEDURES.has("nodes.list")).toBe(false);
     for (const [path, procedure] of procedures)
       expect(CSRF_REQUIRED_PROCEDURES.has(path), path).toBe(
-        procedure.access === "human" || procedure.access === "human_admin",
+        procedure.access === "human" ||
+          procedure.access === "human_admin" ||
+          (procedure.access === "agent" && procedure.kind === "mutation"),
       );
   });
 

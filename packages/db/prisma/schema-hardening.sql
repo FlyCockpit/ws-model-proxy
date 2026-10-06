@@ -182,7 +182,9 @@ ALTER TABLE node_command DROP CONSTRAINT IF EXISTS node_command_shape;
 ALTER TABLE node_command ADD CONSTRAINT node_command_shape CHECK (
   id ~ '^[A-Za-z0-9_-]{22}$'
   AND length(subject) BETWEEN 1 AND 4096
-  AND (actor = 'AGENT') = ("agentTokenId" IS NOT NULL)
+  -- An agent acted through exactly one credential: an agent token or an OAuth grant.
+  AND (actor = 'AGENT') = (num_nonnulls("agentTokenId", "mcpGrantId") = 1)
+  AND num_nonnulls("agentTokenId", "mcpGrantId") <= 1
   AND "endsBy" > "startedAt" AND "endsBy" <= "startedAt" + interval '24 hours'
   AND (state = 'RUNNING') = ("finishedAt" IS NULL)
   AND ("finishedAt" IS NULL OR "finishedAt" >= "startedAt")
@@ -429,7 +431,8 @@ ALTER TABLE node_audit_event ADD CONSTRAINT node_audit_event_shape CHECK (
   AND length(subject) BETWEEN 1 AND 4096
   AND (rank IS NULL OR rank BETWEEN 0 AND 63)
   AND ("exitCode" IS NULL OR "exitCode" BETWEEN 0 AND 255)
-  AND (actor = 'AGENT') = ("agentTokenId" IS NOT NULL)
+  AND (actor = 'AGENT') = (num_nonnulls("agentTokenId", "mcpGrantId") = 1)
+  AND num_nonnulls("agentTokenId", "mcpGrantId") <= 1
   AND ("finishedAt" IS NULL OR "finishedAt" >= "startedAt")
 );
 DROP TRIGGER IF EXISTS node_audit_event_append_only ON node_audit_event;
@@ -439,6 +442,8 @@ FOR EACH ROW EXECUTE FUNCTION reject_immutable_history_mutation();
 ALTER TABLE queued_node_command DROP CONSTRAINT IF EXISTS queued_node_command_shape;
 ALTER TABLE queued_node_command ADD CONSTRAINT queued_node_command_shape CHECK (
   octet_length(command) BETWEEN 1 AND 16384
+  -- Queued by an agent: through exactly one credential (agent token or OAuth grant).
+  AND num_nonnulls("agentTokenId", "mcpGrantId") = 1
   AND (note IS NULL OR octet_length(note) <= 2000)
   AND "expiresAt" > "createdAt"
   AND "expiresAt" <= "createdAt" + interval '7 days'
@@ -449,8 +454,10 @@ ALTER TABLE queued_node_command ADD CONSTRAINT queued_node_command_shape CHECK (
 CREATE OR REPLACE FUNCTION enforce_queued_node_command_transition()
 RETURNS trigger LANGUAGE plpgsql AS $queued_node_command_transition$
 BEGIN
-  IF (NEW.command, NEW.note, NEW."nodeId", NEW."userId", NEW."agentTokenId", NEW."expiresAt")
-     IS DISTINCT FROM (OLD.command, OLD.note, OLD."nodeId", OLD."userId", OLD."agentTokenId", OLD."expiresAt") THEN
+  IF (NEW.command, NEW.note, NEW."nodeId", NEW."userId", NEW."agentTokenId", NEW."mcpGrantId",
+      NEW."expiresAt")
+     IS DISTINCT FROM (OLD.command, OLD.note, OLD."nodeId", OLD."userId", OLD."agentTokenId",
+      OLD."mcpGrantId", OLD."expiresAt") THEN
     RAISE EXCEPTION 'a queued command is immutable' USING ERRCODE = '55000';
   END IF;
   IF OLD.state <> 'QUEUED' AND NEW.state IS DISTINCT FROM OLD.state THEN
@@ -487,7 +494,8 @@ ALTER TABLE runtime_version ADD CONSTRAINT runtime_version_derived_columns CHECK
   AND "launchHash" ~ '^[0-9a-f]{64}$'
   AND "contentHash" ~ '^[0-9a-f]{64}$'
   AND version >= 1
-  AND (editor = 'AGENT') = ("agentTokenId" IS NOT NULL)
+  AND (editor = 'AGENT') = (num_nonnulls("agentTokenId", "mcpGrantId") = 1)
+  AND num_nonnulls("agentTokenId", "mcpGrantId") <= 1
   AND (note IS NULL OR length(note) BETWEEN 1 AND 500)
   AND octet_length(spec::text) <= 65536
 );
@@ -659,7 +667,8 @@ ALTER TABLE instance_step ADD CONSTRAINT instance_step_operator_hold CHECK (
 
 ALTER TABLE runtime_operation DROP CONSTRAINT IF EXISTS runtime_operation_shape;
 ALTER TABLE runtime_operation ADD CONSTRAINT runtime_operation_shape CHECK (
-  (actor = 'AGENT') = ("agentTokenId" IS NOT NULL)
+  (actor = 'AGENT') = (num_nonnulls("agentTokenId", "mcpGrantId") = 1)
+  AND num_nonnulls("agentTokenId", "mcpGrantId") <= 1
   AND (kind = 'PROFILE_APPLY') = ("profileId" IS NOT NULL)
   AND fingerprint ~ '^[0-9a-f]{64}$'
   AND jsonb_typeof(summary) = 'object'
@@ -1444,7 +1453,8 @@ CREATE TRIGGER audit_event_immutable BEFORE UPDATE ON audit_event
 FOR EACH ROW EXECUTE FUNCTION reject_immutable_history_mutation();
 ALTER TABLE audit_event DROP CONSTRAINT IF EXISTS audit_event_shape;
 ALTER TABLE audit_event ADD CONSTRAINT audit_event_shape CHECK (
-  (actor = 'AGENT') = ("agentTokenId" IS NOT NULL)
+  (actor = 'AGENT') = (num_nonnulls("agentTokenId", "mcpGrantId") = 1)
+  AND num_nonnulls("agentTokenId", "mcpGrantId") <= 1
   AND action ~ '^[a-z_]+(\.[a-z_]+)*$'
   AND length("resourceType") BETWEEN 1 AND 64
   AND length("resourceId") BETWEEN 1 AND 128

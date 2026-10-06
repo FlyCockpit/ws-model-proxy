@@ -417,6 +417,27 @@ try {
     "55000",
   );
   await expectFailure(
+    "node_command_shape agent without a credential",
+    `INSERT INTO node_command (id, "userId", "nodeId", actor, subject, "startedAt", "endsBy")
+     VALUES ('CCCCCCCCCCCCCCCCCCCCCC', 'owner-a', 'node-a1', 'AGENT', 'x', now(), now() + interval '1 hour')`,
+    "23514",
+  );
+  await expectFailure(
+    "node_command_shape agent with both credentials",
+    `INSERT INTO node_command (id, "userId", "nodeId", actor, "agentTokenId", "mcpGrantId", subject, "startedAt", "endsBy")
+     VALUES ('CCCCCCCCCCCCCCCCCCCCCC', 'owner-a', 'node-a1', 'AGENT', 'tok-1', 'grant-1', 'x', now(), now() + interval '1 hour')`,
+    "23514",
+  );
+  await client.query(`
+    INSERT INTO node_command (id, "userId", "nodeId", actor, "mcpGrantId", subject, "startedAt", "endsBy")
+    VALUES ('DDDDDDDDDDDDDDDDDDDDDD', 'owner-a', 'node-a1', 'AGENT', 'grant-1', 'x', now(), now() + interval '1 hour')`);
+  await expectFailure(
+    "node_audit_event_shape agent with both credentials",
+    `INSERT INTO node_audit_event (id, "userId", "nodeId", actor, "agentTokenId", "mcpGrantId", kind, subject, outcome, "startedAt")
+     VALUES ('nae-both', 'owner-a', 'node-a1', 'AGENT', 'tok-1', 'grant-1', 'command', 'x', 'completed', now())`,
+    "23514",
+  );
+  await expectFailure(
     "node_command_shape lifetime over 24 h",
     `INSERT INTO node_command (id, "userId", "nodeId", actor, subject, "startedAt", "endsBy")
      VALUES ('BBBBBBBBBBBBBBBBBBBBBB', 'owner-a', 'node-a1', 'USER', 'x', now(), now() + interval '25 hours')`,
@@ -575,9 +596,21 @@ try {
      VALUES ('cred-2', 'owner-a', 'node-a1', 'lp-2', 'sd-2', 'key')`,
     "23505",
   );
+  await expectFailure(
+    "queued_node_command_shape without the agent's credential",
+    `INSERT INTO queued_node_command (id, "userId", "nodeId", command, "expiresAt")
+     VALUES ('q-0', 'owner-a', 'node-a1', 'sudo apt install x', now() + interval '1 day')`,
+    "23514",
+  );
+  await expectFailure(
+    "queued_node_command_shape with both credentials",
+    `INSERT INTO queued_node_command (id, "userId", "nodeId", "agentTokenId", "mcpGrantId", command, "expiresAt")
+     VALUES ('q-0', 'owner-a', 'node-a1', 'tok-1', 'grant-1', 'sudo apt install x', now() + interval '1 day')`,
+    "23514",
+  );
   await client.query(`
-    INSERT INTO queued_node_command (id, "userId", "nodeId", command, "expiresAt")
-    VALUES ('q-1', 'owner-a', 'node-a1', 'sudo apt install x', now() + interval '1 day')`);
+    INSERT INTO queued_node_command (id, "userId", "nodeId", "mcpGrantId", command, "expiresAt")
+    VALUES ('q-1', 'owner-a', 'node-a1', 'grant-1', 'sudo apt install x', now() + interval '1 day')`);
   await client.query(
     `UPDATE queued_node_command SET state = 'DISMISSED', "decidedAt" = now(), "decidedBy" = 'owner-a' WHERE id = 'q-1'`,
   );
