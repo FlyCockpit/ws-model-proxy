@@ -380,7 +380,7 @@ pub fn run(
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, RunError> {
     let deadline = Instant::now() + timeout;
-    run_inner(program, args, deadline, limit, cancel, None)
+    run_inner(program, args, deadline, limit, cancel, None, false)
 }
 
 /// Total budget variant: settlement shares the caller's absolute deadline.
@@ -392,7 +392,29 @@ pub fn run_until(
     limit: usize,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, RunError> {
-    run_inner(program, args, deadline, limit, cancel, Some(deadline))
+    run_inner(
+        program,
+        args,
+        deadline,
+        limit,
+        cancel,
+        Some(deadline),
+        false,
+    )
+}
+
+/// [`run_until`] for programs that report through stdout and their exit
+/// status at once (`systemctl is-system-running` prints `degraded` and exits
+/// 1): stdout is returned whatever the exit status, never `ExitStatus`. Every
+/// other failure (spawn, timeout, size, cancel) is still an error.
+pub fn run_until_any_status(
+    program: &str,
+    args: &[String],
+    deadline: Instant,
+    limit: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<u8>, RunError> {
+    run_inner(program, args, deadline, limit, cancel, Some(deadline), true)
 }
 
 fn run_inner(
@@ -402,6 +424,7 @@ fn run_inner(
     limit: usize,
     cancel: Option<&AtomicBool>,
     settlement: Option<Instant>,
+    any_status: bool,
 ) -> Result<Vec<u8>, RunError> {
     let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
     if cancelled() {
@@ -514,7 +537,7 @@ fn run_inner(
         return Err(RunError::Timeout);
     }
     match finished.status {
-        Some(status) if status.success() => Ok(buffer),
+        Some(status) if status.success() || any_status => Ok(buffer),
         Some(_) => Err(RunError::ExitStatus),
         // Exited but never reaped in the grace: no verdict on its status.
         None => Err(RunError::Timeout),

@@ -1811,3 +1811,34 @@ impl TerminalId for Job {
         });
     }
 }
+
+#[test]
+fn a_degraded_or_starting_user_manager_is_live() {
+    for state in ["running", "degraded\n", " starting \n"] {
+        assert!(user_manager_live(state), "{state:?}");
+    }
+    for state in ["", "offline", "stopping", "maintenance", "unknown\n"] {
+        assert!(!user_manager_live(state), "{state:?}");
+    }
+}
+
+#[test]
+fn linger_is_read_from_loginctl_output_robustly() {
+    for output in [
+        "Linger=yes",
+        "Linger=yes\n",
+        "  Linger = yes  \n",
+        "Name=me\nLinger=yes\n",
+    ] {
+        assert!(linger_enabled(output), "{output:?}");
+    }
+    for output in [
+        "",
+        "Linger=no\n",
+        "Linger=yesno",
+        "NoLinger=yes",
+        "linger=yes",
+    ] {
+        assert!(!linger_enabled(output), "{output:?}");
+    }
+}

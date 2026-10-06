@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use wsmp::bounded_run::{REAP_GRACE, RunError, run};
+use wsmp::bounded_run::{REAP_GRACE, RunError, run, run_until_any_status};
 
 /// A process in its own group, alive for the test: the escaping child joins
 /// that group, so the deadline's `killpg(child pid)` finds nothing to kill.
@@ -383,4 +383,35 @@ fn cancel_kills_the_group_at_once() {
     let survived = path.exists();
     let _ = std::fs::remove_file(&path);
     assert!(!survived, "the helper outlived a cancelled run");
+}
+
+/// `run_until_any_status` keeps stdout on a nonzero exit (how
+/// `systemctl is-system-running` reports `degraded`), but every other failure
+/// stays an error.
+#[test]
+fn any_status_returns_stdout_on_a_nonzero_exit() {
+    let args = |script: &str| vec!["-c".to_string(), script.to_string()];
+    let deadline = || Instant::now() + Duration::from_secs(5);
+    assert_eq!(
+        run_until_any_status("sh", &args("echo degraded; exit 1"), deadline(), 1024, None),
+        Ok(b"degraded\n".to_vec())
+    );
+    assert_eq!(
+        run_until_any_status("sh", &args("echo running"), deadline(), 1024, None),
+        Ok(b"running\n".to_vec())
+    );
+    assert_eq!(
+        run_until_any_status(
+            "sh",
+            &args("yes x | head -c 4096; exit 1"),
+            deadline(),
+            16,
+            None
+        ),
+        Err(RunError::OutputTooLarge)
+    );
+    assert_eq!(
+        run_until_any_status("wsmp-no-such-program", &[], deadline(), 16, None),
+        Err(RunError::Spawn)
+    );
 }
