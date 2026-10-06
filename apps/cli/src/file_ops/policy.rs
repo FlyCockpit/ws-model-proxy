@@ -456,6 +456,13 @@ fn default_protected() -> Vec<Protected> {
         });
         for name in [
             "device-auth.json",
+            "node-credential.json",
+            "node-secrets.json",
+            "runtime-store.json",
+            "frozen-definitions.json",
+            "runtime-instances.json",
+            "runtime-instances.lock",
+            "node-commands.json",
             "terminal-identity.json",
             "terminal-approvals.json",
             "terminal-approval-pending.json",

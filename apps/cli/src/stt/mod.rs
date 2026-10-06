@@ -83,12 +83,13 @@ impl EngineEndpoint {
     pub fn credential_headers(&self) -> Result<Vec<(String, String)>> {
         let mut headers = Vec::with_capacity(self.headers.len() + 1);
         for (name, env) in &self.headers {
-            let value =
-                std::env::var(env).with_context(|| format!("reading endpoint header `{name}`"))?;
+            let value = crate::secrets::credential(env)
+                .with_context(|| format!("reading endpoint header `{name}`"))?;
             headers.push((name.clone(), value));
         }
         if let Some((mode, env)) = &self.auth {
-            let value = std::env::var(env).context("reading typed endpoint credential")?;
+            let value =
+                crate::secrets::credential(env).context("reading typed endpoint credential")?;
             headers.push(match mode {
                 EndpointAuthMode::ApiKey => ("x-api-key".into(), value),
                 EndpointAuthMode::Bearer => ("authorization".into(), format!("Bearer {value}")),

@@ -138,7 +138,7 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
         .into();
     let mut request = agent.get(url.as_str()).header("Accept", "application/json");
     for header in &endpoint.headers {
-        let value = std::env::var(&header.env).with_context(|| {
+        let value = crate::secrets::credential(&header.env).with_context(|| {
             format!(
                 "reading endpoint header `{}` from `{}`",
                 header.name, header.env
@@ -147,7 +147,7 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
         request = request.header(&header.name, &value);
     }
     if let Some(auth) = &endpoint.auth {
-        let value = std::env::var(&auth.env)
+        let value = crate::secrets::credential(&auth.env)
             .with_context(|| format!("reading typed endpoint credential from `{}`", auth.env))?;
         request = match auth.mode {
             crate::config::EndpointAuthMode::ApiKey => request.header("x-api-key", &value),

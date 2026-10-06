@@ -33,6 +33,8 @@ pub mod paths;
 pub mod probe;
 pub mod protocol;
 pub mod relay_bus;
+pub mod runtime_store;
+pub mod runtimes;
 pub mod secrets;
 pub mod sessions;
 pub mod shutdown;
@@ -48,6 +50,7 @@ pub mod terminal_identity;
 pub mod terminal_parse;
 pub mod tls;
 pub mod tokens;
+pub mod trust;
 
 #[cfg(all(test, windows))]
 #[path = "../tests/support/windows_tree.rs"]

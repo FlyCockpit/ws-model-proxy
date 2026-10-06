@@ -193,9 +193,9 @@ pub fn conform_node_metrics(metrics: &mut NodeMetrics) {
                 && series.value.is_finite()
                 && labels.is_none_or(|labels| {
                     labels.len() <= CUSTOM_LABELS_MAX
-                        && labels
-                            .iter()
-                            .all(|(key, value)| is_label_key(key) && is_metric_name(value))
+                        && labels.iter().all(|(key, value)| {
+                            is_label_key(key) && crate::telemetry::is_label_value(value)
+                        })
                 })
         });
         custom.truncate(NODE_METRICS_CUSTOM_MAX);

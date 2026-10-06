@@ -380,7 +380,7 @@ pub fn run(
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, RunError> {
     let deadline = Instant::now() + timeout;
-    run_inner(program, args, deadline, limit, cancel, None, false)
+    run_inner(program, args, deadline, limit, cancel, None, false, &[])
 }
 
 /// Total budget variant: settlement shares the caller's absolute deadline.
@@ -400,6 +400,29 @@ pub fn run_until(
         cancel,
         Some(deadline),
         false,
+        &[],
+    )
+}
+
+/// [`run_until`] with extra environment on top of the scrubbed parent
+/// environment (runtime commands: node secrets). Never log `env`.
+pub fn run_until_env(
+    program: &str,
+    args: &[String],
+    deadline: Instant,
+    limit: usize,
+    cancel: Option<&AtomicBool>,
+    env: &[(String, String)],
+) -> Result<Vec<u8>, RunError> {
+    run_inner(
+        program,
+        args,
+        deadline,
+        limit,
+        cancel,
+        Some(deadline),
+        false,
+        env,
     )
 }
 
@@ -414,9 +437,19 @@ pub fn run_until_any_status(
     limit: usize,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, RunError> {
-    run_inner(program, args, deadline, limit, cancel, Some(deadline), true)
+    run_inner(
+        program,
+        args,
+        deadline,
+        limit,
+        cancel,
+        Some(deadline),
+        true,
+        &[],
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     program: &str,
     args: &[String],
@@ -425,6 +458,7 @@ fn run_inner(
     cancel: Option<&AtomicBool>,
     settlement: Option<Instant>,
     any_status: bool,
+    extra_env: &[(String, String)],
 ) -> Result<Vec<u8>, RunError> {
     let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
     if cancelled() {
@@ -446,6 +480,11 @@ fn run_inner(
         .args(args)
         .env_clear()
         .envs(crate::child_env::scrub_parent_env(&[]))
+        .envs(
+            extra_env
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // Never read, never uploaded.

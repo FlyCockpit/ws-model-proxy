@@ -541,6 +541,11 @@ impl FileRelay {
         }
     }
 
+    /// `wsmp trust full`: file ops are allowed again (roots still apply).
+    pub fn raise_trust(&mut self) {
+        self.full_control = true;
+    }
+
     /// `trust.lower`: refuse every later op (`trust_relay`) and cancel the
     /// pending ones.
     pub fn lower_trust(&mut self) {

@@ -1,18 +1,15 @@
 //! Daemon-lifetime terminal key, identity key, trust and features.
 //!
-//! `connect_foreground` captures this before the reconnect loop. Config is
-//! re-read on reconnect; that must not change the key, the trust or these
-//! features (hot reload with `node.state` lands with config v3, C1).
-//!
-//! S0 trust bridge: until `config.json` v3 carries `trust` (C1), the node is
-//! at Full control exactly when the old most permissive switch is set
-//! (`mcpCommandMode: unsupervised`, which allowed headless commands and file
-//! ops); every other config is Relay only. Relay only refuses commands, file
-//! ops, browser terminals and runtime definitions on this node.
+//! `connect_foreground` captures this before the reconnect loop. Trust comes
+//! from `config.json` `trust` (unset: Relay only). The daemon changes it only
+//! through [`TerminalStartup::lower_trust`] (any lowering) and
+//! [`TerminalStartup::raise_trust`] (after `wsmp trust full` passed the
+//! control socket's peer check). Relay only refuses commands, file ops,
+//! browser terminals and runtime definitions on this node.
 
 use anyhow::{Context, Result};
 
-use crate::config::{Config, McpCommandMode};
+use crate::config::Config;
 use crate::protocol::frames::{HelloNode, NodeTerminalIdentity, TrustState, TrustValue};
 use crate::protocol::runtime_spec::{FileFeatures, NodeFeatures, TerminalFeatures};
 use crate::terminal_crypto::CliTerminalKey;
@@ -31,6 +28,8 @@ pub struct TerminalStartup {
     allow_file_tools_as_root: bool,
     file_roots: Vec<std::path::PathBuf>,
     file_roots_configured: bool,
+    /// `config.json` `runtimeHosts`, re-read on hot reload.
+    runtime_hosts: std::sync::Mutex<Vec<String>>,
 }
 
 impl TerminalStartup {
@@ -52,13 +51,14 @@ impl TerminalStartup {
             identity: None,
             allow_human_terminal: config.allow_human_terminal,
             full: std::sync::atomic::AtomicBool::new(
-                config.mcp_command_mode == McpCommandMode::Unsupervised,
+                crate::trust::at_startup(config) == TrustValue::Full,
             ),
             require_terminal_approval: config.require_terminal_approval,
             max_terminals: usize::try_from(config.effective_max_terminals()).unwrap_or(usize::MAX),
             allow_file_tools_as_root: config.allow_file_tools_as_root,
             file_roots: config.file_roots.clone(),
             file_roots_configured: crate::config::file_roots_usable(&config.file_roots),
+            runtime_hosts: std::sync::Mutex::new(config.runtime_hosts.clone()),
         }
     }
 
@@ -88,9 +88,28 @@ impl TerminalStartup {
         }
     }
 
-    /// `trust.lower`: Relay only from now on. There is no way back up here.
-    pub fn lower_trust(&self) {
-        self.full.store(false, std::sync::atomic::Ordering::SeqCst);
+    /// Relay only from now on. Returns whether trust changed.
+    pub fn lower_trust(&self) -> bool {
+        self.full.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Full control again: only after `wsmp trust full` passed the control
+    /// socket's peer check and was persisted. Returns whether trust changed.
+    pub fn raise_trust(&self) -> bool {
+        !self.full.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn runtime_hosts(&self) -> Vec<String> {
+        self.runtime_hosts
+            .lock()
+            .map(|hosts| hosts.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_runtime_hosts(&self, hosts: Vec<String>) {
+        if let Ok(mut current) = self.runtime_hosts.lock() {
+            *current = hosts;
+        }
     }
 
     /// Full control: definitions, commands, file ops and browser terminals.
@@ -133,8 +152,8 @@ impl TerminalStartup {
                 max: u8::try_from(self.max_terminals).unwrap_or(u8::MAX),
                 approval_required: self.require_terminal_approval,
             },
-            // Operator terminals run interactive steps of runtime jobs, which
-            // land with the runtime store (C2/C3).
+            // Interactive runtime steps are not run by this node yet: the
+            // server places no interactive definition here.
             operator_terminals: false,
             files: FileFeatures {
                 roots: self.file_roots_configured.then(|| {
@@ -145,11 +164,10 @@ impl TerminalStartup {
                 }),
                 as_root: self.allow_file_tools_as_root,
             },
-            runtime_hosts: Vec::new(),
+            runtime_hosts: self.runtime_hosts(),
             media_expand: true,
             live_stt: true,
-            // Node secrets (`secrets.env`) land with config v3 (C1).
-            secrets: Vec::new(),
+            secrets: crate::secrets::entries(),
         }
     }
 
@@ -198,14 +216,14 @@ mod tests {
         let mut config = Config {
             file_roots: vec![dir.path().to_path_buf()],
             allow_human_terminal: true,
-            mcp_command_mode: McpCommandMode::Unsupervised,
+            trust: Some(TrustValue::Full),
             require_terminal_approval: true,
             allow_file_tools_as_root: true,
             ..Config::default()
         };
         let startup = TerminalStartup::capture(&config).expect("startup");
         config.allow_human_terminal = false;
-        config.mcp_command_mode = McpCommandMode::Off;
+        config.trust = Some(TrustValue::Relay);
         config.file_roots.clear();
         let features = startup.features();
         assert_eq!(features.terminals.supported, cfg!(unix));
@@ -229,10 +247,10 @@ mod tests {
     }
 
     #[test]
-    fn anything_but_unsupervised_is_relay_only_and_frozen() {
-        for mode in [McpCommandMode::Off, McpCommandMode::Supervised] {
+    fn unset_or_relay_trust_is_relay_only_and_frozen_and_only_raise_goes_up() {
+        for trust in [None, Some(TrustValue::Relay)] {
             let config = Config {
-                mcp_command_mode: mode,
+                trust,
                 ..Config::default()
             };
             let startup = TerminalStartup::from_key(key(), &config);
@@ -241,6 +259,11 @@ mod tests {
             assert_eq!(trust.value, TrustValue::Relay);
             assert!(trust.frozen);
             assert!(trust.validate().is_ok());
+            assert!(!startup.lower_trust());
+            assert!(startup.raise_trust());
+            assert!(startup.full_control());
+            assert!(startup.lower_trust());
+            assert!(!startup.full_control());
         }
     }
 

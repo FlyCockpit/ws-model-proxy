@@ -61,6 +61,8 @@ fn main() {
 fn run(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
         Command::Login(args) => commands::login::run(args),
+        Command::Trust(args) => commands::trust::run(args),
+        Command::Secret(args) => commands::secret::run(args),
         Command::Config(args) => commands::config::run(args),
         Command::Run(args) => commands::run::run(args),
         Command::Service(args) => commands::service::run(args),

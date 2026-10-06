@@ -1,48 +1,61 @@
-//! Durable product-native device credential storage.
+//! Durable node credential storage (`node-credential.json`, 0600).
 
 use std::io::Write;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeviceCredential {
-    pub credential_id: Option<String>,
-    pub user_id: Option<String>,
-    pub secret: String,
+/// What `wsmp login` stored. `Debug` never prints the credential.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeCredential {
+    pub node_id: String,
+    pub slug: String,
+    pub server: String,
+    pub credential: String,
 }
 
-pub fn load_device_credential() -> Result<Option<DeviceCredential>> {
-    let path = crate::paths::device_credential_file()?;
+impl std::fmt::Debug for NodeCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeCredential")
+            .field("node_id", &self.node_id)
+            .field("slug", &self.slug)
+            .field("server", &self.server)
+            .field("credential", &"[redacted]")
+            .finish()
+    }
+}
+
+pub fn load_node_credential() -> Result<Option<NodeCredential>> {
+    let path = crate::paths::node_credential_file()?;
     match std::fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str(&text)
-            .with_context(|| format!("parsing device credential `{}`", path.display()))
+            .with_context(|| format!("parsing node credential `{}`", path.display()))
             .map(Some),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => {
-            Err(err).with_context(|| format!("reading device credential `{}`", path.display()))
+            Err(err).with_context(|| format!("reading node credential `{}`", path.display()))
         }
     }
 }
 
-pub fn save_device_credential(credential: &DeviceCredential) -> Result<()> {
-    let path = crate::paths::device_credential_file()?;
+pub fn save_node_credential(credential: &NodeCredential) -> Result<()> {
+    let path = crate::paths::node_credential_file()?;
     let dir = path
         .parent()
         .map(std::path::Path::to_path_buf)
-        .context("device credential path has no parent directory")?;
+        .context("node credential path has no parent directory")?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating state directory `{}`", dir.display()))?;
     set_private_dir(&dir)?;
-    let text = serde_json::to_string_pretty(credential).context("serializing device credential")?;
+    let text = serde_json::to_string_pretty(credential).context("serializing node credential")?;
     write_private_file(&path, text.as_bytes())?;
     sync_parent_dir(&path)?;
     Ok(())
 }
 
-pub fn remove_device_credential() -> Result<bool> {
-    let path = crate::paths::device_credential_file()?;
+pub fn remove_node_credential() -> Result<bool> {
+    let path = crate::paths::node_credential_file()?;
     match std::fs::remove_file(&path) {
         Ok(()) => {
             sync_parent_dir(&path)?;
@@ -50,7 +63,7 @@ pub fn remove_device_credential() -> Result<bool> {
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => {
-            Err(err).with_context(|| format!("removing device credential `{}`", path.display()))
+            Err(err).with_context(|| format!("removing node credential `{}`", path.display()))
         }
     }
 }

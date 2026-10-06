@@ -146,6 +146,21 @@ fn offer(tx: &SyncSender<FromWorker>, mut message: NodeFrame) -> Sent {
 /// Conform and encode one telemetry frame; `None` (logged) if it cannot be.
 pub fn encode_telemetry(message: &mut NodeFrame) -> Option<String> {
     crate::telemetry_bounds::conform(message);
+    // `node.metrics` stays within the chunk budget: drop custom values, last
+    // command first, until it fits.
+    if let NodeFrame::NodeMetrics(metrics) = message {
+        while serde_json::to_vec(&NodeFrame::NodeMetrics(metrics.clone()))
+            .map_or(usize::MAX, |bytes| bytes.len())
+            > crate::protocol::frames::CHUNK_BUDGET_BYTES
+        {
+            match metrics.custom.as_mut() {
+                Some(custom) if !custom.is_empty() => {
+                    custom.pop();
+                }
+                _ => break,
+            }
+        }
+    }
     match encode_control(message) {
         Ok(text) => Some(text),
         Err(error) => {
@@ -692,6 +707,12 @@ pub fn is_label_key(value: &str) -> bool {
     is_metric_name(value) && !RESERVED_LABEL_KEYS.contains(&value)
 }
 
+/// Label values are free text (GPU names have spaces): 1 to 128 characters,
+/// no control characters.
+pub fn is_label_value(value: &str) -> bool {
+    (1..=128).contains(&value.chars().count()) && !value.chars().any(char::is_control)
+}
+
 /// UTC `YYYY-MM-DDTHH:MM:SS.mmmZ`.
 pub fn now_rfc3339() -> String {
     rfc3339(SystemTime::now())
@@ -1029,7 +1050,7 @@ fn saturating_byte_counter(value: u64) -> u64 {
 }
 
 #[cfg(unix)]
-fn interface_addresses() -> BTreeMap<String, Vec<String>> {
+pub(crate) fn interface_addresses() -> BTreeMap<String, Vec<String>> {
     let mut addresses = BTreeMap::<String, Vec<String>>::new();
     let Ok(interfaces) = nix::ifaddrs::getifaddrs() else {
         return addresses;
@@ -1054,7 +1075,7 @@ fn interface_addresses() -> BTreeMap<String, Vec<String>> {
 }
 
 #[cfg(not(unix))]
-fn interface_addresses() -> BTreeMap<String, Vec<String>> {
+pub(crate) fn interface_addresses() -> BTreeMap<String, Vec<String>> {
     BTreeMap::new()
 }
 
@@ -1215,6 +1236,41 @@ fn collect_node_metrics(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn node_metrics_drop_custom_values_to_fit_the_chunk_budget() {
+        let labels: std::collections::BTreeMap<String, String> = (0..16)
+            .map(|index| (format!("label_{index:02}"), "x".repeat(128)))
+            .collect();
+        let custom = (0..256)
+            .map(|index| crate::protocol::frames::CustomMetric {
+                name: format!("metric_{index}"),
+                labels: Some(labels.clone()),
+                value: 1.0,
+                ts: "2026-10-06T00:00:00.000Z".to_string(),
+            })
+            .collect();
+        let mut frame = NodeFrame::NodeMetrics(crate::protocol::frames::NodeMetrics {
+            ts: "2026-10-06T00:00:00.000Z".to_string(),
+            cpu: None,
+            memory: None,
+            disks: None,
+            gpus: None,
+            interfaces: None,
+            custom: Some(custom),
+            metric_commands: None,
+            abandoned_recovery: None,
+        });
+        let text = encode_telemetry(&mut frame).expect("fits once trimmed");
+        assert!(text.len() <= crate::protocol::frames::CHUNK_BUDGET_BYTES);
+        let NodeFrame::NodeMetrics(metrics) = &frame else {
+            panic!("node.metrics");
+        };
+        let kept = metrics.custom.as_ref().map_or(0, Vec::len);
+        assert!(kept > 0 && kept < 256, "{kept}");
+        assert!(frame.validate().is_ok());
+    }
+
     #[cfg(unix)]
     #[test]
     fn counter_store_filesystem_update_prune_and_idle_retries() {
