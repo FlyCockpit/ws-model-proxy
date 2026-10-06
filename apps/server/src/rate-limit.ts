@@ -105,6 +105,31 @@ export const realtimeUpgradeLimiter = new RateLimiterMemory({
 });
 
 /**
+ * `POST /api/auth/device/code` (the start of `wsmp login`), per client IP.
+ * Minting a device code grants nothing: a person still has to approve it in
+ * the dashboard. So it leaves the strict credential-stuffing bucket and its
+ * 15-minute block, which a fleet re-login behind one NAT tripped. 20 per
+ * minute and no block: an over-eager caller recovers within one window.
+ */
+export const DEVICE_CODE_MINT_PATH = "/api/auth/device/code";
+export const DEVICE_CODE_MINT_POINTS = 20;
+export const DEVICE_CODE_MINT_DURATION_SECONDS = 60;
+
+export const deviceCodeMintLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:device-code",
+  points: DEVICE_CODE_MINT_POINTS,
+  duration: DEVICE_CODE_MINT_DURATION_SECONDS,
+});
+
+/**
+ * Exactly `POST /api/auth/device/code` on the raw pathname. Any other method
+ * or spelling (`/api/%61uth/...`, a trailing slash) keeps the strict limiter.
+ */
+export function isDeviceCodeMintRequest(c: Context): boolean {
+  return c.req.method === "POST" && new URL(c.req.url).pathname === DEVICE_CODE_MINT_PATH;
+}
+
+/**
  * `cliCredentials.exchangeDeviceCode` limiters: the public device-flow
  * redemption a `wsmp login` polls (every 5 s for up to 30 min). One bucket per
  * client IP and one per device code; see {@link consumeDeviceCodeExchange}.

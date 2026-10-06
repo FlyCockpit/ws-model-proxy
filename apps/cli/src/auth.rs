@@ -144,6 +144,16 @@ pub fn device_login_scope(cli_slug: &str) -> String {
     format!("cli-slug:{cli_slug}")
 }
 
+/// Longest `Retry-After` that `wsmp login` waits out by itself (once) when
+/// the server rate limits the device-code request.
+pub const DEVICE_CODE_RETRY_WAIT_MAX_SECS: u64 = 30;
+
+enum DeviceCodeStart {
+    Started(DeviceCodeStartResponse),
+    /// HTTP 429, with the `Retry-After` seconds when the server sent them.
+    RateLimited(Option<u64>),
+}
+
 pub fn start_device_authorization(
     server_url: &str,
     cli_slug: &str,
@@ -154,15 +164,85 @@ pub fn start_device_authorization(
         "scope": device_login_scope(cli_slug),
     }))
     .context("serializing device authorization request")?;
+    let retry_after = match request_device_code(&url, &body)? {
+        DeviceCodeStart::Started(started) => return Ok(started),
+        DeviceCodeStart::RateLimited(retry_after) => retry_after,
+    };
+    // A short wait is cheaper than making the user run login again.
+    let Some(wait) = retry_after.filter(|secs| *secs <= DEVICE_CODE_RETRY_WAIT_MAX_SECS) else {
+        anyhow::bail!(rate_limited_message(retry_after));
+    };
+    crate::output::diagnostic(format!(
+        "device login is rate limited, retry in {wait} s; waiting"
+    ))?;
+    std::thread::sleep(std::time::Duration::from_secs(wait.max(1)));
+    match request_device_code(&url, &body)? {
+        DeviceCodeStart::Started(started) => Ok(started),
+        DeviceCodeStart::RateLimited(retry_after) => {
+            anyhow::bail!(rate_limited_message(retry_after))
+        }
+    }
+}
+
+fn request_device_code(url: &Url, body: &[u8]) -> Result<DeviceCodeStart> {
     let mut response = ureq::post(url.as_str())
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
+        .config()
+        .http_status_as_error(false)
+        .build()
         .send(body)
         .with_context(|| format!("starting device authorization at `{}`", url.as_str()))?;
+    let status = response.status().as_u16();
+    if status == 429 {
+        let retry_after = parse_retry_after(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+        );
+        return Ok(DeviceCodeStart::RateLimited(retry_after));
+    }
+    if !response.status().is_success() {
+        let text = response.body_mut().read_to_string().unwrap_or_default();
+        anyhow::bail!(
+            "starting device authorization at `{}` failed with HTTP status {status}{}",
+            url.as_str(),
+            server_error_detail(&text)
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default()
+        );
+    }
     response
         .body_mut()
         .read_json()
+        .map(DeviceCodeStart::Started)
         .context("parsing device authorization response")
+}
+
+/// `Retry-After` as delay-seconds; an HTTP-date or junk is ignored.
+fn parse_retry_after(value: Option<&str>) -> Option<u64> {
+    value?.trim().parse().ok()
+}
+
+fn rate_limited_message(retry_after: Option<u64>) -> String {
+    match retry_after {
+        Some(secs) => format!(
+            "the server rate limited device login (HTTP 429): rate limited, retry in {secs} s"
+        ),
+        None => "the server rate limited device login (HTTP 429): rate limited, retry in a minute"
+            .to_string(),
+    }
+}
+
+/// A short message from a JSON error body (`message`, `error_description`
+/// or `error`), if there is one.
+fn server_error_detail(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    ["message", "error_description", "error"]
+        .iter()
+        .find_map(|key| value.get(key).and_then(serde_json::Value::as_str))
+        .map(|text| text.chars().take(300).collect())
 }
 
 pub fn exchange_device_code(
@@ -292,6 +372,28 @@ mod tests {
             }
             ExchangeError::DeviceFlow(state) => panic!("classified as {state:?}"),
         }
+    }
+
+    #[test]
+    fn retry_after_is_read_as_seconds_only() {
+        assert_eq!(parse_retry_after(Some("12")), Some(12));
+        assert_eq!(parse_retry_after(Some(" 7 ")), Some(7));
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            None
+        );
+        assert_eq!(parse_retry_after(None), None);
+        assert!(rate_limited_message(Some(42)).contains("rate limited, retry in 42 s"));
+        assert!(rate_limited_message(None).contains("rate limited"));
+    }
+
+    #[test]
+    fn server_error_detail_reads_json_messages_only() {
+        assert_eq!(
+            server_error_detail(r#"{"error":"Too many attempts."}"#).as_deref(),
+            Some("Too many attempts.")
+        );
+        assert_eq!(server_error_detail("<html>bad gateway</html>"), None);
     }
 
     #[test]

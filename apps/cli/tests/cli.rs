@@ -102,8 +102,14 @@ fn request_is_complete(bytes: &[u8]) -> bool {
 
 fn write_response(stream: &mut TcpStream, status: u16, body: &[u8]) {
     let status_text = if status == 200 { "OK" } else { "ERROR" };
+    // A rate limit always says when to come back, as the server does.
+    let retry_after = if status == 429 {
+        "Retry-After: 1\r\n"
+    } else {
+        ""
+    };
     let response = format!(
-        "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream
@@ -413,6 +419,80 @@ fn non_interactive_login_defaults_the_slug_from_the_hostname() {
     assert!(exchange_request.contains(&format!(r#""cliSlug":"{expected}""#)));
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(cfg["cliSlug"], expected.as_str());
+    server.join();
+}
+
+#[test]
+fn login_waits_out_a_short_device_code_rate_limit_once() {
+    let started = json!({
+        "device_code": "device-code-1",
+        "user_code": "ABCD-EFGH",
+        "verification_uri": "http://example.test/en-US/device",
+        "expires_in": 30,
+        "interval": 1
+    });
+    let server = TestServer::start(vec![
+        (
+            "/api/auth/device/code",
+            429,
+            json!({ "error": "Too many attempts." }),
+        ),
+        ("/api/auth/device/code", 200, started),
+        (
+            "/rpc/cliCredentials/exchangeDeviceCode",
+            200,
+            json!({
+                "json": {
+                    "credentialId": "credential-1",
+                    "userId": "user-1",
+                    "secret": "wsmp_device_secret_for_test"
+                }
+            }),
+        ),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({ "version": 1, "serverUrl": server.base_url }),
+    );
+    cli(&config, &state)
+        .args(["login", "--slug", "desk-01"])
+        .write_stdin("")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("rate limited, retry in 1 s"));
+    server.join();
+}
+
+#[test]
+fn login_reports_a_repeated_device_code_rate_limit_with_its_wait() {
+    let server = TestServer::start(vec![
+        (
+            "/api/auth/device/code",
+            429,
+            json!({ "error": "Too many attempts." }),
+        ),
+        (
+            "/api/auth/device/code",
+            429,
+            json!({ "error": "Too many attempts." }),
+        ),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({ "version": 1, "serverUrl": server.base_url }),
+    );
+    cli(&config, &state)
+        .args(["login", "--slug", "desk-01"])
+        .write_stdin("")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("rate limited, retry in 1 s"));
     server.join();
 }
 
