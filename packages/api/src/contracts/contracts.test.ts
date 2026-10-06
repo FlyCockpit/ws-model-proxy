@@ -1,0 +1,326 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+import { z } from "zod";
+import { PRISMA_ENUM_MIRRORS } from "./common";
+import {
+  apiContract,
+  flattenContract,
+  MCP_EXCLUDED_SESSION_PROCEDURES,
+  MCP_READ_TOOLS,
+  MCP_TOOL_NAMES,
+  MCP_TOOLS,
+} from "./index";
+import { metricsQueryInputSchema } from "./metrics";
+
+/** Spec §8.1a, with the decisions recorded in docs/contracts/0.4.0.md. */
+const INVENTORY = [
+  "app.config",
+  "app.flags",
+  "app.features",
+  "auth.verifyEmailTransport",
+  "auth.updateLocale",
+  "auth.passwordCapabilities",
+  "settings.get",
+  "settings.update",
+  "settings.onboarding.complete",
+  "users.list",
+  "users.invite",
+  "users.setRole",
+  "users.archive",
+  "users.unarchive",
+  "users.remove",
+  "adminObservability.nodes",
+  "adminObservability.runtimes",
+  "adminObservability.pools",
+  "adminObservability.relay",
+  "adminSettings.get",
+  "adminSettings.update",
+  "nodes.list",
+  "nodes.get",
+  "nodes.update",
+  "nodes.rename",
+  "nodes.delete",
+  "nodes.lowerTrust",
+  "nodes.enrollmentCodes.list",
+  "nodes.enrollmentCodes.create",
+  "nodes.enrollmentCodes.revoke",
+  "nodes.credentials.list",
+  "nodes.credentials.revoke",
+  "nodes.activity.list",
+  "nodes.terminals.openTicket",
+  "nodes.queued.list",
+  "nodes.queued.enqueue",
+  "nodes.queued.run",
+  "nodes.queued.dismiss",
+  "nodes.commands.run",
+  "nodes.files.read",
+  "nodes.files.write",
+  "nodes.files.edit",
+  "runtimes.list",
+  "runtimes.get",
+  "runtimes.versions.list",
+  "runtimes.versions.get",
+  "runtimes.presets.list",
+  "runtimes.create",
+  "runtimes.update",
+  "runtimes.delete",
+  "runtimes.start",
+  "runtimes.stop",
+  "runtimes.restart",
+  "runtimes.instances.forget",
+  "runtimes.models.setCapabilities",
+  "runtimes.detected.add",
+  "runtimes.shares.list",
+  "runtimes.shares.create",
+  "runtimes.shares.delete",
+  "runtimes.fork",
+  "profiles.list",
+  "profiles.get",
+  "profiles.save",
+  "profiles.delete",
+  "profiles.apply",
+  "pools.list",
+  "pools.get",
+  "pools.history.list",
+  "pools.create",
+  "pools.update",
+  "pools.delete",
+  "pools.cloud.setMode",
+  "pools.cloud.setPaidWarmProtection",
+  "pools.cloud.setOwnKeyEquivalent",
+  "pools.routing.setOwnHardwareOnly",
+  "pools.members.addContributed",
+  "pools.members.removeContributed",
+  "pools.rules.delete",
+  "models.list",
+  "models.test",
+  "access.apiKeys.list",
+  "access.apiKeys.create",
+  "access.apiKeys.revoke",
+  "access.agentTokens.list",
+  "access.agentTokens.create",
+  "access.agentTokens.revoke",
+  "access.oauthGrants.list",
+  "access.oauthGrants.revoke",
+  "access.shares.list",
+  "access.shares.create",
+  "access.shares.update",
+  "access.shares.delete",
+  "access.shares.setOwnKey",
+  "access.contributing.pools",
+  "providers.accounts.list",
+  "providers.accounts.get",
+  "providers.accounts.create",
+  "providers.accounts.update",
+  "providers.accounts.delete",
+  "providers.accounts.setEnabled",
+  "providers.accounts.setDataCollection",
+  "providers.credentials.replace",
+  "providers.credentials.revoke",
+  "providers.credentials.test",
+  "providers.credentials.reencrypt",
+  "providers.models.list",
+  "providers.models.create",
+  "providers.models.update",
+  "providers.models.delete",
+  "providers.pricing.list",
+  "providers.pricing.create",
+  "providers.pricing.activate",
+  "providers.pricing.retire",
+  "providers.pricing.delete",
+  "providers.catalog.search",
+  "providers.usage.list",
+  "providers.attempts.list",
+  "providers.spendCaps.set",
+  "providers.spendCaps.clear",
+  "activity.metrics.query",
+  "activity.requests.list",
+  "activity.requests.delete",
+  "activity.overview.summary",
+  "activity.needsYou.list",
+];
+
+/** Spec §1.2 (case-insensitive unless noted). "Relay only" is the trust name and allowed. */
+const BANNED: RegExp[] = [
+  /\bCLI\b/,
+  /\bmachines?\b/i,
+  /\bdevices?\b/i,
+  /\brelay\b(?![- ]only)/i,
+  /\bendpoints?\b/i,
+  /\bmodel servers?\b/i,
+  /\bdeployments?\b/i,
+  /\brecipes?\b/i,
+  /\btemplates?\b/i,
+  /\bvariants?\b/i,
+  /\brevisions?\b/i,
+  /\branks?\b/i,
+  /\bclaim(s|ed)?\b/i,
+  /\bcapacity\b/i,
+  /\bexecution targets?\b/i,
+  /\bdiscovered models?\b/i,
+  /\bdirect models?\b/i,
+  /\bmember tiers?\b/i,
+  /\bprimary\b/i,
+  /\bpublic overflow\b/i,
+  /\bguarded\b/i,
+  /\bprotected pools?\b/i,
+  /\btransformers?\b/i,
+  /\boffer(s|ed)?\b/i,
+  /\baccept(s|ed)?\b/i,
+  /\bgrants?\b/i,
+  /\bBYOK\b/i,
+  /\begress\b/i,
+  /\bbudget (policy|policies|rules?)\b/i,
+  /\blayouts?\b/i,
+  /\bplans?\b/i,
+  /\bask first\b/i,
+  /\bsupervised\b/i,
+  /\bMCP tokens?\b/i,
+  /\bPAT\b/,
+  /\bAPI tokens?\b/i,
+  /\bforwarders?\b/i,
+  /\bunrestricted\b/i,
+  /\bmcpCommandMode\b/,
+  /\boperate\b/i,
+  /\bobserve\b/i,
+];
+
+const procedures = new Map(flattenContract(apiContract));
+
+describe("0.4.0 oRPC contract", () => {
+  it("has exactly the §8.1a procedures", () => {
+    expect([...procedures.keys()].sort()).toEqual([...INVENTORY].sort());
+  });
+
+  it("only agent procedures name tools, and every agent procedure has one", () => {
+    for (const [path, procedure] of procedures) {
+      if (procedure.access === "agent") expect(procedure.tools?.length, path).toBeGreaterThan(0);
+      else expect(procedure.tools, path).toBeUndefined();
+    }
+  });
+
+  it("keeps session procedures off MCP only with a reason", () => {
+    const viaTools = new Set(MCP_TOOLS.flatMap((tool) => tool.procedures));
+    for (const [path, procedure] of procedures)
+      if (procedure.access === "session")
+        expect(viaTools.has(path) || path in MCP_EXCLUDED_SESSION_PROCEDURES, path).toBe(true);
+    for (const path of Object.keys(MCP_EXCLUDED_SESSION_PROCEDURES))
+      expect(procedures.get(path)?.access, path).toBe("session");
+  });
+
+  it("mirrors the Prisma enums exactly", () => {
+    const dir = fileURLToPath(new URL("../../../db/prisma/schema/", import.meta.url));
+    const text = readdirSync(dir)
+      .filter((name) => name.endsWith(".prisma"))
+      .map((name) => readFileSync(join(dir, name), "utf8"))
+      .join("\n");
+    const enums = new Map<string, string[]>();
+    for (const match of text.matchAll(/^enum (\w+) \{([^}]*)\}/gm))
+      enums.set(
+        match[1] ?? "",
+        (match[2] ?? "")
+          .split("\n")
+          .map((line) => line.replace(/\/\/.*$/, "").trim())
+          .filter((line) => /^\w+$/.test(line)),
+      );
+    for (const [name, values] of Object.entries(PRISMA_ENUM_MIRRORS))
+      expect(enums.get(name), name).toEqual([...values]);
+  });
+});
+
+describe("0.4.0 MCP tool manifest", () => {
+  it("has the 25 tools in order, 7 of them read-only", () => {
+    expect(MCP_TOOLS.map((tool) => tool.name)).toEqual([...MCP_TOOL_NAMES]);
+    expect(MCP_TOOLS.filter((tool) => tool.level === "READ").map((tool) => tool.name)).toEqual([
+      ...MCP_READ_TOOLS,
+    ]);
+    expect(MCP_TOOLS).toHaveLength(25);
+  });
+
+  it("calls only agent procedures that name the tool back; read tools only query", () => {
+    for (const tool of MCP_TOOLS)
+      for (const path of tool.procedures) {
+        const procedure = procedures.get(path);
+        expect(procedure?.access, `${tool.name} → ${path}`).toBe("agent");
+        expect(procedure?.tools, `${tool.name} → ${path}`).toContain(tool.name);
+        if (tool.level === "READ") expect(procedure?.kind, `${tool.name} → ${path}`).toBe("query");
+      }
+    for (const [path, procedure] of procedures)
+      for (const name of procedure.tools ?? [])
+        expect(
+          MCP_TOOLS.find((tool) => tool.name === name)?.procedures,
+          `${path} names ${name}`,
+        ).toContain(path);
+  });
+
+  it("requires confirm on deletes and command runs", () => {
+    for (const name of ["pool_delete", "runtime_delete", "profile_delete"]) {
+      const tool = MCP_TOOLS.find((entry) => entry.name === name);
+      expect(tool?.input.safeParse({ poolId: "p", runtimeId: "r", profileId: "x" }).success).toBe(
+        false,
+      );
+    }
+    const run = MCP_TOOLS.find((entry) => entry.name === "node_command_run");
+    expect(run?.input.safeParse({ nodeId: "n", command: "ls" }).success).toBe(false);
+    expect(run?.input.safeParse({ nodeId: "n", command: "ls", confirm: "RUN" }).success).toBe(true);
+  });
+
+  it("uses the user's words in names and descriptions", () => {
+    for (const tool of MCP_TOOLS)
+      for (const pattern of BANNED) {
+        expect(pattern.test(tool.description), `${tool.name}: ${pattern}`).toBe(false);
+        expect(pattern.test(tool.name.replaceAll("_", " ")), `${tool.name}: ${pattern}`).toBe(
+          false,
+        );
+      }
+  });
+
+  it("converts every tool schema to JSON Schema", () => {
+    for (const tool of MCP_TOOLS) {
+      expect(() => z.toJSONSchema(tool.input, { io: "input" }), tool.name).not.toThrow();
+      expect(() => z.toJSONSchema(tool.output, { io: "output" }), tool.name).not.toThrow();
+    }
+  });
+});
+
+describe("metrics_query input", () => {
+  const base = { metrics: ["ttft_p95"], range: "24h", step: "5m" } as const;
+
+  it("accepts groupBy keys the rollups have", () => {
+    expect(
+      metricsQueryInputSchema.safeParse({ ...base, scope: { pool: "p" }, groupBy: "member" })
+        .success,
+    ).toBe(true);
+    expect(
+      metricsQueryInputSchema.safeParse({
+        ...base,
+        scope: { node: "n" },
+        metrics: ["custom:gpu_power"],
+      }).success,
+    ).toBe(true);
+  });
+
+  it("refuses groupBy values a scope or family cannot have, and minute steps past 30 days", () => {
+    expect(
+      metricsQueryInputSchema.safeParse({ ...base, scope: { instance: "i" }, groupBy: "node" })
+        .success,
+    ).toBe(false);
+    expect(
+      metricsQueryInputSchema.safeParse({
+        ...base,
+        metrics: ["kv_usage_max"],
+        scope: { pool: "p" },
+        groupBy: "member",
+      }).success,
+    ).toBe(false);
+    expect(
+      metricsQueryInputSchema.safeParse({
+        ...base,
+        scope: { pool: "p" },
+        range: { from: "2026-01-01T00:00:00Z", to: "2026-03-01T00:00:00Z" },
+      }).success,
+    ).toBe(false);
+  });
+});

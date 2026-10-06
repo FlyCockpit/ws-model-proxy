@@ -10,6 +10,12 @@
     "./deployment-job-wire": {
       "default": "./src/deployment-job-wire.ts"
     },
+    "./pool-defaults": {
+      "default": "./src/pool-defaults.ts"
+    },
+    "./runtime-defaults": {
+      "default": "./src/runtime-defaults.ts"
+    },
     "./tsconfig.base.json": "./tsconfig.base.json",
     "./biome.json": "./biome.json",
     "./postcss.config.mjs": "./postcss.config.mjs",

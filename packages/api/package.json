@@ -17,6 +17,9 @@
     "./lib/runtime-launch-hash": {
       "default": "./src/lib/runtime-launch-hash.ts"
     },
+    "./contracts": {
+      "default": "./src/contracts/index.ts"
+    },
     "./lib/deployment-operator-notify": {
       "default": "./src/lib/deployment-operator-notify.ts"
     },
