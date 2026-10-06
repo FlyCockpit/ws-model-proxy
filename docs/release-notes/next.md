@@ -424,6 +424,82 @@ assignment provenance and automatic concurrency seed columns.
   an earlier CLI, treat them as sensitive and revoke the credential or CLI
   token they contain from the dashboard.
 
+## Security notes
+
+Follow-ups from the final 0.4.0 security review. All are rated low, except
+SEC-14, which is medium on Windows only and predates 0.4.0.
+
+Fixed in this release:
+
+- **`wsmp login` no longer passes the server's approval URL through
+  `cmd.exe` on Windows (SEC-14).** The CLI ran `cmd /C start "" <url>` with
+  the server-supplied verification URL. Its `&` and other cmd metacharacters
+  were shell syntax, so a malicious or compromised server could run commands
+  on the Windows machine, and ordinary `&user_code=` URLs broke. Now, on every
+  platform, the browser opens only for an https URL (http only on a loopback
+  host) on the configured server's origin with no embedded credentials. On
+  Windows it opens through `rundll32 url.dll,FileProtocolHandler`, with no
+  shell in between. Any other URL is printed for you to open yourself. Not yet
+  run on a real Windows machine.
+- **The CLI signs only its configured server's hello origin (SEC-13).** The
+  hello signature binds the server origin, but the CLI used to sign whatever
+  origin the challenge named. A relay or wrong-URL server that receives the
+  bearer credential could therefore forward a valid signature to the real
+  server. The CLI now stops with an error, without signing, when the
+  challenge origin differs from the configured server URL's origin. **Action:**
+  `wsmp config set-server` must use the server's public origin (the origin of
+  its `BETTER_AUTH_URL`). A CLI that reaches the server through another
+  address, such as a LAN IP or an internal hostname, cannot connect until you
+  change it.
+- **Terminal approval codes are never moved to another browser identity
+  (SEC-15).** Recording a pending browser identity used to replace any pending
+  entry with the same 8-character (40-bit) code, and approving it replaced an
+  approved identity that had that code. Now a code approved for one identity
+  is never re-approved for another. If two identities ask for the same pending
+  code, neither can be approved until `wsmp terminal approvals revoke <code>`
+  clears it.
+- **MCP output redacts product tokens embedded in text (SEC-17g).** A
+  `wsmp_…` token inside a longer string, such as a recipe command, used to
+  pass through because redaction only checked whether the string started with
+  a token prefix.
+
+Known limitations, not fixed in 0.4.0:
+
+- **SEC-15 (rest):** codes are still 40 bits, and `wsmp terminal approve`
+  shows no key fingerprint. Approve only a code your own browser is showing
+  right now.
+- **SEC-11:** the inference-contribution accept list shows only the pool and
+  model IDs. It does not name the contributor or their device, and it does not
+  say that accepting sends your pool's prompts to that user's hardware. Accept
+  only offers you expected.
+- **SEC-17**, grouped:
+  - Overview metrics and health label contributed members with the
+    contributor's device name or hostname.
+  - `offer` reveals whether a pool ID exists (NOT_FOUND vs BAD_REQUEST) and
+    returns the pool owner's user ID.
+  - Warm protection on a contributed node counts every pool's sessions with
+    that pool's own protection percent, so one pool owner can push other
+    owners' warm sessions off the node. This redirects them; it does not deny
+    them.
+  - The cache-affinity reset ledger holds 4,096 keys, at most 1,024 per owner.
+    A few colluding accounts can fill it, after which another owner's CLI that
+    sends a reset is disconnected (1011) and reconnects.
+  - Setting a CLI device's feature grants, labels or usable budgets takes the
+    device's advisory lock before checking ownership, so another user can
+    briefly hold it.
+  - Removing a pool member leaves its inference contribution ACTIVE with no
+    member.
+  - All MCP credentials of one user act as one actor. Any of that user's MCP
+    tokens can apply a plan another of their tokens created, even after the
+    creating token is revoked, and recipe revisions do not record which token
+    edited them.
+  - KV-eviction feedback is stored per capacity, not per owner. On a shared
+    node, the first owner's evidence affects another pool's budget until it
+    expires.
+  - MCP output redaction catches product tokens embedded in text only when at
+    least 32 characters follow the prefix. Real tokens have about 43, so a
+    truncated token can still appear.
+
 ## Per-caller `:external` wait (#181)
 
 A model-API token can store `externalAfterWaitMs` (null uses each pool's wait).
