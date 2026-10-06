@@ -704,3 +704,22 @@ it("preserves a lease renewed between idempotent acquire's expiry read and UPDAT
   );
   expect(tx.admissionRequest.update).not.toHaveBeenCalled();
 });
+
+describe("admission priority", () => {
+  it("refuses a base priority that is not a class rank before touching the database", async () => {
+    // The store's database is an empty mock: reaching it would throw a TypeError instead.
+    const store = new PostgresCapacityAdmissionStore({} as never, "priority-proof");
+    const attempt = {
+      requestId: "r",
+      attemptId: "a",
+      ownerId: "u",
+      sourceKind: "POOL" as const,
+      poolId: "p",
+      basePriority: 16,
+      connectionOwner: "c",
+      deadlineAt: new Date(Date.now() + 1_000),
+      candidates: [],
+    };
+    await expect(store.acquire(attempt)).rejects.toBeInstanceOf(RangeError);
+  });
+});

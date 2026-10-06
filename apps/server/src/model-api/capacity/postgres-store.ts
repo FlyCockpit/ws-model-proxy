@@ -23,6 +23,7 @@ import {
   type AdmissionAttempt,
   type AdmissionResult,
   type AdmissionTerminalizationResult,
+  assertPriority,
   type CapacityAdmissionStore,
   type CapacityLeaseHandle,
   NORMAL_PRIORITY_RANK,
@@ -160,6 +161,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   }
 
   async acquire(attempt: AdmissionAttempt, signal?: AbortSignal): Promise<AdmissionResult> {
+    // A class rank (0..2), as admission_request_shape_check requires: fail here, not in SQL.
+    assertPriority(attempt.basePriority);
     if (signal?.aborted) return { state: "CANCELLED" };
     const result = await this.#serializable(async (tx) => {
       // Identical attempts must share one creation boundary even if a buggy
@@ -1970,11 +1973,10 @@ export function candidateDeadlineAt(
 }
 
 /**
- * Saturation S-C per-grant queue priority: for a grantee's pool admission,
- * the rank of `PoolGrant.queuePriorityClass` replaces the pool's class; null
- * (or no grant, or a grant of another pool) inherits. A plain read inside
- * the admission transaction: `pool_grant` is outside the capacity lock order
- * and is never locked here.
+ * A share holder's class: for a pool admission under a share, the rank of
+ * `Share.priorityClass` replaces the pool's class; null (or no share, or a
+ * share of another pool or owner) inherits. A plain read inside the admission
+ * transaction: `share` is never locked here.
  */
 async function resolveSharePriority(
   tx: Prisma.TransactionClient,

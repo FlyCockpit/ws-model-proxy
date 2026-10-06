@@ -6,6 +6,8 @@ import type { AdmissionAttempt } from "./types.js";
 // switch, the share's class) on real PostgreSQL and the 0.4.0 graph (runtime instance =
 // capacity, pool_routing). Ported from the limits-redesign store proofs onto the 0.4.0 schema;
 // the planner and DRR logic themselves are unit-tested in admission-planner/scheduler tests.
+// Routing changes mid-test go through the seeding (fixture) client, which skips the policy
+// fences a real `pools.update` takes; the test runs alone, so nothing races them.
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
@@ -116,17 +118,22 @@ async function seed(url: string) {
       priorityClass: "HIGH",
     },
   });
-  return { db, owner, instance, target, pools, share, suffix };
+  return { db, owner, grantee, instance, target, pools, share, suffix };
 }
 
 async function cleanup(fixture: Fixture) {
   const { db, owner, instance } = fixture;
-  // Scoped deletes (WHERE): this run's rows only.
-  await db.capacityLease.deleteMany({ where: { capacityId: instance.id } });
-  await db.capacityWaiter.deleteMany({ where: { capacityId: instance.id } });
-  await db.admissionRequest.deleteMany({ where: { userId: owner.id } });
-  await db.capacityScheduler.deleteMany({ where: { capacityId: instance.id } });
-  await db.$disconnect();
+  // Scoped deletes (WHERE): this run's hot-path rows only. The seeded graph (unique per run)
+  // stays in the disposable test database: a user delete goes through the ordered parent
+  // sweep, which this proof does not exercise.
+  try {
+    await db.capacityLease.deleteMany({ where: { capacityId: instance.id } });
+    await db.capacityWaiter.deleteMany({ where: { capacityId: instance.id } });
+    await db.admissionRequest.deleteMany({ where: { userId: owner.id } });
+    await db.capacityScheduler.deleteMany({ where: { capacityId: instance.id } });
+  } finally {
+    await db.$disconnect();
+  }
 }
 
 integration("PostgreSQL priority classes and kept slots (0.4.0 graph)", () => {
@@ -173,8 +180,8 @@ integration("PostgreSQL priority classes and kept slots (0.4.0 graph)", () => {
 
   it("keeps kept slots as a guarantee and honours the borrow switch", async () => {
     if (!databaseUrl) return;
-    const fixture = await seed(databaseUrl);
     const { client, store: admission } = await store("classes-proof");
+    const fixture = await seed(databaseUrl);
     try {
       const { db, pools } = fixture;
       const [a, b] = pools;
@@ -228,8 +235,8 @@ integration("PostgreSQL priority classes and kept slots (0.4.0 graph)", () => {
 
   it("gives a share holder's waiters the share's class, and a pool's waiters the pool's", async () => {
     if (!databaseUrl) return;
-    const fixture = await seed(databaseUrl);
     const { client, store: admission } = await store("share-class-proof");
+    const fixture = await seed(databaseUrl);
     try {
       const { db } = fixture;
       // Fill both slots (each pool's kept slot), then queue one of each.
