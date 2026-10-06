@@ -14,13 +14,20 @@
  *   GPU a claim holds is deterministic and freeing it gives back exactly what it took.
  * - Ports: every claim's `port` and `distPort` stay taken until the claim is released, also
  *   for an instance this plan stops (its start queues behind the stop, `blockedBy`).
+ * - Stopping: an instance already stopping (desired STOPPED) is planned like one this plan
+ *   stops: its HELD claims' memory and GPUs are free, its ports stay taken, and a start on its
+ *   nodes waits for it (`blockedBy`, warning `waits_for_stop`). A HELD_UNKNOWN claim is never
+ *   freed by a stop (the engine does not wait for it). Nodes free now are preferred.
  *
  * Choice (deterministic): one rank per node within an instance. Without preemption the planner
  * packs best-fit (least memory left over, then least GPU memory, then slug), which keeps whole
  * nodes free for multi-node instances. A multi-node instance stays inside ONE fabric (by name
  * when `launch.fabric` pins one): the smallest fabric that fits wins, then the name
  * (`no_shared_fabric` when no fabric has enough members). The head (rank 0) address and every
- * rank's `fabric_ip` come from that fabric's member IPs.
+ * rank's `fabric_ip` come from that fabric's member IPs. A node set is usable only when every
+ * Relay-only rank holds the head address in its frozen copy of that fabric (§4.4, else the node
+ * refuses with `definition_frozen`) and one dist port is free on every rank; otherwise other
+ * sets are tried (`head_not_in_frozen_fabric` / `no_free_ports` when none works).
  *
  * Preemption (only when nothing fits without it, only when the request allows it): the stop
  * set with the least disruption, compared as (contributed instances, instances, ranks, GiB
@@ -47,6 +54,14 @@ export type PlacementGpu = {
   vramGb: number;
 };
 
+/** A fabric as a Relay-only node froze it (`Node.frozenFabrics`, `nodeFabricSetsSchema`). */
+export type PlacementFrozenFabric = {
+  fabricId: string;
+  /** The fabric's name when frozen: a launch that pins a fabric must match it (render.rs). */
+  name: string;
+  memberIps: readonly string[];
+};
+
 export type PlacementNode = {
   id: string;
   slug: string;
@@ -59,6 +74,13 @@ export type PlacementNode = {
   portRange: readonly [number, number];
   /** Version ids the node holds (frozen at Relay only). */
   heldVersionIds: ReadonlySet<string>;
+  /**
+   * The fabrics a Relay-only node checks a multi-node head against: what it froze; `"current"`
+   * for a pending lower whose fabric definition is in sync (it will freeze its current
+   * memberships, taken from the context's fabrics); null when not checked (Full control, or a
+   * pending lower whose fabrics are not in sync).
+   */
+  frozenFabrics: readonly PlacementFrozenFabric[] | "current" | null;
   /** Usable node memory (GiB) before any claim (`effectiveHardware().usableMemoryGb`). */
   memoryGb: number;
   gpus: readonly PlacementGpu[];
@@ -73,6 +95,8 @@ export type PlacementRank = {
   distPort: number | null;
   /** The rank's `resources` JSON (`runtimeResourceSchema`); anything else claims nothing. */
   resources: unknown;
+  /** HELD_UNKNOWN (forgotten) claims stay counted: no stop releases them. */
+  claim: "HELD" | "HELD_UNKNOWN";
 };
 
 export type PlacementInstance = {
@@ -82,7 +106,10 @@ export type PlacementInstance = {
   ownerId: string;
   /** STARTABLE (an always-on runtime is never stopped by placement). */
   startable: boolean;
-  /** `desiredState` RUNNING (one already stopping is not a preemption candidate). */
+  /**
+   * `desiredState` RUNNING. One that is not is already stopping: never a preemption candidate,
+   * and its HELD claims are planned free (new ranks on its nodes wait for it).
+   */
   running: boolean;
   /** Ranks whose claim is not RELEASED. */
   ranks: readonly PlacementRank[];
@@ -160,7 +187,7 @@ export type PlacementRefusal = {
 };
 
 export type PlacementWarning = {
-  code: "low_free_memory" | "interactive_needs_person";
+  code: "low_free_memory" | "interactive_needs_person" | "waits_for_stop";
   nodeId: string | null;
   detail: string;
 };
@@ -411,7 +438,30 @@ const MESSAGES: Partial<Record<RefusalReason, string>> = {
   unknown_node: "That node does not exist.",
   invalid_node_count: "Give exactly one node per rank (groupSize).",
   not_enough_nodes: "Not enough eligible nodes are online for this runtime.",
+  head_not_in_frozen_fabric:
+    "A Relay-only node does not hold the head's address in its frozen copy of this fabric, so it would refuse the start. Raise its trust to Full, or start on nodes whose frozen fabric includes the head.",
 };
+
+/** Set-level reasons (a whole node set was found but cannot run), the closest miss first. */
+const GROUP_REASONS = ["no_free_ports", "head_not_in_frozen_fabric"] as const;
+type GroupReason = (typeof GROUP_REASONS)[number];
+
+const GROUP_MESSAGES: Record<GroupReason, string> = {
+  no_free_ports:
+    "No set of nodes that fits has one dist port free on every node; free a port or widen the nodes' port ranges.",
+  head_not_in_frozen_fabric:
+    "In every set of nodes that fits, a Relay-only node does not hold the head's address in its frozen copy of the fabric, so it would refuse the start. Raise its trust to Full, or start on nodes whose frozen fabric includes the head.",
+};
+
+/**
+ * At most this many other node sets are tried per pass of one `place()` (across every fabric and
+ * preemption seed) when the best set cannot run. Each try is one greedy run: groupSize ×
+ * candidates fits, each trying up to 2^MAX_VICTIMS_PER_NODE stop sets with preemption.
+ */
+const MAX_SET_TRIES = 32;
+
+/** Why a whole node set cannot run, and the node it is about (the first refusing node). */
+type GroupProblem = { reason: GroupReason; subjectId: string | null };
 
 function refusal(reason: RefusalReason, subjectId: string | null, message?: string) {
   return { reason, subjectId, message: message ?? MESSAGES[reason] ?? reason };
@@ -437,6 +487,8 @@ type RankChoice = {
   needs: Needs;
   /** Memory, then GPU memory left on the node after this rank (best fit). */
   leftover: [number, number];
+  /** An instance already stopping holds a claim here: the rank waits for its release. */
+  waits: boolean;
 };
 
 type InstanceChoice = {
@@ -454,15 +506,43 @@ export class PlacementPlanner {
   #budgets: Map<string, Budget>;
   /** Which GPUs each claim holds: `instanceId|rankIndex` → GPU keys. */
   readonly #gpuClaims = new Map<string, string[]>();
-  /** Every instance planned to stop: the context's plus this planner's preemptions. */
+  /**
+   * Every instance planned to stop: the context's, those already stopping (`#draining`) and this
+   * planner's preemptions. Their HELD claims are free in the budgets; their ports stay taken.
+   */
   readonly #stopping: Set<string>;
+  /** Instances already stopping before this plan (desired STOPPED, a claim still HELD). */
+  readonly #draining: Set<string>;
+  /** Each node's frozen fabrics as checked (`"current"` resolved), or null: not checked. */
+  readonly #frozen: Map<string, readonly PlacementFrozenFabric[] | null>;
+  /** Alternative node sets still allowed in this pass (`MAX_SET_TRIES`). */
+  #setTries = MAX_SET_TRIES;
   readonly #stops: PlannedStop[] = [];
 
   constructor(context: PlacementContext) {
     this.#context = context;
     this.#nodes = new Map(context.nodes.map((node) => [node.id, node]));
     this.#instances = new Map(context.instances.map((instance) => [instance.id, instance]));
-    this.#stopping = new Set(context.stopping ?? []);
+    this.#draining = new Set(
+      context.instances
+        .filter((instance) => !instance.running && instance.ranks.some(isHeld))
+        .map((instance) => instance.id),
+    );
+    this.#stopping = new Set([...(context.stopping ?? []), ...this.#draining]);
+    this.#frozen = new Map(
+      context.nodes.map((node) => [
+        node.id,
+        node.frozenFabrics === "current"
+          ? context.fabrics
+              .filter((fabric) => fabric.members.some((member) => member.nodeId === node.id))
+              .map((fabric) => ({
+                fabricId: fabric.id,
+                name: fabric.name,
+                memberIps: fabric.members.map((member) => member.ip),
+              }))
+          : node.frozenFabrics,
+      ]),
+    );
     this.#budgets = new Map(
       context.nodes.map((node) => [
         node.id,
@@ -490,7 +570,7 @@ export class PlacementPlanner {
           const needs = resourceNeeds(rank.resources);
           const gpuKeys = claimGpus(budget, needs, rank.resources);
           this.#gpuClaims.set(`${instance.id}|${index}`, gpuKeys);
-          if (!this.#stopping.has(instance.id)) apply(budget, needs, gpuKeys, 1);
+          if (!this.#freedByStop(instance.id, rank)) apply(budget, needs, gpuKeys, 1);
         });
   }
 
@@ -502,7 +582,7 @@ export class PlacementPlanner {
   /** Places one instance; on success its claims (and any preemption) are committed. */
   place(request: PlacementRequest): PlacementResult {
     const working: Working = { budgets: this.#cloneBudgets(), victims: new Set() };
-    if (request.restart) this.#freeInstance(working, request.restart.instanceId, true);
+    if (request.restart) this.#freeInstance(working, request.restart.instanceId, "restart");
 
     const chosen = request.nodeIds
       ? this.#placeOnNodes(working, request, request.nodeIds)
@@ -540,19 +620,31 @@ export class PlacementPlanner {
         });
     }
     const nodeIds = new Set(ranks.map((rank) => rank.node.id));
+    // Never its own id: a restart waiting for itself would never start.
     const blockedBy = [...this.#stopping]
-      .filter((id) =>
-        this.#instances
-          .get(id)
-          ?.ranks.some((rank) => rank.nodeId !== null && nodeIds.has(rank.nodeId)),
+      .filter(
+        (id) =>
+          id !== request.restart?.instanceId && this.#heldOn(id, (nodeId) => nodeIds.has(nodeId)),
       )
       .sort(compareCodePoints);
+    // A restarted instance runs again: later plans no longer wait for it.
+    if (request.restart) {
+      this.#stopping.delete(request.restart.instanceId);
+      this.#draining.delete(request.restart.instanceId);
+    }
     for (const rank of ranks) {
       const live = rank.node.liveFreeMemoryGb;
+      const on = (nodeId: string) => nodeId === rank.node.id;
       // A node a stop frees reports its memory only after the stop.
-      const freed = blockedBy.some((id) =>
-        this.#instances.get(id)?.ranks.some((claim) => claim.nodeId === rank.node.id),
-      );
+      const freed = blockedBy.some((id) => this.#heldOn(id, on));
+      // Not this plan's stop, so the preview's stops do not show it: say the start waits.
+      if (blockedBy.some((id) => this.#draining.has(id) && this.#heldOn(id, on)))
+        warnings.push({
+          code: "waits_for_stop",
+          nodeId: rank.node.id,
+          detail:
+            "An instance that is already stopping holds room on this node; this start waits until the node releases it.",
+        });
       if (!freed && live !== null && rank.needs.memoryGb > live + EPSILON)
         warnings.push({
           code: "low_free_memory",
@@ -630,7 +722,7 @@ export class PlacementPlanner {
     };
     for (const id of [...victims].sort(compareCodePoints)) {
       working.victims.add(id);
-      this.#freeInstance(working, id, false);
+      this.#freeInstance(working, id, "stop");
     }
     const replayed: RankChoice[] = [];
     for (const [index, rank] of ranks.entries()) {
@@ -638,7 +730,7 @@ export class PlacementPlanner {
       if (!budget) return null;
       const fitted = fit(rank.node, budget, rankResources(request.launch, index), rank.port);
       if (!fitted.ok) return null;
-      const choice = rankChoice(rank.node, budget, fitted, []);
+      const choice = rankChoice(rank.node, budget, fitted, [], rank.waits);
       apply(budget, choice.needs, choice.gpuKeys, 1);
       budget.ports.add(choice.port);
       replayed.push(choice);
@@ -666,10 +758,19 @@ export class PlacementPlanner {
     }
     let fabric: PlacementFabric | null = null;
     if (launch.groupSize > 1) {
-      fabric =
-        this.#fabricsFor(launch).find((candidate) =>
-          nodes.every((node) => candidate.members.some((member) => member.nodeId === node.id)),
-        ) ?? null;
+      const sharing = this.#fabricsFor(launch).filter((candidate) =>
+        nodes.every((node) => candidate.members.some((member) => member.nodeId === node.id)),
+      );
+      // The first shared fabric on which every Relay-only rank accepts the head (§4.4).
+      fabric = sharing.find((candidate) => !this.#frozenRefuser(nodes, candidate, launch)) ?? null;
+      const first = sharing[0];
+      if (!fabric && first)
+        return {
+          refusal: refusal(
+            "head_not_in_frozen_fabric",
+            this.#frozenRefuser(nodes, first, launch)?.id ?? null,
+          ),
+        };
       if (!fabric)
         return {
           refusal: refusal(
@@ -716,17 +817,28 @@ export class PlacementPlanner {
     // Fit reasons of the last pass explain the refusal (with preemption, what is left after
     // every allowed stop).
     const fitReasons = new Set<RefusalReason>();
-    const pass = (run: (preempt: boolean, into: Set<RefusalReason>) => InstanceChoice | null) => {
-      const plain = run(false, fitReasons);
+    // Whole node sets that fit but cannot run (last pass), which explain a refusal first.
+    const groupReasons: GroupReasons = new Map();
+    const pass = (
+      run: (
+        preempt: boolean,
+        into: Set<RefusalReason>,
+        groups: GroupReasons,
+      ) => InstanceChoice | null,
+    ) => {
+      this.#setTries = MAX_SET_TRIES;
+      const plain = run(false, fitReasons, groupReasons);
       if (plain || !request.preempt) return plain;
       fitReasons.clear();
-      return run(true, fitReasons);
+      groupReasons.clear();
+      this.#setTries = MAX_SET_TRIES;
+      return run(true, fitReasons, groupReasons);
     };
 
     if (launch.groupSize === 1) {
       for (const reason of nodeReasons.values()) reasons.add(reason);
-      const choice = pass((preempt, into) =>
-        this.#bestGroup(working, request, eligible, null, preempt, into),
+      const choice = pass((preempt, into, groups) =>
+        this.#bestGroup(working, request, eligible, null, preempt, into, groups),
       );
       for (const reason of fitReasons) reasons.add(reason);
       return choice ?? { refusal: this.#autoRefusal(reasons, request, eligible) };
@@ -750,17 +862,27 @@ export class PlacementPlanner {
         reasons.add(reason);
     const membersOf = (fabric: PlacementFabric) =>
       eligible.filter((node) => fabric.members.some((member) => member.nodeId === node.id));
-    const choice = pass((preempt, into) => {
+    const choice = pass((preempt, into, groups) => {
       let best: InstanceChoice | null = null;
       for (const fabric of fabrics) {
         const members = membersOf(fabric);
         if (members.length < launch.groupSize) continue;
-        const candidate = this.#bestGroup(working, request, members, fabric, preempt, into);
+        const candidate = this.#bestGroup(working, request, members, fabric, preempt, into, groups);
         if (candidate && (!best || compareInstanceChoice(candidate, best) < 0)) best = candidate;
       }
       return best;
     });
     if (choice) return choice;
+    // Whole node sets fit but none can run: say why (the closest miss first).
+    const groupReason = GROUP_REASONS.find((reason) => groupReasons.has(reason));
+    if (groupReason)
+      return {
+        refusal: refusal(
+          groupReason,
+          groupReasons.get(groupReason) ?? null,
+          GROUP_MESSAGES[groupReason],
+        ),
+      };
     for (const reason of fitReasons) reasons.add(reason);
     if (!fabrics.some((fabric) => membersOf(fabric).length >= launch.groupSize)) {
       // Fabrics with enough members exist, but too few of them may take a rank.
@@ -783,8 +905,11 @@ export class PlacementPlanner {
     fabric: PlacementFabric | null,
     preempt: boolean,
     reasons: Set<RefusalReason>,
+    groupReasons: GroupReasons,
   ): InstanceChoice | null {
-    let best = this.#greedyGroup(base, request, candidates, fabric, preempt, reasons, null);
+    const group = (seed: PlacementInstance | null) =>
+      this.#usableGroup(base, request, candidates, fabric, preempt, reasons, groupReasons, seed);
+    let best = group(null);
     if (!preempt || request.launch.groupSize === 1) return best;
     // Rank by rank, one single-node victim always looks cheaper than a multi-node one, though
     // stopping that one instance may free several ranks at once. Try each multi-node victim
@@ -800,10 +925,121 @@ export class PlacementPlanner {
       )
       .sort((a, b) => compareCodePoints(a.id, b.id));
     for (const seed of seeds) {
-      const choice = this.#greedyGroup(base, request, candidates, fabric, preempt, reasons, seed);
+      const choice = group(seed);
       if (choice && (!best || compareInstanceChoice(choice, best) < 0)) best = choice;
     }
     return best;
+  }
+
+  /**
+   * The greedy node set, or, when that set cannot run (a Relay-only rank would refuse the head,
+   * or no dist port is free on every rank), the best usable set found from failed sets by making
+   * another member the head or leaving a member out, breadth first (fewest changes), within
+   * the pass's `MAX_SET_TRIES` budget.
+   */
+  #usableGroup(
+    base: Working,
+    request: PlacementRequest,
+    candidates: readonly PlacementNode[],
+    fabric: PlacementFabric | null,
+    preempt: boolean,
+    reasons: Set<RefusalReason>,
+    groupReasons: GroupReasons,
+    seed: PlacementInstance | null,
+  ): InstanceChoice | null {
+    const greedy = (
+      pool: readonly PlacementNode[],
+      head: string | null,
+      into: Set<RefusalReason>,
+    ) => this.#greedyGroup(base, request, pool, fabric, preempt, into, seed, head);
+    const first = greedy(candidates, null, reasons);
+    if (!first) return null;
+    const problem = this.#groupProblem(first, request);
+    if (!problem) return first;
+    noteProblem(groupReasons, problem);
+
+    // Fit reasons of the narrower pools would only repeat the first run's.
+    const scratch = new Set<RefusalReason>();
+    const seen = new Set<string>();
+    type Trial = { left: readonly string[]; head: string | null };
+    let frontier: Array<Trial & { failed: InstanceChoice }> = [
+      { left: [], head: null, failed: first },
+    ];
+    while (frontier.length > 0 && this.#setTries > 0) {
+      const next: typeof frontier = [];
+      let best: InstanceChoice | null = null;
+      for (const { left, head, failed } of frontier) {
+        const trials: Trial[] = [
+          // Another member as the head (the frozen rule depends on the head's address).
+          ...failed.ranks.slice(1).map((rank) => ({ left, head: rank.node.id })),
+          // A member left out (keeping a pinned head unless it is the one left out).
+          ...failed.ranks.map((rank) => ({
+            left: [...left, rank.node.id].sort(compareCodePoints),
+            head: head === rank.node.id ? null : head,
+          })),
+        ];
+        for (const trial of trials) {
+          const key = `${trial.left.join(",")}|${trial.head ?? ""}`;
+          if (seen.has(key) || this.#setTries <= 0) continue;
+          seen.add(key);
+          this.#setTries--;
+          const pool = candidates.filter((node) => !trial.left.includes(node.id));
+          if (pool.length < request.launch.groupSize) continue;
+          const choice = greedy(pool, trial.head, scratch);
+          if (!choice) continue;
+          const reason = this.#groupProblem(choice, request);
+          if (reason) {
+            noteProblem(groupReasons, reason);
+            next.push({ ...trial, failed: choice });
+          } else if (!best || compareInstanceChoice(choice, best) < 0) best = choice;
+        }
+      }
+      if (best) return best;
+      frontier = next;
+    }
+    return null;
+  }
+
+  /** Why this node set cannot run a multi-node instance, or null. */
+  #groupProblem(choice: InstanceChoice, request: PlacementRequest): GroupProblem | null {
+    if (request.launch.groupSize <= 1) return null;
+    const nodes = choice.ranks.map((rank) => rank.node);
+    const refuser = this.#frozenRefuser(nodes, choice.fabric, request.launch);
+    if (refuser) return { reason: "head_not_in_frozen_fabric", subjectId: refuser.id };
+    if (this.#distPort(choice.working, choice.ranks, request.restart?.distPort ?? null) === null)
+      return { reason: "no_free_ports", subjectId: null };
+    return null;
+  }
+
+  /**
+   * The first Relay-only node (in rank order) that would refuse this set's head on `fabric`: its
+   * frozen copy of the fabric (same id, and the pinned name when the launch pins one) does not
+   * list the head's address (§4.4). Null when every node accepts, or without a fabric.
+   */
+  #frozenRefuser(
+    nodes: readonly PlacementNode[],
+    fabric: PlacementFabric | null,
+    launch: LaunchShape,
+  ): PlacementNode | null {
+    const head = nodes[0];
+    if (!fabric || !head) return null;
+    const headAddr = fabric.members.find((member) => member.nodeId === head.id)?.ip;
+    return (
+      nodes.find((node) => {
+        const frozen = this.#frozen.get(node.id) ?? null;
+        return (
+          node.trust === "RELAY" &&
+          frozen !== null &&
+          !frozen.some(
+            (set) =>
+              set.fabricId === fabric.id &&
+              (!launch.fabric || set.name === launch.fabric) &&
+              headAddr !== undefined &&
+              set.memberIps.includes(headAddr),
+          )
+        );
+      }) ?? null
+    );
   }
 
   #greedyGroup(
@@ -814,6 +1050,8 @@ export class PlacementPlanner {
     preempt: boolean,
     reasons: Set<RefusalReason>,
     seed: PlacementInstance | null,
+    /** Only this node may take rank 0 (the head), when set. */
+    head: string | null = null,
   ): InstanceChoice | null {
     const working: Working = {
       budgets: new Map([...base.budgets].map(([id, budget]) => [id, cloneBudget(budget)])),
@@ -821,14 +1059,14 @@ export class PlacementPlanner {
     };
     if (seed) {
       working.victims.add(seed.id);
-      this.#freeInstance(working, seed.id, false);
+      this.#freeInstance(working, seed.id, "stop");
     }
     const used = new Set<string>();
     const ranks: RankChoice[] = [];
     for (let index = 0; index < request.launch.groupSize; index++) {
       let best: RankChoice | null = null;
       for (const node of candidates) {
-        if (used.has(node.id)) continue;
+        if (used.has(node.id) || (index === 0 && head !== null && node.id !== head)) continue;
         const choice = this.#rankOn(
           working,
           request,
@@ -869,8 +1107,12 @@ export class PlacementPlanner {
     const budget = working.budgets.get(node.id);
     if (!budget) return { reason: "not_enough_memory" };
     const resources = rankResources(request.launch, rank);
+    const waits = [...this.#draining].some(
+      (id) =>
+        id !== request.restart?.instanceId && this.#heldOn(id, (nodeId) => nodeId === node.id),
+    );
     const plain = fit(node, budget, resources, fixedPort);
-    if (plain.ok) return rankChoice(node, budget, plain, []);
+    if (plain.ok) return rankChoice(node, budget, plain, [], waits);
     // Ports are not freed by a stop (the claim keeps them until released): no preemption helps.
     if (!preempt || plain.reason !== "not_enough_memory") return { reason: plain.reason };
 
@@ -899,7 +1141,7 @@ export class PlacementPlanner {
         if (fitted.reason !== "not_enough_memory") reason = fitted.reason;
         continue;
       }
-      best = rankChoice(node, trial, fitted, victims);
+      best = rankChoice(node, trial, fitted, victims, waits);
       bestCost = cost;
     }
     return best ?? { reason };
@@ -910,7 +1152,7 @@ export class PlacementPlanner {
     for (const victim of choice.victims) {
       if (working.victims.has(victim.id)) continue;
       working.victims.add(victim.id);
-      this.#freeInstance(working, victim.id, false);
+      this.#freeInstance(working, victim.id, "stop");
     }
     const budget = working.budgets.get(choice.node.id);
     if (!budget) return;
@@ -921,15 +1163,18 @@ export class PlacementPlanner {
     budget.ports.add(choice.port);
   }
 
-  /** Gives back an instance's memory and GPUs (and with `ports`, its ports) in `working`. */
-  #freeInstance(working: Working, instanceId: string, ports: boolean): void {
+  /**
+   * Gives back an instance's memory and GPUs in `working`: a stop frees its HELD claims; a
+   * restart frees every claim (it retakes HELD_UNKNOWN ones) and its ports. Claims that are
+   * free already (`#freedByStop`) are skipped.
+   */
+  #freeInstance(working: Working, instanceId: string, mode: "stop" | "restart"): void {
     const instance = this.#instances.get(instanceId);
-    if (!instance || this.#stopping.has(instanceId)) {
-      if (instance && ports) this.#freePorts(working, instance);
-      return;
-    }
+    if (!instance) return;
     instance.ranks.forEach((rank, index) => {
       if (!rank.nodeId) return;
+      if (this.#freedByStop(instanceId, rank)) return;
+      if (mode === "stop" && !isHeld(rank)) return;
       const budget = working.budgets.get(rank.nodeId);
       if (!budget) return;
       apply(
@@ -939,7 +1184,19 @@ export class PlacementPlanner {
         -1,
       );
     });
-    if (ports) this.#freePorts(working, instance);
+    if (mode === "restart") this.#freePorts(working, instance);
+  }
+
+  /** Whether this claim is free in the budgets already (a HELD claim of a stopping instance). */
+  #freedByStop(instanceId: string, rank: PlacementRank): boolean {
+    return this.#stopping.has(instanceId) && isHeld(rank);
+  }
+
+  /** Whether the instance has a HELD claim on a node matching `on`. */
+  #heldOn(instanceId: string, on: (nodeId: string) => boolean): boolean {
+    return !!this.#instances
+      .get(instanceId)
+      ?.ranks.some((rank) => rank.nodeId !== null && isHeld(rank) && on(rank.nodeId));
   }
 
   #freePorts(working: Working, instance: PlacementInstance): void {
@@ -954,7 +1211,7 @@ export class PlacementPlanner {
 
   #freeOnNode(budget: Budget, instance: PlacementInstance, nodeId: string): void {
     instance.ranks.forEach((rank, index) => {
-      if (rank.nodeId !== nodeId) return;
+      if (rank.nodeId !== nodeId || !isHeld(rank)) return;
       apply(
         budget,
         resourceNeeds(rank.resources),
@@ -1101,6 +1358,7 @@ function rankChoice(
   budget: Budget,
   fitted: Extract<Fit, { ok: true }>,
   victims: PlacementInstance[],
+  waits: boolean,
 ): RankChoice {
   const gpuLeft = budget.gpus
     .filter((gpu) => fitted.gpuKeys.includes(gpu.key))
@@ -1112,7 +1370,23 @@ function rankChoice(
     gpuKeys: fitted.gpuKeys,
     needs: fitted.needs,
     leftover: [budget.memoryGb - fitted.needs.memoryGb, gpuLeft],
+    waits,
   };
+}
+
+function isHeld(rank: PlacementRank): boolean {
+  return rank.claim === "HELD";
+}
+
+/** Set-level reasons seen in a pass, each with the subject of the first set that failed so. */
+type GroupReasons = Map<GroupReason, string | null>;
+
+function noteProblem(reasons: GroupReasons, problem: GroupProblem): void {
+  if (!reasons.has(problem.reason)) reasons.set(problem.reason, problem.subjectId);
+}
+
+function waitingRanks(choice: InstanceChoice): number {
+  return choice.ranks.filter((rank) => rank.waits).length;
 }
 
 const FIT_REASONS: ReadonlySet<RefusalReason> = new Set([
@@ -1121,20 +1395,28 @@ const FIT_REASONS: ReadonlySet<RefusalReason> = new Set([
   "no_free_ports",
 ]);
 
-/** Fewest stops, then the smallest fabric, then best fit, then the fabric name. */
+/**
+ * Fewest stops, then fewest ranks waiting for an instance already stopping, then the smallest
+ * fabric, then best fit, then the fabric name.
+ */
 function compareInstanceChoice(a: InstanceChoice, b: InstanceChoice): number {
   return (
     compareCost(a.cost, b.cost) ||
+    waitingRanks(a) - waitingRanks(b) ||
     (a.fabric?.members.length ?? 0) - (b.fabric?.members.length ?? 0) ||
     a.leftover - b.leftover ||
     compareCodePoints(a.fabric?.name ?? "", b.fabric?.name ?? "")
   );
 }
 
-/** Fewest stops first, then best fit (least memory, then GPU memory left), then slug. */
+/**
+ * Fewest stops first, then a node free now over one an instance already stopping frees, then
+ * best fit (least memory, then GPU memory left), then slug.
+ */
 function compareRank(a: RankChoice, b: RankChoice): number {
   return (
     compareCost(costOf(a.victims), costOf(b.victims)) ||
+    Number(a.waits) - Number(b.waits) ||
     a.leftover[0] - b.leftover[0] ||
     a.leftover[1] - b.leftover[1] ||
     compareCodePoints(a.node.slug, b.node.slug)

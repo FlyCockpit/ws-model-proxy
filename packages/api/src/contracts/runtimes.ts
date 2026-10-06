@@ -226,6 +226,8 @@ export const previewWarningSchema = z
       "interactive_needs_person",
       "definition_not_on_node",
       "binds_all_interfaces",
+      /** A start waits for an instance that was already stopping to release its claims. */
+      "waits_for_stop",
     ]),
     nodeId: idSchema.nullable(),
     detail: z.string(),

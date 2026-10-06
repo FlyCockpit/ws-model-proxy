@@ -10,10 +10,12 @@ import { parseHeldDefinitions } from "../nodes/views";
 import type {
   PlacementContext,
   PlacementFabric,
+  PlacementFrozenFabric,
   PlacementInstance,
   PlacementNode,
 } from "./placement";
-import { runtimeSpecSchema } from "./runtime-spec";
+import { nodeFabricsHash } from "./runtime-launch-hash";
+import { nodeFabricSetsSchema, runtimeSpecSchema } from "./runtime-spec";
 import type { Tx } from "./runtime-store";
 
 export const PLACEMENT_NODE_SELECT = {
@@ -28,6 +30,9 @@ export const PLACEMENT_NODE_SELECT = {
   portStart: true,
   portEnd: true,
   heldDefinitions: true,
+  frozenFabrics: true,
+  fabricsHash: true,
+  heldFabricsHash: true,
   declaredResources: true,
   nodeInfo: true,
   nodeMetrics: true,
@@ -46,11 +51,39 @@ export type PlacementNodeRow = {
   portStart: number;
   portEnd: number;
   heldDefinitions: unknown;
+  frozenFabrics: unknown;
+  fabricsHash: string | null;
+  heldFabricsHash: string | null;
   declaredResources: unknown;
   nodeInfo: unknown;
   nodeMetrics: unknown;
   nodeMetricsAt: Date | null;
 };
+
+const EMPTY_FABRICS_HASH = nodeFabricsHash([]);
+
+/**
+ * The fabrics a Relay-only node checks a multi-node head against. A node reporting RELAY: what
+ * it froze (`[{ fabricId, name, selfIp, memberIps }]`); an unreadable value freezes nothing, so
+ * a multi-node start there is refused, as the node would refuse it. A pending lower whose fabric
+ * definition is in sync (`heldFabricsHash` matches `fabricsHash`): `"current"`, the memberships
+ * it will freeze. Otherwise null (not checked).
+ */
+function frozenFabricsOf(row: PlacementNodeRow): PlacementFrozenFabric[] | "current" | null {
+  if (row.trust === "RELAY") {
+    const parsed = nodeFabricSetsSchema.safeParse(row.frozenFabrics ?? []);
+    if (!parsed.success) return [];
+    return parsed.data.map((fabric) => ({
+      fabricId: fabric.fabricId,
+      name: fabric.name,
+      memberIps: fabric.memberIps,
+    }));
+  }
+  const lowerPending = row.trustLowerRequestedAt !== null;
+  const inSync =
+    (row.fabricsHash ?? EMPTY_FABRICS_HASH) === (row.heldFabricsHash ?? EMPTY_FABRICS_HASH);
+  return lowerPending && inSync ? "current" : null;
+}
 
 /** A node row as the planner sees it: usable memory and per-GPU usable VRAM, before claims. */
 export function placementNodeOf(row: PlacementNodeRow, now: Date): PlacementNode {
@@ -71,6 +104,7 @@ export function placementNodeOf(row: PlacementNodeRow, now: Date): PlacementNode
     labels: row.labels,
     portRange: [row.portStart, row.portEnd],
     heldVersionIds: new Set(parseHeldDefinitions(row.heldDefinitions).map((d) => d.versionId)),
+    frozenFabrics: frozenFabricsOf(row),
     memoryGb: hardware.usableMemoryGb,
     gpus: hardware.gpus.map((gpu) => ({
       key: gpu.key,
@@ -116,7 +150,7 @@ export async function loadPlacementInstances(
       Ranks: {
         where: { claim: { not: "RELEASED" } },
         orderBy: { rank: "asc" },
-        select: { nodeId: true, port: true, distPort: true, resources: true },
+        select: { nodeId: true, port: true, distPort: true, resources: true, claim: true },
       },
     },
     orderBy: { id: "asc" },
@@ -127,7 +161,14 @@ export async function loadPlacementInstances(
     ownerId: row.userId,
     startable: row.Runtime.kind === "STARTABLE",
     running: row.desiredState === "RUNNING",
-    ranks: row.Ranks,
+    ranks: row.Ranks.map((rank) => ({
+      nodeId: rank.nodeId,
+      port: rank.port,
+      distPort: rank.distPort,
+      resources: rank.resources,
+      // RELEASED claims are not loaded.
+      claim: rank.claim === "HELD_UNKNOWN" ? ("HELD_UNKNOWN" as const) : ("HELD" as const),
+    })),
     contributed: row.Runtime.Models.length > 0,
     interactiveStop: hasInteractiveStop(row.LaunchVersion.spec),
   }));

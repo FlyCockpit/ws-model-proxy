@@ -27,7 +27,7 @@ function claimant(id: string, nodeId: string, port: number, resources: unknown):
     ownerId: "u-1",
     startable: true,
     running: true,
-    ranks: [{ nodeId, port, distPort: null, resources }],
+    ranks: [{ nodeId, port, distPort: null, claim: "HELD", resources }],
     contributed: false,
     interactiveStop: false,
   };
@@ -94,6 +94,28 @@ describe("profilePlan", () => {
     expect(plan.preview.starts).toHaveLength(1);
     expect(plan.preview.starts[0]?.placements[0]).toMatchObject({ port: 30000, nodeNumber: 1 });
     expect(plan.preview.fingerprint).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("refuses an interactive item in this preview instead of placing it", () => {
+    const spec = launchSpec({
+      management: "service",
+      commands: [
+        {
+          start: "sudo systemctl start x",
+          stop: "true",
+          status: "systemctl is-active x",
+          interactive: { start: true },
+        },
+      ],
+    });
+    const versions = new Map([
+      ["v-1", { id: "v-1", runtimeId: "rt-1", runtimeSlug: "qwen", currentVersionId: "v-1", spec }],
+    ]);
+    const plan = profilePlan(input({ versions }));
+    expect(plan.preview.starts).toEqual([]);
+    expect(plan.preview.refusals).toEqual([
+      expect.objectContaining({ reason: "interactive_needs_person", subjectId: "rt-1" }),
+    ]);
   });
 
   it("keeps a matching instance and stops everything else on owned nodes", () => {

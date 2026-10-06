@@ -15,7 +15,12 @@ import type { refusalSchema } from "../contracts/refusals";
 import type { previewWarningSchema, startPreviewSchema } from "../contracts/runtimes";
 import { compareCodePoints } from "../lib/canonical-json";
 import {
+  INTERACTIVE_STEPS_SUPPORTED,
+  INTERACTIVE_UNSUPPORTED_MESSAGE,
+} from "../lib/interactive-steps";
+import {
   type PlacementFabric,
+  type PlacementFrozenFabric,
   type PlacementGpu,
   type PlacementInstance,
   PlacementPlanner,
@@ -46,6 +51,11 @@ export type PlanNode = {
   portRange: readonly [number, number];
   /** Version ids the node holds (frozen at Relay only). */
   heldVersionIds: ReadonlySet<string>;
+  /**
+   * The fabrics the node froze at Relay only (`placementNodeOf(...).frozenFabrics`). Absent or
+   * null: not checked (the node refuses a head outside them at dispatch).
+   */
+  frozenFabrics?: readonly PlacementFrozenFabric[] | "current" | null;
   /** Node memory budget for wsmp (usable, before any claim). */
   memoryGb: number;
   /** Usable VRAM per GPU (reserved taken off), before any claim. */
@@ -259,6 +269,7 @@ export function profilePlan(input: PlanInput): ProfilePlan {
       labels: node.labels,
       portRange: node.portRange,
       heldVersionIds: node.heldVersionIds,
+      frozenFabrics: node.frozenFabrics ?? null,
       memoryGb: node.memoryGb,
       gpus: node.gpus,
       liveFreeMemoryGb: node.liveFreeMemoryGb,
@@ -290,12 +301,21 @@ export function profilePlan(input: PlanInput): ProfilePlan {
         nodeId: null,
         detail: `${version.runtimeSlug} binds every interface.`,
       });
-    if (launch.commands.some((commands) => Object.values(commands.interactive ?? {}).some(Boolean)))
+    if (
+      launch.commands.some((commands) => Object.values(commands.interactive ?? {}).some(Boolean))
+    ) {
+      if (!INTERACTIVE_STEPS_SUPPORTED) {
+        refusals.push(
+          refusal("interactive_needs_person", item.runtimeId, INTERACTIVE_UNSUPPORTED_MESSAGE),
+        );
+        continue;
+      }
       warnings.push({
         code: "interactive_needs_person",
         nodeId: null,
         detail: `${version.runtimeSlug} has a step a person runs in a terminal.`,
       });
+    }
 
     const allowed = new Set(
       (item.nodeIds.length > 0 ? item.nodeIds : [...placeable]).filter((id) => placeable.has(id)),

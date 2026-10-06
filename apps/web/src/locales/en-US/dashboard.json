@@ -519,7 +519,8 @@
       "pins_outdated": "Newer versions exist",
       "interactive_needs_person": "Needs you in a terminal",
       "definition_not_on_node": "Definition sent first",
-      "binds_all_interfaces": "Listens on every network"
+      "binds_all_interfaces": "Listens on every network",
+      "waits_for_stop": "Waits for a stop"
     },
     "new": {
       "button": "New profile",
@@ -1026,7 +1027,8 @@
       "pins_outdated": "A profile pins an older version.",
       "interactive_needs_person": "A step will wait for you in an operator terminal.",
       "definition_not_on_node": "The node does not hold this definition yet.",
-      "binds_all_interfaces": "A command binds 0.0.0.0 or ::."
+      "binds_all_interfaces": "A command binds 0.0.0.0 or ::.",
+      "waits_for_stop": "An instance that is already stopping holds room on a node; the start waits until it is released."
     },
     "refusals": {
       "human_only": "Only a person can do this, in the browser.",

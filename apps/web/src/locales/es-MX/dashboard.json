@@ -519,7 +519,8 @@
       "pins_outdated": "Hay versiones más nuevas",
       "interactive_needs_person": "Te necesita en una terminal",
       "definition_not_on_node": "Primero se envía la definición",
-      "binds_all_interfaces": "Escucha en todas las redes"
+      "binds_all_interfaces": "Escucha en todas las redes",
+      "waits_for_stop": "Espera a que algo se detenga"
     },
     "new": {
       "button": "Nuevo perfil",
@@ -1026,7 +1027,8 @@
       "pins_outdated": "Un perfil fija una versión anterior.",
       "interactive_needs_person": "Un paso te esperará en una terminal de operador.",
       "definition_not_on_node": "El nodo aún no tiene esta definición.",
-      "binds_all_interfaces": "Un comando escucha en 0.0.0.0 o ::."
+      "binds_all_interfaces": "Un comando escucha en 0.0.0.0 o ::.",
+      "waits_for_stop": "Una instancia que ya se está deteniendo ocupa espacio en un nodo; el inicio espera hasta que se libere."
     },
     "refusals": {
       "human_only": "Solo una persona puede hacer esto, en el navegador.",

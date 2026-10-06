@@ -8,6 +8,7 @@ import {
   type PlacementRequest,
   type PlacementResult,
 } from "./placement";
+import { type PlacementNodeRow, placementNodeOf } from "./placement-load";
 import type { RuntimeResource } from "./runtime-spec";
 
 // ── Fixtures: the owner's lab ──
@@ -26,6 +27,7 @@ function node(id: string, overrides: Partial<PlacementNode> = {}): PlacementNode
     labels: [],
     portRange: [30000, 30009],
     heldVersionIds: new Set(),
+    frozenFabrics: null,
     memoryGb: 126,
     gpus: [],
     liveFreeMemoryGb: null,
@@ -122,6 +124,7 @@ function running(
       nodeId,
       port: 30000 + index,
       distPort: null,
+      claim: "HELD",
       resources: { kind: "unified", memoryGb },
     })),
     contributed: false,
@@ -343,10 +346,13 @@ describe("accounting", () => {
     expect(amd.ok).toBe(false);
   });
 
-  it("counts HELD_UNKNOWN and stopping claims that are not this plan's (they arrive as ranks)", () => {
+  it("prefers a node free now over one an instance already stopping frees", () => {
     const stopping = running("old", ["h1"], 100, { running: false });
     const planner = new PlacementPlanner(context({ instances: [stopping] }));
-    expect(nodesOf(planner.place(request({ labels: ["strix"] })))).toEqual(["h2"]);
+    const result = ok(planner.place(request({ labels: ["strix"] })));
+    expect(nodesOf(result)).toEqual(["h2"]);
+    expect(result.start.blockedBy).toEqual([]);
+    expect(result.warnings).toEqual([]);
   });
 
   it("subtracts claims of another user's instance on the node, and never preempts it", () => {
@@ -389,7 +395,15 @@ describe("accounting", () => {
         fabrics: [fabric("ab", ["a", "b"])],
         instances: [
           running("x", ["b"], 1, {
-            ranks: [{ nodeId: "b", port: 30003, distPort: null, resources: { kind: "none" } }],
+            ranks: [
+              {
+                nodeId: "b",
+                port: 30003,
+                distPort: null,
+                claim: "HELD",
+                resources: { kind: "none" },
+              },
+            ],
           }),
         ],
       }),
@@ -493,6 +507,7 @@ describe("explicit nodes and restarts", () => {
           nodeId: "h1",
           port: 30005,
           distPort: null,
+          claim: "HELD",
           resources: { kind: "unified", memoryGb: 120 },
         },
       ],
@@ -513,11 +528,15 @@ describe("explicit nodes and restarts", () => {
 
   it("a restart is refused when another claim took its port", () => {
     const self = running("self", ["h1"], 10, {
-      ranks: [{ nodeId: "h1", port: 30005, distPort: null, resources: { kind: "none" } }],
+      ranks: [
+        { nodeId: "h1", port: 30005, distPort: null, claim: "HELD", resources: { kind: "none" } },
+      ],
       running: false,
     });
     const thief = running("thief", ["h1"], 10, {
-      ranks: [{ nodeId: "h1", port: 30005, distPort: null, resources: { kind: "none" } }],
+      ranks: [
+        { nodeId: "h1", port: 30005, distPort: null, claim: "HELD", resources: { kind: "none" } },
+      ],
     });
     const planner = new PlacementPlanner(context({ instances: [self, thief] }));
     const result = planner.place(
@@ -698,7 +717,13 @@ describe("review fixes", () => {
       claims.push(
         running(id, ["gpu"], 0, {
           ranks: [
-            { nodeId: "gpu", port: placement.port, distPort: null, resources: placement.resources },
+            {
+              nodeId: "gpu",
+              port: placement.port,
+              distPort: null,
+              claim: "HELD",
+              resources: placement.resources,
+            },
           ],
         }),
       );
@@ -714,13 +739,19 @@ describe("review fixes", () => {
     // 26 GiB claimed on 24 GiB without recorded GPUs (claims from before lane F).
     const claims = [
       running("x", ["gpu"], 0, {
-        ranks: [{ nodeId: "gpu", port: 30000, distPort: null, resources: discrete(10)[0] }],
+        ranks: [
+          { nodeId: "gpu", port: 30000, distPort: null, claim: "HELD", resources: discrete(10)[0] },
+        ],
       }),
       running("y", ["gpu"], 0, {
-        ranks: [{ nodeId: "gpu", port: 30001, distPort: null, resources: discrete(10)[0] }],
+        ranks: [
+          { nodeId: "gpu", port: 30001, distPort: null, claim: "HELD", resources: discrete(10)[0] },
+        ],
       }),
       running("z", ["gpu"], 0, {
-        ranks: [{ nodeId: "gpu", port: 30002, distPort: null, resources: discrete(6)[0] }],
+        ranks: [
+          { nodeId: "gpu", port: 30002, distPort: null, claim: "HELD", resources: discrete(6)[0] },
+        ],
       }),
     ];
     const planner = new PlacementPlanner(context({ nodes: [twoGpus()], instances: claims }));
@@ -798,7 +829,9 @@ describe("review fixes", () => {
       ],
     });
     const claim = (id: string, resources: unknown, port: number) =>
-      running(id, ["gpu"], 0, { ranks: [{ nodeId: "gpu", port, distPort: null, resources }] });
+      running(id, ["gpu"], 0, {
+        ranks: [{ nodeId: "gpu", port, distPort: null, claim: "HELD", resources }],
+      });
     const planner = new PlacementPlanner(
       context({
         nodes: [gpuNode],
@@ -820,7 +853,9 @@ describe("review fixes", () => {
 
   it("a restart takes the new version's fixed port", () => {
     const self = running("self", ["h1"], 10, {
-      ranks: [{ nodeId: "h1", port: 30005, distPort: null, resources: { kind: "none" } }],
+      ranks: [
+        { nodeId: "h1", port: 30005, distPort: null, claim: "HELD", resources: { kind: "none" } },
+      ],
     });
     const planner = new PlacementPlanner(context({ instances: [self] }));
     const result = ok(
@@ -833,5 +868,355 @@ describe("review fixes", () => {
       ),
     );
     expect(result.start.placements[0]?.port).toBe(31000);
+  });
+});
+
+/** A fabric with explicit member IPs (node id → IP), in this order. */
+function netFabric(name: string, ips: Record<string, string>): PlacementFabric {
+  return {
+    id: `f-${name}`,
+    name,
+    members: Object.entries(ips).map(([nodeId, ip]) => ({ nodeId, ip })),
+  };
+}
+
+/** A Relay-only node that froze the `net` fabric (or `fabricId`) with these member IPs. */
+function relayNode(
+  id: string,
+  memberIps: readonly string[],
+  fabricId = "f-net",
+  name = "net",
+): PlacementNode {
+  return node(id, { trust: "RELAY", frozenFabrics: [{ fabricId, name, memberIps }] });
+}
+
+/** A node row as `loadPlacementContext` reads it (b, online, no hardware info). */
+function nodeRow(overrides: Partial<PlacementNodeRow> = {}): PlacementNodeRow {
+  return {
+    id: "b",
+    slug: "b",
+    connection: "ONLINE",
+    trust: "FULL",
+    trustChangedAt: null,
+    trustLowerRequestedAt: null,
+    labels: [],
+    holdAt: null,
+    portStart: 30000,
+    portEnd: 30009,
+    heldDefinitions: [],
+    frozenFabrics: null,
+    fabricsHash: null,
+    heldFabricsHash: null,
+    declaredResources: { memoryGb: 128 },
+    nodeInfo: null,
+    nodeMetrics: null,
+    nodeMetricsAt: null,
+    ...overrides,
+  };
+}
+
+const NET = netFabric("net", { a: "10.0.0.1", b: "10.0.0.2", c: "10.0.0.3" });
+const PAIR = { groupSize: 2, resources: [{ kind: "unified", memoryGb: 10 }] as RuntimeResource[] };
+
+describe("Relay-only nodes and their frozen fabrics", () => {
+  it("accepts a Relay-only worker whose frozen fabric holds the head", () => {
+    const nodes = [node("a"), relayNode("b", ["10.0.0.1", "10.0.0.2"])];
+    const planner = new PlacementPlanner(context({ nodes, fabrics: [NET] }));
+    const result = ok(planner.place(request(PAIR)));
+    expect(nodesOf(result)).toEqual(["a", "b"]);
+    expect(result.start.fabric?.headAddr).toBe("10.0.0.1");
+  });
+
+  it("makes another member the head when a Relay-only node froze the fabric without it", () => {
+    // b froze the fabric before a joined: with a as the head b would refuse (definition_frozen).
+    const nodes = [node("a"), relayNode("b", ["10.0.0.2", "10.0.0.3"]), node("c")];
+    const planner = new PlacementPlanner(context({ nodes, fabrics: [NET] }));
+    const result = ok(planner.place(request(PAIR)));
+    expect(nodesOf(result)).toEqual(["b", "a"]);
+    expect(result.start.fabric?.headAddr).toBe("10.0.0.2");
+  });
+
+  it("leaves out a Relay-only node that would refuse every head, and uses another set", () => {
+    const nodes = [node("a"), relayNode("b", ["10.9.0.2"], "f-old"), node("c")];
+    const planner = new PlacementPlanner(context({ nodes, fabrics: [NET] }));
+    expect(nodesOf(planner.place(request(PAIR)))).toEqual(["a", "c"]);
+  });
+
+  it("refuses head_not_in_frozen_fabric when no node set works", () => {
+    const nodes = [node("a"), relayNode("b", ["10.0.0.1", "10.0.0.2"], "f-old")];
+    const fabrics = [netFabric("net", { a: "10.0.0.1", b: "10.0.0.2" })];
+    const result = new PlacementPlanner(context({ nodes, fabrics })).place(
+      request({ ...PAIR, preempt: true }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.refusal.reason).toBe("head_not_in_frozen_fabric");
+  });
+
+  it("explicit nodes: refuses naming the node that would refuse, and accepts its own head", () => {
+    const nodes = [node("a"), relayNode("b", ["10.0.0.2", "10.0.0.3"]), node("c")];
+    const planner = new PlacementPlanner(context({ nodes, fabrics: [NET] }));
+    const refused = planner.place(request({ ...PAIR, nodeIds: ["a", "b"] }));
+    expect(refused.ok).toBe(false);
+    if (!refused.ok)
+      expect(refused.refusal).toMatchObject({
+        reason: "head_not_in_frozen_fabric",
+        subjectId: "b",
+      });
+    const swapped = ok(planner.place(request({ ...PAIR, nodeIds: ["b", "a"] })));
+    expect(swapped.start.fabric?.headAddr).toBe("10.0.0.2");
+  });
+
+  it("loads the fabrics a node froze while it reports Relay only", () => {
+    const frozen = [
+      { fabricId: "f-net", name: "net", selfIp: "10.0.0.2", memberIps: ["10.0.0.1", "10.0.0.2"] },
+    ];
+    const now = new Date();
+    expect(
+      placementNodeOf(nodeRow({ trust: "RELAY", frozenFabrics: frozen }), now).frozenFabrics,
+    ).toEqual([{ fabricId: "f-net", name: "net", memberIps: ["10.0.0.1", "10.0.0.2"] }]);
+    // Unreadable: nothing frozen, so the node refuses any head (as it would).
+    expect(
+      placementNodeOf(nodeRow({ trust: "RELAY", frozenFabrics: [{ bad: true }] }), now)
+        .frozenFabrics,
+    ).toEqual([]);
+    expect(placementNodeOf(nodeRow({ trust: "RELAY" }), now).frozenFabrics).toEqual([]);
+    expect(placementNodeOf(nodeRow(), now).frozenFabrics).toBeNull();
+  });
+
+  it("a pending lower in sync is checked against its current memberships", () => {
+    const now = new Date();
+    const pending = (held: string | null) =>
+      placementNodeOf(
+        nodeRow({ trustLowerRequestedAt: new Date(0), fabricsHash: "h1", heldFabricsHash: held }),
+        now,
+      );
+    expect(pending("h1").trust).toBe("RELAY");
+    expect(pending("h1").frozenFabrics).toBe("current");
+    // Not in sync: what it will freeze is unknown, so it is not checked.
+    expect(pending("h0").frozenFabrics).toBeNull();
+    // Current memberships hold the head, so the planner places it (the CLI agrees).
+    for (const b of [pending("h1"), pending("h0")]) {
+      const planner = new PlacementPlanner(context({ nodes: [node("a"), b], fabrics: [NET] }));
+      expect(nodesOf(planner.place(request(PAIR)))).toEqual(["a", "b"]);
+    }
+  });
+
+  it("a launch that pins a fabric needs the frozen copy to carry that name", () => {
+    // b froze f-net under its old name: the CLI refuses a pinned launch.fabric that differs.
+    const nodes = [node("a"), relayNode("b", ["10.0.0.1", "10.0.0.2"], "f-net", "old-name")];
+    const fabrics = [netFabric("net", { a: "10.0.0.1", b: "10.0.0.2" })];
+    const planner = new PlacementPlanner(context({ nodes, fabrics }));
+    const pinned = planner.place(request({ ...PAIR, fabric: "net" }));
+    expect(pinned.ok).toBe(false);
+    if (!pinned.ok) expect(pinned.refusal.reason).toBe("head_not_in_frozen_fabric");
+    expect(nodesOf(planner.place(request(PAIR)))).toEqual(["a", "b"]);
+  });
+
+  it("names the first refusing node of a set-level refusal", () => {
+    const nodes = [node("a"), relayNode("b", ["10.0.0.2"], "f-old")];
+    const fabrics = [netFabric("net", { a: "10.0.0.1", b: "10.0.0.2" })];
+    const result = new PlacementPlanner(context({ nodes, fabrics })).place(request(PAIR));
+    expect(result.ok).toBe(false);
+    if (!result.ok)
+      expect(result.refusal).toMatchObject({ reason: "head_not_in_frozen_fabric", subjectId: "b" });
+  });
+
+  it("stops after the set budget when every Relay-only node refuses every head, deterministically", () => {
+    const ids = ["n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8"];
+    const nodes = ids.map((id) => relayNode(id, ["10.9.0.1"], "f-old"));
+    const fabrics = [
+      netFabric("net", Object.fromEntries(ids.map((id, index) => [id, `10.0.0.${index + 1}`]))),
+    ];
+    const plan = (ctx: PlacementContext) =>
+      new PlacementPlanner(ctx).place(request({ groupSize: 4, resources: PAIR.resources }));
+    const forward = plan(context({ nodes, fabrics }));
+    expect(forward.ok).toBe(false);
+    if (!forward.ok)
+      expect(forward.refusal).toMatchObject({
+        reason: "head_not_in_frozen_fabric",
+        subjectId: "n1",
+      });
+    expect(plan(context({ nodes: [...nodes].reverse(), fabrics }))).toEqual(forward);
+  });
+
+  it("names no_free_ports over head_not_in_frozen_fabric (the closer miss)", () => {
+    // {a, b} fails only on the dist port (b's second port is taken); any set with c fails the
+    // frozen rule.
+    const nodes = [
+      node("a", { portRange: [30000, 30001] }),
+      node("b", { portRange: [30000, 30001] }),
+      relayNode("c", ["10.9.0.3"], "f-old"),
+    ];
+    const taken = running("x", ["b"], 0, {
+      ranks: [
+        { nodeId: "b", port: 30001, distPort: null, claim: "HELD", resources: { kind: "none" } },
+      ],
+    });
+    const result = new PlacementPlanner(
+      context({ nodes, fabrics: [NET], instances: [taken] }),
+    ).place(request(PAIR));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.refusal.reason).toBe("no_free_ports");
+  });
+});
+
+describe("instances already stopping", () => {
+  const strix = () => [node("h1", { labels: ["strix"] })];
+
+  it("plans over a stopping instance's HELD claims and waits for it instead of refusing", () => {
+    const old = running("old", ["h1"], 100, { running: false });
+    const planner = new PlacementPlanner(context({ nodes: strix(), instances: [old] }));
+    const result = ok(planner.place(request({ labels: ["strix"] })));
+    expect(nodesOf(result)).toEqual(["h1"]);
+    // Its port stays taken until the node releases the claim.
+    expect(result.start.placements[0]?.port).toBe(30001);
+    expect(result.start.blockedBy).toEqual(["old"]);
+    expect(result.stops).toEqual([]);
+    expect(result.warnings).toEqual([
+      expect.objectContaining({ code: "waits_for_stop", nodeId: "h1" }),
+    ]);
+    // The same instance still running leaves no room.
+    const busy = new PlacementPlanner(
+      context({ nodes: strix(), instances: [running("old", ["h1"], 100)] }),
+    ).place(request({ labels: ["strix"] }));
+    expect(busy.ok).toBe(false);
+  });
+
+  it("keeps counting a HELD_UNKNOWN claim: no stop releases it", () => {
+    const forgotten = running("old", ["h1"], 100, {
+      running: false,
+      ranks: [
+        {
+          nodeId: "h1",
+          port: 30000,
+          distPort: null,
+          claim: "HELD_UNKNOWN",
+          resources: { kind: "unified", memoryGb: 100 },
+        },
+      ],
+    });
+    const result = new PlacementPlanner(context({ nodes: strix(), instances: [forgotten] })).place(
+      request({ labels: ["strix"] }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.refusal.reason).toBe("not_enough_memory");
+  });
+
+  it("waits for a stop already requested rather than stopping another instance", () => {
+    const nodes = [node("h1", { labels: ["strix"] }), node("h2", { labels: ["strix"] })];
+    const instances = [
+      running("old", ["h1"], 100, { running: false }),
+      running("own", ["h2"], 100),
+    ];
+    const result = ok(
+      new PlacementPlanner(context({ nodes, instances })).place(
+        request({ labels: ["strix"], preempt: true }),
+      ),
+    );
+    expect(nodesOf(result)).toEqual(["h1"]);
+    expect(result.stops).toEqual([]);
+    expect(result.start.blockedBy).toEqual(["old"]);
+  });
+
+  it("an agent waits only on a Full node and never stops anything", () => {
+    const nodes = [
+      node("h1", { labels: ["strix"], trust: "RELAY" }),
+      node("h2", { labels: ["strix"] }),
+    ];
+    const instances = [
+      running("on-relay", ["h1"], 100, { running: false }),
+      running("on-full", ["h2"], 100, { running: false }),
+    ];
+    const result = ok(
+      new PlacementPlanner(context({ agent: true, nodes, instances })).place(
+        request({ labels: ["strix"], preempt: true }),
+      ),
+    );
+    expect(nodesOf(result)).toEqual(["h2"]);
+    expect(result.start.blockedBy).toEqual(["on-full"]);
+    expect(result.stops).toEqual([]);
+  });
+
+  it("shares the room a stopping instance frees across place() calls of one planner", () => {
+    const old = running("old", ["h1"], 100, { running: false });
+    const planner = new PlacementPlanner(context({ nodes: strix(), instances: [old] }));
+    const sixty = request({ labels: ["strix"], resources: [{ kind: "unified", memoryGb: 60 }] });
+    const first = ok(planner.place(sixty));
+    const second = ok(planner.place(sixty));
+    expect([first.start.blockedBy, second.start.blockedBy]).toEqual([["old"], ["old"]]);
+    expect([first, second].map((result) => result.start.placements[0]?.port)).toEqual([
+      30001, 30002,
+    ]);
+    const third = planner.place(sixty);
+    expect(third.ok).toBe(false);
+    if (!third.ok) expect(third.refusal.reason).toBe("not_enough_memory");
+  });
+
+  it("once restarted, a stopping instance is no longer waited for", () => {
+    const self = running("self", ["h1"], 10, { running: false });
+    const planner = new PlacementPlanner(context({ nodes: strix(), instances: [self] }));
+    ok(
+      planner.place(
+        request({
+          resources: [{ kind: "unified", memoryGb: 10 }],
+          nodeIds: ["h1"],
+          restart: { instanceId: "self", ports: [30000], distPort: null },
+        }),
+      ),
+    );
+    const next = ok(planner.place(request({ labels: ["strix"] })));
+    expect(next.start.blockedBy).toEqual([]);
+    expect(next.warnings).toEqual([]);
+  });
+
+  it("a restart of a stopping instance never waits for itself", () => {
+    const self = running("self", ["h1"], 120, { running: false });
+    const planner = new PlacementPlanner(context({ nodes: strix(), instances: [self] }));
+    const result = ok(
+      planner.place(
+        request({
+          resources: [{ kind: "unified", memoryGb: 120 }],
+          nodeIds: ["h1"],
+          restart: { instanceId: "self", ports: [30000], distPort: null },
+        }),
+      ),
+    );
+    expect(result.start.blockedBy).toEqual([]);
+    expect(result.warnings).toEqual([]);
+  });
+});
+
+describe("dist port across node sets", () => {
+  const nodes = () => [
+    node("a", { portRange: [30000, 30001] }),
+    node("b", { portRange: [30000, 30001] }),
+    node("c", { portRange: [30000, 30009] }),
+  ];
+  // b's second port is taken, so no set with b has a dist port free on every rank.
+  const taken = running("x", ["b"], 0, {
+    ranks: [
+      { nodeId: "b", port: 30001, distPort: null, claim: "HELD", resources: { kind: "none" } },
+    ],
+  });
+
+  it("tries another node set when the first has no dist port free on every rank", () => {
+    const planner = new PlacementPlanner(
+      context({ nodes: nodes(), fabrics: [NET], instances: [taken] }),
+    );
+    const result = ok(planner.place(request(PAIR)));
+    expect(nodesOf(result)).toEqual(["a", "c"]);
+    expect(result.start.distPort).toBe(30001);
+  });
+
+  it("refuses no_free_ports when no node set has one", () => {
+    const fabrics = [netFabric("net", { a: "10.0.0.1", b: "10.0.0.2" })];
+    const result = new PlacementPlanner(
+      context({ nodes: nodes().slice(0, 2), fabrics, instances: [taken] }),
+    ).place(request(PAIR));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.refusal.reason).toBe("no_free_ports");
+      expect(result.refusal.message).toContain("dist port");
+    }
   });
 });
