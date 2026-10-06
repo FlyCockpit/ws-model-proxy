@@ -524,6 +524,7 @@ export const profileProcedures = {
     assertMayWrite(context.auth);
     const userId = context.session.user.id;
     await prisma.$transaction(async (tx) => {
+      await lockProfileRows(tx, userId, input.profileId, []);
       const profile = await tx.profile.findFirst({
         where: { id: input.profileId, userId },
         select: { id: true, Nodes: { where: { hold: true }, select: { nodeId: true } } },
@@ -583,6 +584,12 @@ export const profileProcedures = {
       // Holds are planned again on the rows as they are now (planProfileHolds). A hold set
       // since the plan refuses an agent (node_held); any other change refuses the apply as
       // stale (preview_stale), for agents too. Every hold write must land as planned.
+      await lockProfileRows(
+        tx,
+        userId,
+        profile.id,
+        planInput.owned.map((line) => line.nodeId),
+      );
       const lines = await tx.profileNode.findMany({
         where: { profileId: profile.id },
         select: { nodeId: true, hold: true, holdNote: true },
@@ -679,4 +686,20 @@ function toJsonValue(value: unknown): Prisma.InputJsonValue {
 
 function sameIds(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && [...a].sort().join("\u0000") === [...b].sort().join("\u0000");
+}
+
+/**
+ * Lock the profile row and its owned node rows (sorted, one fixed order) for the rest of the
+ * transaction, so a save, a hold or a release cannot change what this transaction checked
+ * before it commits. Rows of another user are not touched (the filter names the owner).
+ */
+async function lockProfileRows(
+  tx: Prisma.TransactionClient,
+  userId: string,
+  profileId: string,
+  nodeIds: readonly string[],
+): Promise<void> {
+  await tx.$queryRaw`SELECT id FROM profile WHERE id = ${profileId} AND "userId" = ${userId} FOR UPDATE`;
+  for (const nodeId of [...new Set(nodeIds)].sort())
+    await tx.$queryRaw`SELECT id FROM node WHERE id = ${nodeId} AND "userId" = ${userId} FOR UPDATE`;
 }

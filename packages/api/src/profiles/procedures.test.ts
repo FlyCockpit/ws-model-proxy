@@ -118,6 +118,15 @@ describe("profiles.apply", () => {
       fingerprint: preview.preview.fingerprint,
     });
     expect(profileApplied).toHaveBeenCalledWith("op-1");
+    // The profile row and its owned node rows are locked before the holds are re-read.
+    const locked = db.$queryRaw.mock.calls.map((call) =>
+      (call[0] as TemplateStringsArray).join("?"),
+    );
+    expect(locked[0]).toContain('FROM profile WHERE id = ? AND "userId" = ? FOR UPDATE');
+    expect(locked[1]).toContain('FROM node WHERE id = ? AND "userId" = ? FOR UPDATE');
+    expect(db.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      db.profileNode.findMany.mock.invocationCallOrder[0] ?? 0,
+    );
   });
 
   it("lets an agent apply without a fingerprint", async () => {

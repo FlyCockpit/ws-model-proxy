@@ -61,6 +61,8 @@ async function secretTarget(context: SignedInContext, nodeId: string) {
   return { userId, node, writeSecrets: send };
 }
 
+const SECRET_REFUSALS = ["invalid", "store_failed", "limit"] as const;
+
 function failed(result: NodeSecretWriteResult | undefined, nodeId: string): never {
   if (result?.reason === "trust_relay")
     throw refuseAbout(
@@ -68,9 +70,9 @@ function failed(result: NodeSecretWriteResult | undefined, nodeId: string): neve
       nodeId,
       "The node is Relay only: set the secret with `wsmp secret set NAME` on it.",
     );
-  throw new ORPCError("CONFLICT", {
-    message: `The node did not store the secret (${result?.reason ?? "no answer"}).`,
-  });
+  // Only a known reason code reaches the message, never text the node sent.
+  const reason = SECRET_REFUSALS.find((known) => known === result?.reason) ?? "no answer";
+  throw new ORPCError("CONFLICT", { message: `The node did not store the secret (${reason}).` });
 }
 
 async function auditSecret(
