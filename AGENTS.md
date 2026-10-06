@@ -9,7 +9,8 @@ Rules and context for AI coding agents working in WS Model Proxy.
 - oRPC routers and procedures
 - Prisma with Postgres
 - Better Auth
-- Tailwind CSS v4 and shadcn/ui in `packages/ui/`
+- Tailwind CSS v4 and shadcn/ui in `packages/ui/` (the shadcn CLI is not a
+  dependency; run it as `pnpm dlx shadcn@4.21.0`, the version `scripts/theme-apply.ts` pins)
 - Zustand for client-side state
 - Vite, vite-plugin-pwa, Turborepo, pnpm
 - react-i18next with locale-prefixed routes under `/$lang/...`

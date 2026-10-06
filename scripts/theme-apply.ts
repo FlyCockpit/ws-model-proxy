@@ -24,20 +24,11 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const ROOT = resolve(import.meta.dirname!, "..");
-const uiPackageJson = JSON.parse(
-  readFileSync(resolve(ROOT, "packages/ui/package.json"), "utf-8"),
-) as {
-  dependencies?: Record<string, string>;
-  devDependencies?: Record<string, string>;
-};
-const shadcnVersion =
-  uiPackageJson.dependencies?.shadcn?.replace(/^[~^]/, "") ??
-  uiPackageJson.devDependencies?.shadcn?.replace(/^[~^]/, "");
-
-if (!shadcnVersion) {
-  console.error("Refusing: packages/ui/package.json must pin the shadcn CLI version.");
-  process.exit(1);
-}
+// The shadcn CLI is not a workspace dependency (it pulls express, fast-glob and
+// ts-morph into the graph), so it runs through `pnpm dlx` at this exact
+// version. packages/ui/src/styles/shadcn-tailwind.css is vendored from the same
+// release; bump both together.
+const SHADCN_VERSION = "4.21.0";
 
 const preset = process.argv[2];
 
@@ -73,7 +64,7 @@ try {
     "pnpm",
     [
       "dlx",
-      `shadcn@${shadcnVersion}`,
+      `shadcn@${SHADCN_VERSION}`,
       "apply",
       "--preset",
       preset,
