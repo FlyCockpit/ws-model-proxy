@@ -21,7 +21,7 @@ import { activityContract } from "./activity";
 import { modelsContract } from "./models";
 import { nodesContract } from "./nodes";
 import { poolsContract } from "./pools";
-import type { RouterContract } from "./procedure";
+import { flattenContract, type RouterContract } from "./procedure";
 import { profilesContract } from "./profiles";
 import { providersContract } from "./providers";
 import { runtimesContract } from "./runtimes";
@@ -43,6 +43,17 @@ export const apiContract = {
   activity: activityContract,
 } as const satisfies RouterContract;
 
+/**
+ * Procedures whose `/rpc` call must carry a validated `x-csrf-token` header on every deployment
+ * shape (the source of `CallerAuth.csrfVerified`): every human and human_admin procedure.
+ */
+export const CSRF_REQUIRED_PROCEDURES: ReadonlySet<string> = new Set(
+  flattenContract(apiContract)
+    .filter(([, procedure]) => procedure.access === "human" || procedure.access === "human_admin")
+    .map(([path]) => path),
+);
+
+export * from "./auth-context";
 export { MCP_EXCLUDED_SESSION_PROCEDURES, MCP_TOOLS, type McpToolContract } from "./mcp-tools";
 export * from "./procedure";
 export * from "./tool-names";

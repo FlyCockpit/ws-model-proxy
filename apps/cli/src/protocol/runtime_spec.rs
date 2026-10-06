@@ -70,7 +70,11 @@ pub const RUNTIME_PLACEHOLDERS: [&str; 10] = [
     "head_addr",
 ];
 pub const RUNTIME_COMMAND_MAX_BYTES: usize = 4096;
-pub const RUNTIME_SPEC_MAX_BYTES: usize = 64 * 1024;
+/// Canonical bytes of one spec; below the 64 KiB control cap so one define
+/// envelope always fits one chunk.
+pub const RUNTIME_SPEC_MAX_BYTES: usize = 48 * 1024;
+/// Canonical bytes of all node metric commands together.
+pub const NODE_METRIC_COMMANDS_MAX_BYTES: usize = 32 * 1024;
 pub const RUNTIME_DEFINITIONS_MAX: usize = 128;
 pub const NODE_METRIC_COMMANDS_MAX: usize = 16;
 

@@ -84,6 +84,8 @@ export const RUNTIME_INVENTORY_CHUNK_MAX = 512;
  * envelope. Every frame of 3.0 must encode within `RELAY_JSON_CONTROL_MAX_BYTES`.
  */
 export const CHUNK_BUDGET_BYTES = 60 * 1024;
+/** Versions one define chunk names (put + keep + remove), so its answer fits one frame. */
+export const DEFINE_CHUNK_MAX_VERSIONS = 64;
 /** Server accepts at most one `node.info` per this window. */
 export const NODE_INFO_MIN_INTERVAL_MS = 5_000;
 
@@ -91,7 +93,8 @@ export const NODE_INFO_MIN_INTERVAL_MS = 5_000;
 
 export const relayIdSchema = z.string().trim().min(1).max(128);
 /** Row ids (cuid2) and step ids. */
-export const rowIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
+/** Row ids (cuid2) and step ids; 64 chars bound the chunked frames. */
+export const rowIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
 export const sha256HexSchema = z.string().regex(/^[0-9a-f]{64}$/);
 /** 16 raw bytes as canonical unpadded base64url (22 chars, zero trailing bits). */
 export const base64Url16Schema = z.string().regex(/^[A-Za-z0-9_-]{21}[AQgw]$/);
@@ -458,7 +461,12 @@ export const nodeMetricsFrameSchema = z
       .optional(),
     abandonedRecovery: z.number().int().min(0).max(10_000).optional(),
   })
-  .strict();
+  .strict()
+  // The node drops custom values (last command first) until the frame fits the budget.
+  .refine(
+    (frame) => new TextEncoder().encode(JSON.stringify(frame)).byteLength <= CHUNK_BUDGET_BYTES,
+    { message: "node.metrics stays within the chunk budget." },
+  );
 
 // ── runtime.load ──
 
@@ -545,7 +553,13 @@ export const runtimeDefineFrameSchema = z
   })
   .refine((frame) => frame.complete || frame.keep === undefined, {
     message: "keep belongs to complete operations.",
-  });
+  })
+  .refine(
+    (frame) =>
+      (frame.put?.length ?? 0) + (frame.keep?.length ?? 0) + (frame.remove?.length ?? 0) <=
+      DEFINE_CHUNK_MAX_VERSIONS,
+    { message: "One chunk names at most 64 versions (so its answer fits one frame)." },
+  );
 
 export const DEFINE_REJECT_REASONS = [
   "trust_relay",
@@ -557,13 +571,18 @@ export const DEFINE_REJECT_REASONS = [
   "limit",
 ] as const;
 /** Answers one define chunk; the final answer also carries the node's whole held state. */
+const encodedBytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
 export const runtimeDefineResultFrameSchema = z
   .object({
     type: z.literal("runtime.define.result"),
     opId: relayIdSchema,
     chunkIndex: z.number().int().min(0).max(RUNTIME_DEFINITIONS_MAX),
     final: z.boolean(),
-    /** One entry per `put`, `remove` and (complete) implicitly dropped version, by version. */
+    /**
+     * One entry per `put` and `remove` of the answered chunk (at most 64 together). Versions a
+     * complete operation drops implicitly are not listed: the final `held` set shows them gone.
+     */
     results: z
       .array(
         z
@@ -583,7 +602,7 @@ export const runtimeDefineResultFrameSchema = z
             message: "reason exactly for rejected entries.",
           }),
       )
-      .max(RUNTIME_DEFINITIONS_MAX * 2),
+      .max(DEFINE_CHUNK_MAX_VERSIONS),
     node: z
       .object({
         status: z.enum(["applied", "unchanged", "rejected"]),
@@ -608,7 +627,10 @@ export const runtimeDefineResultFrameSchema = z
       message:
         "held, heldMetricCommandsHash, heldPortRange and frozen exactly on the final answer.",
     },
-  );
+  )
+  .refine((frame) => encodedBytes(frame) <= CHUNK_BUDGET_BYTES, {
+    message: "A define answer stays within the chunk budget.",
+  });
 
 // ── runtime.job ──
 

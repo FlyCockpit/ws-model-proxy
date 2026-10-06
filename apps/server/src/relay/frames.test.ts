@@ -6,7 +6,12 @@ import {
   nodeMetricCommandsHash,
   runtimeLaunchHash,
 } from "@ws-model-proxy/api/lib/runtime-launch-hash";
-import { runtimeSpecSchema } from "@ws-model-proxy/api/lib/runtime-spec";
+import {
+  canonicalBytes,
+  nodeMetricCommandsSchema,
+  RUNTIME_SPEC_MAX_BYTES,
+  runtimeSpecSchema,
+} from "@ws-model-proxy/api/lib/runtime-spec";
 import { describe, expect, it } from "vitest";
 import type { z } from "zod";
 import {
@@ -105,6 +110,67 @@ describe("relay 3.0 frames", () => {
     if (!spec?.models[0]) throw new Error("fixture changed");
     spec.models[0].embeddingContract.model = " BAAI/bge-m3 ";
     expect(runtimeSpecSchema.safeParse(spec).success).toBe(false);
+  });
+
+  it("enforces the byte caps one frame relies on", () => {
+    const define = serverToNode.find(([name]) => name === "runtime.define-chunk.json")?.[1];
+    const put = (define?.put ?? []) as Array<{ spec: unknown }>;
+    const spec = structuredClone(put[0]?.spec) as {
+      launch: { commands: Array<{ start: string }>; groupSize: number };
+      models: Array<{ id: string }>;
+    };
+    // Fill the spec up to just over 48 KiB with valid model ids.
+    spec.models = Array.from({ length: 64 }, (_, index) => ({
+      id: `m${index}-${"x".repeat(200)}`,
+    }));
+    spec.launch.commands = Array.from({ length: 16 }, () => ({
+      ...spec.launch.commands[0],
+      start: `run ${"y".repeat(4_000)}`,
+    })) as typeof spec.launch.commands;
+    spec.launch.groupSize = 16;
+    const bytes = canonicalBytes(spec) ?? 0;
+    expect(bytes).toBeGreaterThan(RUNTIME_SPEC_MAX_BYTES);
+    expect(runtimeSpecSchema.safeParse(spec).success).toBe(false);
+
+    const command = {
+      name: "c",
+      command: `echo ${"z".repeat(4_000)}`,
+      intervalSecs: 30,
+      timeoutSecs: 5,
+      format: "lines",
+    };
+    const commands = Array.from({ length: 9 }, (_, index) => ({ ...command, name: `c${index}` }));
+    expect(nodeMetricCommandsSchema.safeParse(commands).success).toBe(false);
+    expect(nodeMetricCommandsSchema.safeParse(commands.slice(0, 7)).success).toBe(true);
+  });
+
+  it("fits the largest final define answer in one frame", () => {
+    const id = "x".repeat(64);
+    const answer = {
+      type: "runtime.define.result",
+      opId: "o".repeat(128),
+      chunkIndex: 128,
+      final: true,
+      results: Array.from({ length: 64 }, () => ({
+        runtimeId: id,
+        versionId: id,
+        status: "rejected",
+        reason: "base_url_not_allowed",
+        detail: "d".repeat(128),
+      })),
+      node: { status: "rejected", reason: "base_url_not_allowed" },
+      held: Array.from({ length: 128 }, () => ({
+        runtimeId: id,
+        versionId: id,
+        launchHash: "a".repeat(64),
+      })),
+      heldMetricCommandsHash: "a".repeat(64),
+      heldPortRange: [30000, 30999],
+      frozen: false,
+    };
+    expect(new TextEncoder().encode(JSON.stringify(answer)).byteLength).toBeLessThan(
+      RELAY_JSON_CONTROL_MAX_BYTES,
+    );
   });
 
   it("keeps every frame fixture under the 64 KiB control cap", () => {

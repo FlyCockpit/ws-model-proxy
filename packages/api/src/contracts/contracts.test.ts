@@ -3,10 +3,11 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { type CallerAuth, callerMayReach } from "./auth-context";
+import { agentRulesApply, type CallerAuth, callerMayReach } from "./auth-context";
 import { PRISMA_ENUM_MIRRORS } from "./common";
 import {
   apiContract,
+  CSRF_REQUIRED_PROCEDURES,
   flattenContract,
   MCP_EXCLUDED_SESSION_PROCEDURES,
   MCP_READ_TOOLS,
@@ -253,6 +254,20 @@ describe("caller auth (positive human check)", () => {
           `${path} ${name}`,
         ).toBe(false);
     }
+  });
+
+  it("requires the CSRF header on every human procedure, queries included", () => {
+    expect(CSRF_REQUIRED_PROCEDURES.has("nodes.lowerTrustPreview")).toBe(true);
+    for (const [path, procedure] of procedures)
+      expect(CSRF_REQUIRED_PROCEDURES.has(path), path).toBe(
+        procedure.access === "human" || procedure.access === "human_admin",
+      );
+  });
+
+  it("treats a cookie that failed the CSRF check as not a person for agent rules", () => {
+    expect(agentRulesApply(callers.cookie as CallerAuth)).toBe(false);
+    for (const name of ["cookieNoCsrf", "fullAgent", "oauth", "apiKey"])
+      expect(agentRulesApply(callers[name] as CallerAuth), name).toBe(true);
   });
 
   it("refuses tokens on session and admin procedures; API keys reach no procedure", () => {

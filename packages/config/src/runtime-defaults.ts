@@ -19,10 +19,11 @@ export const RUNTIME_LIMIT_COLUMNS = {
     unit: "tokens",
     auto: { source: "engine" },
   },
+  /** An `Int` column: at most 2^31 − 1 tokens. */
   kvBudgetTokens: {
     kind: "int",
     min: 1,
-    max: 1_000_000_000_000,
+    max: 2_147_483_647,
     unit: "tokens",
     auto: { source: "engine" },
   },

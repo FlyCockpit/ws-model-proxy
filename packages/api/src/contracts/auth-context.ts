@@ -3,8 +3,13 @@
  * it to `packages/api/src/context.ts` as `Context.auth`; every transport fills it from the
  * credential it actually verified, never from a header the caller chose.
  *
- * - `cookie_session`: a Better Auth session cookie on `/rpc`. `csrfVerified` is true when the
- *   request passed the CSRF/origin check (`apps/server` `rpc-policy`).
+ * - `cookie_session`: a Better Auth session cookie on `/rpc`. `csrfVerified` is true ONLY when
+ *   the request carried an `x-csrf-token` header that the server validated against the session
+ *   (double-submit check in `apps/server/src/csrf-policy.ts`). CORS or an Origin check alone
+ *   never sets it. The RPC layer requires that header for every procedure in
+ *   `CSRF_REQUIRED_PROCEDURES` (every `human`/`human_admin` procedure, queries included) on
+ *   every deployment shape, same-origin or not; the set is derived from the contract's access
+ *   tags, never kept by hand.
  * - `agent_token`, `oauth_access_token`: an MCP call (`/mcp`), with the token's level.
  * - `api_key`: `/v1` only; never reaches a procedure.
  *
@@ -14,7 +19,9 @@
  *   these procedures are unreachable for tokens even if routed by mistake.
  * - `agent`: a cookie session (the web app) or an MCP token whose tool names the procedure.
  *   Agent-only refusals (Relay-only nodes, `restartRunning` skips, `profile_apply` refused whole)
- *   apply when `kind !== "cookie_session"`.
+ *   apply unless `isHumanCaller(auth)`: a cookie whose CSRF check failed is NOT a person
+ *   (`agentRulesApply`). The preview fingerprint (D13) is required exactly when
+ *   `isHumanCaller(auth)`.
  * - `public`: any.
  */
 import type { ProcedureAccess } from "./procedure";
@@ -57,4 +64,9 @@ export function callerMayReach(access: ProcedureAccess, auth: CallerAuth | Anony
     case "agent":
       return auth.kind === "cookie_session" || isAgentCaller(auth);
   }
+}
+
+/** Agent-only refusals and agent defaults apply to everyone who is not a verified person. */
+export function agentRulesApply(auth: CallerAuth | AnonymousAuth): boolean {
+  return !isHumanCaller(auth);
 }

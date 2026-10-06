@@ -13,6 +13,7 @@
  * Pure module (no Node built-ins): the web Definition form validates with it too.
  */
 import { z } from "zod";
+import { canonicalJson } from "./canonical-json";
 import { transcriptionProfileSchema } from "./transcription-profile";
 
 // ── Vocabularies (wire values; Prisma enums are the upper-case forms) ──
@@ -100,6 +101,8 @@ export const RUNTIME_TIMEOUTS_SEC = {
   status: { max: 3_600, default: 60 },
 } as const;
 export const NODE_METRIC_COMMANDS_MAX = 16;
+/** Canonical UTF-8 bytes of all node metric commands (leaves room in one define frame). */
+export const NODE_METRIC_COMMANDS_MAX_BYTES = 32 * 1024;
 export const NODE_METRIC_COMMAND_NAME_PATTERN = /^[a-z][a-z0-9_]{0,31}$/;
 /** Custom series names a reader or metric command maps to. */
 export const METRIC_SERIES_NAME_PATTERN = /^[A-Za-z0-9_.:-]{1,64}$/;
@@ -143,7 +146,7 @@ export const runtimeTextSchema = (maxBytes: number) =>
 //
 // `launchHash` is computed by the server over the parsed spec and by the node over the spec as
 // received, so nothing in this file may transform a value (no .trim(), .default(), coercion):
-// a schema only accepts or refuses. `runtime-spec.test.ts` checks parse(x) deep-equals x.
+// a schema only accepts or refuses. `apps/server/src/relay/frames.test.ts` checks parse(x) is canonically equal to x.
 
 /** Text with no surrounding whitespace (refused, never trimmed). */
 export const exactTextSchema = (maxBytes: number) =>
@@ -498,6 +501,12 @@ export const runtimeSpecSchema = z
   })
   .strict()
   .superRefine((spec, ctx) => {
+    const bytes = canonicalBytes(spec);
+    if (bytes === null || bytes > RUNTIME_SPEC_MAX_BYTES)
+      ctx.addIssue({
+        code: "custom",
+        message: `A runtime definition is at most ${RUNTIME_SPEC_MAX_BYTES} bytes as canonical JSON.`,
+      });
     if ((spec.address === undefined) === (spec.launch === undefined))
       ctx.addIssue({
         code: "custom",
@@ -562,13 +571,26 @@ export const nodeMetricCommandSchema = z
   .strict();
 export type NodeMetricCommand = z.infer<typeof nodeMetricCommandSchema>;
 
+/** Canonical UTF-8 size, or null when the value cannot be hashed (other issues report why). */
+export function canonicalBytes(value: unknown): number | null {
+  try {
+    return utf8Bytes(canonicalJson(value));
+  } catch {
+    return null;
+  }
+}
+
 export const nodeMetricCommandsSchema = z
   .array(nodeMetricCommandSchema)
   .max(NODE_METRIC_COMMANDS_MAX)
   .refine(
     (commands) => new Set(commands.map((command) => command.name)).size === commands.length,
     "Metric command names must be unique.",
-  );
+  )
+  .refine((commands) => {
+    const bytes = canonicalBytes(commands);
+    return bytes !== null && bytes <= NODE_METRIC_COMMANDS_MAX_BYTES;
+  }, `Node metric commands are at most ${NODE_METRIC_COMMANDS_MAX_BYTES} bytes together.`);
 
 /** `[start, end]`, 1024 ≤ start ≤ end ≤ 65535. */
 export const portRangeSchema = z

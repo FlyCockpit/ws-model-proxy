@@ -14,15 +14,21 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::canonical::canonical_json;
 use super::runtime_spec::{
-    DeclaredHardware, EmbeddingContract, Engine, ModelCapability, NodeFeatures, NodeMetricCommand,
-    ReaderSignal, RuntimeApi, RuntimeKind, RuntimeSpec, TranscriptionProfile,
+    DeclaredHardware, EmbeddingContract, Engine, ModelCapability, NODE_METRIC_COMMANDS_MAX_BYTES,
+    NodeFeatures, NodeMetricCommand, RUNTIME_SPEC_MAX_BYTES, ReaderSignal, RuntimeApi, RuntimeKind,
+    RuntimeSpec, TranscriptionProfile,
 };
 use crate::stt_wire::SttEvent;
 
 pub const RELAY_PROTOCOL_VERSION: &str = "3.0";
 pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v3";
 pub const RUNTIME_INVENTORY_CHUNK_MAX: usize = 512;
+/// Byte budget of one chunked frame (define, its answer, inventory, node.metrics).
+pub const CHUNK_BUDGET_BYTES: usize = 60 * 1024;
+/// Versions one define chunk names (put + keep + remove).
+pub const DEFINE_CHUNK_MAX_VERSIONS: usize = 64;
 
 /// Unit names are deterministic (§3.5): `wsmp-<handle>-r<rank>`.
 pub fn runtime_unit_name(handle: &str, rank: u8) -> String {
@@ -1446,9 +1452,22 @@ impl TrustState {
     }
 }
 
+fn canonical_len<T: Serialize>(value: &T) -> Option<usize> {
+    let value = serde_json::to_value(value).ok()?;
+    canonical_json(&value).ok().map(|text| text.len())
+}
+
+fn encoded_len<T: Serialize>(value: &T) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
 impl DefinitionEnvelope {
     pub fn validate(&self) -> Result<(), FrameRuleError> {
-        rule(self.spec.kind() == self.kind, "kind must match the spec")
+        rule(self.spec.kind() == self.kind, "kind must match the spec")?;
+        rule(
+            canonical_len(&self.spec).is_some_and(|len| len <= RUNTIME_SPEC_MAX_BYTES),
+            "a runtime definition is at most 48 KiB as canonical JSON",
+        )
     }
 }
 
@@ -1482,6 +1501,10 @@ impl NodeFrame {
                     "only operator_closed carries an exit code",
                 )
             }
+            Self::NodeMetrics(_) => rule(
+                encoded_len(self) <= CHUNK_BUDGET_BYTES,
+                "node.metrics stays within the chunk budget",
+            ),
             Self::RuntimeDefineResult {
                 is_final,
                 results,
@@ -1507,6 +1530,11 @@ impl NodeFrame {
                         .iter()
                         .all(|r| (r.status == DefineStatus::Rejected) == r.reason.is_some()),
                     "reason exactly for rejected entries",
+                )?;
+                rule(
+                    results.len() <= DEFINE_CHUNK_MAX_VERSIONS
+                        && encoded_len(self) <= CHUNK_BUDGET_BYTES,
+                    "a define answer stays within one chunk",
                 )
             }
             _ => Ok(()),
@@ -1524,8 +1552,23 @@ impl ServerFrame {
                 keep,
                 remove,
                 complete,
+                node,
                 ..
             } => {
+                let named = put.as_ref().map_or(0, Vec::len)
+                    + keep.as_ref().map_or(0, Vec::len)
+                    + remove.as_ref().map_or(0, Vec::len);
+                rule(
+                    named <= DEFINE_CHUNK_MAX_VERSIONS,
+                    "one chunk names at most 64 versions",
+                )?;
+                if let Some(node) = node {
+                    rule(
+                        canonical_len(&node.metric_commands.commands)
+                            .is_some_and(|len| len <= NODE_METRIC_COMMANDS_MAX_BYTES),
+                        "node metric commands are at most 32 KiB together",
+                    )?;
+                }
                 let complete = complete.unwrap_or(false);
                 rule(
                     !complete || remove.is_none(),
