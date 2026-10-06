@@ -36,7 +36,16 @@
     "clearTitle": "Delete your request log?",
     "clearDescription": "Every finished request you made to your own pools and models is deleted (requests still running stay). Requests you made to other people's pools stay in their owners' logs.",
     "cleared_one": "{{count}} request deleted.",
-    "cleared_other": "{{count}} requests deleted."
+    "cleared_other": "{{count}} requests deleted.",
+    "reason": {
+      "over_capacity": "no capacity was free",
+      "wait_expired": "waited too long for capacity",
+      "context_too_large": "the input is larger than the model's context",
+      "no_member": "the pool has no usable model",
+      "cloud_cap_reached": "the cloud spend cap is reached",
+      "unauthorized_external": "cloud use is not allowed for this caller",
+      "other": "{{code}}"
+    }
   },
   "commands": {
     "title": "Commands",

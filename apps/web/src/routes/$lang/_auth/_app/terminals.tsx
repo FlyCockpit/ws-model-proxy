@@ -11,7 +11,6 @@ import {
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { SquareTerminal } from "lucide-react";
-import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { CodeSnippet } from "@/components/code-snippet";
@@ -27,51 +26,41 @@ export const Route = createFileRoute("/$lang/_auth/_app/terminals")({
 /** The size a terminal opens at before the browser pane fits it. */
 const INITIAL_SIZE = { cols: 120, rows: 32 };
 
-type OpenTerminal = { terminalId: string; nodeSlug: string };
+/**
+ * TODO(server): flip once apps/server serves relay 3.0 browser terminals by ticket and the page
+ * attaches xterm (`use-terminal-sessions`) to it. Until then Open and Run stay disabled: a
+ * ticket nothing attaches to would use up a queued command and open an idle shell.
+ */
+const BROWSER_TERMINALS_READY = false;
 
 function TerminalsPage() {
-  const [open, setOpen] = useState<OpenTerminal | null>(null);
+  const { t } = useTranslation(["terminals"]);
   return (
     <div className="flex min-w-0 flex-col gap-6">
       <PageHeading page="terminals" />
-      {open ? <OpenTerminalCard terminal={open} onClose={() => setOpen(null)} /> : null}
-      <QueuedCommands onOpened={setOpen} />
-      <TerminalNodes onOpened={setOpen} />
+      {BROWSER_TERMINALS_READY ? null : (
+        <Card>
+          <CardContent className="flex min-w-0 items-start gap-2 text-sm">
+            <SquareTerminal aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+            <span className="min-w-0">{t("terminals:attachUnavailable")}</span>
+          </CardContent>
+        </Card>
+      )}
+      <QueuedCommands />
+      <TerminalNodes />
     </div>
   );
 }
 
-/**
- * TODO(server): attach the opened terminal here (xterm through `use-terminal-sessions` on the
- * ticket socket) once apps/server serves relay 3.0 browser terminals by ticket.
- */
-function OpenTerminalCard({ terminal, onClose }: { terminal: OpenTerminal; onClose: () => void }) {
-  const { t } = useTranslation(["terminals"]);
-  return (
-    <Card>
-      <CardContent className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <p className="flex min-w-0 items-start gap-2 text-sm">
-          <SquareTerminal aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
-          <span className="min-w-0 break-words">
-            {t("terminals:attachPending", {
-              terminalId: terminal.terminalId,
-              node: terminal.nodeSlug,
-            })}
-          </span>
-        </p>
-        <Button type="button" variant="outline" size="touch" onClick={onClose}>
-          {t("terminals:close")}
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
-
-function TerminalNodes({ onOpened }: { onOpened: (terminal: OpenTerminal) => void }) {
+function TerminalNodes() {
   const { t } = useTranslation(["terminals"]);
   const nodes = useQuery(orpc.nodes.list.queryOptions());
   const openTicket = useMutation(orpc.nodes.terminals.openTicket.mutationOptions());
   const list = nodes.data?.nodes ?? [];
+  const eligible = list.filter(
+    (node) =>
+      node.trust.effective === "FULL" && !node.trust.lowerPending && node.connection === "ONLINE",
+  );
   return (
     <Card>
       <CardHeader>
@@ -84,59 +73,56 @@ function TerminalNodes({ onOpened }: { onOpened: (terminal: OpenTerminal) => voi
         ) : nodes.isError ? (
           <InlineRetry message={t("terminals:nodesUnavailable")} onRetry={() => nodes.refetch()} />
         ) : list.length === 0 ? (
-          <p className="text-sm text-muted-foreground">{t("terminals:noFullNodes")}</p>
+          <p className="text-sm text-muted-foreground">{t("terminals:noNodes")}</p>
         ) : (
-          list.map((node) => {
-            const full = node.trust.effective === "FULL" && !node.trust.lowerPending;
-            const online = node.connection === "ONLINE";
-            return (
-              <div
-                key={node.id}
-                className="flex min-w-0 flex-wrap items-center justify-between gap-2 py-2 first:pt-0 last:pb-0"
-              >
-                <div className="min-w-0">
-                  <p className="truncate font-mono text-sm">{node.name ?? node.slug}</p>
-                  {!full || !online ? (
-                    <p className="text-xs text-muted-foreground">
-                      {!full ? t("terminals:relayOnly") : t("terminals:offline")}
-                    </p>
-                  ) : null}
-                </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="touch"
-                  disabled={!full || !online || openTicket.isPending}
-                  onClick={() =>
-                    openTicket.mutate(
-                      { nodeId: node.id, ...INITIAL_SIZE },
-                      {
-                        onSuccess: (ticket) =>
-                          onOpened({ terminalId: ticket.terminalId, nodeSlug: node.slug }),
-                      },
-                    )
-                  }
+          <>
+            {eligible.length === 0 ? (
+              <p className="pb-2 text-sm text-muted-foreground">{t("terminals:noFullNodes")}</p>
+            ) : null}
+            {list.map((node) => {
+              const full = node.trust.effective === "FULL" && !node.trust.lowerPending;
+              const online = node.connection === "ONLINE";
+              return (
+                <div
+                  key={node.id}
+                  className="flex min-w-0 flex-wrap items-center justify-between gap-2 py-2 first:pt-0 last:pb-0"
                 >
-                  {openTicket.isPending && openTicket.variables?.nodeId === node.id
-                    ? t("terminals:opening")
-                    : t("terminals:open")}
-                </Button>
-              </div>
-            );
-          })
+                  <div className="min-w-0">
+                    <p className="truncate font-mono text-sm">{node.name ?? node.slug}</p>
+                    {!full || !online ? (
+                      <p className="text-xs text-muted-foreground">
+                        {!full ? t("terminals:relayOnly") : t("terminals:offline")}
+                      </p>
+                    ) : null}
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="touch"
+                    disabled={!BROWSER_TERMINALS_READY || !full || !online || openTicket.isPending}
+                    onClick={() => openTicket.mutate({ nodeId: node.id, ...INITIAL_SIZE })}
+                  >
+                    {openTicket.isPending && openTicket.variables?.nodeId === node.id
+                      ? t("terminals:opening")
+                      : t("terminals:open")}
+                  </Button>
+                </div>
+              );
+            })}
+          </>
         )}
       </CardContent>
     </Card>
   );
 }
 
-function QueuedCommands({ onOpened }: { onOpened: (terminal: OpenTerminal) => void }) {
+function QueuedCommands() {
   const { t } = useTranslation(["terminals"]);
   const queryClient = useQueryClient();
   const queued = useQuery(orpc.nodes.queued.list.queryOptions({ input: { state: "QUEUED" } }));
   const nodes = useQuery(orpc.nodes.list.queryOptions());
   const slugOf = (nodeId: string) =>
-    nodes.data?.nodes.find((node) => node.id === nodeId)?.slug ?? nodeId;
+    nodes.data?.nodes.find((node) => node.id === nodeId)?.slug ?? t("terminals:unknownNode");
   const invalidate = async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: orpc.nodes.queued.list.key() }),
@@ -180,19 +166,8 @@ function QueuedCommands({ onOpened }: { onOpened: (terminal: OpenTerminal) => vo
                 <Button
                   type="button"
                   size="touch"
-                  disabled={run.isPending}
-                  onClick={() =>
-                    run.mutate(
-                      { queuedCommandId: item.id, ...INITIAL_SIZE },
-                      {
-                        onSuccess: (result) =>
-                          onOpened({
-                            terminalId: result.terminalId,
-                            nodeSlug: slugOf(item.nodeId),
-                          }),
-                      },
-                    )
-                  }
+                  disabled={!BROWSER_TERMINALS_READY || run.isPending}
+                  onClick={() => run.mutate({ queuedCommandId: item.id, ...INITIAL_SIZE })}
                 >
                   {t("terminals:run")}
                 </Button>

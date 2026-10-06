@@ -7,8 +7,6 @@
   "nodesUnavailable": "Your nodes could not be loaded.",
   "offline": "Offline",
   "relayOnly": "Relay only",
-  "attachPending": "Terminal {{terminalId}} is open on {{node}}. Attaching it in the browser needs the server's terminal socket, which is not wired in this preview yet.",
-  "close": "Close",
   "queuedTitle": "Commands queued for you",
   "queuedDescription": "An agent asked you to run these. Run opens a terminal with the command typed; you press Enter.",
   "queuedEmpty": "Nothing waiting for you.",
@@ -19,5 +17,8 @@
   "onNode": "On {{node}}",
   "fromAgent": "Queued by an agent",
   "expires": "Expires",
-  "copyCommand": "Copy command"
+  "copyCommand": "Copy command",
+  "unknownNode": "an unknown node",
+  "noNodes": "You have no nodes yet.",
+  "attachUnavailable": "Browser terminals arrive with the next server update. Until then, copy the command and run it on the node yourself."
 }

@@ -24,6 +24,16 @@ const SOURCES = ["ALL", "API_KEY", "TEST", "AGENT_TEST", "SIDECAR"] as const;
 type StatusFilter = (typeof STATUSES)[number];
 type SourceFilter = (typeof SOURCES)[number];
 const PAGE = 50;
+/** The server's bound per delete call (`activity.requests.delete`). */
+const CLEAR_BATCH = 5_000;
+const KNOWN_REASONS = new Set([
+  "over_capacity",
+  "wait_expired",
+  "context_too_large",
+  "no_member",
+  "cloud_cap_reached",
+  "unauthorized_external",
+]);
 
 type RequestRow = {
   id: string;
@@ -62,15 +72,27 @@ function ActivityRequestsPage() {
       getNextPageParam: (page) => page.nextCursor ?? undefined,
     }),
   );
-  const clear = useMutation(
-    orpc.activity.requests.delete.mutationOptions({
-      onSuccess: async (result) => {
-        setClearOpen(false);
-        toast.success(t("activity:requests.cleared", { count: result.deleted }));
-        await queryClient.invalidateQueries({ queryKey: orpc.activity.requests.list.key() });
-      },
-    }),
-  );
+  const deleteBatch = useMutation(orpc.activity.requests.delete.mutationOptions());
+  // The server deletes in bounded batches; keep going until a batch comes back short.
+  // `before` runs a minute ahead so a slow browser clock still covers finished rows (running
+  // ones are never deleted).
+  const clear = useMutation({
+    mutationFn: async () => {
+      const before = new Date(Date.now() + 60_000).toISOString();
+      let total = 0;
+      for (let batch = 0; batch < 100; batch += 1) {
+        const { deleted } = await deleteBatch.mutateAsync({ before });
+        total += deleted;
+        if (deleted < CLEAR_BATCH) break;
+      }
+      return total;
+    },
+    onSuccess: async (total) => {
+      setClearOpen(false);
+      toast.success(t("activity:requests.cleared", { count: total }));
+      await queryClient.invalidateQueries({ queryKey: orpc.activity.requests.list.key() });
+    },
+  });
   const rows = requests.data?.pages.flatMap((page) => page.items) ?? [];
 
   return (
@@ -154,7 +176,7 @@ function ActivityRequestsPage() {
         description={t("activity:requests.clearDescription")}
         confirmLabel={t("activity:requests.clear")}
         isPending={clear.isPending}
-        onConfirm={() => clear.mutate({ before: new Date().toISOString() })}
+        onConfirm={() => clear.mutate()}
       />
     </div>
   );
@@ -209,7 +231,11 @@ function RequestCard({ row }: { row: RequestRow }) {
         ) : null}
         {row.rejection ? (
           <p className="break-all text-xs text-destructive">
-            {t("activity:requests.rejection", { reason: row.rejection })}
+            {t("activity:requests.rejection", {
+              reason: KNOWN_REASONS.has(row.rejection)
+                ? t(`activity:requests.reason.${row.rejection}`)
+                : t("activity:requests.reason.other", { code: row.rejection }),
+            })}
           </p>
         ) : row.errorClass ? (
           <p className="break-all text-xs text-destructive">

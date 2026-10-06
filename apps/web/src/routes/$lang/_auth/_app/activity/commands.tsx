@@ -9,6 +9,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
+import { PageHeading } from "@/components/page-stub";
 import { TimeAgo } from "@/components/time-ago";
 import { WideContent } from "@/components/wide-content";
 import { orpc } from "@/utils/orpc";
@@ -58,10 +59,7 @@ function ActivityCommandsPage() {
   const rows = commands.data?.pages.flatMap((page) => page.items) ?? [];
   return (
     <div className="flex min-w-0 flex-col gap-6">
-      <div className="min-w-0 space-y-1">
-        <h1 className="text-2xl font-semibold">{t("activity:commands.title")}</h1>
-        <p className="text-sm text-muted-foreground">{t("activity:commands.description")}</p>
-      </div>
+      <PageHeading page="activityCommands" />
       {commands.isPending ? (
         <div className="flex flex-col gap-2" aria-hidden="true">
           {[0, 1, 2, 3].map((key) => (
@@ -130,8 +128,9 @@ function CommandCard({ row }: { row: CommandRow }) {
       },
     }),
   );
-  const state = live?.state ?? row.state;
-  const exitCode = live?.exitCode ?? row.exitCode;
+  // The list row wins once it is final; a live snapshot only adds detail while it runs.
+  const state = row.state !== "RUNNING" ? row.state : (live?.state ?? row.state);
+  const exitCode = row.exitCode ?? live?.exitCode;
   const by =
     row.actor === "AGENT"
       ? row.agentTokenName

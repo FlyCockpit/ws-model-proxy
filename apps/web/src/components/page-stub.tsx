@@ -44,7 +44,8 @@ export type StubPageKey =
   | "accessShares"
   | "accessContributions"
   | "activity"
-  | "activityRequests";
+  | "activityRequests"
+  | "activityCommands";
 
 export function PageHeading({ page }: { page: StubPageKey }) {
   const { t } = useTranslation(["dashboard"]);

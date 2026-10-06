@@ -152,6 +152,10 @@
     "activityRequests": {
       "title": "Requests",
       "description": "The request log, with filters."
+    },
+    "activityCommands": {
+      "title": "Commands",
+      "description": "Commands agents and people ran on your nodes. Output comes live from the node and is kept only there."
     }
   },
   "help": {
