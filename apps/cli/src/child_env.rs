@@ -115,6 +115,8 @@ pub fn scrub_parent_env(denied_names: &[String]) -> Vec<(String, String)> {
 /// spawn by [`HostEnvFacts::current`]; tests build their own.
 #[derive(Debug, Default)]
 pub struct HostEnvFacts {
+    /// The directory holding the running wsmp binary.
+    pub exe_dir: Option<PathBuf>,
     /// `/run/user/$UID`, when this is Linux and that directory exists.
     pub user_runtime_dir: Option<PathBuf>,
 }
@@ -122,9 +124,35 @@ pub struct HostEnvFacts {
 impl HostEnvFacts {
     pub fn current() -> Self {
         Self {
+            exe_dir: std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(Path::to_path_buf)),
             user_runtime_dir: user_runtime_dir(),
         }
     }
+}
+
+/// `PATH` for a child when the daemon has none: the usual system directories.
+#[cfg(unix)]
+const FALLBACK_PATH: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin"];
+#[cfg(not(unix))]
+const FALLBACK_PATH: &[&str] = &[];
+
+/// The daemon's `PATH` plus the wsmp binary's directory when it is not
+/// already listed (appended, so nothing the daemon resolves changes). A
+/// service manager's default `PATH` rarely holds `~/.local/bin` or
+/// `~/.cargo/bin`, where wsmp is usually installed, so `wsmp ...` from a
+/// headless command would not be found otherwise.
+fn with_exe_dir(path: Option<&str>, exe_dir: &Path) -> Option<String> {
+    let mut dirs: Vec<PathBuf> = match path {
+        Some(path) => std::env::split_paths(path).collect(),
+        None => FALLBACK_PATH.iter().map(PathBuf::from).collect(),
+    };
+    if dirs.iter().any(|dir| dir == exe_dir) {
+        return None;
+    }
+    dirs.push(exe_dir.to_path_buf());
+    std::env::join_paths(dirs).ok()?.into_string().ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -158,9 +186,10 @@ fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-/// Fill in what a daemon started by a service manager may lack. On Linux,
-/// when the daemon has no `XDG_RUNTIME_DIR` and `/run/user/$UID` exists, the
-/// child gets that directory; when it has no `DBUS_SESSION_BUS_ADDRESS` and
+/// Fill in what a daemon started by a service manager may lack. `PATH` gains
+/// the wsmp binary's directory (see [`with_exe_dir`]). On Linux, when the
+/// daemon has no `XDG_RUNTIME_DIR` and `/run/user/$UID` exists, the child gets
+/// that directory; when it has no `DBUS_SESSION_BUS_ADDRESS` and
 /// `$XDG_RUNTIME_DIR/bus` is a socket, the child gets that bus. Values the
 /// daemon already has are kept as they are.
 pub fn complete_child_env(
@@ -168,6 +197,20 @@ pub fn complete_child_env(
     facts: &HostEnvFacts,
     is_socket: impl Fn(&Path) -> bool,
 ) {
+    if let Some(exe_dir) = &facts.exe_dir {
+        let index = env
+            .iter()
+            .position(|(name, _)| names_equal(name, "PATH", cfg!(windows)));
+        let current = index
+            .and_then(|index| env.get(index))
+            .map(|(_, value)| value.as_str());
+        if let Some(path) = with_exe_dir(current, exe_dir) {
+            match index.and_then(|index| env.get_mut(index)) {
+                Some(entry) => entry.1 = path,
+                None => env.push(("PATH".to_string(), path)),
+            }
+        }
+    }
     let Some(user_runtime_dir) = &facts.user_runtime_dir else {
         return;
     };
@@ -373,6 +416,7 @@ mod tests {
     fn fills_the_runtime_dir_and_bus_when_the_daemon_lacks_them() {
         let facts = HostEnvFacts {
             user_runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..HostEnvFacts::default()
         };
         let mut env = owned(&[("PATH", "/usr/bin")]);
         complete_child_env(&mut env, &facts, |path| {
@@ -400,6 +444,7 @@ mod tests {
     fn keeps_what_the_daemon_has_and_fills_nothing_without_a_user_runtime_dir() {
         let facts = HostEnvFacts {
             user_runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..HostEnvFacts::default()
         };
         let daemon = owned(&[
             ("XDG_RUNTIME_DIR", "/custom/runtime"),
@@ -426,6 +471,59 @@ mod tests {
         let mut env = owned(&[("PATH", "/usr/bin")]);
         complete_child_env(&mut env, &HostEnvFacts::default(), |_| true);
         assert_eq!(env, owned(&[("PATH", "/usr/bin")]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_gains_the_wsmp_directory_once() {
+        let facts = HostEnvFacts {
+            exe_dir: Some(PathBuf::from("/home/me/.local/bin")),
+            ..HostEnvFacts::default()
+        };
+        let mut env = owned(&[("PATH", "/usr/bin:/bin"), ("HOME", "/home/me")]);
+        complete_child_env(&mut env, &facts, |_| false);
+        assert_eq!(
+            env,
+            owned(&[
+                ("PATH", "/usr/bin:/bin:/home/me/.local/bin"),
+                ("HOME", "/home/me")
+            ])
+        );
+        // Already listed: unchanged, in its original position.
+        let mut env = owned(&[("PATH", "/home/me/.local/bin:/usr/bin")]);
+        complete_child_env(&mut env, &facts, |_| false);
+        assert_eq!(env, owned(&[("PATH", "/home/me/.local/bin:/usr/bin")]));
+        // No daemon PATH: the system directories plus wsmp's.
+        let mut env = owned(&[("HOME", "/home/me")]);
+        complete_child_env(&mut env, &facts, |_| false);
+        assert_eq!(
+            env,
+            owned(&[
+                ("HOME", "/home/me"),
+                ("PATH", "/usr/local/bin:/usr/bin:/bin:/home/me/.local/bin")
+            ])
+        );
+        // A directory that cannot be listed in PATH is left out.
+        let odd = HostEnvFacts {
+            exe_dir: Some(PathBuf::from("/opt/a:b")),
+            ..HostEnvFacts::default()
+        };
+        let mut env = owned(&[("PATH", "/usr/bin")]);
+        complete_child_env(&mut env, &odd, |_| false);
+        assert_eq!(env, owned(&[("PATH", "/usr/bin")]));
+    }
+
+    #[test]
+    fn scrubbed_parent_env_reaches_the_running_binary() {
+        let exe = std::env::current_exe().expect("current exe");
+        let dir = exe.parent().expect("exe dir");
+        let env = scrub_parent_env(&[]);
+        let path = env
+            .iter()
+            .find(|(name, _)| names_equal(name, "PATH", cfg!(windows)))
+            .map(|(_, value)| value.clone())
+            .expect("child PATH");
+        assert!(std::env::split_paths(&path).any(|entry| entry == dir));
     }
 
     #[cfg(unix)]

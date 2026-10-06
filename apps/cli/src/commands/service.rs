@@ -208,8 +208,9 @@ pub fn systemd_quote_arg(value: &str) -> String {
 
 /// Variables `wsmp service install` pins into the service so it resolves the
 /// same config file and state directory (and so the same device credential)
-/// as the shell that installed it, whatever `XDG_*` the service manager sets.
-/// Paths only: no secret ever goes into the unit or wrapper.
+/// as the shell that installed it, whatever `XDG_*` the service manager sets,
+/// and so commands it starts find the same programs (`PATH`). Paths only: no
+/// secret ever goes into the unit or wrapper.
 pub fn pinned_service_env() -> Result<Vec<(&'static str, String)>> {
     let pin = |name: &'static str, path: PathBuf| -> Result<(&'static str, String)> {
         let path = std::path::absolute(&path)
@@ -220,10 +221,16 @@ pub fn pinned_service_env() -> Result<Vec<(&'static str, String)>> {
             .map_err(|_| anyhow::anyhow!("`{name}` path is not valid UTF-8"))?;
         Ok((name, value))
     };
-    Ok(vec![
+    let mut pinned = vec![
         pin("WSMP_CONFIG", crate::paths::config_file()?)?,
         pin("WSMP_STATE_DIR", crate::paths::state_dir()?)?,
-    ])
+    ];
+    // The installing shell's PATH, frozen at install time; re-run install to
+    // refresh it. Skipped when unset, empty or not UTF-8.
+    if let Some(path) = std::env::var("PATH").ok().filter(|path| !path.is_empty()) {
+        pinned.push(("PATH", path));
+    }
+    Ok(pinned)
 }
 
 /// Render a systemd user unit for the relay. `pinned` holds non-secret
@@ -720,6 +727,7 @@ mod tests {
                     "/home/user/.config/ws-model-proxy/config.json".to_string(),
                 ),
                 ("WSMP_STATE_DIR", "/srv/wsmp state/100%".to_string()),
+                ("PATH", "/home/user/.local/bin:/usr/bin".to_string()),
             ],
         );
         assert!(unit.contains("ExecStart=\"/opt/ws model/wsmp\" daemon start --foreground"));
@@ -736,8 +744,9 @@ mod tests {
             )
         );
         assert!(unit.contains("Environment=\"WSMP_STATE_DIR=/srv/wsmp state/100%%\"\n"));
+        assert!(unit.contains("Environment=PATH=/home/user/.local/bin:/usr/bin\n"));
         // Only the pinned paths: no token or header variables in the unit.
-        assert_eq!(unit.matches("Environment=").count(), 2);
+        assert_eq!(unit.matches("Environment=").count(), 3);
     }
 
     #[test]
@@ -777,8 +786,12 @@ mod tests {
         let script = render_macos_service_wrapper(
             "/usr/local/bin/wsmp",
             "/Users/x/.config/ws-model-proxy/service.env",
-            &[("WSMP_STATE_DIR", "/Users/x/it's state".to_string())],
+            &[
+                ("WSMP_STATE_DIR", "/Users/x/it's state".to_string()),
+                ("PATH", "/Users/x/.cargo/bin:/usr/bin".to_string()),
+            ],
         );
+        assert!(script.contains("export PATH='/Users/x/.cargo/bin:/usr/bin'\n"));
         assert!(script.starts_with("#!/bin/sh\n"));
         assert!(script.contains("export WSMP_STATE_DIR='/Users/x/it'\"'\"'s state'\n"));
         assert!(script.contains("ENV_FILE='/Users/x/.config/ws-model-proxy/service.env'"));
