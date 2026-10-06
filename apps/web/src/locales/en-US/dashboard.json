@@ -296,7 +296,9 @@
       "addRow": "Add fabric",
       "removeRow": "Remove this fabric",
       "suggestion": "Use {{ip}} {{speed}}",
-      "membershipInvalid": "Each fabric needs a name and this node's IP address (not 0.0.0.0 or loopback), once per fabric."
+      "membershipInvalid": "Each fabric needs a name and this node's IP address (not 0.0.0.0 or loopback), once per fabric.",
+      "speed": "({{gbps}} Gb/s)",
+      "rdma": "(RDMA)"
     },
     "detail": {
       "back": "All nodes",
@@ -417,7 +419,9 @@
       "delete": "Delete {{name}}",
       "deleted": "Secret deleted.",
       "offline": "The node is offline. Secrets are sent only to a connected node.",
-      "relayHint": "This node is Relay only. Set secrets on the machine:"
+      "relayHint": "This node is Relay only. Set secrets on the machine:",
+      "deleteTitle": "Delete {{name}}?",
+      "deleteDescription": "Commands and runtimes that use it stop getting it. It cannot be shown or restored."
     },
     "runs": {
       "title": "What runs here",
@@ -442,7 +446,9 @@
       "refused": "Last refused: {{reason}}",
       "revoke": "Revoke",
       "revokedBadge": "Revoked",
-      "revoked": "Login revoked."
+      "revoked": "Login revoked.",
+      "revokeTitle": "Revoke this login?",
+      "revokeDescription": "The node is signed out at once and needs a new install code to come back."
     },
     "activity": {
       "title": "Activity",
@@ -452,6 +458,40 @@
         "USER": "You",
         "AGENT": "Agent",
         "SYSTEM": "System"
+      },
+      "kind": {
+        "command": "command",
+        "file_read": "file read",
+        "file_stat": "file info",
+        "file_list": "folder list",
+        "file_search": "file search",
+        "file_write": "file write",
+        "file_edit": "file edit",
+        "file_rename": "file rename",
+        "file_mkdir": "new folder",
+        "file_delete": "file delete",
+        "command_queued_for_user": "command queued for you",
+        "browser_terminal": "browser terminal",
+        "operator_terminal": "operator terminal",
+        "runtime_define": "definition sent",
+        "runtime_remove": "definition removed",
+        "metric_commands_define": "metric commands sent",
+        "node_update": "settings changed",
+        "trust_lower": "trust lowered",
+        "claim_forget": "stop forgotten"
+      },
+      "outcome": {
+        "completed": "done",
+        "refused": "refused",
+        "failed": "failed",
+        "cancelled": "cancelled",
+        "declined": "declined",
+        "expired": "expired",
+        "unknown": "unknown",
+        "opened": "opened",
+        "accepted": "accepted",
+        "closed": "closed",
+        "auto_settled": "settled automatically"
       }
     }
   },
@@ -502,7 +542,12 @@
       "warnings": "Check",
       "confirm": "Confirm",
       "applying": "Applying…",
-      "applied": "{{name}} applied."
+      "applied": "{{name}} applied.",
+      "keepsOthersHold": "{{slug}} stays held by someone else",
+      "stopReason": {
+        "preempted": "makes room",
+        "profile_owned_node": "not in this profile"
+      }
     },
     "editor": {
       "back": "All profiles",
@@ -536,7 +581,8 @@
       "deleteTitle": "Delete profile",
       "deleteDescription": "Nothing stops. Nodes it holds stay held until you release them.",
       "typeSlug": "Type the profile's short name to confirm",
-      "deleted": "Profile deleted."
+      "deleted": "Profile deleted.",
+      "saveFirst": "Save your changes before applying."
     }
   },
   "refusals": {

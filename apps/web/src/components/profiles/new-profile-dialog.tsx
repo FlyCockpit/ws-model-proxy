@@ -104,7 +104,7 @@ function NewProfileForm({
       onSubmit={(event) => {
         event.preventDefault();
         event.stopPropagation();
-        form.handleSubmit();
+        form.handleSubmit().catch(() => undefined);
       }}
     >
       <form.Field name="name">

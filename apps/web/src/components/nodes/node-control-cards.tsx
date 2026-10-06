@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
@@ -223,7 +224,7 @@ function LowerTrustSummary({ preview }: { preview: LowerTrustPreview }) {
 }
 
 /** Hold: nothing is placed on the node, for anyone, until released. */
-export function HoldCard({ node }: { node: NodeDetail }) {
+export function HoldCard({ node, lang }: { node: NodeDetail; lang: string }) {
   const { t } = useTranslation(["dashboard", "common"]);
   const invalidate = useInvalidateNodes();
   const [note, setNote] = useState("");
@@ -249,9 +250,17 @@ export function HoldCard({ node }: { node: NodeDetail }) {
         {node.hold ? (
           <div className="space-y-2 text-sm">
             <p>
-              {node.hold.profileId
-                ? t("dashboard:nodes.hold.heldByProfile")
-                : t("dashboard:nodes.hold.heldByPerson")}{" "}
+              {node.hold.profileId ? (
+                <Link
+                  to="/$lang/profiles/$profileId"
+                  params={{ lang, profileId: node.hold.profileId }}
+                  className="underline"
+                >
+                  {t("dashboard:nodes.hold.heldByProfile")}
+                </Link>
+              ) : (
+                t("dashboard:nodes.hold.heldByPerson")
+              )}{" "}
               <TimeAgo value={node.hold.at} />
             </p>
             {node.hold.note ? <p className="text-muted-foreground">“{node.hold.note}”</p> : null}

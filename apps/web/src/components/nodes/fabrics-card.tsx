@@ -86,7 +86,7 @@ export function FabricsCard({ lang }: { lang: string }) {
                         key={member.nodeId}
                         to="/$lang/nodes/$nodeId"
                         params={{ lang, nodeId: member.nodeId }}
-                        className="hover:underline"
+                        className="inline-flex min-h-[44px] items-center hover:underline"
                       >
                         {member.slug} ({member.ip})
                       </Link>
@@ -199,7 +199,7 @@ function RenameFabricForm({
       onSubmit={(event) => {
         event.preventDefault();
         event.stopPropagation();
-        form.handleSubmit();
+        form.handleSubmit().catch(() => undefined);
       }}
     >
       <form.Field name="name">

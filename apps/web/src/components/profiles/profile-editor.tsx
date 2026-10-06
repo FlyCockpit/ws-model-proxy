@@ -117,7 +117,10 @@ export function ProfileEditor({
           z.object({
             runtimeId: z.string().min(1, t("dashboard:profiles.editor.runtimeRequired")),
             versionId: z.string().nullable(),
-            count: z.string().regex(/^[1-9][0-9]?$/, t("dashboard:profiles.editor.countInvalid")),
+            count: z
+              .string()
+              .regex(/^[1-9][0-9]?$/, t("dashboard:profiles.editor.countInvalid"))
+              .refine((count) => Number(count) <= 64, t("dashboard:profiles.editor.countInvalid")),
             nodeIds: z.array(z.string()),
           }),
         ),
@@ -164,7 +167,7 @@ export function ProfileEditor({
       onSubmit={(event) => {
         event.preventDefault();
         event.stopPropagation();
-        form.handleSubmit();
+        form.handleSubmit().catch(() => undefined);
       }}
     >
       <Card className="min-w-0">
@@ -372,6 +375,7 @@ export function ProfileEditor({
                               value={sub.state.value}
                               onChange={(event) => sub.handleChange(event.target.value)}
                             />
+                            <FieldError errors={sub.state.meta.errors} />
                           </div>
                         )}
                       </form.Field>
@@ -441,14 +445,20 @@ export function ProfileEditor({
         >
           {t("dashboard:profiles.editor.updatePins")}
         </Button>
-        <Button
-          type="button"
-          variant="outline"
-          className="min-h-[44px]"
-          onClick={() => setApplying(true)}
-        >
-          {t("dashboard:profiles.apply.button")}
-        </Button>
+        <form.Subscribe selector={(state) => state.isDirty}>
+          {(dirty) => (
+            <Button
+              type="button"
+              variant="outline"
+              className="min-h-[44px]"
+              disabled={dirty}
+              title={dirty ? t("dashboard:profiles.editor.saveFirst") : undefined}
+              onClick={() => setApplying(true)}
+            >
+              {t("dashboard:profiles.apply.button")}
+            </Button>
+          )}
+        </form.Subscribe>
         <Button
           type="button"
           variant="ghost"
@@ -458,7 +468,15 @@ export function ProfileEditor({
           {t("common:actions.delete")}
         </Button>
       </div>
-      <p className="text-xs text-muted-foreground">{t("dashboard:profiles.editor.applyHint")}</p>
+      <form.Subscribe selector={(state) => state.isDirty}>
+        {(dirty) => (
+          <p className="text-xs text-muted-foreground">
+            {dirty
+              ? t("dashboard:profiles.editor.saveFirst")
+              : t("dashboard:profiles.editor.applyHint")}
+          </p>
+        )}
+      </form.Subscribe>
 
       <ApplyProfileDialog profile={profile} open={applying} onOpenChange={setApplying} />
       <ConfirmDeleteDialog

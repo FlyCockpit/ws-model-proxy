@@ -27,6 +27,10 @@ export const Route = createFileRoute("/$lang/_auth/_app/nodes/$nodeId")({
 
 const NODE_REFRESH_MS = 15_000;
 
+function serverKey(...values: unknown[]): string {
+  return JSON.stringify(values);
+}
+
 function NodeDetailPage() {
   const { lang, nodeId } = Route.useParams();
   const { t } = useTranslation(["dashboard"]);
@@ -62,14 +66,37 @@ function NodeDetailPage() {
           <NodeDetailHeader node={node.data} lang={lang} />
           <div className="grid min-w-0 gap-4 lg:grid-cols-2">
             <TrustCard node={node.data} />
-            <HoldCard node={node.data} />
+            <HoldCard node={node.data} lang={lang} />
             <RunsHereCard node={node.data} lang={lang} />
-            <HardwareCard node={node.data} lang={lang} />
-            <PlacementCard node={node.data} />
-            <NodeFabricsCard node={node.data} />
-            <MetricCommandsCard node={node.data} />
+            {/* Forms start from the server's values and restart when those change (another tab,
+                an agent, a trust change), so Save never sends a stale replacement. */}
+            <HardwareCard
+              key={serverKey(node.data.trust.effective, node.data.declaredHardware)}
+              node={node.data}
+              lang={lang}
+            />
+            <PlacementCard
+              key={serverKey(
+                node.data.trust.effective,
+                node.data.labels,
+                node.data.portRange,
+                node.data.commandMaxMs,
+              )}
+              node={node.data}
+            />
+            <NodeFabricsCard
+              key={serverKey(
+                node.data.trust.effective,
+                node.data.fabrics.map((fabric) => [fabric.name, fabric.ip]),
+              )}
+              node={node.data}
+            />
+            <MetricCommandsCard
+              key={serverKey(node.data.trust.effective, node.data.metricCommands)}
+              node={node.data}
+            />
             <SecretsCard node={node.data} />
-            <TemporaryCard node={node.data} />
+            <TemporaryCard key={String(node.data.removeAfterOfflineMs)} node={node.data} />
             <CredentialsCard node={node.data} />
           </div>
           <NodeActivityCard node={node.data} />

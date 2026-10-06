@@ -296,7 +296,9 @@
       "addRow": "Agregar fabric",
       "removeRow": "Quitar este fabric",
       "suggestion": "Usar {{ip}} {{speed}}",
-      "membershipInvalid": "Cada fabric necesita un nombre y la dirección IP de este nodo (no 0.0.0.0 ni loopback), una vez por fabric."
+      "membershipInvalid": "Cada fabric necesita un nombre y la dirección IP de este nodo (no 0.0.0.0 ni loopback), una vez por fabric.",
+      "speed": "({{gbps}} Gb/s)",
+      "rdma": "(RDMA)"
     },
     "detail": {
       "back": "Todos los nodos",
@@ -417,7 +419,9 @@
       "delete": "Eliminar {{name}}",
       "deleted": "Secreto eliminado.",
       "offline": "El nodo está sin conexión. Los secretos solo se envían a un nodo conectado.",
-      "relayHint": "Este nodo es solo retransmisión. Configura los secretos en la máquina:"
+      "relayHint": "Este nodo es solo retransmisión. Configura los secretos en la máquina:",
+      "deleteTitle": "¿Eliminar {{name}}?",
+      "deleteDescription": "Los comandos y runtimes que lo usan dejan de recibirlo. No se puede mostrar ni recuperar."
     },
     "runs": {
       "title": "Qué corre aquí",
@@ -442,7 +446,9 @@
       "refused": "Último rechazo: {{reason}}",
       "revoke": "Revocar",
       "revokedBadge": "Revocado",
-      "revoked": "Inicio de sesión revocado."
+      "revoked": "Inicio de sesión revocado.",
+      "revokeTitle": "¿Revocar este inicio de sesión?",
+      "revokeDescription": "El nodo cierra sesión de inmediato y necesita un nuevo código de instalación para volver."
     },
     "activity": {
       "title": "Actividad",
@@ -452,6 +458,40 @@
         "USER": "Tú",
         "AGENT": "Agente",
         "SYSTEM": "Sistema"
+      },
+      "kind": {
+        "command": "comando",
+        "file_read": "lectura de archivo",
+        "file_stat": "info de archivo",
+        "file_list": "lista de carpeta",
+        "file_search": "búsqueda de archivos",
+        "file_write": "escritura de archivo",
+        "file_edit": "edición de archivo",
+        "file_rename": "archivo renombrado",
+        "file_mkdir": "carpeta nueva",
+        "file_delete": "archivo eliminado",
+        "command_queued_for_user": "comando en cola para ti",
+        "browser_terminal": "terminal del navegador",
+        "operator_terminal": "terminal de operador",
+        "runtime_define": "definición enviada",
+        "runtime_remove": "definición quitada",
+        "metric_commands_define": "comandos de métricas enviados",
+        "node_update": "ajustes cambiados",
+        "trust_lower": "confianza bajada",
+        "claim_forget": "parada olvidada"
+      },
+      "outcome": {
+        "completed": "hecho",
+        "refused": "rechazado",
+        "failed": "falló",
+        "cancelled": "cancelado",
+        "declined": "declinado",
+        "expired": "vencido",
+        "unknown": "desconocido",
+        "opened": "abierto",
+        "accepted": "aceptado",
+        "closed": "cerrado",
+        "auto_settled": "resuelto automáticamente"
       }
     }
   },
@@ -502,7 +542,12 @@
       "warnings": "Revisa",
       "confirm": "Confirmar",
       "applying": "Aplicando…",
-      "applied": "{{name}} aplicado."
+      "applied": "{{name}} aplicado.",
+      "keepsOthersHold": "{{slug}} sigue retenido por alguien más",
+      "stopReason": {
+        "preempted": "libera espacio",
+        "profile_owned_node": "no está en este perfil"
+      }
     },
     "editor": {
       "back": "Todos los perfiles",
@@ -536,7 +581,8 @@
       "deleteTitle": "Eliminar perfil",
       "deleteDescription": "Nada se detiene. Los nodos que retiene siguen retenidos hasta que los liberes.",
       "typeSlug": "Escribe el nombre corto del perfil para confirmar",
-      "deleted": "Perfil eliminado."
+      "deleted": "Perfil eliminado.",
+      "saveFirst": "Guarda tus cambios antes de aplicar."
     }
   },
   "refusals": {

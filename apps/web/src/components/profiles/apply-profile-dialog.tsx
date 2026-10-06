@@ -35,9 +35,16 @@ export function ApplyProfileDialog({
   const { t } = useTranslation(["dashboard", "common"]);
   const queryClient = useQueryClient();
   const nodes = useQuery({ ...orpc.nodes.list.queryOptions(), enabled: open });
+  const runtimes = useQuery({ ...orpc.runtimes.list.queryOptions(), enabled: open, retry: false });
+  const previewKey = ["profiles", "applyPreview", profile.id, profile.updatedAt] as const;
+  const setOpen = (next: boolean) => {
+    // A closed dialog keeps no preview: reopening always plans again.
+    if (!next) queryClient.removeQueries({ queryKey: previewKey });
+    onOpenChange(next);
+  };
   // A preview is a mutation procedure (it plans against live state); it is safe to repeat.
   const preview = useQuery({
-    queryKey: ["profiles", "applyPreview", profile.id, profile.updatedAt],
+    queryKey: previewKey,
     queryFn: async () => {
       const result = await orpc.profiles.apply.call({ profileId: profile.id, preview: true });
       if (result.mode !== "preview") throw new Error("Expected a preview.");
@@ -53,7 +60,7 @@ export function ApplyProfileDialog({
         toast.success(t("dashboard:profiles.apply.applied", { name: profile.name }));
         queryClient.invalidateQueries({ queryKey: orpc.profiles.key() });
         queryClient.invalidateQueries({ queryKey: orpc.nodes.key() });
-        onOpenChange(false);
+        setOpen(false);
       },
       onError: (error) => {
         if (refusalReasonOf(error) === "preview_stale") preview.refetch();
@@ -66,7 +73,7 @@ export function ApplyProfileDialog({
   const nodeById = new Map((nodes.data?.nodes ?? []).map((node) => [node.id, node]));
   const data = preview.data;
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={setOpen}>
       <DialogContent className="max-h-[90dvh] overflow-x-hidden overflow-y-auto overscroll-contain sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>{t("dashboard:profiles.apply.title", { name: profile.name })}</DialogTitle>
@@ -84,20 +91,31 @@ export function ApplyProfileDialog({
             onRetry={() => preview.refetch()}
           />
         ) : data ? (
-          <PreviewSummary preview={data} profile={profile} nodeById={nodeById} />
+          <PreviewSummary
+            preview={data}
+            profile={profile}
+            nodeById={nodeById}
+            runtimeNames={new Map((runtimes.data?.runtimes ?? []).map((r) => [r.id, r.name]))}
+          />
         ) : null}
         <DialogFooter>
           <Button
             type="button"
             variant="ghost"
             className="min-h-[44px]"
-            onClick={() => onOpenChange(false)}
+            onClick={() => setOpen(false)}
           >
             {t("common:actions.cancel")}
           </Button>
           <Button
             className="min-h-[44px]"
-            disabled={!data || data.refusals.length > 0 || apply.isPending}
+            disabled={
+              !data ||
+              data.refusals.length > 0 ||
+              apply.isPending ||
+              preview.isFetching ||
+              nodes.isPending
+            }
             onClick={() => {
               if (data) apply.mutate({ profileId: profile.id, fingerprint: data.fingerprint });
             }}
@@ -116,15 +134,19 @@ function PreviewSummary({
   preview,
   profile,
   nodeById,
+  runtimeNames,
 }: {
   preview: StartPreview;
   profile: ProfileView;
   nodeById: ReadonlyMap<string, NodeSummary>;
+  runtimeNames: ReadonlyMap<string, string>;
 }) {
   const { t } = useTranslation(["dashboard"]);
   const slug = (nodeId: string) => nodeById.get(nodeId)?.slug ?? nodeId;
   const runtimeSlug = (runtimeId: string) =>
-    profile.items.find((item) => item.runtimeId === runtimeId)?.runtimeSlug ?? runtimeId;
+    runtimeNames.get(runtimeId) ??
+    profile.items.find((item) => item.runtimeId === runtimeId)?.runtimeSlug ??
+    runtimeId;
   const holdLines = new Set(profile.holds.map((hold) => hold.nodeId));
   // The contract's preview has no hold list (contract gap): derived here from the profile and
   // the nodes' current holds, the same rule the server applies (planProfileHolds).
@@ -178,8 +200,11 @@ function PreviewSummary({
         ) : (
           <ul className="space-y-0.5">
             {preview.stops.map((stop) => (
-              <li key={stop.instanceId} className="font-mono text-xs">
-                {stop.runtimeId} · {stop.instanceId}
+              <li key={stop.instanceId}>
+                <span className="font-medium">{runtimeSlug(stop.runtimeId)}</span>{" "}
+                <span className="text-muted-foreground">
+                  · {t(`dashboard:profiles.apply.stopReason.${stop.reason}`)}
+                </span>
               </li>
             ))}
           </ul>
@@ -194,11 +219,17 @@ function PreviewSummary({
         <section className="space-y-1">
           <h3 className="font-medium">{t("dashboard:profiles.apply.holds")}</h3>
           <ul className="space-y-0.5">
-            {profile.holds.map((hold) => (
-              <li key={hold.nodeId}>
-                {t("dashboard:profiles.apply.holdsNode", { slug: slug(hold.nodeId) })}
-              </li>
-            ))}
+            {profile.holds.map((hold) => {
+              const current = nodeById.get(hold.nodeId)?.hold;
+              const othersHold = current && current.profileId !== profile.id;
+              return (
+                <li key={hold.nodeId}>
+                  {othersHold
+                    ? t("dashboard:profiles.apply.keepsOthersHold", { slug: slug(hold.nodeId) })
+                    : t("dashboard:profiles.apply.holdsNode", { slug: slug(hold.nodeId) })}
+                </li>
+              );
+            })}
             {releases.map((nodeId) => (
               <li key={nodeId}>
                 {t("dashboard:profiles.apply.releasesNode", { slug: slug(nodeId) })}

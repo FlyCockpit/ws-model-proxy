@@ -155,7 +155,7 @@ export function PlacementCard({ node }: { node: NodeDetail }) {
             onSubmit={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              form.handleSubmit();
+              form.handleSubmit().catch(() => undefined);
             }}
           >
             <form.Field name="labels">
@@ -308,7 +308,7 @@ export function MetricCommandsCard({ node }: { node: NodeDetail }) {
             onSubmit={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              form.handleSubmit();
+              form.handleSubmit().catch(() => undefined);
             }}
           >
             <form.Field name="json">
@@ -398,7 +398,7 @@ export function NodeFabricsCard({ node }: { node: NodeDetail }) {
             onSubmit={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              form.handleSubmit();
+              form.handleSubmit().catch(() => undefined);
             }}
           >
             <form.Field name="fabrics" mode="array">
@@ -475,9 +475,11 @@ export function NodeFabricsCard({ node }: { node: NodeDetail }) {
                           {t("dashboard:nodes.fabrics.suggestion", {
                             ip: suggestion.ip,
                             speed: suggestion.linkSpeedMbps
-                              ? `${Math.round(suggestion.linkSpeedMbps / 1000)} Gb/s`
+                              ? t("dashboard:nodes.fabrics.speed", {
+                                  gbps: Math.round(suggestion.linkSpeedMbps / 1000),
+                                })
                               : suggestion.rdma
-                                ? "RDMA"
+                                ? t("dashboard:nodes.fabrics.rdma")
                                 : "",
                           })}
                         </Button>
@@ -609,7 +611,7 @@ export function HardwareCard({ node, lang }: { node: NodeDetail; lang: string })
             onSubmit={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              form.handleSubmit();
+              form.handleSubmit().catch(() => undefined);
             }}
           >
             <p className="text-sm font-medium">{t("dashboard:nodes.hardware.declare")}</p>

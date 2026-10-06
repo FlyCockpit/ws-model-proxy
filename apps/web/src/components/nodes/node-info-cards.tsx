@@ -16,6 +16,7 @@ import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Trash } from "lucide-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
@@ -23,6 +24,7 @@ import { InlineRetry } from "@/components/inline-retry";
 import { TimeAgo } from "@/components/time-ago";
 import { orpc } from "@/utils/orpc";
 
+import { ConfirmActionDialog } from "./confirm-action-dialog";
 import { FieldError } from "./field-error";
 import { CommandBlock, StatusPill } from "./node-badges";
 import type { NodeDetail } from "./node-types";
@@ -38,7 +40,10 @@ export function SecretsCard({ node }: { node: NodeDetail }) {
   const { t } = useTranslation(["dashboard", "common"]);
   const invalidate = useInvalidateNodes();
   const canWrite = node.trust.effective === "FULL" && node.connection === "ONLINE";
+  const [deletingSecret, setDeletingSecret] = useState<string | null>(null);
   const set = useMutation({
+    // The value is in the mutation's variables: keep them no longer than the call.
+    gcTime: 0,
     ...orpc.nodes.secrets.set.mutationOptions({
       onSuccess: (result) => {
         toast.success(t("dashboard:nodes.secrets.saved", { name: result.name }));
@@ -65,9 +70,13 @@ export function SecretsCard({ node }: { node: NodeDetail }) {
       }),
     },
     onSubmit: async ({ value, formApi }) => {
-      await set.mutateAsync({ nodeId: node.id, name: value.name, value: value.value });
-      // The value never stays in the page after it is sent.
-      formApi.reset();
+      try {
+        await set.mutateAsync({ nodeId: node.id, name: value.name, value: value.value });
+      } finally {
+        // The value never stays in the page after it is sent, sent or not.
+        formApi.reset();
+        set.reset();
+      }
     },
   });
   return (
@@ -93,7 +102,7 @@ export function SecretsCard({ node }: { node: NodeDetail }) {
                     size="icon-touch"
                     aria-label={t("dashboard:nodes.secrets.delete", { name: secret.name })}
                     disabled={remove.isPending}
-                    onClick={() => remove.mutate({ nodeId: node.id, name: secret.name })}
+                    onClick={() => setDeletingSecret(secret.name)}
                   >
                     <Trash aria-hidden="true" />
                   </Button>
@@ -102,6 +111,19 @@ export function SecretsCard({ node }: { node: NodeDetail }) {
             ))}
           </ul>
         )}
+        <ConfirmActionDialog
+          open={deletingSecret !== null}
+          onOpenChange={(open) => {
+            if (!open) setDeletingSecret(null);
+          }}
+          title={t("dashboard:nodes.secrets.deleteTitle", { name: deletingSecret ?? "" })}
+          description={t("dashboard:nodes.secrets.deleteDescription")}
+          confirmLabel={t("common:actions.delete")}
+          pending={remove.isPending}
+          onConfirm={() => {
+            if (deletingSecret) remove.mutate({ nodeId: node.id, name: deletingSecret });
+          }}
+        />
         {canWrite ? (
           <form
             className="space-y-2"
@@ -109,7 +131,7 @@ export function SecretsCard({ node }: { node: NodeDetail }) {
             onSubmit={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              form.handleSubmit();
+              form.handleSubmit().catch(() => undefined);
             }}
           >
             <form.Field name="name">
@@ -227,7 +249,7 @@ export function RunsHereCard({ node, lang }: { node: NodeDetail; lang: string })
                   <Link
                     to="/$lang/runtimes/$runtimeId"
                     params={{ lang, runtimeId: held.runtimeId }}
-                    className="font-mono text-xs hover:underline"
+                    className="inline-flex min-h-[44px] items-center font-mono text-xs hover:underline"
                   >
                     {held.launchHash.slice(0, 12)}
                   </Link>
@@ -272,6 +294,7 @@ export function RunsHereCard({ node, lang }: { node: NodeDetail; lang: string })
 export function CredentialsCard({ node }: { node: NodeDetail }) {
   const { t } = useTranslation(["dashboard"]);
   const queryClient = useQueryClient();
+  const [revoking, setRevoking] = useState<string | null>(null);
   const credentials = useQuery(
     orpc.nodes.credentials.list.queryOptions({ input: { nodeId: node.id } }),
   );
@@ -312,7 +335,9 @@ export function CredentialsCard({ node }: { node: NodeDetail }) {
                   {credential.lastRefusedReason ? (
                     <p className="text-muted-foreground">
                       {t("dashboard:nodes.credentials.refused", {
-                        reason: credential.lastRefusedReason,
+                        reason: t(`dashboard:refusals.${credential.lastRefusedReason}`, {
+                          defaultValue: credential.lastRefusedReason,
+                        }),
                       })}
                     </p>
                   ) : null}
@@ -326,7 +351,7 @@ export function CredentialsCard({ node }: { node: NodeDetail }) {
                     variant="outline"
                     className="min-h-[44px]"
                     disabled={revoke.isPending}
-                    onClick={() => revoke.mutate({ credentialId: credential.id })}
+                    onClick={() => setRevoking(credential.id)}
                   >
                     {t("dashboard:nodes.credentials.revoke")}
                   </Button>
@@ -335,6 +360,19 @@ export function CredentialsCard({ node }: { node: NodeDetail }) {
             ))}
           </ul>
         )}
+        <ConfirmActionDialog
+          open={revoking !== null}
+          onOpenChange={(open) => {
+            if (!open) setRevoking(null);
+          }}
+          title={t("dashboard:nodes.credentials.revokeTitle")}
+          description={t("dashboard:nodes.credentials.revokeDescription")}
+          confirmLabel={t("dashboard:nodes.credentials.revoke")}
+          pending={revoke.isPending}
+          onConfirm={() => {
+            if (revoking) revoke.mutate({ credentialId: revoking });
+          }}
+        />
       </CardContent>
     </Card>
   );
@@ -369,11 +407,13 @@ export function NodeActivityCard({ node }: { node: NodeDetail }) {
                   <TimeAgo value={event.createdAt} />
                 </span>
                 <span>{t(`dashboard:nodes.activity.actor.${event.actor}`)}</span>
-                <span className="font-medium">{event.kind.replaceAll("_", " ")}</span>
+                <span className="font-medium">
+                  {t(`dashboard:nodes.activity.kind.${event.kind}`)}
+                </span>
                 <span className="min-w-0 truncate font-mono text-muted-foreground">
                   {event.subject}
                 </span>
-                <span>{event.outcome}</span>
+                <span>{t(`dashboard:nodes.activity.outcome.${event.outcome}`)}</span>
               </li>
             ))}
           </ul>

@@ -143,8 +143,10 @@ export function AddNodeDialog({ open, onOpenChange, lang, replace }: AddNodeDial
     },
   });
 
-  const close = (next: boolean) => {
+  const close = (next: boolean, explicit = false) => {
     if (create.isPending) return;
+    // The one-time command closes only through Done, never a stray tap or Escape.
+    if (!next && result && !explicit) return;
     if (!next) {
       setResult(null);
       form.reset();
@@ -153,7 +155,7 @@ export function AddNodeDialog({ open, onOpenChange, lang, replace }: AddNodeDial
   };
 
   return (
-    <Dialog open={open} onOpenChange={close}>
+    <Dialog open={open} onOpenChange={(next) => close(next)}>
       <DialogContent className="max-h-[90dvh] overflow-x-hidden overflow-y-auto overscroll-contain sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>
@@ -169,14 +171,14 @@ export function AddNodeDialog({ open, onOpenChange, lang, replace }: AddNodeDial
         </DialogHeader>
 
         {result ? (
-          <EnrollmentResultView result={result} lang={lang} onDone={() => close(false)} />
+          <EnrollmentResultView result={result} lang={lang} onDone={() => close(false, true)} />
         ) : (
           <form
             className="min-w-0 space-y-4"
             onSubmit={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              form.handleSubmit();
+              form.handleSubmit().catch(() => undefined);
             }}
           >
             {replace ? null : (
