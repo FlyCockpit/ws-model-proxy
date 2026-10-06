@@ -268,4 +268,58 @@ describe("profilePlan", () => {
       "pins_outdated",
     );
   });
+
+  it("counts GPUs already claimed on a discrete node", () => {
+    const spec = launchSpec({ resources: [{ kind: "discrete", gpuCount: 1, vramGb: 10 }] });
+    const versions = new Map([
+      ["v-1", { id: "v-1", runtimeId: "rt-1", runtimeSlug: "gpu", currentVersionId: "v-1", spec }],
+    ]);
+    const plan = profilePlan(
+      input({
+        owned: [{ nodeId: "a", hold: false }],
+        nodes: new Map([["a", node("a", { usableGpuGb: 48, gpuCount: 1 })]]),
+        versions,
+        claims: [
+          {
+            instanceId: "i-x",
+            nodeId: "a",
+            port: 30005,
+            distPort: null,
+            resources: { kind: "discrete", gpuCount: 1, vramGb: 10 },
+          },
+        ],
+      }),
+    );
+    expect(plan.preview.refusals[0]?.reason).toBe("not_enough_memory");
+  });
+
+  it("stops a matching instance that also runs on a node outside the profile", () => {
+    const plan = profilePlan(
+      input({
+        instances: [
+          {
+            id: "i-wide",
+            runtimeId: "rt-1",
+            launchVersionId: "v-1",
+            desiredRunning: true,
+            rankNodeIds: ["elsewhere", "a"],
+          },
+        ],
+      }),
+    );
+    expect(plan.preview.kept).toEqual([]);
+    expect(plan.preview.stops.map((stop) => stop.instanceId)).toEqual(["i-wide"]);
+  });
+
+  it("gives the same fingerprint whatever order the owned nodes come in", () => {
+    const reversed = profilePlan(
+      input({
+        owned: [
+          { nodeId: "b", hold: false },
+          { nodeId: "a", hold: false },
+        ],
+      }),
+    );
+    expect(reversed.preview.fingerprint).toBe(profilePlan(input()).preview.fingerprint);
+  });
 });

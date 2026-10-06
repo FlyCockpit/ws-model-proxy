@@ -16,6 +16,7 @@ import { effectiveHardware, liveMetrics } from "../nodes/hardware";
 import { nodeTrustView } from "../nodes/trust";
 import { parseHeldDefinitions } from "../nodes/views";
 import {
+  instanceServesItem,
   type PlanInstance,
   type PlanItem,
   type PlanNode,
@@ -108,7 +109,8 @@ async function runningInstancesOn(userId: string, nodeIds: readonly string[]) {
 type RunningInstance = Awaited<ReturnType<typeof runningInstancesOn>>[number];
 
 export function toProfileView(row: ProfileRow, instances: readonly RunningInstance[]): ProfileView {
-  const owned = new Set(row.Nodes.map((node) => node.nodeId));
+  const ownedIds = row.Nodes.map((node) => node.nodeId);
+  const owned = new Set(ownedIds);
   const holdLines = new Set(row.Nodes.filter((node) => node.hold).map((node) => node.nodeId));
   const running = instances.filter(
     (instance) =>
@@ -118,15 +120,19 @@ export function toProfileView(row: ProfileRow, instances: readonly RunningInstan
   );
   const matched = new Set<string>();
   const items = row.Items.map((item) => {
-    const allowed = item.nodeIds.length > 0 ? new Set(item.nodeIds) : owned;
     const matches = running.filter(
       (instance) =>
-        instance.runtimeId === item.runtimeId &&
-        instance.launchVersionId === item.versionId &&
         !matched.has(instance.id) &&
-        instance.Ranks[0]?.nodeId != null &&
-        allowed.has(instance.Ranks[0].nodeId) &&
-        !instance.Ranks.some((rank) => rank.nodeId !== null && holdLines.has(rank.nodeId)),
+        instanceServesItem(
+          {
+            runtimeId: instance.runtimeId,
+            launchVersionId: instance.launchVersionId,
+            rankNodeIds: instance.Ranks.flatMap((rank) => (rank.nodeId ? [rank.nodeId] : [])),
+          },
+          item,
+          ownedIds,
+          holdLines,
+        ),
     );
     const counted = matches.slice(0, item.count);
     for (const instance of counted) matched.add(instance.id);
@@ -257,6 +263,7 @@ async function loadPlanInput(context: Context, userId: string, profileId: string
     }),
     prisma.fabric.findMany({
       where: { userId },
+      orderBy: { name: "asc" },
       select: { id: true, name: true, Members: { select: { nodeId: true } } },
     }),
   ]);
@@ -419,6 +426,10 @@ export const profileProcedures = {
             throw new ORPCError("BAD_REQUEST", {
               message: "A profile pins startable runtimes only.",
             });
+          if (input.updatePins && item.versionId)
+            throw new ORPCError("BAD_REQUEST", {
+              message: "Give versionId or updatePins, not both.",
+            });
           let versionId = item.versionId;
           if (versionId && versionRuntime.get(versionId) !== runtime.id)
             throw notFound("Runtime version");
@@ -472,6 +483,11 @@ export const profileProcedures = {
             };
           }),
         });
+        // A node leaving the profile keeps no hold this profile set (no apply could clear it).
+        await tx.node.updateMany({
+          where: { userId, holdProfileId: profile.id, id: { notIn: nodeIds } },
+          data: { holdAt: null, holdNote: null, holdProfileId: null },
+        });
         await tx.profileItem.deleteMany({ where: { profileId: profile.id } });
         if (items.length > 0)
           await tx.profileItem.createMany({
@@ -490,8 +506,15 @@ export const profileProcedures = {
   delete: contractProcedure(c.delete).handler(async ({ context, input }) => {
     assertMayWrite(context.auth);
     const userId = context.session.user.id;
-    const deleted = await prisma.profile.deleteMany({ where: { id: input.profileId, userId } });
-    if (deleted.count === 0) throw notFound("Profile");
+    await prisma.$transaction(async (tx) => {
+      const deleted = await tx.profile.deleteMany({ where: { id: input.profileId, userId } });
+      if (deleted.count === 0) throw notFound("Profile");
+      // Holds this profile set would otherwise outlive it (nothing could release them).
+      await tx.node.updateMany({
+        where: { userId, holdProfileId: input.profileId },
+        data: { holdAt: null, holdNote: null, holdProfileId: null },
+      });
+    });
     return { ok: true as const };
   }),
 
@@ -530,11 +553,25 @@ export const profileProcedures = {
         },
         select: { id: true, createdAt: true },
       });
-      for (const nodeId of plan.holdNodeIds)
-        await tx.node.updateMany({
-          where: { id: nodeId, userId },
+      for (const nodeId of plan.holdNodeIds) {
+        const held = await tx.node.updateMany({
+          where: {
+            id: nodeId,
+            userId,
+            // An agent never takes over a person's hold, even one set after the plan.
+            ...(planInput.agentRules
+              ? { NOT: { holdAt: { not: null }, holdProfileId: null } }
+              : {}),
+          },
           data: { holdAt: now, holdNote: holdNotes.get(nodeId) ?? null, holdProfileId: profile.id },
         });
+        if (held.count === 0)
+          throw refuseAbout(
+            "node_held",
+            nodeId,
+            "A person holds this node; agents cannot apply here.",
+          );
+      }
       if (plan.releaseNodeIds.length > 0)
         await tx.node.updateMany({
           where: { id: { in: plan.releaseNodeIds }, userId, holdProfileId: profile.id },

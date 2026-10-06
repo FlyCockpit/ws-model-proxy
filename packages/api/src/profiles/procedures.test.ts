@@ -224,3 +224,135 @@ describe("profiles.save hold lines (people only)", () => {
     expect(db.node.findMany.mock.calls[0]?.[0]?.where).toMatchObject({ userId: "owner-1" });
   });
 });
+
+describe("profiles.save validation", () => {
+  const base = { slug: "evening", name: "Evening", nodeIds: ["a"], items: [] };
+
+  it("refuses an agent creating a profile with hold lines", async () => {
+    db.node.findMany.mockResolvedValueOnce([{ id: "a" }] as never);
+    db.runtime.findMany.mockResolvedValueOnce([]);
+    await expect(
+      client(FULL_AGENT).save({ ...base, holds: [{ nodeId: "a" }] }),
+    ).rejects.toMatchObject({ data: { reason: "human_only" } });
+    expect(db.profile.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses an agent changing only a hold note", async () => {
+    db.node.findMany.mockResolvedValueOnce([{ id: "a" }] as never);
+    db.profile.findFirst.mockResolvedValueOnce({
+      id: "p-1",
+      Nodes: [{ nodeId: "a", hold: true, holdNote: "old" }],
+      Items: [],
+    } as never);
+    await expect(
+      client(FULL_AGENT).save({ ...base, profileId: "p-1", holds: [{ nodeId: "a", note: "new" }] }),
+    ).rejects.toMatchObject({ data: { reason: "human_only" } });
+  });
+
+  it("refuses updatePins together with an explicit version", async () => {
+    db.node.findMany.mockResolvedValueOnce([{ id: "a" }] as never);
+    db.runtime.findMany.mockResolvedValueOnce([
+      { id: "rt-1", kind: "STARTABLE", currentVersionId: "v-2" },
+    ] as never);
+    db.runtimeVersion.findMany.mockResolvedValueOnce([{ id: "v-1", runtimeId: "rt-1" }] as never);
+    await expect(
+      client().save({
+        ...base,
+        updatePins: true,
+        items: [{ runtimeId: "rt-1", versionId: "v-1", count: 1 }],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
+  it("refuses an always-on runtime as an item", async () => {
+    db.node.findMany.mockResolvedValueOnce([{ id: "a" }] as never);
+    db.runtime.findMany.mockResolvedValueOnce([
+      { id: "rt-1", kind: "ALWAYS_ON", currentVersionId: "v-1" },
+    ] as never);
+    await expect(
+      client().save({ ...base, items: [{ runtimeId: "rt-1", count: 1 }] }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
+  it("releases holds this profile set on nodes it no longer owns", async () => {
+    db.node.findMany.mockResolvedValueOnce([{ id: "a" }] as never);
+    db.profile.findFirst.mockResolvedValueOnce({ id: "p-1", Nodes: [], Items: [] } as never);
+    db.runtime.findMany.mockResolvedValueOnce([]);
+    db.profile.update.mockResolvedValueOnce({ id: "p-1" } as never);
+    db.profile.findMany.mockResolvedValueOnce([]);
+    await client()
+      .save({ ...base, profileId: "p-1" })
+      .catch(() => undefined);
+    expect(db.node.updateMany.mock.calls[0]?.[0]).toMatchObject({
+      where: { userId: "owner-1", holdProfileId: "p-1", id: { notIn: ["a"] } },
+      data: { holdAt: null, holdProfileId: null },
+    });
+  });
+});
+
+describe("profiles.delete", () => {
+  it("clears the holds the profile set", async () => {
+    db.profile.deleteMany.mockResolvedValueOnce({ count: 1 });
+    await client(FULL_AGENT).delete({ profileId: "p-1" });
+    expect(db.profile.deleteMany.mock.calls[0]?.[0]?.where).toEqual({
+      id: "p-1",
+      userId: "owner-1",
+    });
+    expect(db.node.updateMany.mock.calls[0]?.[0]?.where).toEqual({
+      userId: "owner-1",
+      holdProfileId: "p-1",
+    });
+  });
+
+  it("refuses a read-only agent", async () => {
+    await expect(client(READ_AGENT).delete({ profileId: "p-1" })).rejects.toMatchObject({
+      code: "FORBIDDEN",
+    });
+    expect(db.profile.deleteMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("profiles.apply hold race", () => {
+  it("refuses an agent when a person holds a hold-line node by the time it writes", async () => {
+    db.profile.findFirst.mockResolvedValueOnce({
+      id: "p-1",
+      Nodes: [{ nodeId: "a", hold: true, holdNote: null }],
+      Items: [],
+    } as never);
+    db.node.findMany.mockResolvedValueOnce([
+      {
+        id: "a",
+        slug: "a",
+        connection: "ONLINE",
+        trust: "FULL",
+        trustChangedAt: null,
+        trustLowerRequestedAt: null,
+        labels: [],
+        holdAt: null,
+        holdProfileId: null,
+        portStart: 30000,
+        portEnd: 30010,
+        heldDefinitions: [],
+        declaredResources: null,
+        nodeInfo: null,
+        nodeMetrics: null,
+        nodeMetricsAt: null,
+      },
+    ] as never);
+    db.runtimeVersion.findMany.mockResolvedValueOnce([]);
+    db.runtimeInstance.findMany.mockResolvedValueOnce([]);
+    db.instanceRank.findMany.mockResolvedValueOnce([]);
+    db.fabric.findMany.mockResolvedValueOnce([]);
+    db.runtimeOperation.create.mockResolvedValueOnce({
+      id: "op-1",
+      createdAt: new Date(),
+    } as never);
+    db.node.updateMany.mockResolvedValueOnce({ count: 0 });
+    await expect(client(FULL_AGENT).apply({ profileId: "p-1" })).rejects.toMatchObject({
+      data: { reason: "node_held" },
+    });
+    expect(db.node.updateMany.mock.calls[0]?.[0]?.where).toMatchObject({
+      NOT: { holdAt: { not: null }, holdProfileId: null },
+    });
+  });
+});

@@ -121,17 +121,37 @@ function claimNeeds(resources: unknown): { memoryGb: number; gpuGb: number; gpus
   }
 }
 
-type Budget = { memoryGb: number; gpuGb: number; ports: Set<number> };
+type Budget = { memoryGb: number; gpuGb: number; gpus: number; ports: Set<number> };
 
 function sha256(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+/**
+ * Whether a running instance counts toward a pinned item: same runtime and launched version,
+ * and every rank on the item's nodes (or the profile's nodes) without a hold line. The view's
+ * `runningNow` and the plan's "kept" use this one rule.
+ */
+export function instanceServesItem(
+  instance: { runtimeId: string; launchVersionId: string; rankNodeIds: readonly string[] },
+  item: { runtimeId: string; versionId: string; nodeIds: readonly string[] },
+  ownedIds: readonly string[],
+  holdLines: ReadonlySet<string>,
+): boolean {
+  if (instance.runtimeId !== item.runtimeId || instance.launchVersionId !== item.versionId)
+    return false;
+  if (instance.rankNodeIds.length === 0) return false;
+  const allowed = new Set(
+    (item.nodeIds.length > 0 ? item.nodeIds : ownedIds).filter((id) => !holdLines.has(id)),
+  );
+  return instance.rankNodeIds.every((nodeId) => allowed.has(nodeId));
 }
 
 export function profilePlan(input: PlanInput): ProfilePlan {
   const refusals: Refusal[] = [];
   const warnings: Warning[] = [];
   const holdLines = new Set(input.owned.filter((line) => line.hold).map((line) => line.nodeId));
-  const ownedIds = input.owned.map((line) => line.nodeId);
+  const ownedIds = input.owned.map((line) => line.nodeId).sort(compareCodePoints);
 
   // ── Who may apply ──
   for (const nodeId of ownedIds) {
@@ -173,18 +193,11 @@ export function profilePlan(input: PlanInput): ProfilePlan {
   const keptPerItem = new Map<string, number>();
   for (const instance of [...input.instances].sort((a, b) => compareCodePoints(a.id, b.id))) {
     if (!instance.desiredRunning) continue;
-    const onHoldLine = instance.rankNodeIds.some((id) => holdLines.has(id));
-    const item = onHoldLine
-      ? undefined
-      : input.items.find((candidate) => {
-          if (candidate.runtimeId !== instance.runtimeId) return false;
-          if (candidate.versionId !== instance.launchVersionId) return false;
-          if ((itemSlots.get(candidate.id) ?? 0) <= 0) return false;
-          const allowed = candidate.nodeIds.length > 0 ? new Set(candidate.nodeIds) : null;
-          return instance.rankNodeIds.every(
-            (nodeId) => !ownedIds.includes(nodeId) || !allowed || allowed.has(nodeId),
-          );
-        });
+    const item = input.items.find(
+      (candidate) =>
+        (itemSlots.get(candidate.id) ?? 0) > 0 &&
+        instanceServesItem(instance, candidate, ownedIds, holdLines),
+    );
     if (item) {
       itemSlots.set(item.id, (itemSlots.get(item.id) ?? 0) - 1);
       keptPerItem.set(item.id, (keptPerItem.get(item.id) ?? 0) + 1);
@@ -207,6 +220,7 @@ export function profilePlan(input: PlanInput): ProfilePlan {
     budgets.set(nodeId, {
       memoryGb: node.usableMemoryGb,
       gpuGb: node.usableGpuGb,
+      gpus: node.gpuCount,
       ports: new Set(),
     });
   }
@@ -221,6 +235,7 @@ export function profilePlan(input: PlanInput): ProfilePlan {
     const needs = claimNeeds(claim.resources);
     budget.memoryGb -= needs.memoryGb;
     budget.gpuGb -= needs.gpuGb;
+    budget.gpus -= needs.gpus;
   }
 
   // ── Starts ──
@@ -332,8 +347,7 @@ function fits(
   fixedPort: number | undefined,
 ): Fit {
   const needs = claimNeeds(resources);
-  if (needs.gpus > node.gpuCount && needs.gpus > 0)
-    return { ok: false, reason: "not_enough_memory" };
+  if (needs.gpus > budget.gpus) return { ok: false, reason: "not_enough_memory" };
   if (needs.memoryGb > budget.memoryGb + 1e-9 || needs.gpuGb > budget.gpuGb + 1e-9)
     return { ok: false, reason: "not_enough_memory" };
   const port = freePort(budget, node, fixedPort);
@@ -345,6 +359,7 @@ function take(budget: Budget, resources: RuntimeResource, port: number): void {
   const needs = claimNeeds(resources);
   budget.memoryGb -= needs.memoryGb;
   budget.gpuGb -= needs.gpuGb;
+  budget.gpus -= needs.gpus;
   budget.ports.add(port);
 }
 
@@ -440,7 +455,9 @@ function placeOne(
   }
 
   // Multi-node: every rank inside one fabric (`no_shared_fabric`), the head is rank 0.
-  const fabrics = input.fabrics.filter((fabric) => !launch.fabric || fabric.name === launch.fabric);
+  const fabrics = input.fabrics
+    .filter((fabric) => !launch.fabric || fabric.name === launch.fabric)
+    .sort((a, b) => compareCodePoints(a.name, b.name));
   let sawEnoughMembers = false;
   for (const fabric of fabrics) {
     const members = eligible.filter((node) => fabric.nodeIds.includes(node.id)).sort(byFreeMemory);
@@ -452,7 +469,12 @@ function placeOne(
         return [
           node.id,
           budget
-            ? { memoryGb: budget.memoryGb, gpuGb: budget.gpuGb, ports: new Set(budget.ports) }
+            ? {
+                memoryGb: budget.memoryGb,
+                gpuGb: budget.gpuGb,
+                gpus: budget.gpus,
+                ports: new Set(budget.ports),
+              }
             : null,
         ];
       }),
