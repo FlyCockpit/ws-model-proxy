@@ -10,6 +10,7 @@ import {
   relayProtocolAtLeast,
 } from "@ws-model-proxy/api/lib/relay-protocol-version";
 import { adapterRouteIsValid } from "@ws-model-proxy/api/lib/remote-engine-adapters";
+import { WSMP_MIN_CLI_VERSION } from "@ws-model-proxy/config/cli-device-login";
 import { normalizeReportedHostname } from "@ws-model-proxy/config/cli-device-name";
 import {
   deploymentJobOperatorValid,
@@ -58,10 +59,11 @@ type FileSpawnSpec = z.infer<typeof fileSpawnSpecSchema>;
 /**
  * Sent as `protocol.error` to a CLI whose hello is older than 2.4. Every
  * released wsmp prints `relay protocol error: <message>` and exits, so this
- * text is what the person sees. It names the protocol rather than a wsmp
- * version: the first release that speaks 2.4 is cut separately.
+ * text is what the person sees: it names both the first wsmp release that
+ * speaks the protocol and the protocol itself. The frame also carries
+ * `minCliVersion` for clients that read fields.
  */
-export const RELAY_UPGRADE_REQUIRED_MESSAGE = `This server requires a newer wsmp (relay protocol ${RELAY_MIN_PROTOCOL_VERSION}). Upgrade wsmp and restart it.`;
+export const RELAY_UPGRADE_REQUIRED_MESSAGE = `This server requires wsmp ${WSMP_MIN_CLI_VERSION} or newer (relay protocol ${RELAY_MIN_PROTOCOL_VERSION}). Upgrade wsmp and restart it.`;
 export const RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE =
   "This wsmp speaks a newer relay protocol than the server. Upgrade WS Model Proxy and restart the CLI.";
 export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v2";
@@ -1142,6 +1144,8 @@ export type RelayServerControlMessage =
       code: RelayProtocolErrorCode;
       message: string;
       supportedVersions: readonly RelayProtocolVersion[];
+      /** On `upgrade_cli`: the first wsmp release this server accepts. */
+      minCliVersion?: string;
       requestId?: string;
     }
   | {
@@ -1365,6 +1369,7 @@ export function protocolErrorMessage(input: {
     code: input.code,
     message: input.message,
     supportedVersions: RELAY_PROTOCOL_VERSIONS,
+    ...(input.code === "upgrade_cli" ? { minCliVersion: WSMP_MIN_CLI_VERSION } : {}),
     ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
   };
 }

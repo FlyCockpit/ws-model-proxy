@@ -383,6 +383,8 @@ path (never the URL signature).
 
 These commands work after the first public GitHub release.
 
+> **This server needs wsmp 0.4.0 or newer** (relay protocol 2.4). Until 0.4.0 is released, `releases/latest` and Homebrew still serve 0.3.x, which the server refuses at connect (`This server requires wsmp 0.4.0 or newer`). Until then, build the CLI from this repository: `cargo install --path apps/cli --bin wsmp`.
+
 **Shell:**
 
 ```sh

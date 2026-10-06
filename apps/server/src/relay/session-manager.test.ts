@@ -2689,6 +2689,8 @@ describe("relay terminal and exec sessions", () => {
         code,
         message,
         supportedVersions: [...RELAY_PROTOCOL_VERSIONS],
+        // Only a too-old CLI is told which wsmp release to install.
+        ...(code === "upgrade_cli" ? { minCliVersion: "0.4.0" } : {}),
       });
       expect(socket.closes).toEqual([{ code: 1002, reason: code }]);
       expect(db.cliDevice.upsert).not.toHaveBeenCalled();
