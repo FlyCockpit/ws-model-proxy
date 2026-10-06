@@ -25,6 +25,32 @@ pub struct Target {
     pub spec: RuntimeSpec,
 }
 
+/// Instances this node runs, by handle: rank 0 of every ready instance.
+pub fn instance_targets(
+    instances: &[(
+        crate::runtimes::executor::Job,
+        crate::protocol::frames::InstanceRecord,
+    )],
+) -> BTreeMap<String, Target> {
+    instances
+        .iter()
+        .filter(|(job, record)| {
+            job.rank == 0
+                && matches!(
+                    record.phase,
+                    crate::protocol::frames::InstancePhase::Ready
+                        | crate::protocol::frames::InstancePhase::Unhealthy
+                )
+        })
+        .filter_map(|(job, _)| {
+            let spec = job.parsed_spec()?;
+            spec.models.as_ref()?;
+            let endpoint = endpoint_for(&job.handle, &spec, job.base_url());
+            Some((job.handle.clone(), Target { endpoint, spec }))
+        })
+        .collect()
+}
+
 /// The always-on version a slug currently means: the last one received for
 /// its runtime (a newer push of the same runtime is appended).
 pub fn current_always_on(store: &Store) -> Vec<(&HeldVersion, RuntimeSpec)> {

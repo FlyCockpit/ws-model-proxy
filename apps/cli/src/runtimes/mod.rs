@@ -1,4 +1,9 @@
 //! Runtimes on this node: how handles resolve and what the inventory says.
 
 pub mod endpoints;
+pub mod executor;
+pub mod fabric;
 pub mod inventory;
+pub mod render;
+#[cfg(unix)]
+pub mod runner;

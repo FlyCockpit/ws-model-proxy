@@ -1029,7 +1029,7 @@ fn saturating_byte_counter(value: u64) -> u64 {
 }
 
 #[cfg(unix)]
-fn interface_addresses() -> BTreeMap<String, Vec<String>> {
+pub(crate) fn interface_addresses() -> BTreeMap<String, Vec<String>> {
     let mut addresses = BTreeMap::<String, Vec<String>>::new();
     let Ok(interfaces) = nix::ifaddrs::getifaddrs() else {
         return addresses;
@@ -1054,7 +1054,7 @@ fn interface_addresses() -> BTreeMap<String, Vec<String>> {
 }
 
 #[cfg(not(unix))]
-fn interface_addresses() -> BTreeMap<String, Vec<String>> {
+pub(crate) fn interface_addresses() -> BTreeMap<String, Vec<String>> {
     BTreeMap::new()
 }
 

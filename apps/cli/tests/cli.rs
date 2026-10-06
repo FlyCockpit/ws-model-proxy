@@ -1688,6 +1688,82 @@ mod signal_shutdown {
         assert!(!stored.contains(SECRET));
     }
 
+    /// A startable definition is held; a job naming it with a value outside
+    /// the node's rules is refused before admission, and a job naming a
+    /// version the node does not hold is `definition_missing`.
+    #[test]
+    fn runtime_jobs_render_only_from_held_definitions() {
+        let mut setup = start_relay(&["run"]);
+        setup.relay.next_text("hello");
+        let mut socket = setup
+            .relay
+            .socket
+            .recv_timeout(Duration::from_secs(5))
+            .expect("relay socket");
+        hello_ok(&mut socket);
+        setup.relay.next_text("runtime.inventory");
+        let spec = json!({
+            "api": "openai", "engine": "vllm", "modelType": "llm",
+            "models": [{ "id": "m" }],
+            "launch": {
+                "management": "process", "groupSize": 1,
+                "resources": [{ "kind": "none" }], "labels": [],
+                "commands": [{ "start": "vllm serve m --host 127.0.0.1 --port {{port}}", "stop": "true" }],
+                "readiness": { "path": "/health", "expectedStatus": 200, "timeoutMs": 60000 },
+                "health": { "intervalMs": 30000, "failureThreshold": 3, "successThreshold": 1 }
+            }
+        });
+        let hash = wsmp::protocol::canonical::launch_hash(&spec).expect("hash");
+        let commands = json!([]);
+        let fabrics = json!([]);
+        write_text(
+            &mut socket,
+            &json!({
+                "type": "runtime.define", "opId": "op1", "chunkIndex": 0, "final": true,
+                "put": [{
+                    "runtimeId": "rt1", "versionId": "vr1", "launchHash": hash,
+                    "kind": "startable", "slug": "qwen", "spec": spec
+                }],
+                "node": {
+                    "portRange": [30000, 30999],
+                    "metricCommands": {
+                        "hash": wsmp::protocol::canonical::canonical_sha256(&commands).expect("hash"),
+                        "commands": commands
+                    },
+                    "fabrics": {
+                        "hash": wsmp::protocol::canonical::canonical_sha256(&fabrics).expect("hash"),
+                        "sets": fabrics
+                    },
+                    "commandMaxMs": 86_400_000
+                }
+            })
+            .to_string(),
+        );
+        let defined = setup.relay.next_text("runtime.define.result");
+        assert_eq!(defined["results"][0]["status"], "applied", "{defined}");
+        assert_eq!(defined["heldPortRange"], json!([30000, 30999]));
+        let job = |step: &str, version: &str, port: u16| {
+            json!({
+                "type": "runtime.job", "stepId": step, "instanceId": "in1",
+                "runtimeId": "rt1", "launchVersionId": version, "launchHash": hash,
+                "generation": 1, "rank": 0, "nnodes": 1, "phase": "start",
+                "handle": "i-abcdefabcdef", "unitName": "wsmp-i-abcdefabcdef-r0",
+                "placeholders": { "port": port }, "timeoutMs": 60_000,
+                "ownerEpoch": "epoch:1", "intentHash": "a".repeat(64)
+            })
+            .to_string()
+        };
+        write_text(&mut socket, &job("st1", "vr1", 22_000));
+        let refused = setup.relay.next_text("runtime.job.result");
+        assert_eq!(refused["error"], "bad_job", "{refused}");
+        assert_eq!(refused["detail"], "placeholders.port");
+        write_text(&mut socket, &job("st2", "vr-not-held", 30_001));
+        let missing = setup.relay.next_text("runtime.job.result");
+        assert_eq!(missing["error"], "definition_missing", "{missing}");
+        signal(setup.child.id(), "TERM");
+        let _ = wait_for_exit(&mut setup.child);
+    }
+
     /// `trust.lower` sticks: persisted, frozen, reported; defines are refused.
     #[test]
     fn trust_lower_persists_freezes_and_refuses_defines() {

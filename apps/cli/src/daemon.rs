@@ -44,8 +44,8 @@ use crate::media::{
 #[cfg(test)]
 use crate::protocol::decode_binary_frame;
 use crate::protocol::frames::{
-    CountMethod, HttpMethod, JobError, JobStatus, RelayUsage, SecretRefusal, SecretStatus,
-    TrustValue,
+    CountMethod, HttpMethod, InstancePhase, InstanceRecord, JobError, JobPhase, JobStatus,
+    RelayUsage, SecretRefusal, SecretStatus, TrustValue,
 };
 use crate::protocol::{
     FrameFault, NodeBinaryMetadata, NodeFrame, ProtocolErrorCode,
@@ -57,6 +57,7 @@ use crate::protocol::{
 use crate::relay_bus::{FromWorker, WsFrame};
 use crate::runtime_store::{Defines, Store};
 use crate::runtimes::endpoints::Target;
+use crate::runtimes::executor::Job;
 use crate::sessions::{
     DEFAULT_COMMAND_MAX, ExecRegistry, OutboundFrame, TermHandshake, TerminalRegistry,
 };
@@ -710,6 +711,8 @@ fn wait_for_reconnect(
 struct NodeRuntimes {
     store: Store,
     targets: BTreeMap<String, Target>,
+    /// Every instance rank on this node, as last observed.
+    instances: Vec<(Job, InstanceRecord)>,
 }
 
 impl NodeRuntimes {
@@ -721,8 +724,50 @@ impl NodeRuntimes {
             );
             Store::default()
         });
-        let targets = crate::runtimes::endpoints::always_on_targets(&store);
-        Self { store, targets }
+        let mut runtimes = Self {
+            store,
+            targets: BTreeMap::new(),
+            instances: Vec::new(),
+        };
+        runtimes.retarget();
+        runtimes
+    }
+
+    /// Reload the held set for `trust`, keeping the observed instances.
+    fn reload(&mut self, trust: TrustValue) {
+        let instances = std::mem::take(&mut self.instances);
+        *self = Self::load(trust);
+        self.instances = instances;
+        self.retarget();
+    }
+
+    fn set_instances(&mut self, instances: Vec<(Job, InstanceRecord)>) {
+        self.instances = instances;
+        self.retarget();
+    }
+
+    fn retarget(&mut self) {
+        let mut targets = crate::runtimes::endpoints::always_on_targets(&self.store);
+        targets.extend(crate::runtimes::endpoints::instance_targets(
+            &self.instances,
+        ));
+        self.targets = targets;
+    }
+
+    /// Ports live instances hold, by the runtime they run.
+    fn busy_ports(&self) -> BTreeMap<u16, String> {
+        self.instances
+            .iter()
+            .filter(|(_, record)| record.phase != InstancePhase::Stopped)
+            .map(|(job, _)| (job.port, job.runtime_id.clone()))
+            .collect()
+    }
+
+    fn instance_records(&self) -> Vec<InstanceRecord> {
+        self.instances
+            .iter()
+            .map(|(_, record)| record.clone())
+            .collect()
     }
 
     fn endpoints(&self) -> Vec<crate::config::EndpointConfig> {
@@ -748,6 +793,8 @@ struct Session {
     telemetry: Option<crate::telemetry::Telemetry>,
     defines: Defines,
     runtimes: NodeRuntimes,
+    #[cfg(unix)]
+    runner: Option<crate::runtimes::runner::Runner>,
 }
 
 /// The hello `features`, with the names of the node's secrets.
@@ -824,6 +871,15 @@ fn run_relay_session(
         telemetry: None,
         defines: Defines::default(),
         runtimes: NodeRuntimes::load(startup.trust_value()),
+        #[cfg(unix)]
+        runner: crate::runtimes::runner::Runner::start()
+            .inspect_err(|error| {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "runtime steps are unavailable"
+                );
+            })
+            .ok(),
     };
 
     let server_url = config.server_url.as_deref().unwrap_or_default();
@@ -860,6 +916,9 @@ fn run_relay_session(
             break 'session Err(RelaySessionError::Shutdown(signal));
         }
         if let Err(error) = drain_worker_output(&mut socket, &worker_rx, &mut session) {
+            break Err(error);
+        }
+        if let Err(error) = drain_runner(&mut socket, &mut session) {
             break Err(error);
         }
         let now = Instant::now();
@@ -1192,7 +1251,7 @@ where
         }
         ServerFrame::RuntimeDefine { .. } => {
             let runtime_hosts = startup.runtime_hosts();
-            let busy_ports = BTreeMap::new();
+            let busy_ports = session.runtimes.busy_ports();
             let ctx = crate::runtime_store::DefineContext {
                 trust: startup.trust_value(),
                 runtime_hosts: &runtime_hosts,
@@ -1203,7 +1262,7 @@ where
                 Ok(outcome) => {
                     send_control(socket, &outcome.answer, "answering a runtime definition")?;
                     if outcome.changed {
-                        session.runtimes = NodeRuntimes::load(startup.trust_value());
+                        session.runtimes.reload(startup.trust_value());
                         send_inventory(session);
                     }
                 }
@@ -1242,35 +1301,7 @@ where
             );
         }
         ServerFrame::RuntimeJob(job) => {
-            // Jobs render from held definitions only; nothing is held yet, so
-            // the rank fails before admission and the server releases it.
-            let error = if startup.full_control() {
-                JobError::DefinitionMissing
-            } else {
-                JobError::DefinitionFrozen
-            };
-            tracing::warn!(
-                step_id = job.step_id,
-                ?error,
-                "refusing a runtime job: no definition is held"
-            );
-            send_control(
-                socket,
-                &NodeFrame::RuntimeJobResult {
-                    step_id: job.step_id,
-                    instance_id: job.instance_id,
-                    rank: job.rank,
-                    intent_hash: job.intent_hash,
-                    owner_epoch: job.owner_epoch,
-                    status: JobStatus::Failed,
-                    stopped: true,
-                    error: Some(error),
-                    detail: None,
-                    terminal_id: None,
-                    exit_code: None,
-                },
-                "refusing a runtime job",
-            )?;
+            handle_runtime_job(socket, startup, session, *job)?;
         }
         ServerFrame::SecretSet(secret) => {
             let result = crate::secrets::set(startup.full_control(), &secret.name, &secret.value);
@@ -1552,7 +1583,7 @@ where
         .iter()
         .any(|change| matches!(change, NodeChange::Lowered | NodeChange::Raised))
     {
-        session.runtimes = NodeRuntimes::load(startup.trust_value());
+        session.runtimes.reload(startup.trust_value());
     }
     if !session.registered {
         return Ok(());
@@ -1567,12 +1598,149 @@ where
     )
 }
 
+/// `runtime.job`: render from the held/frozen definition and run it off this
+/// loop, or refuse before admission. A stop or check of an instance whose
+/// version the server since dropped runs from the instance's own record.
+fn handle_runtime_job<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    startup: &TerminalStartup,
+    session: &mut Session,
+    job: crate::protocol::frames::RuntimeJob,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    let refusal = |error: JobError, detail: Option<String>| NodeFrame::RuntimeJobResult {
+        step_id: job.step_id.clone(),
+        instance_id: job.instance_id.clone(),
+        rank: job.rank,
+        intent_hash: job.intent_hash.clone(),
+        owner_epoch: job.owner_epoch.clone(),
+        status: JobStatus::Failed,
+        stopped: false,
+        error: Some(error),
+        detail,
+        terminal_id: None,
+        exit_code: None,
+    };
+    let facts = crate::runtimes::render::NodeFacts::current();
+    let rendered = match crate::runtimes::render::render(
+        &job,
+        startup.trust_value(),
+        &session.runtimes.store,
+        &facts,
+    ) {
+        Ok(rendered) => Ok(rendered),
+        Err(refused)
+            if matches!(
+                refused.error,
+                JobError::DefinitionMissing | JobError::DefinitionFrozen
+            ) && matches!(
+                job.phase,
+                JobPhase::Stop | JobPhase::Status | JobPhase::Health | JobPhase::Readiness
+            ) =>
+        {
+            session
+                .runtimes
+                .instances
+                .iter()
+                .find(|(known, _)| {
+                    known.instance_id == job.instance_id
+                        && known.rank == job.rank
+                        && known.launch_hash == job.launch_hash
+                        && known.version_id == job.launch_version_id
+                        && known.unit_name == job.unit_name
+                })
+                .map(|(known, _)| Job {
+                    step_id: job.step_id.clone(),
+                    action: job.phase,
+                    intent_hash: job.intent_hash.clone(),
+                    owner_epoch: job.owner_epoch.clone(),
+                    timeout_ms: job.timeout_ms.clamp(1, 3_600_000),
+                    command: String::new(),
+                    ..known.clone()
+                })
+                .ok_or(refused)
+        }
+        Err(refused) => Err(refused),
+    };
+    let rendered = match rendered {
+        Ok(rendered) => rendered,
+        Err(refused) => {
+            tracing::warn!(
+                step_id = job.step_id,
+                error = ?refused.error,
+                detail = refused.detail.as_deref().unwrap_or(""),
+                "refused a runtime job before admission"
+            );
+            return send_control(
+                socket,
+                &refusal(refused.error, refused.detail),
+                "refusing a runtime job",
+            );
+        }
+    };
+    #[cfg(unix)]
+    {
+        let submitted = match session.runner.as_ref() {
+            Some(runner) => runner.submit(rendered),
+            None => Err(anyhow::anyhow!("runtime steps are unavailable")),
+        };
+        if let Err(error) = submitted {
+            tracing::warn!(error = %format!("{error:#}"), "could not run a runtime job");
+            return send_control(
+                socket,
+                &refusal(JobError::SessionDisconnected, None),
+                "refusing a runtime job",
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = rendered;
+        send_control(
+            socket,
+            &refusal(JobError::ExecutionMechanismUnavailable, None),
+            "refusing a runtime job",
+        )
+    }
+}
+
+/// Step results and instance observations from the runner.
+fn drain_runner<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    session: &mut Session,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    #[cfg(unix)]
+    while let Some(update) = session
+        .runner
+        .as_ref()
+        .and_then(|runner| runner.try_update())
+    {
+        session.runtimes.set_instances(update.instances);
+        if !session.registered {
+            continue;
+        }
+        if let Some(result) = &update.result {
+            send_control(socket, result, "sending a runtime job result")?;
+        }
+        send_inventory(session);
+    }
+    #[cfg(not(unix))]
+    let _ = (socket, session);
+    Ok(())
+}
+
 /// Send a fresh `runtime.inventory` (built off this loop).
 fn send_inventory(session: &Session) {
     crate::runtimes::inventory::spawn(
         session.worker_tx.clone(),
         session.runtimes.store.clone(),
-        Vec::new(),
+        session.runtimes.instance_records(),
     );
 }
 
