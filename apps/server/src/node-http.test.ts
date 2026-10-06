@@ -87,8 +87,8 @@ describe("node bootstrap HTTP", () => {
     );
     expect(text.startsWith("#!/bin/sh\n")).toBe(true);
     // A deployment pins the exact commit (WMP_CLI_SOURCE_REV) instead of following the branch.
-    const pinned = installScript("https://proxy.example.com", "0123abc");
-    expect(pinned).toContain("--rev '0123abc' --locked");
+    const pinned = installScript("https://proxy.example.com", "a".repeat(40));
+    expect(pinned).toContain(`--rev '${"a".repeat(40)}' --locked`);
     expect(pinned).not.toContain("--branch");
   });
 

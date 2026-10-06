@@ -678,14 +678,18 @@ ALTER TABLE runtime_operation ADD CONSTRAINT runtime_operation_shape CHECK (
 CREATE OR REPLACE FUNCTION enforce_runtime_operation_profile()
 RETURNS trigger LANGUAGE plpgsql AS $runtime_operation_profile$
 BEGIN
-  IF NEW.kind = 'PROFILE_APPLY' AND NEW."profileId" IS NULL THEN
+  IF NEW.kind = 'PROFILE_APPLY' AND NEW."profileId" IS NULL
+     AND (TG_OP = 'INSERT'
+          OR OLD.kind IS DISTINCT FROM NEW.kind
+          -- The profile's own delete (FK SET NULL) runs after its row is gone.
+          OR EXISTS (SELECT 1 FROM profile WHERE id = OLD."profileId")) THEN
     RAISE EXCEPTION 'a profile apply names its profile' USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
 END;
 $runtime_operation_profile$;
 DROP TRIGGER IF EXISTS runtime_operation_profile ON runtime_operation;
-CREATE TRIGGER runtime_operation_profile BEFORE INSERT ON runtime_operation
+CREATE TRIGGER runtime_operation_profile BEFORE INSERT OR UPDATE OF kind, "profileId" ON runtime_operation
 FOR EACH ROW EXECUTE FUNCTION enforce_runtime_operation_profile();
 
 -- One model on one instance, or one provider model.
