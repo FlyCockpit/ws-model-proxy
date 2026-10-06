@@ -1497,7 +1497,10 @@ pub enum RelayFailure {
     Transport,
     Timeout,
     Disconnected,
+    // snake_case would spell these `upstream5xx`; the server expects an underscore.
+    #[serde(rename = "upstream_5xx")]
     Upstream5xx,
+    #[serde(rename = "upstream_4xx")]
     Upstream4xx,
     UnsupportedCapability,
     NotFound,
@@ -2615,6 +2618,18 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn upstream_failures_use_the_server_spelling() {
+        assert_eq!(
+            serde_json::to_value(super::RelayFailure::Upstream5xx).unwrap(),
+            "upstream_5xx"
+        );
+        assert_eq!(
+            serde_json::to_value(super::RelayFailure::Upstream4xx).unwrap(),
+            "upstream_4xx"
+        );
+    }
+
     #[test]
     fn deployment_commit_ack_decoder_is_strict_and_bounded() {
         let valid =
