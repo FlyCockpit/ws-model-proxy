@@ -65,6 +65,7 @@ const request = {
   errorClass: null,
   httpStatusCode: 200,
   attemptCount: 1,
+  resourceOwnerUserId: "owner",
 };
 
 beforeEach(() => mockReset(db));
@@ -91,6 +92,24 @@ describe("request log", () => {
     expect(JSON.stringify(db.relayRequest.findMany.mock.calls[1]?.[0]?.where)).toContain('"lt"');
   });
 
+  it("hides where another owner's pool ran my request, and keeps placement filters to mine", async () => {
+    db.relayRequest.findMany.mockResolvedValue([
+      {
+        ...request,
+        resourceOwnerUserId: "someone-else",
+        selectedNodeId: "their-node",
+        selectedProviderModelId: "their-model",
+      },
+    ] as never);
+    db.pool.findMany.mockResolvedValue([] as never);
+    const page = await client().requests.list({ limit: 10 });
+    expect(page.items[0]).toMatchObject({ nodeId: null, providerModelId: null, route: null });
+    await client().requests.list({ limit: 10, nodeId: "their-node" });
+    expect(JSON.stringify(db.relayRequest.findMany.mock.calls[1]?.[0]?.where)).not.toContain(
+      '"userId":"owner"',
+    );
+  });
+
   it("refuses a forged cursor", async () => {
     await expect(client().requests.list({ limit: 10, cursor: "bm9wZQ" })).rejects.toMatchObject({
       code: "BAD_REQUEST",
@@ -107,6 +126,7 @@ describe("request log", () => {
     expect(db.relayRequest.deleteMany.mock.calls[0]?.[0]?.where).toMatchObject({
       userId: "owner",
       status: { not: "PENDING" },
+      OR: [{ resourceOwnerUserId: "owner" }, { resourceOwnerUserId: null }],
     });
   });
 });

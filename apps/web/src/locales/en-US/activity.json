@@ -34,7 +34,7 @@
     "loadFailed": "Could not load the request log.",
     "clear": "Clear my log",
     "clearTitle": "Delete your request log?",
-    "clearDescription": "Every finished request you made is deleted (requests still running stay). Requests other people made to your pools stay in their logs.",
+    "clearDescription": "Every finished request you made to your own pools and models is deleted (requests still running stay). Requests you made to other people's pools stay in their owners' logs.",
     "cleared_one": "{{count}} request deleted.",
     "cleared_other": "{{count}} requests deleted."
   },

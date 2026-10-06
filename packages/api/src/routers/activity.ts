@@ -76,6 +76,7 @@ const requestSelect = {
   errorClass: true,
   httpStatusCode: true,
   attemptCount: true,
+  resourceOwnerUserId: true,
 } satisfies Prisma.RelayRequestSelect;
 
 const requests = {
@@ -91,14 +92,20 @@ const requests = {
           })
         ).map((version) => version.id)
       : null;
+    // Filters on where a request ran (runtime, version, node) only ever match requests to the
+    // caller's own resources, so they cannot probe another owner's ids.
+    const placementFilter =
+      input.runtimeId !== undefined || input.versionId !== undefined || input.nodeId !== undefined;
     const where: Prisma.RelayRequestWhereInput = {
       AND: [
-        { OR: [{ userId }, { resourceOwnerUserId: userId }] },
+        placementFilter
+          ? { resourceOwnerUserId: userId }
+          : { OR: [{ userId }, { resourceOwnerUserId: userId }] },
         afterCursor(cursor),
+        input.versionId ? { selectedVersionId: input.versionId } : {},
+        versionIds ? { selectedVersionId: { in: versionIds } } : {},
         {
           ...(input.poolId ? { poolId: input.poolId } : {}),
-          ...(input.versionId ? { selectedVersionId: input.versionId } : {}),
-          ...(versionIds ? { selectedVersionId: { in: versionIds } } : {}),
           ...(input.nodeId ? { selectedNodeId: input.nodeId } : {}),
           ...(input.status ? { status: input.status } : {}),
           ...(input.source ? { source: input.source } : {}),
@@ -123,35 +130,40 @@ const requests = {
     const callable = new Map(
       pools.map((pool) => [pool.id, callableIdOf(pool.User.slug, pool.slug)]),
     );
-    const items: RequestRow[] = page.map((row) => ({
-      id: row.id,
-      createdAt: row.createdAt.toISOString(),
-      source: row.source,
-      status: row.status,
-      poolId: row.poolId,
-      callableId: row.poolId
-        ? `${callable.get(row.poolId) ?? row.poolId}${row.external ? ":external" : ""}`
-        : null,
-      external: row.external,
-      operation: row.operation,
-      route: row.route && ROUTES.has(row.route) ? (row.route as RequestRow["route"]) : null,
-      instanceId: row.selectedInstanceId,
-      versionId: row.selectedVersionId,
-      nodeId: row.selectedNodeId,
-      providerModelId: row.selectedProviderModelId,
-      queueWaitMs: row.queueWaitMs,
-      ttftMs: row.firstClientByteAt
-        ? Math.max(0, row.firstClientByteAt.getTime() - row.startedAt.getTime())
-        : null,
-      durationMs: row.durationMs,
-      promptTokens: row.promptTokens,
-      completionTokens: row.completionTokens,
-      cacheReadTokens: row.cacheReadTokens,
-      rejection: row.rejection,
-      errorClass: row.errorClass,
-      httpStatusCode: row.httpStatusCode,
-      attempts: row.attemptCount,
-    }));
+    const items: RequestRow[] = page.map((row) => {
+      // Requests to someone else's pool: where it ran is that owner's business.
+      const own = row.resourceOwnerUserId === userId || row.resourceOwnerUserId === null;
+      return {
+        id: row.id,
+        createdAt: row.createdAt.toISOString(),
+        source: row.source,
+        status: row.status,
+        poolId: row.poolId,
+        callableId: row.poolId
+          ? `${callable.get(row.poolId) ?? row.poolId}${row.external ? ":external" : ""}`
+          : null,
+        external: row.external,
+        operation: row.operation,
+        route:
+          own && row.route && ROUTES.has(row.route) ? (row.route as RequestRow["route"]) : null,
+        instanceId: own ? row.selectedInstanceId : null,
+        versionId: own ? row.selectedVersionId : null,
+        nodeId: own ? row.selectedNodeId : null,
+        providerModelId: own ? row.selectedProviderModelId : null,
+        queueWaitMs: row.queueWaitMs,
+        ttftMs: row.firstClientByteAt
+          ? Math.max(0, row.firstClientByteAt.getTime() - row.startedAt.getTime())
+          : null,
+        durationMs: row.durationMs,
+        promptTokens: row.promptTokens,
+        completionTokens: row.completionTokens,
+        cacheReadTokens: row.cacheReadTokens,
+        rejection: row.rejection,
+        errorClass: row.errorClass,
+        httpStatusCode: row.httpStatusCode,
+        attempts: row.attemptCount,
+      };
+    });
     const last = page.at(-1);
     return {
       items,
@@ -161,11 +173,16 @@ const requests = {
 
   delete: contractProcedure(c.requests.delete).handler(async ({ context, input }) => {
     const userId = context.session.user.id;
-    // Only the caller's own requests, and never one still in flight (its attempts and spend
-    // reservations are live hot-path state).
-    const where: Prisma.RelayRequestWhereInput = {
+    // Only the caller's own requests to the caller's own resources (a request to someone
+    // else's pool stays in that owner's log), and never one still in flight (its attempts and
+    // spend reservations are live hot-path state).
+    const ownRows: Prisma.RelayRequestWhereInput = {
       userId,
       status: { not: "PENDING" },
+      OR: [{ resourceOwnerUserId: userId }, { resourceOwnerUserId: null }],
+    };
+    const where: Prisma.RelayRequestWhereInput = {
+      ...ownRows,
       ...(input.ids ? { id: { in: input.ids } } : {}),
       ...(input.before ? { createdAt: { lt: new Date(input.before) } } : {}),
     };
@@ -177,7 +194,7 @@ const requests = {
     });
     if (ids.length === 0) return { deleted: 0 };
     const deleted = await prisma.relayRequest.deleteMany({
-      where: { id: { in: ids.map((row) => row.id) }, userId, status: { not: "PENDING" } },
+      where: { id: { in: ids.map((row) => row.id) }, ...ownRows },
     });
     return { deleted: deleted.count };
   }),

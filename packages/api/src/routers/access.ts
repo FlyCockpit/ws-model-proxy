@@ -468,6 +468,19 @@ async function writeInvite(
         select: shareInviteSelect,
       });
     }
+    // An expired invite still holds the one-pending slot (the partial unique index ignores
+    // expiry): withdraw it so the address can be invited again.
+    await tx.shareInvite.updateMany({
+      where: {
+        poolId: args.poolId,
+        email: args.email,
+        ownerUserId: args.ownerUserId,
+        acceptedAt: null,
+        revokedAt: null,
+        expiresAt: { lte: now },
+      },
+      data: { revokedAt: now },
+    });
     const pending = await tx.shareInvite.findFirst({
       where: { poolId: args.poolId, email: args.email, ...pendingInviteWhere(now) },
       select: { id: true },

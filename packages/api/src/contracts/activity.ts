@@ -135,7 +135,7 @@ export const activityContract = {
         })
         .strict(),
       pageOf(commandLogRowSchema),
-      "Command log: commands agents and people ran on your nodes, running ones first by start time (no text, no output).",
+      "Command log: commands agents and people ran on your nodes, newest first (no text, no output).",
     ),
   },
   overview: {

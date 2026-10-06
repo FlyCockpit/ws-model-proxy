@@ -114,10 +114,42 @@ const queuedRow = {
 
 beforeEach(() => {
   mockReset(db);
+  db.$transaction.mockImplementation((async (work: (tx: typeof db) => unknown) =>
+    work(db)) as never);
 });
 
 describe("node commands", () => {
   const runInput = { nodeId: "node1", command: "ls -la", confirm: "RUN" as const };
+
+  it("refuses a browser call without the CSRF header (a cross-site form post)", async () => {
+    const forged: CallerAuth = { ...PERSON, csrfVerified: false };
+    await expect(client(forged, operator()).commands.run(runInput)).rejects.toMatchObject({
+      code: "FORBIDDEN",
+    });
+    await expect(
+      client(forged, operator()).queued.enqueue({ nodeId: "node1", command: "ls", note: "x" }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(
+      client(forged, operator()).commands.get({ commandId: commandRow.id, cancel: true }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(db.node.findFirst).not.toHaveBeenCalled();
+    expect(db.nodeCommand.findFirst).not.toHaveBeenCalled();
+  });
+
+  it("audits a command the node never started as failed to start", async () => {
+    const ops = operator();
+    ops.startCommand.mockRejectedValue(new Error("socket closed"));
+    db.node.findFirst.mockResolvedValue(fullNode as never);
+    db.nodeCommand.create.mockResolvedValue(commandRow as never);
+    db.nodeCommand.updateMany.mockResolvedValue({ count: 1 });
+    await expect(client(FULL_AGENT, ops).commands.run(runInput)).rejects.toMatchObject({
+      data: { reason: "node_offline" },
+    });
+    expect(db.nodeAuditEvent.create.mock.calls[0]?.[0].data).toMatchObject({
+      outcome: "failed",
+      reason: "start_failed",
+    });
+  });
 
   it("refuses a Read-only agent before anything runs", async () => {
     await expect(client(READ_AGENT, operator()).commands.run(runInput)).rejects.toMatchObject({

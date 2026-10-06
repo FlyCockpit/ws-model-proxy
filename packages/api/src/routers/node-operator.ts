@@ -72,8 +72,16 @@ function actorOf(auth: CallerAuth | { kind: "anonymous" }): {
   return { actor: "USER", agentTokenId: null };
 }
 
-/** Agents need a Full token for anything that runs or queues a command. */
+/**
+ * Agents need a Full token for anything that runs or queues a command, and a browser call must
+ * carry the verified CSRF header: a cookie without it is not a person (`agentRulesApply`) and
+ * could be a cross-site form post. TODO(contract): list these agent mutations in
+ * CSRF_REQUIRED_PROCEDURES so the RPC layer refuses them first.
+ */
 function assertAgentMayWrite(auth: CallerAuth | { kind: "anonymous" }): void {
+  if (auth.kind === "cookie_session" && !auth.csrfVerified) {
+    throw new ORPCError("FORBIDDEN", { message: "This request is missing its CSRF header." });
+  }
   if (
     (auth.kind === "agent_token" || auth.kind === "oauth_access_token") &&
     auth.level !== "FULL"
@@ -192,6 +200,7 @@ async function settleCommand(
   state: Exclude<CommandState, "RUNNING">,
   exitCode: number | null | undefined,
   finishedAtHint: Date | undefined,
+  audit?: { outcome: "failed"; reason: string },
 ): Promise<CommandRow> {
   const finishedAt = new Date(
     Math.max(row.startedAt.getTime(), (finishedAtHint ?? new Date()).getTime()),
@@ -204,13 +213,15 @@ async function settleCommand(
     exitCode <= 255
       ? exitCode
       : null;
-  const settled = await prisma.nodeCommand.updateMany({
-    where: { id: row.id, state: "RUNNING" },
-    data: { state, exitCode: storedExit, finishedAt },
-  });
-  if (settled.count === 1) {
-    const { outcome, reason } = AUDIT_OUTCOME[state];
-    await prisma.nodeAuditEvent.create({
+  // The state change and its audit event commit together, exactly once.
+  const settledHere = await prisma.$transaction(async (tx) => {
+    const settled = await tx.nodeCommand.updateMany({
+      where: { id: row.id, state: "RUNNING" },
+      data: { state, exitCode: storedExit, finishedAt },
+    });
+    if (settled.count !== 1) return false;
+    const { outcome, reason } = audit ?? AUDIT_OUTCOME[state];
+    await tx.nodeAuditEvent.create({
       data: {
         userId: row.userId,
         nodeId: row.nodeId,
@@ -225,8 +236,9 @@ async function settleCommand(
         finishedAt,
       },
     });
-    return { ...row, state, exitCode: storedExit, finishedAt };
-  }
+    return true;
+  });
+  if (settledHere) return { ...row, state, exitCode: storedExit, finishedAt };
   const current = await prisma.nodeCommand.findUnique({
     where: { id: row.id },
     select: commandSelect,
@@ -294,7 +306,10 @@ const commands = {
         timeoutMs,
       });
     } catch (error) {
-      await settleCommand(row, "FAILED", null, undefined);
+      await settleCommand(row, "FAILED", null, undefined, {
+        outcome: "failed",
+        reason: "start_failed",
+      });
       throw error instanceof ORPCError
         ? error
         : refuse(

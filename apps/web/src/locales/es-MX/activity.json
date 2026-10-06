@@ -34,7 +34,7 @@
     "loadFailed": "No se pudo cargar el registro de solicitudes.",
     "clear": "Borrar mi registro",
     "clearTitle": "¿Borrar tu registro de solicitudes?",
-    "clearDescription": "Se borra cada solicitud terminada que hiciste (las que siguen en curso se quedan). Las solicitudes que otras personas hicieron a tus pools se quedan en sus registros.",
+    "clearDescription": "Se borra cada solicitud terminada que hiciste a tus propios pools y modelos (las que siguen en curso se quedan). Las solicitudes que hiciste a pools de otras personas se quedan en los registros de sus dueños.",
     "cleared_one": "{{count}} solicitud borrada.",
     "cleared_other": "{{count}} solicitudes borradas."
   },

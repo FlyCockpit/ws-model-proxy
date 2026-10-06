@@ -489,6 +489,25 @@ describe("shares", () => {
     );
   });
 
+  it("withdraws an expired invite to the same address before inviting again", async () => {
+    db.pool.findFirst.mockResolvedValue(pool as never);
+    db.user.findFirst.mockResolvedValue(null);
+    db.shareInvite.findFirst.mockResolvedValue(null);
+    db.shareInvite.count.mockResolvedValue(0);
+    db.shareInvite.create.mockResolvedValue(inviteRow as never);
+    await client().shares.create(input);
+    expect(db.shareInvite.updateMany.mock.calls[0]?.[0]).toMatchObject({
+      where: {
+        poolId: "pool1",
+        email: "friend@example.test",
+        ownerUserId: "owner",
+        acceptedAt: null,
+        revokedAt: null,
+      },
+      data: { revokedAt: expect.any(Date) },
+    });
+  });
+
   it("refuses a second pending invite to the same e-mail and pool", async () => {
     db.pool.findFirst.mockResolvedValue(pool as never);
     db.user.findFirst.mockResolvedValue(null);
