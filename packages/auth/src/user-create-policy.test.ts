@@ -180,6 +180,42 @@ describe("resolveUserCreatePolicy", () => {
     }
   });
 
+  it("allows a public sign-up with a pending invite token when signup is disabled, as user", () => {
+    expect(
+      resolveUserCreatePolicy({
+        signupEnabled: false,
+        userCount: 2,
+        emailConfigured: true,
+        inviteTokenPending: true,
+        requestedRole: "admin",
+        contextPath: "/sign-up/email",
+      }),
+    ).toEqual({ role: "user" });
+  });
+
+  it("a pending invite token opens no other creation path, and no token opens nothing", () => {
+    for (const contextPath of ["/unknown", "/sign-in/email", "/sign-up", "", undefined, null]) {
+      expect(() =>
+        resolveUserCreatePolicy({
+          signupEnabled: false,
+          userCount: 2,
+          emailConfigured: false,
+          inviteTokenPending: true,
+          contextPath,
+        }),
+      ).toThrow(SIGNUP_DISABLED_MESSAGE);
+    }
+    expect(() =>
+      resolveUserCreatePolicy({
+        signupEnabled: false,
+        userCount: 2,
+        emailConfigured: false,
+        inviteTokenPending: false,
+        contextPath: "/sign-up/email",
+      }),
+    ).toThrow(SIGNUP_DISABLED_MESSAGE);
+  });
+
   it("allows admin create-user when signup is disabled", () => {
     expect(
       resolveUserCreatePolicy({

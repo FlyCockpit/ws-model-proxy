@@ -4,6 +4,7 @@ import {
   slugifyForwarderSeed,
   validateForwarderSlug,
 } from "@ws-model-proxy/config/forwarder-identifiers";
+import { shareInviteTokenFromHeaders } from "@ws-model-proxy/config/share-invite";
 import prisma from "@ws-model-proxy/db";
 import { deleteUserDurably } from "@ws-model-proxy/db/parent-deletion";
 import { env } from "@ws-model-proxy/env/server";
@@ -23,14 +24,22 @@ import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
 import {
+  acceptClaimedShareInviteToken,
   acceptShareInvitesForProvenEmail,
+  claimShareInviteToken,
   isEmailVerificationPath,
+  isPendingShareInviteToken,
 } from "./share-invite-acceptance";
 import { resolveSignupLocale } from "./signup-locale";
-import { getSignupAccessState, resolveBootstrapAdminIdentity } from "./signup-policy";
+import {
+  getSignupAccessState,
+  resolveBootstrapAdminIdentity,
+  SignupDisabledError,
+} from "./signup-policy";
 import { notifyUserBanned } from "./user-ban-listeners";
 import {
   isAdminCreateUserPath,
+  isPublicSignupPath,
   resolveUserCreatePolicy,
   toUserCreatePolicyInput,
 } from "./user-create-policy";
@@ -61,6 +70,49 @@ async function acceptInvitesQuietly(user: unknown): Promise<void> {
     });
   } catch (error) {
     console.error("share invite acceptance failed", error instanceof Error ? error.name : "error");
+  }
+}
+
+/**
+ * The invite token of a public sign-up request (the `x-wsmp-invite` header the sign-up page
+ * sends); null on every other route, so the header opens nothing else.
+ */
+function signupInviteToken(
+  context: { path?: unknown; headers?: Headers; request?: Request } | null | undefined,
+): string | null {
+  if (!isPublicSignupPath(typeof context?.path === "string" ? context.path : null)) return null;
+  return shareInviteTokenFromHeaders(context?.headers ?? context?.request?.headers);
+}
+
+type InviteClaim = { token: string; claimedAt: Date };
+
+/**
+ * The invite each sign-up reserved in the user-create `before` hook, for its `after` hook.
+ * Better Auth hands both hooks the same endpoint context object.
+ */
+const inviteClaims = new WeakMap<object, InviteClaim>();
+
+/**
+ * The invite link acceptance never fails the sign-up that carried it. A failure is logged with
+ * the user id and the error class (never the token); the invite stays reserved until the claim
+ * window passes, then the link works again.
+ */
+async function acceptClaimedInviteQuietly(user: unknown, claim: InviteClaim): Promise<void> {
+  const row = user as { id?: unknown; email?: unknown } | null;
+  if (!row || typeof row.id !== "string" || typeof row.email !== "string") return;
+  try {
+    const accepted = await acceptClaimedShareInviteToken(
+      { id: row.id, email: row.email },
+      claim.token,
+      claim.claimedAt,
+    );
+    if (!accepted) console.error("share invite link acceptance refused", `user=${row.id}`);
+  } catch (error) {
+    console.error(
+      "share invite link acceptance failed",
+      `user=${row.id}`,
+      error instanceof Error ? error.name : "error",
+    );
   }
 }
 
@@ -357,11 +409,22 @@ export const auth = betterAuth({
         before: async (user, context) => {
           const { signupEnabled, userCount } = await getSignupAccessState();
           const bootstrapAdminIdentity = resolveBootstrapAdminIdentity(user.email);
+          // An invite link (the `x-wsmp-invite` header, public sign-up route only). With open
+          // sign-up off it is what lets this sign-up through, so it must be pending here and
+          // reserved below.
+          const inviteToken = signupInviteToken(context);
+          const reliesOnInvite =
+            !signupEnabled && !(userCount === 0 && bootstrapAdminIdentity.allowed);
+          const inviteTokenPending =
+            !signupEnabled &&
+            inviteToken !== null &&
+            (await isPendingShareInviteToken(inviteToken));
           const policy = resolveUserCreatePolicy(
             toUserCreatePolicyInput({
               signupEnabled,
               userCount,
               adminBootstrapAllowed: bootstrapAdminIdentity.allowed,
+              inviteTokenPending,
               emailConfigured,
               user,
               context,
@@ -372,6 +435,14 @@ export const auth = betterAuth({
             name: typeof user.name === "string" ? user.name : undefined,
             email: typeof user.email === "string" ? user.email : undefined,
           });
+          // Reserve the invite for this one sign-up (atomic guarded update), after every other
+          // refusal so a refused request does not hold it. Of two sign-ups with one token only
+          // one gets the claim; the other is refused when the invite is what admits it.
+          if (inviteToken !== null && context) {
+            const claimedAt = await claimShareInviteToken(inviteToken);
+            if (claimedAt) inviteClaims.set(context, { token: inviteToken, claimedAt });
+            else if (reliesOnInvite) throw new SignupDisabledError();
+          }
           const locale = resolveSignupLocale(context?.headers);
           return {
             data: {
@@ -388,12 +459,18 @@ export const auth = betterAuth({
             },
           };
         },
-        // Pending share invites to this e-mail become shares once the e-mail is proven.
+        // The invite link the person signed up through becomes a share (the token is the
+        // proof); pending share invites to this e-mail become shares once the e-mail is proven.
         after: async (user, context) => {
           // An admin-created account's e-mail is marked verified without proof (the admin
           // knows its temporary password), so its invites wait for the invite link.
           if (isAdminCreateUserPath(typeof context?.path === "string" ? context.path : null)) {
             return;
+          }
+          const claim = context ? inviteClaims.get(context) : undefined;
+          if (context && claim) {
+            inviteClaims.delete(context);
+            await acceptClaimedInviteQuietly(user, claim);
           }
           await acceptInvitesQuietly(user);
         },

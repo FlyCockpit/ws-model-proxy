@@ -132,25 +132,28 @@ model Share {
 /// lets that person sign up even when open sign-up is off. E-mailed when SMTP is configured;
 /// otherwise the owner copies the link (shown once).
 model ShareInvite {
-  id            String         @id @default(cuid(2))
-  createdAt     DateTime       @default(now())
-  updatedAt     DateTime       @default(now()) @updatedAt
-  poolId        String
-  ownerUserId   String
+  id              String         @id @default(cuid(2))
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @default(now()) @updatedAt
+  poolId          String
+  ownerUserId     String
   /// Lower-cased, trimmed.
-  email         String
+  email           String
   /// sha256 of the invite token (`wsmp_inv_` + 26 base32 characters); the token is shown once.
   /// Resending rotates it (and `expiresAt`) while the invite is pending.
-  tokenDigest   String         @unique
-  canUse        Boolean        @default(true)
-  canContribute Boolean        @default(false)
-  priorityClass PriorityClass?
-  expiresAt     DateTime
-  emailSentAt   DateTime?
-  acceptedAt    DateTime?
+  tokenDigest     String         @unique
+  canUse          Boolean        @default(true)
+  canContribute   Boolean        @default(false)
+  priorityClass   PriorityClass?
+  expiresAt       DateTime
+  emailSentAt     DateTime?
+  acceptedAt      DateTime?
   /// The share the acceptance created (null until then, or after it was deleted).
-  shareId       String?
-  revokedAt     DateTime?
+  shareId         String?
+  revokedAt       DateTime?
+  /// An invite-link sign-up reserved the invite (user-create `before` hook); another sign-up
+  /// with the same token is refused until this is older than the claim window (10 minutes).
+  signupClaimedAt DateTime?
 
   Pool  Pool   @relation(fields: [poolId, ownerUserId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
   Owner User   @relation(fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)

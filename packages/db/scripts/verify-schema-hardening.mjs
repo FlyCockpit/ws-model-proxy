@@ -899,6 +899,8 @@ try {
   await client.query(
     `UPDATE share_invite SET "tokenDigest" = ${HEX("e")}, "expiresAt" = now() + interval '14 days' WHERE id = 'inv-2'`,
   );
+  // An invite-link sign-up reserves the pending invite.
+  await client.query(`UPDATE share_invite SET "signupClaimedAt" = now() WHERE id = 'inv-2'`);
   await client.query(`UPDATE share_invite SET "revokedAt" = now() WHERE id = 'inv-2'`);
   await client.query(`
     INSERT INTO share_invite (id, "poolId", "ownerUserId", email, "tokenDigest", "expiresAt")

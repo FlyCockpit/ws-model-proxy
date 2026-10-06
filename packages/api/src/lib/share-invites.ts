@@ -15,7 +15,8 @@ import { env } from "@ws-model-proxy/env/server";
 import { isEmailConfigured, renderShareInvite, sendEmail } from "@ws-model-proxy/mailer";
 
 const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-export const SHARE_INVITE_TOKEN_PATTERN = /^wsmp_inv_[A-Z2-7]{26}$/;
+
+export { SHARE_INVITE_TOKEN_PATTERN } from "@ws-model-proxy/config/share-invite";
 /** How long an invite link works (the hardening allows at most 30 days). */
 export const SHARE_INVITE_TTL_MS = 14 * 86_400_000;
 /** One resend per invite per minute (each one can send an e-mail). */
@@ -84,4 +85,20 @@ export async function sendShareInviteEmail(args: {
 /** A pending invite: neither accepted nor revoked, and not expired. */
 export function pendingInviteWhere(now: Date): Prisma.ShareInviteWhereInput {
   return { acceptedAt: null, revokedAt: null, expiresAt: { gt: now } };
+}
+
+/**
+ * How long an invite-link sign-up holds its reservation of the invite (`signupClaimedAt`). A
+ * sign-up that failed after reserving frees the link again once this has passed.
+ */
+export const SHARE_INVITE_SIGNUP_CLAIM_MS = 10 * 60_000;
+
+/** No invite-link sign-up holds the invite (never claimed, or the claim is stale). */
+export function unclaimedInviteWhere(now: Date): Prisma.ShareInviteWhereInput {
+  return {
+    OR: [
+      { signupClaimedAt: null },
+      { signupClaimedAt: { lt: new Date(now.getTime() - SHARE_INVITE_SIGNUP_CLAIM_MS) } },
+    ],
+  };
 }

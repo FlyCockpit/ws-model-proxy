@@ -38,6 +38,7 @@ import {
   SIGNUP_MEDIA_TYPES,
   SIGNUP_RECIPIENT_PATH,
 } from "./email-recipient-limit.js";
+import { consumeInviteAccept } from "./invite-accept-limit.js";
 import { createMcpAdmissionGate } from "./mcp/admission.js";
 import { createMcpRequestHandler, type McpAuthInstance } from "./mcp/auth.js";
 import { createMcpTransport } from "./mcp/handler.js";
@@ -276,6 +277,7 @@ function contextServices(request: HonoContext | null): ContextServices {
   return {
     // Public invite lookups are charged to the caller's address (like sign-in).
     ...(request ? { limitInviteLookup: () => consumeInviteLookup(resolveClientIp(request)) } : {}),
+    limitInviteAccept: (userId: string) => consumeInviteAccept(userId),
     onPoolRoutingRulesChanged: (poolId: string) =>
       relaySessionManager.onPoolRoutingRulesChanged(poolId),
     nodes: nodeServices,

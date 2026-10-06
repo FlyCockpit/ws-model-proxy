@@ -823,7 +823,11 @@ describe("shares", () => {
 describe("auth.inviteInfo (public)", () => {
   const auth = () =>
     createRouterClient(authRouter, {
-      context: { session: null, auth: { kind: "anonymous" } } satisfies Context,
+      context: {
+        session: null,
+        auth: { kind: "anonymous" },
+        services: { limitInviteLookup: async () => true },
+      } satisfies Context,
     });
 
   it("answers valid: false and nothing else for an unknown link", async () => {

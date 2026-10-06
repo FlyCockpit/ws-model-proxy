@@ -1,4 +1,5 @@
 import { APP_LOCALE_HEADER } from "@ws-model-proxy/config/locales";
+import { SHARE_INVITE_HEADER } from "@ws-model-proxy/config/share-invite";
 import { betterAuth } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
 import { describe, expect, it, vi } from "vitest";
@@ -124,6 +125,12 @@ describe("createApp CORS preflight (CORS_ALLOW_HEADERS wiring)", () => {
     expect(CORS_ALLOW_HEADERS).toContain(APP_LOCALE_HEADER);
     const res = await preflight(`content-type,${APP_LOCALE_HEADER}`);
     expect(allowedHeaders(res)).toContain(APP_LOCALE_HEADER);
+  });
+
+  it("allows the invite header the sign-up page sets on an invite sign-up", async () => {
+    expect(CORS_ALLOW_HEADERS).toContain(SHARE_INVITE_HEADER);
+    const res = await preflight(`content-type,${SHARE_INVITE_HEADER}`);
+    expect(allowedHeaders(res)).toContain(SHARE_INVITE_HEADER);
   });
 
   it("allows the CSRF header Better-Auth's client plugin sets", async () => {

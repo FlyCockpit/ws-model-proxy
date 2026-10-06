@@ -1059,10 +1059,10 @@ RETURNS trigger LANGUAGE plpgsql AS $share_invite_transition$
 BEGIN
   IF (to_jsonb(NEW) - ARRAY['updatedAt', 'emailSentAt', 'acceptedAt', 'shareId', 'revokedAt',
                              'canUse', 'canContribute', 'priorityClass', 'tokenDigest',
-                             'expiresAt']::text[])
+                             'expiresAt', 'signupClaimedAt']::text[])
       IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['updatedAt', 'emailSentAt', 'acceptedAt', 'shareId',
                              'revokedAt', 'canUse', 'canContribute', 'priorityClass', 'tokenDigest',
-                             'expiresAt']::text[]) THEN
+                             'expiresAt', 'signupClaimedAt']::text[]) THEN
     RAISE EXCEPTION 'a share invite keeps its pool and e-mail' USING ERRCODE = '55000';
   END IF;
   -- Resend rotates the token and the expiry, only while the invite is pending, and the expiry
@@ -1085,12 +1085,14 @@ BEGIN
           OR (NEW."shareId" IS NOT NULL AND NEW."shareId" IS DISTINCT FROM OLD."shareId")) THEN
     RAISE EXCEPTION 'an accepted or revoked share invite is final' USING ERRCODE = '55000';
   END IF;
+  -- The accepted share is a share of the invite pool, whatever the grantee e-mail: an invite
+  -- link is the proof, so the person who signed up through it may use another address
+  -- (packages/api lib/invite-acceptance.ts decides when an e-mail match is enough).
   IF NEW."acceptedAt" IS NOT NULL AND OLD."acceptedAt" IS NULL
      AND (NEW."shareId" IS NULL
-          OR NOT EXISTS (SELECT 1 FROM share s JOIN "user" u ON u.id = s."granteeUserId"
-                          WHERE s.id = NEW."shareId" AND s."poolId" = NEW."poolId"
-                            AND lower(u.email) = NEW.email)) THEN
-    RAISE EXCEPTION 'an accepted invite names the share of its pool and e-mail' USING ERRCODE = '23514';
+          OR NOT EXISTS (SELECT 1 FROM share s
+                          WHERE s.id = NEW."shareId" AND s."poolId" = NEW."poolId")) THEN
+    RAISE EXCEPTION 'an accepted invite names a share of its pool' USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
 END;
@@ -1309,26 +1311,26 @@ DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION enforce_provider_cre
 CREATE OR REPLACE FUNCTION enforce_provider_current_credential_consistency()
 RETURNS trigger LANGUAGE plpgsql AS $provider_current_credential$
 DECLARE credential_owner TEXT; credential_account TEXT; credential_state TEXT; credential_auth TEXT;
-  account RECORD;
+  acct RECORD;
 BEGIN
   -- Deferred to commit, where NEW is the row as of its event: check the row as it is now (an
   -- account is inserted, then given its first credential, in one transaction).
-  SELECT id, "userId", "currentCredentialId", "authType"::text AS "authType" INTO account
+  SELECT id, "userId", "currentCredentialId", "authType"::text AS "authType" INTO acct
     FROM provider_account WHERE id = NEW.id;
   IF NOT FOUND THEN
     RETURN NULL;
   END IF;
-  IF account."currentCredentialId" IS NOT NULL THEN
+  IF acct."currentCredentialId" IS NOT NULL THEN
     SELECT "userId", "providerAccountId", status::text, "credentialType"::text
       INTO credential_owner, credential_account, credential_state, credential_auth
-      FROM provider_credential WHERE id = account."currentCredentialId";
-    IF credential_owner IS DISTINCT FROM account."userId" OR credential_account IS DISTINCT FROM account.id
-       OR credential_state IS DISTINCT FROM 'ACTIVE' OR credential_auth IS DISTINCT FROM account."authType" THEN
+      FROM provider_credential WHERE id = acct."currentCredentialId";
+    IF credential_owner IS DISTINCT FROM acct."userId" OR credential_account IS DISTINCT FROM acct.id
+       OR credential_state IS DISTINCT FROM 'ACTIVE' OR credential_auth IS DISTINCT FROM acct."authType" THEN
       RAISE EXCEPTION 'current provider credential must be active and belong to the account owner' USING ERRCODE = '23514';
     END IF;
   ELSIF EXISTS (
     SELECT 1 FROM provider_credential
-     WHERE "providerAccountId" = account.id AND "userId" = account."userId" AND status = 'ACTIVE'
+     WHERE "providerAccountId" = acct.id AND "userId" = acct."userId" AND status = 'ACTIVE'
   ) THEN
     RAISE EXCEPTION 'provider account without a current credential cannot retain an active credential' USING ERRCODE = '23514';
   END IF;

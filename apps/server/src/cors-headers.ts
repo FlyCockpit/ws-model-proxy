@@ -1,4 +1,5 @@
 import { APP_LOCALE_HEADER } from "@ws-model-proxy/config/locales";
+import { SHARE_INVITE_HEADER } from "@ws-model-proxy/config/share-invite";
 
 /**
  * Request headers the browser is allowed to send cross-origin.
@@ -18,6 +19,8 @@ import { APP_LOCALE_HEADER } from "@ws-model-proxy/config/locales";
  *   - `x-csrf-token` — Better-Auth's SimpleCsrfProtectionLinkPlugin, every request.
  *   - APP_LOCALE_HEADER — the auth client (apps/web/src/lib/auth-client.ts),
  *     every auth request.
+ *   - SHARE_INVITE_HEADER — the sign-up page (apps/web/src/routes/$lang/signup.tsx) on an
+ *     invite sign-up.
  *
  * **Adding a client-set header means adding it here.** cors-headers.test.ts
  * asserts the preflight actually echoes each one.
@@ -27,4 +30,5 @@ export const CORS_ALLOW_HEADERS = [
   "Authorization",
   "x-csrf-token",
   APP_LOCALE_HEADER,
+  SHARE_INVITE_HEADER,
 ] as const;

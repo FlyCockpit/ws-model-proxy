@@ -24,6 +24,7 @@ const INVENTORY = [
   "app.flags",
   "app.features",
   "auth.inviteInfo",
+  "auth.acceptInvite",
   "auth.verifyEmailTransport",
   "auth.updateLocale",
   "auth.passwordCapabilities",

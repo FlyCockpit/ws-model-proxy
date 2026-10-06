@@ -1,3 +1,4 @@
+import { SUPPORTED_LOCALES } from "@ws-model-proxy/config/locales";
 import { MCP_WELL_KNOWN_PATHS } from "./mcp-discovery.js";
 import { MCP_WEB_PAGE_PATHS } from "./mcp-web-page-gate.js";
 
@@ -75,6 +76,17 @@ const MCP_WEB_PAGE_LOG_PATHS = new Set(MCP_WEB_PAGE_PATHS);
  */
 const REALTIME_LOG_PATHS = new Set(["/v1/realtime", "/v1/realtime/"]);
 
+/**
+ * The sign-up and login pages under every supported locale: an invite link carries its live
+ * token in the query (`/{lang}/signup?invite=<token>`, and through "sign in" as
+ * `/{lang}/login?redirectTo=…invite=<token>`). Exact pathname equality, like the MCP pages.
+ */
+const SIGNUP_PAGE_LOG_PATHS = new Set(
+  SUPPORTED_LOCALES.flatMap((locale) =>
+    ["signup", "login"].flatMap((page) => [`/${locale}/${page}`, `/${locale}/${page}/`]),
+  ),
+);
+
 /** true when the request-log line for this pathname must strip the query. */
 export function stripsOAuthQuery(pathname: string): boolean {
   return (
@@ -82,7 +94,8 @@ export function stripsOAuthQuery(pathname: string): boolean {
     REALTIME_LOG_PATHS.has(pathname) ||
     ROOT_DISCOVERY_LOG_PATHS.has(pathname) ||
     MCP_ENDPOINT_LOG_PATHS.has(pathname) ||
-    MCP_WEB_PAGE_LOG_PATHS.has(pathname)
+    MCP_WEB_PAGE_LOG_PATHS.has(pathname) ||
+    SIGNUP_PAGE_LOG_PATHS.has(pathname)
   );
 }
 

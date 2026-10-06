@@ -3,6 +3,7 @@
  * `users` (admin, kept), `adminObservability`, `adminSettings`.
  */
 import { SUPPORTED_LOCALES } from "@ws-model-proxy/config/locales";
+import { SHARE_INVITE_TOKEN_PATTERN } from "@ws-model-proxy/config/share-invite";
 import { z } from "zod";
 import {
   emailSchema,
@@ -79,7 +80,7 @@ export const authContract = {
   /** The sign-up page of an invite link (rate-limited like sign-in). */
   inviteInfo: query(
     "public",
-    z.object({ token: z.string().regex(/^wsmp_inv_[A-Z2-7]{26}$/) }).strict(),
+    z.object({ token: z.string().regex(SHARE_INVITE_TOKEN_PATTERN) }).strict(),
     z
       .object({
         valid: z.boolean(),
@@ -89,6 +90,13 @@ export const authContract = {
       })
       .strict(),
     "Public: who invited this e-mail to which pool (valid false for an unknown, used or expired link).",
+  ),
+  /** A signed-in person opening an invite link (rate-limited per user). */
+  acceptInvite: mutation(
+    "human",
+    z.object({ token: z.string().regex(SHARE_INVITE_TOKEN_PATTERN) }).strict(),
+    z.object({ result: z.enum(["accepted", "invalid", "own_pool"]) }).strict(),
+    "Accept a pool invite link as the signed-in person, whatever their e-mail (the token is the proof).",
   ),
   verifyEmailTransport: query(
     "public",

@@ -1,18 +1,31 @@
+import { ORPCError } from "@orpc/server";
 import prisma from "@ws-model-proxy/db";
 import { verifyTransport } from "@ws-model-proxy/mailer";
 import { contractProcedure, publicContractProcedure } from "../contract-procedure";
 import { authContract as c } from "../contracts/account";
 import { callableIdOf } from "../lib/access-views";
 import { canUserChangePassword } from "../lib/password-capabilities";
+import { acceptShareInviteByLink } from "../lib/share-invite-accept";
 import { pendingInviteWhere, shareInviteDigest } from "../lib/share-invites";
 
 export const authRouter = {
   /**
    * The invite sign-up page: who invited this e-mail to which pool. Answers `valid: false`
    * (and nothing else) for an unknown, used, withdrawn or expired link, so it reveals nothing
-   * without a live token. TODO(server): rate-limit like sign-in (apps/server `/rpc` limiter).
+   * without a live token. Charged to the caller's address like sign-in (`limitInviteLookup`).
+   * The limiter is in-memory, per server process: with several replicas each one keeps its
+   * own budget. Without the service (MCP, or an unwired server) the lookup is refused.
    */
-  inviteInfo: publicContractProcedure(c.inviteInfo).handler(async ({ input }) => {
+  inviteInfo: publicContractProcedure(c.inviteInfo).handler(async ({ input, context }) => {
+    const limit = context.services?.limitInviteLookup;
+    if (!limit)
+      throw new ORPCError("SERVICE_UNAVAILABLE", {
+        message: "Invite lookups are unavailable.",
+      });
+    if (!(await limit()))
+      throw new ORPCError("TOO_MANY_REQUESTS", {
+        message: "Too many invite lookups. Try again later.",
+      });
     const invite = await prisma.shareInvite.findFirst({
       where: { tokenDigest: shareInviteDigest(input.token), ...pendingInviteWhere(new Date()) },
       select: {
@@ -28,6 +41,27 @@ export const authRouter = {
       ownerName: invite.Owner.name,
       callableId: callableIdOf(invite.Pool.User.slug, invite.Pool.slug),
     };
+  }),
+  /**
+   * A signed-in person opening an invite link accepts it, whatever their e-mail (the token is
+   * the proof). Charged per user (`limitInviteAccept`, in-memory per server process); refused
+   * without the service.
+   */
+  acceptInvite: contractProcedure(c.acceptInvite).handler(async ({ input, context }) => {
+    const limit = context.services?.limitInviteAccept;
+    if (!limit)
+      throw new ORPCError("SERVICE_UNAVAILABLE", {
+        message: "Invite acceptance is unavailable.",
+      });
+    if (!(await limit(context.session.user.id)))
+      throw new ORPCError("TOO_MANY_REQUESTS", {
+        message: "Too many invite attempts. Try again later.",
+      });
+    const result = await acceptShareInviteByLink(
+      { id: context.session.user.id, email: context.session.user.email },
+      input.token,
+    );
+    return { result };
   }),
   /**
    * Delivery-aware preflight for the email-OTP second factor. The login challenge calls this

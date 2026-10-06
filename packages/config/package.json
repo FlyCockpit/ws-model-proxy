@@ -63,6 +63,9 @@
     },
     "./cli-agent-audit": {
       "default": "./src/cli-agent-audit.ts"
+    },
+    "./share-invite": {
+      "default": "./src/share-invite.ts"
     }
   },
   "files": [

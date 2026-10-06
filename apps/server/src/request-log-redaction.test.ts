@@ -27,6 +27,17 @@ describe("request-log redaction (OAuth query stripping)", () => {
     expect(stripsOAuthQuery("/v1/realtimeish")).toBe(false);
   });
 
+  it("strips the sign-up and login page queries (an invite link carries its token) for every locale", () => {
+    expect(stripsOAuthQuery("/en-US/signup")).toBe(true);
+    expect(stripsOAuthQuery("/es-MX/signup")).toBe(true);
+    expect(stripsOAuthQuery("/en-US/signup/")).toBe(true);
+    expect(stripsOAuthQuery("/en-US/login")).toBe(true);
+    expect(stripsOAuthQuery("/es-MX/login")).toBe(true);
+    expect(stripsOAuthQuery("/en-US/loginish")).toBe(false);
+    expect(stripsOAuthQuery("/en-US/signupish")).toBe(false);
+    expect(stripsOAuthQuery("/xx-XX/signup")).toBe(false);
+  });
+
   it("flags exactly the /api/auth/oauth2/ prefix family", () => {
     expect(stripsOAuthQuery("/api/auth/oauth2/authorize")).toBe(true);
     expect(stripsOAuthQuery("/api/auth/oauth2/token")).toBe(true);

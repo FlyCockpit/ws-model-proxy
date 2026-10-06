@@ -55,6 +55,8 @@ export type ContextServices = {
   onAccessRevoked?: (event: AccessRevokedEvent) => Promise<void>;
   /** Charges one public invite lookup to the caller's address; false: over its budget. */
   limitInviteLookup?: () => Promise<boolean>;
+  /** Charges one signed-in invite acceptance (`auth.acceptInvite`) to the user; false: over. */
+  limitInviteAccept?: (userId: string) => Promise<boolean>;
   /** Lane D (terminals, node commands): the relay surfaces these procedures need. */
   nodeOperator?: NodeOperatorServices;
   /**
