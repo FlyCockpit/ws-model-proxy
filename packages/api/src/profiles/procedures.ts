@@ -11,13 +11,16 @@ import { agentRulesApply, isHumanCaller } from "../contracts/auth-context";
 import { profilesContract as c, type profileViewSchema } from "../contracts/profiles";
 import { assertMayWrite, callerActor } from "../lib/caller-actor";
 import { graphDelete, graphWrite } from "../lib/graph-write";
+import {
+  loadPlacementFabrics,
+  loadPlacementInstances,
+  PLACEMENT_NODE_SELECT,
+  placementNodeOf,
+} from "../lib/placement-load";
 import { planProfileHolds } from "../lib/profile-holds";
 import { planProfileSave } from "../lib/profile-save";
 import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
 import { runtimeSpecSchema } from "../lib/runtime-spec";
-import { effectiveHardware, liveMetrics } from "../nodes/hardware";
-import { nodeTrustView } from "../nodes/trust";
-import { parseHeldDefinitions } from "../nodes/views";
 import {
   instanceServesItem,
   type PlanInstance,
@@ -227,27 +230,10 @@ async function loadPlanInput(context: Context, userId: string, profileId: string
   if (!profile) throw notFound("That profile does not exist.");
   const ownedIds = profile.Nodes.map((node) => node.nodeId);
   const now = new Date();
-  const [nodes, versions, instances, claims, fabrics] = await Promise.all([
+  const [nodes, versions, instances, claimants, fabrics] = await Promise.all([
     prisma.node.findMany({
       where: { userId, id: { in: ownedIds } },
-      select: {
-        id: true,
-        slug: true,
-        connection: true,
-        trust: true,
-        trustChangedAt: true,
-        trustLowerRequestedAt: true,
-        labels: true,
-        holdAt: true,
-        holdProfileId: true,
-        portStart: true,
-        portEnd: true,
-        heldDefinitions: true,
-        declaredResources: true,
-        nodeInfo: true,
-        nodeMetrics: true,
-        nodeMetricsAt: true,
-      },
+      select: { ...PLACEMENT_NODE_SELECT, holdProfileId: true },
     }),
     prisma.runtimeVersion.findMany({
       where: {
@@ -262,43 +248,25 @@ async function loadPlanInput(context: Context, userId: string, profileId: string
       },
     }),
     runningInstancesOn(userId, ownedIds),
-    prisma.instanceRank.findMany({
-      where: { nodeId: { in: ownedIds }, claim: { not: "RELEASED" }, Instance: { userId } },
-      select: { instanceId: true, nodeId: true, port: true, distPort: true, resources: true },
-    }),
-    prisma.fabric.findMany({
-      where: { userId },
-      orderBy: { name: "asc" },
-      select: { id: true, name: true, Members: { select: { nodeId: true } } },
-    }),
+    loadPlacementInstances(prisma, ownedIds),
+    loadPlacementFabrics(prisma, userId),
   ]);
 
   const planNodes = new Map<string, PlanNode>();
   for (const node of nodes) {
-    const hardware = effectiveHardware({
-      declaredResources: node.declaredResources,
-      nodeInfo: node.nodeInfo,
-      nodeMetrics: node.nodeMetrics,
-      nodeMetricsAt: node.nodeMetricsAt,
-      heldClaims: [],
-      now,
-    });
+    const placement = placementNodeOf(node, now);
     planNodes.set(node.id, {
       id: node.id,
       slug: node.slug,
-      online: node.connection === "ONLINE",
-      trust: nodeTrustView(node).effective,
+      online: placement.online,
+      trust: placement.trust,
       labels: node.labels,
       hold: { holdAt: node.holdAt, holdProfileId: node.holdProfileId },
-      portRange: [node.portStart, node.portEnd],
-      heldVersionIds: new Set(parseHeldDefinitions(node.heldDefinitions).map((d) => d.versionId)),
-      usableMemoryGb: hardware.usableMemoryGb,
-      usableGpuGb: hardware.gpus.reduce(
-        (sum, gpu) => sum + Math.max(0, gpu.vramGb - gpu.reservedVramGb),
-        0,
-      ),
-      gpuCount: hardware.gpus.length,
-      liveFreeMemoryGb: liveMetrics(node.nodeMetrics, node.nodeMetricsAt, now).freeMemoryGb,
+      portRange: placement.portRange,
+      heldVersionIds: placement.heldVersionIds,
+      memoryGb: placement.memoryGb,
+      gpus: placement.gpus,
+      liveFreeMemoryGb: placement.liveFreeMemoryGb,
     });
   }
   const planVersions = new Map<string, PlanVersion>(
@@ -333,12 +301,9 @@ async function loadPlanInput(context: Context, userId: string, profileId: string
       items,
       versions: planVersions,
       instances: planInstances,
-      claims: claims.flatMap((claim) => (claim.nodeId ? [{ ...claim, nodeId: claim.nodeId }] : [])),
-      fabrics: fabrics.map((fabric) => ({
-        id: fabric.id,
-        name: fabric.name,
-        nodeIds: fabric.Members.map((member) => member.nodeId),
-      })),
+      claimants,
+      callerId: userId,
+      fabrics,
       agentRules: agentRulesApply(context.auth),
     },
   };

@@ -91,7 +91,7 @@ import {
   type CapacityAdmissionRuntime,
   StoreCapacityAdmissionRuntime,
 } from "./capacity/runtime.js";
-import type { CapacityLeaseHandle } from "./capacity/types.js";
+import { type CapacityLeaseHandle, NORMAL_PRIORITY_RANK } from "./capacity/types.js";
 import {
   allowsChatTestExecutionMode,
   resolveChatTestRoutingMode,
@@ -3795,7 +3795,7 @@ async function relayDirect({
           attemptId: crypto.randomUUID(),
           ownerId: selected.userId,
           sourceKind: "TEST",
-          basePriority: 16,
+          basePriority: NORMAL_PRIORITY_RANK,
           connectionOwner: "model-api",
           deadlineAt: new Date(startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS),
           candidates: [
@@ -5362,7 +5362,7 @@ async function relayPool({
           ownerId: target.ownerUserId,
           sourceKind: "POOL",
           poolId: target.id,
-          basePriority: 16,
+          basePriority: NORMAL_PRIORITY_RANK,
           // S-C: the grant's queue priority (if set) replaces the pool/member
           // priority for this grantee's waiters; the store reads it.
           priorityShareId: target.shareId,
@@ -7204,7 +7204,7 @@ async function relaySelectedModelNoFailover({
           ownerId: selected.userId,
           sourceKind: requestedPoolId ? "POOL" : "TEST",
           poolId: requestedPoolId,
-          basePriority: 16,
+          basePriority: NORMAL_PRIORITY_RANK,
           priorityShareId: requestedPoolId ? poolAccess?.shareId : undefined,
           warmSessionIds: boundSessionId ? [boundSessionId] : [],
           connectionOwner: "model-api",

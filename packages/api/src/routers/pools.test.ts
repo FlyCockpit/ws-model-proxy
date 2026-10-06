@@ -255,6 +255,31 @@ describe("pools.update (agent-editable)", () => {
     ).toBe("sidecar_chain");
   });
 
+  it("refuses kept slots above the pool's cap, also against the stored cap", async () => {
+    db.pool.findFirst.mockResolvedValue({ id: "pool-1", userId: OWNER, modelType: "LLM" } as never);
+    expect(
+      await reasonOf(
+        client().update({ poolId: "pool-1", routing: { concurrencyLimit: 2, keptSlots: 3 } }),
+      ),
+    ).toBe("BAD_REQUEST");
+    db.poolRouting.findUnique.mockResolvedValue({ concurrencyLimit: 1, keptSlots: 0 } as never);
+    expect(await reasonOf(client().update({ poolId: "pool-1", routing: { keptSlots: 2 } }))).toBe(
+      "BAD_REQUEST",
+    );
+    expect(db.poolRouting.upsert).not.toHaveBeenCalled();
+    // A patch that leaves both alone (a stored pool from before the check) still goes through.
+    db.poolRouting.findUnique.mockResolvedValue({ concurrencyLimit: 1, keptSlots: 3 } as never);
+    db.pool.findFirst.mockReset();
+    db.pool.findFirst.mockResolvedValueOnce({
+      id: "pool-1",
+      userId: OWNER,
+      modelType: "LLM",
+    } as never);
+    db.pool.findFirst.mockResolvedValue(poolRow() as never);
+    await client().update({ poolId: "pool-1", routing: { priorityClass: "HIGH" } });
+    expect(db.poolRouting.upsert).toHaveBeenCalledTimes(1);
+  });
+
   it("an agent cannot reach another person's pool", async () => {
     db.pool.findFirst.mockResolvedValue(null);
     expect(await reasonOf(client(CALLERS.fullAgent()).update({ poolId: "p", name: "x" }))).toBe(

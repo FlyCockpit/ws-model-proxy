@@ -248,6 +248,22 @@ async function applyRouting(db: Tx, poolId: string, routing: RoutingPatch | unde
   const data = Object.fromEntries(
     Object.entries(routing).filter(([, value]) => value !== undefined),
   ) as RoutingPatch;
+  // Kept slots beyond the pool's own cap could never be used by the pool, yet would still be
+  // held back from other owners (no borrowing): refuse them, as the limits redesign did.
+  const stored = await db.poolRouting.findUnique({
+    where: { poolId },
+    select: { concurrencyLimit: true, keptSlots: true },
+  });
+  const keptSlots = data.keptSlots ?? stored?.keptSlots ?? 0;
+  const concurrencyLimit =
+    data.concurrencyLimit !== undefined
+      ? data.concurrencyLimit
+      : (stored?.concurrencyLimit ?? null);
+  const touchesSlots = data.keptSlots !== undefined || data.concurrencyLimit !== undefined;
+  if (touchesSlots && concurrencyLimit !== null && keptSlots > concurrencyLimit)
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Kept slots cannot exceed the pool's requests-at-once limit.",
+    });
   await db.poolRouting.upsert({ where: { poolId }, create: { poolId, ...data }, update: data });
 }
 

@@ -211,6 +211,8 @@ export const placementSchema = z
     nodeSlug: z.string(),
     nodeNumber: z.number().int().min(1),
     port: z.number().int(),
+    /** This node's IP on the instance's fabric (`{{fabric_ip}}`); null for single-node. */
+    fabricIp: z.string().nullable(),
     resources: z.record(z.string(), z.unknown()),
   })
   .strict();
@@ -258,6 +260,13 @@ export const startPreviewSchema = z
           versionId: idSchema,
           instanceId: idSchema.nullable(),
           placements: z.array(placementSchema),
+          /** Multi-node: the one fabric every rank shares, with the head's IP (`head_addr`). */
+          fabric: z
+            .object({ fabricId: idSchema, name: z.string(), headAddr: z.string() })
+            .strict()
+            .nullable(),
+          /** Multi-node: `{{dist_port}}`, one port free on every rank's node. */
+          distPort: z.number().int().nullable(),
         })
         .strict(),
     ),
