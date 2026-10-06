@@ -475,20 +475,23 @@ export class PlacementPlanner {
         },
       ]),
     );
-    // Replay every claim in one fixed order (instance id, rank), so GPU picks are stable.
+    // Replay every claim in one fixed order (instance id, rank), so GPU picks are stable:
+    // claims that recorded their GPUs first, then older claims onto what is left.
     const ordered = [...context.instances].sort((a, b) => compareCodePoints(a.id, b.id));
-    for (const instance of ordered)
-      instance.ranks.forEach((rank, index) => {
-        if (!rank.nodeId) return;
-        const budget = this.#budgets.get(rank.nodeId);
-        if (!budget) return;
-        budget.ports.add(rank.port);
-        if (rank.distPort !== null) budget.ports.add(rank.distPort);
-        const needs = resourceNeeds(rank.resources);
-        const gpuKeys = claimGpus(budget, needs, rank.resources);
-        this.#gpuClaims.set(`${instance.id}|${index}`, gpuKeys);
-        if (!this.#stopping.has(instance.id)) apply(budget, needs, gpuKeys, 1);
-      });
+    for (const recordedPass of [true, false])
+      for (const instance of ordered)
+        instance.ranks.forEach((rank, index) => {
+          if (!rank.nodeId) return;
+          if ((recordedGpuKeys(rank.resources) !== null) !== recordedPass) return;
+          const budget = this.#budgets.get(rank.nodeId);
+          if (!budget) return;
+          budget.ports.add(rank.port);
+          if (rank.distPort !== null) budget.ports.add(rank.distPort);
+          const needs = resourceNeeds(rank.resources);
+          const gpuKeys = claimGpus(budget, needs, rank.resources);
+          this.#gpuClaims.set(`${instance.id}|${index}`, gpuKeys);
+          if (!this.#stopping.has(instance.id)) apply(budget, needs, gpuKeys, 1);
+        });
   }
 
   /** Every instance this planner decided to stop so far (sorted by id). */
@@ -505,6 +508,7 @@ export class PlacementPlanner {
       ? this.#placeOnNodes(working, request, request.nodeIds)
       : this.#placeAuto(working, request);
     if ("refusal" in chosen) return { ok: false, refusal: chosen.refusal };
+    if (chosen.working.victims.size > 0) this.#pruneVictims(working, request, chosen);
 
     const { ranks, fabric } = chosen;
     // dist_port: one port free on every rank's node (multi-node only).
@@ -588,6 +592,60 @@ export class PlacementPlanner {
     };
   }
 
+  /**
+   * Drops stops the chosen placement does not need: the search may stop an instance whose
+   * freed resources end up unused (a seed that only moved the best fit elsewhere). Each victim,
+   * most disruptive first, is kept running when the same ranks (nodes, ports) still fit
+   * without it. `chosen` is updated in place.
+   */
+  #pruneVictims(base: Working, request: PlacementRequest, chosen: InstanceChoice): void {
+    const victims = [...chosen.working.victims]
+      .flatMap((id) => {
+        const instance = this.#instances.get(id);
+        return instance ? [instance] : [];
+      })
+      .sort((a, b) => compareCost(costOf([b]), costOf([a])));
+    let kept = new Set(chosen.working.victims);
+    for (const victim of victims) {
+      const without = new Set([...kept].filter((id) => id !== victim.id));
+      const replay = this.#replayRanks(base, request, chosen.ranks, without);
+      if (!replay) continue;
+      kept = without;
+      chosen.working = replay.working;
+      chosen.ranks = replay.ranks;
+    }
+    chosen.cost = this.#costOfWorking(chosen.working);
+  }
+
+  /** The same ranks (nodes, ports) on `base` with exactly `victims` stopped, or null. */
+  #replayRanks(
+    base: Working,
+    request: PlacementRequest,
+    ranks: readonly RankChoice[],
+    victims: ReadonlySet<string>,
+  ): { working: Working; ranks: RankChoice[] } | null {
+    const working: Working = {
+      budgets: new Map([...base.budgets].map(([id, budget]) => [id, cloneBudget(budget)])),
+      victims: new Set(base.victims),
+    };
+    for (const id of [...victims].sort(compareCodePoints)) {
+      working.victims.add(id);
+      this.#freeInstance(working, id, false);
+    }
+    const replayed: RankChoice[] = [];
+    for (const [index, rank] of ranks.entries()) {
+      const budget = working.budgets.get(rank.node.id);
+      if (!budget) return null;
+      const fitted = fit(rank.node, budget, rankResources(request.launch, index), rank.port);
+      if (!fitted.ok) return null;
+      const choice = rankChoice(rank.node, budget, fitted, []);
+      apply(budget, choice.needs, choice.gpuKeys, 1);
+      budget.ports.add(choice.port);
+      replayed.push(choice);
+    }
+    return { working, ranks: replayed };
+  }
+
   // ── Explicit nodes (nodeIds or a restart) ──
 
   #placeOnNodes(
@@ -625,7 +683,8 @@ export class PlacementPlanner {
     }
     const ranks: RankChoice[] = [];
     for (const [index, node] of nodes.entries()) {
-      const fixedPort = request.restart?.ports[index] ?? launch.port?.fixed;
+      // A fixed port of the (new) version wins; otherwise a restart keeps its own port.
+      const fixedPort = launch.port?.fixed ?? request.restart?.ports[index];
       const choice = this.#rankOn(working, request, node, index, fixedPort, request.preempt);
       if ("reason" in choice)
         return { refusal: this.#fitRefusal(choice.reason, node, request, index, working) };

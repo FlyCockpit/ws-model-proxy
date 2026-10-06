@@ -258,7 +258,8 @@ async function applyRouting(db: Tx, poolId: string, routing: RoutingPatch | unde
     data.concurrencyLimit !== undefined
       ? data.concurrencyLimit
       : (stored?.concurrencyLimit ?? null);
-  if (concurrencyLimit !== null && keptSlots > concurrencyLimit)
+  const touchesSlots = data.keptSlots !== undefined || data.concurrencyLimit !== undefined;
+  if (touchesSlots && concurrencyLimit !== null && keptSlots > concurrencyLimit)
     throw new ORPCError("BAD_REQUEST", {
       message: "Kept slots cannot exceed the pool's requests-at-once limit.",
     });

@@ -762,4 +762,76 @@ describe("review fixes", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.refusal.reason).toBe("no_free_ports");
   });
+
+  it("never stops an instance the chosen placement does not need", () => {
+    // Second review's repro: seeding S moved the best fit, but B + A fit without stopping S.
+    const nodes = [
+      node("a", { memoryGb: 8, gpus: [{ key: "nvidia:0", vendor: "nvidia", vramGb: 24 }] }),
+      node("b", { memoryGb: 7 }),
+      node("e", { memoryGb: 2 }),
+    ];
+    const s = running("s", ["a", "e"], 2);
+    const planner = new PlacementPlanner(
+      context({ nodes, instances: [s], fabrics: [fabric("abe", ["a", "b", "e"])] }),
+    );
+    const result = planner.place(
+      request({
+        groupSize: 2,
+        resources: [
+          { kind: "unified", memoryGb: 5 },
+          { kind: "discrete", gpuCount: 1, vramGb: 10, ramGb: 5 },
+        ],
+        preempt: true,
+      }),
+    );
+    expect(ok(result).stops).toEqual([]);
+    expect(planner.stops).toEqual([]);
+    expect(nodesOf(result)).toEqual(["b", "a"]);
+  });
+
+  it("replays claims that recorded their GPUs before older claims", () => {
+    const gpuNode = node("gpu", {
+      memoryGb: 64,
+      gpus: [
+        { key: "nvidia:0", vendor: "nvidia", vramGb: 24 },
+        { key: "nvidia:1", vendor: "nvidia", vramGb: 24 },
+      ],
+    });
+    const claim = (id: string, resources: unknown, port: number) =>
+      running(id, ["gpu"], 0, { ranks: [{ nodeId: "gpu", port, distPort: null, resources }] });
+    const planner = new PlacementPlanner(
+      context({
+        nodes: [gpuNode],
+        instances: [
+          // "a" predates the record; "b" recorded nvidia:0. "a" must land on nvidia:1.
+          claim("a", { kind: "discrete", gpuCount: 1, vramGb: 20 }, 30000),
+          claim("b", { kind: "discrete", gpuCount: 1, vramGb: 20, gpus: ["nvidia:0"] }, 30001),
+        ],
+      }),
+    );
+    expect(
+      planner.place(request({ resources: [{ kind: "discrete", gpuCount: 1, vramGb: 5 }] })).ok,
+    ).toBe(false);
+    expect(
+      ok(planner.place(request({ resources: [{ kind: "discrete", gpuCount: 1, vramGb: 4 }] })))
+        .start.placements[0]?.resources.gpus,
+    ).toHaveLength(1);
+  });
+
+  it("a restart takes the new version's fixed port", () => {
+    const self = running("self", ["h1"], 10, {
+      ranks: [{ nodeId: "h1", port: 30005, distPort: null, resources: { kind: "none" } }],
+    });
+    const planner = new PlacementPlanner(context({ instances: [self] }));
+    const result = ok(
+      planner.place(
+        request({
+          port: { fixed: 31000 },
+          nodeIds: ["h1"],
+          restart: { instanceId: "self", ports: [30005], distPort: null },
+        }),
+      ),
+    );
+    expect(result.start.placements[0]?.port).toBe(31000);
+  });
 });

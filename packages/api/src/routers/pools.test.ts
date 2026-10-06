@@ -267,6 +267,17 @@ describe("pools.update (agent-editable)", () => {
       "BAD_REQUEST",
     );
     expect(db.poolRouting.upsert).not.toHaveBeenCalled();
+    // A patch that leaves both alone (a stored pool from before the check) still goes through.
+    db.poolRouting.findUnique.mockResolvedValue({ concurrencyLimit: 1, keptSlots: 3 } as never);
+    db.pool.findFirst.mockReset();
+    db.pool.findFirst.mockResolvedValueOnce({
+      id: "pool-1",
+      userId: OWNER,
+      modelType: "LLM",
+    } as never);
+    db.pool.findFirst.mockResolvedValue(poolRow() as never);
+    await client().update({ poolId: "pool-1", routing: { priorityClass: "HIGH" } });
+    expect(db.poolRouting.upsert).toHaveBeenCalledTimes(1);
   });
 
   it("an agent cannot reach another person's pool", async () => {
