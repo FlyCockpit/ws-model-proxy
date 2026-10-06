@@ -24,8 +24,8 @@ To deploy:
 2. Create a new, empty Postgres database and point `DATABASE_URL` at it.
 3. Update the environment (see [Configuration](#configuration)): remove every
    `RATE_LIMIT_*` variable; set `ADMIN_EMAIL` when public sign-up is off (it is
-   required to bootstrap the first admin on a fresh production database); pin
-   `WMP_CLI_SOURCE_REV` (below).
+   required to bootstrap the first admin on a fresh production database); set
+   `WMP_CLI_SOURCE_REV` (required in practice, see below).
 4. Start the container once with `APPLY_SCHEMA=safe`. On an empty database
    `safe` creates every table and installs the schema hardening (triggers and
    CHECKs); nothing destructive is involved.
@@ -58,17 +58,24 @@ only.
 ## Nodes: logging in with an enrollment code
 
 Device login is gone. To add a node, create an enrollment code on the
-**Nodes** page and run the one-liner it shows:
+**Nodes** page and run the one-liner it shows. Written with the full path, so
+it works before `~/.cargo/bin` is on your `PATH`:
 
 ```sh
-curl -fsSL https://wsmp.example.com/install.sh | sh && wsmp login https://wsmp.example.com --code wsmp_enr_...
+curl -fsSL https://wsmp.example.com/install.sh | sh && ~/.cargo/bin/wsmp login https://wsmp.example.com --code wsmp_enr_...
 ```
 
-- `/install.sh` builds `wsmp` from source with `cargo install` (Rust 1.88 or
-  newer); there are no 0.4.0 release binaries yet. It builds the commit in
-  `WMP_CLI_SOURCE_REV`; unset, it follows the `redesign-0.4.0` branch, so
-  anyone who can push there reaches every node you add. Pin it to the commit
-  your server runs. The binary lands in `~/.cargo/bin`.
+- `/install.sh` builds `wsmp` from source with `cargo install`; there are no
+  0.4.0 release binaries yet. The node needs Rust 1.88 or newer and a C
+  toolchain (`cc`, for example `build-essential` or the Xcode command-line
+  tools). The binary lands in `~/.cargo/bin`.
+- **Pin `WMP_CLI_SOURCE_REV`; treat it as required.** It must be a full
+  40-character commit hash (a short hash or a tag fails the environment
+  check); get it with `git rev-parse 'v0.4.0^{commit}'`. Unset, the installer
+  follows the `redesign-0.4.0` branch, so anyone who can push there reaches
+  every node you add.
+- Remove a Homebrew 0.3 `wsmp` (`brew uninstall wsmp`) if one is installed:
+  it can shadow `~/.cargo/bin/wsmp` on your `PATH`.
 - `wsmp login <url>` takes the code from `--code`, a prompt, or
   `WSMP_ENROLL_CODE`. It asks for the node's trust level and offers to
   install the per-user service.
@@ -91,16 +98,25 @@ Full details: [`apps/cli/README.md`](../../apps/cli/README.md).
 
 ## Relay protocol 3.0: upgrade every wsmp
 
-The server accepts only relay protocol 3.0, and a 0.4.0 `wsmp` connects only to
-a server that speaks it. A node running an older `wsmp` is refused at hello with
-"This server requires relay protocol 3.0. Upgrade wsmp and restart it.", and the
-web app says "Upgrade wsmp on the node first." A 0.3 node's credential does not exist
-in the new database either, so every node needs the new `wsmp` and a new
-`wsmp login` with an enrollment code.
+A 0.3 node cannot reach a 0.4.0 server at all: its credential does not exist in
+the new database, so it is refused at authentication. Every node needs the new
+`wsmp` and a new `wsmp login` with an enrollment code.
 
-Removed CLI commands include `wsmp connect`, `daemon *`, `token`, `endpoints *`,
-`metrics *` and every `config set-*` capability switch; use `wsmp run`,
-`wsmp service`, `wsmp runtime` and `wsmp trust`.
+The server accepts only relay protocol 3.0, and a 0.4.0 `wsmp` connects only to
+a server that speaks it. A node that is enrolled but runs an older `wsmp` is
+refused at hello with "This server requires relay protocol 3.0. Upgrade wsmp
+and restart it.", and the web app says "Upgrade wsmp on the node first."
+
+**Replace the old service unit.** A 0.3.1 service runs `wsmp daemon start
+--foreground`, which no longer exists. Accept the service offer at
+`wsmp login`, or run `wsmp service install`, to rewrite it. If you log in with
+`--no-service`, run `wsmp service uninstall` first so the old unit stops
+restarting.
+
+Removed CLI commands: `connect`, `daemon *`, `token`, `endpoints *`, `reload`
+and the `config set-*` capability switches. Use `wsmp run`, `wsmp service` and
+`wsmp trust`; runtimes are defined in the web app or through MCP, not with the
+CLI.
 
 ## Trust: Full control and Relay only
 
@@ -127,8 +143,8 @@ commands) keep running, which is why the Lower dialog lists them.
 **Browser terminals** open a shell on a node from the **Terminals** page. They
 need Full control and the node's own opt-in, `wsmp config set-human-terminal
 on` (off by default). Limits are configurable and higher by default: 8 open per
-user (`WMP_TERMINAL_USER_LIMIT`), 4 per node (`WMP_TERMINAL_CLI_LIMIT`), each 1
-to 64, and each node caps its own with `wsmp config set-max-terminals` (1 to
+user and 4 per node. The server settings are `WMP_TERMINAL_USER_LIMIT` and
+`WMP_TERMINAL_CLI_LIMIT` (each 1 to 64), and each node caps its own with `wsmp config set-max-terminals` (1 to
 32, default 4). The lowest limit applies; operator terminals are not counted.
 
 **Interactive steps** are runtime commands a person must run, typically one
@@ -139,8 +155,9 @@ the node opens an operator terminal, which you open from the Terminals page or
 the runtime. It shows the exact command and who wrote it, and runs it only
 after you press Enter. The node then:
 
-- runs only that command on a fresh PTY, never a shell: when it exits the
-  terminal ends, with no prompt left to type into;
+- runs only that command on a fresh PTY (under `/bin/sh -c`), never an
+  interactive shell or prompt: when it exits the terminal ends, with nothing
+  left to type into;
 - runs `sudo -k` before and after it, and strips `SUDO_ASKPASS`, so no sudo
   credential survives between steps;
 - forwards your keystrokes only while the command runs.
@@ -178,6 +195,11 @@ What does not hold:
   set-terminal-approval on`, off by default), the node accepts any browser key
   the server relays, so the server can join an operator terminal itself, press
   Enter on its confirm screen, and send input while the command runs.
+  Approval stops a key the server makes up; it does not stop a modified page
+  running in a browser you already approved.
+- **The server sees the size and timing of every frame.** Each keystroke is
+  its own sealed frame, so a password's length and typing rhythm are visible
+  to the server even though the characters are not.
 - On a browser's first use of a node there is no earlier pin to compare with;
   check the fingerprint if it matters.
 
@@ -189,12 +211,12 @@ Full control only where trusting the server with a shell is fine.
 
 ### Rate limits
 
-The 21 `RATE_LIMIT_*` settings are gone and no longer read (the server warns at
+The `RATE_LIMIT_*` settings are gone and no longer read (the server warns at
 startup when one is still set). Every limit uses its built-in budget, and one
 setting, `WMP_RATE_LIMIT_SCALE` (default 1, 0.1-100), multiplies every budget;
 windows and block durations stay fixed. The per-recipient email caps and the
-failed-password cap are always on: setting their points to 0 no longer turns
-them off.
+failed-password cap are always on (on unreleased master builds, setting their
+points to 0 turned them off; that is gone).
 
 ### Email recipient caps
 
@@ -202,8 +224,9 @@ The anonymous endpoints that send mail to an address in the request body
 (resend verification, request password reset) allow 3 mails per address per hour;
 sign-up has its own cap of 6 per address per hour. Both are always on, with or
 without SMTP configured, and `WMP_RATE_LIMIT_SCALE` can raise them but never
-below 1. The enrollment-code exchange is new and limited to 10 attempts per IP
-per 15 minutes and 20 per user per hour, failures included.
+below 1. The enrollment-code exchange is new: 10 attempts per IP per 15
+minutes, where only failures use up the budget (a successful exchange is
+refunded), and 20 exchanges per code owner per hour, successes included.
 
 ### Other environment changes
 
