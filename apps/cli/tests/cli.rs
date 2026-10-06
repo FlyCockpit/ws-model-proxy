@@ -201,10 +201,11 @@ fn config_set_server_pins_and_clears_a_public_origin() {
     assert_eq!(shown["helloOrigin"], "https://wsmp.example.com");
 
     // Not an origin, or a host a shell would interpret: refused, config
-    // unchanged.
+    // unchanged. Built at run time so the source holds no literal credential URL for secret scanners.
+    let with_credentials = format!("https://{}:{}@wsmp.example.com", "user", "pw");
     for bad in [
         "https://wsmp.example.com/app",
-        format!("https://{}:{}@wsmp.example.com", "user", "pw").as_str(),
+        with_credentials.as_str(),
         "ftp://wsmp.example.com",
         "https://wsmp.example.com/?x=1",
         "https://a$({touch,pwned}).com",

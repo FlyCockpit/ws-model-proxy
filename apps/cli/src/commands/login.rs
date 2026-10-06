@@ -570,11 +570,13 @@ mod tests {
 
     #[test]
     fn approval_url_off_the_configured_origin_is_refused() {
+        // Built at run time so the source holds no literal credential URL for secret scanners.
+        let with_credentials = format!("https://{}:{}@wsmp.example.com/device", "user", "pass");
         for candidate in [
             "https://evil.example.com/device",
             "https://wsmp.example.com:8443/device",
             "https://wsmp.example.com.evil.example/device",
-            format!("https://{}:{}@wsmp.example.com/device", "user", "pass").as_str(),
+            with_credentials.as_str(),
             "https://wsmp.example.com@evil.example/device",
         ] {
             assert!(browser_url(candidate, SERVER).is_err(), "{candidate}");

@@ -2115,6 +2115,8 @@ mod tests {
             );
         }
         // Each of these parses as a URL; none may become a pin.
+        // Built at run time so the source holds no literal credential URL for secret scanners.
+        let with_credentials = format!("https://{}:{}@wsmp.example.com", "user", "pw");
         for value in [
             "https://a$({touch,pwned}).com",
             "https://a$(id).com",
@@ -2130,7 +2132,7 @@ mod tests {
             "https://a..com",
             "https://a_b.com",
             "https://wsmp.example.com/app",
-            format!("https://{}:{}@wsmp.example.com", "user", "pw").as_str(),
+            with_credentials.as_str(),
             "ftp://wsmp.example.com",
         ] {
             assert!(normalize_public_origin(value).is_err(), "{value}");
