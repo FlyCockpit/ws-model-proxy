@@ -1,0 +1,22 @@
+{
+  "type": "node.state",
+  "trust": {
+    "value": "full",
+    "frozen": true
+  },
+  "features": {
+    "terminals": {
+      "supported": true,
+      "max": 4,
+      "approvalRequired": false
+    },
+    "operatorTerminals": true,
+    "files": {
+      "roots": ["/home/me/models"],
+      "asRoot": false
+    },
+    "runtimeHosts": ["10.0.0.5:8000"],
+    "mediaExpand": true,
+    "liveStt": true
+  }
+}

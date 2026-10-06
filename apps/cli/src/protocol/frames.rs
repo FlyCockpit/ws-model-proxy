@@ -84,10 +84,13 @@ pub struct TrustState {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FrozenPeerSet {
     pub runtime_id: String,
+    /// The head IP literal this node last joined for that runtime.
     pub head_addr: String,
-    pub peers: Vec<String>,
 }
 
+/// One held server-origin definition VERSION: a node keeps every version the
+/// server pushed and did not remove (current, profile-pinned, running),
+/// keyed by `version_id`. The frozen copy is the same set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HeldDefinition {
@@ -217,6 +220,9 @@ pub struct AlwaysOnInventory {
     pub models: Vec<InventoryModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_facts: Option<EngineFacts>,
+    /// `true` when the entry was cut down to fit one chunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,8 +646,7 @@ pub enum DefineRejectReason {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DefineEntryResult {
     pub runtime_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version_id: Option<String>,
+    pub version_id: String,
     pub status: DefineStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<DefineRejectReason>,
@@ -945,7 +950,6 @@ pub enum NodeFrame {
         definitions: Vec<HeldDefinition>,
         held_metric_commands_hash: Option<String>,
         held_port_range: Option<[u16; 2]>,
-        runtimes: Vec<AlwaysOnInventory>,
     },
     #[serde(rename = "heartbeat")]
     Heartbeat {
@@ -980,22 +984,41 @@ pub enum NodeFrame {
         stopped: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<JobError>,
+        /// Which check failed: a field path, never a value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<u8>,
     },
     #[serde(rename = "runtime.define.result")]
+    /// Answers one define chunk; the final answer also carries the held state.
     RuntimeDefineResult {
         op_id: String,
+        chunk_index: u32,
+        #[serde(rename = "final")]
+        is_final: bool,
         results: Vec<DefineEntryResult>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node: Option<DefineNodeResult>,
-        /// The complete held set after applying the frame.
-        held: Vec<HeldDefinition>,
-        held_metric_commands_hash: Option<String>,
-        held_port_range: Option<[u16; 2]>,
-        frozen: bool,
+        /// Final only: the complete held set after applying the operation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        held: Option<Vec<HeldDefinition>>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "double_option"
+        )]
+        held_metric_commands_hash: Option<Option<String>>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "double_option"
+        )]
+        held_port_range: Option<Option<[u16; 2]>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frozen: Option<bool>,
     },
     #[serde(rename = "runtime.detected")]
     RuntimeDetected {
@@ -1179,10 +1202,18 @@ pub enum ServerFrame {
     #[serde(rename = "trust.lower")]
     TrustLower { id: String, requested_at: String },
     #[serde(rename = "runtime.define")]
+    /// One byte-bounded chunk of a define operation; applied after `final`.
     RuntimeDefine {
         op_id: String,
+        chunk_index: u32,
+        #[serde(rename = "final")]
+        is_final: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         put: Option<Vec<DefinitionEnvelope>>,
+        /// `complete` only: held versions to keep (by version id).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keep: Option<Vec<String>>,
+        /// Incremental only: versions to drop (by version id).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remove: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1360,6 +1391,159 @@ pub enum NodeBinaryMetadata {
     FileData { op_id: String },
 }
 
+/// Serde helper for "absent / null / value" fields.
+mod double_option {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer, T: Serialize>(
+        value: &Option<Option<T>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(inner) => inner.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Option<T>>, D::Error> {
+        Option::<T>::deserialize(deserializer).map(Some)
+    }
+}
+
+/// A cross-field rule a frame broke (the zod schemas refuse the same frames;
+/// shared vectors: `relay-3.0/invalid/*/semantic-*.json`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameRuleError(pub &'static str);
+
+impl std::fmt::Display for FrameRuleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for FrameRuleError {}
+
+fn rule(ok: bool, message: &'static str) -> Result<(), FrameRuleError> {
+    if ok {
+        Ok(())
+    } else {
+        Err(FrameRuleError(message))
+    }
+}
+
+impl TrustState {
+    pub fn validate(&self) -> Result<(), FrameRuleError> {
+        rule(
+            self.frozen == (self.value == TrustValue::Relay),
+            "frozen is true exactly at relay",
+        )?;
+        rule(
+            self.value == TrustValue::Relay || self.frozen_peers.is_none(),
+            "only a relay node reports frozen peers",
+        )
+    }
+}
+
+impl DefinitionEnvelope {
+    pub fn validate(&self) -> Result<(), FrameRuleError> {
+        rule(self.spec.kind() == self.kind, "kind must match the spec")
+    }
+}
+
+impl RuntimeJob {
+    pub fn validate(&self) -> Result<(), FrameRuleError> {
+        rule(self.rank < self.nnodes, "rank must be below nnodes")?;
+        rule(
+            self.unit_name == runtime_unit_name(&self.handle, self.rank),
+            "unitName must be wsmp-<handle>-r<rank>",
+        )
+    }
+}
+
+impl NodeFrame {
+    /// Cross-field rules serde cannot express.
+    pub fn validate(&self) -> Result<(), FrameRuleError> {
+        match self {
+            Self::Hello { trust, .. } | Self::NodeState { trust, .. } => trust.validate(),
+            Self::RuntimeJobResult {
+                status,
+                error,
+                exit_code,
+                ..
+            } => {
+                rule(
+                    (*status == JobStatus::Failed) == error.is_some(),
+                    "error exactly on failed results",
+                )?;
+                rule(
+                    exit_code.is_none() || *status == JobStatus::OperatorClosed,
+                    "only operator_closed carries an exit code",
+                )
+            }
+            Self::RuntimeDefineResult {
+                is_final,
+                results,
+                held,
+                held_metric_commands_hash,
+                held_port_range,
+                frozen,
+                ..
+            } => {
+                rule(
+                    [
+                        held.is_some(),
+                        held_metric_commands_hash.is_some(),
+                        held_port_range.is_some(),
+                        frozen.is_some(),
+                    ]
+                    .iter()
+                    .all(|present| present == is_final),
+                    "held state exactly on the final answer",
+                )?;
+                rule(
+                    results
+                        .iter()
+                        .all(|r| (r.status == DefineStatus::Rejected) == r.reason.is_some()),
+                    "reason exactly for rejected entries",
+                )
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl ServerFrame {
+    /// Cross-field rules serde cannot express.
+    pub fn validate(&self) -> Result<(), FrameRuleError> {
+        match self {
+            Self::RuntimeJob(job) => job.validate(),
+            Self::RuntimeDefine {
+                put,
+                keep,
+                remove,
+                complete,
+                ..
+            } => {
+                let complete = complete.unwrap_or(false);
+                rule(
+                    !complete || remove.is_none(),
+                    "a complete operation lists put and keep, never remove",
+                )?;
+                rule(
+                    complete || keep.is_none(),
+                    "keep belongs to complete operations",
+                )?;
+                put.iter()
+                    .flatten()
+                    .try_for_each(DefinitionEnvelope::validate)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1410,12 +1594,40 @@ mod tests {
         }
     }
 
-    fn round_trip<T: DeserializeOwned + Serialize>(dir: &str) -> Vec<(String, T)> {
+    trait Validated {
+        fn ok(&self) -> bool;
+    }
+    impl Validated for NodeFrame {
+        fn ok(&self) -> bool {
+            self.validate().is_ok()
+        }
+    }
+    impl Validated for ServerFrame {
+        fn ok(&self) -> bool {
+            self.validate().is_ok()
+        }
+    }
+    impl Validated for ServerBinaryMetadata {
+        fn ok(&self) -> bool {
+            true
+        }
+    }
+    impl Validated for NodeBinaryMetadata {
+        fn ok(&self) -> bool {
+            true
+        }
+    }
+    fn valid<T: Validated>(frame: &T) -> bool {
+        frame.ok()
+    }
+
+    fn round_trip<T: DeserializeOwned + Serialize + Validated>(dir: &str) -> Vec<(String, T)> {
         load(dir)
             .into_iter()
             .map(|(name, json)| {
                 let frame: T = serde_json::from_value(json.clone())
                     .unwrap_or_else(|error| panic!("{dir}/{name}: {error}"));
+                assert!(valid(&frame), "{dir}/{name} breaks a cross-field rule");
                 let back = serde_json::to_value(&frame).expect("serializes");
                 assert!(
                     same(&back, &json),
@@ -1445,28 +1657,30 @@ mod tests {
     #[test]
     fn invalid_frames_are_refused() {
         for (name, json) in load("invalid/server-to-node") {
-            assert!(
-                serde_json::from_value::<ServerFrame>(json).is_err(),
-                "server-to-node/{name} must be refused"
-            );
+            let refused = serde_json::from_value::<ServerFrame>(json)
+                .map_or(true, |frame| frame.validate().is_err());
+            assert!(refused, "server-to-node/{name} must be refused");
         }
         for (name, json) in load("invalid/node-to-server") {
-            assert!(
-                serde_json::from_value::<NodeFrame>(json).is_err(),
-                "node-to-server/{name} must be refused"
-            );
+            let refused = serde_json::from_value::<NodeFrame>(json)
+                .map_or(true, |frame| frame.validate().is_err());
+            assert!(refused, "node-to-server/{name} must be refused");
         }
     }
 
     #[test]
     fn define_and_inventory_name_the_launch_hash_of_their_spec() {
-        let define = load("frames/server-to-node")
+        let defines: Vec<Value> = load("frames/server-to-node")
             .into_iter()
-            .find(|(name, _)| name == "runtime.define.json")
             .map(|(_, json)| json)
-            .expect("runtime.define fixture");
-        let put = define["put"].as_array().expect("put");
-        assert!(!put.is_empty());
+            .filter(|json| json["type"] == "runtime.define")
+            .collect();
+        let put: Vec<&Value> = defines
+            .iter()
+            .filter_map(|define| define["put"].as_array())
+            .flatten()
+            .collect();
+        assert!(put.len() > 1);
         for envelope in put {
             // Hash the spec exactly as received ...
             assert_eq!(
@@ -1483,6 +1697,10 @@ mod tests {
                 envelope["launchHash"].as_str().unwrap_or_default()
             );
         }
+        let define = defines
+            .iter()
+            .find(|define| define.get("node").is_some())
+            .expect("a define with the node part");
         let commands = &define["node"]["metricCommands"];
         assert_eq!(
             canonical_sha256(&commands["commands"]).expect("hash"),

@@ -1,0 +1,65 @@
+{
+  "type": "runtime.define",
+  "opId": "def-1",
+  "chunkIndex": 0,
+  "final": false,
+  "complete": true,
+  "put": [
+    {
+      "runtimeId": "rt1q8m3k2v9x7c4b6n0z5h1j8",
+      "versionId": "vr1a2b3c4d5e6f7g8h9i0j1k2",
+      "launchHash": "7d80f5e860fb99a08c22b7aefb21407ce26c1d4b6c15d1050d1ff1c043f63b40",
+      "kind": "startable",
+      "slug": "qwen3-32b",
+      "spec": {
+        "api": "openai",
+        "engine": "vllm",
+        "modelType": "llm",
+        "models": [
+          {
+            "id": "Qwen/Qwen3-32B",
+            "capabilities": ["text_generation", "responses_api"]
+          }
+        ],
+        "launch": {
+          "management": "process",
+          "groupSize": 2,
+          "resources": [
+            {
+              "kind": "discrete",
+              "gpuCount": 1,
+              "vramGb": 79.5,
+              "vendor": "nvidia"
+            }
+          ],
+          "labels": ["h100"],
+          "iface": "eth0",
+          "commands": [
+            {
+              "prepare": "huggingface-cli download Qwen/Qwen3-32B",
+              "start": "vllm serve Qwen/Qwen3-32B --port {{port}} --pipeline-parallel-size {{nnodes}} --node-rank {{node_rank}} --master-addr {{head_addr}} --master-port {{dist_port}} --gpu-memory-utilization {{memory_fraction}}",
+              "stop": "true",
+              "timeoutsSec": {
+                "prepare": 86400,
+                "start": 1800
+              }
+            }
+          ],
+          "readiness": {
+            "path": "/health",
+            "expectedStatus": 200,
+            "timeoutMs": 1800000
+          },
+          "health": {
+            "intervalMs": 30000,
+            "failureThreshold": 3,
+            "successThreshold": 1
+          }
+        },
+        "metricsReader": {
+          "kind": "builtin"
+        }
+      }
+    }
+  ]
+}

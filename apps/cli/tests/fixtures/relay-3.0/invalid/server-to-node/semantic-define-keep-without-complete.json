@@ -3,5 +3,6 @@
   "opId": "def-2",
   "chunkIndex": 0,
   "final": true,
-  "remove": ["vr2z9y8x7w6v5u4t3s2r1q0p9"]
+  "remove": ["vr2z9y8x7w6v5u4t3s2r1q0p9"],
+  "keep": ["vr1a2b3c4d5e6f7g8h9i0j1k2"]
 }

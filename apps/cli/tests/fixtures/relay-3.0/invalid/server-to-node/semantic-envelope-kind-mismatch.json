@@ -1,15 +1,14 @@
 {
   "type": "runtime.define",
-  "opId": "def-1",
-  "chunkIndex": 1,
+  "opId": "def-2",
+  "chunkIndex": 0,
   "final": true,
-  "complete": true,
   "put": [
     {
       "runtimeId": "rt2p9o8i7u6y5t4r3e2w1q0a9",
       "versionId": "vr2z9y8x7w6v5u4t3s2r1q0p9",
       "launchHash": "cab1dcd89087852aa3ba53595f7406545fcf43c7d0efcd5a3e8316bc76b90960",
-      "kind": "always_on",
+      "kind": "startable",
       "slug": "bge",
       "spec": {
         "api": "openai",
@@ -49,21 +48,5 @@
         "expandMedia": false
       }
     }
-  ],
-  "keep": ["vr1b2c3d4e5f6g7h8i9j0k1l2"],
-  "node": {
-    "portRange": [30000, 30999],
-    "metricCommands": {
-      "hash": "bab560648992cf2cac00bd361ddee7bf69baab83e9712853ccae40558fae6eca",
-      "commands": [
-        {
-          "name": "gpu_power",
-          "command": "nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits",
-          "intervalSecs": 30,
-          "timeoutSecs": 5,
-          "format": "lines"
-        }
-      ]
-    }
-  }
+  ]
 }

@@ -76,8 +76,14 @@ export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v3";
 export const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
 export const RELAY_BINARY_CHUNK_MAX_BYTES = 1024 * 1024;
 export const RELAY_REQUEST_BODY_WINDOW_CHUNKS = 16;
-/** Per-chunk bound of `runtime.inventory` (both lists together). */
+/** Entry bound of one `runtime.inventory` chunk (both lists together). */
 export const RUNTIME_INVENTORY_CHUNK_MAX = 512;
+/**
+ * Byte budget a sender fills a chunked frame (`runtime.define`, its result, `runtime.inventory`)
+ * up to before starting the next chunk; leaves room under the 64 KiB control cap for the
+ * envelope. Every frame of 3.0 must encode within `RELAY_JSON_CONTROL_MAX_BYTES`.
+ */
+export const CHUNK_BUDGET_BYTES = 60 * 1024;
 /** Server accepts at most one `node.info` per this window. */
 export const NODE_INFO_MIN_INTERVAL_MS = 5_000;
 
@@ -143,7 +149,6 @@ export const frozenPeerSetSchema = z
     runtimeId: rowIdSchema,
     /** The head IP literal this node last joined. */
     headAddr: z.string().regex(/^(?:[0-9.]{7,15}|[0-9A-Fa-f:.]{2,45})$/),
-    peers: z.array(nodeSlugSchema).max(63),
   })
   .strict();
 
@@ -162,7 +167,11 @@ export const nodeTrustStateSchema = z
     message: "Only a relay node reports frozen peers.",
   });
 
-/** One held server-origin definition. */
+/**
+ * One held server-origin definition VERSION. A node holds every version the server pushed and
+ * did not remove (current, profile-pinned, running), keyed by `versionId`; several versions of
+ * one runtime are normal. The frozen copy (Relay only) is the same set.
+ */
 export const heldDefinitionSchema = z
   .object({ runtimeId: rowIdSchema, versionId: rowIdSchema, launchHash: sha256HexSchema })
   .strict();
@@ -233,6 +242,11 @@ export const alwaysOnInventorySchema = z
     status: z.enum(["unknown", "online", "degraded", "offline"]),
     models: z.array(inventoryModelSchema).max(1000),
     engineFacts: engineFactsSchema.optional(),
+    /**
+     * One entry must fit one chunk: the node first drops per-model engine facts, then models,
+     * and says so here (the server keeps the models it already knows).
+     */
+    truncated: z.literal(true).optional(),
   })
   .strict()
   .superRefine((entry, ctx) => {
@@ -414,8 +428,9 @@ export const nodeMetricsFrameSchema = z
         z
           .object({
             name: metricName,
+            /** Label values are free text (GPU names have spaces), no control characters. */
             labels: z
-              .record(metricName, metricName)
+              .record(metricName, z.string().regex(/^[^\p{Cc}]{1,128}$/u))
               .refine((labels) => Object.keys(labels).length <= 16)
               .optional(),
             value: z.number().finite(),
@@ -423,7 +438,8 @@ export const nodeMetricsFrameSchema = z
           })
           .strict(),
       )
-      .max(64)
+      /** 16 metric commands × 16 metrics each. */
+      .max(256)
       .optional(),
     /** Per metric command status. Command text and output never leave the node. */
     metricCommands: z
@@ -488,15 +504,31 @@ export const definitionEnvelopeSchema = z
   });
 export type DefinitionEnvelope = z.infer<typeof definitionEnvelopeSchema>;
 
+/**
+ * One chunk of a define operation. The server splits an operation by bytes
+ * (`CHUNK_BUDGET_BYTES`; one envelope always fits, see `RUNTIME_SPEC_MAX_BYTES`); the node
+ * applies the operation once, after the `final` chunk, and answers every chunk.
+ */
 export const runtimeDefineFrameSchema = z
   .object({
     type: z.literal("runtime.define"),
     opId: relayIdSchema,
+    chunkIndex: z.number().int().min(0).max(RUNTIME_DEFINITIONS_MAX),
+    final: z.boolean(),
+    /** New versions to hold. */
     put: z.array(definitionEnvelopeSchema).max(RUNTIME_DEFINITIONS_MAX).optional(),
+    /** `complete` only: versions the node already holds and keeps (no re-send). */
+    keep: z.array(rowIdSchema).max(RUNTIME_DEFINITIONS_MAX).optional(),
+    /** Incremental only: versions to drop. */
     remove: z.array(rowIdSchema).max(RUNTIME_DEFINITIONS_MAX).optional(),
-    /** The server-origin set after this frame is exactly `put` ∪ unchanged held − `remove`. */
+    /**
+     * Same on every chunk of the operation. true: the operation carries the WHOLE server-origin
+     * set; after the final chunk the node holds exactly `put` ∪ `keep` (over all chunks) and drops
+     * every other server-origin version. false/absent: apply `put` and `remove` only. The server
+     * never omits a version a running instance launched from.
+     */
     complete: z.boolean().optional(),
-    /** The node's own definition; frozen with the rest at Relay only. */
+    /** The node's own definition, at most once per operation; frozen with the rest at Relay only. */
     node: z
       .object({
         portRange: portRangeSchema,
@@ -507,7 +539,13 @@ export const runtimeDefineFrameSchema = z
       .strict()
       .optional(),
   })
-  .strict();
+  .strict()
+  .refine((frame) => !frame.complete || frame.remove === undefined, {
+    message: "A complete operation lists put and keep, never remove.",
+  })
+  .refine((frame) => frame.complete || frame.keep === undefined, {
+    message: "keep belongs to complete operations.",
+  });
 
 export const DEFINE_REJECT_REASONS = [
   "trust_relay",
@@ -518,20 +556,27 @@ export const DEFINE_REJECT_REASONS = [
   "conflict",
   "limit",
 ] as const;
+/** Answers one define chunk; the final answer also carries the node's whole held state. */
 export const runtimeDefineResultFrameSchema = z
   .object({
     type: z.literal("runtime.define.result"),
     opId: relayIdSchema,
+    chunkIndex: z.number().int().min(0).max(RUNTIME_DEFINITIONS_MAX),
+    final: z.boolean(),
+    /** One entry per `put`, `remove` and (complete) implicitly dropped version, by version. */
     results: z
       .array(
         z
           .object({
             runtimeId: rowIdSchema,
-            versionId: rowIdSchema.optional(),
+            versionId: rowIdSchema,
             status: z.enum(["applied", "unchanged", "removed", "rejected"]),
             reason: z.enum(DEFINE_REJECT_REASONS).optional(),
-            /** For `invalid`: the JSON path; never spec text. */
-            detail: z.string().max(256).optional(),
+            /** For `invalid`: the JSON path (never spec text). */
+            detail: z
+              .string()
+              .regex(/^[A-Za-z0-9_.$[\]-]{1,128}$/)
+              .optional(),
           })
           .strict()
           .refine((result) => (result.status === "rejected") === (result.reason !== undefined), {
@@ -546,14 +591,24 @@ export const runtimeDefineResultFrameSchema = z
       })
       .strict()
       .optional(),
-    /** The node's complete held set after applying the frame (replaces Node.heldDefinitions). */
-    held: z.array(heldDefinitionSchema).max(RUNTIME_DEFINITIONS_MAX),
-    /** Hash of the metric commands the node holds (null: none received yet). */
-    heldMetricCommandsHash: sha256HexSchema.nullable(),
-    heldPortRange: portRangeSchema.nullable(),
-    frozen: z.boolean(),
+    /** Final only: the node's complete held set (replaces Node.heldDefinitions). */
+    held: z.array(heldDefinitionSchema).max(RUNTIME_DEFINITIONS_MAX).optional(),
+    /** Final only: hash of the metric commands the node holds (null: none received yet). */
+    heldMetricCommandsHash: sha256HexSchema.nullable().optional(),
+    heldPortRange: portRangeSchema.nullable().optional(),
+    frozen: z.boolean().optional(),
   })
-  .strict();
+  .strict()
+  .refine(
+    (frame) =>
+      [frame.held, frame.heldMetricCommandsHash, frame.heldPortRange, frame.frozen].every(
+        (field) => (field !== undefined) === frame.final,
+      ),
+    {
+      message:
+        "held, heldMetricCommandsHash, heldPortRange and frozen exactly on the final answer.",
+    },
+  );
 
 // ── runtime.job ──
 
@@ -671,6 +726,11 @@ export const runtimeJobResultFrameSchema = z
     /** True only after the stop command and unit teardown succeeded. */
     stopped: z.boolean(),
     error: z.enum(RUNTIME_JOB_ERRORS).optional(),
+    /** Which check failed (`bad_job`, `definition_missing`): a field path, never a value. */
+    detail: z
+      .string()
+      .regex(/^[A-Za-z0-9_.$[\]-]{1,128}$/)
+      .optional(),
     terminalId: base64Url16Schema.optional(),
     exitCode: z.number().int().min(0).max(255).optional(),
   })
@@ -768,8 +828,6 @@ export const helloFrameSchema = z
     definitions: z.array(heldDefinitionSchema).max(RUNTIME_DEFINITIONS_MAX),
     heldMetricCommandsHash: sha256HexSchema.nullable(),
     heldPortRange: portRangeSchema.nullable(),
-    /** Always-on runtimes as in `runtime.inventory`. */
-    runtimes: z.array(alwaysOnInventorySchema).max(RUNTIME_INVENTORY_CHUNK_MAX),
   })
   .strict();
 

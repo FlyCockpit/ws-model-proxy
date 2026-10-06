@@ -13,6 +13,7 @@ import {
   NODE_TO_SERVER_CONTROL_TYPES,
   nodeToServerBinaryMetadataSchema,
   nodeToServerControlFrameSchema,
+  RELAY_JSON_CONTROL_MAX_BYTES,
   SERVER_TO_NODE_CONTROL_TYPES,
   serverToNodeBinaryMetadataSchema,
   serverToNodeControlFrameSchema,
@@ -69,12 +70,16 @@ describe("relay 3.0 frames", () => {
   });
 
   it("names the launch hash of every spec it carries", () => {
-    const define = serverToNode.find(([name]) => name === "runtime.define.json")?.[1];
-    const put = (define?.put ?? []) as Array<{ launchHash: string; spec: unknown }>;
-    expect(put.length).toBeGreaterThan(0);
+    const defines = serverToNode.filter(([, frame]) => frame.type === "runtime.define");
+    const put = defines.flatMap(
+      ([, frame]) => (frame.put ?? []) as Array<{ launchHash: string; spec: unknown }>,
+    );
+    expect(put.length).toBeGreaterThan(1);
     for (const envelope of put)
       expect(runtimeLaunchHash(runtimeSpecSchema.parse(envelope.spec))).toBe(envelope.launchHash);
-    const node = define?.node as { metricCommands: { hash: string; commands: never[] } };
+    const node = defines.find(([, frame]) => frame.node)?.[1].node as {
+      metricCommands: { hash: string; commands: never[] };
+    };
     expect(nodeMetricCommandsHash(node.metricCommands.commands)).toBe(node.metricCommands.hash);
     const inventory = nodeToServer.find(([name]) => name === "runtime.inventory.json")?.[1];
     for (const entry of (inventory?.alwaysOn ?? []) as Array<{
@@ -83,6 +88,30 @@ describe("relay 3.0 frames", () => {
     }>)
       if (entry.spec)
         expect(runtimeLaunchHash(runtimeSpecSchema.parse(entry.spec))).toBe(entry.launchHash);
+  });
+
+  it("never transforms what it parses (the server hashes the parsed spec, the node the raw one)", () => {
+    const sets = [
+      [nodeToServerControlFrameSchema, nodeToServer],
+      [serverToNodeControlFrameSchema, serverToNode],
+    ] as const;
+    for (const [schema, frames] of sets)
+      for (const [name, frame] of frames)
+        expect(canonicalJson(schema.parse(frame)), name).toBe(canonicalJson(frame));
+    const padded = structuredClone(
+      serverToNode.find(([name]) => name === "runtime.define.json")?.[1].put,
+    ) as Array<{ spec: { models: Array<{ embeddingContract: { model: string } }> } }>;
+    const spec = padded[0]?.spec;
+    if (!spec?.models[0]) throw new Error("fixture changed");
+    spec.models[0].embeddingContract.model = " BAAI/bge-m3 ";
+    expect(runtimeSpecSchema.safeParse(spec).success).toBe(false);
+  });
+
+  it("keeps every frame fixture under the 64 KiB control cap", () => {
+    for (const [name, frame] of [...nodeToServer, ...serverToNode])
+      expect(new TextEncoder().encode(JSON.stringify(frame)).byteLength, name).toBeLessThan(
+        RELAY_JSON_CONTROL_MAX_BYTES,
+      );
   });
 });
 

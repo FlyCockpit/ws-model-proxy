@@ -26,7 +26,7 @@ export function runtimeContentHash(input: {
     contextLimit: number | null;
     kvBudgetTokens: number | null;
     kvFullThreshold: number | null;
-    engineLoadGate: "auto" | "enforce" | "observe";
+    engineLoadGate: "AUTO" | "ENFORCE" | "OBSERVE";
   };
   advanced: Record<string, unknown>;
 }): string {

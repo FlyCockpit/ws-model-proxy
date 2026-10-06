@@ -13,7 +13,6 @@
  * Pure module (no Node built-ins): the web Definition form validates with it too.
  */
 import { z } from "zod";
-import { embeddingContractSchema } from "./embedding-contract";
 import { transcriptionProfileSchema } from "./transcription-profile";
 
 // ── Vocabularies (wire values; Prisma enums are the upper-case forms) ──
@@ -78,9 +77,12 @@ export type RuntimePlaceholder = (typeof RUNTIME_PLACEHOLDERS)[number];
 
 /** UTF-8 bytes of one command, saved and after placeholder substitution. */
 export const RUNTIME_COMMAND_MAX_BYTES = 4096;
-/** UTF-8 bytes of one canonical spec (`runtime.define` refuses larger). */
-export const RUNTIME_SPEC_MAX_BYTES = 64 * 1024;
-/** Server-origin definitions one node holds. */
+/**
+ * UTF-8 bytes of one canonical spec. Below the 64 KiB control-frame cap so one define envelope
+ * always fits in one `runtime.define` chunk.
+ */
+export const RUNTIME_SPEC_MAX_BYTES = 48 * 1024;
+/** Server-origin definition VERSIONS one node holds (current, pinned and running ones). */
 export const RUNTIME_DEFINITIONS_MAX = 128;
 export const RUNTIME_GROUP_SIZE_MAX = 64;
 export const RUNTIME_MODELS_MAX = 64;
@@ -137,6 +139,30 @@ export const runtimeTextSchema = (maxBytes: number) =>
         ctx.addIssue({ code: "custom", message: `Text must be at most ${maxBytes} bytes.` });
     });
 
+// ── Hash-safe values ──
+//
+// `launchHash` is computed by the server over the parsed spec and by the node over the spec as
+// received, so nothing in this file may transform a value (no .trim(), .default(), coercion):
+// a schema only accepts or refuses. `runtime-spec.test.ts` checks parse(x) deep-equals x.
+
+/** Text with no surrounding whitespace (refused, never trimmed). */
+export const exactTextSchema = (maxBytes: number) =>
+  runtimeTextSchema(maxBytes).refine(
+    (value) => value.length > 0 && value.trim() === value,
+    "Text must not be blank or have leading or trailing spaces.",
+  );
+
+/** A number canonical JSON can hash: a safe integer, or 1e-6 ≤ |x| < 1e15. */
+export function isCanonicalNumber(value: number): boolean {
+  if (!Number.isFinite(value)) return false;
+  if (Number.isInteger(value)) return Number.isSafeInteger(value);
+  const magnitude = Math.abs(value);
+  return magnitude >= 1e-6 && magnitude < 1e15;
+}
+export const canonicalNumberSchema = z
+  .number()
+  .refine(isCanonicalNumber, "Use a whole number or a decimal between 0.000001 and 1e15.");
+
 const PLACEHOLDER = /\{\{([a-z_]+)\}\}/g;
 export const runtimeCommandSchema = runtimeTextSchema(RUNTIME_COMMAND_MAX_BYTES)
   .refine((value) => value.trim().length > 0, "Command must not be blank.")
@@ -169,11 +195,22 @@ export const runtimeLabelsSchema = z
 
 // ── Models ──
 
+/** Identity of a vector space (validate-only copy of `embedding-contract.ts` for hashing). */
+export const specEmbeddingContractSchema = z
+  .object({
+    model: exactTextSchema(256),
+    revision: exactTextSchema(256),
+    dimensions: z.number().int().positive().max(1_000_000),
+    normalization: z.enum(["none", "l2"]),
+    vectorSpace: exactTextSchema(256),
+  })
+  .strict();
+
 export const runtimeSpecModelSchema = z
   .object({
     id: servedModelIdSchema,
     capabilities: z.array(z.enum(MODEL_CAPABILITIES)).max(MODEL_CAPABILITIES.length).optional(),
-    embeddingContract: embeddingContractSchema.optional(),
+    embeddingContract: specEmbeddingContractSchema.optional(),
     transcription: transcriptionProfileSchema.optional(),
   })
   .strict();
@@ -214,7 +251,12 @@ export const runtimeBaseUrlSchema = z
       ctx.addIssue({ code: "custom", message: "No user info, query or fragment." });
     if (url.hostname !== "localhost" && !isIpLiteral(url.hostname))
       ctx.addIssue({ code: "custom", message: "The host must be localhost or an IP literal." });
-    if (url.pathname !== "/" && !/^(\/[A-Za-z0-9._~-]+)+$/.test(url.pathname))
+    // The stored text is the normalized form, so TS and Rust URL parsers cannot disagree
+    // (`http://2130706433/`, `/v1/../x`, upper-case schemes are refused, not normalized).
+    const normalized = url.pathname === "/" ? url.origin : `${url.origin}${url.pathname}`;
+    if (value !== normalized)
+      ctx.addIssue({ code: "custom", message: `Write the address as ${normalized}.` });
+    if (url.pathname !== "/" && !/^(\/[A-Za-z0-9_~-][A-Za-z0-9._~-]*)+$/.test(url.pathname))
       ctx.addIssue({ code: "custom", message: "The API prefix must be a plain path." });
   });
 
@@ -254,7 +296,10 @@ export type RuntimeAddress = z.infer<typeof runtimeAddressSchema>;
 // ── Launch (STARTABLE) ──
 
 /** GiB (2^30 bytes), like node budgets. */
-const gib = z.number().finite().positive().max(1_000_000);
+const gib = canonicalNumberSchema.refine(
+  (value) => value > 0 && value <= 1_000_000,
+  "0 < GiB ≤ 1e6.",
+);
 export const GPU_VENDORS = ["nvidia", "amd", "intel", "apple", "other"] as const;
 export type GpuVendor = (typeof GPU_VENDORS)[number];
 
@@ -316,7 +361,8 @@ export const runtimeLaunchSchema = z
     resources: z.array(runtimeResourceSchema).min(1).max(RUNTIME_GROUP_SIZE_MAX),
     labels: runtimeLabelsSchema,
     port: z
-      .object({ fixed: z.number().int().min(1).max(65_535) })
+      // Ports below 1024 are refused here as on the node (§4.6), never only at dispatch.
+      .object({ fixed: z.number().int().min(1024).max(65_535) })
       .strict()
       .optional(),
     iface: z.string().regex(RUNTIME_IFACE_PATTERN).optional(),
@@ -395,15 +441,15 @@ export type RuntimeLaunch = z.infer<typeof runtimeLaunchSchema>;
 export const readerMapEntrySchema = z
   .object({
     /** A Prometheus series name or an RFC 6901 JSON pointer. */
-    series: z.string().trim().min(1).max(256),
+    series: exactTextSchema(256),
     labels: z
       .record(z.string().regex(METRIC_SERIES_NAME_PATTERN), z.string().min(1).max(64))
       .refine((labels) => Object.keys(labels).length <= 16, "At most 16 labels.")
       .optional(),
     aggregate: z.enum(["sum", "max", "first"]).optional(),
-    scale: z.number().finite().optional(),
+    scale: canonicalNumberSchema.optional(),
     /** Divide by this other series (same syntax), e.g. used/total. */
-    divideBy: z.string().trim().min(1).max(256).optional(),
+    divideBy: exactTextSchema(256).optional(),
   })
   .strict();
 export const readerMapSchema = z.partialRecord(z.enum(READER_SIGNALS), readerMapEntrySchema);
@@ -540,9 +586,14 @@ export const declaredHardwareSchema = z
     memoryGb: gib.optional(),
     acceleratorMemoryGb: gib.optional(),
     /** Used by things outside wsmp (always-on servers, the desktop). */
-    reservedMemoryGb: z.number().finite().min(0).max(1_000_000).optional(),
+    reservedMemoryGb: canonicalNumberSchema
+      .refine((value) => value >= 0 && value <= 1_000_000)
+      .optional(),
     reservedVramGb: z
-      .record(gpuKeySchema, z.number().finite().min(0).max(1_000_000))
+      .record(
+        gpuKeySchema,
+        canonicalNumberSchema.refine((value) => value >= 0 && value <= 1_000_000),
+      )
       .refine((map) => Object.keys(map).length <= 256, "At most 256 GPUs.")
       .optional(),
     gpus: z
@@ -551,7 +602,7 @@ export const declaredHardwareSchema = z
           .object({
             vendor: z.enum(GPU_VENDORS),
             index: z.number().int().min(0).max(255),
-            name: z.string().trim().min(1).max(256).optional(),
+            name: exactTextSchema(256).optional(),
             vramGb: gib,
           })
           .strict(),
