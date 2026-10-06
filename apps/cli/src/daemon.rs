@@ -1819,7 +1819,7 @@ where
         return Ok(());
     }
 
-    let Some(endpoint) = targets.get(&handle).map(|target| &target.endpoint) else {
+    let Some(target) = targets.get(&handle) else {
         send_relay_error(
             socket,
             &request_id,
@@ -1829,6 +1829,25 @@ where
         )?;
         return Ok(());
     };
+    // §4.8: only the routes this runtime's API, model type and definition
+    // name, checked on the path as sent, before any connection is opened.
+    if !crate::runtimes::allowlist::allowed(&target.spec, &method, &path) {
+        tracing::warn!(
+            request_id,
+            handle,
+            method,
+            "refused a relayed path outside the allowlist"
+        );
+        send_relay_error(
+            socket,
+            &request_id,
+            RelayFailure::AccessDenied,
+            Some(crate::runtimes::allowlist::PATH_NOT_ALLOWED.to_string()),
+            None,
+        )?;
+        return Ok(());
+    }
+    let endpoint = &target.endpoint;
 
     let spec = UpstreamRequestSpec {
         request_id: request_id.clone(),
@@ -3283,6 +3302,11 @@ fn websocket_url(server_url: &str) -> Result<Url> {
 pub(crate) fn endpoint_url(base_url: &str, request_path: &str) -> Result<Url> {
     let mut base =
         Url::parse(base_url).with_context(|| format!("parsing endpoint URL `{base_url}`"))?;
+    // API paths (`/v1/...`) join onto the base URL with its API prefix;
+    // engine routes (readiness, metrics reader, count route) onto the origin.
+    if !(request_path == "/v1" || request_path.starts_with("/v1/")) {
+        base.set_path("/");
+    }
     let request_path = request_path.trim_start_matches('/');
     // Upstreams commonly document either their origin or their `/v1` base URL.
     // Keep the configured URL intact, but avoid duplicating that version prefix
@@ -4097,6 +4121,22 @@ mod tests {
     }
 
     #[test]
+    fn engine_routes_join_onto_the_origin() {
+        assert_eq!(
+            endpoint_url("http://127.0.0.1:8080/v1", "/slots")
+                .expect("URL should join")
+                .as_str(),
+            "http://127.0.0.1:8080/slots"
+        );
+        assert_eq!(
+            endpoint_url("http://127.0.0.1:8080/api/v1", "/v1/models")
+                .expect("URL should join")
+                .as_str(),
+            "http://127.0.0.1:8080/api/v1/models"
+        );
+    }
+
+    #[test]
     fn endpoint_url_does_not_duplicate_a_configured_v1_prefix() {
         assert_eq!(
             endpoint_url("http://localhost:11434/v1", "/v1/chat/completions")
@@ -4123,12 +4163,12 @@ mod tests {
                 .as_str(),
             "http://localhost:11434/api/v1beta/v1/models"
         );
-        // Non-versioned request paths still join normally onto a `/v1` base.
+        // Engine routes (no `/v1`) join onto the origin (§4.8).
         assert_eq!(
             endpoint_url("http://localhost:11434/v1", "/models")
                 .expect("URL should join")
                 .as_str(),
-            "http://localhost:11434/v1/models"
+            "http://localhost:11434/models"
         );
     }
 

@@ -1664,6 +1664,25 @@ mod signal_shutdown {
         );
         assert!(request.contains(&format!("Bearer {SECRET}")));
         setup.relay.next_text("relay.complete");
+        // An engine admin route is refused before any connection.
+        write_text(
+            &mut socket,
+            &json!({
+                "type": "relay.request", "requestId": "r3", "family": "generic",
+                "method": "POST", "path": "/api/pull", "headers": {}, "timeoutMs": 10_000,
+                "handle": "tiny", "expectBody": false
+            })
+            .to_string(),
+        );
+        let refused = setup.relay.next_text("relay.error");
+        assert_eq!(refused["requestId"], "r3");
+        assert_eq!(refused["failure"], "access_denied");
+        assert_eq!(refused["message"], "path_not_allowed");
+        assert!(
+            seen.recv_timeout(Duration::from_millis(300))
+                .map_or(true, |request| !request.contains("/api/pull")),
+            "the refused path reached the upstream"
+        );
         // An unknown handle is refused without reaching anything.
         write_text(
             &mut socket,
