@@ -194,6 +194,35 @@ describe("deployment recipe text", () => {
         JSON.stringify(bad).slice(0, 40),
       ).toBe(false);
   });
+
+  it("takes an opt-in realtime block with the adapter's bounds", () => {
+    const stt = (realtime: unknown, engine = "vllm") =>
+      accepts({
+        engine,
+        attachment: { type: "transcription", poolId: "pool", transcription: { realtime } },
+      });
+    expect(stt({ adapter: "vllm" })).toBe(true);
+    expect(stt({ adapter: "vllm", maxItemSeconds: 600, maxSessions: 8 })).toBe(true);
+    expect(stt({ adapter: "segmented", maxItemSeconds: 120, maxSessions: 1 }, "llama.cpp")).toBe(
+      true,
+    );
+    // vLLM's realtime route needs a vLLM server; `other` covers wrapper commands.
+    expect(stt({ adapter: "vllm" }, "other")).toBe(true);
+    expect(stt({ adapter: "vllm" }, "sglang")).toBe(false);
+    expect(stt({ adapter: "vllm" }, "llama.cpp")).toBe(false);
+    for (const bad of [
+      {},
+      { adapter: "openai" },
+      { adapter: "segmented", maxItemSeconds: 121 },
+      { adapter: "vllm", maxItemSeconds: 4 },
+      { adapter: "vllm", maxItemSeconds: 601 },
+      { adapter: "vllm", maxItemSeconds: 30.5 },
+      { adapter: "vllm", maxSessions: 0 },
+      { adapter: "vllm", maxSessions: 9 },
+      { adapter: "vllm", supported: true },
+    ])
+      expect(stt(bad), JSON.stringify(bad)).toBe(false);
+  });
 });
 
 describe("interactive recipe commands", () => {

@@ -234,6 +234,14 @@ export default defineConfig(({ mode }) => {
           changeOrigin: true,
           secure: false,
         },
+        // Chat Test → Live transcription: the dashboard-signed realtime socket.
+        // Listed before `/api` so the upgrade is not swallowed by the HTTP proxy.
+        "/api/internal/chat-test/realtime": {
+          target: devProxyTarget.ws,
+          ws: true,
+          changeOrigin: true,
+          secure: false,
+        },
         "/api": { target: devProxyTarget.http, changeOrigin: true, secure: false },
         "/rpc": { target: devProxyTarget.http, changeOrigin: true, secure: false },
         "/ws": { target: devProxyTarget.ws, ws: true, changeOrigin: true, secure: false },

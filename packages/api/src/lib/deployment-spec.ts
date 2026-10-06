@@ -288,6 +288,17 @@ function variantSchema(strict: boolean) {
           path: ["iface"],
           message: "Multi-node deployments require a network interface.",
         });
+      // `other` stays allowed: some people run vLLM behind a wrapper command.
+      if (
+        v.attachment.transcription?.realtime?.adapter === "vllm" &&
+        v.engine !== "vllm" &&
+        v.engine !== "other"
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["attachment", "transcription", "realtime", "adapter"],
+          message: "The vllm realtime adapter needs a vllm (or other) engine.",
+        });
     });
 }
 export const deploymentVariantSchema = variantSchema(true);

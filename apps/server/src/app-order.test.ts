@@ -276,6 +276,25 @@ describe("createApp registration contract — discovery gates own every method (
   });
 });
 
+describe("createApp registration contract — live transcription upgrade (/v1/realtime)", () => {
+  it("is answered by the realtime upgrade middleware, ahead of the /v1 model routes", async () => {
+    const app = await buildApp(false);
+    const plain = await app.request(`${BASE}/v1/realtime?intent=transcription`, { headers: HOST });
+    expect(plain.status).toBe(426);
+    expect(await plain.json()).toMatchObject({ error: { code: "upgrade_required" } });
+    const unauthenticated = await app.request(`${BASE}/v1/realtime?intent=transcription`, {
+      headers: { ...HOST, Upgrade: "websocket" },
+    });
+    expect(unauthenticated.status).toBe(401);
+    expect(await unauthenticated.json()).toMatchObject({ error: { code: "invalid_api_key" } });
+    const keyInUrl = await app.request(
+      `${BASE}/v1/realtime?intent=transcription&api_key=wsmp_model_x`,
+      { headers: { ...HOST, Upgrade: "websocket" } },
+    );
+    expect(keyInUrl.status).toBe(400);
+  });
+});
+
 describe("createApp registration contract — MCP OAuth limiter selection (L24)", () => {
   it("flag ON: `%61uth`-encoded spellings of ALL NINE pairs keep the GENERAL limiter (never the MCP buckets)", async () => {
     const app = await buildApp(true);

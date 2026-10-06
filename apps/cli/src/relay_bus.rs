@@ -75,4 +75,12 @@ pub(crate) enum FromWorker {
         generation: u64,
         outcome: crate::file_ops::FileResult<serde_json::Value>,
     },
+    /// 2.4: a frame from a live speech-to-text session thread. The loop
+    /// sends it only while the session is live, through the non-fatal
+    /// `stt.*` encoder path.
+    Stt {
+        session_id: String,
+        /// Boxed: control messages are large next to the other variants.
+        message: Box<crate::protocol::ClientControlMessage>,
+    },
 }

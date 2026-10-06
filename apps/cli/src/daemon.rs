@@ -336,7 +336,7 @@ static UPSTREAM_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static UPSTREAM_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn upstream_runtime() -> Result<&'static tokio::runtime::Runtime> {
+pub(crate) fn upstream_runtime() -> Result<&'static tokio::runtime::Runtime> {
     if let Some(runtime) = UPSTREAM_RUNTIME.get() {
         return Ok(runtime);
     }
@@ -350,7 +350,7 @@ fn upstream_runtime() -> Result<&'static tokio::runtime::Runtime> {
         .context("initializing shared cancellable upstream runtime")
 }
 
-fn upstream_http_client() -> Result<&'static reqwest::Client> {
+pub(crate) fn upstream_http_client() -> Result<&'static reqwest::Client> {
     if let Some(client) = UPSTREAM_HTTP_CLIENT.get() {
         return Ok(client);
     }
@@ -1095,6 +1095,8 @@ fn run_relay_session(
     let (worker_tx, worker_rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
     let mut terminals = TerminalRegistry::new(worker_tx.clone());
     let mut execs = ExecRegistry::new(worker_tx.clone(), DEFAULT_EXEC_TIMEOUT);
+    // 2.4 live speech-to-text sessions; dropping the registry ends them all.
+    let mut stt = crate::stt::SttRegistry::new(worker_tx.clone());
     // 2.8 node file ops run on the daemon's file pool, never on this loop; the
     // relay keeps only the ops it has pending. Dropping it cancels them all.
     #[cfg(unix)]
@@ -1215,6 +1217,13 @@ fn run_relay_session(
             );
             let frames = (|| -> RelaySessionResult<()> {
                 if let Some(result) = update.result {
+                    // A failed stop leaves its endpoint serving.
+                    if result.status == "failed" {
+                        stt.stop_failed(&result.step_id);
+                    } else if result.status == "succeeded" {
+                        // A start that arrived meanwhile may take sessions again.
+                        stt.stop_finished(&result.step_id);
+                    }
                     send_deployment_result(&mut socket, &result)?;
                 }
                 if let Some(open) = update.operator {
@@ -1267,6 +1276,7 @@ fn run_relay_session(
             &mut pending_preparation,
             #[cfg(unix)]
             &mut pending_reload,
+            &mut stt,
         ) {
             break Err(error);
         }
@@ -1277,10 +1287,14 @@ fn run_relay_session(
             break Err(error);
         }
         #[cfg(unix)]
-        if let Err(error) = forward_operator_events(&mut socket, &mut terminals) {
+        if let Err(error) = forward_operator_events(&mut socket, &mut terminals, &mut stt) {
             break Err(error);
         }
         if let Err(error) = send_outbound_frames(&mut socket, execs.poll(now)) {
+            break Err(error);
+        }
+        let stt_frames = stt.poll(now, crate::deployments::managed_endpoints);
+        if let Err(error) = send_stt_frames(&mut socket, &mut stt, stt_frames) {
             break Err(error);
         }
         #[cfg(unix)]
@@ -1395,6 +1409,7 @@ fn run_relay_session(
                 &mut deployment_publisher,
                 telemetry.as_ref(),
                 &mut remote_adapters,
+                &mut stt,
             ),
             Ok(Message::Binary(bytes)) => handle_binary(
                 &mut socket,
@@ -1405,6 +1420,7 @@ fn run_relay_session(
                 &mut execs,
                 #[cfg(unix)]
                 &mut files,
+                &mut stt,
             ),
             Ok(Message::Close(frame)) => {
                 tracing::warn!(?frame, "relay websocket closed by server");
@@ -1483,6 +1499,8 @@ fn run_relay_session(
     // In-flight file ops are cancelled; their results are dropped.
     #[cfg(unix)]
     files.cancel_all();
+    // The server fails these sessions itself when the relay drops.
+    stt.abort_all();
     abort_all_workers(workers);
     if matches!(result, Err(RelaySessionError::Shutdown(_))) {
         // The connection is still open: say goodbye so the server marks the
@@ -1528,6 +1546,7 @@ fn drain_worker_output<S>(
     #[cfg(unix)] reload_preparing: &mut bool,
     #[cfg(unix)] pending_preparation: &mut Option<PendingRequest>,
     #[cfg(unix)] pending_reload: &mut Option<PendingReload>,
+    stt: &mut crate::stt::SttRegistry,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
@@ -1585,6 +1604,14 @@ where
             }
             Ok(FromWorker::ExecEof { command_id, stderr }) => {
                 send_outbound_frames(socket, execs.on_eof(&command_id, stderr))?;
+            }
+            Ok(FromWorker::Stt {
+                session_id,
+                message,
+            }) => {
+                if let Some(message) = stt.outbound(&session_id, *message) {
+                    send_stt(socket, stt, message)?;
+                }
             }
             Ok(FromWorker::Telemetry(text)) => {
                 socket
@@ -1957,6 +1984,7 @@ fn handle_text<S>(
     deployment_publisher: &mut DeploymentPublisher,
     telemetry: Option<&crate::telemetry::Telemetry>,
     remote_adapters: &mut Vec<crate::protocol::RemoteEngineAdapter>,
+    stt: &mut crate::stt::SttRegistry,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
@@ -1972,6 +2000,14 @@ where
                 return Ok(());
             }
         };
+        // Live speech-to-text sessions on the endpoint end before its stop
+        // runs, and none opens there until a start job for it arrives.
+        if job.action == crate::deployments::Action::Stop {
+            let frames = stt.endpoint_stopping(&job.endpoint_slug, &job.step_id);
+            send_stt_frames(socket, stt, frames)?;
+        } else if job.action == crate::deployments::Action::Start {
+            stt.endpoint_starting(&job.endpoint_slug);
+        }
         // A stop for the instance cancels its start/prepare still waiting for
         // a person. A person's command already running is never cut off: the
         // stop waits for that run to end (so it cannot settle from status
@@ -1991,6 +2027,8 @@ where
         #[cfg(not(unix))]
         let refused = true;
         if refused {
+            // A refused stop leaves its endpoint serving.
+            stt.stop_failed(&job.step_id);
             let result =
                 crate::deployments::JobResult::failure(&job, "deployment_worker_unavailable");
             let text = serde_json::to_string(&result)
@@ -2004,7 +2042,11 @@ where
     let message = match parse_server_control(text) {
         Ok(message) => message,
         Err(error) => {
-            return apply_frame_fault(socket, control_frame_fault(text), terminals, execs, &error);
+            let fault = control_frame_fault(text);
+            if let Some(result) = apply_stt_fault(socket, stt, &fault) {
+                return result;
+            }
+            return apply_frame_fault(socket, fault, terminals, execs, &error);
         }
     };
     let state_dir = crate::paths::state_dir().ok();
@@ -2256,6 +2298,15 @@ where
                 frame_type = type_name,
                 "ignoring unknown relay server frame"
             );
+        }
+        ServerControlMessage::Stt(message) => {
+            let managed = if matches!(message, crate::stt_wire::SttServerMessage::Open { .. }) {
+                crate::deployments::managed_endpoints()
+            } else {
+                Vec::new()
+            };
+            let frames = stt.handle(message, &managed, Instant::now());
+            send_stt_frames(socket, stt, frames)?;
         }
         ServerControlMessage::TermOpen {
             terminal_id,
@@ -2591,6 +2642,73 @@ where
     Ok(())
 }
 
+/// Sends one `stt.*` frame without risking the relay: a frame the encoder
+/// refuses ends only its session, with an `stt.error` in its place. Socket
+/// errors stay what they are for every frame.
+fn send_stt<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    stt: &mut crate::stt::SttRegistry,
+    message: ClientControlMessage,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    let text = match encode_control(&message) {
+        Ok(text) => text,
+        Err(_) => {
+            let Some(session_id) = crate::stt::session_of(&message) else {
+                return Ok(());
+            };
+            tracing::warn!(
+                session_id,
+                "a speech-to-text frame was outside the wire contract; ending that session"
+            );
+            let Some(refusal) = stt.refused_by_encoder(session_id) else {
+                return Ok(());
+            };
+            match encode_control(&refusal) {
+                Ok(text) => text,
+                Err(_) => return Ok(()),
+            }
+        }
+    };
+    socket
+        .send(Message::Text(text.into()))
+        .map_err(|error| websocket_session_error(error, "sending a speech-to-text frame", true))
+}
+
+fn send_stt_frames<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    stt: &mut crate::stt::SttRegistry,
+    frames: Vec<ClientControlMessage>,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    for frame in frames {
+        send_stt(socket, stt, frame)?;
+    }
+    Ok(())
+}
+
+/// A malformed frame that names a speech-to-text session concerns only it.
+fn apply_stt_fault<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    stt: &mut crate::stt::SttRegistry,
+    fault: &FrameFault,
+) -> Option<RelaySessionResult<()>>
+where
+    S: std::io::Read + std::io::Write,
+{
+    let frames = match fault {
+        FrameFault::RejectStt { session_id } => stt.malformed(session_id, true),
+        FrameFault::FailStt { session_id } => stt.malformed(session_id, false),
+        _ => return None,
+    };
+    tracing::warn!("a malformed speech-to-text frame");
+    Some(send_stt_frames(socket, stt, frames))
+}
+
 fn apply_frame_fault<S>(
     socket: &mut tungstenite::WebSocket<S>,
     fault: FrameFault,
@@ -2672,9 +2790,16 @@ where
             );
             send_outbound_frames(socket, terminals.cancel_supervised(&command_id, false))
         }
+        // Speech-to-text faults go to the session registry first
+        // (`apply_stt_fault`); one arriving here has nothing left to name.
+        FrameFault::RejectStt { .. } | FrameFault::FailStt { .. } => {
+            tracing::warn!("ignoring a malformed speech-to-text frame");
+            Ok(())
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_binary<S>(
     socket: &mut tungstenite::WebSocket<S>,
     bytes: &[u8],
@@ -2683,6 +2808,7 @@ fn handle_binary<S>(
     terminals: &mut TerminalRegistry,
     execs: &mut ExecRegistry,
     #[cfg(unix)] files: &mut crate::file_relay::FileRelay,
+    stt: &mut crate::stt::SttRegistry,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
@@ -2693,6 +2819,9 @@ where
     let (metadata, body) = match binary_frame_fault(bytes) {
         Ok(parsed) => parsed,
         Err(fault) => {
+            if let Some(result) = apply_stt_fault(socket, stt, &fault) {
+                return result;
+            }
             return apply_frame_fault(
                 socket,
                 fault,
@@ -2751,6 +2880,10 @@ where
             RelayBinaryFrameMetadata::FileData { .. } => {
                 tracing::warn!("ignoring an unexpected file.data frame");
                 Ok(())
+            }
+            RelayBinaryFrameMetadata::SttAudio { session_id, seq } => {
+                let frames = stt.audio(&session_id, seq, body);
+                send_stt_frames(socket, stt, frames)
             }
             RelayBinaryFrameMetadata::RequestBody { .. } => Ok(()),
         };
@@ -3528,7 +3661,12 @@ fn worker_send_control(tx: &SyncSender<FromWorker>, message: &ClientControlMessa
         | ClientControlMessage::FileRejected { .. }
         | ClientControlMessage::NodeInfo(_)
         | ClientControlMessage::NodeMetrics(_)
-        | ClientControlMessage::EndpointLoad(_) => {
+        | ClientControlMessage::EndpointLoad(_)
+        | ClientControlMessage::SttOpened { .. }
+        | ClientControlMessage::SttAudioAck { .. }
+        | ClientControlMessage::SttEvent { .. }
+        | ClientControlMessage::SttError { .. }
+        | ClientControlMessage::SttClosed { .. } => {
             anyhow::bail!("worker emitted non-request relay control")
         }
     };
@@ -3674,6 +3812,7 @@ where
 fn forward_operator_events<S>(
     socket: &mut tungstenite::WebSocket<S>,
     terminals: &mut TerminalRegistry,
+    stt: &mut crate::stt::SttRegistry,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
@@ -3693,6 +3832,7 @@ where
             }
             OperatorEvent::Verify(job) => {
                 if crate::deployments::service::submit_operator_verify(job.clone()).is_err() {
+                    stt.stop_failed(&job.step_id);
                     send_deployment_result(
                         socket,
                         &crate::deployments::JobResult::failure(
@@ -3707,6 +3847,7 @@ where
     // After the events: a held stop follows the verify of the run it waited for.
     for job in terminals.take_released_jobs() {
         if crate::deployments::service::submit(job.clone()).is_err() {
+            stt.stop_failed(&job.step_id);
             send_deployment_result(
                 socket,
                 &crate::deployments::JobResult::failure(&job, "deployment_worker_unavailable"),
@@ -3930,7 +4071,7 @@ fn websocket_url(server_url: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn endpoint_url(base_url: &str, request_path: &str) -> Result<Url> {
+pub(crate) fn endpoint_url(base_url: &str, request_path: &str) -> Result<Url> {
     let mut base =
         Url::parse(base_url).with_context(|| format!("parsing endpoint URL `{base_url}`"))?;
     let request_path = request_path.trim_start_matches('/');
@@ -4602,6 +4743,46 @@ mod tests {
             !log.contains("x\\u0000y") && !log.contains("x\u{0}"),
             "the command text leaked: {log}"
         );
+    }
+
+    #[test]
+    fn a_refused_stt_frame_ends_only_its_session_and_never_the_relay() {
+        let session = "AAECAwQFBgcICQoLDA0ODw";
+        let (tx, _rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
+        let mut stt = crate::stt::SttRegistry::new(tx);
+        let mut socket = sink_socket();
+        // A transcript over the wire limit: the encoder refuses it, the
+        // session gets one stt.error, and the relay goes on.
+        let oversized = ClientControlMessage::SttEvent {
+            session_id: session.to_string(),
+            event: crate::stt_wire::SttEvent::Delta {
+                item_seq: 0,
+                text: "secret ".repeat(4_000),
+            },
+        };
+        assert!(send_stt(&mut socket, &mut stt, oversized).is_ok());
+        let written = String::from_utf8_lossy(&socket.get_ref().written).to_string();
+        assert!(written.contains("stt.error") && written.contains("protocol_error"));
+        assert!(
+            !written.contains("secret"),
+            "the refused text never goes out"
+        );
+
+        // A malformed open that names its session is refused by name, not fatally.
+        let mut socket = sink_socket();
+        let other = "AQIDBAUGBwgJCgsMDQ4PEA";
+        let malformed = format!(r#"{{"type":"stt.open","sessionId":"{other}"}}"#);
+        let fault = crate::protocol::control_frame_fault(&malformed);
+        let outcome = apply_stt_fault(&mut socket, &mut stt, &fault).expect("an stt fault");
+        assert!(outcome.is_ok());
+        let written = String::from_utf8_lossy(&socket.get_ref().written).to_string();
+        assert!(written.contains("stt.error") && written.contains(other));
+        // A malformed frame for a session that is not live sends nothing.
+        let mut socket = sink_socket();
+        let commit = format!(r#"{{"type":"stt.commit","sessionId":"{session}","itemSeq":-1}}"#);
+        let fault = crate::protocol::control_frame_fault(&commit);
+        assert!(apply_stt_fault(&mut socket, &mut stt, &fault).is_some_and(|r| r.is_ok()));
+        assert!(socket.get_ref().written.is_empty());
     }
 
     #[test]

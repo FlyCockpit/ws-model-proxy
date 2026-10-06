@@ -943,4 +943,112 @@ integration("local permission acceptance on PostgreSQL and real WebSocket", () =
       await runtime.close();
     }
   }, 20_000);
+  async function realtimeFixture() {
+    const f = await arrangement();
+    const { withAuthorizedLocalSend } = await import("./local-send.js");
+    const { createRealtimeAuthorizer, realtimeLocalSendBinding } = await import(
+      "./realtime/authorize.js"
+    );
+    const token = await fixture.modelApiToken.create({
+      data: {
+        userId: f.owner.id,
+        name: "realtime",
+        lookupPrefix: randomUUID(),
+        secretDigest: randomUUID(),
+        scopeMode: "ALLOWLIST",
+      },
+    });
+    const candidate = {
+      cliDeviceId: f.binding.cliDeviceId,
+      endpointSlug: f.binding.endpointSlug,
+      upstreamModel: f.binding.upstreamModelId,
+      capabilities: null,
+      deploymentManaged: true,
+      memberId: f.member.id,
+      route: {
+        kind: "pool" as const,
+        poolId: f.pool.id,
+        poolMemberId: f.member.id,
+        discoveredModelId: f.model.id,
+        endpointId: f.binding.endpointId,
+        executionTargetId: f.target.id,
+        capacityId: f.target.inferenceCapacityId,
+        ownerUserId: f.owner.id,
+        engineOwnerUserId: f.contributor.id,
+        accessGrantId: null,
+        contributionId: f.consent.id,
+      },
+    };
+    const requester = { tokenId: token.id, userId: f.owner.id };
+    const authorize = createRealtimeAuthorizer(requester, (binding, send, options) =>
+      withAuthorizedLocalSend(binding, send, { ...options, db: strict }),
+    );
+    const binding = realtimeLocalSendBinding(requester, candidate);
+    if (!binding) throw new Error("no binding");
+    return { f, token, candidate, authorize, binding };
+  }
+
+  it("live transcription opens take the same claim and allowlist check as HTTP sends", async () => {
+    const { checkLocalSendPermission } = await import("./local-send.js");
+    const { f, token, candidate, authorize, binding } = await realtimeFixture();
+    const sent: string[] = [];
+    const open = () => sent.push("open");
+    const abort = () => sent.push("abort");
+    // An ALLOWLIST token without an entry for this pool: refused, nothing sent.
+    expect(await authorize(candidate, open, abort)).toEqual({ ok: false, denial: "access" });
+    expect(await checkLocalSendPermission(binding, strict)).toBe("ACCESS_REVOKED");
+    expect(sent).toEqual([]);
+    await fixture.modelApiTokenAllowlistEntry.create({
+      data: { modelApiTokenId: token.id, target: "MODEL_POOL", modelPoolId: f.pool.id },
+    });
+    expect(await authorize(candidate, open, abort)).toEqual({ ok: true });
+    expect(sent).toEqual(["open"]);
+    expect(await checkLocalSendPermission(binding, strict)).toBeNull();
+    // A revoked token: the recheck and the next open are refused.
+    await fixture.modelApiToken.update({
+      where: { id: token.id },
+      data: { revokedAt: new Date() },
+    });
+    expect(await checkLocalSendPermission(binding, strict)).toBe("ACCESS_REVOKED");
+    expect(await authorize(candidate, open, abort)).toEqual({ ok: false, denial: "access" });
+    expect(sent).toEqual(["open"]);
+  }, 20_000);
+
+  it("live transcription opens refuse a revoked member and a disconnected CLI", async () => {
+    const { checkLocalSendPermission } = await import("./local-send.js");
+    const disconnected = await realtimeFixture();
+    await fixture.modelApiTokenAllowlistEntry.create({
+      data: {
+        modelApiTokenId: disconnected.token.id,
+        target: "MODEL_POOL",
+        modelPoolId: disconnected.f.pool.id,
+      },
+    });
+    expect(await checkLocalSendPermission(disconnected.binding, strict)).toBeNull();
+    await fixture.cliDevice.update({
+      where: { id: disconnected.binding.cliDeviceId },
+      data: { status: "DISCONNECTED" },
+    });
+    expect(await checkLocalSendPermission(disconnected.binding, strict)).toBe("MEMBER_UNAVAILABLE");
+    const sent: string[] = [];
+    expect(
+      await disconnected.authorize(
+        disconnected.candidate,
+        () => sent.push("open"),
+        () => sent.push("abort"),
+      ),
+    ).toEqual({ ok: false, denial: "member" });
+    expect(sent).toEqual([]);
+
+    const revoked = await realtimeFixture();
+    await fixture.modelApiTokenAllowlistEntry.create({
+      data: {
+        modelApiTokenId: revoked.token.id,
+        target: "MODEL_POOL",
+        modelPoolId: revoked.f.pool.id,
+      },
+    });
+    await revoked.f.revoke();
+    expect(await checkLocalSendPermission(revoked.binding, strict)).toBe("MEMBER_UNAVAILABLE");
+  }, 20_000);
 });

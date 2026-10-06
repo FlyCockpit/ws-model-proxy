@@ -57,7 +57,9 @@
         // running `knip --production`, which excludes dev-only files).
         "src/routes/**/*.tsx!",
         "src/hooks/*.ts!",
-        "src/stores/*.ts!"
+        "src/stores/*.ts!",
+        // The Chat Test microphone AudioWorklet, loaded by URL at runtime.
+        "public/realtime-pcm-worklet.js!"
       ],
       "ignoreDependencies": [
         // Imported only via PostCSS/Tailwind CSS pipeline, not statically.

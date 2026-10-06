@@ -61,6 +61,10 @@ function harness(overrides: Partial<ServerShutdownDeps> = {}): Harness {
       events.push("audit:flush");
     },
     terminalHub: { closeAll: record("terminals:closeAll") },
+    realtimeSessions: { closeAll: record("realtime:closeAll") },
+    flushRealtimeMetering: async () => {
+      events.push("realtime:flushMetering");
+    },
     server: {
       close: (callback) => {
         events.push("http:close");
@@ -136,12 +140,14 @@ describe("installServerShutdown", () => {
       // 2. browser sockets, after the drain flag refuses new terminal upgrades.
       "relay:beginDrain",
       "terminals:closeAll",
+      "realtime:closeAll",
       // 3. drain: admission stops first, then idle CLI sockets close.
       "relay:beginDrain",
       "http:close",
       "relay:closeIdle",
       // 4. relay close.
       "relay:close",
+      "realtime:flushMetering",
       "audit:flush",
       // 5. both capacity runtimes, once each.
       "capacity:close",

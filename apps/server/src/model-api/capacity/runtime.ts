@@ -11,10 +11,22 @@ import type {
 } from "./types.js";
 
 export interface CapacityAdmissionRuntime {
-  acquire(attempt: AdmissionAttempt, signal?: AbortSignal): Promise<RuntimeAdmissionResult>;
+  acquire(
+    attempt: AdmissionAttempt,
+    signal?: AbortSignal,
+    options?: CapacityAcquireOptions,
+  ): Promise<RuntimeAdmissionResult>;
   release(lease: CapacityLeaseHandle): Promise<boolean>;
   hold(response: Response, lease: CapacityLeaseHandle, signal?: AbortSignal): Response;
 }
+
+export type CapacityAcquireOptions = {
+  /**
+   * The owner's lifetime backstop for a lease held beyond one relay deadline
+   * (a live transcription session). Defaults to CAPACITY_LEASE_MAX_LIFETIME_MS.
+   */
+  maxLeaseLifetimeMs?: number;
+};
 
 // Polling re-enters store.acquire, which durably refreshes the WAITING request
 // heartbeat. Keep this safely below the 60-second abandonment threshold.
@@ -47,11 +59,20 @@ export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
   private async adopt(
     lease: CapacityLeaseHandle,
     signal?: AbortSignal,
+    options?: CapacityAcquireOptions,
   ): Promise<CapacityLeaseHandle> {
     const key = this.leaseKey(lease);
     let owner = this.owners.get(key);
     if (!owner) {
-      owner = new CapacityLeaseOwner(this.store, lease, signal, 10_000, 30_000, true);
+      owner = new CapacityLeaseOwner(
+        this.store,
+        lease,
+        signal,
+        10_000,
+        30_000,
+        true,
+        options?.maxLeaseLifetimeMs,
+      );
       this.owners.set(key, owner);
       const owned = owner;
       const forgetReleased = () => {
@@ -91,7 +112,11 @@ export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
     }
   }
 
-  async acquire(attempt: AdmissionAttempt, signal?: AbortSignal): Promise<RuntimeAdmissionResult> {
+  async acquire(
+    attempt: AdmissionAttempt,
+    signal?: AbortSignal,
+    options?: CapacityAcquireOptions,
+  ): Promise<RuntimeAdmissionResult> {
     // G2n pass 5: maintain() is part of the acquisition flow, so it lives
     // INSIDE the failure boundary — any throw there (fence rejection,
     // connection loss) terminalizes an already-persisted attempt exactly
@@ -102,7 +127,7 @@ export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
       await this.maintain();
       const result = await this.#acquireUntilTerminal(attempt, signal);
       if (result.state !== "ADMITTED") return result;
-      const lease = await this.adopt(result.lease, signal);
+      const lease = await this.adopt(result.lease, signal, options);
       if (this.closed || lease.signal?.aborted) {
         // Classify before releasing: release aborts the signal too. A lease
         // lost while confirming ownership is a server-side failure of this

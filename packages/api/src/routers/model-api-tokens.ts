@@ -390,6 +390,16 @@ export const modelApiTokensRouter = {
         data: { revokedAt },
         select: tokenSelection,
       });
+      // Post-commit: live sessions on this token end now, not at the next
+      // 60 s recheck. A failing hook never fails the revoke (it committed).
+      try {
+        await context.services?.onModelApiTokenRevoked?.(updated.id);
+      } catch (error) {
+        console.error(
+          "[model-api-tokens] revoke hook failed",
+          error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+        );
+      }
 
       return serializeToken(updated);
     }),

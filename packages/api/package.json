@@ -44,6 +44,9 @@
     "./lib/openai-compatible-capabilities": {
       "default": "./src/lib/openai-compatible-capabilities.ts"
     },
+    "./lib/transcription-profile": {
+      "default": "./src/lib/transcription-profile.ts"
+    },
     "./lib/embedding-contract": {
       "default": "./src/lib/embedding-contract.ts"
     },

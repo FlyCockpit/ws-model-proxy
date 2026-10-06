@@ -88,6 +88,17 @@ import { MODEL_API_MAX_REQUEST_BODY_BYTES } from "./model-api/limits.js";
 import { openAiErrorBody } from "./model-api/openai-errors.js";
 import { createPoolMemberTestRoutes } from "./model-api/pool-member-test.js";
 import { repairExpiredProviderBudgets } from "./model-api/provider-budget.js";
+import {
+  DASHBOARD_REALTIME_PATH,
+  dashboardRealtimeRoutes,
+} from "./model-api/realtime/dashboard-websocket.js";
+import { realtimeSessionRegistry } from "./model-api/realtime/registry.js";
+import {
+  createRealtimeWebsocketMiddleware,
+  productionRealtimeDeps,
+  REALTIME_PATH,
+  realtimeUpgradeHandler,
+} from "./model-api/realtime/websocket.js";
 import { createModelApiRoutes } from "./model-api/routes.js";
 import { transcriptionContentLengthGuard } from "./model-api/transcription-body-guard.js";
 import { logOrpcError } from "./orpc-error-log.js";
@@ -232,6 +243,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  */
 const closeRelaySessionsForDeletedUser = async (userId: string): Promise<void> => {
   terminalBrowserHub.revokeTerminalAccessForUser(userId);
+  realtimeSessionRegistry.terminateForUser(userId);
   await relaySessionManager.closeSessionsForUser(userId);
 };
 onUserDeleted(closeRelaySessionsForDeletedUser);
@@ -239,6 +251,9 @@ onUserDeletionMarked(closeRelaySessionsForDeletedUser);
 
 // A ban ends the user's in-flight relay file ops and commands (#159; ./relay/user-ban.ts).
 onUserBanned(cancelRelayWorkForBannedUser);
+// A ban ends the user's live transcription sessions, and those their engines
+// or pools serve, at once (not at the next 60 s recheck).
+onUserBanned((userId) => realtimeSessionRegistry.terminateForUser(userId));
 
 function cliContextServices() {
   return {
@@ -252,6 +267,7 @@ function cliContextServices() {
       relaySessionManager.onRemoteEngineAdaptersChanged(cliDeviceId),
     onPoolRoutingRulesChanged: (poolId: string) =>
       relaySessionManager.onPoolRoutingRulesChanged(poolId),
+    onModelApiTokenRevoked: (tokenId: string) => realtimeSessionRegistry.terminateForToken(tokenId),
     onCliCredentialsRevoked: (revoked: {
       kind: "cliToken" | "deviceCredential";
       ids: readonly string[];
@@ -345,6 +361,16 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.post("/v1/files", createModelApiFileUploadHandler());
   app.get("/v1/files/:id", createModelApiFileGetHandler());
 
+  const capacityLifecycle = createProductionCapacityRuntime();
+
+  // Live transcription (`/v1/realtime?intent=transcription`, design §2): a
+  // WebSocket on the same bearer-token auth as the rest of /v1 (no cookies, no
+  // CSRF, no CORS). Mounted ahead of the /v1 body limit and model routes, and
+  // outside their capacity request scope: a session owns its own lease.
+  const realtimeDeps = productionRealtimeDeps(capacityLifecycle.runtime);
+  app.use(REALTIME_PATH, createRealtimeWebsocketMiddleware(realtimeDeps));
+  app.get(REALTIME_PATH, realtimeUpgradeHandler(realtimeDeps));
+
   // OpenAI-compatible model API routes. These are public server-to-server
   // bearer-token routes: no cookie session auth, no CSRF, and no browser CORS in
   // v1. The limit is intentionally larger than the browser/RPC default because
@@ -378,7 +404,6 @@ export async function createApp(options: CreateAppOptions = {}) {
     }
     return generalModelApiBodyLimit(c, next);
   });
-  const capacityLifecycle = createProductionCapacityRuntime();
   app.route(
     "/v1",
     createModelApiRoutes({
@@ -392,12 +417,11 @@ export async function createApp(options: CreateAppOptions = {}) {
   // ride the victim's cookies. The guard only acts on mutating methods, so the
   // GET config + signed GET /media routes are unaffected. Allowed origins are the
   // app's own origin and, on a split-origin deploy, the SPA origin (CORS_ORIGIN).
-  const mediaCsrfGuard = createSameOriginGuard({
-    allowedOrigins: [
-      new URL(env.BETTER_AUTH_URL).origin,
-      ...(env.CORS_ORIGIN ? [new URL(env.CORS_ORIGIN).origin] : []),
-    ],
-  });
+  const dashboardOrigins = [
+    new URL(env.BETTER_AUTH_URL).origin,
+    ...(env.CORS_ORIGIN ? [new URL(env.CORS_ORIGIN).origin] : []),
+  ];
+  const mediaCsrfGuard = createSameOriginGuard({ allowedOrigins: dashboardOrigins });
 
   // Ephemeral media upload (session-authenticated). Mounted with its OWN body
   // limit of MEDIA_MAX_UPLOAD_BYTES and registered BEFORE the global 10 MB
@@ -841,6 +865,17 @@ export async function createApp(options: CreateAppOptions = {}) {
   // cookie-bearing non-browser callers without an Origin header are rejected.
   app.use("/api/internal/chat-test/*", mediaCsrfGuard);
   app.use("/api/internal/chat-test/*", createRateLimiterMiddleware(rpcLimiter));
+  // Chat Test live transcription (chunk 10): the `/v1/realtime` session behind
+  // the dashboard cookie, attributed as HTTP Chat Test. The CSRF guard above
+  // passes the GET upgrade; the socket's own Origin check refuses cross-site
+  // pages. Registered ahead of the Chat Test sub-app (its catch-all and its
+  // capacity request scope never see the upgrade; the session owns its lease).
+  const dashboardRealtime = dashboardRealtimeRoutes(
+    { allowedOrigins: dashboardOrigins },
+    realtimeDeps,
+  );
+  app.use(DASHBOARD_REALTIME_PATH, dashboardRealtime.middleware);
+  app.get(DASHBOARD_REALTIME_PATH, dashboardRealtime.handler);
   app.route("/api/internal/chat-test", createChatTestRoutes());
 
   app.use("/api/internal/pools/*", sessionMiddleware);

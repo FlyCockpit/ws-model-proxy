@@ -204,6 +204,33 @@ function generate() {
     stopCommand: stop,
     statusCommand: status,
   });
+  // A speech-to-text recipe that opts in to live transcription, rendered by admission.
+  const realtimeStt = dispatched(
+    renderedStart(
+      variant(
+        {
+          management: "ownedProcess",
+          start: "vllm serve fixture/model --port {{port}}",
+          stop: "true",
+        },
+        {
+          attachment: {
+            type: "transcription",
+            poolId: "pool",
+            transcription: {
+              languages: ["en"],
+              realtime: { adapter: "vllm", maxItemSeconds: 300, maxSessions: 2 },
+            },
+          },
+        },
+      ),
+    ),
+    "tz4a98xxat96iws9zmbrgj3e",
+  );
+  const realtime = (value: unknown): DeploymentJob => ({
+    ...realtimeStt,
+    transcriptionProfile: { realtime: value as { adapter: "vllm" } },
+  });
   const { contextWindow: _contextWindow, ...withoutContextWindow } = plain;
   // A dispatch never omits it, but `Option<u64>` in Rust decodes an absent field as None.
   const wireCases = {
@@ -225,6 +252,13 @@ function generate() {
       readinessQueryString: { ...plain, readiness: { ...plain.readiness, path: "/health?x=1" } },
       model256Bytes: { ...plain, models: ["é".repeat(128)] },
       embeddingText256Bytes: embeddings("é".repeat(128)),
+      transcriptionRealtime: realtimeStt,
+      realtimeSegmentedBounds: realtime({
+        adapter: "segmented",
+        maxItemSeconds: 120,
+        maxSessions: 8,
+      }),
+      realtimeVllmMaxItem: realtime({ adapter: "vllm", maxItemSeconds: 600 }),
     },
     rejected: {
       endpointSlugTrailingHyphen: { ...plain, endpointSlug: "inst-qwen--a1b2c3d4e5f6" },
@@ -272,6 +306,16 @@ function generate() {
       operatorExtraField: {
         ...jobs.interactiveStart,
         operator: { terminalId: TERMINAL_ID, commandAuthor: "user", viewerId: "x" },
+      },
+      realtimeUnknownAdapter: realtime({ adapter: "openai" }),
+      realtimeWithoutAdapter: realtime({ maxSessions: 1 }),
+      realtimeSegmentedItemTooLong: realtime({ adapter: "segmented", maxItemSeconds: 121 }),
+      realtimeItemTooShort: realtime({ adapter: "vllm", maxItemSeconds: 4 }),
+      realtimeTooManySessions: realtime({ adapter: "vllm", maxSessions: 9 }),
+      realtimeUnknownKey: realtime({ adapter: "vllm", supported: true }),
+      realtimeOnLlmAttachment: {
+        ...plain,
+        transcriptionProfile: { realtime: { adapter: "vllm" } },
       },
     },
   };

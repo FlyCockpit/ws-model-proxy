@@ -11,8 +11,9 @@ use crate::config::{
 };
 pub use crate::terminal_identity::TerminalIdentityProof;
 
-/// The one protocol bump of this release (v0.3.1 spoke 2.3). The server
-/// accepts only this version.
+/// The one protocol bump of this release (v0.3.1 spoke 2.3), which also
+/// carries live speech-to-text frames (`stt.*`, `crate::stt_wire`). The
+/// server accepts only this version.
 pub const RELAY_PROTOCOL_VERSION: &str = "2.4";
 #[cfg(test)]
 const TEST_IDENTITY_PUBLIC_KEY: &str =
@@ -477,6 +478,29 @@ pub enum ClientControlMessage {
     /// 2.7: live engine load for one endpoint (or one model on it).
     #[serde(rename = "endpoint.load")]
     EndpointLoad(EndpointLoad),
+    /// 2.4: the engine side of a live speech-to-text session is ready.
+    #[serde(rename = "stt.opened")]
+    SttOpened { session_id: String },
+    /// 2.4: audio bytes handed to the engine; returns that much credit.
+    #[serde(rename = "stt.audio.ack")]
+    SttAudioAck { session_id: String, bytes: u32 },
+    /// 2.4: one normalized transcription event.
+    #[serde(rename = "stt.event")]
+    SttEvent {
+        session_id: String,
+        event: crate::stt_wire::SttEvent,
+    },
+    /// 2.4: the session failed (before or after open); terminal.
+    #[serde(rename = "stt.error")]
+    SttError {
+        session_id: String,
+        failure: RelayFailure,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// 2.4: the answer to `stt.close`.
+    #[serde(rename = "stt.closed")]
+    SttClosed { session_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1460,6 +1484,8 @@ pub enum ServerControlMessage {
     FileCancel {
         op_id: String,
     },
+    /// 2.4: live speech-to-text control.
+    Stt(crate::stt_wire::SttServerMessage),
     Unknown {
         type_name: String,
     },
@@ -1531,6 +1557,9 @@ pub enum RelayBinaryFrameMetadata {
     /// 2.8, CLI to server: a `file.result` text field above the inline 48 KiB.
     #[serde(rename = "file.data")]
     FileData { op_id: String },
+    /// 2.4, server to CLI: live speech-to-text PCM (s16le, 24 kHz mono).
+    #[serde(rename = "stt.audio")]
+    SttAudio { session_id: String, seq: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1551,6 +1580,7 @@ impl RelayBinaryFrameMetadata {
             | Self::ExecStderr { command_id, .. }
             | Self::SupervisedOutput { command_id, .. } => command_id,
             Self::FileBody { op_id } | Self::FileData { op_id } => op_id,
+            Self::SttAudio { session_id, .. } => session_id,
         }
     }
 }
@@ -1807,6 +1837,7 @@ fn stable_object_json(values: &Map<String, Value>) -> String {
 }
 
 pub fn encode_control(message: &ClientControlMessage) -> Result<String> {
+    crate::stt_wire::validate_client_message(message)?;
     let text = serde_json::to_string(message).context("serializing relay control frame")?;
     if text.len() <= RELAY_JSON_CONTROL_MAX_BYTES {
         return Ok(text);
@@ -1864,6 +1895,20 @@ pub fn parse_server_control(text: &str) -> Result<ServerControlMessage> {
     let Some(type_name) = value.get("type").and_then(Value::as_str) else {
         anyhow::bail!("parsing relay server control frame");
     };
+    if type_name.starts_with("stt.") {
+        // serde reads a struct from an array too, and an `Option` from null;
+        // the server's strict schema allows neither.
+        if let Some(config) = value.get("config") {
+            let strict = config
+                .as_object()
+                .is_some_and(|fields| fields.values().all(Value::is_string));
+            anyhow::ensure!(strict, "stt config must be an object of strings");
+        }
+        let message: crate::stt_wire::SttServerMessage =
+            serde_json::from_value(value).context("parsing relay stt frame")?;
+        message.validate()?;
+        return Ok(ServerControlMessage::Stt(message));
+    }
     if !known_server_frame(type_name) {
         return Ok(ServerControlMessage::Unknown {
             type_name: type_name.to_string(),
@@ -2251,6 +2296,18 @@ pub fn parse_binary_frame(frame: &[u8]) -> Result<(RelayBinaryFrameMetadata, Vec
     }
     let metadata =
         serde_json::from_slice(&frame[4..body_offset]).context("parsing relay binary metadata")?;
+    if let RelayBinaryFrameMetadata::SttAudio { session_id, seq } = &metadata {
+        // The server's metadata schema is strict; this enum is not.
+        let object: Map<String, Value> = serde_json::from_slice(&frame[4..body_offset])
+            .context("parsing relay binary metadata")?;
+        anyhow::ensure!(
+            object
+                .keys()
+                .all(|key| matches!(key.as_str(), "type" | "sessionId" | "seq")),
+            "stt.audio metadata carries an unknown field"
+        );
+        crate::stt_wire::validate_audio_frame(session_id, *seq, body_len)?;
+    }
     Ok((metadata, frame[body_offset..].to_vec()))
 }
 
@@ -2290,6 +2347,15 @@ pub enum FrameFault {
     /// 2.8: a malformed `file.op` that names an op: answer `file.rejected bad_frame`.
     RejectFile {
         op_id: String,
+    },
+    /// 2.4: a malformed `stt.open` that names a session: answer `stt.error`.
+    RejectStt {
+        session_id: String,
+    },
+    /// 2.4: any other malformed `stt.*` frame (text or `stt.audio`) that
+    /// names a session: a live session fails, an unknown one is ignored.
+    FailStt {
+        session_id: String,
     },
 }
 
@@ -2438,6 +2504,7 @@ fn known_binary_type(type_name: &str) -> bool {
             | "exec.stderr"
             | "supervised.output"
             | "file.body"
+            | "stt.audio"
     )
 }
 
@@ -2460,6 +2527,21 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
     }
     if type_name.starts_with("file.") {
         return FrameFault::Ignore;
+    }
+    // 2.4 live speech-to-text: a bad frame concerns one session, never the
+    // relay. A bad `stt.open` is refused by name so the server can try
+    // another node at once; any other bad frame for a live session fails
+    // that session (its audio or commands would be lost otherwise).
+    if type_name.starts_with("stt.") {
+        let Some(session_id) =
+            string_field(value, "sessionId").filter(|id| crate::stt_wire::is_session_id(id))
+        else {
+            return FrameFault::Ignore;
+        };
+        if type_name == "stt.open" {
+            return FrameFault::RejectStt { session_id };
+        }
+        return FrameFault::FailStt { session_id };
     }
     if type_name == "term.spawn"
         && let Some(command_id) = string_field(value, "commandId")

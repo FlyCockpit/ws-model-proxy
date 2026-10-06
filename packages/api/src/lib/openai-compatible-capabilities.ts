@@ -6,6 +6,7 @@
 import { z } from "zod";
 import { embeddingContractSchema } from "./embedding-contract";
 import { reasoningConfigSchema, validateSurfaceReasoningConfig } from "./reasoning-contract";
+import { realtimeTranscriptionCapabilitiesSchema } from "./transcription-profile";
 
 const booleanSupportSchema = z.boolean().optional();
 
@@ -33,6 +34,11 @@ export const transcriptionCapabilitiesSchema = z
       .max(2 ** 31 - 1)
       .optional(),
     acceptedMimeTypes: z.array(z.string().trim().min(1).max(255)).max(128).optional(),
+    /**
+     * Live `/v1/realtime` sessions. Recipes emit it from the transcription profile; absent
+     * means none. Only `supported: true` makes a target eligible.
+     */
+    realtime: realtimeTranscriptionCapabilitiesSchema.optional(),
   })
   .strict();
 
@@ -378,6 +384,22 @@ export function normalizeTranscriptionCapabilities(
 ): TranscriptionCapabilities | undefined {
   if (typeof value === "boolean") return { supported: value };
   return value ?? undefined;
+}
+
+/**
+ * Whether capabilities advertise live transcription: `audio.transcriptions.realtime`
+ * with `supported: true` (never translations). A hint for lists; sessions open
+ * only on recipe-managed, healthy members.
+ */
+export function realtimeTranscriptionAdvertised(
+  capabilities: OpenAiCompatibleCapabilities | null | undefined,
+): boolean {
+  const transcriptions = capabilities?.audio?.transcriptions;
+  return (
+    typeof transcriptions === "object" &&
+    transcriptions !== null &&
+    transcriptions.realtime?.supported === true
+  );
 }
 
 export function audioOperationSupported(

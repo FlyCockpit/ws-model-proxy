@@ -285,6 +285,88 @@ assignment provenance and automatic concurrency seed columns.
   unacknowledged delete, and a rename or replace that may have published stays
   manual. See [`apps/cli/docs/file-recovery.md`](../../apps/cli/docs/file-recovery.md).
 
+- **Live transcription profile.** A transcription profile may add
+  an opt-in `realtime` block, `{adapter, maxItemSeconds?, maxSessions?}`, that
+  marks the endpoint for live speech-to-text sessions. `adapter` is `vllm` (the
+  engine serves vLLM's own `/v1/realtime`; needs engine `vllm` or `other`) or
+  `segmented` (each turn the client ends goes to the endpoint's
+  `/v1/audio/transcriptions`). `maxItemSeconds` (5–600, at most 120 for
+  `segmented`; default 300 for `vllm`, 30 for `segmented`) is when an unfinished
+  turn is ended for the client, since there is no voice activity detection;
+  `maxSessions` (1–8) caps live sessions per endpoint. Without the block an
+  endpoint takes no live sessions. The CLI advertises the block in its
+  transcription capability; this is part of relay protocol 2.4, not a new
+  version. Live sessions open only on recipe-managed endpoints.
+  For a Voxtral realtime model, the whole turn shares one context, so a small
+  `--max-model-len` can fail a long turn part-way; keep `maxItemSeconds` well
+  inside it (600 s is roughly 7.5k audio tokens). Qwen3-ASR realtime is not
+  affected.
+  Version skew (development builds only, since 2.4 is unreleased): upgrade
+  every CLI before adding a `realtime` block, because an older CLI cannot read
+  the job and the start fails only at its deadline (up to 15 minutes). After
+  downgrading a CLI that ran one, remove its deployment state file. Do not roll
+  the server back while a realtime deployment exists: an older server refuses
+  that node's whole inventory, and the node stays offline.
+
+- **Live transcription routing (`/v1/realtime`).** A live session opens only on
+  a recipe-managed member that is fully healthy. A pool whose members are all
+  degraded or recovering (half-open) refuses live sessions with close code
+  1013 (`model_not_available`) until one is healthy again, even when ordinary
+  HTTP requests can still use a degraded single member. An endpoint that
+  refuses live sessions for a configuration reason (for example a `vllm`
+  realtime claim on an engine without `/v1/realtime`) is reported in the
+  server log and is not counted against the member's health, so a wrong
+  `realtime` block cannot take the member out of HTTP routing.
+
+- **Live transcription test panel.** Chat Test has a microphone button that
+  opens a live transcription panel for a live-capable model you can use. It
+  signs in with your dashboard session (no token to paste) and runs the same
+  live session as `/v1/realtime`, as you: every model you can see, the same
+  limits and access checks, and usage recorded as Chat Test. The socket only
+  accepts the dashboard's own origin; signing out or revoking the session ends
+  a live session within 60 seconds, and a ban ends it at once. The microphone
+  needs HTTPS or localhost. Stop ends the session without transcribing the
+  turn in progress; use End turn first.
+
+- **Chat Test follows the force-2FA policy.** While two-factor authentication
+  is required, Chat Test requests (`/api/internal/chat-test/*`) from a user who
+  has not enrolled are refused with 403 `two_factor_required`, as the rest of
+  the dashboard already is.
+
+- **Live transcription sessions (`GET /v1/realtime?intent=transcription`).**
+  A WebSocket API following the OpenAI Realtime GA transcription events
+  (`session.update`, `input_audio_buffer.append/commit/clear`; transcription
+  `delta`/`completed`/`failed` with `usage: {type: "duration", seconds}`).
+  Authenticate with `Authorization: Bearer <model API token>`, or from a
+  browser with the subprotocols `realtime` and
+  `openai-insecure-api-key.<token>` (only `realtime` is echoed). A key in the
+  URL is refused. Input is `audio/pcm` at 24 kHz only, at most 512 KiB of
+  base64 per append; turns end when the client commits (`turn_detection`
+  must be null; there is no voice activity detection) or at the profile's
+  `maxItemSeconds`. Limits: 4 sessions per token, 8 per user, 30 minutes per
+  session, 120 s without audio. More than 64 clears or `session.update`s
+  with no audio after them get `rate_limited` ("Too many pending commands")
+  until the node catches up; the session stays open. `:external` model
+  names are refused: live audio never leaves your nodes. There is no
+  failover once a session has opened; clients reconnect. `GET /v1/models` marks live models with
+  `supports_realtime_transcription`.
+  Access is checked when the session opens (under the same locked send check
+  as HTTP requests) and again every 60 seconds. Revoking the token, banning
+  or deleting a user ends live sessions at once in the server process that
+  made the change (other processes end theirs within 60 seconds); a token
+  that expires, or an allowlist edit that removes the model, ends them within
+  60 seconds.
+  Each opened session is one request row (`audio.realtime_transcription`)
+  with the forwarded audio in `audioInputMs`; its wall time is kept out of
+  request latency statistics. The `segmented` adapter returns one result per
+  turn; live partial results need a vLLM realtime model. With vLLM, audio
+  appended after the engine ended a turn on its own (its token limit), but
+  before the CLI read that, can be lost (a few hundred milliseconds).
+  See `docs/transcription-interoperability.md` for client usage and recipe
+  notes (whisper.cpp needs `--inference-path /v1/audio/transcriptions`).
+  Database: three additive columns (`relay_request."audioInputMs"`,
+  `usage_rollup_minute/_hour."audioInputMs"`); `APPLY_SCHEMA=safe` adds them.
+
 ## Fixed
 
 - **A disconnect that arrives just after a CLI reconnects no longer re-opens

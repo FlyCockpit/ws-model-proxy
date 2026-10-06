@@ -285,6 +285,82 @@ async function checkPermission(tx: Prisma.TransactionClient, input: LocalSendBin
   return expiresAt;
 }
 
+const PERMISSION_TRANSACTION = {
+  isolationLevel: "ReadCommitted" as const,
+  maxWait: 2_000,
+  timeout: 5_000,
+};
+
+/**
+ * The send claim shared by every local send (HTTP relay attempts and live
+ * transcription opens): the permission check of {@link checkPermission}
+ * under its row locks, then `send` — a SYNCHRONOUS external effect (a relay
+ * CONTROL enqueue) — inside the same transaction, so a management write that
+ * commits before the claim can never be followed by the send. Never await
+ * inside `send`; never retry (the send is an external effect). When the
+ * transaction fails after `send` ran, `onCommitFailure` undoes it, and the
+ * send is refused (`CHECK_FAILED` unless a denial was decided).
+ */
+export async function withAuthorizedLocalSend<T>(
+  binding: LocalSendBinding,
+  send: () => T,
+  {
+    abortSignal,
+    onCommitFailure,
+    db = prisma,
+  }: {
+    abortSignal?: AbortSignal;
+    onCommitFailure?: (sent: T) => void;
+    db?: Pick<typeof prisma, "$transaction">;
+  } = {},
+): Promise<T> {
+  let sent: { value: T } | undefined;
+  try {
+    return await db.$transaction(async (tx) => {
+      const permissionDeadline = Date.now() + 4_000;
+      await tx.$executeRaw`SELECT set_config('lock_timeout', '1500ms', true), set_config('statement_timeout', '2000ms', true)`;
+      const expiresAt = await checkPermission(tx, binding);
+      if (
+        abortSignal?.aborted ||
+        Date.now() >= permissionDeadline ||
+        (expiresAt && expiresAt.getTime() <= Date.now())
+      )
+        throw new LocalSendRefused("CHECK_FAILED");
+      // No await after this point until the transaction ends.
+      sent = { value: send() };
+      return sent.value;
+    }, PERMISSION_TRANSACTION);
+  } catch (error) {
+    if (sent) onCommitFailure?.(sent.value);
+    if (error instanceof LocalSendRefused) throw error;
+    throw new LocalSendRefused("CHECK_FAILED");
+  }
+}
+
+/**
+ * The same permission check without a send: for rechecks of a long-lived
+ * send (a live transcription session every 60 s). Null when the binding is
+ * still authorized; the denial otherwise. A transaction or lock failure
+ * throws (the caller decides; it is never a pass).
+ */
+export async function checkLocalSendPermission(
+  binding: LocalSendBinding,
+  db: Pick<typeof prisma, "$transaction"> = prisma,
+): Promise<LocalSendDenial | null> {
+  try {
+    await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT set_config('lock_timeout', '1500ms', true), set_config('statement_timeout', '2000ms', true)`;
+      const expiresAt = await checkPermission(tx, binding);
+      if (expiresAt && expiresAt.getTime() <= Date.now())
+        throw new LocalSendRefused("ACCESS_REVOKED");
+    }, PERMISSION_TRANSACTION);
+    return null;
+  } catch (error) {
+    if (error instanceof LocalSendRefused) return error.denial;
+    throw error;
+  }
+}
+
 /**
  * Send acceptance linearizes at the synchronous relay.request CONTROL enqueue
  * inside startRelayAttempt -> RelaySessionManager.sendRelayRequest. Subsequent
@@ -301,31 +377,20 @@ export async function startAuthorizedLocalRelayAttempt(
   if (binding.cliDeviceId !== args.cliDeviceId || binding.endpointSlug !== args.endpointSlug) {
     throw new LocalSendRefused("MEMBER_UNAVAILABLE");
   }
-  let attempt: RelayAttempt | undefined;
-  try {
-    return await db.$transaction(
-      async (tx) => {
-        const permissionDeadline = Date.now() + 4_000;
-        await tx.$executeRaw`SELECT set_config('lock_timeout', '1500ms', true), set_config('statement_timeout', '2000ms', true)`;
-        const expiresAt = await checkPermission(tx, binding);
-        if (
-          args.abortSignal?.aborted ||
-          Date.now() >= permissionDeadline ||
-          (expiresAt && expiresAt.getTime() <= Date.now())
-        )
-          throw new LocalSendRefused("CHECK_FAILED");
-        // No await after this point until the transaction ends. The real manager
-        // queues CONTROL synchronously before starting its async body pump.
-        attempt = startRelayAttempt(args);
-        // Ensure commit failure cleanup cannot create an unhandled rejection.
-        void attempt.started.catch(() => {});
-        return attempt;
-      },
-      { isolationLevel: "ReadCommitted", maxWait: 2_000, timeout: 5_000 },
-    );
-  } catch (error) {
-    attempt?.cancel("cancelled");
-    if (error instanceof LocalSendRefused) throw error;
-    throw new LocalSendRefused("CHECK_FAILED");
-  }
+  return withAuthorizedLocalSend(
+    binding,
+    () => {
+      // The real manager queues CONTROL synchronously before starting its
+      // async body pump.
+      const attempt = startRelayAttempt(args);
+      // Ensure commit failure cleanup cannot create an unhandled rejection.
+      void attempt.started.catch(() => {});
+      return attempt;
+    },
+    {
+      ...(args.abortSignal ? { abortSignal: args.abortSignal } : {}),
+      onCommitFailure: (attempt) => attempt.cancel("cancelled"),
+      db,
+    },
+  );
 }

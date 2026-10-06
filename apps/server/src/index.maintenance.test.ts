@@ -44,6 +44,14 @@ describe("relay maintenance", () => {
     await stop();
   });
 
+  it("rechecks live transcription sessions on the terminal recheck interval", async () => {
+    const realtimeSessions = { recheckSessions: vi.fn(async () => undefined) };
+    const stop = startRelayMaintenance({ ...fakes(), realtimeSessions });
+    await vi.advanceTimersByTimeAsync(TERMINAL_SESSION_RECHECK_INTERVAL_MS);
+    expect(realtimeSessions.recheckSessions).toHaveBeenCalledTimes(1);
+    await stop();
+  });
+
   it("stop clears every timer", async () => {
     const deps = fakes();
     await startRelayMaintenance(deps)();

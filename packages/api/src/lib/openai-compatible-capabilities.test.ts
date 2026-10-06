@@ -7,6 +7,7 @@ import {
   supportsChatCompletions,
   transformerSupportedModalities,
 } from "./openai-compatible-capabilities";
+import { realtimeMaxItemSeconds } from "./transcription-profile";
 
 const endpointCaps = {
   version: 1 as const,
@@ -441,6 +442,35 @@ describe("detailed transcription capabilities", () => {
       responseFormats: ["json", "verbose_json"],
       timestampGranularities: [],
     });
+  });
+
+  it("takes a realtime block with the profile's bounds", () => {
+    const parse = (realtime: unknown) =>
+      parseOpenAiCompatibleCapabilities({
+        version: 2,
+        protocol: "openai-compatible",
+        audio: { transcriptions: { supported: true, realtime } },
+      });
+    expect(parse({ supported: true, adapter: "vllm" })).not.toBeNull();
+    expect(
+      parse({ supported: true, adapter: "segmented", maxItemSeconds: 120, maxSessions: 8 }),
+    ).not.toBeNull();
+    for (const bad of [
+      { supported: true },
+      { supported: true, adapter: "openai" },
+      { supported: true, adapter: "segmented", maxItemSeconds: 121 },
+      { supported: true, adapter: "vllm", maxSessions: 9 },
+      { supported: true, adapter: "vllm", extra: 1 },
+    ])
+      expect(parse(bad), JSON.stringify(bad)).toBeNull();
+  });
+});
+
+describe("realtime turn length", () => {
+  it("uses the adapter default unless the profile sets one", () => {
+    expect(realtimeMaxItemSeconds({ adapter: "vllm" })).toBe(300);
+    expect(realtimeMaxItemSeconds({ adapter: "segmented" })).toBe(30);
+    expect(realtimeMaxItemSeconds({ adapter: "segmented", maxItemSeconds: 90 })).toBe(90);
   });
 });
 

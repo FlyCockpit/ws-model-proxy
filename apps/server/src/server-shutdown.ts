@@ -76,6 +76,14 @@ export type ServerShutdownDeps = {
   /** Same for the deployment operator audit (session teardown records `closed`). */
   flushDeploymentOperatorAudit?: () => Promise<void>;
   terminalHub: { closeAll(): void };
+  /** Live transcription client sessions, including those still waiting for a model. */
+  realtimeSessions?: { closeAll(): void };
+  /**
+   * Waits for live transcription usage writes already started (sessions
+   * ended by `realtimeSessions.closeAll`). Runs with the relay close, before
+   * the database fence arms; never rejects.
+   */
+  flushRealtimeMetering?: () => Promise<void>;
   server: ShutdownHttpServer;
   capacityLifecycle?: {
     stopMaintenance(): Promise<void>;
@@ -143,9 +151,11 @@ export function installServerShutdown(deps: ServerShutdownDeps): ServerShutdown 
         // the flag again; it is idempotent).
         relaySessions.beginDrain();
         deps.terminalHub.closeAll();
+        deps.realtimeSessions?.closeAll();
       },
       closeRelaySessions: async () => {
         await relaySessions.closeRelaySessions();
+        await deps.flushRealtimeMetering?.();
         await deps.flushAgentAudit();
         await deps.flushDeploymentOperatorAudit?.();
       },

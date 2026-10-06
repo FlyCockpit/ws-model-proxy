@@ -68,10 +68,18 @@ const MCP_ENDPOINT_LOG_PATHS = new Set([MCP_ENDPOINT_LOG_PATH, `${MCP_ENDPOINT_L
  */
 const MCP_WEB_PAGE_LOG_PATHS = new Set(MCP_WEB_PAGE_PATHS);
 
+/**
+ * `/v1/realtime`: a client may put a key in the query by mistake; the upgrade
+ * refuses it, and the log line must not carry it either. Local literal, like
+ * the /mcp path (pinned by tests).
+ */
+const REALTIME_LOG_PATHS = new Set(["/v1/realtime", "/v1/realtime/"]);
+
 /** true when the request-log line for this pathname must strip the query. */
 export function stripsOAuthQuery(pathname: string): boolean {
   return (
     pathname.startsWith(OAUTH_LOG_PATH_PREFIX) ||
+    REALTIME_LOG_PATHS.has(pathname) ||
     ROOT_DISCOVERY_LOG_PATHS.has(pathname) ||
     MCP_ENDPOINT_LOG_PATHS.has(pathname) ||
     MCP_WEB_PAGE_LOG_PATHS.has(pathname)

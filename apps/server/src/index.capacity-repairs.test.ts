@@ -61,6 +61,8 @@ vi.mock("./deployments/reconciler.js", () => ({
   },
 }));
 vi.mock("./relay/terminal-websocket.js", () => ({ terminalBrowserHub: {} }));
+vi.mock("./model-api/realtime/registry.js", () => ({ realtimeSessionRegistry: {} }));
+vi.mock("./model-api/realtime/metering.js", () => ({ flushRealtimeMetering: vi.fn() }));
 vi.mock("./relay-maintenance.js", () => ({ startRelayMaintenance: vi.fn() }));
 vi.mock("./session-cleanup.js", () => ({ startSessionCleanup: vi.fn() }));
 vi.mock("./user-deletion-sweep.js", () => ({

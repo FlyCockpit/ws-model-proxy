@@ -119,6 +119,11 @@ export type ContextServices = {
     kind: "cliToken" | "deviceCredential";
     ids: readonly string[];
   }) => void | Promise<void>;
+  /**
+   * A model API token was just revoked (committed): end the live
+   * transcription sessions it authenticated in this process at once.
+   */
+  onModelApiTokenRevoked?: (tokenId: string) => void | Promise<void>;
   /** Cancel in-memory CLI commands bound to a revoked personal token. */
   cancelMcpTokenCommands?: (tokenId: string) => void;
   /** In-memory supervised-command requests (dashboard awareness and output review). */

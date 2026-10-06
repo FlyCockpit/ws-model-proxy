@@ -55,7 +55,7 @@
     "pool": "Target pool",
     "choose": "Choose…",
     "spec": "Recipe specification (JSON)",
-    "specHint": "Each variant needs key, engine, groupSize, measured resources in GiB, commands (management, start, stop), readiness, models, attachment {type, poolId}, and hardConcurrencyLimit. attachment.type is llm, embeddings or transcription (speech-to-text); a transcription attachment may add a transcription profile (languages, responseFormats, timestampGranularities, maxUploadBytes, ...) so requests using those options reach it. Commands management is ownedProcess or externalService; externalService also requires status (exit 0 alive, exit 3 stopped). Multi-node groups require iface. Never paste credentials.",
+    "specHint": "Each variant needs key, engine, groupSize, measured resources in GiB, commands (management, start, stop), readiness, models, attachment {type, poolId}, and hardConcurrencyLimit. attachment.type is llm, embeddings or transcription (speech-to-text); a transcription attachment may add a transcription profile (languages, responseFormats, timestampGranularities, maxUploadBytes, ...) so requests using those options reach it, and an optional realtime block for live sessions: {\"adapter\":\"vllm\"} for a vLLM realtime model, or {\"adapter\":\"segmented\",\"maxItemSeconds\":30} for any engine with a file transcription route. Commands management is ownedProcess or externalService; externalService also requires status (exit 0 alive, exit 3 stopped). Multi-node groups require iface. Never paste credentials.",
     "invalid": "Check required fields and allowed ranges.",
     "invalidSpec": "Invalid recipe JSON or schema. Check every variant, resource, command and attachment.",
     "saveRecipe": "Save new revision",
@@ -599,6 +599,48 @@
         "local_context_ceiling": "the request exceeded the local context limit",
         "local_failure": "the local attempt failed",
         "other": "{{reason}}"
+      }
+    },
+    "live": {
+      "open": "Live transcription",
+      "title": "Live transcription",
+      "description": "Speak into your microphone and watch a live-capable model transcribe it with the same live session API clients use (/v1/realtime). It runs as you, like the rest of Chat Test, and counts as Chat Test usage.",
+      "model": "Model",
+      "noModels": "No model you can use takes live sessions. A speech-to-text recipe needs a realtime profile, and a live member must be running.",
+      "start": "Start microphone",
+      "stop": "Stop",
+      "commit": "End turn",
+      "status": {
+        "idle": "Not started.",
+        "starting": "Connecting…",
+        "live": "Listening. Press End turn when you finish speaking.",
+        "stopped": "Stopped.",
+        "failed": "The session ended."
+      },
+      "transcribing": "Transcribing…",
+      "itemFailed": "This turn could not be transcribed.",
+      "seconds": "{{seconds}} s of audio",
+      "empty": "Transcripts appear here after each turn.",
+      "privacy": "Audio and transcripts are not stored or logged.",
+      "problems": {
+        "mic": {
+          "denied": "Microphone access was denied. Allow it in your browser's site settings and try again.",
+          "missing": "No microphone was found.",
+          "failed": "The microphone could not be started.",
+          "unsupported": "This browser cannot capture microphone audio for live transcription."
+        },
+        "signedOut": "Your dashboard session ended. Sign in again.",
+        "modelNotFound": "You cannot use that model, or it is no longer available.",
+        "busy": "No live member is free right now. Try again shortly.",
+        "backlog": "Audio arrived faster than the model could take it.",
+        "upstream": "The transcription node failed or disconnected.",
+        "shutdown": "The server is restarting. Try again shortly.",
+        "expired": "The session reached its maximum duration.",
+        "idle": "The session ended after two minutes without audio.",
+        "emptyCommit": "Nothing was said since the last turn.",
+        "denied": "The server refused the session or its access ended.",
+        "connection": "Could not connect. Check that you are still signed in and that the model has a live member.",
+        "server": "The server reported an error."
       }
     }
   },

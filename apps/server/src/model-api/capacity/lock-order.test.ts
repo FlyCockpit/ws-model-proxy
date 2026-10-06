@@ -162,6 +162,8 @@ const HOT_PATH_WRITERS: Record<string, string> = {
   "apps/server/src/relay/node-metrics-rollup.ts":
     "H: node metrics minutes (batched upserts, no fence)",
   "apps/server/src/model-api/usage-rollup.ts": "H: relay finalization and rollups",
+  "apps/server/src/model-api/realtime/metering.ts":
+    "H: live transcription session relay rows (one create at open; finalized through usage-rollup's terminal transition); no fence, no graph locks",
   "apps/server/src/model-api/relay-telemetry-recovery.ts": "H/S: relay crash repair",
   "apps/server/src/model-api/usage-retention.ts": "S: relay and rollup retention",
   "apps/server/src/relay/metric-routing-evaluator.ts":

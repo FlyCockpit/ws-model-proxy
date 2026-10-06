@@ -59,7 +59,7 @@
     "pool": "Pool de destino",
     "choose": "Elige…",
     "spec": "Especificación de receta (JSON)",
-    "specHint": "Cada variante requiere key, engine, groupSize, resources medidos en GiB, commands (management, start, stop), readiness, models, attachment {type, poolId} y hardConcurrencyLimit. attachment.type es llm, embeddings o transcription (voz a texto); un attachment transcription puede añadir un perfil transcription (languages, responseFormats, timestampGranularities, maxUploadBytes, ...) para que le lleguen las solicitudes que usan esas opciones. management es ownedProcess o externalService; externalService también requiere status (salida 0: activo, salida 3: detenido). Los grupos de varios nodos requieren iface. No pegues credenciales.",
+    "specHint": "Cada variante requiere key, engine, groupSize, resources medidos en GiB, commands (management, start, stop), readiness, models, attachment {type, poolId} y hardConcurrencyLimit. attachment.type es llm, embeddings o transcription (voz a texto); un attachment transcription puede añadir un perfil transcription (languages, responseFormats, timestampGranularities, maxUploadBytes, ...) para que le lleguen las solicitudes que usan esas opciones, y un bloque realtime opcional para sesiones en vivo: {\"adapter\":\"vllm\"} para un modelo realtime de vLLM, o {\"adapter\":\"segmented\",\"maxItemSeconds\":30} para cualquier motor con ruta de transcripción de archivos. management es ownedProcess o externalService; externalService también requiere status (salida 0: activo, salida 3: detenido). Los grupos de varios nodos requieren iface. No pegues credenciales.",
     "invalid": "Revisa campos obligatorios e intervalos permitidos.",
     "invalidSpec": "JSON o esquema de receta inválido. Revisa cada variante, recurso, comando y destino.",
     "saveRecipe": "Guardar nueva revisión",
@@ -277,6 +277,48 @@
         "local_context_ceiling": "la solicitud superó el límite de contexto local",
         "local_failure": "el intento local falló",
         "other": "{{reason}}"
+      }
+    },
+    "live": {
+      "open": "Transcripción en vivo",
+      "title": "Transcripción en vivo",
+      "description": "Habla al micrófono y observa cómo un modelo con sesiones en vivo lo transcribe con la misma API de sesiones en vivo que usan los clientes (/v1/realtime). Se ejecuta como tú, igual que el resto de Chat Test, y cuenta como uso de Chat Test.",
+      "model": "Modelo",
+      "noModels": "Ningún modelo que puedas usar acepta sesiones en vivo. Una receta de voz a texto necesita un perfil realtime y un miembro en vivo en ejecución.",
+      "start": "Iniciar micrófono",
+      "stop": "Detener",
+      "commit": "Terminar turno",
+      "status": {
+        "idle": "Sin iniciar.",
+        "starting": "Conectando…",
+        "live": "Escuchando. Pulsa Terminar turno cuando acabes de hablar.",
+        "stopped": "Detenido.",
+        "failed": "La sesión terminó."
+      },
+      "transcribing": "Transcribiendo…",
+      "itemFailed": "No se pudo transcribir este turno.",
+      "seconds": "{{seconds}} s de audio",
+      "empty": "Las transcripciones aparecen aquí después de cada turno.",
+      "privacy": "El audio y las transcripciones no se guardan ni se registran.",
+      "problems": {
+        "mic": {
+          "denied": "Se negó el acceso al micrófono. Permítelo en la configuración del sitio de tu navegador e inténtalo de nuevo.",
+          "missing": "No se encontró ningún micrófono.",
+          "failed": "No se pudo iniciar el micrófono.",
+          "unsupported": "Este navegador no puede capturar audio del micrófono para la transcripción en vivo."
+        },
+        "signedOut": "Tu sesión del panel terminó. Inicia sesión de nuevo.",
+        "modelNotFound": "No puedes usar ese modelo o ya no está disponible.",
+        "busy": "No hay ningún miembro en vivo libre ahora. Inténtalo de nuevo en un momento.",
+        "backlog": "El audio llegó más rápido de lo que el modelo podía procesarlo.",
+        "upstream": "El nodo de transcripción falló o se desconectó.",
+        "shutdown": "El servidor se está reiniciando. Inténtalo de nuevo en un momento.",
+        "expired": "La sesión alcanzó su duración máxima.",
+        "idle": "La sesión terminó tras dos minutos sin audio.",
+        "emptyCommit": "No se dijo nada desde el último turno.",
+        "denied": "El servidor rechazó la sesión o su acceso terminó.",
+        "connection": "No se pudo conectar. Revisa que sigas con la sesión iniciada y que el modelo tenga un miembro en vivo.",
+        "server": "El servidor informó un error."
       }
     }
   },

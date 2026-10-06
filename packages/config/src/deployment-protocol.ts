@@ -85,6 +85,12 @@ export type DeploymentJob = {
     multipleLanguageHints?: boolean;
     maxUploadBytes?: number;
     acceptedMimeTypes?: string[];
+    /** Opt-in live transcription; see `realtimeTranscriptionProfileSchema`. */
+    realtime?: {
+      adapter: "vllm" | "segmented";
+      maxItemSeconds?: number;
+      maxSessions?: number;
+    };
   };
   command: string;
   /** A person runs `command` in an operator terminal; present only when true. */

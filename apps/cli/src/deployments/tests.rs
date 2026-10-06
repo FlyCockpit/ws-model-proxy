@@ -381,6 +381,11 @@ fn transcription_recipe_advertises_its_profile_as_the_server_golden() {
         language_detection: Some(true),
         max_upload_bytes: Some(26_214_400),
         accepted_mime_types: Some(vec!["audio/wav".into(), "audio/mpeg".into()]),
+        realtime: Some(RealtimeTranscriptionProfile {
+            adapter: crate::config::RealtimeAdapter::Segmented,
+            max_item_seconds: Some(30),
+            max_sessions: Some(4),
+        }),
         ..Default::default()
     });
     assert!(transcription.validate().is_ok());
@@ -409,6 +414,16 @@ fn transcription_recipe_advertises_its_profile_as_the_server_golden() {
     // Version 2 is the first that carries a detailed transcription profile.
     assert_eq!(capabilities["version"], 2);
     assert_eq!(capabilities["audio"]["transcriptions"]["streaming"], true);
+    // Live transcription is advertised only because the profile opts in.
+    assert_eq!(
+        capabilities["audio"]["transcriptions"]["realtime"],
+        serde_json::json!({
+            "supported": true,
+            "adapter": "segmented",
+            "maxItemSeconds": 30,
+            "maxSessions": 4
+        })
+    );
 
     let mut misplaced = job(Action::Start);
     misplaced.transcription_profile = Some(TranscriptionProfile::default());
@@ -419,6 +434,42 @@ fn transcription_recipe_advertises_its_profile_as_the_server_golden() {
     let mut unknown = job(Action::Start);
     unknown.attachment = "speech".into();
     assert!(unknown.validate().is_err());
+}
+
+#[test]
+fn realtime_transcription_is_opt_in_and_bounded_per_adapter() {
+    let with = |realtime: serde_json::Value| {
+        let mut transcription = job(Action::Start);
+        transcription.attachment = "transcription".into();
+        let mut value = serde_json::to_value(&transcription).expect("job");
+        value["transcriptionProfile"] = serde_json::json!({ "realtime": realtime });
+        serde_json::from_value::<Job>(value).is_ok_and(|job| job.validate().is_ok())
+    };
+    for accepted in [
+        serde_json::json!({ "adapter": "vllm" }),
+        serde_json::json!({ "adapter": "vllm", "maxItemSeconds": 600, "maxSessions": 8 }),
+        serde_json::json!({ "adapter": "segmented", "maxItemSeconds": 5, "maxSessions": 1 }),
+        serde_json::json!({ "adapter": "segmented", "maxItemSeconds": 120 }),
+    ] {
+        assert!(with(accepted.clone()), "{accepted}");
+    }
+    for rejected in [
+        serde_json::json!({}),
+        serde_json::json!({ "adapter": "openai" }),
+        serde_json::json!({ "adapter": "segmented", "maxItemSeconds": 121 }),
+        serde_json::json!({ "adapter": "vllm", "maxItemSeconds": 4 }),
+        serde_json::json!({ "adapter": "vllm", "maxItemSeconds": 601 }),
+        serde_json::json!({ "adapter": "vllm", "maxSessions": 0 }),
+        serde_json::json!({ "adapter": "vllm", "maxSessions": 9 }),
+        serde_json::json!({ "adapter": "vllm", "supported": true }),
+    ] {
+        assert!(!with(rejected.clone()), "{rejected}");
+    }
+
+    // Without the block an endpoint advertises no live transcription.
+    let plain = crate::config::OpenAiCompatibleCapabilities::transcription(None);
+    let value = serde_json::to_value(plain).expect("capabilities");
+    assert!(value["audio"]["transcriptions"].get("realtime").is_none());
 }
 
 #[test]
@@ -441,6 +492,11 @@ fn a_maximal_transcription_endpoint_fits_one_control_frame() {
         multiple_language_hints: Some(true),
         max_upload_bytes: Some(i32::MAX as u64),
         accepted_mime_types: Some((0..16).map(token).collect()),
+        realtime: Some(RealtimeTranscriptionProfile {
+            adapter: crate::config::RealtimeAdapter::Segmented,
+            max_item_seconds: Some(120),
+            max_sessions: Some(8),
+        }),
     });
     assert!(transcription.validate().is_ok());
     let inventory = crate::protocol::endpoint_inventory(
@@ -1575,6 +1631,17 @@ fn wire_edge_cases_agree_with_the_server_mirror() {
             .map_or(true, |job| job.validate().is_err());
         assert!(refused, "{name} must be refused");
     }
+    // A rendered live-transcription job keeps its realtime block through decode
+    // and re-encode, so the intent hash still matches.
+    let realtime = &accepted["transcriptionRealtime"];
+    let job: Job = serde_json::from_value(realtime.clone()).expect("realtime job");
+    assert_eq!(&serde_json::to_value(&job).expect("encode"), realtime);
+    assert_eq!(
+        job.transcription_profile
+            .and_then(|profile| profile.realtime)
+            .map(|realtime| realtime.adapter),
+        Some(crate::config::RealtimeAdapter::Vllm)
+    );
     // The forwarder slug rules on their own, reserved words included.
     for slug in golden["slugCases"]["accepted"].as_array().expect("slugs") {
         let slug = slug.as_str().expect("slug");

@@ -40,6 +40,8 @@ pub mod shutdown;
 pub mod slug;
 pub mod startup;
 pub mod state;
+pub mod stt;
+pub mod stt_wire;
 pub mod supervised_file;
 pub mod supervised_run;
 pub mod supervised_screen;

@@ -33,11 +33,21 @@ import {
   supervisedFileErrorSchema,
   supervisedFileResultSchema,
 } from "./file-protocol.js";
+import { type RelayFailure, relayFailureSchema } from "./relay-failure.js";
+import {
+  STT_AUDIO_FRAME_MAX_BYTES,
+  type SttServerControlMessage,
+  sttAudioBodyValid,
+  sttAudioMetadataSchema,
+  sttClientControlSchemas,
+  sttServerControlSchema,
+} from "./stt-protocol.js";
 import { isWellFormedText, stringifyWellFormed } from "./wire-text.js";
 
 export {
   RELAY_MIN_PROTOCOL_VERSION,
   RELAY_PROTOCOL_VERSIONS,
+  type RelayFailure,
   type RelayProtocolVersion,
   refusedRelayProtocolReason,
   relayProtocolAtLeast,
@@ -89,23 +99,6 @@ const relayExitSignalSchema = z.preprocess(
     .regex(/^[A-Za-z0-9_+.-]{1,32}$/)
     .optional(),
 );
-
-const relayFailureSchema = z.enum([
-  "transport",
-  "timeout",
-  "disconnected",
-  "upstream_5xx",
-  "upstream_4xx",
-  "unsupported_capability",
-  "not_found",
-  "access_denied",
-  "rate_limited",
-  "request_too_large",
-  "cancelled",
-  "protocol_error",
-  "unknown",
-]);
-export type RelayFailure = z.infer<typeof relayFailureSchema>;
 
 const requestIdSchema = z.string().trim().min(1).max(128);
 const headerNameSchema = z.string().trim().min(1).max(128);
@@ -1076,6 +1069,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
   endpointLoadSchema,
   fileResultFrameSchema,
   fileRejectedFrameSchema,
+  ...sttClientControlSchemas,
 ]);
 export type RelayClientControlMessage = z.infer<typeof relayClientControlMessageSchema>;
 
@@ -1241,7 +1235,9 @@ export type RelayServerControlMessage =
       mode: FileOpFrame["mode"];
       readGrant: boolean;
     }
-  | { type: "file.cancel"; opId: string };
+  | { type: "file.cancel"; opId: string }
+  /** 2.4: live speech-to-text (`stt-protocol.ts`). */
+  | SttServerControlMessage;
 
 const relayBodyMetadataFields = {
   requestId: requestIdSchema,
@@ -1298,6 +1294,8 @@ const relayBinaryFrameMetadataSchema = z.discriminatedUnion("type", [
   fileBodyMetadataSchema,
   /** 2.8: a `file.result` text field above the inline 48 KiB, CLI to server. */
   fileDataMetadataSchema,
+  /** 2.4: live speech-to-text PCM, server to CLI. */
+  sttAudioMetadataSchema,
 ]);
 
 export type RelayBinaryFrameMetadata = z.infer<typeof relayBinaryFrameMetadataSchema>;
@@ -1412,6 +1410,10 @@ export function encodeRelayServerControlMessage(message: RelayServerControlMessa
     throw new RelayProtocolError(
       "deployment.job operator must accompany exactly interactive jobs.",
     );
+  }
+  // 2.4 live speech-to-text frames fail closed against the shared golden contract.
+  if (message.type.startsWith("stt.") && !sttServerControlSchema.safeParse(message).success) {
+    throw new RelayProtocolError(`${message.type} fails the wire schema.`);
   }
   const encoded = stringifyWellFormed(message);
   // Both carry user-authored commands; the CLI drops larger control frames undecoded.
@@ -1554,6 +1556,16 @@ export function encodeRelayBinaryFrame(
 ): ArrayBuffer {
   if (body.byteLength > RELAY_BINARY_CHUNK_MAX_BYTES) {
     throw new RelayProtocolError("Binary body chunk exceeds 1 MiB.");
+  }
+  if (metadata.type === "stt.audio") {
+    if (!sttAudioMetadataSchema.safeParse(metadata).success) {
+      throw new RelayProtocolError("stt.audio metadata fails the wire schema.");
+    }
+    if (!sttAudioBodyValid(body.byteLength)) {
+      throw new RelayProtocolError(
+        `stt.audio carries 1 to ${STT_AUDIO_FRAME_MAX_BYTES} bytes of whole samples.`,
+      );
+    }
   }
   const metadataBytes = new TextEncoder().encode(stringifyWellFormed(metadata));
   if (metadataBytes.byteLength > RELAY_JSON_CONTROL_MAX_BYTES) {

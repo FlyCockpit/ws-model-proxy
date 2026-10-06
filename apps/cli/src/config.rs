@@ -950,6 +950,14 @@ impl OpenAiCompatibleCapabilities {
                         multiple_language_hints: profile.multiple_language_hints,
                         max_upload_bytes: profile.max_upload_bytes,
                         accepted_mime_types: profile.accepted_mime_types,
+                        realtime: profile.realtime.map(|realtime| {
+                            RealtimeTranscriptionCapabilities {
+                                supported: Some(true),
+                                adapter: realtime.adapter,
+                                max_item_seconds: realtime.max_item_seconds,
+                                max_sessions: realtime.max_sessions,
+                            }
+                        }),
                     },
                 )),
                 translations: None,
@@ -1498,6 +1506,32 @@ pub struct TranscriptionCapabilities {
     pub max_upload_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accepted_mime_types: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realtime: Option<RealtimeTranscriptionCapabilities>,
+}
+
+/// The engine bridge a live `/v1/realtime` transcription session uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RealtimeAdapter {
+    /// vLLM's own `/v1/realtime` protocol: deltas while the person speaks.
+    Vllm,
+    /// Each committed turn goes to the endpoint's file transcription route.
+    Segmented,
+}
+
+/// Live transcription an endpoint advertises (the server's strict
+/// `realtimeTranscriptionCapabilitiesSchema`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RealtimeTranscriptionCapabilities {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported: Option<bool>,
+    pub adapter: RealtimeAdapter,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_item_seconds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sessions: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

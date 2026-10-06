@@ -27,11 +27,11 @@ export async function drainRequesterUsageRollupsBatch(
     ins AS (
     INSERT INTO usage_rollup_minute AS target (
       "bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
-      "executionTargetId", source, "updatedAt", "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "continuationRequests", "continuationInputTokens", "continuationCacheReadTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs",
+      "executionTargetId", source, "updatedAt", "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "continuationRequests", "continuationInputTokens", "continuationCacheReadTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs", "audioInputMs",
       "latencyHistogram", "ttftHistogram"
     )
     SELECT "bucketStart", "ownerUserId", '', "poolId", "poolMemberId",
-      "executionTargetId", source, now(), "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "continuationRequests", "continuationInputTokens", "continuationCacheReadTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs",
+      "executionTargetId", source, now(), "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "continuationRequests", "continuationInputTokens", "continuationCacheReadTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs", "audioInputMs",
       "latencyHistogram", "ttftHistogram"
       FROM moved
      WHERE "ownerUserId" <> ${requesterUserId}
@@ -59,6 +59,7 @@ export async function drainRequesterUsageRollupsBatch(
         "durationSumMs" = target."durationSumMs" + EXCLUDED."durationSumMs",
         "ttftCount" = target."ttftCount" + EXCLUDED."ttftCount",
         "ttftSumMs" = target."ttftSumMs" + EXCLUDED."ttftSumMs",
+        "audioInputMs" = target."audioInputMs" + EXCLUDED."audioInputMs",
         "latencyHistogram" = ARRAY(SELECT COALESCE(h.a, 0) + COALESCE(h.b, 0) FROM unnest(target."latencyHistogram", EXCLUDED."latencyHistogram") WITH ORDINALITY AS h(a, b, i) ORDER BY h.i),
         "ttftHistogram" = ARRAY(SELECT COALESCE(h.a, 0) + COALESCE(h.b, 0) FROM unnest(target."ttftHistogram", EXCLUDED."ttftHistogram") WITH ORDINALITY AS h(a, b, i) ORDER BY h.i),
         "updatedAt" = now()
@@ -78,11 +79,11 @@ export async function drainRequesterUsageRollupsBatch(
     ins AS (
     INSERT INTO usage_rollup_hour AS target (
       "bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
-      "executionTargetId", source, "updatedAt", "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "continuationRequests", "continuationInputTokens", "continuationCacheReadTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs",
+      "executionTargetId", source, "updatedAt", "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "continuationRequests", "continuationInputTokens", "continuationCacheReadTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs", "audioInputMs",
       "latencyHistogram", "ttftHistogram"
     )
     SELECT "bucketStart", "ownerUserId", '', "poolId", "poolMemberId",
-      "executionTargetId", source, now(), "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "continuationRequests", "continuationInputTokens", "continuationCacheReadTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs",
+      "executionTargetId", source, now(), "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "continuationRequests", "continuationInputTokens", "continuationCacheReadTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs", "audioInputMs",
       "latencyHistogram", "ttftHistogram"
       FROM moved
      WHERE "ownerUserId" <> ${requesterUserId}
@@ -110,6 +111,7 @@ export async function drainRequesterUsageRollupsBatch(
         "durationSumMs" = target."durationSumMs" + EXCLUDED."durationSumMs",
         "ttftCount" = target."ttftCount" + EXCLUDED."ttftCount",
         "ttftSumMs" = target."ttftSumMs" + EXCLUDED."ttftSumMs",
+        "audioInputMs" = target."audioInputMs" + EXCLUDED."audioInputMs",
         "latencyHistogram" = ARRAY(SELECT COALESCE(h.a, 0) + COALESCE(h.b, 0) FROM unnest(target."latencyHistogram", EXCLUDED."latencyHistogram") WITH ORDINALITY AS h(a, b, i) ORDER BY h.i),
         "ttftHistogram" = ARRAY(SELECT COALESCE(h.a, 0) + COALESCE(h.b, 0) FROM unnest(target."ttftHistogram", EXCLUDED."ttftHistogram") WITH ORDINALITY AS h(a, b, i) ORDER BY h.i),
         "updatedAt" = now()

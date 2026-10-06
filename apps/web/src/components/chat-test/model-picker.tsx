@@ -13,6 +13,7 @@ import { AudioLines, ChevronsUpDown, Image, Video } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { ChatTestLiveTranscription } from "@/components/chat-test/live-transcription-panel";
 import { PoolFallbackBadge } from "@/components/pool-fallback-badge";
 import type { AttachmentModalities } from "@/lib/image-attachments";
 
@@ -160,6 +161,8 @@ export function ModelPicker({
       {selected?.kind === "MODEL_POOL" ? (
         <PoolFallbackBadge routes={poolRoutes(selected)} providers={poolProviders(selected)} />
       ) : null}
+      {/* The microphone panel sits with the model choice in the Chat Test toolbar. */}
+      <ChatTestLiveTranscription />
     </div>
   );
 }

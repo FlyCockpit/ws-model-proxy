@@ -92,6 +92,19 @@ export const rpcLimiter = new RateLimiterMemory({
 });
 
 /**
+ * `/v1/realtime` upgrades, per client IP, before authentication (failed
+ * authentications count). A session is long-lived, so an honest client opens
+ * few; 30 per minute leaves room for reconnect loops behind one address.
+ */
+export const REALTIME_UPGRADE_POINTS = 30;
+export const REALTIME_UPGRADE_DURATION_SECONDS = 60;
+export const realtimeUpgradeLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:realtime",
+  points: REALTIME_UPGRADE_POINTS,
+  duration: REALTIME_UPGRADE_DURATION_SECONDS,
+});
+
+/**
  * `cliCredentials.exchangeDeviceCode` limiters: the public device-flow
  * redemption a `wsmp login` polls (every 5 s for up to 30 min). One bucket per
  * client IP and one per device code; see {@link consumeDeviceCodeExchange}.
