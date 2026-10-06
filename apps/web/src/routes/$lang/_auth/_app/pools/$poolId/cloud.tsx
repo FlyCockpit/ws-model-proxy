@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
+import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
   CardContent,
@@ -11,6 +12,8 @@ import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Switch } from "@ws-model-proxy/ui/components/switch";
+import { Trash2 } from "lucide-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
@@ -59,6 +62,16 @@ function CloudSettings({ pool }: { pool: PoolView }) {
     }
   };
   const cloudMembers = pool.members.filter((member) => member.kind === "CLOUD");
+  const providerModels = useQuery(orpc.providers.models.list.queryOptions({ input: {} }));
+  const [choice, setChoice] = useState("");
+  const updatePool = useMutation({
+    ...orpc.pools.update.mutationOptions(),
+    meta: { skipGlobalErrorToast: true },
+  });
+  const inUse = new Set(cloudMembers.map((member) => member.providerModelId));
+  const candidates = (providerModels.data?.models ?? []).filter(
+    (model) => model.enabled && model.type === pool.modelType && !inUse.has(model.id),
+  );
   return (
     <div className="flex min-w-0 flex-col gap-4">
       <Card>
@@ -125,10 +138,71 @@ function CloudSettings({ pool }: { pool: PoolView }) {
                   <StatusPill tone="info">
                     {t(`dashboard:pool.memberStatus.${member.status}`)}
                   </StatusPill>
+                  <Button
+                    variant="ghost"
+                    size="icon-touch"
+                    aria-label={t("dashboard:pool.removeMember", {
+                      member: member.upstreamModelId,
+                    })}
+                    disabled={updatePool.isPending}
+                    onClick={() =>
+                      run(() =>
+                        updatePool.mutateAsync({
+                          poolId: pool.id,
+                          cloudMembers: cloudMembers
+                            .filter((other) => other.id !== member.id)
+                            .flatMap((other) =>
+                              other.providerModelId
+                                ? [{ providerModelId: other.providerModelId }]
+                                : [],
+                            ),
+                        }),
+                      )
+                    }
+                  >
+                    <Trash2 aria-hidden="true" />
+                  </Button>
                 </li>
               ))}
             </ol>
           )}
+          <form
+            className="mt-4 flex min-w-0 flex-col gap-2 sm:flex-row sm:items-end"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (!choice) return;
+              run(() =>
+                updatePool.mutateAsync({
+                  poolId: pool.id,
+                  cloudMembers: [
+                    ...cloudMembers.flatMap((member) =>
+                      member.providerModelId ? [{ providerModelId: member.providerModelId }] : [],
+                    ),
+                    { providerModelId: choice },
+                  ],
+                }),
+              ).then(() => setChoice(""));
+            }}
+          >
+            <div className="min-w-0 flex-1 space-y-1.5">
+              <Label htmlFor="cloud-add">{t("dashboard:pool.cloud.add")}</Label>
+              <NativeSelect
+                id="cloud-add"
+                value={choice}
+                onChange={(event) => setChoice(event.target.value)}
+              >
+                <option value="">{t("dashboard:pool.cloud.pickModel")}</option>
+                {candidates.map((model) => (
+                  <option key={model.id} value={model.id}>
+                    {model.displayName ?? model.upstreamModelId}
+                  </option>
+                ))}
+              </NativeSelect>
+            </div>
+            <Button type="submit" size="touch" disabled={!choice || updatePool.isPending}>
+              {t("dashboard:pool.add")}
+            </Button>
+          </form>
         </CardContent>
       </Card>
     </div>
