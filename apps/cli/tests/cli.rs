@@ -1246,10 +1246,23 @@ mod signal_shutdown {
         env: &[(&str, &str)],
         stderr: Stdio,
     ) -> Setup {
+        start_relay_prepared(args, extra, env, stderr, &|_| {})
+    }
+
+    /// `start_relay_logged`, with `prepare` run on the state dir first.
+    fn start_relay_prepared(
+        args: &[&str],
+        extra: Value,
+        env: &[(&str, &str)],
+        stderr: Stdio,
+        prepare: &dyn Fn(&Path),
+    ) -> Setup {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().canonicalize().expect("canonical tempdir");
         let config = dir.join("config.json");
         let state = dir.join("state");
+        fs::create_dir_all(&state).expect("state dir");
+        prepare(&state);
         let relay = FakeRelay::start();
         let mut value = json!({
             "version": 1,
@@ -1779,6 +1792,27 @@ mod signal_shutdown {
         write_text(&mut socket, &job("st2", "vr-not-held", 30_001));
         let missing = setup.relay.next_text("runtime.job.result");
         assert_eq!(missing["error"], "definition_missing", "{missing}");
+        signal(setup.child.id(), "TERM");
+        let _ = wait_for_exit(&mut setup.child);
+    }
+
+    /// A node that was lowered stays lowered across a restart even when
+    /// config.json was edited back to `full`: only `wsmp trust full` raises.
+    #[test]
+    fn a_frozen_copy_keeps_a_hand_raised_node_relay_only() {
+        let mut setup = start_relay_prepared(&["run"], json!({}), &[], Stdio::null(), &|state| {
+            fs::write(
+                state.join("frozen-definitions.json"),
+                r#"{"version":1,"held":[]}"#,
+            )
+            .expect("frozen");
+        });
+        let hello = setup.relay.next_text("hello");
+        assert_eq!(hello["trust"], json!({ "value": "relay", "frozen": true }));
+        let config: Value =
+            serde_json::from_slice(&fs::read(setup.dir.join("config.json")).expect("config"))
+                .expect("json");
+        assert_eq!(config["trust"], "relay");
         signal(setup.child.id(), "TERM");
         let _ = wait_for_exit(&mut setup.child);
     }

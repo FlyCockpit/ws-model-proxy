@@ -13,11 +13,12 @@ use crate::protocol::runtime_spec::{MetricsReader, ModelType, RuntimeApi, Runtim
 pub const PATH_NOT_ALLOWED: &str = "path_not_allowed";
 
 /// A request path the node will even consider: one leading slash, no `//`,
-/// no `.`/`..` segment, no scheme, query, fragment, backslash, whitespace,
-/// control character or percent-encoded `.`/`/`.
+/// no `.`/`..` segment, no `:` (so no scheme), query, fragment, backslash,
+/// whitespace, control character or percent-encoded `.`/`/`/`\`.
 pub fn path_is_plain(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     path.starts_with('/')
+        && !path.contains(':')
         && !path.contains("//")
         && path.len() <= 2048
         && !path
@@ -91,18 +92,44 @@ pub fn allowed(spec: &RuntimeSpec, method: &str, path: &str) -> bool {
     if method == "GET" && readiness == Some(path) {
         return true;
     }
-    if let Some(MetricsReader::Route {
-        route, count_route, ..
-    }) = &spec.metrics_reader
+    // The count route is the node's own count step, never a relayed request.
+    if let Some(MetricsReader::Route { route, .. }) = &spec.metrics_reader
+        && method == "GET"
+        && route == path
     {
-        if method == "GET" && route == path {
-            return true;
-        }
-        if method == "POST" && count_route.as_deref() == Some(path) {
-            return true;
-        }
+        return true;
     }
     false
+}
+
+/// Request headers from the server that may reach an engine (lower-case
+/// names; mirrors the server's `sanitizeRelayRequestHeaders`). Framing,
+/// hop-by-hop, Host, forwarding and credential headers never do.
+pub fn request_header_allowed(name: &str) -> bool {
+    const ALLOWED: [&str; 17] = [
+        "accept",
+        "accept-encoding",
+        "accept-language",
+        "content-type",
+        "user-agent",
+        "idempotency-key",
+        "openai-beta",
+        "openai-version",
+        "anthropic-version",
+        "anthropic-beta",
+        "x-request-id",
+        "x-stainless-lang",
+        "x-stainless-package-version",
+        "x-stainless-os",
+        "x-stainless-arch",
+        "x-stainless-runtime",
+        "x-stainless-runtime-version",
+    ];
+    let credential_like = ["token", "secret", "credential", "password", "key", "auth"]
+        .iter()
+        .any(|word| name.contains(word))
+        && name != "idempotency-key";
+    !credential_like && (ALLOWED.contains(&name) || name.starts_with("x-openai-"))
 }
 
 #[cfg(test)]
@@ -135,10 +162,11 @@ mod tests {
             ("GET", "/v1/models"),
             ("DELETE", "/v1/responses/resp_abc-123"),
             ("GET", "/slots"),
-            ("POST", "/apply-template"),
         ] {
             assert!(allowed(&llm, method, path), "{method} {path}");
         }
+        // The count route serves the node's own count step only.
+        assert!(!allowed(&llm, "POST", "/apply-template"));
         for (method, path) in [
             ("GET", "/v1/chat/completions"),
             ("POST", "/v1/embeddings"),
@@ -190,6 +218,9 @@ mod tests {
             "/v1/models?x=1",
             "/v1/models#x",
             "\\v1\\models",
+            "/https:evil.example/x",
+            "/file:etc/passwd",
+            "/v1/models;x=1",
             "/v1/./models",
             "http://evil/v1/models",
             "v1/models",
@@ -200,6 +231,40 @@ mod tests {
                 "{path:?}"
             );
             assert!(!allowed(&llm, "GET", path), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn only_plain_metadata_headers_pass() {
+        for name in [
+            "content-type",
+            "accept",
+            "anthropic-version",
+            "x-openai-trace",
+            "idempotency-key",
+        ] {
+            assert!(request_header_allowed(name), "{name}");
+        }
+        for name in [
+            "content-length",
+            "transfer-encoding",
+            "host",
+            "connection",
+            "keep-alive",
+            "te",
+            "trailer",
+            "upgrade",
+            "expect",
+            "proxy-authorization",
+            "forwarded",
+            "x-forwarded-for",
+            "authorization",
+            "x-api-key",
+            "x-openai-api-key",
+            "x-openai-auth",
+            "cookie",
+        ] {
+            assert!(!request_header_allowed(name), "{name}");
         }
     }
 

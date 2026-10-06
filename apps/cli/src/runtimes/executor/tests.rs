@@ -238,3 +238,91 @@ fn missing_secrets_are_named_never_valued() {
         "{text}"
     );
 }
+
+/// A Runtime whose status/health can fail with an error (unknown).
+struct Flaky {
+    inner: Fake,
+    erroring: Cell<bool>,
+}
+
+impl Runtime for Flaky {
+    fn launch(&self, job: &Job, owner: &str, unit: &str, deadline: Deadline) -> Result<String> {
+        self.inner.launch(job, owner, unit, deadline)
+    }
+    fn identity(&self, unit: &str, owner: &str, deadline: Deadline) -> Result<Option<String>> {
+        anyhow::ensure!(!self.erroring.get(), "manager timed out");
+        self.inner.identity(unit, owner, deadline)
+    }
+    fn shell_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<()> {
+        self.inner.shell_until(job, command, deadline)
+    }
+    fn status_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<bool> {
+        self.inner.status_until(job, command, deadline)
+    }
+    fn stop(&self, unit: &str, owner: &str, invocation: &str, deadline: Deadline) -> Result<()> {
+        self.inner.stop(unit, owner, invocation, deadline)
+    }
+    fn healthy_until(&self, job: &Job, deadline: Deadline) -> bool {
+        self.inner.healthy_until(job, deadline)
+    }
+}
+
+#[test]
+fn a_check_that_errored_does_not_block_the_next_check() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Flaky {
+        inner: Fake::new(path.clone()),
+        erroring: Cell::new(false),
+    };
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(job(JobPhase::Start), &runtime, deadline());
+    runtime.erroring.set(true);
+    let mut first = job(JobPhase::Health);
+    first.step_id = "h1".into();
+    assert_eq!(
+        executor.execute(first, &runtime, deadline()).status,
+        JobStatus::Failed
+    );
+    runtime.erroring.set(false);
+    let mut second = job(JobPhase::Health);
+    second.step_id = "h2".into();
+    assert_eq!(
+        executor.execute(second, &runtime, deadline()).status,
+        JobStatus::Succeeded
+    );
+}
+
+#[test]
+fn a_prepare_cannot_swap_the_identity_of_a_running_instance() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(job(JobPhase::Start), &runtime, deadline());
+    let mut prepare = job(JobPhase::Prepare);
+    prepare.port = 40000;
+    prepare.version_id = "vr2".into();
+    prepare.command = "true".into();
+    assert_eq!(
+        executor.execute(prepare, &runtime, deadline()).status,
+        JobStatus::Failed
+    );
+    assert_eq!(executor.observations(&runtime, deadline())[0].1.port, 30001);
+}
+
+#[test]
+fn a_missing_secret_refuses_a_launch_before_anything_is_recorded() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path.clone()).expect("load");
+    let mut start = job(JobPhase::Start);
+    start.secrets = vec!["WSMP_SECRET_DEFINITELY_NOT_SET_7F3B".into()];
+    assert_eq!(
+        executor.execute(start, &runtime, deadline()).error,
+        Some(JobError::LocalConfigUnavailable)
+    );
+    assert_eq!(runtime.launches.get(), 0);
+    assert!(!path.exists());
+}

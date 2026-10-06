@@ -77,6 +77,9 @@ struct LoginOutput<'a> {
 }
 
 pub fn run(args: &Args) -> Result<()> {
+    if std::env::var_os(crate::trust::JOB_MARKER_ENV).is_some() {
+        anyhow::bail!("`wsmp login` cannot run from a command, job or terminal wsmp started");
+    }
     let server_url = normalize_server_url(&args.url)?;
     if let Some(warning) = server_url_http_warning(&server_url) {
         output::diagnostic(warning)?;
@@ -140,8 +143,17 @@ pub fn run(args: &Args) -> Result<()> {
         config.server_url = Some(server_url.clone());
         config.public_origin = (public_origin != url_origin).then(|| public_origin.clone());
         config.cli_slug = Some(enrolled.slug.clone());
-        // Never raise a node that is already Relay only through a re-login.
-        let keep_relay = config.trust == Some(TrustValue::Relay);
+        // Never raise a node that is already Relay only (unset counts) or
+        // was lowered (a frozen copy exists) through a re-login.
+        let enrolled_before = config.server_url.is_some()
+            || crate::state::load_node_credential()
+                .ok()
+                .flatten()
+                .is_some();
+        let keep_relay = crate::runtime_store::frozen_path()
+            .map(|path| path.exists())
+            .unwrap_or(true)
+            || (enrolled_before && crate::trust::configured(&config) == TrustValue::Relay);
         config.trust = Some(if keep_relay { TrustValue::Relay } else { trust });
         config.save()?;
         if config.trust == Some(TrustValue::Relay) {

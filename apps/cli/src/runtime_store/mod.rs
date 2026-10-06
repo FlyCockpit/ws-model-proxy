@@ -217,6 +217,11 @@ fn freeze_at(live: &Path, frozen: &Path) -> Result<()> {
     Store::load(live)?.save(frozen)
 }
 
+/// Replace the frozen copy with today's held set (a Full to Relay change).
+pub fn freeze_now() -> Result<()> {
+    Store::load(&live_path()?)?.save(&frozen_path()?)
+}
+
 /// Drop the frozen copy (raising trust).
 pub fn unfreeze() -> Result<()> {
     let path = frozen_path()?;
@@ -598,15 +603,34 @@ fn stage(
         .iter()
         .chain(op.staged.iter())
         .find(|held| held.version_id == envelope.version_id)
-        .map(|held| (held.launch_hash.clone(), held.runtime_id.clone()));
-    if let Some((hash, runtime_id)) = known {
-        // A version never changes: the same id with another hash conflicts.
-        if hash != envelope.launch_hash || runtime_id != envelope.runtime_id {
+        .map(|held| {
+            (
+                held.launch_hash.clone(),
+                held.runtime_id.clone(),
+                held.slug.clone(),
+                held.kind,
+            )
+        });
+    if let Some((hash, runtime_id, slug, kind)) = known {
+        // A version never changes: the same id with another hash, runtime,
+        // slug or kind conflicts.
+        if hash != envelope.launch_hash
+            || runtime_id != envelope.runtime_id
+            || slug != envelope.slug
+            || kind != envelope.kind
+        {
             return rejected(
                 envelope,
                 DefineRejectReason::Conflict,
                 Some("versionId".into()),
             );
+        }
+        if envelope.kind == RuntimeKind::AlwaysOn
+            && projected(op, current)
+                .iter()
+                .any(|held| held.slug == envelope.slug && held.runtime_id != envelope.runtime_id)
+        {
+            return rejected(envelope, DefineRejectReason::Conflict, Some("slug".into()));
         }
         if !op
             .staged

@@ -330,6 +330,14 @@ impl Executor {
         Ok(())
     }
 
+    /// The job the record for `instance_id`/`rank` last ran.
+    pub fn recorded_job(&self, instance_id: &str, rank: u8) -> Option<Job> {
+        self.state
+            .records
+            .get(&format!("{instance_id}:{rank}"))
+            .map(|record| record.job.clone())
+    }
+
     /// Verified stopped long enough ago that nothing will ask about it.
     pub fn expired(&self) -> bool {
         let now = (self.clock)();
@@ -386,11 +394,22 @@ impl Executor {
             return Err(fail(JobError::SessionDisconnected));
         }
         let key = job.key();
+        if matches!(
+            job.action,
+            JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin
+        ) && !job.command.trim().is_empty()
+        {
+            // A missing secret refuses the launch before anything is recorded.
+            command_env(job)?;
+        }
         let mut admitted = false;
         if let Some(record) = self.state.records.get(&key) {
+            // A new launch may change the version (a restart), but only while
+            // nothing of the old one runs.
             anyhow::ensure!(
                 record.job.identity_matches(job)
-                    || matches!(job.action, JobPhase::Prepare | JobPhase::Start),
+                    || (matches!(job.action, JobPhase::Prepare | JobPhase::Start)
+                        && record.invocations.is_empty()),
                 "instance identity changed"
             );
             if let Some(done) = record.completed.get(&job.step_id) {
@@ -408,13 +427,29 @@ impl Executor {
                             "stopped unit revived"
                         );
                     }
+                    if let Some(status) = job.status_command.as_deref() {
+                        anyhow::ensure!(
+                            !runtime.status_until(
+                                job,
+                                status,
+                                deadline.cap(Duration::from_secs(5))
+                            )?,
+                            "stopped service revived"
+                        );
+                    }
                 }
                 return Ok(done.outcome.clone());
             }
             if let Some(pending) = &record.pending {
+                // A read-only check that failed part way had no effect: a
+                // later step replaces it.
                 anyhow::ensure!(
                     (pending.step_id == job.step_id && pending.intent_hash == job.intent_hash)
-                        || job.action == JobPhase::Stop,
+                        || job.action == JobPhase::Stop
+                        || matches!(
+                            pending.action,
+                            JobPhase::Readiness | JobPhase::Health | JobPhase::Status
+                        ),
                     "another step is unresolved"
                 );
                 // A launch may have happened before the node died: never
@@ -485,6 +520,11 @@ impl Executor {
             return Err(error);
         }
         if runtime.cancelled() {
+            // Nothing external ran: forget a record this step created.
+            if admitted {
+                self.state.records.remove(&key);
+                let _ = self.persist();
+            }
             return Err(fail(JobError::SessionDisconnected));
         }
         deadline.remaining()?;
@@ -736,7 +776,10 @@ impl Executor {
                         runtime
                             .identity(unit, &self.state.owner_id, deadline)
                             .is_ok_and(|seen| seen.as_ref() == Some(identity))
-                    });
+                    })
+                    && (job.management() != Management::Process
+                        || serving_confirmed(record, &self.state.owner_id, runtime, deadline)
+                            .is_ok_and(|alive| alive));
                 let absent = record.phase == InstancePhase::Stopped
                     && owned_units(job).iter().all(|unit| {
                         runtime

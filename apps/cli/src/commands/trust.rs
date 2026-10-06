@@ -83,15 +83,32 @@ fn answer_ok(response: &serde_json::Value) -> Result<bool> {
 }
 
 fn lower(json: bool) -> Result<()> {
-    let (changed, running) = match control::request_if_running(ControlCommand::TrustRelay)? {
-        Some(response) => (answer_ok(&response)?, true),
-        None => {
-            let before = crate::trust::configured(&Config::load_required()?);
-            crate::trust::persist_relay()?;
-            (before == TrustValue::Full, false)
+    // Lowering is always allowed: persist it here first, so it sticks even
+    // when the relay is busy or unreachable; then tell the relay.
+    let before = crate::trust::configured(&Config::load_required()?);
+    if before == TrustValue::Full {
+        crate::trust::persist_lowering()?;
+    } else {
+        crate::trust::persist_relay()?;
+    }
+    let running = match control::request_if_running(ControlCommand::TrustRelay) {
+        Ok(Some(response)) => {
+            if let Err(error) = answer_ok(&response) {
+                output::diagnostic(format!(
+                    "warning: lowered in config.json, but the relay answered: {error}"
+                ))?;
+            }
+            true
+        }
+        Ok(None) => false,
+        Err(error) => {
+            output::diagnostic(format!(
+                "warning: lowered in config.json; the relay picks it up within 2 s ({error:#})"
+            ))?;
+            true
         }
     };
-    report(json, TrustValue::Relay, changed, running)
+    report(json, TrustValue::Relay, before == TrustValue::Full, running)
 }
 
 fn raise(json: bool) -> Result<()> {
@@ -124,6 +141,10 @@ fn raise(json: bool) -> Result<()> {
     let (changed, running) = match control::request_if_running(ControlCommand::TrustFull)? {
         Some(response) => (answer_ok(&response)?, true),
         None => {
+            // No relay to check this process: check it here, the same way.
+            #[cfg(unix)]
+            crate::trust::peer_may_raise(i32::try_from(std::process::id()).unwrap_or(0), 0)
+                .map_err(|reason| anyhow::anyhow!("{reason}"))?;
             crate::trust::persist_full()?;
             (true, false)
         }

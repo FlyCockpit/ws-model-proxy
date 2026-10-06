@@ -237,6 +237,40 @@ fn slugs_conflict_across_runtimes_and_versions_never_change() {
         results(&changed.answer)[0].2,
         Some(DefineRejectReason::Conflict)
     );
+    // The same version under another slug is not the same version.
+    let renamed = fx.send(
+        &define(
+            "op6",
+            "vr1",
+            "rt1",
+            "renamed",
+            always_on("http://127.0.0.1:8080/v1"),
+        ),
+        TrustValue::Full,
+    );
+    assert_eq!(
+        results(&renamed.answer)[0].2,
+        Some(DefineRejectReason::Conflict)
+    );
+    // A complete operation cannot end with two runtimes on one slug.
+    let put = |version: &str, runtime: &str, base: &str| -> Value {
+        serde_json::from_str::<Value>(&define("x", version, runtime, "bge", always_on(base)))
+            .expect("json")["put"][0]
+            .clone()
+    };
+    let complete = serde_json::json!({
+        "type": "runtime.define", "opId": "op7", "chunkIndex": 0, "final": true, "complete": true,
+        "put": [put("vr9", "rt9", "http://127.0.0.1:7000"), put("vr1", "rt1", "http://127.0.0.1:8080/v1")]
+    })
+    .to_string();
+    let both = fx.send(&complete, TrustValue::Full);
+    assert!(
+        results(&both.answer)
+            .iter()
+            .any(|(_, _, reason)| *reason == Some(DefineRejectReason::Conflict))
+    );
+    let held = fx.store().held;
+    assert_eq!(held.iter().filter(|h| h.slug == "bge").count(), 1);
     let instance_slug = fx.send(
         &define(
             "op5",

@@ -23,7 +23,6 @@ pub fn interface_for(ip: &str, addresses: &BTreeMap<String, Vec<String>>) -> Opt
                 .any(|address| address.parse::<IpAddr>().is_ok_and(|seen| seen == wanted))
         })
         .map(|(name, _)| name.clone())
-        .filter(|name| is_fabric_device_name(name))
 }
 
 /// The RDMA device bound to `iface`, read under `sys` (normally `/sys`).
@@ -78,8 +77,11 @@ mod tests {
             Some("enp1s0f0")
         );
         assert_eq!(interface_for("10.0.0.6", &addresses), None);
-        // A name that is not plain never reaches a command.
-        assert_eq!(interface_for("10.0.0.9", &addresses), None);
+        // Found as is: the caller refuses a name that is not plain.
+        assert_eq!(
+            interface_for("10.0.0.9", &addresses).as_deref(),
+            Some("bad;name")
+        );
     }
 
     #[test]

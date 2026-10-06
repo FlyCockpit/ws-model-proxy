@@ -23,6 +23,8 @@ const INSTANCES_DIR: &str = "runtime-instances";
 /// What a finished step (or an observation pass) reports.
 #[derive(Debug)]
 pub struct Update {
+    /// Observations are ordered: an older one never replaces a newer one.
+    pub generation: u64,
     pub result: Option<NodeFrame>,
     /// Every instance rank this node knows, verified against the machine.
     pub instances: Vec<(Job, InstanceRecord)>,
@@ -65,6 +67,7 @@ pub struct Runner {
     running: Arc<Mutex<BTreeMap<String, Vec<Arc<AtomicBool>>>>>,
     keys: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     active: Arc<AtomicUsize>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
     dir: PathBuf,
 }
 
@@ -78,6 +81,7 @@ impl Runner {
             running: Arc::new(Mutex::new(BTreeMap::new())),
             keys: Arc::new(Mutex::new(BTreeMap::new())),
             active: Arc::new(AtomicUsize::new(0)),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dir,
         };
         runner.observe();
@@ -88,11 +92,14 @@ impl Runner {
     pub fn observe(&self) {
         let tx = self.tx.clone();
         let dir = self.dir.clone();
+        let generation = Arc::clone(&self.generation);
         let _ = std::thread::Builder::new()
             .name("wsmp-instances".into())
             .spawn(move || {
+                let generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
                 let instances = observe_all(&dir);
                 let _ = tx.send(Update {
+                    generation,
                     result: None,
                     instances,
                 });
@@ -138,6 +145,7 @@ impl Runner {
         let dir = self.dir.clone();
         let running = Arc::clone(&self.running);
         let active = Arc::clone(&self.active);
+        let generation = Arc::clone(&self.generation);
         active.fetch_add(1, Ordering::SeqCst);
         let spawned = std::thread::Builder::new()
             .name("wsmp-runtime-step".into())
@@ -154,8 +162,10 @@ impl Runner {
                         running.remove(&key);
                     }
                 }
+                let generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
                 let instances = observe_all(&dir);
                 let _ = tx.send(Update {
+                    generation,
                     result: Some(result_frame(&job, &outcome)),
                     instances,
                 });
@@ -169,15 +179,20 @@ impl Runner {
     }
 }
 
-impl Drop for Runner {
-    /// The connection ended: cancel steps in flight (units keep running).
-    fn drop(&mut self) {
-        if let Ok(running) = self.running.lock() {
-            for flag in running.values().flatten() {
-                flag.store(true, Ordering::SeqCst);
-            }
-        }
+/// The rendered job a rank last ran (its own record), for steps on an
+/// instance whose version the server since dropped.
+pub fn recorded_job(instance_id: &str, rank: u8) -> Option<Job> {
+    let dir = instances_dir().ok()?;
+    let ok = !instance_id.is_empty()
+        && instance_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if !ok {
+        return None;
     }
+    Executor::load(dir.join(format!("{instance_id}-r{rank}.json")))
+        .ok()?
+        .recorded_job(instance_id, rank)
 }
 
 fn run_step(
@@ -221,8 +236,37 @@ fn run_step(
     executor.execute(job, &runtime, deadline)
 }
 
+/// Delete an expired record only under its lock, re-checked after locking
+/// (a step may have started on it). The lock file stays.
+fn remove_expired(dir: &Path, path: &Path) {
+    let Some(key) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return;
+    };
+    let Ok(_lock) = file_lock_now(dir, key) else {
+        return;
+    };
+    if Executor::load(path.to_path_buf()).is_ok_and(|executor| executor.expired()) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 #[cfg(unix)]
 fn file_lock(dir: &Path, key: &str) -> Result<nix::fcntl::Flock<std::fs::File>> {
+    lock_with(dir, key, nix::fcntl::FlockArg::LockExclusive)
+}
+
+/// The lock when it is free right now; never waits.
+#[cfg(unix)]
+fn file_lock_now(dir: &Path, key: &str) -> Result<nix::fcntl::Flock<std::fs::File>> {
+    lock_with(dir, key, nix::fcntl::FlockArg::LockExclusiveNonblock)
+}
+
+#[cfg(unix)]
+fn lock_with(
+    dir: &Path,
+    key: &str,
+    mode: nix::fcntl::FlockArg,
+) -> Result<nix::fcntl::Flock<std::fs::File>> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     std::fs::create_dir_all(dir).context("creating the instance state directory")?;
     let metadata = std::fs::symlink_metadata(dir)?;
@@ -240,7 +284,7 @@ fn file_lock(dir: &Path, key: &str) -> Result<nix::fcntl::Flock<std::fs::File>> 
         .custom_flags(nix::libc::O_NOFOLLOW)
         .open(dir.join(format!("{key}.lock")))
         .context("opening the instance lock")?;
-    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+    nix::fcntl::Flock::lock(file, mode)
         .map_err(|(_, error)| anyhow::anyhow!("locking instance state: {error}"))
 }
 
@@ -263,8 +307,7 @@ pub fn observe_all(dir: &Path) -> Vec<(Job, InstanceRecord)> {
         };
         let deadline = Deadline::new(Duration::from_secs(20));
         if executor.expired() {
-            let _ = std::fs::remove_file(&path);
-            let _ = std::fs::remove_file(path.with_extension("lock"));
+            remove_expired(dir, &path);
             continue;
         }
         out.extend(executor.observations(&runtime, deadline));

@@ -509,26 +509,40 @@ enum NodeChange {
     Features,
 }
 
-/// Lower to Relay only: persist, freeze, latch. Whether it changed.
+/// Lower to Relay only: freeze (today's set when coming from Full),
+/// persist, latch. Whether it changed. The latch holds even when writing
+/// fails.
 fn apply_lower(startup: &TerminalStartup) -> Result<bool> {
-    crate::trust::persist_relay()?;
-    Ok(startup.lower_trust())
+    let persisted = if startup.full_control() {
+        crate::trust::persist_lowering()
+    } else {
+        crate::trust::persist_relay()
+    };
+    let changed = startup.lower_trust();
+    persisted.map(|()| changed)
 }
 
 /// Hot reload (every 2 s on a changed `config.json`, and on `Reload`):
 /// runtime hosts follow the file; trust only ever goes down. A file that
 /// says `full` while the node is Relay only is written back to `relay`.
 fn reload_config(startup: &TerminalStartup) -> Result<Vec<NodeChange>> {
-    let config = Config::load_required()?;
     let mut changes = vec![NodeChange::Features];
-    startup.set_runtime_hosts(config.runtime_hosts.clone());
-    let file_trust = crate::trust::configured(&config);
+    // Trust first, from the raw file: a config that does not parse (a typo
+    // anywhere) or lacks `trust: full` reads as Relay only.
+    let file_trust = crate::trust::configured_on_disk();
+    match Config::load_required() {
+        Ok(config) => startup.set_runtime_hosts(config.runtime_hosts.clone()),
+        Err(error) => tracing::warn!(
+            error = %format!("{error:#}"),
+            "config.json does not load; keeping the runtime hosts"
+        ),
+    }
     match (startup.trust_value(), file_trust) {
         (TrustValue::Full, TrustValue::Relay) => {
-            if apply_lower(startup)? {
-                tracing::warn!("config.json lowered this node to Relay only");
-                changes.push(NodeChange::Lowered);
-            }
+            let lowered = apply_lower(startup);
+            tracing::warn!("config.json lowered this node to Relay only");
+            changes.push(NodeChange::Lowered);
+            lowered?;
         }
         (TrustValue::Relay, TrustValue::Full) => {
             tracing::warn!(
@@ -643,10 +657,14 @@ fn answer_control_requests(
                 let _ = control::respond(pending, &response);
             }
             ControlCommand::TrustRelay => {
-                let response = match apply_lower(startup) {
+                let was_full = startup.full_control();
+                let lowered = apply_lower(startup);
+                if was_full {
+                    changes.push(NodeChange::Lowered);
+                }
+                let response = match lowered {
                     Ok(true) => {
                         tracing::warn!("`wsmp trust relay` lowered this node to Relay only");
-                        changes.push(NodeChange::Lowered);
                         simple_response(true, "changed", None)
                     }
                     Ok(false) => simple_response(true, "unchanged", None),
@@ -658,11 +676,10 @@ fn answer_control_requests(
                 let _ = control::respond(pending, &response);
             }
             ControlCommand::TrustFull => {
-                let allowed = pending
-                    .peer_pid
-                    .map_or(cfg!(not(target_os = "linux")), |pid| {
-                        crate::trust::peer_may_raise(pid, std::process::id()).is_ok()
-                    });
+                // No peer pid, no raise.
+                let allowed = pending.peer_pid.is_some_and(|pid| {
+                    crate::trust::peer_may_raise(pid, std::process::id()).is_ok()
+                });
                 let response = if !allowed {
                     tracing::warn!("refused a trust raise from a process wsmp started");
                     simple_response(false, "refused", Some("raise"))
@@ -738,13 +755,15 @@ fn wait_for_reconnect(
 /// Held definitions and what their handles reach, for the current trust.
 struct NodeRuntimes {
     store: Store,
+    /// `runtimeHosts` as last read: always-on addresses are re-checked.
+    runtime_hosts: Vec<String>,
     targets: BTreeMap<String, Target>,
     /// Every instance rank on this node, as last observed.
     instances: Vec<(Job, InstanceRecord)>,
 }
 
 impl NodeRuntimes {
-    fn load(trust: TrustValue) -> Self {
+    fn load(trust: TrustValue, runtime_hosts: &[String]) -> Self {
         let store = crate::runtime_store::load_for(trust).unwrap_or_else(|error| {
             tracing::warn!(
                 error = %format!("{error:#}"),
@@ -754,6 +773,7 @@ impl NodeRuntimes {
         });
         let mut runtimes = Self {
             store,
+            runtime_hosts: runtime_hosts.to_vec(),
             targets: BTreeMap::new(),
             instances: Vec::new(),
         };
@@ -762,9 +782,9 @@ impl NodeRuntimes {
     }
 
     /// Reload the held set for `trust`, keeping the observed instances.
-    fn reload(&mut self, trust: TrustValue) {
+    fn reload(&mut self, trust: TrustValue, runtime_hosts: &[String]) {
         let instances = std::mem::take(&mut self.instances);
-        *self = Self::load(trust);
+        *self = Self::load(trust, runtime_hosts);
         self.instances = instances;
         self.retarget();
     }
@@ -776,6 +796,22 @@ impl NodeRuntimes {
 
     fn retarget(&mut self) {
         let mut targets = crate::runtimes::endpoints::always_on_targets(&self.store);
+        // An address no longer allowed (a host removed from `runtimeHosts`)
+        // stops being reachable at once.
+        targets.retain(|slug, target| {
+            let allowed = crate::runtime_store::validate::check_base_url(
+                &target.endpoint.base_url,
+                &self.runtime_hosts,
+            )
+            .is_ok();
+            if !allowed {
+                tracing::warn!(
+                    runtime = slug,
+                    "an always-on address is no longer allowed here"
+                );
+            }
+            allowed
+        });
         targets.extend(crate::runtimes::endpoints::instance_targets(
             &self.instances,
         ));
@@ -824,6 +860,8 @@ struct Session<'a> {
     runtimes: NodeRuntimes,
     #[cfg(unix)]
     runner: Option<crate::runtimes::runner::Runner>,
+    /// The newest instance observation applied.
+    observed_generation: u64,
 }
 
 /// What outlives one relay connection: the worker channel and the node
@@ -962,7 +1000,7 @@ fn run_relay_session(
         registered: false,
         telemetry: None,
         defines: Defines::default(),
-        runtimes: NodeRuntimes::load(startup.trust_value()),
+        runtimes: NodeRuntimes::load(startup.trust_value(), &startup.runtime_hosts()),
         #[cfg(unix)]
         runner: crate::runtimes::runner::Runner::start()
             .inspect_err(|error| {
@@ -972,6 +1010,7 @@ fn run_relay_session(
                 );
             })
             .ok(),
+        observed_generation: 0,
     };
 
     let server_url = config.server_url.as_deref().unwrap_or_default();
@@ -986,6 +1025,15 @@ fn run_relay_session(
     let identity_signature = identity
         .sign_hello(&nonce, node_slug, &origin)
         .map_err(RelaySessionError::Fatal)?;
+    // Any edit made while connecting (a hand-written `relay`) applies before
+    // the hello reports trust.
+    match reload_config(startup) {
+        Ok(changes) => apply_node_changes(&mut socket, startup, &mut session, &changes)?,
+        Err(error) => tracing::warn!(
+            error = %format!("{error:#}"),
+            "reloading the config failed"
+        ),
+    }
     let hello = NodeFrame::Hello {
         id: next_id("hello"),
         protocol_version: RELAY_PROTOCOL_VERSION.to_string(),
@@ -1360,7 +1408,9 @@ where
                 Ok(outcome) => {
                     send_control(socket, &outcome.answer, "answering a runtime definition")?;
                     if outcome.changed {
-                        session.runtimes.reload(startup.trust_value());
+                        session
+                            .runtimes
+                            .reload(startup.trust_value(), &startup.runtime_hosts());
                         if let Some(max) = session.runtimes.store.command_max_ms() {
                             session.execs.set_command_max(Duration::from_millis(max));
                         }
@@ -1642,14 +1692,14 @@ fn lower_trust<S>(
 where
     S: std::io::Read + std::io::Write,
 {
-    if let Err(error) = crate::trust::persist_relay() {
-        // Latch for this daemon anyway; the next start reads the file.
-        tracing::warn!(
+    if let Err(error) = apply_lower(startup) {
+        // Latched for this daemon anyway; the frozen copy, when it was
+        // written, keeps the node lowered after a restart.
+        tracing::error!(
             error = %format!("{error:#}"),
-            "persisting the lowered trust failed; it holds until wsmp restarts"
+            "persisting the lowered trust failed"
         );
     }
-    startup.lower_trust();
     tracing::warn!(id, "a person lowered this node to Relay only");
     apply_node_changes(socket, startup, session, &[NodeChange::Lowered])
 }
@@ -1680,12 +1730,10 @@ where
         #[cfg(unix)]
         session.files.raise_trust();
     }
-    if changes
-        .iter()
-        .any(|change| matches!(change, NodeChange::Lowered | NodeChange::Raised))
-    {
-        session.runtimes.reload(startup.trust_value());
-    }
+    // Trust changes switch the held set; host changes re-check addresses.
+    session
+        .runtimes
+        .reload(startup.trust_value(), &startup.runtime_hosts());
     if !session.registered {
         return Ok(());
     }
@@ -1725,45 +1773,66 @@ where
         exit_code: None,
     };
     let facts = crate::runtimes::render::NodeFacts::current();
-    let rendered = match crate::runtimes::render::render(
-        &job,
-        startup.trust_value(),
-        &session.runtimes.store,
-        &facts,
-    ) {
-        Ok(rendered) => Ok(rendered),
+    let trust = startup.trust_value();
+    let missing = if trust == TrustValue::Full {
+        JobError::DefinitionMissing
+    } else {
+        JobError::DefinitionFrozen
+    };
+    let refused_with = |error: JobError, detail: &str| crate::runtimes::render::Refusal {
+        error,
+        detail: Some(detail.to_string()),
+    };
+    let rendered = if job.operator.is_some() {
+        Err(crate::runtimes::render::Refusal {
+            error: JobError::InteractiveUnsupported,
+            detail: None,
+        })
+    } else if let Err(refused) = crate::runtimes::render::check_ids(&job) {
         Err(refused)
-            if matches!(
-                refused.error,
-                JobError::DefinitionMissing | JobError::DefinitionFrozen
-            ) && matches!(
-                job.phase,
-                JobPhase::Stop | JobPhase::Status | JobPhase::Health | JobPhase::Readiness
-            ) =>
-        {
-            session
-                .runtimes
-                .instances
-                .iter()
-                .find(|(known, _)| {
-                    known.instance_id == job.instance_id
-                        && known.rank == job.rank
-                        && known.launch_hash == job.launch_hash
-                        && known.version_id == job.launch_version_id
-                        && known.unit_name == job.unit_name
-                })
-                .map(|(known, _)| Job {
-                    step_id: job.step_id.clone(),
-                    action: job.phase,
-                    intent_hash: job.intent_hash.clone(),
-                    owner_epoch: job.owner_epoch.clone(),
-                    timeout_ms: job.timeout_ms.clamp(1, 3_600_000),
-                    command: String::new(),
-                    ..known.clone()
-                })
-                .ok_or(refused)
+    } else if matches!(
+        job.phase,
+        JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin
+    ) {
+        crate::runtimes::render::render(&job, trust, &session.runtimes.store, &facts)
+    } else {
+        // Checks and stops run the commands the rank was launched with (its
+        // own record), never re-rendered. Checks still need the version held;
+        // a stop also works after the server dropped it.
+        let held = session
+            .runtimes
+            .store
+            .find(&job.launch_version_id, &job.launch_hash)
+            .is_some();
+        #[cfg(unix)]
+        let recorded =
+            crate::runtimes::runner::recorded_job(&job.instance_id, job.rank).filter(|known| {
+                known.version_id == job.launch_version_id
+                    && known.launch_hash == job.launch_hash
+                    && known.unit_name == job.unit_name
+                    && known.handle == job.handle
+                    && known.runtime_id == job.runtime_id
+            });
+        #[cfg(not(unix))]
+        let recorded: Option<Job> = None;
+        if !held && job.phase != JobPhase::Stop {
+            Err(refused_with(missing, "launchVersionId"))
+        } else if let Some(known) = recorded {
+            Ok(Job {
+                step_id: job.step_id.clone(),
+                action: job.phase,
+                intent_hash: job.intent_hash.clone(),
+                owner_epoch: job.owner_epoch.clone(),
+                timeout_ms: job.timeout_ms.clamp(1, 3_600_000),
+                command: String::new(),
+                ..known
+            })
+        } else if held {
+            // No record: the executor answers `instance_unknown`.
+            crate::runtimes::render::render(&job, trust, &session.runtimes.store, &facts)
+        } else {
+            Err(refused_with(missing, "launchVersionId"))
         }
-        Err(refused) => Err(refused),
     };
     let rendered = match rendered {
         Ok(rendered) => rendered,
@@ -1822,7 +1891,10 @@ where
         .as_ref()
         .and_then(|runner| runner.try_update())
     {
-        session.runtimes.set_instances(update.instances);
+        if update.generation > session.observed_generation {
+            session.observed_generation = update.generation;
+            session.runtimes.set_instances(update.instances);
+        }
         if !session.registered {
             continue;
         }
@@ -2476,26 +2548,51 @@ async fn execute_upstream(
     let mut builder = client
         .request(method, url.as_str())
         .timeout(Duration::from_millis(spec.timeout_ms));
+    // Only plain request metadata from the server reaches the engine: no
+    // framing, hop-by-hop, Host, forwarding or credential headers (a
+    // server-chosen Content-Length could smuggle a second request past the
+    // allowlist on a kept-alive connection).
+    let node_header_names: Vec<String> = spec
+        .endpoint_headers
+        .iter()
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect();
     for (name, value) in &spec.request_headers {
-        // When streaming a body, let the HTTP client frame it (chunked). Drop any
-        // caller-provided framing headers to avoid a content-length mismatch.
-        if spec.has_body && (name == "content-length" || name == "transfer-encoding") {
+        let lower = name.to_ascii_lowercase();
+        if !crate::runtimes::allowlist::request_header_allowed(&lower)
+            || node_header_names.contains(&lower)
+        {
             continue;
         }
-        builder = builder.header(name, value);
+        builder = builder.header(lower, value);
     }
+    // The node's own credentials replace anything of the same name.
+    let mut credentials = reqwest::header::HeaderMap::new();
     for (name, env) in &spec.endpoint_headers {
         let value = crate::secrets::credential(env)
             .with_context(|| format!("reading endpoint header `{name}` from `{env}`"))?;
-        builder = builder.header(name, value);
+        credentials.insert(
+            reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .context("an endpoint header name is invalid")?,
+            reqwest::header::HeaderValue::from_str(&value)
+                .context("an endpoint header value is invalid")?,
+        );
     }
     if let Some((mode, env)) = &spec.endpoint_auth {
         let value = crate::secrets::credential(env).context("reading typed endpoint credential")?;
-        builder = match mode {
-            EndpointAuthMode::ApiKey => builder.header("x-api-key", value),
-            EndpointAuthMode::Bearer => builder.header("authorization", format!("Bearer {value}")),
+        let (name, value) = match mode {
+            EndpointAuthMode::ApiKey => {
+                (reqwest::header::HeaderName::from_static("x-api-key"), value)
+            }
+            EndpointAuthMode::Bearer => (reqwest::header::AUTHORIZATION, format!("Bearer {value}")),
         };
+        credentials.insert(
+            name,
+            reqwest::header::HeaderValue::from_str(&value)
+                .context("the endpoint credential is not a valid header value")?,
+        );
     }
+    builder = builder.headers(credentials);
 
     // Media expansion only applies to chat-shaped JSON bodies on an opted-in
     // endpoint. Every other shape (non-JSON, body-less) stays on the streaming
@@ -3400,29 +3497,38 @@ fn websocket_url(server_url: &str) -> Result<Url> {
     Ok(url)
 }
 
+/// The upstream URL for `request_path` on a runtime at `base_url` (§4.8):
+/// API paths (`/v1/...`) join onto the base URL, whose API prefix replaces the
+/// leading `/v1`; engine routes (readiness, metrics reader, count route) join
+/// onto the origin. The result must stay on the base URL's origin.
 pub(crate) fn endpoint_url(base_url: &str, request_path: &str) -> Result<Url> {
-    let mut base =
+    let base =
         Url::parse(base_url).with_context(|| format!("parsing endpoint URL `{base_url}`"))?;
-    // API paths (`/v1/...`) join onto the base URL with its API prefix;
-    // engine routes (readiness, metrics reader, count route) onto the origin.
-    if !(request_path == "/v1" || request_path.starts_with("/v1/")) {
-        base.set_path("/");
-    }
-    let request_path = request_path.trim_start_matches('/');
-    // Upstreams commonly document either their origin or their `/v1` base URL.
-    // Keep the configured URL intact, but avoid duplicating that version prefix
-    // when the relay receives an OpenAI-shaped `/v1/...` request from WMP.
-    let request_path = if base.path().trim_end_matches('/').ends_with("/v1") {
-        request_path.strip_prefix("v1/").unwrap_or(request_path)
-    } else {
-        request_path
+    anyhow::ensure!(
+        crate::runtimes::allowlist::path_is_plain(request_path),
+        "the request path is not a plain path"
+    );
+    let prefix = base.path().trim_end_matches('/');
+    let path = match request_path.strip_prefix("/v1") {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            // No prefix: keep `/v1`. A prefix replaces it.
+            if prefix.is_empty() {
+                request_path.to_string()
+            } else {
+                format!("{prefix}{rest}")
+            }
+        }
+        _ => request_path.to_string(),
     };
-    if !base.path().ends_with('/') {
-        let next = format!("{}/", base.path());
-        base.set_path(&next);
-    }
-    base.join(request_path)
-        .with_context(|| format!("joining endpoint URL `{base_url}` with path `{request_path}`"))
+    let mut url = base.clone();
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    anyhow::ensure!(
+        url.origin() == base.origin() && url.path() == path,
+        "the request path leaves the runtime's address"
+    );
+    Ok(url)
 }
 
 fn next_id(prefix: &str) -> String {
@@ -4222,55 +4328,69 @@ mod tests {
     }
 
     #[test]
-    fn engine_routes_join_onto_the_origin() {
-        assert_eq!(
-            endpoint_url("http://127.0.0.1:8080/v1", "/slots")
-                .expect("URL should join")
-                .as_str(),
-            "http://127.0.0.1:8080/slots"
-        );
-        assert_eq!(
-            endpoint_url("http://127.0.0.1:8080/api/v1", "/v1/models")
-                .expect("URL should join")
-                .as_str(),
-            "http://127.0.0.1:8080/api/v1/models"
-        );
+    fn api_paths_take_the_prefix_and_engine_routes_the_origin() {
+        let join = |base: &str, path: &str| endpoint_url(base, path).map(|url| url.to_string());
+        for (base, path, want) in [
+            (
+                "http://127.0.0.1:8080/v1",
+                "/v1/chat/completions",
+                "http://127.0.0.1:8080/v1/chat/completions",
+            ),
+            (
+                "http://127.0.0.1:8080",
+                "/v1/chat/completions",
+                "http://127.0.0.1:8080/v1/chat/completions",
+            ),
+            (
+                "http://127.0.0.1:8080/openai",
+                "/v1/chat/completions",
+                "http://127.0.0.1:8080/openai/chat/completions",
+            ),
+            (
+                "http://127.0.0.1:8080/api/v1",
+                "/v1/models",
+                "http://127.0.0.1:8080/api/v1/models",
+            ),
+            (
+                "http://127.0.0.1:8080/v1",
+                "/slots",
+                "http://127.0.0.1:8080/slots",
+            ),
+            (
+                "http://[::1]:8080/v1",
+                "/v1/models",
+                "http://[::1]:8080/v1/models",
+            ),
+            (
+                "http://127.0.0.1:8080/v1",
+                "/v1x/models",
+                "http://127.0.0.1:8080/v1x/models",
+            ),
+        ] {
+            assert_eq!(join(base, path).expect(path), want, "{base} {path}");
+        }
     }
 
     #[test]
-    fn endpoint_url_does_not_duplicate_a_configured_v1_prefix() {
-        assert_eq!(
-            endpoint_url("http://localhost:11434/v1", "/v1/chat/completions")
-                .expect("URL should join")
-                .as_str(),
-            "http://localhost:11434/v1/chat/completions"
-        );
-        assert_eq!(
-            endpoint_url("http://localhost:11434/v1/", "/v1/chat/completions")
-                .expect("URL should join")
-                .as_str(),
-            "http://localhost:11434/v1/chat/completions"
-        );
-        assert_eq!(
-            endpoint_url("http://localhost:11434", "/v1/chat/completions")
-                .expect("URL should join")
-                .as_str(),
-            "http://localhost:11434/v1/chat/completions"
-        );
-        // Base paths that merely contain `v1` as a longer segment keep the request path.
-        assert_eq!(
-            endpoint_url("http://localhost:11434/api/v1beta", "/v1/models")
-                .expect("URL should join")
-                .as_str(),
-            "http://localhost:11434/api/v1beta/v1/models"
-        );
-        // Engine routes (no `/v1`) join onto the origin (§4.8).
-        assert_eq!(
-            endpoint_url("http://localhost:11434/v1", "/models")
-                .expect("URL should join")
-                .as_str(),
-            "http://localhost:11434/models"
-        );
+    fn a_request_path_never_leaves_the_runtime_address() {
+        for path in [
+            "http://evil.example/x",
+            "/https://evil.example/x",
+            "https:evil.example",
+            "/https:evil.example/x",
+            "/ws:evil.example/x",
+            "/file:etc/passwd",
+            "\\\\evil.example/x",
+            "/v1/../../admin",
+            "//evil.example/x",
+            "/v1/%2e%2e/admin",
+            "/v1/models?x=1",
+        ] {
+            assert!(
+                endpoint_url("http://127.0.0.1:8000/v1", path).is_err(),
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -4513,6 +4633,66 @@ mod tests {
         )));
     }
 
+    /// Framing, Host and credential headers from the server never reach the
+    /// engine; the node's own credential is the only one sent.
+    #[test]
+    fn server_headers_cannot_smuggle_framing_or_credentials() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+        let address = listener.local_addr().expect("address");
+        let upstream = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0_u8; 4096];
+            let size = std::io::Read::read(&mut stream, &mut request).expect("read");
+            let text = String::from_utf8_lossy(&request[..size]).to_ascii_lowercase();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                .expect("write");
+            text
+        });
+        let mut spec = local_upstream_spec(format!("http://{address}"));
+        spec.method = "GET".to_string();
+        spec.has_body = false;
+        for (name, value) in [
+            ("Content-Length", "40"),
+            ("host", "admin.internal"),
+            ("authorization", "Bearer server-chosen"),
+            ("x-api-key", "server-chosen"),
+            ("transfer-encoding", "chunked"),
+            ("x-forwarded-for", "1.2.3.4"),
+            ("content-type", "application/json"),
+        ] {
+            spec.request_headers
+                .insert(name.to_string(), value.to_string());
+        }
+        crate::secrets::test_secrets()
+            .lock()
+            .expect("test secrets")
+            .insert(
+                "WSMP_SECRET_HEADER_TEST".to_string(),
+                "node-own".to_string(),
+            );
+        spec.endpoint_auth = Some((
+            EndpointAuthMode::Bearer,
+            "WSMP_SECRET_HEADER_TEST".to_string(),
+        ));
+        let (tx, _rx) = mpsc::sync_channel(RELAY_WORKER_OUTBOUND_CAPACITY);
+        let (_cancellation, cancellation_rx) = CancellationHandle::new();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(execute_upstream(spec, None, &tx, cancellation_rx))
+            .expect("relay");
+        let seen = upstream.join().expect("upstream");
+        assert!(!seen.contains("content-length: 40"), "{seen}");
+        assert!(!seen.contains("admin.internal"), "{seen}");
+        assert!(!seen.contains("server-chosen"), "{seen}");
+        assert!(!seen.contains("transfer-encoding"), "{seen}");
+        assert!(!seen.contains("x-forwarded-for"), "{seen}");
+        assert!(seen.contains("authorization: bearer node-own"), "{seen}");
+        assert!(seen.contains("content-type: application/json"), "{seen}");
+    }
+
     #[test]
     fn reqwest_relay_does_not_follow_cross_origin_redirects_or_replay_credentials() {
         let first = match std::net::TcpListener::bind("127.0.0.1:0") {
@@ -4537,8 +4717,17 @@ mod tests {
             ).as_bytes()).expect("write redirect");
         });
         let mut spec = local_upstream_spec(format!("http://{first_address}"));
-        spec.request_headers
-            .insert("x-api-key".to_string(), "redirect-test-secret".to_string());
+        crate::secrets::test_secrets()
+            .lock()
+            .expect("test secrets")
+            .insert(
+                "WSMP_SECRET_REDIRECT_TEST".to_string(),
+                "redirect-test-secret".to_string(),
+            );
+        spec.endpoint_auth = Some((
+            EndpointAuthMode::ApiKey,
+            "WSMP_SECRET_REDIRECT_TEST".to_string(),
+        ));
         let (tx, rx) = mpsc::sync_channel(RELAY_WORKER_OUTBOUND_CAPACITY);
         let (_cancellation, cancellation_rx) = CancellationHandle::new();
         tokio::runtime::Builder::new_current_thread()

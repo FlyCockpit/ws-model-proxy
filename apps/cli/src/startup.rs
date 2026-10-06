@@ -51,7 +51,7 @@ impl TerminalStartup {
             identity: None,
             allow_human_terminal: config.allow_human_terminal,
             full: std::sync::atomic::AtomicBool::new(
-                crate::trust::configured(config) == TrustValue::Full,
+                crate::trust::at_startup(config) == TrustValue::Full,
             ),
             require_terminal_approval: config.require_terminal_approval,
             max_terminals: usize::try_from(config.effective_max_terminals()).unwrap_or(usize::MAX),

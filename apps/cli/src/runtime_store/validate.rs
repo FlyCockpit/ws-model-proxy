@@ -117,6 +117,7 @@ pub fn route_ok(route: &str) -> bool {
     text_ok(route, 1024)
         && route.starts_with('/')
         && !route.starts_with("//")
+        && !route.contains(':')
         && !route
             .chars()
             .any(|c| c.is_whitespace() || matches!(c, '#' | '?' | '\\'))
@@ -460,6 +461,8 @@ fn validate_launch(launch: &Launch, serves: bool) -> Check {
         ensure(secrets.len() <= NODE_SECRETS_MAX, || {
             "launch.secrets".into()
         })?;
+        let unique: BTreeSet<&String> = secrets.iter().collect();
+        ensure(unique.len() == secrets.len(), || "launch.secrets".into())?;
         for (index, name) in secrets.iter().enumerate() {
             if !is_secret_name(name) {
                 return Err(SpecIssue::EnvNotAllowed(format!("launch.secrets[{index}]")));

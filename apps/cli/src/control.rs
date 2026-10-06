@@ -217,7 +217,20 @@ fn peer_pid(stream: &UnixStream) -> Option<i32> {
         .map(|peer| peer.pid())
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn peer_pid(stream: &UnixStream) -> Option<i32> {
+    getsockopt(stream, sockopt::LocalPeerPid).ok()
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
 fn peer_pid(_stream: &UnixStream) -> Option<i32> {
     None
 }

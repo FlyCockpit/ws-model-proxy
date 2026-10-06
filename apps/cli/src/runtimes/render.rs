@@ -224,12 +224,26 @@ pub fn render(
     })
 }
 
-fn check_identity(job: &RuntimeJob, launch: &Launch) -> Result<(), Refusal> {
-    if job.nnodes != launch.group_size {
-        return Err(refuse(JobError::BadJob, "nnodes"));
+/// Step id, instance id, epoch and intent hash are plain.
+pub fn check_ids(job: &RuntimeJob) -> Result<(), Refusal> {
+    let id_ok = |value: &str, colon: bool| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || (colon && b == b':')
+            })
+    };
+    for (field, value, colon) in [
+        ("stepId", job.step_id.as_str(), false),
+        ("instanceId", job.instance_id.as_str(), false),
+        ("ownerEpoch", job.owner_epoch.as_str(), true),
+    ] {
+        if !id_ok(value, colon) {
+            return Err(refuse(JobError::BadJob, field));
+        }
     }
-    if job.rank >= job.nnodes {
-        return Err(refuse(JobError::BadJob, "rank"));
+    if job.intent_hash.len() != 64 || !job.intent_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(refuse(JobError::BadJob, "intentHash"));
     }
     if !is_instance_handle(&job.handle) {
         return Err(refuse(JobError::BadJob, "handle"));
@@ -237,25 +251,17 @@ fn check_identity(job: &RuntimeJob, launch: &Launch) -> Result<(), Refusal> {
     if job.unit_name != runtime_unit_name(&job.handle, job.rank) {
         return Err(refuse(JobError::BadJob, "unitName"));
     }
-    let id_ok = |value: &str| {
-        !value.is_empty()
-            && value.len() <= 128
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b':')
-    };
-    for (field, value) in [
-        ("stepId", job.step_id.as_str()),
-        ("instanceId", job.instance_id.as_str()),
-        ("ownerEpoch", job.owner_epoch.as_str()),
-    ] {
-        if !id_ok(value) {
-            return Err(refuse(JobError::BadJob, field));
-        }
+    Ok(())
+}
+
+fn check_identity(job: &RuntimeJob, launch: &Launch) -> Result<(), Refusal> {
+    if job.nnodes != launch.group_size {
+        return Err(refuse(JobError::BadJob, "nnodes"));
     }
-    if job.intent_hash.len() != 64 || !job.intent_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(refuse(JobError::BadJob, "intentHash"));
+    if job.rank >= job.nnodes {
+        return Err(refuse(JobError::BadJob, "rank"));
     }
+    check_ids(job)?;
     Ok(())
 }
 
@@ -285,7 +291,10 @@ fn typed_values(
     }
     values.insert("port", p.port.to_string());
     if let Some(dist) = p.dist_port {
-        if dist < 1024 {
+        let in_range = store
+            .port_range()
+            .is_some_and(|[start, end]| (start..=end).contains(&dist));
+        if dist < 1024 || dist == p.port || !in_range {
             return Err(refuse(JobError::BadJob, "placeholders.dist_port"));
         }
         values.insert("dist_port", dist.to_string());
@@ -329,14 +338,19 @@ fn typed_values(
         {
             return Err(refuse(JobError::BadJob, "fabricId"));
         }
+        // The node's own address on the fabric must be on this machine.
+        let Some(iface) = super::fabric::interface_for(&set.self_ip, &facts.addresses) else {
+            return Err(refuse(JobError::BadJob, "placeholders.fabric_ip"));
+        };
+        if !is_fabric_device_name(&iface) {
+            return Err(refuse(JobError::BadJob, "placeholders.fabric_iface"));
+        }
         values.insert("head_addr", head.clone());
         values.insert("fabric_ip", set.self_ip.clone());
-        if let Some(iface) = super::fabric::interface_for(&set.self_ip, &facts.addresses) {
-            if let Some(device) = super::fabric::rdma_device_for(&iface, &facts.sys) {
-                values.insert("fabric_rdma_device", device);
-            }
-            values.insert("fabric_iface", iface);
+        if let Some(device) = super::fabric::rdma_device_for(&iface, &facts.sys) {
+            values.insert("fabric_rdma_device", device);
         }
+        values.insert("fabric_iface", iface);
     } else if job.fabric_id.is_some() || p.head_addr.is_some() {
         return Err(refuse(JobError::BadJob, "fabricId"));
     }

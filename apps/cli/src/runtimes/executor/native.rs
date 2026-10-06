@@ -200,11 +200,25 @@ impl Runtime for NativeRuntime {
             ]);
             let outcome = (|| {
                 manager_until("systemd-run", &args, deadline, self.cancel_flag(), &env)?;
+                // A unit that is gone after it started failed (`--collect`
+                // removes a failed one): fail now, not at the deadline.
+                let mut gone_since: Option<std::time::Instant> = None;
                 loop {
                     if let Some(identity) = self.launch_completed(job, owner, deadline)? {
                         return Ok(identity);
                     }
                     anyhow::ensure!(!self.cancelled(), "launch incomplete");
+                    if self.identity(unit, owner, deadline)?.is_none() {
+                        let since = *gone_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= Duration::from_secs(5) {
+                            return Err(super::fail(
+                                crate::protocol::frames::JobError::CommandFailed,
+                            ))
+                            .context("the command exited without success");
+                        }
+                    } else {
+                        gone_since = None;
+                    }
                     deadline.sleep(Duration::from_millis(200))?;
                 }
             })();

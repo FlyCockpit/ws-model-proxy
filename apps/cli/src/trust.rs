@@ -25,6 +25,39 @@ pub fn configured(config: &Config) -> TrustValue {
     config.trust.unwrap_or(TrustValue::Relay)
 }
 
+/// The trust the daemon starts with. A frozen copy on disk means the node
+/// was lowered, and only `wsmp trust full` removes it (before it writes
+/// `full`), so a hand-edited `full` next to a frozen copy stays Relay only
+/// and is written back.
+pub fn at_startup(config: &Config) -> TrustValue {
+    let frozen = crate::runtime_store::frozen_path()
+        .map(|path| path.exists())
+        .unwrap_or(true);
+    if frozen {
+        if config.trust == Some(TrustValue::Full) {
+            tracing::warn!(
+                "config.json says `full` but this node was lowered; only `wsmp trust full` raises it"
+            );
+            let _ = persist_relay();
+        }
+        return TrustValue::Relay;
+    }
+    configured(config)
+}
+
+/// The trust a hot reload sees: an unreadable or unparsable config, or one
+/// whose `trust` is not exactly `full`, is Relay only.
+pub fn configured_on_disk() -> TrustValue {
+    let raw = crate::paths::config_file()
+        .ok()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    match raw.as_ref().and_then(|value| value.get("trust")) {
+        Some(value) if value == "full" => TrustValue::Full,
+        _ => TrustValue::Relay,
+    }
+}
+
 pub fn word(trust: TrustValue) -> &'static str {
     match trust {
         TrustValue::Full => "full",
@@ -32,26 +65,35 @@ pub fn word(trust: TrustValue) -> &'static str {
     }
 }
 
-/// Persist `trust: relay` (atomic config write under the config lock) and
-/// freeze the held definitions. Idempotent.
+/// Persist `trust: relay` and freeze the held definitions. The frozen copy
+/// is written first (it is the marker that keeps a node lowered), then the
+/// config. Idempotent: an existing frozen copy is kept.
 pub fn persist_relay() -> Result<()> {
-    Config::update(true, |config| {
+    crate::runtime_store::freeze().context("freezing the held definitions")?;
+    Config::update(false, |config| {
         config.trust = Some(TrustValue::Relay);
         Ok(())
     })
-    .context("persisting trust `relay` to the config")?;
-    crate::runtime_store::freeze().context("freezing the held definitions")
+    .context("persisting trust `relay` to the config")
 }
 
-/// Persist `trust: full` and unfreeze. Only `wsmp trust full` (directly when
-/// no daemon runs, else through the daemon after its peer check) calls this.
+/// A Full to Relay change: the frozen copy is today's held set, never an
+/// older copy left behind.
+pub fn persist_lowering() -> Result<()> {
+    crate::runtime_store::freeze_now().context("freezing the held definitions")?;
+    persist_relay()
+}
+
+/// Unfreeze, then persist `trust: full`. Only `wsmp trust full` (directly
+/// when no daemon runs, else through the daemon after its peer check) calls
+/// this; a failure part way leaves the node Relay only.
 pub fn persist_full() -> Result<()> {
+    crate::runtime_store::unfreeze().context("unfreezing the held definitions")?;
     Config::update(true, |config| {
         config.trust = Some(TrustValue::Full);
         Ok(())
     })
-    .context("persisting trust `full` to the config")?;
-    crate::runtime_store::unfreeze().context("unfreezing the held definitions")
+    .context("persisting trust `full` to the config")
 }
 
 /// Why a local process may not raise trust, if it may not.
@@ -61,15 +103,30 @@ pub fn caller_marker_refusal() -> Option<&'static str> {
         .then_some("`wsmp trust full` cannot run from a command, job or terminal wsmp started")
 }
 
-/// The daemon's check of a control peer asking to raise trust: refused when
-/// the peer or any ancestor carries `WSMP_JOB`, runs in a `wsmp-*` unit's
-/// cgroup, or descends from the daemon itself. Linux reads `/proc`; other
-/// Unix systems rely on the environment marker of the requesting process,
-/// which that process checked itself.
+/// The check of a process asking to raise trust (the control socket's peer,
+/// or `wsmp trust full` itself when no daemon runs): refused when it or any
+/// ancestor carries `WSMP_JOB`, runs in a wsmp unit (`wsmp-*`, the relay's
+/// own `wsmp.service`), a `systemd-run` transient unit (`run-*`), the
+/// daemon's own cgroup, or descends from the daemon. This keeps commands,
+/// jobs and terminals wsmp started from raising trust; code the user's own
+/// account runs outside them can, as it can edit any of the user's files.
 #[cfg(target_os = "linux")]
 pub fn peer_may_raise(peer_pid: i32, daemon_pid: u32) -> Result<(), &'static str> {
     let proc_root = std::path::Path::new("/proc");
     peer_may_raise_in(proc_root, peer_pid, daemon_pid)
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_refused(cgroup: &str, daemon_cgroup: Option<&str>) -> bool {
+    cgroup.lines().any(|line| {
+        let path = line.splitn(3, ':').nth(2).unwrap_or(line);
+        path.split('/').any(|unit| {
+            unit.starts_with("wsmp-")
+                || unit == "wsmp.service"
+                || (unit.starts_with("run-") && unit.ends_with(".service"))
+                || (unit.starts_with("run-") && unit.ends_with(".scope"))
+        }) || daemon_cgroup.is_some_and(|daemon| daemon == path && path != "/")
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -79,6 +136,19 @@ pub(crate) fn peer_may_raise_in(
     daemon_pid: u32,
 ) -> Result<(), &'static str> {
     const REFUSED: &str = "a process wsmp started cannot raise trust";
+    let daemon_cgroup = (daemon_pid != 0)
+        .then(|| {
+            std::fs::read_to_string(proc_root.join(daemon_pid.to_string()).join("cgroup")).ok()
+        })
+        .flatten()
+        .and_then(|text| {
+            text.lines()
+                .next()
+                .map(|line| line.splitn(3, ':').nth(2).unwrap_or(line).to_string())
+        })
+        // Only a service unit is the daemon's own: a relay started by hand
+        // shares the person's session scope with their other terminals.
+        .filter(|path| path.ends_with(".service"));
     let mut pid = u32::try_from(peer_pid).map_err(|_| "unknown control peer")?;
     if pid == 0 {
         return Err("unknown control peer");
@@ -97,7 +167,7 @@ pub(crate) fn peer_may_raise_in(
             return Err(REFUSED);
         }
         if let Ok(cgroup) = std::fs::read_to_string(dir.join("cgroup"))
-            && cgroup.lines().any(|line| line.contains("/wsmp-"))
+            && cgroup_refused(&cgroup, daemon_cgroup.as_deref())
         {
             return Err(REFUSED);
         }
@@ -120,9 +190,29 @@ fn parent_pid(dir: &std::path::Path) -> Option<u32> {
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// macOS: no `/proc`; refuse descendants of the daemon (`ps -o ppid=`).
+/// The requesting process checked its own `WSMP_JOB` marker.
 #[cfg(all(unix, not(target_os = "linux")))]
-pub fn peer_may_raise(_peer_pid: i32, _daemon_pid: u32) -> Result<(), &'static str> {
-    Ok(())
+pub fn peer_may_raise(peer_pid: i32, daemon_pid: u32) -> Result<(), &'static str> {
+    const REFUSED: &str = "a process wsmp started cannot raise trust";
+    let mut pid = u32::try_from(peer_pid).map_err(|_| "unknown control peer")?;
+    for _ in 0..256 {
+        if pid == daemon_pid {
+            return Err(REFUSED);
+        }
+        if pid <= 1 {
+            return Ok(());
+        }
+        let output = std::process::Command::new("ps")
+            .args(["-o", "ppid=", "-p", &pid.to_string()])
+            .output()
+            .map_err(|_| REFUSED)?;
+        pid = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .map_err(|_| REFUSED)?;
+    }
+    Err(REFUSED)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -183,6 +273,40 @@ mod tests {
             "0::/user.slice/user@1000.service/app.slice/wsmp-i-abc-r0.service\n",
         );
         assert!(peer_may_raise_in(root.path(), 60, 999).is_err());
+        // The relay's own service (a `setsid` escapee from a command).
+        process(
+            root.path(),
+            61,
+            1,
+            &[],
+            "0::/user.slice/user@1000.service/app.slice/wsmp.service\n",
+        );
+        assert!(peer_may_raise_in(root.path(), 61, 999).is_err());
+        // A `systemd-run --user --pty` transient unit.
+        process(
+            root.path(),
+            62,
+            1,
+            &[],
+            "0::/user.slice/user@1000.service/app.slice/run-u12.service\n",
+        );
+        assert!(peer_may_raise_in(root.path(), 62, 999).is_err());
+        // The daemon's own cgroup, whatever it is called.
+        process(
+            root.path(),
+            999,
+            1,
+            &[],
+            "0::/system.slice/custom-relay.service\n",
+        );
+        process(
+            root.path(),
+            63,
+            1,
+            &[],
+            "0::/system.slice/custom-relay.service\n",
+        );
+        assert!(peer_may_raise_in(root.path(), 63, 999).is_err());
         // A descendant of the daemon.
         process(root.path(), 70, 999, &[], "0::/x\n");
         assert!(peer_may_raise_in(root.path(), 70, 999).is_err());

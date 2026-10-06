@@ -245,6 +245,28 @@ fn a_malicious_interface_name_never_reaches_a_command() {
         assert_eq!(refused.error, JobError::BadJob, "{iface}");
         assert_eq!(refused.detail.as_deref(), Some("placeholders.fabric_iface"));
     }
+    // Refused even when the command does not use the name.
+    let (plain, hash) = store_with(spec("serve {{port}} on {{fabric_ip}}", 2));
+    let refused = render(
+        &job(&hash, 1, 2),
+        TrustValue::Full,
+        &plain,
+        &facts("eth0;reboot"),
+    )
+    .expect_err("refused");
+    assert_eq!(refused.detail.as_deref(), Some("placeholders.fabric_iface"));
+}
+
+#[test]
+fn the_fabric_address_must_be_local() {
+    let (store, hash) = store_with(spec("serve {{port}} on {{fabric_ip}}", 2));
+    let mut elsewhere = facts("eth0");
+    elsewhere
+        .addresses
+        .insert("eth0".into(), vec!["10.9.9.9".into()]);
+    let refused =
+        render(&job(&hash, 1, 2), TrustValue::Full, &store, &elsewhere).expect_err("not local");
+    assert_eq!(refused.detail.as_deref(), Some("placeholders.fabric_ip"));
 }
 
 #[test]
