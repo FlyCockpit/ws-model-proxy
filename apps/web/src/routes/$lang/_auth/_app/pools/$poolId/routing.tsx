@@ -40,7 +40,10 @@ function PoolRoutingPage() {
     return <InlineRetry message={t("dashboard:pool.loadFailed")} onRetry={() => pool.refetch()} />;
   return (
     <div className="flex min-w-0 flex-col gap-4">
-      <RoutingForm key={JSON.stringify(pool.data.routing)} pool={pool.data} />
+      <RoutingForm
+        key={JSON.stringify({ ...pool.data.routing, ownHardwareOnly: null })}
+        pool={pool.data}
+      />
       <OwnHardwareCard pool={pool.data} />
     </div>
   );
@@ -214,6 +217,7 @@ function OwnHardwareCard({ pool }: { pool: PoolView }) {
               try {
                 await set.mutateAsync({ poolId: pool.id, enabled: checked === true });
                 await queryClient.invalidateQueries({ queryKey: orpc.pools.key() });
+                await queryClient.invalidateQueries({ queryKey: orpc.models.key() });
                 toast.success(t("dashboard:pool.saved"));
               } catch (error) {
                 toast.error(refusalText(error));

@@ -526,7 +526,9 @@
       "not_your_runtime": "Aquí solo puedes agregar tus propios modelos servidos.",
       "secret_needs_node": "Define este secreto en el nodo.",
       "command_not_running": "Ese comando no se está ejecutando.",
-      "other": "Esto no puede ejecutarse como en la vista previa."
+      "other": "Esto no puede ejecutarse como en la vista previa.",
+      "fabric_in_use": "Una instancia multinodo en ejecución usa esta red.",
+      "invite_needs_link": "Esta invitación necesita su enlace para aceptarse."
     },
     "delete": "Eliminar runtime",
     "deleteTitle": "¿Eliminar {{name}}?",
@@ -544,6 +546,12 @@
       "SYSTEM": "Sistema"
     },
     "needsRestartBadge": "Arranque cambiado",
-    "appliesLive": "Se aplica en vivo"
+    "appliesLive": "Se aplica en vivo",
+    "stops": "Se detendrá:",
+    "stopReason": {
+      "preempted": "{{handle}} (para hacer espacio)",
+      "profile_owned_node": "{{handle}} (un perfil es dueño del nodo)"
+    },
+    "poolCreated": "Pool creado."
   }
 }

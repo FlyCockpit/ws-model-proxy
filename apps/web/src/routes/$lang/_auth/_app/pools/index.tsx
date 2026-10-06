@@ -214,6 +214,7 @@ function NewPoolDialog({
         });
         await queryClient.invalidateQueries({ queryKey: orpc.pools.key() });
         await queryClient.invalidateQueries({ queryKey: orpc.models.key() });
+        await queryClient.invalidateQueries({ queryKey: orpc.runtimes.key() });
         toast.success(t("dashboard:pool.created"));
         onOpenChange(false);
         form.reset();

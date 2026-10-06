@@ -526,7 +526,9 @@
       "not_your_runtime": "Only your own served models can be added here.",
       "secret_needs_node": "Set this secret on the node.",
       "command_not_running": "That command is not running.",
-      "other": "This cannot run as previewed."
+      "other": "This cannot run as previewed.",
+      "fabric_in_use": "A running multi-node instance uses this fabric.",
+      "invite_needs_link": "This invite needs its link to be accepted."
     },
     "delete": "Delete runtime",
     "deleteTitle": "Delete {{name}}?",
@@ -544,6 +546,12 @@
       "SYSTEM": "System"
     },
     "needsRestartBadge": "Launch changed",
-    "appliesLive": "Applies live"
+    "appliesLive": "Applies live",
+    "stops": "It will stop:",
+    "stopReason": {
+      "preempted": "{{handle}} (to make room)",
+      "profile_owned_node": "{{handle}} (a profile owns the node)"
+    },
+    "poolCreated": "Pool created."
   }
 }

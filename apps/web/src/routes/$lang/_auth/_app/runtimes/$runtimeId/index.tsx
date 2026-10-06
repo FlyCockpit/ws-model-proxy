@@ -56,7 +56,19 @@ function useRuntimeInvalidation() {
 function RuntimeOverviewPage() {
   const { t } = useTranslation(["dashboard", "common"]);
   const { runtimeId } = Route.useParams();
-  const runtime = useQuery(orpc.runtimes.get.queryOptions({ input: { runtimeId } }));
+  const runtime = useQuery({
+    ...orpc.runtimes.get.queryOptions({ input: { runtimeId } }),
+    // Follow instances while they move between states.
+    refetchInterval: (query) =>
+      query.state.data?.instanceList.some(
+        (instance) =>
+          instance.phase === "STARTING" ||
+          instance.phase === "STOPPING" ||
+          instance.needsOperator !== null,
+      )
+        ? 3_000
+        : false,
+  });
   if (runtime.isPending)
     return (
       <div className="flex flex-col gap-4" aria-hidden="true">
@@ -142,12 +154,28 @@ function ServedModelRow({ runtime, model }: { runtime: RuntimeDetail; model: Ser
   const candidates = (pools.data?.pools ?? []).filter(
     (pool) => pool.modelType === model.type && !inPools.has(pool.id),
   );
+  const navigate = useNavigate();
   const run = async (work: () => Promise<unknown>) => {
     try {
       await work();
       await invalidate();
       toast.success(t("dashboard:pool.memberAdded"));
       setPoolId("");
+    } catch (error) {
+      toast.error(refusalText(error));
+    }
+  };
+  const createPool = async () => {
+    try {
+      const pool = await create.mutateAsync({
+        name: model.upstreamModelId.slice(0, 120),
+        slug: slugify(`${runtime.slug}-${model.upstreamModelId}`) || runtime.slug,
+        type: model.type,
+        members: [{ runtimeModelId: model.id }],
+      });
+      await invalidate();
+      toast.success(t("dashboard:runtime.poolCreated"));
+      await navigate({ to: "/$lang/pools/$poolId", params: { lang, poolId: pool.id } });
     } catch (error) {
       toast.error(refusalText(error));
     }
@@ -213,21 +241,7 @@ function ServedModelRow({ runtime, model }: { runtime: RuntimeDetail; model: Ser
         >
           {t("dashboard:pool.add")}
         </Button>
-        <Button
-          size="touch"
-          variant="outline"
-          disabled={create.isPending}
-          onClick={() =>
-            run(() =>
-              create.mutateAsync({
-                name: model.upstreamModelId.slice(0, 120),
-                slug: slugify(`${runtime.slug}-${model.upstreamModelId}`) || runtime.slug,
-                type: model.type,
-                members: [{ runtimeModelId: model.id }],
-              }),
-            )
-          }
-        >
+        <Button size="touch" variant="outline" disabled={create.isPending} onClick={createPool}>
           {t("dashboard:runtime.newPoolFromModel")}
         </Button>
       </div>
@@ -440,6 +454,22 @@ function StartDialog({
                 </p>
               )),
             )}
+            {preview.stops.length > 0 ? (
+              <div className="font-medium text-amber-700 dark:text-amber-300">
+                <p>{t("dashboard:runtime.stops")}</p>
+                <ul className="list-disc pl-5">
+                  {preview.stops.map((stopEntry) => (
+                    <li key={stopEntry.instanceId}>
+                      {t(`dashboard:runtime.stopReason.${stopEntry.reason}`, {
+                        handle:
+                          runtime.instanceList.find((item) => item.id === stopEntry.instanceId)
+                            ?.handle ?? stopEntry.instanceId,
+                      })}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
             {preview.warnings.map((warning) => (
               <p
                 key={`${warning.code}-${warning.nodeId ?? ""}`}
@@ -498,9 +528,10 @@ function DeleteRuntime({ runtime }: { runtime: RuntimeDetail }) {
               onClick={async () => {
                 try {
                   await remove.mutateAsync({ runtimeId: runtime.id });
-                  await invalidate();
                   setOpen(false);
+                  // Leave first: the deleted runtime's own query must not refetch.
                   await navigate({ to: "/$lang/runtimes", params: { lang } });
+                  await invalidate();
                 } catch (error) {
                   toast.error(refusalText(error));
                 }

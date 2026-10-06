@@ -46,7 +46,11 @@ function usePoolInvalidation() {
 function PoolOverviewPage() {
   const { t } = useTranslation(["dashboard", "common"]);
   const { poolId } = Route.useParams();
-  const pool = useQuery(orpc.pools.get.queryOptions({ input: { poolId } }));
+  const pool = useQuery({
+    ...orpc.pools.get.queryOptions({ input: { poolId } }),
+    refetchInterval: (query) =>
+      query.state.data?.members.some((member) => member.status === "starting") ? 3_000 : false,
+  });
 
   if (pool.isPending)
     return (
@@ -137,13 +141,15 @@ function MembersCard({ pool }: { pool: PoolView }) {
     (option) => !inPool.has(option.value),
   );
 
-  const run = async (work: () => Promise<unknown>, success: string) => {
+  const run = async (work: () => Promise<unknown>, success: string): Promise<boolean> => {
     try {
       await work();
       await invalidate();
       toast.success(success);
+      return true;
     } catch (error) {
       toast.error(refusalText(error));
+      return false;
     }
   };
 
@@ -249,7 +255,9 @@ function MembersCard({ pool }: { pool: PoolView }) {
             run(
               () => update.mutateAsync({ poolId: pool.id, members: { add: [member] } }),
               t("dashboard:pool.memberAdded"),
-            ).then(() => setChoice(""));
+            ).then((ok) => {
+              if (ok) setChoice("");
+            });
           }}
         >
           <div className="min-w-0 flex-1 space-y-1.5">
@@ -322,9 +330,10 @@ function DeletePool({ pool }: { pool: PoolView }) {
               onClick={async () => {
                 try {
                   await remove.mutateAsync({ poolId: pool.id });
-                  await invalidate();
                   setOpen(false);
+                  // Leave first: the deleted pool's own query must not refetch.
                   await navigate({ to: "/$lang/pools", params: { lang } });
+                  await invalidate();
                 } catch (error) {
                   toast.error(refusalText(error));
                 }

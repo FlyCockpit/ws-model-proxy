@@ -139,6 +139,8 @@ function DefinitionForm({ runtime }: { runtime: RuntimeDetail }) {
           restartRunning: value.restartRunning,
         });
         await queryClient.invalidateQueries({ queryKey: orpc.runtimes.key() });
+        await queryClient.invalidateQueries({ queryKey: orpc.pools.key() });
+        await queryClient.invalidateQueries({ queryKey: orpc.models.key() });
         toast.success(
           t("dashboard:runtime.savedVersion", {
             version: result.version.version,
