@@ -1,0 +1,43 @@
+import { describe, expect, it } from "vitest";
+
+import { renderShareInvite } from "./share-invite";
+
+const base = {
+  ownerName: "Ana",
+  callableId: "ana/chat",
+  inviteUrl: "https://proxy.example.com/en-US/signup?invite=wsmp_inv_ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+  expiresAt: new Date("2026-10-20T00:00:00Z"),
+};
+
+describe("renderShareInvite", () => {
+  it("names the owner, the pool and the link", () => {
+    const { subject, html } = renderShareInvite({ ...base, locale: "en-US" });
+    expect(subject).toBe("Ana shared a pool with you");
+    expect(html).toContain("<code>ana/chat</code>");
+    expect(html).toContain(base.inviteUrl);
+    expect(html).toContain("October 20, 2026");
+  });
+
+  it("renders the Spanish bundle", () => {
+    const { subject, html } = renderShareInvite({ ...base, locale: "es-MX" });
+    expect(subject).toBe("Ana compartió un pool contigo");
+    expect(html).toContain('<html lang="es-MX">');
+  });
+
+  it("escapes the owner's name in the body and strips control characters in the subject", () => {
+    const { subject, html } = renderShareInvite({
+      ...base,
+      ownerName: "<script>x</script>\r\nBcc: a@b",
+      locale: "en-US",
+    });
+    expect(html).not.toContain("<script>x</script>");
+    expect(html).toContain("&lt;script&gt;");
+    expect(subject).not.toMatch(/[\r\n]/);
+  });
+
+  it("refuses a non-HTTP link", () => {
+    expect(() =>
+      renderShareInvite({ ...base, inviteUrl: "javascript:alert(1)", locale: "en-US" }),
+    ).toThrow();
+  });
+});

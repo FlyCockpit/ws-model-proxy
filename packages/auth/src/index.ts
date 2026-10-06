@@ -22,6 +22,7 @@ import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
+import { acceptShareInvitesForVerifiedEmail } from "./share-invite-acceptance";
 import { resolveSignupLocale } from "./signup-locale";
 import { getSignupAccessState, resolveBootstrapAdminIdentity } from "./signup-policy";
 import { notifyUserBanned } from "./user-ban-listeners";
@@ -38,6 +39,20 @@ import { withVerificationCallback } from "./verification-callback";
 const isCrossOrigin = !!env.CORS_ORIGIN;
 /** Email/SMTP is optional; when configured, verification is required. */
 const emailConfigured = isEmailConfigured();
+
+/** Invite acceptance never fails the sign-up or update that triggered it. */
+async function acceptInvitesQuietly(user: unknown): Promise<void> {
+  const row = user as { id?: unknown; email?: unknown; emailVerified?: unknown } | null;
+  if (!row || typeof row.id !== "string" || typeof row.email !== "string") return;
+  try {
+    await acceptShareInvitesForVerifiedEmail(
+      { id: row.id, email: row.email, emailVerified: row.emailVerified === true },
+      { emailConfigured },
+    );
+  } catch (error) {
+    console.error("share invite acceptance failed", error instanceof Error ? error.name : "error");
+  }
+}
 
 const userSlugInputSchema = z
   .string()
@@ -363,6 +378,10 @@ export const auth = betterAuth({
             },
           };
         },
+        // Pending share invites to this e-mail become shares once the e-mail is proven.
+        after: async (user) => {
+          await acceptInvitesQuietly(user);
+        },
       },
       update: {
         // A user row that now carries an ACTIVE ban (`/admin/ban-user`, or an
@@ -372,6 +391,8 @@ export const auth = betterAuth({
         // the cancel is idempotent. An unban or an expired ban notifies nothing.
         after: async (user) => {
           if (!user) return;
+          // Verifying the e-mail (or any later update of a verified account) accepts invites.
+          await acceptInvitesQuietly(user);
           const row = user as { id: string; banned?: unknown; banExpires?: unknown };
           if (
             isUserBanned(

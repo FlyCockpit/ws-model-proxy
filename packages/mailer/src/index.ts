@@ -105,6 +105,11 @@ export {
   renderInviteUser,
 } from "./templates/invite-user.js";
 export {
+  type RenderShareInviteArgs,
+  type RenderShareInviteResult,
+  renderShareInvite,
+} from "./templates/share-invite.js";
+export {
   type RenderTwoFactorOtpArgs,
   type RenderTwoFactorOtpResult,
   renderTwoFactorOtp,

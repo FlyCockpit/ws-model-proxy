@@ -43,6 +43,9 @@
     },
     "./user-deletion-access-guard": {
       "default": "./src/user-deletion-access-guard.ts"
+    },
+    "./share-invite-acceptance": {
+      "default": "./src/share-invite-acceptance.ts"
     }
   },
   "scripts": {
