@@ -174,5 +174,376 @@
       "following": "Viendo a {{cols}}×{{rows}}. Escribe aquí para tomar el control.",
       "size": "{{cols}}×{{rows}}"
     }
+  },
+  "models": {
+    "loadFailed": "No se pudieron cargar tus modelos.",
+    "baseUrl": "URL base",
+    "baseUrlHint": "Los clientes compatibles con OpenAI y Anthropic llaman a esta dirección con una clave de API.",
+    "copyBaseUrl": "Copiar la URL base",
+    "copyId": "Copiar {{id}}",
+    "copySnippet": "Copiar el ejemplo",
+    "emptyTitle": "Aún no hay nada que llamar",
+    "emptyHint": "Crea un pool y agrégale un modelo servido. Su ID invocable aparecerá aquí.",
+    "goToPools": "Ir a pools",
+    "external": ":external",
+    "externalHint": "puede usar modelos en la nube cuando la capacidad local está ocupada",
+    "yourPool": "Tu pool",
+    "sharedBy": "Compartido por {{owner}}",
+    "snippet": "Solicitud de ejemplo",
+    "directNote": "Los modelos servidos sin pool no se pueden llamar con una clave de API; pruébalos en el navegador.",
+    "testLink": "Abrir Prueba",
+    "status": {
+      "serving": "Sirviendo",
+      "starting": "Iniciando",
+      "unavailable": "No disponible"
+    },
+    "type": {
+      "LLM": "LLM",
+      "EMBEDDINGS": "Embeddings",
+      "TRANSCRIPTION": "Transcripción"
+    }
+  },
+  "providers": {
+    "title": "Proveedores"
+  },
+  "pool": {
+    "new": "Nuevo pool",
+    "newHint": "Un pool es lo que llaman los clientes: dueño/pool. Agrega modelos servidos como miembros.",
+    "create": "Crear pool",
+    "created": "Pool creado.",
+    "createFailed": "No se pudo crear el pool.",
+    "loadFailed": "No se pudieron cargar los pools.",
+    "emptyTitle": "Aún no hay pools",
+    "emptyHint": "Crea un pool para dar a tus modelos servidos un ID invocable.",
+    "health": {
+      "serving": "Sirviendo",
+      "starting": "Iniciando",
+      "unavailable": "No disponible",
+      "empty": "Sin miembros"
+    },
+    "cloudOn": "Nube activa",
+    "memberCount_one": "{{count}} miembro",
+    "memberCount_other": "{{count}} miembros",
+    "traffic_one": "{{count}} solicitud en 24 h",
+    "traffic_other": "{{count}} solicitudes en 24 h",
+    "sharedWithMe": "Compartidos contigo",
+    "canUse": "Puede usar",
+    "canContribute": "Puede contribuir",
+    "callAs": "Llámalo como",
+    "callAsHint": "Usa esto como nombre de modelo con una clave de API.",
+    "members": "Miembros",
+    "membersHint": "Modelos servidos a los que enruta este pool. Las solicitudes van a miembros con capacidad libre.",
+    "noMembers": "Aún no hay miembros. Agrega un modelo servido abajo.",
+    "memberStatus": {
+      "serving": "Sirviendo",
+      "starting": "Iniciando",
+      "unavailable": "No disponible",
+      "disabled": "Desactivado",
+      "cloud_standby": "Nube en espera"
+    },
+    "cloudMember": "Miembro de nube #{{order}}",
+    "contributedBy": "Contribuido por {{email}}",
+    "instancesLive": "{{running}} de {{total}} instancias listas",
+    "disableMember": "Desactivar",
+    "enableMember": "Activar",
+    "removeMember": "Quitar {{member}}",
+    "memberRemoved": "Miembro quitado.",
+    "memberAdded": "Agregado al pool.",
+    "addMember": "Agregar un modelo servido",
+    "pickServedModel": "Elige un modelo servido",
+    "add": "Agregar",
+    "saved": "Guardado.",
+    "runsOn": "Hardware en el que corre",
+    "runsOnNone": "Nada sirve este pool en este momento.",
+    "runsOnNode_one": "{{node}} · {{count}} instancia",
+    "runsOnNode_other": "{{node}} · {{count}} instancias",
+    "delete": "Eliminar pool",
+    "deleteTitle": "¿Eliminar {{name}}?",
+    "deleteHint": "Se eliminan sus accesos compartidos, miembros contribuidos, entradas de claves de API y enlaces auxiliares. Quienes llamen a su ID recibirán errores.",
+    "form": {
+      "name": "Nombre",
+      "nameRequired": "Ponle un nombre al pool.",
+      "slug": "Identificador",
+      "slugHint": "Parte del ID invocable: dueño/identificador.",
+      "slugInvalid": "Minúsculas, dígitos y guiones simples, empezando con una letra.",
+      "type": "Tipo",
+      "firstMember": "Primer miembro (opcional)",
+      "noMember": "Sin miembro por ahora",
+      "noServedModels": "Aún no hay modelos servidos de este tipo. Crea un runtime primero."
+    },
+    "routing": {
+      "title": "Enrutamiento",
+      "hint": "Límites de equidad de este pool. Los límites físicos están en cada runtime.",
+      "priority": "Clase de prioridad",
+      "priorities": {
+        "BACKGROUND": "Segundo plano",
+        "NORMAL": "Normal",
+        "HIGH": "Alta"
+      },
+      "cap": "Límite del pool (solicitudes simultáneas)",
+      "noCap": "Sin límite",
+      "kept": "Espacios reservados por instancia",
+      "keptHint": "Espacios que este pool reserva en cada instancia miembro.",
+      "borrow": "Usar espacios reservados por otros mientras no tengan espera",
+      "numberRange": "Un número entero de {{min}} a {{max}}, o vacío.",
+      "ownHardware": "Solo mi propio hardware",
+      "ownHardwareHint": "Los miembros contribuidos siguen en la lista pero no reciben solicitudes, y nadie más puede agregar nuevos. Solo una persona puede cambiar esto.",
+      "ownHardwareLabel": "Enrutar solo a mis runtimes"
+    },
+    "cloud": {
+      "title": "Respaldo en la nube",
+      "hint": "Quién puede hacer que este pool gaste dinero en la nube. Quienes llaman igual deben elegir dueño/pool:external.",
+      "mode": "Modo de nube",
+      "modes": {
+        "OFF": "Apagado",
+        "OWNER": "Para mí",
+        "OWNER_AND_SHARES": "Para mí y quienes comparten conmigo"
+      },
+      "humanOnly": "El gasto en la nube solo lo define una persona; los agentes no pueden cambiarlo.",
+      "paidWarm": "Protección pagada de caché caliente en miembros de nube",
+      "members": "Miembros de nube",
+      "membersHint": "Se prueban en este orden. Activa modelos de proveedor en",
+      "noMembers": "Sin miembros de nube."
+    },
+    "advanced": {
+      "intro": "Estos ajustes son automáticos salvo que se sobrescriban. Los agentes pueden ajustarlos; cada cambio queda en el historial del pool.",
+      "sections": {
+        "columns": "Admisión",
+        "flat": "API y multimedia",
+        "affinity": "Afinidad de caché",
+        "protection": "Protección de caché caliente"
+      },
+      "source": {
+        "override": "Sobrescrito",
+        "auto": "Automático",
+        "default": "Predeterminado"
+      },
+      "unknown": "aún desconocido",
+      "pick": "Elige un valor",
+      "bool": {
+        "true": "Activado",
+        "false": "Desactivado"
+      },
+      "override": "Sobrescribir",
+      "automatic": "Volver a automático",
+      "units": {
+        "ms": "ms",
+        "s": "s",
+        "minutes": "min",
+        "tokens": "tokens",
+        "bytes": "bytes",
+        "percent": "%"
+      },
+      "keys": {
+        "maxWaitMs": "Espera máxima en cola",
+        "contextCeiling": "Tope de contexto",
+        "contextMargin": "Margen de contexto",
+        "protocolAdaptation": "Adaptación de API",
+        "allowLossyDeveloperRoleCollapse": "Permitir fusionar el rol developer",
+        "recommendedSurface": "API recomendada",
+        "maxAttachmentBytes": "Tamaño máximo de adjunto",
+        "optimisticBasicTranscription": "Transcripción básica de respaldo",
+        "affinity": {
+          "enabled": "Activada",
+          "ttlSeconds": "Recordar durante",
+          "maxRecords": "Registros máximos",
+          "prefixWeight": "Peso de prefijo",
+          "conversationWeight": "Peso de conversación",
+          "confirmedCacheWeight": "Peso de caché confirmada",
+          "loadPenaltyWeight": "Peso de penalización por carga",
+          "residencyWeight": "Peso de residencia"
+        },
+        "protection": {
+          "enabled": "Activada",
+          "evictionFeedback": "Retroalimentación de desalojo",
+          "windowSeconds": "Ventana",
+          "minTokens": "Tokens mínimos",
+          "share": "Modo de reparto",
+          "fixedPercent": "Porción fija",
+          "ownerPercent": "Porción del dueño"
+        }
+      },
+      "rules": "Reglas de enrutamiento por métricas",
+      "rulesHint": "Los agentes las escriben; aquí puedes eliminarlas.",
+      "noRules": "Sin reglas.",
+      "deleteRule": "Eliminar regla {{rule}}"
+    }
+  },
+  "runtime": {
+    "new": "Nuevo runtime",
+    "loadFailed": "No se pudieron cargar los runtimes.",
+    "presetsFailed": "No se pudieron cargar los puntos de partida.",
+    "emptyTitle": "Aún no hay runtimes",
+    "emptyHint": "Un runtime es un servidor en un nodo: siempre activo o iniciado cuando lo necesitas.",
+    "kind": {
+      "ALWAYS_ON": "Siempre activo",
+      "STARTABLE": "Iniciable"
+    },
+    "service": "Servicio (sin proxy)",
+    "serviceHint": "Este runtime corre en su nodo pero no sirve modelos, así que nunca está en un pool ni se puede llamar.",
+    "notInPool": "No está en un pool",
+    "notInPoolHint": "Aún no está en un pool, así que nada puede llamarlo. Agrégalo a un pool abajo.",
+    "running_one": "{{count}} en ejecución",
+    "running_other": "{{count}} en ejecución",
+    "starting_one": "{{count}} iniciando",
+    "starting_other": "{{count}} iniciando",
+    "failed_one": "{{count}} falló",
+    "failed_other": "{{count}} fallaron",
+    "needsYou_one": "{{count}} te necesita",
+    "needsYou_other": "{{count}} te necesitan",
+    "notRunning": "Sin ejecutar",
+    "pickPreset": "Empezar desde",
+    "presets": {
+      "detected": {
+        "title": "Servidor detectado",
+        "hint": "Un servidor de inferencia que ya corre en un nodo."
+      },
+      "vllm": {
+        "title": "vLLM",
+        "hint": "Se inicia en un nodo con GPU cuando se necesita."
+      },
+      "sglang": {
+        "title": "SGLang",
+        "hint": "Se inicia en un nodo con GPU cuando se necesita."
+      },
+      "llama_cpp": {
+        "title": "llama.cpp",
+        "hint": "Un modelo GGUF en memoria unificada o CPU."
+      },
+      "ollama_service": {
+        "title": "Servicio Ollama",
+        "hint": "El servicio systemd de Ollama del nodo."
+      },
+      "systemd_unit": {
+        "title": "Unidad systemd",
+        "hint": "Cualquier servicio en un nodo, sin proxy."
+      }
+    },
+    "form": {
+      "name": "Nombre",
+      "nameRequired": "Ponle un nombre al runtime.",
+      "slug": "Identificador",
+      "slugReserved": "Este identificador está reservado para instancias.",
+      "node": "Nodo",
+      "pickNode": "Elige un nodo",
+      "nodeRequired": "Elige el nodo donde vive.",
+      "nodeIdHint": "Pega el ID del nodo desde la página del nodo.",
+      "spec": "Definición (JSON)",
+      "specHint": "Los comandos pueden usar marcadores como port y memory_fraction, entre llaves dobles. Usa 127.0.0.1 en runtimes de un solo nodo.",
+      "specNotJson": "Esto no es JSON válido.",
+      "specInvalid": "{{path}}: {{detail}}",
+      "note": "Nota (por qué, opcional)",
+      "fill": "Cambia antes de crear: {{fields}}"
+    },
+    "create": "Crear runtime",
+    "created": "Runtime creado.",
+    "createFailed": "No se pudo crear el runtime.",
+    "bindsAllInterfaces": "Esta definición escucha en 0.0.0.0 o ::, lo que expone el servidor fuera del nodo.",
+    "servedModels": "Modelos servidos",
+    "servedModelsHint": "Agrega un modelo servido a un pool para darle un ID invocable.",
+    "noModelsYet": "Aún no hay modelos servidos. Los runtimes siempre activos los muestran cuando el nodo los reporta.",
+    "contributed": "Contribuido",
+    "openPool": "Abrir pool",
+    "addToPool": "Agregar a un pool",
+    "pickPool": "Elige un pool",
+    "newPoolFromModel": "Nuevo pool con este modelo",
+    "instances": "Instancias",
+    "instancesHint": "Iniciar lo ejecuta en un nodo; ves lo que detendría antes de confirmar.",
+    "alwaysOnHint": "Un runtime siempre activo corre por sí mismo en su nodo.",
+    "phase": {
+      "STARTING": "Iniciando",
+      "READY": "Listo",
+      "UNHEALTHY": "Con fallas",
+      "UNAVAILABLE": "No disponible",
+      "STOPPING": "Deteniéndose",
+      "STOPPED": "Detenido",
+      "FAILED": "Falló"
+    },
+    "needsOperator": {
+      "STEP": "Un paso te espera",
+      "RESTART": "Requiere reinicio",
+      "FORGET": "Detención sin confirmar"
+    },
+    "nodeGone": "nodo eliminado",
+    "start": "Iniciar",
+    "restart": "Reiniciar",
+    "stop": "Detener",
+    "stopping": "Deteniendo.",
+    "startHint": "Mira dónde correría y luego confirma.",
+    "startOn": "Nodo",
+    "anyNode": "Cualquier nodo elegible",
+    "preview": "Vista previa",
+    "previewFirst": "Genera la vista previa para ver la ubicación.",
+    "confirmStart": "Confirmar",
+    "placement": "Nodo {{number}}: {{node}}, puerto {{port}}",
+    "startRequested": "Inicio solicitado.",
+    "warnings": {
+      "low_free_memory": "Poca memoria libre en el nodo.",
+      "frozen_version": "Un nodo solo relé ejecuta su versión congelada.",
+      "pins_outdated": "Un perfil fija una versión anterior.",
+      "interactive_needs_person": "Un paso te esperará en una terminal de operador.",
+      "definition_not_on_node": "El nodo aún no tiene esta definición.",
+      "binds_all_interfaces": "Un comando escucha en 0.0.0.0 o ::."
+    },
+    "refusals": {
+      "human_only": "Solo una persona puede hacer esto, en el navegador.",
+      "trust_relay": "Este nodo es solo relé: los agentes no pueden iniciar ni detener runtimes ahí. Tú sí, en el navegador.",
+      "preview_required": "Primero ve la vista previa y luego confirma.",
+      "preview_stale": "Algo cambió desde la vista previa. Vuelve a generarla.",
+      "definition_frozen": "El nodo tiene congelada una definición de este runtime.",
+      "definition_missing": "El nodo aún no tiene esta definición.",
+      "launch_change_on_relay_only": "Este nodo es solo relé, así que su definición siempre activa está congelada. Cámbiala en el nodo o sube la confianza ahí.",
+      "no_frozen_peer_set": "Este nodo no tiene un conjunto de pares congelado.",
+      "instances_running": "Primero detén las instancias en ejecución.",
+      "pinned_by_profile": "Un perfil fija este runtime. Quítalo del perfil primero.",
+      "interactive_needs_person": "Un paso espera a una persona en una terminal de operador.",
+      "launch_changed": "El arranque cambió: reinicia para aplicarlo.",
+      "invalid_node_count": "Elige un nodo por cada rango de este runtime.",
+      "unknown_node": "Ese nodo no existe.",
+      "label_mismatch": "Al nodo le falta una etiqueta que este runtime requiere.",
+      "head_address_unavailable": "El nodo principal no tiene dirección en la red.",
+      "unknown_placeholder": "Un comando usa un marcador desconocido.",
+      "unsafe_placeholder_value": "El valor de un marcador no es seguro.",
+      "command_too_large": "Un comando es demasiado largo tras los marcadores.",
+      "not_enough_nodes": "No hay suficientes nodos elegibles en línea.",
+      "node_offline": "El nodo está desconectado.",
+      "upgrade_wsmp": "Primero actualiza wsmp en el nodo.",
+      "operator_terminals_unavailable": "El nodo no puede abrir terminales de operador.",
+      "not_enough_memory": "No hay suficiente memoria libre en el nodo.",
+      "resources_held": "Otra instancia retiene los recursos.",
+      "no_free_ports": "El nodo no tiene puertos libres en su rango.",
+      "port_in_use": "El puerto ya está reservado en el nodo.",
+      "contribute_not_allowed": "Este acceso compartido no permite contribuir.",
+      "own_hardware_only": "El dueño enruta este pool solo a su propio hardware.",
+      "model_type_mismatch": "El tipo de modelo no coincide con el tipo del pool.",
+      "sidecar_chain": "Los pools auxiliares no se pueden encadenar.",
+      "cloud_cap_reached": "Se alcanzó el límite mensual de nube.",
+      "slug_taken": "Ese identificador ya está en uso.",
+      "rate_limited": "Demasiadas solicitudes. Espera un momento.",
+      "no_shared_fabric": "No hay suficientes nodos libres en una misma red.",
+      "head_not_in_frozen_fabric": "El nodo principal no está en la red congelada de este nodo.",
+      "node_held": "El nodo está en pausa.",
+      "not_your_runtime": "Aquí solo puedes agregar tus propios modelos servidos.",
+      "secret_needs_node": "Define este secreto en el nodo.",
+      "command_not_running": "Ese comando no se está ejecutando.",
+      "other": "Esto no puede ejecutarse como en la vista previa."
+    },
+    "delete": "Eliminar runtime",
+    "deleteTitle": "¿Eliminar {{name}}?",
+    "deleteHint": "También se eliminan sus versiones y sus modelos servidos salen de todos los pools.",
+    "definition": "Definición",
+    "definitionHint": "Guardar crea una versión nueva. Mismo arranque: las instancias la adoptan en vivo. Arranque distinto: necesitan reinicio.",
+    "restartRunning": "Reiniciar instancias cuyo arranque cambió",
+    "saveVersion": "Guardar versión nueva",
+    "savedVersion": "Versión {{version}} guardada: {{live}} adoptadas en vivo, {{restart}} requieren reinicio.",
+    "versions": "Versiones",
+    "versionsHint": "Cada edición es una versión. Las escritas por agentes están marcadas.",
+    "editor": {
+      "USER": "Tú",
+      "AGENT": "Agente",
+      "SYSTEM": "Sistema"
+    },
+    "needsRestartBadge": "Arranque cambiado",
+    "appliesLive": "Se aplica en vivo"
   }
 }

@@ -174,5 +174,376 @@
       "following": "Viewing at {{cols}}×{{rows}}. Type here to take over.",
       "size": "{{cols}}×{{rows}}"
     }
+  },
+  "models": {
+    "loadFailed": "Couldn't load your models.",
+    "baseUrl": "Base URL",
+    "baseUrlHint": "OpenAI- and Anthropic-compatible clients call this address with an API key.",
+    "copyBaseUrl": "Copy the base URL",
+    "copyId": "Copy {{id}}",
+    "copySnippet": "Copy the example",
+    "emptyTitle": "Nothing to call yet",
+    "emptyHint": "Create a pool and add a served model to it. Its callable ID shows up here.",
+    "goToPools": "Go to pools",
+    "external": ":external",
+    "externalHint": "may use cloud models when local capacity is busy",
+    "yourPool": "Your pool",
+    "sharedBy": "Shared by {{owner}}",
+    "snippet": "Example request",
+    "directNote": "Served models without a pool are not callable with an API key; test them in the browser.",
+    "testLink": "Open Test",
+    "status": {
+      "serving": "Serving",
+      "starting": "Starting",
+      "unavailable": "Unavailable"
+    },
+    "type": {
+      "LLM": "LLM",
+      "EMBEDDINGS": "Embeddings",
+      "TRANSCRIPTION": "Transcription"
+    }
+  },
+  "providers": {
+    "title": "Providers"
+  },
+  "pool": {
+    "new": "New pool",
+    "newHint": "A pool is what clients call: owner/pool. Add served models as members.",
+    "create": "Create pool",
+    "created": "Pool created.",
+    "createFailed": "Couldn't create the pool.",
+    "loadFailed": "Couldn't load pools.",
+    "emptyTitle": "No pools yet",
+    "emptyHint": "Create a pool to give your served models a callable ID.",
+    "health": {
+      "serving": "Serving",
+      "starting": "Starting",
+      "unavailable": "Unavailable",
+      "empty": "No members"
+    },
+    "cloudOn": "Cloud on",
+    "memberCount_one": "{{count}} member",
+    "memberCount_other": "{{count}} members",
+    "traffic_one": "{{count}} request in 24 h",
+    "traffic_other": "{{count}} requests in 24 h",
+    "sharedWithMe": "Shared with you",
+    "canUse": "Can use",
+    "canContribute": "Can contribute",
+    "callAs": "Call it as",
+    "callAsHint": "Use this as the model name with an API key.",
+    "members": "Members",
+    "membersHint": "Served models this pool routes to. Requests go to members with free capacity.",
+    "noMembers": "No members yet. Add a served model below.",
+    "memberStatus": {
+      "serving": "Serving",
+      "starting": "Starting",
+      "unavailable": "Unavailable",
+      "disabled": "Disabled",
+      "cloud_standby": "Cloud standby"
+    },
+    "cloudMember": "Cloud member #{{order}}",
+    "contributedBy": "Contributed by {{email}}",
+    "instancesLive": "{{running}} of {{total}} instances ready",
+    "disableMember": "Disable",
+    "enableMember": "Enable",
+    "removeMember": "Remove {{member}}",
+    "memberRemoved": "Member removed.",
+    "memberAdded": "Added to the pool.",
+    "addMember": "Add a served model",
+    "pickServedModel": "Pick a served model",
+    "add": "Add",
+    "saved": "Saved.",
+    "runsOn": "Hardware it runs on",
+    "runsOnNone": "Nothing is serving this pool right now.",
+    "runsOnNode_one": "{{node}} · {{count}} instance",
+    "runsOnNode_other": "{{node}} · {{count}} instances",
+    "delete": "Delete pool",
+    "deleteTitle": "Delete {{name}}?",
+    "deleteHint": "Its shares, contributed members, API-key entries and sidecar links go with it. Callers of its ID start getting errors.",
+    "form": {
+      "name": "Name",
+      "nameRequired": "Give the pool a name.",
+      "slug": "Slug",
+      "slugHint": "Part of the callable ID: owner/slug.",
+      "slugInvalid": "Lower-case letters, digits and single dashes, starting with a letter.",
+      "type": "Type",
+      "firstMember": "First member (optional)",
+      "noMember": "No member yet",
+      "noServedModels": "No served model of this type yet. Create a runtime first."
+    },
+    "routing": {
+      "title": "Routing",
+      "hint": "Fairness limits for this pool. Physical limits live on each runtime.",
+      "priority": "Priority class",
+      "priorities": {
+        "BACKGROUND": "Background",
+        "NORMAL": "Normal",
+        "HIGH": "High"
+      },
+      "cap": "Pool cap (concurrent requests)",
+      "noCap": "No cap",
+      "kept": "Kept slots per instance",
+      "keptHint": "Slots this pool keeps on each member instance.",
+      "borrow": "Borrow slots others keep while they have no waiter",
+      "numberRange": "A whole number from {{min}} to {{max}}, or empty.",
+      "ownHardware": "Only my own hardware",
+      "ownHardwareHint": "Contributed members stay listed but get no requests, and share holders cannot add new ones. Only a person can change this.",
+      "ownHardwareLabel": "Route only to my runtimes"
+    },
+    "cloud": {
+      "title": "Cloud fallback",
+      "hint": "Who may make this pool spend cloud money. Callers still opt in by calling owner/pool:external.",
+      "mode": "Cloud mode",
+      "modes": {
+        "OFF": "Off",
+        "OWNER": "For me",
+        "OWNER_AND_SHARES": "For me and people I share with"
+      },
+      "humanOnly": "Cloud spend is set by a person only; agents cannot change it.",
+      "paidWarm": "Paid warm-cache protection on cloud members",
+      "members": "Cloud members",
+      "membersHint": "Tried in this order. Enable provider models under",
+      "noMembers": "No cloud members."
+    },
+    "advanced": {
+      "intro": "These settings are automatic unless overridden. Agents may tune them; every change is recorded in the pool history.",
+      "sections": {
+        "columns": "Admission",
+        "flat": "API and media",
+        "affinity": "Cache affinity",
+        "protection": "Warm-cache protection"
+      },
+      "source": {
+        "override": "Override",
+        "auto": "Automatic",
+        "default": "Default"
+      },
+      "unknown": "not known yet",
+      "pick": "Pick a value",
+      "bool": {
+        "true": "On",
+        "false": "Off"
+      },
+      "override": "Override",
+      "automatic": "Back to automatic",
+      "units": {
+        "ms": "ms",
+        "s": "s",
+        "minutes": "min",
+        "tokens": "tokens",
+        "bytes": "bytes",
+        "percent": "%"
+      },
+      "keys": {
+        "maxWaitMs": "Max queue wait",
+        "contextCeiling": "Context ceiling",
+        "contextMargin": "Context margin",
+        "protocolAdaptation": "API adaptation",
+        "allowLossyDeveloperRoleCollapse": "Allow merging the developer role",
+        "recommendedSurface": "Recommended API",
+        "maxAttachmentBytes": "Max attachment size",
+        "optimisticBasicTranscription": "Basic transcription fallback",
+        "affinity": {
+          "enabled": "Enabled",
+          "ttlSeconds": "Remember for",
+          "maxRecords": "Max records",
+          "prefixWeight": "Prefix weight",
+          "conversationWeight": "Conversation weight",
+          "confirmedCacheWeight": "Confirmed cache weight",
+          "loadPenaltyWeight": "Load penalty weight",
+          "residencyWeight": "Residency weight"
+        },
+        "protection": {
+          "enabled": "Enabled",
+          "evictionFeedback": "Eviction feedback",
+          "windowSeconds": "Window",
+          "minTokens": "Minimum tokens",
+          "share": "Share mode",
+          "fixedPercent": "Fixed share",
+          "ownerPercent": "Owner share"
+        }
+      },
+      "rules": "Metric routing rules",
+      "rulesHint": "Agents write these; you can delete them here.",
+      "noRules": "No rules.",
+      "deleteRule": "Delete rule {{rule}}"
+    }
+  },
+  "runtime": {
+    "new": "New runtime",
+    "loadFailed": "Couldn't load runtimes.",
+    "presetsFailed": "Couldn't load the starting points.",
+    "emptyTitle": "No runtimes yet",
+    "emptyHint": "A runtime is a server on a node: always on, or started when you need it.",
+    "kind": {
+      "ALWAYS_ON": "Always on",
+      "STARTABLE": "Startable"
+    },
+    "service": "Service (no proxying)",
+    "serviceHint": "This runtime runs on its node but serves no models, so it is never in a pool or callable.",
+    "notInPool": "Not in a pool",
+    "notInPoolHint": "Not in a pool yet, so nothing can call it. Add it to a pool below.",
+    "running_one": "{{count}} running",
+    "running_other": "{{count}} running",
+    "starting_one": "{{count}} starting",
+    "starting_other": "{{count}} starting",
+    "failed_one": "{{count}} failed",
+    "failed_other": "{{count}} failed",
+    "needsYou_one": "{{count}} needs you",
+    "needsYou_other": "{{count}} need you",
+    "notRunning": "Not running",
+    "pickPreset": "Start from",
+    "presets": {
+      "detected": {
+        "title": "Detected server",
+        "hint": "An inference server already running on a node."
+      },
+      "vllm": {
+        "title": "vLLM",
+        "hint": "Started on a GPU node when needed."
+      },
+      "sglang": {
+        "title": "SGLang",
+        "hint": "Started on a GPU node when needed."
+      },
+      "llama_cpp": {
+        "title": "llama.cpp",
+        "hint": "A GGUF model on unified memory or CPU."
+      },
+      "ollama_service": {
+        "title": "Ollama service",
+        "hint": "The node's Ollama systemd service."
+      },
+      "systemd_unit": {
+        "title": "systemd unit",
+        "hint": "Any service on a node, without proxying."
+      }
+    },
+    "form": {
+      "name": "Name",
+      "nameRequired": "Give the runtime a name.",
+      "slug": "Slug",
+      "slugReserved": "This slug is reserved for instances.",
+      "node": "Node",
+      "pickNode": "Pick a node",
+      "nodeRequired": "Pick the node it lives on.",
+      "nodeIdHint": "Paste the node ID from the node's page.",
+      "spec": "Definition (JSON)",
+      "specHint": "Commands may use placeholders such as port and memory_fraction, written in double braces. Bind 127.0.0.1 on single-node runtimes.",
+      "specNotJson": "This is not valid JSON.",
+      "specInvalid": "{{path}}: {{detail}}",
+      "note": "Note (why, optional)",
+      "fill": "Change before creating: {{fields}}"
+    },
+    "create": "Create runtime",
+    "created": "Runtime created.",
+    "createFailed": "Couldn't create the runtime.",
+    "bindsAllInterfaces": "This definition binds 0.0.0.0 or ::, which exposes the server beyond the node.",
+    "servedModels": "Served models",
+    "servedModelsHint": "Add a served model to a pool to give it a callable ID.",
+    "noModelsYet": "No served models yet. Always-on runtimes list theirs once the node reports them.",
+    "contributed": "Contributed",
+    "openPool": "Open pool",
+    "addToPool": "Add to a pool",
+    "pickPool": "Pick a pool",
+    "newPoolFromModel": "New pool from this model",
+    "instances": "Instances",
+    "instancesHint": "Start runs it on a node; you see what it would stop before you confirm.",
+    "alwaysOnHint": "An always-on runtime runs on its node by itself.",
+    "phase": {
+      "STARTING": "Starting",
+      "READY": "Ready",
+      "UNHEALTHY": "Unhealthy",
+      "UNAVAILABLE": "Unavailable",
+      "STOPPING": "Stopping",
+      "STOPPED": "Stopped",
+      "FAILED": "Failed"
+    },
+    "needsOperator": {
+      "STEP": "A step waits for you",
+      "RESTART": "Restart needed",
+      "FORGET": "Stop unproven"
+    },
+    "nodeGone": "removed node",
+    "start": "Start",
+    "restart": "Restart",
+    "stop": "Stop",
+    "stopping": "Stopping.",
+    "startHint": "Preview where it would run, then confirm.",
+    "startOn": "Node",
+    "anyNode": "Any eligible node",
+    "preview": "Preview",
+    "previewFirst": "Preview to see the placement.",
+    "confirmStart": "Confirm",
+    "placement": "Node {{number}}: {{node}}, port {{port}}",
+    "startRequested": "Start requested.",
+    "warnings": {
+      "low_free_memory": "Little free memory on the node.",
+      "frozen_version": "A Relay-only node runs its frozen version.",
+      "pins_outdated": "A profile pins an older version.",
+      "interactive_needs_person": "A step will wait for you in an operator terminal.",
+      "definition_not_on_node": "The node does not hold this definition yet.",
+      "binds_all_interfaces": "A command binds 0.0.0.0 or ::."
+    },
+    "refusals": {
+      "human_only": "Only a person can do this, in the browser.",
+      "trust_relay": "This node is Relay only: agents cannot start or stop runtimes there. You can, in the browser.",
+      "preview_required": "Preview first, then confirm.",
+      "preview_stale": "Something changed since the preview. Preview again.",
+      "definition_frozen": "The node holds a frozen definition of this runtime.",
+      "definition_missing": "The node does not hold this definition yet.",
+      "launch_change_on_relay_only": "This node is Relay only, so its always-on definition is frozen. Change it on the node or raise trust there.",
+      "no_frozen_peer_set": "This node has no frozen peer set.",
+      "instances_running": "Stop the running instances first.",
+      "pinned_by_profile": "A profile pins this runtime. Remove it from the profile first.",
+      "interactive_needs_person": "A step waits in an operator terminal for a person.",
+      "launch_changed": "The launch changed: restart to apply it.",
+      "invalid_node_count": "Pick one node per rank of this runtime.",
+      "unknown_node": "That node does not exist.",
+      "label_mismatch": "The node lacks a label this runtime requires.",
+      "head_address_unavailable": "The head node has no address on the fabric.",
+      "unknown_placeholder": "A command uses an unknown placeholder.",
+      "unsafe_placeholder_value": "A placeholder value is not safe to use.",
+      "command_too_large": "A command is too long after placeholders.",
+      "not_enough_nodes": "Not enough eligible nodes are online.",
+      "node_offline": "The node is offline.",
+      "upgrade_wsmp": "Upgrade wsmp on the node first.",
+      "operator_terminals_unavailable": "The node cannot open operator terminals.",
+      "not_enough_memory": "Not enough free memory on the node.",
+      "resources_held": "The resources are held by another instance.",
+      "no_free_ports": "The node has no free port in its range.",
+      "port_in_use": "The port is already claimed on the node.",
+      "contribute_not_allowed": "This share does not allow contributing.",
+      "own_hardware_only": "The owner routes this pool to their own hardware only.",
+      "model_type_mismatch": "The model type does not match the pool type.",
+      "sidecar_chain": "Sidecar pools cannot be chained.",
+      "cloud_cap_reached": "The monthly cloud cap is reached.",
+      "slug_taken": "That slug is already used.",
+      "rate_limited": "Too many requests. Wait a moment.",
+      "no_shared_fabric": "Not enough free nodes share one fabric.",
+      "head_not_in_frozen_fabric": "The head is not in this node's frozen fabric.",
+      "node_held": "The node is on hold.",
+      "not_your_runtime": "Only your own served models can be added here.",
+      "secret_needs_node": "Set this secret on the node.",
+      "command_not_running": "That command is not running.",
+      "other": "This cannot run as previewed."
+    },
+    "delete": "Delete runtime",
+    "deleteTitle": "Delete {{name}}?",
+    "deleteHint": "Its versions go too, and its served models leave every pool.",
+    "definition": "Definition",
+    "definitionHint": "Saving makes a new version. Same launch: running instances adopt it live. Changed launch: they need a restart.",
+    "restartRunning": "Restart running instances whose launch changed",
+    "saveVersion": "Save new version",
+    "savedVersion": "Version {{version}} saved: {{live}} adopted live, {{restart}} need a restart.",
+    "versions": "Versions",
+    "versionsHint": "Every edit is a version. Agent-written ones are marked.",
+    "editor": {
+      "USER": "You",
+      "AGENT": "Agent",
+      "SYSTEM": "System"
+    },
+    "needsRestartBadge": "Launch changed",
+    "appliesLive": "Applies live"
   }
 }
