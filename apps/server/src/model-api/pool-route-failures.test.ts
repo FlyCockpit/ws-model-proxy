@@ -116,6 +116,7 @@ const RESPONSES_ONLY_ROUTE: PoolRoute = {
     countStrategy: "CONSERVATIVE_ESTIMATE",
     imageTokenAllowance: null,
     cacheGeneration: "gen",
+    requestCompat: {},
     runtimeIdentityKey: "hash",
     runtimeModel: "m",
     runtimeRevision: "1",

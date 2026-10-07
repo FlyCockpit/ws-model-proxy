@@ -26,7 +26,7 @@ import {
   nodeListRowSchema,
   nodesContract,
 } from "./nodes";
-import { poolsContract, poolViewSchema } from "./pools";
+import { modelAliasNameSchema, poolsContract, poolViewSchema } from "./pools";
 import { profilesContract, profileViewSchema } from "./profiles";
 import { providersContract } from "./providers";
 import {
@@ -126,6 +126,7 @@ export function advertisedToolList(): Array<{
 const SPEC = "Runtime definition; shape in docs/mcp.md, start from runtimes_get presets.";
 const LIMITS = "Limit overrides (null: automatic); runtimes_get shows effective values.";
 const ADVANCED = "Advanced settings by key; pools_get / runtimes_get show keys and defaults.";
+const COMPAT = "Request compatibility (replaces; null: automatic); shape in docs/mcp.md.";
 
 const runtimeCreateInput = z
   .object({
@@ -137,6 +138,7 @@ const runtimeCreateInput = z
     spec: z.record(z.string(), z.unknown()).optional(),
     limits: z.record(z.string(), z.unknown()).optional(),
     advanced: z.record(z.string(), z.unknown()).optional(),
+    compat: z.record(z.string(), z.unknown()).nullable().optional(),
     /** Copy a definition shared with you instead of giving spec. */
     forkFrom: z.object({ runtimeId: idSchema, versionId: idSchema.optional() }).strict().optional(),
     note: noteSchema.optional(),
@@ -153,6 +155,8 @@ const runtimeUpdateInput = z
     spec: z.record(z.string(), z.unknown()).optional(),
     limits: z.record(z.string(), z.unknown()).optional(),
     advanced: z.record(z.string(), z.unknown()).optional(),
+    compat: z.record(z.string(), z.unknown()).nullable().optional(),
+    relearn: z.boolean().optional(),
     restartRunning: z.boolean().optional(),
     /** Per served model; null: what the node detected. */
     modelCapabilities: z
@@ -185,6 +189,21 @@ const poolUpdateInput = z
     cloud: z.record(z.string(), z.unknown()).optional(),
     sidecars: z.array(z.record(z.string(), z.unknown())).max(3).optional(),
     advanced: z.record(z.string(), z.unknown()).optional(),
+    /** Your model-name aliases for this pool (your namespace; any pool you can use). */
+    aliases: z
+      .object({
+        set: z
+          .array(
+            z
+              .object({ name: modelAliasNameSchema, apiKeyId: idSchema.nullable().optional() })
+              .strict(),
+          )
+          .max(16)
+          .optional(),
+        remove: z.array(idSchema).max(16).optional(),
+      })
+      .strict()
+      .optional(),
     /** In a pool shared with you (can contribute): add or withdraw YOUR served models. */
     contribute: z
       .object({
@@ -239,13 +258,21 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   }),
   tool({
     name: "pools_get",
-    description: "Your pools and pools shared with you, or one pool (history: its change log).",
-    input: z.object({ poolId: idSchema.optional(), history: z.boolean().optional() }).strict(),
+    description:
+      "Your pools and pools shared with you, or one pool (history: its change log; aliases: your model-name aliases).",
+    input: z
+      .object({
+        poolId: idSchema.optional(),
+        history: z.boolean().optional(),
+        aliases: z.boolean().optional(),
+      })
+      .strict(),
     output: z.union([
       poolsContract.list.output,
       poolViewSchema.extend({ history: poolsContract.history.list.output.optional() }).strict(),
+      poolsContract.aliases.list.output,
     ]),
-    procedures: ["pools.list", "pools.get", "pools.history.list"],
+    procedures: ["pools.list", "pools.get", "pools.history.list", "pools.aliases.list"],
   }),
   tool({
     name: "profiles_get",
@@ -308,12 +335,19 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "pool_update",
     description:
-      "Change a pool you own, or contribute/withdraw your own served models in a pool shared with you (can contribute). People only: cloud mode, paid warm protection, own-key consent, only-my-own-hardware.",
+      "Change a pool you own, contribute/withdraw your own served models in a pool shared with you (can contribute), or set your model-name aliases for any pool you can use. People only: cloud mode, paid warm protection, own-key consent, only-my-own-hardware.",
     input: poolUpdateInput,
     output: poolsContract.update.output,
-    procedures: ["pools.update", "pools.members.addContributed", "pools.members.removeContributed"],
+    procedures: [
+      "pools.update",
+      "pools.members.addContributed",
+      "pools.members.removeContributed",
+      "pools.aliases.set",
+      "pools.aliases.delete",
+    ],
     compactFields: {
       members: "{add: [{runtimeModelId}], remove: [memberId], set: [{memberId, weight, state}]}.",
+      aliases: "{set: [{name, apiKeyId?}], remove: [aliasId]}; names like gpt-4o.",
       routing: "Priority class, pool cap, kept slots, borrowing.",
       cloud: "{embeddingContract}.",
       advanced: ADVANCED,
@@ -334,7 +368,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
     input: runtimeCreateInput,
     output: runtimesContract.create.output,
     procedures: ["runtimes.create", "runtimes.presets.list", "runtimes.fork"],
-    compactFields: { spec: SPEC, limits: LIMITS, advanced: ADVANCED },
+    compactFields: { spec: SPEC, limits: LIMITS, advanced: ADVANCED, compat: COMPAT },
   }),
   tool({
     name: "runtime_update",
@@ -345,7 +379,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
       models: z.array(runtimeModelViewSchema).optional(),
     }),
     procedures: ["runtimes.update", "runtimes.models.setCapabilities"],
-    compactFields: { spec: SPEC, limits: LIMITS, advanced: ADVANCED },
+    compactFields: { spec: SPEC, limits: LIMITS, advanced: ADVANCED, compat: COMPAT },
   }),
   tool({
     name: "runtime_delete",

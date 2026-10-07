@@ -6,6 +6,7 @@ import { resolveClientIp } from "../../client-ip.js";
 import { createRateLimiterMiddleware, realtimeUpgradeLimiter } from "../../rate-limit.js";
 import { relaySessionManager } from "../../relay/session-manager.js";
 import type { CapacityAdmissionRuntime } from "../capacity/runtime.js";
+import { clientCredential } from "../client-credential.js";
 import { openAiErrorBody } from "../openai-errors.js";
 import { type ApiKeyIdentity, authenticateApiKey } from "../resolve.js";
 import { createRealtimeAuthorizer } from "./authorize.js";
@@ -124,10 +125,16 @@ function errorResponse(
   return c.json(openAiErrorBody({ message, type, code }), status);
 }
 
-function bearerSecret(header: string | undefined): string | null {
-  if (!header) return null;
-  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
-  return match?.[1] ?? null;
+/**
+ * The key from the headers (Bearer, x-api-key, api-key) or the subprotocol; null when absent or
+ * when two different keys were offered (refused, never resolved in favor of one).
+ */
+function realtimeSecret(headers: Headers): string | null {
+  const credential = clientCredential(headers);
+  if (credential.kind === "conflict") return null;
+  const offered = subprotocolSecret(headers.get("sec-websocket-protocol") ?? undefined);
+  if (credential.kind === "key" && offered !== null && offered !== credential.key) return null;
+  return credential.kind === "key" ? credential.key : offered;
 }
 
 /** The offered subprotocols, trimmed. */
@@ -223,9 +230,7 @@ export function createRealtimeWebsocketMiddleware(
     if (limited instanceof Response) return limited;
     const query = readRealtimeQuery(c.req.url);
     if (!query.ok) return errorResponse(c, 400, "invalid_request_error", query.code, query.message);
-    const secret =
-      bearerSecret(c.req.header("authorization")) ??
-      subprotocolSecret(c.req.header("sec-websocket-protocol"));
+    const secret = realtimeSecret(c.req.raw.headers);
     if (!secret) {
       return errorResponse(c, 401, "invalid_request_error", "invalid_api_key", "Missing API key.");
     }

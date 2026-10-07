@@ -29,8 +29,13 @@ export function runtimeContentHash(input: {
     engineLoadGate: "AUTO" | "ENFORCE" | "OBSERVE";
   };
   advanced: Record<string, unknown>;
+  /** Request compatibility; hashed only when set, so older versions keep their hash. */
+  compat?: Record<string, unknown>;
 }): string {
-  return sha256Hex(canonicalJson(input));
+  const { compat, ...rest } = input;
+  return sha256Hex(
+    canonicalJson(compat && Object.keys(compat).length > 0 ? { ...rest, compat } : rest),
+  );
 }
 
 /** `Node.metricCommandsHash` and `runtime.define.node.metricCommands.hash`. */

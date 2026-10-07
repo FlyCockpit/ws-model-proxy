@@ -148,3 +148,27 @@ export function usageFactsFromRelayTerminal(terminal: {
 export function engineCacheConfirmedFromUsageFacts(facts: RelayUsageFacts): boolean | undefined {
   return facts.cacheReadTokens === null ? undefined : facts.cacheReadTokens > 0;
 }
+
+/**
+ * Usage for a successful request whose engine reported none: the prompt from the request's own
+ * context count, the completion from the node's `cl100k_base` count of the answer text. Marked
+ * estimated; `usageKnown` stays false so rollups and billing never count it.
+ */
+export function withEstimatedUsage(
+  usage: RelayUsageFacts,
+  terminal: { ok: boolean; metrics?: { completionTokens: number } | null },
+  contextTokens: number | undefined,
+): RelayUsageFacts & { usageEstimated: boolean } {
+  if (usage.usageKnown || !terminal.ok) return { ...usage, usageEstimated: false };
+  const promptTokens = toInt(contextTokens);
+  const completionTokens = toInt(terminal.metrics?.completionTokens);
+  if (promptTokens === null && completionTokens === null)
+    return { ...usage, usageEstimated: false };
+  return {
+    ...usage,
+    promptTokens,
+    completionTokens,
+    totalTokens: sum(promptTokens, completionTokens),
+    usageEstimated: true,
+  };
+}

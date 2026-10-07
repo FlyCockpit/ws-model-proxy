@@ -114,6 +114,7 @@ function testRoute({
       countStrategy: "CONSERVATIVE_ESTIMATE",
       imageTokenAllowance: null,
       cacheGeneration: "",
+      requestCompat: {},
       runtimeIdentityKey: "h",
       runtimeModel: "whisper-large",
       runtimeRevision: "v-1",

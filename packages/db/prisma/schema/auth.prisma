@@ -53,6 +53,7 @@ model User {
   profiles            Profile[]
   pools               Pool[]
   apiKeys             ApiKey[]
+  modelAliases        ModelAlias[]
   sharesOut           Share[]              @relation("ShareOwner")
   sharesIn            Share[]              @relation("ShareGrantee")
   shareInvites        ShareInvite[]

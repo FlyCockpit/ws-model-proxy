@@ -14,6 +14,7 @@ import { startMediaCleanup } from "./media/cleanup.js";
 import { startAffinityAuthorityMaintenance } from "./model-api/cache-affinity-maintenance.js";
 import { startAffinityResidencyRepair } from "./model-api/cache-affinity-residency.js";
 import { startCacheAffinityCleanup } from "./model-api/cache-affinity-runtime.js";
+import { startRequestProfileProbes } from "./model-api/compat/probe.js";
 import { closeDiagnosticsCapacityRuntime } from "./model-api/diagnostics.js";
 import { stopKvEvictionFeedback } from "./model-api/kv-eviction-feedback.js";
 import {
@@ -156,6 +157,9 @@ const stopCacheAffinityCleanup = startCacheAffinityCleanup();
 const stopAffinityResidencyRepair = startAffinityResidencyRepair();
 const stopAffinityAuthorityMaintenance = startAffinityAuthorityMaintenance();
 const stopRelayTelemetryRecovery = startRelayTelemetryRecovery();
+// What each READY engine accepts in a request, from its own OpenAPI description (through the
+// head node, loopback only); see model-api/compat/probe.ts.
+const stopRequestProfileProbes = startRequestProfileProbes(relaySessionManager);
 const stopProviderBudgetRepair = startProviderBudgetRepair();
 const stopProviderAttemptExpiry = providerAttemptExpiryEnabled(
   env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
@@ -214,6 +218,7 @@ installServerShutdown({
     stopAffinityResidencyRepair,
     stopAffinityAuthorityMaintenance,
     stopRelayTelemetryRecovery,
+    stopRequestProfileProbes,
     stopProviderBudgetRepair,
     stopProviderAttemptExpiry,
     stopOauthCleanup,

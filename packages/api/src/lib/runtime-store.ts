@@ -10,6 +10,7 @@ import type { runtimeAdvancedPatchSchema, runtimeLimitsPatchSchema } from "../co
 import { type CallerActor } from "./caller-actor";
 import { refuseAbout } from "./refuse";
 import { applyJsonPatch } from "./registry-view";
+import type { RequestCompat } from "./request-compat";
 import { runtimeContentHash, runtimeLaunchHash } from "./runtime-launch-hash";
 import type { RuntimeSpec } from "./runtime-spec";
 
@@ -94,10 +95,11 @@ export function versionHashes(
   spec: RuntimeSpec,
   limits: LimitColumns,
   advanced: Record<string, unknown>,
+  compat: RequestCompat = {},
 ) {
   return {
     launchHash: runtimeLaunchHash(spec),
-    contentHash: runtimeContentHash({ spec, limits, advanced }),
+    contentHash: runtimeContentHash({ spec, limits, advanced, compat }),
   };
 }
 
@@ -132,10 +134,13 @@ export async function createVersion(
     spec: RuntimeSpec;
     limits: LimitColumns;
     advanced: Record<string, unknown>;
+    /** Request compatibility (absent: automatic). */
+    compat?: RequestCompat;
     note: string | null;
   },
 ) {
-  const hashes = versionHashes(input.spec, input.limits, input.advanced);
+  const compat = input.compat ?? {};
+  const hashes = versionHashes(input.spec, input.limits, input.advanced, compat);
   return tx.runtimeVersion.create({
     data: {
       runtimeId: input.runtimeId,
@@ -149,6 +154,7 @@ export async function createVersion(
       ...derivedColumns(input.spec),
       ...input.limits,
       advanced: input.advanced as Prisma.InputJsonValue,
+      compat: compat as Prisma.InputJsonValue,
       ...hashes,
     },
     select: { id: true, launchHash: true, contentHash: true },

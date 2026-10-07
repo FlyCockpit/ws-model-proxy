@@ -16,6 +16,8 @@ import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
 import { type EffectiveView, RegistryOverrideRow } from "@/components/registry-override-row";
+import { RequestCompatCard } from "@/components/runtimes/request-compat-card";
+import { RequestProfileCard } from "@/components/runtimes/request-profile-card";
 import { refusalText } from "@/lib/refusal-text";
 import { orpc } from "@/utils/orpc";
 
@@ -66,6 +68,8 @@ function RuntimeAdvancedPage() {
           </CardContent>
         </Card>
       ))}
+      <RequestCompatCard key={runtime.data.currentVersion.id} runtime={runtime.data} />
+      <RequestProfileCard runtime={runtime.data} />
     </div>
   );
 }

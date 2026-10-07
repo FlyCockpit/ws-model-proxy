@@ -19,6 +19,7 @@ import type {
   TargetFailureClass,
   TargetHealthStatus,
 } from "@ws-model-proxy/api/lib/pool-routing";
+import { type RequestCompat, storedRequestCompat } from "@ws-model-proxy/api/lib/request-compat";
 import {
   POOL_ADVANCED_COLUMNS,
   POOL_ADVANCED_OVERRIDES,
@@ -145,7 +146,43 @@ export type TestTarget = {
   maxAttachmentBytes: number | null;
 };
 
-export type CallableTargets = { pools: CallablePool[]; tests: TestTarget[] };
+/**
+ * A model-name alias in effect for the caller: a hard-coded name a harness sends, mapped to one
+ * of `pools` (key-level aliases win over user-level ones of the same name).
+ */
+export type ModelAliasTarget = { name: string; poolId: string };
+
+export type CallableTargets = {
+  pools: CallablePool[];
+  tests: TestTarget[];
+  aliases: ModelAliasTarget[];
+};
+
+/**
+ * The aliases a caller may use: the user's (and the key's, which win), pointing only at pools
+ * in `pools` (an alias never widens access).
+ */
+async function effectiveAliases(
+  userId: string,
+  apiKeyId: string | null,
+  pools: readonly CallablePool[],
+): Promise<ModelAliasTarget[]> {
+  const rows = await prisma.modelAlias.findMany({
+    where: { userId, OR: [{ apiKeyId: null }, ...(apiKeyId ? [{ apiKeyId }] : [])] },
+    select: { name: true, poolId: true, apiKeyId: true },
+    orderBy: { id: "asc" },
+    take: 256,
+  });
+  const callable = new Set(pools.map((pool) => pool.id));
+  const byName = new Map<string, ModelAliasTarget>();
+  // User-level first, then the key's: a usable key-level alias replaces a user-level one (one
+  // whose pool the key cannot call never hides a working user-level alias).
+  for (const row of [...rows].sort(
+    (a, b) => Number(a.apiKeyId !== null) - Number(b.apiKeyId !== null),
+  ))
+    if (callable.has(row.poolId)) byName.set(row.name, { name: row.name, poolId: row.poolId });
+  return [...byName.values()];
+}
 
 export function testTargetModelId(runtimeId: string, upstreamModelId: string): string {
   return `runtime:${runtimeId}:${upstreamModelId}`;
@@ -273,7 +310,7 @@ export async function listCallableTargetsForUser(
     ownerUserSlug: model.Runtime.User.slug,
     maxAttachmentBytes: null,
   }));
-  return { pools, tests };
+  return { pools, tests, aliases: await effectiveAliases(userId, null, pools) };
 }
 
 /** An API key reaches pools only (ALL_POOLS: every callable pool; SELECTED_POOLS: its list). */
@@ -282,13 +319,16 @@ export async function listCallableTargetsForApiKey(
   now = new Date(),
 ): Promise<CallableTargets> {
   const all = await listCallableTargetsForUser(key.userId, now);
-  if (key.scope === "ALL_POOLS") return { pools: all.pools, tests: [] };
-  const selected = new Set(
-    (
-      await prisma.apiKeyPool.findMany({ where: { apiKeyId: key.id }, select: { poolId: true } })
-    ).map((row) => row.poolId),
-  );
-  return { pools: all.pools.filter((pool) => selected.has(pool.id)), tests: [] };
+  let pools = all.pools;
+  if (key.scope !== "ALL_POOLS") {
+    const selected = new Set(
+      (
+        await prisma.apiKeyPool.findMany({ where: { apiKeyId: key.id }, select: { poolId: true } })
+      ).map((row) => row.poolId),
+    );
+    pools = all.pools.filter((pool) => selected.has(pool.id));
+  }
+  return { pools, tests: [], aliases: await effectiveAliases(key.userId, key.id, pools) };
 }
 
 // ── Route rows ──
@@ -316,6 +356,8 @@ export type RouteInstance = {
   imageTokenAllowance: number | null;
   /** Physical KV-cache incarnation (cache-affinity generations key on it). */
   cacheGeneration: string;
+  /** The version's request compatibility setting ({} = automatic). */
+  requestCompat: RequestCompat;
   // ── runtime identity (context counters, calibration, cache-affinity identity) ──
   /** The launch hash: equal hashes run the same command line. */
   runtimeIdentityKey: string;
@@ -520,6 +562,7 @@ const TARGET_SELECT = {
           kvBudgetTokens: true,
           launchHash: true,
           advanced: true,
+          compat: true,
         },
       },
       Runtime: {
@@ -607,6 +650,7 @@ function routeParts(row: TargetSelected, now: Date): TestRoute | null {
         "CONSERVATIVE_ESTIMATE",
       imageTokenAllowance: advancedNumber(version.advanced, "imageTokenAllowance"),
       cacheGeneration: instance.cacheGeneration,
+      requestCompat: storedRequestCompat(version.compat),
       runtimeIdentityKey: version.launchHash,
       runtimeModel: model.upstreamModelId,
       runtimeRevision: instance.versionId,

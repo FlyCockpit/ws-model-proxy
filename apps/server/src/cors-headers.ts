@@ -28,6 +28,9 @@ import { SHARE_INVITE_HEADER } from "@ws-model-proxy/config/share-invite";
 export const CORS_ALLOW_HEADERS = [
   "Content-Type",
   "Authorization",
+  // The model API also takes the key as x-api-key (Anthropic SDKs) or api-key (Azure style).
+  "x-api-key",
+  "api-key",
   "x-csrf-token",
   APP_LOCALE_HEADER,
   SHARE_INVITE_HEADER,

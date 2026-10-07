@@ -90,15 +90,16 @@ model Runtime {
   /// Set when this runtime was created from a definition another user shared.
   forkedFromVersionId String?
 
-  User           User              @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Node           Node?             @relation(fields: [nodeId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  CurrentVersion RuntimeVersion?   @relation("RuntimeCurrentVersion", fields: [currentVersionId], references: [id], onDelete: NoAction, onUpdate: Cascade)
-  Versions       RuntimeVersion[]  @relation("RuntimeVersions")
-  Models         RuntimeModel[]
-  Instances      RuntimeInstance[]
-  Shares         RuntimeShare[]
-  ProfileItems   ProfileItem[]
-  Invites        ShareInvite[]
+  User            User                    @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Node            Node?                   @relation(fields: [nodeId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  CurrentVersion  RuntimeVersion?         @relation("RuntimeCurrentVersion", fields: [currentVersionId], references: [id], onDelete: NoAction, onUpdate: Cascade)
+  Versions        RuntimeVersion[]        @relation("RuntimeVersions")
+  Models          RuntimeModel[]
+  Instances       RuntimeInstance[]
+  Shares          RuntimeShare[]
+  ProfileItems    ProfileItem[]
+  RequestProfiles RuntimeRequestProfile[]
+  Invites         ShareInvite[]
 
   @@unique([userId, slug])
   @@unique([id, userId])
@@ -145,6 +146,10 @@ model RuntimeVersion {
   /// restartBudget (3), restartWindowMin (60), unhealthyRestartMs (120000),
   /// unavailableStopMs (900000). Health thresholds live only in spec.launch.health.
   advanced         Json           @default("{}")
+  /// Request compatibility (RequestCompat zod in @ws-model-proxy/api/lib/request-compat):
+  /// unknown-field policy, semantic-drop allowance, rewrite rules, header modes, proxy extras and
+  /// response shaping. Agent-editable; `{}` means automatic.
+  compat           Json           @default("{}")
 
   Runtime         Runtime           @relation("RuntimeVersions", fields: [runtimeId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   CurrentOf       Runtime?          @relation("RuntimeCurrentVersion")
@@ -186,6 +191,42 @@ model RuntimeModel {
   @@unique([id, userId])
   @@index([userId])
   @@map("runtime_model")
+}
+
+/// Where a request profile's accepted fields came from.
+enum RequestProfileSource {
+  /// Only learned from the engine's 400s (no description).
+  LEARNED
+  /// The engine's own OpenAPI description (`GET /openapi.json` on loopback, through the node).
+  OPENAPI
+  /// A built-in engine-profile catalog entry.
+  CATALOG
+}
+
+/// What one runtime's engine accepts in a request, per launch (equal launch hashes run the same
+/// command line, so edits that keep it keep what was learned). `accepted` holds the fields per
+/// endpoint (AcceptedProfile), `learned` the fixes learned from the engine's 400s
+/// (LearnedProfile); neither ever holds request values. A changed engine fingerprint (another
+/// engine version answered) starts over.
+model RuntimeRequestProfile {
+  id                String               @id @default(cuid(2))
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @default(now()) @updatedAt
+  userId            String
+  runtimeId         String
+  launchHash        String
+  source            RequestProfileSource @default(LEARNED)
+  /// `info.title info.version` of the description plus its digest; null when none was read.
+  engineFingerprint String?
+  accepted          Json?
+  learned           Json                 @default("{}")
+  probedAt          DateTime?
+
+  Runtime Runtime @relation(fields: [runtimeId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([runtimeId, launchHash])
+  @@index([userId])
+  @@map("runtime_request_profile")
 }
 
 /// Read-only share of a runtime definition (all versions) with another user, who can fork it

@@ -95,6 +95,42 @@ describe("model name grammar", () => {
     });
   });
 
+  it("resolves the caller's aliases, never over a callable ID, only to callable pools", () => {
+    const withAliases = {
+      ...targets,
+      aliases: [
+        { name: "gpt-4o", poolId: "pool-id" },
+        { name: "qwen3:8b", poolId: "pool-id" },
+        { name: "owner/pool.v2", poolId: "other-pool" },
+        { name: "ghost", poolId: "invisible-pool" },
+      ],
+    };
+    expect(resolveRequestedModelName(withAliases, "gpt-4o")).toMatchObject({
+      kind: "pool",
+      target: { id: "pool-id" },
+      externalRequested: false,
+    });
+    expect(resolveRequestedModelName(withAliases, "gpt-4o:external")).toMatchObject({
+      kind: "pool",
+      externalRequested: true,
+    });
+    expect(resolveRequestedModelName(withAliases, "qwen3:8b")).toMatchObject({ kind: "pool" });
+    expect(resolveRequestedModelName(withAliases, "qwen3:8b:external")).toMatchObject({
+      kind: "pool",
+      externalRequested: true,
+    });
+    // The callable ID wins over an alias of the same name.
+    expect(resolveRequestedModelName(withAliases, "owner/pool.v2")).toMatchObject({
+      target: { id: "pool-id" },
+    });
+    expect(resolveRequestedModelName(withAliases, "ghost")).toEqual({ kind: "not_found" });
+    // Also in the :external form, the callable ID wins.
+    expect(resolveRequestedModelName(withAliases, "owner/pool.v2:external")).toMatchObject({
+      target: { id: "pool-id" },
+      externalRequested: true,
+    });
+  });
+
   it.each([
     ["an unknown variant", "owner/pool.v2:fallback"],
     ["an uppercase variant", "owner/pool.v2:External"],

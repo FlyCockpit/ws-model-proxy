@@ -81,6 +81,13 @@ export const REFUSAL_REASONS = [
   // E2E fixes.
   /** An agent deletes only an offline node (people delete any in the browser). */
   "node_online",
+  // Request compatibility.
+  /** An alias named like one of the caller's callable IDs (those always win). */
+  "alias_shadowed",
+  /** At most MODEL_ALIASES_MAX_PER_USER aliases per user. */
+  "alias_limit",
+  /** A key-scoped alias for a pool the key cannot call. */
+  "alias_key_not_allowed",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

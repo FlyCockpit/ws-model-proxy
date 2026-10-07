@@ -62,6 +62,8 @@ const request = {
   promptTokens: 10,
   completionTokens: 20,
   cacheReadTokens: null,
+  usageEstimated: false,
+  compat: null,
   rejection: null,
   errorClass: null,
   upstreamErrorExcerpt: "messages must be a list",

@@ -50,6 +50,9 @@
     "./lib/media-attachment-limits": {
       "default": "./src/lib/media-attachment-limits.ts"
     },
+    "./lib/request-compat": {
+      "default": "./src/lib/request-compat.ts"
+    },
     "./lib/openai-compatible-capabilities": {
       "default": "./src/lib/openai-compatible-capabilities.ts"
     },

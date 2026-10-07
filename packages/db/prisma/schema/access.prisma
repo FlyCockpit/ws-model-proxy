@@ -20,9 +20,11 @@ model ApiKey {
   revokedAt    DateTime?
   expiresAt    DateTime?
 
-  User  User         @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Pools ApiKeyPool[]
+  User    User         @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Pools   ApiKeyPool[]
+  Aliases ModelAlias[]
 
+  @@unique([id, userId])
   @@index([userId, revokedAt])
   @@index([expiresAt])
   @@map("api_key")
@@ -38,6 +40,32 @@ model ApiKeyPool {
   @@id([apiKeyId, poolId])
   @@index([poolId])
   @@map("api_key_pool")
+}
+
+/// A model name a caller's harness hard-codes (`gpt-4o`, `claude-sonnet-4-5`) mapped to one of
+/// the pools the caller may use. Lives in the caller's namespace: for every key of the user, or
+/// for one key (which wins). Resolves only while the pool is callable with the key in use;
+/// callable IDs always win over an alias. Configuration, not access: agents may manage it.
+model ModelAlias {
+  id        String   @id @default(cuid(2))
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+  userId    String
+  /// Null: every key of the user. Set: only this key.
+  apiKeyId  String?
+  /// `apiKeyId ?? ""`, so a name is unique per scope (NULLs are distinct in unique indexes).
+  scopeKey  String   @default("")
+  name      String
+  poolId    String
+
+  User   User    @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ApiKey ApiKey? @relation(fields: [apiKeyId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Pool   Pool    @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([userId, scopeKey, name])
+  @@index([poolId])
+  @@index([apiKeyId])
+  @@map("model_alias")
 }
 
 /// MCP OAuth/PAT grant tombstone (unchanged; not a Better Auth model).

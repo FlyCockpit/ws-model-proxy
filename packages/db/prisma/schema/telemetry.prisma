@@ -78,6 +78,12 @@ model RelayRequest {
   cacheReadTokens         Int?
   cacheWriteTokens        Int?
   usageKnown              Boolean       @default(false)
+  /// Usage counted or estimated by the proxy because the engine reported none.
+  usageEstimated          Boolean       @default(false)
+  /// Request compatibility applied to what was sent: dropped field paths, rewrites, stripped
+  /// headers and whether a learned fix retried it ({dropped, rewrites, headers, retried}).
+  /// Names and counts only, never values.
+  compat                  Json?
   httpStatusCode          Int?
   upstreamStatusCode      Int?
   errorClass              String?

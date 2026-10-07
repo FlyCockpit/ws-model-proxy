@@ -145,6 +145,23 @@ describe("realtime upgrade middleware", () => {
     expect(t.counters.count("server")).toBe(0);
   });
 
+  it("accepts x-api-key and api-key, and refuses two different keys", async () => {
+    const t = deps();
+    const path = "/v1/realtime?intent=transcription&model=owner%2Fasr";
+    const single: Record<string, string>[] = [{ "x-api-key": SECRET }, { "api-key": SECRET }];
+    for (const headers of single)
+      expect(await (await app(t.deps).request(path, upgrade(headers))).text()).toBe("upgraded");
+    const conflicting: Record<string, string>[] = [
+      { Authorization: `Bearer ${SECRET}`, "x-api-key": "wsmp_key_other" },
+      {
+        Authorization: `Bearer ${SECRET}`,
+        "Sec-WebSocket-Protocol": "realtime, openai-insecure-api-key.wsmp_key_other",
+      },
+    ];
+    for (const headers of conflicting)
+      expect((await app(t.deps).request(path, upgrade(headers))).status).toBe(401);
+  });
+
   it("accepts the bearer header or the browser subprotocol key, and holds an admission", async () => {
     const t = deps();
     const path = "/v1/realtime?intent=transcription&model=owner%2Fasr";

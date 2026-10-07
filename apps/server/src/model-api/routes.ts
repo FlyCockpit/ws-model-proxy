@@ -97,6 +97,25 @@ import {
   resolveChatTestRoutingMode,
 } from "./chat-test-routing-mode.js";
 import { responseWithFirstClientByte } from "./client-byte-commit.js";
+import { clientCredential } from "./client-credential.js";
+import { recordLearnedFix, recordLearnedHeader } from "./compat/profile-store.js";
+import type { CompatRefusal } from "./compat/request-policy.js";
+import type { ProxyExtras } from "./compat/runtime-compat.js";
+import {
+  addCompatReport,
+  applyCompatToBuilt,
+  type CompatExtra,
+  type CompatTrace,
+  compatExtrasFor,
+  compatLaunchFor,
+  compatRetryDecision,
+  compatTraceData,
+  launchKeyString,
+  MAX_COMPAT_ERROR_BYTES,
+  newCompatTrace,
+  normalizeNativeResponse,
+  peekStream,
+} from "./compat/send.js";
 import {
   EXTERNAL_MODEL_VARIANT,
   type ExternalEgressConsent,
@@ -222,6 +241,7 @@ import {
   reportedAffinityTokens,
   usageFactsFromProviderUsage,
   usageFactsFromRelayTerminal,
+  withEstimatedUsage,
 } from "./relay-usage-facts.js";
 import { type RelayBodySource } from "./request-body-source.js";
 import { profileSurfaceRequest } from "./request-feature-profiler.js";
@@ -1326,17 +1346,11 @@ function dataPolicyRefusalResponse(family: string): Response {
   });
 }
 
-function bearerToken(request: Request): string | null {
-  const authorization = request.headers.get("authorization");
-  if (!authorization) return null;
-  const match = /^Bearer\s+(.+)$/i.exec(authorization.trim());
-  return match?.[1] ?? null;
-}
-
+/** The caller's API key from Authorization: Bearer, x-api-key or api-key (one key only). */
 export async function authenticateRequest(request: Request): Promise<ApiKeyIdentity | null> {
-  const token = bearerToken(request);
-  if (!token) return null;
-  return authenticateApiKey(token);
+  const credential = clientCredential(request.headers);
+  if (credential.kind !== "key") return null;
+  return authenticateApiKey(credential.key);
 }
 
 function isJsonObject(value: unknown): value is JsonObject {
@@ -2063,6 +2077,37 @@ function targetStreamTerminal(target: ProtocolSurface, chunk: Uint8Array): boole
   return /event: (?:message_stop|error)\r?\n/.test(text);
 }
 
+/**
+ * A request the runtime's compatibility policy refuses (strict unknown field, or a semantic
+ * field the engine rejected): a 400 in the caller's protocol naming the field.
+ */
+function compatRefusalResponse(surface: ProtocolSurface | null, refusal: CompatRefusal): Response {
+  if (surface) {
+    const canonicalError = {
+      code: "invalid_request_error",
+      message: refusal.message,
+      parameter: refusal.path,
+      upstreamStatus: 400,
+    };
+    const metadata = renderProtocolErrorMetadata(surface, canonicalError);
+    return new Response(JSON.stringify(renderProtocolError(surface, canonicalError)), {
+      status: metadata.status,
+      headers: metadata.headers,
+    });
+  }
+  return new Response(
+    JSON.stringify(
+      openAiErrorBody({
+        message: refusal.message,
+        type: "invalid_request_error",
+        param: refusal.path,
+        code: refusal.code,
+      }),
+    ),
+    { status: 400, headers: { "content-type": "application/json; charset=utf-8" } },
+  );
+}
+
 function adapterRequestErrorResponse(surface: ProtocolSurface, error: AdapterError): Response {
   const canonicalError = {
     code: "invalid_request_error",
@@ -2083,20 +2128,23 @@ function renderForExecutionTarget({
   model,
   allowLossyDeveloperRoleCollapse,
   capabilities,
+  extras,
 }: {
   request: CanonicalRequest;
   target: ProtocolSurface;
   model: string;
   allowLossyDeveloperRoleCollapse?: boolean;
   capabilities: OpenAiCompatibleCapabilities | null | undefined;
+  /** A runtime's gates on fields the proxy adds (absent: providers, by capabilities only). */
+  extras?: ProxyExtras;
 }) {
   return renderCanonicalRequest({
     request,
     target,
     model,
     allowLossyDeveloperRoleCollapse,
-    acceptsTopK: executionTargetAcceptsTopK({ capabilityInventory: capabilities }),
-    streamUsage: executionTargetSupportsStreamUsage(capabilities),
+    acceptsTopK: extras?.topK ?? executionTargetAcceptsTopK({ capabilityInventory: capabilities }),
+    streamUsage: executionTargetSupportsStreamUsage(capabilities) && (extras?.streamUsage ?? true),
     reasoning: reasoningControlForSurface(capabilities ?? null, target),
   });
 }
@@ -2361,6 +2409,18 @@ function requesterFromChatTestUser(
   };
 }
 
+/**
+ * Records what request compatibility did to a request (field names, rewrites, stripped
+ * headers, whether a learned fix retried it); nothing when it changed nothing. Best effort.
+ */
+async function writeCompatTrace(relayRequestId: string, trace: CompatTrace): Promise<void> {
+  const data = compatTraceData(trace);
+  if (!data) return;
+  await prisma.relayRequest
+    .updateMany({ where: { id: relayRequestId }, data: { compat: data } })
+    .catch(metadataUpdateError);
+}
+
 async function updateRelayMetadata(relayRequestId: string, update: RelayMetadataUpdate) {
   // The request's completion facts are captured ONCE, here, when its outcome
   // is known: completion time, duration, and the parsed usage counts. A local
@@ -2372,8 +2432,14 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
   // Usage is parsed once from the executor's retained response windows
   // (falling back to CLI-normalized usage): here, or by a caller that also
   // needs it and passes the facts in. Counts only.
-  const usage = update.usage ?? usageFactsFromRelayTerminal(update.terminal);
   const executionInstance = update.execution?.instance ?? update.localExecution?.instance;
+  // Engines that report no usage (some never do; others only when asked) get an estimate,
+  // marked as such and never counted as known usage.
+  const usage = withEstimatedUsage(
+    update.usage ?? usageFactsFromRelayTerminal(update.terminal),
+    update.terminal,
+    update.localExecution?.contextCount?.tokens,
+  );
   const relayData = {
     status: update.status,
     completedAt,
@@ -2384,6 +2450,7 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
     cacheReadTokens: usage.cacheReadTokens,
     cacheWriteTokens: usage.cacheWriteTokens,
     usageKnown: usage.usageKnown,
+    usageEstimated: usage.usageEstimated,
     httpStatusCode:
       update.terminal.httpStatusCode ?? (failure ? relayFailureHttpStatus(failure) : null),
     upstreamStatusCode: update.terminal.upstreamStatusCode,
@@ -3675,6 +3742,23 @@ async function modelListResponse(
           }).granted;
         return externalListed ? [...plain, entry(externalModelId(pool.modelId))] : plain;
       }),
+      // The caller's aliases, listed like the pool they name (hard-coded harness names).
+      ...(targets.aliases ?? []).flatMap((alias) => {
+        const pool = targets.pools.find((candidate) => candidate.id === alias.poolId);
+        // A callable ID always wins over an alias of the same name.
+        if (targets.pools.some((candidate) => candidate.modelId === alias.name)) return [];
+        if (!pool || !servingPoolIds.has(pool.id)) return [];
+        const flags = poolFlagsById.get(pool.id) ?? multimodalFlagsFromCapabilities(null);
+        return [
+          {
+            id: alias.name,
+            object: "model" as const,
+            created: 0,
+            owned_by: pool.ownerUserSlug,
+            ...openAiModelListExtensions(flags),
+          },
+        ];
+      }),
     ],
   };
 }
@@ -3892,12 +3976,52 @@ async function relayDirect({
     });
     return operationFailureResponse(operation, "unknown");
   }
-  const responseIdCapture =
+  // The runtime's request compatibility (the same policy pools apply).
+  const compatLaunch = await compatLaunchFor(selected.instance, selected.model.userId);
+  const compatTrace = newCompatTrace();
+  const preCompatBuilt = builtRequest;
+  let directAttemptCount = 1;
+  const finishDirect = async (failure: ModelApiFailure, response: Response) => {
+    await settleRelayCleanup([
+      () => cliLease.release(),
+      () => globalLease?.release(),
+      () =>
+        capacityLease?.state === "ADMITTED"
+          ? capacityRuntime?.release(capacityLease.lease)
+          : undefined,
+      () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
+      () => operation.dispose?.(),
+    ]);
+    await writeCompatTrace(relayRequestId, compatTrace);
+    await failRelayMetadata({
+      relayRequestId,
+      startedAt,
+      failure,
+      selectedRuntimeModelId: selected.id,
+      attemptCount: directAttemptCount,
+    });
+    return response;
+  };
+  const directRefusal = (refusal: CompatRefusal) =>
+    finishDirect(
+      "unsupported_capability",
+      compatRefusalResponse(requestedSurfaceForOperation(operation), refusal),
+    );
+  const applied = applyCompatToBuilt({
+    launch: compatLaunch,
+    family: operation.family,
+    built: builtRequest,
+    clientHeaders: request.headers,
+  });
+  if (!applied.ok) return directRefusal(applied.refusal);
+  builtRequest = applied.built;
+  addCompatReport(compatTrace, applied.report);
+  let responseIdCapture =
     operation.responseStickiness && operation.family === "responses"
       ? createResponseIdCapture()
       : null;
   let attempt: ReturnType<typeof startRelayAttempt> | null = null;
-  const localExecution: LocalExecutionTelemetry = {
+  let localExecution: LocalExecutionTelemetry = {
     selectedExecutionTargetId: selected.target.id,
     nativeSurface: telemetrySurfaceForOperation(operation),
     requestedSurface: telemetrySurfaceForOperation(operation),
@@ -3913,25 +4037,24 @@ async function relayDirect({
           }
         : undefined,
   };
-  try {
-    await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
-    attempt = await startAuthorizedLocalRelayAttempt(localSendBinding(selected, requester), {
-      requestId: localExecution.localAttemptId,
+  const sendDirectAttempt = (execution: LocalExecutionTelemetry, built: BuiltRelayRequest) =>
+    startAuthorizedLocalRelayAttempt(localSendBinding(selected, requester), {
+      requestId: execution.localAttemptId,
       manager,
       nodeId: selected.instance.nodeId,
       handle: selected.instance.handle,
       family: operation.family,
       method: operation.method,
       path: operation.path,
-      headers: builtRequest.headers,
-      ...relayAttemptBody(builtRequest.body),
+      headers: built.headers,
+      ...relayAttemptBody(built.body),
       timeoutMs: MODEL_API_RELAY_TIMEOUT_MS,
       abortSignal:
         capacityLease?.state === "ADMITTED"
           ? (capacityLease.lease.signal ?? request.signal)
           : request.signal,
       onResponseBodyChunk: responseIdCapture
-        ? (chunk) => responseIdCapture.push(chunk, operation.stream)
+        ? (chunk) => responseIdCapture?.push(chunk, operation.stream)
         : undefined,
       ...chatCountFirstRelayFields({
         family: operation.family,
@@ -3947,6 +4070,9 @@ async function relayDirect({
         operation,
       }),
     });
+  try {
+    await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
+    attempt = await sendDirectAttempt(localExecution, builtRequest);
   } catch (error) {
     const failure = error instanceof LocalSendRefused ? error.failure : "unknown";
     attempt?.cancel(failure);
@@ -3967,7 +4093,7 @@ async function relayDirect({
       startedAt,
       failure,
       selectedRuntimeModelId: selected.id,
-      attemptCount: 1,
+      attemptCount: directAttemptCount,
       localExecution,
       userId: requester.userId,
       localTerminal: rejectedRelayTerminal(failure),
@@ -3977,7 +4103,76 @@ async function relayDirect({
   if (!attempt) throw new Error("local relay attempt was not initialized");
 
   try {
-    const started = await attempt.started;
+    let started = await attempt.started;
+    if (
+      (started.status === 400 || started.status === 422) &&
+      builtRequest.body instanceof Uint8Array
+    ) {
+      const peeked = await peekStream(started.body, MAX_COMPAT_ERROR_BYTES);
+      const decision = !peeked.complete
+        ? null
+        : compatRetryDecision({
+            launch: compatLaunch,
+            family: operation.family,
+            status: started.status,
+            errorText: decodeUtf8Bytes(peeked.prefix),
+            sentBody: builtRequest.body,
+            sentHeaders: builtRequest.headers,
+          });
+      if (decision) {
+        const firstTerminal = await attempt.terminal;
+        await recordLocalTerminal(
+          relayRequestId,
+          requester.userId,
+          localExecution,
+          firstTerminal,
+        ).catch(metadataUpdateError);
+      }
+      if (decision?.kind === "refuse") return await directRefusal(decision.refusal);
+      if (decision) {
+        const extra: CompatExtra = { fixes: [], stripHeaders: [] };
+        if (decision.kind === "learn") extra.fixes.push(decision.fix);
+        else extra.stripHeaders.push(decision.name);
+        compatTrace.retried = true;
+        const reapplied = applyCompatToBuilt({
+          launch: compatLaunch,
+          family: operation.family,
+          built: preCompatBuilt,
+          clientHeaders: request.headers,
+          extra,
+        });
+        if (!reapplied.ok) return await directRefusal(reapplied.refusal);
+        builtRequest = reapplied.built;
+        addCompatReport(compatTrace, reapplied.report);
+        directAttemptCount += 1;
+        // The first attempt's error must not reach the stored-response capture.
+        responseIdCapture =
+          operation.responseStickiness && operation.family === "responses"
+            ? createResponseIdCapture()
+            : null;
+        localExecution = { ...localExecution, localAttemptId: crypto.randomUUID() };
+        try {
+          await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
+          attempt = await sendDirectAttempt(localExecution, builtRequest);
+        } catch (error) {
+          const failure = error instanceof LocalSendRefused ? error.failure : "unknown";
+          await recordLocalTerminal(
+            relayRequestId,
+            requester.userId,
+            localExecution,
+            rejectedRelayTerminal(failure),
+          ).catch(metadataUpdateError);
+          return await finishDirect(failure, operationFailureResponse(operation, failure));
+        }
+        started = await attempt.started;
+        // Remembered for the launch only once the fix worked.
+        if (started.status >= 200 && started.status < 300) {
+          if (decision.kind === "learn")
+            await recordLearnedFix(compatLaunch.key, decision.endpoint, decision.fix);
+          else if (decision.remember) await recordLearnedHeader(compatLaunch.key, decision.name);
+        }
+      } else started = { ...started, body: peeked.body };
+    }
     let startedBody = started.body;
     if (started.status >= 400 && started.status < 500) {
       const errorBytes = await readStreamBytes(startedBody);
@@ -3995,7 +4190,7 @@ async function relayDirect({
           startedAt,
           failure: "request_too_large",
           selectedRuntimeModelId: selected.id,
-          attemptCount: 1,
+          attemptCount: directAttemptCount,
           localExecution,
           userId: requester.userId,
           localTerminal: rejectedRelayTerminal(),
@@ -4031,12 +4226,26 @@ async function relayDirect({
             })
         : null,
     });
-    const responseBody = responseBodyForOperation({
+    const forwardedBody = responseBodyForOperation({
       body: startedBody,
       headers: started.headers,
       terminal: attempt.terminal,
       operation,
     });
+    const responseBody =
+      started.status >= 200 && started.status < 300
+        ? normalizeNativeResponse({
+            body: forwardedBody,
+            contentType: started.headers.get("content-type"),
+            family: operation.family,
+            launch: compatLaunch,
+            estimate:
+              operation.contextCount !== undefined
+                ? { inputTokens: operation.contextCount.tokens }
+                : null,
+          })
+        : forwardedBody;
+    void writeCompatTrace(relayRequestId, compatTrace);
     const response = responseWithFirstClientByte(
       new Response(
         persistBinding ? holdEofUntilDurable(responseBody, persistBinding) : responseBody,
@@ -4083,7 +4292,7 @@ async function relayDirect({
             status: terminalStatus(terminal),
             startedAt,
             terminal,
-            attemptCount: 1,
+            attemptCount: directAttemptCount,
             localExecution,
             userId: requester.userId,
           }).catch(metadataUpdateError),
@@ -4123,7 +4332,7 @@ async function relayDirect({
       startedAt,
       terminal,
       fallbackFailure: terminal.failure ?? "unknown",
-      attemptCount: 1,
+      attemptCount: directAttemptCount,
       localExecution,
       userId: requester.userId,
     });
@@ -5067,6 +5276,19 @@ async function relayPool({
   // Estimates rank at `estimateFitIds`. Each selected engine counts its own
   // input after admission; token counts never filter unrelated tokenizers.
   const contextEligibleMembers = members;
+  // Each member's request compatibility (its runtime launch's setting, description and what
+  // was learned), read once per request; fixes learned during this request are added here.
+  const compatByMember = new Map(
+    await Promise.all(
+      members.map(
+        async (member) =>
+          [member.id, await compatLaunchFor(member.instance, member.model.userId)] as const,
+      ),
+    ),
+  );
+  const compatExtraByLaunch = new Map<string, CompatExtra>();
+  const compatTrace = newCompatTrace();
+  let compatRetried = false;
   let canonicalAdaptationRequest: ReturnType<typeof parseCanonicalRequest> | null = null;
   // Why the strict adapter refused this request (it names the feature): the answer when only
   // adapted members could have served it.
@@ -5124,6 +5346,7 @@ async function relayPool({
         model: member.model.upstreamModelId,
         allowLossyDeveloperRoleCollapse: operation.adaptation?.allowLossyDeveloperRoleCollapse,
         capabilities: effectivePoolMemberCapabilities(member),
+        extras: compatExtrasFor(compatByMember.get(member.id)),
       });
       return true;
     } catch (error) {
@@ -6124,6 +6347,7 @@ async function relayPool({
           model: candidate.upstreamModelId,
           allowLossyDeveloperRoleCollapse: operation.adaptation.allowLossyDeveloperRoleCollapse,
           capabilities: effectivePoolMemberCapabilities(member),
+          extras: compatExtrasFor(compatByMember.get(member.id)),
         });
         if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
         const adaptedHeaders = new Headers(builtRequest.headers);
@@ -6179,11 +6403,48 @@ async function relayPool({
       await releaseCapacityAttempt();
       continue;
     }
-    const responseIdCapture =
+    // The runtime's request compatibility, on the exact body this member receives (native or
+    // adapted). The pre-compat request is kept: a learned fix re-applies to it.
+    const compatLaunch = compatByMember.get(member.id);
+    const compatFamily = adaptedSource
+      ? nativeRouteForSurface(adaptedSource).family
+      : operation.family;
+    const preCompatBuilt = builtRequest;
+    if (compatLaunch) {
+      const applied = applyCompatToBuilt({
+        launch: compatLaunch,
+        family: compatFamily,
+        built: builtRequest,
+        clientHeaders: request.headers,
+        extra: compatExtraByLaunch.get(launchKeyString(compatLaunch)),
+      });
+      if (!applied.ok) {
+        await releaseUnusedTrial();
+        await settleRelayCleanup([
+          () => cliLease.release(),
+          () => globalLease?.release(),
+          () =>
+            capacityLease?.state === "ADMITTED"
+              ? capacityRuntime?.release(capacityLease.lease)
+              : undefined,
+          () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
+          () => operation.dispose?.(),
+        ]);
+        await failPoolRelayMetadata({
+          relayRequestId,
+          startedAt,
+          failure: "unsupported_capability",
+        }).catch(metadataUpdateError);
+        return compatRefusalResponse(requestedSurface, applied.refusal);
+      }
+      builtRequest = applied.built;
+      addCompatReport(compatTrace, applied.report);
+    }
+    let responseIdCapture =
       operation.responseStickiness && operation.family === "responses"
         ? createResponseIdCapture()
         : null;
-    const attemptTimeoutMs = remainingRelayBudgetMs(relayDeadlineMs);
+    let attemptTimeoutMs = remainingRelayBudgetMs(relayDeadlineMs);
     if (attemptTimeoutMs === 0) {
       await releaseUnusedTrial();
       await settleRelayCleanup([
@@ -6210,7 +6471,7 @@ async function relayPool({
     // When this attempt was handed to the relay: warm-prefix age for eviction
     // evidence is judged here, not at request arrival or after a long stream.
     let attemptDispatchedAt = new Date();
-    const localExecution: LocalExecutionTelemetry = {
+    let localExecution: LocalExecutionTelemetry = {
       selectedExecutionTargetId: member.target.id,
       selectedPoolMemberId: member.memberId,
       instance: member.instance,
@@ -6239,11 +6500,8 @@ async function relayPool({
     };
     const attemptLeaseSignal =
       capacityLease?.state === "ADMITTED" ? capacityLease.lease.signal : undefined;
-    try {
-      await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
-      attemptDispatchedAt = new Date();
-      attemptedLocalMembers.add(member.id);
-      attempt = await startAuthorizedLocalRelayAttempt(
+    const sendAttempt = (execution: LocalExecutionTelemetry, built: BuiltRelayRequest) =>
+      startAuthorizedLocalRelayAttempt(
         localSendBinding(servedRoute(member), requester, {
           id: target.id,
           ownerUserId: target.ownerUserId,
@@ -6256,15 +6514,15 @@ async function relayPool({
               : undefined,
         }),
         {
-          requestId: localExecution.localAttemptId,
+          requestId: execution.localAttemptId,
           manager,
           nodeId: candidate.nodeId,
           handle: member.instance.handle,
           family: adaptedSource ? nativeRouteForSurface(adaptedSource).family : operation.family,
           method: operation.method,
           path: adaptedSource ? nativeRouteForSurface(adaptedSource).path : operation.path,
-          headers: builtRequest.headers,
-          ...relayAttemptBody(builtRequest.body),
+          headers: built.headers,
+          ...relayAttemptBody(built.body),
           timeoutMs: attemptTimeoutMs,
           abortSignal:
             capacityLease?.state === "ADMITTED"
@@ -6288,6 +6546,11 @@ async function relayPool({
           }),
         },
       );
+    try {
+      await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
+      attemptDispatchedAt = new Date();
+      attemptedLocalMembers.add(member.id);
+      attempt = await sendAttempt(localExecution, builtRequest);
     } catch (error) {
       attempt?.cancel("unknown");
       // Nothing was sent unless the attempt started: the trial goes back.
@@ -6329,7 +6592,116 @@ async function relayPool({
     if (!attempt) throw new Error("pool relay attempt was not initialized");
 
     try {
-      const started = await attempt.started;
+      let started = await attempt.started;
+      // An engine 400 about a field or header this proxy can fix: send once more on the same
+      // member with the fix, before any byte reached the client (the fix is remembered for the
+      // launch only once that retry succeeded); a semantic field gets a clear refusal instead.
+      if (
+        compatLaunch &&
+        !compatRetried &&
+        (started.status === 400 || started.status === 422) &&
+        builtRequest.body instanceof Uint8Array
+      ) {
+        const peeked = await peekStream(started.body, MAX_COMPAT_ERROR_BYTES);
+        const retryBudgetMs = remainingRelayBudgetMs(relayDeadlineMs);
+        const decided = !peeked.complete
+          ? null
+          : compatRetryDecision({
+              launch: compatLaunch,
+              family: compatFamily,
+              status: started.status,
+              errorText: decodeUtf8Bytes(peeked.prefix),
+              sentBody: builtRequest.body,
+              sentHeaders: builtRequest.headers,
+            });
+        // No time left for a second send: the engine's answer passes on.
+        const decision = decided?.kind !== "refuse" && retryBudgetMs === 0 ? null : decided;
+        if (decision) {
+          const firstTerminal = await attempt.terminal;
+          await recordLocalTerminal(
+            relayRequestId,
+            requester.userId,
+            localExecution,
+            firstTerminal,
+          ).catch(metadataUpdateError);
+          cumulativeRequestBytes += firstTerminal.requestBytes;
+          cumulativeResponseBytes += firstTerminal.responseBytes;
+        }
+        const finishCompat = async (failure: ModelApiFailure, response: Response) => {
+          await releaseUnusedTrial();
+          await settleRelayCleanup([
+            () => cliLease.release(),
+            () => globalLease?.release(),
+            () =>
+              capacityLease?.state === "ADMITTED"
+                ? capacityRuntime?.release(capacityLease.lease)
+                : undefined,
+            () => operation.dispose?.(),
+          ]);
+          await writeCompatTrace(relayRequestId, compatTrace);
+          await failPoolRelayMetadata({
+            relayRequestId,
+            startedAt,
+            failure,
+            attemptCount,
+            requestBytes: cumulativeRequestBytes,
+            responseBytes: cumulativeResponseBytes,
+          }).catch(metadataUpdateError);
+          return response;
+        };
+        const refuseCompat = (refusal: CompatRefusal) =>
+          finishCompat("unsupported_capability", compatRefusalResponse(requestedSurface, refusal));
+        if (decision?.kind === "refuse") return await refuseCompat(decision.refusal);
+        if (decision) {
+          const launchKey = launchKeyString(compatLaunch);
+          const extra = compatExtraByLaunch.get(launchKey) ?? { fixes: [], stripHeaders: [] };
+          if (decision.kind === "learn") extra.fixes.push(decision.fix);
+          else extra.stripHeaders.push(decision.name);
+          compatExtraByLaunch.set(launchKey, extra);
+          compatRetried = true;
+          compatTrace.retried = true;
+          const reapplied = applyCompatToBuilt({
+            launch: compatLaunch,
+            family: compatFamily,
+            built: preCompatBuilt,
+            clientHeaders: request.headers,
+            extra,
+          });
+          if (!reapplied.ok) return await refuseCompat(reapplied.refusal);
+          builtRequest = reapplied.built;
+          addCompatReport(compatTrace, reapplied.report);
+          attemptCount += 1;
+          attemptTimeoutMs = retryBudgetMs;
+          // The first attempt's error must not reach the stored-response capture.
+          responseIdCapture =
+            operation.responseStickiness && operation.family === "responses"
+              ? createResponseIdCapture()
+              : null;
+          localExecution = { ...localExecution, localAttemptId: crypto.randomUUID() };
+          try {
+            await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
+            attemptDispatchedAt = new Date();
+            attempt = await sendAttempt(localExecution, builtRequest);
+          } catch (error) {
+            const failure = error instanceof LocalSendRefused ? error.failure : "unknown";
+            await recordLocalTerminal(
+              relayRequestId,
+              requester.userId,
+              localExecution,
+              rejectedRelayTerminal(failure),
+            ).catch(metadataUpdateError);
+            if (error instanceof LocalSendRefused && error.denial !== "MEMBER_UNAVAILABLE")
+              externalAttempt.accessLost = true;
+            return await finishCompat(failure, operationFailureResponse(operation, failure));
+          }
+          started = await attempt.started;
+          if (started.status >= 200 && started.status < 300) {
+            if (decision.kind === "learn")
+              await recordLearnedFix(compatLaunch.key, decision.endpoint, decision.fix);
+            else if (decision.remember) await recordLearnedHeader(compatLaunch.key, decision.name);
+          }
+        } else started = { ...started, body: peeked.body };
+      }
       if (started.status >= 500 && shouldRetryRelayOperation(operation, "precommit_5xx")) {
         // What the runtime said, for the request row if no other member serves it.
         lastUpstreamErrorExcerpt =
@@ -6604,6 +6976,17 @@ async function relayPool({
               terminal: attempt.terminal,
               operation,
             });
+      if (!adaptedSource && compatLaunch && !nonSuccess)
+        responseBody = normalizeNativeResponse({
+          body: responseBody,
+          contentType: started.headers.get("content-type"),
+          family: operation.family,
+          launch: compatLaunch,
+          estimate:
+            operation.contextCount !== undefined
+              ? { inputTokens: operation.contextCount.tokens }
+              : null,
+        });
       if (canonicalNonSuccess) {
         responseHeaders = adaptedProviderResponseHeaders(
           adaptedSource ?? requestedSurface ?? "openai-responses",
@@ -6758,6 +7141,7 @@ async function relayPool({
               })
           : null,
       });
+      void writeCompatTrace(relayRequestId, compatTrace);
       const response = responseWithFirstClientByte(
         new Response(
           persistBinding ? holdEofUntilDurable(responseBody, persistBinding) : responseBody,
@@ -7055,6 +7439,7 @@ async function relayPool({
         : undefined,
     () => operation.dispose?.(),
   ]);
+  await writeCompatTrace(relayRequestId, compatTrace);
   await failPoolRelayMetadata({
     relayRequestId,
     startedAt,
@@ -7893,10 +8278,7 @@ async function relayPreparedModeledRequest({
 }: {
   request: Request;
   requester: RelayRequester;
-  targets: {
-    tests: TestTarget[];
-    pools: CallablePool[];
-  };
+  targets: CallableTargets;
   prepared: PreparedModeledRequest;
   operation: Omit<RelayOperation, "stream" | "buildRequest">;
   capacityRuntime?: CapacityAdmissionRuntime;

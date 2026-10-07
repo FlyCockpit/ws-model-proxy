@@ -23,6 +23,7 @@ import {
 import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
 import { applyJsonPatch, jsonObject } from "../lib/registry-view";
 import type { Tx } from "../lib/runtime-store";
+import { modelAliasesRouter } from "./aliases";
 
 type AdvancedPatch = z.infer<typeof poolAdvancedPatchSchema>;
 type RoutingRules = z.infer<typeof routingRulesSchema>;
@@ -492,6 +493,7 @@ function rethrowSlugTaken(error: unknown): never {
 }
 
 export const poolsRouter = {
+  aliases: modelAliasesRouter,
   list: contractProcedure(c.list).handler(async ({ context }) => {
     const userId = userIdOf(context);
     const [pools, shares] = await Promise.all([
