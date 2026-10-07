@@ -1129,5 +1129,76 @@
       }
     },
     "answerInTerminals": "Answer it on the Terminals page"
+  },
+  "overview": {
+    "range": "Time range",
+    "rangeValue": {
+      "24h": "24 h",
+      "7d": "7 days"
+    },
+    "loadFailed": "The overview could not be loaded.",
+    "start": {
+      "title": "Getting started",
+      "progress": "{{done}} of {{total}} done",
+      "dismiss": "Dismiss",
+      "stepDone": "(done)",
+      "step": {
+        "node": "Add a node",
+        "runtime": "Create a runtime",
+        "pool": "Create a pool",
+        "agent": "Connect an agent",
+        "apiKey": "Create an API key"
+      }
+    },
+    "needsYou": {
+      "title": "Needs you",
+      "description": "Steps, restarts and agent commands waiting for a person.",
+      "loadFailed": "What needs you could not be loaded.",
+      "queued": "Queued",
+      "queuedCount_one": "{{count}} agent command waits for your approval",
+      "queuedCount_other": "{{count}} agent commands wait for your approval",
+      "more_one": "And {{count}} more.",
+      "more_other": "And {{count}} more.",
+      "need": {
+        "STEP": "Step",
+        "RESTART": "Restart",
+        "FORGET": "Forget"
+      }
+    },
+    "kpi": {
+      "title": "Traffic",
+      "description": {
+        "24h": "Your pools and runtimes, and your own requests, in the last 24 hours. Agent tests are left out.",
+        "7d": "Your pools and runtimes, and your own requests, in the last 7 days. Agent tests are left out."
+      },
+      "none": "—",
+      "requests": "Requests",
+      "errors": "Errors",
+      "latency": "Latency (p95)",
+      "ttft": "Time to first token (p95)",
+      "queueWait": "Queue wait (p95)",
+      "cloudShare": "Served by cloud"
+    },
+    "nodes": {
+      "title": "Nodes",
+      "online": "{{online}} of {{total}} online",
+      "empty": "No nodes yet. A node runs your models.",
+      "add": "Add a node"
+    },
+    "pools": {
+      "title": "Your pools",
+      "all": "All pools",
+      "empty": "No pools yet. A pool gives your models one ID to call.",
+      "sparkline": {
+        "24h_one": "{{count}} request in the last 24 hours, per hour",
+        "24h_other": "{{count}} requests in the last 24 hours, per hour",
+        "7d_one": "{{count}} request in the last 7 days, per 6 hours",
+        "7d_other": "{{count}} requests in the last 7 days, per 6 hours"
+      },
+      "requests_one": "{{value}} request",
+      "requests_other": "{{value}} requests",
+      "errors_one": "{{value}} error",
+      "errors_other": "{{value}} errors"
+    }
   }
 }

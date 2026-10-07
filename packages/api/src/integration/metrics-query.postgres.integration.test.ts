@@ -69,7 +69,7 @@ const person = (userId: string): CallerAuth => ({
   csrfVerified: true,
 });
 
-// Two days ago on the hour: inside every family's retention.
+// Two days ago on the hour: inside every family's retention, outside the Overview's 24h.
 const T0 = new Date(Math.floor(Date.now() / 3_600_000) * 3_600_000 - 48 * 3_600_000);
 const at = (minutes: number) => new Date(T0.getTime() + minutes * 60_000);
 const WINDOW = { from: T0.toISOString(), to: at(10).toISOString() };
@@ -451,6 +451,64 @@ integration("metrics_query on PostgreSQL", () => {
         step: "1m",
       }),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("sums the Overview over the owner's resources and their own requests, without agent tests", async () => {
+    const recent = new Date(Math.floor((Date.now() - 30 * 60_000) / 60_000) * 60_000);
+    const base = {
+      bucketStart: recent,
+      poolId: ids.pool,
+      versionId: ids.version,
+      nodeId: ids.node,
+      instanceId: ids.instance,
+      runtimeModelId: ids.runtimeModel,
+    };
+    await fixtures.usageRollupMinute.createMany({
+      data: [
+        {
+          ...base,
+          ownerUserId: OWNER,
+          requesterUserId: GRANTEE,
+          source: "API_KEY",
+          requests: 6,
+          errors: 2,
+          cloudRequests: 3,
+          latencyHistogram: histogramWith(900),
+        },
+        { ...base, ownerUserId: OWNER, requesterUserId: OWNER, source: "AGENT_TEST", requests: 40 },
+        // The grantee's own request to someone else's pool counts on their Overview only.
+        {
+          ownerUserId: STRANGER,
+          requesterUserId: GRANTEE,
+          bucketStart: recent,
+          poolId: "theirs",
+          source: "TEST",
+          requests: 1,
+        },
+      ],
+    });
+    const summary = await client(person(OWNER)).activity.overview.summary({ range: "24h" });
+    expect(summary.kpis).toMatchObject({ requests: 6, errors: 2, cloudShare: 0.5 });
+    expect(summary.kpis.p95LatencyMs).toBeGreaterThan(750);
+    expect(summary.nodes).toEqual([
+      { id: ids.node, slug: `${RUN}-box`, online: true, trust: "FULL" },
+    ]);
+    const [pool] = summary.pools;
+    expect(pool).toMatchObject({
+      id: ids.pool,
+      callableId: `${OWNER}/chat`,
+      requests: 6,
+      errors: 2,
+    });
+    expect(pool?.sparkline).toHaveLength(24);
+    expect(pool?.sparkline.reduce((sum, value) => sum + value, 0)).toBe(6);
+    expect(summary.onboarding.steps).toMatchObject({ node: true, runtime: true, pool: true });
+
+    const grantee = await client(person(GRANTEE)).activity.overview.summary({ range: "24h" });
+    // Their 6 requests to the owner's pool and 1 to another pool.
+    expect(grantee.kpis.requests).toBe(7);
+    expect(grantee.pools).toEqual([]);
+    expect(grantee.nodes).toEqual([]);
   });
 
   it("answers NOT_FOUND to anyone else", async () => {

@@ -1129,5 +1129,76 @@
       }
     },
     "answerInTerminals": "Respóndelo en la página Terminales"
+  },
+  "overview": {
+    "range": "Periodo",
+    "rangeValue": {
+      "24h": "24 h",
+      "7d": "7 días"
+    },
+    "loadFailed": "No se pudo cargar el resumen.",
+    "start": {
+      "title": "Primeros pasos",
+      "progress": "{{done}} de {{total}} listos",
+      "dismiss": "Descartar",
+      "stepDone": "(listo)",
+      "step": {
+        "node": "Agrega un nodo",
+        "runtime": "Crea un runtime",
+        "pool": "Crea un pool",
+        "agent": "Conecta un agente",
+        "apiKey": "Crea una clave de API"
+      }
+    },
+    "needsYou": {
+      "title": "Te necesita",
+      "description": "Pasos, reinicios y comandos de agentes que esperan a una persona.",
+      "loadFailed": "No se pudo cargar lo que te necesita.",
+      "queued": "En cola",
+      "queuedCount_one": "{{count}} comando de agente espera tu aprobación",
+      "queuedCount_other": "{{count}} comandos de agentes esperan tu aprobación",
+      "more_one": "Y {{count}} más.",
+      "more_other": "Y {{count}} más.",
+      "need": {
+        "STEP": "Paso",
+        "RESTART": "Reinicio",
+        "FORGET": "Olvidar"
+      }
+    },
+    "kpi": {
+      "title": "Tráfico",
+      "description": {
+        "24h": "Tus pools y runtimes, y tus propias solicitudes, en las últimas 24 horas. Sin pruebas de agentes.",
+        "7d": "Tus pools y runtimes, y tus propias solicitudes, en los últimos 7 días. Sin pruebas de agentes."
+      },
+      "none": "—",
+      "requests": "Solicitudes",
+      "errors": "Errores",
+      "latency": "Latencia (p95)",
+      "ttft": "Tiempo al primer token (p95)",
+      "queueWait": "Espera en cola (p95)",
+      "cloudShare": "Atendido en la nube"
+    },
+    "nodes": {
+      "title": "Nodos",
+      "online": "{{online}} de {{total}} en línea",
+      "empty": "Aún no hay nodos. Un nodo ejecuta tus modelos.",
+      "add": "Agregar un nodo"
+    },
+    "pools": {
+      "title": "Tus pools",
+      "all": "Todos los pools",
+      "empty": "Aún no hay pools. Un pool le da a tus modelos un ID para llamarlos.",
+      "sparkline": {
+        "24h_one": "{{count}} solicitud en las últimas 24 horas, por hora",
+        "24h_other": "{{count}} solicitudes en las últimas 24 horas, por hora",
+        "7d_one": "{{count}} solicitud en los últimos 7 días, cada 6 horas",
+        "7d_other": "{{count}} solicitudes en los últimos 7 días, cada 6 horas"
+      },
+      "requests_one": "{{value}} solicitud",
+      "requests_other": "{{value}} solicitudes",
+      "errors_one": "{{value}} error",
+      "errors_other": "{{value}} errores"
+    }
   }
 }
