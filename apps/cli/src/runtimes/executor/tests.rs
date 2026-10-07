@@ -249,6 +249,7 @@ fn commands_see_only_the_ranks_gpus() {
     assert_eq!(
         env,
         vec![
+            ("CUDA_DEVICE_ORDER".to_string(), "PCI_BUS_ID".to_string()),
             ("CUDA_VISIBLE_DEVICES".to_string(), "0,3".to_string()),
             ("HIP_VISIBLE_DEVICES".to_string(), "0,3".to_string()),
         ]

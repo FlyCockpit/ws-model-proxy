@@ -1136,12 +1136,14 @@ fn owned_units(job: &Job) -> [String; 3] {
     ]
 }
 
-/// The environment every runtime command gets on top of the scrubbed
-/// parent environment: the job marker and the definition's node secrets.
-/// Errors name a missing secret, never a value.
 /// The variables that limit a command to the rank's GPUs (NVIDIA CUDA, AMD ROCm/HIP).
 pub const GPU_VISIBILITY_ENV: [&str; 2] = ["CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"];
 
+/// The environment every runtime command gets on top of the scrubbed
+/// parent environment: the definition's node secrets and, on a placed rank,
+/// its GPUs. CUDA numbers devices fastest-first by default; `PCI_BUS_ID`
+/// makes its N the `nvidia-smi` index N that `nvidia:N` names.
+/// Errors name a missing secret, never a value.
 pub fn command_env(job: &Job) -> Result<Vec<(String, String)>> {
     let (mut found, missing) = crate::secrets::values(&job.secrets);
     if let Some(name) = missing.first() {
@@ -1150,6 +1152,7 @@ pub fn command_env(job: &Job) -> Result<Vec<(String, String)>> {
         });
     }
     if let Some(ids) = &job.gpu_ids {
+        found.push(("CUDA_DEVICE_ORDER".to_string(), "PCI_BUS_ID".to_string()));
         for name in GPU_VISIBILITY_ENV {
             found.push((name.to_string(), ids.clone()));
         }

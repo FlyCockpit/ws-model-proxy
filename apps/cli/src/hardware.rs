@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::protocol::frames::{GpuVendorWire, NodeGpuInfo, NodeKind};
+use crate::protocol::frames::{GpuVendorWire, NodeGpuInfo, NodeGpuMetrics, NodeKind};
 use crate::telemetry::GpuRow;
 
 const TOOL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -69,6 +69,9 @@ pub struct AmdGpu {
     pub pci_id: Option<String>,
     pub vram_bytes: Option<u64>,
     pub gtt_bytes: Option<u64>,
+    /// `mem_info_vram_used` / `mem_info_gtt_used` when read (node.metrics).
+    pub vram_used_bytes: Option<u64>,
+    pub gtt_used_bytes: Option<u64>,
     pub gfx_target: Option<String>,
     pub name: Option<String>,
 }
@@ -402,6 +405,8 @@ pub fn read_amd_sysfs(root: &Path) -> Vec<AmdGpu> {
             pci_id,
             vram_bytes: sysfs_number(&device.join("mem_info_vram_total")),
             gtt_bytes: sysfs_number(&device.join("mem_info_gtt_total")),
+            vram_used_bytes: sysfs_number(&device.join("mem_info_vram_used")),
+            gtt_used_bytes: sysfs_number(&device.join("mem_info_gtt_used")),
             kfd_node: None,
             gfx_target: None,
             name: None,
@@ -515,6 +520,31 @@ fn amd_infos<'a>(
         })
     })
     .collect()
+}
+
+/// `node.metrics` rows for AMD GPUs: memory in use from sysfs, indexed like
+/// [`amd_infos`] (HIP ordinals, an integrated GPU beside a discrete one left
+/// out). Metrics rows carry no vendor, so the caller sends these only when
+/// no NVIDIA GPU answered.
+pub fn amd_metrics(gpus: &[AmdGpu]) -> Vec<NodeGpuMetrics> {
+    let any_discrete = gpus.iter().any(|gpu| !gpu.is_apu());
+    gpus.iter()
+        .enumerate()
+        .filter(|(_, gpu)| !(any_discrete && gpu.is_apu()))
+        .filter_map(|(index, gpu)| {
+            Some(NodeGpuMetrics {
+                index: u8::try_from(index).ok()?,
+                vram_used_mib: gpu.vram_used_bytes.map(mib),
+                vram_total_mib: gpu.vram_bytes.map(mib),
+                gtt_used_mib: gpu.gtt_used_bytes.map(mib),
+                utilization_percent: None,
+                temperature_c: None,
+                power_w: None,
+                sm_clock_mhz: None,
+            })
+        })
+        .take(crate::protocol::NODE_GPU_MAX)
+        .collect()
 }
 
 fn describe(gpu: &AmdGpu) -> String {
@@ -893,6 +923,8 @@ mod tests {
                 pci_id: Some("1002:1586".into()),
                 vram_bytes: None,
                 gtt_bytes: None,
+                vram_used_bytes: None,
+                gtt_used_bytes: None,
                 gfx_target: None,
                 name: None,
             }],
@@ -924,6 +956,8 @@ mod tests {
             pci_id: Some(id.into()),
             vram_bytes: Some(vram_gib * 1024 * MIB),
             gtt_bytes: Some(32 * 1024 * MIB),
+            vram_used_bytes: Some(MIB),
+            gtt_used_bytes: None,
             gfx_target: Some(gfx.into()),
             name: None,
         };
@@ -939,6 +973,16 @@ mod tests {
         let indexes: Vec<u8> = hardware.gpus.iter().map(|gpu| gpu.index).collect();
         assert_eq!(indexes, vec![0, 2]);
         assert_eq!(hardware.accelerator_memory_mib, Some(49152));
+        let cards = [
+            card(1, "0000:03:00.0", "1002:744c", "gfx1100", 24),
+            card(2, "0000:13:00.0", "1002:164e", "gfx1036", 0),
+            card(3, "0000:2a:00.0", "1002:744c", "gfx1100", 24),
+        ];
+        let metrics = amd_metrics(&cards);
+        let indexes: Vec<u8> = metrics.iter().map(|gpu| gpu.index).collect();
+        assert_eq!(indexes, vec![0, 2]);
+        assert_eq!(metrics[0].vram_used_mib, Some(1));
+        assert_eq!(metrics[0].vram_total_mib, Some(24576));
     }
 
     #[test]
@@ -949,6 +993,11 @@ mod tests {
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].kfd_node, Some(1));
         assert_eq!(gpus[0].gfx_target.as_deref(), Some("gfx1151"));
+        let metrics = amd_metrics(&gpus);
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].index, 0);
+        assert_eq!(metrics[0].vram_used_mib, Some(256));
+        assert_eq!(metrics[0].gtt_used_mib, Some(2048));
     }
 
     #[test]
@@ -959,6 +1008,8 @@ mod tests {
             pci_id: Some("1002:744c".into()),
             vram_bytes: Some(24 * 1024 * MIB),
             gtt_bytes: Some(32 * 1024 * MIB),
+            vram_used_bytes: None,
+            gtt_used_bytes: None,
             gfx_target: Some("gfx1100".into()),
             name: Some("AMD Radeon RX 7900 XTX".into()),
         };

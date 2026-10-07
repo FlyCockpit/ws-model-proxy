@@ -1203,6 +1203,31 @@ fn root_disk() -> Option<NodeDiskMetrics> {
     None
 }
 
+/// `nvidia-smi` rows, else AMD sysfs memory use (metrics rows carry no
+/// vendor, so a mixed node reports its NVIDIA GPUs only).
+fn gpu_metrics(nvidia: Vec<GpuRow>) -> Vec<NodeGpuMetrics> {
+    if nvidia.is_empty() {
+        return crate::hardware::amd_metrics(&crate::hardware::read_amd_sysfs(
+            std::path::Path::new("/"),
+        ));
+    }
+    nvidia
+        .into_iter()
+        .filter_map(|row| {
+            Some(NodeGpuMetrics {
+                index: u8::try_from(row.index).ok()?,
+                vram_used_mib: row.memory_used_mib,
+                vram_total_mib: row.memory_total_mib,
+                gtt_used_mib: None,
+                utilization_percent: row.utilization_percent,
+                temperature_c: row.temperature_c,
+                power_w: row.power_w,
+                sm_clock_mhz: row.sm_clock_mhz,
+            })
+        })
+        .collect()
+}
+
 fn collect_node_metrics(
     cpu: &mut CpuSampler,
     gpu: &mut GpuQuery,
@@ -1236,23 +1261,7 @@ fn collect_node_metrics(
             swap_free_mib: fields.get("SwapFree").copied(),
         }),
         disks: Some(root_disk().into_iter().collect()),
-        gpus: Some(
-            gpu.rows()
-                .into_iter()
-                .filter_map(|row| {
-                    Some(NodeGpuMetrics {
-                        index: u8::try_from(row.index).ok()?,
-                        vram_used_mib: row.memory_used_mib,
-                        vram_total_mib: row.memory_total_mib,
-                        gtt_used_mib: None,
-                        utilization_percent: row.utilization_percent,
-                        temperature_c: row.temperature_c,
-                        power_w: row.power_w,
-                        sm_clock_mhz: row.sm_clock_mhz,
-                    })
-                })
-                .collect(),
-        ),
+        gpus: Some(gpu_metrics(gpu.rows())),
         interfaces: Some(interfaces),
         custom: (!custom.is_empty()).then_some(custom),
         metric_commands: (!statuses.is_empty()).then_some(statuses),
