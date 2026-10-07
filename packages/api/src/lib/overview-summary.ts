@@ -127,7 +127,10 @@ export async function overviewSummary(userId: string, range: OverviewRange, now 
       prisma.runtime.count({ where: { userId } }),
       prisma.pool.count({ where: { userId } }),
       prisma.mcpGrant.count({ where: { userId, revokedAt: null } }),
-      prisma.apiKey.count({ where: { userId, revokedAt: null } }),
+      prisma.apiKey.count({
+        where: { userId, revokedAt: null, OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] },
+      }),
+      prisma.node.count({ where: { userId, connection: "ONLINE" } }),
     ]),
     prisma.$queryRaw<KpiRow[]>`SELECT
         SUM(requests)::float8 AS requests, SUM(errors)::float8 AS errors,
@@ -154,7 +157,7 @@ export async function overviewSummary(userId: string, range: OverviewRange, now 
 
   const kpi = kpiRows[0];
   const requests = num(kpi, "requests");
-  const [nodeCount, runtimeCount, poolCount, agentCount, apiKeyCount] = counts;
+  const [nodeCount, runtimeCount, poolCount, agentCount, apiKeyCount, onlineCount] = counts;
   const steps = {
     node: nodeCount > 0,
     runtime: runtimeCount > 0,
@@ -177,6 +180,8 @@ export async function overviewSummary(userId: string, range: OverviewRange, now 
       online: node.connection === "ONLINE",
       trust: nodeTrustView(node).effective,
     })),
+    nodesTotal: nodeCount,
+    nodesOnline: onlineCount,
     pools: pools.map((pool) => {
       const entry = byPool.get(pool.id);
       return {

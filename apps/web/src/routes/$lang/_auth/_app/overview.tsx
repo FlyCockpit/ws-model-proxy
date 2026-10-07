@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
@@ -41,6 +41,8 @@ function OverviewPage() {
   const summary = useQuery({
     ...orpc.activity.overview.summary.queryOptions({ input: { range } }),
     refetchInterval: REFRESH_MS,
+    // Switching the range keeps the page while the other range loads.
+    placeholderData: keepPreviousData,
   });
   const needsYou = useQuery({
     ...orpc.activity.needsYou.list.queryOptions(),
@@ -61,6 +63,11 @@ function OverviewPage() {
           ]}
         />
       </div>
+      {summary.data && !summary.data.onboarding.done ? (
+        <GettingStarted lang={lang} steps={summary.data.onboarding.steps} />
+      ) : null}
+      {/* What needs a person shows even when the summary fails. */}
+      <NeedsYouCard lang={lang} query={needsYou} />
       {summary.isPending ? (
         <OverviewSkeleton />
       ) : summary.isError ? (
@@ -70,12 +77,13 @@ function OverviewPage() {
         />
       ) : (
         <>
-          {summary.data.onboarding.done ? null : (
-            <GettingStarted lang={lang} steps={summary.data.onboarding.steps} />
-          )}
-          <NeedsYouCard lang={lang} query={needsYou} />
           <KpiGrid kpis={summary.data.kpis} lang={lang} range={range} />
-          <NodesStrip lang={lang} nodes={summary.data.nodes} />
+          <NodesStrip
+            lang={lang}
+            nodes={summary.data.nodes}
+            online={summary.data.nodesOnline}
+            total={summary.data.nodesTotal}
+          />
           <PoolCards lang={lang} pools={summary.data.pools} range={range} />
         </>
       )}
@@ -86,7 +94,6 @@ function OverviewPage() {
 function OverviewSkeleton() {
   return (
     <div className="flex min-w-0 flex-col gap-6" aria-hidden="true">
-      <Skeleton className="h-28 w-full rounded-xl" />
       <div className="grid min-w-0 grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
         {[0, 1, 2, 3, 4, 5].map((key) => (
           <Skeleton key={key} className="h-20 rounded-xl" />
@@ -303,9 +310,19 @@ function NeedsYouRow({ item }: { item: NeedsYou["items"][number] }) {
 
 function formatMs(value: number | null, lang: string, none: string): string {
   if (value === null) return none;
-  if (value < 1000)
-    return `${new Intl.NumberFormat(lang, { maximumFractionDigits: 0 }).format(value)} ms`;
-  return `${new Intl.NumberFormat(lang, { maximumFractionDigits: 1 }).format(value / 1000)} s`;
+  return value < 1000
+    ? new Intl.NumberFormat(lang, {
+        style: "unit",
+        unit: "millisecond",
+        unitDisplay: "short",
+        maximumFractionDigits: 0,
+      }).format(value)
+    : new Intl.NumberFormat(lang, {
+        style: "unit",
+        unit: "second",
+        unitDisplay: "short",
+        maximumFractionDigits: 1,
+      }).format(value / 1000);
 }
 
 function formatShare(value: number | null, lang: string, none: string): string {
@@ -368,9 +385,18 @@ function KpiGrid({ kpis, lang, range }: { kpis: Summary["kpis"]; lang: string; r
 
 // ── Nodes ──
 
-function NodesStrip({ lang, nodes }: { lang: string; nodes: Summary["nodes"] }) {
+function NodesStrip({
+  lang,
+  nodes,
+  online,
+  total,
+}: {
+  lang: string;
+  nodes: Summary["nodes"];
+  online: number;
+  total: number;
+}) {
   const { t } = useTranslation(["dashboard"]);
-  const online = nodes.filter((node) => node.online).length;
   return (
     <section className="flex min-w-0 flex-col gap-3" aria-labelledby="overview-nodes">
       <div className="flex min-w-0 flex-wrap items-baseline justify-between gap-2">
@@ -378,7 +404,7 @@ function NodesStrip({ lang, nodes }: { lang: string; nodes: Summary["nodes"] }) 
           {t("dashboard:overview.nodes.title")}
         </h2>
         <span className="text-sm text-muted-foreground">
-          {t("dashboard:overview.nodes.online", { online, total: nodes.length })}
+          {t("dashboard:overview.nodes.online", { online, total })}
         </span>
       </div>
       {nodes.length === 0 ? (
@@ -425,6 +451,15 @@ function NodesStrip({ lang, nodes }: { lang: string; nodes: Summary["nodes"] }) 
           ))}
         </ul>
       )}
+      {total > nodes.length ? (
+        <Link
+          to="/$lang/nodes"
+          params={{ lang }}
+          className="inline-flex min-h-[44px] items-center self-start text-sm font-medium text-primary hover:underline"
+        >
+          {t("dashboard:overview.nodes.more", { count: total - nodes.length })}
+        </Link>
+      ) : null}
     </section>
   );
 }
@@ -493,7 +528,7 @@ function PoolCards({
                     })}
                     {pool.errors > 0 ? (
                       <span className="text-destructive">
-                        {" · "}
+                        {t("dashboard:overview.pools.separator")}
                         {t("dashboard:overview.pools.errors", {
                           count: pool.errors,
                           value: count.format(pool.errors),

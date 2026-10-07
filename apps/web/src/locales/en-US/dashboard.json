@@ -1183,7 +1183,9 @@
       "title": "Nodes",
       "online": "{{online}} of {{total}} online",
       "empty": "No nodes yet. A node runs your models.",
-      "add": "Add a node"
+      "add": "Add a node",
+      "more_one": "And {{count}} more node",
+      "more_other": "And {{count}} more nodes"
     },
     "pools": {
       "title": "Your pools",
@@ -1198,7 +1200,8 @@
       "requests_one": "{{value}} request",
       "requests_other": "{{value}} requests",
       "errors_one": "{{value}} error",
-      "errors_other": "{{value}} errors"
+      "errors_other": "{{value}} errors",
+      "separator": " · "
     }
   }
 }

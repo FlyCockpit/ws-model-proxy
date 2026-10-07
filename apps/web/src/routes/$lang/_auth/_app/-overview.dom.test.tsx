@@ -48,6 +48,7 @@ vi.mock("@/utils/orpc", () => ({
             queryKey: ["activity", "overview", "summary", input.range],
             queryFn: async () => {
               state.ranges.push(input.range);
+              if (!state.summary) throw new Error("summary down");
               return state.summary;
             },
           }),
@@ -93,6 +94,8 @@ function summary(overrides: Record<string, unknown> = {}) {
       { id: "n1", slug: "desk", online: true, trust: "FULL" },
       { id: "n2", slug: "laptop", online: false, trust: "RELAY" },
     ],
+    nodesTotal: 60,
+    nodesOnline: 41,
     pools: [
       {
         id: "p1",
@@ -138,7 +141,7 @@ describe("Overview", { timeout: 30_000 }, () => {
   it("shows the KPIs, nodes and pools of the summary", async () => {
     state.summary = summary();
     await mount();
-    expect(screen.getByText("2.4 s")).toBeTruthy();
+    expect(screen.getByText("2.4 sec")).toBeTruthy();
     expect(screen.getByText("310 ms")).toBeTruthy();
     expect(screen.getByText("25%")).toBeTruthy();
     expect(screen.getByText("1%")).toBeTruthy();
@@ -146,6 +149,9 @@ describe("Overview", { timeout: 30_000 }, () => {
     expect(screen.getByText("laptop")).toBeTruthy();
     expect(screen.getByText("alex/chat")).toBeTruthy();
     expect(screen.getByText(/dashboard:overview.pools.errors:2/)).toBeTruthy();
+    // The counts cover every node, beyond the 50 the strip shows.
+    expect(screen.getByText("dashboard:overview.nodes.online")).toBeTruthy();
+    expect(screen.getByText("dashboard:overview.nodes.more:58")).toBeTruthy();
     // No queue wait yet: a dash, not a zero.
     expect(screen.getAllByText("dashboard:overview.kpi.none")).toHaveLength(1);
   });
@@ -189,6 +195,36 @@ describe("Overview", { timeout: 30_000 }, () => {
     expect(await screen.findByText("Qwen")).toBeTruthy();
     expect(screen.getByText("dashboard:overview.needsYou.need.RESTART")).toBeTruthy();
     expect(screen.getByText("dashboard:overview.needsYou.queuedCount:2")).toBeTruthy();
+  });
+
+  it("keeps what needs you when the summary fails", async () => {
+    state.summary = null;
+    state.needsYou = {
+      items: [
+        {
+          need: "STEP",
+          instanceId: "i1",
+          runtimeId: "r1",
+          runtimeName: "Whisper",
+          nodeId: null,
+          since: new Date().toISOString(),
+          stepId: "s1",
+        },
+      ],
+      queuedCommands: 0,
+    };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const Component = Route.options.component as ComponentType & {
+      preload?: () => Promise<unknown>;
+    };
+    await Component.preload?.();
+    render(
+      <QueryClientProvider client={client}>
+        <Component />
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByText("Whisper")).toBeTruthy();
+    expect(await screen.findByText("dashboard:overview.loadFailed")).toBeTruthy();
   });
 
   it("shows nothing for what needs you when nothing does", async () => {

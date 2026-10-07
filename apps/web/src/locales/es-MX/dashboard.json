@@ -1183,7 +1183,9 @@
       "title": "Nodos",
       "online": "{{online}} de {{total}} en línea",
       "empty": "Aún no hay nodos. Un nodo ejecuta tus modelos.",
-      "add": "Agregar un nodo"
+      "add": "Agregar un nodo",
+      "more_one": "Y {{count}} nodo más",
+      "more_other": "Y {{count}} nodos más"
     },
     "pools": {
       "title": "Tus pools",
@@ -1198,7 +1200,8 @@
       "requests_one": "{{value}} solicitud",
       "requests_other": "{{value}} solicitudes",
       "errors_one": "{{value}} error",
-      "errors_other": "{{value}} errores"
+      "errors_other": "{{value}} errores",
+      "separator": " · "
     }
   }
 }

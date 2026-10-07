@@ -511,6 +511,32 @@ integration("metrics_query on PostgreSQL", () => {
     expect(grantee.nodes).toEqual([]);
   });
 
+  it("puts pool traffic into fixed sparkline buckets, the oldest at the window start", async () => {
+    const { poolTraffic } = await import("../lib/overview-summary");
+    const sixHours = 6 * 3_600_000;
+    const now = new Date();
+    const end = Math.floor(now.getTime() / sixHours) * sixHours + sixHours;
+    const from = new Date(end - 7 * 24 * 3_600_000);
+    await fixtures.usageRollupMinute.createMany({
+      data: [
+        { bucketStart: from, requests: 5 },
+        { bucketStart: new Date(from.getTime() - 60_000), requests: 100 },
+        { bucketStart: new Date(from.getTime() + sixHours + 60_000), requests: 2 },
+      ].map((row) => ({
+        ...row,
+        ownerUserId: OWNER,
+        requesterUserId: STRANGER,
+        poolId: ids.pool,
+        source: "SIDECAR" as const,
+      })),
+    });
+    const traffic = (await poolTraffic(OWNER, [ids.pool], "7d", now)).get(ids.pool);
+    expect(traffic?.sparkline).toHaveLength(28);
+    expect(traffic?.sparkline.slice(0, 2)).toEqual([5, 2]);
+    expect(traffic?.requests).toBeGreaterThanOrEqual(7);
+    expect(traffic?.requests).toBeLessThan(100);
+  });
+
   it("answers NOT_FOUND to anyone else", async () => {
     const stranger = client(agent(STRANGER)).activity.metrics;
     for (const scope of [

@@ -37,7 +37,8 @@ beforeEach(() => {
     },
   ] as never);
   db.pool.findMany.mockResolvedValue([{ id: "p1", slug: "chat" }] as never);
-  db.node.count.mockResolvedValue(1);
+  db.node.count.mockImplementation((async (args?: { where?: { connection?: string } }) =>
+    args?.where?.connection === "ONLINE" ? 0 : 3) as never);
   db.runtime.count.mockResolvedValue(1);
   db.pool.count.mockResolvedValue(1);
   db.mcpGrant.count.mockResolvedValue(0);
@@ -75,6 +76,7 @@ describe("overview summary", () => {
     expect(summary.kpis.p95LatencyMs).toBeGreaterThan(1_000);
     // A person's pending lower makes the node Relay at once.
     expect(summary.nodes).toEqual([{ id: "n1", slug: "desk", online: true, trust: "RELAY" }]);
+    expect(summary).toMatchObject({ nodesTotal: 3, nodesOnline: 0 });
     const [pool] = summary.pools;
     expect(pool).toMatchObject({ id: "p1", callableId: "alex/chat", requests: 6, errors: 1 });
     expect(pool?.sparkline).toHaveLength(24);
