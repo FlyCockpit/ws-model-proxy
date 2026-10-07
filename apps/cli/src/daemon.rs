@@ -794,6 +794,7 @@ impl NodeRuntimes {
         self.retarget();
     }
 
+    #[cfg(unix)]
     fn set_instances(&mut self, instances: Vec<(Job, InstanceRecord)>) {
         self.instances = instances;
         self.retarget();
@@ -868,6 +869,7 @@ struct Session<'a> {
     #[cfg(unix)]
     runner: Option<crate::runtimes::runner::Runner>,
     /// The newest instance observation applied.
+    #[cfg(unix)]
     observed_generation: u64,
     /// The metric commands hash the telemetry thread runs.
     metric_commands_applied: Option<String>,
@@ -1026,6 +1028,7 @@ fn run_relay_session(
                 );
             })
             .ok(),
+        #[cfg(unix)]
         observed_generation: 0,
         metric_commands_applied: None,
     };

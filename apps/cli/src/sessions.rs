@@ -78,11 +78,14 @@ const MAX_EXECS: usize = 8;
 const SCROLLBACK_LIMIT: usize = 256 * 1024;
 const READ_CHUNK: usize = 8 * 1024;
 const SEAL_CHUNK: usize = 16 * 1024;
+#[cfg(unix)]
 const DEFAULT_IDLE: Duration = Duration::from_secs(15 * 60);
 /// A node command's longest lifetime until the node definition says otherwise.
 pub(crate) const DEFAULT_COMMAND_MAX: Duration = Duration::from_millis(NODE_COMMAND_MAX_MS);
+#[cfg(unix)]
 const PENDING_TTL: Duration = Duration::from_secs(2 * 60);
 /// How often attached 2.5 viewers are re-checked against the approvals file.
+#[cfg(unix)]
 const APPROVAL_RECHECK: Duration = Duration::from_secs(5);
 const SEND_WAIT: Duration = Duration::from_millis(200);
 #[cfg(unix)]
@@ -123,6 +126,7 @@ const REASON_ALREADY_OPEN: &str = "already_open";
 const REASON_SPAWN_FAILED: &str = "spawn_failed";
 const REASON_BAD_HANDSHAKE: &str = "bad_handshake";
 const REASON_BAD_FRAME: &str = "bad_frame";
+#[cfg(unix)]
 const REASON_EXPIRED: &str = "expired";
 #[allow(clippy::large_enum_variant)] // `NodeFrame` carries the telemetry shapes.
 pub(crate) enum OutboundFrame {
@@ -384,6 +388,7 @@ fn approval_code_for_identity(state_dir: Option<&Path>, identity_raw: &[u8; 65])
 
 /// `false` only when the approvals file positively no longer maps this
 /// identity's code to it. A read error keeps the viewer.
+#[cfg(unix)]
 fn identity_still_approved(state_dir: &Path, identity_raw: &[u8; 65]) -> bool {
     let code = terminal_crypto::approval_code(identity_raw);
     match approved_public_key(state_dir, &code) {
@@ -1083,6 +1088,9 @@ struct Viewer {
     last_size: Option<(u16, u16)>,
     /// The identity approved through `term.auth`. Re-checked so a revoke
     /// removes the viewer.
+    // Only the relay loop's `poll` (unix: no terminals elsewhere) re-checks it;
+    // gating it would fork every handshake path that carries it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     approved_identity: Option<[u8; 65]>,
     /// Set after a `term.input_dropped` for this viewer; cleared by the next
     /// input that is queued, so the relay hears once per run of drops.
@@ -1351,6 +1359,7 @@ struct PendingTerminal {
     browser_nonce: [u8; 16],
     cli_nonce: [u8; 16],
     identity: [u8; 65],
+    #[cfg(unix)]
     created: Instant,
     attach: bool,
 }
@@ -1374,9 +1383,11 @@ pub(crate) struct TerminalRegistry {
     pending: BTreeMap<PendingKey, PendingTerminal>,
     #[cfg(unix)]
     tx: SyncSender<FromWorker>,
+    #[cfg(unix)]
     idle_limit: Duration,
     /// The state dir from the last successful `term.auth`, for approval re-checks.
     state_dir: Option<PathBuf>,
+    #[cfg(unix)]
     next_approval_check: Option<Instant>,
     shut_down: bool,
     #[cfg(unix)]
@@ -1409,8 +1420,10 @@ impl TerminalRegistry {
             pending: BTreeMap::new(),
             #[cfg(unix)]
             tx,
+            #[cfg(unix)]
             idle_limit: DEFAULT_IDLE,
             state_dir: None,
+            #[cfg(unix)]
             next_approval_check: None,
             shut_down: false,
             #[cfg(unix)]
@@ -1808,6 +1821,7 @@ impl TerminalRegistry {
                 browser_nonce: prepared.browser_nonce,
                 cli_nonce,
                 identity,
+                #[cfg(unix)]
                 created: Instant::now(),
                 attach,
             },
@@ -2148,6 +2162,7 @@ impl TerminalRegistry {
 
     /// Expire pending approvals, re-check approvals, close exited shells and
     /// idle detached terminals.
+    #[cfg(unix)]
     pub(crate) fn poll(&mut self, now: Instant) -> Vec<OutboundFrame> {
         let mut frames = Vec::new();
         let expired_pending = self
@@ -2220,6 +2235,7 @@ impl TerminalRegistry {
     }
 
     /// 2.5: a viewer whose approval was revoked leaves (and the key rotates).
+    #[cfg(unix)]
     fn recheck_approvals(&mut self, now: Instant) -> Vec<OutboundFrame> {
         if self.next_approval_check.is_some_and(|next| now < next) {
             return Vec::new();

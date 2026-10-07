@@ -11,13 +11,17 @@
 
 use std::sync::mpsc::SyncSender;
 
-use super::{OutboundFrame, TerminalRegistry, TerminalSession, valid_id};
-use crate::protocol::frames::{JobError, JobStatus};
-use crate::protocol::terminal_supported;
+#[cfg(unix)]
+use super::valid_id;
+use super::{OutboundFrame, TerminalRegistry, TerminalSession};
+use crate::protocol::frames::JobStatus;
+#[cfg(unix)]
+use crate::protocol::{frames::JobError, terminal_supported};
 use crate::runtimes::operator::{
-    self as op, ConfirmKey, MAX_OPERATOR_TERMINALS, OperatorEvent, OperatorIds, OperatorOpen,
-    OperatorScreen,
+    self as op, ConfirmKey, OperatorEvent, OperatorIds, OperatorScreen,
 };
+#[cfg(unix)]
+use crate::runtimes::operator::{MAX_OPERATOR_TERMINALS, OperatorOpen};
 use crate::terminal_crypto::TermPlaintextV2;
 
 /// The step behind an operator terminal.
@@ -25,6 +29,7 @@ pub(super) struct OperatorState {
     ids: OperatorIds,
     screen: OperatorScreen,
     /// Node secrets included: never logged.
+    #[cfg(unix)]
     env: Vec<(String, String)>,
     events: SyncSender<OperatorEvent>,
     /// A person accepted and the command's PTY was spawned.
@@ -63,14 +68,17 @@ pub(crate) struct OperatorBook {
     /// Terminal id → (step id, cancelled before it opened).
     pending: std::collections::BTreeMap<String, (String, bool)>,
     used: std::collections::HashSet<String>,
+    #[cfg(unix)]
     used_order: std::collections::VecDeque<String>,
 }
 
 /// Ids remembered as used (oldest forgotten first; the server never
 /// re-sends one that old).
+#[cfg(unix)]
 const USED_IDS_MAX: usize = 4096;
 
 impl OperatorBook {
+    #[cfg(unix)]
     fn take(&mut self, terminal_id: &str, step_id: &str) {
         self.pending
             .insert(terminal_id.to_string(), (step_id.to_string(), false));
@@ -84,6 +92,7 @@ impl OperatorBook {
         }
     }
 
+    #[cfg(unix)]
     fn live(&self) -> usize {
         self.pending
             .values()
@@ -164,6 +173,7 @@ impl TerminalSession {
 
 impl TerminalRegistry {
     /// Live operator terminals.
+    #[cfg(unix)]
     pub(crate) fn operator_count(&self) -> usize {
         self.sessions
             .values()
@@ -211,6 +221,7 @@ impl TerminalRegistry {
     /// still on the confirm screen closes, and one not opened yet never
     /// opens, so the older thread lets go of the rank. Refused when no PTY
     /// can be offered, at the cap, or while shutting down.
+    #[cfg(unix)]
     pub(crate) fn reserve_operator(
         &mut self,
         step_id: &str,
@@ -236,6 +247,7 @@ impl TerminalRegistry {
     }
 
     /// The step's runner thread is done with `terminal_id` (or never got it).
+    #[cfg(unix)]
     pub(crate) fn release_operator(&mut self, terminal_id: &str) {
         self.operators.pending.remove(terminal_id);
     }
@@ -264,6 +276,7 @@ impl TerminalRegistry {
     /// `awaiting_operator`. Only a reserved, uncancelled id opens; anything
     /// else answers `operator_closed` (nothing ran) and the runner thread
     /// hears `Closed`.
+    #[cfg(unix)]
     pub(crate) fn open_operator(&mut self, open: OperatorOpen) -> Vec<OutboundFrame> {
         let terminal_id = open.ids.terminal_id.clone();
         let reserved = self
@@ -342,6 +355,7 @@ impl TerminalRegistry {
 
     /// The step's runner thread was cancelled (a stop): close its terminal
     /// unless a person's run already started.
+    #[cfg(unix)]
     pub(crate) fn close_operator_if_confirming(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
         self.close_confirming(|state| state.ids.terminal_id == terminal_id)
     }

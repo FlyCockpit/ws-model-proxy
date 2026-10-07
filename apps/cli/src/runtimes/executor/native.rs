@@ -5,9 +5,11 @@
 //! Secrets reach a unit through `systemd-run --setenv=NAME` (value taken from
 //! systemd-run's own environment), never on a command line.
 
+#[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -546,7 +548,7 @@ mod tests {
         };
         let runtime = NativeRuntime { cancel: None };
         let mut executor = super::super::Executor::load(root.path().join("x.json")).expect("load");
-        let deadline = || Deadline::new(Duration::from_secs(20));
+        let deadline = || Deadline::new(std::time::Duration::from_secs(20));
         assert_eq!(
             executor
                 .execute(job(JobPhase::Start, "s1"), &runtime, deadline())
