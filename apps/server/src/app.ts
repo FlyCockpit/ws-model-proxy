@@ -122,6 +122,7 @@ import {
 import { readinessResponse } from "./readiness.js";
 import { cancelNodeCommandsForCredentials } from "./relay/node-commands.js";
 import type { NodeIdentity } from "./relay/node-credential-auth.js";
+import { nodeFileServices } from "./relay/node-file-ops.js";
 import {
   dispatchRuntimeOperation,
   nodeOperatorServices,
@@ -285,6 +286,7 @@ function contextServices(request: HonoContext | null): ContextServices {
     pushRuntimeDefinitions,
     dispatchRuntimeOperation,
     nodeOperator: nodeOperatorServices,
+    nodeFiles: nodeFileServices,
     runtimeSteps: runtimeStepServices,
     modelTest: runModelTest,
     onAccessRevoked: (event) =>

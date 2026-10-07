@@ -378,6 +378,47 @@ describe("RelaySessionManager (relay 3.0)", () => {
     expect(manager.nodeSession("node-1")?.trust).toBe("relay");
   });
 
+  it("sends a file op only to the owner's live Full session and routes its answer back", async () => {
+    const socket = await connect();
+    const opId = Buffer.alloc(16, 7).toString("base64url");
+    const tracked = (userId: string) => ({
+      opId,
+      nodeId: "node-1",
+      userId,
+      op: "read" as const,
+      markResult: vi.fn(),
+      markData: vi.fn(),
+      markRejected: vi.fn(),
+      markMalformed: vi.fn(),
+      markLost: vi.fn(),
+    });
+    const frame = {
+      type: "file.op" as const,
+      opId,
+      op: "read" as const,
+      args: { path: "/home/me/a.txt" },
+    };
+    // Another owner's op never reaches this node's session.
+    const foreign = tracked("user-2");
+    expect(manager.dispatchFileOp(foreign, frame)).toBe(false);
+    expect(socket.last("file.op")).toBeUndefined();
+
+    const own = tracked("user-1");
+    expect(manager.dispatchFileOp(own, frame)).toBe(true);
+    expect(socket.last("file.op")).toEqual(frame);
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "file.rejected", opId, reason: "path_denied" }),
+    );
+    expect(own.markRejected).toHaveBeenCalledWith("path_denied", undefined);
+    expect(foreign.markRejected).not.toHaveBeenCalled();
+
+    // At Relay only nothing is sent.
+    manager.forgetFileOp("node-1", opId);
+    manager.requestTrustLower("node-1", new Date());
+    expect(manager.dispatchFileOp(tracked("user-1"), frame)).toBe(false);
+  });
+
   it("sends no lane frame before hello.ok", async () => {
     let during: { session: unknown; sent: boolean } | null = null;
     manager.setNodeFrameHandlers({

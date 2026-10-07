@@ -60,6 +60,12 @@ export type ContextServices = {
   /** Lane D (terminals, node commands): the relay surfaces these procedures need. */
   nodeOperator?: NodeOperatorServices;
   /**
+   * Node file tools (`nodes.files.*`) over relay 3.0. The procedure has checked the caller (a
+   * FULL agent credential), the node's owner and its stored trust; the server admits again
+   * (live credential, owner, trust, live session and its owner, file roots) before sending.
+   */
+  nodeFiles?: NodeFileServices;
+  /**
    * Interactive steps (`runtimes.steps.*`): the lifecycle engine and the relay's operator
    * terminals. People only; the procedure has checked nothing but the caller.
    */
@@ -203,6 +209,60 @@ export type NodeOperatorServices = {
     /** The command's stored end time (bounds how long a pending cancel is remembered). */
     endsBy?: Date;
   }): Promise<NodeCommandLiveStatus | null>;
+};
+
+/** A relay 3.0 file op (`apps/server/src/relay/file-protocol.ts`). */
+export type NodeFileOp =
+  | "read"
+  | "stat"
+  | "list"
+  | "search"
+  | "edit"
+  | "write"
+  | "rename"
+  | "mkdir"
+  | "delete";
+
+/** The agent credential a file op runs under (the one its audit row names). */
+export type NodeFileCredential = { kind: "agent_token" | "oauth_grant"; id: string };
+
+export type NodeFileRunInput = {
+  userId: string;
+  credential: NodeFileCredential;
+  nodeId: string;
+  op: NodeFileOp;
+  /** The relay args for `op`; a write's content is `body`, never in the args. */
+  args: Record<string, unknown>;
+  /** Write content (at most 1 MiB). */
+  body?: Uint8Array;
+  signal?: AbortSignal;
+};
+
+export type NodeFileOutcome =
+  | { ok: true; result: Record<string, unknown> }
+  | {
+      ok: false;
+      /** An admission refusal (`trust_relay`, `no_roots`, ...) or a file error code. */
+      code: string;
+      detail?: Record<string, unknown>;
+      retryAfterMs?: number;
+      /** A mutation whose result the server does not know (check with a stat first). */
+      outcome?: "unknown";
+      /** `path_denied` by the server's root check: the node's file roots. */
+      roots?: string[];
+    };
+
+export type NodeFileServices = {
+  /** Admit, send and wait for one file op. The server audits it; content is never kept. */
+  run(input: NodeFileRunInput): Promise<NodeFileOutcome>;
+  /**
+   * Record a request the procedure refused before `run`, on a node it verified is the
+   * caller's: an input the relay cannot carry, or a node that is not at Full control.
+   * Metadata only.
+   */
+  auditRefused(
+    input: Omit<NodeFileRunInput, "body" | "signal"> & { reason: "invalid_input" | "trust_relay" },
+  ): void;
 };
 
 /**
