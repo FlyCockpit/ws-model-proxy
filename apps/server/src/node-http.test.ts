@@ -116,8 +116,21 @@ describe("node bootstrap HTTP", () => {
       writeFileSync(join(cargoHome, "env"), `export PATH="${bin}:$PATH"\n`);
       rmSync(join(home, ".cargo", "env"));
       expect(run({ CARGO_HOME: cargoHome })).toContain("fake cargo install --git");
+      // A CARGO_HOME env file that does not provide cargo falls through to ~/.cargo/env.
+      writeFileSync(join(cargoHome, "env"), "true\n");
+      writeFileSync(join(home, ".cargo", "env"), `export PATH="${bin}:$PATH"\n`);
+      expect(run({ CARGO_HOME: cargoHome })).toContain("fake cargo install --git");
+      rmSync(join(home, ".cargo", "env"));
       // Without any env file the installer still refuses clearly.
-      expect(() => run()).toThrow();
+      expect(() => run()).toThrow(/cargo is not installed/);
+      // Also with HOME unset (no `parameter not set` abort).
+      expect(() =>
+        execFileSync("/bin/sh", [script], {
+          env: { PATH: join(home, "no-tools") },
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }),
+      ).toThrow(/cargo is not installed/);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

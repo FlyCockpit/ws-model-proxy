@@ -63,10 +63,12 @@ export function installScript(origin: string, rev: string | undefined = undefine
 set -eu
 if ! command -v cargo >/dev/null 2>&1; then
   # A non-interactive SSH shell skips the profile that puts rustup's cargo on PATH.
-  for cargo_env in "\${CARGO_HOME:-}/env" "$HOME/.cargo/env"; do
-    if [ "$cargo_env" != "/env" ] && [ -f "$cargo_env" ]; then
+  for cargo_env in "\${CARGO_HOME:-}/env" "\${HOME:-}/.cargo/env"; do
+    if [ "$cargo_env" != "/env" ] && [ "$cargo_env" != "/.cargo/env" ] && [ -f "$cargo_env" ]; then
+      set +eu
       . "$cargo_env"
-      break
+      set -eu
+      command -v cargo >/dev/null 2>&1 && break
     fi
   done
 fi
