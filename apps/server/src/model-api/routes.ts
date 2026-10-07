@@ -245,6 +245,11 @@ import {
   testRoutes,
 } from "./resolve.js";
 import {
+  RESPONSE_NOT_STORED_MESSAGE,
+  storedResponseUnavailable,
+  unsupportedCapabilityMessage,
+} from "./responses-storage.js";
+import {
   isBasicTranscriptionRequest,
   TranscriptionRequestError,
   type TranscriptionRequestProfile,
@@ -3304,17 +3309,13 @@ async function resolveStickyRoute({
       expiresAt: true,
     },
   });
-  if (
-    !record ||
-    record.userId !== requester.userId ||
-    record.apiKeyId !== requester.apiKeyId ||
-    !record.selectedTargetId ||
-    (record.expiresAt !== null && record.expiresAt <= new Date())
-  )
-    return openAiFailureJsonResponse(
-      "not_found",
-      "Response routing metadata was not found or has expired.",
-    );
+  // Only a response created with `store: true` on a model that stores responses natively
+  // (RESPONSES_API) is kept (its routing, for RESPONSES_STICKINESS_TTL_MS). Anything else,
+  // including a request translated for a model without stored responses, was never stored:
+  // say that, not "expired" (docs/external-fallback.md, "Stored responses").
+  const unavailable = storedResponseUnavailable(record, requester, new Date());
+  if (unavailable) return openAiFailureJsonResponse("not_found", unavailable);
+  if (!record?.selectedTargetId) throw new Error("a stored response names its target");
   // Stickiness is hot-path history (@ws-model-proxy/db/capacity-lock-order):
   // it names its share and target by plain id, with no foreign key. A
   // deleted share or target simply is not found, which fails closed below.
@@ -3355,10 +3356,7 @@ async function resolveStickyRoute({
       !sameAccess(visibleTarget) ||
       record.upstreamResponseIdDigest !== upstreamResponseIdDigest(responseId)
     )
-      return openAiFailureJsonResponse(
-        "not_found",
-        "Response routing metadata was not found or has expired.",
-      );
+      return openAiFailureJsonResponse("not_found", RESPONSE_NOT_STORED_MESSAGE);
     if (
       !record.providerAccountId ||
       !record.providerModelId ||
@@ -3714,7 +3712,11 @@ async function relayDirect({
       failure: "unsupported_capability",
       selectedRuntimeModelId: selected.id,
     });
-    return operationFailureResponse(operation, "unsupported_capability");
+    return operationFailureResponse(
+      operation,
+      "unsupported_capability",
+      unsupportedCapabilityMessage(operation),
+    );
   }
   if (!isEndpointConnected(selected, new Set(manager.getOnlineNodeIds()))) {
     await operation.dispose?.();
@@ -5168,10 +5170,15 @@ async function relayPool({
     if (overflow.kind === "response") return overflow.response;
     if (providerOnly && overflow.kind === "unavailable")
       return providerOnlyUnavailableResponse(overflow.reason);
-    const failure = terminalExternalFailure(overflow) ?? "unsupported_capability";
+    const externalFailure = terminalExternalFailure(overflow);
+    const failure = externalFailure ?? "unsupported_capability";
     await operation.dispose?.();
     await failPoolRelayMetadata({ relayRequestId, startedAt, failure });
-    return operationFailureResponse(operation, failure);
+    return operationFailureResponse(
+      operation,
+      failure,
+      externalFailure ? undefined : unsupportedCapabilityMessage(operation),
+    );
   }
 
   const onlineNodeIds = manager.getOnlineNodeIds();
@@ -7095,7 +7102,11 @@ async function relaySelectedModelNoFailover({
       failure: "unsupported_capability",
       selectedRuntimeModelId: selected.id,
     });
-    return operationFailureResponse(operation, "unsupported_capability");
+    return operationFailureResponse(
+      operation,
+      "unsupported_capability",
+      unsupportedCapabilityMessage(operation),
+    );
   }
 
   if (!isEndpointConnected(selected, new Set(manager.getOnlineNodeIds()))) {
