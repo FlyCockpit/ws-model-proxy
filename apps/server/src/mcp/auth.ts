@@ -3,6 +3,7 @@ import type { AuthInfo } from "@modelcontextprotocol/server";
 import type { ContextServices } from "@ws-model-proxy/api/context";
 import {
   MCP_ISSUER,
+  MCP_RESOURCE_SCOPES,
   MCP_RESOURCE_URL,
   mcpPatClientId,
   mcpScopesAllow,
@@ -527,6 +528,9 @@ async function handleAdmittedRequest(
       issuer: issuerUrl,
       resource: resourceUrl,
       requiredScopes: ["mcp:read"],
+      // The challenge names every resource scope (not just the read baseline), so a client
+      // can ask for mcp:write and the consent page can offer Full.
+      challengeScopes: MCP_RESOURCE_SCOPES,
       isScopeSatisfied: mcpReadBaselineMatcher,
     },
   );

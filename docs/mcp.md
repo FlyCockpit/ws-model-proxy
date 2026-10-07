@@ -341,6 +341,10 @@ Three scopes exist: `mcp:read`, `mcp:write`, and `offline_access`.
 
 - `/mcp` accepts `mcp:read` **or** `mcp:write` (`mcp:write` semantically
   includes read).
+- An unauthenticated `/mcp` request gets a `WWW-Authenticate` challenge with
+  `scope="mcp:read mcp:write"`, the same scopes as `scopes_supported` in
+  `/.well-known/oauth-protected-resource`, so a client asks for both and the
+  consent page can offer Full. Read-only stays the consent default.
 - Write tools need a FULL request level, which for OAuth requires the literal
   `mcp:write` (below). Scope matching is exact-token: padded or case-variant
   tokens never match.
