@@ -81,22 +81,23 @@ function fileCredential(auth: CallerAuth | { kind: "anonymous" }): NodeFileCrede
   });
 }
 
-/** The caller's node at Full control (stored; the server checks the live session too). */
-async function fullControlNode(userId: string, nodeId: string): Promise<{ id: string }> {
+type OwnedNode = { id: string; slug: string; fullControl: boolean };
+
+/**
+ * The caller's node, looked up under the caller only, and whether it is at Full control as
+ * stored (a pending lowering counts as Relay; the server checks the live session too).
+ */
+async function ownedNode(userId: string, nodeId: string): Promise<OwnedNode> {
   const node = await prisma.node.findFirst({
     where: { id: nodeId, userId },
     select: { id: true, slug: true, trust: true, trustLowerRequestedAt: true },
   });
   if (!node) throw notFound("That node does not exist.");
-  if (node.trust !== "FULL" || node.trustLowerRequestedAt) {
-    throw refuseAbout(
-      "trust_relay",
-      node.id,
-      `Node ${node.slug} is Relay only: commands, files and browser terminals need Full control.`,
-      "FORBIDDEN",
-    );
-  }
-  return { id: node.id };
+  return {
+    id: node.id,
+    slug: node.slug,
+    fullControl: node.trust === "FULL" && node.trustLowerRequestedAt === null,
+  };
 }
 
 // ── Input mapping (tool input -> relay args of one op) ──
@@ -346,7 +347,11 @@ const FILE_ERRORS: Readonly<Record<string, { status: FileErrorStatus; message: s
 };
 
 const REPORTED_ETAG = /^[hw]:[A-Za-z0-9_-]{22}$/;
-const ABSOLUTE_PATH = /^\/[^\0]{0,4095}$/;
+/**
+ * A node path shown in a message: absolute, plain characters only (no spaces, no prose), so a
+ * file name an agent chose earlier cannot carry instructions into another agent's error.
+ */
+const SAFE_PATH = /^\/[A-Za-z0-9._@%+=:,~/-]{0,1023}$/;
 
 function failure(
   nodeId: string,
@@ -365,10 +370,10 @@ function failure(
     parts.push(`Retry after ${Math.ceil(outcome.retryAfterMs / 1000)} s.`);
   }
   const recovery = detail.recovery;
-  if (typeof recovery === "string" && ABSOLUTE_PATH.test(recovery)) {
+  if (typeof recovery === "string" && SAFE_PATH.test(recovery)) {
     parts.push(`The previous content is kept at ${recovery}.`);
   }
-  const roots = (outcome.roots ?? []).filter((root) => ABSOLUTE_PATH.test(root));
+  const roots = (outcome.roots ?? []).filter((root) => SAFE_PATH.test(root));
   if (code === "path_denied" && roots.length > 0) {
     parts.push(`File roots: ${roots.join(", ")}.`);
   }
@@ -404,7 +409,11 @@ function mutationOutput(result: Record<string, unknown>): MutationOutput {
   return { etag: stringOrNull(result.etag), diff: stringOrNull(result.diff) };
 }
 
-/** Owner, trust and input checks, then one op through the server. */
+/**
+ * Owner, input and trust checks, then one op through the server. A refusal on the caller's
+ * own node is audited like a refusal at the server; an unknown (or another owner's) node id
+ * names no node of the caller, so nothing is recorded for it.
+ */
 async function runOne(
   context: SignedInContext,
   nodeId: string,
@@ -413,18 +422,41 @@ async function runOne(
 ): Promise<Record<string, unknown>> {
   const credential = fileCredential(context.auth);
   const userId = context.session.user.id;
-  const node = await fullControlNode(userId, nodeId);
+  const node = await ownedNode(userId, nodeId);
   const files = services(context);
   let mapped: Mapped;
   try {
     mapped = map();
   } catch (error) {
     if (!(error instanceof FileInputError)) throw error;
-    files.auditRefused({ userId, credential, nodeId: node.id, op: error.op, args: error.args });
+    files.auditRefused({
+      userId,
+      credential,
+      nodeId: node.id,
+      op: error.op,
+      args: error.args,
+      reason: "invalid_input",
+    });
     throw new ORPCError("BAD_REQUEST", {
       message: error.message,
       data: { reason: "invalid_input", subjectId: node.id },
     });
+  }
+  if (!node.fullControl) {
+    files.auditRefused({
+      userId,
+      credential,
+      nodeId: node.id,
+      op: mapped.op,
+      args: mapped.args,
+      reason: "trust_relay",
+    });
+    throw refuseAbout(
+      "trust_relay",
+      node.id,
+      `Node ${node.slug} is Relay only: commands, files and browser terminals need Full control.`,
+      "FORBIDDEN",
+    );
   }
   const run: NodeFileRunInput = {
     userId,

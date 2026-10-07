@@ -255,8 +255,14 @@ export type NodeFileOutcome =
 export type NodeFileServices = {
   /** Admit, send and wait for one file op. The server audits it; content is never kept. */
   run(input: NodeFileRunInput): Promise<NodeFileOutcome>;
-  /** Record a request the procedure refused before `run` (its input), metadata only. */
-  auditRefused(input: Omit<NodeFileRunInput, "body" | "signal">): void;
+  /**
+   * Record a request the procedure refused before `run`, on a node it verified is the
+   * caller's: an input the relay cannot carry, or a node that is not at Full control.
+   * Metadata only.
+   */
+  auditRefused(
+    input: Omit<NodeFileRunInput, "body" | "signal"> & { reason: "invalid_input" | "trust_relay" },
+  ): void;
 };
 
 /**

@@ -150,7 +150,8 @@ function toRow(event: NodeAuditEventInput): AuditRow | null {
     agentTokenId: optionalText(event.agentTokenId, ID_MAX),
     mcpGrantId: optionalText(event.mcpGrantId, ID_MAX),
     kind: event.kind,
-    subject: text(typeof event.subject === "string" ? event.subject : "", SUBJECT_MAX),
+    // Never empty (a CHECK): one bad row would fail its whole batch.
+    subject: text(typeof event.subject === "string" ? event.subject : "", SUBJECT_MAX) || "-",
     etagBefore: optionalText(event.etagBefore, ETAG_MAX),
     etagAfter: optionalText(event.etagAfter, ETAG_MAX),
     bytes,
@@ -161,8 +162,14 @@ function toRow(event: NodeAuditEventInput): AuditRow | null {
     outcome: event.outcome,
     reason,
     startedAt,
-    finishedAt: validDate(event.finishedAt) ?? startedAt,
+    // The CHECK wants finishedAt >= startedAt: a clock stepped back during the action must not
+    // make one row fail (and with it the whole batch).
+    finishedAt: laterOf(startedAt, validDate(event.finishedAt) ?? startedAt),
   };
+}
+
+function laterOf(first: Date, second: Date): Date {
+  return second.getTime() < first.getTime() ? first : second;
 }
 
 function noteDropped(count: number): void {

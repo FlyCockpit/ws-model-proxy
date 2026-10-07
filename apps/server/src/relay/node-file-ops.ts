@@ -211,8 +211,12 @@ function stringField(source: unknown, key: string): string | null {
   return typeof value === "string" ? value : null;
 }
 
-/** The path an event names: `path`, `root`, the first of `paths`, or a rename's `from`. */
+/** The path an event names: a rename's `from -> to`, `path`, `root` or the first of `paths`. */
 function auditPathOf(args: unknown): string {
+  // A rename names both ends: where a file went matters as much as where it came from.
+  const from = stringField(args, "from");
+  const to = stringField(args, "to");
+  if (from !== null && to !== null) return `${from} -> ${to}`;
   const direct =
     stringField(args, "path") ?? stringField(args, "root") ?? stringField(args, "from");
   if (direct !== null) return direct;
@@ -274,9 +278,10 @@ function auditOutcomeOf(
 }
 
 /**
- * An input the MCP layer refused before `runFileOp` (strict shape, content the relay cannot
- * carry): recorded as a refusal. The node is unverified there, so the row stores
- * {@link NODE_AUDIT_UNKNOWN_NODE}.
+ * A request refused before `runFileOp` (an input the relay cannot carry, or a node the
+ * procedure found Relay only): recorded as a refusal with `reason` (default
+ * `invalid_input`). Unless the caller verified that `nodeId` is one of the user's own nodes
+ * (`nodeVerified`), the row stores {@link NODE_AUDIT_UNKNOWN_NODE}.
  */
 export function auditRefusedFileInput(input: {
   userId: string;
@@ -285,9 +290,12 @@ export function auditRefusedFileInput(input: {
   nodeId: string;
   op: FileOp;
   args: unknown;
+  reason?: "invalid_input" | "trust_relay";
+  nodeVerified?: boolean;
 }): void {
   const audit = newFileAudit({ ...input, expiresAt: null });
-  recordFileAudit(audit, { ok: false, code: "invalid_input" });
+  audit.nodeVerified = input.nodeVerified === true;
+  recordFileAudit(audit, { ok: false, code: input.reason ?? "invalid_input" });
 }
 
 /** The ONE call site of `recordNodeAuditEvent` for file ops. Never throws. */
@@ -797,6 +805,9 @@ export const nodeFileServices: NodeFileServices = {
       nodeId: input.nodeId,
       op: input.op,
       args: input.args,
+      reason: input.reason,
+      // The procedure looked the node up under the caller before refusing.
+      nodeVerified: true,
     });
   },
 };

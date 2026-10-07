@@ -340,21 +340,50 @@ describe("node file ops (server side)", () => {
     ).resolves.toEqual({ ok: false, code: "path_denied", roots: [ROOT] });
   });
 
-  it("audits a refused input without trusting the node id", () => {
+  it("audits a procedure's refusal on the caller's verified node", () => {
     ops.nodeFileServices.auditRefused({
       userId: "user-1",
       credential: { kind: "oauth_grant", id: "grant-1" },
       nodeId: "node-1",
       op: "write",
       args: { path: `${ROOT}/a` },
+      reason: "trust_relay",
     });
     expect(lastAudit()).toMatchObject({
-      nodeId: ops.NODE_AUDIT_UNKNOWN_NODE,
+      nodeId: "node-1",
       mcpGrantId: "grant-1",
       kind: "file_write",
       subject: `${ROOT}/a`,
       outcome: "refused",
+      reason: "trust_relay",
+    });
+    // Without that verification the node id is never stored as given.
+    ops.auditRefusedFileInput({
+      userId: "user-1",
+      tokenId: "tok-1",
+      nodeId: "someone-elses",
+      op: "read",
+      args: {},
+    });
+    expect(lastAudit()).toMatchObject({
+      nodeId: ops.NODE_AUDIT_UNKNOWN_NODE,
+      subject: "(no path)",
       reason: "invalid_input",
+    });
+  });
+
+  it("audits both ends of a rename", async () => {
+    const pending = ops.runFileOp({
+      ...base,
+      op: "rename",
+      args: { from: `${ROOT}/a`, to: `${ROOT}/b` },
+    });
+    const { op } = await dispatched();
+    op.markResult({ type: "file.result", opId: op.opId, op: "rename", result: { etag: ETAG } });
+    await pending;
+    expect(lastAudit()).toMatchObject({
+      kind: "file_rename",
+      subject: `${ROOT}/a -> ${ROOT}/b`,
     });
   });
 });
