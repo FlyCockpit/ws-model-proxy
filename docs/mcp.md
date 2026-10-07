@@ -30,7 +30,10 @@ requests and metrics.
 - **Node trust.** Commands, files, secrets, metric commands and definition
   changes need a node at Full control. A Relay-only node relays inference for
   the definitions it held when it entered Relay only; agents cannot start,
-  stop or change anything there.
+  stop or change anything there. Lowering only stops new agent access through
+  wsmp: software an agent already left on the node at Full control (a systemd
+  user service, say) keeps running as the same user and can even raise trust
+  locally. If you distrust what an agent did, reinstall the node.
 - **Notes.** Most writes take an optional `note` (1–500 characters);
   `node_command_queue_for_user` requires one, and the deletes,
   `runtime_start`, `runtime_stop`, `profile_apply` and `model_test` take none.

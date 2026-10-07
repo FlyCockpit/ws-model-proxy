@@ -136,6 +136,11 @@ security boundary against other code running as your user**: anything that runs 
 your files, including this CLI's configuration. If you do not trust the code on this account,
 Relay only does not make it safe.
 
+Lowering only stops new agent access through wsmp. It does not undo or contain software an agent
+already left on the node while it had Full control, such as a systemd user service: that software
+runs as the same user and can even raise trust again locally. If you distrust what an agent did,
+reinstall the node.
+
 ## Secrets
 
 Runtimes and model servers often need tokens. Node secrets are named `WSMP_SECRET_` followed by

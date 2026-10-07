@@ -144,6 +144,11 @@ from the server can. Lowering protects against a *future* compromise: commands
 written while the node was Full control (frozen start commands, node metric
 commands) keep running, which is why the Lower dialog lists them.
 
+Lowering only stops new agent access through wsmp. It does not undo or contain
+software an agent already left on the node while it had Full control, such as a
+systemd user service: that software runs as the same user and can even raise
+trust again locally. If you distrust what an agent did, reinstall the node.
+
 ## Browser terminals and interactive steps
 
 **Browser terminals** open a shell on a node from the **Terminals** page. They
