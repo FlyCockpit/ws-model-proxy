@@ -329,3 +329,94 @@ describe("McpConsentPage failure states (R83/R84 F4)", () => {
     expect(assignMock).not.toHaveBeenCalled();
   });
 });
+
+describe("McpConsentPage access level choice", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+  });
+
+  const WRITE_SEARCH = { client_id: "mcp-client-1", scope: "mcp:read mcp:write", sig: "sig-1" };
+
+  function approveResponds() {
+    publicClientMock.mockResolvedValue({
+      data: { client_id: "mcp-client-1", client_name: "Client", client_uri: "https://c" },
+      error: null,
+    });
+    consentMock.mockResolvedValue({
+      data: { redirect: true, url: "https://client.example/cb?code=x" },
+      error: null,
+    });
+  }
+
+  it("offers Read-only or Full in the token dialog's words, starting at Read-only like the dialog", async () => {
+    approveResponds();
+    renderPage(WRITE_SEARCH);
+    await waitFor(() => {
+      expect(screen.getByText("access:agents.levelFull")).toBeTruthy();
+    });
+    expect(screen.getByText("access:agents.levelRead")).toBeTruthy();
+    expect(screen.getByText("access:agents.levelReadHint")).toBeTruthy();
+    expect(screen.queryByText("access:agents.levelFullHint")).toBeNull();
+    await userEvent.setup().click(screen.getByText("auth:mcpConsent.accept"));
+    await waitFor(() => {
+      expect(consentMock).toHaveBeenCalledWith({ accept: true, level: "READ" });
+    });
+  });
+
+  it("sends Full only when the person chooses it, and explains what Full allows", async () => {
+    approveResponds();
+    renderPage(WRITE_SEARCH);
+    const user = userEvent.setup();
+    await waitFor(() => {
+      expect(screen.getByText("access:agents.levelFull")).toBeTruthy();
+    });
+    await user.click(screen.getByText("access:agents.levelFull"));
+    expect(screen.getByText("access:agents.levelFullHint")).toBeTruthy();
+    await user.click(screen.getByText("auth:mcpConsent.accept"));
+    await waitFor(() => {
+      expect(consentMock).toHaveBeenCalledWith({ accept: true, level: "FULL" });
+    });
+  });
+
+  it("ignores a level the client put in the authorization URL", async () => {
+    approveResponds();
+    renderPage({ ...WRITE_SEARCH, level: "FULL" });
+    await waitFor(() => {
+      expect(screen.getByText("auth:mcpConsent.accept")).toBeTruthy();
+    });
+    expect(screen.getByText("access:agents.levelReadHint")).toBeTruthy();
+    await userEvent.setup().click(screen.getByText("auth:mcpConsent.accept"));
+    await waitFor(() => {
+      expect(consentMock).toHaveBeenCalledWith({ accept: true, level: "READ" });
+    });
+  });
+
+  it("offers no Full for a read-only request and approves it as Read-only", async () => {
+    approveResponds();
+    renderPage(USABLE_SEARCH);
+    await waitFor(() => {
+      expect(screen.getByText("auth:mcpConsent.readOnlyRequested")).toBeTruthy();
+    });
+    expect(screen.queryByText("access:agents.levelFull")).toBeNull();
+    await userEvent.setup().click(screen.getByText("auth:mcpConsent.accept"));
+    await waitFor(() => {
+      expect(consentMock).toHaveBeenCalledWith({ accept: true, level: "READ" });
+    });
+  });
+
+  it("a denial carries no level", async () => {
+    approveResponds();
+    renderPage(WRITE_SEARCH);
+    const user = userEvent.setup();
+    await waitFor(() => {
+      expect(screen.getByText("access:agents.levelFull")).toBeTruthy();
+    });
+    await user.click(screen.getByText("access:agents.levelFull"));
+    await user.click(screen.getByText("auth:mcpConsent.deny"));
+    await waitFor(() => {
+      expect(consentMock).toHaveBeenCalledWith({ accept: false });
+    });
+  });
+});
