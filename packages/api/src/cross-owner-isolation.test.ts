@@ -808,8 +808,6 @@ const REFUSAL_CODES = new Set([
   "PRECONDITION_FAILED",
 ]);
 
-/** Procedures that are stubs in 0.4.0 (they answer NOT_IMPLEMENTED and touch nothing). */
-const STUBS = new Set<string>();
 const KIND = new Map(PROCEDURES.map(([path, procedure]) => [path, procedure.kind]));
 /** What any row of A's carries (`victimRow`): an answer must not contain it. */
 const VICTIM_DATA = /user-a|row-a|a-box|rank-a/;
@@ -852,9 +850,8 @@ describe("user B cannot reach user A's nodes, runtimes, instances, steps or term
         } else {
           expect(error).toBeInstanceOf(ORPCError);
           const refusal = error as ORPCError<string, unknown>;
-          // Stubs answer NOT_IMPLEMENTED until they are wired (nothing reaches a node).
-          const stub = STUBS.has(path) && refusal.code === "NOT_IMPLEMENTED";
-          expect(stub || REFUSAL_CODES.has(refusal.code)).toBe(true);
+          // Every procedure is implemented: a refusal, never NOT_IMPLEMENTED.
+          expect(REFUSAL_CODES.has(refusal.code)).toBe(true);
           // A refusal of the input itself would prove nothing about ownership.
           expect(refusal.message).not.toBe("Input validation failed");
         }
