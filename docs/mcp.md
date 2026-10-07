@@ -164,13 +164,14 @@ A failed call returns `isError: true` with `structuredContent.error`:
   and, when it helps, a `subjectId`. The message says what to do next.
   `node_secret_set` replaces even that message with the reason, so nothing a
   procedure says can carry a secret back.
-- **Invalid input** is `invalid_input` with up to 20 `issues` (`path` and
-  `code`; input the tool's own schema rejects also gets the validator's
-  message, except on sensitive tools). Values are never echoed.
-- `TOO_MANY_REQUESTS` (tool rate limit, with `retryAfterSeconds`),
-  `REQUEST_ABORTED` (the request or credential went away), and static messages
-  for `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `CONFLICT`,
-  `PRECONDITION_FAILED`. Anything else is `INTERNAL_ERROR` with a `requestId`.
+- **Invalid input** is `invalid_input` with up to 20 `issues`, each `path` and
+  `message` (sensitive tools get `path` and `code` only). Values are never
+  echoed.
+- `TOO_MANY_REQUESTS` (tool rate limit, with `retryAfterSeconds`) and
+  `REQUEST_ABORTED` (the request or credential went away). `BAD_REQUEST`,
+  `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `CONFLICT` and
+  `PRECONDITION_FAILED` keep the procedure's own message (sensitive tools: a
+  static one). Anything else is `INTERNAL_ERROR` with a `requestId`.
 
 No tool's arguments are logged. A tool with secret input (`node_secret_set`)
 and the procedures in `SENSITIVE_INPUT_PROCEDURES` are never logged, audited

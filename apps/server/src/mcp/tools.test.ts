@@ -184,7 +184,7 @@ describe("through the bound router", () => {
       args: { metrics: ["ttft_p95"], range: "24h", step: "5m", scope: { pool: "p" } },
     });
     expect(result.isError).toBe(true);
-    expect(structured(result).error).toEqual({ code: "NOT_IMPLEMENTED" });
+    expect(structured(result).error).toMatchObject({ code: "NOT_IMPLEMENTED" });
   });
 
   it("procedure input validation answers with paths only", async () => {
@@ -218,6 +218,54 @@ describe("errors and output", () => {
       subjectId: "node-1",
       message: "The node is Relay only.",
     });
+  });
+
+  it("keeps a procedure's own message on a BAD_REQUEST without issues (runtime_start on an always-on runtime)", async () => {
+    const result = await runMcpTool(tool("runtime_start"), {
+      dispatch: testDispatch("FULL"),
+      args: { runtimeId: "r", preview: true, count: 1 },
+      invoke: async () => {
+        throw new ORPCError("BAD_REQUEST", { message: "An always-on runtime is not started." });
+      },
+    });
+    expect(result.content).toEqual([
+      { type: "text", text: "An always-on runtime is not started." },
+    ]);
+    expect(structured(result).error).toEqual({
+      code: "BAD_REQUEST",
+      message: "An always-on runtime is not started.",
+    });
+  });
+
+  it("lists procedure validation issues as path and message", async () => {
+    const result = await runMcpTool(tool("runtime_start"), {
+      dispatch: testDispatch("FULL"),
+      args: { runtimeId: "r" },
+      invoke: async () => {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Input validation failed",
+          cause: {
+            issues: [{ path: [{ key: "nodeIds" }, 0], code: "too_small", message: "Too small" }],
+          },
+        });
+      },
+    });
+    expect(structured(result).error).toEqual({
+      code: "invalid_input",
+      issues: [{ path: "nodeIds.0", message: "Too small" }],
+    });
+  });
+
+  it("a sensitive tool's errors carry no procedure message", async () => {
+    const result = await runMcpTool(tool("node_secret_set"), {
+      dispatch: testDispatch("FULL"),
+      args: { nodeId: "n", name: "WSMP_SECRET_HF", value: "hf_secret_value" },
+      invoke: async () => {
+        throw new ORPCError("BAD_REQUEST", { message: "value hf_secret_value is bad" });
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("hf_secret_value");
+    expect(structured(result).error).toEqual({ code: "BAD_REQUEST" });
   });
 
   it("hides unknown failures behind a generic error with the request id", async () => {

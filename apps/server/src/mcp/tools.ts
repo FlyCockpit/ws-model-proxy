@@ -21,7 +21,8 @@
  *      through the bound oRPC router with the agent `CallerAuth`, inside the DB abort fence
  *      and raced against the request's signal;
  *   6. output: redact → JSON-safe → size cap; errors: refusals keep their fixed message and
- *      reason, other codes a static message.
+ *      reason, validation failures list `{path, message}` issues, other 4xx codes keep the
+ *      procedure's (developer-written) message; a sensitive tool gets static text only.
  *
  * Secrets: a tool with `sensitiveInput` (node_secret_set) and the procedures in
  * `SENSITIVE_INPUT_PROCEDURES` never have their input logged, audited or echoed. No tool's
@@ -504,15 +505,23 @@ function sanitizeMessage(message: string): string {
   return out;
 }
 
-type ValidationIssue = { path: string; code: string; message?: string };
+/** `{path, message}`; a sensitive tool gets `{path, code}` (a message could echo a value). */
+type ValidationIssue = { path: string; message: string } | { path: string; code: string };
 
-/** Paths and codes only (plus zod's own message when the tool is not sensitive). */
+const MAX_ISSUES = 20;
+
+function issueOf(path: string, code: string, message: unknown, sensitive: boolean) {
+  const at = path || "(root)";
+  if (sensitive || typeof message !== "string" || message === "") return { path: at, code };
+  return { path: at, message: sanitizeMessage(message).slice(0, 200) };
+}
+
 function validationIssues(error: z.ZodError, sensitive: boolean): ValidationIssue[] {
-  return error.issues.slice(0, 20).map((issue) => ({
-    path: issue.path.map(String).join(".") || "(root)",
-    code: issue.code,
-    ...(sensitive ? {} : { message: sanitizeMessage(issue.message).slice(0, 200) }),
-  }));
+  return error.issues
+    .slice(0, MAX_ISSUES)
+    .map((issue) =>
+      issueOf(issue.path.map(String).join("."), issue.code, issue.message, sensitive),
+    );
 }
 
 function validationError(issues: ValidationIssue[]): ToolResult {
@@ -521,20 +530,21 @@ function validationError(issues: ValidationIssue[]): ToolResult {
 }
 
 /** Issues from an oRPC input validation failure (its cause carries the schema issues). */
-function orpcValidationIssues(error: ORPCError<string, unknown>): ValidationIssue[] | null {
+function orpcValidationIssues(
+  error: ORPCError<string, unknown>,
+  sensitive: boolean,
+): ValidationIssue[] | null {
   const cause: unknown = error.cause;
   if (cause === null || typeof cause !== "object" || !("issues" in cause)) return null;
   const issues: unknown = cause.issues;
   if (!Array.isArray(issues)) return null;
-  return issues.slice(0, 20).map((issue: unknown) => {
+  return issues.slice(0, MAX_ISSUES).map((issue: unknown) => {
     const entry = record(issue);
     const path = Array.isArray(entry.path)
       ? entry.path.map((segment) => String(record(segment).key ?? segment)).join(".")
       : "";
-    return {
-      path: path || "(root)",
-      code: typeof entry.code === "string" ? entry.code : "invalid",
-    };
+    const code = typeof entry.code === "string" ? entry.code : "invalid";
+    return issueOf(path, code, entry.message, sensitive);
   });
 }
 
@@ -564,12 +574,17 @@ function mapError(
       return toolError(message, { error: { code: error.code, reason, subjectId, message } });
     }
     if (error.code === "BAD_REQUEST") {
-      const issues = orpcValidationIssues(error);
+      const issues = orpcValidationIssues(error, sensitive);
       if (issues) return validationError(issues);
     }
     if (Object.hasOwn(STATIC_MESSAGES, error.code)) {
-      const message = STATIC_MESSAGES[error.code] ?? "Internal error";
-      return toolError(message, { error: { code: error.code } });
+      // Procedure messages are developer-written (they may name ids, never secrets): an agent
+      // needs "an always-on runtime is not started", not a bare "Invalid input".
+      const own = sensitive ? "" : sanitizeMessage(error.message).trim();
+      const message = own || (STATIC_MESSAGES[error.code] ?? "Internal error");
+      return toolError(message, {
+        error: { code: error.code, ...(own ? { message: own } : {}) },
+      });
     }
   }
   mcpSanitizedLog(
