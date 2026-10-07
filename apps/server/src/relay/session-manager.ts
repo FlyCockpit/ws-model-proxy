@@ -93,9 +93,11 @@ import {
   encodeRelayBinaryFrame,
   encodeRelayServerControlMessage,
   helloNeedsUpgrade,
+  isCurrentProtocolHello,
   parseRelayBinaryFrame,
   parseRelayClientControlFrame,
   protocolErrorMessage,
+  RELAY_CLI_BUILD_UPGRADE_REQUIRED_MESSAGE,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
   RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE,
   RELAY_STALE_AFTER_MS,
@@ -1310,6 +1312,18 @@ export class RelaySessionManager {
         console.error("[relay] control frame is not JSON");
       } else if (description.kind === "schema") {
         console.error("[relay] control frame schema rejected", description.issues);
+        // An older wsmp build of this protocol: tell it to upgrade (it prints the message and
+        // stops) and show the node as needing an upgrade, instead of an opaque "malformed".
+        if (!session.registered && isCurrentProtocolHello(frame)) {
+          closeWithProtocolError(socket, "upgrade_cli", RELAY_CLI_BUILD_UPGRADE_REQUIRED_MESSAGE);
+          await recordRejectedNodeHello(session.identity, rejectedHelloFacts(frame), now).catch(
+            (recordError: unknown) => {
+              console.error("[relay] recording a refused hello failed", errorName(recordError));
+            },
+          );
+          await this.removeSession(socket, now);
+          return;
+        }
       } else {
         console.error("[relay] control frame parse failed", description.name);
       }

@@ -47,6 +47,12 @@ export type RelayProtocolErrorCode = (typeof RELAY_PROTOCOL_ERROR_CODES)[number]
 export const RELAY_PROTOCOL_VERSIONS = [RELAY_PROTOCOL_VERSION] as const;
 
 export const RELAY_UPGRADE_REQUIRED_MESSAGE = `This server requires relay protocol ${RELAY_PROTOCOL_VERSION}. Upgrade wsmp and restart it.`;
+/**
+ * A hello at this protocol that the schema rejects: before a release, the protocol number stays
+ * put while the hello grows required fields, so an older wsmp of the same protocol lands here.
+ */
+export const RELAY_CLI_BUILD_UPGRADE_REQUIRED_MESSAGE =
+  "This wsmp is older than the server: its hello is missing fields the server requires. Re-run the server's install.sh to upgrade wsmp, then restart it.";
 export const RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE =
   "This wsmp speaks a newer relay protocol than the server. Upgrade WS Model Proxy and restart wsmp.";
 
@@ -164,6 +170,20 @@ export function helloNeedsUpgrade(frame: string): boolean {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
   const record = parsed as Record<string, unknown>;
   return record.type === "hello" && record.protocolVersion !== RELAY_PROTOCOL_VERSION;
+}
+
+/** A `hello` frame that claims this server's relay protocol (whether or not it parses). */
+export function isCurrentProtocolHello(frame: string): boolean {
+  if (utf8Length(frame) > RELAY_JSON_CONTROL_MAX_BYTES) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(frame);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  const record = parsed as Record<string, unknown>;
+  return record.type === "hello" && record.protocolVersion === RELAY_PROTOCOL_VERSION;
 }
 
 /** `major.minor`, the only shape stored for a refused hello. */

@@ -221,6 +221,32 @@ describe("RelaySessionManager (relay 3.0)", () => {
     );
   });
 
+  it("refuses a 3.0 hello from an older wsmp build with an upgrade message and remembers it", async () => {
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity });
+    // Same protocol, but missing fields this server requires (e.g. features.files.source).
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({
+        type: "hello",
+        id: "h",
+        protocolVersion: "3.0",
+        node: { version: "0.4.0" },
+      }),
+    );
+    expect(socket.last("protocol.error")).toMatchObject({ code: "upgrade_cli" });
+    expect(socket.closes).toHaveLength(1);
+    expect(manager.getOnlineNodeIds()).toEqual([]);
+    expect(db.node.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          rejectedProtocolVersion: "3.0",
+          rejectedCliVersion: "0.4.0",
+        }),
+      }),
+    );
+  });
+
   it("refuses an identity key other than the enrolled one", async () => {
     db.nodeCredential.findUnique.mockResolvedValue(credentialRow({ identityPublicKey: "other" }));
     const socket = await connect();
