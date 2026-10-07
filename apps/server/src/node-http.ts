@@ -149,7 +149,12 @@ WSMP_REPOSITORY=${shellQuoted(CLI_REPOSITORY)}
 say() { printf 'wsmp: %s\\n' "$*"; }
 die() { printf 'wsmp: %s\\n' "$*" >&2; exit 1; }
 
-bin_dir() { printf '%s/bin' "\${CARGO_HOME:-$HOME/.cargo}"; }
+# cargo's bin directory. Under \`set -u\` an unset HOME would abort with a shell error: say why.
+cargo_home() {
+  [ -n "\${CARGO_HOME:-}" ] || [ -n "\${HOME:-}" ] || die "set HOME (or CARGO_HOME), then run this again."
+  printf '%s' "\${CARGO_HOME:-$HOME/.cargo}"
+}
+bin_dir() { printf '%s/bin' "$(cargo_home)"; }
 
 # The release target for this machine, or nothing when no release binary runs here.
 detect_target() {
@@ -268,7 +273,7 @@ install_source() {
     die "cargo is not installed. Install Rust 1.88 or newer from https://rustup.rs and a C compiler (cc), then run this again."
   say "building wsmp from $WSMP_REPOSITORY ($*) with cargo; this takes a few minutes..."
   cargo install --git "$WSMP_REPOSITORY" "$@" --locked --force wsmp
-  installed="\${CARGO_INSTALL_ROOT:-\${CARGO_HOME:-$HOME/.cargo}}/bin/wsmp"
+  installed="\${CARGO_INSTALL_ROOT:-$(cargo_home)}/bin/wsmp"
 }
 
 finish() {

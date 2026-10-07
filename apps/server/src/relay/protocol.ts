@@ -49,10 +49,11 @@ export const RELAY_PROTOCOL_VERSIONS = [RELAY_PROTOCOL_VERSION] as const;
 export const RELAY_UPGRADE_REQUIRED_MESSAGE = `This server requires relay protocol ${RELAY_PROTOCOL_VERSION}. Upgrade wsmp and restart it.`;
 /**
  * A hello at this protocol that the schema rejects: before a release, the protocol number stays
- * put while the hello grows required fields, so an older wsmp of the same protocol lands here.
+ * put while the hello grows required fields, so an older wsmp of the same protocol lands here
+ * (as does a newer build with fields this server does not know: the hello is strict).
  */
 export const RELAY_CLI_BUILD_UPGRADE_REQUIRED_MESSAGE =
-  "This wsmp is older than the server: its hello is missing fields the server requires. Re-run the server's install.sh to upgrade wsmp, then restart it.";
+  "This wsmp build does not match the server: its hello was rejected. Re-run the server's install.sh to install the matching wsmp, then restart it.";
 export const RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE =
   "This wsmp speaks a newer relay protocol than the server. Upgrade WS Model Proxy and restart wsmp.";
 

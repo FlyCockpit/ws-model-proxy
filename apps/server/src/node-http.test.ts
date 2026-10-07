@@ -168,6 +168,14 @@ describe("node bootstrap HTTP", () => {
           stdio: ["ignore", "pipe", "pipe"],
         }),
       ).toThrow(/cargo is not installed/);
+      // A cargo on PATH with HOME and CARGO_HOME unset: a clear message, not a shell error.
+      expect(() =>
+        execFileSync("/bin/sh", [script], {
+          env: { PATH: bin },
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }),
+      ).toThrow(/set HOME \(or CARGO_HOME\)/);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
