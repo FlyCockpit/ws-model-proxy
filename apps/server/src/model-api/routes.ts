@@ -3742,6 +3742,23 @@ async function modelListResponse(
           }).granted;
         return externalListed ? [...plain, entry(externalModelId(pool.modelId))] : plain;
       }),
+      // The caller's aliases, listed like the pool they name (hard-coded harness names).
+      ...(targets.aliases ?? []).flatMap((alias) => {
+        const pool = targets.pools.find((candidate) => candidate.id === alias.poolId);
+        // A callable ID always wins over an alias of the same name.
+        if (targets.pools.some((candidate) => candidate.modelId === alias.name)) return [];
+        if (!pool || !servingPoolIds.has(pool.id)) return [];
+        const flags = poolFlagsById.get(pool.id) ?? multimodalFlagsFromCapabilities(null);
+        return [
+          {
+            id: alias.name,
+            object: "model" as const,
+            created: 0,
+            owned_by: pool.ownerUserSlug,
+            ...openAiModelListExtensions(flags),
+          },
+        ];
+      }),
     ],
   };
 }

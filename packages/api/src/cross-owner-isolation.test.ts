@@ -511,6 +511,11 @@ const CASES: ReadonlyArray<[string, unknown]> = [
   ["pools.members.removeContributed", { memberId: "member-a" }],
   ["pools.get", { poolId: "pool-a" }],
   ["pools.history.list", { poolId: "pool-a" }],
+  // Aliases live in the caller's namespace and may only name a pool the caller can use.
+  ["pools.aliases.set", { name: "gpt-4o", poolId: "pool-a" }],
+  ["pools.aliases.set", { name: "gpt-4o", poolId: "pool-b", apiKeyId: "key-a" }],
+  ["pools.aliases.delete", { aliasId: "alias-a" }],
+  ["pools.aliases.list", {}],
   ["pools.delete", { poolId: "pool-a", confirm: "DELETE" }],
   ["pools.cloud.setMode", { poolId: "pool-a", mode: "OFF" }],
   ["pools.cloud.setPaidWarmProtection", { poolId: "pool-a", enabled: true }],

@@ -186,16 +186,33 @@ export type ModelNameResolution =
  * targets (`runtime:<runtimeId>:<upstreamModelId>`) match exactly and take no suffix.
  */
 export function resolveRequestedModelName(
-  targets: { tests: readonly TestTarget[]; pools: readonly CallablePool[] },
+  targets: {
+    tests: readonly TestTarget[];
+    pools: readonly CallablePool[];
+    aliases?: readonly { name: string; poolId: string }[];
+  },
   model: string,
 ): ModelNameResolution {
   const test = targets.tests.find((target) => target.modelId === model);
   if (test) return { kind: "test", target: test };
   const pool = targets.pools.find((target) => target.modelId === model);
   if (pool) return { kind: "pool", target: pool, externalRequested: false };
+  // A caller's alias (only ever one of their callable pools; callable IDs win over it).
+  const aliased = (name: string) => {
+    const alias = targets.aliases?.find((entry) => entry.name === name);
+    return alias ? targets.pools.find((target) => target.id === alias.poolId) : undefined;
+  };
+  const aliasPool = aliased(model);
+  if (aliasPool) return { kind: "pool", target: aliasPool, externalRequested: false };
+  // An alias may itself hold a colon (`qwen3:8b`): its `:external` form is the whole suffix.
+  const externalSuffix = `:${EXTERNAL_MODEL_VARIANT}`;
+  const externalAlias = model.endsWith(externalSuffix)
+    ? aliased(model.slice(0, -externalSuffix.length))
+    : undefined;
+  if (externalAlias) return { kind: "pool", target: externalAlias, externalRequested: true };
   const { base, variant } = splitModelVariant(model);
   if (variant === null) return { kind: "not_found" };
-  const basePool = targets.pools.find((target) => target.modelId === base);
+  const basePool = targets.pools.find((target) => target.modelId === base) ?? aliased(base);
   if (basePool) {
     if (variant === EXTERNAL_MODEL_VARIANT)
       return { kind: "pool", target: basePool, externalRequested: true };

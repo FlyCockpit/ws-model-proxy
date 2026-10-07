@@ -613,7 +613,10 @@
     "no_shared_fabric": "Not enough free nodes share one fabric.",
     "node_held": "A node is held. Release it, or a person applies with the preview.",
     "secret_needs_node": "Set this secret on the node with `wsmp secret set`.",
-    "fabric_in_use": "A runtime spanning several nodes uses this fabric. Stop it first."
+    "fabric_in_use": "A runtime spanning several nodes uses this fabric. Stop it first.",
+    "alias_shadowed": "That name is already one of your callable IDs.",
+    "alias_limit": "Too many aliases. Remove one first.",
+    "alias_key_not_allowed": "That key cannot call this pool. Add the pool to the key first."
   },
   "models": {
     "loadFailed": "Couldn't load your models.",

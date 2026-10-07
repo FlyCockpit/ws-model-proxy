@@ -613,7 +613,10 @@
     "no_shared_fabric": "No hay suficientes nodos libres que compartan un fabric.",
     "node_held": "Un nodo está retenido. Libéralo, o que una persona aplique con la vista previa.",
     "secret_needs_node": "Configura este secreto en el nodo con `wsmp secret set`.",
-    "fabric_in_use": "Un runtime que abarca varios nodos usa este fabric. Detenlo primero."
+    "fabric_in_use": "Un runtime que abarca varios nodos usa este fabric. Detenlo primero.",
+    "alias_shadowed": "Ese nombre ya es uno de tus ID invocables.",
+    "alias_limit": "Demasiados alias. Elimina uno primero.",
+    "alias_key_not_allowed": "Esa clave no puede llamar a este pool. Agrega el pool a la clave primero."
   },
   "models": {
     "loadFailed": "No se pudieron cargar tus modelos.",

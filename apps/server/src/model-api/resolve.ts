@@ -146,7 +146,41 @@ export type TestTarget = {
   maxAttachmentBytes: number | null;
 };
 
-export type CallableTargets = { pools: CallablePool[]; tests: TestTarget[] };
+/**
+ * A model-name alias in effect for the caller: a hard-coded name a harness sends, mapped to one
+ * of `pools` (key-level aliases win over user-level ones of the same name).
+ */
+export type ModelAliasTarget = { name: string; poolId: string };
+
+export type CallableTargets = {
+  pools: CallablePool[];
+  tests: TestTarget[];
+  aliases: ModelAliasTarget[];
+};
+
+/**
+ * The aliases a caller may use: the user's (and the key's, which win), pointing only at pools
+ * in `pools` (an alias never widens access).
+ */
+async function effectiveAliases(
+  userId: string,
+  apiKeyId: string | null,
+  pools: readonly CallablePool[],
+): Promise<ModelAliasTarget[]> {
+  const rows = await prisma.modelAlias.findMany({
+    where: { userId, OR: [{ apiKeyId: null }, ...(apiKeyId ? [{ apiKeyId }] : [])] },
+    select: { name: true, poolId: true, apiKeyId: true },
+    take: 256,
+  });
+  const callable = new Set(pools.map((pool) => pool.id));
+  const byName = new Map<string, ModelAliasTarget>();
+  // User-level first, then the key's: a key-level alias replaces a user-level one.
+  for (const row of [...rows].sort(
+    (a, b) => Number(a.apiKeyId !== null) - Number(b.apiKeyId !== null),
+  ))
+    byName.set(row.name, { name: row.name, poolId: row.poolId });
+  return [...byName.values()].filter((alias) => callable.has(alias.poolId));
+}
 
 export function testTargetModelId(runtimeId: string, upstreamModelId: string): string {
   return `runtime:${runtimeId}:${upstreamModelId}`;
@@ -274,7 +308,7 @@ export async function listCallableTargetsForUser(
     ownerUserSlug: model.Runtime.User.slug,
     maxAttachmentBytes: null,
   }));
-  return { pools, tests };
+  return { pools, tests, aliases: await effectiveAliases(userId, null, pools) };
 }
 
 /** An API key reaches pools only (ALL_POOLS: every callable pool; SELECTED_POOLS: its list). */
@@ -283,13 +317,16 @@ export async function listCallableTargetsForApiKey(
   now = new Date(),
 ): Promise<CallableTargets> {
   const all = await listCallableTargetsForUser(key.userId, now);
-  if (key.scope === "ALL_POOLS") return { pools: all.pools, tests: [] };
-  const selected = new Set(
-    (
-      await prisma.apiKeyPool.findMany({ where: { apiKeyId: key.id }, select: { poolId: true } })
-    ).map((row) => row.poolId),
-  );
-  return { pools: all.pools.filter((pool) => selected.has(pool.id)), tests: [] };
+  let pools = all.pools;
+  if (key.scope !== "ALL_POOLS") {
+    const selected = new Set(
+      (
+        await prisma.apiKeyPool.findMany({ where: { apiKeyId: key.id }, select: { poolId: true } })
+      ).map((row) => row.poolId),
+    );
+    pools = all.pools.filter((pool) => selected.has(pool.id));
+  }
+  return { pools, tests: [], aliases: await effectiveAliases(key.userId, key.id, pools) };
 }
 
 // ── Route rows ──

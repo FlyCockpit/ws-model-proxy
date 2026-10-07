@@ -321,6 +321,7 @@ export function routeToolCall(name: string, args: Record<string, unknown>): Proc
         : [get];
     }
     case "pools_get": {
+      if (args.aliases) return [{ path: "pools.aliases.list", input: {} }];
       if (args.poolId === undefined) return [{ path: "pools.list", input: {} }];
       const get: ProcedureCall = { path: "pools.get", input: pick(args, ["poolId"]) };
       return args.history
@@ -372,7 +373,7 @@ export function routeToolCall(name: string, args: Record<string, unknown>): Proc
     }
     case "pool_update": {
       const calls: ProcedureCall[] = [];
-      const update = omit(args, ["contribute"]);
+      const update = omit(args, ["contribute", "aliases"]);
       if (Object.keys(omit(update, ["poolId", "note"])).length > 0)
         calls.push({ path: "pools.update", input: update });
       const contribute = record(args.contribute);
@@ -384,6 +385,14 @@ export function routeToolCall(name: string, args: Record<string, unknown>): Proc
         });
       for (const memberId of Array.isArray(contribute.withdraw) ? contribute.withdraw : [])
         calls.push({ path: "pools.members.removeContributed", input: { memberId, ...note } });
+      const aliases = record(args.aliases);
+      for (const entry of Array.isArray(aliases.set) ? aliases.set : [])
+        calls.push({
+          path: "pools.aliases.set",
+          input: { ...record(entry), poolId: args.poolId, ...note },
+        });
+      for (const aliasId of Array.isArray(aliases.remove) ? aliases.remove : [])
+        calls.push({ path: "pools.aliases.delete", input: { aliasId, ...note } });
       return calls;
     }
     case "node_secret_set":
@@ -432,6 +441,14 @@ function combineOutputs(name: string, calls: ProcedureCall[], outputs: unknown[]
         withdrawn: calls
           .filter((entry) => entry.path.endsWith("removeContributed"))
           .map((entry) => entry.input.memberId),
+        ...(calls.some((entry) => entry.path.startsWith("pools.aliases."))
+          ? {
+              aliases: outputs.filter((_, index) => calls[index]?.path === "pools.aliases.set"),
+              aliasesRemoved: calls
+                .filter((entry) => entry.path === "pools.aliases.delete")
+                .map((entry) => entry.input.aliasId),
+            }
+          : {}),
       };
     case "node_secret_set":
       return { name: calls[0]?.input.name, deleted: calls[0]?.path === "nodes.secrets.delete" };

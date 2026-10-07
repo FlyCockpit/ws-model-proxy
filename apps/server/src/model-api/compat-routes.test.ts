@@ -440,6 +440,27 @@ describe("request compatibility on a local pool member", () => {
   });
 });
 
+describe("model-name aliases", () => {
+  it("routes a hard-coded name to the caller's pool and lists it", async () => {
+    resolve.listCallableTargetsForApiKey.mockResolvedValue({
+      pools: [POOL],
+      tests: [],
+      aliases: [{ name: "gpt-4o", poolId: "pool-1" }],
+    });
+    relay.answers.push({ status: 200, body: OK });
+    const response = await chat({ model: "gpt-4o" });
+    expect(response.status).toBe(200);
+    expect(JSON.parse(relay.sent[0]!.body)).toMatchObject({ model: "engine-model" });
+    const models = await app().request("/models", {
+      headers: { authorization: "Bearer wsmp_key_test" },
+    });
+    const ids = ((await models.json()) as { data: Array<{ id: string }> }).data.map(
+      (entry) => entry.id,
+    );
+    expect(ids).toEqual(["owner/chat", "gpt-4o"]);
+  });
+});
+
 describe("caller credential styles", () => {
   it.each([
     [{ "x-api-key": "wsmp_key_alt" }],

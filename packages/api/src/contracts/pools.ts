@@ -24,6 +24,36 @@ import {
 } from "./common";
 import { mutation, query } from "./procedure";
 
+// ── Model-name aliases ──
+
+/**
+ * A model name a harness sends (`gpt-4o`, `claude-sonnet-4-5`, `meta-llama/Llama-3.1-8B`): what
+ * OpenAI-, Anthropic- and Hugging Face-style ids look like, without the `:external` variant
+ * suffix or the `runtime:` test prefix.
+ */
+export const modelAliasNameSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$/, "letters, digits and . _ : / @ + - only")
+  .refine((name) => !/:external$/i.test(name), "the :external variant is added by callers")
+  .refine((name) => !name.startsWith("runtime:"), "runtime: names are direct tests");
+
+export const MODEL_ALIASES_MAX_PER_USER = 64;
+
+export const modelAliasViewSchema = z
+  .object({
+    id: idSchema,
+    name: z.string(),
+    poolId: idSchema,
+    /** The pool's callable ID the alias resolves to. */
+    callableId: z.string(),
+    apiKeyId: idSchema.nullable(),
+    /** The key's name (null: every key). */
+    apiKeyName: z.string().nullable(),
+    /** False while the pool is not callable for you (share revoked, key not allowed it). */
+    usable: z.boolean(),
+  })
+  .strict();
+
 // ── Metric routing rules (same rules as 0.4-dev `metric-routing.ts`, JSON-schema friendly) ──
 
 const metricNameSchema = z.string().regex(/^[A-Za-z0-9_.:-]{1,64}$/);
@@ -317,6 +347,38 @@ export const poolsContract = {
     "Edit a pool. Never: cloud mode, paid warm protection, own-key consent, own-hardware-only (human_only).",
     ["pool_update"],
   ),
+  aliases: {
+    list: query(
+      "agent",
+      noInputSchema,
+      z.object({ aliases: z.array(modelAliasViewSchema) }).strict(),
+      "Your model-name aliases (for harnesses with hard-coded model names).",
+      ["pools_get"],
+    ),
+    set: mutation(
+      "agent",
+      z
+        .object({
+          name: modelAliasNameSchema,
+          /** A pool you may use (own, or shared with you with can use). */
+          poolId: idSchema,
+          /** Only for this API key of yours (it wins over an alias for every key). */
+          apiKeyId: idSchema.nullable().optional(),
+          note: noteSchema.optional(),
+        })
+        .strict(),
+      modelAliasViewSchema,
+      "Point a model name callers send at one of your callable pools (creates or moves it).",
+      ["pool_update"],
+    ),
+    delete: mutation(
+      "agent",
+      z.object({ aliasId: idSchema, note: noteSchema.optional() }).strict(),
+      okSchema,
+      "Remove one of your model-name aliases.",
+      ["pool_update"],
+    ),
+  },
   delete: mutation(
     "agent",
     z.object({ poolId: idSchema, confirm: confirmDeleteSchema.optional() }).strict(),
