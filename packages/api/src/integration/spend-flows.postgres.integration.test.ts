@@ -65,6 +65,8 @@ integration("cloud spend on PostgreSQL with the schema hardening", () => {
           name,
           email: `${name}-${suffix}@example.test`,
           emailVerified: true,
+          // A direct share by e-mail needs the mailbox proved (the verify-email flow sets it).
+          provedEmail: `${name}-${suffix}@example.test`,
           slug: `${name}-${suffix}`,
         },
         select: { id: true, email: true, name: true },

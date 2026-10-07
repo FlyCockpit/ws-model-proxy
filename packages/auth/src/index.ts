@@ -26,6 +26,7 @@ import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
+import { recordProvedEmail } from "./proved-email";
 import {
   acceptClaimedShareInviteToken,
   acceptShareInvitesForProvenEmail,
@@ -73,6 +74,22 @@ async function acceptInvitesQuietly(user: unknown): Promise<void> {
     });
   } catch (error) {
     console.error("share invite acceptance failed", error instanceof Error ? error.name : "error");
+  }
+}
+
+/**
+ * A verify-email route verified this address: record it as proved. Without SMTP no verification
+ * link reaches a mailbox, so nothing is proved. A failure leaves the address unproved (shares by
+ * e-mail then go through an invite) and never fails the verification.
+ */
+async function recordProvedEmailQuietly(user: unknown): Promise<void> {
+  const row = user as { id?: unknown; email?: unknown; emailVerified?: unknown } | null;
+  if (!row || typeof row.id !== "string" || typeof row.email !== "string") return;
+  if (!emailConfigured || row.emailVerified !== true) return;
+  try {
+    await recordProvedEmail({ id: row.id, email: row.email });
+  } catch (error) {
+    console.error("proved e-mail record failed", error instanceof Error ? error.name : "error");
   }
 }
 
@@ -491,9 +508,13 @@ export const auth = betterAuth({
         // the cancel is idempotent. An unban or an expired ban notifies nothing.
         after: async (user, context) => {
           if (!user) return;
-          // Verifying the e-mail accepts the invites sent to it (only on the verification
-          // routes: an admin-created account is "verified" without proof).
-          if (isEmailVerificationPath(context?.path)) await acceptInvitesQuietly(user);
+          // Verifying the e-mail proves it (for direct shares) and accepts the invites sent to
+          // it — only on the verification routes: an admin-created account is "verified"
+          // without proof.
+          if (isEmailVerificationPath(context?.path)) {
+            await recordProvedEmailQuietly(user);
+            await acceptInvitesQuietly(user);
+          }
           const row = user as { id: string; banned?: unknown; banExpires?: unknown };
           if (
             isUserBanned(

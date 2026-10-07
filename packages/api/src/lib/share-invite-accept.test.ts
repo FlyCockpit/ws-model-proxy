@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
@@ -41,6 +41,7 @@ import {
 import { pendingInviteWhere as pending, SHARE_INVITE_SIGNUP_CLAIM_MS } from "./share-invites";
 
 const TOKEN = "wsmp_inv_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const DIGEST = credentialDigest("shareInvite", TOKEN);
 
 const later = new Date(Date.now() + 86_400_000);
 const invite = {
@@ -151,7 +152,7 @@ describe("share invite acceptance", () => {
     // The guarded write repeats the claim as read: a sign-up claiming meanwhile wins.
     expect(db.shareInvite.updateMany.mock.calls[0]?.[0]?.where).toEqual({
       id: "inv1",
-      AND: [pending(now), { signupClaimedAt: null, signupClaimedEmail: null }],
+      AND: [pending(now), { tokenDigest: DIGEST, signupClaimedAt: null, signupClaimedEmail: null }],
     });
   });
 
@@ -199,11 +200,77 @@ describe("share invite acceptance", () => {
       id: "inv1",
       AND: [
         pending(now),
-        { signupClaimedAt: claimed.signupClaimedAt, signupClaimedEmail: "other@example.test" },
+        {
+          tokenDigest: DIGEST,
+          signupClaimedAt: claimed.signupClaimedAt,
+          signupClaimedEmail: "other@example.test",
+        },
       ],
     });
     db.shareInvite.findFirst.mockResolvedValue(claimedBy("someone@example.test", now));
     await expect(acceptClaimedShareInvite(other, TOKEN, now)).resolves.toBe(false);
+  });
+});
+
+/**
+ * Codex finding 4: a resend rotates the token between the link's first read and its fenced
+ * work. A stand-in for the row filters by every condition the code names, so the guards decide.
+ */
+describe("an old link after a resend rotated the token", () => {
+  const now = new Date();
+  const rotated = { ...invite, tokenDigest: "f".repeat(64) };
+  type Where = { tokenDigest?: string; id?: string; AND?: Where[] };
+  const matches = (where: Where | undefined): boolean => {
+    if (!where) return true;
+    if (where.tokenDigest !== undefined && where.tokenDigest !== rotated.tokenDigest) return false;
+    if (where.id !== undefined && where.id !== rotated.id) return false;
+    return (where.AND ?? []).every(matches);
+  };
+
+  beforeEach(() => {
+    db.share.findUnique.mockResolvedValue(null);
+    db.share.create.mockResolvedValue({ id: "share1" });
+  });
+  afterEach(() => {
+    db.shareInvite.findFirst.mockReset();
+    db.shareInvite.updateMany.mockReset();
+  });
+
+  it("is refused by the fenced re-read when the rotation landed before the fences", async () => {
+    // The first read still saw the old token; the resend committed before the fences.
+    db.shareInvite.findFirst
+      .mockResolvedValueOnce(invite)
+      .mockImplementationOnce(async (args: { where: Where }) =>
+        matches(args.where) ? rotated : null,
+      );
+    await expect(acceptShareInviteByLink(other, TOKEN, now)).resolves.toBe("invalid");
+    expect(db.shareInvite.findFirst.mock.calls[1]?.[0]?.where).toEqual({
+      id: "inv1",
+      AND: [pending(now), { tokenDigest: DIGEST, signupClaimedAt: null, signupClaimedEmail: null }],
+    });
+    expect(db.share.create).not.toHaveBeenCalled();
+  });
+
+  it("is refused by the guarded acceptance write when the rotation landed after the re-read", async () => {
+    db.shareInvite.findFirst.mockResolvedValue(invite);
+    db.shareInvite.updateMany.mockImplementation(async (args: { where: Where }) => ({
+      count: matches(args.where) ? 1 : 0,
+    }));
+    await expect(acceptShareInviteByLink(other, TOKEN, now)).resolves.toBe("invalid");
+  });
+
+  it("cannot claim the invite for a sign-up, and is told the link is invalid", async () => {
+    db.shareInvite.findFirst
+      .mockResolvedValueOnce(invite)
+      .mockImplementationOnce(async (args: { where: Where }) =>
+        matches(args.where) ? { id: "inv1" } : null,
+      );
+    db.shareInvite.updateMany.mockImplementation(async (args: { where: Where }) => ({
+      count: matches(args.where) ? 1 : 0,
+    }));
+    await expect(claimShareInviteForSignup(TOKEN, "other@example.test", now)).resolves.toBe(
+      "invalid",
+    );
   });
 });
 
@@ -254,7 +321,10 @@ describe("invite-link sign-up claim", () => {
     expect(db.shareInvite.updateMany.mock.calls[0]?.[0]).toEqual({
       where: {
         id: "inv1",
-        AND: [pending(now), { signupClaimedAt: null, signupClaimedEmail: null }],
+        AND: [
+          pending(now),
+          { tokenDigest: DIGEST, signupClaimedAt: null, signupClaimedEmail: null },
+        ],
       },
       data: { signupClaimedAt: now, signupClaimedEmail: "other@example.test" },
     });
@@ -290,7 +360,11 @@ describe("invite-link sign-up claim", () => {
       id: "inv1",
       AND: [
         pending(now),
-        { signupClaimedAt: own.signupClaimedAt, signupClaimedEmail: "other@example.test" },
+        {
+          tokenDigest: DIGEST,
+          signupClaimedAt: own.signupClaimedAt,
+          signupClaimedEmail: "other@example.test",
+        },
       ],
     });
   });

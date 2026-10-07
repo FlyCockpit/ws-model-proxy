@@ -49,6 +49,9 @@
     },
     "./share-invite-acceptance": {
       "default": "./src/share-invite-acceptance.ts"
+    },
+    "./proved-email": {
+      "default": "./src/proved-email.ts"
     }
   },
   "scripts": {

@@ -238,6 +238,17 @@ function consent() {
   return decision.consent;
 }
 
+/** The request with its body's JSON overridden (what the client asked the provider for). */
+function requestWith(fields: Record<string, unknown>) {
+  const base = request();
+  return {
+    ...base,
+    body: new TextEncoder().encode(
+      JSON.stringify({ ...JSON.parse(new TextDecoder().decode(base.body)), ...fields }),
+    ),
+  };
+}
+
 function request() {
   return {
     userId: "owner",
@@ -368,5 +379,54 @@ describe("owner/pool:external dispatch", () => {
     expect(result).toMatchObject({ dispatched: false, reason: "SEND_CLAIM_FAILED" });
     expect(world.sent).toEqual([]);
     expect(world.reconciled[0]).toMatchObject({ dispatchOutcome: "NOT_SENT", reason: "FAILED" });
+  });
+
+  // Codex finding 3: the reservation must cover every candidate the provider bills.
+  describe("multi-candidate requests", () => {
+    async function admittedSpend(fields: Record<string, unknown>) {
+      world.admitted.length = 0;
+      const result = await dispatchPublicOverflow(requestWith(fields));
+      if (result.dispatched) {
+        await result.response.text();
+        await result.terminal;
+      }
+      const liability = world.admitted[0]?.liability as { spend?: { toString(): string } };
+      return Number(liability?.spend?.toString());
+    }
+
+    it("reserves for every candidate (n, best_of) of a natively forwarded body", async () => {
+      const single = await admittedSpend({});
+      expect(single).toBeGreaterThan(0);
+      expect(await admittedSpend({ n: 16 })).toBeGreaterThanOrEqual(single * 16);
+      // Same body length, so the same input estimate: the candidates alone scale the hold.
+      const ten = await admittedSpend({ n: 10, best_of: 10 });
+      expect(await admittedSpend({ n: 16, best_of: 10 })).toBeCloseTo(ten * 1.6, 12);
+      expect(await admittedSpend({ n: 10, best_of: 16 })).toBeCloseTo(ten * 1.6, 12);
+      // The upstream body is sent as asked: the reservation, not the request, changed.
+      expect(JSON.parse(world.sent.at(-1)?.body ?? "{}")).toMatchObject({ n: 10, best_of: 16 });
+    });
+
+    it("reserves for the largest output limit the body names", async () => {
+      // Same body length; the request's own `max_tokens` is 100.
+      const asked = await admittedSpend({ max_completion_tokens: 100 });
+      const larger = await admittedSpend({ max_completion_tokens: 900 });
+      expect(larger).toBeGreaterThan(asked);
+      // A limit above the target's maximum output is not sent at all.
+      world.admitted.length = 0;
+      const over = await dispatchPublicOverflow(requestWith({ max_completion_tokens: 9000 }));
+      expect(over.dispatched).toBe(false);
+      expect(world.admitted).toEqual([]);
+    });
+
+    it("sends nothing when a candidate count cannot be bounded", async () => {
+      for (const n of ["16", 1.5, -1, { count: 2 }]) {
+        world.calls.length = 0;
+        world.admitted.length = 0;
+        const result = await dispatchPublicOverflow(requestWith({ n }));
+        expect(result.dispatched).toBe(false);
+        expect(world.admitted).toEqual([]);
+        expect(world.sent).toEqual([]);
+      }
+    });
   });
 });

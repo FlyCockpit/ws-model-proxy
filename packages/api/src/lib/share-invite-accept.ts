@@ -64,6 +64,14 @@ function liveInviteWhere(now: Date, guard: InviteWhere): InviteWhere {
   return { AND: [pendingInviteWhere(now), guard] };
 }
 
+/**
+ * What a link holds the invite under: still the presented token (a resend rotates it, and the
+ * old link must stop working at once) and the sign-up claim as read.
+ */
+function linkHoldWhere(tokenDigest: string, claim: SignupClaim): InviteWhere {
+  return { tokenDigest, ...claimUnchangedWhere(claim) };
+}
+
 async function acceptOne(
   tx: Tx,
   invite: InviteRow,
@@ -182,8 +190,9 @@ async function acceptLink(
   now: Date,
 ): Promise<LinkAcceptance> {
   if (!SHARE_INVITE_TOKEN_PATTERN.test(token)) return "invalid";
+  const tokenDigest = shareInviteDigest(token);
   const linkInvite = await prisma.shareInvite.findFirst({
-    where: { tokenDigest: shareInviteDigest(token), ...pendingInviteWhere(now) },
+    where: { tokenDigest, ...pendingInviteWhere(now) },
     select: { ...inviteSelect, ...claimSelect },
   });
   if (!linkInvite) return "invalid";
@@ -199,11 +208,12 @@ async function acceptLink(
     now,
   });
   if (!decision.accept) return "invalid";
-  const guard = claimUnchangedWhere(linkInvite);
+  const guard = linkHoldWhere(tokenDigest, linkInvite);
   try {
     return await runCapacityOrderedTransaction(prisma, async (tx) => {
       await fenceOwners(tx, [user.id, linkInvite.ownerUserId]);
-      // Re-read under the fences: a revoke, expiry, other acceptance or new claim since wins.
+      // Re-read under the fences: a revoke, expiry, resend (new token), other acceptance or new
+      // claim since wins.
       const current = await tx.shareInvite.findFirst({
         where: { id: linkInvite.id, ...liveInviteWhere(now, guard) },
         select: inviteSelect,
@@ -267,8 +277,9 @@ export async function claimShareInviteForSignup(
 ): Promise<ShareInviteClaimResult> {
   if (!SHARE_INVITE_TOKEN_PATTERN.test(token)) return "invalid";
   const claimant = inviteEmailKey(email);
+  const tokenDigest = shareInviteDigest(token);
   const invite = await prisma.shareInvite.findFirst({
-    where: { tokenDigest: shareInviteDigest(token), ...pendingInviteWhere(now) },
+    where: { tokenDigest, ...pendingInviteWhere(now) },
     select: { id: true, ...claimSelect },
   });
   if (!invite) return "invalid";
@@ -276,13 +287,14 @@ export async function claimShareInviteForSignup(
   if (hold === "in_use") return "in_use";
   if (hold === "taken") return "invalid";
   const claimed = await prisma.shareInvite.updateMany({
-    where: { id: invite.id, ...liveInviteWhere(now, claimUnchangedWhere(invite)) },
+    where: { id: invite.id, ...liveInviteWhere(now, linkHoldWhere(tokenDigest, invite)) },
     data: { signupClaimedAt: now, signupClaimedEmail: claimant },
   });
   if (claimed.count === 1) return "claimed";
-  // Lost the swap: to another claim (in use), or the invite was accepted, revoked or expired.
+  // Lost the swap: to another claim (in use), or the invite was accepted, revoked, expired or
+  // resent (this token no longer opens it).
   const still = await prisma.shareInvite.findFirst({
-    where: { id: invite.id, ...pendingInviteWhere(now) },
+    where: { id: invite.id, tokenDigest, ...pendingInviteWhere(now) },
     select: { id: true },
   });
   return still ? "in_use" : "invalid";

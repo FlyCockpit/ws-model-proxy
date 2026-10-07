@@ -66,6 +66,11 @@ import {
   releaseProviderHealthTrial,
 } from "./provider-attempt-runtime.js";
 import {
+  attemptOutputTokens,
+  providerBodyBillingBound,
+  scaleProviderLiability,
+} from "./provider-billing-bound.js";
+import {
   admitProviderBudget,
   type ProviderBudgetAdmission,
   type ProviderLiability,
@@ -3165,10 +3170,16 @@ export async function dispatchPublicOverflow(
       providerAccountId: target.providerAccountId,
       providerModelId: target.providerModelId,
     }).catch(() => undefined);
-    const requestedOutputTokens =
+    // The bound comes from the exact body sent: a larger output limit under another field, or
+    // several candidates (`n`, `best_of`, ...), are billed too (Codex finding 3). A body whose
+    // bound cannot be read is not sent.
+    const bodyBound = providerBodyBillingBound(upstream.body);
+    const requestedOutputTokens = attemptOutputTokens(
+      bodyBound,
       request.requestedOutputTokens ??
-      (target.maxOutputTokens === null ? undefined : BigInt(target.maxOutputTokens));
-    if (requestedOutputTokens === undefined) {
+        (target.maxOutputTokens === null ? undefined : BigInt(target.maxOutputTokens)),
+    );
+    if (requestedOutputTokens === undefined || !bodyBound.bounded) {
       await recordProviderAttemptEvent({
         userId: request.userId,
         providerAccountId: target.providerAccountId,
@@ -3190,11 +3201,29 @@ export async function dispatchPublicOverflow(
       (payloadTokens != null && payloadTokens > 0n ? payloadTokens : null) ??
       (estimatedTokens != null && estimatedTokens > 0n ? estimatedTokens : null) ??
       byteEstimate;
-    const renderedLiability = liabilityFromPricing({
-      estimatedInputTokens: renderedInputTokens * 2n,
-      requestedOutputTokens,
-      pricing,
-    });
+    const renderedLiability = scaleProviderLiability(
+      liabilityFromPricing({
+        estimatedInputTokens: renderedInputTokens * 2n,
+        requestedOutputTokens,
+        pricing,
+      }),
+      bodyBound.candidates,
+    );
+    if (renderedLiability === undefined) {
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: "OUTPUT_BOUND_UNAVAILABLE",
+        ...providerEventRouting({ request, target, nativeSurface }),
+        terminalState: "SKIPPED",
+      }).catch(() => undefined);
+      continue;
+    }
     const renderedContextTokens = checkedContextTokens(renderedInputTokens, requestedOutputTokens);
     const renderedCompatibility = publicTargetCompatibility(target, {
       ...request,
