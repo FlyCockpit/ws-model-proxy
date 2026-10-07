@@ -352,7 +352,9 @@ fn is_reportable_text(text: &str, max_bytes: usize) -> bool {
     !text.is_empty()
         && text.len() <= max_bytes
         && text.trim() == text
-        && !text.chars().any(crate::display_escape::needs_escape)
+        && !text
+            .chars()
+            .any(|c| c.is_control() || crate::display_escape::needs_escape(c))
 }
 
 fn version_text(value: &str) -> Option<String> {
@@ -708,6 +710,7 @@ mod tests {
             // A bidi isolate (Trojan Source) and a zero-width space.
             "\"spoof\\u2066x\"".to_string(),
             "\"zero\\u200bwidth\"".to_string(),
+            "\"line\\nbreak\"".to_string(),
             "\" padded\"".to_string(),
             "\"\"".to_string(),
             "7".to_string(),
@@ -764,6 +767,10 @@ mod tests {
             id: "x".repeat(129),
         };
         assert!(long_id.validate().is_err());
+        let padded_id = crate::protocol::frames::ServerFrame::RuntimeDetect {
+            id: format!("det-1{}", " ".repeat(200)),
+        };
+        assert!(padded_id.validate().is_err());
         assert!(text.len() <= crate::protocol::RELAY_JSON_CONTROL_MAX_BYTES);
         let NodeFrame::RuntimeDetected { servers, .. } = frame else {
             panic!("runtime.detected");

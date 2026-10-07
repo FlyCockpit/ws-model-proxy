@@ -1866,7 +1866,7 @@ impl ServerFrame {
             Self::SecretSet(secret) => secret.validate(),
             // `relayIdSchema`: the answer echoes it, so it must stay small.
             Self::RuntimeDetect { id } => rule(
-                !id.trim().is_empty() && id.trim().encode_utf16().count() <= 128,
+                !id.trim().is_empty() && id.encode_utf16().count() <= 128,
                 "a relay id is 1-128 characters",
             ),
             Self::ExecStart { timeout_ms, .. } => rule(
