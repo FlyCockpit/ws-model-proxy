@@ -62,7 +62,8 @@ fn gpu_line(gpu: &NodeGpuInfo) -> String {
     }
     match gpu.vram_total_mib {
         Some(mib) => parts.push(format!("vram {}", size(mib))),
-        None => parts.push("vram shared".into()),
+        None if gpu.apu == Some(true) => parts.push("vram shared".into()),
+        None => parts.push("vram unknown".into()),
     }
     if let Some(gtt) = gpu.gtt_total_mib {
         parts.push(format!("gtt {}", size(gtt)));
@@ -122,7 +123,12 @@ pub fn format_hardware(hardware: &Hardware) -> Vec<String> {
     }
     if !hardware.notes.is_empty() {
         lines.push("notes:".into());
-        lines.extend(hardware.notes.iter().map(|note| format!("  - {note}")));
+        lines.extend(
+            hardware
+                .notes
+                .iter()
+                .map(|note| format!("  - {}", escape_single_line(note))),
+        );
     }
     lines.push(
         "placement uses a declaration (Nodes page, or this node's config) before these values"
@@ -171,7 +177,12 @@ mod tests {
     fn untrusted_names_are_escaped() {
         let mut hardware = assemble(sources("rtx-3090"));
         hardware.gpus[0].name = Some("evil\u{1b}]8;;x\u{7}name".into());
+        hardware.gpus[0].vram_total_mib = None;
+        hardware.notes.push("spoof\u{202e}note".into());
         let lines = format_hardware(&hardware);
         assert!(lines.iter().all(|line| !line.contains('\u{1b}')));
+        assert!(lines.iter().all(|line| !line.contains('\u{202e}')));
+        // A discrete card whose memory read failed is not "shared".
+        assert!(lines.iter().any(|line| line.contains("vram unknown")));
     }
 }

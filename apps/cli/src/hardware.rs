@@ -62,6 +62,9 @@ pub struct Hardware {
 /// One AMD GPU from sysfs and the KFD topology.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmdGpu {
+    /// KFD topology node: ROCm (HIP) numbers GPUs in this order, integrated
+    /// ones included.
+    pub kfd_node: Option<u64>,
     pub pci_slot: String,
     pub pci_id: Option<String>,
     pub vram_bytes: Option<u64>,
@@ -220,7 +223,9 @@ fn json_in(text: &str) -> Option<serde_json::Value> {
     let mut offset = 0;
     for line in text.split_inclusive('\n') {
         if line.trim_start().starts_with(['[', '{'])
-            && let Ok(value) = serde_json::from_str(&text[offset..])
+            && let Some(Ok(value)) = serde_json::Deserializer::from_str(&text[offset..])
+                .into_iter::<serde_json::Value>()
+                .next()
         {
             return Some(value);
         }
@@ -323,8 +328,8 @@ fn uevent_fields(text: &str) -> BTreeMap<&str, &str> {
         .collect()
 }
 
-/// KFD topology: `gfx_target_version` by DRM render minor.
-fn kfd_targets(root: &Path) -> BTreeMap<u64, String> {
+/// KFD topology: node id and gfx target by DRM render minor.
+fn kfd_nodes(root: &Path) -> BTreeMap<u64, (u64, Option<String>)> {
     let nodes = root.join("sys/class/kfd/kfd/topology/nodes");
     let Ok(entries) = std::fs::read_dir(nodes) else {
         return BTreeMap::new();
@@ -332,6 +337,7 @@ fn kfd_targets(root: &Path) -> BTreeMap<u64, String> {
     entries
         .filter_map(Result::ok)
         .filter_map(|entry| {
+            let node = entry.file_name().to_str()?.parse::<u64>().ok()?;
             let text = read_text(&entry.path().join("properties"))?;
             let field = |key: &str| {
                 text.lines().find_map(|line| {
@@ -340,7 +346,8 @@ fn kfd_targets(root: &Path) -> BTreeMap<u64, String> {
                 })
             };
             let minor = field("drm_render_minor").filter(|minor| *minor > 0)?;
-            Some((minor, gfx_target(field("gfx_target_version")?)?))
+            let target = field("gfx_target_version").and_then(gfx_target);
+            Some((minor, (node, target)))
         })
         .collect()
 }
@@ -365,7 +372,7 @@ pub fn read_amd_sysfs(root: &Path) -> Vec<AmdGpu> {
     let Ok(entries) = std::fs::read_dir(root.join("sys/class/drm")) else {
         return Vec::new();
     };
-    let targets = kfd_targets(root);
+    let kfd = kfd_nodes(root);
     let mut gpus: BTreeMap<String, AmdGpu> = BTreeMap::new();
     for entry in entries.filter_map(Result::ok) {
         let name = entry.file_name();
@@ -395,12 +402,23 @@ pub fn read_amd_sysfs(root: &Path) -> Vec<AmdGpu> {
             pci_id,
             vram_bytes: sysfs_number(&device.join("mem_info_vram_total")),
             gtt_bytes: sysfs_number(&device.join("mem_info_gtt_total")),
-            gfx_target: render_minor(&device).and_then(|minor| targets.get(&minor).cloned()),
+            kfd_node: None,
+            gfx_target: None,
             name: None,
         };
-        gpus.entry(gpu.pci_slot.clone()).or_insert(gpu);
+        let (kfd_node, gfx_target) = render_minor(&device)
+            .and_then(|minor| kfd.get(&minor).cloned())
+            .map_or((None, None), |(node, target)| (Some(node), target));
+        gpus.entry(gpu.pci_slot.clone()).or_insert(AmdGpu {
+            kfd_node,
+            gfx_target,
+            ..gpu
+        });
     }
-    gpus.into_values().collect()
+    // HIP's order: KFD nodes, then (unknown to KFD) PCI slot order.
+    let mut gpus: Vec<AmdGpu> = gpus.into_values().collect();
+    gpus.sort_by_key(|gpu| (gpu.kfd_node.unwrap_or(u64::MAX), gpu.pci_slot.clone()));
+    gpus
 }
 
 fn is_pci_id(id: &str) -> bool {
@@ -472,32 +490,31 @@ fn nvidia_info(row: &GpuRow) -> Option<NodeGpuInfo> {
     })
 }
 
-/// AMD GPUs indexed in order among those listed (ROCm numbers the GPUs it
-/// uses the same way, skipping integrated ones beside discrete cards).
+/// AMD GPUs with their HIP ordinal (position among all AMD GPUs in KFD
+/// order), kept when some are left out, so `amd:N` selects device N.
 fn amd_infos<'a>(
-    gpus: impl Iterator<Item = &'a AmdGpu>,
+    gpus: impl Iterator<Item = (usize, &'a AmdGpu)>,
     gtt_cap_mib: Option<u64>,
 ) -> Vec<NodeGpuInfo> {
-    gpus.enumerate()
-        .filter_map(|(index, gpu)| {
-            let gtt = gpu.gtt_bytes.map(mib);
-            Some(NodeGpuInfo {
-                vendor: GpuVendorWire::Amd,
-                index: u8::try_from(index).ok()?,
-                name: gpu.name.clone(),
-                uuid: None,
-                driver_version: None,
-                vram_total_mib: gpu.vram_bytes.map(mib),
-                gtt_total_mib: match (gtt, gtt_cap_mib) {
-                    (Some(gtt), Some(cap)) => Some(gtt.min(cap)),
-                    (gtt, _) => gtt,
-                },
-                gfx_target: gpu.gfx_target.clone(),
-                apu: Some(gpu.is_apu()),
-                pci_id: gpu.pci_id.clone(),
-            })
+    gpus.filter_map(|(index, gpu)| {
+        let gtt = gpu.gtt_bytes.map(mib);
+        Some(NodeGpuInfo {
+            vendor: GpuVendorWire::Amd,
+            index: u8::try_from(index).ok()?,
+            name: gpu.name.clone(),
+            uuid: None,
+            driver_version: None,
+            vram_total_mib: gpu.vram_bytes.map(mib),
+            gtt_total_mib: match (gtt, gtt_cap_mib) {
+                (Some(gtt), Some(cap)) => Some(gtt.min(cap)),
+                (gtt, _) => gtt,
+            },
+            gfx_target: gpu.gfx_target.clone(),
+            apu: Some(gpu.is_apu()),
+            pci_id: gpu.pci_id.clone(),
         })
-        .collect()
+    })
+    .collect()
 }
 
 fn describe(gpu: &AmdGpu) -> String {
@@ -540,7 +557,14 @@ pub fn assemble(sources: Sources) -> Hardware {
     // make it a placement target.
     if nvidia_other || !amd_discrete.is_empty() {
         let mut gpus: Vec<NodeGpuInfo> = sources.nvidia.iter().filter_map(nvidia_info).collect();
-        gpus.extend(amd_infos(amd_discrete.iter().copied(), gtt_cap_mib));
+        gpus.extend(amd_infos(
+            sources
+                .amd
+                .iter()
+                .enumerate()
+                .filter(|(_, gpu)| !gpu.is_apu()),
+            gtt_cap_mib,
+        ));
         gpus.truncate(crate::protocol::NODE_GPU_MAX);
         let unknown = sources
             .nvidia
@@ -583,7 +607,7 @@ pub fn assemble(sources: Sources) -> Hardware {
     }
 
     let mut gpus: Vec<NodeGpuInfo> = sources.nvidia.iter().filter_map(nvidia_info).collect();
-    gpus.extend(amd_infos(sources.amd.iter(), gtt_cap_mib));
+    gpus.extend(amd_infos(sources.amd.iter().enumerate(), gtt_cap_mib));
     if let Some(facts) = apple_silicon {
         gpus.push(NodeGpuInfo {
             vendor: GpuVendorWire::Apple,
@@ -864,6 +888,7 @@ mod tests {
         let hardware = assemble(Sources {
             meminfo_total_mib: Some(127494),
             amd: vec![AmdGpu {
+                kfd_node: None,
                 pci_slot: "0000:c5:00.0".into(),
                 pci_id: Some("1002:1586".into()),
                 vram_bytes: None,
@@ -892,8 +917,44 @@ mod tests {
     }
 
     #[test]
+    fn amd_indexes_stay_hip_ordinals_when_an_igpu_comes_first() {
+        let card = |node: u64, slot: &str, id: &str, gfx: &str, vram_gib: u64| AmdGpu {
+            kfd_node: Some(node),
+            pci_slot: slot.into(),
+            pci_id: Some(id.into()),
+            vram_bytes: Some(vram_gib * 1024 * MIB),
+            gtt_bytes: Some(32 * 1024 * MIB),
+            gfx_target: Some(gfx.into()),
+            name: None,
+        };
+        let hardware = assemble(Sources {
+            meminfo_total_mib: Some(64000),
+            amd: vec![
+                card(1, "0000:03:00.0", "1002:744c", "gfx1100", 24),
+                card(2, "0000:13:00.0", "1002:164e", "gfx1036", 0),
+                card(3, "0000:2a:00.0", "1002:744c", "gfx1100", 24),
+            ],
+            ..Sources::default()
+        });
+        let indexes: Vec<u8> = hardware.gpus.iter().map(|gpu| gpu.index).collect();
+        assert_eq!(indexes, vec![0, 2]);
+        assert_eq!(hardware.accelerator_memory_mib, Some(49152));
+    }
+
+    #[test]
+    fn sysfs_cards_are_ordered_by_kfd_node() {
+        let gpus = read_amd_sysfs(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hardware/strix-halo/root"),
+        );
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].kfd_node, Some(1));
+        assert_eq!(gpus[0].gfx_target.as_deref(), Some("gfx1151"));
+    }
+
+    #[test]
     fn a_discrete_amd_card_counts_its_vram() {
         let gpu = AmdGpu {
+            kfd_node: Some(1),
             pci_slot: "0000:03:00.0".into(),
             pci_id: Some("1002:744c".into()),
             vram_bytes: Some(24 * 1024 * MIB),
@@ -921,6 +982,11 @@ mod tests {
         // A banner holding brackets before the JSON.
         let names = parse_amd_smi_names(
             "[WARNING] driver {old}\n[{\"gpu\":0,\"asic\":{\"market_name\":\"AMD Radeon RX 7900 XTX\"},\"bus\":{\"bdf\":\"0000:03:00.0\"}}]",
+        );
+        assert_eq!(names.len(), 1);
+        // And a footer after it.
+        let names = parse_amd_smi_names(
+            "[{\"gpu\":0,\"asic\":{\"market_name\":\"AMD Radeon RX 7900 XTX\"},\"bus\":{\"bdf\":\"0000:03:00.0\"}}]\nWARNING: done\n",
         );
         assert_eq!(names.len(), 1);
         // A banner before the JSON and an `N/A` name.
