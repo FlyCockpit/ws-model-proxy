@@ -449,6 +449,8 @@ export function startRelayAttempt({
     started: started.promise,
     terminal: terminal.promise,
     cancel(reason) {
+      // A settled attempt is over on the node too: a second cancel frame would be noise.
+      if (terminalSettled) return;
       manager.cancelRelayRequest({ nodeId, requestId, reason });
       finish({
         ok: false,

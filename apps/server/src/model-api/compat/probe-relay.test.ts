@@ -95,6 +95,8 @@ describe("engine description probe through the relay executor", () => {
     await drainTurns();
     expect(unhandled).toEqual([]);
     expect(vi.getTimerCount()).toBe(0);
+    // One cancel: the probe's own cancel after the settled timeout sends nothing more.
+    expect(manager.cancelRelayRequest).toHaveBeenCalledOnce();
     expect(manager.cancelRelayRequest).toHaveBeenCalledWith(
       expect.objectContaining({ nodeId: "node-1", reason: "timeout" }),
     );
