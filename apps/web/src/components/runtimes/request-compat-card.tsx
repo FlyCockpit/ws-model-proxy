@@ -179,7 +179,8 @@ function defaultValueOf(text: string): string | number | boolean | null | undefi
   if (trimmed === "true") return true;
   if (trimmed === "false") return false;
   if (trimmed === "null") return null;
-  if (/^-?\d+(\.\d+)?$/.test(trimmed)) return Number(trimmed);
+  if (trimmed !== "" && /^[-+.\deE]+$/.test(trimmed) && Number.isFinite(Number(trimmed)))
+    return Number(trimmed);
   return trimmed.length <= 128 && /^[A-Za-z0-9 _.,:;=+@-]*$/.test(trimmed) ? trimmed : undefined;
 }
 

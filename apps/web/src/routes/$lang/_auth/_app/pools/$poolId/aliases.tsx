@@ -37,10 +37,6 @@ type AliasView = Awaited<
 type ApiKeyView = Awaited<ReturnType<AppRouterClient["access"]["apiKeys"]["list"]>>["keys"][number];
 
 const K = "dashboard:pool.aliases";
-/**
- * Mirrors `modelAliasNameSchema` (packages/api/src/contracts/pools.ts), which the web cannot
- * import on its own; the server validates again.
- */
 
 /** Keys that may call this pool now (the server refuses others with alias_key_not_allowed). */
 function keysForPool(keys: readonly ApiKeyView[], poolId: string, now: number): ApiKeyView[] {

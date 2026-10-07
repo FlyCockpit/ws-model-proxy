@@ -84,6 +84,7 @@ export function RequestProfileCard({ runtime }: { runtime: RuntimeDetail }) {
         title={t(`${K}.forgetTitle`)}
         description={t(`${K}.forgetHint`)}
         confirmLabel={t(`${K}.forget`)}
+        pendingLabel={t("common:actions.saving")}
         isPending={update.isPending}
         onConfirm={async () => {
           try {

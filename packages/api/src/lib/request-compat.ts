@@ -396,8 +396,19 @@ export const requestCompatSchema = z
      */
     unknownFieldPolicy: z.enum(UNKNOWN_FIELD_POLICIES).optional(),
     /** Semantic paths the operator accepts losing when the engine rejects them. */
-    allowDropSemanticFields: z.array(fieldPathSchema).max(16).optional(),
-    rewriteRules: z.array(rewriteRuleSchema).max(MAX_REWRITE_RULES).optional(),
+    allowDropSemanticFields: z
+      .array(fieldPathSchema)
+      .max(16)
+      .refine((paths) => new Set(paths).size === paths.length, "each path once")
+      .optional(),
+    rewriteRules: z
+      .array(rewriteRuleSchema)
+      .max(MAX_REWRITE_RULES)
+      .refine(
+        (rules) => new Set(rules.map((rule) => JSON.stringify(rule))).size === rules.length,
+        "each rule once",
+      )
+      .optional(),
     /** Per client header: forward or strip (absent: the protocol default, learned from 400s). */
     headers: z.partialRecord(z.enum(COMPAT_HEADERS), z.enum(["forward", "strip"])).optional(),
     /** Fields the proxy adds itself (absent: from the engine and its description). */
