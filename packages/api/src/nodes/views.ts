@@ -41,6 +41,7 @@ export const nodeSummarySelect = {
   trustLowerRequestedAt: true,
   labels: true,
   declaredResources: true,
+  declaredResourcesBy: true,
   nodeInfo: true,
   nodeMetrics: true,
   nodeMetricsAt: true,
@@ -76,6 +77,7 @@ export function toNodeSummary(row: NodeSummaryRow, now: Date): NodeSummary {
   }
   const hardware = effectiveHardware({
     declaredResources: row.declaredResources,
+    declaredBy: row.declaredResourcesBy,
     nodeInfo: row.nodeInfo,
     nodeMetrics: row.nodeMetrics,
     nodeMetricsAt: row.nodeMetricsAt,
@@ -120,6 +122,7 @@ type NodeListSelected = Prisma.NodeGetPayload<{ select: typeof nodeListSelect }>
 export function toNodeListRow(row: NodeListSelected, now: Date): NodeListRow {
   const hardware = effectiveHardware({
     declaredResources: row.declaredResources,
+    declaredBy: row.declaredResourcesBy,
     nodeInfo: row.nodeInfo,
     nodeMetrics: row.nodeMetrics,
     nodeMetricsAt: row.nodeMetricsAt,
@@ -351,6 +354,7 @@ export function toNodeDetail(
     features: features.success ? features.data : null,
     hardware: effectiveHardware({
       declaredResources: row.declaredResources,
+      declaredBy: row.declaredResourcesBy,
       nodeInfo: row.nodeInfo,
       nodeMetrics: row.nodeMetrics,
       nodeMetricsAt: row.nodeMetricsAt,

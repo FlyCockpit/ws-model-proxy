@@ -109,8 +109,16 @@ export const nodeProcedures = {
               : {}),
             ...(input.hardware !== undefined
               ? input.hardware === null
-                ? { declaredResources: Prisma.DbNull, declaredResourcesAt: null }
-                : { declaredResources: input.hardware, declaredResourcesAt: new Date() }
+                ? {
+                    declaredResources: Prisma.DbNull,
+                    declaredResourcesAt: null,
+                    declaredResourcesBy: null,
+                  }
+                : {
+                    declaredResources: input.hardware,
+                    declaredResourcesAt: new Date(),
+                    declaredResourcesBy: actor.actor,
+                  }
               : {}),
             ...(metricCommands !== undefined
               ? {

@@ -85,6 +85,8 @@ model Node {
   /// reservedMemoryGb, reservedVramGb{gpuKey}, gpus[{vendor,index,name,vramGb}] }.
   declaredResources       Json?
   declaredResourcesAt     DateTime?
+  /// Who declared it: USER (a person, shown as source "browser") or AGENT (source "agent").
+  declaredResourcesBy     Actor?
   /// Placement labels (people; agents at FULL, audited). Effective = these ∪ node-declared.
   labels                  String[]       @default([])
   /// Longest lifetime of one node command (`node_command_run` timeoutMs is capped by it).

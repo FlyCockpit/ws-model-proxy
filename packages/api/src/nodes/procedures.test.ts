@@ -283,6 +283,36 @@ describe("nodes.update", () => {
     expect(definitionChanged).toHaveBeenCalledWith(["node-1"]);
   });
 
+  it("records who declared the hardware, and shows an agent's declaration as source agent", async () => {
+    db.node.findFirst
+      .mockResolvedValueOnce(trustRow as never)
+      .mockResolvedValueOnce(nodeRow() as never);
+    db.node.updateMany.mockResolvedValueOnce({ count: 1 });
+    await client(FULL_AGENT).update({ nodeId: "node-1", hardware: { reservedMemoryGb: 8 } });
+    expect(db.node.updateMany.mock.calls[0]?.[0]?.data).toMatchObject({
+      declaredResources: { reservedMemoryGb: 8 },
+      declaredResourcesBy: "AGENT",
+    });
+
+    db.node.findFirst.mockResolvedValueOnce(
+      nodeRow({
+        declaredResources: { reservedMemoryGb: 8 },
+        declaredResourcesBy: "AGENT",
+      }) as never,
+    );
+    const byAgent = await client().get({ nodeId: "node-1" });
+    expect(byAgent.hardware.reservedMemoryGb).toEqual({ value: 8, source: "agent" });
+
+    db.node.findFirst
+      .mockResolvedValueOnce(trustRow as never)
+      .mockResolvedValueOnce(nodeRow() as never);
+    db.node.updateMany.mockResolvedValueOnce({ count: 1 });
+    await client().update({ nodeId: "node-1", hardware: null });
+    expect(db.node.updateMany.mock.calls[1]?.[0]?.data).toMatchObject({
+      declaredResourcesBy: null,
+    });
+  });
+
   it("replaces fabric memberships and refreshes every affected member's hash", async () => {
     db.node.findFirst
       .mockResolvedValueOnce(trustRow as never)

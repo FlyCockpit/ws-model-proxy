@@ -57,7 +57,8 @@ export const nodeTrustViewSchema = z
   })
   .strict();
 
-const hardwareSourceSchema = z.enum(["browser", "node", "detected"]);
+/** `browser`: declared by a person; `agent`: declared by an agent (node_update). */
+const hardwareSourceSchema = z.enum(["browser", "agent", "node", "detected"]);
 function sourced<T extends z.ZodType>(value: T) {
   return z.object({ value: value.nullable(), source: hardwareSourceSchema.nullable() }).strict();
 }
