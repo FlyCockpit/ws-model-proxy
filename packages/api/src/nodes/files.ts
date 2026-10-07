@@ -300,7 +300,7 @@ const FILE_ERRORS: Readonly<Record<string, { status: FileErrorStatus; message: s
   path_denied: {
     status: "FORBIDDEN",
     message:
-      "That path is outside the node's file roots or protected (wsmp's own config, credentials and state are off limits). Use an absolute path under a file root.",
+      "That path is outside the node's file roots or protected (wsmp's own config, credentials and state are off limits). Use an absolute path under a file root: `~` and relative paths are not expanded (node_get lists the roots under features.files.roots).",
   },
   secret_file: {
     status: "FORBIDDEN",
