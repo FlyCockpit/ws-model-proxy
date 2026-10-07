@@ -51,6 +51,10 @@ integration("placement writes on PostgreSQL", () => {
 
   beforeAll(async () => {
     process.env.DATABASE_URL = databaseUrl;
+    // The runtimes router sends share invites (server env). CI sets these; a local run gets
+    // test-only values (never a real deployment's).
+    process.env.BETTER_AUTH_SECRET ??= "integration-test-secret-integration-test-secret";
+    process.env.BETTER_AUTH_URL ??= "http://localhost:3000";
     const [db, graph, runtimes, profiles] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("../lib/graph-write"),
