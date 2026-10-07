@@ -1,6 +1,6 @@
 /**
  * The 0.4.0 MCP tool manifest (spec §6): 27 tools, user nouns, no implementations.
- * `apps/server/src/mcp/tool-manifest.ts` registers these; handlers call the procedures named in
+ * `apps/server/src/mcp/tools.ts` registers these; handlers call the procedures named in
  * `procedures`. READ tokens see the read tools; FULL tokens see all. Every write takes an
  * optional `note`. Refusals carry `data.reason` with a message that says what to do next.
  *

@@ -1,328 +1,87 @@
 # MCP tool coverage
 
-GENERATED FILE — do not edit by hand. Produced from
-`apps/server/src/mcp/tool-manifest.ts` (`MCP_TOOL_MANIFEST` +
-`MCP_TOOL_EXCLUSIONS`) by `apps/server/src/mcp/tool-coverage-doc.ts`;
-`apps/server/src/mcp/tool-coverage-doc.test.ts` fails when this file
-drifts from the manifest. Regenerate with:
+GENERATED FILE — do not edit by hand. Produced from `MCP_TOOLS` and
+`MCP_EXCLUDED_SESSION_PROCEDURES` in `packages/api/src/contracts/mcp-tools.ts` and the
+procedure access levels in `packages/api/src/contracts/`;
+`packages/api/src/contracts/mcp-tool-coverage.test.ts` fails when this file drifts.
+Regenerate with:
 
 ```sh
-UPDATE_MCP_TOOL_COVERAGE=1 pnpm --filter server test -- tool-coverage-doc
+UPDATE_MCP_TOOL_COVERAGE=1 pnpm --filter @ws-model-proxy/api test mcp-tool-coverage
 ```
 
-Every `appRouter` leaf is either an MCP tool target or an explicit
-exclusion (invariant 12); the completeness check walks the real router and
-fails the suite when a leaf is unclassified.
+Every oRPC procedure appears below: called by one or more tools (`agent` access), kept off
+MCP with a reason (`session` access), or unreachable by agent credentials (`public`, `human`,
+`admin`, `human_admin`). See [MCP server](mcp.md) for scopes, errors and examples.
 
-## Coverage table
+## Tools (27)
 
-| Procedure / core target | Tool name | Scope | Confirmation | Side-effect class | Output projector | Feature gates | Exclusion reason |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `adminObservability.listCliDevices` | — (excluded) | — | — | — | — | — | Admin-only observability. |
-| `adminObservability.listEndpoints` | — (excluded) | — | — | — | — | — | Admin-only observability. |
-| `adminObservability.listModels` | — (excluded) | — | — | — | — | — | Admin-only observability. |
-| `adminObservability.listPools` | — (excluded) | — | — | — | — | — | Admin-only observability. |
-| `adminObservability.listRelayMetadataSummaries` | — (excluded) | — | — | — | — | — | Admin-only observability. |
-| `appConfig` | `app_config_get` | read | — | pure | — | — | — |
-| `auth.passwordCapabilities` | — (excluded) | — | — | — | — | — | Auth-router surface; not a model-proxy operation. |
-| `auth.updateLocale` | — (excluded) | — | — | — | — | — | Account identity management, not model-proxy operation. |
-| `auth.verifyEmailTransport` | — (excluded) | — | — | — | — | — | Auth-router surface; not a model-proxy operation. |
-| `capacityManagement.create` | `capacity_record_create` | write | — | pure | — | — | — |
-| `capacityManagement.list` | `capacity_records_list` | read | — | pure | — | — | — |
-| `capacityManagement.listAudit` | `capacity_audit_list` | read | — | pure | — | — | — |
-| `capacityManagement.remove` | `capacity_record_remove` | write | DELETE | destructive | — | — | — |
-| `capacityManagement.update` | `capacity_record_update` | write | — | pure | — | — | — |
-| `capacityManagement.updateDirectPolicy` | `capacity_direct_policy_update` | write | — | pure | — | — | — |
-| `capacityManagement.updateMemberPolicy` | `capacity_member_policy_update` | write | — | pure | — | — | — |
-| `capacityManagement.updatePoolPolicy` | `capacity_pool_policy_update` | write | — | pure | — | — | — |
-| `cliAgentActivity.list` | `forwarder_cli_activity_list` | read | — | pure | — | — | — |
-| `cliCredentials.approveDeviceLogin` | — (excluded) | — | — | — | — | — | Human-only browser approval of a `wsmp login`: an agent must never grant a CLI credential. |
-| `cliCredentials.createToken` | — (excluded) | — | — | — | — | — | Returns the one-time raw token secret. |
-| `cliCredentials.deviceLoginRequest` | — (excluded) | — | — | — | — | — | Browser device-login approval page read; not an MCP surface. |
-| `cliCredentials.exchangeDeviceCode` | — (excluded) | — | — | — | — | — | Public device-flow credential exchange; not an MCP surface. |
-| `cliCredentials.listTokens` | `cli_tokens_list` | read | — | pure | — | — | — |
-| `cliCredentials.resetTokenIdentity` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
-| `cliCredentials.revokeToken` | `cli_token_revoke` | write | DELETE | destructive | — | — | — |
-| `core:forwarderCliCommandResult` | `forwarder_cli_command_result` | write | — | pure | — | — | — |
-| `core:forwarderCliCommandRun` | `forwarder_cli_command_run` | write | RUN | external | — | — | — |
-| `core:forwarderCliFileDelete` | `forwarder_cli_file_delete` | write | DELETE | destructive | `projectFileToolOutput` | — | — |
-| `core:forwarderCliFileEdit` | `forwarder_cli_file_edit` | write | RUN | external | `projectFileToolOutput` | — | — |
-| `core:forwarderCliFileList` | `forwarder_cli_dir_list` | read | — | pure | `projectFileToolOutput` | — | — |
-| `core:forwarderCliFileMkdir` | `forwarder_cli_dir_create` | write | RUN | external | `projectFileToolOutput` | — | — |
-| `core:forwarderCliFileRead` | `forwarder_cli_file_read` | read | — | pure | `projectFileToolOutput` | — | — |
-| `core:forwarderCliFileRename` | `forwarder_cli_file_rename` | write | RUN | external | `projectFileToolOutput` | — | — |
-| `core:forwarderCliFileSearch` | `forwarder_cli_file_search` | read | — | pure | `projectFileToolOutput` | — | — |
-| `core:forwarderCliFileStat` | `forwarder_cli_file_stat` | read | — | pure | `projectFileToolOutput` | — | — |
-| `core:forwarderCliFileWrite` | `forwarder_cli_file_write` | write | RUN | external | `projectFileToolOutput` | — | — |
-| `core:forwarderCliSupervisedCommandStart` | `forwarder_cli_supervised_command_start` | write | RUN | external | — | — | — |
-| `core:model-api/runChatCompletionDiagnostic` | `forwarder_chat_completion_test` | write | RUN | cost | — | — | — |
-| `core:model-api/runPoolMemberTest` | `forwarder_pool_member_test` | write | RUN | cost | — | — | — |
-| `deploymentFeatures` | — (excluded) | — | — | — | — | — | Admin-only deployment inventory, including keyring status. |
-| `deploymentFlags` | — (excluded) | — | — | — | — | — | Signed-in product gates. The browser reads them; MCP does not. |
-| `deployments.applyPlan` | `deployment_plan_apply` | write | RUN | external | — | — | — |
-| `deployments.confirmPlan` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
-| `deployments.createConfig` | `deployment_config_create` | write | — | pure | — | — | — |
-| `deployments.deleteConfig` | — (excluded) | — | — | — | — | — | Human-only recipe deletion; agents may edit recipes but never delete them. |
-| `deployments.getConfig` | `deployment_config_get` | read | — | pure | — | — | — |
-| `deployments.getInstance` | `deployment_instance_get` | read | — | pure | — | — | — |
-| `deployments.listConfigs` | `deployment_configs_list` | read | — | pure | — | — | — |
-| `deployments.listInstances` | `deployment_instances_list` | read | — | pure | — | — | — |
-| `deployments.operatorNeeds` | — (excluded) | — | — | — | — | — | Dashboard notice feed; agents read the same needsOperator fields through deployment_instances_list. |
-| `deployments.pendingPlans` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
-| `deployments.planStart` | `deployment_plan_start` | write | — | pure | — | — | — |
-| `deployments.planStatus` | `deployment_plan_status` | read | — | pure | — | — | — |
-| `deployments.planStop` | `deployment_plan_stop` | write | — | pure | — | — | — |
-| `deployments.reopenOperatorStep` | — (excluded) | — | — | — | — | — | Human-only: interactive recipe steps wait for the owner, who restarts or reopens them from the dashboard; never an agent tool. |
-| `deployments.restartInstance` | — (excluded) | — | — | — | — | — | Human-only: interactive recipe steps wait for the owner, who restarts or reopens them from the dashboard; never an agent tool. |
-| `deployments.setAgentsMayPreempt` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
-| `deployments.setNodeGrant` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
-| `deployments.updateConfig` | `deployment_config_update` | write | — | pure | — | — | — |
-| `devices.list` | — (excluded) | — | — | — | — | — | Admin-only device administration. |
-| `devices.revoke` | — (excluded) | — | — | — | — | — | Admin-only device administration. |
-| `forwarderManagement.addPoolMember` | `forwarder_pool_member_add` | write | — | pure | — | — | — |
-| `forwarderManagement.addProviderPoolMember` | `forwarder_provider_member_add` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `forwarderManagement.cacheAffinityStats` | `forwarder_affinity_stats_get` | read | — | pure | — | — | — |
-| `forwarderManagement.clearCacheAffinity` | `forwarder_affinity_clear` | write | DELETE | destructive | — | — | — |
-| `forwarderManagement.clearCliDeviceEngineAdapters` | `forwarder_device_engine_adapters_clear` | write | RUN | external | — | — | — |
-| `forwarderManagement.createGuardedModelPool` | `forwarder_guarded_pool_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `forwarderManagement.createModelPool` | `forwarder_model_pool_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `forwarderManagement.deleteModelPool` | `forwarder_model_pool_delete` | write | DELETE | destructive | — | — | — |
-| `forwarderManagement.getCliDevice` | `forwarder_cli_device_get` | read | — | pure | — | — | — |
-| `forwarderManagement.getCliDeviceMetrics` | `forwarder_device_metrics_get` | read | — | pure | — | — | — |
-| `forwarderManagement.getEngineLoadHistory` | `forwarder_engine_load_history_get` | read | — | pure | — | — | — |
-| `forwarderManagement.getModelPool` | `forwarder_model_pool_get` | read | — | pure | — | — | — |
-| `forwarderManagement.getPoolRoutingRules` | `forwarder_pool_routing_rules_get` | read | — | pure | — | — | — |
-| `forwarderManagement.getProfileSlug` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
-| `forwarderManagement.grantPoolAccessByEmail` | `forwarder_pool_grant_create` | write | — | pure | — | — | — |
-| `forwarderManagement.listCliDeviceSummaries` | `forwarder_cli_devices_list` | read | — | pure | — | — | — |
-| `forwarderManagement.listCliDevices` | — (excluded) | — | — | — | — | — | Dashboard inventory inlines models and capability JSON. Agents use forwarder_cli_devices_list and forwarder_cli_device_get. |
-| `forwarderManagement.listGuardedOverflowCandidates` | `forwarder_guarded_candidates_list` | read | — | pure | — | — | — |
-| `forwarderManagement.listModelPoolSummaries` | `forwarder_model_pools_list` | read | — | pure | — | — | — |
-| `forwarderManagement.listModelPools` | — (excluded) | — | — | — | — | — | Dashboard inventory inlines members and models. Agents use forwarder_model_pools_list and forwarder_model_pool_get. |
-| `forwarderManagement.poolCacheStats` | `forwarder_pool_cache_stats_get` | read | — | pure | — | — | — |
-| `forwarderManagement.previewProfileSlugChange` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
-| `forwarderManagement.removeCliDeviceMetadata` | `forwarder_cli_metadata_remove` | write | DELETE | destructive | — | — | — |
-| `forwarderManagement.removeDiscoveredModelMetadata` | `forwarder_model_metadata_remove` | write | DELETE | destructive | — | — | — |
-| `forwarderManagement.removeEndpointMetadata` | `forwarder_endpoint_metadata_remove` | write | DELETE | destructive | — | — | — |
-| `forwarderManagement.removePoolMember` | `forwarder_pool_member_remove` | write | DELETE | destructive | — | — | — |
-| `forwarderManagement.renameCliDevice` | `forwarder_cli_device_rename` | write | — | pure | — | — | — |
-| `forwarderManagement.reorderProviderPoolMember` | `forwarder_provider_member_reorder` | write | — | pure | — | — | — |
-| `forwarderManagement.revokePoolAccessByEmail` | `forwarder_pool_grant_revoke` | write | DELETE | destructive | — | — | — |
-| `forwarderManagement.setCliDeviceEngineAdapters` | `forwarder_device_engine_adapters_set` | write | RUN | external | — | — | — |
-| `forwarderManagement.setCliDeviceFeatureGrants` | — (excluded) | — | — | — | — | — | Human-only device grants including read-only file consent; requires the CLI read switch and configured roots reports. |
-| `forwarderManagement.setCliDeviceLabels` | — (excluded) | — | — | — | — | — | Human-only node placement labels. Agents read labels on forwarder_cli_devices_list, forwarder_cli_device_get, and forwarder_device_metrics_get. |
-| `forwarderManagement.setCliDeviceMetricSources` | `forwarder_device_metric_sources_set` | write | RUN | external | — | — | — |
-| `forwarderManagement.setCliDeviceUsableBudgets` | — (excluded) | — | — | — | — | — | Human-only usable memory/RAM/VRAM budgets. Agents read the effective budgets on forwarder_cli_device_get and forwarder_device_metrics_get. |
-| `forwarderManagement.setDiscoveredModelCapabilityProfile` | `forwarder_model_capability_profile_set` | write | — | pure | — | — | — |
-| `forwarderManagement.setPoolMemberEngineLoad` | `forwarder_pool_member_engine_load_set` | write | RUN | cost | — | — | — |
-| `forwarderManagement.setPoolRoutingRules` | `forwarder_pool_routing_rules_set` | write | RUN | cost | — | — | — |
-| `forwarderManagement.updateDiscoveredModelAttachmentLimit` | `forwarder_model_attachment_limit_update` | write | — | pure | — | — | — |
-| `forwarderManagement.updateDiscoveredModelCapabilities` | `forwarder_model_capabilities_update` | write | — | pure | — | — | — |
-| `forwarderManagement.updateModelPool` | `forwarder_model_pool_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `forwarderManagement.updatePoolGrant` | `forwarder_pool_grant_update` | write | — | pure | — | — | — |
-| `forwarderManagement.updatePoolMember` | `forwarder_pool_member_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `forwarderManagement.updateProfileSlug` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
-| `forwarderManagement.visibleModels` | `forwarder_models_visible_list` | read | — | pure | — | — | — |
-| `inferenceContributions.accept` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
-| `inferenceContributions.list` | `inference_contributions_list` | read | — | pure | — | — | — |
-| `inferenceContributions.offer` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
-| `inferenceContributions.revoke` | `inference_contribution_revoke` | write | — | pure | — | — | — |
-| `mcpGrants.listMine` | — (excluded) | — | — | — | — | — | Human-only MCP grant management (Phase 7): a connected MCP client must not enumerate the user's other authorizations. |
-| `mcpGrants.revokeMine` | — (excluded) | — | — | — | — | — | Human-only MCP grant revocation (Phase 7): only the browser session may kill grant generations. |
-| `mcpTokens.create` | — (excluded) | — | — | — | — | — | Returns the one-time raw MCP personal-token secret; human-only browser session. |
-| `mcpTokens.listMine` | — (excluded) | — | — | — | — | — | Human-only MCP personal-token management: a connected MCP client must not enumerate the user's other credentials. |
-| `mcpTokens.revokeMine` | — (excluded) | — | — | — | — | — | Human-only MCP personal-token revocation: only the browser session may kill PAT generations. |
-| `mcpTokens.updateMine` | — (excluded) | — | — | — | — | — | Human-only MCP personal-token capability edits: a connected MCP client must not widen or narrow its own or other credentials. |
-| `modelApiTokens.create` | — (excluded) | — | — | — | — | — | Returns the one-time raw token secret. |
-| `modelApiTokens.list` | `model_api_tokens_list` | read | — | pure | — | — | — |
-| `modelApiTokens.preview` | `model_api_tokens_preview` | read | — | pure | — | — | — |
-| `modelApiTokens.revoke` | `model_api_token_revoke` | write | DELETE | destructive | — | — | — |
-| `modelApiTokens.updateExternalAccess` | — (excluded) | — | — | — | — | — | Human-only external-provider consent: an agent must never raise its own token's egress permission. |
-| `modelApiTokens.updateExternalWait` | `model_api_token_external_wait_update` | write | — | pure | — | — | — |
-| `overview.health` | `overview_health` | read | — | pure | — | — | — |
-| `overview.metrics` | `overview_metrics` | read | — | pure | — | — | — |
-| `poolFallback.get` | `forwarder_pool_fallback_get` | read | — | pure | — | — | — |
-| `poolFallback.update` | `forwarder_pool_fallback_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `poolFallbackPreferences.clear` | — (excluded) | — | — | — | — | — | Human-only own-key preference management. |
-| `poolFallbackPreferences.list` | — (excluded) | — | — | — | — | — | Private dashboard preferences; MCP reads one pool through forwarder_pool_fallback_get. |
-| `poolFallbackPreferences.ownerAggregate` | — (excluded) | — | — | — | — | — | Dashboard aggregate count; MCP reads it through forwarder_pool_fallback_get. |
-| `poolFallbackPreferences.set` | — (excluded) | — | — | — | — | — | Human-only own-key egress consent. |
-| `providerCatalog.getPoolExternalEquivalent` | — (excluded) | — | — | — | — | — | Human-only pool external-equivalent picker. |
-| `providerCatalog.importModel` | — (excluded) | — | — | — | — | — | Human-only catalog import; agents use the confirmed provider model tools. |
-| `providerCatalog.search` | — (excluded) | — | — | — | — | — | Human-only catalog picker: an outbound OpenRouter catalog fetch that stays out of MCP. |
-| `providerCatalog.setPoolExternalEquivalent` | — (excluded) | — | — | — | — | — | Human-only pool external-equivalent picker (the owner's BYOK consent). |
-| `providerManagement.activatePricingVersion` | `provider_pricing_version_activate` | write | RUN | external | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.createAccount` | `provider_account_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.createBudgetPolicy` | `provider_budget_policy_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.createCredential` | — (excluded) | — | — | — | — | — | Accepts plaintext provider secrets; permanently excluded by policy. |
-| `providerManagement.createModel` | `provider_model_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.createPricingVersion` | `provider_pricing_version_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.deactivateBudgetPolicy` | `provider_budget_policy_deactivate` | write | DELETE | destructive | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.deleteAccount` | `provider_account_delete` | write | DELETE | destructive | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.deleteModel` | `provider_model_delete` | write | DELETE | destructive | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.deletePricingVersion` | `provider_pricing_version_delete` | write | DELETE | destructive | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.getUsageTotals` | `provider_usage_totals_get` | read | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.listAccounts` | `provider_accounts_list` | read | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.listAuditEvents` | `provider_audit_events_list` | read | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.listBudgetActivity` | `provider_budget_activity_list` | read | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.listBudgetPolicies` | `provider_budget_policies_list` | read | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.listCredentials` | `provider_credentials_list` | read | — | pure | `projectCredentialRows` | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.listModels` | `provider_models_list` | read | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.listPricingVersions` | `provider_pricing_versions_list` | read | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.listProviderAttemptEvents` | `provider_attempt_events_list` | read | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.listProviderAttempts` | `provider_attempts_list` | read | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.listUsageReport` | — (excluded) | — | — | — | — | — | Overlaps the pageable usage report (provider_usage_page_list). |
-| `providerManagement.listUsageReportPage` | `provider_usage_page_list` | read | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.repairExpiredAttempts` | — (excluded) | — | — | — | — | — | Operational accounting repair (admin-operated). |
-| `providerManagement.replaceBudgetPolicy` | `provider_budget_policy_replace` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.replaceCredential` | — (excluded) | — | — | — | — | — | Accepts plaintext provider secrets; permanently excluded by policy. |
-| `providerManagement.retirePricingVersion` | `provider_pricing_version_retire` | write | RUN | external | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.revokeCredential` | `provider_credential_revoke` | write | DELETE | destructive | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.rotateCredential` | `provider_credential_reencrypt` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.setAccountEnabled` | `provider_account_enabled_set` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.setAllowDataCollection` | — (excluded) | — | — | — | — | — | Human-only OpenRouter privacy opt-out (D9): an agent must never relax an account's data_collection routing. |
-| `providerManagement.testCredential` | `provider_credential_test` | write | RUN | cost | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.updateAccount` | `provider_account_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.updateModel` | `provider_model_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `providerManagement.updatePricingVersion` | `provider_pricing_version_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
-| `relayMetadata.deleteOwn` | — (excluded) | — | — | — | — | — | Audit/history deletion without an agent workflow. |
-| `relayMetadata.listOwn` | `relay_requests_list` | read | — | pure | — | — | — |
-| `relayMetadata.prune` | — (excluded) | — | — | — | — | — | Admin-only accounting deletion. |
-| `settings.getAll` | — (excluded) | — | — | — | — | — | Global application settings read; not model-proxy operation. |
-| `settings.myNotificationPreferences` | — (excluded) | — | — | — | — | — | Notification settings are excluded from MCP. |
-| `settings.update` | — (excluded) | — | — | — | — | — | Admin-only global settings mutation. |
-| `settings.updateMyNotificationPreferences` | — (excluded) | — | — | — | — | — | Notification settings are excluded from MCP. |
-| `supervisedCommands.pending` | — (excluded) | — | — | — | — | — | Human-only supervised-command awareness: the person, not an agent, answers agent requests. |
-| `supervisedCommands.submitOutput` | — (excluded) | — | — | — | — | — | Human-only output review: an agent must never review or release the output of its own request. |
-| `users.archive` | — (excluded) | — | — | — | — | — | Admin-only account management. |
-| `users.invite` | — (excluded) | — | — | — | — | — | Admin-only account management. |
-| `users.list` | — (excluded) | — | — | — | — | — | Admin-only account management. |
-| `users.remove` | — (excluded) | — | — | — | — | — | Admin-only account management. |
-| `users.setRole` | — (excluded) | — | — | — | — | — | Admin-only account management. |
-| `users.unarchive` | — (excluded) | — | — | — | — | — | Admin-only account management. |
+READ tokens see the READ tools; FULL tokens see all. Every write takes an optional `note`.
 
-## Supervised CLI file writes
+| Tool | Token | Procedures | Confirm | Rate limit | Notes | Description |
+| --- | --- | --- | --- | --- | --- | --- |
+| `nodes_get` | READ | `nodes.list`, `nodes.get` | — | default | — | Your nodes, or one in detail: trust, hardware, fabrics, hold, held definitions, instances, found local servers, secret names. |
+| `runtimes_get` | READ | `runtimes.list`, `runtimes.get`, `runtimes.versions.list`, `runtimes.versions.get`, `runtimes.presets.list`, `runtimes.shares.list` | — | default | — | Your runtimes, or one in detail (versions: the version list; versionId: one full definition; presets: starting points; shared: definitions shared with you). |
+| `pools_get` | READ | `pools.list`, `pools.get`, `pools.history.list` | — | default | — | Your pools and pools shared with you, or one pool (history: its change log). |
+| `profiles_get` | READ | `profiles.list`, `profiles.get` | — | default | — | Your profiles, or one: owned nodes, hold lines, pinned versions, satisfied now. |
+| `providers_get` | READ | `providers.accounts.list`, `providers.models.list` | — | default | — | Cloud provider accounts and models with this month's spend (never keys). Only people change providers. |
+| `requests_list` | READ | `activity.requests.list` | — | default | — | Recent requests without prompts: route, what served them, timings, tokens, errors. |
+| `metrics_query` | READ | `activity.metrics.query` | — | default | — | Request, engine-load and node metrics for a pool, runtime, version, node or instance over a range, optionally grouped. Use it to compare versions after a change. |
+| `model_test` | FULL | `models.test` | — | 2/min (`bench`, only with `bench`) | — | Send a test to a callable ID (not :external) or one of your runtimes and see what served it and how fast; bench repeats it on your own pools and runtimes. |
+| `pool_create` | FULL | `pools.create` | — | default | compact: `advanced`, `routing` | Create a pool from your served models. Cloud fallback stays off until a person turns it on. |
+| `pool_update` | FULL | `pools.update`, `pools.members.addContributed`, `pools.members.removeContributed` | — | default | compact: `members`, `routing`, `cloud`, `advanced` | Change a pool you own, or contribute/withdraw your own served models in a pool shared with you (can contribute). People only: cloud mode, paid warm protection, own-key consent, only-my-own-hardware. |
+| `pool_delete` | FULL | `pools.delete` | `DELETE` | default | — | Delete a pool with its shares, contributed members, API-key entries and sidecar links. confirm: "DELETE". |
+| `runtime_create` | FULL | `runtimes.create`, `runtimes.presets.list`, `runtimes.fork` | — | default | compact: `spec`, `limits`, `advanced` | Define a runtime (a server on a node, or commands that start one), or copy one shared with you (forkFrom). Put model downloads and other setup in an idempotent prepare step so applying a profile on a fresh node fetches weights by itself. |
+| `runtime_update` | FULL | `runtimes.update`, `runtimes.models.setCapabilities` | — | default | compact: `spec`, `limits`, `advanced` | Save a new version (say why in note); limit edits apply live, a changed definition needs restartRunning. Setup such as model downloads belongs in the idempotent prepare step. |
+| `runtime_delete` | FULL | `runtimes.delete` | `DELETE` | default | — | Delete a runtime that no instance runs and no profile pins. confirm: "DELETE". |
+| `runtime_start` | FULL | `runtimes.start` | — | 10/min (`start_stop_apply`) | — | Start a runtime on nodes (or count instances placed for you), or restart an instance; preview shows placements and what stops. Refused on Relay-only and held nodes. |
+| `runtime_stop` | FULL | `runtimes.stop` | — | 10/min (`start_stop_apply`) | — | Stop an instance, or every instance of a runtime (optionally on one node). |
+| `profile_save` | FULL | `profiles.save` | — | default | — | Create or replace a profile: owned nodes and pinned runtime versions. Hold lines are for people. |
+| `profile_apply` | FULL | `profiles.apply` | — | 10/min (`start_stop_apply`) | — | Apply a profile (preview first if unsure): start its pins, stop other startable runtimes on its nodes. Refused if any owned node is Relay only. |
+| `profile_delete` | FULL | `profiles.delete` | `DELETE` | default | — | Delete a profile; nothing stops. confirm: "DELETE". |
+| `node_update` | FULL | `nodes.update` | — | default | compact: `hardware`, `metricCommands` | Change a Full-control node: labels, ports, hardware, metric commands, fabrics, command lifetime, rescan. |
+| `node_secret_set` | FULL | `nodes.secrets.set`, `nodes.secrets.delete` | — | default | secret input, never logged or echoed | Set (or with value null delete) a WSMP_SECRET_* on a Full-control node, for runtimes to reference by name. Write-only: never shown again. |
+| `node_command_run` | FULL | `nodes.commands.run` | `RUN` | 30/min (`node_command`) | — | Run a one-off command (downloads while experimenting, builds, diagnostics, benchmarks) on a Full-control node; answers within ~15 s, then poll with node_command_get. Anything that should keep running or serve traffic must be a runtime: a server started here is invisible to the proxy and dies with the command. confirm: "RUN". |
+| `node_command_get` | FULL | `nodes.commands.get` | — | default | — | State and output tail of a command from node_command_run; waitMs waits for it, cancel stops it and everything it started. |
+| `node_command_queue_for_user` | FULL | `nodes.queued.enqueue` | — | 30/min (`node_command`) | — | Queue a command a person must run (e.g. it needs their sudo password); it runs only when they press Run and Enter. |
+| `node_file_read` | FULL | `nodes.files.read` | — | default | — | Read, stat, list or search under the node's allowed folders; returns an etag. |
+| `node_file_write` | FULL | `nodes.files.write` | — | default | — | Write, mkdir, rename or delete under the node's allowed folders (ifMatch: the etag you read). |
+| `node_file_edit` | FULL | `nodes.files.edit` | — | default | — | Replace exact text in a file (ifMatch required); returns the new etag and a diff. |
 
-The five file mutation tools return a supervised request id when the node's effective
-mode is supervised. A person's keypress on the CLI-drawn screen is required; the CLI
-computes a complete diff from disk with byte provenance. Disk-derived removed/context
-lines are masked; an added line carrying any masked disk byte (including whole-line
-and continuation masks) blocks with redacted_span after dismissal. Pure requester
-additions stay visible with controls escaped. Diff and mask use LF-only lines; a
-lone CR stays escaped content, and unmappable line counts block with redacted_span.
-Details discloses creation mode, all preserved permission bits, parent creation,
-ifExists, overwrite and byte counts. Diffs exceeding
-the 8 KiB display cap are blocked with too_large after dismissal. A supervised directory
-rename without replacement is refused with unsupported on macOS. Poll `forwarder_cli_command_result` for
-`file:{op,result}` or `error:{code,message,outcome?}`. Approval implies no read grant.
-Physical root confinement (path_denied), including outside-root text, escaping links
-and unavailable roots, and normalized argument growth above 128 KiB (too_large)
-are blocked screens whose codes reach the agent only after dismissal. Aliases
-resolving inside roots are allowed. The child uses the daemon startup root snapshot;
-apply rechecks authoritative policy. Pre-display refusals depend only on request
-text/input policy (invalid_input, secret_file, protected/staging names, special trees,
-declared sizes), process/mode and capacity checks. The full read grant admits reads
-in supervised/off modes and never writes; off refuses writes.
-Server termination after dispatch without authoritative CLI settlement is unknown
-with started:true when the server received acceptance and started:null otherwise. CLI decline/rejection
-and blocked done before acceptance, and undispatched failures remain definitive.
-Finished file answers and their single audit event do not change on late reports.
-Only a supervised start id is delivered despite MCP abort; headless file results keep
-the abort fence. See [CLI file tools](mcp.md#cli-file-tools-relay-protocol-24).
+## Session procedures kept off MCP
 
-Overwrite rename preflights before capture and supports exchange-less no-replace
-and link mounts. Stable-inode link publication links the source onto the destination
-before capturing it; no-replace and noino/sshfs vacate first. Neither primitive
-means `unsafe_filesystem` with no public change. Plain link rename uses that same
-order, own-name alias proofs, and a source-bound etag at the published name.
-Directories require no-replace, never overwrite, and own-subtree moves are invalid_input.
-Alias cleanup vetoes the unlink on a believable link count below 2 (statx FORCE_SYNC on Linux, calibrated per operation) and reports a last surviving alias; residual
-(g) also applies to rename. Crash residue includes captured source/destination, an
-INTENT slot map fsynced before the first capture, and private preflight dummies.
-Startup reports `.wsmp-recover-*` and never deletes them; there is no replay. Rust tests
-cover Linux/macOS injected capability, ownership, race, cancellation and reply-loss
-tables; the strict real-mount test checks six declared primitive/inode classes (plus a constant-link-count and a cached-attribute class). CI
-runs it on real FUSE mounts in the `exchangeless-fs` job (`apps/cli/scripts/test-exchangeless-fs.sh`,
-no installs; a failed mount fails the job).
+| Procedure | Reason |
+| --- | --- |
+| `access.agentTokens.list` | Agent tokens are managed by people. |
+| `access.apiKeys.list` | API keys are managed by people. |
+| `access.contributing.pools` | pools_get lists pools shared with you and whether you may contribute. |
+| `access.oauthGrants.list` | Agent connections are managed by people. |
+| `access.shares.list` | Sharing is for people only; pools_get shows the count. |
+| `activity.commands.list` | Agents follow their own commands with node_command_get. |
+| `activity.needsYou.list` | Needs-you items are in runtimes_get (instances) and nodes_get. |
+| `activity.overview.summary` | Use metrics_query. |
+| `app.flags` | Web app switches. |
+| `auth.passwordCapabilities` | Web app plumbing. |
+| `auth.updateLocale` | Web app plumbing. |
+| `models.list` | Callable IDs are part of pools_get. |
+| `nodes.activity.list` | Audit history for people (agents see their own results). |
+| `nodes.credentials.list` | Credentials are managed by people. |
+| `nodes.enrollmentCodes.list` | Enrollment is a person's approval; agents never see codes. |
+| `nodes.fabrics.list` | nodes_get shows each node's fabrics and peers. |
+| `nodes.queued.list` | Queued items are shown in nodes_get. |
+| `providers.accounts.get` | providers_get covers accounts and models. |
+| `providers.attempts.list` | Use requests_list (cloud attempts are requests with route cloud). |
+| `providers.catalog.search` | Adding provider models is for people only. |
+| `providers.pricing.list` | providers_get shows the active price. |
+| `providers.usage.list` | Spend details are for people; providers_get shows the month's total. |
+| `runtimes.detected.add` | Agents use runtime_create with preset detected. |
+| `settings.get` | Account settings are for people. |
 
-## Human-only procedures (Phase 7)
+## Procedures agents can never reach
 
-The `mcpGrants` router (`packages/api/src/routers/mcp-grants.ts`) and the
-`mcpTokens` router (`packages/api/src/routers/mcp-tokens.ts`) are
-HUMAN-ONLY: they are mounted on `appRouter` for the browser-session settings
-page (`/{lang}/settings/mcp`) and are excluded from the MCP tool catalog in
-`MCP_TOOL_EXCLUSIONS`. None of these procedures may ever appear as an MCP
-tool: a connected MCP client must not be able to enumerate, mint, or revoke
-the human's other authorizations or personal tokens.
-
-Enforcement (all pinned by `apps/server/src/mcp/tool-manifest.test.ts`):
-
-- the invariant-12 completeness check walks every `appRouter` leaf and fails
-  unless each leaf is a tool target or an explicit `MCP_TOOL_EXCLUSIONS`
-  entry — adding `mcpGrants` or `mcpTokens` without an exclusion fails the
-  suite;
-- the pinned exclusion list asserts the `mcpGrants` and `mcpTokens` leaves
-  verbatim;
-- a dedicated Phase 7 assertion proves those leaves are absent from the tool
-  catalog under any name, and drives EVERY procedure-backed tool's real
-  invoker through a recording proxy client: each tool must dispatch to
-  exactly its declared target leaf (so a selector swap fails the suite) and
-  no dispatch may touch any `mcpGrants` or `mcpTokens` path.
-
-Unlike authorization, discovery, MCP login/consent, and `/mcp`, grant and
-token *revocation* and the settings page are deliberately NOT gated on
-`WMP_MCP_ENABLED` (invariant 13): humans must be able to kill outstanding
-authorization during an emergency MCP shutdown. Personal-token *creation*
-is gated on the flag. Normal browser authentication still applies.
-
-## External fallback settings and consent
-
-Sending request data to external providers needs consent a person gave.
-MCP tools can never grant it:
-
-- `modelApiTokens.updateExternalAccess` (a token's `allowExternal` and
-  per-pool `includeExternal`) is excluded from the catalog (decision C1);
-- `modelApiTokens.updateExternalWait` (a token's `externalAfterWaitMs`) is
-  an ordinary `mcp:write` tool, `model_api_token_external_wait_update`,
-  with no confirmation. Null uses each pool's wait. Pool `externalAfterWaitMs`
-  is an owner floor: callers may only lengthen, up to the local capacity wait
-  budget. A request header cannot go below the pool floor or past that budget.
-  Neither owners nor grantees can shorten requests below the pool floor. Every change writes a
-  `TOKEN_EXTERNAL_WAIT_UPDATED` provider audit event. MCP diagnostics cannot
-  use `:external`;
-- `providerManagement.setAllowDataCollection` (the OpenRouter
-  "providers that may collect data" opt-out, decision D9) is excluded, and
-  `provider_account_create` / `provider_account_update` reject
-  `allowDataCollection` in their input schemas; `providerManagement.updateAccount`
-  refuses an MCP session moving an OpenRouter account to another provider
-  type (the privacy preference is keyed on the type).
-
-The pool owner's fallback switches (`fallbackEnabled`,
-`fallbackForGrantees`, `externalAfterWaitMs`) are an ordinary
-`mcp:write` tool, `forwarder_pool_fallback_update`, with no per-change
-confirmation (owner decision on issue #67). Its description states the cost
-effect, and every change, from MCP or the dashboard, writes a
-`POOL_FALLBACK_UPDATED` provider audit event. So that the cost statement is
-always seen:
-
-- `forwarder_model_pool_create` and `forwarder_model_pool_update` reject
-  `fallbackEnabled` and `fallbackForGrantees` in their input schemas
-  (advertised as `not: {}` with a description naming
-  `forwarder_pool_fallback_update`), whatever the value; they still accept
-  `externalAfterWaitMs`, and their descriptions state its cost;
-- `forwarder_guarded_pool_create` rejects non-empty `providerModels`,
-  because attaching external members there turns fallback on implicitly.
-
-`forwarder_pool_fallback_get` reads the same data as the dashboard: owners
-get the switches, the external members in fallback order and the own-key
-request count; grantees get provider types only and their own-key route.
-
-`forwarder_affinity_clear` returns `{cleared: true, reclamation: "pending"}`.
-The pool's old hints are immediately ineligible; bounded background work reclaims
-their metadata. This does not delete the backend's stored Responses state or
-another pool's private hints. Ownership and DELETE confirmation remain required.
-
-No tool result can carry a secret value WMP holds (provider API keys,
-encrypted credential material, token secrets or hashes, device-flow and 2FA
-backup codes), in any encoding: pinned for every tool by
-`apps/server/src/mcp/secret-output.test.ts`. Pinned by `apps/server/src/mcp/tool-manifest.test.ts`.
+| Access | Procedures |
+| --- | --- |
+| `public` | `app.config`, `auth.inviteInfo`, `auth.verifyEmailTransport` |
+| `human` | `access.agentTokens.create`, `access.agentTokens.revoke`, `access.apiKeys.create`, `access.apiKeys.revoke`, `access.invites.resend`, `access.invites.revoke`, `access.oauthGrants.revoke`, `access.shares.create`, `access.shares.delete`, `access.shares.setOwnKey`, `access.shares.update`, `activity.requests.delete`, `auth.acceptInvite`, `nodes.credentials.revoke`, `nodes.delete`, `nodes.enrollmentCodes.create`, `nodes.enrollmentCodes.revoke`, `nodes.fabrics.delete`, `nodes.fabrics.rename`, `nodes.lowerTrust`, `nodes.lowerTrustPreview`, `nodes.queued.dismiss`, `nodes.queued.run`, `nodes.rename`, `nodes.setHold`, `nodes.setTemporary`, `nodes.terminals.openTicket`, `pools.cloud.setMode`, `pools.cloud.setOwnKeyEquivalent`, `pools.cloud.setPaidWarmProtection`, `pools.routing.setOwnHardwareOnly`, `pools.rules.delete`, `providers.accounts.create`, `providers.accounts.delete`, `providers.accounts.setDataCollection`, `providers.accounts.setEnabled`, `providers.accounts.update`, `providers.credentials.reencrypt`, `providers.credentials.replace`, `providers.credentials.revoke`, `providers.credentials.test`, `providers.models.create`, `providers.models.delete`, `providers.models.update`, `providers.pricing.activate`, `providers.pricing.create`, `providers.pricing.delete`, `providers.pricing.retire`, `providers.spendCaps.clear`, `providers.spendCaps.set`, `runtimes.instances.forget`, `runtimes.shares.create`, `runtimes.shares.delete`, `runtimes.steps.attach`, `runtimes.steps.cancel`, `runtimes.steps.reopen`, `settings.onboarding.complete`, `settings.update` |
+| `admin` | `adminObservability.nodes`, `adminObservability.pools`, `adminObservability.relay`, `adminObservability.runtimes`, `adminSettings.get`, `app.features`, `users.list` |
+| `human_admin` | `adminSettings.update`, `users.archive`, `users.invite`, `users.remove`, `users.setRole`, `users.unarchive` |
