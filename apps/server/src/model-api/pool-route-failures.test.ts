@@ -1,6 +1,7 @@
 /**
- * Route-level API adaptation (on by default): a request only an adapted member could serve, but
- * that the strict adapter cannot translate, fails closed with a 400 naming the feature.
+ * Pool route failures: a request only an adapted member could serve, but
+ * that the strict adapter cannot translate, fails closed with a 400 naming the feature; and a
+ * member that answers 5xx leaves its error message on the request row.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDeep, mockReset } from "vitest-mock-extended";
@@ -40,6 +41,19 @@ vi.mock("./public-overflow.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./public-overflow.js")>()),
   ...overflow,
 }));
+
+// The send permission check runs in a database transaction; here every send is authorized.
+vi.mock("./local-send.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./local-send.js")>();
+  const { startRelayAttempt } = await import("./relay-executor.js");
+  return {
+    ...actual,
+    startAuthorizedLocalRelayAttempt: async (
+      _binding: unknown,
+      args: Parameters<typeof startRelayAttempt>[0],
+    ) => startRelayAttempt(args),
+  };
+});
 
 const prisma = (await import("@ws-model-proxy/db")).default;
 const db = prisma as unknown as ReturnType<typeof mockDeep<PrismaClient>>;
@@ -149,14 +163,24 @@ const RESPONSES_ONLY_ROUTE: PoolRoute = {
   },
 };
 
+type Handlers = import("../relay/session-manager.js").ActiveRelayResponseHandlers;
+let handlers: Handlers | undefined;
+/** What the fake node answers to every relayed request. */
+let nodeAnswer: (handlers: Handlers, requestId: string) => void = () => undefined;
+
 function app() {
   return createModelApiRoutes({
     capacityRuntime: undefined,
     concurrencyLimiter: new ModelApiConcurrencyLimiter(),
     manager: {
       getOnlineNodeIds: () => ["node-1"],
-      registerRelayResponseHandlers: vi.fn(),
-      sendRelayRequest: vi.fn(),
+      registerRelayResponseHandlers: vi.fn((input: { handlers: Handlers }) => {
+        handlers = input.handlers;
+      }),
+      sendRelayRequest: vi.fn((input: { requestId: string }) => {
+        const current = handlers;
+        if (current) queueMicrotask(() => nodeAnswer(current, input.requestId));
+      }),
       cancelRelayRequest: vi.fn(),
       completeRelayRequest: vi.fn(),
       supportsCountContext: () => false,
@@ -207,5 +231,35 @@ describe("API adaptation on a pool", () => {
     const body = (await response.json()) as { error: { message: string; param: string | null } };
     expect(body.error.message).toContain("logprobs");
     expect(overflow.dispatchPublicOverflow).not.toHaveBeenCalled();
+  });
+
+  it("keeps the runtime's error message on the request when the only member answers 5xx", async () => {
+    // Run transactions against the mock so the request's terminal write is visible.
+    db.$transaction.mockImplementation((async (work: unknown) =>
+      typeof work === "function" ? work(db) : undefined) as never);
+    db.$queryRaw.mockResolvedValue([{ now: new Date() }] as never);
+    nodeAnswer = (h, requestId) => {
+      h.onHeaders({ type: "relay.response.headers", requestId, status: 500, headers: [] });
+      h.onBody(new TextEncoder().encode('{"error":{"message":"CUDA out of memory"}}'), {
+        type: "relay.response.body",
+        requestId,
+        chunkId: "0",
+      });
+      h.onComplete({ type: "relay.complete", requestId });
+    };
+    const response = await app().request("/responses", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_key_test", "content-type": "application/json" },
+      body: JSON.stringify({ model: "owner/chat", input: "hello" }),
+    });
+    await response.text();
+    expect(response.status).toBe(502);
+    await vi.waitFor(() => {
+      const excerpts = db.relayRequest.update.mock.calls.map(
+        (call) =>
+          (call[0]?.data as { upstreamErrorExcerpt?: unknown } | undefined)?.upstreamErrorExcerpt,
+      );
+      expect(excerpts).toContain("CUDA out of memory");
+    });
   });
 });

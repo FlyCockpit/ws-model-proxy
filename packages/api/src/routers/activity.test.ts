@@ -43,6 +43,7 @@ function client(auth: CallerAuth = PERSON) {
 const t0 = new Date("2026-10-06T12:00:00Z");
 const request = {
   id: "r2",
+  userId: "owner",
   createdAt: t0,
   source: "API_KEY" as const,
   status: "SUCCEEDED" as const,
@@ -92,6 +93,10 @@ describe("request log", () => {
     const next = await client().requests.list({ limit: 1, cursor: page.nextCursor ?? undefined });
     expect(next.items).toHaveLength(1);
     expect(JSON.stringify(db.relayRequest.findMany.mock.calls[1]?.[0]?.where)).toContain('"lt"');
+    // A share holder's request to my pool: its runtime error stays with that requester.
+    db.relayRequest.findMany.mockResolvedValueOnce([{ ...request, userId: "grantee" }] as never);
+    const theirs = await client().requests.list({ limit: 1 });
+    expect(theirs.items[0]?.upstreamError).toBeNull();
   });
 
   it("hides where another owner's pool ran my request, and keeps placement filters to mine", async () => {

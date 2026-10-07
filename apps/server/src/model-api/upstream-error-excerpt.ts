@@ -5,7 +5,8 @@
  *
  * Structured errors keep only their messages: OpenAI-style `error.message`, FastAPI/pydantic
  * `detail[]` as `loc: msg` (the `input` they echo, which can be prompt text, is dropped), and a
- * plain `detail`/`message`/`error` string. Anything else is the body text. The result is one line,
+ * plain `detail`/`message`/`error` string; other JSON is a fixed placeholder, and plain text is the
+ * body text. Anything that quotes the request (`input=…`) is cut. The result is one line,
  * control characters removed, product credentials, bearer values and JWTs redacted, and at most
  * `UPSTREAM_ERROR_EXCERPT_CHARS` characters.
  */
@@ -85,12 +86,24 @@ function clip(text: string): string {
     : text;
 }
 
+/**
+ * Validation messages that quote the request (vLLM/pydantic `input=`, `'input': …`,
+ * `input_value=`): everything from the quote on is dropped, since it can be prompt text.
+ */
+const ECHOED_INPUT =
+  /(?:\binput_value\s*=|\binput\s*=|['"]input['"]\s*:|\binput\s*:\s*['"{[]).*$/is;
+
+function withoutEchoedInput(text: string): string {
+  return text.replace(ECHOED_INPUT, "[input omitted]");
+}
+
 /** The excerpt of an error body's text, or null when it is empty. */
 export function upstreamErrorExcerptFromText(text: string): string | null {
   let message: string | null = null;
   const trimmed = text.trimStart();
   try {
-    message = structuredMessage(JSON.parse(text));
+    // JSON without a message we know is never stored raw: its fields can echo the request.
+    message = structuredMessage(JSON.parse(text)) ?? "(unrecognized JSON error body)";
   } catch {
     if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
       // JSON cut off at the read window: only a message field, never the echoed input.
@@ -98,7 +111,7 @@ export function upstreamErrorExcerptFromText(text: string): string | null {
       message = found ? found.replace(/\\(.)/g, "$1") : "(unreadable JSON error body)";
     }
   }
-  const line = oneLine(redact(message ?? text));
+  const line = oneLine(redact(withoutEchoedInput(message ?? text)));
   return line ? clip(line) : null;
 }
 
@@ -117,5 +130,50 @@ export function upstreamErrorExcerpt(
   }
   return upstreamErrorExcerptFromText(
     new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(0, offset)),
+  );
+}
+
+/** How long a failover waits for a failed answer's first bytes before moving on. */
+export const ERROR_BODY_WAIT_MS = 1_000;
+
+/**
+ * The excerpt of an error answer read from its body: at most `EXCERPT_SOURCE_BYTES`, waiting at
+ * most `waitMs` (a failover never stalls on a slow error body). The caller cancels the rest.
+ */
+export async function readUpstreamErrorExcerpt(
+  body: ReadableStream<Uint8Array> | null,
+  waitMs = ERROR_BODY_WAIT_MS,
+): Promise<string | null> {
+  if (!body) return null;
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), waitMs);
+  });
+  try {
+    while (total < EXCERPT_SOURCE_BYTES) {
+      const result = await Promise.race([reader.read(), deadline]);
+      if (result === "timeout" || result.done) break;
+      if (result.value) {
+        chunks.push(result.value);
+        total += result.value.byteLength;
+      }
+    }
+  } catch {
+    // An errored body: whatever arrived is the excerpt.
+  } finally {
+    clearTimeout(timer);
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return upstreamErrorExcerptFromText(
+    new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(0, EXCERPT_SOURCE_BYTES)),
   );
 }

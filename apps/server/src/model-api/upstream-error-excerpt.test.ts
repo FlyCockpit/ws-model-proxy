@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ResponseUsageRecorder } from "./response-usage-sample.js";
 import {
+  readUpstreamErrorExcerpt,
   UPSTREAM_ERROR_EXCERPT_CHARS,
   upstreamErrorExcerpt,
   upstreamErrorExcerptFromText,
@@ -47,6 +48,25 @@ describe("upstreamErrorExcerpt", () => {
     expect(excerpt).not.toContain("private");
   });
 
+  it("never stores prompt text a runtime echoes back", () => {
+    for (const body of [
+      JSON.stringify({ errors: [{ field: "messages", input: "MY SECRET PROMPT" }] }),
+      JSON.stringify({ detail: [{ loc: ["body"], input: "MY SECRET PROMPT" }] }),
+      JSON.stringify({
+        message: "1 validation error: {'type': 'missing', 'input': {'prompt': 'MY SECRET PROMPT'}}",
+      }),
+      JSON.stringify({ error: { message: "bad request: input_value='MY SECRET PROMPT'" } }),
+      "Error: messages must be a list (input=MY SECRET PROMPT)",
+    ]) {
+      const excerpt = upstreamErrorExcerptFromText(body);
+      expect(excerpt).not.toContain("SECRET");
+      expect(excerpt).not.toBeNull();
+    }
+    expect(
+      upstreamErrorExcerptFromText(JSON.stringify({ errors: [{ input: "MY SECRET PROMPT" }] })),
+    ).toBe("(unrecognized JSON error body)");
+  });
+
   it("reads only the message of JSON cut off at the read window", () => {
     const cut = `{"detail":[{"msg":"Field required","input":"${"private ".repeat(2000)}`;
     const excerpt = upstreamErrorExcerpt(sampleOf(cut));
@@ -67,5 +87,18 @@ describe("upstreamErrorExcerpt", () => {
   it("is null for an empty answer", () => {
     expect(upstreamErrorExcerpt(null)).toBeNull();
     expect(upstreamErrorExcerptFromText("  \n ")).toBeNull();
+  });
+
+  it("reads a failed answer's body without waiting on a stalled stream", async () => {
+    const encoder = new TextEncoder();
+    const stalled = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('{"error":{"message":"CUDA out'));
+        controller.enqueue(encoder.encode(' of memory"}}'));
+        // Never closes.
+      },
+    });
+    await expect(readUpstreamErrorExcerpt(stalled, 20)).resolves.toBe("CUDA out of memory");
+    await expect(readUpstreamErrorExcerpt(null)).resolves.toBeNull();
   });
 });

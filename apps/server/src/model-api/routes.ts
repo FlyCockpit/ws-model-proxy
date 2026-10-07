@@ -250,6 +250,7 @@ import {
   transcriptionCapabilityCompatible,
   transcriptionRequestProfileFromParts,
 } from "./transcription-request.js";
+import { readUpstreamErrorExcerpt } from "./upstream-error-excerpt.js";
 import { type RelayRequestSourceValue, transitionRelayRequestTerminal } from "./usage-rollup.js";
 import {
   assessWarmProtection,
@@ -2825,6 +2826,7 @@ async function failRelayMetadata({
   httpStatusCode,
   upstreamStatusCode,
   rejection,
+  upstreamErrorExcerpt,
 }: {
   relayRequestId: string;
   startedAt: Date;
@@ -2843,6 +2845,8 @@ async function failRelayMetadata({
   upstreamStatusCode?: number;
   /** Overrides the refusal reason derived from `failure` (refusals without an upstream). */
   rejection?: string | null;
+  /** The last runtime error answer of this request (default: `localTerminal`'s). */
+  upstreamErrorExcerpt?: string | null;
 }) {
   if (requestBytes !== undefined) {
     await prisma.relayRequest.update({
@@ -2879,6 +2883,7 @@ async function failRelayMetadata({
       metrics: null,
       responseBytes: responseBytes ?? 0,
       requestBytes: requestBytes ?? 0,
+      upstreamErrorExcerpt: upstreamErrorExcerpt ?? localTerminal?.upstreamErrorExcerpt ?? null,
     },
   });
 }
@@ -5190,6 +5195,7 @@ async function relayPool({
     if (
       failure === "unsupported_capability" &&
       operation.adaptation &&
+      allowsChatTestExecutionMode(testRoutingMode, "adapted") &&
       adaptedMemberRefused &&
       adaptationRefusal
     ) {
@@ -5905,6 +5911,8 @@ async function relayPool({
     return operationFailureResponse(operation, "unknown");
   }
   let finalFailure: ModelApiFailure = "unknown";
+  // The last member's error answer, kept for the request row when every member failed.
+  let lastUpstreamErrorExcerpt: string | null = null;
   // H1: set when the caller's own per-token/per-user cap stopped the retry
   // loop. That is never a fallback trigger; the caller gets 429.
   let callerLimitReached = false;
@@ -6323,6 +6331,9 @@ async function relayPool({
     try {
       const started = await attempt.started;
       if (started.status >= 500 && shouldRetryRelayOperation(operation, "precommit_5xx")) {
+        // What the runtime said, for the request row if no other member serves it.
+        lastUpstreamErrorExcerpt =
+          (await readUpstreamErrorExcerpt(started.body)) ?? lastUpstreamErrorExcerpt;
         attempt.cancel("upstream_5xx");
         const terminal = await attempt.terminal;
         await recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal).catch(
@@ -6967,6 +6978,7 @@ async function relayPool({
         () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
       ]);
       finalFailure = failure;
+      lastUpstreamErrorExcerpt = terminal.upstreamErrorExcerpt ?? lastUpstreamErrorExcerpt;
       // Only a retryable operation with a member-attributable failure writes
       // member health below (which clears the trial). Every other exit (client
       // abort, lease loss, non-member failure, or a non-retryable operation such
@@ -7050,6 +7062,7 @@ async function relayPool({
     attemptCount,
     requestBytes: cumulativeRequestBytes,
     responseBytes: cumulativeResponseBytes,
+    upstreamErrorExcerpt: lastUpstreamErrorExcerpt,
   });
   return operationFailureResponse(operation, finalFailure);
 }

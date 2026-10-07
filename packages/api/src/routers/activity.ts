@@ -56,6 +56,7 @@ const ROUTES = new Set(["local", "cloud", "own_key"]);
 
 const requestSelect = {
   id: true,
+  userId: true,
   createdAt: true,
   source: true,
   status: true,
@@ -164,7 +165,8 @@ const requests = {
         cacheReadTokens: row.cacheReadTokens,
         rejection: row.rejection,
         errorClass: row.errorClass,
-        upstreamError: own ? row.upstreamErrorExcerpt : null,
+        // The runtime's words about someone else's request stay with that requester.
+        upstreamError: own && row.userId === userId ? row.upstreamErrorExcerpt : null,
         httpStatusCode: row.httpStatusCode,
         attempts: row.attemptCount,
       };
