@@ -297,7 +297,12 @@ describe("createMcpRequestHandler — admission decisions", () => {
     expect(verified[0]?.orpcContext.session.session.token).toBe(MCP_SYNTHETIC_SESSION_TOKEN);
     expect(JSON.stringify(verified[0]?.orpcContext)).not.toContain(TOKEN);
     // The grant fixture has no FULL level, so the request is READ.
-    expect(verified[0]?.credential).toEqual({ kind: "oauth", grantId: GRANT_ID, level: "READ" });
+    expect(verified[0]?.credential).toEqual({
+      kind: "oauth",
+      grantId: GRANT_ID,
+      level: "READ",
+      levelReadAt: expect.any(Number),
+    });
     expect(verified[0]?.orpcContext.auth).toEqual({
       kind: "oauth_access_token",
       userId: SUB,

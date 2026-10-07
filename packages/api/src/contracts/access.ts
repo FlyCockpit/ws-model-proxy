@@ -49,6 +49,8 @@ export const oauthConnectionViewSchema = z
     clientName: z.string().nullable(),
     redirectHost: z.string().nullable(),
     level: z.enum(AGENT_LEVEL),
+    /** The approval included `mcp:write`, so Full can apply (else Full is refused). */
+    fullAvailable: z.boolean(),
     createdAt: isoDateSchema,
     revokedAt: isoDateSchema.nullable(),
   })
@@ -174,6 +176,12 @@ export const accessContract = {
       z.object({ grantId: idSchema }).strict(),
       okSchema,
       "Disconnect an OAuth agent.",
+    ),
+    setLevel: mutation(
+      "human",
+      z.object({ grantId: idSchema, level: z.enum(AGENT_LEVEL) }).strict(),
+      z.object({ level: z.enum(AGENT_LEVEL) }).strict(),
+      "Change an OAuth agent's access (Read-only or Full). Lowering ends its Full work now.",
     ),
   },
   shares: {

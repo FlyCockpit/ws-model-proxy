@@ -53,6 +53,12 @@ export type ContextServices = {
    * next lookup (every lookup reads `revokedAt`).
    */
   onAccessRevoked?: (event: AccessRevokedEvent) => Promise<void>;
+  /**
+   * A grant was lowered from Full to Read-only and committed. Every later lookup already reads
+   * READ; the server ends the work its Full level started (in-flight write tool calls, node
+   * commands and file ops, queued commands).
+   */
+  onAccessLevelLowered?: (event: AccessLevelLoweredEvent) => Promise<void>;
   /** Charges one public invite lookup to the caller's address; false: over its budget. */
   limitInviteLookup?: () => Promise<boolean>;
   /** Charges one signed-in invite acceptance (`auth.acceptInvite`) to the user; false: over. */
@@ -118,6 +124,9 @@ export type AccessRevokedEvent =
   | { kind: "agent_token"; userId: string; agentTokenId: string; grantId: string }
   | { kind: "oauth_grant"; userId: string; grantId: string; clientId: string }
   | { kind: "share"; ownerUserId: string; granteeUserId: string; poolId: string };
+
+/** A grant's level went from Full to Read-only and committed (`access.oauthGrants.setLevel`). */
+export type AccessLevelLoweredEvent = { kind: "oauth_grant"; userId: string; grantId: string };
 
 /** A node command's live status from the node (`exec.status`); null output when offline. */
 export type NodeCommandLiveStatus = {

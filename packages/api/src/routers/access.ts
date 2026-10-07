@@ -15,6 +15,10 @@ import {
   MCP_PAT_MAX_ACTIVE_PER_USER,
   mcpPatClientId,
 } from "@ws-model-proxy/auth/mcp-config";
+import {
+  MCP_GRANT_LEVEL_AUDIT,
+  setActiveMcpGrantLevel,
+} from "@ws-model-proxy/auth/mcp-grant-level";
 import { MCP_PAT_MAX_TTL_DAYS, mcpPatExpiryRejection } from "@ws-model-proxy/auth/mcp-pat-limits";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
@@ -343,6 +347,31 @@ function redirectHostOf(uris: readonly string[]): string | null {
   return null;
 }
 
+function generationKey(clientId: string, referenceId: string): string {
+  return `${clientId}\0${referenceId}`;
+}
+
+/**
+ * The grant generations (client, consent reference) whose remembered approval includes
+ * `mcp:write`: only those can ever act at Full (a request is Full only when its token carries
+ * `mcp:write`).
+ */
+async function writeApprovedGenerations(
+  userId: string,
+  clientIds: readonly string[],
+): Promise<Set<string>> {
+  if (clientIds.length === 0) return new Set();
+  const consents = await prisma.oauthConsent.findMany({
+    where: { userId, clientId: { in: [...clientIds] }, scopes: { has: "mcp:write" } },
+    select: { clientId: true, referenceId: true },
+  });
+  return new Set(
+    consents.flatMap((consent) =>
+      consent.referenceId === null ? [] : [generationKey(consent.clientId, consent.referenceId)],
+    ),
+  );
+}
+
 const oauthGrants = {
   list: contractProcedure(c.oauthGrants.list).handler(async ({ context }) => {
     const userId = userIdOf(context);
@@ -350,12 +379,23 @@ const oauthGrants = {
       where: { userId, NOT: { clientId: { startsWith: "pat:" } } },
       orderBy: { createdAt: "desc" },
       take: 200,
-      select: { id: true, clientId: true, level: true, createdAt: true, revokedAt: true },
+      select: {
+        id: true,
+        clientId: true,
+        referenceId: true,
+        level: true,
+        createdAt: true,
+        revokedAt: true,
+      },
     });
-    const clients = await prisma.oauthClient.findMany({
-      where: { clientId: { in: [...new Set(grants.map((grant) => grant.clientId))] } },
-      select: { clientId: true, name: true, redirectUris: true },
-    });
+    const clientIds = [...new Set(grants.map((grant) => grant.clientId))];
+    const [clients, writeApproved] = await Promise.all([
+      prisma.oauthClient.findMany({
+        where: { clientId: { in: clientIds } },
+        select: { clientId: true, name: true, redirectUris: true },
+      }),
+      writeApprovedGenerations(userId, clientIds),
+    ]);
     const byClientId = new Map(clients.map((client) => [client.clientId, client]));
     return {
       connections: grants
@@ -368,6 +408,7 @@ const oauthGrants = {
             clientName: client?.name ?? null,
             redirectHost: client ? redirectHostOf(client.redirectUris) : null,
             level: grant.level,
+            fullAvailable: writeApproved.has(generationKey(grant.clientId, grant.referenceId)),
             createdAt: grant.createdAt.toISOString(),
             revokedAt: grant.revokedAt?.toISOString() ?? null,
           };
@@ -411,6 +452,65 @@ const oauthGrants = {
       });
     }
     return { ok: true as const };
+  }),
+
+  /**
+   * A person sets a connection's level (human: cookie session + CSRF, never an agent). Lowering
+   * is read by the next lookup (`/mcp` and node admissions read the grant every time) and ends
+   * the work the Full level started (`onAccessLevelLowered`); raising applies from the next
+   * call. Audited like the consent page's choice (`mcp_grant.level`).
+   */
+  setLevel: contractProcedure(c.oauthGrants.setLevel).handler(async ({ context, input }) => {
+    const userId = userIdOf(context);
+    const grant = await prisma.mcpGrant.findFirst({
+      where: { id: input.grantId, userId, revokedAt: null },
+      select: { id: true, clientId: true, referenceId: true, level: true },
+    });
+    if (!grant || isMcpPatClientId(grant.clientId))
+      throw notFound("That key, token, connection, share or invite does not exist.");
+    if (
+      input.level === "FULL" &&
+      !(await writeApprovedGenerations(userId, [grant.clientId])).has(
+        generationKey(grant.clientId, grant.referenceId),
+      )
+    ) {
+      // Its tokens carry no mcp:write, so Full could never apply (and the consent page never
+      // offers it): the agent must reconnect asking for mcp:write.
+      throw badRequest(
+        "This agent did not ask to make changes when it connected. Reconnect it asking for mcp:write.",
+      );
+    }
+    const change = await prisma.$transaction((tx) =>
+      setActiveMcpGrantLevel(tx, {
+        grantId: grant.id,
+        userId,
+        expected: grant.level,
+        level: input.level,
+        action: MCP_GRANT_LEVEL_AUDIT.level,
+      }),
+    );
+    if (change === null) {
+      throw new ORPCError("CONFLICT", {
+        message: "This connection changed meanwhile. Reload and try again.",
+      });
+    }
+    if (change.lowered) {
+      // Committed: a failed cleanup must not turn the lowering into an error (every lookup
+      // already reads READ).
+      try {
+        await context.services?.onAccessLevelLowered?.({
+          kind: "oauth_grant",
+          userId,
+          grantId: grant.id,
+        });
+      } catch (error) {
+        console.error(
+          "[access] ending a lowered grant's Full work failed",
+          error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+        );
+      }
+    }
+    return { level: change.after };
   }),
 };
 

@@ -8,6 +8,8 @@
  *   read tools, FULL tokens all 27.
  * - `cancelMcpToolCallsForToken(credentialId)`: aborts the in-flight tool calls of one
  *   agent token or OAuth grant (call it when the token is revoked).
+ * - `cancelMcpWriteToolCallsForGrant(grantId)`: aborts the in-flight write tool calls of an
+ *   OAuth grant lowered from Full to Read-only.
  * - `runMcpTool(contract, state)`: one call through the wrapper chain (tests drive it).
  *
  * The wrapper chain of one call:
@@ -122,7 +124,9 @@ export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): vo
 
 // ── in-flight calls per credential (revocation) ──
 
-const inFlight = new Map<string, Set<AbortController>>();
+/** One in-flight call; `write`: a FULL-only tool (lowering a grant ends these). */
+type InFlightCall = { controller: AbortController; write: boolean };
+const inFlight = new Map<string, Set<InFlightCall>>();
 
 function credentialId(credential: McpRequestCredential): string {
   return credential.kind === "agent_token" ? credential.tokenId : credential.grantId;
@@ -157,27 +161,84 @@ export function cancelMcpToolCallsForToken(id: string): number {
   // Re-inserted at the end so the map stays in expiry order.
   recentlyRevoked.delete(id);
   recentlyRevoked.set(id, now + REVOKED_REMEMBER_MS);
-  const controllers = inFlight.get(id);
-  if (!controllers) return 0;
-  for (const controller of controllers) controller.abort();
+  const calls = inFlight.get(id);
+  if (!calls) return 0;
+  for (const call of calls) call.controller.abort();
   inFlight.delete(id);
-  return controllers.size;
+  return calls.size;
 }
 
-function trackCall(credential: McpRequestCredential, parent: AbortSignal | undefined) {
+/**
+ * OAuth grants lowered from Full to Read-only recently: grant id → `performance.now()` taken
+ * after the lowering committed. A write call whose request read the grant's level BEFORE that
+ * (`levelReadAt`, taken before the read) still carries the stale FULL; it is aborted when it
+ * registers. Requests that read the level later see READ and never reach a write tool. A few
+ * minutes covers every request between its level read and its call registration.
+ */
+const LOWERED_REMEMBER_MS = 5 * 60_000;
+const recentlyLowered = new Map<string, number>();
+
+/** Insertion order is lowering order (one window for all): stop at the first live entry. */
+function pruneLowered(now: number) {
+  for (const [key, at] of recentlyLowered) {
+    if (at + LOWERED_REMEMBER_MS > now) return;
+    recentlyLowered.delete(key);
+  }
+}
+
+function loweredSinceLevelRead(credential: McpRequestCredential): boolean {
+  if (credential.kind !== "oauth") return false;
+  pruneLowered(performance.now());
+  const at = recentlyLowered.get(credential.grantId);
+  return at !== undefined && at >= credential.levelReadAt;
+}
+
+/**
+ * An OAuth grant was lowered from Full to Read-only (committed): aborts its in-flight write
+ * (FULL-only) tool calls and any write call still registering with the stale level. Read calls
+ * go on; a later raise is honored from the next request (its level read is newer).
+ */
+export function cancelMcpWriteToolCallsForGrant(grantId: string): number {
+  const now = performance.now();
+  pruneLowered(now);
+  // Re-inserted at the end so the map stays in lowering order.
+  recentlyLowered.delete(grantId);
+  recentlyLowered.set(grantId, now);
+  const calls = inFlight.get(grantId);
+  if (!calls) return 0;
+  let aborted = 0;
+  for (const call of calls) {
+    if (!call.write) continue;
+    call.controller.abort();
+    aborted += 1;
+  }
+  return aborted;
+}
+
+function trackCall(
+  credential: McpRequestCredential,
+  parent: AbortSignal | undefined,
+  write: boolean,
+) {
   const controller = new AbortController();
   const onAbort = () => controller.abort();
-  if (parent?.aborted || revokedRecently(credentialId(credential))) controller.abort();
+  if (
+    parent?.aborted ||
+    revokedRecently(credentialId(credential)) ||
+    (write && loweredSinceLevelRead(credential))
+  )
+    controller.abort();
   else parent?.addEventListener("abort", onAbort, { once: true });
   const id = credentialId(credential);
-  const set = inFlight.get(id) ?? new Set<AbortController>();
-  set.add(controller);
+  const set = inFlight.get(id) ?? new Set<InFlightCall>();
+  const call: InFlightCall = { controller, write };
+  set.add(call);
   inFlight.set(id, set);
   return {
     signal: controller.signal,
     done: () => {
       parent?.removeEventListener("abort", onAbort);
-      set.delete(controller);
+      set.delete(call);
       if (set.size === 0 && inFlight.get(id) === set) inFlight.delete(id);
     },
   };
@@ -597,7 +658,7 @@ export async function runMcpTool(
     return toolError("Internal error", { error: { code: "INTERNAL_ERROR" }, requestId });
   }
 
-  const tracked = trackCall(credential, dispatch.signal);
+  const tracked = trackCall(credential, dispatch.signal, !READ_TOOL_NAMES.has(contract.name));
   const invoke = state.invoke ?? invokeBoundProcedure;
   try {
     const outputs: unknown[] = [];

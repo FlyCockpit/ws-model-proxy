@@ -136,7 +136,12 @@ describe("auth instance plugin wiring (real production instance)", () => {
   it("installs the MCP plugins after the two always-on plugins while WMP_MCP_ENABLED is true", () => {
     const ids = idsOf(auth.options);
     expect(ids.slice(0, ALWAYS_ON.length)).toEqual(ALWAYS_ON);
-    expect(ids.slice(ALWAYS_ON.length)).toEqual(["jwt", "oauth-provider", "cimd"]);
+    expect(ids.slice(ALWAYS_ON.length)).toEqual([
+      "jwt",
+      "oauth-provider",
+      "wsmp-mcp-consent-level",
+      "cimd",
+    ]);
   });
 
   it("installs only the always-on plugins when WMP_MCP_ENABLED is false", async () => {

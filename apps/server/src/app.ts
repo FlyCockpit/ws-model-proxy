@@ -6,6 +6,7 @@ import { RPCHandler } from "@orpc/server/fetch";
 import { SimpleCsrfProtectionHandlerPlugin } from "@orpc/server/plugins";
 import { ZodToJsonSchemaConverter } from "@orpc/zod/zod4";
 import {
+  type AccessLevelLoweredEvent,
   type Context as ApiContext,
   type ContextServices,
   createContext,
@@ -19,6 +20,7 @@ import type { Session } from "@ws-model-proxy/auth";
 import { auth as defaultAuth } from "@ws-model-proxy/auth";
 import { armAuthDbShutdownFence } from "@ws-model-proxy/auth/auth-db-shutdown-fence";
 import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
+import { onMcpGrantLevelLowered } from "@ws-model-proxy/auth/mcp-grant-level";
 import { onUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import { onUserDeleted, onUserDeletionMarked } from "@ws-model-proxy/auth/user-deletion-listeners";
 import { THEME_INIT_SCRIPT } from "@ws-model-proxy/config/theme-init";
@@ -28,7 +30,11 @@ import { Hono, type Context as HonoContext } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
-import { endAgentWork, handleAccessRevoked } from "./access-revocation.js";
+import {
+  endAgentWork,
+  handleAccessLevelLowered,
+  handleAccessRevoked,
+} from "./access-revocation.js";
 import { betterAuthAdminGate } from "./better-auth-admin-gate.js";
 import { resolveClientIp } from "./client-ip.js";
 import { CORS_ALLOW_HEADERS } from "./cors-headers.js";
@@ -43,7 +49,7 @@ import { createMcpAdmissionGate } from "./mcp/admission.js";
 import { createMcpRequestHandler, type McpAuthInstance } from "./mcp/auth.js";
 import { createMcpTransport } from "./mcp/handler.js";
 import { bindMcpToolDispatch } from "./mcp/tool-dispatch.js";
-import { cancelMcpToolCallsForToken } from "./mcp/tools.js";
+import { cancelMcpToolCallsForToken, cancelMcpWriteToolCallsForGrant } from "./mcp/tools.js";
 import { mcpAuthorizeScopeGuard } from "./mcp-authorize-scope-guard.js";
 import { createMcpDiscoveryForwarder, MCP_WELL_KNOWN_PATHS } from "./mcp-discovery.js";
 import {
@@ -266,6 +272,21 @@ onUserBanned(cancelRelayWorkForBannedUser);
 onUserBanned((userId) => realtimeSessionRegistry.terminateForUser(userId));
 
 /**
+ * A grant lowered from Full to Read-only (committed): its Full work ends now
+ * (./access-revocation.ts). Shared by the Access page (`onAccessLevelLowered`) and the consent
+ * page's re-approval (`onMcpGrantLevelLowered`, packages/auth/src/mcp-grant-level.ts).
+ */
+const endLoweredGrantWork = (event: AccessLevelLoweredEvent): Promise<void> =>
+  handleAccessLevelLowered(event, {
+    cancelMcpWriteToolCalls: (grantId) => cancelMcpWriteToolCallsForGrant(grantId),
+    endAgentWork: async (input) => {
+      await endAgentWork(input);
+      await cancelNodeCommandsForCredentials(input);
+    },
+  });
+onMcpGrantLevelLowered((event) => endLoweredGrantWork({ kind: "oauth_grant", ...event }));
+
+/**
  * The server hooks procedures may call (packages/api context). S0 wires the pool-routing
  * push; the lanes add theirs (credential revocation, relay pushes, live node state) next to
  * the procedures that need them.
@@ -300,6 +321,7 @@ function contextServices(request: HonoContext | null): ContextServices {
           await cancelNodeCommandsForCredentials(input);
         },
       }),
+    onAccessLevelLowered: endLoweredGrantWork,
   };
 }
 

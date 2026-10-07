@@ -19,12 +19,13 @@ vi.mock("@ws-model-proxy/db", async () => {
 const { MCP_READ_TOOLS, MCP_TOOL_NAMES, MCP_TOOLS } = await import("@ws-model-proxy/api/contracts");
 const {
   cancelMcpToolCallsForToken,
+  cancelMcpWriteToolCallsForGrant,
   mcpToolAllowed,
   resetMcpToolRateLimitsForTests,
   routeToolCall,
   runMcpTool,
 } = await import("./tools");
-const { testDispatch } = await import("./tools.test-helper");
+const { testDispatch, testOAuthDispatch } = await import("./tools.test-helper");
 
 function tool(name: string) {
   const contract = MCP_TOOLS.find((entry) => entry.name === name);
@@ -309,6 +310,76 @@ describe("cancellation", () => {
     });
     expect(structured(result).error).toEqual({ code: "REQUEST_ABORTED" });
     expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("lowering a grant to Read-only aborts its in-flight write calls and lets its reads finish", async () => {
+    const grantId = "lowered-grant";
+    let writeStarted: () => void = () => undefined;
+    const writeRunning = new Promise<void>((resolve) => {
+      writeStarted = resolve;
+    });
+    let readStarted: () => void = () => undefined;
+    const readRunning = new Promise<void>((resolve) => {
+      readStarted = resolve;
+    });
+    let finishRead: (value: unknown) => void = () => undefined;
+    const write = runMcpTool(tool("pool_delete"), {
+      dispatch: testOAuthDispatch("FULL", { grantId }),
+      args: { poolId: "p", confirm: "DELETE" },
+      invoke: () => {
+        writeStarted();
+        return new Promise(() => undefined);
+      },
+    });
+    const read = runMcpTool(tool("nodes_get"), {
+      dispatch: testOAuthDispatch("FULL", { grantId }),
+      args: {},
+      invoke: () => {
+        readStarted();
+        return new Promise((resolve) => {
+          finishRead = resolve;
+        });
+      },
+    });
+    await Promise.all([writeRunning, readRunning]);
+    expect(cancelMcpWriteToolCallsForGrant(grantId)).toBe(1);
+    expect(structured(await write).error).toEqual({ code: "REQUEST_ABORTED" });
+    finishRead({ nodes: [] });
+    expect((await read).isError).toBeUndefined();
+  });
+
+  it("aborts a write that registers after the lowering with a level read before it; not a newer read", async () => {
+    const grantId = "lowered-late-grant";
+    const readBefore = performance.now();
+    cancelMcpWriteToolCallsForGrant(grantId);
+    const stale = vi.fn(async () => ({}));
+    const staleResult = await runMcpTool(tool("pool_delete"), {
+      dispatch: testOAuthDispatch("FULL", { grantId, levelReadAt: readBefore }),
+      args: { poolId: "p", confirm: "DELETE" },
+      invoke: stale,
+    });
+    expect(structured(staleResult).error).toEqual({ code: "REQUEST_ABORTED" });
+    expect(stale).not.toHaveBeenCalled();
+
+    // A read call on the same stale request is not a write: it runs.
+    const reads = vi.fn(async () => ({ nodes: [] }));
+    const readResult = await runMcpTool(tool("nodes_get"), {
+      dispatch: testOAuthDispatch("FULL", { grantId, levelReadAt: readBefore }),
+      args: {},
+      invoke: reads,
+    });
+    expect(readResult.isError).toBeUndefined();
+    expect(reads).toHaveBeenCalledTimes(1);
+
+    // Raised again afterwards: a request that read the level after the lowering writes.
+    const fresh = vi.fn(async () => ({ ok: true }));
+    const freshResult = await runMcpTool(tool("pool_delete"), {
+      dispatch: testOAuthDispatch("FULL", { grantId, levelReadAt: performance.now() + 1 }),
+      args: { poolId: "p", confirm: "DELETE" },
+      invoke: fresh,
+    });
+    expect(freshResult.isError).toBeUndefined();
+    expect(fresh).toHaveBeenCalledTimes(1);
   });
 
   it("stops when the request's signal aborts", async () => {

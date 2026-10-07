@@ -796,6 +796,8 @@ async function handleVerifiedRequest({
     });
   }
   let grant: Awaited<ReturnType<typeof loadMcpGrant>>;
+  // Before the read: a lowering committed after this instant may not be in what it returns.
+  const levelReadAt = performance.now();
   try {
     grant = await loadMcpGrant(options.prisma, grantIdClaim);
   } catch (error) {
@@ -835,6 +837,7 @@ async function handleVerifiedRequest({
           kind: "oauth",
           grantId: grant.id,
           level: oauthLevel(grant.level, scopes),
+          levelReadAt,
         };
 
   // 6-7. Live user: missing → 401; active ban or pending deletion → 403; forced 2FA not set up → 403.
