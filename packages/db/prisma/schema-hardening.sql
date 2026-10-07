@@ -1120,8 +1120,10 @@ DROP TRIGGER IF EXISTS api_key_pool_access ON api_key_pool;
 CREATE TRIGGER api_key_pool_access BEFORE INSERT OR UPDATE ON api_key_pool
 FOR EACH ROW EXECUTE FUNCTION enforce_api_key_pool_access();
 
--- Share invites (owner decision round 3): an e-mail without an account yet. The invite keeps
--- the share's settings; acceptance (sign-up with that e-mail) creates the share and records it.
+-- Share invites (owner decision round 3): an e-mail whose mailbox is not proved. The target is
+-- a pool or (since the proved-mailbox rule) a runtime definition, never both. The invite keeps
+-- the share's settings; acceptance (the link, or a proved e-mail) creates the share and records
+-- it.
 -- A claim written before claims named their e-mail (fe5c26f7) is dropped, so the shape check
 -- below applies. The transition trigger (recreated below) would refuse it on a final invite.
 DROP TRIGGER IF EXISTS share_invite_transition ON share_invite;
@@ -1139,16 +1141,28 @@ ALTER TABLE share_invite ADD CONSTRAINT share_invite_shape CHECK (
   AND (("signupClaimedAt" IS NULL) = ("signupClaimedEmail" IS NULL))
   AND ("signupClaimedEmail" IS NULL OR "signupClaimedEmail" = lower(btrim("signupClaimedEmail")))
 );
+-- Exactly one target. A runtime share carries no settings: a runtime invite is "can use" only,
+-- and records a runtime share (never a pool share); a pool invite never records a runtime share.
+ALTER TABLE share_invite DROP CONSTRAINT IF EXISTS share_invite_target_shape;
+ALTER TABLE share_invite ADD CONSTRAINT share_invite_target_shape CHECK (
+  (("poolId" IS NULL) <> ("runtimeId" IS NULL))
+  AND ("runtimeShareId" IS NULL OR "acceptedAt" IS NOT NULL)
+  AND ("poolId" IS NULL OR "runtimeShareId" IS NULL)
+  AND ("runtimeId" IS NULL
+       OR ("shareId" IS NULL AND "canUse" AND NOT "canContribute" AND "priorityClass" IS NULL))
+);
 CREATE OR REPLACE FUNCTION enforce_share_invite_transition()
 RETURNS trigger LANGUAGE plpgsql AS $share_invite_transition$
 BEGIN
-  IF (to_jsonb(NEW) - ARRAY['updatedAt', 'emailSentAt', 'acceptedAt', 'shareId', 'revokedAt',
-                             'canUse', 'canContribute', 'priorityClass', 'tokenDigest',
-                             'expiresAt', 'signupClaimedAt', 'signupClaimedEmail']::text[])
+  IF (to_jsonb(NEW) - ARRAY['updatedAt', 'emailSentAt', 'acceptedAt', 'shareId',
+                             'runtimeShareId', 'revokedAt', 'canUse', 'canContribute',
+                             'priorityClass', 'tokenDigest', 'expiresAt', 'signupClaimedAt',
+                             'signupClaimedEmail']::text[])
       IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['updatedAt', 'emailSentAt', 'acceptedAt', 'shareId',
-                             'revokedAt', 'canUse', 'canContribute', 'priorityClass', 'tokenDigest',
-                             'expiresAt', 'signupClaimedAt', 'signupClaimedEmail']::text[]) THEN
-    RAISE EXCEPTION 'a share invite keeps its pool and e-mail' USING ERRCODE = '55000';
+                             'runtimeShareId', 'revokedAt', 'canUse', 'canContribute',
+                             'priorityClass', 'tokenDigest', 'expiresAt', 'signupClaimedAt',
+                             'signupClaimedEmail']::text[]) THEN
+    RAISE EXCEPTION 'a share invite keeps its target and e-mail' USING ERRCODE = '55000';
   END IF;
   -- Resend rotates the token and the expiry, only while the invite is pending, and the expiry
   -- only moves together with a new token (an old link never gets more time).
@@ -1169,17 +1183,28 @@ BEGIN
           OR NEW."priorityClass" IS DISTINCT FROM OLD."priorityClass"
           OR NEW."signupClaimedAt" IS DISTINCT FROM OLD."signupClaimedAt"
           OR NEW."signupClaimedEmail" IS DISTINCT FROM OLD."signupClaimedEmail"
-          OR (NEW."shareId" IS NOT NULL AND NEW."shareId" IS DISTINCT FROM OLD."shareId")) THEN
+          OR (NEW."shareId" IS NOT NULL AND NEW."shareId" IS DISTINCT FROM OLD."shareId")
+          OR (NEW."runtimeShareId" IS NOT NULL
+              AND NEW."runtimeShareId" IS DISTINCT FROM OLD."runtimeShareId")) THEN
     RAISE EXCEPTION 'an accepted or revoked share invite is final' USING ERRCODE = '55000';
   END IF;
-  -- The accepted share is a share of the invite pool, whatever the grantee e-mail: an invite
-  -- link is the proof, so the person who signed up through it may use another address
+  -- The accepted share is a share of the invite's pool or runtime, whatever the grantee e-mail:
+  -- an invite link is the proof, so the person who signed up through it may use another address
   -- (packages/api lib/invite-acceptance.ts decides when an e-mail match is enough).
   IF NEW."acceptedAt" IS NOT NULL AND OLD."acceptedAt" IS NULL
+     AND NEW."poolId" IS NOT NULL
      AND (NEW."shareId" IS NULL
           OR NOT EXISTS (SELECT 1 FROM share s
                           WHERE s.id = NEW."shareId" AND s."poolId" = NEW."poolId")) THEN
     RAISE EXCEPTION 'an accepted invite names a share of its pool' USING ERRCODE = '23514';
+  END IF;
+  IF NEW."acceptedAt" IS NOT NULL AND OLD."acceptedAt" IS NULL
+     AND NEW."runtimeId" IS NOT NULL
+     AND (NEW."runtimeShareId" IS NULL
+          OR NOT EXISTS (SELECT 1 FROM runtime_share s
+                          WHERE s.id = NEW."runtimeShareId"
+                            AND s."runtimeId" = NEW."runtimeId")) THEN
+    RAISE EXCEPTION 'an accepted invite names a share of its runtime' USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
 END;
@@ -1201,9 +1226,14 @@ $share_invite_expiry$;
 DROP TRIGGER IF EXISTS share_invite_expiry ON share_invite;
 CREATE TRIGGER share_invite_expiry BEFORE INSERT OR UPDATE OF "expiresAt" ON share_invite
 FOR EACH ROW EXECUTE FUNCTION enforce_share_invite_expiry();
--- One pending invite per pool and e-mail; accepted and revoked ones are history.
+-- One pending invite per target and e-mail; accepted and revoked ones are history. A runtime
+-- invite's null poolId never collides in the pool index (nulls are distinct), and the runtime
+-- index covers runtime invites only.
 CREATE UNIQUE INDEX IF NOT EXISTS share_invite_one_pending
   ON share_invite ("poolId", email) WHERE "acceptedAt" IS NULL AND "revokedAt" IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS share_invite_one_pending_runtime
+  ON share_invite ("runtimeId", email)
+  WHERE "runtimeId" IS NOT NULL AND "acceptedAt" IS NULL AND "revokedAt" IS NULL;
 
 -- ═══════════════════════════════ providers ═══════════════════════════════
 
@@ -2531,7 +2561,7 @@ BEGIN
     ('api_key', 'id,userId,lookupPrefix,secretDigest,scope', ''),
     ('api_key_pool', 'apiKeyId,poolId', ''),
     ('share', 'id,poolId,ownerUserId,granteeUserId', 'priorityClass,canUse,canContribute'),
-    ('share_invite', 'id,poolId,ownerUserId,email,tokenDigest,shareId', ''),
+    ('share_invite', 'id,poolId,runtimeId,ownerUserId,email,tokenDigest,shareId,runtimeShareId', ''),
     ('provider_account', 'id,userId,currentCredentialId', ''),
     ('provider_model', 'id,userId,providerAccountId,upstreamModelId', ''),
     ('provider_credential', 'id,userId,providerAccountId,replacedById', ''),

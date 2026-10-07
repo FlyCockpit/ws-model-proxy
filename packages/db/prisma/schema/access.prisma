@@ -127,16 +127,21 @@ model Share {
   @@map("share")
 }
 
-/// Sharing a pool with an e-mail that has no account yet (owner decision round 3). The invite
-/// carries the share's settings; when a person signs up with this e-mail (verified, or through
-/// the invite link) the share is created for them and the invite is marked accepted. The link
-/// lets that person sign up even when open sign-up is off. E-mailed when SMTP is configured;
-/// otherwise the owner copies the link (shown once).
+/// Sharing a pool, or a runtime definition, with an e-mail whose mailbox is not proved (owner
+/// decision round 3; runtimes since the proved-mailbox rule). Exactly one target is set: `poolId`
+/// or `runtimeId` (hardening `share_invite_target_shape`). The invite carries the share's
+/// settings (pool invites only; a runtime share has none); when the person accepts it (the
+/// link, or a proved e-mail match) the share is created for them and the invite is marked
+/// accepted. The link lets that person sign up even when open sign-up is off. E-mailed when SMTP
+/// is configured; otherwise the owner copies the link (shown once).
 model ShareInvite {
   id                 String         @id @default(cuid(2))
   createdAt          DateTime       @default(now())
   updatedAt          DateTime       @default(now()) @updatedAt
-  poolId             String
+  /// A pool invite's pool (null for a runtime invite).
+  poolId             String?
+  /// A runtime invite's runtime definition (null for a pool invite).
+  runtimeId          String?
   ownerUserId        String
   /// Lower-cased, trimmed.
   email              String
@@ -149,8 +154,10 @@ model ShareInvite {
   expiresAt          DateTime
   emailSentAt        DateTime?
   acceptedAt         DateTime?
-  /// The share the acceptance created (null until then, or after it was deleted).
+  /// The pool share the acceptance created (null until then, or after it was deleted).
   shareId            String?
+  /// The runtime share the acceptance created (null until then, or after it was deleted).
+  runtimeShareId     String?
   revokedAt          DateTime?
   /// An invite-link sign-up reserved the invite (user-create `before` hook, outside Better Auth's
   /// sign-up transaction). Another e-mail's sign-up with the same token is refused while the
@@ -161,14 +168,18 @@ model ShareInvite {
   /// take the claim over at any time (e-mails are unique, so it is the same person).
   signupClaimedEmail String?
 
-  Pool  Pool   @relation(fields: [poolId, ownerUserId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  Owner User   @relation(fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Share Share? @relation(fields: [shareId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  Pool         Pool?         @relation(fields: [poolId, ownerUserId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Runtime      Runtime?      @relation(fields: [runtimeId, ownerUserId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Owner        User          @relation(fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Share        Share?        @relation(fields: [shareId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  RuntimeShare RuntimeShare? @relation(fields: [runtimeShareId], references: [id], onDelete: SetNull, onUpdate: Cascade)
 
-  /// One PENDING invite per pool and e-mail (partial unique index in schema-hardening.sql);
+  /// One PENDING invite per target and e-mail (partial unique indexes in schema-hardening.sql);
   /// accepted and revoked ones stay as history, so the same e-mail can be invited again.
   @@index([poolId, email])
+  @@index([runtimeId, email])
   @@index([shareId])
+  @@index([runtimeShareId])
   @@index([email])
   @@index([ownerUserId])
   @@index([expiresAt])
