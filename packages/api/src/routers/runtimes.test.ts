@@ -316,6 +316,66 @@ describe("runtimes.update", () => {
     expect(result.version.id).toBe("ver-1");
   });
 
+  it("forgets what was learned only for an accepted update, and saves compat in a version", async () => {
+    const { runtimeContentHash } = await import("../lib/runtime-launch-hash");
+    const limits = {
+      concurrencyLimit: null,
+      contextLimit: null,
+      kvBudgetTokens: null,
+      kvFullThreshold: null,
+      engineLoadGate: "AUTO" as const,
+    };
+    const contentHash = runtimeContentHash({ spec: SPEC, limits, advanced: {} });
+    // An empty compat setting keeps the content hash older versions had.
+    expect(runtimeContentHash({ spec: SPEC, limits, advanced: {}, compat: {} })).toBe(contentHash);
+    db.runtime.findFirst.mockResolvedValue(
+      updateRow({ CurrentVersion: versionRow({ contentHash, compat: {} }) }) as never,
+    );
+    await client().update({ runtimeId: "rt-1", relearn: true });
+    expect(db.runtimeRequestProfile.deleteMany).toHaveBeenCalledWith({
+      where: { runtimeId: "rt-1", userId: OWNER },
+    });
+    expect(db.runtimeVersion.create).not.toHaveBeenCalled();
+
+    // A refused update forgets nothing.
+    db.runtimeRequestProfile.deleteMany.mockClear();
+    const spec: RuntimeSpec = {
+      api: "openai",
+      engine: "other",
+      modelType: "llm",
+      address: { baseUrl: "http://127.0.0.1:8000/v1" },
+    };
+    db.runtime.findFirst.mockResolvedValue(
+      updateRow({
+        kind: "ALWAYS_ON",
+        origin: "NODE",
+        Node: { id: "node-1", trust: "FULL", trustLowerRequestedAt: null },
+        CurrentVersion: versionRow({ spec, launchHash: runtimeLaunchHash(spec) }),
+      }) as never,
+    );
+    const changed = { ...spec, address: { baseUrl: "http://127.0.0.1:9000/v1" } };
+    expect(
+      await reasonOf(client().update({ runtimeId: "rt-1", spec: changed, relearn: true })),
+    ).toBe("launch_change_on_node_origin");
+    expect(db.runtimeRequestProfile.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("refuses invalid compat settings before writing anything", async () => {
+    await expect(
+      client().update({
+        runtimeId: "rt-1",
+        compat: { rewriteRules: [{ op: "rename", path: "model", to: "x" }] },
+      }),
+    ).rejects.toThrow();
+    await expect(
+      client().update({
+        runtimeId: "rt-1",
+        compat: { rewriteRules: [{ op: "default", path: "api_key", value: "x" }] },
+      }),
+    ).rejects.toThrow();
+    expect(db.runtimeVersion.create).not.toHaveBeenCalled();
+  });
+
   it("refuses a launch change to an always-on runtime on a Relay-only node", async () => {
     const spec: RuntimeSpec = {
       api: "openai",

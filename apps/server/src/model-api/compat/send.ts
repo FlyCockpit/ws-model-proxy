@@ -4,6 +4,7 @@
  * the profile load is pure; the request path owns retries, telemetry and responses.
  */
 import {
+  COMPAT_HEADERS,
   type CompatEndpoint,
   compatEndpointForFamily,
   type LearnedFix,
@@ -135,7 +136,7 @@ export function applyCompatToBuilt<B>(input: {
 
 export type CompatRetryDecision =
   | { kind: "learn"; endpoint: CompatEndpoint; fix: LearnedFix }
-  | { kind: "header"; name: string }
+  | { kind: "header"; name: string; remember: boolean }
   | { kind: "refuse"; refusal: CompatRefusal };
 
 /**
@@ -169,7 +170,11 @@ export function compatRetryDecision(input: {
   });
   if (!plan) return null;
   if (plan.action === "refuse") return { kind: "refuse", refusal: plan.refusal };
-  if (plan.action === "stripHeader") return { kind: "header", name: plan.name };
+  if (plan.action === "stripHeader")
+    // Only a header the policy can strip: a retry must change what is sent.
+    return (COMPAT_HEADERS as readonly string[]).includes(plan.name)
+      ? { kind: "header", name: plan.name, remember: plan.remember }
+      : null;
   return { kind: "learn", endpoint, fix: plan.fix };
 }
 
@@ -220,6 +225,64 @@ export function compatTraceData(
 }
 
 const MAX_NORMALIZED_JSON_BYTES = 8 * 1024 * 1024;
+/** Engine error bodies larger than this are passed on, never inspected for compatibility. */
+export const MAX_COMPAT_ERROR_BYTES = 64 * 1024;
+
+/** The rest of a stream after `held` chunks, pulled on demand (backpressure preserved). */
+function resumeStream(
+  held: Uint8Array[],
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const next = held.shift();
+      if (next) {
+        controller.enqueue(next);
+        return;
+      }
+      try {
+        const chunk = await reader.read();
+        if (chunk.done) controller.close();
+        else controller.enqueue(chunk.value);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+}
+
+/**
+ * Reads at most `max` bytes of a stream. `complete` when it ended within the bound; `body` is
+ * always the whole stream again, the read part first, so it can still be passed on.
+ */
+export async function peekStream(
+  body: ReadableStream<Uint8Array>,
+  max: number,
+): Promise<{ prefix: Uint8Array; complete: boolean; body: ReadableStream<Uint8Array> }> {
+  const reader = body.getReader();
+  const held: Uint8Array[] = [];
+  let size = 0;
+  let complete = false;
+  while (size <= max) {
+    const next = await reader.read();
+    if (next.done) {
+      complete = true;
+      break;
+    }
+    held.push(next.value);
+    size += next.value.byteLength;
+  }
+  const prefix = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of held) {
+    prefix.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { prefix, complete: complete && size <= max, body: resumeStream([...held], reader) };
+}
 
 function normalizedSurface(family: string): NormalizedSurface | null {
   if (family === "chat.completions") return "openai-chat";
@@ -230,7 +293,7 @@ function normalizedSurface(family: string): NormalizedSurface | null {
 /**
  * A natively forwarded success body shaped toward the caller's protocol (finish reasons,
  * reasoning field, thinking signatures, missing Anthropic usage). Other families and bodies
- * pass unchanged; a JSON body larger than the bound passes unchanged too.
+ * pass unchanged; a JSON body larger than the bound passes unchanged too, pulled on demand.
  */
 export function normalizeNativeResponse(input: {
   body: ReadableStream<Uint8Array>;
@@ -246,43 +309,31 @@ export function normalizeNativeResponse(input: {
   if (type.startsWith("text/event-stream"))
     return input.body.pipeThrough(createSseNormalizer(surface, options, input.estimate));
   if (!type.startsWith("application/json")) return input.body;
-  const reader = input.body.getReader();
+  let innerReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   return new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const chunks: Uint8Array[] = [];
-      let size = 0;
+    async pull(controller) {
       try {
-        while (true) {
-          const next = await reader.read();
-          if (next.done) break;
-          chunks.push(next.value);
-          size += next.value.byteLength;
-          if (size > MAX_NORMALIZED_JSON_BYTES) {
-            // Too large to reshape: the rest streams through as it came.
-            for (const chunk of chunks) controller.enqueue(chunk);
-            while (true) {
-              const rest = await reader.read();
-              if (rest.done) break;
-              controller.enqueue(rest.value);
-            }
+        if (!innerReader) {
+          const peeked = await peekStream(input.body, MAX_NORMALIZED_JSON_BYTES);
+          if (peeked.complete) {
+            controller.enqueue(normalizeJsonBody(peeked.prefix, surface, options, input.estimate));
             controller.close();
             return;
           }
+          // Too large to reshape: it streams through as it came.
+          innerReader = peeked.body.getReader();
         }
-        const whole = new Uint8Array(size);
-        let offset = 0;
-        for (const chunk of chunks) {
-          whole.set(chunk, offset);
-          offset += chunk.byteLength;
-        }
-        controller.enqueue(normalizeJsonBody(whole, surface, options, input.estimate));
-        controller.close();
+        const next = await innerReader.read();
+        if (next.done) controller.close();
+        else controller.enqueue(next.value);
       } catch (error) {
         controller.error(error);
       }
     },
-    cancel(reason) {
-      return reader.cancel(reason);
+    async cancel(reason) {
+      // Before the first pull the body is still ours to cancel; during it, its reader is.
+      if (innerReader) await innerReader.cancel(reason);
+      else await input.body.cancel(reason).catch(() => undefined);
     },
   });
 }

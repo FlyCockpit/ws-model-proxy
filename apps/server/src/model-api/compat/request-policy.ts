@@ -285,7 +285,8 @@ export function applyRequestCompat(input: CompatInput): CompatResult {
 
 export type RetryPlan =
   | { action: "learn"; fix: LearnedFix }
-  | { action: "stripHeader"; name: string }
+  /** `remember`: the engine never takes the header (learned); else only this request. */
+  | { action: "stripHeader"; name: string; remember: boolean }
   | { action: "refuse"; refusal: CompatRefusal };
 
 /**
@@ -299,7 +300,7 @@ export function planCompatRetry(input: {
     | { kind: "field"; path: string }
     | { kind: "replace"; path: string; with: string }
     | { kind: "role"; value: string }
-    | { kind: "header"; name: string };
+    | { kind: "header"; name: string; reason: "unsupported" | "value" };
   excerpt: string;
 }): RetryPlan | null {
   const policy = input.compat.unknownFieldPolicy ?? "auto";
@@ -308,7 +309,11 @@ export function planCompatRetry(input: {
     const mode =
       input.compat.headers?.[rejection.name as keyof NonNullable<RequestCompat["headers"]>];
     return policy === "auto" && mode !== "forward"
-      ? { action: "stripHeader", name: rejection.name }
+      ? {
+          action: "stripHeader",
+          name: rejection.name,
+          remember: rejection.reason === "unsupported",
+        }
       : null;
   }
   if (rejection.kind === "role") {

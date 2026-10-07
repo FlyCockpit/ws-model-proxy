@@ -75,6 +75,8 @@ const requestSelect = {
   promptTokens: true,
   completionTokens: true,
   cacheReadTokens: true,
+  usageEstimated: true,
+  compat: true,
   rejection: true,
   errorClass: true,
   upstreamErrorExcerpt: true,
@@ -82,6 +84,23 @@ const requestSelect = {
   attemptCount: true,
   resourceOwnerUserId: true,
 } satisfies Prisma.RelayRequestSelect;
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string").slice(0, 32)
+    : [];
+}
+
+/** The stored compat trace (names only), tolerant of anything malformed. */
+function compatOf(value: Prisma.JsonValue): RequestRow["compat"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return {
+    dropped: stringList(value.dropped),
+    rewrites: stringList(value.rewrites),
+    headers: stringList(value.headers),
+    retried: value.retried === true,
+  };
+}
 
 const requests = {
   list: contractProcedure(c.requests.list).handler(async ({ context, input }) => {
@@ -163,6 +182,8 @@ const requests = {
         promptTokens: row.promptTokens,
         completionTokens: row.completionTokens,
         cacheReadTokens: row.cacheReadTokens,
+        usageEstimated: row.usageEstimated,
+        compat: own ? compatOf(row.compat) : null,
         rejection: row.rejection,
         errorClass: row.errorClass,
         // The runtime's words about someone else's request stay with that requester.

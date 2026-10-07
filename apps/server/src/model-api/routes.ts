@@ -110,8 +110,10 @@ import {
   compatRetryDecision,
   compatTraceData,
   launchKeyString,
+  MAX_COMPAT_ERROR_BYTES,
   newCompatTrace,
   normalizeNativeResponse,
+  peekStream,
 } from "./compat/send.js";
 import {
   EXTERNAL_MODEL_VARIANT,
@@ -3967,7 +3969,7 @@ async function relayDirect({
   const compatTrace = newCompatTrace();
   const preCompatBuilt = builtRequest;
   let directAttemptCount = 1;
-  const directRefusal = async (refusal: CompatRefusal) => {
+  const finishDirect = async (failure: ModelApiFailure, response: Response) => {
     await settleRelayCleanup([
       () => cliLease.release(),
       () => globalLease?.release(),
@@ -3982,12 +3984,17 @@ async function relayDirect({
     await failRelayMetadata({
       relayRequestId,
       startedAt,
-      failure: "unsupported_capability",
+      failure,
       selectedRuntimeModelId: selected.id,
       attemptCount: directAttemptCount,
     });
-    return compatRefusalResponse(requestedSurfaceForOperation(operation), refusal);
+    return response;
   };
+  const directRefusal = (refusal: CompatRefusal) =>
+    finishDirect(
+      "unsupported_capability",
+      compatRefusalResponse(requestedSurfaceForOperation(operation), refusal),
+    );
   const applied = applyCompatToBuilt({
     launch: compatLaunch,
     family: operation.family,
@@ -3997,7 +4004,7 @@ async function relayDirect({
   if (!applied.ok) return directRefusal(applied.refusal);
   builtRequest = applied.built;
   addCompatReport(compatTrace, applied.report);
-  const responseIdCapture =
+  let responseIdCapture =
     operation.responseStickiness && operation.family === "responses"
       ? createResponseIdCapture()
       : null;
@@ -4035,7 +4042,7 @@ async function relayDirect({
           ? (capacityLease.lease.signal ?? request.signal)
           : request.signal,
       onResponseBodyChunk: responseIdCapture
-        ? (chunk) => responseIdCapture.push(chunk, operation.stream)
+        ? (chunk) => responseIdCapture?.push(chunk, operation.stream)
         : undefined,
       ...chatCountFirstRelayFields({
         family: operation.family,
@@ -4089,15 +4096,17 @@ async function relayDirect({
       (started.status === 400 || started.status === 422) &&
       builtRequest.body instanceof Uint8Array
     ) {
-      const errorBytes = await readStreamBytes(started.body);
-      const decision = compatRetryDecision({
-        launch: compatLaunch,
-        family: operation.family,
-        status: started.status,
-        errorText: decodeUtf8Bytes(errorBytes),
-        sentBody: builtRequest.body,
-        sentHeaders: builtRequest.headers,
-      });
+      const peeked = await peekStream(started.body, MAX_COMPAT_ERROR_BYTES);
+      const decision = !peeked.complete
+        ? null
+        : compatRetryDecision({
+            launch: compatLaunch,
+            family: operation.family,
+            status: started.status,
+            errorText: decodeUtf8Bytes(peeked.prefix),
+            sentBody: builtRequest.body,
+            sentHeaders: builtRequest.headers,
+          });
       if (decision) {
         const firstTerminal = await attempt.terminal;
         await recordLocalTerminal(
@@ -4110,13 +4119,8 @@ async function relayDirect({
       if (decision?.kind === "refuse") return await directRefusal(decision.refusal);
       if (decision) {
         const extra: CompatExtra = { fixes: [], stripHeaders: [] };
-        if (decision.kind === "learn") {
-          extra.fixes.push(decision.fix);
-          await recordLearnedFix(compatLaunch.key, decision.endpoint, decision.fix);
-        } else {
-          extra.stripHeaders.push(decision.name);
-          await recordLearnedHeader(compatLaunch.key, decision.name);
-        }
+        if (decision.kind === "learn") extra.fixes.push(decision.fix);
+        else extra.stripHeaders.push(decision.name);
         compatTrace.retried = true;
         const reapplied = applyCompatToBuilt({
           launch: compatLaunch,
@@ -4129,11 +4133,33 @@ async function relayDirect({
         builtRequest = reapplied.built;
         addCompatReport(compatTrace, reapplied.report);
         directAttemptCount += 1;
+        // The first attempt's error must not reach the stored-response capture.
+        responseIdCapture =
+          operation.responseStickiness && operation.family === "responses"
+            ? createResponseIdCapture()
+            : null;
         localExecution = { ...localExecution, localAttemptId: crypto.randomUUID() };
-        await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
-        attempt = await sendDirectAttempt(localExecution, builtRequest);
+        try {
+          await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
+          attempt = await sendDirectAttempt(localExecution, builtRequest);
+        } catch (error) {
+          const failure = error instanceof LocalSendRefused ? error.failure : "unknown";
+          await recordLocalTerminal(
+            relayRequestId,
+            requester.userId,
+            localExecution,
+            rejectedRelayTerminal(failure),
+          ).catch(metadataUpdateError);
+          return await finishDirect(failure, operationFailureResponse(operation, failure));
+        }
         started = await attempt.started;
-      } else started = { ...started, body: bytesToReadableStream(errorBytes) };
+        // Remembered for the launch only once the fix worked.
+        if (started.status >= 200 && started.status < 300) {
+          if (decision.kind === "learn")
+            await recordLearnedFix(compatLaunch.key, decision.endpoint, decision.fix);
+          else if (decision.remember) await recordLearnedHeader(compatLaunch.key, decision.name);
+        }
+      } else started = { ...started, body: peeked.body };
     }
     let startedBody = started.body;
     if (started.status >= 400 && started.status < 500) {
@@ -6402,11 +6428,11 @@ async function relayPool({
       builtRequest = applied.built;
       addCompatReport(compatTrace, applied.report);
     }
-    const responseIdCapture =
+    let responseIdCapture =
       operation.responseStickiness && operation.family === "responses"
         ? createResponseIdCapture()
         : null;
-    const attemptTimeoutMs = remainingRelayBudgetMs(relayDeadlineMs);
+    let attemptTimeoutMs = remainingRelayBudgetMs(relayDeadlineMs);
     if (attemptTimeoutMs === 0) {
       await releaseUnusedTrial();
       await settleRelayCleanup([
@@ -6555,24 +6581,29 @@ async function relayPool({
 
     try {
       let started = await attempt.started;
-      // An engine 400 about a field or header this proxy can fix: learn the fix and send once
-      // more on the same member, before any byte reached the client; a semantic field gets a
-      // clear refusal instead.
+      // An engine 400 about a field or header this proxy can fix: send once more on the same
+      // member with the fix, before any byte reached the client (the fix is remembered for the
+      // launch only once that retry succeeded); a semantic field gets a clear refusal instead.
       if (
         compatLaunch &&
         !compatRetried &&
         (started.status === 400 || started.status === 422) &&
         builtRequest.body instanceof Uint8Array
       ) {
-        const errorBytes = await readStreamBytes(started.body);
-        const decision = compatRetryDecision({
-          launch: compatLaunch,
-          family: compatFamily,
-          status: started.status,
-          errorText: decodeUtf8Bytes(errorBytes),
-          sentBody: builtRequest.body,
-          sentHeaders: builtRequest.headers,
-        });
+        const peeked = await peekStream(started.body, MAX_COMPAT_ERROR_BYTES);
+        const retryBudgetMs = remainingRelayBudgetMs(relayDeadlineMs);
+        const decided = !peeked.complete
+          ? null
+          : compatRetryDecision({
+              launch: compatLaunch,
+              family: compatFamily,
+              status: started.status,
+              errorText: decodeUtf8Bytes(peeked.prefix),
+              sentBody: builtRequest.body,
+              sentHeaders: builtRequest.headers,
+            });
+        // No time left for a second send: the engine's answer passes on.
+        const decision = decided?.kind !== "refuse" && retryBudgetMs === 0 ? null : decided;
         if (decision) {
           const firstTerminal = await attempt.terminal;
           await recordLocalTerminal(
@@ -6584,7 +6615,7 @@ async function relayPool({
           cumulativeRequestBytes += firstTerminal.requestBytes;
           cumulativeResponseBytes += firstTerminal.responseBytes;
         }
-        const refuseCompat = async (refusal: CompatRefusal) => {
+        const finishCompat = async (failure: ModelApiFailure, response: Response) => {
           await releaseUnusedTrial();
           await settleRelayCleanup([
             () => cliLease.release(),
@@ -6599,24 +6630,21 @@ async function relayPool({
           await failPoolRelayMetadata({
             relayRequestId,
             startedAt,
-            failure: "unsupported_capability",
+            failure,
             attemptCount,
             requestBytes: cumulativeRequestBytes,
             responseBytes: cumulativeResponseBytes,
           }).catch(metadataUpdateError);
-          return compatRefusalResponse(requestedSurface, refusal);
+          return response;
         };
+        const refuseCompat = (refusal: CompatRefusal) =>
+          finishCompat("unsupported_capability", compatRefusalResponse(requestedSurface, refusal));
         if (decision?.kind === "refuse") return await refuseCompat(decision.refusal);
         if (decision) {
           const launchKey = launchKeyString(compatLaunch);
           const extra = compatExtraByLaunch.get(launchKey) ?? { fixes: [], stripHeaders: [] };
-          if (decision.kind === "learn") {
-            extra.fixes.push(decision.fix);
-            await recordLearnedFix(compatLaunch.key, decision.endpoint, decision.fix);
-          } else {
-            extra.stripHeaders.push(decision.name);
-            await recordLearnedHeader(compatLaunch.key, decision.name);
-          }
+          if (decision.kind === "learn") extra.fixes.push(decision.fix);
+          else extra.stripHeaders.push(decision.name);
           compatExtraByLaunch.set(launchKey, extra);
           compatRetried = true;
           compatTrace.retried = true;
@@ -6631,12 +6659,36 @@ async function relayPool({
           builtRequest = reapplied.built;
           addCompatReport(compatTrace, reapplied.report);
           attemptCount += 1;
+          attemptTimeoutMs = retryBudgetMs;
+          // The first attempt's error must not reach the stored-response capture.
+          responseIdCapture =
+            operation.responseStickiness && operation.family === "responses"
+              ? createResponseIdCapture()
+              : null;
           localExecution = { ...localExecution, localAttemptId: crypto.randomUUID() };
-          await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
-          attemptDispatchedAt = new Date();
-          attempt = await sendAttempt(localExecution, builtRequest);
+          try {
+            await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
+            attemptDispatchedAt = new Date();
+            attempt = await sendAttempt(localExecution, builtRequest);
+          } catch (error) {
+            const failure = error instanceof LocalSendRefused ? error.failure : "unknown";
+            await recordLocalTerminal(
+              relayRequestId,
+              requester.userId,
+              localExecution,
+              rejectedRelayTerminal(failure),
+            ).catch(metadataUpdateError);
+            if (error instanceof LocalSendRefused && error.denial !== "MEMBER_UNAVAILABLE")
+              externalAttempt.accessLost = true;
+            return await finishCompat(failure, operationFailureResponse(operation, failure));
+          }
           started = await attempt.started;
-        } else started = { ...started, body: bytesToReadableStream(errorBytes) };
+          if (started.status >= 200 && started.status < 300) {
+            if (decision.kind === "learn")
+              await recordLearnedFix(compatLaunch.key, decision.endpoint, decision.fix);
+            else if (decision.remember) await recordLearnedHeader(compatLaunch.key, decision.name);
+          }
+        } else started = { ...started, body: peeked.body };
       }
       if (started.status >= 500 && shouldRetryRelayOperation(operation, "precommit_5xx")) {
         // What the runtime said, for the request row if no other member serves it.

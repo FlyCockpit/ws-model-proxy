@@ -30,7 +30,7 @@ const resolve = vi.hoisted(() => ({
   listCallableTargetsForUser: vi.fn(),
   listCallableTargetsForApiKey: vi.fn(),
   poolRoutes: vi.fn(async (): Promise<PoolRoute[]> => []),
-  testRoutes: vi.fn(async () => []),
+  testRoutes: vi.fn(async (): Promise<unknown[]> => []),
 }));
 vi.mock("./resolve.js", () => resolve);
 type Sent = { headers: Headers; body: string };
@@ -78,7 +78,7 @@ vi.mock("./local-send.js", async (importOriginal) => ({
 
 const prisma = (await import("@ws-model-proxy/db")).default;
 const db = prisma as unknown as ReturnType<typeof mockDeep<PrismaClient>>;
-const { createModelApiRoutes } = await import("./routes.js");
+const { createModelApiRoutes, chatTestCompletionsHandler } = await import("./routes.js");
 const { ModelApiConcurrencyLimiter } = await import("./limits.js");
 const { clearRequestProfileCache } = await import("./compat/profile-store.js");
 
@@ -322,6 +322,68 @@ describe("request compatibility on a local pool member", () => {
     });
   });
 
+  it("remembers nothing when the retry fails too", async () => {
+    relay.answers.push(
+      {
+        status: 400,
+        body: JSON.stringify({
+          error: { message: "Unrecognized request argument supplied: store" },
+        }),
+      },
+      { status: 500, body: "{}" },
+    );
+    await chat({ store: false });
+    expect(relay.sent).toHaveLength(2);
+    expect(db.runtimeRequestProfile.create).not.toHaveBeenCalled();
+    expect(db.runtimeRequestProfile.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("strips a rejected header value for this request only and never retries other headers", async () => {
+    relay.answers.push(
+      {
+        status: 400,
+        body: JSON.stringify({
+          error: { message: "Unexpected value(s) `x-1` for the `openai-beta` header." },
+        }),
+      },
+      { status: 200, body: OK },
+    );
+    resolve.poolRoutes.mockResolvedValue([route({ headers: { "openai-beta": "forward" } })]);
+    // Forwarded by the operator: the engine's answer passes on, nothing is retried.
+    const forwarded = await chat({}, { "openai-beta": "x-1" });
+    expect(forwarded.status).toBe(400);
+    expect(relay.sent).toHaveLength(1);
+
+    // Automatic: sent once more without the header, which is not remembered.
+    relay.sent = [];
+    relay.answers = [
+      {
+        status: 400,
+        body: JSON.stringify({
+          error: { message: "Unexpected value(s) `x-1` for the `openai-beta` header." },
+        }),
+      },
+      { status: 200, body: OK },
+    ];
+    resolve.poolRoutes.mockResolvedValue([route()]);
+    const stripped = await chat({}, { "openai-beta": "x-1" });
+    expect(stripped.status).toBe(200);
+    expect(relay.sent.map((sent) => sent.headers.has("openai-beta"))).toEqual([true, false]);
+    expect(db.runtimeRequestProfile.create).not.toHaveBeenCalled();
+
+    relay.sent = [];
+    relay.answers = [
+      {
+        status: 400,
+        body: JSON.stringify({ error: { message: "header `accept` is not supported" } }),
+      },
+    ];
+    resolve.poolRoutes.mockResolvedValue([route()]);
+    const other = await chat({});
+    expect(other.status).toBe(400);
+    expect(relay.sent).toHaveLength(1);
+  });
+
   it("retries at most once", async () => {
     const reject = (field: string) => ({
       status: 400,
@@ -374,5 +436,61 @@ describe("request compatibility on a local pool member", () => {
     expect(relay.sent).toHaveLength(0);
     expect(response.status).toBe(400);
     expect(((await response.json()) as { error: { param: string } }).error.param).toBe("metadata");
+  });
+});
+
+describe("request compatibility on a direct runtime test", () => {
+  it("learns and retries once on the tested instance", async () => {
+    const { pool: _pool, member: _member, ...testRoute } = route();
+    resolve.listCallableTargetsForUser.mockResolvedValue({
+      pools: [],
+      tests: [
+        {
+          target: "TEST",
+          id: "model-1",
+          modelId: "runtime:runtime-1:engine-model",
+          runtimeId: "runtime-1",
+          upstreamModelId: "engine-model",
+          ownerUserId: "owner",
+          ownerUserSlug: "owner",
+          maxAttachmentBytes: null,
+        },
+      ],
+    });
+    resolve.testRoutes.mockResolvedValue([testRoute]);
+    relay.answers.push(
+      {
+        status: 400,
+        body: JSON.stringify({
+          error: { message: "Unrecognized request argument supplied: store" },
+        }),
+      },
+      { status: 200, body: OK },
+    );
+    const response = await chatTestCompletionsHandler({
+      request: new Request("http://proxy.test/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "runtime:runtime-1:engine-model",
+          messages: [{ role: "user", content: "hi" }],
+          store: false,
+        }),
+      }),
+      userId: "owner",
+      manager: {
+        getOnlineNodeIds: () => ["node-1"],
+        registerRelayResponseHandlers: vi.fn(),
+        sendRelayRequest: vi.fn(),
+        cancelRelayRequest: vi.fn(),
+        completeRelayRequest: vi.fn(),
+        supportsCountContext: () => false,
+      },
+      limiter: new ModelApiConcurrencyLimiter(),
+    });
+    expect(response.status).toBe(200);
+    expect(relay.sent).toHaveLength(2);
+    expect(JSON.parse(relay.sent[1]!.body)).not.toHaveProperty("store");
+    expect(await response.json()).toMatchObject({ choices: [{ finish_reason: "stop" }] });
   });
 });

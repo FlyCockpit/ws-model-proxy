@@ -146,6 +146,17 @@ describe("engine 400 parsing", () => {
     ).toBeNull();
   });
 
+  it("tells an unsupported header from a rejected value", () => {
+    expect(
+      parseEngineRejection({
+        status: 400,
+        bodyText: "header `openai-beta` is not supported by this server",
+        requestBody: {},
+        requestHeaders: new Headers({ "openai-beta": "x" }),
+      }),
+    ).toEqual({ kind: "header", name: "openai-beta", reason: "unsupported" });
+  });
+
   it("ignores a header the request did not send", () => {
     expect(
       parseEngineRejection({

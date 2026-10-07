@@ -36,6 +36,21 @@ export const requestRowSchema = z
     promptTokens: z.number().int().nullable(),
     completionTokens: z.number().int().nullable(),
     cacheReadTokens: z.number().int().nullable(),
+    /** The engine reported no usage: the token counts are the proxy's estimate. */
+    usageEstimated: z.boolean(),
+    /**
+     * What request compatibility did (field paths, rewrites, stripped headers, one learned
+     * retry); null when nothing, or for a request to someone else's pool.
+     */
+    compat: z
+      .object({
+        dropped: z.array(z.string()),
+        rewrites: z.array(z.string()),
+        headers: z.array(z.string()),
+        retried: z.boolean(),
+      })
+      .strict()
+      .nullable(),
     rejection: z.string().nullable(),
     errorClass: z.string().nullable(),
     /** The runtime's own error message (redacted, one line), for own runtimes. */

@@ -373,15 +373,23 @@ describe("planCompatRetry", () => {
       planCompatRetry({
         endpoint: "messages",
         compat: {},
-        rejection: { kind: "header", name: "anthropic-beta" },
+        rejection: { kind: "header", name: "anthropic-beta", reason: "unsupported" },
         excerpt,
       }),
-    ).toEqual({ action: "stripHeader", name: "anthropic-beta" });
+    ).toEqual({ action: "stripHeader", name: "anthropic-beta", remember: true });
+    expect(
+      planCompatRetry({
+        endpoint: "messages",
+        compat: {},
+        rejection: { kind: "header", name: "anthropic-beta", reason: "value" },
+        excerpt,
+      }),
+    ).toEqual({ action: "stripHeader", name: "anthropic-beta", remember: false });
     expect(
       planCompatRetry({
         endpoint: "messages",
         compat: { headers: { "anthropic-beta": "forward" } },
-        rejection: { kind: "header", name: "anthropic-beta" },
+        rejection: { kind: "header", name: "anthropic-beta", reason: "unsupported" },
         excerpt,
       }),
     ).toBeNull();

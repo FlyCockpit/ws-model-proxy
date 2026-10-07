@@ -93,7 +93,7 @@
       "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Unexpected value(s) `fancy-2025-01-01` for the `anthropic-beta` header. Please consult our documentation.\"}}",
       "request": { "model": "m", "max_tokens": 5, "messages": [] },
       "headers": { "anthropic-beta": "fancy-2025-01-01" },
-      "expect": { "kind": "header", "name": "anthropic-beta" }
+      "expect": { "kind": "header", "name": "anthropic-beta", "reason": "value" }
     },
     {
       "name": "pydantic union tag for an unknown role",

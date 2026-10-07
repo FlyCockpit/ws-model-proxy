@@ -490,10 +490,14 @@ export const runtimesRouter = {
     const warnings = runtimeSpecWarnings(spec);
     const previousOfCurrent = await previousLaunchHashOf(runtime.id, current.version);
 
-    // Forgetting is no version change: the engine is unchanged, only what was learned goes.
-    if (input.relearn)
-      await prisma.runtimeRequestProfile.deleteMany({ where: { runtimeId: runtime.id, userId } });
+    // Forgetting is no version change: the engine is unchanged, only what was learned goes
+    // (servers drop their cached copy within seconds). Done once the update is known valid.
+    const forgetLearned = async () => {
+      if (input.relearn)
+        await prisma.runtimeRequestProfile.deleteMany({ where: { runtimeId: runtime.id, userId } });
+    };
     if (hashes.contentHash === current.contentHash) {
+      await forgetLearned();
       if (input.name !== undefined)
         await prisma.runtime.update({ where: { id: runtime.id }, data: { name: input.name } });
       return {
@@ -537,6 +541,7 @@ export const runtimesRouter = {
         );
     }
 
+    await forgetLearned();
     const agent = agentRulesApply(context.auth);
     const adoptedLive: string[] = [];
     const restarted: string[] = [];

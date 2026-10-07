@@ -11,7 +11,12 @@ export type EngineRejection =
   /** The engine asks for another spelling (`Use 'max_completion_tokens' instead`). */
   | { kind: "replace"; path: string; with: string }
   | { kind: "role"; value: string }
-  | { kind: "header"; name: string };
+  /**
+   * `unsupported`: the engine does not take the header at all (learned for the launch);
+   * `value`: it rejected this request's value (dropped for this request only, so one caller's
+   * bad value never removes the header for everyone).
+   */
+  | { kind: "header"; name: string; reason: "unsupported" | "value" };
 
 const MAX_SCAN_BYTES = 16 * 1024;
 
@@ -246,12 +251,12 @@ function fromRole(message: string, body: unknown): EngineRejection | null {
 }
 
 function fromHeader(message: string, headers: Headers): EngineRejection | null {
-  const match =
-    /for the `?([a-z0-9-]{1,64})`? header|header `?([a-z0-9-]{1,64})`? (?:is )?(?:not supported|invalid|unexpected)/i.exec(
-      message,
-    );
-  const name = (match?.[1] ?? match?.[2])?.toLowerCase();
-  return name && headers.has(name) ? { kind: "header", name } : null;
+  const value = /value\(?s?\)?[^.]{0,200}? for the `?([a-z0-9-]{1,64})`? header/i.exec(message);
+  const unsupported =
+    /header `?([a-z0-9-]{1,64})`? (?:is )?(?:not supported|not allowed|unexpected)/i.exec(message);
+  const name = (value?.[1] ?? unsupported?.[1])?.toLowerCase();
+  if (!name || !headers.has(name)) return null;
+  return { kind: "header", name, reason: value ? "value" : "unsupported" };
 }
 
 /**
