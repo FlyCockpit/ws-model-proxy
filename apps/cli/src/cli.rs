@@ -68,6 +68,9 @@ pub enum Command {
     /// Show whether the relay is running and connected.
     Status(crate::commands::status::Args),
 
+    /// Show the hardware this node detects (memory, GPUs, unified pool).
+    Hardware(crate::commands::hardware::Args),
+
     /// Forget this node's credential.
     Logout(crate::commands::logout::Args),
 

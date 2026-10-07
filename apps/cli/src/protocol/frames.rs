@@ -1741,6 +1741,22 @@ impl RuntimeJob {
     }
 }
 
+/// `http://(127.0.0.1|[::1]|localhost):<1-5 digits>` with an optional `/v1`
+/// (the TS `runtime.detected` `baseUrl` pattern).
+fn is_detected_base_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let Some(rest) = ["127.0.0.1:", "[::1]:", "localhost:"]
+        .iter()
+        .find_map(|host| rest.strip_prefix(host))
+    else {
+        return false;
+    };
+    let port = rest.strip_suffix("/v1").unwrap_or(rest);
+    (1..=5).contains(&port.len()) && port.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 impl NodeFrame {
     /// Cross-field rules serde cannot express.
     pub fn validate(&self) -> Result<(), FrameRuleError> {
@@ -1773,6 +1789,31 @@ impl NodeFrame {
                     exit_code.is_none() || *status == JobStatus::OperatorClosed,
                     "only operator_closed carries an exit code",
                 )
+            }
+            Self::RuntimeDetected { servers, .. } => {
+                rule(servers.len() <= 16, "at most 16 detected servers")?;
+                for server in servers {
+                    rule(
+                        is_detected_base_url(&server.base_url),
+                        "a detected server is a loopback http base URL",
+                    )?;
+                    rule(
+                        server.models.len() <= 64
+                            && server
+                                .models
+                                .iter()
+                                .all(|id| !id.is_empty() && id.encode_utf16().count() <= 256),
+                        "at most 64 detected model ids of 1-256 characters",
+                    )?;
+                    rule(
+                        server.version.as_ref().is_none_or(|version| {
+                            let trimmed = version.trim();
+                            !trimmed.is_empty() && trimmed.encode_utf16().count() <= 80
+                        }),
+                        "a detected version is 1-80 characters",
+                    )?;
+                }
+                Ok(())
             }
             Self::NodeMetrics(_) => rule(
                 encoded_len(self) <= CHUNK_BUDGET_BYTES,
@@ -1823,6 +1864,11 @@ impl ServerFrame {
         match self {
             Self::RuntimeJob(job) => job.validate(),
             Self::SecretSet(secret) => secret.validate(),
+            // `relayIdSchema`: the answer echoes it, so it must stay small.
+            Self::RuntimeDetect { id } => rule(
+                !id.trim().is_empty() && id.encode_utf16().count() <= 128,
+                "a relay id is 1-128 characters",
+            ),
             Self::ExecStart { timeout_ms, .. } => rule(
                 (1_000..=NODE_COMMAND_MAX_MS).contains(timeout_ms),
                 "a command lifetime is 1 s to 24 h",

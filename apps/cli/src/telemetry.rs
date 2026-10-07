@@ -33,9 +33,9 @@ use crate::config::EndpointConfig;
 use crate::engine::{EngineKind, LoadReading};
 use crate::metric_sources::Runner;
 use crate::protocol::frames::{
-    ExecutionMechanism, GpuVendorWire, LoadSource, NodeCpu, NodeCpuMetrics, NodeDiskMetrics,
-    NodeGpuInfo, NodeGpuMetrics, NodeInfo, NodeInterfaceInfo, NodeInterfaceMetrics, NodeKind,
-    NodeMemoryMetrics, NodeMetrics, NodeOs, RuntimeLoad,
+    ExecutionMechanism, LoadSource, NodeCpu, NodeCpuMetrics, NodeDiskMetrics, NodeGpuMetrics,
+    NodeInfo, NodeInterfaceInfo, NodeInterfaceMetrics, NodeMemoryMetrics, NodeMetrics, NodeOs,
+    RuntimeLoad,
 };
 use crate::protocol::runtime_spec::NodeMetricCommand;
 use crate::protocol::{NODE_GPU_MAX, NODE_INTERFACE_MAX, NodeFrame, encode_control};
@@ -817,6 +817,9 @@ pub struct GpuRow {
     pub uuid: Option<String>,
     pub driver_version: Option<String>,
     pub memory_total_mib: Option<u64>,
+    /// `memory.total` read exactly `[N/A]` (a unified-memory GPU such as
+    /// GB10), not an error like `[Unknown Error]`.
+    pub memory_not_applicable: bool,
     pub memory_used_mib: Option<u64>,
     pub utilization_percent: Option<f64>,
     pub temperature_c: Option<f64>,
@@ -848,6 +851,7 @@ pub fn parse_nvidia_smi(text: &str) -> Vec<GpuRow> {
                 uuid: gpu_field(fields[2]).and_then(clip),
                 driver_version: gpu_field(fields[3]).and_then(clip),
                 memory_total_mib: number(4).map(|value| value as u64),
+                memory_not_applicable: fields[4].trim().eq_ignore_ascii_case("[n/a]"),
                 memory_used_mib: number(5).map(|value| value as u64),
                 utilization_percent: number(6),
                 temperature_c: number(7),
@@ -913,22 +917,6 @@ pub fn run_bounded(program: &str, args: &[String], timeout: Duration, limit: u64
         Ok(bytes) => String::from_utf8(bytes).map_or(Bounded::Failed, Bounded::Output),
         Err(crate::bounded_run::RunError::Spawn) => Bounded::Unavailable,
         Err(_) => Bounded::Failed,
-    }
-}
-
-fn node_kind(gpus: &[GpuRow]) -> (NodeKind, bool) {
-    if gpus.is_empty() {
-        // Apple silicon shares memory between CPU and GPU.
-        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            return (NodeKind::Unified, true);
-        }
-        return (NodeKind::Cpu, false);
-    }
-    // GB10 and other unified-memory GPUs report no dedicated VRAM total.
-    if gpus.iter().any(|gpu| gpu.memory_total_mib.is_none()) {
-        (NodeKind::Unified, true)
-    } else {
-        (NodeKind::Discrete, false)
     }
 }
 
@@ -1004,7 +992,9 @@ pub fn parse_os_release(text: &str) -> (Option<String>, Option<String>) {
     (value("NAME"), value("VERSION_ID"))
 }
 
-/// `/proc/cpuinfo` model name (x86 `model name`, Arm `Model` or `Hardware`).
+/// `/proc/cpuinfo` model name (x86 `model name`, Arm `Model` or `Hardware`),
+/// else the Arm core mix from `CPU implementer` / `CPU part` (server and
+/// workstation Arm kernels, e.g. GB10, print no model name).
 pub fn parse_cpu_model(text: &str) -> Option<String> {
     ["model name", "Model", "Hardware", "cpu model"]
         .iter()
@@ -1014,6 +1004,69 @@ pub fn parse_cpu_model(text: &str) -> Option<String> {
                 (name.trim() == *key).then(|| clip(value)).flatten()
             })
         })
+        .or_else(|| arm_core_mix(text))
+}
+
+/// Arm Ltd (`0x41`) part numbers of cores found in inference machines.
+const ARM_PARTS: &[(&str, &str)] = &[
+    ("0xd03", "Cortex-A53"),
+    ("0xd05", "Cortex-A55"),
+    ("0xd08", "Cortex-A72"),
+    ("0xd0b", "Cortex-A76"),
+    ("0xd0c", "Neoverse-N1"),
+    ("0xd40", "Neoverse-V1"),
+    ("0xd41", "Cortex-A78"),
+    ("0xd44", "Cortex-X1"),
+    ("0xd49", "Neoverse-N2"),
+    ("0xd4f", "Neoverse-V2"),
+    ("0xd80", "Cortex-A520"),
+    ("0xd81", "Cortex-A720"),
+    ("0xd82", "Cortex-X4"),
+    ("0xd84", "Neoverse-V3"),
+    ("0xd85", "Cortex-X925"),
+    ("0xd87", "Cortex-A725"),
+];
+
+/// `10x Arm Cortex-X925 + 10x Arm Cortex-A725`, in first-seen order.
+fn arm_core_mix(text: &str) -> Option<String> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    let mut implementer: Option<String> = None;
+    for line in text.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().to_ascii_lowercase();
+        match name.trim() {
+            "CPU implementer" => implementer = Some(value),
+            "CPU part" => {
+                let core = match implementer.as_deref() {
+                    Some("0x41") => ARM_PARTS
+                        .iter()
+                        .find(|(part, _)| *part == value)
+                        .map_or_else(
+                            || format!("Arm part {value}"),
+                            |(_, core)| format!("Arm {core}"),
+                        ),
+                    Some(other) => format!("implementer {other} part {value}"),
+                    None => continue,
+                };
+                match counts.iter_mut().find(|(known, _)| *known == core) {
+                    Some((_, count)) => *count += 1,
+                    None => counts.push((core, 1)),
+                }
+            }
+            _ => {}
+        }
+    }
+    if counts.is_empty() {
+        return None;
+    }
+    let mix = counts
+        .iter()
+        .map(|(core, count)| format!("{count}x {core}"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    clip(&mix)
 }
 
 fn interface_names() -> Vec<String> {
@@ -1080,11 +1133,7 @@ pub(crate) fn interface_addresses() -> BTreeMap<String, Vec<String>> {
 }
 
 fn collect_node_info(gpu: &mut GpuQuery) -> NodeInfo {
-    let gpus = gpu.rows();
-    let (kind, unified) = node_kind(&gpus);
-    let memory_total_mib = read_text("/proc/meminfo")
-        .map(|text| parse_meminfo(&text))
-        .and_then(|fields| fields.get("MemTotal").copied());
+    let hardware = crate::hardware::detect(gpu.rows());
     let (os_name, os_version) = read_text("/etc/os-release")
         .map(|text| parse_os_release(&text))
         .unwrap_or((None, None));
@@ -1109,40 +1158,26 @@ fn collect_node_info(gpu: &mut GpuQuery) -> NodeInfo {
             arch: clip(std::env::consts::ARCH),
         }),
         cpu: Some(NodeCpu {
-            model: read_text("/proc/cpuinfo").and_then(|text| parse_cpu_model(&text)),
+            model: hardware.cpu_model.as_deref().and_then(clip),
             cores: thread::available_parallelism()
                 .ok()
                 .and_then(|count| u32::try_from(count.get()).ok()),
         }),
-        memory_total_mib,
-        unified_memory_mib: memory_total_mib.filter(|_| unified),
-        accelerator_memory_mib: None,
-        gpus: Some(
-            gpus.iter()
-                .filter_map(|row| {
-                    Some(NodeGpuInfo {
-                        // `nvidia-smi` is the only GPU reader until the
-                        // hardware module (AMD, Apple) lands (C5).
-                        vendor: GpuVendorWire::Nvidia,
-                        index: u8::try_from(row.index).ok()?,
-                        name: row.name.clone(),
-                        uuid: row.uuid.clone(),
-                        driver_version: row.driver_version.clone(),
-                        vram_total_mib: row.memory_total_mib,
-                        gtt_total_mib: None,
-                        gfx_target: None,
-                        apu: None,
-                        pci_id: None,
-                    })
-                })
-                .collect(),
-        ),
-        node_kind: Some(kind),
+        memory_total_mib: hardware.memory_total_mib,
+        unified_memory_mib: hardware.unified_memory_mib,
+        accelerator_memory_mib: hardware.accelerator_memory_mib,
+        gpus: Some(hardware.gpus),
+        node_kind: Some(hardware.node_kind),
         interfaces: Some(interfaces),
         execution_mechanism: Some(execution_mechanism()),
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
         declared: None,
     }
+}
+
+/// One `nvidia-smi` query now (empty when it is missing or fails).
+pub fn query_nvidia() -> Vec<GpuRow> {
+    GpuQuery::default().rows()
 }
 
 // `c_ulong` and `fsblkcnt_t` differ in width across Unix targets.
@@ -1343,10 +1378,10 @@ mod tests {
         assert_eq!(rows[0].memory_total_mib, Some(24_564));
         assert_eq!(rows[0].power_w, Some(61.25));
         assert_eq!(rows[1].memory_total_mib, None);
+        assert!(rows[1].memory_not_applicable);
+        assert!(!rows[0].memory_not_applicable);
         assert_eq!(rows[1].power_w, None);
         assert_eq!(rows[1].name.as_deref(), Some("NVIDIA GB10"));
-        assert_eq!(node_kind(&rows).0, NodeKind::Unified);
-        assert_eq!(node_kind(&rows[..1]).0, NodeKind::Discrete);
     }
 
     #[test]

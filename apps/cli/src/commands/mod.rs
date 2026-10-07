@@ -10,6 +10,7 @@
 
 pub mod completions;
 pub mod config;
+pub mod hardware;
 pub mod login;
 pub mod logout;
 pub mod recover;
