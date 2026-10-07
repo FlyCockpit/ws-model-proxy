@@ -648,9 +648,19 @@ impl Executor {
                 );
             }
         } else {
+            if job.action == JobPhase::Stop {
+                // No record (lost, or the run never reached this node): the stop is still
+                // proven when nothing of the rank runs, so a restart's leading stop is not
+                // refused forever. Otherwise the node cannot know what to stop.
+                let proof = self.prove_stopped(job, runtime, deadline)?;
+                if proof.stopped {
+                    return Ok(proof);
+                }
+                return Err(fail(JobError::InstanceUnknown));
+            }
             if matches!(
                 job.action,
-                JobPhase::Readiness | JobPhase::Health | JobPhase::Status | JobPhase::Stop
+                JobPhase::Readiness | JobPhase::Health | JobPhase::Status
             ) {
                 return Err(fail(JobError::InstanceUnknown));
             }
@@ -833,10 +843,8 @@ impl Executor {
         let mut ports = vec![(job.host.as_str(), job.port)];
         let mut detached = false;
         if let Some(record) = self.state.records.get(&key) {
-            if let Some(done) = record.completed.get(&job.step_id) {
-                anyhow::ensure!(done.hash == job.intent_hash, "step intent changed");
-                return Ok(done.outcome.clone());
-            }
+            // A re-delivered probe is proven again, never answered from history: the machine
+            // may have changed since.
             units.extend(record.invocations.keys().cloned());
             detached = record
                 .invocations
@@ -896,8 +904,15 @@ impl Executor {
         let record = self.state.records.get(&key).context("record")?;
         let mut units = record.invocations.clone();
         for unit in owned_units(job) {
-            if let Some(identity) = runtime.identity(&unit, &self.state.owner_id, deadline)? {
-                units.entry(unit).or_insert(identity);
+            match runtime.identity(&unit, &self.state.owner_id, deadline) {
+                Ok(Some(identity)) => {
+                    units.entry(unit).or_insert(identity);
+                }
+                Ok(None) => {}
+                // A unit the node cannot identify (relaunched, another description) whose
+                // process tree is empty has nothing left to stop.
+                Err(_) if !runtime.tasks_alive(&unit, deadline)? => {}
+                Err(error) => return Err(error),
             }
         }
         if !job.stop_command.trim().is_empty() {
@@ -913,7 +928,13 @@ impl Executor {
         }
         for (unit, invocation) in units {
             if invocation != "external" && invocation != "self-detached" {
-                runtime.stop(&unit, &self.state.owner_id, &invocation, deadline)?;
+                if let Err(error) = runtime.stop(&unit, &self.state.owner_id, &invocation, deadline)
+                {
+                    // The process is already gone (the unit was relaunched under another
+                    // invocation, or its leftovers cannot be stopped): an empty process tree is
+                    // the proof. Anything still running keeps the stop unproven.
+                    anyhow::ensure!(!runtime.tasks_alive(&unit, deadline)?, error);
+                }
             } else {
                 anyhow::ensure!(
                     job.status_command.is_some(),

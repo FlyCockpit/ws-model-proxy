@@ -168,13 +168,49 @@ fn steps_for_an_unknown_instance_are_refused_and_leave_nothing() {
     let path = root.path().join("in1-r0.json");
     let runtime = Fake::new(path.clone());
     let mut executor = Executor::load(path.clone()).expect("load");
-    for phase in [JobPhase::Stop, JobPhase::Readiness, JobPhase::Health] {
+    for phase in [JobPhase::Readiness, JobPhase::Health] {
         assert_eq!(
             executor.execute(job(phase), &runtime, deadline()).error,
             Some(JobError::InstanceUnknown)
         );
     }
+    // A stop without a record is refused while something of the rank runs...
+    runtime
+        .orphans
+        .borrow_mut()
+        .push("wsmp-i-abcdefabcdef-r0".into());
+    assert_eq!(
+        executor
+            .execute(job(JobPhase::Stop), &runtime, deadline())
+            .error,
+        Some(JobError::InstanceUnknown)
+    );
+    // ...and proven when nothing does (a restart's leading stop after a lost record).
+    runtime.orphans.borrow_mut().clear();
+    let proven = executor.execute(job(JobPhase::Stop), &runtime, deadline());
+    assert_eq!(
+        (proven.status, proven.stopped),
+        (JobStatus::Succeeded, true)
+    );
     assert!(!path.exists());
+}
+
+#[test]
+fn a_stop_whose_process_is_already_gone_is_proven_although_the_unit_stop_fails() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(job(JobPhase::Start), &runtime, deadline());
+    // The unit stop errors (say the unit was relaunched under another invocation), but no
+    // process of it is left.
+    runtime.stop_fails.set(true);
+    runtime.units.borrow_mut().clear();
+    let stopped = executor.execute(job(JobPhase::Stop), &runtime, deadline());
+    assert_eq!(
+        (stopped.status, stopped.stopped),
+        (JobStatus::Succeeded, true)
+    );
 }
 
 #[test]

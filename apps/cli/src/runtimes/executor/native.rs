@@ -146,7 +146,7 @@ fn description(owner: &str, unit: &str) -> String {
 
 /// From `systemctl show --property=LoadState,ActiveState,TasksCurrent,ControlGroup`: a
 /// unit that is gone, or whose control group is empty, runs nothing. A unit whose task count
-/// is not known counts as alive unless systemd says it is inactive.
+/// is not known counts as alive.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn unit_tasks_alive(output: &str) -> bool {
     let fields = output
@@ -156,19 +156,16 @@ fn unit_tasks_alive(output: &str) -> bool {
     if fields.get("LoadState") == Some(&"not-found") || fields.get("ControlGroup") == Some(&"") {
         return false;
     }
-    match fields
+    // An unknown task count with a control group proves nothing: count it as alive.
+    fields
         .get("TasksCurrent")
         .and_then(|value| value.parse::<u64>().ok())
-    {
-        Some(tasks) => tasks > 0,
-        None => !fields
-            .get("ActiveState")
-            .is_some_and(|state| matches!(*state, "inactive" | "failed")),
-    }
+        .is_none_or(|tasks| tasks > 0)
 }
 
-/// Nothing listens on `port`: binding it on every address (and on `host`) works. Only an
-/// address in use counts; an address this machine does not have proves nothing either way.
+/// Nothing listens on `port`: binding it on every address (and on `host`) works. An address
+/// this machine does not have (no IPv6, another node's fabric IP) says nothing about the
+/// port; any other error (in use, out of descriptors, denied) is no proof that it is free.
 pub fn port_free(host: &str, port: u16) -> bool {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
     let mut addresses = vec![
@@ -178,12 +175,29 @@ pub fn port_free(host: &str, port: u16) -> bool {
     if let Ok(ip) = host.parse::<IpAddr>() {
         addresses.push(ip);
     }
-    addresses.into_iter().all(|ip| {
-        TcpListener::bind(SocketAddr::new(ip, port)).map_or_else(
-            |error| error.kind() != std::io::ErrorKind::AddrInUse,
-            |_| true,
-        )
-    })
+    addresses
+        .into_iter()
+        .all(|ip| match TcpListener::bind(SocketAddr::new(ip, port)) {
+            Ok(_) => true,
+            Err(error) => address_missing(&error),
+        })
+}
+
+fn address_missing(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(nix::libc::EAFNOSUPPORT)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 impl NativeRuntime {
@@ -576,6 +590,9 @@ mod tests {
         ));
         assert!(unit_tasks_alive(
             "LoadState=loaded\nActiveState=active\nTasksCurrent=[not set]\nControlGroup=/x\n"
+        ));
+        assert!(unit_tasks_alive(
+            "LoadState=loaded\nActiveState=failed\nTasksCurrent=[not set]\nControlGroup=/x\n"
         ));
     }
 
