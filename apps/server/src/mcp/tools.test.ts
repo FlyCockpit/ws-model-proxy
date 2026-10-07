@@ -153,6 +153,33 @@ describe("routing to procedures", () => {
     ).toBe("nodes.secrets.set");
   });
 
+  it("runtime_stop stops, or with forget forgets an unprovable stop (confirm FORGET)", () => {
+    expect(routeToolCall("runtime_stop", { runtimeId: "r", nodeId: "n" })).toEqual([
+      { path: "runtimes.stop", input: { runtimeId: "r", nodeId: "n" } },
+    ]);
+    expect(routeToolCall("runtime_stop", { instanceId: "i" })).toEqual([
+      { path: "runtimes.stop", input: { instanceId: "i" } },
+    ]);
+    expect(
+      routeToolCall("runtime_stop", {
+        instanceId: "i",
+        forget: true,
+        confirm: "FORGET",
+        note: "gone",
+      }),
+    ).toEqual([
+      {
+        path: "runtimes.instances.forget",
+        input: { instanceId: "i", confirm: "FORGET", note: "gone" },
+      },
+    ]);
+    const stop = tool("runtime_stop").input;
+    expect(stop.safeParse({ instanceId: "i", forget: true }).success).toBe(false);
+    expect(stop.safeParse({ runtimeId: "r", forget: true, confirm: "FORGET" }).success).toBe(false);
+    expect(stop.safeParse({ instanceId: "i", confirm: "FORGET" }).success).toBe(false);
+    expect(stop.safeParse({ instanceId: "i", runtimeId: "r" }).success).toBe(false);
+  });
+
   it("every route stays inside the tool's own procedures", async () => {
     for (const contract of MCP_TOOLS) {
       for (const entry of routeToolCall(contract.name, {}))
@@ -265,6 +292,37 @@ describe("errors and output", () => {
     });
     expect(JSON.stringify(result)).not.toContain("hf_secret_value");
     expect(structured(result).error).toEqual({ code: "BAD_REQUEST" });
+  });
+
+  it("runtime_start on an always-on runtime carries always_on_runtime through the real procedure", async () => {
+    const { default: prisma } = await import("@ws-model-proxy/db");
+    const db = prisma as unknown as {
+      runtime: { findFirst: ReturnType<typeof vi.fn> };
+      $transaction: ReturnType<typeof vi.fn>;
+    };
+    // The applied start plans inside its graph-write transaction.
+    db.$transaction.mockImplementation(async (work: (tx: unknown) => unknown) => work(prisma));
+    db.runtime.findFirst.mockResolvedValue({
+      id: "rt-1",
+      kind: "ALWAYS_ON",
+      currentVersionId: "ver-1",
+    });
+    for (const args of [
+      { runtimeId: "rt-1" },
+      { runtimeId: "rt-1", instanceId: "inst-1" },
+      { runtimeId: "rt-1", instanceId: "inst-1", preview: true },
+    ]) {
+      const result = await runMcpTool(tool("runtime_start"), {
+        dispatch: testDispatch("FULL"),
+        args,
+      });
+      expect(result.isError).toBe(true);
+      expect(structured(result).error).toMatchObject({
+        code: "BAD_REQUEST",
+        reason: "always_on_runtime",
+        subjectId: "rt-1",
+      });
+    }
   });
 
   it("hides unknown failures behind a generic error with the request id", async () => {

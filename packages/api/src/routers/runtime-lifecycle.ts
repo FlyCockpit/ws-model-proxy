@@ -71,10 +71,15 @@ async function computeStart(
   });
   if (!runtime) throw notFound("That runtime does not exist.");
   if (runtime.kind !== "STARTABLE")
-    throw new ORPCError("BAD_REQUEST", {
-      message:
-        "An always-on runtime runs outside wsmp and is never started or stopped here; it is ready when its node reports it serving.",
-    });
+    // Always-on: the engine runs on its own and the proxy only connects to it. Starting (or
+    // restarting an instance, preview included) would mean nothing: its health is re-checked
+    // automatically, so the answer says what to do instead.
+    throw refuseAbout(
+      "always_on_runtime",
+      runtime.id,
+      `Runtime ${runtime.id} is always-on: it runs outside wsmp and is never started or stopped here; it is ready when its node reports it serving. Check it now with model_test, or change its address with runtime_update.`,
+      "BAD_REQUEST",
+    );
   const versionId = input.versionId ?? runtime.currentVersionId;
   const version = versionId
     ? await db.runtimeVersion.findFirst({

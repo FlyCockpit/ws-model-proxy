@@ -27,6 +27,8 @@ export type RecoveryTarget = {
   handle: string;
   upstreamModelId: string;
   api: "OPENAI" | "ANTHROPIC";
+  /** LLM: a one-token chat (or messages) request; EMBEDDINGS: a one-word embedding. */
+  type: "LLM" | "EMBEDDINGS";
 };
 
 type Timer = ReturnType<typeof setTimeout>;
@@ -168,8 +170,11 @@ export class TargetRecoveryScheduler {
 
 /**
  * Due targets on the owned nodes: unhealthy or degraded, retry time passed, served by an
- * instance whose head runs on one of the nodes, with a chat-capable LLM model (other model
- * types have no safe probe and are never turned into transport failures by recovery).
+ * instance whose head runs on one of the nodes, with a chat-capable LLM model or an OpenAI
+ * embeddings model (transcription has no safe probe and is never turned into a transport
+ * failure by recovery). Chat-capable is the model's effective capabilities: the owner's
+ * override when set, else what the node detected (the override column alone is empty for
+ * almost every model, which once kept recovery from ever probing anything).
  */
 export async function listDueOwnedTargetRecoveries(
   nodeIds: string[],
@@ -181,8 +186,23 @@ export async function listDueOwnedTargetRecoveries(
       kind: "INSTANCE_MODEL",
       health: { in: ["DEGRADED", "UNHEALTHY"] },
       nextRetryAt: { lte: now },
-      RuntimeModel: { type: "LLM", capabilities: { has: "TEXT_GENERATION" } },
+      RuntimeModel: {
+        OR: [
+          {
+            type: "LLM",
+            capabilitiesOverridden: false,
+            detectedCapabilities: { has: "TEXT_GENERATION" },
+          },
+          { type: "LLM", capabilitiesOverridden: true, capabilities: { has: "TEXT_GENERATION" } },
+          // A spec that lists a model without capabilities stores none; the node serves it
+          // as its type's default (text generation for an LLM).
+          { type: "LLM", capabilitiesOverridden: false, detectedCapabilities: { isEmpty: true } },
+          { type: "EMBEDDINGS" },
+        ],
+      },
       Instance: {
+        // Only a ready instance answers; a starting, stopping or failed one is not routed.
+        phase: "READY",
         OR: [
           { Runtime: { kind: "ALWAYS_ON", nodeId: { in: nodeIds } } },
           { Ranks: { some: { rank: 0, nodeId: { in: nodeIds }, claim: { not: "RELEASED" } } } },
@@ -191,7 +211,7 @@ export async function listDueOwnedTargetRecoveries(
     },
     select: {
       id: true,
-      RuntimeModel: { select: { upstreamModelId: true } },
+      RuntimeModel: { select: { upstreamModelId: true, type: true } },
       Instance: {
         select: {
           handle: true,
@@ -205,14 +225,19 @@ export async function listDueOwnedTargetRecoveries(
   return rows.flatMap((row) => {
     const instance = row.Instance;
     const nodeId = instance?.Runtime.nodeId ?? instance?.Ranks[0]?.nodeId ?? null;
-    if (!instance || !row.RuntimeModel || !nodeId || !instance.Version.api) return [];
+    const model = row.RuntimeModel;
+    if (!instance || !model || !nodeId || !instance.Version.api) return [];
+    if (model.type === "TRANSCRIPTION") return [];
+    // An embeddings probe is an OpenAI request.
+    if (model.type === "EMBEDDINGS" && instance.Version.api !== "OPENAI") return [];
     return [
       {
         id: row.id,
         nodeId,
         handle: instance.handle,
-        upstreamModelId: row.RuntimeModel.upstreamModelId,
+        upstreamModelId: model.upstreamModelId,
         api: instance.Version.api,
+        type: model.type,
       },
     ];
   });
@@ -220,12 +245,20 @@ export async function listDueOwnedTargetRecoveries(
 
 /** The smallest request that proves the instance answers (no reasoning, one token). */
 export function recoveryProbe(target: RecoveryTarget): {
-  family: "chat.completions" | "messages";
+  family: "chat.completions" | "messages" | "embeddings";
   path: string;
   headers: Record<string, string>;
   body: Uint8Array;
 } {
   const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
+  if (target.type === "EMBEDDINGS") {
+    return {
+      family: "embeddings",
+      path: "/v1/embeddings",
+      headers: { "content-type": "application/json" },
+      body: encode({ model: target.upstreamModelId, input: "ping" }),
+    };
+  }
   if (target.api === "ANTHROPIC") {
     return {
       family: "messages",

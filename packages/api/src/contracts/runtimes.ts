@@ -591,10 +591,19 @@ export const runtimesContract = {
   },
   instances: {
     forget: mutation(
-      "human",
-      z.object({ instanceId: idSchema, nodeNumber: z.number().int().min(1).optional() }).strict(),
+      "agent",
+      z
+        .object({
+          instanceId: idSchema,
+          nodeNumber: z.number().int().min(1).optional(),
+          /** Agents repeat it (recovery, like node_delete); people confirm in a dialog. */
+          confirm: z.literal("FORGET").optional(),
+          note: noteSchema.optional(),
+        })
+        .strict(),
       instanceViewSchema,
-      "Forget a stop that cannot be proven: resources stay counted until a probe proves the stop.",
+      "Forget a stop that cannot be proven: resources stay counted until a probe proves the stop. Agents: Full-control nodes only (trust_relay), with confirm FORGET; audited on the node.",
+      ["runtime_stop"],
     ),
   },
   models: {

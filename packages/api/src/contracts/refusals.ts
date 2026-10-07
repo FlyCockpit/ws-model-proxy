@@ -88,6 +88,17 @@ export const REFUSAL_REASONS = [
   "alias_limit",
   /** A key-scoped alias for a pool the key cannot call. */
   "alias_key_not_allowed",
+  // E2E findings (round 2).
+  /**
+   * runtime_start on an always-on runtime: it runs on its own and the proxy only connects to
+   * it, so there is nothing to start or restart (health is re-checked automatically).
+   */
+  "always_on_runtime",
+  /**
+   * A multi-node instance needs one dist port inside every node's port range; these nodes'
+   * ranges have none in common (the message names them).
+   */
+  "fabric_port_ranges_disjoint",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

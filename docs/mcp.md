@@ -36,15 +36,17 @@ requests and metrics.
   locally. If you distrust what an agent did, reinstall the node.
 - **Notes.** Most writes take an optional `note` (1–500 characters);
   `node_command_queue_for_user` requires one, and the deletes,
-  `runtime_start`, `runtime_stop`, `profile_apply` and `model_test` take none.
+  `runtime_start`, `runtime_stop` (except with `forget`), `profile_apply` and
+  `model_test` take none.
   Say what you are trying; people see it beside the change (runtime version
   history, node activity, command log, queued commands).
 - **Deleting nodes.** `node_delete` removes an offline node only (refused with
   `node_online` while it is connected, with no override); its always-on
   runtimes go and instances with a part there stop. It is audited with the
   node's slug and id. People delete any node in the browser.
-- **Confirmation.** Deletes take `confirm: "DELETE"` and `node_command_run`
-  takes `confirm: "RUN"`. The literal only proves intent; it never replaces a
+- **Confirmation.** Deletes take `confirm: "DELETE"`, `node_command_run`
+  takes `confirm: "RUN"` and `runtime_stop` with `forget` takes
+  `confirm: "FORGET"`. The literal only proves intent; it never replaces a
   person's confirmation where one is required.
 - **Previews.** `runtime_start` and `profile_apply` accept a preview first: it
   shows placements, what stops and hold changes. Preview when unsure.
@@ -62,7 +64,30 @@ Anything that should keep running or serve traffic must be a runtime. A server
 started with a command is invisible to the proxy and dies with the command. When
 a step needs a person (for example a `sudo` password), queue it with
 `node_command_queue_for_user`; it runs only when they press Run and Enter in
-Terminals.
+Terminals. Poll its `id` with `node_command_get` as well: the answer has
+`queuedForUser: true` and the queued state (`QUEUED`, `RUN`, `DISMISSED`,
+`EXPIRED` or `REFUSED`) and never output, since the person runs it in their
+terminal. Only the person runs or dismisses it, so `cancel` refuses.
+
+### Stops that cannot be proven
+
+A stopping instance keeps its resources and port until its node proves the
+stop. When the stop steps fail (for example the stop command errors because
+the process is already gone), the server asks the node for a status probe: it
+proves the stop when no process of the rank's units is left, the `status`
+command (if any) says stopped, and the rank's port is free. The stop then
+completes with no person involved. Only when the node cannot prove it (still
+alive, or offline for 10 minutes) does the instance show `needsOperator:
+"FORGET"`; the probe is repeated every 5 minutes, so a later proof still
+completes it.
+
+To give up on such a stop, call `runtime_stop {instanceId, forget: true,
+confirm: "FORGET"}` (optionally `nodeNumber` for one node of a multi-node
+instance, and a `note`). Agents may do this only on Full-control nodes
+(`trust_relay` otherwise). The claim stays counted until a status probe proves
+the stop, but the instance settles STOPPED and later starts stop waiting for
+it (`waits_for_stop`). Each forgotten node writes a `claim_forget` row in the
+node's activity.
 
 ### Runtime definitions
 
@@ -80,7 +105,10 @@ A spec has exactly one of:
   with `localhost` or an IP literal as host, written in normalized form.
   `auth` is `{ mode: "bearer" }` or `{ mode: "header", header }` plus
   `env: "WSMP_SECRET_…"`; `headers` are `{ name, env }` pairs. Secrets are
-  referenced by name only.
+  referenced by name only. The proxy never starts or stops it:
+  `runtime_start` (with or without `instanceId` or `preview`) refuses with
+  `always_on_runtime`. Its health is probed automatically; `model_test`
+  checks it now.
 - `launch` (a **startable** runtime: commands that start one):
   - `management`: `process` (the node owns the process) or `service` (stop and
     a `status` command prove it; exit 0 alive, exit 3 stopped).
@@ -227,9 +255,17 @@ secret files.
   (`wsmp config set-file-tools off`). A refused path's error lists them too. wsmp's own
   config, credentials, secrets, runtime stores, state directory, service unit
   and binary are off limits (writes) or read-only (config).
+- **Reads paginate.** A read returns at most 400 lines and 32 KiB at a time
+  (`limit` up to 2,000 lines), never `too_large` for files up to 64 MiB. When the file goes on, the
+  result has `more: {startLine, byteOffset?}`: call again with
+  `offset: more.startLine` (and `byteOffset: more.byteOffset` when a single long
+  line was cut). A 2 MiB text file is read in pages this way.
 - **Writes.** `node_file_write` without `ifMatch` only creates a new file; with
   `ifMatch` it replaces exactly the version you read. `node_file_edit`
-  requires `ifMatch`. Content is at most 1 MiB (UTF-8 text or base64).
+  requires `ifMatch`. Content is at most 1 MiB (UTF-8 text or base64, measured
+  decoded); a larger write is refused as invalid input (`content`). The MCP
+  request body is capped at 1 MiB as well, so the largest write that fits is a
+  little under 1 MiB of plain text, or about 750 KiB (decoded) as base64.
 - **Errors.** `data.reason` carries the file error code (`path_denied`,
   `conflict` with the current etag, `exists`, `not_found`, `too_large`, ...).
   An `outcome: "unknown"` means the change may or may not have happened: stat

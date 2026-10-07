@@ -618,7 +618,9 @@
     "fabric_in_use": "A runtime spanning several nodes uses this fabric. Stop it first.",
     "alias_shadowed": "That name is already one of your callable IDs.",
     "alias_limit": "Too many aliases. Remove one first.",
-    "alias_key_not_allowed": "That key cannot call this pool. Add the pool to the key first."
+    "alias_key_not_allowed": "That key cannot call this pool. Add the pool to the key first.",
+    "always_on_runtime": "An always-on runtime runs on its own; there is nothing to start.",
+    "fabric_port_ranges_disjoint": "These nodes' port ranges share no port; make them overlap."
   },
   "models": {
     "loadFailed": "Couldn't load your models.",
@@ -1110,7 +1112,9 @@
       "command_not_running": "That command is not running.",
       "other": "This cannot run as previewed.",
       "fabric_in_use": "A running multi-node instance uses this fabric.",
-      "invite_needs_link": "This invite needs its link to be accepted."
+      "invite_needs_link": "This invite needs its link to be accepted.",
+      "always_on_runtime": "Always-on runtimes run on their own; there is nothing to start.",
+      "fabric_port_ranges_disjoint": "The nodes' port ranges share no port for the dist port."
     },
     "delete": "Delete runtime",
     "deleteTitle": "Delete {{name}}?",

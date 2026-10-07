@@ -238,6 +238,36 @@ integration("placement writes on PostgreSQL", () => {
     expect(after).toEqual({ port: before.port, claim: "HELD" });
   });
 
+  it("a Full agent forgets an unprovable stop on a Full-control node, audited on the node", async () => {
+    await nodeProvesStops();
+    const lone = await createRuntime(`${RUN}-lone`, 1, 4);
+    const started = await client(CALLERS.fullAgent(USER)).start({ runtimeId: lone });
+    if (started.mode !== "applied") throw new Error("expected an applied start");
+    const instanceId = started.operation.instances[0]?.id ?? "";
+    await client(CALLERS.fullAgent(USER)).stop({ instanceId });
+    const view = await client(CALLERS.fullAgent(USER)).instances.forget({
+      instanceId,
+      confirm: "FORGET",
+      note: "process already gone",
+    });
+    expect(view.id).toBe(instanceId);
+    const rank = await modules.prisma.instanceRank.findFirstOrThrow({
+      where: { instanceId },
+      select: { claim: true, nodeId: true },
+    });
+    expect(rank.claim).toBe("HELD_UNKNOWN");
+    const audit = await modules.prisma.nodeAuditEvent.findFirstOrThrow({
+      where: { userId: USER, kind: "claim_forget", instanceId },
+    });
+    expect(audit).toMatchObject({
+      nodeId: rank.nodeId,
+      actor: "AGENT",
+      agentTokenId: "tok-1",
+      subject: `instance:${instanceId} rank:0`,
+      reason: "process already gone",
+    });
+  });
+
   it("a person's profile apply commits its operation and holds through the fences", async () => {
     await nodeProvesStops();
     const profileRuntime = await createRuntime(`${RUN}-profile`, 1, 8);

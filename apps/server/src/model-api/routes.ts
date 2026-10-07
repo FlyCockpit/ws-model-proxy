@@ -23,6 +23,7 @@ import {
   relayFailureClasses,
   releaseTargetHalfOpenTrial,
   routeKey,
+  targetHealthFailure,
 } from "@ws-model-proxy/api/lib/pool-routing";
 import { ANTHROPIC_DEFAULT_API_VERSION } from "@ws-model-proxy/api/lib/provider-protocol";
 import {
@@ -166,7 +167,7 @@ import { applyMetricRoutingVerdicts } from "./metric-routing-order.js";
 import {
   multimodalFlagsFromCapabilities,
   openAiModelListExtensions,
-  unionMultimodalFlags,
+  poolModelListFlags,
 } from "./model-list-modalities.js";
 import {
   MultipartIngressError,
@@ -263,6 +264,11 @@ import {
   type TestTarget,
   testRoutes,
 } from "./resolve.js";
+import {
+  RESPONSE_NOT_STORED_MESSAGE,
+  storedResponseUnavailable,
+  unsupportedCapabilityMessage,
+} from "./responses-storage.js";
 import {
   isBasicTranscriptionRequest,
   TranscriptionRequestError,
@@ -3376,17 +3382,12 @@ async function resolveStickyRoute({
       expiresAt: true,
     },
   });
-  if (
-    !record ||
-    record.userId !== requester.userId ||
-    record.apiKeyId !== requester.apiKeyId ||
-    !record.selectedTargetId ||
-    (record.expiresAt !== null && record.expiresAt <= new Date())
-  )
-    return openAiFailureJsonResponse(
-      "not_found",
-      "Response routing metadata was not found or has expired.",
-    );
+  // Routing is kept for a stored response (or a follow-up) only, for
+  // RESPONSES_STICKINESS_TTL_MS: anything else was never stored, so say that rather than
+  // "expired" (docs/external-fallback.md, "Stored responses").
+  const unavailable = storedResponseUnavailable(record, requester, new Date());
+  if (unavailable !== null || !record?.selectedTargetId)
+    return openAiFailureJsonResponse("not_found", unavailable ?? RESPONSE_NOT_STORED_MESSAGE);
   // Stickiness is hot-path history (@ws-model-proxy/db/capacity-lock-order):
   // it names its share and target by plain id, with no foreign key. A
   // deleted share or target simply is not found, which fails closed below.
@@ -3429,7 +3430,7 @@ async function resolveStickyRoute({
     )
       return openAiFailureJsonResponse(
         "not_found",
-        "Response routing metadata was not found or has expired.",
+        "This stored response is no longer accessible with this API key.",
       );
     if (
       !record.providerAccountId ||
@@ -3687,15 +3688,7 @@ async function modelListResponse(
     targets.pools.map(async (pool) => {
       const rows = await poolMemberRows(pool.id);
       if (rows.some((row) => routeIsServing(row, onlineNodeIds))) servingPoolIds.add(pool.id);
-      const byModel = new Map(rows.map((row) => [row.model.id, row.model] as const));
-      poolFlagsById.set(
-        pool.id,
-        unionMultimodalFlags(
-          [...byModel.values()].map((model) =>
-            multimodalFlagsFromCapabilities(openAiCapabilitiesFromCoarse(model.capabilities)),
-          ),
-        ),
-      );
+      poolFlagsById.set(pool.id, poolModelListFlags(rows));
     }),
   );
 
@@ -5414,7 +5407,8 @@ async function relayPool({
     if (overflow.kind === "response") return overflow.response;
     if (providerOnly && overflow.kind === "unavailable")
       return providerOnlyUnavailableResponse(overflow.reason);
-    const failure = terminalExternalFailure(overflow) ?? "unsupported_capability";
+    const externalFailure = terminalExternalFailure(overflow);
+    const failure = externalFailure ?? "unsupported_capability";
     if (
       failure === "unsupported_capability" &&
       operation.adaptation &&
@@ -5431,37 +5425,29 @@ async function relayPool({
     }
     await operation.dispose?.();
     await failPoolRelayMetadata({ relayRequestId, startedAt, failure });
-    return operationFailureResponse(operation, failure);
+    return operationFailureResponse(
+      operation,
+      failure,
+      externalFailure ? undefined : unsupportedCapabilityMessage(operation),
+    );
   }
 
   const onlineNodeIds = manager.getOnlineNodeIds();
   const now = new Date();
-  const nativeSequence = buildPoolRouteSequence({
-    routes: selectedNativeProtocolCandidates.map(poolRouteRowOf),
-    onlineNodeIds,
-    now,
+  const groupRows = [
+    selectedNativeProtocolCandidates.map(poolRouteRowOf),
+    selectedAdaptedProtocolCandidates.map(poolRouteRowOf),
+    selectedLegacyProtocolCandidates.map(poolRouteRowOf),
+    unknownFallbackMembers.map(poolRouteRowOf),
+  ] as const;
+  // A degraded route of one group falls back only when no known-compatible group has a
+  // healthy route (an optimistic unknown-capability member is no alternative).
+  const alternatives = groupRows.slice(0, 3).flat();
+  // Native first, then adapted, legacy and unknown (the sort below keeps that rank).
+  const localRouteCandidates = groupRows.flatMap((routes) => {
+    const sequence = buildPoolRouteSequence({ routes, onlineNodeIds, now, alternatives });
+    return sequence.ok ? sequence.candidates : [];
   });
-  const adaptedSequence = buildPoolRouteSequence({
-    routes: selectedAdaptedProtocolCandidates.map(poolRouteRowOf),
-    onlineNodeIds,
-    now,
-  });
-  const legacySequence = buildPoolRouteSequence({
-    routes: selectedLegacyProtocolCandidates.map(poolRouteRowOf),
-    onlineNodeIds,
-    now,
-  });
-  const unknownSequence = buildPoolRouteSequence({
-    routes: unknownFallbackMembers.map(poolRouteRowOf),
-    onlineNodeIds,
-    now,
-  });
-  const localRouteCandidates = [
-    ...(nativeSequence.ok ? nativeSequence.candidates : []),
-    ...(adaptedSequence.ok ? adaptedSequence.candidates : []),
-    ...(legacySequence.ok ? legacySequence.candidates : []),
-    ...(unknownSequence.ok ? unknownSequence.candidates : []),
-  ];
   const routeModeRank = (candidate: (typeof localRouteCandidates)[number]) => {
     const mode = executionByMember.get(candidate.poolMemberId)?.mode;
     return mode === "native" ? 0 : mode === "adapted" ? 1 : 2;
@@ -5500,10 +5486,19 @@ async function relayPool({
       async () => undefined,
     );
     if (overflow.kind === "response") return overflow.response;
-    const failure = terminalExternalFailure(overflow) ?? "disconnected";
+    const externalFailure = terminalExternalFailure(overflow);
+    const failure = externalFailure ?? "disconnected";
     await operation.dispose?.();
     await failPoolRelayMetadata({ relayRequestId, startedAt, failure });
-    return operationFailureResponse(operation, failure);
+    // No member is routable now (not ready, node offline, or every target waiting out its
+    // health backoff): say so, rather than blame a connection the caller cannot see.
+    return operationFailureResponse(
+      operation,
+      failure,
+      externalFailure
+        ? undefined
+        : "No member of this pool can serve the request right now. Retry shortly.",
+    );
   }
 
   const memberById = new Map(eligibleMembers.map((member) => [member.id, member] as const));
@@ -6309,10 +6304,10 @@ async function relayPool({
         claimed = await markTargetHalfOpenTrial({
           now: trialStartedAt,
           executionTargetId: candidate.executionTargetId,
-          // `buildPoolRouteSequence` emits this only when the full configured
-          // pool has one route. Passing explicit authority keeps a
+          // `buildPoolRouteSequence` emits this only for a degraded route with
+          // no healthy alternative. Passing explicit authority keeps a
           // degraded row from being claimed by other half-open callers.
-          allowSingleDegradedFallback: candidate.singleRouteDegradedFallback,
+          allowDegradedFallback: candidate.degradedFallback,
         });
       } catch {
         await settleRelayCleanup([() => cliLease.release()]);
@@ -6721,7 +6716,7 @@ async function relayPool({
         await recordTargetRelayFailure({
           executionTargetId: candidate.executionTargetId,
           trialStartedAt: claimedTrialAt,
-          failure: "upstream_5xx",
+          failure: targetHealthFailure("upstream_5xx", adaptedSource !== null),
         }).catch(metadataUpdateError);
         await releaseCapacityAttempt();
         continue;
@@ -6832,7 +6827,7 @@ async function relayPool({
           await recordTargetRelayFailure({
             executionTargetId: candidate.executionTargetId,
             trialStartedAt: claimedTrialAt,
-            failure: "protocol_error",
+            failure: targetHealthFailure("protocol_error", adaptedSource !== null),
           }).catch(metadataUpdateError);
           if (!shouldRetryRelayOperation(operation, "precommit_content_type_mismatch")) break;
           await releaseCapacityAttempt();
@@ -6881,7 +6876,7 @@ async function relayPool({
           await recordTargetRelayFailure({
             executionTargetId: candidate.executionTargetId,
             trialStartedAt: claimedTrialAt,
-            failure: "protocol_error",
+            failure: targetHealthFailure("protocol_error", adaptedSource !== null),
           }).catch(metadataUpdateError);
           await releaseCapacityAttempt();
           continue;
@@ -6937,7 +6932,7 @@ async function relayPool({
           await recordTargetRelayFailure({
             executionTargetId: candidate.executionTargetId,
             trialStartedAt: claimedTrialAt,
-            failure: "protocol_error",
+            failure: targetHealthFailure("protocol_error", adaptedSource !== null),
           }).catch(metadataUpdateError);
           await releaseCapacityAttempt();
           continue;
@@ -7249,7 +7244,7 @@ async function relayPool({
                   ? recordTargetRelayFailure({
                       executionTargetId: candidate.executionTargetId,
                       trialStartedAt: claimedTrialAt,
-                      failure: "protocol_error",
+                      failure: targetHealthFailure("protocol_error", adaptedSource !== null),
                     })
                   : // A served attempt that settled neither way (client abort
                     // mid-stream, non-member failure) gives its trial back; a
@@ -7379,7 +7374,7 @@ async function relayPool({
         await recordTargetRelayFailure({
           executionTargetId: candidate.executionTargetId,
           trialStartedAt: claimedTrialAt,
-          failure,
+          failure: targetHealthFailure(failure, adaptedSource !== null),
         }).catch(metadataUpdateError);
         await releaseCapacityAttempt();
         continue;

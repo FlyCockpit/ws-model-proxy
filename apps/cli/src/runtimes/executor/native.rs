@@ -144,6 +144,62 @@ fn description(owner: &str, unit: &str) -> String {
     format!("wsmp-runtime:{owner}:{base}")
 }
 
+/// From `systemctl show --property=LoadState,ActiveState,TasksCurrent,ControlGroup`: a
+/// unit that is gone, or whose control group is empty, runs nothing. A unit whose task count
+/// is not known counts as alive.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn unit_tasks_alive(output: &str) -> bool {
+    let fields = output
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if fields.get("LoadState") == Some(&"not-found") || fields.get("ControlGroup") == Some(&"") {
+        return false;
+    }
+    // An unknown task count with a control group proves nothing: count it as alive.
+    fields
+        .get("TasksCurrent")
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_none_or(|tasks| tasks > 0)
+}
+
+/// Nothing listens on `port`: binding it on every address (and on `host`) works. An address
+/// this machine does not have (no IPv6, another node's fabric IP) says nothing about the
+/// port; any other error (in use, out of descriptors, denied) is no proof that it is free.
+pub fn port_free(host: &str, port: u16) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
+    let mut addresses = vec![
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    ];
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        addresses.push(ip);
+    }
+    addresses
+        .into_iter()
+        .all(|ip| match TcpListener::bind(SocketAddr::new(ip, port)) {
+            Ok(_) => true,
+            Err(error) => address_missing(&error),
+        })
+}
+
+fn address_missing(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(nix::libc::EAFNOSUPPORT)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 impl NativeRuntime {
     fn cancel_flag(&self) -> Option<&AtomicBool> {
         self.cancel.as_deref()
@@ -457,6 +513,37 @@ impl Runtime for NativeRuntime {
         Ok(())
     }
 
+    fn tasks_alive(&self, unit: &str, deadline: Deadline) -> Result<bool> {
+        deadline.remaining()?;
+        anyhow::ensure!(!self.cancelled(), "session disconnected");
+        #[cfg(target_os = "linux")]
+        {
+            let output = manager_until(
+                "systemctl",
+                &[
+                    "--user".into(),
+                    "show".into(),
+                    unit.into(),
+                    "--property=LoadState,ActiveState,TasksCurrent,ControlGroup".into(),
+                ],
+                deadline,
+                self.cancel_flag(),
+                &[],
+            )?;
+            Ok(unit_tasks_alive(&output))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // No units here: a service is proven by its status command.
+            let _ = unit;
+            Ok(false)
+        }
+    }
+
+    fn port_free(&self, host: &str, port: u16) -> bool {
+        port_free(host, port)
+    }
+
     fn healthy_until(&self, job: &Job, deadline: Deadline) -> bool {
         if self.cancelled() {
             return false;
@@ -485,6 +572,38 @@ impl Runtime for NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_unit_with_no_task_runs_nothing() {
+        assert!(!unit_tasks_alive(
+            "LoadState=not-found\nActiveState=inactive\n"
+        ));
+        // RemainAfterExit: the unit stays active after its process exited.
+        assert!(!unit_tasks_alive(
+            "LoadState=loaded\nActiveState=active\nTasksCurrent=0\nControlGroup=/x\n"
+        ));
+        assert!(!unit_tasks_alive(
+            "LoadState=loaded\nActiveState=active\nTasksCurrent=[not set]\nControlGroup=\n"
+        ));
+        assert!(unit_tasks_alive(
+            "LoadState=loaded\nActiveState=active\nTasksCurrent=3\nControlGroup=/x\n"
+        ));
+        assert!(unit_tasks_alive(
+            "LoadState=loaded\nActiveState=active\nTasksCurrent=[not set]\nControlGroup=/x\n"
+        ));
+        assert!(unit_tasks_alive(
+            "LoadState=loaded\nActiveState=failed\nTasksCurrent=[not set]\nControlGroup=/x\n"
+        ));
+    }
+
+    #[test]
+    fn a_listening_port_is_not_free() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        assert!(!port_free("127.0.0.1", port));
+        drop(listener);
+        assert!(port_free("127.0.0.1", port));
+    }
 
     #[test]
     fn manager_states_and_linger_parse() {

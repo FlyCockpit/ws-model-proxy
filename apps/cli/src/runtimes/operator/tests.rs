@@ -328,6 +328,12 @@ impl Runtime for Machine {
     fn healthy_until(&self, _: &Job, _: Deadline) -> bool {
         true
     }
+    fn tasks_alive(&self, _: &str, _: Deadline) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    fn port_free(&self, _: &str, _: u16) -> bool {
+        true
+    }
 }
 
 fn job(action: JobPhase) -> Job {

@@ -463,6 +463,83 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     return id;
   }
 
+  it("completes a stop its failed stops could not prove once a status probe proves it", async () => {
+    const lc = await engine();
+    const id = await ready(lc, 30_109);
+    await m.fixture.runtimeInstance.update({
+      where: { id },
+      data: { desiredState: "STOPPED", phase: "STOPPING", phaseReason: "stop_requested" },
+    });
+    // Every stop fails (say its stop command errors because the process is already gone).
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await lc.runOnce();
+      await answer(lc, lastJob(id, "stop"), "failed", { error: "command_failed" });
+    }
+    // No person yet: the node is asked for proof first.
+    await lc.runOnce();
+    let row = await instance(id);
+    expect(row.needsOperator).toBeNull();
+    expect(row.Ranks[0]?.claim).toBe("HELD");
+    const first = lastJob(id, "status");
+    // The node cannot prove it (still alive, or unknown): now a person may Forget.
+    await answer(lc, first, "succeeded", { stopped: false });
+    await lc.runOnce();
+    row = await instance(id);
+    expect(row.phase).toBe("STOPPING");
+    expect(row.needsOperator).toBe("FORGET");
+    expect(sent.filter((job) => job.instanceId === id && job.phase === "status")).toHaveLength(1);
+    // Later the probe is repeated; its proof completes the stop with no person.
+    await m.fixture.instanceStep.updateMany({
+      where: { instanceId: id, phase: "STATUS" },
+      data: { updatedAt: new Date(Date.now() - 6 * 60_000) },
+    });
+    await lc.runOnce();
+    const second = lastJob(id, "status");
+    expect(second.stepId).not.toBe(first.stepId);
+    await answer(lc, second, "succeeded", { stopped: true });
+    row = await instance(id);
+    expect(row.phase).toBe("STOPPED");
+    expect(row.needsOperator).toBeNull();
+    expect(row.Ranks[0]?.claim).toBe("RELEASED");
+  });
+
+  it("probes a stop again in a later run of the same instance (probe sequences never clash)", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_110);
+    const failStopsThenProve = async () => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        await lc.runOnce();
+        await answer(lc, lastJob(id, "stop"), "failed", { error: "command_failed" });
+      }
+      await lc.runOnce();
+      const probe = lastJob(id, "status");
+      await answer(lc, probe, "succeeded", { stopped: true });
+      return probe;
+    };
+    // Run 1 fails to start; its stops fail; the probe proves the stop.
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "start"), "failed", { error: "command_failed" });
+    const first = await failStopsThenProve();
+    let row = await instance(id);
+    expect(row.phase).toBe("STOPPED");
+    expect(row.Ranks[0]?.claim).toBe("RELEASED");
+    // Run 2 (the automatic restart) fails the same way: its probe gets a sequence of its own.
+    await m.fixture.runtimeInstance.update({
+      where: { id },
+      data: { nextRestartAt: new Date(Date.now() - 1_000) },
+    });
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "stop"), "succeeded", { stopped: true });
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "start"), "failed", { error: "command_failed" });
+    const second = await failStopsThenProve();
+    expect(second.generation).toBe(2);
+    expect(second.stepId).not.toBe(first.stepId);
+    row = await instance(id);
+    expect(row.Ranks[0]?.claim).toBe("RELEASED");
+    expect(row.phase).toBe("FAILED");
+  });
+
   it("asks a person to Forget a stop whose node stays offline", async () => {
     const lc = await engine();
     const id = await ready(lc, 30_105);

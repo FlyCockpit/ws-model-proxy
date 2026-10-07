@@ -21,6 +21,7 @@ import type { CallerAuth } from "../contracts/auth-context";
 import {
   nodesContract as c,
   type nodeCommandViewSchema,
+  type queuedCommandStatusSchema,
   type queuedCommandViewSchema,
 } from "../contracts/nodes";
 import { callerActor } from "../lib/caller-actor";
@@ -40,6 +41,7 @@ export const QUEUED_COMMANDS_MAX_PER_USER = 50;
 
 type NodeCommandView = z.infer<typeof nodeCommandViewSchema>;
 type QueuedCommandView = z.infer<typeof queuedCommandViewSchema>;
+type QueuedCommandStatus = z.infer<typeof queuedCommandStatusSchema>;
 
 function services(context: Context): NodeOperatorServices {
   const operator = context.services?.nodeOperator;
@@ -260,7 +262,7 @@ const commands = {
       where: { id: input.commandId, userId },
       select: nodeCommandSelect,
     });
-    if (!row) throw notFound("That node or command does not exist.");
+    if (!row) return queuedCommandStatus(userId, input.commandId, input.cancel === true);
     if (input.cancel && row.state !== "RUNNING") {
       throw refuseAbout(
         "command_not_running",
@@ -278,6 +280,41 @@ const commands = {
     return pollAndSettle(operator, row, waitMs, input.cancel === true);
   }),
 };
+
+/**
+ * `node_command_get` on a `node_command_queue_for_user` id: its state, never output (a person
+ * types it into a browser terminal). Only that person runs or dismisses it, so cancel refuses.
+ */
+async function queuedCommandStatus(
+  userId: string,
+  queuedCommandId: string,
+  cancel: boolean,
+): Promise<QueuedCommandStatus> {
+  const queuedRow = await prisma.queuedNodeCommand.findFirst({
+    where: { id: queuedCommandId, userId },
+    select: queuedSelect,
+  });
+  if (!queuedRow) throw notFound("That node or command does not exist.");
+  const view = queuedView(queuedRow, new Date());
+  if (cancel) {
+    throw refuseAbout(
+      "command_not_running",
+      queuedRow.id,
+      `Command ${queuedRow.id} is queued for a person (${view.state}); only they run or dismiss it.`,
+      "CONFLICT",
+    );
+  }
+  return {
+    commandId: view.id,
+    queuedForUser: true,
+    state: view.state,
+    nodeId: view.nodeId,
+    createdAt: view.createdAt,
+    expiresAt: view.expiresAt,
+    decidedAt: view.decidedAt,
+    outcome: view.outcome,
+  };
+}
 
 // ── Browser terminals ──
 

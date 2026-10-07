@@ -123,6 +123,13 @@ describe("nodes.files: who may use them", () => {
 });
 
 describe("nodes.files.read", () => {
+  it("refuses byteOffset inside a tail read", async () => {
+    const read = client(FULL_AGENT, fileServices()).read;
+    await expect(
+      read({ nodeId: "node-1", path: "/srv/a", offset: -20, byteOffset: 10 }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
   it("maps read, stat, list and search to their relay args", async () => {
     const files = fileServices();
     const read = client(FULL_AGENT, files).read;
@@ -130,6 +137,12 @@ describe("nodes.files.read", () => {
     expect(lastRun(files)).toMatchObject({
       op: "read",
       args: { path: "/srv/a", startLine: -20, maxLines: 50, ifNoneMatch: ETAG },
+    });
+    // The next page inside a long line: `more.startLine` and `more.byteOffset`.
+    await read({ nodeId: "node-1", path: "/srv/a", offset: 400, byteOffset: 32_768 });
+    expect(lastRun(files)).toMatchObject({
+      op: "read",
+      args: { path: "/srv/a", startLine: 400, byteOffset: 32_768 },
     });
     await read({ nodeId: "node-1", path: "/srv/a", op: "stat" });
     expect(lastRun(files)).toMatchObject({

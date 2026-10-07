@@ -618,7 +618,9 @@
     "fabric_in_use": "Un runtime que abarca varios nodos usa este fabric. Detenlo primero.",
     "alias_shadowed": "Ese nombre ya es uno de tus ID invocables.",
     "alias_limit": "Demasiados alias. Elimina uno primero.",
-    "alias_key_not_allowed": "Esa clave no puede llamar a este pool. Agrega el pool a la clave primero."
+    "alias_key_not_allowed": "Esa clave no puede llamar a este pool. Agrega el pool a la clave primero.",
+    "always_on_runtime": "Un runtime siempre activo se ejecuta por su cuenta; no hay nada que iniciar.",
+    "fabric_port_ranges_disjoint": "Los rangos de puertos de estos nodos no comparten ningún puerto; haz que se superpongan."
   },
   "models": {
     "loadFailed": "No se pudieron cargar tus modelos.",
@@ -1110,7 +1112,9 @@
       "command_not_running": "Ese comando no se está ejecutando.",
       "other": "Esto no puede ejecutarse como en la vista previa.",
       "fabric_in_use": "Una instancia multinodo en ejecución usa esta red.",
-      "invite_needs_link": "Esta invitación necesita su enlace para aceptarse."
+      "invite_needs_link": "Esta invitación necesita su enlace para aceptarse.",
+      "always_on_runtime": "Los runtimes siempre activos se ejecutan por su cuenta; no hay nada que iniciar.",
+      "fabric_port_ranges_disjoint": "Los rangos de puertos de los nodos no comparten ningún puerto para el puerto dist."
     },
     "delete": "Eliminar runtime",
     "deleteTitle": "¿Eliminar {{name}}?",

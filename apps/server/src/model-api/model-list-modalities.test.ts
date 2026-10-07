@@ -4,6 +4,7 @@ import {
   multimodalFlagsFromCapabilities,
   openAiModelListExtensions,
   openAiModelListExtensionsFromCapabilities,
+  poolModelListFlags,
   unionMultimodalFlags,
 } from "./model-list-modalities.js";
 
@@ -179,5 +180,36 @@ describe("unionMultimodalFlags", () => {
       audioTranscription: true,
       audioTranslation: true,
     });
+  });
+});
+
+describe("poolModelListFlags", () => {
+  const row = (id: string, capabilities: string[], active = true) => ({
+    active,
+    model: { id, capabilities },
+  });
+
+  it("advertises a text-only wrap as text only", () => {
+    const flags = poolModelListFlags([row("glm", ["TEXT_GENERATION"])]);
+    expect(openAiModelListExtensions(flags)).toMatchObject({
+      supports_vision: false,
+      supports_video_input: false,
+      architecture: { input_modalities: ["text"] },
+    });
+  });
+
+  it("ignores a disabled member's capabilities, and unions the active ones", () => {
+    const disabledVision = row(
+      "qwen-vl",
+      ["TEXT_GENERATION", "VISION_INPUT", "VIDEO_INPUT"],
+      false,
+    );
+    expect(poolModelListFlags([row("glm", ["TEXT_GENERATION"]), disabledVision])).toMatchObject({
+      vision: false,
+      video: false,
+    });
+    expect(
+      poolModelListFlags([row("glm", ["TEXT_GENERATION"]), { ...disabledVision, active: true }]),
+    ).toMatchObject({ vision: true, video: true });
   });
 });

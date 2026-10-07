@@ -102,8 +102,8 @@ export type PoolRouteCandidate = {
   lastFailureClass: TargetFailureClass | null;
   lastFailureAt: Date | null;
   nextRetryAt: Date | null;
-  /** True only for the one-route degraded fallback path. */
-  singleRouteDegradedFallback?: boolean;
+  /** A due degraded route routed because no healthy route can serve (half-open request). */
+  degradedFallback?: boolean;
 };
 
 export type PoolRouteSequenceResult =
@@ -129,6 +129,23 @@ export function targetFailureClassForRelayFailure(
   // A protocol violation is attributable to the selected target like a broken relay payload.
   if (failure === "protocol_error") return "TRANSPORT";
   return null;
+}
+
+/**
+ * What one failed attempt says about its target's health. An adapted attempt (the proxy
+ * translated a surface the member does not serve natively, e.g. a Responses request onto chat
+ * completions) that the engine answers with a 5xx, or whose reply the adapter cannot
+ * translate, is evidence about the translation, not the member: it never degrades it. An
+ * unreachable target (transport, timeout, disconnect) still counts. So a member that fails
+ * every translated request stays HEALTHY; native requests still judge it.
+ */
+export function targetHealthFailure(
+  failure: RelayFailureClass,
+  adapted: boolean,
+): RelayFailureClass {
+  return adapted && (failure === "upstream_5xx" || failure === "protocol_error")
+    ? "unknown"
+    : failure;
 }
 
 export function isRetryableTargetRelayFailure(failure: RelayFailureClass): boolean {
@@ -217,7 +234,7 @@ function effectiveHealthForRouting(
   if (target.health === "HALF_OPEN")
     return targetTrialLive(target.halfOpenTrialStartedAt, now) ? null : "HALF_OPEN";
   const due = target.nextRetryAt !== null && target.nextRetryAt.getTime() <= now.getTime();
-  // A one-route pool has no alternative: a due degraded route gets its half-open request.
+  // With no healthy alternative, a due degraded route gets its half-open request.
   if (target.health === "DEGRADED" && allowDegraded && due) return "HALF_OPEN";
   if (target.health === "UNHEALTHY" && due) return "HALF_OPEN";
   return null;
@@ -227,20 +244,34 @@ export function routablePoolRoutes({
   routes,
   onlineNodeIds,
   now,
+  alternatives = routes,
 }: {
   routes: readonly PoolRouteRow[];
   onlineNodeIds: Iterable<string>;
   now: Date;
+  /** Every route of the request (all surface groups), when `routes` is one group of them. */
+  alternatives?: readonly PoolRouteRow[];
 }): PoolRouteCandidate[] {
   const online = new Set(onlineNodeIds);
+  const servable = (route: PoolRouteRow) =>
+    route.instanceReady &&
+    route.nodeOnline &&
+    route.nodeId !== null &&
+    online.has(route.nodeId) &&
+    route.memberActive &&
+    route.weight > 0;
+  // A degraded route is left to the recovery probe while a healthy route can serve. Without
+  // one (every member degraded, or a one-route pool) a due degraded route takes a half-open
+  // request: otherwise a member whose probe cannot run (or has not yet) is never routed again
+  // and the pool answers 503 while its engines are fine.
+  const healthyAlternative = alternatives.some(
+    (route) => (route.health === "HEALTHY" || route.health === "UNKNOWN") && servable(route),
+  );
   const candidates: PoolRouteCandidate[] = [];
   for (const route of routes) {
-    const singleRouteDegradedFallback = routes.length === 1 && route.health === "DEGRADED";
-    const health = effectiveHealthForRouting(route, now, singleRouteDegradedFallback);
-    if (health === null) continue;
-    if (!route.instanceReady || !route.nodeOnline || route.nodeId === null) continue;
-    if (!online.has(route.nodeId)) continue;
-    if (!route.memberActive || route.weight <= 0) continue;
+    const degradedFallback = !healthyAlternative && route.health === "DEGRADED";
+    const health = effectiveHealthForRouting(route, now, degradedFallback);
+    if (health === null || !servable(route) || route.nodeId === null) continue;
     candidates.push({
       poolMemberId: route.poolMemberId,
       poolId: route.poolId,
@@ -256,7 +287,7 @@ export function routablePoolRoutes({
       lastFailureClass: route.lastFailureClass,
       lastFailureAt: route.lastFailureAt,
       nextRetryAt: route.nextRetryAt,
-      singleRouteDegradedFallback,
+      degradedFallback,
     });
   }
   return candidates;
@@ -295,13 +326,21 @@ export function buildPoolRouteSequence({
   onlineNodeIds,
   now,
   state = {},
+  alternatives,
 }: {
   routes: readonly PoolRouteRow[];
   onlineNodeIds: Iterable<string>;
   now: Date;
   state?: SmoothWeightedRoundRobinState;
+  /** Every route of the request, when `routes` is one surface group of them. */
+  alternatives?: readonly PoolRouteRow[];
 }): PoolRouteSequenceResult {
-  const candidates = routablePoolRoutes({ routes, onlineNodeIds, now });
+  const candidates = routablePoolRoutes({
+    routes,
+    onlineNodeIds,
+    now,
+    ...(alternatives ? { alternatives } : {}),
+  });
   if (candidates.length === 0)
     return {
       ok: false,
@@ -359,7 +398,12 @@ export async function recordTargetRelayFailure({
   now?: Date;
 }): Promise<{ retryable: boolean; update: TargetHealthUpdate | null }> {
   const failureClass = targetFailureClassForRelayFailure(failure);
-  if (!failureClass) return { retryable: false, update: null };
+  if (!failureClass) {
+    // Says nothing about the target: a half-open trial it held goes back to waiting out its
+    // backoff (visible to the recovery probe again), not left to its 16-minute lease.
+    if (trialStartedAt) await returnTargetTrial({ executionTargetId, trialStartedAt, now });
+    return { retryable: false, update: null };
+  }
   // A relay `disconnected` outcome is the in-flight echo of a node detach, whose own fenced
   // write (`disconnectNodeAtGeneration`) owns "node unavailable" health.
   if (failureClass === "WEBSOCKET_DISCONNECTED") {
@@ -472,12 +516,12 @@ export async function abandonTargetRecoveryTrial({
 
 export async function markTargetHalfOpenTrial({
   executionTargetId,
-  allowSingleDegradedFallback = false,
+  allowDegradedFallback = false,
   now = new Date(),
 }: {
   executionTargetId: string;
-  /** Only the routing path of a one-route pool may enable this. */
-  allowSingleDegradedFallback?: boolean;
+  /** Only the routing path may enable this, for a route with no healthy alternative. */
+  allowDegradedFallback?: boolean;
   now?: Date;
 }): Promise<number> {
   const result = await prisma.executionTarget.updateMany({
@@ -490,7 +534,7 @@ export async function markTargetHalfOpenTrial({
           health: "HALF_OPEN",
           halfOpenTrialStartedAt: { lte: new Date(now.getTime() - TARGET_HALF_OPEN_LEASE_MS) },
         },
-        ...(allowSingleDegradedFallback
+        ...(allowDegradedFallback
           ? [{ health: "DEGRADED" as const, nextRetryAt: { lte: now } }]
           : []),
       ],
@@ -498,6 +542,37 @@ export async function markTargetHalfOpenTrial({
     data: { health: "HALF_OPEN", halfOpenTrialStartedAt: now },
   });
   return result.count;
+}
+
+/**
+ * An inconclusive half-open trial (the attempt failed for a reason that is not the target's):
+ * the target waits out its current backoff as UNHEALTHY, which the recovery probe and the next
+ * due request both try again (a DEGRADED one could be left to a probe that cannot cover its
+ * model type); no failure is counted.
+ */
+async function returnTargetTrial({
+  executionTargetId,
+  trialStartedAt,
+  now,
+}: {
+  executionTargetId: string;
+  trialStartedAt: Date;
+  now: Date;
+}): Promise<void> {
+  const target = await prisma.executionTarget.findUnique({
+    where: { id: executionTargetId },
+    select: { consecutiveRetryableFailures: true },
+  });
+  if (!target) return;
+  const failures = target.consecutiveRetryableFailures;
+  await prisma.executionTarget.updateMany({
+    where: { id: executionTargetId, health: "HALF_OPEN", halfOpenTrialStartedAt: trialStartedAt },
+    data: {
+      health: "UNHEALTHY",
+      halfOpenTrialStartedAt: null,
+      nextRetryAt: new Date(now.getTime() + targetRecoveryDelayMs(failures)),
+    },
+  });
 }
 
 /** Gives back a half-open trial whose claimant sent nothing. */

@@ -26,8 +26,10 @@
  * (`no_shared_fabric` when no fabric has enough members). The head (rank 0) address and every
  * rank's `fabric_ip` come from that fabric's member IPs. A node set is usable only when every
  * Relay-only rank holds the head address in its frozen copy of that fabric (§4.4, else the node
- * refuses with `definition_frozen`) and one dist port is free on every rank; otherwise other
- * sets are tried (`head_not_in_frozen_fabric` / `no_free_ports` when none works).
+ * refuses with `definition_frozen`) and one dist port, inside the intersection of the ranks'
+ * port ranges, is free on every rank (a rank moves off the common port its own port took);
+ * otherwise other sets are tried (`head_not_in_frozen_fabric` / `no_free_ports`, or
+ * `fabric_port_ranges_disjoint` when the ranges share no port, when none works).
  *
  * Preemption (only when nothing fits without it, only when the request allows it): the stop
  * set with the least disruption, compared as (contributed instances, instances, ranks, GiB
@@ -443,7 +445,11 @@ const MESSAGES: Partial<Record<RefusalReason, string>> = {
 };
 
 /** Set-level reasons (a whole node set was found but cannot run), the closest miss first. */
-const GROUP_REASONS = ["no_free_ports", "head_not_in_frozen_fabric"] as const;
+const GROUP_REASONS = [
+  "no_free_ports",
+  "head_not_in_frozen_fabric",
+  "fabric_port_ranges_disjoint",
+] as const;
 type GroupReason = (typeof GROUP_REASONS)[number];
 
 const GROUP_MESSAGES: Record<GroupReason, string> = {
@@ -451,6 +457,8 @@ const GROUP_MESSAGES: Record<GroupReason, string> = {
     "No set of nodes that fits has one dist port free on every node; free a port or widen the nodes' port ranges.",
   head_not_in_frozen_fabric:
     "In every set of nodes that fits, a Relay-only node does not hold the head's address in its frozen copy of the fabric, so it would refuse the start. Raise its trust to Full, or start on nodes whose frozen fabric includes the head.",
+  fabric_port_ranges_disjoint:
+    "The nodes of every set that fits have port ranges with no port in common, and a multi-node instance needs one dist port on every node. Make the ranges overlap.",
 };
 
 /**
@@ -461,7 +469,7 @@ const GROUP_MESSAGES: Record<GroupReason, string> = {
 const MAX_SET_TRIES = 32;
 
 /** Why a whole node set cannot run, and the node it is about (the first refusing node). */
-type GroupProblem = { reason: GroupReason; subjectId: string | null };
+type GroupProblem = { reason: GroupReason; subjectId: string | null; message?: string };
 
 function refusal(reason: RefusalReason, subjectId: string | null, message?: string) {
   return { reason, subjectId, message: message ?? MESSAGES[reason] ?? reason };
@@ -594,9 +602,20 @@ export class PlacementPlanner {
     // dist_port: one port free on every rank's node (multi-node only).
     let distPort: number | null = null;
     if (request.launch.groupSize > 1) {
-      distPort = this.#distPort(chosen.working, ranks, request.restart?.distPort ?? null);
-      if (distPort === null)
-        return { ok: false, refusal: refusal("no_free_ports", ranks[0]?.node.id ?? null) };
+      const plan = this.#distPlan(chosen.working, ranks, request.restart);
+      if ("reason" in plan)
+        return {
+          ok: false,
+          refusal: refusal(plan.reason, ranks[0]?.node.id ?? null, plan.message),
+        };
+      // A rank whose own port is the only common one moves to another of its ports.
+      for (const [rank, port] of plan.moves) {
+        const budget = chosen.working.budgets.get(rank.node.id);
+        budget?.ports.delete(rank.port);
+        rank.port = port;
+        budget?.ports.add(port);
+      }
+      distPort = plan.port;
       for (const rank of ranks) chosen.working.budgets.get(rank.node.id)?.ports.add(distPort);
     }
 
@@ -879,8 +898,8 @@ export class PlacementPlanner {
       return {
         refusal: refusal(
           groupReason,
-          groupReasons.get(groupReason) ?? null,
-          GROUP_MESSAGES[groupReason],
+          groupReasons.get(groupReason)?.subjectId ?? null,
+          groupReasons.get(groupReason)?.message ?? GROUP_MESSAGES[groupReason],
         ),
       };
     for (const reason of fitReasons) reasons.add(reason);
@@ -1006,8 +1025,13 @@ export class PlacementPlanner {
     const nodes = choice.ranks.map((rank) => rank.node);
     const refuser = this.#frozenRefuser(nodes, choice.fabric, request.launch);
     if (refuser) return { reason: "head_not_in_frozen_fabric", subjectId: refuser.id };
-    if (this.#distPort(choice.working, choice.ranks, request.restart?.distPort ?? null) === null)
-      return { reason: "no_free_ports", subjectId: null };
+    const plan = this.#distPlan(choice.working, choice.ranks, request.restart);
+    if ("reason" in plan)
+      return {
+        reason: plan.reason,
+        subjectId: choice.ranks[0]?.node.id ?? null,
+        ...(plan.message ? { message: plan.message } : {}),
+      };
     return null;
   }
 
@@ -1292,18 +1316,57 @@ export class PlacementPlanner {
     return this.#scopedMembers(fabric, request).length > 0;
   }
 
-  #distPort(working: Working, ranks: readonly RankChoice[], own: number | null): number | null {
-    const free = (port: number) =>
-      ranks.every((rank) => {
+  /**
+   * The dist port: one port inside every rank's range (their intersection) free on every
+   * rank's node. A port a rank of this instance took for itself may still be used when that
+   * rank can move to another free port of its own (ports needing no move first): otherwise a
+   * one-port overlap is always lost to the rank's own port. A restart keeps its own ports
+   * (none moves) and its own dist port.
+   */
+  #distPlan(
+    working: Working,
+    ranks: readonly RankChoice[],
+    restart: PlacementRequest["restart"],
+  ):
+    | { port: number; moves: Array<[RankChoice, number]> }
+    | { reason: "no_free_ports" | "fabric_port_ranges_disjoint"; message?: string } {
+    const inRange = (rank: RankChoice, port: number) =>
+      port >= rank.node.portRange[0] && port <= rank.node.portRange[1];
+    const plan = (port: number, allowMoves: boolean) => {
+      const moves: Array<[RankChoice, number]> = [];
+      for (const rank of ranks) {
         const budget = working.budgets.get(rank.node.id);
+        if (!budget || !inRange(rank, port)) return null;
+        if (!budget.ports.has(port)) continue;
+        if (!allowMoves || rank.port !== port) return null;
         const [start, end] = rank.node.portRange;
-        return !!budget && port >= start && port <= end && !budget.ports.has(port);
-      });
-    if (own !== null) return free(own) ? own : null;
+        let moved: number | null = null;
+        for (let candidate = start; candidate <= end && moved === null; candidate++)
+          if (candidate !== port && !budget.ports.has(candidate)) moved = candidate;
+        if (moved === null) return null;
+        moves.push([rank, moved]);
+      }
+      return { port, moves };
+    };
     const start = Math.max(...ranks.map((rank) => rank.node.portRange[0]));
     const end = Math.min(...ranks.map((rank) => rank.node.portRange[1]));
-    for (let port = start; port <= end; port++) if (free(port)) return port;
-    return null;
+    if (start > end)
+      return {
+        reason: "fabric_port_ranges_disjoint",
+        message: `The port ranges of ${ranks
+          .map((rank) => `${rank.node.slug} (${rank.node.portRange[0]}-${rank.node.portRange[1]})`)
+          .join(
+            ", ",
+          )} have no port in common, and a multi-node instance needs one dist port on every node. Make the ranges overlap.`,
+      };
+    const own = restart?.distPort ?? null;
+    if (own !== null) return plan(own, false) ?? { reason: "no_free_ports" };
+    for (const allowMoves of restart ? [false] : [false, true])
+      for (let port = start; port <= end; port++) {
+        const found = plan(port, allowMoves);
+        if (found) return found;
+      }
+    return { reason: "no_free_ports" };
   }
 
   #fitRefusal(
@@ -1379,10 +1442,14 @@ function isHeld(rank: PlacementRank): boolean {
 }
 
 /** Set-level reasons seen in a pass, each with the subject of the first set that failed so. */
-type GroupReasons = Map<GroupReason, string | null>;
+type GroupReasons = Map<GroupReason, { subjectId: string | null; message?: string }>;
 
 function noteProblem(reasons: GroupReasons, problem: GroupProblem): void {
-  if (!reasons.has(problem.reason)) reasons.set(problem.reason, problem.subjectId);
+  if (!reasons.has(problem.reason))
+    reasons.set(problem.reason, {
+      subjectId: problem.subjectId,
+      ...(problem.message ? { message: problem.message } : {}),
+    });
 }
 
 function waitingRanks(choice: InstanceChoice): number {

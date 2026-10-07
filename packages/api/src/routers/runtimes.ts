@@ -746,14 +746,20 @@ export const runtimesRouter = {
   steps: runtimeSteps,
   instances: {
     /**
-     * A person gives up proving a stop (node gone or unable to prove it): the rank's claim
+     * A person (or a Full agent, on Full-control nodes: recovery like deleting an offline
+     * node) gives up proving a stop (node gone or unable to prove it): the rank's claim
      * becomes HELD_UNKNOWN. Placement keeps counting its resources and port until a status
      * probe proves the stop; the instance settles STOPPED (spec §3.5). Audited as a FORGET
-     * operation.
+     * operation and a `claim_forget` node activity row per forgotten rank.
      */
     forget: contractProcedure(c.instances.forget).handler(async ({ input, context }) => {
       const userId = userIdOf(context);
       const actor = callerActor(context.auth, userId);
+      const agent = agentRulesApply(context.auth);
+      if (agent && input.confirm !== "FORGET")
+        throw new ORPCError("BAD_REQUEST", {
+          message: 'Forgetting a stop is recovery: repeat confirm: "FORGET".',
+        });
       const now = new Date();
       const operationId = await graphWrite(
         [userId],
@@ -763,7 +769,14 @@ export const runtimesRouter = {
             select: {
               id: true,
               phase: true,
-              Ranks: { select: { id: true, rank: true, claim: true } },
+              Ranks: {
+                select: {
+                  id: true,
+                  rank: true,
+                  claim: true,
+                  Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } },
+                },
+              },
             },
           });
           if (!instance) throw notFound("That instance does not exist.");
@@ -776,6 +789,15 @@ export const runtimesRouter = {
             throw new ORPCError("CONFLICT", {
               message: "Nothing of this instance waits for a stop to be proven.",
             });
+          // Agents forget only on Full-control nodes (a node that left counts as not Full).
+          if (agent)
+            for (const rank of ranks)
+              if (!rank.Node || effectiveTrust(rank.Node) !== "FULL")
+                throw refuseAbout(
+                  "trust_relay",
+                  rank.Node?.id ?? instance.id,
+                  "Agents may only forget stops on nodes at Full control. A person can do this in the browser.",
+                );
           const forgotten = ranks.map((rank) => rank.rank);
           const operation = await tx.runtimeOperation.create({
             data: {
@@ -801,6 +823,25 @@ export const runtimesRouter = {
               forgottenBy: userId,
             },
           });
+          for (const rank of ranks)
+            if (rank.Node)
+              await tx.nodeAuditEvent.create({
+                data: {
+                  userId,
+                  nodeId: rank.Node.id,
+                  actor: actor.actor,
+                  agentTokenId: actor.agentTokenId,
+                  mcpGrantId: actor.mcpGrantId,
+                  kind: "claim_forget",
+                  subject: `instance:${instance.id} rank:${rank.rank}`,
+                  instanceId: instance.id,
+                  rank: rank.rank,
+                  outcome: "completed",
+                  reason: input.note ?? null,
+                  startedAt: now,
+                  finishedAt: now,
+                },
+              });
           // Stops not yet sent for those ranks are not needed any more.
           await tx.instanceStep.updateMany({
             where: {

@@ -558,6 +558,35 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
     );
   });
 
+  it("refuses to start or restart an always-on runtime with always_on_runtime, preview too", async () => {
+    setupStart(nodeRow());
+    db.runtime.findFirst.mockResolvedValue({
+      id: "rt-1",
+      kind: "ALWAYS_ON",
+      currentVersionId: "ver-1",
+    } as never);
+    for (const input of [
+      { runtimeId: "rt-1" },
+      { runtimeId: "rt-1", instanceId: "inst-1" },
+      { runtimeId: "rt-1", instanceId: "inst-1", preview: true },
+    ]) {
+      const error = await client(CALLERS.fullAgent())
+        .start(input)
+        .then(
+          () => null,
+          (caught: unknown) => caught,
+        );
+      expect(error).toBeInstanceOf(ORPCError);
+      expect(error).toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "always_on_runtime", subjectId: "rt-1" },
+      });
+      expect((error as ORPCError<string, unknown>).message).toContain("model_test");
+    }
+    expect(db.runtimeOperation.create).not.toHaveBeenCalled();
+    expect(db.runtimeInstance.create).not.toHaveBeenCalled();
+  });
+
   it("an agent starts on a Full-control node without a fingerprint", async () => {
     setupStart(nodeRow());
     const result = await client(CALLERS.fullAgent()).start({ runtimeId: "rt-1" });
@@ -1106,16 +1135,65 @@ describe("runtimes.fork (create-shaped output)", () => {
 });
 
 describe("runtimes.instances.forget", () => {
-  const stopping = (claims: Array<"HELD" | "HELD_UNKNOWN" | "RELEASED">, phase = "STOPPING") => ({
+  const stopping = (
+    claims: Array<"HELD" | "HELD_UNKNOWN" | "RELEASED">,
+    phase = "STOPPING",
+    trust: "FULL" | "RELAY" = "FULL",
+  ) => ({
     id: "inst-1",
     phase,
-    Ranks: claims.map((claim, rank) => ({ id: `rank-${rank}`, rank, claim })),
+    Ranks: claims.map((claim, rank) => ({
+      id: `rank-${rank}`,
+      rank,
+      claim,
+      Node: { id: `node-${rank}`, trust, trustLowerRequestedAt: null },
+    })),
   });
 
-  it("is for people only", async () => {
+  it("refuses an agent without confirm FORGET, a cookie without CSRF, and a Relay-only node", async () => {
     for (const auth of [CALLERS.fullAgent(), CALLERS.oauthAgent(), CALLERS.cookieWithoutCsrf()])
       expect(await reasonOf(client(auth).instances.forget({ instanceId: "inst-1" }))).toBeDefined();
+    db.runtimeInstance.findFirst.mockResolvedValueOnce(
+      stopping(["HELD"], "STOPPING", "RELAY") as never,
+    );
+    expect(
+      await reasonOf(
+        client(CALLERS.fullAgent()).instances.forget({ instanceId: "inst-1", confirm: "FORGET" }),
+      ),
+    ).toBe("trust_relay");
     expect(db.instanceRank.updateMany).not.toHaveBeenCalled();
+    expect(db.nodeAuditEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("lets a Full agent forget on a Full-control node, audited with its token", async () => {
+    db.runtimeInstance.findFirst.mockResolvedValueOnce(stopping(["HELD"]) as never);
+    db.runtimeOperation.create.mockResolvedValueOnce({ id: "op-f" } as never);
+    db.runtimeInstance.findFirst.mockResolvedValueOnce(null);
+    expect(
+      await reasonOf(
+        client(CALLERS.fullAgent()).instances.forget({
+          instanceId: "inst-1",
+          confirm: "FORGET",
+          note: "process already gone",
+        }),
+      ),
+    ).toBe("NOT_FOUND");
+    expect(db.runtimeOperation.create.mock.calls[0]?.[0]?.data).toMatchObject({
+      kind: "FORGET",
+      actor: "AGENT",
+    });
+    expect(db.instanceRank.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ["rank-0"] }, claim: "HELD" },
+      data: expect.objectContaining({ claim: "HELD_UNKNOWN" }),
+    });
+    expect(db.nodeAuditEvent.create.mock.calls[0]?.[0]?.data).toMatchObject({
+      nodeId: "node-0",
+      actor: "AGENT",
+      kind: "claim_forget",
+      subject: "instance:inst-1 rank:0",
+      outcome: "completed",
+      reason: "process already gone",
+    });
   });
 
   it("refuses what is not the caller's, not stopping, or has no unproven stop", async () => {
