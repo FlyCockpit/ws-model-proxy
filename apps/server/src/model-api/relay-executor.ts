@@ -12,6 +12,7 @@ import { isCapacityLeaseLost } from "./capacity/lease-loss.js";
 import type { ModelApiFailure } from "./openai-errors.js";
 import type { RelayBodySource } from "./request-body-source.js";
 import { ResponseUsageRecorder, type ResponseUsageSample } from "./response-usage-sample.js";
+import { upstreamErrorExcerpt } from "./upstream-error-excerpt.js";
 
 type RelayUsage = {
   promptTokens?: number;
@@ -50,6 +51,8 @@ export type RelayAttemptTerminal = {
    * Absent for synthesized terminals that never received a response.
    */
   usageSample?: ResponseUsageSample | null;
+  /** A bounded, redacted excerpt of an upstream error answer (HTTP >= 400); null otherwise. */
+  upstreamErrorExcerpt?: string | null;
 };
 
 type RelayAttemptStarted = {
@@ -305,11 +308,16 @@ export function startRelayAttempt({
       started.reject(new Error(result.failure ?? "unknown"));
       responseController?.error(new Error(result.failure ?? "unknown"));
     }
+    const usageSample = responseBytes > 0 ? usageRecorder.sample() : null;
     terminal.resolve({
       ...result,
       responseBytes,
       requestBytes,
-      usageSample: responseBytes > 0 ? usageRecorder.sample() : null,
+      usageSample,
+      upstreamErrorExcerpt:
+        result.upstreamStatusCode !== null && result.upstreamStatusCode >= 400
+          ? upstreamErrorExcerpt(usageSample)
+          : null,
     });
   }
 

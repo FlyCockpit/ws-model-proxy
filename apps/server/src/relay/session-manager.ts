@@ -2981,6 +2981,9 @@ export class RelaySessionManager {
     if (session.socket.readyState !== WS_READY_STATE_OPEN) {
       throw new Error("Node session is disconnected.");
     }
+    const totalBytes =
+      bodySource?.size ?? bodyChunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+    const expectBody = (bodySource?.size ?? 0) > 0 || bodyChunks.length > 0;
     session.socket.send(
       encodeRelayServerControlMessage({
         type: "relay.request",
@@ -2991,7 +2994,9 @@ export class RelaySessionManager {
         headers: sanitizeRelayRequestHeaders(headers),
         timeoutMs,
         handle,
-        expectBody: (bodySource?.size ?? 0) > 0 || bodyChunks.length > 0,
+        expectBody,
+        // Strict OpenAI-compatible servers refuse a chunked request body (no Content-Length).
+        ...(expectBody && totalBytes > 0 ? { bodyBytes: totalBytes } : {}),
         ...(countFirst
           ? { countFirst: true as const, ...(countCeiling != null ? { countCeiling } : {}) }
           : {}),
@@ -2999,8 +3004,6 @@ export class RelaySessionManager {
     );
 
     if (!bodySource && bodyChunks.length === 0) return;
-    const totalBytes =
-      bodySource?.size ?? bodyChunks.reduce((total, chunk) => total + chunk.byteLength, 0);
     session.bodyStreamsByRequest.set(requestId, {
       chunks: bodySource ? undefined : [...bodyChunks],
       iterator: bodySource?.open()[Symbol.asyncIterator](),

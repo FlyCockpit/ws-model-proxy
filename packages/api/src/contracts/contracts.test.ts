@@ -55,6 +55,7 @@ const INVENTORY = [
   "nodes.fabrics.delete",
   "nodes.rename",
   "nodes.delete",
+  "nodes.deleteOffline",
   "nodes.lowerTrustPreview",
   "nodes.lowerTrust",
   "nodes.enrollmentCodes.list",
@@ -305,12 +306,12 @@ describe("caller auth (positive human check)", () => {
 });
 
 describe("0.4.0 MCP tool manifest", () => {
-  it("has the 27 tools in order, 7 of them read-only", () => {
+  it("has the 28 tools in order, 7 of them read-only", () => {
     expect(MCP_TOOLS.map((tool) => tool.name)).toEqual([...MCP_TOOL_NAMES]);
     expect(MCP_TOOLS.filter((tool) => tool.level === "READ").map((tool) => tool.name)).toEqual([
       ...MCP_READ_TOOLS,
     ]);
-    expect(MCP_TOOLS).toHaveLength(27);
+    expect(MCP_TOOLS).toHaveLength(28);
   });
 
   it("calls only agent procedures that name the tool back; read tools only query", () => {
@@ -330,11 +331,11 @@ describe("0.4.0 MCP tool manifest", () => {
   });
 
   it("requires confirm on deletes and command runs", () => {
-    for (const name of ["pool_delete", "runtime_delete", "profile_delete"]) {
+    for (const name of ["pool_delete", "runtime_delete", "profile_delete", "node_delete"]) {
       const tool = MCP_TOOLS.find((entry) => entry.name === name);
-      expect(tool?.input.safeParse({ poolId: "p", runtimeId: "r", profileId: "x" }).success).toBe(
-        false,
-      );
+      expect(
+        tool?.input.safeParse({ poolId: "p", runtimeId: "r", profileId: "x", nodeId: "n" }).success,
+      ).toBe(false);
     }
     const run = MCP_TOOLS.find((entry) => entry.name === "node_command_run");
     expect(run?.input.safeParse({ nodeId: "n", command: "ls" }).success).toBe(false);
@@ -367,13 +368,30 @@ describe("0.4.0 MCP tool manifest", () => {
     }
   });
 
-  it("advertises compact fields as plain objects that the procedure validates", () => {
+  it("advertises compact fields with the JSON type the procedure takes (object, list, null)", () => {
+    const typesOf = (schema: Record<string, unknown>): string[] => {
+      if (typeof schema.type === "string") return [schema.type];
+      if (Array.isArray(schema.type)) return schema.type as string[];
+      const branches = (schema.anyOf ?? []) as Array<Record<string, unknown>>;
+      return branches.flatMap(typesOf);
+    };
     for (const tool of MCP_TOOLS)
       for (const field of Object.keys(tool.compactFields ?? {})) {
+        const full = z.toJSONSchema(tool.input, { io: "input" }) as {
+          properties: Record<string, Record<string, unknown>>;
+        };
         const schema = advertisedToolList().find((entry) => entry.name === tool.name)?.inputSchema;
-        const properties = (schema?.properties ?? {}) as Record<string, { type?: string }>;
-        expect(properties[field]?.type, `${tool.name}.${field}`).toBe("object");
+        const properties = (schema?.properties ?? {}) as Record<string, Record<string, unknown>>;
+        const advertised = properties[field] ?? {};
+        expect(typesOf(advertised).sort(), `${tool.name}.${field}`).toEqual(
+          typesOf(full.properties[field] ?? {}).sort(),
+        );
       }
+    const nodeUpdate = advertisedToolList().find((entry) => entry.name === "node_update");
+    const fields = (nodeUpdate?.inputSchema.properties ?? {}) as Record<string, { type?: unknown }>;
+    // metricCommands is a list in nodes.update; hardware takes null to clear.
+    expect(fields.metricCommands?.type).toBe("array");
+    expect(fields.hardware?.type).toEqual(["object", "null"]);
   });
 
   it("keeps secret values out of generic inputs (only the sensitive secret tool takes one)", () => {

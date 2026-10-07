@@ -1,11 +1,11 @@
 /**
- * The 0.4.0 MCP tools: exactly the 27 tools of `MCP_TOOLS`
+ * The 0.4.0 MCP tools: exactly the 28 tools of `MCP_TOOLS`
  * (packages/api/src/contracts/mcp-tools.ts), registered on every per-request server.
  *
  * Exports for the server wiring:
  * - `registerMcpTools(server, ctx)`: the transport factory's `registerTools` seam
  *   (mcp/handler.ts). It lists the tools the request's level may call: READ tokens the 7
- *   read tools, FULL tokens all 27.
+ *   read tools, FULL tokens all 28.
  * - `cancelMcpToolCallsForToken(credentialId)`: aborts the in-flight tool calls of one
  *   agent token or OAuth grant (call it when the token is revoked).
  * - `cancelMcpWriteToolCallsForGrant(grantId)`: aborts the in-flight write tool calls of an
@@ -21,11 +21,13 @@
  *      through the bound oRPC router with the agent `CallerAuth`, inside the DB abort fence
  *      and raced against the request's signal;
  *   6. output: redact → JSON-safe → size cap; errors: refusals keep their fixed message and
- *      reason, other codes a static message.
+ *      reason, validation failures list `{path, message}` issues, other 4xx codes keep the
+ *      procedure's (developer-written) message; a sensitive tool gets static text only.
  *
  * Secrets: a tool with `sensitiveInput` (node_secret_set) and the procedures in
  * `SENSITIVE_INPUT_PROCEDURES` never have their input logged, audited or echoed. No tool's
- * arguments are ever logged; validation errors carry paths and codes only.
+ * arguments are ever logged; validation errors carry paths and messages (sensitive tools: paths
+ * and codes only).
  *
  * tools/list advertises the name, the contract description and the compact input schema
  * (`advertisedInputSchema`), nothing else (no titles, annotations or output schemas): the
@@ -40,6 +42,7 @@ import type {
 } from "@modelcontextprotocol/server";
 import { call, getRouter, isProcedure, ORPCError } from "@orpc/server";
 import {
+  advertisedInputSchema,
   MCP_READ_TOOLS,
   MCP_TOOLS,
   type McpToolContract,
@@ -67,29 +70,14 @@ const READ_TOOL_NAMES: ReadonlySet<string> = new Set(MCP_READ_TOOLS);
 
 // ── tools/list ──
 
-type JsonSchema = Record<string, unknown>;
-
-/**
- * The input schema a tool advertises: its contract input as JSON Schema, with each compact
- * field replaced by a plain object and its description (the procedure validates it in full).
- * Mirrors `advertisedInputSchema` in packages/api/src/contracts/mcp-tools.ts.
- */
-export function advertisedToolInputSchema(contract: McpToolContract): JsonSchema {
-  const schema = z.toJSONSchema(contract.input, { io: "input" }) as JsonSchema;
-  delete schema.$schema;
-  const properties = schema.properties as Record<string, JsonSchema> | undefined;
-  for (const [field, description] of Object.entries(contract.compactFields ?? {}))
-    if (properties?.[field]) properties[field] = { type: "object", description };
-  return schema;
-}
-
 /**
  * A standard schema that advertises the compact JSON Schema and accepts any arguments: the
  * wrapper validates with the contract schema itself, so the SDK never echoes a validation
  * message (which could carry an argument).
  */
 function advertisedSchema(contract: McpToolContract): StandardSchemaWithJSON {
-  const json = advertisedToolInputSchema(contract);
+  // The contract input as JSON Schema, compact fields replaced (the procedure validates them).
+  const json = advertisedInputSchema(contract);
   return {
     "~standard": {
       version: 1,
@@ -407,9 +395,24 @@ export function routeToolCall(name: string, args: Record<string, unknown>): Proc
   }
 }
 
+/** A value without null fields and empty lists, at any depth (compact list rows). */
+function withoutEmpty(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutEmpty);
+  if (value === null || typeof value !== "object") return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry === null || (Array.isArray(entry) && entry.length === 0)) continue;
+    out[key] = withoutEmpty(entry);
+  }
+  return out;
+}
+
 /** Combines the outputs of a tool's procedure calls into its result. */
 function combineOutputs(name: string, calls: ProcedureCall[], outputs: unknown[]): unknown {
   switch (name) {
+    case "nodes_get":
+      // The list is read for every node at once: rows leave out nulls and empty lists.
+      return calls[0]?.path === "nodes.list" ? withoutEmpty(outputs[0]) : outputs[0];
     case "runtimes_get":
     case "pools_get":
       if (outputs.length === 2)
@@ -504,15 +507,23 @@ function sanitizeMessage(message: string): string {
   return out;
 }
 
-type ValidationIssue = { path: string; code: string; message?: string };
+/** `{path, message}`; a sensitive tool gets `{path, code}` (a message could echo a value). */
+type ValidationIssue = { path: string; message: string } | { path: string; code: string };
 
-/** Paths and codes only (plus zod's own message when the tool is not sensitive). */
+const MAX_ISSUES = 20;
+
+function issueOf(path: string, code: string, message: unknown, sensitive: boolean) {
+  const at = path || "(root)";
+  if (sensitive || typeof message !== "string" || message === "") return { path: at, code };
+  return { path: at, message: sanitizeMessage(message).slice(0, 200) };
+}
+
 function validationIssues(error: z.ZodError, sensitive: boolean): ValidationIssue[] {
-  return error.issues.slice(0, 20).map((issue) => ({
-    path: issue.path.map(String).join(".") || "(root)",
-    code: issue.code,
-    ...(sensitive ? {} : { message: sanitizeMessage(issue.message).slice(0, 200) }),
-  }));
+  return error.issues
+    .slice(0, MAX_ISSUES)
+    .map((issue) =>
+      issueOf(issue.path.map(String).join("."), issue.code, issue.message, sensitive),
+    );
 }
 
 function validationError(issues: ValidationIssue[]): ToolResult {
@@ -521,20 +532,21 @@ function validationError(issues: ValidationIssue[]): ToolResult {
 }
 
 /** Issues from an oRPC input validation failure (its cause carries the schema issues). */
-function orpcValidationIssues(error: ORPCError<string, unknown>): ValidationIssue[] | null {
+function orpcValidationIssues(
+  error: ORPCError<string, unknown>,
+  sensitive: boolean,
+): ValidationIssue[] | null {
   const cause: unknown = error.cause;
   if (cause === null || typeof cause !== "object" || !("issues" in cause)) return null;
   const issues: unknown = cause.issues;
   if (!Array.isArray(issues)) return null;
-  return issues.slice(0, 20).map((issue: unknown) => {
+  return issues.slice(0, MAX_ISSUES).map((issue: unknown) => {
     const entry = record(issue);
     const path = Array.isArray(entry.path)
       ? entry.path.map((segment) => String(record(segment).key ?? segment)).join(".")
       : "";
-    return {
-      path: path || "(root)",
-      code: typeof entry.code === "string" ? entry.code : "invalid",
-    };
+    const code = typeof entry.code === "string" ? entry.code : "invalid";
+    return issueOf(path, code, entry.message, sensitive);
   });
 }
 
@@ -564,12 +576,17 @@ function mapError(
       return toolError(message, { error: { code: error.code, reason, subjectId, message } });
     }
     if (error.code === "BAD_REQUEST") {
-      const issues = orpcValidationIssues(error);
+      const issues = orpcValidationIssues(error, sensitive);
       if (issues) return validationError(issues);
     }
     if (Object.hasOwn(STATIC_MESSAGES, error.code)) {
-      const message = STATIC_MESSAGES[error.code] ?? "Internal error";
-      return toolError(message, { error: { code: error.code } });
+      // Procedure messages are developer-written (they may name ids, never secrets): an agent
+      // needs "an always-on runtime is not started", not a bare "Invalid input".
+      const own = sensitive ? "" : sanitizeMessage(error.message).trim();
+      const message = own || (STATIC_MESSAGES[error.code] ?? "Internal error");
+      return toolError(message, {
+        error: { code: error.code, ...(own ? { message: own } : {}) },
+      });
     }
   }
   mcpSanitizedLog(

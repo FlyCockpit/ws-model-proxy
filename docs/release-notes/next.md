@@ -129,6 +129,12 @@ and the `config set-*` capability switches. Use `wsmp run`, `wsmp service` and
 `wsmp trust`; runtimes are defined in the web app or through MCP, not with the
 CLI.
 
+**Request bodies are sent with a Content-Length.** A node relays every request
+body with its exact length instead of chunked framing, so strict
+OpenAI-compatible servers (TensorFold, gufo and similar) no longer answer 400.
+When a runtime does answer with an error, the request log and MCP
+(`requests_list`, `model_test`) show one redacted line of what it said.
+
 ## Trust: Full control and Relay only
 
 Each node gives the server one of two levels, chosen at `wsmp login` and kept
@@ -149,6 +155,11 @@ from the server can. Lowering protects against a *future* compromise: commands
 written while the node was Full control (frozen start commands, node metric
 commands) keep running, which is why the Lower dialog lists them.
 
+Lowering only stops new agent access through wsmp. It does not undo or contain
+software an agent already left on the node while it had Full control, such as a
+systemd user service: that software runs as the same user and can even raise
+trust again locally. If you distrust what an agent did, reinstall the node.
+
 ## Sharing pools and runtime definitions
 
 Share a pool or a runtime definition from **Access → Shares** by e-mail. The
@@ -157,10 +168,11 @@ through the verification e-mail (which needs SMTP). Anyone else, including an
 address with no account yet, gets an invite link instead: e-mailed when SMTP is
 configured, otherwise shown to you once to pass on. The link works for 14 days
 and is accepted by signing up or signing in through it, whatever address that
-account uses. The answer never tells you whether an account with that address
-exists. Pending invites are listed on the same page, where you can resend
-(a new link; the old one stops working) or withdraw them. Deleting a runtime
-removes its invites.
+account uses. An address with an unverified account and one with no account
+get the same answer (a direct share does show that the address belongs to an
+account with a verified e-mail). Pending invites are listed on the same page,
+where you can resend (a new link; the old one stops working) or withdraw them.
+Deleting a runtime removes its invites.
 
 ## Browser terminals and interactive steps
 
@@ -233,6 +245,29 @@ What does not hold:
 If that is not acceptable for a machine, do not type its sudo password into a
 web terminal: give the exact command a `NOPASSWD` sudoers rule instead, and use
 Full control only where trusting the server with a shell is fine.
+
+## File tools default to the home directory
+
+On a Full control node, agents' file tools now work out of the box: with no
+roots configured they use the home directory of the user wsmp runs as (`nodes_get`
+shows `features.files.source`: `default`, `configured` or `disabled`). wsmp's own
+files stay protected by the node's deny-list. `wsmp config clear-file-roots`
+returns to this default; it no longer turns the file tools off. To keep agents
+out of files, run `wsmp config set-file-tools off` (or lower the node to Relay
+only).
+
+## Pools translate between API protocols by default
+
+A pool now answers OpenAI Chat Completions, OpenAI Responses and Anthropic
+Messages callers even when a member serves only one of them: **API adaptation**
+(pool Advanced) is on by default. A member that serves the caller's protocol
+natively is always tried first; translation is used only when no native member
+can take the request. Translation is strict: a request feature it cannot carry
+over (for example `logprobs`, audio output or a vendor-specific field) is
+refused with a 400 that names the feature, never silently dropped. Merging a
+developer message into the system prompt for Anthropic targets stays off unless
+you turn on **lossy developer-role collapse**. Turn API adaptation off on a pool
+to serve only native requests.
 
 ## Configuration
 

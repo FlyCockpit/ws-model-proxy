@@ -29,6 +29,7 @@
     "attempts_other": "{{count}} intentos",
     "rejection": "Rechazada: {{reason}}",
     "error": "Error: {{reason}}",
+    "upstreamError": "El runtime respondió: {{message}}",
     "empty": "Ninguna solicitud coincide.",
     "loadMore": "Cargar más",
     "loadFailed": "No se pudo cargar el registro de solicitudes.",

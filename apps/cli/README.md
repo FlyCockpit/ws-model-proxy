@@ -93,6 +93,11 @@ says so.
 A plain code never takes over an existing node, even on the same machine: log in again with a
 new code and a new name, or use a Replace code.
 
+Logging in over an earlier enrollment for another server, or over leftovers of wsmp 0.3, is a
+fresh enrollment: `--trust` (or your answer) applies and the old node name is not reused (you are
+asked for a name, or it comes from the hostname). A node you lowered to Relay only stays Relay
+only; raise it with `wsmp trust full`.
+
 ## Run the relay
 
 ```sh
@@ -129,7 +134,8 @@ servers that already run still works.
 Each node gives the server one of two levels. You choose at login and can change it any time.
 
 - **Full control** (default): the server may define and start runtimes, run commands, read and
-  write files inside the folders you allow (`wsmp config set-file-roots`), open terminals, and
+  write files in your home directory or the folders you allow (`wsmp config set-file-roots`;
+  wsmp's own files stay off limits), open terminals, and
   set node secrets.
 - **Relay only**: the server may only send requests to model servers here and start or stop the
   runtimes this node already holds. Definitions are frozen at the moment you lower trust; nothing
@@ -147,6 +153,11 @@ refuses to run from any process the relay started (its commands, jobs and termin
 security boundary against other code running as your user**: anything that runs as you can edit
 your files, including this CLI's configuration. If you do not trust the code on this account,
 Relay only does not make it safe.
+
+Lowering only stops new agent access through wsmp. It does not undo or contain software an agent
+already left on the node while it had Full control, such as a systemd user service: that software
+runs as the same user and can even raise trust again locally. If you distrust what an agent did,
+reinstall the node.
 
 ## Secrets
 
@@ -187,7 +198,8 @@ The server asks a node to do two different kinds of work:
 | `wsmp config path\|init\|show` | Where the config lives, create it, print it. |
 | `wsmp config set-server <url> [--public-origin <origin>]` | Point at another server address (restart to apply). |
 | `wsmp config set-slug <name>` | Change the saved node name. |
-| `wsmp config set-file-roots <dir>...` / `clear-file-roots` | Folders the file tools may use. |
+| `wsmp config set-file-roots <dir>...` / `clear-file-roots` | Folders the file tools may use (default: your home directory). |
+| `wsmp config set-file-tools on\|off` | Turn the node file tools on or off (on by default). |
 | `wsmp config set-runtime-hosts [host...]` | Extra hosts an always-on runtime may use besides loopback. |
 | `wsmp config set-human-terminal on\|off` | Allow browser terminals (the same setting `wsmp login` asks about). |
 | `wsmp config set-terminal-approval on\|off` | Require approval before a browser opens a terminal. |

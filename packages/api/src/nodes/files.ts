@@ -293,7 +293,7 @@ const FILE_ERRORS: Readonly<Record<string, { status: FileErrorStatus; message: s
   no_roots: {
     status: "CONFLICT",
     message:
-      "The node serves no file roots: run `wsmp config set-file-roots <dir>...` on it and restart wsmp.",
+      "The node serves no file roots (features.files.source says why: file tools turned off, or roots unusable). On the node run `wsmp config set-file-tools on` or `wsmp config set-file-roots <dir>...`, then restart wsmp.",
   },
   limit: { status: "TOO_MANY_REQUESTS", message: "Too many file operations right now." },
   invalid_input: { status: "BAD_REQUEST", message: "The node refused this file request." },

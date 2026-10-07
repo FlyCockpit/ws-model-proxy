@@ -21,7 +21,8 @@
     "operatorTerminals": true,
     "files": {
       "roots": null,
-      "asRoot": false
+      "asRoot": false,
+      "source": "default"
     },
     "runtimeHosts": [],
     "mediaExpand": true,

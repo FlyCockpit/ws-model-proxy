@@ -10,6 +10,7 @@
   "timeoutMs": 600000,
   "handle": "i-in3k4j5h6g7f",
   "expectBody": true,
+  "bodyBytes": 4096,
   "countFirst": true,
   "countCeiling": 32000
 }

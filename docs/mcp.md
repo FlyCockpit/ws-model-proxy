@@ -6,7 +6,7 @@ an OAuth-protected resource at `/mcp`. The surface is on by default.
 canonical URL, protocol profile, scopes, token lifetimes, and registration
 policy — is derived from configuration in code, not operator tuning.
 
-The tool catalog (all 27 tools, their procedures, confirmation literals and rate
+The tool catalog (all 28 tools, their procedures, confirmation literals and rate
 limits, and every procedure kept off MCP with its reason) is the generated,
 test-enforced [docs/mcp-tool-coverage.md](./mcp-tool-coverage.md). The tool
 definitions themselves are `MCP_TOOLS` in
@@ -21,7 +21,7 @@ requests and metrics.
 
 - **Levels.** A credential is Read-only (`READ`) or Full (`FULL`). READ
   credentials see the 7 read tools (`*_get`, `requests_list`, `metrics_query`);
-  FULL credentials see all 27. A FULL tool called with a READ credential answers
+  FULL credentials see all 28. A FULL tool called with a READ credential answers
   exactly like an unknown tool. Even Full cannot touch sharing, API keys,
   agent tokens, provider accounts, enrollment, hold lines or node trust; those
   stay with people. An agent token's level is chosen when it is created; an
@@ -30,12 +30,19 @@ requests and metrics.
 - **Node trust.** Commands, files, secrets, metric commands and definition
   changes need a node at Full control. A Relay-only node relays inference for
   the definitions it held when it entered Relay only; agents cannot start,
-  stop or change anything there.
+  stop or change anything there. Lowering only stops new agent access through
+  wsmp: software an agent already left on the node at Full control (a systemd
+  user service, say) keeps running as the same user and can even raise trust
+  locally. If you distrust what an agent did, reinstall the node.
 - **Notes.** Most writes take an optional `note` (1–500 characters);
   `node_command_queue_for_user` requires one, and the deletes,
   `runtime_start`, `runtime_stop`, `profile_apply` and `model_test` take none.
   Say what you are trying; people see it beside the change (runtime version
   history, node activity, command log, queued commands).
+- **Deleting nodes.** `node_delete` removes an offline node only (refused with
+  `node_online` while it is connected, with no override); its always-on
+  runtimes go and instances with a part there stop. It is audited with the
+  node's slug and id. People delete any node in the browser.
 - **Confirmation.** Deletes take `confirm: "DELETE"` and `node_command_run`
   takes `confirm: "RUN"`. The literal only proves intent; it never replaces a
   person's confirmation where one is required.
@@ -149,8 +156,11 @@ secret files.
 - **Who.** A Full agent token on the caller's own node at Full control.
   People signed in to the web app use a browser terminal instead.
 - **Paths.** Absolute paths under the node's file roots only: `~` and relative
-  paths are refused, not expanded. `node_get` lists the roots under
-  `features.files.roots`; a refused path's error lists them too. wsmp's own
+  paths are refused, not expanded. `nodes_get` lists the roots under
+  `features.files.roots` and where they come from under `features.files.source`:
+  `default` (the user's home directory, used until a person sets roots),
+  `configured` (`wsmp config set-file-roots`) or `disabled`
+  (`wsmp config set-file-tools off`). A refused path's error lists them too. wsmp's own
   config, credentials, secrets, runtime stores, state directory, service unit
   and binary are off limits (writes) or read-only (config).
 - **Writes.** `node_file_write` without `ifMatch` only creates a new file; with
@@ -168,7 +178,10 @@ secret files.
 
 A result is JSON in the text content and in `structuredContent.result`. Output
 is redacted (no secret WMP holds ever appears), made JSON-safe, and capped at
-256 KiB; a larger result fails with `OUTPUT_TOO_LARGE`.
+256 KiB; a larger result fails with `OUTPUT_TOO_LARGE`. The `nodes_get` list
+rows (hostname, `fabrics` as name, ip and `peerCount`, `gpus` as vendor and
+name, `secretNames`, counts) leave out null fields and empty lists: a missing
+field is null or empty.
 
 A failed call returns `isError: true` with `structuredContent.error`:
 
@@ -176,13 +189,14 @@ A failed call returns `isError: true` with `structuredContent.error`:
   and, when it helps, a `subjectId`. The message says what to do next.
   `node_secret_set` replaces even that message with the reason, so nothing a
   procedure says can carry a secret back.
-- **Invalid input** is `invalid_input` with up to 20 `issues` (`path` and
-  `code`; input the tool's own schema rejects also gets the validator's
-  message, except on sensitive tools). Values are never echoed.
-- `TOO_MANY_REQUESTS` (tool rate limit, with `retryAfterSeconds`),
-  `REQUEST_ABORTED` (the request or credential went away), and static messages
-  for `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `CONFLICT`,
-  `PRECONDITION_FAILED`. Anything else is `INTERNAL_ERROR` with a `requestId`.
+- **Invalid input** is `invalid_input` with up to 20 `issues`, each `path` and
+  `message` (sensitive tools get `path` and `code` only). A message may quote
+  part of your own input; a sensitive tool's input is never echoed.
+- `TOO_MANY_REQUESTS` (tool rate limit, with `retryAfterSeconds`) and
+  `REQUEST_ABORTED` (the request or credential went away). `BAD_REQUEST`,
+  `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `CONFLICT` and
+  `PRECONDITION_FAILED` keep the procedure's own message (sensitive tools: a
+  static one). Anything else is `INTERNAL_ERROR` with a `requestId`.
 
 No tool's arguments are logged. A tool with secret input (`node_secret_set`)
 and the procedures in `SENSITIVE_INPUT_PROCEDURES` are never logged, audited
@@ -352,6 +366,10 @@ Three scopes exist: `mcp:read`, `mcp:write`, and `offline_access`.
 
 - `/mcp` accepts `mcp:read` **or** `mcp:write` (`mcp:write` semantically
   includes read).
+- An unauthenticated `/mcp` request gets a `WWW-Authenticate` challenge with
+  `scope="mcp:read mcp:write"`, the same scopes as `scopes_supported` in
+  `/.well-known/oauth-protected-resource`, so a client asks for both and the
+  consent page can offer Full. Read-only stays the consent default.
 - Write tools need a FULL request level, which for OAuth requires the literal
   `mcp:write` (below). Scope matching is exact-token: padded or case-variant
   tokens never match.

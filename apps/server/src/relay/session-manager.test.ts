@@ -118,7 +118,7 @@ function hello(
     features: {
       terminals: { supported: true, max: 4, approvalRequired: false },
       operatorTerminals: overrides.operatorTerminals ?? false,
-      files: { roots: ["/home/me"], asRoot: false },
+      files: { roots: ["/home/me"], asRoot: false, source: "configured" },
       runtimeHosts: [],
       mediaExpand: false,
       liveStt: false,
@@ -251,6 +251,26 @@ describe("RelaySessionManager (relay 3.0)", () => {
     expect(manager.getLiveNodeState("node-1")?.trust).toBe("relay");
   });
 
+  it("declares the exact body length so the node never sends a chunked body", async () => {
+    const socket = await connect();
+    const body = new TextEncoder().encode('{"model":"m","messages":[]}');
+    manager.sendRelayRequest({
+      nodeId: "node-1",
+      handle: "llama",
+      requestId: "req-len",
+      family: "chat.completions",
+      method: "POST",
+      path: "/v1/chat/completions",
+      headers: { "content-type": "application/json" },
+      bodyChunks: [body.subarray(0, 5), body.subarray(5)],
+      timeoutMs: 60_000,
+    });
+    expect(socket.last("relay.request")).toMatchObject({
+      expectBody: true,
+      bodyBytes: body.byteLength,
+    });
+  });
+
   it("sends relay requests by handle and routes the answer only from the owning node", async () => {
     const socket = await connect();
     const onComplete = vi.fn();
@@ -276,6 +296,7 @@ describe("RelaySessionManager (relay 3.0)", () => {
       timeoutMs: 60_000,
     });
     expect(socket.last("relay.request")).toMatchObject({ handle: "llama", expectBody: false });
+    expect(socket.last("relay.request")).not.toHaveProperty("bodyBytes");
     await manager.handleTextFrame(
       socket,
       JSON.stringify({ type: "relay.complete", requestId: "req-1" }),
@@ -477,7 +498,7 @@ describe("RelaySessionManager (relay 3.0)", () => {
     const features = {
       terminals: { supported: true, max: 4, approvalRequired: false },
       operatorTerminals: false,
-      files: { roots: ["/home/me"], asRoot: false },
+      files: { roots: ["/home/me"], asRoot: false, source: "configured" },
       runtimeHosts: [],
       mediaExpand: false,
       liveStt: false,

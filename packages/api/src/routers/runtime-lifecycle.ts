@@ -71,7 +71,10 @@ async function computeStart(
   });
   if (!runtime) throw notFound("That runtime does not exist.");
   if (runtime.kind !== "STARTABLE")
-    throw new ORPCError("BAD_REQUEST", { message: "An always-on runtime is not started." });
+    throw new ORPCError("BAD_REQUEST", {
+      message:
+        "An always-on runtime runs outside wsmp and is never started or stopped here; it is ready when its node reports it serving.",
+    });
   const versionId = input.versionId ?? runtime.currentVersionId;
   const version = versionId
     ? await db.runtimeVersion.findFirst({
@@ -82,7 +85,10 @@ async function computeStart(
   if (!version) throw notFound("That version does not exist.");
   const spec = storedSpec(version.spec);
   const launch = spec.launch;
-  if (!launch) throw new ORPCError("BAD_REQUEST", { message: "This version has no launch." });
+  if (!launch)
+    throw new ORPCError("BAD_REQUEST", {
+      message: "This version has no launch (spec.launch) to start.",
+    });
 
   const planner = new PlacementPlanner(await loadPlacementContext(db, { userId, agent }));
   const refusals: Refusal[] = [];

@@ -19,6 +19,7 @@ export const nodesRouter = {
   fabrics: n.fabrics,
   rename: n.rename,
   delete: n.delete,
+  deleteOffline: n.deleteOffline,
   lowerTrustPreview: n.lowerTrustPreview,
   lowerTrust: n.lowerTrust,
   enrollmentCodes: enrollmentProcedures,

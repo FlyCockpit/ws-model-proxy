@@ -55,16 +55,19 @@ enum Sub {
         #[arg(num_args = 0..)]
         hosts: Vec<String>,
     },
-    /// Confine every file tool to these directories. Suggested roots (never
-    /// applied automatically): ~/models, ~/deploy, ~/.config/llama-swap,
-    /// ~/.local/state/wsmp/logs. Restart wsmp to apply.
+    /// Confine every file tool to these directories (unset: your home
+    /// directory; wsmp's own files stay off limits). For example ~/models,
+    /// ~/deploy, ~/.config/llama-swap. Restart wsmp to apply.
     SetFileRoots {
         #[arg(required = true, num_args = 1..)]
         paths: Vec<PathBuf>,
     },
-    /// Clear the file allowlist; file ops are then refused (`no_roots`).
+    /// Clear the file allowlist: file tools go back to your home directory.
     /// Restart wsmp to apply.
     ClearFileRoots,
+    /// Turn the node file tools on or off (on by default; off refuses every
+    /// file op with `no_roots`). Restart wsmp to apply.
+    SetFileTools { state: Switch },
     /// Require approval before a browser can open a terminal.
     SetTerminalApproval { state: Switch },
     /// Cap the browser terminals open at once on this machine (1 to 32,
@@ -118,7 +121,10 @@ pub fn run(args: &Args) -> Result<()> {
         Sub::Show => {
             let cfg = Config::load_required()?;
             let mut shown = serde_json::to_value(&cfg)?;
-            shown["fileRoots"] = serde_json::to_value(&cfg.file_roots)?;
+            let (roots, source) =
+                crate::config::effective_file_roots(&cfg, dirs::home_dir().as_deref());
+            shown["fileRoots"] = serde_json::to_value(&roots)?;
+            shown["fileRootsSource"] = serde_json::to_value(source)?;
             shown["maxTerminals"] = cfg.effective_max_terminals().into();
             // The origin the relay hello signs (pinned, else the server URL's).
             if cfg.server_url.is_some() || cfg.public_origin.is_some() {
@@ -245,8 +251,15 @@ pub fn run(args: &Args) -> Result<()> {
             if args.json {
                 output::json(&serde_json::json!({"key":"fileRoots", "value":[]}))?;
             } else {
-                output::line("cleared `fileRoots`; restart wsmp to apply")?;
+                output::line(
+                    "cleared `fileRoots` (file tools use your home directory); restart wsmp to apply",
+                )?;
             }
+        }
+        Sub::SetFileTools { state } => {
+            set_flag(args.json, "fileTools", state.enabled(), |cfg| {
+                cfg.disable_file_tools = !state.enabled();
+            })?;
         }
         Sub::SetTerminalApproval { state } => {
             set_flag(

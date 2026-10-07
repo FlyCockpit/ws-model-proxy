@@ -446,6 +446,7 @@ const CASES: ReadonlyArray<[string, unknown]> = [
   ["nodes.setTemporary", { nodeId: "node-a", removeAfterOfflineMs: null }],
   ["nodes.rename", { nodeId: "node-a", name: "mine now" }],
   ["nodes.delete", { nodeId: "node-a" }],
+  ["nodes.deleteOffline", { nodeId: "node-a", confirm: "DELETE" }],
   ["nodes.lowerTrustPreview", { nodeId: "node-a" }],
   // A replace code would move A's node to whoever enrolls with it.
   ["nodes.enrollmentCodes.create", { replaceNodeId: "node-a" }],

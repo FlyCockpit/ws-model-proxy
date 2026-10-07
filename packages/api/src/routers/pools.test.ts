@@ -38,7 +38,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 }));
 
 import prisma from "@ws-model-proxy/db";
-import { callableIdsFor } from "../lib/pool-views";
+import { callableIdsFor, poolAdvancedView } from "../lib/pool-views";
 import { CALLERS, contextFor, OWNER } from "./lane-c-test-helpers";
 import { modelsRouter } from "./models";
 import { poolsRouter } from "./pools";
@@ -614,5 +614,21 @@ describe("own-key equivalent (the share holders' consent)", () => {
     // The first attempt fenced only the owner; the retry adds Bob.
     expect(fenceLog.held).toEqual(["00:owner:owner-1", "00:owner:owner-1", "00:owner:bob"]);
     expect(db.share.updateMany).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("pool Advanced defaults", () => {
+  it("translates between API protocols by default and keeps the lossy collapse off", () => {
+    const view = poolAdvancedView(null);
+    expect(view.protocolAdaptation).toEqual({ effective: true, source: "default" });
+    expect(view.allowLossyDeveloperRoleCollapse).toEqual({ effective: false, source: "default" });
+    const off = poolAdvancedView({
+      poolId: "pool-1",
+      maxWaitMs: null,
+      contextCeiling: null,
+      contextMargin: null,
+      overrides: { protocolAdaptation: false },
+    } as never);
+    expect(off.protocolAdaptation.effective).toBe(false);
   });
 });

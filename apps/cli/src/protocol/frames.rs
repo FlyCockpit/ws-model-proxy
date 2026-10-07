@@ -1481,6 +1481,9 @@ pub enum ServerFrame {
         timeout_ms: u64,
         handle: String,
         expect_body: bool,
+        /// The exact body length: sent as Content-Length, never chunked framing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body_bytes: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         count_first: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -383,6 +383,7 @@
       "reservedNow": "Reserved by runtimes now",
       "source": {
         "browser": "set here",
+        "agent": "set by an agent",
         "node": "node config",
         "detected": "detected"
       },

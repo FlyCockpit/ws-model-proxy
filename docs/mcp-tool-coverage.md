@@ -14,16 +14,16 @@ Every oRPC procedure appears below: called by one or more tools (`agent` access)
 MCP with a reason (`session` access), or unreachable by agent credentials (`public`, `human`,
 `admin`, `human_admin`). See [MCP server](mcp.md) for scopes, errors and examples.
 
-## Tools (27)
+## Tools (28)
 
 READ credentials see the READ tools; FULL credentials see all.
 
 | Tool | Token | Procedures | Confirm | Rate limit | Notes | Description |
 | --- | --- | --- | --- | --- | --- | --- |
-| `nodes_get` | READ | `nodes.list`, `nodes.get` | — | — (only the `/mcp` request limit) | — | Your nodes, or one in detail: trust, hardware, fabrics, hold, held definitions, instances, found local servers, secret names. |
+| `nodes_get` | READ | `nodes.list`, `nodes.get` | — | — (only the `/mcp` request limit) | — | Your nodes, or one in detail: trust, hardware, fabrics, hold, held definitions (versions frozen on a Relay-only node), instances, found local servers, secret names. |
 | `runtimes_get` | READ | `runtimes.list`, `runtimes.get`, `runtimes.versions.list`, `runtimes.versions.get`, `runtimes.presets.list`, `runtimes.shares.list` | — | — (only the `/mcp` request limit) | — | Your runtimes, or one in detail (versions: the version list; versionId: one full definition; presets: starting points; shared: definitions shared with you). |
 | `pools_get` | READ | `pools.list`, `pools.get`, `pools.history.list` | — | — (only the `/mcp` request limit) | — | Your pools and pools shared with you, or one pool (history: its change log). |
-| `profiles_get` | READ | `profiles.list`, `profiles.get` | — | — (only the `/mcp` request limit) | — | Your profiles, or one: owned nodes, hold lines, pinned versions, satisfied now. |
+| `profiles_get` | READ | `profiles.list`, `profiles.get` | — | — (only the `/mcp` request limit) | — | Your profiles, or one: owned nodes, hold lines, pinned versions, satisfied now (pinned versions running). |
 | `providers_get` | READ | `providers.accounts.list`, `providers.models.list` | — | — (only the `/mcp` request limit) | — | Cloud provider accounts and models with this month's spend (never keys). Only people change providers. |
 | `requests_list` | READ | `activity.requests.list` | — | — (only the `/mcp` request limit) | — | Recent requests without prompts: route, what served them, timings, tokens, errors. |
 | `metrics_query` | READ | `activity.metrics.query` | — | — (only the `/mcp` request limit) | — | Request, engine-load and node metrics for a pool, runtime, version, node or instance over a range, optionally grouped; point time = start + at×step. Use it to compare versions after a change. |
@@ -40,6 +40,7 @@ READ credentials see the READ tools; FULL credentials see all.
 | `profile_apply` | FULL | `profiles.apply` | — | 10/min (`start_stop_apply`) | — | Apply a profile (preview first if unsure): start its pins, stop other startable runtimes on its nodes. Refused if any owned node is Relay only. |
 | `profile_delete` | FULL | `profiles.delete` | `DELETE` | — (only the `/mcp` request limit) | — | Delete a profile; nothing stops. confirm: "DELETE". |
 | `node_update` | FULL | `nodes.update` | — | — (only the `/mcp` request limit) | compact: `hardware`, `metricCommands` | Change a Full-control node: labels, ports, hardware, metric commands, fabrics, command lifetime, rescan. |
+| `node_delete` | FULL | `nodes.deleteOffline` | `DELETE` | — (only the `/mcp` request limit) | — | Delete an offline node (refused while online: node_online): its always-on runtimes go, instances with a part there stop. confirm: "DELETE". |
 | `node_secret_set` | FULL | `nodes.secrets.set`, `nodes.secrets.delete` | — | — (only the `/mcp` request limit) | secret input, never logged or echoed | Set (or with value null delete) a WSMP_SECRET_* on a Full-control node, for runtimes to reference by name. Write-only: never shown again. |
 | `node_command_run` | FULL | `nodes.commands.run` | `RUN` | 30/min (`node_command`) | — | Run a one-off command (downloads while experimenting, builds, diagnostics, benchmarks) on a Full-control node; answers within ~15 s, then poll with node_command_get. Anything that should keep running or serve traffic must be a runtime: a server started here is invisible to the proxy and dies with the command. confirm: "RUN". |
 | `node_command_get` | FULL | `nodes.commands.get` | — | — (only the `/mcp` request limit) | — | State and output tail of a command from node_command_run; waitMs waits for it, cancel stops it and everything it started. |

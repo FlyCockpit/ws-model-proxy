@@ -198,6 +198,7 @@ describe("MCP tools act as the credential's user only", () => {
     profile_apply: [{ profileId: "prof-a" }],
     profile_delete: [{ profileId: "prof-a", confirm: "DELETE" }],
     node_update: [{ nodeId: "node-a", labels: ["x"] }],
+    node_delete: [{ nodeId: "node-a", confirm: "DELETE" }],
     node_secret_set: [
       { nodeId: "node-a", name: "WSMP_SECRET_HF", value: "v" },
       { nodeId: "node-a", name: "WSMP_SECRET_HF", value: null },

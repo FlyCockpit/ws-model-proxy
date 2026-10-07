@@ -501,7 +501,7 @@ export function NodeFabricsCard({ node }: { node: NodeDetail }) {
 const KINDS = ["cpu", "discrete", "unified"] as const;
 type Kind = (typeof KINDS)[number];
 
-function SourceTag({ source }: { source: "browser" | "node" | "detected" | null }) {
+function SourceTag({ source }: { source: "browser" | "agent" | "node" | "detected" | null }) {
   const { t } = useTranslation(["dashboard"]);
   if (!source) return null;
   return (
@@ -550,7 +550,7 @@ export function HardwareCard({ node, lang }: { node: NodeDetail; lang: string })
     },
   });
 
-  const rows: Array<[string, string | null, "browser" | "node" | "detected" | null]> = [
+  const rows: Array<[string, string | null, "browser" | "agent" | "node" | "detected" | null]> = [
     [
       t("dashboard:nodes.hardware.kind"),
       hw.kind.value ? t(`dashboard:nodes.hardwareKind.${hw.kind.value}`) : null,

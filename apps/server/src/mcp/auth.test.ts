@@ -255,6 +255,8 @@ describe("createMcpRequestHandler — upstream wrapper wiring", () => {
       issuer: `${BASE}/api/auth`,
       resource: RESOURCE,
       requiredScopes: ["mcp:read"],
+      // An unauthenticated client learns it may ask for mcp:write (consent can offer Full).
+      challengeScopes: ["mcp:read", "mcp:write"],
     });
   });
 

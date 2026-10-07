@@ -38,6 +38,8 @@ export const requestRowSchema = z
     cacheReadTokens: z.number().int().nullable(),
     rejection: z.string().nullable(),
     errorClass: z.string().nullable(),
+    /** The runtime's own error message (redacted, one line), for own runtimes. */
+    upstreamError: z.string().nullable(),
     httpStatusCode: z.number().int().nullable(),
     attempts: z.number().int(),
   })

@@ -81,6 +81,9 @@ model RelayRequest {
   httpStatusCode          Int?
   upstreamStatusCode      Int?
   errorClass              String?
+  /// A local runtime's error answer (HTTP >= 400): one redacted line, at most 300 characters.
+  /// Messages only (never echoed input); see apps/server/src/model-api/upstream-error-excerpt.ts.
+  upstreamErrorExcerpt    String?
   contextTokenCount       Int?
   contextCountMethod      String?
   contextCountExact       Boolean?

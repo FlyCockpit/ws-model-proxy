@@ -1,3 +1,7 @@
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Hono } from "hono";
 import { RateLimiterMemory } from "rate-limiter-flexible";
 import { describe, expect, it, vi } from "vitest";
@@ -122,6 +126,50 @@ describe("node bootstrap HTTP", () => {
       expect(pinned).toContain(`install_source --rev '${"a".repeat(40)}'`);
     } finally {
       Object.assign(env, { WMP_CLI_RELEASE_BASE_URL: undefined, WMP_CLI_SOURCE_REV: undefined });
+    }
+  });
+
+  it("finds rustup's cargo over a non-interactive shell that never read the profile", () => {
+    const home = mkdtempSync(join(tmpdir(), "wsmp-install-"));
+    try {
+      const bin = join(home, ".cargo", "bin");
+      mkdirSync(bin, { recursive: true });
+      writeFileSync(join(bin, "cargo"), '#!/bin/sh\necho "fake cargo $*"\n');
+      chmodSync(join(bin, "cargo"), 0o755);
+      writeFileSync(join(home, ".cargo", "env"), `export PATH="${bin}:$PATH"\n`);
+      const script = join(home, "install.sh");
+      writeFileSync(script, installScript("https://proxy.example.com", { kind: "source" }));
+      const run = (extra: Record<string, string> = {}) =>
+        execFileSync("/bin/sh", [script], {
+          // Only builtins and the fake cargo: a cargo on the host must not satisfy the check.
+          env: { HOME: home, PATH: join(home, "no-tools"), ...extra },
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      expect(run()).toContain("fake cargo install --git");
+      // CARGO_HOME wins when set.
+      const cargoHome = join(home, "custom");
+      mkdirSync(cargoHome);
+      writeFileSync(join(cargoHome, "env"), `export PATH="${bin}:$PATH"\n`);
+      rmSync(join(home, ".cargo", "env"));
+      expect(run({ CARGO_HOME: cargoHome })).toContain("fake cargo install --git");
+      // A CARGO_HOME env file that does not provide cargo falls through to ~/.cargo/env.
+      writeFileSync(join(cargoHome, "env"), "true\n");
+      writeFileSync(join(home, ".cargo", "env"), `export PATH="${bin}:$PATH"\n`);
+      expect(run({ CARGO_HOME: cargoHome })).toContain("fake cargo install --git");
+      rmSync(join(home, ".cargo", "env"));
+      // Without any env file the installer still refuses clearly.
+      expect(() => run()).toThrow(/cargo is not installed/);
+      // Also with HOME unset (no `parameter not set` abort).
+      expect(() =>
+        execFileSync("/bin/sh", [script], {
+          env: { PATH: join(home, "no-tools") },
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }),
+      ).toThrow(/cargo is not installed/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
     }
   });
 

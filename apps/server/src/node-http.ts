@@ -247,7 +247,23 @@ install_release() {
   installed="$dir/wsmp"
 }
 
+# A non-interactive SSH shell skips the profile that puts rustup's cargo on PATH: source
+# rustup's env file, and keep looking past one that does not provide cargo.
+find_cargo() {
+  command -v cargo >/dev/null 2>&1 && return 0
+  for cargo_env in "\${CARGO_HOME:-}/env" "\${HOME:-}/.cargo/env"; do
+    if [ "$cargo_env" != "/env" ] && [ "$cargo_env" != "/.cargo/env" ] && [ -f "$cargo_env" ]; then
+      set +eu
+      . "$cargo_env"
+      set -eu
+      command -v cargo >/dev/null 2>&1 && return 0
+    fi
+  done
+  return 0
+}
+
 install_source() {
+  find_cargo
   command -v cargo >/dev/null 2>&1 ||
     die "cargo is not installed. Install Rust 1.88 or newer from https://rustup.rs and a C compiler (cc), then run this again."
   say "building wsmp from $WSMP_REPOSITORY ($*) with cargo; this takes a few minutes..."

@@ -162,6 +162,38 @@ pub fn file_roots_usable(roots: &[PathBuf]) -> bool {
     validate_file_roots(roots, None).is_ok()
 }
 
+/// Where the node's file roots come from (the hello `features.files.source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileRootsSource {
+    /// No `fileRoots`: the user's home directory. File ops still need Full
+    /// control, and wsmp's own files stay protected inside it.
+    Default,
+    /// `wsmp config set-file-roots`.
+    Configured,
+    /// `wsmp config set-file-tools off`: no roots at all.
+    Disabled,
+}
+
+/// The roots file ops are confined to, and where they come from. A Full
+/// node's commands can already do anything as this user, so the home
+/// directory adds no authority; the deny-list keeps wsmp's own state out.
+pub fn effective_file_roots(
+    config: &Config,
+    home: Option<&Path>,
+) -> (Vec<PathBuf>, FileRootsSource) {
+    if config.disable_file_tools {
+        return (Vec::new(), FileRootsSource::Disabled);
+    }
+    if !config.file_roots.is_empty() {
+        return (config.file_roots.clone(), FileRootsSource::Configured);
+    }
+    let roots = home
+        .and_then(|home| validate_file_roots(&[home.to_path_buf()], None).ok())
+        .unwrap_or_default();
+    (roots, FileRootsSource::Default)
+}
+
 /// A short-lived advisory lock shared by every local config mutation.  The
 /// daemon still owns the future control-plane mutation API; this is the
 /// transitional guard that prevents a standalone command from overwriting a
@@ -257,9 +289,14 @@ pub struct Config {
     /// once when the relay starts; off by default.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_file_tools_as_root: bool,
-    /// Explicit directory allowlist for every file operation.
+    /// Explicit directory allowlist for every file operation. Unset: the
+    /// user's home directory ([`effective_file_roots`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_roots: Vec<PathBuf>,
+    /// Turn the node file tools off (no roots at all). Read once when the
+    /// relay starts.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disable_file_tools: bool,
 }
 
 impl Config {
@@ -428,6 +465,7 @@ struct ConfigWire {
     allow_file_tools_as_root: bool,
     #[serde(deserialize_with = "deserialize_file_roots")]
     file_roots: Vec<PathBuf>,
+    disable_file_tools: bool,
 }
 
 impl Default for ConfigWire {
@@ -447,6 +485,7 @@ impl Default for ConfigWire {
             max_terminals: None,
             allow_file_tools_as_root: false,
             file_roots: Vec::new(),
+            disable_file_tools: false,
         }
     }
 }
@@ -467,6 +506,7 @@ impl From<ConfigWire> for Config {
             max_terminals: wire.max_terminals,
             allow_file_tools_as_root: wire.allow_file_tools_as_root,
             file_roots: wire.file_roots,
+            disable_file_tools: wire.disable_file_tools,
         }
     }
 }
@@ -487,6 +527,7 @@ impl Default for Config {
             max_terminals: None,
             allow_file_tools_as_root: false,
             file_roots: Vec::new(),
+            disable_file_tools: false,
         }
     }
 }

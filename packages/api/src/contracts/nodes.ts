@@ -17,6 +17,7 @@ import {
 import {
   ACTOR,
   CLAIM_STATE,
+  confirmDeleteSchema,
   confirmRunSchema,
   ENGINE,
   INSTANCE_PHASE,
@@ -57,7 +58,8 @@ export const nodeTrustViewSchema = z
   })
   .strict();
 
-const hardwareSourceSchema = z.enum(["browser", "node", "detected"]);
+/** `browser`: declared by a person; `agent`: declared by an agent (node_update). */
+const hardwareSourceSchema = z.enum(["browser", "agent", "node", "detected"]);
 function sourced<T extends z.ZodType>(value: T) {
   return z.object({ value: value.nullable(), source: hardwareSourceSchema.nullable() }).strict();
 }
@@ -146,6 +148,29 @@ export const nodeSummarySchema = z
     hold: nodeHoldSchema.nullable(),
     /** Temporary node: deleted after being offline this long. */
     removeAfterOfflineMs: z.number().int().nullable(),
+  })
+  .strict();
+
+/**
+ * One row of the node list: the summary plus what an agent needs to pick a node without a
+ * get per node (MCP drops nulls and empty lists from these rows).
+ */
+export const nodeListRowSchema = nodeSummarySchema
+  .extend({
+    hostname: z.string().nullable(),
+    /** Fabric memberships: this node's address and how many other nodes share the fabric. */
+    fabrics: z.array(
+      z.object({ name: z.string(), ip: z.string(), peerCount: z.number().int() }).strict(),
+    ),
+    gpus: z.array(
+      z
+        .object({
+          vendor: z.enum(["nvidia", "amd", "intel", "apple", "other"]),
+          name: z.string().nullable(),
+        })
+        .strict(),
+    ),
+    secretNames: z.array(z.string()),
   })
   .strict();
 
@@ -380,8 +405,8 @@ export const nodesContract = {
   list: query(
     "agent",
     noInputSchema,
-    z.object({ nodes: z.array(nodeSummarySchema) }).strict(),
-    "Your nodes with trust, hardware summary and running counts.",
+    z.object({ nodes: z.array(nodeListRowSchema) }).strict(),
+    "Your nodes with trust, hardware summary, fabrics, GPUs, secret names and running counts.",
     ["nodes_get"],
   ),
   get: query(
@@ -503,6 +528,16 @@ export const nodesContract = {
     z.object({ nodeId: idSchema }).strict(),
     z.object({ deleted: z.literal(true), stoppedInstances: z.array(idSchema) }).strict(),
     "Delete a node: its always-on runtimes go, every reservation there is released and instances with a part there stop.",
+  ),
+  /** An agent's delete: offline nodes only (owner decision), audited with the slug and id. */
+  deleteOffline: mutation(
+    "agent",
+    z
+      .object({ nodeId: idSchema, confirm: confirmDeleteSchema, note: noteSchema.optional() })
+      .strict(),
+    z.object({ deleted: z.literal(true), stoppedInstances: z.array(idSchema) }).strict(),
+    "Delete an offline node as nodes.delete does; refused while it is online (node_online), with no override.",
+    ["node_delete"],
   ),
   lowerTrustPreview: query(
     "human",

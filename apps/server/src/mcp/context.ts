@@ -23,7 +23,7 @@ export const MCP_SYNTHETIC_SESSION_TOKEN = "mcp-synthetic-session";
 /** The full live user row (never a projection). */
 export type McpSessionUser = Session["user"];
 
-/** An agent credential level: READ tokens see the read tools, FULL tokens all 27. */
+/** An agent credential level: READ tokens see the read tools, FULL tokens all 28. */
 export type McpLevel = "READ" | "FULL";
 
 /** How a request was admitted (never inferred from a client id). */

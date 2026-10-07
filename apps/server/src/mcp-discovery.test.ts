@@ -28,6 +28,8 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: { mcpGrant: grants } }));
 
+import { requireMcpAuth } from "@better-auth/mcp";
+import { MCP_RESOURCE_SCOPES } from "../../../packages/auth/src/mcp-config";
 import { resolveMcpPlugins } from "../../../packages/auth/src/mcp-plugins";
 import { createMcpDiscoveryForwarder, MCP_WELL_KNOWN_PATHS } from "./mcp-discovery";
 
@@ -245,6 +247,8 @@ describe("MCP discovery aliases against the real installed handler", () => {
       expect(doc.authorization_servers).toEqual([ISSUER]);
       expect(doc.bearer_methods_supported).toEqual(["header"]);
       expect(doc.scopes_supported).toEqual(["mcp:read", "mcp:write"]);
+      // The /mcp WWW-Authenticate challenge names the same scopes (mcp/auth.ts).
+      expect(doc.scopes_supported).toEqual([...MCP_RESOURCE_SCOPES]);
     });
 
     it("HEAD matches the GET status and content-type with an EMPTY body", async () => {
@@ -310,5 +314,21 @@ describe("MCP discovery aliases against the real installed handler", () => {
     expect(getRes.status).toBe(200);
     const headRes = await app.request(`${BASE}/api/auth/jwks`, { method: "HEAD" });
     expect(headRes.status).toBe(404);
+  });
+});
+
+describe("the /mcp challenge and the resource document name the same scopes", () => {
+  it("an unauthenticated request is told mcp:read and mcp:write (so consent can offer Full)", async () => {
+    const auth = buildAuth();
+    // The options mcp/auth.ts passes, through the REAL upstream challenge builder.
+    const wrapped = requireMcpAuth(auth, async () => new Response("ok"), {
+      issuer: `${BASE}/api/auth`,
+      resource: CANONICAL,
+      requiredScopes: ["mcp:read"],
+      challengeScopes: MCP_RESOURCE_SCOPES,
+    });
+    const res = await wrapped(new Request(CANONICAL, { method: "POST" }));
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate") ?? "").toContain('scope="mcp:read mcp:write"');
   });
 });

@@ -1,5 +1,5 @@
 /**
- * The 0.4.0 MCP tool manifest (spec §6): 27 tools, user nouns, no implementations.
+ * The 0.4.0 MCP tool manifest (spec §6): 28 tools, user nouns, no implementations.
  * `apps/server/src/mcp/tools.ts` registers these; handlers call the procedures named in
  * `procedures`. READ tokens see the read tools; FULL tokens see all. Most writes take an
  * optional `note`. Refusals carry `data.reason` with a message that says what to do next.
@@ -7,7 +7,8 @@
  * Token budget (owner guidance): descriptions are 1–3 short sentences (what it does plus the
  * one rule an agent must know); long guidance lives in docs/mcp.md and in refusal messages.
  * Large nested inputs (runtime definitions, pool advanced settings, hardware, metric commands)
- * are advertised as plain objects (`compactFields`) and validated in full by the procedure;
+ * are advertised compactly (`compactFields`: their JSON type only — object, list or null) and
+ * validated in full by the procedure;
  * `contracts.test.ts` fails when `tools/list` grows past its budget.
  */
 import { z } from "zod";
@@ -22,7 +23,7 @@ import {
   nodeFileReadInputSchema,
   nodeFileReadOutputSchema,
   nodeFileWriteInputSchema,
-  nodeSummarySchema,
+  nodeListRowSchema,
   nodesContract,
 } from "./nodes";
 import { poolsContract, poolViewSchema } from "./pools";
@@ -76,13 +77,36 @@ function tool(contract: Omit<McpToolContract, "level">): McpToolContract {
 
 type JsonSchema = Record<string, unknown>;
 
+/** The JSON types a full field schema allows (`anyOf` branches flattened). */
+function jsonTypes(schema: JsonSchema): string[] {
+  if (typeof schema.type === "string") return [schema.type];
+  if (Array.isArray(schema.type)) return schema.type.filter((t) => typeof t === "string");
+  const branches = Array.isArray(schema.anyOf) ? (schema.anyOf as JsonSchema[]) : [];
+  return branches.flatMap(jsonTypes);
+}
+
+/**
+ * A compact field: a plain object, or a list of objects when the field is a list, with
+ * `null` kept when the field takes it (so the shape an agent sends matches the procedure).
+ */
+function compactField(full: JsonSchema, description: string): JsonSchema {
+  const types = jsonTypes(full);
+  const base: JsonSchema = types.includes("array")
+    ? { type: "array", items: { type: "object" } }
+    : { type: "object" };
+  if (types.includes("null")) base.type = [base.type, "null"];
+  return { ...base, description };
+}
+
 /** The `inputSchema` a tool advertises in `tools/list` (compact fields replaced). */
 export function advertisedInputSchema(contract: McpToolContract): JsonSchema {
   const schema = z.toJSONSchema(contract.input, { io: "input" }) as JsonSchema;
   delete schema.$schema;
   const properties = schema.properties as Record<string, JsonSchema> | undefined;
-  for (const [field, description] of Object.entries(contract.compactFields ?? {}))
-    if (properties?.[field]) properties[field] = { type: "object", description };
+  for (const [field, description] of Object.entries(contract.compactFields ?? {})) {
+    const full = properties?.[field];
+    if (properties && full) properties[field] = compactField(full, description);
+  }
   return schema;
 }
 
@@ -177,9 +201,9 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "nodes_get",
     description:
-      "Your nodes, or one in detail: trust, hardware, fabrics, hold, held definitions, instances, found local servers, secret names.",
+      "Your nodes, or one in detail: trust, hardware, fabrics, hold, held definitions (versions frozen on a Relay-only node), instances, found local servers, secret names.",
     input: z.object({ nodeId: idSchema.optional() }).strict(),
-    output: z.union([z.object({ nodes: z.array(nodeSummarySchema) }).strict(), nodeDetailSchema]),
+    output: z.union([z.object({ nodes: z.array(nodeListRowSchema) }).strict(), nodeDetailSchema]),
     procedures: ["nodes.list", "nodes.get"],
   }),
   tool({
@@ -225,7 +249,8 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   }),
   tool({
     name: "profiles_get",
-    description: "Your profiles, or one: owned nodes, hold lines, pinned versions, satisfied now.",
+    description:
+      "Your profiles, or one: owned nodes, hold lines, pinned versions, satisfied now (pinned versions running).",
     input: z.object({ profileId: idSchema.optional() }).strict(),
     output: z.union([profilesContract.list.output, profileViewSchema]),
     procedures: ["profiles.list", "profiles.get"],
@@ -381,6 +406,14 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
       hardware: "Declared hardware (null clears); nodes_get shows sources.",
       metricCommands: "Node metric commands; shape in docs/mcp.md.",
     },
+  }),
+  tool({
+    name: "node_delete",
+    description:
+      'Delete an offline node (refused while online: node_online): its always-on runtimes go, instances with a part there stop. confirm: "DELETE".',
+    input: nodesContract.deleteOffline.input,
+    output: nodesContract.deleteOffline.output,
+    procedures: ["nodes.deleteOffline"],
   }),
   tool({
     name: "node_secret_set",

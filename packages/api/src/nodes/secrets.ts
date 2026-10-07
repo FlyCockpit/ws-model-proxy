@@ -12,6 +12,7 @@ import { nodesContract as c } from "../contracts/nodes";
 import { assertMayWrite, callerActor } from "../lib/caller-actor";
 import type { NodeSecretWriteResult } from "../lib/node-relay-services";
 import { notFound, refuseAbout } from "../lib/refuse";
+import { nodeFeaturesSchema } from "../lib/runtime-spec";
 import { isFullControl } from "./trust";
 
 async function secretTarget(context: SignedInContext, nodeId: string) {
@@ -74,6 +75,34 @@ function failed(result: NodeSecretWriteResult | undefined, nodeId: string): neve
   throw new ORPCError("CONFLICT", { message: `The node did not store the secret (${reason}).` });
 }
 
+/**
+ * Keeps the stored secret NAMES (`features.secrets`) in step with a write the node confirmed,
+ * so `nodes.get` lists them at once. The node also reports its full list (`node.state`), which
+ * stays authoritative; this only closes the gap until it lands. Never stores a value.
+ * One compare-and-set statement: when `node.state` replaced the features since the read, the
+ * write is skipped (the node's own list already has the name).
+ */
+async function recordSecretName(
+  userId: string,
+  nodeId: string,
+  name: string,
+  updatedAt: string | null,
+): Promise<void> {
+  const row = await prisma.node.findFirst({
+    where: { id: nodeId, userId },
+    select: { features: true },
+  });
+  const features = nodeFeaturesSchema.safeParse(row?.features);
+  if (!features.success) return;
+  const others = features.data.secrets.filter((secret) => secret.name !== name);
+  const secrets = updatedAt === null ? others : [...others, { name, updatedAt }];
+  secrets.sort((a, b) => a.name.localeCompare(b.name));
+  await prisma.node.updateMany({
+    where: { id: nodeId, userId, features: { equals: row?.features ?? undefined } },
+    data: { features: { ...features.data, secrets }, featuresAt: new Date() },
+  });
+}
+
 async function auditSecret(
   context: Context,
   userId: string,
@@ -110,8 +139,10 @@ export const secretProcedures = {
       delete: [],
     });
     if (result?.name !== input.name || result.status !== "set") failed(result, node.id);
+    const updatedAt = result.updatedAt ?? new Date().toISOString();
+    await recordSecretName(userId, node.id, input.name, updatedAt);
     await auditSecret(context, userId, node.id, `secret:set:${input.name}`, input.note);
-    return { name: input.name, updatedAt: result.updatedAt ?? new Date().toISOString() };
+    return { name: input.name, updatedAt };
   }),
 
   delete: contractProcedure(c.secrets.delete).handler(async ({ context, input }) => {
@@ -127,6 +158,7 @@ export const secretProcedures = {
       (result.status !== "deleted" && result.status !== "not_found")
     )
       failed(result, node.id);
+    await recordSecretName(userId, node.id, input.name, null);
     await auditSecret(context, userId, node.id, `secret:delete:${input.name}`, input.note);
     return { ok: true as const };
   }),

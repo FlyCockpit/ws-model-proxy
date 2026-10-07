@@ -26,6 +26,7 @@ const REFUSAL_STATUS: Partial<Record<RefusalReason, RefusalCode>> = {
   sidecar_chain: "BAD_REQUEST",
   unknown_node: "BAD_REQUEST",
   invalid_node_count: "BAD_REQUEST",
+  node_online: "CONFLICT",
   rate_limited: "TOO_MANY_REQUESTS",
 };
 

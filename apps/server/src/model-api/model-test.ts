@@ -29,7 +29,6 @@ import { relaySessionManager } from "../relay/session-manager.js";
 import { withCapacityRequestScope } from "./capacity/request-scope.js";
 import { diagnosticsCapacityRuntime, GENERIC_PROVIDER_ERROR_TYPE } from "./diagnostics.js";
 import { modelApiConcurrencyLimiter } from "./limits.js";
-import { PROBE_MAX_TOKENS } from "./probe-settings.js";
 import { observeRelayRequests } from "./relay-request-observer.js";
 import { testTargetModelId } from "./resolve.js";
 import { modelTestHandler } from "./routes.js";
@@ -37,6 +36,13 @@ import { modelTestHandler } from "./routes.js";
 type ModelTestRow = ModelTestServiceOutput["result"];
 type Percentiles = { ttftMs: number | null; latencyMs: number | null };
 
+/**
+ * A chat test's default output budget: room for a reasoning model's thinking before its answer
+ * (GLM spent 64 tokens on reasoning alone).
+ */
+export const MODEL_TEST_DEFAULT_MAX_TOKENS = 256;
+/** The excerpt of an answer that was reasoning only (no content within the budget). */
+export const REASONING_ONLY_PREFIX = "[reasoning only] ";
 /** Longest answer or transcript excerpt a result carries. */
 export const MODEL_TEST_EXCERPT_CHARS = 280;
 /** Most response bytes read from one test (the rest is cancelled). */
@@ -129,6 +135,7 @@ export type RelayRequestReadback = {
   completionTokens: number | null;
   rejection: string | null;
   errorClass: string | null;
+  upstreamErrorExcerpt: string | null;
 };
 
 export type ModelTestDependencies = {
@@ -166,6 +173,7 @@ const RELAY_REQUEST_SELECT = {
   completionTokens: true,
   rejection: true,
   errorClass: true,
+  upstreamErrorExcerpt: true,
 } as const;
 
 function defaultReadRelayRequest(id: string): Promise<RelayRequestReadback | null> {
@@ -217,7 +225,7 @@ function buildRequest(input: ModelTestServiceInput, signal: AbortSignal | undefi
           model,
           stream: true,
           stream_options: { include_usage: true },
-          max_tokens: input.maxTokens ?? PROBE_MAX_TOKENS,
+          max_tokens: input.maxTokens ?? MODEL_TEST_DEFAULT_MAX_TOKENS,
           messages: [
             {
               role: "user",
@@ -273,6 +281,21 @@ function errorCodeOf(parsed: unknown): string | null {
 
 function clip(text: string): string {
   return text.length > MODEL_TEST_EXCERPT_CHARS ? text.slice(0, MODEL_TEST_EXCERPT_CHARS) : text;
+}
+
+/** The answer's excerpt, or its reasoning marked as such when it has no content. */
+function answerExcerpt(answer: string, reasoning: string): string {
+  if (answer.trim() !== "" || reasoning.trim() === "") return clip(answer);
+  return clip(`${REASONING_ONLY_PREFIX}${reasoning.trim()}`);
+}
+
+function reasoningText(source: Record<string, unknown> | null): string {
+  if (!source) return "";
+  for (const key of ["reasoning_content", "reasoning"] as const) {
+    const value = source[key];
+    if (typeof value === "string" && value !== "") return value;
+  }
+  return "";
 }
 
 /** The stable error code of a response cut off at `MODEL_TEST_MAX_RESPONSE_BYTES`. */
@@ -334,6 +357,7 @@ async function readChatStream(response: Response, now: () => number): Promise<Re
   };
   let pending = "";
   let answer = "";
+  let reasoningSoFar = "";
   const onLine = (line: string) => {
     if (!line.startsWith("data:")) return;
     const data = line.slice(5).trim();
@@ -360,13 +384,13 @@ async function readChatStream(response: Response, now: () => number): Promise<Re
     if (!delta) return;
     outcome.valid = true;
     const content = typeof delta.content === "string" ? delta.content : "";
-    const reasoning = ["reasoning_content", "reasoning"].some(
-      (key) => typeof delta[key] === "string" && delta[key] !== "",
-    );
-    if ((content !== "" || reasoning) && outcome.firstTokenAt === null) {
+    const reasoning = reasoningText(delta);
+    if ((content !== "" || reasoning !== "") && outcome.firstTokenAt === null) {
       outcome.firstTokenAt = now();
     }
     if (content !== "" && answer.length < MODEL_TEST_EXCERPT_CHARS) answer += content;
+    if (reasoning !== "" && reasoningSoFar.length < MODEL_TEST_EXCERPT_CHARS)
+      reasoningSoFar += reasoning;
   };
   const truncated = await readText(response.body, (text) => {
     pending += text;
@@ -381,7 +405,7 @@ async function readChatStream(response: Response, now: () => number): Promise<Re
   }
   // An error event (or the cap) ends the answer as failed, whatever streamed before it.
   if (outcome.errorCode !== null) outcome.valid = false;
-  outcome.excerpt = outcome.valid ? clip(answer) : null;
+  outcome.excerpt = outcome.valid ? answerExcerpt(answer, reasoningSoFar) : null;
   return outcome;
 }
 
@@ -417,11 +441,13 @@ async function readAnswer(
   }
   // A chat answer that came back as one JSON body.
   const choices = Array.isArray(body.choices) ? body.choices : [];
-  const content = record(record(choices[0])?.message)?.content;
+  const message = record(record(choices[0])?.message);
+  const content = typeof message?.content === "string" ? message.content : "";
+  const reasoning = reasoningText(message);
   return {
     ...base,
     valid: choices.length > 0,
-    excerpt: typeof content === "string" ? clip(content) : null,
+    excerpt: content !== "" || reasoning !== "" ? answerExcerpt(content, reasoning) : null,
   };
 }
 
@@ -501,6 +527,7 @@ async function runOne(
     promptTokens: row?.promptTokens ?? read?.promptTokens ?? null,
     completionTokens: row?.completionTokens ?? read?.completionTokens ?? null,
     errorClass: ok || refused ? null : (row?.errorClass ?? fallbackCode),
+    upstreamError: ok ? null : (row?.upstreamErrorExcerpt ?? null),
     rejection: refused ? (row?.rejection ?? fallbackCode) : null,
     excerpt: ok && options.withExcerpt ? (read?.excerpt ?? null) : null,
   };
@@ -516,6 +543,7 @@ function refusedRow(rejection: string): ModelTestRow {
     promptTokens: null,
     completionTokens: null,
     errorClass: null,
+    upstreamError: null,
     rejection,
     excerpt: null,
   };

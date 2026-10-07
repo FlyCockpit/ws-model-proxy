@@ -2267,6 +2267,7 @@ ALTER TABLE relay_request ADD CONSTRAINT relay_request_execution_telemetry_check
   AND ((source = 'SIDECAR') = ("parentRequestId" IS NOT NULL))
   AND (source <> 'API_KEY' OR ("poolId" IS NOT NULL AND "runtimeModelId" IS NULL))
   AND (status <> 'PENDING' OR "completedAt" IS NULL)
+  AND ("upstreamErrorExcerpt" IS NULL OR char_length("upstreamErrorExcerpt") BETWEEN 1 AND 300)
 );
 -- Usage attribution, derived and pinned: the requested pool's owner, else the served model's
 -- owner (direct tests), else the requester. Never trusted from the writer.

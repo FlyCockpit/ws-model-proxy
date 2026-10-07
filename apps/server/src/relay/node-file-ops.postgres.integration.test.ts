@@ -83,7 +83,7 @@ integration("node file ops (PostgreSQL)", () => {
       nodeId,
       userId,
       trust: "full",
-      features: { files: { roots: [ROOT], asRoot: false } },
+      features: { files: { roots: [ROOT], asRoot: false, source: "configured" } },
     });
   });
 

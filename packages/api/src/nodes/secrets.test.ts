@@ -64,6 +64,50 @@ describe("nodes.secrets", () => {
     expect(JSON.stringify(out)).not.toContain(SECRET);
   });
 
+  it("lists the new name in the node's features at once, and drops a deleted one", async () => {
+    const features = {
+      terminals: { supported: true, max: 4, approvalRequired: false },
+      operatorTerminals: true,
+      files: { roots: null, asRoot: false, source: "disabled" },
+      runtimeHosts: [],
+      mediaExpand: true,
+      liveStt: true,
+      secrets: [{ name: "WSMP_SECRET_OLD", updatedAt: "2026-10-01T00:00:00.000Z" }],
+    };
+    const writeSecrets = vi.fn<NonNullable<NodeRelayServices["writeSecrets"]>>(async () => [
+      { name: "WSMP_SECRET_HF", status: "set", updatedAt: "2026-10-06T10:00:00.000Z" },
+    ]);
+    db.node.findFirst
+      .mockResolvedValueOnce(node() as never)
+      .mockResolvedValueOnce({ features } as never);
+    await client(FULL_AGENT, { writeSecrets }).secrets.set({
+      nodeId: "node-1",
+      name: "WSMP_SECRET_HF",
+      value: SECRET,
+    });
+    const written = db.node.updateMany.mock.calls[0]?.[0];
+    expect(written?.where).toEqual({ id: "node-1", userId: OWNER, features: { equals: features } });
+    expect(written?.data.featuresAt).toBeInstanceOf(Date);
+    expect((written?.data.features as typeof features | undefined)?.secrets).toEqual([
+      { name: "WSMP_SECRET_HF", updatedAt: "2026-10-06T10:00:00.000Z" },
+      { name: "WSMP_SECRET_OLD", updatedAt: "2026-10-01T00:00:00.000Z" },
+    ]);
+    expect(JSON.stringify(written)).not.toContain(SECRET);
+
+    const deleteSecrets = vi.fn<NonNullable<NodeRelayServices["writeSecrets"]>>(async () => [
+      { name: "WSMP_SECRET_OLD", status: "deleted" },
+    ]);
+    db.node.findFirst
+      .mockResolvedValueOnce(node() as never)
+      .mockResolvedValueOnce({ features } as never);
+    await client(FULL_AGENT, { writeSecrets: deleteSecrets }).secrets.delete({
+      nodeId: "node-1",
+      name: "WSMP_SECRET_OLD",
+    });
+    const removed = db.node.updateMany.mock.calls[1]?.[0];
+    expect((removed?.data.features as typeof features | undefined)?.secrets).toEqual([]);
+  });
+
   it("refuses a Relay-only node (secret_needs_node) without sending anything", async () => {
     const writeSecrets = vi.fn();
     db.node.findFirst.mockResolvedValueOnce(node({ trust: "RELAY" }) as never);

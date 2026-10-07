@@ -67,6 +67,7 @@ function row(overrides: Partial<RelayRequestReadback> = {}): RelayRequestReadbac
     completionTokens: 2,
     rejection: null,
     errorClass: null,
+    upstreamErrorExcerpt: null,
     ...overrides,
   };
 }
@@ -108,6 +109,7 @@ describe("bench statistics", () => {
       promptTokens: null,
       completionTokens: null,
       errorClass: null,
+      upstreamError: null,
       rejection: null,
       excerpt: null,
     };
@@ -150,6 +152,7 @@ describe("runModelTest", () => {
       promptTokens: 7,
       completionTokens: 2,
       errorClass: null,
+      upstreamError: null,
       rejection: null,
       excerpt: "pong",
     });
@@ -266,6 +269,60 @@ describe("runModelTest", () => {
       errorClass: RESPONSE_TOO_LARGE,
       latencyMs: null,
       excerpt: null,
+    });
+  });
+
+  it("asks for 256 tokens by default so a reasoning model can answer", async () => {
+    const sent: Request[] = [];
+    const send: ModelTestSend = async ({ request }) => {
+      sent.push(request);
+      return chatAnswer("pong");
+    };
+    await createModelTest({ send, readRelayRequest: async () => null })(input());
+    const body = (await sent[0]?.json()) as Record<string, unknown>;
+    expect(body.max_tokens).toBe(256);
+  });
+
+  it("reports an answer that was reasoning only as answered, marked reasoning only", async () => {
+    const send: ModelTestSend = async () => {
+      reportRelayRequestCreated("req1");
+      return sse(
+        { choices: [{ delta: { role: "assistant" } }] },
+        { choices: [{ delta: { reasoning_content: "The user wants pong." } }] },
+        { choices: [{ delta: { content: "" }, finish_reason: "length" }] },
+      );
+    };
+    const { result } = await createModelTest({ send, readRelayRequest: async () => row() })(
+      input(),
+    );
+    expect(result).toMatchObject({
+      outcome: "ok",
+      excerpt: "[reasoning only] The user wants pong.",
+    });
+  });
+
+  it("returns the runtime's own error message from the request's row on a 4xx", async () => {
+    const send: ModelTestSend = async () => {
+      reportRelayRequestCreated("req1");
+      return new Response(JSON.stringify({ error: { message: "upstream refused" } }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const run = createModelTest({
+      send,
+      readRelayRequest: async () =>
+        row({
+          status: "FAILED",
+          errorClass: "upstream_4xx",
+          upstreamErrorExcerpt: "messages must be a list",
+        }),
+    });
+    const { result } = await run(input());
+    expect(result).toMatchObject({
+      outcome: "error",
+      errorClass: "upstream_4xx",
+      upstreamError: "messages must be a list",
     });
   });
 

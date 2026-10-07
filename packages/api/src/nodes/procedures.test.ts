@@ -212,6 +212,68 @@ describe("nodes.list / get", () => {
   });
 });
 
+describe("nodes.deleteOffline (MCP node_delete)", () => {
+  function setupDelete(connection: "ONLINE" | "OFFLINE", deleted = 1) {
+    db.node.deleteMany.mockResolvedValueOnce({ count: deleted });
+    db.node.findFirst.mockResolvedValueOnce({ id: "node-1", slug: "box", connection } as never);
+    db.profileItem.findFirst.mockResolvedValueOnce(null);
+    db.instanceRank.findMany.mockResolvedValueOnce([{ instanceId: "inst-1" }] as never);
+    db.fabricMember.findMany.mockResolvedValue([] as never);
+  }
+
+  it("refuses an online node (node_online) and deletes nothing", async () => {
+    setupDelete("ONLINE");
+    await expect(
+      client(FULL_AGENT).deleteOffline({ nodeId: "node-1", confirm: "DELETE" }),
+    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "node_online" } });
+    expect(db.node.delete).not.toHaveBeenCalled();
+  });
+
+  it("refuses a node that came online after the check, inside the same transaction", async () => {
+    setupDelete("OFFLINE", 0);
+    await expect(
+      client(FULL_AGENT).deleteOffline({ nodeId: "node-1", confirm: "DELETE" }),
+    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "node_online" } });
+    expect(db.auditEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("deletes an offline node and audits its slug and id, never credentials", async () => {
+    setupDelete("OFFLINE");
+    const out = await client(FULL_AGENT).deleteOffline({
+      nodeId: "node-1",
+      confirm: "DELETE",
+      note: "old box",
+    });
+    expect(out).toEqual({ deleted: true, stoppedInstances: ["inst-1"] });
+    expect(db.node.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      id: "node-1",
+      userId: "owner-1",
+    });
+    expect(db.node.deleteMany).toHaveBeenCalledWith({
+      where: { id: "node-1", userId: "owner-1", connection: { not: "ONLINE" } },
+    });
+    expect(db.node.delete).not.toHaveBeenCalled();
+    const audit = db.auditEvent.create.mock.calls[0]?.[0]?.data;
+    expect(audit).toMatchObject({
+      actor: "AGENT",
+      agentTokenId: "tok-1",
+      action: "node.delete",
+      resourceType: "node",
+      resourceId: "node-1",
+      before: { slug: "box" },
+      after: { stoppedInstances: ["inst-1"], note: "old box" },
+    });
+    expect(JSON.stringify(audit)).not.toMatch(/credential|secret|wsmp_node_/i);
+  });
+
+  it("is refused for a read-only agent before reading the node", async () => {
+    await expect(
+      client(READ_AGENT).deleteOffline({ nodeId: "node-1", confirm: "DELETE" }),
+    ).rejects.toBeDefined();
+    expect(db.node.findFirst).not.toHaveBeenCalled();
+  });
+});
+
 describe("nodes.update", () => {
   const trustRow = {
     id: "node-1",
@@ -281,6 +343,36 @@ describe("nodes.update", () => {
       reason: "more ports",
     });
     expect(definitionChanged).toHaveBeenCalledWith(["node-1"]);
+  });
+
+  it("records who declared the hardware, and shows an agent's declaration as source agent", async () => {
+    db.node.findFirst
+      .mockResolvedValueOnce(trustRow as never)
+      .mockResolvedValueOnce(nodeRow() as never);
+    db.node.updateMany.mockResolvedValueOnce({ count: 1 });
+    await client(FULL_AGENT).update({ nodeId: "node-1", hardware: { reservedMemoryGb: 8 } });
+    expect(db.node.updateMany.mock.calls[0]?.[0]?.data).toMatchObject({
+      declaredResources: { reservedMemoryGb: 8 },
+      declaredResourcesBy: "AGENT",
+    });
+
+    db.node.findFirst.mockResolvedValueOnce(
+      nodeRow({
+        declaredResources: { reservedMemoryGb: 8 },
+        declaredResourcesBy: "AGENT",
+      }) as never,
+    );
+    const byAgent = await client().get({ nodeId: "node-1" });
+    expect(byAgent.hardware.reservedMemoryGb).toEqual({ value: 8, source: "agent" });
+
+    db.node.findFirst
+      .mockResolvedValueOnce(trustRow as never)
+      .mockResolvedValueOnce(nodeRow() as never);
+    db.node.updateMany.mockResolvedValueOnce({ count: 1 });
+    await client().update({ nodeId: "node-1", hardware: null });
+    expect(db.node.updateMany.mock.calls[1]?.[0]?.data).toMatchObject({
+      declaredResourcesBy: null,
+    });
   });
 
   it("replaces fabric memberships and refreshes every affected member's hash", async () => {

@@ -383,6 +383,7 @@
       "reservedNow": "Reservada por runtimes ahora",
       "source": {
         "browser": "definido aquí",
+        "agent": "definido por un agente",
         "node": "config del nodo",
         "detected": "detectado"
       },

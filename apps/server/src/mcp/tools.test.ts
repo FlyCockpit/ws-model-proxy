@@ -41,11 +41,11 @@ beforeEach(() => resetMcpToolRateLimitsForTests());
 afterEach(() => vi.restoreAllMocks());
 
 describe("MCP tool levels", () => {
-  it("READ credentials get exactly the 7 read tools, FULL all 27", () => {
+  it("READ credentials get exactly the 7 read tools, FULL all 28", () => {
     expect(MCP_TOOL_NAMES.filter((name) => mcpToolAllowed(name, "READ"))).toEqual([
       ...MCP_READ_TOOLS,
     ]);
-    expect(MCP_TOOL_NAMES.filter((name) => mcpToolAllowed(name, "FULL"))).toHaveLength(27);
+    expect(MCP_TOOL_NAMES.filter((name) => mcpToolAllowed(name, "FULL"))).toHaveLength(28);
   });
 
   it("a FULL tool called with a READ credential answers like an unknown tool and calls nothing", async () => {
@@ -217,6 +217,54 @@ describe("errors and output", () => {
       subjectId: "node-1",
       message: "The node is Relay only.",
     });
+  });
+
+  it("keeps a procedure's own message on a BAD_REQUEST without issues (runtime_start on an always-on runtime)", async () => {
+    const result = await runMcpTool(tool("runtime_start"), {
+      dispatch: testDispatch("FULL"),
+      args: { runtimeId: "r", preview: true, count: 1 },
+      invoke: async () => {
+        throw new ORPCError("BAD_REQUEST", { message: "An always-on runtime is not started." });
+      },
+    });
+    expect(result.content).toEqual([
+      { type: "text", text: "An always-on runtime is not started." },
+    ]);
+    expect(structured(result).error).toEqual({
+      code: "BAD_REQUEST",
+      message: "An always-on runtime is not started.",
+    });
+  });
+
+  it("lists procedure validation issues as path and message", async () => {
+    const result = await runMcpTool(tool("runtime_start"), {
+      dispatch: testDispatch("FULL"),
+      args: { runtimeId: "r" },
+      invoke: async () => {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Input validation failed",
+          cause: {
+            issues: [{ path: [{ key: "nodeIds" }, 0], code: "too_small", message: "Too small" }],
+          },
+        });
+      },
+    });
+    expect(structured(result).error).toEqual({
+      code: "invalid_input",
+      issues: [{ path: "nodeIds.0", message: "Too small" }],
+    });
+  });
+
+  it("a sensitive tool's errors carry no procedure message", async () => {
+    const result = await runMcpTool(tool("node_secret_set"), {
+      dispatch: testDispatch("FULL"),
+      args: { nodeId: "n", name: "WSMP_SECRET_HF", value: "hf_secret_value" },
+      invoke: async () => {
+        throw new ORPCError("BAD_REQUEST", { message: "value hf_secret_value is bad" });
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("hf_secret_value");
+    expect(structured(result).error).toEqual({ code: "BAD_REQUEST" });
   });
 
   it("hides unknown failures behind a generic error with the request id", async () => {

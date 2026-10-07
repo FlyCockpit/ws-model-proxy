@@ -68,7 +68,7 @@ async function listTools(level: "READ" | "FULL") {
 }
 
 describe("the server's tools/list", () => {
-  it("lists all 27 tools for FULL credentials within the token budget (chars / 4)", async () => {
+  it("lists all 28 tools for FULL credentials within the token budget (chars / 4)", async () => {
     const tools = await listTools("FULL");
     expect(tools.map((entry) => entry.name)).toEqual([...MCP_TOOL_NAMES]);
     const tokens = Math.ceil(JSON.stringify({ tools }).length / 4);

@@ -49,7 +49,11 @@ export function TrustBadge({ trust }: { trust: NodeSummary["trust"] }) {
   );
 }
 
-export function NodeFlags({ node }: { node: NodeSummary }) {
+export function NodeFlags({
+  node,
+}: {
+  node: Pick<NodeSummary, "hold" | "rejectedProtocolVersion" | "removeAfterOfflineMs">;
+}) {
   const { t } = useTranslation(["dashboard"]);
   return (
     <>

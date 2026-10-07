@@ -48,6 +48,8 @@ export const modelTestResultSchema = z
     promptTokens: z.number().int().nullable(),
     completionTokens: z.number().int().nullable(),
     errorClass: z.string().nullable(),
+    /** The runtime's own error message (redacted, one line) when it answered >= 400. */
+    upstreamError: z.string().nullable(),
     /** Refusal reason (over_capacity, wait_expired, context_too_large, ...). */
     rejection: z.string().nullable(),
     /** A short excerpt of the answer (chat) or the transcript (transcription). */

@@ -13,7 +13,8 @@ import {
 } from "../lib/runtime-spec";
 
 type EffectiveHardware = z.infer<typeof effectiveHardwareSchema>;
-type Source = "browser" | "node" | "detected";
+/** `browser`: a person declared it; `agent`: an agent did (node_update). */
+type Source = "browser" | "agent" | "node" | "detected";
 const GPU_VENDORS = ["nvidia", "amd", "intel", "apple", "other"] as const;
 type Vendor = (typeof GPU_VENDORS)[number];
 
@@ -94,11 +95,12 @@ function round(value: number): number {
 }
 
 function pick<T>(
+  declaredSource: "browser" | "agent",
   browser: T | undefined,
   node: T | undefined,
   detected: T | undefined,
 ): { value: T | null; source: Source | null } {
-  if (browser !== undefined) return { value: browser, source: "browser" };
+  if (browser !== undefined) return { value: browser, source: declaredSource };
   if (node !== undefined) return { value: node, source: "node" };
   if (detected !== undefined) return { value: detected, source: "detected" };
   return { value: null, source: null };
@@ -117,6 +119,8 @@ export function claimMemoryGb(resources: unknown): number {
 
 export type HardwareInput = {
   declaredResources: unknown;
+  /** Who declared `declaredResources` (`Node.declaredResourcesBy`); null or absent: a person. */
+  declaredBy?: "USER" | "AGENT" | "SYSTEM" | null;
   nodeInfo: unknown;
   nodeMetrics: unknown;
   nodeMetricsAt: Date | null;
@@ -148,6 +152,7 @@ export function liveMetrics(
 
 export function effectiveHardware(input: HardwareInput): EffectiveHardware {
   const browser = parseDeclared(input.declaredResources) ?? {};
+  const declaredSource = input.declaredBy === "AGENT" ? "agent" : "browser";
   const info = parseNodeInfo(input.nodeInfo);
   const node = parseNodeDeclared(info?.declared) ?? {};
 
@@ -157,18 +162,25 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
   const detectedAcceleratorMiB =
     info?.acceleratorMemoryMiB ?? (detectedVramMiB > 0 ? detectedVramMiB : undefined);
 
-  const kind = pick(browser.kind, node.kind, info?.nodeKind);
+  const kind = pick(declaredSource, browser.kind, node.kind, info?.nodeKind);
   const memoryGb = pick(
+    declaredSource,
     browser.memoryGb,
     node.memoryGb,
     detectedMemoryMiB === undefined ? undefined : gb(detectedMemoryMiB),
   );
   const acceleratorMemoryGb = pick(
+    declaredSource,
     browser.acceleratorMemoryGb,
     node.acceleratorMemoryGb,
     detectedAcceleratorMiB === undefined ? undefined : gb(detectedAcceleratorMiB),
   );
-  const reservedMemoryGb = pick(browser.reservedMemoryGb, node.reservedMemoryGb, undefined);
+  const reservedMemoryGb = pick(
+    declaredSource,
+    browser.reservedMemoryGb,
+    node.reservedMemoryGb,
+    undefined,
+  );
 
   const gpus = new Map<string, EffectiveHardware["gpus"][number]>();
   const reservedVram = (key: string) =>
@@ -189,7 +201,7 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
       source,
     });
   };
-  for (const gpu of browser.gpus ?? []) addGpu(gpu, "browser");
+  for (const gpu of browser.gpus ?? []) addGpu(gpu, declaredSource);
   for (const gpu of node.gpus ?? []) addGpu(gpu, "node");
   for (const gpu of detectedGpus)
     addGpu({ ...gpu, vramGb: gpu.vramTotalMiB == null ? 0 : gb(gpu.vramTotalMiB) }, "detected");
