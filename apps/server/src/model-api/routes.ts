@@ -97,6 +97,7 @@ import {
   resolveChatTestRoutingMode,
 } from "./chat-test-routing-mode.js";
 import { responseWithFirstClientByte } from "./client-byte-commit.js";
+import { clientCredential } from "./client-credential.js";
 import { recordLearnedFix, recordLearnedHeader } from "./compat/profile-store.js";
 import type { CompatRefusal } from "./compat/request-policy.js";
 import type { ProxyExtras } from "./compat/runtime-compat.js";
@@ -1345,17 +1346,11 @@ function dataPolicyRefusalResponse(family: string): Response {
   });
 }
 
-function bearerToken(request: Request): string | null {
-  const authorization = request.headers.get("authorization");
-  if (!authorization) return null;
-  const match = /^Bearer\s+(.+)$/i.exec(authorization.trim());
-  return match?.[1] ?? null;
-}
-
+/** The caller's API key from Authorization: Bearer, x-api-key or api-key (one key only). */
 export async function authenticateRequest(request: Request): Promise<ApiKeyIdentity | null> {
-  const token = bearerToken(request);
-  if (!token) return null;
-  return authenticateApiKey(token);
+  const credential = clientCredential(request.headers);
+  if (credential.kind !== "key") return null;
+  return authenticateApiKey(credential.key);
 }
 
 function isJsonObject(value: unknown): value is JsonObject {

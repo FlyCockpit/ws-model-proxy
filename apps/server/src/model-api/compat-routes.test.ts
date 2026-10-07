@@ -265,7 +265,7 @@ describe("request compatibility on a local pool member", () => {
     relay.answers.push({ status: 200, body: OK });
     const response = await chat(
       { max_completion_tokens: 5, metadata: { a: 1 } },
-      { "openai-beta": "x", "x-api-key": "secret" },
+      { "openai-beta": "x", "x-api-key": "wsmp_key_test", "api-key": "wsmp_key_test" },
     );
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ choices: [{ finish_reason: "stop" }] });
@@ -276,6 +276,7 @@ describe("request compatibility on a local pool member", () => {
     expect(sent.max_completion_tokens).toBeUndefined();
     expect(relay.sent[0]!.headers.has("openai-beta")).toBe(false);
     expect(relay.sent[0]!.headers.has("x-api-key")).toBe(false);
+    expect(relay.sent[0]!.headers.has("api-key")).toBe(false);
     expect(relay.sent[0]!.headers.has("authorization")).toBe(false);
     expect(db.relayRequest.updateMany).toHaveBeenCalledWith({
       where: { id: "relay-1" },
@@ -436,6 +437,71 @@ describe("request compatibility on a local pool member", () => {
     expect(relay.sent).toHaveLength(0);
     expect(response.status).toBe(400);
     expect(((await response.json()) as { error: { param: string } }).error.param).toBe("metadata");
+  });
+});
+
+describe("caller credential styles", () => {
+  it.each([
+    [{ "x-api-key": "wsmp_key_alt" }],
+    [{ "api-key": "wsmp_key_alt" }],
+    [{ authorization: "Bearer wsmp_key_alt", "x-api-key": "wsmp_key_alt" }],
+  ])("authenticates %o and never forwards it", async (credential) => {
+    relay.answers.push({ status: 200, body: OK });
+    const response = await app().request("/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...credential },
+      body: JSON.stringify({ model: "owner/chat", messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(response.status).toBe(200);
+    expect(resolve.authenticateApiKey).toHaveBeenCalledWith("wsmp_key_alt");
+    for (const name of ["authorization", "x-api-key", "api-key"])
+      expect(relay.sent[0]!.headers.has(name)).toBe(false);
+  });
+
+  it("refuses two different keys", async () => {
+    const response = await app().request("/chat/completions", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer wsmp_key_a",
+        "x-api-key": "wsmp_key_b",
+      },
+      body: JSON.stringify({ model: "owner/chat", messages: [] }),
+    });
+    expect(response.status).toBe(401);
+    expect(resolve.authenticateApiKey).not.toHaveBeenCalled();
+  });
+
+  it("serves Anthropic Messages with x-api-key", async () => {
+    relay.answers.push({
+      status: 200,
+      body: JSON.stringify({
+        id: "m",
+        type: "message",
+        role: "assistant",
+        model: "engine-model",
+        content: [{ type: "text", text: "ok" }],
+        stop_reason: "stop",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }),
+    });
+    resolve.poolRoutes.mockResolvedValue([route()]);
+    const response = await app().request("/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "wsmp_key_alt",
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "owner/chat",
+        max_tokens: 5,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    expect(resolve.authenticateApiKey).toHaveBeenCalledWith("wsmp_key_alt");
+    expect(response.status).not.toBe(401);
+    expect(relay.sent.every((sent) => !sent.headers.has("x-api-key"))).toBe(true);
   });
 });
 
