@@ -82,6 +82,11 @@ says so.
 A plain code never takes over an existing node, even on the same machine: log in again with a
 new code and a new name, or use a Replace code.
 
+Logging in over an earlier enrollment for another server, or over leftovers of wsmp 0.3, is a
+fresh enrollment: `--trust` (or your answer) applies and the old node name is not reused (you are
+asked for a name, or it comes from the hostname). A node you lowered to Relay only stays Relay
+only; raise it with `wsmp trust full`.
+
 ## Run the relay
 
 ```sh

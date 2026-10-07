@@ -98,7 +98,29 @@ pub fn run(args: &Args) -> Result<()> {
         .context("the server announces an invalid public origin")?;
     let url_origin = url::Url::parse(&server_url)?.origin().ascii_serialization();
     let saved = Config::load()?;
-    let slug = requested_slug(args, saved.cli_slug.as_deref())?;
+    let prior = prior_enrollment(
+        saved.server_url.as_deref(),
+        crate::state::load_node_credential(),
+        &server_url,
+    );
+    // An earlier enrollment elsewhere (another server, or a 0.3 credential)
+    // does not hand its node name to this one: that would leave its node
+    // behind as a ghost under a reused name.
+    let saved_slug = match prior {
+        Prior::SameServer | Prior::None => saved.cli_slug.as_deref(),
+        Prior::Stale => {
+            if let Some(old) = saved.cli_slug.as_deref()
+                && args.slug.is_none()
+            {
+                output::diagnostic(format!(
+                    "not reusing the earlier node name `{}` from an older enrollment; pass `--slug` to choose one",
+                    escape_single_line(old)
+                ))?;
+            }
+            None
+        }
+    };
+    let slug = requested_slug(args, saved_slug)?;
     let code = enrollment_code(args)?;
     let state_dir = crate::paths::state_dir().context("determining the state directory")?;
     let identity = crate::terminal_identity::load_or_create(&state_dir)
@@ -147,7 +169,7 @@ pub fn run(args: &Args) -> Result<()> {
         trust
     };
     // Not asked when the node will stay Relay only (rechecked under the lock).
-    let human_terminal = if keeps_relay(&Config::load()?) {
+    let human_terminal = if keeps_relay(&Config::load()?, prior) {
         choose_human_terminal(args, TrustValue::Relay)?
     } else {
         choose_human_terminal(args, trust)?
@@ -159,7 +181,7 @@ pub fn run(args: &Args) -> Result<()> {
         let mut config = Config::load()?;
         human_terminal_changed = config.server_url.is_some()
             && human_terminal.is_some_and(|allow| allow != config.allow_human_terminal);
-        let chosen = if keeps_relay(&config) {
+        let chosen = if keeps_relay(&config, prior) {
             TrustValue::Relay
         } else {
             trust
@@ -377,18 +399,45 @@ fn choose_trust(args: &Args, origin: &str) -> Result<TrustValue> {
     }
 }
 
-/// Whether a re-login must keep this node Relay only: never raise a node that
-/// is already Relay only (unset counts) or was lowered (a frozen copy exists).
-fn keeps_relay(config: &Config) -> bool {
-    let enrolled_before = config.server_url.is_some()
-        || crate::state::load_node_credential()
-            .ok()
-            .flatten()
-            .is_some();
-    crate::runtime_store::frozen_path()
+/// What this machine was enrolled with before this login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prior {
+    /// Never enrolled.
+    None,
+    /// A 0.4 credential for this same server: a re-login.
+    SameServer,
+    /// Leftovers of another enrollment: a credential for another server, a
+    /// 0.3 credential this version cannot read, or a 0.3 config without one.
+    /// This login is a fresh enrollment.
+    Stale,
+}
+
+fn prior_enrollment(
+    saved_server: Option<&str>,
+    credential: Result<Option<crate::state::NodeCredential>>,
+    server_url: &str,
+) -> Prior {
+    match credential {
+        Ok(Some(credential)) if credential.server == server_url => Prior::SameServer,
+        Ok(Some(_)) | Err(_) => Prior::Stale,
+        Ok(None) if saved_server.is_some() => Prior::Stale,
+        Ok(None) => Prior::None,
+    }
+}
+
+/// Whether a login must keep this node Relay only. A person's explicit
+/// lowering always holds: a frozen copy exists (every lowering writes one),
+/// or this same server's node was saved as `relay`. An absent trust (a 0.3
+/// config) is not a lowering, and a fresh enrollment takes the chosen trust.
+fn keeps_relay(config: &Config, prior: Prior) -> bool {
+    let frozen = crate::runtime_store::frozen_path()
         .map(|path| path.exists())
-        .unwrap_or(true)
-        || (enrolled_before && crate::trust::configured(config) == TrustValue::Relay)
+        .unwrap_or(true);
+    keeps_relay_with(frozen, prior, config.trust)
+}
+
+fn keeps_relay_with(frozen: bool, prior: Prior, saved: Option<TrustValue>) -> bool {
+    frozen || (prior == Prior::SameServer && saved == Some(TrustValue::Relay))
 }
 
 /// The browser terminal setting to write: `Some` sets it, `None` keeps the
@@ -494,6 +543,63 @@ mod tests {
             choose_human_terminal(&login_args(&[]), TrustValue::Relay).unwrap(),
             None
         );
+    }
+
+    fn credential(server: &str) -> crate::state::NodeCredential {
+        crate::state::NodeCredential {
+            node_id: "node-1".into(),
+            slug: "old-box".into(),
+            server: server.into(),
+            credential: "c".repeat(48),
+        }
+    }
+
+    #[test]
+    fn leftovers_of_another_enrollment_make_a_fresh_one() {
+        let here = "https://models.example.com";
+        assert_eq!(prior_enrollment(None, Ok(None), here), Prior::None);
+        assert_eq!(
+            prior_enrollment(Some(here), Ok(Some(credential(here))), here),
+            Prior::SameServer
+        );
+        // Another server, a 0.3 credential (unreadable here), or a 0.3
+        // config without a 0.4 credential.
+        assert_eq!(
+            prior_enrollment(
+                Some(here),
+                Ok(Some(credential("https://old.example"))),
+                here
+            ),
+            Prior::Stale
+        );
+        assert_eq!(
+            prior_enrollment(Some(here), Err(anyhow::anyhow!("0.3 format")), here),
+            Prior::Stale
+        );
+        assert_eq!(prior_enrollment(Some(here), Ok(None), here), Prior::Stale);
+    }
+
+    #[test]
+    fn only_an_explicit_lowering_keeps_a_login_relay_only() {
+        // A 0.3 config has no trust: not a lowering.
+        assert!(!keeps_relay_with(false, Prior::SameServer, None));
+        assert!(!keeps_relay_with(false, Prior::Stale, None));
+        // This server's node saved as relay stays relay; a fresh enrollment
+        // takes the chosen trust.
+        assert!(keeps_relay_with(
+            false,
+            Prior::SameServer,
+            Some(TrustValue::Relay)
+        ));
+        assert!(!keeps_relay_with(
+            false,
+            Prior::Stale,
+            Some(TrustValue::Relay)
+        ));
+        // A frozen copy is a person's lowering, whatever the server.
+        for prior in [Prior::None, Prior::SameServer, Prior::Stale] {
+            assert!(keeps_relay_with(true, prior, None));
+        }
     }
 
     #[test]

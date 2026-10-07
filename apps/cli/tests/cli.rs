@@ -481,6 +481,59 @@ fn a_fresh_login_takes_the_chosen_trust_and_a_lowered_node_stays_lowered() {
         .stderr(predicate::str::contains("cannot run from a command"));
 }
 
+/// Leftover 0.3 state (a config without `trust`, an old credential) is not
+/// a lowering and not this node: the login takes `--trust` and a new name.
+#[test]
+fn a_login_over_leftover_0_3_state_is_a_fresh_enrollment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({
+            "version": 1,
+            "serverUrl": "https://old.example.com",
+            "cliSlug": "old-box",
+            "endpoints": []
+        }),
+    );
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        state.join("node-credential.json"),
+        json!({ "token": "old-0.3-credential", "server": "https://old.example.com" }).to_string(),
+    )
+    .unwrap();
+    let server = TestServer::start(vec![
+        (
+            "/.well-known/wsmp",
+            200,
+            well_known("https://wsmp.example.com"),
+        ),
+        ("/api/node/enroll", 200, enrolled("fresh-box")),
+    ]);
+    let mut cmd = cli(&config, &state);
+    cmd.args([
+        "login",
+        &server.base_url,
+        "--code",
+        CODE,
+        "--trust",
+        "full",
+        "--no-service",
+        "--json",
+    ]);
+    assert_eq!(json_stdout(cmd)["trust"], "full");
+    server.requests.recv().unwrap();
+    let enroll_request = server.requests.recv().unwrap();
+    let body: Value =
+        serde_json::from_str(enroll_request.split("\r\n\r\n").nth(1).expect("body")).unwrap();
+    assert_ne!(body["slug"], "old-box", "the old node's name was reused");
+    server.join();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["trust"], "full");
+    assert_eq!(cfg["cliSlug"], "fresh-box");
+}
+
 #[test]
 fn login_sets_browser_terminals_by_flag_and_keeps_them_without_a_terminal() {
     let tmp = tempfile::tempdir().unwrap();
