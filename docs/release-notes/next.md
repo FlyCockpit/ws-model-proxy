@@ -216,6 +216,19 @@ If that is not acceptable for a machine, do not type its sudo password into a
 web terminal: give the exact command a `NOPASSWD` sudoers rule instead, and use
 Full control only where trusting the server with a shell is fine.
 
+## Pools translate between API protocols by default
+
+A pool now answers OpenAI Chat Completions, OpenAI Responses and Anthropic
+Messages callers even when a member serves only one of them: **API adaptation**
+(pool Advanced) is on by default. A member that serves the caller's protocol
+natively is always tried first; translation is used only when no native member
+can take the request. Translation is strict: a request feature it cannot carry
+over (for example `logprobs`, audio output or a vendor-specific field) is
+refused with a 400 that names the feature, never silently dropped. Merging a
+developer message into the system prompt for Anthropic targets stays off unless
+you turn on **lossy developer-role collapse**. Turn API adaptation off on a pool
+to serve only native requests.
+
 ## Configuration
 
 ### Rate limits

@@ -66,7 +66,9 @@ export const POOL_ADVANCED_OVERRIDES = {
     /** The owner's own share (the owner has no share row). Automatic = the share mode. */
     ownerPercent: { kind: "int", min: 0, max: 100, unit: "percent", auto: { source: "derived" } },
   },
-  protocolAdaptation: { kind: "bool", auto: { default: false } },
+  /** Translate between OpenAI Chat, OpenAI Responses and Anthropic Messages when a member does
+   * not serve the caller's protocol natively (native members always route first). */
+  protocolAdaptation: { kind: "bool", auto: { default: true } },
   allowLossyDeveloperRoleCollapse: { kind: "bool", auto: { default: false } },
   recommendedSurface: {
     kind: "enum",

@@ -5063,14 +5063,18 @@ async function relayPool({
   // input after admission; token counts never filter unrelated tokenizers.
   const contextEligibleMembers = members;
   let canonicalAdaptationRequest: ReturnType<typeof parseCanonicalRequest> | null = null;
+  // Why the strict adapter refused this request (it names the feature): the answer when only
+  // adapted members could have served it.
+  let adaptationRefusal: AdapterError | undefined;
   if (operation.adaptation?.poolEnabled === true) {
     try {
       canonicalAdaptationRequest = parseCanonicalRequest(
         operation.adaptation.requestedSurface,
         operation.adaptation.payload,
       );
-    } catch {
+    } catch (error) {
       // Native members may still accept extensions outside the strict adapted subset.
+      if (error instanceof AdapterError) adaptationRefusal = error;
     }
   }
   const executionByMember = new Map(
@@ -5084,6 +5088,7 @@ async function relayPool({
     ]),
   );
   let adaptationDepthError: AdapterError | undefined;
+  let adaptedMemberRefused = false;
   const protocolCandidates = contextEligibleMembers.filter((member) => {
     if (
       operation.family === "embeddings" &&
@@ -5103,7 +5108,10 @@ async function relayPool({
     if (execution.mode === "unavailable") return false;
     if (execution.mode === "native") return true;
     const source = execution.nativeSurface ? protocolSurface(execution.nativeSurface) : null;
-    if (!source || !canonicalAdaptationRequest) return false;
+    if (!source || !canonicalAdaptationRequest) {
+      adaptedMemberRefused = true;
+      return false;
+    }
     try {
       renderForExecutionTarget({
         request: canonicalAdaptationRequest,
@@ -5115,6 +5123,8 @@ async function relayPool({
       return true;
     } catch (error) {
       if (isRequestDepthError(error)) adaptationDepthError = error;
+      else if (error instanceof AdapterError) adaptationRefusal ??= error;
+      adaptedMemberRefused = true;
       return false;
     }
   });
@@ -5177,6 +5187,19 @@ async function relayPool({
     if (providerOnly && overflow.kind === "unavailable")
       return providerOnlyUnavailableResponse(overflow.reason);
     const failure = terminalExternalFailure(overflow) ?? "unsupported_capability";
+    if (
+      failure === "unsupported_capability" &&
+      operation.adaptation &&
+      adaptedMemberRefused &&
+      adaptationRefusal
+    ) {
+      // Fail closed with the feature the adapter cannot translate, never a generic refusal.
+      await operation.dispose?.();
+      await failPoolRelayMetadata({ relayRequestId, startedAt, failure }).catch(
+        metadataUpdateError,
+      );
+      return adapterRequestErrorResponse(operation.adaptation.requestedSurface, adaptationRefusal);
+    }
     await operation.dispose?.();
     await failPoolRelayMetadata({ relayRequestId, startedAt, failure });
     return operationFailureResponse(operation, failure);
