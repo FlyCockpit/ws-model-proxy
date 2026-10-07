@@ -1015,14 +1015,14 @@
     "markStopped": {
       "action": "Mark as stopped…",
       "title": "Mark as stopped?",
-      "description": "wsmp couldn't confirm that this process stopped. Marking it stopped tells wsmp to stop waiting for it. It doesn't touch the node or kill anything. Its port and GPUs stay reserved until wsmp confirms the process is gone or you restart this instance. Do this only if you've checked on the node that the process is gone.",
+      "description": "wsmp couldn't confirm that this process stopped. Marking it stopped tells wsmp to stop waiting for it; nothing is run on the node to do it. Its port, memory and GPUs stay reserved until wsmp confirms the process is gone or the instance starts again (wsmp restarts an instance that should keep running). Do this only if you've checked on the node that the process is gone.",
       "confirm": "Mark as stopped",
       "pending": "Marking…",
       "done": "Marked as stopped.",
       "noteLabel": "Note (optional)",
       "notePlaceholder": "What you checked on the node",
       "noteTooLong": "Keep the note to 500 characters.",
-      "help": "wsmp asked the node to stop this process but couldn't confirm it is gone, so its port and GPUs stay reserved. wsmp checks again every 5 minutes. If you've checked on the node that the process is gone, use Mark as stopped.",
+      "help": "wsmp asked the node to stop this process but couldn't confirm it is gone, so its port, memory and GPUs stay reserved. While the node is online, wsmp checks again every 5 minutes. If you've checked on the node that the process is gone, use Mark as stopped.",
       "evidence": {
         "title": "What wsmp knows",
         "stopRequested": "Stop requested",

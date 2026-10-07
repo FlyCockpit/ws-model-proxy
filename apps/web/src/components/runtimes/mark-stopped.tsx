@@ -12,6 +12,7 @@ import { z } from "zod";
 
 import { ConfirmAction } from "@/components/access/confirm-action";
 import { Help } from "@/components/help";
+import { InlineRetry } from "@/components/inline-retry";
 import { FieldError } from "@/components/nodes/field-error";
 import { TimeAgo } from "@/components/time-ago";
 import { refusalText } from "@/lib/refusal-text";
@@ -76,20 +77,21 @@ export function MarkStoppedAction({
           ...(nodeNumber === undefined ? {} : { nodeNumber }),
           ...(note ? { note } : {}),
         });
-        setOpen(false);
-        form.reset();
-        toast.success(t("dashboard:runtime.markStopped.done"));
-        // The instance settles STOPPED: runtimes list it, nodes their parts, pools and models
-        // its availability.
-        await Promise.all([
-          queryClient.invalidateQueries({ queryKey: orpc.runtimes.key() }),
-          queryClient.invalidateQueries({ queryKey: orpc.nodes.key() }),
-          queryClient.invalidateQueries({ queryKey: orpc.pools.key() }),
-          queryClient.invalidateQueries({ queryKey: orpc.models.key() }),
-        ]);
       } catch (error) {
         toast.error(refusalText(error));
+        return;
       }
+      setOpen(false);
+      form.reset();
+      toast.success(t("dashboard:runtime.markStopped.done"));
+      // The instance settles STOPPED: runtimes list it, nodes their parts, pools and models its
+      // availability.
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: orpc.runtimes.key() }),
+        queryClient.invalidateQueries({ queryKey: orpc.nodes.key() }),
+        queryClient.invalidateQueries({ queryKey: orpc.pools.key() }),
+        queryClient.invalidateQueries({ queryKey: orpc.models.key() }),
+      ]);
     },
   });
   return (
@@ -169,9 +171,10 @@ function StopEvidence({
   const instance = runtime.data?.instanceList.find((row) => row.id === instanceId);
   if (!instance)
     return (
-      <p className="text-sm text-muted-foreground">
-        {t("dashboard:runtime.markStopped.evidence.loadFailed")}
-      </p>
+      <InlineRetry
+        message={t("dashboard:runtime.markStopped.evidence.loadFailed")}
+        onRetry={() => runtime.refetch()}
+      />
     );
   const ranks = instance.ranks.filter(
     (rank) => nodeNumber === undefined || rank.nodeNumber === nodeNumber,
@@ -179,18 +182,16 @@ function StopEvidence({
   return (
     <section className="flex min-w-0 flex-col gap-2 rounded-lg border p-3 text-sm">
       <h3 className="font-medium">{t("dashboard:runtime.markStopped.evidence.title")}</h3>
-      <dl className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1">
-        {instance.phase === "STOPPING" ? (
-          <>
-            <dt className="text-muted-foreground">
-              {t("dashboard:runtime.markStopped.evidence.stopRequested")}
-            </dt>
-            <dd>
-              <TimeAgo value={instance.phaseChangedAt} />
-            </dd>
-          </>
-        ) : null}
-      </dl>
+      {instance.phase === "STOPPING" ? (
+        <dl className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1">
+          <dt className="text-muted-foreground">
+            {t("dashboard:runtime.markStopped.evidence.stopRequested")}
+          </dt>
+          <dd>
+            <TimeAgo value={instance.phaseChangedAt} />
+          </dd>
+        </dl>
+      ) : null}
       {ranks.map((rank) => (
         <RankEvidence key={rank.nodeNumber} rank={rank} />
       ))}

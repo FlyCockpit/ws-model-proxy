@@ -39,7 +39,14 @@ export function ConfirmAction({
   const { t } = useTranslation(["common"]);
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
-      <AlertDialogContent>
+      {/* Fields make it tall: keep it inside the viewport (and above a phone keyboard). */}
+      <AlertDialogContent
+        className={
+          children
+            ? "max-h-[calc(100dvh-2rem)] overflow-x-hidden overflow-y-auto overscroll-contain"
+            : undefined
+        }
+      >
         <AlertDialogHeader>
           <AlertDialogTitle>{title}</AlertDialogTitle>
           <AlertDialogDescription>{description}</AlertDialogDescription>
