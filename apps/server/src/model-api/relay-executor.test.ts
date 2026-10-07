@@ -307,3 +307,69 @@ describe("capacity lease loss is not a client cancellation", () => {
     expect(manager.sendRelayRequest).not.toHaveBeenCalled();
   });
 });
+
+// Production crash: the timeout settled an attempt nobody was awaiting, and the unobserved
+// `started` rejection ended the whole process.
+describe("an unobserved attempt failure never becomes an unhandled rejection", () => {
+  async function unhandledDuring(run: () => void): Promise<unknown[]> {
+    const seen: unknown[] = [];
+    const listener = (reason: unknown) => seen.push(reason);
+    process.on("unhandledRejection", listener);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      run();
+      // Node reports unhandled rejections once the microtask queue has drained.
+      for (let turn = 0; turn < 3; turn += 1) await new Promise((r) => setImmediate(r));
+    } finally {
+      vi.useRealTimers();
+      process.off("unhandledRejection", listener);
+    }
+    return seen;
+  }
+
+  it("times out with no listener on `started` without an unhandled rejection", async () => {
+    let attempt: ReturnType<typeof startRelayAttempt> | undefined;
+    const seen = await unhandledDuring(() => {
+      attempt = harness().attempt;
+      vi.advanceTimersByTime(30_000);
+    });
+    expect(seen).toEqual([]);
+    // A caller that does await it still sees the failure.
+    await expect(attempt?.started).rejects.toThrow("timeout");
+    await expect(attempt?.terminal).resolves.toMatchObject({ ok: false, failure: "timeout" });
+  });
+
+  it("refuses an attempt without a body before arming its timeout or abort listener", async () => {
+    const manager = {
+      registerRelayResponseHandlers: vi.fn(),
+      sendRelayRequest: vi.fn(),
+      cancelRelayRequest: vi.fn(),
+      completeRelayRequest: vi.fn(),
+    };
+    const controller = new AbortController();
+    const addListener = vi.spyOn(controller.signal, "addEventListener");
+    const seen = await unhandledDuring(() => {
+      expect(() =>
+        // @ts-expect-error -- the runtime guard behind the type: exactly one body is required.
+        startRelayAttempt({
+          manager,
+          nodeId: "cli-1",
+          handle: "neutral-upstream",
+          family: "generic",
+          method: "GET",
+          path: "/openapi.json",
+          headers: new Headers(),
+          timeoutMs: 10_000,
+          abortSignal: controller.signal,
+        }),
+      ).toThrow("exactly one request body");
+      expect(vi.getTimerCount()).toBe(0);
+      vi.advanceTimersByTime(10_000);
+    });
+    expect(seen).toEqual([]);
+    expect(addListener).not.toHaveBeenCalled();
+    expect(manager.registerRelayResponseHandlers).not.toHaveBeenCalled();
+    expect(manager.cancelRelayRequest).not.toHaveBeenCalled();
+    expect(manager.completeRelayRequest).not.toHaveBeenCalled();
+  });
+});
