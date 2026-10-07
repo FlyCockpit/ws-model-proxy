@@ -228,6 +228,7 @@ const GRAPH_WRITERS: Record<string, string> = {
   "packages/api/src/routers/users.ts": "user profile/ban fields (unfenced columns)",
   "packages/api/src/routers/auth.ts": "user profile fields (unfenced columns)",
   "packages/api/src/routers/settings.ts": "user settings (unfenced columns)",
+  "packages/auth/src/proved-email.ts": "user mailbox proof after verify-email (unfenced column)",
   "packages/db/src/capacity-lock-order.ts": "M: the user delete under owner fences",
   "apps/server/src/model-api/public-overflow.ts":
     "H status: the E0 send claim's credential lastUsedAt, after its owner fences and the credential row FOR UPDATE",
