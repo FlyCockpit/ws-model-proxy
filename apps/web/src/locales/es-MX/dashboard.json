@@ -1082,7 +1082,7 @@
       },
       "held": {
         "pill": "Recursos reservados hasta confirmar la detención",
-        "help": "Esta instancia está detenida, pero wsmp no ha confirmado que su proceso terminó, así que su puerto, memoria y GPU siguen reservados. Mientras el nodo esté en línea, wsmp vuelve a comprobarlo cada 5 minutos y los libera en cuanto una comprobación confirma la detención."
+        "help": "Se indicó a wsmp que este proceso se detuvo, pero aún no ha confirmado que terminó, así que su puerto, memoria y GPU siguen reservados. Mientras el nodo esté en línea, wsmp vuelve a comprobarlo cada 5 minutos y los libera en cuanto una comprobación confirma la detención."
       }
     },
     "nodeGone": "nodo eliminado",

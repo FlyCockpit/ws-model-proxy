@@ -1082,7 +1082,7 @@
       },
       "held": {
         "pill": "Resources held until the stop is confirmed",
-        "help": "This instance is stopped, but wsmp hasn't confirmed its process is gone, so its port, memory and GPUs stay reserved. While the node is online, wsmp checks again every 5 minutes and frees them as soon as a check confirms the stop."
+        "help": "wsmp was told this process stopped but hasn't confirmed it is gone, so its port, memory and GPUs stay reserved. While the node is online, wsmp checks again every 5 minutes and frees them as soon as a check confirms the stop."
       }
     },
     "nodeGone": "removed node",

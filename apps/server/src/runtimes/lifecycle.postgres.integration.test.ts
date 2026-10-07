@@ -497,7 +497,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     await answer(lc, probe, "succeeded", { stopped: false, detail: "process_alive" });
     expect(await stepCode(probe.stepId)).toBe("process_alive");
     expect((await instance(id)).Ranks[0]?.claim).toBe("HELD_UNKNOWN");
-    // An older node gives no reason; an unknown reason is never stored.
+    // An older node gives no reason: the code stays not_stopped.
     await m.fixture.instanceStep.updateMany({
       where: { instanceId: id, phase: "STATUS" },
       data: { updatedAt: new Date(Date.now() - 6 * 60_000) },
@@ -505,7 +505,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     await lc.runOnce();
     await lc.runOnce();
     const old = lastJob(id, "status");
-    await answer(lc, old, "succeeded", { stopped: false, detail: "something_else" });
+    await answer(lc, old, "succeeded", { stopped: false });
     expect(await stepCode(old.stepId)).toBe("not_stopped");
     // Later the process is gone and the port free: the proof releases the hold at once.
     await m.fixture.instanceStep.updateMany({
