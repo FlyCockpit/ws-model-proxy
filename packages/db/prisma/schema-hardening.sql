@@ -230,6 +230,20 @@ $node_hold_profile_owner$;
 DROP TRIGGER IF EXISTS node_hold_profile_owner ON node;
 CREATE TRIGGER node_hold_profile_owner BEFORE INSERT OR UPDATE OF "holdProfileId", "userId" ON node
 FOR EACH ROW EXECUTE FUNCTION enforce_node_hold_profile_owner();
+-- A node keeps its owner: everything that reaches a node (its credentials, commands, runtimes,
+-- instance ranks and steps) is checked against the owner it had when it was written.
+CREATE OR REPLACE FUNCTION enforce_node_owner_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $node_owner_immutable$
+BEGIN
+  IF NEW."userId" IS DISTINCT FROM OLD."userId" THEN
+    RAISE EXCEPTION 'a node keeps its owner' USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END;
+$node_owner_immutable$;
+DROP TRIGGER IF EXISTS node_owner_immutable ON node;
+CREATE TRIGGER node_owner_immutable BEFORE UPDATE OF "userId" ON node
+FOR EACH ROW EXECUTE FUNCTION enforce_node_owner_immutable();
 -- Temporary nodes: removed after 1 min .. 30 days offline (the sweeper deletes them like a
 -- manual delete).
 ALTER TABLE node DROP CONSTRAINT IF EXISTS node_temporary_shape;
@@ -611,6 +625,25 @@ DROP TRIGGER IF EXISTS runtime_instance_launch_version ON runtime_instance;
 CREATE TRIGGER runtime_instance_launch_version
 BEFORE INSERT OR UPDATE OF "versionId", "launchVersionId", "runtimeId", "userId", handle ON runtime_instance
 FOR EACH ROW EXECUTE FUNCTION enforce_runtime_instance_versions();
+-- The operation that last changed an instance (a start, a stop, a preemption, a profile apply)
+-- is its owner's: no operation of one user can start or stop another user's instance.
+CREATE OR REPLACE FUNCTION enforce_runtime_instance_operation_owner()
+RETURNS trigger LANGUAGE plpgsql AS $runtime_instance_operation_owner$
+BEGIN
+  IF NEW."operationId" IS NOT NULL
+     AND (TG_OP = 'INSERT' OR NEW."operationId" IS DISTINCT FROM OLD."operationId")
+     AND NOT EXISTS (
+       SELECT 1 FROM runtime_operation o WHERE o.id = NEW."operationId" AND o."userId" = NEW."userId"
+     ) THEN
+    RAISE EXCEPTION 'an instance is changed only by an operation of its owner' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$runtime_instance_operation_owner$;
+DROP TRIGGER IF EXISTS runtime_instance_operation_owner ON runtime_instance;
+CREATE TRIGGER runtime_instance_operation_owner
+BEFORE INSERT OR UPDATE OF "operationId", "userId" ON runtime_instance
+FOR EACH ROW EXECUTE FUNCTION enforce_runtime_instance_operation_owner();
 
 ALTER TABLE instance_rank DROP CONSTRAINT IF EXISTS instance_rank_bounds;
 ALTER TABLE instance_rank ADD CONSTRAINT instance_rank_bounds CHECK (
@@ -633,6 +666,30 @@ ALTER TABLE instance_rank ADD CONSTRAINT instance_rank_claim_shape CHECK (
 -- The held-unknown probe sweep pages these rows by id.
 CREATE INDEX IF NOT EXISTS instance_rank_held_unknown_id
   ON instance_rank (id) WHERE claim = 'HELD_UNKNOWN';
+-- A rank claims, and a step runs on, a node of the instance's owner only: the relay sends a
+-- step's job to its node, so this keeps one user's commands off another user's nodes. A step's
+-- node is checked when it is written (no foreign key: a deleted node leaves its steps).
+CREATE OR REPLACE FUNCTION enforce_instance_node_owner()
+RETURNS trigger LANGUAGE plpgsql AS $instance_node_owner$
+BEGIN
+  IF NEW."nodeId" IS NOT NULL
+     AND (TG_OP = 'INSERT' OR NEW."nodeId" IS DISTINCT FROM OLD."nodeId"
+          OR NEW."instanceId" IS DISTINCT FROM OLD."instanceId")
+     AND NOT EXISTS (
+       SELECT 1 FROM runtime_instance i JOIN node n ON n."userId" = i."userId"
+        WHERE i.id = NEW."instanceId" AND n.id = NEW."nodeId"
+     ) THEN
+    RAISE EXCEPTION 'an instance runs only on nodes of its owner' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$instance_node_owner$;
+DROP TRIGGER IF EXISTS instance_rank_node_owner ON instance_rank;
+CREATE TRIGGER instance_rank_node_owner BEFORE INSERT OR UPDATE OF "nodeId", "instanceId" ON instance_rank
+FOR EACH ROW EXECUTE FUNCTION enforce_instance_node_owner();
+DROP TRIGGER IF EXISTS instance_step_node_owner ON instance_step;
+CREATE TRIGGER instance_step_node_owner BEFORE INSERT OR UPDATE OF "nodeId", "instanceId" ON instance_step
+FOR EACH ROW EXECUTE FUNCTION enforce_instance_node_owner();
 
 ALTER TABLE instance_step DROP CONSTRAINT IF EXISTS instance_step_shape;
 ALTER TABLE instance_step ADD CONSTRAINT instance_step_shape CHECK (
