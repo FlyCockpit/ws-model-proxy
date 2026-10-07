@@ -246,20 +246,18 @@ describe("errors and output", () => {
     });
   });
 
-  it("keeps a procedure's own message on a BAD_REQUEST without issues (runtime_start on an always-on runtime)", async () => {
+  it("keeps a procedure's own message on a BAD_REQUEST without issues or reason", async () => {
     const result = await runMcpTool(tool("runtime_start"), {
       dispatch: testDispatch("FULL"),
       args: { runtimeId: "r", preview: true, count: 1 },
       invoke: async () => {
-        throw new ORPCError("BAD_REQUEST", { message: "An always-on runtime is not started." });
+        throw new ORPCError("BAD_REQUEST", { message: "That start was refused." });
       },
     });
-    expect(result.content).toEqual([
-      { type: "text", text: "An always-on runtime is not started." },
-    ]);
+    expect(result.content).toEqual([{ type: "text", text: "That start was refused." }]);
     expect(structured(result).error).toEqual({
       code: "BAD_REQUEST",
-      message: "An always-on runtime is not started.",
+      message: "That start was refused.",
     });
   });
 
