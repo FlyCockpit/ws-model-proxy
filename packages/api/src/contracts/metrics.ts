@@ -112,6 +112,32 @@ export const GROUP_BY_BY_SCOPE: Record<MetricScope, Record<MetricFamily, readonl
 export const METRIC_RANGES = ["1h", "24h", "7d", "30d"] as const;
 export const METRIC_STEPS = ["1m", "5m", "1h", "1d"] as const;
 const DAY_MS = 86_400_000;
+export const RANGE_MS: Record<(typeof METRIC_RANGES)[number], number> = {
+  "1h": 3_600_000,
+  "24h": DAY_MS,
+  "7d": 7 * DAY_MS,
+  "30d": 30 * DAY_MS,
+};
+export const STEP_MS: Record<(typeof METRIC_STEPS)[number], number> = {
+  "1m": 60_000,
+  "5m": 300_000,
+  "1h": 3_600_000,
+  "1d": DAY_MS,
+};
+/**
+ * Output bounds (MCP answers stay small): at most this many buckets per series, and buckets ×
+ * metrics per series. Grouped answers keep the largest groups that fit `METRICS_MAX_VALUES`.
+ */
+export const METRICS_MAX_POINTS = 720;
+export const METRICS_MAX_CELLS = 2_880;
+export const METRICS_MAX_VALUES = 8_000;
+export const METRICS_MAX_GROUPS = 10;
+
+/** Buckets a query spans: the first one starts at the range start rounded down to the step. */
+export function metricBuckets(fromMs: number, toMs: number, stepMs: number): number {
+  const start = Math.floor(fromMs / stepMs) * stepMs;
+  return Math.max(1, Math.ceil((toMs - start) / stepMs));
+}
 /**
  * How far back each family is kept, so a query never promises more than the tables hold:
  * request rollups 30 days per minute and 13 months per hour; engine load (per minute only) 8
@@ -165,14 +191,26 @@ export const metricsQueryInputSchema = z
           });
     const rangeMs =
       typeof input.range === "string"
-        ? { "1h": 3_600_000, "24h": DAY_MS, "7d": 7 * DAY_MS, "30d": 30 * DAY_MS }[input.range]
+        ? RANGE_MS[input.range]
         : Date.parse(input.range.to) - Date.parse(input.range.from);
     if (rangeMs <= 0) ctx.addIssue({ code: "custom", path: ["range"], message: "Empty range." });
+    const points = Math.ceil(rangeMs / STEP_MS[input.step]) + 1;
+    if (points > METRICS_MAX_POINTS || points * input.metrics.length > METRICS_MAX_CELLS)
+      ctx.addIssue({
+        code: "custom",
+        path: ["step"],
+        message: `Too many points: use a coarser step, a shorter range or fewer metrics (≤${METRICS_MAX_POINTS} buckets, ≤${METRICS_MAX_CELLS} buckets × metrics).`,
+      });
     const minuteStep = input.step === "1m" || input.step === "5m";
+    // How far back the range reaches: a custom range may start long ago and be short.
+    const reachMs =
+      typeof input.range === "string"
+        ? rangeMs
+        : Math.max(rangeMs, Date.now() - Date.parse(input.range.from));
     for (const metric of input.metrics) {
       const limit = RANGE_LIMIT_MS[metricFamily(metric)];
       const maxMs = minuteStep ? limit.minuteSteps : limit.any;
-      if (rangeMs > maxMs)
+      if (reachMs > maxMs)
         ctx.addIssue({
           code: "custom",
           path: ["range"],
@@ -181,19 +219,29 @@ export const metricsQueryInputSchema = z
     }
   });
 
-const metricValues = z.record(z.string(), z.number().nullable());
+/**
+ * Compact on purpose (MCP answers are read by agents): no input is echoed, a bucket with no data
+ * is left out (`at` lists the buckets that have some), a metric with no data is left out of
+ * `totals`, and only the largest groups are returned (`truncated`). A point's time is
+ * `start + at × step`. Units: ms (latency, ttft, queue wait), tokens/s, GB, percent (`*_pct`),
+ * fractions 0–1 (kv usage, ratios, shares).
+ */
 export const metricsQueryOutputSchema = z
   .object({
+    start: isoDateSchema,
     series: z.array(
       z
         .object({
-          /** Null when not grouped. */
-          group: z.object({ key: z.string(), label: z.string() }).strict().nullable(),
-          points: z.array(z.object({ t: isoDateSchema }).catchall(z.number().nullable())),
+          /** Absent when not grouped; `key` "" collects rows without one (e.g. cloud traffic). */
+          group: z.object({ key: z.string(), label: z.string().optional() }).strict().optional(),
+          at: z.array(z.number().int()),
+          /** One value per `at` entry; null where the metric has no data in that bucket. */
+          values: z.record(z.string(), z.array(z.number().nullable())),
         })
         .strict(),
     ),
-    totals: metricValues,
+    totals: z.record(z.string(), z.number()),
+    truncated: z.literal(true).optional(),
     histogramVersion: z.literal("v1"),
   })
   .strict();

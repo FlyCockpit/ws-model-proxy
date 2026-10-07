@@ -177,14 +177,13 @@ describe("routing to procedures", () => {
 });
 
 describe("through the bound router", () => {
-  it("an agent reaches the stub procedure and gets NOT_IMPLEMENTED", async () => {
-    // metrics.query is still a stub (lane B5); nodes.list is implemented now.
+  it("an agent reaches the procedure: a pool it cannot see is NOT_FOUND", async () => {
     const result = await runMcpTool(tool("metrics_query"), {
       dispatch: testDispatch("READ"),
       args: { metrics: ["ttft_p95"], range: "24h", step: "5m", scope: { pool: "p" } },
     });
     expect(result.isError).toBe(true);
-    expect(structured(result).error).toEqual({ code: "NOT_IMPLEMENTED" });
+    expect(structured(result).error).toMatchObject({ code: "NOT_FOUND" });
   });
 
   it("procedure input validation answers with paths only", async () => {

@@ -1,6 +1,6 @@
 /**
- * Activity (lane D): the request log, the command log and what waits for a person. Metrics and
- * the overview summary are still stubs (`metrics.query` reads the rollup tables; a later chunk).
+ * Activity (lane D): the request log, the command log, what waits for a person, and metrics over
+ * the rollup tables (`metrics.query`, lib/metrics-query.ts).
  *
  * The request log shows requests the caller made and requests to the caller's own pools and
  * runtimes (`resourceOwnerUserId`), prompt-free. Only the caller's own finished requests can be
@@ -10,11 +10,13 @@ import { ORPCError } from "@orpc/server";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { deleteTerminalRelayRequestsWithoutWaiting } from "@ws-model-proxy/db/capacity-lock-order";
 import type { z } from "zod";
-import { contractProcedure, stub } from "../contract-procedure";
+import { contractProcedure } from "../contract-procedure";
 import { activityContract as c, type requestRowSchema } from "../contracts/activity";
 import { callableIdOf } from "../lib/access-views";
 import { loadAgentNames } from "../lib/agent-names";
 import { programOfSubject } from "../lib/command-audit";
+import { runMetricsQuery } from "../lib/metrics-query";
+import { overviewSummary } from "../lib/overview-summary";
 
 type RequestRow = z.infer<typeof requestRowSchema>;
 
@@ -329,12 +331,16 @@ const needsYou = {
 
 export const activityRouter = {
   metrics: {
-    query: stub(c.metrics.query),
+    query: contractProcedure(c.metrics.query).handler(({ context, input }) =>
+      runMetricsQuery(context.session.user.id, input),
+    ),
   },
   requests,
   commands,
   overview: {
-    summary: stub(c.overview.summary),
+    summary: contractProcedure(c.overview.summary).handler(({ context, input }) =>
+      overviewSummary(context.session.user.id, input.range),
+    ),
   },
   needsYou,
 };

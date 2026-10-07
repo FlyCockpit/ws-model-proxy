@@ -154,6 +154,7 @@ export const activityContract = {
               cloudShare: z.number().nullable(),
             })
             .strict(),
+          /** The first 50 nodes by slug; `nodesTotal` counts them all. */
           nodes: z.array(
             z
               .object({
@@ -164,6 +165,8 @@ export const activityContract = {
               })
               .strict(),
           ),
+          nodesTotal: z.number().int(),
+          nodesOnline: z.number().int(),
           pools: z.array(
             z
               .object({

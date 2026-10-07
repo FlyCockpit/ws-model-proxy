@@ -35,6 +35,8 @@ function adminPageOf<T extends z.ZodType>(item: T) {
       total: z.number().int(),
       page: z.number().int(),
       pageSize: z.number().int(),
+      /** `total` is a lower bound (a capped count, or an owner query that matched too many). */
+      partial: z.literal(true).optional(),
     })
     .strict();
 }
@@ -265,7 +267,9 @@ export const adminObservabilityContract = {
           slug: z.string(),
           owner: ownerRefSchema,
           kind: z.enum(RUNTIME_KIND),
-          modelType: z.enum(MODEL_TYPE),
+          /** Null for a service runtime (no served model type). */
+          modelType: z.enum(MODEL_TYPE).nullable(),
+          /** Instances that are not stopped, newest first (at most 20). */
           instances: z.array(z.object({ id: idSchema, phase: z.enum(INSTANCE_PHASE) }).strict()),
         })
         .strict(),

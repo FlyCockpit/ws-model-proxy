@@ -22,7 +22,23 @@ export type NodeMetricsRollupSample = {
   memoryTotalMiB?: number | null;
   gpuTemperatureC?: number | null;
   gpuUtilizationPercent?: number | null;
+  /** Free VRAM summed over the GPUs that report both used and total. */
+  acceleratorFreeMiB?: number | null;
+  /** Node metric command values (`node.metrics.custom`), every label set a sample of its name. */
+  custom?: ReadonlyArray<{ name: string; value: number }>;
 };
+
+/** One custom metric's minute aggregate (the `custom` JSON column, one entry per name). */
+export type CustomMetricAggregate = { min: number; sum: number; max: number; samples: number };
+
+/**
+ * Names kept per node-minute: what one frame may carry (16 metric commands × 16 values) and the
+ * hardening CHECK allows.
+ */
+export const NODE_METRICS_CUSTOM_MAX_NAMES = 256;
+/** Larger magnitudes are dropped so sums stay finite (JSON has no Infinity). */
+const CUSTOM_MAX_ABS = 1e15;
+const CUSTOM_NAME = /^[A-Za-z0-9_.:-]{1,64}$/;
 
 export type NodeMetricsRollupIncrement = {
   bucketStart: Date;
@@ -42,6 +58,8 @@ export type NodeMetricsRollupIncrement = {
   maxMemoryUsedPercent: number | null;
   maxGpuTemperatureC: number | null;
   maxGpuUtilizationPercent: number | null;
+  minAcceleratorFreeMiB: number | null;
+  custom: Record<string, CustomMetricAggregate>;
 };
 
 export function truncateToMinute(value: Date): Date {
@@ -67,6 +85,30 @@ function maxOpt(current: number | null, next: number | null): number | null {
 function addOpt(current: number | null, next: number | null): number | null {
   if (next == null) return current;
   return (current ?? 0) + next;
+}
+
+function mergeCustom(
+  current: Record<string, CustomMetricAggregate>,
+  values: NodeMetricsRollupSample["custom"],
+): Record<string, CustomMetricAggregate> {
+  if (!values || values.length === 0) return current;
+  const next = { ...current };
+  for (const { name, value } of values) {
+    if (!CUSTOM_NAME.test(name) || !Number.isFinite(value) || Math.abs(value) > CUSTOM_MAX_ABS)
+      continue;
+    const entry = next[name];
+    if (entry) {
+      next[name] = {
+        min: Math.min(entry.min, value),
+        sum: entry.sum + value,
+        max: Math.max(entry.max, value),
+        samples: entry.samples + 1,
+      };
+    } else if (Object.keys(next).length < NODE_METRICS_CUSTOM_MAX_NAMES) {
+      next[name] = { min: value, sum: value, max: value, samples: 1 };
+    }
+  }
+  return next;
 }
 
 function memoryUsedPercent(available: number | null, total: number | null): number | null {
@@ -109,6 +151,8 @@ export function mergeNodeMetricsIncrements(
     maxMemoryUsedPercent: null,
     maxGpuTemperatureC: null,
     maxGpuUtilizationPercent: null,
+    minAcceleratorFreeMiB: null,
+    custom: {},
   };
   return {
     ...next,
@@ -126,6 +170,8 @@ export function mergeNodeMetricsIncrements(
     maxMemoryUsedPercent: maxOpt(next.maxMemoryUsedPercent, used),
     maxGpuTemperatureC: maxOpt(next.maxGpuTemperatureC, temp),
     maxGpuUtilizationPercent: maxOpt(next.maxGpuUtilizationPercent, util),
+    minAcceleratorFreeMiB: minOpt(next.minAcceleratorFreeMiB, finite(sample.acceleratorFreeMiB)),
+    custom: mergeCustom(next.custom, sample.custom),
   };
 }
 
@@ -135,6 +181,41 @@ export function incrementKeyString(increment: NodeMetricsRollupIncrement): strin
   );
 }
 
+/**
+ * The accelerator minimum, and the custom aggregates merged per name: min/max/sum/samples
+ * combine; names already stored win the 16-name cap over new ones.
+ */
+function mergeAcceleratorAndCustom(): Prisma.Sql {
+  return Prisma.sql`"minAcceleratorFreeMiB" = CASE
+        WHEN existing."minAcceleratorFreeMiB" IS NULL THEN EXCLUDED."minAcceleratorFreeMiB"
+        WHEN EXCLUDED."minAcceleratorFreeMiB" IS NULL THEN existing."minAcceleratorFreeMiB"
+        ELSE LEAST(existing."minAcceleratorFreeMiB", EXCLUDED."minAcceleratorFreeMiB") END,
+      custom = (
+        SELECT COALESCE(jsonb_object_agg(names.name, CASE
+          WHEN NOT (existing.custom ? names.name) THEN EXCLUDED.custom -> names.name
+          WHEN NOT (EXCLUDED.custom ? names.name) THEN existing.custom -> names.name
+          ELSE jsonb_build_object(
+            'min', LEAST((existing.custom -> names.name ->> 'min')::float8,
+                         (EXCLUDED.custom -> names.name ->> 'min')::float8),
+            'sum', (existing.custom -> names.name ->> 'sum')::float8
+                   + (EXCLUDED.custom -> names.name ->> 'sum')::float8,
+            'max', GREATEST((existing.custom -> names.name ->> 'max')::float8,
+                            (EXCLUDED.custom -> names.name ->> 'max')::float8),
+            'samples', (existing.custom -> names.name ->> 'samples')::bigint
+                       + (EXCLUDED.custom -> names.name ->> 'samples')::bigint) END), '{}'::jsonb)
+        FROM (
+          SELECT name FROM (
+            SELECT name, 0 AS rank FROM jsonb_object_keys(existing.custom) AS name
+            UNION ALL
+            SELECT name, 1 AS rank FROM jsonb_object_keys(EXCLUDED.custom) AS name
+              WHERE NOT (existing.custom ? name)
+          ) AS candidates
+          ORDER BY rank, name
+          LIMIT ${NODE_METRICS_CUSTOM_MAX_NAMES}
+        ) AS names
+      )`;
+}
+
 function upsertSql(increment: NodeMetricsRollupIncrement): Prisma.Sql {
   return Prisma.sql`
     INSERT INTO node_metrics_minute AS existing
@@ -142,7 +223,7 @@ function upsertSql(increment: NodeMetricsRollupIncrement): Prisma.Sql {
        "minCpuPercent", "sumCpuPercent", "maxCpuPercent", "memorySamples",
        "minMemoryAvailableMiB", "sumMemoryAvailableMiB", "maxMemoryAvailableMiB",
        "minMemoryUsedPercent", "sumMemoryUsedPercent", "maxMemoryUsedPercent",
-       "maxGpuTemperatureC", "maxGpuUtilizationPercent")
+       "maxGpuTemperatureC", "maxGpuUtilizationPercent", "minAcceleratorFreeMiB", custom)
     VALUES (${increment.bucketStart}, ${increment.ownerUserId}, ${increment.nodeId},
       ${increment.samples}, ${increment.cpuSamples},
       ${increment.minCpuPercent}, ${increment.sumCpuPercent}, ${increment.maxCpuPercent},
@@ -150,7 +231,8 @@ function upsertSql(increment: NodeMetricsRollupIncrement): Prisma.Sql {
       ${increment.sumMemoryAvailableMiB}, ${increment.maxMemoryAvailableMiB},
       ${increment.minMemoryUsedPercent}, ${increment.sumMemoryUsedPercent},
       ${increment.maxMemoryUsedPercent}, ${increment.maxGpuTemperatureC},
-      ${increment.maxGpuUtilizationPercent})
+      ${increment.maxGpuUtilizationPercent}, ${increment.minAcceleratorFreeMiB},
+      ${JSON.stringify(increment.custom)}::jsonb)
     ON CONFLICT ("bucketStart", "ownerUserId", "nodeId")
     DO UPDATE SET
       samples = existing.samples + EXCLUDED.samples,
@@ -193,6 +275,7 @@ function upsertSql(increment: NodeMetricsRollupIncrement): Prisma.Sql {
         WHEN existing."maxGpuUtilizationPercent" IS NULL THEN EXCLUDED."maxGpuUtilizationPercent"
         WHEN EXCLUDED."maxGpuUtilizationPercent" IS NULL THEN existing."maxGpuUtilizationPercent"
         ELSE GREATEST(existing."maxGpuUtilizationPercent", EXCLUDED."maxGpuUtilizationPercent") END,
+      ${mergeAcceleratorAndCustom()},
       "updatedAt" = now()`;
 }
 
@@ -204,7 +287,8 @@ function incrementValues(increment: NodeMetricsRollupIncrement): Prisma.Sql {
     ${increment.sumMemoryAvailableMiB}, ${increment.maxMemoryAvailableMiB},
     ${increment.minMemoryUsedPercent}, ${increment.sumMemoryUsedPercent},
     ${increment.maxMemoryUsedPercent}, ${increment.maxGpuTemperatureC},
-    ${increment.maxGpuUtilizationPercent})`;
+    ${increment.maxGpuUtilizationPercent}, ${increment.minAcceleratorFreeMiB},
+    ${JSON.stringify(increment.custom)}::jsonb)`;
 }
 
 function upsertManySql(increments: readonly NodeMetricsRollupIncrement[]): Prisma.Sql {
@@ -214,7 +298,7 @@ function upsertManySql(increments: readonly NodeMetricsRollupIncrement[]): Prism
        "minCpuPercent", "sumCpuPercent", "maxCpuPercent", "memorySamples",
        "minMemoryAvailableMiB", "sumMemoryAvailableMiB", "maxMemoryAvailableMiB",
        "minMemoryUsedPercent", "sumMemoryUsedPercent", "maxMemoryUsedPercent",
-       "maxGpuTemperatureC", "maxGpuUtilizationPercent")
+       "maxGpuTemperatureC", "maxGpuUtilizationPercent", "minAcceleratorFreeMiB", custom)
     VALUES ${Prisma.join(increments.map(incrementValues))}
     ON CONFLICT ("bucketStart", "ownerUserId", "nodeId")
     DO UPDATE SET
@@ -258,6 +342,7 @@ function upsertManySql(increments: readonly NodeMetricsRollupIncrement[]): Prism
         WHEN existing."maxGpuUtilizationPercent" IS NULL THEN EXCLUDED."maxGpuUtilizationPercent"
         WHEN EXCLUDED."maxGpuUtilizationPercent" IS NULL THEN existing."maxGpuUtilizationPercent"
         ELSE GREATEST(existing."maxGpuUtilizationPercent", EXCLUDED."maxGpuUtilizationPercent") END,
+      ${mergeAcceleratorAndCustom()},
       "updatedAt" = now()`;
 }
 

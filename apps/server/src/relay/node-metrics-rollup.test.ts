@@ -70,6 +70,47 @@ describe("node-metrics rollup merge", () => {
     expect(merged.sumCpuPercent).toBe(20);
   });
 
+  it("keeps the minimum free accelerator memory", () => {
+    const merged = mergeNodeMetricsIncrements(
+      mergeNodeMetricsIncrements(
+        mergeNodeMetricsIncrements(undefined, sample({ acceleratorFreeMiB: 9_000 })),
+        sample({ acceleratorFreeMiB: null }),
+      ),
+      sample({ acceleratorFreeMiB: 4_000 }),
+    );
+    expect(merged.minAcceleratorFreeMiB).toBe(4_000);
+  });
+
+  it("aggregates custom metric values per name, every label set a sample, up to 256 names", () => {
+    const first = mergeNodeMetricsIncrements(
+      undefined,
+      sample({
+        custom: [
+          { name: "gpu_power", value: 100 },
+          { name: "gpu_power", value: 300 },
+          { name: "bad name", value: 1 },
+          { name: "queue", value: Number.NaN },
+          { name: "huge", value: 1e300 },
+        ],
+      }),
+    );
+    expect(first.custom).toEqual({ gpu_power: { min: 100, sum: 400, max: 300, samples: 2 } });
+    const second = mergeNodeMetricsIncrements(
+      first,
+      sample({ custom: [{ name: "gpu_power", value: 50 }] }),
+    );
+    expect(second.custom.gpu_power).toEqual({ min: 50, sum: 450, max: 300, samples: 3 });
+    const many = mergeNodeMetricsIncrements(
+      undefined,
+      sample({
+        custom: Array.from({ length: 300 }, (_, index) => ({ name: `m${index}`, value: 1 })),
+      }),
+    );
+    expect(Object.keys(many.custom)).toHaveLength(256);
+    // The first merge's object is not mutated by later samples.
+    expect(first.custom.gpu_power?.samples).toBe(2);
+  });
+
   it("sorts upserts by a stable key", () => {
     const left = mergeNodeMetricsIncrements(undefined, sample({ nodeId: "a" }));
     const right = mergeNodeMetricsIncrements(undefined, sample({ nodeId: "b" }));

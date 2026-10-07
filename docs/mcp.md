@@ -122,6 +122,21 @@ recorded as `name`. `map` names up to 16 metrics, each `{ series, labels?,
 aggregate?, scale?, divideBy? }`, where `series` is a Prometheus series name or
 a JSON pointer.
 
+### Metrics
+
+`metrics_query` reads the minute and hour rollups, never the request log.
+The answer is `{ start, series: [{ group?, at, values }], totals, truncated? }`:
+a point's time is `start + at × step`, buckets with no data are left out, and a
+metric with no data is left out of `totals`. Values are ms (latency, TTFT,
+queue wait), tokens/s, GB, percent (`*_pct`) or fractions 0–1 (KV usage,
+`full_ratio`, `cache_hit_rate`, `cloud_share`). At most 720 buckets and 2,880
+buckets × metrics per query; a grouped answer keeps the largest groups that fit
+(at most 10) and says `truncated`. Group key `""` collects rows without one
+(cloud traffic has no node). Engine load and node gauges are kept 8 and 7 days;
+`custom:<name>` reads node metric command values (average per bucket). A pool
+shared with you answers request metrics of your own requests only, ungrouped or
+by `source`.
+
 ### Node files
 
 `node_file_read` reads, stats, lists or searches under the folders the node

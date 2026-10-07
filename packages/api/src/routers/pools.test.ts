@@ -117,7 +117,7 @@ beforeEach(() => {
   fenceLog.held.length = 0;
   fenceLog.deletes.length = 0;
   db.$transaction.mockImplementation(((work: (tx: PrismaClient) => unknown) => work(db)) as never);
-  db.usageRollupHour.findMany.mockResolvedValue([]);
+  db.$queryRaw.mockResolvedValue([] as never);
   db.executionTarget.findMany.mockResolvedValue([]);
   db.runtimeModel.findMany.mockResolvedValue([]);
 });

@@ -46,6 +46,7 @@ vi.mock("./node-metrics-rollup.js", () => ({ observeNodeMetricsRollup: vi.fn() }
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { RelaySessionManager } = await import("./session-manager.js");
 const { observeRuntimeLoadRollup } = await import("./runtime-load-rollup.js");
+const { observeNodeMetricsRollup } = await import("./node-metrics-rollup.js");
 
 const db = prisma as unknown as {
   $transaction: MockInstance;
@@ -529,11 +530,94 @@ describe("RelaySessionManager (relay 3.0)", () => {
     const second = await connect();
     await manager.handleTextFrame(second, load);
     expect(observeRuntimeLoadRollup).toHaveBeenCalledWith(
-      expect.objectContaining({ instanceId: "inst-2", nodeId: "node-1", running: 1 }),
+      expect.objectContaining({ instanceId: "inst-2", nodeId: "node-1", running: 1, full: false }),
     );
     expect(manager.getLiveNodeTelemetry(["node-1"]).get("node-1")?.runtimeLoad).toEqual([
       expect.objectContaining({ endpointSlug: "llama", instanceId: "inst-2" }),
     ]);
+  });
+
+  it("marks a runtime.load sample FULL for the history as the live verdict judges its engine", async () => {
+    db.runtimeInstance.findFirst.mockResolvedValue({
+      id: "inst-3",
+      runtimeId: "rt-1",
+      versionId: "v-1",
+      engineSlots: null,
+      loadSignals: [],
+      Version: { engine: "VLLM", kvFullThreshold: null },
+    });
+    const socket = await connect();
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({
+        type: "runtime.load",
+        handle: "vllm",
+        running: 4,
+        waiting: 0,
+        kvUsage: 0.97,
+        counterEpoch: 0,
+        source: "builtin",
+        ts: new Date().toISOString(),
+      }),
+    );
+    expect(observeRuntimeLoadRollup).toHaveBeenCalledWith(
+      expect.objectContaining({ instanceId: "inst-3", full: true }),
+    );
+    // llama.cpp: KV is not its signal; busy slots are.
+    db.runtimeInstance.findFirst.mockResolvedValue({
+      id: "inst-4",
+      runtimeId: "rt-2",
+      versionId: "v-2",
+      engineSlots: 4,
+      loadSignals: [],
+      Version: { engine: "LLAMA_CPP", kvFullThreshold: null },
+    });
+    const frame = (handle: string, slotsBusy: number) =>
+      JSON.stringify({
+        type: "runtime.load",
+        handle,
+        running: 4,
+        waiting: 0,
+        kvUsage: 0.99,
+        slotsBusy,
+        counterEpoch: 0,
+        source: "builtin",
+        ts: new Date().toISOString(),
+      });
+    await manager.handleTextFrame(socket, frame("llama-a", 2));
+    expect(observeRuntimeLoadRollup).toHaveBeenLastCalledWith(
+      expect.objectContaining({ instanceId: "inst-4", full: false }),
+    );
+    await manager.handleTextFrame(socket, frame("llama-b", 4));
+    expect(observeRuntimeLoadRollup).toHaveBeenLastCalledWith(
+      expect.objectContaining({ instanceId: "inst-4", full: true }),
+    );
+  });
+
+  it("rolls up free VRAM and the node metric command values of node.metrics", async () => {
+    const socket = await connect();
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({
+        type: "node.metrics",
+        ts: new Date().toISOString(),
+        gpus: [
+          { index: 0, vramUsedMiB: 1_000, vramTotalMiB: 24_000 },
+          { index: 1, vramUsedMiB: 4_000, vramTotalMiB: 24_000 },
+          { index: 2, vramUsedMiB: null, vramTotalMiB: 24_000 },
+        ],
+        custom: [
+          { name: "gpu_power", labels: { gpu: "0" }, value: 210, ts: new Date().toISOString() },
+        ],
+      }),
+    );
+    expect(observeNodeMetricsRollup).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nodeId: "node-1",
+        acceleratorFreeMiB: 43_000,
+        custom: [expect.objectContaining({ name: "gpu_power", value: 210 })],
+      }),
+    );
   });
 
   it("persists the disconnect fenced by the session's generation", async () => {

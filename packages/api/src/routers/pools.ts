@@ -9,10 +9,10 @@ import { poolsContract as c, type routingRulesSchema } from "../contracts/pools"
 import { type CallerActor, callerActor } from "../lib/caller-actor";
 import { cloudEgressEnabled } from "../lib/cloud-egress";
 import { graphDelete, graphWrite, modelTargetFences, poolTargetFences } from "../lib/graph-write";
+import { poolTraffic } from "../lib/overview-summary";
 import { invalidatePoolRouting } from "../lib/pool-routing-invalidation";
 import {
   callableIdsFor,
-  EMPTY_TRAFFIC,
   MEMBER_INCLUDE,
   memberView,
   POOL_INCLUDE,
@@ -47,34 +47,8 @@ function userIdOf(context: SignedInContext): string {
 }
 
 /** Hourly request counts of the last 24 h (agent tests excluded), from the usage rollup. */
-async function trafficOf(ownerId: string, poolIds: string[]): Promise<Map<string, Traffic>> {
-  const result = new Map<string, Traffic>();
-  if (poolIds.length === 0) return result;
-  const hour = 3_600_000;
-  const start = new Date(Math.floor(Date.now() / hour) * hour - 23 * hour);
-  const rows = await prisma.usageRollupHour.findMany({
-    where: {
-      ownerUserId: ownerId,
-      poolId: { in: poolIds },
-      bucketStart: { gte: start },
-      source: { not: "AGENT_TEST" },
-    },
-    select: { poolId: true, bucketStart: true, requests: true, errors: true },
-  });
-  for (const row of rows) {
-    const traffic = result.get(row.poolId) ?? {
-      requests: 0,
-      errors: 0,
-      sparkline: [...EMPTY_TRAFFIC.sparkline],
-    };
-    const index = Math.floor((row.bucketStart.getTime() - start.getTime()) / hour);
-    if (index >= 0 && index < 24)
-      traffic.sparkline[index] = (traffic.sparkline[index] ?? 0) + row.requests;
-    traffic.requests += row.requests;
-    traffic.errors += row.errors;
-    result.set(row.poolId, traffic);
-  }
-  return result;
+function trafficOf(ownerId: string, poolIds: string[]): Promise<Map<string, Traffic>> {
+  return poolTraffic(ownerId, poolIds, "24h");
 }
 
 async function ownedPoolRow(userId: string, poolId: string): Promise<PoolRow> {
