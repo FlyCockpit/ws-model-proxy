@@ -1134,7 +1134,7 @@ describe("runtimes.fork (create-shaped output)", () => {
   });
 });
 
-describe("runtimes.instances.forget", () => {
+describe("runtimes.instances.markStopped", () => {
   const stopping = (
     claims: Array<"HELD" | "HELD_UNKNOWN" | "RELEASED">,
     phase = "STOPPING",
@@ -1150,36 +1150,41 @@ describe("runtimes.instances.forget", () => {
     })),
   });
 
-  it("refuses an agent without confirm FORGET, a cookie without CSRF, and a Relay-only node", async () => {
+  it("refuses an agent without confirm MARK_STOPPED, a cookie without CSRF, and a Relay-only node", async () => {
     for (const auth of [CALLERS.fullAgent(), CALLERS.oauthAgent(), CALLERS.cookieWithoutCsrf()])
-      expect(await reasonOf(client(auth).instances.forget({ instanceId: "inst-1" }))).toBeDefined();
+      expect(
+        await reasonOf(client(auth).instances.markStopped({ instanceId: "inst-1" })),
+      ).toBeDefined();
     db.runtimeInstance.findFirst.mockResolvedValueOnce(
       stopping(["HELD"], "STOPPING", "RELAY") as never,
     );
     expect(
       await reasonOf(
-        client(CALLERS.fullAgent()).instances.forget({ instanceId: "inst-1", confirm: "FORGET" }),
+        client(CALLERS.fullAgent()).instances.markStopped({
+          instanceId: "inst-1",
+          confirm: "MARK_STOPPED",
+        }),
       ),
     ).toBe("trust_relay");
     expect(db.instanceRank.updateMany).not.toHaveBeenCalled();
     expect(db.nodeAuditEvent.create).not.toHaveBeenCalled();
   });
 
-  it("lets a Full agent forget on a Full-control node, audited with its token", async () => {
+  it("lets a Full agent mark stopped on a Full-control node, audited with its token", async () => {
     db.runtimeInstance.findFirst.mockResolvedValueOnce(stopping(["HELD"]) as never);
     db.runtimeOperation.create.mockResolvedValueOnce({ id: "op-f" } as never);
     db.runtimeInstance.findFirst.mockResolvedValueOnce(null);
     expect(
       await reasonOf(
-        client(CALLERS.fullAgent()).instances.forget({
+        client(CALLERS.fullAgent()).instances.markStopped({
           instanceId: "inst-1",
-          confirm: "FORGET",
+          confirm: "MARK_STOPPED",
           note: "process already gone",
         }),
       ),
     ).toBe("NOT_FOUND");
     expect(db.runtimeOperation.create.mock.calls[0]?.[0]?.data).toMatchObject({
-      kind: "FORGET",
+      kind: "MARK_STOPPED",
       actor: "AGENT",
     });
     expect(db.instanceRank.updateMany).toHaveBeenCalledWith({
@@ -1189,7 +1194,7 @@ describe("runtimes.instances.forget", () => {
     expect(db.nodeAuditEvent.create.mock.calls[0]?.[0]?.data).toMatchObject({
       nodeId: "node-0",
       actor: "AGENT",
-      kind: "claim_forget",
+      kind: "marked_stopped",
       subject: "instance:inst-1 rank:0",
       outcome: "completed",
       reason: "process already gone",
@@ -1198,29 +1203,35 @@ describe("runtimes.instances.forget", () => {
 
   it("refuses what is not the caller's, not stopping, or has no unproven stop", async () => {
     db.runtimeInstance.findFirst.mockResolvedValueOnce(null);
-    expect(await reasonOf(client().instances.forget({ instanceId: "inst-1" }))).toBe("NOT_FOUND");
+    expect(await reasonOf(client().instances.markStopped({ instanceId: "inst-1" }))).toBe(
+      "NOT_FOUND",
+    );
     db.runtimeInstance.findFirst.mockResolvedValueOnce(stopping(["HELD"], "READY") as never);
-    expect(await reasonOf(client().instances.forget({ instanceId: "inst-1" }))).toBe("CONFLICT");
-    db.runtimeInstance.findFirst.mockResolvedValueOnce(stopping(["RELEASED"]) as never);
-    expect(await reasonOf(client().instances.forget({ instanceId: "inst-1" }))).toBe("CONFLICT");
-    db.runtimeInstance.findFirst.mockResolvedValueOnce(stopping(["HELD", "RELEASED"]) as never);
-    expect(await reasonOf(client().instances.forget({ instanceId: "inst-1", nodeNumber: 2 }))).toBe(
+    expect(await reasonOf(client().instances.markStopped({ instanceId: "inst-1" }))).toBe(
       "CONFLICT",
     );
+    db.runtimeInstance.findFirst.mockResolvedValueOnce(stopping(["RELEASED"]) as never);
+    expect(await reasonOf(client().instances.markStopped({ instanceId: "inst-1" }))).toBe(
+      "CONFLICT",
+    );
+    db.runtimeInstance.findFirst.mockResolvedValueOnce(stopping(["HELD", "RELEASED"]) as never);
+    expect(
+      await reasonOf(client().instances.markStopped({ instanceId: "inst-1", nodeNumber: 2 })),
+    ).toBe("CONFLICT");
     expect(db.instanceRank.updateMany).not.toHaveBeenCalled();
   });
 
-  it("forgets the held ranks under the owner and capacity fences, audited as FORGET", async () => {
+  it("marks the held ranks stopped under the owner and capacity fences, audited as MARK_STOPPED", async () => {
     db.runtimeInstance.findFirst.mockResolvedValueOnce(stopping(["HELD", "HELD"]) as never);
     db.runtimeOperation.create.mockResolvedValueOnce({ id: "op-f" } as never);
     db.runtimeInstance.findFirst.mockResolvedValueOnce(null);
     // The view read after the commit: gone meanwhile is NOT_FOUND, never a 500.
-    expect(await reasonOf(client().instances.forget({ instanceId: "inst-1", nodeNumber: 2 }))).toBe(
-      "NOT_FOUND",
-    );
+    expect(
+      await reasonOf(client().instances.markStopped({ instanceId: "inst-1", nodeNumber: 2 })),
+    ).toBe("NOT_FOUND");
     expect(fenceLog.held).toEqual(expect.arrayContaining([expect.stringContaining("inst-1")]));
     expect(db.runtimeOperation.create.mock.calls[0]?.[0]?.data).toMatchObject({
-      kind: "FORGET",
+      kind: "MARK_STOPPED",
       actor: "USER",
       agentTokenId: null,
       mcpGrantId: null,
@@ -1228,9 +1239,9 @@ describe("runtimes.instances.forget", () => {
     });
     expect(db.instanceRank.updateMany).toHaveBeenCalledWith({
       where: { id: { in: ["rank-1"] }, claim: "HELD" },
-      data: expect.objectContaining({ claim: "HELD_UNKNOWN", forgottenBy: OWNER }),
+      data: expect.objectContaining({ claim: "HELD_UNKNOWN", markedStoppedBy: OWNER }),
     });
-    // Only never-sent stops of the forgotten rank are dropped.
+    // Only never-sent stops of the rank marked stopped are dropped.
     expect(db.instanceStep.updateMany).toHaveBeenCalledWith({
       where: {
         instanceId: "inst-1",

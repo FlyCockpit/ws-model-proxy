@@ -21,6 +21,7 @@ import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
 import { InlineRetry } from "@/components/inline-retry";
+import { MarkStoppedAction, StopNotConfirmedHelp } from "@/components/runtimes/mark-stopped";
 import { TimeAgo } from "@/components/time-ago";
 import { orpc } from "@/utils/orpc";
 
@@ -231,7 +232,22 @@ export function RunsHereCard({ node, lang }: { node: NodeDetail; lang: string })
                     })}
                   </span>
                 ) : null}
-                {instance.needsOperator ? (
+                {instance.needsOperator === "MARK_STOPPED" ? (
+                  <>
+                    <StatusPill tone="warning">
+                      {t("dashboard:runtime.needsOperator.MARK_STOPPED")}
+                    </StatusPill>
+                    <StopNotConfirmedHelp />
+                    {/* Only this node's part, and only while it still waits for its stop. */}
+                    {instance.reserved === "HELD" ? (
+                      <MarkStoppedAction
+                        runtimeId={instance.runtimeId}
+                        instanceId={instance.instanceId}
+                        nodeNumber={instance.nodeNumber}
+                      />
+                    ) : null}
+                  </>
+                ) : instance.needsOperator ? (
                   <StatusPill tone="warning">{t("dashboard:nodes.runs.needsYou")}</StatusPill>
                 ) : null}
               </li>

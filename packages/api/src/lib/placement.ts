@@ -97,7 +97,7 @@ export type PlacementRank = {
   distPort: number | null;
   /** The rank's `resources` JSON (`runtimeResourceSchema`); anything else claims nothing. */
   resources: unknown;
-  /** HELD_UNKNOWN (forgotten) claims stay counted: no stop releases them. */
+  /** HELD_UNKNOWN (marked stopped) claims stay counted: no stop releases them. */
   claim: "HELD" | "HELD_UNKNOWN";
 };
 

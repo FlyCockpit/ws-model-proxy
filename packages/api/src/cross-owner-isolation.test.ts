@@ -484,7 +484,7 @@ const CASES: ReadonlyArray<[string, unknown]> = [
   ["runtimes.start", { runtimeId: "rt-b", instanceId: "inst-a" }],
   ["runtimes.stop", { instanceId: "inst-a" }],
   ["runtimes.stop", { runtimeId: "rt-a", nodeId: "node-a" }],
-  ["runtimes.instances.forget", { instanceId: "inst-a" }],
+  ["runtimes.instances.markStopped", { instanceId: "inst-a" }],
   ["runtimes.steps.attach", { stepId: "step-a", cols: 80, rows: 24 }],
   ["runtimes.steps.reopen", { stepId: "step-a" }],
   ["runtimes.steps.cancel", { stepId: "step-a" }],

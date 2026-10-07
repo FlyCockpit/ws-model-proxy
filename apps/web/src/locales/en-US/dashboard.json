@@ -487,7 +487,7 @@
         "metric_commands_define": "metric commands sent",
         "node_update": "settings changed",
         "trust_lower": "trust lowered",
-        "claim_forget": "stop forgotten"
+        "marked_stopped": "marked as stopped"
       },
       "outcome": {
         "completed": "done",
@@ -1044,7 +1044,34 @@
     "needsOperator": {
       "STEP": "A step waits for you",
       "RESTART": "Restart needed",
-      "FORGET": "Stop unproven"
+      "MARK_STOPPED": "Stop not confirmed"
+    },
+    "markStopped": {
+      "action": "Mark as stopped…",
+      "title": "Mark as stopped?",
+      "description": "wsmp couldn't confirm that this process stopped. Marking it stopped tells wsmp to stop waiting for it; nothing is run on the node to do it. Its port, memory and GPUs stay reserved until wsmp confirms the process is gone or the instance starts again (wsmp restarts an instance that should keep running). Do this only if you've checked on the node that the process is gone.",
+      "confirm": "Mark as stopped",
+      "pending": "Marking…",
+      "done": "Marked as stopped.",
+      "noteLabel": "Note (optional)",
+      "notePlaceholder": "What you checked on the node",
+      "noteTooLong": "Keep the note to 500 characters.",
+      "help": "wsmp asked the node to stop this process but couldn't confirm it is gone, so its port, memory and GPUs stay reserved. While the node is online, wsmp checks again every 5 minutes. If you've checked on the node that the process is gone, use Mark as stopped.",
+      "evidence": {
+        "title": "What wsmp knows",
+        "stopRequested": "Stop requested",
+        "node": "Node {{node}}",
+        "online": "Online since",
+        "offline": "Offline since",
+        "onlineNoTime": "Online",
+        "offlineNoTime": "Offline",
+        "removed": "Removed from wsmp",
+        "lastCheck": "Last automatic check",
+        "checkNone": "None yet",
+        "checkNotProven": "Couldn't confirm the stop",
+        "checkProven": "Confirmed stopped",
+        "loadFailed": "Couldn't load what wsmp knows about this stop."
+      }
     },
     "nodeGone": "removed node",
     "start": "Start",
@@ -1346,7 +1373,7 @@
       "need": {
         "STEP": "Step",
         "RESTART": "Restart",
-        "FORGET": "Forget"
+        "MARK_STOPPED": "Mark as stopped"
       }
     },
     "kpi": {

@@ -153,7 +153,7 @@ describe("routing to procedures", () => {
     ).toBe("nodes.secrets.set");
   });
 
-  it("runtime_stop stops, or with forget forgets an unprovable stop (confirm FORGET)", () => {
+  it("runtime_stop stops, or with markStopped marks an unprovable stop stopped (confirm MARK_STOPPED)", () => {
     expect(routeToolCall("runtime_stop", { runtimeId: "r", nodeId: "n" })).toEqual([
       { path: "runtimes.stop", input: { runtimeId: "r", nodeId: "n" } },
     ]);
@@ -163,20 +163,22 @@ describe("routing to procedures", () => {
     expect(
       routeToolCall("runtime_stop", {
         instanceId: "i",
-        forget: true,
-        confirm: "FORGET",
+        markStopped: true,
+        confirm: "MARK_STOPPED",
         note: "gone",
       }),
     ).toEqual([
       {
-        path: "runtimes.instances.forget",
-        input: { instanceId: "i", confirm: "FORGET", note: "gone" },
+        path: "runtimes.instances.markStopped",
+        input: { instanceId: "i", confirm: "MARK_STOPPED", note: "gone" },
       },
     ]);
     const stop = tool("runtime_stop").input;
-    expect(stop.safeParse({ instanceId: "i", forget: true }).success).toBe(false);
-    expect(stop.safeParse({ runtimeId: "r", forget: true, confirm: "FORGET" }).success).toBe(false);
-    expect(stop.safeParse({ instanceId: "i", confirm: "FORGET" }).success).toBe(false);
+    expect(stop.safeParse({ instanceId: "i", markStopped: true }).success).toBe(false);
+    expect(
+      stop.safeParse({ runtimeId: "r", markStopped: true, confirm: "MARK_STOPPED" }).success,
+    ).toBe(false);
+    expect(stop.safeParse({ instanceId: "i", confirm: "MARK_STOPPED" }).success).toBe(false);
     expect(stop.safeParse({ instanceId: "i", runtimeId: "r" }).success).toBe(false);
   });
 

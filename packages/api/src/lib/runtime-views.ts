@@ -23,6 +23,7 @@ import {
 } from "./request-compat";
 import { type RuntimeSpec, runtimeSpecSchema } from "./runtime-spec";
 import { type StepIntent, stepIntentSchema, stepJobPlaceholders } from "./step-intent";
+import { nodeConnectionView, type StopCheck, stopCheckKey } from "./stop-evidence";
 
 export const VERSION_SELECT = {
   id: true,
@@ -48,7 +49,20 @@ export const VERSION_SELECT = {
 export type VersionRow = Prisma.RuntimeVersionGetPayload<{ select: typeof VERSION_SELECT }>;
 
 export const INSTANCE_INCLUDE = {
-  Ranks: { include: { Node: { select: { slug: true } } }, orderBy: { rank: "asc" } },
+  Ranks: {
+    include: {
+      Node: {
+        select: {
+          slug: true,
+          connection: true,
+          lastConnectedAt: true,
+          lastDisconnectedAt: true,
+          lastHeartbeatAt: true,
+        },
+      },
+    },
+    orderBy: { rank: "asc" },
+  },
   Steps: {
     where: { state: { in: ["PENDING", "RUNNING", "AWAITING_OPERATOR"] } },
     orderBy: { createdAt: "asc" },
@@ -360,7 +374,14 @@ function safeSpec(value: unknown): RuntimeSpec | null {
   return parsed.success ? parsed.data : null;
 }
 
-export function instanceView(row: InstanceRow): InstanceView {
+/**
+ * `stopChecks` (`latestStopChecks`): the last finished status probe per rank of STOPPING
+ * instances, for callers that show why a stop is not confirmed; others pass none and report null.
+ */
+export function instanceView(
+  row: InstanceRow,
+  stopChecks: ReadonlyMap<string, StopCheck> = new Map(),
+): InstanceView {
   const advanced = advancedView(row.Version.advanced);
   const context = stepViewContext(row);
   return {
@@ -389,6 +410,9 @@ export function instanceView(row: InstanceRow): InstanceView {
       port: rank.port,
       reserved: rank.claim,
       unitName: rank.unitName,
+      nodeConnection: nodeConnectionView(rank.Node),
+      lastStopCheck:
+        row.phase === "STOPPING" ? (stopChecks.get(stopCheckKey(row.id, rank.rank)) ?? null) : null,
     })),
     openSteps: row.Steps.map((step) => stepView(step, context)),
     // TODO(lane A, hot path): live load comes from the relay's in-memory engine-load cache.

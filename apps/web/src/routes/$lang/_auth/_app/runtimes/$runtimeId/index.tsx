@@ -19,6 +19,7 @@ import { useTranslation } from "react-i18next";
 import { CopyableCode } from "@/components/copy-button";
 import { InlineRetry } from "@/components/inline-retry";
 import { NativeSelect } from "@/components/native-select";
+import { MarkStoppedAction, StopNotConfirmedHelp } from "@/components/runtimes/mark-stopped";
 import { type PillTone, StatusPill } from "@/components/status-pill";
 import { refusalText } from "@/lib/refusal-text";
 import { slugify } from "@/lib/slugify";
@@ -307,6 +308,7 @@ function InstancesCard({ runtime }: { runtime: RuntimeDetail }) {
                         {t(`dashboard:runtime.needsOperator.${instance.needsOperator}`)}
                       </StatusPill>
                     ) : null}
+                    {instance.needsOperator === "MARK_STOPPED" ? <StopNotConfirmedHelp /> : null}
                   </p>
                   {instance.needsOperator === "STEP" ? (
                     <Link
@@ -326,6 +328,9 @@ function InstancesCard({ runtime }: { runtime: RuntimeDetail }) {
                     {instance.phaseReason ? ` · ${instance.phaseReason}` : ""}
                   </p>
                 </div>
+                {instance.needsOperator === "MARK_STOPPED" ? (
+                  <MarkStoppedAction runtimeId={runtime.id} instanceId={instance.id} />
+                ) : null}
                 {startable && instance.desiredState === "RUNNING" ? (
                   <Button
                     variant="outline"
