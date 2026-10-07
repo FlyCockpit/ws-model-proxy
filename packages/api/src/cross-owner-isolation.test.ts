@@ -543,6 +543,25 @@ const CASES: ReadonlyArray<[string, unknown]> = [
     "activity.metrics.query",
     { scope: { instance: "inst-a" }, metrics: ["requests"], range: "1h", step: "1m" },
   ],
+  [
+    "activity.metrics.query",
+    {
+      scope: { pool: "pool-a" },
+      metrics: ["requests", "kv_usage_max", "cpu_pct"],
+      range: "1h",
+      step: "1m",
+      groupBy: "node",
+    },
+  ],
+  [
+    "activity.metrics.query",
+    {
+      scope: { node: "node-a" },
+      metrics: ["custom:gpu_power", "full_ratio"],
+      range: "24h",
+      step: "5m",
+    },
+  ],
   ["activity.requests.list", { runtimeId: "rt-a" }],
   ["activity.requests.list", { nodeId: "node-a" }],
   ["activity.requests.list", { versionId: "ver-a" }],
@@ -790,7 +809,7 @@ const REFUSAL_CODES = new Set([
 ]);
 
 /** Procedures that are stubs in 0.4.0 (they answer NOT_IMPLEMENTED and touch nothing). */
-const STUBS = new Set(["activity.metrics.query"]);
+const STUBS = new Set<string>();
 const KIND = new Map(PROCEDURES.map(([path, procedure]) => [path, procedure.kind]));
 /** What any row of A's carries (`victimRow`): an answer must not contain it. */
 const VICTIM_DATA = /user-a|row-a|a-box|rank-a/;

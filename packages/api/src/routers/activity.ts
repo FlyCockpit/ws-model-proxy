@@ -1,6 +1,6 @@
 /**
- * Activity (lane D): the request log, the command log and what waits for a person. Metrics and
- * the overview summary are still stubs (`metrics.query` reads the rollup tables; a later chunk).
+ * Activity (lane D): the request log, the command log, what waits for a person, and metrics over
+ * the rollup tables (`metrics.query`, lib/metrics-query.ts).
  *
  * The request log shows requests the caller made and requests to the caller's own pools and
  * runtimes (`resourceOwnerUserId`), prompt-free. Only the caller's own finished requests can be
@@ -15,6 +15,7 @@ import { activityContract as c, type requestRowSchema } from "../contracts/activ
 import { callableIdOf } from "../lib/access-views";
 import { loadAgentNames } from "../lib/agent-names";
 import { programOfSubject } from "../lib/command-audit";
+import { runMetricsQuery } from "../lib/metrics-query";
 
 type RequestRow = z.infer<typeof requestRowSchema>;
 
@@ -329,7 +330,9 @@ const needsYou = {
 
 export const activityRouter = {
   metrics: {
-    query: stub(c.metrics.query),
+    query: contractProcedure(c.metrics.query).handler(({ context, input }) =>
+      runMetricsQuery(context.session.user.id, input),
+    ),
   },
   requests,
   commands,
