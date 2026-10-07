@@ -8,9 +8,13 @@ import {
   AlertDialogTitle,
 } from "@ws-model-proxy/ui/components/alert-dialog";
 import { Button } from "@ws-model-proxy/ui/components/button";
+import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
-/** A destructive action behind a confirmation (revoke, remove, withdraw). */
+/**
+ * A destructive action behind a confirmation (revoke, remove, withdraw). `children` (optional
+ * fields, such as a note) sit between the explanation and the buttons.
+ */
 export function ConfirmAction({
   open,
   onOpenChange,
@@ -20,6 +24,7 @@ export function ConfirmAction({
   pendingLabel,
   isPending,
   onConfirm,
+  children,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -29,6 +34,7 @@ export function ConfirmAction({
   pendingLabel?: string;
   isPending: boolean;
   onConfirm: () => void;
+  children?: ReactNode;
 }) {
   const { t } = useTranslation(["common"]);
   return (
@@ -38,6 +44,7 @@ export function ConfirmAction({
           <AlertDialogTitle>{title}</AlertDialogTitle>
           <AlertDialogDescription>{description}</AlertDialogDescription>
         </AlertDialogHeader>
+        {children}
         <AlertDialogFooter>
           <AlertDialogCancel className="min-h-11">{t("common:actions.cancel")}</AlertDialogCancel>
           <Button
