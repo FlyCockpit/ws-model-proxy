@@ -99,6 +99,7 @@ const REQUIRED_OBJECTS = [
   "runtime_instance_launch_version",
   "runtime_instance_operation_owner",
   "runtime_operation_profile",
+  "runtime_operation_owner_immutable",
   "instance_rank_bounds",
   "instance_rank_reserved_port",
   "instance_rank_claim_shape",
@@ -282,13 +283,19 @@ function runHardening(extraEnv = {}) {
 }
 
 let failures = 0;
-async function expectFailure(name, statement, code) {
+/**
+ * The statement must fail with `code`. `message` (optional) must match the error's message too:
+ * a generic code such as 23514 is raised by many checks, so the pattern proves which one fired.
+ */
+async function expectFailure(name, statement, code, message) {
   try {
     await client.query(statement);
   } catch (error) {
-    if (error?.code === code) return;
+    if (error?.code === code && (message === undefined || message.test(error?.message ?? "")))
+      return;
     failures += 1;
-    process.stderr.write(`✗ ${name}: expected ${code}, got ${error?.code} ${error?.message}\n`);
+    const wanted = message === undefined ? code : `${code} ${message}`;
+    process.stderr.write(`✗ ${name}: expected ${wanted}, got ${error?.code} ${error?.message}\n`);
     return;
   }
   failures += 1;
@@ -395,28 +402,33 @@ try {
     "node_owner_immutable",
     `UPDATE node SET "userId" = 'owner-b' WHERE id = 'node-a1'`,
     "55000",
+    /a node keeps its owner/,
   );
   await expectFailure(
     "instance_rank_node_owner insert",
     `INSERT INTO instance_rank (id, "instanceId", "nodeId", "unitName", rank, resources, port) VALUES
       ('rank-x', 'inst-m', 'node-b1', 'wsmp-i-aaaaaaaaaaaa-r2', 2, '{}', 30009)`,
     "23514",
+    /an instance runs only on nodes of its owner/,
   );
   await expectFailure(
     "instance_rank_node_owner move",
     `UPDATE instance_rank SET "nodeId" = 'node-b1' WHERE id = 'rank-w0'`,
     "23514",
+    /an instance runs only on nodes of its owner/,
   );
   await expectFailure(
     "instance_step_node_owner insert",
     `INSERT INTO instance_step (id, "instanceId", "nodeId", rank, phase, sequence, generation, intent,
       "intentHash") VALUES ('step-x', 'inst-m', 'node-b1', 0, 'START', 120, 2, '{}', ${HEX("d")})`,
     "23514",
+    /an instance runs only on nodes of its owner/,
   );
   await expectFailure(
     "instance_step_node_owner move",
     `UPDATE instance_step SET "nodeId" = 'node-b1' WHERE id = 'step-m1'`,
     "23514",
+    /an instance runs only on nodes of its owner/,
   );
   await client.query(`
     INSERT INTO runtime_operation (id, "userId", kind, actor, "actorUserId", summary, fingerprint)
@@ -426,17 +438,102 @@ try {
     "runtime_instance_operation_owner",
     `UPDATE runtime_instance SET "operationId" = 'op-b' WHERE id = 'inst-w'`,
     "23514",
+    /an instance is changed only by an operation of its owner/,
+  );
+  await expectFailure(
+    "runtime_operation_owner_immutable",
+    `UPDATE runtime_operation SET "userId" = 'owner-a' WHERE id = 'op-b'`,
+    "55000",
+    /an operation keeps its owner/,
   );
   // The owner's own operation, and the rows above unchanged by the refusals.
   await client.query(`UPDATE runtime_instance SET "operationId" = 'op-a' WHERE id = 'inst-w'`);
   await client.query(`UPDATE runtime_instance SET "operationId" = NULL WHERE id = 'inst-w'`);
+  // Ranks and steps counted apart: a join would miss a rank whose instance has no step.
   await expectValue(
-    "cross-owner refusals wrote nothing",
-    `SELECT count(*) FROM instance_rank r JOIN instance_step s USING ("instanceId")
-      WHERE r."nodeId" = 'node-b1' OR s."nodeId" = 'node-b1'`,
+    "cross-owner refusals wrote no rank",
+    `SELECT count(*) FROM instance_rank WHERE "nodeId" = 'node-b1'`,
     0,
   );
+  await expectValue(
+    "cross-owner refusals wrote no step",
+    `SELECT count(*) FROM instance_step WHERE "nodeId" = 'node-b1'`,
+    0,
+  );
+  await expectValue(
+    "cross-owner refusals left rank-w0 on its node",
+    `SELECT "nodeId" FROM instance_rank WHERE id = 'rank-w0'`,
+    "node-a3",
+  );
+  await expectValue(
+    "cross-owner refusals left op-b with its owner",
+    `SELECT "userId" FROM runtime_operation WHERE id = 'op-b'`,
+    "owner-b",
+  );
   await client.query(`DELETE FROM runtime_operation WHERE id IN ('op-a', 'op-b')`);
+
+  // FOR KEY SHARE: a step insert racing its node's delete waits for the delete, then is refused
+  // (a step has no node foreign key; without the lock it would land on the deleted node).
+  await client.query(
+    `INSERT INTO node (id, "userId", slug, trust) VALUES ('node-race', 'owner-a', 'nrace', 'FULL')`,
+  );
+  const racer = new pg.Client({ connectionString: schemaUrl.toString() });
+  await racer.connect();
+  let inTransaction = false;
+  try {
+    await racer.query("SET wsmp.fences = ',*,'");
+    await client.query("BEGIN");
+    inTransaction = true;
+    await client.query(`DELETE FROM node WHERE id = 'node-race'`);
+    let settled = false;
+    const insert = racer
+      .query(
+        `INSERT INTO instance_step (id, "instanceId", "nodeId", rank, phase, sequence, generation,
+          intent, "intentHash") VALUES ('step-race', 'inst-m', 'node-race', 0, 'START', 121, 2,
+          '{}', ${HEX("d")})`,
+      )
+      .then(
+        () => ({ error: null }),
+        (error) => ({ error }),
+      )
+      .finally(() => {
+        settled = true;
+      });
+    // The insert must be seen waiting on a lock (not merely late) before the delete commits.
+    let waited = false;
+    for (let poll = 0; poll < 400 && !settled && !waited; poll++) {
+      const { rows } = await client.query(
+        "SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1",
+        [racer.processID],
+      );
+      waited = rows[0]?.wait_event_type === "Lock";
+      if (!waited) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    if (!waited) {
+      failures += 1;
+      process.stderr.write("✗ instance_step_node_owner race: the insert did not wait\n");
+    }
+    await client.query("COMMIT");
+    inTransaction = false;
+    const { error } = await insert;
+    if (
+      error?.code !== "23514" ||
+      !/an instance runs only on nodes of its owner/.test(error?.message ?? "")
+    ) {
+      failures += 1;
+      process.stderr.write(
+        `✗ instance_step_node_owner race: expected 23514, got ${error?.code ?? "success"}\n`,
+      );
+    }
+  } finally {
+    if (inTransaction) await client.query("ROLLBACK").catch(() => undefined);
+    await racer.end().catch(() => undefined);
+  }
+  await expectValue(
+    "instance_step_node_owner race wrote no step",
+    `SELECT count(*) FROM instance_step WHERE id = 'step-race'`,
+    0,
+  );
 
   // ── nodes ──
   await expectFailure(

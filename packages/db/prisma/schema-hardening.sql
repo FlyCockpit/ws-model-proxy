@@ -676,8 +676,14 @@ BEGIN
      AND (TG_OP = 'INSERT' OR NEW."nodeId" IS DISTINCT FROM OLD."nodeId"
           OR NEW."instanceId" IS DISTINCT FROM OLD."instanceId")
      AND NOT EXISTS (
+       -- KEY SHARE on the node: a write racing the node's delete waits for it, then sees the
+       -- node gone (a step has no foreign key that would make it wait). A writer that already
+       -- holds the instance can deadlock with node_delete_release (which updates the instance
+       -- after locking the node), as rank inserts could through their foreign key before: one
+       -- side gets 40P01, which the graph-write and lifecycle retries treat as retryable.
        SELECT 1 FROM runtime_instance i JOIN node n ON n."userId" = i."userId"
         WHERE i.id = NEW."instanceId" AND n.id = NEW."nodeId"
+        FOR KEY SHARE OF n
      ) THEN
     RAISE EXCEPTION 'an instance runs only on nodes of its owner' USING ERRCODE = '23514';
   END IF;
@@ -748,6 +754,20 @@ $runtime_operation_profile$;
 DROP TRIGGER IF EXISTS runtime_operation_profile ON runtime_operation;
 CREATE TRIGGER runtime_operation_profile BEFORE INSERT OR UPDATE OF kind, "profileId" ON runtime_operation
 FOR EACH ROW EXECUTE FUNCTION enforce_runtime_operation_profile();
+-- An operation keeps its owner: the owner check on the instances it marks
+-- (runtime_instance_operation_owner) holds for the operation's lifetime.
+CREATE OR REPLACE FUNCTION enforce_runtime_operation_owner_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $runtime_operation_owner_immutable$
+BEGIN
+  IF NEW."userId" IS DISTINCT FROM OLD."userId" THEN
+    RAISE EXCEPTION 'an operation keeps its owner' USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END;
+$runtime_operation_owner_immutable$;
+DROP TRIGGER IF EXISTS runtime_operation_owner_immutable ON runtime_operation;
+CREATE TRIGGER runtime_operation_owner_immutable BEFORE UPDATE OF "userId" ON runtime_operation
+FOR EACH ROW EXECUTE FUNCTION enforce_runtime_operation_owner_immutable();
 
 -- One model on one instance, or one provider model.
 ALTER TABLE execution_target DROP CONSTRAINT IF EXISTS execution_target_kind_source_xor_check;
