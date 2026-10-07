@@ -86,7 +86,7 @@ describe("nodes.secrets", () => {
       value: SECRET,
     });
     const written = db.node.updateMany.mock.calls[0]?.[0];
-    expect(written?.where).toEqual({ id: "node-1", userId: OWNER });
+    expect(written?.where).toEqual({ id: "node-1", userId: OWNER, features: { equals: features } });
     expect((written?.data.features as typeof features | undefined)?.secrets).toEqual([
       { name: "WSMP_SECRET_HF", updatedAt: "2026-10-06T10:00:00.000Z" },
       { name: "WSMP_SECRET_OLD", updatedAt: "2026-10-01T00:00:00.000Z" },

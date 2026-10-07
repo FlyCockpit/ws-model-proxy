@@ -79,6 +79,8 @@ function failed(result: NodeSecretWriteResult | undefined, nodeId: string): neve
  * Keeps the stored secret NAMES (`features.secrets`) in step with a write the node confirmed,
  * so `nodes.get` lists them at once. The node also reports its full list (`node.state`), which
  * stays authoritative; this only closes the gap until it lands. Never stores a value.
+ * One compare-and-set statement: when `node.state` replaced the features since the read, the
+ * write is skipped (the node's own list already has the name).
  */
 async function recordSecretName(
   userId: string,
@@ -96,7 +98,7 @@ async function recordSecretName(
   const secrets = updatedAt === null ? others : [...others, { name, updatedAt }];
   secrets.sort((a, b) => a.name.localeCompare(b.name));
   await prisma.node.updateMany({
-    where: { id: nodeId, userId },
+    where: { id: nodeId, userId, features: { equals: row?.features ?? undefined } },
     data: { features: { ...features.data, secrets } },
   });
 }
