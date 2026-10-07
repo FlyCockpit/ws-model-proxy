@@ -41,6 +41,7 @@ import type {
 } from "@modelcontextprotocol/server";
 import { call, getRouter, isProcedure, ORPCError } from "@orpc/server";
 import {
+  advertisedInputSchema,
   MCP_READ_TOOLS,
   MCP_TOOLS,
   type McpToolContract,
@@ -68,29 +69,14 @@ const READ_TOOL_NAMES: ReadonlySet<string> = new Set(MCP_READ_TOOLS);
 
 // ── tools/list ──
 
-type JsonSchema = Record<string, unknown>;
-
-/**
- * The input schema a tool advertises: its contract input as JSON Schema, with each compact
- * field replaced by a plain object and its description (the procedure validates it in full).
- * Mirrors `advertisedInputSchema` in packages/api/src/contracts/mcp-tools.ts.
- */
-export function advertisedToolInputSchema(contract: McpToolContract): JsonSchema {
-  const schema = z.toJSONSchema(contract.input, { io: "input" }) as JsonSchema;
-  delete schema.$schema;
-  const properties = schema.properties as Record<string, JsonSchema> | undefined;
-  for (const [field, description] of Object.entries(contract.compactFields ?? {}))
-    if (properties?.[field]) properties[field] = { type: "object", description };
-  return schema;
-}
-
 /**
  * A standard schema that advertises the compact JSON Schema and accepts any arguments: the
  * wrapper validates with the contract schema itself, so the SDK never echoes a validation
  * message (which could carry an argument).
  */
 function advertisedSchema(contract: McpToolContract): StandardSchemaWithJSON {
-  const json = advertisedToolInputSchema(contract);
+  // The contract input as JSON Schema, compact fields replaced (the procedure validates them).
+  const json = advertisedInputSchema(contract);
   return {
     "~standard": {
       version: 1,

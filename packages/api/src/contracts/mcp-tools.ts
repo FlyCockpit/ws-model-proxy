@@ -76,13 +76,36 @@ function tool(contract: Omit<McpToolContract, "level">): McpToolContract {
 
 type JsonSchema = Record<string, unknown>;
 
+/** The JSON types a full field schema allows (`anyOf` branches flattened). */
+function jsonTypes(schema: JsonSchema): string[] {
+  if (typeof schema.type === "string") return [schema.type];
+  if (Array.isArray(schema.type)) return schema.type.filter((t) => typeof t === "string");
+  const branches = Array.isArray(schema.anyOf) ? (schema.anyOf as JsonSchema[]) : [];
+  return branches.flatMap(jsonTypes);
+}
+
+/**
+ * A compact field: a plain object, or a list of objects when the field is a list, with
+ * `null` kept when the field takes it (so the shape an agent sends matches the procedure).
+ */
+function compactField(full: JsonSchema, description: string): JsonSchema {
+  const types = jsonTypes(full);
+  const base: JsonSchema = types.includes("array")
+    ? { type: "array", items: { type: "object" } }
+    : { type: "object" };
+  if (types.includes("null")) base.type = [base.type, "null"];
+  return { ...base, description };
+}
+
 /** The `inputSchema` a tool advertises in `tools/list` (compact fields replaced). */
 export function advertisedInputSchema(contract: McpToolContract): JsonSchema {
   const schema = z.toJSONSchema(contract.input, { io: "input" }) as JsonSchema;
   delete schema.$schema;
   const properties = schema.properties as Record<string, JsonSchema> | undefined;
-  for (const [field, description] of Object.entries(contract.compactFields ?? {}))
-    if (properties?.[field]) properties[field] = { type: "object", description };
+  for (const [field, description] of Object.entries(contract.compactFields ?? {})) {
+    const full = properties?.[field];
+    if (properties && full) properties[field] = compactField(full, description);
+  }
   return schema;
 }
 

@@ -367,13 +367,30 @@ describe("0.4.0 MCP tool manifest", () => {
     }
   });
 
-  it("advertises compact fields as plain objects that the procedure validates", () => {
+  it("advertises compact fields with the JSON type the procedure takes (object, list, null)", () => {
+    const typesOf = (schema: Record<string, unknown>): string[] => {
+      if (typeof schema.type === "string") return [schema.type];
+      if (Array.isArray(schema.type)) return schema.type as string[];
+      const branches = (schema.anyOf ?? []) as Array<Record<string, unknown>>;
+      return branches.flatMap(typesOf);
+    };
     for (const tool of MCP_TOOLS)
       for (const field of Object.keys(tool.compactFields ?? {})) {
+        const full = z.toJSONSchema(tool.input, { io: "input" }) as {
+          properties: Record<string, Record<string, unknown>>;
+        };
         const schema = advertisedToolList().find((entry) => entry.name === tool.name)?.inputSchema;
-        const properties = (schema?.properties ?? {}) as Record<string, { type?: string }>;
-        expect(properties[field]?.type, `${tool.name}.${field}`).toBe("object");
+        const properties = (schema?.properties ?? {}) as Record<string, Record<string, unknown>>;
+        const advertised = properties[field] ?? {};
+        expect(typesOf(advertised).sort(), `${tool.name}.${field}`).toEqual(
+          typesOf(full.properties[field] ?? {}).sort(),
+        );
       }
+    const nodeUpdate = advertisedToolList().find((entry) => entry.name === "node_update");
+    const fields = (nodeUpdate?.inputSchema.properties ?? {}) as Record<string, { type?: unknown }>;
+    // metricCommands is a list in nodes.update; hardware takes null to clear.
+    expect(fields.metricCommands?.type).toBe("array");
+    expect(fields.hardware?.type).toEqual(["object", "null"]);
   });
 
   it("keeps secret values out of generic inputs (only the sensitive secret tool takes one)", () => {
