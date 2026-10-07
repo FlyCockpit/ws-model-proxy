@@ -5184,32 +5184,19 @@ async function relayPool({
 
   const onlineNodeIds = manager.getOnlineNodeIds();
   const now = new Date();
-  const nativeSequence = buildPoolRouteSequence({
-    routes: selectedNativeProtocolCandidates.map(poolRouteRowOf),
-    onlineNodeIds,
-    now,
+  const groupRows = [
+    selectedNativeProtocolCandidates.map(poolRouteRowOf),
+    selectedAdaptedProtocolCandidates.map(poolRouteRowOf),
+    selectedLegacyProtocolCandidates.map(poolRouteRowOf),
+    unknownFallbackMembers.map(poolRouteRowOf),
+  ] as const;
+  // A degraded route of one group falls back only when no group has a healthy route.
+  const alternatives = groupRows.flat();
+  // Native first, then adapted, legacy and unknown (the sort below keeps that rank).
+  const localRouteCandidates = groupRows.flatMap((routes) => {
+    const sequence = buildPoolRouteSequence({ routes, onlineNodeIds, now, alternatives });
+    return sequence.ok ? sequence.candidates : [];
   });
-  const adaptedSequence = buildPoolRouteSequence({
-    routes: selectedAdaptedProtocolCandidates.map(poolRouteRowOf),
-    onlineNodeIds,
-    now,
-  });
-  const legacySequence = buildPoolRouteSequence({
-    routes: selectedLegacyProtocolCandidates.map(poolRouteRowOf),
-    onlineNodeIds,
-    now,
-  });
-  const unknownSequence = buildPoolRouteSequence({
-    routes: unknownFallbackMembers.map(poolRouteRowOf),
-    onlineNodeIds,
-    now,
-  });
-  const localRouteCandidates = [
-    ...(nativeSequence.ok ? nativeSequence.candidates : []),
-    ...(adaptedSequence.ok ? adaptedSequence.candidates : []),
-    ...(legacySequence.ok ? legacySequence.candidates : []),
-    ...(unknownSequence.ok ? unknownSequence.candidates : []),
-  ];
   const routeModeRank = (candidate: (typeof localRouteCandidates)[number]) => {
     const mode = executionByMember.get(candidate.poolMemberId)?.mode;
     return mode === "native" ? 0 : mode === "adapted" ? 1 : 2;

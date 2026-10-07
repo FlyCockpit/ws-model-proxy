@@ -243,10 +243,13 @@ export function routablePoolRoutes({
   routes,
   onlineNodeIds,
   now,
+  alternatives = routes,
 }: {
   routes: readonly PoolRouteRow[];
   onlineNodeIds: Iterable<string>;
   now: Date;
+  /** Every route of the request (all surface groups), when `routes` is one group of them. */
+  alternatives?: readonly PoolRouteRow[];
 }): PoolRouteCandidate[] {
   const online = new Set(onlineNodeIds);
   const servable = (route: PoolRouteRow) =>
@@ -260,7 +263,7 @@ export function routablePoolRoutes({
   // one (every member degraded, or a one-route pool) a due degraded route takes a half-open
   // request: otherwise a member whose probe cannot run (or has not yet) is never routed again
   // and the pool answers 503 while its engines are fine.
-  const healthyAlternative = routes.some(
+  const healthyAlternative = alternatives.some(
     (route) => (route.health === "HEALTHY" || route.health === "UNKNOWN") && servable(route),
   );
   const candidates: PoolRouteCandidate[] = [];
@@ -322,13 +325,21 @@ export function buildPoolRouteSequence({
   onlineNodeIds,
   now,
   state = {},
+  alternatives,
 }: {
   routes: readonly PoolRouteRow[];
   onlineNodeIds: Iterable<string>;
   now: Date;
   state?: SmoothWeightedRoundRobinState;
+  /** Every route of the request, when `routes` is one surface group of them. */
+  alternatives?: readonly PoolRouteRow[];
 }): PoolRouteSequenceResult {
-  const candidates = routablePoolRoutes({ routes, onlineNodeIds, now });
+  const candidates = routablePoolRoutes({
+    routes,
+    onlineNodeIds,
+    now,
+    ...(alternatives ? { alternatives } : {}),
+  });
   if (candidates.length === 0)
     return {
       ok: false,
@@ -387,8 +398,9 @@ export async function recordTargetRelayFailure({
 }): Promise<{ retryable: boolean; update: TargetHealthUpdate | null }> {
   const failureClass = targetFailureClassForRelayFailure(failure);
   if (!failureClass) {
-    // Not the target's fault: a half-open trial it held is given back, not left to its lease.
-    if (trialStartedAt) await releaseTargetHalfOpenTrial({ executionTargetId, trialStartedAt });
+    // Says nothing about the target: a half-open trial it held goes back to waiting out its
+    // backoff (visible to the recovery probe again), not left to its 16-minute lease.
+    if (trialStartedAt) await returnTargetTrial({ executionTargetId, trialStartedAt, now });
     return { retryable: false, update: null };
   }
   // A relay `disconnected` outcome is the in-flight echo of a node detach, whose own fenced
@@ -529,6 +541,36 @@ export async function markTargetHalfOpenTrial({
     data: { health: "HALF_OPEN", halfOpenTrialStartedAt: now },
   });
   return result.count;
+}
+
+/**
+ * An inconclusive half-open trial (the attempt failed for a reason that is not the target's):
+ * the target is degraded (unhealthy after enough failures) again with its current backoff, so
+ * the recovery probe and the next due request may try it; no failure is counted.
+ */
+async function returnTargetTrial({
+  executionTargetId,
+  trialStartedAt,
+  now,
+}: {
+  executionTargetId: string;
+  trialStartedAt: Date;
+  now: Date;
+}): Promise<void> {
+  const target = await prisma.executionTarget.findUnique({
+    where: { id: executionTargetId },
+    select: { consecutiveRetryableFailures: true },
+  });
+  if (!target) return;
+  const failures = target.consecutiveRetryableFailures;
+  await prisma.executionTarget.updateMany({
+    where: { id: executionTargetId, health: "HALF_OPEN", halfOpenTrialStartedAt: trialStartedAt },
+    data: {
+      health: failures >= TARGET_UNHEALTHY_AFTER_RETRYABLE_FAILURES ? "UNHEALTHY" : "DEGRADED",
+      halfOpenTrialStartedAt: null,
+      nextRetryAt: new Date(now.getTime() + targetRecoveryDelayMs(failures)),
+    },
+  });
 }
 
 /** Gives back a half-open trial whose claimant sent nothing. */

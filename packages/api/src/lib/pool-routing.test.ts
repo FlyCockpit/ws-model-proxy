@@ -77,6 +77,18 @@ describe("routing around degraded targets", () => {
     ]);
   });
 
+  it("judges the alternatives across every surface group of the request", () => {
+    const degradedNative = [degraded("a")];
+    expect(
+      routablePoolRoutes({
+        routes: degradedNative,
+        onlineNodeIds: ["node"],
+        now,
+        alternatives: [...degradedNative, route("b")],
+      }),
+    ).toEqual([]);
+  });
+
   it("does not count a healthy route that cannot serve as an alternative", () => {
     expect(routable([route("a", { nodeOnline: false }), degraded("b")])).toEqual([
       ["target-b", "HALF_OPEN", true],
@@ -98,7 +110,8 @@ describe("what a failed attempt says about its target", () => {
     expect(targetHealthFailure("upstream_5xx", false)).toBe("upstream_5xx");
   });
 
-  it("writes no health for an uncounted failure and gives its half-open trial back", async () => {
+  it("counts no failure for an uncounted one; its half-open trial waits out its backoff again", async () => {
+    db.executionTarget.findUnique.mockResolvedValue({ consecutiveRetryableFailures: 1 } as never);
     db.executionTarget.updateMany.mockResolvedValue({ count: 1 });
     const result = await recordTargetRelayFailure({
       executionTargetId: "target-a",
@@ -107,10 +120,14 @@ describe("what a failed attempt says about its target", () => {
       now,
     });
     expect(result).toEqual({ retryable: false, update: null });
-    expect(db.executionTarget.findUnique).not.toHaveBeenCalled();
+    // Back where the recovery probe sees it (not HALF_OPEN), with the same failure count.
     expect(db.executionTarget.updateMany).toHaveBeenCalledWith({
       where: { id: "target-a", health: "HALF_OPEN", halfOpenTrialStartedAt: past },
-      data: { halfOpenTrialStartedAt: null },
+      data: {
+        health: "DEGRADED",
+        halfOpenTrialStartedAt: null,
+        nextRetryAt: new Date(now.getTime() + 1_000),
+      },
     });
   });
 });
