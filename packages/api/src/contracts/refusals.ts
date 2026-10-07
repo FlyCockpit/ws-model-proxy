@@ -19,6 +19,7 @@ export const REFUSAL_REASONS = [
   "definition_frozen",
   "definition_missing",
   "launch_change_on_relay_only",
+  "launch_change_on_node_origin",
   /** Retired with fabrics (owner decision round 3); kept so the value is never reused. */
   "no_frozen_peer_set",
   // Lifecycle and deletion.

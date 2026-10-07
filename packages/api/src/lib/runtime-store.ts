@@ -66,12 +66,12 @@ const ENGINE = {
   lm_studio: "LM_STUDIO",
   other: "OTHER",
 } as const;
-const MODEL_TYPE = {
+export const MODEL_TYPE = {
   llm: "LLM",
   embeddings: "EMBEDDINGS",
   transcription: "TRANSCRIPTION",
 } as const;
-const CAPABILITY = {
+export const CAPABILITY = {
   text_generation: "TEXT_GENERATION",
   vision_input: "VISION_INPUT",
   video_input: "VIDEO_INPUT",
@@ -115,12 +115,20 @@ export function specIsInteractive(spec: RuntimeSpec): boolean {
   );
 }
 
+/**
+ * Who wrote a version: a caller, or SYSTEM for a definition the server took from a node's
+ * inventory (`wsmp runtime add`: written on the node, by nobody the server saw).
+ */
+export type VersionEditor = Omit<CallerActor, "actor"> & {
+  actor: CallerActor["actor"] | "SYSTEM";
+};
+
 export async function createVersion(
   tx: Tx,
   input: {
     runtimeId: string;
     version: number;
-    actor: CallerActor;
+    actor: VersionEditor;
     spec: RuntimeSpec;
     limits: LimitColumns;
     advanced: Record<string, unknown>;

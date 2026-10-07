@@ -1038,6 +1038,7 @@
       "definition_frozen": "El nodo tiene congelada una definición de este runtime.",
       "definition_missing": "El nodo aún no tiene esta definición.",
       "launch_change_on_relay_only": "Este nodo es solo relé, así que su definición siempre activa está congelada. Cámbiala en el nodo o sube la confianza ahí.",
+      "launch_change_on_node_origin": "Este runtime se agregó en su nodo, así que su dirección y definición se cambian ahí (wsmp runtime add). Los límites y la configuración avanzada se pueden cambiar aquí.",
       "no_frozen_peer_set": "Este nodo no tiene un conjunto de pares congelado.",
       "instances_running": "Primero detén las instancias en ejecución.",
       "pinned_by_profile": "Un perfil fija este runtime. Quítalo del perfil primero.",

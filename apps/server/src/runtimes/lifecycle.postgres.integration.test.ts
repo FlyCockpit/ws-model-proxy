@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { runtimeLaunchHash } from "@ws-model-proxy/api/lib/runtime-launch-hash";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 // The runtime lifecycle engine on real PostgreSQL: the graph-write fences, the step/claim/
@@ -770,5 +771,316 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     for (const id of ids) await stopInstance(id);
     await lc.runOnce();
     for (const id of ids) expect((await instance(id)).phase).toBe("STOPPED");
+  });
+
+  // ── Always-on runtimes from inventory ──
+
+  const alwaysOnSpec = (port: number) => ({
+    api: "openai" as const,
+    engine: "vllm" as const,
+    modelType: "llm" as const,
+    address: { baseUrl: `http://127.0.0.1:${port}/v1` },
+  });
+
+  function nodeEntry(
+    slug: string,
+    port: number,
+    extra: Partial<import("../relay/frames.js").AlwaysOnInventory> = {},
+  ): import("../relay/frames.js").AlwaysOnInventory {
+    const spec = alwaysOnSpec(port);
+    return {
+      slug,
+      origin: "node",
+      launchHash: runtimeLaunchHash(spec),
+      spec,
+      status: "online",
+      models: [{ id: "local-model", capabilities: ["text_generation"] }],
+      ...extra,
+    };
+  }
+
+  const inventory = (
+    lc: Awaited<ReturnType<typeof engine>>,
+    alwaysOn: import("../relay/frames.js").AlwaysOnInventory[],
+    instances: import("../relay/frames.js").InstanceRecord[] = [],
+  ) => lc.runtimeInventory(ref(), { snapshotId: randomUUID(), alwaysOn, instances });
+
+  const nodeRuntime = (slug: string) =>
+    m.fixture.runtime.findFirst({
+      where: { userId, slug },
+      include: {
+        Versions: { orderBy: { version: "asc" } },
+        Models: true,
+        Instances: { include: { Targets: true } },
+      },
+    });
+
+  it("creates a node-origin always-on runtime from inventory, versions it and removes it", async () => {
+    const lc = await engine();
+    const slug = `ao-${suffix}`;
+    await inventory(lc, [
+      nodeEntry(slug, 18_001, {
+        engineFacts: {
+          slots: { value: 8, source: "probe" },
+          kvTokens: { value: 400_000, source: "probe" },
+        },
+      }),
+    ]);
+    let runtime = await nodeRuntime(slug);
+    expect(runtime).toMatchObject({ kind: "ALWAYS_ON", origin: "NODE", nodeId });
+    expect(runtime?.Versions).toHaveLength(1);
+    const first = runtime?.Versions[0];
+    expect(first?.launchHash).toBe(runtimeLaunchHash(alwaysOnSpec(18_001)));
+    expect(first?.editor).toBe("SYSTEM");
+    expect(runtime?.currentVersionId).toBe(first?.id);
+    expect(runtime?.Models.map((model) => model.upstreamModelId)).toEqual(["local-model"]);
+    expect(runtime?.Models[0]?.detectedCapabilities).toEqual(["TEXT_GENERATION"]);
+    let inst = runtime?.Instances[0];
+    expect(runtime?.Instances).toHaveLength(1);
+    expect(inst).toMatchObject({
+      handle: slug,
+      desiredState: null,
+      phase: "READY",
+      versionId: first?.id,
+      launchVersionId: first?.id,
+      engineSlots: 8,
+      observedKvBudgetTokens: 400_000,
+    });
+    expect(inst?.Targets).toHaveLength(1);
+
+    // The same report again changes nothing.
+    await inventory(lc, [nodeEntry(slug, 18_001)]);
+    expect((await nodeRuntime(slug))?.Versions).toHaveLength(1);
+
+    // A person set a limit in the browser (version 2, same launch).
+    const limited = await m.fixture.runtimeVersion.create({
+      data: {
+        runtimeId: runtime?.id ?? "",
+        version: 2,
+        editor: "USER",
+        editorUserId: userId,
+        contentHash: hex(`content-ao-2-${suffix}`),
+        launchHash: first?.launchHash ?? "",
+        spec: alwaysOnSpec(18_001),
+        api: "OPENAI",
+        engine: "VLLM",
+        modelType: "LLM",
+        concurrencyLimit: 3,
+      },
+    });
+    await m.fixture.runtime.update({
+      where: { id: runtime?.id ?? "" },
+      data: { currentVersionId: limited.id },
+    });
+    // The definition changed on the node: version 3 (the limit carried over), adopted at once;
+    // its status degraded; a second discovered model (a degraded server's list retires nothing).
+    await inventory(lc, [
+      nodeEntry(slug, 18_002, {
+        status: "degraded",
+        models: [{ id: "other-model", capabilities: [] }],
+      }),
+    ]);
+    runtime = await nodeRuntime(slug);
+    expect(runtime?.Versions.map((version) => version.version)).toEqual([1, 2, 3]);
+    const second = runtime?.Versions[2];
+    expect(second?.concurrencyLimit).toBe(3);
+    expect(second?.launchHash).toBe(runtimeLaunchHash(alwaysOnSpec(18_002)));
+    expect(runtime?.currentVersionId).toBe(second?.id);
+    inst = runtime?.Instances[0];
+    expect(inst).toMatchObject({
+      phase: "UNHEALTHY",
+      phaseReason: "node_degraded",
+      versionId: second?.id,
+      launchVersionId: second?.id,
+    });
+    const retired = async () =>
+      new Map(
+        (await nodeRuntime(slug))?.Models.map((model) => [model.upstreamModelId, model.retired]),
+      );
+    expect(await retired()).toEqual(
+      new Map([
+        ["local-model", false],
+        ["other-model", false],
+      ]),
+    );
+    expect(inst?.Targets).toHaveLength(2);
+    // Online, the list is the whole served set: the first model is gone.
+    await inventory(lc, [
+      nodeEntry(slug, 18_002, { models: [{ id: "other-model", capabilities: [] }] }),
+    ]);
+    expect(await retired()).toEqual(
+      new Map([
+        ["local-model", true],
+        ["other-model", false],
+      ]),
+    );
+
+    // A truncated entry, or a server that is offline (it lists nothing), keeps the models the
+    // server knows.
+    await inventory(lc, [nodeEntry(slug, 18_002, { models: [], truncated: true })]);
+    await inventory(lc, [nodeEntry(slug, 18_002, { models: [], status: "offline" })]);
+    runtime = await nodeRuntime(slug);
+    expect(runtime?.Models.find((model) => model.upstreamModelId === "other-model")?.retired).toBe(
+      false,
+    );
+    expect(runtime?.Instances[0]).toMatchObject({
+      phase: "UNAVAILABLE",
+      phaseReason: "node_offline",
+    });
+
+    // No longer reported while a profile pins it: kept, but no longer routed to.
+    const profile = await m.fixture.profile.create({
+      data: { userId, slug: `ao-${suffix}`, name: "AO", editor: "USER", editorUserId: userId },
+    });
+    await m.fixture.profileItem.create({
+      data: {
+        profileId: profile.id,
+        position: 0,
+        runtimeId: runtime?.id ?? "",
+        versionId: runtime?.currentVersionId ?? "",
+      },
+    });
+    await inventory(lc, [nodeEntry(slug, 18_002)]);
+    expect((await nodeRuntime(slug))?.Instances[0]?.phase).toBe("READY");
+    await inventory(lc, []);
+    expect((await nodeRuntime(slug))?.Instances[0]).toMatchObject({
+      phase: "UNAVAILABLE",
+      phaseReason: "node_removed",
+    });
+    await m.fixture.profile.delete({ where: { id: profile.id } });
+
+    // No longer reported: the runtime and its instance are removed.
+    await inventory(lc, []);
+    expect(await nodeRuntime(slug)).toBeNull();
+    expect(await m.fixture.runtimeInstance.count({ where: { userId, handle: slug } })).toBe(0);
+  });
+
+  it("skips a node-origin slug another runtime of the user has, and a bad hash", async () => {
+    const lc = await engine();
+    // The startable runtime's slug is taken (server origin).
+    const taken = `lc-${suffix}`;
+    // Another node of the user already added a runtime with this slug.
+    const otherNode = await m.fixture.node.create({
+      data: { userId, slug: `lc2-${suffix}`, connection: "ONLINE", trust: "FULL" },
+    });
+    const elsewhere = `ae-${suffix}`;
+    await m.fixture.runtime.create({
+      data: {
+        userId,
+        slug: elsewhere,
+        name: "elsewhere",
+        kind: "ALWAYS_ON",
+        origin: "NODE",
+        nodeId: otherNode.id,
+      },
+    });
+    const before = await m.fixture.runtime.count({ where: { userId } });
+    await inventory(lc, [
+      nodeEntry(elsewhere, 18_006),
+      nodeEntry(taken, 18_003),
+      nodeEntry(`bad-${suffix}`, 18_004, { launchHash: "0".repeat(64) }),
+    ]);
+    expect(await m.fixture.runtime.count({ where: { userId } })).toBe(before);
+    const kept = await m.fixture.runtime.findFirstOrThrow({ where: { userId, slug: taken } });
+    expect(kept).toMatchObject({ origin: "SERVER", kind: "STARTABLE" });
+    // The other node's runtime is untouched (still there, no version, on its node).
+    const theirs = await m.fixture.runtime.findFirstOrThrow({
+      where: { userId, slug: elsewhere },
+      include: { Versions: true },
+    });
+    expect(theirs).toMatchObject({ nodeId: otherNode.id, currentVersionId: null });
+    expect(theirs.Versions).toHaveLength(0);
+    await m.fixture.runtime.delete({ where: { id: theirs.id } });
+    await m.fixture.node.delete({ where: { id: otherNode.id } });
+  });
+
+  it("follows a server-origin always-on runtime's status, models and engine facts", async () => {
+    const lc = await engine();
+    const slug = `aos-${suffix}`;
+    const spec = alwaysOnSpec(18_005);
+    const db = m.fixture;
+    const runtime = await db.runtime.create({
+      data: { userId, slug, name: "AOS", kind: "ALWAYS_ON", origin: "SERVER", nodeId },
+    });
+    const version = await db.runtimeVersion.create({
+      data: {
+        runtimeId: runtime.id,
+        version: 1,
+        editor: "USER",
+        editorUserId: userId,
+        contentHash: hex(`content-aos-${suffix}`),
+        launchHash: runtimeLaunchHash(spec),
+        spec,
+        api: "OPENAI",
+        engine: "VLLM",
+        modelType: "LLM",
+      },
+    });
+    await db.runtime.update({ where: { id: runtime.id }, data: { currentVersionId: version.id } });
+    await db.runtimeInstance.create({
+      data: {
+        userId,
+        runtimeId: runtime.id,
+        versionId: version.id,
+        launchVersionId: version.id,
+        handle: slug,
+        startedBy: "USER",
+        phase: "UNAVAILABLE",
+        phaseReason: "awaiting_node",
+      },
+    });
+    await inventory(lc, [
+      {
+        slug,
+        origin: "server",
+        runtimeId: runtime.id,
+        versionId: version.id,
+        launchHash: version.launchHash,
+        status: "online",
+        models: [
+          {
+            id: "served",
+            capabilities: ["text_generation"],
+            engineFacts: { maxModelLen: { value: 65_536, source: "probe" } },
+          },
+        ],
+      },
+    ]);
+    const row = await nodeRuntime(slug);
+    expect(row?.Models.map((model) => model.upstreamModelId)).toEqual(["served"]);
+    expect(row?.Instances[0]).toMatchObject({ phase: "READY", maxModelLen: 65_536 });
+    expect(row?.Instances[0]?.Targets).toHaveLength(1);
+    // It stays: server-origin runtimes are never removed by inventory.
+    await inventory(lc, []);
+    expect(await nodeRuntime(slug)).not.toBeNull();
+  });
+
+  it("records a managed instance's engine facts from its head rank", async () => {
+    const lc = await engine();
+    const id = await ready(lc, 30_301);
+    const row = await instance(id);
+    await inventory(
+      lc,
+      [],
+      [
+        {
+          instanceId: id,
+          launchVersionId: row.launchVersionId,
+          launchHash: hex(`launch-${suffix}`),
+          rank: 0,
+          intentHash: hex("intent"),
+          phase: "ready",
+          unitName: `wsmp-${row.handle}-r0`,
+          port: 30_301,
+          handle: row.handle,
+          models: ["m"],
+          engineFacts: { kvTokens: { value: 123_456, source: "probe" } },
+        },
+      ],
+    );
+    const after = await instance(id);
+    expect(after.phase).toBe("READY");
+    expect(after.observedKvBudgetTokens).toBe(123_456);
+    expect(after.factsAt).not.toBeNull();
   });
 });

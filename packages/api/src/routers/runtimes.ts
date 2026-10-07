@@ -443,6 +443,7 @@ export const runtimesRouter = {
       select: {
         id: true,
         kind: true,
+        origin: true,
         Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } },
         CurrentVersion: { select: VERSION_SELECT },
       },
@@ -480,6 +481,14 @@ export const runtimesRouter = {
     }
 
     const launchChanged = hashes.launchHash !== current.launchHash;
+    // A node-origin runtime's definition lives in the node's runtimes.json and comes back with
+    // every inventory; the server never pushes it, so only the node can change it.
+    if (launchChanged && runtime.origin === "NODE")
+      throw refuseAbout(
+        "launch_change_on_node_origin",
+        runtime.id,
+        "This runtime was added on its node: change its definition there (`wsmp runtime add`). Limits and advanced settings can be changed here.",
+      );
     if (launchChanged && runtime.Node && effectiveTrust(runtime.Node) !== "FULL")
       throw refuseAbout(
         "launch_change_on_relay_only",

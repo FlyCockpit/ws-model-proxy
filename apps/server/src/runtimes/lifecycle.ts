@@ -16,15 +16,18 @@
  * {@link OPERATOR_TERMINALS_PER_NODE} live per node (stops exempt). A person's run is never cut
  * off: stops of the instance on that node wait behind it.
  *
- * Not here yet: node-origin always-on runtimes from inventory.
+ * Always-on runtimes in a node's inventory (node-origin ones included) are applied by
+ * `./always-on.ts`; the engine facts of managed instances are recorded here.
  */
 import { randomBytes } from "node:crypto";
+import { sameStoredInstanceFacts, storedInstanceFacts } from "@ws-model-proxy/api/lib/engine-facts";
 import { graphWrite, instanceCapacityFences } from "@ws-model-proxy/api/lib/graph-write";
 import { type RuntimeLaunch, runtimeLaunchSchema } from "@ws-model-proxy/api/lib/runtime-spec";
 import { RUNTIME_ADVANCED } from "@ws-model-proxy/config/runtime-defaults";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import {
+  type InstanceRecord,
   type NodeToServerControlFrame,
   type NodeTrustWire,
   RUNTIME_JOB_PRE_ADMISSION_ERRORS,
@@ -36,6 +39,7 @@ import type {
   RuntimeInventorySnapshot,
   SendGuard,
 } from "../relay/session-manager.js";
+import { applyAlwaysOnInventory, instanceStoredFacts } from "./always-on.js";
 import {
   GENERATION_STRIDE,
   generationSteps,
@@ -2163,47 +2167,34 @@ export class RuntimeLifecycle {
           instance.desiredState === "RUNNING";
         const sameRun = !record || record.launchVersionId === instance.launchVersionId;
         const lost = !record || record.phase === "stopped" || record.phase === "unknown";
-        if (live && sameRun && lost && claim.claim === "HELD")
+        if (live && sameRun && lost && claim.claim === "HELD") {
           await this.gangStop(tx, instance, "crashed");
+          return;
+        }
+        if (record && claim.claim === "HELD" && instance.desiredState === "RUNNING")
+          await this.recordInstanceFacts(tx, instance, record);
       }).catch((error: unknown) =>
         console.error("[lifecycle] applying inventory failed", errorName(error)),
       );
     }
-    await this.applyAlwaysOn(ref, snapshot);
+    await applyAlwaysOnInventory(ref, snapshot.alwaysOn, this.now()).catch((error: unknown) =>
+      console.error("[lifecycle] applying always-on inventory failed", errorName(error)),
+    );
     this.wake();
     return { ok: true };
   }
 
-  private async applyAlwaysOn(ref: NodeSessionRef, snapshot: RuntimeInventorySnapshot) {
-    const now = this.now();
-    for (const entry of snapshot.alwaysOn) {
-      if (entry.origin !== "server" || !entry.runtimeId) continue;
-      const phase =
-        entry.status === "online"
-          ? "READY"
-          : entry.status === "degraded"
-            ? "UNHEALTHY"
-            : "UNAVAILABLE";
-      // Status columns only (no fence): the instance of the node's own always-on runtime.
-      await prisma.runtimeInstance
-        .updateMany({
-          where: {
-            runtimeId: entry.runtimeId,
-            userId: ref.userId,
-            desiredState: null,
-            Runtime: { nodeId: ref.nodeId, kind: "ALWAYS_ON" },
-            phase: { not: phase },
-          },
-          data: {
-            phase,
-            phaseChangedAt: now,
-            phaseReason: phase === "READY" ? null : `node_${entry.status}`,
-          },
-        })
-        .catch((error: unknown) =>
-          console.error("[lifecycle] always-on status failed", errorName(error)),
-        );
-    }
+  /** The head rank's engine facts of the run the node reports (admission reads them). */
+  private async recordInstanceFacts(tx: Tx, instance: InstanceRow, record: InstanceRecord) {
+    if (record.rank !== 0 || record.launchVersionId !== instance.launchVersionId) return;
+    if (record.phase !== "ready" && record.phase !== "unhealthy" && record.phase !== "starting")
+      return;
+    const facts = storedInstanceFacts(record.engineFacts);
+    if (!facts || sameStoredInstanceFacts(facts, instanceStoredFacts(instance))) return;
+    await tx.runtimeInstance.update({
+      where: { id: instance.id },
+      data: { ...facts, factsAt: this.now() },
+    });
   }
 
   handlers(): Pick<
