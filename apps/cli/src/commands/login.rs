@@ -100,27 +100,29 @@ pub fn run(args: &Args) -> Result<()> {
     let saved = Config::load()?;
     let prior = prior_enrollment(
         saved.server_url.as_deref(),
+        saved.trust,
         crate::state::load_node_credential(),
-        &server_url,
+        &[server_url.as_str(), public_origin.as_str()],
     );
     // An earlier enrollment elsewhere (another server, or a 0.3 credential)
     // does not hand its node name to this one: that would leave its node
     // behind as a ghost under a reused name.
     let saved_slug = match prior {
         Prior::SameServer | Prior::None => saved.cli_slug.as_deref(),
-        Prior::Stale => {
-            if let Some(old) = saved.cli_slug.as_deref()
-                && args.slug.is_none()
-            {
-                output::diagnostic(format!(
-                    "not reusing the earlier node name `{}` from an older enrollment; pass `--slug` to choose one",
-                    escape_single_line(old)
-                ))?;
-            }
-            None
-        }
+        Prior::Stale => None,
     };
     let slug = requested_slug(args, saved_slug)?;
+    if prior == Prior::Stale
+        && args.slug.is_none()
+        && let Some(old) = saved.cli_slug.as_deref()
+        && old != slug
+    {
+        output::diagnostic(format!(
+            "not reusing the earlier node name `{}` from an older enrollment; this node is `{}`",
+            escape_single_line(old),
+            escape_single_line(&slug)
+        ))?;
+    }
     let code = enrollment_code(args)?;
     let state_dir = crate::paths::state_dir().context("determining the state directory")?;
     let identity = crate::terminal_identity::load_or_create(&state_dir)
@@ -176,6 +178,7 @@ pub fn run(args: &Args) -> Result<()> {
     };
     // Set only when this re-login changed it: a running relay needs a restart.
     let human_terminal_changed;
+    let kept_relay;
     {
         let _lock = ConfigLock::exclusive()?;
         let mut config = Config::load()?;
@@ -186,6 +189,7 @@ pub fn run(args: &Args) -> Result<()> {
         } else {
             trust
         };
+        kept_relay = chosen != trust;
         if chosen == TrustValue::Relay {
             // The marker first, then the config (as every lowering does).
             crate::runtime_store::freeze()?;
@@ -205,6 +209,11 @@ pub fn run(args: &Args) -> Result<()> {
         server: server_url.clone(),
         credential: enrolled.credential.clone(),
     })?;
+    if kept_relay {
+        output::diagnostic(
+            "this node stays Relay only: it was lowered on this machine before; raise it with `wsmp trust full` on a terminal",
+        )?;
+    }
     let config = Config::load_required()?;
     let trust = crate::trust::configured(&config);
     let allow_human_terminal = config.allow_human_terminal;
@@ -314,9 +323,14 @@ fn ask(text: &str) -> Result<String> {
     write!(err, "{text}").context("writing the prompt")?;
     err.flush().context("flushing the prompt")?;
     let mut answer = String::new();
-    std::io::stdin()
+    let read = std::io::stdin()
         .read_line(&mut answer)
         .context("reading the answer")?;
+    // End of input is not an answer: never loop on it or take it as a default.
+    anyhow::ensure!(
+        read > 0,
+        "the prompt reached end of input; pass the value as an option instead"
+    );
     Ok(answer)
 }
 
@@ -407,21 +421,48 @@ enum Prior {
     /// A 0.4 credential for this same server: a re-login.
     SameServer,
     /// Leftovers of another enrollment: a credential for another server, a
-    /// 0.3 credential this version cannot read, or a 0.3 config without one.
-    /// This login is a fresh enrollment.
+    /// 0.3 credential this version cannot read, or a 0.3 config (no `trust`)
+    /// without one. This login is a fresh enrollment.
     Stale,
 }
 
+/// `url` as an origin (`scheme://host[:port]`), so spellings of one server compare equal.
+fn origin_of(url: &str) -> Option<String> {
+    let with_scheme = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("https://{url}")
+    };
+    url::Url::parse(&with_scheme)
+        .ok()
+        .map(|url| url.origin().ascii_serialization())
+}
+
+/// `this_server` holds every name of the server being logged into (the URL
+/// given and its announced public origin).
 fn prior_enrollment(
     saved_server: Option<&str>,
+    saved_trust: Option<TrustValue>,
     credential: Result<Option<crate::state::NodeCredential>>,
-    server_url: &str,
+    this_server: &[&str],
 ) -> Prior {
+    let here = |url: &str| {
+        origin_of(url).is_some_and(|origin| {
+            this_server
+                .iter()
+                .any(|name| origin_of(name).as_deref() == Some(origin.as_str()))
+        })
+    };
     match credential {
-        Ok(Some(credential)) if credential.server == server_url => Prior::SameServer,
+        Ok(Some(credential)) if here(&credential.server) => Prior::SameServer,
         Ok(Some(_)) | Err(_) => Prior::Stale,
-        Ok(None) if saved_server.is_some() => Prior::Stale,
-        Ok(None) => Prior::None,
+        // `wsmp logout` keeps the 0.4 config (it has `trust`): logging back
+        // in to the same server is a re-login, not a fresh enrollment.
+        Ok(None) => match saved_server {
+            None => Prior::None,
+            Some(server) if saved_trust.is_some() && here(server) => Prior::SameServer,
+            Some(_) => Prior::Stale,
+        },
     }
 }
 
@@ -557,26 +598,51 @@ mod tests {
     #[test]
     fn leftovers_of_another_enrollment_make_a_fresh_one() {
         let here = "https://models.example.com";
-        assert_eq!(prior_enrollment(None, Ok(None), here), Prior::None);
+        let names = [here, "https://public.example.com"];
+        let full = Some(TrustValue::Full);
+        assert_eq!(prior_enrollment(None, None, Ok(None), &names), Prior::None);
         assert_eq!(
-            prior_enrollment(Some(here), Ok(Some(credential(here))), here),
+            prior_enrollment(Some(here), full, Ok(Some(credential(here))), &names),
             Prior::SameServer
         );
-        // Another server, a 0.3 credential (unreadable here), or a 0.3
-        // config without a 0.4 credential.
+        // Another spelling of this server (as typed, or its public origin).
         assert_eq!(
             prior_enrollment(
                 Some(here),
+                full,
+                Ok(Some(credential("https://public.example.com/"))),
+                &names
+            ),
+            Prior::SameServer
+        );
+        // After `wsmp logout`: the 0.4 config (with trust) stays, the credential goes.
+        assert_eq!(
+            prior_enrollment(Some(here), full, Ok(None), &names),
+            Prior::SameServer
+        );
+        // Another server, a 0.3 credential (unreadable here), a 0.3 config
+        // without a 0.4 credential, or a 0.4 config for another server.
+        assert_eq!(
+            prior_enrollment(
+                Some(here),
+                full,
                 Ok(Some(credential("https://old.example"))),
-                here
+                &names
             ),
             Prior::Stale
         );
         assert_eq!(
-            prior_enrollment(Some(here), Err(anyhow::anyhow!("0.3 format")), here),
+            prior_enrollment(Some(here), None, Err(anyhow::anyhow!("0.3 format")), &names),
             Prior::Stale
         );
-        assert_eq!(prior_enrollment(Some(here), Ok(None), here), Prior::Stale);
+        assert_eq!(
+            prior_enrollment(Some(here), None, Ok(None), &names),
+            Prior::Stale
+        );
+        assert_eq!(
+            prior_enrollment(Some("https://old.example"), full, Ok(None), &names),
+            Prior::Stale
+        );
     }
 
     #[test]
