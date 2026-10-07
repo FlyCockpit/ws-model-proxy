@@ -817,6 +817,9 @@ pub struct GpuRow {
     pub uuid: Option<String>,
     pub driver_version: Option<String>,
     pub memory_total_mib: Option<u64>,
+    /// `memory.total` read exactly `[N/A]` (a unified-memory GPU such as
+    /// GB10), not an error like `[Unknown Error]`.
+    pub memory_not_applicable: bool,
     pub memory_used_mib: Option<u64>,
     pub utilization_percent: Option<f64>,
     pub temperature_c: Option<f64>,
@@ -848,6 +851,7 @@ pub fn parse_nvidia_smi(text: &str) -> Vec<GpuRow> {
                 uuid: gpu_field(fields[2]).and_then(clip),
                 driver_version: gpu_field(fields[3]).and_then(clip),
                 memory_total_mib: number(4).map(|value| value as u64),
+                memory_not_applicable: fields[4].trim().eq_ignore_ascii_case("[n/a]"),
                 memory_used_mib: number(5).map(|value| value as u64),
                 utilization_percent: number(6),
                 temperature_c: number(7),
@@ -1374,6 +1378,8 @@ mod tests {
         assert_eq!(rows[0].memory_total_mib, Some(24_564));
         assert_eq!(rows[0].power_w, Some(61.25));
         assert_eq!(rows[1].memory_total_mib, None);
+        assert!(rows[1].memory_not_applicable);
+        assert!(!rows[0].memory_not_applicable);
         assert_eq!(rows[1].power_w, None);
         assert_eq!(rows[1].name.as_deref(), Some("NVIDIA GB10"));
     }

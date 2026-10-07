@@ -10,7 +10,10 @@
 //!   `mem_info_gtt_total`, `uevent`) joined with the KFD topology
 //!   (`gfx_target_version`) by render minor. `amd-smi` (else `rocm-smi`)
 //!   only names the GPUs. An APU (Strix Halo, Phoenix, ...) can address its
-//!   VRAM carve-out plus GTT, never more than physical memory.
+//!   VRAM carve-out plus GTT (capped by `ttm.pages_limit`), never more than
+//!   physical memory. An integrated GPU beside a discrete one is left out.
+//! - NVIDIA errors (`[Unknown Error]`) never make a node unified: only an
+//!   exact `[N/A]` on GB10 / Thor or an Arm host does.
 //! - Apple silicon: `sysctl` `hw.memsize`, the chip name, and the GPU wired
 //!   limit (`iogpu.wired_limit_mb`, else macOS's default share).
 //!
@@ -91,10 +94,10 @@ const APU_GFX_TARGETS: &[&str] = &[
 
 /// Integrated GPU PCI device ids and names (when no tool names them).
 const APU_DEVICES: &[(&str, &str)] = &[
-    ("1586", "Radeon 8060S (Strix Halo)"),
-    ("150e", "Radeon 890M (Strix Point)"),
-    ("1114", "Radeon 860M (Krackan Point)"),
-    ("15bf", "Radeon 780M (Phoenix)"),
+    ("1586", "Radeon 8050S/8060S (Strix Halo)"),
+    ("150e", "Radeon 880M/890M (Strix Point)"),
+    ("1114", "Radeon 840M/860M (Krackan Point)"),
+    ("15bf", "Radeon 760M/780M (Phoenix)"),
     ("15c8", "Radeon 740M (Phoenix 2)"),
     ("1681", "Radeon 680M (Rembrandt)"),
     ("164e", "Radeon Graphics (Raphael)"),
@@ -121,7 +124,18 @@ pub struct Sources {
     pub cpu_model: Option<String>,
     pub nvidia: Vec<GpuRow>,
     pub amd: Vec<AmdGpu>,
+    /// `/sys/module/ttm/parameters/pages_limit`: TTM caps GTT (and KFD)
+    /// allocations here even when `mem_info_gtt_total` says more.
+    pub ttm_pages_limit: Option<u64>,
     pub apple: Option<AppleFacts>,
+}
+
+/// TTM pages are 4 KiB on the x86 APUs this applies to.
+const TTM_PAGE_BYTES: u64 = 4096;
+
+/// Read the TTM page limit under `root`.
+pub fn read_ttm_pages_limit(root: &Path) -> Option<u64> {
+    sysfs_number(&root.join("sys/module/ttm/parameters/pages_limit")).filter(|pages| *pages > 0)
 }
 
 /// Detect this machine's hardware. `nvidia` are this round's `nvidia-smi`
@@ -150,6 +164,7 @@ fn gather(nvidia: Vec<GpuRow>) -> Sources {
             .and_then(|text| crate::telemetry::parse_cpu_model(&text)),
         nvidia,
         amd: read_amd_sysfs(Path::new("/")),
+        ttm_pages_limit: read_ttm_pages_limit(Path::new("/")),
         apple: None,
     };
     if !sources.amd.is_empty() {
@@ -199,10 +214,19 @@ fn amd_tool_names() -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-/// The JSON document in a tool's stdout (some versions print a banner).
+/// The JSON document in a tool's stdout (some versions print a banner,
+/// which may hold brackets itself): the first line that starts one.
 fn json_in(text: &str) -> Option<serde_json::Value> {
-    let start = text.find(['[', '{'])?;
-    serde_json::from_str(&text[start..]).ok()
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with(['[', '{'])
+            && let Ok(value) = serde_json::from_str(&text[offset..])
+        {
+            return Some(value);
+        }
+        offset += line.len();
+    }
+    None
 }
 
 fn usable_name(name: &str) -> Option<String> {
@@ -221,13 +245,10 @@ pub fn parse_amd_smi_names(text: &str) -> BTreeMap<String, String> {
     };
     let list = match value {
         serde_json::Value::Array(list) => list,
-        serde_json::Value::Object(object) => object
-            .into_iter()
-            .find_map(|(_, value)| match value {
-                serde_json::Value::Array(list) => Some(list),
-                _ => None,
-            })
-            .unwrap_or_default(),
+        serde_json::Value::Object(mut object) => match object.remove("gpu_data") {
+            Some(serde_json::Value::Array(list)) => list,
+            _ => Vec::new(),
+        },
         _ => Vec::new(),
     };
     list.iter()
@@ -285,7 +306,7 @@ pub fn name_amd_gpus(gpus: &mut [AmdGpu], names: &BTreeMap<String, String>) {
 /// LLVM target name, e.g. 110501 is `gfx1151`, 90012 is `gfx90c`.
 pub fn gfx_target(version: u64) -> Option<String> {
     let (major, minor, step) = (version / 10_000, (version / 100) % 100, version % 100);
-    if major == 0 || minor > 15 || step > 15 {
+    if !(1..=99).contains(&major) || minor > 15 || step > 15 {
         return None;
     }
     Some(format!("gfx{major}{minor:x}{step:x}"))
@@ -423,68 +444,146 @@ fn mib(bytes: u64) -> u64 {
     bytes / MIB
 }
 
+/// A GPU sharing system memory: `memory.total` exactly `[N/A]` on a
+/// unified part (GB10, Thor) or an Arm host. An error such as
+/// `[Unknown Error]` on a discrete card never makes the node unified.
+fn is_unified_nvidia(row: &GpuRow) -> bool {
+    row.memory_total_mib.is_none()
+        && row.memory_not_applicable
+        && (cfg!(target_arch = "aarch64")
+            || row
+                .name
+                .as_deref()
+                .is_some_and(|name| name.contains("GB10") || name.contains("Thor")))
+}
+
+fn nvidia_info(row: &GpuRow) -> Option<NodeGpuInfo> {
+    Some(NodeGpuInfo {
+        vendor: GpuVendorWire::Nvidia,
+        index: u8::try_from(row.index).ok()?,
+        name: row.name.clone(),
+        uuid: row.uuid.clone(),
+        driver_version: row.driver_version.clone(),
+        vram_total_mib: row.memory_total_mib,
+        gtt_total_mib: None,
+        gfx_target: None,
+        apu: is_unified_nvidia(row).then_some(true),
+        pci_id: None,
+    })
+}
+
+/// AMD GPUs indexed in order among those listed (ROCm numbers the GPUs it
+/// uses the same way, skipping integrated ones beside discrete cards).
+fn amd_infos<'a>(
+    gpus: impl Iterator<Item = &'a AmdGpu>,
+    gtt_cap_mib: Option<u64>,
+) -> Vec<NodeGpuInfo> {
+    gpus.enumerate()
+        .filter_map(|(index, gpu)| {
+            let gtt = gpu.gtt_bytes.map(mib);
+            Some(NodeGpuInfo {
+                vendor: GpuVendorWire::Amd,
+                index: u8::try_from(index).ok()?,
+                name: gpu.name.clone(),
+                uuid: None,
+                driver_version: None,
+                vram_total_mib: gpu.vram_bytes.map(mib),
+                gtt_total_mib: match (gtt, gtt_cap_mib) {
+                    (Some(gtt), Some(cap)) => Some(gtt.min(cap)),
+                    (gtt, _) => gtt,
+                },
+                gfx_target: gpu.gfx_target.clone(),
+                apu: Some(gpu.is_apu()),
+                pci_id: gpu.pci_id.clone(),
+            })
+        })
+        .collect()
+}
+
+fn describe(gpu: &AmdGpu) -> String {
+    gpu.name
+        .clone()
+        .or_else(|| gpu.pci_id.clone())
+        .unwrap_or_else(|| gpu.pci_slot.clone())
+}
+
 /// Build the report from gathered sources. Pure.
 pub fn assemble(sources: Sources) -> Hardware {
     let mut notes = Vec::new();
-    let mut gpus = Vec::new();
     let meminfo = sources.meminfo_total_mib;
-
-    let nvidia_discrete: Vec<&GpuRow> = sources
-        .nvidia
-        .iter()
-        .filter(|row| row.memory_total_mib.is_some())
-        .collect();
-    let nvidia_unified = sources
-        .nvidia
-        .iter()
-        .any(|row| row.memory_total_mib.is_none());
-    for row in &sources.nvidia {
-        let Ok(index) = u8::try_from(row.index) else {
-            continue;
-        };
-        gpus.push(NodeGpuInfo {
-            vendor: GpuVendorWire::Nvidia,
-            index,
-            name: row.name.clone(),
-            uuid: row.uuid.clone(),
-            driver_version: row.driver_version.clone(),
-            vram_total_mib: row.memory_total_mib,
-            gtt_total_mib: None,
-            gfx_target: None,
-            apu: row.memory_total_mib.is_none().then_some(true),
-            pci_id: None,
-        });
-    }
-    let amd_discrete_mib: u64 = sources
-        .amd
-        .iter()
-        .filter(|gpu| !gpu.is_apu())
-        .filter_map(|gpu| gpu.vram_bytes.map(mib))
-        .sum();
-    let amd_has_discrete = sources.amd.iter().any(|gpu| !gpu.is_apu());
-    for (index, gpu) in sources.amd.iter().enumerate() {
-        let Ok(index) = u8::try_from(index) else {
-            continue;
-        };
-        gpus.push(NodeGpuInfo {
-            vendor: GpuVendorWire::Amd,
-            index,
-            name: gpu.name.clone(),
-            uuid: None,
-            driver_version: None,
-            vram_total_mib: gpu.vram_bytes.map(mib),
-            gtt_total_mib: gpu.gtt_bytes.map(mib),
-            gfx_target: gpu.gfx_target.clone(),
-            apu: Some(gpu.is_apu()),
-            pci_id: gpu.pci_id.clone(),
-        });
-    }
+    let gtt_cap_mib = sources
+        .ttm_pages_limit
+        .map(|pages| mib(pages.saturating_mul(TTM_PAGE_BYTES)));
+    let cpu_model = sources
+        .cpu_model
+        .clone()
+        .or_else(|| sources.apple.as_ref().and_then(|facts| facts.chip.clone()));
     let apple_silicon = sources.apple.as_ref().filter(|facts| {
         facts
             .chip
             .as_deref()
             .is_some_and(|chip| chip.starts_with("Apple"))
     });
+    let physical_mib = meminfo.or_else(|| {
+        sources
+            .apple
+            .as_ref()
+            .and_then(|facts| facts.memsize_bytes.map(mib))
+    });
+
+    let nvidia_unified = sources.nvidia.iter().any(is_unified_nvidia);
+    let nvidia_other = sources.nvidia.iter().any(|row| !is_unified_nvidia(row));
+    let amd_discrete: Vec<&AmdGpu> = sources.amd.iter().filter(|gpu| !gpu.is_apu()).collect();
+
+    // Discrete accelerators decide the kind: an integrated GPU beside one
+    // (a desktop CPU's iGPU) is not where models go, and listing it would
+    // make it a placement target.
+    if nvidia_other || !amd_discrete.is_empty() {
+        let mut gpus: Vec<NodeGpuInfo> = sources.nvidia.iter().filter_map(nvidia_info).collect();
+        gpus.extend(amd_infos(amd_discrete.iter().copied(), gtt_cap_mib));
+        gpus.truncate(crate::protocol::NODE_GPU_MAX);
+        let unknown = sources
+            .nvidia
+            .iter()
+            .filter(|row| row.memory_total_mib.is_none())
+            .count();
+        let total = sources
+            .nvidia
+            .iter()
+            .filter_map(|row| row.memory_total_mib)
+            .chain(
+                amd_discrete
+                    .iter()
+                    .filter_map(|gpu| gpu.vram_bytes.map(mib)),
+            )
+            .fold(0u64, u64::saturating_add);
+        notes.push(format!(
+            "discrete: accelerator memory is the sum of dedicated VRAM ({total} MiB)"
+        ));
+        if unknown > 0 {
+            notes.push(format!(
+                "{unknown} NVIDIA GPU(s) reported no memory total (a driver error?): listed, not counted"
+            ));
+        }
+        for apu in sources.amd.iter().filter(|gpu| gpu.is_apu()) {
+            notes.push(format!(
+                "integrated GPU {} beside discrete ones: not listed, not counted",
+                describe(apu)
+            ));
+        }
+        return Hardware {
+            node_kind: NodeKind::Discrete,
+            memory_total_mib: physical_mib,
+            unified_memory_mib: None,
+            accelerator_memory_mib: (total > 0).then_some(total),
+            cpu_model,
+            gpus,
+            notes,
+        };
+    }
+
+    let mut gpus: Vec<NodeGpuInfo> = sources.nvidia.iter().filter_map(nvidia_info).collect();
+    gpus.extend(amd_infos(sources.amd.iter(), gtt_cap_mib));
     if let Some(facts) = apple_silicon {
         gpus.push(NodeGpuInfo {
             vendor: GpuVendorWire::Apple,
@@ -500,43 +599,6 @@ pub fn assemble(sources: Sources) -> Hardware {
         });
     }
     gpus.truncate(crate::protocol::NODE_GPU_MAX);
-
-    let cpu_model = sources
-        .cpu_model
-        .clone()
-        .or_else(|| sources.apple.as_ref().and_then(|facts| facts.chip.clone()));
-    let physical_mib = meminfo.or_else(|| {
-        sources
-            .apple
-            .as_ref()
-            .and_then(|facts| facts.memsize_bytes.map(mib))
-    });
-
-    // Discrete accelerators decide the kind: an integrated GPU beside one
-    // (a desktop CPU's iGPU) is not where models go.
-    if !nvidia_discrete.is_empty() || amd_has_discrete {
-        let nvidia_mib: u64 = nvidia_discrete
-            .iter()
-            .filter_map(|row| row.memory_total_mib)
-            .sum();
-        let total = nvidia_mib.saturating_add(amd_discrete_mib);
-        notes.push(format!(
-            "discrete: accelerator memory is the sum of dedicated VRAM ({total} MiB)"
-        ));
-        if nvidia_unified || sources.amd.iter().any(AmdGpu::is_apu) {
-            notes.push("integrated GPUs beside discrete ones are listed, not counted".into());
-        }
-        return Hardware {
-            node_kind: NodeKind::Discrete,
-            memory_total_mib: physical_mib,
-            unified_memory_mib: None,
-            accelerator_memory_mib: (total > 0).then_some(total),
-            cpu_model,
-            gpus,
-            notes,
-        };
-    }
-
     let unified = |pool: Option<u64>, physical: Option<u64>, notes: Vec<String>, gpus| Hardware {
         node_kind: NodeKind::Unified,
         memory_total_mib: physical,
@@ -549,7 +611,7 @@ pub fn assemble(sources: Sources) -> Hardware {
 
     if nvidia_unified {
         notes.push(
-            "unified (NVIDIA, no dedicated VRAM reported): the pool is MemTotal; \
+            "unified (NVIDIA, no dedicated VRAM): the pool is MemTotal; \
              the server keeps 2 GiB headroom"
                 .into(),
         );
@@ -558,18 +620,26 @@ pub fn assemble(sources: Sources) -> Hardware {
 
     if let Some(apu) = sources.amd.iter().find(|gpu| gpu.is_apu()) {
         let vram = apu.vram_bytes.map(mib).unwrap_or(0);
-        let gtt = apu.gtt_bytes.map(mib).unwrap_or(0);
+        let raw_gtt = apu.gtt_bytes.map(mib).unwrap_or(0);
+        let gtt = gtt_cap_mib.map_or(raw_gtt, |cap| raw_gtt.min(cap));
         // `MemTotal` excludes the BIOS carve-out.
         let physical = meminfo.map(|total| total.saturating_add(vram));
         let addressable = vram.saturating_add(gtt);
         // Unknown GPU limits leave the pool unreported: placement then falls
         // back to physical memory, as it would without this report.
         let pool = (addressable > 0).then(|| physical.map_or(addressable, |p| addressable.min(p)));
+        let unknown = || "unknown".to_string();
         notes.push(format!(
             "unified (AMD APU): pool = min(VRAM carve-out {vram} MiB + GTT {gtt} MiB, \
-             physical {} MiB); raise GTT (amdgpu.gttsize / ttm.pages_limit) to grow it",
-            physical.map_or_else(|| "unknown".to_string(), |value| value.to_string())
+             physical {} MiB)",
+            physical.map_or_else(unknown, |value| value.to_string())
         ));
+        if gtt < raw_gtt {
+            notes.push(format!(
+                "GTT is {raw_gtt} MiB but ttm.pages_limit caps allocations at {gtt} MiB; \
+                 raise ttm.pages_limit (and ttm.page_pool_size) to use more"
+            ));
+        }
         return unified(pool, physical, notes, gpus);
     }
 
@@ -599,8 +669,6 @@ pub fn assemble(sources: Sources) -> Hardware {
     }
 }
 
-/// Recorded machines under `tests/fixtures/hardware/<machine>`, read with
-/// the same parsers production uses.
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
@@ -641,6 +709,7 @@ pub(crate) mod fixtures {
             cpu_model: parse_cpu_model(&fixture(machine, "root/proc/cpuinfo")),
             nvidia: parse_nvidia_smi(&fixture(machine, "nvidia-smi.csv")),
             amd,
+            ttm_pages_limit: read_ttm_pages_limit(&root),
             apple: (!sysctl.is_empty()).then(|| parse_sysctl(&sysctl)),
         }
     }
@@ -705,7 +774,7 @@ mod tests {
         // rocm-smi names it generically: the device table is more specific.
         assert_eq!(
             hardware.gpus[0].name.as_deref(),
-            Some("AMD Radeon 8060S (Strix Halo)")
+            Some("AMD Radeon 8050S/8060S (Strix Halo)")
         );
     }
 
@@ -720,11 +789,55 @@ mod tests {
         assert_eq!(nvidia.name.as_deref(), Some("NVIDIA GeForce RTX 3090"));
         assert_eq!(nvidia.vram_total_mib, Some(24576));
         assert_eq!(nvidia.apu, None);
-        let igpu = &hardware.gpus[1];
-        assert_eq!(igpu.vendor, GpuVendorWire::Amd);
-        assert_eq!(igpu.apu, Some(true));
-        assert_eq!(igpu.gfx_target.as_deref(), Some("gfx1036"));
-        assert_eq!(igpu.name.as_deref(), Some("AMD Radeon Graphics (Raphael)"));
+        // The Raphael iGPU is not a placement target: only a note names it.
+        assert_eq!(hardware.gpus.len(), 1);
+        assert!(
+            hardware
+                .notes
+                .iter()
+                .any(|note| note.contains("AMD Radeon Graphics (Raphael)"))
+        );
+        let raphael = read_amd_sysfs(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hardware/rtx-3090/root"),
+        );
+        assert_eq!(raphael[0].gfx_target.as_deref(), Some("gfx1036"));
+        assert!(raphael[0].is_apu());
+    }
+
+    #[test]
+    fn a_driver_error_on_a_discrete_nvidia_gpu_never_makes_the_node_unified() {
+        let mut sources = sources("rtx-3090");
+        sources.nvidia = crate::telemetry::parse_nvidia_smi(
+            "0, NVIDIA GeForce RTX 3090, GPU-x, 580.82.09, [Unknown Error], [Unknown Error], 0, 34, 28.61, 210\n",
+        );
+        let hardware = assemble(sources);
+        assert_eq!(hardware.node_kind, NodeKind::Discrete);
+        assert_eq!(hardware.unified_memory_mib, None);
+        assert_eq!(hardware.accelerator_memory_mib, None);
+        assert_eq!(hardware.gpus[0].apu, None);
+        assert!(
+            hardware
+                .notes
+                .iter()
+                .any(|note| note.contains("no memory total"))
+        );
+    }
+
+    #[test]
+    fn gtt_beyond_the_ttm_page_limit_is_not_counted() {
+        // `amdgpu.gttsize=122880` without `ttm.pages_limit`: TTM keeps its
+        // default, half of RAM (127494 MiB / 2 in 4 KiB pages).
+        let mut sources = sources("strix-halo");
+        sources.ttm_pages_limit = Some(127_494 * 256 / 2);
+        let hardware = assemble(sources);
+        assert_eq!(hardware.unified_memory_mib, Some(512 + 63_747));
+        assert_eq!(hardware.gpus[0].gtt_total_mib, Some(63_747));
+        assert!(
+            hardware
+                .notes
+                .iter()
+                .any(|note| note.contains("ttm.pages_limit"))
+        );
     }
 
     #[test]
@@ -804,6 +917,12 @@ mod tests {
         assert_eq!(gfx_target(90012).as_deref(), Some("gfx90c"));
         assert_eq!(gfx_target(100300).as_deref(), Some("gfx1030"));
         assert_eq!(gfx_target(0), None);
+        assert_eq!(gfx_target(4_294_967_295), None);
+        // A banner holding brackets before the JSON.
+        let names = parse_amd_smi_names(
+            "[WARNING] driver {old}\n[{\"gpu\":0,\"asic\":{\"market_name\":\"AMD Radeon RX 7900 XTX\"},\"bus\":{\"bdf\":\"0000:03:00.0\"}}]",
+        );
+        assert_eq!(names.len(), 1);
         // A banner before the JSON and an `N/A` name.
         let names = parse_amd_smi_names(
             "WARNING: something\n[{\"gpu\":0,\"asic\":{\"market_name\":\"N/A\"},\"bus\":{\"bdf\":\"0000:03:00.0\"}}]",
@@ -824,7 +943,14 @@ mod tests {
             let hardware = assemble(sources(machine));
             for gpu in &hardware.gpus {
                 if let Some(target) = &gpu.gfx_target {
-                    assert!(target.starts_with("gfx") && (6..=8).contains(&target.len()));
+                    let digits = target.strip_prefix("gfx").unwrap_or_default();
+                    assert!(
+                        (3..=5).contains(&digits.len())
+                            && digits
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                        "{target}"
+                    );
                 }
                 if let Some(id) = &gpu.pci_id {
                     assert!(is_pci_id(id), "{id}");

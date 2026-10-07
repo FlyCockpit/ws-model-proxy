@@ -156,6 +156,7 @@ mod tests {
         let rtx = format_hardware(&assemble(sources("rtx-3090")));
         assert_eq!(rtx[0], "kind: discrete");
         assert!(rtx.contains(&"accelerator memory: 24.0 GiB (24576 MiB)".into()));
+        assert!(!rtx.iter().any(|line| line.starts_with("  amd:")));
 
         for machine in MACHINES {
             let lines = format_hardware(&assemble(sources(machine)));
