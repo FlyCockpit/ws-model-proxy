@@ -1,0 +1,150 @@
+{
+  "openapi": "3.1.0",
+  "info": { "title": "Strict Engine", "version": "1.2.3" },
+  "paths": {
+    "/v1/chat/completions": {
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ChatCompletionRequest" }
+            }
+          }
+        }
+      }
+    },
+    "/v1/embeddings": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  { "$ref": "#/components/schemas/EmbeddingCompletionRequest" },
+                  { "$ref": "#/components/schemas/EmbeddingChatRequest" }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/responses": { "post": { "summary": "raw request, no schema" } },
+    "/health": { "get": {} }
+  },
+  "components": {
+    "schemas": {
+      "ChatCompletionRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "model": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "messages": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                { "$ref": "#/components/schemas/SystemMessage" },
+                { "$ref": "#/components/schemas/UserMessage" },
+                { "$ref": "#/components/schemas/AssistantMessage" }
+              ]
+            }
+          },
+          "max_tokens": { "type": "integer" },
+          "temperature": { "type": "number" },
+          "stream": { "type": "boolean" },
+          "stream_options": {
+            "anyOf": [{ "$ref": "#/components/schemas/StreamOptions" }, { "type": "null" }]
+          },
+          "top_k": { "type": "integer" },
+          "tools": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": { "const": "function" },
+                "function": {
+                  "type": "object",
+                  "properties": {
+                    "name": { "type": "string" },
+                    "description": { "type": "string" },
+                    "parameters": { "type": "object", "additionalProperties": true }
+                  }
+                }
+              }
+            }
+          },
+          "chat_template_kwargs": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "StreamOptions": {
+        "type": "object",
+        "properties": { "include_usage": { "type": "boolean" } }
+      },
+      "SystemMessage": {
+        "type": "object",
+        "properties": { "role": { "const": "system" }, "content": { "type": "string" } }
+      },
+      "UserMessage": {
+        "type": "object",
+        "properties": {
+          "role": { "enum": ["user"] },
+          "content": {
+            "anyOf": [
+              { "type": "string" },
+              {
+                "type": "array",
+                "items": {
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/TextPart" },
+                    { "$ref": "#/components/schemas/ImagePart" }
+                  ]
+                }
+              }
+            ]
+          },
+          "name": { "type": "string" }
+        }
+      },
+      "AssistantMessage": {
+        "allOf": [
+          {
+            "type": "object",
+            "properties": { "role": { "const": "assistant" }, "content": { "type": "string" } }
+          },
+          { "type": "object", "properties": { "tool_calls": { "type": "array", "items": {} } } }
+        ]
+      },
+      "TextPart": {
+        "type": "object",
+        "properties": { "type": { "const": "text" }, "text": { "type": "string" } }
+      },
+      "ImagePart": {
+        "type": "object",
+        "properties": {
+          "type": { "const": "image_url" },
+          "image_url": { "type": "object", "properties": { "url": { "type": "string" } } }
+        }
+      },
+      "EmbeddingCompletionRequest": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string" },
+          "input": {},
+          "dimensions": { "type": "integer" }
+        }
+      },
+      "EmbeddingChatRequest": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string" },
+          "messages": { "type": "array", "items": {} }
+        }
+      },
+      "Loop": {
+        "type": "object",
+        "properties": { "self": { "$ref": "#/components/schemas/Loop" } }
+      }
+    }
+  }
+}

@@ -1,0 +1,80 @@
+import { readFile } from "node:fs/promises";
+import { describe, expect, it } from "vitest";
+import { parseEngineRejection, resolveLocation, upstreamErrorExcerpt } from "./engine-errors.js";
+
+type Case = {
+  name: string;
+  status: number;
+  body: string;
+  request: unknown;
+  headers?: Record<string, string>;
+  expect: unknown;
+};
+
+const fixture = JSON.parse(
+  await readFile(new URL("./fixtures/engine-errors.json", import.meta.url), "utf8"),
+) as { cases: Case[] };
+
+describe("engine 400 parsing", () => {
+  it.each(fixture.cases.map((entry) => [entry.name, entry] as const))("%s", (_name, entry) => {
+    expect(
+      parseEngineRejection({
+        status: entry.status,
+        bodyText: entry.body,
+        requestBody: entry.request,
+        requestHeaders: new Headers(entry.headers ?? {}),
+      }),
+    ).toEqual(entry.expect);
+  });
+
+  it("names a nested key by its unique path when the error gives only its name", () => {
+    expect(
+      parseEngineRejection({
+        status: 400,
+        bodyText: '{"error":"unknown field `strict`, expected one of `name`"}',
+        requestBody: { tools: [{ type: "function", function: { name: "f", strict: true } }] },
+        requestHeaders: new Headers(),
+      }),
+    ).toEqual({ kind: "field", path: "tools[].function.strict" });
+  });
+
+  it("does not guess between two keys of the same name", () => {
+    expect(
+      parseEngineRejection({
+        status: 400,
+        bodyText: '{"error":"unknown field `extra`"}',
+        requestBody: { a: { extra: 1 }, b: { extra: 2 } },
+        requestHeaders: new Headers(),
+      }),
+    ).toBeNull();
+  });
+
+  it("ignores a header the request did not send", () => {
+    expect(
+      parseEngineRejection({
+        status: 400,
+        bodyText: "Unexpected value(s) `x` for the `anthropic-beta` header.",
+        requestBody: {},
+        requestHeaders: new Headers(),
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("resolveLocation", () => {
+  it("skips union tags and needs the last key to exist", () => {
+    const body = { messages: [{ role: "user", content: [{ type: "text", text: "x", y: 1 }] }] };
+    expect(
+      resolveLocation(["body", "messages", 0, "user", "content", 0, "TextPart", "y"], body),
+    ).toBe("messages[].content[].y");
+    expect(resolveLocation(["body", "messages", 0, "missing"], body)).toBeNull();
+    expect(resolveLocation(["body", "messages", 7, "role"], body)).toBeNull();
+  });
+});
+
+describe("upstreamErrorExcerpt", () => {
+  it("is printable and bounded", () => {
+    expect(upstreamErrorExcerpt("a\u0000b\nc")).toBe("a b c");
+    expect(upstreamErrorExcerpt("x".repeat(400))).toHaveLength(301);
+  });
+});
