@@ -148,7 +148,7 @@ import { applyMetricRoutingVerdicts } from "./metric-routing-order.js";
 import {
   multimodalFlagsFromCapabilities,
   openAiModelListExtensions,
-  unionMultimodalFlags,
+  poolModelListFlags,
 } from "./model-list-modalities.js";
 import {
   MultipartIngressError,
@@ -3615,15 +3615,7 @@ async function modelListResponse(
     targets.pools.map(async (pool) => {
       const rows = await poolMemberRows(pool.id);
       if (rows.some((row) => routeIsServing(row, onlineNodeIds))) servingPoolIds.add(pool.id);
-      const byModel = new Map(rows.map((row) => [row.model.id, row.model] as const));
-      poolFlagsById.set(
-        pool.id,
-        unionMultimodalFlags(
-          [...byModel.values()].map((model) =>
-            multimodalFlagsFromCapabilities(openAiCapabilitiesFromCoarse(model.capabilities)),
-          ),
-        ),
-      );
+      poolFlagsById.set(pool.id, poolModelListFlags(rows));
     }),
   );
 

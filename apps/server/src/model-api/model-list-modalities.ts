@@ -12,7 +12,10 @@
  * Extra fields are ignored by strict OpenAI SDKs.
  */
 
-import { audioOperationSupported } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import {
+  audioOperationSupported,
+  openAiCapabilitiesFromCoarse,
+} from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import type { OpenAiCompatibleCapabilities } from "../relay/protocol.js";
 import { realtimeTranscriptionCapability } from "../relay/stt-relay.js";
 
@@ -166,6 +169,28 @@ export function unionMultimodalFlags(flags: MultimodalFlags[]): MultimodalFlags 
       audioTranscription: false,
       audioTranslation: false,
     },
+  );
+}
+
+/**
+ * What `/v1/models` advertises for a pool: the union of its ACTIVE members' served-model
+ * capabilities (the owner's override, else what the node detected), never a guess from the
+ * model's name or a catalog. A disabled member (say a vision model switched off) does not
+ * make the text-only members still serving look multimodal.
+ */
+export function poolModelListFlags(
+  rows: ReadonlyArray<{
+    active?: boolean;
+    model: { id: string; capabilities: readonly string[] };
+  }>,
+): MultimodalFlags {
+  const byModel = new Map(
+    rows.filter((row) => row.active !== false).map((row) => [row.model.id, row.model] as const),
+  );
+  return unionMultimodalFlags(
+    [...byModel.values()].map((model) =>
+      multimodalFlagsFromCapabilities(openAiCapabilitiesFromCoarse(model.capabilities)),
+    ),
   );
 }
 
