@@ -136,7 +136,8 @@ export function targetFailureClassForRelayFailure(
  * translated a surface the member does not serve natively, e.g. a Responses request onto chat
  * completions) that the engine answers with a 5xx, or whose reply the adapter cannot
  * translate, is evidence about the translation, not the member: it never degrades it. An
- * unreachable target (transport, timeout, disconnect) still counts.
+ * unreachable target (transport, timeout, disconnect) still counts. So a member that fails
+ * every translated request stays HEALTHY; native requests still judge it.
  */
 export function targetHealthFailure(
   failure: RelayFailureClass,
@@ -545,8 +546,9 @@ export async function markTargetHalfOpenTrial({
 
 /**
  * An inconclusive half-open trial (the attempt failed for a reason that is not the target's):
- * the target is degraded (unhealthy after enough failures) again with its current backoff, so
- * the recovery probe and the next due request may try it; no failure is counted.
+ * the target waits out its current backoff as UNHEALTHY, which the recovery probe and the next
+ * due request both try again (a DEGRADED one could be left to a probe that cannot cover its
+ * model type); no failure is counted.
  */
 async function returnTargetTrial({
   executionTargetId,
@@ -566,7 +568,7 @@ async function returnTargetTrial({
   await prisma.executionTarget.updateMany({
     where: { id: executionTargetId, health: "HALF_OPEN", halfOpenTrialStartedAt: trialStartedAt },
     data: {
-      health: failures >= TARGET_UNHEALTHY_AFTER_RETRYABLE_FAILURES ? "UNHEALTHY" : "DEGRADED",
+      health: "UNHEALTHY",
       halfOpenTrialStartedAt: null,
       nextRetryAt: new Date(now.getTime() + targetRecoveryDelayMs(failures)),
     },

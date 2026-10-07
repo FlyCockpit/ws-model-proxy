@@ -5189,8 +5189,9 @@ async function relayPool({
     selectedLegacyProtocolCandidates.map(poolRouteRowOf),
     unknownFallbackMembers.map(poolRouteRowOf),
   ] as const;
-  // A degraded route of one group falls back only when no group has a healthy route.
-  const alternatives = groupRows.flat();
+  // A degraded route of one group falls back only when no known-compatible group has a
+  // healthy route (an optimistic unknown-capability member is no alternative).
+  const alternatives = groupRows.slice(0, 3).flat();
   // Native first, then adapted, legacy and unknown (the sort below keeps that rank).
   const localRouteCandidates = groupRows.flatMap((routes) => {
     const sequence = buildPoolRouteSequence({ routes, onlineNodeIds, now, alternatives });

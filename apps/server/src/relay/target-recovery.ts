@@ -201,6 +201,8 @@ export async function listDueOwnedTargetRecoveries(
         ],
       },
       Instance: {
+        // Only a ready instance answers; a starting, stopping or failed one is not routed.
+        phase: "READY",
         OR: [
           { Runtime: { kind: "ALWAYS_ON", nodeId: { in: nodeIds } } },
           { Ranks: { some: { rank: 0, nodeId: { in: nodeIds }, claim: { not: "RELEASED" } } } },

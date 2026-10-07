@@ -124,7 +124,7 @@ describe("what a failed attempt says about its target", () => {
     expect(db.executionTarget.updateMany).toHaveBeenCalledWith({
       where: { id: "target-a", health: "HALF_OPEN", halfOpenTrialStartedAt: past },
       data: {
-        health: "DEGRADED",
+        health: "UNHEALTHY",
         halfOpenTrialStartedAt: null,
         nextRetryAt: new Date(now.getTime() + 1_000),
       },
