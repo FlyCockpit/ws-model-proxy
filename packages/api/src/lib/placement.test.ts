@@ -1274,3 +1274,34 @@ describe("dist port and the members' port ranges", () => {
     if (!result.ok) expect(result.refusal.reason).toBe("no_free_ports");
   });
 });
+
+describe("dist port on restarts", () => {
+  it("never moves a restart's own ports, and says disjoint before trying its own dist port", () => {
+    const fabrics = [netFabric("net", { a: "10.0.0.1", b: "10.0.0.2" })];
+    const overlapOne = [
+      node("a", { portRange: [30000, 30009] }),
+      node("b", { portRange: [30009, 30018] }),
+    ];
+    // A restart onto two nodes with no dist port yet: b keeps its own port 30009, so the one
+    // common port is taken and nothing moves.
+    const restart = { instanceId: "i-1", ports: [30000, 30009], distPort: null };
+    const kept = new PlacementPlanner(context({ nodes: overlapOne, fabrics })).place(
+      request({ ...PAIR, nodeIds: ["a", "b"], restart }),
+    );
+    expect(kept.ok).toBe(false);
+    if (!kept.ok) expect(kept.refusal.reason).toBe("no_free_ports");
+    const disjoint = [
+      node("a", { portRange: [30000, 30009] }),
+      node("b", { portRange: [31000, 31009] }),
+    ];
+    const result = new PlacementPlanner(context({ nodes: disjoint, fabrics })).place(
+      request({
+        ...PAIR,
+        nodeIds: ["a", "b"],
+        restart: { instanceId: "i-1", ports: [30000, 31000], distPort: 30001 },
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.refusal.reason).toBe("fabric_port_ranges_disjoint");
+  });
+});

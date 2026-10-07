@@ -602,7 +602,7 @@ export class PlacementPlanner {
     // dist_port: one port free on every rank's node (multi-node only).
     let distPort: number | null = null;
     if (request.launch.groupSize > 1) {
-      const plan = this.#distPlan(chosen.working, ranks, request.restart?.distPort ?? null);
+      const plan = this.#distPlan(chosen.working, ranks, request.restart);
       if ("reason" in plan)
         return {
           ok: false,
@@ -1025,7 +1025,7 @@ export class PlacementPlanner {
     const nodes = choice.ranks.map((rank) => rank.node);
     const refuser = this.#frozenRefuser(nodes, choice.fabric, request.launch);
     if (refuser) return { reason: "head_not_in_frozen_fabric", subjectId: refuser.id };
-    const plan = this.#distPlan(choice.working, choice.ranks, request.restart?.distPort ?? null);
+    const plan = this.#distPlan(choice.working, choice.ranks, request.restart);
     if ("reason" in plan)
       return {
         reason: plan.reason,
@@ -1320,12 +1320,13 @@ export class PlacementPlanner {
    * The dist port: one port inside every rank's range (their intersection) free on every
    * rank's node. A port a rank of this instance took for itself may still be used when that
    * rank can move to another free port of its own (ports needing no move first): otherwise a
-   * one-port overlap is always lost to the rank's own port. A restart keeps its own dist port.
+   * one-port overlap is always lost to the rank's own port. A restart keeps its own ports
+   * (none moves) and its own dist port.
    */
   #distPlan(
     working: Working,
     ranks: readonly RankChoice[],
-    own: number | null,
+    restart: PlacementRequest["restart"],
   ):
     | { port: number; moves: Array<[RankChoice, number]> }
     | { reason: "no_free_ports" | "fabric_port_ranges_disjoint"; message?: string } {
@@ -1347,7 +1348,6 @@ export class PlacementPlanner {
       }
       return { port, moves };
     };
-    if (own !== null) return plan(own, false) ?? { reason: "no_free_ports" };
     const start = Math.max(...ranks.map((rank) => rank.node.portRange[0]));
     const end = Math.min(...ranks.map((rank) => rank.node.portRange[1]));
     if (start > end)
@@ -1359,7 +1359,9 @@ export class PlacementPlanner {
             ", ",
           )} have no port in common, and a multi-node instance needs one dist port on every node. Make the ranges overlap.`,
       };
-    for (const allowMoves of [false, true])
+    const own = restart?.distPort ?? null;
+    if (own !== null) return plan(own, false) ?? { reason: "no_free_ports" };
+    for (const allowMoves of restart ? [false] : [false, true])
       for (let port = start; port <= end; port++) {
         const found = plan(port, allowMoves);
         if (found) return found;
