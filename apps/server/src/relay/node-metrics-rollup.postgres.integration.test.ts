@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 // The node_metrics_minute upsert on real PostgreSQL: two flushes into one node-minute merge
-// the gauges, the free accelerator minimum and the custom aggregates per name (the 16-name cap
+// the gauges, the free accelerator minimum and the custom aggregates per name (the 256-name cap
 // keeps the names stored first). Rows are removed afterwards, scoped to this run's owner.
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
@@ -46,7 +46,7 @@ integration("node metrics rollup upsert (PostgreSQL)", () => {
       custom: [
         { name: "gpu_power", value: 100 },
         { name: "gpu_power", value: 200 },
-        ...Array.from({ length: 15 }, (_, index) => ({ name: `a${index}`, value: index })),
+        ...Array.from({ length: 255 }, (_, index) => ({ name: `a${index}`, value: index })),
       ],
     });
     expect(await writeNodeMetricsIncrements([first], m.prisma)).toBe(1);
@@ -73,8 +73,8 @@ integration("node metrics rollup upsert (PostgreSQL)", () => {
       { min: number; sum: number; max: number; samples: number }
     >;
     expect(custom.gpu_power).toEqual({ min: 50, sum: 350, max: 200, samples: 3 });
-    // 16 names stored by the first flush: the new name does not displace them.
-    expect(Object.keys(custom)).toHaveLength(16);
+    // 256 names stored by the first flush: the new name does not displace them.
+    expect(Object.keys(custom)).toHaveLength(256);
     expect(custom.zz_new).toBeUndefined();
   });
 

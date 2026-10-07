@@ -81,7 +81,7 @@ describe("node-metrics rollup merge", () => {
     expect(merged.minAcceleratorFreeMiB).toBe(4_000);
   });
 
-  it("aggregates custom metric values per name, every label set a sample, up to 16 names", () => {
+  it("aggregates custom metric values per name, every label set a sample, up to 256 names", () => {
     const first = mergeNodeMetricsIncrements(
       undefined,
       sample({
@@ -90,6 +90,7 @@ describe("node-metrics rollup merge", () => {
           { name: "gpu_power", value: 300 },
           { name: "bad name", value: 1 },
           { name: "queue", value: Number.NaN },
+          { name: "huge", value: 1e300 },
         ],
       }),
     );
@@ -102,10 +103,10 @@ describe("node-metrics rollup merge", () => {
     const many = mergeNodeMetricsIncrements(
       undefined,
       sample({
-        custom: Array.from({ length: 20 }, (_, index) => ({ name: `m${index}`, value: 1 })),
+        custom: Array.from({ length: 300 }, (_, index) => ({ name: `m${index}`, value: 1 })),
       }),
     );
-    expect(Object.keys(many.custom)).toHaveLength(16);
+    expect(Object.keys(many.custom)).toHaveLength(256);
     // The first merge's object is not mutated by later samples.
     expect(first.custom.gpu_power?.samples).toBe(2);
   });

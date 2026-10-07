@@ -31,8 +31,13 @@ export type NodeMetricsRollupSample = {
 /** One custom metric's minute aggregate (the `custom` JSON column, one entry per name). */
 export type CustomMetricAggregate = { min: number; sum: number; max: number; samples: number };
 
-/** Names kept per node-minute (the frame allows 16 metric commands). */
-export const NODE_METRICS_CUSTOM_MAX_NAMES = 16;
+/**
+ * Names kept per node-minute: what one frame may carry (16 metric commands × 16 values) and the
+ * hardening CHECK allows.
+ */
+export const NODE_METRICS_CUSTOM_MAX_NAMES = 256;
+/** Larger magnitudes are dropped so sums stay finite (JSON has no Infinity). */
+const CUSTOM_MAX_ABS = 1e15;
 const CUSTOM_NAME = /^[A-Za-z0-9_.:-]{1,64}$/;
 
 export type NodeMetricsRollupIncrement = {
@@ -89,7 +94,8 @@ function mergeCustom(
   if (!values || values.length === 0) return current;
   const next = { ...current };
   for (const { name, value } of values) {
-    if (!CUSTOM_NAME.test(name) || !Number.isFinite(value)) continue;
+    if (!CUSTOM_NAME.test(name) || !Number.isFinite(value) || Math.abs(value) > CUSTOM_MAX_ABS)
+      continue;
     const entry = next[name];
     if (entry) {
       next[name] = {

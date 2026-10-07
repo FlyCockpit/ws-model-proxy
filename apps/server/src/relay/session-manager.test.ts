@@ -537,11 +537,14 @@ describe("RelaySessionManager (relay 3.0)", () => {
     ]);
   });
 
-  it("marks a runtime.load sample FULL for the history at the default KV threshold", async () => {
+  it("marks a runtime.load sample FULL for the history as the live verdict judges its engine", async () => {
     db.runtimeInstance.findFirst.mockResolvedValue({
       id: "inst-3",
       runtimeId: "rt-1",
       versionId: "v-1",
+      engineSlots: null,
+      loadSignals: [],
+      Version: { engine: "VLLM", kvFullThreshold: null },
     });
     const socket = await connect();
     await manager.handleTextFrame(
@@ -559,6 +562,35 @@ describe("RelaySessionManager (relay 3.0)", () => {
     );
     expect(observeRuntimeLoadRollup).toHaveBeenCalledWith(
       expect.objectContaining({ instanceId: "inst-3", full: true }),
+    );
+    // llama.cpp: KV is not its signal; busy slots are.
+    db.runtimeInstance.findFirst.mockResolvedValue({
+      id: "inst-4",
+      runtimeId: "rt-2",
+      versionId: "v-2",
+      engineSlots: 4,
+      loadSignals: [],
+      Version: { engine: "LLAMA_CPP", kvFullThreshold: null },
+    });
+    const frame = (handle: string, slotsBusy: number) =>
+      JSON.stringify({
+        type: "runtime.load",
+        handle,
+        running: 4,
+        waiting: 0,
+        kvUsage: 0.99,
+        slotsBusy,
+        counterEpoch: 0,
+        source: "builtin",
+        ts: new Date().toISOString(),
+      });
+    await manager.handleTextFrame(socket, frame("llama-a", 2));
+    expect(observeRuntimeLoadRollup).toHaveBeenLastCalledWith(
+      expect.objectContaining({ instanceId: "inst-4", full: false }),
+    );
+    await manager.handleTextFrame(socket, frame("llama-b", 4));
+    expect(observeRuntimeLoadRollup).toHaveBeenLastCalledWith(
+      expect.objectContaining({ instanceId: "inst-4", full: true }),
     );
   });
 

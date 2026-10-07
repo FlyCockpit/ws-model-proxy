@@ -30,10 +30,7 @@
  *   `checkStaleSessions`, `dispose`.
  */
 import { randomBytes, randomUUID } from "node:crypto";
-import {
-  DEFAULT_KV_FULL_THRESHOLD,
-  WAITING_SUSTAINED_FRAMES,
-} from "@ws-model-proxy/api/lib/engine-load";
+import { evaluateEngineLoad } from "@ws-model-proxy/api/lib/engine-load";
 import {
   ENDPOINT_LOAD_STALE_AFTER_MS,
   type NodeMetricsSample,
@@ -81,6 +78,7 @@ import { sanitizeRelayRequestHeaders } from "./headers.js";
 import { relayHelloOrigin, verifyHelloIdentitySignature } from "./hello-identity.js";
 import {
   createRoutingEvaluationState,
+  historyEngineFacts,
   MetricRoutingEvaluator,
   type RoutingEvaluationState,
   type RuntimeLoadReading,
@@ -567,7 +565,18 @@ export type CountContextErrorMessage = NodeFrame<"context.count.error">;
 
 type ActiveRelayRequest = ActiveRelayResponseHandlers & { nodeId: string };
 
-type ResolvedInstance = { instanceId: string; runtimeId: string; versionId: string };
+type ResolvedInstance = {
+  instanceId: string;
+  runtimeId: string;
+  versionId: string;
+  /** What the load history needs to judge FULL like the live verdict. */
+  engine: {
+    engine: string | null;
+    kvFullThreshold: number | null;
+    engineSlots: number | null;
+    loadSignals: string[];
+  };
+};
 
 function mintViewerId(terminal?: TerminalRecord): string {
   for (;;) {
@@ -2369,10 +2378,27 @@ export class RelaySessionManager {
     try {
       const row = await prisma.runtimeInstance.findFirst({
         where: { userId, handle, ...servedOnNodeWhere(nodeId) },
-        select: { id: true, runtimeId: true, versionId: true },
+        select: {
+          id: true,
+          runtimeId: true,
+          versionId: true,
+          engineSlots: true,
+          loadSignals: true,
+          Version: { select: { engine: true, kvFullThreshold: true } },
+        },
       });
       value = row
-        ? { instanceId: row.id, runtimeId: row.runtimeId, versionId: row.versionId }
+        ? {
+            instanceId: row.id,
+            runtimeId: row.runtimeId,
+            versionId: row.versionId,
+            engine: {
+              engine: row.Version?.engine ?? null,
+              kvFullThreshold: row.Version?.kvFullThreshold ?? null,
+              engineSlots: row.engineSlots ?? null,
+              loadSignals: row.loadSignals ?? [],
+            },
+          }
         : null;
     } catch (error) {
       console.error("[relay] resolving a load handle failed", errorName(error));
@@ -2462,13 +2488,21 @@ export class RelaySessionManager {
       prefixCacheHitsDelta: hitsDelta,
       prefixCacheQueriesDelta: queriesDelta,
       source: load.source,
-      // Engine-agnostic FULL for the history (the live verdict also knows the engine kind,
-      // its slots and a member's threshold): deferred work, sustained waiting or KV at the
-      // default threshold.
-      full:
-        (load.deferred ?? 0) > 0 ||
-        waitingStreak >= WAITING_SUSTAINED_FRAMES ||
-        (load.kvUsage ?? 0) >= DEFAULT_KV_FULL_THRESHOLD,
+      // FULL as the live verdict judges this engine (whatever the version's gate).
+      full: evaluateEngineLoad(
+        historyEngineFacts(instance.engine, load.source),
+        {
+          running: load.running,
+          waiting: load.waiting,
+          kvUsage: load.kvUsage,
+          slotsBusy: load.slotsBusy,
+          deferred: load.deferred,
+          source: load.source,
+          waitingStreak,
+          receivedAt: now,
+        },
+        now,
+      ).full,
     });
     this.scheduleRoutingEvaluation(session);
   }

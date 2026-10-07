@@ -131,6 +131,31 @@ export function gateFacts(gate: string | null | undefined): {
   return { mode: "AUTO", customMode: "OBSERVE" };
 }
 
+/**
+ * Engine facts for the load history (`runtime_load_minute.fullSamples`): saturation as the live
+ * verdict judges it for this engine, its slots, signals and KV threshold, whatever the gate
+ * (an OBSERVE version is still FULL in its history when it is saturated).
+ */
+export function historyEngineFacts(
+  instance: {
+    engine: string | null;
+    kvFullThreshold: number | null;
+    engineSlots: number | null;
+    loadSignals: readonly string[];
+  },
+  readingSource: string | undefined,
+): EngineLoadFacts {
+  return {
+    engineKind: ENGINE_TO_KIND[instance.engine ?? ""] ?? null,
+    engineSlots: instance.engineSlots,
+    mode: "AUTO",
+    kvFullThreshold: instance.kvFullThreshold,
+    loadSource: readingSource === "route" || readingSource === "command" ? "custom" : "builtin",
+    signals: instance.loadSignals,
+    customMode: "ENFORCE",
+  };
+}
+
 /** The rules an evaluation used, in a form that compares by value. */
 function rulesKey(rules: unknown): string {
   return JSON.stringify(rules);

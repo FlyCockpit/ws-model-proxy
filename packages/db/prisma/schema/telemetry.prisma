@@ -365,8 +365,8 @@ model NodeMetricsMinute {
   minAcceleratorFreeMiB    Float?
   maxGpuTemperatureC       Float?
   maxGpuUtilizationPercent Float?
-  /// Node metric commands: { "<name>": { "min": n, "sum": n, "max": n, "samples": n } } (≤ 16
-  /// names). Serves metrics_query `custom:<name>` over any retained range.
+  /// Node metric commands: { "<name>": { "min": n, "sum": n, "max": n, "samples": n } } (≤ 256
+  /// names, as one frame carries). Serves metrics_query `custom:<name>` over any retained range.
   custom                   Json     @default("{}")
 
   @@id([bucketStart, ownerUserId, nodeId])
