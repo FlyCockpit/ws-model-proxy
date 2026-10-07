@@ -99,7 +99,7 @@ async function recordSecretName(
   secrets.sort((a, b) => a.name.localeCompare(b.name));
   await prisma.node.updateMany({
     where: { id: nodeId, userId, features: { equals: row?.features ?? undefined } },
-    data: { features: { ...features.data, secrets } },
+    data: { features: { ...features.data, secrets }, featuresAt: new Date() },
   });
 }
 

@@ -175,8 +175,8 @@ A failed call returns `isError: true` with `structuredContent.error`:
   `node_secret_set` replaces even that message with the reason, so nothing a
   procedure says can carry a secret back.
 - **Invalid input** is `invalid_input` with up to 20 `issues`, each `path` and
-  `message` (sensitive tools get `path` and `code` only). Values are never
-  echoed.
+  `message` (sensitive tools get `path` and `code` only). A message may quote
+  part of your own input; a sensitive tool's input is never echoed.
 - `TOO_MANY_REQUESTS` (tool rate limit, with `retryAfterSeconds`) and
   `REQUEST_ABORTED` (the request or credential went away). `BAD_REQUEST`,
   `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `CONFLICT` and

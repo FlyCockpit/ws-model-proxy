@@ -26,7 +26,8 @@
  *
  * Secrets: a tool with `sensitiveInput` (node_secret_set) and the procedures in
  * `SENSITIVE_INPUT_PROCEDURES` never have their input logged, audited or echoed. No tool's
- * arguments are ever logged; validation errors carry paths and codes only.
+ * arguments are ever logged; validation errors carry paths and messages (sensitive tools: paths
+ * and codes only).
  *
  * tools/list advertises the name, the contract description and the compact input schema
  * (`advertisedInputSchema`), nothing else (no titles, annotations or output schemas): the

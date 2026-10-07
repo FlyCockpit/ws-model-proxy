@@ -221,6 +221,16 @@ If that is not acceptable for a machine, do not type its sudo password into a
 web terminal: give the exact command a `NOPASSWD` sudoers rule instead, and use
 Full control only where trusting the server with a shell is fine.
 
+## File tools default to the home directory
+
+On a Full control node, agents' file tools now work out of the box: with no
+roots configured they use the home directory of the user wsmp runs as (`nodes_get`
+shows `features.files.source`: `default`, `configured` or `disabled`). wsmp's own
+files stay protected by the node's deny-list. `wsmp config clear-file-roots`
+returns to this default; it no longer turns the file tools off. To keep agents
+out of files, run `wsmp config set-file-tools off` (or lower the node to Relay
+only).
+
 ## Pools translate between API protocols by default
 
 A pool now answers OpenAI Chat Completions, OpenAI Responses and Anthropic
