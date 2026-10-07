@@ -35,9 +35,60 @@ export function operatorStepStatusKey(step: OperatorStepView): string {
 }
 
 /**
- * One interactive step waiting for its person: the exact command (from the launched version,
- * placeholders unrendered) and who wrote it, so the person can judge it before typing a sudo
- * password, then Open terminal / Run again / Cancel step.
+ * The command the person authorizes: rendered with the values its job sends, as the node renders
+ * it (`rendered`). Values only the node knows stay `{{name}}` with a note. When the server cannot
+ * render it faithfully, or the node would refuse it, it says so and shows only the template.
+ */
+function StepCommand({ step }: { step: OperatorStepView }) {
+  const { t } = useTranslation(["terminals"]);
+  const copyLabel = t("terminals:copyCommand");
+  const rendered = step.rendered;
+  if (!rendered)
+    return step.command ? <CodeSnippet code={step.command} copyLabel={copyLabel} /> : null;
+  const template = step.command ? (
+    <div className="flex min-w-0 flex-col gap-1">
+      <p className="text-xs text-muted-foreground">{t("terminals:steps.template")}</p>
+      <CodeSnippet code={step.command} copyLabel={copyLabel} />
+    </div>
+  ) : null;
+  if (rendered.state === "ready")
+    return (
+      <div className="flex min-w-0 flex-col gap-2">
+        <p className="text-xs text-muted-foreground">{t("terminals:steps.commandRendered")}</p>
+        <CodeSnippet code={rendered.text} copyLabel={copyLabel} />
+        {step.headAddr ? (
+          <p className="break-all text-xs text-muted-foreground">
+            {t("terminals:steps.headAddr", { addr: step.headAddr })}
+          </p>
+        ) : null}
+        {rendered.nodeFills.length > 0 ? (
+          <p className="text-xs text-muted-foreground" role="note">
+            {t("terminals:steps.nodeFills", {
+              names: rendered.nodeFills.map((name) => `{{${name}}}`).join(", "),
+            })}
+          </p>
+        ) : null}
+      </div>
+    );
+  return (
+    <div className="flex min-w-0 flex-col gap-2">
+      <p className="text-sm text-destructive" role="alert">
+        {rendered.state === "refused"
+          ? // An open terminal means the node accepted the job: the prediction was wrong.
+            step.terminalOpen
+            ? `${t("terminals:steps.refusedButOpen", { field: rendered.field })} ${t("terminals:steps.unavailableHint")}`
+            : t("terminals:steps.refused", { field: rendered.field })
+          : `${t(`terminals:steps.unavailable.${rendered.reason}`)} ${t("terminals:steps.unavailableHint")}`}
+      </p>
+      {template}
+    </div>
+  );
+}
+
+/**
+ * One interactive step waiting for its person: the command with its values filled in as the node
+ * renders it, and who wrote it, so the person can judge it before typing a sudo password, then
+ * Open terminal / Run again / Cancel step.
  */
 export function OperatorStepItem({
   step,
@@ -82,9 +133,7 @@ export function OperatorStepItem({
       <p className="text-sm text-muted-foreground" role="status">
         {t(operatorStepStatusKey(step))}
       </p>
-      {step.command ? (
-        <CodeSnippet code={step.command} copyLabel={t("terminals:copyCommand")} />
-      ) : null}
+      <StepCommand step={step} />
       <p className="text-xs text-muted-foreground">
         {t("terminals:onNode", { node: nodeLabel })} · {t("terminals:steps.since")}{" "}
         <TimeAgo value={since} />

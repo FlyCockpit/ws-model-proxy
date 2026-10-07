@@ -20,7 +20,12 @@ import {
   type RuntimeCommands,
   type RuntimeLaunch,
 } from "@ws-model-proxy/api/lib/runtime-spec";
-import { z } from "zod";
+import {
+  type StepIntent,
+  stepIntentSchema,
+  stepJobFabricId,
+  stepJobPlaceholders,
+} from "@ws-model-proxy/api/lib/step-intent";
 import { type JobPlaceholders, type RuntimeJobFrame, runtimeUnitName } from "../relay/frames.js";
 
 export const HEALTH_SEQUENCE_BASE = 1_000_000;
@@ -62,28 +67,7 @@ const WIRE_PHASE = {
 } as const satisfies Record<StepPhase, RuntimeJobFrame["phase"]>;
 
 /** What a step carries (stored as `InstanceStep.intent`, hashed into `intentHash`). */
-export const stepIntentSchema = z
-  .object({
-    /** The operation the generation belongs to (a restart keeps it; null for probes). */
-    operationId: z.string().nullable(),
-    runtimeId: z.string(),
-    launchVersionId: z.string(),
-    launchHash: z.string(),
-    rank: z.number().int().min(0).max(63),
-    nnodes: z.number().int().min(1).max(64),
-    handle: z.string(),
-    unitName: z.string(),
-    port: z.number().int(),
-    distPort: z.number().int().nullable(),
-    fabricId: z.string().nullable(),
-    /** Placeholders other than head_addr (resolved from the fabric at dispatch). */
-    placeholders: z.record(z.string(), z.union([z.string(), z.number()])),
-    timeoutMs: z.number().int().min(1_000).max(86_400_000),
-    /** The command of this phase runs in an operator terminal (a person must answer). */
-    interactive: z.boolean(),
-  })
-  .strict();
-export type StepIntent = z.infer<typeof stepIntentSchema>;
+export { type StepIntent, stepIntentSchema };
 
 export function intentHash(intent: StepIntent): string {
   return createHash("sha256").update(canonicalJson(intent), "utf8").digest("hex");
@@ -343,16 +327,9 @@ export function jobFrame(input: {
   operator?: RuntimeJobFrame["operator"];
 }): RuntimeJobFrame {
   const { intent } = input;
-  const placeholders: JobPlaceholders = { port: intent.port };
-  for (const [key, value] of Object.entries(intent.placeholders)) {
-    if (key === "dist_port" && typeof value === "number") placeholders.dist_port = value;
-    else if (key === "gpu_ids" && typeof value === "string") placeholders.gpu_ids = value;
-    else if (key === "memory_gb" && typeof value === "string") placeholders.memory_gb = value;
-    else if (key === "vram_gb" && typeof value === "string") placeholders.vram_gb = value;
-    else if (key === "memory_fraction" && typeof value === "string")
-      placeholders.memory_fraction = value;
-  }
-  if (intent.nnodes > 1 && input.headAddr) placeholders.head_addr = input.headAddr;
+  // The same values the step views render the shown command from (`step-intent.ts`).
+  const placeholders: JobPlaceholders = stepJobPlaceholders(intent, input.headAddr);
+  const fabricId = stepJobFabricId(intent);
   return {
     type: "runtime.job",
     stepId: input.stepId,
@@ -367,7 +344,7 @@ export function jobFrame(input: {
     handle: intent.handle,
     unitName: intent.unitName,
     placeholders,
-    ...(intent.nnodes > 1 && intent.fabricId ? { fabricId: intent.fabricId } : {}),
+    ...(fabricId ? { fabricId } : {}),
     timeoutMs: intent.timeoutMs,
     ownerEpoch: input.ownerEpoch,
     intentHash: input.intentHash,

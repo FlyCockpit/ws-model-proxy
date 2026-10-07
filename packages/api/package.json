@@ -8,6 +8,9 @@
     "./lib/canonical-json": {
       "default": "./src/lib/canonical-json.ts"
     },
+    "./lib/step-intent": {
+      "default": "./src/lib/step-intent.ts"
+    },
     "./lib/runtime-launch-hash": {
       "default": "./src/lib/runtime-launch-hash.ts"
     },

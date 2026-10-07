@@ -109,6 +109,19 @@
       "superseded": "The runtime stopped or restarted since; this step no longer runs.",
       "terminal_closed": "The terminal closed. Run the step again to get a new one.",
       "terminal_unavailable": "The terminal is not open on the node yet, or the node is offline. Try again shortly."
-    }
+    },
+    "commandRendered": "The command that runs, with its values filled in as the node fills them:",
+    "nodeFills": "The node fills in {{names}} itself, from its own address on the fabric. A node without such a value refuses the step.",
+    "headAddr": "Head node address: {{addr}}",
+    "refused": "The server expects the node to refuse this step (bad value: {{field}}), so nothing would run. Cancel it and fix the runtime.",
+    "unavailable": {
+      "intent": "This step's values cannot be read here, so its command is not shown.",
+      "version": "This step runs a different definition than the one this instance launched, so its command is not shown here.",
+      "head_addr": "The head node has no address on this step's fabric yet, so its command is not filled in.",
+      "node_fill_ambiguous": "This command contains text that looks like a value the node fills in but is not one, so it is not shown filled in here."
+    },
+    "unavailableHint": "The terminal on the node shows the exact command before it runs.",
+    "template": "Command template",
+    "refusedButOpen": "The server expected the node to refuse this step (bad value: {{field}}), yet its terminal opened, so the command cannot be confirmed here."
   }
 }
