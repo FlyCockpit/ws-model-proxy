@@ -827,27 +827,50 @@ impl Executor {
     ) -> Result<Outcome> {
         let key = job.key();
         let mut units: std::collections::BTreeSet<String> = owned_units(job).into_iter().collect();
+        // What the launched run used: a probe rendered from another version may name another
+        // port or status command, so both the probe's and the record's are checked.
+        let mut statuses: Vec<(&Job, &str)> = Vec::new();
+        let mut ports = vec![(job.host.as_str(), job.port)];
+        let mut detached = false;
         if let Some(record) = self.state.records.get(&key) {
             if let Some(done) = record.completed.get(&job.step_id) {
                 anyhow::ensure!(done.hash == job.intent_hash, "step intent changed");
                 return Ok(done.outcome.clone());
             }
             units.extend(record.invocations.keys().cloned());
+            detached = record
+                .invocations
+                .values()
+                .any(|invocation| invocation == "external" || invocation == "self-detached");
+            if let Some(status) = record.job.status_command.as_deref() {
+                statuses.push((&record.job, status));
+            }
+            ports.push((record.job.host.as_str(), record.job.port));
+        }
+        if let Some(status) = job.status_command.as_deref() {
+            statuses.push((job, status));
+        }
+        // A service that runs outside the node's units is proven only by its status command.
+        if detached && statuses.is_empty() {
+            return Ok(Outcome::ok(false));
         }
         for unit in &units {
             if runtime.tasks_alive(unit, deadline)? {
                 return Ok(Outcome::ok(false));
             }
         }
-        if let Some(status) = job.status_command.as_deref()
-            && !matches!(
-                runtime.status_until(job, status, deadline.cap(Duration::from_secs(30))),
+        for (owner, status) in statuses {
+            if !matches!(
+                runtime.status_until(owner, status, deadline.cap(Duration::from_secs(30))),
                 Ok(false)
-            )
-        {
-            return Ok(Outcome::ok(false));
+            ) {
+                return Ok(Outcome::ok(false));
+            }
         }
-        if !runtime.port_free(&job.host, job.port) {
+        if ports
+            .iter()
+            .any(|(host, port)| !runtime.port_free(host, *port))
+        {
             return Ok(Outcome::ok(false));
         }
         deadline.remaining()?;

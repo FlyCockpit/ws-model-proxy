@@ -55,6 +55,7 @@ import {
   type NewStep,
   type RankInput,
   START_PHASES,
+  STATUS_SEQUENCE_BASE,
   STOP_ORDER_BASE,
   type StepIntent,
   type StepPhase,
@@ -301,11 +302,23 @@ function rankInput(rank: InstanceRow["Ranks"][number]): RankInput {
 
 /**
  * A status probe (stop proof) is for a forgotten claim, or a held claim of an instance that is
- * stopping (its stops could not prove the stop). Anything else is the run that holds the claim
- * now: a probe never goes out for it, and an answer releases nothing.
+ * stopping (its stops could not prove the stop), sent for the run that holds it: a probe of an
+ * earlier run carries that run's port and commands, so it proves nothing about a later one.
+ * Anything else is the run that holds the claim now: a probe never goes out for it, and an
+ * answer releases nothing.
  */
-function statusProbeWanted(instance: { phase: string }, claim: string | undefined): boolean {
-  return claim === "HELD_UNKNOWN" || (claim === "HELD" && instance.phase === "STOPPING");
+function statusProbeWanted(
+  instance: { phase: string },
+  claim: string | undefined,
+  probeGeneration: number,
+  currentGeneration: number,
+): boolean {
+  if (claim === "HELD_UNKNOWN") return true;
+  return (
+    claim === "HELD" &&
+    instance.phase === "STOPPING" &&
+    probeGeneration === Math.max(currentGeneration, 1)
+  );
 }
 
 function isStartPhase(phase: string): boolean {
@@ -738,7 +751,11 @@ export class RuntimeLifecycle {
     generation: number,
     now: Date,
   ): Promise<boolean> {
-    if (rank.nodeId === null || !this.relay.nodeSession(rank.nodeId)) return true;
+    if (rank.nodeId === null) return true;
+    // An offline node gets its probe when it is back; a person is asked only once it has been
+    // away for FORGET_AFTER_OFFLINE_MS (a node connected to another server process is online).
+    if (await this.offlineSince(tx, rank.nodeId, 0))
+      return this.offlineSince(tx, rank.nodeId, FORGET_AFTER_OFFLINE_MS);
     const probeGeneration = Math.max(generation, 1);
     const probes = await tx.instanceStep.findMany({
       where: {
@@ -763,12 +780,26 @@ export class RuntimeLifecycle {
           nnodes: instance.Ranks.length,
           launch,
           generation: probeGeneration,
-          attempt: probes.length,
+          attempt: await this.nextStatusAttempt(tx, instance.id, rank.rank),
           operationId: null,
           phase: "STATUS",
         }),
       ]);
     return finished.length > 0;
+  }
+
+  /**
+   * The attempt number of a rank's next status probe. Probe sequences are unique per rank
+   * across generations (the step key has no generation), so this counts past every earlier
+   * probe of the instance, not just this run's.
+   */
+  private async nextStatusAttempt(tx: Tx, instanceId: string, rank: number): Promise<number> {
+    const latest = await tx.instanceStep.aggregate({
+      where: { instanceId, rank, phase: "STATUS" },
+      _max: { sequence: true },
+    });
+    const sequence = latest._max.sequence;
+    return sequence === null ? 0 : sequence - STATUS_SEQUENCE_BASE + 1;
   }
 
   private async offlineSince(tx: Tx, nodeId: string, ms: number): Promise<boolean> {
@@ -1261,7 +1292,13 @@ export class RuntimeLifecycle {
       const superseded =
         (step.phase === "STOP" &&
           step.generation < (await this.currentGeneration(tx, instance.id))) ||
-        (step.phase === "STATUS" && !statusProbeWanted(instance, claim));
+        (step.phase === "STATUS" &&
+          !statusProbeWanted(
+            instance,
+            claim,
+            step.generation,
+            await this.currentGeneration(tx, instance.id),
+          ));
       if (claim === "RELEASED" || superseded) {
         await tx.instanceStep.updateMany({
           where: { id: step.id, state: "PENDING" },
@@ -2243,7 +2280,12 @@ export class RuntimeLifecycle {
         // releases a forgotten claim. A late answer of an earlier run releases nothing.
         const proves =
           phase === "STATUS"
-            ? statusProbeWanted(instance, claim.claim)
+            ? statusProbeWanted(
+                instance,
+                claim.claim,
+                generation,
+                await this.currentGeneration(tx, instanceId),
+              )
             : current && (!leading || claim.claim === "HELD_UNKNOWN");
         if (proves) await this.release(tx, claim.id, now);
       } else if (!succeeded && leading) {
@@ -2369,9 +2411,7 @@ export class RuntimeLifecycle {
         const row = instance?.Ranks.find((candidate) => candidate.id === rank.id);
         if (!instance || !launch || !row) return;
         const generation = Math.max(await this.currentGeneration(tx, instance.id), 1);
-        const attempts = await tx.instanceStep.count({
-          where: { instanceId: instance.id, rank: row.rank, generation, phase: "STATUS" },
-        });
+        const attempts = await this.nextStatusAttempt(tx, instance.id, row.rank);
         await this.insertSteps(tx, instance, [
           stopStep({
             instance: instanceInput(instance),

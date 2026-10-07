@@ -243,6 +243,27 @@ fn a_status_probe_proves_a_stop_without_a_record_and_writes_nothing() {
 }
 
 #[test]
+fn a_detached_service_is_proven_stopped_only_by_its_status() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(job(JobPhase::Start), &runtime, deadline());
+    // The run is a service the node does not own (no unit to watch).
+    executor
+        .state
+        .records
+        .get_mut("in1:0")
+        .expect("record")
+        .invocations
+        .insert("wsmp-i-abcdefabcdef-r0".into(), "external".into());
+    runtime.units.borrow_mut().clear();
+    let mut probe = job(JobPhase::Status);
+    probe.step_id = "s1".into();
+    assert!(!executor.execute(probe, &runtime, deadline()).stopped);
+}
+
+#[test]
 fn health_hysteresis_marks_unhealthy_then_ready() {
     let root = tempfile::tempdir().expect("root");
     let path = root.path().join("in1-r0.json");
