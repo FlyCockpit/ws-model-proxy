@@ -4,31 +4,38 @@
  * A spend reservation priced for one completion of the request's `max_tokens` is not a bound
  * when the body asks the provider for several candidates (`n`, `best_of`, ...) or names a larger
  * output limit under another field: the provider bills every candidate. The bound is read from
- * the bytes that go upstream (native forwarding and rendered bodies alike), so no field the
- * provider honours is left out. A candidate or output field that is present but not a
- * non-negative safe integer cannot be bounded and the attempt is not sent.
+ * the bytes that go upstream (native forwarding and rendered bodies alike). Fields are matched by
+ * family (any `max_*tokens`, any candidate count, the llama.cpp/Ollama/TGI spellings, also inside
+ * a generation-config object), not by one provider's list. A matched field that is present but
+ * not a non-negative safe integer (e.g. llama.cpp's `n_predict: -1`, "unlimited") cannot be
+ * bounded and the attempt is not sent.
  */
 import { Prisma } from "@ws-model-proxy/db";
 import type { ProviderLiability } from "./provider-budget.js";
 
-/** Output-token limits (per candidate) across OpenAI, Anthropic and compatible servers. */
-const OUTPUT_LIMIT_FIELDS = [
-  "max_tokens",
-  "max_completion_tokens",
-  "max_output_tokens",
-  "maxOutputTokens",
-  "max_new_tokens",
+/**
+ * Output-token limits (per candidate) across OpenAI, Anthropic and compatible servers: any
+ * `max_*tokens` field (max_tokens, max_completion_tokens, max_output_tokens, max_new_tokens,
+ * ...), plus the spellings that do not follow it (llama.cpp `n_predict`, Ollama `num_predict`,
+ * Gemini-style `maxOutputTokens`, `max_length`). A field matched here that is no count is
+ * refused, so an unknown alias in this family is never read as "no limit".
+ */
+const OUTPUT_LIMIT_FIELD =
+  /^(max_\w*tokens|maxOutputTokens|maxTokens|n_predict|num_predict|max_length|max_gen_len)$/;
+/**
+ * Candidate counts (each candidate is billed; `best_of` bills all it generates): `n`, llama.cpp
+ * `n_cmpl`, `best_of`, the `num_*` spellings of compatible servers, and any candidate-count
+ * field in either case style (`candidate_count`, `candidateCount`).
+ */
+const CANDIDATE_FIELD =
+  /^(n|n_cmpl|best_of|bestOf|num_return_sequences|num_completions|num_generations|num_samples)$|candidate_?count/i;
+/** Generation-config objects compatible servers read the same limits from. */
+const NESTED_CONFIG_FIELDS = [
+  "generationConfig",
+  "generation_config",
+  "options",
+  "parameters",
 ] as const;
-/** Candidate counts: every candidate is billed (`best_of` bills all of them, `n` returned). */
-const CANDIDATE_FIELDS = [
-  "n",
-  "best_of",
-  "candidate_count",
-  "candidateCount",
-  "num_return_sequences",
-] as const;
-/** Generation-config objects some compatible servers read the same limits from. */
-const NESTED_CONFIG_FIELDS = ["generationConfig", "generation_config"] as const;
 
 const MAX_SIGNED_BIGINT = 9_223_372_036_854_775_807n;
 
@@ -62,9 +69,18 @@ function maxOf(a: bigint | undefined, b: bigint | undefined): bigint | undefined
 }
 
 export function providerBodyBillingBound(body: Uint8Array): ProviderBodyBillingBound {
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(body);
+  } catch {
+    return { bounded: false };
+  }
+  // No body (stored Responses retrieve, cancel, delete, input items): nothing is generated
+  // beyond what the request's own bound already covers.
+  if (text.trim() === "") return { bounded: true, outputTokens: undefined, candidates: 1n };
   let parsed: unknown;
   try {
-    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body));
+    parsed = JSON.parse(text);
   } catch {
     return { bounded: false };
   }
@@ -79,15 +95,15 @@ export function providerBodyBillingBound(body: Uint8Array): ProviderBodyBillingB
   let outputTokens: bigint | undefined;
   let candidates = 1n;
   for (const scope of scopes) {
-    for (const field of OUTPUT_LIMIT_FIELDS) {
-      const count = readCount(scope[field]);
+    for (const [field, value] of Object.entries(scope)) {
+      const output = OUTPUT_LIMIT_FIELD.test(field);
+      const candidate = CANDIDATE_FIELD.test(field);
+      if (!output && !candidate) continue;
+      const count = readCount(value);
       if (count === "invalid") return { bounded: false };
-      if (count !== null) outputTokens = maxOf(outputTokens, count);
-    }
-    for (const field of CANDIDATE_FIELDS) {
-      const count = readCount(scope[field]);
-      if (count === "invalid") return { bounded: false };
-      if (count !== null && count > candidates) candidates = count;
+      if (count === null) continue;
+      if (output) outputTokens = maxOf(outputTokens, count);
+      if (candidate && count > candidates) candidates = count;
     }
   }
   return { bounded: true, outputTokens, candidates };

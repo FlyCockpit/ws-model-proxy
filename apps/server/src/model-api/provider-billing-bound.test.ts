@@ -33,6 +33,35 @@ describe("provider body billing bound", () => {
     expect(providerBodyBillingBound(body({ n: null }))).toMatchObject({ candidates: 1n });
   });
 
+  it("reads the llama.cpp, Ollama and TGI spellings, also inside their config objects", () => {
+    expect(providerBodyBillingBound(body({ max_tokens: 100, n_cmpl: 16 }))).toMatchObject({
+      outputTokens: 100n,
+      candidates: 16n,
+    });
+    expect(providerBodyBillingBound(body({ max_tokens: 100, n_predict: 10_000 }))).toMatchObject({
+      outputTokens: 10_000n,
+    });
+    expect(providerBodyBillingBound(body({ options: { num_predict: 500 } }))).toMatchObject({
+      outputTokens: 500n,
+    });
+    expect(
+      providerBodyBillingBound(body({ parameters: { max_new_tokens: 50, best_of: 3 } })),
+    ).toMatchObject({ outputTokens: 50n, candidates: 3n });
+    expect(providerBodyBillingBound(body({ CandidateCount: 2 }))).toMatchObject({ candidates: 2n });
+    // "Unlimited" is no bound.
+    expect(providerBodyBillingBound(body({ n_predict: -1 }))).toEqual({ bounded: false });
+    expect(providerBodyBillingBound(body({ options: [] }))).toEqual({ bounded: false });
+  });
+
+  it("bounds an empty body (stored Responses retrieve, cancel, delete) by the request alone", () => {
+    expect(providerBodyBillingBound(new Uint8Array())).toEqual({
+      bounded: true,
+      outputTokens: undefined,
+      candidates: 1n,
+    });
+    expect(attemptOutputTokens(providerBodyBillingBound(new Uint8Array()), 0n)).toBe(0n);
+  });
+
   it("takes the largest output limit under any field", () => {
     expect(
       providerBodyBillingBound(body({ max_tokens: 10, max_completion_tokens: 5000 })),
