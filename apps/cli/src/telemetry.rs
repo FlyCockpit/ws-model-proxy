@@ -867,6 +867,9 @@ pub fn parse_nvidia_smi(text: &str) -> Vec<GpuRow> {
 #[derive(Default)]
 struct GpuQuery {
     unavailable: bool,
+    /// It answered with GPUs at least once: an NVIDIA node, so a failed
+    /// query later must not fall back to AMD rows ([`gpu_metrics`]).
+    nvidia_seen: bool,
 }
 
 impl GpuQuery {
@@ -884,7 +887,11 @@ impl GpuQuery {
             GPU_QUERY_TIMEOUT,
             GPU_QUERY_OUTPUT_LIMIT,
         ) {
-            Bounded::Output(output) => parse_nvidia_smi(&output),
+            Bounded::Output(output) => {
+                let rows = parse_nvidia_smi(&output);
+                self.nvidia_seen |= !rows.is_empty();
+                rows
+            }
             Bounded::Failed => Vec::new(),
             Bounded::Unavailable => {
                 self.unavailable = true;
@@ -1203,10 +1210,15 @@ fn root_disk() -> Option<NodeDiskMetrics> {
     None
 }
 
-/// `nvidia-smi` rows, else AMD sysfs memory use (metrics rows carry no
-/// vendor, so a mixed node reports its NVIDIA GPUs only).
-fn gpu_metrics(nvidia: Vec<GpuRow>) -> Vec<NodeGpuMetrics> {
+/// `nvidia-smi` rows, else (on a node where it never answered with GPUs)
+/// AMD sysfs memory use. Metrics rows carry no vendor, so a mixed node
+/// reports its NVIDIA GPUs only, and a failed query on an NVIDIA node
+/// reports none rather than AMD rows under NVIDIA indexes.
+fn gpu_metrics(nvidia: Vec<GpuRow>, nvidia_seen: bool) -> Vec<NodeGpuMetrics> {
     if nvidia.is_empty() {
+        if nvidia_seen || !cfg!(target_os = "linux") {
+            return Vec::new();
+        }
         return crate::hardware::amd_metrics(&crate::hardware::read_amd_sysfs(
             std::path::Path::new("/"),
         ));
@@ -1261,7 +1273,10 @@ fn collect_node_metrics(
             swap_free_mib: fields.get("SwapFree").copied(),
         }),
         disks: Some(root_disk().into_iter().collect()),
-        gpus: Some(gpu_metrics(gpu.rows())),
+        gpus: Some({
+            let rows = gpu.rows();
+            gpu_metrics(rows, gpu.nvidia_seen)
+        }),
         interfaces: Some(interfaces),
         custom: (!custom.is_empty()).then_some(custom),
         metric_commands: (!statuses.is_empty()).then_some(statuses),
@@ -1280,6 +1295,17 @@ fn collect_node_metrics(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_failed_nvidia_query_never_reports_amd_rows_on_an_nvidia_node() {
+        assert!(super::gpu_metrics(Vec::new(), true).is_empty());
+        let rows = super::parse_nvidia_smi(
+            "0, NVIDIA GeForce RTX 3090, GPU-1, 550.54, 24576, 1024, 7, 40, 30.5, 210",
+        );
+        let metrics = super::gpu_metrics(rows, true);
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].vram_used_mib, Some(1024));
+    }
 
     #[test]
     fn node_metrics_drop_custom_values_to_fit_the_chunk_budget() {

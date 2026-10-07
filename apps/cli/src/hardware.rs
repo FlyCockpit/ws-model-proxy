@@ -535,7 +535,10 @@ pub fn amd_metrics(gpus: &[AmdGpu]) -> Vec<NodeGpuMetrics> {
             Some(NodeGpuMetrics {
                 index: u8::try_from(index).ok()?,
                 vram_used_mib: gpu.vram_used_bytes.map(mib),
-                vram_total_mib: gpu.vram_bytes.map(mib),
+                // An APU's "VRAM" is a BIOS carve-out of a unified pool, not
+                // its accelerator memory: no total, so nothing derives a
+                // free-VRAM figure from it (as with GB10's `[N/A]`).
+                vram_total_mib: (!gpu.is_apu()).then(|| gpu.vram_bytes.map(mib)).flatten(),
                 gtt_used_mib: gpu.gtt_used_bytes.map(mib),
                 utilization_percent: None,
                 temperature_c: None,
@@ -998,6 +1001,7 @@ mod tests {
         assert_eq!(metrics[0].index, 0);
         assert_eq!(metrics[0].vram_used_mib, Some(256));
         assert_eq!(metrics[0].gtt_used_mib, Some(2048));
+        assert_eq!(metrics[0].vram_total_mib, None);
     }
 
     #[test]
