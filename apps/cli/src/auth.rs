@@ -289,7 +289,7 @@ mod tests {
         let ok = parse_enroll_answer(
             200,
             &serde_json::json!({
-                "ok": true, "nodeId": "nd1", "slug": "spark-1",
+                "ok": true, "nodeId": "node-1", "slug": "spark-1",
                 "credential": "c".repeat(40), "replaced": null, "trustLowerPending": false
             })
             .to_string(),
@@ -300,7 +300,7 @@ mod tests {
         let temporary = parse_enroll_answer(
             200,
             &serde_json::json!({
-                "ok": true, "nodeId": "nd1", "slug": "spark-1",
+                "ok": true, "nodeId": "node-1", "slug": "spark-1",
                 "credential": "c".repeat(40), "replaced": null, "trustLowerPending": false,
                 "removeAfterOfflineMs": 3_600_000
             })

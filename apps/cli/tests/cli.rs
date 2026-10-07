@@ -341,7 +341,7 @@ fn well_known(origin: &str) -> Value {
 
 fn enrolled(slug: &str) -> Value {
     json!({
-        "ok": true, "nodeId": "nd1", "slug": slug, "credential": "c".repeat(48),
+        "ok": true, "nodeId": "node-1", "slug": slug, "credential": "c".repeat(48),
         "replaced": null, "trustLowerPending": false
     })
 }
@@ -1483,7 +1483,7 @@ mod signal_shutdown {
         fs::write(
             state.join("node-credential.json"),
             json!({
-                "nodeId": "nd1", "slug": "cli-signal-test", "server": relay.server_url,
+                "nodeId": "node-1", "slug": "cli-signal-test", "server": relay.server_url,
                 "credential": "signal-test-token"
             })
             .to_string(),
@@ -1790,7 +1790,7 @@ mod signal_shutdown {
     fn hello_ok(socket: &mut TcpStream) {
         write_text(
             socket,
-            r#"{"type":"hello.ok","id":"h-1","protocolVersion":"3.0","nodeId":"nd1","definitionSync":"expect"}"#,
+            r#"{"type":"hello.ok","id":"h-1","protocolVersion":"3.0","nodeId":"node-1","definitionSync":"expect"}"#,
         );
     }
 
