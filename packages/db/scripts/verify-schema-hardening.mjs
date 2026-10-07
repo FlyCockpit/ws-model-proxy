@@ -66,6 +66,7 @@ const REQUIRED_OBJECTS = [
   "node_temporary_shape",
   "node_hold_shape",
   "node_hold_profile_owner",
+  "node_owner_immutable",
   "node_command_max_check",
   "node_command_shape",
   "node_command_transition",
@@ -96,11 +97,14 @@ const REQUIRED_OBJECTS = [
   "runtime_instance_notify_failures",
   "runtime_instance_operator_shape",
   "runtime_instance_launch_version",
+  "runtime_instance_operation_owner",
   "runtime_operation_profile",
   "instance_rank_bounds",
   "instance_rank_reserved_port",
   "instance_rank_claim_shape",
   "instance_rank_held_unknown_id",
+  "instance_rank_node_owner",
+  "instance_step_node_owner",
   "instance_step_shape",
   "instance_step_operator_shape",
   "instance_step_operator_hold",
@@ -385,6 +389,54 @@ try {
     'SELECT count(*) FROM pool_routing r JOIN pool_fallback f USING ("poolId") JOIN pool_advanced a USING ("poolId") WHERE "poolId" = \'pool-a\'',
     1,
   );
+
+  // ── cross-owner isolation: nothing of one user runs on, or changes, another user's ──
+  await expectFailure(
+    "node_owner_immutable",
+    `UPDATE node SET "userId" = 'owner-b' WHERE id = 'node-a1'`,
+    "55000",
+  );
+  await expectFailure(
+    "instance_rank_node_owner insert",
+    `INSERT INTO instance_rank (id, "instanceId", "nodeId", "unitName", rank, resources, port) VALUES
+      ('rank-x', 'inst-m', 'node-b1', 'wsmp-i-aaaaaaaaaaaa-r2', 2, '{}', 30009)`,
+    "23514",
+  );
+  await expectFailure(
+    "instance_rank_node_owner move",
+    `UPDATE instance_rank SET "nodeId" = 'node-b1' WHERE id = 'rank-w0'`,
+    "23514",
+  );
+  await expectFailure(
+    "instance_step_node_owner insert",
+    `INSERT INTO instance_step (id, "instanceId", "nodeId", rank, phase, sequence, generation, intent,
+      "intentHash") VALUES ('step-x', 'inst-m', 'node-b1', 0, 'START', 120, 2, '{}', ${HEX("d")})`,
+    "23514",
+  );
+  await expectFailure(
+    "instance_step_node_owner move",
+    `UPDATE instance_step SET "nodeId" = 'node-b1' WHERE id = 'step-m1'`,
+    "23514",
+  );
+  await client.query(`
+    INSERT INTO runtime_operation (id, "userId", kind, actor, "actorUserId", summary, fingerprint)
+    VALUES ('op-b', 'owner-b', 'STOP', 'USER', 'owner-b', '{}', ${HEX("e")}),
+           ('op-a', 'owner-a', 'STOP', 'USER', 'owner-a', '{}', ${HEX("f")})`);
+  await expectFailure(
+    "runtime_instance_operation_owner",
+    `UPDATE runtime_instance SET "operationId" = 'op-b' WHERE id = 'inst-w'`,
+    "23514",
+  );
+  // The owner's own operation, and the rows above unchanged by the refusals.
+  await client.query(`UPDATE runtime_instance SET "operationId" = 'op-a' WHERE id = 'inst-w'`);
+  await client.query(`UPDATE runtime_instance SET "operationId" = NULL WHERE id = 'inst-w'`);
+  await expectValue(
+    "cross-owner refusals wrote nothing",
+    `SELECT count(*) FROM instance_rank r JOIN instance_step s USING ("instanceId")
+      WHERE r."nodeId" = 'node-b1' OR s."nodeId" = 'node-b1'`,
+    0,
+  );
+  await client.query(`DELETE FROM runtime_operation WHERE id IN ('op-a', 'op-b')`);
 
   // ── nodes ──
   await expectFailure(
