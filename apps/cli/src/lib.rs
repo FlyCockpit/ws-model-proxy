@@ -21,6 +21,7 @@ pub mod exit;
 pub mod file_ops;
 #[cfg(unix)]
 pub mod file_relay;
+pub mod hardware;
 pub mod hostname;
 #[cfg(windows)]
 mod job_tree;
