@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { NODE_LOCAL_PLACEHOLDERS } from "../lib/command-render";
 import { RUNTIME_SPEC_WARNINGS, runtimeSpecSchema } from "../lib/runtime-spec";
 import {
   runtimeAdvancedPatchSchema,
@@ -81,6 +82,32 @@ export const instanceRankViewSchema = z
   })
   .strict();
 
+/**
+ * An interactive step's command as the node will render it (`lib/command-render.ts`, mirroring
+ * `render.rs`). `ready`: the text that runs, except the `nodeFills` placeholders, which stay
+ * `{{name}}` because only the node knows them. `refused`: the node refuses the job with this
+ * field and nothing runs. `unavailable`: the server cannot render it faithfully (the step's
+ * intent is unreadable, it names another launch hash than the instance's spec, or the head's
+ * fabric address is unknown, or a literal `{{fabric_*}}` would look like one the node fills) and
+ * shows no rendered text rather than a wrong one.
+ */
+export const renderedStepCommandSchema = z.discriminatedUnion("state", [
+  z
+    .object({
+      state: z.literal("ready"),
+      text: z.string(),
+      nodeFills: z.array(z.enum(NODE_LOCAL_PLACEHOLDERS)),
+    })
+    .strict(),
+  z.object({ state: z.literal("refused"), field: z.string() }).strict(),
+  z
+    .object({
+      state: z.literal("unavailable"),
+      reason: z.enum(["intent", "version", "head_addr", "node_fill_ambiguous"]),
+    })
+    .strict(),
+]);
+
 export const instanceStepViewSchema = z
   .object({
     id: idSchema,
@@ -92,12 +119,17 @@ export const instanceStepViewSchema = z
     /** A person runs this step in an operator terminal. */
     interactive: z.boolean(),
     /**
-     * The command text the step runs (from the launched version, placeholders unrendered) and who
-     * wrote it, so a person can judge it before typing a sudo password. Terminal ids are never in
-     * a view (agents read this through runtimes_get); people attach by step id.
+     * The command template the step runs (from the launched version, placeholders unrendered) and
+     * who wrote it, so a person can judge it before typing a sudo password. Terminal ids are never
+     * in a view (agents read this through runtimes_get); people attach by step id. Null too when
+     * the step names another spec than the instance's (its text here would not be what runs).
      */
     command: z.string().nullable(),
     commandAuthor: z.enum(["user", "agent", "unknown"]).nullable(),
+    /** Interactive steps only (null otherwise): the command with its placeholder values. */
+    rendered: renderedStepCommandSchema.nullable(),
+    /** The head node's fabric address the job sends as `{{head_addr}}` (multi-node only). */
+    headAddr: z.string().nullable(),
     terminalOpen: z.boolean(),
     updatedAt: isoDateSchema,
   })

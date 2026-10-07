@@ -107,6 +107,19 @@
       "superseded": "El runtime se detuvo o reinició desde entonces; este paso ya no se ejecuta.",
       "terminal_closed": "La terminal se cerró. Ejecuta el paso de nuevo para obtener una nueva.",
       "terminal_unavailable": "La terminal aún no está abierta en el nodo, o el nodo está sin conexión. Inténtalo de nuevo en un momento."
-    }
+    },
+    "commandRendered": "El comando que se ejecuta, con sus valores completados como los completa el nodo:",
+    "nodeFills": "El nodo completa {{names}} por sí mismo, a partir de su propia dirección en la red de interconexión. Un nodo sin ese valor rechaza el paso.",
+    "headAddr": "Dirección del nodo principal: {{addr}}",
+    "refused": "El servidor espera que el nodo rechace este paso (valor no válido: {{field}}), así que no se ejecutaría nada. Cancélalo y corrige el runtime.",
+    "unavailable": {
+      "intent": "Los valores de este paso no se pueden leer aquí, así que su comando no se muestra.",
+      "version": "Este paso ejecuta una definición distinta de la que lanzó esta instancia, así que su comando no se muestra aquí.",
+      "head_addr": "El nodo principal aún no tiene dirección en la red de interconexión de este paso, así que su comando no se completa.",
+      "node_fill_ambiguous": "Este comando contiene texto que parece un valor que completa el nodo pero no lo es, así que no se muestra completado aquí."
+    },
+    "unavailableHint": "La terminal en el nodo muestra el comando exacto antes de ejecutarlo.",
+    "template": "Plantilla del comando",
+    "refusedButOpen": "El servidor esperaba que el nodo rechazara este paso (valor no válido: {{field}}), pero su terminal se abrió, así que el comando no se puede confirmar aquí."
   }
 }

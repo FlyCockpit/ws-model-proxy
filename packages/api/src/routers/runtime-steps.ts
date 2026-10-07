@@ -14,8 +14,7 @@ import type { Context, RuntimeStepRefusal, RuntimeStepServices } from "../contex
 import { contractProcedure } from "../contract-procedure";
 import { runtimesContract as c } from "../contracts/runtimes";
 import { notFound, refuse } from "../lib/refuse";
-import { runtimeSpecSchema } from "../lib/runtime-spec";
-import { stepView } from "../lib/runtime-views";
+import { INSTANCE_INCLUDE, stepView, stepViewContext } from "../lib/runtime-views";
 
 function services(context: Context): RuntimeStepServices {
   const steps = context.services?.runtimeSteps;
@@ -44,15 +43,22 @@ function refusal(code: RuntimeStepRefusal): ORPCError<string, unknown> {
   return new ORPCError("CONFLICT", { message: REFUSAL_MESSAGES[code], data: { code } });
 }
 
-/** The step as people see it: the launched version's command text and its author. */
+/** The step as people see it: its command as the node renders it, and the command's author. */
 async function ownedStepView(userId: string, stepId: string) {
   const step = await prisma.instanceStep.findFirst({
     where: { id: stepId, Instance: { userId } },
-    include: { Instance: { select: { LaunchVersion: { select: { spec: true, editor: true } } } } },
+    include: {
+      Instance: {
+        select: {
+          LaunchVersion: INSTANCE_INCLUDE.LaunchVersion,
+          Fabric: INSTANCE_INCLUDE.Fabric,
+          Ranks: { where: { rank: 0 }, select: { rank: true, nodeId: true } },
+        },
+      },
+    },
   });
   if (!step) throw notFound("That step does not exist.");
-  const spec = runtimeSpecSchema.safeParse(step.Instance.LaunchVersion.spec);
-  return stepView(step, spec.success ? spec.data : null, step.Instance.LaunchVersion.editor);
+  return stepView(step, stepViewContext(step.Instance));
 }
 
 export const runtimeSteps = {

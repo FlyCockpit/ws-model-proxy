@@ -13,8 +13,10 @@ import type {
   runtimeVersionDetailSchema,
   runtimeVersionSummarySchema,
 } from "../contracts/runtimes";
+import { rankCommands, renderStepCommand, type StepCommandPhase } from "./command-render";
 import { jsonObject, registryView } from "./registry-view";
 import { type RuntimeSpec, runtimeSpecSchema } from "./runtime-spec";
+import { type StepIntent, stepIntentSchema, stepJobPlaceholders } from "./step-intent";
 
 export const VERSION_SELECT = {
   id: true,
@@ -45,7 +47,9 @@ export const INSTANCE_INCLUDE = {
     orderBy: { createdAt: "asc" },
   },
   Version: { select: { version: true, advanced: true } },
-  LaunchVersion: { select: { spec: true, editor: true } },
+  LaunchVersion: { select: { spec: true, editor: true, launchHash: true } },
+  // The head's fabric address, as dispatch resolves `{{head_addr}}`.
+  Fabric: { select: { id: true, name: true, Members: { select: { nodeId: true, ip: true } } } },
 } as const satisfies Prisma.RuntimeInstanceInclude;
 export type InstanceRow = Prisma.RuntimeInstanceGetPayload<{ include: typeof INSTANCE_INCLUDE }>;
 
@@ -195,19 +199,85 @@ const INTERACTIVE_KEY = {
   STOP: "stop",
 } as const;
 
-export function stepView(
-  step: InstanceRow["Steps"][number],
-  spec: RuntimeSpec | null,
-  author: "USER" | "AGENT" | "SYSTEM",
-): StepView {
-  const commands = spec?.launch?.commands;
-  const rankCommands = commands ? (commands[step.rank] ?? commands[0]) : undefined;
+/** What a step view needs of its instance to show the command as the node renders it. */
+export type StepViewContext = {
+  /** The instance's launch version (its spec, null when unreadable). */
+  spec: RuntimeSpec | null;
+  /** `sha256(canonicalJson(spec))`: the identity the node renders by. */
+  launchHash: string;
+  author: "USER" | "AGENT" | "SYSTEM";
+  /** The instance's fabric and its members' addresses (multi-node only). */
+  fabric: {
+    id: string;
+    name: string;
+    Members: ReadonlyArray<{ nodeId: string; ip: string }>;
+  } | null;
+  /** The node of rank 0 (the head). */
+  headNodeId: string | null;
+};
+
+export type StepRow = Pick<
+  InstanceRow["Steps"][number],
+  | "id"
+  | "rank"
+  | "phase"
+  | "state"
+  | "attempts"
+  | "errorCode"
+  | "intent"
+  | "operatorTerminalId"
+  | "updatedAt"
+>;
+
+/** The step's command rendered from the values its job sends, or why it is not shown. */
+function renderedView(
+  intent: StepIntent | null,
+  phase: StepCommandPhase,
+  context: StepViewContext,
+): Pick<StepView, "rendered" | "headAddr"> {
+  const unavailable = (reason: "intent" | "version" | "head_addr") => ({
+    rendered: { state: "unavailable" as const, reason },
+    headAddr: null,
+  });
+  if (!intent) return unavailable("intent");
+  // The node renders the spec whose hash the job names; only that one is rendered here.
+  if (!context.spec || intent.launchHash !== context.launchHash) return unavailable("version");
+  // As dispatch resolves it: the head rank's member address on the step's fabric.
+  let headAddr: string | null = null;
+  if (intent.nnodes > 1) {
+    const fabric = context.fabric?.id === intent.fabricId ? context.fabric : null;
+    headAddr = fabric?.Members.find((member) => member.nodeId === context.headNodeId)?.ip ?? null;
+    if (!headAddr) return unavailable("head_addr");
+  }
+  const rendered = renderStepCommand({
+    spec: context.spec,
+    phase,
+    intent,
+    placeholders: stepJobPlaceholders(intent, headAddr),
+    fabricName: context.fabric?.name ?? null,
+  });
+  return { rendered, headAddr };
+}
+
+export function stepView(step: StepRow, context: StepViewContext): StepView {
+  const parsed = stepIntentSchema.safeParse(step.intent);
+  const intent = parsed.success && parsed.data.rank === step.rank ? parsed.data : null;
+  // Without the step's intent, or for another launch spec than the instance's, the text here
+  // would not be known to be what runs: no command is shown.
+  const known = intent !== null && intent.launchHash === context.launchHash;
+  const launch = context.spec?.launch;
+  const commands = launch ? rankCommands(launch, step.rank) : undefined;
   const commandKey = STEP_COMMAND[step.phase];
   const interactiveKey =
     step.phase in INTERACTIVE_KEY
       ? INTERACTIVE_KEY[step.phase as keyof typeof INTERACTIVE_KEY]
       : null;
-  const command = commandKey && rankCommands ? (rankCommands[commandKey] ?? null) : null;
+  const command = known && commandKey && commands ? (commands[commandKey] ?? null) : null;
+  // Dispatch opens a terminal from the intent's flag; the spec's flag only when it is unreadable.
+  const interactive =
+    intent?.interactive ??
+    (interactiveKey ? commands?.interactive?.[interactiveKey] === true : false);
+  const { author } = context;
   return {
     id: step.id,
     nodeNumber: step.rank + 1,
@@ -215,7 +285,7 @@ export function stepView(
     state: step.state,
     attempts: step.attempts,
     errorCode: step.errorCode,
-    interactive: interactiveKey ? rankCommands?.interactive?.[interactiveKey] === true : false,
+    interactive,
     command,
     commandAuthor:
       command === null
@@ -225,8 +295,27 @@ export function stepView(
           : author === "USER"
             ? "user"
             : "unknown",
+    // Interactive steps only: a person authorizes those (and views stay small for agents).
+    ...(interactive && step.phase !== "READINESS"
+      ? renderedView(intent, step.phase, context)
+      : { rendered: null, headAddr: null }),
     terminalOpen: step.operatorTerminalId !== null,
     updatedAt: step.updatedAt.toISOString(),
+  };
+}
+
+/** The step-view context of an instance (`INSTANCE_INCLUDE`). */
+export function stepViewContext(
+  row: Pick<InstanceRow, "LaunchVersion" | "Fabric"> & {
+    Ranks: ReadonlyArray<{ rank: number; nodeId: string | null }>;
+  },
+): StepViewContext {
+  return {
+    spec: safeSpec(row.LaunchVersion.spec),
+    launchHash: row.LaunchVersion.launchHash,
+    author: row.LaunchVersion.editor,
+    fabric: row.Fabric,
+    headNodeId: row.Ranks.find((rank) => rank.rank === 0)?.nodeId ?? null,
   };
 }
 
@@ -237,7 +326,7 @@ function safeSpec(value: unknown): RuntimeSpec | null {
 
 export function instanceView(row: InstanceRow): InstanceView {
   const advanced = advancedView(row.Version.advanced);
-  const spec = safeSpec(row.LaunchVersion.spec);
+  const context = stepViewContext(row);
   return {
     id: row.id,
     runtimeId: row.runtimeId,
@@ -265,7 +354,7 @@ export function instanceView(row: InstanceRow): InstanceView {
       reserved: rank.claim,
       unitName: rank.unitName,
     })),
-    openSteps: row.Steps.map((step) => stepView(step, spec, row.LaunchVersion.editor)),
+    openSteps: row.Steps.map((step) => stepView(step, context)),
     // TODO(lane A, hot path): live load comes from the relay's in-memory engine-load cache.
     live: {
       running: null,

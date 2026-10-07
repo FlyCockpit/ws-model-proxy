@@ -86,7 +86,22 @@ const stepRow = {
   sequence: 120,
   generation: 1,
   state: "AWAITING_OPERATOR" as const,
-  intent: {},
+  intent: {
+    operationId: "op1",
+    runtimeId: "rt1",
+    launchVersionId: "ver1",
+    launchHash: "b".repeat(64),
+    rank: 0,
+    nnodes: 1,
+    handle: "i-abcdefabcdef",
+    unitName: "wsmp-rt-i-abcdefabcdef-0.service",
+    port: 30001,
+    distPort: null,
+    fabricId: null,
+    placeholders: { port: 30001 },
+    timeoutMs: 60_000,
+    interactive: true,
+  },
   intentHash: "a".repeat(64),
   attempts: 1,
   ownerEpoch: "e:1",
@@ -100,8 +115,12 @@ const stepRow = {
   operatorLastExit: null,
   operatorHold: null,
   Instance: {
+    launchVersionId: "ver1",
+    Fabric: null,
+    Ranks: [{ rank: 0, nodeId: "node1" }],
     LaunchVersion: {
       editor: "AGENT" as const,
+      launchHash: "b".repeat(64),
       spec: {
         api: "openai",
         engine: "vllm",
@@ -114,7 +133,7 @@ const stepRow = {
           labels: [],
           commands: [
             {
-              start: "sudo systemctl start llm",
+              start: "sudo systemctl start llm@{{port}}",
               stop: "sudo systemctl stop llm",
               status: "systemctl is-active llm",
               interactive: { start: true },
@@ -177,8 +196,10 @@ describe("runtimes.steps", () => {
       id: "step1",
       state: "AWAITING_OPERATOR",
       interactive: true,
-      command: "sudo systemctl start llm",
+      command: "sudo systemctl start llm@{{port}}",
       commandAuthor: "agent",
+      rendered: { state: "ready", text: "sudo systemctl start llm@30001", nodeFills: [] },
+      headAddr: null,
       terminalOpen: true,
     });
     // The view never carries the terminal id.

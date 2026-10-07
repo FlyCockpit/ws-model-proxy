@@ -320,3 +320,121 @@ fn substitution_and_decimals() {
     assert!(fraction("1") && fraction("0.5") && fraction("1.000"));
     assert!(!fraction("0") && !fraction("1.01") && !fraction("2"));
 }
+
+/// The vectors the server's renderer (`packages/api/src/lib/command-render.ts`) is checked
+/// against too: the command a person is shown in the web is rendered the same way.
+#[test]
+fn shared_render_vectors() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/relay-3.0/rules/command-render.json");
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("shared vectors"))
+        .expect("json");
+    let values_of = |object: &Value| -> BTreeMap<&'static str, String> {
+        object
+            .as_object()
+            .expect("values")
+            .iter()
+            .map(|(name, value)| {
+                let name: &'static str = Box::leak(name.clone().into_boxed_str());
+                (name, value.as_str().expect("string value").to_string())
+            })
+            .collect()
+    };
+    let base = values_of(&doc["values"]);
+    let cases = doc["substitute"].as_array().expect("cases");
+    assert!(cases.len() >= 20);
+    for case in cases {
+        let text = case["text"].as_str().expect("text");
+        let mut values = base.clone();
+        if let Some(extra) = case.get("values") {
+            values.extend(values_of(extra));
+        }
+        let expected = match (case.get("rendered"), case.get("missing")) {
+            (Some(rendered), None) => Ok(rendered.as_str().expect("rendered").to_string()),
+            (None, Some(missing)) => Err(missing.as_str().expect("missing").to_string()),
+            _ => panic!("case needs rendered or missing: {case}"),
+        };
+        assert_eq!(substitute(text, &values), expected, "{text:?}");
+    }
+    let list = |key: &str, which: &str| -> Vec<String> {
+        doc[key][which]
+            .as_array()
+            .expect("list")
+            .iter()
+            .map(|value| value.as_str().expect("string").to_string())
+            .collect()
+    };
+    // Whole jobs: the same cases `command-render.test.ts` renders on the server side.
+    let jobs = &doc["jobs"];
+    let cases = jobs["cases"].as_array().expect("job cases");
+    assert!(cases.len() >= 10);
+    for case in cases {
+        let name = case["name"].as_str().expect("name");
+        let commands: Vec<Value> = case["commands"]
+            .as_array()
+            .expect("commands")
+            .iter()
+            .map(|entry| {
+                let mut merged = json!({ "stop": "pkill -f {{port}}", "status": "true" });
+                for (key, value) in entry.as_object().expect("commands entry") {
+                    merged[key] = value.clone();
+                }
+                merged
+            })
+            .collect();
+        let group_size = case["groupSize"].as_u64().expect("groupSize");
+        let mut launch = json!({
+            "management": "service", "groupSize": group_size,
+            "resources": [{ "kind": "none" }], "labels": [],
+            "commands": commands,
+            "readiness": { "path": "/health", "expectedStatus": 200, "timeoutMs": 60000 },
+            "health": { "intervalMs": 30000, "failureThreshold": 3, "successThreshold": 1 }
+        });
+        if group_size > 1 {
+            launch["fabric"] = json!("qsfp");
+        }
+        let (store, hash) = store_with(json!({
+            "api": "openai", "engine": "vllm", "modelType": "llm",
+            "models": [{ "id": "m" }], "launch": launch
+        }));
+        let rank = u8::try_from(case["rank"].as_u64().expect("rank")).expect("rank");
+        let nnodes = u8::try_from(case["nnodes"].as_u64().expect("nnodes")).expect("nnodes");
+        let mut job = job(&hash, rank, nnodes);
+        job.phase = serde_json::from_value(case["phase"].clone()).expect("phase");
+        job.placeholders =
+            serde_json::from_value(case["placeholders"].clone()).expect("placeholders");
+        if case["interactive"].as_bool().expect("interactive") {
+            job.operator = Some(crate::protocol::frames::JobOperator {
+                terminal_id: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+                command_author: crate::protocol::frames::CommandAuthor::Agent,
+            });
+        }
+        let outcome = render(&job, TrustValue::Full, &store, &facts("eth0"));
+        match (case.get("command"), case.get("refused")) {
+            (Some(command), None) => assert_eq!(
+                outcome.expect(name).command,
+                command.as_str().expect("command"),
+                "{name}"
+            ),
+            (None, Some(field)) => {
+                let refusal = outcome.expect_err(name);
+                assert_eq!(refusal.detail.as_deref(), field.as_str(), "{name}");
+            }
+            _ => panic!("case needs command or refused: {name}"),
+        }
+    }
+    type Check = fn(&str) -> bool;
+    let checks: [(&str, Check); 3] = [
+        ("gpuIds", gpu_ids),
+        ("positiveDecimal", positive_decimal),
+        ("fraction", fraction),
+    ];
+    for (key, check) in checks {
+        for value in list(key, "valid") {
+            assert!(check(&value), "{key} accepts {value:?}");
+        }
+        for value in list(key, "invalid") {
+            assert!(!check(&value), "{key} refuses {value:?}");
+        }
+    }
+}
