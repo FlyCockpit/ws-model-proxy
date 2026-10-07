@@ -23,6 +23,7 @@ import {
   relayFailureClasses,
   releaseTargetHalfOpenTrial,
   routeKey,
+  targetHealthFailure,
 } from "@ws-model-proxy/api/lib/pool-routing";
 import { ANTHROPIC_DEFAULT_API_VERSION } from "@ws-model-proxy/api/lib/provider-protocol";
 import {
@@ -5247,10 +5248,19 @@ async function relayPool({
       async () => undefined,
     );
     if (overflow.kind === "response") return overflow.response;
-    const failure = terminalExternalFailure(overflow) ?? "disconnected";
+    const externalFailure = terminalExternalFailure(overflow);
+    const failure = externalFailure ?? "disconnected";
     await operation.dispose?.();
     await failPoolRelayMetadata({ relayRequestId, startedAt, failure });
-    return operationFailureResponse(operation, failure);
+    // No member is routable now (not ready, node offline, or every target waiting out its
+    // health backoff): say so, rather than blame a connection the caller cannot see.
+    return operationFailureResponse(
+      operation,
+      failure,
+      externalFailure
+        ? undefined
+        : "No member of this pool can serve the request right now. Retry shortly.",
+    );
   }
 
   const memberById = new Map(eligibleMembers.map((member) => [member.id, member] as const));
@@ -6054,10 +6064,10 @@ async function relayPool({
         claimed = await markTargetHalfOpenTrial({
           now: trialStartedAt,
           executionTargetId: candidate.executionTargetId,
-          // `buildPoolRouteSequence` emits this only when the full configured
-          // pool has one route. Passing explicit authority keeps a
+          // `buildPoolRouteSequence` emits this only for a degraded route with
+          // no healthy alternative. Passing explicit authority keeps a
           // degraded row from being claimed by other half-open callers.
-          allowSingleDegradedFallback: candidate.singleRouteDegradedFallback,
+          allowDegradedFallback: candidate.degradedFallback,
         });
       } catch {
         await settleRelayCleanup([() => cliLease.release()]);
@@ -6314,7 +6324,7 @@ async function relayPool({
         await recordTargetRelayFailure({
           executionTargetId: candidate.executionTargetId,
           trialStartedAt: claimedTrialAt,
-          failure: "upstream_5xx",
+          failure: targetHealthFailure("upstream_5xx", adaptedSource !== null),
         }).catch(metadataUpdateError);
         await releaseCapacityAttempt();
         continue;
@@ -6425,7 +6435,7 @@ async function relayPool({
           await recordTargetRelayFailure({
             executionTargetId: candidate.executionTargetId,
             trialStartedAt: claimedTrialAt,
-            failure: "protocol_error",
+            failure: targetHealthFailure("protocol_error", adaptedSource !== null),
           }).catch(metadataUpdateError);
           if (!shouldRetryRelayOperation(operation, "precommit_content_type_mismatch")) break;
           await releaseCapacityAttempt();
@@ -6474,7 +6484,7 @@ async function relayPool({
           await recordTargetRelayFailure({
             executionTargetId: candidate.executionTargetId,
             trialStartedAt: claimedTrialAt,
-            failure: "protocol_error",
+            failure: targetHealthFailure("protocol_error", adaptedSource !== null),
           }).catch(metadataUpdateError);
           await releaseCapacityAttempt();
           continue;
@@ -6530,7 +6540,7 @@ async function relayPool({
           await recordTargetRelayFailure({
             executionTargetId: candidate.executionTargetId,
             trialStartedAt: claimedTrialAt,
-            failure: "protocol_error",
+            failure: targetHealthFailure("protocol_error", adaptedSource !== null),
           }).catch(metadataUpdateError);
           await releaseCapacityAttempt();
           continue;
@@ -6830,7 +6840,7 @@ async function relayPool({
                   ? recordTargetRelayFailure({
                       executionTargetId: candidate.executionTargetId,
                       trialStartedAt: claimedTrialAt,
-                      failure: "protocol_error",
+                      failure: targetHealthFailure("protocol_error", adaptedSource !== null),
                     })
                   : // A served attempt that settled neither way (client abort
                     // mid-stream, non-member failure) gives its trial back; a
@@ -6959,7 +6969,7 @@ async function relayPool({
         await recordTargetRelayFailure({
           executionTargetId: candidate.executionTargetId,
           trialStartedAt: claimedTrialAt,
-          failure,
+          failure: targetHealthFailure(failure, adaptedSource !== null),
         }).catch(metadataUpdateError);
         await releaseCapacityAttempt();
         continue;
