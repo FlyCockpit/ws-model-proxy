@@ -98,6 +98,12 @@ export const SEMANTIC_FIELDS = [
   "max_completion_tokens",
   "temperature",
   "top_p",
+  "top_k",
+  "min_p",
+  "frequency_penalty",
+  "presence_penalty",
+  "repetition_penalty",
+  "parallel_tool_calls",
   "stop",
   "stop_sequences",
   "n",
@@ -239,6 +245,30 @@ const fieldPathSchema = z
 
 const endpointSchema = z.enum(COMPAT_ENDPOINTS).optional();
 
+/**
+ * Null when a rename may move `path` to the key `to`. The destination gets the default rule's
+ * protection too, since a rename could move a value a default created: an object-level move may
+ * not land on a content, conversation, adapter, file or media key. Same-meaning spellings
+ * (`max_completion_tokens` → `max_tokens`) are always allowed.
+ */
+export function renameTargetProblem(path: string, to: string): string | null {
+  const segments = parseFieldPath(path);
+  if (!segments) return "not a field path (a.b[].c)";
+  if (
+    Object.values(SEMANTIC_EQUIVALENTS).some(
+      (map) => map !== undefined && Object.hasOwn(map, path) && map[path] === to,
+    )
+  )
+    return null;
+  const destination = formatFieldPath([...segments.slice(0, -1), { key: to, each: false }]);
+  const credential = rulePathProblem(destination);
+  if (credential) return credential;
+  if (DEFAULT_FORBIDDEN_SEGMENT.test(to)) return `${to} names an adapter, file or media reference`;
+  if (segments.length === 1 && DEFAULT_FORBIDDEN_FIRST.has(to))
+    return `a rename cannot create ${to}`;
+  return null;
+}
+
 /** Null when a `default` rule may set `path`; otherwise why not. */
 export function defaultPathProblem(path: string): string | null {
   const segments = parseFieldPath(path);
@@ -274,7 +304,7 @@ export const rewriteRuleSchema = z.discriminatedUnion("op", [
     })
     .strict()
     .superRefine((rule, ctx) => {
-      const problem = rulePathProblem(rule.to);
+      const problem = renameTargetProblem(rule.path, rule.to);
       if (problem) ctx.addIssue({ code: "custom", path: ["to"], message: problem });
     }),
   z.object({ op: z.literal("drop"), endpoint: endpointSchema, path: fieldPathSchema }).strict(),
@@ -394,10 +424,9 @@ export const requestCompatSchema = z
   });
 export type RequestCompat = z.infer<typeof requestCompatSchema>;
 
-/** The stored setting, tolerant of old or hand-edited rows (invalid parts read as absent). */
-export function readRequestCompat(advanced: unknown): RequestCompat {
-  if (!advanced || typeof advanced !== "object" || Array.isArray(advanced)) return {};
-  const parsed = requestCompatSchema.safeParse((advanced as Record<string, unknown>).compat);
+/** `RuntimeVersion.compat` as stored; an invalid value (never written) reads as automatic. */
+export function storedRequestCompat(value: unknown): RequestCompat {
+  const parsed = requestCompatSchema.safeParse(value);
   return parsed.success ? parsed.data : {};
 }
 

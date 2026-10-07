@@ -143,11 +143,11 @@ describe("applyRequestCompat", () => {
       "messages[].cache_control",
       "messages[].content[].cache_control",
       "metadata",
-      "parallel_tool_calls",
       "stream_options.continuous_usage_stats",
     ]);
     expect(result.report.rewrites).toEqual(["mapRole:developer>system"]);
     expect(result.body.logprobs).toBe(true);
+    expect(result.body.parallel_tool_calls).toBe(false);
     expect(result.body.tools).toEqual(input.tools);
     expect(result.body.stream_options).toEqual({ include_usage: true });
     expect((result.body.messages as Array<{ role: string }>)[0]!.role).toBe("system");

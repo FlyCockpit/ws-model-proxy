@@ -72,6 +72,42 @@ describe("engine 400 parsing", () => {
     ).toEqual({ kind: "field", path: "tools[].type" });
   });
 
+  it("never pins an error about a missing path on another field", () => {
+    for (const bodyText of [
+      '{"error":{"message":"Unknown parameter: \'missing.extra\'."}}',
+      '{"error":{"message":"Unknown parameter: \'messages[0].missing.extra\'."}}',
+    ])
+      expect(
+        parseEngineRejection({
+          status: 400,
+          bodyText,
+          requestBody: { extra: 1, messages: [{ role: "user", content: "x", extra: 1 }] },
+          requestHeaders: new Headers(),
+        }),
+      ).toBeNull();
+    expect(resolveLocation(["body", "nope", "extra"], { extra: 1 })).toBeNull();
+  });
+
+  it("parses adversarial 16 KiB messages in linear time", () => {
+    const hostile = [
+      "'a' not supported ".repeat(1000),
+      `field ${"a".repeat(16_000)}`,
+      `'loc': (${"'a', ".repeat(3000)}`,
+      `unknown field \`${"x".repeat(16_000)}`,
+      `${"messages.0.".repeat(1500)}\n  Extra inputs are not permitted`,
+    ];
+    for (const message of hostile) {
+      const started = performance.now();
+      parseEngineRejection({
+        status: 400,
+        bodyText: JSON.stringify({ error: { message } }),
+        requestBody: { messages: [] },
+        requestHeaders: new Headers(),
+      });
+      expect(performance.now() - started).toBeLessThan(250);
+    }
+  });
+
   it("learns nothing when union variants disagree", () => {
     const detail = {
       detail: [

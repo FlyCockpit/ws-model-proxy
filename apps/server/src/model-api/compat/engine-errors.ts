@@ -55,14 +55,27 @@ function messagesOf(text: string): { messages: string[]; detail: unknown[] } {
 }
 
 /**
+ * A validation-union tag pydantic puts in a location (`ChatCompletionUserMessageParam`,
+ * `function-after[...]`, a role-tagged variant): never a request key.
+ */
+function isUnionTag(segment: string): boolean {
+  return (
+    /^[A-Z][A-Za-z0-9]{0,127}$/.test(segment) ||
+    /[[\]()-]/.test(segment) ||
+    ["system", "developer", "user", "assistant", "tool", "function"].includes(segment)
+  );
+}
+
+/**
  * Resolves a location (`["body", "messages", 0, "user", "cache_control"]`) against the request:
- * integer segments descend arrays, keys the object has descend it, anything else (union tags
- * such as `user` or `ChatCompletionUserMessageParam`) is skipped. Null unless the last segment
- * is a key the request really has.
+ * integer segments descend arrays and keys the object has descend it. A union tag the request
+ * does not have as a key is skipped; any other missing segment (or index) fails, so an error
+ * about a field the request lacks is never pinned on another one. `strict` skips nothing.
  */
 export function resolveLocation(
   location: ReadonlyArray<string | number>,
   body: unknown,
+  { strict = false }: { strict?: boolean } = {},
 ): string | null {
   const segments = location[0] === "body" ? location.slice(1) : location;
   let current: unknown = body;
@@ -72,9 +85,9 @@ export function resolveLocation(
     lastMatched = false;
     if (Array.isArray(current)) {
       const index =
-        typeof segment === "number" ? segment : /^\d+$/.test(segment) ? Number(segment) : null;
-      if (index === null || index >= current.length) continue;
-      path[path.length - 1] = `${path.at(-1)}[]`;
+        typeof segment === "number" ? segment : /^\d{1,6}$/.test(segment) ? Number(segment) : null;
+      if (index === null || index >= current.length || path.length === 0) return null;
+      if (!path.at(-1)!.endsWith("[]")) path[path.length - 1] = `${path.at(-1)}[]`;
       current = current[index];
       continue;
     }
@@ -82,7 +95,9 @@ export function resolveLocation(
       path.push(segment);
       current = current[segment];
       lastMatched = true;
+      continue;
     }
+    if (strict || typeof segment !== "string" || !isUnionTag(segment)) return null;
   }
   return lastMatched && path.length > 0 ? path.join(".") : null;
 }
@@ -139,7 +154,7 @@ function fromDetail(detail: unknown[], body: unknown): EngineRejection | null {
 
 /** Pydantic tuples rendered in a message: `'loc': ('body', 'stream_options')`. */
 function fromPydanticRepr(message: string, body: unknown): EngineRejection | null {
-  const pattern = /'loc':\s*\(([^)]*)\)[^}]*?'msg':\s*'([^']*)'/g;
+  const pattern = /'loc':\s*\(([^)]{0,512})\)[^}]{0,512}?'msg':\s*'([^']{0,256})'/g;
   const entries: Json[] = [];
   for (const match of message.matchAll(pattern)) {
     if (!EXTRA.test(match[2] ?? "") && !EXTRA.test(match[0])) continue;
@@ -160,13 +175,13 @@ function fromPydanticText(message: string, body: unknown): EngineRejection | nul
   const lines = message.split(/\r?\n|\\n/);
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index]!.trim();
-    const inline = /^([A-Za-z0-9_.\-[\]]+):\s*(.*)$/.exec(line);
+    const inline = /^([A-Za-z0-9_.\-[\]]{1,256}):\s*(.*)$/.exec(line);
     if (inline && EXTRA.test(inline[2] ?? "")) {
       const path = resolveLocation(inline[1]!.split("."), body);
       if (path) return { kind: "field", path };
     }
     const next = lines[index + 1]?.trim() ?? "";
-    if (/^[A-Za-z0-9_.-]+$/.test(line) && EXTRA.test(next)) {
+    if (/^[A-Za-z0-9_.-]{1,256}$/.test(line) && EXTRA.test(next)) {
       const path = resolveLocation(line.split("."), body);
       if (path) return { kind: "field", path };
     }
@@ -176,20 +191,23 @@ function fromPydanticText(message: string, body: unknown): EngineRejection | nul
 
 const NAMED_FIELD_PATTERNS: RegExp[] = [
   // serde (TGI and Rust servers): unknown field `foo`, expected one of ...
-  /unknown field `([^`]+)`/i,
+  /unknown field `([^`]{1,128})`/i,
   // Go encoding/json (Ollama with DisallowUnknownFields): json: unknown field "foo"
-  /unknown field "([^"]+)"/i,
+  /unknown field "([^"]{1,128})"/i,
   // OpenAI: Unrecognized request argument supplied: foo / Unknown parameter: 'foo'.
-  /unrecognized request arguments? supplied:\s*([A-Za-z0-9_.[\]-]+)/i,
-  /unknown parameter:?\s*'([^']+)'/i,
-  /unsupported param(?:eter)?:\s*['"`]?([A-Za-z0-9_.[\]-]+)/i,
+  /unrecognized request arguments? supplied:\s*([A-Za-z0-9_.[\]-]{1,128})/i,
+  /unknown parameter:?\s*'([^']{1,128})'/i,
+  /unsupported param(?:eter)?:\s*['"`]?([A-Za-z0-9_.[\]-]{1,128})/i,
   // llama.cpp and friends: "foo" is not supported / Unsupported param: foo
-  /(?:param(?:eter)?|field)\s+'?`?"?([A-Za-z0-9_.-]+)'?`?"?\s+is not (?:supported|allowed|permitted)/i,
+  /(?:param(?:eter)?|field) ['`"]?([A-Za-z0-9_.-]{1,64})['`"]? is not (?:supported|allowed|permitted)/i,
 ];
 
 function fromNamedField(message: string, body: unknown): EngineRejection | null {
+  // OpenAI's exact wording, with bounded names: linear in the message length.
   const replacement =
-    /'([A-Za-z0-9_.-]+)'[^.]*not supported[^.]*\.\s*Use '([A-Za-z0-9_.-]+)' instead/i.exec(message);
+    /'([A-Za-z0-9_.-]{1,64})' is not supported with this model\. Use '([A-Za-z0-9_.-]{1,64})' instead/i.exec(
+      message,
+    );
   if (replacement) {
     const path = findKey(replacement[1]!, body);
     if (path) return { kind: "replace", path, with: replacement[2]! };
@@ -199,7 +217,9 @@ function fromNamedField(message: string, body: unknown): EngineRejection | null 
     if (!match) continue;
     // OpenAI-style indexes (`messages[0].foo`) become location segments.
     const name = match[1]!.replace(/\[(\d+)\]/g, ".$1");
-    const path = name.includes(".") ? resolveLocation(name.split("."), body) : findKey(name, body);
+    const path = name.includes(".")
+      ? resolveLocation(name.split("."), body, { strict: true })
+      : findKey(name, body);
     if (path) return { kind: "field", path };
   }
   return null;
@@ -207,9 +227,9 @@ function fromNamedField(message: string, body: unknown): EngineRejection | null 
 
 function fromRole(message: string, body: unknown): EngineRejection | null {
   const patterns = [
-    /(?:unexpected|invalid|unsupported|unknown) (?:message )?role:?\s*'?"?`?([a-z_]+)/i,
-    /input tag '([a-z_]+)' found using 'role'/i,
-    /role '?"?([a-z_]+)'?"? is not (?:supported|allowed)/i,
+    /(?:unexpected|invalid|unsupported|unknown) (?:message )?role:? ?['"`]?([a-z_]{1,32})/i,
+    /input tag '([a-z_]{1,32})' found using 'role'/i,
+    /role ['"]?([a-z_]{1,32})['"]? is not (?:supported|allowed)/i,
   ];
   for (const pattern of patterns) {
     const match = pattern.exec(message);
@@ -227,7 +247,7 @@ function fromRole(message: string, body: unknown): EngineRejection | null {
 
 function fromHeader(message: string, headers: Headers): EngineRejection | null {
   const match =
-    /for the `?([a-z0-9-]+)`? header|header `?([a-z0-9-]+)`? (?:is )?(?:not supported|invalid|unexpected)/i.exec(
+    /for the `?([a-z0-9-]{1,64})`? header|header `?([a-z0-9-]{1,64})`? (?:is )?(?:not supported|invalid|unexpected)/i.exec(
       message,
     );
   const name = (match?.[1] ?? match?.[2])?.toLowerCase();

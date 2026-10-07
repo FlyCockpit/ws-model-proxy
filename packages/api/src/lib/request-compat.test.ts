@@ -3,9 +3,9 @@ import {
   isSemanticPath,
   parseFieldPath,
   readLearnedProfile,
-  readRequestCompat,
   requestCompatSchema,
   rulePathProblem,
+  storedRequestCompat,
 } from "./request-compat";
 
 describe("semantic fields", () => {
@@ -33,6 +33,10 @@ describe("semantic fields", () => {
     "tools[].strict",
     "guided_json",
     "chat_template_kwargs",
+    "top_k",
+    "frequency_penalty",
+    "presence_penalty",
+    "parallel_tool_calls",
   ])("%s is semantic", (path) => expect(isSemanticPath(path)).toBe(true));
 
   it.each([
@@ -42,10 +46,8 @@ describe("semantic fields", () => {
     "messages[].content[].cache_control",
     "tools[].cache_control",
     "metadata",
-    "parallel_tool_calls",
     "user",
     "store",
-    "top_k",
     "text.verbosity",
   ])("%s is not semantic", (path) => expect(isSemanticPath(path)).toBe(false));
 });
@@ -160,6 +162,30 @@ describe("field paths and rule safety", () => {
     ).toBe(true);
   });
 
+  it("refuses composed default+rename moves onto protected keys", () => {
+    for (const [path, to] of [
+      ["scratch", "file_id"],
+      ["scratch", "lora_request"],
+      ["scratch", "previous_response_id"],
+      ["scratch", "instructions"],
+      ["scratch", "image_url"],
+    ])
+      expect(
+        requestCompatSchema.safeParse({
+          rewriteRules: [
+            { op: "default", path: `${path}.name`, value: "x" },
+            { op: "rename", path, to },
+          ],
+        }).success,
+        `${path}>${to}`,
+      ).toBe(false);
+    expect(
+      requestCompatSchema.safeParse({
+        rewriteRules: [{ op: "rename", path: "messages[].reasoning", to: "reasoning_content" }],
+      }).success,
+    ).toBe(true);
+  });
+
   it("refuses a rename onto a forbidden key and unknown rule shapes", () => {
     expect(
       requestCompatSchema.safeParse({ rewriteRules: [{ op: "rename", path: "x", to: "model" }] })
@@ -185,11 +211,11 @@ describe("field paths and rule safety", () => {
 
 describe("stored settings", () => {
   it("reads invalid stored parts as absent", () => {
-    expect(readRequestCompat({ compat: { unknownFieldPolicy: "strict" } })).toEqual({
+    expect(storedRequestCompat({ unknownFieldPolicy: "strict" })).toEqual({
       unknownFieldPolicy: "strict",
     });
-    expect(readRequestCompat({ compat: { unknownFieldPolicy: "nope" } })).toEqual({});
-    expect(readRequestCompat(null)).toEqual({});
+    expect(storedRequestCompat({ unknownFieldPolicy: "nope" })).toEqual({});
+    expect(storedRequestCompat(null)).toEqual({});
     expect(readLearnedProfile({ v: 2 })).toEqual({ v: 1, fixes: {}, stripHeaders: [] });
   });
 });
