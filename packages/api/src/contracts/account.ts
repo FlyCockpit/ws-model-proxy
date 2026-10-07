@@ -35,6 +35,8 @@ function adminPageOf<T extends z.ZodType>(item: T) {
       total: z.number().int(),
       page: z.number().int(),
       pageSize: z.number().int(),
+      /** `total` is a lower bound (a capped count, or an owner query that matched too many). */
+      partial: z.literal(true).optional(),
     })
     .strict();
 }

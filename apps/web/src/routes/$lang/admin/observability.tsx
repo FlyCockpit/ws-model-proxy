@@ -85,7 +85,7 @@ function AdminObservability() {
   );
 }
 
-type Paged<T> = { items: T[]; total: number; page: number; pageSize: number };
+type Paged<T> = { items: T[]; total: number; page: number; pageSize: number; partial?: true };
 type PagedQuery<T> = {
   isPending: boolean;
   isError: boolean;
@@ -116,12 +116,14 @@ function PagedList<T extends { id: string }>({
     return (
       <InlineRetry message={t("admin:observability.loadFailed")} onRetry={() => query.refetch()} />
     );
-  const { items, total, page, pageSize } = query.data;
+  const { items, total, page, pageSize, partial } = query.data;
   const pages = Math.max(1, Math.ceil(total / pageSize));
   return (
     <div className="flex min-w-0 flex-col gap-3">
       <p className="text-sm text-muted-foreground">
-        {t("admin:observability.total", { count: total })}
+        {partial
+          ? t("admin:observability.totalAtLeast", { count: total })
+          : t("admin:observability.total", { count: total })}
       </p>
       {items.length === 0 ? (
         <Card>

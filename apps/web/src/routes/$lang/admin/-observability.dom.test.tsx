@@ -73,6 +73,7 @@ vi.mock("@/utils/orpc", () => {
         state.inputs.push({ list: name, input });
         const items = rows[name] ?? [];
         return {
+          ...(name === "relay" ? { partial: true } : {}),
           items,
           total: name === "nodes" ? 60 : items.length,
           page: input.page,
@@ -137,6 +138,7 @@ describe("Admin observability", { timeout: 30_000 }, () => {
     expect(await screen.findByText("admin:observability.empty")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "admin:observability.tabs.requests" }));
     expect(await screen.findByText("u-one/chat")).toBeTruthy();
+    expect(screen.getByText("admin:observability.totalAtLeast:1")).toBeTruthy();
     fireEvent.change(screen.getByLabelText("admin:observability.ownerLabel"), {
       target: { value: " one " },
     });

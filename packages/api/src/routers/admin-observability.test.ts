@@ -190,5 +190,25 @@ describe("admin observability", () => {
     expect(db.relayRequest.findMany).toHaveBeenCalledWith(
       expect.objectContaining({ where: { userId: { in: ["u1"] } } }),
     );
+    expect(result.partial).toBeUndefined();
+  });
+
+  it("caps the request count, and says the list is partial past it or past 1,000 owners", async () => {
+    db.relayRequest.findMany.mockResolvedValue([]);
+    db.relayRequest.count.mockResolvedValue(10_001);
+    const unfiltered = await client("admin").relay({});
+    expect(unfiltered).toMatchObject({ total: 10_000, partial: true });
+    expect(db.relayRequest.count).toHaveBeenCalledWith({ where: {}, take: 10_001 });
+
+    db.user.findMany.mockResolvedValueOnce(
+      Array.from({ length: 1_001 }, (_, index) => ({ id: `u${index}` })) as never,
+    );
+    db.relayRequest.count.mockResolvedValue(3);
+    const broad = await client("admin").relay({ ownerQuery: "a" });
+    expect(broad).toMatchObject({ total: 3, partial: true });
+    const where = db.relayRequest.findMany.mock.calls.at(-1)?.[0]?.where as {
+      userId: { in: string[] };
+    };
+    expect(where.userId.in).toHaveLength(1_000);
   });
 });

@@ -293,6 +293,7 @@ integration("metrics_query on PostgreSQL", () => {
     const db = fixtures;
     try {
       const users = { in: [OWNER, GRANTEE, STRANGER] };
+      await db.relayRequest.deleteMany({ where: { userId: users } });
       await db.usageRollupMinute.deleteMany({ where: { ownerUserId: users } });
       await db.usageRollupHour.deleteMany({ where: { ownerUserId: users } });
       await db.runtimeLoadMinute.deleteMany({ where: { ownerUserId: users } });
@@ -545,19 +546,51 @@ integration("metrics_query on PostgreSQL", () => {
       } as Context,
     }).adminObservability;
     const ownerQuery = OWNER;
+    const instance = await fixtures.runtimeInstance.findUniqueOrThrow({
+      where: { id: ids.instance },
+      select: { phase: true },
+    });
+    // The started instance has not stopped (no node acts in this test).
+    expect(["STARTING", "READY", "UNHEALTHY", "UNAVAILABLE"]).toContain(instance.phase);
     const nodes = await admin.nodes({ ownerQuery });
     expect(nodes.items).toEqual([
-      expect.objectContaining({ id: ids.node, trust: "FULL", connection: "ONLINE" }),
+      expect.objectContaining({
+        id: ids.node,
+        trust: "FULL",
+        connection: "ONLINE",
+        runningInstances: 1,
+      }),
     ]);
-    expect(nodes.items[0]?.runningInstances).toBeGreaterThanOrEqual(0);
     const runtimes = await admin.runtimes({ ownerQuery });
     expect(runtimes.items[0]).toMatchObject({ id: ids.runtime, modelType: "LLM" });
     const pools = await admin.pools({ ownerQuery });
     expect(pools.items).toEqual([
       expect.objectContaining({ id: ids.pool, callableId: `${OWNER}/chat`, members: 1, shares: 1 }),
     ]);
+    await fixtures.relayRequest.create({
+      data: {
+        userId: OWNER,
+        source: "API_KEY",
+        poolId: ids.pool,
+        external: true,
+        status: "FAILED",
+        durationMs: 120,
+        errorClass: "upstream_5xx",
+        completedAt: new Date(),
+      },
+    });
     const relay = await admin.relay({ ownerQuery });
-    expect(relay.total).toBe(0);
+    expect(relay.total).toBe(1);
+    expect(relay.items).toEqual([
+      expect.objectContaining({
+        owner: expect.objectContaining({ id: OWNER }),
+        status: "FAILED",
+        callableId: `${OWNER}/chat:external`,
+        durationMs: 120,
+        errorClass: "upstream_5xx",
+      }),
+    ]);
+    expect((await admin.relay({ ownerQuery: `${RUN}-nobody` })).items).toEqual([]);
     await expect(client(person(OWNER)).adminObservability.nodes({})).rejects.toMatchObject({
       code: "NOT_FOUND",
     });

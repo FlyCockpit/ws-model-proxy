@@ -16,6 +16,8 @@ const OWNER_SELECT = { id: true, email: true, name: true, slug: true } as const;
 const LIVE_PHASES = ["STARTING", "READY", "UNHEALTHY", "UNAVAILABLE"] as const;
 /** Request log rows: owners matching a query, at most this many (a narrower query finds more). */
 const MAX_MATCHED_OWNERS = 1_000;
+/** The request log only grows: its count stops here (the answer says `partial`). */
+const MAX_RELAY_COUNT = 10_000;
 
 function ownerWhere(query: string | undefined): Prisma.UserWhereInput | undefined {
   if (!query) return undefined;
@@ -32,8 +34,14 @@ function paging(input: PageInput) {
   return { skip: (input.page - 1) * input.pageSize, take: input.pageSize };
 }
 
-function pageOf<T>(items: T[], total: number, input: PageInput) {
-  return { items, total, page: input.page, pageSize: input.pageSize };
+function pageOf<T>(items: T[], total: number, input: PageInput, partial = false) {
+  return {
+    items,
+    total,
+    page: input.page,
+    pageSize: input.pageSize,
+    ...(partial ? { partial: true as const } : {}),
+  };
 }
 
 export const adminObservabilityRouter = {
@@ -155,14 +163,16 @@ export const adminObservabilityRouter = {
       ? await prisma.user.findMany({
           where: owner,
           select: { id: true },
-          take: MAX_MATCHED_OWNERS,
+          orderBy: { id: "asc" },
+          take: MAX_MATCHED_OWNERS + 1,
         })
       : null;
     if (matched && matched.length === 0) return pageOf([], 0, input);
+    const tooManyOwners = matched !== null && matched.length > MAX_MATCHED_OWNERS;
     const where: Prisma.RelayRequestWhereInput = matched
-      ? { userId: { in: matched.map((user) => user.id) } }
+      ? { userId: { in: matched.slice(0, MAX_MATCHED_OWNERS).map((user) => user.id) } }
       : {};
-    const [rows, total] = await Promise.all([
+    const [rows, counted] = await Promise.all([
       prisma.relayRequest.findMany({
         where,
         orderBy: [{ createdAt: "desc" }, { id: "desc" }],
@@ -178,8 +188,9 @@ export const adminObservabilityRouter = {
           errorClass: true,
         },
       }),
-      prisma.relayRequest.count({ where }),
+      prisma.relayRequest.count({ where, take: MAX_RELAY_COUNT + 1 }),
     ]);
+    const total = Math.min(counted, MAX_RELAY_COUNT);
     const userIds = [...new Set(rows.map((row) => row.userId))];
     const poolIds = [...new Set(rows.flatMap((row) => (row.poolId ? [row.poolId] : [])))];
     const [users, pools] = await Promise.all([
@@ -200,7 +211,7 @@ export const adminObservabilityRouter = {
     return pageOf(
       rows.flatMap((row) => {
         const user = usersById.get(row.userId);
-        // A deleted requester's rows go with their account.
+        // A deleted requester's rows go with the deferred sweep; until then a page may be short.
         if (!user) return [];
         const pool = row.poolId ? callable.get(row.poolId) : undefined;
         return [
@@ -217,6 +228,7 @@ export const adminObservabilityRouter = {
       }),
       total,
       input,
+      tooManyOwners || counted > MAX_RELAY_COUNT,
     );
   }),
 };
