@@ -1,12 +1,15 @@
 /**
  * Cross-owner isolation on the server side: what the procedures hand off to (MCP tool dispatch,
  * the interactive-step services, the lifecycle engine's dispatch, the definition sync) never lets
- * user B act on user A's node, step or terminal, whatever B names. The procedures' own scoping is
+ * user B act on user A's node, step or terminal, whatever B names. The MCP tool list comes from
+ * MCP_TOOLS: every tool is covered or exempted, with a reason. The relay's own owner checks
+ * (node-owner.ts) are tested with each sender. The procedures' own scoping is
  * proven in packages/api/src/cross-owner-isolation.test.ts; the database's in
  * packages/api/src/integration/cross-owner-isolation.postgres.integration.test.ts.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { type DeepMockProxy, mockReset } from "vitest-mock-extended";
+import { z } from "zod";
 import type { PrismaClient } from "../../../packages/db/prisma/generated/client";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
@@ -63,6 +66,46 @@ function namesOwner(value: unknown, owner: string, depth = 0): boolean {
   return false;
 }
 
+/** Input fields that name a node, runtime, instance, step, profile or command of someone's. */
+const TARGET_FIELDS = new Set([
+  "nodeId",
+  "nodeIds",
+  "replaceNodeId",
+  "runtimeId",
+  "versionId",
+  "instanceId",
+  "stepId",
+  "commandId",
+  "queuedCommandId",
+  "profileId",
+  "fabricId",
+  "runtimeModelId",
+  "node",
+  "runtime",
+  "version",
+  "instance",
+]);
+
+/** The id-shaped fields (a target field, `id`, `ids`, `*Id`, `*Ids`) anywhere in an input. */
+function idFields(schema: z.ZodType | undefined): string[] {
+  if (!schema) return ["(no schema)"];
+  const found = new Set<string>();
+  const walk = (value: unknown, depth: number) => {
+    if (value === null || typeof value !== "object" || depth > 16) return;
+    if (Array.isArray(value)) {
+      for (const entry of value) walk(entry, depth + 1);
+      return;
+    }
+    const properties = Reflect.get(value, "properties");
+    if (properties && typeof properties === "object")
+      for (const key of Object.keys(properties))
+        if (TARGET_FIELDS.has(key) || /^ids?$|Ids?$/.test(key)) found.add(key);
+    for (const entry of Object.values(value)) walk(entry, depth + 1);
+  };
+  walk(z.toJSONSchema(schema, { unrepresentable: "any", io: "input" }), 0);
+  return [...found].sort();
+}
+
 const INTENT = {
   operationId: null,
   runtimeId: "rt-a",
@@ -102,66 +145,141 @@ describe("MCP tools act as the credential's user only", () => {
     credential: { ...credential, expiresAt: null },
   });
 
-  /** Every tool that reaches a node, runtime, instance or profile, aimed at A's ids. */
-  const CALLS: ReadonlyArray<[string, Record<string, unknown>]> = [
-    ["node_update", { nodeId: "node-a", labels: ["x"] }],
-    ["node_secret_set", { nodeId: "node-a", name: "WSMP_SECRET_HF", value: "v" }],
-    ["node_secret_set", { nodeId: "node-a", name: "WSMP_SECRET_HF", value: null }],
-    ["node_command_run", { nodeId: "node-a", command: "id", timeoutMs: 10_000, confirm: "RUN" }],
-    ["node_command_get", { commandId: "AAAAAAAAAAAAAAAAAAAAAA", cancel: true }],
-    [
-      "node_command_queue_for_user",
+  /**
+   * Every MCP tool (generated from MCP_TOOLS: a new tool fails below until it is covered here or
+   * exempted), aimed at A's ids. One or more calls per tool.
+   */
+  const CALLS: Readonly<Record<string, ReadonlyArray<Record<string, unknown>>>> = {
+    nodes_get: [{ nodeId: "node-a" }],
+    runtimes_get: [
+      { runtimeId: "rt-a" },
+      { runtimeId: "rt-a", versions: true },
+      { versionId: "ver-a" },
+    ],
+    pools_get: [{ poolId: "pool-a" }, { poolId: "pool-a", history: true }],
+    profiles_get: [{ profileId: "prof-a" }],
+    requests_list: [{ runtimeId: "rt-a" }, { nodeId: "node-a" }, { versionId: "ver-a" }],
+    metrics_query: [
+      { scope: { node: "node-a" }, metrics: ["requests"], range: "1h", step: "1m" },
+      { scope: { runtime: "rt-a" }, metrics: ["requests"], range: "1h", step: "1m" },
+      { scope: { instance: "inst-a" }, metrics: ["requests"], range: "1h", step: "1m" },
+    ],
+    model_test: [{ target: { runtimeId: "rt-a" } }],
+    pool_create: [
+      { slug: "mine", name: "Mine", type: "LLM", members: [{ runtimeModelId: "rm-a" }] },
+      { slug: "mine", name: "Mine", type: "LLM", members: [{ runtimeId: "rt-a", model: "m" }] },
+    ],
+    pool_update: [
+      { poolId: "pool-a", name: "mine" },
+      { poolId: "pool-b", contribute: { add: ["rm-a"] } },
+    ],
+    pool_delete: [{ poolId: "pool-a", confirm: "DELETE" }],
+    runtime_create: [
+      { slug: "mine", name: "Mine", forkFrom: { runtimeId: "rt-a" } },
+      { slug: "mine", name: "Mine", kind: "ALWAYS_ON", nodeId: "node-a", spec: {} },
+    ],
+    runtime_update: [
+      { runtimeId: "rt-a", name: "mine" },
+      {
+        runtimeId: "rt-b",
+        modelCapabilities: [{ runtimeModelId: "rm-a", capabilities: null }],
+      },
+    ],
+    runtime_delete: [{ runtimeId: "rt-a", confirm: "DELETE" }],
+    runtime_start: [
+      { runtimeId: "rt-a", nodeIds: ["node-a"] },
+      { runtimeId: "rt-b", instanceId: "inst-a" },
+    ],
+    runtime_stop: [{ instanceId: "inst-a" }, { runtimeId: "rt-a", nodeId: "node-a" }],
+    profile_save: [
+      { slug: "mine", name: "Mine", nodeIds: ["node-a"], items: [] },
+      { profileId: "prof-a", slug: "mine", name: "Mine", nodeIds: ["node-b"], items: [] },
+    ],
+    profile_apply: [{ profileId: "prof-a" }],
+    profile_delete: [{ profileId: "prof-a", confirm: "DELETE" }],
+    node_update: [{ nodeId: "node-a", labels: ["x"] }],
+    node_secret_set: [
+      { nodeId: "node-a", name: "WSMP_SECRET_HF", value: "v" },
+      { nodeId: "node-a", name: "WSMP_SECRET_HF", value: null },
+    ],
+    node_command_run: [{ nodeId: "node-a", command: "id", timeoutMs: 10_000, confirm: "RUN" }],
+    node_command_get: [{ commandId: "AAAAAAAAAAAAAAAAAAAAAA", cancel: true }],
+    node_command_queue_for_user: [
       { nodeId: "node-a", command: "id", note: "n", expiresInHours: 1 },
     ],
-    ["node_file_read", { nodeId: "node-a", path: "/etc/hostname" }],
-    ["node_file_write", { nodeId: "node-a", path: "/tmp/x", content: "x" }],
-    [
-      "node_file_edit",
+    node_file_read: [{ nodeId: "node-a", path: "/etc/hostname" }],
+    node_file_write: [{ nodeId: "node-a", path: "/tmp/x", content: "x" }],
+    node_file_edit: [
       { nodeId: "node-a", path: "/tmp/x", edits: [{ old: "a", new: "b" }], ifMatch: "e" },
     ],
-    ["runtime_start", { runtimeId: "rt-a", nodeIds: ["node-a"] }],
-    ["runtime_stop", { instanceId: "inst-a" }],
-    ["runtime_delete", { runtimeId: "rt-a", confirm: "DELETE" }],
-    ["profile_apply", { profileId: "prof-a" }],
-    ["model_test", { target: { runtimeId: "rt-a" } }],
-  ];
+  };
+
+  /**
+   * Tools that take no id at all, with the reason (any id-shaped input field disqualifies one).
+   * The one place a tool may be left out of CALLS; checked against the tool's input below.
+   */
+  const MCP_EXEMPT: Readonly<Record<string, string>> = {
+    providers_get: "takes no input: lists the caller's own provider accounts and models",
+  };
 
   beforeEach(() => resetMcpToolRateLimitsForTests());
 
-  for (const [name, args] of CALLS) {
-    const contract = MCP_TOOLS.find((entry) => entry.name === name);
-    it(`${name}: every procedure call runs as B, with no owner in its input`, async () => {
-      if (!contract) throw new Error(`no tool ${name}`);
-      const invoke = vi.fn(async () => {
-        throw new Error("refused");
-      });
-      const result = await runMcpTool(contract, { dispatch: dispatch(), args, invoke });
-      expect(result.isError).toBe(true);
-      expect(invoke).toHaveBeenCalled();
-      for (const [, input, context] of invoke.mock.calls as unknown as Array<
-        [
-          string,
-          Record<string, unknown>,
-          { auth: { userId: string }; session: { user: { id: string } } },
-        ]
-      >) {
-        expect(context.auth.userId).toBe(ATTACKER);
-        expect(context.session.user.id).toBe(ATTACKER);
-        expect(input).not.toHaveProperty("userId");
-      }
-    });
+  it("covers every MCP tool, or exempts one that takes no target id", () => {
+    const names = MCP_TOOLS.map((tool) => tool.name as string);
+    expect(names.filter((name) => !(name in CALLS) && !(name in MCP_EXEMPT))).toEqual([]);
+    // No stale or doubled entries.
+    expect(Object.keys(CALLS).filter((name) => !names.includes(name))).toEqual([]);
+    expect(
+      Object.keys(MCP_EXEMPT).filter((name) => !names.includes(name) || name in CALLS),
+    ).toEqual([]);
+    for (const [name, reason] of Object.entries(MCP_EXEMPT)) {
+      expect(reason.length).toBeGreaterThan(10);
+      const tool = MCP_TOOLS.find((entry) => entry.name === name);
+      expect({ name, fields: idFields(tool?.input) }).toEqual({ name, fields: [] });
+    }
+  });
 
-    it(`${name}: a smuggled userId is refused before any procedure runs`, async () => {
-      if (!contract) throw new Error(`no tool ${name}`);
-      const invoke = vi.fn();
-      const result = await runMcpTool(contract, {
-        dispatch: dispatch(),
-        args: { ...args, userId: VICTIM },
-        invoke,
-      });
-      expect(result.isError).toBe(true);
-      expect(invoke).not.toHaveBeenCalled();
+  for (const tool of MCP_TOOLS) {
+    const name = tool.name as string;
+    if (name in MCP_EXEMPT) continue;
+    const calls = CALLS[name] ?? [];
+    it(`${name}: has at least one call aimed at A's ids`, () => {
+      expect(calls.length).toBeGreaterThan(0);
     });
+    for (const args of calls) {
+      it(`${name} ${JSON.stringify(args)}: every procedure call runs as B, with no owner in its input`, async () => {
+        // The call must reach a procedure: an input refusal would prove nothing.
+        expect(tool.input.safeParse(args).success).toBe(true);
+        const invoke = vi.fn(async () => {
+          throw new Error("refused");
+        });
+        const result = await runMcpTool(tool, { dispatch: dispatch(), args, invoke });
+        expect(result.isError).toBe(true);
+        expect(invoke).toHaveBeenCalled();
+        for (const [, input, context] of invoke.mock.calls as unknown as Array<
+          [
+            string,
+            Record<string, unknown>,
+            { auth: { userId: string }; session: { user: { id: string } } },
+          ]
+        >) {
+          expect(context.auth.userId).toBe(ATTACKER);
+          expect(context.session.user.id).toBe(ATTACKER);
+          expect(input).not.toHaveProperty("userId");
+        }
+      });
+
+      it(`${name} ${JSON.stringify(args)}: a smuggled userId is refused before any procedure runs`, async () => {
+        const invoke = vi.fn();
+        const result = await runMcpTool(tool, {
+          dispatch: dispatch(),
+          args: { ...args, userId: VICTIM },
+          invoke,
+        });
+        expect(result.isError).toBe(true);
+        expect(invoke).not.toHaveBeenCalled();
+      });
+    }
   }
 });
 
