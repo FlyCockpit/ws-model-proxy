@@ -351,8 +351,19 @@ export const ENV_VARS: EnvVar[] = [
     example: "0123456789abcdef0123456789abcdef01234567",
     comment: [
       "Optional. The full 40-character commit /install.sh builds the wsmp CLI from (cargo install",
-      "--rev). Pin it to the commit this server runs: unset, the installer follows",
-      "the redesign-0.4.0 branch, so whoever can push to it reaches every new node.",
+      "--rev). Set, nodes always build that commit from source (Rust 1.88+ and a C toolchain),",
+      "whatever WMP_CLI_RELEASE_BASE_URL says. Released versions do not need it.",
+    ],
+  },
+  {
+    key: "WMP_CLI_RELEASE_BASE_URL",
+    group: "runtime",
+    source: "manual",
+    example: "https://github.com/FlyCockpit/ws-model-proxy/releases/download/v0.4.0",
+    comment: [
+      "Optional. Where /install.sh downloads wsmp-<target>.tar.xz and sha256.sum (https only) and",
+      "installs the checksum-verified binary. Unset: released versions use their GitHub Release;",
+      "pre-release builds build the redesign-0.4.0 branch from source. Ignored when WMP_CLI_SOURCE_REV is set.",
     ],
   },
   {

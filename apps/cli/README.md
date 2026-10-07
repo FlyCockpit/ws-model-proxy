@@ -12,36 +12,47 @@
   <a href="#license"><img alt="License" src="https://shieldcn.dev/github/license/FlyCockpit/ws-model-proxy.svg?variant=secondary&mode=light&size=sm"></a>
 </p>
 
-> The node client for WS Model Proxy 0.4.0 (preview).
+> The node client for WS Model Proxy 0.4.0.
 
 `wsmp` turns a machine into a **node** of your WS Model Proxy server. It keeps one outbound
 websocket to the server (no port forwarding), relays model requests to the model servers on this
 machine, and, when you allow it, runs the runtimes, commands, file operations and terminals the
 server asks for.
 
-0.4.0 is a preview: there are no release binaries yet, and it speaks relay protocol 3.0 only.
+0.4.0 speaks relay protocol 3.0 only.
 A 0.3 CLI cannot connect to a 0.4.0 server, and this CLI cannot connect to a 0.3 server.
 
 ## Install
 
-You need Rust 1.88 or newer (`rustup update stable`; get it from <https://rustup.rs>).
-
-From your server (its script runs the `cargo install` below, pinned to the commit the server
-is configured with, if any):
+From your server:
 
 ```sh
 curl -fsSL https://wsmp.example.com/install.sh | sh
 ```
 
-Or with cargo directly:
+The script installs the release binary of the server's version on Linux x86_64 and ARM64 (glibc
+2.34 or newer, such as Ubuntu 22.04+ and DGX OS) and on macOS. It verifies the archive's SHA-256
+against the release's `sha256.sum` and refuses to install on any mismatch or missing checksum.
+On other machines, or when the server pins a commit (`WMP_CLI_SOURCE_REV`), it builds from source
+with `cargo install`, which needs Rust 1.88 or newer (<https://rustup.rs>) and a C compiler.
+
+Either way the binary lands in `~/.cargo/bin` (`$CARGO_HOME/bin` when set); add it to your `PATH`
+if `wsmp` is not found.
+
+Until v0.4.0 is released, a server's script builds from source by default: the
+`redesign-0.4.0` branch, or the commit in `WMP_CLI_SOURCE_REV`. The server opts into release
+binaries with `WMP_CLI_RELEASE_BASE_URL`; from the release on, that is the default. To check a
+downloaded archive yourself:
 
 ```sh
-cargo install --git https://github.com/FlyCockpit/ws-model-proxy --branch redesign-0.4.0 --locked wsmp
+gh attestation verify wsmp-aarch64-unknown-linux-gnu.tar.xz --repo FlyCockpit/ws-model-proxy
 ```
 
-To pin an exact build, replace `--branch redesign-0.4.0` with `--rev <full 40-character commit
-hash>`. Either way the binary lands in `~/.cargo/bin`; add it to your `PATH` if `wsmp` is not
-found.
+Or build a release tag with cargo directly:
+
+```sh
+cargo install --git https://github.com/FlyCockpit/ws-model-proxy --tag v0.4.0 --locked wsmp
+```
 
 ## Log in
 

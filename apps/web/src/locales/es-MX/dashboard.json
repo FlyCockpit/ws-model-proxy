@@ -253,6 +253,7 @@
       "failed": "No se pudo crear el comando.",
       "commandLabel": "Comando de instalación",
       "secretOnce": "Este código se muestra una sola vez.",
+      "installsWhere": "Instala wsmp en ~/.cargo/bin ($CARGO_HOME/bin si está definido). Cuando el servidor ofrece compilaciones publicadas, Linux (x86_64 o ARM64, glibc 2.34 o posterior) y macOS reciben un binario verificado con suma de verificación; si no, compila wsmp desde el código fuente, lo que requiere Rust 1.88 o posterior.",
       "terminalsAsked": "Con control total, `wsmp login` luego pregunta si se permiten terminales del navegador en esa máquina (sí, de forma predeterminada). Solo la máquina puede cambiarlo más adelante, con `wsmp config set-human-terminal on|off`.",
       "expires": "Vence",
       "waiting": "Esperando a que el nodo se conecte…",

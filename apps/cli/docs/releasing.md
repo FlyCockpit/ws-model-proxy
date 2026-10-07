@@ -23,6 +23,17 @@ Installers generated: **shell** (`curl ... | sh`), **PowerShell** (`irm ... |
 iex`), and a **Homebrew formula** (`wsmp.rb`). The formula is uploaded to the
 GitHub Release and then copied into the tap as `Formula/wsmp.rb`.
 
+Every archive is listed in `sha256.sum`, and the publish job signs build
+provenance for the archives and `sha256.sum` with `actions/attest` (verify with
+`gh attestation verify <file> --repo FlyCockpit/ws-model-proxy`). The server's
+`/install.sh` downloads `wsmp-<target>.tar.xz` and `sha256.sum` from the release
+of the server's version and refuses to install on a mismatch, so the publish job
+fails before creating the release if a Linux or macOS archive or its checksum
+entry is missing. Keep the archive names and the `.tar.xz` format (dist's
+default) in step with `CLI_RELEASE_TARGETS` in `apps/server/src/node-http.ts`;
+the server tests check both. The Linux builds run on Ubuntu 22.04 runners, so
+they need glibc 2.34 or newer (`CLI_RELEASE_MIN_GLIBC`).
+
 The container image is published to GHCR as:
 
 ```text
@@ -35,12 +46,28 @@ ghcr.io/flycockpit/ws-model-proxy:latest   # only when publish_latest is true
 ## Cutting a release
 
 ```sh
-# 1. Bump apps/cli/Cargo.toml (e.g. 0.1.0 -> 0.1.1).
-# 2. Merge that change to master.
+# 1. Bump apps/cli/Cargo.toml (e.g. 0.1.0 -> 0.1.1) and SERVER_VERSION in
+#    apps/server/src/node-http.ts to match (a server test checks they agree).
+# 2. Flip the CLI install default to release binaries (same commit; see below).
+# 3. Merge that change to master.
 git push origin master
-# 3. In GitHub Actions, run the root "Release" workflow from master with:
+# 4. In GitHub Actions, run the root "Release" workflow from master with:
 #    version = v0.1.1
 ```
+
+### Flip the CLI install default to release binaries
+
+Until a version is released, `/install.sh` on an unconfigured server builds the preview branch
+(`CLI_PREVIEW_BRANCH`) from source, because the release it would download does not exist yet;
+release binaries are opt-in through `WMP_CLI_RELEASE_BASE_URL`. In the release commit, set
+`CLI_RELEASE_BINARIES_BY_DEFAULT = true` in `apps/server/src/node-http.ts` (it is marked
+`RELEASE FLIP`). From then on an unconfigured server installs the checksum-verified binaries
+from the GitHub Release of `SERVER_VERSION`, and only machines without a matching binary build
+the version's tag from source. A server that deploys the flip commit before the Release workflow
+has published the GitHub Release cannot install nodes until it has (the script stops at the
+missing `sha256.sum`), so run the workflow right after merging, or deploy from the published
+image. After the release, set the constant back to `false` (and point `CLI_PREVIEW_BRANCH` at the
+next preview branch) when work on the next version starts.
 
 The workflow validates that it is running from `master` and that the requested
 `vX.Y.Z` tag matches `apps/cli/Cargo.toml`. It creates the GitHub Release for
@@ -55,7 +82,7 @@ The server accepts the listed relay protocol versions
 together when the minimum moves.
 
 A release bumps the protocol at most once. This release speaks relay protocol
-2.4 (v0.3.1 spoke 2.3) and supports only that version. Release notes must
+3.0 (v0.3.x spoke 2.4) and supports only that version. Release notes must
 require upgrading the server and every CLI together. Older CLIs are
 refused with an upgrade-CLI message; this CLI against an older server reports
 that the server needs upgrading. A genuine future-server upgrade-CLI reply
