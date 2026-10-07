@@ -1864,6 +1864,11 @@ impl ServerFrame {
         match self {
             Self::RuntimeJob(job) => job.validate(),
             Self::SecretSet(secret) => secret.validate(),
+            // `relayIdSchema`: the answer echoes it, so it must stay small.
+            Self::RuntimeDetect { id } => rule(
+                !id.trim().is_empty() && id.trim().encode_utf16().count() <= 128,
+                "a relay id is 1-128 characters",
+            ),
             Self::ExecStart { timeout_ms, .. } => rule(
                 (1_000..=NODE_COMMAND_MAX_MS).contains(timeout_ms),
                 "a command lifetime is 1 s to 24 h",

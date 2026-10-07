@@ -13,7 +13,9 @@
 //! Candidates are a fixed list of well-known engine ports plus (Linux) the
 //! TCP ports this machine listens on at loopback or a wildcard address, read
 //! from `/proc/net/tcp{,6}`. Ports held by this node's managed instances are
-//! skipped: those are runtimes already, not discoveries.
+//! skipped: those are runtimes already, not discoveries. Listeners of every
+//! local user are reported (container engines listen as root); a person
+//! confirms a detected server before it becomes a runtime.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -63,8 +65,9 @@ pub const WELL_KNOWN_PORTS: &[u16] = &[
 /// Ports that are never an HTTP model server (databases, brokers, the
 /// common dev servers that answer anything): not probed even when listening.
 const NEVER_PROBED: &[u16] = &[
-    1433, 1521, 2375, 2376, 2379, 2380, 3306, 4369, 5432, 5672, 5900, 6379, 6443, 9042, 9092, 9200,
-    9300, 11211, 15672, 25672, 27017, 27018, 27019, 50051,
+    1433, 1521, 2019, 2375, 2376, 2379, 2380, 3306, 4369, 4646, 5432, 5672, 5900, 6379, 6443, 8300,
+    8301, 8302, 8500, 9042, 9092, 9200, 9222, 9300, 10250, 10255, 11211, 15672, 25672, 27017,
+    27018, 27019, 50051,
 ];
 
 /// The address family a port listens on at loopback (or a wildcard).
@@ -110,18 +113,20 @@ pub(crate) fn spawn(tx: SyncSender<FromWorker>, id: String, skip_ports: BTreeSet
     let spawned = std::thread::Builder::new()
         .name("wsmp-detect".into())
         .spawn(move || {
-            let servers = {
-                let _slot = slot;
-                scan(&skip_ports)
-            };
-            match crate::protocol::encode_control(&detected_frame(id, servers)) {
-                Ok(text) => {
+            // The slot covers the whole worker, the answer included.
+            let _slot = slot;
+            let servers = scan(&skip_ports);
+            let encoded =
+                detected_frame(id, servers).map(|frame| crate::protocol::encode_control(&frame));
+            match encoded {
+                Some(Ok(text)) => {
                     let _ = tx.send(FromWorker::Telemetry(text));
                 }
-                Err(error) => tracing::warn!(
+                Some(Err(error)) => tracing::warn!(
                     error = %format!("{error:#}"),
                     "encoding the detection answer failed"
                 ),
+                None => tracing::warn!("the detection answer cannot fit one control frame"),
             }
         });
     // A failed spawn drops the closure, and the slot with it.
@@ -130,33 +135,48 @@ pub(crate) fn spawn(tx: SyncSender<FromWorker>, id: String, skip_ports: BTreeSet
     }
 }
 
-/// The answer frame, cut to the control-frame size limit: the longest model
-/// lists lose their last ids first, then the last servers go.
-pub fn detected_frame(id: String, mut servers: Vec<DetectedServer>) -> NodeFrame {
+/// The answer frame, cut to the control-frame size limit: every server's
+/// model list to the longest common length that fits, then trailing servers.
+/// `None` when not even an empty answer fits (an oversized request id).
+pub fn detected_frame(id: String, servers: Vec<DetectedServer>) -> Option<NodeFrame> {
+    let scanned_at = crate::telemetry::now_rfc3339();
     let frame = |servers: Vec<DetectedServer>| NodeFrame::RuntimeDetected {
         id: Some(id.clone()),
-        scanned_at: crate::telemetry::now_rfc3339(),
+        scanned_at: scanned_at.clone(),
         servers,
     };
     let fits = |servers: &[DetectedServer]| {
         serde_json::to_vec(&frame(servers.to_vec()))
             .is_ok_and(|bytes| bytes.len() <= crate::protocol::RELAY_JSON_CONTROL_MAX_BYTES)
     };
-    while !fits(&servers) {
-        match servers
-            .iter_mut()
-            .filter(|server| !server.models.is_empty())
-            .max_by_key(|server| server.models.len())
-        {
-            Some(server) => {
-                server.models.pop();
-            }
-            None => {
-                servers.pop();
-            }
+    let capped = |cap: usize| -> Vec<DetectedServer> {
+        servers
+            .iter()
+            .cloned()
+            .map(|mut server| {
+                server.models.truncate(cap);
+                server
+            })
+            .collect()
+    };
+    if fits(&servers) {
+        return Some(frame(servers));
+    }
+    // Largest cap that fits, by bisection (a few encodes, not one per id).
+    let (mut low, mut high) = (0, DETECTED_MODELS_MAX);
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        if fits(&capped(middle)) {
+            low = middle;
+        } else {
+            high = middle - 1;
         }
     }
-    frame(servers)
+    let mut servers = capped(low);
+    while !fits(&servers) {
+        servers.pop()?;
+    }
+    Some(frame(servers))
 }
 
 /// Scan this machine's loopback ports now, within about [`SCAN_BUDGET`]: no
@@ -283,6 +303,8 @@ struct ModelList {
 #[derive(Deserialize)]
 struct ModelEntry {
     #[serde(default)]
+    object: Option<serde_json::Value>,
+    #[serde(default)]
     id: Option<serde_json::Value>,
     #[serde(default)]
     owned_by: Option<serde_json::Value>,
@@ -293,16 +315,13 @@ struct ModelEntry {
 pub fn parse_model_list(body: &str) -> Option<(Vec<String>, Vec<String>)> {
     let list: ModelList = serde_json::from_str(body).ok()?;
     let is_list = list.object.as_deref() == Some("list");
+    let is_model =
+        |row: &ModelEntry| row.object.as_ref().and_then(serde_json::Value::as_str) == Some("model");
     let rows = match list.data {
-        // Some servers omit `object`; a string id still marks a model list.
-        Some(rows)
-            if is_list
-                || rows
-                    .iter()
-                    .any(|row| row.id.as_ref().is_some_and(serde_json::Value::is_string)) =>
-        {
-            rows
-        }
+        // Only rows marked `"object": "model"` are models (every engine marks
+        // them); a list of anything else is not a model server's answer.
+        Some(rows) if rows.iter().any(is_model) => rows,
+        Some(rows) if is_list && rows.is_empty() => rows,
         // Ollama answers `"data": null` with no models pulled.
         None if is_list => Vec::new(),
         _ => return None,
@@ -310,7 +329,7 @@ pub fn parse_model_list(body: &str) -> Option<(Vec<String>, Vec<String>)> {
     let mut seen = BTreeSet::new();
     let mut ids = Vec::new();
     let mut owners = Vec::new();
-    for row in rows {
+    for row in rows.iter().filter(|row| is_model(row)) {
         let Some(id) = row.id.as_ref().and_then(serde_json::Value::as_str) else {
             continue;
         };
@@ -333,14 +352,7 @@ fn is_reportable_text(text: &str, max_bytes: usize) -> bool {
     !text.is_empty()
         && text.len() <= max_bytes
         && text.trim() == text
-        && !text.chars().any(|c| c.is_control() || is_invisible(c))
-}
-
-fn is_invisible(c: char) -> bool {
-    matches!(
-        c,
-        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}'
-    )
+        && !text.chars().any(crate::display_escape::needs_escape)
 }
 
 fn version_text(value: &str) -> Option<String> {
@@ -410,6 +422,11 @@ fn wire_engine(kind: Option<EngineKind>) -> Engine {
 pub fn probe_with(fetch: impl Fn(&str, u64) -> Option<String>) -> Option<Probed> {
     let cache = RefCell::new(HashMap::<String, Option<String>>::new());
     let get = |route: &str, limit: u64| -> Option<String> {
+        // `owned_by` names vLLM and SGLang; a Prometheus body (up to 2 MiB
+        // of labels) is not worth parsing for detection.
+        if route == "metrics" {
+            return None;
+        }
         if let Some(hit) = cache.borrow().get(route) {
             return hit.clone();
         }
@@ -683,18 +700,31 @@ mod tests {
     fn model_ids_and_versions_stay_within_the_frame_contract() {
         let long = "m".repeat(257);
         let mut rows: Vec<String> = (0..100)
-            .map(|index| format!("{{\"id\":\"model-{index}\"}}"))
+            .map(|index| format!("{{\"object\":\"model\",\"id\":\"model-{index}\"}}"))
             .collect();
-        rows.insert(0, format!("{{\"id\":\"{long}\"}}"));
-        rows.insert(0, "{\"id\":\"bad\\u0007bell\"}".to_string());
-        rows.insert(0, "{\"id\":\" padded\"}".to_string());
-        rows.insert(0, "{\"id\":\"\"}".to_string());
-        rows.insert(0, "{\"id\":7}".to_string());
-        rows.insert(0, "{\"id\":\"model-0\"}".to_string());
+        for bad in [
+            format!("\"{long}\""),
+            "\"bad\\u0007bell\"".to_string(),
+            // A bidi isolate (Trojan Source) and a zero-width space.
+            "\"spoof\\u2066x\"".to_string(),
+            "\"zero\\u200bwidth\"".to_string(),
+            "\" padded\"".to_string(),
+            "\"\"".to_string(),
+            "7".to_string(),
+            "\"model-0\"".to_string(),
+        ] {
+            rows.insert(0, format!("{{\"object\":\"model\",\"id\":{bad}}}"));
+        }
+        // Rows not marked as models never leave the node.
+        rows.insert(
+            0,
+            "{\"object\":\"session\",\"id\":\"secret-token\"}".to_string(),
+        );
         let body = format!("{{\"object\":\"list\",\"data\":[{}]}}", rows.join(","));
         let (models, _) = parse_model_list(&body).expect("list");
         assert_eq!(models.len(), DETECTED_MODELS_MAX);
         assert_eq!(models[0], "model-0");
+        assert!(!models.iter().any(|id| id == "secret-token"));
         assert!(models.iter().all(|id| is_reportable_text(id, 256)));
         assert_eq!(version_text(&"9".repeat(81)), None);
         assert_eq!(version_text("  0.1.0 \n").as_deref(), Some("0.1.0"));
@@ -705,7 +735,11 @@ mod tests {
         // A generic `data` array without model ids is not a model list.
         assert_eq!(parse_model_list("{\"data\":[{\"name\":\"x\"}]}"), None);
         assert_eq!(parse_model_list("{\"data\":[]}"), None);
-        assert!(parse_model_list("{\"data\":[{\"id\":\"m\"}]}").is_some());
+        assert_eq!(parse_model_list("{\"data\":[{\"id\":\"m\"}]}"), None);
+        assert_eq!(
+            parse_model_list("{\"data\":[{\"object\":\"model\",\"id\":\"m\"}]}"),
+            Some((vec!["m".to_string()], vec![]))
+        );
     }
 
     #[test]
@@ -721,8 +755,15 @@ mod tests {
                 version: Some("0.11.0".into()),
             })
             .collect();
-        let frame = detected_frame("det-1".into(), servers);
+        let frame = detected_frame("det-1".into(), servers.clone()).expect("an answer");
         let text = crate::protocol::encode_control(&frame).expect("fits one control frame");
+        // A request id that leaves no room for any answer gets none (and the
+        // cut always ends).
+        assert!(detected_frame("x".repeat(70_000), servers).is_none());
+        let long_id = crate::protocol::frames::ServerFrame::RuntimeDetect {
+            id: "x".repeat(129),
+        };
+        assert!(long_id.validate().is_err());
         assert!(text.len() <= crate::protocol::RELAY_JSON_CONTROL_MAX_BYTES);
         let NodeFrame::RuntimeDetected { servers, .. } = frame else {
             panic!("runtime.detected");
@@ -792,7 +833,7 @@ mod tests {
     #[test]
     fn mixed_owners_fall_back_to_engine_routes() {
         // A proxy fronting several engines names none: the routes decide.
-        let body = r#"{"object":"list","data":[{"id":"a","owned_by":"vllm"},{"id":"b","owned_by":"sglang"}]}"#;
+        let body = r#"{"object":"list","data":[{"object":"model","id":"a","owned_by":"vllm"},{"object":"model","id":"b","owned_by":"sglang"}]}"#;
         let (probed, asked) = probe(&[("v1/models", body)]);
         assert_eq!(probed.expect("generic").engine, Engine::Other);
         assert!(asked.contains(&"props".to_string()));
