@@ -42,57 +42,18 @@ import {
   RUNTIME_SUMMARY_INCLUDE,
   type RuntimeSummaryRow,
   runtimeSummary,
-  type StopCheck,
-  stopCheckKey,
   storedSpec,
   VERSION_SELECT,
   versionDetail,
   versionSummary,
 } from "../lib/runtime-views";
+import { latestStopChecks } from "../lib/stop-evidence";
 import { normalizeBaseUrl, parseDetectedServers } from "../nodes/views";
 import { runtimeStart, runtimeStop } from "./runtime-lifecycle";
 import { runtimeSteps } from "./runtime-steps";
 
 function userIdOf(context: SignedInContext): string {
   return context.session.user.id;
-}
-
-/**
- * The last finished status probe (automatic stop check) of each rank of the STOPPING instances
- * among `instances`: the evidence a person weighs before marking an instance stopped.
- */
-async function latestStopChecks(
-  instances: ReadonlyArray<{ id: string; phase: string; Ranks: ReadonlyArray<{ rank: number }> }>,
-): Promise<Map<string, StopCheck>> {
-  // One indexed lookup per rank (probe sequences grow per rank; a stuck stop is probed every
-  // 5 minutes, so its probes are not all read).
-  const probes = await Promise.all(
-    instances
-      .filter((row) => row.phase === "STOPPING")
-      .flatMap((row) =>
-        row.Ranks.map(({ rank }) =>
-          prisma.instanceStep.findFirst({
-            where: {
-              instanceId: row.id,
-              rank,
-              phase: "STATUS",
-              state: { in: ["SUCCEEDED", "FAILED"] },
-            },
-            orderBy: { sequence: "desc" },
-            select: { instanceId: true, rank: true, state: true, errorCode: true, updatedAt: true },
-          }),
-        ),
-      ),
-  );
-  const checks = new Map<string, StopCheck>();
-  for (const probe of probes)
-    if (probe)
-      checks.set(stopCheckKey(probe.instanceId, probe.rank), {
-        at: probe.updatedAt.toISOString(),
-        proven: probe.state === "SUCCEEDED",
-        errorCode: probe.errorCode,
-      });
-  return checks;
 }
 
 /** Previous launch hashes of each runtime's current version (for `launchChanged`). */
@@ -368,7 +329,7 @@ export const runtimesRouter = {
         select: { id: true, heldDefinitions: true },
       }),
     ]);
-    const stopChecks = await latestStopChecks(instances);
+    const stopChecks = await latestStopChecks(prisma, instances);
     const factsFrom = instances.find((instance) => instance.phase === "READY") ?? null;
     const previous = summary.currentVersion.launchChanged
       ? await previousLaunchHashOf(input.runtimeId, current.version)
@@ -763,7 +724,7 @@ export const runtimesRouter = {
       const agent = agentRulesApply(context.auth);
       if (agent && input.confirm !== "MARK_STOPPED")
         throw new ORPCError("BAD_REQUEST", {
-          message: 'Marking a stop as done is recovery: repeat confirm: "MARK_STOPPED".',
+          message: 'Marking an instance stopped is recovery: repeat confirm: "MARK_STOPPED".',
         });
       const now = new Date();
       const operationId = await graphWrite(
@@ -869,7 +830,7 @@ export const runtimesRouter = {
         include: INSTANCE_INCLUDE,
       });
       if (!row) throw notFound("That instance does not exist.");
-      return instanceView(row, await latestStopChecks([row]));
+      return instanceView(row, await latestStopChecks(prisma, [row]));
     }),
   },
 

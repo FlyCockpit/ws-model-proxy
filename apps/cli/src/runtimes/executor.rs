@@ -823,7 +823,7 @@ impl Executor {
     }
 
     /// A status probe (the server sends one when the stops of a stopping rank
-    /// failed, or for a forgotten claim): proves the stop when nothing of the
+    /// failed, or for a claim marked stopped): proves the stop when nothing of the
     /// rank's process tree runs (no owned or recorded unit has a task), its
     /// status command (when defined) says stopped, and its port is free. It
     /// runs nothing and needs no record (a lost record cannot block the

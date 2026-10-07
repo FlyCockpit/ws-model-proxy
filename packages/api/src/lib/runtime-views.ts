@@ -17,6 +17,7 @@ import { rankCommands, renderStepCommand, type StepCommandPhase } from "./comman
 import { jsonObject, registryView } from "./registry-view";
 import { type RuntimeSpec, runtimeSpecSchema } from "./runtime-spec";
 import { type StepIntent, stepIntentSchema, stepJobPlaceholders } from "./step-intent";
+import { nodeConnectionView, type StopCheck, stopCheckKey } from "./stop-evidence";
 
 export const VERSION_SELECT = {
   id: true,
@@ -44,7 +45,13 @@ export const INSTANCE_INCLUDE = {
   Ranks: {
     include: {
       Node: {
-        select: { slug: true, connection: true, lastConnectedAt: true, lastDisconnectedAt: true },
+        select: {
+          slug: true,
+          connection: true,
+          lastConnectedAt: true,
+          lastDisconnectedAt: true,
+          lastHeartbeatAt: true,
+        },
       },
     },
     orderBy: { rank: "asc" },
@@ -331,16 +338,9 @@ function safeSpec(value: unknown): RuntimeSpec | null {
   return parsed.success ? parsed.data : null;
 }
 
-/** A rank's last finished stop check (status probe), keyed by {@link stopCheckKey}. */
-export type StopCheck = NonNullable<InstanceView["ranks"][number]["lastStopCheck"]>;
-
-export function stopCheckKey(instanceId: string, rank: number): string {
-  return `${instanceId}:${rank}`;
-}
-
 /**
- * `stopChecks`: the last finished status probe per rank of STOPPING instances, for callers that
- * show why a stop is not confirmed (runtimes.get); others pass none and report null.
+ * `stopChecks` (`latestStopChecks`): the last finished status probe per rank of STOPPING
+ * instances, for callers that show why a stop is not confirmed; others pass none and report null.
  */
 export function instanceView(
   row: InstanceRow,
@@ -374,16 +374,7 @@ export function instanceView(
       port: rank.port,
       reserved: rank.claim,
       unitName: rank.unitName,
-      nodeConnection: rank.Node
-        ? {
-            state: rank.Node.connection,
-            since:
-              (rank.Node.connection === "ONLINE"
-                ? rank.Node.lastConnectedAt
-                : rank.Node.lastDisconnectedAt
-              )?.toISOString() ?? null,
-          }
-        : null,
+      nodeConnection: nodeConnectionView(rank.Node),
       lastStopCheck:
         row.phase === "STOPPING" ? (stopChecks.get(stopCheckKey(row.id, rank.rank)) ?? null) : null,
     })),
