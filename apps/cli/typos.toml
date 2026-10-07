@@ -18,6 +18,8 @@ wsmp = "wsmp"
 fo = "fo"
 foob = "foob"
 fooba = "fooba"
+# Speaches, the speech-to-text server `runtime.detect` recognizes (`src/runtimes/detect.rs`).
+speaches = "speaches"
 
 [default]
 # Random test data that happens to contain a "typo". Ignore those exact
@@ -32,4 +34,6 @@ extend-ignore-re = [
     "nd5q6w7e8r9t0y1u2i3o4p5a6",
     # A Spanish transcript in the live speech-to-text tests (`src/stt/tests.rs`).
     "primera frase",
+    # A TGI build label in `tests/fixtures/detect/tgi-info.json`: `ba`.
+    "sha-8801ba1",
 ]
