@@ -65,27 +65,51 @@ const person = (userId: string): CallerAuth => ({
   csrfVerified: true,
 });
 
-/** B's credentials. */
-const ATTACKERS: ReadonlyArray<[string, CallerAuth]> = [
-  [
-    "Full agent token",
-    { kind: "agent_token", userId: B, agentTokenId: `${RUN}-tok`, level: "FULL" },
-  ],
-  [
-    "Full OAuth grant",
-    { kind: "oauth_access_token", userId: B, grantId: `${RUN}-grant`, level: "FULL" },
-  ],
-  ["cookie with CSRF", person(B)],
-];
+/** A user's credentials: a Full agent token, a Full OAuth grant, a cookie with CSRF. */
+function credentialsOf(userId: string): ReadonlyArray<[string, CallerAuth]> {
+  return [
+    [
+      "Full agent token",
+      { kind: "agent_token", userId, agentTokenId: `${userId}-tok`, level: "FULL" },
+    ],
+    [
+      "Full OAuth grant",
+      { kind: "oauth_access_token", userId, grantId: `${userId}-grant`, level: "FULL" },
+    ],
+    ["cookie with CSRF", person(userId)],
+  ];
+}
+
+/** One user's node with a running instance, a profile and a command. */
+type World = {
+  userId: string;
+  nodeId: string;
+  runtimeId: string;
+  runtimeModelId: string;
+  instanceId: string;
+  profileId: string;
+  commandId: string;
+  poolId: string;
+};
 
 integration("cross-owner isolation on PostgreSQL", () => {
   let modules: {
     fixtures: ReturnType<typeof createFixturePrismaClient>;
     appRouter: typeof import("../routers/index")["appRouter"];
   };
-  /** A's world. */
-  const a = { nodeId: "", runtimeId: "", instanceId: "", profileId: "", commandId: "" };
-  /** B's own runtime (to aim at A's node). */
+  const blank = (userId: string): World => ({
+    userId,
+    nodeId: "",
+    runtimeId: "",
+    runtimeModelId: "",
+    instanceId: "",
+    profileId: "",
+    commandId: "",
+    poolId: "",
+  });
+  const a = blank(A);
+  const b = blank(B);
+  /** B's own runtime (to aim at A's node); it also runs on B's node. */
   let runtimeOfB = "";
 
   const services = {
@@ -108,6 +132,9 @@ integration("cross-owner isolation on PostgreSQL", () => {
     },
     dispatchRuntimeOperation: vi.fn(async () => {}),
     pushRuntimeDefinitions: vi.fn(async () => []),
+    modelTest: vi.fn(async () => {
+      throw new Error("a model test must not run");
+    }),
   } satisfies ContextServices;
 
   function client(auth: CallerAuth, withServices = true) {
@@ -119,12 +146,12 @@ integration("cross-owner isolation on PostgreSQL", () => {
     return createRouterClient(modules.appRouter, { context });
   }
 
-  /** What A owns, as it stands: must not change while B tries. */
-  async function snapshotOfA() {
+  /** What the target owns, as it stands: must not change while the other user tries. */
+  async function snapshotOf(target: World, attacker: string) {
     const db = modules.fixtures;
     return {
       node: await db.node.findUnique({
-        where: { id: a.nodeId },
+        where: { id: target.nodeId },
         select: {
           userId: true,
           name: true,
@@ -134,22 +161,95 @@ integration("cross-owner isolation on PostgreSQL", () => {
         },
       }),
       instance: await db.runtimeInstance.findUnique({
-        where: { id: a.instanceId },
+        where: { id: target.instanceId },
         select: { userId: true, desiredState: true, phase: true, operationId: true },
       }),
       ranks: await db.instanceRank.findMany({
-        where: { nodeId: a.nodeId },
+        where: { nodeId: target.nodeId },
         select: { instanceId: true, claim: true },
         orderBy: { id: "asc" },
       }),
-      steps: await db.instanceStep.count({ where: { nodeId: a.nodeId } }),
-      commands: await db.nodeCommand.count({ where: { nodeId: a.nodeId } }),
-      queued: await db.queuedNodeCommand.count({ where: { nodeId: a.nodeId } }),
-      runtimesOnNode: await db.runtime.count({ where: { nodeId: a.nodeId } }),
-      profileNodes: await db.profileNode.count({ where: { nodeId: a.nodeId } }),
-      operationsOfB: await db.runtimeOperation.count({ where: { userId: B } }),
-      auditOfB: await db.nodeAuditEvent.count({ where: { userId: B } }),
+      steps: await db.instanceStep.count({ where: { nodeId: target.nodeId } }),
+      commands: await db.nodeCommand.count({ where: { nodeId: target.nodeId } }),
+      queued: await db.queuedNodeCommand.count({ where: { nodeId: target.nodeId } }),
+      runtimesOnNode: await db.runtime.count({ where: { nodeId: target.nodeId } }),
+      profileNodes: await db.profileNode.count({ where: { nodeId: target.nodeId } }),
+      models: await db.runtimeModel.findMany({
+        where: { runtimeId: target.runtimeId },
+        select: { capabilities: true, capabilitiesOverridden: true, retired: true },
+      }),
+      operationsOfAttacker: await db.runtimeOperation.count({ where: { userId: attacker } }),
+      auditOfAttacker: await db.nodeAuditEvent.count({ where: { userId: attacker } }),
     };
+  }
+
+  /** The owner's node, runtime (started there), profile and a command, through the procedures. */
+  async function seedWorld(world: World, tag: string) {
+    const db = modules.fixtures;
+    const node = await db.node.create({
+      data: {
+        userId: world.userId,
+        slug: `${RUN}-${tag}`,
+        connection: "ONLINE",
+        trust: "FULL",
+        declaredResources: { kind: "unified", memoryGb: 66 },
+        portStart: 30000,
+        portEnd: 30010,
+      },
+      select: { id: true },
+    });
+    world.nodeId = node.id;
+    const owner = client(person(world.userId), false);
+    const created = await owner.runtimes.create({
+      slug: "model",
+      name: "Model",
+      kind: "STARTABLE",
+      spec: SPEC,
+    });
+    world.runtimeId = created.runtime.id;
+    world.runtimeModelId = (
+      await db.runtimeModel.findFirstOrThrow({
+        where: { runtimeId: world.runtimeId },
+        select: { id: true },
+      })
+    ).id;
+    const preview = await owner.runtimes.start({
+      runtimeId: world.runtimeId,
+      nodeIds: [world.nodeId],
+      preview: true,
+    });
+    if (preview.mode !== "preview") throw new Error("expected a preview");
+    const applied = await owner.runtimes.start({
+      runtimeId: world.runtimeId,
+      nodeIds: [world.nodeId],
+      fingerprint: preview.preview.fingerprint,
+    });
+    if (applied.mode !== "applied") throw new Error("expected an applied start");
+    world.instanceId = applied.operation.instances[0]?.id ?? "";
+    const profile = await owner.profiles.save({
+      slug: "day",
+      name: "Day",
+      nodeIds: [world.nodeId],
+      items: [],
+    });
+    world.profileId = profile.id;
+    world.commandId = `${tag.toUpperCase()}${"A".repeat(19)}${RUN.slice(-2)}`;
+    await db.nodeCommand.create({
+      data: {
+        id: world.commandId,
+        userId: world.userId,
+        nodeId: world.nodeId,
+        actor: "USER",
+        subject: "hmac-sha256:00 ls",
+        startedAt: new Date(),
+        endsBy: new Date(Date.now() + 3_600_000),
+      },
+    });
+    const pool = await db.pool.create({
+      data: { userId: world.userId, slug: "shared", name: "Shared", modelType: "LLM" },
+      select: { id: true },
+    });
+    world.poolId = pool.id;
   }
 
   beforeAll(async () => {
@@ -166,72 +266,38 @@ integration("cross-owner isolation on PostgreSQL", () => {
       await db.user.create({
         data: { id, name: id, email: `${id}@example.test`, emailVerified: true, slug: id },
       });
-    // A's node, as the relay leaves it after a Full-control hello.
-    const node = await db.node.create({
-      data: {
-        userId: A,
-        slug: `${RUN}-box`,
-        connection: "ONLINE",
-        trust: "FULL",
-        declaredResources: { kind: "unified", memoryGb: 66 },
-        portStart: 30000,
-        portEnd: 30010,
-      },
-      select: { id: true },
-    });
-    a.nodeId = node.id;
-
-    // A's runtime, started by A on A's node through the real procedures.
-    const ownerClient = client(person(A), false);
-    const created = await ownerClient.runtimes.create({
-      slug: "model",
-      name: "Model",
-      kind: "STARTABLE",
-      spec: SPEC,
-    });
-    a.runtimeId = created.runtime.id;
-    const preview = await ownerClient.runtimes.start({
-      runtimeId: a.runtimeId,
-      nodeIds: [a.nodeId],
-      preview: true,
-    });
-    if (preview.mode !== "preview") throw new Error("expected a preview");
-    const applied = await ownerClient.runtimes.start({
-      runtimeId: a.runtimeId,
-      nodeIds: [a.nodeId],
-      fingerprint: preview.preview.fingerprint,
-    });
-    if (applied.mode !== "applied") throw new Error("expected an applied start");
-    a.instanceId = applied.operation.instances[0]?.id ?? "";
-    const profile = await ownerClient.profiles.save({
-      slug: "day",
-      name: "Day",
-      nodeIds: [a.nodeId],
-      items: [],
-    });
-    a.profileId = profile.id;
-    a.commandId = "A".repeat(20) + RUN.slice(-2).replace(/[^A-Za-z0-9]/g, "A");
-    await db.nodeCommand.create({
-      data: {
-        id: a.commandId,
-        userId: A,
-        nodeId: a.nodeId,
-        actor: "USER",
-        subject: "hmac-sha256:00 ls",
-        startedAt: new Date(),
-        endsBy: new Date(Date.now() + 3_600_000),
-      },
-    });
-
-    // B's own runtime.
-    const mine = await client(person(B), false).runtimes.create({
-      slug: "mine",
-      name: "Mine",
-      kind: "STARTABLE",
-      spec: SPEC,
-    });
-    runtimeOfB = mine.runtime.id;
-  });
+    await seedWorld(a, "a");
+    await seedWorld(b, "b");
+    runtimeOfB = b.runtimeId;
+    // Everything the two may share, both ways: each one's pool shared with the other with use
+    // and contribute, each one's model contributed to the other's pool (through the real
+    // procedure), each one's runtime shared with the other.
+    for (const [owner, grantee] of [
+      [a, b],
+      [b, a],
+    ] as const) {
+      await db.share.create({
+        data: {
+          poolId: owner.poolId,
+          ownerUserId: owner.userId,
+          granteeUserId: grantee.userId,
+          canUse: true,
+          canContribute: true,
+        },
+      });
+      await client(person(grantee.userId), false).pools.members.addContributed({
+        poolId: owner.poolId,
+        runtimeModelId: grantee.runtimeModelId,
+      });
+      await db.runtimeShare.create({
+        data: {
+          runtimeId: owner.runtimeId,
+          ownerUserId: owner.userId,
+          granteeUserId: grantee.userId,
+        },
+      });
+    }
+  }, 60_000);
 
   afterAll(async () => {
     if (!modules) return;
@@ -239,6 +305,7 @@ integration("cross-owner isolation on PostgreSQL", () => {
     try {
       // Children first, every delete scoped to this run's two users (WHERE).
       const users = { in: [A, B] };
+      await db.pool.deleteMany({ where: { userId: users } });
       await db.runtimeInstance.deleteMany({ where: { userId: users } });
       await db.runtimeOperation.deleteMany({ where: { userId: users } });
       await db.profile.deleteMany({ where: { userId: users } });
@@ -247,68 +314,81 @@ integration("cross-owner isolation on PostgreSQL", () => {
       await db.nodeCommand.deleteMany({ where: { userId: users } });
       await db.node.deleteMany({ where: { userId: users } });
       await db.nodeAuditEvent.deleteMany({ where: { userId: users } });
+      await db.auditEvent.deleteMany({ where: { userId: users } });
       await db.user.deleteMany({ where: { id: users } });
       expect(await db.user.count({ where: { id: users } })).toBe(0);
     } finally {
       await db.$disconnect();
     }
-  });
+  }, 60_000);
 
-  /** Every procedure that reaches a node, runtime, instance or profile, aimed at A's ids. */
-  const calls = (): ReadonlyArray<[string, (c: ReturnType<typeof client>) => Promise<unknown>]> => [
-    ["nodes.get", (c) => c.nodes.get({ nodeId: a.nodeId })],
-    ["nodes.update", (c) => c.nodes.update({ nodeId: a.nodeId, labels: ["b"], rescan: true })],
-    ["nodes.rename", (c) => c.nodes.rename({ nodeId: a.nodeId, name: "B's now" })],
-    ["nodes.setHold", (c) => c.nodes.setHold({ nodeId: a.nodeId, hold: true })],
-    ["nodes.lowerTrust", (c) => c.nodes.lowerTrust({ nodeId: a.nodeId })],
-    ["nodes.delete", (c) => c.nodes.delete({ nodeId: a.nodeId })],
+  /** Every procedure that reaches a node, runtime, instance or profile, aimed at `t`'s ids. */
+  const calls = (
+    t: World,
+    own: World,
+  ): ReadonlyArray<[string, (c: ReturnType<typeof client>) => Promise<unknown>]> => [
+    ["nodes.get", (c) => c.nodes.get({ nodeId: t.nodeId })],
+    ["nodes.update", (c) => c.nodes.update({ nodeId: t.nodeId, labels: ["x"], rescan: true })],
+    ["nodes.rename", (c) => c.nodes.rename({ nodeId: t.nodeId, name: "mine now" })],
+    ["nodes.setHold", (c) => c.nodes.setHold({ nodeId: t.nodeId, hold: true })],
+    ["nodes.lowerTrust", (c) => c.nodes.lowerTrust({ nodeId: t.nodeId })],
+    ["nodes.delete", (c) => c.nodes.delete({ nodeId: t.nodeId })],
     [
       "nodes.secrets.set",
-      (c) => c.nodes.secrets.set({ nodeId: a.nodeId, name: "WSMP_SECRET_X", value: "v" }),
+      (c) => c.nodes.secrets.set({ nodeId: t.nodeId, name: "WSMP_SECRET_X", value: "v" }),
     ],
     [
       "nodes.terminals.openTicket",
-      (c) => c.nodes.terminals.openTicket({ nodeId: a.nodeId, cols: 80, rows: 24 }),
+      (c) => c.nodes.terminals.openTicket({ nodeId: t.nodeId, cols: 80, rows: 24 }),
     ],
     [
       "nodes.commands.run",
       (c) =>
         c.nodes.commands.run({
-          nodeId: a.nodeId,
+          nodeId: t.nodeId,
           command: "id",
           timeoutMs: 10_000,
           confirm: "RUN",
         }),
     ],
-    ["nodes.commands.get", (c) => c.nodes.commands.get({ commandId: a.commandId, cancel: true })],
+    ["nodes.commands.get", (c) => c.nodes.commands.get({ commandId: t.commandId, cancel: true })],
     [
       "nodes.queued.enqueue",
       (c) =>
-        c.nodes.queued.enqueue({ nodeId: a.nodeId, command: "id", note: "n", expiresInHours: 1 }),
+        c.nodes.queued.enqueue({ nodeId: t.nodeId, command: "id", note: "n", expiresInHours: 1 }),
     ],
     [
-      "runtimes.start on A's node",
-      (c) => c.runtimes.start({ runtimeId: runtimeOfB, nodeIds: [a.nodeId] }),
+      "runtimes.start own runtime on the other's node",
+      (c) => c.runtimes.start({ runtimeId: own.runtimeId, nodeIds: [t.nodeId] }),
     ],
     [
-      "runtimes.start restart of A's instance",
-      (c) => c.runtimes.start({ runtimeId: runtimeOfB, instanceId: a.instanceId }),
+      "runtimes.start restart of the other's instance",
+      (c) => c.runtimes.start({ runtimeId: own.runtimeId, instanceId: t.instanceId }),
     ],
-    ["runtimes.start of A's runtime", (c) => c.runtimes.start({ runtimeId: a.runtimeId })],
-    ["runtimes.stop A's instance", (c) => c.runtimes.stop({ instanceId: a.instanceId })],
+    ["runtimes.start of the other's runtime", (c) => c.runtimes.start({ runtimeId: t.runtimeId })],
+    ["runtimes.stop the other's instance", (c) => c.runtimes.stop({ instanceId: t.instanceId })],
     [
-      "runtimes.stop A's runtime on A's node",
-      (c) => c.runtimes.stop({ runtimeId: a.runtimeId, nodeId: a.nodeId }),
+      "runtimes.stop the other's runtime on its node",
+      (c) => c.runtimes.stop({ runtimeId: t.runtimeId, nodeId: t.nodeId }),
     ],
-    ["runtimes.instances.forget", (c) => c.runtimes.instances.forget({ instanceId: a.instanceId })],
+    ["runtimes.instances.forget", (c) => c.runtimes.instances.forget({ instanceId: t.instanceId })],
     [
-      "runtimes.create always-on on A's node",
+      "runtimes.update the other's runtime",
+      (c) => c.runtimes.update({ runtimeId: t.runtimeId, spec: SPEC }),
+    ],
+    [
+      "runtimes.models.setCapabilities",
+      (c) =>
+        c.runtimes.models.setCapabilities({ runtimeModelId: t.runtimeModelId, capabilities: [] }),
+    ],
+    [
+      "runtimes.create always-on on the other's node",
       (c) =>
         c.runtimes.create({
           slug: "squat",
           name: "Squat",
           kind: "ALWAYS_ON",
-          nodeId: a.nodeId,
+          nodeId: t.nodeId,
           spec: {
             api: "openai",
             engine: "vllm",
@@ -317,45 +397,72 @@ integration("cross-owner isolation on PostgreSQL", () => {
           },
         }),
     ],
-    ["profiles.apply", (c) => c.profiles.apply({ profileId: a.profileId })],
+    ["profiles.apply", (c) => c.profiles.apply({ profileId: t.profileId })],
     [
-      "profiles.save with A's node",
-      (c) => c.profiles.save({ slug: "grab", name: "Grab", nodeIds: [a.nodeId], items: [] }),
+      "profiles.save with the other's node",
+      (c) => c.profiles.save({ slug: "grab", name: "Grab", nodeIds: [t.nodeId], items: [] }),
+    ],
+    [
+      "models.test on the other's runtime",
+      (c) => c.models.test({ target: { runtimeId: t.runtimeId } }),
     ],
   ];
 
-  describe("B's procedures on A's ids", () => {
-    for (const [label, auth] of ATTACKERS) {
-      it(`${label}: every call is refused and nothing of A's changes`, async () => {
-        const before = await snapshotOfA();
-        expect(before.instance).toMatchObject({ userId: A, desiredState: "RUNNING" });
-        expect(before.ranks).toEqual([{ instanceId: a.instanceId, claim: "HELD" }]);
-        const c = client(auth);
-        for (const [name, call] of calls()) {
-          const error = await call(c).then(
-            () => new Error(`${name} succeeded`),
-            (caught: unknown) => caught,
-          );
-          expect(error, name).toBeInstanceOf(ORPCError);
-          const code = (error as ORPCError<string, unknown>).code;
-          // CONFLICT: a person must preview a start first (preview_required).
-          expect(
-            ["NOT_FOUND", "FORBIDDEN", "BAD_REQUEST", "CONFLICT"],
-            `${name}: ${code}`,
-          ).toContain(code);
-          expect((error as Error).message, name).not.toBe("Input validation failed");
-        }
-        for (const hook of [
-          ...Object.values(services.nodes),
-          ...Object.values(services.nodeOperator),
-          services.dispatchRuntimeOperation,
-          services.pushRuntimeDefinitions,
-        ])
-          expect(hook).not.toHaveBeenCalled();
-        expect(await snapshotOfA()).toEqual(before);
-      });
-    }
+  /** Contributor and pool owner, both ways: each shares a pool with the other, both contribute. */
+  const DIRECTIONS = [
+    ["B (contributor to A's pool, A's runtime shared with B) on A's ids", () => [b, a] as const],
+    ["A (owner of the pool B contributes to) on B's ids", () => [a, b] as const],
+  ] as const;
 
+  for (const [direction, pair] of DIRECTIONS) {
+    describe(direction, () => {
+      for (const [label] of credentialsOf(A)) {
+        it(`${label}: every call is refused and nothing of the other's changes`, async () => {
+          const [attacker, target] = pair();
+          const auth = credentialsOf(attacker.userId).find(([name]) => name === label)?.[1];
+          if (!auth) throw new Error(label);
+          // The shares are really there.
+          expect(
+            await modules.fixtures.poolMember.count({
+              where: { poolId: target.poolId, runtimeModelId: attacker.runtimeModelId },
+            }),
+          ).toBe(1);
+          const before = await snapshotOf(target, attacker.userId);
+          expect(before.instance).toMatchObject({
+            userId: target.userId,
+            desiredState: "RUNNING",
+          });
+          expect(before.ranks).toEqual([{ instanceId: target.instanceId, claim: "HELD" }]);
+          const c = client(auth);
+          for (const [name, call] of calls(target, attacker)) {
+            const error = await call(c).then(
+              () => new Error(`${name} succeeded`),
+              (caught: unknown) => caught,
+            );
+            expect(error, name).toBeInstanceOf(ORPCError);
+            const code = (error as ORPCError<string, unknown>).code;
+            // CONFLICT: a person must preview a start first (preview_required).
+            expect(
+              ["NOT_FOUND", "FORBIDDEN", "BAD_REQUEST", "CONFLICT"],
+              `${name}: ${code}`,
+            ).toContain(code);
+            expect((error as Error).message, name).not.toBe("Input validation failed");
+          }
+          for (const hook of [
+            ...Object.values(services.nodes),
+            ...Object.values(services.nodeOperator),
+            services.dispatchRuntimeOperation,
+            services.pushRuntimeDefinitions,
+            services.modelTest,
+          ])
+            expect(hook).not.toHaveBeenCalled();
+          expect(await snapshotOf(target, attacker.userId)).toEqual(before);
+        });
+      }
+    });
+  }
+
+  describe("start previews", () => {
     it("a person's start preview places nothing of B's on A's node", async () => {
       const result = await client(person(B)).runtimes.start({
         runtimeId: runtimeOfB,

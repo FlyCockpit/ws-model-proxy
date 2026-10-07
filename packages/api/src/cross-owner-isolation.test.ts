@@ -391,6 +391,9 @@ const CASES: ReadonlyArray<[string, unknown]> = [
   ["nodes.rename", { nodeId: "node-a", name: "mine now" }],
   ["nodes.delete", { nodeId: "node-a" }],
   ["nodes.lowerTrustPreview", { nodeId: "node-a" }],
+  // A replace code would move A's node to whoever enrolls with it.
+  ["nodes.enrollmentCodes.create", { replaceNodeId: "node-a" }],
+  ["nodes.credentials.revoke", { credentialId: "cred-a" }],
   ["nodes.lowerTrust", { nodeId: "node-a" }],
   ["nodes.secrets.set", { nodeId: "node-a", name: "WSMP_SECRET_HF", value: "stolen" }],
   ["nodes.secrets.delete", { nodeId: "node-a", name: "WSMP_SECRET_HF" }],
