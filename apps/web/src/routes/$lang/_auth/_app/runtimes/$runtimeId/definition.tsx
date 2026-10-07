@@ -48,6 +48,10 @@ function RuntimeDefinitionPage() {
           message={t("dashboard:runtime.loadFailed")}
           onRetry={() => runtime.refetch()}
         />
+      ) : // The node owns a node-origin definition: the server refuses any change
+      // to it (`launch_change_on_node_origin`), so it is shown read-only.
+      runtime.data.origin === "NODE" ? (
+        <NodeOriginDefinition runtime={runtime.data} />
       ) : (
         <DefinitionForm key={runtime.data.currentVersion.id} runtime={runtime.data} />
       )}
@@ -89,6 +93,37 @@ function RuntimeDefinitionPage() {
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+function NodeOriginDefinition({ runtime }: { runtime: RuntimeDetail }) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">{t("dashboard:runtime.definition")}</CardTitle>
+        <CardDescription id="definition-node-origin">
+          <span className="block font-medium text-foreground">
+            {t("dashboard:runtime.nodeOrigin")}
+          </span>
+          {t("dashboard:runtime.nodeOriginHint")}
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <div className="space-y-1.5">
+          <Label htmlFor="definition-spec">{t("dashboard:runtime.form.spec")}</Label>
+          <Textarea
+            id="definition-spec"
+            rows={22}
+            readOnly
+            spellCheck={false}
+            aria-describedby="definition-node-origin"
+            className="bg-muted/50 font-mono text-xs"
+            value={JSON.stringify(runtime.current.spec, null, 2)}
+          />
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 

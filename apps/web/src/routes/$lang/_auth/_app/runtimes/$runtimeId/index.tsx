@@ -99,6 +99,7 @@ function RuntimeOverview({ runtime }: { runtime: RuntimeDetail }) {
         <p className="break-all font-mono text-sm text-muted-foreground">
           {runtime.slug} · v{runtime.currentVersion.version}
         </p>
+        {runtime.origin === "NODE" ? <NodeOriginNote runtime={runtime} /> : null}
       </div>
       {runtime.service ? (
         <Card>
@@ -113,6 +114,20 @@ function RuntimeOverview({ runtime }: { runtime: RuntimeDetail }) {
       <InstancesCard runtime={runtime} />
       <DeleteRuntime runtime={runtime} />
     </div>
+  );
+}
+
+function NodeOriginNote({ runtime }: { runtime: RuntimeDetail }) {
+  const { t } = useTranslation(["dashboard"]);
+  const { lang } = Route.useParams();
+  return (
+    <Link
+      to="/$lang/runtimes/$runtimeId/definition"
+      params={{ lang, runtimeId: runtime.id }}
+      className="inline-flex min-h-[44px] items-center text-sm text-muted-foreground underline"
+    >
+      {t("dashboard:runtime.nodeOrigin")}
+    </Link>
   );
 }
 
@@ -525,7 +540,11 @@ function DeleteRuntime({ runtime }: { runtime: RuntimeDetail }) {
         open={open}
         onOpenChange={setOpen}
         title={t("dashboard:runtime.deleteTitle", { name: runtime.name })}
-        description={t("dashboard:runtime.deleteHint")}
+        description={t(
+          runtime.origin === "NODE"
+            ? "dashboard:runtime.deleteHintNodeOrigin"
+            : "dashboard:runtime.deleteHint",
+        )}
         footer={
           <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
             <Button variant="outline" size="touch" onClick={() => setOpen(false)}>
