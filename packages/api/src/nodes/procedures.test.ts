@@ -213,7 +213,8 @@ describe("nodes.list / get", () => {
 });
 
 describe("nodes.deleteOffline (MCP node_delete)", () => {
-  function setupDelete(connection: "ONLINE" | "OFFLINE") {
+  function setupDelete(connection: "ONLINE" | "OFFLINE", deleted = 1) {
+    db.node.deleteMany.mockResolvedValueOnce({ count: deleted });
     db.node.findFirst.mockResolvedValueOnce({ id: "node-1", slug: "box", connection } as never);
     db.profileItem.findFirst.mockResolvedValueOnce(null);
     db.instanceRank.findMany.mockResolvedValueOnce([{ instanceId: "inst-1" }] as never);
@@ -228,6 +229,14 @@ describe("nodes.deleteOffline (MCP node_delete)", () => {
     expect(db.node.delete).not.toHaveBeenCalled();
   });
 
+  it("refuses a node that came online after the check, inside the same transaction", async () => {
+    setupDelete("OFFLINE", 0);
+    await expect(
+      client(FULL_AGENT).deleteOffline({ nodeId: "node-1", confirm: "DELETE" }),
+    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "node_online" } });
+    expect(db.auditEvent.create).not.toHaveBeenCalled();
+  });
+
   it("deletes an offline node and audits its slug and id, never credentials", async () => {
     setupDelete("OFFLINE");
     const out = await client(FULL_AGENT).deleteOffline({
@@ -240,7 +249,10 @@ describe("nodes.deleteOffline (MCP node_delete)", () => {
       id: "node-1",
       userId: "owner-1",
     });
-    expect(db.node.delete).toHaveBeenCalledWith({ where: { id: "node-1" } });
+    expect(db.node.deleteMany).toHaveBeenCalledWith({
+      where: { id: "node-1", userId: "owner-1", connection: { not: "ONLINE" } },
+    });
+    expect(db.node.delete).not.toHaveBeenCalled();
     const audit = db.auditEvent.create.mock.calls[0]?.[0]?.data;
     expect(audit).toMatchObject({
       actor: "AGENT",

@@ -7,7 +7,8 @@
  * Token budget (owner guidance): descriptions are 1–3 short sentences (what it does plus the
  * one rule an agent must know); long guidance lives in docs/mcp.md and in refusal messages.
  * Large nested inputs (runtime definitions, pool advanced settings, hardware, metric commands)
- * are advertised as plain objects (`compactFields`) and validated in full by the procedure;
+ * are advertised compactly (`compactFields`: their JSON type only — object, list or null) and
+ * validated in full by the procedure;
  * `contracts.test.ts` fails when `tools/list` grows past its budget.
  */
 import { z } from "zod";

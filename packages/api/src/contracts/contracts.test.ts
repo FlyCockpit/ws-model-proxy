@@ -331,11 +331,11 @@ describe("0.4.0 MCP tool manifest", () => {
   });
 
   it("requires confirm on deletes and command runs", () => {
-    for (const name of ["pool_delete", "runtime_delete", "profile_delete"]) {
+    for (const name of ["pool_delete", "runtime_delete", "profile_delete", "node_delete"]) {
       const tool = MCP_TOOLS.find((entry) => entry.name === name);
-      expect(tool?.input.safeParse({ poolId: "p", runtimeId: "r", profileId: "x" }).success).toBe(
-        false,
-      );
+      expect(
+        tool?.input.safeParse({ poolId: "p", runtimeId: "r", profileId: "x", nodeId: "n" }).success,
+      ).toBe(false);
     }
     const run = MCP_TOOLS.find((entry) => entry.name === "node_command_run");
     expect(run?.input.safeParse({ nodeId: "n", command: "ls" }).success).toBe(false);

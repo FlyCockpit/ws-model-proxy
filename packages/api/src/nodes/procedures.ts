@@ -531,7 +531,22 @@ async function deleteNode(
     ).map((row) => row.fabricId);
     const peers = (await fabricMemberNodeIds(tx, userId, fabricIds)).filter((id) => id !== node.id);
     // `node_delete_release` releases every claim here and stops instances with a part here.
-    await tx.node.delete({ where: { id: node.id } });
+    if (agent) {
+      // The online check above is a plain read: a hello can commit after it. The delete re-checks
+      // the row it locks (Postgres re-evaluates the WHERE), so an agent never deletes a node
+      // that came online in between.
+      const deleted = await tx.node.deleteMany({
+        where: { id: node.id, userId, connection: { not: "ONLINE" } },
+      });
+      if (deleted.count === 0)
+        throw refuseAbout(
+          "node_online",
+          node.id,
+          "This node came online: agents delete only offline nodes. Stop wsmp on it (or ask a person to delete it in the browser).",
+        );
+    } else {
+      await tx.node.delete({ where: { id: node.id } });
+    }
     await refreshFabricsHashes(tx, userId, peers);
     const instanceIds = [...new Set(ranks.map((rank) => rank.instanceId))];
     if (agent) {
