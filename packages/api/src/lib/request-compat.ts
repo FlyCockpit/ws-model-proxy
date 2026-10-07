@@ -37,6 +37,23 @@ export function compatEndpointForFamily(family: string): CompatEndpoint | null {
     : null;
 }
 
+// ── Model-name aliases ──
+
+/**
+ * A model-name alias (`gpt-4o`, `claude-sonnet-4-5`, `meta-llama/Llama-3.1-8B`, `qwen3:8b`):
+ * what OpenAI-, Anthropic- and Hugging Face-style ids look like. Shared by the contract and the
+ * web form.
+ */
+export const MODEL_ALIAS_NAME = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$/;
+
+/** Why `name` cannot be an alias, or null: the shape, the `:external` variant, a direct test. */
+export function modelAliasNameProblem(name: string): "invalid" | "external" | "runtime" | null {
+  if (!MODEL_ALIAS_NAME.test(name)) return "invalid";
+  if (/:external$/i.test(name)) return "external";
+  if (name.startsWith("runtime:")) return "runtime";
+  return null;
+}
+
 // ── Field paths ──
 
 const SEGMENT = /^[A-Za-z_][A-Za-z0-9_-]{0,63}(\[\])?$/;

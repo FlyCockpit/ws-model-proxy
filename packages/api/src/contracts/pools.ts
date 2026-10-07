@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { embeddingContractSchema } from "../lib/embedding-contract";
+import { MODEL_ALIAS_NAME, modelAliasNameProblem } from "../lib/request-compat";
 import { poolAdvancedPatchSchema, poolAdvancedViewSchema } from "./advanced";
 import {
   actorRefSchema,
@@ -33,9 +34,12 @@ import { mutation, query } from "./procedure";
  */
 export const modelAliasNameSchema = z
   .string()
-  .regex(/^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$/, "letters, digits and . _ : / @ + - only")
-  .refine((name) => !/:external$/i.test(name), "the :external variant is added by callers")
-  .refine((name) => !name.startsWith("runtime:"), "runtime: names are direct tests");
+  .regex(MODEL_ALIAS_NAME, "letters, digits and . _ : / @ + - only")
+  .refine(
+    (name) => modelAliasNameProblem(name) !== "external",
+    "the :external variant is added by callers",
+  )
+  .refine((name) => modelAliasNameProblem(name) !== "runtime", "runtime: names are direct tests");
 
 export const MODEL_ALIASES_MAX_PER_USER = 64;
 

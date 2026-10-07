@@ -16,6 +16,7 @@
       "routing": "Routing",
       "cloud": "Cloud",
       "media": "Media",
+      "aliases": "Aliases",
       "sharing": "Sharing",
       "advanced": "Advanced"
     },
@@ -916,6 +917,35 @@
         "VIDEO": "An LLM pool describes each video."
       },
       "unavailable": "{{id}} (no longer available)"
+    },
+    "aliases": {
+      "title": "Model-name aliases",
+      "intro": "Harnesses with hard-coded model names (gpt-4o, claude-sonnet-4-5) can call this pool through an alias.",
+      "private": "Aliases are yours only: they apply to requests made with your keys and never give anyone access.",
+      "modelsHint": "/v1/models lists your aliases too, so harnesses that check it find them.",
+      "copyModels": "Copy the models request",
+      "listTitle": "Aliases for this pool",
+      "loadFailed": "Couldn't load your aliases.",
+      "empty": "No aliases point at this pool yet.",
+      "unusable": "Unusable",
+      "unusableHint": "This pool is not callable for you right now (share revoked, or the key does not allow it).",
+      "allKeys": "All keys",
+      "onlyKey": "Only key {{name}}",
+      "oneKey": "Only one of your keys",
+      "remove": "Remove {{name}}",
+      "removed": "Removed {{name}}.",
+      "add": "Add an alias",
+      "addButton": "Add alias",
+      "added": "{{name}} now calls this pool.",
+      "name": "Model name callers send",
+      "key": "For",
+      "moveHint": "If you already use this name for the same keys, it moves to this pool.",
+      "errors": {
+        "nameRequired": "Enter a model name.",
+        "nameInvalid": "Use letters, digits and . _ : / @ + -, starting with a letter or digit (128 at most).",
+        "nameExternal": "Leave out :external; callers add it.",
+        "nameRuntime": "Names starting with runtime: are for direct tests."
+      }
     }
   },
   "runtime": {
@@ -1132,6 +1162,151 @@
         "unavailableStopMs": "Stop other nodes after one is offline for"
       }
     },
-    "answerInTerminals": "Answer it on the Terminals page"
+    "answerInTerminals": "Answer it on the Terminals page",
+    "compat": {
+      "title": "Request compatibility",
+      "hint": "How requests are adjusted so this engine accepts them. Automatic unless you change it; saving makes a new version.",
+      "policy": {
+        "label": "Unknown fields",
+        "hint": "Fields in a request that the engine does not list or rejects.",
+        "options": {
+          "auto": "Automatic",
+          "forward": "Forward",
+          "strict": "Strict"
+        },
+        "help": {
+          "auto": "Drop unknown fields that do not change the answer; refuse ones that would.",
+          "forward": "Send every field as is, even ones the engine may reject.",
+          "strict": "Refuse requests with unknown fields with a clear error."
+        }
+      },
+      "allowDrop": {
+        "label": "Fields allowed to drop",
+        "hint": "Fields that change the answer are never dropped unless listed here.",
+        "empty": "None. Requests the engine cannot take get a clear error instead.",
+        "path": "Field path",
+        "add": "Add",
+        "remove": "Remove {{path}}",
+        "limit": "That is the most fields you can list."
+      },
+      "rules": {
+        "label": "Rewrite rules",
+        "hint": "Applied to every request, in order, before it reaches the engine.",
+        "empty": "No rules.",
+        "add": "Add a rule",
+        "addButton": "Add rule",
+        "remove": "Remove rule: {{rule}}",
+        "limit": "That is the most rules a runtime can have ({{max}}).",
+        "op": "Action",
+        "ops": {
+          "rename": "Rename a field",
+          "drop": "Drop a field",
+          "default": "Set a default",
+          "clamp": "Keep a number in range",
+          "mapRole": "Change a message role"
+        },
+        "endpoint": "Applies to",
+        "everyEndpoint": "Every endpoint",
+        "onlyEndpoint": "Only {{endpoint}}",
+        "path": "Field path",
+        "to": "New key",
+        "value": "Value",
+        "valueHint": "true, false, null and numbers are read as such; anything else is text.",
+        "min": "Minimum",
+        "max": "Maximum",
+        "from": "Role sent",
+        "toRole": "Send it as"
+      },
+      "describe": {
+        "rename": "Rename {{path}} to {{to}}",
+        "drop": "Drop {{path}}",
+        "default": "Set {{path}} to {{value}} when missing",
+        "clampBoth": "Keep {{path}} between {{min}} and {{max}}",
+        "clampMin": "Keep {{path}} at least {{min}}",
+        "clampMax": "Keep {{path}} at most {{max}}",
+        "mapRole": "Send role {{from}} as {{to}}"
+      },
+      "headers": {
+        "label": "Headers",
+        "hint": "Client headers passed to the engine. Credentials are never forwarded.",
+        "auto": "Automatic",
+        "forward": "Forward",
+        "strip": "Strip"
+      },
+      "extras": {
+        "label": "Added fields",
+        "hint": "Fields the proxy adds to requests itself.",
+        "streamUsage": "Usage in streams",
+        "topK": "top_k",
+        "options": {
+          "auto": "Automatic",
+          "on": "On",
+          "off": "Off"
+        },
+        "help": {
+          "streamUsage": "Ask the engine for token usage at the end of a stream.",
+          "topK": "Pass top_k through when a caller sends it."
+        }
+      },
+      "response": {
+        "label": "Responses",
+        "hint": "Shape answers toward what the caller's API expects.",
+        "reasoningField": "Reasoning text",
+        "reasoning": {
+          "auto": "Automatic",
+          "reasoning": "As reasoning",
+          "reasoning_content": "As reasoning_content",
+          "strip": "Remove it"
+        },
+        "stripNonStandard": "Remove non-standard fields",
+        "stripNonStandardHint": "For strict client SDKs that reject fields outside their API."
+      },
+      "save": "Save compatibility",
+      "discard": "Discard changes",
+      "reset": "Reset to automatic",
+      "resetTitle": "Reset request compatibility?",
+      "resetHint": "Your rules and choices are removed and a new version uses the automatic behavior.",
+      "isAutomatic": "Currently automatic.",
+      "isCustom": "Currently customized.",
+      "errors": {
+        "pathSyntax": "Use a field path like a.b[].c.",
+        "pathForbidden": "That field cannot be rewritten: model, stream, credentials and addresses are off-limits.",
+        "defaultForbidden": "A default cannot set arrays, content, conversation, adapter, file or media fields.",
+        "keySyntax": "Use a plain key: letters, digits, _ and -.",
+        "renameTarget": "A rename cannot move a value onto that key.",
+        "defaultValue": "Use true, false, null, a number, or text with letters, digits, spaces and . , : ; = + @ - (128 at most).",
+        "number": "Enter a number.",
+        "clampBounds": "Give a minimum, a maximum, or both.",
+        "clampOrder": "The maximum must not be below the minimum.",
+        "semantic": "This field changes the answer: add it to the fields allowed to drop first.",
+        "duplicate": "Already listed.",
+        "invalid": "This is not allowed.",
+        "fixBelow": "Fix the marked items, then save."
+      },
+      "profile": {
+        "title": "What the engine accepts",
+        "hint": "Read from the engine's API description and learned from the requests it rejected.",
+        "none": "Nothing known yet. It is filled in once the engine is described or answers a request.",
+        "source": "Source",
+        "sources": {
+          "LEARNED": "Learned from its answers",
+          "OPENAPI": "Its OpenAPI description",
+          "CATALOG": "Engine catalog"
+        },
+        "engine": "Engine",
+        "engineUnknown": "Unknown",
+        "probedAt": "Checked",
+        "described": "Described endpoints",
+        "describedNone": "None described.",
+        "learned": "Learned fixes",
+        "learnedNone": "None learned.",
+        "stripHeaders": "Stripped headers",
+        "stripHeadersNone": "None.",
+        "forget": "Forget what was learned",
+        "forgetTitle": "Forget what was learned?",
+        "forgetHint": "Learned fixes and stripped headers are removed and learned again from the engine's next answers. No new version is made.",
+        "forgotten": "Learned fixes forgotten."
+      }
+    }
   }
 }

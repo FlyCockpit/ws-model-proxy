@@ -16,6 +16,7 @@
       "routing": "Enrutamiento",
       "cloud": "Nube",
       "media": "Medios",
+      "aliases": "Alias",
       "sharing": "Compartir",
       "advanced": "Avanzado"
     },
@@ -916,6 +917,35 @@
         "VIDEO": "Un pool LLM describe cada video."
       },
       "unavailable": "{{id}} (ya no disponible)"
+    },
+    "aliases": {
+      "title": "Alias de nombres de modelo",
+      "intro": "Las herramientas con nombres de modelo fijos en su código (gpt-4o, claude-sonnet-4-5) pueden llamar a este pool mediante un alias.",
+      "private": "Los alias son solo tuyos: se aplican a las solicitudes hechas con tus claves y nunca le dan acceso a nadie.",
+      "modelsHint": "/v1/models también lista tus alias, así que las herramientas que lo consultan los encuentran.",
+      "copyModels": "Copiar la solicitud de modelos",
+      "listTitle": "Alias de este pool",
+      "loadFailed": "No se pudieron cargar tus alias.",
+      "empty": "Todavía no hay alias que apunten a este pool.",
+      "unusable": "No disponible",
+      "unusableHint": "Por ahora no puedes llamar a este pool (se revocó el acceso compartido o la clave no lo permite).",
+      "allKeys": "Todas las claves",
+      "onlyKey": "Solo la clave {{name}}",
+      "oneKey": "Solo una de tus claves",
+      "remove": "Quitar {{name}}",
+      "removed": "Se quitó {{name}}.",
+      "add": "Agregar un alias",
+      "addButton": "Agregar alias",
+      "added": "{{name}} ahora llama a este pool.",
+      "name": "Nombre de modelo que envían",
+      "key": "Para",
+      "moveHint": "Si ya usas este nombre para las mismas claves, se mueve a este pool.",
+      "errors": {
+        "nameRequired": "Escribe un nombre de modelo.",
+        "nameInvalid": "Usa letras, dígitos y . _ : / @ + -, empezando con una letra o un dígito (máximo 128).",
+        "nameExternal": "No incluyas :external; quien llama lo agrega.",
+        "nameRuntime": "Los nombres que empiezan con runtime: son para pruebas directas."
+      }
     }
   },
   "runtime": {
@@ -1132,6 +1162,151 @@
         "unavailableStopMs": "Detener los demás nodos si uno está desconectado durante"
       }
     },
-    "answerInTerminals": "Respóndelo en la página Terminales"
+    "answerInTerminals": "Respóndelo en la página Terminales",
+    "compat": {
+      "title": "Compatibilidad de solicitudes",
+      "hint": "Cómo se ajustan las solicitudes para que este motor las acepte. Es automático a menos que lo cambies; al guardar se crea una versión nueva.",
+      "policy": {
+        "label": "Campos desconocidos",
+        "hint": "Campos de una solicitud que el motor no tiene en su lista o que rechaza.",
+        "options": {
+          "auto": "Automático",
+          "forward": "Reenviar",
+          "strict": "Estricto"
+        },
+        "help": {
+          "auto": "Quita los campos desconocidos que no cambian la respuesta; rechaza los que sí la cambian.",
+          "forward": "Envía todos los campos tal cual, aunque el motor pueda rechazarlos.",
+          "strict": "Rechaza las solicitudes con campos desconocidos con un error claro."
+        }
+      },
+      "allowDrop": {
+        "label": "Campos que se pueden quitar",
+        "hint": "Los campos que cambian la respuesta nunca se quitan, salvo que estén en esta lista.",
+        "empty": "Ninguno. Las solicitudes que el motor no acepte reciben un error claro.",
+        "path": "Ruta del campo",
+        "add": "Agregar",
+        "remove": "Quitar {{path}}",
+        "limit": "Ya llegaste al máximo de campos en la lista."
+      },
+      "rules": {
+        "label": "Reglas de reescritura",
+        "hint": "Se aplican a cada solicitud, en orden, antes de que llegue al motor.",
+        "empty": "Sin reglas.",
+        "add": "Agregar una regla",
+        "addButton": "Agregar regla",
+        "remove": "Quitar regla: {{rule}}",
+        "limit": "Ya llegaste al máximo de reglas de un runtime ({{max}}).",
+        "op": "Acción",
+        "ops": {
+          "rename": "Renombrar un campo",
+          "drop": "Quitar un campo",
+          "default": "Poner un valor predeterminado",
+          "clamp": "Mantener un número en un rango",
+          "mapRole": "Cambiar el rol de un mensaje"
+        },
+        "endpoint": "Se aplica a",
+        "everyEndpoint": "Todos los endpoints",
+        "onlyEndpoint": "Solo {{endpoint}}",
+        "path": "Ruta del campo",
+        "to": "Clave nueva",
+        "value": "Valor",
+        "valueHint": "true, false, null y los números se leen como tales; todo lo demás es texto.",
+        "min": "Mínimo",
+        "max": "Máximo",
+        "from": "Rol enviado",
+        "toRole": "Enviarlo como"
+      },
+      "describe": {
+        "rename": "Renombrar {{path}} a {{to}}",
+        "drop": "Quitar {{path}}",
+        "default": "Poner {{path}} en {{value}} si falta",
+        "clampBoth": "Mantener {{path}} entre {{min}} y {{max}}",
+        "clampMin": "Mantener {{path}} en al menos {{min}}",
+        "clampMax": "Mantener {{path}} en máximo {{max}}",
+        "mapRole": "Enviar el rol {{from}} como {{to}}"
+      },
+      "headers": {
+        "label": "Encabezados",
+        "hint": "Encabezados del cliente que se pasan al motor. Las credenciales nunca se reenvían.",
+        "auto": "Automático",
+        "forward": "Reenviar",
+        "strip": "Quitar"
+      },
+      "extras": {
+        "label": "Campos agregados",
+        "hint": "Campos que el proxy agrega por su cuenta a las solicitudes.",
+        "streamUsage": "Uso en streams",
+        "topK": "top_k",
+        "options": {
+          "auto": "Automático",
+          "on": "Activado",
+          "off": "Desactivado"
+        },
+        "help": {
+          "streamUsage": "Pide al motor el uso de tokens al final de un stream.",
+          "topK": "Deja pasar top_k cuando quien llama lo envía."
+        }
+      },
+      "response": {
+        "label": "Respuestas",
+        "hint": "Ajusta las respuestas a lo que espera la API de quien llama.",
+        "reasoningField": "Texto de razonamiento",
+        "reasoning": {
+          "auto": "Automático",
+          "reasoning": "Como reasoning",
+          "reasoning_content": "Como reasoning_content",
+          "strip": "Quitarlo"
+        },
+        "stripNonStandard": "Quitar campos no estándar",
+        "stripNonStandardHint": "Para SDKs de cliente estrictos que rechazan campos fuera de su API."
+      },
+      "save": "Guardar compatibilidad",
+      "discard": "Descartar cambios",
+      "reset": "Volver a automático",
+      "resetTitle": "¿Volver la compatibilidad de solicitudes a automático?",
+      "resetHint": "Se quitan tus reglas y opciones, y una versión nueva usa el comportamiento automático.",
+      "isAutomatic": "Ahora es automático.",
+      "isCustom": "Ahora está personalizado.",
+      "errors": {
+        "pathSyntax": "Usa una ruta de campo como a.b[].c.",
+        "pathForbidden": "Ese campo no se puede reescribir: model, stream, credenciales y direcciones están fuera de los límites.",
+        "defaultForbidden": "Un valor predeterminado no puede poner arreglos, contenido, conversación, adaptadores, archivos ni medios.",
+        "keySyntax": "Usa una clave simple: letras, dígitos, _ y -.",
+        "renameTarget": "Un cambio de nombre no puede mover un valor a esa clave.",
+        "defaultValue": "Usa true, false, null, un número o texto con letras, dígitos, espacios y . , : ; = + @ - (máximo 128).",
+        "number": "Escribe un número.",
+        "clampBounds": "Indica un mínimo, un máximo o ambos.",
+        "clampOrder": "El máximo no puede ser menor que el mínimo.",
+        "semantic": "Este campo cambia la respuesta: primero agrégalo a los campos que se pueden quitar.",
+        "duplicate": "Ya está en la lista.",
+        "invalid": "Esto no está permitido.",
+        "fixBelow": "Corrige lo marcado y luego guarda."
+      },
+      "profile": {
+        "title": "Lo que acepta el motor",
+        "hint": "Se lee de la descripción de la API del motor y se aprende de las solicitudes que rechazó.",
+        "none": "Todavía no se sabe nada. Se llena cuando el motor se describe o responde una solicitud.",
+        "source": "Fuente",
+        "sources": {
+          "LEARNED": "Aprendido de sus respuestas",
+          "OPENAPI": "Su descripción OpenAPI",
+          "CATALOG": "Catálogo de motores"
+        },
+        "engine": "Motor",
+        "engineUnknown": "Desconocido",
+        "probedAt": "Revisado",
+        "described": "Endpoints descritos",
+        "describedNone": "Ninguno descrito.",
+        "learned": "Ajustes aprendidos",
+        "learnedNone": "Ninguno aprendido.",
+        "stripHeaders": "Encabezados quitados",
+        "stripHeadersNone": "Ninguno.",
+        "forget": "Olvidar lo aprendido",
+        "forgetTitle": "¿Olvidar lo aprendido?",
+        "forgetHint": "Se quitan los ajustes aprendidos y los encabezados quitados, y se vuelven a aprender de las siguientes respuestas del motor. No se crea una versión nueva.",
+        "forgotten": "Se olvidaron los ajustes aprendidos."
+      }
+    }
   }
 }

@@ -55,6 +55,7 @@ import { Route as LangAuthAppSettingsIndexRouteImport } from './routes/$lang/_au
 import { Route as LangAuthAppSettingsSecurityRouteImport } from './routes/$lang/_auth/_app/settings/security'
 import { Route as LangAuthAppPoolsPoolIdIndexRouteImport } from './routes/$lang/_auth/_app/pools/$poolId/index'
 import { Route as LangAuthAppPoolsPoolIdAdvancedRouteImport } from './routes/$lang/_auth/_app/pools/$poolId/advanced'
+import { Route as LangAuthAppPoolsPoolIdAliasesRouteImport } from './routes/$lang/_auth/_app/pools/$poolId/aliases'
 import { Route as LangAuthAppPoolsPoolIdCloudRouteImport } from './routes/$lang/_auth/_app/pools/$poolId/cloud'
 import { Route as LangAuthAppPoolsPoolIdMediaRouteImport } from './routes/$lang/_auth/_app/pools/$poolId/media'
 import { Route as LangAuthAppPoolsPoolIdRoutingRouteImport } from './routes/$lang/_auth/_app/pools/$poolId/routing'
@@ -306,6 +307,12 @@ const LangAuthAppPoolsPoolIdAdvancedRoute =
     path: '/advanced',
     getParentRoute: () => LangAuthAppPoolsPoolIdRoute,
   } as any)
+const LangAuthAppPoolsPoolIdAliasesRoute =
+  LangAuthAppPoolsPoolIdAliasesRouteImport.update({
+    id: '/aliases',
+    path: '/aliases',
+    getParentRoute: () => LangAuthAppPoolsPoolIdRoute,
+  } as any)
 const LangAuthAppPoolsPoolIdCloudRoute =
   LangAuthAppPoolsPoolIdCloudRouteImport.update({
     id: '/cloud',
@@ -393,6 +400,7 @@ export interface FileRoutesByFullPath {
   '/$lang/runtimes/': typeof LangAuthAppRuntimesIndexRoute
   '/$lang/settings/': typeof LangAuthAppSettingsIndexRoute
   '/$lang/pools/$poolId/advanced': typeof LangAuthAppPoolsPoolIdAdvancedRoute
+  '/$lang/pools/$poolId/aliases': typeof LangAuthAppPoolsPoolIdAliasesRoute
   '/$lang/pools/$poolId/cloud': typeof LangAuthAppPoolsPoolIdCloudRoute
   '/$lang/pools/$poolId/media': typeof LangAuthAppPoolsPoolIdMediaRoute
   '/$lang/pools/$poolId/routing': typeof LangAuthAppPoolsPoolIdRoutingRoute
@@ -439,6 +447,7 @@ export interface FileRoutesByTo {
   '/$lang/runtimes': typeof LangAuthAppRuntimesIndexRoute
   '/$lang/settings': typeof LangAuthAppSettingsIndexRoute
   '/$lang/pools/$poolId/advanced': typeof LangAuthAppPoolsPoolIdAdvancedRoute
+  '/$lang/pools/$poolId/aliases': typeof LangAuthAppPoolsPoolIdAliasesRoute
   '/$lang/pools/$poolId/cloud': typeof LangAuthAppPoolsPoolIdCloudRoute
   '/$lang/pools/$poolId/media': typeof LangAuthAppPoolsPoolIdMediaRoute
   '/$lang/pools/$poolId/routing': typeof LangAuthAppPoolsPoolIdRoutingRoute
@@ -495,6 +504,7 @@ export interface FileRoutesById {
   '/$lang/_auth/_app/runtimes/': typeof LangAuthAppRuntimesIndexRoute
   '/$lang/_auth/_app/settings/': typeof LangAuthAppSettingsIndexRoute
   '/$lang/_auth/_app/pools/$poolId/advanced': typeof LangAuthAppPoolsPoolIdAdvancedRoute
+  '/$lang/_auth/_app/pools/$poolId/aliases': typeof LangAuthAppPoolsPoolIdAliasesRoute
   '/$lang/_auth/_app/pools/$poolId/cloud': typeof LangAuthAppPoolsPoolIdCloudRoute
   '/$lang/_auth/_app/pools/$poolId/media': typeof LangAuthAppPoolsPoolIdMediaRoute
   '/$lang/_auth/_app/pools/$poolId/routing': typeof LangAuthAppPoolsPoolIdRoutingRoute
@@ -550,6 +560,7 @@ export interface FileRouteTypes {
     | '/$lang/runtimes/'
     | '/$lang/settings/'
     | '/$lang/pools/$poolId/advanced'
+    | '/$lang/pools/$poolId/aliases'
     | '/$lang/pools/$poolId/cloud'
     | '/$lang/pools/$poolId/media'
     | '/$lang/pools/$poolId/routing'
@@ -596,6 +607,7 @@ export interface FileRouteTypes {
     | '/$lang/runtimes'
     | '/$lang/settings'
     | '/$lang/pools/$poolId/advanced'
+    | '/$lang/pools/$poolId/aliases'
     | '/$lang/pools/$poolId/cloud'
     | '/$lang/pools/$poolId/media'
     | '/$lang/pools/$poolId/routing'
@@ -651,6 +663,7 @@ export interface FileRouteTypes {
     | '/$lang/_auth/_app/runtimes/'
     | '/$lang/_auth/_app/settings/'
     | '/$lang/_auth/_app/pools/$poolId/advanced'
+    | '/$lang/_auth/_app/pools/$poolId/aliases'
     | '/$lang/_auth/_app/pools/$poolId/cloud'
     | '/$lang/_auth/_app/pools/$poolId/media'
     | '/$lang/_auth/_app/pools/$poolId/routing'
@@ -990,6 +1003,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAuthAppPoolsPoolIdAdvancedRouteImport
       parentRoute: typeof LangAuthAppPoolsPoolIdRoute
     }
+    '/$lang/_auth/_app/pools/$poolId/aliases': {
+      id: '/$lang/_auth/_app/pools/$poolId/aliases'
+      path: '/aliases'
+      fullPath: '/$lang/pools/$poolId/aliases'
+      preLoaderRoute: typeof LangAuthAppPoolsPoolIdAliasesRouteImport
+      parentRoute: typeof LangAuthAppPoolsPoolIdRoute
+    }
     '/$lang/_auth/_app/pools/$poolId/cloud': {
       id: '/$lang/_auth/_app/pools/$poolId/cloud'
       path: '/cloud'
@@ -1091,6 +1111,7 @@ const LangAuthAppSettingsRouteWithChildren =
 
 interface LangAuthAppPoolsPoolIdRouteChildren {
   LangAuthAppPoolsPoolIdAdvancedRoute: typeof LangAuthAppPoolsPoolIdAdvancedRoute
+  LangAuthAppPoolsPoolIdAliasesRoute: typeof LangAuthAppPoolsPoolIdAliasesRoute
   LangAuthAppPoolsPoolIdCloudRoute: typeof LangAuthAppPoolsPoolIdCloudRoute
   LangAuthAppPoolsPoolIdMediaRoute: typeof LangAuthAppPoolsPoolIdMediaRoute
   LangAuthAppPoolsPoolIdRoutingRoute: typeof LangAuthAppPoolsPoolIdRoutingRoute
@@ -1101,6 +1122,7 @@ interface LangAuthAppPoolsPoolIdRouteChildren {
 const LangAuthAppPoolsPoolIdRouteChildren: LangAuthAppPoolsPoolIdRouteChildren =
   {
     LangAuthAppPoolsPoolIdAdvancedRoute: LangAuthAppPoolsPoolIdAdvancedRoute,
+    LangAuthAppPoolsPoolIdAliasesRoute: LangAuthAppPoolsPoolIdAliasesRoute,
     LangAuthAppPoolsPoolIdCloudRoute: LangAuthAppPoolsPoolIdCloudRoute,
     LangAuthAppPoolsPoolIdMediaRoute: LangAuthAppPoolsPoolIdMediaRoute,
     LangAuthAppPoolsPoolIdRoutingRoute: LangAuthAppPoolsPoolIdRoutingRoute,

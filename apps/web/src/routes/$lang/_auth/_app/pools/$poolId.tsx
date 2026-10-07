@@ -72,6 +72,21 @@ function PoolLayout() {
       ),
     },
     {
+      key: "aliases",
+      labelKey: "dashboard:tabs.pool.aliases",
+      render: (className, activeClassName, children) => (
+        <Link
+          to="/$lang/pools/$poolId/aliases"
+          params={{ lang, poolId }}
+          activeOptions={{ exact: false }}
+          className={className}
+          activeProps={{ className: activeClassName }}
+        >
+          {children}
+        </Link>
+      ),
+    },
+    {
       key: "sharing",
       labelKey: "dashboard:tabs.pool.sharing",
       render: (className, activeClassName, children) => (

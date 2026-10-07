@@ -40,13 +40,14 @@ All require an active session (`_auth` layout).
 | `/{lang}/pools/{poolId}/routing` | Priority class, pool cap, kept slots, borrowing, only my own hardware. |
 | `/{lang}/pools/{poolId}/cloud` | Cloud mode (off / for me / for me and people I share with), cloud members order, embedding contract, paid warm protection, own-key consent, history. |
 | `/{lang}/pools/{poolId}/media` | Sidecar pools per input (images, audio, video): pool picker, prompt, limits, pipeline strip. |
+| `/{lang}/pools/{poolId}/aliases` | Model-name aliases pointing at this pool (for harnesses with hard-coded model names): name, key scope (all keys or one key), unusable badge, Remove, add form. Yours only; never grants access. |
 | `/{lang}/pools/{poolId}/sharing` | Shares (email, can use / can contribute, priority class, monthly cap, protection) and contributed members by person. |
 | `/{lang}/pools/{poolId}/advanced` | Automatic settings with overrides (max wait, context ceiling and margin, affinity, warm protection, API adaptation, attachments, transcription fallback), metric routing rules (read-only, Delete per rule), danger zone. |
 | `/{lang}/runtimes` | Runtimes grouped by node (always-on and instances of startable ones), not running, Needs you, detected-servers banner. |
 | `/{lang}/runtimes/new` | New runtime: preset picker (detected server, vLLM, SGLang, llama.cpp, Ollama service, systemd unit), then the definition form. |
 | `/{lang}/runtimes/{runtimeId}` | Runtime overview: instances (phase, nodes, KV meter, slots, waiting, restart window), Start (node picker, preview, confirm), Stop, Restart, Forget, served models, metrics by version, sharing. |
 | `/{lang}/runtimes/{runtimeId}/definition` | Definition form and raw JSON, version history with notes and diffs, agent-written badges, applies-live vs needs-restart hints. |
-| `/{lang}/runtimes/{runtimeId}/advanced` | Limits and advanced settings (automatic / override), metrics reader, restart settings. |
+| `/{lang}/runtimes/{runtimeId}/advanced` | Limits and advanced settings (automatic / override), metrics reader, restart settings, request compatibility (unknown-field policy, semantic fields allowed to drop, rewrite rules, header modes, extras, response shaping; Save / Reset to automatic) and what the engine accepts (described endpoints, learned fixes, stripped headers, Forget what was learned). |
 | `/{lang}/profiles` | Profiles: nodes, items, satisfied, pins outdated, Apply. |
 | `/{lang}/profiles/{profileId}` | Profile editor (nodes with hold lines, pinned items, Update pins), delete, and Apply → preview → Confirm. |
 | `/{lang}/nodes` | Node cards (online, trust, hold, temporary, hardware, free memory, runtimes), Add node dialog (multi-use, labels, temporary), install codes, fabrics. |
