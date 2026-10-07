@@ -470,7 +470,7 @@ try {
     `SELECT "userId" FROM runtime_operation WHERE id = 'op-b'`,
     "owner-b",
   );
-  await client.query(`DELETE FROM runtime_operation WHERE id IN ('op-a', 'op-b')`);
+  await client.query(`DELETE FROM runtime_operation WHERE id IN ('op-a', 'op-b')`); // policy: bounded-delete
 
   // FOR KEY SHARE: a step insert racing its node's delete waits for the delete, then is refused
   // (a step has no node foreign key; without the lock it would land on the deleted node).
@@ -484,7 +484,7 @@ try {
     await racer.query("SET wsmp.fences = ',*,'");
     await client.query("BEGIN");
     inTransaction = true;
-    await client.query(`DELETE FROM node WHERE id = 'node-race'`);
+    await client.query(`DELETE FROM node WHERE id = 'node-race'`); // policy: bounded-delete
     let settled = false;
     const insert = racer
       .query(
@@ -1263,15 +1263,15 @@ try {
 
   // ── delete rules (plan cases 1-6) ──
   // 4. a pinned runtime cannot be deleted; a node holding one gives a clean reason.
-  await expectFailure("pinned runtime delete", `DELETE FROM runtime WHERE id = 'rt-a'`, "23503");
+  await expectFailure("pinned runtime delete", `DELETE FROM runtime WHERE id = 'rt-a'`, "23503"); // policy: bounded-delete
   await expectFailure(
     "node delete with a pinned always-on runtime",
     `DELETE FROM node WHERE id = 'node-a1'`,
     "WMPP1",
   );
-  await client.query(`DELETE FROM profile_item WHERE id = 'item-a'`);
+  await client.query(`DELETE FROM profile_item WHERE id = 'item-a'`); // policy: bounded-delete
   // 2. the node holding the head of a multi-node instance (and a worker of nothing else)
-  await client.query(`DELETE FROM node WHERE id = 'node-a2'`);
+  await client.query(`DELETE FROM node WHERE id = 'node-a2'`); // policy: bounded-delete
   await expectValue(
     "head node delete releases its part",
     `SELECT claim FROM instance_rank WHERE id = 'rank-m0'`,
@@ -1293,7 +1293,7 @@ try {
     "HELD",
   );
   // 3. the node holding only workers: its open step ends, its parts are released
-  await client.query(`DELETE FROM node WHERE id = 'node-a3'`);
+  await client.query(`DELETE FROM node WHERE id = 'node-a3'`); // policy: bounded-delete
   await expectValue(
     "worker node delete releases",
     `SELECT count(*) FROM instance_rank WHERE claim <> 'RELEASED'`,
@@ -1305,7 +1305,7 @@ try {
     "CANCELLED",
   );
   // always-on runtimes leave with their node (instance first)
-  await client.query(`DELETE FROM node WHERE id = 'node-a1'`);
+  await client.query(`DELETE FROM node WHERE id = 'node-a1'`); // policy: bounded-delete
   await expectValue(
     "always-on runtime removed with its node",
     `SELECT count(*) FROM runtime WHERE id = 'rt-a'`,
@@ -1318,14 +1318,14 @@ try {
     "23503",
   );
   // 5. a pool used as another pool's sidecar
-  await client.query(`DELETE FROM pool WHERE id = 'pool-vision'`);
+  await client.query(`DELETE FROM pool WHERE id = 'pool-vision'`); // policy: bounded-delete
   await expectValue(
     "sidecar link removed with its target",
     `SELECT count(*) FROM pool_sidecar WHERE id = 'sc-img'`,
     0,
   );
   // routing rules follow their member
-  await client.query(`DELETE FROM pool_member WHERE id = 'member-a'`);
+  await client.query(`DELETE FROM pool_member WHERE id = 'member-a'`); // policy: bounded-delete
   await expectValue(
     "targeted rule removed with its member",
     `SELECT count(*) FROM pool_routing_rule WHERE id = 'rule-target'`,
@@ -1343,7 +1343,7 @@ try {
     `SELECT count(*) FROM pool_member WHERE "shareId" = 'share-b'`,
     0,
   );
-  await client.query(`DELETE FROM share WHERE id = 'share-b'`);
+  await client.query(`DELETE FROM share WHERE id = 'share-b'`); // policy: bounded-delete
   await expectValue(
     "share delete removes the grantee's API-key entries",
     `SELECT count(*) FROM api_key_pool WHERE "apiKeyId" = 'key-b'`,
@@ -1352,13 +1352,13 @@ try {
   // 1. a user with running instances: the sweeper's order (instances, profiles, runtimes,
   //    nodes, pools, providers, user) succeeds.
   await client.query(`
-    DELETE FROM runtime_instance WHERE "userId" = 'owner-a';
-    DELETE FROM profile WHERE "userId" = 'owner-a';
+    DELETE FROM runtime_instance WHERE "userId" = 'owner-a'; -- policy: bounded-delete
+    DELETE FROM profile WHERE "userId" = 'owner-a'; -- policy: bounded-delete
     UPDATE runtime SET "currentVersionId" = NULL WHERE "userId" = 'owner-a';
-    DELETE FROM runtime WHERE "userId" = 'owner-a';
-    DELETE FROM node WHERE "userId" = 'owner-a';
-    DELETE FROM pool WHERE "userId" = 'owner-a';
-    DELETE FROM "user" WHERE id = 'owner-a';`);
+    DELETE FROM runtime WHERE "userId" = 'owner-a'; -- policy: bounded-delete
+    DELETE FROM node WHERE "userId" = 'owner-a'; -- policy: bounded-delete
+    DELETE FROM pool WHERE "userId" = 'owner-a'; -- policy: bounded-delete
+    DELETE FROM "user" WHERE id = 'owner-a'; -- policy: bounded-delete`);
   await expectValue("ordered user deletion", `SELECT count(*) FROM "user" WHERE id = 'owner-a'`, 0);
 
   if (failures > 0) throw new Error(`${failures} schema-hardening case(s) failed`);
