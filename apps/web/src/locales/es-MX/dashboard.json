@@ -614,7 +614,8 @@
     "node_held": "Un nodo está retenido. Libéralo, o que una persona aplique con la vista previa.",
     "secret_needs_node": "Configura este secreto en el nodo con `wsmp secret set`.",
     "fabric_in_use": "Un runtime que abarca varios nodos usa este fabric. Detenlo primero.",
-    "always_on_runtime": "Un runtime siempre activo se ejecuta por su cuenta; no hay nada que iniciar."
+    "always_on_runtime": "Un runtime siempre activo se ejecuta por su cuenta; no hay nada que iniciar.",
+    "fabric_port_ranges_disjoint": "Los rangos de puertos de estos nodos no comparten ningún puerto; haz que se superpongan."
   },
   "models": {
     "loadFailed": "No se pudieron cargar tus modelos.",
@@ -1078,7 +1079,8 @@
       "other": "Esto no puede ejecutarse como en la vista previa.",
       "fabric_in_use": "Una instancia multinodo en ejecución usa esta red.",
       "invite_needs_link": "Esta invitación necesita su enlace para aceptarse.",
-      "always_on_runtime": "Los runtimes siempre activos se ejecutan por su cuenta; no hay nada que iniciar."
+      "always_on_runtime": "Los runtimes siempre activos se ejecutan por su cuenta; no hay nada que iniciar.",
+      "fabric_port_ranges_disjoint": "Los rangos de puertos de los nodos no comparten ningún puerto para el puerto dist."
     },
     "delete": "Eliminar runtime",
     "deleteTitle": "¿Eliminar {{name}}?",

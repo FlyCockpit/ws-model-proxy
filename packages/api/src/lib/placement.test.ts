@@ -1220,3 +1220,57 @@ describe("dist port across node sets", () => {
     }
   });
 });
+
+describe("dist port and the members' port ranges", () => {
+  const pairFabric = () => [netFabric("net", { a: "10.0.0.1", b: "10.0.0.2" })];
+
+  it("refuses fabric_port_ranges_disjoint, naming the nodes, when the ranges share no port", () => {
+    const nodes = [
+      node("a", { portRange: [30000, 30009] }),
+      node("b", { portRange: [31000, 31009] }),
+    ];
+    for (const nodeIds of [["a", "b"], undefined]) {
+      const result = new PlacementPlanner(context({ nodes, fabrics: pairFabric() })).place(
+        request({ ...PAIR, ...(nodeIds ? { nodeIds } : {}) }),
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.refusal.reason).toBe("fabric_port_ranges_disjoint");
+        expect(result.refusal.message).toContain("a (30000-30009)");
+        expect(result.refusal.message).toContain("b (31000-31009)");
+      }
+    }
+  });
+
+  it("takes the dist port from the intersection, moving a rank off the only common port", () => {
+    // The ranges overlap in one port, which b's own (lowest) port would otherwise take.
+    const nodes = [
+      node("a", { portRange: [30000, 30009] }),
+      node("b", { portRange: [30009, 30018] }),
+    ];
+    for (const nodeIds of [["a", "b"], undefined]) {
+      const result = ok(
+        new PlacementPlanner(context({ nodes, fabrics: pairFabric() })).place(
+          request({ ...PAIR, ...(nodeIds ? { nodeIds } : {}) }),
+        ),
+      );
+      expect(result.start.distPort).toBe(30009);
+      const ports = Object.fromEntries(
+        result.start.placements.map((placement) => [placement.nodeId, placement.port]),
+      );
+      expect(ports).toEqual({ a: 30000, b: 30010 });
+    }
+  });
+
+  it("still says no_free_ports when the common ports are all taken", () => {
+    const nodes = [
+      node("a", { portRange: [30000, 30009] }),
+      node("b", { portRange: [30009, 30009] }),
+    ];
+    const result = new PlacementPlanner(context({ nodes, fabrics: pairFabric() })).place(
+      request(PAIR),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.refusal.reason).toBe("no_free_ports");
+  });
+});

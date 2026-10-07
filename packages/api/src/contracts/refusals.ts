@@ -84,6 +84,11 @@ export const REFUSAL_REASONS = [
    * it, so there is nothing to start or restart (health is re-checked automatically).
    */
   "always_on_runtime",
+  /**
+   * A multi-node instance needs one dist port inside every node's port range; these nodes'
+   * ranges have none in common (the message names them).
+   */
+  "fabric_port_ranges_disjoint",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);
