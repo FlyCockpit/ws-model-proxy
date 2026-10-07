@@ -23,12 +23,14 @@ integration("target recovery (PostgreSQL)", () => {
   const suffix = randomUUID().slice(0, 8);
   const userId = `tr-${suffix}`;
   const nodeId = `trnode${suffix}`;
-  const targets: Record<"chat" | "override" | "embeddings" | "transcription", string> = {
-    chat: "",
-    override: "",
-    embeddings: "",
-    transcription: "",
-  };
+  const targets: Record<"chat" | "declared" | "override" | "embeddings" | "transcription", string> =
+    {
+      chat: "",
+      declared: "",
+      override: "",
+      embeddings: "",
+      transcription: "",
+    };
 
   beforeAll(async () => {
     process.env.DATABASE_URL = databaseUrl;
@@ -52,6 +54,8 @@ integration("target recovery (PostgreSQL)", () => {
     // An always-on wrap per model type (the shape always-on.ts writes).
     const models = [
       { key: "chat", type: "LLM", detected: ["TEXT_GENERATION"], override: null },
+      // Listed in the spec without capabilities: none stored.
+      { key: "declared", type: "LLM", detected: [], override: null },
       { key: "override", type: "LLM", detected: [], override: ["TEXT_GENERATION"] },
       { key: "embeddings", type: "EMBEDDINGS", detected: ["EMBEDDING"], override: null },
       { key: "transcription", type: "TRANSCRIPTION", detected: ["AUDIO_INPUT"], override: null },
@@ -152,6 +156,7 @@ integration("target recovery (PostgreSQL)", () => {
       type: "LLM",
     });
     expect(byId.get(targets.override)?.type).toBe("LLM");
+    expect(byId.get(targets.declared)?.type).toBe("LLM");
     expect(byId.get(targets.embeddings)?.type).toBe("EMBEDDINGS");
     // No safe probe for transcription.
     expect(byId.has(targets.transcription)).toBe(false);
@@ -187,7 +192,7 @@ integration("target recovery (PostgreSQL)", () => {
       const settled = await fixture.executionTarget.count({
         where: { id: { in: [targets.chat, targets.embeddings] }, health: { not: "HALF_OPEN" } },
       });
-      if (probed.length >= 3 && settled === 2) break;
+      if (probed.length >= 4 && settled === 2) break;
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     scheduler.stop();
@@ -202,6 +207,7 @@ integration("target recovery (PostgreSQL)", () => {
       nextRetryAt: null,
     });
     expect(health.get(targets.override)?.health).toBe("HEALTHY");
+    expect(health.get(targets.declared)?.health).toBe("HEALTHY");
     // A failed probe of a half-open trial: unhealthy, with a later retry.
     expect(health.get(targets.embeddings)?.health).toBe("UNHEALTHY");
     expect(health.get(targets.transcription)?.health).toBe("DEGRADED");
