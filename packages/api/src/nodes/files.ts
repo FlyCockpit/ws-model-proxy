@@ -137,6 +137,7 @@ function mapReadInput(input: ReadInput): Mapped {
   const fields = {
     offset: input.offset,
     limit: input.limit,
+    byteOffset: input.byteOffset,
     pattern: input.pattern,
     ifNoneMatch: input.ifNoneMatch,
   };
@@ -146,9 +147,10 @@ function mapReadInput(input: ReadInput): Mapped {
         path: input.path,
         startLine: input.offset,
         maxLines: input.limit,
+        byteOffset: input.byteOffset,
         ifNoneMatch: input.ifNoneMatch,
       });
-      onlyFor("read", args, fields, ["offset", "limit", "ifNoneMatch"]);
+      onlyFor("read", args, fields, ["offset", "limit", "byteOffset", "ifNoneMatch"]);
       return { op: "read", args };
     }
     case "stat": {

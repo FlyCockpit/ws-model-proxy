@@ -166,9 +166,17 @@ secret files.
   `features.files.roots`; a refused path's error lists them too. wsmp's own
   config, credentials, secrets, runtime stores, state directory, service unit
   and binary are off limits (writes) or read-only (config).
+- **Reads paginate.** A read returns at most 400 lines and 32 KiB at a time
+  (`limit` up to 2,000 lines), never `too_large`. When the file goes on, the
+  result has `more: {startLine, byteOffset?}`: call again with
+  `offset: more.startLine` (and `byteOffset: more.byteOffset` when a single long
+  line was cut). A 2 MiB text file is read in pages this way.
 - **Writes.** `node_file_write` without `ifMatch` only creates a new file; with
   `ifMatch` it replaces exactly the version you read. `node_file_edit`
-  requires `ifMatch`. Content is at most 1 MiB (UTF-8 text or base64).
+  requires `ifMatch`. Content is at most 1 MiB (UTF-8 text or base64, measured
+  decoded); a larger write is refused with `too_large`. The MCP request body is capped
+  at 1 MiB as well, so the largest write that fits is a little under 1 MiB of
+  text (about 750 KiB as base64).
 - **Errors.** `data.reason` carries the file error code (`path_denied`,
   `conflict` with the current etag, `exists`, `not_found`, `too_large`, ...).
   An `outcome: "unknown"` means the change may or may not have happened: stat

@@ -131,6 +131,12 @@ describe("nodes.files.read", () => {
       op: "read",
       args: { path: "/srv/a", startLine: -20, maxLines: 50, ifNoneMatch: ETAG },
     });
+    // The next page inside a long line: `more.startLine` and `more.byteOffset`.
+    await read({ nodeId: "node-1", path: "/srv/a", offset: 400, byteOffset: 32_768 });
+    expect(lastRun(files)).toMatchObject({
+      op: "read",
+      args: { path: "/srv/a", startLine: 400, byteOffset: 32_768 },
+    });
     await read({ nodeId: "node-1", path: "/srv/a", op: "stat" });
     expect(lastRun(files)).toMatchObject({
       op: "stat",

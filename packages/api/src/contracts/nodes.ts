@@ -337,6 +337,8 @@ export const nodeFileReadInputSchema = z
     /** read: first line (negative counts from the end); list: depth. */
     offset: z.number().int().min(-1_000_000).optional(),
     limit: z.number().int().min(1).max(2_000).optional(),
+    /** read: continue inside a long line (`more.byteOffset`, with `offset: more.startLine`). */
+    byteOffset: z.number().int().min(0).optional(),
     /** search: the pattern; list: a glob. */
     pattern: z.string().min(1).max(1_024).optional(),
     ifNoneMatch: z.string().min(1).max(64).optional(),
