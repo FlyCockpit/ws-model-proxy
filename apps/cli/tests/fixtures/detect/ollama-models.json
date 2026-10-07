@@ -1,0 +1,7 @@
+{
+  "object": "list",
+  "data": [
+    { "id": "gpt-oss:20b", "object": "model", "created": 1759700000, "owned_by": "library" },
+    { "id": "qwen3-embedding:8b", "object": "model", "created": 1759600000, "owned_by": "library" }
+  ]
+}

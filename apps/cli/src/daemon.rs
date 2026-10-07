@@ -13,7 +13,8 @@
 //! node's own (`crate::trust`): lowered by `trust.lower`, `wsmp trust relay`
 //! or a hand edit (hot reload), raised only by `wsmp trust full`.
 //!
-//! Not implemented yet: `runtime.detect` answers an empty scan.
+//! `runtime.detect` scans loopback ports off this loop
+//! (`crate::runtimes::detect`).
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
@@ -1453,15 +1454,13 @@ where
             }
         }
         ServerFrame::RuntimeDetect { id } => {
-            send_control(
-                socket,
-                &NodeFrame::RuntimeDetected {
-                    id: Some(id),
-                    scanned_at: crate::telemetry::now_rfc3339(),
-                    servers: Vec::new(),
-                },
-                "answering a detection scan",
-            )?;
+            // Off this loop: a scan takes seconds. Ports the node's own
+            // instances hold are runtimes already, not discoveries.
+            crate::runtimes::detect::spawn(
+                session.worker_tx.clone(),
+                id,
+                session.runtimes.busy_ports().into_keys().collect(),
+            );
         }
         ServerFrame::RuntimeInventoryOk { snapshot_id } => {
             tracing::debug!(snapshot_id, "runtime inventory acknowledged");
