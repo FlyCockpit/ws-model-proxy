@@ -46,3 +46,27 @@ export function testDispatch(
     credential,
   };
 }
+
+/** A verified OAuth dispatch; `levelReadAt` defaults to now (`performance.now()`). */
+export function testOAuthDispatch(
+  level: McpLevel,
+  options: { grantId?: string; levelReadAt?: number } = {},
+): McpToolDispatch {
+  const credential = {
+    kind: "oauth" as const,
+    grantId: options.grantId ?? "grant-1",
+    level,
+    levelReadAt: options.levelReadAt ?? performance.now(),
+  };
+  return {
+    orpcContext: createMcpContext({
+      user: TEST_USER,
+      credential,
+      expiresAt: new Date("2030-01-01T00:00:00Z"),
+      now: new Date("2026-10-06T00:00:00Z"),
+      services: undefined,
+    }),
+    requestId: "req-test",
+    credential,
+  };
+}

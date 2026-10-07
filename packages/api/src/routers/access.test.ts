@@ -180,6 +180,14 @@ describe("only a person may mint credentials or grant access", () => {
     ["agentTokens.revoke", (c) => c.agentTokens.revoke({ agentTokenId: "tok1" })],
     ["oauthGrants.revoke", (c) => c.oauthGrants.revoke({ grantId: "g" })],
     [
+      "oauthGrants.setLevel (raise)",
+      (c) => c.oauthGrants.setLevel({ grantId: "g", level: "FULL" }),
+    ],
+    [
+      "oauthGrants.setLevel (lower)",
+      (c) => c.oauthGrants.setLevel({ grantId: "g", level: "READ" }),
+    ],
+    [
       "shares.create",
       (c) =>
         c.shares.create({
@@ -206,6 +214,7 @@ describe("only a person may mint credentials or grant access", () => {
         expect(db.apiKey.create).not.toHaveBeenCalled();
         expect(db.agentToken.create).not.toHaveBeenCalled();
         expect(db.mcpGrant.create).not.toHaveBeenCalled();
+        expect(db.mcpGrant.updateMany).not.toHaveBeenCalled();
         expect(db.share.create).not.toHaveBeenCalled();
         expect(db.shareInvite.create).not.toHaveBeenCalled();
       });
@@ -397,6 +406,163 @@ describe("OAuth connections", () => {
       userId: "owner",
     });
     expect(db.mcpGrant.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("OAuth connection level", () => {
+  function grantRow(level: "READ" | "FULL", clientId = "https://client.example.com/meta") {
+    db.mcpGrant.findFirst.mockResolvedValue({
+      id: "g1",
+      clientId,
+      referenceId: "ref1",
+      level,
+    } as never);
+  }
+  function writeApproved(clientId = "https://client.example.com/meta") {
+    db.oauthConsent.findMany.mockResolvedValue([{ clientId, referenceId: "ref1" }] as never);
+  }
+
+  it("refuses Full for a connection whose approval did not include mcp:write", async () => {
+    grantRow("READ");
+    db.oauthConsent.findMany.mockResolvedValue([]);
+    await expect(
+      client().oauthGrants.setLevel({ grantId: "g1", level: "FULL" }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.oauthConsent.findMany.mock.calls[0]?.[0]?.where).toEqual({
+      userId: "owner",
+      clientId: { in: ["https://client.example.com/meta"] },
+      scopes: { has: "mcp:write" },
+    });
+    expect(db.mcpGrant.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("lists whether Full can apply to each connection", async () => {
+    db.mcpGrant.findMany.mockResolvedValue([
+      {
+        id: "g1",
+        clientId: "c1",
+        referenceId: "ref1",
+        level: "READ",
+        createdAt: now,
+        revokedAt: null,
+      },
+      {
+        id: "g2",
+        clientId: "c1",
+        referenceId: "ref2",
+        level: "READ",
+        createdAt: now,
+        revokedAt: null,
+      },
+    ] as never);
+    db.oauthClient.findMany.mockResolvedValue([]);
+    writeApproved("c1");
+    const { connections } = await client().oauthGrants.list();
+    expect(connections.map((row) => [row.grantId, row.fullAvailable])).toEqual([
+      ["g1", true],
+      ["g2", false],
+    ]);
+  });
+
+  it("lowers Full to Read-only conditionally, audits it as the person, then ends Full work", async () => {
+    grantRow("FULL");
+    db.mcpGrant.updateMany.mockResolvedValue({ count: 1 });
+    const lowered = vi.fn(async () => undefined);
+    const result = await client(PERSON, { onAccessLevelLowered: lowered }).oauthGrants.setLevel({
+      grantId: "g1",
+      level: "READ",
+    });
+    expect(result).toEqual({ level: "READ" });
+    expect(db.mcpGrant.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      id: "g1",
+      userId: "owner",
+      revokedAt: null,
+    });
+    // Conditional on the level read: a concurrent change is never overwritten silently.
+    expect(db.mcpGrant.updateMany.mock.calls[0]?.[0]).toEqual({
+      where: { id: "g1", userId: "owner", revokedAt: null, level: "FULL" },
+      data: { level: "READ" },
+    });
+    expect(db.auditEvent.create.mock.calls[0]?.[0]?.data).toMatchObject({
+      userId: "owner",
+      actor: "USER",
+      actorUserId: "owner",
+      action: "mcp_grant.level",
+      resourceType: "mcp_grant",
+      resourceId: "g1",
+      before: { level: "FULL" },
+      after: { level: "READ" },
+    });
+    expect(db.auditEvent.create.mock.calls[0]?.[0]?.data).not.toHaveProperty("mcpGrantId");
+    expect(lowered).toHaveBeenCalledWith({ kind: "oauth_grant", userId: "owner", grantId: "g1" });
+  });
+
+  it("raises Read-only to Full without ending anything (it applies from the next call)", async () => {
+    grantRow("READ");
+    writeApproved();
+    db.mcpGrant.updateMany.mockResolvedValue({ count: 1 });
+    const lowered = vi.fn(async () => undefined);
+    const result = await client(PERSON, { onAccessLevelLowered: lowered }).oauthGrants.setLevel({
+      grantId: "g1",
+      level: "FULL",
+    });
+    expect(result).toEqual({ level: "FULL" });
+    expect(db.mcpGrant.updateMany.mock.calls[0]?.[0]?.data).toEqual({ level: "FULL" });
+    expect(db.auditEvent.create).toHaveBeenCalledTimes(1);
+    expect(lowered).not.toHaveBeenCalled();
+  });
+
+  it("writes and audits nothing when the level is unchanged", async () => {
+    grantRow("READ");
+    const lowered = vi.fn(async () => undefined);
+    await client(PERSON, { onAccessLevelLowered: lowered }).oauthGrants.setLevel({
+      grantId: "g1",
+      level: "READ",
+    });
+    expect(db.mcpGrant.updateMany).not.toHaveBeenCalled();
+    expect(db.auditEvent.create).not.toHaveBeenCalled();
+    expect(lowered).not.toHaveBeenCalled();
+  });
+
+  it("refuses an agent token's grant, a revoked one and another person's alike", async () => {
+    grantRow("FULL", "pat:tok1");
+    await expect(
+      client().oauthGrants.setLevel({ grantId: "g1", level: "READ" }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    db.mcpGrant.findFirst.mockResolvedValue(null);
+    await expect(
+      client().oauthGrants.setLevel({ grantId: "theirs", level: "FULL" }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.mcpGrant.updateMany).not.toHaveBeenCalled();
+    expect(db.auditEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("reports a concurrent change (revoked or re-levelled meanwhile) instead of writing over it", async () => {
+    grantRow("FULL");
+    db.mcpGrant.updateMany.mockResolvedValue({ count: 0 });
+    const lowered = vi.fn(async () => undefined);
+    await expect(
+      client(PERSON, { onAccessLevelLowered: lowered }).oauthGrants.setLevel({
+        grantId: "g1",
+        level: "READ",
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(db.auditEvent.create).not.toHaveBeenCalled();
+    expect(lowered).not.toHaveBeenCalled();
+  });
+
+  it("keeps a committed lowering even when ending the Full work fails", async () => {
+    grantRow("FULL");
+    db.mcpGrant.updateMany.mockResolvedValue({ count: 1 });
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const result = await client(PERSON, {
+      onAccessLevelLowered: async () => {
+        throw new Error("relay down");
+      },
+    }).oauthGrants.setLevel({ grantId: "g1", level: "READ" });
+    expect(result).toEqual({ level: "READ" });
+    expect(errors).toHaveBeenCalled();
+    errors.mockRestore();
   });
 });
 

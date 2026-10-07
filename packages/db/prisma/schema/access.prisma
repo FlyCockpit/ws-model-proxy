@@ -48,7 +48,8 @@ model McpGrant {
   userId      String
   clientId    String
   referenceId String
-  /// READ or FULL (OAuth `mcp:read` / `mcp:write`). OAuth clients may be FULL.
+  /// READ or FULL, the person's choice (consent page, Access → Agents). An OAuth request is
+  /// FULL only while this is FULL and its token carries `mcp:write`.
   level       AgentLevel @default(READ)
   revokedAt   DateTime?
 

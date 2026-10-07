@@ -29,7 +29,16 @@ export type McpLevel = "READ" | "FULL";
 /** How a request was admitted (never inferred from a client id). */
 export type McpRequestCredential =
   | { kind: "agent_token"; tokenId: string; level: McpLevel; expiresAt: Date | null }
-  | { kind: "oauth"; grantId: string; level: McpLevel };
+  | {
+      kind: "oauth";
+      grantId: string;
+      level: McpLevel;
+      /**
+       * `performance.now()` taken just before the grant (and so `level`) was read. A grant
+       * lowered after it may still have been read as FULL (mcp/tools.ts aborts its writes).
+       */
+      levelReadAt: number;
+    };
 
 /** The agent `CallerAuth` of a verified MCP credential. */
 export type McpCallerAuth = Extract<CallerAuth, { kind: "agent_token" | "oauth_access_token" }>;

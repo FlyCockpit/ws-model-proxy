@@ -15,6 +15,7 @@ import {
   MCP_REFRESH_RETRY_WINDOW_SECONDS,
   MCP_SCOPES,
 } from "./mcp-config";
+import { mcpConsentLevel } from "./mcp-consent-level";
 import { createMcpPostLoginOptions, issueMcpGrantClaims } from "./mcp-grant";
 
 /**
@@ -153,6 +154,10 @@ export function resolveMcpPlugins({ enabled, baseUrl }: { enabled: boolean; base
         },
       ],
     }),
+    // The consent page's Read-only/Full choice, recorded on the grant the approval's code
+    // exchanges into (mcp-consent-level.ts). After mcp(): the provider's before hook verifies
+    // the signed oauth_query first.
+    mcpConsentLevel({ secret: env.BETTER_AUTH_SECRET }),
     cimd({
       // Upstream hardened Node transport: resolve-once DNS validation,
       // public-routable address checks, connection pinning, TLS hostname

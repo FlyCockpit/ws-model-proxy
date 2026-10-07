@@ -24,8 +24,9 @@ requests and metrics.
   FULL credentials see all 27. A FULL tool called with a READ credential answers
   exactly like an unknown tool. Even Full cannot touch sharing, API keys,
   agent tokens, provider accounts, enrollment, hold lines or node trust; those
-  stay with people. Today only agent tokens can be Full: OAuth connections are
-  Read-only (see [Scopes](#scopes)).
+  stay with people. An agent token's level is chosen when it is created; an
+  OAuth connection's level is chosen by the person on the consent page and can
+  be changed in Access → Agents (see [Scopes](#scopes)).
 - **Node trust.** Commands, files, secrets, metric commands and definition
   changes need a node at Full control. A Relay-only node relays inference for
   the definitions it held when it entered Relay only; agents cannot start,
@@ -347,10 +348,47 @@ Three scopes exist: `mcp:read`, `mcp:write`, and `offline_access`.
   to Better Auth unchanged for client/redirect validation.
 
 An OAuth request's level is FULL only when its grant is Full and the access
-token carries `mcp:write`; otherwise it is READ. Grants are created Read-only
-and the consent page does not offer Full yet, so OAuth connections are
-Read-only today; an agent needing Full uses a Full agent token. An agent
-token's level is the one it was created with.
+token carries `mcp:write`; otherwise it is READ. A client can therefore ask for
+less than the person allowed (omit `mcp:write`), never for more. The grant's
+level is the person's choice:
+
+- **Consent page.** When the client asks for `mcp:write`, the page offers
+  Read-only or Full, starting at Read-only (the agent token dialog's default)
+  and explaining Full in the dialog's words. A request without `mcp:write` is
+  approved Read-only and the page says so. The choice travels as the `level`
+  field of the person's `POST /api/auth/oauth2/consent` body (a cookie session
+  behind Better Auth's origin check, pinned by the signed `oauth_query`); a
+  missing `level` means Read-only. No authorize parameter, scope or signed-query
+  value is ever read as a level, so a client cannot pick Full. `FULL` without
+  `mcp:write` among the approved scopes, or any other value, is refused (400)
+  before a code is issued. When the approval issues a code, the level is
+  recorded on the exact grant generation the code exchanges into before the
+  response reaches the browser; if it cannot be recorded, the code is withheld
+  (500) and the remembered approval is forgotten, so the next authorize asks
+  again. A concurrent change to the same grant is retried on the fresh row.
+- **Access → Agents.** A person changes a connection between Read-only and
+  Full (`access.oauthGrants.setLevel`, a human procedure: cookie session with a
+  verified CSRF header; agents and MCP tokens are refused). Raising asks for
+  confirmation, showing what Full allows. Full is offered (and accepted) only
+  for a connection whose remembered approval includes `mcp:write`
+  (`fullAvailable` in the list); otherwise the page says the agent must
+  reconnect asking for `mcp:write`.
+
+Lowering to Read-only (in Access → Agents, or by choosing Read-only when the
+person approves the client again) takes effect at once: the next `/mcp`
+request and every node admission read the grant and see READ; the grant's
+in-flight write tool calls are aborted (read calls finish), and so is a write
+call whose request read the level just before the lowering; its running node
+commands and file ops are cancelled and the commands it queued for a person
+expire (`credential_lowered`). Nothing caches a grant's level, so there is no
+cached admission to drop. Runtime operations the grant already started (start,
+stop, restart) are not undone, as with a revocation. Raising takes effect on
+the next call. Every level
+write is audited (`audit_event`, actor USER, resource `mcp_grant`:
+`mcp_grant.consent` for the consent page, `mcp_grant.level` for Access →
+Agents, with the level before and after).
+
+An agent token's level is the one it was created with.
 
 ## Login, consent, and scope step-up
 
@@ -364,14 +402,19 @@ The authorization flow uses Better Auth's signed OAuth transaction
   page offers "Sign in again to reauthorize": signing out (preserving the
   signed query) and signing in again creates a new session-derived grant
   generation that requires fresh consent.
-- `/{lang}/mcp-consent` — the consent page. It shows the requesting client
-  and the requested scopes, with Authorize and Deny. First use always prompts;
+- `/{lang}/mcp-consent` — the consent page. It shows the requesting client,
+  the requested scopes and the access level (Read-only or Full, see
+  [Scopes](#scopes)), with Authorize and Deny. The level is part of what the
+  person approves. First use always prompts;
   expanded scopes (for example stepping up from `mcp:read` to `mcp:write`)
-  prompt again for the full requested set. A remembered consent is reused only when the
+  prompt again for the full requested set, and the level chosen on that prompt
+  replaces the grant's level. A remembered consent is reused only when the
   client, the user, the session-derived reference, the requested scopes
   (every requested scope must be inside the remembered set), and the requested
   resources all match the stored consent row — and an explicit `prompt=consent`
-  overrides reuse and forces the page. Denial is honored: the consent endpoint
+  overrides reuse and forces the page (whose choice again replaces the level).
+  A reused consent never changes the level: re-authorization keeps the level
+  the person last chose on the page or in Access → Agents. Denial is honored: the consent endpoint
   answers HTTP 200 `{redirect: true, url}` pointing at the validated callback
   with `error=access_denied` — no code and no grant are minted. The page
   explains `offline_access` (background renewal, 72-hour inactivity expiry,
@@ -404,8 +447,9 @@ Every OAuth access JWT carries a private `mcp_grant_id` claim bound to an
 application-owned `McpGrant` generation keyed by
 `(userId, clientId, referenceId)`, where the reference is an HMAC of the
 consenting session and the validated client. Each grant records a level
-(Read-only for every grant created today). On every `/mcp` request the exact grant is loaded and
-must be active:
+(the person's choice on the consent page, created when the approval issues its
+code; Read-only for a grant created without the page). On every `/mcp` request
+the exact grant is loaded and must be active:
 
 - **Disconnecting** a connection (Access → Agents, `access.oauthGrants.revoke`)
   tombstones the grant, marks the client's refresh and access token rows for
@@ -432,7 +476,8 @@ must be active:
 ## Agent tokens and connections
 
 Access → Agents shows the MCP URL, the OAuth connections (client name, redirect
-host, level) with a Disconnect action, and agent tokens.
+host, level) with a Read-only / Full control and a Disconnect action, and agent
+tokens.
 
 An **agent token** (`wsmp_agent_…`) is for a headless client; send it as
 `Authorization: Bearer <token>` to `/mcp`. A person creates it in the browser
@@ -759,14 +804,16 @@ Operator procedure, not a unit test. Run against a deployment that leaves
 3. Login with 2FA.
 4. Consent including `offline_access`.
 5. Read — a read tool succeeds.
-6. Read-only write denial / step-up — a Read-only connection lists only the
-   read tools and a write tool answers as unknown, even with `mcp:write`.
-   Repeat the write with a Full agent token.
+6. Read-only write denial / step-up — a connection approved Read-only lists
+   only the read tools and a write tool answers as unknown, even with
+   `mcp:write`. Raise it to Full in Access → Agents (or re-authorize with
+   `prompt=consent` and choose Full) and repeat the write; lower it again and
+   the next write answers as unknown.
 7. Confirmation denial / success (Full agent token) — a delete without
    `confirm`, then with `confirm: "DELETE"`.
 8. Refresh rotation and retry — tokens rotate; a retried refresh within the
    window returns the cached response.
-9. Access → Agents connection listing / disconnect.
+9. Access → Agents connection listing, level change / disconnect.
 10. Post-revoke refresh, both branches — ORDER MATTERS: within the
     30-second window, first retry the **rotated ancestor** (it returns the
     cached pair whose access token gets 403 at `/mcp` — cached delivery, not

@@ -23,7 +23,7 @@ and `/llms.txt` (the locale root); auth and MCP routes are intentionally exclude
 | `/{lang}/signup` | Sign up. The first account becomes admin; later accounts follow the sign-up setting. |
 | `/{lang}/verify-email` | Verify email (only when SMTP is configured). |
 | `/{lang}/mcp-login` | Agent sign-in for OAuth (feature-gated by `WMP_MCP_ENABLED`; not in SEO). |
-| `/{lang}/mcp-consent` | Agent consent: Read-only (default) or Full, what Full allows (commands and files on Full-control nodes), and the client's redirect host (feature-gated; not in SEO). |
+| `/{lang}/mcp-consent` | Agent consent: Read-only (default) or Full (offered when the agent asks for `mcp:write`), what Full allows (commands and files on Full-control nodes), and the client's redirect host (feature-gated; not in SEO). |
 
 ## Authenticated Routes
 
@@ -56,7 +56,7 @@ All require an active session (`_auth` layout).
 | `/{lang}/providers/{accountId}` | Key (replace/revoke), models (enable, type, pricing), monthly cap, data collection, usage. |
 | `/{lang}/access` | Redirects to `/{lang}/access/api-keys`. |
 | `/{lang}/access/api-keys` | API keys (all pools or selected pools), expiry, base URL and example. |
-| `/{lang}/access/agents` | MCP URL, OAuth connections (level), agent tokens (Read-only / Full, expiry). |
+| `/{lang}/access/agents` | MCP URL, OAuth connections (level: change Read-only / Full, disconnect), agent tokens (Read-only / Full, expiry). |
 | `/{lang}/access/shares` | Shares you made and shares you received; your own-key choice for shared pools. |
 | `/{lang}/access/contributions` | Pools you may contribute to (add a served model), what you contribute, runtime definitions shared with you (fork). |
 | `/{lang}/activity` | Metrics explorer: scope (pool / runtime / version / node), metric, range and step, compare versions. |

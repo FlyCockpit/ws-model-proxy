@@ -47,6 +47,7 @@ describe("auth locale key parity (en-US / es-MX)", () => {
           "unknownClient",
           "scopesTitle",
           "noScopes",
+          "readOnlyRequested",
           "accept",
           "deny",
           "submitting",

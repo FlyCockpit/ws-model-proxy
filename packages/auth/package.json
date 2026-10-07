@@ -35,6 +35,9 @@
     "./mcp-grant": {
       "default": "./src/mcp-grant.ts"
     },
+    "./mcp-grant-level": {
+      "default": "./src/mcp-grant-level.ts"
+    },
     "./user-deletion-listeners": {
       "default": "./src/user-deletion-listeners.ts"
     },

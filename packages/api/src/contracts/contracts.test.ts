@@ -121,6 +121,7 @@ const INVENTORY = [
   "access.agentTokens.revoke",
   "access.oauthGrants.list",
   "access.oauthGrants.revoke",
+  "access.oauthGrants.setLevel",
   "access.shares.list",
   "access.shares.create",
   "access.shares.update",

@@ -680,6 +680,7 @@ const EXEMPT: Readonly<Record<string, Exemption>> = {
   "access.agentTokens.revoke": ACCESS,
   "access.oauthGrants.list": ACCESS,
   "access.oauthGrants.revoke": ACCESS,
+  "access.oauthGrants.setLevel": ACCESS,
   "access.shares.list": ACCESS,
   "access.shares.create": ACCESS,
   "access.shares.update": ACCESS,

@@ -7,7 +7,9 @@ vi.mock("@ws-model-proxy/db", () => ({ default: db }));
 const files = vi.hoisted(() => ({ cancelFileOpsForToken: vi.fn() }));
 vi.mock("./relay/node-file-ops.js", () => files);
 
-const { endAgentWork, handleAccessRevoked } = await import("./access-revocation.js");
+const { endAgentWork, handleAccessLevelLowered, handleAccessRevoked } = await import(
+  "./access-revocation.js"
+);
 
 function deps() {
   return {
@@ -76,5 +78,34 @@ describe("endAgentWork", () => {
         outcome: "credential_revoked",
       }),
     });
+  });
+});
+
+describe("handleAccessLevelLowered", () => {
+  it("ends only the grant's Full work: write tool calls, node work, queued commands", async () => {
+    const cancelMcpWriteToolCalls = vi.fn(() => 2);
+    const endWork = vi.fn(async () => undefined);
+    await handleAccessLevelLowered(
+      { kind: "oauth_grant", userId: "u", grantId: "g3" },
+      { cancelMcpWriteToolCalls, endAgentWork: endWork },
+    );
+    expect(cancelMcpWriteToolCalls).toHaveBeenCalledWith("g3");
+    expect(endWork).toHaveBeenCalledWith({
+      userId: "u",
+      credentialIds: ["g3"],
+      outcome: "credential_lowered",
+    });
+  });
+
+  it("records why the queued commands expired", async () => {
+    db.queuedNodeCommand.updateMany.mockClear();
+    files.cancelFileOpsForToken.mockClear();
+    await endAgentWork({ userId: "u", credentialIds: ["g3"], outcome: "credential_lowered" });
+    expect(files.cancelFileOpsForToken.mock.calls).toEqual([["g3"]]);
+    expect(db.queuedNodeCommand.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ state: "EXPIRED", outcome: "credential_lowered" }),
+      }),
+    );
   });
 });

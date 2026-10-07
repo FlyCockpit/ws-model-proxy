@@ -19,6 +19,11 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
+import {
+  type AgentLevel,
+  AgentLevelChoice,
+  DEFAULT_AGENT_LEVEL,
+} from "@/components/access/agent-level-choice";
 import { ConfirmAction } from "@/components/access/confirm-action";
 import {
   CredentialDatesList,
@@ -40,7 +45,6 @@ export const Route = createFileRoute("/$lang/_auth/_app/access/agents")({
   component: AccessAgentsPage,
 });
 
-type AgentLevel = "READ" | "FULL";
 type AgentTokenView = {
   id: string;
   name: string;
@@ -228,12 +232,14 @@ function OAuthRow({
     clientName: string | null;
     redirectHost: string | null;
     level: AgentLevel;
+    fullAvailable: boolean;
     createdAt: string;
   };
 }) {
   const { t } = useTranslation(["access"]);
   const queryClient = useQueryClient();
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [confirmFullOpen, setConfirmFullOpen] = useState(false);
   const name = connection.clientName ?? t("access:agents.unnamedClient");
   const revoke = useMutation(
     orpc.access.oauthGrants.revoke.mutationOptions({
@@ -244,6 +250,26 @@ function OAuthRow({
       },
     }),
   );
+  // A failure is toasted by the global mutation error handler; the list stays the truth.
+  const setLevel = useMutation(
+    orpc.access.oauthGrants.setLevel.mutationOptions({
+      onSuccess: async () => {
+        setConfirmFullOpen(false);
+        toast.success(t("access:agents.levelChanged"));
+      },
+      onSettled: () =>
+        queryClient.invalidateQueries({ queryKey: orpc.access.oauthGrants.list.key() }),
+    }),
+  );
+  const chooseLevel = (next: AgentLevel) => {
+    if (next === connection.level || setLevel.isPending) return;
+    // Raising gives the agent write access: say what Full allows first. Lowering is immediate.
+    if (next === "FULL") setConfirmFullOpen(true);
+    else setLevel.mutate({ grantId: connection.grantId, level: next });
+  };
+  // Without mcp:write in its approval the agent can never act at Full: nothing to raise to
+  // (a Full grant from before stays lowerable).
+  const levelLocked = !connection.fullAvailable && connection.level === "READ";
   return (
     <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <div className="min-w-0 space-y-1">
@@ -255,16 +281,35 @@ function OAuthRow({
           {connection.redirectHost ? `${connection.redirectHost} · ` : null}
           <TimeAgo value={connection.createdAt} />
         </p>
+        {levelLocked ? (
+          <p className="text-xs text-muted-foreground">{t("access:agents.fullUnavailable")}</p>
+        ) : null}
       </div>
-      <Button
-        type="button"
-        variant="outline"
-        size="touch"
-        className="self-start sm:self-center"
-        onClick={() => setConfirmOpen(true)}
-      >
-        {t("access:agents.disconnect")}
-      </Button>
+      <div className="flex min-w-0 flex-wrap items-center gap-2 self-start sm:self-center">
+        {levelLocked ? null : (
+          <SegmentedControl
+            value={connection.level}
+            onChange={chooseLevel}
+            ariaLabel={t("access:agents.levelFor", { name })}
+            items={[
+              { value: "READ", label: t("access:agents.levelRead") },
+              { value: "FULL", label: t("access:agents.levelFull") },
+            ]}
+          />
+        )}
+        <Button type="button" variant="outline" size="touch" onClick={() => setConfirmOpen(true)}>
+          {t("access:agents.disconnect")}
+        </Button>
+      </div>
+      <ConfirmAction
+        open={confirmFullOpen}
+        onOpenChange={setConfirmFullOpen}
+        title={t("access:agents.raiseTitle", { name })}
+        description={t("access:agents.levelFullHint")}
+        confirmLabel={t("access:agents.raiseConfirm")}
+        isPending={setLevel.isPending}
+        onConfirm={() => setLevel.mutate({ grantId: connection.grantId, level: "FULL" })}
+      />
       <ConfirmAction
         open={confirmOpen}
         onOpenChange={setConfirmOpen}
@@ -370,7 +415,7 @@ function CreateAgentTokenForm({
   const form = useForm({
     defaultValues: {
       name: "",
-      level: "READ" as AgentLevel,
+      level: DEFAULT_AGENT_LEVEL,
       expiry: "d90" as ExpiryChoice,
     },
     validators: { onSubmit: createSchema },
@@ -420,25 +465,7 @@ function CreateAgentTokenForm({
         )}
       </form.Field>
       <form.Field name="level">
-        {(field) => (
-          <div className="min-w-0 space-y-2">
-            <Label>{t("access:agents.level")}</Label>
-            <SegmentedControl
-              value={field.state.value}
-              onChange={field.handleChange}
-              ariaLabel={t("access:agents.level")}
-              items={[
-                { value: "READ", label: t("access:agents.levelRead") },
-                { value: "FULL", label: t("access:agents.levelFull") },
-              ]}
-            />
-            <p className="text-xs text-muted-foreground">
-              {field.state.value === "FULL"
-                ? t("access:agents.levelFullHint")
-                : t("access:agents.levelReadHint")}
-            </p>
-          </div>
-        )}
+        {(field) => <AgentLevelChoice value={field.state.value} onChange={field.handleChange} />}
       </form.Field>
       <form.Field name="expiry">
         {(field) => (

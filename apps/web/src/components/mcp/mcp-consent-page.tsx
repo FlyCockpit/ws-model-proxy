@@ -8,8 +8,13 @@ import {
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+  type AgentLevel,
+  AgentLevelChoice,
+  DEFAULT_AGENT_LEVEL,
+} from "@/components/access/agent-level-choice";
 import { useMcpConsentSubmit } from "@/hooks/use-mcp-consent-submit";
 import { authClient } from "@/lib/auth-client";
 import {
@@ -55,6 +60,9 @@ function McpConsentTransaction({ search }: { search: Record<string, unknown> }) 
   const info = useMemo(() => parseMcpOAuthSearch(search), [search]);
   const { t } = useTranslation(["auth", "common"]);
   const { phase, submit } = useMcpConsentSubmit();
+  // The person's choice only (never read from the URL the client built); the same default as
+  // the agent token dialog.
+  const [level, setLevel] = useState<AgentLevel>(DEFAULT_AGENT_LEVEL);
 
   const client = useQuery({
     queryKey: ["mcp-consent-client", info.clientId],
@@ -112,6 +120,9 @@ function McpConsentTransaction({ search }: { search: Record<string, unknown> }) 
   const clientInfo = client.data;
   const clientName = clientInfo?.name ?? clientInfo?.clientId ?? t("auth:mcpConsent.unknownClient");
   const scopeRows = explainableMcpScopes(info.scopes);
+  // Full is offered only when the agent asked to make changes (`mcp:write`): a token without
+  // it can never act at Full, and the server refuses Full for it.
+  const fullAvailable = info.scopes.includes("mcp:write");
 
   return (
     <div className="flex min-w-0 items-center justify-center px-4 py-10">
@@ -148,12 +159,22 @@ function McpConsentTransaction({ search }: { search: Record<string, unknown> }) 
                 ))
               )}
             </ul>
-            <p className="text-xs text-muted-foreground">{t("auth:mcpConsent.manageNote")}</p>
           </div>
+          {fullAvailable ? (
+            <AgentLevelChoice value={level} onChange={setLevel} />
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              {t("auth:mcpConsent.readOnlyRequested")}
+            </p>
+          )}
+          <p className="text-xs text-muted-foreground">{t("auth:mcpConsent.manageNote")}</p>
           <div className="space-y-2">
             {/* Submitting renders the skeleton above, so these are only
                 reachable in the review phase. */}
-            <Button className="min-h-[44px] w-full" onClick={() => void submit(true)}>
+            <Button
+              className="min-h-[44px] w-full"
+              onClick={() => void submit(true, fullAvailable ? level : DEFAULT_AGENT_LEVEL)}
+            >
               {t("auth:mcpConsent.accept")}
             </Button>
             <Button
