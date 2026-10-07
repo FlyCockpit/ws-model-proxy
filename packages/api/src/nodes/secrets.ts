@@ -105,6 +105,7 @@ export const secretProcedures = {
     const { userId, node, writeSecrets } = await secretTarget(context, input.nodeId);
     const [result] = await writeSecrets({
       nodeId: node.id,
+      userId,
       set: [{ name: input.name, value: input.value }],
       delete: [],
     });
@@ -115,7 +116,12 @@ export const secretProcedures = {
 
   delete: contractProcedure(c.secrets.delete).handler(async ({ context, input }) => {
     const { userId, node, writeSecrets } = await secretTarget(context, input.nodeId);
-    const [result] = await writeSecrets({ nodeId: node.id, set: [], delete: [input.name] });
+    const [result] = await writeSecrets({
+      nodeId: node.id,
+      userId,
+      set: [],
+      delete: [input.name],
+    });
     if (
       result?.name !== input.name ||
       (result.status !== "deleted" && result.status !== "not_found")

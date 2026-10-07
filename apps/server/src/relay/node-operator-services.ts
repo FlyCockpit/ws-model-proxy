@@ -32,6 +32,7 @@ import type {
   ServerToNodeControlFrame,
 } from "./frames.js";
 import type { NodeCommandTracker } from "./node-command-tracker.js";
+import { nodeOwnerMatches } from "./node-owner.js";
 import type { NodeFrameHandlers, NodeSessionRef, SendGuard } from "./session-manager.js";
 import type { TerminalTicketStore } from "./terminal-tickets.js";
 
@@ -55,7 +56,9 @@ export class NodeCommandStartError extends Error {
 
 export type NodeOperatorRelayPort = {
   sendToNode(nodeId: string, frame: ServerToNodeControlFrame, guard?: SendGuard): boolean;
-  nodeSession(nodeId: string): { connectionGeneration: number; trust: NodeTrustWire } | null;
+  nodeSession(
+    nodeId: string,
+  ): { userId: string; connectionGeneration: number; trust: NodeTrustWire } | null;
 };
 
 export type NodeOperatorHandlers = Pick<
@@ -134,7 +137,12 @@ export function createNodeOperatorServices(
   const startCommand: NodeOperatorServices["startCommand"] = (args) =>
     new Promise((resolve, reject) => {
       const session = relay.nodeSession(args.nodeId);
-      if (session?.trust !== "full" || pendingStarts.has(args.commandId)) {
+      if (
+        session?.trust !== "full" ||
+        pendingStarts.has(args.commandId) ||
+        // Defence in depth: the command's owner must own the node it runs on.
+        !nodeOwnerMatches(session, args.userId, "command")
+      ) {
         reject(new NodeCommandStartError("not_delivered"));
         return;
       }
@@ -171,7 +179,12 @@ export function createNodeOperatorServices(
           ...(args.cwd !== undefined ? { cwd: args.cwd } : {}),
           timeoutMs: args.timeoutMs,
         },
-        { connectionGeneration, requireFullTrust: true },
+        {
+          connectionGeneration,
+          requireFullTrust: true,
+          userId: args.userId,
+          ownerCheck: "command",
+        },
       );
       if (!sent) {
         tracker.forget(args.commandId, args.nodeId);
@@ -193,12 +206,17 @@ export function createNodeOperatorServices(
         });
       }
       const session = relay.nodeSession(args.nodeId);
-      if (!session) {
+      // Offline, or (defence in depth) a node of another owner: nothing is asked of it.
+      if (!session || !nodeOwnerMatches(session, args.userId, "command_poll")) {
         resolve(null);
         return;
       }
       const { connectionGeneration } = session;
-      const guard: SendGuard = { connectionGeneration };
+      const guard: SendGuard = {
+        connectionGeneration,
+        userId: args.userId,
+        ownerCheck: "command_poll",
+      };
       const poll = () =>
         relay.sendToNode(
           args.nodeId,
@@ -268,6 +286,10 @@ export function createNodeOperatorServices(
         data: { reason: "node_offline", subjectId: args.nodeId },
       });
     }
+    // Defence in depth: a ticket is only ever minted for a node of the caller's.
+    if (!nodeOwnerMatches(session, args.userId, "terminal_ticket")) {
+      throw new ORPCError("NOT_FOUND", { message: "That node does not exist." });
+    }
     if (session.trust !== "full") {
       throw new ORPCError("FORBIDDEN", {
         message: "Browser terminals need the node at Full control.",
@@ -308,11 +330,19 @@ export function createNodeOperatorServices(
         // A start that answered after its timeout: the row is already failed and a cancel
         // was asked for; the node registered it only now, so send the cancel again.
         const tracked = tracker.get(frame.commandId);
-        if (tracked?.nodeId === node.nodeId && tracked.cancelRequested)
+        if (
+          tracked?.nodeId === node.nodeId &&
+          tracked.userId === node.userId &&
+          tracked.cancelRequested
+        )
           relay.sendToNode(
             node.nodeId,
             { type: "exec.cancel", commandId: frame.commandId },
-            { connectionGeneration: node.connectionGeneration },
+            {
+              connectionGeneration: node.connectionGeneration,
+              userId: tracked.userId,
+              ownerCheck: "command_cancel",
+            },
           );
         return;
       }
@@ -326,7 +356,11 @@ export function createNodeOperatorServices(
         relay.sendToNode(
           node.nodeId,
           { type: "exec.cancel", commandId: frame.commandId },
-          { connectionGeneration: node.connectionGeneration },
+          {
+            connectionGeneration: node.connectionGeneration,
+            userId: entry.userId,
+            ownerCheck: "command_cancel",
+          },
         );
       }
       entry.resolve({ startedAt: new Date(frame.startedAt), endsBy });

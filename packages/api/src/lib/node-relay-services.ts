@@ -27,6 +27,8 @@ export type NodeRelayServices = {
    */
   writeSecrets?: (input: {
     nodeId: string;
+    /** The caller (the node's owner): the relay refuses a node of anyone else. */
+    userId: string;
     set: ReadonlyArray<{ name: string; value: string }>;
     delete: readonly string[];
   }) => Promise<NodeSecretWriteResult[]>;

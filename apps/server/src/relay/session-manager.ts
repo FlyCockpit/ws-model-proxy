@@ -84,6 +84,7 @@ import {
 import { type NodeAuditOutcome, recordNodeAuditEvent } from "./node-audit.js";
 import type { NodeIdentity } from "./node-credential-auth.js";
 import { observeNodeMetricsRollup } from "./node-metrics-rollup.js";
+import { type NodeOwnerCheck, nodeOwnerMatches } from "./node-owner.js";
 import {
   binaryFrameTarget,
   describeRelayControlParseError,
@@ -188,6 +189,8 @@ export type FileOpLossCause = "node_offline" | "trust_relay" | "no_roots";
 export type TrackedFileOp = {
   opId: string;
   nodeId: string;
+  /** The op's owner: it is sent only to a node of theirs. */
+  userId: string;
   op: FileOp;
   markResult(frame: FileResultFrame): void;
   markData(body: Uint8Array): void;
@@ -460,7 +463,17 @@ export type NodeFrameHandlers = {
 };
 
 /** Optional checks `sendToNode` makes against the live session before sending. */
-export type SendGuard = { connectionGeneration?: number; requireFullTrust?: boolean };
+export type SendGuard = {
+  connectionGeneration?: number;
+  requireFullTrust?: boolean;
+  /**
+   * The owner of what is sent (the command's, secret's, instance's or definitions' user): the
+   * live session must be a node of that user, or nothing is sent (`node-owner.ts`).
+   */
+  userId?: string;
+  /** The log class of an owner refusal (default `frame`). */
+  ownerCheck?: NodeOwnerCheck;
+};
 
 /** How recovery probes reach a node (injected: model-api's relay attempt). */
 export type RelayAttemptStarter = (input: {
@@ -763,6 +776,16 @@ export class RelaySessionManager {
     )
       return false;
     if (guard.requireFullTrust && session.trust !== "full") return false;
+    if (
+      // A guard that carries the key is checked even when its value is missing (refused then).
+      Object.hasOwn(guard, "userId") &&
+      !nodeOwnerMatches(
+        { userId: session.identity.userId },
+        guard.userId ?? "",
+        guard.ownerCheck ?? "frame",
+      )
+    )
+      return false;
     let encoded: string;
     try {
       encoded = encodeRelayServerControlMessage(frame);
@@ -780,14 +803,21 @@ export class RelaySessionManager {
     }
   }
 
-  /** The live registered session of a node: its generation and trust, or null when offline. */
-  nodeSession(
-    nodeId: string,
-  ): { connectionGeneration: number; trust: NodeTrustWire; operatorTerminals: boolean } | null {
+  /**
+   * The live registered session of a node: its owner (the session's user), generation and
+   * trust, or null when offline.
+   */
+  nodeSession(nodeId: string): {
+    userId: string;
+    connectionGeneration: number;
+    trust: NodeTrustWire;
+    operatorTerminals: boolean;
+  } | null {
     const session = this.sessionsByNodeId.get(nodeId);
     if (!session?.registered || !session.helloAcked || session.connectionGeneration === null)
       return null;
     return {
+      userId: session.identity.userId,
       connectionGeneration: session.connectionGeneration,
       trust: session.trust,
       operatorTerminals: this.operatorTerminalsAllowed(session),
@@ -1107,6 +1137,9 @@ export class RelaySessionManager {
     for (const session of this.sessionsByNodeId.values()) {
       const tracker = session.operatorSteps.get(stepId);
       if (!tracker || tracker.cancelled || tracker.userId !== userId) continue;
+      // The node holding the terminal is the step owner's (defence in depth).
+      if (!nodeOwnerMatches({ userId: session.identity.userId }, userId, "operator_attach"))
+        return null;
       if (!this.operatorTerminalsAllowed(session) || this.relayDrain) return null;
       const terminal = session.terminalsById.get(tracker.terminalId);
       if (!terminal?.operator || terminal.phase !== "open" || terminal.userId !== userId)
@@ -2651,7 +2684,9 @@ export class RelaySessionManager {
     viewerId?: string;
   }): boolean {
     const session = this.sessionsByNodeId.get(input.nodeId);
-    if (!session || session.identity.userId !== input.userId) return false;
+    if (!session) return false;
+    if (!nodeOwnerMatches({ userId: session.identity.userId }, input.userId, "terminal_open"))
+      return false;
     if (!this.canStartTerminal(session)) return false;
     if (this.hasTerminal(input.terminalId)) return false;
     const approvalRequired = session.features?.terminals.approvalRequired === true;
@@ -2835,6 +2870,8 @@ export class RelaySessionManager {
     const roots = session.features?.files.roots ?? null;
     if (session.trust !== "full" || roots === null || roots.length === 0) return false;
     if (session.filesById.has(op.opId)) return false;
+    // Defence in depth: a path or a file's content goes only to a node of the op's owner.
+    if (!nodeOwnerMatches({ userId: session.identity.userId }, op.userId, "file_op")) return false;
     const control = encodeRelayServerControlMessage(frame);
     const bodyFrame = body
       ? encodeRelayBinaryFrame({ type: "file.body", opId: op.opId }, body)
@@ -3288,6 +3325,9 @@ export class RelaySessionManager {
       const terminal = session.terminalsById.get(terminalId);
       if (!terminal) continue;
       if (terminal.userId !== userId) return null;
+      // The node holding the terminal is its owner's too (defence in depth).
+      if (!nodeOwnerMatches({ userId: session.identity.userId }, userId, "terminal_attach"))
+        return null;
       return { session, terminal };
     }
     return null;

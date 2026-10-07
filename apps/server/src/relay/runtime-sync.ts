@@ -37,6 +37,7 @@ import {
   type NodeTrustWire,
   type ServerToNodeControlFrame,
 } from "./frames.js";
+import { nodeOwnerMatches } from "./node-owner.js";
 import type { NodeFrameHandlers, NodeSessionRef, SendGuard } from "./session-manager.js";
 
 type DefineFrame = Extract<ServerToNodeControlFrame, { type: "runtime.define" }>;
@@ -286,7 +287,9 @@ export async function loadNodeDefinitionState(nodeId: string): Promise<NodeDefin
 
 export type RuntimeSyncRelay = {
   sendToNode(nodeId: string, frame: ServerToNodeControlFrame, guard?: SendGuard): boolean;
-  nodeSession(nodeId: string): { connectionGeneration: number; trust: NodeTrustWire } | null;
+  nodeSession(
+    nodeId: string,
+  ): { userId: string; connectionGeneration: number; trust: NodeTrustWire } | null;
   getOnlineNodeIds(): string[];
 };
 
@@ -398,7 +401,9 @@ export function createRuntimeSync(
       const state = await loadNodeDefinitionState(nodeId);
       // Replaced meanwhile (a new session took the slot): this operation is over.
       if (inFlight.get(nodeId) !== op) return answer;
-      if (!state?.fullControl) {
+      // The definitions are read under the node's owner (`loadNodeDefinitionState`); the live
+      // session must be that owner's node too (defence in depth).
+      if (!state?.fullControl || !nodeOwnerMatches(session, state.userId, "definition_sync")) {
         finish(nodeId, op, null);
         return answer;
       }
@@ -413,6 +418,8 @@ export function createRuntimeSync(
         const sent = relay.sendToNode(nodeId, frame, {
           connectionGeneration: op.connectionGeneration,
           requireFullTrust: true,
+          userId: state.userId,
+          ownerCheck: "definition_sync",
         });
         if (!sent) {
           finish(nodeId, op, null);

@@ -13,7 +13,7 @@ const { TerminalTicketStore } = await import("../relay/terminal-tickets.js");
 
 const db = prisma as unknown as {
   instanceStep: { findFirst: MockInstance };
-  node: { findFirst: MockInstance };
+  node: { findFirst: MockInstance; count: MockInstance };
 };
 
 const terminalId = Buffer.alloc(16, 3).toString("base64url");
@@ -54,6 +54,8 @@ describe("runtime step services", () => {
     tickets = new TerminalTicketStore();
     services = createRuntimeStepServices({ engine, relay, tickets });
     relay.operatorStepTerminal.mockReturnValue({ nodeId: "node-1", terminalId, state: "awaiting" });
+    // node-1 is user-1's.
+    db.node.count.mockResolvedValue(1);
   });
 
   it("mints a ticket bound to the step's live terminal, for this session only", async () => {
@@ -89,6 +91,14 @@ describe("runtime step services", () => {
     db.instanceStep.findFirst.mockResolvedValueOnce(row());
     relay.operatorStepTerminal.mockReturnValueOnce(null);
     expect(await services.attach(input)).toEqual({ ok: false, code: "terminal_unavailable" });
+    expect(tickets.size).toBe(0);
+  });
+
+  it("mints no ticket when the step's node is not the step owner's (defence in depth)", async () => {
+    db.instanceStep.findFirst.mockResolvedValue(row());
+    db.node.count.mockResolvedValueOnce(0);
+    expect(await services.attach(input)).toEqual({ ok: false, code: "terminal_unavailable" });
+    expect(db.node.count).toHaveBeenCalledWith({ where: { id: "node-1", userId: "user-1" } });
     expect(tickets.size).toBe(0);
   });
 

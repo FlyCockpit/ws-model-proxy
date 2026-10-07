@@ -7,7 +7,7 @@ const { createNodeRelayServices, SecretWriteError } = await import("./node-servi
 const { composeNodeFrameHandlers } = await import("./node-frame-handlers.js");
 
 import type { ServerToNodeControlFrame } from "./frames.js";
-import type { NodeSessionRef } from "./session-manager.js";
+import type { NodeSessionRef, SendGuard } from "./session-manager.js";
 
 const ref = (nodeId = "node-1"): NodeSessionRef => ({
   nodeId,
@@ -19,7 +19,8 @@ const ref = (nodeId = "node-1"): NodeSessionRef => ({
 
 function relay(deliver = true) {
   const sent: ServerToNodeControlFrame[] = [];
-  const session: { connectionGeneration: number; trust: "full" | "relay" } = {
+  const session: { userId: string; connectionGeneration: number; trust: "full" | "relay" } = {
+    userId: "user-1",
     connectionGeneration: 3,
     trust: "full",
   };
@@ -27,22 +28,17 @@ function relay(deliver = true) {
     sent,
     session,
     port: {
-      sendToNode: vi.fn(
-        (
-          _nodeId: string,
-          frame: ServerToNodeControlFrame,
-          guard?: { connectionGeneration?: number; requireFullTrust?: boolean },
-        ) => {
-          if (guard?.requireFullTrust && session.trust !== "full") return false;
-          if (
-            guard?.connectionGeneration !== undefined &&
-            guard.connectionGeneration !== session.connectionGeneration
-          )
-            return false;
-          sent.push(frame);
-          return deliver;
-        },
-      ),
+      sendToNode: vi.fn((_nodeId: string, frame: ServerToNodeControlFrame, guard?: SendGuard) => {
+        if (guard?.requireFullTrust && session.trust !== "full") return false;
+        if (guard?.userId !== undefined && guard.userId !== session.userId) return false;
+        if (
+          guard?.connectionGeneration !== undefined &&
+          guard.connectionGeneration !== session.connectionGeneration
+        )
+          return false;
+        sent.push(frame);
+        return deliver;
+      }),
       nodeSession: vi.fn(() => ({ ...session })),
       requestTrustLower: vi.fn(() => true),
       closeSessionsForNodes: vi.fn(async () => undefined),
@@ -61,6 +57,7 @@ describe("node relay services", () => {
     const { services, handlers } = createNodeRelayServices(r.port);
     const write = services.writeSecrets?.({
       nodeId: "node-1",
+      userId: "user-1",
       set: [{ name: "HF_TOKEN", value: "s3cret" }],
       delete: [],
     });
@@ -98,7 +95,12 @@ describe("node relay services", () => {
   it("sends deletes and passes refusals through", async () => {
     const r = relay();
     const { services, handlers } = createNodeRelayServices(r.port);
-    const write = services.writeSecrets?.({ nodeId: "node-1", set: [], delete: ["OLD"] });
+    const write = services.writeSecrets?.({
+      nodeId: "node-1",
+      userId: "user-1",
+      set: [],
+      delete: ["OLD"],
+    });
     await vi.waitFor(() => expect(r.sent).toHaveLength(1));
     expect(r.sent[0]).toMatchObject({ type: "secret.delete", name: "OLD" });
     await handlers["secret.result"]?.(ref(), {
@@ -116,6 +118,7 @@ describe("node relay services", () => {
     await expect(
       undelivered.services.writeSecrets?.({
         nodeId: "node-1",
+        userId: "user-1",
         set: [{ name: "A", value: "v" }],
         delete: [],
       }),
@@ -123,15 +126,70 @@ describe("node relay services", () => {
 
     const slow = createNodeRelayServices(relay().port, {}, { secretTimeoutMs: 5 });
     await expect(
-      slow.services.writeSecrets?.({ nodeId: "node-1", set: [], delete: ["A"] }),
+      slow.services.writeSecrets?.({ nodeId: "node-1", userId: "user-1", set: [], delete: ["A"] }),
     ).rejects.toMatchObject({ code: "no_answer" });
 
     const r = relay();
     const dropped = createNodeRelayServices(r.port);
-    const write = dropped.services.writeSecrets?.({ nodeId: "node-1", set: [], delete: ["A"] });
+    const write = dropped.services.writeSecrets?.({
+      nodeId: "node-1",
+      userId: "user-1",
+      set: [],
+      delete: ["A"],
+    });
     await vi.waitFor(() => expect(r.sent).toHaveLength(1));
     dropped.handlers.nodeDisconnected?.(ref());
     await expect(write).rejects.toMatchObject({ code: "disconnected" });
+  });
+
+  it("never sends a secret to a node of another owner (defence in depth)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const r = relay();
+      r.session.userId = "user-2";
+      const { services } = createNodeRelayServices(r.port);
+      for (const input of [
+        { set: [{ name: "A", value: "s3cret" }], delete: [] },
+        { set: [], delete: ["A"] },
+      ]) {
+        await expect(
+          services.writeSecrets?.({ nodeId: "node-1", userId: "user-1", ...input }),
+        ).rejects.toMatchObject({ code: "not_delivered" });
+      }
+      expect(r.sent).toHaveLength(0);
+      expect(r.port.sendToNode).not.toHaveBeenCalled();
+      // The class only: no id, name or value in the log.
+      expect(warn.mock.calls).toEqual([
+        ["[relay] refused a send to a node of another owner", "secret"],
+        ["[relay] refused a send to a node of another owner", "secret"],
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("pins every secret frame to the secret's owner", async () => {
+    const r = relay();
+    const { services, handlers } = createNodeRelayServices(r.port);
+    const write = services.writeSecrets?.({
+      nodeId: "node-1",
+      userId: "user-1",
+      set: [],
+      delete: ["A"],
+    });
+    await vi.waitFor(() => expect(r.sent).toHaveLength(1));
+    expect(r.port.sendToNode).toHaveBeenCalledWith(
+      "node-1",
+      expect.objectContaining({ type: "secret.delete" }),
+      expect.objectContaining({ userId: "user-1", requireFullTrust: true }),
+    );
+    await handlers["secret.result"]?.(ref(), {
+      type: "secret.result",
+      id: idOf(r.sent[0]),
+      name: "A",
+      status: "deleted",
+    });
+    expect(await write).toEqual([{ name: "A", status: "deleted" }]);
   });
 
   it("never sends a secret to a session that is no longer at Full control", async () => {
@@ -141,6 +199,7 @@ describe("node relay services", () => {
     expect(
       await services.writeSecrets?.({
         nodeId: "node-1",
+        userId: "user-1",
         set: [{ name: "A", value: "v" }],
         delete: [],
       }),
@@ -151,7 +210,12 @@ describe("node relay services", () => {
   it("ignores an earlier session's answer and disconnect", async () => {
     const r = relay();
     const { services, handlers } = createNodeRelayServices(r.port);
-    const write = services.writeSecrets?.({ nodeId: "node-1", set: [], delete: ["A"] });
+    const write = services.writeSecrets?.({
+      nodeId: "node-1",
+      userId: "user-1",
+      set: [],
+      delete: ["A"],
+    });
     await vi.waitFor(() => expect(r.sent).toHaveLength(1));
     const id = idOf(r.sent[0]);
     const old = { ...ref(), connectionGeneration: 2 };

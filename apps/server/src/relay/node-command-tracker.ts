@@ -91,17 +91,27 @@ export class NodeCommandTracker {
    */
   cancel(entry: { commandId: string; nodeId: string; userId: string; endsBy: number }): boolean {
     const tracked = this.byId.get(entry.commandId);
-    if (tracked && tracked.nodeId !== entry.nodeId) return false;
+    if (tracked && (tracked.nodeId !== entry.nodeId || tracked.userId !== entry.userId))
+      return false;
     if (tracked) tracked.cancelRequested = true;
     else this.byId.set(entry.commandId, { ...entry, cancelRequested: true });
-    return this.relay.sendToNode(entry.nodeId, { type: "exec.cancel", commandId: entry.commandId });
+    return this.relay.sendToNode(
+      entry.nodeId,
+      { type: "exec.cancel", commandId: entry.commandId },
+      // Only to a node of the command's owner.
+      { userId: entry.userId, ownerCheck: "command_cancel" },
+    );
   }
 
   /** A node session is ready: cancels it could not get before go out now. */
   nodeReady(nodeId: string): void {
     for (const entry of this.byId.values()) {
       if (entry.nodeId !== nodeId || !entry.cancelRequested) continue;
-      this.relay.sendToNode(nodeId, { type: "exec.cancel", commandId: entry.commandId });
+      this.relay.sendToNode(
+        nodeId,
+        { type: "exec.cancel", commandId: entry.commandId },
+        { userId: entry.userId, ownerCheck: "command_cancel" },
+      );
     }
   }
 

@@ -18,6 +18,7 @@ import type {
   NodeTrustWire,
   ServerToNodeControlFrame,
 } from "./frames.js";
+import { nodeOwnerMatches } from "./node-owner.js";
 import type { NodeFrameHandlers, NodeSessionRef, SendGuard } from "./session-manager.js";
 
 type NodeFrame<T extends NodeToServerControlFrame["type"]> = Extract<
@@ -37,7 +38,9 @@ export class SecretWriteError extends Error {
 
 type RelayPort = {
   sendToNode(nodeId: string, frame: ServerToNodeControlFrame, guard?: SendGuard): boolean;
-  nodeSession(nodeId: string): { connectionGeneration: number; trust: NodeTrustWire } | null;
+  nodeSession(
+    nodeId: string,
+  ): { userId: string; connectionGeneration: number; trust: NodeTrustWire } | null;
   requestTrustLower(nodeId: string, requestedAt: Date): boolean;
   closeSessionsForNodes(nodeIds: readonly string[]): Promise<void>;
 };
@@ -76,13 +79,16 @@ export function createNodeRelayServices(
   /** Sends one frame and waits for the `secret.result` with its id. */
   const exchange = (
     nodeId: string,
+    /** The secret's owner: the node must be theirs. */
+    userId: string,
     name: string,
     frame: (id: string) => ServerToNodeControlFrame,
   ): Promise<NodeSecretWriteResult> => {
     const id = `secret-${randomBytes(12).toString("hex")}`;
     return new Promise<NodeSecretWriteResult>((resolve, reject) => {
       const session = relay.nodeSession(nodeId);
-      if (!session) {
+      // Offline, or (defence in depth) a node of another owner: the value is never sent.
+      if (!session || !nodeOwnerMatches(session, userId, "secret")) {
         reject(new SecretWriteError("not_delivered"));
         return;
       }
@@ -99,7 +105,13 @@ export function createNodeRelayServices(
       pending.set(id, { nodeId, connectionGeneration, name, resolve, reject, timer });
       // Full control is re-checked on the live session: a lowering that landed after the
       // procedure's check wins, and the value is never sent.
-      if (!relay.sendToNode(nodeId, frame(id), { connectionGeneration, requireFullTrust: true })) {
+      const guard: SendGuard = {
+        connectionGeneration,
+        requireFullTrust: true,
+        userId,
+        ownerCheck: "secret",
+      };
+      if (!relay.sendToNode(nodeId, frame(id), guard)) {
         settle(id)?.reject(new SecretWriteError("not_delivered"));
       }
     });
@@ -109,7 +121,7 @@ export function createNodeRelayServices(
     const results: NodeSecretWriteResult[] = [];
     // One at a time (the node answers each); a refusal stops the rest.
     for (const entry of input.set) {
-      const result = await exchange(input.nodeId, entry.name, (id) => ({
+      const result = await exchange(input.nodeId, input.userId, entry.name, (id) => ({
         type: "secret.set",
         id,
         name: entry.name,
@@ -119,7 +131,7 @@ export function createNodeRelayServices(
       if (result.status === "refused") return results;
     }
     for (const name of input.delete) {
-      const result = await exchange(input.nodeId, name, (id) => ({
+      const result = await exchange(input.nodeId, input.userId, name, (id) => ({
         type: "secret.delete",
         id,
         name,

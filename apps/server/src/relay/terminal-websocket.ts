@@ -21,6 +21,7 @@ import {
   p256PublicKeySchema as uncompressedP256PublicKeySchema,
 } from "./frames.js";
 import { recordNodeAuditEvent } from "./node-audit.js";
+import { nodeOwnerMatches } from "./node-owner.js";
 import { encodeRelayBinaryFrame, parseRelayBinaryFrame } from "./protocol.js";
 import {
   type LiveNodeState,
@@ -1037,7 +1038,8 @@ export class TerminalBrowserHub {
       return;
     }
     const state = relaySessionManager.getLiveNodeState(row.id);
-    const live = state && state.userId === conn.userId ? state : null;
+    // Defence in depth: a live session of another owner is never opened (as if offline).
+    const live = nodeOwnerMatches(state, conn.userId, "terminal_open") ? state : null;
     const availability = availabilityFor(row, live);
     if (!availability.available) {
       this.sendError(conn, availability.reason, ref);

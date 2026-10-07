@@ -359,6 +359,7 @@ describe("RelaySessionManager (relay 3.0)", () => {
     await connect();
     const session = manager.nodeSession("node-1");
     expect(session).toEqual({
+      userId: "user-1",
       connectionGeneration: generation,
       trust: "full",
       operatorTerminals: false,
@@ -376,6 +377,31 @@ describe("RelaySessionManager (relay 3.0)", () => {
     manager.requestTrustLower("node-1", new Date());
     expect(manager.sendToNode("node-1", frame, { requireFullTrust: true })).toBe(false);
     expect(manager.nodeSession("node-1")?.trust).toBe("relay");
+  });
+
+  it("sends nothing pinned to another owner, and logs the class only", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const socket = await connect();
+      const frame = { type: "runtime.detect" as const, id: "d3" };
+      expect(manager.sendToNode("node-1", frame, { userId: "user-2" })).toBe(false);
+      expect(
+        manager.sendToNode("node-1", frame, { userId: "user-2", ownerCheck: "runtime_step" }),
+      ).toBe(false);
+      expect(socket.last("runtime.detect")).toBeUndefined();
+      expect(warn.mock.calls).toEqual([
+        ["[relay] refused a send to a node of another owner", "frame"],
+        ["[relay] refused a send to a node of another owner", "runtime_step"],
+      ]);
+      // A guard naming no owner (a slip upstream) is refused too, not skipped.
+      expect(manager.sendToNode("node-1", frame, { userId: undefined })).toBe(false);
+      expect(socket.last("runtime.detect")).toBeUndefined();
+      // The owner's own frame goes out.
+      expect(manager.sendToNode("node-1", frame, { userId: "user-1" })).toBe(true);
+      expect(socket.last("runtime.detect")).toEqual(frame);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("sends no lane frame before hello.ok", async () => {
@@ -485,6 +511,65 @@ describe("RelaySessionManager (relay 3.0)", () => {
     await manager.closeSessionsForRevokedCredentials({ ids: ["cred-1"] });
     expect(socket.closes).toEqual([{ code: 1008, reason: "access_denied" }]);
     expect(manager.getOnlineNodeIds()).toEqual([]);
+  });
+
+  it("never opens a browser shell for a user on another owner's node", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const socket = await connect();
+      expect(
+        manager.startTerminal({
+          terminalId: Buffer.alloc(16, 1).toString("base64url"),
+          userId: "user-2",
+          nodeId: "node-1",
+          cols: 80,
+          rows: 24,
+          browserPublicKey: TERMINAL_KEY,
+          browserNonce: Buffer.alloc(16, 2).toString("base64url"),
+          connId: "conn-1",
+        }),
+      ).toBe(false);
+      expect(socket.last("term.open")).toBeUndefined();
+      expect(warn.mock.calls).toEqual([
+        ["[relay] refused a send to a node of another owner", "terminal_open"],
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("never sends a file op of another owner's to the node", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const socket = await connect();
+      const opId = "aI2y1_whRmuQtdr_JElukw";
+      const tracked = (userId: string) => ({
+        opId,
+        nodeId: "node-1",
+        userId,
+        op: "read" as const,
+        markResult: vi.fn(),
+        markData: vi.fn(),
+        markRejected: vi.fn(),
+        markMalformed: vi.fn(),
+        markLost: vi.fn(),
+      });
+      const frame = {
+        type: "file.op" as const,
+        opId,
+        op: "read" as const,
+        args: { path: "/home/me/a.txt", maxLines: 20 },
+      };
+      expect(manager.dispatchFileOp(tracked("user-2"), frame)).toBe(false);
+      expect(socket.last("file.op")).toBeUndefined();
+      expect(warn.mock.calls).toEqual([
+        ["[relay] refused a send to a node of another owner", "file_op"],
+      ]);
+      expect(manager.dispatchFileOp(tracked("user-1"), frame)).toBe(true);
+      expect(socket.last("file.op")).toMatchObject({ opId });
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("refuses browser shells on a node at Relay only", async () => {
@@ -658,6 +743,35 @@ describe("RelaySessionManager (relay 3.0)", () => {
       const stray = Buffer.alloc(16, 8).toString("base64url");
       manager.closeOperatorTerminal("node-1", stray);
       expect(socket.last("term.close")).toEqual({ type: "term.close", terminalId: stray });
+    });
+
+    it("attaches nobody when the session holding the terminal is another owner's", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        const socket = await connect({ operatorTerminals: true });
+        expect(manager.sendToNode("node-1", job())).toBe(true);
+        await manager.handleTextFrame(socket, result("awaiting_operator"));
+        expect(manager.operatorStepTerminal("step-1", "user-1")).not.toBeNull();
+        // A slip elsewhere left user-1's step and terminal on a session of user-2's.
+        const sessions = (
+          manager as unknown as {
+            sessionsByNodeId: Map<string, { identity: NodeIdentity }>;
+          }
+        ).sessionsByNodeId;
+        const live = sessions.get("node-1");
+        if (!live) throw new Error("no session");
+        live.identity = { ...live.identity, userId: "user-2" };
+        const sendsBefore = socket.sends.length;
+        expect(manager.operatorStepTerminal("step-1", "user-1")).toBeNull();
+        expect(manager.attachOperatorTerminal(attach)).toEqual({ ok: false, error: "not_found" });
+        expect(socket.sends.length).toBe(sendsBefore);
+        expect(warn.mock.calls).toEqual([
+          ["[relay] refused a send to a node of another owner", "operator_attach"],
+          ["[relay] refused a send to a node of another owner", "terminal_attach"],
+        ]);
+      } finally {
+        warn.mockRestore();
+      }
     });
 
     it("closes the user's operator terminals on a ban", async () => {

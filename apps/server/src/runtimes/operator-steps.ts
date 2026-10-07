@@ -80,6 +80,10 @@ export function createRuntimeStepServices(deps: {
       const live = deps.relay.operatorStepTerminal(stepId, userId);
       if (live?.terminalId !== step.operatorTerminalId || live.nodeId !== step.nodeId)
         return refuse("terminal_unavailable");
+      // Defence in depth: the node holding the terminal is the step owner's (the relay checks
+      // its live session's user in `operatorStepTerminal`; this checks the node row).
+      if ((await prisma.node.count({ where: { id: live.nodeId, userId } })) === 0)
+        return refuse("terminal_unavailable");
       const minted = deps.tickets.mint({
         userId,
         sessionId,

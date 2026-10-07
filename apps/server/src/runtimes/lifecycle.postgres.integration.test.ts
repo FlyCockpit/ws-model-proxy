@@ -233,6 +233,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       nodeSession: (id) =>
         id === nodeId && session.online
           ? {
+              userId,
               connectionGeneration: session.connectionGeneration,
               trust: session.trust,
               operatorTerminals: operatorRelay.supported,

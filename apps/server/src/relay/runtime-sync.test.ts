@@ -152,7 +152,8 @@ function mockNode(trust: "FULL" | "RELAY" = "FULL") {
 describe("createRuntimeSync", () => {
   function setup() {
     const sent: ServerToNodeControlFrame[] = [];
-    const session: { connectionGeneration: number; trust: "full" | "relay" } = {
+    const session: { userId: string; connectionGeneration: number; trust: "full" | "relay" } = {
+      userId: "user-1",
       connectionGeneration: 4,
       trust: "full",
     };
@@ -161,9 +162,10 @@ describe("createRuntimeSync", () => {
         (
           _nodeId: string,
           frame: ServerToNodeControlFrame,
-          guard?: { connectionGeneration?: number; requireFullTrust?: boolean },
+          guard?: { connectionGeneration?: number; requireFullTrust?: boolean; userId?: string },
         ) => {
           if (guard?.requireFullTrust && session.trust !== "full") return false;
+          if (guard?.userId !== undefined && guard.userId !== session.userId) return false;
           if (
             guard?.connectionGeneration !== undefined &&
             guard.connectionGeneration !== session.connectionGeneration
@@ -219,6 +221,38 @@ describe("createRuntimeSync", () => {
       where: { id: "node-1", connectionGeneration: 4 },
       data: { heldDefinitions: held, heldMetricCommandsHash: null, heldFabricsHash: null },
     });
+  });
+
+  it("sends no definitions to a live session of another owner (defence in depth)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      // The node row (and so every definition read) is user-1's; its live session is not.
+      mockNode();
+      db.runtimeVersion.findMany.mockResolvedValue([]);
+      const { sent, relay, session, sync } = setup();
+      session.userId = "user-2";
+      expect(await sync.syncNode("node-1")).toBeNull();
+      expect(sent).toHaveLength(0);
+      expect(relay.sendToNode).not.toHaveBeenCalled();
+      expect(warn.mock.calls).toEqual([
+        ["[relay] refused a send to a node of another owner", "definition_sync"],
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("pins every definition frame to the node row's owner", async () => {
+    mockNode();
+    db.runtimeVersion.findMany.mockResolvedValue([]);
+    const { sent, relay, sync } = setup();
+    void sync.syncNode("node-1");
+    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    expect(relay.sendToNode).toHaveBeenCalledWith(
+      "node-1",
+      expect.objectContaining({ type: "runtime.define" }),
+      expect.objectContaining({ userId: "user-1", requireFullTrust: true }),
+    );
   });
 
   it("sends nothing to a Relay-only node and reports the push skipped", async () => {
@@ -364,7 +398,11 @@ describe("buildCompleteOperation limits", () => {
 describe("createRuntimeSync sessions", () => {
   function setupSessions() {
     const sent: ServerToNodeControlFrame[] = [];
-    const session = { connectionGeneration: 4, trust: "full" as "full" | "relay" };
+    const session = {
+      userId: "user-1",
+      connectionGeneration: 4,
+      trust: "full" as "full" | "relay",
+    };
     const relay = {
       sendToNode: vi.fn(
         (
@@ -419,7 +457,7 @@ describe("createRuntimeSync sessions", () => {
     mockNode();
     db.runtimeVersion.findMany.mockResolvedValue([]);
     const sent: ServerToNodeControlFrame[] = [];
-    const session = { connectionGeneration: 4, trust: "full" as const };
+    const session = { userId: "user-1", connectionGeneration: 4, trust: "full" as const };
     const sync = createRuntimeSync(
       {
         sendToNode: (_n, frame) => {

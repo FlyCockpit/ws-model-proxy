@@ -276,7 +276,17 @@ describe("lifecycle dispatch", () => {
     };
   }
 
-  async function dispatchOnce(instanceOwner: string) {
+  /**
+   * One dispatch pass over one pending step of `instanceOwner`'s on node-a. node-a's row is
+   * `nodeOwner`'s, its live session `sessionOwner`'s (both A by default).
+   */
+  async function dispatchOnce(
+    instanceOwner: string,
+    {
+      nodeOwner = VICTIM,
+      sessionOwner = VICTIM,
+    }: { nodeOwner?: string; sessionOwner?: string } = {},
+  ) {
     db.instanceStep.findMany.mockResolvedValue([
       {
         id: "step-1",
@@ -295,9 +305,8 @@ describe("lifecycle dispatch", () => {
       banned: false,
       banExpires: null,
     } as never);
-    // node-a is A's.
     db.node.findUnique.mockResolvedValue({
-      userId: VICTIM,
+      userId: nodeOwner,
       trust: "FULL",
       trustLowerRequestedAt: null,
       connectionGeneration: 1,
@@ -305,6 +314,7 @@ describe("lifecycle dispatch", () => {
     const relay = {
       sendToNode: vi.fn(() => true),
       nodeSession: vi.fn(() => ({
+        userId: sessionOwner,
         connectionGeneration: 1,
         trust: "full" as const,
         operatorTerminals: false,
@@ -316,9 +326,45 @@ describe("lifecycle dispatch", () => {
     return relay;
   }
 
+  /** Runs `work` with console.warn captured; returns the warnings. */
+  async function warnings(work: () => Promise<unknown>) {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await work();
+      return warn.mock.calls;
+    } finally {
+      warn.mockRestore();
+    }
+  }
+  const REFUSED = ["[relay] refused a send to a node of another owner", "runtime_step"];
+
   it("never sends B's step to A's node and claims nothing", async () => {
-    const relay = await dispatchOnce(ATTACKER);
-    expect(relay.sendToNode).not.toHaveBeenCalled();
+    let relay: Awaited<ReturnType<typeof dispatchOnce>> | undefined;
+    // node-a's row and live session are A's; the instance is B's.
+    expect(await warnings(async () => (relay = await dispatchOnce(ATTACKER)))).toEqual([REFUSED]);
+    expect(relay?.sendToNode).not.toHaveBeenCalled();
+    expect(db.instanceStep.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("never sends a step to a live session of another owner, even when the rows agree", async () => {
+    let relay: Awaited<ReturnType<typeof dispatchOnce>> | undefined;
+    // Instance and node row are A's; the session on node-a is B's (a slip elsewhere).
+    expect(
+      await warnings(async () => (relay = await dispatchOnce(VICTIM, { sessionOwner: ATTACKER }))),
+    ).toEqual([REFUSED]);
+    expect(relay?.sendToNode).not.toHaveBeenCalled();
+    expect(db.instanceStep.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("never claims a step whose node row is another owner's, even when the session agrees", async () => {
+    let relay: Awaited<ReturnType<typeof dispatchOnce>> | undefined;
+    // Instance and live session are B's; node-a's row is A's.
+    expect(
+      await warnings(
+        async () => (relay = await dispatchOnce(ATTACKER, { sessionOwner: ATTACKER })),
+      ),
+    ).toEqual([REFUSED]);
+    expect(relay?.sendToNode).not.toHaveBeenCalled();
     expect(db.instanceStep.updateMany).not.toHaveBeenCalled();
   });
 
@@ -327,7 +373,8 @@ describe("lifecycle dispatch", () => {
     expect(relay.sendToNode).toHaveBeenCalledWith(
       "node-a",
       expect.objectContaining({ type: "runtime.job", stepId: "step-1" }),
-      { connectionGeneration: 1 },
+      // Pinned to the instance's owner at the relay too.
+      { connectionGeneration: 1, userId: VICTIM, ownerCheck: "runtime_step" },
     );
   });
 });

@@ -42,10 +42,19 @@ const ref = (overrides: Partial<NodeSessionRef> = {}): NodeSessionRef => ({
   ...overrides,
 });
 
+/** Owners of nodes other than node-1 (one live session each, like node-1's). */
+const otherOwners: Record<string, string> = { "node-banned": "user-banned" };
+
 function relay() {
   const sent: Array<{ nodeId: string; frame: ServerToNodeControlFrame; guard?: SendGuard }> = [];
-  const session: { online: boolean; connectionGeneration: number; trust: "full" | "relay" } = {
+  const session: {
+    online: boolean;
+    userId: string;
+    connectionGeneration: number;
+    trust: "full" | "relay";
+  } = {
     online: true,
+    userId: "user-1",
     connectionGeneration: 3,
     trust: "full",
   };
@@ -53,6 +62,9 @@ function relay() {
     sendToNode: vi.fn((nodeId: string, frame: ServerToNodeControlFrame, guard?: SendGuard) => {
       if (!session.online) return false;
       if (guard?.requireFullTrust && session.trust !== "full") return false;
+      // Another node's owner (a node of the tests' other users), or this session's.
+      const owner = otherOwners[nodeId] ?? session.userId;
+      if (guard?.userId !== undefined && guard.userId !== owner) return false;
       if (
         guard?.connectionGeneration !== undefined &&
         guard.connectionGeneration !== session.connectionGeneration
@@ -63,7 +75,11 @@ function relay() {
     }),
     nodeSession: vi.fn(() =>
       session.online
-        ? { connectionGeneration: session.connectionGeneration, trust: session.trust }
+        ? {
+            userId: session.userId,
+            connectionGeneration: session.connectionGeneration,
+            trust: session.trust,
+          }
         : null,
     ),
   };
@@ -299,7 +315,7 @@ describe("node operator services: commands", () => {
     expect(s.sent.at(-1)).toEqual({
       nodeId: "node-1",
       frame: { type: "exec.cancel", commandId: COMMAND },
-      guard: { connectionGeneration: 3 },
+      guard: { connectionGeneration: 3, userId: "user-1", ownerCheck: "command_cancel" },
     });
   });
 
@@ -415,7 +431,7 @@ describe("node operator services: command tracking", () => {
       row("expired", { agentTokenId: "token-gone" }),
       row("grant", { mcpGrantId: "grant-gone" }),
       row("person", {}),
-      row("banned", { userId: "user-banned" }),
+      row("banned", { userId: "user-banned", nodeId: "node-banned" }),
     ]);
     db.client.agentToken.findMany.mockResolvedValueOnce([{ id: "token-live" }]);
     db.client.mcpGrant.findMany.mockResolvedValueOnce([]);
@@ -498,5 +514,86 @@ describe("node operator services: terminal tickets", () => {
     ).rejects.toMatchObject({ data: { reason: "node_offline" } });
     // Nothing about a terminal ticket goes to the node.
     expect(s.sent).toHaveLength(0);
+  });
+});
+
+describe("node operator services: the node's owner", () => {
+  const REFUSED = "[relay] refused a send to a node of another owner";
+  let warn: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    warn.mockRestore();
+  });
+
+  it("never starts a command on a node of another owner", async () => {
+    const s = setup();
+    s.session.userId = "user-2";
+    await expect(s.services.startCommand(startArgs)).rejects.toMatchObject({
+      code: "not_delivered",
+    });
+    expect(s.port.sendToNode).not.toHaveBeenCalled();
+    expect(s.tracker.size).toBe(0);
+    // The class only: never the command, its id or the node.
+    expect(warn.mock.calls).toEqual([[REFUSED, "command"]]);
+  });
+
+  it("pins exec.start to the command's owner", async () => {
+    const s = setup();
+    void s.services.startCommand(startArgs).catch(() => undefined);
+    expect(s.sent[0]?.guard).toMatchObject({ userId: "user-1", requireFullTrust: true });
+  });
+
+  it("never polls or cancels a command on a node of another owner", async () => {
+    const s = setup();
+    s.session.userId = "user-2";
+    await expect(
+      s.services.pollCommand({ ...startArgs, waitMs: 0, cancel: false }),
+    ).resolves.toBeNull();
+    await expect(
+      s.services.pollCommand({ ...startArgs, waitMs: 0, cancel: true }),
+    ).resolves.toBeNull();
+    // The cancel is remembered for the owner's own node, but nothing reached this one.
+    expect(s.sent).toHaveLength(0);
+    expect(warn.mock.calls).toEqual([
+      [REFUSED, "command_poll"],
+      [REFUSED, "command_poll"],
+    ]);
+  });
+
+  it("pins exec.poll and exec.cancel to the command's owner", async () => {
+    const s = setup();
+    void s.services.pollCommand({ ...startArgs, waitMs: 0, cancel: true });
+    expect(s.sent.map((entry) => [entry.frame.type, entry.guard?.userId])).toEqual([
+      ["exec.cancel", "user-1"],
+      ["exec.poll", "user-1"],
+    ]);
+  });
+
+  it("does not let another user's cancel take over a tracked command", () => {
+    const s = setup();
+    s.tracker.track({ commandId: COMMAND, nodeId: "node-1", userId: "user-1", endsBy: 0 });
+    expect(
+      s.tracker.cancel({ commandId: COMMAND, nodeId: "node-1", userId: "user-2", endsBy: 0 }),
+    ).toBe(false);
+    expect(s.tracker.get(COMMAND)).toMatchObject({ userId: "user-1", cancelRequested: false });
+    expect(s.sent).toHaveLength(0);
+  });
+
+  it("mints no terminal ticket for a node of another owner", async () => {
+    const s = setup();
+    s.session.userId = "user-2";
+    await expect(
+      s.services.openTerminalTicket({
+        userId: "user-1",
+        sessionId: "session-1",
+        nodeId: "node-1",
+        cols: 80,
+        rows: 24,
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(s.tickets.size).toBe(0);
+    expect(warn.mock.calls).toEqual([[REFUSED, "terminal_ticket"]]);
   });
 });

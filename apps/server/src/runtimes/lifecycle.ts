@@ -37,6 +37,7 @@ import {
   RUNTIME_JOB_PRE_ADMISSION_ERRORS,
   type ServerToNodeControlFrame,
 } from "../relay/frames.js";
+import { nodeOwnerMatches } from "../relay/node-owner.js";
 import type {
   NodeFrameHandlers,
   NodeSessionRef,
@@ -141,6 +142,8 @@ const PRE_ADMISSION: ReadonlySet<string> = new Set(RUNTIME_JOB_PRE_ADMISSION_ERR
 export type LifecycleRelay = {
   sendToNode(nodeId: string, frame: ServerToNodeControlFrame, guard?: SendGuard): boolean;
   nodeSession(nodeId: string): {
+    /** The node's owner (the live session's user). */
+    userId: string;
     connectionGeneration: number;
     trust: NodeTrustWire;
     /** The node can hold operator terminals (feature and terminal key). */
@@ -1137,7 +1140,9 @@ export class RuntimeLifecycle {
     });
     for (const row of rows) {
       const session = this.relay.nodeSession(row.nodeId);
-      if (!session) continue;
+      // Defence in depth: a step goes only to a node of its instance's owner (claimStep checks
+      // the node row too; the SQL trigger instance_step_node_owner the step's node).
+      if (!session || !nodeOwnerMatches(session, row.Instance.userId, "runtime_step")) continue;
       let job: ReturnType<typeof jobFrame> | null = null;
       try {
         job = await this.write(row.Instance.userId, row.instanceId, (tx) =>
@@ -1149,6 +1154,8 @@ export class RuntimeLifecycle {
       if (!job) continue;
       const sent = this.relay.sendToNode(row.nodeId, job, {
         connectionGeneration: session.connectionGeneration,
+        userId: row.Instance.userId,
+        ownerCheck: "runtime_step",
       });
       if (!sent) await this.undeliver(row.Instance.userId, row.instanceId, row.id, job.ownerEpoch);
     }
@@ -1227,7 +1234,7 @@ export class RuntimeLifecycle {
         connectionGeneration: true,
       },
     });
-    if (!node || node.userId !== instance.userId) return null;
+    if (!node || !nodeOwnerMatches(node, instance.userId, "runtime_step")) return null;
     if (node.connectionGeneration !== session.connectionGeneration) return null;
     const fullControl =
       node.trust === "FULL" && node.trustLowerRequestedAt === null && session.trust === "full";

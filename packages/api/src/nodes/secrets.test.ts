@@ -18,7 +18,7 @@ import prisma from "@ws-model-proxy/db";
 import type { CallerAuth } from "../contracts/auth-context";
 import type { NodeRelayServices } from "../lib/node-relay-services";
 import { nodesRouter } from "../routers/nodes";
-import { contextFor, FULL_AGENT, PERSON, READ_AGENT } from "./lane-b-test-helpers";
+import { contextFor, FULL_AGENT, OWNER, PERSON, READ_AGENT } from "./lane-b-test-helpers";
 
 const db = vi.mocked(prisma, true);
 const SECRET = "hf_very_secret_value";
@@ -53,6 +53,8 @@ describe("nodes.secrets", () => {
     expect(out).toEqual({ name: "WSMP_SECRET_HF", updatedAt: "2026-10-06T10:00:00.000Z" });
     expect(writeSecrets).toHaveBeenCalledWith({
       nodeId: "node-1",
+      // The relay checks the node is this user's before the value leaves.
+      userId: OWNER,
       set: [{ name: "WSMP_SECRET_HF", value: SECRET }],
       delete: [],
     });
