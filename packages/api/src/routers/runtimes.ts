@@ -487,7 +487,7 @@ export const runtimesRouter = {
       throw refuseAbout(
         "launch_change_on_node_origin",
         runtime.id,
-        "This runtime was added on its node: change its definition there (`wsmp runtime add`). Limits and advanced settings can be changed here.",
+        "This runtime is defined on its node: edit its definition there. Limits and advanced settings can be changed here.",
       );
     if (launchChanged && runtime.Node && effectiveTrust(runtime.Node) !== "FULL")
       throw refuseAbout(

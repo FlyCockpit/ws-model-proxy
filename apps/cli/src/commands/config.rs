@@ -46,7 +46,8 @@ enum Sub {
     },
     /// Set this CLI connection's slug.
     SetSlug { slug: String },
-    /// Allow browser terminals. Takes effect the next time wsmp starts.
+    /// Allow browser terminals (also asked at `wsmp login`). Takes effect
+    /// the next time wsmp starts.
     SetHumanTerminal { state: Switch },
     /// Extra hosts (`ip` or `ip:port`, IP literals) a server-defined
     /// always-on runtime may use besides loopback. Applies at once.
@@ -80,13 +81,13 @@ enum Sub {
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum Switch {
+pub(crate) enum Switch {
     On,
     Off,
 }
 
 impl Switch {
-    fn enabled(self) -> bool {
+    pub(crate) fn enabled(self) -> bool {
         matches!(self, Self::On)
     }
 }

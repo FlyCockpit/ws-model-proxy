@@ -6,7 +6,9 @@
 //!    slug for the node credential. A Replace code needs `--replace` or a
 //!    typed `yes`.
 //! 3. Choose trust (prompt on a terminal unless `--trust`; default Full
-//!    control, with a warning when nobody was asked).
+//!    control, with a warning when nobody was asked), then browser
+//!    terminals (prompt on a terminal unless `--human-terminal`; default
+//!    yes; without a terminal the saved value, off unless set, is kept).
 //! 4. Write `config.json` and `node-credential.json` (0600).
 //! 5. Offer the per-user service (`--service`/`--no-service`).
 //!
@@ -22,6 +24,7 @@ use crate::auth::{
     EnrollError, EnrollOutcome, EnrollRequest, enroll, fetch_well_known, is_enrollment_code,
     refusal_message,
 };
+use crate::commands::config::Switch;
 use crate::config::{Config, ConfigLock, is_loopback_host, server_url_http_warning};
 use crate::display_escape::escape_single_line;
 use crate::hostname::hostname_slug;
@@ -48,6 +51,10 @@ pub struct Args {
     /// What the server may do here. Prompted on a terminal; default `full`.
     #[arg(long, value_enum)]
     trust: Option<TrustArg>,
+    /// Allow browser terminals on this node. Prompted on a terminal
+    /// (default `on`); without one, the saved setting (default `off`) stays.
+    #[arg(long, value_enum, value_name = "on|off")]
+    human_terminal: Option<Switch>,
     /// Install and start the per-user service without asking.
     #[arg(long, conflicts_with = "no_service")]
     service: bool,
@@ -72,6 +79,7 @@ struct LoginOutput<'a> {
     slug: &'a str,
     server: &'a str,
     trust: &'a str,
+    allow_human_terminal: bool,
     replaced: Option<&'a str>,
     remove_after_offline_ms: Option<u64>,
     service_installed: bool,
@@ -138,21 +146,24 @@ pub fn run(args: &Args) -> Result<()> {
     } else {
         trust
     };
+    // Not asked when the node will stay Relay only (rechecked under the lock).
+    let human_terminal = if keeps_relay(&Config::load()?) {
+        choose_human_terminal(args, TrustValue::Relay)?
+    } else {
+        choose_human_terminal(args, trust)?
+    };
+    // Set only when this re-login changed it: a running relay needs a restart.
+    let human_terminal_changed;
     {
         let _lock = ConfigLock::exclusive()?;
         let mut config = Config::load()?;
-        // Never raise a node that is already Relay only (unset counts) or
-        // was lowered (a frozen copy exists) through a re-login.
-        let enrolled_before = config.server_url.is_some()
-            || crate::state::load_node_credential()
-                .ok()
-                .flatten()
-                .is_some();
-        let keep_relay = crate::runtime_store::frozen_path()
-            .map(|path| path.exists())
-            .unwrap_or(true)
-            || (enrolled_before && crate::trust::configured(&config) == TrustValue::Relay);
-        let chosen = if keep_relay { TrustValue::Relay } else { trust };
+        human_terminal_changed = config.server_url.is_some()
+            && human_terminal.is_some_and(|allow| allow != config.allow_human_terminal);
+        let chosen = if keeps_relay(&config) {
+            TrustValue::Relay
+        } else {
+            trust
+        };
         if chosen == TrustValue::Relay {
             // The marker first, then the config (as every lowering does).
             crate::runtime_store::freeze()?;
@@ -161,6 +172,9 @@ pub fn run(args: &Args) -> Result<()> {
         config.public_origin = (public_origin != url_origin).then(|| public_origin.clone());
         config.cli_slug = Some(enrolled.slug.clone());
         config.trust = Some(chosen);
+        if let Some(allow) = human_terminal {
+            config.allow_human_terminal = allow;
+        }
         config.save()?;
     }
     save_node_credential(&NodeCredential {
@@ -171,13 +185,27 @@ pub fn run(args: &Args) -> Result<()> {
     })?;
     let config = Config::load_required()?;
     let trust = crate::trust::configured(&config);
+    let allow_human_terminal = config.allow_human_terminal;
+    if human_terminal.is_none() && trust == TrustValue::Full {
+        output::diagnostic(format!(
+            "warning: no terminal to ask, so browser terminals stay {}; set them with `--human-terminal on|off` or `wsmp config set-human-terminal on|off`",
+            on_off(allow_human_terminal)
+        ))?;
+    }
     let service_installed = offer_service(args)?;
+    // A relay already running reads the setting only when it starts.
+    if human_terminal_changed && !service_installed {
+        output::diagnostic(
+            "restart wsmp if it is already running to apply the browser terminal setting",
+        )?;
+    }
     if args.json {
         return output::json(&LoginOutput {
             node_id: &enrolled.node_id,
             slug: &enrolled.slug,
             server: &server_url,
             trust: crate::trust::word(trust),
+            allow_human_terminal,
             replaced: enrolled.replaced.as_ref().map(|node| node.slug.as_str()),
             remove_after_offline_ms: enrolled.remove_after_offline_ms,
             service_installed,
@@ -189,6 +217,15 @@ pub fn run(args: &Args) -> Result<()> {
         match trust {
             TrustValue::Full => "full control",
             TrustValue::Relay => "relay only",
+        }
+    ))?;
+    output::line(format!(
+        "browser terminals: {}{}",
+        on_off(allow_human_terminal),
+        if allow_human_terminal && trust == TrustValue::Relay {
+            " (they need full control)"
+        } else {
+            ""
         }
     ))?;
     if let Some(node) = &enrolled.replaced {
@@ -340,6 +377,54 @@ fn choose_trust(args: &Args, origin: &str) -> Result<TrustValue> {
     }
 }
 
+/// Whether a re-login must keep this node Relay only: never raise a node that
+/// is already Relay only (unset counts) or was lowered (a frozen copy exists).
+fn keeps_relay(config: &Config) -> bool {
+    let enrolled_before = config.server_url.is_some()
+        || crate::state::load_node_credential()
+            .ok()
+            .flatten()
+            .is_some();
+    crate::runtime_store::frozen_path()
+        .map(|path| path.exists())
+        .unwrap_or(true)
+        || (enrolled_before && crate::trust::configured(config) == TrustValue::Relay)
+}
+
+/// The browser terminal setting to write: `Some` sets it, `None` keeps the
+/// saved one. Never asked at Relay only, where terminals cannot open.
+fn choose_human_terminal(args: &Args, trust: TrustValue) -> Result<Option<bool>> {
+    if let Some(state) = args.human_terminal {
+        return Ok(Some(state.enabled()));
+    }
+    if trust == TrustValue::Relay || !interactive() {
+        return Ok(None);
+    }
+    output::diagnostic(
+        "Browser terminals open a shell on this machine from the server's Terminals page.\n  Change later with `wsmp config set-human-terminal on|off`.",
+    )?;
+    loop {
+        match yes_no(&ask("Allow browser terminals on this node? [Y/n]: ")?, true) {
+            Some(allow) => return Ok(Some(allow)),
+            None => output::diagnostic("type y or n")?,
+        }
+    }
+}
+
+/// A `[Y/n]` answer: empty takes `default`; anything else unclear is `None`.
+fn yes_no(answer: &str, default: bool) -> Option<bool> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "" => Some(default),
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value { "on" } else { "off" }
+}
+
 fn offer_service(args: &Args) -> Result<bool> {
     if args.no_service {
         return Ok(false);
@@ -372,6 +457,44 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn browser_terminal_answers_default_to_yes() {
+        assert_eq!(yes_no("\n", true), Some(true));
+        assert_eq!(yes_no(" Y\n", true), Some(true));
+        assert_eq!(yes_no("yes", true), Some(true));
+        assert_eq!(yes_no("n\n", true), Some(false));
+        assert_eq!(yes_no("NO", true), Some(false));
+        assert_eq!(yes_no("maybe", true), None);
+        assert_eq!(yes_no("", false), Some(false));
+    }
+
+    fn login_args(extra: &[&str]) -> Args {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: Args,
+        }
+        let mut argv = vec!["wsmp", "https://wsmp.example.com"];
+        argv.extend_from_slice(extra);
+        Wrapper::try_parse_from(argv).expect("login args").args
+    }
+
+    #[test]
+    fn the_human_terminal_flag_wins_at_either_trust() {
+        let on = login_args(&["--human-terminal", "on"]);
+        let off = login_args(&["--human-terminal", "off"]);
+        for trust in [TrustValue::Full, TrustValue::Relay] {
+            assert_eq!(choose_human_terminal(&on, trust).unwrap(), Some(true));
+            assert_eq!(choose_human_terminal(&off, trust).unwrap(), Some(false));
+        }
+        // Relay only never asks and keeps the saved value.
+        assert_eq!(
+            choose_human_terminal(&login_args(&[]), TrustValue::Relay).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn server_urls_normalize_to_their_origin() {
