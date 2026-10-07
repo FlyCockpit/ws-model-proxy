@@ -29,7 +29,7 @@ import {
 import { type JobPlaceholders, type RuntimeJobFrame, runtimeUnitName } from "../relay/frames.js";
 
 export const HEALTH_SEQUENCE_BASE = 1_000_000;
-/** Status probes of forgotten (held-unknown) ranks: unbounded, like health probes. */
+/** Status probes of ranks marked stopped (held-unknown): unbounded, like health probes. */
 export const STATUS_SEQUENCE_BASE = 2_000_000;
 export const GENERATION_STRIDE = 100;
 export const STOP_ORDER_BASE = 50;

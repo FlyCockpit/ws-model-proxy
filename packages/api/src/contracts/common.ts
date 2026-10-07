@@ -77,7 +77,7 @@ export const NODE_AUDIT_KIND = [
   "metric_commands_define",
   "node_update",
   "trust_lower",
-  "claim_forget",
+  "marked_stopped",
 ] as const;
 export const NODE_AUDIT_OUTCOME = [
   "completed",
@@ -127,7 +127,7 @@ export const INSTANCE_PHASE = [
   "STOPPED",
   "FAILED",
 ] as const;
-export const OPERATOR_NEED = ["STEP", "RESTART", "FORGET"] as const;
+export const OPERATOR_NEED = ["STEP", "RESTART", "MARK_STOPPED"] as const;
 export const CLAIM_STATE = ["HELD", "RELEASED", "HELD_UNKNOWN"] as const;
 export const STEP_PHASE = [
   "PREPARE",
@@ -146,7 +146,13 @@ export const STEP_STATE = [
   "FAILED",
   "CANCELLED",
 ] as const;
-export const OPERATION_KIND = ["START", "STOP", "RESTART", "PROFILE_APPLY", "FORGET"] as const;
+export const OPERATION_KIND = [
+  "START",
+  "STOP",
+  "RESTART",
+  "PROFILE_APPLY",
+  "MARK_STOPPED",
+] as const;
 export const TARGET_HEALTH = ["UNKNOWN", "HEALTHY", "DEGRADED", "HALF_OPEN", "UNHEALTHY"] as const;
 export const PRIORITY_CLASS = ["BACKGROUND", "NORMAL", "HIGH"] as const;
 export const FALLBACK_MODE = ["OFF", "OWNER", "OWNER_AND_SHARES"] as const;

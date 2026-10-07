@@ -33,13 +33,13 @@ requests and metrics.
   stop or change anything there.
 - **Notes.** Most writes take an optional `note` (1–500 characters);
   `node_command_queue_for_user` requires one, and the deletes,
-  `runtime_start`, `runtime_stop` (except with `forget`), `profile_apply` and
+  `runtime_start`, `runtime_stop` (except with `markStopped`), `profile_apply` and
   `model_test` take none.
   Say what you are trying; people see it beside the change (runtime version
   history, node activity, command log, queued commands).
 - **Confirmation.** Deletes take `confirm: "DELETE"`, `node_command_run`
-  takes `confirm: "RUN"` and `runtime_stop` with `forget` takes
-  `confirm: "FORGET"`. The literal only proves intent; it never replaces a
+  takes `confirm: "RUN"` and `runtime_stop` with `markStopped` takes
+  `confirm: "MARK_STOPPED"`. The literal only proves intent; it never replaces a
   person's confirmation where one is required.
 - **Previews.** `runtime_start` and `profile_apply` accept a preview first: it
   shows placements, what stops and hold changes. Preview when unsure.
@@ -71,16 +71,16 @@ proves the stop when no process of the rank's units is left, the `status`
 command (if any) says stopped, and the rank's port is free. The stop then
 completes with no person involved. Only when the node cannot prove it (still
 alive, or offline for 10 minutes) does the instance show `needsOperator:
-"FORGET"`; the probe is repeated every 5 minutes, so a later proof still
-completes it.
+"MARK_STOPPED"`; the probe is repeated every 5 minutes, so a later proof
+still completes it.
 
-To give up on such a stop, call `runtime_stop {instanceId, forget: true,
-confirm: "FORGET"}` (optionally `nodeNumber` for one node of a multi-node
-instance, and a `note`). Agents may do this only on Full-control nodes
-(`trust_relay` otherwise). The claim stays counted until a status probe proves
-the stop, but the instance settles STOPPED and later starts stop waiting for
-it (`waits_for_stop`). Each forgotten node writes a `claim_forget` row in the
-node's activity.
+To mark such an instance stopped, call `runtime_stop {instanceId,
+markStopped: true, confirm: "MARK_STOPPED"}` (optionally `nodeNumber` for one
+node of a multi-node instance, and a `note`). It touches nothing on the node.
+Agents may do this only on Full-control nodes (`trust_relay` otherwise). The
+claim stays counted until a status probe proves the stop, but the instance
+settles STOPPED and later starts stop waiting for it (`waits_for_stop`). Each
+node marked stopped writes a `marked_stopped` row in the node's activity.
 
 ### Runtime definitions
 

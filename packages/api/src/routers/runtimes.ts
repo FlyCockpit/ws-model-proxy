@@ -42,6 +42,8 @@ import {
   RUNTIME_SUMMARY_INCLUDE,
   type RuntimeSummaryRow,
   runtimeSummary,
+  type StopCheck,
+  stopCheckKey,
   storedSpec,
   VERSION_SELECT,
   versionDetail,
@@ -53,6 +55,44 @@ import { runtimeSteps } from "./runtime-steps";
 
 function userIdOf(context: SignedInContext): string {
   return context.session.user.id;
+}
+
+/**
+ * The last finished status probe (automatic stop check) of each rank of the STOPPING instances
+ * among `instances`: the evidence a person weighs before marking an instance stopped.
+ */
+async function latestStopChecks(
+  instances: ReadonlyArray<{ id: string; phase: string; Ranks: ReadonlyArray<{ rank: number }> }>,
+): Promise<Map<string, StopCheck>> {
+  // One indexed lookup per rank (probe sequences grow per rank; a stuck stop is probed every
+  // 5 minutes, so its probes are not all read).
+  const probes = await Promise.all(
+    instances
+      .filter((row) => row.phase === "STOPPING")
+      .flatMap((row) =>
+        row.Ranks.map(({ rank }) =>
+          prisma.instanceStep.findFirst({
+            where: {
+              instanceId: row.id,
+              rank,
+              phase: "STATUS",
+              state: { in: ["SUCCEEDED", "FAILED"] },
+            },
+            orderBy: { sequence: "desc" },
+            select: { instanceId: true, rank: true, state: true, errorCode: true, updatedAt: true },
+          }),
+        ),
+      ),
+  );
+  const checks = new Map<string, StopCheck>();
+  for (const probe of probes)
+    if (probe)
+      checks.set(stopCheckKey(probe.instanceId, probe.rank), {
+        at: probe.updatedAt.toISOString(),
+        proven: probe.state === "SUCCEEDED",
+        errorCode: probe.errorCode,
+      });
+  return checks;
 }
 
 /** Previous launch hashes of each runtime's current version (for `launchChanged`). */
@@ -328,6 +368,7 @@ export const runtimesRouter = {
         select: { id: true, heldDefinitions: true },
       }),
     ]);
+    const stopChecks = await latestStopChecks(instances);
     const factsFrom = instances.find((instance) => instance.phase === "READY") ?? null;
     const previous = summary.currentVersion.launchChanged
       ? await previousLaunchHashOf(input.runtimeId, current.version)
@@ -347,7 +388,7 @@ export const runtimesRouter = {
       ...summary,
       current: versionDetail(current, previous, factsFrom),
       servedModels: models.map(runtimeModelView),
-      instanceList: instances.map(instanceView),
+      instanceList: instances.map((row) => instanceView(row, stopChecks)),
       shares: shares.map((share) => ({ id: share.id, email: share.Grantee.email })),
       contributions: models.flatMap((model) =>
         model.Members.filter((member) => member.shareId !== null).map((member) => ({
@@ -711,18 +752,18 @@ export const runtimesRouter = {
   instances: {
     /**
      * A person (or a Full agent, on Full-control nodes: recovery like deleting an offline
-     * node) gives up proving a stop (node gone or unable to prove it): the rank's claim
+     * node) marks stopped an instance whose stop cannot be proven (node gone or unable to prove it): the rank's claim
      * becomes HELD_UNKNOWN. Placement keeps counting its resources and port until a status
-     * probe proves the stop; the instance settles STOPPED (spec §3.5). Audited as a FORGET
-     * operation and a `claim_forget` node activity row per forgotten rank.
+     * probe proves the stop; the instance settles STOPPED (spec §3.5). Audited as a MARK_STOPPED
+     * operation and a `marked_stopped` node activity row per rank marked stopped.
      */
-    forget: contractProcedure(c.instances.forget).handler(async ({ input, context }) => {
+    markStopped: contractProcedure(c.instances.markStopped).handler(async ({ input, context }) => {
       const userId = userIdOf(context);
       const actor = callerActor(context.auth, userId);
       const agent = agentRulesApply(context.auth);
-      if (agent && input.confirm !== "FORGET")
+      if (agent && input.confirm !== "MARK_STOPPED")
         throw new ORPCError("BAD_REQUEST", {
-          message: 'Forgetting a stop is recovery: repeat confirm: "FORGET".',
+          message: 'Marking a stop as done is recovery: repeat confirm: "MARK_STOPPED".',
         });
       const now = new Date();
       const operationId = await graphWrite(
@@ -753,27 +794,27 @@ export const runtimesRouter = {
             throw new ORPCError("CONFLICT", {
               message: "Nothing of this instance waits for a stop to be proven.",
             });
-          // Agents forget only on Full-control nodes (a node that left counts as not Full).
+          // Agents mark stopped only on Full-control nodes (a node that left counts as not Full).
           if (agent)
             for (const rank of ranks)
               if (!rank.Node || effectiveTrust(rank.Node) !== "FULL")
                 throw refuseAbout(
                   "trust_relay",
                   rank.Node?.id ?? instance.id,
-                  "Agents may only forget stops on nodes at Full control. A person can do this in the browser.",
+                  "Agents may only mark instances stopped on nodes at Full control. A person can do this in the browser.",
                 );
-          const forgotten = ranks.map((rank) => rank.rank);
+          const marked = ranks.map((rank) => rank.rank);
           const operation = await tx.runtimeOperation.create({
             data: {
               userId,
-              kind: "FORGET",
+              kind: "MARK_STOPPED",
               actor: actor.actor,
               actorUserId: actor.actorUserId,
               agentTokenId: actor.agentTokenId,
               mcpGrantId: actor.mcpGrantId,
-              summary: { instanceId: instance.id, ranks: forgotten },
+              summary: { instanceId: instance.id, ranks: marked },
               fingerprint: createHash("sha256")
-                .update(canonicalJson({ forget: instance.id, ranks: forgotten }), "utf8")
+                .update(canonicalJson({ markStopped: instance.id, ranks: marked }), "utf8")
                 .digest("hex"),
             },
             select: { id: true },
@@ -783,8 +824,8 @@ export const runtimesRouter = {
             data: {
               claim: "HELD_UNKNOWN",
               claimChangedAt: now,
-              forgottenAt: now,
-              forgottenBy: userId,
+              markedStoppedAt: now,
+              markedStoppedBy: userId,
             },
           });
           for (const rank of ranks)
@@ -796,7 +837,7 @@ export const runtimesRouter = {
                   actor: actor.actor,
                   agentTokenId: actor.agentTokenId,
                   mcpGrantId: actor.mcpGrantId,
-                  kind: "claim_forget",
+                  kind: "marked_stopped",
                   subject: `instance:${instance.id} rank:${rank.rank}`,
                   instanceId: instance.id,
                   rank: rank.rank,
@@ -810,7 +851,7 @@ export const runtimesRouter = {
           await tx.instanceStep.updateMany({
             where: {
               instanceId: instance.id,
-              rank: { in: forgotten },
+              rank: { in: marked },
               phase: "STOP",
               state: "PENDING",
               attempts: 0,
@@ -828,7 +869,7 @@ export const runtimesRouter = {
         include: INSTANCE_INCLUDE,
       });
       if (!row) throw notFound("That instance does not exist.");
-      return instanceView(row);
+      return instanceView(row, await latestStopChecks([row]));
     }),
   },
 

@@ -230,8 +230,8 @@ enum OperatorNeed {
   /// An interactive start stopped; only a person's Restart brings it back.
   RESTART
   /// A stop cannot be proven (node offline past the grace period, or the node could not
-  /// confirm the stop): waits for the node or for a person's Forget.
-  FORGET
+  /// confirm the stop): waits for the node or for a person to mark it stopped.
+  MARK_STOPPED
 }
 
 /// A running (or always-on) copy of a runtime. ALWAYS_ON runtimes have exactly one instance,
@@ -258,7 +258,7 @@ model RuntimeInstance {
   phase                       InstancePhase
   phaseChangedAt              DateTime            @default(now())
   /// Stable machine code for the last phase change (startup_failed, readiness_timeout,
-  /// health_failed, node_offline, preempted, restart_budget_exhausted, forgotten, …).
+  /// health_failed, node_offline, preempted, restart_budget_exhausted, …).
   phaseReason                 String?
   /// Windowed restart budget (non-interactive starts only).
   restartWindowStartedAt      DateTime?
@@ -269,7 +269,7 @@ model RuntimeInstance {
   lastHealthAt                DateTime?
   unhealthySince              DateTime?
   /// Since when a rank's node has been offline (L2: after advanced.unavailableStopMs the online
-  /// ranks are gang-stopped and the offline rank waits for proof or Forget).
+  /// ranks are gang-stopped and the offline rank waits for proof or Mark as stopped).
   unavailableSince            DateTime?
   needsOperator               OperatorNeed?
   needsOperatorSince          DateTime?
@@ -314,7 +314,7 @@ model RuntimeInstance {
 enum ClaimState {
   HELD
   RELEASED
-  /// Released for bookkeeping without proof the service stopped (Forget, or an inactive
+  /// Released for bookkeeping without proof the service stopped (Mark as stopped, or an inactive
   /// owner's cancelled interactive stop). Placement still counts its resources and port until
   /// a status probe proves the service stopped (→ RELEASED) or a restart retakes it (→ HELD).
   HELD_UNKNOWN
@@ -322,26 +322,26 @@ enum ClaimState {
 
 /// One rank of an instance on one node: its resource and port claim.
 model InstanceRank {
-  id             String     @id @default(cuid(2))
-  instanceId     String
+  id              String     @id @default(cuid(2))
+  instanceId      String
   /// Null after the node was deleted (claim RELEASED by node_delete_release; the row keeps the
   /// rank so the gang stop of the other ranks completes).
-  nodeId         String?
+  nodeId          String?
   /// Deterministic from (handle, rank): `wsmp-<handle>-r<rank>`; the held-unknown probe
   /// needs no local record.
-  unitName       String
-  rank           Int
-  resources      Json
-  port           Int
-  distPort       Int?
-  portFixed      Boolean    @default(false)
-  claim          ClaimState @default(HELD)
-  claimChangedAt DateTime   @default(now())
+  unitName        String
+  rank            Int
+  resources       Json
+  port            Int
+  distPort        Int?
+  portFixed       Boolean    @default(false)
+  claim           ClaimState @default(HELD)
+  claimChangedAt  DateTime   @default(now())
   /// New claims may queue behind this stopping instance, never dispatched before it releases.
-  blockedBy      String[]   @default([])
-  stoppedAt      DateTime?
-  forgottenAt    DateTime?
-  forgottenBy    String?
+  blockedBy       String[]   @default([])
+  stoppedAt       DateTime?
+  markedStoppedAt DateTime?
+  markedStoppedBy String?
 
   Instance RuntimeInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Node     Node?           @relation(fields: [nodeId], references: [id], onDelete: SetNull, onUpdate: Cascade)
@@ -416,7 +416,7 @@ enum OperationKind {
   STOP
   RESTART
   PROFILE_APPLY
-  FORGET
+  MARK_STOPPED
 }
 
 /// One start/stop/apply as confirmed (replaces DeploymentPlan + DeploymentRun). There is no

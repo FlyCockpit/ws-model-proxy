@@ -221,6 +221,24 @@ If that is not acceptable for a machine, do not type its sudo password into a
 web terminal: give the exact command a `NOPASSWD` sudoers rule instead, and use
 Full control only where trusting the server with a shell is fine.
 
+## Stops that can't be confirmed
+
+A stopping instance keeps its port and GPUs until its node proves the process
+is gone. When the stop command fails, the server asks the node to check (no
+process of the runtime left, `status` says stopped, port free) and finishes
+the stop on its own when the check passes. If it can't confirm the stop (the
+process still runs, or the node has been offline for 10 minutes), the instance
+shows **Stop not confirmed**. The check repeats every 5 minutes.
+
+After checking on the node that the process is really gone, press **Mark as
+stopped…** on the runtime or node page. The dialog shows when the stop was
+requested, the last automatic check and the node's connection. Marking touches
+nothing on the node: the instance settles stopped, while its port and GPUs
+stay counted until a later check proves the process gone or you restart the
+instance. Full agents can do the same on Full-control nodes with
+`runtime_stop {markStopped: true, confirm: "MARK_STOPPED"}`. Each mark writes
+a "marked as stopped" row in the node's activity.
+
 ## Configuration
 
 ### Rate limits

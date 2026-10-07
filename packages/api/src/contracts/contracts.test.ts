@@ -86,7 +86,7 @@ const INVENTORY = [
   "runtimes.steps.attach",
   "runtimes.steps.reopen",
   "runtimes.steps.cancel",
-  "runtimes.instances.forget",
+  "runtimes.instances.markStopped",
   "runtimes.models.setCapabilities",
   "runtimes.detected.add",
   "runtimes.shares.list",

@@ -485,7 +485,7 @@
         "metric_commands_define": "comandos de métricas enviados",
         "node_update": "ajustes cambiados",
         "trust_lower": "confianza bajada",
-        "claim_forget": "parada olvidada"
+        "marked_stopped": "marcada como detenida"
       },
       "outcome": {
         "completed": "hecho",
@@ -1010,7 +1010,34 @@
     "needsOperator": {
       "STEP": "Un paso te espera",
       "RESTART": "Requiere reinicio",
-      "FORGET": "Detención sin confirmar"
+      "MARK_STOPPED": "Detención sin confirmar"
+    },
+    "markStopped": {
+      "action": "Marcar como detenida…",
+      "title": "¿Marcar como detenida?",
+      "description": "wsmp no pudo confirmar que este proceso se detuvo. Al marcarla como detenida, wsmp deja de esperarla. No toca el nodo ni termina ningún proceso. Su puerto y sus GPU siguen reservados hasta que wsmp confirme que el proceso ya no existe o reinicies esta instancia. Hazlo solo si verificaste en el nodo que el proceso terminó.",
+      "confirm": "Marcar como detenida",
+      "pending": "Marcando…",
+      "done": "Marcada como detenida.",
+      "noteLabel": "Nota (opcional)",
+      "notePlaceholder": "Qué revisaste en el nodo",
+      "noteTooLong": "La nota debe tener como máximo 500 caracteres.",
+      "help": "wsmp pidió al nodo detener este proceso, pero no pudo confirmar que terminó, así que su puerto y sus GPU siguen reservados. wsmp vuelve a revisar cada 5 minutos. Si verificaste en el nodo que el proceso terminó, usa Marcar como detenida.",
+      "evidence": {
+        "title": "Lo que sabe wsmp",
+        "stopRequested": "Detención solicitada",
+        "node": "Nodo {{node}}",
+        "online": "En línea desde",
+        "offline": "Sin conexión desde",
+        "onlineNoTime": "En línea",
+        "offlineNoTime": "Sin conexión",
+        "removed": "Eliminado de wsmp",
+        "lastCheck": "Última revisión automática",
+        "checkNone": "Ninguna todavía",
+        "checkNotProven": "No pudo confirmar la detención",
+        "checkProven": "Detención confirmada",
+        "loadFailed": "No se pudo cargar lo que sabe wsmp sobre esta detención."
+      }
     },
     "nodeGone": "nodo eliminado",
     "start": "Iniciar",

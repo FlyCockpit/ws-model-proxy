@@ -1083,7 +1083,7 @@ describe("instances already stopping", () => {
   });
 
   it("keeps counting a HELD_UNKNOWN claim: no stop releases it", () => {
-    const forgotten = running("old", ["h1"], 100, {
+    const markedStopped = running("old", ["h1"], 100, {
       running: false,
       ranks: [
         {
@@ -1095,9 +1095,9 @@ describe("instances already stopping", () => {
         },
       ],
     });
-    const result = new PlacementPlanner(context({ nodes: strix(), instances: [forgotten] })).place(
-      request({ labels: ["strix"] }),
-    );
+    const result = new PlacementPlanner(
+      context({ nodes: strix(), instances: [markedStopped] }),
+    ).place(request({ labels: ["strix"] }));
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.refusal.reason).toBe("not_enough_memory");
   });

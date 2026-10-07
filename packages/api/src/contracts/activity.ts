@@ -199,7 +199,7 @@ export const activityContract = {
       "session",
       noInputSchema,
       z.object({ items: z.array(needsYouItemSchema), queuedCommands: z.number().int() }).strict(),
-      "Everything waiting for a person: interactive steps, restarts, Forget; queued agent commands.",
+      "Everything waiting for a person: interactive steps, restarts, unproven stops to mark stopped; queued agent commands.",
     ),
   },
 } as const;

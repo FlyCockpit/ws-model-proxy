@@ -172,7 +172,7 @@ const HOT_PATH_WRITERS: Record<string, string> = {
   "packages/db/scripts/verify-schema-hardening.mjs":
     "D: schema verification on a disposable database",
   "packages/db/scripts/pre-push-null-cleanup.mjs":
-    "D: legacy NULL row cleanup before the schema push",
+    "D: legacy NULL row cleanup and in-place renames before the schema push",
 };
 
 // ---------------------------------------------------------------------------

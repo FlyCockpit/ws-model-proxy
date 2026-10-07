@@ -320,7 +320,7 @@ enum NodeAuditKind {
   metric_commands_define
   node_update
   trust_lower
-  claim_forget
+  marked_stopped
 }
 
 enum NodeAuditOutcome {
@@ -338,7 +338,7 @@ enum NodeAuditOutcome {
 }
 
 /// Everything done on or to a node by an agent or a person: commands, files, terminals,
-/// definition pushes, trust and Forget. Metadata only (never content, output or command
+/// definition pushes, trust and marking stops done. Metadata only (never content, output or command
 /// text: commands are an HMAC digest + allowlisted program name). Plain ids, no foreign keys
 /// (owner history outside the deletion lock graph). Append-only. Replaces CliAgentActionEvent
 /// and DeploymentOperatorEvent.

@@ -18,6 +18,7 @@ import {
   isoDateSchema,
   MODEL_CAPABILITY,
   MODEL_TYPE,
+  NODE_CONNECTION,
   nameSchema,
   noInputSchema,
   noteSchema,
@@ -79,6 +80,20 @@ export const instanceRankViewSchema = z
     port: z.number().int(),
     reserved: z.enum(CLAIM_STATE),
     unitName: z.string(),
+    /** The node's connection and since when (its last connect or disconnect); null if deleted. */
+    nodeConnection: z
+      .object({ state: z.enum(NODE_CONNECTION), since: isoDateSchema.nullable() })
+      .strict()
+      .nullable(),
+    /**
+     * The rank's last automatic stop check (status probe) that finished, while the instance is
+     * STOPPING: `proven` false means the node could not confirm the process is gone. Null when
+     * none ran (or the instance is not stopping).
+     */
+    lastStopCheck: z
+      .object({ at: isoDateSchema, proven: z.boolean(), errorCode: z.string().nullable() })
+      .strict()
+      .nullable(),
   })
   .strict();
 
@@ -558,19 +573,19 @@ export const runtimesContract = {
     ),
   },
   instances: {
-    forget: mutation(
+    markStopped: mutation(
       "agent",
       z
         .object({
           instanceId: idSchema,
           nodeNumber: z.number().int().min(1).optional(),
           /** Agents repeat it (recovery, like node_delete); people confirm in a dialog. */
-          confirm: z.literal("FORGET").optional(),
+          confirm: z.literal("MARK_STOPPED").optional(),
           note: noteSchema.optional(),
         })
         .strict(),
       instanceViewSchema,
-      "Forget a stop that cannot be proven: resources stay counted until a probe proves the stop. Agents: Full-control nodes only (trust_relay), with confirm FORGET; audited on the node.",
+      "Mark stopped an instance whose stop cannot be proven: resources stay counted until a probe proves the stop. Agents: Full-control nodes only (trust_relay), with confirm MARK_STOPPED; audited on the node.",
       ["runtime_stop"],
     ),
   },

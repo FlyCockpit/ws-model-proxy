@@ -41,7 +41,14 @@ export const VERSION_SELECT = {
 export type VersionRow = Prisma.RuntimeVersionGetPayload<{ select: typeof VERSION_SELECT }>;
 
 export const INSTANCE_INCLUDE = {
-  Ranks: { include: { Node: { select: { slug: true } } }, orderBy: { rank: "asc" } },
+  Ranks: {
+    include: {
+      Node: {
+        select: { slug: true, connection: true, lastConnectedAt: true, lastDisconnectedAt: true },
+      },
+    },
+    orderBy: { rank: "asc" },
+  },
   Steps: {
     where: { state: { in: ["PENDING", "RUNNING", "AWAITING_OPERATOR"] } },
     orderBy: { createdAt: "asc" },
@@ -324,7 +331,21 @@ function safeSpec(value: unknown): RuntimeSpec | null {
   return parsed.success ? parsed.data : null;
 }
 
-export function instanceView(row: InstanceRow): InstanceView {
+/** A rank's last finished stop check (status probe), keyed by {@link stopCheckKey}. */
+export type StopCheck = NonNullable<InstanceView["ranks"][number]["lastStopCheck"]>;
+
+export function stopCheckKey(instanceId: string, rank: number): string {
+  return `${instanceId}:${rank}`;
+}
+
+/**
+ * `stopChecks`: the last finished status probe per rank of STOPPING instances, for callers that
+ * show why a stop is not confirmed (runtimes.get); others pass none and report null.
+ */
+export function instanceView(
+  row: InstanceRow,
+  stopChecks: ReadonlyMap<string, StopCheck> = new Map(),
+): InstanceView {
   const advanced = advancedView(row.Version.advanced);
   const context = stepViewContext(row);
   return {
@@ -353,6 +374,18 @@ export function instanceView(row: InstanceRow): InstanceView {
       port: rank.port,
       reserved: rank.claim,
       unitName: rank.unitName,
+      nodeConnection: rank.Node
+        ? {
+            state: rank.Node.connection,
+            since:
+              (rank.Node.connection === "ONLINE"
+                ? rank.Node.lastConnectedAt
+                : rank.Node.lastDisconnectedAt
+              )?.toISOString() ?? null,
+          }
+        : null,
+      lastStopCheck:
+        row.phase === "STOPPING" ? (stopChecks.get(stopCheckKey(row.id, rank.rank)) ?? null) : null,
     })),
     openSteps: row.Steps.map((step) => stepView(step, context)),
     // TODO(lane A, hot path): live load comes from the relay's in-memory engine-load cache.

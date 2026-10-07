@@ -229,7 +229,7 @@ async function operationView(operationId: string) {
     kind: operation.kind,
     createdAt: operation.createdAt.toISOString(),
     actor: actorRefOf(operation),
-    instances: operation.Instances.map(instanceView),
+    instances: operation.Instances.map((row) => instanceView(row)),
   };
 }
 

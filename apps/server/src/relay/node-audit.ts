@@ -56,7 +56,7 @@ export const NODE_AUDIT_KINDS = [
   "metric_commands_define",
   "node_update",
   "trust_lower",
-  "claim_forget",
+  "marked_stopped",
 ] as const satisfies readonly NodeAuditKind[];
 
 export const NODE_AUDIT_OUTCOMES = [

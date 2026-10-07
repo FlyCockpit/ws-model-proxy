@@ -424,7 +424,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     }
   });
 
-  it("settles a forgotten stop and releases it once a status probe proves it", async () => {
+  it("settles a stop marked stopped and releases it once a status probe proves it", async () => {
     const lc = await engine();
     const id = await startInstance(30_104);
     await lc.runOnce();
@@ -436,11 +436,11 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       data: { desiredState: "STOPPED", phase: "STOPPING", phaseReason: "stop_requested" },
     });
     await lc.runOnce();
-    // The stop cannot be proven; a person forgets it (what instances.forget writes).
+    // The stop cannot be proven; a person marks it stopped (what instances.markStopped writes).
     await answer(lc, lastJob(id, "stop"), "failed", { error: "command_failed" });
     await m.fixture.instanceRank.updateMany({
       where: { instanceId: id },
-      data: { claim: "HELD_UNKNOWN", forgottenAt: new Date(), forgottenBy: userId },
+      data: { claim: "HELD_UNKNOWN", markedStoppedAt: new Date(), markedStoppedBy: userId },
     });
     await lc.runOnce();
     let row = await instance(id);
@@ -481,12 +481,12 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     expect(row.needsOperator).toBeNull();
     expect(row.Ranks[0]?.claim).toBe("HELD");
     const first = lastJob(id, "status");
-    // The node cannot prove it (still alive, or unknown): now a person may Forget.
+    // The node cannot prove it (still alive, or unknown): now a person may mark it stopped.
     await answer(lc, first, "succeeded", { stopped: false });
     await lc.runOnce();
     row = await instance(id);
     expect(row.phase).toBe("STOPPING");
-    expect(row.needsOperator).toBe("FORGET");
+    expect(row.needsOperator).toBe("MARK_STOPPED");
     expect(sent.filter((job) => job.instanceId === id && job.phase === "status")).toHaveLength(1);
     // Later the probe is repeated; its proof completes the stop with no person.
     await m.fixture.instanceStep.updateMany({
@@ -540,7 +540,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     expect(row.phase).toBe("FAILED");
   });
 
-  it("asks a person to Forget a stop whose node stays offline", async () => {
+  it("asks a person to mark stopped a stop whose node stays offline", async () => {
     const lc = await engine();
     const id = await ready(lc, 30_105);
     await m.fixture.runtimeInstance.update({
@@ -560,7 +560,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       await lc.runOnce();
       const row = await instance(id);
       expect(row.phase).toBe("STOPPING");
-      expect(row.needsOperator).toBe("FORGET");
+      expect(row.needsOperator).toBe("MARK_STOPPED");
       expect(row.Ranks[0]?.claim).toBe("HELD");
     } finally {
       session.online = true;
@@ -1082,7 +1082,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     expect((await instance(id)).phase).toBe("STOPPED");
   });
 
-  it("forgets an inactive owner's unanswerable interactive stop; a status probe proves it", async () => {
+  it("marks stopped an inactive owner's unanswerable interactive stop; a status probe proves it", async () => {
     const lc = await engine();
     const id = await startInstance(30_216, "USER", "stopper");
     await lc.runOnce();
@@ -1095,7 +1095,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       await stopInstance(id);
       const before = sent.length;
       await lc.runOnce();
-      // No terminal for the stop: it is cancelled and the rank forgotten by the engine.
+      // No terminal for the stop: it is cancelled and the rank marked stopped by the engine.
       expect(sent.slice(before).some((job) => job.instanceId === id && job.phase === "stop")).toBe(
         false,
       );
@@ -1107,9 +1107,9 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       expect(inst.needsOperator).toBeNull();
       expect(inst.Ranks[0]).toMatchObject({
         claim: "HELD_UNKNOWN",
-        forgottenBy: "system:owner_inactive",
+        markedStoppedBy: "system:owner_inactive",
       });
-      expect(inst.Ranks[0]?.forgottenAt).not.toBeNull();
+      expect(inst.Ranks[0]?.markedStoppedAt).not.toBeNull();
       // The status probe goes out for the inactive owner and proves the stop.
       await lc.runOnce();
       const status = lastJob(id, "status");
@@ -1122,7 +1122,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     }
   });
 
-  it("forgets a stop a person gave up on once the owner is inactive", async () => {
+  it("marks stopped a stop a person gave up on once the owner is inactive", async () => {
     const lc = await engine();
     const id = await startInstance(30_217, "USER", "stopper");
     await lc.runOnce();
@@ -1136,7 +1136,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     await progress(lc, job, "awaiting_operator");
     await lc.cancelStep({ userId, stepId: job.stepId });
     let inst = await instance(id);
-    expect(inst.needsOperator).toBe("FORGET");
+    expect(inst.needsOperator).toBe("MARK_STOPPED");
     expect(inst.Ranks[0]?.claim).toBe("HELD");
     await markDeleting();
     try {

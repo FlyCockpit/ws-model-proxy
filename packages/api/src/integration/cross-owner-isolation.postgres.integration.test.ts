@@ -371,7 +371,10 @@ integration("cross-owner isolation on PostgreSQL", () => {
       "runtimes.stop the other's runtime on its node",
       (c) => c.runtimes.stop({ runtimeId: t.runtimeId, nodeId: t.nodeId }),
     ],
-    ["runtimes.instances.forget", (c) => c.runtimes.instances.forget({ instanceId: t.instanceId })],
+    [
+      "runtimes.instances.markStopped",
+      (c) => c.runtimes.instances.markStopped({ instanceId: t.instanceId }),
+    ],
     [
       "runtimes.update the other's runtime",
       (c) => c.runtimes.update({ runtimeId: t.runtimeId, spec: SPEC }),

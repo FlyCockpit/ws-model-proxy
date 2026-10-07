@@ -71,8 +71,8 @@ const BATCH = 64;
 const LIVE_STEP_STATES = ["PENDING", "RUNNING", "AWAITING_OPERATOR"] as const;
 const LIVE_PHASES = ["STARTING", "READY", "UNHEALTHY", "UNAVAILABLE"] as const;
 const STOP_ATTEMPTS = 3;
-/** A STOPPING rank whose node has been offline this long needs a person (Forget). */
-export const FORGET_AFTER_OFFLINE_MS = 10 * 60_000;
+/** A STOPPING rank whose node has been offline this long needs a person (Mark as stopped). */
+export const MARK_STOPPED_AFTER_OFFLINE_MS = 10 * 60_000;
 /** Held-unknown ranks are probed this often while their node is online. */
 export const HELD_UNKNOWN_PROBE_MS = 5 * 60_000;
 /** Completed health probes are kept this long. */
@@ -104,8 +104,8 @@ export const OPERATOR_CANCELLED = "operator_cancelled";
  * STARTING instance gang-stops with it as its reason).
  */
 export const OWNER_INACTIVE = "owner_inactive";
-/** `InstanceRank.forgottenBy` of a claim the engine forgot for an inactive owner (no person). */
-export const FORGOTTEN_OWNER_INACTIVE = "system:owner_inactive";
+/** `InstanceRank.markedStoppedBy` of a claim the engine marked stopped for an inactive owner (no person). */
+export const MARKED_STOPPED_OWNER_INACTIVE = "system:owner_inactive";
 
 /** A banned (ban active now) or deletion-pending owner, as `userCredentialAccessBlocked`. */
 function inactiveOwner(now: Date): Prisma.UserWhereInput {
@@ -128,9 +128,9 @@ function activeOwner(now: Date): Prisma.UserWhereInput {
   };
 }
 
-/** Codes that prove a stop cannot be proven by the node: a person decides (Forget). */
+/** Codes that prove a stop cannot be proven by the node: a person decides (Mark as stopped). */
 const UNPROVABLE_STOP = new Set([
-  // A person gave up on an interactive stop: they decide (Forget), nothing is retried.
+  // A person gave up on an interactive stop: they decide (Mark as stopped), nothing is retried.
   OPERATOR_CANCELLED,
   "definition_missing",
   "definition_frozen",
@@ -301,7 +301,7 @@ function rankInput(rank: InstanceRow["Ranks"][number]): RankInput {
 }
 
 /**
- * A status probe (stop proof) is for a forgotten claim, or a held claim of an instance that is
+ * A status probe (stop proof) is for a claim marked stopped, or a held claim of an instance that is
  * stopping (its stops could not prove the stop), sent for the run that holds it: a probe of an
  * earlier run carries that run's port and commands, so it proves nothing about a later one.
  * Anything else is the run that holds the claim now: a probe never goes out for it, and an
@@ -588,7 +588,7 @@ export class RuntimeLifecycle {
   /**
    * One pass over a STOPPING instance: cancel what no longer runs, release ranks that provably
    * never started, create stop steps for the rest, ask a person when a stop cannot be proven,
-   * and settle STOPPED once every claim is released (or forgotten).
+   * and settle STOPPED once every claim is released (or marked stopped).
    */
   private async settleStopping(tx: Tx, instance: InstanceRow) {
     const now = this.now();
@@ -638,7 +638,7 @@ export class RuntimeLifecycle {
         errorCode: true,
       },
     });
-    let needsForget = false;
+    let needsMarkStopped = false;
     // Claims as they are now (a caller's copy may predate a release in this transaction).
     const current = await tx.instanceRank.findMany({ where: { instanceId: instance.id } });
     for (const rank of current) {
@@ -671,17 +671,17 @@ export class RuntimeLifecycle {
           step.sequence < (generation + 1) * GENERATION_STRIDE,
       );
       // Offline too long: the stop cannot be proven until the node returns (a person may
-      // Forget), whether or not a stop is still queued for it.
+      // mark it stopped), whether or not a stop is still queued for it.
       if (
         rank.nodeId !== null &&
-        (await this.offlineSince(tx, rank.nodeId, FORGET_AFTER_OFFLINE_MS))
+        (await this.offlineSince(tx, rank.nodeId, MARK_STOPPED_AFTER_OFFLINE_MS))
       )
-        needsForget = true;
+        needsMarkStopped = true;
       if (stops.some((step) => (LIVE_STEP_STATES as readonly string[]).includes(step.state)))
         continue;
       const failed = stops.filter((step) => step.state === "FAILED");
       if (!launch || rank.nodeId === null) {
-        needsForget = true;
+        needsMarkStopped = true;
         continue;
       }
       if (
@@ -690,7 +690,7 @@ export class RuntimeLifecycle {
       ) {
         // The stop itself cannot prove it, but the node may: a status probe answers stopped
         // when the rank's process tree is gone and its port is free. A person is asked to
-        // Forget only once a probe could not prove it (or none can be sent); the probe keeps
+        // mark it stopped only once a probe could not prove it (or none can be sent); the probe keeps
         // being repeated, so a later proof still completes the stop with no person.
         // A person who gave up on an interactive stop decides at once (the probe still runs).
         const probeUnproven = await this.probeStoppingRank(
@@ -702,7 +702,7 @@ export class RuntimeLifecycle {
           now,
         );
         if (probeUnproven || failed.some((step) => step.errorCode === OPERATOR_CANCELLED))
-          needsForget = true;
+          needsMarkStopped = true;
         continue;
       }
       await this.insertSteps(tx, instance, [
@@ -725,9 +725,9 @@ export class RuntimeLifecycle {
       await this.settleStopped(tx, instance, now);
       return;
     }
-    // An unprovable stop needs Forget; otherwise a step waiting for its person needs them.
-    const need = needsForget
-      ? "FORGET"
+    // An unprovable stop needs Mark as stopped; otherwise a step waiting for its person needs them.
+    const need = needsMarkStopped
+      ? "MARK_STOPPED"
       : (await this.operatorStepWaiting(tx, instance.id))
         ? "STEP"
         : null;
@@ -753,9 +753,9 @@ export class RuntimeLifecycle {
   ): Promise<boolean> {
     if (rank.nodeId === null) return true;
     // An offline node gets its probe when it is back; a person is asked only once it has been
-    // away for FORGET_AFTER_OFFLINE_MS (a node connected to another server process is online).
+    // away for MARK_STOPPED_AFTER_OFFLINE_MS (a node connected to another server process is online).
     if (await this.offlineSince(tx, rank.nodeId, 0))
-      return this.offlineSince(tx, rank.nodeId, FORGET_AFTER_OFFLINE_MS);
+      return this.offlineSince(tx, rank.nodeId, MARK_STOPPED_AFTER_OFFLINE_MS);
     const probeGeneration = Math.max(generation, 1);
     const probes = await tx.instanceStep.findMany({
       where: {
@@ -818,7 +818,7 @@ export class RuntimeLifecycle {
     });
   }
 
-  /** Every claim is released or forgotten: STOPPED, then the restart rule for RUNNING. */
+  /** Every claim is released or marked stopped: STOPPED, then the restart rule for RUNNING. */
   private async settleStopped(tx: Tx, instance: InstanceRow, now: Date) {
     // Interactive stops still waiting for their person have nothing left to stop.
     await this.settleOperatorSteps(tx, instance.id, ["STOP"], "superseded");
@@ -997,8 +997,8 @@ export class RuntimeLifecycle {
         claim: "HELD",
         claimChangedAt: now,
         stoppedAt: null,
-        forgottenAt: null,
-        forgottenBy: null,
+        markedStoppedAt: null,
+        markedStoppedBy: null,
         blockedBy: [],
       },
     });
@@ -1287,7 +1287,7 @@ export class RuntimeLifecycle {
     // run always has its claim HELD).
     if (step.phase === "STOP" || step.phase === "STATUS") {
       const claim = instance.Ranks.find((rank) => rank.rank === step.rank)?.claim;
-      // A stop of an earlier run, or a probe of a claim that is no longer forgotten, would act
+      // A stop of an earlier run, or a probe of a claim that is no longer marked stopped, would act
       // on the run that holds the claim now: it never goes out.
       const superseded =
         (step.phase === "STOP" &&
@@ -1522,7 +1522,7 @@ export class RuntimeLifecycle {
   }
 
   /**
-   * `needsOperator` STEP while a step waits for its person; it clears when none does. FORGET
+   * `needsOperator` STEP while a step waits for its person; it clears when none does. MARK_STOPPED
    * (only while STOPPING, see settleStopping) and RESTART are kept.
    */
   private async syncNeedsOperator(tx: Tx, instanceId: string) {
@@ -1530,8 +1530,12 @@ export class RuntimeLifecycle {
       where: { id: instanceId },
       select: { needsOperator: true },
     });
-    // FORGET and RESTART are decided by the stop and restart rules, never by a step.
-    if (!instance || instance.needsOperator === "FORGET" || instance.needsOperator === "RESTART")
+    // MARK_STOPPED and RESTART are decided by the stop and restart rules, never by a step.
+    if (
+      !instance ||
+      instance.needsOperator === "MARK_STOPPED" ||
+      instance.needsOperator === "RESTART"
+    )
       return;
     const waiting = await this.operatorStepWaiting(tx, instanceId);
     const need = waiting
@@ -1847,7 +1851,7 @@ export class RuntimeLifecycle {
    * `runtimes.steps.cancel`: a person gives up on an interactive step that waits for them (or is
    * held, or whose terminal is coming up). It fails `operator_cancelled` and the instance follows
    * its rules: a start gang-stops (an interactive start then waits for a person's restart), a
-   * stop needs Forget. A person's run in progress is not cut off (`running`).
+   * stop needs Mark as stopped. A person's run in progress is not cut off (`running`).
    */
   async cancelStep(input: { userId: string; stepId: string }): Promise<void> {
     const instanceId = await prisma.instanceStep
@@ -2063,9 +2067,9 @@ export class RuntimeLifecycle {
       else if (isStartPhase(step.phase) && step.generation === generation) startCancelled = true;
     }
     // Ranks of the current run whose stop nobody can answer (just cancelled, or failed or given
-    // up earlier): forgotten (HELD_UNKNOWN) with no person. An older run's stop forgets nothing.
+    // up earlier): marked stopped (HELD_UNKNOWN) with no person. An older run's stop marks nothing.
     const unanswerable = await this.unanswerableStopRanks(tx, instance, generation);
-    let forgot = 0;
+    let marked = 0;
     for (const rank of instance.Ranks) {
       if (rank.claim !== "HELD" || !unanswerable.has(rank.rank)) continue;
       const changed = await tx.instanceRank.updateMany({
@@ -2073,13 +2077,13 @@ export class RuntimeLifecycle {
         data: {
           claim: "HELD_UNKNOWN",
           claimChangedAt: now,
-          forgottenAt: now,
-          forgottenBy: FORGOTTEN_OWNER_INACTIVE,
+          markedStoppedAt: now,
+          markedStoppedBy: MARKED_STOPPED_OWNER_INACTIVE,
         },
       });
-      forgot += changed.count;
+      marked += changed.count;
     }
-    if (!startCancelled && !stopCancelled && forgot === 0) return;
+    if (!startCancelled && !stopCancelled && marked === 0) return;
     const fresh = await tx.runtimeInstance.findUnique({
       where: { id: instanceId },
       include: INSTANCE_INCLUDE,
@@ -2277,7 +2281,7 @@ export class RuntimeLifecycle {
       if (succeeded && claim) {
         // The leading stop of a restart proves the previous run ended; the claim stays (the
         // new run uses it). Any other verified stop of this run releases it, and a probe
-        // releases a forgotten claim. A late answer of an earlier run releases nothing.
+        // releases a claim marked stopped. A late answer of an earlier run releases nothing.
         const proves =
           phase === "STATUS"
             ? statusProbeWanted(
@@ -2375,7 +2379,7 @@ export class RuntimeLifecycle {
 
   // ── Held-unknown probes ──
 
-  /** Forgotten ranks are probed with a status step every 5 minutes while the node is online. */
+  /** Ranks marked stopped are probed with a status step every 5 minutes while the node is online. */
   private async probeHeldUnknown() {
     const ranks = await prisma.instanceRank.findMany({
       where: { claim: "HELD_UNKNOWN", nodeId: { not: null } },
@@ -2425,7 +2429,7 @@ export class RuntimeLifecycle {
           }),
         ]);
       }).catch((error: unknown) =>
-        console.error("[lifecycle] probing a forgotten rank failed", errorName(error)),
+        console.error("[lifecycle] probing a rank marked stopped failed", errorName(error)),
       );
     }
   }

@@ -590,13 +590,13 @@ ALTER TABLE runtime_instance DROP CONSTRAINT IF EXISTS runtime_instance_notify_f
 ALTER TABLE runtime_instance ADD CONSTRAINT runtime_instance_notify_failures
   CHECK ("needsOperatorNotifyFailures" BETWEEN 0 AND 1000);
 -- needsOperator and its timestamp travel together; RESTART only for an instance that should
--- run and has stopped; FORGET only while STOPPING.
+-- run and has stopped; MARK_STOPPED only while STOPPING.
 ALTER TABLE runtime_instance DROP CONSTRAINT IF EXISTS runtime_instance_operator_shape;
 ALTER TABLE runtime_instance ADD CONSTRAINT runtime_instance_operator_shape CHECK (
   ("needsOperator" IS NULL) = ("needsOperatorSince" IS NULL)
   AND ("needsOperator" IS DISTINCT FROM 'RESTART'
        OR ("desiredState" = 'RUNNING' AND phase IN ('STOPPED', 'FAILED')))
-  AND ("needsOperator" IS DISTINCT FROM 'FORGET' OR phase = 'STOPPING')
+  AND ("needsOperator" IS DISTINCT FROM 'MARK_STOPPED' OR phase = 'STOPPING')
 );
 -- The admission view (versionId) and the launched version belong to the instance's runtime and
 -- share one launch hash (live adoption never changes what runs).
@@ -659,9 +659,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS instance_rank_reserved_port
   ON instance_rank ("nodeId", port) WHERE claim <> 'RELEASED';
 ALTER TABLE instance_rank DROP CONSTRAINT IF EXISTS instance_rank_claim_shape;
 ALTER TABLE instance_rank ADD CONSTRAINT instance_rank_claim_shape CHECK (
-  (claim <> 'HELD_UNKNOWN' OR "forgottenAt" IS NOT NULL)
+  (claim <> 'HELD_UNKNOWN' OR "markedStoppedAt" IS NOT NULL)
   AND (claim <> 'RELEASED' OR "stoppedAt" IS NOT NULL)
-  AND ("forgottenAt" IS NULL) = ("forgottenBy" IS NULL)
+  AND ("markedStoppedAt" IS NULL) = ("markedStoppedBy" IS NULL)
 );
 -- The held-unknown probe sweep pages these rows by id.
 CREATE INDEX IF NOT EXISTS instance_rank_held_unknown_id
