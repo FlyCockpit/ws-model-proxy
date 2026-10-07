@@ -2286,7 +2286,14 @@ where
     };
     // §4.8: only the routes this runtime's API, model type and definition
     // name, checked on the path as sent, before any connection is opened.
-    if !crate::runtimes::allowlist::allowed(&target.spec, &method, &path) {
+    if !crate::runtimes::allowlist::allowed(&target.spec, &method, &path)
+        && !crate::runtimes::allowlist::engine_description_allowed(
+            &target.spec,
+            &target.endpoint.base_url,
+            &method,
+            &path,
+        )
+    {
         tracing::warn!(
             request_id,
             handle,

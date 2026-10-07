@@ -102,6 +102,36 @@ pub fn allowed(spec: &RuntimeSpec, method: &str, path: &str) -> bool {
     false
 }
 
+/// The engine's own OpenAPI description, which the server reads to learn which request fields
+/// the engine accepts (`GET /openapi.json`; vLLM and SGLang serve it). Allowed only for a
+/// model-serving runtime whose address is on this machine's loopback, so the probe never
+/// leaves the node and never reaches a remote API.
+pub const ENGINE_DESCRIPTION_PATH: &str = "/openapi.json";
+
+pub fn engine_description_allowed(
+    spec: &RuntimeSpec,
+    base_url: &str,
+    method: &str,
+    path: &str,
+) -> bool {
+    method == "GET"
+        && path == ENGINE_DESCRIPTION_PATH
+        && spec.model_type.is_some()
+        && base_url_is_loopback(base_url)
+}
+
+fn base_url_is_loopback(base_url: &str) -> bool {
+    let Ok(url) = url::Url::parse(base_url) else {
+        return false;
+    };
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
 /// Request headers from the server that may reach an engine (lower-case
 /// names; mirrors the server's `sanitizeRelayRequestHeaders`). Framing,
 /// hop-by-hop, Host, forwarding and credential headers never do.
@@ -266,6 +296,69 @@ mod tests {
         ] {
             assert!(!request_header_allowed(name), "{name}");
         }
+    }
+
+    #[test]
+    fn the_engine_description_is_reachable_on_loopback_only() {
+        let llm = openai_llm();
+        for base in [
+            "http://127.0.0.1:8080/v1",
+            "http://127.0.0.2:8000",
+            "http://localhost:8000",
+            "http://[::1]:8000",
+        ] {
+            assert!(
+                engine_description_allowed(&llm, base, "GET", "/openapi.json"),
+                "{base}"
+            );
+        }
+        for base in [
+            "http://10.0.0.5:8000",
+            "http://192.168.1.2:8000",
+            "https://api.example.com",
+            "http://0.0.0.0:8000",
+            "not a url",
+        ] {
+            assert!(
+                !engine_description_allowed(&llm, base, "GET", "/openapi.json"),
+                "{base}"
+            );
+        }
+        let local = "http://127.0.0.1:8000";
+        assert!(!engine_description_allowed(
+            &llm,
+            local,
+            "POST",
+            "/openapi.json"
+        ));
+        for path in [
+            "/docs",
+            "/openapi.yaml",
+            "/v1/openapi.json",
+            "/openapi.json/../x",
+        ] {
+            assert!(
+                !engine_description_allowed(&llm, local, "GET", path),
+                "{path}"
+            );
+        }
+        // The plain allowlist still refuses it: only the loopback rule admits it.
+        assert!(!allowed(&llm, "GET", "/openapi.json"));
+        let service = spec(json!({
+            "launch": {
+                "management": "service", "groupSize": 1,
+                "resources": [{ "kind": "none" }], "labels": [],
+                "commands": [{ "start": "a", "stop": "b", "status": "c" }],
+                "readiness": { "path": "/health", "expectedStatus": 200, "timeoutMs": 60000 },
+                "health": { "intervalMs": 30000, "failureThreshold": 3, "successThreshold": 1 }
+            }
+        }));
+        assert!(!engine_description_allowed(
+            &service,
+            local,
+            "GET",
+            "/openapi.json"
+        ));
     }
 
     #[test]
