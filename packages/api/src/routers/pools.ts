@@ -143,22 +143,38 @@ function assertType(poolType: ModelType, modelType: ModelType, subjectId: string
     );
 }
 
-/** The served-model ids behind member references (plain reads; checked again on write). */
+/**
+ * The caller's served-model ids behind member references (plain reads; checked again on write).
+ * Another user's id is left out: it is refused when the member is added, and its fences are
+ * never taken.
+ */
 async function referencedModelIds(db: Tx, userId: string, refs: readonly MemberRef[]) {
-  const byRuntime = refs.filter(
-    (ref): ref is { runtimeId: string; model: string } => "runtimeId" in ref,
+  const byRuntime = refs.flatMap((ref) =>
+    "runtimeId" in ref ? [{ runtimeId: ref.runtimeId, upstreamModelId: ref.model }] : [],
   );
   const direct = refs.flatMap((ref) => ("runtimeModelId" in ref ? [ref.runtimeModelId] : []));
-  const resolved = byRuntime.length
-    ? await db.runtimeModel.findMany({
-        where: {
-          userId,
-          OR: byRuntime.map((ref) => ({ runtimeId: ref.runtimeId, upstreamModelId: ref.model })),
-        },
-        select: { id: true },
-      })
-    : [];
-  return [...direct, ...resolved.map((model) => model.id)];
+  if (byRuntime.length === 0 && direct.length === 0) return [];
+  const resolved = await db.runtimeModel.findMany({
+    where: {
+      userId,
+      OR: [...(direct.length ? [{ id: { in: direct } }] : []), ...byRuntime],
+    },
+    select: { id: true },
+  });
+  return resolved.map((model) => model.id);
+}
+
+/**
+ * The caller's provider models among `ids` (plain read; checked again on write). Another user's
+ * id is left out: replaceCloudMembers refuses it, and its fences are never taken.
+ */
+async function ownProviderModelIds(db: Tx, userId: string, ids: readonly string[]) {
+  if (ids.length === 0) return [];
+  const models = await db.providerModel.findMany({
+    where: { id: { in: [...ids] }, userId },
+    select: { id: true },
+  });
+  return models.map((model) => model.id);
 }
 
 async function addOwnMembers(
@@ -713,7 +729,11 @@ export const poolsRouter = {
           ...(await poolTargetFences(tx, pool.id)),
           ...(await modelTargetFences(tx, {
             runtimeModelIds: await referencedModelIds(tx, userId, input.members?.add ?? []),
-            providerModelIds: (input.cloudMembers ?? []).map((member) => member.providerModelId),
+            providerModelIds: await ownProviderModelIds(
+              tx,
+              userId,
+              (input.cloudMembers ?? []).map((member) => member.providerModelId),
+            ),
           })),
         ],
       );

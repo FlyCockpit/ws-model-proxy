@@ -88,7 +88,8 @@ const requests = {
     const versionIds = input.runtimeId
       ? (
           await prisma.runtimeVersion.findMany({
-            where: { runtimeId: input.runtimeId },
+            // The caller's own runtime only (the filter below matches only their resources).
+            where: { runtimeId: input.runtimeId, Runtime: { userId } },
             select: { id: true },
             take: 10_000,
           })
