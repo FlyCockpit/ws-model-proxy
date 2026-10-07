@@ -11,6 +11,11 @@ model User {
   email                      String
   slug                       String    @unique @default(cuid(2))
   emailVerified              Boolean   @default(false)
+  /// The address the verify-email flow proved (ASCII lower-cased), set only there. Unlike
+  /// `emailVerified` (forced true without SMTP and for admin-created accounts so they can sign
+  /// in), it is proof of the mailbox: a direct share by e-mail needs it to equal `email`. Not a
+  /// Better Auth field, so no auth route can write it.
+  provedEmail                String?
   image                      String?
   /// Better Auth admin plugin role string ("admin" | "user" | custom). Not an enum on purpose.
   role                       String    @default("user")

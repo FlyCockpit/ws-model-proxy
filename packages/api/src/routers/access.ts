@@ -20,6 +20,7 @@ import {
   setActiveMcpGrantLevel,
 } from "@ws-model-proxy/auth/mcp-grant-level";
 import { MCP_PAT_MAX_TTL_DAYS, mcpPatExpiryRejection } from "@ws-model-proxy/auth/mcp-pat-limits";
+import { hasProvedEmail } from "@ws-model-proxy/auth/proved-email";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
   credentialDigest,
@@ -711,11 +712,12 @@ const shares = {
     }
     const account = await prisma.user.findFirst({
       where: { email: { equals: email, mode: "insensitive" } },
-      select: { id: true, emailVerified: true },
+      select: { id: true, email: true, provedEmail: true },
     });
-    // Only an account whose e-mail is verified gets the share directly; anyone else proves
-    // the address through the invite (verification or the invite link).
-    const grantee = account?.emailVerified ? account : null;
+    // Only an account whose mailbox the verify-email flow proved gets the share directly.
+    // `emailVerified` is no proof: it is forced true without SMTP (anyone may register the
+    // address) and for admin-created accounts. Anyone else gets an invite that needs its link.
+    const grantee = account && hasProvedEmail(account) ? account : null;
     if (!grantee) {
       if (input.monthlyCap !== null || input.protectionPercent !== null) {
         throw badRequest(

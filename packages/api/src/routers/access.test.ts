@@ -588,9 +588,13 @@ describe("shares", () => {
     expect(db.pool.findFirst.mock.calls[0]?.[0]?.where).toEqual({ id: "pool1", userId: "owner" });
   });
 
-  it("shares directly with a verified account, under both owners' fences", async () => {
+  it("shares directly with an account whose mailbox was proved, under both owners' fences", async () => {
     db.pool.findFirst.mockResolvedValue(pool as never);
-    db.user.findFirst.mockResolvedValue({ id: "friend", emailVerified: true } as never);
+    db.user.findFirst.mockResolvedValue({
+      id: "friend",
+      email: "Friend@example.test",
+      provedEmail: "friend@example.test",
+    } as never);
     db.share.create.mockResolvedValue({ id: "share1" } as never);
     db.share.findUnique.mockResolvedValue(shareRow as never);
     const result = await client().shares.create(input);
@@ -609,7 +613,49 @@ describe("shares", () => {
 
   it("invites an unverified account instead of sharing directly", async () => {
     db.pool.findFirst.mockResolvedValue(pool as never);
-    db.user.findFirst.mockResolvedValue({ id: "squatter", emailVerified: false } as never);
+    db.user.findFirst.mockResolvedValue({
+      id: "squatter",
+      email: "friend@example.test",
+      provedEmail: null,
+    } as never);
+    db.shareInvite.findFirst.mockResolvedValue(null);
+    db.shareInvite.count.mockResolvedValue(0);
+    db.shareInvite.create.mockResolvedValue(inviteRow as never);
+    const result = await client().shares.create(input);
+    expect(result.kind).toBe("invite");
+    expect(db.share.create).not.toHaveBeenCalled();
+  });
+
+  // Codex finding 2: without SMTP (or for an admin-created account) `emailVerified` is forced
+  // true with no proof, so a squatter who registered the address must not get the share.
+  it("invites a login-verified account whose mailbox was never proved", async () => {
+    db.pool.findFirst.mockResolvedValue(pool as never);
+    db.user.findFirst.mockResolvedValue({
+      id: "squatter",
+      email: "friend@example.test",
+      emailVerified: true,
+      provedEmail: null,
+    } as never);
+    db.shareInvite.findFirst.mockResolvedValue(null);
+    db.shareInvite.count.mockResolvedValue(0);
+    db.shareInvite.create.mockResolvedValue(inviteRow as never);
+    const result = await client().shares.create(input);
+    expect(result.kind).toBe("invite");
+    expect(db.share.create).not.toHaveBeenCalled();
+    expect(db.user.findFirst.mock.calls[0]?.[0]?.select).toEqual({
+      id: true,
+      email: true,
+      provedEmail: true,
+    });
+  });
+
+  it("invites an account whose proof is for an address it no longer has", async () => {
+    db.pool.findFirst.mockResolvedValue(pool as never);
+    db.user.findFirst.mockResolvedValue({
+      id: "changed",
+      email: "friend@example.test",
+      provedEmail: "old@example.test",
+    } as never);
     db.shareInvite.findFirst.mockResolvedValue(null);
     db.shareInvite.count.mockResolvedValue(0);
     db.shareInvite.create.mockResolvedValue(inviteRow as never);
