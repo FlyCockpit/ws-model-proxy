@@ -80,7 +80,7 @@ describe("engine description probe", () => {
       path: "/openapi.json",
       family: "generic",
     });
-    expect(relay.calls[0]?.body).toBeUndefined();
+    expect(relay.calls[0]?.body).toEqual(new Uint8Array(0));
     expect(store.saveDescribedProfile).toHaveBeenCalledWith(
       target.key,
       expect.objectContaining({

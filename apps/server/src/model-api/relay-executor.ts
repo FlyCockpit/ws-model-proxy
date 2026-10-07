@@ -76,12 +76,22 @@ type RelayManager = Pick<
   | "completeRelayRequest"
 >;
 
+/** Exactly one request body; a bodiless request (a GET) sends an empty `body`. */
+type RelayAttemptBody =
+  | { body: Uint8Array; bodySource?: undefined }
+  | { body?: undefined; bodySource: RelayBodySource };
+
 type Deferred<T> = {
   promise: Promise<T>;
   resolve(value: T): void;
   reject(error: Error): void;
 };
 
+/**
+ * A promise settled from outside. It is marked handled at creation: a rejection nobody awaits
+ * (a caller that never reached `await`, or one that stopped listening) must not become an
+ * unhandled rejection, which ends the whole process. Callers that await it still see it.
+ */
 function deferred<T>(): Deferred<T> {
   let resolve: (value: T) => void = () => undefined;
   let reject: (error: Error) => void = () => undefined;
@@ -89,6 +99,7 @@ function deferred<T>(): Deferred<T> {
     resolve = promiseResolve;
     reject = promiseReject;
   });
+  void promise.catch(() => undefined);
   return { promise, resolve, reject };
 }
 
@@ -181,7 +192,7 @@ export function startRelayAttempt({
   countFirst,
   countCeiling,
   onCountResult,
-}: {
+}: RelayAttemptBody & {
   /** Caller-supplied only when durable telemetry must exist before dispatch. */
   requestId?: string;
   manager: RelayManager;
@@ -193,8 +204,6 @@ export function startRelayAttempt({
   method: "GET" | "POST" | "DELETE";
   path: string;
   headers: Headers;
-  body?: Uint8Array;
-  bodySource?: RelayBodySource;
   timeoutMs: number;
   abortSignal?: AbortSignal;
   onResponseBodyChunk?: (chunk: Uint8Array) => void;
@@ -202,6 +211,11 @@ export function startRelayAttempt({
   countCeiling?: number;
   onCountResult?: (message: CountContextResultMessage) => void;
 }): RelayAttempt {
+  // Checked before anything is armed: a throw after the timeout or abort listener exist would
+  // leave them settling an attempt its caller never received.
+  if ((body === undefined) === (bodySource === undefined)) {
+    throw new Error("A relay attempt requires exactly one request body representation.");
+  }
   const started = deferred<RelayAttemptStarted>();
   const terminal = deferred<RelayAttemptTerminal>();
 
@@ -401,10 +415,6 @@ export function startRelayAttempt({
     },
   };
 
-  if ((body === undefined) === (bodySource === undefined)) {
-    throw new Error("A relay attempt requires exactly one request body representation.");
-  }
-
   manager.registerRelayResponseHandlers({ nodeId, requestId, handlers });
   try {
     manager.sendRelayRequest({
@@ -439,6 +449,8 @@ export function startRelayAttempt({
     started: started.promise,
     terminal: terminal.promise,
     cancel(reason) {
+      // A settled attempt is over on the node too: a second cancel frame would be noise.
+      if (terminalSettled) return;
       manager.cancelRelayRequest({ nodeId, requestId, reason });
       finish({
         ok: false,

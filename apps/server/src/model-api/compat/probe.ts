@@ -88,6 +88,7 @@ export async function probeEngineDescription(
       method: "GET",
       path: "/openapi.json",
       headers: new Headers({ accept: "application/json" }),
+      body: new Uint8Array(0),
       timeoutMs: PROBE_TIMEOUT_MS,
     });
     const started = await attempt.started;
