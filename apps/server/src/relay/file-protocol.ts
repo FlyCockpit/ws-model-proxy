@@ -2,9 +2,11 @@ import { z } from "zod";
 
 /**
  * Node file tools: the strict per-op argument and result schemas, shared by the relay 3.0
- * frames (`frames.ts`), the MCP tool inputs (which add `nodeId`/`confirm`) and the
- * cross-language fixtures under `apps/cli/tests/fixtures/relay-3.0/`. The Rust mirror is
- * `apps/cli/src/file_ops` (`FileOps::execute`) and `apps/cli/src/file_relay.rs`.
+ * frames (`frames.ts`) and the cross-language fixtures under
+ * `apps/cli/tests/fixtures/relay-3.0/`. The MCP tool inputs are
+ * `packages/api/src/contracts/nodes.ts`, mapped to these args by
+ * `packages/api/src/nodes/files.ts`. The Rust mirror is `apps/cli/src/file_ops`
+ * (`FileOps::execute`) and `apps/cli/src/file_relay.rs`.
  *
  * Wire shape recap (control frames stay <= 64 KiB; the frame schemas live in `frames.ts`):
  * - S->N `file.op {opId, op, args, bodyBytes?}`: no mode or grant travels any more; the node
@@ -192,23 +194,6 @@ const deleteArgsShape = {
   expectedEtag: etagSchema.optional(),
   reason: reasonSchema.optional(),
 };
-
-/** MCP-tool input shapes (per op, without `cliDeviceId`/`confirm`), for reuse by the tool schemas. */
-export const fileToolArgShapes = {
-  read: readArgsShape,
-  stat: statArgsShape,
-  list: listArgsShape,
-  search: searchArgsShape,
-  edit: editArgsShape,
-  write: {
-    ...writeRelayArgsShape,
-    content: z.string(),
-    encoding: z.enum(["utf-8", "base64"]).optional(),
-  },
-  rename: renameArgsShape,
-  mkdir: mkdirArgsShape,
-  delete: deleteArgsShape,
-} as const;
 
 export const readArgsSchema = z.object(readArgsShape).strict();
 export const statArgsSchema = z.object(statArgsShape).strict();

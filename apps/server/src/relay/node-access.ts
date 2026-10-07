@@ -86,7 +86,10 @@ type AccessNode = {
 
 export type NodeAgentAccessInput = {
   userId: string;
+  /** The agent token id, or the OAuth grant id when `credentialKind` is "oauth_grant". */
   tokenId: string;
+  /** Which credential `tokenId` names (default: an agent token). */
+  credentialKind?: "agent_token" | "oauth_grant";
   /** The expiry the caller's credential was admitted with. */
   expiresAt: Date | null;
   nodeId: string;
@@ -99,6 +102,34 @@ export type NodeAgentAccessReads = {
   token: LiveAgentToken | null;
   owner: OwnerState | null;
 };
+
+/**
+ * The caller's credential if it is still live and FULL: an agent token (not revoked, not
+ * expired) or an OAuth grant (not revoked; its access tokens expire on their own and the MCP
+ * layer checks them per request).
+ */
+async function readLiveCredential(
+  input: NodeAgentAccessInput,
+  now: Date,
+): Promise<LiveAgentToken | null> {
+  if (input.credentialKind === "oauth_grant") {
+    const grant = await prisma.mcpGrant.findFirst({
+      where: { id: input.tokenId, userId: input.userId, level: "FULL", revokedAt: null },
+      select: { clientId: true },
+    });
+    return grant ? { name: grant.clientId, expiresAt: null } : null;
+  }
+  return prisma.agentToken.findFirst({
+    where: {
+      id: input.tokenId,
+      userId: input.userId,
+      level: "FULL",
+      revokedAt: null,
+      OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+    },
+    select: { name: true, expiresAt: true },
+  });
+}
 
 /**
  * Open the admission, read the node and live token together, then the owner last. The
@@ -125,16 +156,7 @@ export async function readNodeAgentAccess(
           rejectedProtocolVersion: true,
         },
       }),
-      prisma.agentToken.findFirst({
-        where: {
-          id: input.tokenId,
-          userId: input.userId,
-          level: "FULL",
-          revokedAt: null,
-          OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
-        },
-        select: { name: true, expiresAt: true },
-      }),
+      readLiveCredential(input, now),
     ]);
     const owner = await prisma.user.findUnique({
       where: { id: input.userId },
@@ -201,6 +223,8 @@ export function judgeNodeAgentAccess(
         }
       : { ok: false, error: "node_offline" };
   }
+  // The live session must be the caller's too (the stored row was checked above).
+  if (live.userId !== input.userId) return { ok: false, error: "node_offline" };
   if (live.trust !== "full") return { ok: false, error: "trust_relay" };
   if (capability === "command") {
     return { ok: true, token: reads.token, node, fileRoots: null };
