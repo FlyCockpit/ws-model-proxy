@@ -229,11 +229,15 @@ fn a_status_probe_proves_a_stop_the_stops_could_not() {
     probe.step_id = "s1".into();
     let alive = executor.execute(probe, &runtime, deadline());
     assert_eq!((alive.status, alive.stopped), (JobStatus::Succeeded, false));
+    // Each unproven answer says why, so a person sees why the claim stays held.
+    assert_eq!(alive.detail.as_deref(), Some("process_alive"));
     runtime.units.borrow_mut().clear();
     runtime.port_busy.set(true);
     let mut probe = job(JobPhase::Status);
     probe.step_id = "s2".into();
-    assert!(!executor.execute(probe, &runtime, deadline()).stopped);
+    let busy = executor.execute(probe, &runtime, deadline());
+    assert!(!busy.stopped);
+    assert_eq!(busy.detail.as_deref(), Some("port_in_use"));
     // The process tree is gone and the port is free: proven, and the record resolves.
     runtime.port_busy.set(false);
     let mut probe = job(JobPhase::Status);
@@ -243,6 +247,7 @@ fn a_status_probe_proves_a_stop_the_stops_could_not() {
         (proven.status, proven.stopped),
         (JobStatus::Succeeded, true)
     );
+    assert_eq!(proven.detail, None);
     assert_eq!(
         executor.observations(&runtime, deadline())[0].1.phase,
         InstancePhase::Stopped
@@ -483,4 +488,20 @@ fn a_missing_secret_refuses_a_launch_before_anything_is_recorded() {
     );
     assert_eq!(runtime.launches.get(), 0);
     assert!(!path.exists());
+}
+
+#[test]
+fn a_status_probe_whose_status_command_cannot_tell_says_so() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    let mut probe = job(JobPhase::Status);
+    probe.status_command = Some("systemctl is-active llm".into());
+    let unproven = executor.execute(probe, &runtime, deadline());
+    assert_eq!(
+        (unproven.status, unproven.stopped),
+        (JobStatus::Succeeded, false)
+    );
+    assert_eq!(unproven.detail.as_deref(), Some("status_unknown"));
 }
