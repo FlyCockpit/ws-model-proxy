@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { ORPCError } from "@orpc/server";
+import { hasProvedEmail } from "@ws-model-proxy/auth/proved-email";
 import prisma from "@ws-model-proxy/db";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import { agentRulesApply } from "../contracts/auth-context";
@@ -47,6 +48,7 @@ import {
   versionDetail,
   versionSummary,
 } from "../lib/runtime-views";
+import { deliverInvite, writeInvite } from "../lib/share-invite-write";
 import { normalizeBaseUrl, parseDetectedServers } from "../nodes/views";
 import { runtimeStart, runtimeStop } from "./runtime-lifecycle";
 import { runtimeSteps } from "./runtime-steps";
@@ -684,6 +686,8 @@ export const runtimesRouter = {
     });
     try {
       await graphDelete({ userId, runtimeIds: [runtime.id] }, async (tx) => {
+        // Its invites go with it (the cascade would too): no link opens a deleted runtime.
+        await tx.shareInvite.deleteMany({ where: { runtimeId: runtime.id, ownerUserId: userId } });
         await tx.runtimeInstance.deleteMany({ where: { runtimeId: runtime.id } });
         await tx.runtime.update({ where: { id: runtime.id }, data: { currentVersionId: null } });
         await tx.runtime.delete({ where: { id: runtime.id } });
@@ -912,19 +916,41 @@ export const runtimesRouter = {
         }),
       };
     }),
+    /**
+     * The pool rule (`access.shares.create`): a direct share only with an account whose mailbox
+     * the verify-email flow proved; anyone else, an unknown e-mail included, gets an invite that
+     * needs its link, with the same answer shape, so the answer tells nothing about accounts.
+     */
     create: contractProcedure(c.shares.create).handler(async ({ input, context }) => {
       const userId = userIdOf(context);
       const runtime = await prisma.runtime.findFirst({
         where: { id: input.runtimeId, userId },
-        select: { id: true },
+        select: { id: true, User: { select: { name: true, locale: true } } },
       });
       if (!runtime) throw notFound("That runtime does not exist.");
-      const grantee = await prisma.user.findFirst({
-        where: { email: input.email },
-        select: { id: true },
+      const email = input.email;
+      if (email === context.session.user.email.trim().toLowerCase())
+        throw new ORPCError("BAD_REQUEST", { message: "You already own this runtime." });
+      const account = await prisma.user.findFirst({
+        where: { email: { equals: email, mode: "insensitive" } },
+        select: { id: true, email: true, provedEmail: true },
       });
-      if (!grantee || grantee.id === userId)
-        throw notFound("No other account uses that e-mail address.");
+      const grantee = account && hasProvedEmail(account) ? account : null;
+      if (!grantee) {
+        const written = await writeInvite({
+          mode: "create",
+          ownerUserId: userId,
+          target: { kind: "runtime", runtimeId: runtime.id },
+          email,
+        });
+        const delivered = await deliverInvite({
+          ...written,
+          owner: { name: runtime.User.name, locale: runtime.User.locale },
+        });
+        return { kind: "invite" as const, ...delivered };
+      }
+      if (grantee.id === userId)
+        throw new ORPCError("BAD_REQUEST", { message: "You already own this runtime." });
       const share = await graphWrite([userId, grantee.id], (tx) =>
         tx.runtimeShare.upsert({
           where: {
@@ -932,10 +958,18 @@ export const runtimesRouter = {
           },
           create: { runtimeId: runtime.id, ownerUserId: userId, granteeUserId: grantee.id },
           update: {},
-          select: { id: true },
+          select: { id: true, runtimeId: true, createdAt: true },
         }),
       );
-      return { id: share.id };
+      return {
+        kind: "share" as const,
+        share: {
+          id: share.id,
+          runtimeId: share.runtimeId,
+          email: grantee.email,
+          createdAt: share.createdAt.toISOString(),
+        },
+      };
     }),
     delete: contractProcedure(c.shares.delete).handler(async ({ input, context }) => {
       const userId = userIdOf(context);

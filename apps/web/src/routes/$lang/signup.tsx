@@ -220,7 +220,7 @@ function SignupPage() {
           lang={lang}
           token={invite}
           ownerName={validInvite.ownerName ?? ""}
-          callableId={validInvite.callableId ?? ""}
+          target={validInvite.target}
         />
       </Frame>
     );
@@ -234,10 +234,15 @@ function SignupPage() {
             <>
               <CardTitle className="text-2xl">{t("auth:invite.title")}</CardTitle>
               <CardDescription className="break-words">
-                {t("auth:invite.description", {
-                  ownerName: validInvite.ownerName ?? "",
-                  callableId: validInvite.callableId ?? "",
-                })}
+                {validInvite.target?.kind === "runtime"
+                  ? t("auth:invite.runtimeDescription", {
+                      ownerName: validInvite.ownerName ?? "",
+                      name: validInvite.target.name,
+                    })
+                  : t("auth:invite.description", {
+                      ownerName: validInvite.ownerName ?? "",
+                      callableId: validInvite.target?.name ?? "",
+                    })}
               </CardDescription>
               <CardDescription>{t("auth:invite.anyEmail")}</CardDescription>
             </>
@@ -277,12 +282,13 @@ function AcceptInviteCard({
   lang,
   token,
   ownerName,
-  callableId,
+  target,
 }: {
   lang: string;
   token: string;
   ownerName: string;
-  callableId: string;
+  /** What the invite shares: a pool's callable id or a runtime definition's name. */
+  target: { kind: "pool" | "runtime"; name: string } | null;
 }) {
   const { t } = useTranslation(["auth"]);
   const acceptInvite = useMutation({
@@ -292,6 +298,8 @@ function AcceptInviteCard({
     },
   });
   const result = acceptInvite.data?.result;
+  const runtime = target?.kind === "runtime";
+  const name = target?.name ?? "";
 
   if (result === "accepted") {
     return (
@@ -299,7 +307,9 @@ function AcceptInviteCard({
         <CardHeader className="text-center">
           <CardTitle className="text-2xl">{t("auth:invite.acceptedTitle")}</CardTitle>
           <CardDescription className="break-words">
-            {t("auth:invite.acceptedDescription", { callableId })}
+            {runtime
+              ? t("auth:invite.runtimeAcceptedDescription", { name })
+              : t("auth:invite.acceptedDescription", { callableId: name })}
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -316,8 +326,8 @@ function AcceptInviteCard({
   }
 
   const refusal =
-    result === "own_pool"
-      ? t("auth:invite.ownPool")
+    result === "own"
+      ? t("auth:invite.own")
       : result === "invalid"
         ? t("auth:invite.invalidDescription")
         : null;
@@ -332,7 +342,9 @@ function AcceptInviteCard({
           {refusal ??
             (result === "in_use"
               ? t("auth:invite.inUse")
-              : t("auth:invite.signedInDescription", { ownerName, callableId }))}
+              : runtime
+                ? t("auth:invite.runtimeSignedInDescription", { ownerName, name })
+                : t("auth:invite.signedInDescription", { ownerName, callableId: name }))}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">

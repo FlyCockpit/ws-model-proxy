@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { NODE_LOCAL_PLACEHOLDERS } from "../lib/command-render";
 import { RUNTIME_SPEC_WARNINGS, runtimeSpecSchema } from "../lib/runtime-spec";
+import { shareInviteViewSchema } from "./access";
 import {
   runtimeAdvancedPatchSchema,
   runtimeAdvancedViewSchema,
@@ -233,6 +234,11 @@ export const runtimeDetailSchema = runtimeSummarySchema
     /** Nodes holding an older version of this runtime frozen (Relay only). */
     frozenOn: z.array(z.object({ nodeId: idSchema, versionId: idSchema }).strict()),
   })
+  .strict();
+
+/** A share of your runtime definition. */
+export const runtimeShareViewSchema = z
+  .object({ id: idSchema, runtimeId: idSchema, email: z.string(), createdAt: isoDateSchema })
   .strict();
 
 // ── Previews and operations ──
@@ -602,16 +608,7 @@ export const runtimesContract = {
       z.object({ runtimeId: idSchema.optional() }).strict(),
       z
         .object({
-          sharedByMe: z.array(
-            z
-              .object({
-                id: idSchema,
-                runtimeId: idSchema,
-                email: z.string(),
-                createdAt: isoDateSchema,
-              })
-              .strict(),
-          ),
+          sharedByMe: z.array(runtimeShareViewSchema),
           sharedWithMe: z.array(
             z
               .object({
@@ -631,8 +628,18 @@ export const runtimesContract = {
     create: mutation(
       "human",
       z.object({ runtimeId: idSchema, email: emailSchema }).strict(),
-      z.object({ id: idSchema }).strict(),
-      "Share a runtime definition (read-only, all versions).",
+      z.discriminatedUnion("kind", [
+        z.object({ kind: z.literal("share"), share: runtimeShareViewSchema }).strict(),
+        z
+          .object({
+            kind: z.literal("invite"),
+            invite: shareInviteViewSchema,
+            /** Shown once, only when no e-mail could be sent: copy it to the person. */
+            link: z.string().nullable(),
+          })
+          .strict(),
+      ]),
+      "Share a runtime definition (read-only, all versions), as access.shares.create does a pool: directly only with an account whose mailbox was proved; any other e-mail (an unknown one included, answered alike) gets an invite that needs its link (access.invites resend/revoke).",
     ),
     delete: mutation(
       "human",

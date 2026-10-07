@@ -202,7 +202,9 @@ const GRAPH_WRITERS: Record<string, string> = {
   "packages/api/src/lib/runtime-store.ts":
     "M: runtime versions, written inside lane C's graphWrite (owner fence, then capacity fences of the runtime's instances)",
   "packages/api/src/lib/share-invite-accept.ts":
-    "M: invite acceptance creates the share under both owners' fences (sorted), then the invite row",
+    "M: invite acceptance creates the pool share or runtime share under both owners' fences (sorted), then the invite row",
+  "packages/api/src/lib/share-invite-write.ts":
+    "M: pool and runtime invites (create, resend) under runAccessTransaction (the owner's fence); emailSentAt is a status column",
   "packages/api/src/nodes/enroll-exchange.ts":
     "M: enrollment exchange creates or takes over the node under graphWrite (the code owner's fence), code row FOR UPDATE",
   "packages/api/src/nodes/fabrics.ts":

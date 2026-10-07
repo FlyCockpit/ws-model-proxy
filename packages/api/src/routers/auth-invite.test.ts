@@ -78,7 +78,7 @@ describe("auth.acceptInvite (signed in)", () => {
     );
   });
 
-  it.each(["invalid", "own_pool", "in_use"] as const)("answers %s as a result", async (result) => {
+  it.each(["invalid", "own", "in_use"] as const)("answers %s as a result", async (result) => {
     accept.acceptShareInviteByLink.mockResolvedValueOnce(result);
     await expect(client(signedIn()).acceptInvite({ token: TOKEN })).resolves.toEqual({ result });
   });

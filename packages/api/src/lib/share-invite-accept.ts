@@ -1,6 +1,7 @@
 /**
- * Share invite acceptance (contract fix e4dc646b): a pending invite becomes a share through
- * its link, or by e-mail match only for a proven address (`inviteAcceptance`).
+ * Share invite acceptance (contract fix e4dc646b): a pending invite becomes a share (of its pool,
+ * or of its runtime definition) through its link, or by e-mail match only for a proven address
+ * (`inviteAcceptance`).
  *
  * - `acceptShareInvitesForProvenEmail`: Better Auth calls it (via the registry in
  *   `@ws-model-proxy/auth/share-invite-acceptance`) on account creation and on the e-mail
@@ -49,6 +50,7 @@ const inviteSelect = {
   acceptedAt: true,
   revokedAt: true,
   poolId: true,
+  runtimeId: true,
   ownerUserId: true,
   canUse: true,
   canContribute: true,
@@ -56,8 +58,11 @@ const inviteSelect = {
 } as const;
 type InviteRow = Prisma.ShareInviteGetPayload<{ select: typeof inviteSelect }>;
 
-/** What became of an invite link: accepted (now or already a share), or not. */
-export type LinkAcceptance = "accepted" | "invalid" | "own_pool" | "in_use";
+/**
+ * What became of an invite link: accepted (now or already a share), or not (`own`: the invite
+ * is to the person's own pool or runtime).
+ */
+export type LinkAcceptance = "accepted" | "invalid" | "own" | "in_use";
 
 /** Pending, plus whatever extra condition the caller holds the invite under. */
 function liveInviteWhere(now: Date, guard: InviteWhere): InviteWhere {
@@ -72,6 +77,45 @@ function linkHoldWhere(tokenDigest: string, claim: SignupClaim): InviteWhere {
   return { tokenDigest, ...claimUnchangedWhere(claim) };
 }
 
+/** The pool share, or runtime share, the invite becomes; `created` when it did not exist. */
+async function shareFor(
+  tx: Tx,
+  invite: InviteRow,
+  userId: string,
+): Promise<{ data: { shareId: string } | { runtimeShareId: string }; created: boolean }> {
+  if (invite.runtimeId !== null) {
+    const where = {
+      runtimeId_granteeUserId: { runtimeId: invite.runtimeId, granteeUserId: userId },
+    };
+    const existing = await tx.runtimeShare.findUnique({ where, select: { id: true } });
+    if (existing) return { data: { runtimeShareId: existing.id }, created: false };
+    const created = await tx.runtimeShare.create({
+      data: { runtimeId: invite.runtimeId, ownerUserId: invite.ownerUserId, granteeUserId: userId },
+      select: { id: true },
+    });
+    return { data: { runtimeShareId: created.id }, created: true };
+  }
+  // The hardening keeps exactly one target.
+  if (invite.poolId === null) throw new Error("share invite without a target");
+  const existing = await tx.share.findUnique({
+    where: { poolId_granteeUserId: { poolId: invite.poolId, granteeUserId: userId } },
+    select: { id: true },
+  });
+  if (existing) return { data: { shareId: existing.id }, created: false };
+  const created = await tx.share.create({
+    data: {
+      poolId: invite.poolId,
+      ownerUserId: invite.ownerUserId,
+      granteeUserId: userId,
+      canUse: invite.canUse,
+      canContribute: invite.canContribute,
+      priorityClass: invite.priorityClass,
+    },
+    select: { id: true },
+  });
+  return { data: { shareId: created.id }, created: true };
+}
+
 async function acceptOne(
   tx: Tx,
   invite: InviteRow,
@@ -80,33 +124,15 @@ async function acceptOne(
   guard: InviteWhere = {},
 ): Promise<boolean> {
   if (invite.ownerUserId === userId) return false;
-  const existing = await tx.share.findUnique({
-    where: { poolId_granteeUserId: { poolId: invite.poolId, granteeUserId: userId } },
-    select: { id: true },
-  });
-  const shareId =
-    existing?.id ??
-    (
-      await tx.share.create({
-        data: {
-          poolId: invite.poolId,
-          ownerUserId: invite.ownerUserId,
-          granteeUserId: userId,
-          canUse: invite.canUse,
-          canContribute: invite.canContribute,
-          priorityClass: invite.priorityClass,
-        },
-        select: { id: true },
-      })
-    ).id;
+  const share = await shareFor(tx, invite, userId);
   // Guarded on still pending (and the caller's hold): a concurrent accept or revoke wins and
   // this one rolls back.
   const updated = await tx.shareInvite.updateMany({
     where: { id: invite.id, ...liveInviteWhere(now, guard) },
-    data: { acceptedAt: now, shareId },
+    data: { acceptedAt: now, ...share.data },
   });
   if (updated.count !== 1) throw new InviteChangedError();
-  return !existing;
+  return share.created;
 }
 
 /** Applies a decision under the fences of the account and every inviting owner. */
@@ -196,7 +222,7 @@ async function acceptLink(
     select: { ...inviteSelect, ...claimSelect },
   });
   if (!linkInvite) return "invalid";
-  if (linkInvite.ownerUserId === user.id) return "own_pool";
+  if (linkInvite.ownerUserId === user.id) return "own";
   const hold = await claimHold(linkInvite, inviteEmailKey(user.email), now);
   if (mode === "signup" && hold !== "mine") return "invalid";
   if (hold === "in_use") return "in_use";

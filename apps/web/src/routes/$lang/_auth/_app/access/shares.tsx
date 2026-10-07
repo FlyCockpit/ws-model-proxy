@@ -43,7 +43,9 @@ type ShareView = {
 };
 type InviteView = {
   id: string;
-  callableId: string;
+  target:
+    | { kind: "pool"; poolId: string; callableId: string }
+    | { kind: "runtime"; runtimeId: string; name: string };
   email: string;
   canUse: boolean;
   canContribute: boolean;
@@ -351,7 +353,9 @@ function InviteRow({ invite, onLink }: { invite: InviteView; onLink: (link: Invi
     <div className="flex min-w-0 flex-col gap-2 py-3 first:pt-0 last:pb-0 sm:flex-row sm:items-start sm:justify-between">
       <div className="min-w-0 space-y-0.5">
         <p className="truncate font-medium">{invite.email}</p>
-        <p className="truncate font-mono text-xs text-muted-foreground">{invite.callableId}</p>
+        <p className="truncate font-mono text-xs text-muted-foreground">
+          {invite.target.kind === "pool" ? invite.target.callableId : invite.target.name}
+        </p>
         <p className="text-xs text-muted-foreground">
           {invite.emailSentAt ? t("access:shares.emailSent") : t("access:shares.notEmailed")}
           {" · "}

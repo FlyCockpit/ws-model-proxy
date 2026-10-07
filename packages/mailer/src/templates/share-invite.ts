@@ -1,7 +1,7 @@
 /**
- * Renders the pool share invite (an e-mail without an account yet). Every caller-supplied value
- * (owner name, pool id, date) is HTML-escaped before interpolation; the link must be an
- * absolute HTTP(S) URL.
+ * Renders a share invite (a pool or a runtime definition, to an e-mail not proved yet). Every
+ * caller-supplied value (owner name, pool id or runtime name, date) is HTML-escaped before
+ * interpolation; the link must be an absolute HTTP(S) URL.
  */
 import enBundle from "../locales/en-US/share-invite.json";
 import esBundle from "../locales/es-MX/share-invite.json";
@@ -12,6 +12,9 @@ interface ShareInviteBundle {
   subject: string;
   heading: string;
   body: string;
+  runtimeSubject: string;
+  runtimeHeading: string;
+  runtimeBody: string;
   cta: string;
   expiry: string;
   ignoreFooter: string;
@@ -30,8 +33,8 @@ function interpolate(template: string, vars: Record<string, string>): string {
 
 export interface RenderShareInviteArgs {
   ownerName: string;
-  /** The pool's callable id (`owner/pool`). */
-  callableId: string;
+  /** What is shared: a pool (its callable id, `owner/pool`) or a runtime definition (its name). */
+  target: { kind: "pool"; callableId: string } | { kind: "runtime"; name: string };
   /** Absolute URL of the invite sign-up page (carries the one-time token). */
   inviteUrl: string;
   expiresAt: Date;
@@ -54,12 +57,19 @@ export function renderShareInvite(args: RenderShareInviteArgs): RenderShareInvit
   // The subject is plain text (no HTML), so it takes the raw values with control characters
   // removed; the body takes the escaped ones.
   const plainOwner = args.ownerName.replace(/[\p{Cc}\p{Cf}]/gu, " ").slice(0, 120);
-  const subject = interpolate(bundle.subject, { owner: plainOwner });
+  const runtime = args.target.kind === "runtime";
+  const subject = interpolate(runtime ? bundle.runtimeSubject : bundle.subject, {
+    owner: plainOwner,
+  });
   const vars = {
     owner: escapeHtml(args.ownerName),
-    pool: `<code>${escapeHtml(args.callableId)}</code>`,
+    ...(args.target.kind === "runtime"
+      ? { runtime: `<strong>${escapeHtml(args.target.name)}</strong>` }
+      : { pool: `<code>${escapeHtml(args.target.callableId)}</code>` }),
     expiresAt: escapeHtml(expiresAt),
   };
+  const heading = runtime ? bundle.runtimeHeading : bundle.heading;
+  const body = runtime ? bundle.runtimeBody : bundle.body;
   const html = `<!DOCTYPE html>
 <html lang="${locale}">
 <head><meta charset="utf-8" /></head>
@@ -68,8 +78,8 @@ export function renderShareInvite(args: RenderShareInviteArgs): RenderShareInvit
     <tr><td align="center">
       <table width="480" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:8px;padding:40px;max-width:480px">
         <tr><td>
-          <h1 style="margin:0 0 16px;font-size:22px;color:#18181b">${escapeHtml(bundle.heading)}</h1>
-          <p style="margin:0 0 24px;font-size:15px;color:#52525b;line-height:1.5">${interpolate(escapeHtml(bundle.body), vars)}</p>
+          <h1 style="margin:0 0 16px;font-size:22px;color:#18181b">${escapeHtml(heading)}</h1>
+          <p style="margin:0 0 24px;font-size:15px;color:#52525b;line-height:1.5">${interpolate(escapeHtml(body), vars)}</p>
           <p style="margin:0 0 24px;text-align:center">
             <a href="${href}" style="display:inline-block;padding:12px 32px;background:#18181b;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;border-radius:6px">${escapeHtml(bundle.cta)}</a>
           </p>

@@ -48,16 +48,8 @@ import {
 } from "../lib/access-views";
 import { isUniqueViolation, notFound, refuse } from "../lib/refuse";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
-import {
-  generateShareInviteToken,
-  pendingInviteWhere,
-  SHARE_INVITE_MAX_PENDING_PER_OWNER,
-  SHARE_INVITE_RESEND_COOLDOWN_MS,
-  SHARE_INVITE_TTL_MS,
-  sendShareInviteEmail,
-  shareInviteDigest,
-  shareInviteUrl,
-} from "../lib/share-invites";
+import { deliverInvite, writeInvite } from "../lib/share-invite-write";
+import { pendingInviteWhere } from "../lib/share-invites";
 
 /** Active (unrevoked, unexpired) API keys one person may hold. */
 export const API_KEY_MAX_ACTIVE_PER_USER = 50;
@@ -526,151 +518,6 @@ async function ownedPool(userId: string, poolId: string) {
   return pool;
 }
 
-type InviteSettings = {
-  canUse: boolean;
-  canContribute: boolean;
-  priorityClass: "BACKGROUND" | "NORMAL" | "HIGH" | null;
-};
-
-/**
- * Writes a pending invite for (pool, e-mail) with a fresh token (contract fix): a new invite
- * when none is pending, or, for a resend, the pending one with its token and expiry rotated
- * (the old link stops working). Earlier accepted, revoked or expired rows stay as history.
- */
-async function writeInvite(
-  args:
-    | {
-        mode: "create";
-        ownerUserId: string;
-        poolId: string;
-        email: string;
-        settings: InviteSettings;
-      }
-    | { mode: "resend"; ownerUserId: string; inviteId: string },
-) {
-  const now = new Date();
-  const token = generateShareInviteToken();
-  const tokenDigest = shareInviteDigest(token);
-  const expiresAt = new Date(now.getTime() + SHARE_INVITE_TTL_MS);
-  const row = await runAccessTransaction({ owners: [args.ownerUserId] }, async (tx) => {
-    if (args.mode === "resend") {
-      const invite = await tx.shareInvite.findFirst({
-        where: { id: args.inviteId, ownerUserId: args.ownerUserId, ...pendingInviteWhere(now) },
-        select: { createdAt: true, updatedAt: true },
-      });
-      if (!invite) throw notFound("That key, token, connection, share or invite does not exist.");
-      if (now.getTime() - invite.updatedAt.getTime() < SHARE_INVITE_RESEND_COOLDOWN_MS) {
-        throw new ORPCError("CONFLICT", {
-          message: "This invite was just sent. Wait a minute before sending it again.",
-          data: { reason: "rate_limited" },
-        });
-      }
-      const rotated = await tx.shareInvite.updateMany({
-        where: { id: args.inviteId, ownerUserId: args.ownerUserId, ...pendingInviteWhere(now) },
-        // A new link starts free: an old link's sign-up claim does not hold the new one.
-        data: {
-          tokenDigest,
-          expiresAt,
-          emailSentAt: null,
-          signupClaimedAt: null,
-          signupClaimedEmail: null,
-        },
-      });
-      if (rotated.count !== 1)
-        throw notFound("That key, token, connection, share or invite does not exist.");
-      return tx.shareInvite.findUniqueOrThrow({
-        where: { id: args.inviteId },
-        select: shareInviteSelect,
-      });
-    }
-    // An expired invite still holds the one-pending slot (the partial unique index ignores
-    // expiry): withdraw it so the address can be invited again.
-    await tx.shareInvite.updateMany({
-      where: {
-        poolId: args.poolId,
-        email: args.email,
-        ownerUserId: args.ownerUserId,
-        acceptedAt: null,
-        revokedAt: null,
-        expiresAt: { lte: now },
-      },
-      data: { revokedAt: now },
-    });
-    const pending = await tx.shareInvite.findFirst({
-      where: { poolId: args.poolId, email: args.email, ...pendingInviteWhere(now) },
-      select: { id: true },
-    });
-    if (pending) {
-      throw new ORPCError("CONFLICT", {
-        message: "This e-mail already has a pending invite to this pool. Resend it instead.",
-      });
-    }
-    const pendingCount = await tx.shareInvite.count({
-      where: { ownerUserId: args.ownerUserId, ...pendingInviteWhere(now) },
-    });
-    if (pendingCount >= SHARE_INVITE_MAX_PENDING_PER_OWNER) {
-      throw new ORPCError("CONFLICT", {
-        message: "Too many pending invites. Withdraw some before inviting more people.",
-      });
-    }
-    return tx.shareInvite
-      .create({
-        data: {
-          poolId: args.poolId,
-          ownerUserId: args.ownerUserId,
-          email: args.email,
-          tokenDigest,
-          canUse: args.settings.canUse,
-          canContribute: args.settings.canContribute,
-          priorityClass: args.settings.priorityClass,
-          expiresAt,
-        },
-        select: shareInviteSelect,
-      })
-      .catch((error: unknown) => {
-        // One pending invite per pool and e-mail (partial unique index): a concurrent invite
-        // to the same address won.
-        if (isUniqueViolation(error)) {
-          throw new ORPCError("CONFLICT", {
-            message: "This e-mail already has a pending invite to this pool. Resend it instead.",
-          });
-        }
-        throw error;
-      });
-  });
-  return { row, token, expiresAt: row.expiresAt };
-}
-
-/** E-mails the invite; returns the view and, only when no e-mail went out, the link. */
-async function deliverInvite(args: {
-  row: Awaited<ReturnType<typeof writeInvite>>["row"];
-  token: string;
-  expiresAt: Date;
-  owner: { name: string; locale: string };
-}) {
-  const callableId = callableIdOf(args.row.Pool.User.slug, args.row.Pool.slug);
-  const sent = await sendShareInviteEmail({
-    to: args.row.email,
-    ownerName: args.owner.name,
-    callableId,
-    token: args.token,
-    expiresAt: args.expiresAt,
-    locale: args.owner.locale,
-  });
-  if (!sent) {
-    return {
-      invite: shareInviteView(args.row),
-      link: shareInviteUrl(args.token, args.owner.locale),
-    };
-  }
-  const updated = await prisma.shareInvite.update({
-    where: { id: args.row.id },
-    data: { emailSentAt: new Date() },
-    select: shareInviteSelect,
-  });
-  return { invite: shareInviteView(updated), link: null };
-}
-
 const shares = {
   list: contractProcedure(c.shares.list).handler(async ({ context }) => {
     const userId = userIdOf(context);
@@ -727,13 +574,16 @@ const shares = {
       const written = await writeInvite({
         mode: "create",
         ownerUserId,
-        poolId: pool.id,
-        email,
-        settings: {
-          canUse: input.canUse,
-          canContribute: input.canContribute,
-          priorityClass: input.priorityClass,
+        target: {
+          kind: "pool",
+          poolId: pool.id,
+          settings: {
+            canUse: input.canUse,
+            canContribute: input.canContribute,
+            priorityClass: input.priorityClass,
+          },
         },
+        email,
       });
       const delivered = await deliverInvite({
         ...written,
