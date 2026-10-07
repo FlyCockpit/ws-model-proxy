@@ -14,7 +14,7 @@ Every oRPC procedure appears below: called by one or more tools (`agent` access)
 MCP with a reason (`session` access), or unreachable by agent credentials (`public`, `human`,
 `admin`, `human_admin`). See [MCP server](mcp.md) for scopes, errors and examples.
 
-## Tools (27)
+## Tools (28)
 
 READ credentials see the READ tools; FULL credentials see all.
 
@@ -40,6 +40,7 @@ READ credentials see the READ tools; FULL credentials see all.
 | `profile_apply` | FULL | `profiles.apply` | — | 10/min (`start_stop_apply`) | — | Apply a profile (preview first if unsure): start its pins, stop other startable runtimes on its nodes. Refused if any owned node is Relay only. |
 | `profile_delete` | FULL | `profiles.delete` | `DELETE` | — (only the `/mcp` request limit) | — | Delete a profile; nothing stops. confirm: "DELETE". |
 | `node_update` | FULL | `nodes.update` | — | — (only the `/mcp` request limit) | compact: `hardware`, `metricCommands` | Change a Full-control node: labels, ports, hardware, metric commands, fabrics, command lifetime, rescan. |
+| `node_delete` | FULL | `nodes.deleteOffline` | `DELETE` | — (only the `/mcp` request limit) | — | Delete an offline node (refused while online: node_online): its always-on runtimes go, instances with a part there stop. confirm: "DELETE". |
 | `node_secret_set` | FULL | `nodes.secrets.set`, `nodes.secrets.delete` | — | — (only the `/mcp` request limit) | secret input, never logged or echoed | Set (or with value null delete) a WSMP_SECRET_* on a Full-control node, for runtimes to reference by name. Write-only: never shown again. |
 | `node_command_run` | FULL | `nodes.commands.run` | `RUN` | 30/min (`node_command`) | — | Run a one-off command (downloads while experimenting, builds, diagnostics, benchmarks) on a Full-control node; answers within ~15 s, then poll with node_command_get. Anything that should keep running or serve traffic must be a runtime: a server started here is invisible to the proxy and dies with the command. confirm: "RUN". |
 | `node_command_get` | FULL | `nodes.commands.get` | — | — (only the `/mcp` request limit) | — | State and output tail of a command from node_command_run; waitMs waits for it, cancel stops it and everything it started. |

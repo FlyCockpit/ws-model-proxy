@@ -6,7 +6,7 @@
 import { ORPCError } from "@orpc/server";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import type { Context } from "../context";
-import { contractProcedure } from "../contract-procedure";
+import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import { nodesContract as c } from "../contracts/nodes";
 import { loadAgentNames } from "../lib/agent-names";
 import { assertMayWrite, callerActor } from "../lib/caller-actor";
@@ -215,54 +215,13 @@ export const nodeProcedures = {
     return loadNodeSummary(userId, input.nodeId);
   }),
 
-  delete: contractProcedure(c.delete).handler(async ({ context, input }) => {
-    const userId = context.session.user.id;
-    const stopped = await graphDelete({ userId, nodeIds: [input.nodeId] }, async (tx) => {
-      const node = await tx.node.findFirst({
-        where: { id: input.nodeId, userId },
-        select: { id: true },
-      });
-      if (!node) throw notFound("That node does not exist.");
-      // Its always-on runtimes go with it; a profile pinning one keeps the runtime (NoAction).
-      const pinned = await tx.profileItem.findFirst({
-        where: { Runtime: { userId, nodeId: node.id } },
-        select: { Profile: { select: { id: true } } },
-      });
-      if (pinned)
-        throw refuseAbout(
-          "pinned_by_profile",
-          pinned.Profile.id,
-          "A profile pins a runtime on this node. Remove it from the profile first.",
-        );
-      const ranks = await tx.instanceRank.findMany({
-        where: {
-          nodeId: node.id,
-          claim: { not: "RELEASED" },
-          Instance: { phase: { notIn: [...NOT_RUNNING] } },
-        },
-        select: { instanceId: true },
-      });
-      const fabricIds = (
-        await tx.fabricMember.findMany({
-          where: { userId, nodeId: node.id },
-          select: { fabricId: true },
-        })
-      ).map((row) => row.fabricId);
-      const peers = (await fabricMemberNodeIds(tx, userId, fabricIds)).filter(
-        (id) => id !== node.id,
-      );
-      // `node_delete_release` releases every claim here and stops instances with a part here.
-      await tx.node.delete({ where: { id: node.id } });
-      await refreshFabricsHashes(tx, userId, peers);
-      return { instanceIds: [...new Set(ranks.map((rank) => rank.instanceId))], peers };
-    });
-    const services = relay(context);
-    const disconnect = services?.disconnect;
-    await afterCommit(disconnect && (() => disconnect(input.nodeId, "node_deleted")));
-    const definitionChanged = services?.definitionChanged;
-    if (stopped.peers.length > 0)
-      await afterCommit(definitionChanged && (() => definitionChanged(stopped.peers)));
-    return { deleted: true as const, stoppedInstances: stopped.instanceIds };
+  delete: contractProcedure(c.delete).handler(async ({ context, input }) =>
+    deleteNode(context, input.nodeId, null),
+  ),
+
+  deleteOffline: contractProcedure(c.deleteOffline).handler(async ({ context, input }) => {
+    assertMayWrite(context.auth);
+    return deleteNode(context, input.nodeId, { note: input.note ?? null });
   }),
 
   lowerTrustPreview: contractProcedure(c.lowerTrustPreview).handler(async ({ context, input }) => {
@@ -519,6 +478,88 @@ async function mapFabricInUse<T>(run: () => Promise<T>): Promise<T> {
     if (isFabricMemberInUse(error) || isForeignKeyViolation(error)) throw fabricInUseRefusal();
     throw error;
   }
+}
+
+/**
+ * Deletes one of the caller's nodes: its always-on runtimes go, every reservation there is
+ * released and instances with a part there stop. `agent` (nodes.deleteOffline): refused while
+ * the node is online (node_online), and audited with the node's slug and id (never its
+ * credentials) because the node's own activity goes with it.
+ */
+async function deleteNode(
+  context: SignedInContext,
+  nodeId: string,
+  agent: { note: string | null } | null,
+) {
+  const userId = context.session.user.id;
+  const stopped = await graphDelete({ userId, nodeIds: [nodeId] }, async (tx) => {
+    const node = await tx.node.findFirst({
+      where: { id: nodeId, userId },
+      select: { id: true, slug: true, connection: true },
+    });
+    if (!node) throw notFound("That node does not exist.");
+    if (agent && node.connection === "ONLINE")
+      throw refuseAbout(
+        "node_online",
+        node.id,
+        "This node is online: agents delete only offline nodes. Stop wsmp on it (or ask a person to delete it in the browser).",
+      );
+    // Its always-on runtimes go with it; a profile pinning one keeps the runtime (NoAction).
+    const pinned = await tx.profileItem.findFirst({
+      where: { Runtime: { userId, nodeId: node.id } },
+      select: { Profile: { select: { id: true } } },
+    });
+    if (pinned)
+      throw refuseAbout(
+        "pinned_by_profile",
+        pinned.Profile.id,
+        "A profile pins a runtime on this node. Remove it from the profile first.",
+      );
+    const ranks = await tx.instanceRank.findMany({
+      where: {
+        nodeId: node.id,
+        claim: { not: "RELEASED" },
+        Instance: { phase: { notIn: [...NOT_RUNNING] } },
+      },
+      select: { instanceId: true },
+    });
+    const fabricIds = (
+      await tx.fabricMember.findMany({
+        where: { userId, nodeId: node.id },
+        select: { fabricId: true },
+      })
+    ).map((row) => row.fabricId);
+    const peers = (await fabricMemberNodeIds(tx, userId, fabricIds)).filter((id) => id !== node.id);
+    // `node_delete_release` releases every claim here and stops instances with a part here.
+    await tx.node.delete({ where: { id: node.id } });
+    await refreshFabricsHashes(tx, userId, peers);
+    const instanceIds = [...new Set(ranks.map((rank) => rank.instanceId))];
+    if (agent) {
+      const actor = callerActor(context.auth, userId);
+      await tx.auditEvent.create({
+        data: {
+          userId,
+          actor: actor.actor,
+          actorUserId: actor.actorUserId,
+          agentTokenId: actor.agentTokenId,
+          mcpGrantId: actor.mcpGrantId,
+          action: "node.delete",
+          resourceType: "node",
+          resourceId: node.id,
+          before: { slug: node.slug },
+          after: { stoppedInstances: instanceIds, ...(agent.note ? { note: agent.note } : {}) },
+        },
+      });
+    }
+    return { instanceIds, peers };
+  });
+  const services = relay(context);
+  const disconnect = services?.disconnect;
+  await afterCommit(disconnect && (() => disconnect(nodeId, "node_deleted")));
+  const definitionChanged = services?.definitionChanged;
+  if (stopped.peers.length > 0)
+    await afterCommit(definitionChanged && (() => definitionChanged(stopped.peers)));
+  return { deleted: true as const, stoppedInstances: stopped.instanceIds };
 }
 
 function secretNamesOf(features: unknown): string[] {

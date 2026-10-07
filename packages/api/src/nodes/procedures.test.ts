@@ -212,6 +212,56 @@ describe("nodes.list / get", () => {
   });
 });
 
+describe("nodes.deleteOffline (MCP node_delete)", () => {
+  function setupDelete(connection: "ONLINE" | "OFFLINE") {
+    db.node.findFirst.mockResolvedValueOnce({ id: "node-1", slug: "box", connection } as never);
+    db.profileItem.findFirst.mockResolvedValueOnce(null);
+    db.instanceRank.findMany.mockResolvedValueOnce([{ instanceId: "inst-1" }] as never);
+    db.fabricMember.findMany.mockResolvedValue([] as never);
+  }
+
+  it("refuses an online node (node_online) and deletes nothing", async () => {
+    setupDelete("ONLINE");
+    await expect(
+      client(FULL_AGENT).deleteOffline({ nodeId: "node-1", confirm: "DELETE" }),
+    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "node_online" } });
+    expect(db.node.delete).not.toHaveBeenCalled();
+  });
+
+  it("deletes an offline node and audits its slug and id, never credentials", async () => {
+    setupDelete("OFFLINE");
+    const out = await client(FULL_AGENT).deleteOffline({
+      nodeId: "node-1",
+      confirm: "DELETE",
+      note: "old box",
+    });
+    expect(out).toEqual({ deleted: true, stoppedInstances: ["inst-1"] });
+    expect(db.node.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      id: "node-1",
+      userId: "owner-1",
+    });
+    expect(db.node.delete).toHaveBeenCalledWith({ where: { id: "node-1" } });
+    const audit = db.auditEvent.create.mock.calls[0]?.[0]?.data;
+    expect(audit).toMatchObject({
+      actor: "AGENT",
+      agentTokenId: "tok-1",
+      action: "node.delete",
+      resourceType: "node",
+      resourceId: "node-1",
+      before: { slug: "box" },
+      after: { stoppedInstances: ["inst-1"], note: "old box" },
+    });
+    expect(JSON.stringify(audit)).not.toMatch(/credential|secret|wsmp_node_/i);
+  });
+
+  it("is refused for a read-only agent before reading the node", async () => {
+    await expect(
+      client(READ_AGENT).deleteOffline({ nodeId: "node-1", confirm: "DELETE" }),
+    ).rejects.toBeDefined();
+    expect(db.node.findFirst).not.toHaveBeenCalled();
+  });
+});
+
 describe("nodes.update", () => {
   const trustRow = {
     id: "node-1",

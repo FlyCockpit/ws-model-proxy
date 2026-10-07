@@ -6,7 +6,7 @@ an OAuth-protected resource at `/mcp`. The surface is on by default.
 canonical URL, protocol profile, scopes, token lifetimes, and registration
 policy — is derived from configuration in code, not operator tuning.
 
-The tool catalog (all 27 tools, their procedures, confirmation literals and rate
+The tool catalog (all 28 tools, their procedures, confirmation literals and rate
 limits, and every procedure kept off MCP with its reason) is the generated,
 test-enforced [docs/mcp-tool-coverage.md](./mcp-tool-coverage.md). The tool
 definitions themselves are `MCP_TOOLS` in
@@ -21,7 +21,7 @@ requests and metrics.
 
 - **Levels.** A credential is Read-only (`READ`) or Full (`FULL`). READ
   credentials see the 7 read tools (`*_get`, `requests_list`, `metrics_query`);
-  FULL credentials see all 27. A FULL tool called with a READ credential answers
+  FULL credentials see all 28. A FULL tool called with a READ credential answers
   exactly like an unknown tool. Even Full cannot touch sharing, API keys,
   agent tokens, provider accounts, enrollment, hold lines or node trust; those
   stay with people. An agent token's level is chosen when it is created; an
@@ -39,6 +39,10 @@ requests and metrics.
   `runtime_start`, `runtime_stop`, `profile_apply` and `model_test` take none.
   Say what you are trying; people see it beside the change (runtime version
   history, node activity, command log, queued commands).
+- **Deleting nodes.** `node_delete` removes an offline node only (refused with
+  `node_online` while it is connected, with no override); its always-on
+  runtimes go and instances with a part there stop. It is audited with the
+  node's slug and id. People delete any node in the browser.
 - **Confirmation.** Deletes take `confirm: "DELETE"` and `node_command_run`
   takes `confirm: "RUN"`. The literal only proves intent; it never replaces a
   person's confirmation where one is required.

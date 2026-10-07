@@ -78,6 +78,9 @@ export const REFUSAL_REASONS = [
   // Lane E integration.
   /** A cap's currency changes only while its subject has no spend or reservation this month. */
   "cap_currency_has_spend",
+  // E2E fixes.
+  /** An agent deletes only an offline node (people delete any in the browser). */
+  "node_online",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

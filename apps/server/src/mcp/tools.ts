@@ -1,11 +1,11 @@
 /**
- * The 0.4.0 MCP tools: exactly the 27 tools of `MCP_TOOLS`
+ * The 0.4.0 MCP tools: exactly the 28 tools of `MCP_TOOLS`
  * (packages/api/src/contracts/mcp-tools.ts), registered on every per-request server.
  *
  * Exports for the server wiring:
  * - `registerMcpTools(server, ctx)`: the transport factory's `registerTools` seam
  *   (mcp/handler.ts). It lists the tools the request's level may call: READ tokens the 7
- *   read tools, FULL tokens all 27.
+ *   read tools, FULL tokens all 28.
  * - `cancelMcpToolCallsForToken(credentialId)`: aborts the in-flight tool calls of one
  *   agent token or OAuth grant (call it when the token is revoked).
  * - `cancelMcpWriteToolCallsForGrant(grantId)`: aborts the in-flight write tool calls of an

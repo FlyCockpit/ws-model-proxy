@@ -1,5 +1,5 @@
 /**
- * The 0.4.0 MCP tool manifest (spec §6): 27 tools, user nouns, no implementations.
+ * The 0.4.0 MCP tool manifest (spec §6): 28 tools, user nouns, no implementations.
  * `apps/server/src/mcp/tools.ts` registers these; handlers call the procedures named in
  * `procedures`. READ tokens see the read tools; FULL tokens see all. Most writes take an
  * optional `note`. Refusals carry `data.reason` with a message that says what to do next.
@@ -405,6 +405,14 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
       hardware: "Declared hardware (null clears); nodes_get shows sources.",
       metricCommands: "Node metric commands; shape in docs/mcp.md.",
     },
+  }),
+  tool({
+    name: "node_delete",
+    description:
+      'Delete an offline node (refused while online: node_online): its always-on runtimes go, instances with a part there stop. confirm: "DELETE".',
+    input: nodesContract.deleteOffline.input,
+    output: nodesContract.deleteOffline.output,
+    procedures: ["nodes.deleteOffline"],
   }),
   tool({
     name: "node_secret_set",

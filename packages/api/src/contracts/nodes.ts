@@ -17,6 +17,7 @@ import {
 import {
   ACTOR,
   CLAIM_STATE,
+  confirmDeleteSchema,
   confirmRunSchema,
   ENGINE,
   INSTANCE_PHASE,
@@ -527,6 +528,16 @@ export const nodesContract = {
     z.object({ nodeId: idSchema }).strict(),
     z.object({ deleted: z.literal(true), stoppedInstances: z.array(idSchema) }).strict(),
     "Delete a node: its always-on runtimes go, every reservation there is released and instances with a part there stop.",
+  ),
+  /** An agent's delete: offline nodes only (owner decision), audited with the slug and id. */
+  deleteOffline: mutation(
+    "agent",
+    z
+      .object({ nodeId: idSchema, confirm: confirmDeleteSchema, note: noteSchema.optional() })
+      .strict(),
+    z.object({ deleted: z.literal(true), stoppedInstances: z.array(idSchema) }).strict(),
+    "Delete an offline node as nodes.delete does; refused while it is online (node_online), with no override.",
+    ["node_delete"],
   ),
   lowerTrustPreview: query(
     "human",

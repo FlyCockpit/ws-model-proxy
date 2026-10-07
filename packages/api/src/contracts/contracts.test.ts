@@ -55,6 +55,7 @@ const INVENTORY = [
   "nodes.fabrics.delete",
   "nodes.rename",
   "nodes.delete",
+  "nodes.deleteOffline",
   "nodes.lowerTrustPreview",
   "nodes.lowerTrust",
   "nodes.enrollmentCodes.list",
@@ -305,12 +306,12 @@ describe("caller auth (positive human check)", () => {
 });
 
 describe("0.4.0 MCP tool manifest", () => {
-  it("has the 27 tools in order, 7 of them read-only", () => {
+  it("has the 28 tools in order, 7 of them read-only", () => {
     expect(MCP_TOOLS.map((tool) => tool.name)).toEqual([...MCP_TOOL_NAMES]);
     expect(MCP_TOOLS.filter((tool) => tool.level === "READ").map((tool) => tool.name)).toEqual([
       ...MCP_READ_TOOLS,
     ]);
-    expect(MCP_TOOLS).toHaveLength(27);
+    expect(MCP_TOOLS).toHaveLength(28);
   });
 
   it("calls only agent procedures that name the tool back; read tools only query", () => {

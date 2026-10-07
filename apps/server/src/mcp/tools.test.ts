@@ -41,11 +41,11 @@ beforeEach(() => resetMcpToolRateLimitsForTests());
 afterEach(() => vi.restoreAllMocks());
 
 describe("MCP tool levels", () => {
-  it("READ credentials get exactly the 7 read tools, FULL all 27", () => {
+  it("READ credentials get exactly the 7 read tools, FULL all 28", () => {
     expect(MCP_TOOL_NAMES.filter((name) => mcpToolAllowed(name, "READ"))).toEqual([
       ...MCP_READ_TOOLS,
     ]);
-    expect(MCP_TOOL_NAMES.filter((name) => mcpToolAllowed(name, "FULL"))).toHaveLength(27);
+    expect(MCP_TOOL_NAMES.filter((name) => mcpToolAllowed(name, "FULL"))).toHaveLength(28);
   });
 
   it("a FULL tool called with a READ credential answers like an unknown tool and calls nothing", async () => {
