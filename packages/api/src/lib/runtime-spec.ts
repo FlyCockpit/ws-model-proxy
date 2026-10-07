@@ -818,6 +818,12 @@ export const nodeFeaturesSchema = z
       .object({
         roots: z.array(z.string().min(1).max(4096)).max(64).nullable(),
         asRoot: z.boolean(),
+        /**
+         * Where the roots come from: `default` (the user's home directory), `configured`
+         * (`wsmp config set-file-roots`) or `disabled` (`wsmp config set-file-tools off`).
+         * `roots` null with `default`/`configured` means the roots are unusable.
+         */
+        source: z.enum(["default", "configured", "disabled"]),
       })
       .strict(),
     /** `ip[:port]` entries from config.json. */

@@ -13,7 +13,8 @@
     "operatorTerminals": true,
     "files": {
       "roots": ["/home/me/models"],
-      "asRoot": false
+      "asRoot": false,
+      "source": "default"
     },
     "runtimeHosts": ["10.0.0.5:8000"],
     "mediaExpand": true,

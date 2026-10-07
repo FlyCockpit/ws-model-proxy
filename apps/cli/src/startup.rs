@@ -28,6 +28,7 @@ pub struct TerminalStartup {
     allow_file_tools_as_root: bool,
     file_roots: Vec<std::path::PathBuf>,
     file_roots_configured: bool,
+    file_roots_source: crate::config::FileRootsSource,
     /// `config.json` `runtimeHosts`, re-read on hot reload.
     runtime_hosts: std::sync::Mutex<Vec<String>>,
 }
@@ -46,6 +47,16 @@ impl TerminalStartup {
     }
 
     pub fn from_key(key: CliTerminalKey, config: &Config) -> Self {
+        Self::from_key_with_home(key, config, dirs::home_dir().as_deref())
+    }
+
+    /// [`Self::from_key`] with an explicit home directory (the default root).
+    pub fn from_key_with_home(
+        key: CliTerminalKey,
+        config: &Config,
+        home: Option<&std::path::Path>,
+    ) -> Self {
+        let (file_roots, file_roots_source) = crate::config::effective_file_roots(config, home);
         Self {
             key,
             identity: None,
@@ -56,8 +67,9 @@ impl TerminalStartup {
             require_terminal_approval: config.require_terminal_approval,
             max_terminals: usize::try_from(config.effective_max_terminals()).unwrap_or(usize::MAX),
             allow_file_tools_as_root: config.allow_file_tools_as_root,
-            file_roots: config.file_roots.clone(),
-            file_roots_configured: crate::config::file_roots_usable(&config.file_roots),
+            file_roots_configured: crate::config::file_roots_usable(&file_roots),
+            file_roots,
+            file_roots_source,
             runtime_hosts: std::sync::Mutex::new(config.runtime_hosts.clone()),
         }
     }
@@ -163,6 +175,7 @@ impl TerminalStartup {
                         .collect()
                 }),
                 as_root: self.allow_file_tools_as_root,
+                source: self.file_roots_source,
             },
             runtime_hosts: self.runtime_hosts(),
             media_expand: true,
@@ -278,6 +291,41 @@ mod tests {
         let startup = TerminalStartup::from_key(key(), &config);
         assert_eq!(startup.features().files.roots, None);
         assert_eq!(startup.file_roots(), config.file_roots);
+    }
+
+    #[test]
+    fn file_roots_default_to_home_and_say_where_they_come_from() {
+        use crate::config::FileRootsSource;
+        let home = tempfile::tempdir().expect("home");
+        let physical = std::fs::canonicalize(home.path()).expect("physical home");
+        let startup =
+            TerminalStartup::from_key_with_home(key(), &Config::default(), Some(home.path()));
+        let files = startup.features().files;
+        assert_eq!(files.source, FileRootsSource::Default);
+        assert_eq!(files.roots, Some(vec![physical.display().to_string()]));
+        assert_eq!(startup.file_roots(), [physical]);
+
+        let configured_dir = tempfile::tempdir().expect("configured");
+        let configured = Config {
+            file_roots: vec![configured_dir.path().to_path_buf()],
+            ..Config::default()
+        };
+        let startup = TerminalStartup::from_key_with_home(key(), &configured, Some(home.path()));
+        assert_eq!(startup.features().files.source, FileRootsSource::Configured);
+        assert_eq!(startup.file_roots(), configured.file_roots);
+
+        // Off wins over configured roots, and no home means no default roots.
+        let off = Config {
+            disable_file_tools: true,
+            ..configured
+        };
+        let startup = TerminalStartup::from_key_with_home(key(), &off, Some(home.path()));
+        assert_eq!(startup.features().files.source, FileRootsSource::Disabled);
+        assert_eq!(startup.features().files.roots, None);
+        assert!(startup.file_roots().is_empty());
+        let homeless = TerminalStartup::from_key_with_home(key(), &Config::default(), None);
+        assert_eq!(homeless.features().files.roots, None);
+        assert_eq!(homeless.features().files.source, FileRootsSource::Default);
     }
 
     #[test]

@@ -38,7 +38,7 @@ function liveState(overrides: Record<string, unknown> = {}) {
     nodeId: "node-1",
     userId: "user-1",
     trust: "full",
-    features: { files: { roots: [ROOT], asRoot: false } },
+    features: { files: { roots: [ROOT], asRoot: false, source: "configured" } },
     ...overrides,
   };
 }

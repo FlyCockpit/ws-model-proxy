@@ -117,7 +117,8 @@ servers that already run still works.
 Each node gives the server one of two levels. You choose at login and can change it any time.
 
 - **Full control** (default): the server may define and start runtimes, run commands, read and
-  write files inside the folders you allow (`wsmp config set-file-roots`), open terminals, and
+  write files in your home directory or the folders you allow (`wsmp config set-file-roots`;
+  wsmp's own files stay off limits), open terminals, and
   set node secrets.
 - **Relay only**: the server may only send requests to model servers here and start or stop the
   runtimes this node already holds. Definitions are frozen at the moment you lower trust; nothing
@@ -180,7 +181,8 @@ The server asks a node to do two different kinds of work:
 | `wsmp config path\|init\|show` | Where the config lives, create it, print it. |
 | `wsmp config set-server <url> [--public-origin <origin>]` | Point at another server address (restart to apply). |
 | `wsmp config set-slug <name>` | Change the saved node name. |
-| `wsmp config set-file-roots <dir>...` / `clear-file-roots` | Folders the file tools may use. |
+| `wsmp config set-file-roots <dir>...` / `clear-file-roots` | Folders the file tools may use (default: your home directory). |
+| `wsmp config set-file-tools on\|off` | Turn the node file tools on or off (on by default). |
 | `wsmp config set-runtime-hosts [host...]` | Extra hosts an always-on runtime may use besides loopback. |
 | `wsmp config set-human-terminal on\|off` | Allow browser terminals (the same setting `wsmp login` asks about). |
 | `wsmp config set-terminal-approval on\|off` | Require approval before a browser opens a terminal. |

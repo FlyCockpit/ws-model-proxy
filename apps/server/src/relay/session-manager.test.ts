@@ -117,7 +117,7 @@ function hello(
     features: {
       terminals: { supported: true, max: 4, approvalRequired: false },
       operatorTerminals: overrides.operatorTerminals ?? false,
-      files: { roots: ["/home/me"], asRoot: false },
+      files: { roots: ["/home/me"], asRoot: false, source: "configured" },
       runtimeHosts: [],
       mediaExpand: false,
       liveStt: false,
@@ -497,7 +497,7 @@ describe("RelaySessionManager (relay 3.0)", () => {
     const features = {
       terminals: { supported: true, max: 4, approvalRequired: false },
       operatorTerminals: false,
-      files: { roots: ["/home/me"], asRoot: false },
+      files: { roots: ["/home/me"], asRoot: false, source: "configured" },
       runtimeHosts: [],
       mediaExpand: false,
       liveStt: false,

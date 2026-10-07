@@ -137,8 +137,11 @@ secret files.
 - **Who.** A Full agent token on the caller's own node at Full control.
   People signed in to the web app use a browser terminal instead.
 - **Paths.** Absolute paths under the node's file roots only: `~` and relative
-  paths are refused, not expanded. `node_get` lists the roots under
-  `features.files.roots`; a refused path's error lists them too. wsmp's own
+  paths are refused, not expanded. `nodes_get` lists the roots under
+  `features.files.roots` and where they come from under `features.files.source`:
+  `default` (the user's home directory, used until a person sets roots),
+  `configured` (`wsmp config set-file-roots`) or `disabled`
+  (`wsmp config set-file-tools off`). A refused path's error lists them too. wsmp's own
   config, credentials, secrets, runtime stores, state directory, service unit
   and binary are off limits (writes) or read-only (config).
 - **Writes.** `node_file_write` without `ifMatch` only creates a new file; with

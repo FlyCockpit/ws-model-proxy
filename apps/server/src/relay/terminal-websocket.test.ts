@@ -219,7 +219,7 @@ function hello(socket: FakeSocket, slug: string, kind: CliKind, features?: CliFe
         approvalRequired: features?.terminalApproval ?? false,
       },
       operatorTerminals: features?.operatorTerminals ?? false,
-      files: { roots: null, asRoot: false },
+      files: { roots: null, asRoot: false, source: "disabled" },
       runtimeHosts: [],
       mediaExpand: false,
       liveStt: false,

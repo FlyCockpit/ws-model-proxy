@@ -2154,10 +2154,18 @@ fn config_read_grant_is_explicit_and_roots_are_validated() {
         .args(["config", "init"])
         .assert()
         .success();
-    let mut show = cli(&config, &state);
-    show.args(["config", "--json", "show"]);
-    let value = json_stdout(show);
-    assert_eq!(value["fileRoots"], json!([]));
+    let home_root = fs::canonicalize(tmp.path()).expect("home root");
+    let show_roots = || {
+        let mut show = cli(&config, &state);
+        show.env("HOME", tmp.path())
+            .args(["config", "--json", "show"]);
+        let value = json_stdout(show);
+        (value["fileRoots"].clone(), value["fileRootsSource"].clone())
+    };
+    // Unset roots: the home directory, said to be the default.
+    if cfg!(unix) {
+        assert_eq!(show_roots(), (json!([home_root]), json!("default")));
+    }
     let disk: Value = serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
     assert!(disk.get("fileRoots").is_none());
     // `~` expands through the platform home directory, which HOME redirects on Unix only.
@@ -2192,14 +2200,20 @@ fn config_read_grant_is_explicit_and_roots_are_validated() {
         .success()
         .stdout(predicate::str::contains("~/models"))
         .stdout(predicate::str::contains("~/deploy"))
-        .stdout(predicate::str::contains("~/.config/llama-swap"))
-        .stdout(predicate::str::contains("~/.local/state/wsmp/logs"));
+        .stdout(predicate::str::contains("~/.config/llama-swap"));
+    assert_eq!(show_roots().1, json!("configured"));
     cli(&config, &state)
         .args(["config", "clear-file-roots"])
         .assert()
         .success();
-    let mut show = cli(&config, &state);
-    show.args(["config", "--json", "show"]);
-    let value = json_stdout(show);
-    assert_eq!(value["fileRoots"], json!([]));
+    if cfg!(unix) {
+        assert_eq!(show_roots(), (json!([home_root]), json!("default")));
+    }
+    cli(&config, &state)
+        .args(["config", "set-file-tools", "off"])
+        .assert()
+        .success();
+    assert_eq!(show_roots(), (json!([]), json!("disabled")));
+    let disk: Value = serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
+    assert_eq!(disk["disableFileTools"], json!(true));
 }

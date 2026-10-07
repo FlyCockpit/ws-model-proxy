@@ -601,7 +601,10 @@ pub struct TerminalFeatures {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileFeatures {
-    /// `null`: no roots configured (file ops refused with `no_roots`).
+    /// `null`: no usable roots (file ops refused with `no_roots`).
     pub roots: Option<Vec<String>>,
     pub as_root: bool,
+    /// Where the roots come from: the home directory by default, the
+    /// configured list, or none (file tools turned off).
+    pub source: crate::config::FileRootsSource,
 }

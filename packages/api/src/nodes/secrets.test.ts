@@ -68,7 +68,7 @@ describe("nodes.secrets", () => {
     const features = {
       terminals: { supported: true, max: 4, approvalRequired: false },
       operatorTerminals: true,
-      files: { roots: null, asRoot: false },
+      files: { roots: null, asRoot: false, source: "disabled" },
       runtimeHosts: [],
       mediaExpand: true,
       liveStt: true,
