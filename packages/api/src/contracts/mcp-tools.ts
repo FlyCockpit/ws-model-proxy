@@ -122,6 +122,33 @@ const runtimeCreateInput = z
     message: "Give spec, or forkFrom to copy a shared definition.",
   });
 
+/** runtimes.stop, or (forget) runtimes.instances.forget: one flat object keeps tools/list small. */
+const runtimeStopInput = z
+  .object({
+    instanceId: idSchema.optional(),
+    runtimeId: idSchema.optional(),
+    nodeId: idSchema.optional(),
+    forget: z.literal(true).optional(),
+    /** forget: only this node of a multi-node instance (1-based). */
+    nodeNumber: z.number().int().min(1).optional(),
+    confirm: z.literal("FORGET").optional(),
+    note: noteSchema.optional(),
+  })
+  .strict()
+  .refine((input) => (input.instanceId === undefined) !== (input.runtimeId === undefined), {
+    message: "Give instanceId or runtimeId.",
+  })
+  .refine(
+    (input) =>
+      input.forget
+        ? input.instanceId !== undefined && input.confirm === "FORGET" && !input.nodeId
+        : input.confirm === undefined &&
+          input.nodeNumber === undefined &&
+          input.note === undefined &&
+          (input.instanceId === undefined || input.nodeId === undefined),
+    { message: 'forget takes instanceId and confirm "FORGET"; a stop takes neither.' },
+  );
+
 const runtimeUpdateInput = z
   .object({
     runtimeId: idSchema,
@@ -340,10 +367,11 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   }),
   tool({
     name: "runtime_stop",
-    description: "Stop an instance, or every instance of a runtime (optionally on one node).",
-    input: runtimesContract.stop.input,
-    output: runtimesContract.stop.output,
-    procedures: ["runtimes.stop"],
+    description:
+      'Stop an instance, or every instance of a runtime (optionally on one node). forget with confirm "FORGET" gives up an instance\'s stop its node cannot prove (Full-control nodes).',
+    input: runtimeStopInput,
+    output: z.union([runtimesContract.stop.output, runtimesContract.instances.forget.output]),
+    procedures: ["runtimes.stop", "runtimes.instances.forget"],
     rateLimit: { perMinute: 10, key: "start_stop_apply" },
   }),
   tool({

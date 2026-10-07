@@ -153,6 +153,33 @@ describe("routing to procedures", () => {
     ).toBe("nodes.secrets.set");
   });
 
+  it("runtime_stop stops, or with forget forgets an unprovable stop (confirm FORGET)", () => {
+    expect(routeToolCall("runtime_stop", { runtimeId: "r", nodeId: "n" })).toEqual([
+      { path: "runtimes.stop", input: { runtimeId: "r", nodeId: "n" } },
+    ]);
+    expect(routeToolCall("runtime_stop", { instanceId: "i" })).toEqual([
+      { path: "runtimes.stop", input: { instanceId: "i" } },
+    ]);
+    expect(
+      routeToolCall("runtime_stop", {
+        instanceId: "i",
+        forget: true,
+        confirm: "FORGET",
+        note: "gone",
+      }),
+    ).toEqual([
+      {
+        path: "runtimes.instances.forget",
+        input: { instanceId: "i", confirm: "FORGET", note: "gone" },
+      },
+    ]);
+    const stop = tool("runtime_stop").input;
+    expect(stop.safeParse({ instanceId: "i", forget: true }).success).toBe(false);
+    expect(stop.safeParse({ runtimeId: "r", forget: true, confirm: "FORGET" }).success).toBe(false);
+    expect(stop.safeParse({ instanceId: "i", confirm: "FORGET" }).success).toBe(false);
+    expect(stop.safeParse({ instanceId: "i", runtimeId: "r" }).success).toBe(false);
+  });
+
   it("every route stays inside the tool's own procedures", async () => {
     for (const contract of MCP_TOOLS) {
       for (const entry of routeToolCall(contract.name, {}))

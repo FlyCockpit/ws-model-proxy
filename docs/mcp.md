@@ -33,11 +33,13 @@ requests and metrics.
   stop or change anything there.
 - **Notes.** Most writes take an optional `note` (1–500 characters);
   `node_command_queue_for_user` requires one, and the deletes,
-  `runtime_start`, `runtime_stop`, `profile_apply` and `model_test` take none.
+  `runtime_start`, `runtime_stop` (except with `forget`), `profile_apply` and
+  `model_test` take none.
   Say what you are trying; people see it beside the change (runtime version
   history, node activity, command log, queued commands).
-- **Confirmation.** Deletes take `confirm: "DELETE"` and `node_command_run`
-  takes `confirm: "RUN"`. The literal only proves intent; it never replaces a
+- **Confirmation.** Deletes take `confirm: "DELETE"`, `node_command_run`
+  takes `confirm: "RUN"` and `runtime_stop` with `forget` takes
+  `confirm: "FORGET"`. The literal only proves intent; it never replaces a
   person's confirmation where one is required.
 - **Previews.** `runtime_start` and `profile_apply` accept a preview first: it
   shows placements, what stops and hold changes. Preview when unsure.
@@ -59,6 +61,26 @@ Terminals. Poll its `id` with `node_command_get` as well: the answer has
 `queuedForUser: true` and the queued state (`QUEUED`, `RUN`, `DISMISSED`,
 `EXPIRED` or `REFUSED`) and never output, since the person runs it in their
 terminal. Only the person runs or dismisses it, so `cancel` refuses.
+
+### Stops that cannot be proven
+
+A stopping instance keeps its resources and port until its node proves the
+stop. When the stop steps fail (for example the stop command errors because
+the process is already gone), the server asks the node for a status probe: it
+proves the stop when no process of the rank's units is left, the `status`
+command (if any) says stopped, and the rank's port is free. The stop then
+completes with no person involved. Only when the node cannot prove it (still
+alive, or offline for 10 minutes) does the instance show `needsOperator:
+"FORGET"`; the probe is repeated every 5 minutes, so a later proof still
+completes it.
+
+To give up on such a stop, call `runtime_stop {instanceId, forget: true,
+confirm: "FORGET"}` (optionally `nodeNumber` for one node of a multi-node
+instance, and a `note`). Agents may do this only on Full-control nodes
+(`trust_relay` otherwise). The claim stays counted until a status probe proves
+the stop, but the instance settles STOPPED and later starts stop waiting for
+it (`waits_for_stop`). Each forgotten node writes a `claim_forget` row in the
+node's activity.
 
 ### Runtime definitions
 
