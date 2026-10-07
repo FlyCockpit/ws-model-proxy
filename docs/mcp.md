@@ -22,16 +22,19 @@ requests and metrics.
 - **Levels.** A credential is Read-only (`READ`) or Full (`FULL`). READ
   credentials see the 7 read tools (`*_get`, `requests_list`, `metrics_query`);
   FULL credentials see all 27. A FULL tool called with a READ credential answers
-  exactly like an unknown tool. Full never grants anything: sharing, API keys,
-  agent tokens, provider accounts, enrollment, hold lines and node trust stay
-  with people.
+  exactly like an unknown tool. Even Full cannot touch sharing, API keys,
+  agent tokens, provider accounts, enrollment, hold lines or node trust; those
+  stay with people. Today only agent tokens can be Full: OAuth connections are
+  Read-only (see [Scopes](#scopes)).
 - **Node trust.** Commands, files, secrets, metric commands and definition
   changes need a node at Full control. A Relay-only node relays inference for
   the definitions it held when it entered Relay only; agents cannot start,
   stop or change anything there.
-- **Notes.** Every write takes an optional `note` (1–500 characters). Say what
-  you are trying; people see it beside the change (runtime version history,
-  node activity, command log).
+- **Notes.** Most writes take an optional `note` (1–500 characters);
+  `node_command_queue_for_user` requires one, and the deletes,
+  `runtime_start`, `runtime_stop`, `profile_apply` and `model_test` take none.
+  Say what you are trying; people see it beside the change (runtime version
+  history, node activity, command log, queued commands).
 - **Confirmation.** Deletes take `confirm: "DELETE"` and `node_command_run`
   takes `confirm: "RUN"`. The literal only proves intent; it never replaces a
   person's confirmation where one is required.
@@ -89,7 +92,7 @@ A spec has exactly one of:
     `{{fabric_iface}}` and `{{fabric_rdma_device}}`.
   - `secrets`: node secret names exported to every command.
   - `readiness: {path, expectedStatus, timeoutMs}` (required when the runtime
-    serves models) and `health: {intervalMs, failureThreshold,
+    serves models) and the required `health: {intervalMs, failureThreshold,
     successThreshold}`.
 
 A runtime that serves models also declares `api` (`openai` or `anthropic`),
@@ -156,9 +159,10 @@ and the procedures in `SENSITIVE_INPUT_PROCEDURES` are never logged, audited
 Agent actions are recorded with the agent token (`agentTokenId`) or OAuth
 grant (`mcpGrantId`) that made them: runtime versions and operations, node
 commands, node activity (files, secrets, commands), queued commands and the
-general audit log. Commands are stored as an HMAC of the text plus the program
-name, never the text. People read them under Activity, the node's activity, and
-the runtime's version history.
+general audit log. Node commands and node activity store an HMAC of the
+command text plus the program name, never the text; a queued command keeps its
+text so the person can read it before pressing Run. People read them under
+Activity, the node's activity, Terminals and the runtime's version history.
 
 ## Setup
 
@@ -324,9 +328,11 @@ Three scopes exist: `mcp:read`, `mcp:write`, and `offline_access`.
   caller-supplied redirect URI. Every present, well-formed request is forwarded
   to Better Auth unchanged for client/redirect validation.
 
-An OAuth request's level is FULL only when its grant is Full (the person chose
-Full at consent) and the access token carries `mcp:write`; otherwise it is READ.
-An agent token's level is the one it was created with.
+An OAuth request's level is FULL only when its grant is Full and the access
+token carries `mcp:write`; otherwise it is READ. Grants are created Read-only
+and the consent page does not offer Full yet, so OAuth connections are
+Read-only today; an agent needing Full uses a Full agent token. An agent
+token's level is the one it was created with.
 
 ## Login, consent, and scope step-up
 
@@ -340,9 +346,8 @@ The authorization flow uses Better Auth's signed OAuth transaction
   page offers "Sign in again to reauthorize": signing out (preserving the
   signed query) and signing in again creates a new session-derived grant
   generation that requires fresh consent.
-- `/{lang}/mcp-consent` — the consent page. The person chooses Read-only (the
-  default) or Full, and sees what Full allows (commands and files on
-  Full-control nodes) and the client's redirect host. First use always prompts;
+- `/{lang}/mcp-consent` — the consent page. It shows the requesting client
+  and the requested scopes, with Authorize and Deny. First use always prompts;
   expanded scopes (for example stepping up from `mcp:read` to `mcp:write`)
   prompt again for the full requested set. A remembered consent is reused only when the
   client, the user, the session-derived reference, the requested scopes
@@ -380,8 +385,8 @@ flag is off.
 Every OAuth access JWT carries a private `mcp_grant_id` claim bound to an
 application-owned `McpGrant` generation keyed by
 `(userId, clientId, referenceId)`, where the reference is an HMAC of the
-consenting session and the validated client. Each grant records the level the
-person chose at consent. On every `/mcp` request the exact grant is loaded and
+consenting session and the validated client. Each grant records a level
+(Read-only for every grant created today). On every `/mcp` request the exact grant is loaded and
 must be active:
 
 - **Disconnecting** a connection (Access → Agents, `access.oauthGrants.revoke`)
@@ -737,10 +742,10 @@ Operator procedure, not a unit test. Run against a deployment that leaves
 4. Consent including `offline_access`.
 5. Read — a read tool succeeds.
 6. Read-only write denial / step-up — a Read-only connection lists only the
-   read tools and a write tool answers as unknown; re-consent with Full for the
-   expanded scope set.
-7. Confirmation denial / success — a delete without `confirm`, then with
-   `confirm: "DELETE"`.
+   read tools and a write tool answers as unknown, even with `mcp:write`.
+   Repeat the write with a Full agent token.
+7. Confirmation denial / success (Full agent token) — a delete without
+   `confirm`, then with `confirm: "DELETE"`.
 8. Refresh rotation and retry — tokens rotate; a retried refresh within the
    window returns the cached response.
 9. Access → Agents connection listing / disconnect.
@@ -750,11 +755,7 @@ Operator procedure, not a unit test. Run against a deployment that leaves
     restored authorization); only THEN present the revoked **current**
     refresh token (rejected, and it wipes the whole refresh family — doing
     this first makes the cached branch unobservable).
-11. Reauthorization — sign in again after revocation; fresh consent required
-    (this path created a remembered consent row in step 4, so the narrow
-    artifact-free exception — consumed code, no consent row, no grant yet,
-    revoked mid-exchange — does not apply here; see
-    [Grants and revocation](#grants-and-revocation)).
+11. Reauthorization — sign in again after revocation; fresh consent required.
 12. Wrong-resource denial — a token for a foreign resource/audience is
     rejected.
 13. Bearer / DPoP interoperability — a plain Bearer client works; a

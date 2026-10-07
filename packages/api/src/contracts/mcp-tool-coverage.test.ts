@@ -30,7 +30,7 @@ function confirmLiteral(tool: McpToolContract): string {
 }
 
 function rateLimit(tool: McpToolContract): string {
-  if (!tool.rateLimit) return "default";
+  if (!tool.rateLimit) return "— (only the `/mcp` request limit)";
   const { perMinute, key, onlyWhen } = tool.rateLimit;
   return `${perMinute}/min (${code(key)}${onlyWhen ? `, only with ${code(onlyWhen)}` : ""})`;
 }
@@ -64,7 +64,7 @@ function renderCoverage(): string {
     "",
     `## Tools (${MCP_TOOLS.length})`,
     "",
-    "READ tokens see the READ tools; FULL tokens see all. Every write takes an optional `note`.",
+    "READ credentials see the READ tools; FULL credentials see all.",
     "",
     "| Tool | Token | Procedures | Confirm | Rate limit | Notes | Description |",
     "| --- | --- | --- | --- | --- | --- | --- |",
@@ -78,7 +78,7 @@ function renderCoverage(): string {
     "| Procedure | Reason |",
     "| --- | --- |",
     ...Object.entries(MCP_EXCLUDED_SESSION_PROCEDURES)
-      .sort(([a], [b]) => a.localeCompare(b))
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
       .map(([path, reason]) => `| ${code(path)} | ${cell(reason)} |`),
     "",
     "## Procedures agents can never reach",
@@ -89,7 +89,7 @@ function renderCoverage(): string {
       const paths = procedures
         .filter(([, procedure]) => procedure.access === access)
         .map(([path]) => path)
-        .sort((a, b) => a.localeCompare(b));
+        .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
       return `| ${code(access)} | ${paths.map(code).join(", ") || "—"} |`;
     }),
     "",

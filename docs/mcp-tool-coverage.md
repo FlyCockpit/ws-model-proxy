@@ -16,37 +16,37 @@ MCP with a reason (`session` access), or unreachable by agent credentials (`publ
 
 ## Tools (27)
 
-READ tokens see the READ tools; FULL tokens see all. Every write takes an optional `note`.
+READ credentials see the READ tools; FULL credentials see all.
 
 | Tool | Token | Procedures | Confirm | Rate limit | Notes | Description |
 | --- | --- | --- | --- | --- | --- | --- |
-| `nodes_get` | READ | `nodes.list`, `nodes.get` | — | default | — | Your nodes, or one in detail: trust, hardware, fabrics, hold, held definitions, instances, found local servers, secret names. |
-| `runtimes_get` | READ | `runtimes.list`, `runtimes.get`, `runtimes.versions.list`, `runtimes.versions.get`, `runtimes.presets.list`, `runtimes.shares.list` | — | default | — | Your runtimes, or one in detail (versions: the version list; versionId: one full definition; presets: starting points; shared: definitions shared with you). |
-| `pools_get` | READ | `pools.list`, `pools.get`, `pools.history.list` | — | default | — | Your pools and pools shared with you, or one pool (history: its change log). |
-| `profiles_get` | READ | `profiles.list`, `profiles.get` | — | default | — | Your profiles, or one: owned nodes, hold lines, pinned versions, satisfied now. |
-| `providers_get` | READ | `providers.accounts.list`, `providers.models.list` | — | default | — | Cloud provider accounts and models with this month's spend (never keys). Only people change providers. |
-| `requests_list` | READ | `activity.requests.list` | — | default | — | Recent requests without prompts: route, what served them, timings, tokens, errors. |
-| `metrics_query` | READ | `activity.metrics.query` | — | default | — | Request, engine-load and node metrics for a pool, runtime, version, node or instance over a range, optionally grouped. Use it to compare versions after a change. |
+| `nodes_get` | READ | `nodes.list`, `nodes.get` | — | — (only the `/mcp` request limit) | — | Your nodes, or one in detail: trust, hardware, fabrics, hold, held definitions, instances, found local servers, secret names. |
+| `runtimes_get` | READ | `runtimes.list`, `runtimes.get`, `runtimes.versions.list`, `runtimes.versions.get`, `runtimes.presets.list`, `runtimes.shares.list` | — | — (only the `/mcp` request limit) | — | Your runtimes, or one in detail (versions: the version list; versionId: one full definition; presets: starting points; shared: definitions shared with you). |
+| `pools_get` | READ | `pools.list`, `pools.get`, `pools.history.list` | — | — (only the `/mcp` request limit) | — | Your pools and pools shared with you, or one pool (history: its change log). |
+| `profiles_get` | READ | `profiles.list`, `profiles.get` | — | — (only the `/mcp` request limit) | — | Your profiles, or one: owned nodes, hold lines, pinned versions, satisfied now. |
+| `providers_get` | READ | `providers.accounts.list`, `providers.models.list` | — | — (only the `/mcp` request limit) | — | Cloud provider accounts and models with this month's spend (never keys). Only people change providers. |
+| `requests_list` | READ | `activity.requests.list` | — | — (only the `/mcp` request limit) | — | Recent requests without prompts: route, what served them, timings, tokens, errors. |
+| `metrics_query` | READ | `activity.metrics.query` | — | — (only the `/mcp` request limit) | — | Request, engine-load and node metrics for a pool, runtime, version, node or instance over a range, optionally grouped. Use it to compare versions after a change. |
 | `model_test` | FULL | `models.test` | — | 2/min (`bench`, only with `bench`) | — | Send a test to a callable ID (not :external) or one of your runtimes and see what served it and how fast; bench repeats it on your own pools and runtimes. |
-| `pool_create` | FULL | `pools.create` | — | default | compact: `advanced`, `routing` | Create a pool from your served models. Cloud fallback stays off until a person turns it on. |
-| `pool_update` | FULL | `pools.update`, `pools.members.addContributed`, `pools.members.removeContributed` | — | default | compact: `members`, `routing`, `cloud`, `advanced` | Change a pool you own, or contribute/withdraw your own served models in a pool shared with you (can contribute). People only: cloud mode, paid warm protection, own-key consent, only-my-own-hardware. |
-| `pool_delete` | FULL | `pools.delete` | `DELETE` | default | — | Delete a pool with its shares, contributed members, API-key entries and sidecar links. confirm: "DELETE". |
-| `runtime_create` | FULL | `runtimes.create`, `runtimes.presets.list`, `runtimes.fork` | — | default | compact: `spec`, `limits`, `advanced` | Define a runtime (a server on a node, or commands that start one), or copy one shared with you (forkFrom). Put model downloads and other setup in an idempotent prepare step so applying a profile on a fresh node fetches weights by itself. |
-| `runtime_update` | FULL | `runtimes.update`, `runtimes.models.setCapabilities` | — | default | compact: `spec`, `limits`, `advanced` | Save a new version (say why in note); limit edits apply live, a changed definition needs restartRunning. Setup such as model downloads belongs in the idempotent prepare step. |
-| `runtime_delete` | FULL | `runtimes.delete` | `DELETE` | default | — | Delete a runtime that no instance runs and no profile pins. confirm: "DELETE". |
+| `pool_create` | FULL | `pools.create` | — | — (only the `/mcp` request limit) | compact: `advanced`, `routing` | Create a pool from your served models. Cloud fallback stays off until a person turns it on. |
+| `pool_update` | FULL | `pools.update`, `pools.members.addContributed`, `pools.members.removeContributed` | — | — (only the `/mcp` request limit) | compact: `members`, `routing`, `cloud`, `advanced` | Change a pool you own, or contribute/withdraw your own served models in a pool shared with you (can contribute). People only: cloud mode, paid warm protection, own-key consent, only-my-own-hardware. |
+| `pool_delete` | FULL | `pools.delete` | `DELETE` | — (only the `/mcp` request limit) | — | Delete a pool with its shares, contributed members, API-key entries and sidecar links. confirm: "DELETE". |
+| `runtime_create` | FULL | `runtimes.create`, `runtimes.presets.list`, `runtimes.fork` | — | — (only the `/mcp` request limit) | compact: `spec`, `limits`, `advanced` | Define a runtime (a server on a node, or commands that start one), or copy one shared with you (forkFrom). Put model downloads and other setup in an idempotent prepare step so applying a profile on a fresh node fetches weights by itself. |
+| `runtime_update` | FULL | `runtimes.update`, `runtimes.models.setCapabilities` | — | — (only the `/mcp` request limit) | compact: `spec`, `limits`, `advanced` | Save a new version (say why in note); limit edits apply live, a changed definition needs restartRunning. Setup such as model downloads belongs in the idempotent prepare step. |
+| `runtime_delete` | FULL | `runtimes.delete` | `DELETE` | — (only the `/mcp` request limit) | — | Delete a runtime that no instance runs and no profile pins. confirm: "DELETE". |
 | `runtime_start` | FULL | `runtimes.start` | — | 10/min (`start_stop_apply`) | — | Start a runtime on nodes (or count instances placed for you), or restart an instance; preview shows placements and what stops. Refused on Relay-only and held nodes. |
 | `runtime_stop` | FULL | `runtimes.stop` | — | 10/min (`start_stop_apply`) | — | Stop an instance, or every instance of a runtime (optionally on one node). |
-| `profile_save` | FULL | `profiles.save` | — | default | — | Create or replace a profile: owned nodes and pinned runtime versions. Hold lines are for people. |
+| `profile_save` | FULL | `profiles.save` | — | — (only the `/mcp` request limit) | — | Create or replace a profile: owned nodes and pinned runtime versions. Hold lines are for people. |
 | `profile_apply` | FULL | `profiles.apply` | — | 10/min (`start_stop_apply`) | — | Apply a profile (preview first if unsure): start its pins, stop other startable runtimes on its nodes. Refused if any owned node is Relay only. |
-| `profile_delete` | FULL | `profiles.delete` | `DELETE` | default | — | Delete a profile; nothing stops. confirm: "DELETE". |
-| `node_update` | FULL | `nodes.update` | — | default | compact: `hardware`, `metricCommands` | Change a Full-control node: labels, ports, hardware, metric commands, fabrics, command lifetime, rescan. |
-| `node_secret_set` | FULL | `nodes.secrets.set`, `nodes.secrets.delete` | — | default | secret input, never logged or echoed | Set (or with value null delete) a WSMP_SECRET_* on a Full-control node, for runtimes to reference by name. Write-only: never shown again. |
+| `profile_delete` | FULL | `profiles.delete` | `DELETE` | — (only the `/mcp` request limit) | — | Delete a profile; nothing stops. confirm: "DELETE". |
+| `node_update` | FULL | `nodes.update` | — | — (only the `/mcp` request limit) | compact: `hardware`, `metricCommands` | Change a Full-control node: labels, ports, hardware, metric commands, fabrics, command lifetime, rescan. |
+| `node_secret_set` | FULL | `nodes.secrets.set`, `nodes.secrets.delete` | — | — (only the `/mcp` request limit) | secret input, never logged or echoed | Set (or with value null delete) a WSMP_SECRET_* on a Full-control node, for runtimes to reference by name. Write-only: never shown again. |
 | `node_command_run` | FULL | `nodes.commands.run` | `RUN` | 30/min (`node_command`) | — | Run a one-off command (downloads while experimenting, builds, diagnostics, benchmarks) on a Full-control node; answers within ~15 s, then poll with node_command_get. Anything that should keep running or serve traffic must be a runtime: a server started here is invisible to the proxy and dies with the command. confirm: "RUN". |
-| `node_command_get` | FULL | `nodes.commands.get` | — | default | — | State and output tail of a command from node_command_run; waitMs waits for it, cancel stops it and everything it started. |
+| `node_command_get` | FULL | `nodes.commands.get` | — | — (only the `/mcp` request limit) | — | State and output tail of a command from node_command_run; waitMs waits for it, cancel stops it and everything it started. |
 | `node_command_queue_for_user` | FULL | `nodes.queued.enqueue` | — | 30/min (`node_command`) | — | Queue a command a person must run (e.g. it needs their sudo password); it runs only when they press Run and Enter. |
-| `node_file_read` | FULL | `nodes.files.read` | — | default | — | Read, stat, list or search under the node's allowed folders; returns an etag. |
-| `node_file_write` | FULL | `nodes.files.write` | — | default | — | Write, mkdir, rename or delete under the node's allowed folders (ifMatch: the etag you read). |
-| `node_file_edit` | FULL | `nodes.files.edit` | — | default | — | Replace exact text in a file (ifMatch required); returns the new etag and a diff. |
+| `node_file_read` | FULL | `nodes.files.read` | — | — (only the `/mcp` request limit) | — | Read, stat, list or search under the node's allowed folders; returns an etag. |
+| `node_file_write` | FULL | `nodes.files.write` | — | — (only the `/mcp` request limit) | — | Write, mkdir, rename or delete under the node's allowed folders (ifMatch: the etag you read). |
+| `node_file_edit` | FULL | `nodes.files.edit` | — | — (only the `/mcp` request limit) | — | Replace exact text in a file (ifMatch required); returns the new etag and a diff. |
 
 ## Session procedures kept off MCP
 
