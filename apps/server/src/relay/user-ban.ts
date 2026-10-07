@@ -5,7 +5,7 @@ import { relaySessionManager } from "./session-manager.js";
 /**
  * The ban fence: a user was banned, so nothing they started may keep running. Ends their
  * node commands, in-flight file ops and operator terminals (the engine opens no new one for a
- * banned or deleting owner; their waiting interactive steps keep waiting) and refuses
+ * banned or deleting owner, and its drain cancels their waiting interactive steps) and refuses
  * admissions still reading (the per-user twin of the token revoke). Their relay sockets stay
  * open; a ban already refuses reauthentication and every new admission re-reads the owner's
  * ban state. Browser terminals end at the terminal hub's session recheck.

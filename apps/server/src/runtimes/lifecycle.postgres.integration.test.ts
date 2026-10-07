@@ -34,6 +34,9 @@ integration("runtime lifecycle (PostgreSQL)", () => {
   /** A service runtime whose start a person runs in an operator terminal. */
   let operatorRuntimeId = "";
   let operatorVersionId = "";
+  /** A service whose stop a person runs in an operator terminal. */
+  let stopperRuntimeId = "";
+  let stopperVersionId = "";
   const sent: Job[] = [];
   const session = { connectionGeneration: 1, trust: "full" as "full" | "relay", online: true };
   /** The fake relay's operator-terminal side. */
@@ -154,6 +157,45 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       where: { id: operatorRuntimeId },
       data: { currentVersionId: operatorVersionId },
     });
+    // A service whose stop a person runs in an operator terminal (its start is automatic).
+    const stopperSpec = {
+      ...spec,
+      launch: {
+        ...spec.launch,
+        management: "service",
+        commands: [
+          {
+            start: "systemctl start llm --port {{port}}",
+            stop: "sudo systemctl stop llm",
+            status: "systemctl is-active llm",
+            interactive: { stop: true },
+          },
+        ],
+      },
+    };
+    const stopperRuntime = await db.runtime.create({
+      data: { userId, slug: `lcs-${suffix}`, name: "LCS", kind: "STARTABLE", origin: "SERVER" },
+    });
+    stopperRuntimeId = stopperRuntime.id;
+    const stopperVersion = await db.runtimeVersion.create({
+      data: {
+        runtimeId: stopperRuntimeId,
+        version: 1,
+        editor: "USER",
+        editorUserId: userId,
+        contentHash: hex(`content-stop-${suffix}`),
+        launchHash: hex(`launch-stop-${suffix}`),
+        spec: stopperSpec,
+        api: "OPENAI",
+        engine: "VLLM",
+        modelType: "LLM",
+      },
+    });
+    stopperVersionId = stopperVersion.id;
+    await db.runtime.update({
+      where: { id: stopperRuntimeId },
+      data: { currentVersionId: stopperVersionId },
+    });
   });
 
   afterAll(async () => {
@@ -212,7 +254,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
   async function startInstance(
     port: number,
     startedBy: "USER" | "AGENT" = "USER",
-    which: "plain" | "operator" = "plain",
+    which: "plain" | "operator" | "stopper" = "plain",
   ) {
     const db = m.fixture;
     const operation = await db.runtimeOperation.create({
@@ -228,7 +270,11 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     const id = `c${hex(`${suffix}-${port}`).slice(0, 23)}`;
     const handle = `i-${id.slice(0, 12)}`;
     const [instanceRuntime, instanceVersion] =
-      which === "operator" ? [operatorRuntimeId, operatorVersionId] : [runtimeId, versionId];
+      which === "operator"
+        ? [operatorRuntimeId, operatorVersionId]
+        : which === "stopper"
+          ? [stopperRuntimeId, stopperVersionId]
+          : [runtimeId, versionId];
     await db.runtimeInstance.create({
       data: {
         id,
@@ -509,10 +555,17 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       orderBy: { createdAt: "desc" },
     });
 
+  /** What `markInstancesStopping` writes. */
   const stopInstance = (id: string) =>
     m.fixture.runtimeInstance.update({
       where: { id },
-      data: { desiredState: "STOPPED", phase: "STOPPING", phaseReason: "stop_requested" },
+      data: {
+        desiredState: "STOPPED",
+        phase: "STOPPING",
+        phaseReason: "stop_requested",
+        needsOperator: null,
+        needsOperatorSince: null,
+      },
     });
 
   it("runs an interactive start in an operator terminal a person answers", async () => {
@@ -742,21 +795,280 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     expect(inst.needsOperator).toBeNull();
   });
 
-  it("opens no terminal for a banned owner", async () => {
+  // ── Inactive (banned or deleting) owners ──
+
+  const ban = (until: Date | null) =>
+    m.fixture.user.update({ where: { id: userId }, data: { banned: true, banExpires: until } });
+  const unban = () =>
+    m.fixture.user.update({ where: { id: userId }, data: { banned: false, banExpires: null } });
+  const markDeleting = () =>
+    m.fixture.user.update({
+      where: { id: userId },
+      data: { deletionRequestedAt: new Date() },
+    });
+  /** Only the deletion subsystem may clear the marker (user_deletion_marker_guard). */
+  const clearDeleting = () =>
+    m.fixture.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT set_config('wsmp.user_deletion_writer', 'on', true)`;
+      await tx.user.update({ where: { id: userId }, data: { deletionRequestedAt: null } });
+    });
+
+  it("cancels a banned owner's held interactive start: no terminal, nothing sent", async () => {
     const lc = await engine();
     const id = await startInstance(30_207, "USER", "operator");
-    await m.fixture.user.update({ where: { id: userId }, data: { banned: true } });
+    await ban(null);
     try {
       const before = sent.length;
       await lc.runOnce();
       expect(sent.slice(before).some((job) => job.instanceId === id)).toBe(false);
-      expect((await step(id, "START")).state).toBe("PENDING");
+      const start = await step(id, "START");
+      expect(start.state).toBe("CANCELLED");
+      expect(start.errorCode).toBe("owner_inactive");
+      // The start never ran: the claim is released and the interactive start waits for a
+      // person's restart.
+      const inst = await instance(id);
+      expect(inst.phase).toBe("STOPPED");
+      expect(inst.Ranks[0]?.claim).toBe("RELEASED");
+      expect(inst.needsOperator).toBe("RESTART");
     } finally {
-      await m.fixture.user.update({ where: { id: userId }, data: { banned: false } });
+      await unban();
     }
     await stopInstance(id);
     await lc.runOnce();
     expect((await instance(id)).phase).toBe("STOPPED");
+  });
+
+  it("closes a deleting owner's open start terminal; the plain stop still goes out", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_208, "USER", "operator");
+    await lc.runOnce();
+    const start = lastJob(id, "start");
+    await progress(lc, start, "awaiting_operator");
+    await markDeleting();
+    try {
+      operatorRelay.closed.length = 0;
+      await lc.runOnce();
+      const row = await step(id, "START");
+      expect(operatorRelay.closed).toContain(row.id);
+      expect(row.state).toBe("FAILED");
+      expect(row.errorCode).toBe("owner_inactive");
+      // The screen was up: a person may have pressed Enter, so the rank needs a proven stop.
+      expect(row.attempts).toBe(1);
+      expect(row.operatorTerminalId).toBeNull();
+      const stop = lastJob(id, "stop");
+      expect(stop.operator).toBeUndefined();
+      await answer(lc, stop, "succeeded", { stopped: true });
+      const inst = await instance(id);
+      expect(inst.phase).toBe("STOPPED");
+      expect(inst.Ranks[0]?.claim).toBe("RELEASED");
+    } finally {
+      await clearDeleting();
+    }
+  });
+
+  it("never starts an inactive owner's instance; a stop still settles it", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_209);
+    await ban(new Date(Date.now() + 3_600_000));
+    try {
+      const before = sent.length;
+      await lc.runOnce();
+      await lc.runOnce();
+      expect(sent.slice(before).some((job) => job.instanceId === id)).toBe(false);
+      expect((await step(id, "START")).state).toBe("PENDING");
+      expect((await instance(id)).phase).toBe("STARTING");
+      await stopInstance(id);
+      await lc.runOnce();
+      const inst = await instance(id);
+      expect(inst.phase).toBe("STOPPED");
+      expect(inst.Ranks[0]?.claim).toBe("RELEASED");
+    } finally {
+      await unban();
+    }
+  });
+
+  it("sends an inactive owner's ready instance no health probe and never restarts it", async () => {
+    const lc = await engine();
+    const id = await ready(lc, 30_218);
+    await ban(null);
+    try {
+      await m.fixture.runtimeInstance.update({
+        where: { id },
+        data: { lastHealthAt: new Date(Date.now() - 60_000) },
+      });
+      const before = sent.length;
+      await lc.runOnce();
+      expect(sent.slice(before).some((job) => job.instanceId === id)).toBe(false);
+      // Crashed (the node no longer runs it): the stop goes out, the restart never does.
+      await m.fixture.instanceStep.updateMany({
+        where: { instanceId: id, phase: "HEALTH", state: "PENDING" },
+        data: { state: "CANCELLED" },
+      });
+      await lc.runtimeInventory(ref(), { snapshotId: "s-ban", alwaysOn: [], instances: [] });
+      await lc.runOnce();
+      await answer(lc, lastJob(id, "stop"), "succeeded", { stopped: true });
+      let inst = await instance(id);
+      expect(inst.phase).toBe("STOPPED");
+      expect(inst.desiredState).toBe("RUNNING");
+      await m.fixture.runtimeInstance.update({
+        where: { id },
+        data: { nextRestartAt: new Date(Date.now() - 1_000) },
+      });
+      await lc.runOnce();
+      inst = await instance(id);
+      expect(inst.phase).toBe("STOPPED");
+      expect(inst.Ranks[0]?.claim).toBe("RELEASED");
+    } finally {
+      await unban();
+    }
+    // Active again: the restart rule applies.
+    await lc.runOnce();
+    expect((await instance(id)).phase).toBe("STARTING");
+    await stopInstance(id);
+    await lc.runOnce();
+    const stop = [...sent].reverse().find((job) => job.instanceId === id && job.phase === "stop");
+    if (stop && (await instance(id)).phase === "STOPPING")
+      await answer(lc, stop, "succeeded", { stopped: true });
+  });
+
+  it("leaves a person's run alone, and counts a terminal the ban fence already closed", async () => {
+    const lc = await engine();
+    const running = await startInstance(30_219, "USER", "operator");
+    const spawning = await startInstance(30_220, "USER", "operator");
+    await lc.runOnce();
+    const run = lastJob(running, "start");
+    await progress(lc, run, "awaiting_operator");
+    // The person pressed Enter; the node's report has not arrived yet.
+    operatorRelay.closeAnswer = "running";
+    await ban(null);
+    try {
+      await lc.runOnce();
+      expect((await step(running, "START")).state).toBe("AWAITING_OPERATOR");
+      // The other terminal's screen never came up, and the ban fence already cancelled it
+      // ("absent"): it may have run, so the attempt counts and the rank needs a proven stop.
+      operatorRelay.closeAnswer = "absent";
+      await lc.runOnce();
+      const row = await step(spawning, "START");
+      expect(row.state).toBe("FAILED");
+      expect(row.errorCode).toBe("owner_inactive");
+      expect(row.attempts).toBe(1);
+      expect((await instance(spawning)).phase).toBe("STOPPING");
+    } finally {
+      operatorRelay.closeAnswer = "closed";
+      await unban();
+    }
+    for (const id of [running, spawning]) {
+      await stopInstance(id);
+      await lc.runOnce();
+      const stop = [...sent].reverse().find((job) => job.instanceId === id && job.phase === "stop");
+      if (stop) await answer(lc, stop, "succeeded", { stopped: true });
+    }
+  });
+
+  it("a terminal this close ends before its screen came up gives its attempt back", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_221, "USER", "operator");
+    await lc.runOnce();
+    const start = await step(id, "START");
+    expect(start.state).toBe("RUNNING");
+    await ban(null);
+    try {
+      operatorRelay.closed.length = 0;
+      await lc.runOnce();
+      expect(operatorRelay.closed).toContain(start.id);
+      const row = await step(id, "START");
+      expect(row.state).toBe("CANCELLED");
+      expect(row.attempts).toBe(0);
+      // Nothing ran: the claim is released without a stop.
+      const inst = await instance(id);
+      expect(inst.phase).toBe("STOPPED");
+      expect(inst.Ranks[0]?.claim).toBe("RELEASED");
+    } finally {
+      await unban();
+    }
+  });
+
+  it("an expired ban is no ban: the start goes out", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_215);
+    await ban(new Date(Date.now() - 60_000));
+    try {
+      await lc.runOnce();
+      expect(lastJob(id, "start").instanceId).toBe(id);
+    } finally {
+      await unban();
+    }
+    await stopInstance(id);
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "stop"), "succeeded", { stopped: true });
+    expect((await instance(id)).phase).toBe("STOPPED");
+  });
+
+  it("forgets an inactive owner's unanswerable interactive stop; a status probe proves it", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_216, "USER", "stopper");
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "start"), "succeeded");
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "readiness"), "succeeded");
+    expect((await instance(id)).phase).toBe("READY");
+    await ban(null);
+    try {
+      await stopInstance(id);
+      const before = sent.length;
+      await lc.runOnce();
+      // No terminal for the stop: it is cancelled and the rank forgotten by the engine.
+      expect(sent.slice(before).some((job) => job.instanceId === id && job.phase === "stop")).toBe(
+        false,
+      );
+      const stop = await step(id, "STOP");
+      expect(stop.state).toBe("CANCELLED");
+      expect(stop.errorCode).toBe("owner_inactive");
+      let inst = await instance(id);
+      expect(inst.phase).toBe("STOPPED");
+      expect(inst.needsOperator).toBeNull();
+      expect(inst.Ranks[0]).toMatchObject({
+        claim: "HELD_UNKNOWN",
+        forgottenBy: "system:owner_inactive",
+      });
+      expect(inst.Ranks[0]?.forgottenAt).not.toBeNull();
+      // The status probe goes out for the inactive owner and proves the stop.
+      await lc.runOnce();
+      const status = lastJob(id, "status");
+      expect(status.operator).toBeUndefined();
+      await answer(lc, status, "succeeded", { stopped: true });
+      inst = await instance(id);
+      expect(inst.Ranks[0]?.claim).toBe("RELEASED");
+    } finally {
+      await unban();
+    }
+  });
+
+  it("forgets a stop a person gave up on once the owner is inactive", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_217, "USER", "stopper");
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "start"), "succeeded");
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "readiness"), "succeeded");
+    await stopInstance(id);
+    await lc.runOnce();
+    const job = lastJob(id, "stop");
+    expect(job.operator).toBeDefined();
+    await progress(lc, job, "awaiting_operator");
+    await lc.cancelStep({ userId, stepId: job.stepId });
+    let inst = await instance(id);
+    expect(inst.needsOperator).toBe("FORGET");
+    expect(inst.Ranks[0]?.claim).toBe("HELD");
+    await markDeleting();
+    try {
+      await lc.runOnce();
+      inst = await instance(id);
+      expect(inst.phase).toBe("STOPPED");
+      expect(inst.Ranks[0]?.claim).toBe("HELD_UNKNOWN");
+    } finally {
+      await clearDeleting();
+    }
   });
 
   it("opens at most four operator terminals per node; the rest are held", async () => {

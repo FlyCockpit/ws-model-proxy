@@ -190,7 +190,7 @@ const GRAPH_WRITERS: Record<string, string> = {
     "H status: bounded capacity generation then endpoint epoch; commits each before optional projection publication, no source/bucket lock overlaps",
   "apps/server/src/relay/registration.ts": "M: relay registration",
   "apps/server/src/runtimes/lifecycle.ts":
-    "M: runtime lifecycle (steps, claims, instance phases, a managed instance's engine facts) under graphWrite: the owner fence, then the instance's capacity fence; execution targets of a READY instance in the same transaction",
+    "M: runtime lifecycle (steps, claims, instance phases, a managed instance's engine facts, the inactive-owner drain) under graphWrite: the owner fence, then the instance's capacity fence; execution targets of a READY instance in the same transaction",
   "apps/server/src/runtimes/always-on.ts":
     "M: always-on runtimes from inventory (node-origin runtimes, versions, served models, the instance, its targets, facts and phase) under graphWrite: the owner fence, then the capacity fences of the runtime's instances; a node-origin runtime the node stopped reporting under graphDelete (fenceParentDelete)",
   "apps/server/src/relay/node-services.ts":

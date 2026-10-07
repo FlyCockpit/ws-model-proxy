@@ -16,6 +16,10 @@
  * {@link OPERATOR_TERMINALS_PER_NODE} live per node (stops exempt). A person's run is never cut
  * off: stops of the instance on that node wait behind it.
  *
+ * A banned or deleting owner's steps that wait for a person are cancelled, and a rank whose
+ * stop nobody can answer becomes HELD_UNKNOWN until a status probe proves the stop (§3.5).
+ * Their non-interactive stops and status probes still go out; starts never do.
+ *
  * Always-on runtimes in a node's inventory (node-origin ones included) are applied by
  * `./always-on.ts`; the engine facts of managed instances are recorded here.
  */
@@ -92,6 +96,35 @@ export const OPERATOR_HOLD = {
 const OPERATOR_HOLD_CODES: ReadonlySet<string> = new Set(Object.values(OPERATOR_HOLD));
 /** A person gave up on an interactive step (`runtimes.steps.cancel`). */
 export const OPERATOR_CANCELLED = "operator_cancelled";
+/**
+ * The owner is banned or deleting (`userCredentialAccessBlocked`): nobody may answer their
+ * interactive steps, so the ones waiting for a person are cancelled with this code (and a
+ * STARTING instance gang-stops with it as its reason).
+ */
+export const OWNER_INACTIVE = "owner_inactive";
+/** `InstanceRank.forgottenBy` of a claim the engine forgot for an inactive owner (no person). */
+export const FORGOTTEN_OWNER_INACTIVE = "system:owner_inactive";
+
+/** A banned (ban active now) or deletion-pending owner, as `userCredentialAccessBlocked`. */
+function inactiveOwner(now: Date): Prisma.UserWhereInput {
+  return {
+    OR: [
+      { deletionRequestedAt: { not: null } },
+      { banned: true, OR: [{ banExpires: null }, { banExpires: { gte: now } }] },
+    ],
+  };
+}
+
+/**
+ * The complement of {@link inactiveOwner}, spelled out: `NOT` over the nullable `banned` would
+ * drop never-banned owners (`banned` NULL) in SQL's three-valued logic.
+ */
+function activeOwner(now: Date): Prisma.UserWhereInput {
+  return {
+    deletionRequestedAt: null,
+    OR: [{ banned: null }, { banned: false }, { banExpires: { lt: now } }],
+  };
+}
 
 /** Codes that prove a stop cannot be proven by the node: a person decides (Forget). */
 const UNPROVABLE_STOP = new Set([
@@ -365,6 +398,7 @@ export class RuntimeLifecycle {
   private async tick() {
     await this.prepareStarts();
     await this.reconcileStopping();
+    await this.drainInactiveOwners();
     await this.restartDue();
     await this.watchLive();
     await this.expireSteps();
@@ -789,7 +823,13 @@ export class RuntimeLifecycle {
   /** (RUNNING, STOPPED) past `nextRestartAt`: retake the claims and start a new generation. */
   private async restartDue() {
     const rows = await prisma.runtimeInstance.findMany({
-      where: { desiredState: "RUNNING", phase: "STOPPED", nextRestartAt: { lte: this.now() } },
+      where: {
+        desiredState: "RUNNING",
+        phase: "STOPPED",
+        nextRestartAt: { lte: this.now() },
+        // An inactive owner's instance never starts (it restarts once the owner is active).
+        Runtime: { User: activeOwner(this.now()) },
+      },
       select: { id: true, userId: true },
       take: BATCH,
     });
@@ -1077,7 +1117,17 @@ export class RuntimeLifecycle {
     const rows = await prisma.instanceStep.findMany({
       where: {
         state: "PENDING",
-        OR: [{ notBefore: null }, { notBefore: { lte: this.now() } }],
+        AND: [
+          { OR: [{ notBefore: null }, { notBefore: { lte: this.now() } }] },
+          // Stops and status probes go out for every owner; nothing else for an inactive one
+          // (claimStep checks again under the fence).
+          {
+            OR: [
+              { phase: { in: ["STOP", "STATUS"] } },
+              { Instance: { Runtime: { User: activeOwner(this.now()) } } },
+            ],
+          },
+        ],
         // Steps that can go now: on a connected node.
         ...(online ? { nodeId: { in: online } } : {}),
       },
@@ -1164,6 +1214,9 @@ export class RuntimeLifecycle {
       if (startPhase && instance.phase !== "STARTING") return null;
       if (step.phase === "HEALTH" && instance.phase !== "READY" && instance.phase !== "UNHEALTHY")
         return null;
+      // A banned or deleting owner's instance never starts (or runs anything but stops and
+      // status probes); the step waits, and is cancelled if a person would have to answer it.
+      if (!(await this.ownerActive(tx, instance.userId))) return null;
     }
     const node = await tx.node.findUnique({
       where: { id: step.nodeId },
@@ -1216,15 +1269,17 @@ export class RuntimeLifecycle {
     }
     // A stop is never sent over a person's run of this instance: it waits until that run
     // answers (and is neither failed nor counted meanwhile).
-    if (step.phase === "STOP" && (await this.operatorRunInProgress(tx, step))) return null;
+    // Nor a status probe: it could see the service stopped before the run brings it up.
+    if (
+      (step.phase === "STOP" || step.phase === "STATUS") &&
+      (await this.operatorRunInProgress(tx, step))
+    )
+      return null;
     const interactive = intent.data.interactive;
     if (interactive) {
-      // A banned or deleting owner could never answer the terminal: none opens.
-      const owner = await tx.user.findUnique({
-        where: { id: instance.userId },
-        select: { banned: true, banExpires: true, deletionRequestedAt: true },
-      });
-      if (!owner || userCredentialAccessBlocked(owner, now)) return null;
+      // A banned or deleting owner could never answer the terminal: none opens (the drain
+      // cancels the step, see drainInactiveOwners).
+      if (!(await this.ownerActive(tx, instance.userId))) return null;
       const hold = await this.operatorHold(tx, step, session);
       if (hold === "wait") {
         // Only its turn is missing now: an earlier hold no longer explains the wait.
@@ -1718,6 +1773,210 @@ export class RuntimeLifecycle {
       await this.afterStep(tx, step, false, OPERATOR_CANCELLED);
     });
     this.wake();
+  }
+
+  // ── Inactive (banned or deleting) owners ──
+
+  private async ownerActive(tx: Tx, userId: string): Promise<boolean> {
+    const owner = await tx.user.findUnique({
+      where: { id: userId },
+      select: { banned: true, banExpires: true, deletionRequestedAt: true },
+    });
+    return !!owner && !userCredentialAccessBlocked(owner, this.now());
+  }
+
+  /** Where the next drain pass continues (instances by id; null: from the start). */
+  private drainCursor: string | null = null;
+
+  /**
+   * Banned or deletion-pending owners (§3.5 S): nobody may answer their interactive steps, so
+   * the ones waiting for a person (held, terminal coming up, open or closed) are cancelled and
+   * their terminals closed. A person's run already in progress is left to answer. A cancelled
+   * start gang-stops its instance; a rank whose interactive stop is cancelled (or whose latest
+   * stop of this run is a failed interactive one) becomes HELD_UNKNOWN: the service may still
+   * run, so placement keeps counting it until a status probe proves the stop. The instance then
+   * settles. Non-interactive stops still go out; starts never do (dispatch).
+   */
+  private async drainInactiveOwners() {
+    const now = this.now();
+    const interactive = { path: ["interactive"], equals: true };
+    const rows = await prisma.runtimeInstance.findMany({
+      where: {
+        ...(this.drainCursor ? { id: { gt: this.drainCursor } } : {}),
+        Runtime: { User: inactiveOwner(now) },
+        OR: [
+          {
+            Steps: {
+              some: {
+                intent: interactive,
+                OR: [
+                  { state: { in: ["PENDING", "AWAITING_OPERATOR"] } },
+                  { state: "RUNNING", operatorAcceptedAt: null },
+                ],
+              },
+            },
+          },
+          {
+            phase: { in: ["STOPPING", "STARTING"] },
+            Ranks: { some: { claim: "HELD" } },
+            Steps: {
+              some: { phase: "STOP", state: { in: ["FAILED", "CANCELLED"] }, intent: interactive },
+            },
+          },
+        ],
+      },
+      select: { id: true, userId: true },
+      orderBy: { id: "asc" },
+      take: BATCH,
+    });
+    this.drainCursor = rows.length === BATCH ? (rows.at(-1)?.id ?? null) : null;
+    for (const row of rows) {
+      if (this.stopped) return;
+      // Plain reads first: an instance matched only by history (an older run's failed stop, a
+      // person's run in progress) costs no fenced transaction.
+      if (!(await this.drainWork(prisma, row.id))) continue;
+      await this.write(row.userId, row.id, (tx) =>
+        this.drainInstance(tx, row.id, row.userId),
+      ).catch((error: unknown) =>
+        console.error("[lifecycle] draining an inactive owner failed", errorName(error)),
+      );
+    }
+  }
+
+  /** Interactive steps of the instance that wait for a person (what the drain cancels). */
+  private async waitingInteractiveSteps(db: Tx, instanceId: string): Promise<StepRow[]> {
+    const steps = await db.instanceStep.findMany({
+      where: {
+        instanceId,
+        OR: [
+          { state: { in: ["PENDING", "AWAITING_OPERATOR"] } },
+          { state: "RUNNING", operatorAcceptedAt: null, operatorTerminalId: { not: null } },
+        ],
+      },
+    });
+    return steps.filter((step) => interactiveIntent(step.intent));
+  }
+
+  /**
+   * HELD ranks of a stopping (or restarting) instance whose latest stop of the current run is an
+   * interactive one that failed or was cancelled: nobody can answer it again.
+   */
+  private async unanswerableStopRanks(
+    db: Tx,
+    instance: {
+      id: string;
+      phase: string;
+      Ranks: ReadonlyArray<{ id: string; rank: number; claim: string }>;
+    },
+    generation: number,
+  ): Promise<Set<number>> {
+    const ranks = new Set<number>();
+    if (instance.phase !== "STOPPING" && instance.phase !== "STARTING") return ranks;
+    for (const rank of instance.Ranks) {
+      if (rank.claim !== "HELD") continue;
+      const latest = await db.instanceStep.findFirst({
+        where: { instanceId: instance.id, rank: rank.rank, phase: "STOP", generation },
+        orderBy: { sequence: "desc" },
+        select: { state: true, intent: true },
+      });
+      if (
+        latest &&
+        (latest.state === "FAILED" || latest.state === "CANCELLED") &&
+        interactiveIntent(latest.intent)
+      )
+        ranks.add(rank.rank);
+    }
+    return ranks;
+  }
+
+  /** Whether the drain has anything to do for this instance (read without fences). */
+  private async drainWork(db: Tx, instanceId: string): Promise<boolean> {
+    if ((await this.waitingInteractiveSteps(db, instanceId)).length > 0) return true;
+    const instance = await db.runtimeInstance.findUnique({
+      where: { id: instanceId },
+      select: { id: true, phase: true, Ranks: { select: { id: true, rank: true, claim: true } } },
+    });
+    if (!instance) return false;
+    const generation = await this.currentGeneration(db, instanceId);
+    return (await this.unanswerableStopRanks(db, instance, generation)).size > 0;
+  }
+
+  private async drainInstance(tx: Tx, instanceId: string, userId: string) {
+    // Again under the owner fence: an owner unbanned meanwhile answers their steps.
+    if (await this.ownerActive(tx, userId)) return;
+    const instance = await tx.runtimeInstance.findUnique({
+      where: { id: instanceId },
+      include: INSTANCE_INCLUDE,
+    });
+    if (!instance) return;
+    const now = this.now();
+    const generation = await this.currentGeneration(tx, instanceId);
+    let startCancelled = false;
+    let stopCancelled = false;
+    for (const step of await this.waitingInteractiveSteps(tx, instanceId)) {
+      // Closed by step id on whichever session holds it; a person's run is left alone.
+      const closed =
+        step.state === "PENDING"
+          ? null
+          : this.relay.closeOperatorStep?.(step.id, { keepRunning: true });
+      if (closed === "running") continue;
+      // A dispatch whose screen never came up gives its attempt back, but only when this close
+      // ended it: a terminal the ban fence already cancelled (or another process tracks)
+      // answers "absent" and may have run, so its attempt counts. A step that never ran is
+      // CANCELLED (proof for the claim's auto-release), else FAILED.
+      const attempts =
+        step.state === "PENDING"
+          ? step.attempts
+          : closed === "closed"
+            ? attemptsAfterServerClose(step)
+            : step.attempts;
+      const changed = await tx.instanceStep.updateMany({
+        where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
+        data: {
+          state: attempts === 0 ? "CANCELLED" : "FAILED",
+          errorCode: OWNER_INACTIVE,
+          attempts,
+          deadline: null,
+          leaseExpiresAt: null,
+          operatorHold: null,
+          operatorTerminalId: null,
+        },
+      });
+      if (changed.count === 0) continue;
+      if (step.phase === "STOP") stopCancelled = true;
+      // Only this run's start stops the instance; an older run's step is just cancelled.
+      else if (isStartPhase(step.phase) && step.generation === generation) startCancelled = true;
+    }
+    // Ranks of the current run whose stop nobody can answer (just cancelled, or failed or given
+    // up earlier): forgotten (HELD_UNKNOWN) with no person. An older run's stop forgets nothing.
+    const unanswerable = await this.unanswerableStopRanks(tx, instance, generation);
+    let forgot = 0;
+    for (const rank of instance.Ranks) {
+      if (rank.claim !== "HELD" || !unanswerable.has(rank.rank)) continue;
+      const changed = await tx.instanceRank.updateMany({
+        where: { id: rank.id, claim: "HELD" },
+        data: {
+          claim: "HELD_UNKNOWN",
+          claimChangedAt: now,
+          forgottenAt: now,
+          forgottenBy: FORGOTTEN_OWNER_INACTIVE,
+        },
+      });
+      forgot += changed.count;
+    }
+    if (!startCancelled && !stopCancelled && forgot === 0) return;
+    const fresh = await tx.runtimeInstance.findUnique({
+      where: { id: instanceId },
+      include: INSTANCE_INCLUDE,
+    });
+    if (!fresh) return;
+    if (fresh.phase === "STOPPING") await this.settleStopping(tx, fresh);
+    else if (
+      fresh.desiredState === "RUNNING" &&
+      (LIVE_PHASES as readonly string[]).includes(fresh.phase)
+    )
+      await this.gangStop(tx, fresh, OWNER_INACTIVE);
+    else await this.syncNeedsOperator(tx, instanceId);
   }
 
   // ── Results ──
