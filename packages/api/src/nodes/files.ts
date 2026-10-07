@@ -151,6 +151,9 @@ function mapReadInput(input: ReadInput): Mapped {
         ifNoneMatch: input.ifNoneMatch,
       });
       onlyFor("read", args, fields, ["offset", "limit", "byteOffset", "ifNoneMatch"]);
+      // byteOffset continues inside the line a page ended in, never in a tail read.
+      if (input.byteOffset !== undefined && (input.offset ?? 0) < 0)
+        throw new FileInputError("byteOffset needs offset at or after line 0.", "read", args);
       return { op: "read", args };
     }
     case "stat": {

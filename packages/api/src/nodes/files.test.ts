@@ -123,6 +123,13 @@ describe("nodes.files: who may use them", () => {
 });
 
 describe("nodes.files.read", () => {
+  it("refuses byteOffset inside a tail read", async () => {
+    const read = client(FULL_AGENT, fileServices()).read;
+    await expect(
+      read({ nodeId: "node-1", path: "/srv/a", offset: -20, byteOffset: 10 }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
   it("maps read, stat, list and search to their relay args", async () => {
     const files = fileServices();
     const read = client(FULL_AGENT, files).read;

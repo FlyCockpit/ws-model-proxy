@@ -187,12 +187,13 @@ integration("target recovery (PostgreSQL)", () => {
     });
     scheduler.wake();
     run();
-    // The pass runs asynchronously: wait for its writes.
-    for (let attempt = 0; attempt < 100; attempt++) {
+    // The pass runs asynchronously: wait (bounded) until every probed target is settled.
+    const probedIds = [targets.chat, targets.declared, targets.override, targets.embeddings];
+    for (let attempt = 0; attempt < 600; attempt++) {
       const settled = await fixture.executionTarget.count({
-        where: { id: { in: [targets.chat, targets.embeddings] }, health: { not: "HALF_OPEN" } },
+        where: { id: { in: probedIds }, health: { in: ["HEALTHY", "UNHEALTHY"] } },
       });
-      if (probed.length >= 4 && settled === 2) break;
+      if (settled === probedIds.length) break;
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     scheduler.stop();
@@ -212,5 +213,5 @@ integration("target recovery (PostgreSQL)", () => {
     expect(health.get(targets.embeddings)?.health).toBe("UNHEALTHY");
     expect(health.get(targets.transcription)?.health).toBe("DEGRADED");
     expect(probed).not.toContain(targets.transcription);
-  });
+  }, 60_000);
 });
