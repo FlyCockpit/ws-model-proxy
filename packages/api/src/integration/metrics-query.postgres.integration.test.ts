@@ -537,6 +537,32 @@ integration("metrics_query on PostgreSQL", () => {
     expect(traffic?.requests).toBeLessThan(100);
   });
 
+  it("lists the run's nodes, runtimes, pools and requests to an admin", async () => {
+    const admin = createRouterClient(appRouter, {
+      context: {
+        auth: person(STRANGER),
+        session: { ...sessionOf(STRANGER), user: { ...sessionOf(STRANGER).user, role: "admin" } },
+      } as Context,
+    }).adminObservability;
+    const ownerQuery = OWNER;
+    const nodes = await admin.nodes({ ownerQuery });
+    expect(nodes.items).toEqual([
+      expect.objectContaining({ id: ids.node, trust: "FULL", connection: "ONLINE" }),
+    ]);
+    expect(nodes.items[0]?.runningInstances).toBeGreaterThanOrEqual(0);
+    const runtimes = await admin.runtimes({ ownerQuery });
+    expect(runtimes.items[0]).toMatchObject({ id: ids.runtime, modelType: "LLM" });
+    const pools = await admin.pools({ ownerQuery });
+    expect(pools.items).toEqual([
+      expect.objectContaining({ id: ids.pool, callableId: `${OWNER}/chat`, members: 1, shares: 1 }),
+    ]);
+    const relay = await admin.relay({ ownerQuery });
+    expect(relay.total).toBe(0);
+    await expect(client(person(OWNER)).adminObservability.nodes({})).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+  });
+
   it("answers NOT_FOUND to anyone else", async () => {
     const stranger = client(agent(STRANGER)).activity.metrics;
     for (const scope of [

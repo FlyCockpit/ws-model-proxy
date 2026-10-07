@@ -265,7 +265,9 @@ export const adminObservabilityContract = {
           slug: z.string(),
           owner: ownerRefSchema,
           kind: z.enum(RUNTIME_KIND),
-          modelType: z.enum(MODEL_TYPE),
+          /** Null for a service runtime (no served model type). */
+          modelType: z.enum(MODEL_TYPE).nullable(),
+          /** Instances that are not stopped, newest first (at most 20). */
           instances: z.array(z.object({ id: idSchema, phase: z.enum(INSTANCE_PHASE) }).strict()),
         })
         .strict(),
