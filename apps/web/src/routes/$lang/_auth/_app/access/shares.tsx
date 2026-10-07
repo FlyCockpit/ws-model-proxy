@@ -86,6 +86,7 @@ function AccessSharesPage() {
               shares.data.byMe.map((share) => <ShareByMeRow key={share.id} share={share} />)
             )}
           </Section>
+          <RuntimeSharesByMe />
           <Section title={t("access:shares.invitesTitle")}>
             {shares.data.invites.length === 0 ? (
               <Empty text={t("access:shares.invitesEmpty")} />
@@ -127,7 +128,95 @@ function Empty({ text }: { text: string }) {
 
 function useInvalidateShares() {
   const queryClient = useQueryClient();
-  return () => queryClient.invalidateQueries({ queryKey: orpc.access.shares.list.key() });
+  return () =>
+    Promise.all([
+      queryClient.invalidateQueries({ queryKey: orpc.access.shares.list.key() }),
+      queryClient.invalidateQueries({ queryKey: orpc.runtimes.shares.list.key() }),
+    ]);
+}
+
+/** Runtime definitions you share (read-only, every version), with stop sharing. */
+function RuntimeSharesByMe() {
+  const { t } = useTranslation(["access"]);
+  const shares = useQuery(orpc.runtimes.shares.list.queryOptions({ input: {} }));
+  const runtimes = useQuery(orpc.runtimes.list.queryOptions());
+  const names = new Map(
+    (runtimes.data?.runtimes ?? []).map((runtime) => [runtime.id, runtime.name]),
+  );
+  return (
+    <Section title={t("access:shares.runtimesByMeTitle")}>
+      {shares.isPending ? (
+        <Skeleton className="h-12 w-full" />
+      ) : shares.isError ? (
+        <InlineRetry message={t("access:shares.loadFailed")} onRetry={() => shares.refetch()} />
+      ) : shares.data.sharedByMe.length === 0 ? (
+        <Empty text={t("access:shares.runtimesByMeEmpty")} />
+      ) : (
+        shares.data.sharedByMe.map((share) => (
+          <RuntimeShareRow
+            key={share.id}
+            share={share}
+            name={names.get(share.runtimeId) ?? share.runtimeId}
+          />
+        ))
+      )}
+    </Section>
+  );
+}
+
+function RuntimeShareRow({
+  share,
+  name,
+}: {
+  share: { id: string; runtimeId: string; email: string };
+  name: string;
+}) {
+  const { t } = useTranslation(["access"]);
+  const invalidate = useInvalidateShares();
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const remove = useMutation(
+    orpc.runtimes.shares.delete.mutationOptions({
+      onSuccess: async () => {
+        setConfirmOpen(false);
+        toast.success(t("access:shares.removed"));
+        await invalidate();
+      },
+    }),
+  );
+  return (
+    <div className="flex min-w-0 flex-wrap items-start justify-between gap-2 py-3 first:pt-0 last:pb-0">
+      <div className="min-w-0 space-y-0.5">
+        <p className="truncate font-medium">{share.email}</p>
+        <p className="truncate text-xs text-muted-foreground">
+          {t("access:shares.runtimeTarget", { name })}
+        </p>
+      </div>
+      <Button type="button" variant="outline" size="touch" onClick={() => setConfirmOpen(true)}>
+        {t("access:shares.remove")}
+      </Button>
+      <ConfirmAction
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        title={t("access:shares.removeRuntimeTitle", { runtime: name, email: share.email })}
+        description={t("access:shares.removeRuntimeDescription")}
+        confirmLabel={t("access:shares.remove")}
+        isPending={remove.isPending}
+        onConfirm={() => remove.mutate({ shareId: share.id })}
+      />
+    </div>
+  );
+}
+
+/** What an invite or share names: a pool's callable id, or a runtime definition. */
+function TargetLine({ target }: { target: InviteView["target"] }) {
+  const { t } = useTranslation(["access"]);
+  return target.kind === "pool" ? (
+    <p className="truncate font-mono text-xs text-muted-foreground">{target.callableId}</p>
+  ) : (
+    <p className="truncate text-xs text-muted-foreground">
+      {t("access:shares.runtimeTarget", { name: target.name })}
+    </p>
+  );
 }
 
 function Permissions({ share }: { share: ShareView }) {
@@ -353,9 +442,7 @@ function InviteRow({ invite, onLink }: { invite: InviteView; onLink: (link: Invi
     <div className="flex min-w-0 flex-col gap-2 py-3 first:pt-0 last:pb-0 sm:flex-row sm:items-start sm:justify-between">
       <div className="min-w-0 space-y-0.5">
         <p className="truncate font-medium">{invite.email}</p>
-        <p className="truncate font-mono text-xs text-muted-foreground">
-          {invite.target.kind === "pool" ? invite.target.callableId : invite.target.name}
-        </p>
+        <TargetLine target={invite.target} />
         <p className="text-xs text-muted-foreground">
           {invite.emailSentAt ? t("access:shares.emailSent") : t("access:shares.notEmailed")}
           {" · "}
@@ -417,16 +504,27 @@ function InviteLinkDialog({ value, onClose }: { value: InviteLink | null; onClos
 
 const PRIORITY_CHOICES = ["POOL", "BACKGROUND", "NORMAL", "HIGH"] as const;
 type PriorityChoice = (typeof PRIORITY_CHOICES)[number];
+type ShareWhat = "pool" | "runtime";
 
 const createSchema = z
   .object({
-    poolId: z.string().min(1),
+    what: z.enum(["pool", "runtime"]),
+    poolId: z.string(),
+    runtimeId: z.string(),
     email: z.string().trim().toLowerCase().email().max(320),
     canUse: z.boolean(),
     canContribute: z.boolean(),
     priority: z.enum(PRIORITY_CHOICES),
   })
-  .refine((value) => value.canUse || value.canContribute, { path: ["canUse"] });
+  .superRefine((value, ctx) => {
+    if (value.what === "runtime") {
+      if (!value.runtimeId) ctx.addIssue({ code: "custom", path: ["runtimeId"], message: "" });
+      return;
+    }
+    if (!value.poolId) ctx.addIssue({ code: "custom", path: ["poolId"], message: "" });
+    if (!value.canUse && !value.canContribute)
+      ctx.addIssue({ code: "custom", path: ["canUse"], message: "" });
+  });
 
 function CreateShareDialog({
   open,
@@ -461,11 +559,16 @@ function CreateShareForm({ onDone }: { onDone: (link: InviteLink | null) => void
   const { t } = useTranslation(["access"]);
   const invalidate = useInvalidateShares();
   const pools = useQuery(orpc.pools.list.queryOptions());
-  const create = useMutation(orpc.access.shares.create.mutationOptions());
+  const runtimes = useQuery(orpc.runtimes.list.queryOptions());
+  const createPoolShare = useMutation(orpc.access.shares.create.mutationOptions());
+  const createRuntimeShare = useMutation(orpc.runtimes.shares.create.mutationOptions());
   const ownPools = pools.data?.pools ?? [];
+  const ownRuntimes = runtimes.data?.runtimes ?? [];
   const form = useForm({
     defaultValues: {
+      what: "pool" as ShareWhat,
       poolId: "",
+      runtimeId: "",
       email: "",
       canUse: true,
       canContribute: false,
@@ -474,18 +577,20 @@ function CreateShareForm({ onDone }: { onDone: (link: InviteLink | null) => void
     validators: { onSubmit: createSchema },
     onSubmit: async ({ value }) => {
       const email = value.email.trim().toLowerCase();
-      // A failure is toasted by the global mutation error handler.
-      const result = await create
-        .mutateAsync({
-          poolId: value.poolId,
-          email,
-          canUse: value.canUse,
-          canContribute: value.canContribute,
-          priorityClass: value.priority === "POOL" ? null : value.priority,
-          protectionPercent: null,
-          monthlyCap: null,
-        })
-        .catch(() => null);
+      // A failure is toasted by the global mutation error handler. Both answer alike: a share
+      // (a proved mailbox) or an invite, whose link is shown once when no e-mail went out.
+      const result = await (value.what === "runtime"
+        ? createRuntimeShare.mutateAsync({ runtimeId: value.runtimeId, email })
+        : createPoolShare.mutateAsync({
+            poolId: value.poolId,
+            email,
+            canUse: value.canUse,
+            canContribute: value.canContribute,
+            priorityClass: value.priority === "POOL" ? null : value.priority,
+            protectionPercent: null,
+            monthlyCap: null,
+          })
+      ).catch(() => null);
       if (!result) return;
       await invalidate();
       if (result.kind === "share") {
@@ -509,43 +614,108 @@ function CreateShareForm({ onDone }: { onDone: (link: InviteLink | null) => void
         void form.handleSubmit();
       }}
     >
-      <form.Field name="poolId">
+      <form.Field name="what">
         {(field) => (
-          <fieldset className="min-w-0 space-y-1">
-            <legend className="mb-1 text-sm font-medium">{t("access:shares.pool")}</legend>
-            {pools.isPending ? (
-              <Skeleton className="h-11 w-full" />
-            ) : pools.isError ? (
-              <p className="text-sm text-muted-foreground">{t("access:shares.poolsLoadFailed")}</p>
-            ) : ownPools.length === 0 ? (
-              <p className="text-sm text-muted-foreground">{t("access:shares.noOwnPools")}</p>
-            ) : (
-              <div className="flex min-w-0 flex-col">
-                {ownPools.map((pool) => (
-                  <label
-                    key={pool.id}
-                    className="flex min-h-11 min-w-0 cursor-pointer items-center gap-3 rounded-md px-2 hover:bg-muted"
-                  >
-                    <input
-                      type="radio"
-                      name="share-pool"
-                      className="size-4 shrink-0 accent-primary"
-                      checked={field.state.value === pool.id}
-                      onChange={() => field.handleChange(pool.id)}
-                    />
-                    <span className="truncate font-mono text-sm">
-                      {pool.callableIds[0] ?? pool.slug}
-                    </span>
-                  </label>
-                ))}
-              </div>
-            )}
-            {field.state.meta.errors.length > 0 ? (
-              <p className="text-sm text-destructive">{t("access:shares.choosePool")}</p>
-            ) : null}
-          </fieldset>
+          <div className="min-w-0 space-y-2">
+            <Label>{t("access:shares.what")}</Label>
+            <SegmentedControl
+              value={field.state.value}
+              onChange={field.handleChange}
+              ariaLabel={t("access:shares.what")}
+              items={[
+                { value: "pool", label: t("access:shares.whatPool") },
+                { value: "runtime", label: t("access:shares.whatRuntime") },
+              ]}
+            />
+          </div>
         )}
       </form.Field>
+      <form.Subscribe selector={(state) => state.values.what}>
+        {(what) =>
+          what === "runtime" ? (
+            <form.Field name="runtimeId">
+              {(field) => (
+                <fieldset className="min-w-0 space-y-1">
+                  <legend className="mb-1 text-sm font-medium">{t("access:shares.runtime")}</legend>
+                  {runtimes.isPending ? (
+                    <Skeleton className="h-11 w-full" />
+                  ) : runtimes.isError ? (
+                    <p className="text-sm text-muted-foreground">
+                      {t("access:shares.runtimesLoadFailed")}
+                    </p>
+                  ) : ownRuntimes.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">
+                      {t("access:shares.noOwnRuntimes")}
+                    </p>
+                  ) : (
+                    <div className="flex min-w-0 flex-col">
+                      {ownRuntimes.map((runtime) => (
+                        <label
+                          key={runtime.id}
+                          className="flex min-h-11 min-w-0 cursor-pointer items-center gap-3 rounded-md px-2 hover:bg-muted"
+                        >
+                          <input
+                            type="radio"
+                            name="share-runtime"
+                            className="size-4 shrink-0 accent-primary"
+                            checked={field.state.value === runtime.id}
+                            onChange={() => field.handleChange(runtime.id)}
+                          />
+                          <span className="min-w-0 truncate text-sm">{runtime.name}</span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                  {field.state.meta.errors.length > 0 ? (
+                    <p className="text-sm text-destructive">{t("access:shares.chooseRuntime")}</p>
+                  ) : null}
+                  <p className="text-xs text-muted-foreground">{t("access:shares.runtimeHint")}</p>
+                </fieldset>
+              )}
+            </form.Field>
+          ) : (
+            <form.Field name="poolId">
+              {(field) => (
+                <fieldset className="min-w-0 space-y-1">
+                  <legend className="mb-1 text-sm font-medium">{t("access:shares.pool")}</legend>
+                  {pools.isPending ? (
+                    <Skeleton className="h-11 w-full" />
+                  ) : pools.isError ? (
+                    <p className="text-sm text-muted-foreground">
+                      {t("access:shares.poolsLoadFailed")}
+                    </p>
+                  ) : ownPools.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">{t("access:shares.noOwnPools")}</p>
+                  ) : (
+                    <div className="flex min-w-0 flex-col">
+                      {ownPools.map((pool) => (
+                        <label
+                          key={pool.id}
+                          className="flex min-h-11 min-w-0 cursor-pointer items-center gap-3 rounded-md px-2 hover:bg-muted"
+                        >
+                          <input
+                            type="radio"
+                            name="share-pool"
+                            className="size-4 shrink-0 accent-primary"
+                            checked={field.state.value === pool.id}
+                            onChange={() => field.handleChange(pool.id)}
+                          />
+                          <span className="truncate font-mono text-sm">
+                            {pool.callableIds[0] ?? pool.slug}
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                  {field.state.meta.errors.length > 0 ? (
+                    <p className="text-sm text-destructive">{t("access:shares.choosePool")}</p>
+                  ) : null}
+                </fieldset>
+              )}
+            </form.Field>
+          )
+        }
+      </form.Subscribe>
       <form.Field name="email">
         {(field) => (
           <div className="space-y-2">
@@ -569,51 +739,66 @@ function CreateShareForm({ onDone }: { onDone: (link: InviteLink | null) => void
           </div>
         )}
       </form.Field>
-      <form.Field name="canUse">
-        {(field) => (
-          <PermissionCheckbox
-            id="share-can-use"
-            label={t("access:shares.canUse")}
-            hint={t("access:shares.canUseHint")}
-            checked={field.state.value}
-            onChange={field.handleChange}
-            error={field.state.meta.errors.length > 0 ? t("access:shares.needOne") : null}
-          />
-        )}
-      </form.Field>
-      <form.Field name="canContribute">
-        {(field) => (
-          <PermissionCheckbox
-            id="share-can-contribute"
-            label={t("access:shares.canContribute")}
-            hint={t("access:shares.canContributeHint")}
-            checked={field.state.value}
-            onChange={field.handleChange}
-            error={null}
-          />
-        )}
-      </form.Field>
-      <form.Field name="priority">
-        {(field) => (
-          <div className="min-w-0 space-y-2">
-            <Label>{t("access:shares.priority")}</Label>
-            <SegmentedControl
-              value={field.state.value}
-              onChange={field.handleChange}
-              ariaLabel={t("access:shares.priority")}
-              items={[
-                { value: "POOL", label: t("access:shares.priorityPool") },
-                { value: "BACKGROUND", label: t("access:shares.priorityBackground") },
-                { value: "NORMAL", label: t("access:shares.priorityNormal") },
-                { value: "HIGH", label: t("access:shares.priorityHigh") },
-              ]}
-            />
-          </div>
-        )}
-      </form.Field>
-      <form.Subscribe selector={(state) => state.isSubmitting}>
-        {(isSubmitting) => (
-          <Button type="submit" size="touch" disabled={isSubmitting || ownPools.length === 0}>
+      <form.Subscribe selector={(state) => state.values.what}>
+        {(what) =>
+          what === "pool" ? (
+            <>
+              <form.Field name="canUse">
+                {(field) => (
+                  <PermissionCheckbox
+                    id="share-can-use"
+                    label={t("access:shares.canUse")}
+                    hint={t("access:shares.canUseHint")}
+                    checked={field.state.value}
+                    onChange={field.handleChange}
+                    error={field.state.meta.errors.length > 0 ? t("access:shares.needOne") : null}
+                  />
+                )}
+              </form.Field>
+              <form.Field name="canContribute">
+                {(field) => (
+                  <PermissionCheckbox
+                    id="share-can-contribute"
+                    label={t("access:shares.canContribute")}
+                    hint={t("access:shares.canContributeHint")}
+                    checked={field.state.value}
+                    onChange={field.handleChange}
+                    error={null}
+                  />
+                )}
+              </form.Field>
+              <form.Field name="priority">
+                {(field) => (
+                  <div className="min-w-0 space-y-2">
+                    <Label>{t("access:shares.priority")}</Label>
+                    <SegmentedControl
+                      value={field.state.value}
+                      onChange={field.handleChange}
+                      ariaLabel={t("access:shares.priority")}
+                      items={[
+                        { value: "POOL", label: t("access:shares.priorityPool") },
+                        { value: "BACKGROUND", label: t("access:shares.priorityBackground") },
+                        { value: "NORMAL", label: t("access:shares.priorityNormal") },
+                        { value: "HIGH", label: t("access:shares.priorityHigh") },
+                      ]}
+                    />
+                  </div>
+                )}
+              </form.Field>
+            </>
+          ) : null
+        }
+      </form.Subscribe>
+      <form.Subscribe selector={(state) => [state.isSubmitting, state.values.what] as const}>
+        {([isSubmitting, what]) => (
+          <Button
+            type="submit"
+            size="touch"
+            disabled={
+              isSubmitting ||
+              (what === "runtime" ? ownRuntimes.length === 0 : ownPools.length === 0)
+            }
+          >
             {isSubmitting ? t("access:shares.sharing") : t("access:shares.create")}
           </Button>
         )}

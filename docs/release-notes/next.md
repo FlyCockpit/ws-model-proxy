@@ -149,6 +149,19 @@ from the server can. Lowering protects against a *future* compromise: commands
 written while the node was Full control (frozen start commands, node metric
 commands) keep running, which is why the Lower dialog lists them.
 
+## Sharing pools and runtime definitions
+
+Share a pool or a runtime definition from **Access → Shares** by e-mail. The
+person gets it at once only when their account's e-mail address was verified
+through the verification e-mail (which needs SMTP). Anyone else, including an
+address with no account yet, gets an invite link instead: e-mailed when SMTP is
+configured, otherwise shown to you once to pass on. The link works for 14 days
+and is accepted by signing up or signing in through it, whatever address that
+account uses. The answer never tells you whether an account with that address
+exists. Pending invites are listed on the same page, where you can resend
+(a new link; the old one stops working) or withdraw them. Deleting a runtime
+removes its invites.
+
 ## Browser terminals and interactive steps
 
 **Browser terminals** open a shell on a node from the **Terminals** page. They
