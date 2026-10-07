@@ -33,7 +33,6 @@ import {
   poolOwnerActive,
   userCredentialAccessBlocked,
 } from "@ws-model-proxy/db/user-deletion-access";
-import { env } from "@ws-model-proxy/env/server";
 import { effectiveInstanceConcurrency } from "./capacity/instance-limits.js";
 
 // ── Callers ──
@@ -733,9 +732,4 @@ export function poolRouteRow(route: PoolRoute): PoolRouteRow {
     nextRetryAt: route.target.nextRetryAt,
     halfOpenTrialStartedAt: route.target.halfOpenTrialStartedAt,
   };
-}
-
-/** The deployment switch for any cloud traffic (and the keyring must be configured). */
-export function cloudEgressEnabled(): boolean {
-  return env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED === true;
 }

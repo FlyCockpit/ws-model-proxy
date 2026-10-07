@@ -116,7 +116,6 @@
   "dependencies": {
     "@orpc/openapi": "catalog:",
     "@orpc/server": "catalog:",
-    "@orpc/zod": "catalog:",
     "@ws-model-proxy/auth": "workspace:*",
     "@ws-model-proxy/config": "workspace:*",
     "@ws-model-proxy/db": "workspace:*",
@@ -125,7 +124,6 @@
     "zod": "catalog:"
   },
   "devDependencies": {
-    "@orpc/client": "catalog:",
     "hono": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:",

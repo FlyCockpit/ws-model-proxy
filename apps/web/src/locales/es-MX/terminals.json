@@ -29,7 +29,6 @@
     "unauthorized": "Tu sesión terminó. Vuelve a iniciar sesión para usar terminales."
   },
   "phase": {
-    "waiting": "En espera",
     "opening": "Abriendo…",
     "live": "Conectada",
     "rejected": "Rechazada",
@@ -60,7 +59,6 @@
     "limit": "Se alcanzó el límite de terminales. Termina una sesión e inténtalo de nuevo.",
     "invalid": "El relé rechazó esta solicitud de terminal.",
     "ticket_invalid": "Este enlace de terminal venció o ya se usó. Vuelve a abrir la terminal.",
-    "declined": "La terminal fue rechazada en el nodo.",
     "bad_handshake": "Falló el intercambio seguro con el nodo.",
     "other": "La terminal fue rechazada ({{reason}}).",
     "step_detached": "Esta terminal se desconectó. Ábrela de nuevo desde Pasos que te esperan."

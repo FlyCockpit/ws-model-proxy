@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import {
   decideAdminRouteAccess,
   decideAnonymousOnlyRouteAccess,
-  decideDeviceRouteAccess,
   decideMcpConsentRouteAccess,
   decideProtectedRouteAccess,
   failedRouteSessionResolution,
@@ -59,7 +58,6 @@ describe("route session access decisions", () => {
     expect(decideAnonymousOnlyRouteAccess(failedRouteSessionResolution())).toEqual({
       kind: "error",
     });
-    expect(decideDeviceRouteAccess(failedRouteSessionResolution())).toEqual({ kind: "error" });
   });
 
   it("redirects authenticated users away from anonymous-only routes", () => {
@@ -88,25 +86,6 @@ describe("route session access decisions", () => {
 
   it("allows verified admins through admin routes", () => {
     expect(decideAdminRouteAccess(resolvedRouteSession(adminSession))).toEqual({
-      kind: "allow",
-      session: adminSession,
-    });
-  });
-
-  it("redirects non-admin device approvers to dashboard", () => {
-    expect(decideDeviceRouteAccess(resolvedRouteSession(session))).toEqual({
-      kind: "redirect-to-overview",
-    });
-  });
-
-  it("redirects anonymous device approvers to login", () => {
-    expect(decideDeviceRouteAccess(resolvedRouteSession(null))).toEqual({
-      kind: "redirect-to-login",
-    });
-  });
-
-  it("allows verified admins on the device route", () => {
-    expect(decideDeviceRouteAccess(resolvedRouteSession(adminSession))).toEqual({
       kind: "allow",
       session: adminSession,
     });

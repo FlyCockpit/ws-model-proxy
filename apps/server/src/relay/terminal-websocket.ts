@@ -84,7 +84,7 @@ const BROWSER_JSON_ECHO_MAX_BYTES = 4096;
 /**
  * Client-chosen, echoed by every answer the relay gives that frame directly
  * (`terminals` to a list, `opening`, `attaching`, `closed`, `detached` self,
- * a Decline's immediate `started`, and every error, including a rate-limit
+ * and every error, including a rate-limit
  * or validation refusal), so the browser can tell which of its frames an
  * answer is for. Later events about a terminal (`pending`, `opened`,
  * `attached`, `rejected`, `exit`, pushes) are not answers to one frame and
@@ -142,9 +142,6 @@ const browserClientMessageSchema = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({ type: z.literal("close"), ...requestIdField, terminalId: base64Url16ByteSchema })
-    .strict(),
-  z
-    .object({ type: z.literal("decline"), ...requestIdField, terminalId: base64Url16ByteSchema })
     .strict(),
   z
     .object({ type: z.literal("detach"), ...requestIdField, terminalId: base64Url16ByteSchema })
@@ -507,7 +504,7 @@ export class TerminalBrowserHub {
       return Promise.resolve();
     }
     if (!this.allowJson(conn)) {
-      // Answer the refused frame itself: a Decline refused here must reach a
+      // Answer the refused frame itself: a close refused here must reach a
       // state the person can retry, and an open must not shift the browser's
       // matching of later `opening` answers.
       this.sendError(conn, "rate_limited", rawFrameRef(frame));
@@ -699,15 +696,6 @@ export class TerminalBrowserHub {
         terminalId: data.terminalId,
         ...(ref.requestId ? { requestId: ref.requestId } : {}),
       });
-      return;
-    }
-    if (data.type === "decline") {
-      // Agent (supervised) terminals are gone in 0.4.0: a decline names nothing to stop.
-      this.sendError(
-        conn,
-        relaySessionManager.declineTerminalFromBrowser(data.terminalId, conn.userId, conn.id),
-        ref,
-      );
       return;
     }
     // Stop viewing (X button). `close` above ends the session for everyone.
@@ -1016,7 +1004,6 @@ export class TerminalBrowserHub {
         .map(({ nodeId, ...terminal }) => ({
           ...terminal,
           cliDeviceId: nodeId,
-          origin: "user" as const,
         })),
     });
   }

@@ -20,7 +20,7 @@
  *   `onPoolRoutingRulesChanged(poolId)`.
  * - Terminals (./terminal-websocket.ts): `registerTerminalBridge`, `startTerminal`,
  *   `attachTerminal`, `detachTerminalViewer`, `closeTerminalFromBrowser`,
- *   `declineTerminalFromBrowser`, `forwardTerminalAuth`, `forwardBrowserSealed`,
+ *   `forwardTerminalAuth`, `forwardBrowserSealed`,
  *   `listTerminalsForUser`, `terminalCounts`, `hasTerminal`, `releaseBrowserViewer`,
  *   `sweepExpiredPendingTerminals`, `notifyTerminalListChanged`.
  * - File ops (./node-file-ops.ts): `dispatchFileOp`, `dispatchFileCancel`, `forgetFileOp`.
@@ -2780,15 +2780,6 @@ export class RelaySessionManager {
     if (!located || located.terminal.operator) return false;
     this.closeTerminal(located.session, located.terminal, true);
     return true;
-  }
-
-  /** Agent (supervised) terminals no longer exist: a decline names nothing it can stop. */
-  declineTerminalFromBrowser(
-    terminalId: string,
-    userId: string,
-    _connId: string,
-  ): "not_found" | "invalid" {
-    return this.terminalForUser(terminalId, userId) ? "invalid" : "not_found";
   }
 
   /** The server stamps the viewer id of this socket's pending attachment. */

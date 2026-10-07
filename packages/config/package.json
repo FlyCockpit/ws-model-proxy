@@ -4,12 +4,6 @@
   "private": true,
   "type": "module",
   "exports": {
-    "./deployment-protocol": {
-      "default": "./src/deployment-protocol.ts"
-    },
-    "./deployment-job-wire": {
-      "default": "./src/deployment-job-wire.ts"
-    },
     "./pool-defaults": {
       "default": "./src/pool-defaults.ts"
     },
@@ -24,18 +18,6 @@
     },
     "./forwarder-identifiers": {
       "default": "./src/forwarder-identifiers.ts"
-    },
-    "./cli-device-name": {
-      "default": "./src/cli-device-name.ts"
-    },
-    "./cli-device-login": {
-      "default": "./src/cli-device-login.ts"
-    },
-    "./cli-identity-key": {
-      "default": "./src/cli-identity-key.ts"
-    },
-    "./decimal-input": {
-      "default": "./src/decimal-input.ts"
     },
     "./theme-init": {
       "default": "./src/theme-init.ts"
