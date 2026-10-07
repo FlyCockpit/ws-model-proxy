@@ -378,6 +378,7 @@ function EnrollmentResultView({
           ? ` · ${t("dashboard:nodes.codes.uses", { used: code.usedCount, max: code.maxUses })}`
           : null}
       </p>
+      <p className="text-xs text-muted-foreground">{t("dashboard:nodes.add.terminalsAsked")}</p>
       {enrolled.length === 0 ? (
         <p className="flex items-center gap-2 text-sm" role="status">
           <LoaderCircle aria-hidden="true" className="size-4 animate-spin text-muted-foreground" />

@@ -253,6 +253,7 @@
       "failed": "No se pudo crear el comando.",
       "commandLabel": "Comando de instalación",
       "secretOnce": "Este código se muestra una sola vez.",
+      "terminalsAsked": "Con control total, `wsmp login` luego pregunta si se permiten terminales del navegador en esa máquina (sí, de forma predeterminada). Solo la máquina puede cambiarlo más adelante, con `wsmp config set-human-terminal on|off`.",
       "expires": "Vence",
       "waiting": "Esperando a que el nodo se conecte…",
       "joined": "{{slug}} se unió",

@@ -253,6 +253,7 @@
       "failed": "The command could not be created.",
       "commandLabel": "Install command",
       "secretOnce": "This code is shown only once.",
+      "terminalsAsked": "With Full control, `wsmp login` then asks whether to allow browser terminals on that machine (yes by default). Only the machine can change it later, with `wsmp config set-human-terminal on|off`.",
       "expires": "It expires",
       "waiting": "Waiting for the node to connect…",
       "joined": "{{slug}} joined",

@@ -141,8 +141,11 @@ commands) keep running, which is why the Lower dialog lists them.
 ## Browser terminals and interactive steps
 
 **Browser terminals** open a shell on a node from the **Terminals** page. They
-need Full control and the node's own opt-in, `wsmp config set-human-terminal
-on` (off by default). Limits are configurable and higher by default: 8 open per
+need Full control and the node's own opt-in. At Full control, `wsmp login` asks
+for it next to the trust question (default yes). Without a terminal, pass
+`--human-terminal on|off`; otherwise the saved setting stays (off unless set)
+and login says so. Change it later with `wsmp config set-human-terminal
+on|off`; the server cannot. Limits are configurable and higher by default: 8 open per
 user and 4 per node. The server settings are `WMP_TERMINAL_USER_LIMIT` and
 `WMP_TERMINAL_CLI_LIMIT` (each 1 to 64), and each node caps its own with `wsmp config set-max-terminals` (1 to
 32, default 4). The lowest limit applies; operator terminals are not counted.

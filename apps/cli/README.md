@@ -58,6 +58,7 @@ Useful flags:
 | ---- | ------- |
 | `--slug <name>` | This node's name. Defaults to the saved name, else one derived from the hostname. |
 | `--trust full\|relay` | What the server may do here (see [Trust](#trust)). Prompted on a terminal; without one, `full`. |
+| `--human-terminal on\|off` | Allow browser terminals on this node. Asked next to trust on a terminal (default yes; not asked at Relay only, where they cannot open); without a terminal, the saved setting stays (`off` unless set) and login says so. |
 | `--service` / `--no-service` | Install and start the per-user service without asking, or skip it. |
 | `--replace` | Confirm a Replace code (below) without the prompt. |
 | `--json` | Print the result as JSON. |
@@ -171,7 +172,7 @@ The server asks a node to do two different kinds of work:
 | `wsmp config set-slug <name>` | Change the saved node name. |
 | `wsmp config set-file-roots <dir>...` / `clear-file-roots` | Folders the file tools may use. |
 | `wsmp config set-runtime-hosts [host...]` | Extra hosts an always-on runtime may use besides loopback. |
-| `wsmp config set-human-terminal on\|off` | Allow browser terminals. |
+| `wsmp config set-human-terminal on\|off` | Allow browser terminals (the same setting `wsmp login` asks about). |
 | `wsmp config set-terminal-approval on\|off` | Require approval before a browser opens a terminal. |
 | `wsmp config set-max-terminals <1-32>` | Cap browser terminals open at once. |
 | `wsmp config set-file-tools-as-root on\|off` | Allow the file tools when wsmp runs as root. |
