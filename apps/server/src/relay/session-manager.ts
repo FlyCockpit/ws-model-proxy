@@ -31,6 +31,10 @@
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import {
+  DEFAULT_KV_FULL_THRESHOLD,
+  WAITING_SUSTAINED_FRAMES,
+} from "@ws-model-proxy/api/lib/engine-load";
+import {
   ENDPOINT_LOAD_STALE_AFTER_MS,
   type NodeMetricsSample,
   parseNodeMetricsSample,
@@ -2458,6 +2462,13 @@ export class RelaySessionManager {
       prefixCacheHitsDelta: hitsDelta,
       prefixCacheQueriesDelta: queriesDelta,
       source: load.source,
+      // Engine-agnostic FULL for the history (the live verdict also knows the engine kind,
+      // its slots and a member's threshold): deferred work, sustained waiting or KV at the
+      // default threshold.
+      full:
+        (load.deferred ?? 0) > 0 ||
+        waitingStreak >= WAITING_SUSTAINED_FRAMES ||
+        (load.kvUsage ?? 0) >= DEFAULT_KV_FULL_THRESHOLD,
     });
     this.scheduleRoutingEvaluation(session);
   }
@@ -2520,6 +2531,14 @@ export class RelaySessionManager {
       memoryTotalMiB: frame.memory?.totalMiB,
       gpuTemperatureC: maxOf((frame.gpus ?? []).map((gpu) => gpu.temperatureC)),
       gpuUtilizationPercent: maxOf((frame.gpus ?? []).map((gpu) => gpu.utilizationPercent)),
+      acceleratorFreeMiB: (frame.gpus ?? []).reduce<number | null>(
+        (sum, gpu) =>
+          gpu.vramTotalMiB == null || gpu.vramUsedMiB == null
+            ? sum
+            : (sum ?? 0) + Math.max(0, gpu.vramTotalMiB - gpu.vramUsedMiB),
+        null,
+      ),
+      custom: frame.custom,
     });
     this.scheduleRoutingEvaluation(session);
     if (
