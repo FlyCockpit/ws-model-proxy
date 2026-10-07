@@ -99,7 +99,10 @@ export function normalizeChatObject(body: Json, options: NormalizeOptions): bool
     for (const choice of body.choices) {
       if (!isObject(choice)) continue;
       if (typeof choice.finish_reason === "string") {
-        const mapped = CHAT_FINISH[choice.finish_reason] ?? "stop";
+        // Unknown values (`abort`, `error`) pass through: they may report a failure.
+        const mapped = Object.hasOwn(CHAT_FINISH, choice.finish_reason)
+          ? (CHAT_FINISH[choice.finish_reason] ?? choice.finish_reason)
+          : choice.finish_reason;
         if (mapped !== choice.finish_reason) {
           choice.finish_reason = mapped;
           changed = true;
@@ -151,7 +154,9 @@ const ANTHROPIC_TOP = new Set([
 function normalizeStopReason(holder: Json): boolean {
   const reason = holder.stop_reason;
   if (typeof reason !== "string" || ANTHROPIC_STOP.has(reason)) return false;
-  holder.stop_reason = ANTHROPIC_STOP_ALIASES[reason] ?? "end_turn";
+  holder.stop_reason = Object.hasOwn(ANTHROPIC_STOP_ALIASES, reason)
+    ? (ANTHROPIC_STOP_ALIASES[reason] ?? "end_turn")
+    : "end_turn";
   return true;
 }
 
@@ -250,31 +255,52 @@ export function normalizeSseEvent(
 }
 
 const MAX_EVENT_BUFFER = 4 * 1024 * 1024;
+const LF = 0x0a;
+const CR = 0x0d;
+
+/** The first event and its terminator (`\n\n` or `\r\n\r\n`), or null. */
+function eventEnd(bytes: Uint8Array, length: number): { end: number; terminator: number } | null {
+  for (let index = 0; index + 1 < length; index += 1) {
+    if (bytes[index] !== LF) continue;
+    if (bytes[index + 1] === LF) return { end: index, terminator: 2 };
+    if (bytes[index + 1] === CR && bytes[index + 2] === LF && index > 0 && bytes[index - 1] === CR)
+      return { end: index - 1, terminator: 4 };
+  }
+  return null;
+}
 
 /**
- * An SSE transform normalizing each JSON event. Bytes are re-emitted unchanged unless an event
- * changed; an oversized or undecodable buffer switches the rest of the stream to pass-through.
+ * An SSE transform normalizing each JSON event. Works on bytes: an event that is unchanged,
+ * not JSON or not valid UTF-8 is re-emitted byte for byte, and an event larger than the bound
+ * switches the rest of the stream to pass-through.
  */
 export function createSseNormalizer(
   surface: NormalizedSurface,
   options: NormalizeOptions,
   estimate: UsageEstimate | null,
 ): TransformStream<Uint8Array, Uint8Array> {
-  const decoder = new TextDecoder("utf-8");
+  const decoder = new TextDecoder("utf-8", { fatal: true });
   const encoder = new TextEncoder();
-  let buffer = "";
+  let buffer = new Uint8Array(0);
   let passThrough = false;
-  const flushEvents = (controller: TransformStreamDefaultController<Uint8Array>) => {
-    // Events end with a blank line; CRLF streams are normalized to LF in the events we touch.
+  const emitEvents = (controller: TransformStreamDefaultController<Uint8Array>) => {
     while (true) {
-      const match = /\r?\n\r?\n/.exec(buffer);
-      if (!match) return;
-      const block = buffer.slice(0, match.index).replaceAll("\r\n", "\n");
-      const terminator = match[0];
-      buffer = buffer.slice(match.index + terminator.length);
-      controller.enqueue(
-        encoder.encode(`${normalizeSseEvent(block, surface, options, estimate)}${terminator}`),
-      );
+      const found = eventEnd(buffer, buffer.length);
+      if (!found) return;
+      const raw = buffer.subarray(0, found.end);
+      const terminator = buffer.subarray(found.end, found.end + found.terminator);
+      let block: string | null = null;
+      try {
+        block = decoder.decode(raw).replaceAll("\r\n", "\n");
+      } catch {
+        block = null;
+      }
+      const normalized =
+        block === null ? null : normalizeSseEvent(block, surface, options, estimate);
+      if (normalized === null || normalized === block) controller.enqueue(raw.slice());
+      else controller.enqueue(encoder.encode(normalized));
+      controller.enqueue(terminator.slice());
+      buffer = buffer.slice(found.end + found.terminator);
     }
   };
   return new TransformStream({
@@ -283,19 +309,21 @@ export function createSseNormalizer(
         controller.enqueue(chunk);
         return;
       }
-      buffer += decoder.decode(chunk, { stream: true });
-      flushEvents(controller);
+      const joined = new Uint8Array(buffer.length + chunk.length);
+      joined.set(buffer);
+      joined.set(chunk, buffer.length);
+      buffer = joined;
+      emitEvents(controller);
       if (buffer.length > MAX_EVENT_BUFFER) {
         passThrough = true;
-        controller.enqueue(encoder.encode(buffer));
-        buffer = "";
+        controller.enqueue(buffer);
+        buffer = new Uint8Array(0);
       }
     },
     flush(controller) {
       if (passThrough) return;
-      buffer += decoder.decode();
-      flushEvents(controller);
-      if (buffer.length > 0) controller.enqueue(encoder.encode(buffer));
+      emitEvents(controller);
+      if (buffer.length > 0) controller.enqueue(buffer);
     },
   });
 }

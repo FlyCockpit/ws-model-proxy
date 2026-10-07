@@ -40,7 +40,14 @@ export function compatEndpointForFamily(family: string): CompatEndpoint | null {
 // ── Field paths ──
 
 const SEGMENT = /^[A-Za-z_][A-Za-z0-9_-]{0,63}(\[\])?$/;
+/** Keys that reach JavaScript object internals instead of a request field. */
+const RESERVED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 export const MAX_FIELD_PATH_SEGMENTS = 8;
+
+/** A plain request key: identifier-like and not an object internal. */
+export function isFieldKey(key: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(key) && !RESERVED_KEYS.has(key);
+}
 
 export type FieldPathSegment = { key: string; each: boolean };
 
@@ -53,7 +60,9 @@ export function parseFieldPath(path: string): FieldPathSegment[] | null {
   for (const part of parts) {
     if (!SEGMENT.test(part)) return null;
     const each = part.endsWith("[]");
-    segments.push({ key: each ? part.slice(0, -2) : part, each });
+    const key = each ? part.slice(0, -2) : part;
+    if (RESERVED_KEYS.has(key)) return null;
+    segments.push({ key, each });
   }
   return segments;
 }
@@ -101,6 +110,19 @@ export const SEMANTIC_FIELDS = [
   "prediction",
   "dimensions",
   "encoding_format",
+  // Conversation state (Responses).
+  "previous_response_id",
+  "conversation",
+  // Output constraints and template switches: losing one silently changes the answer.
+  "logit_bias",
+  "guided_json",
+  "guided_regex",
+  "guided_choice",
+  "guided_grammar",
+  "structured_outputs",
+  "grammar",
+  "json_schema",
+  "chat_template_kwargs",
 ] as const;
 
 /**
@@ -112,7 +134,7 @@ const SEMANTIC_CONTAINER_PARTS: Readonly<Record<string, readonly string[]>> = {
   messages: ["role", "content", "tool_calls", "tool_call_id", "function_call", "name"],
   input: ["role", "content", "type", "call_id", "output", "arguments", "name"],
   system: ["text", "type"],
-  tools: ["type", "function", "name", "description", "parameters", "input_schema"],
+  tools: ["type", "function", "name", "description", "parameters", "input_schema", "strict"],
 };
 
 /** The path as written, without `[]` markers (`messages.cache_control`). */
@@ -124,7 +146,9 @@ function plainKeys(path: string): string[] {
 export function isSemanticPath(path: string): boolean {
   const keys = plainKeys(path);
   const head = keys[0] ?? "";
-  const container = SEMANTIC_CONTAINER_PARTS[head];
+  const container = Object.hasOwn(SEMANTIC_CONTAINER_PARTS, head)
+    ? SEMANTIC_CONTAINER_PARTS[head]
+    : undefined;
   if (container) {
     if (keys.length === 1) return true;
     // Content parts and tool definitions are meaning; their metadata keys are not, except the
@@ -138,7 +162,10 @@ export function isSemanticPath(path: string): boolean {
     return true;
   }
   const joined = keys.join(".");
-  return SEMANTIC_FIELDS.some((field) => joined === field || joined.startsWith(`${field}.`));
+  // A field, anything under it, and any object holding one (`text` holds `text.format`).
+  return SEMANTIC_FIELDS.some(
+    (field) => joined === field || joined.startsWith(`${field}.`) || field.startsWith(`${joined}.`),
+  );
 }
 
 /**
@@ -162,6 +189,29 @@ export const SEMANTIC_EQUIVALENTS: Readonly<
  * or redirect a request.
  */
 const FORBIDDEN_FIRST = new Set(["model", "stream"]);
+/**
+ * A default may not add content or a reference to something: no message, instruction or tool
+ * containers, and no adapter, file or media keys (a default could otherwise pick another LoRA
+ * adapter or point at someone's upload).
+ */
+const DEFAULT_FORBIDDEN_FIRST = new Set([
+  "messages",
+  "input",
+  "instructions",
+  "system",
+  "prompt",
+  "tools",
+  "tool_choice",
+  "functions",
+  "function_call",
+  "response_format",
+  "text",
+  "prediction",
+  "previous_response_id",
+  "conversation",
+]);
+const DEFAULT_FORBIDDEN_SEGMENT =
+  /(lora|adapter|^file|_file$|file_id|image|audio|video|media|path$)/i;
 const FORBIDDEN_SEGMENT =
   /(api[_-]?key|apikey|authori[sz]ation|password|passwd|secret|credential|bearer|cookie|token$|^auth$|^headers?$|^extra_headers$|^base_url$|^api_base$|^endpoint$|^url$|private[_-]?key)/i;
 
@@ -189,6 +239,19 @@ const fieldPathSchema = z
 
 const endpointSchema = z.enum(COMPAT_ENDPOINTS).optional();
 
+/** Null when a `default` rule may set `path`; otherwise why not. */
+export function defaultPathProblem(path: string): string | null {
+  const segments = parseFieldPath(path);
+  if (!segments) return "not a field path (a.b[].c)";
+  if (segments.some((segment) => segment.each)) return "defaults are set on objects, not arrays";
+  if (DEFAULT_FORBIDDEN_FIRST.has(segments[0]!.key))
+    return `a default cannot add to ${segments[0]!.key}`;
+  for (const segment of segments)
+    if (DEFAULT_FORBIDDEN_SEGMENT.test(segment.key))
+      return `${segment.key} names an adapter, file or media reference`;
+  return null;
+}
+
 /** A default may not carry a URL, a data URI or a path: letters, digits and simple marks. */
 const defaultValueSchema = z.union([
   z
@@ -207,7 +270,7 @@ export const rewriteRuleSchema = z.discriminatedUnion("op", [
       endpoint: endpointSchema,
       path: fieldPathSchema,
       /** The new key, in the same object. */
-      to: z.string().regex(/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/),
+      to: z.string().refine(isFieldKey, "a plain key (letters, digits, _ and -)"),
     })
     .strict()
     .superRefine((rule, ctx) => {
@@ -219,10 +282,10 @@ export const rewriteRuleSchema = z.discriminatedUnion("op", [
     .object({
       op: z.literal("default"),
       endpoint: endpointSchema,
-      path: fieldPathSchema.refine(
-        (path) => !path.includes("[]"),
-        "defaults are set on objects, not arrays",
-      ),
+      path: fieldPathSchema.superRefine((path, ctx) => {
+        const problem = rulePathProblem(path) ? null : defaultPathProblem(path);
+        if (problem) ctx.addIssue({ code: "custom", message: problem });
+      }),
       value: defaultValueSchema,
     })
     .strict(),
@@ -312,11 +375,20 @@ export const requestCompatSchema = z
   .superRefine((compat, ctx) => {
     const allowed = new Set(compat.allowDropSemanticFields ?? []);
     compat.rewriteRules?.forEach((rule, index) => {
-      if (rule.op === "drop" && isSemanticPath(rule.path) && !allowed.has(rule.path))
+      if (rule.op !== "drop" && rule.op !== "rename") return;
+      if (!isSemanticPath(rule.path) || allowed.has(rule.path)) return;
+      // Renaming to the same-meaning spelling keeps the meaning; any other rename of a semantic
+      // field hides it from the engine just like a drop.
+      const same =
+        rule.op === "rename" &&
+        Object.values(SEMANTIC_EQUIVALENTS).some(
+          (map) => map !== undefined && Object.hasOwn(map, rule.path) && map[rule.path] === rule.to,
+        );
+      if (!same)
         ctx.addIssue({
           code: "custom",
           path: ["rewriteRules", index, "path"],
-          message: `${rule.path} is semantic: list it in allowDropSemanticFields to drop it`,
+          message: `${rule.path} is semantic: list it in allowDropSemanticFields to ${rule.op} it`,
         });
     });
   });

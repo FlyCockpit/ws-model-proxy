@@ -73,6 +73,45 @@ describe("OpenAPI accepted profile", () => {
     expect(acceptedProfileFromOpenApi(loop)?.endpoints["chat.completions"]?.p?.self).toBeDefined();
   });
 
+  it("treats an object without additionalProperties as open", () => {
+    expect(unknownPaths({ metadata_ignore: { a: "x", b: 1 } }, chat)).toEqual([]);
+  });
+
+  it("adds sibling properties next to $ref and anyOf", () => {
+    const document = {
+      openapi: "3.1.0",
+      paths: {
+        "/v1/chat/completions": {
+          post: {
+            requestBody: {
+              content: {
+                "application/json": {
+                  schema: {
+                    $ref: "#/components/schemas/Base",
+                    properties: { extra_key: { type: "string" } },
+                    additionalProperties: false,
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      components: {
+        schemas: {
+          Base: {
+            type: "object",
+            properties: { model: { type: "string" } },
+            additionalProperties: false,
+          },
+        },
+      },
+    };
+    const node = acceptedProfileFromOpenApi(document)?.endpoints["chat.completions"];
+    expect(Object.keys(node?.p ?? {}).sort()).toEqual(["extra_key", "model"]);
+    expect(unknownPaths({ model: "m", extra_key: "x", other: 1 }, node!)).toEqual(["other"]);
+  });
+
   it("fingerprints the engine from info", () => {
     expect(openApiEngineVersion(openapi)).toBe("Strict Engine 1.2.3");
     expect(openApiEngineVersion({ info: { title: "x\u0000y" } })).toBe("xy");
@@ -223,6 +262,21 @@ describe("applyRequestCompat", () => {
       ok: true,
       body: { chat_template_kwargs: { enable_thinking: true } },
     });
+  });
+});
+
+describe("object internals", () => {
+  it("never walks into or writes a prototype", () => {
+    const body = JSON.parse('{"__proto__": {"x": 1}, "a": 1}') as Record<string, unknown>;
+    const result = applyRequestCompat({
+      endpoint: "chat.completions",
+      body,
+      compat: {},
+      accepted: null,
+      learned: [{ kind: "drop", path: "__proto__.x" }],
+    });
+    expect(result.ok).toBe(true);
+    expect(({} as Record<string, unknown>).x).toBeUndefined();
   });
 });
 

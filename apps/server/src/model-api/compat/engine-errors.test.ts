@@ -38,12 +38,73 @@ describe("engine 400 parsing", () => {
     ).toEqual({ kind: "field", path: "tools[].function.strict" });
   });
 
+  it("reads OpenAI-style indexed paths", () => {
+    expect(
+      parseEngineRejection({
+        status: 400,
+        bodyText: '{"error":{"message":"Unknown parameter: \'messages[0].content[0].foo\'."}}',
+        requestBody: {
+          messages: [{ role: "user", content: [{ type: "text", text: "x", foo: 1 }] }],
+        },
+        requestHeaders: new Headers(),
+      }),
+    ).toEqual({ kind: "field", path: "messages[].content[].foo" });
+  });
+
+  it("does not pin a word of the message on a nested caller field", () => {
+    expect(
+      parseEngineRejection({
+        status: 400,
+        bodyText: '{"error":{"message":"Unsupported parameter value for \'temperature\'"}}',
+        requestBody: { temperature: 3, metadata: { value: 1 } },
+        requestHeaders: new Headers(),
+      }),
+    ).toBeNull();
+    expect(
+      parseEngineRejection({
+        status: 400,
+        bodyText: '{"error":"unknown field `type`"}',
+        requestBody: {
+          tools: [{ type: "function", function: { name: "f", parameters: { type: "object" } } }],
+        },
+        requestHeaders: new Headers(),
+      }),
+    ).toEqual({ kind: "field", path: "tools[].type" });
+  });
+
+  it("learns nothing when union variants disagree", () => {
+    const detail = {
+      detail: [
+        {
+          type: "extra_forbidden",
+          loc: ["body", "messages", 0, "UserMessage", "reasoning_content"],
+          msg: "Extra inputs are not permitted",
+        },
+        {
+          type: "extra_forbidden",
+          loc: ["body", "messages", 0, "AssistantMessage", "name"],
+          msg: "Extra inputs are not permitted",
+        },
+      ],
+    };
+    expect(
+      parseEngineRejection({
+        status: 422,
+        bodyText: JSON.stringify(detail),
+        requestBody: {
+          messages: [{ role: "assistant", content: "x", reasoning_content: "r", name: "n" }],
+        },
+        requestHeaders: new Headers(),
+      }),
+    ).toBeNull();
+  });
+
   it("does not guess between two keys of the same name", () => {
     expect(
       parseEngineRejection({
         status: 400,
         bodyText: '{"error":"unknown field `extra`"}',
-        requestBody: { a: { extra: 1 }, b: { extra: 2 } },
+        requestBody: { messages: [{ role: "user", extra: 1 }], tools: [{ extra: 2 }] },
         requestHeaders: new Headers(),
       }),
     ).toBeNull();

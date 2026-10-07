@@ -63,10 +63,11 @@ function forEachHolder(
     visit(value, head.key);
     return;
   }
+  // Own keys only: a path never walks into a prototype.
+  if (!Object.hasOwn(value, head.key)) return;
   const child = value[head.key];
   if (head.each) {
-    if (!Array.isArray(child)) return;
-    if (rest.length === 0) return;
+    if (!Array.isArray(child) || rest.length === 0) return;
     for (const item of child) forEachHolder(item, rest, visit);
     return;
   }
@@ -136,7 +137,7 @@ function applyRule(body: Json, rule: RewriteRule, report: CompatReport): void {
       // Creates missing parent objects; never replaces a value the caller sent.
       let holder: Json = body;
       for (const segment of segments.slice(0, -1)) {
-        const next = holder[segment.key];
+        const next = Object.hasOwn(holder, segment.key) ? holder[segment.key] : undefined;
         if (next === undefined) holder[segment.key] = {};
         else if (!isObject(next)) return;
         holder = holder[segment.key] as Json;
@@ -215,7 +216,7 @@ export function unknownPaths(
     }
     if (!isObject(current) || !accepted.p) return;
     for (const [key, child] of Object.entries(current)) {
-      const childNode = accepted.p[key];
+      const childNode = Object.hasOwn(accepted.p, key) ? accepted.p[key] : undefined;
       const childPath = [...at, { key, each: false }];
       if (childNode === undefined) {
         if (!accepted.o) found.push(formatFieldPath(childPath));
@@ -317,13 +318,12 @@ export function planCompatRetry(input: {
     return refuse("messages[].role", input.excerpt, `role "${rejection.value}"`);
   }
   const path = rejection.path;
+  // Only a plain field path is ever learned (never an object internal or a malformed one).
+  if (!parseFieldPath(path)) return null;
   const equivalents = SEMANTIC_EQUIVALENTS[input.endpoint] ?? {};
+  const equivalent = Object.hasOwn(equivalents, path) ? (equivalents[path] ?? null) : null;
   const replacement =
-    rejection.kind === "replace"
-      ? equivalents[path] === rejection.with
-        ? rejection.with
-        : null
-      : (equivalents[path] ?? null);
+    rejection.kind === "replace" ? (equivalent === rejection.with ? equivalent : null) : equivalent;
   if (policy === "auto" && replacement)
     return { action: "learn", fix: { kind: "rename", path, to: replacement } };
   const allowed = new Set(input.compat.allowDropSemanticFields ?? []);

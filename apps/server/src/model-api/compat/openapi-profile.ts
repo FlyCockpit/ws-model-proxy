@@ -88,25 +88,44 @@ function walk(
   refs: string[],
 ): AcceptedNode {
   if (!isObject(schema) || depth > MAX_DEPTH || !budget.spend()) return ANY;
+  const composed: AcceptedNode[] = [];
+  let isComposed = false;
   if (typeof schema.$ref === "string") {
-    if (refs.includes(schema.$ref)) return ANY;
-    const target = resolveRef(document, schema.$ref);
-    return target ? walk(document, target, depth + 1, budget, [...refs, schema.$ref]) : ANY;
+    isComposed = true;
+    const target = refs.includes(schema.$ref) ? null : resolveRef(document, schema.$ref);
+    composed.push(target ? walk(document, target, depth + 1, budget, [...refs, schema.$ref]) : ANY);
   }
   for (const key of ["anyOf", "oneOf"] as const) {
     const variants = schema[key];
-    if (Array.isArray(variants)) {
-      // `null` variants (Optional[...]) carry no keys: skip them.
-      const real = variants.filter((variant) => !(isObject(variant) && variant.type === "null"));
-      return union(real.map((variant) => walk(document, variant, depth + 1, budget, refs)));
-    }
+    if (!Array.isArray(variants)) continue;
+    isComposed = true;
+    // `null` variants (Optional[...]) carry no keys: skip them.
+    const real = variants.filter((variant) => !(isObject(variant) && variant.type === "null"));
+    composed.push(union(real.map((variant) => walk(document, variant, depth + 1, budget, refs))));
   }
   if (Array.isArray(schema.allOf)) {
-    const parts = schema.allOf.map((part) => walk(document, part, depth + 1, budget, refs));
-    if (parts.length === 1) return parts[0]!;
-    // Intersection approximated by union: never drops more than the description allows.
-    return union(parts);
+    isComposed = true;
+    // Every part's keys are accepted (inheritance): their union.
+    composed.push(union(schema.allOf.map((part) => walk(document, part, depth + 1, budget, refs))));
   }
+  const own = walkOwn(document, schema, depth, budget, refs);
+  if (!isComposed) return own;
+  // Sibling keywords (`properties` next to `$ref` or `anyOf`) add to what the parts accept.
+  return isAny(own)
+    ? composed.length === 1
+      ? composed[0]!
+      : union(composed)
+    : union([own, ...composed]);
+}
+
+/** The schema's own keywords, ignoring `$ref`, `anyOf`, `oneOf` and `allOf`. */
+function walkOwn(
+  document: Json,
+  schema: Json,
+  depth: number,
+  budget: Budget,
+  refs: string[],
+): AcceptedNode {
   const enumValues = Array.isArray(schema.enum)
     ? schema.enum.filter((value): value is string => typeof value === "string")
     : typeof schema.const === "string"
@@ -124,8 +143,9 @@ function walk(
         ]),
       ),
     };
-    const extra = schema.additionalProperties;
-    if (extra === true || isObject(extra)) node.o = 1;
+    // Only an explicit `additionalProperties: false` (pydantic `extra="forbid"`) closes an
+    // object; absent means open in JSON Schema, and such engines ignore extra keys anyway.
+    if (schema.additionalProperties !== false) node.o = 1;
     return node;
   }
   if (schema.type === "array" && schema.items !== undefined)

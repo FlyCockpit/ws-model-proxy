@@ -38,7 +38,7 @@ describe("Chat Completions normalization", () => {
       "length",
       "tool_calls",
       null,
-      "stop",
+      "weird",
     ]);
     expect(normalizeChatObject({ choices: [{ finish_reason: "stop" }] }, auto)).toBe(false);
   });
@@ -97,6 +97,27 @@ describe("Chat Completions normalization", () => {
         'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\r\n\r\n' +
         ": keepalive\n\ndata: [DONE]\n\n",
     );
+  });
+
+  it("keeps bytes intact across split UTF-8, CRLF and invalid UTF-8", async () => {
+    const encoder = new TextEncoder();
+    const event = encoder.encode('data: {"choices":[{"delta":{"content":"é"}}]}\r\n\r\n');
+    const split = event.indexOf(0xc3) + 1;
+    const invalid = new Uint8Array([...encoder.encode("data: "), 0xff, 0x0a, 0x0a]);
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(event.subarray(0, split));
+        controller.enqueue(event.subarray(split));
+        controller.enqueue(invalid);
+        controller.close();
+      },
+    });
+    const out = new Uint8Array(
+      await new Response(
+        source.pipeThrough(createSseNormalizer("openai-chat", auto, null)),
+      ).arrayBuffer(),
+    );
+    expect([...out]).toEqual([...event, ...invalid]);
   });
 
   it("returns the same bytes for an unchanged or non-JSON body", () => {

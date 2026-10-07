@@ -28,6 +28,11 @@ describe("semantic fields", () => {
     "messages[].content[].text",
     "input",
     "prediction",
+    "text",
+    "previous_response_id",
+    "tools[].strict",
+    "guided_json",
+    "chat_template_kwargs",
   ])("%s is semantic", (path) => expect(isSemanticPath(path)).toBe(true));
 
   it.each([
@@ -42,7 +47,6 @@ describe("semantic fields", () => {
     "store",
     "top_k",
     "text.verbosity",
-    "chat_template_kwargs",
   ])("%s is not semantic", (path) => expect(isSemanticPath(path)).toBe(false));
 });
 
@@ -53,7 +57,18 @@ describe("field paths and rule safety", () => {
       { key: "content", each: true },
       { key: "cache_control", each: false },
     ]);
-    for (const bad of ["", "a..b", "a.0", "a[0]", "$x", "a b", "a.b.c.d.e.f.g.h.i"])
+    for (const bad of [
+      "",
+      "a..b",
+      "a.0",
+      "a[0]",
+      "$x",
+      "a b",
+      "a.b.c.d.e.f.g.h.i",
+      "__proto__.x",
+      "a.constructor",
+      "prototype",
+    ])
       expect(parseFieldPath(bad)).toBeNull();
   });
 
@@ -106,6 +121,43 @@ describe("field paths and rule safety", () => {
       requestCompatSchema.safeParse({ rewriteRules: [{ op: "default", path: "a[].b", value: 1 }] })
         .success,
     ).toBe(false);
+  });
+
+  it("keeps defaults off content, adapters, files and media", () => {
+    for (const path of [
+      "instructions",
+      "system",
+      "messages",
+      "lora_path",
+      "lora_request.name",
+      "file_id",
+      "input_audio.data",
+      "image_detail",
+      "text.format",
+    ])
+      expect(
+        requestCompatSchema.safeParse({ rewriteRules: [{ op: "default", path, value: "x" }] })
+          .success,
+        path,
+      ).toBe(false);
+    expect(
+      requestCompatSchema.safeParse({
+        rewriteRules: [{ op: "default", path: "temperature", value: 0.6 }],
+      }).success,
+    ).toBe(true);
+  });
+
+  it("guards renames of semantic fields like drops, except same-meaning spellings", () => {
+    expect(
+      requestCompatSchema.safeParse({
+        rewriteRules: [{ op: "rename", path: "messages", to: "msgs" }],
+      }).success,
+    ).toBe(false);
+    expect(
+      requestCompatSchema.safeParse({
+        rewriteRules: [{ op: "rename", path: "max_completion_tokens", to: "max_tokens" }],
+      }).success,
+    ).toBe(true);
   });
 
   it("refuses a rename onto a forbidden key and unknown rule shapes", () => {

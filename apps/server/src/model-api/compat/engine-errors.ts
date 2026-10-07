@@ -87,30 +87,42 @@ export function resolveLocation(
   return lastMatched && path.length > 0 ? path.join(".") : null;
 }
 
-/** The unique path of a key named `name` in the request (top level first), or null. */
+/**
+ * The unique path of a key named `name` in the request's STRUCTURE (top level first, then the
+ * items of `messages`/`input`/`tools`/`system`, their content parts and tool functions), or
+ * null. Caller data such as tool JSON schemas or metadata maps is never searched, so an error
+ * naming a common word cannot be pinned on an unrelated nested field.
+ */
 function findKey(name: string, body: unknown): string | null {
-  if (isObject(body) && Object.hasOwn(body, name)) return name;
+  if (!isObject(body)) return null;
+  if (Object.hasOwn(body, name)) return name;
   const found = new Set<string>();
-  const visit = (value: unknown, path: string, depth: number) => {
-    if (depth > 6 || found.size > 1) return;
-    if (Array.isArray(value)) {
-      for (const item of value) visit(item, `${path}[]`, depth + 1);
-      return;
-    }
-    if (!isObject(value)) return;
-    for (const [key, child] of Object.entries(value)) {
-      const childPath = path ? `${path}.${key}` : key;
-      if (key === name) found.add(childPath);
-      visit(child, childPath, depth + 1);
-    }
+  const addFrom = (holder: unknown, path: string) => {
+    if (isObject(holder) && Object.hasOwn(holder, name)) found.add(`${path}.${name}`);
   };
-  visit(body, "", 0);
+  for (const container of ["messages", "input", "tools", "system"]) {
+    const list = body[container];
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      addFrom(item, `${container}[]`);
+      if (!isObject(item)) continue;
+      if (Array.isArray(item.content))
+        for (const part of item.content) addFrom(part, `${container}[].content[]`);
+      addFrom(item.function, `${container}[].function`);
+    }
+  }
   return found.size === 1 ? [...found][0]! : null;
 }
 
 const EXTRA = /extra (?:inputs|fields) (?:are )?not permitted|extra_forbidden/i;
 
+/**
+ * Pydantic reports `extra_forbidden` once per union variant it tried; a key one variant accepts
+ * may be "extra" for another. Only a path every such entry agrees on is taken.
+ */
 function fromDetail(detail: unknown[], body: unknown): EngineRejection | null {
+  const paths = new Set<string>();
+  let unresolved = false;
   for (const entry of detail) {
     if (!isObject(entry) || !Array.isArray(entry.loc)) continue;
     const kind = `${entry.type ?? ""} ${entry.msg ?? ""}`;
@@ -119,23 +131,24 @@ function fromDetail(detail: unknown[], body: unknown): EngineRejection | null {
       (part): part is string | number => typeof part === "string" || typeof part === "number",
     );
     const path = resolveLocation(loc, body);
-    if (path) return { kind: "field", path };
+    if (path) paths.add(path);
+    else unresolved = true;
   }
-  return null;
+  return paths.size === 1 && !unresolved ? { kind: "field", path: [...paths][0]! } : null;
 }
 
 /** Pydantic tuples rendered in a message: `'loc': ('body', 'stream_options')`. */
 function fromPydanticRepr(message: string, body: unknown): EngineRejection | null {
   const pattern = /'loc':\s*\(([^)]*)\)[^}]*?'msg':\s*'([^']*)'/g;
+  const entries: Json[] = [];
   for (const match of message.matchAll(pattern)) {
     if (!EXTRA.test(match[2] ?? "") && !EXTRA.test(match[0])) continue;
     const loc = [...(match[1] ?? "").matchAll(/'([^']*)'|(\d+)/g)].map((part) =>
       part[1] !== undefined ? part[1] : Number(part[2]),
     );
-    const path = resolveLocation(loc, body);
-    if (path) return { kind: "field", path };
+    entries.push({ type: "extra_forbidden", loc });
   }
-  return null;
+  return fromDetail(entries, body);
 }
 
 /**
@@ -169,7 +182,7 @@ const NAMED_FIELD_PATTERNS: RegExp[] = [
   // OpenAI: Unrecognized request argument supplied: foo / Unknown parameter: 'foo'.
   /unrecognized request arguments? supplied:\s*([A-Za-z0-9_.[\]-]+)/i,
   /unknown parameter:?\s*'([^']+)'/i,
-  /unsupported param(?:eter)?:?\s*'?([A-Za-z0-9_.[\]-]+)'?/i,
+  /unsupported param(?:eter)?:\s*['"`]?([A-Za-z0-9_.[\]-]+)/i,
   // llama.cpp and friends: "foo" is not supported / Unsupported param: foo
   /(?:param(?:eter)?|field)\s+'?`?"?([A-Za-z0-9_.-]+)'?`?"?\s+is not (?:supported|allowed|permitted)/i,
 ];
@@ -184,7 +197,8 @@ function fromNamedField(message: string, body: unknown): EngineRejection | null 
   for (const pattern of NAMED_FIELD_PATTERNS) {
     const match = pattern.exec(message);
     if (!match) continue;
-    const name = match[1]!.replace(/\[\d+\]/g, "");
+    // OpenAI-style indexes (`messages[0].foo`) become location segments.
+    const name = match[1]!.replace(/\[(\d+)\]/g, ".$1");
     const path = name.includes(".") ? resolveLocation(name.split("."), body) : findKey(name, body);
     if (path) return { kind: "field", path };
   }
