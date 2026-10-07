@@ -8278,10 +8278,7 @@ async function relayPreparedModeledRequest({
 }: {
   request: Request;
   requester: RelayRequester;
-  targets: {
-    tests: TestTarget[];
-    pools: CallablePool[];
-  };
+  targets: CallableTargets;
   prepared: PreparedModeledRequest;
   operation: Omit<RelayOperation, "stream" | "buildRequest">;
   capacityRuntime?: CapacityAdmissionRuntime;

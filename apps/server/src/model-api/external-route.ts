@@ -199,6 +199,8 @@ export function resolveRequestedModelName(
   if (pool) return { kind: "pool", target: pool, externalRequested: false };
   // A caller's alias (only ever one of their callable pools; callable IDs win over it).
   const aliased = (name: string) => {
+    // A callable ID always wins, in every form (also `name:external`).
+    if (targets.pools.some((target) => target.modelId === name)) return undefined;
     const alias = targets.aliases?.find((entry) => entry.name === name);
     return alias ? targets.pools.find((target) => target.id === alias.poolId) : undefined;
   };

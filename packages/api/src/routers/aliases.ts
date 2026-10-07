@@ -9,9 +9,10 @@
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import type { SignedInContext } from "../contract-procedure";
 import { contractProcedure } from "../contract-procedure";
+import { agentRulesApply } from "../contracts/auth-context";
 import { MODEL_ALIASES_MAX_PER_USER, poolsContract } from "../contracts/pools";
 import { callerActor } from "../lib/caller-actor";
-import { notFound, refuse } from "../lib/refuse";
+import { isUniqueViolation, notFound, refuse } from "../lib/refuse";
 
 const c = poolsContract.aliases;
 
@@ -33,7 +34,6 @@ const ALIAS_SELECT = {
   name: true,
   poolId: true,
   apiKeyId: true,
-  Pool: { select: { slug: true, User: { select: { slug: true } } } },
   ApiKey: {
     select: {
       name: true,
@@ -51,14 +51,16 @@ function keyAllowsPool(key: NonNullable<AliasRow["ApiKey"]>, poolId: string, now
   return key.scope === "ALL_POOLS" || key.Pools.some((pool) => pool.poolId === poolId);
 }
 
-function aliasView(row: AliasRow, callable: Map<string, string>, now = new Date()) {
+function aliasView(row: AliasRow, callable: Map<string, string>, agent: boolean, now = new Date()) {
   return {
     id: row.id,
     name: row.name,
     poolId: row.poolId,
-    callableId: callable.get(row.poolId) ?? `${row.Pool.User.slug}/${row.Pool.slug}`,
+    // Only what the caller may see: a pool no longer callable shows nothing of itself.
+    callableId: callable.get(row.poolId) ?? null,
     apiKeyId: row.apiKeyId,
-    apiKeyName: row.ApiKey?.name ?? null,
+    // Keys are managed by people: agents see which key an alias is for, not its name.
+    apiKeyName: agent ? null : (row.ApiKey?.name ?? null),
     usable: callable.has(row.poolId) && (!row.ApiKey || keyAllowsPool(row.ApiKey, row.poolId, now)),
   };
 }
@@ -96,7 +98,8 @@ export const modelAliasesRouter = {
       }),
       callablePools(userId),
     ]);
-    return { aliases: rows.map((row) => aliasView(row, callable)) };
+    const agent = agentRulesApply(context.auth);
+    return { aliases: rows.map((row) => aliasView(row, callable, agent)) };
   }),
 
   set: contractProcedure(c.set).handler(async ({ input, context }) => {
@@ -112,8 +115,14 @@ export const modelAliasesRouter = {
       );
     const apiKeyId = input.apiKeyId ?? null;
     if (apiKeyId) {
+      const now = new Date();
       const key = await prisma.apiKey.findFirst({
-        where: { id: apiKeyId, userId, revokedAt: null },
+        where: {
+          id: apiKeyId,
+          userId,
+          revokedAt: null,
+          OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+        },
         select: {
           scope: true,
           Pools: { where: { poolId: input.poolId }, select: { poolId: true } },
@@ -128,42 +137,48 @@ export const modelAliasesRouter = {
         );
     }
     const scopeKey = apiKeyId ?? "";
-    const row = await prisma.$transaction(async (tx) => {
-      const existing = await tx.modelAlias.findUnique({
-        where: { userId_scopeKey_name: { userId, scopeKey, name: input.name } },
-        select: { id: true },
+    const write = () =>
+      prisma.$transaction(async (tx) => {
+        const existing = await tx.modelAlias.findUnique({
+          where: { userId_scopeKey_name: { userId, scopeKey, name: input.name } },
+          select: { id: true },
+        });
+        if (
+          !existing &&
+          (await tx.modelAlias.count({ where: { userId } })) >= MODEL_ALIASES_MAX_PER_USER
+        )
+          throw refuse(
+            "alias_limit",
+            `At most ${MODEL_ALIASES_MAX_PER_USER} aliases; remove one first.`,
+            "CONFLICT",
+          );
+        const saved = await tx.modelAlias.upsert({
+          where: { userId_scopeKey_name: { userId, scopeKey, name: input.name } },
+          create: { userId, apiKeyId, scopeKey, name: input.name, poolId: input.poolId },
+          update: { poolId: input.poolId },
+          select: ALIAS_SELECT,
+        });
+        await audit(tx, context, {
+          aliasId: saved.id,
+          action: "model_alias.set",
+          after: { name: input.name, poolId: input.poolId, apiKeyId },
+          note: input.note,
+        });
+        return saved;
       });
-      if (
-        !existing &&
-        (await tx.modelAlias.count({ where: { userId } })) >= MODEL_ALIASES_MAX_PER_USER
-      )
-        throw refuse(
-          "alias_limit",
-          `At most ${MODEL_ALIASES_MAX_PER_USER} aliases; remove one first.`,
-          "CONFLICT",
-        );
-      const saved = await tx.modelAlias.upsert({
-        where: { userId_scopeKey_name: { userId, scopeKey, name: input.name } },
-        create: { userId, apiKeyId, scopeKey, name: input.name, poolId: input.poolId },
-        update: { poolId: input.poolId },
-        select: ALIAS_SELECT,
-      });
-      await audit(tx, context, {
-        aliasId: saved.id,
-        action: "model_alias.set",
-        after: { name: input.name, poolId: input.poolId, apiKeyId },
-        note: input.note,
-      });
-      return saved;
+    // Two first-time sets of the same name race on the unique index: the second one moves it.
+    const row = await write().catch((error: unknown) => {
+      if (isUniqueViolation(error)) return write();
+      throw error;
     });
-    return aliasView(row, callable);
+    return aliasView(row, callable, agentRulesApply(context.auth));
   }),
 
   delete: contractProcedure(c.delete).handler(async ({ input, context }) => {
     const userId = userIdOf(context);
     const alias = await prisma.modelAlias.findFirst({
       where: { id: input.aliasId, userId },
-      select: { id: true },
+      select: { id: true, name: true, poolId: true, apiKeyId: true },
     });
     if (!alias) throw notFound("That alias does not exist.");
     // Owner-scoped again: a concurrent move of the id can only ever be the caller's own row.
@@ -171,6 +186,7 @@ export const modelAliasesRouter = {
     await audit(prisma, context, {
       aliasId: input.aliasId,
       action: "model_alias.delete",
+      after: { name: alias.name, poolId: alias.poolId, apiKeyId: alias.apiKeyId },
       note: input.note,
     });
     return { ok: true as const };

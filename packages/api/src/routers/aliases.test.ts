@@ -82,10 +82,13 @@ describe("model-name aliases", () => {
     );
     expect(aliases.map((alias) => [alias.name, alias.callableId, alias.usable])).toEqual([
       ["gpt-4o", "me/chat", true],
-      ["claude-sonnet-4-5", "ex/old", false],
+      ["claude-sonnet-4-5", null, false],
       ["gpt-4o", "friend/big", false],
     ]);
-    expect(aliases[2]?.apiKeyName).toBe("ci");
+    // Keys are for people: an agent sees the key id, not its name.
+    expect(aliases[2]?.apiKeyName).toBeNull();
+    const asPerson = await client(CALLERS.person()).list({});
+    expect(asPerson.aliases[2]?.apiKeyName).toBe("ci");
   });
 
   it("an agent sets an alias to a pool it can use, audited, in its own namespace", async () => {
@@ -134,7 +137,14 @@ describe("model-name aliases", () => {
       await reasonOf(client().set({ name: "gpt-4o", poolId: "pool-own", apiKeyId: "key-x" })),
     ).toBe("NOT_FOUND");
     expect(db.apiKey.findFirst).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: "key-x", userId: OWNER, revokedAt: null } }),
+      expect.objectContaining({
+        where: {
+          id: "key-x",
+          userId: OWNER,
+          revokedAt: null,
+          OR: [{ expiresAt: null }, { expiresAt: { gt: expect.any(Date) } }],
+        },
+      }),
     );
     db.apiKey.findFirst.mockResolvedValueOnce({ scope: "SELECTED_POOLS", Pools: [] } as never);
     expect(

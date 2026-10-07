@@ -170,16 +170,18 @@ async function effectiveAliases(
   const rows = await prisma.modelAlias.findMany({
     where: { userId, OR: [{ apiKeyId: null }, ...(apiKeyId ? [{ apiKeyId }] : [])] },
     select: { name: true, poolId: true, apiKeyId: true },
+    orderBy: { id: "asc" },
     take: 256,
   });
   const callable = new Set(pools.map((pool) => pool.id));
   const byName = new Map<string, ModelAliasTarget>();
-  // User-level first, then the key's: a key-level alias replaces a user-level one.
+  // User-level first, then the key's: a usable key-level alias replaces a user-level one (one
+  // whose pool the key cannot call never hides a working user-level alias).
   for (const row of [...rows].sort(
     (a, b) => Number(a.apiKeyId !== null) - Number(b.apiKeyId !== null),
   ))
-    byName.set(row.name, { name: row.name, poolId: row.poolId });
-  return [...byName.values()].filter((alias) => callable.has(alias.poolId));
+    if (callable.has(row.poolId)) byName.set(row.name, { name: row.name, poolId: row.poolId });
+  return [...byName.values()];
 }
 
 export function testTargetModelId(runtimeId: string, upstreamModelId: string): string {

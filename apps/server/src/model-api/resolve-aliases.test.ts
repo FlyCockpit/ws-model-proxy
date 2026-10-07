@@ -70,6 +70,16 @@ describe("caller aliases", () => {
     expect(targets.aliases).toEqual([{ name: "gpt-4o", poolId: "b" }]);
   });
 
+  it("an alias for a pool the key cannot call never hides the user's alias", async () => {
+    db.apiKeyPool.findMany.mockResolvedValue([{ poolId: "a" }] as never);
+    const targets = await listCallableTargetsForApiKey(key);
+    // The key's gpt-4o names pool b (not selected): the user-level gpt-4o -> a stays.
+    expect(targets.aliases).toEqual([
+      { name: "gpt-4o", poolId: "a" },
+      { name: "claude", poolId: "a" },
+    ]);
+  });
+
   it("sessions see the user's aliases only", async () => {
     const targets = await listCallableTargetsForUser("u");
     expect(db.modelAlias.findMany).toHaveBeenCalledWith(

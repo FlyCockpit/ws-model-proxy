@@ -124,6 +124,11 @@ describe("model name grammar", () => {
       target: { id: "pool-id" },
     });
     expect(resolveRequestedModelName(withAliases, "ghost")).toEqual({ kind: "not_found" });
+    // Also in the :external form, the callable ID wins.
+    expect(resolveRequestedModelName(withAliases, "owner/pool.v2:external")).toMatchObject({
+      target: { id: "pool-id" },
+      externalRequested: true,
+    });
   });
 
   it.each([

@@ -290,6 +290,7 @@ mod tests {
             "x-forwarded-for",
             "authorization",
             "x-api-key",
+            "api-key",
             "x-openai-api-key",
             "x-openai-auth",
             "cookie",

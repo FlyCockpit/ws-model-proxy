@@ -44,8 +44,8 @@ export const modelAliasViewSchema = z
     id: idSchema,
     name: z.string(),
     poolId: idSchema,
-    /** The pool's callable ID the alias resolves to. */
-    callableId: z.string(),
+    /** The pool's callable ID; null while you cannot use the pool (nothing of it is shown). */
+    callableId: z.string().nullable(),
     apiKeyId: idSchema.nullable(),
     /** The key's name (null: every key). */
     apiKeyName: z.string().nullable(),
