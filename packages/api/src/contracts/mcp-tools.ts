@@ -200,7 +200,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "nodes_get",
     description:
-      "Your nodes, or one in detail: trust, hardware, fabrics, hold, held definitions, instances, found local servers, secret names.",
+      "Your nodes, or one in detail: trust, hardware, fabrics, hold, held definitions (versions frozen on a Relay-only node), instances, found local servers, secret names.",
     input: z.object({ nodeId: idSchema.optional() }).strict(),
     output: z.union([z.object({ nodes: z.array(nodeListRowSchema) }).strict(), nodeDetailSchema]),
     procedures: ["nodes.list", "nodes.get"],
@@ -248,7 +248,8 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   }),
   tool({
     name: "profiles_get",
-    description: "Your profiles, or one: owned nodes, hold lines, pinned versions, satisfied now.",
+    description:
+      "Your profiles, or one: owned nodes, hold lines, pinned versions, satisfied now (pinned versions running).",
     input: z.object({ profileId: idSchema.optional() }).strict(),
     output: z.union([profilesContract.list.output, profileViewSchema]),
     procedures: ["profiles.list", "profiles.get"],

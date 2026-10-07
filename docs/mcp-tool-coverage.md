@@ -20,10 +20,10 @@ READ credentials see the READ tools; FULL credentials see all.
 
 | Tool | Token | Procedures | Confirm | Rate limit | Notes | Description |
 | --- | --- | --- | --- | --- | --- | --- |
-| `nodes_get` | READ | `nodes.list`, `nodes.get` | — | — (only the `/mcp` request limit) | — | Your nodes, or one in detail: trust, hardware, fabrics, hold, held definitions, instances, found local servers, secret names. |
+| `nodes_get` | READ | `nodes.list`, `nodes.get` | — | — (only the `/mcp` request limit) | — | Your nodes, or one in detail: trust, hardware, fabrics, hold, held definitions (versions frozen on a Relay-only node), instances, found local servers, secret names. |
 | `runtimes_get` | READ | `runtimes.list`, `runtimes.get`, `runtimes.versions.list`, `runtimes.versions.get`, `runtimes.presets.list`, `runtimes.shares.list` | — | — (only the `/mcp` request limit) | — | Your runtimes, or one in detail (versions: the version list; versionId: one full definition; presets: starting points; shared: definitions shared with you). |
 | `pools_get` | READ | `pools.list`, `pools.get`, `pools.history.list` | — | — (only the `/mcp` request limit) | — | Your pools and pools shared with you, or one pool (history: its change log). |
-| `profiles_get` | READ | `profiles.list`, `profiles.get` | — | — (only the `/mcp` request limit) | — | Your profiles, or one: owned nodes, hold lines, pinned versions, satisfied now. |
+| `profiles_get` | READ | `profiles.list`, `profiles.get` | — | — (only the `/mcp` request limit) | — | Your profiles, or one: owned nodes, hold lines, pinned versions, satisfied now (pinned versions running). |
 | `providers_get` | READ | `providers.accounts.list`, `providers.models.list` | — | — (only the `/mcp` request limit) | — | Cloud provider accounts and models with this month's spend (never keys). Only people change providers. |
 | `requests_list` | READ | `activity.requests.list` | — | — (only the `/mcp` request limit) | — | Recent requests without prompts: route, what served them, timings, tokens, errors. |
 | `metrics_query` | READ | `activity.metrics.query` | — | — (only the `/mcp` request limit) | — | Request, engine-load and node metrics for a pool, runtime, version, node or instance over a range, optionally grouped. Use it to compare versions after a change. |
