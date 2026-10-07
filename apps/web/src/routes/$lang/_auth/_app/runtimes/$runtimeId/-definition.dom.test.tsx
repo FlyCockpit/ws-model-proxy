@@ -3,7 +3,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
 import type { ComponentType } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
   origin: "SERVER" as "NODE" | "SERVER",
@@ -65,12 +65,19 @@ vi.mock("@/utils/orpc", () => ({
 
 import { Route } from "./definition";
 
+const Component = Route.options.component as ComponentType & {
+  preload?: () => Promise<unknown>;
+};
+
+// Load the lazy page once, outside any test: a cold import under a parallel
+// run can outlast a test's timeout, and a render that lands after that
+// test's cleanup would leak into the next test.
+beforeAll(async () => {
+  await Component.preload?.();
+}, 30_000);
+
 async function mount() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const Component = Route.options.component as ComponentType & {
-    preload?: () => Promise<unknown>;
-  };
-  await Component.preload?.();
   render(
     <QueryClientProvider client={client}>
       <Component />
