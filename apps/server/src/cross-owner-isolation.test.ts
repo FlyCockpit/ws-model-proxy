@@ -226,6 +226,11 @@ describe("MCP tools act as the credential's user only", () => {
 
   it("covers every MCP tool, or exempts one that takes no target id", () => {
     const names = MCP_TOOLS.map((tool) => tool.name as string);
+    // The node file tools reach a node's files: always covered, never exempt.
+    for (const name of ["node_file_read", "node_file_write", "node_file_edit"]) {
+      expect(CALLS[name]?.length ?? 0).toBeGreaterThan(0);
+      expect(MCP_EXEMPT[name]).toBeUndefined();
+    }
     expect(names.filter((name) => !(name in CALLS) && !(name in MCP_EXEMPT))).toEqual([]);
     // No stale or doubled entries.
     expect(Object.keys(CALLS).filter((name) => !names.includes(name))).toEqual([]);

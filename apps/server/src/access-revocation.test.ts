@@ -4,6 +4,8 @@ const db = vi.hoisted(() => ({
   queuedNodeCommand: { updateMany: vi.fn(async () => ({ count: 1 })) },
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
+const files = vi.hoisted(() => ({ cancelFileOpsForToken: vi.fn() }));
+vi.mock("./relay/node-file-ops.js", () => files);
 
 const { endAgentWork, handleAccessRevoked } = await import("./access-revocation.js");
 
@@ -53,6 +55,13 @@ describe("handleAccessRevoked", () => {
 });
 
 describe("endAgentWork", () => {
+  it("cancels the credentials' file ops before anything awaits", () => {
+    files.cancelFileOpsForToken.mockClear();
+    void endAgentWork({ userId: "u", credentialIds: ["t1", "g1"] });
+    // Synchronously: no file op of a revoked credential outlives the revoke call.
+    expect(files.cancelFileOpsForToken.mock.calls).toEqual([["t1"], ["g1"]]);
+  });
+
   it("expires the credentials' queued commands", async () => {
     await endAgentWork({ userId: "u", credentialIds: ["t1", "g1"] });
     expect(db.queuedNodeCommand.updateMany).toHaveBeenCalledWith({

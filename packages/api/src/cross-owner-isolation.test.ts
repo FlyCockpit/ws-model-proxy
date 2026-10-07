@@ -351,9 +351,14 @@ function servicesSpy() {
     reopen: vi.fn(async () => ({ ok: false as const, code: "not_found" as const })),
     cancel: vi.fn(async () => ({ ok: false as const, code: "not_found" as const })),
   };
+  const nodeFiles = {
+    run: vi.fn(async () => ({ ok: true as const, result: {} })),
+    auditRefused: vi.fn(),
+  };
   const services = {
     nodes,
     nodeOperator,
+    nodeFiles,
     runtimeSteps,
     dispatchRuntimeOperation: vi.fn(async () => {}),
     pushRuntimeDefinitions: vi.fn(async () => []),
@@ -367,6 +372,7 @@ function servicesSpy() {
     [
       ...Object.entries(nodes),
       ...Object.entries(nodeOperator),
+      ...Object.entries(nodeFiles),
       ["dispatchRuntimeOperation", services.dispatchRuntimeOperation],
       ["pushRuntimeDefinitions", services.pushRuntimeDefinitions],
       ["modelTest", services.modelTest],
@@ -454,7 +460,7 @@ const CASES: ReadonlyArray<[string, unknown]> = [
   ["nodes.commands.run", { nodeId: "node-a", command: "id", timeoutMs: 10_000, confirm: "RUN" }],
   ["nodes.commands.get", { commandId: COMMAND_A, cancel: true }],
   ["nodes.commands.get", { commandId: COMMAND_A, waitMs: 1_000 }],
-  // Not wired to the relay in 0.4.0 (stubs): nothing reaches a node at all.
+  // Node file tools: nothing reaches the relay (or the file audit) for A's node.
   ["nodes.files.read", { nodeId: "node-a", path: "/etc/hostname" }],
   ["nodes.files.write", { nodeId: "node-a", path: "/tmp/x", content: "x" }],
   [
@@ -734,6 +740,11 @@ describe("the cross-owner cases cover the router", () => {
   it("covers every procedure, or exempts one that takes no target id, with a reason", () => {
     const covered = new Set(CASES.map(([path]) => path));
     const paths = PROCEDURES.map(([path]) => path);
+    // The node file tools reach a node's files: always covered, never exempt.
+    for (const path of ["nodes.files.read", "nodes.files.write", "nodes.files.edit"]) {
+      expect(covered.has(path)).toBe(true);
+      expect(EXEMPT[path]).toBeUndefined();
+    }
     expect(paths.filter((path) => !covered.has(path) && !(path in EXEMPT))).toEqual([]);
     // No stale entries, and nothing both covered and exempt.
     expect([...covered].filter((path) => !paths.includes(path))).toEqual([]);
@@ -778,12 +789,7 @@ const REFUSAL_CODES = new Set([
 ]);
 
 /** Procedures that are stubs in 0.4.0 (they answer NOT_IMPLEMENTED and touch nothing). */
-const STUBS = new Set([
-  "nodes.files.read",
-  "nodes.files.write",
-  "nodes.files.edit",
-  "activity.metrics.query",
-]);
+const STUBS = new Set(["activity.metrics.query"]);
 const KIND = new Map(PROCEDURES.map(([path, procedure]) => [path, procedure.kind]));
 /** What any row of A's carries (`victimRow`): an answer must not contain it. */
 const VICTIM_DATA = /user-a|row-a|a-box|rank-a/;

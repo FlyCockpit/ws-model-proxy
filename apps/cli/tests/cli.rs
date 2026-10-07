@@ -482,6 +482,139 @@ fn a_fresh_login_takes_the_chosen_trust_and_a_lowered_node_stays_lowered() {
 }
 
 #[test]
+fn login_sets_browser_terminals_by_flag_and_keeps_them_without_a_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let login = |extra: &[&str]| {
+        let server = TestServer::start(vec![
+            (
+                "/.well-known/wsmp",
+                200,
+                well_known("https://wsmp.example.com"),
+            ),
+            ("/api/node/enroll", 200, enrolled("spark-1")),
+        ]);
+        let mut cmd = cli(&config, &state);
+        cmd.args([
+            "login",
+            &server.base_url,
+            "--code",
+            CODE,
+            "--slug",
+            "spark-1",
+            "--trust",
+            "full",
+            "--no-service",
+        ]);
+        cmd.args(extra);
+        let output = cmd.assert().success().get_output().clone();
+        server.join();
+        let saved: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        (
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+            saved["allowHumanTerminal"].as_bool().unwrap_or(false),
+        )
+    };
+    // No terminal, no flag: off, and the output says so.
+    let (stdout, stderr, saved) = login(&["--json"]);
+    let value: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["allowHumanTerminal"], false);
+    assert!(!saved);
+    assert!(
+        stderr.contains("no terminal to ask, so browser terminals stay off"),
+        "{stderr}"
+    );
+    // The flag turns them on, without the warning.
+    let (stdout, stderr, saved) = login(&["--human-terminal", "on"]);
+    assert!(stdout.contains("browser terminals: on"), "{stdout}");
+    assert!(saved);
+    assert!(!stderr.contains("no terminal to ask"), "{stderr}");
+    // A re-login that changes it reminds a running relay to restart.
+    assert!(
+        stderr.contains("restart wsmp if it is already running"),
+        "{stderr}"
+    );
+    // A later login without the flag keeps the saved choice.
+    let (stdout, stderr, saved) = login(&["--json"]);
+    let value: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["allowHumanTerminal"], true);
+    assert!(saved);
+    assert!(stderr.contains("browser terminals stay on"), "{stderr}");
+    assert!(!stderr.contains("restart wsmp"), "{stderr}");
+    // `off` turns them off again; the config command still works after.
+    let (_, _, saved) = login(&["--human-terminal", "off"]);
+    assert!(!saved);
+    // Relay only: nothing to warn about, but an explicit flag is still saved
+    // and the output says terminals need full control.
+    let relay = tmp.path().join("relay");
+    let relay_config = relay.join("config.json");
+    let relay_state = relay.join("state");
+    let relay_login = |extra: &[&str]| {
+        let server = TestServer::start(vec![
+            (
+                "/.well-known/wsmp",
+                200,
+                well_known("https://wsmp.example.com"),
+            ),
+            ("/api/node/enroll", 200, enrolled("spark-2")),
+        ]);
+        let mut cmd = cli(&relay_config, &relay_state);
+        cmd.args([
+            "login",
+            &server.base_url,
+            "--code",
+            CODE,
+            "--slug",
+            "spark-2",
+            "--trust",
+            "relay",
+            "--no-service",
+        ]);
+        cmd.args(extra);
+        let output = cmd.assert().success().get_output().clone();
+        server.join();
+        (
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+    let (stdout, stderr) = relay_login(&[]);
+    assert!(stdout.contains("browser terminals: off"), "{stdout}");
+    assert!(
+        !stderr.contains("no terminal to ask, so browser"),
+        "{stderr}"
+    );
+    let (stdout, _) = relay_login(&["--human-terminal", "on"]);
+    assert!(
+        stdout.contains("browser terminals: on (they need full control)"),
+        "{stdout}"
+    );
+    let cfg: Value = serde_json::from_slice(&fs::read(&relay_config).unwrap()).unwrap();
+    assert_eq!(cfg["allowHumanTerminal"], true);
+    cli(&config, &state)
+        .args(["config", "set-human-terminal", "on"])
+        .assert()
+        .success();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["allowHumanTerminal"], true);
+    // Anything but on|off is refused before contacting a server.
+    cli(&config, &state)
+        .args([
+            "login",
+            "http://127.0.0.1:9",
+            "--code",
+            CODE,
+            "--human-terminal",
+            "yes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--human-terminal"));
+}
+
+#[test]
 fn login_refuses_a_malformed_code_before_any_exchange() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");

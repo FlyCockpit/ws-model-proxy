@@ -189,7 +189,7 @@ export type FileOpLossCause = "node_offline" | "trust_relay" | "no_roots";
 export type TrackedFileOp = {
   opId: string;
   nodeId: string;
-  /** The op's owner: it is sent only to a node of theirs. */
+  /** The node owner the op was admitted for: only that owner's live session gets it. */
   userId: string;
   op: FileOp;
   markResult(frame: FileResultFrame): void;
@@ -2860,18 +2860,20 @@ export class RelaySessionManager {
 
   /**
    * Store a file op and send `file.op` (then `file.body` for a write). False means no frame
-   * was sent and the op was not stored: offline, draining, Relay only or no roots. The frame
-   * is encoded first, so a string the node could not read throws before anything is stored.
+   * was sent and the op was not stored: offline, draining, Relay only, no roots, or a session
+   * of another owner (an op admitted for one owner never reaches a node another owner runs).
+   * The frame is encoded first, so a string the node could not read throws before anything is
+   * stored.
    */
   dispatchFileOp(op: TrackedFileOp, frame: ServerFrame<"file.op">, body?: Uint8Array): boolean {
     if (this.relayDrain) return false;
     const session = this.sessionsByNodeId.get(op.nodeId);
     if (!session?.registered || session.socket.readyState !== WS_READY_STATE_OPEN) return false;
+    // A path or a file's content goes only to a node of the op's owner (node-owner.ts).
+    if (!nodeOwnerMatches({ userId: session.identity.userId }, op.userId, "file_op")) return false;
     const roots = session.features?.files.roots ?? null;
     if (session.trust !== "full" || roots === null || roots.length === 0) return false;
     if (session.filesById.has(op.opId)) return false;
-    // Defence in depth: a path or a file's content goes only to a node of the op's owner.
-    if (!nodeOwnerMatches({ userId: session.identity.userId }, op.userId, "file_op")) return false;
     const control = encodeRelayServerControlMessage(frame);
     const bodyFrame = body
       ? encodeRelayBinaryFrame({ type: "file.body", opId: op.opId }, body)

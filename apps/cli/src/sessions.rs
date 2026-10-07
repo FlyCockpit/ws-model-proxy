@@ -1337,15 +1337,9 @@ impl TerminalSession {
         match terminal_crypto::decode_plaintext_v2(&plaintext) {
             Ok(TermPlaintextV2::Data(bytes)) => Incoming::Write(bytes),
             Ok(TermPlaintextV2::Resize { cols, rows }) => Incoming::Resize { cols, rows },
-            // A browser never sends an output key; review frames belonged to
-            // the removed supervised terminals.
-            Ok(
-                TermPlaintextV2::OutputKey { .. }
-                | TermPlaintextV2::ReviewToggle(_)
-                | TermPlaintextV2::ReviewCapture { .. }
-                | TermPlaintextV2::ReviewState(_),
-            )
-            | Err(_) => Incoming::DropViewer,
+            // A browser never sends an output key. Retired and unknown tags
+            // fail to decode.
+            Ok(TermPlaintextV2::OutputKey { .. }) | Err(_) => Incoming::DropViewer,
         }
     }
 }
@@ -4237,8 +4231,6 @@ mod tests {
         Key(u32),
         Size(u16, u16),
         Data(Vec<u8>),
-        Review(bool),
-        Capture(u64, Vec<u8>, Vec<u8>),
         Opaque,
     }
 
@@ -4306,16 +4298,21 @@ mod tests {
         }
 
         fn seal(&mut self, terminal_id: &str, message: &TermPlaintextV2) -> (u64, Vec<u8>) {
+            let plaintext = terminal_crypto::encode_plaintext_v2(message).expect("encode");
+            self.seal_bytes(terminal_id, &plaintext)
+        }
+
+        /// Seal raw plaintext bytes, including tags the codec cannot encode.
+        fn seal_bytes(&mut self, terminal_id: &str, plaintext: &[u8]) -> (u64, Vec<u8>) {
             self.tx_seq += 1;
             let keys = self.keys.as_ref().expect("bound");
-            let plaintext = terminal_crypto::encode_plaintext_v2(message).expect("encode");
             let body = terminal_crypto::seal_v2(
                 &keys.browser_to_cli,
                 terminal_id,
                 &self.id,
                 DIR_BROWSER_TO_CLI,
                 self.tx_seq,
-                &plaintext,
+                plaintext,
             )
             .expect("seal");
             (self.tx_seq, body)
@@ -4382,13 +4379,6 @@ mod tests {
                         }
                         TermPlaintextV2::Resize { cols, rows } => Seen::Size(cols, rows),
                         TermPlaintextV2::Data(bytes) => Seen::Data(bytes),
-                        TermPlaintextV2::ReviewState(on) => Seen::Review(on),
-                        TermPlaintextV2::ReviewCapture { total, head, tail } => {
-                            Seen::Capture(total, head, tail)
-                        }
-                        TermPlaintextV2::ReviewToggle(_) => {
-                            panic!("the CLI never sends a review toggle")
-                        }
                     },
                 );
             }
@@ -4530,6 +4520,41 @@ mod tests {
         );
         assert_eq!(writer_changes(&frames), vec![Some(a.id.clone())]);
         assert_eq!(writer(&terminals), Some(a.id.clone()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retired_review_and_unknown_tags_drop_only_the_sender() {
+        let (tx, _rx) = channel();
+        let mut terminals = multi_registry(tx);
+        let startup = enabled_startup(false);
+        let mut a = TestViewer::new(1);
+        open_viewer(&mut terminals, &startup, &mut a);
+        // A 0.3 review toggle, capture and state, then a tag never assigned.
+        let retired_capture = [0x05, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        for (tag, plaintext) in [
+            (11, &[0x04, 1][..]),
+            (12, &retired_capture[..]),
+            (13, &[0x06, 0][..]),
+            (14, &[0x07, 1][..]),
+        ] {
+            let mut sender = TestViewer::new(tag);
+            attach_viewer(&mut terminals, &startup, &mut sender);
+            let (seq, body) = sender.seal_bytes(MULTI_TERMINAL, plaintext);
+            let sender_id = sender.id.clone();
+            let frames = terminals.handle_sealed(MULTI_TERMINAL, Some(&sender_id), seq, &body);
+            assert_eq!(
+                rejection(&frames),
+                Some((Some(sender_id), REASON_BAD_FRAME.to_string())),
+                "{plaintext:?}"
+            );
+            let session = terminals.sessions.get(MULTI_TERMINAL).expect("session");
+            assert_eq!(
+                session.viewers.keys().cloned().collect::<Vec<_>>(),
+                vec![a.id.clone()],
+                "{plaintext:?}"
+            );
+        }
     }
 
     #[cfg(unix)]

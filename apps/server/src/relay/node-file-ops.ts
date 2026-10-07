@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import type { NodeFileServices } from "@ws-model-proxy/api/context";
 import {
   FILE_BODY_MAX_BYTES,
   FILE_OP_DEADLINE_MS,
@@ -67,6 +68,8 @@ export type FileOpFailure = {
   outcome?: "unknown";
   /** `upgrade_wsmp`: the relay protocol the refused node spoke. */
   rejectedProtocolVersion?: string;
+  /** `path_denied` by the server's root check: the node's file roots (absolute paths). */
+  roots?: string[];
 };
 
 export type FileOpSuccess = {
@@ -208,8 +211,12 @@ function stringField(source: unknown, key: string): string | null {
   return typeof value === "string" ? value : null;
 }
 
-/** The path an event names: `path`, `root`, the first of `paths`, or a rename's `from`. */
+/** The path an event names: a rename's `from -> to`, `path`, `root` or the first of `paths`. */
 function auditPathOf(args: unknown): string {
+  // A rename names both ends: where a file went matters as much as where it came from.
+  const from = stringField(args, "from");
+  const to = stringField(args, "to");
+  if (from !== null && to !== null) return `${from} -> ${to}`;
   const direct =
     stringField(args, "path") ?? stringField(args, "root") ?? stringField(args, "from");
   if (direct !== null) return direct;
@@ -271,9 +278,10 @@ function auditOutcomeOf(
 }
 
 /**
- * An input the MCP layer refused before `runFileOp` (strict shape, content the relay cannot
- * carry): recorded as a refusal. The node is unverified there, so the row stores
- * {@link NODE_AUDIT_UNKNOWN_NODE}.
+ * A request refused before `runFileOp` (an input the relay cannot carry, or a node the
+ * procedure found Relay only): recorded as a refusal with `reason` (default
+ * `invalid_input`). Unless the caller verified that `nodeId` is one of the user's own nodes
+ * (`nodeVerified`), the row stores {@link NODE_AUDIT_UNKNOWN_NODE}.
  */
 export function auditRefusedFileInput(input: {
   userId: string;
@@ -282,9 +290,12 @@ export function auditRefusedFileInput(input: {
   nodeId: string;
   op: FileOp;
   args: unknown;
+  reason?: "invalid_input" | "trust_relay";
+  nodeVerified?: boolean;
 }): void {
   const audit = newFileAudit({ ...input, expiresAt: null });
-  recordFileAudit(audit, { ok: false, code: "invalid_input" });
+  audit.nodeVerified = input.nodeVerified === true;
+  recordFileAudit(audit, { ok: false, code: input.reason ?? "invalid_input" });
 }
 
 /** The ONE call site of `recordNodeAuditEvent` for file ops. Never throws. */
@@ -297,7 +308,8 @@ function recordFileAudit(audit: FileAudit, outcome: FileOpOutcome): void {
   if (outcome.ok) {
     etagAfter = stringField(outcome.result, "etag");
     const size: unknown = Reflect.get(outcome.result, "size");
-    if (bytes === null && audit.kind === "file_write" && typeof size === "number") bytes = size;
+    const sized = audit.kind === "file_write" || audit.kind === "file_read";
+    if (bytes === null && sized && typeof size === "number") bytes = size;
   }
   recordNodeAuditEvent({
     userId: audit.userId,
@@ -306,7 +318,8 @@ function recordFileAudit(audit: FileAudit, outcome: FileOpOutcome): void {
     agentTokenId: audit.credentialKind === "agent_token" ? audit.tokenId : null,
     mcpGrantId: audit.credentialKind === "oauth_grant" ? audit.tokenId : null,
     kind: audit.kind,
-    subject: audit.path,
+    // The row's subject is never empty (a CHECK): an input without a path says so.
+    subject: audit.path === "" ? "(no path)" : audit.path,
     etagBefore: audit.etagBefore,
     etagAfter,
     bytes,
@@ -504,6 +517,43 @@ function invalid(): FileOpFailure {
   return { ok: false, code: "invalid_input" };
 }
 
+/** Every path a (strictly parsed) `file.op` names. */
+function requestedPaths(frame: FileOpFrame): string[] {
+  switch (frame.op) {
+    case "stat":
+      return frame.args.paths;
+    case "search":
+      return [frame.args.root];
+    case "rename":
+      return [frame.args.from, frame.args.to];
+    default:
+      return [frame.args.path];
+  }
+}
+
+/** The `/`-separated components of an absolute path, or null (relative, `~`, `.` or `..`). */
+function absoluteComponents(path: string): string[] | null {
+  if (!path.startsWith("/") || path.includes("\0")) return null;
+  const parts = path.split("/").filter((part) => part !== "");
+  if (parts.some((part) => part === "." || part === "..")) return null;
+  return parts;
+}
+
+/**
+ * Whether `path` is lexically a file root or beneath one, component by component. The roots
+ * are the node's canonical absolute directories (`wsmp config set-file-roots`); a `~/` path,
+ * a relative path or any `.`/`..` component is refused here, before anything is sent.
+ */
+function underFileRoots(path: string, roots: readonly string[]): boolean {
+  const target = absoluteComponents(path);
+  if (target === null) return false;
+  return roots.some((root) => {
+    const base = absoluteComponents(root);
+    if (base === null || base.length === 0 || base.length > target.length) return false;
+    return base.every((part, index) => target[index] === part);
+  });
+}
+
 /**
  * Run one file op on a node and wait for its outcome. Checks run in the admission order
  * (token, node, owner, trust, live node and roots), then the input and the limits; the frame
@@ -529,7 +579,13 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
   const mutating = isMutatingFileOp(input.op);
   if (input.signal?.aborted) return { ok: false, code: "cancelled" };
 
-  const reads = await readNodeAgentAccess(input);
+  const reads = await readNodeAgentAccess({
+    userId: input.userId,
+    tokenId: input.tokenId,
+    credentialKind: input.credentialKind ?? "agent_token",
+    expiresAt: input.expiresAt,
+    nodeId: input.nodeId,
+  });
   // Never start new work for an aborted request.
   if (input.signal?.aborted) {
     closeNodeAgentAccess(reads);
@@ -579,6 +635,11 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
     }
   } catch {
     return invalid();
+  }
+  // Every path the op names must lie under one of the live session's file roots. The node
+  // resolves and checks them again (symlinks, its deny list); this check never relies on it.
+  if (!requestedPaths(frame).every((path) => underFileRoots(path, verdict.fileRoots ?? []))) {
+    return { ok: false, code: "path_denied", roots: [...(verdict.fileRoots ?? [])] };
   }
 
   const counts = pendingCounts(input.userId, input.nodeId);
@@ -710,3 +771,43 @@ export function resetFileOpsForTests(): void {
   opTimesByUser.clear();
   mutationTimesByUser.clear();
 }
+
+/** `Context.services.nodeFiles`: the `nodes.files.*` procedures' way to the relay. */
+export const nodeFileServices: NodeFileServices = {
+  async run(input) {
+    const outcome = await runFileOp({
+      userId: input.userId,
+      tokenId: input.credential.id,
+      credentialKind: input.credential.kind,
+      // The credential's own row carries its expiry; admission reads it.
+      expiresAt: null,
+      nodeId: input.nodeId,
+      op: input.op,
+      args: input.args,
+      ...(input.body ? { body: input.body } : {}),
+      ...(input.signal ? { signal: input.signal } : {}),
+    });
+    if (outcome.ok) return { ok: true, result: { ...outcome.result } };
+    return {
+      ok: false,
+      code: outcome.code,
+      ...(outcome.detail ? { detail: { ...outcome.detail } } : {}),
+      ...(outcome.retryAfterMs !== undefined ? { retryAfterMs: outcome.retryAfterMs } : {}),
+      ...(outcome.outcome ? { outcome: outcome.outcome } : {}),
+      ...(outcome.roots ? { roots: outcome.roots } : {}),
+    };
+  },
+  auditRefused(input) {
+    auditRefusedFileInput({
+      userId: input.userId,
+      tokenId: input.credential.id,
+      credentialKind: input.credential.kind,
+      nodeId: input.nodeId,
+      op: input.op,
+      args: input.args,
+      reason: input.reason,
+      // The procedure looked the node up under the caller before refusing.
+      nodeVerified: true,
+    });
+  },
+};

@@ -1,6 +1,6 @@
 /**
  * The 0.4.0 API contract (S0 first deliverable): every oRPC procedure (spec §8.1a) with its
- * input/output zod and access level, the 25 MCP tools, the plain-HTTP node endpoints, and the
+ * input/output zod and access level, the 27 MCP tools, the plain-HTTP node endpoints, and the
  * metrics vocabulary. Overview: `docs/contracts/0.4.0.md`.
  *
  * S0c binds each leaf to its base procedure (see `procedure.ts`) with a NOT_IMPLEMENTED

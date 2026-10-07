@@ -74,7 +74,7 @@ pub fn service_env_file() -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn service_file() -> Result<PathBuf> {
+pub(crate) fn service_file() -> Result<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
@@ -83,7 +83,7 @@ fn service_file() -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn service_file() -> Result<PathBuf> {
+pub(crate) fn service_file() -> Result<PathBuf> {
     let home = dirs::home_dir().context("could not determine the user home directory")?;
     Ok(home
         .join("Library/LaunchAgents")
@@ -96,13 +96,13 @@ fn macos_wrapper_path() -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_log_dir() -> Result<PathBuf> {
+pub(crate) fn macos_log_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("could not determine the user home directory")?;
     Ok(home.join("Library/Logs/ws-model-proxy"))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn service_file() -> Result<PathBuf> {
+pub(crate) fn service_file() -> Result<PathBuf> {
     anyhow::bail!("service installation is only supported on Linux and macOS")
 }
 
