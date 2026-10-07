@@ -1884,7 +1884,8 @@ where
             });
         #[cfg(not(unix))]
         let recorded: Option<Job> = None;
-        if !held && job.phase != JobPhase::Stop {
+        // A stop, and a status probe proving one, also work after the server dropped it.
+        if !held && job.phase != JobPhase::Stop && job.phase != JobPhase::Status {
             Err(refused_with(missing, "launchVersionId"))
         } else if let Some(known) = recorded {
             from_record(&job, known)

@@ -46,6 +46,9 @@ struct Fake {
     intent_path: PathBuf,
     stop_fails: Cell<bool>,
     ready: Cell<bool>,
+    /// Units whose process tree still has a task (launched units count unless stopped).
+    orphans: RefCell<Vec<String>>,
+    port_busy: Cell<bool>,
 }
 
 impl Fake {
@@ -56,6 +59,8 @@ impl Fake {
             intent_path,
             stop_fails: Cell::new(false),
             ready: Cell::new(true),
+            orphans: RefCell::new(Vec::new()),
+            port_busy: Cell::new(false),
         }
     }
 }
@@ -99,6 +104,13 @@ impl Runtime for Fake {
     }
     fn healthy_until(&self, _: &Job, _: Deadline) -> bool {
         self.ready.get()
+    }
+    fn tasks_alive(&self, unit: &str, _: Deadline) -> Result<bool> {
+        Ok(self.units.borrow().contains_key(unit)
+            || self.orphans.borrow().iter().any(|orphan| orphan == unit))
+    }
+    fn port_free(&self, _: &str, _: u16) -> bool {
+        !self.port_busy.get()
     }
 }
 
@@ -156,17 +168,77 @@ fn steps_for_an_unknown_instance_are_refused_and_leave_nothing() {
     let path = root.path().join("in1-r0.json");
     let runtime = Fake::new(path.clone());
     let mut executor = Executor::load(path.clone()).expect("load");
-    for phase in [
-        JobPhase::Stop,
-        JobPhase::Readiness,
-        JobPhase::Health,
-        JobPhase::Status,
-    ] {
+    for phase in [JobPhase::Stop, JobPhase::Readiness, JobPhase::Health] {
         assert_eq!(
             executor.execute(job(phase), &runtime, deadline()).error,
             Some(JobError::InstanceUnknown)
         );
     }
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_status_probe_proves_a_stop_the_stops_could_not() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path.clone()).expect("load");
+    executor.execute(job(JobPhase::Start), &runtime, deadline());
+    // The stop cannot stop the unit (say it was relaunched under another invocation).
+    runtime.stop_fails.set(true);
+    let failed = executor.execute(job(JobPhase::Stop), &runtime, deadline());
+    assert_eq!(failed.status, JobStatus::Failed);
+    // While the unit still has a task, or the port is taken, nothing is proven.
+    let mut probe = job(JobPhase::Status);
+    probe.step_id = "s1".into();
+    let alive = executor.execute(probe, &runtime, deadline());
+    assert_eq!((alive.status, alive.stopped), (JobStatus::Succeeded, false));
+    runtime.units.borrow_mut().clear();
+    runtime.port_busy.set(true);
+    let mut probe = job(JobPhase::Status);
+    probe.step_id = "s2".into();
+    assert!(!executor.execute(probe, &runtime, deadline()).stopped);
+    // The process tree is gone and the port is free: proven, and the record resolves.
+    runtime.port_busy.set(false);
+    let mut probe = job(JobPhase::Status);
+    probe.step_id = "s3".into();
+    let proven = executor.execute(probe, &runtime, deadline());
+    assert_eq!(
+        (proven.status, proven.stopped),
+        (JobStatus::Succeeded, true)
+    );
+    assert_eq!(
+        executor.observations(&runtime, deadline())[0].1.phase,
+        InstancePhase::Stopped
+    );
+    // A later stop (the unresolved one was resolved by the proof) answers stopped too.
+    runtime.stop_fails.set(false);
+    let mut stop = job(JobPhase::Stop);
+    stop.step_id = "stop-2".into();
+    assert!(executor.execute(stop, &runtime, deadline()).stopped);
+}
+
+#[test]
+fn a_status_probe_proves_a_stop_without_a_record_and_writes_nothing() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path.clone()).expect("load");
+    runtime
+        .orphans
+        .borrow_mut()
+        .push("wsmp-i-abcdefabcdef-r0".into());
+    assert!(
+        !executor
+            .execute(job(JobPhase::Status), &runtime, deadline())
+            .stopped
+    );
+    runtime.orphans.borrow_mut().clear();
+    let proven = executor.execute(job(JobPhase::Status), &runtime, deadline());
+    assert_eq!(
+        (proven.status, proven.stopped),
+        (JobStatus::Succeeded, true)
+    );
     assert!(!path.exists());
 }
 
@@ -286,6 +358,13 @@ impl Runtime for Flaky {
     }
     fn healthy_until(&self, job: &Job, deadline: Deadline) -> bool {
         self.inner.healthy_until(job, deadline)
+    }
+    fn tasks_alive(&self, unit: &str, deadline: Deadline) -> Result<bool> {
+        anyhow::ensure!(!self.erroring.get(), "manager timed out");
+        self.inner.tasks_alive(unit, deadline)
+    }
+    fn port_free(&self, host: &str, port: u16) -> bool {
+        self.inner.port_free(host, port)
     }
 }
 

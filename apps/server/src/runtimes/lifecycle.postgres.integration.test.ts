@@ -463,6 +463,46 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     return id;
   }
 
+  it("completes a stop its failed stops could not prove once a status probe proves it", async () => {
+    const lc = await engine();
+    const id = await ready(lc, 30_109);
+    await m.fixture.runtimeInstance.update({
+      where: { id },
+      data: { desiredState: "STOPPED", phase: "STOPPING", phaseReason: "stop_requested" },
+    });
+    // Every stop fails (say its stop command errors because the process is already gone).
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await lc.runOnce();
+      await answer(lc, lastJob(id, "stop"), "failed", { error: "command_failed" });
+    }
+    // No person yet: the node is asked for proof first.
+    await lc.runOnce();
+    let row = await instance(id);
+    expect(row.needsOperator).toBeNull();
+    expect(row.Ranks[0]?.claim).toBe("HELD");
+    const first = lastJob(id, "status");
+    // The node cannot prove it (still alive, or unknown): now a person may Forget.
+    await answer(lc, first, "succeeded", { stopped: false });
+    await lc.runOnce();
+    row = await instance(id);
+    expect(row.phase).toBe("STOPPING");
+    expect(row.needsOperator).toBe("FORGET");
+    expect(sent.filter((job) => job.instanceId === id && job.phase === "status")).toHaveLength(1);
+    // Later the probe is repeated; its proof completes the stop with no person.
+    await m.fixture.instanceStep.updateMany({
+      where: { instanceId: id, phase: "STATUS" },
+      data: { updatedAt: new Date(Date.now() - 6 * 60_000) },
+    });
+    await lc.runOnce();
+    const second = lastJob(id, "status");
+    expect(second.stepId).not.toBe(first.stepId);
+    await answer(lc, second, "succeeded", { stopped: true });
+    row = await instance(id);
+    expect(row.phase).toBe("STOPPED");
+    expect(row.needsOperator).toBeNull();
+    expect(row.Ranks[0]?.claim).toBe("RELEASED");
+  });
+
   it("asks a person to Forget a stop whose node stays offline", async () => {
     const lc = await engine();
     const id = await ready(lc, 30_105);

@@ -344,6 +344,11 @@ pub trait Runtime {
     fn status_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<bool>;
     fn stop(&self, unit: &str, owner: &str, invocation: &str, deadline: Deadline) -> Result<()>;
     fn healthy_until(&self, job: &Job, deadline: Deadline) -> bool;
+    /// Whether any process of the unit's tree still runs (whoever launched it): false when
+    /// the unit is gone or its control group has no task. Errors are unknown.
+    fn tasks_alive(&self, unit: &str, deadline: Deadline) -> Result<bool>;
+    /// Whether nothing listens on `port` (any address, and `host`).
+    fn port_free(&self, host: &str, port: u16) -> bool;
 }
 
 fn owner_ok(owner: &str) -> bool {
@@ -570,6 +575,9 @@ impl Executor {
             return Err(fail(JobError::SessionDisconnected));
         }
         let key = job.key();
+        if job.action == JobPhase::Status {
+            return self.prove_stopped(job, runtime, deadline);
+        }
         if matches!(
             job.action,
             JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin
@@ -759,7 +767,8 @@ impl Executor {
                 self.state.records.get_mut(&key).context("record")?.phase = InstancePhase::Ready;
                 Outcome::ok(false)
             }
-            JobPhase::Health | JobPhase::Status => {
+            JobPhase::Status => anyhow::bail!("a status probe is answered by the stop proof"),
+            JobPhase::Health => {
                 anyhow::ensure!(
                     serving_confirmed(
                         self.state.records.get(&key).context("record")?,
@@ -801,6 +810,55 @@ impl Executor {
                 .context("service remains alive")?,
         };
         self.complete(job, outcome)
+    }
+
+    /// A status probe (the server sends one when the stops of a stopping rank
+    /// failed, or for a forgotten claim): proves the stop when nothing of the
+    /// rank's process tree runs (no owned or recorded unit has a task), its
+    /// status command (when defined) says stopped, and its port is free. It
+    /// runs nothing and needs no record (a lost record cannot block the
+    /// proof); a proof resolves the record like a verified stop. Anything
+    /// short of proof answers not stopped.
+    fn prove_stopped(
+        &mut self,
+        job: &Job,
+        runtime: &impl Runtime,
+        deadline: Deadline,
+    ) -> Result<Outcome> {
+        let key = job.key();
+        let mut units: std::collections::BTreeSet<String> = owned_units(job).into_iter().collect();
+        if let Some(record) = self.state.records.get(&key) {
+            if let Some(done) = record.completed.get(&job.step_id) {
+                anyhow::ensure!(done.hash == job.intent_hash, "step intent changed");
+                return Ok(done.outcome.clone());
+            }
+            units.extend(record.invocations.keys().cloned());
+        }
+        for unit in &units {
+            if runtime.tasks_alive(unit, deadline)? {
+                return Ok(Outcome::ok(false));
+            }
+        }
+        if let Some(status) = job.status_command.as_deref()
+            && !matches!(
+                runtime.status_until(job, status, deadline.cap(Duration::from_secs(30))),
+                Ok(false)
+            )
+        {
+            return Ok(Outcome::ok(false));
+        }
+        if !runtime.port_free(&job.host, job.port) {
+            return Ok(Outcome::ok(false));
+        }
+        deadline.remaining()?;
+        let now = (self.clock)();
+        let Some(record) = self.state.records.get_mut(&key) else {
+            return Ok(Outcome::ok(true));
+        };
+        record.invocations.clear();
+        record.phase = InstancePhase::Stopped;
+        record.stopped_at = Some(now);
+        self.complete(job, Outcome::ok(true))
     }
 
     /// Run the stop command, stop every owned unit, then require status
@@ -1044,6 +1102,12 @@ impl<R: Runtime> Runtime for OperatorRan<'_, R> {
     }
     fn healthy_until(&self, job: &Job, deadline: Deadline) -> bool {
         self.inner.healthy_until(job, deadline)
+    }
+    fn tasks_alive(&self, unit: &str, deadline: Deadline) -> Result<bool> {
+        self.inner.tasks_alive(unit, deadline)
+    }
+    fn port_free(&self, host: &str, port: u16) -> bool {
+        self.inner.port_free(host, port)
     }
 }
 

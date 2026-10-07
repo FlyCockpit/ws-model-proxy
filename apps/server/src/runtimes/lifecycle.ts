@@ -299,6 +299,15 @@ function rankInput(rank: InstanceRow["Ranks"][number]): RankInput {
   return { rank: rank.rank, port: rank.port, distPort: rank.distPort, resources: rank.resources };
 }
 
+/**
+ * A status probe (stop proof) is for a forgotten claim, or a held claim of an instance that is
+ * stopping (its stops could not prove the stop). Anything else is the run that holds the claim
+ * now: a probe never goes out for it, and an answer releases nothing.
+ */
+function statusProbeWanted(instance: { phase: string }, claim: string | undefined): boolean {
+  return claim === "HELD_UNKNOWN" || (claim === "HELD" && instance.phase === "STOPPING");
+}
+
 function isStartPhase(phase: string): boolean {
   return (START_PHASES as readonly string[]).includes(phase);
 }
@@ -658,13 +667,29 @@ export class RuntimeLifecycle {
       if (stops.some((step) => (LIVE_STEP_STATES as readonly string[]).includes(step.state)))
         continue;
       const failed = stops.filter((step) => step.state === "FAILED");
+      if (!launch || rank.nodeId === null) {
+        needsForget = true;
+        continue;
+      }
       if (
         failed.some((step) => UNPROVABLE_STOP.has(step.errorCode ?? "")) ||
-        failed.length >= STOP_ATTEMPTS ||
-        !launch ||
-        rank.nodeId === null
+        failed.length >= STOP_ATTEMPTS
       ) {
-        needsForget = true;
+        // The stop itself cannot prove it, but the node may: a status probe answers stopped
+        // when the rank's process tree is gone and its port is free. A person is asked to
+        // Forget only once a probe could not prove it (or none can be sent); the probe keeps
+        // being repeated, so a later proof still completes the stop with no person.
+        // A person who gave up on an interactive stop decides at once (the probe still runs).
+        const probeUnproven = await this.probeStoppingRank(
+          tx,
+          instance,
+          rank,
+          launch,
+          generation,
+          now,
+        );
+        if (probeUnproven || failed.some((step) => step.errorCode === OPERATOR_CANCELLED))
+          needsForget = true;
         continue;
       }
       await this.insertSteps(tx, instance, [
@@ -698,6 +723,52 @@ export class RuntimeLifecycle {
         where: { id: instance.id },
         data: { needsOperator: need, needsOperatorSince: need ? now : null },
       });
+  }
+
+  /**
+   * A STOPPING rank whose stops failed: keeps one status probe (stop proof) going, at most one
+   * every {@link HELD_UNKNOWN_PROBE_MS}. True when a person must decide now: the node is not
+   * connected here, or an earlier probe answered without proving the stop.
+   */
+  private async probeStoppingRank(
+    tx: Tx,
+    instance: InstanceRow,
+    rank: InstanceRow["Ranks"][number],
+    launch: RuntimeLaunch,
+    generation: number,
+    now: Date,
+  ): Promise<boolean> {
+    if (rank.nodeId === null || !this.relay.nodeSession(rank.nodeId)) return true;
+    const probeGeneration = Math.max(generation, 1);
+    const probes = await tx.instanceStep.findMany({
+      where: {
+        instanceId: instance.id,
+        rank: rank.rank,
+        generation: probeGeneration,
+        phase: "STATUS",
+      },
+      select: { state: true, updatedAt: true },
+    });
+    const finished = probes.filter(
+      (probe) => !(LIVE_STEP_STATES as readonly string[]).includes(probe.state),
+    );
+    // A probe on its way: wait for it (a person is asked only if an earlier one failed).
+    if (probes.length > finished.length) return finished.length > 0;
+    const latest = Math.max(0, ...finished.map((probe) => probe.updatedAt.getTime()));
+    if (finished.length === 0 || latest <= now.getTime() - HELD_UNKNOWN_PROBE_MS)
+      await this.insertSteps(tx, instance, [
+        stopStep({
+          instance: instanceInput(instance),
+          rank: rankInput(rank),
+          nnodes: instance.Ranks.length,
+          launch,
+          generation: probeGeneration,
+          attempt: probes.length,
+          operationId: null,
+          phase: "STATUS",
+        }),
+      ]);
+    return finished.length > 0;
   }
 
   private async offlineSince(tx: Tx, nodeId: string, ms: number): Promise<boolean> {
@@ -1190,7 +1261,7 @@ export class RuntimeLifecycle {
       const superseded =
         (step.phase === "STOP" &&
           step.generation < (await this.currentGeneration(tx, instance.id))) ||
-        (step.phase === "STATUS" && claim !== "HELD_UNKNOWN");
+        (step.phase === "STATUS" && !statusProbeWanted(instance, claim));
       if (claim === "RELEASED" || superseded) {
         await tx.instanceStep.updateMany({
           where: { id: step.id, state: "PENDING" },
@@ -2172,7 +2243,7 @@ export class RuntimeLifecycle {
         // releases a forgotten claim. A late answer of an earlier run releases nothing.
         const proves =
           phase === "STATUS"
-            ? claim.claim === "HELD_UNKNOWN"
+            ? statusProbeWanted(instance, claim.claim)
             : current && (!leading || claim.claim === "HELD_UNKNOWN");
         if (proves) await this.release(tx, claim.id, now);
       } else if (!succeeded && leading) {
