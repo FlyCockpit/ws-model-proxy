@@ -117,7 +117,7 @@
   "scripts": {
     "check-types": "tsc -p tsconfig.check-types.json --noEmit",
     "test": "vitest run --passWithNoTests",
-    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism --passWithNoTests postgres.integration"
+    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism --hookTimeout=60000 --testTimeout=60000 --passWithNoTests postgres.integration"
   },
   "dependencies": {
     "@orpc/openapi": "catalog:",

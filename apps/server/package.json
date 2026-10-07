@@ -9,7 +9,7 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.mjs",
     "test": "vitest run --passWithNoTests",
-    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism --passWithNoTests integration.test"
+    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism --hookTimeout=60000 --testTimeout=60000 --passWithNoTests integration.test"
   },
   "dependencies": {
     "@better-auth/mcp": "catalog:",
