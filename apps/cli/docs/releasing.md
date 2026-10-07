@@ -23,6 +23,17 @@ Installers generated: **shell** (`curl ... | sh`), **PowerShell** (`irm ... |
 iex`), and a **Homebrew formula** (`wsmp.rb`). The formula is uploaded to the
 GitHub Release and then copied into the tap as `Formula/wsmp.rb`.
 
+Every archive is listed in `sha256.sum`, and the publish job signs build
+provenance for the archives and `sha256.sum` with `actions/attest` (verify with
+`gh attestation verify <file> --repo FlyCockpit/ws-model-proxy`). The server's
+`/install.sh` downloads `wsmp-<target>.tar.xz` and `sha256.sum` from the release
+of the server's version and refuses to install on a mismatch, so the publish job
+fails before creating the release if a Linux or macOS archive or its checksum
+entry is missing. Keep the archive names and the `.tar.xz` format (dist's
+default) in step with `CLI_RELEASE_TARGETS` in `apps/server/src/node-http.ts`;
+the server tests check both. The Linux builds run on Ubuntu 22.04 runners, so
+they need glibc 2.34 or newer (`CLI_RELEASE_MIN_GLIBC`).
+
 The container image is published to GHCR as:
 
 ```text
@@ -55,7 +66,7 @@ The server accepts the listed relay protocol versions
 together when the minimum moves.
 
 A release bumps the protocol at most once. This release speaks relay protocol
-2.4 (v0.3.1 spoke 2.3) and supports only that version. Release notes must
+3.0 (v0.3.x spoke 2.4) and supports only that version. Release notes must
 require upgrading the server and every CLI together. Older CLIs are
 refused with an upgrade-CLI message; this CLI against an older server reports
 that the server needs upgrading. A genuine future-server upgrade-CLI reply

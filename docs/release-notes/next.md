@@ -24,8 +24,8 @@ To deploy:
 2. Create a new, empty Postgres database and point `DATABASE_URL` at it.
 3. Update the environment (see [Configuration](#configuration)): remove every
    `RATE_LIMIT_*` variable; set `ADMIN_EMAIL` when public sign-up is off (it is
-   required to bootstrap the first admin on a fresh production database); set
-   `WMP_CLI_SOURCE_REV` (required in practice, see below).
+   required to bootstrap the first admin on a fresh production database); leave
+   `WMP_CLI_SOURCE_REV` unset so nodes install the release binary (see below).
 4. Start the container once with `APPLY_SCHEMA=safe`. On an empty database
    `safe` creates every table and installs the schema hardening (triggers and
    CHECKs); nothing destructive is involved.
@@ -59,23 +59,33 @@ only.
 
 Device login is gone. To add a node, create an enrollment code on the
 **Nodes** page and run the one-liner it shows. Written with the full path, so
-it works before `~/.cargo/bin` is on your `PATH`:
+it works before `~/.cargo/bin` is on your `PATH` (on a node with `CARGO_HOME`
+set, run `$CARGO_HOME/bin/wsmp login` instead; the installer prints the path):
 
 ```sh
 curl -fsSL https://wsmp.example.com/install.sh | sh && ~/.cargo/bin/wsmp login https://wsmp.example.com --code wsmp_enr_...
 ```
 
-- `/install.sh` builds `wsmp` from source with `cargo install`; there are no
-  0.4.0 release binaries yet. The node needs Rust 1.88 or newer and a C
-  toolchain (`cc`, for example `build-essential` or the Xcode command-line
-  tools). The binary lands in `~/.cargo/bin`.
-- **Pin `WMP_CLI_SOURCE_REV`; treat it as required.** It must be a full
-  40-character commit hash (a short hash or a tag fails the environment
-  check); get it with `git rev-parse 'v0.4.0^{commit}'`. Unset, the installer
-  follows the `redesign-0.4.0` branch, so anyone who can push there reaches
-  every node you add.
+- `/install.sh` installs the `wsmp` 0.4.0 release binary for the node:
+  Linux x86_64 or ARM64 (glibc 2.34 or newer: Ubuntu 22.04 and later, DGX OS)
+  and macOS (Apple silicon or Intel). It downloads `wsmp-<target>.tar.xz` and
+  `sha256.sum` from the GitHub Release and installs only when the SHA-256
+  matches; a missing checksum, a mismatch or a failed download stops the
+  install. No Rust toolchain is needed. The binary lands in `~/.cargo/bin`
+  (`$CARGO_HOME/bin` when that is set).
+- Other machines (musl, older glibc, other architectures) build the `v0.4.0`
+  tag from source with `cargo install`; they need Rust 1.88 or newer and a C
+  toolchain (`cc`, for example `build-essential`).
+- `WMP_CLI_RELEASE_BASE_URL` points `/install.sh` at another copy of the
+  release assets (an internal mirror, https only). Unset, it is this
+  version's GitHub Release.
+- `WMP_CLI_SOURCE_REV` makes every node build that exact commit from source
+  instead (a full 40-character hash). Use it only for a build that has no
+  release; it no longer needs to be set for 0.4.0.
+- Each archive and `sha256.sum` carries a signed build-provenance attestation:
+  `gh attestation verify wsmp-x86_64-unknown-linux-gnu.tar.xz --repo FlyCockpit/ws-model-proxy`.
 - Remove a Homebrew 0.3 `wsmp` (`brew uninstall wsmp`) if one is installed:
-  it can shadow `~/.cargo/bin/wsmp` on your `PATH`.
+  it can shadow `~/.cargo/bin/wsmp` on your `PATH` (the installer warns).
 - `wsmp login <url>` takes the code from `--code`, a prompt, or
   `WSMP_ENROLL_CODE`. It asks for the node's trust level and offers to
   install the per-user service.
@@ -233,8 +243,9 @@ refunded), and 20 exchanges per code owner per hour, successes included.
 
 ### Other environment changes
 
-- **Added:** `WMP_RATE_LIMIT_SCALE`, `WMP_CLI_SOURCE_REV` (the commit
-  `/install.sh` builds), `WMP_TERMINAL_USER_LIMIT`, `WMP_TERMINAL_CLI_LIMIT`,
+- **Added:** `WMP_RATE_LIMIT_SCALE`, `WMP_CLI_RELEASE_BASE_URL` (where
+  `/install.sh` downloads the CLI), `WMP_CLI_SOURCE_REV` (a commit
+  `/install.sh` builds instead), `WMP_TERMINAL_USER_LIMIT`, `WMP_TERMINAL_CLI_LIMIT`,
   `WMP_MCP_ENABLED` (MCP kill switch, on by default), `WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY`
   (was `WMP_MCP_PAT_ALLOW_NO_EXPIRY` on unreleased master builds), `ADMIN_EMAIL`,
   `RELAY_REQUEST_RETENTION_DAYS`.

@@ -38,12 +38,11 @@ export function enrollmentCodePrefix(code: string): string {
 }
 
 /**
- * The "Add a node" one-liner: install `wsmp`, then log in with the pre-approved code.
- *
- * TODO(cli/server): the install script (`/install.sh`) and `wsmp login --code` are built in the
- * CLI and server lanes; keep this text in step with them.
+ * The "Add a node" one-liner: install `wsmp`, then log in with the pre-approved code. `/install.sh`
+ * (apps/server/src/node-http.ts) installs into `~/.cargo/bin`, so login runs by full path: a node
+ * without Rust does not have that directory on its `PATH`.
  */
 export function enrollmentInstallCommand(origin: string, code: string): string {
   const base = origin.replace(/\/+$/, "");
-  return `curl -fsSL ${base}/install.sh | sh && wsmp login ${base} --code ${code}`;
+  return `curl -fsSL ${base}/install.sh | sh && ~/.cargo/bin/wsmp login ${base} --code ${code}`;
 }

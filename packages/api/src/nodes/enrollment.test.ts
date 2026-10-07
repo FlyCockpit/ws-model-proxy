@@ -87,7 +87,7 @@ describe("nodes.enrollmentCodes.create", () => {
     expect(ttl).toBeGreaterThan(23.9 * 3_600_000);
     expect(ttl).toBeLessThanOrEqual(24 * 3_600_000);
     expect(out.installCommand).toBe(
-      `curl -fsSL https://proxy.example.com/install.sh | sh && wsmp login https://proxy.example.com --code ${out.secret}`,
+      `curl -fsSL https://proxy.example.com/install.sh | sh && ~/.cargo/bin/wsmp login https://proxy.example.com --code ${out.secret}`,
     );
     expect(out.code.enrolled).toEqual([
       { nodeId: "node-1", slug: "box", usedAt: "2026-10-06T10:05:00.000Z" },
