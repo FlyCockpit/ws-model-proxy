@@ -47,15 +47,19 @@ independent logging practices.
 ### Stored responses
 
 `/v1/responses` without `store` sends `store: false` upstream: nothing is stored, and
-`GET` / `DELETE /v1/responses/{id}` answer 404 "This response was not stored". A
+`GET` / `DELETE /v1/responses/{id}` answer 404 "This response is not stored here". A
 response is stored only when created with `store: true` on a model that stores
 responses natively (`RESPONSES_API` in its served-model capabilities, or a provider
 model with the native Responses surface); WMP then keeps only its routing (which
 model on which instance or provider served it, for the same API key) for 7 days, and
-`GET` / `DELETE` reach that backend. After 7 days they answer 404 "This stored response
-has expired". `store: true` on a model without stored responses (for example a wrap of
-a chat-only engine, where WMP translates Responses onto chat completions) is refused
-with 400 `unsupported_capability` and a message saying to send it without `store`.
+`GET` / `DELETE` reach that backend. A follow-up (`previous_response_id`) keeps its
+routing too, so the chain continues; `GET` / `DELETE` of its id reach the backend, which
+answers for what it stored. Past 7 days the routing is pruned (within the hour) and the
+answer is the not-stored one. In a pool, `store: true` cannot go to a member reached by
+translation (a wrap of a chat-only engine, where WMP translates Responses onto chat
+completions); when no member can take it the answer is 400 `unsupported_capability`
+saying so. A direct runtime model without native Responses refuses every
+`/v1/responses` request with 400 `unsupported_capability`.
 
 For owner-paid pool fallback, all of these must hold:
 

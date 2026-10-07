@@ -3309,13 +3309,12 @@ async function resolveStickyRoute({
       expiresAt: true,
     },
   });
-  // Only a response created with `store: true` on a model that stores responses natively
-  // (RESPONSES_API) is kept (its routing, for RESPONSES_STICKINESS_TTL_MS). Anything else,
-  // including a request translated for a model without stored responses, was never stored:
-  // say that, not "expired" (docs/external-fallback.md, "Stored responses").
+  // Routing is kept for a stored response (or a follow-up) only, for
+  // RESPONSES_STICKINESS_TTL_MS: anything else was never stored, so say that rather than
+  // "expired" (docs/external-fallback.md, "Stored responses").
   const unavailable = storedResponseUnavailable(record, requester, new Date());
-  if (unavailable) return openAiFailureJsonResponse("not_found", unavailable);
-  if (!record?.selectedTargetId) throw new Error("a stored response names its target");
+  if (unavailable !== null || !record?.selectedTargetId)
+    return openAiFailureJsonResponse("not_found", unavailable ?? RESPONSE_NOT_STORED_MESSAGE);
   // Stickiness is hot-path history (@ws-model-proxy/db/capacity-lock-order):
   // it names its share and target by plain id, with no foreign key. A
   // deleted share or target simply is not found, which fails closed below.
@@ -3356,7 +3355,10 @@ async function resolveStickyRoute({
       !sameAccess(visibleTarget) ||
       record.upstreamResponseIdDigest !== upstreamResponseIdDigest(responseId)
     )
-      return openAiFailureJsonResponse("not_found", RESPONSE_NOT_STORED_MESSAGE);
+      return openAiFailureJsonResponse(
+        "not_found",
+        "This stored response is no longer accessible with this API key.",
+      );
     if (
       !record.providerAccountId ||
       !record.providerModelId ||
@@ -3712,11 +3714,7 @@ async function relayDirect({
       failure: "unsupported_capability",
       selectedRuntimeModelId: selected.id,
     });
-    return operationFailureResponse(
-      operation,
-      "unsupported_capability",
-      unsupportedCapabilityMessage(operation),
-    );
+    return operationFailureResponse(operation, "unsupported_capability");
   }
   if (!isEndpointConnected(selected, new Set(manager.getOnlineNodeIds()))) {
     await operation.dispose?.();
@@ -7103,11 +7101,7 @@ async function relaySelectedModelNoFailover({
       failure: "unsupported_capability",
       selectedRuntimeModelId: selected.id,
     });
-    return operationFailureResponse(
-      operation,
-      "unsupported_capability",
-      unsupportedCapabilityMessage(operation),
-    );
+    return operationFailureResponse(operation, "unsupported_capability");
   }
 
   if (!isEndpointConnected(selected, new Set(manager.getOnlineNodeIds()))) {

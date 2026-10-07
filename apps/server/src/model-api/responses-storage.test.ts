@@ -34,10 +34,13 @@ describe("GET/DELETE of a Responses id", () => {
   });
 
   it("explains a store: true create that no member can store", () => {
-    expect(unsupportedCapabilityMessage({ family: "responses", responseStickiness: {} })).toContain(
-      '"store": true',
-    );
-    expect(unsupportedCapabilityMessage({ family: "responses" })).toBeUndefined();
-    expect(unsupportedCapabilityMessage({ family: "chat.completions" })).toBeUndefined();
+    expect(
+      unsupportedCapabilityMessage({ family: "responses", contextInput: { store: true } }),
+    ).toContain('"store": true');
+    for (const contextInput of [{ store: false }, { store: true, previous_response_id: "r" }])
+      expect(unsupportedCapabilityMessage({ family: "responses", contextInput })).toBeUndefined();
+    expect(
+      unsupportedCapabilityMessage({ family: "chat.completions", contextInput: { store: true } }),
+    ).toBeUndefined();
   });
 });
