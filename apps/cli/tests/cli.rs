@@ -2150,3 +2150,20 @@ fn config_read_grant_is_explicit_and_roots_are_validated() {
     let value = json_stdout(show);
     assert_eq!(value["fileRoots"], json!([]));
 }
+
+#[test]
+fn hardware_reports_this_machine_as_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let mut cmd = cli(&config, &state);
+    cmd.args(["hardware", "--json"]);
+    let report = json_stdout(cmd);
+    let detected = &report["detected"];
+    assert!(
+        ["cpu", "discrete", "unified"].contains(&detected["nodeKind"].as_str().unwrap_or("")),
+        "{report}"
+    );
+    assert!(detected["gpus"].is_array(), "{report}");
+    assert!(detected["notes"].is_array(), "{report}");
+}

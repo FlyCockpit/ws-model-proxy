@@ -89,9 +89,15 @@ wsmp service install     # install, enable and start the per-user service
 wsmp service status      # what the service manager reports
 wsmp service uninstall   # stop, disable and remove it
 wsmp status              # whether the relay runs and is connected
+wsmp hardware            # what this node detects (memory, GPUs, unified pool); --json
 wsmp run                 # run the relay in the foreground (what the service runs)
 wsmp logout              # forget this node's credential
 ```
+
+`wsmp hardware` shows what placement falls back to when no hardware is declared: NVIDIA GPUs
+(a GB10 with no dedicated VRAM makes the node unified), AMD GPUs from sysfs (an APU such as Strix
+Halo reports VRAM carve-out plus GTT as its pool), and Apple silicon (the GPU wired limit). Check
+it before declaring overrides on the Nodes page.
 
 The service is a systemd user unit on Linux and a launchd agent on macOS. `wsmp service
 env-sync` and `wsmp service env-path` manage the private (0600) environment file the service

@@ -67,6 +67,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Command::Run(args) => commands::run::run(args),
         Command::Service(args) => commands::service::run(args),
         Command::Status(args) => commands::status::run(args),
+        Command::Hardware(args) => commands::hardware::run(args),
         Command::Logout(args) => commands::logout::run(args),
         Command::Completions(args) => commands::completions::run(args),
         Command::Terminal(args) => commands::terminal::run(args),

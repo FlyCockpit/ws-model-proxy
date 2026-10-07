@@ -599,11 +599,21 @@ pub fn assemble(sources: Sources) -> Hardware {
     }
 }
 
+/// Recorded machines under `tests/fixtures/hardware/<machine>`, read with
+/// the same parsers production uses.
 #[cfg(test)]
-mod tests {
+pub(crate) mod fixtures {
     use super::*;
     use crate::telemetry::{parse_cpu_model, parse_meminfo, parse_nvidia_smi};
     use std::path::PathBuf;
+
+    pub const MACHINES: &[&str] = &[
+        "dgx-spark-gb10",
+        "strix-halo",
+        "strix-halo-uma96",
+        "rtx-3090",
+        "apple-m3-max",
+    ];
 
     fn fixture_dir(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -615,8 +625,7 @@ mod tests {
         std::fs::read_to_string(fixture_dir(machine).join(file)).unwrap_or_default()
     }
 
-    /// The sources a machine fixture records (the same readers production uses).
-    fn sources(machine: &str) -> Sources {
+    pub fn sources(machine: &str) -> Sources {
         let root = fixture_dir(machine).join("root");
         let mut amd = read_amd_sysfs(&root);
         let mut names = parse_amd_smi_names(&fixture(machine, "amd-smi-static.json"));
@@ -635,6 +644,12 @@ mod tests {
             apple: (!sysctl.is_empty()).then(|| parse_sysctl(&sysctl)),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::{MACHINES, sources};
+    use super::*;
 
     #[test]
     fn dgx_spark_gb10_is_unified_with_memtotal_as_its_pool() {
@@ -805,13 +820,7 @@ mod tests {
 
     #[test]
     fn the_wire_frame_built_from_each_fixture_is_valid_json_for_node_info() {
-        for machine in [
-            "dgx-spark-gb10",
-            "strix-halo",
-            "strix-halo-uma96",
-            "rtx-3090",
-            "apple-m3-max",
-        ] {
+        for machine in MACHINES {
             let hardware = assemble(sources(machine));
             for gpu in &hardware.gpus {
                 if let Some(target) = &gpu.gfx_target {
