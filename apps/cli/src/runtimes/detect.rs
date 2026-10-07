@@ -84,24 +84,37 @@ pub struct Probed {
 
 static SCANNING: AtomicBool = AtomicBool::new(false);
 
+/// Holds [`SCANNING`] for one scan and releases it however the scan ends
+/// (a probe panic included).
+struct ScanSlot;
+
+impl ScanSlot {
+    fn claim() -> Option<Self> {
+        (!SCANNING.swap(true, Ordering::AcqRel)).then_some(Self)
+    }
+}
+
+impl Drop for ScanSlot {
+    fn drop(&mut self) {
+        SCANNING.store(false, Ordering::Release);
+    }
+}
+
 /// Answer `runtime.detect` off the relay loop. A request that arrives while a
 /// scan runs is folded into it: that scan's answer is the fresh one.
 pub(crate) fn spawn(tx: SyncSender<FromWorker>, id: String, skip_ports: BTreeSet<u16>) {
-    if SCANNING.swap(true, Ordering::AcqRel) {
+    let Some(slot) = ScanSlot::claim() else {
         tracing::debug!(id, "a detection scan is already running");
         return;
-    }
+    };
     let spawned = std::thread::Builder::new()
         .name("wsmp-detect".into())
         .spawn(move || {
-            let servers = scan(&skip_ports);
-            SCANNING.store(false, Ordering::Release);
-            let frame = NodeFrame::RuntimeDetected {
-                id: Some(id),
-                scanned_at: crate::telemetry::now_rfc3339(),
-                servers,
+            let servers = {
+                let _slot = slot;
+                scan(&skip_ports)
             };
-            match crate::protocol::encode_control(&frame) {
+            match crate::protocol::encode_control(&detected_frame(id, servers)) {
                 Ok(text) => {
                     let _ = tx.send(FromWorker::Telemetry(text));
                 }
@@ -111,13 +124,43 @@ pub(crate) fn spawn(tx: SyncSender<FromWorker>, id: String, skip_ports: BTreeSet
                 ),
             }
         });
+    // A failed spawn drops the closure, and the slot with it.
     if let Err(error) = spawned {
-        SCANNING.store(false, Ordering::Release);
         tracing::warn!(error = %error, "starting the detection worker failed");
     }
 }
 
-/// Scan this machine's loopback ports now.
+/// The answer frame, cut to the control-frame size limit: the longest model
+/// lists lose their last ids first, then the last servers go.
+pub fn detected_frame(id: String, mut servers: Vec<DetectedServer>) -> NodeFrame {
+    let frame = |servers: Vec<DetectedServer>| NodeFrame::RuntimeDetected {
+        id: Some(id.clone()),
+        scanned_at: crate::telemetry::now_rfc3339(),
+        servers,
+    };
+    let fits = |servers: &[DetectedServer]| {
+        serde_json::to_vec(&frame(servers.to_vec()))
+            .is_ok_and(|bytes| bytes.len() <= crate::protocol::RELAY_JSON_CONTROL_MAX_BYTES)
+    };
+    while !fits(&servers) {
+        match servers
+            .iter_mut()
+            .filter(|server| !server.models.is_empty())
+            .max_by_key(|server| server.models.len())
+        {
+            Some(server) => {
+                server.models.pop();
+            }
+            None => {
+                servers.pop();
+            }
+        }
+    }
+    frame(servers)
+}
+
+/// Scan this machine's loopback ports now, within about [`SCAN_BUDGET`]: no
+/// port starts and no request starts that could end after it.
 pub fn scan(skip_ports: &BTreeSet<u16>) -> Vec<DetectedServer> {
     let listening = listening_ports();
     let candidates = candidate_ports(WELL_KNOWN_PORTS, &listening, skip_ports);
@@ -136,7 +179,7 @@ pub fn scan(skip_ports: &BTreeSet<u16>) -> Vec<DetectedServer> {
                     }
                     let next = queue.lock().ok().and_then(|mut queue| queue.next());
                     let Some(port) = next else { return };
-                    if let Some(server) = probe_port(port, listening.get(&port).copied())
+                    if let Some(server) = probe_port(port, listening.get(&port).copied(), deadline)
                         && let Ok(mut found) = found.lock()
                     {
                         found.insert(port, server);
@@ -187,7 +230,11 @@ fn reachable(port: u16, listening: Option<Listening>) -> Option<IpAddr> {
         .find(|ip| TcpStream::connect_timeout(&SocketAddr::new(*ip, port), CONNECT_TIMEOUT).is_ok())
 }
 
-fn probe_port(port: u16, listening: Option<Listening>) -> Option<DetectedServer> {
+fn probe_port(
+    port: u16,
+    listening: Option<Listening>,
+    deadline: Instant,
+) -> Option<DetectedServer> {
     let ip = reachable(port, listening)?;
     let root = match ip {
         IpAddr::V4(_) => format!("http://127.0.0.1:{port}/"),
@@ -195,6 +242,9 @@ fn probe_port(port: u16, listening: Option<Listening>) -> Option<DetectedServer>
     };
     let agent = loopback_agent();
     let fetch = |route: &str, limit: u64| -> Option<String> {
+        if Instant::now() + REQUEST_TIMEOUT > deadline {
+            return None;
+        }
         let mut response = agent.get(format!("{root}{route}")).call().ok()?;
         engine::read_decoded_body(response.body_mut(), limit).ok()
     };
@@ -242,10 +292,19 @@ struct ModelEntry {
 /// `None` when the body is not a model list.
 pub fn parse_model_list(body: &str) -> Option<(Vec<String>, Vec<String>)> {
     let list: ModelList = serde_json::from_str(body).ok()?;
-    let rows = match (list.object.as_deref(), list.data) {
-        (_, Some(rows)) => rows,
+    let is_list = list.object.as_deref() == Some("list");
+    let rows = match list.data {
+        // Some servers omit `object`; a string id still marks a model list.
+        Some(rows)
+            if is_list
+                || rows
+                    .iter()
+                    .any(|row| row.id.as_ref().is_some_and(serde_json::Value::is_string)) =>
+        {
+            rows
+        }
         // Ollama answers `"data": null` with no models pulled.
-        (Some("list"), None) => Vec::new(),
+        None if is_list => Vec::new(),
         _ => return None,
     };
     let mut seen = BTreeSet::new();
@@ -643,6 +702,49 @@ mod tests {
             parse_model_list("{\"object\":\"list\",\"data\":null}"),
             Some((vec![], vec![]))
         );
+        // A generic `data` array without model ids is not a model list.
+        assert_eq!(parse_model_list("{\"data\":[{\"name\":\"x\"}]}"), None);
+        assert_eq!(parse_model_list("{\"data\":[]}"), None);
+        assert!(parse_model_list("{\"data\":[{\"id\":\"m\"}]}").is_some());
+    }
+
+    #[test]
+    fn an_answer_too_large_for_one_control_frame_is_cut_to_fit() {
+        let servers: Vec<DetectedServer> = (0..DETECTED_SERVERS_MAX)
+            .map(|index| DetectedServer {
+                base_url: format!("http://127.0.0.1:{}/v1", 8000 + index),
+                engine: Engine::Vllm,
+                api: RuntimeApi::Openai,
+                models: (0..DETECTED_MODELS_MAX)
+                    .map(|model| format!("{model:03}{}", "m".repeat(253)))
+                    .collect(),
+                version: Some("0.11.0".into()),
+            })
+            .collect();
+        let frame = detected_frame("det-1".into(), servers);
+        let text = crate::protocol::encode_control(&frame).expect("fits one control frame");
+        assert!(text.len() <= crate::protocol::RELAY_JSON_CONTROL_MAX_BYTES);
+        let NodeFrame::RuntimeDetected { servers, .. } = frame else {
+            panic!("runtime.detected");
+        };
+        // Every server stays; their model lists are cut evenly.
+        assert_eq!(servers.len(), DETECTED_SERVERS_MAX);
+        let counts: BTreeSet<usize> = servers.iter().map(|s| s.models.len()).collect();
+        assert!(counts.len() <= 2 && counts.iter().all(|count| *count > 0));
+    }
+
+    #[test]
+    fn the_scan_slot_is_released_even_when_a_scan_panics() {
+        let slot = ScanSlot::claim().expect("free");
+        assert!(ScanSlot::claim().is_none());
+        let result = std::thread::spawn(move || {
+            let _slot = slot;
+            panic!("a probe panicked");
+        })
+        .join();
+        assert!(result.is_err());
+        let again = ScanSlot::claim();
+        assert!(again.is_some());
     }
 
     #[test]
@@ -721,6 +823,14 @@ mod tests {
                         v6: false
                     }
                 ),
+                // `::ffff:127.0.0.1` in `tcp6` is an IPv4 loopback listener.
+                (
+                    8002,
+                    Listening {
+                        v4: true,
+                        v6: false
+                    }
+                ),
                 (
                     8080,
                     Listening {
@@ -773,6 +883,92 @@ mod tests {
         assert_eq!(&ports[..WELL_KNOWN_PORTS.len()], WELL_KNOWN_PORTS);
     }
 
+    /// A loopback server answering each HTTP request with `respond`. The
+    /// connect check's empty connection is skipped.
+    fn serve(respond: impl Fn(&str, &mut std::net::TcpStream) + Send + 'static) -> u16 {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buffer = [0u8; 4096];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                if read > 0 {
+                    respond(&String::from_utf8_lossy(&buffer[..read]), &mut stream);
+                }
+            }
+        });
+        port
+    }
+
+    const V4: Option<Listening> = Some(Listening {
+        v4: true,
+        v6: false,
+    });
+
+    #[test]
+    fn redirects_are_not_followed() {
+        use std::io::Write;
+        let hit = Arc::new(AtomicBool::new(false));
+        let target = {
+            let hit = Arc::clone(&hit);
+            serve(move |_, stream| {
+                hit.store(true, Ordering::SeqCst);
+                let body = VLLM_MODELS;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            })
+        };
+        let port = serve(move |_, stream| {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{target}/v1/models\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+        });
+        assert_eq!(probe_port(port, V4, Instant::now() + SCAN_BUDGET), None);
+        assert!(!hit.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_slow_drip_body_is_cut_off_by_the_request_timeout() {
+        use std::io::Write;
+        let port = serve(|_, stream| {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100000\r\n\r\n{{\"object\":\"list\",\"data\":["
+            );
+            for _ in 0..200 {
+                if stream.write_all(b" ").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let started = Instant::now();
+        assert_eq!(probe_port(port, V4, Instant::now() + SCAN_BUDGET), None);
+        // `v1/models` and the `info` fallback, 1.5 s each at most.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn no_request_starts_past_the_scan_deadline() {
+        let asked = Arc::new(AtomicBool::new(false));
+        let port = {
+            let asked = Arc::clone(&asked);
+            serve(move |_, _| asked.store(true, Ordering::SeqCst))
+        };
+        assert_eq!(probe_port(port, V4, Instant::now()), None);
+        assert!(!asked.load(Ordering::SeqCst));
+    }
+
     #[test]
     fn a_live_loopback_server_is_detected_without_credentials() {
         use std::io::{Read, Write};
@@ -812,6 +1008,7 @@ mod tests {
                 v4: true,
                 v6: false,
             }),
+            Instant::now() + SCAN_BUDGET,
         )
         .expect("detected");
         assert_eq!(server.base_url, format!("http://127.0.0.1:{port}/v1"));
