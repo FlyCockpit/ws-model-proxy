@@ -131,11 +131,19 @@ export const env = createEnv({
     // grant listing/revocation stays available while disabled.
     WMP_MCP_ENABLED: strictBooleanFlag(true),
     // The full 40-character commit /install.sh builds the CLI from (`cargo install --rev`:
-    // cargo fetches only a full hash directly); unset follows the
-    // preview branch.
+    // cargo fetches only a full hash directly). Set, /install.sh always builds from source;
+    // unset, it installs this version's release binary.
     WMP_CLI_SOURCE_REV: z
       .string()
       .regex(/^[0-9a-f]{40}$/)
+      .optional(),
+    // Where /install.sh downloads wsmp-<target>.tar.xz and sha256.sum from; unset, the GitHub
+    // Release of this server's version. https only, and a plain URL: the script embeds it
+    // in single quotes, so quotes, spaces and shell metacharacters are refused.
+    WMP_CLI_RELEASE_BASE_URL: z
+      .string()
+      .regex(/^https:\/\/[A-Za-z0-9.-]+(:[0-9]{1,5})?(\/[A-Za-z0-9._~%+@-]+)*\/?$/)
+      .transform((url) => url.replace(/\/+$/, ""))
       .optional(),
     // Agent tokens default to 90 days when expiresAt is omitted.
     // This flag still allows an explicit no-expiry (null) mint. Turn it off

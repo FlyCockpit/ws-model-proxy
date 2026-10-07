@@ -16,7 +16,8 @@ vi.mock("@ws-model-proxy/api/nodes/enroll-exchange", () => ({
 }));
 vi.mock("./client-ip.js", () => ({ resolveClientIp: () => "203.0.113.9" }));
 
-const { installScript, registerNodeHttpRoutes, CLI_SOURCE } = await import("./node-http.js");
+const { CLI_REPOSITORY, SERVER_VERSION, cliInstallSource, installScript, registerNodeHttpRoutes } =
+  await import("./node-http.js");
 
 const CODE = `wsmp_enr_${"A".repeat(26)}`;
 const KEY = `B${"A".repeat(85)}A`;
@@ -73,19 +74,21 @@ describe("node bootstrap HTTP", () => {
     });
   });
 
-  it("serves an installer that builds the CLI from the configured source", async () => {
+  it("serves an installer for this version's release binaries", async () => {
     const res = await app().hono.request("/install.sh");
     expect(res.headers.get("content-type")).toContain("shellscript");
+    expect(res.headers.get("cache-control")).toBe("no-store");
     const text = await res.text();
-    expect(text).toBe(installScript("https://proxy.example.com"));
-    expect(text).toContain(
-      `cargo install --git '${CLI_SOURCE.repository}' --branch '${CLI_SOURCE.ref}' --locked --force wsmp`,
+    // Neither WMP_CLI_SOURCE_REV nor WMP_CLI_RELEASE_BASE_URL is set in this env mock.
+    expect(text).toBe(
+      installScript("https://proxy.example.com", cliInstallSource(undefined, undefined)),
     );
     expect(text.startsWith("#!/bin/sh\n")).toBe(true);
-    // A deployment pins the exact commit (WMP_CLI_SOURCE_REV) instead of following the branch.
-    const pinned = installScript("https://proxy.example.com", "a".repeat(40));
-    expect(pinned).toContain(`--rev '${"a".repeat(40)}' --locked`);
-    expect(pinned).not.toContain("--branch");
+    expect(text).toContain(
+      `WSMP_RELEASE_URL='${CLI_REPOSITORY}/releases/download/v${SERVER_VERSION}'`,
+    );
+    // A download cut short runs nothing: the only top-level command is the last line.
+    expect(text.endsWith('\nmain "$@"\n')).toBe(true);
   });
 
   it("enrolls and closes the sessions of credentials the exchange revoked", async () => {

@@ -3,8 +3,8 @@
  *
  * - `GET /.well-known/wsmp`: what `wsmp login <url>` checks and pins (canonical origin,
  *   protocol, where to enroll).
- * - `GET /install.sh`: installs the `wsmp` CLI. Until signed release builds of 0.4.0 exist it
- *   builds the CLI from source with cargo (the repository and ref below).
+ * - `GET /install.sh`: installs the `wsmp` CLI: this version's checksummed release binary, or a
+ *   cargo source build where none fits the node or a commit is pinned (`installScript`).
  * - `POST /api/node/enroll`: exchanges an enrollment code for the node credential
  *   (`@ws-model-proxy/api/nodes/enroll-exchange`). Unauthenticated by design (the code is the
  *   credential): no cookies, no CSRF, rate-limited per client IP before any lookup and per code
@@ -34,18 +34,53 @@ import {
   refundEnrollmentExchange,
 } from "./rate-limit.js";
 
-/**
- * Where `install.sh` builds the CLI from until release builds of 0.4.0 are published. A
- * deployment pins an exact commit with `WMP_CLI_SOURCE_REV` (recommended: a branch moves);
- * without it the installer follows the branch.
- */
-export const CLI_SOURCE = {
-  repository: "https://github.com/FlyCockpit/ws-model-proxy",
-  ref: "redesign-0.4.0",
-} as const;
+/** The server and CLI version this build ships; `/install.sh` installs the matching wsmp. */
+export const SERVER_VERSION = "0.4.0";
 
-function cargoSourceArgs(rev: string | undefined): string {
-  return rev ? `--rev '${rev}'` : `--branch '${CLI_SOURCE.ref}'`;
+/** Where the CLI's source and GitHub Releases live. */
+export const CLI_REPOSITORY = "https://github.com/FlyCockpit/ws-model-proxy";
+
+/**
+ * Release targets `/install.sh` downloads (`wsmp-<target>.tar.xz`, checksummed in `sha256.sum`;
+ * apps/cli/dist-workspace.toml builds them). The Linux builds link glibc, built on Ubuntu 22.04
+ * runners, so they need at least {@link CLI_RELEASE_MIN_GLIBC}.
+ */
+export const CLI_RELEASE_TARGETS = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+] as const;
+export const CLI_RELEASE_MIN_GLIBC = { major: 2, minor: 34 } as const;
+
+/** The GitHub Release of this server's version. */
+export function defaultCliReleaseBaseUrl(): string {
+  return `${CLI_REPOSITORY}/releases/download/v${SERVER_VERSION}`;
+}
+
+/**
+ * What `/install.sh` installs. `release`: the checksummed binary for the node's platform from
+ * `baseUrl`, or a cargo build of this version's tag where no binary fits. `source`: always a
+ * cargo build of the pinned commit (`WMP_CLI_SOURCE_REV`).
+ */
+export type CliInstallSource =
+  | { kind: "release"; baseUrl: string }
+  | { kind: "source"; rev: string };
+
+export function cliInstallSource(
+  rev: string | undefined,
+  releaseBaseUrl: string | undefined,
+): CliInstallSource {
+  if (rev) return { kind: "source", rev };
+  return { kind: "release", baseUrl: releaseBaseUrl ?? defaultCliReleaseBaseUrl() };
+}
+
+// Values are embedded in single quotes; refuse anything that could leave them.
+function shellQuoted(value: string): string {
+  if (!/^[A-Za-z0-9._~%+@:/=-]*$/.test(value)) {
+    throw new Error(`install.sh: refusing to embed ${JSON.stringify(value)}`);
+  }
+  return `'${value}'`;
 }
 
 export const NODE_ENROLL_PATH = "/api/node/enroll";
@@ -55,20 +90,171 @@ function canonicalOrigin(): string {
   return new URL(env.BETTER_AUTH_URL).origin;
 }
 
-/** The POSIX installer: checks for cargo, then builds and installs `wsmp` from source. */
-export function installScript(origin: string, rev: string | undefined = undefined): string {
+/**
+ * The POSIX installer (`curl -fsSL <origin>/install.sh | sh`). Everything runs from `main` on the
+ * last line, so a download cut short runs nothing. Both paths install into `$CARGO_HOME/bin`
+ * (`~/.cargo/bin`), where cargo puts a source build, so the two never leave two copies.
+ * A release binary is installed only after its SHA-256 matches `sha256.sum` (fail closed: no
+ * checksum file, no entry, no hashing tool or a mismatch stops the install).
+ */
+export function installScript(origin: string, source: CliInstallSource): string {
+  const releaseUrl = source.kind === "release" ? source.baseUrl.replace(/\/+$/, "") : "";
+  const sourceArgs =
+    source.kind === "source"
+      ? `--rev ${shellQuoted(source.rev)}`
+      : `--tag ${shellQuoted(`v${SERVER_VERSION}`)}`;
+  const summary =
+    source.kind === "source"
+      ? `# Builds wsmp from source with cargo at commit ${source.rev} (WMP_CLI_SOURCE_REV).`
+      : `# Installs the checksummed wsmp ${SERVER_VERSION} release binary for this machine, or builds\n# v${SERVER_VERSION} from source with cargo where no binary fits.`;
   return `#!/bin/sh
 # WS Model Proxy node CLI (wsmp) installer for ${origin}
-# Builds wsmp ${CLI_SOURCE.ref} from source with cargo (release builds of 0.4.0 are not published yet).
+${summary}
 set -eu
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "wsmp: cargo is not installed. Install Rust from https://rustup.rs, then run this again." >&2
-  exit 1
-fi
-echo "wsmp: building ${rev ?? CLI_SOURCE.ref} from ${CLI_SOURCE.repository} (this takes a few minutes)..."
-cargo install --git '${CLI_SOURCE.repository}' ${cargoSourceArgs(rev)} --locked --force wsmp
-echo "wsmp: installed $(command -v wsmp || echo "$HOME/.cargo/bin/wsmp")."
-echo "wsmp: if 'wsmp' is not found, add \\"$HOME/.cargo/bin\\" to your PATH."
+
+WSMP_VERSION=${shellQuoted(SERVER_VERSION)}
+WSMP_RELEASE_URL=${shellQuoted(releaseUrl)}
+WSMP_REPOSITORY=${shellQuoted(CLI_REPOSITORY)}
+
+say() { printf 'wsmp: %s\\n' "$*"; }
+die() { printf 'wsmp: %s\\n' "$*" >&2; exit 1; }
+
+bin_dir() { printf '%s/bin' "\${CARGO_HOME:-$HOME/.cargo}"; }
+
+# The release target for this machine, or nothing when no release binary runs here.
+detect_target() {
+  arch=$(uname -m)
+  case "$arch" in
+    x86_64 | amd64) arch=x86_64 ;;
+    aarch64 | arm64) arch=aarch64 ;;
+    *) return 0 ;;
+  esac
+  case "$(uname -s)" in
+    Linux)
+      # The Linux builds link glibc ${CLI_RELEASE_MIN_GLIBC.major}.${CLI_RELEASE_MIN_GLIBC.minor} or newer; musl and older glibc build from source.
+      glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null || true)
+      case "$glibc" in
+        "glibc "*) ;;
+        *) return 0 ;;
+      esac
+      version=\${glibc#glibc }
+      major=\${version%%.*}
+      minor=\${version#*.}
+      minor=\${minor%%.*}
+      case "$major.$minor" in
+        *[!0-9.]* | .* | *.) return 0 ;;
+      esac
+      if [ "$major" -lt ${CLI_RELEASE_MIN_GLIBC.major} ] || { [ "$major" -eq ${CLI_RELEASE_MIN_GLIBC.major} ] && [ "$minor" -lt ${CLI_RELEASE_MIN_GLIBC.minor} ]; }; then
+        return 0
+      fi
+      printf '%s-unknown-linux-gnu' "$arch"
+      ;;
+    Darwin)
+      # A Rosetta shell reports x86_64 on Apple silicon: install the native build.
+      if [ "$arch" = x86_64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ]; then
+        arch=aarch64
+      fi
+      printf '%s-apple-darwin' "$arch"
+      ;;
+  esac
+}
+
+# curl only: wget cannot refuse a redirect away from https for a single download.
+fetch() {
+  curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$2" "$1"
+}
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1"
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1"
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 -r "$1"
+  else
+    return 1
+  fi
+}
+
+install_release() {
+  target=$1
+  archive="wsmp-$target.tar.xz"
+  command -v curl >/dev/null 2>&1 || die "curl is needed to download wsmp."
+  dir=$(bin_dir)
+  mkdir -p "$dir"
+  # Staged beside the install directory, not in /tmp: the binary is test-run before it is
+  # installed (a noexec /tmp would refuse that), and the final rename stays on one filesystem.
+  tmp=$(mktemp -d "$dir/.wsmp-install.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  say "downloading wsmp $WSMP_VERSION for $target from $WSMP_RELEASE_URL..."
+  fetch "$WSMP_RELEASE_URL/sha256.sum" "$tmp/sha256.sum" ||
+    die "could not download $WSMP_RELEASE_URL/sha256.sum (is wsmp $WSMP_VERSION published there?)."
+  fetch "$WSMP_RELEASE_URL/$archive" "$tmp/$archive" ||
+    die "could not download $WSMP_RELEASE_URL/$archive."
+  expected=$(awk -v f="$archive" '{ sub(/\\r$/, "") } $2 == f || $2 == "*" f { print tolower($1); exit }' "$tmp/sha256.sum")
+  case "$expected" in
+    "" | *[!0-9a-f]*) die "sha256.sum has no checksum for $archive; not installing it." ;;
+  esac
+  [ \${#expected} -eq 64 ] || die "sha256.sum has no checksum for $archive; not installing it."
+  actual=$(sha256_of "$tmp/$archive" | awk '{ print tolower($1) }')
+  [ -n "$actual" ] ||
+    die "no SHA-256 tool (sha256sum, shasum or openssl) found; not installing an unverified binary."
+  [ "$actual" = "$expected" ] ||
+    die "checksum mismatch for $archive (expected $expected, got $actual); not installing it."
+  say "checksum verified ($expected)."
+  (cd "$tmp" && tar -xJf "$archive") ||
+    die "could not unpack $archive (tar needs xz: install xz-utils)."
+  binary="$tmp/wsmp-$target/wsmp"
+  [ -f "$binary" ] && [ ! -L "$binary" ] || die "$archive does not contain wsmp-$target/wsmp."
+  "$binary" --version >/dev/null 2>&1 ||
+    die "the downloaded wsmp does not run on this machine; install Rust 1.88+ and run: cargo install --git $WSMP_REPOSITORY --tag v$WSMP_VERSION --locked wsmp"
+  [ ! -d "$dir/wsmp" ] || die "$dir/wsmp is a directory; remove it, then run this again."
+  # Rename over the old binary: a running wsmp keeps its old file.
+  chmod 755 "$binary" && mv -f "$binary" "$dir/wsmp" || die "could not install into $dir."
+  installed="$dir/wsmp"
+}
+
+install_source() {
+  command -v cargo >/dev/null 2>&1 ||
+    die "cargo is not installed. Install Rust 1.88 or newer from https://rustup.rs and a C compiler (cc), then run this again."
+  say "building wsmp from $WSMP_REPOSITORY ($*) with cargo; this takes a few minutes..."
+  cargo install --git "$WSMP_REPOSITORY" "$@" --locked --force wsmp
+  installed="\${CARGO_INSTALL_ROOT:-\${CARGO_HOME:-$HOME/.cargo}}/bin/wsmp"
+}
+
+finish() {
+  dir=\${installed%/wsmp}
+  say "installed $installed."
+  case ":$PATH:" in
+    *":$dir:"*) ;;
+    *) say "$dir is not on your PATH: run \\"$dir/wsmp\\", or add it to PATH." ;;
+  esac
+  found=$(command -v wsmp 2>/dev/null || true)
+  if [ -n "$found" ] && [ "$found" != "$installed" ]; then
+    say "warning: $found comes first on your PATH (an older wsmp, for example from Homebrew); remove it."
+  fi
+}
+
+main() {
+  installed=""
+  if [ -z "$WSMP_RELEASE_URL" ]; then
+    install_source ${sourceArgs}
+  else
+    target=$(detect_target)
+    if [ -n "$target" ]; then
+      install_release "$target"
+    else
+      say "no wsmp release binary fits this machine ($(uname -s) $(uname -m); Linux needs glibc ${CLI_RELEASE_MIN_GLIBC.major}.${CLI_RELEASE_MIN_GLIBC.minor} or newer); building from source instead."
+      install_source ${sourceArgs}
+    fi
+  fi
+  finish
+}
+
+main "$@"
 `;
 }
 
@@ -142,7 +328,7 @@ export function registerNodeHttpRoutes<E extends Env>(
   app.get("/.well-known/wsmp", (c) =>
     c.json(
       wellKnownWsmpSchema.parse({
-        serverVersion: "0.4.0",
+        serverVersion: SERVER_VERSION,
         protocolVersion: RELAY_PROTOCOL,
         origin: canonicalOrigin(),
         installScript: "/install.sh",
@@ -151,10 +337,17 @@ export function registerNodeHttpRoutes<E extends Env>(
     ),
   );
   app.get("/install.sh", (c) =>
-    c.body(installScript(canonicalOrigin(), env.WMP_CLI_SOURCE_REV), 200, {
-      "content-type": "text/x-shellscript; charset=utf-8",
-      "cache-control": "no-store",
-    }),
+    c.body(
+      installScript(
+        canonicalOrigin(),
+        cliInstallSource(env.WMP_CLI_SOURCE_REV, env.WMP_CLI_RELEASE_BASE_URL),
+      ),
+      200,
+      {
+        "content-type": "text/x-shellscript; charset=utf-8",
+        "cache-control": "no-store",
+      },
+    ),
   );
   app.use(
     NODE_ENROLL_PATH,
