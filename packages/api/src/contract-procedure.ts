@@ -1,10 +1,10 @@
 /**
  * Binds a procedure contract (`contracts/*.ts`) to an oRPC procedure: the access check comes
  * from the contract's access tag, and the input/output validators are the contract's zod.
- * A lane implements a procedure by replacing `stub(c.x)` with
- * `contractProcedure(c.x).handler(...)`; it never restates the shapes.
+ * A router implements a procedure with `contractProcedure(c.x).handler(...)`; it never restates
+ * the shapes.
  */
-import { ORPCError, os } from "@orpc/server";
+import { os } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
 import type { z } from "zod";
 import type { Context } from "./context";
@@ -41,17 +41,4 @@ export function publicContractProcedure<Input extends z.ZodType, Output extends 
     throw new Error("publicContractProcedure binds only public contracts");
   }
   return o.input(contract.input).output(contract.output);
-}
-
-export const NOT_IMPLEMENTED_MESSAGE = "Not implemented yet.";
-
-function notImplemented(): never {
-  throw new ORPCError("NOT_IMPLEMENTED", { message: NOT_IMPLEMENTED_MESSAGE });
-}
-
-/** S0c: the procedure exists with its contract and access check; the lane implements it. */
-export function stub<Input extends z.ZodType, Output extends z.ZodType>(
-  contract: ProcedureContract<Input, Output>,
-) {
-  return contractProcedure(contract).handler(notImplemented);
 }
