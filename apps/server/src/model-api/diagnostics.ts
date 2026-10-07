@@ -316,5 +316,5 @@ async function poolMemberTest({
   }
 }
 
-/** Generic stable kind substituted for unknown provider error types (G2). */
+/** Stable kind the model test reports for a provider error type that is not a stable code (G2). */
 export const GENERIC_PROVIDER_ERROR_TYPE = "provider_error";

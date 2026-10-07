@@ -94,7 +94,6 @@ const memoryAuth = betterAuth({
     session: [],
     user: [],
     account: [],
-    deviceCode: [],
   }),
   plugins: [],
 });
