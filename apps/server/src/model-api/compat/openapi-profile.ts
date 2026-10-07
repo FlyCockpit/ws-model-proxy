@@ -13,6 +13,10 @@ import {
 const MAX_DEPTH = 12;
 const MAX_NODES = 20_000;
 const MAX_ENUM_VALUES = 64;
+/** An object with more keys is read as open (it can never cause a drop). */
+const MAX_PROPERTIES = 256;
+/** A larger profile is not stored at all. */
+const MAX_PROFILE_JSON_CHARS = 512 * 1024;
 
 type Json = Record<string, unknown>;
 
@@ -50,7 +54,7 @@ function isAny(node: AcceptedNode): boolean {
 function union(nodes: AcceptedNode[]): AcceptedNode {
   if (nodes.length === 0 || nodes.some(isAny)) return ANY;
   const out: AcceptedNode = {};
-  const props: Record<string, AcceptedNode[]> = {};
+  const props = new Map<string, AcceptedNode[]>();
   const items: AcceptedNode[] = [];
   const values = new Set<string>();
   let hasProps = false;
@@ -61,9 +65,9 @@ function union(nodes: AcceptedNode[]): AcceptedNode {
     if (node.p) {
       hasProps = true;
       for (const [key, child] of Object.entries(node.p)) {
-        const list = props[key] ?? [];
+        const list = props.get(key) ?? [];
         list.push(child);
-        props[key] = list;
+        props.set(key, list);
       }
     }
     if (node.i) items.push(node.i);
@@ -72,7 +76,7 @@ function union(nodes: AcceptedNode[]): AcceptedNode {
       for (const value of node.e) values.add(value);
     } else if (node.s) scalarWithoutEnum = true;
   }
-  if (hasProps) out.p = Object.fromEntries(Object.entries(props).map(([k, v]) => [k, union(v)]));
+  if (hasProps) out.p = Object.fromEntries([...props].map(([k, v]) => [k, union(v)]));
   if (items.length > 0) out.i = union(items);
   // A variant that is a plain string accepts every value.
   if (hasEnum && !scalarWithoutEnum && values.size <= MAX_ENUM_VALUES) out.e = [...values].sort();
@@ -134,6 +138,7 @@ function walkOwn(
   if (enumValues && enumValues.length > 0 && enumValues.length <= MAX_ENUM_VALUES)
     return { e: [...new Set(enumValues)].sort() };
   const properties = schema.properties;
+  if (isObject(properties) && Object.keys(properties).length > MAX_PROPERTIES) return ANY;
   if (isObject(properties)) {
     const node: AcceptedNode = {
       p: Object.fromEntries(
@@ -187,7 +192,9 @@ export function acceptedProfileFromOpenApi(document: unknown): AcceptedProfile |
     // Only an object with known keys can tell unknown fields apart.
     if (node.p) endpoints[endpoint] = node;
   }
-  return Object.keys(endpoints).length > 0 ? { v: 1, endpoints } : null;
+  if (Object.keys(endpoints).length === 0) return null;
+  const profile: AcceptedProfile = { v: 1, endpoints };
+  return JSON.stringify(profile).length <= MAX_PROFILE_JSON_CHARS ? profile : null;
 }
 
 /** `info.title` and `info.version` (bounded), for the engine fingerprint. */

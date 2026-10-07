@@ -22,6 +22,8 @@ const PROBES_PER_TICK = 8;
 const PROBE_TIMEOUT_MS = 10_000;
 const MAX_DESCRIPTION_BYTES = 4 * 1024 * 1024;
 const MAX_REMEMBERED = 10_000;
+/** A probe that failed (timeout, node reconnect) is tried again this many times in all. */
+const MAX_TRIES = 3;
 
 type ProbeManager = Parameters<typeof startRelayAttempt>[0]["manager"] & {
   getOnlineNodeIds(): Iterable<string>;
@@ -49,8 +51,9 @@ async function readyTargets(onlineNodeIds: Set<string>): Promise<ProbeTarget[]> 
       Runtime: { select: { kind: true, nodeId: true } },
       Ranks: { where: { rank: 0 }, select: { nodeId: true } },
     },
-    orderBy: { id: "asc" },
-    take: 1_000,
+    // The most recently ready first: a new incarnation is asked within a tick or two.
+    orderBy: [{ phaseChangedAt: "desc" }, { id: "asc" }],
+    take: 500,
   });
   return rows.flatMap((row) => {
     const nodeId = row.Runtime.kind === "ALWAYS_ON" ? row.Runtime.nodeId : row.Ranks[0]?.nodeId;
@@ -134,17 +137,31 @@ export async function probeEngineDescription(
  * Starts the periodic probe sweep (unref'd). Returns its stop, which waits for a running sweep.
  */
 export function startRequestProfileProbes(manager: ProbeManager): () => Promise<void> {
-  const probed = new Map<string, string>();
+  /** Per instance: the incarnation asked, and how many tries it took so far. */
+  const probed = new Map<string, { generation: string; tries: number; done: boolean }>();
   let running: Promise<void> | null = null;
+  let stopped = false;
   const sweep = async () => {
     const targets = await readyTargets(new Set(manager.getOnlineNodeIds()));
     const due = targets
-      .filter((target) => probed.get(target.instanceId) !== target.generation)
+      .filter((target) => {
+        const seen = probed.get(target.instanceId);
+        return (
+          !seen || seen.generation !== target.generation || (!seen.done && seen.tries < MAX_TRIES)
+        );
+      })
       .slice(0, PROBES_PER_TICK);
     for (const target of due) {
-      await probeEngineDescription(manager, target);
+      if (stopped) return;
+      const outcome = await probeEngineDescription(manager, target);
+      const seen = probed.get(target.instanceId);
+      const tries = seen?.generation === target.generation ? seen.tries + 1 : 1;
       if (probed.size >= MAX_REMEMBERED) probed.clear();
-      probed.set(target.instanceId, target.generation);
+      probed.set(target.instanceId, {
+        generation: target.generation,
+        tries,
+        done: outcome !== "failed",
+      });
     }
   };
   const tick = () => {
@@ -165,6 +182,7 @@ export function startRequestProfileProbes(manager: ProbeManager): () => Promise<
   const timer = setInterval(tick, PROBE_INTERVAL_MS);
   timer.unref();
   return async () => {
+    stopped = true;
     clearTimeout(first);
     clearInterval(timer);
     await running;

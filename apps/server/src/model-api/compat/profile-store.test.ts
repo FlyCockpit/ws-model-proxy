@@ -72,41 +72,28 @@ describe("request profile store", () => {
 
   it("keeps what was learned for the same engine and forgets it for another", async () => {
     db.runtimeRequestProfile.findFirst.mockResolvedValue({
-      id: "p",
       engineFingerprint: "e 1",
       learned,
     } as never);
     await store.saveDescribedProfile(key, { accepted, engineFingerprint: "e 1" });
-    expect(db.runtimeRequestProfile.update).toHaveBeenLastCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ learned, source: "OPENAPI" }) }),
-    );
+    const same = db.runtimeRequestProfile.upsert.mock.calls.at(-1)?.[0];
+    expect(same?.where).toEqual({ runtimeId_launchHash: { runtimeId: "r", launchHash: "h" } });
+    // Same engine: learning is never written back (nor overwritten).
+    expect(same?.update).not.toHaveProperty("learned");
+    expect(same?.update).toMatchObject({ source: "OPENAPI", engineFingerprint: "e 1" });
     await store.saveDescribedProfile(key, { accepted, engineFingerprint: "e 2" });
-    expect(db.runtimeRequestProfile.update).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({ learned: { v: 1, fixes: {}, stripHeaders: [] } }),
-      }),
-    );
+    expect(db.runtimeRequestProfile.upsert.mock.calls.at(-1)?.[0].update).toMatchObject({
+      engineFingerprint: "e 2",
+      learned: { v: 1, fixes: {}, stripHeaders: [] },
+    });
   });
 
-  it("forgets a described engine that no longer describes itself", async () => {
-    db.runtimeRequestProfile.findFirst.mockResolvedValue({
-      id: "p",
-      engineFingerprint: "e 1",
-    } as never);
-    await store.markProbedWithoutDescription(key);
-    expect(db.runtimeRequestProfile.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({ engineFingerprint: null, source: "LEARNED" }),
-      }),
-    );
-    db.runtimeRequestProfile.findFirst.mockResolvedValue({
-      id: "p",
-      engineFingerprint: null,
-    } as never);
+  it("an engine answering without a description keeps what was described", async () => {
     await store.markProbedWithoutDescription(key, new Date(5));
-    expect(db.runtimeRequestProfile.update).toHaveBeenLastCalledWith({
-      where: { id: "p" },
-      data: { probedAt: new Date(5) },
+    expect(db.runtimeRequestProfile.upsert).toHaveBeenCalledWith({
+      where: { runtimeId_launchHash: { runtimeId: "r", launchHash: "h" } },
+      create: { ...key, probedAt: new Date(5) },
+      update: { probedAt: new Date(5) },
     });
   });
 });

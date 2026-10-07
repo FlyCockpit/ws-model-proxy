@@ -13,7 +13,7 @@ import {
   readAcceptedProfile,
   readLearnedProfile,
 } from "@ws-model-proxy/api/lib/request-compat";
-import prisma, { Prisma } from "@ws-model-proxy/db";
+import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { withLearnedFix, withLearnedHeader } from "./runtime-compat.js";
 
 export type StoredRequestProfile = {
@@ -129,67 +129,44 @@ export function recordLearnedHeader(key: LaunchKey, name: string): Promise<void>
 
 /**
  * Stores what the engine's description says it accepts. Another fingerprint than the stored one
- * means another engine version answered: what was learned before is dropped.
+ * means another engine version answered: what was learned before is dropped; the same engine
+ * keeps it (and learning that lands meanwhile is never overwritten).
  */
 export async function saveDescribedProfile(
   key: LaunchKey,
   described: { accepted: AcceptedProfile; engineFingerprint: string },
   now = new Date(),
 ): Promise<void> {
+  const where = { runtimeId_launchHash: { runtimeId: key.runtimeId, launchHash: key.launchHash } };
   const row = await prisma.runtimeRequestProfile.findFirst({
     where: { runtimeId: key.runtimeId, launchHash: key.launchHash, userId: key.userId },
-    select: { id: true, engineFingerprint: true, learned: true },
+    select: { engineFingerprint: true, learned: true },
   });
   const sameEngine = row?.engineFingerprint === described.engineFingerprint;
-  const learned = sameEngine ? readLearnedProfile(row?.learned) : emptyLearnedProfile();
-  const data = {
+  const described_ = {
     source: "OPENAPI" as const,
     engineFingerprint: described.engineFingerprint,
     accepted: described.accepted as Prisma.InputJsonValue,
-    learned: learned as Prisma.InputJsonValue,
     probedAt: now,
   };
-  if (row) await prisma.runtimeRequestProfile.update({ where: { id: row.id }, data });
-  else
-    await prisma.runtimeRequestProfile.create({
-      data: { userId: key.userId, runtimeId: key.runtimeId, launchHash: key.launchHash, ...data },
-    });
-  remember(key, {
-    accepted: described.accepted,
-    learned,
-    engineFingerprint: described.engineFingerprint,
+  const empty = emptyLearnedProfile() as Prisma.InputJsonValue;
+  await prisma.runtimeRequestProfile.upsert({
+    where,
+    create: { ...key, ...described_, learned: empty },
+    update: row && !sameEngine ? { ...described_, learned: empty } : described_,
   });
+  cache.delete(cacheKey(key));
 }
 
 /**
- * Notes that the engine has no readable description, so it is not asked again until it
- * restarts. When it had one before, another engine answers now: everything is forgotten.
+ * Notes that the engine answered without a readable description, so it is not asked again until
+ * it restarts. What was described or learned before stays: one replica without a description
+ * must not wipe what another described.
  */
 export async function markProbedWithoutDescription(key: LaunchKey, now = new Date()) {
-  const row = await prisma.runtimeRequestProfile.findFirst({
-    where: { runtimeId: key.runtimeId, launchHash: key.launchHash, userId: key.userId },
-    select: { id: true, engineFingerprint: true },
+  await prisma.runtimeRequestProfile.upsert({
+    where: { runtimeId_launchHash: { runtimeId: key.runtimeId, launchHash: key.launchHash } },
+    create: { ...key, probedAt: now },
+    update: { probedAt: now },
   });
-  if (!row) {
-    await prisma.runtimeRequestProfile
-      .create({ data: { ...key, probedAt: now } })
-      .catch(() => undefined);
-    return;
-  }
-  const changedEngine = row.engineFingerprint !== null;
-  await prisma.runtimeRequestProfile.update({
-    where: { id: row.id },
-    data: {
-      probedAt: now,
-      ...(changedEngine
-        ? {
-            source: "LEARNED" as const,
-            engineFingerprint: null,
-            accepted: Prisma.DbNull,
-            learned: emptyLearnedProfile() as Prisma.InputJsonValue,
-          }
-        : {}),
-    },
-  });
-  if (changedEngine) cache.delete(cacheKey(key));
 }
