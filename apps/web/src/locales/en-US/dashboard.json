@@ -1038,6 +1038,7 @@
       "definition_frozen": "The node holds a frozen definition of this runtime.",
       "definition_missing": "The node does not hold this definition yet.",
       "launch_change_on_relay_only": "This node is Relay only, so its always-on definition is frozen. Change it on the node or raise trust there.",
+      "launch_change_on_node_origin": "This runtime was added on its node, so its address and definition are changed there (wsmp runtime add). Limits and advanced settings can be changed here.",
       "no_frozen_peer_set": "This node has no frozen peer set.",
       "instances_running": "Stop the running instances first.",
       "pinned_by_profile": "A profile pins this runtime. Remove it from the profile first.",

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { runtimeLaunchHash } from "@ws-model-proxy/api/lib/runtime-launch-hash";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 // The runtime lifecycle engine on real PostgreSQL: the graph-write fences, the step/claim/
@@ -33,6 +34,9 @@ integration("runtime lifecycle (PostgreSQL)", () => {
   /** A service runtime whose start a person runs in an operator terminal. */
   let operatorRuntimeId = "";
   let operatorVersionId = "";
+  /** A service whose stop a person runs in an operator terminal. */
+  let stopperRuntimeId = "";
+  let stopperVersionId = "";
   const sent: Job[] = [];
   const session = { connectionGeneration: 1, trust: "full" as "full" | "relay", online: true };
   /** The fake relay's operator-terminal side. */
@@ -153,6 +157,45 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       where: { id: operatorRuntimeId },
       data: { currentVersionId: operatorVersionId },
     });
+    // A service whose stop a person runs in an operator terminal (its start is automatic).
+    const stopperSpec = {
+      ...spec,
+      launch: {
+        ...spec.launch,
+        management: "service",
+        commands: [
+          {
+            start: "systemctl start llm --port {{port}}",
+            stop: "sudo systemctl stop llm",
+            status: "systemctl is-active llm",
+            interactive: { stop: true },
+          },
+        ],
+      },
+    };
+    const stopperRuntime = await db.runtime.create({
+      data: { userId, slug: `lcs-${suffix}`, name: "LCS", kind: "STARTABLE", origin: "SERVER" },
+    });
+    stopperRuntimeId = stopperRuntime.id;
+    const stopperVersion = await db.runtimeVersion.create({
+      data: {
+        runtimeId: stopperRuntimeId,
+        version: 1,
+        editor: "USER",
+        editorUserId: userId,
+        contentHash: hex(`content-stop-${suffix}`),
+        launchHash: hex(`launch-stop-${suffix}`),
+        spec: stopperSpec,
+        api: "OPENAI",
+        engine: "VLLM",
+        modelType: "LLM",
+      },
+    });
+    stopperVersionId = stopperVersion.id;
+    await db.runtime.update({
+      where: { id: stopperRuntimeId },
+      data: { currentVersionId: stopperVersionId },
+    });
   });
 
   afterAll(async () => {
@@ -211,7 +254,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
   async function startInstance(
     port: number,
     startedBy: "USER" | "AGENT" = "USER",
-    which: "plain" | "operator" = "plain",
+    which: "plain" | "operator" | "stopper" = "plain",
   ) {
     const db = m.fixture;
     const operation = await db.runtimeOperation.create({
@@ -227,7 +270,11 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     const id = `c${hex(`${suffix}-${port}`).slice(0, 23)}`;
     const handle = `i-${id.slice(0, 12)}`;
     const [instanceRuntime, instanceVersion] =
-      which === "operator" ? [operatorRuntimeId, operatorVersionId] : [runtimeId, versionId];
+      which === "operator"
+        ? [operatorRuntimeId, operatorVersionId]
+        : which === "stopper"
+          ? [stopperRuntimeId, stopperVersionId]
+          : [runtimeId, versionId];
     await db.runtimeInstance.create({
       data: {
         id,
@@ -508,10 +555,17 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       orderBy: { createdAt: "desc" },
     });
 
+  /** What `markInstancesStopping` writes. */
   const stopInstance = (id: string) =>
     m.fixture.runtimeInstance.update({
       where: { id },
-      data: { desiredState: "STOPPED", phase: "STOPPING", phaseReason: "stop_requested" },
+      data: {
+        desiredState: "STOPPED",
+        phase: "STOPPING",
+        phaseReason: "stop_requested",
+        needsOperator: null,
+        needsOperatorSince: null,
+      },
     });
 
   it("runs an interactive start in an operator terminal a person answers", async () => {
@@ -741,21 +795,280 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     expect(inst.needsOperator).toBeNull();
   });
 
-  it("opens no terminal for a banned owner", async () => {
+  // ── Inactive (banned or deleting) owners ──
+
+  const ban = (until: Date | null) =>
+    m.fixture.user.update({ where: { id: userId }, data: { banned: true, banExpires: until } });
+  const unban = () =>
+    m.fixture.user.update({ where: { id: userId }, data: { banned: false, banExpires: null } });
+  const markDeleting = () =>
+    m.fixture.user.update({
+      where: { id: userId },
+      data: { deletionRequestedAt: new Date() },
+    });
+  /** Only the deletion subsystem may clear the marker (user_deletion_marker_guard). */
+  const clearDeleting = () =>
+    m.fixture.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT set_config('wsmp.user_deletion_writer', 'on', true)`;
+      await tx.user.update({ where: { id: userId }, data: { deletionRequestedAt: null } });
+    });
+
+  it("cancels a banned owner's held interactive start: no terminal, nothing sent", async () => {
     const lc = await engine();
     const id = await startInstance(30_207, "USER", "operator");
-    await m.fixture.user.update({ where: { id: userId }, data: { banned: true } });
+    await ban(null);
     try {
       const before = sent.length;
       await lc.runOnce();
       expect(sent.slice(before).some((job) => job.instanceId === id)).toBe(false);
-      expect((await step(id, "START")).state).toBe("PENDING");
+      const start = await step(id, "START");
+      expect(start.state).toBe("CANCELLED");
+      expect(start.errorCode).toBe("owner_inactive");
+      // The start never ran: the claim is released and the interactive start waits for a
+      // person's restart.
+      const inst = await instance(id);
+      expect(inst.phase).toBe("STOPPED");
+      expect(inst.Ranks[0]?.claim).toBe("RELEASED");
+      expect(inst.needsOperator).toBe("RESTART");
     } finally {
-      await m.fixture.user.update({ where: { id: userId }, data: { banned: false } });
+      await unban();
     }
     await stopInstance(id);
     await lc.runOnce();
     expect((await instance(id)).phase).toBe("STOPPED");
+  });
+
+  it("closes a deleting owner's open start terminal; the plain stop still goes out", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_208, "USER", "operator");
+    await lc.runOnce();
+    const start = lastJob(id, "start");
+    await progress(lc, start, "awaiting_operator");
+    await markDeleting();
+    try {
+      operatorRelay.closed.length = 0;
+      await lc.runOnce();
+      const row = await step(id, "START");
+      expect(operatorRelay.closed).toContain(row.id);
+      expect(row.state).toBe("FAILED");
+      expect(row.errorCode).toBe("owner_inactive");
+      // The screen was up: a person may have pressed Enter, so the rank needs a proven stop.
+      expect(row.attempts).toBe(1);
+      expect(row.operatorTerminalId).toBeNull();
+      const stop = lastJob(id, "stop");
+      expect(stop.operator).toBeUndefined();
+      await answer(lc, stop, "succeeded", { stopped: true });
+      const inst = await instance(id);
+      expect(inst.phase).toBe("STOPPED");
+      expect(inst.Ranks[0]?.claim).toBe("RELEASED");
+    } finally {
+      await clearDeleting();
+    }
+  });
+
+  it("never starts an inactive owner's instance; a stop still settles it", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_209);
+    await ban(new Date(Date.now() + 3_600_000));
+    try {
+      const before = sent.length;
+      await lc.runOnce();
+      await lc.runOnce();
+      expect(sent.slice(before).some((job) => job.instanceId === id)).toBe(false);
+      expect((await step(id, "START")).state).toBe("PENDING");
+      expect((await instance(id)).phase).toBe("STARTING");
+      await stopInstance(id);
+      await lc.runOnce();
+      const inst = await instance(id);
+      expect(inst.phase).toBe("STOPPED");
+      expect(inst.Ranks[0]?.claim).toBe("RELEASED");
+    } finally {
+      await unban();
+    }
+  });
+
+  it("sends an inactive owner's ready instance no health probe and never restarts it", async () => {
+    const lc = await engine();
+    const id = await ready(lc, 30_218);
+    await ban(null);
+    try {
+      await m.fixture.runtimeInstance.update({
+        where: { id },
+        data: { lastHealthAt: new Date(Date.now() - 60_000) },
+      });
+      const before = sent.length;
+      await lc.runOnce();
+      expect(sent.slice(before).some((job) => job.instanceId === id)).toBe(false);
+      // Crashed (the node no longer runs it): the stop goes out, the restart never does.
+      await m.fixture.instanceStep.updateMany({
+        where: { instanceId: id, phase: "HEALTH", state: "PENDING" },
+        data: { state: "CANCELLED" },
+      });
+      await lc.runtimeInventory(ref(), { snapshotId: "s-ban", alwaysOn: [], instances: [] });
+      await lc.runOnce();
+      await answer(lc, lastJob(id, "stop"), "succeeded", { stopped: true });
+      let inst = await instance(id);
+      expect(inst.phase).toBe("STOPPED");
+      expect(inst.desiredState).toBe("RUNNING");
+      await m.fixture.runtimeInstance.update({
+        where: { id },
+        data: { nextRestartAt: new Date(Date.now() - 1_000) },
+      });
+      await lc.runOnce();
+      inst = await instance(id);
+      expect(inst.phase).toBe("STOPPED");
+      expect(inst.Ranks[0]?.claim).toBe("RELEASED");
+    } finally {
+      await unban();
+    }
+    // Active again: the restart rule applies.
+    await lc.runOnce();
+    expect((await instance(id)).phase).toBe("STARTING");
+    await stopInstance(id);
+    await lc.runOnce();
+    const stop = [...sent].reverse().find((job) => job.instanceId === id && job.phase === "stop");
+    if (stop && (await instance(id)).phase === "STOPPING")
+      await answer(lc, stop, "succeeded", { stopped: true });
+  });
+
+  it("leaves a person's run alone, and counts a terminal the ban fence already closed", async () => {
+    const lc = await engine();
+    const running = await startInstance(30_219, "USER", "operator");
+    const spawning = await startInstance(30_220, "USER", "operator");
+    await lc.runOnce();
+    const run = lastJob(running, "start");
+    await progress(lc, run, "awaiting_operator");
+    // The person pressed Enter; the node's report has not arrived yet.
+    operatorRelay.closeAnswer = "running";
+    await ban(null);
+    try {
+      await lc.runOnce();
+      expect((await step(running, "START")).state).toBe("AWAITING_OPERATOR");
+      // The other terminal's screen never came up, and the ban fence already cancelled it
+      // ("absent"): it may have run, so the attempt counts and the rank needs a proven stop.
+      operatorRelay.closeAnswer = "absent";
+      await lc.runOnce();
+      const row = await step(spawning, "START");
+      expect(row.state).toBe("FAILED");
+      expect(row.errorCode).toBe("owner_inactive");
+      expect(row.attempts).toBe(1);
+      expect((await instance(spawning)).phase).toBe("STOPPING");
+    } finally {
+      operatorRelay.closeAnswer = "closed";
+      await unban();
+    }
+    for (const id of [running, spawning]) {
+      await stopInstance(id);
+      await lc.runOnce();
+      const stop = [...sent].reverse().find((job) => job.instanceId === id && job.phase === "stop");
+      if (stop) await answer(lc, stop, "succeeded", { stopped: true });
+    }
+  });
+
+  it("a terminal this close ends before its screen came up gives its attempt back", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_221, "USER", "operator");
+    await lc.runOnce();
+    const start = await step(id, "START");
+    expect(start.state).toBe("RUNNING");
+    await ban(null);
+    try {
+      operatorRelay.closed.length = 0;
+      await lc.runOnce();
+      expect(operatorRelay.closed).toContain(start.id);
+      const row = await step(id, "START");
+      expect(row.state).toBe("CANCELLED");
+      expect(row.attempts).toBe(0);
+      // Nothing ran: the claim is released without a stop.
+      const inst = await instance(id);
+      expect(inst.phase).toBe("STOPPED");
+      expect(inst.Ranks[0]?.claim).toBe("RELEASED");
+    } finally {
+      await unban();
+    }
+  });
+
+  it("an expired ban is no ban: the start goes out", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_215);
+    await ban(new Date(Date.now() - 60_000));
+    try {
+      await lc.runOnce();
+      expect(lastJob(id, "start").instanceId).toBe(id);
+    } finally {
+      await unban();
+    }
+    await stopInstance(id);
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "stop"), "succeeded", { stopped: true });
+    expect((await instance(id)).phase).toBe("STOPPED");
+  });
+
+  it("forgets an inactive owner's unanswerable interactive stop; a status probe proves it", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_216, "USER", "stopper");
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "start"), "succeeded");
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "readiness"), "succeeded");
+    expect((await instance(id)).phase).toBe("READY");
+    await ban(null);
+    try {
+      await stopInstance(id);
+      const before = sent.length;
+      await lc.runOnce();
+      // No terminal for the stop: it is cancelled and the rank forgotten by the engine.
+      expect(sent.slice(before).some((job) => job.instanceId === id && job.phase === "stop")).toBe(
+        false,
+      );
+      const stop = await step(id, "STOP");
+      expect(stop.state).toBe("CANCELLED");
+      expect(stop.errorCode).toBe("owner_inactive");
+      let inst = await instance(id);
+      expect(inst.phase).toBe("STOPPED");
+      expect(inst.needsOperator).toBeNull();
+      expect(inst.Ranks[0]).toMatchObject({
+        claim: "HELD_UNKNOWN",
+        forgottenBy: "system:owner_inactive",
+      });
+      expect(inst.Ranks[0]?.forgottenAt).not.toBeNull();
+      // The status probe goes out for the inactive owner and proves the stop.
+      await lc.runOnce();
+      const status = lastJob(id, "status");
+      expect(status.operator).toBeUndefined();
+      await answer(lc, status, "succeeded", { stopped: true });
+      inst = await instance(id);
+      expect(inst.Ranks[0]?.claim).toBe("RELEASED");
+    } finally {
+      await unban();
+    }
+  });
+
+  it("forgets a stop a person gave up on once the owner is inactive", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_217, "USER", "stopper");
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "start"), "succeeded");
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "readiness"), "succeeded");
+    await stopInstance(id);
+    await lc.runOnce();
+    const job = lastJob(id, "stop");
+    expect(job.operator).toBeDefined();
+    await progress(lc, job, "awaiting_operator");
+    await lc.cancelStep({ userId, stepId: job.stepId });
+    let inst = await instance(id);
+    expect(inst.needsOperator).toBe("FORGET");
+    expect(inst.Ranks[0]?.claim).toBe("HELD");
+    await markDeleting();
+    try {
+      await lc.runOnce();
+      inst = await instance(id);
+      expect(inst.phase).toBe("STOPPED");
+      expect(inst.Ranks[0]?.claim).toBe("HELD_UNKNOWN");
+    } finally {
+      await clearDeleting();
+    }
   });
 
   it("opens at most four operator terminals per node; the rest are held", async () => {
@@ -770,5 +1083,316 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     for (const id of ids) await stopInstance(id);
     await lc.runOnce();
     for (const id of ids) expect((await instance(id)).phase).toBe("STOPPED");
+  });
+
+  // ── Always-on runtimes from inventory ──
+
+  const alwaysOnSpec = (port: number) => ({
+    api: "openai" as const,
+    engine: "vllm" as const,
+    modelType: "llm" as const,
+    address: { baseUrl: `http://127.0.0.1:${port}/v1` },
+  });
+
+  function nodeEntry(
+    slug: string,
+    port: number,
+    extra: Partial<import("../relay/frames.js").AlwaysOnInventory> = {},
+  ): import("../relay/frames.js").AlwaysOnInventory {
+    const spec = alwaysOnSpec(port);
+    return {
+      slug,
+      origin: "node",
+      launchHash: runtimeLaunchHash(spec),
+      spec,
+      status: "online",
+      models: [{ id: "local-model", capabilities: ["text_generation"] }],
+      ...extra,
+    };
+  }
+
+  const inventory = (
+    lc: Awaited<ReturnType<typeof engine>>,
+    alwaysOn: import("../relay/frames.js").AlwaysOnInventory[],
+    instances: import("../relay/frames.js").InstanceRecord[] = [],
+  ) => lc.runtimeInventory(ref(), { snapshotId: randomUUID(), alwaysOn, instances });
+
+  const nodeRuntime = (slug: string) =>
+    m.fixture.runtime.findFirst({
+      where: { userId, slug },
+      include: {
+        Versions: { orderBy: { version: "asc" } },
+        Models: true,
+        Instances: { include: { Targets: true } },
+      },
+    });
+
+  it("creates a node-origin always-on runtime from inventory, versions it and removes it", async () => {
+    const lc = await engine();
+    const slug = `ao-${suffix}`;
+    await inventory(lc, [
+      nodeEntry(slug, 18_001, {
+        engineFacts: {
+          slots: { value: 8, source: "probe" },
+          kvTokens: { value: 400_000, source: "probe" },
+        },
+      }),
+    ]);
+    let runtime = await nodeRuntime(slug);
+    expect(runtime).toMatchObject({ kind: "ALWAYS_ON", origin: "NODE", nodeId });
+    expect(runtime?.Versions).toHaveLength(1);
+    const first = runtime?.Versions[0];
+    expect(first?.launchHash).toBe(runtimeLaunchHash(alwaysOnSpec(18_001)));
+    expect(first?.editor).toBe("SYSTEM");
+    expect(runtime?.currentVersionId).toBe(first?.id);
+    expect(runtime?.Models.map((model) => model.upstreamModelId)).toEqual(["local-model"]);
+    expect(runtime?.Models[0]?.detectedCapabilities).toEqual(["TEXT_GENERATION"]);
+    let inst = runtime?.Instances[0];
+    expect(runtime?.Instances).toHaveLength(1);
+    expect(inst).toMatchObject({
+      handle: slug,
+      desiredState: null,
+      phase: "READY",
+      versionId: first?.id,
+      launchVersionId: first?.id,
+      engineSlots: 8,
+      observedKvBudgetTokens: 400_000,
+    });
+    expect(inst?.Targets).toHaveLength(1);
+
+    // The same report again changes nothing.
+    await inventory(lc, [nodeEntry(slug, 18_001)]);
+    expect((await nodeRuntime(slug))?.Versions).toHaveLength(1);
+
+    // A person set a limit in the browser (version 2, same launch).
+    const limited = await m.fixture.runtimeVersion.create({
+      data: {
+        runtimeId: runtime?.id ?? "",
+        version: 2,
+        editor: "USER",
+        editorUserId: userId,
+        contentHash: hex(`content-ao-2-${suffix}`),
+        launchHash: first?.launchHash ?? "",
+        spec: alwaysOnSpec(18_001),
+        api: "OPENAI",
+        engine: "VLLM",
+        modelType: "LLM",
+        concurrencyLimit: 3,
+      },
+    });
+    await m.fixture.runtime.update({
+      where: { id: runtime?.id ?? "" },
+      data: { currentVersionId: limited.id },
+    });
+    // The definition changed on the node: version 3 (the limit carried over), adopted at once;
+    // its status degraded; a second discovered model (a degraded server's list retires nothing).
+    await inventory(lc, [
+      nodeEntry(slug, 18_002, {
+        status: "degraded",
+        models: [{ id: "other-model", capabilities: [] }],
+      }),
+    ]);
+    runtime = await nodeRuntime(slug);
+    expect(runtime?.Versions.map((version) => version.version)).toEqual([1, 2, 3]);
+    const second = runtime?.Versions[2];
+    expect(second?.concurrencyLimit).toBe(3);
+    expect(second?.launchHash).toBe(runtimeLaunchHash(alwaysOnSpec(18_002)));
+    expect(runtime?.currentVersionId).toBe(second?.id);
+    inst = runtime?.Instances[0];
+    expect(inst).toMatchObject({
+      phase: "UNHEALTHY",
+      phaseReason: "node_degraded",
+      versionId: second?.id,
+      launchVersionId: second?.id,
+    });
+    const retired = async () =>
+      new Map(
+        (await nodeRuntime(slug))?.Models.map((model) => [model.upstreamModelId, model.retired]),
+      );
+    expect(await retired()).toEqual(
+      new Map([
+        ["local-model", false],
+        ["other-model", false],
+      ]),
+    );
+    expect(inst?.Targets).toHaveLength(2);
+    // Online, the list is the whole served set: the first model is gone.
+    await inventory(lc, [
+      nodeEntry(slug, 18_002, { models: [{ id: "other-model", capabilities: [] }] }),
+    ]);
+    expect(await retired()).toEqual(
+      new Map([
+        ["local-model", true],
+        ["other-model", false],
+      ]),
+    );
+
+    // A truncated entry, or a server that is offline (it lists nothing), keeps the models the
+    // server knows.
+    await inventory(lc, [nodeEntry(slug, 18_002, { models: [], truncated: true })]);
+    await inventory(lc, [nodeEntry(slug, 18_002, { models: [], status: "offline" })]);
+    runtime = await nodeRuntime(slug);
+    expect(runtime?.Models.find((model) => model.upstreamModelId === "other-model")?.retired).toBe(
+      false,
+    );
+    expect(runtime?.Instances[0]).toMatchObject({
+      phase: "UNAVAILABLE",
+      phaseReason: "node_offline",
+    });
+
+    // No longer reported while a profile pins it: kept, but no longer routed to.
+    const profile = await m.fixture.profile.create({
+      data: { userId, slug: `ao-${suffix}`, name: "AO", editor: "USER", editorUserId: userId },
+    });
+    await m.fixture.profileItem.create({
+      data: {
+        profileId: profile.id,
+        position: 0,
+        runtimeId: runtime?.id ?? "",
+        versionId: runtime?.currentVersionId ?? "",
+      },
+    });
+    await inventory(lc, [nodeEntry(slug, 18_002)]);
+    expect((await nodeRuntime(slug))?.Instances[0]?.phase).toBe("READY");
+    await inventory(lc, []);
+    expect((await nodeRuntime(slug))?.Instances[0]).toMatchObject({
+      phase: "UNAVAILABLE",
+      phaseReason: "node_removed",
+    });
+    await m.fixture.profile.delete({ where: { id: profile.id } });
+
+    // No longer reported: the runtime and its instance are removed.
+    await inventory(lc, []);
+    expect(await nodeRuntime(slug)).toBeNull();
+    expect(await m.fixture.runtimeInstance.count({ where: { userId, handle: slug } })).toBe(0);
+  });
+
+  it("skips a node-origin slug another runtime of the user has, and a bad hash", async () => {
+    const lc = await engine();
+    // The startable runtime's slug is taken (server origin).
+    const taken = `lc-${suffix}`;
+    // Another node of the user already added a runtime with this slug.
+    const otherNode = await m.fixture.node.create({
+      data: { userId, slug: `lc2-${suffix}`, connection: "ONLINE", trust: "FULL" },
+    });
+    const elsewhere = `ae-${suffix}`;
+    await m.fixture.runtime.create({
+      data: {
+        userId,
+        slug: elsewhere,
+        name: "elsewhere",
+        kind: "ALWAYS_ON",
+        origin: "NODE",
+        nodeId: otherNode.id,
+      },
+    });
+    const before = await m.fixture.runtime.count({ where: { userId } });
+    await inventory(lc, [
+      nodeEntry(elsewhere, 18_006),
+      nodeEntry(taken, 18_003),
+      nodeEntry(`bad-${suffix}`, 18_004, { launchHash: "0".repeat(64) }),
+    ]);
+    expect(await m.fixture.runtime.count({ where: { userId } })).toBe(before);
+    const kept = await m.fixture.runtime.findFirstOrThrow({ where: { userId, slug: taken } });
+    expect(kept).toMatchObject({ origin: "SERVER", kind: "STARTABLE" });
+    // The other node's runtime is untouched (still there, no version, on its node).
+    const theirs = await m.fixture.runtime.findFirstOrThrow({
+      where: { userId, slug: elsewhere },
+      include: { Versions: true },
+    });
+    expect(theirs).toMatchObject({ nodeId: otherNode.id, currentVersionId: null });
+    expect(theirs.Versions).toHaveLength(0);
+    await m.fixture.runtime.delete({ where: { id: theirs.id } });
+    await m.fixture.node.delete({ where: { id: otherNode.id } });
+  });
+
+  it("follows a server-origin always-on runtime's status, models and engine facts", async () => {
+    const lc = await engine();
+    const slug = `aos-${suffix}`;
+    const spec = alwaysOnSpec(18_005);
+    const db = m.fixture;
+    const runtime = await db.runtime.create({
+      data: { userId, slug, name: "AOS", kind: "ALWAYS_ON", origin: "SERVER", nodeId },
+    });
+    const version = await db.runtimeVersion.create({
+      data: {
+        runtimeId: runtime.id,
+        version: 1,
+        editor: "USER",
+        editorUserId: userId,
+        contentHash: hex(`content-aos-${suffix}`),
+        launchHash: runtimeLaunchHash(spec),
+        spec,
+        api: "OPENAI",
+        engine: "VLLM",
+        modelType: "LLM",
+      },
+    });
+    await db.runtime.update({ where: { id: runtime.id }, data: { currentVersionId: version.id } });
+    await db.runtimeInstance.create({
+      data: {
+        userId,
+        runtimeId: runtime.id,
+        versionId: version.id,
+        launchVersionId: version.id,
+        handle: slug,
+        startedBy: "USER",
+        phase: "UNAVAILABLE",
+        phaseReason: "awaiting_node",
+      },
+    });
+    await inventory(lc, [
+      {
+        slug,
+        origin: "server",
+        runtimeId: runtime.id,
+        versionId: version.id,
+        launchHash: version.launchHash,
+        status: "online",
+        models: [
+          {
+            id: "served",
+            capabilities: ["text_generation"],
+            engineFacts: { maxModelLen: { value: 65_536, source: "probe" } },
+          },
+        ],
+      },
+    ]);
+    const row = await nodeRuntime(slug);
+    expect(row?.Models.map((model) => model.upstreamModelId)).toEqual(["served"]);
+    expect(row?.Instances[0]).toMatchObject({ phase: "READY", maxModelLen: 65_536 });
+    expect(row?.Instances[0]?.Targets).toHaveLength(1);
+    // It stays: server-origin runtimes are never removed by inventory.
+    await inventory(lc, []);
+    expect(await nodeRuntime(slug)).not.toBeNull();
+  });
+
+  it("records a managed instance's engine facts from its head rank", async () => {
+    const lc = await engine();
+    const id = await ready(lc, 30_301);
+    const row = await instance(id);
+    await inventory(
+      lc,
+      [],
+      [
+        {
+          instanceId: id,
+          launchVersionId: row.launchVersionId,
+          launchHash: hex(`launch-${suffix}`),
+          rank: 0,
+          intentHash: hex("intent"),
+          phase: "ready",
+          unitName: `wsmp-${row.handle}-r0`,
+          port: 30_301,
+          handle: row.handle,
+          models: ["m"],
+          engineFacts: { kvTokens: { value: 123_456, source: "probe" } },
+        },
+      ],
+    );
+    const after = await instance(id);
+    expect(after.phase).toBe("READY");
+    expect(after.observedKvBudgetTokens).toBe(123_456);
+    expect(after.factsAt).not.toBeNull();
   });
 });

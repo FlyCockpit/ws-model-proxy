@@ -23,6 +23,9 @@
     "./lib/graph-write": {
       "default": "./src/lib/graph-write.ts"
     },
+    "./lib/runtime-store": {
+      "default": "./src/lib/runtime-store.ts"
+    },
     "./nodes/fabrics": {
       "default": "./src/nodes/fabrics.ts"
     },

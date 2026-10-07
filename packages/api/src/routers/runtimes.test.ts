@@ -284,6 +284,7 @@ describe("runtimes.update", () => {
     return {
       id: "rt-1",
       kind: "STARTABLE" as const,
+      origin: "SERVER" as const,
       Node: null,
       CurrentVersion: versionRow(),
       ...overrides,
@@ -333,6 +334,28 @@ describe("runtimes.update", () => {
     expect(await reasonOf(client().update({ runtimeId: "rt-1", spec: changed }))).toBe(
       "launch_change_on_relay_only",
     );
+  });
+
+  it("refuses a launch change to a node-origin runtime even at Full control", async () => {
+    const spec: RuntimeSpec = {
+      api: "openai",
+      engine: "other",
+      modelType: "llm",
+      address: { baseUrl: "http://127.0.0.1:8000/v1" },
+    };
+    db.runtime.findFirst.mockResolvedValue(
+      updateRow({
+        kind: "ALWAYS_ON",
+        origin: "NODE",
+        Node: { id: "node-1", trust: "FULL", trustLowerRequestedAt: null },
+        CurrentVersion: versionRow({ spec, launchHash: runtimeLaunchHash(spec) }),
+      }) as never,
+    );
+    const changed = { ...spec, address: { baseUrl: "http://127.0.0.1:9000/v1" } };
+    expect(await reasonOf(client().update({ runtimeId: "rt-1", spec: changed }))).toBe(
+      "launch_change_on_node_origin",
+    );
+    expect(db.runtimeVersion.create).not.toHaveBeenCalled();
   });
 
   it("restarts for a person but reports trust_relay for an agent on a Relay-only node", async () => {

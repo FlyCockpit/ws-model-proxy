@@ -482,7 +482,7 @@ export const runtimesContract = {
         warnings: z.array(z.enum(RUNTIME_SPEC_WARNINGS)),
       })
       .strict(),
-    "New version. Same launch hash: adopted live. A launch change to an always-on runtime on a Relay-only node is refused (launch_change_on_relay_only). With MCP capability overrides, the overrides and the new version commit in one transaction or not at all.",
+    "New version. Same launch hash: adopted live. A launch change to an always-on runtime on a Relay-only node is refused (launch_change_on_relay_only), on a node-origin runtime always (launch_change_on_node_origin). With MCP capability overrides, the overrides and the new version commit in one transaction or not at all.",
     ["runtime_update"],
   ),
   delete: mutation(
