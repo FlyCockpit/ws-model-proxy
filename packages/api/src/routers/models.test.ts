@@ -53,6 +53,7 @@ const OUTPUT: ModelTestServiceOutput = {
     promptTokens: 5,
     completionTokens: 1,
     errorClass: null,
+    upstreamError: null,
     rejection: null,
     excerpt: "pong",
   },

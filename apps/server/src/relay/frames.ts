@@ -1274,6 +1274,8 @@ export const serverToNodeControlFrameSchema = z.discriminatedUnion("type", [
       timeoutMs: z.number().int().min(1_000).max(3_600_000),
       handle: runtimeHandleSchema,
       expectBody: z.boolean(),
+      /** The exact body length, so the node sends Content-Length (never chunked framing). */
+      bodyBytes: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
       countFirst: z.boolean().optional(),
       countCeiling: z.number().int().min(1).max(TOKEN_COUNT_MAX).optional(),
     })

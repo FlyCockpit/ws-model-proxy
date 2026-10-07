@@ -118,6 +118,12 @@ and the `config set-*` capability switches. Use `wsmp run`, `wsmp service` and
 `wsmp trust`; runtimes are defined in the web app or through MCP, not with the
 CLI.
 
+**Request bodies are sent with a Content-Length.** A node relays every request
+body with its exact length instead of chunked framing, so strict
+OpenAI-compatible servers (TensorFold, gufo and similar) no longer answer 400.
+When a runtime does answer with an error, the request log and MCP
+(`requests_list`, `model_test`) show one redacted line of what it said.
+
 ## Trust: Full control and Relay only
 
 Each node gives the server one of two levels, chosen at `wsmp login` and kept

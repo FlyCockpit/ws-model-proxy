@@ -2386,6 +2386,7 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
     httpStatusCode:
       update.terminal.httpStatusCode ?? (failure ? relayFailureHttpStatus(failure) : null),
     upstreamStatusCode: update.terminal.upstreamStatusCode,
+    upstreamErrorExcerpt: update.terminal.upstreamErrorExcerpt ?? null,
     requestBytes: BigInt(update.terminal.requestBytes),
     responseBytes: BigInt(update.terminal.responseBytes),
     ...(update.rejection !== undefined ? { rejection: update.rejection } : {}),

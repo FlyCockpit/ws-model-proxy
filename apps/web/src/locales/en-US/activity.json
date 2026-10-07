@@ -29,6 +29,7 @@
     "attempts_other": "{{count}} attempts",
     "rejection": "Refused: {{reason}}",
     "error": "Error: {{reason}}",
+    "upstreamError": "The runtime said: {{message}}",
     "empty": "No requests match.",
     "loadMore": "Load more",
     "loadFailed": "Could not load the request log.",

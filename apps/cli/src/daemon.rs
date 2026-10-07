@@ -232,6 +232,10 @@ struct UpstreamRequestSpec {
     endpoint_auth: Option<(EndpointAuthMode, String)>,
     timeout_ms: u64,
     has_body: bool,
+    /// The body length the server declared. A streamed body is sent with this
+    /// Content-Length: strict OpenAI-compatible servers (TensorFold, gufo)
+    /// answer a chunked request body with 400.
+    body_bytes: Option<u64>,
     /// When set, buffer a chat-shaped JSON body and inline trusted media URLs as
     /// `data:` URLs before forwarding. Off for the plain streaming relay path.
     expand_media: bool,
@@ -253,6 +257,65 @@ fn deliver_body_chunk(body_tx: &SyncSender<BodyChunk>, data: Vec<u8>, last: bool
         Ok(()) => BodyRoute::Delivered,
         Err(TrySendError::Full(_)) => BodyRoute::OverCredit,
         Err(TrySendError::Disconnected(_)) => BodyRoute::WorkerGone,
+    }
+}
+
+/// A streamed body that fails if it yields more or fewer than `length` bytes,
+/// so a declared Content-Length always frames exactly what is sent.
+struct ExactLengthBody<S> {
+    inner: S,
+    length: u64,
+    sent: u64,
+    done: bool,
+}
+
+fn exact_length_body<S>(inner: S, length: u64) -> ExactLengthBody<S> {
+    ExactLengthBody {
+        inner,
+        length,
+        sent: 0,
+        done: false,
+    }
+}
+
+impl<S> Stream for ExactLengthBody<S>
+where
+    S: Stream<Item = std::result::Result<Vec<u8>, io::Error>> + Unpin,
+{
+    type Item = std::result::Result<Vec<u8>, io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        if self.done {
+            return Poll::Ready(None);
+        }
+        let mismatch =
+            || io::Error::new(io::ErrorKind::InvalidData, "request body length mismatch");
+        let item = match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(item) => item,
+        };
+        let result = match item {
+            Some(Ok(chunk)) => {
+                self.sent = self.sent.saturating_add(chunk.len() as u64);
+                if self.sent > self.length {
+                    Err(mismatch())
+                } else {
+                    return Poll::Ready(Some(Ok(chunk)));
+                }
+            }
+            Some(Err(error)) => Err(error),
+            None if self.sent != self.length => Err(mismatch()),
+            None => {
+                self.done = true;
+                return Poll::Ready(None);
+            }
+        };
+        self.done = true;
+        Poll::Ready(Some(result))
     }
 }
 
@@ -1522,6 +1585,7 @@ where
             timeout_ms,
             handle,
             expect_body,
+            body_bytes,
             count_first,
             count_ceiling,
             ..
@@ -1546,6 +1610,7 @@ where
                     timeout_ms,
                     handle,
                     expect_body,
+                    body_bytes,
                     count_first: count_first.unwrap_or(false),
                     count_ceiling,
                 },
@@ -2146,6 +2211,7 @@ struct RelayRequest {
     timeout_ms: u64,
     handle: String,
     expect_body: bool,
+    body_bytes: Option<u64>,
     count_first: bool,
     count_ceiling: Option<u64>,
 }
@@ -2170,6 +2236,7 @@ where
         timeout_ms,
         handle,
         expect_body,
+        body_bytes,
         count_first,
         count_ceiling,
     } = request;
@@ -2237,6 +2304,7 @@ where
             .map(|auth| (auth.mode.clone(), auth.env.clone())),
         timeout_ms,
         has_body: expect_body,
+        body_bytes: body_bytes.filter(|_| expect_body),
         expand_media: endpoint.expand_media,
         trusted_origins: TrustedOrigins::new(
             config.server_url.as_deref(),
@@ -2694,6 +2762,9 @@ fn run_count_first_worker(
         let _ = tx.send(FromWorker::Finished(request_id));
         return;
     };
+    let mut spec = spec;
+    // The buffered body is exactly what goes upstream.
+    spec.body_bytes = Some(bytes.len() as u64);
     let (body_tx, body_rx) = mpsc::sync_channel(1);
     let _ = body_tx.send(BodyChunk {
         data: bytes,
@@ -2863,13 +2934,44 @@ async fn execute_upstream(
         builder.body(transformed)
     } else if spec.has_body {
         let rx = body_rx.context("missing request body channel for a body request")?;
-        let body = streaming_request_body(
-            rx,
-            tx.clone(),
-            spec.request_id.clone(),
-            cancellation_rx.clone(),
-        );
-        builder.body(reqwest::Body::wrap_stream(body))
+        match spec.body_bytes {
+            // hyper frames a body with an explicit Content-Length by that
+            // length; the stream fails rather than send more or fewer bytes.
+            Some(length) => {
+                let body = streaming_request_body(
+                    rx,
+                    tx.clone(),
+                    spec.request_id.clone(),
+                    cancellation_rx.clone(),
+                );
+                builder
+                    .header(reqwest::header::CONTENT_LENGTH, length)
+                    .body(reqwest::Body::wrap_stream(exact_length_body(
+                        Box::pin(body),
+                        length,
+                    )))
+            }
+            // No declared length: buffer up to a cap so the body still goes
+            // with a Content-Length; only a larger body is sent chunked.
+            None => {
+                match buffer_body_prefix(&rx, tx, &spec.request_id, UNSIZED_BODY_BUFFER_BYTES) {
+                    BufferedBody::Whole(raw) => builder.body(raw),
+                    BufferedBody::Prefix(prefix) => {
+                        let rest = streaming_request_body(
+                            rx,
+                            tx.clone(),
+                            spec.request_id.clone(),
+                            cancellation_rx.clone(),
+                        );
+                        builder.body(reqwest::Body::wrap_stream(PrefixedBody {
+                            prefix: prefix.into(),
+                            rest: Box::pin(rest),
+                        }))
+                    }
+                    BufferedBody::Aborted => return Ok(()),
+                }
+            }
+        }
     } else {
         builder
     };
@@ -3155,6 +3257,68 @@ enum CollectError {
     Aborted,
     /// The buffered body exceeded the cap.
     TooLarge,
+}
+
+/// The most a body without a declared length is buffered to send it with a
+/// Content-Length (the server's JSON body cap).
+const UNSIZED_BODY_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
+/// A body read up to a cap: whole, or the chunks read before the cap.
+enum BufferedBody {
+    Whole(Vec<u8>),
+    Prefix(Vec<Vec<u8>>),
+    Aborted,
+}
+
+/// Read body chunks (one credit each, as the streaming reader returns them)
+/// until the final chunk or until more than `max_bytes` arrived.
+fn buffer_body_prefix(
+    rx: &Receiver<BodyChunk>,
+    tx: &SyncSender<FromWorker>,
+    request_id: &str,
+    max_bytes: usize,
+) -> BufferedBody {
+    let mut chunks = Vec::new();
+    let mut total = 0_usize;
+    loop {
+        let Ok(BodyChunk { data, last }) = rx.recv() else {
+            return BufferedBody::Aborted;
+        };
+        if !send_body_credit(tx, request_id) {
+            return BufferedBody::Aborted;
+        }
+        total = total.saturating_add(data.len());
+        chunks.push(data);
+        if last {
+            return BufferedBody::Whole(chunks.concat());
+        }
+        if total > max_bytes {
+            return BufferedBody::Prefix(chunks);
+        }
+    }
+}
+
+/// Chunks already read, then the rest of the streamed body.
+struct PrefixedBody<S> {
+    prefix: std::collections::VecDeque<Vec<u8>>,
+    rest: S,
+}
+
+impl<S> Stream for PrefixedBody<S>
+where
+    S: Stream<Item = std::result::Result<Vec<u8>, io::Error>> + Unpin,
+{
+    type Item = std::result::Result<Vec<u8>, io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if let Some(chunk) = self.prefix.pop_front() {
+            return std::task::Poll::Ready(Some(Ok(chunk)));
+        }
+        std::pin::Pin::new(&mut self.rest).poll_next(cx)
+    }
 }
 
 /// Drain the streamed request body into memory, returning one flow-control
@@ -4426,6 +4590,7 @@ mod tests {
                 timeout_ms: 1_000,
                 handle: "local".to_string(),
                 expect_body: false,
+                body_bytes: None,
                 count_first: false,
                 count_ceiling: None,
             },
@@ -4467,6 +4632,7 @@ mod tests {
                 timeout_ms: 1_000,
                 handle: "local".to_string(),
                 expect_body: false,
+                body_bytes: None,
                 count_first: false,
                 count_ceiling: None,
             },
@@ -4773,9 +4939,231 @@ mod tests {
             endpoint_auth: None,
             timeout_ms: 2_000,
             has_body: false,
+            body_bytes: None,
             expand_media: false,
             trusted_origins: TrustedOrigins::new(None, &[]),
         }
+    }
+
+    /// A strict OpenAI-compatible upstream (TensorFold, gufo): answers 400
+    /// unless the request carries a Content-Length and no chunked framing.
+    fn strict_length_upstream() -> Option<(std::net::SocketAddr, JoinHandle<String>)> {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("bind strict upstream: {error}"),
+        };
+        let address = listener.local_addr().expect("address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut seen = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            // Read the head, then exactly Content-Length body bytes.
+            let head_end = loop {
+                let size = std::io::Read::read(&mut stream, &mut buffer).expect("read");
+                assert!(size > 0, "request ended early");
+                seen.extend_from_slice(&buffer[..size]);
+                if let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&seen[..head_end]).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok());
+            let response: &[u8] = match length {
+                Some(length) if !head.contains("transfer-encoding") => {
+                    while seen.len() < head_end + length {
+                        let size = std::io::Read::read(&mut stream, &mut buffer).expect("read");
+                        assert!(size > 0, "body ended early");
+                        seen.extend_from_slice(&buffer[..size]);
+                    }
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"
+                }
+                _ => b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 39\r\nconnection: close\r\n\r\n{\"error\":\"Content-Length is required\"}\n",
+            };
+            stream.write_all(response).expect("write");
+            String::from_utf8_lossy(&seen).into_owned()
+        });
+        Some((address, server))
+    }
+
+    fn relay_status(frames: &[FromWorker]) -> Option<u16> {
+        frames.iter().find_map(|frame| match frame {
+            FromWorker::Send {
+                frame: WsFrame::Text(text),
+                ..
+            } if text.contains(r#""type":"relay.response.headers""#) => {
+                let value: serde_json::Value = serde_json::from_str(text).ok()?;
+                value["status"].as_u64().and_then(|s| u16::try_from(s).ok())
+            }
+            _ => None,
+        })
+    }
+
+    /// I11: a relayed body with a declared length reaches a strict upstream
+    /// with Content-Length framing, split across relay chunks as sent.
+    #[test]
+    fn a_declared_body_length_is_sent_as_content_length_not_chunked() {
+        let Some((address, upstream)) = strict_length_upstream() else {
+            return;
+        };
+        let body = br#"{"model":"GLM-5.3-Flash-EXL3","messages":[{"role":"user","content":"hi"}]}"#;
+        let mut spec = local_upstream_spec(format!("http://{address}"));
+        spec.has_body = true;
+        spec.body_bytes = Some(body.len() as u64);
+        spec.request_headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        let (body_tx, body_rx) = mpsc::sync_channel(4);
+        body_tx
+            .send(BodyChunk {
+                data: body[..10].to_vec(),
+                last: false,
+            })
+            .expect("first chunk");
+        body_tx
+            .send(BodyChunk {
+                data: body[10..].to_vec(),
+                last: true,
+            })
+            .expect("last chunk");
+        let (tx, rx) = mpsc::sync_channel(RELAY_WORKER_OUTBOUND_CAPACITY);
+        let (_cancellation, cancellation_rx) = CancellationHandle::new();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(execute_upstream(spec, Some(body_rx), &tx, cancellation_rx))
+            .expect("relay");
+        let seen = upstream.join().expect("upstream");
+        let frames = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(relay_status(&frames), Some(200), "{seen}");
+        assert!(
+            seen.to_ascii_lowercase()
+                .contains(&format!("content-length: {}", body.len()))
+        );
+        assert!(
+            seen.ends_with(std::str::from_utf8(body).expect("utf8")),
+            "{seen}"
+        );
+    }
+
+    /// A body without a declared length is still sent with Content-Length
+    /// (buffered under the cap).
+    #[test]
+    fn an_undeclared_body_length_is_buffered_and_sent_sized() {
+        let Some((address, upstream)) = strict_length_upstream() else {
+            return;
+        };
+        let body = br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+        let mut spec = local_upstream_spec(format!("http://{address}"));
+        spec.has_body = true;
+        let (body_tx, body_rx) = mpsc::sync_channel(body.len());
+        for (index, part) in body.chunks(7).enumerate() {
+            body_tx
+                .send(BodyChunk {
+                    data: part.to_vec(),
+                    last: (index + 1) * 7 >= body.len(),
+                })
+                .expect("chunk");
+        }
+        let (tx, rx) = mpsc::sync_channel(RELAY_WORKER_OUTBOUND_CAPACITY);
+        let (_cancellation, cancellation_rx) = CancellationHandle::new();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(execute_upstream(spec, Some(body_rx), &tx, cancellation_rx))
+            .expect("relay");
+        let seen = upstream.join().expect("upstream");
+        let frames = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(relay_status(&frames), Some(200), "{seen}");
+        let credits = frames
+            .iter()
+            .filter(|frame| matches!(frame, FromWorker::Send { frame: WsFrame::Text(text), .. } if text.contains("relay.request.body.ack")))
+            .count();
+        assert_eq!(credits, body.chunks(7).count());
+    }
+
+    #[test]
+    fn a_body_over_the_buffer_cap_keeps_its_prefix_and_streams_the_rest() {
+        let (body_tx, body_rx) = mpsc::sync_channel(4);
+        body_tx
+            .send(BodyChunk {
+                data: vec![1; 4],
+                last: false,
+            })
+            .expect("a");
+        body_tx
+            .send(BodyChunk {
+                data: vec![2; 4],
+                last: false,
+            })
+            .expect("b");
+        let (tx, _rx) = mpsc::sync_channel(RELAY_WORKER_OUTBOUND_CAPACITY);
+        match buffer_body_prefix(&body_rx, &tx, "r", 6) {
+            BufferedBody::Prefix(prefix) => assert_eq!(prefix, vec![vec![1; 4], vec![2; 4]]),
+            _ => panic!("expected a prefix"),
+        }
+        drop(body_tx);
+        assert!(matches!(
+            buffer_body_prefix(&body_rx, &tx, "r", 6),
+            BufferedBody::Aborted
+        ));
+    }
+
+    /// A body longer than its declared length fails instead of being cut
+    /// (or smuggling the rest as a second request).
+    #[test]
+    fn a_body_longer_than_declared_fails_closed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let chunks = vec![Ok(b"12345".to_vec()), Ok(b"678".to_vec())];
+        let mut body = exact_length_body(Box::pin(tokio_stream_of(chunks)), 6);
+        let first = runtime.block_on(next_item(&mut body));
+        assert!(matches!(first, Some(Ok(_))));
+        let second = runtime.block_on(next_item(&mut body));
+        assert!(matches!(second, Some(Err(_))));
+        assert!(runtime.block_on(next_item(&mut body)).is_none());
+
+        let mut short = exact_length_body(Box::pin(tokio_stream_of(vec![Ok(b"12".to_vec())])), 6);
+        assert!(matches!(
+            runtime.block_on(next_item(&mut short)),
+            Some(Ok(_))
+        ));
+        assert!(matches!(
+            runtime.block_on(next_item(&mut short)),
+            Some(Err(_))
+        ));
+    }
+
+    type TestBodyItem = std::result::Result<Vec<u8>, io::Error>;
+
+    struct VecStream(std::collections::VecDeque<TestBodyItem>);
+
+    impl Stream for VecStream {
+        type Item = TestBodyItem;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<TestBodyItem>> {
+            std::task::Poll::Ready(self.0.pop_front())
+        }
+    }
+
+    fn tokio_stream_of(items: Vec<TestBodyItem>) -> VecStream {
+        VecStream(items.into())
+    }
+
+    async fn next_item<S: Stream<Item = TestBodyItem> + Unpin>(
+        stream: &mut S,
+    ) -> Option<TestBodyItem> {
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut *stream).poll_next(cx)).await
     }
 
     #[test]

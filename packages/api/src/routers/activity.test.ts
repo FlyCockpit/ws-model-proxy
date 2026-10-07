@@ -63,6 +63,7 @@ const request = {
   cacheReadTokens: null,
   rejection: null,
   errorClass: null,
+  upstreamErrorExcerpt: "messages must be a list",
   httpStatusCode: 200,
   attemptCount: 1,
   resourceOwnerUserId: "owner",
@@ -83,6 +84,7 @@ describe("request log", () => {
       route: "cloud",
       ttftMs: 250,
       attempts: 1,
+      upstreamError: "messages must be a list",
     });
     expect(page.nextCursor).not.toBeNull();
     const where = db.relayRequest.findMany.mock.calls[0]?.[0]?.where;
@@ -103,7 +105,12 @@ describe("request log", () => {
     ] as never);
     db.pool.findMany.mockResolvedValue([] as never);
     const page = await client().requests.list({ limit: 10 });
-    expect(page.items[0]).toMatchObject({ nodeId: null, providerModelId: null, route: null });
+    expect(page.items[0]).toMatchObject({
+      nodeId: null,
+      providerModelId: null,
+      route: null,
+      upstreamError: null,
+    });
     await client().requests.list({ limit: 10, nodeId: "their-node" });
     expect(JSON.stringify(db.relayRequest.findMany.mock.calls[1]?.[0]?.where)).not.toContain(
       '"userId":"owner"',

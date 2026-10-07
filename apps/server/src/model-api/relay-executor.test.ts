@@ -163,8 +163,30 @@ describe("relay response backpressure", () => {
       expect(read.value?.byteLength).toBe(chunk.byteLength);
     }
     handlers.onComplete({ type: "relay.complete", requestId: attempt.requestId });
-    await expect(attempt.terminal).resolves.toMatchObject({ ok: true });
+    await expect(attempt.terminal).resolves.toMatchObject({ ok: true, upstreamErrorExcerpt: null });
     expect(manager.cancelRelayRequest).not.toHaveBeenCalled();
+  });
+
+  it("keeps a redacted excerpt of an upstream 4xx answer on the terminal", async () => {
+    const { attempt, handlers } = harness();
+    handlers.onHeaders({
+      type: "relay.response.headers",
+      requestId: attempt.requestId,
+      status: 400,
+      headers: [["content-type", "application/json"]],
+    });
+    handlers.onBody(new TextEncoder().encode('{"detail":"messages must be a list"}'), {
+      type: "relay.response.body",
+      requestId: attempt.requestId,
+      chunkId: "0",
+    });
+    handlers.onComplete({ type: "relay.complete", requestId: attempt.requestId });
+    await expect(attempt.terminal).resolves.toMatchObject({
+      ok: false,
+      failure: "upstream_4xx",
+      upstreamStatusCode: 400,
+      upstreamErrorExcerpt: "messages must be a list",
+    });
   });
 });
 

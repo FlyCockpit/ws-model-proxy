@@ -76,6 +76,7 @@ const requestSelect = {
   cacheReadTokens: true,
   rejection: true,
   errorClass: true,
+  upstreamErrorExcerpt: true,
   httpStatusCode: true,
   attemptCount: true,
   resourceOwnerUserId: true,
@@ -163,6 +164,7 @@ const requests = {
         cacheReadTokens: row.cacheReadTokens,
         rejection: row.rejection,
         errorClass: row.errorClass,
+        upstreamError: own ? row.upstreamErrorExcerpt : null,
         httpStatusCode: row.httpStatusCode,
         attempts: row.attemptCount,
       };

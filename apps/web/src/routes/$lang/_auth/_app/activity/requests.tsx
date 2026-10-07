@@ -48,6 +48,7 @@ type RequestRow = {
   completionTokens: number | null;
   rejection: string | null;
   errorClass: string | null;
+  upstreamError: string | null;
   httpStatusCode: number | null;
   attempts: number;
 };
@@ -239,6 +240,11 @@ function RequestCard({ row }: { row: RequestRow }) {
         ) : row.errorClass ? (
           <p className="break-all text-xs text-destructive">
             {t("activity:requests.error", { reason: row.errorClass })}
+          </p>
+        ) : null}
+        {row.upstreamError ? (
+          <p className="break-words text-xs text-muted-foreground">
+            {t("activity:requests.upstreamError", { message: row.upstreamError })}
           </p>
         ) : null}
       </CardContent>
