@@ -177,25 +177,37 @@ function histogramOf(metric: Metric): HistogramName | null {
 const ident = (name: string) => Prisma.raw(`"${name}"`);
 const zero = () => Prisma.sql`''`;
 
-/** The group expression of a family's rows (`r` usage, `l` load, `n` node). */
-function requestGroup(groupBy: GroupBy | undefined): Prisma.Sql {
+/**
+ * The group expression of a family's rows (`r` usage, `l` load, `n` node). In a pool, a member a
+ * share holder contributed runs on their runtime and node: those placement keys collapse into
+ * "" (the pool owner sees that the traffic happened, not where).
+ */
+function requestGroup(groupBy: GroupBy | undefined, userId: string, pool: boolean): Prisma.Sql {
   const model = Prisma.sql`CASE WHEN r."runtimeModelId" <> '' THEN r."runtimeModelId" ELSE r."providerModelId" END`;
+  const own = (key: Prisma.Sql) =>
+    pool
+      ? Prisma.sql`CASE WHEN r."versionId" IN (SELECT v.id FROM runtime_version v
+          JOIN runtime rt ON rt.id = v."runtimeId" WHERE rt."userId" = ${userId})
+          THEN ${key} ELSE '' END`
+      : key;
   switch (groupBy) {
     case undefined:
       return zero();
     case "runtime":
       // Older rows carry the runtime only through their version.
-      return Prisma.sql`COALESCE(NULLIF(r."runtimeId", ''), (SELECT v."runtimeId" FROM runtime_version v WHERE v.id = r."versionId"), '')`;
+      return own(
+        Prisma.sql`COALESCE(NULLIF(r."runtimeId", ''), (SELECT v."runtimeId" FROM runtime_version v WHERE v.id = r."versionId"), '')`,
+      );
     case "version":
-      return Prisma.sql`r."versionId"`;
+      return own(Prisma.sql`r."versionId"`);
     case "node":
-      return Prisma.sql`r."nodeId"`;
+      return own(Prisma.sql`r."nodeId"`);
     case "instance":
-      return Prisma.sql`r."instanceId"`;
+      return own(Prisma.sql`r."instanceId"`);
     case "model":
       return model;
     case "member":
-      return Prisma.sql`(${model}) || CASE WHEN r."instanceId" <> '' THEN '/' || r."instanceId" ELSE '' END`;
+      return Prisma.sql`(${model}) || ${own(Prisma.sql`CASE WHEN r."instanceId" <> '' THEN '/' || r."instanceId" ELSE '' END`)}`;
     case "source":
       return Prisma.sql`r.source::text`;
   }
@@ -233,6 +245,9 @@ function requestWhere(
     Prisma.sql`"bucketStart" < ${window.to}`,
   ];
   if (!includeAgentTests) parts.push(Prisma.sql`source <> 'AGENT_TEST'::"RequestSource"`);
+  // Placement scopes count traffic of the caller's own pools and direct calls only (as the
+  // request log does): a runtime contributed to someone else's pool serves that owner's users.
+  if (scope.kind !== "pool") parts.push(Prisma.sql`"ownerUserId" = ${userId}`);
   switch (scope.kind) {
     case "pool":
       parts.push(Prisma.sql`"poolId" = ${scope.id}`);
@@ -342,13 +357,13 @@ function requestPlan(
   const source = withHours
     ? Prisma.sql`(SELECT ${columns} FROM usage_rollup_minute WHERE ${where} UNION ALL SELECT ${columns} FROM usage_rollup_hour WHERE ${where})`
     : Prisma.sql`(SELECT ${columns} FROM usage_rollup_minute WHERE ${where})`;
-  const group = requestGroup(input.groupBy);
+  const group = requestGroup(input.groupBy, userId, scope.kind === "pool");
   const aggregates = requestAggregates(histograms);
   return {
     family: "request",
     totals: () =>
       prisma.$queryRaw<Row[]>`SELECT ${group} AS g, ${aggregates} FROM ${source} r
-        GROUP BY 1 ORDER BY SUM(r.requests) DESC LIMIT 1000`,
+        GROUP BY 1 ORDER BY SUM(r.requests) DESC`,
     series: (keys) =>
       prisma.$queryRaw<
         Row[]
@@ -389,7 +404,7 @@ function loadPlan(
     family: "load",
     totals: () =>
       prisma.$queryRaw<Row[]>`SELECT ${group} AS g, ${loadAggregates()} FROM runtime_load_minute l
-        WHERE ${where} GROUP BY 1 ORDER BY SUM(l.samples) DESC LIMIT 1000`,
+        WHERE ${where} GROUP BY 1 ORDER BY SUM(l.samples) DESC`,
     series: (keys) =>
       prisma.$queryRaw<
         Row[]
@@ -400,7 +415,7 @@ function loadPlan(
 
 /**
  * Node gauges are per node: rows come back per node (`n`) so memory and free VRAM add up across
- * nodes while CPU averages and GPU peaks take the maximum.
+ * nodes, CPU averages by samples and GPU peaks take the maximum.
  */
 function nodePlan(
   userId: string,
@@ -449,7 +464,7 @@ function nodePlan(
       prisma.$queryRaw<
         Row[]
       >`SELECT ${group} AS g, n."nodeId" AS n, ${aggregates} FROM node_metrics_minute n
-        WHERE ${where} GROUP BY 1, 2 ORDER BY SUM(n.samples) DESC LIMIT 1000`,
+        WHERE ${where} GROUP BY 1, 2 ORDER BY SUM(n.samples) DESC`,
     series: (keys) =>
       prisma.$queryRaw<
         Row[]

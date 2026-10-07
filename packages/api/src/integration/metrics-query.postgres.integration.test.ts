@@ -69,7 +69,8 @@ const person = (userId: string): CallerAuth => ({
   csrfVerified: true,
 });
 
-const T0 = new Date("2026-09-01T10:00:00.000Z");
+// Two days ago on the hour: inside every family's retention.
+const T0 = new Date(Math.floor(Date.now() / 3_600_000) * 3_600_000 - 48 * 3_600_000);
 const at = (minutes: number) => new Date(T0.getTime() + minutes * 60_000);
 const WINDOW = { from: T0.toISOString(), to: at(10).toISOString() };
 
@@ -467,5 +468,50 @@ integration("metrics_query on PostgreSQL", () => {
       expect(error).toBeInstanceOf(ORPCError);
       expect((error as ORPCError<string, unknown>).code).toBe("NOT_FOUND");
     }
+  });
+  it("counts only the owner's own traffic on their node, and hides a contributor's placement", async () => {
+    const node = await client(agent(OWNER)).activity.metrics.query({
+      scope: { node: ids.node },
+      metrics: ["requests"],
+      range: WINDOW,
+      step: "5m",
+    });
+    // 3 + 2 + 1 of the owner's pool; the other owner's 50 on this node stay theirs.
+    expect(node.totals.requests).toBe(6);
+
+    // A share holder's contributed model serves the owner's pool on the holder's runtime.
+    await fixtures.usageRollupMinute.create({
+      data: {
+        bucketStart: at(7),
+        ownerUserId: OWNER,
+        requesterUserId: OWNER,
+        poolId: ids.pool,
+        versionId: "contrib-version",
+        nodeId: "contrib-node",
+        instanceId: "contrib-instance",
+        runtimeModelId: "contrib-model",
+        source: "API_KEY",
+        requests: 3,
+      },
+    });
+    const window = { from: at(7).toISOString(), to: at(8).toISOString() };
+    for (const groupBy of ["node", "instance", "version", "runtime"] as const) {
+      const result = await client(agent(OWNER)).activity.metrics.query({
+        scope: { pool: ids.pool },
+        metrics: ["requests"],
+        range: window,
+        step: "1m",
+        groupBy,
+      });
+      expect(result.series).toEqual([{ group: { key: "" }, at: [0], values: { requests: [3] } }]);
+    }
+    const member = await client(agent(OWNER)).activity.metrics.query({
+      scope: { pool: ids.pool },
+      metrics: ["requests"],
+      range: window,
+      step: "1m",
+      groupBy: "member",
+    });
+    expect(member.series[0]?.group).toEqual({ key: "contrib-model" });
   });
 });

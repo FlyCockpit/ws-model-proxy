@@ -202,10 +202,15 @@ export const metricsQueryInputSchema = z
         message: `Too many points: use a coarser step, a shorter range or fewer metrics (≤${METRICS_MAX_POINTS} buckets, ≤${METRICS_MAX_CELLS} buckets × metrics).`,
       });
     const minuteStep = input.step === "1m" || input.step === "5m";
+    // How far back the range reaches: a custom range may start long ago and be short.
+    const reachMs =
+      typeof input.range === "string"
+        ? rangeMs
+        : Math.max(rangeMs, Date.now() - Date.parse(input.range.from));
     for (const metric of input.metrics) {
       const limit = RANGE_LIMIT_MS[metricFamily(metric)];
       const maxMs = minuteStep ? limit.minuteSteps : limit.any;
-      if (rangeMs > maxMs)
+      if (reachMs > maxMs)
         ctx.addIssue({
           code: "custom",
           path: ["range"],

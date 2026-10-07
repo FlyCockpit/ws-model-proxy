@@ -417,6 +417,27 @@ describe("metrics_query input bounds", () => {
   });
 });
 
+describe("metrics_query retention", () => {
+  it("refuses a short range that starts before the rows its step reads are kept", () => {
+    const hourAgo = (days: number) => new Date(Date.now() - days * 86_400_000);
+    const range = (days: number) => ({
+      from: hourAgo(days).toISOString(),
+      to: new Date(hourAgo(days).getTime() + 3_600_000).toISOString(),
+    });
+    const input = (metric: string, step: string, days: number) => ({
+      scope: { node: "n" },
+      metrics: [metric],
+      range: range(days),
+      step,
+    });
+    expect(metricsQueryInputSchema.safeParse(input("requests", "1m", 29)).success).toBe(true);
+    expect(metricsQueryInputSchema.safeParse(input("requests", "1m", 40)).success).toBe(false);
+    expect(metricsQueryInputSchema.safeParse(input("requests", "1h", 40)).success).toBe(true);
+    expect(metricsQueryInputSchema.safeParse(input("kv_usage_max", "1h", 9)).success).toBe(false);
+    expect(metricsQueryInputSchema.safeParse(input("cpu_pct", "5m", 6)).success).toBe(true);
+  });
+});
+
 describe("compactNumber", () => {
   it("keeps integers and three significant digits", () => {
     expect(compactNumber(12_345)).toBe(12_345);
