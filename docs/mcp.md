@@ -55,7 +55,10 @@ Anything that should keep running or serve traffic must be a runtime. A server
 started with a command is invisible to the proxy and dies with the command. When
 a step needs a person (for example a `sudo` password), queue it with
 `node_command_queue_for_user`; it runs only when they press Run and Enter in
-Terminals.
+Terminals. Poll its `id` with `node_command_get` as well: the answer has
+`queuedForUser: true` and the queued state (`QUEUED`, `RUN`, `DISMISSED`,
+`EXPIRED` or `REFUSED`) and never output, since the person runs it in their
+terminal. Only the person runs or dismisses it, so `cancel` refuses.
 
 ### Runtime definitions
 

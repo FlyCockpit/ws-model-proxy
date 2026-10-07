@@ -291,6 +291,24 @@ export const nodeCommandViewSchema = z
   })
   .strict();
 
+/**
+ * `node_command_get` on an id from `node_command_queue_for_user`: a person decides when (and
+ * whether) it runs, in a browser terminal, so there is no output tail. `outcome` is the refusal
+ * reason (REFUSED) or the browser terminal it was typed into (RUN).
+ */
+export const queuedCommandStatusSchema = z
+  .object({
+    commandId: idSchema,
+    queuedForUser: z.literal(true),
+    state: z.enum(QUEUED_COMMAND_STATE),
+    nodeId: idSchema,
+    createdAt: isoDateSchema,
+    expiresAt: isoDateSchema,
+    decidedAt: isoDateSchema.nullable(),
+    outcome: z.string().nullable(),
+  })
+  .strict();
+
 export const nodeCredentialViewSchema = z
   .object({
     id: idSchema,
@@ -745,14 +763,15 @@ export const nodesContract = {
       "agent",
       z
         .object({
-          commandId: z.string().regex(/^[A-Za-z0-9_-]{22}$/),
+          /** From node_command_run, or from node_command_queue_for_user (its `id`). */
+          commandId: idSchema,
           /** Wait up to this long for it to finish. */
           waitMs: z.number().int().min(0).max(NODE_COMMAND_GET_WAIT_MAX_MS).optional(),
           cancel: z.literal(true).optional(),
         })
         .strict(),
-      nodeCommandViewSchema,
-      "A command's state and output tail; optionally wait for it or cancel it.",
+      z.union([nodeCommandViewSchema, queuedCommandStatusSchema]),
+      "A command's state and output tail (or a queued command's state); optionally wait for it or cancel it.",
       ["node_command_get"],
     ),
   },

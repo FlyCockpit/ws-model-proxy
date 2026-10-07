@@ -121,6 +121,8 @@ function CommandCard({ row }: { row: CommandRow }) {
   const fetchLive = useMutation(
     orpc.nodes.commands.get.mutationOptions({
       onSuccess: async (view) => {
+        // Only node commands are listed here; a queued command's id never reaches this card.
+        if ("queuedForUser" in view) return;
         setLive(view);
         if (view.state !== row.state) {
           await queryClient.invalidateQueries({ queryKey: orpc.activity.commands.list.key() });

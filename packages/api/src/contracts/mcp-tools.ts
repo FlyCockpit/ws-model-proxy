@@ -411,7 +411,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "node_command_get",
     description:
-      "State and output tail of a command from node_command_run; waitMs waits for it, cancel stops it and everything it started.",
+      "State and output tail of a command from node_command_run (or the state of one from node_command_queue_for_user); waitMs waits for it, cancel stops it and everything it started.",
     input: nodesContract.commands.get.input,
     output: nodesContract.commands.get.output,
     procedures: ["nodes.commands.get"],

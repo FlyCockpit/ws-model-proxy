@@ -388,6 +388,53 @@ describe("node commands", () => {
   });
 });
 
+describe("node_command_get on a queued command", () => {
+  // Queued ids are cuid2 (24 chars); node command ids are 22-char base64url. Both poll here.
+  const queuedId = "x9k2m4p6r8t0v1w3y5z7a9b1";
+
+  it("answers the queued command's state, with no output", async () => {
+    db.nodeCommand.findFirst.mockResolvedValue(null);
+    db.queuedNodeCommand.findFirst.mockResolvedValue({ ...queuedRow, id: queuedId } as never);
+    const ops = operator();
+    const view = await client(FULL_AGENT, ops).commands.get({ commandId: queuedId, waitMs: 5_000 });
+    expect(view).toMatchObject({
+      commandId: queuedId,
+      queuedForUser: true,
+      state: "QUEUED",
+      nodeId: "node1",
+      decidedAt: null,
+    });
+    expect(ops.pollCommand).not.toHaveBeenCalled();
+    expect(db.queuedNodeCommand.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      id: queuedId,
+      userId: "owner",
+    });
+  });
+
+  it("shows a queued command past its expiry as expired, and refuses to cancel it", async () => {
+    db.nodeCommand.findFirst.mockResolvedValue(null);
+    db.queuedNodeCommand.findFirst.mockResolvedValue({
+      ...queuedRow,
+      id: queuedId,
+      expiresAt: new Date(Date.now() - 1_000),
+    } as never);
+    await expect(
+      client(FULL_AGENT, operator()).commands.get({ commandId: queuedId }),
+    ).resolves.toMatchObject({ state: "EXPIRED" });
+    await expect(
+      client(FULL_AGENT, operator()).commands.get({ commandId: queuedId, cancel: true }),
+    ).rejects.toMatchObject({ data: { reason: "command_not_running" } });
+  });
+
+  it("is not found when neither kind of command is the caller's", async () => {
+    db.nodeCommand.findFirst.mockResolvedValue(null);
+    db.queuedNodeCommand.findFirst.mockResolvedValue(null);
+    await expect(
+      client(FULL_AGENT, operator()).commands.get({ commandId: queuedId }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+});
+
 describe("browser terminals and queued commands", () => {
   it("never opens a terminal or runs a queued command for an agent", async () => {
     for (const call of [

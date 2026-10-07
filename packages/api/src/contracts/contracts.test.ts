@@ -304,6 +304,63 @@ describe("caller auth (positive human check)", () => {
   });
 });
 
+describe("id formats", () => {
+  // The ids the server mints: cuid2 row ids (Prisma `@default(cuid(2))`, 24 chars here; the
+  // length is configurable) and the 22-char base64url ids of node commands. Any id one tool
+  // returns must be accepted wherever another takes it (older rows: cuid v1, Better Auth ids), so every `id`/`*Id`/`*Ids` input field
+  // accepts all of them (node_command_get once took only 22 chars and refused queued ids).
+  const MINTED_IDS = [
+    "x9k2m4p6r8t0v1w3y5z7a9b1",
+    "AbC-_dEfGhIjKlMnOpQrSt",
+    "ckh3d0k1q0000a1b2c3d4e5f6",
+    "Xk3P0aQz9LmN2bVc8RtY6uWe4SdF1gHj",
+  ];
+  type Json = { [key: string]: unknown };
+  function idFields(schema: unknown, at: string, out: Array<[string, Json]>): void {
+    if (Array.isArray(schema)) {
+      for (const [index, entry] of schema.entries()) idFields(entry, `${at}[${index}]`, out);
+      return;
+    }
+    if (typeof schema !== "object" || schema === null) return;
+    const node = schema as Json;
+    const properties = node.properties as Record<string, Json> | undefined;
+    for (const [key, value] of Object.entries(properties ?? {})) {
+      if (/^(id|.*Id)$/.test(key)) out.push([`${at}.${key}`, value]);
+      if (/Ids$/.test(key) && typeof value.items === "object")
+        out.push([`${at}.${key}[]`, value.items as Json]);
+    }
+    for (const value of Object.values(node)) idFields(value, at, out);
+  }
+  function stringPatterns(schema: Json): string[] {
+    const options = [schema, ...((schema.anyOf as Json[] | undefined) ?? [])];
+    return options.flatMap((option) =>
+      option.type === "string" && typeof option.pattern === "string" ? [option.pattern] : [],
+    );
+  }
+
+  it("accepts every minted id format in every id input field", () => {
+    const inputs: Array<[string, z.ZodType]> = [
+      ...Array.from(procedures, ([path, procedure]): [string, z.ZodType] => [
+        path,
+        procedure.input,
+      ]),
+      ...MCP_TOOLS.map((tool): [string, z.ZodType] => [`mcp:${tool.name}`, tool.input]),
+    ];
+    let checked = 0;
+    for (const [name, input] of inputs) {
+      const fields: Array<[string, Json]> = [];
+      idFields(z.toJSONSchema(input, { io: "input", unrepresentable: "any" }), name, fields);
+      for (const [path, field] of fields)
+        for (const pattern of stringPatterns(field)) {
+          checked += 1;
+          for (const id of MINTED_IDS)
+            expect(new RegExp(pattern).test(id), `${path} ${id}`).toBe(true);
+        }
+    }
+    expect(checked).toBeGreaterThan(50);
+  });
+});
+
 describe("0.4.0 MCP tool manifest", () => {
   it("has the 27 tools in order, 7 of them read-only", () => {
     expect(MCP_TOOLS.map((tool) => tool.name)).toEqual([...MCP_TOOL_NAMES]);
