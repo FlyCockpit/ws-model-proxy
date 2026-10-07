@@ -119,8 +119,10 @@ impl Policy {
     }
 
     /// The built-in protected set for this installation: wsmp state files and
-    /// `service.env` are neither readable nor writable, `config.json` is
-    /// readable but not writable (a write could raise the CLI's own mode).
+    /// `service.env` are neither readable nor writable; `config.json`, the
+    /// service unit (and its drop-ins), the launchd logs and the running binary
+    /// are readable but not writable (a write could raise the CLI's own mode or
+    /// change what starts at the next boot). Matched case-folded.
     pub fn from_environment(roots: Vec<PathBuf>, allow_root: bool) -> Self {
         Self::new(roots, default_protected(), allow_root)
     }
@@ -222,8 +224,15 @@ impl Policy {
                 "secret files and their directories are read-only through the file tools",
             ));
         }
+        // Folded like every other path classification (`redact::fold`): on a
+        // case-insensitive volume (macOS default, casefold ext4) `STATE/WS-MODEL-PROXY`
+        // opens the protected state dir, and a file that does not exist yet has no
+        // inode for `check_identity` to match. Over-protecting a distinct case
+        // variant on a case-sensitive volume is the safe direction.
+        let folded = PathBuf::from(super::redact::fold(&full.to_string_lossy()));
         for entry in protected {
-            let inside = full == entry.path || (entry.subtree && full.starts_with(&entry.path));
+            let entry_path = PathBuf::from(super::redact::fold(&entry.path.to_string_lossy()));
+            let inside = folded == entry_path || (entry.subtree && folded.starts_with(&entry_path));
             let blocked = match entry.deny {
                 Deny::ReadWrite => true,
                 Deny::WriteOnly => access != Access::Read,
@@ -231,7 +240,7 @@ impl Policy {
             if inside && blocked {
                 return Err(FileError::denied("path is protected by wsmp"));
             }
-            if access == Access::Remove && entry.path.starts_with(full) {
+            if access == Access::Remove && entry_path.starts_with(&folded) {
                 return Err(FileError::denied(
                     "path contains protected wsmp files and cannot be removed or moved",
                 ));
@@ -480,6 +489,31 @@ fn default_protected() -> Vec<Protected> {
         let lock = config_file.with_extension("json.lock");
         out.push(file(lock, Deny::WriteOnly));
         out.push(file(config_file, Deny::WriteOnly));
+    }
+    // What starts wsmp and with which environment: the per-user service unit
+    // (systemd: its drop-in directory too; launchd: the plist), the binary that
+    // runs, and the launchd log directory. A write there would become a trust,
+    // root or config change at the next start.
+    if let Ok(unit) = crate::commands::service::service_file() {
+        let mut drop_ins = unit.clone().into_os_string();
+        drop_ins.push(".d");
+        out.push(Protected {
+            path: PathBuf::from(drop_ins),
+            subtree: true,
+            deny: Deny::WriteOnly,
+        });
+        out.push(file(unit, Deny::WriteOnly));
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(logs) = crate::commands::service::macos_log_dir() {
+        out.push(Protected {
+            path: logs,
+            subtree: true,
+            deny: Deny::WriteOnly,
+        });
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        out.push(file(exe, Deny::WriteOnly));
     }
     out
 }
@@ -760,6 +794,90 @@ mod tests {
             let got = p.check_path(*access, Path::new(path)).err().map(|e| e.code);
             assert_eq!(&got, expected, "{access:?} {path}");
         }
+    }
+
+    /// A case-insensitive volume opens `STATE/WS-MODEL-PROXY` as the state dir:
+    /// protected entries match case-folded (and with trailing dots or spaces
+    /// trimmed), for reads, writes, creation of missing files and ancestor moves.
+    #[test]
+    fn protected_entries_match_case_folded() {
+        let p = policy(
+            &[],
+            vec![
+                entry(
+                    "/home/me/.local/state/ws-model-proxy",
+                    true,
+                    Deny::ReadWrite,
+                ),
+                entry(
+                    "/home/me/.config/ws-model-proxy/config.json",
+                    false,
+                    Deny::WriteOnly,
+                ),
+            ],
+        );
+        let cases: &[(Access, &str, Option<ErrorCode>)] = &[
+            (
+                Access::Write,
+                "/home/me/.local/state/WS-MODEL-PROXY/wsmp-service-run.sh",
+                Some(ErrorCode::PathDenied),
+            ),
+            (
+                Access::Read,
+                "/home/me/.local/State/ws-model-proxy/node-credential.json",
+                Some(ErrorCode::PathDenied),
+            ),
+            (
+                Access::Write,
+                "/home/me/.local/state/ws-model-proxy./TERMINAL-APPROVALS.json",
+                Some(ErrorCode::PathDenied),
+            ),
+            (
+                Access::Remove,
+                "/home/me/.local/STATE",
+                Some(ErrorCode::PathDenied),
+            ),
+            (
+                Access::Write,
+                "/home/me/.config/WS-Model-Proxy/Config.JSON",
+                Some(ErrorCode::PathDenied),
+            ),
+            (
+                Access::Read,
+                "/home/me/.config/WS-Model-Proxy/Config.JSON",
+                None,
+            ),
+            (Access::Write, "/home/me/.local/state/other/x", None),
+        ];
+        for (access, path, expected) in cases {
+            let got = p.check_path(*access, Path::new(path)).err().map(|e| e.code);
+            assert_eq!(&got, expected, "{access:?} {path}");
+        }
+    }
+
+    /// What starts wsmp is write-protected: the service unit and its drop-ins
+    /// and the running binary.
+    #[test]
+    fn service_unit_and_binary_are_write_protected() {
+        let p = Policy::from_environment(Vec::new(), false);
+        let unit = crate::commands::service::service_file().unwrap();
+        let mut drop_in = unit.clone().into_os_string();
+        drop_in.push(".d/override.conf");
+        let exe = std::env::current_exe().unwrap();
+        for path in [unit.clone(), PathBuf::from(drop_in), exe.clone()] {
+            assert_eq!(
+                p.check_path(Access::Write, &path).err().map(|e| e.code),
+                Some(ErrorCode::PathDenied),
+                "{}",
+                path.display()
+            );
+        }
+        assert!(p.check_path(Access::Read, &unit).is_ok());
+        let parent = exe.parent().unwrap();
+        assert_eq!(
+            p.check_path(Access::Remove, parent).err().map(|e| e.code),
+            Some(ErrorCode::PathDenied)
+        );
     }
 
     #[test]
