@@ -302,7 +302,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     lc: InstanceType<Modules["lifecycle"]["RuntimeLifecycle"]>,
     job: Job,
     status: "succeeded" | "failed",
-    extra: { stopped?: boolean; error?: "command_failed" } = {},
+    extra: { stopped?: boolean; error?: "command_failed"; detail?: string } = {},
   ) {
     await lc.handleJobResult(ref(), {
       type: "runtime.job.result",
@@ -314,8 +314,13 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       status,
       stopped: extra.stopped ?? false,
       ...(status === "failed" ? { error: extra.error ?? "command_failed" } : {}),
+      ...(extra.detail ? { detail: extra.detail } : {}),
     });
   }
+
+  /** A STATUS step's error code (what the stop evidence shows as the check's reason). */
+  const stepCode = async (stepId: string) =>
+    (await m.fixture.instanceStep.findUniqueOrThrow({ where: { id: stepId } })).errorCode;
 
   const lastJob = (instanceId: string, phase: Job["phase"]) => {
     const job = [...sent].reverse().find((j) => j.instanceId === instanceId && j.phase === phase);
@@ -451,6 +456,76 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     await answer(lc, status, "succeeded", { stopped: true });
     row = await instance(id);
     expect(row.Ranks[0]?.claim).toBe("RELEASED");
+  });
+
+  it("proves and releases a hold left on a STOPPED instance; a failed proof says why", async () => {
+    const lc = await engine();
+    const id = await ready(lc, 30_111);
+    await m.fixture.runtimeInstance.update({
+      where: { id },
+      data: { desiredState: "STOPPED", phase: "STOPPING", phaseReason: "stop_requested" },
+    });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await lc.runOnce();
+      await answer(lc, lastJob(id, "stop"), "failed", { error: "command_failed" });
+    }
+    await lc.runOnce();
+    // The node cannot prove it and says why: the step keeps the reason as its code.
+    const first = lastJob(id, "status");
+    await answer(lc, first, "succeeded", { stopped: false, detail: "port_in_use" });
+    expect(await stepCode(first.stepId)).toBe("port_in_use");
+    // The row the preview server was left with: marked stopped, settled STOPPED, nobody asked.
+    await m.fixture.instanceRank.updateMany({
+      where: { instanceId: id },
+      data: { claim: "HELD_UNKNOWN", markedStoppedAt: new Date(), markedStoppedBy: userId },
+    });
+    await lc.runOnce();
+    let row = await instance(id);
+    expect(row.phase).toBe("STOPPED");
+    expect(row.needsOperator).toBeNull();
+    expect(row.Ranks[0]?.claim).toBe("HELD_UNKNOWN");
+    // The sweep probes it again on the online node (5 minutes on: one pass queues, one sends).
+    await m.fixture.instanceStep.updateMany({
+      where: { instanceId: id, phase: "STATUS" },
+      data: { updatedAt: new Date(Date.now() - 6 * 60_000) },
+    });
+    const before = sent.length;
+    await lc.runOnce();
+    await lc.runOnce();
+    const probe = sent.slice(before).find((job) => job.instanceId === id && job.phase === "status");
+    if (!probe) throw new Error("the STOPPED instance's hold was not probed");
+    await answer(lc, probe, "succeeded", { stopped: false, detail: "process_alive" });
+    expect(await stepCode(probe.stepId)).toBe("process_alive");
+    expect((await instance(id)).Ranks[0]?.claim).toBe("HELD_UNKNOWN");
+    // An older node gives no reason; an unknown reason is never stored.
+    await m.fixture.instanceStep.updateMany({
+      where: { instanceId: id, phase: "STATUS" },
+      data: { updatedAt: new Date(Date.now() - 6 * 60_000) },
+    });
+    await lc.runOnce();
+    await lc.runOnce();
+    const old = lastJob(id, "status");
+    await answer(lc, old, "succeeded", { stopped: false, detail: "something_else" });
+    expect(await stepCode(old.stepId)).toBe("not_stopped");
+    // Later the process is gone and the port free: the proof releases the hold at once.
+    await m.fixture.instanceStep.updateMany({
+      where: { instanceId: id, phase: "STATUS" },
+      data: { updatedAt: new Date(Date.now() - 6 * 60_000) },
+    });
+    await lc.runOnce();
+    await lc.runOnce();
+    const proof = lastJob(id, "status");
+    expect(proof.stepId).not.toBe(old.stepId);
+    await answer(lc, proof, "succeeded", { stopped: true });
+    row = await instance(id);
+    expect(row.phase).toBe("STOPPED");
+    expect(row.Ranks[0]?.claim).toBe("RELEASED");
+    expect(row.Ranks[0]?.stoppedAt).not.toBeNull();
+    expect(
+      await m.fixture.instanceRank.count({
+        where: { nodeId, port: 30_111, claim: { not: "RELEASED" } },
+      }),
+    ).toBe(0);
   });
 
   async function ready(lc: Awaited<ReturnType<typeof engine>>, port: number) {

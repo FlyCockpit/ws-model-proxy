@@ -38,6 +38,8 @@ describe("nodeConnectionView", () => {
 });
 
 describe("latestStopChecks", () => {
+  const held = (rank: number) => ({ rank, claim: "HELD", markedStoppedAt: null });
+
   it("reads each stopping rank's last finished check of this stop only", async () => {
     const findFirst = vi.fn(async ({ where }: { where: { instanceId: string; rank: number } }) =>
       where.rank === 0
@@ -56,9 +58,9 @@ describe("latestStopChecks", () => {
         id: "stuck",
         phase: "STOPPING",
         phaseChangedAt: stopRequested,
-        Ranks: [{ rank: 0 }, { rank: 1 }],
+        Ranks: [held(0), held(1)],
       },
-      { id: "ready", phase: "READY", phaseChangedAt: stopRequested, Ranks: [{ rank: 0 }] },
+      { id: "ready", phase: "READY", phaseChangedAt: stopRequested, Ranks: [held(0)] },
     ]);
     // Only the stopping instance is read, one lookup per rank, from when it began stopping.
     expect(findFirst).toHaveBeenCalledTimes(2);
@@ -78,5 +80,37 @@ describe("latestStopChecks", () => {
         { at: "2026-10-07T11:55:00.000Z", proven: false, errorCode: null },
       ],
     ]);
+  });
+
+  it("reads a STOPPED instance's rank still held after it was marked stopped, from its mark on", async () => {
+    const findFirst = vi.fn(async ({ where }: { where: { instanceId: string; rank: number } }) => ({
+      instanceId: where.instanceId,
+      rank: where.rank,
+      state: "FAILED",
+      errorCode: "port_in_use",
+      updatedAt: at("2026-10-07T11:58:00.000Z"),
+    }));
+    const marked = at("2026-10-07T11:30:00.000Z");
+    const checks = await latestStopChecks({ instanceStep: { findFirst } } as never, [
+      {
+        id: "leaked",
+        phase: "STOPPED",
+        phaseChangedAt: at("2026-10-07T11:31:00.000Z"),
+        Ranks: [
+          { rank: 0, claim: "HELD_UNKNOWN", markedStoppedAt: marked },
+          { rank: 1, claim: "RELEASED", markedStoppedAt: null },
+        ],
+      },
+    ]);
+    // Only the held rank is read (a released one needs no proof).
+    expect(findFirst).toHaveBeenCalledTimes(1);
+    expect(findFirst.mock.calls[0]?.[0]).toMatchObject({
+      where: { instanceId: "leaked", rank: 0, createdAt: { gte: marked } },
+    });
+    expect(checks.get(stopCheckKey("leaked", 0))).toEqual({
+      at: "2026-10-07T11:58:00.000Z",
+      proven: false,
+      errorCode: "port_in_use",
+    });
   });
 });

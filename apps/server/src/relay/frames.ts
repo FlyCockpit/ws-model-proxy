@@ -756,6 +756,18 @@ export const RUNTIME_JOB_ERRORS = [
   "health_failed",
   "job_deadline",
 ] as const;
+/**
+ * Why a status probe (stop proof) answered not stopped, in its `detail`: a process of the
+ * rank's units still runs, the status command says running (or could not tell), the port is
+ * still in use, or the service runs outside the node's units and has no status command.
+ */
+export const STOP_PROOF_FAILURES = [
+  "process_alive",
+  "status_running",
+  "status_unknown",
+  "port_in_use",
+  "unowned_service",
+] as const;
 export const RUNTIME_JOB_OPERATOR_STATUSES = [
   "awaiting_operator",
   "operator_running",
@@ -774,7 +786,10 @@ export const runtimeJobResultFrameSchema = z
     /** True only after the stop command and unit teardown succeeded. */
     stopped: z.boolean(),
     error: z.enum(RUNTIME_JOB_ERRORS).optional(),
-    /** Which check failed (`bad_job`, `definition_missing`): a field path, never a value. */
+    /**
+     * Which check failed (`bad_job`, `definition_missing`): a field path, never a value. On a
+     * status probe answered not stopped: why ({@link STOP_PROOF_FAILURES}).
+     */
     detail: z
       .string()
       .regex(/^[A-Za-z0-9_.$[\]-]{1,128}$/)

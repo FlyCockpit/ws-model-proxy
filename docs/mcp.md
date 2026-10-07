@@ -79,14 +79,19 @@ command (if any) says stopped, and the rank's port is free. The stop then
 completes with no person involved. Only when the node cannot prove it (still
 alive, or offline for 10 minutes) does the instance show `needsOperator:
 "MARK_STOPPED"`; the probe is repeated every 5 minutes, so a later proof
-still completes it.
+still completes it. Each rank's `lastStopCheck.errorCode` says why the last
+probe failed: `process_alive`, `status_running`, `status_unknown`,
+`port_in_use`, `unowned_service` (runs outside the node's units with no
+`status` command), or `not_stopped` from a node too old to say.
 
 To mark such an instance stopped, call `runtime_stop {instanceId,
 markStopped: true, confirm: "MARK_STOPPED"}` (optionally `nodeNumber` for one
 node of a multi-node instance, and a `note`). It touches nothing on the node.
 Agents may do this only on Full-control nodes (`trust_relay` otherwise). The
 claim stays counted until a status probe proves the stop, but the instance
-settles STOPPED and later starts stop waiting for it (`waits_for_stop`). Each
+settles STOPPED and later starts stop waiting for it (`waits_for_stop`). The
+probes go on after that, also on a STOPPED instance, and the first one that
+proves the stop releases the claim; `lastStopCheck` keeps showing why. Each
 node marked stopped writes a `marked_stopped` row in the node's activity.
 
 ### Runtime definitions

@@ -412,7 +412,9 @@ export function instanceView(
       unitName: rank.unitName,
       nodeConnection: nodeConnectionView(rank.Node),
       lastStopCheck:
-        row.phase === "STOPPING" ? (stopChecks.get(stopCheckKey(row.id, rank.rank)) ?? null) : null,
+        row.phase === "STOPPING" || rank.claim === "HELD_UNKNOWN"
+          ? (stopChecks.get(stopCheckKey(row.id, rank.rank)) ?? null)
+          : null,
     })),
     openSteps: row.Steps.map((step) => stepView(step, context)),
     // TODO(lane A, hot path): live load comes from the relay's in-memory engine-load cache.
