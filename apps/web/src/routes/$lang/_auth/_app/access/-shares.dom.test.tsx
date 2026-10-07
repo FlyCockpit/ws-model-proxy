@@ -92,6 +92,8 @@ vi.mock("@/utils/orpc", () => {
       },
       pools: { list: query(["pools", "list"], () => ({ pools: [] })) },
       runtimes: {
+        key: () => ["runtimes"],
+        get: { key: () => ["runtimes", "get"] },
         list: query(["runtimes", "list"], () => ({ runtimes: [{ id: "rt-1", name: "Qwen" }] })),
         shares: {
           list: query(["runtimes", "shares", "list"], () => ({

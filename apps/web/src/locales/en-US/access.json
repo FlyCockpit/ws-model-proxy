@@ -126,7 +126,7 @@
     "inviteLinkTitle": "Send this link",
     "inviteLinkDescription": "No e-mail could be sent. Give this link to {{email}}; it is shown only once and works until {{date}}.",
     "copyInviteLink": "Copy invite link",
-    "byMeTitle": "Shared by you",
+    "byMeTitle": "Pools shared by you",
     "byMeEmpty": "You have not shared a pool yet.",
     "runtimesByMeTitle": "Runtime definitions shared by you",
     "runtimesByMeEmpty": "You have not shared a runtime definition yet.",

@@ -132,6 +132,8 @@ function useInvalidateShares() {
     Promise.all([
       queryClient.invalidateQueries({ queryKey: orpc.access.shares.list.key() }),
       queryClient.invalidateQueries({ queryKey: orpc.runtimes.shares.list.key() }),
+      // A runtime's page lists its shares too.
+      queryClient.invalidateQueries({ queryKey: orpc.runtimes.get.key() }),
     ]);
 }
 
