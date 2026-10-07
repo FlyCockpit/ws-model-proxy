@@ -1547,19 +1547,15 @@ where
         }
         ServerFrame::SecretSet(secret) => {
             let result = crate::secrets::set(startup.full_control(), &secret.name, &secret.value);
-            send_control(
-                socket,
-                &secret_result(secret.id, secret.name, result),
-                "answering a secret write",
-            )?;
+            for frame in secret_answer(secret.id, secret.name, result, || node_state(startup)) {
+                send_control(socket, &frame, "answering a secret write")?;
+            }
         }
         ServerFrame::SecretDelete { id, name } => {
             let result = crate::secrets::delete(startup.full_control(), &name);
-            send_control(
-                socket,
-                &secret_result(id, name, result),
-                "answering a secret removal",
-            )?;
+            for frame in secret_answer(id, name, result, || node_state(startup)) {
+                send_control(socket, &frame, "answering a secret removal")?;
+            }
         }
         ServerFrame::RelayCancel { request_id, reason } => {
             tracing::warn!(request_id, ?reason, "relay request cancelled");
@@ -1841,14 +1837,7 @@ where
     if !session.registered {
         return Ok(());
     }
-    send_control(
-        socket,
-        &NodeFrame::NodeState {
-            trust: startup.trust(),
-            features: node_features(startup),
-        },
-        "reporting the node state",
-    )
+    send_control(socket, &node_state(startup), "reporting the node state")
 }
 
 /// `runtime.job`: render from the held/frozen definition and run it off this
@@ -2178,6 +2167,34 @@ fn send_inventory(session: &Session) {
         session.runtimes.store.clone(),
         session.runtimes.instance_records(),
     );
+}
+
+/// The `node.state` this node reports now (trust and features).
+fn node_state(startup: &TerminalStartup) -> NodeFrame {
+    NodeFrame::NodeState {
+        trust: startup.trust(),
+        features: node_features(startup),
+    }
+}
+
+/// The answer to a secret write, then (when the secret set changed) a
+/// `node.state` whose features carry the new secret names, so the server
+/// lists them without waiting for the next hello.
+fn secret_answer(
+    id: String,
+    name: String,
+    result: Result<crate::secrets::Outcome, SecretRefusal>,
+    state: impl FnOnce() -> NodeFrame,
+) -> Vec<NodeFrame> {
+    let changed = matches!(
+        result,
+        Ok(crate::secrets::Outcome::Set { .. } | crate::secrets::Outcome::Deleted)
+    );
+    let mut frames = vec![secret_result(id, name, result)];
+    if changed {
+        frames.push(state());
+    }
+    frames
 }
 
 fn secret_result(
@@ -5554,5 +5571,67 @@ mod tests {
         assert_eq!(ticket.screen.handle, "i-abcdefabcdef");
         assert_eq!(ticket.screen.command, "sudo systemctl start x");
         assert_eq!(ticket.ids.terminal_id, "AAAAAAAAAAAAAAAAAAAAAA");
+    }
+
+    /// A secret write that changed the set is followed by a `node.state`, so
+    /// the server lists the new name at once; a refusal or no-op is not.
+    #[test]
+    fn a_changed_secret_set_reports_the_node_state() {
+        // Stands in for the real `node.state` (built from the startup).
+        let state = || NodeFrame::RelayCancelled {
+            request_id: "state".into(),
+        };
+        let kinds = |frames: Vec<NodeFrame>| {
+            frames
+                .iter()
+                .map(|frame| match frame {
+                    NodeFrame::SecretResult { .. } => "secret.result",
+                    NodeFrame::RelayCancelled { .. } => "node.state",
+                    _ => "other",
+                })
+                .collect::<Vec<_>>()
+        };
+        let set = Ok(crate::secrets::Outcome::Set {
+            updated_at: "2026-10-07T00:00:00Z".to_string(),
+        });
+        assert_eq!(
+            kinds(secret_answer(
+                "1".into(),
+                "WSMP_SECRET_A".into(),
+                set,
+                state
+            )),
+            ["secret.result", "node.state"]
+        );
+        let deleted = Ok(crate::secrets::Outcome::Deleted);
+        assert_eq!(
+            kinds(secret_answer(
+                "2".into(),
+                "WSMP_SECRET_A".into(),
+                deleted,
+                state
+            )),
+            ["secret.result", "node.state"]
+        );
+        let missing = Ok(crate::secrets::Outcome::NotFound);
+        assert_eq!(
+            kinds(secret_answer(
+                "3".into(),
+                "WSMP_SECRET_A".into(),
+                missing,
+                state
+            )),
+            ["secret.result"]
+        );
+        let refused = Err(SecretRefusal::TrustRelay);
+        assert_eq!(
+            kinds(secret_answer(
+                "4".into(),
+                "WSMP_SECRET_A".into(),
+                refused,
+                state
+            )),
+            ["secret.result"]
+        );
     }
 }
