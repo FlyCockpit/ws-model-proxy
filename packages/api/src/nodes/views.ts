@@ -9,6 +9,7 @@ import type {
   nodeDetailSchema,
   nodeFabricViewSchema,
   nodeInstanceRefSchema,
+  nodeListRowSchema,
   nodeSummarySchema,
   queuedCommandViewSchema,
 } from "../contracts/nodes";
@@ -22,6 +23,7 @@ import { effectiveHardware, fabricSuggestions, liveMetrics } from "./hardware";
 import { nodeTrustView } from "./trust";
 
 type NodeSummary = z.infer<typeof nodeSummarySchema>;
+type NodeListRow = z.infer<typeof nodeListRowSchema>;
 type NodeDetail = z.infer<typeof nodeDetailSchema>;
 
 const HELD_CLAIMS = ["HELD", "HELD_UNKNOWN"] as const;
@@ -100,6 +102,41 @@ export function toNodeSummary(row: NodeSummaryRow, now: Date): NodeSummary {
       : null,
     removeAfterOfflineMs:
       row.removeAfterOfflineMs === null ? null : Number(row.removeAfterOfflineMs),
+  };
+}
+
+export const nodeListSelect = {
+  ...nodeSummarySelect,
+  hostname: true,
+  features: true,
+  FabricMembers: {
+    select: { ip: true, Fabric: { select: { name: true, _count: { select: { Members: true } } } } },
+  },
+} satisfies Prisma.NodeSelect;
+
+type NodeListSelected = Prisma.NodeGetPayload<{ select: typeof nodeListSelect }>;
+
+/** A node list row: the summary with hostname, fabrics, GPUs and secret names. */
+export function toNodeListRow(row: NodeListSelected, now: Date): NodeListRow {
+  const hardware = effectiveHardware({
+    declaredResources: row.declaredResources,
+    nodeInfo: row.nodeInfo,
+    nodeMetrics: row.nodeMetrics,
+    nodeMetricsAt: row.nodeMetricsAt,
+    heldClaims: [],
+    now,
+  });
+  const features = nodeFeaturesSchema.safeParse(row.features);
+  return {
+    ...toNodeSummary(row, now),
+    hostname: row.hostname,
+    fabrics: row.FabricMembers.map((member) => ({
+      name: member.Fabric.name,
+      ip: member.ip,
+      peerCount: Math.max(0, member.Fabric._count.Members - 1),
+    })).sort((a, b) => a.name.localeCompare(b.name)),
+    gpus: hardware.gpus.map((gpu) => ({ vendor: gpu.vendor, name: gpu.name })),
+    secretNames: features.success ? features.data.secrets.map((secret) => secret.name) : [],
   };
 }
 

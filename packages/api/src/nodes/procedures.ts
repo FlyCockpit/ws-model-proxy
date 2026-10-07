@@ -29,7 +29,7 @@ import {
 } from "./fabrics";
 import { loadNodeDetail, loadNodeSummary } from "./load";
 import { isFullControl, nodeTrustView } from "./trust";
-import { nodeSummarySelect, parseHeldDefinitions, toNodeSummary } from "./views";
+import { nodeListSelect, parseHeldDefinitions, toNodeListRow } from "./views";
 
 function relayOnly(nodeId: string) {
   return refuseAbout(
@@ -63,10 +63,10 @@ export const nodeProcedures = {
     const now = new Date();
     const rows = await prisma.node.findMany({
       where: { userId: context.session.user.id },
-      select: nodeSummarySelect,
+      select: nodeListSelect,
       orderBy: { slug: "asc" },
     });
-    return { nodes: rows.map((row) => toNodeSummary(row, now)) };
+    return { nodes: rows.map((row) => toNodeListRow(row, now)) };
   }),
 
   get: contractProcedure(c.get).handler(async ({ context, input }) =>

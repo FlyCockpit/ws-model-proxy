@@ -408,9 +408,24 @@ export function routeToolCall(name: string, args: Record<string, unknown>): Proc
   }
 }
 
+/** A value without null fields and empty lists, at any depth (compact list rows). */
+function withoutEmpty(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutEmpty);
+  if (value === null || typeof value !== "object") return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry === null || (Array.isArray(entry) && entry.length === 0)) continue;
+    out[key] = withoutEmpty(entry);
+  }
+  return out;
+}
+
 /** Combines the outputs of a tool's procedure calls into its result. */
 function combineOutputs(name: string, calls: ProcedureCall[], outputs: unknown[]): unknown {
   switch (name) {
+    case "nodes_get":
+      // The list is read for every node at once: rows leave out nulls and empty lists.
+      return calls[0]?.path === "nodes.list" ? withoutEmpty(outputs[0]) : outputs[0];
     case "runtimes_get":
     case "pools_get":
       if (outputs.length === 2)

@@ -149,6 +149,29 @@ export const nodeSummarySchema = z
   })
   .strict();
 
+/**
+ * One row of the node list: the summary plus what an agent needs to pick a node without a
+ * get per node (MCP drops nulls and empty lists from these rows).
+ */
+export const nodeListRowSchema = nodeSummarySchema
+  .extend({
+    hostname: z.string().nullable(),
+    /** Fabric memberships: this node's address and how many other nodes share the fabric. */
+    fabrics: z.array(
+      z.object({ name: z.string(), ip: z.string(), peerCount: z.number().int() }).strict(),
+    ),
+    gpus: z.array(
+      z
+        .object({
+          vendor: z.enum(["nvidia", "amd", "intel", "apple", "other"]),
+          name: z.string().nullable(),
+        })
+        .strict(),
+    ),
+    secretNames: z.array(z.string()),
+  })
+  .strict();
+
 export const nodeFabricViewSchema = z
   .object({
     fabricId: idSchema,
@@ -380,8 +403,8 @@ export const nodesContract = {
   list: query(
     "agent",
     noInputSchema,
-    z.object({ nodes: z.array(nodeSummarySchema) }).strict(),
-    "Your nodes with trust, hardware summary and running counts.",
+    z.object({ nodes: z.array(nodeListRowSchema) }).strict(),
+    "Your nodes with trust, hardware summary, fabrics, GPUs, secret names and running counts.",
     ["nodes_get"],
   ),
   get: query(

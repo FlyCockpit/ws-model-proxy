@@ -22,7 +22,7 @@ import {
   nodeFileReadInputSchema,
   nodeFileReadOutputSchema,
   nodeFileWriteInputSchema,
-  nodeSummarySchema,
+  nodeListRowSchema,
   nodesContract,
 } from "./nodes";
 import { poolsContract, poolViewSchema } from "./pools";
@@ -179,7 +179,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
     description:
       "Your nodes, or one in detail: trust, hardware, fabrics, hold, held definitions, instances, found local servers, secret names.",
     input: z.object({ nodeId: idSchema.optional() }).strict(),
-    output: z.union([z.object({ nodes: z.array(nodeSummarySchema) }).strict(), nodeDetailSchema]),
+    output: z.union([z.object({ nodes: z.array(nodeListRowSchema) }).strict(), nodeDetailSchema]),
     procedures: ["nodes.list", "nodes.get"],
   }),
   tool({

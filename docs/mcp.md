@@ -159,7 +159,10 @@ secret files.
 
 A result is JSON in the text content and in `structuredContent.result`. Output
 is redacted (no secret WMP holds ever appears), made JSON-safe, and capped at
-256 KiB; a larger result fails with `OUTPUT_TOO_LARGE`.
+256 KiB; a larger result fails with `OUTPUT_TOO_LARGE`. The `nodes_get` list
+rows (hostname, `fabrics` as name, ip and `peerCount`, `gpus` as vendor and
+name, `secretNames`, counts) leave out null fields and empty lists: a missing
+field is null or empty.
 
 A failed call returns `isError: true` with `structuredContent.error`:
 

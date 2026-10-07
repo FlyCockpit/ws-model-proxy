@@ -46,6 +46,10 @@ function node(overrides: Partial<NodeSummary> = {}): NodeSummary {
     needsYou: 0,
     hold: null,
     removeAfterOfflineMs: null,
+    hostname: null,
+    fabrics: [],
+    gpus: [],
+    secretNames: [],
     ...overrides,
   };
 }
