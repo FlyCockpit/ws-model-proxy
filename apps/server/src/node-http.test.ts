@@ -1,3 +1,7 @@
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Hono } from "hono";
 import { RateLimiterMemory } from "rate-limiter-flexible";
 import { describe, expect, it, vi } from "vitest";
@@ -86,6 +90,37 @@ describe("node bootstrap HTTP", () => {
     const pinned = installScript("https://proxy.example.com", "a".repeat(40));
     expect(pinned).toContain(`--rev '${"a".repeat(40)}' --locked`);
     expect(pinned).not.toContain("--branch");
+  });
+
+  it("finds rustup's cargo over a non-interactive shell that never read the profile", () => {
+    const home = mkdtempSync(join(tmpdir(), "wsmp-install-"));
+    try {
+      const bin = join(home, ".cargo", "bin");
+      mkdirSync(bin, { recursive: true });
+      writeFileSync(join(bin, "cargo"), '#!/bin/sh\necho "fake cargo $*"\n');
+      chmodSync(join(bin, "cargo"), 0o755);
+      writeFileSync(join(home, ".cargo", "env"), `export PATH="${bin}:$PATH"\n`);
+      const script = join(home, "install.sh");
+      writeFileSync(script, installScript("https://proxy.example.com"));
+      const run = (extra: Record<string, string> = {}) =>
+        execFileSync("/bin/sh", [script], {
+          // Only builtins and the fake cargo: a cargo on the host must not satisfy the check.
+          env: { HOME: home, PATH: join(home, "no-tools"), ...extra },
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      expect(run()).toContain("fake cargo install --git");
+      // CARGO_HOME wins when set.
+      const cargoHome = join(home, "custom");
+      mkdirSync(cargoHome);
+      writeFileSync(join(cargoHome, "env"), `export PATH="${bin}:$PATH"\n`);
+      rmSync(join(home, ".cargo", "env"));
+      expect(run({ CARGO_HOME: cargoHome })).toContain("fake cargo install --git");
+      // Without any env file the installer still refuses clearly.
+      expect(() => run()).toThrow();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("enrolls and closes the sessions of credentials the exchange revoked", async () => {

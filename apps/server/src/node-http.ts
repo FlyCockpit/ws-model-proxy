@@ -62,6 +62,15 @@ export function installScript(origin: string, rev: string | undefined = undefine
 # Builds wsmp ${CLI_SOURCE.ref} from source with cargo (release builds of 0.4.0 are not published yet).
 set -eu
 if ! command -v cargo >/dev/null 2>&1; then
+  # A non-interactive SSH shell skips the profile that puts rustup's cargo on PATH.
+  for cargo_env in "\${CARGO_HOME:-}/env" "$HOME/.cargo/env"; do
+    if [ "$cargo_env" != "/env" ] && [ -f "$cargo_env" ]; then
+      . "$cargo_env"
+      break
+    fi
+  done
+fi
+if ! command -v cargo >/dev/null 2>&1; then
   echo "wsmp: cargo is not installed. Install Rust from https://rustup.rs, then run this again." >&2
   exit 1
 fi
