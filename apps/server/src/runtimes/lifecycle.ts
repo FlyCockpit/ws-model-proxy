@@ -36,6 +36,7 @@ import {
   type NodeTrustWire,
   RUNTIME_JOB_PRE_ADMISSION_ERRORS,
   type ServerToNodeControlFrame,
+  STOP_PROOF_FAILURES,
 } from "../relay/frames.js";
 import { nodeOwnerMatches } from "../relay/node-owner.js";
 import type {
@@ -319,6 +320,15 @@ function statusProbeWanted(
     instance.phase === "STOPPING" &&
     probeGeneration === Math.max(currentGeneration, 1)
   );
+}
+
+const STOP_PROOF_FAILURE_CODES: ReadonlySet<string> = new Set(STOP_PROOF_FAILURES);
+
+/** Why a status probe answered not stopped (its `detail`), when the node said (newer nodes). */
+function stopProofFailure(phase: string, detail: string | undefined): string | null {
+  return phase === "STATUS" && detail !== undefined && STOP_PROOF_FAILURE_CODES.has(detail)
+    ? detail
+    : null;
 }
 
 function isStartPhase(phase: string): boolean {
@@ -2191,7 +2201,14 @@ export class RuntimeLifecycle {
       }
       const stopLike = step.phase === "STOP" || step.phase === "STATUS";
       const succeeded = result.status === "succeeded" && (!stopLike || result.stopped);
-      let code = succeeded ? null : (result.error ?? (stopLike ? "not_stopped" : "job_failed"));
+      // A stop proof that failed keeps the node's reason (`port_in_use`, ...) as its error
+      // code: the stop evidence shows a person why the claim stays held.
+      let code = succeeded
+        ? null
+        : (result.error ??
+          (stopLike
+            ? (stopProofFailure(step.phase, result.detail) ?? "not_stopped")
+            : "job_failed"));
       // A Relay-only node cannot be sent the definition: missing there is frozen (terminal).
       if (
         code === "definition_missing" &&
@@ -2379,10 +2396,16 @@ export class RuntimeLifecycle {
 
   // ── Held-unknown probes ──
 
-  /** Ranks marked stopped are probed with a status step every 5 minutes while the node is online. */
+  /**
+   * Ranks marked stopped are probed with a status step every 5 minutes while the node is online,
+   * whatever the instance's phase (a STOPPED instance's hold is proven and released the same
+   * way). Only ranks on connected nodes are read, so ranks on offline nodes never crowd them out.
+   */
   private async probeHeldUnknown() {
+    const online = this.relay.onlineNodeIds?.();
+    if (online && online.length === 0) return;
     const ranks = await prisma.instanceRank.findMany({
-      where: { claim: "HELD_UNKNOWN", nodeId: { not: null } },
+      where: { claim: "HELD_UNKNOWN", nodeId: online ? { in: online } : { not: null } },
       select: {
         id: true,
         nodeId: true,

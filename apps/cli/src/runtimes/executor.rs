@@ -127,6 +127,9 @@ pub struct Outcome {
     pub stopped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<JobError>,
+    /// A stop proof answered not stopped: why (`port_in_use`, `process_alive`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl Outcome {
@@ -135,6 +138,15 @@ impl Outcome {
             status: JobStatus::Succeeded,
             stopped,
             error: None,
+            detail: None,
+        }
+    }
+
+    /// A stop proof that did not prove the stop, and why.
+    fn unproven(reason: &str) -> Self {
+        Self {
+            detail: Some(reason.to_string()),
+            ..Self::ok(false)
         }
     }
 
@@ -143,6 +155,7 @@ impl Outcome {
             status: JobStatus::Failed,
             stopped: false,
             error: Some(error),
+            detail: None,
         }
     }
 }
@@ -828,7 +841,7 @@ impl Executor {
     /// status command (when defined) says stopped, and its port is free. It
     /// runs nothing and needs no record (a lost record cannot block the
     /// proof); a proof resolves the record like a verified stop. Anything
-    /// short of proof answers not stopped.
+    /// short of proof answers not stopped, saying why (`detail`).
     fn prove_stopped(
         &mut self,
         job: &Job,
@@ -860,26 +873,25 @@ impl Executor {
         }
         // A service that runs outside the node's units is proven only by its status command.
         if detached && statuses.is_empty() {
-            return Ok(Outcome::ok(false));
+            return Ok(Outcome::unproven("unowned_service"));
         }
         for unit in &units {
             if runtime.tasks_alive(unit, deadline)? {
-                return Ok(Outcome::ok(false));
+                return Ok(Outcome::unproven("process_alive"));
             }
         }
         for (owner, status) in statuses {
-            if !matches!(
-                runtime.status_until(owner, status, deadline.cap(Duration::from_secs(30))),
-                Ok(false)
-            ) {
-                return Ok(Outcome::ok(false));
+            match runtime.status_until(owner, status, deadline.cap(Duration::from_secs(30))) {
+                Ok(false) => {}
+                Ok(true) => return Ok(Outcome::unproven("status_running")),
+                Err(_) => return Ok(Outcome::unproven("status_unknown")),
             }
         }
         if ports
             .iter()
             .any(|(host, port)| !runtime.port_free(host, *port))
         {
-            return Ok(Outcome::ok(false));
+            return Ok(Outcome::unproven("port_in_use"));
         }
         deadline.remaining()?;
         let now = (self.clock)();

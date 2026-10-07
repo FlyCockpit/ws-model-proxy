@@ -1070,7 +1070,19 @@
         "checkNone": "Ninguna todavía",
         "checkNotProven": "No pudo confirmar la detención",
         "checkProven": "Detención confirmada",
-        "loadFailed": "No se pudo cargar lo que sabe wsmp sobre esta detención."
+        "loadFailed": "No se pudo cargar lo que sabe wsmp sobre esta detención.",
+        "reason": {
+          "process_alive": "Un proceso del servicio sigue en ejecución",
+          "status_running": "El comando de estado indica que está en ejecución",
+          "status_unknown": "El comando de estado no pudo determinarlo",
+          "port_in_use": "El puerto sigue en uso",
+          "unowned_service": "El servicio se ejecuta fuera del control del nodo y no tiene comando de estado",
+          "not_stopped": "El nodo no pudo confirmarlo (actualiza el nodo si esto continúa)"
+        }
+      },
+      "held": {
+        "pill": "Recursos reservados hasta confirmar la detención",
+        "help": "Se indicó a wsmp que este proceso se detuvo, pero aún no ha confirmado que terminó, así que su puerto, memoria y GPU siguen reservados. Mientras el nodo esté en línea, wsmp vuelve a comprobarlo cada 5 minutos y los libera en cuanto una comprobación confirma la detención."
       }
     },
     "nodeGone": "nodo eliminado",

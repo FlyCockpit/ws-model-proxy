@@ -19,7 +19,11 @@ import { useTranslation } from "react-i18next";
 import { CopyableCode } from "@/components/copy-button";
 import { InlineRetry } from "@/components/inline-retry";
 import { NativeSelect } from "@/components/native-select";
-import { MarkStoppedAction, StopNotConfirmedHelp } from "@/components/runtimes/mark-stopped";
+import {
+  HeldUntilConfirmed,
+  MarkStoppedAction,
+  StopNotConfirmedHelp,
+} from "@/components/runtimes/mark-stopped";
 import { type PillTone, StatusPill } from "@/components/status-pill";
 import { refusalText } from "@/lib/refusal-text";
 import { slugify } from "@/lib/slugify";
@@ -309,6 +313,7 @@ function InstancesCard({ runtime }: { runtime: RuntimeDetail }) {
                       </StatusPill>
                     ) : null}
                     {instance.needsOperator === "MARK_STOPPED" ? <StopNotConfirmedHelp /> : null}
+                    <HeldUntilConfirmed instance={instance} />
                   </p>
                   {instance.needsOperator === "STEP" ? (
                     <Link

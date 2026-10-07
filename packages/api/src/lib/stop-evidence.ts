@@ -42,9 +42,12 @@ export function nodeConnectionView(
 type StepReader = { instanceStep: { findFirst: Prisma.InstanceStepDelegate["findFirst"] } };
 
 /**
- * The last finished status probe (automatic stop check) of each rank of the STOPPING instances
- * among `instances`, from this stop only (created since the instance began stopping): a check of
- * an earlier run says nothing about this one. One indexed lookup per rank.
+ * The last finished status probe (automatic stop check) of each rank whose stop is not proven:
+ * every rank of a STOPPING instance, from this stop only (created since the instance began
+ * stopping: a check of an earlier run says nothing about this one), and a rank still held after
+ * it was marked stopped (HELD_UNKNOWN, also on a STOPPED or FAILED instance), from its mark on.
+ * Its `errorCode` says why the node could not prove the stop (`port_in_use`, ...). One indexed
+ * lookup per rank.
  */
 export async function latestStopChecks(
   db: StepReader,
@@ -52,27 +55,34 @@ export async function latestStopChecks(
     id: string;
     phase: string;
     phaseChangedAt: Date;
-    Ranks: ReadonlyArray<{ rank: number }>;
+    Ranks: ReadonlyArray<{ rank: number; claim: string; markedStoppedAt: Date | null }>;
   }>,
 ): Promise<Map<string, StopCheck>> {
   const probes = await Promise.all(
-    instances
-      .filter((row) => row.phase === "STOPPING")
-      .flatMap((row) =>
-        row.Ranks.map(({ rank }) =>
+    instances.flatMap((row) =>
+      row.Ranks.flatMap(({ rank, claim, markedStoppedAt }) => {
+        const since =
+          row.phase === "STOPPING"
+            ? row.phaseChangedAt
+            : claim === "HELD_UNKNOWN"
+              ? (markedStoppedAt ?? row.phaseChangedAt)
+              : null;
+        if (since === null) return [];
+        return [
           db.instanceStep.findFirst({
             where: {
               instanceId: row.id,
               rank,
               phase: "STATUS",
               state: { in: ["SUCCEEDED", "FAILED"] },
-              createdAt: { gte: row.phaseChangedAt },
+              createdAt: { gte: since },
             },
             orderBy: { sequence: "desc" },
             select: { instanceId: true, rank: true, state: true, errorCode: true, updatedAt: true },
           }),
-        ),
-      ),
+        ];
+      }),
+    ),
   );
   const checks = new Map<string, StopCheck>();
   for (const probe of probes)

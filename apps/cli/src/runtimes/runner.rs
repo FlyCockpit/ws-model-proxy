@@ -68,7 +68,7 @@ pub fn result_frame_for(job: &Job, outcome: &Outcome, terminal_id: Option<&str>)
         status: outcome.status,
         stopped: outcome.stopped,
         error: outcome.error,
-        detail: None,
+        detail: outcome.detail.clone(),
         terminal_id: terminal_id.map(str::to_string),
         exit_code: None,
     }

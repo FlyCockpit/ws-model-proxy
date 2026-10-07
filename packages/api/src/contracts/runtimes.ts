@@ -89,8 +89,10 @@ export const instanceRankViewSchema = z
       .nullable(),
     /**
      * The rank's last automatic stop check (status probe) that finished, while the instance is
-     * STOPPING: `proven` false means the node could not confirm the process is gone. Null when
-     * none ran (or the instance is not stopping).
+     * STOPPING or the rank is still held after it was marked stopped (HELD_UNKNOWN, also on a
+     * STOPPED instance): `proven` false means the node could not confirm the process is gone,
+     * and `errorCode` says why (`port_in_use`, `process_alive`, `status_running`,
+     * `status_unknown`, `unowned_service`; `not_stopped` from older nodes). Null when none ran.
      */
     lastStopCheck: z
       .object({ at: isoDateSchema, proven: z.boolean(), errorCode: z.string().nullable() })
