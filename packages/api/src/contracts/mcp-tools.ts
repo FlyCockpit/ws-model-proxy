@@ -332,7 +332,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "runtime_start",
     description:
-      "Start a runtime on nodes (or count instances placed for you), or restart an instance; preview shows placements and what stops. Refused on Relay-only and held nodes.",
+      "Start a startable runtime on nodes (or count instances placed for you), or restart an instance; preview shows placements and what stops. Refused on Relay-only and held nodes.",
     input: runtimesContract.start.input,
     output: runtimesContract.start.output,
     procedures: ["runtimes.start"],

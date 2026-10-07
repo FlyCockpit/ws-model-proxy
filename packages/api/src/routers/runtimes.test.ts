@@ -482,6 +482,35 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
     );
   });
 
+  it("refuses to start or restart an always-on runtime with always_on_runtime, preview too", async () => {
+    setupStart(nodeRow());
+    db.runtime.findFirst.mockResolvedValue({
+      id: "rt-1",
+      kind: "ALWAYS_ON",
+      currentVersionId: "ver-1",
+    } as never);
+    for (const input of [
+      { runtimeId: "rt-1" },
+      { runtimeId: "rt-1", instanceId: "inst-1" },
+      { runtimeId: "rt-1", instanceId: "inst-1", preview: true },
+    ]) {
+      const error = await client(CALLERS.fullAgent())
+        .start(input)
+        .then(
+          () => null,
+          (caught: unknown) => caught,
+        );
+      expect(error).toBeInstanceOf(ORPCError);
+      expect(error).toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "always_on_runtime", subjectId: "rt-1" },
+      });
+      expect((error as ORPCError<string, unknown>).message).toContain("model_test");
+    }
+    expect(db.runtimeOperation.create).not.toHaveBeenCalled();
+    expect(db.runtimeInstance.create).not.toHaveBeenCalled();
+  });
+
   it("an agent starts on a Full-control node without a fingerprint", async () => {
     setupStart(nodeRow());
     const result = await client(CALLERS.fullAgent()).start({ runtimeId: "rt-1" });

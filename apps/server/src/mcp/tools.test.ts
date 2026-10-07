@@ -220,6 +220,37 @@ describe("errors and output", () => {
     });
   });
 
+  it("runtime_start on an always-on runtime carries always_on_runtime through the real procedure", async () => {
+    const { default: prisma } = await import("@ws-model-proxy/db");
+    const db = prisma as unknown as {
+      runtime: { findFirst: ReturnType<typeof vi.fn> };
+      $transaction: ReturnType<typeof vi.fn>;
+    };
+    // The applied start plans inside its graph-write transaction.
+    db.$transaction.mockImplementation(async (work: (tx: unknown) => unknown) => work(prisma));
+    db.runtime.findFirst.mockResolvedValue({
+      id: "rt-1",
+      kind: "ALWAYS_ON",
+      currentVersionId: "ver-1",
+    });
+    for (const args of [
+      { runtimeId: "rt-1" },
+      { runtimeId: "rt-1", instanceId: "inst-1" },
+      { runtimeId: "rt-1", instanceId: "inst-1", preview: true },
+    ]) {
+      const result = await runMcpTool(tool("runtime_start"), {
+        dispatch: testDispatch("FULL"),
+        args,
+      });
+      expect(result.isError).toBe(true);
+      expect(structured(result).error).toMatchObject({
+        code: "BAD_REQUEST",
+        reason: "always_on_runtime",
+        subjectId: "rt-1",
+      });
+    }
+  });
+
   it("hides unknown failures behind a generic error with the request id", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const result = await runMcpTool(tool("nodes_get"), {

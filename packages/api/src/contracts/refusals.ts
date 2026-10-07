@@ -78,6 +78,12 @@ export const REFUSAL_REASONS = [
   // Lane E integration.
   /** A cap's currency changes only while its subject has no spend or reservation this month. */
   "cap_currency_has_spend",
+  // E2E findings (round 2).
+  /**
+   * runtime_start on an always-on runtime: it runs on its own and the proxy only connects to
+   * it, so there is nothing to start or restart (health is re-checked automatically).
+   */
+  "always_on_runtime",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

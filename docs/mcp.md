@@ -76,7 +76,10 @@ A spec has exactly one of:
   with `localhost` or an IP literal as host, written in normalized form.
   `auth` is `{ mode: "bearer" }` or `{ mode: "header", header }` plus
   `env: "WSMP_SECRET_…"`; `headers` are `{ name, env }` pairs. Secrets are
-  referenced by name only.
+  referenced by name only. The proxy never starts or stops it:
+  `runtime_start` (with or without `instanceId` or `preview`) refuses with
+  `always_on_runtime`. Its health is probed automatically; `model_test`
+  checks it now.
 - `launch` (a **startable** runtime: commands that start one):
   - `management`: `process` (the node owns the process) or `service` (stop and
     a `status` command prove it; exit 0 alive, exit 3 stopped).

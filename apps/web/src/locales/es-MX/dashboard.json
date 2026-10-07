@@ -613,7 +613,8 @@
     "no_shared_fabric": "No hay suficientes nodos libres que compartan un fabric.",
     "node_held": "Un nodo está retenido. Libéralo, o que una persona aplique con la vista previa.",
     "secret_needs_node": "Configura este secreto en el nodo con `wsmp secret set`.",
-    "fabric_in_use": "Un runtime que abarca varios nodos usa este fabric. Detenlo primero."
+    "fabric_in_use": "Un runtime que abarca varios nodos usa este fabric. Detenlo primero.",
+    "always_on_runtime": "Un runtime siempre activo se ejecuta por su cuenta; no hay nada que iniciar."
   },
   "models": {
     "loadFailed": "No se pudieron cargar tus modelos.",
@@ -1076,7 +1077,8 @@
       "command_not_running": "Ese comando no se está ejecutando.",
       "other": "Esto no puede ejecutarse como en la vista previa.",
       "fabric_in_use": "Una instancia multinodo en ejecución usa esta red.",
-      "invite_needs_link": "Esta invitación necesita su enlace para aceptarse."
+      "invite_needs_link": "Esta invitación necesita su enlace para aceptarse.",
+      "always_on_runtime": "Los runtimes siempre activos se ejecutan por su cuenta; no hay nada que iniciar."
     },
     "delete": "Eliminar runtime",
     "deleteTitle": "¿Eliminar {{name}}?",

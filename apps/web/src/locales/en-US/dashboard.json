@@ -613,7 +613,8 @@
     "no_shared_fabric": "Not enough free nodes share one fabric.",
     "node_held": "A node is held. Release it, or a person applies with the preview.",
     "secret_needs_node": "Set this secret on the node with `wsmp secret set`.",
-    "fabric_in_use": "A runtime spanning several nodes uses this fabric. Stop it first."
+    "fabric_in_use": "A runtime spanning several nodes uses this fabric. Stop it first.",
+    "always_on_runtime": "An always-on runtime runs on its own; there is nothing to start."
   },
   "models": {
     "loadFailed": "Couldn't load your models.",
@@ -1076,7 +1077,8 @@
       "command_not_running": "That command is not running.",
       "other": "This cannot run as previewed.",
       "fabric_in_use": "A running multi-node instance uses this fabric.",
-      "invite_needs_link": "This invite needs its link to be accepted."
+      "invite_needs_link": "This invite needs its link to be accepted.",
+      "always_on_runtime": "Always-on runtimes run on their own; there is nothing to start."
     },
     "delete": "Delete runtime",
     "deleteTitle": "Delete {{name}}?",
