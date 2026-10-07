@@ -35,6 +35,7 @@ import {
   graphWrite,
   runtimeCapacityFences,
 } from "@ws-model-proxy/api/lib/graph-write";
+import { storedRequestCompat } from "@ws-model-proxy/api/lib/request-compat";
 import { runtimeLaunchHash } from "@ws-model-proxy/api/lib/runtime-launch-hash";
 import {
   READER_SIGNALS,
@@ -285,6 +286,7 @@ const CURRENT_VERSION_SELECT = {
   kvFullThreshold: true,
   engineLoadGate: true,
   advanced: true,
+  compat: true,
 } as const;
 
 function jsonObject(value: Prisma.JsonValue): Record<string, unknown> {
@@ -398,6 +400,7 @@ async function upsertNodeOrigin(
         }
       : AUTOMATIC_LIMITS,
     advanced: current ? jsonObject(current.advanced) : {},
+    compat: current ? storedRequestCompat(current.compat) : {},
     note: "Changed on the node",
   });
   await tx.runtime.update({ where: { id: runtime.id }, data: { currentVersionId: version.id } });

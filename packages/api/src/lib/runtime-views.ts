@@ -15,6 +15,12 @@ import type {
 } from "../contracts/runtimes";
 import { rankCommands, renderStepCommand, type StepCommandPhase } from "./command-render";
 import { jsonObject, registryView } from "./registry-view";
+import {
+  COMPAT_ENDPOINTS,
+  readAcceptedProfile,
+  readLearnedProfile,
+  storedRequestCompat,
+} from "./request-compat";
 import { type RuntimeSpec, runtimeSpecSchema } from "./runtime-spec";
 import { type StepIntent, stepIntentSchema, stepJobPlaceholders } from "./step-intent";
 
@@ -37,6 +43,7 @@ export const VERSION_SELECT = {
   kvFullThreshold: true,
   engineLoadGate: true,
   advanced: true,
+  compat: true,
 } as const satisfies Prisma.RuntimeVersionSelect;
 export type VersionRow = Prisma.RuntimeVersionGetPayload<{ select: typeof VERSION_SELECT }>;
 
@@ -150,6 +157,35 @@ export function versionDetail(
     spec: storedSpec(row.spec),
     limits: limitsView(row, facts),
     advanced: advancedView(row.advanced),
+    compat: storedRequestCompat(row.compat),
+  };
+}
+
+/** The request profile row of the current launch, as `runtimes.get` shows it. */
+export function requestProfileView(row: {
+  source: "LEARNED" | "OPENAPI" | "CATALOG";
+  engineFingerprint: string | null;
+  probedAt: Date | null;
+  accepted: unknown;
+  learned: unknown;
+}) {
+  const accepted = readAcceptedProfile(row.accepted);
+  const learned = readLearnedProfile(row.learned);
+  return {
+    source: row.source,
+    engine: row.engineFingerprint,
+    probedAt: row.probedAt?.toISOString() ?? null,
+    described: COMPAT_ENDPOINTS.filter((endpoint) => accepted?.endpoints[endpoint] !== undefined),
+    learned: COMPAT_ENDPOINTS.flatMap((endpoint) =>
+      (learned.fixes[endpoint] ?? []).map((fix) =>
+        fix.kind === "mapRole"
+          ? `${endpoint} mapRole ${fix.from}>${fix.to}`
+          : fix.kind === "rename"
+            ? `${endpoint} rename ${fix.path}>${fix.to}`
+            : `${endpoint} drop ${fix.path}`,
+      ),
+    ),
+    stripHeaders: learned.stripHeaders,
   };
 }
 

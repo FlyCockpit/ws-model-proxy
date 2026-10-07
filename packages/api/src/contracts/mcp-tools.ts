@@ -126,6 +126,7 @@ export function advertisedToolList(): Array<{
 const SPEC = "Runtime definition; shape in docs/mcp.md, start from runtimes_get presets.";
 const LIMITS = "Limit overrides (null: automatic); runtimes_get shows effective values.";
 const ADVANCED = "Advanced settings by key; pools_get / runtimes_get show keys and defaults.";
+const COMPAT = "Request compatibility (replaces; null: automatic); shape in docs/mcp.md.";
 
 const runtimeCreateInput = z
   .object({
@@ -137,6 +138,7 @@ const runtimeCreateInput = z
     spec: z.record(z.string(), z.unknown()).optional(),
     limits: z.record(z.string(), z.unknown()).optional(),
     advanced: z.record(z.string(), z.unknown()).optional(),
+    compat: z.record(z.string(), z.unknown()).nullable().optional(),
     /** Copy a definition shared with you instead of giving spec. */
     forkFrom: z.object({ runtimeId: idSchema, versionId: idSchema.optional() }).strict().optional(),
     note: noteSchema.optional(),
@@ -153,6 +155,8 @@ const runtimeUpdateInput = z
     spec: z.record(z.string(), z.unknown()).optional(),
     limits: z.record(z.string(), z.unknown()).optional(),
     advanced: z.record(z.string(), z.unknown()).optional(),
+    compat: z.record(z.string(), z.unknown()).nullable().optional(),
+    relearn: z.boolean().optional(),
     restartRunning: z.boolean().optional(),
     /** Per served model; null: what the node detected. */
     modelCapabilities: z
@@ -334,7 +338,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
     input: runtimeCreateInput,
     output: runtimesContract.create.output,
     procedures: ["runtimes.create", "runtimes.presets.list", "runtimes.fork"],
-    compactFields: { spec: SPEC, limits: LIMITS, advanced: ADVANCED },
+    compactFields: { spec: SPEC, limits: LIMITS, advanced: ADVANCED, compat: COMPAT },
   }),
   tool({
     name: "runtime_update",
@@ -345,7 +349,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
       models: z.array(runtimeModelViewSchema).optional(),
     }),
     procedures: ["runtimes.update", "runtimes.models.setCapabilities"],
-    compactFields: { spec: SPEC, limits: LIMITS, advanced: ADVANCED },
+    compactFields: { spec: SPEC, limits: LIMITS, advanced: ADVANCED, compat: COMPAT },
   }),
   tool({
     name: "runtime_delete",

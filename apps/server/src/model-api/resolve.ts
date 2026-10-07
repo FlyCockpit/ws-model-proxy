@@ -19,6 +19,7 @@ import type {
   TargetFailureClass,
   TargetHealthStatus,
 } from "@ws-model-proxy/api/lib/pool-routing";
+import { type RequestCompat, storedRequestCompat } from "@ws-model-proxy/api/lib/request-compat";
 import {
   POOL_ADVANCED_COLUMNS,
   POOL_ADVANCED_OVERRIDES,
@@ -316,6 +317,8 @@ export type RouteInstance = {
   imageTokenAllowance: number | null;
   /** Physical KV-cache incarnation (cache-affinity generations key on it). */
   cacheGeneration: string;
+  /** The version's request compatibility setting ({} = automatic). */
+  requestCompat: RequestCompat;
   // ── runtime identity (context counters, calibration, cache-affinity identity) ──
   /** The launch hash: equal hashes run the same command line. */
   runtimeIdentityKey: string;
@@ -520,6 +523,7 @@ const TARGET_SELECT = {
           kvBudgetTokens: true,
           launchHash: true,
           advanced: true,
+          compat: true,
         },
       },
       Runtime: {
@@ -607,6 +611,7 @@ function routeParts(row: TargetSelected, now: Date): TestRoute | null {
         "CONSERVATIVE_ESTIMATE",
       imageTokenAllowance: advancedNumber(version.advanced, "imageTokenAllowance"),
       cacheGeneration: instance.cacheGeneration,
+      requestCompat: storedRequestCompat(version.compat),
       runtimeIdentityKey: version.launchHash,
       runtimeModel: model.upstreamModelId,
       runtimeRevision: instance.versionId,

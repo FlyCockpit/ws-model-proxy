@@ -58,6 +58,7 @@ model Pool {
   Shares       Share[]
   Invites      ShareInvite[]
   ApiKeys      ApiKeyPool[]
+  Aliases      ModelAlias[]
 
   @@unique([userId, slug])
   @@unique([id, userId])

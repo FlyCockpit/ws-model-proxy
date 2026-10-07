@@ -344,7 +344,7 @@ export function routeToolCall(name: string, args: Record<string, unknown>): Proc
             path: "runtimes.fork",
             input: {
               ...pick(fork, ["runtimeId", "versionId"]),
-              ...pick(args, ["slug", "name", "nodeId", "limits", "advanced", "note"]),
+              ...pick(args, ["slug", "name", "nodeId", "limits", "advanced", "compat", "note"]),
             },
           },
         ];

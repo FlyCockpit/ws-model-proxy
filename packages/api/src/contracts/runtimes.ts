@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { NODE_LOCAL_PLACEHOLDERS } from "../lib/command-render";
+import { COMPAT_ENDPOINTS, requestCompatSchema } from "../lib/request-compat";
 import { RUNTIME_SPEC_WARNINGS, runtimeSpecSchema } from "../lib/runtime-spec";
 import {
   runtimeAdvancedPatchSchema,
@@ -191,6 +192,8 @@ export const runtimeVersionDetailSchema = runtimeVersionSummarySchema
     spec: runtimeSpecSchema,
     limits: runtimeLimitsViewSchema,
     advanced: runtimeAdvancedViewSchema,
+    /** Request compatibility ({} = automatic). */
+    compat: requestCompatSchema,
   })
   .strict();
 
@@ -220,9 +223,26 @@ export const runtimeSummarySchema = z
   })
   .strict();
 
+/**
+ * What the current launch's engine accepts, as learned: `described` lists the endpoints its
+ * OpenAPI description covers; `learned` the fixes learned from its 400s (`endpoint op path`).
+ */
+export const requestProfileViewSchema = z
+  .object({
+    source: z.enum(["LEARNED", "OPENAPI", "CATALOG"]),
+    engine: z.string().nullable(),
+    probedAt: isoDateSchema.nullable(),
+    described: z.array(z.enum(COMPAT_ENDPOINTS)),
+    learned: z.array(z.string()),
+    stripHeaders: z.array(z.string()),
+  })
+  .strict();
+
 export const runtimeDetailSchema = runtimeSummarySchema
   .extend({
     current: runtimeVersionDetailSchema,
+    /** Null until the engine was described or answered a request. */
+    requestProfile: requestProfileViewSchema.nullable(),
     servedModels: z.array(runtimeModelViewSchema),
     instanceList: z.array(instanceViewSchema),
     shares: z.array(z.object({ id: idSchema, email: z.string() }).strict()),
@@ -348,6 +368,8 @@ export const defineResultSchema = z
 
 const limitsInput = runtimeLimitsPatchSchema.optional();
 const advancedInput = runtimeAdvancedPatchSchema.optional();
+/** Replaces the whole setting; null returns it to automatic. */
+const compatInput = requestCompatSchema.nullable().optional();
 
 // ── Procedures ──
 
@@ -432,6 +454,7 @@ export const runtimesContract = {
         spec: runtimeSpecSchema,
         limits: limitsInput,
         advanced: advancedInput,
+        compat: compatInput,
         note: noteSchema.optional(),
       })
       .strict()
@@ -456,6 +479,9 @@ export const runtimesContract = {
         spec: runtimeSpecSchema.optional(),
         limits: limitsInput,
         advanced: advancedInput,
+        compat: compatInput,
+        /** Forget what was learned about the engine's requests; it is learned again. */
+        relearn: z.boolean().optional(),
         note: noteSchema.optional(),
         /** Restart instances whose launch changed (agents: Full-control nodes only). */
         restartRunning: z.boolean().optional(),
@@ -653,6 +679,7 @@ export const runtimesContract = {
         /** Applied on top of the copied definition, exactly as on create. */
         limits: limitsInput,
         advanced: advancedInput,
+        compat: compatInput,
         note: noteSchema.optional(),
       })
       .strict(),

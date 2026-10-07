@@ -20,6 +20,7 @@ import {
   refuseAbout,
 } from "../lib/refuse";
 import { jsonObject } from "../lib/registry-view";
+import { type RequestCompat, storedRequestCompat } from "../lib/request-compat";
 import { RUNTIME_PRESET_LIST } from "../lib/runtime-presets";
 import { type RuntimeSpec, runtimeSpecSchema, runtimeSpecWarnings } from "../lib/runtime-spec";
 import {
@@ -41,6 +42,7 @@ import {
   previousLaunchHashes,
   RUNTIME_SUMMARY_INCLUDE,
   type RuntimeSummaryRow,
+  requestProfileView,
   runtimeSummary,
   storedSpec,
   VERSION_SELECT,
@@ -118,6 +120,7 @@ type CreateInput = {
   spec: RuntimeSpec;
   limits: LimitColumns;
   advanced: Record<string, unknown>;
+  compat: RequestCompat;
   note: string | null;
   forkedFromVersionId?: string;
 };
@@ -154,6 +157,7 @@ async function createRuntime(context: SignedInContext, input: CreateInput) {
         spec: input.spec,
         limits: input.limits,
         advanced: input.advanced,
+        compat: input.compat,
         note: input.note,
       });
       await tx.runtime.update({
@@ -291,7 +295,7 @@ export const runtimesRouter = {
   get: contractProcedure(c.get).handler(async ({ input, context }) => {
     const userId = userIdOf(context);
     const summary = await summaryOf(userId, input.runtimeId);
-    const [current, models, instances, shares, nodes] = await Promise.all([
+    const [current, models, instances, shares, nodes, profile] = await Promise.all([
       prisma.runtimeVersion.findFirstOrThrow({
         where: { id: summary.currentVersion.id },
         select: VERSION_SELECT,
@@ -327,6 +331,20 @@ export const runtimesRouter = {
         where: { userId, OR: [{ trust: "RELAY" }, { trustLowerRequestedAt: { not: null } }] },
         select: { id: true, heldDefinitions: true },
       }),
+      prisma.runtimeRequestProfile.findFirst({
+        where: {
+          runtimeId: input.runtimeId,
+          userId,
+          launchHash: summary.currentVersion.launchHash,
+        },
+        select: {
+          source: true,
+          engineFingerprint: true,
+          probedAt: true,
+          accepted: true,
+          learned: true,
+        },
+      }),
     ]);
     const factsFrom = instances.find((instance) => instance.phase === "READY") ?? null;
     const previous = summary.currentVersion.launchChanged
@@ -346,6 +364,7 @@ export const runtimesRouter = {
     return {
       ...summary,
       current: versionDetail(current, previous, factsFrom),
+      requestProfile: profile ? requestProfileView(profile) : null,
       servedModels: models.map(runtimeModelView),
       instanceList: instances.map(instanceView),
       shares: shares.map((share) => ({ id: share.id, email: share.Grantee.email })),
@@ -430,6 +449,7 @@ export const runtimesRouter = {
       spec: input.spec,
       limits: applyLimitsPatch(AUTOMATIC_LIMITS, input.limits),
       advanced: applyAdvancedPatch({}, input.advanced),
+      compat: input.compat ?? {},
       note: input.note ?? null,
     });
     return { ...result, version: result.runtime.currentVersion };
@@ -463,10 +483,16 @@ export const runtimesRouter = {
       input.limits,
     );
     const advanced = applyAdvancedPatch(jsonObject(current.advanced), input.advanced);
-    const hashes = versionHashes(spec, limits, advanced);
+    // `compat` replaces the whole setting (null: automatic); absent keeps it.
+    const compat =
+      input.compat === undefined ? storedRequestCompat(current.compat) : (input.compat ?? {});
+    const hashes = versionHashes(spec, limits, advanced, compat);
     const warnings = runtimeSpecWarnings(spec);
     const previousOfCurrent = await previousLaunchHashOf(runtime.id, current.version);
 
+    // Forgetting is no version change: the engine is unchanged, only what was learned goes.
+    if (input.relearn)
+      await prisma.runtimeRequestProfile.deleteMany({ where: { runtimeId: runtime.id, userId } });
     if (hashes.contentHash === current.contentHash) {
       if (input.name !== undefined)
         await prisma.runtime.update({ where: { id: runtime.id }, data: { name: input.name } });
@@ -571,6 +597,7 @@ export const runtimesRouter = {
           spec,
           limits,
           advanced,
+          compat,
           note: input.note ?? null,
         });
         await tx.runtime.update({
@@ -849,6 +876,7 @@ export const runtimesRouter = {
         spec: parsed.data,
         limits: AUTOMATIC_LIMITS,
         advanced: {},
+        compat: {},
         note: null,
       });
       return result.runtime;
@@ -990,6 +1018,8 @@ export const runtimesRouter = {
         input.limits,
       ),
       advanced: applyAdvancedPatch(jsonObject(version.advanced), input.advanced),
+      compat:
+        input.compat === undefined ? storedRequestCompat(version.compat) : (input.compat ?? {}),
       note: input.note ?? null,
       forkedFromVersionId: version.id,
     });
