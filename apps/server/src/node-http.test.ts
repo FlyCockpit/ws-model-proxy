@@ -16,8 +16,16 @@ vi.mock("@ws-model-proxy/api/nodes/enroll-exchange", () => ({
 }));
 vi.mock("./client-ip.js", () => ({ resolveClientIp: () => "203.0.113.9" }));
 
-const { CLI_REPOSITORY, SERVER_VERSION, cliInstallSource, installScript, registerNodeHttpRoutes } =
-  await import("./node-http.js");
+const {
+  CLI_PREVIEW_BRANCH,
+  CLI_RELEASE_BINARIES_BY_DEFAULT,
+  CLI_REPOSITORY,
+  SERVER_VERSION,
+  cliInstallSource,
+  installScript,
+  registerNodeHttpRoutes,
+} = await import("./node-http.js");
+const { env } = await import("@ws-model-proxy/env/server");
 
 const CODE = `wsmp_enr_${"A".repeat(26)}`;
 const KEY = `B${"A".repeat(85)}A`;
@@ -74,7 +82,7 @@ describe("node bootstrap HTTP", () => {
     });
   });
 
-  it("serves an installer for this version's release binaries", async () => {
+  it("serves the preview-branch source build until the release flip, unconfigured", async () => {
     const res = await app().hono.request("/install.sh");
     expect(res.headers.get("content-type")).toContain("shellscript");
     expect(res.headers.get("cache-control")).toBe("no-store");
@@ -84,11 +92,37 @@ describe("node bootstrap HTTP", () => {
       installScript("https://proxy.example.com", cliInstallSource(undefined, undefined)),
     );
     expect(text.startsWith("#!/bin/sh\n")).toBe(true);
-    expect(text).toContain(
-      `WSMP_RELEASE_URL='${CLI_REPOSITORY}/releases/download/v${SERVER_VERSION}'`,
-    );
+    if (CLI_RELEASE_BINARIES_BY_DEFAULT) {
+      expect(text).toContain(
+        `WSMP_RELEASE_URL='${CLI_REPOSITORY}/releases/download/v${SERVER_VERSION}'`,
+      );
+    } else {
+      expect(text).toContain("WSMP_RELEASE_URL=''");
+      expect(text).toContain(`install_source --branch '${CLI_PREVIEW_BRANCH}'`);
+    }
     // A download cut short runs nothing: the only top-level command is the last line.
     expect(text.endsWith('\nmain "$@"\n')).toBe(true);
+  });
+
+  it("serves the verified release-binary installer when WMP_CLI_RELEASE_BASE_URL is set", async () => {
+    const mirror = "https://mirror.example.com/wsmp/v0.4.0";
+    Object.assign(env, { WMP_CLI_RELEASE_BASE_URL: mirror });
+    try {
+      const text = await (await app().hono.request("/install.sh")).text();
+      expect(text).toContain(`WSMP_RELEASE_URL='${mirror}'`);
+      expect(text).toContain(
+        CLI_RELEASE_BINARIES_BY_DEFAULT
+          ? `install_source --tag 'v${SERVER_VERSION}'`
+          : `install_source --branch '${CLI_PREVIEW_BRANCH}'`,
+      );
+      // A pinned commit still wins.
+      Object.assign(env, { WMP_CLI_SOURCE_REV: "a".repeat(40) });
+      const pinned = await (await app().hono.request("/install.sh")).text();
+      expect(pinned).toContain("WSMP_RELEASE_URL=''");
+      expect(pinned).toContain(`install_source --rev '${"a".repeat(40)}'`);
+    } finally {
+      Object.assign(env, { WMP_CLI_RELEASE_BASE_URL: undefined, WMP_CLI_SOURCE_REV: undefined });
+    }
   });
 
   it("enrolls and closes the sessions of credentials the exchange revoked", async () => {

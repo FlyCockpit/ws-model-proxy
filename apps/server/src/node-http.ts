@@ -3,8 +3,9 @@
  *
  * - `GET /.well-known/wsmp`: what `wsmp login <url>` checks and pins (canonical origin,
  *   protocol, where to enroll).
- * - `GET /install.sh`: installs the `wsmp` CLI: this version's checksummed release binary, or a
- *   cargo source build where none fits the node or a commit is pinned (`installScript`).
+ * - `GET /install.sh`: installs the `wsmp` CLI: a checksummed release binary (by default once
+ *   `CLI_RELEASE_BINARIES_BY_DEFAULT` is flipped at release, or with `WMP_CLI_RELEASE_BASE_URL`),
+ *   else a cargo source build (`installScript`).
  * - `POST /api/node/enroll`: exchanges an enrollment code for the node credential
  *   (`@ws-model-proxy/api/nodes/enroll-exchange`). Unauthenticated by design (the code is the
  *   credential): no cookies, no CSRF, rate-limited per client IP before any lookup and per code
@@ -59,20 +60,43 @@ export function defaultCliReleaseBaseUrl(): string {
 }
 
 /**
+ * RELEASE FLIP: set to `true` in the release commit (apps/cli/docs/releasing.md, "Flip the CLI
+ * install default"). Until then the v0.4.0 release does not exist, so an unconfigured server
+ * keeps building the preview branch from source and release binaries are opt-in through
+ * `WMP_CLI_RELEASE_BASE_URL`. Once `true`, an unconfigured server installs the release binaries
+ * of {@link SERVER_VERSION} from {@link defaultCliReleaseBaseUrl}.
+ */
+export const CLI_RELEASE_BINARIES_BY_DEFAULT = false;
+
+/** The branch an unconfigured server builds before {@link CLI_RELEASE_BINARIES_BY_DEFAULT}. */
+export const CLI_PREVIEW_BRANCH = "redesign-0.4.0";
+
+/**
  * What `/install.sh` installs. `release`: the checksummed binary for the node's platform from
  * `baseUrl`, or a cargo build of this version's tag where no binary fits. `source`: always a
- * cargo build of the pinned commit (`WMP_CLI_SOURCE_REV`).
+ * cargo build, of the pinned commit (`WMP_CLI_SOURCE_REV`) or else of {@link CLI_PREVIEW_BRANCH}.
  */
 export type CliInstallSource =
-  | { kind: "release"; baseUrl: string }
-  | { kind: "source"; rev: string };
+  | { kind: "release"; baseUrl: string; fallbackBranch?: string }
+  | { kind: "source"; rev?: string };
 
+/** `WMP_CLI_SOURCE_REV` wins, then `WMP_CLI_RELEASE_BASE_URL`, then the built-in default. */
 export function cliInstallSource(
   rev: string | undefined,
   releaseBaseUrl: string | undefined,
+  binariesByDefault: boolean = CLI_RELEASE_BINARIES_BY_DEFAULT,
 ): CliInstallSource {
   if (rev) return { kind: "source", rev };
-  return { kind: "release", baseUrl: releaseBaseUrl ?? defaultCliReleaseBaseUrl() };
+  // Before the flip this version's tag does not exist yet: machines without a binary build the
+  // preview branch instead.
+  if (releaseBaseUrl) {
+    return binariesByDefault
+      ? { kind: "release", baseUrl: releaseBaseUrl }
+      : { kind: "release", baseUrl: releaseBaseUrl, fallbackBranch: CLI_PREVIEW_BRANCH };
+  }
+  return binariesByDefault
+    ? { kind: "release", baseUrl: defaultCliReleaseBaseUrl() }
+    : { kind: "source" };
 }
 
 // Values are embedded in single quotes; refuse anything that could leave them.
@@ -100,12 +124,18 @@ function canonicalOrigin(): string {
 export function installScript(origin: string, source: CliInstallSource): string {
   const releaseUrl = source.kind === "release" ? source.baseUrl.replace(/\/+$/, "") : "";
   const sourceArgs =
-    source.kind === "source"
-      ? `--rev ${shellQuoted(source.rev)}`
-      : `--tag ${shellQuoted(`v${SERVER_VERSION}`)}`;
+    source.kind === "release"
+      ? source.fallbackBranch
+        ? `--branch ${shellQuoted(source.fallbackBranch)}`
+        : `--tag ${shellQuoted(`v${SERVER_VERSION}`)}`
+      : source.rev
+        ? `--rev ${shellQuoted(source.rev)}`
+        : `--branch ${shellQuoted(CLI_PREVIEW_BRANCH)}`;
   const summary =
     source.kind === "source"
-      ? `# Builds wsmp from source with cargo at commit ${source.rev} (WMP_CLI_SOURCE_REV).`
+      ? source.rev
+        ? `# Builds wsmp from source with cargo at commit ${source.rev} (WMP_CLI_SOURCE_REV).`
+        : `# Builds wsmp from source with cargo from the ${CLI_PREVIEW_BRANCH} branch (no release binaries yet).`
       : `# Installs the checksummed wsmp ${SERVER_VERSION} release binary for this machine, or builds\n# v${SERVER_VERSION} from source with cargo where no binary fits.`;
   return `#!/bin/sh
 # WS Model Proxy node CLI (wsmp) installer for ${origin}
@@ -210,7 +240,7 @@ install_release() {
   binary="$tmp/wsmp-$target/wsmp"
   [ -f "$binary" ] && [ ! -L "$binary" ] || die "$archive does not contain wsmp-$target/wsmp."
   "$binary" --version >/dev/null 2>&1 ||
-    die "the downloaded wsmp does not run on this machine; install Rust 1.88+ and run: cargo install --git $WSMP_REPOSITORY --tag v$WSMP_VERSION --locked wsmp"
+    die "the downloaded wsmp does not run on this machine; install Rust 1.88+ and run: cargo install --git $WSMP_REPOSITORY ${sourceArgs} --locked wsmp"
   [ ! -d "$dir/wsmp" ] || die "$dir/wsmp is a directory; remove it, then run this again."
   # Rename over the old binary: a running wsmp keeps its old file.
   chmod 755 "$binary" && mv -f "$binary" "$dir/wsmp" || die "could not install into $dir."

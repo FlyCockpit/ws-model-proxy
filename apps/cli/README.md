@@ -39,9 +39,10 @@ with `cargo install`, which needs Rust 1.88 or newer (<https://rustup.rs>) and a
 Either way the binary lands in `~/.cargo/bin` (`$CARGO_HOME/bin` when set); add it to your `PATH`
 if `wsmp` is not found.
 
-Until the v0.4.0 release is published there is nothing to download: the script stops with
-"could not download .../sha256.sum". A server running a pre-release build sets
-`WMP_CLI_SOURCE_REV` to its commit so nodes build that commit from source. To check a downloaded archive yourself:
+Until v0.4.0 is released, a server's script builds from source by default: the
+`redesign-0.4.0` branch, or the commit in `WMP_CLI_SOURCE_REV`. The server opts into release
+binaries with `WMP_CLI_RELEASE_BASE_URL`; from the release on, that is the default. To check a
+downloaded archive yourself:
 
 ```sh
 gh attestation verify wsmp-aarch64-unknown-linux-gnu.tar.xz --repo FlyCockpit/ws-model-proxy

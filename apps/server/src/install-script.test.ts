@@ -27,6 +27,8 @@ vi.mock("@ws-model-proxy/api/nodes/enroll-exchange", () => ({
 }));
 
 const {
+  CLI_PREVIEW_BRANCH,
+  CLI_RELEASE_BINARIES_BY_DEFAULT,
   CLI_RELEASE_TARGETS,
   CLI_REPOSITORY,
   SERVER_VERSION,
@@ -45,14 +47,37 @@ function has(command: string): boolean {
 }
 
 describe("install.sh rendering", () => {
-  it("defaults to this version's GitHub Release and pins source builds to a commit", () => {
-    expect(cliInstallSource(undefined, undefined)).toEqual({
+  it("chooses a pinned commit, then the configured release, then the built-in default", () => {
+    // Before the release flip, an unconfigured server builds the preview branch.
+    expect(cliInstallSource(undefined, undefined, false)).toEqual({ kind: "source" });
+    // After it, this version's GitHub Release.
+    expect(cliInstallSource(undefined, undefined, true)).toEqual({
       kind: "release",
       baseUrl: `${CLI_REPOSITORY}/releases/download/v${SERVER_VERSION}`,
     });
-    expect(cliInstallSource(undefined, RELEASE)).toEqual({ kind: "release", baseUrl: RELEASE });
-    // A pinned commit always builds from source, whatever the release URL says.
-    expect(cliInstallSource(REV, RELEASE)).toEqual({ kind: "source", rev: REV });
+    expect(cliInstallSource(undefined, undefined)).toEqual(
+      cliInstallSource(undefined, undefined, CLI_RELEASE_BINARIES_BY_DEFAULT),
+    );
+    // Opted in before the flip, machines without a binary build the preview branch (no tag yet).
+    expect(cliInstallSource(undefined, RELEASE, false)).toEqual({
+      kind: "release",
+      baseUrl: RELEASE,
+      fallbackBranch: CLI_PREVIEW_BRANCH,
+    });
+    expect(cliInstallSource(undefined, RELEASE, true)).toEqual({
+      kind: "release",
+      baseUrl: RELEASE,
+    });
+    for (const byDefault of [false, true]) {
+      // A pinned commit always builds from source, whatever the release URL says.
+      expect(cliInstallSource(REV, RELEASE, byDefault)).toEqual({ kind: "source", rev: REV });
+    }
+  });
+
+  it("renders the preview-branch source build", () => {
+    const text = installScript(ORIGIN, { kind: "source" });
+    expect(text).toContain("WSMP_RELEASE_URL=''");
+    expect(text).toContain(`install_source --branch '${CLI_PREVIEW_BRANCH}'`);
   });
 
   it("renders a source-only script for a pinned commit", () => {
@@ -78,7 +103,8 @@ describe("install.sh rendering", () => {
 
   it("parses as POSIX sh", () => {
     for (const source of [
-      cliInstallSource(undefined, undefined),
+      cliInstallSource(undefined, undefined, true),
+      cliInstallSource(undefined, undefined, false),
       cliInstallSource(REV, undefined),
     ]) {
       for (const [shell, ...args] of [["sh"], ["dash"], ["bash", "--posix"], ["busybox", "sh"]]) {
@@ -327,6 +353,25 @@ describe.skipIf(!canRun)("install.sh behavior", () => {
         `cargo install --git ${CLI_REPOSITORY} --tag v${SERVER_VERSION} --locked --force wsmp\n`,
       );
     }
+  });
+
+  it("builds the preview branch where no binary fits, when opted in before the flip", () => {
+    const script = installScript(ORIGIN, cliInstallSource(undefined, RELEASE, false));
+    const out = run(script, { arch: "riscv64" });
+    expect(out.status).toBe(0);
+    expect(out.calls).toBe(
+      `cargo install --git ${CLI_REPOSITORY} --branch ${CLI_PREVIEW_BRANCH} --locked --force wsmp\n`,
+    );
+    // Machines with a binary still get the verified download.
+    expect(run(script).installed).not.toBeNull();
+  });
+
+  it("builds the preview branch and never downloads before the release flip", () => {
+    const out = run(installScript(ORIGIN, { kind: "source" }));
+    expect(out.status).toBe(0);
+    expect(out.calls).toBe(
+      `cargo install --git ${CLI_REPOSITORY} --branch ${CLI_PREVIEW_BRANCH} --locked --force wsmp\n`,
+    );
   });
 
   it("builds the pinned commit and never downloads when WMP_CLI_SOURCE_REV is set", () => {

@@ -80,8 +80,9 @@ curl -fsSL https://wsmp.example.com/install.sh | sh && ~/.cargo/bin/wsmp login h
   release assets (an internal mirror, https only). Unset, it is this
   version's GitHub Release.
 - `WMP_CLI_SOURCE_REV` makes every node build that exact commit from source
-  instead (a full 40-character hash). Use it only for a build that has no
-  release; it no longer needs to be set for 0.4.0.
+  instead (a full 40-character hash), whatever `WMP_CLI_RELEASE_BASE_URL`
+  says. Use it only for a build that has no release; it no longer needs to
+  be set for 0.4.0.
 - Each archive and `sha256.sum` carries a signed build-provenance attestation:
   `gh attestation verify wsmp-x86_64-unknown-linux-gnu.tar.xz --repo FlyCockpit/ws-model-proxy`.
 - Remove a Homebrew 0.3 `wsmp` (`brew uninstall wsmp`) if one is installed:
