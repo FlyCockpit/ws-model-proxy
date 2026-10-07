@@ -46,6 +46,11 @@ export interface RenderShareInviteResult {
   html: string;
 }
 
+/** A caller-supplied name as plain text: control and format characters blanked, capped. */
+function plainText(value: string): string {
+  return value.replace(/[\p{Cc}\p{Cf}]/gu, " ").slice(0, 120);
+}
+
 export function renderShareInvite(args: RenderShareInviteArgs): RenderShareInviteResult {
   const locale = resolveMailerLocale(args.locale);
   const bundle = BUNDLES[locale] ?? BUNDLES["en-US"];
@@ -56,7 +61,7 @@ export function renderShareInvite(args: RenderShareInviteArgs): RenderShareInvit
   }).format(args.expiresAt);
   // The subject is plain text (no HTML), so it takes the raw values with control characters
   // removed; the body takes the escaped ones.
-  const plainOwner = args.ownerName.replace(/[\p{Cc}\p{Cf}]/gu, " ").slice(0, 120);
+  const plainOwner = plainText(args.ownerName);
   const runtime = args.target.kind === "runtime";
   const subject = interpolate(runtime ? bundle.runtimeSubject : bundle.subject, {
     owner: plainOwner,
@@ -64,7 +69,7 @@ export function renderShareInvite(args: RenderShareInviteArgs): RenderShareInvit
   const vars = {
     owner: escapeHtml(args.ownerName),
     ...(args.target.kind === "runtime"
-      ? { runtime: `<strong>${escapeHtml(args.target.name)}</strong>` }
+      ? { runtime: `<strong>${escapeHtml(plainText(args.target.name))}</strong>` }
       : { pool: `<code>${escapeHtml(args.target.callableId)}</code>` }),
     expiresAt: escapeHtml(expiresAt),
   };

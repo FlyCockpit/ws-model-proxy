@@ -30,6 +30,17 @@ describe("renderShareInvite", () => {
     expect(html).toContain(base.inviteUrl);
   });
 
+  it("blanks control characters in a runtime name and caps its length", () => {
+    const { html } = renderShareInvite({
+      ...base,
+      target: { kind: "runtime", name: `Qwen\u202E\r\n${"x".repeat(300)}` },
+      locale: "en-US",
+    });
+    const name = /<strong>([^<]*)<\/strong>/.exec(html)?.[1] ?? "";
+    expect(name).not.toMatch(/[\u202E\r\n]/);
+    expect(name.length).toBe(120);
+  });
+
   it("renders the Spanish bundle", () => {
     const { subject, html } = renderShareInvite({ ...base, locale: "es-MX" });
     expect(subject).toBe("Ana compartió un pool contigo");

@@ -595,6 +595,11 @@ const shares = {
     let shareId: string;
     try {
       shareId = await runAccessTransaction({ owners: [ownerUserId, grantee.id] }, async (tx) => {
+        // The share replaces a pending invite to this address: its link stops working.
+        await tx.shareInvite.updateMany({
+          where: { poolId: pool.id, email, ownerUserId, acceptedAt: null, revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
         const share = await tx.share.create({
           data: {
             poolId: pool.id,
@@ -804,22 +809,32 @@ const invites = {
 
   revoke: contractProcedure(c.invites.revoke).handler(async ({ context, input }) => {
     const ownerUserId = userIdOf(context);
-    const invite = await prisma.shareInvite.findFirst({
-      where: { id: input.inviteId, ownerUserId },
-      select: { id: true, acceptedAt: true, revokedAt: true },
-    });
-    if (!invite) throw notFound("That key, token, connection, share or invite does not exist.");
-    if (invite.acceptedAt) {
-      throw new ORPCError("CONFLICT", {
+    const accepted = () =>
+      new ORPCError("CONFLICT", {
         message: "This invite was accepted. Delete the share instead.",
       });
-    }
-    if (!invite.revokedAt) {
-      await prisma.shareInvite.updateMany({
+    // Under the owner's fence, which every acceptance also takes: an acceptance either committed
+    // before the read (refused here) or waits until this revoke commits (and then finds it
+    // revoked). The count check still catches a write this read did not see.
+    await runAccessTransaction({ owners: [ownerUserId] }, async (tx) => {
+      const invite = await tx.shareInvite.findFirst({
+        where: { id: input.inviteId, ownerUserId },
+        select: { id: true, acceptedAt: true, revokedAt: true },
+      });
+      if (!invite) throw notFound("That key, token, connection, share or invite does not exist.");
+      if (invite.acceptedAt) throw accepted();
+      if (invite.revokedAt) return;
+      const revoked = await tx.shareInvite.updateMany({
         where: { id: invite.id, ownerUserId, acceptedAt: null, revokedAt: null },
         data: { revokedAt: new Date() },
       });
-    }
+      if (revoked.count === 1) return;
+      const now = await tx.shareInvite.findFirst({
+        where: { id: invite.id, ownerUserId },
+        select: { acceptedAt: true },
+      });
+      if (now?.acceptedAt) throw accepted();
+    });
     return { ok: true as const };
   }),
 };

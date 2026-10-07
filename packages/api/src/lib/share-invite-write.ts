@@ -172,11 +172,16 @@ export async function deliverInvite(args: {
       link: shareInviteUrl(args.token, args.owner.locale),
     };
   }
-  // emailSentAt is a status column: no fence.
-  const updated = await prisma.shareInvite.update({
-    where: { id: args.row.id },
-    data: { emailSentAt: new Date() },
-    select: shareInviteSelect,
+  // emailSentAt is a status column: no fence. Guarded on the link just sent: a resend since,
+  // or the target's delete (which deletes its invites), matches nothing, and the answer is the
+  // row as written.
+  const sentAt = new Date();
+  const marked = await prisma.shareInvite.updateMany({
+    where: { id: args.row.id, tokenDigest: shareInviteDigest(args.token) },
+    data: { emailSentAt: sentAt },
   });
-  return { invite: shareInviteView(updated), link: null };
+  return {
+    invite: shareInviteView(marked.count === 1 ? { ...args.row, emailSentAt: sentAt } : args.row),
+    link: null,
+  };
 }

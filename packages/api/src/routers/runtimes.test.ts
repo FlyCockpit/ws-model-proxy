@@ -1174,6 +1174,17 @@ describe("runtimes.shares.create: a direct share only to a proved mailbox", () =
     });
     expect(fenceLog.held).toEqual([`00:owner:${OWNER}`, "00:owner:friend"]);
     expect(db.shareInvite.create).not.toHaveBeenCalled();
+    // A pending invite to the address is withdrawn in the same transaction.
+    expect(db.shareInvite.updateMany.mock.calls[0]?.[0]).toEqual({
+      where: {
+        runtimeId: "rt-1",
+        email: "friend@example.test",
+        ownerUserId: OWNER,
+        acceptedAt: null,
+        revokedAt: null,
+      },
+      data: { revokedAt: expect.any(Date) },
+    });
   });
 
   it.each([
@@ -1251,12 +1262,11 @@ describe("runtimes.shares.create: a direct share only to a proved mailbox", () =
     mailer.isEmailConfigured.mockReturnValue(true);
     setupInvite();
     db.user.findFirst.mockResolvedValue(null);
-    db.shareInvite.update.mockResolvedValue({
-      ...inviteRow("friend@example.test"),
-      emailSentAt: new Date(),
-    } as never);
+    db.shareInvite.updateMany.mockResolvedValue({ count: 1 });
     const result = await client().shares.create(input);
     expect(result).toMatchObject({ kind: "invite", link: null });
+    if (result.kind !== "invite") throw new Error("expected an invite");
+    expect(result.invite.emailSentAt).not.toBeNull();
     expect(mailer.renderShareInvite).toHaveBeenCalledWith(
       expect.objectContaining({ target: { kind: "runtime", name: "Qwen" } }),
     );

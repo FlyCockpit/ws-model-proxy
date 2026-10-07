@@ -951,16 +951,27 @@ export const runtimesRouter = {
       }
       if (grantee.id === userId)
         throw new ORPCError("BAD_REQUEST", { message: "You already own this runtime." });
-      const share = await graphWrite([userId, grantee.id], (tx) =>
-        tx.runtimeShare.upsert({
+      const share = await graphWrite([userId, grantee.id], async (tx) => {
+        // The share replaces a pending invite to this address: its link stops working.
+        await tx.shareInvite.updateMany({
+          where: {
+            runtimeId: runtime.id,
+            email,
+            ownerUserId: userId,
+            acceptedAt: null,
+            revokedAt: null,
+          },
+          data: { revokedAt: new Date() },
+        });
+        return tx.runtimeShare.upsert({
           where: {
             runtimeId_granteeUserId: { runtimeId: runtime.id, granteeUserId: grantee.id },
           },
           create: { runtimeId: runtime.id, ownerUserId: userId, granteeUserId: grantee.id },
           update: {},
           select: { id: true, runtimeId: true, createdAt: true },
-        }),
-      );
+        });
+      });
       return {
         kind: "share" as const,
         share: {
