@@ -36,7 +36,6 @@ import { runWithDbShutdownPermit } from "@ws-model-proxy/db/shutdown-fence";
 import { providerAccountSpend, shareSpend } from "@ws-model-proxy/db/spend";
 import { type ProviderTokenUsage, providerBillableTokens } from "./provider-budget-accounting.js";
 
-export type BudgetMetric = "CONCURRENCY" | "TOKENS" | "SPEND";
 export type UsageConfidence = "REPORTED" | "CALCULATED" | "ESTIMATED";
 
 export interface ProviderLiability {

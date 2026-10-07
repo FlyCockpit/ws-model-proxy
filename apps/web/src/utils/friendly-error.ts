@@ -186,26 +186,6 @@ export function isNotFound(error: unknown): boolean {
   return e.status === 404 || e.code === "NOT_FOUND";
 }
 
-/**
- * True if the error looks like a 403 / FORBIDDEN response from oRPC — e.g. a
- * policy that flipped server-side after the page loaded.
- */
-export function isForbidden(error: unknown): boolean {
-  const e = asErrorShape(error);
-  if (!e) return false;
-  return e.status === 403 || e.code === "FORBIDDEN";
-}
-
-/**
- * True if the error looks like a 400 / BAD_REQUEST response from oRPC — e.g.
- * a field-level schema rejection on the submitted input.
- */
-export function isBadRequest(error: unknown): boolean {
-  const e = asErrorShape(error);
-  if (!e) return false;
-  return e.status === 400 || e.code === "BAD_REQUEST";
-}
-
 type ErrorShape = {
   status?: number;
   code?: string;

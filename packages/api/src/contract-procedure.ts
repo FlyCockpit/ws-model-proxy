@@ -55,10 +55,3 @@ export function stub<Input extends z.ZodType, Output extends z.ZodType>(
 ) {
   return contractProcedure(contract).handler(notImplemented);
 }
-
-/** S0c: a public procedure that exists with its contract; the lane implements it. */
-export function publicStub<Input extends z.ZodType, Output extends z.ZodType>(
-  contract: ProcedureContract<Input, Output>,
-) {
-  return publicContractProcedure(contract).handler(notImplemented);
-}

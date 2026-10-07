@@ -216,9 +216,6 @@ export const PRISMA_ENUM_MIRRORS = {
  * `default`: the registry default.
  */
 export const VALUE_SOURCE = ["override", "auto", "default"] as const;
-export function effectiveOf<T extends z.ZodType>(value: T) {
-  return z.object({ effective: value.nullable(), source: z.enum(VALUE_SOURCE) }).strict();
-}
 
 /** Money as a decimal string (Prisma Decimal(30,9)); never a float. */
 export const moneySchema = z.string().regex(/^-?(0|[1-9][0-9]{0,20})(\.[0-9]{1,9})?$/);

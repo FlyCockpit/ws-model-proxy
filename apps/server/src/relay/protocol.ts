@@ -9,10 +9,7 @@
  */
 import { z } from "zod";
 
-export {
-  type OpenAiCompatibleCapabilities,
-  openAiCompatibleCapabilitiesSchema,
-} from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+export { type OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 
 import {
   type NodeToServerControlFrame,
@@ -28,7 +25,7 @@ import {
   serverToNodeBinaryMetadataSchema,
   serverToNodeControlFrameSchema,
 } from "./frames.js";
-import { type RelayFailure, relayFailureSchema } from "./relay-failure.js";
+import type { RelayFailure } from "./relay-failure.js";
 import { STT_AUDIO_FRAME_MAX_BYTES, sttAudioBodyValid } from "./stt-protocol.js";
 import { stringifyWellFormed } from "./wire-text.js";
 
@@ -39,7 +36,6 @@ export {
   RELAY_PROTOCOL_VERSION,
   RELAY_SUBPROTOCOL,
   type RelayFailure,
-  relayFailureSchema,
 };
 /** Kept names for the model API (the 2.x types were `RelayClient/ServerControlMessage`). */
 export type RelayClientControlMessage = NodeToServerControlFrame;

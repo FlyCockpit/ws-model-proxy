@@ -7,7 +7,6 @@ import { providerHealthCoolingDown } from "./provider-health-state.js";
 // five minutes so a provider response cannot disable a configured target
 // indefinitely; repeated failures re-enter the same bounded cooldown.
 export const PROVIDER_MAX_COOLDOWN_MS = 5 * 60_000;
-export { PROVIDER_HALF_OPEN_LEASE_MS } from "./provider-health-state.js";
 
 const BASE_COOLDOWN_MS = 1_000;
 

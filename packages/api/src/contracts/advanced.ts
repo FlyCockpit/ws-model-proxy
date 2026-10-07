@@ -75,7 +75,6 @@ export const poolOverridesSchema = z
     ...patchShape(poolFlat),
   })
   .strict();
-export type PoolOverrides = z.infer<typeof poolOverridesSchema>;
 
 export const poolAdvancedPatchSchema = z
   .object({

@@ -14,8 +14,6 @@ import {
   USAGE_ROLLUP_MINUTE_RETENTION_DAYS,
 } from "@ws-model-proxy/config/usage-metrics";
 
-export const CACHE_STATS_MAX_LAST_MINUTES = 43_200;
-export const CACHE_STATS_MAX_LAST_DAYS = 395;
 export const CACHE_STATS_MAX_SERIES_POINTS = 120;
 export const CACHE_STATS_LOW_COVERAGE = 0.5;
 
