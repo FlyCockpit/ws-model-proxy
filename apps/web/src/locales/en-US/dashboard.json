@@ -1070,7 +1070,19 @@
         "checkNone": "None yet",
         "checkNotProven": "Couldn't confirm the stop",
         "checkProven": "Confirmed stopped",
-        "loadFailed": "Couldn't load what wsmp knows about this stop."
+        "loadFailed": "Couldn't load what wsmp knows about this stop.",
+        "reason": {
+          "process_alive": "A process of the service still runs",
+          "status_running": "The status command says it is running",
+          "status_unknown": "The status command couldn't tell",
+          "port_in_use": "The port is still in use",
+          "unowned_service": "The service runs outside the node's control and has no status command",
+          "not_stopped": "The node couldn't confirm it (update the node if this keeps happening)"
+        }
+      },
+      "held": {
+        "pill": "Resources held until the stop is confirmed",
+        "help": "This instance is stopped, but wsmp hasn't confirmed its process is gone, so its port, memory and GPUs stay reserved. While the node is online, wsmp checks again every 5 minutes and frees them as soon as a check confirms the stop."
       }
     },
     "nodeGone": "removed node",

@@ -14,6 +14,7 @@ import { ConfirmAction } from "@/components/access/confirm-action";
 import { Help } from "@/components/help";
 import { InlineRetry } from "@/components/inline-retry";
 import { FieldError } from "@/components/nodes/field-error";
+import { StatusPill } from "@/components/status-pill";
 import { TimeAgo } from "@/components/time-ago";
 import { refusalText } from "@/lib/refusal-text";
 import { orpc } from "@/utils/orpc";
@@ -31,6 +32,44 @@ export function StopNotConfirmedHelp() {
     <Help title={t("dashboard:runtime.needsOperator.MARK_STOPPED")}>
       <p>{t("dashboard:runtime.markStopped.help")}</p>
     </Help>
+  );
+}
+
+/** Why the node could not confirm a stop, in words (an unknown code is shown as is). */
+function useCheckReason() {
+  const { t } = useTranslation(["dashboard"]);
+  return (code: string) =>
+    t(`dashboard:runtime.markStopped.evidence.reason.${code}`, { defaultValue: code });
+}
+
+/**
+ * An instance that needs nobody but still holds resources until its stop is confirmed (a rank
+ * marked stopped: HELD_UNKNOWN, also once the instance is STOPPED). wsmp keeps checking on the
+ * node; the help says why the last check could not confirm it.
+ */
+export function HeldUntilConfirmed({ instance }: { instance: Instance }) {
+  const { t } = useTranslation(["dashboard"]);
+  const reason = useCheckReason();
+  const held = instance.ranks.filter((rank) => rank.reserved === "HELD_UNKNOWN");
+  if (instance.needsOperator !== null || held.length === 0) return null;
+  return (
+    <>
+      <StatusPill tone="busy">{t("dashboard:runtime.markStopped.held.pill")}</StatusPill>
+      <Help title={t("dashboard:runtime.markStopped.held.pill")}>
+        <p>{t("dashboard:runtime.markStopped.held.help")}</p>
+        {held.map((rank) => (
+          <p key={rank.nodeNumber} className="break-words">
+            {t("dashboard:runtime.markStopped.evidence.node", {
+              node: rank.nodeSlug ?? t("dashboard:runtime.nodeGone"),
+            })}
+            {": "}
+            {rank.lastStopCheck && !rank.lastStopCheck.proven
+              ? reason(rank.lastStopCheck.errorCode ?? "not_stopped")
+              : t("dashboard:runtime.markStopped.evidence.checkNone")}
+          </p>
+        ))}
+      </Help>
+    </>
   );
 }
 
@@ -201,6 +240,7 @@ function StopEvidence({
 
 function RankEvidence({ rank }: { rank: Rank }) {
   const { t } = useTranslation(["dashboard"]);
+  const reason = useCheckReason();
   const check = rank.lastStopCheck;
   const connection = rank.nodeConnection;
   return (
@@ -246,7 +286,9 @@ function RankEvidence({ rank }: { rank: Rank }) {
                 <TimeAgo value={check.at} />
               </span>
               {check.errorCode ? (
-                <code className="break-all text-xs text-muted-foreground">{check.errorCode}</code>
+                <span className="break-words text-xs text-muted-foreground">
+                  {reason(check.errorCode)}
+                </span>
               ) : null}
             </>
           )}
