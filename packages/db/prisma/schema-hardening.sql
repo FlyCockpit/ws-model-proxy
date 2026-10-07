@@ -1212,6 +1212,21 @@ $share_invite_transition$;
 DROP TRIGGER IF EXISTS share_invite_transition ON share_invite;
 CREATE TRIGGER share_invite_transition BEFORE UPDATE ON share_invite
 FOR EACH ROW EXECUTE FUNCTION enforce_share_invite_transition();
+-- A new invite starts pending: it is accepted (with the share it made) or revoked only by a
+-- later UPDATE, which the transition trigger checks. The deploy marker does not exempt it.
+CREATE OR REPLACE FUNCTION enforce_share_invite_starts_pending()
+RETURNS trigger LANGUAGE plpgsql AS $share_invite_starts_pending$
+BEGIN
+  IF NEW."acceptedAt" IS NOT NULL OR NEW."revokedAt" IS NOT NULL
+     OR NEW."shareId" IS NOT NULL OR NEW."runtimeShareId" IS NOT NULL THEN
+    RAISE EXCEPTION 'a new share invite starts pending' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$share_invite_starts_pending$;
+DROP TRIGGER IF EXISTS share_invite_starts_pending ON share_invite;
+CREATE TRIGGER share_invite_starts_pending BEFORE INSERT ON share_invite
+FOR EACH ROW EXECUTE FUNCTION enforce_share_invite_starts_pending();
 -- A link is valid at most 30 days from when it was issued (created or resent).
 CREATE OR REPLACE FUNCTION enforce_share_invite_expiry()
 RETURNS trigger LANGUAGE plpgsql AS $share_invite_expiry$

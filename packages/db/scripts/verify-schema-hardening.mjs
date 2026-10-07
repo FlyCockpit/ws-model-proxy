@@ -132,6 +132,7 @@ const REQUIRED_OBJECTS = [
   "share_delete_cleanup",
   "share_invite_shape",
   "share_invite_transition",
+  "share_invite_starts_pending",
   "share_invite_one_pending",
   "share_invite_one_pending_runtime",
   "share_invite_target_shape",
@@ -1000,6 +1001,19 @@ try {
      VALUES ('inv-bad', 'pool-a', 'owner-a', 'New@Example.test', ${HEX("a")}, now() + interval '7 days')`,
     "23514",
   );
+  // A new invite starts pending: no forged acceptance (or revocation) on INSERT.
+  for (const [label, columns, values] of [
+    ["accepted", `"acceptedAt", "shareId"`, `now(), 'share-b'`],
+    ["revoked", `"revokedAt"`, `now()`],
+  ]) {
+    await expectFailure(
+      `share_invite_starts_pending ${label}`,
+      `INSERT INTO share_invite (id, "poolId", "ownerUserId", email, "tokenDigest", "expiresAt", ${columns})
+       VALUES ('inv-forged', 'pool-a', 'owner-a', 'f@example.test', ${HEX("9")}, now() + interval '7 days', ${values})`,
+      "23514",
+      /starts pending/,
+    );
+  }
   await client.query(`
     INSERT INTO share_invite (id, "poolId", "ownerUserId", email, "tokenDigest", "expiresAt")
     VALUES ('inv-1', 'pool-a', 'owner-a', 'b@example.test', ${HEX("a")}, now() + interval '7 days')`);
@@ -1131,6 +1145,13 @@ try {
   await client.query(`
     INSERT INTO runtime_share (id, "runtimeId", "ownerUserId", "granteeUserId") VALUES
       ('rsh-b', 'rt-s', 'owner-a', 'owner-b'), ('rsh-c', 'rt-c', 'owner-a', 'owner-b')`);
+  await expectFailure(
+    "share_invite_starts_pending accepted runtime invite",
+    `INSERT INTO share_invite (id, "runtimeId", "ownerUserId", email, "tokenDigest", "expiresAt", "acceptedAt", "runtimeShareId")
+     VALUES ('inv-rforged', 'rt-s', 'owner-a', 'f@example.test', ${HEX("8")}, now() + interval '7 days', now(), 'rsh-b')`,
+    "23514",
+    /starts pending/,
+  );
   await expectFailure(
     "share_invite_target_shape runtime invite names a pool share",
     `UPDATE share_invite SET "acceptedAt" = now(), "shareId" = 'share-b', "runtimeShareId" = 'rsh-b' WHERE id = 'inv-r1'`,
