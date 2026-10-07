@@ -345,7 +345,19 @@ export const profileProcedures = {
           where: { userId, id: { in: nodeIds } },
           select: { id: true },
         });
-        if (owned.length !== nodeIds.length) throw notFound("Node");
+        if (owned.length !== nodeIds.length) {
+          // Name the first id the caller sent that is not theirs (never another user's slug).
+          const ownedIds = new Set(owned.map((node) => node.id));
+          const missing = nodeIds.find((id) => !ownedIds.has(id)) ?? null;
+          throw refuseAbout(
+            "unknown_node",
+            missing,
+            missing === null
+              ? "A node of this profile does not exist."
+              : `No node of yours has the id ${missing}.`,
+            "NOT_FOUND",
+          );
+        }
 
         const existing = input.profileId
           ? await tx.profile.findFirst({
@@ -407,7 +419,7 @@ export const profileProcedures = {
         const previousPins = [...(existing?.Items ?? [])];
         const items = input.items.map((item, position) => {
           const runtime = runtimeById.get(item.runtimeId);
-          if (!runtime) throw notFound("Runtime");
+          if (!runtime) throw notFound(`No runtime of yours has the id ${item.runtimeId}.`);
           if (runtime.kind !== "STARTABLE")
             throw new ORPCError("BAD_REQUEST", {
               message: "A profile pins startable runtimes only.",
@@ -418,7 +430,7 @@ export const profileProcedures = {
             });
           let versionId = item.versionId;
           if (versionId && versionRuntime.get(versionId) !== runtime.id)
-            throw notFound("Runtime version");
+            throw notFound(`Runtime ${item.runtimeId} has no version with the id ${versionId}.`);
           if (!versionId) {
             const index = previousPins.findIndex((pin) => pin.runtimeId === runtime.id);
             if (index >= 0) {

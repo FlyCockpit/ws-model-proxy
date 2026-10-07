@@ -309,6 +309,21 @@ describe("profiles.save hold lines (people only)", () => {
     await expect(client().save(base)).rejects.toMatchObject({ code: "NOT_FOUND" });
     expect(db.node.findMany.mock.calls[0]?.[0]?.where).toMatchObject({ userId: "owner-1" });
   });
+
+  it("names the node it did not find by its id (never `Node undefined`)", async () => {
+    // "a" is the caller's; "z" is not.
+    db.node.findMany.mockResolvedValueOnce([{ id: "a" }] as never);
+    const error = await client()
+      .save({ ...base, nodeIds: ["a", "z"] })
+      .catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      code: "NOT_FOUND",
+      message: "No node of yours has the id z.",
+      data: { reason: "unknown_node", subjectId: "z" },
+    });
+    expect((error as Error).message).not.toContain("undefined");
+    expect(db.profile.updateMany).not.toHaveBeenCalled();
+  });
 });
 
 describe("profiles.save validation", () => {
