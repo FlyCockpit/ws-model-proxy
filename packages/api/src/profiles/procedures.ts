@@ -647,7 +647,13 @@ export const profileProcedures = {
           if (released.count !== 1) throw raced(nodeId);
         }
         const stopIds = plan.preview.stops.map((stop) => stop.instanceId);
-        const stopped = await markInstancesStopping(tx, stopIds, created.id, "profile_apply");
+        const stopped = await markInstancesStopping(
+          tx,
+          userId,
+          stopIds,
+          created.id,
+          "profile_apply",
+        );
         if (stopped !== stopIds.length)
           throw refuse("preview_stale", "An instance this apply stops changed. Preview again.");
         await writePlannedStarts(tx, {

@@ -176,7 +176,7 @@ describe("profiles.apply", () => {
       mode: "applied",
     });
     expect(db.runtimeInstance.updateMany).toHaveBeenCalledWith({
-      where: { id: { in: ["i-1"] }, desiredState: "RUNNING" },
+      where: { id: { in: ["i-1"] }, userId: "owner-1", desiredState: "RUNNING" },
       data: expect.objectContaining({
         desiredState: "STOPPED",
         phase: "STOPPING",

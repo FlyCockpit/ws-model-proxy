@@ -224,13 +224,15 @@ export type StopReason = "stop_requested" | "preempted" | "profile_apply";
  */
 export async function markInstancesStopping(
   tx: Tx,
+  /** The owner: only their instances are marked (the operation is theirs too). */
+  userId: string,
   instanceIds: readonly string[],
   operationId: string,
   reason: StopReason,
 ): Promise<number> {
   if (instanceIds.length === 0) return 0;
   const result = await tx.runtimeInstance.updateMany({
-    where: { id: { in: [...instanceIds] }, desiredState: "RUNNING" },
+    where: { id: { in: [...instanceIds] }, userId, desiredState: "RUNNING" },
     data: {
       desiredState: "STOPPED",
       phase: "STOPPING",

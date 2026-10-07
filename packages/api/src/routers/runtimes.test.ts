@@ -589,7 +589,7 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
     await client().start({ runtimeId: "rt-1", fingerprint: preview.preview.fingerprint });
     expect(fenceLog.held).toEqual([`00:owner:${OWNER}`, "08:capacity:victim"]);
     expect(db.runtimeInstance.updateMany.mock.calls[0]?.[0]).toMatchObject({
-      where: { id: { in: ["victim"] }, desiredState: "RUNNING" },
+      where: { id: { in: ["victim"] }, userId: OWNER, desiredState: "RUNNING" },
       data: {
         desiredState: "STOPPED",
         phase: "STOPPING",

@@ -267,7 +267,7 @@ export const runtimeStart = contractProcedure(c.start).handler(async ({ input, c
         select: { id: true },
       });
       const stopIds = computed.preview.stops.map((stop) => stop.instanceId);
-      const stopped = await markInstancesStopping(tx, stopIds, operation.id, "preempted");
+      const stopped = await markInstancesStopping(tx, userId, stopIds, operation.id, "preempted");
       if (stopped !== stopIds.length)
         throw refuse("preview_stale", "An instance this start stops changed. Preview again.");
       await writePlannedStarts(tx, {
@@ -326,7 +326,7 @@ export const runtimeStop = contractProcedure(c.stop).handler(async ({ input, con
         },
         select: { id: true },
       });
-      await markInstancesStopping(tx, ids, operation.id, "stop_requested");
+      await markInstancesStopping(tx, userId, ids, operation.id, "stop_requested");
       return operation.id;
     },
     async (tx) => {
