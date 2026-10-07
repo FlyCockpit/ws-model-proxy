@@ -90,12 +90,18 @@ const shareSettings = {
   monthlyCap: z.object({ limit: moneySchema, currency: currencySchema }).strict().nullable(),
 };
 
+/** What an invite shares: a pool (its callable id) or a runtime definition (its name). */
+export const shareInviteTargetSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("pool"), poolId: idSchema, callableId: z.string() }).strict(),
+  z.object({ kind: z.literal("runtime"), runtimeId: idSchema, name: z.string() }).strict(),
+]);
+
 export const shareInviteViewSchema = z
   .object({
     id: idSchema,
-    poolId: idSchema,
-    callableId: z.string(),
+    target: shareInviteTargetSchema,
     email: z.string(),
+    /** Pool invites only; a runtime invite is can use, nothing else. */
     canUse: z.boolean(),
     canContribute: z.boolean(),
     priorityClass: z.enum(PRIORITY_CLASS).nullable(),
@@ -192,7 +198,7 @@ export const accessContract = {
         .object({
           byMe: z.array(shareViewSchema),
           withMe: z.array(shareViewSchema),
-          /** Pending invites to e-mails without an account yet. */
+          /** Pending invites (pools and runtime definitions) to e-mails not proved yet. */
           invites: z.array(shareInviteViewSchema),
         })
         .strict(),
@@ -217,7 +223,7 @@ export const accessContract = {
           })
           .strict(),
       ]),
-      "Share a pool with a person. An e-mail without an account becomes an invite (e-mailed when SMTP is set up, otherwise a link to copy); the share starts when they sign up through the link, even with open sign-up off. Without the link an invite is accepted only by a verified e-mail address (inviteAcceptance; with verification off, only the link works: invite_needs_link).",
+      "Share a pool with a person. Only an account whose mailbox the verify-email flow proved gets the share directly; any other e-mail (an unknown one included, answered alike) becomes an invite (e-mailed when SMTP is set up, otherwise a link to copy); the share starts when they sign up or sign in through the link, even with open sign-up off. Without the link an invite is accepted only by a proved e-mail address (inviteAcceptance; with verification off, only the link works: invite_needs_link).",
     ),
     update: mutation(
       "human",
@@ -259,13 +265,13 @@ export const accessContract = {
       "human",
       z.object({ inviteId: idSchema }).strict(),
       z.object({ invite: shareInviteViewSchema, link: z.string().nullable() }).strict(),
-      "Send the invite again with a new link and expiry (the old link stops working; pending invites only). A revoked or accepted e-mail can be invited again with shares.create.",
+      "Send a pool or runtime invite again with a new link and expiry (the old link stops working; pending invites only). A revoked or accepted e-mail can be invited again with shares.create.",
     ),
     revoke: mutation(
       "human",
       z.object({ inviteId: idSchema }).strict(),
       okSchema,
-      "Withdraw an invite.",
+      "Withdraw a pool or runtime invite.",
     ),
   },
   contributing: {

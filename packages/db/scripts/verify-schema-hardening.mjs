@@ -132,7 +132,10 @@ const REQUIRED_OBJECTS = [
   "share_delete_cleanup",
   "share_invite_shape",
   "share_invite_transition",
+  "share_invite_starts_pending",
   "share_invite_one_pending",
+  "share_invite_one_pending_runtime",
+  "share_invite_target_shape",
   "share_invite_expiry",
   "api_key_pool_access",
   // providers and spend
@@ -998,6 +1001,19 @@ try {
      VALUES ('inv-bad', 'pool-a', 'owner-a', 'New@Example.test', ${HEX("a")}, now() + interval '7 days')`,
     "23514",
   );
+  // A new invite starts pending: no forged acceptance (or revocation) on INSERT.
+  for (const [label, columns, values] of [
+    ["accepted", `"acceptedAt", "shareId"`, `now(), 'share-b'`],
+    ["revoked", `"revokedAt"`, `now()`],
+  ]) {
+    await expectFailure(
+      `share_invite_starts_pending ${label}`,
+      `INSERT INTO share_invite (id, "poolId", "ownerUserId", email, "tokenDigest", "expiresAt", ${columns})
+       VALUES ('inv-forged', 'pool-a', 'owner-a', 'f@example.test', ${HEX("9")}, now() + interval '7 days', ${values})`,
+      "23514",
+      /starts pending/,
+    );
+  }
   await client.query(`
     INSERT INTO share_invite (id, "poolId", "ownerUserId", email, "tokenDigest", "expiresAt")
     VALUES ('inv-1', 'pool-a', 'owner-a', 'b@example.test', ${HEX("a")}, now() + interval '7 days')`);
@@ -1076,6 +1092,117 @@ try {
   await client.query(`
     INSERT INTO share_invite (id, "poolId", "ownerUserId", email, "tokenDigest", "expiresAt")
     VALUES ('inv-3', 'pool-a', 'owner-a', 'b@example.test', ${HEX("d")}, now() + interval '7 days')`);
+  // Runtime invites: exactly one target, no pool settings, accepted only into a share of the
+  // invite's runtime, one pending per runtime and e-mail, the runtime's owner only.
+  await expectFailure(
+    "share_invite_target_shape no target",
+    `INSERT INTO share_invite (id, "ownerUserId", email, "tokenDigest", "expiresAt")
+     VALUES ('inv-none', 'owner-a', 'b@example.test', ${HEX("1")}, now() + interval '7 days')`,
+    "23514",
+    /share_invite_target_shape/,
+  );
+  await expectFailure(
+    "share_invite_target_shape both targets",
+    `INSERT INTO share_invite (id, "poolId", "runtimeId", "ownerUserId", email, "tokenDigest", "expiresAt")
+     VALUES ('inv-both', 'pool-a', 'rt-s', 'owner-a', 'r@example.test', ${HEX("2")}, now() + interval '7 days')`,
+    "23514",
+    /share_invite_target_shape/,
+  );
+  await expectFailure(
+    "share_invite_target_shape runtime settings",
+    `INSERT INTO share_invite (id, "runtimeId", "ownerUserId", email, "tokenDigest", "expiresAt", "canContribute")
+     VALUES ('inv-rset', 'rt-s', 'owner-a', 'r@example.test', ${HEX("3")}, now() + interval '7 days', true)`,
+    "23514",
+    /share_invite_target_shape/,
+  );
+  await expectFailure(
+    "share_invite runtime of another owner",
+    `INSERT INTO share_invite (id, "runtimeId", "ownerUserId", email, "tokenDigest", "expiresAt")
+     VALUES ('inv-rown', 'rt-b', 'owner-a', 'r@example.test', ${HEX("4")}, now() + interval '7 days')`,
+    "23503",
+  );
+  await client.query(`
+    INSERT INTO share_invite (id, "runtimeId", "ownerUserId", email, "tokenDigest", "expiresAt")
+    VALUES ('inv-r1', 'rt-s', 'owner-a', 'b@example.test', ${HEX("5")}, now() + interval '7 days')`);
+  await expectFailure(
+    "share_invite_one_pending_runtime",
+    `INSERT INTO share_invite (id, "runtimeId", "ownerUserId", email, "tokenDigest", "expiresAt")
+     VALUES ('inv-r2', 'rt-s', 'owner-a', 'b@example.test', ${HEX("6")}, now() + interval '7 days')`,
+    "23505",
+    /share_invite_one_pending_runtime/,
+  );
+  // The same e-mail may have a pending invite to the pool and to the runtime at once.
+  await expectValue(
+    "share_invite pending per target",
+    `SELECT count(*) FROM share_invite WHERE email = 'b@example.test' AND "acceptedAt" IS NULL AND "revokedAt" IS NULL`,
+    2,
+  );
+  await expectFailure(
+    "share_invite_transition runtime identity",
+    `UPDATE share_invite SET "runtimeId" = 'rt-c' WHERE id = 'inv-r1'`,
+    "55000",
+  );
+  await client.query(`
+    INSERT INTO runtime_share (id, "runtimeId", "ownerUserId", "granteeUserId") VALUES
+      ('rsh-b', 'rt-s', 'owner-a', 'owner-b'), ('rsh-c', 'rt-c', 'owner-a', 'owner-b')`);
+  await expectFailure(
+    "share_invite_starts_pending accepted runtime invite",
+    `INSERT INTO share_invite (id, "runtimeId", "ownerUserId", email, "tokenDigest", "expiresAt", "acceptedAt", "runtimeShareId")
+     VALUES ('inv-rforged', 'rt-s', 'owner-a', 'f@example.test', ${HEX("8")}, now() + interval '7 days', now(), 'rsh-b')`,
+    "23514",
+    /starts pending/,
+  );
+  await expectFailure(
+    "share_invite_target_shape runtime invite names a pool share",
+    `UPDATE share_invite SET "acceptedAt" = now(), "shareId" = 'share-b', "runtimeShareId" = 'rsh-b' WHERE id = 'inv-r1'`,
+    "23514",
+    /share_invite_target_shape/,
+  );
+  await expectFailure(
+    "share_invite_transition accepted runtime share without one",
+    `UPDATE share_invite SET "acceptedAt" = now() WHERE id = 'inv-r1'`,
+    "23514",
+    /share of its runtime/,
+  );
+  await expectFailure(
+    "share_invite_transition accepted runtime share of another runtime",
+    `UPDATE share_invite SET "acceptedAt" = now(), "runtimeShareId" = 'rsh-c' WHERE id = 'inv-r1'`,
+    "23514",
+    /share of its runtime/,
+  );
+  await expectFailure(
+    "share_invite_target_shape pool invite names a runtime share",
+    `UPDATE share_invite SET "acceptedAt" = now(), "shareId" = 'share-b', "runtimeShareId" = 'rsh-b' WHERE id = 'inv-3'`,
+    "23514",
+    /share_invite_target_shape/,
+  );
+  await client.query(
+    `UPDATE share_invite SET "acceptedAt" = now(), "runtimeShareId" = 'rsh-b' WHERE id = 'inv-r1'`,
+  );
+  await expectFailure(
+    "share_invite_transition final runtime share",
+    `UPDATE share_invite SET "runtimeShareId" = 'rsh-c' WHERE id = 'inv-r1'`,
+    "55000",
+  );
+  // Deleting the runtime share keeps the accepted invite as history (the link is nulled).
+  await client.query(`DELETE FROM runtime_share WHERE id = 'rsh-b'`); // policy: bounded-delete
+  await expectValue(
+    "share_invite runtime share deleted",
+    `SELECT count(*) FROM share_invite WHERE id = 'inv-r1' AND "runtimeShareId" IS NULL AND "acceptedAt" IS NOT NULL`,
+    1,
+  );
+  // Deleting the runtime removes its invites.
+  await client.query(`
+    INSERT INTO runtime (id, "userId", slug, name, kind, origin) VALUES
+      ('rt-gone', 'owner-a', 'gone', 'Gone', 'STARTABLE', 'SERVER');
+    INSERT INTO share_invite (id, "runtimeId", "ownerUserId", email, "tokenDigest", "expiresAt")
+    VALUES ('inv-gone', 'rt-gone', 'owner-a', 'g@example.test', ${HEX("7")}, now() + interval '7 days')`);
+  await client.query(`DELETE FROM runtime WHERE id = 'rt-gone'`); // policy: bounded-delete
+  await expectValue(
+    "share_invite runtime delete cascades",
+    `SELECT count(*) FROM share_invite WHERE id = 'inv-gone'`,
+    0,
+  );
   // sidecars
   await expectFailure(
     "pool_sidecar_target_check self",

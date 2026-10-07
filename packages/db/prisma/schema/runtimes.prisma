@@ -98,6 +98,7 @@ model Runtime {
   Instances      RuntimeInstance[]
   Shares         RuntimeShare[]
   ProfileItems   ProfileItem[]
+  Invites        ShareInvite[]
 
   @@unique([userId, slug])
   @@unique([id, userId])
@@ -196,9 +197,10 @@ model RuntimeShare {
   ownerUserId   String
   granteeUserId String
 
-  Runtime Runtime @relation(fields: [runtimeId, ownerUserId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  Owner   User    @relation("RuntimeShareOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Grantee User    @relation("RuntimeShareGrantee", fields: [granteeUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Runtime Runtime       @relation(fields: [runtimeId, ownerUserId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Owner   User          @relation("RuntimeShareOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Grantee User          @relation("RuntimeShareGrantee", fields: [granteeUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Invites ShareInvite[]
 
   @@unique([runtimeId, granteeUserId])
   @@index([granteeUserId])

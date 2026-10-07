@@ -3,16 +3,16 @@ import prisma from "@ws-model-proxy/db";
 import { verifyTransport } from "@ws-model-proxy/mailer";
 import { contractProcedure, publicContractProcedure } from "../contract-procedure";
 import { authContract as c } from "../contracts/account";
-import { callableIdOf } from "../lib/access-views";
+import { shareInviteTarget } from "../lib/access-views";
 import { canUserChangePassword } from "../lib/password-capabilities";
 import { acceptShareInviteByLink } from "../lib/share-invite-accept";
 import { pendingInviteWhere, shareInviteDigest } from "../lib/share-invites";
 
 export const authRouter = {
   /**
-   * The invite sign-up page: who invited this e-mail to which pool. Answers `valid: false`
-   * (and nothing else) for an unknown, used, withdrawn or expired link, so it reveals nothing
-   * without a live token. Charged to the caller's address like sign-in (`limitInviteLookup`).
+   * The invite sign-up page: who invited this e-mail to which pool or runtime definition.
+   * Answers `valid: false` (and nothing else) for an unknown, used, withdrawn or expired link,
+   * so it reveals nothing without a live token. Charged to the caller's address like sign-in (`limitInviteLookup`).
    * The limiter is in-memory, per server process: with several replicas each one keeps its
    * own budget. Without the service (MCP, or an unwired server) the lookup is refused.
    */
@@ -30,16 +30,23 @@ export const authRouter = {
       where: { tokenDigest: shareInviteDigest(input.token), ...pendingInviteWhere(new Date()) },
       select: {
         email: true,
+        poolId: true,
+        runtimeId: true,
         Owner: { select: { name: true } },
         Pool: { select: { slug: true, User: { select: { slug: true } } } },
+        Runtime: { select: { name: true } },
       },
     });
-    if (!invite) return { valid: false, email: null, ownerName: null, callableId: null };
+    if (!invite) return { valid: false, email: null, ownerName: null, target: null };
+    const target = shareInviteTarget(invite);
     return {
       valid: true,
       email: invite.email,
       ownerName: invite.Owner.name,
-      callableId: callableIdOf(invite.Pool.User.slug, invite.Pool.slug),
+      target:
+        target.kind === "pool"
+          ? { kind: "pool" as const, name: target.callableId }
+          : { kind: "runtime" as const, name: target.name },
     };
   }),
   /**

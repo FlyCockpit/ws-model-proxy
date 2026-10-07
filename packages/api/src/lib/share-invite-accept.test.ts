@@ -14,6 +14,7 @@ vi.mock("@ws-model-proxy/mailer", () => ({
 const db = vi.hoisted(() => ({
   shareInvite: { findMany: vi.fn(), findFirst: vi.fn(), updateMany: vi.fn() },
   share: { findUnique: vi.fn(), create: vi.fn() },
+  runtimeShare: { findUnique: vi.fn(), create: vi.fn() },
   user: { findUnique: vi.fn() },
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
@@ -50,7 +51,8 @@ const invite = {
   expiresAt: later,
   acceptedAt: null,
   revokedAt: null,
-  poolId: "pool1",
+  poolId: "pool1" as string | null,
+  runtimeId: null as string | null,
   ownerUserId: "owner",
   canUse: true,
   canContribute: true,
@@ -125,6 +127,59 @@ describe("share invite acceptance", () => {
     });
   });
 
+  it("creates the runtime share for a runtime invite, under both owners' fences", async () => {
+    const runtimeInvite = {
+      ...invite,
+      poolId: null,
+      runtimeId: "rt1",
+      canContribute: false,
+    };
+    db.shareInvite.findMany
+      .mockResolvedValueOnce([runtimeInvite])
+      .mockResolvedValueOnce([runtimeInvite]);
+    db.runtimeShare.findUnique.mockResolvedValue(null);
+    db.runtimeShare.create.mockResolvedValue({ id: "rshare1" });
+    db.shareInvite.updateMany.mockResolvedValue({ count: 1 });
+    await expect(acceptShareInvitesForProvenEmail({ ...user, emailVerified: true })).resolves.toBe(
+      1,
+    );
+    expect(lockOrder.fenceOwners).toHaveBeenCalledWith(db, ["friend", "owner"]);
+    expect(db.runtimeShare.create.mock.calls[0]?.[0].data).toEqual({
+      runtimeId: "rt1",
+      ownerUserId: "owner",
+      granteeUserId: "friend",
+    });
+    expect(db.share.create).not.toHaveBeenCalled();
+    expect(db.shareInvite.updateMany.mock.calls[0]?.[0].data).toEqual({
+      acceptedAt: expect.any(Date),
+      runtimeShareId: "rshare1",
+    });
+  });
+
+  it("accepts a runtime invite link into the existing runtime share, guarded on the token", async () => {
+    const runtimeInvite = { ...invite, poolId: null, runtimeId: "rt1", canContribute: false };
+    db.shareInvite.findFirst.mockResolvedValue(runtimeInvite);
+    db.runtimeShare.findUnique.mockResolvedValue({ id: "rshare0" });
+    db.shareInvite.updateMany.mockResolvedValue({ count: 1 });
+    await expect(acceptShareInviteByLink(other, TOKEN)).resolves.toBe("accepted");
+    expect(lockOrder.fenceOwners).toHaveBeenCalledWith(db, ["friend", "owner"]);
+    expect(db.runtimeShare.findUnique.mock.calls[0]?.[0].where).toEqual({
+      runtimeId_granteeUserId: { runtimeId: "rt1", granteeUserId: "friend" },
+    });
+    expect(db.runtimeShare.create).not.toHaveBeenCalled();
+    const write = db.shareInvite.updateMany.mock.calls[0]?.[0];
+    expect(write?.data).toEqual({ acceptedAt: expect.any(Date), runtimeShareId: "rshare0" });
+    expect(JSON.stringify(write?.where)).toContain(DIGEST);
+  });
+
+  it("answers own for the owner's own runtime invite link", async () => {
+    db.shareInvite.findFirst.mockResolvedValue({ ...invite, poolId: null, runtimeId: "rt1" });
+    await expect(
+      acceptShareInviteByLink({ id: "owner", email: "o@example.test" }, TOKEN),
+    ).resolves.toBe("own");
+    expect(db.runtimeShare.create).not.toHaveBeenCalled();
+  });
+
   it("rolls back when the invite was revoked meanwhile", async () => {
     db.shareInvite.findMany.mockResolvedValueOnce([invite]).mockResolvedValueOnce([invite]);
     db.share.findUnique.mockResolvedValue(null);
@@ -163,7 +218,7 @@ describe("share invite acceptance", () => {
     db.shareInvite.findFirst.mockResolvedValueOnce(invite);
     await expect(
       acceptShareInviteByLink({ id: "owner", email: "o@example.test" }, TOKEN),
-    ).resolves.toBe("own_pool");
+    ).resolves.toBe("own");
     expect(db.share.create).not.toHaveBeenCalled();
   });
 

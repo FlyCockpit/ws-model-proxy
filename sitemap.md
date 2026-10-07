@@ -57,7 +57,7 @@ All require an active session (`_auth` layout).
 | `/{lang}/access` | Redirects to `/{lang}/access/api-keys`. |
 | `/{lang}/access/api-keys` | API keys (all pools or selected pools), expiry, base URL and example. |
 | `/{lang}/access/agents` | MCP URL, OAuth connections (level: change Read-only / Full, disconnect), agent tokens (Read-only / Full, expiry). |
-| `/{lang}/access/shares` | Shares you made and shares you received; your own-key choice for shared pools. |
+| `/{lang}/access/shares` | Shares you made and shares you received; your own-key choice for shared pools; share a pool or a runtime definition by e-mail (a direct share only to a verified mailbox, otherwise an invite link shown once without SMTP); runtime definitions you share; pending pool and runtime invites (resend, withdraw). |
 | `/{lang}/access/contributions` | Pools you may contribute to (add a served model), what you contribute, runtime definitions shared with you (fork). |
 | `/{lang}/activity` | Metrics explorer: scope (pool / runtime / version / node), metric, range and step, compare versions. |
 | `/{lang}/activity/requests` | Request log with filters and delete. |

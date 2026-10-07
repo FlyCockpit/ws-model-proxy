@@ -13,7 +13,7 @@
  * - Graph (configuration): {@link GRAPH_TABLES}: `user`, `node`, `runtime`, its versions,
  *   models, shares, instances, ranks, steps and operations, `execution_target`, profiles,
  *   pools and their 1:1 children, members, routing rules, sidecars, `api_key`(+`_pool`),
- *   `share`, provider accounts, models, credentials, pricing and spend caps.
+ *   `share`, `share_invite`, provider accounts, models, credentials, pricing and spend caps.
  * - Hot path, H-private ({@link HOT_PATH_TABLES}): admission and capacity
  *   runtime state, cache affinity, relay and provider history and accounting,
  *   response stickiness, usage rollups. They reference graph rows by plain id:
@@ -263,6 +263,7 @@ export const GRAPH_TABLES = [
   "api_key",
   "api_key_pool",
   "share",
+  "share_invite",
   "provider_account",
   "provider_model",
   "provider_credential",

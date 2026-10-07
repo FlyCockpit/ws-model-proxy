@@ -88,17 +88,21 @@ export const authContract = {
         valid: z.boolean(),
         email: z.string().nullable(),
         ownerName: z.string().nullable(),
-        callableId: z.string().nullable(),
+        /** What the invite shares: a pool's callable id or a runtime definition's name. */
+        target: z
+          .object({ kind: z.enum(["pool", "runtime"]), name: z.string() })
+          .strict()
+          .nullable(),
       })
       .strict(),
-    "Public: who invited this e-mail to which pool (valid false for an unknown, used or expired link).",
+    "Public: who invited this e-mail to which pool or runtime definition (valid false for an unknown, used or expired link).",
   ),
   /** A signed-in person opening an invite link (rate-limited per user). */
   acceptInvite: mutation(
     "human",
     z.object({ token: z.string().regex(SHARE_INVITE_TOKEN_PATTERN) }).strict(),
-    z.object({ result: z.enum(["accepted", "invalid", "own_pool", "in_use"]) }).strict(),
-    "Accept a pool invite link as the signed-in person, whatever their e-mail (the token is the proof).",
+    z.object({ result: z.enum(["accepted", "invalid", "own", "in_use"]) }).strict(),
+    "Accept a pool or runtime invite link as the signed-in person, whatever their e-mail (the token is the proof). own: the invite is to something you own.",
   ),
   verifyEmailTransport: query(
     "public",

@@ -1,11 +1,13 @@
 /**
- * Share invites (owner decision round 3): sharing a pool with an e-mail that has no account yet.
+ * Share invites (owner decision round 3): sharing a pool, or a runtime definition, with an e-mail
+ * whose mailbox is not proved (an unknown one included).
  *
  * The token (`wsmp_inv_` + 26 base32 characters, 130 random bits) is shown once: e-mailed when
  * SMTP is configured, otherwise returned to the owner to copy. Only its purpose HMAC is stored
  * (`credentialDigest("shareInvite", token)`, 64 hex characters, the hardening shape).
  *
- * Acceptance: `lib/share-invite-accept.ts` (the `inviteAcceptance` rule).
+ * Writing and delivery: `lib/share-invite-write.ts`. Acceptance: `lib/share-invite-accept.ts`
+ * (the `inviteAcceptance` rule).
  */
 import { randomBytes } from "node:crypto";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@ws-model-proxy/config/locales";
@@ -61,7 +63,7 @@ export function shareInviteUrl(token: string, locale: string | null | undefined)
 export async function sendShareInviteEmail(args: {
   to: string;
   ownerName: string;
-  callableId: string;
+  target: { kind: "pool"; callableId: string } | { kind: "runtime"; name: string };
   token: string;
   expiresAt: Date;
   locale: string | null | undefined;
@@ -70,7 +72,7 @@ export async function sendShareInviteEmail(args: {
   try {
     const { subject, html } = renderShareInvite({
       ownerName: args.ownerName,
-      callableId: args.callableId,
+      target: args.target,
       inviteUrl: shareInviteUrl(args.token, args.locale),
       expiresAt: args.expiresAt,
       locale: args.locale ?? DEFAULT_LOCALE,

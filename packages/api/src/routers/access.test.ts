@@ -126,6 +126,8 @@ const inviteRow = {
   expiresAt: now,
   emailSentAt: null,
   Pool: { slug: "chat", User: { slug: "owner" } },
+  runtimeId: null,
+  Runtime: null,
 };
 
 /** Every fence requested through `wsmp_acquire_fences`, in request order. */
@@ -680,6 +682,8 @@ describe("shares", () => {
       expiresAt: new Date(now.getTime() + 14 * 86_400_000),
       emailSentAt: null,
       Pool: { slug: "chat", User: { slug: "owner" } },
+      runtimeId: null,
+      Runtime: null,
     })) as never);
     const result = await client().shares.create(input);
     if (result.kind !== "invite") throw new Error("expected an invite");
@@ -711,14 +715,70 @@ describe("shares", () => {
       expiresAt: now,
       emailSentAt: null,
       Pool: { slug: "chat", User: { slug: "owner" } },
+      runtimeId: null,
+      Runtime: null,
     };
     db.shareInvite.create.mockResolvedValue(inviteRow as never);
-    db.shareInvite.update.mockResolvedValue({ ...inviteRow, emailSentAt: now } as never);
+    db.shareInvite.updateMany.mockResolvedValue({ count: 1 });
     const result = await client().shares.create(input);
     expect(result).toMatchObject({ kind: "invite", link: null });
+    if (result.kind !== "invite") throw new Error("expected an invite");
+    expect(result.invite.emailSentAt).not.toBeNull();
     expect(mailer.sendEmail).toHaveBeenCalledWith(
       expect.objectContaining({ to: "friend@example.test" }),
     );
+    // Marked sent only while the invite still has the link that went out.
+    const marked = db.shareInvite.updateMany.mock.calls.at(-1)?.[0];
+    expect(marked?.where).toEqual({
+      id: "inv1",
+      tokenDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    expect(marked?.data).toEqual({ emailSentAt: expect.any(Date) });
+    expect(db.shareInvite.update).not.toHaveBeenCalled();
+  });
+
+  it("answers the invite as written when it vanished before it could be marked e-mailed", async () => {
+    mailer.isEmailConfigured.mockReturnValue(true);
+    db.pool.findFirst.mockResolvedValue(pool as never);
+    db.user.findFirst.mockResolvedValue(null);
+    db.shareInvite.findFirst.mockResolvedValue(null);
+    db.shareInvite.count.mockResolvedValue(0);
+    db.shareInvite.create.mockResolvedValue(inviteRow as never);
+    // The pool's delete removed the invite (or a resend rotated it) after it was written.
+    db.shareInvite.updateMany.mockResolvedValue({ count: 0 });
+    const result = await client().shares.create(input);
+    expect(result).toMatchObject({ kind: "invite", link: null, invite: { emailSentAt: null } });
+  });
+
+  it("withdraws a pending invite to the address when the share is made directly", async () => {
+    db.pool.findFirst.mockResolvedValue(pool as never);
+    db.user.findFirst.mockResolvedValue({
+      id: "friend",
+      email: "friend@example.test",
+      provedEmail: "friend@example.test",
+    } as never);
+    const order: string[] = [];
+    db.shareInvite.updateMany.mockImplementation((async () => {
+      order.push("withdraw");
+      return { count: 1 };
+    }) as never);
+    db.share.create.mockImplementation((async () => {
+      order.push("share");
+      return { id: "share1" };
+    }) as never);
+    db.share.findUnique.mockResolvedValue(shareRow as never);
+    await client().shares.create(input);
+    expect(db.shareInvite.updateMany.mock.calls[0]?.[0]).toEqual({
+      where: {
+        poolId: "pool1",
+        email: "friend@example.test",
+        ownerUserId: "owner",
+        acceptedAt: null,
+        revokedAt: null,
+      },
+      data: { revokedAt: expect.any(Date) },
+    });
+    expect(order).toEqual(["withdraw", "share"]);
   });
 
   it("withdraws an expired invite to the same address before inviting again", async () => {
@@ -798,6 +858,8 @@ describe("shares", () => {
       expiresAt: now,
       emailSentAt: null,
       Pool: { slug: "chat", User: { slug: "owner" } },
+      runtimeId: null,
+      Runtime: null,
     } as never);
     const result = await client().invites.resend({ inviteId: "inv1" });
     const token = new URL(result.link ?? "").searchParams.get("invite") ?? "";
@@ -824,6 +886,101 @@ describe("shares", () => {
       code: "CONFLICT",
     });
     expect(db.shareInvite.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("resends a runtime invite: a new link, e-mailed naming the runtime definition", async () => {
+    mailer.isEmailConfigured.mockReturnValue(true);
+    db.user.findUnique.mockResolvedValue({ name: "Owner", locale: "en-US" } as never);
+    db.shareInvite.findFirst.mockResolvedValue({
+      createdAt: new Date(Date.now() - 86_400_000),
+      updatedAt: new Date(Date.now() - 86_400_000),
+    } as never);
+    db.shareInvite.updateMany.mockResolvedValue({ count: 1 });
+    const runtimeInvite = {
+      ...inviteRow,
+      id: "inv-rt",
+      poolId: null,
+      Pool: null,
+      runtimeId: "rt1",
+      Runtime: { name: "Qwen" },
+    };
+    db.shareInvite.findUniqueOrThrow.mockResolvedValue(runtimeInvite as never);
+    db.shareInvite.update.mockResolvedValue({ ...runtimeInvite, emailSentAt: now } as never);
+    const result = await client().invites.resend({ inviteId: "inv-rt" });
+    expect(result.link).toBeNull();
+    expect(result.invite.target).toEqual({ kind: "runtime", runtimeId: "rt1", name: "Qwen" });
+    expect(mailer.renderShareInvite).toHaveBeenCalledWith(
+      expect.objectContaining({ target: { kind: "runtime", name: "Qwen" } }),
+    );
+    expect(db.shareInvite.updateMany.mock.calls[0]?.[0]?.where).toMatchObject({
+      id: "inv-rt",
+      ownerUserId: "owner",
+    });
+  });
+
+  it("withdraws a pending runtime invite", async () => {
+    db.shareInvite.findFirst.mockResolvedValue({
+      id: "inv-rt",
+      acceptedAt: null,
+      revokedAt: null,
+    } as never);
+    db.shareInvite.updateMany.mockResolvedValue({ count: 1 });
+    await expect(client().invites.revoke({ inviteId: "inv-rt" })).resolves.toEqual({ ok: true });
+    expect(db.shareInvite.updateMany.mock.calls[0]?.[0]).toMatchObject({
+      where: { id: "inv-rt", ownerUserId: "owner", acceptedAt: null, revokedAt: null },
+      data: { revokedAt: expect.any(Date) },
+    });
+  });
+
+  it("withdraws under the owner's fence and refuses when an acceptance won the race", async () => {
+    db.shareInvite.findFirst
+      .mockResolvedValueOnce({ id: "inv-rt", acceptedAt: null, revokedAt: null } as never)
+      .mockResolvedValueOnce({ acceptedAt: new Date() } as never);
+    // The acceptance committed between the read and the guarded revoke.
+    db.shareInvite.updateMany.mockResolvedValue({ count: 0 });
+    await expect(client().invites.revoke({ inviteId: "inv-rt" })).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: "This invite was accepted. Delete the share instead.",
+    });
+    expect(heldFences()).toEqual(["00:owner:owner"]);
+  });
+
+  it("refuses to withdraw an accepted invite, and is a no-op for a withdrawn one", async () => {
+    db.shareInvite.findFirst.mockResolvedValueOnce({
+      id: "inv1",
+      acceptedAt: new Date(),
+      revokedAt: null,
+    } as never);
+    await expect(client().invites.revoke({ inviteId: "inv1" })).rejects.toMatchObject({
+      code: "CONFLICT",
+    });
+    db.shareInvite.findFirst.mockResolvedValueOnce({
+      id: "inv1",
+      acceptedAt: null,
+      revokedAt: new Date(),
+    } as never);
+    await expect(client().invites.revoke({ inviteId: "inv1" })).resolves.toEqual({ ok: true });
+    expect(db.shareInvite.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("lists pending pool and runtime invites with their targets", async () => {
+    db.share.findMany.mockResolvedValue([]);
+    db.shareInvite.findMany.mockResolvedValue([
+      inviteRow,
+      {
+        ...inviteRow,
+        id: "inv-rt",
+        poolId: null,
+        Pool: null,
+        runtimeId: "rt1",
+        Runtime: { name: "Qwen" },
+      },
+    ] as never);
+    const result = await client().shares.list();
+    expect(result.invites.map((invite) => invite.target)).toEqual([
+      { kind: "pool", poolId: "pool1", callableId: "owner/chat" },
+      { kind: "runtime", runtimeId: "rt1", name: "Qwen" },
+    ]);
   });
 
   it("resends and withdraws only the caller's own invites", async () => {
@@ -1047,11 +1204,30 @@ describe("auth.inviteInfo (public)", () => {
       } satisfies Context,
     });
 
+  it("names a runtime invite's owner and runtime definition", async () => {
+    db.shareInvite.findFirst.mockResolvedValue({
+      email: "friend@example.test",
+      poolId: null,
+      runtimeId: "rt1",
+      Owner: { name: "Owner" },
+      Pool: null,
+      Runtime: { name: "Qwen" },
+    } as never);
+    await expect(
+      auth().inviteInfo({ token: "wsmp_inv_ABCDEFGHIJKLMNOPQRSTUVWXYZ" }),
+    ).resolves.toEqual({
+      valid: true,
+      email: "friend@example.test",
+      ownerName: "Owner",
+      target: { kind: "runtime", name: "Qwen" },
+    });
+  });
+
   it("answers valid: false and nothing else for an unknown link", async () => {
     db.shareInvite.findFirst.mockResolvedValue(null);
     await expect(
       auth().inviteInfo({ token: "wsmp_inv_ABCDEFGHIJKLMNOPQRSTUVWXYZ" }),
-    ).resolves.toEqual({ valid: false, email: null, ownerName: null, callableId: null });
+    ).resolves.toEqual({ valid: false, email: null, ownerName: null, target: null });
     expect(db.shareInvite.findFirst.mock.calls[0]?.[0]?.where).toMatchObject({
       tokenDigest: credentialDigest("shareInvite", "wsmp_inv_ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
       acceptedAt: null,

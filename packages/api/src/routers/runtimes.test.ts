@@ -4,6 +4,18 @@ import { mockDeep, mockReset } from "vitest-mock-extended";
 import type { PrismaClient } from "../../../db/prisma/generated/client";
 
 vi.mock("@ws-model-proxy/db", () => ({ default: mockDeep<PrismaClient>() }));
+vi.mock("@ws-model-proxy/env/server", () => ({
+  env: {
+    BETTER_AUTH_URL: "https://proxy.example.com",
+    BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret-0123",
+  },
+}));
+const mailer = vi.hoisted(() => ({
+  isEmailConfigured: vi.fn(() => false),
+  sendEmail: vi.fn(async () => undefined),
+  renderShareInvite: vi.fn(() => ({ subject: "s", html: "h" })),
+}));
+vi.mock("@ws-model-proxy/mailer", () => mailer);
 const fenceLog = vi.hoisted(() => ({ held: [] as string[], deletes: [] as unknown[] }));
 vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => {
   const real = await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>();
@@ -12,6 +24,9 @@ vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => {
     acquireFences: vi.fn(async (_tx: unknown, requested: Iterable<string>) => {
       fenceLog.held.push(...requested);
       return true;
+    }),
+    fenceOwners: vi.fn(async (_tx: unknown, userIds: Iterable<string>) => {
+      fenceLog.held.push(...[...new Set(userIds)].sort().map((userId) => `00:owner:${userId}`));
     }),
     fenceParentDelete: vi.fn(async (_tx: unknown, scope: unknown) => {
       fenceLog.deletes.push(scope);
@@ -28,6 +43,7 @@ vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
 }));
 
 import prisma from "@ws-model-proxy/db";
+import { credentialDigest } from "@ws-model-proxy/db/node-security";
 import type { DeepMockProxy } from "vitest-mock-extended";
 import { runtimeLaunchHash } from "../lib/runtime-launch-hash";
 import { RUNTIME_PRESET_LIST } from "../lib/runtime-presets";
@@ -975,6 +991,27 @@ describe("graph-write fences", () => {
     expect(fenceLog.deletes).toEqual([{ userId: OWNER, runtimeIds: ["rt-1"] }]);
     expect(result.removedMembers).toEqual(["mem-1"]);
   });
+
+  it("deleting a runtime removes its invites, so no link opens it", async () => {
+    db.runtime.findFirst.mockResolvedValue({ id: "rt-1" } as never);
+    db.runtimeInstance.count.mockResolvedValue(0);
+    db.profileItem.count.mockResolvedValue(0);
+    db.poolMember.findMany.mockResolvedValue([]);
+    const order: string[] = [];
+    db.shareInvite.deleteMany.mockImplementation((async () => {
+      order.push("invites");
+      return { count: 2 };
+    }) as never);
+    db.runtime.delete.mockImplementation((async () => {
+      order.push("runtime");
+      return { id: "rt-1" };
+    }) as never);
+    await client().delete({ runtimeId: "rt-1" });
+    expect(db.shareInvite.deleteMany.mock.calls[0]?.[0]).toEqual({
+      where: { runtimeId: "rt-1", ownerUserId: OWNER },
+    });
+    expect(order).toEqual(["invites", "runtime"]);
+  });
 });
 
 describe("runtimes.fork (create-shaped output)", () => {
@@ -1066,5 +1103,195 @@ describe("runtimes.instances.forget", () => {
       },
       data: { state: "CANCELLED", operatorHold: null },
     });
+  });
+});
+
+describe("runtimes.shares.create: a direct share only to a proved mailbox", () => {
+  const owner = { name: "Owner", locale: "en-US" };
+  const input = { runtimeId: "rt-1", email: "Friend@Example.test" };
+  const later = new Date(Date.now() + 14 * 86_400_000);
+  function inviteRow(email: string) {
+    return {
+      id: "inv-1",
+      poolId: null,
+      runtimeId: "rt-1",
+      email,
+      canUse: true,
+      canContribute: false,
+      priorityClass: null,
+      createdAt: new Date(),
+      expiresAt: later,
+      emailSentAt: null,
+      Pool: null,
+      Runtime: { name: "Qwen" },
+    };
+  }
+  function setupInvite() {
+    db.runtime.findFirst.mockResolvedValue({ id: "rt-1", User: owner } as never);
+    db.shareInvite.updateMany.mockResolvedValue({ count: 0 });
+    db.shareInvite.findFirst.mockResolvedValue(null);
+    db.shareInvite.count.mockResolvedValue(0);
+    db.shareInvite.create.mockImplementation((async (args: { data: { email: string } }) =>
+      inviteRow(args.data.email)) as never);
+  }
+
+  beforeEach(() => {
+    mailer.isEmailConfigured.mockReturnValue(false);
+    mailer.sendEmail.mockClear();
+    mailer.renderShareInvite.mockClear();
+  });
+
+  it("shares directly with an account whose mailbox was proved, under both owners' fences", async () => {
+    db.runtime.findFirst.mockResolvedValue({ id: "rt-1", User: owner } as never);
+    db.user.findFirst.mockResolvedValue({
+      id: "friend",
+      email: "Friend@example.test",
+      provedEmail: "friend@example.test",
+    } as never);
+    const createdAt = new Date("2026-10-07T00:00:00Z");
+    db.runtimeShare.upsert.mockResolvedValue({
+      id: "rsh-1",
+      runtimeId: "rt-1",
+      createdAt,
+    } as never);
+    const result = await client().shares.create(input);
+    expect(result).toEqual({
+      kind: "share",
+      share: {
+        id: "rsh-1",
+        runtimeId: "rt-1",
+        email: "Friend@example.test",
+        createdAt: createdAt.toISOString(),
+      },
+    });
+    expect(db.user.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      email: { equals: "friend@example.test", mode: "insensitive" },
+    });
+    expect(db.runtimeShare.upsert.mock.calls[0]?.[0].create).toEqual({
+      runtimeId: "rt-1",
+      ownerUserId: OWNER,
+      granteeUserId: "friend",
+    });
+    expect(fenceLog.held).toEqual([`00:owner:${OWNER}`, "00:owner:friend"]);
+    expect(db.shareInvite.create).not.toHaveBeenCalled();
+    // A pending invite to the address is withdrawn in the same transaction.
+    expect(db.shareInvite.updateMany.mock.calls[0]?.[0]).toEqual({
+      where: {
+        runtimeId: "rt-1",
+        email: "friend@example.test",
+        ownerUserId: OWNER,
+        acceptedAt: null,
+        revokedAt: null,
+      },
+      data: { revokedAt: expect.any(Date) },
+    });
+  });
+
+  it.each([
+    [
+      "never proved its mailbox",
+      { id: "squatter", email: "friend@example.test", provedEmail: null },
+    ],
+    [
+      "proved another address",
+      { id: "changed", email: "friend@example.test", provedEmail: "old@example.test" },
+    ],
+  ])("invites an account that %s instead of sharing directly", async (_label, account) => {
+    setupInvite();
+    db.user.findFirst.mockResolvedValue(account as never);
+    const result = await client().shares.create(input);
+    expect(result.kind).toBe("invite");
+    expect(db.runtimeShare.upsert).not.toHaveBeenCalled();
+    expect(db.runtimeShare.create).not.toHaveBeenCalled();
+  });
+
+  it("answers an unknown e-mail exactly like an unproved account (no account oracle)", async () => {
+    setupInvite();
+    db.user.findFirst.mockResolvedValueOnce(null);
+    const unknown = await client().shares.create(input);
+    setupInvite();
+    db.user.findFirst.mockResolvedValueOnce({
+      id: "squatter",
+      email: "friend@example.test",
+      provedEmail: null,
+    } as never);
+    const unproved = await client().shares.create(input);
+    const shape = (result: typeof unknown) => ({
+      ...result,
+      ...(result.kind === "invite"
+        ? { link: result.link?.replace(/invite=[^&]+/, "invite=T") ?? null }
+        : {}),
+      invite: result.kind === "invite" ? { ...result.invite, createdAt: "" } : null,
+    });
+    expect(shape(unknown)).toEqual(shape(unproved));
+    expect(unknown.kind).toBe("invite");
+  });
+
+  it("writes a can-use runtime invite under the owner's fence; the link is shown once", async () => {
+    setupInvite();
+    db.user.findFirst.mockResolvedValue(null);
+    const result = await client().shares.create(input);
+    if (result.kind !== "invite") throw new Error("expected an invite");
+    expect(result.invite.target).toEqual({ kind: "runtime", runtimeId: "rt-1", name: "Qwen" });
+    expect(result.invite.email).toBe("friend@example.test");
+    expect(result.link).toMatch(
+      /^https:\/\/proxy\.example\.com\/en-US\/signup\?invite=wsmp_inv_[A-Z2-7]{26}$/,
+    );
+    const token = new URL(result.link ?? "").searchParams.get("invite") ?? "";
+    const data = db.shareInvite.create.mock.calls[0]?.[0].data;
+    expect(data).toMatchObject({
+      runtimeId: "rt-1",
+      ownerUserId: OWNER,
+      email: "friend@example.test",
+      tokenDigest: credentialDigest("shareInvite", token),
+      canUse: true,
+      canContribute: false,
+      priorityClass: null,
+    });
+    expect(data).not.toHaveProperty("poolId");
+    expect(JSON.stringify(data)).not.toContain(token);
+    expect(db.shareInvite.findFirst.mock.calls[0]?.[0]?.where).toMatchObject({
+      runtimeId: "rt-1",
+      email: "friend@example.test",
+    });
+    expect(fenceLog.held).toEqual([`00:owner:${OWNER}`]);
+    expect(mailer.sendEmail).not.toHaveBeenCalled();
+  });
+
+  it("e-mails the runtime invite when SMTP works and then returns no link", async () => {
+    mailer.isEmailConfigured.mockReturnValue(true);
+    setupInvite();
+    db.user.findFirst.mockResolvedValue(null);
+    db.shareInvite.updateMany.mockResolvedValue({ count: 1 });
+    const result = await client().shares.create(input);
+    expect(result).toMatchObject({ kind: "invite", link: null });
+    if (result.kind !== "invite") throw new Error("expected an invite");
+    expect(result.invite.emailSentAt).not.toBeNull();
+    expect(mailer.renderShareInvite).toHaveBeenCalledWith(
+      expect.objectContaining({ target: { kind: "runtime", name: "Qwen" } }),
+    );
+    expect(mailer.sendEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "friend@example.test" }),
+    );
+  });
+
+  it("refuses a second pending invite to the same e-mail and runtime", async () => {
+    setupInvite();
+    db.user.findFirst.mockResolvedValue(null);
+    db.shareInvite.findFirst.mockResolvedValue({ id: "inv-0" } as never);
+    expect(await reasonOf(client().shares.create(input))).toBe("CONFLICT");
+    expect(db.shareInvite.create).not.toHaveBeenCalled();
+  });
+
+  it("shares only the caller's runtime, never with themselves, and only for a person", async () => {
+    db.runtime.findFirst.mockResolvedValue(null);
+    expect(await reasonOf(client().shares.create(input))).toBe("NOT_FOUND");
+    expect(db.runtime.findFirst.mock.calls[0]?.[0]?.where).toEqual({ id: "rt-1", userId: OWNER });
+    db.runtime.findFirst.mockResolvedValue({ id: "rt-1", User: owner } as never);
+    expect(
+      await reasonOf(client().shares.create({ ...input, email: `${OWNER}@example.test` })),
+    ).toBe("BAD_REQUEST");
+    expect(await reasonOf(client(CALLERS.fullAgent()).shares.create(input))).toBe("FORBIDDEN");
+    expect(db.user.findFirst).not.toHaveBeenCalled();
   });
 });

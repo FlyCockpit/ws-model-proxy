@@ -4,6 +4,7 @@ import type { z } from "zod";
 import type {
   agentTokenViewSchema,
   apiKeyViewSchema,
+  shareInviteTargetSchema,
   shareInviteViewSchema,
   shareViewSchema,
 } from "../contracts/access";
@@ -135,6 +136,7 @@ export function shareView(
 export const shareInviteSelect = {
   id: true,
   poolId: true,
+  runtimeId: true,
   email: true,
   canUse: true,
   canContribute: true,
@@ -143,14 +145,33 @@ export const shareInviteSelect = {
   expiresAt: true,
   emailSentAt: true,
   Pool: { select: { slug: true, User: { select: { slug: true } } } },
+  Runtime: { select: { name: true } },
 } satisfies Prisma.ShareInviteSelect;
 export type ShareInviteRow = Prisma.ShareInviteGetPayload<{ select: typeof shareInviteSelect }>;
+type ShareInviteTarget = z.infer<typeof shareInviteTargetSchema>;
+
+/** What an invite shares (the hardening keeps exactly one of pool and runtime). */
+export function shareInviteTarget(row: {
+  poolId: string | null;
+  runtimeId: string | null;
+  Pool: { slug: string; User: { slug: string } } | null;
+  Runtime: { name: string } | null;
+}): ShareInviteTarget {
+  if (row.poolId !== null && row.Pool)
+    return {
+      kind: "pool",
+      poolId: row.poolId,
+      callableId: callableIdOf(row.Pool.User.slug, row.Pool.slug),
+    };
+  if (row.runtimeId !== null && row.Runtime)
+    return { kind: "runtime", runtimeId: row.runtimeId, name: row.Runtime.name };
+  throw new Error("share invite without a target");
+}
 
 export function shareInviteView(row: ShareInviteRow): z.infer<typeof shareInviteViewSchema> {
   return {
     id: row.id,
-    poolId: row.poolId,
-    callableId: callableIdOf(row.Pool.User.slug, row.Pool.slug),
+    target: shareInviteTarget(row),
     email: row.email,
     canUse: row.canUse,
     canContribute: row.canContribute,
