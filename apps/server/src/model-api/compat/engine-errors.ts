@@ -285,16 +285,3 @@ export function parseEngineRejection(input: {
   }
   return null;
 }
-
-/** A short, printable excerpt of an upstream error body for the caller (never stored). */
-export function upstreamErrorExcerpt(bodyText: string, maxChars = 300): string {
-  let printable = "";
-  for (const char of bodyText) {
-    const code = char.codePointAt(0) ?? 0;
-    const control = code < 0x20 || code === 0x7f;
-    if (!control) printable += char;
-    else if (!printable.endsWith(" ")) printable += " ";
-  }
-  printable = printable.trim();
-  return printable.length > maxChars ? `${printable.slice(0, maxChars)}…` : printable;
-}

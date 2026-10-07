@@ -11,7 +11,8 @@ import {
   type RequestCompat,
 } from "@ws-model-proxy/api/lib/request-compat";
 import type { EngineValue } from "../resolve.js";
-import { parseEngineRejection, upstreamErrorExcerpt } from "./engine-errors.js";
+import { upstreamErrorExcerptFromText } from "../upstream-error-excerpt.js";
+import { parseEngineRejection } from "./engine-errors.js";
 import { type LaunchKey, loadRequestProfile } from "./profile-store.js";
 import { applyRequestCompat, type CompatRefusal, planCompatRetry } from "./request-policy.js";
 import {
@@ -166,7 +167,7 @@ export function compatRetryDecision(input: {
     endpoint,
     compat: input.launch.runtime.compat,
     rejection,
-    excerpt: upstreamErrorExcerpt(input.errorText),
+    excerpt: upstreamErrorExcerptFromText(input.errorText) ?? "(no readable error)",
   });
   if (!plan) return null;
   if (plan.action === "refuse") return { kind: "refuse", refusal: plan.refusal };

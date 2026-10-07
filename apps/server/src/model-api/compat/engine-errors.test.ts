@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
-import { parseEngineRejection, resolveLocation, upstreamErrorExcerpt } from "./engine-errors.js";
+import { parseEngineRejection, resolveLocation } from "./engine-errors.js";
 
 type Case = {
   name: string;
@@ -177,12 +177,5 @@ describe("resolveLocation", () => {
     ).toBe("messages[].content[].y");
     expect(resolveLocation(["body", "messages", 0, "missing"], body)).toBeNull();
     expect(resolveLocation(["body", "messages", 7, "role"], body)).toBeNull();
-  });
-});
-
-describe("upstreamErrorExcerpt", () => {
-  it("is printable and bounded", () => {
-    expect(upstreamErrorExcerpt("a\u0000b\nc")).toBe("a b c");
-    expect(upstreamErrorExcerpt("x".repeat(400))).toHaveLength(301);
   });
 });
