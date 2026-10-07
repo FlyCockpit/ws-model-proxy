@@ -119,6 +119,70 @@ canonical JSON and one command at most 4 KiB. `limits` (null: automatic) and
 effective values. Limit edits apply live; a changed definition saves a new
 version and needs `restartRunning` to reach running instances.
 
+### Request compatibility
+
+Engines differ in what they accept, and harnesses send what they send. Every
+runtime version has a `compat` setting (`runtime_create` / `runtime_update`
+take it as a plain object that **replaces** the whole setting; `null` returns it
+to automatic; schema `requestCompatSchema` in
+`packages/api/src/lib/request-compat.ts`). The same policy applies to every
+request the runtime receives, forwarded natively or translated between
+protocols:
+
+- `unknownFieldPolicy`: `auto` (default) drops unknown **non-semantic** fields
+  the engine does not accept; `forward` sends everything as written; `strict`
+  refuses unknown fields with a 400 naming the field.
+- Semantic fields are never dropped automatically: `model`, `messages`,
+  `input`, `instructions`, `system`, `prompt`, `tools`, `tool_choice`,
+  `response_format`, `text.format`, `stream`, `max_tokens`,
+  `max_output_tokens`, `max_completion_tokens`, `temperature`, `top_p`,
+  `top_k`, `min_p`, penalties, `stop`, `n`, `seed`, `logprobs`, `reasoning`,
+  `reasoning_effort`, `thinking`, `prediction`, `parallel_tool_calls`,
+  output constraints (`guided_*`, `structured_outputs`, `grammar`,
+  `json_schema`, `logit_bias`), `chat_template_kwargs`, conversation state
+  (`previous_response_id`, `conversation`) and embedding `dimensions` /
+  `encoding_format` (the list is `SEMANTIC_FIELDS`). When the engine rejects
+  one, the caller gets a clear 400 naming it with the engine's words.
+  `allowDropSemanticFields: [path]` accepts losing one.
+- `rewriteRules` (at most 32, applied in order, optionally per `endpoint`):
+  `{op: "rename", path, to}`, `{op: "drop", path}`, `{op: "default", path,
+  value}` (only when the caller did not send it), `{op: "clamp", path, min?,
+  max?}` and `{op: "mapRole", from, to}`. Paths are dotted, with `[]` for every
+  element of an array: `messages[].cache_control`. Rules cannot touch `model`
+  or `stream`, credential- or address-like keys, and defaults cannot add
+  content, adapters, files or media.
+- `headers`: per client header (`anthropic-beta`, `anthropic-version`,
+  `openai-beta`, `openai-version`, `idempotency-key`, `x-request-id`,
+  `request-id`) `forward` or `strip`. Auth headers are never forwarded; the
+  node adds its own upstream credentials from its secrets.
+- `extras`: `streamUsage` and `topK` override whether the proxy adds
+  `stream_options.include_usage` or renders `top_k` (automatic: from the
+  engine's description, what was learned and the engine kind; unknown engines
+  get neither). Missing usage is estimated and marked as estimated.
+- `response`: `reasoningField` (`auto`, `reasoning`, `reasoning_content`,
+  `strip`) and `stripNonStandard` shape native Chat and Messages answers;
+  finish reasons, thinking signatures and missing Anthropic usage are always
+  normalized.
+
+What the engine accepts is learned per runtime launch: from its OpenAPI
+description (`GET /openapi.json`, read through the node from a loopback engine
+when an instance becomes ready) and, without one, from its 400s (the named
+field is dropped and the request sent once more, before anything reached the
+client). `runtimes_get` shows it as `requestProfile`; `runtime_update
+{relearn: true}` forgets it. Requests record what was dropped or rewritten
+(names only) in `requests_list` as `compat`.
+
+### Model-name aliases
+
+Harnesses that hard-code a model name (`gpt-4o`, `claude-sonnet-4-5`) can call a
+pool through an alias: `pool_update {poolId, aliases: {set: [{name,
+apiKeyId?}], remove: [aliasId]}}`; `pools_get {aliases: true}` lists them. An
+alias lives in your own namespace (for every key, or one key, which wins), only
+resolves to a pool the key in use can call, never wins over a callable ID, and
+is listed by `/v1/models`. Agents may manage aliases; API keys stay
+people-only. The model API accepts the key as `Authorization: Bearer`,
+`x-api-key` or `api-key`.
+
 ### Node metric commands
 
 `node_update` takes `metricCommands`: at most 16 entries (32 KiB together) of

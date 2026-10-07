@@ -244,6 +244,37 @@ developer message into the system prompt for Anthropic targets stays off unless
 you turn on **lossy developer-role collapse**. Turn API adaptation off on a pool
 to serve only native requests.
 
+## Request compatibility: any engine, any harness
+
+Pools now adapt each request to the engine that serves it, so vLLM, SGLang,
+llama.cpp, Ollama, LM Studio and other OpenAI- or Anthropic-style servers work
+with the clients you already use, including harnesses you cannot change:
+
+- **Unknown fields**: per runtime, `auto` (default) drops fields the engine does
+  not accept, `forward` sends everything, `strict` refuses them. What an engine
+  accepts is read from its OpenAPI description when an instance becomes ready
+  (through the node, loopback only) and otherwise learned from its 400s: the
+  named field is dropped and the request retried once, before anything reached
+  the client. Semantic fields (messages, tools, sampling, output constraints,
+  reasoning, ...) are never dropped silently: the caller gets a 400 naming the
+  field.
+- **Rewrite rules** per runtime version (rename, drop, default, clamp, role
+  mapping such as developer to system), header modes (forward or strip
+  `anthropic-beta`, `OpenAI-Beta`, ...) and response shaping (reasoning field,
+  strict-SDK cleanup). Agents can edit them; every edit is a version.
+- **Model-name aliases**: map `gpt-4o` or `claude-sonnet-4-5` to one of your
+  pools, for all keys or one key. `/v1/models` lists them.
+- **Auth styles**: the model API accepts `Authorization: Bearer`, `x-api-key`
+  and `api-key`.
+- Requests show what was dropped or rewritten, and usage an engine did not
+  report is estimated and marked.
+
+The schema gains `runtime_version.compat`, `runtime_request_profile`,
+`model_alias`, `relay_request.compat` and `relay_request.usageEstimated`:
+redeploy with `APPLY_SCHEMA=safe` once. Nodes need the new `wsmp` to let the
+server read engine descriptions; older nodes keep working and learn from 400s
+only.
+
 ## Configuration
 
 ### Rate limits
