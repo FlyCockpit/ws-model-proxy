@@ -9,9 +9,9 @@ caller asks for it in the model name and every party allows it.
   leaves this server.
 - `owner/pool:external`: may use the pool's cloud members or your own-key
   model when local service is unavailable.
-  - The variant is lowercase and used once. Unknown, uppercase, or stacked
-    variants, and any suffix on a name that is not a pool, return `404 model_not_found`
-    with a message naming the correct id.
+  - The variant is lowercase and used once. An unknown, uppercase, or stacked
+    variant on a pool's name returns `404 model_not_found` with a message naming the
+    correct id; a suffix on a name that is not a pool gets the plain `404 model_not_found`.
   - Accepted on `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, and `/v1/embeddings`.
     `count_tokens` treats it as the plain name and never contacts a provider;
     on a pool with only external members it returns
@@ -70,7 +70,8 @@ For owner-paid pool fallback, all of these must hold:
    signed-in person's own Test page (asking for it there is that person's
    consent). API keys have no separate cloud switch: any key that may call the
    pool may ask for `:external`. Agent tests (`model_test`) cannot use it:
-   `400 external_not_supported_for_mcp`.
+   `400 external_not_supported_for_mcp` (with the server switch off, the switch's
+   `403 external_providers_disabled` answers first).
 3. The pool's cloud mode covers the requester: **For me** (`OWNER`) covers the
    owner, **For me and people I share with** (`OWNER_AND_SHARES`) also covers
    share holders, **Off** (the default for every pool) covers nobody. Only a
@@ -87,8 +88,8 @@ switch, the pool's cloud mode, the API key's revocation or expiry, the
 requester's account (not banned, no pending deletion), and, for someone other
 than the owner, the exact share the request was resolved under; a deleted and
 re-created share does not count). That last check runs
-in the same database transaction that claims the provider credential for the
-send, and it holds those settings unchanged until the send is claimed; key
+in the same database transaction that reserves the provider credential for the
+send, and it holds those settings unchanged until the send is reserved; key
 expiry and the account state are evaluated together against the database's
 statement clock, again after that transaction's last lock wait. If any of them no longer holds, nothing is sent. A change
 saved after that point applies from the next send.
@@ -192,18 +193,16 @@ Responses operations on externally served responses) count against those caps.
 A request has at most one external phase; precommit failover across external
 members follows the existing retry rules.
 
-On a pool that also has local members, an owner-paid external phase waits for
-a provider slot at most `min(provider member wait, 10 s)`. If no provider
-slot frees by then, the attempt counts as "provider busy" and the request goes
-back to the local members (see the table below).
-The 10 s cap covers the whole external phase: a pre-commit retry on the next
-external member gets only what is left of it.
-Pools with only external members keep the provider member's own wait.
+On a pool that also has local members, an owner-paid external phase waits a
+bounded time for a provider slot. If no provider slot frees by then, the attempt
+counts as "provider busy" and the request goes back to the local members (see the
+table below). A pre-commit retry on the next external member gets only what is
+left of that phase.
 
 ### New-conversation placement
 
 When a request is not affine on any member (no scored conversation-prefix depth
-and no conversation match), ranking spreads it by how full each member KV pool
+and no conversation match), scoring spreads it by how full each member KV pool
 already is. The resident set is unique unexpired sessions
 (`prefixDigest IS NULL`) on that instance, newest 2,000 footprints per
 instance, counted only above a one-token floor. Continuations still
@@ -238,7 +237,7 @@ Residency spreading reads a maintained bucket of at most 2,000 newest footprint
 records per instance (expiry, then record id), with strict expiry filtering.
 Request completions update only these bounded metadata buckets. When deletion or
 an expiry reduction requires older records to be promoted, the bucket becomes
-unknown and spreading is suppressed for that ranking snapshot. Unknown is not
+unknown and spreading is suppressed for that scoring snapshot. Unknown is not
 evidence that a target is cold or unavailable and never authorizes paid fallback.
 A background worker discovers dormant targets in durable 32-target pages and repairs
 unknown buckets in durable 256-record pages; concurrent writes restart that repair.
@@ -325,9 +324,9 @@ both start counting after the hold.
 A new conversation should not evict a protected warm session's recently used,
 large prompt cache (including your own conversations') when another member, or
 an external provider, can take it. No engine
-reports how old its cached prefixes are, so WSMP estimates "warm" from its own
+reports how old its cached prefixes are, so WMP estimates "warm" from its own
 routing records (sizes and times only, never prompt content). Traffic that
-bypasses WSMP is not seen.
+bypasses WMP is not seen.
 
 A session is protected when it was used within the pool's protection window
 (default 5 minutes) and is at least the minimum size (default 8192 tokens).
@@ -391,9 +390,9 @@ the resolver picks the earliest-expiring tip. If another session last stamped
 the shared hint, that turn yields no evidence, failing closed. At most one
 observation is lost per tied session; its own identifiable write restamps the
 hints and restores evidence. No other session's footprint is accepted. These
-checks apply **as of the ranking snapshot** and do not establish engine residency
+checks apply **as of the scoring snapshot** and do not establish engine residency
 at dispatch or response time; a later unrelated writer does not affect that snapshot.
-The bound Responses `previous_response_id` path is excluded: it has neither a ranked
+The bound Responses `previous_response_id` path is excluded: it has neither a scored
 decision nor the matched record's age. Engine prefix-cache counters are also
 excluded: they are cumulative, include bypass traffic and cannot be attributed
 to a matched prefix. Unconfirmed records cannot count; remembering a zero-read
@@ -541,7 +540,7 @@ depth 0; each object property or array entry adds one level). Exceeding that
 limit or a converter/HMAC/work-budget error makes the whole request unidentifiable:
 no nodes, hints, client session footprint or Responses lineage.
 
-Ranking builds canonical request material once and reuses it across targets;
+Scoring builds canonical request material once and reuses it across targets;
 only binding and HMAC work depends on the target. A shared **16,777,216 visited-node
 budget (8 × 2 MiB)** bounds validation, extraction and incremental serialization.
 Work-budget exhaustion makes the whole advisory request unidentifiable. Arrays
@@ -569,7 +568,7 @@ per-turn footprint. Routing hints never establish resolver identity.
 
 Model API JSON acceptance has a separate **256-level request nesting limit**,
 measured iteratively with parallel container/depth stacks immediately after JSON
-parsing, before model lookup, counting, affinity ranking or dispatch. Depth 257 and above return HTTP 400 with
+parsing, before model lookup, counting, affinity scoring or dispatch. Depth 257 and above return HTTP 400 with
 a protocol-appropriate invalid-request error: `request JSON nesting exceeds 256
 levels`. Depth 129 through 256 is served with affinity advisory identity off,
 including bound Responses follow-ups. Realistic tool/JSON schemas are far below
@@ -587,7 +586,7 @@ JSON bodies, SSE stream `data` JSON, and embedded tool arguments decoded during
 response adaptation. Overflow is an upstream failure:
 `response_json_depth_exceeded` / `provider response JSON nesting exceeds 256 levels`.
 It returns HTTP 502 before any output, or a terminal protocol error event after
-output; the relay finishes `FAILED` with `protocol_error`. Native argument strings
+output; the request is recorded `FAILED` with `protocol_error`. Native argument strings
 passed through without decoding retain their existing behavior.
 
 The shared parser covers `/chat/completions`, `/messages`,
@@ -597,7 +596,7 @@ The shared parser covers `/chat/completions`, `/messages`,
 same guard before their first size serialization, and the chat diagnostic core
 checks again before creating its synthetic model API request. Multipart audio
 routes do not parse JSON bodies. Responses retrieve/delete/cancel/input-items/
-compact use empty relay bodies. Other JSON reads in routing, external dispatch,
+compact use empty forwarded bodies. Other JSON reads in routing, external dispatch,
 privacy, diagnostics and protocol adapters inspect already accepted internal
 requests, upstream responses/SSE, or embedded tool argument strings; they are
 not separate HTTP JSON acceptance paths.
@@ -663,7 +662,7 @@ preserve the upstream status as described under [Own-key failure and accounting]
 | Pool has only external members, no external member fits the request | `400 unsupported_capability` |
 | Pool has only external members, the compatible ones are all in a provider health cooldown | `503 external_unavailable` |
 | Pool has only external members, provider busy | `429 rate_limited` |
-| Pool has only external members, this share holder's monthly cap is used up | `429 grantee_spend_cap` (no remaining amount, policy id, or account label) |
+| Pool has only external members, this share holder's monthly cap is used up | `429 grantee_spend_cap` (no remaining amount, cap id, or account label) |
 | Pool has only external members, anything else (unhealthy, failure before the first byte, send check timed out, cloud mode or own-key consent withdrawn) | `503 external_unavailable` |
 | Owner account banned or deletion pending (any pool shape) | `404`, the request ends (see [Pool owner account state](#pool-owner-account-state)) |
 | Requester account banned or deletion pending, seen by the external check | `401`, the request ends, no `x-wsmp-fallback` |
@@ -686,7 +685,7 @@ All of these except the two account rows carry `x-wsmp-fallback: unavailable`.
 - With the switch off, `:external` requests get `403 external_providers_disabled`
   (OpenAI error shape, or an Anthropic `permission_error` on `/v1/messages`) and
   `/v1/models` does not list `:external` names.
-- An agent test (`model_test`) of an `:external` name gets
+- With the switch on, an agent test (`model_test`) of an `:external` name gets
   `400 external_not_supported_for_mcp`.
 - A pool with only external members answers its plain name with
   `400 external_required`, naming the `:external` id.
@@ -778,8 +777,8 @@ native pass-through and adapted requests alike. Other provider types never get
 the field. If the rendered body already has a `provider` object, its other keys
 are kept and `data_collection` is overwritten, so a caller cannot relax it.
 
-Each OpenRouter account has the setting **Allow OpenRouter providers that may
-collect data** (off by default) on its page under **Providers**
+Each OpenRouter account has the setting **Allow the provider to collect data
+(OpenRouter)** (off by default) on its page under **Providers**
 (`/{lang}/providers/{accountId}`, `providers.accounts.setDataCollection`). The
 owner sets it for owner-paid accounts; share holders set it on their own accounts.
 It is human-only: MCP cannot change it, and an account's provider type cannot
@@ -817,8 +816,8 @@ Own-key egress requires the server switch, the `:external` name, a valid
 requester, the exact live share, the owner's equivalent declaration, and a
 requester-owned enabled model/account/current credential. The signed-in Test page
 follows the same explicit-name consent as other external requests. MCP cannot set
-these preferences. The send claim rechecks consent under the documented C1–C6 lock
-order after the slot and spend waits, with a fresh requester-validity read after
+these preferences. The send check rechecks consent under the server's lock order
+after the slot and spend waits, with a fresh requester-validity read after
 the final lock wait. Deleting and re-creating a share never revives an old
 preference or Responses binding.
 
@@ -840,9 +839,9 @@ Native Responses bindings store the route and exact provider URL tuple.
 Own-key follow-ups require `:external` and current own-key consent. Stored
 response operations revalidate consent too: withdrawals return 403, permanent
 identity/share loss 404, and temporary provider unavailability 503. Bindings
-never fail over to another route. The HTTP route header uses `pool-fallback`;
-existing durable owner-paid records retain `pool-external` for additive schema
-compatibility. Own-key durable records and headers use `own-key`.
+never fail over to another route. The `x-wsmp-route` header uses `local`,
+`pool-fallback` or `own-key`; stored request records use `local`, `cloud` or
+`own_key`.
 
 Catalog pricing bounds include base and tiered one-hour cache writes and audio
 tokens; any variable (`-1`) or malformed supported rate makes pricing unknown.
@@ -902,6 +901,6 @@ picker and import summary disclose this limitation.
 
 ### Own-key failure and accounting
 
-Own-key admission tries only provider slots available now, preserving time for the owner-paid route and any remaining local wait. A skipped own-key route permits an independently consented owner-paid attempt even for non-retry-safe operations; after provider I/O may have started, the operation's retry policy applies. No route changes after a response commits. On a provider-only pool, when the owner-paid plan is disabled or empty, an own-key provider error retains its status and safe Retry-After header. Cancellation retains the relay's cancellation status. Unserved failures have no `x-wsmp-route` header. Owner-paid failures retain the status table above, including `503 external_unavailable` for transport errors and retryable upstream failures before the first byte.
+Own-key admission tries only provider slots available now, preserving time for the owner-paid route and any remaining local wait. A skipped own-key route permits an independently consented owner-paid attempt even for non-retry-safe operations; after provider I/O may have started, the operation's retry policy applies. No route changes after a response commits. On a provider-only pool, when the owner-paid plan is disabled or empty, an own-key provider error retains its status and safe Retry-After header. Cancellation retains the server's cancellation status (499). Unserved failures have no `x-wsmp-route` header. Owner-paid failures retain the status table above, including `503 external_unavailable` for transport errors and retryable upstream failures before the first byte.
 
 Own-key route/target intent is persisted after consent and request setup, immediately before transport I/O. Known no-send failures leave the prior route intact. A failed, uncommitted route attempt durably restores the prior route and target before pool fallback or local resumption. Terminal metadata uses that same identity. Crash recovery attributes a pending send intent to the requester because the transport may have run; a crash before intent or after supersession uses the prior route. The owner's aggregate counts successful own-key requests only.
