@@ -605,6 +605,25 @@ fn a_fresh_enrollment_clears_a_leftover_lowering_only_when_full_is_chosen() {
     let (value, _) = login(&["--trust", "relay"]);
     assert_eq!(value["trust"], "relay");
     assert!(frozen.exists());
+    // Not while a relay runs here: its reload would write `relay` back.
+    #[cfg(unix)]
+    {
+        let listener = std::os::unix::net::UnixListener::bind(state.join("relay-control.sock"))
+            .expect("bind a stand-in relay control socket");
+        let relay = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("control request");
+            let mut request = String::new();
+            stream.read_to_string(&mut request).expect("read request");
+            stream.write_all(br#"{"ok":true}"#).expect("answer");
+        });
+        let (value, stderr) = login(&["--trust", "full"]);
+        relay.join().unwrap();
+        fs::remove_file(state.join("relay-control.sock")).unwrap();
+        assert_eq!(value["trust"], "relay", "{stderr}");
+        assert!(stderr.contains("a relay is running here"), "{stderr}");
+        assert!(!stderr.contains("pass `--trust full`"), "{stderr}");
+        assert!(frozen.exists());
+    }
     // An explicit `--trust full` clears it, and says so.
     let (value, stderr) = login(&["--trust", "full"]);
     assert_eq!(value["trust"], "full", "{stderr}");
