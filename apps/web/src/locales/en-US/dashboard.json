@@ -648,6 +648,15 @@
       "LLM": "LLM",
       "EMBEDDINGS": "Embeddings",
       "TRANSCRIPTION": "Transcription"
+    },
+    "test": "Test",
+    "testOne": "Test {{id}}",
+    "snippets": {
+      "label": "Example style",
+      "curl": "curl",
+      "openai": "OpenAI SDK",
+      "anthropic": "Anthropic SDK",
+      "anthropicChatOnly": "The Anthropic SDK calls chat models only; use curl or the OpenAI SDK for this one."
     }
   },
   "providers": {

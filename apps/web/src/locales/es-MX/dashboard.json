@@ -648,6 +648,15 @@
       "LLM": "LLM",
       "EMBEDDINGS": "Embeddings",
       "TRANSCRIPTION": "Transcripción"
+    },
+    "test": "Probar",
+    "testOne": "Probar {{id}}",
+    "snippets": {
+      "label": "Estilo del ejemplo",
+      "curl": "curl",
+      "openai": "SDK de OpenAI",
+      "anthropic": "SDK de Anthropic",
+      "anthropicChatOnly": "El SDK de Anthropic solo llama modelos de chat; usa curl o el SDK de OpenAI para este."
     }
   },
   "providers": {
