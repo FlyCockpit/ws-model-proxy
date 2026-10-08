@@ -15,6 +15,7 @@
 import { z } from "zod";
 import { canonicalJson } from "./canonical-json";
 import { isFabricIp, isUrlIpHost } from "./ip-literal";
+import { specIssue, specIssueMessage } from "./spec-issues";
 import { transcriptionProfileSchema } from "./transcription-profile";
 
 // ── Vocabularies (wire values; Prisma enums are the upper-case forms) ──
@@ -168,22 +169,25 @@ export function utf8Bytes(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
 /** Text stored and shown for human review: well-formed, no hidden or reordering characters. */
-export function runtimeTextIssue(value: string): string | null {
-  if (LONE_SURROGATE.test(value)) return "Text must be valid Unicode.";
-  for (const char of value)
-    if (isHiddenCodePoint(char.codePointAt(0) ?? 0))
-      return "Text must not contain control or bidirectional formatting characters.";
+export function runtimeTextIssueId(value: string): "textUnicode" | "textHidden" | null {
+  if (LONE_SURROGATE.test(value)) return "textUnicode";
+  for (const char of value) if (isHiddenCodePoint(char.codePointAt(0) ?? 0)) return "textHidden";
   return null;
+}
+/** {@link runtimeTextIssueId} as English text (API and MCP messages). */
+export function runtimeTextIssue(value: string): string | null {
+  const id = runtimeTextIssueId(value);
+  return id ? specIssueMessage(id) : null;
 }
 export const runtimeTextSchema = (maxBytes: number) =>
   z
     .string()
     .max(maxBytes)
     .superRefine((value, ctx) => {
-      const issue = runtimeTextIssue(value);
-      if (issue) ctx.addIssue({ code: "custom", message: issue });
+      const issue = runtimeTextIssueId(value);
+      if (issue) ctx.addIssue({ code: "custom", ...specIssue(issue) });
       else if (utf8Bytes(value) > maxBytes)
-        ctx.addIssue({ code: "custom", message: `Text must be at most ${maxBytes} bytes.` });
+        ctx.addIssue({ code: "custom", ...specIssue("textTooLong", { maxBytes }) });
     });
 
 // ── Hash-safe values ──
@@ -196,7 +200,7 @@ export const runtimeTextSchema = (maxBytes: number) =>
 export const exactTextSchema = (maxBytes: number) =>
   runtimeTextSchema(maxBytes).refine(
     (value) => value.length > 0 && value.trim() === value,
-    "Text must not be blank or have leading or trailing spaces.",
+    specIssue("textPadded"),
   );
 
 /** A number canonical JSON can hash: a safe integer, or 1e-6 ≤ |x| < 1e15. */
@@ -208,23 +212,24 @@ export function isCanonicalNumber(value: number): boolean {
 }
 export const canonicalNumberSchema = z
   .number()
-  .refine(isCanonicalNumber, "Use a whole number or a decimal between 0.000001 and 1e15.");
+  .refine(isCanonicalNumber, specIssue("numberNotCanonical"));
 
 const PLACEHOLDER = /\{\{([a-z_]+)\}\}/g;
 export const runtimeCommandSchema = runtimeTextSchema(RUNTIME_COMMAND_MAX_BYTES)
-  .refine((value) => value.trim().length > 0, "Command must not be blank.")
+  .refine((value) => value.trim().length > 0, specIssue("commandBlank"))
   .superRefine((value, ctx) => {
     for (const [, key] of value.matchAll(PLACEHOLDER))
       if (!(RUNTIME_PLACEHOLDERS as readonly string[]).includes(key ?? ""))
-        ctx.addIssue({ code: "custom", message: `Unknown placeholder {{${key}}}.` });
+        ctx.addIssue({
+          code: "custom",
+          ...specIssue("unknownPlaceholder", { placeholder: `{{${key}}}` }),
+        });
   });
 
 /** A served model id exactly as the relay normalizes it: trimmed, single line, ≤ 256 bytes. */
 export const servedModelIdSchema = runtimeTextSchema(256)
-  .refine((value) => value.length > 0 && value.trim() === value, {
-    message: "Model ids must not be blank or have leading or trailing spaces.",
-  })
-  .refine((value) => !/[\n\t]/.test(value), "Model ids must be a single line.");
+  .refine((value) => value.length > 0 && value.trim() === value, specIssue("modelIdPadded"))
+  .refine((value) => !/[\n\t]/.test(value), specIssue("modelIdMultiline"));
 
 /** An origin-relative path: one leading slash, no `//`, `..`, `#`, `?`, backslash or `%2e`/`%2f`. */
 export const runtimeRouteSchema = runtimeTextSchema(1024).refine(
@@ -232,13 +237,13 @@ export const runtimeRouteSchema = runtimeTextSchema(1024).refine(
     /^\/(?!\/)[^\s#?\\]*$/.test(value) &&
     !value.split("/").includes("..") &&
     !/%2[ef]/i.test(value),
-  "A route must start with a single / and contain no .., //, ?, #, backslash or encoded . or /.",
+  specIssue("routeInvalid"),
 );
 
 export const runtimeLabelsSchema = z
   .array(z.string().regex(RUNTIME_LABEL_PATTERN))
   .max(RUNTIME_LABELS_MAX)
-  .refine((labels) => new Set(labels).size === labels.length, "Labels must be unique.");
+  .refine((labels) => new Set(labels).size === labels.length, specIssue("labelsUnique"));
 
 // ── Models ──
 
@@ -281,22 +286,22 @@ export const runtimeBaseUrlSchema = z
     try {
       url = new URL(value);
     } catch {
-      ctx.addIssue({ code: "custom", message: "Expected an http(s) URL." });
+      ctx.addIssue({ code: "custom", ...specIssue("urlInvalid") });
       return;
     }
     if (url.protocol !== "http:" && url.protocol !== "https:")
-      ctx.addIssue({ code: "custom", message: "Only http and https are allowed." });
+      ctx.addIssue({ code: "custom", ...specIssue("urlScheme") });
     if (url.username || url.password || url.search || url.hash || value.includes("#"))
-      ctx.addIssue({ code: "custom", message: "No user info, query or fragment." });
+      ctx.addIssue({ code: "custom", ...specIssue("urlExtras") });
     if (url.hostname !== "localhost" && !isUrlIpHost(url.hostname))
-      ctx.addIssue({ code: "custom", message: "The host must be localhost or an IP literal." });
+      ctx.addIssue({ code: "custom", ...specIssue("urlHost") });
     // The stored text is the normalized form, so TS and Rust URL parsers cannot disagree
     // (`http://2130706433/`, `/v1/../x`, upper-case schemes are refused, not normalized).
     const normalized = url.pathname === "/" ? url.origin : `${url.origin}${url.pathname}`;
     if (value !== normalized)
-      ctx.addIssue({ code: "custom", message: `Write the address as ${normalized}.` });
+      ctx.addIssue({ code: "custom", ...specIssue("urlNormalize", { normalized }) });
     if (url.pathname !== "/" && !/^(\/[A-Za-z0-9_~-][A-Za-z0-9._~-]*)+$/.test(url.pathname))
-      ctx.addIssue({ code: "custom", message: "The API prefix must be a plain path." });
+      ctx.addIssue({ code: "custom", ...specIssue("urlPrefix") });
   });
 
 export const runtimeAddressSchema = z
@@ -313,7 +318,7 @@ export const runtimeAddressSchema = z
       })
       .strict()
       .refine((auth) => (auth.mode === "header") === (auth.header !== undefined), {
-        message: "A header name is required exactly for mode header.",
+        ...specIssue("authHeader"),
         path: ["header"],
       })
       .optional(),
@@ -337,7 +342,7 @@ export type RuntimeAddress = z.infer<typeof runtimeAddressSchema>;
 /** GiB (2^30 bytes), like node budgets. */
 const gib = canonicalNumberSchema.refine(
   (value) => value > 0 && value <= 1_000_000,
-  "0 < GiB ≤ 1e6.",
+  specIssue("gibRange"),
 );
 export const GPU_VENDORS = ["nvidia", "amd", "intel", "apple", "other"] as const;
 export type GpuVendor = (typeof GPU_VENDORS)[number];
@@ -443,19 +448,19 @@ export const runtimeLaunchSchema = z
         ctx.addIssue({
           code: "custom",
           path: [key],
-          message: "Provide one entry for every rank or exactly one per rank.",
+          ...specIssue("perNodeEntries"),
         });
     if (launch.fabric && launch.groupSize === 1)
       ctx.addIssue({
         code: "custom",
         path: ["fabric"],
-        message: "Only a multi-node runtime names a fabric.",
+        ...specIssue("fabricSingleNode"),
       });
     if (launch.port && launch.groupSize !== 1)
       ctx.addIssue({
         code: "custom",
         path: ["port"],
-        message: "A fixed port needs groupSize 1.",
+        ...specIssue("fixedPortGroup"),
       });
     // The node refuses a definition that names a secret twice.
     launch.secrets?.forEach((name, index) => {
@@ -463,7 +468,7 @@ export const runtimeLaunchSchema = z
         ctx.addIssue({
           code: "custom",
           path: ["secrets", index],
-          message: "Name each secret once.",
+          ...specIssue("secretTwice"),
         });
     });
     launch.commands.forEach((commands, index) => {
@@ -480,26 +485,26 @@ export const runtimeLaunchSchema = z
         ctx.addIssue({
           code: "custom",
           path: [...path, "status"],
-          message: "Service runtimes need a status command (exit 0 alive, exit 3 stopped).",
+          ...specIssue("serviceStatus"),
         });
       if (anyInteractive && !commands.status?.trim())
         ctx.addIssue({
           code: "custom",
           path: [...path, "status"],
-          message: "Interactive commands need a status command.",
+          ...specIssue("interactiveStatus"),
         });
       if ((interactive?.start || interactive?.afterJoin) && launch.management !== "service")
         ctx.addIssue({
           code: "custom",
           path: ["management"],
-          message: "An interactive start or afterJoin needs management service.",
+          ...specIssue("interactiveService"),
         });
       for (const field of ["prepare", "afterJoin", "stop"] as const)
         if (interactive?.[field] && !commands[field])
           ctx.addIssue({
             code: "custom",
             path: [...path, "interactive", field],
-            message: `An interactive ${field} needs a ${field} command.`,
+            ...specIssue("interactiveCommand", { field }),
           });
     });
   });
@@ -513,7 +518,7 @@ export const readerMapEntrySchema = z
     series: exactTextSchema(256),
     labels: z
       .record(z.string().regex(METRIC_SERIES_NAME_PATTERN), z.string().min(1).max(64))
-      .refine((labels) => Object.keys(labels).length <= 16, "At most 16 labels.")
+      .refine((labels) => Object.keys(labels).length <= 16, specIssue("labelsMax16"))
       .optional(),
     aggregate: z.enum(["sum", "max", "first"]).optional(),
     scale: canonicalNumberSchema.optional(),
@@ -577,12 +582,12 @@ export const runtimeSpecSchema = z
     if (bytes === null || bytes > RUNTIME_SPEC_MAX_BYTES)
       ctx.addIssue({
         code: "custom",
-        message: `A runtime definition is at most ${RUNTIME_SPEC_MAX_BYTES} bytes as canonical JSON.`,
+        ...specIssue("specTooLarge", { maxBytes: RUNTIME_SPEC_MAX_BYTES }),
       });
     if ((spec.address === undefined) === (spec.launch === undefined))
       ctx.addIssue({
         code: "custom",
-        message: "A runtime has exactly one of address (always-on) or launch (startable).",
+        ...specIssue("addressOrLaunch"),
       });
     // An always-on runtime always serves (its models may be discovered); a startable one
     // serves exactly when it lists models.
@@ -592,20 +597,18 @@ export const runtimeSpecSchema = z
         ctx.addIssue({
           code: "custom",
           path: [key],
-          message: serves
-            ? "A runtime that serves models declares api, engine and modelType."
-            : "A service (no models) has no api, engine or modelType.",
+          ...specIssue(serves ? "servingFields" : "serviceFields"),
         });
     if (!serves && (spec.metricsReader || spec.expandMedia !== undefined))
       ctx.addIssue({
         code: "custom",
-        message: "A service has no metrics reader or media expansion.",
+        ...specIssue("serviceExtras"),
       });
     if (spec.launch && serves && !spec.launch.readiness)
       ctx.addIssue({
         code: "custom",
         path: ["launch", "readiness"],
-        message: "A runtime that serves models needs an HTTP readiness check.",
+        ...specIssue("servingReadiness"),
       });
     if (
       spec.launch &&
@@ -616,31 +619,35 @@ export const runtimeSpecSchema = z
       ctx.addIssue({
         code: "custom",
         path: ["launch", "readiness"],
-        message: "A service needs an HTTP readiness check or a status/health command per rank.",
+        ...specIssue("serviceReadiness"),
       });
     const ids = new Set<string>();
     spec.models?.forEach((model, index) => {
       if (ids.has(model.id))
-        ctx.addIssue({ code: "custom", path: ["models", index, "id"], message: "Duplicate id." });
+        ctx.addIssue({
+          code: "custom",
+          path: ["models", index, "id"],
+          ...specIssue("duplicateId"),
+        });
       ids.add(model.id);
       if (model.embeddingContract && spec.modelType !== "embeddings")
         ctx.addIssue({
           code: "custom",
           path: ["models", index, "embeddingContract"],
-          message: "Embedding contracts need modelType embeddings.",
+          ...specIssue("embeddingModelType"),
         });
       if (model.transcription && spec.modelType !== "transcription")
         ctx.addIssue({
           code: "custom",
           path: ["models", index, "transcription"],
-          message: "A transcription profile needs modelType transcription.",
+          ...specIssue("transcriptionModelType"),
         });
     });
     if (spec.api === "anthropic" && spec.modelType !== "llm")
       ctx.addIssue({
         code: "custom",
         path: ["modelType"],
-        message: "Anthropic runtimes serve LLMs only.",
+        ...specIssue("anthropicLlm"),
       });
   });
 export type RuntimeSpec = z.infer<typeof runtimeSpecSchema>;
@@ -670,7 +677,7 @@ export const nodeMetricCommandSchema = z
     /** Metric name → where to read it. */
     map: z
       .record(z.string().regex(METRIC_SERIES_NAME_PATTERN), readerMapEntrySchema)
-      .refine((map) => Object.keys(map).length <= 16, "At most 16 metrics per command.")
+      .refine((map) => Object.keys(map).length <= 16, specIssue("metricsPerCommand"))
       .optional(),
   })
   .strict();
@@ -690,12 +697,15 @@ export const nodeMetricCommandsSchema = z
   .max(NODE_METRIC_COMMANDS_MAX)
   .refine(
     (commands) => new Set(commands.map((command) => command.name)).size === commands.length,
-    "Metric command names must be unique.",
+    specIssue("metricNamesUnique"),
   )
-  .refine((commands) => {
-    const bytes = canonicalBytes(commands);
-    return bytes !== null && bytes <= NODE_METRIC_COMMANDS_MAX_BYTES;
-  }, `Node metric commands are at most ${NODE_METRIC_COMMANDS_MAX_BYTES} bytes together.`);
+  .refine(
+    (commands) => {
+      const bytes = canonicalBytes(commands);
+      return bytes !== null && bytes <= NODE_METRIC_COMMANDS_MAX_BYTES;
+    },
+    specIssue("metricCommandsTooLarge", { maxBytes: NODE_METRIC_COMMANDS_MAX_BYTES }),
+  );
 
 // ── Fabrics (part of the node definition; frozen at Relay only) ──
 
@@ -704,10 +714,7 @@ export const fabricNameSchema = z.string().regex(FABRIC_NAME_PATTERN);
  * The node's address on a fabric: a canonical IP literal, never unspecified, loopback or
  * IPv4-mapped (`ip-literal.ts`; the node and the database apply the same rule).
  */
-export const fabricIpSchema = z
-  .string()
-  .max(39)
-  .refine(isFabricIp, "Expected the node's IP address on this fabric (e.g. 10.0.0.5 or fd00::5).");
+export const fabricIpSchema = z.string().max(39).refine(isFabricIp, specIssue("fabricIp"));
 
 /** A node's memberships as people and agents edit them (`nodes.update`). */
 export const nodeFabricMembershipsSchema = z
@@ -715,7 +722,7 @@ export const nodeFabricMembershipsSchema = z
   .max(NODE_FABRICS_MAX)
   .refine(
     (fabrics) => new Set(fabrics.map((fabric) => fabric.name)).size === fabrics.length,
-    "A node joins each fabric once.",
+    specIssue("fabricOnce"),
   );
 
 /**
@@ -733,7 +740,7 @@ export const nodeFabricSetsSchema = z
         memberIps: z.array(fabricIpSchema).min(1).max(FABRIC_MEMBERS_MAX),
       })
       .strict()
-      .refine((set) => set.memberIps.includes(set.selfIp), "memberIps includes selfIp."),
+      .refine((set) => set.memberIps.includes(set.selfIp), specIssue("fabricSelfIp")),
   )
   .max(NODE_FABRICS_MAX);
 export type NodeFabricSets = z.infer<typeof nodeFabricSetsSchema>;
@@ -766,7 +773,7 @@ export function runtimeSpecWarnings(spec: RuntimeSpec): RuntimeSpecWarning[] {
 /** `[start, end]`, 1024 ≤ start ≤ end ≤ 65535. */
 export const portRangeSchema = z
   .tuple([z.number().int().min(1024).max(65_535), z.number().int().min(1024).max(65_535)])
-  .refine(([start, end]) => start <= end, "The port range must not be reversed.");
+  .refine(([start, end]) => start <= end, specIssue("portRangeReversed"));
 
 // ── Declared hardware (browser/agent `Node.declaredResources`; `node.info.declared`, which the
 // 0.4.0 node never sends: hardware is declared in the web app or through MCP) ──
@@ -792,13 +799,13 @@ const declaredGpuSchema = z
       ctx.addIssue({
         code: "custom",
         path: ["vramGb"],
-        message: "A unified GPU shares system memory: omit vramGb.",
+        ...specIssue("gpuUnifiedVram"),
       });
     if (gpu.unified !== true && gpu.vramGb === undefined)
       ctx.addIssue({
         code: "custom",
         path: ["vramGb"],
-        message: "A discrete GPU needs vramGb (or unified: true when it shares system memory).",
+        ...specIssue("gpuDiscreteVram"),
       });
   });
 
@@ -816,7 +823,7 @@ export const declaredHardwareSchema = z
         gpuKeySchema,
         canonicalNumberSchema.refine((value) => value >= 0 && value <= 1_000_000),
       )
-      .refine((map) => Object.keys(map).length <= 256, "At most 256 GPUs.")
+      .refine((map) => Object.keys(map).length <= 256, specIssue("gpusMax"))
       .optional(),
     gpus: z.array(declaredGpuSchema).max(32).optional(),
   })

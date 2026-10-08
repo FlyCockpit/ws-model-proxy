@@ -37,6 +37,7 @@ import {
   readerToDraft,
 } from "@/lib/metrics-reader-draft";
 import { refusalText } from "@/lib/refusal-text";
+import { specIssueText } from "@/lib/spec-issue-text";
 import { orpc } from "@/utils/orpc";
 
 const KINDS: ReaderKind[] = ["none", "builtin", "route", "command"];
@@ -55,15 +56,16 @@ function readerIssues(values: ReaderValues, base: MetricsReader | undefined) {
   if (!parsed.success)
     for (const issue of parsed.error.issues) {
       const [head, signal, field] = issue.path;
+      const message = specIssueText(issue);
       const row = values.map.findIndex((item) => item.signal === signal);
       if (head === "map" && row >= 0 && typeof field === "string")
-        issues.push({ path: ["map", row, field], message: issue.message });
+        issues.push({ path: ["map", row, field], message });
       else if (typeof head === "string" && head !== "map" && head !== "kind")
-        issues.push({ path: [head], message: issue.message });
+        issues.push({ path: [head], message });
       else
         issues.push({
           path: ["check"],
-          message: `${issue.path.join(".") || "metricsReader"}: ${issue.message}`,
+          message: `${issue.path.join(".") || "metricsReader"}: ${message}`,
         });
     }
   return issues;

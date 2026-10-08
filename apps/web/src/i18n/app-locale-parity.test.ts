@@ -3,16 +3,20 @@ import enAccess from "../locales/en-US/access.json";
 import enActivity from "../locales/en-US/activity.json";
 import enAdmin from "../locales/en-US/admin.json";
 import enDashboard from "../locales/en-US/dashboard.json";
+import enErrors from "../locales/en-US/errors.json";
 import enNav from "../locales/en-US/nav.json";
 import enSettings from "../locales/en-US/settings.json";
 import enTerminals from "../locales/en-US/terminals.json";
+import enValidation from "../locales/en-US/validation.json";
 import esAccess from "../locales/es-MX/access.json";
 import esActivity from "../locales/es-MX/activity.json";
 import esAdmin from "../locales/es-MX/admin.json";
 import esDashboard from "../locales/es-MX/dashboard.json";
+import esErrors from "../locales/es-MX/errors.json";
 import esNav from "../locales/es-MX/nav.json";
 import esSettings from "../locales/es-MX/settings.json";
 import esTerminals from "../locales/es-MX/terminals.json";
+import esValidation from "../locales/es-MX/validation.json";
 
 /** Whole-namespace key-tree parity: no en-US fallback can leak into an es-MX page. */
 function keyTree(value: unknown, prefix = ""): string[] {
@@ -31,6 +35,8 @@ describe("app locale key parity (en-US / es-MX)", () => {
     ["access", enAccess, esAccess],
     ["activity", enActivity, esActivity],
     ["terminals", enTerminals, esTerminals],
+    ["errors", enErrors, esErrors],
+    ["validation", enValidation, esValidation],
   ])("has identical key trees in %s", (_name, en, es) => {
     expect(keyTree(es).sort()).toEqual(keyTree(en).sort());
   });

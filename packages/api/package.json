@@ -5,6 +5,9 @@
     "./lib/runtime-spec": {
       "default": "./src/lib/runtime-spec.ts"
     },
+    "./lib/spec-issues": {
+      "default": "./src/lib/spec-issues.ts"
+    },
     "./lib/canonical-json": {
       "default": "./src/lib/canonical-json.ts"
     },
