@@ -949,6 +949,23 @@
         "nameExternal": "Leave out :external; callers add it.",
         "nameRuntime": "Names starting with runtime: are for direct tests."
       }
+    },
+    "sharing": {
+      "sharesTitle": "Shares",
+      "sharesEmpty": "This pool is not shared with anyone yet.",
+      "shareTitle": "Share this pool",
+      "share": "Share this pool",
+      "laterHint": "A monthly cloud cap and warm protection are set with Edit once the person has the share.",
+      "contributedTitle": "Contributed models",
+      "othersHardware": "Contributed models run on other people's hardware. They may stop or withdraw them at any time, so do not count on them for capacity you need.",
+      "ownHardwareOnly": "This pool routes to your own hardware only: contributed models stay listed but get no traffic.",
+      "contributedEmpty": "Nobody contributes a model to this pool.",
+      "removeContributedTitle": "Remove {{model}} contributed by {{email}}?",
+      "removeContributedDescription": "The pool stops routing to it at once. They keep can contribute and may add it again.",
+      "notYours": "This pool is not yours and is not shared with you.",
+      "yourGrantTitle": "Your access to this pool",
+      "yourGrantHint": "Only the owner can change this share. You can leave it from Access → Shares.",
+      "unknownPerson": "Someone who left"
     }
   },
   "runtime": {
@@ -1154,7 +1171,12 @@
       "fabric_in_use": "A running multi-node instance uses this fabric.",
       "invite_needs_link": "This invite needs its link to be accepted.",
       "always_on_runtime": "Always-on runtimes run on their own; there is nothing to start.",
-      "fabric_port_ranges_disjoint": "The nodes' port ranges share no port for the dist port."
+      "fabric_port_ranges_disjoint": "The nodes' port ranges share no port for the dist port.",
+      "cap_currency_has_spend": "The cap's currency must be the one this share has spent in this month.",
+      "already_shared": "This pool is already shared with this person. Change the existing share.",
+      "invite_pending": "This e-mail already has a pending invite. Resend it instead.",
+      "too_many_invites": "Too many pending invites. Withdraw some before inviting more people.",
+      "invite_accepted": "That invite was just accepted, so it is a share now."
     },
     "delete": "Delete runtime",
     "deleteTitle": "Delete {{name}}?",

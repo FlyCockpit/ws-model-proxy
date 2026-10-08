@@ -1,58 +1,44 @@
 import { useForm } from "@tanstack/react-form";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@ws-model-proxy/ui/components/card";
-import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { Switch } from "@ws-model-proxy/ui/components/switch";
 import { Plus } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
 import { ConfirmAction } from "@/components/access/confirm-action";
-import { SecretReveal } from "@/components/access/secret-reveal";
+import {
+  announceShared,
+  CapLine,
+  type InviteLink,
+  InviteLinkDialog,
+  InviteRow,
+  PermissionCheckbox,
+  Permissions,
+  PRIORITY_CHOICES,
+  type PriorityChoice,
+  priorityItems,
+  ShareByMeRow,
+  ShareEmpty,
+  ShareSection,
+  type ShareView,
+  useCreatePoolShare,
+  useInvalidateShares,
+} from "@/components/access/pool-shares";
 import { InlineRetry } from "@/components/inline-retry";
 import { PageHeading } from "@/components/page-stub";
 import { SegmentedControl } from "@/components/segmented-control";
-import { TimeAgo } from "@/components/time-ago";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/access/shares")({
   component: AccessSharesPage,
 });
-
-type PriorityClass = "BACKGROUND" | "NORMAL" | "HIGH";
-type ShareView = {
-  id: string;
-  poolId: string;
-  callableId: string;
-  ownerEmail: string;
-  granteeEmail: string;
-  canUse: boolean;
-  canContribute: boolean;
-  priorityClass: PriorityClass | null;
-  monthlyCap: { limit: string; currency: string; spentThisMonth: string } | null;
-  contributedMembers: number;
-  createdAt: string;
-};
-type InviteView = {
-  id: string;
-  target:
-    | { kind: "pool"; poolId: string; callableId: string }
-    | { kind: "runtime"; runtimeId: string; name: string };
-  email: string;
-  canUse: boolean;
-  canContribute: boolean;
-  expiresAt: string;
-  emailSentAt: string | null;
-};
-type InviteLink = { email: string; link: string; expiresAt: string };
 
 function AccessSharesPage() {
   const { t } = useTranslation(["access"]);
@@ -79,62 +65,36 @@ function AccessSharesPage() {
         <InlineRetry message={t("access:shares.loadFailed")} onRetry={() => shares.refetch()} />
       ) : (
         <>
-          <Section title={t("access:shares.byMeTitle")}>
+          <ShareSection title={t("access:shares.byMeTitle")}>
             {shares.data.byMe.length === 0 ? (
-              <Empty text={t("access:shares.byMeEmpty")} />
+              <ShareEmpty text={t("access:shares.byMeEmpty")} />
             ) : (
               shares.data.byMe.map((share) => <ShareByMeRow key={share.id} share={share} />)
             )}
-          </Section>
+          </ShareSection>
           <RuntimeSharesByMe />
-          <Section title={t("access:shares.invitesTitle")}>
+          <ShareSection title={t("access:shares.invitesTitle")}>
             {shares.data.invites.length === 0 ? (
-              <Empty text={t("access:shares.invitesEmpty")} />
+              <ShareEmpty text={t("access:shares.invitesEmpty")} />
             ) : (
               shares.data.invites.map((invite) => (
                 <InviteRow key={invite.id} invite={invite} onLink={setInviteLink} />
               ))
             )}
-          </Section>
-          <Section title={t("access:shares.withMeTitle")}>
+          </ShareSection>
+          <ShareSection title={t("access:shares.withMeTitle")}>
             {shares.data.withMe.length === 0 ? (
-              <Empty text={t("access:shares.withMeEmpty")} />
+              <ShareEmpty text={t("access:shares.withMeEmpty")} />
             ) : (
               shares.data.withMe.map((share) => <ShareWithMeRow key={share.id} share={share} />)
             )}
-          </Section>
+          </ShareSection>
         </>
       )}
       <CreateShareDialog open={createOpen} onOpenChange={setCreateOpen} onLink={setInviteLink} />
       <InviteLinkDialog value={inviteLink} onClose={() => setInviteLink(null)} />
     </div>
   );
-}
-
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base">{title}</CardTitle>
-      </CardHeader>
-      <CardContent className="flex min-w-0 flex-col divide-y">{children}</CardContent>
-    </Card>
-  );
-}
-
-function Empty({ text }: { text: string }) {
-  return <p className="text-sm text-muted-foreground">{text}</p>;
-}
-
-function useInvalidateShares() {
-  const queryClient = useQueryClient();
-  return () =>
-    Promise.all([
-      queryClient.invalidateQueries({ queryKey: orpc.access.shares.list.key() }),
-      queryClient.invalidateQueries({ queryKey: orpc.runtimes.shares.list.key() }),
-      // A runtime's page lists its shares too.
-      queryClient.invalidateQueries({ queryKey: orpc.runtimes.get.key() }),
-    ]);
 }
 
 /** Runtime definitions you share (read-only, every version), with stop sharing. */
@@ -146,13 +106,13 @@ function RuntimeSharesByMe() {
     (runtimes.data?.runtimes ?? []).map((runtime) => [runtime.id, runtime.name]),
   );
   return (
-    <Section title={t("access:shares.runtimesByMeTitle")}>
+    <ShareSection title={t("access:shares.runtimesByMeTitle")}>
       {shares.isPending ? (
         <Skeleton className="h-12 w-full" />
       ) : shares.isError ? (
         <InlineRetry message={t("access:shares.loadFailed")} onRetry={() => shares.refetch()} />
       ) : shares.data.sharedByMe.length === 0 ? (
-        <Empty text={t("access:shares.runtimesByMeEmpty")} />
+        <ShareEmpty text={t("access:shares.runtimesByMeEmpty")} />
       ) : (
         shares.data.sharedByMe.map((share) => (
           <RuntimeShareRow
@@ -162,7 +122,7 @@ function RuntimeSharesByMe() {
           />
         ))
       )}
-    </Section>
+    </ShareSection>
   );
 }
 
@@ -209,173 +169,6 @@ function RuntimeShareRow({
   );
 }
 
-/** What an invite or share names: a pool's callable id, or a runtime definition. */
-function TargetLine({ target }: { target: InviteView["target"] }) {
-  const { t } = useTranslation(["access"]);
-  return target.kind === "pool" ? (
-    <p className="truncate font-mono text-xs text-muted-foreground">{target.callableId}</p>
-  ) : (
-    <p className="truncate text-xs text-muted-foreground">
-      {t("access:shares.runtimeTarget", { name: target.name })}
-    </p>
-  );
-}
-
-function Permissions({ share }: { share: ShareView }) {
-  const { t } = useTranslation(["access"]);
-  return (
-    <p className="text-xs text-muted-foreground">
-      {[
-        share.canUse ? t("access:shares.canUse") : null,
-        share.canContribute ? t("access:shares.canContribute") : null,
-        share.contributedMembers > 0
-          ? t("access:shares.contributed", { count: share.contributedMembers })
-          : null,
-      ]
-        .filter(Boolean)
-        .join(" · ")}
-    </p>
-  );
-}
-
-function CapLine({ share }: { share: ShareView }) {
-  const { t } = useTranslation(["access"]);
-  if (!share.monthlyCap) return null;
-  return (
-    <p className="text-xs text-muted-foreground">
-      {t("access:shares.monthlyCap", {
-        spent: share.monthlyCap.spentThisMonth,
-        limit: share.monthlyCap.limit,
-        currency: share.monthlyCap.currency,
-      })}
-    </p>
-  );
-}
-
-function ShareByMeRow({ share }: { share: ShareView }) {
-  const { t } = useTranslation(["access"]);
-  const invalidate = useInvalidateShares();
-  const [confirmOpen, setConfirmOpen] = useState(false);
-  const [contributeOffOpen, setContributeOffOpen] = useState(false);
-  const update = useMutation(
-    orpc.access.shares.update.mutationOptions({
-      onSuccess: async () => {
-        toast.success(t("access:shares.updated"));
-        await invalidate();
-      },
-    }),
-  );
-  const remove = useMutation(
-    orpc.access.shares.delete.mutationOptions({
-      onSuccess: async () => {
-        setConfirmOpen(false);
-        toast.success(t("access:shares.removed"));
-        await invalidate();
-      },
-    }),
-  );
-  const toggle = (field: "canUse" | "canContribute", next: boolean) => {
-    const other = field === "canUse" ? share.canContribute : share.canUse;
-    if (!next && !other) {
-      toast.error(t("access:shares.needOne"));
-      return;
-    }
-    // Clearing can contribute removes the person's contributed members: confirm first.
-    if (field === "canContribute" && !next && share.contributedMembers > 0) {
-      setContributeOffOpen(true);
-      return;
-    }
-    update.mutate({ shareId: share.id, [field]: next });
-  };
-  return (
-    <div className="flex min-w-0 flex-col gap-3 py-3 first:pt-0 last:pb-0">
-      <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
-        <div className="min-w-0 space-y-0.5">
-          <p className="truncate font-medium">{share.granteeEmail}</p>
-          <p className="truncate font-mono text-xs text-muted-foreground">{share.callableId}</p>
-          {share.contributedMembers > 0 ? (
-            <p className="text-xs text-muted-foreground">
-              {t("access:shares.contributed", { count: share.contributedMembers })}
-            </p>
-          ) : null}
-          <CapLine share={share} />
-        </div>
-        <Button type="button" variant="outline" size="touch" onClick={() => setConfirmOpen(true)}>
-          {t("access:shares.remove")}
-        </Button>
-      </div>
-      <div className="flex min-w-0 flex-wrap gap-x-6 gap-y-1">
-        <SwitchRow
-          id={`share-${share.id}-use`}
-          label={t("access:shares.canUse")}
-          checked={share.canUse}
-          disabled={update.isPending}
-          onChange={(next) => toggle("canUse", next)}
-        />
-        <SwitchRow
-          id={`share-${share.id}-contribute`}
-          label={t("access:shares.canContribute")}
-          checked={share.canContribute}
-          disabled={update.isPending}
-          onChange={(next) => toggle("canContribute", next)}
-        />
-      </div>
-      <ConfirmAction
-        open={confirmOpen}
-        onOpenChange={setConfirmOpen}
-        title={t("access:shares.removeTitle", {
-          pool: share.callableId,
-          email: share.granteeEmail,
-        })}
-        description={t("access:shares.removeDescription")}
-        confirmLabel={t("access:shares.remove")}
-        isPending={remove.isPending}
-        onConfirm={() => remove.mutate({ shareId: share.id })}
-      />
-      <ConfirmAction
-        open={contributeOffOpen}
-        onOpenChange={setContributeOffOpen}
-        title={t("access:shares.contributeOffTitle", {
-          email: share.granteeEmail,
-          pool: share.callableId,
-        })}
-        description={t("access:shares.contributeOffDescription", {
-          count: share.contributedMembers,
-        })}
-        confirmLabel={t("access:shares.contributeOff")}
-        isPending={update.isPending}
-        onConfirm={() =>
-          update.mutate(
-            { shareId: share.id, canContribute: false },
-            { onSettled: () => setContributeOffOpen(false) },
-          )
-        }
-      />
-    </div>
-  );
-}
-
-function SwitchRow({
-  id,
-  label,
-  checked,
-  disabled,
-  onChange,
-}: {
-  id: string;
-  label: string;
-  checked: boolean;
-  disabled: boolean;
-  onChange: (next: boolean) => void;
-}) {
-  return (
-    <label htmlFor={id} className="flex min-h-11 cursor-pointer items-center gap-3">
-      <Switch id={id} checked={checked} disabled={disabled} onCheckedChange={onChange} />
-      <span className="text-sm">{label}</span>
-    </label>
-  );
-}
-
 function ShareWithMeRow({ share }: { share: ShareView }) {
   const { t } = useTranslation(["access"]);
   const invalidate = useInvalidateShares();
@@ -396,7 +189,7 @@ function ShareWithMeRow({ share }: { share: ShareView }) {
         <p className="truncate text-xs text-muted-foreground">
           {t("access:shares.from", { email: share.ownerEmail })}
         </p>
-        <Permissions share={share} />
+        <Permissions grant={share} />
         <CapLine share={share} />
       </div>
       <Button type="button" variant="outline" size="touch" onClick={() => setConfirmOpen(true)}>
@@ -415,97 +208,6 @@ function ShareWithMeRow({ share }: { share: ShareView }) {
   );
 }
 
-function InviteRow({ invite, onLink }: { invite: InviteView; onLink: (link: InviteLink) => void }) {
-  const { t } = useTranslation(["access"]);
-  const invalidate = useInvalidateShares();
-  const resend = useMutation(
-    orpc.access.invites.resend.mutationOptions({
-      onSuccess: async (result) => {
-        if (result.link) {
-          onLink({ email: invite.email, link: result.link, expiresAt: result.invite.expiresAt });
-        } else {
-          toast.success(t("access:shares.resent"));
-        }
-        await invalidate();
-      },
-    }),
-  );
-  const [withdrawOpen, setWithdrawOpen] = useState(false);
-  const withdraw = useMutation(
-    orpc.access.invites.revoke.mutationOptions({
-      onSuccess: async () => {
-        setWithdrawOpen(false);
-        toast.success(t("access:shares.withdrawn"));
-        await invalidate();
-      },
-    }),
-  );
-  return (
-    <div className="flex min-w-0 flex-col gap-2 py-3 first:pt-0 last:pb-0 sm:flex-row sm:items-start sm:justify-between">
-      <div className="min-w-0 space-y-0.5">
-        <p className="truncate font-medium">{invite.email}</p>
-        <TargetLine target={invite.target} />
-        <p className="text-xs text-muted-foreground">
-          {invite.emailSentAt ? t("access:shares.emailSent") : t("access:shares.notEmailed")}
-          {" · "}
-          {t("access:shares.expires")} <TimeAgo value={invite.expiresAt} />
-        </p>
-      </div>
-      <div className="flex shrink-0 gap-2">
-        <Button
-          type="button"
-          variant="outline"
-          size="touch"
-          disabled={resend.isPending}
-          onClick={() => resend.mutate({ inviteId: invite.id })}
-        >
-          {t("access:shares.resend")}
-        </Button>
-        <Button type="button" variant="ghost" size="touch" onClick={() => setWithdrawOpen(true)}>
-          {t("access:shares.withdraw")}
-        </Button>
-      </div>
-      <ConfirmAction
-        open={withdrawOpen}
-        onOpenChange={setWithdrawOpen}
-        title={t("access:shares.withdrawTitle", { email: invite.email })}
-        description={t("access:shares.withdrawDescription")}
-        confirmLabel={t("access:shares.withdraw")}
-        isPending={withdraw.isPending}
-        onConfirm={() => withdraw.mutate({ inviteId: invite.id })}
-      />
-    </div>
-  );
-}
-
-function InviteLinkDialog({ value, onClose }: { value: InviteLink | null; onClose: () => void }) {
-  const { t, i18n } = useTranslation(["access"]);
-  return (
-    <ResponsiveDialog
-      open={value !== null}
-      onOpenChange={(next) => (next ? undefined : onClose())}
-      title={t("access:shares.inviteLinkTitle")}
-    >
-      {value ? (
-        <SecretReveal
-          value={value.link}
-          title={t("access:shares.inviteLinkTitle")}
-          description={t("access:shares.inviteLinkDescription", {
-            email: value.email,
-            date: new Date(value.expiresAt).toLocaleDateString(i18n.language, {
-              dateStyle: "medium",
-            }),
-          })}
-          copyLabel={t("access:shares.copyInviteLink")}
-          onDone={onClose}
-        />
-      ) : null}
-    </ResponsiveDialog>
-  );
-}
-
-const PRIORITY_CHOICES = ["POOL", "BACKGROUND", "NORMAL", "HIGH"] as const;
-type PriorityChoice = (typeof PRIORITY_CHOICES)[number];
 type ShareWhat = "pool" | "runtime";
 
 const createSchema = z
@@ -545,24 +247,23 @@ function CreateShareDialog({
       title={t("access:shares.createTitle")}
       description={t("access:shares.createDescription")}
     >
-      {open ? (
-        <CreateShareForm
-          onDone={(link) => {
-            onOpenChange(false);
-            if (link) onLink(link);
-          }}
-        />
-      ) : null}
+      {open ? <CreateShareForm onDone={() => onOpenChange(false)} onLink={onLink} /> : null}
     </ResponsiveDialog>
   );
 }
 
-function CreateShareForm({ onDone }: { onDone: (link: InviteLink | null) => void }) {
+function CreateShareForm({
+  onDone,
+  onLink,
+}: {
+  onDone: () => void;
+  onLink: (link: InviteLink) => void;
+}) {
   const { t } = useTranslation(["access"]);
   const invalidate = useInvalidateShares();
   const pools = useQuery(orpc.pools.list.queryOptions());
   const runtimes = useQuery(orpc.runtimes.list.queryOptions());
-  const createPoolShare = useMutation(orpc.access.shares.create.mutationOptions());
+  const createPoolShare = useCreatePoolShare(onLink);
   const createRuntimeShare = useMutation(orpc.runtimes.shares.create.mutationOptions());
   const ownPools = pools.data?.pools ?? [];
   const ownRuntimes = runtimes.data?.runtimes ?? [];
@@ -579,11 +280,11 @@ function CreateShareForm({ onDone }: { onDone: (link: InviteLink | null) => void
     validators: { onSubmit: createSchema },
     onSubmit: async ({ value }) => {
       const email = value.email.trim().toLowerCase();
-      // A failure is toasted by the global mutation error handler. Both answer alike: a share
-      // (a proved mailbox) or an invite, whose link is shown once when no e-mail went out.
-      const result = await (value.what === "runtime"
-        ? createRuntimeShare.mutateAsync({ runtimeId: value.runtimeId, email })
-        : createPoolShare.mutateAsync({
+      // Both answer alike: a share (a proved mailbox) or an invite, whose link is shown once
+      // when no e-mail went out.
+      if (value.what === "pool") {
+        await createPoolShare.submit(
+          {
             poolId: value.poolId,
             email,
             canUse: value.canUse,
@@ -591,19 +292,19 @@ function CreateShareForm({ onDone }: { onDone: (link: InviteLink | null) => void
             priorityClass: value.priority === "POOL" ? null : value.priority,
             protectionPercent: null,
             monthlyCap: null,
-          })
-      ).catch(() => null);
+          },
+          onDone,
+        );
+        return;
+      }
+      // A failure is toasted by the global mutation error handler.
+      const result = await createRuntimeShare
+        .mutateAsync({ runtimeId: value.runtimeId, email })
+        .catch(() => null);
       if (!result) return;
       await invalidate();
-      if (result.kind === "share") {
-        toast.success(t("access:shares.shared", { email }));
-        onDone(null);
-      } else if (result.link) {
-        onDone({ email, link: result.link, expiresAt: result.invite.expiresAt });
-      } else {
-        toast.success(t("access:shares.invited", { email }));
-        onDone(null);
-      }
+      onDone();
+      announceShared(result, email, t, onLink);
     },
   });
 
@@ -777,12 +478,7 @@ function CreateShareForm({ onDone }: { onDone: (link: InviteLink | null) => void
                       value={field.state.value}
                       onChange={field.handleChange}
                       ariaLabel={t("access:shares.priority")}
-                      items={[
-                        { value: "POOL", label: t("access:shares.priorityPool") },
-                        { value: "BACKGROUND", label: t("access:shares.priorityBackground") },
-                        { value: "NORMAL", label: t("access:shares.priorityNormal") },
-                        { value: "HIGH", label: t("access:shares.priorityHigh") },
-                      ]}
+                      items={priorityItems(t)}
                     />
                   </div>
                 )}
@@ -806,39 +502,5 @@ function CreateShareForm({ onDone }: { onDone: (link: InviteLink | null) => void
         )}
       </form.Subscribe>
     </form>
-  );
-}
-
-function PermissionCheckbox({
-  id,
-  label,
-  hint,
-  checked,
-  onChange,
-  error,
-}: {
-  id: string;
-  label: string;
-  hint: string;
-  checked: boolean;
-  onChange: (next: boolean) => void;
-  error: string | null;
-}) {
-  return (
-    <div className="space-y-1">
-      <label htmlFor={id} className="flex min-h-11 cursor-pointer items-start gap-3 py-1">
-        <Checkbox
-          id={id}
-          className="mt-0.5"
-          checked={checked}
-          onCheckedChange={(next) => onChange(next === true)}
-        />
-        <span className="min-w-0 space-y-0.5">
-          <span className="block text-sm font-medium">{label}</span>
-          <span className="block text-xs text-muted-foreground">{hint}</span>
-        </span>
-      </label>
-      {error ? <p className="text-sm text-destructive">{error}</p> : null}
-    </div>
   );
 }

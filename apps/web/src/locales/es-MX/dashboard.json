@@ -949,6 +949,23 @@
         "nameExternal": "No incluyas :external; quien llama lo agrega.",
         "nameRuntime": "Los nombres que empiezan con runtime: son para pruebas directas."
       }
+    },
+    "sharing": {
+      "sharesTitle": "Compartidos",
+      "sharesEmpty": "Este pool aún no está compartido con nadie.",
+      "shareTitle": "Compartir este pool",
+      "share": "Compartir este pool",
+      "laterHint": "El tope mensual de nube y la protección de caché caliente se ajustan con Editar cuando la persona ya tiene el compartido.",
+      "contributedTitle": "Modelos contribuidos",
+      "othersHardware": "Los modelos contribuidos corren en el hardware de otras personas. Pueden detenerlos o retirarlos en cualquier momento, así que no cuentes con ellos para la capacidad que necesitas.",
+      "ownHardwareOnly": "Este pool enruta solo a tu propio hardware: los modelos contribuidos siguen en la lista pero no reciben tráfico.",
+      "contributedEmpty": "Nadie contribuye un modelo a este pool.",
+      "removeContributedTitle": "¿Quitar {{model}} contribuido por {{email}}?",
+      "removeContributedDescription": "El pool deja de enrutarle de inmediato. La persona conserva puede contribuir y puede volver a agregarlo.",
+      "notYours": "Este pool no es tuyo y no está compartido contigo.",
+      "yourGrantTitle": "Tu acceso a este pool",
+      "yourGrantHint": "Solo el dueño puede cambiar este compartido. Puedes salir de él en Acceso → Compartidos.",
+      "unknownPerson": "Alguien que ya no está"
     }
   },
   "runtime": {
@@ -1154,7 +1171,12 @@
       "fabric_in_use": "Una instancia multinodo en ejecución usa esta red.",
       "invite_needs_link": "Esta invitación necesita su enlace para aceptarse.",
       "always_on_runtime": "Los runtimes siempre activos se ejecutan por su cuenta; no hay nada que iniciar.",
-      "fabric_port_ranges_disjoint": "Los rangos de puertos de los nodos no comparten ningún puerto para el puerto dist."
+      "fabric_port_ranges_disjoint": "Los rangos de puertos de los nodos no comparten ningún puerto para el puerto dist.",
+      "cap_currency_has_spend": "La moneda del tope debe ser la que este compartido ya gastó este mes.",
+      "already_shared": "Este pool ya está compartido con esta persona. Cambia el compartido existente.",
+      "invite_pending": "Este correo ya tiene una invitación pendiente. Reenvíala en su lugar.",
+      "too_many_invites": "Demasiadas invitaciones pendientes. Retira algunas antes de invitar a más personas.",
+      "invite_accepted": "Esa invitación se acaba de aceptar, así que ahora es un compartido."
     },
     "delete": "Eliminar runtime",
     "deleteTitle": "¿Eliminar {{name}}?",

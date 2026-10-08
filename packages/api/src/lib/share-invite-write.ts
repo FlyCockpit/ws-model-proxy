@@ -12,7 +12,7 @@ import { ORPCError } from "@orpc/server";
 import prisma from "@ws-model-proxy/db";
 import { runAccessTransaction } from "./access-transaction";
 import { shareInviteSelect, shareInviteTarget, shareInviteView } from "./access-views";
-import { isUniqueViolation, notFound } from "./refuse";
+import { isUniqueViolation, notFound, refuse } from "./refuse";
 import {
   generateShareInviteToken,
   pendingInviteWhere,
@@ -37,13 +37,13 @@ export type InviteTarget =
   | { kind: "pool"; poolId: string; settings: InviteSettings }
   | { kind: "runtime"; runtimeId: string };
 
-function pendingConflict(target: InviteTarget["kind"]): ORPCError<"CONFLICT", unknown> {
-  return new ORPCError("CONFLICT", {
-    message:
-      target === "pool"
-        ? "This e-mail already has a pending invite to this pool. Resend it instead."
-        : "This e-mail already has a pending invite to this runtime. Resend it instead.",
-  });
+function pendingConflict(target: InviteTarget["kind"]) {
+  return refuse(
+    "invite_pending",
+    target === "pool"
+      ? "This e-mail already has a pending invite to this pool. Resend it instead."
+      : "This e-mail already has a pending invite to this runtime. Resend it instead.",
+  );
 }
 
 /**
@@ -115,9 +115,10 @@ export async function writeInvite(
       where: { ownerUserId: args.ownerUserId, ...pendingInviteWhere(now) },
     });
     if (pendingCount >= SHARE_INVITE_MAX_PENDING_PER_OWNER) {
-      throw new ORPCError("CONFLICT", {
-        message: "Too many pending invites. Withdraw some before inviting more people.",
-      });
+      throw refuse(
+        "too_many_invites",
+        "Too many pending invites. Withdraw some before inviting more people.",
+      );
     }
     return tx.shareInvite
       .create({
