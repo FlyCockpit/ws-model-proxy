@@ -102,12 +102,16 @@ export type MembersLive = {
 };
 export const NO_MEMBERS_LIVE: MembersLive = { load: NO_LIVE_LOAD, p95: new Map() };
 
-/** A member's key in the usage rollups of its pool: its runtime model, or its cloud model. */
+/**
+ * A member's key in its pool's usage rollups: the runtime that served (pool traffic records the
+ * serving version, not the runtime model; two models of one runtime in a pool share its p95), or
+ * the cloud model.
+ */
 export function memberLatencyKey(
   poolId: string,
-  member: { runtimeModelId?: string | null; providerModelId?: string | null },
+  member: { runtimeId?: string | null; providerModelId?: string | null },
 ): string {
-  return `${poolId}\u0000${member.runtimeModelId ?? ""}\u0000${member.providerModelId ?? ""}`;
+  return `${poolId}\u0000${member.runtimeId ?? ""}\u0000${member.providerModelId ?? ""}`;
 }
 
 /**
@@ -155,7 +159,13 @@ export function memberView(
       instances: instances.length,
       running: instances.filter((instance) => instance.phase === "READY").length,
       waiting: memberWaiting(instances, live.load),
-      p95LatencyMs: live.p95.get(memberLatencyKey(member.poolId, member)) ?? null,
+      p95LatencyMs:
+        live.p95.get(
+          memberLatencyKey(member.poolId, {
+            runtimeId: model?.runtimeId,
+            providerModelId: member.providerModelId,
+          }),
+        ) ?? null,
     },
   };
 }

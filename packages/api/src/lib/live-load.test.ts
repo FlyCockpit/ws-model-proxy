@@ -184,7 +184,7 @@ function memberRow(instanceIds: string[], kind: "LOCAL" | "CLOUD" = "LOCAL"): Me
 }
 
 describe("memberView live", () => {
-  const p95 = new Map([[memberLatencyKey("pool1", { runtimeModelId: "rm1" }), 840]]);
+  const p95 = new Map([[memberLatencyKey("pool1", { runtimeId: "rt1" }), 840]]);
 
   it("adds the waiting of instances with a known reading, and shows the member's p95", () => {
     const load = new Map([

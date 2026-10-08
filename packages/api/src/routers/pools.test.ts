@@ -156,7 +156,7 @@ describe("pools.get: member live load", () => {
   function latencyRow(bucketCounts: Record<number, number>) {
     const row: Record<string, unknown> = {
       pool: "pool-1",
-      runtime_model: "rm-1",
+      runtime: "rt-1",
       provider_model: "",
     };
     for (let index = 1; index <= LATENCY_HISTOGRAM_BUCKETS; index += 1)
@@ -168,7 +168,7 @@ describe("pools.get: member live load", () => {
     db.pool.findFirst.mockResolvedValue(poolRow({ Members: [servingMember()] }) as never);
     db.$queryRaw.mockImplementation(((strings: TemplateStringsArray) =>
       Promise.resolve(
-        strings.join("").includes("runtime_model") ? [latencyRow({ 5: 10 })] : [],
+        strings.join("").includes("provider_model") ? [latencyRow({ 5: 10 })] : [],
       )) as never);
     const liveLoad = vi.fn(
       () => new Map([["inst-1", { running: 1, waiting: 4, kvUsage: null, at: new Date() }]]),
@@ -180,9 +180,23 @@ describe("pools.get: member live load", () => {
     expect(view.members[0]?.live.waiting).toBe(4);
     expect(view.members[0]?.live.p95LatencyMs).toEqual(expect.any(Number));
     const p95Call = db.$queryRaw.mock.calls.find((call) =>
-      (call[0] as unknown as TemplateStringsArray).join("").includes("runtime_model"),
+      (call[0] as unknown as TemplateStringsArray).join("").includes("provider_model"),
     );
     expect(p95Call?.slice(1)).toContain(OWNER);
+  });
+
+  it("never reads a contributed member's load (the contributor's engine)", async () => {
+    db.pool.findFirst.mockResolvedValue(
+      poolRow({
+        Members: [{ ...servingMember(), shareId: "share-1", Share: { Grantee: { email: "c@x" } } }],
+      }) as never,
+    );
+    const liveLoad = vi.fn(() => new Map());
+    const view = await createRouterClient(poolsRouter, {
+      context: contextFor(CALLERS.person(), { liveLoad }),
+    }).get({ poolId: "pool-1" });
+    expect(liveLoad).not.toHaveBeenCalled();
+    expect(view.members[0]?.live.waiting).toBeNull();
   });
 
   it("keeps load unknown without the relay service and p95 unknown without traffic", async () => {

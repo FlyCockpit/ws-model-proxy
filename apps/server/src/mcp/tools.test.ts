@@ -321,9 +321,15 @@ describe("errors and output", () => {
     const list = await runMcpTool(tool("pools_get"), {
       dispatch: testDispatch("READ"),
       args: {},
-      invoke: async () => ({ pools: [pool(known)], sharedWithMe: [] }),
+      invoke: async () => ({ pools: [pool(known), pool(unknown)], sharedWithMe: [] }),
     });
-    expect(structured(list).result).toEqual({ pools: [pool(known)], sharedWithMe: [] });
+    expect(structured(list).result).toEqual({
+      pools: [
+        pool(known),
+        { ...pool(unknown), members: [{ id: "m-1", live: { instances: 1, running: 1 } }] },
+      ],
+      sharedWithMe: [],
+    });
   });
 
   it("copies a refusal's fixed message and reason", async () => {

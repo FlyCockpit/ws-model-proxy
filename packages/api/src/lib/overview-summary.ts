@@ -111,19 +111,23 @@ export async function memberLatencyP95(
   const byMember = new Map<string, number>();
   if (poolIds.length === 0) return byMember;
   const from = new Date(now.getTime() - MEMBER_LATENCY_WINDOW_MS);
+  // Pool traffic records the serving version (and instance), not the runtime model: the
+  // version names the runtime.
   const rows = await prisma.$queryRaw<KpiRow[]>`SELECT "poolId" AS pool,
-      "runtimeModelId" AS runtime_model, "providerModelId" AS provider_model,
+      COALESCE(NULLIF("runtimeId", ''),
+        (SELECT v."runtimeId" FROM runtime_version v WHERE v.id = "versionId"), '') AS runtime,
+      "providerModelId" AS provider_model,
       ${Prisma.join(histogramColumns("latencyHistogram", "l"), ", ")}
     FROM usage_rollup_minute
     WHERE "ownerUserId" = ${ownerId} AND "poolId" = ANY(${[...poolIds]}::text[])
-      AND "bucketStart" >= ${from} AND ${realTraffic()}
+      AND "bucketStart" >= ${from} AND "bucketStart" <= ${now} AND ${realTraffic()}
     GROUP BY 1, 2, 3`;
   for (const row of rows) {
     const value = p95(row, "l");
     if (value === null) continue;
     byMember.set(
       memberLatencyKey(String(row.pool), {
-        runtimeModelId: row.runtime_model ? String(row.runtime_model) : null,
+        runtimeId: row.runtime ? String(row.runtime) : null,
         providerModelId: row.provider_model ? String(row.provider_model) : null,
       }),
       value,

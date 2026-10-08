@@ -69,9 +69,13 @@ async function membersLive(
   ownerId: string,
   pools: readonly PoolRow[],
 ): Promise<MembersLive> {
+  // Only the owner's own runtimes: a contributed member's queue is the contributor's engine
+  // (their other traffic included), so it stays unknown here.
   const instanceIds = pools.flatMap((pool) =>
-    pool.Members.flatMap(
-      (member) => member.RuntimeModel?.Runtime.Instances.map((instance) => instance.id) ?? [],
+    pool.Members.flatMap((member) =>
+      member.shareId === null
+        ? (member.RuntimeModel?.Runtime.Instances.map((instance) => instance.id) ?? [])
+        : [],
     ),
   );
   return {
