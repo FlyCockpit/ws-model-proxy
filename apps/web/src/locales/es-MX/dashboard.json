@@ -746,7 +746,6 @@
     "sharedWithMe": "Compartidos contigo",
     "canUse": "Puede usar",
     "canContribute": "Puede contribuir",
-    "callAs": "Llámalo como",
     "callAsHint": "Usa esto como nombre de modelo con una clave de API.",
     "members": "Miembros",
     "membersHint": "Modelos servidos a los que enruta este pool. Las solicitudes van a miembros con capacidad libre.",
@@ -964,6 +963,36 @@
       "slugConfirmMismatch": "Los dos identificadores no coinciden.",
       "slugChanged": "Identificador cambiado. Actualiza tus clientes.",
       "slugAliased": "Un alias de nombre de modelo ya usa ese ID invocable. Elige otro identificador o elimina el alias."
+    },
+    "details": {
+      "edit": "Editar",
+      "title": "Nombre y descripción",
+      "description": "Descripción",
+      "descriptionTooLong": "La descripción debe tener menos de 2,000 caracteres."
+    },
+    "stats": {
+      "title": "Últimas 24 horas (sin pruebas)",
+      "loadFailed": "No se pudo cargar el tráfico de este pool."
+    },
+    "call": {
+      "title": "Llamar a este pool",
+      "kind": "Ejemplo",
+      "kinds": {
+        "curl": "curl",
+        "openai": "SDK de OpenAI",
+        "anthropic": "SDK de Anthropic"
+      }
+    },
+    "live": {
+      "p95": "p95 {{value}}",
+      "waiting_one": "{{count}} en espera",
+      "waiting_other": "{{count}} en espera"
+    },
+    "weight": {
+      "label": "Peso",
+      "aria": "Peso de {{member}}",
+      "save": "Fijar",
+      "invalid": "Un número entero de 1 a 1000."
     }
   },
   "runtime": {

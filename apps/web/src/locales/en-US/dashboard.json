@@ -746,7 +746,6 @@
     "sharedWithMe": "Shared with you",
     "canUse": "Can use",
     "canContribute": "Can contribute",
-    "callAs": "Call it as",
     "callAsHint": "Use this as the model name with an API key.",
     "members": "Members",
     "membersHint": "Served models this pool routes to. Requests go to members with free capacity.",
@@ -964,6 +963,36 @@
       "slugConfirmMismatch": "The two slugs differ.",
       "slugChanged": "Slug changed. Update your clients.",
       "slugAliased": "A model-name alias already uses that callable ID. Pick another slug or remove the alias."
+    },
+    "details": {
+      "edit": "Edit",
+      "title": "Name and description",
+      "description": "Description",
+      "descriptionTooLong": "Keep the description under 2,000 characters."
+    },
+    "stats": {
+      "title": "Last 24 hours (tests left out)",
+      "loadFailed": "Couldn't load this pool's traffic."
+    },
+    "call": {
+      "title": "Call this pool",
+      "kind": "Example",
+      "kinds": {
+        "curl": "curl",
+        "openai": "OpenAI SDK",
+        "anthropic": "Anthropic SDK"
+      }
+    },
+    "live": {
+      "p95": "p95 {{value}}",
+      "waiting_one": "{{count}} waiting",
+      "waiting_other": "{{count}} waiting"
+    },
+    "weight": {
+      "label": "Weight",
+      "aria": "Weight of {{member}}",
+      "save": "Set",
+      "invalid": "A whole number from 1 to 1000."
     }
   },
   "runtime": {
