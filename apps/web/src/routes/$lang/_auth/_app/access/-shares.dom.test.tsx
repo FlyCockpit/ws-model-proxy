@@ -90,7 +90,7 @@ vi.mock("@/utils/orpc", () => {
           revoke: mutation("access.invites.revoke", () => ({ ok: true })),
         },
       },
-      pools: { list: query(["pools", "list"], () => ({ pools: [] })) },
+      pools: { key: () => ["pools"], list: query(["pools", "list"], () => ({ pools: [] })) },
       runtimes: {
         key: () => ["runtimes"],
         get: { key: () => ["runtimes", "get"] },
