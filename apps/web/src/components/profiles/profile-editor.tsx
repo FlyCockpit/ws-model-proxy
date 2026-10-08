@@ -37,7 +37,14 @@ import { ApplyProfileDialog } from "./apply-profile-dialog";
 
 export const PROFILE_SLUG_PATTERN = /^[a-z](?:[a-z0-9]|-(?=[a-z0-9])){0,40}$/;
 
-type ItemRow = { runtimeId: string; versionId: string | null; count: string; nodeIds: string[] };
+/** `key`: the saved item's id, or a fresh one for a new line (rows keep it when others move). */
+type ItemRow = {
+  key: string;
+  runtimeId: string;
+  versionId: string | null;
+  count: string;
+  nodeIds: string[];
+};
 type HoldRow = { nodeId: string; note: string };
 
 /** A slug from a name: "Evening gaming" → "evening-gaming". */
@@ -101,6 +108,7 @@ export function ProfileEditor({
         note: hold.note ?? "",
       })) as HoldRow[],
       items: profile.items.map((item) => ({
+        key: item.id,
         runtimeId: item.runtimeId,
         versionId: item.versionId,
         count: String(item.count),
@@ -116,6 +124,7 @@ export function ProfileEditor({
         holds: z.array(z.object({ nodeId: z.string(), note: z.string().max(500) })),
         items: z.array(
           z.object({
+            key: z.string(),
             runtimeId: z.string().min(1, t("dashboard:profiles.editor.runtimeRequired")),
             versionId: z.string().nullable(),
             count: z
@@ -133,8 +142,19 @@ export function ProfileEditor({
   });
 
   type Values = typeof form.state.values;
+  const currentVersionOf = (runtimeId: string) =>
+    startable.find((runtime) => runtime.id === runtimeId)?.currentVersion.id ?? null;
   const saveWith = async (value: Values, updatePins: boolean) => {
     const owned = new Set(value.nodeIds);
+    // Omitting a version keeps the line's old pin on the server: never do that for a line set
+    // to "Current version" whose current version is not known here.
+    if (
+      !updatePins &&
+      value.items.some((item) => item.versionId === null && !currentVersionOf(item.runtimeId))
+    ) {
+      toast.error(t("dashboard:profiles.editor.runtimesUnavailable"));
+      return;
+    }
     await save.mutateAsync({
       profileId: profile.id,
       slug: value.slug,
@@ -148,11 +168,8 @@ export function ProfileEditor({
           ...(hold.note.trim() ? { note: hold.note.trim() } : {}),
         })),
       items: value.items.map((item) => {
-        // "Current version" means the runtime's current version, not the line's old pin.
-        const versionId =
-          item.versionId ??
-          startable.find((runtime) => runtime.id === item.runtimeId)?.currentVersion.id ??
-          null;
+        // "Current version" means the runtime's current version, never the line's old pin.
+        const versionId = item.versionId ?? currentVersionOf(item.runtimeId);
         return {
           runtimeId: item.runtimeId,
           ...(versionId && !updatePins ? { versionId } : {}),
@@ -329,14 +346,14 @@ export function ProfileEditor({
             {(field) => (
               <div className="space-y-2">
                 {field.state.value.map((row, index) => {
-                  // The saved line at this position, while it still names the same runtime.
+                  // The saved line this row came from, while it still names the same runtime.
                   const item = profile.items.find(
                     (candidate) =>
-                      candidate.position === index && candidate.runtimeId === row.runtimeId,
+                      candidate.id === row.key && candidate.runtimeId === row.runtimeId,
                   );
                   return (
                     <div
-                      key={`${row.runtimeId}-${index}`}
+                      key={row.key}
                       className="flex min-w-0 flex-wrap items-end gap-2 border-b pb-2"
                     >
                       <form.Field name={`items[${index}].runtimeId`}>
@@ -442,6 +459,7 @@ export function ProfileEditor({
                   disabled={startable.length === 0}
                   onClick={() =>
                     field.pushValue({
+                      key: `new-${crypto.randomUUID()}`,
                       runtimeId: startable[0]?.id ?? "",
                       versionId: null,
                       count: "1",
@@ -461,20 +479,32 @@ export function ProfileEditor({
       <div className="flex flex-wrap gap-2">
         <form.Subscribe selector={(state) => [state.canSubmit, state.isSubmitting] as const}>
           {([canSubmit, isSubmitting]) => (
-            <Button type="submit" className="min-h-[44px]" disabled={!canSubmit || isSubmitting}>
+            <Button
+              type="submit"
+              className="min-h-[44px]"
+              // "Current version" needs the runtimes' current versions to save as chosen.
+              disabled={!canSubmit || isSubmitting || runtimes.isPending || runtimes.isError}
+            >
               {t("common:actions.save")}
             </Button>
           )}
         </form.Subscribe>
-        <Button
-          type="button"
-          variant="outline"
-          className="min-h-[44px]"
-          disabled={save.isPending || !profile.items.some((item) => item.pinOutdated)}
-          onClick={() => saveWith(form.state.values, true)}
-        >
-          {t("dashboard:profiles.editor.updatePins")}
-        </Button>
+        <form.Subscribe selector={(state) => state.isDirty}>
+          {(dirty) => (
+            // Moves every saved line to its runtime's current version; unsaved picks would be
+            // lost, so it waits for a save.
+            <Button
+              type="button"
+              variant="outline"
+              className="min-h-[44px]"
+              disabled={dirty || save.isPending || !profile.items.some((item) => item.pinOutdated)}
+              title={dirty ? t("dashboard:profiles.editor.saveFirst") : undefined}
+              onClick={() => saveWith(form.state.values, true)}
+            >
+              {t("dashboard:profiles.editor.updatePins")}
+            </Button>
+          )}
+        </form.Subscribe>
         <form.Subscribe selector={(state) => state.isDirty}>
           {(dirty) => (
             <Button

@@ -176,6 +176,64 @@ describe("profile items", { timeout: 30_000 }, () => {
   });
 });
 
+describe("profile item rows", { timeout: 30_000 }, () => {
+  const twoLines = {
+    ...PROFILE,
+    items: [
+      { ...PROFILE.items[0], id: "item-1", position: 0, versionId: "v-1", versionNumber: 1 },
+      {
+        ...PROFILE.items[0],
+        id: "item-2",
+        position: 1,
+        versionId: "v-3",
+        versionNumber: 3,
+        pinOutdated: false,
+      },
+    ],
+  } as ProfileView;
+
+  it("keeps each saved line's pin on its own row after a row above is removed", async () => {
+    wrap(<ProfileEditor profile={twoLines} nodes={nodes} lang="en-US" />);
+    expect(screen.getByText(/profiles\.editor\.pinned\(\{"version":1\}\)/)).toBeTruthy();
+    fireEvent.click(
+      screen.getAllByRole("button", {
+        name: "dashboard:profiles.editor.removeItem",
+      })[0] as HTMLElement,
+    );
+    expect(screen.queryByText(/profiles\.editor\.pinned\(\{"version":1\}\)/)).toBeNull();
+    expect(screen.getByText(/profiles\.editor\.pinned\(\{"version":3\}\)/)).toBeTruthy();
+    expect(
+      (screen.getByLabelText("dashboard:profiles.editor.version") as HTMLSelectElement).value,
+    ).toBe("v-3");
+  });
+
+  it("waits for a save before Update pins moves every line", async () => {
+    wrap(<ProfileEditor profile={PROFILE} nodes={nodes} lang="en-US" />);
+    const updatePins = screen.getByRole("button", {
+      name: "dashboard:profiles.editor.updatePins",
+    }) as HTMLButtonElement;
+    expect(updatePins.disabled).toBe(false);
+    fireEvent.change(screen.getByLabelText("dashboard:profiles.editor.version"), {
+      target: { value: "v-1" },
+    });
+    await waitFor(() => expect(updatePins.disabled).toBe(true));
+  });
+
+  it("saves a new line's Current version as the runtime's current version id", async () => {
+    wrap(<ProfileEditor profile={{ ...PROFILE, items: [] }} nodes={nodes} lang="en-US" />);
+    const add = screen.getByRole("button", { name: "dashboard:profiles.editor.addItem" });
+    await waitFor(() => expect((add as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(add);
+    const save = screen.getByRole("button", { name: "common:actions.save" }) as HTMLButtonElement;
+    await waitFor(() => expect(save.disabled).toBe(false));
+    fireEvent.click(save);
+    await waitFor(() => expect(state.saves).toHaveLength(1));
+    expect(state.saves[0]?.items).toEqual([
+      { runtimeId: "rt-1", versionId: "v-3", count: 1, nodeIds: [] },
+    ]);
+  });
+});
+
 describe("apply preview", { timeout: 30_000 }, () => {
   it("shows the pinned version each start runs", async () => {
     const profile = {
