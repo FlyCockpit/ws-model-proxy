@@ -44,11 +44,14 @@ export function parseMemberChoice(value: string): { runtimeId: string; model: st
 }
 
 /**
- * A pool slug from a served model's name (`Qwen/Qwen3-32B` → `qwen3-32b`), suffixed (`-2`, `-3`…)
+ * A pool slug from a served model's name, suffixed (`-2`, `-3`…)
  * when one of `taken` already uses it.
  */
 export function poolSlugFor(model: string, taken: ReadonlySet<string>): string {
-  const base = slugify(model.split("/").pop() ?? model) || slugify(model) || "pool";
+  // The last path segment (`Qwen/Qwen3-32B` → `qwen3-32b`) unless it starts with a digit, which
+  // a slug cannot (`org/7b-chat` → `org-7b-chat`, not `b-chat`).
+  const last = model.split("/").pop() ?? model;
+  const base = (/^[a-z]/i.test(last) ? slugify(last) : "") || slugify(model) || "pool";
   if (!taken.has(base)) return base;
   for (let index = 2; ; index += 1) {
     const suffix = `-${index}`;

@@ -30,6 +30,13 @@ export function PoolStep({ lang }: { lang: string }) {
   const [creating, setCreating] = useState<string | null>(null);
   const [dialog, setDialog] = useState<NewPoolInitial | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
+  // Bumped on every open: each open starts a fresh form, even for the same prefill.
+  const [dialogKey, setDialogKey] = useState(0);
+  const openDialog = (initial: NewPoolInitial | null) => {
+    setDialog(initial);
+    setDialogKey((key) => key + 1);
+    setDialogOpen(true);
+  };
 
   if (runtimes.isPending || pools.isPending) {
     return (
@@ -132,15 +139,14 @@ export function PoolStep({ lang }: { lang: string }) {
                       size="touch"
                       variant="outline"
                       disabled={creating !== null}
-                      onClick={() => {
-                        setDialog({
+                      onClick={() =>
+                        openDialog({
                           name: choice.model.slice(0, 120),
                           slug,
                           type: choice.type,
                           member: choice.value,
-                        });
-                        setDialogOpen(true);
-                      }}
+                        })
+                      }
                     >
                       {t("dashboard:welcome.pool.customize")}
                     </Button>
@@ -163,22 +169,17 @@ export function PoolStep({ lang }: { lang: string }) {
         variant="outline"
         size="touch"
         className="self-start"
-        onClick={() => {
-          setDialog(null);
-          setDialogOpen(true);
-        }}
+        onClick={() => openDialog(null)}
       >
         <Plus aria-hidden="true" />
         {t("dashboard:pool.new")}
       </Button>
       <NewPoolDialog
-        // A fresh form for each prefill.
-        key={dialog?.member ?? "blank"}
+        key={dialogKey}
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         lang={lang}
         initial={dialog ?? undefined}
-        onCreated={() => setDialog(null)}
       />
     </div>
   );

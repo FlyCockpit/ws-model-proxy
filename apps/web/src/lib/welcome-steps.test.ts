@@ -52,6 +52,7 @@ describe("poolSlugFor", () => {
     );
     expect(poolSlugFor("llama3.1:8b", new Set())).toBe("llama3-1-8b");
     expect(poolSlugFor("///", new Set())).toBe("pool");
+    expect(poolSlugFor("org/7b-chat", new Set())).toBe("org-7b-chat");
     const long = "a".repeat(60);
     expect(poolSlugFor(long, new Set(["a".repeat(41)]))).toBe(`${"a".repeat(39)}-2`);
   });

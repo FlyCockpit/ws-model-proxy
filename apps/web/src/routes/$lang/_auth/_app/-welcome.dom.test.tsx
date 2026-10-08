@@ -248,12 +248,31 @@ afterEach(() => {
 });
 
 describe("Welcome", { timeout: 30_000 }, () => {
-  it("opens on the first step not done and marks done steps", async () => {
+  it("puts the first step not done in the URL, once", async () => {
     await mount({}, { ...NONE, node: true });
+    await waitFor(() =>
+      expect(state.navigations).toEqual([
+        {
+          to: "/$lang/welcome",
+          params: { lang: "en-US" },
+          search: { step: "runtime" },
+          replace: true,
+        },
+      ]),
+    );
+    // No step body until the step is pinned: progress refreshes never move the person.
+    expect(screen.queryByRole("heading", { name: "dashboard:welcome.node.title" })).toBeNull();
+  });
+
+  it("marks done steps and shows the chosen one", async () => {
+    await mount({ step: "runtime" }, { ...NONE, node: true });
     const nav = screen.getByRole("navigation", { name: "dashboard:welcome.stepsLabel" });
-    const links = within(nav).getAllByRole("link");
+    const links = await waitFor(() => {
+      const found = within(nav).getAllByRole("link");
+      expect(found[0]?.textContent).toContain("dashboard:welcome.doneSr");
+      return found;
+    });
     expect(links).toHaveLength(5);
-    expect(links[0]?.textContent).toContain("dashboard:welcome.doneSr");
     expect(links[1]?.getAttribute("aria-current")).toBe("step");
     expect(links[1]?.getAttribute("href")).toBe("/$lang/welcome?step=runtime");
     expect(

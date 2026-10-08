@@ -268,7 +268,7 @@
         "install": "El script instala wsmp (dónde y cómo, abajo).",
         "login": "`wsmp login` usa el código: la máquina se une a tu cuenta como nodo, sin otra aprobación.",
         "trust": "Pregunta cuánto control tiene este servidor: control total (el predeterminado) o solo retransmisión, donde los agentes no pueden cambiar nada en la máquina.",
-        "service": "Ofrece instalar un servicio de usuario para que el nodo arranque al iniciar."
+        "service": "Ofrece instalar un servicio de usuario para que el nodo arranque al iniciar el sistema."
       },
       "readingHardware": "Conectado. Leyendo su hardware…"
     },
@@ -1451,7 +1451,7 @@
     "node": {
       "title": "Agrega un nodo",
       "description": "Un nodo es una máquina que ejecuta modelos para ti: un servidor con GPU, una estación de trabajo o una laptop.",
-      "intro": "Un comando instala wsmp e inicia sesión en la máquina con un código que funciona una vez, durante una hora. El código es tu aprobación.",
+      "intro": "Un comando instala wsmp y conecta la máquina a tu cuenta con un código que funciona una vez, durante una hora. El código es tu aprobación.",
       "mint": "Obtener el comando de instalación",
       "mintAnother": "Agregar otro nodo",
       "yours_one": "Tu nodo",
@@ -1462,7 +1462,7 @@
     "runtime": {
       "title": "Tus servidores de modelos",
       "description": "Un runtime es un servidor de modelos al que wsmp puede llamar: uno que inicia cuando se necesita, o uno que siempre está en marcha.",
-      "presetTitle": "Inicia uno desde un preset",
+      "presetTitle": "Inicia uno desde un preajuste",
       "presetHint": "vLLM, SGLang o llama.cpp, iniciado en uno de tus nodos cuando un pool lo necesita.",
       "presetAction": "Nuevo runtime",
       "runningTitle": "¿Ya tienes un servidor en marcha?",

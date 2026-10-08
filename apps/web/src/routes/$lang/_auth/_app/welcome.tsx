@@ -12,17 +12,18 @@ import {
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { ArrowLeft, ArrowRight, Check } from "lucide-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import type { EnrollmentResult } from "@/components/nodes/node-types";
 import { PageHeading } from "@/components/page-stub";
 import { AgentStep } from "@/components/welcome/agent-step";
 import { ApiKeyStep } from "@/components/welcome/api-key-step";
 import { NodeStep } from "@/components/welcome/node-step";
 import { PoolStep } from "@/components/welcome/pool-step";
 import { ServersStep } from "@/components/welcome/servers-step";
-import { useMarkWelcomeOffered } from "@/hooks/use-welcome-offer";
+import { useMarkWelcomeOffered, usePinWelcomeStep } from "@/hooks/use-welcome-offer";
 import {
-  firstOpenStep,
   nextStep,
   parseWelcomeStep,
   previousStep,
@@ -57,7 +58,12 @@ function WelcomePage() {
   });
   const complete = useMutation(orpc.settings.onboarding.complete.mutationOptions());
   const progress = summary.data?.onboarding.steps;
-  const current: WelcomeStep = search.step ?? (progress ? firstOpenStep(progress) : "node");
+  usePinWelcomeStep(lang, search.step, progress);
+  // The minted install command outlives step changes (its code stays valid for an hour).
+  const [enrollment, setEnrollment] = useState<EnrollmentResult | null>(null);
+  // Until a step is in the URL the step card is a skeleton (a failed summary means step 1).
+  const current: WelcomeStep = search.step ?? "node";
+  const pinned = search.step !== undefined || summary.isError;
   const index = WELCOME_STEPS.indexOf(current);
   const back = previousStep(current);
   const next = nextStep(current);
@@ -100,65 +106,86 @@ function WelcomePage() {
         <Stepper lang={lang} current={current} progress={progress} />
       )}
 
-      <Card className="min-w-0">
-        <CardHeader>
-          <p className="text-xs font-medium text-muted-foreground">
-            {t("dashboard:welcome.stepOf", { step: index + 1, total: WELCOME_STEPS.length })}
-          </p>
-          <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-lg">
-            <h2>{t(`dashboard:welcome.${current}.title`)}</h2>
-            {progress?.[current] ? (
-              <span className="inline-flex items-center gap-1 rounded-full bg-state-success-bg px-2 py-0.5 text-xs font-medium text-state-success">
-                <Check aria-hidden="true" className="size-3.5" />
-                {t("dashboard:welcome.done")}
-              </span>
-            ) : null}
-          </CardTitle>
-          <CardDescription>{t(`dashboard:welcome.${current}.description`)}</CardDescription>
-        </CardHeader>
-        <CardContent className="min-w-0">
-          <StepBody step={current} lang={lang} />
-        </CardContent>
-        <CardFooter className="flex min-w-0 flex-wrap justify-between gap-2">
-          {back ? (
-            <Button type="button" variant="ghost" size="touch" onClick={() => void goTo(back)}>
-              <ArrowLeft aria-hidden="true" />
-              {t("dashboard:welcome.back")}
-            </Button>
-          ) : (
-            <span />
-          )}
-          {next ? (
-            <Button
-              type="button"
-              variant={progress?.[current] ? "default" : "outline"}
-              size="touch"
-              onClick={() => void goTo(next)}
-            >
-              {progress?.[current] ? t("dashboard:welcome.continue") : t("dashboard:welcome.skip")}
-              <ArrowRight aria-hidden="true" />
-            </Button>
-          ) : (
-            <Button
-              type="button"
-              size="touch"
-              disabled={complete.isPending}
-              onClick={() => void finish()}
-            >
-              {t("dashboard:welcome.finish")}
-              <ArrowRight aria-hidden="true" />
-            </Button>
-          )}
-        </CardFooter>
-      </Card>
+      {pinned ? (
+        <Card className="min-w-0">
+          <CardHeader>
+            <p className="text-xs font-medium text-muted-foreground">
+              {t("dashboard:welcome.stepOf", { step: index + 1, total: WELCOME_STEPS.length })}
+            </p>
+            <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-lg">
+              <h2>{t(`dashboard:welcome.${current}.title`)}</h2>
+              {progress?.[current] ? (
+                <span className="inline-flex items-center gap-1 rounded-full bg-state-success-bg px-2 py-0.5 text-xs font-medium text-state-success">
+                  <Check aria-hidden="true" className="size-3.5" />
+                  {t("dashboard:welcome.done")}
+                </span>
+              ) : null}
+            </CardTitle>
+            <CardDescription>{t(`dashboard:welcome.${current}.description`)}</CardDescription>
+          </CardHeader>
+          <CardContent className="min-w-0">
+            <StepBody
+              step={current}
+              lang={lang}
+              enrollment={enrollment}
+              onEnrollment={setEnrollment}
+            />
+          </CardContent>
+          <CardFooter className="flex min-w-0 flex-wrap justify-between gap-2">
+            {back ? (
+              <Button type="button" variant="ghost" size="touch" onClick={() => void goTo(back)}>
+                <ArrowLeft aria-hidden="true" />
+                {t("dashboard:welcome.back")}
+              </Button>
+            ) : (
+              <span />
+            )}
+            {next ? (
+              <Button
+                type="button"
+                variant={progress?.[current] ? "default" : "outline"}
+                size="touch"
+                onClick={() => void goTo(next)}
+              >
+                {progress?.[current]
+                  ? t("dashboard:welcome.continue")
+                  : t("dashboard:welcome.skip")}
+                <ArrowRight aria-hidden="true" />
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                size="touch"
+                disabled={complete.isPending}
+                onClick={() => void finish()}
+              >
+                {t("dashboard:welcome.finish")}
+                <ArrowRight aria-hidden="true" />
+              </Button>
+            )}
+          </CardFooter>
+        </Card>
+      ) : (
+        <Skeleton aria-hidden="true" className="h-72 w-full rounded-xl" />
+      )}
     </div>
   );
 }
 
-function StepBody({ step, lang }: { step: WelcomeStep; lang: string }) {
+function StepBody({
+  step,
+  lang,
+  enrollment,
+  onEnrollment,
+}: {
+  step: WelcomeStep;
+  lang: string;
+  enrollment: EnrollmentResult | null;
+  onEnrollment: (result: EnrollmentResult) => void;
+}) {
   switch (step) {
     case "node":
-      return <NodeStep lang={lang} />;
+      return <NodeStep lang={lang} result={enrollment} onResult={onEnrollment} />;
     case "runtime":
       return <ServersStep lang={lang} />;
     case "pool":
