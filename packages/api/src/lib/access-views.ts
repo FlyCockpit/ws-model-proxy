@@ -97,7 +97,7 @@ export const shareSelect = {
   ownKeyProviderModelId: true,
   ownKeyProtocolAdaptation: true,
   createdAt: true,
-  Pool: { select: { slug: true } },
+  Pool: { select: { slug: true, Fallback: { select: { ownKeyEquivalentModel: true } } } },
   Owner: { select: { email: true, slug: true } },
   Grantee: { select: { email: true } },
   SpendCap: { select: { id: true, monthlyLimit: true, currency: true } },
@@ -126,6 +126,7 @@ export function shareView(
           spentThisMonth: spentThisMonth.get(row.SpendCap.id) ?? "0",
         }
       : null,
+    ownKeyEquivalentModel: row.Pool.Fallback?.ownKeyEquivalentModel ?? null,
     ownKeyProviderModelId: row.ownKeyProviderModelId,
     ownKeyProtocolAdaptation: row.ownKeyProtocolAdaptation,
     contributedMembers: row._count.Contributed,

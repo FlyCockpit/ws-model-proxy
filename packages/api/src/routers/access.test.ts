@@ -108,7 +108,7 @@ const shareRow = {
   ownKeyProviderModelId: null,
   ownKeyProtocolAdaptation: false,
   createdAt: now,
-  Pool: { slug: "chat" },
+  Pool: { slug: "chat", Fallback: null },
   Owner: { email: "owner@example.test", slug: "owner" },
   Grantee: { email: "friend@example.test" },
   SpendCap: null,
@@ -408,6 +408,39 @@ describe("OAuth connections", () => {
       userId: "owner",
     });
     expect(db.mcpGrant.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("Contributing", () => {
+  it("lists only the caller's shares and the caller's own served models", async () => {
+    db.share.findMany.mockResolvedValue([]);
+    db.runtimeModel.findMany.mockResolvedValue([
+      {
+        id: "rm1",
+        upstreamModelId: "qwen",
+        type: "LLM",
+        runtimeId: "rt1",
+        Runtime: { name: "Qwen box" },
+      },
+    ] as never);
+    const result = await client().contributing.pools();
+    expect(db.share.findMany.mock.calls[0]?.[0]?.where).toEqual({
+      granteeUserId: "owner",
+      canContribute: true,
+    });
+    expect(db.runtimeModel.findMany.mock.calls[0]?.[0]?.where).toEqual({
+      userId: "owner",
+      retired: false,
+    });
+    expect(result.servedModels).toEqual([
+      {
+        runtimeModelId: "rm1",
+        upstreamModelId: "qwen",
+        type: "LLM",
+        runtimeId: "rt1",
+        runtimeName: "Qwen box",
+      },
+    ]);
   });
 });
 
@@ -1006,6 +1039,17 @@ describe("shares", () => {
       OR: [{ ownerUserId: "owner" }, { granteeUserId: "owner" }],
     });
     expect(db.share.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("tells a share holder which model the owner lets them bring their own key for", async () => {
+    db.share.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([
+      { ...shareRow, Pool: { slug: "chat", Fallback: { ownKeyEquivalentModel: "openai/gpt" } } },
+      { ...shareRow, id: "share2", Pool: { slug: "chat", Fallback: null } },
+    ] as never);
+    db.shareInvite.findMany.mockResolvedValue([]);
+    const listed = await client().shares.list();
+    expect(db.share.findMany.mock.calls[1]?.[0]?.where).toEqual({ granteeUserId: "owner" });
+    expect(listed.withMe.map((share) => share.ownKeyEquivalentModel)).toEqual(["openai/gpt", null]);
   });
 
   it("sets an own key only from the share holder's own provider models", async () => {

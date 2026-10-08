@@ -1103,6 +1103,24 @@ describe("graph-write fences", () => {
   });
 });
 
+describe("runtimes.shares.list (shared with me)", () => {
+  it("lists only definitions shared with the caller, with the kind a fork needs", async () => {
+    db.runtimeShare.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([
+      {
+        id: "rs-1",
+        runtimeId: "rt-9",
+        Owner: { email: "friend@example.test" },
+        Runtime: { name: "Their Qwen", kind: "ALWAYS_ON", CurrentVersion: versionRow() },
+      },
+    ] as never);
+    const result = await client().shares.list({});
+    expect(db.runtimeShare.findMany.mock.calls[1]?.[0]?.where).toEqual({ granteeUserId: OWNER });
+    expect(result.sharedWithMe).toMatchObject([
+      { id: "rs-1", runtimeId: "rt-9", name: "Their Qwen", kind: "ALWAYS_ON" },
+    ]);
+  });
+});
+
 describe("runtimes.fork (create-shaped output)", () => {
   it("copies a shared version, applies the given limits and answers like create", async () => {
     db.runtimeShare.findFirst.mockResolvedValue({

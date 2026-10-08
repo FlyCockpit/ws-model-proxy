@@ -866,7 +866,26 @@ const contributing = {
         },
       },
     });
+    const served = await prisma.runtimeModel.findMany({
+      where: { userId, retired: false },
+      orderBy: [{ runtimeId: "asc" }, { upstreamModelId: "asc" }],
+      take: 500,
+      select: {
+        id: true,
+        upstreamModelId: true,
+        type: true,
+        runtimeId: true,
+        Runtime: { select: { name: true } },
+      },
+    });
     return {
+      servedModels: served.map((model) => ({
+        runtimeModelId: model.id,
+        upstreamModelId: model.upstreamModelId,
+        type: model.type,
+        runtimeId: model.runtimeId,
+        runtimeName: model.Runtime.name,
+      })),
       pools: rows.map((row) => ({
         shareId: row.id,
         poolId: row.poolId,

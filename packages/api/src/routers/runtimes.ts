@@ -1009,7 +1009,9 @@ export const runtimesRouter = {
             id: true,
             runtimeId: true,
             Owner: { select: { email: true } },
-            Runtime: { select: { name: true, CurrentVersion: { select: VERSION_SELECT } } },
+            Runtime: {
+              select: { name: true, kind: true, CurrentVersion: { select: VERSION_SELECT } },
+            },
           },
           orderBy: { createdAt: "asc" },
         }),
@@ -1030,6 +1032,7 @@ export const runtimesRouter = {
               runtimeId: share.runtimeId,
               ownerEmail: share.Owner.email,
               name: share.Runtime.name,
+              kind: share.Runtime.kind,
               // The grantee sees the definition, not who on the owner's side edited it.
               currentVersion: (() => {
                 const summary = versionSummary(current, null);
