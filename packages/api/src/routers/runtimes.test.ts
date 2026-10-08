@@ -108,6 +108,7 @@ function runtimeRow(overrides: Record<string, unknown> = {}) {
     forkedFromVersionId: null,
     CurrentVersion: versionRow(),
     Models: [{ upstreamModelId: "qwen" }],
+    Node: null,
     Instances: [],
     ...overrides,
   };
@@ -1309,6 +1310,114 @@ describe("runtimes.get: instances that still hold resources", () => {
         { NOT: { desiredState: "STOPPED", phase: "STOPPED" } },
         { Ranks: { some: { claim: { in: ["HELD", "HELD_UNKNOWN"] } } } },
       ],
+    });
+  });
+});
+
+describe("runtimes.list: the nodes each runtime is on", () => {
+  const rank = (nodeId: string, slug: string, userId = OWNER) => ({
+    nodeId,
+    Node: { slug, userId },
+  });
+  const instance = (phase: string, ranks: ReturnType<typeof rank>[]) => ({
+    phase,
+    needsOperator: null,
+    desiredState: phase === "STOPPED" ? "STOPPED" : "RUNNING",
+    Ranks: ranks,
+  });
+
+  it("names an always-on runtime's node and the nodes of live instances, each once", async () => {
+    db.runtime.findMany.mockResolvedValue([
+      runtimeRow({
+        id: "rt-on",
+        kind: "ALWAYS_ON",
+        nodeId: "node-1",
+        Node: { id: "node-1", slug: "box", userId: OWNER },
+      }),
+      runtimeRow({
+        id: "rt-big",
+        Instances: [
+          instance("READY", [rank("node-1", "box"), rank("node-2", "spark")]),
+          instance("STARTING", [rank("node-2", "spark")]),
+          instance("STOPPED", [rank("node-3", "old")]),
+        ],
+      }),
+      runtimeRow({ id: "rt-idle" }),
+    ] as never);
+    const { runtimes } = await client().list();
+    expect(runtimes.map((runtime) => [runtime.id, runtime.nodes])).toEqual([
+      ["rt-on", [{ id: "node-1", slug: "box" }]],
+      [
+        "rt-big",
+        [
+          { id: "node-1", slug: "box" },
+          { id: "node-2", slug: "spark" },
+        ],
+      ],
+      ["rt-idle", []],
+    ]);
+    expect(db.runtime.findMany.mock.calls[0]?.[0]?.where).toEqual({ userId: OWNER });
+  });
+
+  it("never names another user's node", async () => {
+    db.runtime.findMany.mockResolvedValue([
+      runtimeRow({
+        Instances: [instance("READY", [rank("node-x", "theirs", "someone-else")])],
+      }),
+    ] as never);
+    const { runtimes } = await client().list();
+    expect(runtimes[0]?.nodes).toEqual([]);
+  });
+});
+
+describe("runtimes.get: live load", () => {
+  it("reads the relay's load for the listed instances and shows it", async () => {
+    db.runtime.findFirst.mockResolvedValue(runtimeRow() as never);
+    db.runtimeVersion.findFirstOrThrow.mockResolvedValue(versionRow() as never);
+    db.runtimeModel.findMany.mockResolvedValue([]);
+    db.runtimeShare.findMany.mockResolvedValue([]);
+    db.node.findMany.mockResolvedValue([]);
+    db.runtimeRequestProfile.findFirst.mockResolvedValue(null);
+    db.runtimeInstance.findMany.mockResolvedValue([
+      {
+        id: "inst-1",
+        runtimeId: "rt-1",
+        handle: "i-abcdefabcdef",
+        versionId: "ver-1",
+        launchVersionId: "ver-1",
+        desiredState: "RUNNING",
+        phase: "READY",
+        phaseReason: null,
+        phaseChangedAt: new Date(),
+        needsOperator: null,
+        startedBy: "USER",
+        restartsInWindow: 0,
+        nextRestartAt: null,
+        engineSlots: 8,
+        factsAt: null,
+        Ranks: [],
+        Steps: [],
+        Version: { version: 1, advanced: {} },
+        LaunchVersion: { spec: SPEC, editor: "USER", launchHash: runtimeLaunchHash(SPEC) },
+        Fabric: null,
+      },
+    ] as never);
+    const liveLoad = vi.fn((ids: readonly string[]) => {
+      expect(ids).toEqual(["inst-1"]);
+      return new Map([
+        ["inst-1", { running: 3, waiting: 1, kvUsage: 0.5, at: new Date("2026-10-08T12:00:00Z") }],
+      ]);
+    });
+    const runtime = await createRouterClient(runtimesRouter, {
+      context: contextFor(CALLERS.person(), { liveLoad }),
+    }).get({ runtimeId: "rt-1" });
+    expect(liveLoad).toHaveBeenCalledTimes(1);
+    expect(runtime.instanceList[0]?.live).toEqual({
+      running: 3,
+      waiting: 1,
+      kvUsage: 0.5,
+      slots: 8,
+      at: "2026-10-08T12:00:00.000Z",
     });
   });
 });
