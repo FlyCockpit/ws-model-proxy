@@ -53,7 +53,13 @@ export function versionDocument(version: VersionDetail | null): unknown {
  * Every version of a runtime, newest first: who wrote it (agent-written ones marked), whether it
  * applied live or needs a restart, its note, and its changes against the version before it.
  */
-export function VersionHistory({ runtimeId }: { runtimeId: string }) {
+export function VersionHistory({
+  runtimeId,
+  kind,
+}: {
+  runtimeId: string;
+  kind: "ALWAYS_ON" | "STARTABLE";
+}) {
   const { t } = useTranslation(["dashboard"]);
   const versions = useInfiniteQuery(
     orpc.runtimes.versions.list.infiniteOptions({
@@ -84,6 +90,8 @@ export function VersionHistory({ runtimeId }: { runtimeId: string }) {
                 <VersionRow
                   key={version.id}
                   version={version}
+                  // Instances of a startable runtime restart; an always-on one has none to.
+                  showLaunch={kind === "STARTABLE"}
                   // Newest first: the next row is the version before this one.
                   previous={rows[index + 1] ?? null}
                 />
@@ -112,9 +120,11 @@ export function VersionHistory({ runtimeId }: { runtimeId: string }) {
 function VersionRow({
   version,
   previous,
+  showLaunch,
 }: {
   version: VersionSummary;
   previous: VersionSummary | null;
+  showLaunch: boolean;
 }) {
   const { t } = useTranslation(["dashboard"]);
   const [open, setOpen] = useState(false);
@@ -132,7 +142,7 @@ function VersionRow({
             {t(`dashboard:runtime.editor.${version.editor.actor}`)}
           </StatusPill>
         )}
-        {version.launchChanged ? (
+        {!showLaunch || version.version === 1 ? null : version.launchChanged ? (
           <StatusPill tone="busy">{t("dashboard:runtime.needsRestartBadge")}</StatusPill>
         ) : (
           <StatusPill tone="good">{t("dashboard:runtime.appliesLive")}</StatusPill>

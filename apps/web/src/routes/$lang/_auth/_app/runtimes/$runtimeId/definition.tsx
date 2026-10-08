@@ -60,7 +60,7 @@ function RuntimeDefinitionPage() {
       ) : (
         <DefinitionForm key={runtime.data.currentVersion.id} runtime={runtime.data} />
       )}
-      <VersionHistory runtimeId={runtimeId} />
+      {runtime.isSuccess ? <VersionHistory runtimeId={runtimeId} kind={runtime.data.kind} /> : null}
     </div>
   );
 }

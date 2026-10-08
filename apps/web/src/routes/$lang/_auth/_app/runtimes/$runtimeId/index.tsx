@@ -541,6 +541,8 @@ function StartDialog({
   );
 }
 
+const LIVE_PHASES = new Set<Instance["phase"]>(["STARTING", "READY", "UNHEALTHY", "UNAVAILABLE"]);
+
 /**
  * Load and request metrics of this runtime per version, in the Activity explorer: all versions
  * compared, or one version (the current one and any other an instance still runs).
@@ -552,7 +554,7 @@ function MetricsByVersionCard({ runtime }: { runtime: RuntimeDetail }) {
     [runtime.currentVersion.id, runtime.currentVersion.version],
   ]);
   for (const instance of runtime.instanceList)
-    if (instance.phase !== "STOPPED") versions.set(instance.versionId, instance.versionNumber);
+    if (LIVE_PHASES.has(instance.phase)) versions.set(instance.versionId, instance.versionNumber);
   const linkClass = "inline-flex min-h-11 items-center text-sm underline underline-offset-4";
   return (
     <Card>
