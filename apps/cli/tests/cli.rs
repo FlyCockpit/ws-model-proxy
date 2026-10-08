@@ -535,6 +535,8 @@ fn a_login_over_leftover_0_3_state_is_a_fresh_enrollment() {
 /// A Relay-only setting an earlier enrollment (another server) left: a fresh
 /// enrollment keeps it without an explicit choice and clears it with
 /// `--trust full`.
+// Clearing needs to know no relay runs; Windows cannot tell, so it always keeps the lowering.
+#[cfg(unix)]
 #[test]
 fn a_fresh_enrollment_clears_a_leftover_lowering_only_when_full_is_chosen() {
     let tmp = tempfile::tempdir().unwrap();
@@ -959,6 +961,8 @@ fn commands_wsmp_started_cannot_change_wsmp_itself() {
         &["logout"],
         &["terminal", "approve", "ABCD-EFGH"],
         &["run"],
+        // File recovery exists on Unix only (elsewhere it is refused as unsupported first).
+        #[cfg(unix)]
         &["recover", "--apply"],
     ];
     for args in refused {
