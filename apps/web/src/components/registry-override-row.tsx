@@ -1,4 +1,9 @@
-import type { RegistryEntry } from "@ws-model-proxy/config/pool-defaults";
+import {
+  POOL_ADVANCED_COLUMNS,
+  POOL_ADVANCED_OVERRIDES,
+  type RegistryEntry,
+} from "@ws-model-proxy/config/pool-defaults";
+import { RUNTIME_ADVANCED, RUNTIME_LIMIT_COLUMNS } from "@ws-model-proxy/config/runtime-defaults";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
@@ -10,6 +15,30 @@ import { StatusPill } from "@/components/status-pill";
 
 export type RegistryValue = number | boolean | string | null;
 export type EffectiveView = { effective: RegistryValue; source: string } | undefined;
+
+/**
+ * Each registry entry's help text (locale key): entries are unique objects, so the row finds
+ * its help from the entry it renders. Pool keys mirror `pool.advanced.keys`, runtime keys
+ * `runtime.advanced.keys`.
+ */
+const HELP_KEYS: ReadonlyMap<RegistryEntry, string> = (() => {
+  const keys = new Map<RegistryEntry, string>();
+  const add = (prefix: string, entries: Record<string, RegistryEntry>) => {
+    for (const [name, entry] of Object.entries(entries)) keys.set(entry, `${prefix}${name}`);
+  };
+  const { affinity, protection, ...flat } = POOL_ADVANCED_OVERRIDES;
+  add("dashboard:pool.advanced.help.", POOL_ADVANCED_COLUMNS);
+  add("dashboard:pool.advanced.help.", flat);
+  add("dashboard:pool.advanced.help.affinity.", affinity);
+  add("dashboard:pool.advanced.help.protection.", protection);
+  add("dashboard:runtime.advanced.help.", RUNTIME_LIMIT_COLUMNS);
+  add("dashboard:runtime.advanced.help.", RUNTIME_ADVANCED);
+  return keys;
+})();
+
+function registryHelpKey(entry: RegistryEntry): string | undefined {
+  return HELP_KEYS.get(entry);
+}
 
 /**
  * One Advanced setting (pool or runtime registries): its effective value and source, an
@@ -31,6 +60,8 @@ export function RegistryOverrideRow({
   onSave: (value: RegistryValue) => Promise<boolean>;
 }) {
   const { t } = useTranslation(["dashboard"]);
+  const helpKey = registryHelpKey(entry);
+  const helpId = helpKey ? `${id}-help` : undefined;
   const [draft, setDraft] = useState<string>(
     view?.source === "override" && view.effective !== null ? String(view.effective) : "",
   );
@@ -71,10 +102,16 @@ export function RegistryOverrideRow({
             : ""}
         </span>
       </div>
+      {helpKey ? (
+        <p id={helpId} className="text-sm text-muted-foreground">
+          {t(helpKey)}
+        </p>
+      ) : null}
       <div className="flex min-w-0 flex-col gap-2 sm:flex-row">
         {entry.kind === "bool" || entry.kind === "enum" ? (
           <NativeSelect
             id={id}
+            aria-describedby={helpId}
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             className="sm:max-w-xs"
@@ -91,6 +128,7 @@ export function RegistryOverrideRow({
         ) : (
           <Input
             id={id}
+            aria-describedby={helpId}
             inputMode={entry.kind === "int" ? "numeric" : "decimal"}
             className="h-11 sm:max-w-xs"
             placeholder={`${entry.min} – ${entry.max}`}

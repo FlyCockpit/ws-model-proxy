@@ -908,6 +908,35 @@
         "openai_chat_completions": "OpenAI Chat Completions",
         "openai_responses": "OpenAI Responses",
         "anthropic_messages": "Anthropic Messages"
+      },
+      "help": {
+        "maxWaitMs": "How long a request may wait for local capacity. Then a plain request is refused and an :external request goes to the cloud.",
+        "contextCeiling": "The largest context (prompt plus output) this pool accepts, for every member. Automatic: worked out from the members.",
+        "contextMargin": "Tokens kept free below each member's context, as a safety margin for token estimates.",
+        "protocolAdaptation": "Translate between OpenAI Chat, OpenAI Responses and Anthropic Messages when a member does not serve the caller's API. Members that serve it natively are always tried first.",
+        "allowLossyDeveloperRoleCollapse": "When translating for a member without a developer role, merge developer messages into system messages. Their separate meaning is lost.",
+        "recommendedSurface": "The API callers are pointed to first for this pool. Automatic: worked out from what the members serve.",
+        "maxAttachmentBytes": "Largest attachment (image, audio, file) one request may carry. Automatic: the server's media setting.",
+        "optimisticBasicTranscription": "Also send basic transcription requests to members whose transcription support is not known yet, after the known ones.",
+        "affinity": {
+          "enabled": "Send a conversation back to the member that already holds its prompt cache.",
+          "ttlSeconds": "How long the server remembers which member holds a conversation's cache.",
+          "maxRecords": "How many conversations the server remembers for this pool.",
+          "prefixWeight": "How much a shared prompt prefix counts when picking a member.",
+          "conversationWeight": "How much continuing the same conversation counts when picking a member.",
+          "confirmedCacheWeight": "How much a cache hit the engine confirmed counts when picking a member.",
+          "loadPenaltyWeight": "How strongly a busy member is avoided, even when it holds the cache.",
+          "residencyWeight": "How strongly a new conversation avoids pushing other conversations' cache out. 0 turns it off."
+        },
+        "protection": {
+          "enabled": "Keep recent conversations' cache from being pushed out by other requests.",
+          "evictionFeedback": "Learn from the evictions the engine reports how much cache really fits. Off: use the engine's reported size as is.",
+          "windowSeconds": "How long after its last request a conversation stays protected.",
+          "minTokens": "Conversations shorter than this are not protected.",
+          "share": "How protected cache is split between the people using this pool.",
+          "fixedPercent": "With the fixed-percent mode: each person's share of the protected cache.",
+          "ownerPercent": "Your own share of the protected cache. Automatic: follows the share mode."
+        }
       }
     },
     "media": {
@@ -1211,6 +1240,20 @@
         "restartWindowMin": "Restart window",
         "unhealthyRestartMs": "Restart after unhealthy for",
         "unavailableStopMs": "Stop other nodes after one is offline for"
+      },
+      "help": {
+        "concurrencyLimit": "Requests one instance runs at once. Automatic: what the engine reports.",
+        "contextLimit": "Largest context (prompt plus output) one instance accepts. Automatic: what the engine reports.",
+        "kvBudgetTokens": "Tokens of KV cache one instance has. Automatic: what the engine reports.",
+        "kvFullThreshold": "When KV cache use reaches this fraction (0.95 = 95 %), the instance counts as full.",
+        "engineLoadGate": "Whether admission also follows the engine's own load report. Enforce: always. Observe only: record it, never wait on it. Automatic: the server decides.",
+        "countStrategy": "How the server counts a request's tokens before sending it.",
+        "imageTokenAllowance": "Tokens counted for each image. Automatic: from the served model's vision settings.",
+        "maxAttachmentBytes": "Largest attachment one request to this runtime may carry. Automatic: the server's media setting.",
+        "restartBudget": "Automatic restarts allowed within the restart window. After that, a restart needs you.",
+        "restartWindowMin": "The window the automatic restarts are counted over.",
+        "unhealthyRestartMs": "An instance unhealthy this long is restarted automatically.",
+        "unavailableStopMs": "Multi-node: when one node is offline this long, the instance's other nodes are stopped."
       }
     },
     "answerInTerminals": "Answer it on the Terminals page",

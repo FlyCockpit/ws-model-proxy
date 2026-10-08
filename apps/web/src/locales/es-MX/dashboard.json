@@ -908,6 +908,35 @@
         "openai_chat_completions": "OpenAI Chat Completions",
         "openai_responses": "OpenAI Responses",
         "anthropic_messages": "Anthropic Messages"
+      },
+      "help": {
+        "maxWaitMs": "Cuánto puede esperar una solicitud por capacidad local. Después, una solicitud normal se rechaza y una :external va a la nube.",
+        "contextCeiling": "El contexto más grande (prompt más salida) que acepta este pool, para todos los miembros. Automático: se calcula a partir de los miembros.",
+        "contextMargin": "Tokens que se dejan libres bajo el contexto de cada miembro, como margen para las estimaciones de tokens.",
+        "protocolAdaptation": "Traduce entre OpenAI Chat, OpenAI Responses y Anthropic Messages cuando un miembro no sirve la API de quien llama. Los miembros que la sirven de forma nativa siempre se prueban primero.",
+        "allowLossyDeveloperRoleCollapse": "Al traducir para un miembro sin rol developer, une los mensajes developer con los de sistema. Se pierde su significado aparte.",
+        "recommendedSurface": "La API que se recomienda primero para este pool. Automático: se calcula a partir de lo que sirven los miembros.",
+        "maxAttachmentBytes": "El adjunto más grande (imagen, audio, archivo) que puede llevar una solicitud. Automático: el ajuste de medios del servidor.",
+        "optimisticBasicTranscription": "También envía transcripciones básicas a miembros cuyo soporte de transcripción aún no se conoce, después de los conocidos.",
+        "affinity": {
+          "enabled": "Envía una conversación de vuelta al miembro que ya tiene su caché de prompt.",
+          "ttlSeconds": "Cuánto tiempo recuerda el servidor qué miembro tiene la caché de una conversación.",
+          "maxRecords": "Cuántas conversaciones recuerda el servidor para este pool.",
+          "prefixWeight": "Cuánto cuenta un prefijo de prompt compartido al elegir un miembro.",
+          "conversationWeight": "Cuánto cuenta seguir la misma conversación al elegir un miembro.",
+          "confirmedCacheWeight": "Cuánto cuenta un acierto de caché confirmado por el motor al elegir un miembro.",
+          "loadPenaltyWeight": "Qué tanto se evita un miembro ocupado, aunque tenga la caché.",
+          "residencyWeight": "Qué tanto evita una conversación nueva sacar de la caché a otras conversaciones. 0 lo desactiva."
+        },
+        "protection": {
+          "enabled": "Evita que otras solicitudes saquen de la caché a las conversaciones recientes.",
+          "evictionFeedback": "Aprende de los desalojos que reporta el motor cuánta caché cabe en realidad. Apagado: usa tal cual el tamaño que reporta el motor.",
+          "windowSeconds": "Cuánto tiempo después de su última solicitud sigue protegida una conversación.",
+          "minTokens": "Las conversaciones más cortas que esto no se protegen.",
+          "share": "Cómo se reparte la caché protegida entre las personas que usan este pool.",
+          "fixedPercent": "Con el modo de porcentaje fijo: la parte de la caché protegida de cada persona.",
+          "ownerPercent": "Tu propia parte de la caché protegida. Automático: sigue el modo de reparto."
+        }
       }
     },
     "media": {
@@ -1211,6 +1240,20 @@
         "restartWindowMin": "Ventana de reinicios",
         "unhealthyRestartMs": "Reiniciar tras fallar durante",
         "unavailableStopMs": "Detener los demás nodos si uno está desconectado durante"
+      },
+      "help": {
+        "concurrencyLimit": "Solicitudes que una instancia ejecuta a la vez. Automático: lo que reporta el motor.",
+        "contextLimit": "El contexto más grande (prompt más salida) que acepta una instancia. Automático: lo que reporta el motor.",
+        "kvBudgetTokens": "Tokens de caché KV que tiene una instancia. Automático: lo que reporta el motor.",
+        "kvFullThreshold": "Cuando el uso de la caché KV llega a esta fracción (0.95 = 95 %), la instancia cuenta como llena.",
+        "engineLoadGate": "Si la admisión también sigue el reporte de carga del propio motor. Aplicar: siempre. Solo observar: lo registra, nunca espera por él. Automático: decide el servidor.",
+        "countStrategy": "Cómo cuenta el servidor los tokens de una solicitud antes de enviarla.",
+        "imageTokenAllowance": "Tokens que se cuentan por cada imagen. Automático: según los ajustes de visión del modelo servido.",
+        "maxAttachmentBytes": "El adjunto más grande que puede llevar una solicitud a este runtime. Automático: el ajuste de medios del servidor.",
+        "restartBudget": "Reinicios automáticos permitidos dentro de la ventana de reinicio. Después, un reinicio te necesita.",
+        "restartWindowMin": "La ventana en la que se cuentan los reinicios automáticos.",
+        "unhealthyRestartMs": "Una instancia que lleva este tiempo sin estar sana se reinicia automáticamente.",
+        "unavailableStopMs": "Varios nodos: cuando un nodo lleva este tiempo desconectado, se detienen los demás nodos de la instancia."
       }
     },
     "answerInTerminals": "Respóndelo en la página Terminales",
