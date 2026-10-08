@@ -260,22 +260,37 @@ function isSuggestible(address: string): boolean {
 /** A link this fast (or with RDMA) looks like a fabric. */
 export const FABRIC_SUGGESTION_MIN_MBPS = 10_000;
 
+type InfoInterface = NonNullable<NodeInfoView["interfaces"]>[number];
+
+/** ≥ 10 GbE or RDMA. */
+function isFabricLink(iface: InfoInterface): boolean {
+  return (
+    iface.rdma === true ||
+    (iface.linkSpeedMbps !== undefined && iface.linkSpeedMbps >= FABRIC_SUGGESTION_MIN_MBPS)
+  );
+}
+
 /**
  * Fabric suggestions from `node.info.interfaces`: fast or RDMA links, with the other nodes that
- * have an address in the same IPv4 /24. Suggestions only; a person or agent decides.
+ * have a fast or RDMA link with an address in the same IPv4 /24 (a peer on the plain LAN of
+ * that subnet is not one). RDMA links come first, and RDMA peers first within a link.
+ * Suggestions only; a person or agent decides.
  */
 export function fabricSuggestions(
   nodeInfo: unknown,
   otherNodes: ReadonlyArray<{ id: string; nodeInfo: unknown }>,
 ): Array<{ ip: string; linkSpeedMbps: number | null; rdma: boolean; peerNodeIds: string[] }> {
   const info = parseNodeInfo(nodeInfo);
+  /** Per peer: subnet → whether its link there is RDMA (true wins). */
   const peerSubnets = otherNodes.map((other) => {
-    const subnets = new Set<string>();
-    for (const iface of parseNodeInfo(other.nodeInfo)?.interfaces ?? [])
+    const subnets = new Map<string, boolean>();
+    for (const iface of parseNodeInfo(other.nodeInfo)?.interfaces ?? []) {
+      if (!isFabricLink(iface)) continue;
       for (const address of iface.addresses ?? []) {
         const subnet = ipv4Subnet24(bareAddress(address));
-        if (subnet) subnets.add(subnet);
+        if (subnet) subnets.set(subnet, subnets.get(subnet) === true || iface.rdma === true);
       }
+    }
     return { id: other.id, subnets };
   });
   const out: Array<{
@@ -285,22 +300,25 @@ export function fabricSuggestions(
     peerNodeIds: string[];
   }> = [];
   for (const iface of info?.interfaces ?? []) {
+    if (!isFabricLink(iface)) continue;
     const rdma = iface.rdma === true;
     const speed = iface.linkSpeedMbps ?? null;
-    if (!rdma && (speed === null || speed < FABRIC_SUGGESTION_MIN_MBPS)) continue;
     for (const raw of iface.addresses ?? []) {
       const ip = bareAddress(raw);
       if (!isSuggestible(ip)) continue;
       const subnet = ipv4Subnet24(ip);
-      out.push({
-        ip,
-        linkSpeedMbps: speed,
-        rdma,
-        peerNodeIds: subnet
-          ? peerSubnets.filter((peer) => peer.subnets.has(subnet)).map((peer) => peer.id)
-          : [],
-      });
+      const peerNodeIds = subnet
+        ? peerSubnets
+            .filter((peer) => peer.subnets.has(subnet))
+            // Stable: RDMA peers first, otherwise in the given order.
+            .sort((x, y) => Number(y.subnets.get(subnet)) - Number(x.subnets.get(subnet)))
+            .map((peer) => peer.id)
+        : [];
+      out.push({ ip, linkSpeedMbps: speed, rdma, peerNodeIds });
     }
   }
-  return out;
+  // Stable: RDMA links first, then faster links, otherwise in interface order.
+  return out.sort(
+    (a, b) => Number(b.rdma) - Number(a.rdma) || (b.linkSpeedMbps ?? 0) - (a.linkSpeedMbps ?? 0),
+  );
 }

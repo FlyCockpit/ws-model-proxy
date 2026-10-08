@@ -220,7 +220,7 @@ export const nodeDetailSchema = nodeSummarySchema
           ip: z.string(),
           linkSpeedMbps: z.number().int().nullable(),
           rdma: z.boolean(),
-          /** Nodes with an address in the same subnet. */
+          /** Nodes with a fast or RDMA link in the same subnet, RDMA first. */
           peerNodeIds: z.array(idSchema),
         })
         .strict(),

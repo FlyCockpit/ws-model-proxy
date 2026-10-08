@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { effectiveHardware } from "./hardware";
+import { effectiveHardware, fabricSuggestions } from "./hardware";
 
 const NOW = new Date("2026-10-08T00:00:00Z");
 
@@ -75,5 +75,72 @@ describe("effectiveHardware: unified GPUs", () => {
       ["amd:1", 16, false],
       ["nvidia:0", 24, false],
     ]);
+  });
+});
+
+function iface(
+  name: string,
+  address: string,
+  link: { linkSpeedMbps?: number; rdma?: boolean } = {},
+) {
+  return { name, addresses: [address], ...link };
+}
+
+describe("fabricSuggestions", () => {
+  it("suggests only peers whose link on that subnet is also fast or RDMA", () => {
+    const spark = {
+      interfaces: [
+        iface("enp1s0", "192.168.1.10/24", { linkSpeedMbps: 10_000 }),
+        iface("wlan0", "192.168.2.10/24", { linkSpeedMbps: 1_000 }),
+      ],
+    };
+    const otherSpark = {
+      id: "spark-2",
+      nodeInfo: { interfaces: [iface("enp1s0", "192.168.1.11/24", { linkSpeedMbps: 25_000 })] },
+    };
+    // A Strix Halo on the plain LAN of the same /24.
+    const strix = {
+      id: "strix",
+      nodeInfo: { interfaces: [iface("eno1", "192.168.1.20/24", { linkSpeedMbps: 2_500 })] },
+    };
+    const unknownSpeed = {
+      id: "unknown",
+      nodeInfo: { interfaces: [iface("eth0", "192.168.1.30/24")] },
+    };
+    expect(fabricSuggestions(spark, [strix, otherSpark, unknownSpeed])).toEqual([
+      { ip: "192.168.1.10", linkSpeedMbps: 10_000, rdma: false, peerNodeIds: ["spark-2"] },
+    ]);
+  });
+
+  it("accepts a slow link with RDMA on either side", () => {
+    const local = { interfaces: [iface("ib0", "10.0.0.1/24", { rdma: true })] };
+    const peer = {
+      id: "p",
+      nodeInfo: { interfaces: [iface("ib0", "10.0.0.2/24", { rdma: true })] },
+    };
+    expect(fabricSuggestions(local, [peer])).toEqual([
+      { ip: "10.0.0.1", linkSpeedMbps: null, rdma: true, peerNodeIds: ["p"] },
+    ]);
+  });
+
+  it("prefers RDMA links, and RDMA peers within a link", () => {
+    const local = {
+      interfaces: [
+        iface("enp1s0", "10.1.0.1/24", { linkSpeedMbps: 100_000 }),
+        iface("rdma0", "10.2.0.1/24", { linkSpeedMbps: 200_000, rdma: true }),
+        iface("enp2s0", "10.3.0.1/24", { linkSpeedMbps: 10_000 }),
+      ],
+    };
+    const tcp = {
+      id: "tcp",
+      nodeInfo: { interfaces: [iface("enp1s0", "10.2.0.2/24", { linkSpeedMbps: 100_000 })] },
+    };
+    const rdma = {
+      id: "rdma",
+      nodeInfo: { interfaces: [iface("rdma0", "10.2.0.3/24", { rdma: true })] },
+    };
+    const result = fabricSuggestions(local, [tcp, rdma]);
+    expect(result.map((suggestion) => suggestion.ip)).toEqual(["10.2.0.1", "10.1.0.1", "10.3.0.1"]);
+    expect(result[0]?.peerNodeIds).toEqual(["rdma", "tcp"]);
   });
 });
