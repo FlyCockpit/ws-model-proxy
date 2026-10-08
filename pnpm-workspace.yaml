@@ -136,6 +136,10 @@ catalog:
   react-is: ^19.3.0
   # shadcn chart component (packages/ui/src/components/chart.tsx).
   recharts: ^3.10.1
+  # Test page chat answers (apps/web/src/components/test/chat-markdown.tsx).
+  # Exact pins, as master had them; raw HTML stays off (no rehype-raw).
+  react-markdown: 10.1.0
+  remark-gfm: 4.0.1
   sileo: ^0.1.5
   "@prisma/client": ^7.10.0
   "@orpc/client": ^1.15.4
