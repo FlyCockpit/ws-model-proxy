@@ -106,10 +106,12 @@ export function placementNodeOf(row: PlacementNodeRow, now: Date): PlacementNode
     heldVersionIds: new Set(parseHeldDefinitions(row.heldDefinitions).map((d) => d.versionId)),
     frozenFabrics: frozenFabricsOf(row),
     memoryGb: hardware.usableMemoryGb,
+    // A unified GPU's VRAM is the node's usable memory (system memory minus reserved).
     gpus: hardware.gpus.map((gpu) => ({
       key: gpu.key,
       vendor: gpu.vendor,
-      vramGb: Math.max(0, gpu.vramGb - gpu.reservedVramGb),
+      vramGb: gpu.vramGb === null ? 0 : Math.max(0, gpu.vramGb - gpu.reservedVramGb),
+      unified: gpu.unified,
     })),
     liveFreeMemoryGb: liveMetrics(row.nodeMetrics, row.nodeMetricsAt, now).freeMemoryGb,
   };

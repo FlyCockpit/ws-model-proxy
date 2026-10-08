@@ -36,6 +36,8 @@ const nodeInfoSchema = z.object({
         index: z.number().int().min(0),
         name: z.string().optional(),
         vramTotalMiB: z.number().nonnegative().nullable().optional(),
+        /** Integrated GPU sharing system memory (GB10, Thor, an AMD APU). */
+        apu: z.boolean().optional(),
       }),
     )
     .optional(),
@@ -158,7 +160,10 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
 
   const detectedMemoryMiB = info?.unifiedMemoryMiB ?? info?.memoryTotalMiB;
   const detectedGpus = info?.gpus ?? [];
-  const detectedVramMiB = detectedGpus.reduce((sum, gpu) => sum + (gpu.vramTotalMiB ?? 0), 0);
+  const detectedVramMiB = detectedGpus.reduce(
+    (sum, gpu) => sum + (gpu.apu === true ? 0 : (gpu.vramTotalMiB ?? 0)),
+    0,
+  );
   const detectedAcceleratorMiB =
     info?.acceleratorMemoryMiB ?? (detectedVramMiB > 0 ? detectedVramMiB : undefined);
 
@@ -186,7 +191,7 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
   const reservedVram = (key: string) =>
     browser.reservedVramGb?.[key] ?? node.reservedVramGb?.[key] ?? 0;
   const addGpu = (
-    gpu: { vendor: Vendor; index: number; name?: string | null; vramGb: number },
+    gpu: { vendor: Vendor; index: number; name?: string | null; vramGb: number | null },
     source: Source,
   ) => {
     const key = `${gpu.vendor}:${gpu.index}`;
@@ -197,14 +202,20 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
       index: gpu.index,
       name: gpu.name ?? null,
       vramGb: gpu.vramGb,
+      unified: gpu.vramGb === null,
       reservedVramGb: reservedVram(key),
       source,
     });
   };
   for (const gpu of browser.gpus ?? []) addGpu(gpu, declaredSource);
   for (const gpu of node.gpus ?? []) addGpu(gpu, "node");
-  for (const gpu of detectedGpus)
-    addGpu({ ...gpu, vramGb: gpu.vramTotalMiB == null ? 0 : gb(gpu.vramTotalMiB) }, "detected");
+  // An integrated GPU (or one without VRAM of its own on a unified node: GB10 reports `[N/A]`)
+  // shares system memory: no VRAM figure, placement counts it against node memory.
+  for (const gpu of detectedGpus) {
+    const shared = gpu.apu === true || (gpu.vramTotalMiB == null && kind.value === "unified");
+    const vramGb = shared ? null : gpu.vramTotalMiB == null ? 0 : gb(gpu.vramTotalMiB);
+    addGpu({ ...gpu, vramGb }, "detected");
+  }
 
   const headroom = kind.value === "unified" ? UNIFIED_HEADROOM_GB : 0;
   const usableMemoryGb = round(

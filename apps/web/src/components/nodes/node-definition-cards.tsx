@@ -599,7 +599,11 @@ export function HardwareCard({ node, lang }: { node: NodeDetail; lang: string })
               <li key={gpu.key} className="flex flex-wrap items-center gap-1.5">
                 <span className="font-mono text-xs">{gpu.key}</span>
                 <span>{gpu.name ?? gpu.vendor}</span>
-                <span className="text-muted-foreground">{formatGb(gpu.vramGb, lang)}</span>
+                <span className="text-muted-foreground">
+                  {gpu.unified
+                    ? t("dashboard:nodes.hardware.sharedVram")
+                    : formatGb(gpu.vramGb, lang)}
+                </span>
                 <SourceTag source={gpu.source} />
               </li>
             ))}

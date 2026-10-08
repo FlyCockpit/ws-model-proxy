@@ -10,7 +10,8 @@
  * - Memory: `unified.memoryGb`, `cpu.ramGb` and `discrete.ramGb` count against the node's
  *   usable memory. A service runtime (no served models) claims its declared resources too.
  * - GPUs: a `discrete` rank takes `gpuCount` GPUs (of `vendor`, when set) that each have
- *   `vramGb` free. Claims are replayed in a fixed order with the same best-fit rule, so which
+ *   `vramGb` free. A unified GPU (GB10, an APU) has no VRAM of its own: what a rank takes on it
+ *   comes out of the node's usable memory. Claims are replayed in a fixed order with the same best-fit rule, so which
  *   GPU a claim holds is deterministic and freeing it gives back exactly what it took.
  * - Ports: every claim's `port` and `distPort` stay taken until the claim is released, also
  *   for an instance this plan stops (its start queues behind the stop, `blockedBy`).
@@ -52,8 +53,10 @@ export type PlacementGpu = {
   /** `vendor:index`, as `effectiveHardware` names it. */
   key: string;
   vendor: GpuVendor;
-  /** Usable VRAM (GiB): the GPU's VRAM minus its reserved VRAM. */
+  /** Usable VRAM (GiB): the GPU's VRAM minus its reserved VRAM (0 when `unified`). */
   vramGb: number;
+  /** Shares system memory: VRAM taken on it comes out of the node's `memoryGb`. */
+  unified?: boolean;
 };
 
 /** A fabric as a Relay-only node froze it (`Node.frozenFabrics`, `nodeFabricSetsSchema`). */
@@ -245,7 +248,8 @@ export function resourceNeeds(resources: unknown): Needs {
 /** Floating-point slack for GiB comparisons (values carry two decimals). */
 const EPSILON = 1e-9;
 
-type GpuBudget = { key: string; vendor: GpuVendor; freeGb: number };
+/** `freeGb` is unused on a unified GPU: it shares the node's `memoryGb`. */
+type GpuBudget = { key: string; vendor: GpuVendor; freeGb: number; unified: boolean };
 
 /** Claimed ports, counted: two claims of one port (a restart and a thief) release separately. */
 class PortClaims {
@@ -277,20 +281,38 @@ function cloneBudget(budget: Budget): Budget {
 }
 
 /**
- * The GPUs a rank takes: `gpuCount` GPUs of the vendor with `vramGb` free each, best fit
- * (least free first, then key). Null when they do not exist.
+ * What a GPU has free for a rank: its own VRAM, or on a unified GPU the node memory left once
+ * the rank's own memory (`reserveGb`) is taken.
  */
-function pickGpus(gpus: readonly GpuBudget[], needs: Needs): string[] | null {
+function gpuFreeGb(budget: Budget, gpu: GpuBudget, reserveGb: number): number {
+  return gpu.unified ? budget.memoryGb - reserveGb : gpu.freeGb;
+}
+
+/** How many of these GPU keys are unified (their VRAM comes out of node memory). */
+function unifiedCount(budget: Budget, gpuKeys: readonly string[]): number {
+  return budget.gpus.filter((gpu) => gpu.unified && gpuKeys.includes(gpu.key)).length;
+}
+
+/**
+ * The GPUs a rank takes: `gpuCount` GPUs of the vendor with `vramGb` free each, best fit
+ * (least free first, then key). Unified GPUs share the node memory left after the rank's own
+ * memory. Null when they do not exist.
+ */
+function pickGpus(budget: Budget, needs: Needs): string[] | null {
   if (needs.gpuCount === 0) return [];
-  const fitting = gpus
+  const free = (gpu: GpuBudget) => gpuFreeGb(budget, gpu, needs.memoryGb);
+  const fitting = budget.gpus
     .filter(
       (gpu) =>
         (needs.vendor === null || gpu.vendor === needs.vendor) &&
-        gpu.freeGb + EPSILON >= needs.vramGb,
+        free(gpu) + EPSILON >= needs.vramGb,
     )
-    .sort((a, b) => a.freeGb - b.freeGb || compareCodePoints(a.key, b.key));
+    .sort((a, b) => free(a) - free(b) || compareCodePoints(a.key, b.key));
   if (fitting.length < needs.gpuCount) return null;
-  return fitting.slice(0, needs.gpuCount).map((gpu) => gpu.key);
+  const picked = fitting.slice(0, needs.gpuCount).map((gpu) => gpu.key);
+  const shared = unifiedCount(budget, picked) * needs.vramGb;
+  if (needs.memoryGb + shared > budget.memoryGb + EPSILON) return null;
+  return picked;
 }
 
 /** Takes (sign 1) or gives back (sign -1) memory and VRAM on these GPUs. */
@@ -298,7 +320,9 @@ function apply(budget: Budget, needs: Needs, gpuKeys: readonly string[], sign: 1
   budget.memoryGb -= sign * needs.memoryGb;
   for (const key of gpuKeys) {
     const gpu = budget.gpus.find((candidate) => candidate.key === key);
-    if (gpu) gpu.freeGb -= sign * needs.vramGb;
+    if (!gpu) continue;
+    if (gpu.unified) budget.memoryGb -= sign * needs.vramGb;
+    else gpu.freeGb -= sign * needs.vramGb;
   }
 }
 
@@ -322,9 +346,12 @@ function claimGpus(budget: Budget, needs: Needs, resources: unknown): string[] {
   )
     return recorded;
   return (
-    pickGpus(budget.gpus, needs) ??
+    pickGpus(budget, needs) ??
     [...budget.gpus]
-      .sort((a, b) => b.freeGb - a.freeGb || compareCodePoints(a.key, b.key))
+      .sort(
+        (a, b) =>
+          gpuFreeGb(budget, b, 0) - gpuFreeGb(budget, a, 0) || compareCodePoints(a.key, b.key),
+      )
       .slice(0, needs.gpuCount)
       .map((gpu) => gpu.key)
   );
@@ -350,14 +377,16 @@ function fit(
 ): Fit {
   const needs = resourceNeeds(resources);
   if (needs.memoryGb > budget.memoryGb + EPSILON) return { ok: false, reason: "not_enough_memory" };
-  const gpuKeys = pickGpus(budget.gpus, needs);
+  const gpuKeys = pickGpus(budget, needs);
   if (!gpuKeys) return { ok: false, reason: "not_enough_memory" };
   // Over-committed claims show as negative free VRAM on some GPU: the vendor's total must
-  // cover the rank too, so no over-commit is ever placed on top.
+  // cover the rank too, so no over-commit is ever placed on top. Unified GPUs were checked
+  // against node memory (where their over-commit shows) by the pick.
+  const dedicated = gpuKeys.length - unifiedCount(budget, gpuKeys);
   const totalFree = budget.gpus
-    .filter((gpu) => needs.vendor === null || gpu.vendor === needs.vendor)
+    .filter((gpu) => !gpu.unified && (needs.vendor === null || gpu.vendor === needs.vendor))
     .reduce((sum, gpu) => sum + gpu.freeGb, 0);
-  if (needs.gpuCount > 0 && totalFree + EPSILON < needs.gpuCount * needs.vramGb)
+  if (dedicated > 0 && totalFree + EPSILON < dedicated * needs.vramGb)
     return { ok: false, reason: "not_enough_memory" };
   const port = freePort(budget, node, fixedPort);
   if (port === null)
@@ -558,7 +587,12 @@ export class PlacementPlanner {
           memoryGb: node.memoryGb,
           gpus: [...node.gpus]
             .sort((a, b) => compareCodePoints(a.key, b.key))
-            .map((gpu) => ({ key: gpu.key, vendor: gpu.vendor, freeGb: gpu.vramGb })),
+            .map((gpu) => ({
+              key: gpu.key,
+              vendor: gpu.vendor,
+              freeGb: gpu.unified ? 0 : gpu.vramGb,
+              unified: gpu.unified === true,
+            })),
           ports: new PortClaims(),
         },
       ]),
@@ -1181,7 +1215,7 @@ export class PlacementPlanner {
     const budget = working.budgets.get(choice.node.id);
     if (!budget) return;
     // GPUs again on the freed budget (identical to the trial's pick: same state, same rule).
-    const gpuKeys = pickGpus(budget.gpus, choice.needs) ?? choice.gpuKeys;
+    const gpuKeys = pickGpus(budget, choice.needs) ?? choice.gpuKeys;
     choice.gpuKeys = gpuKeys;
     apply(budget, choice.needs, gpuKeys, 1);
     budget.ports.add(choice.port);
@@ -1423,16 +1457,18 @@ function rankChoice(
   victims: PlacementInstance[],
   waits: boolean,
 ): RankChoice {
+  // VRAM on a unified GPU is node memory: it counts in the memory left over.
   const gpuLeft = budget.gpus
-    .filter((gpu) => fitted.gpuKeys.includes(gpu.key))
+    .filter((gpu) => !gpu.unified && fitted.gpuKeys.includes(gpu.key))
     .reduce((sum, gpu) => sum + gpu.freeGb - fitted.needs.vramGb, 0);
+  const sharedGb = unifiedCount(budget, fitted.gpuKeys) * fitted.needs.vramGb;
   return {
     node,
     victims,
     port: fitted.port,
     gpuKeys: fitted.gpuKeys,
     needs: fitted.needs,
-    leftover: [budget.memoryGb - fitted.needs.memoryGb, gpuLeft],
+    leftover: [budget.memoryGb - fitted.needs.memoryGb - sharedGb, gpuLeft],
     waits,
   };
 }

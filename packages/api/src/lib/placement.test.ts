@@ -1305,3 +1305,77 @@ describe("dist port on restarts", () => {
     if (!result.ok) expect(result.refusal.reason).toBe("fabric_port_ranges_disjoint");
   });
 });
+
+describe("unified GPUs (GB10, APUs)", () => {
+  const SPARK_GPU = { key: "nvidia:0", vendor: "nvidia" as const, vramGb: 0, unified: true };
+  const discrete = (vramGb: number, ramGb?: number): RuntimeResource[] => [
+    { kind: "discrete", gpuCount: 1, vramGb, ...(ramGb ? { ramGb } : {}) },
+  ];
+
+  it("loads a GB10 node's GPU as unified, sharing the node's usable memory", () => {
+    const placement = placementNodeOf(
+      nodeRow({
+        declaredResources: { reservedMemoryGb: 10 },
+        nodeInfo: {
+          nodeKind: "unified",
+          memoryTotalMiB: 131072,
+          unifiedMemoryMiB: 131072,
+          gpus: [{ vendor: "nvidia", index: 0, name: "NVIDIA GB10", vramTotalMiB: null }],
+        },
+      }),
+      new Date(),
+    );
+    // 128 GiB − 10 reserved − 2 headroom.
+    expect(placement.memoryGb).toBe(116);
+    expect(placement.gpus).toEqual([
+      { key: "nvidia:0", vendor: "nvidia", vramGb: 0, unified: true },
+    ]);
+  });
+
+  it("takes a discrete rank's VRAM on a unified GPU from node memory", () => {
+    const planner = new PlacementPlanner(
+      context({ nodes: [node("s1", { memoryGb: 126, gpus: [SPARK_GPU] })], fabrics: [] }),
+    );
+    expect(nodesOf(planner.place(request({ resources: discrete(60, 4) })))).toEqual(["s1"]);
+    // 126 − 64 = 62 left: a 60 GiB rank with 4 GiB of RAM no longer fits, a 50 GiB one does.
+    const tooBig = planner.place(request({ resources: discrete(60, 4) }));
+    expect(tooBig.ok).toBe(false);
+    if (!tooBig.ok) expect(tooBig.refusal.reason).toBe("not_enough_memory");
+    expect(nodesOf(planner.place(request({ resources: discrete(50) })))).toEqual(["s1"]);
+    // 12 GiB left for unified claims too.
+    expect(planner.place(request({ resources: [{ kind: "unified", memoryGb: 13 }] })).ok).toBe(
+      false,
+    );
+    expect(planner.place(request({ resources: [{ kind: "unified", memoryGb: 12 }] })).ok).toBe(
+      true,
+    );
+  });
+
+  it("counts existing claims on a unified GPU against node memory", () => {
+    const held: PlacementInstance = {
+      ...running("old", ["s1"], 0),
+      ranks: [
+        {
+          nodeId: "s1",
+          port: 30000,
+          distPort: null,
+          claim: "HELD",
+          resources: { kind: "discrete", gpuCount: 1, vramGb: 100, gpus: ["nvidia:0"] },
+        },
+      ],
+    };
+    const planner = new PlacementPlanner(
+      context({
+        nodes: [node("s1", { memoryGb: 126, gpus: [SPARK_GPU] })],
+        fabrics: [],
+        instances: [held],
+      }),
+    );
+    expect(planner.place(request({ resources: [{ kind: "unified", memoryGb: 27 }] })).ok).toBe(
+      false,
+    );
+    expect(planner.place(request({ resources: [{ kind: "unified", memoryGb: 26 }] })).ok).toBe(
+      true,
+    );
+  });
+});

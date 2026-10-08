@@ -76,7 +76,10 @@ export const effectiveHardwareSchema = z
           vendor: z.enum(["nvidia", "amd", "intel", "apple", "other"]),
           index: z.number().int(),
           name: z.string().nullable(),
-          vramGb: z.number(),
+          /** Null when the GPU shares system memory (`unified`). */
+          vramGb: z.number().nullable(),
+          /** Shares system memory (GB10, an APU): placement counts it against node memory. */
+          unified: z.boolean(),
           reservedVramGb: z.number(),
           source: hardwareSourceSchema,
         })

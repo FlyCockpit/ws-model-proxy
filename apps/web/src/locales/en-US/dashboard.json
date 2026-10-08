@@ -382,6 +382,7 @@
       "reserved": "Reserved for other things",
       "usable": "Usable for wsmp",
       "reservedNow": "Reserved by runtimes now",
+      "sharedVram": "Shared with system memory",
       "source": {
         "browser": "set here",
         "agent": "set by an agent",
