@@ -1,22 +1,10 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import {
-  cleanup,
-  configure,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-  within,
-} from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ComponentType, ReactNode } from "react";
 import { useSyncExternalStore } from "react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-
-// The chart's first render after the queries settle can take longer than the
-// 1 s default on a loaded runner; every wait is still for a real condition.
-configure({ asyncUtilTimeout: 10_000 });
 
 /** Activity metrics explorer: scope, metric, range/step, tests, compare versions, URL state. */
 
@@ -217,7 +205,7 @@ afterEach(() => {
   cleanup();
 });
 
-describe("Activity metrics explorer", { timeout: 30_000 }, () => {
+describe("Activity metrics explorer", () => {
   it("queries the first pool over 24 hours without tests and shows the totals", async () => {
     await mount();
     expect(await screen.findByText("1,239")).toBeTruthy();

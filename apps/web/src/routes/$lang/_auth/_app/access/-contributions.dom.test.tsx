@@ -222,7 +222,7 @@ afterEach(() => {
   state.navigations = [];
 });
 
-describe("Access → Contributing", { timeout: 30_000 }, () => {
+describe("Access → Contributing", () => {
   it("adds a served model of the pool's type that is not in the pool yet", async () => {
     await mount();
     const pool = screen.getByLabelText("access:contributions.pool");
@@ -291,7 +291,7 @@ describe("Access → Contributing", { timeout: 30_000 }, () => {
   });
 });
 
-describe("Access → Contributing: fork a startable definition", { timeout: 30_000 }, () => {
+describe("Access → Contributing: fork a startable definition", () => {
   it("asks for no node and forks under the shared name", async () => {
     await mount();
     expect(await screen.findByText("Bob Whisper")).toBeTruthy();

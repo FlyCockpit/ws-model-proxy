@@ -1,13 +1,9 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, configure, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import type { ComponentType, ReactNode } from "react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-
-// The overview's first render can take longer than the 1 s default on a
-// loaded runner; every wait is still for a real condition.
-configure({ asyncUtilTimeout: 10_000 });
 
 /** Runtime overview: an instance whose stop is not confirmed offers Mark as stopped. */
 
@@ -124,7 +120,7 @@ function mount() {
   );
 }
 
-describe("runtime overview instances", { timeout: 30_000 }, () => {
+describe("runtime overview instances", () => {
   it("offers no Start, Stop or Restart for an always-on runtime", async () => {
     state.kind = "ALWAYS_ON";
     mount();

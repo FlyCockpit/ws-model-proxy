@@ -247,7 +247,7 @@ afterEach(() => {
   state.toastError = [];
 });
 
-describe("Pool · Sharing", { timeout: 30_000 }, () => {
+describe("Pool · Sharing", () => {
   it("lists only this pool's shares and invites, and contributed models by person", async () => {
     state.pool = ownPool();
     state.shares = {
@@ -271,7 +271,7 @@ describe("Pool · Sharing", { timeout: 30_000 }, () => {
       ],
     };
     await mount();
-    expect(await screen.findByText("bo@example.test", {}, { timeout: 10_000 })).toBeTruthy();
+    expect(await screen.findByText("bo@example.test")).toBeTruthy();
     // Once as a share, once as a contributor.
     expect(screen.getAllByText("ana@example.test")).toHaveLength(2);
     expect(screen.queryByText("other-pool@example.test")).toBeNull();
@@ -311,7 +311,7 @@ describe("Pool · Sharing", { timeout: 30_000 }, () => {
     const link = "https://proxy.example.com/en-US/signup?invite=wsmp_inv_ABCDEFGHIJKLMNOP";
     state.createAnswer = { kind: "invite", invite: invite(), link };
     await mount();
-    fireEvent.change(await screen.findByLabelText("access:shares.email", {}, { timeout: 10_000 }), {
+    fireEvent.change(await screen.findByLabelText("access:shares.email"), {
       target: { value: "Bo@Example.test" },
     });
     fireEvent.click(screen.getByRole("checkbox", { name: /^access:shares\.canContribute/ }));
@@ -344,9 +344,7 @@ describe("Pool · Sharing", { timeout: 30_000 }, () => {
       invites: [],
     };
     await mount();
-    fireEvent.click(
-      await screen.findByRole("button", { name: "access:shares.edit" }, { timeout: 10_000 }),
-    );
+    fireEvent.click(await screen.findByRole("button", { name: "access:shares.edit" }));
     const dialog = await screen.findByRole("dialog", {
       name: "access:shares.editTitle:ana@example.test",
     });
@@ -379,7 +377,7 @@ describe("Pool · Sharing", { timeout: 30_000 }, () => {
       data: { reason: "invite_pending", subjectId: null },
     });
     await mount();
-    fireEvent.change(await screen.findByLabelText("access:shares.email", {}, { timeout: 10_000 }), {
+    fireEvent.change(await screen.findByLabelText("access:shares.email"), {
       target: { value: "bo@example.test" },
     });
     fireEvent.click(screen.getByRole("button", { name: "dashboard:pool.sharing.share" }));
@@ -395,11 +393,7 @@ describe("Pool · Sharing", { timeout: 30_000 }, () => {
       invites: [],
     };
     await mount();
-    const edit = await screen.findByRole(
-      "button",
-      { name: "access:shares.edit" },
-      { timeout: 10_000 },
-    );
+    const edit = await screen.findByRole("button", { name: "access:shares.edit" });
     // Retyped with a trailing zero: the same cap, so no write.
     fireEvent.click(edit);
     let dialog = await screen.findByRole("dialog");
@@ -435,9 +429,7 @@ describe("Pool · Sharing", { timeout: 30_000 }, () => {
       data: { reason: "invite_accepted", subjectId: null },
     });
     await mount();
-    fireEvent.click(
-      await screen.findByRole("button", { name: "access:shares.withdraw" }, { timeout: 10_000 }),
-    );
+    fireEvent.click(await screen.findByRole("button", { name: "access:shares.withdraw" }));
     const confirm = await screen.findByRole("alertdialog", {
       name: "access:shares.withdrawTitle:bo@example.test",
     });

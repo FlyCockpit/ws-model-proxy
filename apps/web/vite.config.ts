@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 // Load root `.env` before any SSR module graph validates process.env.
 // Production SSR runs under apps/server (which already loads dotenv); this is
 // for local `vite dev` / build where Vite is its own process.
@@ -246,6 +247,12 @@ export default defineConfig(({ mode }) => {
         "/rpc": { target: devProxyTarget.http, changeOrigin: true, secure: false },
         "/ws": { target: devProxyTarget.ws, ws: true, changeOrigin: true, secure: false },
       },
+    },
+    test: {
+      // Render time is not what the DOM tests measure; a cold first render on a
+      // loaded runner exceeds Vitest's 5 s default. Waits: `src/test-setup.ts`.
+      testTimeout: 30_000,
+      setupFiles: ["./src/test-setup.ts"],
     },
   };
 });

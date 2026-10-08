@@ -107,7 +107,7 @@ afterEach(() => {
   state.runtimes = [];
 });
 
-describe("Runtimes page", { timeout: 30_000 }, () => {
+describe("Runtimes page", () => {
   it("groups by node, Needs you first and the runtimes on no node last", async () => {
     const box = { id: "n-box", slug: "box" };
     const spark = { id: "n-spark", slug: "spark" };

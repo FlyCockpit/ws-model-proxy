@@ -253,7 +253,7 @@ afterEach(() => {
   state.minted = 0;
 });
 
-describe("Welcome", { timeout: 30_000 }, () => {
+describe("Welcome", () => {
   it("puts the first step not done in the URL, once", async () => {
     await mount({}, { ...NONE, node: true });
     await waitFor(() =>

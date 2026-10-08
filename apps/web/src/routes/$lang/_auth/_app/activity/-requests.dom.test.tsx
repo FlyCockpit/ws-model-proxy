@@ -141,7 +141,7 @@ afterEach(() => {
   state.deleteResults = [];
 });
 
-describe("request log filters", { timeout: 30_000 }, () => {
+describe("request log filters", () => {
   it("lists own and shared pools and filters by pool and node", async () => {
     await mount();
     const pool = screen.getByLabelText("activity:requests.filter.poolId");
@@ -190,7 +190,7 @@ describe("request log filters", { timeout: 30_000 }, () => {
   });
 });
 
-describe("request log deletes", { timeout: 30_000 }, () => {
+describe("request log deletes", () => {
   it("deletes finished requests older than the chosen range after a confirm", async () => {
     state.deleteResults = [3, 0];
     await mount();

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { webcrypto } from "node:crypto";
-import { act, cleanup, configure, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { TERMINAL_BROWSER_JSON_WINDOW_MS } from "@ws-model-proxy/config/terminal-socket-policy";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -40,12 +40,6 @@ import {
   type TerminalOutputEvent,
   useTerminalSessions,
 } from "./use-terminal-sessions";
-
-// `waitFor` polls until the awaited async work (WebCrypto on the thread pool, React
-// transitions) completes and returns as soon as it does; the timeout only bounds a
-// genuine hang. RTL's 1 s default is shorter than this file's slowest completion on a
-// loaded CI or shared host, which showed up as one-off failures in passing tests.
-configure({ asyncUtilTimeout: 10_000 });
 
 const socket = vi.hoisted(() => ({
   handlers: null as TerminalSocketHandlers | null,

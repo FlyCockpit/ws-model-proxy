@@ -153,7 +153,7 @@ afterEach(() => {
   state.calls = [];
 });
 
-describe("Access → Agents connection level", { timeout: 30_000 }, () => {
+describe("Access → Agents connection level", () => {
   it("shows each connection's level and lowers to Read-only at once", async () => {
     state.connections = [connection({ level: "FULL" })];
     const group = await mount();

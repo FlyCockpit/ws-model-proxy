@@ -113,7 +113,7 @@ afterEach(() => {
   vi.mocked(toast.success).mockClear();
 });
 
-describe("settings locale", { timeout: 30_000 }, () => {
+describe("settings locale", () => {
   it("shows the saved locale", async () => {
     const select = await mount();
     expect(select.value).toBe("en-US");
