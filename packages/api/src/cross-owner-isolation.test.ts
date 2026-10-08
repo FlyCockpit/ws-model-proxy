@@ -745,6 +745,7 @@ const EXEMPT: Readonly<Record<string, Exemption>> = {
   },
   "activity.overview.summary": NO_ID_LIST,
   "activity.needsYou.list": NO_ID_LIST,
+  "activity.needsYou.count": NO_ID_LIST,
 };
 
 /** Every procedure path the router serves (its leaves), to check the contract list against. */

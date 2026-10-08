@@ -226,4 +226,22 @@ describe("needs you", () => {
       state: "QUEUED",
     });
   });
+
+  it("counts the caller's instance needs and queued commands for the nav badge", async () => {
+    db.runtimeInstance.count.mockResolvedValue(2);
+    db.queuedNodeCommand.count.mockResolvedValue(3);
+    await expect(client().needsYou.count()).resolves.toEqual({ count: 5 });
+    expect(db.runtimeInstance.count.mock.calls[0]?.[0]?.where).toEqual({
+      userId: "owner",
+      needsOperator: { not: null },
+    });
+    expect(db.queuedNodeCommand.count.mock.calls[0]?.[0]?.where).toMatchObject({
+      userId: "owner",
+      state: "QUEUED",
+    });
+  });
+
+  it("is a session procedure: no agent tokens", async () => {
+    await expect(client(AGENT).needsYou.count()).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
 });

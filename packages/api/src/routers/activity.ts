@@ -352,6 +352,18 @@ const needsYou = {
       queuedCommands,
     };
   }),
+
+  /** The nav badge: two counts, polled from every page (cheaper than the list). */
+  count: contractProcedure(c.needsYou.count).handler(async ({ context }) => {
+    const userId = context.session.user.id;
+    const [instances, queued] = await Promise.all([
+      prisma.runtimeInstance.count({ where: { userId, needsOperator: { not: null } } }),
+      prisma.queuedNodeCommand.count({
+        where: { userId, state: "QUEUED", expiresAt: { gt: new Date() } },
+      }),
+    ]);
+    return { count: instances + queued };
+  }),
 };
 
 export const activityRouter = {
