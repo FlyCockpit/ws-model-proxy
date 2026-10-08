@@ -31,8 +31,8 @@ All require an active session (`_auth` layout).
 
 | Path | Description |
 |------|-------------|
-| `/{lang}/welcome` | Get started: add a node (enrollment one-liner with countdown), add detected servers, create a pool, connect an agent, create an API key. |
-| `/{lang}/overview` | KPIs (requests, errors, p95, TTFT, queue wait, cloud share; agent tests excluded), Needs-you list, nodes strip, pool cards with sparklines, getting-started checklist until done. |
+| `/{lang}/welcome` | Get started stepper (`?step=node\|runtime\|pool\|agent\|apiKey`, each skippable): add a node (enrollment one-liner with countdown, New code, node turns green when it connects), your model servers (New runtime from a preset or an always-on runtime), create a pool from a served model (callable ID), connect an agent (MCP URL, OAuth, agent token, first prompt), create an API key (base URL, curl). A first sign-in lands here from the Overview; Skip setup / Finish end getting started. |
+| `/{lang}/overview` | KPIs (requests, errors, p95, TTFT, queue wait, cloud share; agent tests excluded), Needs-you list, nodes strip, pool cards with sparklines, getting-started checklist (each item opens its Welcome step) until done. |
 | `/{lang}/models` | Every callable ID you may use (own pools and pools shared with you with can use): `owner/pool` and, where cloud mode covers you, `owner/pool:external`; type, status, base URL, copy buttons and snippets. |
 | `/{lang}/test` | Test a callable ID or one of your served models directly (web only): chat, embeddings, transcription, live speech-to-text mic panel. |
 | `/{lang}/pools` | Pool cards (flow strip, health, sparkline, cloud badge), pools shared with you, New pool sheet. |

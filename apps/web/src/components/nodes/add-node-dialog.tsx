@@ -1,6 +1,5 @@
 import { useForm } from "@tanstack/react-form";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link } from "@tanstack/react-router";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button, buttonVariants } from "@ws-model-proxy/ui/components/button";
 import {
   Dialog,
@@ -20,17 +19,14 @@ import {
   SelectValue,
 } from "@ws-model-proxy/ui/components/select";
 import { Switch } from "@ws-model-proxy/ui/components/switch";
-import { CircleCheck, LoaderCircle } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
 import { SegmentedControl } from "@/components/segmented-control";
-import { TimeAgo } from "@/components/time-ago";
 import { orpc } from "@/utils/orpc";
-
+import { EnrollmentPanel } from "./enrollment-panel";
 import { FieldError } from "./field-error";
-import { CommandBlock } from "./node-badges";
 import type { EnrollmentResult } from "./node-types";
 import { refusalToastOptions } from "./refusal";
 
@@ -350,7 +346,7 @@ export function AddNodeDialog({ open, onOpenChange, lang, replace }: AddNodeDial
   );
 }
 
-/** The one-liner, its expiry, and the nodes that used it so far (polled while open). */
+/** The minted command (shared panel) with Done: the only way out once the secret is shown. */
 function EnrollmentResultView({
   result,
   lang,
@@ -361,50 +357,9 @@ function EnrollmentResultView({
   onDone: () => void;
 }) {
   const { t } = useTranslation(["dashboard"]);
-  const codes = useQuery({
-    ...orpc.nodes.enrollmentCodes.list.queryOptions(),
-    refetchInterval: 3_000,
-  });
-  const code =
-    codes.data?.codes.find((candidate) => candidate.id === result.code.id) ?? result.code;
-  const enrolled = code.enrolled;
   return (
     <div className="min-w-0 space-y-4">
-      <CommandBlock command={result.installCommand} label={t("dashboard:nodes.add.commandLabel")} />
-      <p className="text-xs text-muted-foreground">
-        {t("dashboard:nodes.add.secretOnce")} {t("dashboard:nodes.add.expires")}{" "}
-        <TimeAgo value={code.expiresAt} />
-        {code.maxUses > 1
-          ? ` · ${t("dashboard:nodes.codes.uses", { used: code.usedCount, max: code.maxUses })}`
-          : null}
-      </p>
-      <p className="text-xs text-muted-foreground">{t("dashboard:nodes.add.installsWhere")}</p>
-      <p className="text-xs text-muted-foreground">{t("dashboard:nodes.add.terminalsAsked")}</p>
-      {enrolled.length === 0 ? (
-        <p className="flex items-center gap-2 text-sm" role="status">
-          <LoaderCircle aria-hidden="true" className="size-4 animate-spin text-muted-foreground" />
-          {t("dashboard:nodes.add.waiting")}
-        </p>
-      ) : (
-        <ul className="space-y-1" role="status">
-          {enrolled.map((use) => (
-            <li key={`${use.nodeId}-${use.usedAt}`} className="flex items-center gap-2 text-sm">
-              <CircleCheck aria-hidden="true" className="size-4 text-state-success" />
-              {use.nodeId ? (
-                <Link
-                  to="/$lang/nodes/$nodeId"
-                  params={{ lang, nodeId: use.nodeId }}
-                  className="inline-flex min-h-[44px] items-center underline"
-                >
-                  {t("dashboard:nodes.add.joined", { slug: use.slug ?? use.nodeId })}
-                </Link>
-              ) : (
-                t("dashboard:nodes.add.joinedDeleted")
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
+      <EnrollmentPanel result={result} lang={lang} />
       <DialogFooter>
         <button
           type="button"

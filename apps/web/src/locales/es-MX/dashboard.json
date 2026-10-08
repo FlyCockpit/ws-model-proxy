@@ -40,7 +40,7 @@
   "pages": {
     "welcome": {
       "title": "Primeros pasos",
-      "description": "Agrega un nodo, agrega los servidores que encontró, crea un pool, conecta un agente y crea una clave de API."
+      "description": "Agrega un nodo, agrega tus servidores de modelos, crea un pool, conecta un agente y crea una clave de API."
     },
     "overview": {
       "title": "Resumen",
@@ -256,11 +256,21 @@
       "secretOnce": "Este código se muestra una sola vez.",
       "installsWhere": "Instala wsmp en ~/.cargo/bin ($CARGO_HOME/bin si está definido). Cuando el servidor ofrece compilaciones publicadas, Linux (x86_64 o ARM64, glibc 2.34 o posterior) y macOS reciben un binario verificado con suma de verificación; si no, compila wsmp desde el código fuente, lo que requiere Rust 1.88 o posterior.",
       "terminalsAsked": "Con control total, `wsmp login` luego pregunta si se permiten terminales del navegador en esa máquina (sí, de forma predeterminada). Solo la máquina puede cambiarlo más adelante, con `wsmp config set-human-terminal on|off`.",
-      "expires": "Vence",
       "waiting": "Esperando a que el nodo se conecte…",
       "joined": "{{slug}} se unió",
       "joinedDeleted": "Un nodo se unió y ya fue quitado",
-      "done": "Listo"
+      "done": "Listo",
+      "expiresIn": "Vence en {{time}}.",
+      "expired": "Este código venció; obtén uno nuevo.",
+      "newCode": "Código nuevo",
+      "onMachine": "Qué pasa en la máquina",
+      "machineSteps": {
+        "install": "El script instala wsmp (dónde y cómo, abajo).",
+        "login": "`wsmp login` usa el código: la máquina se une a tu cuenta como nodo, sin otra aprobación.",
+        "trust": "Pregunta cuánto control tiene este servidor: control total (el predeterminado) o solo retransmisión, donde los agentes no pueden cambiar nada en la máquina.",
+        "service": "Ofrece instalar un servicio de usuario para que el nodo arranque al iniciar el sistema."
+      },
+      "readingHardware": "Conectado. Leyendo su hardware…"
     },
     "codes": {
       "title": "Códigos de instalación",
@@ -1448,6 +1458,72 @@
       "errors_one": "{{value}} error",
       "errors_other": "{{value}} errores",
       "separator": " · "
+    }
+  },
+  "welcome": {
+    "skipSetup": "Omitir configuración",
+    "stepsLabel": "Pasos de configuración",
+    "stepOf": "Paso {{step}} de {{total}}",
+    "done": "Listo",
+    "doneSr": "(listo)",
+    "back": "Atrás",
+    "continue": "Continuar",
+    "skip": "Omitir este paso",
+    "finish": "Terminar",
+    "node": {
+      "title": "Agrega un nodo",
+      "description": "Un nodo es una máquina que ejecuta modelos para ti: un servidor con GPU, una estación de trabajo o una laptop.",
+      "intro": "Un comando instala wsmp y conecta la máquina a tu cuenta con un código que funciona una vez, durante una hora. El código es tu aprobación.",
+      "mint": "Obtener el comando de instalación",
+      "mintAnother": "Agregar otro nodo",
+      "yours_one": "Tu nodo",
+      "yours_other": "Tus {{count}} nodos",
+      "moreOptions": "Varias máquinas a la vez, etiquetas o nodos temporales:",
+      "nodesPage": "Nodos → Agregar un nodo"
+    },
+    "runtime": {
+      "title": "Tus servidores de modelos",
+      "description": "Un runtime es un servidor de modelos al que wsmp puede llamar: uno que inicia cuando se necesita, o uno que siempre está en marcha.",
+      "presetTitle": "Inicia uno desde un preajuste",
+      "presetHint": "vLLM, SGLang o llama.cpp, iniciado en uno de tus nodos cuando un pool lo necesita.",
+      "presetAction": "Nuevo runtime",
+      "runningTitle": "¿Ya tienes un servidor en marcha?",
+      "runningHint": "Si vLLM, llama.cpp, Ollama u otro servidor compatible con OpenAI ya se ejecuta en un nodo, agrégalo como runtime siempre activo: en Nuevo runtime elige Servidor detectado e ingresa su dirección en el nodo. wsmp le envía solicitudes y nunca lo inicia ni lo detiene.",
+      "noDetection": "wsmp todavía no encuentra por sí mismo los servidores en marcha, así que agrégalos de esta forma.",
+      "runningAction": "Agregar un runtime siempre activo",
+      "yours_one": "Tu runtime",
+      "yours_other": "Tus {{count}} runtimes",
+      "models_one": "{{count}} modelo servido",
+      "models_other": "{{count}} modelos servidos"
+    },
+    "pool": {
+      "title": "Crea un pool",
+      "description": "Un pool es lo que llaman los clientes, por su ID invocable (dueño/pool). Empieza con un modelo servido y agrega más después.",
+      "callable": "Tus IDs invocables",
+      "fromModel": "Modelos servidos que aún no están en un pool",
+      "createNamed": "Crear pool {{slug}}",
+      "customize": "Elegir un nombre…",
+      "noModels": "Aún no hay modelos servidos. Agrega un servidor de modelos en el paso anterior: los runtimes que se inician listan sus modelos al definirlos; los siempre activos, cuando el nodo los reporta.",
+      "allPooled": "Todos los modelos servidos están en un pool.",
+      "loadFailed": "No se pudieron cargar tus runtimes o pools."
+    },
+    "agent": {
+      "title": "Conecta un agente",
+      "description": "Agentes como los asistentes de programación configuran y ejecutan modelos por ti mediante MCP.",
+      "oauthTitle": "Conectar con OAuth",
+      "oauthHint": "Agrega la URL de MCP a un agente compatible con OAuth. Abre este sitio, inicias sesión, eliges Solo lectura o Completo, y queda conectado. No hay nada que copiar.",
+      "tokenTitle": "O usa un token de agente",
+      "tokenHint": "Para agentes sin OAuth: un token que pegas en la configuración del agente. Solo lectura solo lee; Completo también puede configurar, iniciar y detener.",
+      "promptTitle": "Un primer prompt para probar",
+      "promptNode": "Configura un modelo en {{node}}.",
+      "promptNoNode": "Muéstrame mis nodos y qué pueden ejecutar.",
+      "copyPrompt": "Copiar prompt"
+    },
+    "apiKey": {
+      "title": "Crea una clave de API",
+      "description": "Las apps y los SDK llaman a tus pools con una clave de API en la URL base compatible con OpenAI de abajo.",
+      "existing_one": "Tienes {{count}} clave activa.",
+      "existing_other": "Tienes {{count}} claves activas."
     }
   }
 }
