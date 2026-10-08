@@ -949,7 +949,10 @@
         "nameExternal": "Leave out :external; callers add it.",
         "nameRuntime": "Names starting with runtime: are for direct tests."
       }
-    }
+    },
+    "memberWaiting_one": "{{count}} waiting",
+    "memberWaiting_other": "{{count}} waiting",
+    "memberP95": "p95 {{latency}} ms (15 min)"
   },
   "runtime": {
     "new": "New runtime",
@@ -1352,7 +1355,8 @@
         "forgetHint": "Learned fixes and stripped headers are removed and learned again from the engine's next answers. No new version is made.",
         "forgotten": "Learned fixes forgotten."
       }
-    }
+    },
+    "kvUsage": "KV cache {{percent}}%"
   },
   "overview": {
     "range": "Time range",

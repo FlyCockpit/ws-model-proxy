@@ -120,6 +120,28 @@ function memberLabel(member: PoolMemberView): string {
     : member.upstreamModelId;
 }
 
+/** Queue and recent p95 of a member; left out while unknown. */
+function MemberLoad({ live }: { live: PoolMemberView["live"] }) {
+  const { t } = useTranslation(["dashboard"]);
+  const { lang } = Route.useParams();
+  const parts = [
+    ...(live.waiting !== null && live.waiting > 0
+      ? [t("dashboard:pool.memberWaiting", { count: live.waiting })]
+      : []),
+    ...(live.p95LatencyMs !== null
+      ? [
+          t("dashboard:pool.memberP95", {
+            latency: new Intl.NumberFormat(lang, { maximumFractionDigits: 0 }).format(
+              live.p95LatencyMs,
+            ),
+          }),
+        ]
+      : []),
+  ];
+  if (parts.length === 0) return null;
+  return <p className="text-xs text-muted-foreground">{parts.join(" · ")}</p>;
+}
+
 function MembersCard({ pool }: { pool: PoolView }) {
   const { t } = useTranslation(["dashboard", "common"]);
   const { lang } = Route.useParams();
@@ -190,6 +212,7 @@ function MembersCard({ pool }: { pool: PoolView }) {
                             total: member.live.instances,
                           })}
                   </p>
+                  <MemberLoad live={member.live} />
                 </div>
                 <StatusPill tone={MEMBER_STATUS_TONE[member.status]}>
                   {t(`dashboard:pool.memberStatus.${member.status}`)}

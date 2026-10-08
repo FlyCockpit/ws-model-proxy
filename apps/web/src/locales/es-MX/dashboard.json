@@ -949,7 +949,10 @@
         "nameExternal": "No incluyas :external; quien llama lo agrega.",
         "nameRuntime": "Los nombres que empiezan con runtime: son para pruebas directas."
       }
-    }
+    },
+    "memberWaiting_one": "{{count}} en espera",
+    "memberWaiting_other": "{{count}} en espera",
+    "memberP95": "p95 {{latency}} ms (15 min)"
   },
   "runtime": {
     "new": "Nuevo runtime",
@@ -1352,7 +1355,8 @@
         "forgetHint": "Se quitan los ajustes aprendidos y los encabezados quitados, y se vuelven a aprender de las siguientes respuestas del motor. No se crea una versión nueva.",
         "forgotten": "Se olvidaron los ajustes aprendidos."
       }
-    }
+    },
+    "kvUsage": "Caché KV {{percent}} %"
   },
   "overview": {
     "range": "Periodo",

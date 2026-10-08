@@ -19,6 +19,7 @@ import { useTranslation } from "react-i18next";
 import { CopyableCode } from "@/components/copy-button";
 import { InlineRetry } from "@/components/inline-retry";
 import { NativeSelect } from "@/components/native-select";
+import { InstanceLoad } from "@/components/runtimes/instance-load";
 import {
   HeldUntilConfirmed,
   MarkStoppedAction,
@@ -332,6 +333,7 @@ function InstancesCard({ runtime }: { runtime: RuntimeDetail }) {
                     )}
                     {instance.phaseReason ? ` · ${instance.phaseReason}` : ""}
                   </p>
+                  <InstanceLoad live={instance.live} />
                 </div>
                 {instance.needsOperator === "MARK_STOPPED" ? (
                   <MarkStoppedAction runtimeId={runtime.id} instanceId={instance.id} />
