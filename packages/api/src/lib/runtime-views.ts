@@ -89,7 +89,9 @@ export const RUNTIME_SUMMARY_INCLUDE = {
       phase: true,
       needsOperator: true,
       desiredState: true,
+      // Ranks that hold (or may still hold) their node; a failed or stopped one has let go.
       Ranks: {
+        where: { claim: { in: ["HELD", "HELD_UNKNOWN"] } },
         select: { nodeId: true, Node: { select: { slug: true, userId: true } } },
         orderBy: { rank: "asc" },
       },
