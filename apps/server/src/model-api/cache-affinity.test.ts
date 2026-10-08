@@ -4726,7 +4726,9 @@ it("R4 bounds wide/deep canonical work and reads the payload once for 3 targets"
   // Validation and root capture only: the wide canonical is built once and
   // shared, never rebuilt per target. A count, not a wall-clock budget.
   expect(reads).toBe(2);
-}, 10_000);
+  // Four CPU-bound passes over a 4M-element fixture (about 1 s each idle,
+  // over 10 s in total at gate load); the timeout only guards against a hang.
+}, 60_000);
 
 it("precomputed unit tokens rank 8 targets on a 2 MiB canonical with one estimation pass", async () => {
   db.cacheAffinityRecord.findMany.mockResolvedValue([]);
