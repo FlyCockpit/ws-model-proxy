@@ -15,6 +15,7 @@ import {
   AgentLevelChoice,
   DEFAULT_AGENT_LEVEL,
 } from "@/components/access/agent-level-choice";
+import { useLocationSearch } from "@/hooks/use-location-search";
 import { useMcpConsentSubmit } from "@/hooks/use-mcp-consent-submit";
 import { authClient } from "@/lib/auth-client";
 import {
@@ -64,6 +65,8 @@ function McpConsentTransaction({ search }: { search: Record<string, unknown> }) 
   const info = useMemo(() => parseMcpOAuthSearch(search), [search]);
   const { t } = useTranslation(["auth", "common"]);
   const { phase, submit } = useMcpConsentSubmit();
+  // The raw URL, as the consent call forwards it (the router's search is re-serialized).
+  const rawSearch = useLocationSearch();
   // The person's choice only (never read from the URL the client built); the same default as
   // the agent token dialog.
   const [level, setLevel] = useState<AgentLevel>(DEFAULT_AGENT_LEVEL);
@@ -121,9 +124,7 @@ function McpConsentTransaction({ search }: { search: Record<string, unknown> }) 
     );
   }
 
-  // The raw URL, as the consent call forwards it (the router's search is re-serialized).
-  const redirectHost =
-    typeof window === "undefined" ? null : signedRedirectHost(window.location.search);
+  const redirectHost = rawSearch === null ? null : signedRedirectHost(rawSearch);
   if (redirectHost === null) {
     return (
       <ConsentTerminalCard
