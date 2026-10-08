@@ -25,6 +25,7 @@ import {
   PRIORITY_CHOICES,
   type PriorityChoice,
   priorityItems,
+  RuntimeShareRow,
   ShareByMeRow,
   ShareEmpty,
   ShareSection,
@@ -124,49 +125,6 @@ function RuntimeSharesByMe() {
         ))
       )}
     </ShareSection>
-  );
-}
-
-function RuntimeShareRow({
-  share,
-  name,
-}: {
-  share: { id: string; runtimeId: string; email: string };
-  name: string;
-}) {
-  const { t } = useTranslation(["access"]);
-  const invalidate = useInvalidateShares();
-  const [confirmOpen, setConfirmOpen] = useState(false);
-  const remove = useMutation(
-    orpc.runtimes.shares.delete.mutationOptions({
-      onSuccess: async () => {
-        setConfirmOpen(false);
-        toast.success(t("access:shares.removed"));
-        await invalidate();
-      },
-    }),
-  );
-  return (
-    <div className="flex min-w-0 flex-wrap items-start justify-between gap-2 py-3 first:pt-0 last:pb-0">
-      <div className="min-w-0 space-y-0.5">
-        <p className="truncate font-medium">{share.email}</p>
-        <p className="truncate text-xs text-muted-foreground">
-          {t("access:shares.runtimeTarget", { name })}
-        </p>
-      </div>
-      <Button type="button" variant="outline" size="touch" onClick={() => setConfirmOpen(true)}>
-        {t("access:shares.remove")}
-      </Button>
-      <ConfirmAction
-        open={confirmOpen}
-        onOpenChange={setConfirmOpen}
-        title={t("access:shares.removeRuntimeTitle", { runtime: name, email: share.email })}
-        description={t("access:shares.removeRuntimeDescription")}
-        confirmLabel={t("access:shares.remove")}
-        isPending={remove.isPending}
-        onConfirm={() => remove.mutate({ shareId: share.id })}
-      />
-    </div>
   );
 }
 

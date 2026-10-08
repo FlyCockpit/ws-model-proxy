@@ -1546,6 +1546,249 @@
         "forgetHint": "Se quitan los ajustes aprendidos y los encabezados quitados, y se vuelven a aprender de las siguientes respuestas del motor. No se crea una versión nueva.",
         "forgotten": "Se olvidaron los ajustes aprendidos."
       }
+    },
+    "kindChoice": {
+      "label": "¿Cómo se ejecuta?",
+      "ALWAYS_ON": {
+        "title": "Ya en ejecución (siempre activo)",
+        "hint": "Un servidor que ejecutas tú. wsmp se conecta a su dirección y nunca lo inicia ni lo detiene."
+      },
+      "STARTABLE": {
+        "title": "Iniciable",
+        "hint": "wsmp lo inicia y lo detiene en tus nodos cuando tú o un perfil lo piden."
+      },
+      "serviceStartable": "Un servicio sin modelos siempre es iniciable."
+    },
+    "specForm": {
+      "view": "Vista de la definición",
+      "formTab": "Formulario",
+      "jsonTab": "JSON",
+      "fixJsonFirst": "Corrige el JSON antes de volver al formulario.",
+      "servesLabel": "Qué ejecuta",
+      "serves": "Sirve modelos",
+      "service": "Servicio (sin modelos)",
+      "serving": "Servicio de modelos",
+      "api": "API",
+      "apis": {
+        "openai": "Compatible con OpenAI",
+        "anthropic": "Anthropic Messages"
+      },
+      "engine": "Motor",
+      "engines": {
+        "vllm": "vLLM",
+        "sglang": "SGLang",
+        "llama_cpp": "llama.cpp",
+        "ollama": "Ollama",
+        "lm_studio": "LM Studio",
+        "other": "Otro"
+      },
+      "modelType": "Tipo de modelo",
+      "modelTypes": {
+        "llm": "Modelo de lenguaje",
+        "embeddings": "Embeddings",
+        "transcription": "Transcripción"
+      },
+      "models": "Modelos servidos",
+      "modelsDiscovered": "Opcional: déjalo vacío y el nodo lista los modelos que informa el servidor.",
+      "modelId": "ID del modelo",
+      "removeModel": "Quitar este modelo",
+      "addModel": "Agregar un modelo",
+      "declareCapabilities": "Declarar capacidades (si no, se detectan)",
+      "expandMedia": "Expansión de medios",
+      "expandMediaValues": {
+        "auto": "Automática",
+        "on": "Activada",
+        "off": "Desactivada"
+      },
+      "address": "Dirección",
+      "addressHint": "Dónde el nodo llega al servidor: localhost o una dirección IP, con el prefijo de la API (por ejemplo /v1).",
+      "baseUrl": "URL base",
+      "launch": "Lanzamiento",
+      "management": "Se administra como",
+      "process": "Proceso (el nodo lo ejecuta y lo detiene)",
+      "serviceUnit": "Servicio (comandos de inicio, parada y estado)",
+      "groupSize": "Nodos por instancia",
+      "groupSizeHint": "Más de 1 ejecuta una instancia en varios nodos.",
+      "labels": "Etiquetas de nodo",
+      "labelsHint": "Solo se usan nodos con todas las etiquetas. Sepáralas con comas.",
+      "fixedPort": "Puerto fijo",
+      "fixedPortHint": "Déjalo vacío para usar un puerto libre del rango del nodo (el marcador port en los comandos).",
+      "fabric": "Red de interconexión",
+      "fabricHint": "Opcional: la red que deben compartir todos los nodos de una instancia.",
+      "resources": "Recursos",
+      "resourcesHint": "Lo que una posición reserva en su nodo mientras se ejecuta.",
+      "resourceKind": "Tipo",
+      "resourceKinds": {
+        "discrete": "GPU",
+        "unified": "Memoria unificada",
+        "cpu": "CPU y RAM",
+        "none": "Nada (sin presupuesto)"
+      },
+      "memoryGb": "Memoria (GiB)",
+      "gpuCount": "GPU",
+      "vramGb": "VRAM por GPU (GiB)",
+      "ramGb": "RAM (GiB)",
+      "vendor": "Fabricante de GPU",
+      "anyVendor": "Cualquiera",
+      "vendors": {
+        "nvidia": "NVIDIA",
+        "amd": "AMD",
+        "intel": "Intel",
+        "apple": "Apple",
+        "other": "Otro"
+      },
+      "optional": "Opcional",
+      "everyRank": "Todos los nodos",
+      "rank": "Nodo {{number}}",
+      "perRank": "Definir por nodo",
+      "sameForEveryRank": "Igual para todos los nodos",
+      "commands": "Comandos",
+      "commandsHint": "Los comandos pueden usar marcadores como port y memory_fraction, entre llaves dobles. En runtimes de un solo nodo, escucha en 127.0.0.1.",
+      "commandFields": {
+        "start": "Inicio",
+        "stop": "Parada",
+        "prepare": "Preparación",
+        "afterJoin": "Tras unirse",
+        "status": "Estado",
+        "health": "Salud"
+      },
+      "timeouts": "Tiempos límite (segundos)",
+      "timeoutsHint": "Vacío usa el valor predeterminado mostrado. Las descargas van en Preparación, que puede durar más.",
+      "readiness": "Disponibilidad",
+      "readinessEnabled": "Comprobar una ruta HTTP antes de considerarlo listo",
+      "readinessPath": "Ruta",
+      "readinessStatus": "Estado esperado",
+      "readinessTimeout": "Rendirse después de (ms)",
+      "health": "Comprobaciones de salud",
+      "healthFields": {
+        "intervalMs": "Cada (ms)",
+        "failureThreshold": "Fallos antes de no saludable",
+        "successThreshold": "Éxitos antes de saludable"
+      },
+      "kept": "Las credenciales de la dirección, los secretos del nodo, los pasos interactivos, los contratos de embeddings y los perfiles de transcripción no tienen campos aquí: se conservan como están (edítalos en JSON). El lector de métricas está en Avanzado.",
+      "wrongKind": {
+        "ALWAYS_ON": "Un runtime siempre activo tiene una dirección y no tiene lanzamiento.",
+        "STARTABLE": "Un runtime iniciable tiene un lanzamiento y no tiene dirección."
+      },
+      "hintLive": "Misma definición: las instancias en ejecución usan esta versión de inmediato.",
+      "hintRestart": {
+        "ALWAYS_ON": "La definición cambia: el nodo se vuelve a conectar al servidor con ella.",
+        "STARTABLE": "La definición cambia: las instancias en ejecución conservan la anterior hasta que se reinicien."
+      }
+    },
+    "history": {
+      "agentWritten": "Escrita por un agente",
+      "showChanges": "Ver cambios",
+      "hideChanges": "Ocultar cambios",
+      "older": "Versiones anteriores",
+      "loadOlder": "Carga versiones anteriores para comparar esta.",
+      "diffFailed": "No se pudieron cargar los cambios.",
+      "noChanges": "Sin cambios en la definición (solo una nota).",
+      "first": "La primera versión: todo es nuevo.",
+      "diffLabel": "Cambios respecto a la versión anterior",
+      "unchanged_one": "… {{count}} línea sin cambios",
+      "unchanged_other": "… {{count}} líneas sin cambios",
+      "added": "Agregado: ",
+      "removed": "Quitado: "
+    },
+    "capabilities": {
+      "title": "Capacidades:",
+      "none": "ninguna",
+      "detected": "Detectadas",
+      "overridden": "Definidas por ti",
+      "change": "Cambiar",
+      "dialogTitle": "Capacidades de {{model}}",
+      "dialogHint": "Los pools solo envían las solicitudes que un modelo puede atender. Corrige lo que detectó el nodo si está mal.",
+      "detectedList": "Detectadas: {{list}}",
+      "useDetected": "Usar las detectadas",
+      "saved": "Capacidades guardadas.",
+      "values": {
+        "text_generation": "Texto",
+        "vision_input": "Imágenes de entrada",
+        "video_input": "Video de entrada",
+        "embedding": "Embeddings",
+        "audio_input": "Audio de entrada",
+        "audio_output": "Audio de salida",
+        "responses_api": "API Responses"
+      }
+    },
+    "metrics": {
+      "title": "Métricas por versión",
+      "hint": "Solicitudes, latencia y carga de este runtime en Actividad, por versión.",
+      "compare": "Comparar versiones",
+      "current": "Versión actual (v{{version}})",
+      "running": "v{{version}} (aún en ejecución)"
+    },
+    "sharing": {
+      "title": "Compartir",
+      "hint": "Comparte esta definición (solo lectura, todas las versiones) con personas. Pueden copiarla a sus propios nodos; tus nodos e instancias siguen siendo tuyos.",
+      "none": "No se comparte con nadie.",
+      "email": "Correo electrónico",
+      "emailInvalid": "Escribe un correo electrónico.",
+      "share": "Compartir",
+      "invitesLink": "Las invitaciones pendientes están en Acceso · Compartidos"
+    },
+    "nodePicker": {
+      "multiHint_one": "Elige un nodo, o déjalo en cualquier nodo apto.",
+      "multiHint_other": "Elige un nodo para cada uno de los {{count}} nodos (el nodo 1 dirige), o deja todos en cualquier nodo apto.",
+      "rank": "Nodo {{number}}",
+      "pickEveryRank": "Elige un nodo para cada posición, o ninguno.",
+      "pickDistinct": "Elige un nodo distinto para cada posición."
+    },
+    "reader": {
+      "title": "Lector de métricas",
+      "hint": "Cómo lee wsmp la carga (en curso, en espera, caché KV) del motor. Guardar crea una versión nueva: las instancias en ejecución la usan tras reiniciarse.",
+      "readOnly": "El nodo es dueño de esta definición, así que su lector se muestra solo para lectura.",
+      "preset": "Empezar desde",
+      "pickPreset": "Elige un punto de partida…",
+      "presets": {
+        "builtin": "El propio del motor (integrado)",
+        "vllm": "vLLM /metrics",
+        "sglang": "SGLang /metrics",
+        "llama_cpp": "llama.cpp /metrics (--metrics)",
+        "custom_route": "Ruta personalizada",
+        "custom_command": "Comando personalizado"
+      },
+      "kind": "Lector",
+      "kinds": {
+        "none": "Ninguno",
+        "builtin": "Integrado (según el motor)",
+        "route": "Ruta HTTP",
+        "command": "Comando en el nodo"
+      },
+      "route": "Ruta",
+      "routeHint": "En el puerto de la instancia, por ejemplo /metrics.",
+      "countRoute": "Ruta de conteo de tokens",
+      "countRouteHint": "Opcional: una ruta POST que cuenta los tokens de una solicitud.",
+      "command": "Comando",
+      "commandHint": "Se ejecuta en el nodo (requiere Control total) e imprime las métricas.",
+      "format": "Formato",
+      "formats": {
+        "prometheus": "Texto de Prometheus",
+        "json": "JSON"
+      },
+      "interval": "Cada (segundos)",
+      "intervalHint": "Vacío usa el valor predeterminado.",
+      "map": "Señales",
+      "mapHint": "Cada señal lee un nombre de serie de Prometheus o un puntero JSON como /queue/running.",
+      "signal": "Señal",
+      "fields": {
+        "series": "Serie",
+        "divideBy": "Dividir entre",
+        "scale": "Escala",
+        "aggregate": "Combinar"
+      },
+      "aggregates": {
+        "default": "Predeterminado",
+        "sum": "Suma",
+        "max": "Máximo",
+        "first": "Primero"
+      },
+      "addSignal": "Agregar una señal",
+      "removeSignal": "Quitar",
+      "duplicate": "Cada señal se puede leer una sola vez.",
+      "save": "Guardar lector",
+      "note": "Lector de métricas cambiado"
     }
   },
   "overview": {

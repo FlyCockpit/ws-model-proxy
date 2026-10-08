@@ -23,8 +23,9 @@ import { isConflict, isNotFound } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
 /**
- * Pool shares and invites, shared by Access → Shares (every pool) and a pool's Sharing tab
- * (that pool only). Every write here is people-only (a CSRF-checked session).
+ * Pool and runtime shares and invites, shared by Access → Shares (everything), a pool's Sharing
+ * tab (that pool only) and a runtime's sharing card. Every write here is people-only (a
+ * CSRF-checked session).
  */
 
 type SharesList = Awaited<ReturnType<AppRouterClient["access"]["shares"]["list"]>>;
@@ -512,6 +513,50 @@ function SwitchRow({
   );
 }
 
+/** One person a runtime definition is shared with, with stop sharing. */
+export function RuntimeShareRow({
+  share,
+  name,
+}: {
+  share: { id: string; runtimeId: string; email: string };
+  name: string;
+}) {
+  const { t } = useTranslation(["access"]);
+  const invalidate = useInvalidateShares();
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const remove = useMutation(
+    orpc.runtimes.shares.delete.mutationOptions({
+      onSuccess: async () => {
+        setConfirmOpen(false);
+        toast.success(t("access:shares.removed"));
+        await invalidate();
+      },
+    }),
+  );
+  return (
+    <div className="flex min-w-0 flex-wrap items-start justify-between gap-2 py-3 first:pt-0 last:pb-0">
+      <div className="min-w-0 space-y-0.5">
+        <p className="truncate font-medium">{share.email}</p>
+        <p className="truncate text-xs text-muted-foreground">
+          {t("access:shares.runtimeTarget", { name })}
+        </p>
+      </div>
+      <Button type="button" variant="outline" size="touch" onClick={() => setConfirmOpen(true)}>
+        {t("access:shares.remove")}
+      </Button>
+      <ConfirmAction
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        title={t("access:shares.removeRuntimeTitle", { runtime: name, email: share.email })}
+        description={t("access:shares.removeRuntimeDescription")}
+        confirmLabel={t("access:shares.remove")}
+        isPending={remove.isPending}
+        onConfirm={() => remove.mutate({ shareId: share.id })}
+      />
+    </div>
+  );
+}
+
 /** A pending invite: resend (a new link) or withdraw. */
 export function InviteRow({
   invite,
@@ -605,6 +650,7 @@ export function InviteRow({
   );
 }
 
+/** The invite link of an invite no e-mail went out for, shown once. */
 export function InviteLinkDialog({
   value,
   onClose,

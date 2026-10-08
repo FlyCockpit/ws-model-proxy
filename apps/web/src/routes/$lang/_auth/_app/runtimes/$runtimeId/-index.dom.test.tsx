@@ -7,6 +7,8 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 /** Runtime overview: an instance whose stop is not confirmed offers Mark as stopped. */
 
+const state = vi.hoisted(() => ({ kind: "STARTABLE" as "STARTABLE" | "ALWAYS_ON" }));
+
 vi.mock("@tanstack/react-router", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@tanstack/react-router")>();
   return {
@@ -56,16 +58,17 @@ vi.mock("@/utils/orpc", () => ({
       key: () => ["runtimes"],
       get: {
         queryOptions: () => ({
-          queryKey: ["runtimes", "get"],
+          queryKey: ["runtimes", "get", state.kind],
           queryFn: async () => ({
             id: "rt-1",
             name: "LLM",
             slug: "llm",
-            kind: "STARTABLE",
+            kind: state.kind,
             service: false,
             origin: "SERVER",
-            currentVersion: { version: 1 },
+            currentVersion: { id: "v-1", version: 1 },
             servedModels: [],
+            shares: [],
             instanceList: [
               instance("stuck", { needsOperator: "MARK_STOPPED" }),
               instance("stopping", {}),
@@ -76,6 +79,10 @@ vi.mock("@/utils/orpc", () => ({
       },
       stop: { mutationOptions: () => ({ mutationFn: async () => ({}) }) },
       delete: { mutationOptions: () => ({ mutationFn: async () => ({}) }) },
+      shares: {
+        create: { mutationOptions: () => ({ mutationFn: async () => ({}) }) },
+        delete: { mutationOptions: () => ({ mutationFn: async () => ({}) }) },
+      },
       instances: {
         markStopped: { mutationOptions: () => ({ mutationFn: async () => ({}) }) },
       },
@@ -99,7 +106,33 @@ beforeAll(async () => {
 
 afterEach(cleanup);
 
+function mount() {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <QueryClientProvider client={client}>
+      <Component />
+    </QueryClientProvider>,
+  );
+}
+
 describe("runtime overview instances", () => {
+  it("offers no Start, Stop or Restart for an always-on runtime", async () => {
+    state.kind = "ALWAYS_ON";
+    mount();
+    await screen.findByText("i-stuck");
+    for (const name of ["start", "stop", "restart"])
+      expect(screen.queryByRole("button", { name: `dashboard:runtime.${name}` })).toBeNull();
+    state.kind = "STARTABLE";
+  });
+
+  it("links metrics by version and shows the sharing card", async () => {
+    mount();
+    await screen.findByText("i-stuck");
+    expect(screen.getByText("dashboard:runtime.metrics.compare")).toBeTruthy();
+    expect(screen.getByText("dashboard:runtime.sharing.title")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "dashboard:runtime.start" })).toBeTruthy();
+  });
+
   it("shows Stop not confirmed, its explanation and Mark as stopped only on that instance", async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(

@@ -16,6 +16,7 @@ import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
 import { type EffectiveView, RegistryOverrideRow } from "@/components/registry-override-row";
+import { MetricsReaderCard } from "@/components/runtimes/metrics-reader-card";
 import { RequestCompatCard } from "@/components/runtimes/request-compat-card";
 import { RequestProfileCard } from "@/components/runtimes/request-profile-card";
 import { refusalText } from "@/lib/refusal-text";
@@ -68,6 +69,15 @@ function RuntimeAdvancedPage() {
           </CardContent>
         </Card>
       ))}
+      {runtime.data.service ? null : (
+        <MetricsReaderCard
+          key={`reader-${runtime.data.currentVersion.id}`}
+          runtimeId={runtime.data.id}
+          spec={runtime.data.current.spec}
+          // A node-origin definition belongs to the node (`launch_change_on_node_origin`).
+          readOnly={runtime.data.origin === "NODE"}
+        />
+      )}
       <RequestCompatCard key={runtime.data.currentVersion.id} runtime={runtime.data} />
       <RequestProfileCard runtime={runtime.data} />
     </div>
