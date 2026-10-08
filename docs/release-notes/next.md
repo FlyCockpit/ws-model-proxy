@@ -320,6 +320,23 @@ can do the same on Full-control nodes with
 `runtime_stop {markStopped: true, confirm: "MARK_STOPPED"}`. Each mark writes
 a "marked as stopped" row in the node's activity.
 
+## Runtime starts and health
+
+- A `management: "process"` runtime no longer needs a stop command: the node's
+  stop ends everything in the rank's slice and proves it. The vLLM, SGLang and
+  llama.cpp presets drop their `stop: "true"` stub. Service runtimes still
+  need `stop` and `status`.
+- A `process` start that hands its server off (`docker compose up -d`, a
+  server that daemonizes) now fails with **process_detached** instead of
+  looking healthy while the node can neither watch nor stop it. Define such a
+  runtime as `management: "service"` with real stop and status commands.
+- An unhealthy instance shows why its last health check failed (for example
+  "answered HTTP 503" or "the serving process is not running in its unit") on
+  the runtime page and as `healthDetail` in `runtimes_get`.
+- A wsmp the server refuses for its relay protocol now stops with exit code 5
+  under the systemd service instead of restarting every 5 seconds; re-run the
+  server's install.sh, then restart it.
+
 ## Configuration
 
 ### Rate limits

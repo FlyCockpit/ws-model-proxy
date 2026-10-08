@@ -151,10 +151,13 @@ A spec has exactly one of:
     `{kind: "discrete", gpuCount, vramGb, ramGb?, vendor?}`), `labels` the node
     must carry, optional `port: {fixed}` (≥ 1024, single node only), and
     `fabric` (multi-node only).
-  - `commands` (one entry, or one per rank): `start` and `stop` required;
-    `prepare`, `afterJoin`, `status`, `health`, `interactive` (steps a person
-    completes in a terminal; they need `management: "service"` for start or
-    afterJoin, and a `status` command) and `timeoutsSec` (prepare ≤ 24 h,
+  - `commands` (one entry, or one per rank): `start` required; `stop`
+    required for `service` and for an interactive stop, optional for `process`
+    (the node's stop ends everything in the rank's slice and proves it, so a
+    process runtime needs no stop command of its own); `prepare`, `afterJoin`,
+    `status`, `health`, `interactive` (steps a person completes in a
+    terminal; they need `management: "service"` for start or afterJoin, and a
+    `status` command) and `timeoutsSec` (prepare ≤ 24 h,
     default 1 h; start and afterJoin ≤ 1 h, default 15 min; stop default 5 min;
     status default 1 min). Commands may use `{{port}}`, `{{node_rank}}`,
     `{{nnodes}}`, `{{dist_port}}`, `{{memory_gb}}`, `{{gpu_ids}}`,

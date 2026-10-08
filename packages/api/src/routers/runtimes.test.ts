@@ -191,6 +191,45 @@ describe("runtimes.presets", () => {
   });
 });
 
+describe("launch.commands stop", () => {
+  const launch = SPEC.launch as NonNullable<RuntimeSpec["launch"]>;
+  const withCommands = (
+    management: "process" | "service",
+    commands: NonNullable<RuntimeSpec["launch"]>["commands"][number],
+  ): RuntimeSpec => ({ ...SPEC, launch: { ...launch, management, commands: [commands] } });
+  const issuePaths = (spec: RuntimeSpec) =>
+    runtimeSpecSchema.safeParse(spec).error?.issues.map((issue) => issue.path) ?? [];
+
+  it("may be left out of a process runtime: the node's slice kill and proof stop it", () => {
+    expect(runtimeSpecSchema.safeParse(withCommands("process", { start: "run" })).success).toBe(
+      true,
+    );
+    // The presets no longer carry a stub `stop: "true"`.
+    for (const preset of RUNTIME_PRESET_LIST)
+      if (preset.spec.launch?.management === "process")
+        expect(preset.spec.launch.commands[0]?.stop, preset.id).toBeUndefined();
+  });
+
+  it("is required for a service runtime and for an interactive stop", () => {
+    expect(issuePaths(withCommands("service", { start: "run", status: "check" }))).toContainEqual([
+      "launch",
+      "commands",
+      0,
+      "stop",
+    ]);
+    expect(
+      issuePaths(
+        withCommands("process", { start: "run", status: "check", interactive: { stop: true } }),
+      ),
+    ).toContainEqual(["launch", "commands", 0, "interactive", "stop"]);
+    expect(
+      runtimeSpecSchema.safeParse(
+        withCommands("service", { start: "run", stop: "halt", status: "check" }),
+      ).success,
+    ).toBe(true);
+  });
+});
+
 describe("launch.secrets", () => {
   const withSecrets = (secrets: string[]) => ({
     ...SPEC,

@@ -364,7 +364,10 @@ pub enum Resource {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Commands {
     pub start: String,
-    pub stop: String,
+    /// Optional for a `process` runtime (its stop is the rank's slice kill
+    /// and the node's proof); a `service` runtime must have one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepare: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -491,6 +491,30 @@ fn a_service_start_may_hand_its_server_off() {
 }
 
 #[test]
+fn a_process_stop_without_a_stop_command_is_the_slice_kill_and_the_proof() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    let without = |phase| {
+        let mut job = job(phase);
+        job.stop_command = String::new();
+        job.spec["launch"]["commands"][0]
+            .as_object_mut()
+            .expect("commands")
+            .remove("stop");
+        job
+    };
+    executor.execute(without(JobPhase::Start), &runtime, deadline());
+    let stopped = executor.execute(without(JobPhase::Stop), &runtime, deadline());
+    assert!(stopped.stopped, "{stopped:?}");
+    assert_eq!(
+        runtime.slice_stops.borrow().as_slice(),
+        ["wsmp_i_abcdefabcdef_r0.slice"]
+    );
+}
+
+#[test]
 fn a_prepare_without_a_command_runs_nothing() {
     let root = tempfile::tempdir().expect("root");
     let path = root.path().join("in1-r0.json");

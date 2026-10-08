@@ -438,3 +438,21 @@ fn shared_render_vectors() {
         }
     }
 }
+
+#[test]
+fn a_process_runtime_without_a_stop_command_renders_an_empty_stop() {
+    let mut without = spec("vllm serve m --port {{port}}", 1);
+    without["launch"]["commands"][0]
+        .as_object_mut()
+        .expect("commands")
+        .remove("stop");
+    let (store, hash) = store_with(without);
+    let mut stop = job(&hash, 0, 1);
+    stop.phase = JobPhase::Stop;
+    let rendered = render(&stop, TrustValue::Full, &store, &facts("eth0")).expect("rendered");
+    assert_eq!(rendered.command, "");
+    assert_eq!(rendered.stop_command, "");
+    let start =
+        render(&job(&hash, 0, 1), TrustValue::Full, &store, &facts("eth0")).expect("rendered");
+    assert_eq!(start.stop_command, "");
+}

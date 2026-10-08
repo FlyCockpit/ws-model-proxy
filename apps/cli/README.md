@@ -180,8 +180,9 @@ can use one for its auth header.
 The server asks a node to do two different kinds of work:
 
 - **Runtimes** are definitions the server stores and versions: an always-on model server already
-  running here, or a startable one (or a service) with start, stop, readiness and health
-  commands. The server sends the definitions to the node, then starts and stops instances by
+  running here, or a startable one (or a service) with start, readiness and health commands,
+  and a stop command where it needs one (a `process` runtime may leave it out: the node's stop
+  ends everything in the rank's systemd slice and proves it). The server sends the definitions to the node, then starts and stops instances by
   version; the node renders each command from the definition it holds, so a start never runs
   text it was not given in a definition. At Relay only, the held definitions are frozen and can
   still be started and stopped.

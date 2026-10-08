@@ -1016,7 +1016,7 @@ mod tests {
                 "launch": {
                     "management": "process", "groupSize": 1,
                     "resources": [{ "kind": "none" }], "labels": [],
-                    "commands": [{ "start": "x", "stop": "true" }],
+                    "commands": [{ "start": "x" }],
                     "readiness": { "path": "/", "expectedStatus": 200, "timeoutMs": 20000 },
                     "health": { "intervalMs": 30000, "failureThreshold": 3, "successThreshold": 1 }
                 }
