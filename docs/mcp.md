@@ -461,7 +461,7 @@ rebuilt onto the configured canonical origin:
   including every header nominated by `Connection` — while method, path,
   query, body, `Authorization`, and the allowed `Origin` are preserved.
 
-Deployments behind a proxy must preserve `Host` (or configure the ingress so
+Servers behind a proxy must preserve `Host` (or configure the ingress so
 the direct host is allowlisted and `X-Forwarded-Host` is exactly the canonical
 public host).
 
@@ -559,7 +559,7 @@ level is the person's choice:
   again. A concurrent change to the same grant is retried on the fresh row.
 - **Access → Agents.** A person changes a connection between Read-only and
   Full (`access.oauthGrants.setLevel`, a human procedure: cookie session with a
-  verified CSRF header; agents and MCP tokens are refused). Raising asks for
+  verified CSRF header; agents and agent tokens are refused). Raising asks for
   confirmation, showing what Full allows. Full is offered (and accepted) only
   for a connection whose remembered approval includes `mcp:write`
   (`fullAvailable` in the list); otherwise the page says the agent must
@@ -769,7 +769,7 @@ starts an immediate sweep that will remove artifacts already past eligibility
   restart, and clients exceeding a bucket get `429` with a `Retry-After`
   header. Statelessness removes session affinity, not the need for
   distributed limiting: the documented ceilings assume a **single-process
-  deployment** — when replicas scale horizontally, every in-memory ceiling
+  server** — when replicas scale horizontally, every in-memory ceiling
   effectively multiplies by the replica count, so arrange shared enforcement
   before relying on fleet-wide ceilings. Distributed rate limiting is out of
   scope for this release.
@@ -991,7 +991,7 @@ When bumping the Better Auth family (`better-auth`, `@better-auth/mcp`,
 
 ## Manual MCP Inspector smoke checklist
 
-Operator procedure, not a unit test. Run against a deployment that leaves
+Operator procedure, not a unit test. Run against a server that leaves
 `WMP_MCP_ENABLED` at its default of true:
 
 1. Discovery — all four well-known aliases return metadata; the RFC 7591

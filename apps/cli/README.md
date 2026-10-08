@@ -14,9 +14,9 @@
 
 > The node client for WS Model Proxy 0.4.0.
 
-`wsmp` turns a machine into a **node** of your WS Model Proxy server. It keeps one outbound
-websocket to the server (no port forwarding), relays model requests to the model servers on this
-machine, and, when you allow it, runs the runtimes, commands, file operations and terminals the
+`wsmp` turns a computer into a **node** of your WS Model Proxy server. It keeps one outbound
+websocket to the server (no port forwarding), relays model requests to the runtimes on this
+node, and, when you allow it, runs the runtimes, commands, file operations and terminals the
 server asks for.
 
 0.4.0 speaks relay protocol 3.0 only.
@@ -33,7 +33,7 @@ curl -fsSL https://wsmp.example.com/install.sh | sh
 The script installs the release binary of the server's version on Linux x86_64 and ARM64 (glibc
 2.34 or newer, such as Ubuntu 22.04+ and DGX OS) and on macOS. It verifies the archive's SHA-256
 against the release's `sha256.sum` and refuses to install on any mismatch or missing checksum.
-On other machines, or when the server pins a commit (`WMP_CLI_SOURCE_REV`), it builds from source
+On other systems, or when the server pins a commit (`WMP_CLI_SOURCE_REV`), it builds from source
 with `cargo install`, which needs Rust 1.88 or newer (<https://rustup.rs>) and a C compiler.
 
 Either way the binary lands in `~/.cargo/bin` (`$CARGO_HOME/bin` when set); add it to your `PATH`
@@ -56,7 +56,7 @@ cargo install --git https://github.com/FlyCockpit/ws-model-proxy --tag v0.4.0 --
 
 ## Log in
 
-On the server's **Nodes** page, create an enrollment code, then on this machine run:
+On the server's **Nodes** page, create an enrollment code, then on this computer run:
 
 ```sh
 wsmp login https://wsmp.example.com --code wsmp_enr_...
@@ -81,8 +81,8 @@ and ending with a letter or digit. A few names are reserved because they collide
 `model`, `models`, `cli`, `clis`, `endpoint`, `endpoints`, `pool`, `pools`, `token`, `tokens`).
 Names are unique per account; a name that is taken is refused (`slug_taken`).
 
-**Replace codes** move an existing node to this machine: same node, same runtimes and traffic,
-new identity and credential (the old machine's credential stops working). Create one from the
+**Replace codes** move an existing node to this computer: same node, same runtimes and traffic,
+new identity and credential (the old computer's credential stops working). Create one from the
 node's page. `wsmp login` shows which node it replaces and asks you to type `yes`; pass
 `--replace` to confirm non-interactively. If the replaced node was Relay only, this one starts
 Relay only as well.
@@ -91,7 +91,7 @@ Relay only as well.
 a node after it has been offline for the code's window (one hour unless set), and `wsmp login`
 says so.
 
-A plain code never takes over an existing node, even on the same machine: log in again with a
+A plain code never takes over an existing node, even on the same computer: log in again with a
 new code and a new name, or use a Replace code.
 
 Logging in over an earlier enrollment for another server, or over leftovers of wsmp 0.3, is a
@@ -138,8 +138,8 @@ transient user units, which need a user manager that outlives your sessions. Ena
 loginctl enable-linger $USER
 ```
 
-Without linger the node refuses to start runtimes (the server shows why); relaying to model
-servers that already run still works.
+Without linger the node refuses to start runtimes (the server shows why); relaying to always-on
+runtimes still works.
 
 ## Trust
 
@@ -149,14 +149,14 @@ Each node gives the server one of two levels. You choose at login and can change
   write files in your home directory or the folders you allow (`wsmp config set-file-roots`;
   wsmp's own files stay off limits), open terminals, and
   set node secrets.
-- **Relay only**: the server may only send requests to model servers here and start or stop the
+- **Relay only**: the server may only send requests to runtimes here and start or stop the
   runtimes this node already holds. Definitions are frozen at the moment you lower trust; nothing
   new can be defined, run or read. Lowering also stops node commands that are running.
 
 ```sh
 wsmp trust          # show the current level
 wsmp trust relay    # lower: works from anywhere, takes effect at once
-wsmp trust full     # raise: needs you at this machine's terminal
+wsmp trust full     # raise: needs you at this node's terminal
 ```
 
 `wsmp trust full` asks you to type `full`, takes no `--yes` flag and no environment override, and
@@ -200,8 +200,8 @@ reinstall the node.
 
 ## Secrets
 
-Runtimes and model servers often need tokens. Node secrets are named `WSMP_SECRET_` followed by
-1 to 64 of `A-Z`, `0-9` and `_`. Values stay on this machine; the server only ever sees names.
+Runtimes often need tokens. Node secrets are named `WSMP_SECRET_` followed by
+1 to 64 of `A-Z`, `0-9` and `_`. Values stay on this node; the server only ever sees names.
 
 ```sh
 wsmp secret set WSMP_SECRET_HF_TOKEN   # the value is typed at a hidden prompt
@@ -211,17 +211,18 @@ wsmp secret remove WSMP_SECRET_HF_TOKEN
 
 `wsmp secret` works at either trust level (it is how a Relay-only node gets secrets) and, like
 `wsmp trust full`, only from a person's terminal. At Full control the server can also set them.
-A runtime names the secrets its commands receive in `launch.secrets`; a model server's address
-can use one for its auth header.
+A runtime names the secrets its commands receive in `launch.secrets`; an always-on runtime's
+address can use one for its auth header.
 
 ## Commands and runtimes
 
 The server asks a node to do two different kinds of work:
 
-- **Runtimes** are definitions the server stores and versions: an always-on model server already
-  running here, or a startable one (or a service) with start, readiness and health commands,
-  and a stop command where it needs one (a `process` runtime may leave it out: the node's stop
-  ends everything in the rank's systemd slice and proves it). The server sends the definitions to the node, then starts and stops instances by
+- **Runtimes** are definitions the server stores and versions: an always-on inference server
+  already running here, or a startable one (or a service) with start, readiness and health
+  commands, and a stop command where it needs one (a `process` runtime may leave it out: the
+  node's stop ends everything in that part's systemd slice and proves it). The server sends the
+  definitions to the node, then starts and stops instances by
   version; the node renders each command from the definition it holds, so a start never runs
   text it was not given in a definition. At Relay only, the held definitions are frozen and can
   still be started and stopped.
@@ -243,7 +244,7 @@ wsmp runtime test <target>     # one small request: status and latency
 a running instance's readiness route (else its model list, or a TCP connect for a service without
 readiness) and an always-on runtime's model list, and exits non-zero when the answer is not the
 expected one (3 when nothing matches). The stop proof `wsmp runtime list` shows for a stopping or
-stopped rank is the one the inventory reports: `proven`, or why not (`port_in_use`,
+stopped part of an instance is the one the inventory reports: `proven`, or why not (`port_in_use`,
 `process_alive`, `status_unknown`, ...). To check the ports it binds each one for an instant, as
 the relay does; it writes nothing and runs no definition command. Runtimes are defined in the web app or through MCP.
 

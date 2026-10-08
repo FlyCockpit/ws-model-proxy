@@ -1,9 +1,7 @@
 # Sitemap
 
-Routes of the web app (`apps/web/src/routes/`), 0.4.0 information architecture (spec §7). In the
-S0 skeleton most signed-in pages are stubs (`PageStub`) that later chunks fill in; the auth pages,
-Settings and the admin Users and Settings pages are complete. Navigation lives in
-`apps/web/src/lib/nav-items.ts`; signed-in pages render inside the app frame
+Routes of the web app (`apps/web/src/routes/`), 0.4.0 information architecture (spec §7).
+Navigation lives in `apps/web/src/lib/nav-items.ts`; signed-in pages render inside the app frame
 (`routes/$lang/_auth/_app.tsx`, `components/app-frame.tsx`).
 
 Only indexable content pages belong in `apps/server/src/seo.ts` `PUBLIC_PATHS` for `/sitemap.xml`
@@ -31,7 +29,7 @@ All require an active session (`_auth` layout).
 
 | Path | Description |
 |------|-------------|
-| `/{lang}/welcome` | Get started stepper (`?step=node\|runtime\|pool\|agent\|apiKey`, each skippable): add a node (enrollment one-liner with countdown, New code, node turns green when it connects), your model servers (New runtime from a preset or an always-on runtime), create a pool from a served model (callable ID), connect an agent (MCP URL, OAuth, agent token, first prompt), create an API key (base URL, curl). A first sign-in lands here from the Overview; Skip setup / Finish end getting started. |
+| `/{lang}/welcome` | Get started stepper (`?step=node\|runtime\|pool\|agent\|apiKey`, each skippable): add a node (enrollment one-liner with countdown, New code, node turns green when it connects), your runtimes (New runtime from a preset or an always-on runtime), create a pool from a served model (callable ID), connect an agent (MCP URL, OAuth, agent token, first prompt), create an API key (base URL, curl). A first sign-in lands here from the Overview; Skip setup / Finish end getting started. |
 | `/{lang}/overview` | KPIs (requests, errors, p95, TTFT, queue wait, cloud share; agent tests excluded), Needs-you list, nodes strip, pool cards with sparklines, getting-started checklist (each item opens its Welcome step) until done. |
 | `/{lang}/models` | Every callable ID you may use (own pools and pools shared with you with can use): `owner/pool` and, where cloud mode covers you, `owner/pool:external`; type, status, base URL, copy buttons and snippets. |
 | `/{lang}/test` | Test a callable ID or one of your served models directly (web only): chat, embeddings, transcription, live speech-to-text mic panel. `?target=` preselects a callable ID or `runtime:<runtimeId>:<model>` (the Models page's Test links). |
@@ -47,7 +45,7 @@ All require an active session (`_auth` layout).
 | `/{lang}/runtimes/new` | New runtime: preset picker (detected server, vLLM, SGLang, llama.cpp, Ollama service, systemd unit), then the definition form. |
 | `/{lang}/runtimes/{runtimeId}` | Runtime overview: instances (phase, nodes, KV meter, slots, waiting, restart window), Start (node picker, preview, confirm), Stop, Restart, Mark as stopped, served models, metrics by version, sharing. |
 | `/{lang}/runtimes/{runtimeId}/definition` | Definition form and raw JSON, version history with notes and diffs, agent-written badges, applies-live vs needs-restart hints. |
-| `/{lang}/runtimes/{runtimeId}/advanced` | Limits and advanced settings (automatic / override), metrics reader, restart settings, request compatibility (unknown-field policy, semantic fields allowed to drop, rewrite rules, header modes, extras, response shaping; Save / Reset to automatic) and what the engine accepts (described endpoints, learned fixes, stripped headers, Forget what was learned). |
+| `/{lang}/runtimes/{runtimeId}/advanced` | Limits and advanced settings (automatic / override), metrics reader, restart settings, request compatibility (unknown-field policy, semantic fields allowed to drop, rewrite rules, header modes, extras, response shaping; Save / Reset to automatic) and what the engine accepts (described API paths, learned fixes, stripped headers, Forget what was learned). |
 | `/{lang}/profiles` | Profiles: nodes, items, satisfied, pins outdated, Apply. |
 | `/{lang}/profiles/{profileId}` | Profile editor (nodes with hold lines, pinned items, Update pins), delete, and Apply → preview → Confirm. |
 | `/{lang}/nodes` | Node cards (online, trust, hold, temporary, hardware, free memory, runtimes), Add node dialog (multi-use, labels, temporary), install codes, fabrics. |
