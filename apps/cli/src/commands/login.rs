@@ -90,9 +90,7 @@ struct LoginOutput<'a> {
 }
 
 pub fn run(args: &Args) -> Result<()> {
-    if std::env::var_os(crate::trust::JOB_MARKER_ENV).is_some() {
-        anyhow::bail!("`wsmp login` cannot run from a command, job or terminal wsmp started");
-    }
+    crate::trust::refuse_in_job("wsmp login")?;
     let server_url = normalize_server_url(&args.url)?;
     if let Some(warning) = server_url_http_warning(&server_url) {
         output::diagnostic(warning)?;
@@ -596,7 +594,8 @@ fn lowering_with(
 
 /// Why this login may not clear an earlier lowering now: a relay running
 /// here keeps its Relay-only latch and writes `relay` back. (A process wsmp
-/// started never gets here: `wsmp login` refuses `WSMP_JOB` first.)
+/// started never gets here: `wsmp login` refuses one first, by the same
+/// check as `wsmp trust full`.)
 #[cfg(unix)]
 fn leftover_clear_refusal() -> Option<&'static str> {
     match crate::control::request_if_running(crate::control::ControlCommand::Status) {

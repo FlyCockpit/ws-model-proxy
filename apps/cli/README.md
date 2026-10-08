@@ -151,18 +151,24 @@ wsmp trust full     # raise: needs you at this machine's terminal
 ```
 
 `wsmp trust full` asks you to type `full`, takes no `--yes` flag and no environment override, and
-refuses to run from any process the relay started (its commands, jobs and terminals). This is a
-**best-effort guard against agents** raising their own access through the server. It is **not a
-security boundary against other code running as your user**: anything that runs as you can edit
-your files, including this CLI's configuration. If you do not trust the code on this account,
-Relay only does not make it safe.
+refuses to run from any process the relay started (its commands, jobs, runtimes and terminals).
+It counts as started by wsmp when it or an ancestor carries `WSMP_JOB`, runs in one of wsmp's
+cgroups (`wsmp.service`, `wsmp-*` units, `wsmp_i_*` runtime slices, `systemd-run` transient
+units), descends from a running relay, or itself runs as a service of your systemd user manager
+(`systemd-run --user --unit=…`). A shell in a terminal, tmux or an SSH session passes.
 
-The same refusal covers every command that changes wsmp itself: `wsmp login`, `wsmp secret set|remove`,
-the `wsmp config` setters (`init`, `set-…`, `clear-file-roots`), `wsmp service
-install|uninstall|env-sync`, `wsmp logout`, `wsmp run`, `wsmp terminal approve` and `wsmp recover
---apply`. Reading (`wsmp config show|path`, `wsmp service status|env-path`, listings) and lowering
-(`wsmp trust relay`, `wsmp terminal approvals revoke`) work from anywhere. So an agent cannot widen
-its own file roots or other settings through `wsmp config`; the same caveat applies.
+The same refusal covers every command that changes wsmp itself: `wsmp login`, `wsmp secret
+set|remove`, the `wsmp config` setters (`init`, `set-…`, `clear-file-roots`), `wsmp service
+install|uninstall|env-sync`, `wsmp logout`, `wsmp terminal approve` and `wsmp recover --apply`.
+`wsmp run` checks only `WSMP_JOB`, since the relay's own service starts it. Reading (`wsmp config
+show|path`, `wsmp service status|env-path`, listings) and lowering (`wsmp trust relay`, `wsmp
+terminal approvals revoke`) work from anywhere.
+
+This is a **best-effort guard against agents** raising or widening their own access through the
+server: dropping `WSMP_JOB` does not get past it. It is **not a security boundary against other
+code running as your user**: such code can name a unit like a terminal's scope, `ssh` back in to
+this machine, or simply edit your files, including this CLI's configuration. If you do not trust
+the code on this account, Relay only does not make it safe.
 
 Lowering only stops new agent access through wsmp. It does not undo or contain software an agent
 already left on the node while it had Full control, such as a systemd user service: that software

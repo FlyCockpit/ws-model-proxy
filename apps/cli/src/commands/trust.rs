@@ -122,8 +122,9 @@ fn lower(json: bool) -> Result<()> {
 }
 
 fn raise(json: bool) -> Result<()> {
-    if let Some(refusal) = crate::trust::caller_marker_refusal() {
-        anyhow::bail!("{refusal}");
+    // Checked before asking, and again by a running relay on its socket peer.
+    if crate::trust::self_started_by_wsmp().is_some() {
+        anyhow::bail!("`wsmp trust full` cannot run from a command, job or terminal wsmp started");
     }
     anyhow::ensure!(
         std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
@@ -151,10 +152,7 @@ fn raise(json: bool) -> Result<()> {
     let (changed, running) = match control::request_if_running(ControlCommand::TrustFull)? {
         Some(response) => (answer_ok(&response)?, true),
         None => {
-            // No relay to check this process: check it here, the same way.
-            #[cfg(unix)]
-            crate::trust::peer_may_raise(i32::try_from(std::process::id()).unwrap_or(0), 0)
-                .map_err(|reason| anyhow::anyhow!("{reason}"))?;
+            // No relay to check this process: checked here above, the same way.
             crate::trust::persist_full()?;
             (true, false)
         }

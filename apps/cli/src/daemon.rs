@@ -747,7 +747,7 @@ fn answer_control_requests(
             ControlCommand::TrustFull => {
                 // No peer pid, no raise.
                 let allowed = pending.peer_pid.is_some_and(|pid| {
-                    crate::trust::peer_may_raise(pid, std::process::id()).is_ok()
+                    crate::trust::started_by_wsmp(pid, std::process::id()).is_ok()
                 });
                 let response = if !allowed {
                     tracing::warn!("refused a trust raise from a process wsmp started");

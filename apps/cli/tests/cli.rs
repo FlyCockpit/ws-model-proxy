@@ -2423,3 +2423,67 @@ fn hardware_reports_this_machine_as_json() {
     assert!(detected["gpus"].is_array(), "{report}");
     assert!(detected["notes"].is_array(), "{report}");
 }
+
+/// Real system (Linux with a systemd user manager; run with `--ignored`):
+/// `wsmp trust full` works from a person's ordinary terminal, whose
+/// ancestors include the unreadable user manager or sshd, and is refused
+/// from a `systemd-run --user --unit` service that dropped `WSMP_JOB`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs a systemd user manager and `script`"]
+fn trust_full_from_a_terminal_but_not_from_a_user_service() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({ "version": 1, "serverUrl": "https://wsmp.example.com", "trust": "full", "endpoints": [] }),
+    );
+    cli(&config, &state)
+        .args(["trust", "relay"])
+        .assert()
+        .success();
+    let wsmp = assert_cmd::cargo::cargo_bin("wsmp");
+    // A user service, with the marker dropped: refused before any prompt.
+    let unit = format!("provtest-{}", std::process::id());
+    let refused = std::process::Command::new("systemd-run")
+        .args(["--user", "--quiet", "--wait", "--pipe", "--collect"])
+        .arg(format!("--unit={unit}"))
+        .arg(format!("--setenv=WSMP_CONFIG={}", config.display()))
+        .arg(format!("--setenv=WSMP_STATE_DIR={}", state.display()))
+        .args(["env", "-u", "WSMP_JOB"])
+        .arg(&wsmp)
+        .args(["trust", "full"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("systemd-run");
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("cannot run from a command"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    // A terminal (a pty from `script`) in this shell: raised.
+    let command = format!(
+        "WSMP_CONFIG='{}' WSMP_STATE_DIR='{}' '{}' trust full",
+        config.display(),
+        state.display(),
+        wsmp.display()
+    );
+    let raised = std::process::Command::new("script")
+        .args(["-qec", &command, "/dev/null"])
+        .env_remove("WSMP_JOB")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            child.stdin.take().expect("stdin").write_all(b"full\n")?;
+            child.wait_with_output()
+        })
+        .expect("script");
+    let out = String::from_utf8_lossy(&raised.stdout);
+    assert!(out.contains("trust: now full control"), "{out}");
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["trust"], "full");
+}
