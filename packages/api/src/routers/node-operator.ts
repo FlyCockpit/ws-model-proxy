@@ -26,6 +26,7 @@ import {
 } from "../contracts/nodes";
 import { callerActor } from "../lib/caller-actor";
 import { commandAuditSubject } from "../lib/command-audit";
+import { notifyQueuedCommand } from "../lib/needs-you-mail";
 import {
   type NodeCommandRow,
   nodeCommandSelect,
@@ -514,7 +515,9 @@ const queued = {
       },
       select: queuedSelect,
     });
-    // TODO(server): notify the person (Needs you / e-mail) that a command waits for them.
+    // Needs you: e-mail the person (when SMTP and their alerts are on). Never awaited, never
+    // throws: the agent's call does not wait on SMTP.
+    void notifyQueuedCommand({ userId, nodeSlug: node.slug, now });
     return queuedView(row, now);
   }),
 

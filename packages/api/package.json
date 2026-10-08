@@ -26,6 +26,9 @@
     "./lib/runtime-store": {
       "default": "./src/lib/runtime-store.ts"
     },
+    "./lib/needs-you-mail": {
+      "default": "./src/lib/needs-you-mail.ts"
+    },
     "./nodes/fabrics": {
       "default": "./src/nodes/fabrics.ts"
     },
