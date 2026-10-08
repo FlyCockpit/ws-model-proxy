@@ -763,6 +763,7 @@ export const RUNTIME_JOB_ERRORS = [
  */
 export const STOP_PROOF_FAILURES = [
   "process_alive",
+  "process_unknown",
   "status_running",
   "status_unknown",
   "port_in_use",

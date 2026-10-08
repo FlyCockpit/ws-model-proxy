@@ -1072,6 +1072,7 @@
         "checkProven": "Detención confirmada",
         "loadFailed": "No se pudo cargar lo que sabe wsmp sobre esta detención.",
         "reason": {
+          "process_unknown": "El nodo no pudo saber si aún se ejecuta un proceso del servicio",
           "process_alive": "Un proceso del servicio sigue en ejecución",
           "status_running": "El comando de estado indica que está en ejecución",
           "status_unknown": "El comando de estado no pudo determinarlo",

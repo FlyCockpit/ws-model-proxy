@@ -361,6 +361,7 @@ fn job(action: JobPhase) -> Job {
         handle: "i-abcdefabcdef".into(),
         port: 30001,
         gpu_ids: None,
+        dist_port: None,
         host: "127.0.0.1".into(),
         spec: serde_json::json!({
             "api": "openai", "engine": "vllm", "modelType": "llm",
@@ -665,8 +666,10 @@ fn an_interactive_stop_runs_its_command_once_then_proves_the_stop() {
         machine.shells.borrow().is_empty(),
         "the stop command is never run again by the node"
     );
+    // The inventory runs no command in the rank's slice (it holds no rank lock): a service,
+    // proven only by its status command, is never reported stopped from there.
     let observed = executor.observations(&machine, Deadline::new(Duration::from_secs(1)));
-    assert_eq!(observed[0].1.phase, InstancePhase::Stopped);
+    assert_eq!(observed[0].1.phase, InstancePhase::Unknown);
 }
 
 #[test]

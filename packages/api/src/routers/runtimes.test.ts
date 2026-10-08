@@ -1221,6 +1221,43 @@ describe("runtimes.instances.markStopped", () => {
     expect(db.instanceRank.updateMany).not.toHaveBeenCalled();
   });
 
+  it("points a rank already marked stopped to the automatic check and its last result", async () => {
+    const marked = {
+      ...stopping(["HELD_UNKNOWN", "HELD_UNKNOWN"], "STOPPED"),
+      phaseChangedAt: new Date("2026-10-07T20:00:00Z"),
+    };
+    const ranks = [
+      ...marked.Ranks.map((rank) => ({
+        ...rank,
+        markedStoppedAt: new Date("2026-10-07T19:59:00Z"),
+      })),
+      // A third rank whose node was removed: no check can run for it.
+      { id: "rank-2", rank: 2, claim: "HELD_UNKNOWN", markedStoppedAt: null, Node: null },
+    ];
+    db.runtimeInstance.findFirst.mockResolvedValueOnce({ ...marked, Ranks: ranks } as never);
+    db.instanceStep.findFirst.mockImplementation((async (args: { where: { rank: number } }) =>
+      args.where.rank === 0
+        ? {
+            instanceId: "inst-1",
+            rank: 0,
+            state: "FAILED",
+            errorCode: "health_failed",
+            updatedAt: new Date("2026-10-07T20:05:00Z"),
+          }
+        : null) as never);
+    const refused = client().instances.markStopped({ instanceId: "inst-1" });
+    await expect(refused).rejects.toMatchObject({ code: "CONFLICT" });
+    const message = await refused.catch((error: unknown) =>
+      error instanceof ORPCError ? error.message : "",
+    );
+    expect(message).toContain("Already marked stopped");
+    expect(message).toContain("every 5 minutes");
+    expect(message).toContain(
+      "node 1: not proven at 2026-10-07T20:05:00.000Z (health_failed); node 2: no check has finished yet; node 3: its node was removed, so no check can run",
+    );
+    expect(db.instanceRank.updateMany).not.toHaveBeenCalled();
+  });
+
   it("marks the held ranks stopped under the owner and capacity fences, audited as MARK_STOPPED", async () => {
     db.runtimeInstance.findFirst.mockResolvedValueOnce(stopping(["HELD", "HELD"]) as never);
     db.runtimeOperation.create.mockResolvedValueOnce({ id: "op-f" } as never);
@@ -1251,6 +1288,27 @@ describe("runtimes.instances.markStopped", () => {
         attempts: 0,
       },
       data: { state: "CANCELLED", operatorHold: null },
+    });
+  });
+});
+
+describe("runtimes.get: instances that still hold resources", () => {
+  it("lists a stopped instance while a rank of it is still reserved", async () => {
+    db.runtime.findFirst.mockResolvedValue(runtimeRow() as never);
+    db.runtimeInstance.findMany.mockResolvedValue([]);
+    await client()
+      .get({ runtimeId: "rt-1" })
+      .catch(() => undefined);
+    const listed = db.runtimeInstance.findMany.mock.calls.find(
+      (call) => call[0]?.where?.runtimeId === "rt-1",
+    );
+    expect(listed?.[0]?.where).toEqual({
+      runtimeId: "rt-1",
+      userId: OWNER,
+      OR: [
+        { NOT: { desiredState: "STOPPED", phase: "STOPPED" } },
+        { Ranks: { some: { claim: { in: ["HELD", "HELD_UNKNOWN"] } } } },
+      ],
     });
   });
 });

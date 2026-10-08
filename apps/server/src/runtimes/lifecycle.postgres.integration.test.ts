@@ -37,6 +37,9 @@ integration("runtime lifecycle (PostgreSQL)", () => {
   /** A service whose stop a person runs in an operator terminal. */
   let stopperRuntimeId = "";
   let stopperVersionId = "";
+  /** A runtime whose stop, status and health commands are all the stub `true`. */
+  let stubRuntimeId = "";
+  let stubVersionId = "";
   const sent: Job[] = [];
   const session = { connectionGeneration: 1, trust: "full" as "full" | "relay", online: true };
   /** The fake relay's operator-terminal side. */
@@ -198,6 +201,54 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     });
   });
 
+  beforeAll(async () => {
+    const db = m.fixture;
+    const stub = await db.runtime.create({
+      data: { userId, slug: `lct-${suffix}`, name: "LCT", kind: "STARTABLE", origin: "SERVER" },
+    });
+    stubRuntimeId = stub.id;
+    const version = await db.runtimeVersion.create({
+      data: {
+        runtimeId: stubRuntimeId,
+        version: 1,
+        editor: "USER",
+        editorUserId: userId,
+        contentHash: hex(`content-stub-${suffix}`),
+        launchHash: hex(`launch-stub-${suffix}`),
+        spec: {
+          api: "openai",
+          engine: "other",
+          modelType: "llm",
+          models: [{ id: "m" }],
+          launch: {
+            management: "process",
+            groupSize: 1,
+            resources: [{ kind: "none" }],
+            labels: [],
+            commands: [
+              {
+                start: "python3 -m http.server {{port}}",
+                stop: "true",
+                status: "true",
+                health: "true",
+              },
+            ],
+            readiness: { path: "/", expectedStatus: 200, timeoutMs: 60_000 },
+            health: { intervalMs: 15_000, failureThreshold: 2, successThreshold: 1 },
+          },
+        },
+        api: "OPENAI",
+        engine: "OTHER",
+        modelType: "LLM",
+      },
+    });
+    stubVersionId = version.id;
+    await db.runtime.update({
+      where: { id: stubRuntimeId },
+      data: { currentVersionId: stubVersionId },
+    });
+  });
+
   afterAll(async () => {
     if (!m) return;
     await retireEngines();
@@ -255,7 +306,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
   async function startInstance(
     port: number,
     startedBy: "USER" | "AGENT" = "USER",
-    which: "plain" | "operator" | "stopper" = "plain",
+    which: "plain" | "operator" | "stopper" | "stub" = "plain",
   ) {
     const db = m.fixture;
     const operation = await db.runtimeOperation.create({
@@ -275,7 +326,9 @@ integration("runtime lifecycle (PostgreSQL)", () => {
         ? [operatorRuntimeId, operatorVersionId]
         : which === "stopper"
           ? [stopperRuntimeId, stopperVersionId]
-          : [runtimeId, versionId];
+          : which === "stub"
+            ? [stubRuntimeId, stubVersionId]
+            : [runtimeId, versionId];
     await db.runtimeInstance.create({
       data: {
         id,
@@ -524,6 +577,81 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     expect(
       await m.fixture.instanceRank.count({
         where: { nodeId, port: 30_111, claim: { not: "RELEASED" } },
+      }),
+    ).toBe(0);
+  });
+
+  /**
+   * The state spark-1958 was left in (live report on a6f2bbfb): a runtime whose stop, status and
+   * health commands are all `true`. Its stop step hung RUNNING (the old node waited for status to
+   * say stopped), a person marked it stopped while STOPPING, it settled STOPPED with nobody asked
+   * and the rank HELD_UNKNOWN, and every probe of the old node failed (`health_failed`). Once the
+   * node runs the fixed CLI (no process left, port free: proven whatever status says), the next
+   * sweep's probe releases the hold with no person.
+   */
+  it("releases a stub runtime's rank marked stopped once the node proves the stop", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_112, "USER", "stub");
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "start"), "succeeded");
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "readiness"), "succeeded");
+    expect((await instance(id)).phase).toBe("READY");
+    await m.fixture.runtimeInstance.update({
+      where: { id },
+      data: { desiredState: "STOPPED", phase: "STOPPING", phaseReason: "stop_requested" },
+    });
+    await lc.runOnce();
+    const hung = lastJob(id, "stop");
+    // Marked stopped while the stop still runs (what instances.markStopped writes).
+    await m.fixture.instanceRank.updateMany({
+      where: { instanceId: id, claim: "HELD" },
+      data: { claim: "HELD_UNKNOWN", markedStoppedAt: new Date(), markedStoppedBy: userId },
+    });
+    await lc.runOnce();
+    let row = await instance(id);
+    expect(row.phase).toBe("STOPPED");
+    expect(row.needsOperator).toBeNull();
+    expect(row.Ranks[0]?.claim).toBe("HELD_UNKNOWN");
+    // The hung stop fails at its deadline; the old node's probes fail too. Nothing is released.
+    await answer(lc, hung, "failed", { error: "command_failed" });
+    await lc.runOnce();
+    await lc.runOnce();
+    const old = lastJob(id, "status");
+    await lc.handleJobResult(ref(), {
+      type: "runtime.job.result",
+      stepId: old.stepId,
+      instanceId: old.instanceId,
+      rank: old.rank,
+      intentHash: old.intentHash,
+      ownerEpoch: old.ownerEpoch,
+      status: "failed",
+      stopped: false,
+      error: "health_failed",
+    });
+    expect(await stepCode(old.stepId)).toBe("health_failed");
+    row = await instance(id);
+    expect(row.Ranks[0]?.claim).toBe("HELD_UNKNOWN");
+    expect(row.needsOperator).toBeNull();
+    // Deployed with the fixed node: the next sweep (5 minutes on, node online) probes again.
+    await m.fixture.instanceStep.updateMany({
+      where: { instanceId: id, phase: "STATUS" },
+      data: { updatedAt: new Date(Date.now() - 6 * 60_000) },
+    });
+    const before = sent.length;
+    await lc.runOnce();
+    await lc.runOnce();
+    const probe = sent.slice(before).find((job) => job.instanceId === id && job.phase === "status");
+    if (!probe) throw new Error("the held rank was not probed");
+    expect(probe.stepId).not.toBe(old.stepId);
+    // No process left in the rank's unit, port free: proven although status says "alive".
+    await answer(lc, probe, "succeeded", { stopped: true });
+    row = await instance(id);
+    expect(row.phase).toBe("STOPPED");
+    expect(row.Ranks[0]?.claim).toBe("RELEASED");
+    expect(
+      await m.fixture.instanceRank.count({
+        where: { nodeId, port: 30_112, claim: { not: "RELEASED" } },
       }),
     ).toBe(0);
   });

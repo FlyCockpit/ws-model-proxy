@@ -53,6 +53,10 @@ pub struct Job {
     pub unit_name: String,
     pub handle: String,
     pub port: u16,
+    /// The rank's second reserved port (`placeholders.dist_port`), when placement gave one:
+    /// the stop proof requires it free as well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dist_port: Option<u16>,
     /// The GPUs placement gave this rank (`placeholders.gpu_ids`, e.g. `0,3`): every command
     /// sees only them (`CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES`), so two runtimes on one
     /// GPU node do not collide even when their commands never name `{{gpu_ids}}`.
@@ -231,9 +235,24 @@ struct Record {
     consecutive_health_successes: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stopped_at: Option<u64>,
+    /// A step of this run ran outside the node's units (`external`: a person ran it in an
+    /// operator terminal; `self-detached`: no units on this platform). Kept after the stop
+    /// clears `invocations`, so a later check still asks its status command.
+    #[serde(default)]
+    outside_units: bool,
 }
 
 impl Record {
+    /// The run is proven stopped: its units are forgotten, but not that a step of it ran
+    /// outside them.
+    fn clear_invocations(&mut self) {
+        self.outside_units |= self
+            .invocations
+            .values()
+            .any(|invocation| outside(invocation));
+        self.invocations.clear();
+    }
+
     /// Verified stopped with nothing unresolved.
     fn terminal(&self) -> bool {
         self.phase == InstancePhase::Stopped
@@ -322,6 +341,7 @@ pub struct OperatorMark {
     phase: InstancePhase,
     pending: Option<Job>,
     job: Job,
+    outside_units: bool,
 }
 
 /// Executes the steps of one instance rank (one state file).
@@ -362,6 +382,13 @@ pub trait Runtime {
     fn tasks_alive(&self, unit: &str, deadline: Deadline) -> Result<bool>;
     /// Whether nothing listens on `port` (any address, and `host`).
     fn port_free(&self, host: &str, port: u16) -> bool;
+    /// The rank's slice was proven empty: let the manager forget it (best effort).
+    fn forget_slice(&self, _slice: &str, _deadline: Deadline) {}
+    /// A stop ends whatever still runs in the rank's slice: SIGTERM, then SIGKILL after a grace
+    /// period. Errors are logged; the proof that follows decides.
+    fn stop_slice(&self, _slice: &str, _deadline: Deadline) -> Result<()> {
+        Ok(())
+    }
 }
 
 fn owner_ok(owner: &str) -> bool {
@@ -463,11 +490,13 @@ impl Executor {
                     phase: record.phase,
                     pending: record.pending.clone(),
                     job: record.job.clone(),
+                    outside_units: record.outside_units,
                 };
                 if matches!(job.action, JobPhase::Prepare | JobPhase::Start)
                     && record.invocations.is_empty()
                 {
                     record.job = job.clone();
+                    record.outside_units = false;
                 }
                 record.pending = Some(job.clone());
                 record.phase = if job.action == JobPhase::Stop {
@@ -494,6 +523,7 @@ impl Executor {
                         consecutive_health_failures: 0,
                         consecutive_health_successes: 0,
                         stopped_at: None,
+                        outside_units: false,
                     },
                 );
                 OperatorMark {
@@ -501,6 +531,7 @@ impl Executor {
                     phase: InstancePhase::Unknown,
                     pending: None,
                     job: job.clone(),
+                    outside_units: false,
                 }
             }
         };
@@ -540,6 +571,7 @@ impl Executor {
             record.pending = mark.pending;
             record.phase = mark.phase;
             record.job = mark.job;
+            record.outside_units = mark.outside_units;
         }
         if let Err(error) = self.persist() {
             tracing::warn!(error = %format!("{error:#}"), "clearing an operator step failed");
@@ -617,15 +649,21 @@ impl Executor {
                             "stopped unit revived"
                         );
                     }
-                    if let Some(status) = job.status_command.as_deref() {
-                        anyhow::ensure!(
-                            !runtime.status_until(
-                                job,
-                                status,
-                                deadline.cap(Duration::from_secs(5))
-                            )?,
-                            "stopped service revived"
+                    // Answered again only while the stop still holds, proven afresh (the
+                    // port may have been taken since, a process may have come back).
+                    if let Some(reason) = self.stop_unproven(
+                        job,
+                        runtime,
+                        deadline.cap(Duration::from_secs(30)),
+                        true,
+                    )? {
+                        tracing::warn!(
+                            instance_id = job.instance_id,
+                            rank = job.rank,
+                            reason,
+                            "a stopped run is not proven stopped any more"
                         );
+                        return Ok(Outcome::unproven(reason));
                     }
                 }
                 return Ok(done.outcome.clone());
@@ -691,11 +729,16 @@ impl Executor {
                     consecutive_health_failures: 0,
                     consecutive_health_successes: 0,
                     stopped_at: None,
+                    outside_units: false,
                 },
             );
         }
         let record = self.state.records.get_mut(&key).context("record")?;
         if matches!(job.action, JobPhase::Prepare | JobPhase::Start) {
+            if record.invocations.is_empty() {
+                // A new run: nothing of an earlier one ran outside the units any more.
+                record.outside_units = false;
+            }
             record.job = job.clone();
         }
         record.pending = Some(job.clone());
@@ -835,13 +878,123 @@ impl Executor {
         self.complete(job, outcome)
     }
 
+    /// Why the rank's stop is not proven, or `None` when it is. Stops, status
+    /// probes, a re-delivered stop and the inventory's `stopped` all ask this
+    /// one question (the server releases a claim on any of them).
+    ///
+    /// The proof rests on what the node observes itself: no unit of the rank
+    /// (owned, or recorded by its launch) and nothing in the rank's slice
+    /// ([`rank_slice`], where every command of the rank runs) has a process
+    /// left, and every port reserved for the rank (`port`, `dist_port`) is
+    /// free. A `process` runtime runs in the node's own
+    /// units (`KillMode=control-group`): those facts are its proof, and its
+    /// status command can neither block nor replace them (a stub `true`, "alive"
+    /// forever, must not hold a claim forever). A run whose processes may live
+    /// outside the node's units also needs its status command to say stopped
+    /// (exit 3): a `service` runtime (its start may hand off to docker or a
+    /// service manager, so an empty unit and a port not yet bound prove
+    /// nothing), a serving step a person ran in an operator terminal
+    /// (`external`), and any run on a platform without units (`self-detached`).
+    ///
+    /// Reasons: `process_alive`, `process_unknown` (the user manager could not
+    /// say), `port_in_use`, `unowned_service` (outside the node's units with no
+    /// status command), `status_running`, `status_unknown`.
+    ///
+    /// `run_status`: false for the inventory, which runs nothing in a rank's slice (it holds no
+    /// rank lock): a run that needs its status command is then simply not reported stopped.
+    fn stop_unproven(
+        &self,
+        job: &Job,
+        runtime: &impl Runtime,
+        deadline: Deadline,
+        run_status: bool,
+    ) -> Result<Option<&'static str>> {
+        let record = self.state.records.get(&job.key());
+        // Every unit of the rank and its slice (every command the node ran for it: start,
+        // prepare, after-join, stop, status, health). What the launched run used is checked
+        // too: a probe rendered from another version may name other ports or commands.
+        let mut units: std::collections::BTreeSet<String> = owned_units(job).into_iter().collect();
+        units.insert(rank_slice(job));
+        let mut jobs = vec![job];
+        if let Some(record) = record {
+            units.extend(owned_units(&record.job));
+            units.insert(rank_slice(&record.job));
+            units.extend(record.invocations.keys().cloned());
+            jobs.push(&record.job);
+        }
+        let mut ports: Vec<(&str, u16)> = Vec::new();
+        let mut statuses: Vec<(&Job, &str)> = Vec::new();
+        for owner in &jobs {
+            for port in std::iter::once(owner.port).chain(owner.dist_port) {
+                if !ports.contains(&(owner.host.as_str(), port)) {
+                    ports.push((owner.host.as_str(), port));
+                }
+            }
+            if let Some(status) = owner.status_command.as_deref()
+                && !statuses.iter().any(|(_, seen)| *seen == status)
+            {
+                statuses.push((owner, status));
+            }
+        }
+        let detached = cfg!(not(target_os = "linux"))
+            || jobs
+                .iter()
+                .any(|owner| owner.management() == Management::Service)
+            || record.is_some_and(|record| {
+                record.outside_units || record.invocations.values().any(|i| outside(i))
+            });
+        if detached && statuses.is_empty() {
+            return Ok(Some("unowned_service"));
+        }
+        if detached && !run_status {
+            return Ok(Some("status_unknown"));
+        }
+        if detached {
+            for (owner, status) in statuses {
+                match runtime.status_until(owner, status, deadline.cap(Duration::from_secs(30))) {
+                    Ok(false) => {}
+                    Ok(true) => return Ok(Some("status_running")),
+                    Err(_) => {
+                        if runtime.cancelled() {
+                            return Err(fail(JobError::SessionDisconnected));
+                        }
+                        return Ok(Some("status_unknown"));
+                    }
+                }
+            }
+        }
+        // After the status command (it runs in the rank's slice too): nothing it or any
+        // other command of the rank left behind may still run.
+        for unit in &units {
+            match runtime.tasks_alive(unit, deadline) {
+                Ok(false) => {}
+                Ok(true) => return Ok(Some("process_alive")),
+                Err(_) => {
+                    deadline.remaining()?;
+                    if runtime.cancelled() {
+                        return Err(fail(JobError::SessionDisconnected));
+                    }
+                    return Ok(Some("process_unknown"));
+                }
+            }
+        }
+        if ports
+            .iter()
+            .any(|(host, port)| !runtime.port_free(host, *port))
+        {
+            return Ok(Some("port_in_use"));
+        }
+        Ok(None)
+    }
+
     /// A status probe (the server sends one when the stops of a stopping rank
-    /// failed, or for a claim marked stopped): proves the stop when nothing of the
-    /// rank's process tree runs (no owned or recorded unit has a task), its
-    /// status command (when defined) says stopped, and its port is free. It
-    /// runs nothing and needs no record (a lost record cannot block the
-    /// proof); a proof resolves the record like a verified stop. Anything
-    /// short of proof answers not stopped, saying why (`detail`).
+    /// failed, or for a claim marked stopped): proves the stop as
+    /// [`Executor::stop_unproven`] does. It runs nothing but the status command
+    /// of a run outside the node's units, and needs no record (a lost record
+    /// cannot block the proof); a proof resolves the record like a verified
+    /// stop. A re-delivered probe is proven again, never answered from history:
+    /// the machine may have changed since. Anything short of proof answers not
+    /// stopped, saying why (`detail`).
     fn prove_stopped(
         &mut self,
         job: &Job,
@@ -849,63 +1002,24 @@ impl Executor {
         deadline: Deadline,
     ) -> Result<Outcome> {
         let key = job.key();
-        let mut units: std::collections::BTreeSet<String> = owned_units(job).into_iter().collect();
-        // What the launched run used: a probe rendered from another version may name another
-        // port or status command, so both the probe's and the record's are checked.
-        let mut statuses: Vec<(&Job, &str)> = Vec::new();
-        let mut ports = vec![(job.host.as_str(), job.port)];
-        let mut detached = false;
-        if let Some(record) = self.state.records.get(&key) {
-            // A re-delivered probe is proven again, never answered from history: the machine
-            // may have changed since.
-            units.extend(record.invocations.keys().cloned());
-            detached = record
-                .invocations
-                .values()
-                .any(|invocation| invocation == "external" || invocation == "self-detached");
-            if let Some(status) = record.job.status_command.as_deref() {
-                statuses.push((&record.job, status));
-            }
-            ports.push((record.job.host.as_str(), record.job.port));
-        }
-        if let Some(status) = job.status_command.as_deref() {
-            statuses.push((job, status));
-        }
-        // A service that runs outside the node's units is proven only by its status command.
-        if detached && statuses.is_empty() {
-            return Ok(Outcome::unproven("unowned_service"));
-        }
-        for unit in &units {
-            if runtime.tasks_alive(unit, deadline)? {
-                return Ok(Outcome::unproven("process_alive"));
-            }
-        }
-        for (owner, status) in statuses {
-            match runtime.status_until(owner, status, deadline.cap(Duration::from_secs(30))) {
-                Ok(false) => {}
-                Ok(true) => return Ok(Outcome::unproven("status_running")),
-                Err(_) => return Ok(Outcome::unproven("status_unknown")),
-            }
-        }
-        if ports
-            .iter()
-            .any(|(host, port)| !runtime.port_free(host, *port))
-        {
-            return Ok(Outcome::unproven("port_in_use"));
+        if let Some(reason) = self.stop_unproven(job, runtime, deadline, true)? {
+            return Ok(Outcome::unproven(reason));
         }
         deadline.remaining()?;
+        runtime.forget_slice(&rank_slice(job), deadline);
         let now = (self.clock)();
         let Some(record) = self.state.records.get_mut(&key) else {
             return Ok(Outcome::ok(true));
         };
-        record.invocations.clear();
+        record.clear_invocations();
         record.phase = InstancePhase::Stopped;
         record.stopped_at = Some(now);
         self.complete(job, Outcome::ok(true))
     }
 
-    /// Run the stop command, stop every owned unit, then require status
-    /// (when defined) to show the service stopped. `None`: still alive.
+    /// Run the stop command, stop every owned unit, then wait (within the
+    /// step's deadline) until the stop is proven ([`Executor::stop_unproven`]).
+    /// `None`: not proven by the deadline.
     fn stop_teardown(
         &mut self,
         job: &Job,
@@ -938,14 +1052,12 @@ impl Executor {
                 );
             }
         }
+        let mut failed_units = Vec::new();
         for (unit, invocation) in units {
             if invocation != "external" && invocation != "self-detached" {
                 if let Err(error) = runtime.stop(&unit, &self.state.owner_id, &invocation, deadline)
                 {
-                    // The process is already gone (the unit was relaunched under another
-                    // invocation, or its leftovers cannot be stopped): an empty process tree is
-                    // the proof. Anything still running keeps the stop unproven.
-                    anyhow::ensure!(!runtime.tasks_alive(&unit, deadline)?, error);
+                    failed_units.push((unit, error));
                 }
             } else {
                 anyhow::ensure!(
@@ -954,16 +1066,54 @@ impl Executor {
                 );
             }
         }
-        if let Some(status) = job.status_command.as_deref() {
-            let stopped = wait_for_status(job, runtime, status, false, deadline)?;
-            if !stopped {
+        // Then everything else wsmp launched for the rank: the slice holds nothing but the
+        // rank's own commands and what they left behind (a `setsid` daemon of the stop
+        // command, say). Only a stop ends it; status and health checks never kill anything.
+        if let Err(error) = runtime.stop_slice(&rank_slice(job), deadline) {
+            tracing::warn!(
+                instance_id = job.instance_id,
+                rank = job.rank,
+                error = %format!("{error:#}"),
+                "stopping the rank's slice failed"
+            );
+        }
+        for (unit, error) in failed_units {
+            // The process is already gone (the unit was relaunched under another invocation,
+            // or its leftovers cannot be stopped): an empty process tree is the proof.
+            // Anything still running keeps the stop unproven.
+            anyhow::ensure!(!runtime.tasks_alive(&unit, deadline)?, error);
+        }
+        // A stop command that exits at once (`true`) leaves nothing to wait for once the
+        // proof holds; a status command that keeps saying "alive" does not hold a process
+        // runtime's stop until its deadline. Checks back off to one every 5 seconds.
+        let mut pause = Duration::from_millis(250);
+        loop {
+            if runtime.cancelled() {
+                return Err(fail(JobError::SessionDisconnected));
+            }
+            let reason = match self.stop_unproven(job, runtime, deadline, true) {
+                Ok(None) => break,
+                Ok(Some(reason)) => reason,
+                // Out of time inside a check: the same answer as out of time between checks.
+                Err(_) if deadline.remaining().is_err() && !runtime.cancelled() => "deadline",
+                Err(error) => return Err(error),
+            };
+            pause = (pause * 2).min(Duration::from_secs(5));
+            if deadline.sleep(pause).is_err() {
+                tracing::warn!(
+                    instance_id = job.instance_id,
+                    rank = job.rank,
+                    reason,
+                    "the stop could not be proven"
+                );
                 return Ok(None);
             }
         }
         deadline.remaining()?;
+        runtime.forget_slice(&rank_slice(job), deadline);
         let now = (self.clock)();
         let record = self.state.records.get_mut(&key).context("record")?;
-        record.invocations.clear();
+        record.clear_invocations();
         record.phase = InstancePhase::Stopped;
         record.stopped_at = Some(now);
         Ok(Some(Outcome::ok(true)))
@@ -1028,6 +1178,10 @@ impl Executor {
                 action: job.action,
             },
         );
+        record.outside_units |= record
+            .invocations
+            .values()
+            .any(|invocation| outside(invocation));
         record.pending = None;
         record.observed_step = job.step_id.clone();
         record.observed_hash = job.intent_hash.clone();
@@ -1063,12 +1217,15 @@ impl Executor {
                     && (job.management() != Management::Process
                         || serving_confirmed(record, &self.state.owner_id, runtime, deadline)
                             .is_ok_and(|alive| alive));
+                // `stopped` releases a claim on the server: reported only while the stop is
+                // proven afresh, never from empty units alone.
                 let absent = record.phase == InstancePhase::Stopped
                     && owned_units(job).iter().all(|unit| {
                         runtime
                             .identity(unit, &self.state.owner_id, deadline)
                             .is_ok_and(|seen| seen.is_none())
-                    });
+                    })
+                    && matches!(self.stop_unproven(job, runtime, deadline, false), Ok(None));
                 let phase = if absent {
                     InstancePhase::Stopped
                 } else if record.pending.is_some() || !owned {
@@ -1165,6 +1322,12 @@ impl<R: Runtime> Runtime for OperatorRan<'_, R> {
     fn port_free(&self, host: &str, port: u16) -> bool {
         self.inner.port_free(host, port)
     }
+    fn forget_slice(&self, slice: &str, deadline: Deadline) {
+        self.inner.forget_slice(slice, deadline);
+    }
+    fn stop_slice(&self, slice: &str, deadline: Deadline) -> Result<()> {
+        self.inner.stop_slice(slice, deadline)
+    }
 }
 
 /// Polls `status` until it shows `alive == want`; a failed probe is no answer.
@@ -1246,6 +1409,18 @@ pub fn phase_unit(job: &Job) -> String {
         JobPhase::AfterJoin => format!("{}-after-join", job.unit_name),
         _ => job.unit_name.clone(),
     }
+}
+
+/// A run the node did not start in a unit of its own.
+fn outside(invocation: &str) -> bool {
+    invocation == "external" || invocation == "self-detached"
+}
+
+/// The systemd user slice every command of the rank runs in (`wsmp_i_<id>_r<rank>.slice`; no
+/// `-`, which would nest it in parent slices that outlive it): the stop proof requires it
+/// empty, so nothing a command left behind (forked, `setsid`) escapes the proof.
+pub fn rank_slice(job: &Job) -> String {
+    format!("{}.slice", job.unit_name.replace('-', "_"))
 }
 
 fn owned_units(job: &Job) -> [String; 3] {

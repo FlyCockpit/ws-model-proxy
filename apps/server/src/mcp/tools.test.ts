@@ -229,6 +229,59 @@ describe("through the bound router", () => {
 });
 
 describe("errors and output", () => {
+  it("runtimes_get lists a held STOPPED instance compactly: nulls and empty lists left out", async () => {
+    const instance = {
+      id: "inst-1",
+      phase: "STOPPED",
+      phaseReason: null,
+      needsOperator: null,
+      openSteps: [],
+      ranks: [
+        {
+          nodeNumber: 1,
+          port: 30000,
+          reserved: "HELD_UNKNOWN",
+          nodeSlug: "spark-1958",
+          lastStopCheck: {
+            at: "2026-10-07T00:00:00.000Z",
+            proven: false,
+            errorCode: "port_in_use",
+          },
+        },
+      ],
+    };
+    const result = await runMcpTool(tool("runtimes_get"), {
+      dispatch: testDispatch("READ"),
+      args: { runtimeId: "rt-1", versions: true },
+      invoke: async (path) =>
+        path === "runtimes.get" ? { id: "rt-1", instanceList: [instance] } : [{ version: 1 }],
+    });
+    expect(result.isError).toBeFalsy();
+    expect(structured(result).result).toEqual({
+      id: "rt-1",
+      instanceList: [
+        {
+          id: "inst-1",
+          phase: "STOPPED",
+          ranks: [
+            {
+              nodeNumber: 1,
+              port: 30000,
+              reserved: "HELD_UNKNOWN",
+              nodeSlug: "spark-1958",
+              lastStopCheck: {
+                at: "2026-10-07T00:00:00.000Z",
+                proven: false,
+                errorCode: "port_in_use",
+              },
+            },
+          ],
+        },
+      ],
+      versions: [{ version: 1 }],
+    });
+  });
+
   it("copies a refusal's fixed message and reason", async () => {
     const result = await runMcpTool(tool("runtime_start"), {
       dispatch: testDispatch("FULL"),

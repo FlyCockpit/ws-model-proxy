@@ -71,18 +71,34 @@ terminal. Only the person runs or dismisses it, so `cancel` refuses.
 
 ### Stops that cannot be proven
 
-A stopping instance keeps its resources and port until its node proves the
-stop. When the stop steps fail (for example the stop command errors because
-the process is already gone), the server asks the node for a status probe: it
-proves the stop when no process of the rank's units is left, the `status`
-command (if any) says stopped, and the rank's port is free. The stop then
-completes with no person involved. Only when the node cannot prove it (still
-alive, or offline for 10 minutes) does the instance show `needsOperator:
-"MARK_STOPPED"`; the probe is repeated every 5 minutes, so a later proof
-still completes it. Each rank's `lastStopCheck.errorCode` says why the last
-probe failed: `process_alive`, `status_running`, `status_unknown`,
-`port_in_use`, `unowned_service` (runs outside the node's units with no
-`status` command), or `not_stopped` from a node too old to say.
+A stopping instance keeps its resources and ports until its node proves the
+stop. Every command the node runs for a rank (prepare, start, after-join,
+stop, status, health) runs in that rank's systemd user slice, so whatever a
+command leaves behind (a fork, a `setsid` daemon) stays where the node looks.
+A stop runs the stop command, stops the rank's units, then ends everything
+left in the slice (SIGTERM, then SIGKILL after 10 seconds); status and health
+checks never kill anything. On Linux these commands need the systemd user
+manager (lingering, or wsmp running as the installed `wsmp.service`).
+The node proves the stop from what it observes itself: no process is left in
+the rank's units or its slice, and every port reserved for the rank (`port`
+and the distributed port) is free. For a `process` runtime the `status`
+command is not needed for that proof and cannot block it (a stub `status:
+"true"` would say "alive" forever). A run whose processes may live outside
+the slice also needs its `status` command to say stopped (exit 3): a
+`service` runtime (a start that hands off to docker or a service manager
+escapes the slice on purpose), any step a person ran in a terminal (a
+prepare too), and any run on a node without systemd units. The same proof is
+required again before a repeated stop answers stopped and before the node's
+inventory reports a rank stopped. A stop step completes as soon as this proof holds. When the stop
+steps fail, the server asks the node for a status probe that checks the same
+proof; the stop then completes with no person involved. Only when the node
+cannot prove it (still alive, or offline for 10 minutes) does the instance
+show `needsOperator: "MARK_STOPPED"`; the probe is repeated every 5 minutes, so
+a later proof still completes it. Each rank's `lastStopCheck.errorCode` says
+why the last probe failed: `process_alive`, `process_unknown` (the node could
+not read its units), `port_in_use`, `status_running`, `status_unknown`,
+`unowned_service` (runs outside the node's units with no `status` command), or
+`not_stopped` from a node too old to say.
 
 To mark such an instance stopped, call `runtime_stop {instanceId,
 markStopped: true, confirm: "MARK_STOPPED"}` (optionally `nodeNumber` for one
@@ -91,7 +107,12 @@ Agents may do this only on Full-control nodes (`trust_relay` otherwise). The
 claim stays counted until a status probe proves the stop, but the instance
 settles STOPPED and later starts stop waiting for it (`waits_for_stop`). The
 probes go on after that, also on a STOPPED instance, and the first one that
-proves the stop releases the claim; `lastStopCheck` keeps showing why. Each
+proves the stop releases the claim; `lastStopCheck` keeps showing why.
+`runtimes_get` keeps listing a STOPPED or FAILED instance while any of its
+ranks is still reserved, with that `reserved` state and `lastStopCheck`
+(instance rows leave out null fields and empty lists: an absent field is
+null, e.g. no `nodeSlug` means the node was removed). Marking such a rank
+stopped again answers CONFLICT with the last automatic check's result. Each
 node marked stopped writes a `marked_stopped` row in the node's activity.
 
 ### Runtime definitions
@@ -115,8 +136,10 @@ A spec has exactly one of:
   `always_on_runtime`. Its health is probed automatically; `model_test`
   checks it now.
 - `launch` (a **startable** runtime: commands that start one):
-  - `management`: `process` (the node owns the process) or `service` (stop and
-    a `status` command prove it; exit 0 alive, exit 3 stopped).
+  - `management`: `process` (the node owns the process: every process stays in
+    the unit the node starts; a start that hands off to docker or a service
+    manager must be `service`) or `service` (stop and a `status` command prove
+    it; exit 0 alive, exit 3 stopped).
   - `groupSize` (1–64 nodes), `resources` (one entry, or one per rank:
     `{kind: "none"}`, `{kind: "unified", memoryGb}`, `{kind: "cpu", ramGb}` or
     `{kind: "discrete", gpuCount, vramGb, ramGb?, vendor?}`), `labels` the node

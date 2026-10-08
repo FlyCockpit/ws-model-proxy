@@ -5536,6 +5536,7 @@ mod tests {
             handle: "i-abcdefabcdef".into(),
             port: 30001,
             gpu_ids: None,
+            dist_port: None,
             host: "127.0.0.1".into(),
             spec: serde_json::json!({
                 "api": "openai", "engine": "vllm", "modelType": "llm",
