@@ -1352,6 +1352,149 @@
         "forgetHint": "Learned fixes and stripped headers are removed and learned again from the engine's next answers. No new version is made.",
         "forgotten": "Learned fixes forgotten."
       }
+    },
+    "specForm": {
+      "view": "Definition view",
+      "formTab": "Form",
+      "jsonTab": "JSON",
+      "fixJsonFirst": "Fix the JSON before switching back to the form.",
+      "servesLabel": "What it runs",
+      "serves": "Serves models",
+      "service": "Service (no models)",
+      "serving": "Serving",
+      "api": "API",
+      "apis": {
+        "openai": "OpenAI-compatible",
+        "anthropic": "Anthropic Messages"
+      },
+      "engine": "Engine",
+      "engines": {
+        "vllm": "vLLM",
+        "sglang": "SGLang",
+        "llama_cpp": "llama.cpp",
+        "ollama": "Ollama",
+        "lm_studio": "LM Studio",
+        "other": "Other"
+      },
+      "modelType": "Model type",
+      "modelTypes": {
+        "llm": "Language model",
+        "embeddings": "Embeddings",
+        "transcription": "Transcription"
+      },
+      "models": "Served models",
+      "modelsDiscovered": "Optional: leave empty and the node lists the models the server reports.",
+      "modelId": "Model ID",
+      "removeModel": "Remove this model",
+      "addModel": "Add a model",
+      "declareCapabilities": "Declare capabilities (otherwise they are detected)",
+      "expandMedia": "Media expansion",
+      "expandMediaValues": {
+        "auto": "Automatic",
+        "on": "On",
+        "off": "Off"
+      },
+      "address": "Address",
+      "addressHint": "Where the node reaches the server: localhost or an IP address, with the API prefix (for example /v1).",
+      "baseUrl": "Base URL",
+      "launch": "Launch",
+      "management": "Managed as",
+      "process": "Process (the node runs and stops it)",
+      "serviceUnit": "Service (start, stop and status commands)",
+      "groupSize": "Nodes per instance",
+      "groupSizeHint": "More than 1 runs one instance across several nodes.",
+      "labels": "Node labels",
+      "labelsHint": "Only nodes with every label are used. Separate with commas.",
+      "fixedPort": "Fixed port",
+      "fixedPortHint": "Leave empty to use a free port from the node's range (the port placeholder in commands).",
+      "fabric": "Fabric",
+      "fabricHint": "Optional: the network every node of an instance must share.",
+      "resources": "Resources",
+      "resourcesHint": "What one rank claims on its node while it runs.",
+      "resourceKind": "Kind",
+      "resourceKinds": {
+        "discrete": "GPUs",
+        "unified": "Unified memory",
+        "cpu": "CPU and RAM",
+        "none": "Nothing (no budget)"
+      },
+      "memoryGb": "Memory (GiB)",
+      "gpuCount": "GPUs",
+      "vramGb": "VRAM per GPU (GiB)",
+      "ramGb": "RAM (GiB)",
+      "vendor": "GPU vendor",
+      "anyVendor": "Any",
+      "vendors": {
+        "nvidia": "NVIDIA",
+        "amd": "AMD",
+        "intel": "Intel",
+        "apple": "Apple",
+        "other": "Other"
+      },
+      "optional": "Optional",
+      "everyRank": "Every node",
+      "rank": "Node {{number}}",
+      "perRank": "Set per node",
+      "sameForEveryRank": "Same for every node",
+      "commands": "Commands",
+      "commandsHint": "Commands may use placeholders such as port and memory_fraction, written in double braces. Bind 127.0.0.1 on single-node runtimes.",
+      "commandFields": {
+        "start": "Start",
+        "stop": "Stop",
+        "prepare": "Prepare",
+        "afterJoin": "After join",
+        "status": "Status",
+        "health": "Health"
+      },
+      "timeouts": "Timeouts (seconds)",
+      "timeoutsHint": "Empty uses the default shown. Downloads belong in Prepare, which may run longest.",
+      "readiness": "Readiness",
+      "readinessEnabled": "Check an HTTP route before it counts as ready",
+      "readinessPath": "Path",
+      "readinessStatus": "Expected status",
+      "readinessTimeout": "Give up after (ms)",
+      "health": "Health checks",
+      "healthFields": {
+        "intervalMs": "Every (ms)",
+        "failureThreshold": "Failures before unhealthy",
+        "successThreshold": "Successes before healthy"
+      },
+      "kept": "Address credentials, node secrets, interactive steps, embedding contracts and transcription profiles have no inputs here: they are kept as they are (edit them in JSON). The metrics reader is on Advanced.",
+      "wrongKind": {
+        "ALWAYS_ON": "An always-on runtime has an address and no launch.",
+        "STARTABLE": "A startable runtime has a launch and no address."
+      },
+      "hintLive": "Same definition: running instances use this version right away.",
+      "hintRestart": {
+        "ALWAYS_ON": "The definition changes: the node reconnects to the server with it.",
+        "STARTABLE": "The definition changes: running instances keep the old one until they restart."
+      }
+    },
+    "history": {
+      "agentWritten": "Agent-written",
+      "showChanges": "Show changes",
+      "hideChanges": "Hide changes",
+      "older": "Older versions",
+      "loadOlder": "Load older versions to compare this one.",
+      "diffFailed": "Couldn't load the changes.",
+      "noChanges": "No changes to the definition (only a note).",
+      "first": "The first version: everything is new.",
+      "diffLabel": "Changes against the version before",
+      "unchanged_one": "… {{count}} unchanged line",
+      "unchanged_other": "… {{count}} unchanged lines",
+      "added": "Added: ",
+      "removed": "Removed: "
+    },
+    "capabilities": {
+      "values": {
+        "text_generation": "Text",
+        "vision_input": "Images in",
+        "video_input": "Video in",
+        "embedding": "Embeddings",
+        "audio_input": "Audio in",
+        "audio_output": "Audio out",
+        "responses_api": "Responses API"
+      }
     }
   },
   "overview": {

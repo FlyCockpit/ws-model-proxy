@@ -1,7 +1,5 @@
-import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
-import { runtimeSpecSchema } from "@ws-model-proxy/api/lib/runtime-spec";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
@@ -20,11 +18,19 @@ import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
-import { FieldErrors } from "@/components/field-errors";
 import { InlineRetry } from "@/components/inline-retry";
+import { RuntimeSpecFields } from "@/components/runtimes/runtime-spec-fields";
+import { VersionHistory } from "@/components/runtimes/version-history";
 import { StatusPill } from "@/components/status-pill";
-import { TimeAgo } from "@/components/time-ago";
+import { useAppForm } from "@/hooks/use-app-form";
 import { refusalText } from "@/lib/refusal-text";
+import {
+  editorValues,
+  type RuntimeKind,
+  readSpecEditor,
+  type SpecEditorValues,
+  sameSpec,
+} from "@/lib/runtime-spec-draft";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/runtimes/$runtimeId/definition")({
@@ -37,7 +43,6 @@ function RuntimeDefinitionPage() {
   const { t } = useTranslation(["dashboard", "common"]);
   const { runtimeId } = Route.useParams();
   const runtime = useQuery(orpc.runtimes.get.queryOptions({ input: { runtimeId } }));
-  const versions = useQuery(orpc.runtimes.versions.list.queryOptions({ input: { runtimeId } }));
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
@@ -55,43 +60,7 @@ function RuntimeDefinitionPage() {
       ) : (
         <DefinitionForm key={runtime.data.currentVersion.id} runtime={runtime.data} />
       )}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">{t("dashboard:runtime.versions")}</CardTitle>
-          <CardDescription>{t("dashboard:runtime.versionsHint")}</CardDescription>
-        </CardHeader>
-        <CardContent>
-          {versions.isPending ? (
-            <Skeleton className="h-24 w-full" aria-hidden="true" />
-          ) : versions.isError ? (
-            <InlineRetry onRetry={() => versions.refetch()} />
-          ) : (
-            <ul className="flex min-w-0 flex-col divide-y">
-              {versions.data.items.map((version) => (
-                <li key={version.id} className="flex min-w-0 flex-wrap items-center gap-2 py-2">
-                  <span className="font-mono text-sm">v{version.version}</span>
-                  <StatusPill tone={version.editor.actor === "AGENT" ? "info" : "muted"}>
-                    {t(`dashboard:runtime.editor.${version.editor.actor}`)}
-                  </StatusPill>
-                  {version.launchChanged ? (
-                    <StatusPill tone="busy">{t("dashboard:runtime.needsRestartBadge")}</StatusPill>
-                  ) : (
-                    <StatusPill tone="good">{t("dashboard:runtime.appliesLive")}</StatusPill>
-                  )}
-                  <span className="text-xs text-muted-foreground">
-                    <TimeAgo value={version.createdAt} />
-                  </span>
-                  {version.note ? (
-                    <span className="min-w-0 basis-full break-words text-sm text-muted-foreground">
-                      {version.note}
-                    </span>
-                  ) : null}
-                </li>
-              ))}
-            </ul>
-          )}
-        </CardContent>
-      </Card>
+      <VersionHistory runtimeId={runtimeId} />
     </div>
   );
 }
@@ -134,42 +103,37 @@ function DefinitionForm({ runtime }: { runtime: RuntimeDetail }) {
     ...orpc.runtimes.update.mutationOptions(),
     meta: { skipGlobalErrorToast: true },
   });
-  const schema = z.object({
-    spec: z.string().superRefine((text, ctx) => {
-      let value: unknown;
-      try {
-        value = JSON.parse(text);
-      } catch {
-        ctx.addIssue({ code: "custom", message: t("dashboard:runtime.form.specNotJson") });
-        return;
-      }
-      const parsed = runtimeSpecSchema.safeParse(value);
-      if (!parsed.success) {
-        const issue = parsed.error.issues[0];
-        ctx.addIssue({
-          code: "custom",
-          message: t("dashboard:runtime.form.specInvalid", {
-            path: issue?.path.join(".") || "spec",
-            detail: issue?.message ?? "",
-          }),
-        });
-      }
-    }),
-    note: z.string().max(500),
-    restartRunning: z.boolean(),
-  });
-  const form = useForm({
+  const kind: RuntimeKind = runtime.kind;
+  const messages = {
+    notJson: t("dashboard:runtime.form.specNotJson"),
+    wrongKind: t(`dashboard:runtime.specForm.wrongKind.${kind}`),
+  };
+  const schema = z
+    .object({
+      spec: z.custom<SpecEditorValues>(),
+      note: z.string().max(500),
+      restartRunning: z.boolean(),
+    })
+    .superRefine((value, ctx) => {
+      const reading = readSpecEditor(value.spec, kind, messages);
+      if (!reading.ok)
+        for (const issue of reading.issues)
+          ctx.addIssue({ code: "custom", path: ["spec", ...issue.path], message: issue.message });
+    });
+  const form = useAppForm({
     defaultValues: {
-      spec: JSON.stringify(runtime.current.spec, null, 2),
+      spec: editorValues(runtime.current.spec),
       note: "",
       restartRunning: false,
     },
     validators: { onSubmit: schema },
     onSubmit: async ({ value }) => {
+      const reading = readSpecEditor(value.spec, kind, messages);
+      if (!reading.ok) return;
       try {
         const result = await update.mutateAsync({
           runtimeId: runtime.id,
-          spec: runtimeSpecSchema.parse(JSON.parse(value.spec)),
+          spec: reading.spec,
           ...(value.note.trim() ? { note: value.note.trim() } : {}),
           restartRunning: value.restartRunning,
         });
@@ -205,23 +169,7 @@ function DefinitionForm({ runtime }: { runtime: RuntimeDetail }) {
             form.handleSubmit();
           }}
         >
-          <form.Field name="spec">
-            {(field) => (
-              <div className="space-y-1.5">
-                <Label htmlFor="definition-spec">{t("dashboard:runtime.form.spec")}</Label>
-                <Textarea
-                  id="definition-spec"
-                  rows={22}
-                  spellCheck={false}
-                  className="font-mono text-xs"
-                  value={field.state.value}
-                  onBlur={field.handleBlur}
-                  onChange={(event) => field.handleChange(event.target.value)}
-                />
-                <FieldErrors field={field} />
-              </div>
-            )}
-          </form.Field>
+          <RuntimeSpecFields form={form} fields="spec" kind={kind} idPrefix="definition" />
           <form.Field name="note">
             {(field) => (
               <div className="space-y-1.5">
@@ -235,7 +183,7 @@ function DefinitionForm({ runtime }: { runtime: RuntimeDetail }) {
               </div>
             )}
           </form.Field>
-          {runtime.kind === "STARTABLE" ? (
+          {kind === "STARTABLE" ? (
             <form.Field name="restartRunning">
               {(field) => (
                 <div className="flex min-h-11 items-center gap-3">
@@ -251,6 +199,9 @@ function DefinitionForm({ runtime }: { runtime: RuntimeDetail }) {
               )}
             </form.Field>
           ) : null}
+          <form.Subscribe selector={(state) => state.values.spec}>
+            {(spec) => <EditHint runtime={runtime} spec={spec} messages={messages} />}
+          </form.Subscribe>
           <form.Subscribe selector={(state) => state.isSubmitting}>
             {(submitting) => (
               <Button type="submit" size="touch" disabled={submitting}>
@@ -261,5 +212,40 @@ function DefinitionForm({ runtime }: { runtime: RuntimeDetail }) {
         </form>
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * Whether saving the edit applies live: a version with the same spec keeps the launch hash,
+ * so running instances adopt it; any change to the spec is a new launch, which they only use
+ * after a restart.
+ */
+function EditHint({
+  runtime,
+  spec,
+  messages,
+}: {
+  runtime: RuntimeDetail;
+  spec: SpecEditorValues;
+  messages: { notJson: string; wrongKind: string };
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  const reading = readSpecEditor(spec, runtime.kind, messages);
+  if (!reading.ok) return null;
+  const live = sameSpec(reading.spec, runtime.current.spec);
+  return (
+    <p
+      className="flex min-w-0 flex-wrap items-center gap-2 text-sm text-muted-foreground"
+      aria-live="polite"
+    >
+      <StatusPill tone={live ? "good" : "busy"}>
+        {live ? t("dashboard:runtime.appliesLive") : t("dashboard:runtime.needsRestartBadge")}
+      </StatusPill>
+      <span className="min-w-0">
+        {live
+          ? t("dashboard:runtime.specForm.hintLive")
+          : t(`dashboard:runtime.specForm.hintRestart.${runtime.kind}`)}
+      </span>
+    </p>
   );
 }
