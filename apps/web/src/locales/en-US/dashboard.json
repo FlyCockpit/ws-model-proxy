@@ -735,6 +735,92 @@
       "insufficient_permission": "Couldn't confirm: the key may not list models, but it may still work.",
       "unverified": "Couldn't confirm: this endpoint answers without checking keys.",
       "unexpected_status": "The provider gave an unexpected answer."
+    },
+    "details": "Account",
+    "addModel": "Add a model",
+    "modelIdRequired": "Enter the model ID the provider uses.",
+    "contextWindow": "Context (tokens)",
+    "contextWindowInvalid": "A whole number of tokens, or empty.",
+    "deleteModel": "Delete {{model}}",
+    "deleteModelTitle": "Delete {{model}}?",
+    "deleteModelHint": "It leaves every pool it is a cloud member of. Its usage and price history stay.",
+    "modelDeleted": "Model deleted.",
+    "pricing": {
+      "title": "Prices of {{model}}",
+      "toggle": "Prices",
+      "loadFailed": "Couldn't load the prices.",
+      "none": "No prices yet.",
+      "noActive": "No active price",
+      "status": {
+        "DRAFT": "Draft",
+        "ACTIVE": "Active",
+        "RETIRED": "Retired"
+      },
+      "rate": {
+        "input": "Input",
+        "output": "Output",
+        "cacheRead": "Cache read",
+        "cacheWrite": "Cache write"
+      },
+      "rateValue": {
+        "input": "input {{value}}",
+        "output": "output {{value}}",
+        "cacheRead": "cache read {{value}}",
+        "cacheWrite": "cache write {{value}}"
+      },
+      "currency": "Currency",
+      "effective": "Effective",
+      "newHint": "New draft price, per million tokens. Cache prices are optional.",
+      "addDraft": "Add draft",
+      "draftAdded": "Draft price added. Activate it to use it.",
+      "rateInvalid": "A plain amount, like 0.15.",
+      "currencyInvalid": "A three-letter code, like USD.",
+      "activate": "Activate",
+      "activated": "Price activated.",
+      "retire": "Retire",
+      "retireTitle": "Retire price {{version}}?",
+      "retireHint": "The model has no active price until you activate another one.",
+      "deleteTitle": "Delete draft {{version}}?",
+      "deleteHint": "The draft is removed. Active and retired prices stay."
+    },
+    "catalog": {
+      "label": "Search the OpenRouter catalog",
+      "placeholder": "qwen, llama, embedding…",
+      "search": "Search",
+      "failed": "Couldn't search the catalog.",
+      "none": "Nothing in the catalog matches “{{query}}”.",
+      "results": "Catalog results",
+      "context": "{{tokens}} tokens of context",
+      "use": "Use",
+      "useModel": "Use {{model}}"
+    },
+    "activity": {
+      "title": "Activity",
+      "hint": "Cloud attempts and the usage they were charged for, newest first.",
+      "attempts": "Attempts",
+      "usage": "Usage",
+      "unknownModel": "Unknown model",
+      "removedModel": "Deleted model",
+      "loadFailed": "Couldn't load the activity.",
+      "noAttempts": "No cloud attempts yet.",
+      "noUsage": "No usage yet.",
+      "attemptState": {
+        "ACTIVE": "Running",
+        "COMPLETED": "Completed",
+        "FAILED": "Failed",
+        "CANCELLED": "Canceled",
+        "EXPIRED": "Expired"
+      },
+      "http": "HTTP {{status}}",
+      "tokens": "{{input}} in / {{output}} out",
+      "cost": "{{cost}} {{currency}}",
+      "noCost": "no cost recorded",
+      "confidence": {
+        "REPORTED": "reported by the provider",
+        "CALCULATED": "calculated from the price",
+        "ESTIMATED": "estimated"
+      },
+      "loadMore": "Load more"
     }
   },
   "pool": {
