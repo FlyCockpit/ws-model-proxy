@@ -20,11 +20,14 @@ vi.mock("./routes.js", () => ({
 }));
 
 import { createChatTestRoutes } from "./chat-test.js";
+import { reportRelayRequestCreated } from "./relay-request-observer.js";
 import { chatTestCompletionsHandler, modelTestHandler } from "./routes.js";
 
 const session = { user: { id: "me", twoFactorEnabled: true } } as unknown as Session;
 
-function app(readUpstreamExcerpt = vi.fn(async () => null as string | null)) {
+function app(
+  readUpstreamExcerpt = vi.fn(async (_userId: string, _id: string) => null as string | null),
+) {
   const root = new Hono<{ Variables: { session: Session | null } }>();
   root.use("*", async (c, next) => {
     c.set("session", c.req.header("x-test-anonymous") ? null : session);
@@ -78,11 +81,16 @@ describe("Test page routes", () => {
     expect(modelTestHandler).not.toHaveBeenCalled();
   });
 
-  it("quotes the runtime's own error in a failed answer", async () => {
-    vi.mocked(chatTestCompletionsHandler).mockResolvedValue(
-      json({ error: { message: "The model failed.", code: "upstream_error" } }, 502),
+  it("quotes the runtime's own error of this request in a failed answer", async () => {
+    vi.mocked(chatTestCompletionsHandler).mockImplementation(async () => {
+      reportRelayRequestCreated("rr1");
+      // A later row (a sidecar hop) is not the request.
+      reportRelayRequestCreated("rr2");
+      return json({ error: { message: "The model failed.", code: "upstream_error" } }, 502);
+    });
+    const { root, readUpstreamExcerpt } = app(
+      vi.fn(async (_userId: string, _id: string) => "max_tokens is too large"),
     );
-    const { root, readUpstreamExcerpt } = app(vi.fn(async () => "max_tokens is too large"));
     const response = await root.request("/chat-test/chat/completions", {
       method: "POST",
       body: "{}",
@@ -95,23 +103,34 @@ describe("Test page routes", () => {
         upstream_error: "max_tokens is too large",
       },
     });
-    expect(readUpstreamExcerpt).toHaveBeenCalledWith("me", expect.any(Date));
+    expect(readUpstreamExcerpt).toHaveBeenCalledWith("me", "rr1");
   });
 
   it("leaves successful answers and answers without an excerpt unchanged", async () => {
     const { root, readUpstreamExcerpt } = app();
-    vi.mocked(chatTestCompletionsHandler).mockResolvedValueOnce(json({ ok: true }, 200));
+    vi.mocked(chatTestCompletionsHandler).mockImplementationOnce(async () => {
+      reportRelayRequestCreated("rr1");
+      return json({ ok: true }, 200);
+    });
     expect(
       await (await root.request("/chat-test/chat/completions", { method: "POST" })).json(),
     ).toEqual({ ok: true });
     expect(readUpstreamExcerpt).not.toHaveBeenCalled();
 
-    vi.mocked(chatTestCompletionsHandler).mockResolvedValueOnce(
-      json({ error: { message: "Busy." } }, 429),
-    );
+    vi.mocked(chatTestCompletionsHandler).mockImplementationOnce(async () => {
+      reportRelayRequestCreated("rr2");
+      return json({ error: { message: "Busy." } }, 429);
+    });
     expect(
       await (await root.request("/chat-test/chat/completions", { method: "POST" })).json(),
     ).toEqual({ error: { message: "Busy." } });
+    expect(readUpstreamExcerpt).toHaveBeenCalledTimes(1);
+
+    // Refused before any request row: nothing to read.
+    vi.mocked(chatTestCompletionsHandler).mockResolvedValueOnce(
+      json({ error: { message: "Bad JSON." } }, 400),
+    );
+    await root.request("/chat-test/chat/completions", { method: "POST" });
     expect(readUpstreamExcerpt).toHaveBeenCalledTimes(1);
   });
 });

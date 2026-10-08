@@ -697,6 +697,7 @@ const EXEMPT: Readonly<Record<string, Exemption>> = {
   "profiles.list": NO_ID_LIST,
   "pools.list": NO_ID_LIST,
   "models.list": NO_ID_LIST,
+  "models.testTargets": NO_ID_LIST,
   "access.apiKeys.list": ACCESS,
   "access.apiKeys.create": ACCESS,
   "access.apiKeys.revoke": ACCESS,
