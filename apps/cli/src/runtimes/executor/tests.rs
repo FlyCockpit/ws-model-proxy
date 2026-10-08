@@ -25,6 +25,7 @@ fn job(action: JobPhase) -> Job {
         handle: "i-abcdefabcdef".into(),
         port: 30001,
         gpu_ids: None,
+        dist_port: None,
         host: "127.0.0.1".into(),
         spec: serde_json::json!({
             "api": "openai", "engine": "vllm", "modelType": "llm",
@@ -49,6 +50,8 @@ struct Fake {
     /// Units whose process tree still has a task (launched units count unless stopped).
     orphans: RefCell<Vec<String>>,
     port_busy: Cell<bool>,
+    /// Single ports something listens on.
+    busy_ports: RefCell<Vec<u16>>,
     /// What the status command answers: alive, stopped, or (None) an error.
     status_alive: Cell<Option<bool>>,
     /// Whether the user manager errors when asked for a unit's tasks.
@@ -65,6 +68,7 @@ impl Fake {
             ready: Cell::new(true),
             orphans: RefCell::new(Vec::new()),
             port_busy: Cell::new(false),
+            busy_ports: RefCell::new(Vec::new()),
             status_alive: Cell::new(None),
             tasks_unknown: Cell::new(false),
         }
@@ -116,8 +120,8 @@ impl Runtime for Fake {
         Ok(self.units.borrow().contains_key(unit)
             || self.orphans.borrow().iter().any(|orphan| orphan == unit))
     }
-    fn port_free(&self, _: &str, _: u16) -> bool {
-        !self.port_busy.get()
+    fn port_free(&self, _: &str, port: u16) -> bool {
+        !self.port_busy.get() && !self.busy_ports.borrow().contains(&port)
     }
 }
 
@@ -598,7 +602,8 @@ fn a_stop_is_never_proven_while_its_unit_runs_or_its_port_is_taken() {
     );
 }
 
-/// The state spark-1958 was left in: the stop of a run whose commands are all `true` failed
+/// The state spark-1958 was left in (launched by an older CLI, so a legacy record and no rank
+/// slice): the stop of a `process` run whose commands are all `true` failed
 /// at its deadline (status kept saying alive), the instance was marked stopped and settled
 /// STOPPED, and the rank stays HELD_UNKNOWN. Its unit is gone and its port is free: the next
 /// automatic check proves the stop, so the server releases the claim.
@@ -617,6 +622,20 @@ fn a_rank_marked_stopped_whose_status_is_a_stub_is_proven_once_its_process_is_go
         record.phase = InstancePhase::Stopping;
     }
     executor.persist().expect("persist");
+    // Written by the older CLI that launched it: no `outside_units`, no dist port, and its
+    // commands never ran in a rank slice (the slice does not exist: nothing in it).
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+    for record in stored["records"]
+        .as_object_mut()
+        .expect("records")
+        .values_mut()
+    {
+        let record = record.as_object_mut().expect("record");
+        assert!(record.remove("outside_units").is_some());
+        assert!(record["job"].get("distPort").is_none());
+    }
+    std::fs::write(&path, serde_json::to_vec(&stored).expect("json")).expect("write");
     // The unit is gone (`systemctl stop` ran), nothing listens on the port.
     runtime.units.borrow_mut().clear();
     let mut executor = Executor::load(path).expect("reload");
@@ -694,13 +713,14 @@ fn a_service_whose_unit_is_empty_still_needs_its_status_to_say_stopped() {
 }
 
 #[test]
-fn a_prepare_a_person_ran_does_not_make_a_process_runtime_need_its_status() {
+fn a_prepare_a_person_ran_keeps_the_status_requirement() {
     let root = tempfile::tempdir().expect("root");
     let path = root.path().join("in1-r0.json");
     let runtime = Fake::new(path.clone());
     runtime.status_alive.set(Some(true));
     let mut executor = Executor::load(path).expect("load");
     executor.execute(stubbed(job(JobPhase::Start)), &runtime, deadline());
+    // A prepare run in an operator terminal may leave a helper outside the node's units.
     executor
         .state
         .records
@@ -711,5 +731,140 @@ fn a_prepare_a_person_ran_does_not_make_a_process_runtime_need_its_status() {
     runtime.units.borrow_mut().clear();
     let mut probe = stubbed(job(JobPhase::Status));
     probe.step_id = "p1".into();
+    assert_eq!(
+        executor
+            .execute(probe, &runtime, deadline())
+            .detail
+            .as_deref(),
+        Some("status_running")
+    );
+    runtime.status_alive.set(Some(false));
+    let mut probe = stubbed(job(JobPhase::Status));
+    probe.step_id = "p2".into();
+    assert!(executor.execute(probe, &runtime, deadline()).stopped);
+    // The run's stop cleared its units, but a later check still asks the status command.
+    runtime.status_alive.set(Some(true));
+    let mut probe = stubbed(job(JobPhase::Status));
+    probe.step_id = "p3".into();
+    assert_eq!(
+        executor
+            .execute(probe, &runtime, deadline())
+            .detail
+            .as_deref(),
+        Some("status_running")
+    );
+}
+
+#[test]
+fn a_process_left_in_the_ranks_slice_keeps_the_stop_unproven() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(stubbed(job(JobPhase::Start)), &runtime, deadline());
+    // The stop command forked a `setsid` daemon: its unit is gone, the slice is not empty.
+    runtime
+        .orphans
+        .borrow_mut()
+        .push("wsmp_i_abcdefabcdef_r0.slice".into());
+    let short = Deadline::new(Duration::from_millis(1_200));
+    let stop = executor.execute(stubbed(job(JobPhase::Stop)), &runtime, short);
+    assert_eq!((stop.status, stop.stopped), (JobStatus::Failed, false));
+    let mut probe = stubbed(job(JobPhase::Status));
+    probe.step_id = "p1".into();
+    assert_eq!(
+        executor
+            .execute(probe, &runtime, deadline())
+            .detail
+            .as_deref(),
+        Some("process_alive")
+    );
+    runtime.orphans.borrow_mut().clear();
+    let mut probe = stubbed(job(JobPhase::Status));
+    probe.step_id = "p2".into();
+    assert!(executor.execute(probe, &runtime, deadline()).stopped);
+}
+
+#[test]
+fn a_re_delivered_stop_is_proven_again_before_it_answers_stopped() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(stubbed(job(JobPhase::Start)), &runtime, deadline());
+    assert!(
+        executor
+            .execute(stubbed(job(JobPhase::Stop)), &runtime, deadline())
+            .stopped
+    );
+    // Something bound the port since: the recorded answer is not repeated.
+    runtime.busy_ports.borrow_mut().push(30001);
+    let again = executor.execute(stubbed(job(JobPhase::Stop)), &runtime, deadline());
+    assert_eq!((again.status, again.stopped), (JobStatus::Failed, false));
+    runtime.busy_ports.borrow_mut().clear();
+    assert!(
+        executor
+            .execute(stubbed(job(JobPhase::Stop)), &runtime, deadline())
+            .stopped
+    );
+}
+
+#[test]
+fn the_inventory_reports_stopped_only_while_the_stop_is_proven() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(stubbed(job(JobPhase::Start)), &runtime, deadline());
+    executor.execute(stubbed(job(JobPhase::Stop)), &runtime, deadline());
+    let phase = |executor: &Executor| executor.observations(&runtime, deadline())[0].1.phase;
+    assert_eq!(phase(&executor), InstancePhase::Stopped);
+    // Empty units alone are no proof (the server releases a claim on `stopped`).
+    runtime.busy_ports.borrow_mut().push(30001);
+    assert_eq!(phase(&executor), InstancePhase::Unknown);
+    runtime.busy_ports.borrow_mut().clear();
+    runtime
+        .orphans
+        .borrow_mut()
+        .push("wsmp_i_abcdefabcdef_r0.slice".into());
+    assert_eq!(phase(&executor), InstancePhase::Unknown);
+}
+
+#[test]
+fn a_held_dist_port_keeps_the_stop_unproven() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    let with_dist = |phase: JobPhase| {
+        let mut job = stubbed(job(phase));
+        job.dist_port = Some(30002);
+        job
+    };
+    executor.execute(with_dist(JobPhase::Start), &runtime, deadline());
+    runtime.units.borrow_mut().clear();
+    runtime.busy_ports.borrow_mut().push(30002);
+    let mut probe = with_dist(JobPhase::Status);
+    probe.step_id = "p1".into();
+    assert_eq!(
+        executor
+            .execute(probe, &runtime, deadline())
+            .detail
+            .as_deref(),
+        Some("port_in_use")
+    );
+    // A probe rendered without it still checks the launched run's dist port.
+    let mut probe = stubbed(job(JobPhase::Status));
+    probe.step_id = "p2".into();
+    assert_eq!(
+        executor
+            .execute(probe, &runtime, deadline())
+            .detail
+            .as_deref(),
+        Some("port_in_use")
+    );
+    runtime.busy_ports.borrow_mut().clear();
+    let mut probe = with_dist(JobPhase::Status);
+    probe.step_id = "p3".into();
     assert!(executor.execute(probe, &runtime, deadline()).stopped);
 }

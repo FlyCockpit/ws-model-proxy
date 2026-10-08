@@ -53,6 +53,10 @@ pub struct Job {
     pub unit_name: String,
     pub handle: String,
     pub port: u16,
+    /// The rank's second reserved port (`placeholders.dist_port`), when placement gave one:
+    /// the stop proof requires it free as well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dist_port: Option<u16>,
     /// The GPUs placement gave this rank (`placeholders.gpu_ids`, e.g. `0,3`): every command
     /// sees only them (`CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES`), so two runtimes on one
     /// GPU node do not collide even when their commands never name `{{gpu_ids}}`.
@@ -231,9 +235,24 @@ struct Record {
     consecutive_health_successes: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stopped_at: Option<u64>,
+    /// A step of this run ran outside the node's units (`external`: a person ran it in an
+    /// operator terminal; `self-detached`: no units on this platform). Kept after the stop
+    /// clears `invocations`, so a later check still asks its status command.
+    #[serde(default)]
+    outside_units: bool,
 }
 
 impl Record {
+    /// The run is proven stopped: its units are forgotten, but not that a step of it ran
+    /// outside them.
+    fn clear_invocations(&mut self) {
+        self.outside_units |= self
+            .invocations
+            .values()
+            .any(|invocation| outside(invocation));
+        self.invocations.clear();
+    }
+
     /// Verified stopped with nothing unresolved.
     fn terminal(&self) -> bool {
         self.phase == InstancePhase::Stopped
@@ -362,6 +381,8 @@ pub trait Runtime {
     fn tasks_alive(&self, unit: &str, deadline: Deadline) -> Result<bool>;
     /// Whether nothing listens on `port` (any address, and `host`).
     fn port_free(&self, host: &str, port: u16) -> bool;
+    /// The rank's slice was proven empty: let the manager forget it (best effort).
+    fn forget_slice(&self, _slice: &str, _deadline: Deadline) {}
 }
 
 fn owner_ok(owner: &str) -> bool {
@@ -468,6 +489,7 @@ impl Executor {
                     && record.invocations.is_empty()
                 {
                     record.job = job.clone();
+                    record.outside_units = false;
                 }
                 record.pending = Some(job.clone());
                 record.phase = if job.action == JobPhase::Stop {
@@ -494,6 +516,7 @@ impl Executor {
                         consecutive_health_failures: 0,
                         consecutive_health_successes: 0,
                         stopped_at: None,
+                        outside_units: false,
                     },
                 );
                 OperatorMark {
@@ -617,19 +640,12 @@ impl Executor {
                             "stopped unit revived"
                         );
                     }
-                    // A process-managed run lives in the units checked above; only a service may
-                    // have come back outside them (its status command says so).
-                    if job.management() == Management::Service
-                        && let Some(status) = job.status_command.as_deref()
+                    // Answered again only while the stop still holds, proven afresh (the
+                    // port may have been taken since, a process may have come back).
+                    if let Some(reason) =
+                        self.stop_unproven(job, runtime, deadline.cap(Duration::from_secs(30)))?
                     {
-                        anyhow::ensure!(
-                            !runtime.status_until(
-                                job,
-                                status,
-                                deadline.cap(Duration::from_secs(5))
-                            )?,
-                            "stopped service revived"
-                        );
+                        anyhow::bail!("the stopped run is not proven stopped any more ({reason})");
                     }
                 }
                 return Ok(done.outcome.clone());
@@ -695,11 +711,16 @@ impl Executor {
                     consecutive_health_failures: 0,
                     consecutive_health_successes: 0,
                     stopped_at: None,
+                    outside_units: false,
                 },
             );
         }
         let record = self.state.records.get_mut(&key).context("record")?;
         if matches!(job.action, JobPhase::Prepare | JobPhase::Start) {
+            if record.invocations.is_empty() {
+                // A new run: nothing of an earlier one ran outside the units any more.
+                record.outside_units = false;
+            }
             record.job = job.clone();
         }
         record.pending = Some(job.clone());
@@ -839,12 +860,15 @@ impl Executor {
         self.complete(job, outcome)
     }
 
-    /// Why the rank's stop is not proven, or `None` when it is. Stops and
-    /// status probes ask this one question.
+    /// Why the rank's stop is not proven, or `None` when it is. Stops, status
+    /// probes, a re-delivered stop and the inventory's `stopped` all ask this
+    /// one question (the server releases a claim on any of them).
     ///
     /// The proof rests on what the node observes itself: no unit of the rank
-    /// (owned, or recorded by its launch) has a task left in its control group,
-    /// and the rank's port is free. A `process` runtime runs in the node's own
+    /// (owned, or recorded by its launch) and nothing in the rank's slice
+    /// ([`rank_slice`], where every command of the rank runs) has a process
+    /// left, and every port reserved for the rank (`port`, `dist_port`) is
+    /// free. A `process` runtime runs in the node's own
     /// units (`KillMode=control-group`): those facts are its proof, and its
     /// status command can neither block nor replace them (a stub `true`, "alive"
     /// forever, must not hold a claim forever). A run whose processes may live
@@ -863,32 +887,59 @@ impl Executor {
         runtime: &impl Runtime,
         deadline: Deadline,
     ) -> Result<Option<&'static str>> {
+        let record = self.state.records.get(&job.key());
+        // Every unit of the rank and its slice (every command the node ran for it: start,
+        // prepare, after-join, stop, status, health). What the launched run used is checked
+        // too: a probe rendered from another version may name other ports or commands.
         let mut units: std::collections::BTreeSet<String> = owned_units(job).into_iter().collect();
-        // What the launched run used: a probe rendered from another version may name another
-        // port or status command, so both the probe's and the record's are checked.
-        let mut statuses: Vec<(&Job, &str)> = Vec::new();
-        let mut ports = vec![(job.host.as_str(), job.port)];
-        let mut detached =
-            job.management() == Management::Service || cfg!(not(target_os = "linux"));
-        if let Some(record) = self.state.records.get(&job.key()) {
+        units.insert(rank_slice(job));
+        let mut jobs = vec![job];
+        if let Some(record) = record {
+            units.extend(owned_units(&record.job));
+            units.insert(rank_slice(&record.job));
             units.extend(record.invocations.keys().cloned());
-            let prepare = format!("{}-prepare", record.job.unit_name);
-            // A prepare a person ran leaves nothing serving; a serving step they ran may.
-            detached |= record.job.management() == Management::Service
-                || record.invocations.iter().any(|(unit, invocation)| {
-                    *unit != prepare && (invocation == "external" || invocation == "self-detached")
-                });
-            if let Some(status) = record.job.status_command.as_deref() {
-                statuses.push((&record.job, status));
+            jobs.push(&record.job);
+        }
+        let mut ports: Vec<(&str, u16)> = Vec::new();
+        let mut statuses: Vec<(&Job, &str)> = Vec::new();
+        for owner in &jobs {
+            for port in std::iter::once(owner.port).chain(owner.dist_port) {
+                if !ports.contains(&(owner.host.as_str(), port)) {
+                    ports.push((owner.host.as_str(), port));
+                }
             }
-            ports.push((record.job.host.as_str(), record.job.port));
+            if let Some(status) = owner.status_command.as_deref()
+                && !statuses.iter().any(|(_, seen)| *seen == status)
+            {
+                statuses.push((owner, status));
+            }
         }
-        if let Some(status) = job.status_command.as_deref() {
-            statuses.push((job, status));
-        }
+        let detached = cfg!(not(target_os = "linux"))
+            || jobs
+                .iter()
+                .any(|owner| owner.management() == Management::Service)
+            || record.is_some_and(|record| {
+                record.outside_units || record.invocations.values().any(|i| outside(i))
+            });
         if detached && statuses.is_empty() {
             return Ok(Some("unowned_service"));
         }
+        if detached {
+            for (owner, status) in statuses {
+                match runtime.status_until(owner, status, deadline.cap(Duration::from_secs(30))) {
+                    Ok(false) => {}
+                    Ok(true) => return Ok(Some("status_running")),
+                    Err(_) => {
+                        if runtime.cancelled() {
+                            return Err(fail(JobError::SessionDisconnected));
+                        }
+                        return Ok(Some("status_unknown"));
+                    }
+                }
+            }
+        }
+        // After the status command (it runs in the rank's slice too): nothing it or any
+        // other command of the rank left behind may still run.
         for unit in &units {
             match runtime.tasks_alive(unit, deadline) {
                 Ok(false) => {}
@@ -907,20 +958,6 @@ impl Executor {
             .any(|(host, port)| !runtime.port_free(host, *port))
         {
             return Ok(Some("port_in_use"));
-        }
-        if detached {
-            for (owner, status) in statuses {
-                match runtime.status_until(owner, status, deadline.cap(Duration::from_secs(30))) {
-                    Ok(false) => {}
-                    Ok(true) => return Ok(Some("status_running")),
-                    Err(_) => {
-                        if runtime.cancelled() {
-                            return Err(fail(JobError::SessionDisconnected));
-                        }
-                        return Ok(Some("status_unknown"));
-                    }
-                }
-            }
         }
         Ok(None)
     }
@@ -944,11 +981,12 @@ impl Executor {
             return Ok(Outcome::unproven(reason));
         }
         deadline.remaining()?;
+        runtime.forget_slice(&rank_slice(job), deadline);
         let now = (self.clock)();
         let Some(record) = self.state.records.get_mut(&key) else {
             return Ok(Outcome::ok(true));
         };
-        record.invocations.clear();
+        record.clear_invocations();
         record.phase = InstancePhase::Stopped;
         record.stopped_at = Some(now);
         self.complete(job, Outcome::ok(true))
@@ -1032,9 +1070,10 @@ impl Executor {
             }
         }
         deadline.remaining()?;
+        runtime.forget_slice(&rank_slice(job), deadline);
         let now = (self.clock)();
         let record = self.state.records.get_mut(&key).context("record")?;
-        record.invocations.clear();
+        record.clear_invocations();
         record.phase = InstancePhase::Stopped;
         record.stopped_at = Some(now);
         Ok(Some(Outcome::ok(true)))
@@ -1099,6 +1138,10 @@ impl Executor {
                 action: job.action,
             },
         );
+        record.outside_units |= record
+            .invocations
+            .values()
+            .any(|invocation| outside(invocation));
         record.pending = None;
         record.observed_step = job.step_id.clone();
         record.observed_hash = job.intent_hash.clone();
@@ -1134,12 +1177,15 @@ impl Executor {
                     && (job.management() != Management::Process
                         || serving_confirmed(record, &self.state.owner_id, runtime, deadline)
                             .is_ok_and(|alive| alive));
+                // `stopped` releases a claim on the server: reported only while the stop is
+                // proven afresh, never from empty units alone.
                 let absent = record.phase == InstancePhase::Stopped
                     && owned_units(job).iter().all(|unit| {
                         runtime
                             .identity(unit, &self.state.owner_id, deadline)
                             .is_ok_and(|seen| seen.is_none())
-                    });
+                    })
+                    && matches!(self.stop_unproven(job, runtime, deadline), Ok(None));
                 let phase = if absent {
                     InstancePhase::Stopped
                 } else if record.pending.is_some() || !owned {
@@ -1236,6 +1282,9 @@ impl<R: Runtime> Runtime for OperatorRan<'_, R> {
     fn port_free(&self, host: &str, port: u16) -> bool {
         self.inner.port_free(host, port)
     }
+    fn forget_slice(&self, slice: &str, deadline: Deadline) {
+        self.inner.forget_slice(slice, deadline);
+    }
 }
 
 /// Polls `status` until it shows `alive == want`; a failed probe is no answer.
@@ -1317,6 +1366,18 @@ pub fn phase_unit(job: &Job) -> String {
         JobPhase::AfterJoin => format!("{}-after-join", job.unit_name),
         _ => job.unit_name.clone(),
     }
+}
+
+/// A run the node did not start in a unit of its own.
+fn outside(invocation: &str) -> bool {
+    invocation == "external" || invocation == "self-detached"
+}
+
+/// The systemd user slice every command of the rank runs in (`wsmp_i_<id>_r<rank>.slice`; no
+/// `-`, which would nest it in parent slices that outlive it): the stop proof requires it
+/// empty, so nothing a command left behind (forked, `setsid`) escapes the proof.
+pub fn rank_slice(job: &Job) -> String {
+    format!("{}.slice", job.unit_name.replace('-', "_"))
 }
 
 fn owned_units(job: &Job) -> [String; 3] {

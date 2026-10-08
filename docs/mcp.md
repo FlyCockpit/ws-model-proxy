@@ -71,15 +71,21 @@ terminal. Only the person runs or dismisses it, so `cancel` refuses.
 
 ### Stops that cannot be proven
 
-A stopping instance keeps its resources and port until its node proves the
-stop. The node proves it from what it observes itself: no process is left in
-the rank's units (their control groups are empty) and the rank's port is
-free. For a `process` runtime (its processes stay in the node's units) the
-`status` command is not needed for that proof and cannot block it (a stub
-`status: "true"` would say "alive" forever). A run whose processes may live
-outside the node's units also needs its `status` command to say stopped (exit
-3): a `service` runtime, a start a person ran in a terminal, and any run on a
-node without systemd units. A stop step completes as soon as this proof holds. When the stop
+A stopping instance keeps its resources and ports until its node proves the
+stop. Every command the node runs for a rank (prepare, start, after-join,
+stop, status, health) runs in that rank's systemd user slice, so whatever a
+command leaves behind (a fork, a `setsid` daemon) stays where the node looks.
+The node proves the stop from what it observes itself: no process is left in
+the rank's units or its slice, and every port reserved for the rank (`port`
+and the distributed port) is free. For a `process` runtime the `status`
+command is not needed for that proof and cannot block it (a stub `status:
+"true"` would say "alive" forever). A run whose processes may live outside
+the slice also needs its `status` command to say stopped (exit 3): a
+`service` runtime (a start that hands off to docker or a service manager
+escapes the slice on purpose), any step a person ran in a terminal (a
+prepare too), and any run on a node without systemd units. The same proof is
+required again before a repeated stop answers stopped and before the node's
+inventory reports a rank stopped. A stop step completes as soon as this proof holds. When the stop
 steps fail, the server asks the node for a status probe that checks the same
 proof; the stop then completes with no person involved. Only when the node
 cannot prove it (still alive, or offline for 10 minutes) does the instance

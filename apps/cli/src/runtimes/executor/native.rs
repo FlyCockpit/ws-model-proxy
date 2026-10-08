@@ -145,22 +145,102 @@ fn description(owner: &str, unit: &str) -> String {
 }
 
 /// From `systemctl show --property=LoadState,ActiveState,TasksCurrent,ControlGroup`: a
-/// unit that is gone, or whose control group is empty, runs nothing. A unit whose task count
-/// is not known counts as alive.
+/// unit or slice that is gone, or whose control group is empty, runs nothing. `populated`
+/// reads the control group's `cgroup.events` (cgroup v2): it counts every process of the
+/// group and of every group below it (a slice's scopes and services). Without it, a unit whose
+/// task count is not known counts as alive.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn unit_tasks_alive(output: &str) -> bool {
+fn unit_tasks_alive(output: &str, populated: impl FnOnce(&str) -> Option<bool>) -> bool {
     let fields = output
         .lines()
         .filter_map(|line| line.split_once('='))
         .collect::<std::collections::BTreeMap<_, _>>();
-    if fields.get("LoadState") == Some(&"not-found") || fields.get("ControlGroup") == Some(&"") {
+    let group = fields.get("ControlGroup").copied().unwrap_or("");
+    if fields.get("LoadState") == Some(&"not-found") || group.is_empty() {
         return false;
+    }
+    if let Some(populated) = populated(group) {
+        return populated;
     }
     // An unknown task count with a control group proves nothing: count it as alive.
     fields
         .get("TasksCurrent")
         .and_then(|value| value.parse::<u64>().ok())
         .is_none_or(|tasks| tasks > 0)
+}
+
+/// `populated` of a control group (cgroup v2 `cgroup.events`), or `None` when it cannot be read
+/// (cgroup v1, or a path that is not a plain absolute group path). A group that does not exist
+/// any more holds nothing.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cgroup_populated(group: &str) -> Option<bool> {
+    let plain = group.starts_with('/')
+        && group
+            .split('/')
+            .skip(1)
+            .all(|part| !part.is_empty() && part != "." && part != "..");
+    if !plain {
+        return None;
+    }
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    if !root.join("cgroup.controllers").exists() {
+        return None;
+    }
+    match std::fs::read_to_string(root.join(&group[1..]).join("cgroup.events")) {
+        Ok(events) => events.lines().find_map(|line| match line.trim() {
+            "populated 1" => Some(true),
+            "populated 0" => Some(false),
+            _ => None,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// `/bin/sh -c script` with the rank's environment, inside a transient scope of the rank's
+/// slice (Linux), so whatever it leaves behind (a fork, a `setsid` daemon) stays where the stop
+/// proof looks. The exit status is the script's (`systemd-run --scope` runs it in place).
+fn run_in_rank_slice(
+    job: &Job,
+    script: String,
+    deadline: Deadline,
+    limit: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<u8>> {
+    let env = command_env(job)?;
+    #[cfg(target_os = "linux")]
+    {
+        let args: Vec<String> = vec![
+            format!(
+                "XDG_RUNTIME_DIR=/run/user/{}",
+                nix::unistd::Uid::effective().as_raw()
+            ),
+            "systemd-run".into(),
+            "--user".into(),
+            "--scope".into(),
+            "--quiet".into(),
+            "--collect".into(),
+            format!("--slice={}", super::rank_slice(job)),
+            "--".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            script,
+        ];
+        crate::bounded_run::run_until_env("env", &args, deadline.instant(), limit, cancel, &env)
+            .map_err(|_| anyhow::anyhow!("the command did not succeed"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        crate::bounded_run::run_until_env(
+            "/bin/sh",
+            &["-c".into(), script],
+            deadline.instant(),
+            limit,
+            cancel,
+            &env,
+        )
+        .map_err(|_| anyhow::anyhow!("the command did not succeed"))
+    }
 }
 
 /// Nothing listens on `port`: binding it on every address (and on `host`) works. An address
@@ -234,6 +314,7 @@ impl Runtime for NativeRuntime {
                 "--property=KillMode=control-group".into(),
                 "--property=Restart=no".into(),
                 "--property=TasksAccounting=yes".into(),
+                format!("--slice={}", super::rank_slice(job)),
                 "--setenv=WSMP_JOB=1".into(),
             ];
             for (name, _) in &env {
@@ -450,36 +531,25 @@ impl Runtime for NativeRuntime {
     fn shell_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<()> {
         deadline.remaining()?;
         anyhow::ensure!(!self.cancelled(), "session disconnected");
-        let env = command_env(job)?;
         // Output goes nowhere: no backend output reaches a pipe or a log.
-        crate::bounded_run::run_until_env(
-            "/bin/sh",
-            &["-c".into(), format!("exec >/dev/null 2>&1; {command}")],
-            deadline.instant(),
+        run_in_rank_slice(
+            job,
+            format!("exec >/dev/null 2>&1; {command}"),
+            deadline,
             0,
             self.cancel_flag(),
-            &env,
-        )
-        .map_err(|_| anyhow::anyhow!("the command did not succeed"))?;
+        )?;
         Ok(())
     }
 
     fn status_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<bool> {
         deadline.remaining()?;
         anyhow::ensure!(!self.cancelled(), "session disconnected");
-        let env = command_env(job)?;
         let script = format!(
             "( {command}\n) >/dev/null 2>&1; rc=$?; if [ \"$rc\" -eq 0 ]; then printf alive; elif [ \"$rc\" -eq 3 ]; then printf stopped; else printf unknown; fi"
         );
-        let output = crate::bounded_run::run_until_env(
-            "/bin/sh",
-            &["-c".into(), script],
-            deadline.instant(),
-            16,
-            self.cancel_flag(),
-            &env,
-        )
-        .map_err(|_| anyhow::anyhow!("status unconfirmed"))?;
+        let output = run_in_rank_slice(job, script, deadline, 16, self.cancel_flag())
+            .map_err(|_| anyhow::anyhow!("status unconfirmed"))?;
         match output.as_slice() {
             b"alive" => Ok(true),
             b"stopped" => Ok(false),
@@ -530,7 +600,7 @@ impl Runtime for NativeRuntime {
                 self.cancel_flag(),
                 &[],
             )?;
-            Ok(unit_tasks_alive(&output))
+            Ok(unit_tasks_alive(&output, cgroup_populated))
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -542,6 +612,20 @@ impl Runtime for NativeRuntime {
 
     fn port_free(&self, host: &str, port: u16) -> bool {
         port_free(host, port)
+    }
+
+    fn forget_slice(&self, slice: &str, deadline: Deadline) {
+        // Proven empty just before: stopping it ends nothing, it only unloads the slice.
+        #[cfg(target_os = "linux")]
+        let _ = manager_until(
+            "systemctl",
+            &["--user".into(), "stop".into(), slice.into()],
+            deadline.cap(Duration::from_secs(10)),
+            None,
+            &[],
+        );
+        #[cfg(not(target_os = "linux"))]
+        let _ = (slice, deadline);
     }
 
     fn healthy_until(&self, job: &Job, deadline: Deadline) -> bool {
@@ -575,6 +659,7 @@ mod tests {
 
     #[test]
     fn a_unit_with_no_task_runs_nothing() {
+        let unit_tasks_alive = |output: &str| unit_tasks_alive(output, |_| None);
         assert!(!unit_tasks_alive(
             "LoadState=not-found\nActiveState=inactive\n"
         ));
@@ -652,6 +737,7 @@ mod tests {
             handle: "i-itestitestabc".into(),
             port,
             gpu_ids: None,
+            dist_port: None,
             host: "127.0.0.1".into(),
             spec: serde_json::json!({
                 "api": "openai", "engine": "other", "modelType": "llm",
@@ -687,6 +773,115 @@ mod tests {
         let stopped = executor.execute(job(JobPhase::Stop, "s3"), &runtime, deadline());
         assert!(stopped.stopped, "{stopped:?}");
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+    }
+
+    /// Real systemd user units (`--ignored`): every way a stop could be released without a
+    /// fresh proof is refused. A `setsid` descendant of the stop command stays in the rank's
+    /// slice; a re-delivered stop and the inventory check the port again; the dist port counts.
+    #[test]
+    #[ignore = "needs a systemd user manager"]
+    fn a_real_stop_is_proven_only_with_an_empty_slice_and_free_ports() {
+        use crate::protocol::frames::{InstancePhase, JobStatus};
+        let free_port = || {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.local_addr())
+                .expect("port")
+                .port()
+        };
+        let (port, dist) = (free_port(), free_port());
+        let root = tempfile::tempdir().expect("root");
+        let start = format!("exec python3 -m http.server {port} --bind 127.0.0.1");
+        let unit = "wsmp-i-proofproofabc-r0";
+        let job = |action: JobPhase, step: &str, stop: &str| super::super::Job {
+            step_id: step.into(),
+            instance_id: "proof".into(),
+            runtime_id: "rt".into(),
+            version_id: "vr".into(),
+            launch_hash: "h".repeat(64),
+            rank: 0,
+            action,
+            intent_hash: "a".repeat(64),
+            owner_epoch: "e".into(),
+            command: if action == JobPhase::Start {
+                start.clone()
+            } else {
+                String::new()
+            },
+            stop_command: stop.into(),
+            status_command: Some("true".into()),
+            health_command: Some("true".into()),
+            secrets: Vec::new(),
+            timeout_ms: 20_000,
+            unit_name: unit.into(),
+            handle: "i-proofproofabc".into(),
+            port,
+            dist_port: Some(dist),
+            gpu_ids: None,
+            host: "127.0.0.1".into(),
+            spec: serde_json::json!({
+                "api": "openai", "engine": "other", "modelType": "llm",
+                "models": [{ "id": "m" }],
+                "launch": {
+                    "management": "process", "groupSize": 1,
+                    "resources": [{ "kind": "none" }], "labels": [],
+                    "commands": [{ "start": "x", "stop": "true", "status": "true" }],
+                    "health": { "intervalMs": 30000, "failureThreshold": 3, "successThreshold": 1 }
+                }
+            }),
+        };
+        let runtime = NativeRuntime { cancel: None };
+        let mut executor = super::super::Executor::load(root.path().join("x.json")).expect("load");
+        let deadline = |secs| Deadline::new(std::time::Duration::from_secs(secs));
+        // A rank launched by an older CLI has no slice: an absent slice holds nothing.
+        assert!(
+            !runtime
+                .tasks_alive("wsmp_i_neverneverab_r0.slice", deadline(10))
+                .expect("manager")
+        );
+        // The stop command leaves a `setsid` daemon behind while the marker exists.
+        let marker = root.path().join("leave-a-daemon");
+        std::fs::write(&marker, b"").expect("marker");
+        let daemon = format!(
+            "if [ -e '{}' ]; then setsid sleep 120 </dev/null >/dev/null 2>&1 & fi",
+            marker.display()
+        );
+        let daemon = daemon.as_str();
+        assert_eq!(
+            executor
+                .execute(job(JobPhase::Start, "s1", daemon), &runtime, deadline(20))
+                .status,
+            JobStatus::Succeeded
+        );
+        // The stop command leaves a `setsid` daemon behind: never proven.
+        let stop = executor.execute(job(JobPhase::Stop, "s2", daemon), &runtime, deadline(4));
+        assert_eq!((stop.status, stop.stopped), (JobStatus::Failed, false));
+        let probe = executor.execute(job(JobPhase::Status, "s3", daemon), &runtime, deadline(10));
+        assert_eq!(probe.detail.as_deref(), Some("process_alive"), "{probe:?}");
+        std::fs::remove_file(&marker).expect("marker");
+        let slice = format!("{}.slice", unit.replace('-', "_"));
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "stop", &slice])
+            .status();
+        // The dist port is held: still not proven.
+        let held = std::net::TcpListener::bind(("127.0.0.1", dist)).expect("dist");
+        let probe = executor.execute(job(JobPhase::Status, "s4", daemon), &runtime, deadline(10));
+        assert_eq!(probe.detail.as_deref(), Some("port_in_use"), "{probe:?}");
+        drop(held);
+        let stop = executor.execute(job(JobPhase::Stop, "s5", daemon), &runtime, deadline(10));
+        assert!(stop.stopped, "{stop:?}");
+        assert_eq!(
+            executor.observations(&runtime, deadline(10))[0].1.phase,
+            InstancePhase::Stopped
+        );
+        // The port is taken again: neither the re-delivered stop nor the inventory says stopped.
+        let taken = std::net::TcpListener::bind(("127.0.0.1", port)).expect("port");
+        let again = executor.execute(job(JobPhase::Stop, "s5", daemon), &runtime, deadline(10));
+        assert_eq!((again.status, again.stopped), (JobStatus::Failed, false));
+        assert_eq!(
+            executor.observations(&runtime, deadline(10))[0].1.phase,
+            InstancePhase::Unknown
+        );
+        drop(taken);
     }
 
     #[test]
