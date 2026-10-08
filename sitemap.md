@@ -34,7 +34,7 @@ All require an active session (`_auth` layout).
 | `/{lang}/welcome` | Get started: add a node (enrollment one-liner with countdown), add detected servers, create a pool, connect an agent, create an API key. |
 | `/{lang}/overview` | KPIs (requests, errors, p95, TTFT, queue wait, cloud share; agent tests excluded), Needs-you list, nodes strip, pool cards with sparklines, getting-started checklist until done. |
 | `/{lang}/models` | Every callable ID you may use (own pools and pools shared with you with can use): `owner/pool` and, where cloud mode covers you, `owner/pool:external`; type, status, base URL, copy buttons and snippets. |
-| `/{lang}/test` | Test a callable ID or one of your served models directly (web only): chat, embeddings, transcription, live speech-to-text mic panel. |
+| `/{lang}/test` | Test a callable ID or one of your served models directly (web only): chat, embeddings, transcription, live speech-to-text mic panel. `?target=` preselects a callable ID or `runtime:<runtimeId>:<model>` (the Models page's Test links). |
 | `/{lang}/pools` | Pool cards (flow strip, health, sparkline, cloud badge), pools shared with you, New pool sheet. |
 | `/{lang}/pools/{poolId}` | Pool overview: stats, members (local, contributed, cloud in order) with load and status, call snippet, hardware it runs on, name and description. |
 | `/{lang}/pools/{poolId}/routing` | Priority class, pool cap, kept slots, borrowing, only my own hardware. |

@@ -1427,5 +1427,166 @@
       "errors_other": "{{value}} errors",
       "separator": " · "
     }
+  },
+  "test": {
+    "loadFailed": "Couldn't load what you can test.",
+    "emptyTitle": "Nothing to test yet",
+    "emptyHint": "Start a runtime on one of your nodes, or create a pool. Its served models and callable IDs show up here.",
+    "goToWelcome": "Open Welcome",
+    "errors": {
+      "upstream": "The model server said:",
+      "empty": "The model answered with no text."
+    },
+    "target": {
+      "label": "Target",
+      "pools": "Callable IDs",
+      "direct": "Your runtimes' served models (direct)",
+      "directPill": "Direct",
+      "poolPill": "Pool",
+      "notServing": "Nothing serves this target right now; a request may wait for it or fail.",
+      "directHint": "A direct test goes straight to this served model. Only you can test it, and only here or with model_test; API keys call pools.",
+      "missing": "{{target}} isn't something you can test. Pick a target below."
+    },
+    "kind": {
+      "chat": {
+        "title": "Chat",
+        "description": "Streams the answer, with the model's reasoning when it shares it."
+      },
+      "embeddings": {
+        "title": "Embeddings",
+        "description": "Embeds each line and summarizes the vectors."
+      },
+      "transcription": {
+        "title": "Transcription",
+        "description": "Transcribes an audio file, or your microphone live where the target supports it."
+      }
+    },
+    "surface": {
+      "label": "API",
+      "only": "API: {{surface}}",
+      "OPENAI_CHAT_COMPLETIONS": "OpenAI Chat",
+      "OPENAI_RESPONSES": "OpenAI Responses",
+      "ANTHROPIC_MESSAGES": "Anthropic Messages"
+    },
+    "reasoning": {
+      "label": "Reasoning",
+      "help": "Reasoning levels depend on the model; Default sends none and lets the model decide.",
+      "levels": {
+        "unset": "Default",
+        "none": "None",
+        "minimal": "Minimal",
+        "low": "Low",
+        "medium": "Medium",
+        "high": "High",
+        "xhigh": "Extra high",
+        "max": "Max"
+      }
+    },
+    "chat": {
+      "tooLong": "Keep the message under 32,000 characters.",
+      "maxTokens": "Max tokens",
+      "newChat": "New chat",
+      "system": "System prompt",
+      "systemPlaceholder": "Optional instructions sent with every turn",
+      "message": "Message",
+      "placeholder": "Send a message (Enter sends, Shift+Enter adds a line)",
+      "send": "Send",
+      "stop": "Stop",
+      "empty": "Send a message to test this target.",
+      "you": "You",
+      "model": "Model",
+      "reasoning": "Reasoning",
+      "waiting": "Waiting for the first token…",
+      "stopped": "Stopped.",
+      "attachments": {
+        "requestTooLarge": "This conversation is too large to send. Remove attachments or start a new chat.",
+        "max_one": "Attach at most {{count}} file.",
+        "max_other": "Attach at most {{count}} files.",
+        "unsupported": "This target and API can't take that kind of file.",
+        "tooLarge": "Attachments can be at most {{size}} each.",
+        "list": "Attachments",
+        "remove": "Remove {{name}}",
+        "add": "Attach"
+      }
+    },
+    "metrics": {
+      "ttft": "First token {{ms}} ms",
+      "total": "Total {{ms}} ms",
+      "tokens_one": "{{count}} token",
+      "tokens_other": "{{count}} tokens",
+      "rate": "{{rate}} tokens/s",
+      "promptTokens_one": "{{count}} input token",
+      "promptTokens_other": "{{count}} input tokens"
+    },
+    "embeddings": {
+      "sample": "The quick brown fox jumps over the lazy dog.\nA fast auburn fox leaps over a sleepy hound.",
+      "required": "Enter at least one line.",
+      "tooMany_one": "Send at most {{count}} line.",
+      "tooMany_other": "Send at most {{count}} lines.",
+      "label": "Inputs",
+      "hint_one": "One input per line, up to {{count}}.",
+      "hint_other": "One input per line, up to {{count}}.",
+      "send": "Embed",
+      "result": "Embeddings result",
+      "vectors_one": "{{count}} vector",
+      "vectors_other": "{{count}} vectors",
+      "dimensions_one": "{{count}} dimension",
+      "dimensions_other": "{{count}} dimensions",
+      "similarity": "Cosine similarity of the first two: {{value}}",
+      "dims": "Dimensions",
+      "norm": "Norm",
+      "range": "Range",
+      "head": "First values"
+    },
+    "transcription": {
+      "fileRequired": "Choose an audio file.",
+      "fileTooLarge": "Test files can be at most 9.5 MB.",
+      "badLanguage": "Use a language code like en or es-MX.",
+      "file": "Audio file",
+      "language": "Language (optional)",
+      "send": "Transcribe",
+      "result": "Transcript",
+      "emptyText": "The model returned an empty transcript."
+    },
+    "live": {
+      "title": "Live transcription",
+      "description": "Speak into your microphone and watch this target transcribe it with the same live session API clients use (/v1/realtime). It runs as you and counts as Test usage.",
+      "start": "Start microphone",
+      "stop": "Stop",
+      "commit": "End turn",
+      "status": {
+        "idle": "Not started.",
+        "starting": "Connecting…",
+        "live": "Listening. Press End turn when you finish speaking.",
+        "stopped": "Stopped.",
+        "failed": "The session ended."
+      },
+      "transcribing": "Transcribing…",
+      "itemFailed": "This turn could not be transcribed.",
+      "seconds": "{{seconds}} s of audio",
+      "empty": "Transcripts appear here after each turn.",
+      "privacy": "Audio and transcripts are not stored or logged.",
+      "problems": {
+        "mic": {
+          "denied": "Microphone access was denied. Allow it in your browser's site settings and try again.",
+          "missing": "No microphone was found.",
+          "failed": "The microphone could not be started.",
+          "unsupported": "This browser cannot capture microphone audio for live transcription."
+        },
+        "signedOut": "Your dashboard session ended. Sign in again.",
+        "modelNotFound": "You cannot use that model, or it is no longer available.",
+        "busy": "No live member is free right now. Try again shortly.",
+        "backlog": "Audio arrived faster than the model could take it.",
+        "upstream": "The transcription node failed or disconnected.",
+        "shutdown": "The server is restarting. Try again shortly.",
+        "expired": "The session reached its maximum duration.",
+        "idle": "The session ended after two minutes without audio.",
+        "emptyCommit": "Nothing was said since the last turn.",
+        "denied": "The server refused the session or its access ended.",
+        "connection": "Could not connect. Check that you are still signed in and that the model has a live member.",
+        "server": "The server reported an error."
+      },
+      "unsupported": "Live transcription isn't available for this target: none of its served models declares live sessions."
+    }
   }
 }

@@ -1427,5 +1427,166 @@
       "errors_other": "{{value}} errores",
       "separator": " · "
     }
+  },
+  "test": {
+    "loadFailed": "No se pudo cargar lo que puedes probar.",
+    "emptyTitle": "Todavía no hay nada que probar",
+    "emptyHint": "Inicia un runtime en uno de tus nodos o crea un pool. Sus modelos servidos e IDs invocables aparecen aquí.",
+    "goToWelcome": "Abrir Bienvenida",
+    "errors": {
+      "upstream": "El servidor del modelo dijo:",
+      "empty": "El modelo respondió sin texto."
+    },
+    "target": {
+      "label": "Destino",
+      "pools": "IDs invocables",
+      "direct": "Modelos servidos de tus runtimes (directo)",
+      "directPill": "Directo",
+      "poolPill": "Pool",
+      "notServing": "Nada sirve este destino ahora; una solicitud puede esperarlo o fallar.",
+      "directHint": "Una prueba directa va directo a este modelo servido. Solo tú puedes probarlo, y solo aquí o con model_test; las claves de API llaman a pools.",
+      "missing": "{{target}} no es algo que puedas probar. Elige un destino abajo."
+    },
+    "kind": {
+      "chat": {
+        "title": "Chat",
+        "description": "Transmite la respuesta, con el razonamiento del modelo cuando lo comparte."
+      },
+      "embeddings": {
+        "title": "Embeddings",
+        "description": "Genera un embedding por línea y resume los vectores."
+      },
+      "transcription": {
+        "title": "Transcripción",
+        "description": "Transcribe un archivo de audio, o tu micrófono en vivo donde el destino lo admite."
+      }
+    },
+    "surface": {
+      "label": "API",
+      "only": "API: {{surface}}",
+      "OPENAI_CHAT_COMPLETIONS": "OpenAI Chat",
+      "OPENAI_RESPONSES": "OpenAI Responses",
+      "ANTHROPIC_MESSAGES": "Anthropic Messages"
+    },
+    "reasoning": {
+      "label": "Razonamiento",
+      "help": "Los niveles de razonamiento dependen del modelo; Predeterminado no envía ninguno y deja decidir al modelo.",
+      "levels": {
+        "unset": "Predeterminado",
+        "none": "Ninguno",
+        "minimal": "Mínimo",
+        "low": "Bajo",
+        "medium": "Medio",
+        "high": "Alto",
+        "xhigh": "Muy alto",
+        "max": "Máximo"
+      }
+    },
+    "chat": {
+      "tooLong": "Mantén el mensaje por debajo de 32,000 caracteres.",
+      "maxTokens": "Tokens máximos",
+      "newChat": "Chat nuevo",
+      "system": "Prompt del sistema",
+      "systemPlaceholder": "Instrucciones opcionales enviadas en cada turno",
+      "message": "Mensaje",
+      "placeholder": "Envía un mensaje (Enter envía, Shift+Enter agrega una línea)",
+      "send": "Enviar",
+      "stop": "Detener",
+      "empty": "Envía un mensaje para probar este destino.",
+      "you": "Tú",
+      "model": "Modelo",
+      "reasoning": "Razonamiento",
+      "waiting": "Esperando el primer token…",
+      "stopped": "Detenido.",
+      "attachments": {
+        "requestTooLarge": "Esta conversación es demasiado grande para enviarla. Quita adjuntos o empieza un chat nuevo.",
+        "max_one": "Adjunta como máximo {{count}} archivo.",
+        "max_other": "Adjunta como máximo {{count}} archivos.",
+        "unsupported": "Este destino y esta API no aceptan ese tipo de archivo.",
+        "tooLarge": "Cada adjunto puede pesar como máximo {{size}}.",
+        "list": "Adjuntos",
+        "remove": "Quitar {{name}}",
+        "add": "Adjuntar"
+      }
+    },
+    "metrics": {
+      "ttft": "Primer token {{ms}} ms",
+      "total": "Total {{ms}} ms",
+      "tokens_one": "{{count}} token",
+      "tokens_other": "{{count}} tokens",
+      "rate": "{{rate}} tokens/s",
+      "promptTokens_one": "{{count}} token de entrada",
+      "promptTokens_other": "{{count}} tokens de entrada"
+    },
+    "embeddings": {
+      "sample": "El veloz zorro marrón salta sobre el perro perezoso.\nUn zorro rojizo y rápido brinca sobre un sabueso dormido.",
+      "required": "Escribe al menos una línea.",
+      "tooMany_one": "Envía como máximo {{count}} línea.",
+      "tooMany_other": "Envía como máximo {{count}} líneas.",
+      "label": "Entradas",
+      "hint_one": "Una entrada por línea, hasta {{count}}.",
+      "hint_other": "Una entrada por línea, hasta {{count}}.",
+      "send": "Generar embeddings",
+      "result": "Resultado de embeddings",
+      "vectors_one": "{{count}} vector",
+      "vectors_other": "{{count}} vectores",
+      "dimensions_one": "{{count}} dimensión",
+      "dimensions_other": "{{count}} dimensiones",
+      "similarity": "Similitud coseno de las dos primeras: {{value}}",
+      "dims": "Dimensiones",
+      "norm": "Norma",
+      "range": "Rango",
+      "head": "Primeros valores"
+    },
+    "transcription": {
+      "fileRequired": "Elige un archivo de audio.",
+      "fileTooLarge": "Los archivos de prueba pueden pesar como máximo 9.5 MB.",
+      "badLanguage": "Usa un código de idioma como en o es-MX.",
+      "file": "Archivo de audio",
+      "language": "Idioma (opcional)",
+      "send": "Transcribir",
+      "result": "Transcripción",
+      "emptyText": "El modelo devolvió una transcripción vacía."
+    },
+    "live": {
+      "title": "Transcripción en vivo",
+      "description": "Habla al micrófono y observa cómo este destino lo transcribe con la misma API de sesiones en vivo que usan los clientes (/v1/realtime). Se ejecuta como tú y cuenta como uso de Test.",
+      "start": "Iniciar micrófono",
+      "stop": "Detener",
+      "commit": "Terminar turno",
+      "status": {
+        "idle": "Sin iniciar.",
+        "starting": "Conectando…",
+        "live": "Escuchando. Pulsa Terminar turno cuando acabes de hablar.",
+        "stopped": "Detenido.",
+        "failed": "La sesión terminó."
+      },
+      "transcribing": "Transcribiendo…",
+      "itemFailed": "No se pudo transcribir este turno.",
+      "seconds": "{{seconds}} s de audio",
+      "empty": "Las transcripciones aparecen aquí después de cada turno.",
+      "privacy": "El audio y las transcripciones no se guardan ni se registran.",
+      "problems": {
+        "mic": {
+          "denied": "Se negó el acceso al micrófono. Permítelo en la configuración del sitio de tu navegador e inténtalo de nuevo.",
+          "missing": "No se encontró ningún micrófono.",
+          "failed": "No se pudo iniciar el micrófono.",
+          "unsupported": "Este navegador no puede capturar audio del micrófono para la transcripción en vivo."
+        },
+        "signedOut": "Tu sesión del panel terminó. Inicia sesión de nuevo.",
+        "modelNotFound": "No puedes usar ese modelo o ya no está disponible.",
+        "busy": "No hay ningún miembro en vivo libre ahora. Inténtalo de nuevo en un momento.",
+        "backlog": "El audio llegó más rápido de lo que el modelo podía procesarlo.",
+        "upstream": "El nodo de transcripción falló o se desconectó.",
+        "shutdown": "El servidor se está reiniciando. Inténtalo de nuevo en un momento.",
+        "expired": "La sesión alcanzó su duración máxima.",
+        "idle": "La sesión terminó tras dos minutos sin audio.",
+        "emptyCommit": "No se dijo nada desde el último turno.",
+        "denied": "El servidor rechazó la sesión o su acceso terminó.",
+        "connection": "No se pudo conectar. Revisa que sigas con la sesión iniciada y que el modelo tenga un miembro en vivo.",
+        "server": "El servidor informó un error."
+      },
+      "unsupported": "La transcripción en vivo no está disponible para este destino: ninguno de sus modelos servidos declara sesiones en vivo."
+    }
   }
 }
