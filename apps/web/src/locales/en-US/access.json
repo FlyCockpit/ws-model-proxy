@@ -210,5 +210,16 @@
     "submit": "Fork",
     "forking": "Forking…",
     "done": "Runtime forked"
+  },
+  "ownKey": {
+    "label": "Cloud fallback key",
+    "ownerKey": "The owner's key (default)",
+    "hint": "When this pool falls back to the cloud, the owner lets you pay with your own key instead, using one of your provider models that stands in for {{model}}.",
+    "loadFailed": "Your provider models could not be loaded.",
+    "noModels": "You have no provider models to use your own key with.",
+    "addProvider": "Add a provider",
+    "unavailable": "A model you no longer have",
+    "saved": "Your own key is used for this pool's cloud fallback",
+    "cleared": "The owner's key is used again"
   }
 }

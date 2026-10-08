@@ -210,5 +210,16 @@
     "submit": "Hacer fork",
     "forking": "Haciendo fork…",
     "done": "Fork del runtime creado"
+  },
+  "ownKey": {
+    "label": "Clave para el respaldo en la nube",
+    "ownerKey": "La clave del dueño (predeterminada)",
+    "hint": "Cuando este pool recurre a la nube, el dueño te permite pagar con tu propia clave, usando uno de tus modelos de proveedor que sustituya a {{model}}.",
+    "loadFailed": "No se pudieron cargar tus modelos de proveedor.",
+    "noModels": "No tienes modelos de proveedor con los que usar tu propia clave.",
+    "addProvider": "Agregar un proveedor",
+    "unavailable": "Un modelo que ya no tienes",
+    "saved": "Se usa tu propia clave para el respaldo en la nube de este pool",
+    "cleared": "Se vuelve a usar la clave del dueño"
   }
 }

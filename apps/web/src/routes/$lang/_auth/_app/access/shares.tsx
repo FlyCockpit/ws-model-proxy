@@ -16,6 +16,7 @@ import { useTranslation } from "react-i18next";
 import z from "zod";
 
 import { ConfirmAction } from "@/components/access/confirm-action";
+import { OwnKeyChoice } from "@/components/access/own-key-choice";
 import { SecretReveal } from "@/components/access/secret-reveal";
 import { InlineRetry } from "@/components/inline-retry";
 import { PageHeading } from "@/components/page-stub";
@@ -411,6 +412,7 @@ function ShareWithMeRow({ share }: { share: ShareView }) {
         isPending={leave.isPending}
         onConfirm={() => leave.mutate({ shareId: share.id })}
       />
+      <OwnKeyChoice shareId={share.id} />
     </div>
   );
 }
