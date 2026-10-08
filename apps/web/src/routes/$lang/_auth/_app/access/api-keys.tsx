@@ -109,8 +109,9 @@ function CanUseChips({ apiKey }: { apiKey: ApiKeyView }) {
   });
   const names = new Map<string, string>();
   for (const pool of pools.data?.pools ?? []) names.set(pool.id, pool.callableIds[0] ?? pool.slug);
+  // A shared pool counts only while its share still lets you use it.
   for (const pool of pools.data?.sharedWithMe ?? [])
-    names.set(pool.poolId, pool.callableIds[0] ?? pool.poolId);
+    if (pool.canUse) names.set(pool.poolId, pool.callableIds[0] ?? pool.poolId);
   const chips =
     apiKey.scope === "ALL_POOLS"
       ? [{ key: "all", label: t("access:apiKeys.allPools"), known: true }]

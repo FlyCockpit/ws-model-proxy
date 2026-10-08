@@ -52,7 +52,10 @@ vi.mock("@/utils/orpc", () => {
       pools: {
         list: query(["pools", "list"], () => ({
           pools: [{ id: "p-own", slug: "chat", callableIds: ["me/chat"] }],
-          sharedWithMe: [{ poolId: "p-shared", callableIds: ["alice/embed"], canUse: true }],
+          sharedWithMe: [
+            { poolId: "p-shared", callableIds: ["alice/embed"], canUse: true },
+            { poolId: "p-contribute-only", callableIds: ["alice/batch"], canUse: false },
+          ],
         })),
       },
     },
@@ -95,8 +98,8 @@ afterEach(() => {
 });
 
 describe("Access → API keys: can use", { timeout: 30_000 }, () => {
-  it("names each selected pool, own and shared, and marks one no longer usable", async () => {
-    state.keys = [key("laptop", { poolIds: ["p-own", "p-shared", "p-gone"] })];
+  it("names each selected pool, own and shared, and marks those no longer usable", async () => {
+    state.keys = [key("laptop", { poolIds: ["p-own", "p-shared", "p-contribute-only", "p-gone"] })];
     await mount();
     await screen.findByText("me/chat");
     const chips = screen.getByText("me/chat").closest("ul");
@@ -105,7 +108,7 @@ describe("Access → API keys: can use", { timeout: 30_000 }, () => {
       within(chips)
         .getAllByRole("listitem")
         .map((chip) => chip.textContent),
-    ).toEqual(["me/chat", "alice/embed", "access:apiKeys.poolGone"]);
+    ).toEqual(["me/chat", "alice/embed", "access:apiKeys.poolGone", "access:apiKeys.poolGone"]);
     expect(screen.queryByText(/access:apiKeys.poolCount/)).toBeNull();
   });
 
