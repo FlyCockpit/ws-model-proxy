@@ -755,7 +755,34 @@ export const RUNTIME_JOB_ERRORS = [
   "readiness_failed",
   "health_failed",
   "job_deadline",
+  /**
+   * A `process` start handed its server off out of the node's units (its start unit has no task
+   * left while the port answers): it needs `management: "service"` with stop and status.
+   */
+  "process_detached",
 ] as const;
+/**
+ * Why a health probe failed, in a failed health result's `detail`: the serving process is not
+ * confirmed (its unit has no task left), the readiness URL answered another status
+ * (`http_<code>`), nothing listens, the probe ran out of time, the request failed another way,
+ * or the health/status command said not healthy.
+ */
+export const HEALTH_FAILURES = [
+  "serving_unconfirmed",
+  "connect_refused",
+  "timeout",
+  "unreachable",
+  "command_failed",
+  "status_not_running",
+] as const;
+const HEALTH_HTTP_FAILURE = /^http_[1-5][0-9]{2}$/;
+const HEALTH_FAILURE_CODES: ReadonlySet<string> = new Set(HEALTH_FAILURES);
+
+/** A health result's `detail` when it is a known reason (a node may send others later). */
+export function healthFailureDetail(detail: string | undefined): string | null {
+  if (detail === undefined) return null;
+  return HEALTH_FAILURE_CODES.has(detail) || HEALTH_HTTP_FAILURE.test(detail) ? detail : null;
+}
 /**
  * Why a status probe (stop proof) answered not stopped, in its `detail`: a process of the
  * rank's units still runs, the status command says running (or could not tell), the port is
@@ -789,7 +816,8 @@ export const runtimeJobResultFrameSchema = z
     error: z.enum(RUNTIME_JOB_ERRORS).optional(),
     /**
      * Which check failed (`bad_job`, `definition_missing`): a field path, never a value. On a
-     * status probe answered not stopped: why ({@link STOP_PROOF_FAILURES}).
+     * status probe answered not stopped: why ({@link STOP_PROOF_FAILURES}). On a failed health
+     * probe: why ({@link healthFailureDetail}).
      */
     detail: z
       .string()

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use super::{Deadline, Job, Runtime, command_env};
+use super::{Deadline, HealthMiss, Job, Runtime, command_env};
 use crate::protocol::frames::JobPhase;
 use crate::protocol::runtime_spec::Management;
 
@@ -390,7 +390,22 @@ impl Runtime for NativeRuntime {
                         return Ok(identity);
                     }
                     anyhow::ensure!(!self.cancelled(), "launch incomplete");
-                    if self.identity(unit, owner, deadline)?.is_none() {
+                    let current = self.identity(unit, owner, deadline)?;
+                    // A `process` start whose command exited 0 (the unit stays active with
+                    // no task) while its port is taken handed its server off (`docker
+                    // compose up -d`): nothing of it runs where wsmp can watch or stop it.
+                    if current.is_some()
+                        && job.action == JobPhase::Start
+                        && job.management() == Management::Process
+                        && !self.tasks_alive(unit, deadline)?
+                        && !self.port_free(&job.host, job.port)
+                    {
+                        return Err(super::fail(
+                            crate::protocol::frames::JobError::ProcessDetached,
+                        ))
+                        .context("the start handed its server off out of wsmp's units");
+                    }
+                    if current.is_none() {
                         let since = *gone_since.get_or_insert_with(std::time::Instant::now);
                         if since.elapsed() >= Duration::from_secs(5) {
                             return Err(super::fail(
@@ -724,15 +739,15 @@ impl Runtime for NativeRuntime {
         let _ = (slice, deadline);
     }
 
-    fn healthy_until(&self, job: &Job, deadline: Deadline) -> bool {
+    fn healthy_until(&self, job: &Job, deadline: Deadline) -> Result<(), HealthMiss> {
         if self.cancelled() {
-            return false;
+            return Err(HealthMiss::Unreachable);
         }
         let Some(readiness) = job.readiness() else {
-            return false;
+            return Err(HealthMiss::Unreachable);
         };
         let Ok(timeout) = deadline.remaining() else {
-            return false;
+            return Err(HealthMiss::Timeout);
         };
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
@@ -740,12 +755,38 @@ impl Runtime for NativeRuntime {
             .max_redirects(0)
             .build()
             .new_agent();
-        agent
+        let answered = agent
             .get(format!("{}{}", job.base_url(), readiness.path))
             .call()
-            .is_ok_and(|response| response.status().as_u16() == readiness.expected_status)
-            && !self.cancelled()
-            && deadline.remaining().is_ok()
+            .map_err(|error| health_miss(&error))?
+            .status()
+            .as_u16();
+        if self.cancelled() {
+            return Err(HealthMiss::Unreachable);
+        }
+        if deadline.remaining().is_err() {
+            return Err(HealthMiss::Timeout);
+        }
+        if answered == readiness.expected_status {
+            Ok(())
+        } else {
+            Err(HealthMiss::Http(answered))
+        }
+    }
+}
+
+/// Why a readiness request failed before any answer.
+fn health_miss(error: &ureq::Error) -> HealthMiss {
+    match error {
+        ureq::Error::Timeout(_) => HealthMiss::Timeout,
+        ureq::Error::StatusCode(status) => HealthMiss::Http(*status),
+        ureq::Error::Io(io) => match io.kind() {
+            std::io::ErrorKind::ConnectionRefused => HealthMiss::ConnectRefused,
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => HealthMiss::Timeout,
+            _ => HealthMiss::Unreachable,
+        },
+        ureq::Error::ConnectionFailed => HealthMiss::ConnectRefused,
+        _ => HealthMiss::Unreachable,
     }
 }
 
@@ -922,6 +963,88 @@ mod tests {
         let stopped = executor.execute(job(JobPhase::Stop, "s3"), &runtime, deadline());
         assert!(stopped.stopped, "{stopped:?}");
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+    }
+
+    /// Real systemd user units (`--ignored`): a `process` start that hands its server to
+    /// another manager (here the user manager itself, as `docker compose up -d` hands it to
+    /// dockerd) answers on its port with nothing left in its unit: readiness fails
+    /// `process_detached`.
+    #[test]
+    #[ignore = "needs a systemd user manager"]
+    fn a_real_process_start_that_hands_off_fails_detached() {
+        use crate::protocol::frames::{JobError, JobStatus};
+        let root = tempfile::tempdir().expect("root");
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("port")
+            .port();
+        let elsewhere = format!("wsmp-handoff-test-{port}");
+        // `sleep 2`: the start unit still runs when the start step checks it.
+        let start = format!(
+            "systemd-run --user --quiet --collect --unit={elsewhere} \
+             python3 -m http.server {port} --bind 127.0.0.1; sleep 2"
+        );
+        let job = |action: JobPhase, step: &str| super::super::Job {
+            step_id: step.into(),
+            instance_id: "handoff".into(),
+            runtime_id: "rt".into(),
+            version_id: "vr".into(),
+            launch_hash: "h".repeat(64),
+            rank: 0,
+            action,
+            intent_hash: "a".repeat(64),
+            owner_epoch: "e".into(),
+            command: if action == JobPhase::Start {
+                start.clone()
+            } else {
+                String::new()
+            },
+            stop_command: String::new(),
+            status_command: None,
+            health_command: None,
+            secrets: Vec::new(),
+            timeout_ms: 20_000,
+            unit_name: "wsmp-i-handoffhando-r0".into(),
+            handle: "i-handoffhando".into(),
+            port,
+            gpu_ids: None,
+            dist_port: None,
+            host: "127.0.0.1".into(),
+            spec: serde_json::json!({
+                "api": "openai", "engine": "other", "modelType": "llm",
+                "models": [{ "id": "m" }],
+                "launch": {
+                    "management": "process", "groupSize": 1,
+                    "resources": [{ "kind": "none" }], "labels": [],
+                    "commands": [{ "start": "x", "stop": "true" }],
+                    "readiness": { "path": "/", "expectedStatus": 200, "timeoutMs": 20000 },
+                    "health": { "intervalMs": 30000, "failureThreshold": 3, "successThreshold": 1 }
+                }
+            }),
+        };
+        let runtime = NativeRuntime { cancel: None };
+        let mut executor = super::super::Executor::load(root.path().join("x.json")).expect("load");
+        let deadline = || Deadline::new(std::time::Duration::from_secs(20));
+        let started = executor.execute(job(JobPhase::Start, "s1"), &runtime, deadline());
+        // The start command has exited and the handed-off server answers.
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        let readiness = executor.execute(job(JobPhase::Readiness, "s2"), &runtime, deadline());
+        let stopped = executor.execute(
+            job(JobPhase::Stop, "s3"),
+            &runtime,
+            Deadline::new(std::time::Duration::from_secs(5)),
+        );
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "stop", &elsewhere, "wsmp_i_handoffhando_r0.slice"])
+            .status();
+        assert_eq!(started.status, JobStatus::Succeeded, "{started:?}");
+        assert_eq!(
+            readiness.error,
+            Some(JobError::ProcessDetached),
+            "{readiness:?}"
+        );
+        // The rank's stop cannot be proven while the handed-off server holds the port.
+        assert!(!stopped.stopped, "{stopped:?}");
     }
 
     /// Real systemd user units (`--ignored`): a stop ends what its command left in the rank's

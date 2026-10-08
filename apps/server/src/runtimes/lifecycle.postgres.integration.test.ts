@@ -355,7 +355,11 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     lc: InstanceType<Modules["lifecycle"]["RuntimeLifecycle"]>,
     job: Job,
     status: "succeeded" | "failed",
-    extra: { stopped?: boolean; error?: "command_failed"; detail?: string } = {},
+    extra: {
+      stopped?: boolean;
+      error?: "command_failed" | "health_failed" | "process_detached";
+      detail?: string;
+    } = {},
   ) {
     await lc.handleJobResult(ref(), {
       type: "runtime.job.result",
@@ -399,16 +403,31 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     expect((await instance(id)).phase).toBe("READY");
     expect(await m.fixture.executionTarget.count({ where: { instanceId: id } })).toBe(1);
 
-    // Two failed probes make it UNHEALTHY.
-    for (let n = 0; n < 2; n++) {
+    // Two failed probes make it UNHEALTHY, and the node's reason is kept.
+    for (const detail of ["serving_unconfirmed", "http_503"]) {
       await m.fixture.runtimeInstance.update({
         where: { id },
         data: { lastHealthAt: new Date(Date.now() - 60_000) },
       });
       await lc.runOnce();
-      await answer(lc, lastJob(id, "health"), "failed", { error: "command_failed" });
+      await answer(lc, lastJob(id, "health"), "failed", { error: "health_failed", detail });
     }
-    expect((await instance(id)).phase).toBe("UNHEALTHY");
+    let unhealthy = await instance(id);
+    expect(unhealthy.phase).toBe("UNHEALTHY");
+    expect(unhealthy.phaseReason).toBe("health_failed");
+    expect(unhealthy.healthDetail).toBe("http_503");
+    // A reason this server does not know is not stored.
+    await m.fixture.runtimeInstance.update({
+      where: { id },
+      data: { lastHealthAt: new Date(Date.now() - 60_000) },
+    });
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "health"), "failed", {
+      error: "health_failed",
+      detail: "something_new",
+    });
+    unhealthy = await instance(id);
+    expect(unhealthy.healthDetail).toBeNull();
 
     // A person stops it: a stop step, then the proof releases the claim.
     await m.fixture.runtimeInstance.update({
@@ -458,6 +477,24 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     // The budget (1) is used up.
     expect(row.phase).toBe("FAILED");
     expect(row.phaseReason).toBe("restart_budget_exhausted");
+  });
+
+  it("fails a start that handed its server off, without restarting it", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_190);
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "start"), "succeeded");
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "readiness"), "failed", { error: "process_detached" });
+    let row = await instance(id);
+    expect(row.phase).toBe("STOPPING");
+    expect(row.phaseReason).toBe("process_detached");
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "stop"), "succeeded", { stopped: true });
+    row = await instance(id);
+    expect(row.phase).toBe("FAILED");
+    expect(row.phaseReason).toBe("process_detached");
+    expect(row.nextRestartAt).toBeNull();
   });
 
   it("never runs an agent's start on a Relay-only node; the claim is released", async () => {

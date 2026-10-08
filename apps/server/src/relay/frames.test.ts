@@ -16,6 +16,7 @@ import {
 import { describe, expect, it } from "vitest";
 import type { z } from "zod";
 import {
+  healthFailureDetail,
   NODE_TO_SERVER_CONTROL_TYPES,
   nodeToServerBinaryMetadataSchema,
   nodeToServerControlFrameSchema,
@@ -246,5 +247,38 @@ describe("relay.request methods", () => {
     expect(serverToNodeControlFrameSchema.safeParse({ ...frame, method: "PUT" }).success).toBe(
       false,
     );
+  });
+});
+
+describe("runtime job results", () => {
+  const result = {
+    type: "runtime.job.result",
+    stepId: "c".repeat(25),
+    instanceId: "d".repeat(25),
+    rank: 0,
+    intentHash: "a".repeat(64),
+    ownerEpoch: "epoch",
+    status: "failed",
+    stopped: false,
+  } as const;
+
+  it("accepts a health failure's reason and a detached process start", () => {
+    for (const detail of ["serving_unconfirmed", "http_503", "connect_refused", "timeout"]) {
+      expect(
+        nodeToServerControlFrameSchema.safeParse({ ...result, error: "health_failed", detail })
+          .success,
+      ).toBe(true);
+    }
+    expect(
+      nodeToServerControlFrameSchema.safeParse({ ...result, error: "process_detached" }).success,
+    ).toBe(true);
+  });
+
+  it("keeps only the health reasons it knows", () => {
+    expect(healthFailureDetail("http_404")).toBe("http_404");
+    expect(healthFailureDetail("serving_unconfirmed")).toBe("serving_unconfirmed");
+    expect(healthFailureDetail("http_99")).toBeNull();
+    expect(healthFailureDetail("port_in_use")).toBeNull();
+    expect(healthFailureDetail(undefined)).toBeNull();
   });
 });

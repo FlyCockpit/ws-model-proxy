@@ -395,6 +395,7 @@ export function instanceView(
     phase: row.phase,
     phaseReason: row.phaseReason,
     phaseChangedAt: row.phaseChangedAt.toISOString(),
+    healthDetail: row.healthDetail,
     needsOperator: row.needsOperator,
     startedBy: row.startedBy,
     restartWindow: {

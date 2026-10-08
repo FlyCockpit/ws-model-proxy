@@ -139,7 +139,13 @@ A spec has exactly one of:
   - `management`: `process` (the node owns the process: every process stays in
     the unit the node starts; a start that hands off to docker or a service
     manager must be `service`) or `service` (stop and a `status` command prove
-    it; exit 0 alive, exit 3 stopped).
+    it; exit 0 alive, exit 3 stopped). <a id="process-detached"></a>A
+    `process` start that hands off anyway (`docker compose up -d`, a server
+    that daemonizes) is caught once its port answers while nothing is left in
+    its unit: the start fails with `phaseReason: "process_detached"` and is not
+    restarted. Whatever it started runs outside the node's control, so the
+    stop cannot be proven while it holds the port; stop it by hand and redefine
+    the runtime as `service` with real `stop` and `status` commands.
   - `groupSize` (1–64 nodes), `resources` (one entry, or one per rank:
     `{kind: "none"}`, `{kind: "unified", memoryGb}`, `{kind: "cpu", ramGb}` or
     `{kind: "discrete", gpuCount, vramGb, ramGb?, vendor?}`), `labels` the node
@@ -157,7 +163,11 @@ A spec has exactly one of:
   - `secrets`: node secret names exported to every command.
   - `readiness: {path, expectedStatus, timeoutMs}` (required when the runtime
     serves models) and the required `health: {intervalMs, failureThreshold,
-    successThreshold}`.
+    successThreshold}`. An UNHEALTHY instance (`phaseReason:
+    "health_failed"`) shows why its last probe failed in `healthDetail`:
+    `serving_unconfirmed` (the serving process is gone from its unit),
+    `http_<code>`, `connect_refused`, `timeout`, `unreachable`,
+    `command_failed` (the `health` command) or `status_not_running`.
 
 A runtime that serves models also declares `api` (`openai` or `anthropic`),
 `engine` (`vllm`, `sglang`, `llama_cpp`, `ollama`, `lm_studio`, `other`),
@@ -753,6 +763,11 @@ starts an immediate sweep that will remove artifacts already past eligibility
   effectively multiplies by the replica count, so arrange shared enforcement
   before relying on fleet-wide ceilings. Distributed rate limiting is out of
   scope for this release.
+- The node relay (`/api/cli/ws`) has its own buckets, apart from sign-in:
+  10 authenticated connections per node per minute and 30 failed
+  (unauthenticated) connections per address per minute, each then blocked for
+  5 minutes (times `WMP_RATE_LIMIT_SCALE`). A connection that authenticates
+  gives its address point back.
 
 ## Client examples
 

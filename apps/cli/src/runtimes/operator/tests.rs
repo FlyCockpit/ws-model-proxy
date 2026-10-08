@@ -325,8 +325,12 @@ impl Runtime for Machine {
         self.stops.set(self.stops.get() + 1);
         Ok(())
     }
-    fn healthy_until(&self, _: &Job, _: Deadline) -> bool {
-        true
+    fn healthy_until(
+        &self,
+        _: &Job,
+        _: Deadline,
+    ) -> Result<(), crate::runtimes::executor::HealthMiss> {
+        Ok(())
     }
     fn tasks_alive(&self, _: &str, _: Deadline) -> anyhow::Result<bool> {
         Ok(false)

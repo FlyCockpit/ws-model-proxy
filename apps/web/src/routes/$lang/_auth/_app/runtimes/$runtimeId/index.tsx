@@ -269,6 +269,48 @@ function ServedModelRow({ runtime, model }: { runtime: RuntimeDetail; model: Ser
   );
 }
 
+const HEALTH_REASONS = [
+  "serving_unconfirmed",
+  "connect_refused",
+  "timeout",
+  "unreachable",
+  "command_failed",
+  "status_not_running",
+] as const;
+type HealthReason = (typeof HEALTH_REASONS)[number];
+
+function isHealthReason(value: string): value is HealthReason {
+  return (HEALTH_REASONS as readonly string[]).includes(value);
+}
+
+/** Why the instance is unhealthy or failed to start, when the node said. */
+function InstanceReasonNote({ instance }: { instance: Instance }) {
+  const { t } = useTranslation();
+  const detail = instance.healthDetail;
+  const status = detail ? /^http_(\d{3})$/.exec(detail)?.[1] : undefined;
+  const reason = !detail
+    ? null
+    : status
+      ? t("dashboard:runtime.healthReason.http", { status })
+      : isHealthReason(detail)
+        ? t(`dashboard:runtime.healthReason.${detail}`)
+        : detail;
+  return (
+    <>
+      {reason ? (
+        <p className="break-words text-xs text-muted-foreground">
+          {t("dashboard:runtime.healthReason.label", { reason })}
+        </p>
+      ) : null}
+      {instance.phaseReason === "process_detached" ? (
+        <p className="break-words text-sm text-destructive">
+          {t("dashboard:runtime.processDetached")}
+        </p>
+      ) : null}
+    </>
+  );
+}
+
 function InstancesCard({ runtime }: { runtime: RuntimeDetail }) {
   const { t } = useTranslation(["dashboard", "common"]);
   const { lang } = Route.useParams();
@@ -332,6 +374,7 @@ function InstancesCard({ runtime }: { runtime: RuntimeDetail }) {
                     )}
                     {instance.phaseReason ? ` · ${instance.phaseReason}` : ""}
                   </p>
+                  <InstanceReasonNote instance={instance} />
                 </div>
                 {instance.needsOperator === "MARK_STOPPED" ? (
                   <MarkStoppedAction runtimeId={runtime.id} instanceId={instance.id} />

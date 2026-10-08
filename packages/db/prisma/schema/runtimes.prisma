@@ -311,6 +311,9 @@ model RuntimeInstance {
   healthSuccesses             Int                 @default(0)
   lastHealthAt                DateTime?
   unhealthySince              DateTime?
+  /// Why the last health probe failed (`serving_unconfirmed`, `http_<code>`, `connect_refused`,
+  /// `timeout`, …), kept until the instance is READY again.
+  healthDetail                String?
   /// Since when a rank's node has been offline (L2: after advanced.unavailableStopMs the online
   /// ranks are gang-stopped and the offline rank waits for proof or Mark as stopped).
   unavailableSince            DateTime?

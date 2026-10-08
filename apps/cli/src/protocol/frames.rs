@@ -981,6 +981,9 @@ pub enum JobError {
     ReadinessFailed,
     HealthFailed,
     JobDeadline,
+    /// A `process` start handed its server off out of wsmp's units (the
+    /// start unit has no task left while the port answers).
+    ProcessDetached,
 }
 
 impl JobError {
@@ -1199,7 +1202,9 @@ pub enum NodeFrame {
         stopped: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<JobError>,
-        /// Which check failed: a field path, never a value.
+        /// Which check failed: a field path, never a value. A stop proof
+        /// answered not stopped: why. A failed health probe: why
+        /// (`serving_unconfirmed`, `http_<code>`, `connect_refused`, ...).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
