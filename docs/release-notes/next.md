@@ -163,7 +163,7 @@ in the node's own configuration:
 - **Full control** (default): the server may define and start runtimes, run
   commands, read and write files inside the folders you allow, open terminals
   and set node secrets.
-- **Relay only**: the server may only send requests to the model servers on the
+- **Relay only**: the server may only send requests to the runtimes on the
   node and start or stop the runtimes it already holds. Definitions are frozen
   when trust is lowered; nothing new can be defined, run or read, and running
   node commands are stopped. People can still start and stop those runtimes

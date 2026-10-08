@@ -182,7 +182,7 @@ terminal approvals revoke`) work from anywhere.
 This is a **best-effort guard against agents** raising or widening their own access through the
 server: dropping `WSMP_JOB`, `systemd-run --user` or a crontab does not get past it. It is **not a
 security boundary against other code running as your user**: such code can move itself into a
-cgroup named like a terminal's, ask your tmux to run a command, `ssh` back in to this machine, or
+cgroup named like a terminal's, ask your tmux to run a command, `ssh` back in to this node, or
 simply edit your files, including this CLI's configuration. On Linux the relay adopts what its
 commands leave behind (a `setsid` or double-forked process re-parents to it, not to init; if it
 cannot, it logs an error at startup), so that stays refused while the relay runs. That includes a
