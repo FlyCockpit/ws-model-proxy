@@ -173,7 +173,9 @@ const UNTRACED: &str = "its parent processes do not lead back to a terminal or a
 ///   (`run-*.service`, `run-*.scope`), or the relay's own service cgroup;
 /// - (c) an ancestor is the relay (`daemon_pid`, or any `wsmp … run`). The
 ///   relay is a child subreaper (`crate::subreaper`), so an orphan of its
-///   commands (`setsid -f`, a double fork) re-parents to it, not to init;
+///   commands (`setsid -f`, a double fork) re-parents to it, not to init.
+///   A daemon a command started (a tmux server, `gpg-agent`) is then the
+///   relay's, and so is everything it later starts, while the relay runs;
 /// - (d) it runs in a service of the user's systemd manager
 ///   (`user@UID.service/…/x.service/…`): a person's shell runs in a session
 ///   or app scope, while `systemd-run --user --unit=x` makes a service.
@@ -658,7 +660,20 @@ mod tests {
             Some(helper_pid),
             "the subreaper adopts the double-forked orphan"
         );
-        assert_eq!(started_by_wsmp(adopted as i32, helper_pid), Err(STARTED));
+        let adopted_pid = i32::try_from(adopted).expect("pid");
+        assert!(started_by_wsmp(adopted_pid, helper_pid).is_err());
+        // Rule (c) itself: with a cgroup check that never fires, the walk
+        // still stops at the relay (the helper) above the orphan. (Run under
+        // a user service or a `run-*` scope, rules (b) and (d) fire first.)
+        let me = i32::try_from(std::process::id()).expect("pid");
+        if started_by_wsmp(me, 0).is_ok() {
+            assert_eq!(started_by_wsmp(adopted_pid, helper_pid), Err(STARTED));
+            assert_eq!(
+                started_by_wsmp(adopted_pid, 0),
+                Ok(()),
+                "without the relay's pid"
+            );
+        }
         drop(helper.stdin.take());
         assert!(
             // Read to the end: a closed pipe would fail the helper's last prints.

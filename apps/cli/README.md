@@ -182,8 +182,10 @@ server: dropping `WSMP_JOB`, `systemd-run --user` or a crontab does not get past
 security boundary against other code running as your user**: such code can move itself into a
 cgroup named like a terminal's, ask your tmux to run a command, `ssh` back in to this machine, or
 simply edit your files, including this CLI's configuration. On Linux the relay adopts what its
-commands leave behind (a `setsid` or double-forked process re-parents to it, not to init), so that
-stays refused while the relay runs. Prefer the service (`wsmp service install`): when a relay you
+commands leave behind (a `setsid` or double-forked process re-parents to it, not to init; if it
+cannot, it logs an error at startup), so that stays refused while the relay runs. That includes a
+daemon a command or browser terminal started, such as a tmux server, and everything it starts later:
+a new pane of that tmux cannot raise trust. Prefer the service (`wsmp service install`): when a relay you
 started by hand stops, those processes re-parent away from it and are no longer caught, while the
 service's cgroup still holds them. On macOS only the relay's descendants are refused (the `ps` parent
 walk), so a detached process escapes. If you do not trust the code on this account, Relay only does

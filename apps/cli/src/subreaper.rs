@@ -115,11 +115,11 @@ pub fn start() {
             }
         });
     if let Err(error) = spawned {
-        tracing::warn!(%error, "no reaper thread; commands' orphans re-parent away from the relay");
+        tracing::error!(%error, "no reaper thread; commands' orphans re-parent away from the relay");
         return;
     }
     if let Err(error) = nix::sys::prctl::set_child_subreaper(true) {
-        tracing::warn!(%error, "cannot become a child subreaper; commands' orphans re-parent away from the relay");
+        tracing::error!(%error, "cannot become a child subreaper; commands' orphans re-parent away from the relay");
     }
 }
 
@@ -128,18 +128,34 @@ pub fn start() {
 pub fn start() {}
 
 /// Reap every child that is a zombie and not registered by [`spawn`]: the
-/// orphans this subreaper adopted. Returns how many were reaped.
+/// orphans this subreaper adopted. Returns how many were reaped. Skips the
+/// round while a spawn holds the gate: a spawn stuck before `exec` (a hung
+/// mount) must not make every later spawn queue behind a waiting scan.
 #[cfg(target_os = "linux")]
 pub fn reap_adopted() -> usize {
-    reap_adopted_where(|_| true)
+    let gate = match GATE.try_write() {
+        Ok(gate) => gate,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return 0,
+    };
+    reap_unowned(&gate, |_| true)
 }
 
-/// [`reap_adopted`] limited to the children `consider` accepts (tests share a
-/// process with other tests' children).
-#[cfg(target_os = "linux")]
+/// [`reap_adopted`] limited to the children `consider` accepts, waiting for
+/// the gate (tests share a process with other tests' children).
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn reap_adopted_where(consider: impl Fn(u32) -> bool) -> usize {
+    let gate = GATE.write().unwrap_or_else(PoisonError::into_inner);
+    reap_unowned(&gate, consider)
+}
+
+/// The scan, under the gate held exclusively.
+#[cfg(target_os = "linux")]
+fn reap_unowned(
+    _gate: &std::sync::RwLockWriteGuard<'_, ()>,
+    consider: impl Fn(u32) -> bool,
+) -> usize {
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-    let _gate = GATE.write().unwrap_or_else(PoisonError::into_inner);
     // Registration needs the gate, so the set can only shrink while it is
     // held: this copy skips at least every pid registered now.
     let owned: std::collections::BTreeSet<u32> = OWNED
@@ -200,14 +216,22 @@ fn is_zombie_child(pid: u32, me: u32) -> bool {
     stat_fields(pid).is_some_and(|(state, ppid)| state == 'Z' && ppid == me)
 }
 
-/// State and parent pid from `/proc/<pid>/stat` (`pid (comm) S ppid …`;
-/// `comm` may hold spaces and parentheses).
+/// State and parent pid from `/proc/<pid>/stat` (`pid (comm) S ppid …`).
+/// Read as bytes: `comm` may hold spaces, parentheses and bytes that are not
+/// UTF-8 (the kernel cuts it at 15 bytes, possibly inside a character).
 #[cfg(target_os = "linux")]
 fn stat_fields(pid: u32) -> Option<(char, u32)> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let mut rest = stat[stat.rfind(')')? + 1..].split_whitespace();
-    let state = rest.next()?.chars().next()?;
-    let ppid = rest.next()?.parse().ok()?;
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    stat_fields_of(&stat)
+}
+
+#[cfg(target_os = "linux")]
+fn stat_fields_of(stat: &[u8]) -> Option<(char, u32)> {
+    let close = stat.iter().rposition(|byte| *byte == b')')?;
+    let rest = std::str::from_utf8(&stat[close + 1..]).ok()?;
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let ppid = fields.next()?.parse().ok()?;
     Some((state, ppid))
 }
 
@@ -254,14 +278,35 @@ mod tests {
         assert!(!is_zombie_child(stray, me), "the stray is gone");
         // The owner still gets its child's status.
         assert!(owned.wait().expect("owner's wait").success());
-        // A dropped handle unregisters its pid.
-        let pid = owned.id();
-        drop(owned);
-        assert!(
-            !OWNED
+    }
+
+    #[test]
+    fn a_dropped_handle_unregisters_its_pid() {
+        // A pid no real child has, so no parallel test can register it.
+        let registered = |pid| {
+            OWNED
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .contains_key(&pid)
+        };
+        let first = spawn(|| Ok::<_, ()>(()), |_| Some(u32::MAX)).expect("first");
+        let second = spawn(|| Ok::<_, ()>(()), |_| Some(u32::MAX)).expect("second");
+        drop(first);
+        assert!(
+            registered(u32::MAX),
+            "a reused pid stays while a handle lives"
         );
+        drop(second);
+        assert!(!registered(u32::MAX));
+    }
+
+    #[test]
+    fn stat_fields_read_names_that_are_not_utf8() {
+        assert_eq!(
+            stat_fields_of(b"42 (1234567890123\xc3) Z 25 42 42 0"),
+            Some(('Z', 25))
+        );
+        assert_eq!(stat_fields_of(b"42 (a) b) S 1 42"), Some(('S', 1)));
+        assert_eq!(stat_fields_of(b"42 (a"), None);
     }
 }
