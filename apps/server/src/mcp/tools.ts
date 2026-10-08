@@ -528,7 +528,6 @@ const STATIC_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   CONFLICT: "Conflict",
   PRECONDITION_FAILED: "Precondition failed",
   TOO_MANY_REQUESTS: "Too many requests",
-  NOT_IMPLEMENTED: "Not implemented yet.",
 });
 
 const REFUSAL_REASON_SHAPE = /^[a-z][a-z0-9_]{1,63}$/;
