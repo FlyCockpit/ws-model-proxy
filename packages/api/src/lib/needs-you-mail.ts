@@ -3,11 +3,14 @@
  * on, the owner gets one e-mail per new need. Without SMTP nothing is sent and nothing is read.
  *
  * - Instance needs (an interactive step waiting, a restart, Mark as stopped) are picked up by
- *   `sweepNeedsYouMail`, which the server runs every minute. A need is new when the instance's
- *   `needsOperatorNotifiedAt` is unset or older than `needsOperatorSince` (set each time a need
- *   begins). The sweep claims a need by writing `needsOperatorNotifiedAt` in a compare-and-set
- *   before it sends, so replicas and overlapping sweeps never send it twice. A failed send
- *   releases the claim for the next sweep, up to `NEEDS_YOU_MAIL_MAX_FAILURES` times.
+ *   `sweepNeedsYouMail`, which the server runs every minute. `needsOperatorNotifiedAt` holds the
+ *   `needsOperatorSince` of the need last mailed (not a clock reading, so a need raised while a
+ *   sweep runs is never mistaken for one already mailed); a need is new when it is unset or
+ *   older than `needsOperatorSince`, which is set each time a need begins. The sweep claims a
+ *   need with a compare-and-set before it sends, so replicas and overlapping sweeps never send
+ *   it twice. A failed send releases the claim for the next sweep, marked `since - 1 ms`, so the
+ *   failure count is known to belong to this need; after `NEEDS_YOU_MAIL_MAX_FAILURES` tries
+ *   the need counts as mailed.
  * - A command an agent queued for the person is mailed once, when the row is created
  *   (`notifyQueuedCommand`): creation happens once per row, so it needs no marker.
  *
@@ -19,6 +22,7 @@
  */
 import { DEFAULT_LOCALE, isSupportedLocale } from "@ws-model-proxy/config/locales";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
+import { isDbShutdownFenceArmed } from "@ws-model-proxy/db/shutdown-fence";
 import { env } from "@ws-model-proxy/env/server";
 import {
   isEmailConfigured,
@@ -133,14 +137,17 @@ export async function notifyQueuedCommand(args: {
   now?: Date;
 }): Promise<boolean> {
   if (!isEmailConfigured()) return false;
+  const nowMs = (args.now ?? new Date()).getTime();
   try {
     const user = await prisma.user.findFirst({
       where: { id: args.userId, ...recipientWhere },
       select: { email: true, locale: true },
     });
     if (!user) return false;
-    if (!takeMailSlot(args.userId, (args.now ?? new Date()).getTime())) return false;
-    return await deliver(user, "queued_command", args.nodeSlug, null);
+    if (!takeMailSlot(args.userId, nowMs)) return false;
+    const sent = await deliver(user, "queued_command", args.nodeSlug, null);
+    if (!sent) returnMailSlot(args.userId, nowMs);
+    return sent;
   } catch (error) {
     console.warn(
       "[needs-you] queued command notice failed:",
@@ -150,9 +157,15 @@ export async function notifyQueuedCommand(args: {
   }
 }
 
+/** The release marker of a failed send: just before the need began, so it stays new. */
+function releaseMarker(since: Date): Date {
+  return new Date(since.getTime() - 1);
+}
+
 /**
  * One pass over new instance needs. Returns how many e-mails were sent. Throws only on a
- * database failure (the scheduler logs it); a send failure is counted on the row.
+ * database failure (the scheduler logs it); a send failure is counted on the row. Stops before
+ * the next claim once the database shutdown fence is armed.
  */
 export async function sweepNeedsYouMail(now: Date = new Date()): Promise<number> {
   if (!isEmailConfigured()) return 0;
@@ -184,17 +197,24 @@ export async function sweepNeedsYouMail(now: Date = new Date()): Promise<number>
   });
   let sent = 0;
   for (const row of rows) {
-    if (row.needsOperator === null || row.needsOperatorSince === null) continue;
+    if (isDbShutdownFenceArmed()) break;
+    const since = row.needsOperatorSince;
+    if (row.needsOperator === null || since === null) continue;
     if (!takeMailSlot(row.userId, nowMs)) continue;
+    // Failures counted for an earlier need do not count against this one.
+    const priorFailures =
+      row.needsOperatorNotifiedAt?.getTime() === releaseMarker(since).getTime()
+        ? row.needsOperatorNotifyFailures
+        : 0;
     // Compare-and-set on the need as read: a need that changed or was claimed elsewhere is left.
     const claim = await prisma.runtimeInstance.updateMany({
       where: {
         id: row.id,
         needsOperator: row.needsOperator,
-        needsOperatorSince: row.needsOperatorSince,
+        needsOperatorSince: since,
         needsOperatorNotifiedAt: row.needsOperatorNotifiedAt,
       },
-      data: { needsOperatorNotifiedAt: now },
+      data: { needsOperatorNotifiedAt: since },
     });
     if (claim.count === 0) {
       returnMailSlot(row.userId, nowMs);
@@ -210,23 +230,23 @@ export async function sweepNeedsYouMail(now: Date = new Date()): Promise<number>
       sent += 1;
       if (row.needsOperatorNotifyFailures > 0) {
         await prisma.runtimeInstance.updateMany({
-          where: { id: row.id, needsOperatorNotifiedAt: now },
+          where: { id: row.id, needsOperatorSince: since, needsOperatorNotifiedAt: since },
           data: { needsOperatorNotifyFailures: 0 },
         });
       }
       continue;
     }
     returnMailSlot(row.userId, nowMs);
-    const failures = row.needsOperatorNotifyFailures + 1;
+    const failures = priorFailures + 1;
     await prisma.runtimeInstance.updateMany({
-      where: { id: row.id, needsOperatorNotifiedAt: now },
-      // After the last try the need counts as handled (the claim stays) and the count resets
-      // for the next one; before it, the claim is released for the next sweep.
+      where: { id: row.id, needsOperatorSince: since, needsOperatorNotifiedAt: since },
+      // After the last try the need counts as mailed (the claim stays) and the count resets;
+      // before it, the claim is released for the next sweep.
       data:
         failures >= NEEDS_YOU_MAIL_MAX_FAILURES
           ? { needsOperatorNotifyFailures: 0 }
           : {
-              needsOperatorNotifiedAt: row.needsOperatorNotifiedAt,
+              needsOperatorNotifiedAt: releaseMarker(since),
               needsOperatorNotifyFailures: failures,
             },
     });

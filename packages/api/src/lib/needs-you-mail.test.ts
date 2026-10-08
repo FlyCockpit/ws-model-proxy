@@ -7,6 +7,10 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 }));
 vi.mock("@ws-model-proxy/env/shared", () => ({ env: {} }));
 vi.mock("@ws-model-proxy/db", () => ({ default: mockDeep<PrismaClient>() }));
+const fence = vi.hoisted(() => ({ armed: false }));
+vi.mock("@ws-model-proxy/db/shutdown-fence", () => ({
+  isDbShutdownFenceArmed: () => fence.armed,
+}));
 const mail = vi.hoisted(() => ({
   configured: true,
   sendEmail: vi.fn(async (_message: { to: string; subject: string; html: string }) => {}),
@@ -49,6 +53,7 @@ function need(overrides: Record<string, unknown> = {}) {
 beforeEach(() => {
   mockReset(db);
   mail.configured = true;
+  fence.armed = false;
   mail.sendEmail.mockReset();
   mail.sendEmail.mockResolvedValue(undefined);
   resetNeedsYouMailLimiter();
@@ -78,7 +83,11 @@ describe("sweepNeedsYouMail", () => {
       needsOperator: { not: null },
       Runtime: { User: { operationalAlerts: true, emailVerified: true } },
     });
-    expect(where?.OR?.[0]).toEqual({ needsOperatorNotifiedAt: null });
+    // Unmarked, or marked for an earlier need: the column is compared with needsOperatorSince.
+    expect(where?.OR).toEqual([
+      { needsOperatorNotifiedAt: null },
+      { needsOperatorNotifiedAt: { lt: db.runtimeInstance.fields.needsOperatorSince } },
+    ]);
     // Each one is claimed with a compare-and-set on the need as read, before it is sent.
     expect(db.runtimeInstance.updateMany.mock.calls[0]?.[0]).toEqual({
       where: {
@@ -87,8 +96,27 @@ describe("sweepNeedsYouMail", () => {
         needsOperatorSince: since,
         needsOperatorNotifiedAt: null,
       },
-      data: { needsOperatorNotifiedAt: now },
+      // The marker is the need's own start, not a clock reading.
+      data: { needsOperatorNotifiedAt: since },
     });
+  });
+
+  it("mails a need raised again after one already mailed", async () => {
+    const earlier = new Date(since.getTime() - 600_000);
+    db.runtimeInstance.findMany.mockResolvedValue([
+      need({ needsOperatorNotifiedAt: earlier }),
+    ] as never);
+    await expect(sweepNeedsYouMail(now)).resolves.toBe(1);
+    expect(db.runtimeInstance.updateMany.mock.calls[0]?.[0]?.where).toMatchObject({
+      needsOperatorNotifiedAt: earlier,
+    });
+  });
+
+  it("stops claiming once the shutdown fence is armed", async () => {
+    db.runtimeInstance.findMany.mockResolvedValue([need()] as never);
+    fence.armed = true;
+    await expect(sweepNeedsYouMail(now)).resolves.toBe(0);
+    expect(db.runtimeInstance.updateMany).not.toHaveBeenCalled();
   });
 
   it("sends nothing and reads nothing without SMTP", async () => {
@@ -109,17 +137,51 @@ describe("sweepNeedsYouMail", () => {
     db.runtimeInstance.findMany.mockResolvedValue([need()] as never);
     mail.sendEmail.mockRejectedValue(new Error("smtp down"));
     await expect(sweepNeedsYouMail(now)).resolves.toBe(0);
+    const released = new Date(since.getTime() - 1);
     expect(db.runtimeInstance.updateMany.mock.calls[1]?.[0]).toEqual({
-      where: { id: "inst1", needsOperatorNotifiedAt: now },
-      data: { needsOperatorNotifiedAt: null, needsOperatorNotifyFailures: 1 },
+      where: { id: "inst1", needsOperatorSince: since, needsOperatorNotifiedAt: since },
+      data: { needsOperatorNotifiedAt: released, needsOperatorNotifyFailures: 1 },
     });
     db.runtimeInstance.updateMany.mockClear();
     db.runtimeInstance.findMany.mockResolvedValue([
-      need({ needsOperatorNotifyFailures: NEEDS_YOU_MAIL_MAX_FAILURES - 1 }),
+      need({
+        needsOperatorNotifiedAt: released,
+        needsOperatorNotifyFailures: NEEDS_YOU_MAIL_MAX_FAILURES - 1,
+      }),
     ] as never);
     await sweepNeedsYouMail(now);
     expect(db.runtimeInstance.updateMany.mock.calls[1]?.[0]).toEqual({
-      where: { id: "inst1", needsOperatorNotifiedAt: now },
+      where: { id: "inst1", needsOperatorSince: since, needsOperatorNotifiedAt: since },
+      data: { needsOperatorNotifyFailures: 0 },
+    });
+  });
+
+  it("does not count an earlier need's failures against a new one", async () => {
+    mail.sendEmail.mockRejectedValue(new Error("smtp down"));
+    db.runtimeInstance.findMany.mockResolvedValue([
+      // Failed for a need released at an older marker; this need started later.
+      need({
+        needsOperatorNotifiedAt: new Date(since.getTime() - 600_001),
+        needsOperatorNotifyFailures: NEEDS_YOU_MAIL_MAX_FAILURES - 1,
+      }),
+    ] as never);
+    await sweepNeedsYouMail(now);
+    expect(db.runtimeInstance.updateMany.mock.calls[1]?.[0]?.data).toEqual({
+      needsOperatorNotifiedAt: new Date(since.getTime() - 1),
+      needsOperatorNotifyFailures: 1,
+    });
+  });
+
+  it("resets the failure count after a successful retry", async () => {
+    db.runtimeInstance.findMany.mockResolvedValue([
+      need({
+        needsOperatorNotifiedAt: new Date(since.getTime() - 1),
+        needsOperatorNotifyFailures: 2,
+      }),
+    ] as never);
+    await expect(sweepNeedsYouMail(now)).resolves.toBe(1);
+    expect(db.runtimeInstance.updateMany.mock.calls[1]?.[0]).toEqual({
+      where: { id: "inst1", needsOperatorSince: since, needsOperatorNotifiedAt: since },
       data: { needsOperatorNotifyFailures: 0 },
     });
   });
@@ -174,6 +236,19 @@ describe("notifyQueuedCommand", () => {
     await expect(notifyQueuedCommand({ userId: "owner", nodeSlug: "box" })).resolves.toBe(false);
     expect(db.user.findFirst).not.toHaveBeenCalled();
     expect(mail.sendEmail).not.toHaveBeenCalled();
+  });
+
+  it("gives the rate-limit slot back when the send fails", async () => {
+    db.user.findFirst.mockResolvedValue({ email: "o@example.test", locale: "en-US" } as never);
+    mail.sendEmail.mockRejectedValueOnce(new Error("smtp down"));
+    await expect(notifyQueuedCommand({ userId: "owner", nodeSlug: "box", now })).resolves.toBe(
+      false,
+    );
+    for (let i = 0; i < NEEDS_YOU_MAIL_PER_WINDOW; i += 1) {
+      await expect(notifyQueuedCommand({ userId: "owner", nodeSlug: "box", now })).resolves.toBe(
+        true,
+      );
+    }
   });
 
   it("sends nothing when the owner turned alerts off", async () => {

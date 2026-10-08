@@ -3,9 +3,9 @@
  * nothing when SMTP is not configured, claims each need with a compare-and-set before it sends
  * (safe across replicas and overlapping runs), and is guarded so runs never overlap here.
  *
- * It owns no durable work at shutdown: stop() prevents future runs and the DB shutdown fence
- * skips a run that would start during teardown. An unsent need stays unclaimed for the next
- * process.
+ * It owns no durable work at shutdown: stop() prevents future runs, and once the DB shutdown
+ * fence is armed no run starts and a running sweep claims nothing more. A need not yet claimed
+ * stays for the next process; one whose send was cut short may count as mailed.
  */
 import { sweepNeedsYouMail } from "@ws-model-proxy/api/lib/needs-you-mail";
 import { isDbShutdownFenceArmed } from "@ws-model-proxy/db/shutdown-fence";

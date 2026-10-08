@@ -8,6 +8,8 @@ vi.mock("@ws-model-proxy/db", () => ({
   Prisma: { DbNull: "DbNull" },
 }));
 vi.mock("@ws-model-proxy/db/node-security", () => ({ credentialDigest: vi.fn() }));
+// The queued-command notice pulls in the mailer; without SMTP it sends nothing.
+vi.mock("@ws-model-proxy/env/shared", () => ({ env: {} }));
 vi.mock("@ws-model-proxy/env/server", () => ({ env: {} }));
 vi.mock("@ws-model-proxy/auth", () => ({ auth: { api: {} } }));
 vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
