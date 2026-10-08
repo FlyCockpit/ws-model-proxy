@@ -22,6 +22,7 @@ describe("ChatMarkdown", () => {
     expect(container.querySelector(":not(pre) > code")?.textContent).toBe("code");
     expect(container.querySelectorAll("li")).toHaveLength(2);
     expect(container.querySelector("table td")?.textContent).toBe("1");
+    expect(container.querySelector("table")?.parentElement?.className).toContain("overflow-x-auto");
     expect(container.querySelector("del")?.textContent).toBe("gone");
   });
 
@@ -52,6 +53,36 @@ describe("ChatMarkdown", () => {
     expect(docs?.getAttribute("target")).toBe("_blank");
     expect(docs?.getAttribute("rel")).toBe("noopener noreferrer");
     expect(container.innerHTML).not.toContain("javascript:");
+    // The dropped link is plain text, not a link to this page.
+    expect(links).toHaveLength(1);
+    expect(container.textContent).toContain("bad");
+  });
+
+  it("keeps footnote links in the page with ids unique per answer", () => {
+    const answer = "Fact[^1].\n\n[^1]: Source.";
+    const { container } = render(
+      <>
+        <ChatMarkdown content={answer} />
+        <ChatMarkdown content={answer} />
+      </>,
+    );
+    const refs = [...container.querySelectorAll("a[href^='#']")];
+    expect(refs.length).toBeGreaterThan(0);
+    for (const ref of refs) expect(ref.getAttribute("target")).toBeNull();
+    const ids = [...container.querySelectorAll("[id]")].map((element) => element.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    // Each reference names its own answer's footnote label.
+    for (const ref of refs) {
+      const label = ref.getAttribute("aria-describedby");
+      if (label) expect(ids).toContain(label);
+    }
+  });
+
+  it("renders an answer's headings below the page's own", () => {
+    const { container } = render(<ChatMarkdown content={"# Title\n\n## Part"} />);
+    expect(container.querySelector("h1, h2")).toBeNull();
+    expect(container.querySelector("h3")?.textContent).toBe("Title");
+    expect(container.querySelector("h4")?.textContent).toBe("Part");
   });
 
   it("shows images as links instead of loading them", () => {
@@ -61,6 +92,11 @@ describe("ChatMarkdown", () => {
     expect(container.querySelector("img")).toBeNull();
     const link = container.querySelector("a");
     expect(link?.textContent).toBe("a chart");
+    expect(link?.getAttribute("href")).toBe("https://example.com/c.png?leak=1");
+    cleanup();
+    const unsafe = render(<ChatMarkdown content={"![just text](javascript:alert(1))"} />);
+    expect(unsafe.container.querySelector("img, a")).toBeNull();
+    expect(unsafe.container.textContent).toBe("just text");
     expect(link?.getAttribute("rel")).toBe("noopener noreferrer");
   });
 
