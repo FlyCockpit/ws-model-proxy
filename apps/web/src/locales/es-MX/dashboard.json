@@ -1356,7 +1356,12 @@
         "forgotten": "Se olvidaron los ajustes aprendidos."
       }
     },
-    "kvUsage": "Caché KV {{percent}} %"
+    "kvUsage": "Caché KV {{percent}} %",
+    "groups": {
+      "needsYou": "Te necesita",
+      "node": "En {{node}}",
+      "notRunning": "Sin ejecutar"
+    }
   },
   "overview": {
     "range": "Periodo",

@@ -1356,7 +1356,12 @@
         "forgotten": "Learned fixes forgotten."
       }
     },
-    "kvUsage": "KV cache {{percent}}%"
+    "kvUsage": "KV cache {{percent}}%",
+    "groups": {
+      "needsYou": "Needs you",
+      "node": "On {{node}}",
+      "notRunning": "Not running"
+    }
   },
   "overview": {
     "range": "Time range",

@@ -64,20 +64,80 @@ function RuntimesPage() {
           </CardHeader>
         </Card>
       ) : (
-        <ul className="grid min-w-0 gap-3 md:grid-cols-2">
-          {runtimes.data.runtimes.map((runtime) => (
-            <li key={runtime.id} className="min-w-0">
-              <RuntimeCard
-                runtime={runtime}
-                inPool={pooled.has(runtime.id)}
-                poolsKnown={pools.isSuccess}
-              />
-            </li>
-          ))}
-        </ul>
+        groupRuntimes(runtimes.data.runtimes).map((group) => (
+          <section
+            key={group.key}
+            aria-labelledby={`runtimes-${group.key}`}
+            className="flex min-w-0 flex-col gap-3"
+          >
+            <h2 id={`runtimes-${group.key}`} className="break-all text-sm font-medium">
+              {group.kind === "node"
+                ? t("dashboard:runtime.groups.node", { node: group.nodeSlug })
+                : t(`dashboard:runtime.groups.${group.kind}`)}
+            </h2>
+            <ul className="grid min-w-0 gap-3 md:grid-cols-2">
+              {group.runtimes.map((runtime) => (
+                <li key={runtime.id} className="min-w-0">
+                  <RuntimeCard
+                    runtime={runtime}
+                    inPool={pooled.has(runtime.id)}
+                    poolsKnown={pools.isSuccess}
+                  />
+                </li>
+              ))}
+            </ul>
+          </section>
+        ))
       )}
     </div>
   );
+}
+
+type RuntimeGroup = {
+  key: string;
+  kind: "needsYou" | "node" | "notRunning";
+  nodeSlug?: string;
+  runtimes: RuntimeSummary[];
+};
+
+/**
+ * Needs you first (only there), then one group per node in slug order (an always-on runtime
+ * under its node, a startable one under each node its instances run on), then the runtimes on
+ * no node. Empty groups are left out.
+ */
+function groupRuntimes(runtimes: readonly RuntimeSummary[]): RuntimeGroup[] {
+  const needsYou: RuntimeSummary[] = [];
+  const notRunning: RuntimeSummary[] = [];
+  const byNode = new Map<string, { slug: string; runtimes: RuntimeSummary[] }>();
+  for (const runtime of runtimes) {
+    if (runtime.instances.needsYou > 0) needsYou.push(runtime);
+    else if (runtime.nodes.length === 0) notRunning.push(runtime);
+    else
+      for (const node of runtime.nodes) {
+        const group = byNode.get(node.id) ?? { slug: node.slug, runtimes: [] };
+        group.runtimes.push(runtime);
+        byNode.set(node.id, group);
+      }
+  }
+  const nodeGroups = [...byNode.entries()]
+    .sort(([, a], [, b]) => a.slug.localeCompare(b.slug))
+    .map(
+      ([nodeId, group]): RuntimeGroup => ({
+        key: `node-${nodeId}`,
+        kind: "node",
+        nodeSlug: group.slug,
+        runtimes: group.runtimes,
+      }),
+    );
+  return [
+    ...(needsYou.length > 0
+      ? [{ key: "needs-you", kind: "needsYou" as const, runtimes: needsYou }]
+      : []),
+    ...nodeGroups,
+    ...(notRunning.length > 0
+      ? [{ key: "not-running", kind: "notRunning" as const, runtimes: notRunning }]
+      : []),
+  ];
 }
 
 function RuntimeCard({
