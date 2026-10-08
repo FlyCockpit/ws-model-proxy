@@ -6,7 +6,7 @@
  */
 import { histogramQuantile, LATENCY_HISTOGRAM_BUCKETS } from "@ws-model-proxy/config/usage-metrics";
 import prisma, { Prisma } from "@ws-model-proxy/db";
-import { nodeTrustView } from "../nodes/trust";
+import { effectiveTrust } from "../nodes/trust";
 import { callableIdOf } from "./access-views";
 import { compactNumber } from "./metrics-query";
 import { realTraffic } from "./test-traffic";
@@ -178,7 +178,7 @@ export async function overviewSummary(userId: string, range: OverviewRange, now 
       id: node.id,
       slug: node.slug,
       online: node.connection === "ONLINE",
-      trust: nodeTrustView(node).effective,
+      trust: effectiveTrust(node),
     })),
     nodesTotal: nodeCount,
     nodesOnline: onlineCount,

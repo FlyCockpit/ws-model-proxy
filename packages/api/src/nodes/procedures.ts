@@ -274,9 +274,12 @@ export const nodeProcedures = {
         where: { id: input.nodeId, userId },
         select: {
           id: true,
+          userId: true,
           trust: true,
           trustChangedAt: true,
           trustLowerRequestedAt: true,
+          trustLowerRequestedBy: true,
+          User: { select: { name: true } },
           heldDefinitions: true,
           metricCommands: true,
         },
@@ -296,7 +299,7 @@ export const nodeProcedures = {
             })
           : { count: 0 };
       if (requested.count === 1) {
-        trustColumns = { ...node, trustLowerRequestedAt: now };
+        trustColumns = { ...node, trustLowerRequestedAt: now, trustLowerRequestedBy: userId };
         await tx.queuedNodeCommand.updateMany({
           where: { userId, nodeId: node.id, state: "QUEUED" },
           data: { state: "REFUSED", decidedAt: now, decidedBy: userId, outcome: "trust_relay" },

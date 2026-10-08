@@ -5,7 +5,7 @@
  */
 
 import { effectiveHardware, liveMetrics } from "../nodes/hardware";
-import { nodeTrustView } from "../nodes/trust";
+import { effectiveTrust } from "../nodes/trust";
 import { parseHeldDefinitions } from "../nodes/views";
 import type {
   PlacementContext,
@@ -99,7 +99,7 @@ export function placementNodeOf(row: PlacementNodeRow, now: Date): PlacementNode
     id: row.id,
     slug: row.slug,
     online: row.connection === "ONLINE",
-    trust: nodeTrustView(row).effective,
+    trust: effectiveTrust(row),
     held: row.holdAt !== null,
     labels: row.labels,
     portRange: [row.portStart, row.portEnd],

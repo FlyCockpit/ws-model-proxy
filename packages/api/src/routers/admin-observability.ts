@@ -7,7 +7,7 @@ import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { contractProcedure } from "../contract-procedure";
 import { adminObservabilityContract as c } from "../contracts/account";
 import { callableIdOf } from "../lib/access-views";
-import { nodeTrustView } from "../nodes/trust";
+import { effectiveTrust } from "../nodes/trust";
 
 type PageInput = { page: number; pageSize: number; ownerQuery?: string | undefined };
 
@@ -76,7 +76,7 @@ export const adminObservabilityRouter = {
         slug: row.slug,
         owner: row.User,
         connection: row.connection,
-        trust: nodeTrustView(row).effective,
+        trust: effectiveTrust(row),
         version: row.cliVersion,
         lastHeartbeatAt: row.lastHeartbeatAt?.toISOString() ?? null,
         runningInstances: row._count.Ranks,
