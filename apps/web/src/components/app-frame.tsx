@@ -4,20 +4,24 @@ import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { PanelLeft } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { NeedsYouBadge } from "@/components/needs-you-badge";
 import { useAuthSession } from "@/hooks/use-auth-session";
+import { useNeedsYouCount } from "@/hooks/use-needs-you-count";
 import { type AppNavItem, getNavItems, toLangRoute } from "@/lib/nav-items";
 import { useUiPreferences } from "@/stores/ui-preferences";
 
 /**
  * The signed-in app frame (spec §7.1): a desktop sidebar with every section (main sections,
  * then Terminals, Settings and Admin) next to the page. Below `md` the app's BottomNav and its
- * More sheet are the only navigation. The root shell owns safe areas and page scroll.
+ * More sheet are the only navigation. The root shell owns safe areas and page scroll. Terminals
+ * carries the Needs-you badge (spec §7.4).
  */
 export function AppFrame({ lang }: { lang: string }) {
   const { t } = useTranslation(["dashboard"]);
   const { state } = useAuthSession();
   const sidebarCollapsed = useUiPreferences((prefs) => prefs.sidebarCollapsed);
   const toggleSidebar = useUiPreferences((prefs) => prefs.toggleSidebar);
+  const needsYou = useNeedsYouCount(Boolean(state.session));
   const items = getNavItems({
     placement: "sidebar",
     isAuthenticated: Boolean(state.session),
@@ -67,7 +71,13 @@ export function AppFrame({ lang }: { lang: string }) {
               )}
             >
               {group.items.map((item) => (
-                <SidebarLink key={item.id} item={item} lang={lang} collapsed={sidebarCollapsed} />
+                <SidebarLink
+                  key={item.id}
+                  item={item}
+                  lang={lang}
+                  collapsed={sidebarCollapsed}
+                  badge={item.id === "terminals" ? needsYou : 0}
+                />
               ))}
             </div>
           ))}
@@ -87,32 +97,42 @@ function SidebarLink({
   item,
   lang,
   collapsed,
+  badge,
 }: {
   item: AppNavItem;
   lang: string;
   collapsed: boolean;
+  /** Needs-you count shown on this item (0 hides it). */
+  badge: number;
 }) {
   const { t } = useTranslation(["nav"]);
   const label = t(`nav:${item.labelKey}`);
+  const name = badge > 0 ? `${label}, ${t("nav:needsYou.badge", { count: badge })}` : label;
   return (
     <Link
       to={toLangRoute(item.path)}
       params={{ lang }}
       activeOptions={{ exact: item.exact }}
-      aria-label={label}
+      aria-label={name}
       title={item.hintKey ? t(`nav:${item.hintKey}`) : label}
       className={cn(
         buttonVariants({ variant: "ghost", size: collapsed ? "icon-touch" : "touch" }),
-        "text-muted-foreground",
+        "relative text-muted-foreground",
         collapsed ? "justify-center" : "justify-start gap-2",
       )}
       activeProps={{ className: "bg-sidebar-accent text-sidebar-accent-foreground" }}
     >
       <item.icon aria-hidden="true" className="size-4 shrink-0" />
       {collapsed ? (
-        <span className="sr-only">{label}</span>
+        <>
+          <span className="sr-only">{name}</span>
+          <NeedsYouBadge count={badge} className="absolute -end-1 -top-1" />
+        </>
       ) : (
-        <span className="min-w-0 truncate">{label}</span>
+        <>
+          <span className="min-w-0 truncate">{label}</span>
+          <NeedsYouBadge count={badge} className="ms-auto" />
+        </>
       )}
     </Link>
   );

@@ -22,8 +22,21 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
       options,
       useParams: () => ({ lang: "en-US" }),
     }),
-    Link: ({ children, className }: { children: ReactNode; className?: string }) => (
-      <a href="#x" className={className}>
+    Link: ({
+      children,
+      className,
+      to,
+      params,
+    }: {
+      children: ReactNode;
+      className?: string;
+      to?: string;
+      params?: Record<string, string>;
+    }) => (
+      <a
+        href={(to ?? "#x").replace(/\$(\w+)/g, (_, name: string) => params?.[name] ?? `$${name}`)}
+        className={className}
+      >
         {children}
       </a>
     ),
@@ -195,6 +208,34 @@ describe("Overview", { timeout: 30_000 }, () => {
     expect(await screen.findByText("Qwen")).toBeTruthy();
     expect(screen.getByText("dashboard:overview.needsYou.need.RESTART")).toBeTruthy();
     expect(screen.getByText("dashboard:overview.needsYou.queuedCount:2")).toBeTruthy();
+  });
+
+  it("links each need to where it is resolved", async () => {
+    state.summary = summary();
+    const item = (need: string, runtimeId: string, runtimeName: string) => ({
+      need,
+      instanceId: `i-${runtimeId}`,
+      runtimeId,
+      runtimeName,
+      nodeId: "n1",
+      since: new Date().toISOString(),
+      stepId: need === "STEP" ? "s1" : null,
+    });
+    state.needsYou = {
+      items: [
+        item("STEP", "r1", "Stepper"),
+        item("RESTART", "r2", "Restarter"),
+        item("MARK_STOPPED", "r3", "Stopper"),
+      ],
+      queuedCommands: 1,
+    };
+    await mount();
+    const hrefOf = async (text: string) =>
+      (await screen.findByText(text)).closest("a")?.getAttribute("href");
+    expect(await hrefOf("Stepper")).toBe("/en-US/terminals");
+    expect(await hrefOf("Restarter")).toBe("/en-US/runtimes/r2");
+    expect(await hrefOf("Stopper")).toBe("/en-US/runtimes/r3");
+    expect(await hrefOf("dashboard:overview.needsYou.queuedCount:1")).toBe("/en-US/terminals");
   });
 
   it("keeps what needs you when the summary fails", async () => {

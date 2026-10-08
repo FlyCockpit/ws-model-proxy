@@ -46,5 +46,9 @@
     "terminals": "Terminales y comandos en cola",
     "settings": "Tu cuenta",
     "admin": "Administración del servidor"
+  },
+  "needsYou": {
+    "badge_one": "{{count}} cosa te necesita",
+    "badge_other": "{{count}} cosas te necesitan"
   }
 }
