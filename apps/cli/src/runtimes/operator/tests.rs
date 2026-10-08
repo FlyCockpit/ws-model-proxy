@@ -257,29 +257,40 @@ fn the_wrapper_resets_sudo_before_and_after_and_keeps_the_exit_code() {
 #[cfg(unix)]
 #[test]
 fn ctrl_c_ends_the_command_but_the_wrapper_still_resets_sudo() {
-    use std::os::unix::process::CommandExt;
+    // Spawned the way the operator terminal spawns it, through portable-pty,
+    // which resets SIGINT to its default and gives the child its own session.
+    // A plain `std::process::Command` would hand the wrapper this process's
+    // dispositions, and a test run started as a background job of a
+    // non-interactive shell inherits SIGINT as ignored, which no shell can
+    // trap or undo: `sleep` would then outlive the Ctrl-C.
     let (dir, path) = fake_sudo();
     let log = dir.path().join("sudo.log");
     let started = dir.path().join("started");
     let (program, args) = wrapper_argv(&format!("touch '{}'; sleep 30", started.display()));
-    let mut child = std::process::Command::new(program)
-        .args(args)
-        .env_clear()
-        .env("PATH", &path)
-        .process_group(0)
-        .spawn()
-        .expect("spawn");
+    let pair = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize::default())
+        .expect("pty");
+    let mut command = portable_pty::CommandBuilder::new(program);
+    command.args(args);
+    command.env_clear();
+    command.env("PATH", &path);
+    command.cwd(dir.path());
+    let mut child = pair.slave.spawn_command(command).expect("spawn");
+    drop(pair.slave);
     let until = std::time::Instant::now() + Duration::from_secs(10);
     while !started.exists() && std::time::Instant::now() < until {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(started.exists());
-    let group = nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("pid"));
+    let pid = child.process_id().expect("pid");
+    // The session leader leads its own process group.
+    let group = nix::unistd::Pid::from_raw(i32::try_from(pid).expect("pid"));
     // As a terminal delivers Ctrl-C: SIGINT to the whole foreground group.
     nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGINT).expect("signal");
     let status = child.wait().expect("wait");
-    assert_eq!(status.code(), Some(130), "the command died of SIGINT");
+    assert_eq!(status.exit_code(), 130, "the command died of SIGINT");
     assert_eq!(std::fs::read_to_string(&log).expect("log"), "-k\n-k\n");
+    drop(pair.master);
 }
 
 // ── The step flow, with a scripted machine and terminal ──
