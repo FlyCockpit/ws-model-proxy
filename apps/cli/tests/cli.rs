@@ -460,7 +460,9 @@ fn a_fresh_login_takes_the_chosen_trust_and_a_lowered_node_stays_lowered() {
         "--no-service",
         "--json",
     ]);
+    // A same-server re-login keeps the person's lowering, even with `--trust full`.
     assert_eq!(json_stdout(again)["trust"], "relay");
+    assert!(state.join("frozen-definitions.json").exists());
     server.join();
     // Not from a process wsmp started.
     cli(&config, &state)
@@ -528,6 +530,106 @@ fn a_login_over_leftover_0_3_state_is_a_fresh_enrollment() {
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(cfg["trust"], "full");
     assert_eq!(cfg["cliSlug"], "fresh-box");
+}
+
+/// A Relay-only setting an earlier enrollment (another server) left: a fresh
+/// enrollment keeps it without an explicit choice and clears it with
+/// `--trust full`.
+#[test]
+fn a_fresh_enrollment_clears_a_leftover_lowering_only_when_full_is_chosen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let frozen = state.join("frozen-definitions.json");
+    write_config(
+        &config,
+        json!({
+            "version": 1,
+            "serverUrl": "https://old.example.com",
+            "cliSlug": "old-box",
+            "trust": "full",
+            "endpoints": []
+        }),
+    );
+    cli(&config, &state)
+        .args(["trust", "relay"])
+        .assert()
+        .success();
+    assert!(frozen.exists());
+    let login = |extra: &[&str]| {
+        let server = TestServer::start(vec![
+            (
+                "/.well-known/wsmp",
+                200,
+                well_known("https://wsmp.example.com"),
+            ),
+            ("/api/node/enroll", 200, enrolled("fresh-box")),
+        ]);
+        let mut cmd = cli(&config, &state);
+        cmd.args([
+            "login",
+            &server.base_url,
+            "--code",
+            CODE,
+            "--slug",
+            "fresh-box",
+            "--no-service",
+            "--json",
+        ]);
+        cmd.args(extra);
+        let output = cmd.assert().success().get_output().clone();
+        server.join();
+        // Next login is to another server again: forget this enrollment.
+        fs::remove_file(state.join("node-credential.json")).unwrap();
+        let mut cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        cfg["serverUrl"] = "https://old.example.com".into();
+        cfg.as_object_mut().unwrap().remove("publicOrigin");
+        write_config(&config, cfg);
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        (value, String::from_utf8(output.stderr).unwrap())
+    };
+    // No explicit choice (no terminal, no `--trust`): stays Relay only.
+    let (value, stderr) = login(&[]);
+    assert_eq!(value["trust"], "relay");
+    assert!(
+        stderr.contains("pass `--trust full` to clear that"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("full control"), "{stderr}");
+    assert!(frozen.exists());
+    // An explicit `--trust relay` keeps it too.
+    let (value, _) = login(&["--trust", "relay"]);
+    assert_eq!(value["trust"], "relay");
+    assert!(frozen.exists());
+    // Not while a relay runs here: its reload would write `relay` back.
+    #[cfg(unix)]
+    {
+        let listener = std::os::unix::net::UnixListener::bind(state.join("relay-control.sock"))
+            .expect("bind a stand-in relay control socket");
+        let relay = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("control request");
+            let mut request = String::new();
+            stream.read_to_string(&mut request).expect("read request");
+            stream.write_all(br#"{"ok":true}"#).expect("answer");
+        });
+        let (value, stderr) = login(&["--trust", "full"]);
+        relay.join().unwrap();
+        fs::remove_file(state.join("relay-control.sock")).unwrap();
+        assert_eq!(value["trust"], "relay", "{stderr}");
+        assert!(stderr.contains("a relay is running here"), "{stderr}");
+        assert!(!stderr.contains("pass `--trust full`"), "{stderr}");
+        assert!(frozen.exists());
+    }
+    // An explicit `--trust full` clears it, and says so.
+    let (value, stderr) = login(&["--trust", "full"]);
+    assert_eq!(value["trust"], "full", "{stderr}");
+    assert!(
+        stderr.contains("cleared the Relay-only setting"),
+        "{stderr}"
+    );
+    assert!(!frozen.exists());
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["trust"], "full");
 }
 
 #[test]
@@ -811,6 +913,93 @@ fn trust_lowers_without_a_relay_and_refuses_to_raise_without_a_terminal() {
         .stderr(predicate::str::contains("cannot run from a command"));
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(cfg["trust"], "relay");
+}
+
+/// A command, job or terminal wsmp started cannot change wsmp's own
+/// settings, credential, service or terminal approvals; reads still work.
+#[test]
+fn commands_wsmp_started_cannot_change_wsmp_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({
+            "version": 1,
+            "serverUrl": "https://wsmp.example.com",
+            "cliSlug": "spark-1",
+            "trust": "full",
+            "endpoints": []
+        }),
+    );
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        state.join("node-credential.json"),
+        json!({ "nodeId": "node-1", "slug": "spark-1", "server": "https://wsmp.example.com", "credential": "c".repeat(48) })
+            .to_string(),
+    )
+    .unwrap();
+    let before = fs::read(&config).unwrap();
+    let home = tmp.path().display().to_string();
+    let refused: &[&[&str]] = &[
+        &["config", "init"],
+        &["config", "set-server", "https://evil.example.com"],
+        &["config", "set-slug", "other"],
+        &["config", "set-human-terminal", "on"],
+        &["config", "set-runtime-hosts", "10.0.0.5"],
+        &["config", "set-file-roots", "/"],
+        &["config", "clear-file-roots"],
+        &["config", "set-file-tools", "on"],
+        &["config", "set-terminal-approval", "off"],
+        &["config", "set-max-terminals", "32"],
+        &["config", "set-file-tools-as-root", "on"],
+        &["service", "install"],
+        &["service", "uninstall"],
+        &["service", "restart"],
+        &["logout"],
+        &["terminal", "approve", "ABCD-EFGH"],
+        &["run"],
+        &["recover", "--apply"],
+    ];
+    for args in refused {
+        cli(&config, &state)
+            .args(*args)
+            .env("WSMP_JOB", "1")
+            .env("HOME", &home)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "cannot run from a command, job or terminal wsmp started",
+            ));
+    }
+    assert_eq!(fs::read(&config).unwrap(), before, "the config changed");
+    assert!(state.join("node-credential.json").exists());
+    // Reads stay allowed.
+    let allowed: &[&[&str]] = &[
+        &["config", "show"],
+        &["config", "path"],
+        &["terminal", "approvals", "list"],
+        &["runtime", "list"],
+        &["recover"],
+        &["trust"],
+        // Lowering works from anywhere.
+        &["trust", "relay"],
+    ];
+    for args in allowed {
+        cli(&config, &state)
+            .args(*args)
+            .env("WSMP_JOB", "1")
+            .env("HOME", &home)
+            .assert()
+            .success();
+    }
+    // Revoking narrows access too: not refused (the code is just unknown).
+    cli(&config, &state)
+        .args(["terminal", "approvals", "revoke", "ABCD-EFGH"])
+        .env("WSMP_JOB", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot run from").not());
 }
 
 #[test]
@@ -2275,4 +2464,68 @@ fn hardware_reports_this_machine_as_json() {
     );
     assert!(detected["gpus"].is_array(), "{report}");
     assert!(detected["notes"].is_array(), "{report}");
+}
+
+/// Real system (Linux with a systemd user manager; run with `--ignored`):
+/// `wsmp trust full` works from a person's ordinary terminal, whose
+/// ancestors include the unreadable user manager or sshd, and is refused
+/// from a `systemd-run --user --unit` service that dropped `WSMP_JOB`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs a systemd user manager and `script`"]
+fn trust_full_from_a_terminal_but_not_from_a_user_service() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({ "version": 1, "serverUrl": "https://wsmp.example.com", "trust": "full", "endpoints": [] }),
+    );
+    cli(&config, &state)
+        .args(["trust", "relay"])
+        .assert()
+        .success();
+    let wsmp = assert_cmd::cargo::cargo_bin("wsmp");
+    // A user service, with the marker dropped: refused before any prompt.
+    let unit = format!("provtest-{}", std::process::id());
+    let refused = std::process::Command::new("systemd-run")
+        .args(["--user", "--quiet", "--wait", "--pipe", "--collect"])
+        .arg(format!("--unit={unit}"))
+        .arg(format!("--setenv=WSMP_CONFIG={}", config.display()))
+        .arg(format!("--setenv=WSMP_STATE_DIR={}", state.display()))
+        .args(["env", "-u", "WSMP_JOB"])
+        .arg(&wsmp)
+        .args(["trust", "full"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("systemd-run");
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("cannot run from a command"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    // A terminal (a pty from `script`) in this shell: raised.
+    let command = format!(
+        "WSMP_CONFIG='{}' WSMP_STATE_DIR='{}' '{}' trust full",
+        config.display(),
+        state.display(),
+        wsmp.display()
+    );
+    let raised = std::process::Command::new("script")
+        .args(["-qec", &command, "/dev/null"])
+        .env_remove("WSMP_JOB")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            child.stdin.take().expect("stdin").write_all(b"full\n")?;
+            child.wait_with_output()
+        })
+        .expect("script");
+    let out = String::from_utf8_lossy(&raised.stdout);
+    assert!(out.contains("trust: now full control"), "{out}");
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["trust"], "full");
 }

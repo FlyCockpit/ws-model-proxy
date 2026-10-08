@@ -59,10 +59,20 @@ struct LogsArgs {
 
 pub fn run(args: &Args) -> Result<()> {
     match &args.command {
-        CommandName::Install => install(false),
-        CommandName::Uninstall => uninstall(),
+        CommandName::Install => {
+            crate::trust::refuse_in_job("wsmp service install")?;
+            install(false)
+        }
+        CommandName::Uninstall => {
+            crate::trust::refuse_in_job("wsmp service uninstall")?;
+            uninstall()
+        }
         CommandName::Status => status(),
-        CommandName::Restart => restart(),
+        CommandName::Restart => {
+            crate::trust::refuse_in_job("wsmp service restart")?;
+            restart()
+        }
+        // Read-only.
         CommandName::Logs(logs_args) => logs(logs_args),
     }
 }

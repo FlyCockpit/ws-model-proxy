@@ -95,7 +95,30 @@ impl Switch {
     }
 }
 
+impl Sub {
+    /// The command, when it changes the config (`None`: read-only).
+    fn mutation(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::Path | Self::Show => return None,
+            Self::Init => "wsmp config init",
+            Self::SetServer { .. } => "wsmp config set-server",
+            Self::SetSlug { .. } => "wsmp config set-slug",
+            Self::SetHumanTerminal { .. } => "wsmp config set-human-terminal",
+            Self::SetRuntimeHosts { .. } => "wsmp config set-runtime-hosts",
+            Self::SetFileRoots { .. } => "wsmp config set-file-roots",
+            Self::ClearFileRoots => "wsmp config clear-file-roots",
+            Self::SetFileTools { .. } => "wsmp config set-file-tools",
+            Self::SetTerminalApproval { .. } => "wsmp config set-terminal-approval",
+            Self::SetMaxTerminals { .. } => "wsmp config set-max-terminals",
+            Self::SetFileToolsAsRoot { .. } => "wsmp config set-file-tools-as-root",
+        })
+    }
+}
+
 pub fn run(args: &Args) -> Result<()> {
+    if let Some(command) = args.command.mutation() {
+        crate::trust::refuse_in_job(command)?;
+    }
     match &args.command {
         Sub::Path => {
             let path = crate::paths::config_file()?;

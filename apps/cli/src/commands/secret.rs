@@ -86,8 +86,10 @@ fn check_name(name: &str) -> Result<()> {
 
 /// A person at this machine's terminal, outside the wsmp job tree.
 fn guard_local() -> Result<()> {
-    if std::env::var_os(crate::trust::JOB_MARKER_ENV).is_some() {
-        anyhow::bail!("secrets cannot be set from a command, job or terminal wsmp started");
+    if let Some(reason) = crate::trust::self_started_by_wsmp() {
+        anyhow::bail!(
+            "secrets cannot be set from a command, job or terminal wsmp started ({reason})"
+        );
     }
     anyhow::ensure!(
         std::io::stdin().is_terminal(),
