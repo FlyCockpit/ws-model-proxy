@@ -105,8 +105,10 @@ function CreateApiKeyForm({
         expiresAt: expiryFromChoice(value.expiry, Date.now()),
       }).catch(() => null);
       if (!result) return;
-      await queryClient.invalidateQueries({ queryKey: orpc.access.apiKeys.list.key() });
+      // Reveal at once: the dialog may close while the list refreshes, and a late reveal would
+      // leave the secret behind for the next open.
       onCreated(result.secret);
+      void queryClient.invalidateQueries({ queryKey: orpc.access.apiKeys.list.key() });
     },
   });
   const usablePools = pools.data
