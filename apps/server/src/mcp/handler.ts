@@ -6,7 +6,7 @@ import {
   McpServer,
 } from "@modelcontextprotocol/server";
 import { advertisedInputSchema, MCP_TOOLS } from "@ws-model-proxy/api/contracts";
-import { canonicalJson, compareCodePoints } from "@ws-model-proxy/api/lib/canonical-json";
+import { compareCodePoints } from "@ws-model-proxy/api/lib/canonical-json";
 
 import { SERVER_VERSION } from "../version";
 import { registerMcpTools } from "./tools";
@@ -50,7 +50,16 @@ export function mcpToolManifestHash(
   const manifest = tools
     .map((tool) => ({ name: tool.name, inputSchema: tool.inputSchema }))
     .sort((a, b) => compareCodePoints(a.name, b.name));
-  return createHash("sha256").update(canonicalJson(manifest)).digest("hex").slice(0, 12);
+  return createHash("sha256").update(sortedJson(manifest)).digest("hex").slice(0, 12);
+}
+
+/** JSON with object keys sorted (any JSON value, unlike `canonicalJson`, which limits numbers). */
+function sortedJson(value: unknown): string {
+  return JSON.stringify(value, (_key, entry: unknown) =>
+    entry && typeof entry === "object" && !Array.isArray(entry)
+      ? Object.fromEntries(Object.entries(entry).sort(([a], [b]) => compareCodePoints(a, b)))
+      : entry,
+  );
 }
 
 /** Advertised server identity: the app version plus the tool manifest hash (build metadata). */

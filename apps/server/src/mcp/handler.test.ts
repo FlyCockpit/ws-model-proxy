@@ -60,6 +60,7 @@ vi.mock("@ws-model-proxy/db", async () => {
 type ProbeToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 
 import { MCP_READ_TOOLS } from "@ws-model-proxy/api/contracts";
+import { SERVER_VERSION } from "../version";
 import { registerMcpTools } from "./tools";
 
 const ENVELOPE = {
@@ -174,8 +175,8 @@ describe("createMcpTransport — advertised identity and capabilities", () => {
   });
 
   it("carries the app version plus the tool manifest hash in serverInfo", async () => {
-    expect(MCP_SERVER_INFO.version).toMatch(/^\d+\.\d+\.\d+\+tools\.[0-9a-f]{12}$/);
-    expect(MCP_SERVER_INFO.version.endsWith(`+tools.${mcpToolManifestHash()}`)).toBe(true);
+    expect(MCP_SERVER_INFO.version).toBe(`${SERVER_VERSION}+tools.${mcpToolManifestHash()}`);
+    expect(mcpToolManifestHash()).toMatch(/^[0-9a-f]{12}$/);
     const res = await createMcpTransport().fetch(modernRequest("tools/list", 2));
     const body = (await res.json()) as {
       result?: { _meta?: Record<string, { name?: string; version?: string } | undefined> };
@@ -187,6 +188,13 @@ describe("createMcpTransport — advertised identity and capabilities", () => {
     const a = { name: "a_get", inputSchema: { type: "object", properties: { id: {} } } };
     const b = { name: "b_get", inputSchema: { type: "object" } };
     expect(mcpToolManifestHash([a, b])).toBe(mcpToolManifestHash([b, a]));
+    // Key order inside a schema does not matter either.
+    expect(mcpToolManifestHash([a, b])).toBe(
+      mcpToolManifestHash([
+        { inputSchema: { properties: { id: {} }, type: "object" }, name: "a_get" },
+        b,
+      ]),
+    );
     expect(mcpToolManifestHash()).toBe(mcpToolManifestHash());
     expect(mcpToolManifestHash([a, b])).not.toBe(mcpToolManifestHash([a]));
     expect(mcpToolManifestHash([a, b])).not.toBe(
