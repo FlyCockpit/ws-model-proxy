@@ -562,7 +562,7 @@ fn prior_enrollment(
     // The config's server or pinned origin is this server: `wsmp config
     // set-server` readdresses the config only, so the credential can keep the
     // old address. Erring toward the same server only keeps a lowering.
-    let saved_here = saved_server.is_some_and(&here) || saved_public.is_some_and(&here);
+    let saved_here = saved_server.is_some_and(here) || saved_public.is_some_and(here);
     match credential {
         Ok(Some(credential)) if here(&credential.server) || saved_here => Prior::SameServer,
         Ok(Some(_)) | Err(_) => Prior::Stale,

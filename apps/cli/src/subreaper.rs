@@ -5,7 +5,7 @@
 //! kernel re-parents such an orphan to its nearest subreaper ancestor, else to
 //! init. On Linux `wsmp run` marks itself a child subreaper
 //! (`PR_SET_CHILD_SUBREAPER`, [`start`]), so those orphans re-parent to the
-//! relay and stay its descendants: [`crate::trust::started_by_wsmp`] rule (c)
+//! relay and stay its descendants: `trust::started_by_wsmp` rule (c)
 //! still finds the relay above them. Under `wsmp.service` the unit's cgroup
 //! already caught them; a relay run by hand from a terminal shares the
 //! terminal's cgroup, so only this keeps them caught.
@@ -14,7 +14,7 @@
 //! the exit status of a child the relay waits for itself (an exec command, a
 //! terminal shell, a bounded run). Every such child is spawned through
 //! [`spawn`], which returns it in an [`Owned`] handle that keeps its pid
-//! registered until the handle drops. [`reap_adopted`] then waits only for
+//! registered until the handle drops. `reap_adopted` then waits only for
 //! zombie children whose pid is not registered:
 //! - a spawn holds the gate shared from fork to registration and a scan holds
 //!   it exclusively, so no scan sees a child before it is registered;
@@ -32,21 +32,28 @@
 //! that left them, and those re-parent upward once the relay exits. Runtimes
 //! run in systemd units, never as the relay's descendants.
 
-use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
-use std::sync::{Mutex, PoisonError, RwLock};
+#[cfg(target_os = "linux")]
+use std::{
+    collections::BTreeMap,
+    sync::{Mutex, PoisonError, RwLock},
+};
 
 /// Held shared by [`spawn`] from fork to registration, exclusively by a scan.
+#[cfg(target_os = "linux")]
 static GATE: RwLock<()> = RwLock::new(());
 /// Registered pids, counted: a reaped pid can be reused while its old handle
 /// lives on.
+#[cfg(target_os = "linux")]
 static OWNED: Mutex<BTreeMap<u32, usize>> = Mutex::new(BTreeMap::new());
 
-/// A child the relay spawned and waits for itself. Its pid stays registered
-/// (never reaped by [`reap_adopted`]) until this drops.
+/// A child the relay spawned and waits for itself. On Linux its pid stays
+/// registered (never reaped by `reap_adopted`) until this drops; elsewhere
+/// nothing scans, and this only wraps the child.
 #[derive(Debug)]
 pub struct Owned<C> {
     child: C,
+    #[cfg(target_os = "linux")]
     pid: Option<u32>,
 }
 
@@ -63,6 +70,7 @@ impl<C> DerefMut for Owned<C> {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl<C> Drop for Owned<C> {
     fn drop(&mut self) {
         let Some(pid) = self.pid else {
@@ -80,6 +88,7 @@ impl<C> Drop for Owned<C> {
 
 /// Spawn a child the caller will wait for, registered before any scan can
 /// see it. `pid` names the spawned child (`None`: nothing to register).
+#[cfg(target_os = "linux")]
 pub fn spawn<C, E>(
     spawn: impl FnOnce() -> Result<C, E>,
     pid: impl FnOnce(&C) -> Option<u32>,
@@ -95,6 +104,15 @@ pub fn spawn<C, E>(
             .or_insert(0) += 1;
     }
     Ok(Owned { child, pid })
+}
+
+/// Elsewhere the relay is no subreaper: nothing to register.
+#[cfg(not(target_os = "linux"))]
+pub fn spawn<C, E>(
+    spawn: impl FnOnce() -> Result<C, E>,
+    _pid: impl FnOnce(&C) -> Option<u32>,
+) -> Result<Owned<C>, E> {
+    spawn().map(|child| Owned { child })
 }
 
 /// How often adopted orphans that exited are reaped.
@@ -141,7 +159,7 @@ pub fn reap_adopted() -> usize {
     reap_unowned(&gate, |_| true)
 }
 
-/// [`reap_adopted`] limited to the children `consider` accepts, waiting for
+/// `reap_adopted` limited to the children `consider` accepts, waiting for
 /// the gate (tests share a process with other tests' children).
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn reap_adopted_where(consider: impl Fn(u32) -> bool) -> usize {
