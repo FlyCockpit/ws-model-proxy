@@ -17,6 +17,7 @@ import { z } from "zod";
 import { FieldErrors } from "@/components/field-errors";
 import { NativeSelect } from "@/components/native-select";
 import { SegmentedControl } from "@/components/segmented-control";
+import { ChatMarkdown } from "@/components/test/chat-markdown";
 import { TestErrorNotice } from "@/components/test/test-error";
 import { type TestChatMessage, useTestChat } from "@/hooks/use-test-chat";
 import {
@@ -456,7 +457,11 @@ function Transcript({ messages }: { messages: TestChatMessage[] }) {
               </details>
             ) : null}
             {message.content ? (
-              <p className="whitespace-pre-wrap break-words text-sm">{message.content}</p>
+              message.role === "assistant" ? (
+                <ChatMarkdown content={message.content} />
+              ) : (
+                <p className="whitespace-pre-wrap break-words text-sm">{message.content}</p>
+              )
             ) : null}
             {message.attachments.length > 0 ? (
               <p className="break-words text-xs text-muted-foreground">
