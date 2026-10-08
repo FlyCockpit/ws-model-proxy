@@ -386,10 +386,22 @@ describe("metrics_query values", () => {
     const tests = queries.find((query) => text(query).includes(`source = 'AGENT_TEST'`));
     for (const query of queries.filter((query) => query !== tests))
       expect(text(query)).toContain(`source <> 'AGENT_TEST'::"RequestSource"`);
-    // The count reads the same pool, owner and range as the metrics.
-    expect(text(tests)).toContain(`source = 'AGENT_TEST'::"RequestSource"`);
-    expect(text(tests)).toContain('"poolId" =');
-    expect(values(tests)).toEqual(expect.arrayContaining(["pool1", "owner"]));
+    // The count reads the same pool, owner and range as the metrics: same filter but the source.
+    const filter = (query: unknown) =>
+      /FROM usage_rollup_minute WHERE (.*?)\)/s
+        .exec(text(query))?.[1]
+        ?.replace(/source [<>=]+ /, "");
+    const totals = queries.find((query) => query !== tests && !text(query).includes("date_bin"));
+    expect(filter(tests)).toBeTruthy();
+    expect(filter(tests)).toBe(filter(totals));
+    expect(values(tests)).toEqual(values(totals));
+
+    // Hour and day steps count the hourly rows too.
+    const hourly = answer({ tests: 1 });
+    await runMetricsQuery("owner", parse({ ...input, range: "7d", step: "1h" }), NOW);
+    expect(hourly.find((query) => text(query).includes(`source = 'AGENT_TEST'`))).toSatisfy(
+      (query: unknown) => text(query).includes("usage_rollup_hour"),
+    );
 
     // Only tests in the range: requests 0 and still the tests, so an agent sees why.
     answer({ tests: 1 });
