@@ -96,7 +96,11 @@ Agents may do this only on Full-control nodes (`trust_relay` otherwise). The
 claim stays counted until a status probe proves the stop, but the instance
 settles STOPPED and later starts stop waiting for it (`waits_for_stop`). The
 probes go on after that, also on a STOPPED instance, and the first one that
-proves the stop releases the claim; `lastStopCheck` keeps showing why. Each
+proves the stop releases the claim; `lastStopCheck` keeps showing why.
+`runtimes_get` keeps listing a STOPPED or FAILED instance while any of its
+ranks is still reserved, with that `reserved` state and `lastStopCheck`
+(instance rows leave out null fields and empty lists). Marking such a rank
+stopped again answers CONFLICT with the last automatic check's result. Each
 node marked stopped writes a `marked_stopped` row in the node's activity.
 
 ### Runtime definitions

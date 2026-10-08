@@ -51,7 +51,7 @@ import {
   versionSummary,
 } from "../lib/runtime-views";
 import { deliverInvite, writeInvite } from "../lib/share-invite-write";
-import { latestStopChecks } from "../lib/stop-evidence";
+import { latestStopChecks, stopCheckKey } from "../lib/stop-evidence";
 import { normalizeBaseUrl, parseDetectedServers } from "../nodes/views";
 import { runtimeStart, runtimeStop } from "./runtime-lifecycle";
 import { runtimeSteps } from "./runtime-steps";
@@ -285,6 +285,39 @@ const ACTIVE_INSTANCE = {
   OR: [{ desiredState: "RUNNING" as const }, { desiredState: null }],
 };
 
+/**
+ * Why there is nothing to mark stopped. A rank already marked stopped (HELD_UNKNOWN) is not
+ * waiting for a person: the node is asked to prove its stop every 5 minutes while it is online,
+ * and the first proof frees its resources. The message says so, with the last check's result.
+ */
+async function markStoppedConflict(
+  tx: Parameters<typeof latestStopChecks>[0],
+  instance: {
+    id: string;
+    phase: string;
+    phaseChangedAt: Date;
+    Ranks: ReadonlyArray<{ rank: number; claim: string; markedStoppedAt: Date | null }>;
+  },
+  nodeNumber: number | undefined,
+): Promise<string> {
+  const marked = instance.Ranks.filter(
+    (rank) =>
+      rank.claim === "HELD_UNKNOWN" && (nodeNumber === undefined || rank.rank === nodeNumber - 1),
+  );
+  if (marked.length === 0) return "Nothing of this instance waits for a stop to be proven.";
+  const checks = await latestStopChecks(tx, [{ ...instance, Ranks: marked }]);
+  const results = marked.map((rank) => {
+    const check = checks.get(stopCheckKey(instance.id, rank.rank));
+    const result = !check
+      ? "no check has finished yet"
+      : check.proven
+        ? `proven at ${check.at}`
+        : `not proven at ${check.at} (${check.errorCode ?? "not_stopped"})`;
+    return `node ${rank.rank + 1}: ${result}`;
+  });
+  return `Already marked stopped. While its node is online, wsmp checks every 5 minutes whether the stop is proven and then frees the resources. Last check: ${results.join("; ")}.`;
+}
+
 export const runtimesRouter = {
   list: contractProcedure(c.list).handler(async ({ context }) => {
     const rows = await prisma.runtime.findMany({
@@ -321,7 +354,13 @@ export const runtimesRouter = {
         where: {
           runtimeId: input.runtimeId,
           userId,
-          NOT: { desiredState: "STOPPED", phase: "STOPPED" },
+          // A stopped instance is listed while it still holds resources (a rank marked
+          // stopped whose stop is not proven yet), so its reserved state and last stop check
+          // stay visible.
+          OR: [
+            { NOT: { desiredState: "STOPPED", phase: "STOPPED" } },
+            { Ranks: { some: { claim: { in: ["HELD", "HELD_UNKNOWN"] } } } },
+          ],
         },
         include: INSTANCE_INCLUDE,
         orderBy: { createdAt: "asc" },
@@ -771,11 +810,13 @@ export const runtimesRouter = {
             select: {
               id: true,
               phase: true,
+              phaseChangedAt: true,
               Ranks: {
                 select: {
                   id: true,
                   rank: true,
                   claim: true,
+                  markedStoppedAt: true,
                   Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } },
                 },
               },
@@ -789,7 +830,7 @@ export const runtimesRouter = {
           );
           if (instance.phase !== "STOPPING" || ranks.length === 0)
             throw new ORPCError("CONFLICT", {
-              message: "Nothing of this instance waits for a stop to be proven.",
+              message: await markStoppedConflict(tx, instance, input.nodeNumber),
             });
           // Agents mark stopped only on Full-control nodes (a node that left counts as not Full).
           if (agent)
