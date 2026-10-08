@@ -35,6 +35,9 @@
     "./contracts": {
       "default": "./src/contracts/index.ts"
     },
+    "./contracts/metrics": {
+      "default": "./src/contracts/metrics.ts"
+    },
     ".": {
       "default": "./src/index.ts"
     },
