@@ -769,8 +769,8 @@ starts an immediate sweep that will remove artifacts already past eligibility
 - The node relay (`/api/cli/ws`) has its own buckets, apart from sign-in:
   10 authenticated connections per node per minute and 30 failed
   (unauthenticated) connections per address per minute, each then blocked for
-  5 minutes (times `WMP_RATE_LIMIT_SCALE`). A connection that authenticates
-  gives its address point back.
+  5 minutes (times `WMP_RATE_LIMIT_SCALE`). Only failed connections count
+  against an address.
 
 ## Client examples
 

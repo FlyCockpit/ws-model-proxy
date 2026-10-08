@@ -43,8 +43,8 @@ export const DEFAULTS = {
   inviteInfo: { points: 10, duration: 60, blockDuration: 15 * 60 },
   /**
    * Relay websocket upgrades (`/api/cli/ws`) that fail before a node is known (no or bad
-   * credential, unsupported subprotocol), per client IP. An authenticated upgrade refunds its
-   * point, so honest nodes behind one NAT do not share this budget.
+   * credential, unsupported subprotocol), per client IP. Only failures spend it, so honest
+   * nodes behind one NAT never share this budget, however many connect at once.
    */
   relayUpgradeIp: { points: 30, duration: 60, blockDuration: 5 * 60 },
   /** Authenticated relay upgrades, per node: bounds one node's reconnect storm. */
@@ -136,10 +136,10 @@ export const realtimeUpgradeLimiter = new RateLimiterMemory({
 
 /**
  * Relay websocket upgrades. Their own buckets, never `authLimiter`: a node reconnecting in a
- * loop must not lock its owner out of sign-in from the same address. Every upgrade first
- * reserves a point in the per-IP bucket (before the credential is checked, so guessing
- * credentials spends it); once the credential authenticates, that point is refunded and the
- * upgrade is charged to the node's own bucket instead.
+ * loop must not lock its owner out of sign-in from the same address. An address whose failed
+ * upgrades (bad or missing credential, unsupported subprotocol) used up the per-IP bucket is
+ * refused before the credential is checked; an authenticated upgrade is charged to the node's
+ * own bucket instead (see `relayUpgradeFailureBudget` / `chargeRelayUpgradeFailure`).
  */
 export const relayUpgradeIpLimiter = new RateLimiterMemory({
   keyPrefix: "rl:relay-ip",
@@ -154,6 +154,32 @@ export const relayUpgradeNodeLimiter = new RateLimiterMemory({
   duration: DEFAULTS.relayUpgradeNode.duration,
   blockDuration: DEFAULTS.relayUpgradeNode.blockDuration,
 });
+
+/**
+ * Whether this address may still try a relay upgrade: its failures have not used up the
+ * per-IP bucket. Only reads the bucket, so concurrent honest upgrades spend nothing. An
+ * unexpected limiter error fails open, like the middleware.
+ */
+export async function relayUpgradeFailureBudget(key: string): Promise<ExchangeLimit> {
+  try {
+    const state = await relayUpgradeIpLimiter.get(key);
+    if (state && state.consumedPoints >= relayUpgradeIpLimiter.points) {
+      return { allowed: false, retryAfterMs: state.msBeforeNext };
+    }
+  } catch {
+    // Fail open.
+  }
+  return { allowed: true };
+}
+
+/** Charges one failed relay upgrade to its address (blocking it once the budget is spent). */
+export async function chargeRelayUpgradeFailure(key: string): Promise<void> {
+  try {
+    await relayUpgradeIpLimiter.consume(key);
+  } catch {
+    // Over the budget (now blocked), or a limiter error: nothing else to do.
+  }
+}
 
 /**
  * Enrollment-code exchanges (`POST /api/node/enroll`, lane A1), per client IP. A code is a

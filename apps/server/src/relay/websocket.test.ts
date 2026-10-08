@@ -149,11 +149,35 @@ describe("createRelayWebsocketMiddleware", () => {
     // …while another node behind the same address still connects…
     authenticateMock.mockResolvedValue(identityFor("node-b"));
     expect((await upgrade()).status).toBe(200);
-    // …the address kept its whole budget (each authenticated point was refunded)…
-    const ipBudget = await relayUpgradeIpLimiter.get("ip:203.0.113.1");
-    expect(ipBudget?.consumedPoints ?? 0).toBe(0);
+    // …the address spent none of its failure budget…
+    expect(await relayUpgradeIpLimiter.get("ip:203.0.113.1")).toBeNull();
     // …and the sign-in bucket for that address was never touched.
     expect(await authLimiter.get("203.0.113.1")).toBeNull();
+  });
+
+  it("lets many honest nodes behind one address connect at once", async () => {
+    let finish: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    let index = 0;
+    authenticateMock.mockImplementation(async () => {
+      const nodeId = `nat-${index++}`;
+      await gate;
+      return identityFor(nodeId);
+    });
+    const upgrades = Array.from({ length: 64 }, () =>
+      app().request("/api/cli/ws", {
+        method: "GET",
+        headers: websocketHeaders({ Authorization: "Bearer wsmp_node_secret" }),
+      }),
+    );
+    await vi.waitFor(() => expect(authenticateMock).toHaveBeenCalledTimes(64));
+    finish();
+    const statuses = (await Promise.all(upgrades)).map((response) => response.status);
+    expect(statuses.every((status) => status === 200)).toBe(true);
+    expect(await relayUpgradeIpLimiter.get("ip:203.0.113.1")).toBeNull();
+    for (let n = 0; n < 64; n += 1) await relayUpgradeNodeLimiter.delete(`node:nat-${n}`);
   });
 
   it("rejects revoked websocket credentials", async () => {

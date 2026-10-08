@@ -3,8 +3,9 @@ import type { Context, MiddlewareHandler } from "hono";
 import type { WSContext, WSEvents } from "hono/ws";
 import { resolveClientIp } from "../client-ip.js";
 import {
+  chargeRelayUpgradeFailure,
   createRateLimiterMiddleware,
-  relayUpgradeIpLimiter,
+  relayUpgradeFailureBudget,
   relayUpgradeNodeLimiter,
 } from "../rate-limit.js";
 import { authenticateNodeCredential, type NodeIdentity } from "./node-credential-auth.js";
@@ -29,16 +30,13 @@ function bearerSecret(header: string | undefined): string | null {
 const relayIpKey = (c: Context) => `ip:${resolveClientIp(c)}`;
 
 /**
- * Relay upgrades have their own limiters (see `relayUpgradeIpLimiter`), never the sign-in
- * bucket. The per-IP point reserved before authentication is refunded once the credential
- * authenticates; the upgrade is then charged to the node, keyed by its verified id (never by
- * the presented secret's bytes, so a caller cannot pick a bucket).
+ * Relay upgrades have their own limiters, never the sign-in bucket. An address whose failed
+ * upgrades used up its relay budget is refused before the credential is checked; only failures
+ * spend that budget, so many honest nodes behind one NAT connecting at once never do. An
+ * authenticated upgrade is charged to its node, keyed by the verified id (never by the presented
+ * secret's bytes, so a caller cannot pick a bucket).
  */
 export function createRelayWebsocketMiddleware(): MiddlewareHandler<{ Variables: RelayVariables }> {
-  const ipRateLimit = createRateLimiterMiddleware(relayUpgradeIpLimiter, {
-    resolveKey: relayIpKey,
-  });
-
   return async (c, next) => {
     if (c.req.header("upgrade")?.toLowerCase() !== "websocket") {
       return c.json({ error: "WebSocket upgrade required." }, 426);
@@ -47,11 +45,16 @@ export function createRelayWebsocketMiddleware(): MiddlewareHandler<{ Variables:
       return c.json({ error: "Server is shutting down." }, 503);
     }
 
-    const limited = await ipRateLimit(c, async () => undefined);
-    if (limited instanceof Response) return limited;
+    const ipKey = relayIpKey(c);
+    const budget = await relayUpgradeFailureBudget(ipKey);
+    if (!budget.allowed) {
+      c.header("Retry-After", String(Math.max(1, Math.ceil(budget.retryAfterMs / 1000))));
+      return c.json({ error: "Too many attempts. Please wait a moment and try again." }, 429);
+    }
 
     const requestedProtocol = parseRelaySubprotocolHeader(c.req.header("sec-websocket-protocol"));
     if (!requestedProtocol.supported) {
+      await chargeRelayUpgradeFailure(ipKey);
       return c.json(
         {
           ...protocolErrorMessage({
@@ -66,14 +69,15 @@ export function createRelayWebsocketMiddleware(): MiddlewareHandler<{ Variables:
 
     const secret = bearerSecret(c.req.header("authorization"));
     if (!secret) {
+      await chargeRelayUpgradeFailure(ipKey);
       return c.json({ error: "Node credential required." }, 401);
     }
 
     const identity = await authenticateNodeCredential(secret);
     if (!identity) {
+      await chargeRelayUpgradeFailure(ipKey);
       return c.json({ error: "Invalid or revoked node credential." }, 401);
     }
-    await relayUpgradeIpLimiter.reward(relayIpKey(c), 1).catch(() => undefined);
     const nodeRateLimit = createRateLimiterMiddleware(relayUpgradeNodeLimiter, {
       resolveKey: () => `node:${identity.nodeId}`,
     });
