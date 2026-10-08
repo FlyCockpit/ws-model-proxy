@@ -13,7 +13,8 @@
 //!   5  the server refused this wsmp's relay protocol (it needs a newer wsmp,
 //!      or the server is too old). Re-run the server's `install.sh` (or upgrade
 //!      the server), then restart wsmp. The systemd unit lists this in
-//!      `RestartPreventExitStatus=` too.
+//!      `RestartPreventExitStatus=` too and sets `WSMP_STOP_ON_PROTOCOL_MISMATCH`;
+//!      under an older unit without it, the relay retries every 5 minutes.
 //!
 //! A relay stopped by SIGHUP, SIGINT, or SIGTERM cleans up and then dies from
 //! that signal (shell status 128 + signal); see `crate::shutdown`.

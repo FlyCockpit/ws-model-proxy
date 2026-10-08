@@ -307,6 +307,7 @@ pub fn render_systemd_user_unit(
          # Exit 5: the server refused this wsmp's relay protocol. Re-run the\n\
          # server's install.sh (or upgrade the server), then restart.\n\
          RestartPreventExitStatus=4 5\n\
+         Environment=WSMP_STOP_ON_PROTOCOL_MISMATCH=1\n\
          # Tells the relay it may exit 4 here instead of retrying in-process.\n\
          Environment=WSMP_STOP_ON_REJECTED_CREDENTIAL=1\n\
          # The config and state paths `wsmp service install` resolved, so the service\n\
@@ -794,8 +795,12 @@ mod tests {
             "Environment={}=1\n",
             crate::daemon::STOP_ON_REJECTED_CREDENTIAL_ENV
         )));
-        // Only the pinned paths and the stop marker: no token or header variables.
-        assert_eq!(unit.matches("Environment=").count(), 4);
+        assert!(unit.contains(&format!(
+            "Environment={}=1\n",
+            crate::daemon::STOP_ON_PROTOCOL_MISMATCH_ENV
+        )));
+        // Only the pinned paths and the stop markers: no token or header variables.
+        assert_eq!(unit.matches("Environment=").count(), 5);
     }
 
     #[cfg(unix)]

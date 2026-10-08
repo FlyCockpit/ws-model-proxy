@@ -333,9 +333,10 @@ a "marked as stopped" row in the node's activity.
 - An unhealthy instance shows why its last health check failed (for example
   "answered HTTP 503" or "the serving process is not running in its unit") on
   the runtime page and as `healthDetail` in `runtimes_get`.
-- A wsmp the server refuses for its relay protocol now stops with exit code 5
-  under the systemd service instead of restarting every 5 seconds; re-run the
-  server's install.sh, then restart it.
+- A wsmp the server refuses for its relay protocol no longer restarts every 5
+  seconds: under a service unit written by `wsmp service install` it stops
+  with exit code 5, and under an older unit it retries every 5 minutes. Re-run
+  the server's install.sh, then `wsmp service install` to update the unit.
 
 ## Configuration
 
@@ -352,8 +353,9 @@ Relay connections (`/api/cli/ws`) have their own limits and no longer share
 the sign-in bucket, so a node reconnecting in a loop cannot lock its owner out
 of sign-in from the same address. Each node may open 10 relay connections per
 minute (then it waits 5 minutes), and each address may fail 30 relay
-connections per minute before authenticating (then 5 minutes); a connection
-that authenticates does not count against its address. A refused connection
+connections per minute before authenticating (then 5 minutes); only failed
+connections count against an address, so many nodes behind one NAT can
+connect at once. A refused connection
 answers 429 with `Retry-After`, and `wsmp` waits at least that long.
 
 ### Email recipient caps

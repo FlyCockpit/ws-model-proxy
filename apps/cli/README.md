@@ -223,7 +223,7 @@ Commands that print data take `--json` (`wsmp service` does not). Logs go to std
 | 2 | usage error |
 | 3 | not found |
 | 4 | the relay has no usable credential (none saved, rejected with HTTP 401, or refused at hello as revoked or enrolled with another identity); run `wsmp login`. Only under the systemd unit and in an interactive terminal; elsewhere the relay retries instead. The systemd unit does not restart on this code. |
-| 5 | the server refused this wsmp's relay protocol (HTTP 426 or an `upgrade_cli`/`upgrade_server` refusal at hello). Re-run the server's `install.sh` to install the matching wsmp (or upgrade the server), then restart wsmp. Like 4, only under the systemd unit and in an interactive terminal; elsewhere the relay logs it and retries every 5 minutes. The systemd unit does not restart on this code. |
+| 5 | the server refused this wsmp's relay protocol (HTTP 426 or an `upgrade_cli`/`upgrade_server` refusal at hello). Re-run the server's `install.sh` to install the matching wsmp (or upgrade the server), then restart wsmp. Only under a systemd unit written by this version's `wsmp service install` (it does not restart on this code) and in an interactive terminal; elsewhere, including an older unit, the relay logs it and retries every 5 minutes (re-run `wsmp service install` to update an older unit). |
 | 128 + signal | the relay stopped on SIGHUP (129), SIGINT (130), or SIGTERM (143); on Unix it dies from that signal after cleanup |
 
 ## Development

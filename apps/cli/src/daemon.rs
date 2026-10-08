@@ -1025,8 +1025,8 @@ fn run_relay_session(
         HeaderValue::from_static(RELAY_SUBPROTOCOL),
     );
     request.headers_mut().insert("Authorization", auth_value);
-    let (mut socket, response) = connect(request)
-        .map_err(|error| relay_connect_error(error, stop_on_unusable_credential()))?;
+    let (mut socket, response) =
+        connect(request).map_err(|error| relay_connect_error(error, StopOn::here()))?;
     if response
         .headers()
         .get("Sec-WebSocket-Protocol")
@@ -1037,7 +1037,7 @@ fn run_relay_session(
             anyhow::anyhow!(
                 "server did not accept relay websocket subprotocol `{RELAY_SUBPROTOCOL}`; upgrade the WS Model Proxy server"
             ),
-            stop_on_unusable_credential(),
+            StopOn::here(),
         ));
     }
     set_socket_timeouts(
@@ -1103,7 +1103,7 @@ fn run_relay_session(
             "CLI identity key is unavailable; cannot bind this node"
         ))
     })?;
-    let (nonce, origin) = wait_for_hello_challenge(&mut socket, stop_on_unusable_credential())?;
+    let (nonce, origin) = wait_for_hello_challenge(&mut socket, StopOn::here())?;
     check_hello_origin(&origin, &hello_origin, server_url)?;
     let identity_signature = identity
         .sign_hello(&nonce, node_slug, &origin)
@@ -1477,11 +1477,7 @@ where
                     "relay protocol error: {message}"
                 )));
             }
-            return Err(hello_rejection(
-                &message,
-                Some(&code),
-                stop_on_unusable_credential(),
-            ));
+            return Err(hello_rejection(&message, Some(&code), StopOn::here()));
         }
         ServerFrame::HeartbeatPong { id, .. } => {
             tracing::debug!(id, "relay heartbeat acknowledged");
@@ -3618,7 +3614,7 @@ where
     Ok(())
 }
 
-fn old_server_upgrade_error(stop: bool) -> RelaySessionError {
+fn old_server_upgrade_error(stop: StopOn) -> RelaySessionError {
     protocol_mismatch(
         anyhow::anyhow!(
             "the server did not complete the relay handshake for protocol {RELAY_PROTOCOL_VERSION}; upgrade the WS Model Proxy server"
@@ -3628,37 +3624,59 @@ fn old_server_upgrade_error(stop: bool) -> RelaySessionError {
 }
 
 /// A refusal before `hello.ok` that the same binary cannot get past by
-/// retrying soon. Where stopping is safe (see `stop_on_unusable_credential`)
-/// it exits with its own code, which the systemd unit does not restart: a
-/// protocol mismatch exits 5, a revoked or mismatched credential exits 4. A
-/// malformed-frame refusal is a bug and exits 1. Elsewhere the relay keeps
-/// the message in its log and retries only every few minutes, so a service
-/// manager that relaunches every exit (launchd) cannot turn it into a storm.
+/// retrying soon. Where stopping is safe ([`StopOn`]) it exits with its own
+/// code, which the systemd unit does not restart: a protocol mismatch exits
+/// 5, a credential enrolled with another identity exits 4. A malformed-frame
+/// refusal is a bug and exits 1. Elsewhere the relay keeps the message in its
+/// log and retries only every few minutes, so a service manager that
+/// relaunches every exit (launchd) cannot turn it into a storm. An
+/// `access_denied` (revoked credential, an owner who is not active, a
+/// rebound credential) may clear up by itself (an owner reactivated): it is
+/// always retried slowly.
 fn hello_rejection(
     message: &str,
     code: Option<&ProtocolErrorCode>,
-    stop: bool,
+    stop: StopOn,
 ) -> RelaySessionError {
     let text = hello_rejection_message(message, code);
     match code {
         None | Some(ProtocolErrorCode::UpgradeCli | ProtocolErrorCode::UpgradeServer) => {
             protocol_mismatch(anyhow::anyhow!(text), stop)
         }
-        Some(ProtocolErrorCode::AccessDenied | ProtocolErrorCode::IdentityMismatch) => {
-            unrecoverable(
-                anyhow::anyhow!("{text}; run `wsmp login` to enroll this machine again"),
-                crate::exit::ExitCode::CredentialRejected,
-                stop,
-            )
-        }
+        Some(ProtocolErrorCode::AccessDenied) => unrecoverable(
+            anyhow::anyhow!(
+                "{text}; if this machine's credential was revoked, run `wsmp login` to enroll it again"
+            ),
+            crate::exit::ExitCode::CredentialRejected,
+            false,
+        ),
+        Some(ProtocolErrorCode::IdentityMismatch) => unrecoverable(
+            anyhow::anyhow!("{text}; run `wsmp login` to enroll this machine again"),
+            crate::exit::ExitCode::CredentialRejected,
+            stop.credential,
+        ),
         Some(ProtocolErrorCode::Malformed | ProtocolErrorCode::Internal) => {
             RelaySessionError::Fatal(anyhow::anyhow!(text))
         }
     }
 }
 
-fn protocol_mismatch(error: anyhow::Error, stop: bool) -> RelaySessionError {
-    unrecoverable(error, crate::exit::ExitCode::RelayProtocolMismatch, stop)
+fn protocol_mismatch(error: anyhow::Error, stop: StopOn) -> RelaySessionError {
+    // A unit written before exit 5 existed restarts on it: retry slowly there,
+    // and say how to get the unit that stops instead.
+    let error = if !stop.protocol && stop.credential {
+        error.context(
+            "this wsmp.service predates the protocol-mismatch exit code; after installing the matching wsmp, \
+             run `wsmp service install` to update it",
+        )
+    } else {
+        error
+    };
+    unrecoverable(
+        error,
+        crate::exit::ExitCode::RelayProtocolMismatch,
+        stop.protocol,
+    )
 }
 
 /// Stops with `code` where stopping is safe; elsewhere retries no sooner than
@@ -3720,7 +3738,7 @@ fn check_hello_origin(
 /// A reply to the hello wait that strict 3.0 parsing refused, read loosely:
 /// an older server sends `protocol.error` without a code, or a challenge
 /// without an origin. Both mean "upgrade the server".
-fn older_server_reply(text: &str, stop: bool) -> Option<RelaySessionError> {
+fn older_server_reply(text: &str, stop: StopOn) -> Option<RelaySessionError> {
     let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
     match value.get("type").and_then(serde_json::Value::as_str)? {
         "protocol.error" => {
@@ -3737,7 +3755,7 @@ fn older_server_reply(text: &str, stop: bool) -> Option<RelaySessionError> {
 
 fn wait_for_hello_challenge<S>(
     socket: &mut tungstenite::WebSocket<S>,
-    stop: bool,
+    stop: StopOn,
 ) -> RelaySessionResult<(String, String)>
 where
     S: std::io::Read + std::io::Write,
@@ -3851,6 +3869,54 @@ fn stop_on_unusable_credential() -> bool {
         || std::io::stderr().is_terminal()
 }
 
+/// Set by a systemd unit that also lists exit 5 in `RestartPreventExitStatus=`
+/// (units written before exit 5 existed do not set it, and would restart on
+/// it every 5 seconds).
+pub const STOP_ON_PROTOCOL_MISMATCH_ENV: &str = "WSMP_STOP_ON_PROTOCOL_MISMATCH";
+
+/// Where an unrecoverable refusal may stop the relay instead of retrying it
+/// slowly: `credential` (exit 4, see [`stop_on_unusable_credential`]) and
+/// `protocol` (exit 5: a unit that does not restart on it, or a terminal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StopOn {
+    credential: bool,
+    protocol: bool,
+}
+
+impl StopOn {
+    fn here() -> Self {
+        use std::io::IsTerminal;
+        Self {
+            credential: stop_on_unusable_credential(),
+            protocol: std::env::var_os(STOP_ON_PROTOCOL_MISMATCH_ENV)
+                .is_some_and(|value| value == "1")
+                || std::io::stderr().is_terminal(),
+        }
+    }
+
+    #[cfg(test)]
+    const ALL: Self = Self {
+        credential: true,
+        protocol: true,
+    };
+    #[cfg(test)]
+    const NONE: Self = Self {
+        credential: false,
+        protocol: false,
+    };
+}
+
+/// Whether a 426 body is the server's relay protocol refusal (`upgrade_cli`,
+/// with the subprotocol it speaks), not a proxy's or the server's plain
+/// "WebSocket upgrade required" (an `Upgrade` header lost on the way).
+fn refuses_relay_protocol(body: Option<&[u8]>) -> bool {
+    body.and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        .is_some_and(|value| {
+            value.get("code").and_then(serde_json::Value::as_str) == Some("upgrade_cli")
+                || value.get("supportedSubprotocol").is_some()
+        })
+}
+
 /// The longest `Retry-After` the relay honours; a longer one waits this long.
 const RELAY_RETRY_AFTER_MAX: Duration = Duration::from_secs(60 * 60);
 
@@ -3935,14 +4001,14 @@ fn retry_after_header(response: &tungstenite::http::Response<Option<Vec<u8>>>) -
 /// wsmp's relay protocol (exit 5 with `stop`). Everything else, including a
 /// 403 from a proxy or firewall in front of the server, 429 and 5xx,
 /// reconnects, no sooner than a `Retry-After` the server sent.
-fn relay_connect_error(error: tungstenite::Error, stop: bool) -> RelaySessionError {
+fn relay_connect_error(error: tungstenite::Error, stop: StopOn) -> RelaySessionError {
     if let tungstenite::Error::Http(response) = &error
         && response.status().as_u16() == 401
     {
         let rejected = anyhow::anyhow!(
             "the server rejected this machine's relay credential (HTTP 401); it is revoked or invalid. Run `wsmp login` to sign in again"
         );
-        return if stop {
+        return if stop.credential {
             RelaySessionError::Fatal(rejected.context(crate::exit::CodedError::new(
                 crate::exit::ExitCode::CredentialRejected,
             )))
@@ -3955,6 +4021,7 @@ fn relay_connect_error(error: tungstenite::Error, stop: bool) -> RelaySessionErr
     }
     if let tungstenite::Error::Http(response) = &error
         && response.status().as_u16() == 426
+        && refuses_relay_protocol(response.body().as_deref())
     {
         return protocol_mismatch(
             anyhow::Error::new(error).context(format!(
@@ -3969,7 +4036,17 @@ fn relay_connect_error(error: tungstenite::Error, stop: bool) -> RelaySessionErr
         tungstenite::Error::Http(response) => retry_after_header(response),
         _ => None,
     };
+    let upgrade_lost =
+        matches!(&error, tungstenite::Error::Http(response) if response.status().as_u16() == 426);
     let error = anyhow::Error::new(error).context("opening relay websocket");
+    let error = if upgrade_lost {
+        error.context(
+            "the WebSocket upgrade did not reach the relay (HTTP 426 without a protocol refusal); \
+             check that the proxy in front of the server forwards WebSocket upgrades",
+        )
+    } else {
+        error
+    };
     RelaySessionError::Reconnectable {
         error: match retry_after {
             Some(delay) => error.context(RetryFloor {
@@ -4492,7 +4569,7 @@ mod tests {
         for message in [Message::Close(None), Message::Text("{garbled".into())] {
             let mut socket = challenge_socket(message);
             assert!(matches!(
-                wait_for_hello_challenge(&mut socket, true),
+                wait_for_hello_challenge(&mut socket, StopOn::ALL),
                 Err(RelaySessionError::Reconnectable {
                     reset_backoff: false,
                     ..
@@ -4508,7 +4585,7 @@ mod tests {
                 .into(),
         ));
         assert!(matches!(
-            wait_for_hello_challenge(&mut socket, true),
+            wait_for_hello_challenge(&mut socket, StopOn::ALL),
             Err(RelaySessionError::Reconnectable {
                 reset_backoff: false,
                 ..
@@ -4518,7 +4595,7 @@ mod tests {
             r#"{"type":"protocol.error","failure":"protocol_error","message":"Registration was not received in time."}"#
                 .into(),
         ));
-        match wait_for_hello_challenge(&mut socket, true) {
+        match wait_for_hello_challenge(&mut socket, StopOn::ALL) {
             Err(RelaySessionError::Fatal(error)) => {
                 assert!(
                     crate::exit::message_for(&error).contains("upgrade the WS Model Proxy server")
@@ -4538,13 +4615,15 @@ mod tests {
             r#"{"type":"hello.challenge","nonce":"AAAAAAAAAAAAAAAAAAAAAA"}"#.into(),
         ));
         assert!(matches!(
-            wait_for_hello_challenge(&mut socket, true),
+            wait_for_hello_challenge(&mut socket, StopOn::ALL),
             Err(RelaySessionError::Fatal(_))
         ));
         let mut socket = challenge_socket(Message::Text(
             r#"{"type":"hello.challenge","nonce":"AAAAAAAAAAAAAAAAAAAAAA","origin":"https://example.test"}"#.into()));
         assert_eq!(
-            wait_for_hello_challenge(&mut socket, true).ok().unwrap(),
+            wait_for_hello_challenge(&mut socket, StopOn::ALL)
+                .ok()
+                .unwrap(),
             (
                 "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
                 "https://example.test".to_string()
@@ -4960,7 +5039,7 @@ mod tests {
                 .expect("response");
             tungstenite::Error::Http(Box::new(response))
         };
-        match relay_connect_error(http(401), true) {
+        match relay_connect_error(http(401), StopOn::ALL) {
             RelaySessionError::Fatal(error) => {
                 assert_eq!(
                     crate::exit::code_for(&error),
@@ -4971,7 +5050,7 @@ mod tests {
             _ => panic!("HTTP 401 must be fatal where stopping is safe"),
         }
         // Where exiting would only be relaunched (launchd), 401 is retried.
-        match relay_connect_error(http(401), false) {
+        match relay_connect_error(http(401), StopOn::NONE) {
             RelaySessionError::Reconnectable { error, .. } => {
                 assert!(format!("{error:#}").contains("`wsmp login`"));
             }
@@ -4979,7 +5058,7 @@ mod tests {
         }
         // 403 can come from a proxy or firewall: never fatal.
         for status in [403, 429, 500, 502, 503] {
-            for stop in [true, false] {
+            for stop in [StopOn::ALL, StopOn::NONE] {
                 assert!(matches!(
                     relay_connect_error(http(status), stop),
                     RelaySessionError::Reconnectable { .. }
@@ -4989,7 +5068,7 @@ mod tests {
         let io =
             tungstenite::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
         assert!(matches!(
-            relay_connect_error(io, true),
+            relay_connect_error(io, StopOn::ALL),
             RelaySessionError::Reconnectable { .. }
         ));
     }
@@ -5004,7 +5083,7 @@ mod tests {
 
     #[test]
     fn a_rate_limited_upgrade_waits_at_least_retry_after_and_logs_it() {
-        for stop in [true, false] {
+        for stop in [StopOn::ALL, StopOn::NONE] {
             match relay_connect_error(http_error(429, Some("120")), stop) {
                 RelaySessionError::Reconnectable { error, .. } => {
                     assert_eq!(retry_floor(&error), Some(Duration::from_secs(120)));
@@ -5017,14 +5096,14 @@ mod tests {
             }
         }
         // A huge or missing Retry-After: capped, or none at all.
-        match relay_connect_error(http_error(503, Some("999999")), true) {
+        match relay_connect_error(http_error(503, Some("999999")), StopOn::ALL) {
             RelaySessionError::Reconnectable { error, .. } => {
                 assert_eq!(retry_floor(&error), Some(RELAY_RETRY_AFTER_MAX));
             }
             _ => panic!("HTTP 503 must reconnect"),
         }
         for value in [None, Some("Wed, 21 Oct 2015 07:28:00 GMT"), Some("soon")] {
-            match relay_connect_error(http_error(429, value), true) {
+            match relay_connect_error(http_error(429, value), StopOn::ALL) {
                 RelaySessionError::Reconnectable { error, .. } => {
                     assert_eq!(retry_floor(&error), None);
                 }
@@ -5054,11 +5133,14 @@ mod tests {
             hello_rejection(
                 "This server requires relay protocol 3.0. Upgrade wsmp and restart it.",
                 Some(&ProtocolErrorCode::UpgradeCli),
-                true,
+                StopOn::ALL,
             ),
-            hello_rejection("too new", Some(&ProtocolErrorCode::UpgradeServer), true),
-            hello_rejection("Malformed relay protocol message.", None, true),
-            relay_connect_error(http_error(426, None), true),
+            hello_rejection(
+                "too new",
+                Some(&ProtocolErrorCode::UpgradeServer),
+                StopOn::ALL,
+            ),
+            hello_rejection("Malformed relay protocol message.", None, StopOn::ALL),
         ];
         for refusal in refusals {
             match refusal {
@@ -5076,7 +5158,11 @@ mod tests {
                 _ => panic!("a refused protocol must stop where stopping is safe"),
             }
         }
-        let cli = hello_rejection("Upgrade wsmp.", Some(&ProtocolErrorCode::UpgradeCli), true);
+        let cli = hello_rejection(
+            "Upgrade wsmp.",
+            Some(&ProtocolErrorCode::UpgradeCli),
+            StopOn::ALL,
+        );
         let RelaySessionError::Fatal(error) = cli else {
             panic!("upgrade_cli must stop");
         };
@@ -5085,7 +5171,11 @@ mod tests {
 
     #[test]
     fn a_refused_relay_protocol_retries_slowly_where_exiting_would_relaunch() {
-        match hello_rejection("Upgrade wsmp.", Some(&ProtocolErrorCode::UpgradeCli), false) {
+        match hello_rejection(
+            "Upgrade wsmp.",
+            Some(&ProtocolErrorCode::UpgradeCli),
+            StopOn::NONE,
+        ) {
             RelaySessionError::Reconnectable { error, .. } => {
                 assert_eq!(retry_floor(&error), Some(RELAY_RECONNECT_MAX_DELAY));
                 assert!(format!("{error:#}").contains("install.sh"));
@@ -5096,28 +5186,89 @@ mod tests {
 
     #[test]
     fn a_hello_credential_refusal_asks_for_login_and_malformed_stays_generic() {
-        for code in [
-            ProtocolErrorCode::AccessDenied,
-            ProtocolErrorCode::IdentityMismatch,
-        ] {
-            let RelaySessionError::Fatal(error) = hello_rejection("revoked", Some(&code), true)
-            else {
-                panic!("a credential refusal must stop where stopping is safe");
-            };
-            assert_eq!(
-                crate::exit::code_for(&error),
-                crate::exit::ExitCode::CredentialRejected
-            );
-            assert!(crate::exit::message_for(&error).contains("`wsmp login`"));
+        let RelaySessionError::Fatal(error) = hello_rejection(
+            "another identity key",
+            Some(&ProtocolErrorCode::IdentityMismatch),
+            StopOn::ALL,
+        ) else {
+            panic!("an identity mismatch must stop where stopping is safe");
+        };
+        assert_eq!(
+            crate::exit::code_for(&error),
+            crate::exit::ExitCode::CredentialRejected
+        );
+        assert!(crate::exit::message_for(&error).contains("`wsmp login`"));
+        // Access denied (revoked, owner not active) may clear up: retried slowly.
+        match hello_rejection(
+            "The node's owner is not active.",
+            Some(&ProtocolErrorCode::AccessDenied),
+            StopOn::ALL,
+        ) {
+            RelaySessionError::Reconnectable { error, .. } => {
+                assert_eq!(retry_floor(&error), Some(RELAY_RECONNECT_MAX_DELAY));
+                assert!(format!("{error:#}").contains("`wsmp login`"));
+            }
+            _ => panic!("access_denied must be retried slowly"),
         }
         let RelaySessionError::Fatal(error) =
-            hello_rejection("bad", Some(&ProtocolErrorCode::Malformed), true)
+            hello_rejection("bad", Some(&ProtocolErrorCode::Malformed), StopOn::ALL)
         else {
             panic!("malformed must stay fatal");
         };
         assert_eq!(
             crate::exit::code_for(&error),
             crate::exit::ExitCode::Failure
+        );
+    }
+
+    #[test]
+    fn an_old_unit_retries_a_refused_protocol_slowly_and_says_to_reinstall_it() {
+        let old_unit = StopOn {
+            credential: true,
+            protocol: false,
+        };
+        match hello_rejection(
+            "Upgrade wsmp.",
+            Some(&ProtocolErrorCode::UpgradeCli),
+            old_unit,
+        ) {
+            RelaySessionError::Reconnectable { error, .. } => {
+                assert_eq!(retry_floor(&error), Some(RELAY_RECONNECT_MAX_DELAY));
+                assert!(format!("{error:#}").contains("`wsmp service install`"));
+            }
+            _ => panic!("an old unit restarts on exit 5: retry instead"),
+        }
+    }
+
+    #[test]
+    fn a_plain_426_is_a_lost_upgrade_not_a_protocol_mismatch() {
+        let refusal = |body: &str| {
+            let response = tungstenite::http::Response::builder()
+                .status(426)
+                .body(Some(body.as_bytes().to_vec()))
+                .expect("response");
+            tungstenite::Error::Http(Box::new(response))
+        };
+        match relay_connect_error(
+            refusal(r#"{"error":"WebSocket upgrade required."}"#),
+            StopOn::ALL,
+        ) {
+            RelaySessionError::Reconnectable { error, .. } => {
+                assert!(format!("{error:#}").contains("forwards WebSocket upgrades"));
+            }
+            _ => panic!("a lost upgrade must reconnect"),
+        }
+        let RelaySessionError::Fatal(error) = relay_connect_error(
+            refusal(
+                r#"{"type":"protocol.error","code":"upgrade_cli","supportedSubprotocol":"ws-model-proxy.relay.v3"}"#,
+            ),
+            StopOn::ALL,
+        ) else {
+            panic!("the server's protocol refusal must stop");
+        };
+        assert_eq!(
+            crate::exit::code_for(&error),
+            crate::exit::ExitCode::RelayProtocolMismatch
         );
     }
 
