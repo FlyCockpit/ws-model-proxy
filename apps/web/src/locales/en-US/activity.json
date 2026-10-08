@@ -46,6 +46,32 @@
       "cloud_cap_reached": "the cloud spend cap is reached",
       "unauthorized_external": "cloud use is not allowed for this caller",
       "other": "{{code}}"
+    },
+    "olderThan": "Older than",
+    "deleteOlder": "Delete older",
+    "deleteOlderTitle": "Delete requests older than {{range}}?",
+    "deleteOlderDescription": "Finished requests you made to your own pools and models from before then are deleted (requests still running stay). Requests you made to other people's pools stay in their owners' logs.",
+    "range": {
+      "1h": "1 hour",
+      "24h": "1 day",
+      "7d": "7 days",
+      "30d": "30 days"
+    },
+    "filter": {
+      "poolId": "Pool",
+      "runtimeId": "Runtime",
+      "versionId": "Version",
+      "nodeId": "Node",
+      "since": "Since",
+      "anyTime": "Any time",
+      "versionNumber": "Version {{version}}",
+      "reset": "Reset filters"
+    },
+    "sinceRange": {
+      "1h": "Last hour",
+      "24h": "Last day",
+      "7d": "Last 7 days",
+      "30d": "Last 30 days"
     }
   },
   "commands": {
