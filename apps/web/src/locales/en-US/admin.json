@@ -8,7 +8,7 @@
   },
   "overview": {
     "title": "Admin",
-    "description": "Manage users, access, device sign-in, and instance settings."
+    "description": "Manage users, access and server settings."
   },
   "observability": {
     "title": "Observability",
@@ -41,7 +41,7 @@
     "members_other": "{{count}} members",
     "shares_one": "{{count}} share",
     "shares_other": "{{count}} shares",
-    "direct": "Direct call",
+    "direct": "Served model (test)",
     "duration": "{{value}} ms"
   },
   "settings": {
@@ -77,7 +77,7 @@
       "attachmentLimitTitle": "Maximum attachment size (bytes)",
       "attachmentLimitDescription": "Limits each attachment across chat models. Model-specific limits may be lower, but cannot be higher.",
       "attachmentLimitNoDeploymentCap": "Upload storage is disabled, so this policy will apply when it is enabled.",
-      "attachmentLimitDeploymentCap": "The deployment upload ceiling is {{max}}; it remains a hard upper bound.",
+      "attachmentLimitDeploymentCap": "This server's upload ceiling is {{max}}; it remains a hard upper bound.",
       "attachmentLimitEffective": "The effective attachment limit is currently {{max}}.",
       "attachmentLimitInvalid": "Enter a whole number of bytes.",
       "attachmentLimitMinimum": "Enter at least {{min}}.",
@@ -107,25 +107,6 @@
       "deleteAllConfirmToken": "DELETE ALL",
       "deleteAllConfirmPrompt": "Type DELETE ALL to confirm.",
       "deleteAllCopyLabel": "Copy confirmation text"
-    },
-    "deploymentFeatures": {
-      "title": "Deployment features",
-      "description": "Read-only flags for this deployment. Change them in the environment and restart.",
-      "on": "On",
-      "off": "Off",
-      "configured": "Configured",
-      "missing": "Missing",
-      "ready": "Ready",
-      "notReady": "Not ready",
-      "flags": {
-        "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED": "External providers: requests to a pool's :external name may use third-party provider fallback.",
-        "keyringConfigured": "Whether WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS is set. The key itself is never shown.",
-        "ready": "External providers are enabled and the credential keyring is configured.",
-        "WMP_MCP_ENABLED": "MCP server and OAuth provider surface.",
-        "WMP_MCP_PAT_ALLOW_NO_EXPIRY": "Allow minting MCP personal tokens with no expiry.",
-        "WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS": "Allow private and loopback provider URLs.",
-        "SIGNUP_ENABLED": "Public signup. A database setting can override the environment flag."
-      }
     }
   },
   "users": {

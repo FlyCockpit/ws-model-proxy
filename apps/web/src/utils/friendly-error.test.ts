@@ -10,15 +10,7 @@ import {
   friendly,
 } from "./friendly-error";
 
-const ENTITIES: DeletionEntity[] = [
-  "user",
-  "cliDevice",
-  "endpoint",
-  "discoveredModel",
-  "pool",
-  "poolMember",
-  "capacity",
-];
+const ENTITIES: DeletionEntity[] = ["user"];
 
 function conflict(data?: unknown, message = "raw server message") {
   return { status: 409, code: "CONFLICT", message, data };
@@ -44,7 +36,11 @@ describe("deletionConflictReason", () => {
     expect(deletionConflictReason(conflict())).toBeNull();
     expect(deletionConflictReason(conflict({ reason: "something_else" }))).toBeNull();
     expect(
-      deletionConflictReason({ status: 400, code: "BAD_REQUEST", data: { reason: "not_stale" } }),
+      deletionConflictReason({
+        status: 400,
+        code: "BAD_REQUEST",
+        data: { reason: "delete_pending" },
+      }),
     ).toBeNull();
     expect(deletionConflictReason(null)).toBeNull();
   });
@@ -71,18 +67,16 @@ describe("deletionConflictMessageKey", () => {
     const expected = {
       delete_pending: "errors:deletionConflict.deletePending",
       delete_contended: "errors:deletionConflict.deleteContended",
-      still_attached: "errors:deletionConflict.stillAttached",
-      not_stale: "errors:deletionConflict.notStale",
       deletion_in_progress: "errors:deletionConflict.deletionInProgress",
     };
     for (const [reason, key] of Object.entries(expected)) {
-      expect(deletionConflictMessageKey(conflict({ reason }), "pool")).toBe(key);
+      expect(deletionConflictMessageKey(conflict({ reason }), "user")).toBe(key);
     }
   });
 
   it("returns null for a CONFLICT without a known reason, which keeps the generic copy", () => {
     const error = conflict({ reason: "slug_taken" });
-    expect(deletionConflictMessageKey(error, "pool")).toBeNull();
+    expect(deletionConflictMessageKey(error, "user")).toBeNull();
     expect(friendly(error)).toBe("That conflicts with an existing record.");
   });
 

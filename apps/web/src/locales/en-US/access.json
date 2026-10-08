@@ -70,7 +70,7 @@
     "levelRead": "Read-only",
     "levelFull": "Full",
     "levelReadHint": "Reads pools, runtimes, nodes, metrics and the request log. Changes nothing.",
-    "levelFullHint": "Everything an agent may do: configure, start and stop runtimes, and run commands and edit files on Full-control nodes. It can never grant access.",
+    "levelFullHint": "Everything an agent may do: configure, start and stop runtimes, and run commands and edit files on Full-control nodes. It can never change who has access.",
     "levelFor": "Access for {{name}}",
     "levelChanged": "Access changed.",
     "raiseTitle": "Give {{name}} Full access?",

@@ -70,7 +70,7 @@
     "levelRead": "Solo lectura",
     "levelFull": "Completo",
     "levelReadHint": "Lee pools, runtimes, nodos, métricas y el registro de solicitudes. No cambia nada.",
-    "levelFullHint": "Todo lo que un agente puede hacer: configurar, iniciar y detener runtimes, y ejecutar comandos y editar archivos en nodos con control completo. Nunca puede dar acceso.",
+    "levelFullHint": "Todo lo que un agente puede hacer: configurar, iniciar y detener runtimes, y ejecutar comandos y editar archivos en nodos con control completo. Nunca puede cambiar quién tiene acceso.",
     "levelFor": "Acceso de {{name}}",
     "levelChanged": "Acceso cambiado.",
     "raiseTitle": "¿Dar acceso Completo a {{name}}?",

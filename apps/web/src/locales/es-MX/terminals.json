@@ -1,12 +1,12 @@
 {
   "nodesTitle": "Terminales del navegador",
-  "nodesDescription": "Abre una shell en un nodo con control completo. Los nodos solo relé no aceptan terminales del navegador.",
+  "nodesDescription": "Abre una shell en un nodo con control completo. Los nodos solo retransmisión no aceptan terminales del navegador.",
   "open": "Abrir terminal",
   "opening": "Abriendo…",
   "noFullNodes": "Ningún nodo tiene control completo y está conectado.",
   "nodesUnavailable": "No se pudieron cargar tus nodos.",
   "offline": "Desconectado",
-  "relayOnly": "Solo relé",
+  "relayOnly": "Solo retransmisión",
   "queuedTitle": "Comandos en espera para ti",
   "queuedDescription": "Un agente te pidió ejecutarlos. Ejecutar abre una terminal con el comando escrito; tú presionas Enter.",
   "queuedEmpty": "Nada te está esperando.",
@@ -24,8 +24,8 @@
   "workspaceDescription": "La entrada y salida de la terminal se cifran entre este navegador y el nodo. El servidor no puede leerlas ni escribir en ellas.",
   "workspaceEmpty": "Abre una terminal en un nodo, o ejecuta un comando en espera, y aparecerá aquí.",
   "socket": {
-    "connecting": "Conectando con el relé…",
-    "closed": "Sin conexión con el relé. Reconectando…",
+    "connecting": "Conectando con el servidor…",
+    "closed": "Sin conexión con el servidor. Reconectando…",
     "unauthorized": "Tu sesión terminó. Vuelve a iniciar sesión para usar terminales."
   },
   "phase": {
@@ -41,7 +41,7 @@
   "closeTab": "Cerrar pestaña",
   "endSession": "Terminar sesión",
   "ending": "Terminando…",
-  "endFailed": "El relé no pudo terminar esta sesión. Inténtalo de nuevo.",
+  "endFailed": "El servidor no pudo terminar esta sesión. Inténtalo de nuevo.",
   "typedCommandHint": "El comando está escrito en la terminal. Revísalo y presiona Enter para ejecutarlo.",
   "typedCommandNotTyped": "Este comando tiene más de una línea o caracteres que no son ASCII simple, así que no se escribió. Cópialo de la lista y pégalo en la terminal.",
   "trustNewKey": "Confiar en la nueva clave",
@@ -57,7 +57,7 @@
     "unsupported": "Las terminales del navegador no están activadas en este nodo.",
     "cli_too_old": "Actualiza wsmp en este nodo para usar terminales del navegador.",
     "limit": "Se alcanzó el límite de terminales. Termina una sesión e inténtalo de nuevo.",
-    "invalid": "El relé rechazó esta solicitud de terminal.",
+    "invalid": "El servidor rechazó esta solicitud de terminal.",
     "ticket_invalid": "Este enlace de terminal venció o ya se usó. Vuelve a abrir la terminal.",
     "bad_handshake": "Falló el intercambio seguro con el nodo.",
     "other": "La terminal fue rechazada ({{reason}}).",
@@ -119,7 +119,7 @@
       "node_fill_ambiguous": "Este comando contiene texto que parece un valor que completa el nodo pero no lo es, así que no se muestra completado aquí."
     },
     "unavailableHint": "La terminal en el nodo muestra el comando exacto antes de ejecutarlo.",
-    "template": "Plantilla del comando",
+    "template": "Comando tal como se escribió",
     "refusedButOpen": "El servidor esperaba que el nodo rechazara este paso (valor no válido: {{field}}), pero su terminal se abrió, así que el comando no se puede confirmar aquí."
   }
 }
