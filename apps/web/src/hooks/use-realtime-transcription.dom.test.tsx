@@ -3,6 +3,11 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+// A split-origin deploy: the socket goes to the server, not the page's origin.
+vi.mock("@ws-model-proxy/env/web", () => ({
+  env: { VITE_SERVER_URL: "https://api.example.test" },
+}));
+
 import { useRealtimeTranscription } from "./use-realtime-transcription";
 
 class FakePort {
@@ -127,7 +132,7 @@ describe("useRealtimeTranscription", () => {
       "/realtime-pcm-worklet.js",
     );
     expect(socket.url).toBe(
-      "ws://localhost:3000/api/internal/chat-test/realtime?intent=transcription&model=owner%2Fasr",
+      "wss://api.example.test/api/internal/chat-test/realtime?intent=transcription&model=owner%2Fasr",
     );
     expect(socket.protocols).toBeUndefined();
     expect(hook.result.current.state.phase).toBe("starting");

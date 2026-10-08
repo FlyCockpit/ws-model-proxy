@@ -13,7 +13,7 @@ export const REALTIME_WORKLET_NAME = "realtime-pcm";
 /** Transcript entries kept on screen. */
 export const REALTIME_ITEMS_MAX = 50;
 
-/** The same-origin Test socket, with only the intent and the model in the query. */
+/** The Test socket at `location` (the server URL), with only the intent and the model in the query. */
 export function realtimeSocketUrl(model: string, location: Pick<Location, "href" | "protocol">) {
   const url = new URL(TEST_REALTIME_PATH, location.href);
   url.protocol = location.protocol === "https:" ? "wss:" : "ws:";

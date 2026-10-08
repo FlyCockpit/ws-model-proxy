@@ -1,3 +1,4 @@
+import { env } from "@ws-model-proxy/env/web";
 import { useCallback, useEffect, useReducer, useRef } from "react";
 
 import {
@@ -38,7 +39,9 @@ function openSessionSocket(
   model: string,
   handlers: { onEvent(event: unknown): void; onClose(code: number): void },
 ): WebSocket {
-  const socket = new WebSocket(realtimeSocketUrl(model, window.location));
+  const socket = new WebSocket(
+    realtimeSocketUrl(model, new URL(env.VITE_SERVER_URL, window.location.href)),
+  );
   socket.onmessage = (message) => {
     if (typeof message.data !== "string") return;
     try {
