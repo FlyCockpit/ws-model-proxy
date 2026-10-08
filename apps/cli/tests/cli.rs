@@ -134,11 +134,7 @@ fn config_init_and_show_use_explicit_config_file() {
     show.args(["config", "--json", "show"]);
     let show_value = json_stdout(show);
     assert_eq!(show_value["version"], 3);
-    assert!(
-        show_value["endpoints"]
-            .as_array()
-            .is_some_and(Vec::is_empty)
-    );
+    assert!(show_value.get("endpoints").is_none());
 }
 
 #[test]
