@@ -212,4 +212,20 @@ describe("poolModelListFlags", () => {
       poolModelListFlags([row("glm", ["TEXT_GENERATION"]), { ...disabledVision, active: true }]),
     ).toMatchObject({ vision: true, video: true });
   });
+
+  it("advertises speech-to-text, live included, from the runtime's transcription profile", () => {
+    const flags = poolModelListFlags([
+      {
+        model: {
+          id: "voxtral",
+          capabilities: [],
+          transcriptionProfile: { realtime: { adapter: "segmented", maxItemSeconds: 30 } },
+        },
+      },
+    ]);
+    expect(openAiModelListExtensions(flags)).toMatchObject({
+      supports_audio_transcription: true,
+      supports_realtime_transcription: true,
+    });
+  });
 });

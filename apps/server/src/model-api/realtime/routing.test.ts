@@ -67,7 +67,7 @@ type RouteOverrides = {
   node?: string | null;
   profile?: unknown;
   ready?: boolean;
-  health?: "HEALTHY" | "HALF_OPEN" | "UNHEALTHY";
+  health?: "UNKNOWN" | "HEALTHY" | "HALF_OPEN" | "UNHEALTHY";
   active?: boolean;
   owner?: string;
   shareId?: string | null;
@@ -231,6 +231,16 @@ describe("pool candidates", () => {
       ],
     });
     expect(candidates.map((candidate) => candidate.memberId)).toEqual(["ok"]);
+  });
+
+  it("takes a fresh target nothing has judged yet, as HTTP routing does", async () => {
+    const candidates = await poolCandidates({
+      pool: POOL,
+      config: {},
+      onlineNodeIds: ["node-1"],
+      routes: async () => [poolRoute({ member: "fresh", health: "UNKNOWN" })],
+    });
+    expect(candidates.map((candidate) => candidate.memberId)).toEqual(["fresh"]);
   });
 
   it("drops vLLM routes when a language or prompt is set", async () => {

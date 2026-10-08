@@ -45,7 +45,8 @@ import type {
  * - the served model's transcription profile declares `realtime` (the runtime definition is
  *   the only source; the node's `stt.open` is checked against the same capability);
  * - the instance is READY, its head node is online here, the member (pools) is ACTIVE and the
- *   execution target is HEALTHY (a live session never takes the HTTP half-open trial);
+ *   execution target is HEALTHY or not yet judged (UNKNOWN, as the HTTP path treats it: a
+ *   fresh target has served nothing yet); a live session never takes the HTTP half-open trial;
  * - the served model's owner may use credentials;
  * - a vLLM adapter only when no language or prompt is set.
  *
@@ -85,13 +86,13 @@ function modelEligible(
   return capabilities;
 }
 
-/** Ready instance on an online node, healthy target. */
+/** Ready instance on an online node, healthy (or not yet judged) target. */
 function routeServes(route: TestRoute, onlineNodeIds: ReadonlySet<string>): boolean {
   return (
     route.instance.ready &&
     route.instance.nodeId !== null &&
     onlineNodeIds.has(route.instance.nodeId) &&
-    route.target.health === "HEALTHY"
+    (route.target.health === "HEALTHY" || route.target.health === "UNKNOWN")
   );
 }
 

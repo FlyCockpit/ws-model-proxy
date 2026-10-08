@@ -12,12 +12,10 @@
  * Extra fields are ignored by strict OpenAI SDKs.
  */
 
-import {
-  audioOperationSupported,
-  openAiCapabilitiesFromCoarse,
-} from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import { audioOperationSupported } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import type { OpenAiCompatibleCapabilities } from "../relay/protocol.js";
 import { realtimeTranscriptionCapability } from "../relay/stt-relay.js";
+import { servedModelCapabilities } from "./served-model-capabilities.js";
 
 export type ModelInputModality = "text" | "image" | "audio" | "video" | "file";
 export type ModelOutputModality = "text" | "image" | "audio" | "embedding";
@@ -181,7 +179,12 @@ export function unionMultimodalFlags(flags: MultimodalFlags[]): MultimodalFlags 
 export function poolModelListFlags(
   rows: ReadonlyArray<{
     active?: boolean;
-    model: { id: string; capabilities: readonly string[] };
+    model: {
+      id: string;
+      capabilities: readonly string[];
+      embeddingContract?: unknown;
+      transcriptionProfile?: unknown;
+    };
   }>,
 ): MultimodalFlags {
   const byModel = new Map(
@@ -189,7 +192,7 @@ export function poolModelListFlags(
   );
   return unionMultimodalFlags(
     [...byModel.values()].map((model) =>
-      multimodalFlagsFromCapabilities(openAiCapabilitiesFromCoarse(model.capabilities)),
+      multimodalFlagsFromCapabilities(servedModelCapabilities(model)),
     ),
   );
 }
