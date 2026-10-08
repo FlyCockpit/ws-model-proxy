@@ -14,17 +14,20 @@ import { useCallback, useSyncExternalStore } from "react";
  *     CLAUDE.md.
  *
  * SSR-safe: the snapshot returns the default value on the server where
- * `window` is undefined, and re-syncs on the client's first commit.
+ * `window` is undefined, and re-syncs on the client's first commit. When
+ * session storage is blocked (it throws), the flag reads `unavailableValue`
+ * and writes are dropped.
  */
 export function useSessionFlag(
   key: string,
   defaultValue = false,
+  unavailableValue = defaultValue,
 ): [boolean, (next: boolean) => void] {
   const subscribe = useCallback(
     (onChange: () => void) => {
       if (typeof window === "undefined") return () => {};
       const handler = (event: StorageEvent) => {
-        if (event.storageArea === window.sessionStorage && event.key === key) onChange();
+        if (event.key === key) onChange();
       };
       window.addEventListener("storage", handler);
       return () => window.removeEventListener("storage", handler);
@@ -34,10 +37,15 @@ export function useSessionFlag(
 
   const getSnapshot = useCallback((): boolean => {
     if (typeof window === "undefined") return defaultValue;
-    const raw = window.sessionStorage.getItem(key);
+    let raw: string | null;
+    try {
+      raw = window.sessionStorage.getItem(key);
+    } catch {
+      return unavailableValue;
+    }
     if (raw === null) return defaultValue;
     return raw === "true";
-  }, [key, defaultValue]);
+  }, [key, defaultValue, unavailableValue]);
 
   const getServerSnapshot = useCallback((): boolean => defaultValue, [defaultValue]);
 
@@ -46,16 +54,20 @@ export function useSessionFlag(
   const setFlag = useCallback(
     (next: boolean) => {
       if (typeof window === "undefined") return;
-      window.sessionStorage.setItem(key, String(next));
-      // `storage` events do not fire in the originating tab, so dispatch one
-      // manually so subscribers in the same tab also see the change.
-      window.dispatchEvent(
-        new StorageEvent("storage", {
-          key,
-          newValue: String(next),
-          storageArea: window.sessionStorage,
-        }),
-      );
+      try {
+        window.sessionStorage.setItem(key, String(next));
+        // `storage` events do not fire in the originating tab, so dispatch one
+        // manually so subscribers in the same tab also see the change.
+        window.dispatchEvent(
+          new StorageEvent("storage", {
+            key,
+            newValue: String(next),
+            storageArea: window.sessionStorage,
+          }),
+        );
+      } catch {
+        // Blocked storage: the snapshot already reads `unavailableValue`.
+      }
     },
     [key],
   );
