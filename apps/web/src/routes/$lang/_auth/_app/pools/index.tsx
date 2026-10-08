@@ -9,7 +9,8 @@ import {
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { Plus } from "lucide-react";
+import { cn } from "@ws-model-proxy/ui/lib/utils";
+import { ArrowRight, Plus } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -39,12 +40,19 @@ function PoolsPage() {
   const { lang } = Route.useParams();
   const pools = useQuery(orpc.pools.list.queryOptions());
   const [creating, setCreating] = useState(false);
+  const [opened, setOpened] = useState(0);
 
   return (
     <div className="flex min-w-0 flex-col gap-6">
       <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
         <PageHeading page="pools" />
-        <Button size="touch" onClick={() => setCreating(true)}>
+        <Button
+          size="touch"
+          onClick={() => {
+            setOpened((count) => count + 1);
+            setCreating(true);
+          }}
+        >
           <Plus aria-hidden="true" />
           {t("dashboard:pool.new")}
         </Button>
@@ -96,6 +104,7 @@ function PoolsPage() {
                         </CardDescription>
                       </CardHeader>
                       <CardContent className="flex min-w-0 flex-col gap-2">
+                        <PoolFlow pool={pool} />
                         {pool.callableIds.map((id) => (
                           <CopyableCode
                             key={id}
@@ -158,7 +167,46 @@ function PoolsPage() {
           ) : null}
         </>
       )}
-      <NewPoolDialog open={creating} onOpenChange={setCreating} lang={lang} />
+      {/* A fresh key per opening, so a cancelled sheet starts over. */}
+      <NewPoolDialog key={opened} open={creating} onOpenChange={setCreating} lang={lang} />
     </div>
+  );
+}
+
+/** Where requests go, in order: own local members, contributed members, then the cloud. */
+function PoolFlow({ pool }: { pool: PoolView }) {
+  const { t } = useTranslation(["dashboard"]);
+  const local = pool.members.filter((member) => member.kind === "LOCAL" && !member.shareId);
+  const contributed = pool.members.filter((member) => member.kind === "LOCAL" && member.shareId);
+  const cloud = pool.members.filter((member) => member.kind === "CLOUD");
+  const cloudOff = pool.cloud.mode === "OFF";
+  const steps = [
+    { key: "local", count: local.length, off: false },
+    { key: "contributed", count: contributed.length, off: false },
+    { key: "cloud", count: cloud.length, off: cloudOff },
+  ] as const;
+  return (
+    <ol
+      className="flex min-w-0 flex-wrap items-center gap-1 text-xs"
+      aria-label={t("dashboard:pool.flow.label")}
+    >
+      {steps.map((step, index) => (
+        <li key={step.key} className="flex items-center gap-1">
+          {index > 0 ? (
+            <ArrowRight aria-hidden="true" className="size-3 shrink-0 text-muted-foreground" />
+          ) : null}
+          <span
+            className={cn(
+              "rounded-md border px-2 py-1 tabular-nums",
+              step.count === 0 || step.off ? "text-muted-foreground" : "text-foreground",
+            )}
+          >
+            {step.off
+              ? t("dashboard:pool.flow.cloudOff", { count: step.count })
+              : t(`dashboard:pool.flow.${step.key}`, { count: step.count })}
+          </span>
+        </li>
+      ))}
+    </ol>
   );
 }

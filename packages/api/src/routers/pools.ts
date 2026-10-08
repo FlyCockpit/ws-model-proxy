@@ -486,6 +486,45 @@ async function setOwnKeyEquivalent(context: SignedInContext, poolId: string, mod
   return ownedPoolView(userId, poolId);
 }
 
+/**
+ * Callable IDs always win over model-name aliases (aliases.set refuses a name equal to one), so
+ * a pool slug that makes `owner/slug` equal to an alias of the owner, or of a share holder who
+ * may use the pool, would silently take that alias's traffic: refuse it.
+ */
+async function refuseShadowedAlias(
+  db: Tx,
+  pool: { ownerUserId: string; poolId: string | null },
+  slug: string,
+) {
+  const owner = await db.user.findUnique({
+    where: { id: pool.ownerUserId },
+    select: { slug: true },
+  });
+  if (!owner) return;
+  const grantees = pool.poolId
+    ? await db.share.findMany({
+        where: { poolId: pool.poolId, canUse: true },
+        select: { granteeUserId: true },
+      })
+    : [];
+  const shadowed = await db.modelAlias.findFirst({
+    where: {
+      name: `${owner.slug}/${slug}`,
+      userId:
+        grantees.length > 0
+          ? { in: [pool.ownerUserId, ...grantees.map((share) => share.granteeUserId)] }
+          : pool.ownerUserId,
+    },
+    select: { id: true },
+  });
+  if (shadowed)
+    throw refuse(
+      "alias_shadowed",
+      "A model-name alias already uses this callable ID; pick another slug.",
+      "BAD_REQUEST",
+    );
+}
+
 function rethrowSlugTaken(error: unknown): never {
   if (isUniqueViolation(error))
     throw refuse("slug_taken", "You already have a pool with this slug.");
@@ -594,6 +633,7 @@ export const poolsRouter = {
       poolId = await graphWrite(
         [userId],
         async (tx) => {
+          await refuseShadowedAlias(tx, { ownerUserId: userId, poolId: null }, input.slug);
           const pool = await tx.pool.create({
             data: {
               userId,
@@ -633,9 +673,10 @@ export const poolsRouter = {
     const actor = callerActor(context.auth, userId);
     const pool = await prisma.pool.findFirst({
       where: { id: input.poolId, userId },
-      select: { id: true, userId: true, modelType: true },
+      select: { id: true, userId: true, modelType: true, slug: true },
     });
     if (!pool) throw notFound("That pool does not exist.");
+    const newSlug = input.slug !== undefined && input.slug !== pool.slug ? input.slug : null;
     const { rules, ...advancedPatch } = input.advanced ?? {};
     // Removing a contributed member writes the contributor's graph too (owner fence).
     const removed = input.members?.remove?.length
@@ -652,6 +693,8 @@ export const poolsRouter = {
       await graphWrite(
         owners,
         async (tx) => {
+          if (newSlug)
+            await refuseShadowedAlias(tx, { ownerUserId: userId, poolId: pool.id }, newSlug);
           const fields = {
             ...(input.name !== undefined ? { name: input.name } : {}),
             ...(input.slug !== undefined ? { slug: input.slug } : {}),

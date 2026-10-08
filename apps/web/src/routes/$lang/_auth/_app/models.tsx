@@ -19,6 +19,7 @@ import { PageHeading } from "@/components/page-stub";
 import { SegmentedControl } from "@/components/segmented-control";
 import { type PillTone, StatusPill } from "@/components/status-pill";
 import { WideContent } from "@/components/wide-content";
+import { callSnippet, type SnippetKind } from "@/lib/call-snippets";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/models")({
@@ -31,48 +32,14 @@ const STATUS_TONE: Record<"serving" | "starting" | "unavailable", PillTone> = {
   unavailable: "muted",
 };
 
-const TYPE_ENDPOINT: Record<ModelType, string> = {
-  LLM: "chat/completions",
-  EMBEDDINGS: "embeddings",
-  TRANSCRIPTION: "audio/transcriptions",
-};
-
 type ModelType = "LLM" | "EMBEDDINGS" | "TRANSCRIPTION";
-type SnippetStyle = "curl" | "openai" | "anthropic";
-const SNIPPET_STYLES: readonly SnippetStyle[] = ["curl", "openai", "anthropic"];
+const SNIPPET_STYLES: readonly SnippetKind[] = ["curl", "openai", "anthropic"];
 
-function curlSnippet(baseUrl: string, callableId: string, type: ModelType) {
-  const endpoint = `${baseUrl}/${TYPE_ENDPOINT[type]}`;
-  if (type === "TRANSCRIPTION")
-    return `curl ${endpoint} \\\n  -H "Authorization: Bearer $WSMP_API_KEY" \\\n  -F model=${callableId} \\\n  -F file=@audio.wav`;
-  const body =
-    type === "EMBEDDINGS"
-      ? `{"model":"${callableId}","input":"hello"}`
-      : `{"model":"${callableId}","messages":[{"role":"user","content":"hello"}]}`;
-  return `curl ${endpoint} \\\n  -H "Authorization: Bearer $WSMP_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '${body}'`;
-}
-
-function openAiSnippet(baseUrl: string, callableId: string, type: ModelType) {
-  const call =
-    type === "EMBEDDINGS"
-      ? `result = client.embeddings.create(model="${callableId}", input="hello")\nprint(len(result.data[0].embedding))`
-      : type === "TRANSCRIPTION"
-        ? `with open("audio.wav", "rb") as audio:\n    result = client.audio.transcriptions.create(model="${callableId}", file=audio)\nprint(result.text)`
-        : `result = client.chat.completions.create(\n    model="${callableId}",\n    messages=[{"role": "user", "content": "hello"}],\n)\nprint(result.choices[0].message.content)`;
-  return `import os\nfrom openai import OpenAI\n\nclient = OpenAI(base_url="${baseUrl}", api_key=os.environ["WSMP_API_KEY"])\n${call}`;
-}
-
-/** The Anthropic SDK adds `/v1/messages` itself; chat models only. */
-function anthropicSnippet(baseUrl: string, callableId: string, type: ModelType) {
-  if (type !== "LLM") return null;
-  const root = baseUrl.replace(/\/v1\/?$/, "");
-  return `import os\nfrom anthropic import Anthropic\n\nclient = Anthropic(base_url="${root}", api_key=os.environ["WSMP_API_KEY"])\nmessage = client.messages.create(\n    model="${callableId}",\n    max_tokens=256,\n    messages=[{"role": "user", "content": "hello"}],\n)\nprint(message.content[0].text)`;
-}
-
-function snippetFor(style: SnippetStyle, baseUrl: string, callableId: string, type: ModelType) {
-  if (style === "openai") return openAiSnippet(baseUrl, callableId, type);
-  if (style === "anthropic") return anthropicSnippet(baseUrl, callableId, type);
-  return curlSnippet(baseUrl, callableId, type);
+/** The Anthropic Messages API serves chat only; other types show a note. */
+function snippetFor(style: SnippetKind, baseUrl: string, callableId: string, type: ModelType) {
+  return style === "anthropic" && type !== "LLM"
+    ? null
+    : callSnippet(style, baseUrl, callableId, type);
 }
 
 /** One snippet in a sideways-scrolling block with its copy button. */
@@ -103,7 +70,7 @@ function ModelsPage() {
   const { t } = useTranslation(["dashboard", "common"]);
   const { lang } = Route.useParams();
   const models = useQuery(orpc.models.list.queryOptions());
-  const [style, setStyle] = useState<SnippetStyle>("curl");
+  const [style, setStyle] = useState<SnippetKind>("curl");
   const first = models.data?.models[0];
 
   return (

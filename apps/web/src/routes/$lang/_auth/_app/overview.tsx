@@ -22,6 +22,7 @@ import { Sparkline } from "@/components/sparkline";
 import { StatusPill } from "@/components/status-pill";
 import { TimeAgo } from "@/components/time-ago";
 import { useOfferWelcome } from "@/hooks/use-welcome-offer";
+import { formatMs, formatShare } from "@/lib/format-metrics";
 import { WELCOME_STEPS, type WelcomeStep } from "@/lib/welcome-steps";
 import { orpc } from "@/utils/orpc";
 
@@ -285,28 +286,6 @@ function NeedsYouRow({ item }: { item: NeedsYou["items"][number] }) {
 }
 
 // ── KPIs ──
-
-function formatMs(value: number | null, lang: string, none: string): string {
-  if (value === null) return none;
-  return value < 1000
-    ? new Intl.NumberFormat(lang, {
-        style: "unit",
-        unit: "millisecond",
-        unitDisplay: "short",
-        maximumFractionDigits: 0,
-      }).format(value)
-    : new Intl.NumberFormat(lang, {
-        style: "unit",
-        unit: "second",
-        unitDisplay: "short",
-        maximumFractionDigits: 1,
-      }).format(value / 1000);
-}
-
-function formatShare(value: number | null, lang: string, none: string): string {
-  if (value === null) return none;
-  return new Intl.NumberFormat(lang, { style: "percent", maximumFractionDigits: 1 }).format(value);
-}
 
 function KpiGrid({ kpis, lang, range }: { kpis: Summary["kpis"]; lang: string; range: Range }) {
   const { t } = useTranslation(["dashboard"]);

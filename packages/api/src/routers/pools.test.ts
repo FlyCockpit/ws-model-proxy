@@ -200,6 +200,26 @@ describe("pools.create", () => {
     ).toBe("model_type_mismatch");
   });
 
+  it("refuses a slug whose callable ID is one of the owner's aliases", async () => {
+    db.user.findUnique.mockResolvedValue({ slug: "ann" } as never);
+    db.modelAlias.findFirst.mockResolvedValue({ id: "alias-1" } as never);
+    expect(await reasonOf(client().create({ slug: "chat", name: "C", type: "LLM" }))).toBe(
+      "alias_shadowed",
+    );
+    expect(db.modelAlias.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      name: "ann/chat",
+      userId: OWNER,
+    });
+    expect(db.pool.create).not.toHaveBeenCalled();
+
+    db.modelAlias.findFirst.mockResolvedValue(null);
+    db.pool.create.mockResolvedValue({ id: "pool-1", userId: OWNER, modelType: "LLM" } as never);
+    db.pool.findFirst.mockResolvedValue(poolRow() as never);
+    const view = await client().create({ slug: "chat", name: "C", type: "LLM" });
+    expect(view.callableIds).toEqual(["ann/chat"]);
+    expect(db.pool.create).toHaveBeenCalledTimes(1);
+  });
+
   it("answers slug_taken", async () => {
     db.$transaction.mockRejectedValue(Object.assign(new Error("dup"), { code: "P2002" }));
     expect(await reasonOf(client().create({ slug: "chat", name: "C", type: "LLM" }))).toBe(
@@ -282,6 +302,54 @@ describe("pools.update (agent-editable)", () => {
     db.pool.findFirst.mockResolvedValue(poolRow() as never);
     await client().update({ poolId: "pool-1", routing: { priorityClass: "HIGH" } });
     expect(db.poolRouting.upsert).toHaveBeenCalledTimes(1);
+  });
+
+  it("changes the slug unless an alias of the owner or a can-use holder has that callable ID", async () => {
+    db.pool.findFirst.mockResolvedValueOnce({
+      id: "pool-1",
+      userId: OWNER,
+      modelType: "LLM",
+      slug: "chat",
+    } as never);
+    db.user.findUnique.mockResolvedValue({ slug: "ann" } as never);
+    db.share.findMany.mockResolvedValue([{ granteeUserId: "bob" }] as never);
+    db.modelAlias.findFirst.mockResolvedValue({ id: "alias-1" } as never);
+    expect(await reasonOf(client().update({ poolId: "pool-1", slug: "talk" }))).toBe(
+      "alias_shadowed",
+    );
+    expect(db.modelAlias.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      name: "ann/talk",
+      userId: { in: [OWNER, "bob"] },
+    });
+    expect(db.share.findMany.mock.calls[0]?.[0]?.where).toEqual({
+      poolId: "pool-1",
+      canUse: true,
+    });
+    expect(db.pool.update).not.toHaveBeenCalled();
+
+    db.modelAlias.findFirst.mockResolvedValue(null);
+    db.pool.findFirst.mockResolvedValueOnce({
+      id: "pool-1",
+      userId: OWNER,
+      modelType: "LLM",
+      slug: "chat",
+    } as never);
+    db.pool.findFirst.mockResolvedValue(poolRow({ slug: "talk" }) as never);
+    const view = await client().update({ poolId: "pool-1", slug: "talk" });
+    expect(db.pool.update.mock.calls[0]?.[0]?.data).toEqual({ slug: "talk" });
+    expect(view.callableIds).toEqual(["ann/talk"]);
+  });
+
+  it("re-sending the current slug skips the alias check", async () => {
+    db.pool.findFirst.mockResolvedValueOnce({
+      id: "pool-1",
+      userId: OWNER,
+      modelType: "LLM",
+      slug: "chat",
+    } as never);
+    db.pool.findFirst.mockResolvedValue(poolRow() as never);
+    await client().update({ poolId: "pool-1", slug: "chat", name: "Chat 2" });
+    expect(db.modelAlias.findFirst).not.toHaveBeenCalled();
   });
 
   it("an agent cannot reach another person's pool", async () => {

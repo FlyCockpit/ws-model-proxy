@@ -161,6 +161,12 @@ vi.mock("@/utils/orpc", () => {
           slug: input.slug,
           callableIds: [`alex/${String(input.slug)}`],
         })),
+        // The New pool dialog's optional cloud step (not under test here).
+        update: mutation("pools.update", () => ({})),
+        cloud: { setMode: mutation("pools.cloud.setMode", () => ({})) },
+      },
+      providers: {
+        models: { list: query(["providers", "models", "list"], () => ({ models: [] })) },
       },
       models: { key: () => ["models"] },
       access: {

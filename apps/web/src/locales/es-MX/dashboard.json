@@ -774,7 +774,6 @@
     "sharedWithMe": "Compartidos contigo",
     "canUse": "Puede usar",
     "canContribute": "Puede contribuir",
-    "callAs": "Llámalo como",
     "callAsHint": "Usa esto como nombre de modelo con una clave de API.",
     "members": "Miembros",
     "membersHint": "Modelos servidos a los que enruta este pool. Las solicitudes van a miembros con capacidad libre.",
@@ -812,8 +811,6 @@
       "slugHint": "Parte del ID invocable: dueño/identificador.",
       "slugInvalid": "Minúsculas, dígitos y guiones simples, empezando con una letra.",
       "type": "Tipo",
-      "firstMember": "Primer miembro (opcional)",
-      "noMember": "Sin miembro por ahora",
       "noServedModels": "Aún no hay modelos servidos de este tipo. Crea un runtime primero."
     },
     "routing": {
@@ -851,7 +848,14 @@
       "noMembers": "Sin miembros de nube.",
       "add": "Agregar un modelo de proveedor activo",
       "pickModel": "Elige un modelo de proveedor",
-      "noCandidates": "No hay modelos de proveedor activos de este tipo. Activa uno en Proveedores."
+      "noCandidates": "No hay modelos de proveedor activos de este tipo. Activa uno en Proveedores.",
+      "moveUp": "Subir {{member}}",
+      "moveDown": "Bajar {{member}}",
+      "externalNote": "Las solicitudes a {{id}} van a la nube cuando se agota la espera máxima del pool.",
+      "maxWait": "Espera máxima: {{value}} ({{source}}).",
+      "setOnAdvanced": "Configúrala en Avanzado",
+      "notEnabled": "Modelo de proveedor apagado: quítalo primero",
+      "externalNoteOff": "Con la nube encendida, las solicitudes a {{id}} van a la nube cuando se agota la espera máxima del pool."
     },
     "advanced": {
       "intro": "Estos ajustes son automáticos salvo que se sobrescriban. Los agentes pueden ajustarlos; cada cambio queda en el historial del pool.",
@@ -947,7 +951,23 @@
         "AUDIO": "Un pool de transcripción convierte el audio en texto.",
         "VIDEO": "Un pool LLM describe cada video."
       },
-      "unavailable": "{{id}} (ya no disponible)"
+      "unavailable": "{{id}} (ya no disponible)",
+      "pipeline": "Flujo",
+      "as": {
+        "IMAGE": "describe",
+        "AUDIO": "transcribe",
+        "VIDEO": "describe"
+      },
+      "direct": "se envía tal cual",
+      "timeout": "Tiempo límite (segundos)",
+      "maxAssets": {
+        "IMAGE": "Máximo de imágenes por solicitud",
+        "AUDIO": "Máximo de audios por solicitud",
+        "VIDEO": "Máximo de videos por solicitud"
+      },
+      "automatic": "Automático",
+      "limitsHint": "Deja un límite vacío para mantenerlo automático.",
+      "rangeInvalid": "Un número entero de {{min}} a {{max}}, o vacío."
     },
     "aliases": {
       "title": "Alias de nombres de modelo",
@@ -994,6 +1014,130 @@
       "yourGrantTitle": "Tu acceso a este pool",
       "yourGrantHint": "Solo el dueño puede cambiar este compartido. Puedes salir de él en Acceso → Compartidos.",
       "unknownPerson": "Alguien que ya no está"
+    },
+    "danger": {
+      "title": "Zona de peligro",
+      "slug": "Cambiar el identificador",
+      "slugHint": "Hoy se llama como {{id}}.",
+      "slugButton": "Cambiar identificador",
+      "slugTitle": "¿Cambiar el identificador del pool?",
+      "slugWarning": "El ID invocable {{id}} deja de funcionar de inmediato. Todo cliente, ejemplo de clave de API y enlace auxiliar que lo use fallará hasta que use el nuevo ID.",
+      "newSlug": "Nuevo identificador",
+      "newId": "Nuevo ID invocable: {{id}}",
+      "slugConfirm": "Escribe de nuevo el identificador para confirmar",
+      "slugSame": "Ese es el identificador actual.",
+      "slugConfirmMismatch": "Los dos identificadores no coinciden.",
+      "slugChanged": "Identificador cambiado. Actualiza tus clientes.",
+      "slugAliased": "Un alias de nombre de modelo ya usa ese ID invocable. Elige otro identificador o elimina el alias."
+    },
+    "details": {
+      "edit": "Editar",
+      "title": "Nombre y descripción",
+      "description": "Descripción",
+      "descriptionTooLong": "La descripción debe tener menos de 2,000 caracteres."
+    },
+    "stats": {
+      "title": "Últimas 24 horas (sin pruebas)",
+      "loadFailed": "No se pudo cargar el tráfico de este pool."
+    },
+    "call": {
+      "title": "Llamar a este pool",
+      "kind": "Ejemplo",
+      "kinds": {
+        "curl": "curl",
+        "openai": "SDK de OpenAI",
+        "anthropic": "SDK de Anthropic"
+      }
+    },
+    "live": {
+      "p95": "p95 {{value}}",
+      "waiting_one": "{{count}} en espera",
+      "waiting_other": "{{count}} en espera"
+    },
+    "weight": {
+      "label": "Peso",
+      "aria": "Peso de {{member}}",
+      "save": "Fijar",
+      "invalid": "Un número entero de 1 a 1000."
+    },
+    "contract": {
+      "title": "Contrato de embeddings",
+      "hint": "Los miembros de nube atienden los embeddings de este pool solo si producen los mismos vectores: mismo modelo, revisión, dimensiones, normalización y espacio vectorial.",
+      "required": "Completa este campo.",
+      "dimensionsInvalid": "Un número entero de 1 a 1,000,000.",
+      "fields": {
+        "model": "Modelo",
+        "revision": "Revisión",
+        "dimensions": "Dimensiones",
+        "normalization": "Normalización",
+        "vectorSpace": "Espacio vectorial"
+      },
+      "normalizations": {
+        "none": "Ninguna",
+        "l2": "L2"
+      },
+      "clear": "Quitar contrato"
+    },
+    "ownKey": {
+      "title": "Consentimiento de clave propia",
+      "hint": "Permite que quienes comparten contigo paguen las solicitudes :external con su propia clave de OpenRouter, solo para este modelo.",
+      "current": "Modelo con consentimiento:",
+      "none": "Sin consentimiento: quienes tienen acceso usan tus miembros de nube.",
+      "model": "Modelo de OpenRouter",
+      "save": "Dar consentimiento",
+      "withdraw": "Retirar",
+      "clears": "Cambiar o retirar el modelo borra la elección de clave propia de cada persona con acceso.",
+      "required": "Escribe un ID de modelo de OpenRouter (256 caracteres como máximo).",
+      "tooLong": "Usa 256 caracteres como máximo."
+    },
+    "history": {
+      "title": "Historial",
+      "hint": "Cada cambio a este pool, de personas y agentes.",
+      "loadFailed": "No se pudo cargar el historial.",
+      "empty": "Aún no hay cambios.",
+      "more": "Mostrar más",
+      "actor": {
+        "USER": "Persona",
+        "AGENT": "Agente",
+        "SYSTEM": "Sistema"
+      },
+      "actions": {
+        "pool_create": "Pool creado",
+        "pool_update": "Configuración cambiada",
+        "pool_delete": "Pool eliminado",
+        "pool_fallback_mode": "Modo de nube cambiado",
+        "pool_fallback_paid_warm_protection": "Protección pagada de caché caliente cambiada",
+        "pool_fallback_own_key_equivalent": "Consentimiento de clave propia cambiado",
+        "pool_routing_own_hardware_only": "Solo mi hardware cambiado",
+        "pool_member_contribute": "Miembro contribuido",
+        "pool_member_withdraw": "Miembro contribuido quitado",
+        "pool_rule_delete": "Regla de enrutamiento eliminada",
+        "pool_update_slug": "Identificador cambiado"
+      }
+    },
+    "flow": {
+      "label": "A dónde van las solicitudes",
+      "local_one": "{{count}} local",
+      "local_other": "{{count}} locales",
+      "contributed_one": "{{count}} contribuido",
+      "contributed_other": "{{count}} contribuidos",
+      "cloud_one": "{{count}} en la nube",
+      "cloud_other": "{{count}} en la nube",
+      "cloudOff_one": "Nube apagada",
+      "cloudOff_other": "Nube apagada"
+    },
+    "newSheet": {
+      "servedModel": "Modelo servido",
+      "servedModelHint": "Elige uno de tus modelos servidos; el tipo, el nombre y el identificador salen de él.",
+      "startEmpty": "Empezar vacío (elige un tipo)",
+      "cloud": "A dónde van las solicitudes",
+      "localOnly": "Solo local",
+      "withCloud": "Local y luego nube",
+      "localOnlyHint": "Solo tu hardware (y los miembros contribuidos) atiende este pool. Puedes agregar la nube después.",
+      "withCloudHint": "Las llamadas a dueño/pool:external van a la nube cuando se agota la espera máxima del pool.",
+      "firstCloudMember": "Primer miembro de nube (opcional)",
+      "noCloudMember": "Ninguno por ahora",
+      "cloudFailed": "El pool se creó, pero no se guardó su configuración de nube."
     }
   },
   "runtime": {
