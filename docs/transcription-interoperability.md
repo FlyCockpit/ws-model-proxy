@@ -69,17 +69,15 @@ The opt-in harness starts a deterministic local mock ASR server, a prebuilt WMP
 server, and the prebuilt Rust `wsmp` relay, connects them over the production
 WebSocket protocol, and sends multipart audio through the public model API. It
 asserts model rewriting, scalar-field passthrough, byte preservation, and the
-unmodified upstream response. The harness creates its own user, node credential,
-API key, runtime and pool, derives the callable ID from `/v1/models`, and removes
-the user (with cascading test state) on exit.
+unmodified upstream response. The harness signs a person up, enrolls a real `wsmp` node
+with an enrollment code (`wsmp login`), defines the mock as an always-on runtime, creates
+pools and an API key through the API, waits for the callable ID in `/v1/models`, and
+removes the user (with cascading test state) on exit. A failover pool tries a failing
+member first and must replay the upload to the healthy one exactly once.
 
-> Both e2e harnesses (`scripts/e2e/transcription-relay.mjs` and
-> `realtime-transcription-relay.mjs`) still seed the 0.3 tables and are not yet ported to
-> the 0.4.0 schema; until they are, they fail at setup.
-
-Point it only at an isolated, schema-ready E2E Postgres database. The harness
-does not apply or reset schema and intentionally refuses to reuse normal server
-credentials:
+Point it only at an isolated, schema-ready E2E Postgres database (`pnpm db:push` against
+it first). The harness does not apply or reset schema, starts its own server with fresh
+secrets, and signs up its own person:
 
 ```sh
 WSMP_E2E_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/wsmp_e2e \
@@ -211,16 +209,17 @@ WSMP_E2E_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/wsmp_e2e \
 pnpm test:e2e:realtime-transcription
 ```
 
-It starts the prebuilt server, seeds a user, credentials and a running
-transcription runtime in a pool, and drives an OpenAI-shaped WebSocket client
-against a protocol-faithful fake node. That checks upgrade auth (header and
-subprotocol, refused URL keys), routing to the pool member, the open,
-audio coalescing and credits, results with duration usage, client close
-reaching the node, a busy refusal (1013), a node disconnect (1011), the
-request rows and rollups, and that no audio or transcript reaches logs or
-metadata. Running a real transcription runtime needs a node and an engine, so
-the Rust session and adapters are covered by `wsmp`'s own tests against fake
-vLLM and file engines instead. (Not yet ported to the 0.4.0 schema; see above.)
+It builds the server and `wsmp`, sets up a person, a real node, a mock speech-to-text
+server as an always-on runtime whose served model declares a `segmented` live profile
+(`maxSessions: 1`), a pool and an API key the same way as above, and drives an
+OpenAI-shaped WebSocket client. That checks upgrade auth (header and subprotocol, refused
+URL keys), a committed turn transcribed through `wsmp` (one WAV upload per turn) with
+duration usage, a busy refusal while the instance's one session is taken (1013), the Test
+page session behind the browser cookie (cross-site and signed-out refusals), the node
+going away mid-session (1011), the request rows and rollups, and that no audio or
+transcript reaches logs or metadata. The relay wire itself (audio frames, credits,
+sequence numbers) is covered by the server's stt tests and `wsmp`'s own tests against fake
+vLLM and file engines.
 
 ## Spool orphan cleanup
 
