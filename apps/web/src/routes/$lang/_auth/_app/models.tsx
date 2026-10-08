@@ -16,6 +16,7 @@ import { InlineRetry } from "@/components/inline-retry";
 import { PageHeading } from "@/components/page-stub";
 import { type PillTone, StatusPill } from "@/components/status-pill";
 import { WideContent } from "@/components/wide-content";
+import { curlSnippet } from "@/lib/call-snippets";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/models")({
@@ -27,23 +28,6 @@ const STATUS_TONE: Record<"serving" | "starting" | "unavailable", PillTone> = {
   starting: "busy",
   unavailable: "muted",
 };
-
-const TYPE_ENDPOINT: Record<"LLM" | "EMBEDDINGS" | "TRANSCRIPTION", string> = {
-  LLM: "chat/completions",
-  EMBEDDINGS: "embeddings",
-  TRANSCRIPTION: "audio/transcriptions",
-};
-
-function snippetFor(baseUrl: string, callableId: string, type: keyof typeof TYPE_ENDPOINT) {
-  const endpoint = `${baseUrl}/${TYPE_ENDPOINT[type]}`;
-  if (type === "TRANSCRIPTION")
-    return `curl ${endpoint} \\\n  -H "Authorization: Bearer $WSMP_API_KEY" \\\n  -F model=${callableId} \\\n  -F file=@audio.wav`;
-  const body =
-    type === "EMBEDDINGS"
-      ? `{"model":"${callableId}","input":"hello"}`
-      : `{"model":"${callableId}","messages":[{"role":"user","content":"hello"}]}`;
-  return `curl ${endpoint} \\\n  -H "Authorization: Bearer $WSMP_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '${body}'`;
-}
 
 function ModelsPage() {
   const { t } = useTranslation(["dashboard", "common"]);
@@ -125,11 +109,11 @@ function ModelsPage() {
                         <div className="flex min-w-0 items-start gap-1">
                           <WideContent className="flex-1 rounded-md bg-muted">
                             <pre className="p-3 font-mono text-xs">
-                              {snippetFor(models.data.baseUrl, model.callableId, model.type)}
+                              {curlSnippet(models.data.baseUrl, model.callableId, model.type)}
                             </pre>
                           </WideContent>
                           <CopyButton
-                            value={snippetFor(models.data.baseUrl, model.callableId, model.type)}
+                            value={curlSnippet(models.data.baseUrl, model.callableId, model.type)}
                             label={t("dashboard:models.copySnippet")}
                           />
                         </div>
