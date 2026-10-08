@@ -78,5 +78,108 @@
     "empty": "Todavía no hay comandos.",
     "loadFailed": "No se pudo cargar el registro de comandos.",
     "loadMore": "Cargar más"
+  },
+  "metrics": {
+    "requestLog": "Registro de solicitudes",
+    "scope": "Alcance",
+    "scopeValue": {
+      "pool": "Pool",
+      "runtime": "Runtime",
+      "version": "Versión",
+      "node": "Nodo",
+      "instance": "Instancia"
+    },
+    "runtimeOf": "Runtime",
+    "noTargets": {
+      "pool": "Aún no hay pools.",
+      "runtime": "Aún no hay runtimes.",
+      "version": "Aún no hay runtimes.",
+      "node": "Aún no hay nodos.",
+      "instance": "Este runtime no tiene instancias ahora."
+    },
+    "targetsFailed": "No se pudieron cargar las opciones.",
+    "metric": "Métrica",
+    "family": {
+      "request": "Solicitudes",
+      "load": "Carga del motor",
+      "node": "Nodo",
+      "custom": "Personalizada"
+    },
+    "metricValue": {
+      "requests": "Solicitudes",
+      "errors": "Errores",
+      "rejections": "Rechazos",
+      "rejections_capacity": "Rechazos: capacidad",
+      "rejections_context": "Rechazos: contexto demasiado grande",
+      "rejections_spend": "Rechazos: límite de gasto",
+      "rejections_other": "Rechazos: otros",
+      "ttft_p50": "Primer token p50",
+      "ttft_p95": "Primer token p95",
+      "latency_p50": "Latencia p50",
+      "latency_p95": "Latencia p95",
+      "queue_wait_p50": "Espera en cola p50",
+      "queue_wait_p95": "Espera en cola p95",
+      "decode_tps": "Velocidad de decodificación",
+      "prefill_tps": "Velocidad de prellenado",
+      "input_tokens": "Tokens de entrada",
+      "output_tokens": "Tokens de salida",
+      "cache_hit_rate": "Aciertos de caché de prompt",
+      "cloud_share": "Proporción en la nube",
+      "kv_usage_avg": "Uso de caché KV (prom.)",
+      "kv_usage_max": "Uso de caché KV (máx.)",
+      "running_max": "Solicitudes en ejecución (máx.)",
+      "waiting_max": "Solicitudes en espera (máx.)",
+      "full_ratio": "Tiempo a capacidad",
+      "cpu_pct": "Uso de CPU",
+      "memory_available_gb": "Memoria disponible",
+      "accelerator_free_gb": "Memoria libre del acelerador",
+      "gpu_util_pct": "Uso de GPU",
+      "gpu_temp_c": "Temperatura de GPU"
+    },
+    "groupBy": "Dividir por",
+    "groupByNone": "Nada",
+    "groupByValue": {
+      "runtime": "Runtime",
+      "version": "Versión",
+      "node": "Nodo",
+      "instance": "Instancia",
+      "model": "Modelo",
+      "member": "Miembro del pool",
+      "source": "Origen"
+    },
+    "range": "Rango",
+    "rangeValue": {
+      "1h": "1 hora",
+      "24h": "24 horas",
+      "7d": "7 días",
+      "30d": "30 días"
+    },
+    "step": "Paso",
+    "stepValue": {
+      "1m": "1 min",
+      "5m": "5 min",
+      "1h": "1 hora",
+      "1d": "1 día"
+    },
+    "compareVersions": "Comparar versiones",
+    "includeTests": "Incluir pruebas",
+    "sharedPool": "Un pool compartido contigo: métricas de tus propias solicitudes, sin dividir o por origen.",
+    "loadFailed": "No se pudieron cargar las métricas.",
+    "totals": "Totales",
+    "testsLeftOut_one": "{{count}} solicitud de prueba excluida. Activa “Incluir pruebas” para contarla.",
+    "testsLeftOut_other": "{{count}} solicitudes de prueba excluidas. Activa “Incluir pruebas” para contarlas.",
+    "view": "Vista",
+    "viewValue": {
+      "chart": "Gráfica",
+      "table": "Tabla"
+    },
+    "truncated": "Solo se muestran los grupos más grandes.",
+    "empty": "No hay datos para este alcance y rango.",
+    "emptyHint": "Las métricas aparecen cuando se ejecutan solicitudes. El registro de solicitudes muestra cada una.",
+    "noGroup": "(ninguno)",
+    "chartLabel_one": "{{metric}} en el tiempo, {{count}} línea. La vista de tabla muestra los valores.",
+    "chartLabel_other": "{{metric}} en el tiempo, {{count}} líneas. La vista de tabla muestra los valores.",
+    "time": "Hora",
+    "tokensPerSecond": "{{value}} tok/s"
   }
 }
