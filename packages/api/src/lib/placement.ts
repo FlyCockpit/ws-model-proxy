@@ -698,7 +698,11 @@ export class PlacementPlanner {
           detail:
             "An instance that is already stopping holds room on this node; this start waits until the node releases it.",
         });
-      if (!freed && live !== null && rank.needs.memoryGb > live + EPSILON)
+      // VRAM on a unified GPU is system memory too.
+      const sharedGb =
+        rank.node.gpus.filter((gpu) => gpu.unified && rank.gpuKeys.includes(gpu.key)).length *
+        rank.needs.vramGb;
+      if (!freed && live !== null && rank.needs.memoryGb + sharedGb > live + EPSILON)
         warnings.push({
           code: "low_free_memory",
           nodeId: rank.node.id,

@@ -85,7 +85,7 @@ export const effectiveHardwareSchema = z
         })
         .strict(),
     ),
-    /** Usable = effective total − reserved (− 2 GiB headroom on unified). */
+    /** Usable = effective total − reserved − VRAM reserved on unified GPUs (− 2 GiB headroom on unified). */
     usableMemoryGb: z.number(),
     /** What instances on this node reserve now (HELD + HELD_UNKNOWN). */
     reservedNowMemoryGb: z.number(),

@@ -43,6 +43,23 @@ describe("effectiveHardware: unified GPUs", () => {
     expect(hardware.usableMemoryGb).toBe(117.49);
   });
 
+  it("counts VRAM held on a unified GPU in what runtimes reserve now", () => {
+    const hardware = effectiveHardware({
+      declaredResources: null,
+      nodeInfo: GB10_INFO,
+      nodeMetrics: null,
+      nodeMetricsAt: null,
+      heldClaims: [
+        { kind: "discrete", gpuCount: 1, vramGb: 40, ramGb: 4, gpus: ["nvidia:0"] },
+        // Written before claims recorded their GPUs: every GPU here is unified.
+        { kind: "discrete", gpuCount: 1, vramGb: 10 },
+        { kind: "unified", memoryGb: 20 },
+      ],
+      now: NOW,
+    });
+    expect(hardware.reservedNowMemoryGb).toBe(74);
+  });
+
   it("treats a GPU without VRAM of its own on a unified node as shared, even without apu", () => {
     const hardware = hardwareOf({
       ...GB10_INFO,

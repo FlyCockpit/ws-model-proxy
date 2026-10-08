@@ -1351,6 +1351,61 @@ describe("unified GPUs (GB10, APUs)", () => {
     );
   });
 
+  it("warns about low free memory counting VRAM on a unified GPU", () => {
+    const planner = new PlacementPlanner(
+      context({
+        nodes: [node("s1", { memoryGb: 126, gpus: [SPARK_GPU], liveFreeMemoryGb: 50 })],
+        fabrics: [],
+      }),
+    );
+    const result = ok(planner.place(request({ resources: discrete(60) })));
+    expect(result.warnings.map((warning) => warning.code)).toEqual(["low_free_memory"]);
+  });
+
+  it("frees a unified GPU's VRAM back to node memory when preempting", () => {
+    const held: PlacementInstance = {
+      ...running("old", ["s1"], 0),
+      ranks: [
+        {
+          nodeId: "s1",
+          port: 30000,
+          distPort: null,
+          claim: "HELD",
+          resources: { kind: "discrete", gpuCount: 1, vramGb: 100, gpus: ["nvidia:0"] },
+        },
+      ],
+    };
+    const planner = new PlacementPlanner(
+      context({
+        nodes: [node("s1", { memoryGb: 126, gpus: [SPARK_GPU] })],
+        fabrics: [],
+        instances: [held],
+      }),
+    );
+    const big = request({ resources: [{ kind: "unified", memoryGb: 120 }] });
+    expect(planner.place(big).ok).toBe(false);
+    const result = ok(planner.place({ ...big, preempt: true }));
+    expect(result.stops.map((stop) => stop.instanceId)).toEqual(["old"]);
+    expect(nodesOf(result)).toEqual(["s1"]);
+  });
+
+  it("takes VRAM reserved on a unified GPU from node memory", () => {
+    const placement = placementNodeOf(
+      nodeRow({
+        declaredResources: { reservedVramGb: { "nvidia:0": 6 } },
+        nodeInfo: {
+          nodeKind: "unified",
+          memoryTotalMiB: 131072,
+          unifiedMemoryMiB: 131072,
+          gpus: [{ vendor: "nvidia", index: 0, vramTotalMiB: null, apu: true }],
+        },
+      }),
+      new Date(),
+    );
+    // 128 GiB − 6 reserved on the GPU − 2 headroom.
+    expect(placement.memoryGb).toBe(120);
+  });
+
   it("counts existing claims on a unified GPU against node memory", () => {
     const held: PlacementInstance = {
       ...running("old", ["s1"], 0),

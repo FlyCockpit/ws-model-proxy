@@ -108,15 +108,34 @@ function pick<T>(
   return { value: null, source: null };
 }
 
-/** A claim's node memory (GiB) by its `resources` JSON (`runtimeResourceSchema`). */
-export function claimMemoryGb(resources: unknown): number {
+/**
+ * A claim's node memory (GiB) by its `resources` JSON (`runtimeResourceSchema`). VRAM a discrete
+ * claim takes on a unified GPU (`unifiedGpuKeys`; the claim's recorded `gpus`, else any when
+ * every GPU of the node is unified) is node memory too.
+ */
+export function claimMemoryGb(
+  resources: unknown,
+  unifiedGpuKeys: ReadonlySet<string>,
+  allUnified: boolean,
+): number {
   if (!resources || typeof resources !== "object") return 0;
   const kind = Reflect.get(resources, "kind");
   const memoryGb = Reflect.get(resources, "memoryGb");
   const ramGb = Reflect.get(resources, "ramGb");
   if (kind === "unified" && typeof memoryGb === "number") return memoryGb;
-  if ((kind === "cpu" || kind === "discrete") && typeof ramGb === "number") return ramGb;
-  return 0;
+  if (kind === "cpu" && typeof ramGb === "number") return ramGb;
+  if (kind !== "discrete") return 0;
+  const ram = typeof ramGb === "number" ? ramGb : 0;
+  const vramGb = Reflect.get(resources, "vramGb");
+  const gpuCount = Reflect.get(resources, "gpuCount");
+  if (typeof vramGb !== "number" || typeof gpuCount !== "number") return ram;
+  const recorded = Reflect.get(resources, "gpus");
+  const shared = Array.isArray(recorded)
+    ? recorded.filter((key) => typeof key === "string" && unifiedGpuKeys.has(key)).length
+    : allUnified
+      ? gpuCount
+      : 0;
+  return ram + shared * vramGb;
 }
 
 export type HardwareInput = {
@@ -217,12 +236,25 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
     addGpu({ ...gpu, vramGb }, "detected");
   }
 
+  const sortedGpus = [...gpus.values()].sort((a, b) => a.key.localeCompare(b.key));
+  const unifiedKeys = new Set(sortedGpus.filter((gpu) => gpu.unified).map((gpu) => gpu.key));
+  const allUnified = sortedGpus.length > 0 && unifiedKeys.size === sortedGpus.length;
   const headroom = kind.value === "unified" ? UNIFIED_HEADROOM_GB : 0;
+  // VRAM reserved on a unified GPU is system memory.
+  const reservedSharedGb = sortedGpus
+    .filter((gpu) => gpu.unified)
+    .reduce((sum, gpu) => sum + gpu.reservedVramGb, 0);
   const usableMemoryGb = round(
-    Math.max(0, (memoryGb.value ?? 0) - (reservedMemoryGb.value ?? 0) - headroom),
+    Math.max(
+      0,
+      (memoryGb.value ?? 0) - (reservedMemoryGb.value ?? 0) - reservedSharedGb - headroom,
+    ),
   );
   const reservedNowMemoryGb = round(
-    input.heldClaims.reduce<number>((sum, resources) => sum + claimMemoryGb(resources), 0),
+    input.heldClaims.reduce<number>(
+      (sum, resources) => sum + claimMemoryGb(resources, unifiedKeys, allUnified),
+      0,
+    ),
   );
   const live = liveMetrics(input.nodeMetrics, input.nodeMetricsAt, input.now);
 
@@ -231,7 +263,7 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
     memoryGb,
     acceleratorMemoryGb,
     reservedMemoryGb,
-    gpus: [...gpus.values()].sort((a, b) => a.key.localeCompare(b.key)),
+    gpus: sortedGpus,
     usableMemoryGb,
     reservedNowMemoryGb,
     liveFreeMemoryGb: live.freeMemoryGb,
