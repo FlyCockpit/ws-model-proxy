@@ -365,6 +365,65 @@ describe("profiles.save validation", () => {
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
   });
 
+  it("pins an older version of the caller's runtime and the item's own nodes", async () => {
+    db.node.findMany.mockResolvedValueOnce([{ id: "a" }, { id: "b" }] as never);
+    db.runtime.findMany.mockResolvedValueOnce([
+      { id: "rt-1", kind: "STARTABLE", currentVersionId: "v-2" },
+    ] as never);
+    db.runtimeVersion.findMany.mockResolvedValueOnce([{ id: "v-1", runtimeId: "rt-1" }] as never);
+    db.profile.create.mockResolvedValueOnce({ id: "p-new" } as never);
+    db.profile.findMany.mockResolvedValueOnce([]);
+    await client()
+      .save({
+        ...base,
+        nodeIds: ["a", "b"],
+        items: [{ runtimeId: "rt-1", versionId: "v-1", count: 1, nodeIds: ["b"] }],
+      })
+      .catch(() => undefined);
+    // Owner-fenced: only a version of one of the caller's runtimes counts.
+    expect(db.runtimeVersion.findMany.mock.calls[0]?.[0]?.where).toEqual({
+      id: { in: ["v-1"] },
+      Runtime: { userId: "owner-1" },
+    });
+    expect(db.profileItem.createMany.mock.calls[0]?.[0]?.data).toEqual([
+      {
+        profileId: "p-new",
+        position: 0,
+        runtimeId: "rt-1",
+        versionId: "v-1",
+        count: 1,
+        nodeIds: ["b"],
+      },
+    ]);
+  });
+
+  it("refuses a version that is not one of that runtime's (someone else's included)", async () => {
+    db.node.findMany.mockResolvedValueOnce([{ id: "a" }] as never);
+    db.runtime.findMany.mockResolvedValueOnce([
+      { id: "rt-1", kind: "STARTABLE", currentVersionId: "v-2" },
+    ] as never);
+    // The fenced lookup finds nothing for another owner's version.
+    db.runtimeVersion.findMany.mockResolvedValueOnce([]);
+    await expect(
+      client().save({
+        ...base,
+        items: [{ runtimeId: "rt-1", versionId: "v-foreign", count: 1 }],
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.profileItem.createMany).not.toHaveBeenCalled();
+  });
+
+  it("refuses an item node the profile does not own", async () => {
+    db.node.findMany.mockResolvedValueOnce([{ id: "a" }] as never);
+    db.runtime.findMany.mockResolvedValueOnce([
+      { id: "rt-1", kind: "STARTABLE", currentVersionId: "v-2" },
+    ] as never);
+    await expect(
+      client().save({ ...base, items: [{ runtimeId: "rt-1", count: 1, nodeIds: ["b"] }] }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.profileItem.createMany).not.toHaveBeenCalled();
+  });
+
   it("refuses an always-on runtime as an item", async () => {
     db.node.findMany.mockResolvedValueOnce([{ id: "a" }] as never);
     db.runtime.findMany.mockResolvedValueOnce([
