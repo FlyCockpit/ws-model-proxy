@@ -108,6 +108,44 @@ describe("nodes.secrets", () => {
     expect((removed?.data.features as typeof features | undefined)?.secrets).toEqual([]);
   });
 
+  it("logs (node id and reason, no values) when the stored features cannot be read", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const writeSecrets = vi.fn<NonNullable<NodeRelayServices["writeSecrets"]>>(async () => [
+      { name: "WSMP_SECRET_HF", status: "set", updatedAt: "2026-10-06T10:00:00.000Z" },
+    ]);
+    db.node.findFirst
+      .mockResolvedValueOnce(node() as never)
+      .mockResolvedValueOnce({ features: { secrets: "WSMP_SECRET_LEAK" } } as never);
+    const out = await client(FULL_AGENT, { writeSecrets }).secrets.set({
+      nodeId: "node-1",
+      name: "WSMP_SECRET_HF",
+      value: SECRET,
+    });
+    expect(out.name).toBe("WSMP_SECRET_HF");
+    expect(db.node.updateMany).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+    const line = String(warn.mock.calls[0]?.[0]);
+    expect(line).toMatch(/^\[nodes\.secrets\] secret name list not updated for node node-1: /);
+    expect(line).toContain("stored features unreadable");
+    expect(line).not.toContain(SECRET);
+    expect(line).not.toContain("WSMP_SECRET_LEAK");
+    expect(line).not.toContain("WSMP_SECRET_HF");
+
+    warn.mockClear();
+    db.node.findFirst
+      .mockResolvedValueOnce(node() as never)
+      .mockResolvedValueOnce({ features: null } as never);
+    await client(FULL_AGENT, { writeSecrets }).secrets.set({
+      nodeId: "node-1",
+      name: "WSMP_SECRET_HF",
+      value: SECRET,
+    });
+    expect(warn.mock.calls[0]?.[0]).toBe(
+      "[nodes.secrets] secret name list not updated for node node-1: no features reported yet",
+    );
+    warn.mockRestore();
+  });
+
   it("refuses a Relay-only node (secret_needs_node) without sending anything", async () => {
     const writeSecrets = vi.fn();
     db.node.findFirst.mockResolvedValueOnce(node({ trust: "RELAY" }) as never);
