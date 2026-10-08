@@ -557,6 +557,7 @@ export const MCP_EXCLUDED_SESSION_PROCEDURES: Readonly<Record<string, string>> =
   "nodes.fabrics.list": "nodes_get shows each node's fabrics and peers.",
   "runtimes.detected.add": "Agents use runtime_create with preset detected.",
   "models.list": "Callable IDs are part of pools_get.",
+  "models.testTargets": "The web Test page's picker; agents name targets in model_test.",
   "access.apiKeys.list": "API keys are managed by people.",
   "access.agentTokens.list": "Agent tokens are managed by people.",
   "access.oauthGrants.list": "Agent connections are managed by people.",

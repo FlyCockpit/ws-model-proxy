@@ -1,14 +1,16 @@
 import { ORPCError } from "@orpc/server";
+import { POOL_ADVANCED_OVERRIDES } from "@ws-model-proxy/config/pool-defaults";
 import prisma from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import type { ModelTestKind, ModelTestServiceTarget } from "../context";
 import { contractProcedure } from "../contract-procedure";
 import { type AnonymousAuth, agentRulesApply, type CallerAuth } from "../contracts/auth-context";
-import type { MODEL_TYPE } from "../contracts/common";
-import { modelsContract as c } from "../contracts/models";
+import type { MODEL_CAPABILITY, MODEL_TYPE } from "../contracts/common";
+import { modelsContract as c, type TEST_SURFACES } from "../contracts/models";
 import { cloudEgressEnabled } from "../lib/cloud-egress";
 import { callableIdsFor, MEMBER_INCLUDE, poolStatus } from "../lib/pool-views";
 import { notFound, refuse } from "../lib/refuse";
+import { transcriptionProfileSchema } from "../lib/transcription-profile";
 
 const POOL_SELECT = {
   id: true,
@@ -21,6 +23,40 @@ const POOL_SELECT = {
   Members: { include: MEMBER_INCLUDE },
 } as const;
 
+/** POOL_SELECT plus what the Test page needs: advanced overrides and member capabilities. */
+const TEST_POOL_SELECT = {
+  ...POOL_SELECT,
+  Advanced: { select: { overrides: true } },
+  Members: {
+    include: {
+      ...MEMBER_INCLUDE,
+      RuntimeModel: {
+        select: {
+          ...MEMBER_INCLUDE.RuntimeModel.select,
+          type: true,
+          detectedCapabilities: true,
+          capabilities: true,
+          capabilitiesOverridden: true,
+          transcriptionProfile: true,
+        },
+      },
+    },
+  },
+} as const;
+
+/** Own pools and pools shared with the caller with can use. */
+function usablePoolsWhere(userId: string) {
+  return { OR: [{ userId }, { Shares: { some: { granteeUserId: userId, canUse: true } } }] };
+}
+
+/** Own pools first, then shared ones. */
+function ownFirst<T extends { userId: string }>(pools: T[], userId: string): T[] {
+  return [
+    ...pools.filter((pool) => pool.userId === userId),
+    ...pools.filter((pool) => pool.userId !== userId),
+  ];
+}
+
 export const modelsRouter = {
   /**
    * Every callable ID the person may use: own pools and pools shared with them with can use.
@@ -29,18 +65,14 @@ export const modelsRouter = {
   list: contractProcedure(c.list).handler(async ({ context }) => {
     const userId = context.session.user.id;
     const cloudEnabled = cloudEgressEnabled();
-    const pools = await prisma.pool.findMany({
-      where: {
-        OR: [{ userId }, { Shares: { some: { granteeUserId: userId, canUse: true } } }],
-      },
-      select: POOL_SELECT,
-      orderBy: [{ createdAt: "asc" }],
-    });
-    // Own pools first, then shared ones.
-    const ordered = [
-      ...pools.filter((pool) => pool.userId === userId),
-      ...pools.filter((pool) => pool.userId !== userId),
-    ];
+    const ordered = ownFirst(
+      await prisma.pool.findMany({
+        where: usablePoolsWhere(userId),
+        select: POOL_SELECT,
+        orderBy: [{ createdAt: "asc" }],
+      }),
+      userId,
+    );
     return {
       baseUrl: `${env.BETTER_AUTH_URL.replace(/\/+$/, "")}/v1`,
       models: ordered.flatMap((pool) => {
@@ -68,6 +100,131 @@ export const modelsRouter = {
         });
       }),
     };
+  }),
+  /**
+   * The web Test page's targets: every callable ID (as `models.list`) and the caller's own
+   * runtimes' served models, with what each can do. Capabilities are hints for the page; the
+   * request path decides.
+   */
+  testTargets: contractProcedure(c.testTargets).handler(async ({ context }) => {
+    const userId = context.session.user.id;
+    const cloudEnabled = cloudEgressEnabled();
+    const [pools, runtimes] = await Promise.all([
+      prisma.pool
+        .findMany({
+          where: usablePoolsWhere(userId),
+          select: TEST_POOL_SELECT,
+          orderBy: [{ createdAt: "asc" }],
+        })
+        .then((rows) => ownFirst(rows, userId)),
+      prisma.runtime.findMany({
+        where: { userId },
+        select: {
+          id: true,
+          name: true,
+          Models: {
+            where: { retired: false },
+            select: {
+              upstreamModelId: true,
+              type: true,
+              detectedCapabilities: true,
+              capabilities: true,
+              capabilitiesOverridden: true,
+              transcriptionProfile: true,
+            },
+            orderBy: [{ upstreamModelId: "asc" }],
+          },
+          Instances: {
+            where: { OR: [{ desiredState: "RUNNING" }, { desiredState: null }] },
+            select: { phase: true },
+          },
+        },
+        orderBy: [{ createdAt: "asc" }],
+      }),
+    ]);
+    const poolTargets = pools.flatMap((pool) => {
+      const you = pool.userId === userId;
+      const local = poolStatus(pool.Members, pool.Routing?.ownHardwareOnly ?? false);
+      const hasCloud = pool.Members.some(
+        (member) => member.kind === "CLOUD" && member.state === "ACTIVE",
+      );
+      const localModels = pool.Members.flatMap((member) =>
+        member.kind === "LOCAL" &&
+        member.state === "ACTIVE" &&
+        member.RuntimeModel &&
+        !member.RuntimeModel.retired &&
+        !(pool.Routing?.ownHardwareOnly && member.shareId)
+          ? [member.RuntimeModel]
+          : [],
+      );
+      const capabilities = unionCapabilities(localModels.map(effectiveCapabilities));
+      const overrides = advancedOverrides(pool.Advanced?.overrides);
+      const adaptation =
+        typeof overrides.protocolAdaptation === "boolean"
+          ? overrides.protocolAdaptation
+          : POOL_ADVANCED_OVERRIDES.protocolAdaptation.auto.default;
+      const surfaces = testSurfaces(pool.modelType, capabilities, adaptation);
+      const live =
+        pool.modelType === "TRANSCRIPTION" &&
+        localModels.some((model) => declaresLiveTranscription(model.transcriptionProfile));
+      return callableIdsFor({
+        ownerSlug: pool.User.slug,
+        poolSlug: pool.slug,
+        mode: pool.Fallback?.mode ?? "OFF",
+        callerIsOwner: you,
+        cloudEnabled,
+      }).map((callableId) => {
+        const external = callableId.endsWith(":external");
+        return {
+          model: callableId,
+          source: "pool" as const,
+          label: callableId,
+          servedModel: null,
+          runtimeId: null,
+          type: pool.modelType,
+          status: external && hasCloud && local === "unavailable" ? ("serving" as const) : local,
+          external,
+          capabilities,
+          surfaces,
+          recommendedSurface: recommendedSurface(surfaces, overrides.recommendedSurface),
+          // Live sessions run on local members only.
+          liveTranscription: live && !external,
+          maxAttachmentBytes:
+            typeof overrides.maxAttachmentBytes === "number" ? overrides.maxAttachmentBytes : null,
+        };
+      });
+    });
+    const runtimeTargets = runtimes.flatMap((runtime) => {
+      const phases = runtime.Instances.map((instance) => instance.phase);
+      // As a pool member's status (pool-views memberStatus).
+      const status = phases.includes("READY")
+        ? ("serving" as const)
+        : phases.includes("STARTING")
+          ? ("starting" as const)
+          : ("unavailable" as const);
+      return runtime.Models.map((model) => {
+        const capabilities = effectiveCapabilities(model);
+        // A direct test is never adapted: it answers the APIs its engine serves.
+        const surfaces = testSurfaces(model.type, capabilities, false);
+        return {
+          model: `runtime:${runtime.id}:${model.upstreamModelId}`,
+          source: "runtime" as const,
+          label: runtime.name,
+          servedModel: model.upstreamModelId,
+          runtimeId: runtime.id,
+          type: model.type,
+          status,
+          external: false,
+          capabilities,
+          surfaces,
+          recommendedSurface: recommendedSurface(surfaces, undefined),
+          liveTranscription:
+            model.type === "TRANSCRIPTION" && declaresLiveTranscription(model.transcriptionProfile),
+          maxAttachmentBytes: null,
+        };
+      });
+    });
+    return { targets: [...poolTargets, ...runtimeTargets] };
   }),
   /**
    * Send a test (or a bench) to a callable ID or one of the caller's runtimes. This procedure
@@ -131,6 +288,60 @@ export const modelsRouter = {
     });
   }),
 };
+
+type Capability = (typeof MODEL_CAPABILITY)[number];
+type TestSurface = (typeof TEST_SURFACES)[number];
+
+function effectiveCapabilities(model: {
+  detectedCapabilities: Capability[];
+  capabilities: Capability[];
+  capabilitiesOverridden: boolean;
+}): Capability[] {
+  return model.capabilitiesOverridden ? model.capabilities : model.detectedCapabilities;
+}
+
+function unionCapabilities(lists: Capability[][]): Capability[] {
+  return [...new Set(lists.flat())].sort();
+}
+
+function advancedOverrides(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+/** Chat Completions always; Responses natively or adapted; Messages only adapted. */
+function testSurfaces(
+  type: (typeof MODEL_TYPE)[number],
+  capabilities: readonly Capability[],
+  adaptation: boolean,
+): TestSurface[] {
+  if (type !== "LLM") return [];
+  return [
+    "OPENAI_CHAT_COMPLETIONS",
+    ...(adaptation || capabilities.includes("RESPONSES_API")
+      ? (["OPENAI_RESPONSES"] as const)
+      : []),
+    ...(adaptation ? (["ANTHROPIC_MESSAGES"] as const) : []),
+  ];
+}
+
+const SURFACE_OVERRIDE: Record<string, TestSurface> = {
+  openai_chat_completions: "OPENAI_CHAT_COMPLETIONS",
+  openai_responses: "OPENAI_RESPONSES",
+  anthropic_messages: "ANTHROPIC_MESSAGES",
+};
+
+/** The pool's recommended surface when it can answer it, else the first one. */
+function recommendedSurface(surfaces: TestSurface[], override: unknown): TestSurface | null {
+  const preferred = typeof override === "string" ? SURFACE_OVERRIDE[override] : undefined;
+  return preferred && surfaces.includes(preferred) ? preferred : (surfaces[0] ?? null);
+}
+
+function declaresLiveTranscription(profile: unknown): boolean {
+  const parsed = transcriptionProfileSchema.safeParse(profile);
+  return parsed.success && parsed.data.realtime !== undefined;
+}
 
 const KIND_FOR_TYPE: Record<(typeof MODEL_TYPE)[number], ModelTestKind> = {
   LLM: "chat",
