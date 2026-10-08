@@ -397,7 +397,8 @@ pub struct NodeInfo {
     pub execution_mechanism: Option<ExecutionMechanism>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// The node-side declaration (`config.json` `hardware`), incl. reserved memory.
+    /// A node-side hardware declaration. The 0.4.0 node never sends one:
+    /// hardware is declared on the server (web app or MCP), not on the node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared: Option<DeclaredHardware>,
 }

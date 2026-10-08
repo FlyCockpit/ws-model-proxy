@@ -116,7 +116,8 @@ wsmp logout              # forget this node's credential
 `wsmp hardware` shows what placement falls back to when no hardware is declared: NVIDIA GPUs
 (a GB10 with no dedicated VRAM makes the node unified), AMD GPUs from sysfs (an APU such as Strix
 Halo reports VRAM carve-out plus GTT as its pool), and Apple silicon (the GPU wired limit). Check
-it before declaring overrides on the Nodes page.
+it before declaring overrides on the node's page in the web app (or through MCP); hardware is
+never declared on the node itself.
 
 The service is a systemd user unit on Linux and a launchd agent on macOS. It needs no
 environment file: the node credential and node secrets (`wsmp secret`) are files the relay reads

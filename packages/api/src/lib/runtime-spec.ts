@@ -758,7 +758,8 @@ export const portRangeSchema = z
   .tuple([z.number().int().min(1024).max(65_535), z.number().int().min(1024).max(65_535)])
   .refine(([start, end]) => start <= end, "The port range must not be reversed.");
 
-// ── Declared hardware (browser `Node.declaredResources`, node `config.json` `hardware`) ──
+// ── Declared hardware (browser/agent `Node.declaredResources`; `node.info.declared`, which the
+// 0.4.0 node never sends: hardware is declared in the web app or through MCP) ──
 
 const gpuKeySchema = z
   .string()
@@ -796,7 +797,7 @@ export const declaredHardwareSchema = z
   .strict();
 export type DeclaredHardware = z.infer<typeof declaredHardwareSchema>;
 
-/** The node-side declaration also carries labels (config.json `hardware.labels`). */
+/** The node-side declaration (`node.info.declared`, unused by the 0.4.0 node) also carries labels. */
 export const nodeDeclaredHardwareSchema = declaredHardwareSchema
   .extend({ labels: runtimeLabelsSchema.optional() })
   .strict();

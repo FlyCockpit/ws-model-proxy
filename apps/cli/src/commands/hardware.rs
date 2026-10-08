@@ -1,6 +1,7 @@
 //! `wsmp hardware`: what this node detects, so a person can check it before
-//! declaring overrides. Placement uses a declaration (Nodes page, or the
-//! node's own config) first and these detected values only as a fallback.
+//! declaring overrides. Hardware is declared on the server (the node's page
+//! in the web app, or MCP), never on the node; placement uses a declaration
+//! first and these detected values only as a fallback.
 
 use anyhow::Result;
 use serde::Serialize;
@@ -131,7 +132,7 @@ pub fn format_hardware(hardware: &Hardware) -> Vec<String> {
         );
     }
     lines.push(
-        "placement uses a declaration (Nodes page, or this node's config) before these values"
+        "placement uses a declaration (the node's page in the web app, or MCP) before these values"
             .into(),
     );
     lines
