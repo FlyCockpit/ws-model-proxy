@@ -119,7 +119,9 @@ export function draftToReader(draft: ReaderDraft, base: MetricsReader | undefine
       row.signal,
       compact({
         series: row.series,
-        labels: baseMap[row.signal]?.labels,
+        // Labels select samples of one series: kept only while the series stays the same.
+        labels:
+          baseMap[row.signal]?.series === row.series ? baseMap[row.signal]?.labels : undefined,
         aggregate: row.aggregate === "" ? undefined : row.aggregate,
         scale: num(row.scale),
         divideBy: row.divideBy.trim() === "" ? undefined : row.divideBy,

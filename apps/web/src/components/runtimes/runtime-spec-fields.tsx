@@ -439,7 +439,12 @@ function ModelsSection({
                 variant="outline"
                 size="touch"
                 onClick={() =>
-                  models.pushValue({ id: "", declareCapabilities: false, capabilities: [] })
+                  models.pushValue({
+                    id: "",
+                    declareCapabilities: false,
+                    capabilities: [],
+                    baseIndex: -1,
+                  })
                 }
               >
                 <Plus aria-hidden="true" />

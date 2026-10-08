@@ -8,7 +8,34 @@ export type DiffLine = { kind: "same" | "add" | "remove"; text: string };
 export type DiffHunkLine = DiffLine | { kind: "skip"; count: number };
 
 /** Lines are compared exactly; the result lists every line of both sides once. */
-export function diffLines(before: readonly string[], after: readonly string[]): DiffLine[] {
+export function diffLines(fullBefore: readonly string[], fullAfter: readonly string[]): DiffLine[] {
+  // Equal head and tail lines stay out of the table: an edit usually touches a few lines.
+  let head = 0;
+  while (
+    head < fullBefore.length &&
+    head < fullAfter.length &&
+    fullBefore[head] === fullAfter[head]
+  )
+    head++;
+  let tail = 0;
+  while (
+    tail < fullBefore.length - head &&
+    tail < fullAfter.length - head &&
+    fullBefore[fullBefore.length - 1 - tail] === fullAfter[fullAfter.length - 1 - tail]
+  )
+    tail++;
+  const same = (lines: readonly string[]) =>
+    lines.map((text): DiffLine => ({ kind: "same", text }));
+  const before = fullBefore.slice(head, fullBefore.length - tail);
+  const after = fullAfter.slice(head, fullAfter.length - tail);
+  return [
+    ...same(fullBefore.slice(0, head)),
+    ...diffMiddle(before, after),
+    ...same(fullBefore.slice(fullBefore.length - tail)),
+  ];
+}
+
+function diffMiddle(before: readonly string[], after: readonly string[]): DiffLine[] {
   const rows = before.length;
   const cols = after.length;
   // lengths[i][j]: LCS length of before[i..] and after[j..].

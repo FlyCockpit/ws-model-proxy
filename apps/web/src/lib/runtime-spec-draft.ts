@@ -45,12 +45,16 @@ export type ResourceDraft = {
 };
 export type CommandDraft = Record<CommandField, string> & {
   timeouts: Record<TimeoutField, string>;
+  /** The base spec's command entry this one came from (its interactive steps), or -1. */
+  baseIndex: number;
 };
 export type ModelDraft = {
   id: string;
   /** Off: the node detects the capabilities. */
   declareCapabilities: boolean;
   capabilities: ModelCapabilityWire[];
+  /** The base spec's model this one came from (its contract and profile), or -1. */
+  baseIndex: number;
 };
 export type SpecDraft = {
   /** False: a service (startable, no models, never proxied). */
@@ -115,6 +119,7 @@ export function emptyCommandDraft(): CommandDraft {
     status: "",
     health: "",
     timeouts: emptyTimeouts(),
+    baseIndex: -1,
   };
 }
 
@@ -137,7 +142,7 @@ function resourceDraft(resource: unknown): ResourceDraft {
   };
 }
 
-function commandDraft(commands: unknown): CommandDraft {
+function commandDraft(commands: unknown, baseIndex: number): CommandDraft {
   const value = (commands ?? {}) as Partial<Record<CommandField, string>> & {
     timeoutsSec?: Partial<Record<TimeoutField, number>>;
   };
@@ -151,6 +156,7 @@ function commandDraft(commands: unknown): CommandDraft {
     status: value.status ?? "",
     health: value.health ?? "",
     timeouts,
+    baseIndex,
   };
 }
 
@@ -194,7 +200,8 @@ export function specToDraft(input: unknown): SpecDraft {
     api: spec.api ?? "openai",
     engine,
     modelType: spec.modelType ?? "llm",
-    models: (spec.models ?? []).map((model) => ({
+    models: (spec.models ?? []).map((model, baseIndex) => ({
+      baseIndex,
       id: model.id ?? "",
       declareCapabilities: model.capabilities !== undefined,
       capabilities: [...(model.capabilities ?? [])],
@@ -206,7 +213,9 @@ export function specToDraft(input: unknown): SpecDraft {
     resources: launch
       ? (launch.resources ?? []).map(resourceDraft)
       : [resourceDraft({ kind: "unified", memoryGb: 16 })],
-    commands: launch ? (launch.commands ?? []).map(commandDraft) : [emptyCommandDraft()],
+    commands: launch
+      ? (launch.commands ?? []).map((commands, index) => commandDraft(commands, index))
+      : [emptyCommandDraft()],
     labels: (launch?.labels ?? []).join(", "),
     fixedPort: str(launch?.port?.fixed),
     fabric: launch?.fabric ?? "",
@@ -228,7 +237,10 @@ export function specToDraft(input: unknown): SpecDraft {
 
 /** A number input: empty is "not set"; anything else must read as a number (NaN is refused). */
 function num(value: string): number | undefined {
-  return value.trim() === "" ? undefined : Number(value.trim());
+  const text = value.trim();
+  if (text === "") return undefined;
+  // Plain decimals only: `Number` would also read 0x10, 1e3 or 0b1.
+  return /^-?\d+(?:\.\d+)?$/.test(text) ? Number(text) : Number.NaN;
 }
 
 /** Drops undefined members so the spec hashes and compares like the stored one. */
@@ -305,12 +317,12 @@ export function draftToSpec(draft: SpecDraft, base: Record<string, unknown>, kin
   const labels = draft.labels.split(/[\s,]+/).filter((label) => label !== "");
   const models =
     serves && (kind === "STARTABLE" || draft.models.length > 0)
-      ? draft.models.map((model, index) =>
+      ? draft.models.map((model) =>
           compact({
             id: model.id,
             capabilities: model.declareCapabilities ? [...model.capabilities] : undefined,
-            embeddingContract: baseModels[index]?.embeddingContract,
-            transcription: baseModels[index]?.transcription,
+            embeddingContract: baseModels[model.baseIndex]?.embeddingContract,
+            transcription: baseModels[model.baseIndex]?.transcription,
           }),
         )
       : undefined;
@@ -335,9 +347,10 @@ export function draftToSpec(draft: SpecDraft, base: Record<string, unknown>, kin
             resources: draft.resources.map(resourceFromDraft),
             labels,
             port: draft.fixedPort.trim() === "" ? undefined : { fixed: num(draft.fixedPort) },
-            fabric: optionalText(draft.fabric),
-            commands: draft.commands.map((commands, index) =>
-              commandsFromDraft(commands, baseCommands[index] ?? {}),
+            // The form shows a fabric only for several nodes; a leftover one is dropped.
+            fabric: draft.groupSize.trim() === "1" ? undefined : optionalText(draft.fabric),
+            commands: draft.commands.map((commands) =>
+              commandsFromDraft(commands, baseCommands[commands.baseIndex] ?? {}),
             ),
             secrets: baseLaunch.secrets,
             readiness: draft.readiness.enabled

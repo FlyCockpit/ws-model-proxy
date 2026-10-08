@@ -25,10 +25,16 @@ describe("metrics reader draft", () => {
       map: { running: { series: "/a", labels: { model: "x" }, scale: 0.5, divideBy: "/b" } },
     };
     const draft = readerToDraft(reader);
+    draft.map[0].scale = "2";
+    expect(draftToReader(draft, reader)).toEqual({
+      ...reader,
+      map: { running: { series: "/a", labels: { model: "x" }, scale: 2, divideBy: "/b" } },
+    });
+    // Another series: the old labels would select the wrong samples.
     draft.map[0].series = "/c";
     expect(draftToReader(draft, reader)).toEqual({
       ...reader,
-      map: { running: { series: "/c", labels: { model: "x" }, scale: 0.5, divideBy: "/b" } },
+      map: { running: { series: "/c", scale: 2, divideBy: "/b" } },
     });
   });
 

@@ -5,6 +5,7 @@ import {
   draftPathOf,
   draftToSpec,
   editorValues,
+  parseBase,
   readSpecEditor,
   sameSpec,
   specToDraft,
@@ -158,6 +159,51 @@ describe("runtime spec draft", () => {
       ok: false,
       issues: [{ path: ["json"], message: "not json" }],
     });
+  });
+
+  it("keeps a model's contract with that model when another one is removed", () => {
+    const values = editorValues({
+      ...SPECS.multiNode,
+      models: [{ id: "first" }, ...SPECS.multiNode.models],
+    });
+    values.draft.models.splice(0, 1);
+    const reading = readSpecEditor(values, "STARTABLE", MESSAGES);
+    expect(reading.ok).toBe(true);
+    if (!reading.ok) return;
+    expect(reading.spec.models).toEqual(SPECS.multiNode.models);
+  });
+
+  it("copies a shared command's interactive steps to every node when split per node", () => {
+    const shared = {
+      ...SPECS.multiNode,
+      launch: { ...SPECS.multiNode.launch, commands: [SPECS.multiNode.launch.commands[0]] },
+    };
+    const values = editorValues(shared);
+    const [first] = values.draft.commands;
+    values.draft.commands = [first, { ...first, timeouts: { ...first.timeouts } }];
+    const spec = draftToSpec(values.draft, parseBase(values.base), "STARTABLE") as {
+      launch: { commands: Array<{ interactive?: unknown }> };
+    };
+    expect(spec.launch.commands.map((commands) => commands.interactive)).toEqual([
+      { prepare: true },
+      { prepare: true },
+    ]);
+  });
+
+  it("drops a fabric left over from several nodes, and reads only plain decimals", () => {
+    const values = editorValues(SPECS.multiNode);
+    values.draft.groupSize = "1";
+    values.draft.resources = values.draft.resources.slice(0, 1);
+    values.draft.commands = values.draft.commands.slice(0, 1);
+    const spec = draftToSpec(values.draft, parseBase(values.base), "STARTABLE") as {
+      launch: { fabric?: string };
+    };
+    expect(spec.launch.fabric).toBeUndefined();
+    values.draft.fixedPort = "0x2328";
+    const reading = readSpecEditor(values, "STARTABLE", MESSAGES);
+    expect(reading.ok).toBe(false);
+    if (reading.ok) return;
+    expect(reading.issues.map((issue) => issue.path.join("."))).toContain("draft.fixedPort");
   });
 
   it("maps spec paths to draft paths", () => {
