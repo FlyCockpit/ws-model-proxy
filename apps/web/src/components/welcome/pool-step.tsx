@@ -180,6 +180,8 @@ export function PoolStep({ lang }: { lang: string }) {
         onOpenChange={setDialogOpen}
         lang={lang}
         initial={dialog ?? undefined}
+        // Stay on this step: the new callable ID shows in the list above.
+        onCreated={() => undefined}
       />
     </div>
   );

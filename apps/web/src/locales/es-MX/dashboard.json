@@ -6,10 +6,6 @@
     "openSections": "Abrir secciones"
   },
   "appSettingsLoadFailed": "No se pudieron cargar tus ajustes.",
-  "comingSoon": {
-    "title": "Aún no está lista",
-    "description": "Esta página es parte del rediseño 0.4.0 y llega en un paso posterior de la versión."
-  },
   "tabs": {
     "pool": {
       "overview": "Resumen",
@@ -1137,7 +1133,8 @@
       "withCloudHint": "Las llamadas a dueño/pool:external van a la nube cuando se agota la espera máxima del pool.",
       "firstCloudMember": "Primer miembro de nube (opcional)",
       "noCloudMember": "Ninguno por ahora",
-      "cloudFailed": "El pool se creó, pero no se guardó su configuración de nube."
+      "cloudFailed": "El pool se creó, pero no se guardó su configuración de nube.",
+      "noServedModels": "Aún no hay modelos servidos. Crea un runtime primero."
     }
   },
   "runtime": {
@@ -1202,7 +1199,6 @@
       "spec": "Definición (JSON)",
       "specHint": "Los comandos pueden usar marcadores como port y memory_fraction, entre llaves dobles. Usa 127.0.0.1 en runtimes de un solo nodo.",
       "specNotJson": "Esto no es JSON válido.",
-      "specInvalid": "{{path}}: {{detail}}",
       "note": "Nota (por qué, opcional)",
       "fill": "Cambia antes de crear: {{fields}}"
     },

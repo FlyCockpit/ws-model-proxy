@@ -1,14 +1,5 @@
 import { buttonVariants } from "@ws-model-proxy/ui/components/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@ws-model-proxy/ui/components/card";
-import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { Construction } from "lucide-react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -53,33 +44,6 @@ export function PageHeading({ page }: { page: StubPageKey }) {
     <div className="min-w-0 space-y-1">
       <h1 className="text-2xl font-semibold">{t(`dashboard:pages.${page}.title`)}</h1>
       <p className="text-sm text-muted-foreground">{t(`dashboard:pages.${page}.description`)}</p>
-    </div>
-  );
-}
-
-/**
- * A page that exists in the 0.4.0 route skeleton but is built in a later chunk: its heading,
- * a layout-matching placeholder and a short "not built yet" note. No data is fetched.
- */
-export function PageStub({ page, heading = true }: { page: StubPageKey; heading?: boolean }) {
-  const { t } = useTranslation(["dashboard"]);
-  return (
-    <div className="flex min-w-0 flex-col gap-6" data-page-stub={page}>
-      {heading ? <PageHeading page={page} /> : null}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            <Construction aria-hidden="true" className="size-4 text-muted-foreground" />
-            {t("dashboard:comingSoon.title")}
-          </CardTitle>
-          <CardDescription>{t("dashboard:comingSoon.description")}</CardDescription>
-        </CardHeader>
-        <CardContent aria-hidden="true" className="space-y-3">
-          <Skeleton className="h-6 w-1/3" />
-          <Skeleton className="h-20 w-full" />
-          <Skeleton className="h-20 w-full" />
-        </CardContent>
-      </Card>
     </div>
   );
 }

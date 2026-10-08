@@ -6,10 +6,6 @@
     "openSections": "Open sections"
   },
   "appSettingsLoadFailed": "Your settings could not be loaded.",
-  "comingSoon": {
-    "title": "Not built yet",
-    "description": "This page is part of the 0.4.0 redesign and arrives in a later step of the release."
-  },
   "tabs": {
     "pool": {
       "overview": "Overview",
@@ -1137,7 +1133,8 @@
       "withCloudHint": "Callers of owner/pool:external go to the cloud when the pool's max wait runs out.",
       "firstCloudMember": "First cloud member (optional)",
       "noCloudMember": "None yet",
-      "cloudFailed": "The pool was created, but its cloud settings were not saved."
+      "cloudFailed": "The pool was created, but its cloud settings were not saved.",
+      "noServedModels": "No served model yet. Create a runtime first."
     }
   },
   "runtime": {
@@ -1202,7 +1199,6 @@
       "spec": "Definition (JSON)",
       "specHint": "Commands may use placeholders such as port and memory_fraction, written in double braces. Bind 127.0.0.1 on single-node runtimes.",
       "specNotJson": "This is not valid JSON.",
-      "specInvalid": "{{path}}: {{detail}}",
       "note": "Note (why, optional)",
       "fill": "Change before creating: {{fields}}"
     },

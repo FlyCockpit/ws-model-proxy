@@ -7,6 +7,7 @@ import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
 
@@ -52,6 +53,8 @@ export function NewPoolDialog({
   const { t } = useTranslation(["dashboard", "common"]);
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  // The slug follows the name (and a picked model) until the person edits it.
+  const [slugEdited, setSlugEdited] = useState(false);
   const runtimes = useQuery({ ...orpc.runtimes.list.queryOptions(), enabled: open });
   const { create } = useCreatePool();
   const setMode = useMutation({
@@ -115,11 +118,16 @@ export function NewPoolDialog({
           cloudFailed = true;
           toast.error(`${t("dashboard:pool.newSheet.cloudFailed")} ${refusalText(error)}`.trim());
         }
-        await queryClient.invalidateQueries({ queryKey: orpc.pools.key() });
+        // Cloud on adds the pool's `:external` callable ID to Models and Test.
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: orpc.pools.key() }),
+          queryClient.invalidateQueries({ queryKey: orpc.models.key() }),
+        ]);
       }
       if (!cloudFailed) toast.success(t("dashboard:pool.created"));
       onOpenChange(false);
-      if (onCreated) onCreated(pool);
+      // A failed cloud step always opens the pool's Cloud tab to finish it there.
+      if (onCreated && !cloudFailed) onCreated(pool);
       else
         await navigate(
           cloudFailed
@@ -152,8 +160,7 @@ export function NewPoolDialog({
     if (name === "" || suggested.includes(name)) {
       const suggestion = nameFromModel(next.model);
       form.setFieldValue("name", suggestion);
-      const slug = form.getFieldValue("slug");
-      if (slug === "" || slug === slugify(name)) form.setFieldValue("slug", slugify(suggestion));
+      if (!slugEdited) form.setFieldValue("slug", slugify(suggestion));
     }
   };
 
@@ -203,7 +210,7 @@ export function NewPoolDialog({
               )}
               {runtimes.isSuccess && served.length === 0 ? (
                 <p className="text-xs text-muted-foreground">
-                  {t("dashboard:pool.form.noServedModels")}{" "}
+                  {t("dashboard:pool.newSheet.noServedModels")}{" "}
                   <Link to="/$lang/runtimes/new" params={{ lang }} className="underline">
                     {t("dashboard:runtime.new")}
                   </Link>
@@ -252,11 +259,8 @@ export function NewPoolDialog({
                 value={field.state.value}
                 onBlur={field.handleBlur}
                 onChange={(event) => {
-                  const previousSuggestion = slugify(field.state.value);
                   field.handleChange(event.target.value);
-                  const slug = form.getFieldValue("slug");
-                  if (slug === "" || slug === previousSuggestion)
-                    form.setFieldValue("slug", slugify(event.target.value));
+                  if (!slugEdited) form.setFieldValue("slug", slugify(event.target.value));
                 }}
                 className="h-11"
               />
@@ -272,7 +276,10 @@ export function NewPoolDialog({
                 id="pool-slug"
                 value={field.state.value}
                 onBlur={field.handleBlur}
-                onChange={(event) => field.handleChange(event.target.value)}
+                onChange={(event) => {
+                  setSlugEdited(true);
+                  field.handleChange(event.target.value);
+                }}
                 className="h-11 font-mono"
                 autoCapitalize="none"
                 spellCheck={false}
