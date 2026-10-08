@@ -66,6 +66,7 @@ READ credentials see the READ tools; FULL credentials see all.
 | `auth.passwordCapabilities` | Web app plumbing. |
 | `auth.updateLocale` | Web app plumbing. |
 | `models.list` | Callable IDs are part of pools_get. |
+| `models.testTargets` | The web Test page's picker; agents name targets in model_test. |
 | `nodes.activity.list` | Audit history for people (agents see their own results). |
 | `nodes.credentials.list` | Credentials are managed by people. |
 | `nodes.enrollmentCodes.list` | Enrollment is a person's approval; agents never see codes. |

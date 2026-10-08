@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { idSchema, MODEL_TYPE, noInputSchema } from "./common";
+import { idSchema, MODEL_CAPABILITY, MODEL_TYPE, noInputSchema } from "./common";
 import { mutation, query } from "./procedure";
 
 /** `owner/pool` or `owner/pool:external`. */
@@ -15,6 +15,42 @@ export const callableModelSchema = z
     type: z.enum(MODEL_TYPE),
     owner: z.object({ slug: z.string(), you: z.boolean(), email: z.string().nullable() }).strict(),
     status: z.enum(["serving", "starting", "unavailable"]),
+  })
+  .strict();
+
+/** The request APIs the web Test page can speak. */
+export const TEST_SURFACES = [
+  "OPENAI_CHAT_COMPLETIONS",
+  "OPENAI_RESPONSES",
+  "ANTHROPIC_MESSAGES",
+] as const;
+
+/**
+ * One thing the web Test page can send to: a callable ID, or one of the caller's own served
+ * models (direct, `runtime:<runtimeId>:<model>`, web and model_test only).
+ */
+export const testTargetSchema = z
+  .object({
+    /** The `model` the Test page's requests name. */
+    model: z.string(),
+    source: z.enum(["pool", "runtime"]),
+    /** Pool: its callable ID. Runtime: the runtime's name. */
+    label: z.string(),
+    /** Runtime: the served model name; null for a pool. */
+    servedModel: z.string().nullable(),
+    runtimeId: idSchema.nullable(),
+    type: z.enum(MODEL_TYPE),
+    status: z.enum(["serving", "starting", "unavailable"]),
+    external: z.boolean(),
+    /** Pool: what any local member's served model can do. Runtime: the model's own. */
+    capabilities: z.array(z.enum(MODEL_CAPABILITY)),
+    /** Chat targets only: the request APIs this target answers (natively or adapted). */
+    surfaces: z.array(z.enum(TEST_SURFACES)),
+    recommendedSurface: z.enum(TEST_SURFACES).nullable(),
+    /** A served model declares live (realtime) transcription. */
+    liveTranscription: z.boolean(),
+    /** The pool's per-attachment cap; null when it sets none. */
+    maxAttachmentBytes: z.number().int().nullable(),
   })
   .strict();
 
@@ -69,6 +105,12 @@ export const modelsContract = {
       })
       .strict(),
     "Every callable ID you may use (own pools and pools shared with you with can use).",
+  ),
+  testTargets: query(
+    "session",
+    noInputSchema,
+    z.object({ targets: z.array(testTargetSchema) }).strict(),
+    "What the web Test page can send to: your callable IDs and your runtimes' served models.",
   ),
   test: mutation(
     "agent",

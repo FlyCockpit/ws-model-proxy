@@ -116,6 +116,7 @@ const INVENTORY = [
   "pools.aliases.set",
   "pools.aliases.delete",
   "models.list",
+  "models.testTargets",
   "models.test",
   "access.apiKeys.list",
   "access.apiKeys.create",

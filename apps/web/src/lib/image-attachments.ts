@@ -1,0 +1,267 @@
+// Client-side attachment helpers for the Test page composer (ported from the 0.3 Chat Test).
+//
+// Multimodal encode policy lives in `@ws-model-proxy/config/media-policy`.
+// This module performs browser I/O (decode, canvas, FileReader) and applies
+// that pure policy so model payloads stay compatible with local vision servers.
+//
+// Size budget rationale (see asset-plan.md "Size limits"):
+//   - The session Test routes enforce the global 10 MB Hono body limit.
+//   - The CLI relay streams request bodies; the 10 MB internal route body limit
+//     is the remaining ceiling for base64-through-relay.
+//   - Multi-turn history RE-SENDS every prior image as base64 each turn.
+// So we keep a conservative per-image cap and a total-request budget that both
+// sit safely below that 10 MB route limit.
+
+import {
+  acceptedMediaInputAcceptAttr,
+  DEFAULT_IMAGE_ENCODE_QUALITY,
+  DEFAULT_IMAGE_INLINE_PROFILE,
+  DEFAULT_IMAGE_MAX_EDGE,
+  decideImageEncode,
+  type ImageInlineProfile,
+  type MediaInputInfo,
+  type MediaInputModality,
+  type ModelInlineSafeImageMime,
+  mediaInputInfo,
+  reencodeMimeChain,
+} from "@ws-model-proxy/config/media-policy";
+
+export type AttachmentModality = MediaInputModality;
+export type AttachmentModalities = Record<AttachmentModality, boolean>;
+type AttachmentFileInfo = MediaInputInfo;
+
+export function acceptedAttachmentAcceptAttr(modalities: AttachmentModalities): string {
+  return acceptedMediaInputAcceptAttr(modalities);
+}
+
+export function attachmentFileInfo(file: Pick<File, "name" | "type">): AttachmentFileInfo | null {
+  return mediaInputInfo(file);
+}
+
+/** Longest edge after downscaling; matches the shared media-policy default. */
+const MAX_IMAGE_EDGE = DEFAULT_IMAGE_MAX_EDGE;
+
+/** Re-encode quality for lossy JPEG output. */
+const IMAGE_ENCODE_QUALITY = DEFAULT_IMAGE_ENCODE_QUALITY;
+
+/** Max number of images that may be attached to a single composer message. */
+export const MAX_ATTACHMENTS_PER_MESSAGE = 8;
+
+// Decoded-byte cap for the inline data-URL fallback. Kept small because every
+// prior inline attachment is re-sent with each chat turn.
+export const INLINE_ATTACHMENT_MAX_BYTES = 2 * 1024 * 1024; // ~2 MB
+
+// Hard block: never send a request whose estimated body could exceed the
+// internal chat-test route's 10 MB Hono body limit. We stop below it to leave
+// headroom for JSON framing and non-image message content.
+export const TOTAL_REQUEST_HARD_MAX_BYTES = 9.5 * 1024 * 1024; // ~9.5 MB
+
+type ProcessedImage = {
+  id: string;
+  dataUrl: string;
+  name: string;
+  // Decoded (binary) byte size of the embedded image, post-compression.
+  byteSize: number;
+};
+
+type ProcessImageResult =
+  | { ok: true; image: ProcessedImage }
+  | { ok: false; reason: "unsupported" | "oversize" | "decodeFailed"; name: string };
+
+type ProcessImageOptions = {
+  /**
+   * Encode profile for the model payload. Defaults to `model-inline-safe`
+   * (JPEG/PNG only) so local OpenAI-compatible servers accept the data URL.
+   * Pass `openai-broad` only when the selected upstream is known to accept
+   * WebP/GIF (e.g. cloud OpenAI-compatible APIs).
+   */
+  profile?: ImageInlineProfile;
+  /** Maximum decoded bytes for the inline fallback data URL. */
+  maxBytes?: number;
+};
+
+// Decoded byte size of a base64 `data:` URL payload (excludes the header).
+function dataUrlByteSize(dataUrl: string): number {
+  const comma = dataUrl.indexOf(",");
+  if (comma === -1) return 0;
+  const base64 = dataUrl.slice(comma + 1);
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((base64.length * 3) / 4) - padding);
+}
+
+function newAttachmentId(): string {
+  return `img_${crypto.randomUUID().replaceAll("-", "_")}`;
+}
+
+function scaleWithin(width: number, height: number, maxEdge: number) {
+  const longest = Math.max(width, height);
+  if (longest <= maxEdge) return { width, height };
+  const ratio = maxEdge / longest;
+  return {
+    width: Math.max(1, Math.round(width * ratio)),
+    height: Math.max(1, Math.round(height * ratio)),
+  };
+}
+
+export function readFileAsDataUrl(file: File, mime?: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = typeof reader.result === "string" ? reader.result : "";
+      resolve(mime ? rewriteDataUrlMime(dataUrl, mime) : dataUrl);
+    };
+    reader.onerror = () => reject(new Error("readFailed"));
+    reader.readAsDataURL(file);
+  });
+}
+
+/** Replace a browser-supplied data URL MIME with the shared canonical MIME. */
+function rewriteDataUrlMime(dataUrl: string, mime: string): string {
+  if (!dataUrl.startsWith("data:")) return dataUrl;
+  const comma = dataUrl.indexOf(",");
+  return comma === -1 ? dataUrl : `data:${mime};base64,${dataUrl.slice(comma + 1)}`;
+}
+
+function decodeImage(objectUrl: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("decodeFailed"));
+    image.src = objectUrl;
+  });
+}
+
+function reencodeToDataUrl(
+  image: HTMLImageElement,
+  width: number,
+  height: number,
+  mime: ModelInlineSafeImageMime,
+): string | null {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  // JPEG has no alpha: fill white so transparent PNG/WebP/GIF sources do not
+  // become black (canvas default) in the lossy output. CLI expandMedia uses the
+  // same white matte — keep them aligned.
+  if (mime === "image/jpeg") {
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, width, height);
+  }
+  ctx.drawImage(image, 0, 0, width, height);
+  if (mime === "image/jpeg") {
+    return canvas.toDataURL("image/jpeg", IMAGE_ENCODE_QUALITY);
+  }
+  return canvas.toDataURL("image/png");
+}
+
+/**
+ * Try each target mime in order; return the first data URL under the byte budget.
+ * Returns null if every encode failed (canvas), or the last encode's data URL
+ * when all were over budget (caller decides oversize vs ok).
+ */
+function reencodeUntilFits(
+  image: HTMLImageElement,
+  width: number,
+  height: number,
+  mimes: readonly ModelInlineSafeImageMime[],
+  maxBytes: number,
+): { dataUrl: string; byteSize: number; underBudget: boolean } | null {
+  let last: { dataUrl: string; byteSize: number } | null = null;
+  for (const mime of mimes) {
+    const dataUrl = reencodeToDataUrl(image, width, height, mime);
+    if (!dataUrl) continue;
+    const byteSize = dataUrlByteSize(dataUrl);
+    last = { dataUrl, byteSize };
+    if (byteSize <= maxBytes) {
+      return { dataUrl, byteSize, underBudget: true };
+    }
+  }
+  if (!last) return null;
+  return { ...last, underBudget: false };
+}
+
+/**
+ * Downscale / re-encode a single image file into a base64 data URL suitable for
+ * embedding in an OpenAI-shaped `image_url` content part.
+ *
+ * Policy (default `model-inline-safe`):
+ * - Accept PNG/JPEG/WebP/GIF as input.
+ * - Passthrough JPEG/PNG when already within edge + byte budgets (no quality loss).
+ * - Never emit WebP/GIF on the default profile (local LM Studio / llama.cpp).
+ * - Re-encode with an ordered mime chain: PNG may be tried first for sharpness,
+ *   but JPEG is always the acceptance fallback so large PNGs still fit.
+ */
+export async function processImageFile(
+  file: File,
+  options: ProcessImageOptions = {},
+): Promise<ProcessImageResult> {
+  const fileInfo = attachmentFileInfo(file);
+  if (fileInfo?.modality !== "image") {
+    return { ok: false, reason: "unsupported", name: file.name };
+  }
+  const sourceMime = fileInfo.mime;
+
+  const profile = options.profile ?? DEFAULT_IMAGE_INLINE_PROFILE;
+  const maxBytes = options.maxBytes ?? INLINE_ATTACHMENT_MAX_BYTES;
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const image = await decodeImage(objectUrl);
+    const naturalWidth = image.naturalWidth || image.width;
+    const naturalHeight = image.naturalHeight || image.height;
+    if (!naturalWidth || !naturalHeight) {
+      return { ok: false, reason: "decodeFailed", name: file.name };
+    }
+
+    const decision = decideImageEncode({
+      sourceMime,
+      width: naturalWidth,
+      height: naturalHeight,
+      byteSize: file.size,
+      maxEdge: MAX_IMAGE_EDGE,
+      maxBytes,
+      profile,
+    });
+
+    if (decision.action === "passthrough") {
+      const dataUrl = await readFileAsDataUrl(file, sourceMime);
+      const byteSize = dataUrlByteSize(dataUrl);
+      // File size and decoded payload size can diverge; re-check before shipping.
+      if (byteSize <= maxBytes) {
+        return {
+          ok: true,
+          image: { id: newAttachmentId(), dataUrl, name: file.name, byteSize },
+        };
+      }
+    }
+
+    const { width, height } = scaleWithin(naturalWidth, naturalHeight, MAX_IMAGE_EDGE);
+    // Policy chain when reencode was selected; if passthrough only failed the
+    // post-read size check, still use a full chain (PNG→JPEG for PNG sources).
+    const mimes =
+      decision.action === "reencode"
+        ? decision.mimes
+        : reencodeMimeChain(sourceMime, file.size <= maxBytes);
+    const encoded = reencodeUntilFits(image, width, height, mimes, maxBytes);
+    if (!encoded) {
+      return { ok: false, reason: "decodeFailed", name: file.name };
+    }
+    if (!encoded.underBudget) {
+      return { ok: false, reason: "oversize", name: file.name };
+    }
+    return {
+      ok: true,
+      image: {
+        id: newAttachmentId(),
+        dataUrl: encoded.dataUrl,
+        name: file.name,
+        byteSize: encoded.byteSize,
+      },
+    };
+  } catch {
+    return { ok: false, reason: "decodeFailed", name: file.name };
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}

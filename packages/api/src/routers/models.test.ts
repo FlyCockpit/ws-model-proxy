@@ -245,3 +245,141 @@ describe("models.test", () => {
     expect(modelTest).not.toHaveBeenCalled();
   });
 });
+
+describe("models.testTargets", () => {
+  const instances = (phases: string[]) => phases.map((phase) => ({ phase, Ranks: [] }));
+  const localMember = (model: Record<string, unknown>, phases: string[] = ["READY"]) => ({
+    kind: "LOCAL",
+    state: "ACTIVE",
+    shareId: null,
+    RuntimeModel: {
+      upstreamModelId: "m",
+      runtimeId: "rt1",
+      retired: false,
+      Runtime: { slug: "rt", nodeId: null, Node: null, Instances: instances(phases) },
+      Targets: [],
+      type: "LLM",
+      detectedCapabilities: [],
+      capabilities: [],
+      capabilitiesOverridden: false,
+      transcriptionProfile: null,
+      ...model,
+    },
+    Share: null,
+    ProviderModel: null,
+  });
+
+  it("lists callable IDs and the caller's served models with what each can do", async () => {
+    db.pool.findMany.mockResolvedValue([
+      {
+        id: "p2",
+        slug: "shared",
+        userId: "owner",
+        modelType: "LLM",
+        User: { slug: "owner", email: "o@example.test" },
+        Fallback: null,
+        Routing: null,
+        Advanced: { overrides: { protocolAdaptation: false, maxAttachmentBytes: 1024 } },
+        Members: [localMember({ detectedCapabilities: ["TEXT_GENERATION", "VISION_INPUT"] })],
+      },
+      {
+        id: "p1",
+        slug: "stt",
+        userId: "me",
+        modelType: "TRANSCRIPTION",
+        User: { slug: "me", email: "me@example.test" },
+        Fallback: null,
+        Routing: null,
+        Advanced: null,
+        Members: [
+          localMember(
+            {
+              type: "TRANSCRIPTION",
+              transcriptionProfile: { realtime: { adapter: "segmented" } },
+            },
+            ["STARTING"],
+          ),
+        ],
+      },
+    ] as never);
+    db.runtime.findMany.mockResolvedValue([
+      {
+        id: "rt1",
+        name: "Qwen box",
+        Models: [
+          {
+            upstreamModelId: "qwen",
+            type: "LLM",
+            detectedCapabilities: ["TEXT_GENERATION"],
+            capabilities: ["TEXT_GENERATION", "RESPONSES_API"],
+            capabilitiesOverridden: true,
+            transcriptionProfile: null,
+          },
+        ],
+        Instances: [{ phase: "READY" }],
+      },
+    ] as never);
+
+    const { targets } = await client(PERSON).testTargets();
+    expect(targets.map((target) => target.model)).toEqual([
+      "me/stt",
+      "owner/shared",
+      "runtime:rt1:qwen",
+    ]);
+    const [stt, shared, direct] = targets;
+    expect(stt).toMatchObject({
+      type: "TRANSCRIPTION",
+      status: "starting",
+      surfaces: [],
+      recommendedSurface: null,
+      liveTranscription: true,
+    });
+    expect(shared).toMatchObject({
+      source: "pool",
+      capabilities: ["TEXT_GENERATION", "VISION_INPUT"],
+      // Adaptation off: only the native Chat Completions.
+      surfaces: ["OPENAI_CHAT_COMPLETIONS"],
+      recommendedSurface: "OPENAI_CHAT_COMPLETIONS",
+      maxAttachmentBytes: 1024,
+      liveTranscription: false,
+    });
+    expect(direct).toEqual({
+      model: "runtime:rt1:qwen",
+      source: "runtime",
+      label: "Qwen box",
+      servedModel: "qwen",
+      runtimeId: "rt1",
+      type: "LLM",
+      status: "serving",
+      external: false,
+      capabilities: ["TEXT_GENERATION", "RESPONSES_API"],
+      surfaces: ["OPENAI_CHAT_COMPLETIONS", "OPENAI_RESPONSES"],
+      recommendedSurface: "OPENAI_CHAT_COMPLETIONS",
+      liveTranscription: false,
+      maxAttachmentBytes: null,
+    });
+    expect(db.runtime.findMany.mock.calls[0]?.[0]?.where).toEqual({ userId: "me" });
+  });
+
+  it("offers every API on an adapting pool and keeps its recommended surface", async () => {
+    db.pool.findMany.mockResolvedValue([
+      {
+        id: "p1",
+        slug: "chat",
+        userId: "me",
+        modelType: "LLM",
+        User: { slug: "me", email: "me@example.test" },
+        Fallback: null,
+        Routing: null,
+        Advanced: { overrides: { recommendedSurface: "anthropic_messages" } },
+        Members: [localMember({ detectedCapabilities: ["TEXT_GENERATION"] })],
+      },
+    ] as never);
+    db.runtime.findMany.mockResolvedValue([]);
+    const { targets } = await client(PERSON).testTargets();
+    expect(targets[0]).toMatchObject({
+      surfaces: ["OPENAI_CHAT_COMPLETIONS", "OPENAI_RESPONSES", "ANTHROPIC_MESSAGES"],
+      recommendedSurface: "ANTHROPIC_MESSAGES",
+    });
+  });
+});
