@@ -6,6 +6,7 @@ pub mod endpoints;
 pub mod executor;
 pub mod fabric;
 pub mod inventory;
+pub mod local;
 pub mod operator;
 pub mod render;
 #[cfg(unix)]

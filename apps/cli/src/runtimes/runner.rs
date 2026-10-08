@@ -19,7 +19,6 @@ use crate::protocol::frames::{InstanceRecord, JobError, NodeFrame};
 
 /// Steps running at once.
 const RUNNING_MAX: usize = 32;
-const INSTANCES_DIR: &str = "runtime-instances";
 
 /// What a finished step (or an observation pass) reports.
 #[derive(Debug)]
@@ -74,9 +73,7 @@ pub fn result_frame_for(job: &Job, outcome: &Outcome, terminal_id: Option<&str>)
     }
 }
 
-pub fn instances_dir() -> Result<PathBuf> {
-    Ok(crate::paths::state_dir()?.join(INSTANCES_DIR))
-}
+pub use super::executor::instances_dir;
 
 /// `<instance>-r<rank>`, plain characters only.
 fn key_name(job: &Job) -> Option<String> {

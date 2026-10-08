@@ -104,7 +104,7 @@ only; raise it with `wsmp trust full`.
 wsmp service install     # install, enable and start the per-user service
 wsmp service status      # what the service manager reports
 wsmp service uninstall   # stop, disable and remove it
-wsmp status              # whether the relay runs and is connected
+wsmp status              # whether the relay runs and is connected, plus its runtimes and instances
 wsmp hardware            # what this node detects (memory, GPUs, unified pool); --json
 wsmp run                 # run the relay in the foreground (what the service runs)
 wsmp logout              # forget this node's credential
@@ -190,6 +190,21 @@ The server asks a node to do two different kinds of work:
   node's activity, and stop when trust is lowered. An agent can also queue a command for you
   (one that needs a password, for example); it runs only when you choose Run on the Terminals
   page.
+
+To see what this node holds and runs, read from its own files (the frozen copy at Relay only;
+both commands are read only and work at either trust level):
+
+```sh
+wsmp runtime list              # runtimes, and instances with phase, ports, units and stop proof
+wsmp runtime test <target>     # one small request: status and latency
+```
+
+`wsmp runtime test` takes a runtime slug, an instance handle (`i-...`) or an instance id. It asks
+a running instance's readiness route (else its model list, or a TCP connect for a service without
+readiness) and an always-on runtime's model list, and exits non-zero when the answer is not the
+expected one (3 when nothing matches). The stop proof `wsmp runtime list` shows for a stopping or
+stopped rank is the one the inventory reports: `proven`, or why not (`port_in_use`,
+`process_alive`, `status_unknown`, ...). Runtimes are defined in the web app or through MCP.
 
 ## Other commands
 
