@@ -8665,7 +8665,8 @@ const MODEL_TEST_OPERATIONS = {
 
 /**
  * `models.test` (model-test.ts): one chat, embeddings or transcription request as `userId`
- * through the same targets, admission and routing as the Test page, tagged `AGENT_TEST`.
+ * through the same targets, admission and routing as the Test page, tagged `AGENT_TEST`. The
+ * web Test page's embeddings and transcription requests use it with source `TEST`.
  */
 export async function modelTestHandler({
   request,
@@ -8674,6 +8675,7 @@ export async function modelTestHandler({
   manager,
   limiter,
   capacityRuntime,
+  source = "AGENT_TEST",
 }: {
   request: Request;
   userId: string;
@@ -8681,6 +8683,8 @@ export async function modelTestHandler({
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
   capacityRuntime: CapacityAdmissionRuntime;
+  /** `TEST`: the person's Test page (its own slots, as Chat Test). */
+  source?: "TEST" | "AGENT_TEST";
 }): Promise<Response> {
   const prepared =
     kind === "transcription"
@@ -8703,12 +8707,15 @@ export async function modelTestHandler({
     const targets = await listCallableTargetsForUser(userId);
     const response = await relayPreparedModeledRequest({
       request,
-      // Own limit key (as pool member tests): tests and benches do not use up the person's
-      // Test page slots; the per-user global cap still applies.
-      requester: {
-        ...requesterFromChatTestUser(userId, "AGENT_TEST"),
-        limitKey: `model-test:${userId}`,
-      },
+      // Own limit key (as pool member tests): agent tests and benches do not use up the
+      // person's Test page slots; the per-user global cap still applies.
+      requester:
+        source === "TEST"
+          ? requesterFromChatTestUser(userId)
+          : {
+              ...requesterFromChatTestUser(userId, "AGENT_TEST"),
+              limitKey: `model-test:${userId}`,
+            },
       targets,
       prepared,
       operation: MODEL_TEST_OPERATIONS[kind],
