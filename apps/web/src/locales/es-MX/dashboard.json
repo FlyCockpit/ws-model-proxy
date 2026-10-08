@@ -783,8 +783,6 @@
       "slugHint": "Parte del ID invocable: dueño/identificador.",
       "slugInvalid": "Minúsculas, dígitos y guiones simples, empezando con una letra.",
       "type": "Tipo",
-      "firstMember": "Primer miembro (opcional)",
-      "noMember": "Sin miembro por ahora",
       "noServedModels": "Aún no hay modelos servidos de este tipo. Crea un runtime primero."
     },
     "routing": {
@@ -1067,6 +1065,30 @@
         "pool_member_withdraw": "Miembro contribuido quitado",
         "pool_rule_delete": "Regla de enrutamiento eliminada"
       }
+    },
+    "flow": {
+      "label": "A dónde van las solicitudes",
+      "local_one": "{{count}} local",
+      "local_other": "{{count}} locales",
+      "contributed_one": "{{count}} contribuido",
+      "contributed_other": "{{count}} contribuidos",
+      "cloud_one": "{{count}} en la nube",
+      "cloud_other": "{{count}} en la nube",
+      "cloudOff_one": "Nube apagada",
+      "cloudOff_other": "Nube apagada"
+    },
+    "newSheet": {
+      "servedModel": "Modelo servido",
+      "servedModelHint": "Elige uno de tus modelos servidos; el tipo, el nombre y el identificador salen de él.",
+      "startEmpty": "Empezar vacío (elige un tipo)",
+      "cloud": "A dónde van las solicitudes",
+      "localOnly": "Solo local",
+      "withCloud": "Local y luego nube",
+      "localOnlyHint": "Solo tu hardware (y los miembros contribuidos) atiende este pool. Puedes agregar la nube después.",
+      "withCloudHint": "Las llamadas a dueño/pool:external van a la nube cuando se agota la espera máxima del pool.",
+      "firstCloudMember": "Primer miembro de nube (opcional)",
+      "noCloudMember": "Ninguno por ahora",
+      "cloudFailed": "El pool se creó, pero no se guardó su configuración de nube."
     }
   },
   "runtime": {

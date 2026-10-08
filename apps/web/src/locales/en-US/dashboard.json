@@ -783,8 +783,6 @@
       "slugHint": "Part of the callable ID: owner/slug.",
       "slugInvalid": "Lower-case letters, digits and single dashes, starting with a letter.",
       "type": "Type",
-      "firstMember": "First member (optional)",
-      "noMember": "No member yet",
       "noServedModels": "No served model of this type yet. Create a runtime first."
     },
     "routing": {
@@ -1067,6 +1065,30 @@
         "pool_member_withdraw": "Contributed member removed",
         "pool_rule_delete": "Routing rule deleted"
       }
+    },
+    "flow": {
+      "label": "Where requests go",
+      "local_one": "{{count}} local",
+      "local_other": "{{count}} local",
+      "contributed_one": "{{count}} contributed",
+      "contributed_other": "{{count}} contributed",
+      "cloud_one": "{{count}} cloud",
+      "cloud_other": "{{count}} cloud",
+      "cloudOff_one": "Cloud off",
+      "cloudOff_other": "Cloud off"
+    },
+    "newSheet": {
+      "servedModel": "Served model",
+      "servedModelHint": "Pick one of your served models; the type, name and slug follow from it.",
+      "startEmpty": "Start empty (pick a type)",
+      "cloud": "Where requests go",
+      "localOnly": "Local only",
+      "withCloud": "Local, then cloud",
+      "localOnlyHint": "Only your hardware (and contributed members) serves this pool. You can add the cloud later.",
+      "withCloudHint": "Callers of owner/pool:external go to the cloud when the pool's max wait runs out.",
+      "firstCloudMember": "First cloud member (optional)",
+      "noCloudMember": "None yet",
+      "cloudFailed": "The pool was created, but its cloud settings were not saved."
     }
   },
   "runtime": {
