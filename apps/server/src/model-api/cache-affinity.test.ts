@@ -4779,18 +4779,27 @@ it("R4 unit-count work refusal retains the safe prefix without identifying a tru
       content: "x",
     })),
   };
+  payloadEstimates.calls = 0;
   const refused = affinityPrefixDigests(digestArgs("runtime", request));
+  const refusedPasses = payloadEstimates.calls;
   expect(refused.identifiable).toBe(false);
   expect(refused.nodes).toEqual([]);
   expect(refused.routingNodes).toHaveLength(64);
   expect(refused.routingNodes.at(-1)?.depth).toBe(4096);
   expect(refused.clientSessionId).toBeDefined();
+  payloadEstimates.calls = 0;
   expect(
     affinityPrefixDigests(
       digestArgs("runtime", { ...request, messages: request.messages.slice(0, 4096) }),
     ).identifiable,
   ).toBe(true);
-});
+  // The refusal is a work bound, asserted as a count: the 4097th unit is
+  // never sized, so the refused request costs exactly what the cap does.
+  expect(refusedPasses).toBe(4096);
+  expect(payloadEstimates.calls).toBe(refusedPasses);
+  // Two passes of 4096 units and HMAC chain steps (about 1 s idle, several
+  // seconds at gate load); the timeout only guards against a hang.
+}, 60_000);
 
 it("R4 ordinary request roots and nodes retain the previous v5 digest bytes", async () => {
   const { hmacDigestForPurpose } = await import("@ws-model-proxy/db/node-security");
