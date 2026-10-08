@@ -104,7 +104,7 @@ function SidebarLink({
       className={cn(
         buttonVariants({ variant: "ghost", size: collapsed ? "icon-touch" : "touch" }),
         "text-muted-foreground",
-        collapsed ? "justify-center" : "h-auto justify-start gap-2 py-2",
+        collapsed ? "justify-center" : "justify-start gap-2",
       )}
       activeProps={{ className: "bg-sidebar-accent text-sidebar-accent-foreground" }}
     >
@@ -112,14 +112,7 @@ function SidebarLink({
       {collapsed ? (
         <span className="sr-only">{label}</span>
       ) : (
-        <span className="flex min-w-0 flex-col items-start">
-          <span className="min-w-0 truncate">{label}</span>
-          {item.hintKey ? (
-            <span className="min-w-0 truncate text-xs font-normal text-muted-foreground">
-              {t(`nav:${item.hintKey}`)}
-            </span>
-          ) : null}
-        </span>
+        <span className="min-w-0 truncate">{label}</span>
       )}
     </Link>
   );
