@@ -72,6 +72,7 @@ Useful flags:
 | `--human-terminal on\|off` | Allow browser terminals on this node. Asked next to trust on a terminal (default yes; not asked at Relay only, where they cannot open); without a terminal, the saved setting stays (`off` unless set) and login says so. |
 | `--service` / `--no-service` | Install and start the per-user service without asking, or skip it. |
 | `--replace` | Confirm a Replace code (below) without the prompt. |
+| `--yes`, `-y` | Ask nothing and take the defaults: the saved or hostname node name, and installing the service (unless `--no-service`). It never makes a security choice for you: it needs `--trust`, browser terminals stay as saved (`off` unless set) unless you pass `--human-terminal on`, and a Replace code still needs `--replace`. |
 | `--json` | Print the result as JSON. |
 
 **Node names** are 3 to 63 characters: lowercase letters, digits and single hyphens, starting
