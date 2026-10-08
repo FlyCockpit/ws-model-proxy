@@ -22,7 +22,8 @@ import {
 // an isolated Postgres database, a real `wsmp` node, and a mock speech-to-text server as an
 // always-on runtime whose served model declares a `segmented` live profile. `wsmp` collects
 // each committed turn and posts it to the mock's `/v1/audio/transcriptions` as a WAV file.
-// Setup uses the browser's own paths (sign-up, oRPC, enrollment code, `wsmp login`). The
+// Setup uses the browser's own paths (sign-up, oRPC, enrollment code, `wsmp login`). Set
+// WSMP_E2E_KEEP=1 to keep the person and its rows for a look after a failure. The
 // relay wire itself (audio frames, credits, seq) is covered by the server's stt tests and
 // `wsmp`'s own tests against fake engines.
 
@@ -217,7 +218,7 @@ try {
   await busy.next("session.created");
   sendTurn(busy, pcm);
   await waitFor(() => busy.state.closed, `busy close; events: ${JSON.stringify(busy.events)}`);
-  assert.equal(busy.state.closed.code, 1013);
+  assert.equal(busy.state.closed.code, 1013, JSON.stringify(busy.events));
   assert.equal(busy.events.find((event) => event.type === "error")?.error.code, "server_busy");
   first.socket.close(1000);
   await waitFor(() => first.state.closed, "session 1 close");
@@ -380,7 +381,8 @@ try {
     await new Promise((resolveClose) => upstream.close(resolveClose));
   }
   if (db) {
-    if (userId) await db.query(`DELETE FROM "user" WHERE id = $1`, [userId]).catch(() => undefined); // policy: bounded-delete -- generated test user only
+    if (userId && !process.env.WSMP_E2E_KEEP)
+      await db.query(`DELETE FROM "user" WHERE id = $1`, [userId]).catch(() => undefined); // policy: bounded-delete -- generated test user only
     await db.end();
   }
   await rm(scratch, { recursive: true, force: true });

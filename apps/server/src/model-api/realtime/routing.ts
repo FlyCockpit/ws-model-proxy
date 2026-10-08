@@ -1,10 +1,14 @@
 import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import {
   buildPoolRouteSequence,
+  markTargetHalfOpenTrial,
   markTargetRelaySuccess,
   recordTargetRelayFailure,
+  releaseTargetHalfOpenTrial,
+  returnTargetTrial,
   routeKey,
   type SmoothWeightedRoundRobinState,
+  targetRoutingHealth,
 } from "@ws-model-proxy/api/lib/pool-routing";
 import prisma from "@ws-model-proxy/db";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
@@ -79,13 +83,12 @@ function modelEligible(
   return capabilities;
 }
 
-/** Ready instance on an online node, healthy (or not yet judged) target. */
+/** Ready instance on an online node (target health is judged by {@link targetRoutingHealth}). */
 function routeServes(route: TestRoute, onlineNodeIds: ReadonlySet<string>): boolean {
   return (
     route.instance.ready &&
     route.instance.nodeId !== null &&
-    onlineNodeIds.has(route.instance.nodeId) &&
-    (route.target.health === "HEALTHY" || route.target.health === "UNKNOWN")
+    onlineNodeIds.has(route.instance.nodeId)
   );
 }
 
@@ -176,12 +179,12 @@ export async function poolCandidates({
     onlineNodeIds: online,
     now,
     state: roundRobin.get(pool.id) ?? {},
+    degradedTrials: true,
   });
   if (!sequence.ok) return [];
   rememberRoundRobin(pool.id, sequence.state);
-  const candidates: Array<{ candidate: RealtimeCandidate; judged: boolean }> = [];
+  const candidates: RankedCandidate[] = [];
   for (const routed of sequence.candidates) {
-    if (routed.health !== "HEALTHY") continue;
     const entry = byKey.get(routeKey(routed));
     if (!entry) continue;
     const candidate = candidateFor(
@@ -189,22 +192,42 @@ export async function poolCandidates({
       entry.capabilities,
       poolIdentity(pool, entry.route),
     );
-    if (candidate) candidates.push({ candidate, judged: entry.route.target.health === "HEALTHY" });
+    if (!candidate) continue;
+    candidates.push(
+      routed.health === "HALF_OPEN"
+        ? {
+            candidate: {
+              ...candidate,
+              trial: { degradedFallback: routed.degradedFallback === true },
+            },
+            rank: "trial",
+          }
+        : { candidate, rank: entry.route.target.health === "HEALTHY" ? "proven" : "unjudged" },
+    );
   }
-  return provenFirst(candidates);
+  return liveOrder(candidates);
 }
 
+type RankedCandidate = {
+  candidate: RealtimeCandidate;
+  rank: "trial" | "proven" | "unjudged";
+};
+
 /**
- * Targets that served before go first, in their routing order, then targets nothing has
- * judged yet: an open that fails for a configuration reason leaves a target unjudged, and it
- * must not take every session's first attempt.
+ * The order a session tries its candidates in:
+ * 1. at most one target whose recovery window is open (its half-open trial: no recovery
+ *    probe covers live transcription, so live sessions are what bring a target back; the
+ *    session falls back to the others when the trial fails);
+ * 2. targets that served before, in their routing order;
+ * 3. targets nothing has judged yet: an open that fails for a configuration reason leaves a
+ *    target unjudged, and it must not take every session's first attempt.
  */
-function provenFirst(
-  candidates: ReadonlyArray<{ candidate: RealtimeCandidate; judged: boolean }>,
-): RealtimeCandidate[] {
+function liveOrder(candidates: readonly RankedCandidate[]): RealtimeCandidate[] {
+  const trial = candidates.find((entry) => entry.rank === "trial");
   return [
-    ...candidates.filter((entry) => entry.judged),
-    ...candidates.filter((entry) => !entry.judged),
+    ...(trial ? [trial] : []),
+    ...candidates.filter((entry) => entry.rank === "proven"),
+    ...candidates.filter((entry) => entry.rank === "unjudged"),
   ].map((entry) => entry.candidate);
 }
 
@@ -241,15 +264,28 @@ export async function testCandidates({
   routes?: (runtimeModelId: string, ownerUserId: string, now?: Date) => Promise<TestRoute[]>;
 }): Promise<RealtimeCandidate[]> {
   const online = new Set(onlineNodeIds);
-  const candidates: Array<{ candidate: RealtimeCandidate; judged: boolean }> = [];
+  const candidates: RankedCandidate[] = [];
   for (const route of await routes(target.id, target.ownerUserId, now)) {
     if (!routeServes(route, online)) continue;
+    const health = targetRoutingHealth(route.target, now, true);
+    if (health === null) continue;
     const capabilities = modelEligible(route, config);
     if (!capabilities) continue;
     const candidate = candidateFor(route, capabilities, testIdentity(target, route));
-    if (candidate) candidates.push({ candidate, judged: route.target.health === "HEALTHY" });
+    if (!candidate) continue;
+    candidates.push(
+      health === "HALF_OPEN"
+        ? {
+            candidate: {
+              ...candidate,
+              trial: { degradedFallback: route.target.health === "DEGRADED" },
+            },
+            rank: "trial",
+          }
+        : { candidate, rank: route.target.health === "HEALTHY" ? "proven" : "unjudged" },
+    );
   }
-  return provenFirst(candidates);
+  return liveOrder(candidates);
 }
 
 /** Which callable target a model name names, for routing and rechecks. */
@@ -314,31 +350,52 @@ export function createRealtimeRouter({
         failure,
       });
     },
-    memberOpened(candidate: RealtimeCandidate) {
+    async claimTrial(candidate: RealtimeCandidate) {
+      const executionTargetId = candidate.route?.executionTargetId;
+      if (!executionTargetId || !candidate.trial) return null;
+      // The same claim HTTP takes: one trial in flight per target (the timestamp is the fence).
+      const trialStartedAt = new Date();
+      const claimed = await markTargetHalfOpenTrial({
+        executionTargetId,
+        now: trialStartedAt,
+        allowDegradedFallback: candidate.trial.degradedFallback,
+      });
+      return claimed === 1 ? trialStartedAt : null;
+    },
+    releaseTrial(candidate: RealtimeCandidate, trialStartedAt: Date, outcome) {
       const executionTargetId = candidate.route?.executionTargetId;
       if (!executionTargetId) return;
-      void markTargetRelaySuccess(executionTargetId, { trialStartedAt: null }).catch(
-        (error: unknown) => {
-          console.error(
-            "[realtime] target health write failed",
-            error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
-          );
-        },
+      healthWrite(
+        outcome === "unused"
+          ? releaseTargetHalfOpenTrial({ executionTargetId, trialStartedAt })
+          : returnTargetTrial({ executionTargetId, trialStartedAt, now: new Date() }),
       );
     },
-    memberOpenFailed(candidate: RealtimeCandidate, failure: RelayFailure) {
+    memberOpened(candidate: RealtimeCandidate, trialStartedAt: Date | null = null) {
       const executionTargetId = candidate.route?.executionTargetId;
       if (!executionTargetId) return;
-      void recordTargetRelayFailure({ executionTargetId, failure, trialStartedAt: null }).catch(
-        (error: unknown) => {
-          console.error(
-            "[realtime] target health write failed",
-            error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
-          );
-        },
-      );
+      healthWrite(markTargetRelaySuccess(executionTargetId, { trialStartedAt }));
+    },
+    memberOpenFailed(
+      candidate: RealtimeCandidate,
+      failure: RelayFailure,
+      trialStartedAt: Date | null = null,
+    ) {
+      const executionTargetId = candidate.route?.executionTargetId;
+      if (!executionTargetId) return;
+      healthWrite(recordTargetRelayFailure({ executionTargetId, failure, trialStartedAt }));
     },
   };
+}
+
+/** A target health write off the session's path; a failure is logged, never thrown. */
+function healthWrite(write: Promise<unknown>) {
+  void write.catch((error: unknown) => {
+    console.error(
+      "[realtime] target health write failed",
+      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+    );
+  });
 }
 
 export type RealtimeAccessVerdict =

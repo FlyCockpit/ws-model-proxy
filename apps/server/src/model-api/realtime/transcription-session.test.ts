@@ -110,12 +110,31 @@ class FakeRouter implements RealtimeRouter {
     this.calls.push(input.model);
     return this.result;
   }
-  memberOpenFailed(candidate: RealtimeCandidate, failure: RelayFailure) {
+  memberOpenFailed(
+    candidate: RealtimeCandidate,
+    failure: RelayFailure,
+    trialStartedAt?: Date | null,
+  ) {
     this.failures.push([candidate.nodeId, failure]);
+    this.failedTrials.push(trialStartedAt ?? null);
   }
   openedOn: string[] = [];
-  memberOpened(candidate: RealtimeCandidate) {
+  trialsOpened: (Date | null)[] = [];
+  memberOpened(candidate: RealtimeCandidate, trialStartedAt: Date | null = null) {
     this.openedOn.push(candidate.nodeId);
+    this.trialsOpened.push(trialStartedAt);
+  }
+  failedTrials: (Date | null)[] = [];
+  /** Answers each claim in order (a Date: claimed; null: another request holds it). */
+  claims: (Date | null)[] = [];
+  claimed: string[] = [];
+  async claimTrial(candidate: RealtimeCandidate) {
+    this.claimed.push(candidate.nodeId);
+    return this.claims.shift() ?? null;
+  }
+  released: [string, string][] = [];
+  releaseTrial(candidate: RealtimeCandidate, _at: Date, outcome: string) {
+    this.released.push([candidate.nodeId, outcome]);
   }
 }
 
@@ -272,6 +291,150 @@ describe("realtime transcription session: setup and routing", () => {
     expect(t.session.status).toBe("open");
     expect(t.router.failures).toEqual([["cli-broken", "upstream_5xx"]]);
     expect(t.router.openedOn).toEqual([good.nodeId]);
+  });
+
+  it("runs a recovering target's trial first and falls back when it fails", async () => {
+    const t = setup({ initialModel: "whisper" });
+    const recovering = t.link("cli-recovering");
+    const good = t.link("cli-good");
+    const claimedAt = new Date("2026-01-01T00:00:00.000Z");
+    t.router.claims = [claimedAt];
+    t.router.result = {
+      ok: true,
+      candidates: [
+        { ...candidate("cli-recovering"), trial: { degradedFallback: true } },
+        candidate("cli-good"),
+      ],
+    };
+    t.session.start();
+    await vi.advanceTimersByTimeAsync(0);
+    t.cliFrame(recovering, {
+      type: "stt.error",
+      sessionId: String(recovering.opens().at(-1)?.sessionId),
+      failure: "upstream_5xx",
+    });
+    await t.openOn(good);
+    expect(t.session.status).toBe("open");
+    expect(t.router.claimed).toEqual(["cli-recovering"]);
+    // The failed trial is settled as a failure of that trial; the fallback is no trial.
+    expect(t.router.failures).toEqual([["cli-recovering", "upstream_5xx"]]);
+    expect(t.router.failedTrials).toEqual([claimedAt]);
+    expect(t.router.trialsOpened).toEqual([null]);
+    expect(t.router.released).toEqual([]);
+  });
+
+  it("marks a trial that opens as its success", async () => {
+    const t = setup({ initialModel: "whisper" });
+    const recovering = t.link("cli-recovering");
+    const claimedAt = new Date("2026-01-01T00:00:00.000Z");
+    t.router.claims = [claimedAt];
+    t.router.result = {
+      ok: true,
+      candidates: [{ ...candidate("cli-recovering"), trial: { degradedFallback: false } }],
+    };
+    t.session.start();
+    await t.openOn(recovering);
+    expect(t.router.trialsOpened).toEqual([claimedAt]);
+  });
+
+  it("skips a target whose trial another request holds, without opening on it", async () => {
+    const t = setup({ initialModel: "whisper" });
+    const recovering = t.link("cli-recovering");
+    const good = t.link("cli-good");
+    t.router.claims = [null];
+    t.router.result = {
+      ok: true,
+      candidates: [
+        { ...candidate("cli-recovering"), trial: { degradedFallback: true } },
+        candidate("cli-good"),
+      ],
+    };
+    t.session.start();
+    await t.openOn(good);
+    expect(recovering.opens()).toEqual([]);
+    expect(t.router.openedOn).toEqual(["cli-good"]);
+  });
+
+  it("gives an unproven trial back when the refusal is not the target's", async () => {
+    const t = setup({ initialModel: "whisper" });
+    const recovering = t.link("cli-recovering");
+    const good = t.link("cli-good");
+    t.router.claims = [new Date("2026-01-01T00:00:00.000Z")];
+    t.router.result = {
+      ok: true,
+      candidates: [
+        { ...candidate("cli-recovering"), trial: { degradedFallback: true } },
+        candidate("cli-good"),
+      ],
+    };
+    t.session.start();
+    await vi.advanceTimersByTimeAsync(0);
+    t.cliFrame(recovering, {
+      type: "stt.error",
+      sessionId: String(recovering.opens().at(-1)?.sessionId),
+      failure: "rate_limited",
+    });
+    await t.openOn(good);
+    expect(t.router.failures).toEqual([]);
+    expect(t.router.released).toEqual([["cli-recovering", "inconclusive"]]);
+  });
+
+  it("records a trial that never answers as that trial's timeout, then falls back", async () => {
+    const t = setup({ initialModel: "whisper" });
+    t.link("cli-recovering");
+    const good = t.link("cli-good");
+    const claimedAt = new Date("2026-01-01T00:00:00.000Z");
+    t.router.claims = [claimedAt];
+    t.router.result = {
+      ok: true,
+      candidates: [
+        { ...candidate("cli-recovering"), trial: { degradedFallback: true } },
+        candidate("cli-good"),
+      ],
+    };
+    t.session.start();
+    await vi.advanceTimersByTimeAsync(REALTIME_OPEN_ATTEMPT_MS);
+    await t.openOn(good);
+    expect(t.router.failures).toEqual([["cli-recovering", "timeout"]]);
+    expect(t.router.failedTrials).toEqual([claimedAt]);
+    expect(t.router.released).toEqual([]);
+  });
+
+  it("gives the trial back unused when the client hangs up during its open", async () => {
+    const t = setup({ initialModel: "whisper" });
+    const recovering = t.link("cli-recovering");
+    t.router.claims = [new Date("2026-01-01T00:00:00.000Z")];
+    t.router.result = {
+      ok: true,
+      candidates: [{ ...candidate("cli-recovering"), trial: { degradedFallback: true } }],
+    };
+    t.session.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(recovering.opens()).toHaveLength(1);
+    t.session.clientClosed();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.router.released).toEqual([["cli-recovering", "unused"]]);
+    expect(t.router.failures).toEqual([]);
+  });
+
+  it("moves on when claiming a trial fails", async () => {
+    const t = setup({ initialModel: "whisper" });
+    const recovering = t.link("cli-recovering");
+    const good = t.link("cli-good");
+    t.router.claimTrial = async () => {
+      throw new Error("database unavailable");
+    };
+    t.router.result = {
+      ok: true,
+      candidates: [
+        { ...candidate("cli-recovering"), trial: { degradedFallback: true } },
+        candidate("cli-good"),
+      ],
+    };
+    t.session.start();
+    await t.openOn(good);
+    expect(recovering.opens()).toEqual([]);
+    expect(t.router.released).toEqual([]);
   });
 
   it("tries at most three opens, then closes 1011", async () => {

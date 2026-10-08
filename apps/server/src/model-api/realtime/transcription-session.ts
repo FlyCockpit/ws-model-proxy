@@ -109,7 +109,16 @@ export type RealtimeRouteIdentity = {
 export type RealtimeCandidate = SttAttachTarget & {
   memberId: string | null;
   route?: RealtimeRouteIdentity;
+  /**
+   * The target's recovery window is open: this open is its half-open trial, claimed first
+   * (`RealtimeRouter.claimTrial`, one in flight per target). `degradedFallback` lets the claim
+   * take a DEGRADED row (`markTargetHalfOpenTrial`).
+   */
+  trial?: { degradedFallback: boolean };
 };
+
+/** How a claimed trial ends without a health verdict: nothing was sent, or nothing was proven. */
+export type RealtimeTrialRelease = "unused" | "inconclusive";
 
 export type RealtimeRouteResult =
   | { ok: true; candidates: readonly RealtimeCandidate[] }
@@ -126,8 +135,23 @@ export interface RealtimeRouter {
     config: SttConfig;
     signal: AbortSignal;
   }): Promise<RealtimeRouteResult>;
-  /** An open failed in a way that reflects the member's health (see {@link openFailureMarksMember}). */
-  memberOpenFailed(candidate: RealtimeCandidate, failure: RelayFailure): void;
+  /**
+   * An open failed in a way that reflects the member's health (see
+   * {@link openFailureMarksMember}); `trialStartedAt` is the trial it held, if any.
+   */
+  memberOpenFailed(
+    candidate: RealtimeCandidate,
+    failure: RelayFailure,
+    trialStartedAt?: Date | null,
+  ): void;
+  /** Claims a trial candidate's half-open trial; null when another request holds it. */
+  claimTrial?(candidate: RealtimeCandidate): Promise<Date | null>;
+  /** Gives a claimed trial back without a verdict. */
+  releaseTrial?(
+    candidate: RealtimeCandidate,
+    trialStartedAt: Date,
+    outcome: RealtimeTrialRelease,
+  ): void;
   /**
    * The member refused the open for a configuration reason (no realtime
    * route, a wrong model or credential): reported, never counted against the
@@ -135,10 +159,10 @@ export interface RealtimeRouter {
    */
   memberMisconfigured?(candidate: RealtimeCandidate, failure: RelayFailure): void;
   /**
-   * The member's engine opened the session: it served, so a target nothing had judged yet
-   * counts as healthy (never claims or ends a half-open trial; live sessions take none).
+   * The member's engine opened the session: it served, so its target is healthy (a target
+   * nothing had judged yet, or the half-open trial `trialStartedAt` this open held).
    */
-  memberOpened?(candidate: RealtimeCandidate): void;
+  memberOpened?(candidate: RealtimeCandidate, trialStartedAt?: Date | null): void;
 }
 
 export type RealtimeCandidateLease = {
@@ -373,6 +397,8 @@ export class RealtimeTranscriptionSession {
   private readonly heldUpdates: { patch: RealtimeSessionPatch; eventId: string | undefined }[] = [];
   /** The candidate whose open is in flight, and its admission lease. */
   private attempting: RealtimeCandidate | null = null;
+  /** The half-open trial the current open attempt holds; settled exactly once. */
+  private trial: { candidate: RealtimeCandidate; startedAt: Date } | null = null;
   private lease: RealtimeCandidateLease | null = null;
   private openedOn: RealtimeCandidate | null = null;
 
@@ -679,6 +705,7 @@ export class RealtimeTranscriptionSession {
       // The deadline cut an open in flight: that member did not answer in time.
       const cut = this.attempting;
       if (cut) this.notifyMemberFailed(cut, "timeout");
+      else this.releaseTrial("unused");
       this.fail(REALTIME_CLOSE_CODES.tryAgainLater, {
         type: "server_error",
         code: "server_busy",
@@ -731,6 +758,23 @@ export class RealtimeTranscriptionSession {
         this.lease = null;
         return; // the routing deadline ends the session
       }
+      if (candidate.trial) {
+        // A target in its recovery window: this open is its one half-open trial. Another
+        // request holding it, or a failed claim, moves on to the next candidate.
+        const startedAt = await this.claimTrial(candidate);
+        if (startedAt) this.trial = { candidate, startedAt };
+        if (this.state !== "routing" || signal.aborted) {
+          this.releaseTrial("unused");
+          this.releaseLease(this.lease);
+          this.lease = null;
+          return;
+        }
+        if (!startedAt) {
+          this.releaseLease(this.lease);
+          this.lease = null;
+          continue;
+        }
+      }
       const attempt: { pending: Promise<SttAttachResult> | null } = { pending: null };
       const open = () => {
         this.attempting = candidate;
@@ -746,8 +790,12 @@ export class RealtimeTranscriptionSession {
       // Awaited directly (review L2): `opened` is seen before any `onEnd`.
       const outcome = attempt.pending ? await attempt.pending : null;
       this.attempting = null;
-      if (this.state !== "routing" || signal.aborted || outcome?.status === "ended") return;
+      if (this.state !== "routing" || signal.aborted || outcome?.status === "ended") {
+        this.releaseTrial(outcome ? "inconclusive" : "unused");
+        return;
+      }
       if (!authorized.ok || !outcome) {
+        this.releaseTrial(outcome ? "inconclusive" : "unused");
         // Never left open unauthorized, whatever the claim did with `abort`.
         if (outcome?.status === "opened") relay.cancelOpening();
         if (relay.status === "ended") return;
@@ -781,9 +829,13 @@ export class RealtimeTranscriptionSession {
       if (openWasAttempted(outcome.reason)) attempts += 1;
       if (outcome.failure === "rate_limited") sawCapacity = true;
       if (openFailureMarksMember(outcome)) this.notifyMemberFailed(candidate, outcome.failure);
-      else if (openFailureIsConfiguration(outcome)) {
-        const failure = outcome.failure;
-        this.hook(() => this.deps.router.memberMisconfigured?.(candidate, failure));
+      else {
+        // Not the target's fault (configuration, capacity, not eligible): no verdict.
+        this.releaseTrial(openWasAttempted(outcome.reason) ? "inconclusive" : "unused");
+        if (openFailureIsConfiguration(outcome)) {
+          const failure = outcome.failure;
+          this.hook(() => this.deps.router.memberMisconfigured?.(candidate, failure));
+        }
       }
     }
     const config = this.config();
@@ -827,7 +879,8 @@ export class RealtimeTranscriptionSession {
     this.clearRoutingTimer();
     this.routingAbort = null;
     this.openedOn = candidate;
-    this.hook(() => this.deps.router.memberOpened?.(candidate));
+    const trialStartedAt = this.takeTrial(candidate);
+    this.hook(() => this.deps.router.memberOpened?.(candidate, trialStartedAt));
     this.hook(() =>
       this.deps.hooks?.opened?.(candidate, {
         adapter: outcome.adapter,
@@ -880,7 +933,33 @@ export class RealtimeTranscriptionSession {
   }
 
   private notifyMemberFailed(candidate: RealtimeCandidate, failure: RelayFailure) {
-    this.hook(() => this.deps.router.memberOpenFailed(candidate, failure));
+    const trialStartedAt = this.takeTrial(candidate);
+    this.hook(() => this.deps.router.memberOpenFailed(candidate, failure, trialStartedAt));
+  }
+
+  private async claimTrial(candidate: RealtimeCandidate): Promise<Date | null> {
+    const claim = this.deps.router.claimTrial;
+    if (!claim) return null;
+    try {
+      return await claim.call(this.deps.router, candidate);
+    } catch {
+      return null; // a failed claim is a busy target: the next candidate is tried
+    }
+  }
+
+  /** The trial `candidate`'s attempt holds, handed to exactly one settlement. */
+  private takeTrial(candidate: RealtimeCandidate): Date | null {
+    const trial = this.trial;
+    if (!trial || trial.candidate !== candidate) return null;
+    this.trial = null;
+    return trial.startedAt;
+  }
+
+  private releaseTrial(outcome: RealtimeTrialRelease) {
+    const trial = this.trial;
+    if (!trial) return;
+    this.trial = null;
+    this.hook(() => this.deps.router.releaseTrial?.(trial.candidate, trial.startedAt, outcome));
   }
 
   /** Runs a port callback; a throwing hook never breaks the session. */
@@ -1137,6 +1216,9 @@ export class RealtimeTranscriptionSession {
     this.deferredAudioBytes = 0;
     this.heldUpdates.length = 0;
     this.items.clear();
+    // A session that ends (a client hang-up, a policy close) proves nothing about the target:
+    // the trial goes back for the next session at once.
+    this.releaseTrial("unused");
     this.attempting = null;
     const relay = this.relaySession;
     this.relaySession = null;

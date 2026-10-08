@@ -89,6 +89,19 @@ describe("routing around degraded targets", () => {
     ).toEqual([]);
   });
 
+  it("gives a due degraded target its trial beside healthy ones when no probe covers it", () => {
+    // Live transcription: the recovery probe has no audio, so sessions take the trial.
+    const routes = [route("a"), degraded("b"), degraded("c", future)];
+    expect(
+      routablePoolRoutes({ routes, onlineNodeIds: ["node"], now, degradedTrials: true }).map(
+        (candidate) => [candidate.executionTargetId, candidate.health, candidate.degradedFallback],
+      ),
+    ).toEqual([
+      ["target-a", "HEALTHY", false],
+      ["target-b", "HALF_OPEN", true],
+    ]);
+  });
+
   it("does not count a healthy route that cannot serve as an alternative", () => {
     expect(routable([route("a", { nodeOnline: false }), degraded("b")])).toEqual([
       ["target-b", "HALF_OPEN", true],
