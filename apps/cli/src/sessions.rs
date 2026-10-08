@@ -5095,15 +5095,56 @@ mod tests {
             tx,
             Duration::from_secs(60),
             "/bin/sh",
-            &["-c", "stty raw -echo; sleep 30"],
+            &["-c", "stty raw -echo; printf wsmp-raw; sleep 30"],
         );
         let startup = enabled_startup(false);
         let mut a = TestViewer::new(1);
         let opened = open_viewer(&mut terminals, &startup, &mut a);
         a.receive(MULTI_TERMINAL, &opened);
-        std::thread::sleep(Duration::from_millis(200));
-        let a_id = a.id.clone();
+        // Raw mode must be in force before any input: a canonical-mode line
+        // discipline discards a long line instead of filling up.
+        let expected = b"wsmp-raw";
+        let mut output = Vec::new();
+        while !output
+            .windows(expected.len())
+            .any(|window| window == expected)
+        {
+            match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(FromWorker::TerminalBytes { bytes, .. }) => output.extend(bytes),
+                Ok(_) => {}
+                Err(error) => panic!("the shell never entered raw mode: {error} {output:?}"),
+            }
+        }
+        // Fill the PTY input buffer directly, before the writer thread gets any
+        // input. The room left after `WouldBlock` (at most the line
+        // discipline's buffer, which the kernel may still drain into) is
+        // smaller than one chunk, so the writer can never finish a chunk and
+        // the queue can never shrink during the paste: exactly one run of
+        // drops, however the threads are scheduled.
         let chunk = vec![b'x'; 16 * 1024];
+        {
+            let session = terminals.sessions.get(MULTI_TERMINAL).expect("session");
+            let raw = session
+                .pty
+                .as_ref()
+                .expect("pty")
+                .master
+                .as_raw_fd()
+                .expect("master fd");
+            // Shares the writer's O_NONBLOCK open file description.
+            let mut master = filedescriptor::FileDescriptor::dup(&RawFdHandle(raw)).expect("dup");
+            let mut filled = 0usize;
+            loop {
+                match master.write(&chunk[..1024]) {
+                    Ok(count) => filled += count,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => panic!("filling the pty failed: {error}"),
+                }
+                assert!(filled < 8 * 1024 * 1024, "the pty never filled up");
+            }
+        }
+        let a_id = a.id.clone();
         let started = Instant::now();
         let mut frames = Vec::new();
         // 2 MiB: far beyond the PTY buffer plus the 256 KiB queue.
