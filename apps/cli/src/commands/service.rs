@@ -304,7 +304,9 @@ pub fn render_systemd_user_unit(
          # Exit 4: the credential is missing or was rejected (HTTP 401, including a\n\
          # temporary ban); restarting cannot fix it. Run `wsmp login`, then\n\
          # `systemctl --user restart wsmp.service`.\n\
-         RestartPreventExitStatus=4\n\
+         # Exit 5: the server refused this wsmp's relay protocol. Re-run the\n\
+         # server's install.sh (or upgrade the server), then restart.\n\
+         RestartPreventExitStatus=4 5\n\
          # Tells the relay it may exit 4 here instead of retrying in-process.\n\
          Environment=WSMP_STOP_ON_REJECTED_CREDENTIAL=1\n\
          # The config and state paths `wsmp service install` resolved, so the service\n\
@@ -776,8 +778,9 @@ mod tests {
         assert!(unit.contains("EnvironmentFile=-/home/user/.config/ws-model-proxy/service.env"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains(&format!(
-            "RestartPreventExitStatus={}",
-            crate::exit::ExitCode::CredentialRejected as i32
+            "RestartPreventExitStatus={} {}\n",
+            crate::exit::ExitCode::CredentialRejected as i32,
+            crate::exit::ExitCode::RelayProtocolMismatch as i32
         )));
         assert!(unit.contains("WantedBy=default.target"));
         assert!(

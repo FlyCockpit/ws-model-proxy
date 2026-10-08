@@ -10,6 +10,10 @@
 //!   4  the relay has no usable credential (missing, or rejected with 401);
 //!      run `wsmp login`. The systemd unit lists this in
 //!      `RestartPreventExitStatus=` so it does not restart in a loop.
+//!   5  the server refused this wsmp's relay protocol (it needs a newer wsmp,
+//!      or the server is too old). Re-run the server's `install.sh` (or upgrade
+//!      the server), then restart wsmp. The systemd unit lists this in
+//!      `RestartPreventExitStatus=` too.
 //!
 //! A relay stopped by SIGHUP, SIGINT, or SIGTERM cleans up and then dies from
 //! that signal (shell status 128 + signal); see `crate::shutdown`.
@@ -35,6 +39,9 @@ pub enum ExitCode {
     /// The relay credential is missing, revoked, or rejected by the server.
     /// Retrying cannot fix it; the user must run `wsmp login`.
     CredentialRejected = 4,
+    /// The server refused this build's relay protocol. Restarting the same
+    /// binary cannot fix it; install the matching wsmp (or upgrade the server).
+    RelayProtocolMismatch = 5,
 }
 
 /// Annotate an error to request a specific [`ExitCode`].

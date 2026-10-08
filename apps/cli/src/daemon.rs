@@ -483,18 +483,13 @@ pub fn connect_foreground() -> Result<()> {
                 )));
             }
             Err(error) => {
+                let wait = reconnect_wait(reconnect_delay, None);
                 tracing::warn!(
                     error = %format!("{error:#}"),
-                    retry_delay_secs = reconnect_delay.as_secs(),
+                    retry_delay_secs = wait.as_secs(),
                     "relay credential unavailable; retrying"
                 );
-                wait_for_reconnect(
-                    &mut control,
-                    &startup,
-                    &node_slug,
-                    reconnect_delay,
-                    &mut link,
-                )?;
+                wait_for_reconnect(&mut control, &startup, &node_slug, wait, &mut link)?;
                 reconnect_delay = next_reconnect_delay(reconnect_delay);
                 continue;
             }
@@ -509,6 +504,7 @@ pub fn connect_foreground() -> Result<()> {
             .context("building websocket authorization header")?;
 
         tracing::info!(url = %ws_url, "connecting relay websocket");
+        let mut wait = reconnect_wait(reconnect_delay, None);
         match run_relay_session(
             &config,
             &startup,
@@ -520,7 +516,7 @@ pub fn connect_foreground() -> Result<()> {
         ) {
             Ok(()) => {
                 tracing::warn!(
-                    retry_delay_secs = reconnect_delay.as_secs(),
+                    retry_delay_secs = wait.as_secs(),
                     "relay websocket session ended; reconnecting after backoff"
                 );
             }
@@ -531,9 +527,15 @@ pub fn connect_foreground() -> Result<()> {
                 if reset_backoff {
                     reconnect_delay = RELAY_RECONNECT_INITIAL_DELAY;
                 }
+                let floor = retry_floor(&error);
+                wait = reconnect_wait(reconnect_delay, floor);
+                if let Some(floor) = floor {
+                    // Grow the backoff from the server's floor, not below it.
+                    reconnect_delay = reconnect_delay.max(floor).min(RELAY_RECONNECT_MAX_DELAY);
+                }
                 tracing::warn!(
-                    error = %error,
-                    retry_delay_secs = reconnect_delay.as_secs(),
+                    error = %format!("{error:#}"),
+                    retry_delay_secs = wait.as_secs(),
                     "relay websocket disconnected; reconnecting after backoff"
                 );
             }
@@ -543,13 +545,7 @@ pub fn connect_foreground() -> Result<()> {
                 return Err(crate::shutdown::ShutdownRequested { signal }.into());
             }
         }
-        wait_for_reconnect(
-            &mut control,
-            &startup,
-            &node_slug,
-            reconnect_delay,
-            &mut link,
-        )?;
+        wait_for_reconnect(&mut control, &startup, &node_slug, wait, &mut link)?;
         // Endpoint edits apply on reconnect (hot reload lands with config v3).
         match Config::load_required().and_then(|fresh| fresh.validate().map(|()| fresh)) {
             Ok(fresh) => config = fresh,
@@ -1037,9 +1033,12 @@ fn run_relay_session(
         .and_then(|value| value.to_str().ok())
         != Some(RELAY_SUBPROTOCOL)
     {
-        return Err(RelaySessionError::Fatal(anyhow::anyhow!(
-            "server did not accept relay websocket subprotocol `{RELAY_SUBPROTOCOL}`; upgrade the WS Model Proxy server"
-        )));
+        return Err(protocol_mismatch(
+            anyhow::anyhow!(
+                "server did not accept relay websocket subprotocol `{RELAY_SUBPROTOCOL}`; upgrade the WS Model Proxy server"
+            ),
+            stop_on_unusable_credential(),
+        ));
     }
     set_socket_timeouts(
         socket.get_mut(),
@@ -1104,7 +1103,7 @@ fn run_relay_session(
             "CLI identity key is unavailable; cannot bind this node"
         ))
     })?;
-    let (nonce, origin) = wait_for_hello_challenge(&mut socket)?;
+    let (nonce, origin) = wait_for_hello_challenge(&mut socket, stop_on_unusable_credential())?;
     check_hello_origin(&origin, &hello_origin, server_url)?;
     let identity_signature = identity
         .sign_hello(&nonce, node_slug, &origin)
@@ -1473,12 +1472,16 @@ where
                     reset_backoff: false,
                 });
             }
-            let text = if session.registered {
-                format!("relay protocol error: {message}")
-            } else {
-                hello_rejection_message(&message, Some(&code))
-            };
-            return Err(RelaySessionError::Fatal(anyhow::anyhow!(text)));
+            if session.registered {
+                return Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                    "relay protocol error: {message}"
+                )));
+            }
+            return Err(hello_rejection(
+                &message,
+                Some(&code),
+                stop_on_unusable_credential(),
+            ));
         }
         ServerFrame::HeartbeatPong { id, .. } => {
             tracing::debug!(id, "relay heartbeat acknowledged");
@@ -3615,10 +3618,67 @@ where
     Ok(())
 }
 
-fn old_server_upgrade_error() -> RelaySessionError {
-    RelaySessionError::Fatal(anyhow::anyhow!(
-        "the server did not complete the relay handshake for protocol {RELAY_PROTOCOL_VERSION}; upgrade the WS Model Proxy server"
-    ))
+fn old_server_upgrade_error(stop: bool) -> RelaySessionError {
+    protocol_mismatch(
+        anyhow::anyhow!(
+            "the server did not complete the relay handshake for protocol {RELAY_PROTOCOL_VERSION}; upgrade the WS Model Proxy server"
+        ),
+        stop,
+    )
+}
+
+/// A refusal before `hello.ok` that the same binary cannot get past by
+/// retrying soon. Where stopping is safe (see `stop_on_unusable_credential`)
+/// it exits with its own code, which the systemd unit does not restart: a
+/// protocol mismatch exits 5, a revoked or mismatched credential exits 4. A
+/// malformed-frame refusal is a bug and exits 1. Elsewhere the relay keeps
+/// the message in its log and retries only every few minutes, so a service
+/// manager that relaunches every exit (launchd) cannot turn it into a storm.
+fn hello_rejection(
+    message: &str,
+    code: Option<&ProtocolErrorCode>,
+    stop: bool,
+) -> RelaySessionError {
+    let text = hello_rejection_message(message, code);
+    match code {
+        None | Some(ProtocolErrorCode::UpgradeCli | ProtocolErrorCode::UpgradeServer) => {
+            protocol_mismatch(anyhow::anyhow!(text), stop)
+        }
+        Some(ProtocolErrorCode::AccessDenied | ProtocolErrorCode::IdentityMismatch) => {
+            unrecoverable(
+                anyhow::anyhow!("{text}; run `wsmp login` to enroll this machine again"),
+                crate::exit::ExitCode::CredentialRejected,
+                stop,
+            )
+        }
+        Some(ProtocolErrorCode::Malformed | ProtocolErrorCode::Internal) => {
+            RelaySessionError::Fatal(anyhow::anyhow!(text))
+        }
+    }
+}
+
+fn protocol_mismatch(error: anyhow::Error, stop: bool) -> RelaySessionError {
+    unrecoverable(error, crate::exit::ExitCode::RelayProtocolMismatch, stop)
+}
+
+/// Stops with `code` where stopping is safe; elsewhere retries no sooner than
+/// the backoff cap.
+fn unrecoverable(
+    error: anyhow::Error,
+    code: crate::exit::ExitCode,
+    stop: bool,
+) -> RelaySessionError {
+    if stop {
+        RelaySessionError::Fatal(error.context(crate::exit::CodedError::new(code)))
+    } else {
+        RelaySessionError::Reconnectable {
+            error: error.context(RetryFloor {
+                delay: RELAY_RECONNECT_MAX_DELAY,
+                source: RetryFloorSource::Refusal,
+            }),
+            reset_backoff: false,
+        }
+    }
 }
 
 /// Refuses to sign a hello origin other than the one this CLI trusts.
@@ -3660,7 +3720,7 @@ fn check_hello_origin(
 /// A reply to the hello wait that strict 3.0 parsing refused, read loosely:
 /// an older server sends `protocol.error` without a code, or a challenge
 /// without an origin. Both mean "upgrade the server".
-fn older_server_reply(text: &str) -> Option<RelaySessionError> {
+fn older_server_reply(text: &str, stop: bool) -> Option<RelaySessionError> {
     let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
     match value.get("type").and_then(serde_json::Value::as_str)? {
         "protocol.error" => {
@@ -3668,17 +3728,16 @@ fn older_server_reply(text: &str) -> Option<RelaySessionError> {
                 .get("message")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("protocol error");
-            Some(RelaySessionError::Fatal(anyhow::anyhow!(
-                hello_rejection_message(message, None)
-            )))
+            Some(hello_rejection(message, None, stop))
         }
-        "hello.challenge" => Some(old_server_upgrade_error()),
+        "hello.challenge" => Some(old_server_upgrade_error(stop)),
         _ => None,
     }
 }
 
 fn wait_for_hello_challenge<S>(
     socket: &mut tungstenite::WebSocket<S>,
+    stop: bool,
 ) -> RelaySessionResult<(String, String)>
 where
     S: std::io::Read + std::io::Write,
@@ -3686,7 +3745,13 @@ where
     let deadline = Instant::now() + HELLO_CHALLENGE_TIMEOUT;
     loop {
         if Instant::now() >= deadline {
-            return Err(old_server_upgrade_error());
+            return Err(RelaySessionError::Reconnectable {
+                error: anyhow::anyhow!(
+                    "the server sent no hello.challenge within {} s (a server older than relay protocol {RELAY_PROTOCOL_VERSION} never does; upgrade it if this repeats)",
+                    HELLO_CHALLENGE_TIMEOUT.as_secs()
+                ),
+                reset_backoff: false,
+            });
         }
         if let Some(signal) = crate::shutdown::requested() {
             return Err(RelaySessionError::Shutdown(signal));
@@ -3695,7 +3760,7 @@ where
             Ok(Message::Text(text)) => match parse_server_control(&text) {
                 Ok(ServerFrame::HelloChallenge { nonce, origin }) => {
                     if origin.is_empty() {
-                        return Err(old_server_upgrade_error());
+                        return Err(old_server_upgrade_error(stop));
                     }
                     return Ok((nonce, origin));
                 }
@@ -3706,9 +3771,7 @@ where
                             reset_backoff: false,
                         });
                     }
-                    return Err(RelaySessionError::Fatal(anyhow::anyhow!(
-                        hello_rejection_message(&message, Some(&code))
-                    )));
+                    return Err(hello_rejection(&message, Some(&code), stop));
                 }
                 Ok(_) => {
                     return Err(RelaySessionError::Fatal(anyhow::anyhow!(
@@ -3716,7 +3779,7 @@ where
                     )));
                 }
                 Err(error) => {
-                    if let Some(refusal) = older_server_reply(&text) {
+                    if let Some(refusal) = older_server_reply(&text, stop) {
                         return Err(refusal);
                     }
                     return Err(RelaySessionError::Reconnectable {
@@ -3774,8 +3837,9 @@ where
 /// credential cannot turn into a restart loop.
 pub const STOP_ON_REJECTED_CREDENTIAL_ENV: &str = "WSMP_STOP_ON_REJECTED_CREDENTIAL";
 
-/// Whether a missing or rejected credential stops the relay (exit 4) rather
-/// than being retried in-process with the normal backoff (capped at 5 min).
+/// Whether a missing or rejected credential stops the relay (exit 4), and a
+/// refused relay protocol stops it (exit 5), rather than being retried
+/// in-process (with the normal backoff, capped at 5 min).
 /// It stops under the systemd unit (which does not restart on exit 4) and in
 /// an interactive terminal (where a person sees the message). Elsewhere, such
 /// as a macOS LaunchAgent (`KeepAlive` relaunches every exit) or a detached
@@ -3787,11 +3851,90 @@ fn stop_on_unusable_credential() -> bool {
         || std::io::stderr().is_terminal()
 }
 
+/// The longest `Retry-After` the relay honours; a longer one waits this long.
+const RELAY_RETRY_AFTER_MAX: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryFloorSource {
+    /// The server's `Retry-After` header.
+    Server,
+    /// A refusal that retrying soon cannot fix.
+    Refusal,
+}
+
+/// The least time the reconnect loop waits before the next attempt. Attached
+/// to a reconnectable error as context, so it also shows in the logged chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryFloor {
+    delay: Duration,
+    source: RetryFloorSource,
+}
+
+impl std::fmt::Display for RetryFloor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.source {
+            RetryFloorSource::Server => write!(
+                f,
+                "the server asked to wait {} s (Retry-After) before reconnecting",
+                self.delay.as_secs()
+            ),
+            RetryFloorSource::Refusal => write!(
+                f,
+                "retrying in {} s; restarting wsmp unchanged cannot fix this",
+                self.delay.as_secs()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RetryFloor {}
+
+/// The wait floor a reconnectable error carries, if any.
+fn retry_floor(error: &anyhow::Error) -> Option<Duration> {
+    // A `.context(RetryFloor)` is found by anyhow's downcast; the chain walk
+    // finds one nested inside another error.
+    error
+        .downcast_ref::<RetryFloor>()
+        .or_else(|| {
+            error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<RetryFloor>())
+        })
+        .map(|floor| floor.delay)
+}
+
+/// How long to wait before reconnecting: the backoff with up to 20% taken off
+/// at random (so many nodes do not reconnect in step, and the cap holds), and
+/// never less than `floor` (plus up to 10%, for the same reason).
+fn reconnect_wait(backoff: Duration, floor: Option<Duration>) -> Duration {
+    let jittered = backoff.mul_f64(rand::random_range(0.8..=1.0));
+    match floor {
+        Some(floor) => jittered.max(floor.mul_f64(rand::random_range(1.0..=1.1))),
+        None => jittered,
+    }
+}
+
+/// A `Retry-After` in delta-seconds (the form this server sends), capped at
+/// [`RELAY_RETRY_AFTER_MAX`]. An HTTP-date form is ignored.
+fn retry_after_header(response: &tungstenite::http::Response<Option<Vec<u8>>>) -> Option<Duration> {
+    let seconds = response
+        .headers()
+        .get(tungstenite::http::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(seconds).min(RELAY_RETRY_AFTER_MAX))
+}
+
 /// Classify a failed relay websocket handshake. A 401 means the server
 /// rejected the credential (revoked, replaced by a newer login, invalid, or
 /// temporarily banned); with `stop` it is fatal and asks for `wsmp login`,
-/// otherwise it is retried with backoff. Everything else, including a 403
-/// from a proxy or firewall in front of the server, 429 and 5xx, reconnects.
+/// otherwise it is retried with backoff. A 426 means the server refused this
+/// wsmp's relay protocol (exit 5 with `stop`). Everything else, including a
+/// 403 from a proxy or firewall in front of the server, 429 and 5xx,
+/// reconnects, no sooner than a `Retry-After` the server sent.
 fn relay_connect_error(error: tungstenite::Error, stop: bool) -> RelaySessionError {
     if let tungstenite::Error::Http(response) = &error
         && response.status().as_u16() == 401
@@ -3810,8 +3953,31 @@ fn relay_connect_error(error: tungstenite::Error, stop: bool) -> RelaySessionErr
             }
         };
     }
+    if let tungstenite::Error::Http(response) = &error
+        && response.status().as_u16() == 426
+    {
+        return protocol_mismatch(
+            anyhow::Error::new(error).context(format!(
+                "the server refused relay protocol {RELAY_PROTOCOL_VERSION} (HTTP 426); \
+                 install the server's build by re-running its install.sh \
+                 (`curl -fsSL https://<your server>/install.sh | sh`), then restart wsmp"
+            )),
+            stop,
+        );
+    }
+    let retry_after = match &error {
+        tungstenite::Error::Http(response) => retry_after_header(response),
+        _ => None,
+    };
+    let error = anyhow::Error::new(error).context("opening relay websocket");
     RelaySessionError::Reconnectable {
-        error: anyhow::Error::new(error).context("opening relay websocket"),
+        error: match retry_after {
+            Some(delay) => error.context(RetryFloor {
+                delay,
+                source: RetryFloorSource::Server,
+            }),
+            None => error,
+        },
         reset_backoff: false,
     }
 }
@@ -4326,7 +4492,7 @@ mod tests {
         for message in [Message::Close(None), Message::Text("{garbled".into())] {
             let mut socket = challenge_socket(message);
             assert!(matches!(
-                wait_for_hello_challenge(&mut socket),
+                wait_for_hello_challenge(&mut socket, true),
                 Err(RelaySessionError::Reconnectable {
                     reset_backoff: false,
                     ..
@@ -4342,7 +4508,7 @@ mod tests {
                 .into(),
         ));
         assert!(matches!(
-            wait_for_hello_challenge(&mut socket),
+            wait_for_hello_challenge(&mut socket, true),
             Err(RelaySessionError::Reconnectable {
                 reset_backoff: false,
                 ..
@@ -4352,12 +4518,16 @@ mod tests {
             r#"{"type":"protocol.error","failure":"protocol_error","message":"Registration was not received in time."}"#
                 .into(),
         ));
-        match wait_for_hello_challenge(&mut socket) {
-            Err(RelaySessionError::Fatal(error)) => assert!(
-                error
-                    .to_string()
-                    .contains("upgrade the WS Model Proxy server")
-            ),
+        match wait_for_hello_challenge(&mut socket, true) {
+            Err(RelaySessionError::Fatal(error)) => {
+                assert!(
+                    crate::exit::message_for(&error).contains("upgrade the WS Model Proxy server")
+                );
+                assert_eq!(
+                    crate::exit::code_for(&error),
+                    crate::exit::ExitCode::RelayProtocolMismatch
+                );
+            }
             _ => panic!("expected actionable old server refusal"),
         }
     }
@@ -4368,13 +4538,13 @@ mod tests {
             r#"{"type":"hello.challenge","nonce":"AAAAAAAAAAAAAAAAAAAAAA"}"#.into(),
         ));
         assert!(matches!(
-            wait_for_hello_challenge(&mut socket),
+            wait_for_hello_challenge(&mut socket, true),
             Err(RelaySessionError::Fatal(_))
         ));
         let mut socket = challenge_socket(Message::Text(
             r#"{"type":"hello.challenge","nonce":"AAAAAAAAAAAAAAAAAAAAAA","origin":"https://example.test"}"#.into()));
         assert_eq!(
-            wait_for_hello_challenge(&mut socket).ok().unwrap(),
+            wait_for_hello_challenge(&mut socket, true).ok().unwrap(),
             (
                 "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
                 "https://example.test".to_string()
@@ -4822,6 +4992,133 @@ mod tests {
             relay_connect_error(io, true),
             RelaySessionError::Reconnectable { .. }
         ));
+    }
+
+    fn http_error(status: u16, retry_after: Option<&str>) -> tungstenite::Error {
+        let mut builder = tungstenite::http::Response::builder().status(status);
+        if let Some(value) = retry_after {
+            builder = builder.header("Retry-After", value);
+        }
+        tungstenite::Error::Http(Box::new(builder.body(None).expect("response")))
+    }
+
+    #[test]
+    fn a_rate_limited_upgrade_waits_at_least_retry_after_and_logs_it() {
+        for stop in [true, false] {
+            match relay_connect_error(http_error(429, Some("120")), stop) {
+                RelaySessionError::Reconnectable { error, .. } => {
+                    assert_eq!(retry_floor(&error), Some(Duration::from_secs(120)));
+                    let logged = format!("{error:#}");
+                    assert!(logged.contains("429"), "{logged}");
+                    assert!(logged.contains("Retry-After"), "{logged}");
+                    assert!(logged.contains("120 s"), "{logged}");
+                }
+                _ => panic!("HTTP 429 must reconnect"),
+            }
+        }
+        // A huge or missing Retry-After: capped, or none at all.
+        match relay_connect_error(http_error(503, Some("999999")), true) {
+            RelaySessionError::Reconnectable { error, .. } => {
+                assert_eq!(retry_floor(&error), Some(RELAY_RETRY_AFTER_MAX));
+            }
+            _ => panic!("HTTP 503 must reconnect"),
+        }
+        for value in [None, Some("Wed, 21 Oct 2015 07:28:00 GMT"), Some("soon")] {
+            match relay_connect_error(http_error(429, value), true) {
+                RelaySessionError::Reconnectable { error, .. } => {
+                    assert_eq!(retry_floor(&error), None);
+                }
+                _ => panic!("HTTP 429 must reconnect"),
+            }
+        }
+    }
+
+    #[test]
+    fn reconnect_wait_keeps_jitter_the_cap_and_the_floor() {
+        for _ in 0..200 {
+            let wait = reconnect_wait(RELAY_RECONNECT_MAX_DELAY, None);
+            assert!(wait <= RELAY_RECONNECT_MAX_DELAY);
+            assert!(wait >= RELAY_RECONNECT_MAX_DELAY.mul_f64(0.8));
+            let floored = reconnect_wait(Duration::from_secs(2), Some(Duration::from_secs(60)));
+            assert!(floored >= Duration::from_secs(60), "{floored:?}");
+            assert!(floored <= Duration::from_secs(66), "{floored:?}");
+            // The backoff still wins when it is longer than the floor.
+            let longer = reconnect_wait(Duration::from_secs(256), Some(Duration::from_secs(1)));
+            assert!(longer >= Duration::from_secs(204), "{longer:?}");
+        }
+    }
+
+    #[test]
+    fn a_refused_relay_protocol_stops_with_its_own_exit_code() {
+        let refusals = [
+            hello_rejection(
+                "This server requires relay protocol 3.0. Upgrade wsmp and restart it.",
+                Some(&ProtocolErrorCode::UpgradeCli),
+                true,
+            ),
+            hello_rejection("too new", Some(&ProtocolErrorCode::UpgradeServer), true),
+            hello_rejection("Malformed relay protocol message.", None, true),
+            relay_connect_error(http_error(426, None), true),
+        ];
+        for refusal in refusals {
+            match refusal {
+                RelaySessionError::Fatal(error) => {
+                    assert_eq!(
+                        crate::exit::code_for(&error),
+                        crate::exit::ExitCode::RelayProtocolMismatch
+                    );
+                    let message = crate::exit::message_for(&error);
+                    assert!(
+                        message.contains("upgrade") || message.contains("install.sh"),
+                        "{message}"
+                    );
+                }
+                _ => panic!("a refused protocol must stop where stopping is safe"),
+            }
+        }
+        let cli = hello_rejection("Upgrade wsmp.", Some(&ProtocolErrorCode::UpgradeCli), true);
+        let RelaySessionError::Fatal(error) = cli else {
+            panic!("upgrade_cli must stop");
+        };
+        assert!(crate::exit::message_for(&error).contains("install.sh"));
+    }
+
+    #[test]
+    fn a_refused_relay_protocol_retries_slowly_where_exiting_would_relaunch() {
+        match hello_rejection("Upgrade wsmp.", Some(&ProtocolErrorCode::UpgradeCli), false) {
+            RelaySessionError::Reconnectable { error, .. } => {
+                assert_eq!(retry_floor(&error), Some(RELAY_RECONNECT_MAX_DELAY));
+                assert!(format!("{error:#}").contains("install.sh"));
+            }
+            _ => panic!("without the stop marker a refused protocol must be retried"),
+        }
+    }
+
+    #[test]
+    fn a_hello_credential_refusal_asks_for_login_and_malformed_stays_generic() {
+        for code in [
+            ProtocolErrorCode::AccessDenied,
+            ProtocolErrorCode::IdentityMismatch,
+        ] {
+            let RelaySessionError::Fatal(error) = hello_rejection("revoked", Some(&code), true)
+            else {
+                panic!("a credential refusal must stop where stopping is safe");
+            };
+            assert_eq!(
+                crate::exit::code_for(&error),
+                crate::exit::ExitCode::CredentialRejected
+            );
+            assert!(crate::exit::message_for(&error).contains("`wsmp login`"));
+        }
+        let RelaySessionError::Fatal(error) =
+            hello_rejection("bad", Some(&ProtocolErrorCode::Malformed), true)
+        else {
+            panic!("malformed must stay fatal");
+        };
+        assert_eq!(
+            crate::exit::code_for(&error),
+            crate::exit::ExitCode::Failure
+        );
     }
 
     #[test]
