@@ -72,17 +72,22 @@ terminal. Only the person runs or dismisses it, so `cancel` refuses.
 ### Stops that cannot be proven
 
 A stopping instance keeps its resources and port until its node proves the
-stop. When the stop steps fail (for example the stop command errors because
-the process is already gone), the server asks the node for a status probe: it
-proves the stop when no process of the rank's units is left, the `status`
-command (if any) says stopped, and the rank's port is free. The stop then
-completes with no person involved. Only when the node cannot prove it (still
-alive, or offline for 10 minutes) does the instance show `needsOperator:
-"MARK_STOPPED"`; the probe is repeated every 5 minutes, so a later proof
-still completes it. Each rank's `lastStopCheck.errorCode` says why the last
-probe failed: `process_alive`, `status_running`, `status_unknown`,
-`port_in_use`, `unowned_service` (runs outside the node's units with no
-`status` command), or `not_stopped` from a node too old to say.
+stop. The node proves it from what it observes itself: no process is left in
+the rank's units (their control groups are empty) and the rank's port is
+free. For a run the node started in its own units, the `status` command is not
+needed for that proof and cannot block it (a stub `status: "true"` would say
+"alive" forever). A run the node did not start in a unit of its own (a start a
+person ran in a terminal) also needs its `status` command to say stopped
+(exit 3). A stop step completes as soon as this proof holds. When the stop
+steps fail, the server asks the node for a status probe that checks the same
+proof; the stop then completes with no person involved. Only when the node
+cannot prove it (still alive, or offline for 10 minutes) does the instance
+show `needsOperator: "MARK_STOPPED"`; the probe is repeated every 5 minutes, so
+a later proof still completes it. Each rank's `lastStopCheck.errorCode` says
+why the last probe failed: `process_alive`, `process_unknown` (the node could
+not read its units), `port_in_use`, `status_running`, `status_unknown`,
+`unowned_service` (runs outside the node's units with no `status` command), or
+`not_stopped` from a node too old to say.
 
 To mark such an instance stopped, call `runtime_stop {instanceId,
 markStopped: true, confirm: "MARK_STOPPED"}` (optionally `nodeNumber` for one
@@ -115,8 +120,9 @@ A spec has exactly one of:
   `always_on_runtime`. Its health is probed automatically; `model_test`
   checks it now.
 - `launch` (a **startable** runtime: commands that start one):
-  - `management`: `process` (the node owns the process) or `service` (stop and
-    a `status` command prove it; exit 0 alive, exit 3 stopped).
+  - `management`: `process` (the node owns the process) or `service` (the start
+    may hand off to a service; its `status` command says whether it runs: exit 0
+    alive, exit 3 stopped).
   - `groupSize` (1–64 nodes), `resources` (one entry, or one per rank:
     `{kind: "none"}`, `{kind: "unified", memoryGb}`, `{kind: "cpu", ramGb}` or
     `{kind: "discrete", gpuCount, vramGb, ramGb?, vendor?}`), `labels` the node

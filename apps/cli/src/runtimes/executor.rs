@@ -617,7 +617,11 @@ impl Executor {
                             "stopped unit revived"
                         );
                     }
-                    if let Some(status) = job.status_command.as_deref() {
+                    // A process-managed run lives in the units checked above; only a service may
+                    // have come back outside them (its status command says so).
+                    if job.management() == Management::Service
+                        && let Some(status) = job.status_command.as_deref()
+                    {
                         anyhow::ensure!(
                             !runtime.status_until(
                                 job,
@@ -835,29 +839,37 @@ impl Executor {
         self.complete(job, outcome)
     }
 
-    /// A status probe (the server sends one when the stops of a stopping rank
-    /// failed, or for a claim marked stopped): proves the stop when nothing of the
-    /// rank's process tree runs (no owned or recorded unit has a task), its
-    /// status command (when defined) says stopped, and its port is free. It
-    /// runs nothing and needs no record (a lost record cannot block the
-    /// proof); a proof resolves the record like a verified stop. Anything
-    /// short of proof answers not stopped, saying why (`detail`).
-    fn prove_stopped(
-        &mut self,
+    /// Why the rank's stop is not proven, or `None` when it is. Stops, status
+    /// probes and the re-check of a recorded stop all ask this one question.
+    ///
+    /// The proof rests on what the node observes itself: no unit of the rank
+    /// (owned, or recorded by its launch) has a task left in its control group,
+    /// and the rank's port is free. For a run the node launched in its own
+    /// units (`KillMode=control-group`), those facts are the proof and the
+    /// definition's status command is not needed: its answer can neither block
+    /// nor replace them (a stub `true`, "alive" forever, must not hold a claim
+    /// forever). A run the node did not launch in a unit of its own (an
+    /// operator-run start, `external`; a platform without units,
+    /// `self-detached`) has no unit to observe: there the status command must
+    /// also say stopped (exit 3).
+    ///
+    /// Reasons: `process_alive`, `process_unknown` (the user manager could not
+    /// say), `port_in_use`, `unowned_service` (no unit and no status command),
+    /// `status_running`, `status_unknown`.
+    fn stop_unproven(
+        &self,
         job: &Job,
         runtime: &impl Runtime,
         deadline: Deadline,
-    ) -> Result<Outcome> {
-        let key = job.key();
+    ) -> Result<Option<&'static str>> {
         let mut units: std::collections::BTreeSet<String> = owned_units(job).into_iter().collect();
         // What the launched run used: a probe rendered from another version may name another
         // port or status command, so both the probe's and the record's are checked.
         let mut statuses: Vec<(&Job, &str)> = Vec::new();
         let mut ports = vec![(job.host.as_str(), job.port)];
-        let mut detached = false;
-        if let Some(record) = self.state.records.get(&key) {
-            // A re-delivered probe is proven again, never answered from history: the machine
-            // may have changed since.
+        // No record (lost): a service may have been started outside the node's units.
+        let mut detached = job.management() == Management::Service;
+        if let Some(record) = self.state.records.get(&job.key()) {
             units.extend(record.invocations.keys().cloned());
             detached = record
                 .invocations
@@ -871,27 +883,62 @@ impl Executor {
         if let Some(status) = job.status_command.as_deref() {
             statuses.push((job, status));
         }
-        // A service that runs outside the node's units is proven only by its status command.
         if detached && statuses.is_empty() {
-            return Ok(Outcome::unproven("unowned_service"));
+            return Ok(Some("unowned_service"));
         }
         for unit in &units {
-            if runtime.tasks_alive(unit, deadline)? {
-                return Ok(Outcome::unproven("process_alive"));
-            }
-        }
-        for (owner, status) in statuses {
-            match runtime.status_until(owner, status, deadline.cap(Duration::from_secs(30))) {
+            match runtime.tasks_alive(unit, deadline) {
                 Ok(false) => {}
-                Ok(true) => return Ok(Outcome::unproven("status_running")),
-                Err(_) => return Ok(Outcome::unproven("status_unknown")),
+                Ok(true) => return Ok(Some("process_alive")),
+                Err(_) => {
+                    deadline.remaining()?;
+                    if runtime.cancelled() {
+                        return Err(fail(JobError::SessionDisconnected));
+                    }
+                    return Ok(Some("process_unknown"));
+                }
             }
         }
         if ports
             .iter()
             .any(|(host, port)| !runtime.port_free(host, *port))
         {
-            return Ok(Outcome::unproven("port_in_use"));
+            return Ok(Some("port_in_use"));
+        }
+        if detached {
+            for (owner, status) in statuses {
+                match runtime.status_until(owner, status, deadline.cap(Duration::from_secs(30))) {
+                    Ok(false) => {}
+                    Ok(true) => return Ok(Some("status_running")),
+                    Err(_) => {
+                        if runtime.cancelled() {
+                            return Err(fail(JobError::SessionDisconnected));
+                        }
+                        return Ok(Some("status_unknown"));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// A status probe (the server sends one when the stops of a stopping rank
+    /// failed, or for a claim marked stopped): proves the stop as
+    /// [`Executor::stop_unproven`] does. It runs nothing but the status command
+    /// of a run outside the node's units, and needs no record (a lost record
+    /// cannot block the proof); a proof resolves the record like a verified
+    /// stop. A re-delivered probe is proven again, never answered from history:
+    /// the machine may have changed since. Anything short of proof answers not
+    /// stopped, saying why (`detail`).
+    fn prove_stopped(
+        &mut self,
+        job: &Job,
+        runtime: &impl Runtime,
+        deadline: Deadline,
+    ) -> Result<Outcome> {
+        let key = job.key();
+        if let Some(reason) = self.stop_unproven(job, runtime, deadline)? {
+            return Ok(Outcome::unproven(reason));
         }
         deadline.remaining()?;
         let now = (self.clock)();
@@ -904,8 +951,9 @@ impl Executor {
         self.complete(job, Outcome::ok(true))
     }
 
-    /// Run the stop command, stop every owned unit, then require status
-    /// (when defined) to show the service stopped. `None`: still alive.
+    /// Run the stop command, stop every owned unit, then wait (within the
+    /// step's deadline) until the stop is proven ([`Executor::stop_unproven`]).
+    /// `None`: not proven by the deadline.
     fn stop_teardown(
         &mut self,
         job: &Job,
@@ -954,9 +1002,23 @@ impl Executor {
                 );
             }
         }
-        if let Some(status) = job.status_command.as_deref() {
-            let stopped = wait_for_status(job, runtime, status, false, deadline)?;
-            if !stopped {
+        // A stop command that exits at once (`true`) leaves nothing to wait for once the
+        // node's own observations prove the stop; a status command that keeps saying
+        // "alive" does not hold an owned run's stop until its deadline.
+        loop {
+            if runtime.cancelled() {
+                return Err(fail(JobError::SessionDisconnected));
+            }
+            let Some(reason) = self.stop_unproven(job, runtime, deadline)? else {
+                break;
+            };
+            if deadline.sleep(Duration::from_millis(500)).is_err() {
+                tracing::warn!(
+                    instance_id = job.instance_id,
+                    rank = job.rank,
+                    reason,
+                    "the stop could not be proven"
+                );
                 return Ok(None);
             }
         }

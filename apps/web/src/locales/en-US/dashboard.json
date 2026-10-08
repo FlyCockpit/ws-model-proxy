@@ -1072,6 +1072,7 @@
         "checkProven": "Confirmed stopped",
         "loadFailed": "Couldn't load what wsmp knows about this stop.",
         "reason": {
+          "process_unknown": "The node couldn't tell whether a process of the service still runs",
           "process_alive": "A process of the service still runs",
           "status_running": "The status command says it is running",
           "status_unknown": "The status command couldn't tell",
