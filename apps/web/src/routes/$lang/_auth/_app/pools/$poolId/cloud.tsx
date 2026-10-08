@@ -88,6 +88,12 @@ function CloudSettings({ pool }: { pool: PoolView }) {
     meta: { skipGlobalErrorToast: true },
   });
   const inUse = new Set(cloudMembers.map((member) => member.providerModelId));
+  /** Members whose provider model was turned off or removed: every list write refuses them. */
+  const enabledIds = new Set(
+    (providerModels.data?.models ?? []).filter((model) => model.enabled).map((model) => model.id),
+  );
+  const stale = (member: PoolView["members"][number]) =>
+    providerModels.isSuccess && !enabledIds.has(member.providerModelId ?? "");
   const candidates = (providerModels.data?.models ?? []).filter(
     (model) => model.enabled && model.type === pool.modelType && !inUse.has(model.id),
   );
@@ -157,9 +163,13 @@ function CloudSettings({ pool }: { pool: PoolView }) {
                   <span className="min-w-0 flex-1 break-all font-mono text-sm">
                     {member.upstreamModelId}
                   </span>
-                  <StatusPill tone="info">
-                    {t(`dashboard:pool.memberStatus.${member.status}`)}
-                  </StatusPill>
+                  {stale(member) ? (
+                    <StatusPill tone="bad">{t("dashboard:pool.cloud.notEnabled")}</StatusPill>
+                  ) : (
+                    <StatusPill tone="info">
+                      {t(`dashboard:pool.memberStatus.${member.status}`)}
+                    </StatusPill>
+                  )}
                   <Button
                     variant="ghost"
                     size="icon-touch"
@@ -292,7 +302,12 @@ function ExternalNote({ pool }: { pool: PoolView }) {
       : t("dashboard:pool.advanced.unknown");
   return (
     <p className="rounded-md border bg-muted/40 p-3 text-sm text-muted-foreground">
-      {t("dashboard:pool.cloud.externalNote", { id: `${pool.owner.slug}/${pool.slug}:external` })}{" "}
+      {t(
+        pool.cloud.mode === "OFF"
+          ? "dashboard:pool.cloud.externalNoteOff"
+          : "dashboard:pool.cloud.externalNote",
+        { id: `${pool.owner.slug}/${pool.slug}:external` },
+      )}{" "}
       <span className="font-medium text-foreground">
         {t("dashboard:pool.cloud.maxWait", {
           value,
@@ -504,7 +519,7 @@ function OwnKeyCard({ pool }: { pool: PoolView }) {
           .string()
           .trim()
           .min(1, t("dashboard:pool.ownKey.required"))
-          .max(256, t("dashboard:pool.ownKey.required")),
+          .max(256, t("dashboard:pool.ownKey.tooLong")),
       }),
     },
     onSubmit: async ({ value }) => {
@@ -594,6 +609,16 @@ function OwnKeyCard({ pool }: { pool: PoolView }) {
 
 const HISTORY_PAGE = 20;
 
+/** The locale key of a history entry; a slug change is called out among pool updates. */
+function historyActionKey(item: { action: string; after: unknown }): string {
+  const changesSlug =
+    item.action === "pool.update" &&
+    typeof item.after === "object" &&
+    item.after !== null &&
+    "slug" in item.after;
+  return changesSlug ? "pool_update_slug" : item.action.replaceAll(".", "_");
+}
+
 function HistoryCard({ poolId }: { poolId: string }) {
   const { t } = useTranslation(["dashboard", "common"]);
   const history = useInfiniteQuery(
@@ -633,7 +658,7 @@ function HistoryCard({ poolId }: { poolId: string }) {
             {items.map((item) => (
               <li key={item.id} className="flex min-w-0 flex-wrap items-center gap-2 py-2 text-sm">
                 <span className="min-w-0 flex-1 break-words">
-                  {t(`dashboard:pool.history.actions.${item.action.replaceAll(".", "_")}`, {
+                  {t(`dashboard:pool.history.actions.${historyActionKey(item)}`, {
                     defaultValue: item.action,
                   })}
                 </span>

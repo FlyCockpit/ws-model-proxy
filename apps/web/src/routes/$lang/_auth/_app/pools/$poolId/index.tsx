@@ -428,6 +428,7 @@ function MembersCard({ pool }: { pool: PoolView }) {
                 {member.kind === "LOCAL" ? (
                   <MemberWeightForm
                     member={member}
+                    pending={update.isPending || removeContributed.isPending}
                     onSave={(weight) =>
                       write(
                         () =>
@@ -545,9 +546,12 @@ function MembersCard({ pool }: { pool: PoolView }) {
 /** A member's routing weight (1–1000; higher gets more requests). */
 function MemberWeightForm({
   member,
+  pending,
   onSave,
 }: {
   member: PoolMemberView;
+  /** Another write to this pool is running. */
+  pending: boolean;
   onSave: (weight: number) => Promise<boolean>;
 }) {
   const { t } = useTranslation(["dashboard", "common"]);
@@ -608,7 +612,7 @@ function MemberWeightForm({
             type="submit"
             variant="outline"
             size="touch"
-            disabled={submitting || weight === String(member.weight)}
+            disabled={submitting || pending || weight === String(member.weight)}
           >
             {t("dashboard:pool.weight.save")}
           </Button>

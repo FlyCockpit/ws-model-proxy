@@ -825,7 +825,9 @@
       "moveDown": "Bajar {{member}}",
       "externalNote": "Las solicitudes a {{id}} van a la nube cuando se agota la espera máxima del pool.",
       "maxWait": "Espera máxima: {{value}} ({{source}}).",
-      "setOnAdvanced": "Configúrala en Avanzado"
+      "setOnAdvanced": "Configúrala en Avanzado",
+      "notEnabled": "Modelo de proveedor apagado: quítalo primero",
+      "externalNoteOff": "Con la nube encendida, las solicitudes a {{id}} van a la nube cuando se agota la espera máxima del pool."
     },
     "advanced": {
       "intro": "Estos ajustes son automáticos salvo que se sobrescriban. Los agentes pueden ajustarlos; cada cambio queda en el historial del pool.",
@@ -1040,7 +1042,8 @@
       "save": "Dar consentimiento",
       "withdraw": "Retirar",
       "clears": "Cambiar o retirar el modelo borra la elección de clave propia de cada persona con acceso.",
-      "required": "Escribe un ID de modelo de OpenRouter (256 caracteres como máximo)."
+      "required": "Escribe un ID de modelo de OpenRouter (256 caracteres como máximo).",
+      "tooLong": "Usa 256 caracteres como máximo."
     },
     "history": {
       "title": "Historial",
@@ -1063,7 +1066,8 @@
         "pool_routing_own_hardware_only": "Solo mi hardware cambiado",
         "pool_member_contribute": "Miembro contribuido",
         "pool_member_withdraw": "Miembro contribuido quitado",
-        "pool_rule_delete": "Regla de enrutamiento eliminada"
+        "pool_rule_delete": "Regla de enrutamiento eliminada",
+        "pool_update_slug": "Identificador cambiado"
       }
     },
     "flow": {

@@ -176,7 +176,8 @@ function PoolsPage() {
           ) : null}
         </>
       )}
-      <NewPoolDialog open={creating} onOpenChange={setCreating} />
+      {/* Mounted per opening, so a cancelled sheet starts over. */}
+      {creating ? <NewPoolDialog onClose={() => setCreating(false)} /> : null}
     </div>
   );
 }
@@ -227,18 +228,12 @@ function nameFromModel(model: string): string {
   return model.split("/").filter(Boolean).at(-1) ?? model;
 }
 
-function NewPoolDialog({
-  open,
-  onOpenChange,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-}) {
+function NewPoolDialog({ onClose }: { onClose: () => void }) {
   const { t } = useTranslation(["dashboard", "common"]);
   const { lang } = Route.useParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const runtimes = useQuery({ ...orpc.runtimes.list.queryOptions(), enabled: open });
+  const runtimes = useQuery(orpc.runtimes.list.queryOptions());
   const create = useMutation({
     ...orpc.pools.create.mutationOptions(),
     meta: { skipGlobalErrorToast: true },
@@ -308,8 +303,7 @@ function NewPoolDialog({
       await queryClient.invalidateQueries({ queryKey: orpc.models.key() });
       await queryClient.invalidateQueries({ queryKey: orpc.runtimes.key() });
       if (!cloudFailed) toast.success(t("dashboard:pool.created"));
-      onOpenChange(false);
-      form.reset();
+      onClose();
       await navigate(
         cloudFailed
           ? { to: "/$lang/pools/$poolId/cloud", params: { lang, poolId: pool.id } }
@@ -322,7 +316,7 @@ function NewPoolDialog({
   const type = useStore(form.store, (state) => state.values.type);
   const providerModels = useQuery({
     ...orpc.providers.models.list.queryOptions({ input: {} }),
-    enabled: open && cloud === "cloud",
+    enabled: cloud === "cloud",
   });
   const cloudCandidates = (providerModels.data?.models ?? []).filter(
     (model) => model.enabled && model.type === type,
@@ -348,8 +342,10 @@ function NewPoolDialog({
 
   return (
     <ResponsiveDialog
-      open={open}
-      onOpenChange={onOpenChange}
+      open
+      onOpenChange={(next) => {
+        if (!next) onClose();
+      }}
       title={t("dashboard:pool.new")}
       description={t("dashboard:pool.newHint")}
     >

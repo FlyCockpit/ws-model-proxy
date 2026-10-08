@@ -11,6 +11,7 @@ const state = vi.hoisted(() => ({
   update: vi.fn(),
   ownKey: vi.fn(),
   pool: undefined as unknown,
+  providerModels: [] as Array<{ id: string; enabled: boolean; type: string }>,
 }));
 
 vi.mock("@tanstack/react-router", async (importOriginal) => {
@@ -74,6 +75,14 @@ vi.mock("@/utils/orpc", () => ({
                   after: null,
                 },
                 {
+                  id: "ev-3",
+                  createdAt: new Date().toISOString(),
+                  actor: { actor: "USER", userId: "user-1", agentTokenId: null, label: null },
+                  action: "pool.update",
+                  before: null,
+                  after: { slug: "team-chat" },
+                },
+                {
                   id: "ev-2",
                   createdAt: new Date().toISOString(),
                   actor: { actor: "USER", userId: "user-1", agentTokenId: null, label: null },
@@ -96,7 +105,7 @@ vi.mock("@/utils/orpc", () => ({
         list: {
           queryOptions: () => ({
             queryKey: ["providers", "models"],
-            queryFn: async () => ({ models: [] }),
+            queryFn: async () => ({ models: state.providerModels }),
           }),
         },
       },
@@ -142,11 +151,25 @@ afterEach(() => {
   cleanup();
   state.update.mockReset();
   state.ownKey.mockReset();
+  state.providerModels = [];
 });
 
 describe("pool cloud tab", () => {
   it("notes that :external waits for the pool's max wait, with its current value", async () => {
     await mount();
+    // Cloud off: the :external ID does not exist yet.
+    expect(screen.getByText("dashboard:pool.cloud.externalNoteOff:ann/chat:external")).toBeTruthy();
+    cleanup();
+    await mount(
+      poolFixture({
+        cloud: {
+          mode: "OWNER",
+          embeddingContract: null,
+          paidWarmProtection: false,
+          ownKeyEquivalentModel: null,
+        },
+      }),
+    );
     expect(screen.getByText("dashboard:pool.cloud.externalNote:ann/chat:external")).toBeTruthy();
     expect(
       screen.getByText(
@@ -156,6 +179,10 @@ describe("pool cloud tab", () => {
   });
 
   it("moves a cloud member up and down by resending the order", async () => {
+    state.providerModels = [
+      { id: "pm-a", enabled: true, type: "LLM" },
+      { id: "pm-b", enabled: true, type: "LLM" },
+    ];
     await mount(
       poolFixture({
         members: [cloudMember("b", 1, "model-b"), cloudMember("a", 0, "model-a")],
@@ -251,7 +278,30 @@ describe("pool cloud tab", () => {
     expect(
       screen.getByText("dashboard:pool.history.actions.pool_fallback_mode:pool.fallback.mode"),
     ).toBeTruthy();
+    expect(
+      screen.getByText("dashboard:pool.history.actions.pool_update_slug:pool.update"),
+    ).toBeTruthy();
     expect(screen.getByText("dashboard:pool.history.actor.AGENT")).toBeTruthy();
-    expect(screen.getByText("dashboard:pool.history.actor.USER")).toBeTruthy();
+    expect(screen.getAllByText("dashboard:pool.history.actor.USER")).toHaveLength(2);
+  });
+
+  it("marks a cloud member whose provider model is off, and removes it", async () => {
+    state.providerModels = [
+      { id: "pm-a", enabled: true, type: "LLM" },
+      { id: "pm-b", enabled: false, type: "LLM" },
+    ];
+    await mount(
+      poolFixture({
+        members: [cloudMember("a", 0, "model-a"), cloudMember("b", 1, "model-b")],
+      }),
+    );
+    expect(await screen.findAllByText("dashboard:pool.cloud.notEnabled")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pool.removeMember:model-b" }));
+    await waitFor(() =>
+      expect(state.update).toHaveBeenCalledWith({
+        poolId: "pool-1",
+        cloudMembers: [{ providerModelId: "pm-a" }],
+      }),
+    );
   });
 });

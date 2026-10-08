@@ -825,7 +825,9 @@
       "moveDown": "Move {{member}} down",
       "externalNote": "Requests to {{id}} go to the cloud when the pool's max wait runs out.",
       "maxWait": "Max wait: {{value}} ({{source}}).",
-      "setOnAdvanced": "Set it on Advanced"
+      "setOnAdvanced": "Set it on Advanced",
+      "notEnabled": "Provider model off: remove it first",
+      "externalNoteOff": "With the cloud on, requests to {{id}} go to the cloud when the pool's max wait runs out."
     },
     "advanced": {
       "intro": "These settings are automatic unless overridden. Agents may tune them; every change is recorded in the pool history.",
@@ -1040,7 +1042,8 @@
       "save": "Give consent",
       "withdraw": "Withdraw",
       "clears": "Changing or withdrawing the model clears every share holder's own-key choice.",
-      "required": "Enter an OpenRouter model id (256 characters at most)."
+      "required": "Enter an OpenRouter model id (256 characters at most).",
+      "tooLong": "Use 256 characters at most."
     },
     "history": {
       "title": "History",
@@ -1063,7 +1066,8 @@
         "pool_routing_own_hardware_only": "Own-hardware-only changed",
         "pool_member_contribute": "Member contributed",
         "pool_member_withdraw": "Contributed member removed",
-        "pool_rule_delete": "Routing rule deleted"
+        "pool_rule_delete": "Routing rule deleted",
+        "pool_update_slug": "Slug changed"
       }
     },
     "flow": {

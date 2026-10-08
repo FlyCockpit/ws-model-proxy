@@ -142,16 +142,12 @@ function PipelineStrip({ pool }: { pool: PoolView }) {
 }
 
 /** "" = automatic; otherwise a whole number in [min, max]. */
-function optionalInt(bounds: { min: number; max: number }, message: string) {
-  return z
-    .string()
-    .trim()
-    .refine(
-      (value) =>
-        value === "" ||
-        (/^\d{1,6}$/.test(value) && Number(value) >= bounds.min && Number(value) <= bounds.max),
-      message,
-    );
+function intInRange(value: string, bounds: { min: number; max: number }): boolean {
+  const trimmed = value.trim();
+  return (
+    trimmed === "" ||
+    (/^\d{1,6}$/.test(trimmed) && Number(trimmed) >= bounds.min && Number(trimmed) <= bounds.max)
+  );
 }
 
 function SidecarCard({
@@ -170,25 +166,48 @@ function SidecarCard({
     ...orpc.pools.update.mutationOptions(),
     meta: { skipGlobalErrorToast: true },
   });
+  // An agent may store any millisecond value; the seconds shown are rounded, so an untouched
+  // field keeps the stored value instead of writing the rounded one back.
+  const storedTimeoutS = current?.timeoutMs ? String(Math.round(current.timeoutMs / 1000)) : "";
   const form = useForm({
     defaultValues: {
       target: current?.targetPoolId ?? "",
       prompt: current?.prompt ?? "",
-      timeoutS: current?.timeoutMs ? String(Math.round(current.timeoutMs / 1000)) : "",
+      timeoutS: storedTimeoutS,
       maxAssets: current?.maxAssets ? String(current.maxAssets) : "",
     },
     validators: {
-      onSubmit: z.object({
-        target: z.string(),
-        prompt: z.string().max(8_000),
-        timeoutS: optionalInt(TIMEOUT_S, t("dashboard:pool.media.rangeInvalid", TIMEOUT_S)),
-        maxAssets: optionalInt(MAX_ASSETS, t("dashboard:pool.media.rangeInvalid", MAX_ASSETS)),
-      }),
+      onSubmit: z
+        .object({
+          target: z.string(),
+          prompt: z.string().max(8_000),
+          timeoutS: z.string(),
+          maxAssets: z.string(),
+        })
+        // The limits are asked (and checked) only while a sidecar pool is picked.
+        .superRefine((value, ctx) => {
+          if (!value.target) return;
+          if (!intInRange(value.timeoutS, TIMEOUT_S))
+            ctx.addIssue({
+              code: "custom",
+              path: ["timeoutS"],
+              message: t("dashboard:pool.media.rangeInvalid", TIMEOUT_S),
+            });
+          if (!intInRange(value.maxAssets, MAX_ASSETS))
+            ctx.addIssue({
+              code: "custom",
+              path: ["maxAssets"],
+              message: t("dashboard:pool.media.rangeInvalid", MAX_ASSETS),
+            });
+        }),
     },
     onSubmit: async ({ value }) => {
       const prompt = value.prompt.trim();
       const timeoutS = value.timeoutS.trim();
       const maxAssets = value.maxAssets.trim();
+      // Absent keeps the stored value (pools.update).
+      const timeoutMs =
+        timeoutS === storedTimeoutS ? undefined : timeoutS ? Number(timeoutS) * 1000 : null;
       try {
         await update.mutateAsync({
           poolId: pool.id,
@@ -198,7 +217,7 @@ function SidecarCard({
                   input,
                   targetPoolId: value.target,
                   prompt: input !== "AUDIO" && prompt ? prompt : null,
-                  timeoutMs: timeoutS ? Number(timeoutS) * 1000 : null,
+                  ...(timeoutMs !== undefined ? { timeoutMs } : {}),
                   maxAssets: maxAssets ? Number(maxAssets) : null,
                 }
               : { input, targetPoolId: null },

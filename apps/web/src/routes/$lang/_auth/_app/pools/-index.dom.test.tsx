@@ -12,6 +12,7 @@ const state = vi.hoisted(() => ({
   setMode: vi.fn(),
   update: vi.fn(),
   navigate: vi.fn(),
+  setModeError: null as unknown,
 }));
 
 vi.mock("@tanstack/react-router", async (importOriginal) => {
@@ -42,15 +43,20 @@ vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
 vi.mock("@ws-model-proxy/ui/components/responsive-dialog", () => ({
   ResponsiveDialog: ({
     open,
+    onOpenChange,
     title,
     children,
   }: {
     open: boolean;
+    onOpenChange: (open: boolean) => void;
     title: ReactNode;
     children: ReactNode;
   }) =>
     open ? (
       <div role="dialog" aria-label={String(title)}>
+        <button type="button" onClick={() => onOpenChange(false)}>
+          close
+        </button>
         {children}
       </div>
     ) : null,
@@ -96,7 +102,12 @@ vi.mock("@/utils/orpc", () => ({
       },
       create: mutation((input) => state.create(input)),
       update: mutation((input) => state.update(input)),
-      cloud: { setMode: mutation((input) => state.setMode(input)) },
+      cloud: {
+        setMode: mutation((input) => {
+          state.setMode(input);
+          if (state.setModeError) throw state.setModeError;
+        }),
+      },
     },
     models: { key: () => ["models"] },
     runtimes: {
@@ -176,6 +187,7 @@ afterEach(() => {
   state.setMode.mockReset();
   state.update.mockReset();
   state.navigate.mockReset();
+  state.setModeError = null;
 });
 
 describe("pools page", () => {
@@ -271,5 +283,40 @@ describe("pools page", () => {
       }),
     );
     expect(state.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens the pool's Cloud tab when the cloud step fails after the pool exists", async () => {
+    state.setModeError = new Error("nope");
+    await mount();
+    const dialog = await openSheet();
+    fireEvent.change(within(dialog).getByLabelText("dashboard:pool.newSheet.servedModel"), {
+      target: { value: "rt-1::Qwen/Qwen3-8B" },
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "dashboard:pool.newSheet.withCloud" }),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "dashboard:pool.create" }));
+    await waitFor(() =>
+      expect(state.navigate).toHaveBeenCalledWith({
+        to: "/$lang/pools/$poolId/cloud",
+        params: { lang: "en-US", poolId: "pool-new" },
+      }),
+    );
+    expect(state.create).toHaveBeenCalledTimes(1);
+    expect(state.update).not.toHaveBeenCalled();
+  });
+
+  it("starts over after a cancelled sheet", async () => {
+    await mount();
+    const dialog = await openSheet();
+    fireEvent.change(within(dialog).getByLabelText("dashboard:pool.form.name"), {
+      target: { value: "Draft" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "close" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    const reopened = await openSheet();
+    expect(
+      (within(reopened).getByLabelText("dashboard:pool.form.name") as HTMLInputElement).value,
+    ).toBe("");
   });
 });

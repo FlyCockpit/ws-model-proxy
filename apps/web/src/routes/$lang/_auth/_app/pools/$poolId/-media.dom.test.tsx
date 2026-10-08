@@ -39,7 +39,7 @@ const pool = poolFixture({
       targetPoolId: "pool-vision",
       targetCallableId: "ann/vision",
       prompt: "Describe it",
-      timeoutMs: 20_000,
+      timeoutMs: 20_400,
       maxAssets: 4,
     },
   ],
@@ -155,6 +155,49 @@ describe("pool media tab", () => {
     );
     await screen.findByText("dashboard:pool.media.rangeInvalid:1|64");
     expect(state.update).not.toHaveBeenCalled();
+  });
+
+  it("keeps a stored timeout the person did not touch (shown rounded)", async () => {
+    await mount();
+    fireEvent.change(screen.getByLabelText("dashboard:pool.media.prompt"), {
+      target: { value: "Describe it briefly" },
+    });
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "common:actions.save" })[0] as HTMLElement,
+    );
+    await waitFor(() =>
+      expect(state.update).toHaveBeenCalledWith({
+        poolId: "pool-1",
+        sidecars: [
+          {
+            input: "IMAGE",
+            targetPoolId: "pool-vision",
+            prompt: "Describe it briefly",
+            maxAssets: 4,
+          },
+        ],
+      }),
+    );
+  });
+
+  it("removes a sidecar, ignoring limits left invalid", async () => {
+    await mount();
+    fireEvent.change(screen.getByLabelText("dashboard:pool.media.maxAssets.IMAGE"), {
+      target: { value: "999" },
+    });
+    fireEvent.change(
+      screen.getByLabelText("dashboard:pool.media.target", { selector: "#sidecar-IMAGE" }),
+      { target: { value: "" } },
+    );
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "common:actions.save" })[0] as HTMLElement,
+    );
+    await waitFor(() =>
+      expect(state.update).toHaveBeenCalledWith({
+        poolId: "pool-1",
+        sidecars: [{ input: "IMAGE", targetPoolId: null }],
+      }),
+    );
   });
 
   it("asks for limits only once a sidecar pool is picked", async () => {
