@@ -12,10 +12,18 @@ export function refusalReasonOf(error: unknown): string | null {
   return typeof reason === "string" && /^[a-z_]{1,64}$/.test(reason) ? reason : null;
 }
 
-/** Copy for a refusal reason (`dashboard:refusals.*`), else the generic friendly copy. */
+/**
+ * Keys for a refusal reason, most specific first: the node and profile copy
+ * (`dashboard:refusals.*`), then the shared runtime copy (`dashboard:runtime.refusals.*`).
+ */
+export function refusalKeys(reason: string): string[] {
+  return [`dashboard:refusals.${reason}`, `dashboard:runtime.refusals.${reason}`];
+}
+
+/** Copy for a refusal reason ({@link refusalKeys}), else the generic friendly copy. */
 export function refusalMessage(t: TFunction, error: unknown, fallbackKey?: string): string {
   const reason = refusalReasonOf(error);
-  const specific = reason ? t(`dashboard:refusals.${reason}`, { defaultValue: "" }) : "";
+  const specific = reason ? t(refusalKeys(reason), { defaultValue: "" }) : "";
   if (specific) return specific;
   return friendly(error, fallbackKey ? t(fallbackKey) : undefined);
 }

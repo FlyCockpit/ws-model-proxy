@@ -7,10 +7,15 @@ vi.mock("@/utils/friendly-error", () => ({
 
 import { refusalMessage, refusalReasonOf } from "./refusal";
 
-const t = ((key: string, options?: { defaultValue?: string }) =>
-  key === "dashboard:refusals.trust_relay"
-    ? "relay copy"
-    : (options?.defaultValue ?? key)) as never;
+const copy: Record<string, string> = {
+  "dashboard:refusals.trust_relay": "relay copy",
+  "dashboard:runtime.refusals.trust_relay": "runtime relay copy",
+  "dashboard:runtime.refusals.port_range_in_use": "port range copy",
+};
+const t = ((keys: string | string[], options?: { defaultValue?: string }) => {
+  const found = [keys].flat().find((key) => key in copy);
+  return found ? copy[found] : (options?.defaultValue ?? String(keys));
+}) as never;
 
 describe("refusal copy", () => {
   it("reads data.reason only when it is a reason-shaped code", () => {
@@ -21,6 +26,7 @@ describe("refusal copy", () => {
 
   it("uses the reason's copy, else the friendly fallback", () => {
     expect(refusalMessage(t, { data: { reason: "trust_relay" } })).toBe("relay copy");
+    expect(refusalMessage(t, { data: { reason: "port_range_in_use" } })).toBe("port range copy");
     expect(refusalMessage(t, { data: { reason: "unknown_reason" } }, "fallback.key")).toBe(
       "fallback.key",
     );

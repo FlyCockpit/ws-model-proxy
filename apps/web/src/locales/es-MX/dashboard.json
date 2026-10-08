@@ -649,7 +649,8 @@
     "alias_limit": "Demasiados alias. Elimina uno primero.",
     "alias_key_not_allowed": "Esa clave no puede llamar a este pool. Agrega el pool a la clave primero.",
     "always_on_runtime": "Un runtime siempre activo se ejecuta por su cuenta; no hay nada que iniciar.",
-    "fabric_port_ranges_disjoint": "Los rangos de puertos de estos nodos no comparten ningún puerto; haz que se superpongan."
+    "fabric_port_ranges_disjoint": "Los rangos de puertos de estos nodos no comparten ningún puerto; haz que se superpongan.",
+    "identity_mismatch": "El nodo presentó una clave de identidad distinta."
   },
   "models": {
     "loadFailed": "No se pudieron cargar tus modelos.",
@@ -1484,7 +1485,12 @@
       "already_shared": "Este pool ya está compartido con esta persona. Cambia el compartido existente.",
       "invite_pending": "Este correo ya tiene una invitación pendiente. Reenvíala en su lugar.",
       "too_many_invites": "Demasiadas invitaciones pendientes. Retira algunas antes de invitar a más personas.",
-      "invite_accepted": "Esa invitación se acaba de aceptar, así que ahora es un compartido."
+      "invite_accepted": "Esa invitación se acaba de aceptar, así que ahora es un compartido.",
+      "port_range_in_use": "Una instancia en ejecución en este nodo usa un puerto fuera del nuevo rango. Detenla primero.",
+      "node_online": "El nodo está en línea. Los agentes solo eliminan nodos sin conexión; una persona puede eliminarlo aquí.",
+      "alias_shadowed": "Ese nombre ya es uno de tus ID invocables.",
+      "alias_limit": "Demasiados alias. Elimina uno primero.",
+      "alias_key_not_allowed": "Esa clave no puede llamar a este pool. Agrega el pool a la clave primero."
     },
     "delete": "Eliminar runtime",
     "deleteTitle": "¿Eliminar {{name}}?",

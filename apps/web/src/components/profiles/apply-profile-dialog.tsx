@@ -16,7 +16,7 @@ import { useTranslation } from "react-i18next";
 import { InlineRetry } from "@/components/inline-retry";
 import { StatusPill } from "@/components/nodes/node-badges";
 import type { NodeSummary, ProfileView, StartPreview } from "@/components/nodes/node-types";
-import { refusalMessage, refusalReasonOf } from "@/components/nodes/refusal";
+import { refusalKeys, refusalMessage, refusalReasonOf } from "@/components/nodes/refusal";
 import { orpc } from "@/utils/orpc";
 
 /**
@@ -161,7 +161,7 @@ function PreviewSummary({
           <ul className="list-disc space-y-0.5 pl-5">
             {preview.refusals.map((refusal) => (
               <li key={`${refusal.reason}-${refusal.subjectId}`}>
-                {t(`dashboard:refusals.${refusal.reason}`, { defaultValue: refusal.message })}
+                {t([...refusalKeys(refusal.reason), "dashboard:runtime.refusals.other"])}
                 {refusal.subjectId && nodeById.has(refusal.subjectId)
                   ? ` (${slug(refusal.subjectId)})`
                   : null}
