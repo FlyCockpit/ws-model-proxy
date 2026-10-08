@@ -454,11 +454,14 @@ function combineOutputs(name: string, calls: ProcedureCall[], outputs: unknown[]
       // The list is read for every node at once: rows leave out nulls and empty lists.
       return calls[0]?.path === "nodes.list" ? withoutEmpty(outputs[0]) : outputs[0];
     case "runtimes_get": {
-      // Instance rows leave out nulls and empty lists (a held STOPPED instance stays listed).
+      // Instance rows and list rows leave out nulls and empty lists (a held STOPPED instance
+      // stays listed; a runtime on no node has no `nodes`).
       const runtime =
         calls[0]?.path === "runtimes.get"
           ? { ...record(outputs[0]), instanceList: withoutEmpty(record(outputs[0]).instanceList) }
-          : outputs[0];
+          : calls[0]?.path === "runtimes.list"
+            ? withoutEmpty(outputs[0])
+            : outputs[0];
       return outputs.length === 2 ? { ...record(runtime), versions: outputs[1] } : runtime;
     }
     case "pools_get": {

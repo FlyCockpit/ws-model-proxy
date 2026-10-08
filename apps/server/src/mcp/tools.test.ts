@@ -282,6 +282,24 @@ describe("errors and output", () => {
     });
   });
 
+  it("runtimes_get lists runtimes compactly, with the nodes each is on", async () => {
+    const row = (nodes: unknown[]) => ({
+      id: "rt-1",
+      nodeId: null,
+      forkedFromVersionId: null,
+      models: [],
+      nodes,
+    });
+    const result = await runMcpTool(tool("runtimes_get"), {
+      dispatch: testDispatch("READ"),
+      args: {},
+      invoke: async () => ({ runtimes: [row([{ id: "node-1", slug: "box" }]), row([])] }),
+    });
+    expect(structured(result).result).toEqual({
+      runtimes: [{ id: "rt-1", nodes: [{ id: "node-1", slug: "box" }] }, { id: "rt-1" }],
+    });
+  });
+
   it("pools_get leaves unknown member live load out, and keeps the known values", async () => {
     const pool = (live: Record<string, unknown>) => ({
       id: "pool-1",
