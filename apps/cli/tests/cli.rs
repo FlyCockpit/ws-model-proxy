@@ -984,6 +984,8 @@ fn commands_wsmp_started_cannot_change_wsmp_itself() {
         &["config", "path"],
         &["terminal", "approvals", "list"],
         &["runtime", "list"],
+        // File recovery exists on Unix only (elsewhere `wsmp recover` refuses as unsupported).
+        #[cfg(unix)]
         &["recover"],
         &["trust"],
         // Lowering works from anywhere.
