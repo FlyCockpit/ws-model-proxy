@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { nodesContract } from "../contracts/nodes";
+import { declaredHardwareSchema } from "../lib/runtime-spec";
 import { effectiveHardware, fabricSuggestions } from "./hardware";
 
 const NOW = new Date("2026-10-08T00:00:00Z");
@@ -92,6 +94,92 @@ describe("effectiveHardware: unified GPUs", () => {
       ["amd:1", 16, false],
       ["nvidia:0", 24, false],
     ]);
+  });
+});
+
+describe("declared unified GPUs", () => {
+  /** A Strix Halo declared by hand (no AMD detection). */
+  const STRIX = {
+    kind: "unified",
+    memoryGb: 128,
+    gpus: [{ vendor: "amd", index: 0, name: "Radeon 8060S", unified: true }],
+  };
+
+  it("accepts unified GPUs without vramGb and requires vramGb on discrete ones", () => {
+    expect(declaredHardwareSchema.safeParse(STRIX).success).toBe(true);
+    const both = declaredHardwareSchema.safeParse({
+      gpus: [{ vendor: "amd", index: 0, unified: true, vramGb: 96 }],
+    });
+    expect(both.success).toBe(false);
+    expect(both.error?.issues.map((issue) => issue.path)).toEqual([["gpus", 0, "vramGb"]]);
+    const neither = declaredHardwareSchema.safeParse({ gpus: [{ vendor: "nvidia", index: 0 }] });
+    expect(neither.success).toBe(false);
+    expect(neither.error?.issues[0]?.message).toContain("needs vramGb");
+    expect(
+      declaredHardwareSchema.safeParse({
+        gpus: [{ vendor: "nvidia", index: 0, unified: false, vramGb: 24 }],
+      }).success,
+    ).toBe(true);
+  });
+
+  it("is accepted by nodes.update (node_update over MCP)", () => {
+    const input = nodesContract.update.input.safeParse({ nodeId: "node_1", hardware: STRIX });
+    expect(input.error?.issues ?? []).toEqual([]);
+  });
+
+  it("treats a declared unified GPU exactly like a detected one", () => {
+    const declared = effectiveHardware({
+      declaredResources: { ...STRIX, reservedVramGb: { "amd:0": 4 } },
+      nodeInfo: null,
+      nodeMetrics: null,
+      nodeMetricsAt: null,
+      heldClaims: [{ kind: "discrete", gpuCount: 1, vramGb: 60, ramGb: 2 }],
+      now: NOW,
+    });
+    expect(declared.gpus).toEqual([
+      {
+        key: "amd:0",
+        vendor: "amd",
+        index: 0,
+        name: "Radeon 8060S",
+        vramGb: null,
+        unified: true,
+        reservedVramGb: 4,
+        source: "browser",
+      },
+    ]);
+    // 128 − 4 reserved on the GPU − 2 headroom; the claim's VRAM is node memory.
+    expect(declared.usableMemoryGb).toBe(122);
+    expect(declared.reservedNowMemoryGb).toBe(62);
+    const detected = effectiveHardware({
+      declaredResources: { reservedVramGb: { "amd:0": 4 } },
+      nodeInfo: {
+        nodeKind: "unified",
+        unifiedMemoryMiB: 131072,
+        gpus: [{ vendor: "amd", index: 0, name: "Radeon 8060S", vramTotalMiB: 512, apu: true }],
+      },
+      nodeMetrics: null,
+      nodeMetricsAt: null,
+      heldClaims: [{ kind: "discrete", gpuCount: 1, vramGb: 60, ramGb: 2 }],
+      now: NOW,
+    });
+    expect(detected.gpus.map(({ source: _source, ...gpu }) => gpu)).toEqual(
+      declared.gpus.map(({ source: _source, ...gpu }) => gpu),
+    );
+    expect(detected.usableMemoryGb).toBe(declared.usableMemoryGb);
+    expect(detected.reservedNowMemoryGb).toBe(declared.reservedNowMemoryGb);
+  });
+
+  it("lets a declared unified GPU override a detected discrete reading of the same key", () => {
+    const hardware = effectiveHardware({
+      declaredResources: { gpus: [{ vendor: "nvidia", index: 0, unified: true }] },
+      nodeInfo: { nodeKind: "discrete", gpus: [{ vendor: "nvidia", index: 0, vramTotalMiB: 0 }] },
+      nodeMetrics: null,
+      nodeMetricsAt: null,
+      heldClaims: [],
+      now: NOW,
+    });
+    expect(hardware.gpus[0]).toMatchObject({ vramGb: null, unified: true, source: "browser" });
   });
 });
 

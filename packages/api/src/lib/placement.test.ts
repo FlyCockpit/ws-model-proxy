@@ -1351,6 +1351,30 @@ describe("unified GPUs (GB10, APUs)", () => {
     );
   });
 
+  it("places on a declared unified GPU (a hand-declared Strix Halo) from node memory", () => {
+    const strix = placementNodeOf(
+      nodeRow({
+        declaredResources: {
+          kind: "unified",
+          memoryGb: 128,
+          gpus: [{ vendor: "amd", index: 0, unified: true }],
+        },
+      }),
+      new Date(),
+    );
+    expect(strix.memoryGb).toBe(126);
+    expect(strix.gpus).toEqual([{ key: "amd:0", vendor: "amd", vramGb: 0, unified: true }]);
+    const planner = new PlacementPlanner(context({ nodes: [strix], fabrics: [] }));
+    const amd = (vramGb: number): RuntimeResource[] => [
+      { kind: "discrete", gpuCount: 1, vramGb, vendor: "amd" },
+    ];
+    expect(nodesOf(planner.place(request({ resources: amd(100) })))).toEqual(["b"]);
+    expect(planner.place(request({ resources: amd(30) })).ok).toBe(false);
+    expect(planner.place(request({ resources: [{ kind: "unified", memoryGb: 26 }] })).ok).toBe(
+      true,
+    );
+  });
+
   it("warns about low free memory counting VRAM on a unified GPU", () => {
     const planner = new PlacementPlanner(
       context({

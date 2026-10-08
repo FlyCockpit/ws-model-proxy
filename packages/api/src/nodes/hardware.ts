@@ -226,8 +226,13 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
       source,
     });
   };
-  for (const gpu of browser.gpus ?? []) addGpu(gpu, declaredSource);
-  for (const gpu of node.gpus ?? []) addGpu(gpu, "node");
+  // A declared unified GPU (`unified: true`, no `vramGb`) is shared like a detected one.
+  const declaredGpu = (gpu: NonNullable<DeclaredHardware["gpus"]>[number]) => ({
+    ...gpu,
+    vramGb: gpu.unified === true ? null : (gpu.vramGb ?? 0),
+  });
+  for (const gpu of browser.gpus ?? []) addGpu(declaredGpu(gpu), declaredSource);
+  for (const gpu of node.gpus ?? []) addGpu(declaredGpu(gpu), "node");
   // An integrated GPU (or one without VRAM of its own on a unified node: GB10 reports `[N/A]`)
   // shares system memory: no VRAM figure, placement counts it against node memory.
   for (const gpu of detectedGpus) {

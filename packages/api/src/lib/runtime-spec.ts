@@ -763,6 +763,34 @@ export const portRangeSchema = z
 const gpuKeySchema = z
   .string()
   .regex(/^(?:[A-Za-z0-9-]{1,64}|(?:nvidia|amd|intel|apple|other):[0-9]{1,3})$/);
+/**
+ * A declared GPU: `vramGb` of its own, or `unified: true` (an APU, GB10) sharing system memory,
+ * which has no `vramGb` (placement takes its VRAM from node memory).
+ */
+const declaredGpuSchema = z
+  .object({
+    vendor: z.enum(GPU_VENDORS),
+    index: z.number().int().min(0).max(255),
+    name: exactTextSchema(256).optional(),
+    vramGb: gib.optional(),
+    unified: z.boolean().optional(),
+  })
+  .strict()
+  .superRefine((gpu, ctx) => {
+    if (gpu.unified === true && gpu.vramGb !== undefined)
+      ctx.addIssue({
+        code: "custom",
+        path: ["vramGb"],
+        message: "A unified GPU shares system memory: omit vramGb.",
+      });
+    if (gpu.unified !== true && gpu.vramGb === undefined)
+      ctx.addIssue({
+        code: "custom",
+        path: ["vramGb"],
+        message: "A discrete GPU needs vramGb (or unified: true when it shares system memory).",
+      });
+  });
+
 export const declaredHardwareSchema = z
   .object({
     kind: z.enum(["cpu", "discrete", "unified"]).optional(),
@@ -779,19 +807,7 @@ export const declaredHardwareSchema = z
       )
       .refine((map) => Object.keys(map).length <= 256, "At most 256 GPUs.")
       .optional(),
-    gpus: z
-      .array(
-        z
-          .object({
-            vendor: z.enum(GPU_VENDORS),
-            index: z.number().int().min(0).max(255),
-            name: exactTextSchema(256).optional(),
-            vramGb: gib,
-          })
-          .strict(),
-      )
-      .max(32)
-      .optional(),
+    gpus: z.array(declaredGpuSchema).max(32).optional(),
   })
   .strict();
 export type DeclaredHardware = z.infer<typeof declaredHardwareSchema>;
