@@ -124,10 +124,29 @@ and restart it.", and the web app says "Upgrade wsmp on the node first."
 `--no-service`, run `wsmp service uninstall` first so the old unit stops
 restarting.
 
-Removed CLI commands: `connect`, `daemon *`, `token`, `endpoints *`, `reload`
-and the `config set-*` capability switches. Use `wsmp run`, `wsmp service` and
+Removed CLI commands: `connect`, `daemon *`, `token`, `endpoints *`, `reload`,
+`service env-sync` and `service env-path` (the service needs no environment
+file: the node credential and node secrets are files the relay reads; re-run
+`wsmp service install` and delete an old `service.env`), and the
+capability switches `config set-mcp-commands`, `set-file-read`,
+`set-remote-metric-sources`, `set-remote-engine-adapters`, `set-deployments`
+and `set-deployment-operator-terminal`. Use `wsmp run`, `wsmp service` and
 `wsmp trust`; runtimes are defined in the web app or through MCP, not with the
-CLI.
+CLI. A 0.3 `config.json` `endpoints` list is ignored and dropped on the next
+write. The remaining `wsmp config` setters are `set-server`, `set-slug`,
+`set-runtime-hosts`, `set-file-roots` / `clear-file-roots`, `set-file-tools`,
+`set-file-tools-as-root`, `set-human-terminal`, `set-terminal-approval` and
+`set-max-terminals`.
+
+New on the node: `wsmp runtime list` (the runtimes and instances the node
+holds, with phase, ports, units and stop proof) and `wsmp runtime test
+<slug|handle>` (one small request: status and latency), both read only and
+available at Relay only too; `wsmp status` lists the same runtimes and
+instances. `wsmp service restart` and `wsmp service logs [-f] [-n N]` manage
+the service, and `wsmp login --yes` takes the defaults without asking (it
+still needs `--trust`, and never turns browser terminals on). Hardware is
+declared on the node's page in the web app or through MCP; `wsmp hardware`
+only shows what the node detects.
 
 **Request bodies are sent with a Content-Length.** A node relays every request
 body with its exact length instead of chunked framing, so strict

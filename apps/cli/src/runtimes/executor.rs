@@ -22,6 +22,7 @@ use crate::protocol::frames::{InstancePhase, InstanceRecord, JobError, JobPhase,
 use crate::protocol::runtime_spec::{Management, Readiness, RuntimeSpec};
 
 const STATE_LIMIT: usize = 2 * 1024 * 1024;
+const INSTANCES_DIR: &str = "runtime-instances";
 const COMPLETED_LIMIT: usize = 128;
 /// A verified-stopped record keeps answering retries of its stop for this long.
 pub const STOPPED_RETENTION_SECS: u64 = 60 * 60;
@@ -1253,6 +1254,81 @@ impl Executor {
             })
             .collect()
     }
+}
+
+/// One rank as its record holds it (what `wsmp runtime list` and `wsmp status`
+/// show). Nothing here was checked against the machine.
+#[derive(Debug, Clone)]
+pub struct RankView {
+    pub job: Job,
+    pub phase: InstancePhase,
+    /// The step still unresolved on this rank, when one is.
+    pub pending: Option<JobPhase>,
+    /// The units the run was launched in (`external` and `self-detached`
+    /// steps ran outside units and are not listed).
+    pub units: Vec<String>,
+}
+
+impl Executor {
+    /// Every rank this file records, as recorded.
+    pub fn ranks(&self) -> Vec<RankView> {
+        self.state
+            .records
+            .values()
+            .map(|record| RankView {
+                job: record.job.clone(),
+                phase: record.phase,
+                pending: record.pending.as_ref().map(|pending| pending.action),
+                units: record
+                    .invocations
+                    .iter()
+                    .filter(|(_, invocation)| !outside(invocation))
+                    .map(|(unit, _)| unit.clone())
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// The stop proof as the inventory asks it (no status command runs):
+    /// `None` when the rank is proven stopped, else why not.
+    pub fn stop_unproven_now(
+        &self,
+        job: &Job,
+        runtime: &impl Runtime,
+        deadline: Deadline,
+    ) -> Result<Option<&'static str>> {
+        self.stop_unproven(job, runtime, deadline, false)
+    }
+}
+
+/// The directory of instance records (`<state>/runtime-instances`).
+pub fn instances_dir() -> Result<PathBuf> {
+    Ok(crate::paths::state_dir()?.join(INSTANCES_DIR))
+}
+
+/// Every instance record file in `dir`, read without a lock and without
+/// changing anything: expired stopped records are skipped, not removed.
+/// Files that cannot be read are named in the second list.
+pub fn read_all(dir: &std::path::Path) -> (Vec<Executor>, Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    paths.sort();
+    let mut executors = Vec::new();
+    let mut unreadable = Vec::new();
+    for path in paths {
+        match Executor::load(path.clone()) {
+            Ok(executor) if executor.expired() => {}
+            Ok(executor) => executors.push(executor),
+            Err(error) => unreadable.push(format!("`{}`: {error:#}", path.display())),
+        }
+    }
+    (executors, unreadable)
 }
 
 /// The machine as an interactive step sees it once a person's run of its

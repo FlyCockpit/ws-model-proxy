@@ -226,26 +226,13 @@ control direct and pool eligibility.
 
 ### Why is my model missing from the dashboard?
 
-1. Confirm the long-running daemon is active: `wsmp status --json`. It must
-   show a connected relay and an acknowledged inventory revision.
-2. Confirm the desired endpoint is enabled and its local probe state is visible
-   in the endpoint configuration. An offline enabled endpoint remains published
-   but is not executable.
-3. After any add, edit, disable, or removal, run `wsmp reload`. It succeeds only
-   after the server acknowledges the complete snapshot.
-   On Windows, use `wsmp reload --offline` only to probe and save local state;
-   it explicitly does not publish. Run the relay on Unix and use its live
-   `wsmp reload` to publish the inventory.
-4. Check the intended account/org and dashboard search. Search accepts client
-   model ID, upstream model ID, endpoint slug, and endpoint label.
-5. For systemd/LaunchAgent services, changed environment-held header secrets
-   require `wsmp service env-sync` and a service restart; reload cannot import a
-   service manager’s newly changed environment.
-
-A local probe being green does not by itself prove dashboard publication.
-`wsmp status` is the authoritative local diagnostic because it reports the
-live relay and its server-acknowledged revision.
-
+1. On the node, run `wsmp status`. It must show a connected relay, and the
+   runtime among the runtimes the node holds (or, for a startable runtime, an
+   instance that is `ready`).
+2. Run `wsmp runtime test <slug>` on the node. It sends one small request to
+   the runtime and reports the status and latency; a runtime that does not
+   answer there is not executable from the server either.
+3. Check the intended account/org and dashboard search.
 
 ## License
 

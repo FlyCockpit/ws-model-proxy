@@ -54,7 +54,6 @@ use std::time::{Duration, Instant};
 
 use crate::approvals::{approved_public_key, record_pending};
 use crate::child_env::{self, scrub_parent_env};
-use crate::config::Config;
 use crate::output_mask::StreamMasker;
 use crate::protocol::frames::{
     ExecState, ExecStatus, NODE_COMMAND_MAX_MS, NODE_COMMAND_TAIL_MAX_BYTES, TerminalIdentity,
@@ -189,10 +188,6 @@ fn push_scrollback(buf: &mut VecDeque<u8>, bytes: &[u8]) {
 
 fn user_home() -> Result<PathBuf, &'static str> {
     dirs::home_dir().ok_or("home directory is unavailable")
-}
-
-fn denied_env_names(config: &Config) -> Vec<String> {
-    crate::commands::service::required_service_env_names(config)
 }
 
 fn valid_id(id: &str) -> bool {
@@ -1486,7 +1481,6 @@ impl TerminalRegistry {
     pub(crate) fn open(
         &mut self,
         startup: &TerminalStartup,
-        config: &Config,
         state_dir: Option<&Path>,
         handshake: TermHandshake<'_>,
     ) -> Vec<OutboundFrame> {
@@ -1509,7 +1503,7 @@ impl TerminalRegistry {
         }
         #[cfg(not(unix))]
         {
-            let _ = (config, prepared);
+            let _ = prepared;
             vec![*handshake_rejected(&handshake, REASON_UNSUPPORTED)]
         }
         #[cfg(unix)]
@@ -1518,7 +1512,7 @@ impl TerminalRegistry {
                 Ok(nonce) => nonce,
                 Err(frame) => return vec![*frame],
             };
-            self.open_unix(startup, config, &handshake, prepared, cli_nonce, None)
+            self.open_unix(startup, &handshake, prepared, cli_nonce, None)
         }
     }
 
@@ -1526,7 +1520,6 @@ impl TerminalRegistry {
     fn open_unix(
         &mut self,
         startup: &TerminalStartup,
-        config: &Config,
         handshake: &TermHandshake<'_>,
         prepared: PreparedHandshake,
         cli_nonce: [u8; 16],
@@ -1576,7 +1569,7 @@ impl TerminalRegistry {
                 return vec![*handshake_rejected(handshake, REASON_SPAWN_FAILED)];
             }
         };
-        let env = terminal_env(config);
+        let env = terminal_env();
         let (program, args) = self.shell.clone().unwrap_or_else(child_env::login_shell);
         let pty = match spawn_pty(
             &program,
@@ -1686,7 +1679,6 @@ impl TerminalRegistry {
     pub(crate) fn auth(
         &mut self,
         startup: &TerminalStartup,
-        config: &Config,
         state_dir: Option<&Path>,
         terminal_id: &str,
         viewer_id: Option<&str>,
@@ -1787,7 +1779,6 @@ impl TerminalRegistry {
         {
             self.open_unix(
                 startup,
-                config,
                 &handshake,
                 prepared,
                 pending.cli_nonce,
@@ -2331,8 +2322,8 @@ impl Drop for TerminalRegistry {
 }
 
 #[cfg(unix)]
-fn terminal_env(config: &Config) -> Vec<(String, String)> {
-    let mut env = scrub_parent_env(&denied_env_names(config));
+fn terminal_env() -> Vec<(String, String)> {
+    let mut env = scrub_parent_env(&[]);
     env.retain(|(name, _)| name != "TERM");
     env.push(("TERM".to_string(), "xterm-256color".to_string()));
     env
@@ -2742,7 +2733,6 @@ impl ExecRegistry {
     pub(crate) fn start(
         &mut self,
         startup: &TerminalStartup,
-        config: &Config,
         command_id: &str,
         command: &str,
         cwd: Option<&str>,
@@ -2780,7 +2770,7 @@ impl ExecRegistry {
             }
         };
         let lifetime = Duration::from_millis(timeout_ms).min(self.command_max);
-        match spawn_exec(&self.tx, command_id, command, &cwd, config, lifetime) {
+        match spawn_exec(&self.tx, command_id, command, &cwd, lifetime) {
             Ok(session) => {
                 let frame = NodeFrame::ExecStarted {
                     command_id: command_id.to_string(),
@@ -3109,7 +3099,6 @@ fn spawn_exec(
     command_id: &str,
     command: &str,
     cwd: &Path,
-    config: &Config,
     lifetime: Duration,
 ) -> anyhow::Result<ExecSession> {
     let (program, flag) = child_env::exec_shell();
@@ -3122,7 +3111,7 @@ fn spawn_exec(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    for (name, value) in scrub_parent_env(&denied_env_names(config)) {
+    for (name, value) in scrub_parent_env(&[]) {
         process.env(name, value);
     }
     #[cfg(unix)]
@@ -3209,6 +3198,7 @@ mod tests {
 
     /// A command lifetime longer than any test.
     const TEST_TIMEOUT_MS: u64 = 600_000;
+    use crate::config::Config;
     use crate::terminal_crypto::CliTerminalKey;
 
     fn channel() -> (SyncSender<FromWorker>, mpsc::Receiver<FromWorker>) {
@@ -3254,7 +3244,6 @@ mod tests {
             let command = format!("python tree.py grandchild.pid root.pid {mode}");
             let frames = execs.start(
                 &enabled_startup(false),
-                &Config::default(),
                 "windows-tree",
                 &command,
                 Some(tree.cwd().to_str().expect("fixture cwd")),
@@ -3364,12 +3353,10 @@ mod tests {
             let (tx, _rx) = channel();
             let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
             let startup = enabled_startup(false);
-            let config = Config::default();
             // Refused: bad cwd, and the command carries a secret-looking token.
             let secret_cmd = "echo TOPSECRET_TOKEN_9f3a";
             let _ = execs.start(
                 &startup,
-                &config,
                 "ref1",
                 secret_cmd,
                 Some("relative"),
@@ -3407,7 +3394,6 @@ mod tests {
             let dir = cwd.path().to_string_lossy().into_owned();
             let started = execs.start(
                 &enabled_startup(false),
-                &Config::default(),
                 "started1",
                 command,
                 Some(&dir),
@@ -3444,21 +3430,13 @@ mod tests {
         let (tx, _rx) = channel();
         let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
         let startup = enabled_startup(false);
-        let config = Config::default();
-        let rejected = execs.start(
-            &startup,
-            &config,
-            "one",
-            &"a".repeat(4097),
-            None,
-            TEST_TIMEOUT_MS,
-        );
+        let rejected = execs.start(&startup, "one", &"a".repeat(4097), None, TEST_TIMEOUT_MS);
         assert!(matches!(
             &rejected[0],
             OutboundFrame::Control(NodeFrame::ExecRejected { reason, .. })
                 if reason == REASON_BAD_COMMAND
         ));
-        let rejected = execs.start(&startup, &config, "two", "echo\0no", None, TEST_TIMEOUT_MS);
+        let rejected = execs.start(&startup, "two", "echo\0no", None, TEST_TIMEOUT_MS);
         assert!(matches!(
             &rejected[0],
             OutboundFrame::Control(NodeFrame::ExecRejected { reason, .. })
@@ -3466,7 +3444,6 @@ mod tests {
         ));
         let rejected = execs.start(
             &startup,
-            &config,
             "three",
             "echo ok",
             Some("relative"),
@@ -3485,7 +3462,6 @@ mod tests {
             assert!(matches!(
                 execs.start(
                     &startup,
-                    &config,
                     &format!("cmd-{index}"),
                     slow_command(),
                     None,
@@ -3494,14 +3470,7 @@ mod tests {
                 OutboundFrame::Control(NodeFrame::ExecStarted { .. })
             ));
         }
-        let rejected = execs.start(
-            &startup,
-            &config,
-            "c",
-            slow_command(),
-            None,
-            TEST_TIMEOUT_MS,
-        );
+        let rejected = execs.start(&startup, "c", slow_command(), None, TEST_TIMEOUT_MS);
         assert!(matches!(
             &rejected[0],
             OutboundFrame::Control(NodeFrame::ExecRejected { reason, .. })
@@ -3582,14 +3551,7 @@ mod tests {
         let (tx, rx) = channel();
         let mut execs = ExecRegistry::new(tx, Duration::from_millis(200));
         let startup = enabled_startup(false);
-        execs.start(
-            &startup,
-            &Config::default(),
-            "slow",
-            slow_command(),
-            None,
-            TEST_TIMEOUT_MS,
-        );
+        execs.start(&startup, "slow", slow_command(), None, TEST_TIMEOUT_MS);
         std::thread::sleep(Duration::from_millis(350));
         let deadline = Instant::now() + Duration::from_secs(2);
         let frames = loop {
@@ -3642,7 +3604,6 @@ mod tests {
             let mut execs = ExecRegistry::new(tx, Duration::from_millis(200));
             execs.start(
                 &enabled_startup(false),
-                &Config::default(),
                 "slow",
                 slow_command(),
                 None,
@@ -3691,7 +3652,6 @@ mod tests {
             let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
             execs.start(
                 &enabled_startup(false),
-                &Config::default(),
                 "sleep",
                 slow_command(),
                 None,
@@ -3719,7 +3679,6 @@ mod tests {
         let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
         execs.start(
             &enabled_startup(false),
-            &Config::default(),
             "group",
             &command,
             Some(dir.path().to_str().expect("utf8")),
@@ -3770,7 +3729,6 @@ mod tests {
         let nonce = terminal_crypto::encode_b64url(&[9_u8; 16]);
         let frames = terminals.open(
             &startup,
-            &Config::default(),
             None,
             TermHandshake {
                 terminal_id: "term-1",
@@ -3828,7 +3786,6 @@ mod tests {
             let terminal_id = format!("t{opened}");
             let frames = terminals.open(
                 startup,
-                &Config::default(),
                 None,
                 TermHandshake {
                     terminal_id: &terminal_id,
@@ -3884,7 +3841,6 @@ mod tests {
         let nonce = terminal_crypto::encode_b64url(&[3_u8; 16]);
         terminals.open(
             &startup,
-            &Config::default(),
             None,
             TermHandshake {
                 terminal_id: "idle",
@@ -3995,7 +3951,6 @@ mod tests {
         let nonce = terminal_crypto::encode_b64url(&[4_u8; 16]);
         let frames = terminals.open(
             &startup,
-            &Config::default(),
             Some(dir.path()),
             TermHandshake {
                 terminal_id: "term-a",
@@ -4031,7 +3986,6 @@ mod tests {
         .expect("sign");
         let opened = terminals.auth(
             &startup,
-            &Config::default(),
             Some(dir.path()),
             "term-a",
             Some("viewer-a"),
@@ -4059,7 +4013,6 @@ mod tests {
         };
         execs.start(
             &enabled_startup(false),
-            &Config::default(),
             "sleep",
             command,
             None,
@@ -4117,7 +4070,6 @@ mod tests {
         let mut execs = ExecRegistry::new(tx, Duration::from_secs(30));
         execs.start(
             &enabled_startup(false),
-            &Config::default(),
             "group",
             &command,
             Some(dir.path().to_str().expect("utf8")),
@@ -4177,7 +4129,6 @@ mod tests {
         let nonce = terminal_crypto::encode_b64url(&[9_u8; 16]);
         terminals.open(
             &startup,
-            &Config::default(),
             None,
             TermHandshake {
                 terminal_id: "held",
@@ -4462,12 +4413,7 @@ mod tests {
         startup: &TerminalStartup,
         viewer: &mut TestViewer,
     ) -> Vec<OutboundFrame> {
-        let frames = terminals.open(
-            startup,
-            &Config::default(),
-            None,
-            viewer.handshake(MULTI_TERMINAL, 80, 24),
-        );
+        let frames = terminals.open(startup, None, viewer.handshake(MULTI_TERMINAL, 80, 24));
         viewer.bind(startup, MULTI_TERMINAL, &cli_nonce_of(&frames));
         frames
     }
@@ -4977,7 +4923,6 @@ mod tests {
         let mut a = TestViewer::new(1);
         let pending = terminals.open(
             &startup,
-            &Config::default(),
             Some(dir.path()),
             TermHandshake {
                 identity: Some(&identity_message),
@@ -4992,7 +4937,6 @@ mod tests {
         let a_id = a.id.clone();
         let opened = terminals.auth(
             &startup,
-            &Config::default(),
             Some(dir.path()),
             MULTI_TERMINAL,
             Some(&a_id),
@@ -5031,7 +4975,6 @@ mod tests {
         let c_id = c.id.clone();
         let wrong = terminals.auth(
             &startup,
-            &Config::default(),
             Some(dir.path()),
             MULTI_TERMINAL,
             Some(&c_id),
@@ -5053,7 +4996,6 @@ mod tests {
         nonces[1] = cli_nonce_of(&pending);
         let attached_c = terminals.auth(
             &startup,
-            &Config::default(),
             Some(dir.path()),
             MULTI_TERMINAL,
             Some(&c_id),
@@ -5062,7 +5004,6 @@ mod tests {
         let b_id = b.id.clone();
         let attached_b = terminals.auth(
             &startup,
-            &Config::default(),
             Some(dir.path()),
             MULTI_TERMINAL,
             Some(&b_id),
@@ -5283,7 +5224,6 @@ mod tests {
         let nonce = terminal_crypto::encode_b64url(&[9_u8; 16]);
         terminals.open(
             &startup,
-            &Config::default(),
             None,
             TermHandshake {
                 terminal_id: "jobs",
@@ -5425,7 +5365,6 @@ mod tests {
         let nonce = terminal_crypto::encode_b64url(&[9_u8; 16]);
         let opened = terminals.open(
             &startup,
-            &Config::default(),
             None,
             TermHandshake {
                 terminal_id: "exited",
@@ -5528,7 +5467,6 @@ mod tests {
         let nonce = terminal_crypto::encode_b64url(&[9_u8; 16]);
         terminals.open(
             &startup,
-            &Config::default(),
             None,
             TermHandshake {
                 terminal_id: "forced",
@@ -5549,7 +5487,6 @@ mod tests {
         let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
         execs.start(
             &startup,
-            &Config::default(),
             "forced",
             &format!("sleep 120 & echo $! > '{}'; wait", exec_file.display()),
             Some(dir.path().to_str().expect("utf8")),

@@ -1,6 +1,6 @@
 /**
  * Effective node hardware (spec §3.2): each field from the browser/agent declaration, else the
- * node's own declaration (`config.json` `hardware`, reported in `node.info.declared`), else
+ * node's own declaration (`node.info.declared`; the 0.4.0 node never sends one), else
  * detection (`node.info`). Pure: the procedures pass the stored JSON columns.
  */
 import { z } from "zod";

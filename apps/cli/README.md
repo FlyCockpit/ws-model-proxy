@@ -72,6 +72,7 @@ Useful flags:
 | `--human-terminal on\|off` | Allow browser terminals on this node. Asked next to trust on a terminal (default yes; not asked at Relay only, where they cannot open); without a terminal, the saved setting stays (`off` unless set) and login says so. |
 | `--service` / `--no-service` | Install and start the per-user service without asking, or skip it. |
 | `--replace` | Confirm a Replace code (below) without the prompt. |
+| `--yes`, `-y` | Ask nothing and take the defaults: the saved or hostname node name, and installing the service (unless `--no-service`). It never makes a security choice for you: it needs `--trust`, browser terminals stay as saved (`off` unless set) unless you pass `--human-terminal on`, and a Replace code still needs `--replace`. |
 | `--json` | Print the result as JSON. |
 
 **Node names** are 3 to 63 characters: lowercase letters, digits and single hyphens, starting
@@ -103,8 +104,10 @@ only; raise it with `wsmp trust full`.
 ```sh
 wsmp service install     # install, enable and start the per-user service
 wsmp service status      # what the service manager reports
+wsmp service restart     # restart it (after `wsmp login`, or to apply a setting read at start)
+wsmp service logs        # its logs; -f to follow, -n <lines> (default 100)
 wsmp service uninstall   # stop, disable and remove it
-wsmp status              # whether the relay runs and is connected
+wsmp status              # whether the relay runs and is connected, plus its runtimes and instances
 wsmp hardware            # what this node detects (memory, GPUs, unified pool); --json
 wsmp run                 # run the relay in the foreground (what the service runs)
 wsmp logout              # forget this node's credential
@@ -113,11 +116,17 @@ wsmp logout              # forget this node's credential
 `wsmp hardware` shows what placement falls back to when no hardware is declared: NVIDIA GPUs
 (a GB10 with no dedicated VRAM makes the node unified), AMD GPUs from sysfs (an APU such as Strix
 Halo reports VRAM carve-out plus GTT as its pool), and Apple silicon (the GPU wired limit). Check
-it before declaring overrides on the Nodes page.
+it before declaring overrides on the node's page in the web app (or through MCP); hardware is
+never declared on the node itself.
 
-The service is a systemd user unit on Linux and a launchd agent on macOS. `wsmp service
-env-sync` and `wsmp service env-path` manage the private (0600) environment file the service
-reads; the node credential needs no entry there.
+The service is a systemd user unit on Linux and a launchd agent on macOS. It needs no
+environment file: the node credential and node secrets (`wsmp secret`) are files the relay reads
+itself, and the unit pins only the config and state paths and the installing shell's `PATH`.
+`wsmp service logs` reads journald on Linux (`journalctl --user -u wsmp.service`; on a host whose
+journal is not persistent, user units may log only to the system journal, which needs
+`journalctl --user-unit wsmp.service` with journal read access) and tails
+`~/Library/Logs/ws-model-proxy/relay.*.log` on macOS. Upgrading from 0.3: run `wsmp service
+install` again so the unit stops loading `service.env`, then delete that file.
 
 **Linux: enable lingering.** A user service stops when you log out, and runtimes are started as
 transient user units, which need a user manager that outlives your sessions. Enable it once:
@@ -190,6 +199,22 @@ The server asks a node to do two different kinds of work:
   node's activity, and stop when trust is lowered. An agent can also queue a command for you
   (one that needs a password, for example); it runs only when you choose Run on the Terminals
   page.
+
+To see what this node holds and runs, read from its own files (the frozen copy at Relay only;
+both commands are read only and work at either trust level):
+
+```sh
+wsmp runtime list              # runtimes, and instances with phase, ports, units and stop proof
+wsmp runtime test <target>     # one small request: status and latency
+```
+
+`wsmp runtime test` takes a runtime slug, an instance handle (`i-...`) or an instance id. It asks
+a running instance's readiness route (else its model list, or a TCP connect for a service without
+readiness) and an always-on runtime's model list, and exits non-zero when the answer is not the
+expected one (3 when nothing matches). The stop proof `wsmp runtime list` shows for a stopping or
+stopped rank is the one the inventory reports: `proven`, or why not (`port_in_use`,
+`process_alive`, `status_unknown`, ...). To check the ports it binds each one for an instant, as
+the relay does; it writes nothing and runs no definition command. Runtimes are defined in the web app or through MCP.
 
 ## Other commands
 

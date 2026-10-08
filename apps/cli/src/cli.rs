@@ -62,6 +62,9 @@ pub enum Command {
     /// Run the relay in the foreground (what the service runs).
     Run(crate::commands::run::Args),
 
+    /// List the runtimes and instances this node holds, or test one.
+    Runtime(crate::commands::runtime::Args),
+
     /// Install or inspect a per-user operating-system service for the relay.
     Service(crate::commands::service::Args),
 

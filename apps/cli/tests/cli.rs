@@ -134,11 +134,7 @@ fn config_init_and_show_use_explicit_config_file() {
     show.args(["config", "--json", "show"]);
     let show_value = json_stdout(show);
     assert_eq!(show_value["version"], 3);
-    assert!(
-        show_value["endpoints"]
-            .as_array()
-            .is_some_and(Vec::is_empty)
-    );
+    assert!(show_value.get("endpoints").is_none());
 }
 
 #[test]
@@ -1070,63 +1066,109 @@ fn status_reports_a_relay_that_is_not_running() {
         .stdout(predicate::str::contains(r#""state":"not_running""#));
 }
 
-#[test]
-fn service_env_path_points_under_config_dir() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config").join("config.json");
-    let state = tmp.path().join("state");
-    let stdout = cli(&config, &state)
-        .args(["service", "env-path"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let path = String::from_utf8_lossy(&stdout);
-    assert!(
-        path.contains("service.env"),
-        "expected service.env path, got {path}"
-    );
-}
-
-#[test]
-fn service_env_sync_writes_private_file_without_echoing_secret() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config").join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({
-            "version": 1,
-            "endpoints": [{
-                "slug": "local", "label": "local", "baseUrl": "http://127.0.0.1:8000",
-                "headers": [{ "name": "Authorization", "env": "WSMP_SERVICE_SYNC_TOKEN" }]
-            }]
-        }),
-    );
-    let secret = "super-secret-service-token-value";
-    let assert = cli(&config, &state)
-        .args(["service", "env-sync"])
-        .env("WSMP_SERVICE_SYNC_TOKEN", secret)
-        .assert()
-        .success();
-    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
-    assert!(stdout.contains("WSMP_SERVICE_SYNC_TOKEN"));
-    assert!(
-        !stdout.contains(secret),
-        "env-sync must not print secret values"
-    );
-
-    let env_path = tmp.path().join("config").join("service.env");
-    let body = fs::read_to_string(&env_path).expect("service.env written");
-    assert!(body.contains("WSMP_SERVICE_SYNC_TOKEN="));
-    assert!(body.contains(secret));
+fn write_held_always_on(state: &Path, base_url: &str) {
+    fs::create_dir_all(state).expect("state dir");
+    let store = json!({
+        "version": 1,
+        "held": [{
+            "runtimeId": "rt-1", "versionId": "ver-1", "launchHash": "h", "kind": "always_on",
+            "slug": "local-llm",
+            "spec": {
+                "api": "openai", "engine": "ollama", "modelType": "llm",
+                "models": [{ "id": "llama3" }],
+                "address": { "baseUrl": base_url }
+            }
+        }]
+    });
+    let path = state.join("runtime-store.json");
+    fs::write(&path, serde_json::to_vec(&store).expect("json")).expect("write store");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(&env_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "service.env must be mode 0600");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
     }
+}
+
+#[test]
+fn runtime_list_and_status_show_the_held_runtimes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(&config, json!({ "version": 1, "trust": "full" }));
+    write_held_always_on(&state, "http://127.0.0.1:9");
+    let mut list = cli(&config, &state);
+    list.args(["runtime", "list", "--json"]);
+    let view = json_stdout(list);
+    assert_eq!(view["trust"], "full");
+    assert_eq!(view["definitions"], "live");
+    assert_eq!(view["runtimes"][0]["slug"], "local-llm");
+    assert_eq!(view["runtimes"][0]["kind"], "always_on");
+    assert_eq!(view["runtimes"][0]["models"][0], "llama3");
+    assert_eq!(view["instances"], json!([]));
+    cli(&config, &state)
+        .args(["runtime", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("local-llm  always_on"));
+    let mut status = cli(&config, &state);
+    status.args(["status", "--json"]);
+    let status = json_stdout(status);
+    assert_eq!(status["state"], "not_running");
+    assert_eq!(status["runtimes"][0]["slug"], "local-llm");
+    cli(&config, &state)
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("relay: not running"))
+        .stdout(predicate::str::contains("local-llm  always_on"));
+}
+
+#[test]
+fn runtime_test_asks_the_model_list_and_reports_status_and_latency() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(&config, json!({ "version": 1, "trust": "relay" }));
+    let server = TestServer::start(vec![(
+        "/v1/models",
+        200,
+        json!({ "data": [{ "id": "llama3" }, { "id": "qwen" }] }),
+    )]);
+    write_held_always_on(&state, &server.base_url);
+    let mut test = cli(&config, &state);
+    test.args(["runtime", "test", "local-llm", "--json"]);
+    let results = json_stdout(test);
+    assert_eq!(results[0]["target"], "local-llm");
+    assert_eq!(results[0]["ok"], true);
+    assert_eq!(results[0]["status"], 200);
+    assert_eq!(results[0]["models"], 2);
+    assert!(results[0]["latencyMs"].is_u64());
+    let request = server.requests.recv().expect("one request");
+    assert!(request.starts_with("GET /v1/models "), "{request}");
+    server.join();
+    cli(&config, &state)
+        .args(["runtime", "test", "nope"])
+        .assert()
+        .code(3);
+}
+
+#[test]
+fn service_offers_restart_and_logs_and_no_env_file_commands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args(["service", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("restart"))
+        .stdout(predicate::str::contains("logs"))
+        .stdout(predicate::str::contains("env-sync").not())
+        .stdout(predicate::str::contains("env-path").not());
+    cli(&config, &state)
+        .args(["service", "env-sync"])
+        .assert()
+        .code(2);
 }
 
 #[test]

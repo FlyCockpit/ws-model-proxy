@@ -12,6 +12,11 @@
 //! 4. Write `config.json` and `node-credential.json` (0600).
 //! 5. Offer the per-user service (`--service`/`--no-service`).
 //!
+//! `--yes` takes every default without asking (the node name, installing the
+//! service) except the security choices: it needs `--trust`, browser
+//! terminals stay as saved unless `--human-terminal` says otherwise, and a
+//! Replace code still needs `--replace`.
+//!
 //! The code comes from `--code`, else `WSMP_ENROLL_CODE` (kept out of shell
 //! history), else a prompt. It is never printed or logged.
 
@@ -61,6 +66,13 @@ pub struct Args {
     /// Do not install the service (run `wsmp run` yourself).
     #[arg(long)]
     no_service: bool,
+    /// Take the defaults without asking: the saved or hostname node name,
+    /// and installing the service (unless `--no-service`). Never a security
+    /// choice: it needs `--trust`, leaves browser terminals as saved (off
+    /// unless set) unless `--human-terminal` is given, and a Replace code
+    /// still needs `--replace`.
+    #[arg(long, short = 'y', requires = "trust")]
+    yes: bool,
     /// Emit JSON instead of human-readable text.
     #[arg(long)]
     json: bool,
@@ -154,7 +166,7 @@ pub fn run(args: &Args) -> Result<()> {
                     "This replaces node {old}: its runtimes and traffic move to this machine."
                 ))?;
                 anyhow::ensure!(
-                    interactive() && ask("Type yes to continue: ")?.trim() == "yes",
+                    asks(args) && ask("Type yes to continue: ")?.trim() == "yes",
                     "not replaced; pass `--replace` to confirm"
                 );
                 replace_confirmed = true;
@@ -219,7 +231,12 @@ pub fn run(args: &Args) -> Result<()> {
     let allow_human_terminal = config.allow_human_terminal;
     if human_terminal.is_none() && trust == TrustValue::Full {
         output::diagnostic(format!(
-            "warning: no terminal to ask, so browser terminals stay {}; set them with `--human-terminal on|off` or `wsmp config set-human-terminal on|off`",
+            "warning: {}, so browser terminals stay {}; set them with `--human-terminal on|off` or `wsmp config set-human-terminal on|off`",
+            if args.yes {
+                "not asked (`--yes`)"
+            } else {
+                "no terminal to ask"
+            },
             on_off(allow_human_terminal)
         ))?;
     }
@@ -318,6 +335,11 @@ fn interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
+/// Whether login may prompt: on a terminal, and not told `--yes`.
+fn asks(args: &Args) -> bool {
+    !args.yes && interactive()
+}
+
 fn ask(text: &str) -> Result<String> {
     let mut err = std::io::stderr().lock();
     write!(err, "{text}").context("writing the prompt")?;
@@ -339,7 +361,7 @@ fn enrollment_code(args: &Args) -> Result<String> {
         Some(code) => code.clone(),
         None => match std::env::var(CODE_ENV) {
             Ok(code) if !code.is_empty() => code,
-            _ if interactive() => ask("Enrollment code: ")?.trim().to_string(),
+            _ if asks(args) => ask("Enrollment code: ")?.trim().to_string(),
             _ => {
                 anyhow::bail!("pass `--code` (or set `{CODE_ENV}`); mint a code on the Nodes page")
             }
@@ -361,7 +383,7 @@ fn requested_slug(args: &Args, saved: Option<&str>) -> Result<String> {
         .filter(|slug| validate_slug(slug).is_ok())
         .map(str::to_string)
         .or_else(hostname_slug);
-    if !interactive() {
+    if !asks(args) {
         return default.context(
             "no node slug can be derived from this machine's hostname; pass `--slug <slug>`",
         );
@@ -487,7 +509,7 @@ fn choose_human_terminal(args: &Args, trust: TrustValue) -> Result<Option<bool>>
     if let Some(state) = args.human_terminal {
         return Ok(Some(state.enabled()));
     }
-    if trust == TrustValue::Relay || !interactive() {
+    if trust == TrustValue::Relay || !asks(args) {
         return Ok(None);
     }
     output::diagnostic(
@@ -519,7 +541,9 @@ fn offer_service(args: &Args) -> Result<bool> {
     if args.no_service {
         return Ok(false);
     }
+    // `--yes` takes the default only where a per-user service exists.
     let install = args.service
+        || (args.yes && cfg!(any(target_os = "linux", target_os = "macos")))
         || (interactive()
             && matches!(
                 ask("Install as a service so it starts at boot? [Y/n]: ")?
@@ -531,7 +555,7 @@ fn offer_service(args: &Args) -> Result<bool> {
     if !install {
         return Ok(false);
     }
-    crate::commands::service::install()?;
+    crate::commands::service::install(args.json)?;
     Ok(true)
 }
 
@@ -569,6 +593,29 @@ mod tests {
         let mut argv = vec!["wsmp", "https://wsmp.example.com"];
         argv.extend_from_slice(extra);
         Wrapper::try_parse_from(argv).expect("login args").args
+    }
+
+    #[test]
+    fn yes_needs_an_explicit_trust_and_never_turns_terminals_on() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: Args,
+        }
+        assert!(Wrapper::try_parse_from(["wsmp", "https://x.example", "--yes"]).is_err());
+        let args = login_args(&["--yes", "--trust", "full"]);
+        assert!(!asks(&args));
+        // Not asked: the saved setting stays.
+        assert_eq!(
+            choose_human_terminal(&args, TrustValue::Full).unwrap(),
+            None
+        );
+        let on = login_args(&["--yes", "--trust", "full", "--human-terminal", "on"]);
+        assert_eq!(
+            choose_human_terminal(&on, TrustValue::Full).unwrap(),
+            Some(true)
+        );
     }
 
     #[test]

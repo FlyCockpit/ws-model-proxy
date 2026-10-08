@@ -453,12 +453,7 @@ fn browser_shells_stay_refused_at_relay_only() {
     let mut terminals = multi_registry(tx);
     let startup = relay_startup();
     let a = TestViewer::new(1);
-    let frames = terminals.open(
-        &startup,
-        &Config::default(),
-        None,
-        a.handshake("term-shell", 80, 24),
-    );
+    let frames = terminals.open(&startup, None, a.handshake("term-shell", 80, 24));
     assert!(rejection(&frames).is_some());
     assert!(terminals.sessions.is_empty());
 }
@@ -604,7 +599,6 @@ fn queue_shell_approval(terminals: &mut TerminalRegistry, dir: &Path) {
     let nonce = terminal_crypto::encode_b64url(&[4_u8; 16]);
     let frames = terminals.open(
         &startup,
-        &Config::default(),
         Some(dir),
         TermHandshake {
             terminal_id: "term-shell",
@@ -633,7 +627,6 @@ fn a_shell_waiting_for_approval_never_spawns_after_a_lowering() {
     assert!(terminals.pending.is_empty());
     let frames = terminals.auth(
         &relay_startup(),
-        &Config::default(),
         Some(dir.path()),
         "term-shell",
         Some("viewer-a"),
@@ -652,7 +645,6 @@ fn an_approval_is_checked_against_the_trust_of_its_auth() {
     // The node is Relay only by the time the approval arrives.
     let frames = terminals.auth(
         &relay_startup(),
-        &Config::default(),
         Some(dir.path()),
         "term-shell",
         Some("viewer-a"),

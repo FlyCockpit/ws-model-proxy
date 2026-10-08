@@ -124,8 +124,8 @@ pub(crate) enum OperatorDelivery {
 /// The scrubbed environment an operator command starts from (the browser
 /// terminal environment: denied names removed, `TERM`, `WSMP_JOB=1`).
 #[cfg(unix)]
-pub(crate) fn operator_base_env(config: &crate::config::Config) -> Vec<(String, String)> {
-    super::terminal_env(config)
+pub(crate) fn operator_base_env() -> Vec<(String, String)> {
+    super::terminal_env()
 }
 
 /// The screen bytes, cut for sealing.

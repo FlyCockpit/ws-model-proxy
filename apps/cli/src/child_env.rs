@@ -28,8 +28,8 @@ pub struct ScrubOptions<'a> {
 
 /// Keep the allowlist, then apply the denylist on top.
 ///
-/// Denied names are the CLI token env var, `required_service_env_names`, and
-/// anything starting with `WSMP_`. Values that start with a `wsmp_*` credential
+/// Denied names are the caller's `denied_names` and anything starting with
+/// `WSMP_`. Values that start with a `wsmp_*` credential
 /// prefix are dropped even when the name is allowlisted.
 pub fn scrub_env(entries: &[(&str, &str)], options: &ScrubOptions<'_>) -> Vec<(String, String)> {
     entries
