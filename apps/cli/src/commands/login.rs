@@ -105,6 +105,9 @@ pub fn run(args: &Args) -> Result<()> {
     // Enrolling raises nothing by itself (provisioning from a system service
     // works); clearing a leftover lowering is checked like `wsmp trust full`.
     crate::trust::refuse_marked("wsmp login")?;
+    // Enrolling stays marker-only, but what `config set-human-terminal on` and
+    // `wsmp service install` refuse from a process wsmp started, login skips there too.
+    let started_by_wsmp = crate::trust::self_started_by_wsmp();
     let server_url = normalize_server_url(&args.url)?;
     if let Some(warning) = server_url_http_warning(&server_url) {
         output::diagnostic(warning)?;
@@ -217,6 +220,11 @@ pub fn run(args: &Args) -> Result<()> {
     {
         let _lock = ConfigLock::exclusive()?;
         let mut config = Config::load()?;
+        let (human_terminal, skipped) =
+            terminal_choice(human_terminal, config.allow_human_terminal, started_by_wsmp);
+        if let Some(line) = skipped {
+            output::diagnostic(line)?;
+        }
         human_terminal_changed = config.server_url.is_some()
             && human_terminal.is_some_and(|allow| allow != config.allow_human_terminal);
         let mut clear = false;
@@ -297,7 +305,7 @@ pub fn run(args: &Args) -> Result<()> {
             on_off(allow_human_terminal)
         ))?;
     }
-    let service_installed = offer_service(args)?;
+    let service_installed = offer_service(args, started_by_wsmp)?;
     // A relay already running reads the setting only when it starts.
     if human_terminal_changed && !service_installed {
         output::diagnostic(
@@ -664,6 +672,37 @@ fn choose_human_terminal(args: &Args, trust: TrustValue) -> Result<Option<bool>>
     }
 }
 
+/// The browser-terminal choice to save. From a process wsmp started, turning
+/// terminals on (when that changes the saved value) is skipped, with the line
+/// to print; turning them off or leaving them as saved is kept.
+fn terminal_choice(
+    requested: Option<bool>,
+    saved: bool,
+    started_by_wsmp: Option<&str>,
+) -> (Option<bool>, Option<String>) {
+    match (requested, started_by_wsmp) {
+        (Some(true), Some(reason)) if !saved => (
+            None,
+            Some(format!(
+                "skipped turning browser terminals on: {}; run `wsmp config set-human-terminal on` on a terminal",
+                crate::trust::refusal("wsmp config set-human-terminal on", reason)
+            )),
+        ),
+        _ => (requested, None),
+    }
+}
+
+/// Why the service step is skipped (the line to print): installing or
+/// restarting it would, from a process wsmp started. Silent when login would
+/// not have offered it.
+fn service_skip(would_offer: bool, started_by_wsmp: Option<&str>) -> Option<String> {
+    let reason = started_by_wsmp.filter(|_| would_offer)?;
+    Some(format!(
+        "skipped installing the service: {}; run `wsmp service install` on a terminal",
+        crate::trust::refusal("wsmp service install", reason)
+    ))
+}
+
 /// A `[Y/n]` answer: empty takes `default`; anything else unclear is `None`.
 fn yes_no(answer: &str, default: bool) -> Option<bool> {
     match answer.trim().to_ascii_lowercase().as_str() {
@@ -678,8 +717,12 @@ fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
 
-fn offer_service(args: &Args) -> Result<bool> {
+fn offer_service(args: &Args, started_by_wsmp: Option<&str>) -> Result<bool> {
     if args.no_service {
+        return Ok(false);
+    }
+    if let Some(line) = service_skip(args.service || args.yes || interactive(), started_by_wsmp) {
+        output::diagnostic(line)?;
         return Ok(false);
     }
     // `--yes` takes the default only where a per-user service exists.
@@ -712,6 +755,37 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_process_wsmp_started_never_turns_terminals_on() {
+        let why = Some("its parent processes do not lead back to a terminal or an SSH session");
+        // Turning them on from off is skipped, with one line saying why.
+        let (choice, line) = terminal_choice(Some(true), false, why);
+        assert_eq!(choice, None);
+        let line = line.expect("a skip line");
+        assert!(
+            line.starts_with("skipped turning browser terminals on"),
+            "{line}"
+        );
+        assert!(line.contains("cannot run from a command, job or terminal wsmp started"));
+        // Off, unchanged, or not asked: kept.
+        assert_eq!(terminal_choice(Some(false), true, why), (Some(false), None));
+        assert_eq!(terminal_choice(Some(true), true, why), (Some(true), None));
+        assert_eq!(terminal_choice(None, false, why), (None, None));
+        // From a terminal: whatever was chosen.
+        assert_eq!(terminal_choice(Some(true), false, None), (Some(true), None));
+    }
+
+    #[test]
+    fn a_process_wsmp_started_never_installs_the_service() {
+        let why = Some("it runs in a service of your systemd user manager");
+        let line = service_skip(true, why).expect("a skip line");
+        assert!(line.starts_with("skipped installing the service"), "{line}");
+        assert!(line.contains("wsmp service install"));
+        // Not offered anyway, or from a terminal: nothing to skip.
+        assert_eq!(service_skip(false, why), None);
+        assert_eq!(service_skip(true, None), None);
+    }
 
     #[test]
     fn browser_terminal_answers_default_to_yes() {

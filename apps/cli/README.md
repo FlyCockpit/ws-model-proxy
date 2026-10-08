@@ -168,13 +168,15 @@ units), descends from a running relay, runs as a service of your systemd user ma
 session (so cron, at and system services such as cloud-init are refused). A shell in a terminal,
 tmux or an SSH session passes; a terminal that a user service runs (some compositors, editors)
 does not, so use another terminal or SSH. `wsmp login` itself only checks `WSMP_JOB`, so it works
-from provisioning, but clearing an earlier Relay-only setting takes this check.
+from provisioning, but clearing an earlier Relay-only setting takes this check, and from a process
+that fails it login skips installing the service and turning browser terminals on (it says which
+step it skipped; run `wsmp service install` or `wsmp config set-human-terminal on` on a terminal).
 
 The same refusal covers every command that changes wsmp itself: `wsmp login`, `wsmp secret
 set|remove`, the `wsmp config` setters (`init`, `set-…`, `clear-file-roots`), `wsmp service
-install|uninstall|env-sync`, `wsmp logout`, `wsmp terminal approve` and `wsmp recover --apply`.
+install|uninstall|restart`, `wsmp logout`, `wsmp terminal approve` and `wsmp recover --apply`.
 `wsmp run` checks only `WSMP_JOB`, since the relay's own service starts it. Reading (`wsmp config
-show|path`, `wsmp service status|env-path`, listings) and lowering (`wsmp trust relay`, `wsmp
+show|path`, `wsmp service status|logs`, `wsmp runtime list|test`, listings) and lowering (`wsmp trust relay`, `wsmp
 terminal approvals revoke`) work from anywhere.
 
 This is a **best-effort guard against agents** raising or widening their own access through the
