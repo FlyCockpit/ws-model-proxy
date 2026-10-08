@@ -923,7 +923,23 @@
         "AUDIO": "Un pool de transcripción convierte el audio en texto.",
         "VIDEO": "Un pool LLM describe cada video."
       },
-      "unavailable": "{{id}} (ya no disponible)"
+      "unavailable": "{{id}} (ya no disponible)",
+      "pipeline": "Flujo",
+      "as": {
+        "IMAGE": "describe",
+        "AUDIO": "transcribe",
+        "VIDEO": "describe"
+      },
+      "direct": "se envía tal cual",
+      "timeout": "Tiempo límite (segundos)",
+      "maxAssets": {
+        "IMAGE": "Máximo de imágenes por solicitud",
+        "AUDIO": "Máximo de audios por solicitud",
+        "VIDEO": "Máximo de videos por solicitud"
+      },
+      "automatic": "Automático",
+      "limitsHint": "Deja un límite vacío para mantenerlo automático.",
+      "rangeInvalid": "Un número entero de {{min}} a {{max}}, o vacío."
     },
     "aliases": {
       "title": "Alias de nombres de modelo",

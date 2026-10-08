@@ -923,7 +923,23 @@
         "AUDIO": "A transcription pool turns audio into text.",
         "VIDEO": "An LLM pool describes each video."
       },
-      "unavailable": "{{id}} (no longer available)"
+      "unavailable": "{{id}} (no longer available)",
+      "pipeline": "Pipeline",
+      "as": {
+        "IMAGE": "describes",
+        "AUDIO": "transcribes",
+        "VIDEO": "describes"
+      },
+      "direct": "sent as is",
+      "timeout": "Timeout (seconds)",
+      "maxAssets": {
+        "IMAGE": "Max images per request",
+        "AUDIO": "Max audio files per request",
+        "VIDEO": "Max videos per request"
+      },
+      "automatic": "Automatic",
+      "limitsHint": "Leave a limit empty to keep it automatic.",
+      "rangeInvalid": "A whole number from {{min}} to {{max}}, or empty."
     },
     "aliases": {
       "title": "Model-name aliases",
