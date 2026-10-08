@@ -54,7 +54,9 @@
     "poolCount_other": "{{count}} pools",
     "loadFailed": "Could not load your API keys.",
     "revokeTitle": "Revoke {{name}}?",
-    "revokeDescription": "Programs using this key stop working at once. This cannot be undone."
+    "revokeDescription": "Programs using this key stop working at once. This cannot be undone.",
+    "canUse": "Can use",
+    "poolGone": "A pool you can no longer use"
   },
   "agents": {
     "mcpUrl": "MCP URL",
@@ -187,11 +189,58 @@
     "yourModels": "Your models in this pool",
     "noModels": "You contribute nothing to this pool yet.",
     "ownHardwareOnly": "The owner routes to their own hardware only for now: your models stay listed but get no traffic.",
-    "addHint": "Add one of your served models from the pool's page."
+    "addTitle": "Contribute a served model",
+    "addDescription": "Pick a pool shared with you, then one of your served models of the same type. It serves that pool's requests alongside the owner's models until you withdraw it.",
+    "allOwnHardwareOnly": "Every pool you may contribute to is routed to its owner's hardware only for now.",
+    "pool": "Pool shared with you",
+    "pickPool": "Pick a pool",
+    "choosePool": "Choose a pool.",
+    "model": "Your served model",
+    "pickModel": "Pick a model",
+    "chooseModel": "Choose one of your served models.",
+    "noMatchingModels": "You serve no {{type}} model that is not in this pool yet.",
+    "add": "Add",
+    "adding": "Adding…",
+    "added": "Model added to the pool",
+    "addToShared": "Add to a pool shared with me",
+    "poolFrom": "{{pool}} (from {{email}})",
+    "withdraw": "Withdraw",
+    "withdrawTitle": "Withdraw {{model}} from {{pool}}?",
+    "withdrawDescription": "The pool stops sending requests to this model. You can add it again later.",
+    "withdrawn": "Model withdrawn"
   },
   "modelType": {
     "LLM": "Language model",
     "EMBEDDINGS": "Embeddings",
     "TRANSCRIPTION": "Transcription"
+  },
+  "fork": {
+    "sectionTitle": "Runtime definitions shared with you",
+    "sectionDescription": "Read-only definitions someone shared with you. Fork one to get your own runtime from its current version.",
+    "loadFailed": "Could not load the runtime definitions shared with you.",
+    "empty": "No runtime definitions are shared with you.",
+    "version": "version {{version}}",
+    "action": "Fork to my node",
+    "actionStartable": "Fork",
+    "title": "Fork {{name}}",
+    "description": "Your copy starts at version 1. Later changes by its owner do not reach it.",
+    "nodeRequired": "Pick the node it runs on.",
+    "nodesFailed": "Your nodes could not be loaded. Try again later.",
+    "noNodes": "You have no nodes yet. Add a node first.",
+    "startableHint": "This runtime starts on demand, on any of your nodes that fits it, so it needs no node now.",
+    "submit": "Fork",
+    "forking": "Forking…",
+    "done": "Runtime forked"
+  },
+  "ownKey": {
+    "label": "Cloud fallback key",
+    "ownerKey": "The owner's key (default)",
+    "hint": "When this pool falls back to the cloud, the owner lets you pay with your own key instead, using one of your provider models that stands in for {{model}}.",
+    "loadFailed": "Your provider models could not be loaded.",
+    "noModels": "You have no provider models to use your own key with.",
+    "addProvider": "Add a provider",
+    "unavailable": "A model you no longer have",
+    "saved": "Your own key is used for this pool's cloud fallback",
+    "cleared": "The owner's key is used again"
   }
 }

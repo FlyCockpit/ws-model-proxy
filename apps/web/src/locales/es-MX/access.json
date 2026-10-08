@@ -54,7 +54,9 @@
     "poolCount_other": "{{count}} pools",
     "loadFailed": "No se pudieron cargar tus claves de API.",
     "revokeTitle": "¿Revocar {{name}}?",
-    "revokeDescription": "Los programas que usan esta clave dejan de funcionar de inmediato. No se puede deshacer."
+    "revokeDescription": "Los programas que usan esta clave dejan de funcionar de inmediato. No se puede deshacer.",
+    "canUse": "Puede usar",
+    "poolGone": "Un pool que ya no puedes usar"
   },
   "agents": {
     "mcpUrl": "URL de MCP",
@@ -187,11 +189,58 @@
     "yourModels": "Tus modelos en este pool",
     "noModels": "Todavía no contribuyes nada a este pool.",
     "ownHardwareOnly": "Por ahora el dueño solo enruta a su propio hardware: tus modelos siguen en la lista pero no reciben tráfico.",
-    "addHint": "Agrega uno de tus modelos servidos desde la página del pool."
+    "addTitle": "Contribuye un modelo servido",
+    "addDescription": "Elige un pool compartido contigo y luego uno de tus modelos servidos del mismo tipo. Atiende las solicitudes de ese pool junto a los modelos del dueño hasta que lo retires.",
+    "allOwnHardwareOnly": "Por ahora, todos los pools a los que puedes contribuir se enrutan solo al hardware de su dueño.",
+    "pool": "Pool compartido contigo",
+    "pickPool": "Elige un pool",
+    "choosePool": "Elige un pool.",
+    "model": "Tu modelo servido",
+    "pickModel": "Elige un modelo",
+    "chooseModel": "Elige uno de tus modelos servidos.",
+    "noMatchingModels": "No sirves ningún modelo {{type}} que no esté ya en este pool.",
+    "add": "Agregar",
+    "adding": "Agregando…",
+    "added": "Modelo agregado al pool",
+    "addToShared": "Agregar a un pool compartido conmigo",
+    "poolFrom": "{{pool}} (de {{email}})",
+    "withdraw": "Retirar",
+    "withdrawTitle": "¿Retirar {{model}} de {{pool}}?",
+    "withdrawDescription": "El pool deja de enviar solicitudes a este modelo. Puedes agregarlo de nuevo después.",
+    "withdrawn": "Modelo retirado"
   },
   "modelType": {
     "LLM": "Modelo de lenguaje",
     "EMBEDDINGS": "Embeddings",
     "TRANSCRIPTION": "Transcripción"
+  },
+  "fork": {
+    "sectionTitle": "Definiciones de runtime compartidas contigo",
+    "sectionDescription": "Definiciones de solo lectura que alguien compartió contigo. Haz un fork para tener tu propio runtime a partir de su versión actual.",
+    "loadFailed": "No se pudieron cargar las definiciones de runtime compartidas contigo.",
+    "empty": "No hay definiciones de runtime compartidas contigo.",
+    "version": "versión {{version}}",
+    "action": "Fork a mi nodo",
+    "actionStartable": "Hacer fork",
+    "title": "Fork de {{name}}",
+    "description": "Tu copia empieza en la versión 1. Los cambios posteriores de su dueño no le llegan.",
+    "nodeRequired": "Elige el nodo donde corre.",
+    "nodesFailed": "No se pudieron cargar tus nodos. Inténtalo más tarde.",
+    "noNodes": "Todavía no tienes nodos. Agrega un nodo primero.",
+    "startableHint": "Este runtime arranca bajo demanda, en cualquiera de tus nodos donde quepa, así que ahora no necesita nodo.",
+    "submit": "Hacer fork",
+    "forking": "Haciendo fork…",
+    "done": "Fork del runtime creado"
+  },
+  "ownKey": {
+    "label": "Clave para el respaldo en la nube",
+    "ownerKey": "La clave del dueño (predeterminada)",
+    "hint": "Cuando este pool recurre a la nube, el dueño te permite pagar con tu propia clave, usando uno de tus modelos de proveedor que sustituya a {{model}}.",
+    "loadFailed": "No se pudieron cargar tus modelos de proveedor.",
+    "noModels": "No tienes modelos de proveedor con los que usar tu propia clave.",
+    "addProvider": "Agregar un proveedor",
+    "unavailable": "Un modelo que ya no tienes",
+    "saved": "Se usa tu propia clave para el respaldo en la nube de este pool",
+    "cleared": "Se vuelve a usar la clave del dueño"
   }
 }

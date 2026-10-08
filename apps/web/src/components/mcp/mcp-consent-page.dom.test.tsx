@@ -43,7 +43,20 @@ const USABLE_SEARCH = {
   sig: "sig-1",
 };
 
-function renderPage(search: Record<string, unknown> = USABLE_SEARCH) {
+/** The raw URL as the authorize endpoint signs it: every signed name listed in ba_param. */
+function signedRawSearch(redirectUri: string | null, extra = "") {
+  const params = new URLSearchParams({ client_id: "mcp-client-1", scope: "mcp:read" });
+  if (redirectUri !== null) params.set("redirect_uri", redirectUri);
+  for (const name of [...params.keys(), "ba_param"].sort()) params.append("ba_param", name);
+  params.append("sig", "sig-1");
+  return `?${params.toString()}${extra}`;
+}
+const SIGNED_RAW_SEARCH = signedRawSearch("https://client.example/cb");
+
+function renderPage(
+  search: Record<string, unknown> = USABLE_SEARCH,
+  rawSearch: string = SIGNED_RAW_SEARCH,
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -51,7 +64,7 @@ function renderPage(search: Record<string, unknown> = USABLE_SEARCH) {
   // global is stubbed (probe-verified working in this environment).
   vi.stubGlobal("location", {
     assign: assignMock,
-    search: window.location.search,
+    search: rawSearch,
   });
   return {
     client,
@@ -201,7 +214,7 @@ describe("McpConsentPage failure states (R83/R84 F4)", () => {
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
     });
-    vi.stubGlobal("location", { assign: assignMock, search: window.location.search });
+    vi.stubGlobal("location", { assign: assignMock, search: SIGNED_RAW_SEARCH });
     render(
       <StrictMode>
         <QueryClientProvider client={client}>
@@ -260,7 +273,6 @@ describe("McpConsentPage failure states (R83/R84 F4)", () => {
   });
 
   it("obsolete completion after transaction replacement: no setState, no navigation (R85 N2)", async () => {
-    vi.stubGlobal("location", { assign: assignMock, search: "?client_id=mcp-client-1&sig=sig-1" });
     publicClientMock.mockResolvedValue({
       data: { client_id: "mcp-client-1", client_name: "Client" },
       error: null,
@@ -302,7 +314,6 @@ describe("McpConsentPage failure states (R83/R84 F4)", () => {
   });
 
   it("pending completion after UNMOUNT: no navigation, no setState (R85 N2)", async () => {
-    vi.stubGlobal("location", { assign: assignMock, search: "?client_id=mcp-client-1&sig=sig-1" });
     publicClientMock.mockResolvedValue({
       data: { client_id: "mcp-client-1", client_name: "Client" },
       error: null,
@@ -327,6 +338,57 @@ describe("McpConsentPage failure states (R83/R84 F4)", () => {
       release({ data: { redirect: true, url: "https://old-client.example/cb" }, error: null });
     });
     expect(assignMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("McpConsentPage redirect host", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+  });
+
+  it("shows the signed redirect_uri host, never the client's self-declared client_uri", async () => {
+    publicClientMock.mockResolvedValue({
+      data: {
+        client_id: "mcp-client-1",
+        client_name: "Client",
+        client_uri: "https://trusted-looking.example",
+      },
+      error: null,
+    });
+    renderPage(USABLE_SEARCH, signedRawSearch("https://client.example:8443/cb?x=1"));
+    const host = await screen.findByTestId("redirect-host");
+    expect(host.textContent).toBe("client.example:8443");
+    expect(screen.queryByText(/trusted-looking/)).toBeNull();
+  });
+
+  it("reads the raw URL the consent call forwards, not an unsigned copy appended to it", async () => {
+    publicClientMock.mockResolvedValue({
+      data: { client_id: "mcp-client-1", client_name: "Client" },
+      error: null,
+    });
+    renderPage(USABLE_SEARCH, signedRawSearch(null, "&redirect_uri=https%3A%2F%2Fevil.example"));
+    await waitFor(() => {
+      expect(screen.getByText("auth:mcpConsent.invalidTitle")).toBeTruthy();
+    });
+    expect(screen.queryByText("auth:mcpConsent.accept")).toBeNull();
+    expect(screen.queryByText(/evil\.example/)).toBeNull();
+  });
+
+  it("treats a repeated redirect_uri as an invalid request", async () => {
+    publicClientMock.mockResolvedValue({
+      data: { client_id: "mcp-client-1", client_name: "Client" },
+      error: null,
+    });
+    renderPage(
+      USABLE_SEARCH,
+      signedRawSearch("https://client.example/cb", "&redirect_uri=https%3A%2F%2Fevil.example"),
+    );
+    await waitFor(() => {
+      expect(screen.getByText("auth:mcpConsent.invalidTitle")).toBeTruthy();
+    });
+    expect(screen.queryByText("auth:mcpConsent.accept")).toBeNull();
   });
 });
 

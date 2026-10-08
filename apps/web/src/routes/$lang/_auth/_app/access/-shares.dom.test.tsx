@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({
   calls: [] as Array<{ name: string; input: unknown }>,
   invites: [] as Array<Record<string, unknown>>,
+  withMe: [] as Array<Record<string, unknown>>,
   runtimeAnswer: null as Record<string, unknown> | null,
 }));
 
@@ -21,6 +22,7 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
   return {
     ...actual,
     createFileRoute: () => (options: { component: ComponentType }) => ({ options }),
+    useParams: () => ({ lang: "en-US" }),
   };
 });
 
@@ -78,12 +80,13 @@ vi.mock("@/utils/orpc", () => {
         shares: {
           list: query(["access", "shares", "list"], () => ({
             byMe: [],
-            withMe: [],
+            withMe: state.withMe,
             invites: state.invites,
           })),
           create: mutation("access.shares.create", () => ({ kind: "share" })),
           update: mutation("access.shares.update", () => ({})),
           delete: mutation("access.shares.delete", () => ({ ok: true })),
+          setOwnKey: mutation("access.shares.setOwnKey", () => ({})),
         },
         invites: {
           resend: mutation("access.invites.resend", () => ({})),
@@ -91,6 +94,35 @@ vi.mock("@/utils/orpc", () => {
         },
       },
       pools: { key: () => ["pools"], list: query(["pools", "list"], () => ({ pools: [] })) },
+      providers: {
+        models: {
+          list: query(["providers", "models", "list"], () => ({
+            models: [
+              {
+                id: "pm-1",
+                upstreamModelId: "gpt-x",
+                displayName: "GPT X",
+                enabled: true,
+                type: "LLM",
+              },
+              {
+                id: "pm-off",
+                upstreamModelId: "old",
+                displayName: null,
+                enabled: false,
+                type: "LLM",
+              },
+              {
+                id: "pm-embed",
+                upstreamModelId: "embed",
+                displayName: "Embed",
+                enabled: true,
+                type: "EMBEDDINGS",
+              },
+            ],
+          })),
+        },
+      },
       runtimes: {
         key: () => ["runtimes"],
         get: { key: () => ["runtimes", "get"] },
@@ -145,6 +177,7 @@ afterEach(() => {
   cleanup();
   state.calls = [];
   state.invites = [];
+  state.withMe = [];
   state.runtimeAnswer = null;
 });
 
@@ -181,5 +214,60 @@ describe("Access → Shares: runtime definitions", { timeout: 30_000 }, () => {
     await mount();
     expect(await screen.findByText("friend@example.test")).toBeTruthy();
     expect(screen.getByText("access:shares.runtimeTarget:Qwen")).toBeTruthy();
+  });
+});
+
+function withMe(id: string, ownKeyEquivalentModel: string | null) {
+  return {
+    id,
+    poolId: `pool-${id}`,
+    callableId: `alice/${id}`,
+    ownerEmail: "alice@example.test",
+    granteeEmail: "me@example.test",
+    canUse: true,
+    canContribute: false,
+    priorityClass: null,
+    protectionPercent: null,
+    monthlyCap: null,
+    modelType: "LLM",
+    ownKeyEquivalentModel,
+    ownKeyProviderModelId: null,
+    ownKeyProtocolAdaptation: false,
+    contributedMembers: 0,
+    createdAt: "2026-10-07T00:00:00.000Z",
+  };
+}
+
+describe("Access → Shares: own key for a pool shared with me", { timeout: 30_000 }, () => {
+  it("offers my enabled provider models of the pool's type only where the owner allows my own key", async () => {
+    state.withMe = [withMe("chat", "openai/gpt-x"), withMe("plain", null)];
+    await mount();
+    const select = await screen.findByLabelText("access:ownKey.label");
+    // One select: the pool whose owner allows it.
+    expect(screen.getAllByLabelText("access:ownKey.label")).toHaveLength(1);
+    expect(
+      within(select)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["access:ownKey.ownerKey", "GPT X"]);
+    fireEvent.change(select, { target: { value: "pm-1" } });
+    await waitFor(() =>
+      expect(state.calls).toEqual([
+        { name: "access.shares.setOwnKey", input: { shareId: "chat", providerModelId: "pm-1" } },
+      ]),
+    );
+  });
+
+  it("goes back to the owner's key with a null choice", async () => {
+    state.withMe = [{ ...withMe("chat", "openai/gpt-x"), ownKeyProviderModelId: "pm-1" }];
+    await mount();
+    const select = await screen.findByLabelText("access:ownKey.label");
+    await waitFor(() => expect((select as HTMLSelectElement).value).toBe("pm-1"));
+    fireEvent.change(select, { target: { value: "" } });
+    await waitFor(() =>
+      expect(state.calls).toEqual([
+        { name: "access.shares.setOwnKey", input: { shareId: "chat", providerModelId: null } },
+      ]),
+    );
   });
 });

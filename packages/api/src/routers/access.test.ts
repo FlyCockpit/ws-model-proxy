@@ -108,7 +108,7 @@ const shareRow = {
   ownKeyProviderModelId: null,
   ownKeyProtocolAdaptation: false,
   createdAt: now,
-  Pool: { slug: "chat" },
+  Pool: { slug: "chat", modelType: "LLM" as const, Fallback: null },
   Owner: { email: "owner@example.test", slug: "owner" },
   Grantee: { email: "friend@example.test" },
   SpendCap: null,
@@ -408,6 +408,171 @@ describe("OAuth connections", () => {
       userId: "owner",
     });
     expect(db.mcpGrant.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("OAuth disconnect sweeps pending authorization codes", () => {
+  const CLIENT = "https://client.example.com/meta";
+  function code(userId: string, clientId: string, extra: Record<string, unknown> = {}) {
+    return JSON.stringify({
+      type: "authorization_code",
+      query: { client_id: clientId, redirect_uri: "https://client.example.com/cb" },
+      userId,
+      referenceId: "ref1",
+      ...extra,
+    });
+  }
+  function grant(userId = "owner") {
+    db.mcpGrant.findFirst.mockResolvedValue({
+      id: "g1",
+      clientId: CLIENT,
+      revokedAt: null,
+      userId,
+    } as never);
+  }
+
+  it("deletes only the person's codes for that client, under the person's fence", async () => {
+    grant();
+    db.verification.findMany.mockResolvedValueOnce([
+      { id: "v1", value: code("owner", CLIENT) },
+      // Another client of the same person, another person, and an e-mail OTP row.
+      { id: "v2", value: code("owner", "https://other.example.com/meta") },
+      { id: "v3", value: code("owner2", CLIENT) },
+      { id: "v4", value: JSON.stringify({ type: "email-otp", userId: "owner" }) },
+    ] as never);
+    db.verification.deleteMany.mockResolvedValue({ count: 1 });
+    await client().oauthGrants.revoke({ grantId: "g1" });
+
+    // The revocation and the sweep each run under the person's fence.
+    expect(heldFences()).toEqual(["00:owner:owner", "00:owner:owner"]);
+    const scan = db.verification.findMany.mock.calls[0]?.[0];
+    expect(scan?.where).toMatchObject({
+      AND: [
+        { value: { contains: '"type":"authorization_code"' } },
+        { value: { contains: '"userId":"owner"' } },
+      ],
+    });
+    // A delete with a WHERE: the exact rows found, re-fenced to the person's markers.
+    expect(db.verification.deleteMany).toHaveBeenCalledTimes(1);
+    expect(db.verification.deleteMany.mock.calls[0]?.[0]).toEqual({
+      where: {
+        id: { in: ["v1"] },
+        AND: [
+          { value: { contains: '"type":"authorization_code"' } },
+          { value: { contains: '"userId":"owner"' } },
+        ],
+      },
+    });
+    expect(db.oauthConsent.deleteMany.mock.calls[0]?.[0]).toEqual({
+      where: { userId: "owner", clientId: CLIENT },
+    });
+  });
+
+  it("deletes nothing when no pending code matches", async () => {
+    grant();
+    db.verification.findMany.mockResolvedValueOnce([
+      { id: "v3", value: code("owner2", CLIENT) },
+    ] as never);
+    await client().oauthGrants.revoke({ grantId: "g1" });
+    expect(db.verification.deleteMany).not.toHaveBeenCalled();
+    expect(db.mcpGrant.updateMany).toHaveBeenCalled();
+  });
+
+  it("fails closed on a pending code it cannot read, after revoking the tokens", async () => {
+    grant();
+    const onAccessRevoked = vi.fn();
+    db.verification.findMany.mockResolvedValueOnce([
+      { id: "v1", value: '{"type":"authorization_code","userId":"owner"' },
+    ] as never);
+    await expect(
+      client(PERSON, { onAccessRevoked }).oauthGrants.revoke({ grantId: "g1" }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(db.verification.deleteMany).not.toHaveBeenCalled();
+    // A crowded or unreadable sweep never holds back the disconnect itself.
+    expect(db.mcpGrant.updateMany).toHaveBeenCalled();
+    expect(db.oauthAccessToken.updateMany).toHaveBeenCalled();
+    expect(db.oauthConsent.deleteMany).toHaveBeenCalled();
+    expect(onAccessRevoked).toHaveBeenCalledTimes(1);
+  });
+
+  it("pages by id, so a code redeemed between pages cannot end the scan early", async () => {
+    grant();
+    const other = code("owner", "https://other.example.com/meta");
+    const firstPage = Array.from({ length: 500 }, (_, index) => ({
+      id: `v${String(index).padStart(5, "0")}`,
+      value: other,
+    }));
+    db.verification.findMany
+      .mockResolvedValueOnce(firstPage as never)
+      .mockResolvedValueOnce([{ id: "v99999", value: code("owner", CLIENT) }] as never);
+    db.verification.deleteMany.mockResolvedValue({ count: 1 });
+    await client().oauthGrants.revoke({ grantId: "g1" });
+    const second = db.verification.findMany.mock.calls[1]?.[0];
+    expect(second?.where).toMatchObject({ id: { gt: "v00499" } });
+    expect(second).not.toHaveProperty("cursor");
+    expect(second).not.toHaveProperty("skip");
+    expect(db.verification.deleteMany.mock.calls[0]?.[0]?.where).toMatchObject({
+      id: { in: ["v99999"] },
+    });
+  });
+
+  it("gives up loudly past the scan cap", async () => {
+    grant();
+    let page = 0;
+    db.verification.findMany.mockImplementation((async () => {
+      page += 1;
+      return Array.from({ length: 500 }, (_, index) => ({
+        id: `p${String(page).padStart(3, "0")}-${String(index).padStart(3, "0")}`,
+        value: code("owner", "https://other.example.com/meta"),
+      }));
+    }) as never);
+    await expect(client().oauthGrants.revoke({ grantId: "g1" })).rejects.toMatchObject({
+      code: "CONFLICT",
+    });
+    expect(db.verification.findMany).toHaveBeenCalledTimes(20);
+    expect(db.verification.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("never sweeps another person's codes: their grant is not found", async () => {
+    db.mcpGrant.findFirst.mockResolvedValue(null);
+    await expect(client().oauthGrants.revoke({ grantId: "theirs" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+    expect(db.verification.findMany).not.toHaveBeenCalled();
+    expect(db.verification.deleteMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("Contributing", () => {
+  it("lists only the caller's shares and the caller's own served models", async () => {
+    db.share.findMany.mockResolvedValue([]);
+    db.runtimeModel.findMany.mockResolvedValue([
+      {
+        id: "rm1",
+        upstreamModelId: "qwen",
+        type: "LLM",
+        runtimeId: "rt1",
+        Runtime: { name: "Qwen box" },
+      },
+    ] as never);
+    const result = await client().contributing.pools();
+    expect(db.share.findMany.mock.calls[0]?.[0]?.where).toEqual({
+      granteeUserId: "owner",
+      canContribute: true,
+    });
+    expect(db.runtimeModel.findMany.mock.calls[0]?.[0]?.where).toEqual({
+      userId: "owner",
+      retired: false,
+    });
+    expect(result.servedModels).toEqual([
+      {
+        runtimeModelId: "rm1",
+        upstreamModelId: "qwen",
+        type: "LLM",
+        runtimeId: "rt1",
+        runtimeName: "Qwen box",
+      },
+    ]);
   });
 });
 
@@ -1012,6 +1177,25 @@ describe("shares", () => {
     expect(db.share.deleteMany).not.toHaveBeenCalled();
   });
 
+  it("tells a share holder which model the owner lets them bring their own key for", async () => {
+    db.share.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([
+      {
+        ...shareRow,
+        Pool: {
+          slug: "chat",
+          modelType: "LLM",
+          Fallback: { ownKeyEquivalentModel: "openai/gpt" },
+        },
+      },
+      { ...shareRow, id: "share2", Pool: { slug: "chat", modelType: "LLM", Fallback: null } },
+    ] as never);
+    db.shareInvite.findMany.mockResolvedValue([]);
+    const listed = await client().shares.list();
+    expect(db.share.findMany.mock.calls[1]?.[0]?.where).toEqual({ granteeUserId: "owner" });
+    expect(listed.withMe.map((share) => share.ownKeyEquivalentModel)).toEqual(["openai/gpt", null]);
+    expect(listed.withMe[0]?.modelType).toBe("LLM");
+  });
+
   it("sets an own key only from the share holder's own provider models", async () => {
     db.share.findFirst.mockResolvedValue({
       id: "share1",
@@ -1039,9 +1223,9 @@ describe("shares", () => {
       .mockResolvedValueOnce({ id: "share1", ownerUserId: "pool-owner" } as never)
       .mockResolvedValueOnce({
         ownKeyProtocolAdaptation: false,
-        Pool: { Fallback: { ownKeyEquivalentModel: "openai/gpt" } },
+        Pool: { modelType: "LLM", Fallback: { ownKeyEquivalentModel: "openai/gpt" } },
       } as never);
-    db.providerModel.findFirst.mockResolvedValue({ id: "mine" } as never);
+    db.providerModel.findFirst.mockResolvedValue({ id: "mine", type: "LLM" } as never);
     db.share.findUnique.mockResolvedValue(shareRow as never);
     await client().shares.setOwnKey({ shareId: "share1", providerModelId: "mine" });
     expect(heldFences()).toEqual(["00:owner:owner", "00:owner:pool-owner"]);
@@ -1056,11 +1240,25 @@ describe("shares", () => {
       .mockResolvedValueOnce({ id: "share1", ownerUserId: "pool-owner" } as never)
       .mockResolvedValueOnce({
         ownKeyProtocolAdaptation: false,
-        Pool: { Fallback: null },
+        Pool: { modelType: "LLM", Fallback: null },
       } as never);
     await expect(
       client().shares.setOwnKey({ shareId: "share1", providerModelId: "mine" }),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(db.share.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses an own key of another type than the pool's", async () => {
+    db.share.findFirst
+      .mockResolvedValueOnce({ id: "share1", ownerUserId: "pool-owner" } as never)
+      .mockResolvedValueOnce({
+        ownKeyProtocolAdaptation: false,
+        Pool: { modelType: "EMBEDDINGS", Fallback: { ownKeyEquivalentModel: "openai/embed" } },
+      } as never);
+    db.providerModel.findFirst.mockResolvedValue({ id: "mine", type: "LLM" } as never);
+    await expect(
+      client().shares.setOwnKey({ shareId: "share1", providerModelId: "mine" }),
+    ).rejects.toMatchObject({ data: { reason: "model_type_mismatch" } });
     expect(db.share.update).not.toHaveBeenCalled();
   });
 

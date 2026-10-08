@@ -73,6 +73,10 @@ export const shareViewSchema = z
       .object({ limit: moneySchema, currency: currencySchema, spentThisMonth: moneySchema })
       .strict()
       .nullable(),
+    /** The pool's model type (an own key must be a provider model of this type). */
+    modelType: z.enum(MODEL_TYPE),
+    /** The model the owner lets share holders use their own key for; null: not allowed. */
+    ownKeyEquivalentModel: z.string().nullable(),
     /** The grantee's own-key choice (only while the pool owner consents). */
     ownKeyProviderModelId: idSchema.nullable(),
     ownKeyProtocolAdaptation: z.boolean(),
@@ -301,9 +305,21 @@ export const accessContract = {
               })
               .strict(),
           ),
+          /** Your served models (not retired), to pick a contribution from. */
+          servedModels: z.array(
+            z
+              .object({
+                runtimeModelId: idSchema,
+                upstreamModelId: z.string(),
+                type: z.enum(MODEL_TYPE),
+                runtimeId: idSchema,
+                runtimeName: z.string(),
+              })
+              .strict(),
+          ),
         })
         .strict(),
-      "Pools you may contribute to and what you contribute now.",
+      "Pools you may contribute to, what you contribute now, and your served models.",
     ),
   },
 } as const;

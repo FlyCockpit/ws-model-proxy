@@ -46,7 +46,8 @@ import {
   shareSelect,
   shareView,
 } from "../lib/access-views";
-import { isUniqueViolation, notFound, refuse } from "../lib/refuse";
+import { sweepPendingAuthorizationCodes } from "../lib/oauth-code-sweep";
+import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
 import { deliverInvite, writeInvite } from "../lib/share-invite-write";
 import { pendingInviteWhere } from "../lib/share-invites";
@@ -418,24 +419,23 @@ const oauthGrants = {
     if (!grant || isMcpPatClientId(grant.clientId))
       throw notFound("That key, token, connection, share or invite does not exist.");
     const now = new Date();
-    // Revoke every live token this client holds for the person and forget the consent, so
-    // reconnecting asks again. TODO(server): pending authorization codes are not swept here
-    // (0.3 `mcp-grants.revokeMine` did); they expire within minutes.
-    await prisma.$transaction([
-      prisma.mcpGrant.updateMany({
+    // Revoke every live token this client holds for the person and forget the consent (so
+    // reconnecting asks again), under the person's fence; every write names the person.
+    await runAccessTransaction({ owners: [userId] }, async (tx) => {
+      await tx.mcpGrant.updateMany({
         where: { id: grant.id, userId, revokedAt: null },
         data: { revokedAt: now },
-      }),
-      prisma.oauthRefreshToken.updateMany({
+      });
+      await tx.oauthRefreshToken.updateMany({
         where: { userId, clientId: grant.clientId, revoked: null },
         data: { revoked: now },
-      }),
-      prisma.oauthAccessToken.updateMany({
+      });
+      await tx.oauthAccessToken.updateMany({
         where: { userId, clientId: grant.clientId, revoked: null },
         data: { revoked: now },
-      }),
-      prisma.oauthConsent.deleteMany({ where: { userId, clientId: grant.clientId } }),
-    ]);
+      });
+      await tx.oauthConsent.deleteMany({ where: { userId, clientId: grant.clientId } });
+    });
     if (!grant.revokedAt) {
       await notifyRevoked(context, {
         kind: "oauth_grant",
@@ -444,6 +444,12 @@ const oauthGrants = {
         clientId: grant.clientId,
       });
     }
+    // Then drop the client's pending authorization codes, which could otherwise still be
+    // exchanged. Its own step, so rows it cannot clear (fail closed: CONFLICT, retry) never
+    // hold back the token revocation above; a retry runs the whole revoke again.
+    await runAccessTransaction({ owners: [userId] }, (tx) =>
+      sweepPendingAuthorizationCodes(tx, { userId, clientId: grant.clientId, now }),
+    );
     return { ok: true as const };
   }),
 
@@ -761,21 +767,31 @@ const shares = {
     // choice), so the choice consents to the equivalent read here; under the share holder's,
     // the chosen model cannot be deleted.
     await runAccessTransaction({ owners: [share.ownerUserId, granteeUserId] }, async (tx) => {
-      if (input.providerModelId !== null) {
-        const model = await tx.providerModel.findFirst({
-          where: { id: input.providerModelId, userId: granteeUserId, deletedAt: null },
-          select: { id: true },
-        });
-        if (!model) throw notFound("That key, token, connection, share or invite does not exist.");
-      }
+      const model =
+        input.providerModelId === null
+          ? null
+          : await tx.providerModel.findFirst({
+              where: { id: input.providerModelId, userId: granteeUserId, deletedAt: null },
+              select: { id: true, type: true },
+            });
+      if (input.providerModelId !== null && !model)
+        throw notFound("That key, token, connection, share or invite does not exist.");
       const current = await tx.share.findFirst({
         where: { id: share.id, granteeUserId },
         select: {
           ownKeyProtocolAdaptation: true,
-          Pool: { select: { Fallback: { select: { ownKeyEquivalentModel: true } } } },
+          Pool: {
+            select: { modelType: true, Fallback: { select: { ownKeyEquivalentModel: true } } },
+          },
         },
       });
       if (!current) throw notFound("That key, token, connection, share or invite does not exist.");
+      if (model && model.type !== current.Pool.modelType)
+        throw refuseAbout(
+          "model_type_mismatch",
+          model.id,
+          "This model's type does not match the pool's type.",
+        );
       if (input.providerModelId !== null && !current.Pool.Fallback?.ownKeyEquivalentModel) {
         throw new ORPCError("FORBIDDEN", {
           message: "The pool's owner has not allowed using your own provider key for this pool.",
@@ -865,7 +881,26 @@ const contributing = {
         },
       },
     });
+    const served = await prisma.runtimeModel.findMany({
+      where: { userId, retired: false },
+      orderBy: [{ runtimeId: "asc" }, { upstreamModelId: "asc" }],
+      take: 500,
+      select: {
+        id: true,
+        upstreamModelId: true,
+        type: true,
+        runtimeId: true,
+        Runtime: { select: { name: true } },
+      },
+    });
     return {
+      servedModels: served.map((model) => ({
+        runtimeModelId: model.id,
+        upstreamModelId: model.upstreamModelId,
+        type: model.type,
+        runtimeId: model.runtimeId,
+        runtimeName: model.Runtime.name,
+      })),
       pools: rows.map((row) => ({
         shareId: row.id,
         poolId: row.poolId,

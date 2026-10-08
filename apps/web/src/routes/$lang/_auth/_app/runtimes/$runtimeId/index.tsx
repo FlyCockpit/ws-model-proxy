@@ -16,6 +16,7 @@ import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { AddToSharedPool } from "@/components/access/contribute";
 import { CopyableCode } from "@/components/copy-button";
 import { InlineRetry } from "@/components/inline-retry";
 import { NativeSelect } from "@/components/native-select";
@@ -265,6 +266,7 @@ function ServedModelRow({ runtime, model }: { runtime: RuntimeDetail; model: Ser
           {t("dashboard:runtime.newPoolFromModel")}
         </Button>
       </div>
+      <AddToSharedPool model={model} />
     </div>
   );
 }

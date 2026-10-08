@@ -668,6 +668,8 @@ export const runtimesContract = {
                 runtimeId: idSchema,
                 ownerEmail: z.string(),
                 name: z.string(),
+                /** An always-on fork names its node; a startable one starts on any. */
+                kind: z.enum(RUNTIME_KIND),
                 currentVersion: runtimeVersionSummarySchema,
               })
               .strict(),

@@ -56,6 +56,7 @@ describe("auth locale key parity (en-US / es-MX)", () => {
           "invalidTitle",
           "invalidDescription",
           "manageNote",
+          "returnsTo",
           "scopes.read.name",
           "scopes.read.description",
           "scopes.write.name",

@@ -13,6 +13,7 @@ import { useTranslation } from "react-i18next";
 import z from "zod";
 
 import { ConfirmAction } from "@/components/access/confirm-action";
+import { OwnKeyChoice } from "@/components/access/own-key-choice";
 import {
   announceShared,
   CapLine,
@@ -204,6 +205,7 @@ function ShareWithMeRow({ share }: { share: ShareView }) {
         isPending={leave.isPending}
         onConfirm={() => leave.mutate({ shareId: share.id })}
       />
+      <OwnKeyChoice shareId={share.id} />
     </div>
   );
 }
