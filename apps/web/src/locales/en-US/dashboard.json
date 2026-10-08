@@ -40,7 +40,7 @@
   "pages": {
     "welcome": {
       "title": "Get started",
-      "description": "Add a node, add the servers it found, create a pool, connect an agent and create an API key."
+      "description": "Add a node, add your model servers, create a pool, connect an agent and create an API key."
     },
     "overview": {
       "title": "Overview",
@@ -256,11 +256,21 @@
       "secretOnce": "This code is shown only once.",
       "installsWhere": "It installs wsmp into ~/.cargo/bin ($CARGO_HOME/bin when set). When the server offers release builds, Linux (x86_64 or ARM64, glibc 2.34 or newer) and macOS get a checksummed binary; otherwise it builds wsmp from source, which needs Rust 1.88 or newer.",
       "terminalsAsked": "With Full control, `wsmp login` then asks whether to allow browser terminals on that machine (yes by default). Only the machine can change it later, with `wsmp config set-human-terminal on|off`.",
-      "expires": "It expires",
       "waiting": "Waiting for the node to connect…",
       "joined": "{{slug}} joined",
       "joinedDeleted": "A node joined and was removed since",
-      "done": "Done"
+      "done": "Done",
+      "expiresIn": "It expires in {{time}}.",
+      "expired": "This code has expired; get a new one.",
+      "newCode": "New code",
+      "onMachine": "What happens on the machine",
+      "machineSteps": {
+        "install": "The script installs wsmp (where and how is below).",
+        "login": "`wsmp login` uses the code: the machine joins your account as a node, with no other approval.",
+        "trust": "It asks how much control this server gets: Full control (the default) or Relay only, where agents cannot change anything on the machine.",
+        "service": "It offers to install a per-user service, so the node starts at boot."
+      },
+      "readingHardware": "Connected. Reading its hardware…"
     },
     "codes": {
       "title": "Install codes",
@@ -1426,6 +1436,72 @@
       "errors_one": "{{value}} error",
       "errors_other": "{{value}} errors",
       "separator": " · "
+    }
+  },
+  "welcome": {
+    "skipSetup": "Skip setup",
+    "stepsLabel": "Setup steps",
+    "stepOf": "Step {{step}} of {{total}}",
+    "done": "Done",
+    "doneSr": "(done)",
+    "back": "Back",
+    "continue": "Continue",
+    "skip": "Skip this step",
+    "finish": "Finish",
+    "node": {
+      "title": "Add a node",
+      "description": "A node is a machine that runs models for you: a GPU server, a workstation or a laptop.",
+      "intro": "One command installs wsmp and logs the machine in with a code that works once, for an hour. The code is your approval.",
+      "mint": "Get the install command",
+      "mintAnother": "Add another node",
+      "yours_one": "Your node",
+      "yours_other": "Your {{count}} nodes",
+      "moreOptions": "Several machines at once, labels or temporary nodes:",
+      "nodesPage": "Nodes → Add a node"
+    },
+    "runtime": {
+      "title": "Your model servers",
+      "description": "A runtime is a model server wsmp can call: one it starts when needed, or one that is always running.",
+      "presetTitle": "Start one from a preset",
+      "presetHint": "vLLM, SGLang or llama.cpp, started on one of your nodes when a pool needs it.",
+      "presetAction": "New runtime",
+      "runningTitle": "A server already running?",
+      "runningHint": "If vLLM, llama.cpp, Ollama or another OpenAI-compatible server already runs on a node, add it as an always-on runtime: in New runtime choose Detected server and enter its address on the node. wsmp sends requests to it and never starts or stops it.",
+      "noDetection": "wsmp does not find running servers by itself yet, so add them this way.",
+      "runningAction": "Add an always-on runtime",
+      "yours_one": "Your runtime",
+      "yours_other": "Your {{count}} runtimes",
+      "models_one": "{{count}} served model",
+      "models_other": "{{count}} served models"
+    },
+    "pool": {
+      "title": "Create a pool",
+      "description": "A pool is what clients call, by its callable ID (owner/pool). Start with one served model and add more later.",
+      "callable": "Your callable IDs",
+      "fromModel": "Served models not in a pool yet",
+      "createNamed": "Create pool {{slug}}",
+      "customize": "Choose a name…",
+      "noModels": "No served models yet. Add a model server in the previous step: startable runtimes list their models once defined, always-on ones once the node reports them.",
+      "allPooled": "Every served model is in a pool.",
+      "loadFailed": "Your runtimes or pools could not be loaded."
+    },
+    "agent": {
+      "title": "Connect an agent",
+      "description": "Agents such as coding assistants set up and run models for you through MCP.",
+      "oauthTitle": "Connect with OAuth",
+      "oauthHint": "Add the MCP URL to an agent that supports OAuth. It opens this site, you sign in and choose Read-only or Full, and it is connected. Nothing to copy.",
+      "tokenTitle": "Or use an agent token",
+      "tokenHint": "For agents without OAuth: a token you paste into the agent's configuration. Read-only only reads; Full may also configure, start and stop.",
+      "promptTitle": "A first prompt to try",
+      "promptNode": "Set up a model on {{node}}.",
+      "promptNoNode": "Show me my nodes and what they can run.",
+      "copyPrompt": "Copy prompt"
+    },
+    "apiKey": {
+      "title": "Create an API key",
+      "description": "Apps and SDKs call your pools with an API key at the OpenAI-compatible base URL below.",
+      "existing_one": "You have {{count}} active key.",
+      "existing_other": "You have {{count}} active keys."
     }
   }
 }

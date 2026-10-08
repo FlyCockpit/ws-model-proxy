@@ -1,6 +1,7 @@
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 
 import type { PillTone } from "@/components/status-pill";
+import { slugify } from "@/lib/slugify";
 
 export type PoolsList = Awaited<ReturnType<AppRouterClient["pools"]["list"]>>;
 export type PoolView = PoolsList["pools"][number];
@@ -40,4 +41,18 @@ export function parseMemberChoice(value: string): { runtimeId: string; model: st
   if (index <= 0) return null;
   const model = value.slice(index + 2);
   return model ? { runtimeId: value.slice(0, index), model } : null;
+}
+
+/**
+ * A pool slug from a served model's name (`Qwen/Qwen3-32B` → `qwen3-32b`), suffixed (`-2`, `-3`…)
+ * when one of `taken` already uses it.
+ */
+export function poolSlugFor(model: string, taken: ReadonlySet<string>): string {
+  const base = slugify(model.split("/").pop() ?? model) || slugify(model) || "pool";
+  if (!taken.has(base)) return base;
+  for (let index = 2; ; index += 1) {
+    const suffix = `-${index}`;
+    const candidate = `${base.slice(0, 41 - suffix.length).replace(/-+$/, "")}${suffix}`;
+    if (!taken.has(candidate)) return candidate;
+  }
 }

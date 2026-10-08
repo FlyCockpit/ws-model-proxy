@@ -12,6 +12,7 @@ const state = vi.hoisted(() => ({
   needsYou: { items: [] as Array<Record<string, unknown>>, queuedCommands: 0 },
   ranges: [] as string[],
   dismissed: 0,
+  navigations: [] as Array<Record<string, unknown>>,
 }));
 
 vi.mock("@tanstack/react-router", async (importOriginal) => {
@@ -22,8 +23,21 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
       options,
       useParams: () => ({ lang: "en-US" }),
     }),
-    Link: ({ children, className }: { children: ReactNode; className?: string }) => (
-      <a href="#x" className={className}>
+    useNavigate: () => async (options: Record<string, unknown>) => {
+      state.navigations.push(options);
+    },
+    Link: ({
+      children,
+      className,
+      to,
+      search,
+    }: {
+      children: ReactNode;
+      className?: string;
+      to?: string;
+      search?: { step?: string };
+    }) => (
+      <a href={search?.step ? `${to}?step=${search.step}` : "#x"} className={className}>
         {children}
       </a>
     ),
@@ -135,6 +149,8 @@ afterEach(() => {
   state.needsYou = { items: [], queuedCommands: 0 };
   state.ranges = [];
   state.dismissed = 0;
+  state.navigations = [];
+  window.sessionStorage.clear();
 });
 
 describe("Overview", { timeout: 30_000 }, () => {
@@ -173,6 +189,42 @@ describe("Overview", { timeout: 30_000 }, () => {
     state.summary = summary({ onboarding: { done: true, steps: {} } });
     await mount();
     expect(screen.queryByText("dashboard:overview.start.title")).toBeNull();
+  });
+
+  it("opens each getting-started step on Welcome", async () => {
+    state.summary = summary();
+    await mount();
+    const link = screen.getByText("dashboard:overview.start.step.agent").closest("a");
+    expect(link?.getAttribute("href")).toBe("/$lang/welcome?step=agent");
+    const node = screen.getByText("dashboard:overview.start.step.node").closest("a");
+    expect(node?.getAttribute("href")).toBe("/$lang/welcome?step=node");
+    expect(state.navigations).toEqual([]);
+  });
+
+  it("sends a first sign-in (nothing set up) to Welcome once per tab", async () => {
+    const fresh = {
+      onboarding: {
+        done: false,
+        steps: { node: false, runtime: false, pool: false, agent: false, apiKey: false },
+      },
+    };
+    state.summary = summary(fresh);
+    await mount();
+    await waitFor(() =>
+      expect(state.navigations).toEqual([
+        { to: "/$lang/welcome", params: { lang: "en-US" }, replace: true },
+      ]),
+    );
+    cleanup();
+    state.navigations = [];
+    await mount();
+    expect(state.navigations).toEqual([]);
+    // Dismissed getting started never redirects.
+    cleanup();
+    window.sessionStorage.clear();
+    state.summary = summary({ onboarding: { ...fresh.onboarding, done: true } });
+    await mount();
+    expect(state.navigations).toEqual([]);
   });
 
   it("lists what needs a person and agent commands waiting", async () => {

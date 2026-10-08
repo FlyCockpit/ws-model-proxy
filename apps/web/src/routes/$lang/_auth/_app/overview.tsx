@@ -21,6 +21,8 @@ import { SegmentedControl } from "@/components/segmented-control";
 import { Sparkline } from "@/components/sparkline";
 import { StatusPill } from "@/components/status-pill";
 import { TimeAgo } from "@/components/time-ago";
+import { useOfferWelcome } from "@/hooks/use-welcome-offer";
+import { WELCOME_STEPS, type WelcomeStep } from "@/lib/welcome-steps";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/overview")({
@@ -48,6 +50,8 @@ function OverviewPage() {
     ...orpc.activity.needsYou.list.queryOptions(),
     refetchInterval: REFRESH_MS,
   });
+  // A first sign-in lands here: send it to Welcome once.
+  useOfferWelcome(lang, summary.data?.onboarding);
 
   return (
     <div className="flex min-w-0 flex-col gap-6">
@@ -111,52 +115,26 @@ function OverviewSkeleton() {
 
 // ── Getting started ──
 
-const STEPS = ["node", "runtime", "pool", "agent", "apiKey"] as const;
-type Step = (typeof STEPS)[number];
-
+/** Each item opens its Welcome step. */
 function StepLink({
   step,
   lang,
   children,
 }: {
-  step: Step;
+  step: WelcomeStep;
   lang: string;
   children: React.ReactNode;
 }) {
-  const className =
-    "inline-flex min-h-[44px] min-w-0 items-center gap-2 rounded-md px-2 text-sm hover:bg-muted";
-  switch (step) {
-    case "node":
-      return (
-        <Link to="/$lang/nodes" params={{ lang }} className={className}>
-          {children}
-        </Link>
-      );
-    case "runtime":
-      return (
-        <Link to="/$lang/runtimes/new" params={{ lang }} className={className}>
-          {children}
-        </Link>
-      );
-    case "pool":
-      return (
-        <Link to="/$lang/pools" params={{ lang }} className={className}>
-          {children}
-        </Link>
-      );
-    case "agent":
-      return (
-        <Link to="/$lang/access/agents" params={{ lang }} className={className}>
-          {children}
-        </Link>
-      );
-    case "apiKey":
-      return (
-        <Link to="/$lang/access/api-keys" params={{ lang }} className={className}>
-          {children}
-        </Link>
-      );
-  }
+  return (
+    <Link
+      to="/$lang/welcome"
+      params={{ lang }}
+      search={{ step }}
+      className="inline-flex min-h-[44px] min-w-0 items-center gap-2 rounded-md px-2 text-sm hover:bg-muted"
+    >
+      {children}
+    </Link>
+  );
 }
 
 function GettingStarted({ lang, steps }: { lang: string; steps: Summary["onboarding"]["steps"] }) {
@@ -167,14 +145,14 @@ function GettingStarted({ lang, steps }: { lang: string; steps: Summary["onboard
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: orpc.activity.overview.summary.key() }),
   });
-  const done = STEPS.filter((step) => steps[step]).length;
+  const done = WELCOME_STEPS.filter((step) => steps[step]).length;
   return (
     <Card>
       <CardHeader className="flex min-w-0 flex-row flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 space-y-1">
           <CardTitle className="text-base">{t("dashboard:overview.start.title")}</CardTitle>
           <CardDescription>
-            {t("dashboard:overview.start.progress", { done, total: STEPS.length })}
+            {t("dashboard:overview.start.progress", { done, total: WELCOME_STEPS.length })}
           </CardDescription>
         </div>
         <Button
@@ -189,7 +167,7 @@ function GettingStarted({ lang, steps }: { lang: string; steps: Summary["onboard
       </CardHeader>
       <CardContent>
         <ol className="flex min-w-0 flex-wrap gap-x-2 gap-y-1">
-          {STEPS.map((step, index) => (
+          {WELCOME_STEPS.map((step, index) => (
             <li key={step} className="min-w-0">
               <StepLink step={step} lang={lang}>
                 <span
