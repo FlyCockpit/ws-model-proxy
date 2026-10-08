@@ -1050,7 +1050,7 @@
       }
     },
     "live": {
-      "p95": "p95 {{value}}",
+      "p95": "p95 {{value}} (15 min)",
       "waiting_one": "{{count}} waiting",
       "waiting_other": "{{count}} waiting"
     },
@@ -1789,6 +1789,12 @@
       "duplicate": "Each signal can be read once.",
       "save": "Save reader",
       "note": "Metrics reader changed"
+    },
+    "kvUsage": "KV cache {{percent}}%",
+    "groups": {
+      "needsYou": "Needs you",
+      "node": "On {{node}}",
+      "notRunning": "Not running"
     }
   },
   "overview": {

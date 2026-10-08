@@ -17,6 +17,9 @@
     "./lib/node-relay-services": {
       "default": "./src/lib/node-relay-services.ts"
     },
+    "./lib/live-load": {
+      "default": "./src/lib/live-load.ts"
+    },
     "./lib/node-command-settle": {
       "default": "./src/lib/node-command-settle.ts"
     },

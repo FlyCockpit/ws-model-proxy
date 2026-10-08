@@ -434,6 +434,19 @@ function withoutEmpty(value: unknown): unknown {
   return out;
 }
 
+/** A pool whose members' live load leaves out what is unknown (null waiting or p95). */
+function withCompactMemberLive(pool: unknown): unknown {
+  const members = record(pool).members;
+  if (!Array.isArray(members)) return pool;
+  return {
+    ...record(pool),
+    members: members.map((member) => ({
+      ...record(member),
+      live: withoutEmpty(record(member).live),
+    })),
+  };
+}
+
 /** Combines the outputs of a tool's procedure calls into its result. */
 function combineOutputs(name: string, calls: ProcedureCall[], outputs: unknown[]): unknown {
   switch (name) {
@@ -441,15 +454,27 @@ function combineOutputs(name: string, calls: ProcedureCall[], outputs: unknown[]
       // The list is read for every node at once: rows leave out nulls and empty lists.
       return calls[0]?.path === "nodes.list" ? withoutEmpty(outputs[0]) : outputs[0];
     case "runtimes_get": {
-      // Instance rows leave out nulls and empty lists (a held STOPPED instance stays listed).
+      // Instance rows and list rows leave out nulls and empty lists (a held STOPPED instance
+      // stays listed; a runtime on no node has no `nodes`).
       const runtime =
         calls[0]?.path === "runtimes.get"
           ? { ...record(outputs[0]), instanceList: withoutEmpty(record(outputs[0]).instanceList) }
-          : outputs[0];
+          : calls[0]?.path === "runtimes.list"
+            ? withoutEmpty(outputs[0])
+            : outputs[0];
       return outputs.length === 2 ? { ...record(runtime), versions: outputs[1] } : runtime;
     }
-    case "pools_get":
-      return outputs.length === 2 ? { ...record(outputs[0]), history: outputs[1] } : outputs[0];
+    case "pools_get": {
+      // Member live load leaves out what is unknown (null waiting or p95).
+      const list = record(outputs[0]).pools;
+      const first =
+        calls[0]?.path === "pools.get"
+          ? withCompactMemberLive(outputs[0])
+          : calls[0]?.path === "pools.list" && Array.isArray(list)
+            ? { ...record(outputs[0]), pools: list.map(withCompactMemberLive) }
+            : outputs[0];
+      return outputs.length === 2 ? { ...record(first), history: outputs[1] } : first;
+    }
     case "providers_get":
       return { accounts: record(outputs[0]).accounts, models: record(outputs[1]).models };
     case "runtime_update":

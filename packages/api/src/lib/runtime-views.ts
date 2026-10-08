@@ -14,6 +14,7 @@ import type {
   runtimeVersionSummarySchema,
 } from "../contracts/runtimes";
 import { rankCommands, renderStepCommand, type StepCommandPhase } from "./command-render";
+import { type InstanceLiveLoad, NO_LIVE_LOAD } from "./live-load";
 import { jsonObject, registryView } from "./registry-view";
 import {
   COMPAT_ENDPOINTS,
@@ -81,7 +82,21 @@ export const RUNTIME_SUMMARY_INCLUDE = {
     select: { upstreamModelId: true },
     orderBy: { createdAt: "asc" },
   },
-  Instances: { select: { phase: true, needsOperator: true, desiredState: true } },
+  // Where it runs (`nodes`): an always-on runtime's node, the ranks of its live instances.
+  Node: { select: { id: true, slug: true, userId: true } },
+  Instances: {
+    select: {
+      phase: true,
+      needsOperator: true,
+      desiredState: true,
+      // Ranks that hold (or may still hold) their node; a failed or stopped one has let go.
+      Ranks: {
+        where: { claim: { in: ["HELD", "HELD_UNKNOWN"] } },
+        select: { nodeId: true, Node: { select: { slug: true, userId: true } } },
+        orderBy: { rank: "asc" },
+      },
+    },
+  },
 } as const satisfies Prisma.RuntimeInclude;
 export type RuntimeSummaryRow = Prisma.RuntimeGetPayload<{
   include: typeof RUNTIME_SUMMARY_INCLUDE;
@@ -203,6 +218,25 @@ export function requestProfileView(row: {
   };
 }
 
+/**
+ * The owner's nodes a runtime is on: an always-on runtime's node, then the nodes of its
+ * instances that are not stopped (in rank order, each once). Another user's node never shows.
+ */
+function runtimeNodes(row: RuntimeSummaryRow): Array<{ id: string; slug: string }> {
+  const nodes = new Map<string, { id: string; slug: string }>();
+  if (row.Node && row.Node.userId === row.userId)
+    nodes.set(row.Node.id, { id: row.Node.id, slug: row.Node.slug });
+  for (const instance of row.Instances) {
+    if (instance.phase === "STOPPED") continue;
+    for (const rank of instance.Ranks) {
+      if (!rank.nodeId || !rank.Node || rank.Node.userId !== row.userId) continue;
+      if (!nodes.has(rank.nodeId))
+        nodes.set(rank.nodeId, { id: rank.nodeId, slug: rank.Node.slug });
+    }
+  }
+  return [...nodes.values()];
+}
+
 export function runtimeSummary(
   row: RuntimeSummaryRow,
   previousLaunchHash: string | null,
@@ -228,6 +262,7 @@ export function runtimeSummary(
     currentVersion: versionSummary(current, previousLaunchHash),
     models: row.Models.map((model) => model.upstreamModelId),
     instances: counts,
+    nodes: runtimeNodes(row),
     forkedFromVersionId: row.forkedFromVersionId,
   };
 }
@@ -381,7 +416,9 @@ function safeSpec(value: unknown): RuntimeSpec | null {
 export function instanceView(
   row: InstanceRow,
   stopChecks: ReadonlyMap<string, StopCheck> = new Map(),
+  liveLoad: ReadonlyMap<string, InstanceLiveLoad> = NO_LIVE_LOAD,
 ): InstanceView {
+  const load = liveLoad.get(row.id) ?? null;
   const advanced = advancedView(row.Version.advanced);
   const context = stepViewContext(row);
   return {
@@ -417,13 +454,14 @@ export function instanceView(
           : null,
     })),
     openSteps: row.Steps.map((step) => stepView(step, context)),
-    // TODO(lane A, hot path): live load comes from the relay's in-memory engine-load cache.
+    // Load from the relay's in-memory cache (null: unknown here); `at` is the reading's time,
+    // or the engine facts' while no reading is known.
     live: {
-      running: null,
-      waiting: null,
-      kvUsage: null,
+      running: load?.running ?? null,
+      waiting: load?.waiting ?? null,
+      kvUsage: load?.kvUsage ?? null,
       slots: row.engineSlots,
-      at: row.factsAt?.toISOString() ?? null,
+      at: (load?.at ?? row.factsAt)?.toISOString() ?? null,
     },
   };
 }

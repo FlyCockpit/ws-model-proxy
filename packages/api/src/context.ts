@@ -4,6 +4,7 @@ import type { Context as HonoContext } from "hono";
 import type { z } from "zod";
 import type { AnonymousAuth, CallerAuth } from "./contracts/auth-context";
 import type { modelsContract } from "./contracts/models";
+import type { LiveLoadReader } from "./lib/live-load";
 import type { NodeRelayServices } from "./lib/node-relay-services";
 
 export type CreateContextOptions = {
@@ -82,6 +83,11 @@ export type ContextServices = {
    * for a bench, owns it) and resolved it. Absent: the procedure answers SERVICE_UNAVAILABLE.
    */
   modelTest?: (input: ModelTestServiceInput) => Promise<ModelTestServiceOutput>;
+  /**
+   * The relay's in-memory engine load per instance (instance and pool member views). Absent,
+   * or an instance whose node's session is held by another server process: load is unknown.
+   */
+  liveLoad?: LiveLoadReader;
 };
 
 type ModelTestInput = z.infer<typeof modelsContract.test.input>;

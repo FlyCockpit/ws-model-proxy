@@ -41,6 +41,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   },
 }));
 
+import { LATENCY_HISTOGRAM_BUCKETS } from "@ws-model-proxy/config/usage-metrics";
 import prisma from "@ws-model-proxy/db";
 import { callableIdsFor, poolAdvancedView } from "../lib/pool-views";
 import { CALLERS, contextFor, OWNER } from "./lane-c-test-helpers";
@@ -92,7 +93,13 @@ function servingMember(phase = "READY") {
         slug: "qwen",
         nodeId: null,
         Node: null,
-        Instances: [{ phase, Ranks: [{ nodeId: "node-1", Node: { slug: "box", userId: OWNER } }] }],
+        Instances: [
+          {
+            id: "inst-1",
+            phase,
+            Ranks: [{ nodeId: "node-1", Node: { slug: "box", userId: OWNER } }],
+          },
+        ],
       },
       Targets: [{ health: "HEALTHY" }],
     },
@@ -142,6 +149,60 @@ describe("callable ids", () => {
       "ann/chat",
       "ann/chat:external",
     ]);
+  });
+});
+
+describe("pools.get: member live load", () => {
+  function latencyRow(bucketCounts: Record<number, number>) {
+    const row: Record<string, unknown> = {
+      pool: "pool-1",
+      runtime: "rt-1",
+      provider_model: "",
+    };
+    for (let index = 1; index <= LATENCY_HISTOGRAM_BUCKETS; index += 1)
+      row[`l${index}`] = bucketCounts[index] ?? 0;
+    return row;
+  }
+
+  it("adds the relay's waiting and the member's recent p95 from the owner's rollups", async () => {
+    db.pool.findFirst.mockResolvedValue(poolRow({ Members: [servingMember()] }) as never);
+    db.$queryRaw.mockImplementation(((strings: TemplateStringsArray) =>
+      Promise.resolve(
+        strings.join("").includes("provider_model") ? [latencyRow({ 5: 10 })] : [],
+      )) as never);
+    const liveLoad = vi.fn(
+      () => new Map([["inst-1", { running: 1, waiting: 4, kvUsage: null, at: new Date() }]]),
+    );
+    const view = await createRouterClient(poolsRouter, {
+      context: contextFor(CALLERS.person(), { liveLoad }),
+    }).get({ poolId: "pool-1" });
+    expect(liveLoad).toHaveBeenCalledWith(["inst-1"]);
+    expect(view.members[0]?.live.waiting).toBe(4);
+    expect(view.members[0]?.live.p95LatencyMs).toEqual(expect.any(Number));
+    const p95Call = db.$queryRaw.mock.calls.find((call) =>
+      (call[0] as unknown as TemplateStringsArray).join("").includes("provider_model"),
+    );
+    expect(p95Call?.slice(1)).toContain(OWNER);
+  });
+
+  it("never reads a contributed member's load (the contributor's engine)", async () => {
+    db.pool.findFirst.mockResolvedValue(
+      poolRow({
+        Members: [{ ...servingMember(), shareId: "share-1", Share: { Grantee: { email: "c@x" } } }],
+      }) as never,
+    );
+    const liveLoad = vi.fn(() => new Map());
+    const view = await createRouterClient(poolsRouter, {
+      context: contextFor(CALLERS.person(), { liveLoad }),
+    }).get({ poolId: "pool-1" });
+    expect(liveLoad).not.toHaveBeenCalled();
+    expect(view.members[0]?.live.waiting).toBeNull();
+  });
+
+  it("keeps load unknown without the relay service and p95 unknown without traffic", async () => {
+    db.pool.findFirst.mockResolvedValue(poolRow({ Members: [servingMember()] }) as never);
+    const view = await client().get({ poolId: "pool-1" });
+    expect(view.members[0]?.live).toMatchObject({ waiting: null, p95LatencyMs: null });
   });
 });
 

@@ -417,7 +417,7 @@ function MembersCard({ pool }: { pool: PoolView }) {
                           value: formatMs(member.live.p95LatencyMs, i18n.language, none),
                         })}`
                       : ""}
-                    {member.live.waiting > 0
+                    {member.live.waiting !== null && member.live.waiting > 0
                       ? ` · ${t("dashboard:pool.live.waiting", { count: member.live.waiting })}`
                       : ""}
                   </p>

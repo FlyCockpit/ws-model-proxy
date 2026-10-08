@@ -236,6 +236,8 @@ export const runtimeSummarySchema = z
         needsYou: z.number().int(),
       })
       .strict(),
+    /** Your nodes it is on: an always-on runtime's node, the nodes of its live instances. */
+    nodes: z.array(z.object({ id: idSchema, slug: z.string() }).strict()),
     /** Set when forked from a definition someone shared with you. */
     forkedFromVersionId: idSchema.nullable(),
   })

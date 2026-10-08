@@ -282,6 +282,56 @@ describe("errors and output", () => {
     });
   });
 
+  it("runtimes_get lists runtimes compactly, with the nodes each is on", async () => {
+    const row = (nodes: unknown[]) => ({
+      id: "rt-1",
+      nodeId: null,
+      forkedFromVersionId: null,
+      models: [],
+      nodes,
+    });
+    const result = await runMcpTool(tool("runtimes_get"), {
+      dispatch: testDispatch("READ"),
+      args: {},
+      invoke: async () => ({ runtimes: [row([{ id: "node-1", slug: "box" }]), row([])] }),
+    });
+    expect(structured(result).result).toEqual({
+      runtimes: [{ id: "rt-1", nodes: [{ id: "node-1", slug: "box" }] }, { id: "rt-1" }],
+    });
+  });
+
+  it("pools_get leaves unknown member live load out, and keeps the known values", async () => {
+    const pool = (live: Record<string, unknown>) => ({
+      id: "pool-1",
+      routing: { concurrencyLimit: null },
+      members: [{ id: "m-1", live }],
+    });
+    const unknown = { instances: 1, running: 1, waiting: null, p95LatencyMs: null };
+    const known = { instances: 2, running: 2, waiting: 3, p95LatencyMs: 840 };
+    const one = await runMcpTool(tool("pools_get"), {
+      dispatch: testDispatch("READ"),
+      args: { poolId: "pool-1" },
+      invoke: async () => pool(unknown),
+    });
+    expect(structured(one).result).toEqual({
+      id: "pool-1",
+      routing: { concurrencyLimit: null },
+      members: [{ id: "m-1", live: { instances: 1, running: 1 } }],
+    });
+    const list = await runMcpTool(tool("pools_get"), {
+      dispatch: testDispatch("READ"),
+      args: {},
+      invoke: async () => ({ pools: [pool(known), pool(unknown)], sharedWithMe: [] }),
+    });
+    expect(structured(list).result).toEqual({
+      pools: [
+        pool(known),
+        { ...pool(unknown), members: [{ id: "m-1", live: { instances: 1, running: 1 } }] },
+      ],
+      sharedWithMe: [],
+    });
+  });
+
   it("copies a refusal's fixed message and reason", async () => {
     const result = await runMcpTool(tool("runtime_start"), {
       dispatch: testDispatch("FULL"),

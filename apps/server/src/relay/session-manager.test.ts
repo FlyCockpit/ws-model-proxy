@@ -584,6 +584,36 @@ describe("RelaySessionManager (relay 3.0)", () => {
     ]);
   });
 
+  it("answers an instance's live load from its readings, and nothing for unknown or stale ones", async () => {
+    db.runtimeInstance.findFirst.mockResolvedValue({
+      id: "inst-5",
+      runtimeId: "rt-1",
+      versionId: "v-1",
+      engineSlots: null,
+      loadSignals: [],
+      Version: { engine: "VLLM", kvFullThreshold: null },
+    });
+    const socket = await connect();
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({
+        type: "runtime.load",
+        handle: "vllm",
+        running: 3,
+        waiting: 2,
+        kvUsage: 0.5,
+        counterEpoch: 0,
+        source: "builtin",
+        ts: new Date().toISOString(),
+      }),
+    );
+    const live = manager.getInstanceLiveLoad(["inst-5", "inst-other"]);
+    expect([...live.keys()]).toEqual(["inst-5"]);
+    expect(live.get("inst-5")).toMatchObject({ running: 3, waiting: 2, kvUsage: 0.5 });
+    // Past the staleness window the reading no longer counts.
+    expect(manager.getInstanceLiveLoad(["inst-5"], Date.now() + 60_000).size).toBe(0);
+  });
+
   it("marks a runtime.load sample FULL for the history as the live verdict judges its engine", async () => {
     db.runtimeInstance.findFirst.mockResolvedValue({
       id: "inst-3",

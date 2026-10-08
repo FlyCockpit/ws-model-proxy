@@ -48,6 +48,7 @@ function instance(id: string, overrides: Record<string, unknown>) {
     needsOperator: null,
     ranks: [],
     openSteps: [],
+    live: { running: null, waiting: null, kvUsage: null, slots: null, at: null },
     ...overrides,
   };
 }

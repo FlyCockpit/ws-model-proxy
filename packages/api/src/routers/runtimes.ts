@@ -13,6 +13,7 @@ import {
   instanceCapacityFences,
   runtimeCapacityFences,
 } from "../lib/graph-write";
+import { readLiveLoad } from "../lib/live-load";
 import {
   isForeignKeyViolation,
   isUniqueViolation,
@@ -396,6 +397,10 @@ export const runtimesRouter = {
       }),
     ]);
     const stopChecks = await latestStopChecks(prisma, instances);
+    const liveLoad = readLiveLoad(
+      context.services?.liveLoad,
+      instances.map((row) => row.id),
+    );
     const factsFrom = instances.find((instance) => instance.phase === "READY") ?? null;
     const previous = summary.currentVersion.launchChanged
       ? await previousLaunchHashOf(input.runtimeId, current.version)
@@ -416,7 +421,7 @@ export const runtimesRouter = {
       current: versionDetail(current, previous, factsFrom),
       requestProfile: profile ? requestProfileView(profile) : null,
       servedModels: models.map(runtimeModelView),
-      instanceList: instances.map((row) => instanceView(row, stopChecks)),
+      instanceList: instances.map((row) => instanceView(row, stopChecks, liveLoad)),
       shares: shares.map((share) => ({ id: share.id, email: share.Grantee.email })),
       contributions: models.flatMap((model) =>
         model.Members.filter((member) => member.shareId !== null).map((member) => ({
@@ -914,7 +919,11 @@ export const runtimesRouter = {
         include: INSTANCE_INCLUDE,
       });
       if (!row) throw notFound("That instance does not exist.");
-      return instanceView(row, await latestStopChecks(prisma, [row]));
+      return instanceView(
+        row,
+        await latestStopChecks(prisma, [row]),
+        readLiveLoad(context.services?.liveLoad, [row.id]),
+      );
     }),
   },
 
