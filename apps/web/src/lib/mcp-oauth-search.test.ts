@@ -7,6 +7,7 @@ import {
   mcpSearchFingerprint,
   parseMcpOAuthSearch,
   resolveOauthRedirectUrl,
+  signedRedirectHost,
   toMcpPublicClientInfo,
 } from "./mcp-oauth-search";
 
@@ -72,13 +73,10 @@ describe("explainableMcpScopes", () => {
 });
 
 describe("toMcpPublicClientInfo", () => {
-  // REAL wire shape (installed @better-auth/oauth-provider@1.7.3 dist,
-  // authorize-9whjxVLJ.mjs): getClientPublicEndpoint (:2303-2322) returns
-  // schemaToOAuth output (:2237-2256) whose display fields are snake_case —
-  // client_id / client_name / client_uri / logo_uri (+ contacts / tos_uri /
-  // policy_uri). The previous camelCase fixtures were circular (they fed the
-  // implementation's invented shape back to itself).
-  it("projects the REAL snake_case wire shape (client_id/client_name/client_uri) and drops logo_uri", () => {
+  // REAL wire shape (installed @better-auth/oauth-provider dist): getClientPublicEndpoint
+  // returns schemaToOAuth output whose display fields are snake_case — client_id /
+  // client_name / client_uri / logo_uri (+ contacts / tos_uri / policy_uri).
+  it("projects the REAL snake_case wire shape and drops the self-declared client_uri and logo_uri", () => {
     expect(
       toMcpPublicClientInfo({
         client_id: "client-1",
@@ -89,21 +87,16 @@ describe("toMcpPublicClientInfo", () => {
         tos_uri: "https://client.example/tos",
         policy_uri: "https://client.example/policy",
       }),
-    ).toEqual({ clientId: "client-1", name: "Example Client", uri: "https://client.example" });
+    ).toEqual({ clientId: "client-1", name: "Example Client" });
   });
 
   it("projects the REAL wire shape when optional fields are absent (schemaToOAuth ?? void 0)", () => {
     // name/uri/icon are nullable on the client row; schemaToOAuth emits
     // undefined for them — the projection must degrade to null gracefully.
-    expect(toMcpPublicClientInfo({ client_id: "c" })).toEqual({
-      clientId: "c",
-      name: null,
-      uri: null,
-    });
+    expect(toMcpPublicClientInfo({ client_id: "c" })).toEqual({ clientId: "c", name: null });
     expect(toMcpPublicClientInfo({ client_id: "c", client_name: "", client_uri: 7 })).toEqual({
       clientId: "c",
       name: null,
-      uri: null,
     });
   });
 
@@ -116,12 +109,11 @@ describe("toMcpPublicClientInfo", () => {
     expect(toMcpPublicClientInfo({ clientId: "c1", name: "N", uri: "https://u" })).toEqual({
       clientId: "c1",
       name: "N",
-      uri: "https://u",
     });
     // snake_case wins when both spellings are present.
     expect(
       toMcpPublicClientInfo({ client_id: "c2", clientId: "wrong", client_name: "Right" }),
-    ).toEqual({ clientId: "c2", name: "Right", uri: null });
+    ).toEqual({ clientId: "c2", name: "Right" });
   });
 });
 
@@ -147,5 +139,72 @@ describe("mcpSearchFingerprint + query keys (R83/R84 F5)", () => {
     for (const key of [sessionA, sessionB, txB]) {
       expect(key[0]).toBe(MCP_REAUTH_STATUS_QUERY_KEY);
     }
+  });
+});
+
+describe("signedRedirectHost", () => {
+  /** A signed query as the authorize endpoint writes it: every name listed in ba_param. */
+  function signed(entries: Array<[string, string]>, extra: Array<[string, string]> = []) {
+    const params = new URLSearchParams(entries);
+    for (const name of [...new Set([...entries.map(([key]) => key), "ba_param"])].sort())
+      params.append("ba_param", name);
+    params.append("sig", "s1");
+    for (const [key, value] of extra) params.append(key, value);
+    return `?${params.toString()}`;
+  }
+  const base: Array<[string, string]> = [
+    ["client_id", "c1"],
+    ["scope", "mcp:read"],
+  ];
+
+  it("shows the host of the signed redirect_uri, port included", () => {
+    expect(
+      signedRedirectHost(signed([...base, ["redirect_uri", "https://app.example.com/cb?x=1"]])),
+    ).toBe("app.example.com");
+    expect(
+      signedRedirectHost(signed([...base, ["redirect_uri", "http://127.0.0.1:33418/cb"]])),
+    ).toBe("127.0.0.1:33418");
+  });
+
+  it("names an app scheme so an app link never passes for a website", () => {
+    expect(signedRedirectHost(signed([...base, ["redirect_uri", "cursor://callback/mcp"]]))).toBe(
+      "cursor://callback",
+    );
+    expect(signedRedirectHost(signed([...base, ["redirect_uri", "com.example.app:/cb"]]))).toBe(
+      "com.example.app:",
+    );
+  });
+
+  it("ignores an unsigned redirect_uri the URL carries (the client plugin never forwards it)", () => {
+    expect(
+      signedRedirectHost(signed(base, [["redirect_uri", "https://evil.example/cb"]])),
+    ).toBeNull();
+  });
+
+  it("fails closed on a repeated, missing, unsigned-query or malformed redirect_uri", () => {
+    expect(
+      signedRedirectHost(
+        signed([
+          ...base,
+          ["redirect_uri", "https://app.example.com/cb"],
+          ["redirect_uri", "https://evil.example/cb"],
+        ]),
+      ),
+    ).toBeNull();
+    // Listed as signed, then a second copy appended.
+    expect(
+      signedRedirectHost(
+        signed(
+          [...base, ["redirect_uri", "https://app.example.com/cb"]],
+          [["redirect_uri", "https://evil.example/cb"]],
+        ),
+      ),
+    ).toBeNull();
+    expect(signedRedirectHost(signed(base))).toBeNull();
+    expect(
+      signedRedirectHost("?client_id=c1&redirect_uri=https%3A%2F%2Fapp.example.com"),
+    ).toBeNull();
+    expect(signedRedirectHost(signed([...base, ["redirect_uri", "not a url"]]))).toBeNull();
+    expect(signedRedirectHost("")).toBeNull();
   });
 });

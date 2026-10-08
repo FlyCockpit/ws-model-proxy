@@ -21,6 +21,7 @@ import {
   explainableMcpScopes,
   mcpSearchFingerprint,
   parseMcpOAuthSearch,
+  signedRedirectHost,
   toMcpPublicClientInfo,
 } from "@/lib/mcp-oauth-search";
 
@@ -31,7 +32,10 @@ import {
  * Requires a usable signed OAuth transaction in the URL. Canonical client
  * data comes from the session-authenticated GET /oauth2/public-client
  * (display-safe fields only; the remote `logo_uri` is never fetched or
- * rendered). Approval and denial both submit through POST /oauth2/consent
+ * rendered). Where the answer sends the browser is the host of the SIGNED
+ * `redirect_uri`, read from the raw URL exactly as the consent call forwards
+ * it (`signedRedirectHost`) — never the client's self-declared `client_uri`;
+ * without one the transaction is treated as invalid. Approval and denial both submit through POST /oauth2/consent
  * with `accept: true | false`; the page navigates ONLY on a server response
  * carrying `redirect === true` plus a nonempty `url` — including denial,
  * where Better Auth returns the client's redirect_uri with
@@ -117,6 +121,18 @@ function McpConsentTransaction({ search }: { search: Record<string, unknown> }) 
     );
   }
 
+  // The raw URL, as the consent call forwards it (the router's search is re-serialized).
+  const redirectHost =
+    typeof window === "undefined" ? null : signedRedirectHost(window.location.search);
+  if (redirectHost === null) {
+    return (
+      <ConsentTerminalCard
+        title={t("auth:mcpConsent.invalidTitle")}
+        description={t("auth:mcpConsent.invalidDescription")}
+      />
+    );
+  }
+
   const clientInfo = client.data;
   const clientName = clientInfo?.name ?? clientInfo?.clientId ?? t("auth:mcpConsent.unknownClient");
   const scopeRows = explainableMcpScopes(info.scopes);
@@ -132,9 +148,12 @@ function McpConsentTransaction({ search }: { search: Record<string, unknown> }) 
           <CardDescription className="min-w-0 break-words">
             {t("auth:mcpConsent.description", { client: clientName })}
           </CardDescription>
-          {clientInfo?.uri != null ? (
-            <p className="min-w-0 truncate text-xs text-muted-foreground">{clientInfo.uri}</p>
-          ) : null}
+          <p className="min-w-0 break-all text-sm text-muted-foreground">
+            {t("auth:mcpConsent.returnsTo")}{" "}
+            <span className="font-mono font-medium text-foreground" data-testid="redirect-host">
+              {redirectHost}
+            </span>
+          </p>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-3">
