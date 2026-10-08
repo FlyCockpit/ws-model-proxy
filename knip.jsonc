@@ -55,9 +55,7 @@
         "tailwindcss",
         "postcss",
         // Toast primitive re-exported from @ws-model-proxy/ui.
-        "sileo",
-        // Charts for the redesigned overview page, which the demo UI port adds next.
-        "recharts"
+        "sileo"
       ]
     },
     "packages/ui": {
