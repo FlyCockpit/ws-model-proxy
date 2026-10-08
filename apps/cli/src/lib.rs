@@ -44,6 +44,7 @@ pub mod startup;
 pub mod state;
 pub mod stt;
 pub mod stt_wire;
+pub mod subreaper;
 pub mod telemetry;
 pub mod telemetry_bounds;
 pub mod terminal_crypto;

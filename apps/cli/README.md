@@ -181,9 +181,13 @@ This is a **best-effort guard against agents** raising or widening their own acc
 server: dropping `WSMP_JOB`, `systemd-run --user` or a crontab does not get past it. It is **not a
 security boundary against other code running as your user**: such code can move itself into a
 cgroup named like a terminal's, ask your tmux to run a command, `ssh` back in to this machine, or
-simply edit your files, including this CLI's configuration. Run the relay as its service (`wsmp
-service install`): a command of a relay you started by hand can detach (`setsid`) from it. If you do
-not trust the code on this account, Relay only does not make it safe.
+simply edit your files, including this CLI's configuration. On Linux the relay adopts what its
+commands leave behind (a `setsid` or double-forked process re-parents to it, not to init), so that
+stays refused while the relay runs. Prefer the service (`wsmp service install`): when a relay you
+started by hand stops, those processes re-parent away from it and are no longer caught, while the
+service's cgroup still holds them. On macOS only the relay's descendants are refused (the `ps` parent
+walk), so a detached process escapes. If you do not trust the code on this account, Relay only does
+not make it safe.
 
 Lowering only stops new agent access through wsmp. It does not undo or contain software an agent
 already left on the node while it had Full control, such as a systemd user service: that software

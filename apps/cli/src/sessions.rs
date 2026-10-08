@@ -42,7 +42,8 @@ use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
-use std::process::Child as ExecChild;
+/// Registered with the subreaper, so its scan never reaps the command.
+type ExecChild = crate::subreaper::Owned<std::process::Child>;
 use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::Condvar;
@@ -1031,7 +1032,8 @@ fn pump_input(
 
 #[cfg(unix)]
 struct PtyRuntime {
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// Registered with the subreaper, so its scan never reaps the shell.
+    child: crate::subreaper::Owned<Box<dyn portable_pty::Child + Send + Sync>>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     input: Arc<InputQueue>,
     writer: Option<JoinHandle<()>>,
@@ -2391,7 +2393,10 @@ fn spawn_pty(
         &writer,
         nix::fcntl::FcntlArg::F_SETFL(flags | nix::fcntl::OFlag::O_NONBLOCK),
     )?;
-    let child = pair.slave.spawn_command(command)?;
+    let child = crate::subreaper::spawn(
+        || pair.slave.spawn_command(command),
+        |child| child.process_id(),
+    )?;
     let pid = child.process_id();
     let tracked = pid.map(|pid| LiveChildGuard::track(LiveChild::PtySession(pid)));
     let stop = Arc::new(AtomicBool::new(false));
@@ -3120,7 +3125,7 @@ fn spawn_exec(
         process.process_group(0);
     }
     #[cfg(not(windows))]
-    let mut child = process.spawn()?;
+    let mut child = crate::subreaper::spawn(|| process.spawn(), |child| Some(child.id()))?;
     #[cfg(windows)]
     let mut child = crate::job_tree::spawn(process)?;
     let pid = child.id();

@@ -67,8 +67,9 @@ use crate::job_tree::{Child, JobTree};
 use std::collections::BTreeMap;
 #[cfg(not(windows))]
 use std::collections::BTreeSet;
+/// Registered with the subreaper, so its scan never reaps the run's child.
 #[cfg(not(windows))]
-use std::process::Child;
+type Child = crate::subreaper::Owned<std::process::Child>;
 use std::process::{ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -504,7 +505,7 @@ fn run_inner(
         });
     }
     #[cfg(not(windows))]
-    let mut child = match command.spawn() {
+    let mut child = match crate::subreaper::spawn(|| command.spawn(), |child| Some(child.id())) {
         Ok(child) => child,
         Err(_) => {
             spawn_failed();
@@ -1425,11 +1426,11 @@ mod tests {
     #[cfg(unix)]
     fn own_group_sleeper() -> Child {
         use std::os::unix::process::CommandExt;
-        Command::new("sleep")
-            .arg("30")
-            .process_group(0)
-            .spawn()
-            .expect("sleep")
+        crate::subreaper::spawn(
+            || Command::new("sleep").arg("30").process_group(0).spawn(),
+            |child| Some(child.id()),
+        )
+        .expect("sleep")
     }
 
     /// A run that already passed the shutdown check but is not registered
