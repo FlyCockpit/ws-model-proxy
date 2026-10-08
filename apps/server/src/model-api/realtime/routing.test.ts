@@ -32,6 +32,9 @@ vi.mock("../resolve.js", async () => {
 const health = vi.hoisted(() => ({
   recordTargetRelayFailure: vi.fn(async () => ({ retryable: false, update: null })),
   markTargetRelaySuccess: vi.fn(async () => undefined),
+  markTargetHalfOpenTrial: vi.fn(async () => 1),
+  releaseTargetHalfOpenTrial: vi.fn(async () => true),
+  returnTargetTrial: vi.fn(async () => undefined),
 }));
 vi.mock("@ws-model-proxy/api/lib/pool-routing", async () => {
   const actual = await vi.importActual<typeof import("@ws-model-proxy/api/lib/pool-routing")>(
@@ -41,6 +44,9 @@ vi.mock("@ws-model-proxy/api/lib/pool-routing", async () => {
     ...actual,
     recordTargetRelayFailure: health.recordTargetRelayFailure,
     markTargetRelaySuccess: health.markTargetRelaySuccess,
+    markTargetHalfOpenTrial: health.markTargetHalfOpenTrial,
+    releaseTargetHalfOpenTrial: health.releaseTargetHalfOpenTrial,
+    returnTargetTrial: health.returnTargetTrial,
   };
 });
 
@@ -77,7 +83,12 @@ type RouteOverrides = {
   owner?: string;
   shareId?: string | null;
   weight?: number;
+  nextRetryAt?: Date | null;
+  trialStartedAt?: Date | null;
 };
+
+const PAST = new Date(Date.now() - 60_000);
+const FUTURE = new Date(Date.now() + 60_000);
 
 function testRoute({
   target = "et-1",
@@ -87,6 +98,8 @@ function testRoute({
   ready = true,
   health: targetHealth = "HEALTHY",
   owner = "owner",
+  nextRetryAt = null,
+  trialStartedAt = null,
 }: RouteOverrides = {}): TestRoute {
   return {
     target: {
@@ -95,8 +108,8 @@ function testRoute({
       lastFailureClass: null,
       consecutiveRetryableFailures: 0,
       lastFailureAt: null,
-      nextRetryAt: null,
-      halfOpenTrialStartedAt: null,
+      nextRetryAt,
+      halfOpenTrialStartedAt: trialStartedAt,
       lastRoutedAt: null,
     },
     instance: {
@@ -176,6 +189,9 @@ beforeEach(() => {
   callable.keyCalls = [];
   health.recordTargetRelayFailure.mockClear();
   health.markTargetRelaySuccess.mockClear();
+  health.markTargetHalfOpenTrial.mockClear();
+  health.releaseTargetHalfOpenTrial.mockClear();
+  health.returnTargetTrial.mockClear();
 });
 
 describe("live capability (from the served model's transcription profile)", () => {
@@ -222,7 +238,7 @@ describe("pool candidates", () => {
     ]);
   });
 
-  it("drops offline, unready, half-open, unhealthy, inactive and non-live routes", async () => {
+  it("drops offline, unready, trial-in-flight, cooling, unhealthy, inactive and non-live routes", async () => {
     const candidates = await poolCandidates({
       pool: POOL,
       config: {},
@@ -230,7 +246,8 @@ describe("pool candidates", () => {
       routes: async () => [
         poolRoute({ member: "offline", node: "node-2" }),
         poolRoute({ member: "unready", ready: false }),
-        poolRoute({ member: "half", health: "HALF_OPEN" }),
+        poolRoute({ member: "half", health: "HALF_OPEN", trialStartedAt: new Date() }),
+        poolRoute({ member: "cooling", health: "DEGRADED", nextRetryAt: FUTURE }),
         poolRoute({ member: "sick", health: "UNHEALTHY" }),
         poolRoute({ member: "inactive", active: false }),
         poolRoute({ member: "file-only", profile: { streaming: true } }),
@@ -238,6 +255,38 @@ describe("pool candidates", () => {
       ],
     });
     expect(candidates.map((candidate) => candidate.memberId)).toEqual(["ok"]);
+  });
+
+  it("offers a degraded target whose window opened as the session's trial, ahead of the rest", async () => {
+    const candidates = await poolCandidates({
+      pool: POOL,
+      config: {},
+      onlineNodeIds: ["node-1"],
+      routes: async () => [
+        poolRoute({ member: "fresh", target: "et-fresh", health: "UNKNOWN" }),
+        poolRoute({ member: "proven", target: "et-proven" }),
+        poolRoute({ member: "due", target: "et-due", health: "DEGRADED", nextRetryAt: PAST }),
+      ],
+    });
+    expect(candidates.map((candidate) => [candidate.memberId, candidate.trial])).toEqual([
+      ["due", { degradedFallback: true }],
+      ["proven", undefined],
+      ["fresh", undefined],
+    ]);
+  });
+
+  it("offers one trial per session even when several windows are open", async () => {
+    const candidates = await poolCandidates({
+      pool: POOL,
+      config: {},
+      onlineNodeIds: ["node-1"],
+      routes: async () => [
+        poolRoute({ member: "a", target: "et-a", health: "UNHEALTHY", nextRetryAt: PAST }),
+        poolRoute({ member: "b", target: "et-b", health: "DEGRADED", nextRetryAt: PAST }),
+      ],
+    });
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]?.trial).toBeDefined();
   });
 
   it("tries targets that served before ahead of unjudged ones", async () => {
@@ -253,12 +302,14 @@ describe("pool candidates", () => {
     expect(candidates.map((candidate) => candidate.memberId)).toEqual(["proven", "fresh"]);
   });
 
-  it("drops degraded targets", async () => {
+  it("drops degraded targets still in their cooldown", async () => {
     const candidates = await poolCandidates({
       pool: POOL,
       config: {},
       onlineNodeIds: ["node-1"],
-      routes: async () => [poolRoute({ member: "degraded", health: "DEGRADED" })],
+      routes: async () => [
+        poolRoute({ member: "degraded", health: "DEGRADED", nextRetryAt: FUTURE }),
+      ],
     });
     expect(candidates).toEqual([]);
   });
@@ -290,6 +341,23 @@ describe("pool candidates", () => {
 });
 
 describe("test candidates and model resolution", () => {
+  it("offers a direct test's target whose window opened as a trial, and skips one in flight", async () => {
+    const due = await testCandidates({
+      target: testTarget,
+      config: {},
+      onlineNodeIds: ["node-1"],
+      routes: async () => [testRoute({ health: "UNHEALTHY", nextRetryAt: PAST })],
+    });
+    expect(due.map((candidate) => candidate.trial)).toEqual([{ degradedFallback: false }]);
+    const inFlight = await testCandidates({
+      target: testTarget,
+      config: {},
+      onlineNodeIds: ["node-1"],
+      routes: async () => [testRoute({ health: "HALF_OPEN", trialStartedAt: new Date() })],
+    });
+    expect(inFlight).toEqual([]);
+  });
+
   it("routes the caller's own served model as a TEST target", async () => {
     const [candidate] = await testCandidates({
       target: testTarget,
@@ -382,6 +450,49 @@ describe("test candidates and model resolution", () => {
       failure: "timeout",
       trialStartedAt: null,
     });
+  });
+
+  it("claims, settles and gives back trials through the shared target health writes", async () => {
+    const router = createRealtimeRouter({
+      access: { kind: "dashboard", userId: "u" },
+      onlineNodeIds: () => ["node-1"],
+    });
+    const [candidate] = await poolCandidates({
+      pool: POOL,
+      config: {},
+      onlineNodeIds: ["node-1"],
+      routes: async () => [poolRoute({ health: "DEGRADED", nextRetryAt: PAST })],
+    });
+    if (!candidate?.trial) throw new Error("no trial candidate");
+    const startedAt = await router.claimTrial?.(candidate);
+    expect(startedAt).toBeInstanceOf(Date);
+    expect(health.markTargetHalfOpenTrial).toHaveBeenCalledWith({
+      executionTargetId: "et-1",
+      now: startedAt,
+      allowDegradedFallback: true,
+    });
+    health.markTargetHalfOpenTrial.mockResolvedValueOnce(0);
+    expect(await router.claimTrial?.(candidate)).toBeNull();
+    if (!startedAt) throw new Error("no claim");
+    router.memberOpened?.(candidate, startedAt);
+    expect(health.markTargetRelaySuccess).toHaveBeenCalledWith("et-1", {
+      trialStartedAt: startedAt,
+    });
+    router.memberOpenFailed(candidate, "timeout", startedAt);
+    expect(health.recordTargetRelayFailure).toHaveBeenCalledWith({
+      executionTargetId: "et-1",
+      failure: "timeout",
+      trialStartedAt: startedAt,
+    });
+    router.releaseTrial?.(candidate, startedAt, "unused");
+    expect(health.releaseTargetHalfOpenTrial).toHaveBeenCalledWith({
+      executionTargetId: "et-1",
+      trialStartedAt: startedAt,
+    });
+    router.releaseTrial?.(candidate, startedAt, "inconclusive");
+    expect(health.returnTargetTrial).toHaveBeenCalledWith(
+      expect.objectContaining({ executionTargetId: "et-1", trialStartedAt: startedAt }),
+    );
   });
 
   it("marks the target healthy when its engine opens a session, never as a trial", async () => {

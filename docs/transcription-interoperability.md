@@ -138,12 +138,15 @@ The runtime definition is the only source: a node that reports `realtime` for a
 served model its definition does not declare is never routed to. A session opens
 only on a pool member whose instance is ready on an online node and whose health is
 good or not yet known (a fresh runtime; members that already served go first). An open
-the engine accepts marks the member healthy; one that fails marks it degraded, and a
-degraded member takes no live sessions until an HTTP transcription request succeeds on
-it (live sessions never take the recovery trial). A pool whose members are all degraded
-or recovering refuses the session with close code 1013. A member that refuses sessions
+the engine accepts marks the member healthy; one that fails marks it degraded for a short
+backoff. When that window opens, one live session takes the member's recovery trial (an HTTP
+request may too), the same half-open trial HTTP uses, with one trial in flight per member: a
+session tries it first and falls back to the other members if it fails. A trial that opens
+marks the member healthy; one that fails starts a longer backoff. A pool with no member
+able to open refuses the session with close code 1013. A member that refuses sessions
 for a configuration reason (for example no `/v1/realtime` route) is logged and is not
-marked unhealthy for HTTP traffic. `GET /v1/models` marks a pool with a live-capable
+marked unhealthy for HTTP traffic, except that a recovery trial it refused waits out its
+backoff again. `GET /v1/models` marks a pool with a live-capable
 member with `supports_realtime_transcription` (a hint; routing decides); its
 `:external` entry never has it, since live sessions do not go to the cloud.
 

@@ -225,7 +225,13 @@ export function targetTrialLive(startedAt: Date | null, now: Date): boolean {
   return startedAt !== null && startedAt.getTime() > now.getTime() - TARGET_HALF_OPEN_LEASE_MS;
 }
 
-function effectiveHealthForRouting(
+/**
+ * How a target may be routed now: `HEALTHY` (healthy or not yet judged), `HALF_OPEN` (its
+ * recovery window is open and no trial is in flight: one request may claim the trial with
+ * {@link markTargetHalfOpenTrial}), or null. A due DEGRADED target counts only with
+ * `allowDegraded`.
+ */
+export function targetRoutingHealth(
   target: Pick<TargetHealthSnapshot, "health" | "nextRetryAt" | "halfOpenTrialStartedAt">,
   now: Date,
   allowDegraded: boolean,
@@ -245,12 +251,19 @@ export function routablePoolRoutes({
   onlineNodeIds,
   now,
   alternatives = routes,
+  degradedTrials = false,
 }: {
   routes: readonly PoolRouteRow[];
   onlineNodeIds: Iterable<string>;
   now: Date;
   /** Every route of the request (all surface groups), when `routes` is one group of them. */
   alternatives?: readonly PoolRouteRow[];
+  /**
+   * For targets no recovery probe covers (live transcription: the probe has no audio), a due
+   * degraded route takes its half-open trial beside healthy routes too; the caller falls back
+   * to them when the trial fails.
+   */
+  degradedTrials?: boolean;
 }): PoolRouteCandidate[] {
   const online = new Set(onlineNodeIds);
   const servable = (route: PoolRouteRow) =>
@@ -269,8 +282,8 @@ export function routablePoolRoutes({
   );
   const candidates: PoolRouteCandidate[] = [];
   for (const route of routes) {
-    const degradedFallback = !healthyAlternative && route.health === "DEGRADED";
-    const health = effectiveHealthForRouting(route, now, degradedFallback);
+    const degradedFallback = (degradedTrials || !healthyAlternative) && route.health === "DEGRADED";
+    const health = targetRoutingHealth(route, now, degradedFallback);
     if (health === null || !servable(route) || route.nodeId === null) continue;
     candidates.push({
       poolMemberId: route.poolMemberId,
@@ -327,6 +340,7 @@ export function buildPoolRouteSequence({
   now,
   state = {},
   alternatives,
+  degradedTrials = false,
 }: {
   routes: readonly PoolRouteRow[];
   onlineNodeIds: Iterable<string>;
@@ -334,11 +348,14 @@ export function buildPoolRouteSequence({
   state?: SmoothWeightedRoundRobinState;
   /** Every route of the request, when `routes` is one surface group of them. */
   alternatives?: readonly PoolRouteRow[];
+  /** See {@link routablePoolRoutes}. */
+  degradedTrials?: boolean;
 }): PoolRouteSequenceResult {
   const candidates = routablePoolRoutes({
     routes,
     onlineNodeIds,
     now,
+    degradedTrials,
     ...(alternatives ? { alternatives } : {}),
   });
   if (candidates.length === 0)
@@ -550,7 +567,7 @@ export async function markTargetHalfOpenTrial({
  * due request both try again (a DEGRADED one could be left to a probe that cannot cover its
  * model type); no failure is counted.
  */
-async function returnTargetTrial({
+export async function returnTargetTrial({
   executionTargetId,
   trialStartedAt,
   now,
