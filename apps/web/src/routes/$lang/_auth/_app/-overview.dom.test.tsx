@@ -161,7 +161,7 @@ afterEach(() => {
   window.sessionStorage.clear();
 });
 
-describe("Overview", { timeout: 30_000 }, () => {
+describe("Overview", () => {
   it("shows the KPIs, nodes and pools of the summary", async () => {
     state.summary = summary();
     await mount();

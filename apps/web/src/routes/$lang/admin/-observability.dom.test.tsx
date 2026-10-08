@@ -115,7 +115,7 @@ afterEach(() => {
   state.inputs = [];
 });
 
-describe("Admin observability", { timeout: 30_000 }, () => {
+describe("Admin observability", () => {
   it("lists nodes with owners and pages through them", async () => {
     await mount();
     expect(screen.getByText("U One · u1@example.test")).toBeTruthy();

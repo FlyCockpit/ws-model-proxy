@@ -1,12 +1,9 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, configure, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
-// A loaded runner can take longer than the 1 s default to render the shell.
-configure({ asyncUtilTimeout: 5_000 });
 
 /** The Needs-you badge (spec §7.1, §7.4): the sidebar's Terminals item and BottomNav's More. */
 

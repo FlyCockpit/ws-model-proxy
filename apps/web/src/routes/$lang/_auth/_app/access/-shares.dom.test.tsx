@@ -181,7 +181,7 @@ afterEach(() => {
   state.runtimeAnswer = null;
 });
 
-describe("Access → Shares: runtime definitions", { timeout: 30_000 }, () => {
+describe("Access → Shares: runtime definitions", () => {
   it("shares a runtime and shows the invite link once when no e-mail went out", async () => {
     const link =
       "https://proxy.example.com/en-US/signup?invite=wsmp_inv_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -238,7 +238,7 @@ function withMe(id: string, ownKeyEquivalentModel: string | null) {
   };
 }
 
-describe("Access → Shares: own key for a pool shared with me", { timeout: 30_000 }, () => {
+describe("Access → Shares: own key for a pool shared with me", () => {
   it("offers my enabled provider models of the pool's type only where the owner allows my own key", async () => {
     state.withMe = [withMe("chat", "openai/gpt-x"), withMe("plain", null)];
     await mount();

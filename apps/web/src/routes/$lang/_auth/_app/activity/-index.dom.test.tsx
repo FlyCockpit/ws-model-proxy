@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ComponentType, ReactNode } from "react";
 import { useSyncExternalStore } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 /** Activity metrics explorer: scope, metric, range/step, tests, compare versions, URL state. */
 
@@ -165,13 +165,18 @@ function answer(input: Input): Answer {
   };
 }
 
+const Component = Route.options.component as ComponentType & {
+  preload?: () => Promise<unknown>;
+};
+
+// Route components are code-split: load the chunk once, outside any test's
+// own budget.
+beforeAll(async () => {
+  await Component.preload?.();
+}, 60_000);
+
 async function mount() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  // Route components are code-split: load it before rendering.
-  const Component = Route.options.component as ComponentType & {
-    preload?: () => Promise<unknown>;
-  };
-  await Component.preload?.();
   render(
     <QueryClientProvider client={client}>
       <Component />
@@ -200,7 +205,7 @@ afterEach(() => {
   cleanup();
 });
 
-describe("Activity metrics explorer", { timeout: 30_000 }, () => {
+describe("Activity metrics explorer", () => {
   it("queries the first pool over 24 hours without tests and shows the totals", async () => {
     await mount();
     expect(await screen.findByText("1,239")).toBeTruthy();

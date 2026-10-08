@@ -36,10 +36,13 @@ vi.mock("@/components/confirm-delete-dialog", () => ({ ConfirmDeleteDialog: () =
 vi.mock("@/components/help", () => ({ Help: ({ children }: { children: ReactNode }) => children }));
 
 vi.mock("@/utils/orpc", () => {
+  // Lists render from the first paint (initialData), so no test waits on a
+  // wall-clock deadline for a query to settle.
   const list = (key: string, data: unknown) => ({
     queryOptions: (options?: { input?: unknown }) => ({
       queryKey: [key, options?.input ?? null],
       queryFn: async () => data,
+      initialData: data,
     }),
   });
   return {
@@ -146,11 +149,11 @@ afterEach(() => {
   state.applyCalls = [];
 });
 
-describe("profile items", { timeout: 30_000 }, () => {
+describe("profile items", () => {
   it("picks an older pinned version and the line's own nodes", async () => {
     wrap(<ProfileEditor profile={PROFILE} nodes={nodes} lang="en-US" />);
     const version = screen.getByLabelText("dashboard:profiles.editor.version") as HTMLSelectElement;
-    await within(version).findByRole("option", {
+    within(version).getByRole("option", {
       name: 'dashboard:profiles.editor.versionCurrent({"version":3})',
     });
     expect(version.value).toBe("v-2");
@@ -176,7 +179,7 @@ describe("profile items", { timeout: 30_000 }, () => {
   });
 });
 
-describe("profile item rows", { timeout: 30_000 }, () => {
+describe("profile item rows", () => {
   const twoLines = {
     ...PROFILE,
     items: [
@@ -234,7 +237,7 @@ describe("profile item rows", { timeout: 30_000 }, () => {
   });
 });
 
-describe("apply preview", { timeout: 30_000 }, () => {
+describe("apply preview", () => {
   it("shows the pinned version each start runs", async () => {
     const profile = {
       ...PROFILE,

@@ -265,7 +265,7 @@ afterEach(() => {
   state.catalogQueries = [];
 });
 
-describe("provider page", { timeout: 30_000 }, () => {
+describe("provider page", () => {
   it("shows this account's attempts and usage", async () => {
     await mount();
     expect(

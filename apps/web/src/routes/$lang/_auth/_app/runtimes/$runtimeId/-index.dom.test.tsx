@@ -105,7 +105,11 @@ beforeAll(async () => {
   await Component.preload?.();
 }, 30_000);
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  // Reset here, not at the end of a test: a failed test must not leak its kind.
+  state.kind = "STARTABLE";
+});
 
 function mount() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -123,7 +127,6 @@ describe("runtime overview instances", () => {
     await screen.findByText("i-stuck");
     for (const name of ["start", "stop", "restart"])
       expect(screen.queryByRole("button", { name: `dashboard:runtime.${name}` })).toBeNull();
-    state.kind = "STARTABLE";
   });
 
   it("links metrics by version and shows the sharing card", async () => {

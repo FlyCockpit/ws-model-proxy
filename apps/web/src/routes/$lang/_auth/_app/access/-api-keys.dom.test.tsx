@@ -97,7 +97,7 @@ afterEach(() => {
   state.keys = [];
 });
 
-describe("Access → API keys: can use", { timeout: 30_000 }, () => {
+describe("Access → API keys: can use", () => {
   it("names each selected pool, own and shared, and marks those no longer usable", async () => {
     state.keys = [key("laptop", { poolIds: ["p-own", "p-shared", "p-contribute-only", "p-gone"] })];
     await mount();
