@@ -5095,7 +5095,7 @@ mod tests {
             tx,
             Duration::from_secs(60),
             "/bin/sh",
-            &["-c", "stty raw -echo; printf wsmp-raw; sleep 30"],
+            &["-c", "stty raw -echo; printf wsmp-raw; sleep 600"],
         );
         let startup = enabled_startup(false);
         let mut a = TestViewer::new(1);
@@ -5145,7 +5145,6 @@ mod tests {
             }
         }
         let a_id = a.id.clone();
-        let started = Instant::now();
         let mut frames = Vec::new();
         // 2 MiB: far beyond the PTY buffer plus the 256 KiB queue.
         for _ in 0..128 {
@@ -5156,11 +5155,19 @@ mod tests {
                 &TermPlaintextV2::Data(chunk.clone()),
             ));
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "input handling blocked for {:?}",
-            started.elapsed()
-        );
+        // The PTY stays full until the shell exits, so a blocking write could
+        // only have returned once the shell was gone. Liveness, not speed:
+        // a slow (debug, loaded) but non-blocking paste still passes.
+        let shell_running = terminals
+            .sessions
+            .get_mut(MULTI_TERMINAL)
+            .and_then(|session| session.pty.as_mut())
+            .expect("pty")
+            .child
+            .try_wait()
+            .expect("try_wait")
+            .is_none();
+        assert!(shell_running, "input handling waited for the shell to exit");
         // One signal per run of drops, addressed to the typing viewer.
         assert_eq!(input_drops(&frames), vec![Some(a_id.clone())]);
         assert!(terminals.sessions.contains_key(MULTI_TERMINAL));
