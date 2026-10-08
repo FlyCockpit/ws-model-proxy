@@ -1157,62 +1157,22 @@ fn runtime_test_asks_the_model_list_and_reports_status_and_latency() {
 }
 
 #[test]
-fn service_env_path_points_under_config_dir() {
+fn service_offers_restart_and_logs_and_no_env_file_commands() {
     let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config").join("config.json");
+    let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
-    let stdout = cli(&config, &state)
-        .args(["service", "env-path"])
+    cli(&config, &state)
+        .args(["service", "--help"])
         .assert()
         .success()
-        .get_output()
-        .stdout
-        .clone();
-    let path = String::from_utf8_lossy(&stdout);
-    assert!(
-        path.contains("service.env"),
-        "expected service.env path, got {path}"
-    );
-}
-
-#[test]
-fn service_env_sync_writes_private_file_without_echoing_secret() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config").join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({
-            "version": 1,
-            "endpoints": [{
-                "slug": "local", "label": "local", "baseUrl": "http://127.0.0.1:8000",
-                "headers": [{ "name": "Authorization", "env": "WSMP_SERVICE_SYNC_TOKEN" }]
-            }]
-        }),
-    );
-    let secret = "super-secret-service-token-value";
-    let assert = cli(&config, &state)
+        .stdout(predicate::str::contains("restart"))
+        .stdout(predicate::str::contains("logs"))
+        .stdout(predicate::str::contains("env-sync").not())
+        .stdout(predicate::str::contains("env-path").not());
+    cli(&config, &state)
         .args(["service", "env-sync"])
-        .env("WSMP_SERVICE_SYNC_TOKEN", secret)
         .assert()
-        .success();
-    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
-    assert!(stdout.contains("WSMP_SERVICE_SYNC_TOKEN"));
-    assert!(
-        !stdout.contains(secret),
-        "env-sync must not print secret values"
-    );
-
-    let env_path = tmp.path().join("config").join("service.env");
-    let body = fs::read_to_string(&env_path).expect("service.env written");
-    assert!(body.contains("WSMP_SERVICE_SYNC_TOKEN="));
-    assert!(body.contains(secret));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(&env_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "service.env must be mode 0600");
-    }
+        .code(2);
 }
 
 #[test]

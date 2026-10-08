@@ -56,7 +56,6 @@ fn exec_has_independent_stream_state_and_flushes_before_the_end_without_eof() {
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
     let started = execs.start(
         &enabled_startup(false),
-        &Config::default(),
         "mask-exec",
         slow_command(),
         None,
@@ -101,7 +100,6 @@ fn exec_flushes_each_eof_immediately_while_the_child_is_running() {
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
     let _ = execs.start(
         &enabled_startup(false),
-        &Config::default(),
         "mask-eof",
         slow_command(),
         None,
@@ -136,7 +134,6 @@ fn exec_recovers_after_a_long_line_without_hiding_later_results() {
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
     let _ = execs.start(
         &enabled_startup(false),
-        &Config::default(),
         "mask-long",
         slow_command(),
         None,
@@ -171,7 +168,6 @@ fn real_exec_pipe_output_uses_the_masker_on_both_streams() {
     let command = include_str!("../../../tests/fixtures/masking/stream-exec-colored.sh");
     let _ = execs.start(
         &enabled_startup(false),
-        &Config::default(),
         "mask-real",
         command,
         None,
@@ -198,7 +194,6 @@ fn exec_command_text_naming_the_hf_token_file_selects_the_hf_class() {
     // The command only NAMES the token file (in a comment); nothing reads it.
     let _ = execs.start(
         &enabled_startup(false),
-        &Config::default(),
         "mask-hf",
         "printf 'plainword\\n'; printf 'other\\n' >&2 # ~/.cache/huggingface/token",
         None,
@@ -220,7 +215,6 @@ fn an_unknown_command_polls_as_unknown_and_tails_fit_one_frame() {
     assert!(NodeFrame::ExecStatus(unknown).validate().is_ok());
     let _ = execs.start(
         &enabled_startup(false),
-        &Config::default(),
         "big",
         slow_command(),
         None,

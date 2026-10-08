@@ -1542,7 +1542,7 @@ where
             );
         }
         ServerFrame::RuntimeJob(job) => {
-            handle_runtime_job(socket, config, startup, session, *job)?;
+            handle_runtime_job(socket, startup, session, *job)?;
         }
         ServerFrame::SecretSet(secret) => {
             let result = crate::secrets::set(startup.full_control(), &secret.name, &secret.value);
@@ -1624,7 +1624,6 @@ where
                 socket,
                 session.terminals.open(
                     startup,
-                    config,
                     state_dir.as_deref(),
                     TermHandshake {
                         terminal_id: &terminal_id,
@@ -1683,7 +1682,6 @@ where
                 socket,
                 session.terminals.auth(
                     startup,
-                    config,
                     state_dir.as_deref(),
                     &terminal_id,
                     viewer_id.as_deref(),
@@ -1699,14 +1697,9 @@ where
         } => {
             send_outbound_frames(
                 socket,
-                session.execs.start(
-                    startup,
-                    config,
-                    &command_id,
-                    &command,
-                    cwd.as_deref(),
-                    timeout_ms,
-                ),
+                session
+                    .execs
+                    .start(startup, &command_id, &command, cwd.as_deref(), timeout_ms),
             )?;
         }
         ServerFrame::ExecPoll {
@@ -1850,7 +1843,6 @@ where
 /// (a person's run in progress is never cut off: the stop waits for it).
 fn handle_runtime_job<S>(
     socket: &mut tungstenite::WebSocket<S>,
-    config: &Config,
     startup: &TerminalStartup,
     session: &mut Session,
     job: crate::protocol::frames::RuntimeJob,
@@ -1994,7 +1986,7 @@ where
                         );
                     }
                 }
-                Some(operator_ticket(&job, operator, &rendered, config))
+                Some(operator_ticket(&job, operator, &rendered))
             }
         };
         let submitted = match (session.runner.as_ref(), ticket) {
@@ -2060,7 +2052,6 @@ fn operator_ticket(
     job: &crate::protocol::frames::RuntimeJob,
     operator: &crate::protocol::frames::JobOperator,
     rendered: &Job,
-    config: &Config,
 ) -> crate::runtimes::runner::OperatorTicket {
     let command = if rendered.action == JobPhase::Stop {
         rendered.stop_command.clone()
@@ -2077,7 +2068,7 @@ fn operator_ticket(
             command,
             author: operator.command_author,
         },
-        base_env: crate::sessions::operator_base_env(config),
+        base_env: crate::sessions::operator_base_env(),
     }
 }
 
@@ -5575,7 +5566,7 @@ mod tests {
         let Some(operator) = job.operator.clone() else {
             panic!("operator job");
         };
-        let ticket = operator_ticket(&job, &operator, &rendered, &Config::default());
+        let ticket = operator_ticket(&job, &operator, &rendered);
         assert_eq!(ticket.screen.handle, "i-abcdefabcdef");
         assert_eq!(ticket.screen.command, "sudo systemctl start x");
         assert_eq!(ticket.ids.terminal_id, "AAAAAAAAAAAAAAAAAAAAAA");

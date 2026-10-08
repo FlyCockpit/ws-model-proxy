@@ -103,6 +103,8 @@ only; raise it with `wsmp trust full`.
 ```sh
 wsmp service install     # install, enable and start the per-user service
 wsmp service status      # what the service manager reports
+wsmp service restart     # restart it (after `wsmp login`, or to apply a setting read at start)
+wsmp service logs        # its logs; -f to follow, -n <lines> (default 100)
 wsmp service uninstall   # stop, disable and remove it
 wsmp status              # whether the relay runs and is connected, plus its runtimes and instances
 wsmp hardware            # what this node detects (memory, GPUs, unified pool); --json
@@ -115,9 +117,11 @@ wsmp logout              # forget this node's credential
 Halo reports VRAM carve-out plus GTT as its pool), and Apple silicon (the GPU wired limit). Check
 it before declaring overrides on the Nodes page.
 
-The service is a systemd user unit on Linux and a launchd agent on macOS. `wsmp service
-env-sync` and `wsmp service env-path` manage the private (0600) environment file the service
-reads; the node credential needs no entry there.
+The service is a systemd user unit on Linux and a launchd agent on macOS. It needs no
+environment file: the node credential and node secrets (`wsmp secret`) are files the relay reads
+itself, and the unit pins only the config and state paths and the installing shell's `PATH`.
+`wsmp service logs` reads journald on Linux (`journalctl --user -u wsmp.service`) and tails
+`~/Library/Logs/ws-model-proxy/relay.*.log` on macOS.
 
 **Linux: enable lingering.** A user service stops when you log out, and runtimes are started as
 transient user units, which need a user manager that outlives your sessions. Enable it once:
