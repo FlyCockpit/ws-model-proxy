@@ -291,7 +291,7 @@ fn resolve(
             name: held.slug.clone(),
             endpoint,
             probe: Probe::Models {
-                url: crate::probe::models_url(&base_url)?.to_string(),
+                url: safe_models_url(&base_url)?,
             },
         }]);
     }
@@ -315,14 +315,34 @@ fn resolve(
             escape_single_line(target)
         )));
     }
-    running
+    let targets: Vec<Target> = running
         .into_iter()
         .filter_map(|row| {
             jobs.iter()
                 .find(|job| job.instance_id == row.instance_id)
                 .map(instance_target)
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    if targets.is_empty() {
+        return Err(not_found(format!(
+            "no instance of `{}` runs on this node",
+            escape_single_line(target)
+        )));
+    }
+    Ok(targets)
+}
+
+/// The model-list URL, with an error that prints the (server-supplied) base
+/// URL escaped.
+fn safe_models_url(base_url: &str) -> Result<String> {
+    crate::probe::models_url(base_url)
+        .map(|url| url.to_string())
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "the runtime's address `{}` is not a usable URL",
+                escape_single_line(base_url)
+            )
+        })
 }
 
 fn instance_target(job: &crate::runtimes::executor::Job) -> Result<Target> {
@@ -351,7 +371,7 @@ fn probe_for(spec: &RuntimeSpec, base_url: &str, host: &str, port: u16) -> Resul
     }
     if spec.serves() {
         return Ok(Probe::Models {
-            url: crate::probe::models_url(base_url)?.to_string(),
+            url: safe_models_url(base_url)?,
         });
     }
     Ok(Probe::Connect {

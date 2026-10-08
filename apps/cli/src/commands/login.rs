@@ -541,8 +541,9 @@ fn offer_service(args: &Args) -> Result<bool> {
     if args.no_service {
         return Ok(false);
     }
+    // `--yes` takes the default only where a per-user service exists.
     let install = args.service
-        || args.yes
+        || (args.yes && cfg!(any(target_os = "linux", target_os = "macos")))
         || (interactive()
             && matches!(
                 ask("Install as a service so it starts at boot? [Y/n]: ")?
@@ -554,7 +555,7 @@ fn offer_service(args: &Args) -> Result<bool> {
     if !install {
         return Ok(false);
     }
-    crate::commands::service::install()?;
+    crate::commands::service::install(args.json)?;
     Ok(true)
 }
 

@@ -530,8 +530,9 @@ pub struct NodeMetricCommand {
     pub map: Option<BTreeMap<String, ReaderMapEntry>>,
 }
 
-/// The hardware declaration: browser (`Node.declaredResources`) or node
-/// (`config.json` `hardware`, which also carries `labels`).
+/// The hardware declaration: browser or agent (`Node.declaredResources`), or
+/// the node's `node.info.declared` (which also carries `labels`; the 0.4.0
+/// node never sends one).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeclaredHardware {

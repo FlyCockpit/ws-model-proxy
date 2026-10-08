@@ -59,7 +59,7 @@ struct LogsArgs {
 
 pub fn run(args: &Args) -> Result<()> {
     match &args.command {
-        CommandName::Install => install(),
+        CommandName::Install => install(false),
         CommandName::Uninstall => uninstall(),
         CommandName::Status => status(),
         CommandName::Restart => restart(),
@@ -334,8 +334,18 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// A line of install output: stdout, or stderr when the caller's stdout
+/// carries JSON (`wsmp login --json`).
+fn say(to_stderr: bool, text: impl std::fmt::Display) -> Result<()> {
+    if to_stderr {
+        output::diagnostic(text)
+    } else {
+        output::line(text)
+    }
+}
+
 #[cfg(target_os = "linux")]
-pub fn install() -> Result<()> {
+pub fn install(to_stderr: bool) -> Result<()> {
     let file = service_file()?;
     let executable = executable()?;
     let pinned = pinned_service_env()?;
@@ -349,12 +359,15 @@ pub fn install() -> Result<()> {
     let _ = Command::new("systemctl")
         .args(["--user", "restart", LINUX_UNIT])
         .status();
-    print_install_notes(&pinned)?;
-    output::line(format!("installed and started `{}`", file.display()))
+    print_install_notes(&pinned, to_stderr)?;
+    say(
+        to_stderr,
+        format!("installed and started `{}`", file.display()),
+    )
 }
 
 #[cfg(target_os = "macos")]
-pub fn install() -> Result<()> {
+pub fn install(to_stderr: bool) -> Result<()> {
     let file = service_file()?;
     let executable = executable()?;
 
@@ -399,12 +412,15 @@ pub fn install() -> Result<()> {
         .args(["kickstart", "-k", &format!("{domain}/{MACOS_LABEL}")])
         .status();
 
-    print_install_notes(&pinned)?;
-    output::line(format!("installed and started `{}`", file.display()))
+    print_install_notes(&pinned, to_stderr)?;
+    say(
+        to_stderr,
+        format!("installed and started `{}`", file.display()),
+    )
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn install() -> Result<()> {
+pub fn install(_to_stderr: bool) -> Result<()> {
     let _ = service_file()?;
     unreachable!()
 }
@@ -558,15 +574,17 @@ fn logs(_args: &LogsArgs) -> Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn print_install_notes(pinned: &[(&str, String)]) -> Result<()> {
+fn print_install_notes(pinned: &[(&str, String)], to_stderr: bool) -> Result<()> {
     for (name, value) in pinned {
-        output::line(format!("service pins `{name}` to `{value}`"))?;
+        say(to_stderr, format!("service pins `{name}` to `{value}`"))?;
     }
-    output::line(
+    say(
+        to_stderr,
         "node secrets are read from `secrets.env` (`wsmp secret`); the service needs no environment file",
     )?;
     #[cfg(target_os = "linux")]
-    output::line(
+    say(
+        to_stderr,
         "tip: for a user service that survives logout, run `loginctl enable-linger \"$USER\"`",
     )?;
     Ok(())

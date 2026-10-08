@@ -126,7 +126,8 @@ restarting.
 
 Removed CLI commands: `connect`, `daemon *`, `token`, `endpoints *`, `reload`,
 `service env-sync` and `service env-path` (the service needs no environment
-file: the node credential and node secrets are files the relay reads), and the
+file: the node credential and node secrets are files the relay reads; re-run
+`wsmp service install` and delete an old `service.env`), and the
 capability switches `config set-mcp-commands`, `set-file-read`,
 `set-remote-metric-sources`, `set-remote-engine-adapters`, `set-deployments`
 and `set-deployment-operator-terminal`. Use `wsmp run`, `wsmp service` and

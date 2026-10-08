@@ -122,8 +122,11 @@ never declared on the node itself.
 The service is a systemd user unit on Linux and a launchd agent on macOS. It needs no
 environment file: the node credential and node secrets (`wsmp secret`) are files the relay reads
 itself, and the unit pins only the config and state paths and the installing shell's `PATH`.
-`wsmp service logs` reads journald on Linux (`journalctl --user -u wsmp.service`) and tails
-`~/Library/Logs/ws-model-proxy/relay.*.log` on macOS.
+`wsmp service logs` reads journald on Linux (`journalctl --user -u wsmp.service`; on a host whose
+journal is not persistent, user units may log only to the system journal, which needs
+`journalctl --user-unit wsmp.service` with journal read access) and tails
+`~/Library/Logs/ws-model-proxy/relay.*.log` on macOS. Upgrading from 0.3: run `wsmp service
+install` again so the unit stops loading `service.env`, then delete that file.
 
 **Linux: enable lingering.** A user service stops when you log out, and runtimes are started as
 transient user units, which need a user manager that outlives your sessions. Enable it once:
@@ -210,7 +213,8 @@ a running instance's readiness route (else its model list, or a TCP connect for 
 readiness) and an always-on runtime's model list, and exits non-zero when the answer is not the
 expected one (3 when nothing matches). The stop proof `wsmp runtime list` shows for a stopping or
 stopped rank is the one the inventory reports: `proven`, or why not (`port_in_use`,
-`process_alive`, `status_unknown`, ...). Runtimes are defined in the web app or through MCP.
+`process_alive`, `status_unknown`, ...). To check the ports it binds each one for an instant, as
+the relay does; it writes nothing and runs no definition command. Runtimes are defined in the web app or through MCP.
 
 ## Other commands
 
