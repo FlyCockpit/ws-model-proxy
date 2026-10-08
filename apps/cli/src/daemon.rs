@@ -459,6 +459,9 @@ fn check_shutdown() -> Result<()> {
 pub fn connect_foreground() -> Result<()> {
     // First, so a stop that lands during startup still unwinds cleanly.
     crate::shutdown::install()?;
+    // Orphans of commands re-parent to the relay (Linux), so `trust` still
+    // finds it above them; see `subreaper`.
+    crate::subreaper::start();
     let mut config = Config::load_required()?;
     config.validate()?;
     let mut control = ControlServer::bind()?;

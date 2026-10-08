@@ -173,7 +173,11 @@ const UNTRACED: &str = "its parent processes do not lead back to a terminal or a
 /// - (b) it or an ancestor runs in a wsmp cgroup: `wsmp.service`, a `wsmp-*`
 ///   unit, a `wsmp_i_*` runtime slice, a `systemd-run` transient unit
 ///   (`run-*.service`, `run-*.scope`), or the relay's own service cgroup;
-/// - (c) an ancestor is the relay (`daemon_pid`, or any `wsmp … run`);
+/// - (c) an ancestor is the relay (`daemon_pid`, or any `wsmp … run`). The
+///   relay is a child subreaper (`crate::subreaper`), so an orphan of its
+///   commands (`setsid -f`, a double fork) re-parents to it, not to init.
+///   A daemon a command started (a tmux server, `gpg-agent`) is then the
+///   relay's, and so is everything it later starts, while the relay runs;
 /// - (d) it runs in a service of the user's systemd manager
 ///   (`user@UID.service/…/x.service/…`): a person's shell runs in a session
 ///   or app scope, while `systemd-run --user --unit=x` makes a service.
@@ -187,10 +191,12 @@ const UNTRACED: &str = "its parent processes do not lead back to a terminal or a
 /// at or a system service (cloud-init) are refused too.
 ///
 /// This stops `env -u WSMP_JOB`, `systemd-run --user`, cron and at, and an
-/// orphan of a relay that runs as its service. It is no boundary against
+/// orphan of the relay's commands while the relay runs (its service cgroup,
+/// or the relay as subreaper when run by hand). It is no boundary against
 /// code running as the user, which can still move itself into a cgroup
 /// named like a terminal's, ask the person's tmux to run a command, or `ssh`
-/// back in; nor against an orphan (`setsid -f`) of a relay run by hand.
+/// back in; nor against an orphan that outlives a relay run by hand, which
+/// re-parents away from it when it exits.
 #[cfg(target_os = "linux")]
 pub fn started_by_wsmp(pid: i32, daemon_pid: u32) -> Result<(), &'static str> {
     started_by_wsmp_in(std::path::Path::new("/proc"), pid, daemon_pid)
@@ -529,6 +535,158 @@ mod tests {
         assert!(is_relay(b"wsmp\0run\0"));
         assert!(!is_relay(b"wsmp\0trust\0full\0"));
         assert!(!is_relay(b"/usr/bin/cargo\0run\0"));
+    }
+
+    const SUBREAPER_HELPER: &str = "WSMP_TEST_SUBREAPER_HELPER";
+
+    /// `sh` backgrounds a `sleep` and exits, orphaning it: a double fork.
+    /// Returns the orphan's pid.
+    fn orphan_a_sleeper() -> u32 {
+        use std::io::Read;
+        // Through the subreaper registry, as the relay spawns: its scan must
+        // not take `sh`'s status.
+        let mut sh = crate::subreaper::spawn(
+            || {
+                std::process::Command::new("sh")
+                    .args(["-c", "sleep 60 </dev/null >/dev/null 2>&1 & echo $!"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+            },
+            |child| Some(child.id()),
+        )
+        .expect("sh");
+        let mut out = String::new();
+        sh.stdout
+            .take()
+            .expect("stdout")
+            .read_to_string(&mut out)
+            .expect("read");
+        assert!(sh.wait().expect("sh status").success());
+        out.trim().parse().expect("orphan pid")
+    }
+
+    fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// A line for the test that spawned this helper (the pipe it reads).
+    fn say(line: &str) {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{line}").expect("stdout");
+        out.flush().expect("stdout");
+    }
+
+    /// The relay-like process of the test below (its own process, so this
+    /// test binary never becomes a subreaper). Does nothing unless spawned
+    /// by that test.
+    #[test]
+    fn subreaper_helper() {
+        if std::env::var_os(SUBREAPER_HELPER).is_none() {
+            return;
+        }
+        let proc_root = Path::new("/proc");
+        let me = std::process::id();
+        // Before: the orphan goes to init or the user's systemd manager.
+        let before = orphan_a_sleeper();
+        assert!(wait_until(|| parent_pid(
+            &proc_root.join(before.to_string())
+        )
+        .is_some_and(|parent| parent != me)));
+        say(&format!("BEFORE={before}"));
+        // As the relay does at startup.
+        crate::subreaper::start();
+        let adopted = orphan_a_sleeper();
+        say(&format!("ADOPTED={adopted}"));
+        // Hold until the test has judged the orphan (it closes stdin).
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        for pid in [before, adopted] {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(i32::try_from(pid).expect("pid")),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        // The reaper thread reaps the adopted orphan: it does not stay a zombie.
+        assert!(
+            wait_until(|| !proc_root.join(adopted.to_string()).exists()),
+            "the adopted orphan was not reaped"
+        );
+        say("REAPED");
+    }
+
+    #[test]
+    fn a_double_forked_orphan_of_a_subreaper_relay_is_refused() {
+        use std::io::{BufRead, BufReader};
+        let mut helper = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "trust::tests::subreaper_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SUBREAPER_HELPER, "1")
+            .env_remove(JOB_MARKER_ENV)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("helper");
+        let helper_pid = helper.id();
+        let mut lines = BufReader::new(helper.stdout.take().expect("stdout")).lines();
+        let mut value = |key: &str| -> u32 {
+            lines
+                .by_ref()
+                .map_while(Result::ok)
+                // libtest prints the test's name first, on the same line.
+                .find_map(|line| line.rsplit_once(key)?.1.trim().parse().ok())
+                .unwrap_or_else(|| panic!("helper printed no {key}"))
+        };
+        let before = value("BEFORE=");
+        let adopted = value("ADOPTED=");
+        let proc_root = Path::new("/proc");
+        assert_ne!(
+            parent_pid(&proc_root.join(before.to_string())),
+            Some(helper_pid),
+            "without the subreaper, the orphan leaves the relay"
+        );
+        assert_eq!(
+            parent_pid(&proc_root.join(adopted.to_string())),
+            Some(helper_pid),
+            "the subreaper adopts the double-forked orphan"
+        );
+        let adopted_pid = i32::try_from(adopted).expect("pid");
+        assert!(started_by_wsmp(adopted_pid, helper_pid).is_err());
+        // Rule (c) itself: with a cgroup check that never fires, the walk
+        // still stops at the relay (the helper) above the orphan. (Run under
+        // a user service or a `run-*` scope, rules (b) and (d) fire first.)
+        let me = i32::try_from(std::process::id()).expect("pid");
+        if started_by_wsmp(me, 0).is_ok() {
+            assert_eq!(started_by_wsmp(adopted_pid, helper_pid), Err(STARTED));
+            assert_eq!(
+                started_by_wsmp(adopted_pid, 0),
+                Ok(()),
+                "without the relay's pid"
+            );
+        }
+        drop(helper.stdin.take());
+        assert!(
+            // Read to the end: a closed pipe would fail the helper's last prints.
+            lines
+                .map_while(Result::ok)
+                .filter(|line| line.ends_with("REAPED"))
+                .count()
+                == 1,
+            "the helper did not reap its orphan"
+        );
+        assert!(helper.wait().expect("helper exit").success());
     }
 
     #[test]
