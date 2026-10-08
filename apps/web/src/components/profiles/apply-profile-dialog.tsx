@@ -143,6 +143,9 @@ function PreviewSummary({
 }) {
   const { t } = useTranslation(["dashboard"]);
   const slug = (nodeId: string) => nodeById.get(nodeId)?.slug ?? nodeId;
+  // The pinned version each start runs (an older pin shows as such before confirming).
+  const versionNumber = (versionId: string) =>
+    profile.items.find((item) => item.versionId === versionId)?.versionNumber ?? null;
   const runtimeSlug = (runtimeId: string) =>
     runtimeNames.get(runtimeId) ??
     profile.items.find((item) => item.runtimeId === runtimeId)?.runtimeSlug ??
@@ -176,6 +179,13 @@ function PreviewSummary({
             {preview.starts.map((start, index) => (
               <li key={`${start.versionId}-${index}`}>
                 <span className="font-medium">{runtimeSlug(start.runtimeId)}</span>{" "}
+                {versionNumber(start.versionId) !== null ? (
+                  <span className="text-muted-foreground">
+                    {t("dashboard:profiles.apply.startVersion", {
+                      version: versionNumber(start.versionId),
+                    })}{" "}
+                  </span>
+                ) : null}
                 <span className="text-muted-foreground">
                   →{" "}
                   {start.placements

@@ -563,7 +563,8 @@
       "stopReason": {
         "preempted": "makes room",
         "profile_owned_node": "not in this profile"
-      }
+      },
+      "startVersion": "version {{version}}"
     },
     "editor": {
       "back": "All profiles",
@@ -590,7 +591,6 @@
       "addItem": "Add runtime",
       "removeItem": "Remove this runtime",
       "pinned": "Pinned to version {{version}}",
-      "onlyOn": "only on {{nodes}}",
       "updatePins": "Use newest versions",
       "applyHint": "Saving does not change what runs. Apply to switch.",
       "saved": "Profile saved.",
@@ -598,7 +598,15 @@
       "deleteDescription": "Nothing stops. Nodes it holds stay held until you release them.",
       "typeSlug": "Type the profile's short name to confirm",
       "deleted": "Profile deleted.",
-      "saveFirst": "Save your changes before applying."
+      "saveFirst": "Save your changes before applying.",
+      "version": "Version",
+      "versionNewest": "Current version ({{version}})",
+      "versionNewestUnknown": "Current version",
+      "versionCurrent": "Version {{version}} (current)",
+      "versionOption": "Version {{version}}",
+      "itemNodes": "Runs on",
+      "itemNodesAny": "None checked: any of this profile's nodes.",
+      "itemNodesSome": "Only on the checked nodes."
     }
   },
   "refusals": {

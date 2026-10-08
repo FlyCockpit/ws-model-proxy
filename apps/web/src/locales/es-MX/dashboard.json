@@ -563,7 +563,8 @@
       "stopReason": {
         "preempted": "libera espacio",
         "profile_owned_node": "no está en este perfil"
-      }
+      },
+      "startVersion": "versión {{version}}"
     },
     "editor": {
       "back": "Todos los perfiles",
@@ -590,7 +591,6 @@
       "addItem": "Agregar runtime",
       "removeItem": "Quitar este runtime",
       "pinned": "Fijado a la versión {{version}}",
-      "onlyOn": "solo en {{nodes}}",
       "updatePins": "Usar las versiones más nuevas",
       "applyHint": "Guardar no cambia lo que corre. Aplica para cambiar.",
       "saved": "Perfil guardado.",
@@ -598,7 +598,15 @@
       "deleteDescription": "Nada se detiene. Los nodos que retiene siguen retenidos hasta que los liberes.",
       "typeSlug": "Escribe el nombre corto del perfil para confirmar",
       "deleted": "Perfil eliminado.",
-      "saveFirst": "Guarda tus cambios antes de aplicar."
+      "saveFirst": "Guarda tus cambios antes de aplicar.",
+      "version": "Versión",
+      "versionNewest": "Versión actual ({{version}})",
+      "versionNewestUnknown": "Versión actual",
+      "versionCurrent": "Versión {{version}} (actual)",
+      "versionOption": "Versión {{version}}",
+      "itemNodes": "Corre en",
+      "itemNodesAny": "Ninguno marcado: cualquiera de los nodos de este perfil.",
+      "itemNodesSome": "Solo en los nodos marcados."
     }
   },
   "refusals": {
