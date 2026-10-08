@@ -177,7 +177,7 @@ export const adminUserSchema = z
   })
   .strict();
 
-/** Kept from 0.3 (`archive`/`unarchive` are the spec's ban/unban). */
+/** Kept from 0.3. "Archive" is the word everywhere (it bans the account in Better Auth). */
 export const usersContract = {
   list: query(
     "admin",
@@ -225,13 +225,13 @@ export const usersContract = {
     "human_admin",
     z.object({ userId: idSchema, reason: z.string().trim().max(500).optional() }).strict(),
     successSchema,
-    "Admin: ban an account.",
+    "Admin: archive an account (signed out, cannot sign in).",
   ),
   unarchive: mutation(
     "human_admin",
     z.object({ userId: idSchema }).strict(),
     successSchema,
-    "Admin: lift a ban.",
+    "Admin: restore an archived account.",
   ),
   remove: mutation(
     "human_admin",
