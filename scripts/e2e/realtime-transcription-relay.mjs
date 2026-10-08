@@ -282,13 +282,29 @@ try {
   await waitFor(() => testPage.state.closed, "session 4 close");
 
   // ---- session 5: the node goes away mid-session ----
-  const doomed = await eventually("the instance took no new session", async () => {
-    // The instance frees its one session slot once session 4's close reaches the node.
-    const attempt = realtimeClient(realtimeUrl, { headers: bearer });
-    await waitFor(() => attempt.state.closed || attempt.events.length > 0, "open outcome");
-    if (attempt.events.some((event) => event.type === "session.created")) return attempt;
-    return null;
-  });
+  // The engine session opens on the node with the first turn; a transcribed turn proves it is
+  // open (and the instance's one slot is free again), so the kill lands mid-session, not
+  // during the open (that would be `upstream_unavailable`, a failed open).
+  let doomed;
+  await eventually(
+    "session 5 got no transcript",
+    async () => {
+      doomed = realtimeClient(realtimeUrl, { headers: bearer });
+      await doomed.next("session.created");
+      sendTurn(doomed, pcm);
+      await waitFor(
+        () =>
+          doomed.state.closed ||
+          doomed.events.find(
+            (event) => event.type === "conversation.item.input_audio_transcription.completed",
+          ),
+        "session 5 turn outcome",
+        20_000,
+      );
+      return !doomed.state.closed;
+    },
+    { timeoutMs: 60_000, intervalMs: 1_000 },
+  );
   doomed.send({
     type: "input_audio_buffer.append",
     audio: pcm.subarray(0, 4_800).toString("base64"),

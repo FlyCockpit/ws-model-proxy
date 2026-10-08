@@ -135,7 +135,7 @@ export async function rpcClient(serverUrl, cookie) {
  * browser terminals), then run its relay in the foreground. Resolves once the server shows the
  * node online.
  */
-export async function startNode({ client, serverUrl, scratch, slug }) {
+export async function startNode({ client, serverUrl, scratch, slug, fileRoots }) {
   const cliBinary = resolve(process.env.WSMP_E2E_CLI_BINARY || "apps/cli/target/debug/wsmp");
   await access(cliBinary);
   const env = {
@@ -165,6 +165,17 @@ export async function startNode({ client, serverUrl, scratch, slug }) {
   const loginLog = captured(login);
   const loginCode = await new Promise((resolveExit) => login.once("exit", resolveExit));
   assert.equal(loginCode, 0, `wsmp login failed:\n${loginLog.text}`);
+  if (fileRoots) {
+    // A person at the node chooses the folders the file tools may use.
+    const roots = spawn(cliBinary, ["config", "set-file-roots", ...fileRoots], {
+      cwd: root,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const rootsLog = captured(roots);
+    const rootsCode = await new Promise((resolveExit) => roots.once("exit", resolveExit));
+    assert.equal(rootsCode, 0, `wsmp config set-file-roots failed:\n${rootsLog.text}`);
+  }
 
   const child = spawn(cliBinary, process.env.WSMP_E2E_VERBOSE ? ["-v", "run"] : ["run"], {
     cwd: root,
@@ -178,7 +189,7 @@ export async function startNode({ client, serverUrl, scratch, slug }) {
     if (child.exitCode !== null) throw new Error(`wsmp exited early:\n${log.text}`);
     const { nodes } = await client.nodes.list();
     const node = nodes.find((candidate) => candidate.slug === slug);
-    if (node?.connection === "ONLINE") return { child, log, nodeId: node.id };
+    if (node?.connection === "ONLINE") return { child, log, nodeId: node.id, env, cliBinary };
     await sleep(250);
   }
   throw new Error(`node ${slug} did not come online within 30s:\n${log.text}`);
