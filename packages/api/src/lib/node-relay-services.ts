@@ -1,9 +1,8 @@
 /**
- * Relay hooks the node and profile procedures call after they commit (lane B). Injected through
- * `Context.services.nodes` so the API package never imports the server.
- *
- * TODO(server): `apps/server` wires these to the relay (the server is being rekeyed; until then
- * every hook is optional and the procedures degrade as each one documents).
+ * Relay hooks the node and profile procedures call after they commit. Injected through
+ * `Context.services.nodes` so the API package never imports the server; `apps/server` wires them
+ * in `relay/node-wiring.ts`. Every hook is optional so tests can leave it out; the procedures
+ * degrade as each one documents.
  */
 export type NodeSecretWriteResult = {
   name: string;
@@ -40,7 +39,7 @@ export type NodeRelayServices = {
   disconnect?: (nodeId: string, reason: "node_deleted" | "credential_revoked") => Promise<void>;
   /**
    * A profile apply committed its operation (holds already written): stop the listed instances
-   * and start the planned ones through the runtime lifecycle (lane C owns starts and stops).
+   * and start the planned ones through the runtime lifecycle.
    */
   profileApplied?: (operationId: string) => Promise<void>;
 };

@@ -14,7 +14,7 @@ export type CreateContextOptions = {
 
 /**
  * Server-owned hooks the procedures may call. Injected so the API package never depends on
- * the server; the lanes add the hooks their procedures need (relay pushes, revocations).
+ * the server. `apps/server/src/app.ts` (`contextServices`) wires them; tests leave them out.
  */
 export type ContextServices = {
   /**
@@ -27,7 +27,7 @@ export type ContextServices = {
    * relay clears the pool's stored verdicts: hot-path rows a management writer must not write.
    */
   onPoolRoutingRulesChanged?: (poolId: string) => Promise<void>;
-  /** Lane B: node and profile relay hooks (`lib/node-relay-services.ts`). */
+  /** Node and profile relay hooks (`lib/node-relay-services.ts`). */
   nodes?: NodeRelayServices;
   /**
    * A runtime got a new version (create, update, fork). Push `runtime.define` to the nodes
@@ -48,7 +48,7 @@ export type ContextServices = {
    */
   dispatchRuntimeOperation?: (input: { userId: string; operationId: string }) => Promise<void>;
   /**
-   * Lane D (access): a credential or grant was revoked and committed. The server drops any
+   * A credential or grant was revoked and committed. The server drops any
    * cached admission for it and closes live MCP sessions or terminals it authorized. Absent
    * (tests): a revoked credential still stops working on the next lookup (every lookup reads
    * `revokedAt`).
@@ -64,7 +64,7 @@ export type ContextServices = {
   limitInviteLookup?: () => Promise<boolean>;
   /** Charges one signed-in invite acceptance (`auth.acceptInvite`) to the user; false: over. */
   limitInviteAccept?: (userId: string) => Promise<boolean>;
-  /** Lane D (terminals, node commands): the relay surfaces these procedures need. */
+  /** Terminals and node commands: the relay surfaces these procedures need. */
   nodeOperator?: NodeOperatorServices;
   /**
    * Node file tools (`nodes.files.*`) over relay 3.0. The procedure has checked the caller (a
