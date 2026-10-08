@@ -1540,6 +1540,61 @@
       "rank": "Node {{number}}",
       "pickEveryRank": "Pick a node for every position, or none.",
       "pickDistinct": "Pick a different node for each position."
+    },
+    "reader": {
+      "title": "Metrics reader",
+      "hint": "How wsmp reads load (running, waiting, KV cache) from the engine. Saving makes a new version: running instances use it after a restart.",
+      "readOnly": "The node owns this definition, so its reader is shown read-only.",
+      "preset": "Start from",
+      "pickPreset": "Pick a starting point…",
+      "presets": {
+        "builtin": "The engine's own (built in)",
+        "vllm": "vLLM /metrics",
+        "sglang": "SGLang /metrics",
+        "llama_cpp": "llama.cpp /metrics (--metrics)",
+        "custom_route": "Custom route",
+        "custom_command": "Custom command"
+      },
+      "kind": "Reader",
+      "kinds": {
+        "none": "None",
+        "builtin": "Built in (by engine)",
+        "route": "HTTP route",
+        "command": "Command on the node"
+      },
+      "route": "Route",
+      "routeHint": "On the instance's port, for example /metrics.",
+      "countRoute": "Token count route",
+      "countRouteHint": "Optional: a POST route that counts a request's tokens.",
+      "command": "Command",
+      "commandHint": "Runs on the node (needs Full control) and prints the metrics.",
+      "format": "Format",
+      "formats": {
+        "prometheus": "Prometheus text",
+        "json": "JSON"
+      },
+      "interval": "Every (seconds)",
+      "intervalHint": "Empty uses the default.",
+      "map": "Signals",
+      "mapHint": "Each signal reads a Prometheus series name or a JSON pointer such as /queue/running.",
+      "signal": "Signal",
+      "fields": {
+        "series": "Series",
+        "divideBy": "Divide by",
+        "scale": "Scale",
+        "aggregate": "Combine"
+      },
+      "aggregates": {
+        "default": "Default",
+        "sum": "Sum",
+        "max": "Max",
+        "first": "First"
+      },
+      "addSignal": "Add a signal",
+      "removeSignal": "Remove",
+      "duplicate": "Each signal can be read once.",
+      "save": "Save reader",
+      "note": "Metrics reader changed"
     }
   },
   "overview": {

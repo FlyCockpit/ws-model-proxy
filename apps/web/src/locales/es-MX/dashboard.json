@@ -1540,6 +1540,61 @@
       "rank": "Nodo {{number}}",
       "pickEveryRank": "Elige un nodo para cada posición, o ninguno.",
       "pickDistinct": "Elige un nodo distinto para cada posición."
+    },
+    "reader": {
+      "title": "Lector de métricas",
+      "hint": "Cómo lee wsmp la carga (en curso, en espera, caché KV) del motor. Guardar crea una versión nueva: las instancias en ejecución la usan tras reiniciarse.",
+      "readOnly": "El nodo es dueño de esta definición, así que su lector se muestra solo para lectura.",
+      "preset": "Empezar desde",
+      "pickPreset": "Elige un punto de partida…",
+      "presets": {
+        "builtin": "El propio del motor (integrado)",
+        "vllm": "vLLM /metrics",
+        "sglang": "SGLang /metrics",
+        "llama_cpp": "llama.cpp /metrics (--metrics)",
+        "custom_route": "Ruta personalizada",
+        "custom_command": "Comando personalizado"
+      },
+      "kind": "Lector",
+      "kinds": {
+        "none": "Ninguno",
+        "builtin": "Integrado (según el motor)",
+        "route": "Ruta HTTP",
+        "command": "Comando en el nodo"
+      },
+      "route": "Ruta",
+      "routeHint": "En el puerto de la instancia, por ejemplo /metrics.",
+      "countRoute": "Ruta de conteo de tokens",
+      "countRouteHint": "Opcional: una ruta POST que cuenta los tokens de una solicitud.",
+      "command": "Comando",
+      "commandHint": "Se ejecuta en el nodo (requiere Control total) e imprime las métricas.",
+      "format": "Formato",
+      "formats": {
+        "prometheus": "Texto de Prometheus",
+        "json": "JSON"
+      },
+      "interval": "Cada (segundos)",
+      "intervalHint": "Vacío usa el valor predeterminado.",
+      "map": "Señales",
+      "mapHint": "Cada señal lee un nombre de serie de Prometheus o un puntero JSON como /queue/running.",
+      "signal": "Señal",
+      "fields": {
+        "series": "Serie",
+        "divideBy": "Dividir entre",
+        "scale": "Escala",
+        "aggregate": "Combinar"
+      },
+      "aggregates": {
+        "default": "Predeterminado",
+        "sum": "Suma",
+        "max": "Máximo",
+        "first": "Primero"
+      },
+      "addSignal": "Agregar una señal",
+      "removeSignal": "Quitar",
+      "duplicate": "Cada señal se puede leer una sola vez.",
+      "save": "Guardar lector",
+      "note": "Lector de métricas cambiado"
     }
   },
   "overview": {
