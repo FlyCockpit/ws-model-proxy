@@ -409,6 +409,12 @@ pub trait Runtime {
     fn cancelled(&self) -> bool {
         false
     }
+    /// Whether every command this runtime runs for a rank stays in units and a rank slice it
+    /// can observe (`tasks_alive`), as systemd's do on Linux. Without them (macOS runs a
+    /// service's commands detached) an empty unit proves nothing, so every stop also needs the
+    /// run's status command to say stopped. Required, never defaulted: a wrong `true` would
+    /// prove stops from units that never held anything.
+    fn contains_ranks(&self) -> bool;
     fn launch(&self, job: &Job, owner: &str, unit: &str, deadline: Deadline) -> Result<String>;
     fn identity(&self, unit: &str, owner: &str, deadline: Deadline) -> Result<Option<String>>;
     fn launch_completed(
@@ -994,14 +1000,16 @@ impl Executor {
     /// (exit 3): a `service` runtime (its start may hand off to docker or a
     /// service manager, so an empty unit and a port not yet bound prove
     /// nothing), a serving step a person ran in an operator terminal
-    /// (`external`), and any run on a platform without units (`self-detached`).
+    /// (`external`), and any run on a runtime without units (`self-detached`;
+    /// [`Runtime::contains_ranks`]).
     ///
     /// Reasons: `process_alive`, `process_unknown` (the user manager could not
     /// say), `port_in_use`, `unowned_service` (outside the node's units with no
     /// status command), `status_running`, `status_unknown`.
     ///
     /// `run_status`: false for the inventory, which runs nothing in a rank's slice (it holds no
-    /// rank lock): a run that needs its status command is then simply not reported stopped.
+    /// rank lock): a run that needs its status command is then never reported stopped (a held
+    /// port is still named `port_in_use`).
     fn stop_unproven(
         &self,
         job: &Job,
@@ -1036,7 +1044,7 @@ impl Executor {
                 statuses.push((owner, status));
             }
         }
-        let detached = cfg!(not(target_os = "linux"))
+        let detached = !runtime.contains_ranks()
             || jobs
                 .iter()
                 .any(|owner| owner.management() == Management::Service)
@@ -1046,8 +1054,18 @@ impl Executor {
         if detached && statuses.is_empty() {
             return Ok(Some("unowned_service"));
         }
+        let port_held = || {
+            ports
+                .iter()
+                .any(|(host, port)| !runtime.port_free(host, *port))
+        };
         if detached && !run_status {
-            return Ok(Some("status_unknown"));
+            // A held port is a fact; the status command the inventory may not run is not.
+            return Ok(Some(if port_held() {
+                "port_in_use"
+            } else {
+                "status_unknown"
+            }));
         }
         if detached {
             for (owner, status) in statuses {
@@ -1078,10 +1096,7 @@ impl Executor {
                 }
             }
         }
-        if ports
-            .iter()
-            .any(|(host, port)| !runtime.port_free(host, *port))
-        {
+        if port_held() {
             return Ok(Some("port_in_use"));
         }
         Ok(None)
@@ -1459,6 +1474,9 @@ impl<R: Runtime> OperatorRan<'_, R> {
 impl<R: Runtime> Runtime for OperatorRan<'_, R> {
     fn cancelled(&self) -> bool {
         self.inner.cancelled()
+    }
+    fn contains_ranks(&self) -> bool {
+        self.inner.contains_ranks()
     }
     fn launch(&self, job: &Job, _owner: &str, _unit: &str, deadline: Deadline) -> Result<String> {
         self.launched(job, deadline)

@@ -302,6 +302,9 @@ impl Machine {
 }
 
 impl Runtime for Machine {
+    fn contains_ranks(&self) -> bool {
+        true
+    }
     fn launch(&self, _: &Job, _: &str, _: &str, _: Deadline) -> anyhow::Result<String> {
         anyhow::bail!("an operator step never launches a unit")
     }

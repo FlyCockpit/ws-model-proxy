@@ -328,6 +328,10 @@ impl NativeRuntime {
 }
 
 impl Runtime for NativeRuntime {
+    /// Only Linux runs a rank's commands in systemd units and a slice the node can watch.
+    fn contains_ranks(&self) -> bool {
+        cfg!(target_os = "linux")
+    }
     fn cancelled(&self) -> bool {
         self.cancel
             .as_ref()

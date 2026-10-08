@@ -67,6 +67,9 @@ struct Fake {
     detach_on_probe: Cell<bool>,
     /// The start unit's main process exited with status 0.
     exited_cleanly: Cell<bool>,
+    /// Whether the runtime holds a rank in units and a slice (systemd); false is a node
+    /// without units (macOS), whatever platform the tests run on.
+    contains_ranks: Cell<bool>,
 }
 
 impl Fake {
@@ -87,11 +90,15 @@ impl Fake {
             tasks_unknown: Cell::new(false),
             detach_on_probe: Cell::new(false),
             exited_cleanly: Cell::new(false),
+            contains_ranks: Cell::new(true),
         }
     }
 }
 
 impl Runtime for Fake {
+    fn contains_ranks(&self) -> bool {
+        self.contains_ranks.get()
+    }
     fn launch(&self, _: &Job, _: &str, unit: &str, _: Deadline) -> Result<String> {
         let state: State = serde_json::from_slice(&std::fs::read(&self.intent_path)?)?;
         anyhow::ensure!(
@@ -429,6 +436,9 @@ struct Stalling {
 }
 
 impl Runtime for Stalling {
+    fn contains_ranks(&self) -> bool {
+        self.inner.contains_ranks()
+    }
     fn launch(&self, job: &Job, owner: &str, unit: &str, deadline: Deadline) -> Result<String> {
         self.inner.launch(job, owner, unit, deadline)
     }
@@ -659,6 +669,9 @@ struct Flaky {
 }
 
 impl Runtime for Flaky {
+    fn contains_ranks(&self) -> bool {
+        self.inner.contains_ranks()
+    }
     fn launch(&self, job: &Job, owner: &str, unit: &str, deadline: Deadline) -> Result<String> {
         self.inner.launch(job, owner, unit, deadline)
     }
@@ -1206,4 +1219,65 @@ fn a_new_run_forgets_that_an_earlier_one_ran_outside_the_units() {
     let mut probe = stubbed(job(JobPhase::Status));
     probe.step_id = "p1".into();
     assert!(executor.execute(probe, &runtime, deadline()).stopped);
+}
+
+/// A node without units (macOS): its stops rest on the status command and the ports,
+/// never on units that never held anything, and each unproven answer says which fact failed.
+#[test]
+fn a_node_without_units_proves_a_stop_by_its_status_and_its_ports() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    runtime.contains_ranks.set(false);
+    let mut executor = Executor::load(path.clone()).expect("load");
+    let probe = |step: &str, status: Option<&str>| {
+        let mut probe = job(JobPhase::Status);
+        probe.step_id = step.into();
+        probe.status_command = status.map(str::to_string);
+        probe.dist_port = Some(30002);
+        probe
+    };
+    let detail = |outcome: Outcome| (outcome.stopped, outcome.detail);
+    // Nothing runs in any unit, yet a run without a status command can never be proven.
+    assert_eq!(
+        detail(executor.execute(probe("p1", None), &runtime, deadline())),
+        (false, Some("unowned_service".into()))
+    );
+    let status = Some("systemctl is-active llm");
+    assert_eq!(
+        detail(executor.execute(probe("p2", status), &runtime, deadline())),
+        (false, Some("status_unknown".into()))
+    );
+    runtime.status_alive.set(Some(true));
+    assert_eq!(
+        detail(executor.execute(probe("p3", status), &runtime, deadline())),
+        (false, Some("status_running".into()))
+    );
+    // Status exit 3 is half the proof: a held port (the dist port too) keeps it unproven.
+    runtime.status_alive.set(Some(false));
+    runtime.busy_ports.borrow_mut().push(30002);
+    assert_eq!(
+        detail(executor.execute(probe("p4", status), &runtime, deadline())),
+        (false, Some("port_in_use".into()))
+    );
+    // The inventory runs no status command, but still names a held port.
+    let rank = probe("p5", status);
+    assert_eq!(
+        executor
+            .stop_unproven_now(&rank, &runtime, deadline())
+            .expect("proof"),
+        Some("port_in_use")
+    );
+    runtime.busy_ports.borrow_mut().clear();
+    assert_eq!(
+        executor
+            .stop_unproven_now(&rank, &runtime, deadline())
+            .expect("proof"),
+        Some("status_unknown")
+    );
+    assert_eq!(
+        detail(executor.execute(probe("p6", status), &runtime, deadline())),
+        (true, None)
+    );
+    assert!(!path.exists());
 }
