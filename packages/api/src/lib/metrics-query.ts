@@ -9,8 +9,9 @@
  * `ownerUserId` (they are the node owner's). A pool shared with the caller gives request metrics
  * of the caller's own requests to it only (`requesterUserId`), ungrouped or by source.
  *
- * Agent tests (`AGENT_TEST`, MCP `model_test`) are not load: unless `includeAgentTests`, they are
- * left out of every request metric and only counted, as `totals.tests` when there are any. A test
+ * Tests (the Test page's `TEST` and MCP `model_test`'s `AGENT_TEST`) are not load: unless
+ * `includeTests`, they are left out of every request metric (as on the Overview) and only
+ * counted, as `totals.tests` when there are any. A test
  * of a runtime (`runtime:<id>:<model>`) is direct traffic: it has no pool, so it counts in the
  * runtime, version, node and instance scopes, never in a pool the runtime serves.
  *
@@ -35,6 +36,7 @@ import {
   RANGE_MS,
   STEP_MS,
 } from "../contracts/metrics";
+import { realTraffic, testTraffic } from "./test-traffic";
 
 export type MetricsQueryInput = z.output<typeof metricsQueryInputSchema>;
 export type MetricsQueryOutput = z.infer<typeof metricsQueryOutputSchema>;
@@ -239,8 +241,8 @@ function bucketExpr(alias: string, stepMs: number): Prisma.Sql {
 
 type Window = { from: Date; to: Date; stepMs: number };
 
-/** Which request sources a request query reads: all, all but agent tests, or agent tests only. */
-type SourceFilter = "all" | "notTests" | "tests";
+/** Which request sources a request query reads: all, real traffic only, or tests only. */
+type SourceFilter = "all" | "real" | "tests";
 
 function requestWhere(
   userId: string,
@@ -252,8 +254,8 @@ function requestWhere(
     Prisma.sql`"bucketStart" >= ${window.from}`,
     Prisma.sql`"bucketStart" < ${window.to}`,
   ];
-  if (sources === "notTests") parts.push(Prisma.sql`source <> 'AGENT_TEST'::"RequestSource"`);
-  if (sources === "tests") parts.push(Prisma.sql`source = 'AGENT_TEST'::"RequestSource"`);
+  if (sources === "real") parts.push(realTraffic());
+  if (sources === "tests") parts.push(testTraffic());
   // Placement scopes count traffic of the caller's own pools and direct calls only (as the
   // request log does): a runtime contributed to someone else's pool serves that owner's users.
   if (scope.kind !== "pool") parts.push(Prisma.sql`"ownerUserId" = ${userId}`);
@@ -362,12 +364,8 @@ function requestRows(where: Prisma.Sql, columns: Prisma.Sql, window: Window): Pr
     : Prisma.sql`(SELECT ${columns} FROM usage_rollup_minute WHERE ${where})`;
 }
 
-/** Agent tests in the scope and range that the request metrics left out. */
-async function agentTestCount(
-  userId: string,
-  scope: ResolvedScope,
-  window: Window,
-): Promise<number> {
+/** Tests in the scope and range that the request metrics left out. */
+async function testCount(userId: string, scope: ResolvedScope, window: Window): Promise<number> {
   const where = requestWhere(userId, scope, window, "tests");
   const rows = await prisma.$queryRaw<Row[]>`SELECT SUM(r.requests)::float8 AS requests
     FROM ${requestRows(where, Prisma.raw(`"requests"`), window)} r`;
@@ -381,7 +379,7 @@ function requestPlan(
   input: MetricsQueryInput,
   histograms: readonly HistogramName[],
 ): FamilyPlan {
-  const where = requestWhere(userId, scope, window, input.includeAgentTests ? "all" : "notTests");
+  const where = requestWhere(userId, scope, window, input.includeTests ? "all" : "real");
   const source = requestRows(where, requestColumns(histograms), window);
   const group = requestGroup(input.groupBy, userId, scope.kind === "pool");
   const aggregates = requestAggregates(histograms);
@@ -798,7 +796,7 @@ export async function runMetricsQuery(
 
   const [totalsByFamily, tests] = await Promise.all([
     Promise.all(plans.map((plan) => plan.totals())),
-    families.has("request") && !input.includeAgentTests ? agentTestCount(userId, scope, window) : 0,
+    families.has("request") && !input.includeTests ? testCount(userId, scope, window) : 0,
   ]);
 
   const points = metricBuckets(window.from.getTime(), window.to.getTime(), window.stepMs);

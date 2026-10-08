@@ -191,7 +191,7 @@ export const poolViewSchema = z
         })
         .strict(),
     ),
-    /** Pool cards: last 24 h (agent tests excluded), 24 hourly request counts. */
+    /** Pool cards: last 24 h (tests excluded), 24 hourly request counts. */
     traffic24h: z
       .object({
         requests: z.number().int(),

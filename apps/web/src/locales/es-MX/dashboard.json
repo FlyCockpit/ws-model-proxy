@@ -1391,8 +1391,8 @@
     "kpi": {
       "title": "Tráfico",
       "description": {
-        "24h": "Tus pools y runtimes, y tus propias solicitudes, en las últimas 24 horas. Sin pruebas de agentes.",
-        "7d": "Tus pools y runtimes, y tus propias solicitudes, en los últimos 7 días. Sin pruebas de agentes."
+        "24h": "Tus pools y runtimes, y tus propias solicitudes, en las últimas 24 horas. Sin pruebas.",
+        "7d": "Tus pools y runtimes, y tus propias solicitudes, en los últimos 7 días. Sin pruebas."
       },
       "none": "—",
       "requests": "Solicitudes",

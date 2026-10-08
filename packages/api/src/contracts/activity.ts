@@ -211,7 +211,7 @@ export const activityContract = {
             .strict(),
         })
         .strict(),
-      "Overview KPIs (agent tests excluded), nodes strip, pool cards, getting-started state.",
+      "Overview KPIs (tests excluded), nodes strip, pool cards, getting-started state.",
     ),
   },
   needsYou: {

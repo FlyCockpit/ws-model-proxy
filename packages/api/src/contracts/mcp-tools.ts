@@ -333,7 +333,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "metrics_query",
     description:
-      "Request, engine-load and node metrics for a pool, runtime, version, node or instance over a range, optionally grouped; point time = start + at×step. Use it to compare versions after a change. model_test traffic is left out (totals.tests counts it) unless includeAgentTests; a runtime test counts on the runtime, not its pools.",
+      "Request, engine-load and node metrics for a pool, runtime, version, node or instance over a range, optionally grouped; point time = start + at×step. Use it to compare versions after a change. Tests (model_test, Test page) are left out (totals.tests counts them) unless includeTests; a runtime test counts on the runtime, not its pools.",
     input: activityContract.metrics.query.input,
     output: activityContract.metrics.query.output,
     procedures: ["activity.metrics.query"],

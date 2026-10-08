@@ -9,6 +9,7 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import { nodeTrustView } from "../nodes/trust";
 import { callableIdOf } from "./access-views";
 import { compactNumber } from "./metrics-query";
+import { realTraffic } from "./test-traffic";
 
 export type OverviewRange = "24h" | "7d";
 
@@ -78,7 +79,7 @@ export async function poolTraffic(
       SUM(requests)::float8 AS requests, SUM(errors)::float8 AS errors
     FROM usage_rollup_minute
     WHERE "ownerUserId" = ${ownerId} AND "poolId" = ANY(${[...poolIds]}::text[])
-      AND "bucketStart" >= ${from} AND source <> 'AGENT_TEST'::"RequestSource"
+      AND "bucketStart" >= ${from} AND ${realTraffic()}
     GROUP BY 1, 2`;
   for (const row of rows) {
     const entry = byPool.get(String(row.pool));
@@ -96,7 +97,6 @@ export async function poolTraffic(
 
 export async function overviewSummary(userId: string, range: OverviewRange, now = new Date()) {
   const { from } = windowOf(range, now);
-  const notAgentTest = Prisma.sql`source <> 'AGENT_TEST'::"RequestSource"`;
 
   const [user, nodes, pools, counts, kpiRows] = await Promise.all([
     prisma.user.findUnique({
@@ -145,7 +145,7 @@ export async function overviewSummary(userId: string, range: OverviewRange, now 
         )}
       FROM usage_rollup_minute
       WHERE ("ownerUserId" = ${userId} OR "requesterUserId" = ${userId})
-        AND "bucketStart" >= ${from} AND ${notAgentTest}`,
+        AND "bucketStart" >= ${from} AND ${realTraffic()}`,
   ]);
 
   const byPool = await poolTraffic(

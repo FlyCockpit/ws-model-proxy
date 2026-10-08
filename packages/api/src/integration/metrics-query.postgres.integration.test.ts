@@ -197,6 +197,14 @@ integration("metrics_query on PostgreSQL", () => {
           requests: 1,
         },
         {
+          // A person's Test page request to the pool: a test too.
+          ...key,
+          bucketStart: at(3),
+          requesterUserId: OWNER,
+          source: "TEST",
+          requests: 2,
+        },
+        {
           // An agent test of the runtime itself (`runtime:<id>:<model>`): direct, no pool.
           ...key,
           poolId: "",
@@ -333,28 +341,28 @@ integration("metrics_query on PostgreSQL", () => {
     expect(result.series).toHaveLength(1);
     const [series] = result.series;
     expect(series?.group).toBeUndefined();
-    // The pool's agent test is left out of the series and counted apart; the runtime's own
-    // test (no pool) is not the pool's.
+    // The pool's agent and Test page tests are left out of the series and counted apart; the
+    // runtime's own test (no pool) is not the pool's.
     expect(series?.at).toEqual([1, 3]);
     expect(series?.values.requests).toEqual([5, 4]);
     expect(series?.values.errors).toEqual([1, 0]);
     expect(series?.values.cloud_share).toEqual([0, 1]);
     expect(series?.values.ttft_p95?.[1]).toBeNull();
     expect(series?.values.decode_tps).toEqual([100, null]);
-    expect(result.totals).toMatchObject({ requests: 9, errors: 1, cloud_share: 0.444, tests: 1 });
+    expect(result.totals).toMatchObject({ requests: 9, errors: 1, cloud_share: 0.444, tests: 3 });
     expect(result.totals.ttft_p95).toBeGreaterThan(150);
   });
 
-  it("counts agent tests like any request when asked", async () => {
+  it("counts tests like any request when asked", async () => {
     const result = await client(agent(OWNER)).activity.metrics.query({
       scope: { pool: ids.pool },
       metrics: ["requests"],
       range: WINDOW,
       step: "5m",
-      includeAgentTests: true,
+      includeTests: true,
     });
-    expect(result.series[0]).toEqual({ at: [0], values: { requests: [10] } });
-    expect(result.totals).toEqual({ requests: 10 });
+    expect(result.series[0]).toEqual({ at: [0], values: { requests: [12] } });
+    expect(result.totals).toEqual({ requests: 12 });
   });
 
   it("counts a runtime's own tests and its pool's tests on the runtime", async () => {
@@ -364,7 +372,7 @@ integration("metrics_query on PostgreSQL", () => {
       range: WINDOW,
       step: "5m",
     });
-    expect(result.totals).toEqual({ requests: 5, tests: 2 });
+    expect(result.totals).toEqual({ requests: 5, tests: 4 });
   });
 
   it("groups by runtime through the version, with labels, and an empty key for cloud", async () => {
@@ -498,14 +506,16 @@ integration("metrics_query on PostgreSQL", () => {
           cloudRequests: 3,
           latencyHistogram: histogramWith(900),
         },
+        // Tests are not load: an agent's and a person's Test page requests are left out.
         { ...base, ownerUserId: OWNER, requesterUserId: OWNER, source: "AGENT_TEST", requests: 40 },
+        { ...base, ownerUserId: OWNER, requesterUserId: OWNER, source: "TEST", requests: 30 },
         // The grantee's own request to someone else's pool counts on their Overview only.
         {
           ownerUserId: STRANGER,
           requesterUserId: GRANTEE,
           bucketStart: recent,
           poolId: "theirs",
-          source: "TEST",
+          source: "API_KEY",
           requests: 1,
         },
       ],
@@ -641,9 +651,9 @@ integration("metrics_query on PostgreSQL", () => {
       range: WINDOW,
       step: "5m",
     });
-    // 3 + 2 of the owner's pool, and its agent test and the runtime's own one apart; the other
+    // 3 + 2 of the owner's pool, and its tests and the runtime's own one apart; the other
     // owner's 50 on this node stay theirs.
-    expect(node.totals).toEqual({ requests: 5, tests: 2 });
+    expect(node.totals).toEqual({ requests: 5, tests: 4 });
 
     // A share holder's contributed model serves the owner's pool on the holder's runtime.
     await fixtures.usageRollupMinute.create({

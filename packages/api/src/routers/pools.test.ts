@@ -3,9 +3,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { type DeepMockProxy, mockDeep, mockReset } from "vitest-mock-extended";
 import type { PrismaClient } from "../../../db/prisma/generated/client";
 
-vi.mock("@ws-model-proxy/db", () => ({
+vi.mock("@ws-model-proxy/db", async () => ({
   default: mockDeep<PrismaClient>(),
-  Prisma: { DbNull: "DbNull" },
+  // The real namespace (pool traffic builds SQL fragments); DbNull stays a readable marker.
+  Prisma: {
+    ...(await import("../../../db/prisma/generated/internal/prismaNamespace")),
+    DbNull: "DbNull",
+  },
 }));
 const fenceLog = vi.hoisted(() => ({ held: [] as string[], deletes: [] as unknown[] }));
 vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => {
