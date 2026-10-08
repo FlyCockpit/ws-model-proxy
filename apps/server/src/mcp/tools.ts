@@ -434,6 +434,19 @@ function withoutEmpty(value: unknown): unknown {
   return out;
 }
 
+/** A pool whose members' live load leaves out what is unknown (null waiting or p95). */
+function withCompactMemberLive(pool: unknown): unknown {
+  const members = record(pool).members;
+  if (!Array.isArray(members)) return pool;
+  return {
+    ...record(pool),
+    members: members.map((member) => ({
+      ...record(member),
+      live: withoutEmpty(record(member).live),
+    })),
+  };
+}
+
 /** Combines the outputs of a tool's procedure calls into its result. */
 function combineOutputs(name: string, calls: ProcedureCall[], outputs: unknown[]): unknown {
   switch (name) {
@@ -448,8 +461,17 @@ function combineOutputs(name: string, calls: ProcedureCall[], outputs: unknown[]
           : outputs[0];
       return outputs.length === 2 ? { ...record(runtime), versions: outputs[1] } : runtime;
     }
-    case "pools_get":
-      return outputs.length === 2 ? { ...record(outputs[0]), history: outputs[1] } : outputs[0];
+    case "pools_get": {
+      // Member live load leaves out what is unknown (null waiting or p95).
+      const list = record(outputs[0]).pools;
+      const first =
+        calls[0]?.path === "pools.get"
+          ? withCompactMemberLive(outputs[0])
+          : calls[0]?.path === "pools.list" && Array.isArray(list)
+            ? { ...record(outputs[0]), pools: list.map(withCompactMemberLive) }
+            : outputs[0];
+      return outputs.length === 2 ? { ...record(first), history: outputs[1] } : first;
+    }
     case "providers_get":
       return { accounts: record(outputs[0]).accounts, models: record(outputs[1]).models };
     case "runtime_update":
