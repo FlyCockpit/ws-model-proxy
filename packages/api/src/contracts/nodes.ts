@@ -76,13 +76,16 @@ export const effectiveHardwareSchema = z
           vendor: z.enum(["nvidia", "amd", "intel", "apple", "other"]),
           index: z.number().int(),
           name: z.string().nullable(),
-          vramGb: z.number(),
+          /** Null when the GPU shares system memory (`unified`). */
+          vramGb: z.number().nullable(),
+          /** Shares system memory (GB10, an APU): placement counts it against node memory. */
+          unified: z.boolean(),
           reservedVramGb: z.number(),
           source: hardwareSourceSchema,
         })
         .strict(),
     ),
-    /** Usable = effective total − reserved (− 2 GiB headroom on unified). */
+    /** Usable = effective total − reserved − VRAM reserved on unified GPUs (− 2 GiB headroom on unified). */
     usableMemoryGb: z.number(),
     /** What instances on this node reserve now (HELD + HELD_UNKNOWN). */
     reservedNowMemoryGb: z.number(),
@@ -217,7 +220,7 @@ export const nodeDetailSchema = nodeSummarySchema
           ip: z.string(),
           linkSpeedMbps: z.number().int().nullable(),
           rdma: z.boolean(),
-          /** Nodes with an address in the same subnet. */
+          /** Nodes with a fast or RDMA link in the same subnet, RDMA first. */
           peerNodeIds: z.array(idSchema),
         })
         .strict(),

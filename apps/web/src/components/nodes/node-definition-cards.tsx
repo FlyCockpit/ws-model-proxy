@@ -6,6 +6,7 @@ import { useForm } from "@tanstack/react-form";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   declaredHardwareSchema,
+  GPU_VENDORS,
   nodeFabricMembershipsSchema,
   nodeMetricCommandsSchema,
   runtimeLabelsSchema,
@@ -19,6 +20,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
+import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import {
@@ -38,6 +40,7 @@ import { Help } from "@/components/help";
 import { orpc } from "@/utils/orpc";
 
 import { parseLabels } from "./add-node-dialog";
+import { type GpuRow, KINDS, type Kind, toDeclaration } from "./declared-hardware";
 import { FieldError } from "./field-error";
 import { formatGb, StatusPill } from "./node-badges";
 import type { NodeDetail } from "./node-types";
@@ -498,9 +501,6 @@ export function NodeFabricsCard({ node }: { node: NodeDetail }) {
   );
 }
 
-const KINDS = ["cpu", "discrete", "unified"] as const;
-type Kind = (typeof KINDS)[number];
-
 function SourceTag({ source }: { source: "browser" | "agent" | "node" | "detected" | null }) {
   const { t } = useTranslation(["dashboard"]);
   if (!source) return null;
@@ -523,6 +523,15 @@ export function HardwareCard({ node, lang }: { node: NodeDetail; lang: string })
       memoryGb: declared?.memoryGb === undefined ? "" : String(declared.memoryGb),
       reservedMemoryGb:
         declared?.reservedMemoryGb === undefined ? "" : String(declared.reservedMemoryGb),
+      gpus: (declared?.gpus ?? []).map(
+        (gpu): GpuRow => ({
+          vendor: gpu.vendor,
+          index: String(gpu.index),
+          name: gpu.name ?? "",
+          unified: gpu.unified === true,
+          vramGb: gpu.vramGb === undefined ? "" : String(gpu.vramGb),
+        }),
+      ),
     },
     validators: {
       onChange: z
@@ -530,18 +539,31 @@ export function HardwareCard({ node, lang }: { node: NodeDetail; lang: string })
           kind: z.enum(["", ...KINDS]),
           memoryGb: z.string(),
           reservedMemoryGb: z.string(),
+          gpus: z.array(
+            z.object({
+              vendor: z.enum(GPU_VENDORS),
+              index: z.string(),
+              name: z.string(),
+              unified: z.boolean(),
+              vramGb: z.string(),
+            }),
+          ),
         })
         .superRefine((value, ctx) => {
-          if (!declaredHardwareSchema.safeParse(toDeclaration(value)).success)
-            ctx.addIssue({
-              code: "custom",
-              path: ["memoryGb"],
-              message: t("dashboard:nodes.hardware.invalid"),
-            });
+          const parsed = declaredHardwareSchema.safeParse(toDeclaration(value, declared));
+          if (parsed.success) return;
+          const onGpus = parsed.error.issues.some((issue) => issue.path[0] === "gpus");
+          ctx.addIssue({
+            code: "custom",
+            path: [onGpus ? "gpus" : "memoryGb"],
+            message: t(
+              onGpus ? "dashboard:nodes.hardware.gpuInvalid" : "dashboard:nodes.hardware.invalid",
+            ),
+          });
         }),
     },
     onSubmit: async ({ value }) => {
-      const declaration = toDeclaration(value);
+      const declaration = toDeclaration(value, declared);
       const input: UpdateInput = {
         nodeId: node.id,
         hardware: Object.keys(declaration).length === 0 ? null : declaration,
@@ -599,7 +621,11 @@ export function HardwareCard({ node, lang }: { node: NodeDetail; lang: string })
               <li key={gpu.key} className="flex flex-wrap items-center gap-1.5">
                 <span className="font-mono text-xs">{gpu.key}</span>
                 <span>{gpu.name ?? gpu.vendor}</span>
-                <span className="text-muted-foreground">{formatGb(gpu.vramGb, lang)}</span>
+                <span className="text-muted-foreground">
+                  {gpu.unified
+                    ? t("dashboard:nodes.hardware.sharedVram")
+                    : formatGb(gpu.vramGb, lang)}
+                </span>
                 <SourceTag source={gpu.source} />
               </li>
             ))}
@@ -674,6 +700,137 @@ export function HardwareCard({ node, lang }: { node: NodeDetail; lang: string })
                 )}
               </form.Field>
             </div>
+            <form.Field name="gpus" mode="array">
+              {(field) => (
+                <div className="space-y-2">
+                  <p className="text-sm font-medium">{t("dashboard:nodes.hardware.gpus")}</p>
+                  {field.state.value.map((row, index) => (
+                    <div key={index} className="flex min-w-0 flex-wrap items-end gap-2">
+                      <form.Field name={`gpus[${index}].vendor`}>
+                        {(sub) => (
+                          <div className="w-28 space-y-1">
+                            <Label htmlFor={`gpu-vendor-${index}`}>
+                              {t("dashboard:nodes.hardware.gpuVendor")}
+                            </Label>
+                            <Select
+                              value={sub.state.value}
+                              onValueChange={(next) => {
+                                const vendor = GPU_VENDORS.find((candidate) => candidate === next);
+                                if (vendor) sub.handleChange(vendor);
+                              }}
+                            >
+                              <SelectTrigger
+                                id={`gpu-vendor-${index}`}
+                                className="min-h-[44px] w-full"
+                              >
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {GPU_VENDORS.map((vendor) => (
+                                  <SelectItem key={vendor} value={vendor}>
+                                    {vendor}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                        )}
+                      </form.Field>
+                      <form.Field name={`gpus[${index}].index`}>
+                        {(sub) => (
+                          <div className="w-16 space-y-1">
+                            <Label htmlFor={`gpu-index-${index}`}>
+                              {t("dashboard:nodes.hardware.gpuIndex")}
+                            </Label>
+                            <Input
+                              id={`gpu-index-${index}`}
+                              inputMode="numeric"
+                              className="min-h-[44px]"
+                              value={sub.state.value}
+                              onChange={(event) => sub.handleChange(event.target.value)}
+                            />
+                          </div>
+                        )}
+                      </form.Field>
+                      <form.Field name={`gpus[${index}].name`}>
+                        {(sub) => (
+                          <div className="min-w-0 flex-1 space-y-1">
+                            <Label htmlFor={`gpu-name-${index}`}>
+                              {t("dashboard:nodes.hardware.gpuName")}
+                            </Label>
+                            <Input
+                              id={`gpu-name-${index}`}
+                              className="min-h-[44px]"
+                              value={sub.state.value}
+                              onChange={(event) => sub.handleChange(event.target.value)}
+                            />
+                          </div>
+                        )}
+                      </form.Field>
+                      <form.Field name={`gpus[${index}].unified`}>
+                        {(sub) => (
+                          <div className="flex min-h-[44px] items-center gap-2">
+                            <Checkbox
+                              id={`gpu-unified-${index}`}
+                              checked={sub.state.value}
+                              onCheckedChange={(checked) => sub.handleChange(checked === true)}
+                            />
+                            <Label htmlFor={`gpu-unified-${index}`}>
+                              {t("dashboard:nodes.hardware.sharedVram")}
+                            </Label>
+                          </div>
+                        )}
+                      </form.Field>
+                      {row.unified ? null : (
+                        <form.Field name={`gpus[${index}].vramGb`}>
+                          {(sub) => (
+                            <div className="w-24 space-y-1">
+                              <Label htmlFor={`gpu-vram-${index}`}>
+                                {t("dashboard:nodes.hardware.gpuVram")}
+                              </Label>
+                              <Input
+                                id={`gpu-vram-${index}`}
+                                inputMode="decimal"
+                                className="min-h-[44px]"
+                                value={sub.state.value}
+                                onChange={(event) => sub.handleChange(event.target.value)}
+                              />
+                            </div>
+                          )}
+                        </form.Field>
+                      )}
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-touch"
+                        aria-label={t("dashboard:nodes.hardware.removeGpu")}
+                        onClick={() => field.removeValue(index)}
+                      >
+                        <Trash aria-hidden="true" />
+                      </Button>
+                    </div>
+                  ))}
+                  <FieldError errors={field.state.meta.errors} />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="min-h-[44px]"
+                    onClick={() =>
+                      field.pushValue({
+                        vendor: "nvidia",
+                        index: String(field.state.value.length),
+                        name: "",
+                        unified: false,
+                        vramGb: "",
+                      })
+                    }
+                  >
+                    <Plus aria-hidden="true" />
+                    {t("dashboard:nodes.hardware.addGpu")}
+                  </Button>
+                </div>
+              )}
+            </form.Field>
             <Button type="submit" className="min-h-[44px]" disabled={update.isPending}>
               {t("common:actions.save")}
             </Button>
@@ -682,13 +839,4 @@ export function HardwareCard({ node, lang }: { node: NodeDetail; lang: string })
       </CardContent>
     </Card>
   );
-}
-
-function toDeclaration(value: { kind: string; memoryGb: string; reservedMemoryGb: string }) {
-  const out: { kind?: Kind; memoryGb?: number; reservedMemoryGb?: number } = {};
-  const kind = KINDS.find((candidate) => candidate === value.kind);
-  if (kind) out.kind = kind;
-  if (value.memoryGb.trim() !== "") out.memoryGb = Number(value.memoryGb);
-  if (value.reservedMemoryGb.trim() !== "") out.reservedMemoryGb = Number(value.reservedMemoryGb);
-  return out;
 }

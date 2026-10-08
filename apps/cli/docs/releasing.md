@@ -47,7 +47,7 @@ ghcr.io/flycockpit/ws-model-proxy:latest   # only when publish_latest is true
 
 ```sh
 # 1. Bump apps/cli/Cargo.toml (e.g. 0.1.0 -> 0.1.1) and SERVER_VERSION in
-#    apps/server/src/node-http.ts to match (a server test checks they agree).
+#    apps/server/src/version.ts to match (a server test checks they agree).
 # 2. Flip the CLI install default to release binaries (same commit; see below).
 # 3. Merge that change to master.
 git push origin master

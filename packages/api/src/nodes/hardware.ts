@@ -36,6 +36,8 @@ const nodeInfoSchema = z.object({
         index: z.number().int().min(0),
         name: z.string().optional(),
         vramTotalMiB: z.number().nonnegative().nullable().optional(),
+        /** Integrated GPU sharing system memory (GB10, Thor, an AMD APU). */
+        apu: z.boolean().optional(),
       }),
     )
     .optional(),
@@ -106,15 +108,34 @@ function pick<T>(
   return { value: null, source: null };
 }
 
-/** A claim's node memory (GiB) by its `resources` JSON (`runtimeResourceSchema`). */
-export function claimMemoryGb(resources: unknown): number {
+/**
+ * A claim's node memory (GiB) by its `resources` JSON (`runtimeResourceSchema`). VRAM a discrete
+ * claim takes on a unified GPU (`unifiedGpuKeys`; the claim's recorded `gpus`, else any when
+ * every GPU of the node is unified) is node memory too.
+ */
+export function claimMemoryGb(
+  resources: unknown,
+  unifiedGpuKeys: ReadonlySet<string>,
+  allUnified: boolean,
+): number {
   if (!resources || typeof resources !== "object") return 0;
   const kind = Reflect.get(resources, "kind");
   const memoryGb = Reflect.get(resources, "memoryGb");
   const ramGb = Reflect.get(resources, "ramGb");
   if (kind === "unified" && typeof memoryGb === "number") return memoryGb;
-  if ((kind === "cpu" || kind === "discrete") && typeof ramGb === "number") return ramGb;
-  return 0;
+  if (kind === "cpu" && typeof ramGb === "number") return ramGb;
+  if (kind !== "discrete") return 0;
+  const ram = typeof ramGb === "number" ? ramGb : 0;
+  const vramGb = Reflect.get(resources, "vramGb");
+  const gpuCount = Reflect.get(resources, "gpuCount");
+  if (typeof vramGb !== "number" || typeof gpuCount !== "number") return ram;
+  const recorded = Reflect.get(resources, "gpus");
+  const shared = Array.isArray(recorded)
+    ? recorded.filter((key) => typeof key === "string" && unifiedGpuKeys.has(key)).length
+    : allUnified
+      ? gpuCount
+      : 0;
+  return ram + shared * vramGb;
 }
 
 export type HardwareInput = {
@@ -158,7 +179,10 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
 
   const detectedMemoryMiB = info?.unifiedMemoryMiB ?? info?.memoryTotalMiB;
   const detectedGpus = info?.gpus ?? [];
-  const detectedVramMiB = detectedGpus.reduce((sum, gpu) => sum + (gpu.vramTotalMiB ?? 0), 0);
+  const detectedVramMiB = detectedGpus.reduce(
+    (sum, gpu) => sum + (gpu.apu === true ? 0 : (gpu.vramTotalMiB ?? 0)),
+    0,
+  );
   const detectedAcceleratorMiB =
     info?.acceleratorMemoryMiB ?? (detectedVramMiB > 0 ? detectedVramMiB : undefined);
 
@@ -186,7 +210,7 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
   const reservedVram = (key: string) =>
     browser.reservedVramGb?.[key] ?? node.reservedVramGb?.[key] ?? 0;
   const addGpu = (
-    gpu: { vendor: Vendor; index: number; name?: string | null; vramGb: number },
+    gpu: { vendor: Vendor; index: number; name?: string | null; vramGb: number | null },
     source: Source,
   ) => {
     const key = `${gpu.vendor}:${gpu.index}`;
@@ -197,21 +221,45 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
       index: gpu.index,
       name: gpu.name ?? null,
       vramGb: gpu.vramGb,
+      unified: gpu.vramGb === null,
       reservedVramGb: reservedVram(key),
       source,
     });
   };
-  for (const gpu of browser.gpus ?? []) addGpu(gpu, declaredSource);
-  for (const gpu of node.gpus ?? []) addGpu(gpu, "node");
-  for (const gpu of detectedGpus)
-    addGpu({ ...gpu, vramGb: gpu.vramTotalMiB == null ? 0 : gb(gpu.vramTotalMiB) }, "detected");
+  // A declared unified GPU (`unified: true`, no `vramGb`) is shared like a detected one.
+  const declaredGpu = (gpu: NonNullable<DeclaredHardware["gpus"]>[number]) => ({
+    ...gpu,
+    vramGb: gpu.unified === true ? null : (gpu.vramGb ?? 0),
+  });
+  for (const gpu of browser.gpus ?? []) addGpu(declaredGpu(gpu), declaredSource);
+  for (const gpu of node.gpus ?? []) addGpu(declaredGpu(gpu), "node");
+  // An integrated GPU (or one without VRAM of its own on a unified node: GB10 reports `[N/A]`)
+  // shares system memory: no VRAM figure, placement counts it against node memory.
+  for (const gpu of detectedGpus) {
+    const shared = gpu.apu === true || (gpu.vramTotalMiB == null && kind.value === "unified");
+    const vramGb = shared ? null : gpu.vramTotalMiB == null ? 0 : gb(gpu.vramTotalMiB);
+    addGpu({ ...gpu, vramGb }, "detected");
+  }
 
+  const sortedGpus = [...gpus.values()].sort((a, b) => a.key.localeCompare(b.key));
+  const unifiedKeys = new Set(sortedGpus.filter((gpu) => gpu.unified).map((gpu) => gpu.key));
+  const allUnified = sortedGpus.length > 0 && unifiedKeys.size === sortedGpus.length;
   const headroom = kind.value === "unified" ? UNIFIED_HEADROOM_GB : 0;
+  // VRAM reserved on a unified GPU is system memory.
+  const reservedSharedGb = sortedGpus
+    .filter((gpu) => gpu.unified)
+    .reduce((sum, gpu) => sum + gpu.reservedVramGb, 0);
   const usableMemoryGb = round(
-    Math.max(0, (memoryGb.value ?? 0) - (reservedMemoryGb.value ?? 0) - headroom),
+    Math.max(
+      0,
+      (memoryGb.value ?? 0) - (reservedMemoryGb.value ?? 0) - reservedSharedGb - headroom,
+    ),
   );
   const reservedNowMemoryGb = round(
-    input.heldClaims.reduce<number>((sum, resources) => sum + claimMemoryGb(resources), 0),
+    input.heldClaims.reduce<number>(
+      (sum, resources) => sum + claimMemoryGb(resources, unifiedKeys, allUnified),
+      0,
+    ),
   );
   const live = liveMetrics(input.nodeMetrics, input.nodeMetricsAt, input.now);
 
@@ -220,7 +268,7 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
     memoryGb,
     acceleratorMemoryGb,
     reservedMemoryGb,
-    gpus: [...gpus.values()].sort((a, b) => a.key.localeCompare(b.key)),
+    gpus: sortedGpus,
     usableMemoryGb,
     reservedNowMemoryGb,
     liveFreeMemoryGb: live.freeMemoryGb,
@@ -249,22 +297,37 @@ function isSuggestible(address: string): boolean {
 /** A link this fast (or with RDMA) looks like a fabric. */
 export const FABRIC_SUGGESTION_MIN_MBPS = 10_000;
 
+type InfoInterface = NonNullable<NodeInfoView["interfaces"]>[number];
+
+/** ≥ 10 GbE or RDMA. */
+function isFabricLink(iface: InfoInterface): boolean {
+  return (
+    iface.rdma === true ||
+    (iface.linkSpeedMbps !== undefined && iface.linkSpeedMbps >= FABRIC_SUGGESTION_MIN_MBPS)
+  );
+}
+
 /**
  * Fabric suggestions from `node.info.interfaces`: fast or RDMA links, with the other nodes that
- * have an address in the same IPv4 /24. Suggestions only; a person or agent decides.
+ * have a fast or RDMA link with an address in the same IPv4 /24 (a peer on the plain LAN of
+ * that subnet is not one). RDMA links come first, and RDMA peers first within a link.
+ * Suggestions only; a person or agent decides.
  */
 export function fabricSuggestions(
   nodeInfo: unknown,
   otherNodes: ReadonlyArray<{ id: string; nodeInfo: unknown }>,
 ): Array<{ ip: string; linkSpeedMbps: number | null; rdma: boolean; peerNodeIds: string[] }> {
   const info = parseNodeInfo(nodeInfo);
+  /** Per peer: subnet → whether its link there is RDMA (true wins). */
   const peerSubnets = otherNodes.map((other) => {
-    const subnets = new Set<string>();
-    for (const iface of parseNodeInfo(other.nodeInfo)?.interfaces ?? [])
+    const subnets = new Map<string, boolean>();
+    for (const iface of parseNodeInfo(other.nodeInfo)?.interfaces ?? []) {
+      if (!isFabricLink(iface)) continue;
       for (const address of iface.addresses ?? []) {
         const subnet = ipv4Subnet24(bareAddress(address));
-        if (subnet) subnets.add(subnet);
+        if (subnet) subnets.set(subnet, subnets.get(subnet) === true || iface.rdma === true);
       }
+    }
     return { id: other.id, subnets };
   });
   const out: Array<{
@@ -274,22 +337,25 @@ export function fabricSuggestions(
     peerNodeIds: string[];
   }> = [];
   for (const iface of info?.interfaces ?? []) {
+    if (!isFabricLink(iface)) continue;
     const rdma = iface.rdma === true;
     const speed = iface.linkSpeedMbps ?? null;
-    if (!rdma && (speed === null || speed < FABRIC_SUGGESTION_MIN_MBPS)) continue;
     for (const raw of iface.addresses ?? []) {
       const ip = bareAddress(raw);
       if (!isSuggestible(ip)) continue;
       const subnet = ipv4Subnet24(ip);
-      out.push({
-        ip,
-        linkSpeedMbps: speed,
-        rdma,
-        peerNodeIds: subnet
-          ? peerSubnets.filter((peer) => peer.subnets.has(subnet)).map((peer) => peer.id)
-          : [],
-      });
+      const peerNodeIds = subnet
+        ? peerSubnets
+            .filter((peer) => peer.subnets.has(subnet))
+            // Stable: RDMA peers first, otherwise in the given order.
+            .sort((x, y) => Number(y.subnets.get(subnet)) - Number(x.subnets.get(subnet)))
+            .map((peer) => peer.id)
+        : [];
+      out.push({ ip, linkSpeedMbps: speed, rdma, peerNodeIds });
     }
   }
-  return out;
+  // Stable: RDMA links first, then faster links, otherwise in interface order.
+  return out.sort(
+    (a, b) => Number(b.rdma) - Number(a.rdma) || (b.linkSpeedMbps ?? 0) - (a.linkSpeedMbps ?? 0),
+  );
 }

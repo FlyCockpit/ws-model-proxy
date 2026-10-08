@@ -5,6 +5,7 @@ import {
   type McpRequestContext,
   McpServer,
   PROTOCOL_VERSION_META_KEY,
+  SERVER_INFO_META_KEY,
 } from "@modelcontextprotocol/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -24,7 +25,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * instance).
  */
 
-import { createMcpTransport, MCP_TRANSPORT_OPTIONS } from "./handler";
+import {
+  createMcpTransport,
+  MCP_SERVER_INFO,
+  MCP_TRANSPORT_OPTIONS,
+  mcpToolManifestHash,
+} from "./handler";
 
 // Phase 5: the default registration imports the tool manifest → appRouter →
 // Prisma client and env validation chains. Mock both so no real environment
@@ -54,6 +60,7 @@ vi.mock("@ws-model-proxy/db", async () => {
 type ProbeToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 
 import { MCP_READ_TOOLS } from "@ws-model-proxy/api/contracts";
+import { SERVER_VERSION } from "../version";
 import { registerMcpTools } from "./tools";
 
 const ENVELOPE = {
@@ -154,6 +161,46 @@ describe("createMcpTransport — pinned configuration", () => {
       const names = body.result?.tools?.map((tool) => tool.name).sort();
       expect(names).toEqual([...MCP_READ_TOOLS].sort());
     });
+  });
+});
+
+describe("createMcpTransport — advertised identity and capabilities", () => {
+  it("never advertises tools.listChanged: a stateless JSON-only server sends no notifications", async () => {
+    const res = await createMcpTransport().fetch(modernRequest("server/discover", 1));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result?: { capabilities?: { tools?: { listChanged?: boolean } } };
+    };
+    expect(body.result?.capabilities?.tools).toEqual({ listChanged: false });
+  });
+
+  it("carries the app version plus the tool manifest hash in serverInfo", async () => {
+    expect(MCP_SERVER_INFO.version).toBe(`${SERVER_VERSION}+tools.${mcpToolManifestHash()}`);
+    expect(mcpToolManifestHash()).toMatch(/^[0-9a-f]{12}$/);
+    const res = await createMcpTransport().fetch(modernRequest("tools/list", 2));
+    const body = (await res.json()) as {
+      result?: { _meta?: Record<string, { name?: string; version?: string } | undefined> };
+    };
+    expect(body.result?._meta?.[SERVER_INFO_META_KEY]).toEqual(MCP_SERVER_INFO);
+  });
+
+  it("hashes names and input schemas deterministically, whatever their order", () => {
+    const a = { name: "a_get", inputSchema: { type: "object", properties: { id: {} } } };
+    const b = { name: "b_get", inputSchema: { type: "object" } };
+    expect(mcpToolManifestHash([a, b])).toBe(mcpToolManifestHash([b, a]));
+    // Key order inside a schema does not matter either.
+    expect(mcpToolManifestHash([a, b])).toBe(
+      mcpToolManifestHash([
+        { inputSchema: { properties: { id: {} }, type: "object" }, name: "a_get" },
+        b,
+      ]),
+    );
+    expect(mcpToolManifestHash()).toBe(mcpToolManifestHash());
+    expect(mcpToolManifestHash([a, b])).not.toBe(mcpToolManifestHash([a]));
+    expect(mcpToolManifestHash([a, b])).not.toBe(
+      mcpToolManifestHash([a, { ...b, inputSchema: { type: "object", required: ["id"] } }]),
+    );
+    expect(mcpToolManifestHash([a, b])).not.toBe(mcpToolManifestHash([a, { ...b, name: "c_get" }]));
   });
 });
 

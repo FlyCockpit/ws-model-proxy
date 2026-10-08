@@ -93,7 +93,18 @@ async function recordSecretName(
     select: { features: true },
   });
   const features = nodeFeaturesSchema.safeParse(row?.features);
-  if (!features.success) return;
+  if (!features.success) {
+    // The node's next `node.state` still lists the name. Node id and reason only: never the
+    // stored features or a value.
+    const issue = features.error.issues[0];
+    const reason = !row
+      ? "node not found"
+      : row.features === null
+        ? "no features reported yet"
+        : `stored features unreadable (${issue?.code ?? "invalid"} at ${issue?.path.map(String).join(".") || "root"})`;
+    console.warn(`[nodes.secrets] secret name list not updated for node ${nodeId}: ${reason}`);
+    return;
+  }
   const others = features.data.secrets.filter((secret) => secret.name !== name);
   const secrets = updatedAt === null ? others : [...others, { name, updatedAt }];
   secrets.sort((a, b) => a.name.localeCompare(b.name));

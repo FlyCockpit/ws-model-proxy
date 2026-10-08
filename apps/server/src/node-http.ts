@@ -34,9 +34,7 @@ import {
   type RateLimiter,
   refundEnrollmentExchange,
 } from "./rate-limit.js";
-
-/** The server and CLI version this build ships; `/install.sh` installs the matching wsmp. */
-export const SERVER_VERSION = "0.4.0";
+import { SERVER_VERSION } from "./version.js";
 
 /** Where the CLI's source and GitHub Releases live. */
 export const CLI_REPOSITORY = "https://github.com/FlyCockpit/ws-model-proxy";
