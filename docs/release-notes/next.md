@@ -331,6 +331,14 @@ windows and block durations stay fixed. The per-recipient email caps and the
 failed-password cap are always on (on unreleased master builds, setting their
 points to 0 turned them off; that is gone).
 
+Relay connections (`/api/cli/ws`) have their own limits and no longer share
+the sign-in bucket, so a node reconnecting in a loop cannot lock its owner out
+of sign-in from the same address. Each node may open 10 relay connections per
+minute (then it waits 5 minutes), and each address may fail 30 relay
+connections per minute before authenticating (then 5 minutes); a connection
+that authenticates does not count against its address. A refused connection
+answers 429 with `Retry-After`, and `wsmp` waits at least that long.
+
 ### Email recipient caps
 
 The anonymous endpoints that send mail to an address in the request body

@@ -41,6 +41,14 @@ export const DEFAULTS = {
   enrollmentExchangeUser: { points: 20, duration: 60 * 60 },
   /** Public invite lookups (`auth.inviteInfo`), per client IP: like sign-in. */
   inviteInfo: { points: 10, duration: 60, blockDuration: 15 * 60 },
+  /**
+   * Relay websocket upgrades (`/api/cli/ws`) that fail before a node is known (no or bad
+   * credential, unsupported subprotocol), per client IP. An authenticated upgrade refunds its
+   * point, so honest nodes behind one NAT do not share this budget.
+   */
+  relayUpgradeIp: { points: 30, duration: 60, blockDuration: 5 * 60 },
+  /** Authenticated relay upgrades, per node: bounds one node's reconnect storm. */
+  relayUpgradeNode: { points: 10, duration: 60, blockDuration: 5 * 60 },
 } as const;
 
 /** A built-in points budget times `WMP_RATE_LIMIT_SCALE`, rounded, never below 1. */
@@ -124,6 +132,27 @@ export const realtimeUpgradeLimiter = new RateLimiterMemory({
   keyPrefix: "rl:realtime",
   points: REALTIME_UPGRADE_POINTS,
   duration: REALTIME_UPGRADE_DURATION_SECONDS,
+});
+
+/**
+ * Relay websocket upgrades. Their own buckets, never `authLimiter`: a node reconnecting in a
+ * loop must not lock its owner out of sign-in from the same address. Every upgrade first
+ * reserves a point in the per-IP bucket (before the credential is checked, so guessing
+ * credentials spends it); once the credential authenticates, that point is refunded and the
+ * upgrade is charged to the node's own bucket instead.
+ */
+export const relayUpgradeIpLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:relay-ip",
+  points: scaledPoints(DEFAULTS.relayUpgradeIp.points),
+  duration: DEFAULTS.relayUpgradeIp.duration,
+  blockDuration: DEFAULTS.relayUpgradeIp.blockDuration,
+});
+
+export const relayUpgradeNodeLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:relay-node",
+  points: scaledPoints(DEFAULTS.relayUpgradeNode.points),
+  duration: DEFAULTS.relayUpgradeNode.duration,
+  blockDuration: DEFAULTS.relayUpgradeNode.blockDuration,
 });
 
 /**

@@ -1,7 +1,12 @@
 import { upgradeWebSocket, type WebSocketLike } from "@hono/node-server";
 import type { Context, MiddlewareHandler } from "hono";
 import type { WSContext, WSEvents } from "hono/ws";
-import { authLimiter, createRateLimiterMiddleware } from "../rate-limit.js";
+import { resolveClientIp } from "../client-ip.js";
+import {
+  createRateLimiterMiddleware,
+  relayUpgradeIpLimiter,
+  relayUpgradeNodeLimiter,
+} from "../rate-limit.js";
 import { authenticateNodeCredential, type NodeIdentity } from "./node-credential-auth.js";
 import {
   parseRelaySubprotocolHeader,
@@ -21,8 +26,18 @@ function bearerSecret(header: string | undefined): string | null {
   return match?.[1] ?? null;
 }
 
+const relayIpKey = (c: Context) => `ip:${resolveClientIp(c)}`;
+
+/**
+ * Relay upgrades have their own limiters (see `relayUpgradeIpLimiter`), never the sign-in
+ * bucket. The per-IP point reserved before authentication is refunded once the credential
+ * authenticates; the upgrade is then charged to the node, keyed by its verified id (never by
+ * the presented secret's bytes, so a caller cannot pick a bucket).
+ */
 export function createRelayWebsocketMiddleware(): MiddlewareHandler<{ Variables: RelayVariables }> {
-  const rateLimit = createRateLimiterMiddleware(authLimiter);
+  const ipRateLimit = createRateLimiterMiddleware(relayUpgradeIpLimiter, {
+    resolveKey: relayIpKey,
+  });
 
   return async (c, next) => {
     if (c.req.header("upgrade")?.toLowerCase() !== "websocket") {
@@ -32,7 +47,7 @@ export function createRelayWebsocketMiddleware(): MiddlewareHandler<{ Variables:
       return c.json({ error: "Server is shutting down." }, 503);
     }
 
-    const limited = await rateLimit(c, async () => undefined);
+    const limited = await ipRateLimit(c, async () => undefined);
     if (limited instanceof Response) return limited;
 
     const requestedProtocol = parseRelaySubprotocolHeader(c.req.header("sec-websocket-protocol"));
@@ -58,6 +73,12 @@ export function createRelayWebsocketMiddleware(): MiddlewareHandler<{ Variables:
     if (!identity) {
       return c.json({ error: "Invalid or revoked node credential." }, 401);
     }
+    await relayUpgradeIpLimiter.reward(relayIpKey(c), 1).catch(() => undefined);
+    const nodeRateLimit = createRateLimiterMiddleware(relayUpgradeNodeLimiter, {
+      resolveKey: () => `node:${identity.nodeId}`,
+    });
+    const nodeLimited = await nodeRateLimit(c, async () => undefined);
+    if (nodeLimited instanceof Response) return nodeLimited;
     c.set("relayIdentity", identity);
     await next();
   };
