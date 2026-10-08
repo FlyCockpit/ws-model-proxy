@@ -1486,7 +1486,7 @@ describe("runtimes.shares.create: a direct share only to a proved mailbox", () =
     setupInvite();
     db.user.findFirst.mockResolvedValue(null);
     db.shareInvite.findFirst.mockResolvedValue({ id: "inv-0" } as never);
-    expect(await reasonOf(client().shares.create(input))).toBe("CONFLICT");
+    expect(await reasonOf(client().shares.create(input))).toBe("invite_pending");
     expect(db.shareInvite.create).not.toHaveBeenCalled();
   });
 

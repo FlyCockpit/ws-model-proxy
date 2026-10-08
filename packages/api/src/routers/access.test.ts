@@ -804,7 +804,10 @@ describe("shares", () => {
     db.pool.findFirst.mockResolvedValue(pool as never);
     db.user.findFirst.mockResolvedValue(null);
     db.shareInvite.findFirst.mockResolvedValue({ id: "inv0" } as never);
-    await expect(client().shares.create(input)).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(client().shares.create(input)).rejects.toMatchObject({
+      code: "CONFLICT",
+      data: { reason: "invite_pending" },
+    });
     expect(db.shareInvite.create).not.toHaveBeenCalled();
   });
 
@@ -941,6 +944,7 @@ describe("shares", () => {
     await expect(client().invites.revoke({ inviteId: "inv-rt" })).rejects.toMatchObject({
       code: "CONFLICT",
       message: "This invite was accepted. Delete the share instead.",
+      data: { reason: "invite_accepted" },
     });
     expect(heldFences()).toEqual(["00:owner:owner"]);
   });

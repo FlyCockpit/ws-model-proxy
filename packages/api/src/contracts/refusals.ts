@@ -99,6 +99,15 @@ export const REFUSAL_REASONS = [
    * ranges have none in common (the message names them).
    */
   "fabric_port_ranges_disjoint",
+  // Pool sharing tab.
+  /** shares.create for a person who already has a share of the pool: change that share. */
+  "already_shared",
+  /** An invite to this e-mail and pool (or runtime) is pending: resend it instead. */
+  "invite_pending",
+  /** The owner has SHARE_INVITE_MAX_PENDING_PER_OWNER pending invites. */
+  "too_many_invites",
+  /** invites.revoke lost to an acceptance: it is a share now. */
+  "invite_accepted",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

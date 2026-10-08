@@ -627,9 +627,10 @@ const shares = {
       });
     } catch (error) {
       if (isUniqueViolation(error)) {
-        throw new ORPCError("CONFLICT", {
-          message: "This pool is already shared with this person. Change the existing share.",
-        });
+        throw refuse(
+          "already_shared",
+          "This pool is already shared with this person. Change the existing share.",
+        );
       }
       throw error;
     }
@@ -810,9 +811,7 @@ const invites = {
   revoke: contractProcedure(c.invites.revoke).handler(async ({ context, input }) => {
     const ownerUserId = userIdOf(context);
     const accepted = () =>
-      new ORPCError("CONFLICT", {
-        message: "This invite was accepted. Delete the share instead.",
-      });
+      refuse("invite_accepted", "This invite was accepted. Delete the share instead.");
     // Under the owner's fence, which every acceptance also takes: an acceptance either committed
     // before the read (refused here) or waits until this revoke commits (and then finds it
     // revoked). The count check still catches a write this read did not see.
