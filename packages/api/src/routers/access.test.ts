@@ -411,6 +411,111 @@ describe("OAuth connections", () => {
   });
 });
 
+describe("OAuth disconnect sweeps pending authorization codes", () => {
+  const CLIENT = "https://client.example.com/meta";
+  function code(userId: string, clientId: string, extra: Record<string, unknown> = {}) {
+    return JSON.stringify({
+      type: "authorization_code",
+      query: { client_id: clientId, redirect_uri: "https://client.example.com/cb" },
+      userId,
+      referenceId: "ref1",
+      ...extra,
+    });
+  }
+  function grant(userId = "owner") {
+    db.mcpGrant.findFirst.mockResolvedValue({
+      id: "g1",
+      clientId: CLIENT,
+      revokedAt: null,
+      userId,
+    } as never);
+  }
+
+  it("deletes only the person's codes for that client, under the person's fence", async () => {
+    grant();
+    db.verification.findMany.mockResolvedValueOnce([
+      { id: "v1", value: code("owner", CLIENT) },
+      // Another client of the same person, another person, and an e-mail OTP row.
+      { id: "v2", value: code("owner", "https://other.example.com/meta") },
+      { id: "v3", value: code("owner2", CLIENT) },
+      { id: "v4", value: JSON.stringify({ type: "email-otp", userId: "owner" }) },
+    ] as never);
+    db.verification.deleteMany.mockResolvedValue({ count: 1 });
+    await client().oauthGrants.revoke({ grantId: "g1" });
+
+    expect(heldFences()).toEqual(["00:owner:owner"]);
+    const scan = db.verification.findMany.mock.calls[0]?.[0];
+    expect(scan?.where).toMatchObject({
+      AND: [
+        { value: { contains: '"type":"authorization_code"' } },
+        { value: { contains: '"userId":"owner"' } },
+      ],
+    });
+    // A delete with a WHERE: the exact rows found, re-fenced to the person's markers.
+    expect(db.verification.deleteMany).toHaveBeenCalledTimes(1);
+    expect(db.verification.deleteMany.mock.calls[0]?.[0]).toEqual({
+      where: {
+        id: { in: ["v1"] },
+        AND: [
+          { value: { contains: '"type":"authorization_code"' } },
+          { value: { contains: '"userId":"owner"' } },
+        ],
+      },
+    });
+    expect(db.oauthConsent.deleteMany.mock.calls[0]?.[0]).toEqual({
+      where: { userId: "owner", clientId: CLIENT },
+    });
+  });
+
+  it("deletes nothing when no pending code matches", async () => {
+    grant();
+    db.verification.findMany.mockResolvedValueOnce([
+      { id: "v3", value: code("owner2", CLIENT) },
+    ] as never);
+    await client().oauthGrants.revoke({ grantId: "g1" });
+    expect(db.verification.deleteMany).not.toHaveBeenCalled();
+    expect(db.mcpGrant.updateMany).toHaveBeenCalled();
+  });
+
+  it("fails closed on a pending code it cannot read, and reports no disconnect", async () => {
+    grant();
+    const onAccessRevoked = vi.fn();
+    db.verification.findMany.mockResolvedValueOnce([
+      { id: "v1", value: '{"type":"authorization_code","userId":"owner"' },
+    ] as never);
+    await expect(
+      client(PERSON, { onAccessRevoked }).oauthGrants.revoke({ grantId: "g1" }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(db.verification.deleteMany).not.toHaveBeenCalled();
+    expect(onAccessRevoked).not.toHaveBeenCalled();
+  });
+
+  it("pages through candidates and gives up loudly past the cap", async () => {
+    grant();
+    const page = (start: number) =>
+      Array.from({ length: 200 }, (_, index) => ({
+        id: `v${String(start + index).padStart(5, "0")}`,
+        value: code("owner", "https://other.example.com/meta"),
+      }));
+    db.verification.findMany.mockImplementation((async (args: { skip?: number }) =>
+      page(args.skip ? 1 : 0)) as never);
+    await expect(client().oauthGrants.revoke({ grantId: "g1" })).rejects.toMatchObject({
+      code: "CONFLICT",
+    });
+    expect(db.verification.findMany.mock.calls[1]?.[0]).toMatchObject({ skip: 1 });
+    expect(db.verification.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("never sweeps another person's codes: their grant is not found", async () => {
+    db.mcpGrant.findFirst.mockResolvedValue(null);
+    await expect(client().oauthGrants.revoke({ grantId: "theirs" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+    expect(db.verification.findMany).not.toHaveBeenCalled();
+    expect(db.verification.deleteMany).not.toHaveBeenCalled();
+  });
+});
+
 describe("Contributing", () => {
   it("lists only the caller's shares and the caller's own served models", async () => {
     db.share.findMany.mockResolvedValue([]);

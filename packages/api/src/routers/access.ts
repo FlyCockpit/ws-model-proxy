@@ -46,6 +46,7 @@ import {
   shareSelect,
   shareView,
 } from "../lib/access-views";
+import { sweepPendingAuthorizationCodes } from "../lib/oauth-code-sweep";
 import { isUniqueViolation, notFound, refuse } from "../lib/refuse";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
 import { deliverInvite, writeInvite } from "../lib/share-invite-write";
@@ -418,24 +419,25 @@ const oauthGrants = {
     if (!grant || isMcpPatClientId(grant.clientId))
       throw notFound("That key, token, connection, share or invite does not exist.");
     const now = new Date();
-    // Revoke every live token this client holds for the person and forget the consent, so
-    // reconnecting asks again. TODO(server): pending authorization codes are not swept here
-    // (0.3 `mcp-grants.revokeMine` did); they expire within minutes.
-    await prisma.$transaction([
-      prisma.mcpGrant.updateMany({
+    // Revoke every live token this client holds for the person, forget the consent (so
+    // reconnecting asks again) and drop the client's pending authorization codes, which could
+    // otherwise still be exchanged. Under the person's fence; every write names the person.
+    await runAccessTransaction({ owners: [userId] }, async (tx) => {
+      await tx.mcpGrant.updateMany({
         where: { id: grant.id, userId, revokedAt: null },
         data: { revokedAt: now },
-      }),
-      prisma.oauthRefreshToken.updateMany({
+      });
+      await tx.oauthRefreshToken.updateMany({
         where: { userId, clientId: grant.clientId, revoked: null },
         data: { revoked: now },
-      }),
-      prisma.oauthAccessToken.updateMany({
+      });
+      await tx.oauthAccessToken.updateMany({
         where: { userId, clientId: grant.clientId, revoked: null },
         data: { revoked: now },
-      }),
-      prisma.oauthConsent.deleteMany({ where: { userId, clientId: grant.clientId } }),
-    ]);
+      });
+      await tx.oauthConsent.deleteMany({ where: { userId, clientId: grant.clientId } });
+      await sweepPendingAuthorizationCodes(tx, { userId, clientId: grant.clientId, now });
+    });
     if (!grant.revokedAt) {
       await notifyRevoked(context, {
         kind: "oauth_grant",
