@@ -349,7 +349,10 @@
       "sticky": "Lowering protects against future problems only: what already runs keeps running.",
       "lowerConfirm": "Lower to Relay only",
       "lowered": "Lowering requested. The node confirms when it is online.",
-      "raiseHint": "To give the server full control again, run this on the machine:"
+      "raiseHint": "To give this server full control again, run on {{slug}}:",
+      "changedBy": "by {{name}}",
+      "aPerson": "a person",
+      "changedOnNode": "on the node"
     },
     "hold": {
       "title": "Hold",
@@ -413,7 +416,10 @@
       "metricCommandsDescription": "Commands the node runs on a schedule to report extra metrics.",
       "metricCommandsJson": "Commands (JSON list)",
       "jsonInvalid": "This is not valid JSON.",
-      "metricCommandsInvalid": "Not a valid list of metric commands ({{detail}})."
+      "metricCommandsInvalid": "Not a valid list of metric commands ({{detail}}).",
+      "metricCommandsNone": "No metric commands.",
+      "metricCommandSchedule": "every {{interval}} s · timeout {{timeout}} s · {{format}}",
+      "metricCommandBody": "Command of {{name}}"
     },
     "secrets": {
       "title": "Secrets",

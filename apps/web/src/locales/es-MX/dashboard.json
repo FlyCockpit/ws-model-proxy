@@ -349,7 +349,10 @@
       "sticky": "Bajar la confianza solo protege contra problemas futuros: lo que ya corre sigue corriendo.",
       "lowerConfirm": "Bajar a solo retransmisión",
       "lowered": "Solicitud enviada. El nodo la confirma cuando esté en línea.",
-      "raiseHint": "Para darle al servidor control total otra vez, ejecuta esto en la máquina:"
+      "raiseHint": "Para darle a este servidor control total otra vez, ejecuta en {{slug}}:",
+      "changedBy": "por {{name}}",
+      "aPerson": "una persona",
+      "changedOnNode": "en el nodo"
     },
     "hold": {
       "title": "Retención",
@@ -413,7 +416,10 @@
       "metricCommandsDescription": "Comandos que el nodo ejecuta periódicamente para reportar métricas adicionales.",
       "metricCommandsJson": "Comandos (lista JSON)",
       "jsonInvalid": "Esto no es JSON válido.",
-      "metricCommandsInvalid": "No es una lista válida de comandos de métricas ({{detail}})."
+      "metricCommandsInvalid": "No es una lista válida de comandos de métricas ({{detail}}).",
+      "metricCommandsNone": "Sin comandos de métricas.",
+      "metricCommandSchedule": "cada {{interval}} s · límite {{timeout}} s · {{format}}",
+      "metricCommandBody": "Comando de {{name}}"
     },
     "secrets": {
       "title": "Secretos",

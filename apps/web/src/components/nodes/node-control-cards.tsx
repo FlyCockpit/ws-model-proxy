@@ -59,7 +59,12 @@ export function TrustCard({ node }: { node: NodeDetail }) {
       <CardContent className="space-y-3">
         {node.trust.changedAt ? (
           <p className="text-xs text-muted-foreground">
-            {t("dashboard:nodes.trustCard.changed")} <TimeAgo value={node.trust.changedAt} />
+            {t("dashboard:nodes.trustCard.changed")} <TimeAgo value={node.trust.changedAt} />{" "}
+            {node.trust.changedBy
+              ? t("dashboard:nodes.trustCard.changedBy", {
+                  name: node.trust.changedBy.label ?? t("dashboard:nodes.trustCard.aPerson"),
+                })
+              : t("dashboard:nodes.trustCard.changedOnNode")}
           </p>
         ) : null}
         {full ? (
@@ -69,7 +74,9 @@ export function TrustCard({ node }: { node: NodeDetail }) {
           </Button>
         ) : (
           <div className="space-y-1.5">
-            <p className="text-sm">{t("dashboard:nodes.trustCard.raiseHint")}</p>
+            <p className="text-sm">
+              {t("dashboard:nodes.trustCard.raiseHint", { slug: node.slug })}
+            </p>
             <CommandBlock command="wsmp trust full" />
           </div>
         )}
