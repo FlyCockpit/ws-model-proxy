@@ -432,6 +432,8 @@ export function instanceView(
     phase: row.phase,
     phaseReason: row.phaseReason,
     phaseChangedAt: row.phaseChangedAt.toISOString(),
+    // Shown only while it explains the phase (a stopped run keeps its last value).
+    healthDetail: row.phase === "UNHEALTHY" ? row.healthDetail : null,
     needsOperator: row.needsOperator,
     startedBy: row.startedBy,
     restartWindow: {

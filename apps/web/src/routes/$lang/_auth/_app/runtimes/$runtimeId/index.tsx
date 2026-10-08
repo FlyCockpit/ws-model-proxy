@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
+import { healthHttpStatus, isHealthFailure } from "@ws-model-proxy/config/health-reasons";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
@@ -280,6 +281,34 @@ function ServedModelRow({ runtime, model }: { runtime: RuntimeDetail; model: Ser
   );
 }
 
+/** Why the instance is unhealthy or failed to start, when the node said. */
+function InstanceReasonNote({ instance }: { instance: Instance }) {
+  const { t } = useTranslation();
+  const detail = instance.healthDetail;
+  const status = detail ? healthHttpStatus(detail) : null;
+  const reason = !detail
+    ? null
+    : status
+      ? t("dashboard:runtime.healthReason.http", { status })
+      : isHealthFailure(detail)
+        ? t(`dashboard:runtime.healthReason.${detail}`)
+        : detail;
+  return (
+    <>
+      {reason ? (
+        <p className="break-words text-xs text-muted-foreground">
+          {t("dashboard:runtime.healthReason.label", { reason })}
+        </p>
+      ) : null}
+      {instance.phaseReason === "process_detached" ? (
+        <p className="break-words text-sm text-destructive">
+          {t("dashboard:runtime.processDetached")}
+        </p>
+      ) : null}
+    </>
+  );
+}
+
 function InstancesCard({ runtime }: { runtime: RuntimeDetail }) {
   const { t } = useTranslation(["dashboard", "common"]);
   const { lang } = Route.useParams();
@@ -344,6 +373,7 @@ function InstancesCard({ runtime }: { runtime: RuntimeDetail }) {
                     {instance.phaseReason ? ` · ${instance.phaseReason}` : ""}
                   </p>
                   <InstanceLoad live={instance.live} />
+                  <InstanceReasonNote instance={instance} />
                 </div>
                 {instance.needsOperator === "MARK_STOPPED" ? (
                   <MarkStoppedAction runtimeId={runtime.id} instanceId={instance.id} />

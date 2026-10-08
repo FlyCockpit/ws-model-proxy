@@ -755,6 +755,11 @@ export const RUNTIME_JOB_ERRORS = [
   "readiness_failed",
   "health_failed",
   "job_deadline",
+  /**
+   * A `process` start handed its server off out of the node's units (its start unit has no task
+   * left while the port answers): it needs `management: "service"` with stop and status.
+   */
+  "process_detached",
 ] as const;
 /**
  * Why a status probe (stop proof) answered not stopped, in its `detail`: a process of the
@@ -789,7 +794,8 @@ export const runtimeJobResultFrameSchema = z
     error: z.enum(RUNTIME_JOB_ERRORS).optional(),
     /**
      * Which check failed (`bad_job`, `definition_missing`): a field path, never a value. On a
-     * status probe answered not stopped: why ({@link STOP_PROOF_FAILURES}).
+     * status probe answered not stopped: why ({@link STOP_PROOF_FAILURES}). On a failed health
+     * probe: why (`@ws-model-proxy/config/health-reasons`).
      */
     detail: z
       .string()

@@ -248,3 +248,28 @@ describe("relay.request methods", () => {
     );
   });
 });
+
+describe("runtime job results", () => {
+  const result = {
+    type: "runtime.job.result",
+    stepId: "c".repeat(25),
+    instanceId: "d".repeat(25),
+    rank: 0,
+    intentHash: "a".repeat(64),
+    ownerEpoch: "epoch",
+    status: "failed",
+    stopped: false,
+  } as const;
+
+  it("accepts a health failure's reason and a detached process start", () => {
+    for (const detail of ["serving_unconfirmed", "http_503", "connect_refused", "timeout"]) {
+      expect(
+        nodeToServerControlFrameSchema.safeParse({ ...result, error: "health_failed", detail })
+          .success,
+      ).toBe(true);
+    }
+    expect(
+      nodeToServerControlFrameSchema.safeParse({ ...result, error: "process_detached" }).success,
+    ).toBe(true);
+  });
+});

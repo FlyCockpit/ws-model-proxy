@@ -381,7 +381,11 @@ const timeoutsSchema = z
 export const runtimeCommandsSchema = z
   .object({
     start: runtimeCommandSchema,
-    stop: runtimeCommandSchema,
+    /**
+     * Optional for `management: "process"` (the node's stop ends the rank's slice and proves
+     * it); a `service` runtime must have one.
+     */
+    stop: runtimeCommandSchema.optional(),
     prepare: runtimeCommandSchema.optional(),
     afterJoin: runtimeCommandSchema.optional(),
     status: runtimeCommandSchema.optional(),
@@ -466,6 +470,12 @@ export const runtimeLaunchSchema = z
       const path = ["commands", index];
       const interactive = commands.interactive;
       const anyInteractive = !!interactive && Object.values(interactive).some(Boolean);
+      if (launch.management === "service" && !commands.stop?.trim())
+        ctx.addIssue({
+          code: "custom",
+          path: [...path, "stop"],
+          message: "Service runtimes need a stop command.",
+        });
       if (launch.management === "service" && !commands.status?.trim())
         ctx.addIssue({
           code: "custom",
@@ -484,7 +494,7 @@ export const runtimeLaunchSchema = z
           path: ["management"],
           message: "An interactive start or afterJoin needs management service.",
         });
-      for (const field of ["prepare", "afterJoin"] as const)
+      for (const field of ["prepare", "afterJoin", "stop"] as const)
         if (interactive?.[field] && !commands[field])
           ctx.addIssue({
             code: "custom",

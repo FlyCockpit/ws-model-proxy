@@ -20,24 +20,17 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
-const limiterState = vi.hoisted(() => ({ hits: 0, limit: Number.POSITIVE_INFINITY }));
-
-vi.mock("../rate-limit.js", () => ({
-  authLimiter: {},
-  createRateLimiterMiddleware:
-    () =>
-    async (c: { json: (body: unknown, status: number) => Response }, next: () => Promise<void>) => {
-      limiterState.hits += 1;
-      if (limiterState.hits > limiterState.limit) {
-        return c.json({ error: "Too many attempts. Please wait a moment and try again." }, 429);
-      }
-      await next();
-    },
+vi.mock("../client-ip.js", () => ({
+  resolveClientIp: (c: { req: { header: (name: string) => string | undefined } }) =>
+    c.req.header("x-test-ip") ?? "203.0.113.1",
 }));
 
 const { authenticateNodeCredential } = await import("./node-credential-auth.js");
 const { createRelayWebsocketMiddleware, relaySocketEvents } = await import("./websocket.js");
 const { relaySessionManager } = await import("./session-manager.js");
+const { authLimiter, DEFAULTS, relayUpgradeIpLimiter, relayUpgradeNodeLimiter } = await import(
+  "../rate-limit.js"
+);
 const { WSContext } = await import("hono/ws");
 
 const authenticateMock = vi.mocked(authenticateNodeCredential);
@@ -49,6 +42,20 @@ function app() {
   return hono;
 }
 
+async function resetLimiters() {
+  for (const ip of ["203.0.113.1", "203.0.113.2"]) {
+    await relayUpgradeIpLimiter.delete(`ip:${ip}`);
+    await authLimiter.delete(ip);
+  }
+  for (const node of ["node-id", "node-a", "node-b"]) {
+    await relayUpgradeNodeLimiter.delete(`node:${node}`);
+  }
+}
+
+function identityFor(nodeId: string) {
+  return { credentialId: `cred-${nodeId}`, userId: "user-id", nodeId, identityPublicKey: "key" };
+}
+
 function websocketHeaders(extra: Record<string, string> = {}) {
   return {
     Upgrade: "websocket",
@@ -58,10 +65,9 @@ function websocketHeaders(extra: Record<string, string> = {}) {
 }
 
 describe("createRelayWebsocketMiddleware", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
-    limiterState.hits = 0;
-    limiterState.limit = Number.POSITIVE_INFINITY;
+    await resetLimiters();
   });
 
   it("rejects unauthenticated websocket upgrades", async () => {
@@ -95,8 +101,16 @@ describe("createRelayWebsocketMiddleware", () => {
     });
   });
 
-  it("returns a 429 from the limiter and does not continue the upgrade", async () => {
-    limiterState.limit = 0;
+  it("blocks an address that keeps failing, with Retry-After, without checking credentials", async () => {
+    authenticateMock.mockResolvedValue(null);
+    for (let attempt = 0; attempt < DEFAULTS.relayUpgradeIp.points; attempt += 1) {
+      const response = await app().request("/api/cli/ws", {
+        method: "GET",
+        headers: websocketHeaders({ Authorization: "Bearer wsmp_node_secret" }),
+      });
+      expect(response.status).toBe(401);
+    }
+    authenticateMock.mockClear();
     let continued = false;
     const hono = new Hono();
     hono.use("/api/cli/ws", createRelayWebsocketMiddleware());
@@ -111,11 +125,59 @@ describe("createRelayWebsocketMiddleware", () => {
     });
 
     expect(response.status).toBe(429);
+    expect(Number(response.headers.get("retry-after"))).toBeGreaterThan(0);
     expect(continued).toBe(false);
     expect(authenticateMock).not.toHaveBeenCalled();
-    await expect(response.json()).resolves.toEqual({
-      error: "Too many attempts. Please wait a moment and try again.",
+  });
+
+  it("charges authenticated upgrades to the node, not the address, and never to sign-in", async () => {
+    authenticateMock.mockResolvedValue(identityFor("node-a"));
+    const upgrade = () =>
+      app().request("/api/cli/ws", {
+        method: "GET",
+        headers: websocketHeaders({ Authorization: "Bearer wsmp_node_secret" }),
+      });
+    for (let attempt = 0; attempt < DEFAULTS.relayUpgradeNode.points; attempt += 1) {
+      expect((await upgrade()).status).toBe(200);
+    }
+
+    // The storming node is now limited, with a Retry-After the CLI honours…
+    const limited = await upgrade();
+    expect(limited.status).toBe(429);
+    expect(Number(limited.headers.get("retry-after"))).toBeGreaterThan(0);
+
+    // …while another node behind the same address still connects…
+    authenticateMock.mockResolvedValue(identityFor("node-b"));
+    expect((await upgrade()).status).toBe(200);
+    // …the address spent none of its failure budget…
+    expect(await relayUpgradeIpLimiter.get("ip:203.0.113.1")).toBeNull();
+    // …and the sign-in bucket for that address was never touched.
+    expect(await authLimiter.get("203.0.113.1")).toBeNull();
+  });
+
+  it("lets many honest nodes behind one address connect at once", async () => {
+    let finish: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      finish = resolve;
     });
+    let index = 0;
+    authenticateMock.mockImplementation(async () => {
+      const nodeId = `nat-${index++}`;
+      await gate;
+      return identityFor(nodeId);
+    });
+    const upgrades = Array.from({ length: 64 }, () =>
+      app().request("/api/cli/ws", {
+        method: "GET",
+        headers: websocketHeaders({ Authorization: "Bearer wsmp_node_secret" }),
+      }),
+    );
+    await vi.waitFor(() => expect(authenticateMock).toHaveBeenCalledTimes(64));
+    finish();
+    const statuses = (await Promise.all(upgrades)).map((response) => response.status);
+    expect(statuses.every((status) => status === 200)).toBe(true);
+    expect(await relayUpgradeIpLimiter.get("ip:203.0.113.1")).toBeNull();
+    for (let n = 0; n < 64; n += 1) await relayUpgradeNodeLimiter.delete(`node:nat-${n}`);
   });
 
   it("rejects revoked websocket credentials", async () => {
@@ -153,10 +215,9 @@ describe("relay upgrade during shutdown", () => {
     return { ws: new WSContext<WebSocketLike>(raw), closes };
   }
 
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
-    limiterState.hits = 0;
-    limiterState.limit = Number.POSITIVE_INFINITY;
+    await resetLimiters();
   });
 
   afterEach(() => {

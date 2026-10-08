@@ -27,6 +27,7 @@ import { randomBytes } from "node:crypto";
 import { sameStoredInstanceFacts, storedInstanceFacts } from "@ws-model-proxy/api/lib/engine-facts";
 import { graphWrite, instanceCapacityFences } from "@ws-model-proxy/api/lib/graph-write";
 import { type RuntimeLaunch, runtimeLaunchSchema } from "@ws-model-proxy/api/lib/runtime-spec";
+import { healthFailureDetail } from "@ws-model-proxy/config/health-reasons";
 import { RUNTIME_ADVANCED } from "@ws-model-proxy/config/runtime-defaults";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
@@ -244,6 +245,8 @@ const TERMINAL_START_ERRORS: ReadonlySet<string> = new Set([
   // A node built without operator terminals refuses an interactive step the same way every time.
   "interactive_unsupported",
   "operator_terminals_disabled",
+  // A `process` start that hands its server off does so every time: it needs a `service` spec.
+  "process_detached",
 ]);
 
 export type LifecycleOptions = {
@@ -521,6 +524,7 @@ export class RuntimeLifecycle {
         healthFailures: 0,
         healthSuccesses: 0,
         unhealthySince: null,
+        healthDetail: null,
         cacheGeneration: `${instance.id}:${generation}`,
       },
     });
@@ -2257,7 +2261,7 @@ export class RuntimeLifecycle {
       });
       if (changed.count === 0) return;
       if (interactive) await this.syncNeedsOperator(tx, step.instanceId);
-      await this.afterStep(tx, step, succeeded, code);
+      await this.afterStep(tx, step, succeeded, code, healthFailureDetail(result.detail));
     });
     if (dropped) stale();
     this.wake();
@@ -2272,7 +2276,14 @@ export class RuntimeLifecycle {
   }
 
   /** What a finished step means for its instance. */
-  private async afterStep(tx: Tx, step: FinishedStep, succeeded: boolean, code: string | null) {
+  /** `healthDetail`: why a failed health probe failed, when the node said. */
+  private async afterStep(
+    tx: Tx,
+    step: FinishedStep,
+    succeeded: boolean,
+    code: string | null,
+    healthDetail: string | null = null,
+  ) {
     const { instanceId, phase, rank, generation } = step;
     const instance = await tx.runtimeInstance.findUnique({
       where: { id: instanceId },
@@ -2318,7 +2329,7 @@ export class RuntimeLifecycle {
       return;
     }
     if (phase === "HEALTH") {
-      await this.recordHealth(tx, instance, succeeded);
+      await this.recordHealth(tx, instance, succeeded, healthDetail);
       return;
     }
     // Start phases.
@@ -2359,6 +2370,7 @@ export class RuntimeLifecycle {
         healthFailures: 0,
         healthSuccesses: 0,
         unhealthySince: null,
+        healthDetail: null,
         unavailableSince: null,
         needsOperator: null,
         needsOperatorSince: null,
@@ -2367,7 +2379,12 @@ export class RuntimeLifecycle {
     await registerExecutionTargets(tx, instance);
   }
 
-  private async recordHealth(tx: Tx, instance: InstanceRow, success: boolean) {
+  private async recordHealth(
+    tx: Tx,
+    instance: InstanceRow,
+    success: boolean,
+    detail: string | null,
+  ) {
     const launch = launchOf(instance);
     if (!launch || (instance.phase !== "READY" && instance.phase !== "UNHEALTHY")) return;
     const now = this.now();
@@ -2382,6 +2399,12 @@ export class RuntimeLifecycle {
         healthFailures: failures,
         healthSuccesses: successes,
         lastHealthAt: now,
+        // Why the last probe failed, kept while the instance is UNHEALTHY; READY clears it.
+        ...(phase === "UNHEALTHY"
+          ? success
+            ? {}
+            : { healthDetail: detail }
+          : { healthDetail: null }),
         ...(phase !== instance.phase
           ? {
               phase,

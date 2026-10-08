@@ -96,7 +96,7 @@ fn phase_command(commands: &Commands, phase: JobPhase) -> Option<&str> {
         JobPhase::Prepare => commands.prepare.as_deref(),
         JobPhase::Start => Some(&commands.start),
         JobPhase::AfterJoin => commands.after_join.as_deref(),
-        JobPhase::Stop => Some(&commands.stop),
+        JobPhase::Stop => commands.stop.as_deref(),
         JobPhase::Status => commands.status.as_deref(),
         JobPhase::Health => commands.health.as_deref(),
         JobPhase::Readiness => None,
@@ -186,7 +186,14 @@ pub fn render(
         Some(text) => render_one(text, "command")?,
         None => String::new(),
     };
-    let stop_command = render_one(&commands.stop, "stop")?;
+    // No stop command (a `process` runtime may leave it out): the stop is the
+    // slice kill and the proof alone.
+    let stop_command = commands
+        .stop
+        .as_deref()
+        .map(|text| render_one(text, "stop"))
+        .transpose()?
+        .unwrap_or_default();
     let status_command = commands
         .status
         .as_deref()

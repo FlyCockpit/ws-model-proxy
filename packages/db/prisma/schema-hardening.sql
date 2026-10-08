@@ -583,6 +583,7 @@ ALTER TABLE runtime_instance ADD CONSTRAINT runtime_instance_shape CHECK (
   AND ("observedKvBudgetTokens" IS NULL OR "observedKvBudgetTokens" > 0)
   AND ("maxModelLen" IS NULL OR "maxModelLen" > 0)
   AND ("phaseReason" IS NULL OR "phaseReason" ~ '^[a-z0-9_]{1,64}$')
+  AND ("healthDetail" IS NULL OR "healthDetail" ~ '^[a-z0-9_]{1,64}$')
   -- A multi-node instance names its fabric until it is down (then the fabric may go).
   AND ("fabricId" IS NULL OR ("desiredState" IS NOT NULL AND phase NOT IN ('STOPPED', 'FAILED')))
 );

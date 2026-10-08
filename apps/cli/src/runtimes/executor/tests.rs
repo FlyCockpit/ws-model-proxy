@@ -62,6 +62,11 @@ struct Fake {
     status_alive: Cell<Option<bool>>,
     /// Whether the user manager errors when asked for a unit's tasks.
     tasks_unknown: Cell<bool>,
+    /// Once the port answers, the start unit has no task left (a start that
+    /// handed its server off, like `docker compose up -d`).
+    detach_on_probe: Cell<bool>,
+    /// The start unit's main process exited with status 0.
+    exited_cleanly: Cell<bool>,
 }
 
 impl Fake {
@@ -80,6 +85,8 @@ impl Fake {
             slice_survives: Cell::new(false),
             status_alive: Cell::new(None),
             tasks_unknown: Cell::new(false),
+            detach_on_probe: Cell::new(false),
+            exited_cleanly: Cell::new(false),
         }
     }
 }
@@ -121,8 +128,15 @@ impl Runtime for Fake {
         self.units.borrow_mut().remove(unit);
         Ok(())
     }
-    fn healthy_until(&self, _: &Job, _: Deadline) -> bool {
-        self.ready.get()
+    fn healthy_until(&self, _: &Job, _: Deadline) -> std::result::Result<(), HealthMiss> {
+        if self.detach_on_probe.get() {
+            self.units.borrow_mut().clear();
+        }
+        if self.ready.get() {
+            Ok(())
+        } else {
+            Err(HealthMiss::Http(503))
+        }
     }
     fn tasks_alive(&self, unit: &str, _: Deadline) -> Result<bool> {
         anyhow::ensure!(!self.tasks_unknown.get(), "the user manager did not answer");
@@ -131,6 +145,12 @@ impl Runtime for Fake {
     }
     fn port_free(&self, _: &str, port: u16) -> bool {
         !self.port_busy.get() && !self.busy_ports.borrow().contains(&port)
+    }
+    fn exited_cleanly(&self, _: &str, _: Deadline) -> Result<bool> {
+        Ok(self.exited_cleanly.get())
+    }
+    fn port_answers(&self, _: &str, _: u16) -> bool {
+        self.ready.get()
     }
     fn forget_slice(&self, slice: &str, _: Deadline) {
         self.forgotten.borrow_mut().push(slice.into());
@@ -367,6 +387,212 @@ fn health_hysteresis_marks_unhealthy_then_ready() {
 }
 
 #[test]
+fn a_failed_health_probe_says_why() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(job(JobPhase::Start), &runtime, deadline());
+    runtime.ready.set(false);
+    let mut health = job(JobPhase::Health);
+    health.step_id = "h1".into();
+    let outcome = executor.execute(health, &runtime, deadline());
+    assert_eq!(
+        (outcome.error, outcome.detail.as_deref()),
+        (Some(JobError::HealthFailed), Some("http_503"))
+    );
+    // The unit has no task left: the serving process is unconfirmed, and it
+    // counts as one more failed probe rather than an error.
+    runtime.units.borrow_mut().clear();
+    let mut health = job(JobPhase::Health);
+    health.step_id = "h2".into();
+    let outcome = executor.execute(health, &runtime, deadline());
+    assert_eq!(
+        (outcome.error, outcome.detail.as_deref()),
+        (Some(JobError::HealthFailed), Some("serving_unconfirmed"))
+    );
+    assert_eq!(
+        executor.state.records["in1:0"].consecutive_health_failures,
+        2
+    );
+    // The detail travels in the result frame.
+    let frame = crate::runtimes::runner::result_frame(&job(JobPhase::Health), &outcome);
+    let text = serde_json::to_string(&frame).expect("frame");
+    assert!(text.contains(r#""detail":"serving_unconfirmed""#), "{text}");
+}
+
+/// A probe that uses up all the time it is given.
+struct Stalling {
+    inner: Fake,
+}
+
+impl Runtime for Stalling {
+    fn launch(&self, job: &Job, owner: &str, unit: &str, deadline: Deadline) -> Result<String> {
+        self.inner.launch(job, owner, unit, deadline)
+    }
+    fn identity(&self, unit: &str, owner: &str, deadline: Deadline) -> Result<Option<String>> {
+        self.inner.identity(unit, owner, deadline)
+    }
+    fn shell_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<()> {
+        self.inner.shell_until(job, command, deadline)
+    }
+    fn status_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<bool> {
+        self.inner.status_until(job, command, deadline)
+    }
+    fn stop(&self, unit: &str, owner: &str, invocation: &str, deadline: Deadline) -> Result<()> {
+        self.inner.stop(unit, owner, invocation, deadline)
+    }
+    fn healthy_until(&self, _: &Job, deadline: Deadline) -> std::result::Result<(), HealthMiss> {
+        while deadline.remaining().is_ok() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Err(HealthMiss::Timeout)
+    }
+    fn tasks_alive(&self, unit: &str, deadline: Deadline) -> Result<bool> {
+        self.inner.tasks_alive(unit, deadline)
+    }
+    fn port_free(&self, host: &str, port: u16) -> bool {
+        self.inner.port_free(host, port)
+    }
+}
+
+#[test]
+fn a_stalled_health_probe_answers_timeout_within_its_deadline() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Stalling {
+        inner: Fake::new(path.clone()),
+    };
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(job(JobPhase::Start), &runtime, deadline());
+    let mut health = job(JobPhase::Health);
+    health.step_id = "h1".into();
+    let outcome = executor.execute(health, &runtime, Deadline::new(Duration::from_secs(3)));
+    assert_eq!(
+        (outcome.error, outcome.detail.as_deref()),
+        (Some(JobError::HealthFailed), Some("timeout"))
+    );
+}
+
+#[test]
+fn health_miss_details_are_plain_codes() {
+    for (miss, detail) in [
+        (HealthMiss::ServingUnconfirmed, "serving_unconfirmed"),
+        (HealthMiss::Http(502), "http_502"),
+        (HealthMiss::ConnectRefused, "connect_refused"),
+        (HealthMiss::Timeout, "timeout"),
+        (HealthMiss::Unreachable, "unreachable"),
+        (HealthMiss::CommandFailed, "command_failed"),
+        (HealthMiss::StatusNotRunning, "status_not_running"),
+    ] {
+        assert_eq!(miss.detail(), detail);
+    }
+}
+
+#[test]
+fn a_process_start_that_hands_its_server_off_fails_detached() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(job(JobPhase::Start), &runtime, deadline());
+    runtime.detach_on_probe.set(true);
+    runtime.exited_cleanly.set(true);
+    let outcome = executor.execute(job(JobPhase::Readiness), &runtime, deadline());
+    assert_eq!(outcome.error, Some(JobError::ProcessDetached));
+    assert_ne!(
+        executor.observations(&runtime, deadline())[0].1.phase,
+        InstancePhase::Ready
+    );
+}
+
+#[test]
+fn a_process_start_already_handed_off_at_readiness_fails_detached() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(job(JobPhase::Start), &runtime, deadline());
+    // The start unit emptied before readiness began (its command exited 0), and the port
+    // answers.
+    runtime.units.borrow_mut().clear();
+    runtime.exited_cleanly.set(true);
+    let outcome = executor.execute(job(JobPhase::Readiness), &runtime, deadline());
+    assert_eq!(outcome.error, Some(JobError::ProcessDetached));
+    // Nothing answers either: an ordinary readiness failure, at once.
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(job(JobPhase::Start), &runtime, deadline());
+    runtime.units.borrow_mut().clear();
+    runtime.ready.set(false);
+    let outcome = executor.execute(job(JobPhase::Readiness), &runtime, deadline());
+    assert_eq!(outcome.error, Some(JobError::ReadinessFailed));
+}
+
+#[test]
+fn a_process_that_crashes_after_answering_is_not_a_hand_off() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(job(JobPhase::Start), &runtime, deadline());
+    // The server answered once, then died (a crash or an OOM kill, not an exit 0).
+    runtime.detach_on_probe.set(true);
+    let outcome = executor.execute(job(JobPhase::Readiness), &runtime, deadline());
+    assert_eq!(outcome.error, Some(JobError::ReadinessFailed));
+}
+
+#[test]
+fn a_service_start_may_hand_its_server_off() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    let service = |phase| {
+        let mut job = job(phase);
+        job.spec["launch"]["management"] = "service".into();
+        job.status_command = Some("true".into());
+        job
+    };
+    executor.execute(service(JobPhase::Start), &runtime, deadline());
+    // A service's serving process is proven by its status command, not its unit.
+    runtime.status_alive.set(Some(true));
+    runtime.detach_on_probe.set(true);
+    assert_eq!(
+        executor
+            .execute(service(JobPhase::Readiness), &runtime, deadline())
+            .status,
+        JobStatus::Succeeded
+    );
+}
+
+#[test]
+fn a_process_stop_without_a_stop_command_is_the_slice_kill_and_the_proof() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    let without = |phase| {
+        let mut job = job(phase);
+        job.stop_command = String::new();
+        job.spec["launch"]["commands"][0]
+            .as_object_mut()
+            .expect("commands")
+            .remove("stop");
+        job
+    };
+    executor.execute(without(JobPhase::Start), &runtime, deadline());
+    let stopped = executor.execute(without(JobPhase::Stop), &runtime, deadline());
+    assert!(stopped.stopped, "{stopped:?}");
+    assert_eq!(
+        runtime.slice_stops.borrow().as_slice(),
+        ["wsmp_i_abcdefabcdef_r0.slice"]
+    );
+}
+
+#[test]
 fn a_prepare_without_a_command_runs_nothing() {
     let root = tempfile::tempdir().expect("root");
     let path = root.path().join("in1-r0.json");
@@ -447,7 +673,7 @@ impl Runtime for Flaky {
     fn stop(&self, unit: &str, owner: &str, invocation: &str, deadline: Deadline) -> Result<()> {
         self.inner.stop(unit, owner, invocation, deadline)
     }
-    fn healthy_until(&self, job: &Job, deadline: Deadline) -> bool {
+    fn healthy_until(&self, job: &Job, deadline: Deadline) -> std::result::Result<(), HealthMiss> {
         self.inner.healthy_until(job, deadline)
     }
     fn tasks_alive(&self, unit: &str, deadline: Deadline) -> Result<bool> {

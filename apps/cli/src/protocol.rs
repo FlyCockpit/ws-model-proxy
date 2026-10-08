@@ -52,15 +52,18 @@ pub fn terminal_supported() -> bool {
 /// The fatal error for a `protocol.error` (or an older server's reply) that
 /// arrives before `hello.ok`. A reply without a code comes from a server that
 /// does not speak 3.0: say plainly to upgrade the server. A coded
-/// `upgrade_cli` names the CLI.
+/// `upgrade_cli` names the CLI and how to install the matching one.
 pub fn hello_rejection_message(message: &str, code: Option<&ProtocolErrorCode>) -> String {
-    let server_too_old = matches!(code, Some(ProtocolErrorCode::UpgradeServer) | None);
-    if server_too_old {
-        format!(
+    match code {
+        Some(ProtocolErrorCode::UpgradeServer) | None => format!(
             "the server rejected relay protocol {RELAY_PROTOCOL_VERSION} (`{message}`); upgrade the WS Model Proxy server or use an older wsmp"
-        )
-    } else {
-        format!("relay protocol error: {message}")
+        ),
+        Some(ProtocolErrorCode::UpgradeCli) => format!(
+            "relay protocol error: {message} This wsmp speaks relay protocol {RELAY_PROTOCOL_VERSION}. \
+             Install the server's build by re-running its install.sh \
+             (`curl -fsSL https://<your server>/install.sh | sh`), then restart wsmp"
+        ),
+        Some(_) => format!("relay protocol error: {message}"),
     }
 }
 
@@ -713,10 +716,12 @@ mod tests {
         );
         assert!(message.contains("upgrade the WS Model Proxy server"));
         let reply = "This server requires a newer wsmp. Upgrade wsmp and restart it.";
-        assert_eq!(
-            hello_rejection_message(reply, Some(&ProtocolErrorCode::UpgradeCli)),
-            format!("relay protocol error: {reply}")
+        let upgrade_cli = hello_rejection_message(reply, Some(&ProtocolErrorCode::UpgradeCli));
+        assert!(
+            upgrade_cli.starts_with(&format!("relay protocol error: {reply}")),
+            "{upgrade_cli}"
         );
+        assert!(upgrade_cli.contains("install.sh"), "{upgrade_cli}");
     }
 
     #[test]

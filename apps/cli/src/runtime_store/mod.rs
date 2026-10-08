@@ -472,9 +472,9 @@ pub fn binds_all_interfaces(spec: &RuntimeSpec) -> bool {
     }
     for commands in spec.launch.iter().flat_map(|launch| &launch.commands) {
         texts.push(&commands.start);
-        texts.push(&commands.stop);
         texts.extend(
             [
+                &commands.stop,
                 &commands.prepare,
                 &commands.after_join,
                 &commands.status,

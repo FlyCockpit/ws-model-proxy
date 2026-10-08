@@ -163,6 +163,52 @@ impl Outcome {
             detail: None,
         }
     }
+
+    /// A failed health probe, and why.
+    fn unhealthy(miss: HealthMiss) -> Self {
+        Self {
+            detail: Some(miss.detail()),
+            ..Self::failed(JobError::HealthFailed)
+        }
+    }
+}
+
+/// What a health step keeps of its deadline to record and answer its probe.
+const HEALTH_ANSWER_RESERVE: Duration = Duration::from_secs(2);
+
+/// Why a health (or readiness) probe failed; a health result sends it as its
+/// `detail`. Plain codes only, never the response or command output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthMiss {
+    /// The serving process could not be confirmed (its unit has no task left,
+    /// or a service's status command did not say alive).
+    ServingUnconfirmed,
+    /// The readiness URL answered another status.
+    Http(u16),
+    /// Nothing listens on the port.
+    ConnectRefused,
+    /// The probe did not finish in time.
+    Timeout,
+    /// The request failed another way (reset, no route, protocol error).
+    Unreachable,
+    /// The health command exited non-zero (or could not run).
+    CommandFailed,
+    /// The status command did not say alive.
+    StatusNotRunning,
+}
+
+impl HealthMiss {
+    pub fn detail(self) -> String {
+        match self {
+            Self::ServingUnconfirmed => "serving_unconfirmed".into(),
+            Self::Http(status) => format!("http_{status}"),
+            Self::ConnectRefused => "connect_refused".into(),
+            Self::Timeout => "timeout".into(),
+            Self::Unreachable => "unreachable".into(),
+            Self::CommandFailed => "command_failed".into(),
+            Self::StatusNotRunning => "status_not_running".into(),
+        }
+    }
 }
 
 /// An explicit failure code carried through `anyhow`.
@@ -377,12 +423,23 @@ pub trait Runtime {
     /// true alive, false positively stopped (exit 3); errors are unknown.
     fn status_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<bool>;
     fn stop(&self, unit: &str, owner: &str, invocation: &str, deadline: Deadline) -> Result<()>;
-    fn healthy_until(&self, job: &Job, deadline: Deadline) -> bool;
+    /// Probes the launch's readiness URL once: `Ok` when it answers the
+    /// expected status, else why not.
+    fn healthy_until(&self, job: &Job, deadline: Deadline) -> std::result::Result<(), HealthMiss>;
     /// Whether any process of the unit's tree still runs (whoever launched it): false when
     /// the unit is gone or its control group has no task. Errors are unknown.
     fn tasks_alive(&self, unit: &str, deadline: Deadline) -> Result<bool>;
     /// Whether nothing listens on `port` (any address, and `host`).
     fn port_free(&self, host: &str, port: u16) -> bool;
+    /// Whether the unit's main process exited with status 0 (a `RemainAfterExit` unit stays
+    /// active after that). A crash, a signal or a unit still running is not. Errors are unknown.
+    fn exited_cleanly(&self, _unit: &str, _deadline: Deadline) -> Result<bool> {
+        Ok(false)
+    }
+    /// Whether something accepts a connection on `host:port` now.
+    fn port_answers(&self, _host: &str, _port: u16) -> bool {
+        false
+    }
     /// The rank's slice was proven empty: let the manager forget it (best effort).
     fn forget_slice(&self, _slice: &str, _deadline: Deadline) {}
     /// A stop ends whatever still runs in the rank's slice: SIGTERM, then SIGKILL after a grace
@@ -782,6 +839,12 @@ impl Executor {
                     let invocation =
                         match runtime.launch(job, &self.state.owner_id, &unit, deadline) {
                             Ok(identity) => identity,
+                            // A hand-off is not an unconfirmed launch: keep its reason.
+                            Err(error)
+                                if failure_code(job, &error) == JobError::ProcessDetached =>
+                            {
+                                return Err(error);
+                            }
                             Err(error) => {
                                 deadline.remaining()?;
                                 let _ = runtime.identity(&unit, &self.state.owner_id, deadline)?;
@@ -814,16 +877,34 @@ impl Executor {
                 }
             }
             JobPhase::Readiness => {
-                anyhow::ensure!(
-                    serving_confirmed(
-                        self.state.records.get(&key).context("record")?,
-                        &self.state.owner_id,
-                        runtime,
-                        deadline
-                    )?,
-                    "serving process unconfirmed"
-                );
-                while !probe_once(job, runtime, deadline.cap(Duration::from_secs(10))) {
+                // A `process` start must keep its server in the node's units. One that
+                // answers while its start unit has no task left handed off (`docker
+                // compose up -d`, a daemonizing server): wsmp could neither watch nor stop
+                // it, so the start fails and asks for `management: "service"`. (A person's
+                // run in an operator terminal is `external`: its status command decides.)
+                let record = self.state.records.get(&key).context("record")?;
+                let watched = job.management() == Management::Process
+                    && record
+                        .invocations
+                        .get(&phase_unit(job))
+                        .is_some_and(|invocation| !outside(invocation));
+                let detached = || {
+                    Err::<Outcome, _>(fail(JobError::ProcessDetached)).context(
+                        "the start handed its server off out of wsmp's units; use management \"service\" with stop and status commands",
+                    )
+                };
+                // Handed off, not crashed: the start command exited 0 and the server answers.
+                let handed_off = || -> Result<bool> {
+                    Ok(runtime.exited_cleanly(&phase_unit(job), deadline)?
+                        && probe_once(job, runtime, deadline.cap(Duration::from_secs(10))).is_ok())
+                };
+                if !serving_confirmed(record, &self.state.owner_id, runtime, deadline)? {
+                    if watched && handed_off()? {
+                        return detached();
+                    }
+                    anyhow::bail!("serving process unconfirmed");
+                }
+                while probe_once(job, runtime, deadline.cap(Duration::from_secs(10))).is_err() {
                     if runtime.cancelled() {
                         return Err(fail(JobError::SessionDisconnected));
                     }
@@ -831,22 +912,44 @@ impl Executor {
                         .sleep(Duration::from_millis(500))
                         .map_err(|_| fail(JobError::ReadinessFailed))?;
                 }
+                if watched
+                    && !serving_confirmed(
+                        self.state.records.get(&key).context("record")?,
+                        &self.state.owner_id,
+                        runtime,
+                        deadline,
+                    )?
+                {
+                    // A server that answered and then crashed is an ordinary failed
+                    // readiness (restarted as usual), not a hand-off.
+                    if handed_off()? {
+                        return detached();
+                    }
+                    anyhow::bail!("serving process unconfirmed");
+                }
                 self.state.records.get_mut(&key).context("record")?.phase = InstancePhase::Ready;
                 Outcome::ok(false)
             }
             JobPhase::Status => anyhow::bail!("a status probe is answered by the stop proof"),
             JobPhase::Health => {
-                anyhow::ensure!(
-                    serving_confirmed(
-                        self.state.records.get(&key).context("record")?,
-                        &self.state.owner_id,
-                        runtime,
-                        deadline
-                    )?,
-                    "serving process unconfirmed"
-                );
-                let healthy = probe_once(job, runtime, deadline);
+                let miss = if serving_confirmed(
+                    self.state.records.get(&key).context("record")?,
+                    &self.state.owner_id,
+                    runtime,
+                    deadline,
+                )? {
+                    // Keep time to answer: a probe that runs out of it is a `timeout`,
+                    // not a step past its deadline.
+                    let reserve = deadline
+                        .remaining()?
+                        .saturating_sub(HEALTH_ANSWER_RESERVE)
+                        .max(Duration::from_millis(100));
+                    probe_once(job, runtime, deadline.cap(reserve)).err()
+                } else {
+                    Some(HealthMiss::ServingUnconfirmed)
+                };
                 deadline.remaining()?;
+                let healthy = miss.is_none();
                 if job.action == JobPhase::Health {
                     let (failure_threshold, success_threshold) = job.health_thresholds();
                     let record = self.state.records.get_mut(&key).context("record")?;
@@ -866,11 +969,7 @@ impl Executor {
                         }
                     }
                 }
-                if healthy {
-                    Outcome::ok(false)
-                } else {
-                    Outcome::failed(JobError::HealthFailed)
-                }
+                miss.map_or_else(|| Outcome::ok(false), Outcome::unhealthy)
             }
             JobPhase::Stop => self
                 .stop_teardown(job, runtime, deadline)?
@@ -1389,7 +1488,7 @@ impl<R: Runtime> Runtime for OperatorRan<'_, R> {
     fn stop(&self, unit: &str, owner: &str, invocation: &str, deadline: Deadline) -> Result<()> {
         self.inner.stop(unit, owner, invocation, deadline)
     }
-    fn healthy_until(&self, job: &Job, deadline: Deadline) -> bool {
+    fn healthy_until(&self, job: &Job, deadline: Deadline) -> std::result::Result<(), HealthMiss> {
         self.inner.healthy_until(job, deadline)
     }
     fn tasks_alive(&self, unit: &str, deadline: Deadline) -> Result<bool> {
@@ -1435,23 +1534,37 @@ fn wait_for_status(
 
 /// One readiness/health probe: the health command, else HTTP readiness,
 /// else the status command.
-fn probe_once(job: &Job, runtime: &impl Runtime, deadline: Deadline) -> bool {
+fn probe_once(
+    job: &Job,
+    runtime: &impl Runtime,
+    deadline: Deadline,
+) -> std::result::Result<(), HealthMiss> {
+    let command = |health: &str| {
+        runtime
+            .shell_until(job, health, deadline)
+            .map_err(|_| HealthMiss::CommandFailed)
+    };
     if job.action != JobPhase::Readiness
         && let Some(health) = job.health_command.as_deref()
     {
-        return runtime.shell_until(job, health, deadline).is_ok();
+        return command(health);
     }
     if job.readiness().is_some() {
         return runtime.healthy_until(job, deadline);
     }
     if let Some(health) = job.health_command.as_deref() {
-        return runtime.shell_until(job, health, deadline).is_ok();
+        return command(health);
     }
-    job.status_command.as_deref().is_some_and(|status| {
+    let alive = job.status_command.as_deref().is_some_and(|status| {
         runtime
             .status_until(job, status, deadline)
             .is_ok_and(|alive| alive)
-    })
+    });
+    if alive {
+        Ok(())
+    } else {
+        Err(HealthMiss::StatusNotRunning)
+    }
 }
 
 /// Whether the serving process is up: a status proof for a service the node

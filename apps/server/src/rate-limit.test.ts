@@ -40,6 +40,8 @@ vi.mock("rate-limiter-flexible", async (importOriginal) => {
 
 const {
   authLimiter,
+  relayUpgradeIpLimiter,
+  relayUpgradeNodeLimiter,
   consumeEnrollmentExchange,
   createRateLimiterMiddleware,
   DEFAULTS,
@@ -319,6 +321,8 @@ describe("built-in limits and WMP_RATE_LIMIT_SCALE", () => {
       enrollmentExchangeIp: { points: 10, duration: 900 },
       enrollmentExchangeUser: { points: 20, duration: 3600 },
       inviteInfo: { points: 10, duration: 60, blockDuration: 900 },
+      relayUpgradeIp: { points: 30, duration: 60, blockDuration: 300 },
+      relayUpgradeNode: { points: 10, duration: 60, blockDuration: 300 },
     });
   });
 
@@ -330,6 +334,9 @@ describe("built-in limits and WMP_RATE_LIMIT_SCALE", () => {
     expect(emailRecipientLimiter.points).toBe(DEFAULTS.emailRecipient.points);
     expect(emailRecipientLimiter.blockDuration).toBe(0);
     expect(enrollmentExchangeIpLimiter.points).toBe(DEFAULTS.enrollmentExchangeIp.points);
+    expect(relayUpgradeIpLimiter.points).toBe(DEFAULTS.relayUpgradeIp.points);
+    expect(relayUpgradeNodeLimiter.points).toBe(DEFAULTS.relayUpgradeNode.points);
+    expect(relayUpgradeNodeLimiter.keyPrefix).not.toBe(authLimiter.keyPrefix);
   });
 
   it.each([

@@ -166,6 +166,11 @@ export const instanceViewSchema = z
     phase: z.enum(INSTANCE_PHASE),
     phaseReason: z.string().nullable(),
     phaseChangedAt: isoDateSchema,
+    /**
+     * Why the last health probe failed (`serving_unconfirmed`, `http_<code>`, `connect_refused`,
+     * `timeout`, `unreachable`, `command_failed`, `status_not_running`); null unless UNHEALTHY.
+     */
+    healthDetail: z.string().nullable(),
     needsOperator: z.enum(OPERATOR_NEED).nullable(),
     startedBy: actorRefSchema.shape.actor,
     restartWindow: z

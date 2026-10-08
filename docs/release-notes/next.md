@@ -339,6 +339,24 @@ can do the same on Full-control nodes with
 `runtime_stop {markStopped: true, confirm: "MARK_STOPPED"}`. Each mark writes
 a "marked as stopped" row in the node's activity.
 
+## Runtime starts and health
+
+- A `management: "process"` runtime no longer needs a stop command: the node's
+  stop ends everything in the rank's slice and proves it. The vLLM, SGLang and
+  llama.cpp presets drop their `stop: "true"` stub. Service runtimes still
+  need `stop` and `status`.
+- A `process` start that hands its server off (`docker compose up -d`, a
+  server that daemonizes) now fails with **process_detached** instead of
+  looking healthy while the node can neither watch nor stop it. Define such a
+  runtime as `management: "service"` with real stop and status commands.
+- An unhealthy instance shows why its last health check failed (for example
+  "answered HTTP 503" or "the serving process is not running in its unit") on
+  the runtime page and as `healthDetail` in `runtimes_get`.
+- A wsmp the server refuses for its relay protocol no longer restarts every 5
+  seconds: under a service unit written by `wsmp service install` it stops
+  with exit code 5, and under an older unit it retries every 5 minutes. Re-run
+  the server's install.sh, then `wsmp service install` to update the unit.
+
 ## Configuration
 
 ### Rate limits
@@ -349,6 +367,15 @@ setting, `WMP_RATE_LIMIT_SCALE` (default 1, 0.1-100), multiplies every budget;
 windows and block durations stay fixed. The per-recipient email caps and the
 failed-password cap are always on (on unreleased master builds, setting their
 points to 0 turned them off; that is gone).
+
+Relay connections (`/api/cli/ws`) have their own limits and no longer share
+the sign-in bucket, so a node reconnecting in a loop cannot lock its owner out
+of sign-in from the same address. Each node may open 10 relay connections per
+minute (then it waits 5 minutes), and each address may fail 30 relay
+connections per minute before authenticating (then 5 minutes); only failed
+connections count against an address, so many nodes behind one NAT can
+connect at once. A refused connection
+answers 429 with `Retry-After`, and `wsmp` waits at least that long.
 
 ### Email recipient caps
 

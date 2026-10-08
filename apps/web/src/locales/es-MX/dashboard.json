@@ -1355,6 +1355,17 @@
       "STOPPED": "Detenido",
       "FAILED": "Falló"
     },
+    "healthReason": {
+      "label": "Última revisión de salud: {{reason}}",
+      "serving_unconfirmed": "el proceso que sirve no corre en su unidad",
+      "http": "respondió HTTP {{status}}",
+      "connect_refused": "nada escucha en el puerto",
+      "timeout": "se agotó el tiempo",
+      "unreachable": "la solicitud falló",
+      "command_failed": "el comando de salud falló",
+      "status_not_running": "el comando de estado no dijo que corre"
+    },
+    "processDetached": "El comando de inicio entregó su servidor a otro proceso (por ejemplo `docker compose up -d`), así que el nodo no puede vigilarlo ni detenerlo. Usa management \"service\" con comandos de stop y status, y detén a mano lo que siga corriendo.",
     "needsOperator": {
       "STEP": "Un paso te espera",
       "RESTART": "Requiere reinicio",

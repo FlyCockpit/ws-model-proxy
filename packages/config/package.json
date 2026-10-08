@@ -48,6 +48,9 @@
     },
     "./share-invite": {
       "default": "./src/share-invite.ts"
+    },
+    "./health-reasons": {
+      "default": "./src/health-reasons.ts"
     }
   },
   "files": [

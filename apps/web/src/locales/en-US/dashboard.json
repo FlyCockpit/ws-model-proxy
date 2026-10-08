@@ -1355,6 +1355,17 @@
       "STOPPED": "Stopped",
       "FAILED": "Failed"
     },
+    "healthReason": {
+      "label": "Last health check: {{reason}}",
+      "serving_unconfirmed": "the serving process is not running in its unit",
+      "http": "answered HTTP {{status}}",
+      "connect_refused": "nothing listens on the port",
+      "timeout": "timed out",
+      "unreachable": "the request failed",
+      "command_failed": "the health command failed",
+      "status_not_running": "the status command did not say running"
+    },
+    "processDetached": "The start command handed its server off (for example `docker compose up -d`), so the node cannot watch or stop it. Use management \"service\" with stop and status commands, and stop what is still running by hand.",
     "needsOperator": {
       "STEP": "A step waits for you",
       "RESTART": "Restart needed",

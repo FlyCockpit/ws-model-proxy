@@ -504,7 +504,7 @@ fn validate_commands(commands: &Commands, management: Management, index: usize) 
     let path = |field: &str| format!("launch.commands[{index}].{field}");
     for (field, command) in [
         ("start", Some(&commands.start)),
-        ("stop", Some(&commands.stop)),
+        ("stop", commands.stop.as_ref()),
         ("prepare", commands.prepare.as_ref()),
         ("afterJoin", commands.after_join.as_ref()),
         ("status", commands.status.as_ref()),
@@ -515,6 +515,7 @@ fn validate_commands(commands: &Commands, management: Management, index: usize) 
         }
     }
     if management == Management::Service {
+        ensure(commands.stop.is_some(), || path("stop"))?;
         ensure(commands.status.is_some(), || path("status"))?;
     }
     if let Some(interactive) = commands.interactive {
@@ -537,6 +538,9 @@ fn validate_commands(commands: &Commands, management: Management, index: usize) 
         }
         if interactive.prepare.is_some() {
             ensure(commands.prepare.is_some(), || path("interactive.prepare"))?;
+        }
+        if interactive.stop.is_some() {
+            ensure(commands.stop.is_some(), || path("interactive.stop"))?;
         }
         if interactive.after_join.is_some() {
             ensure(commands.after_join.is_some(), || {
@@ -782,6 +786,36 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_a_process_runtime_may_leave_out_its_stop_command() {
+        let mut process = startable("vllm serve m --port {{port}}");
+        process["launch"]["commands"][0]
+            .as_object_mut()
+            .expect("commands")
+            .remove("stop");
+        assert_eq!(validate_spec(&spec(process.clone()), &[]), Ok(()));
+        // A stop a person runs in a terminal needs its command.
+        let mut interactive = process.clone();
+        interactive["launch"]["commands"][0]["status"] = "true".into();
+        interactive["launch"]["commands"][0]["interactive"] = serde_json::json!({ "stop": true });
+        assert_eq!(
+            validate_spec(&spec(interactive), &[]),
+            Err(SpecIssue::Invalid(
+                "launch.commands[0].interactive.stop".into()
+            ))
+        );
+        // A service is stopped by its stop command (and proven by status).
+        let mut service = process;
+        service["launch"]["management"] = "service".into();
+        service["launch"]["commands"][0]["status"] = "true".into();
+        assert_eq!(
+            validate_spec(&spec(service.clone()), &[]),
+            Err(SpecIssue::Invalid("launch.commands[0].stop".into()))
+        );
+        service["launch"]["commands"][0]["stop"] = "docker compose down".into();
+        assert_eq!(validate_spec(&spec(service), &[]), Ok(()));
     }
 
     #[test]

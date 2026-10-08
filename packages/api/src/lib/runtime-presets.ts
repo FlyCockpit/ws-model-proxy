@@ -49,8 +49,6 @@ export const RUNTIME_PRESET_LIST: readonly RuntimePreset[] = [
           {
             start:
               "vllm serve Qwen/Qwen3-8B --host 127.0.0.1 --port {{port}} --gpu-memory-utilization {{memory_fraction}}",
-            // The node owns a `process` unit and stops it; nothing else to run.
-            stop: "true",
           },
         ],
         readiness: READINESS,
@@ -76,8 +74,6 @@ export const RUNTIME_PRESET_LIST: readonly RuntimePreset[] = [
           {
             start:
               "python -m sglang.launch_server --model-path Qwen/Qwen3-8B --host 127.0.0.1 --port {{port}} --mem-fraction-static {{memory_fraction}}",
-            // The node owns a `process` unit and stops it; nothing else to run.
-            stop: "true",
           },
         ],
         readiness: READINESS,
@@ -103,8 +99,6 @@ export const RUNTIME_PRESET_LIST: readonly RuntimePreset[] = [
           {
             start:
               "llama-server -m /path/to/model.gguf --alias local-gguf --host 127.0.0.1 --port {{port}}",
-            // The node owns a `process` unit and stops it; nothing else to run.
-            stop: "true",
           },
         ],
         readiness: { path: "/health", expectedStatus: 200, timeoutMs: 600_000 },
