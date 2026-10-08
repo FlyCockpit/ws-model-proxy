@@ -10,6 +10,7 @@ const state = vi.hoisted(() => ({
   navigations: [] as unknown[],
   languages: [] as string[],
   fail: false,
+  sessionRefetches: 0,
 }));
 
 vi.mock("@tanstack/react-router", async (importOriginal) => {
@@ -30,6 +31,16 @@ vi.mock("react-i18next", () => ({
       language: "en-US",
       changeLanguage: async (lang: string) => {
         state.languages.push(lang);
+      },
+    },
+  }),
+}));
+
+vi.mock("@/hooks/use-auth-session", () => ({
+  useAuthSession: () => ({
+    actions: {
+      refetch: async () => {
+        state.sessionRefetches += 1;
       },
     },
   }),
@@ -97,6 +108,7 @@ afterEach(() => {
   state.navigations = [];
   state.languages = [];
   state.fail = false;
+  state.sessionRefetches = 0;
   vi.mocked(toast.error).mockClear();
   vi.mocked(toast.success).mockClear();
 });
@@ -118,6 +130,7 @@ describe("settings locale", { timeout: 30_000 }, () => {
       { to: "/$lang/settings", params: { lang: "es-MX" }, replace: true },
     ]);
     expect(window.localStorage.getItem("locale")).toBe("es-MX");
+    expect(state.sessionRefetches).toBe(1);
   });
 
   it("keeps the page as it was when saving fails", async () => {

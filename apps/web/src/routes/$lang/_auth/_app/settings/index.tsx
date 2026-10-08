@@ -20,6 +20,7 @@ import z from "zod";
 
 import { InlineRetry } from "@/components/inline-retry";
 import { NativeSelect } from "@/components/native-select";
+import { useAuthSession } from "@/hooks/use-auth-session";
 import { isSupportedLocale, type Locale, SUPPORTED_LOCALES } from "@/i18n/config";
 import { LOCALE_LABELS } from "@/i18n/labels";
 import { useNamespaceT } from "@/i18n/use-namespace-t";
@@ -198,6 +199,7 @@ function LocaleCard({ locale }: { locale: Locale }) {
   const { t, i18n } = useTranslation(["settings"]);
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const { actions: session } = useAuthSession();
   const update = useMutation({
     ...orpc.settings.update.mutationOptions(),
     meta: { skipGlobalErrorToast: true },
@@ -207,6 +209,8 @@ function LocaleCard({ locale }: { locale: Locale }) {
     try {
       const saved = await update.mutateAsync({ locale: next });
       queryClient.setQueryData(orpc.settings.get.queryKey(), saved);
+      // The session carries user.locale too (the header switcher compares against it).
+      void session.refetch();
       try {
         window.localStorage.setItem("locale", next);
       } catch {
