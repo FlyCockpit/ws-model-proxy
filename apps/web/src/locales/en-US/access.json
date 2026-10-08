@@ -203,6 +203,7 @@
     "empty": "No runtime definitions are shared with you.",
     "version": "version {{version}}",
     "action": "Fork to my node",
+    "actionStartable": "Fork",
     "title": "Fork {{name}}",
     "description": "Your copy starts at version 1. Later changes by its owner do not reach it.",
     "nodeRequired": "Pick the node it runs on.",

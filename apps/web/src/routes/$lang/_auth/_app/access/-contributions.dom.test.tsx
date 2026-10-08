@@ -176,6 +176,14 @@ vi.mock("@/utils/orpc", () => {
                 kind: "ALWAYS_ON",
                 currentVersion: { version: 3 },
               },
+              {
+                id: "rs-2",
+                runtimeId: "rt-startable",
+                ownerEmail: "bob@example.test",
+                name: "Bob Whisper",
+                kind: "STARTABLE",
+                currentVersion: { version: 1 },
+              },
             ],
           })),
         },
@@ -278,6 +286,26 @@ describe("Access → Contributing", { timeout: 30_000 }, () => {
     await waitFor(() =>
       expect(state.navigations).toEqual([
         { to: "/$lang/runtimes/$runtimeId", params: { lang: "en-US", runtimeId: "rt-new" } },
+      ]),
+    );
+  });
+});
+
+describe("Access → Contributing: fork a startable definition", { timeout: 30_000 }, () => {
+  it("asks for no node and forks under the shared name", async () => {
+    await mount();
+    expect(await screen.findByText("Bob Whisper")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "access:fork.actionStartable" }));
+    const dialog = await screen.findByRole("dialog", { name: "access:fork.title:Bob Whisper" });
+    expect(within(dialog).queryByLabelText("dashboard:runtime.form.node")).toBeNull();
+    expect(within(dialog).getByText("access:fork.startableHint")).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "access:fork.submit" }));
+    await waitFor(() =>
+      expect(state.calls).toEqual([
+        {
+          name: "runtimes.fork",
+          input: { runtimeId: "rt-startable", name: "Bob Whisper", slug: "bob-whisper" },
+        },
       ]),
     );
   });

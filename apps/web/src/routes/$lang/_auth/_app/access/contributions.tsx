@@ -198,7 +198,9 @@ function SharedDefinitions({ lang }: { lang: string }) {
                   })
                 }
               >
-                {t("access:fork.action")}
+                {share.kind === "ALWAYS_ON"
+                  ? t("access:fork.action")
+                  : t("access:fork.actionStartable")}
               </Button>
             </div>
           ))

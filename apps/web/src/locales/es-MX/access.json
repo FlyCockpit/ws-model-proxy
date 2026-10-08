@@ -203,6 +203,7 @@
     "empty": "No hay definiciones de runtime compartidas contigo.",
     "version": "versión {{version}}",
     "action": "Fork a mi nodo",
+    "actionStartable": "Hacer fork",
     "title": "Fork de {{name}}",
     "description": "Tu copia empieza en la versión 1. Los cambios posteriores de su dueño no le llegan.",
     "nodeRequired": "Elige el nodo donde corre.",
