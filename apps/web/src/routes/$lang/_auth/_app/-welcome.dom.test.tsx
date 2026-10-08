@@ -263,6 +263,7 @@ describe("Welcome", () => {
           params: { lang: "en-US" },
           search: { step: "runtime" },
           replace: true,
+          resetScroll: false,
         },
       ]),
     );

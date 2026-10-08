@@ -58,6 +58,8 @@ export function useUserLocaleSync(): void {
         params: (p: Record<string, unknown>) => ({ ...p, lang: userLocale }),
         search: (s: Record<string, unknown>) => s,
         replace: true,
+        // Same page in another language: keep the reader's place in <main>.
+        resetScroll: false,
       });
     } else {
       // Fallback: i18next is the source of truth until the URL settles.

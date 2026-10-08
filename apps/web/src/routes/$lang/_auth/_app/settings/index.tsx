@@ -217,7 +217,13 @@ function LocaleCard({ locale }: { locale: Locale }) {
         // Storage can be unavailable (private mode); the saved account locale still applies.
       }
       void i18n.changeLanguage(next);
-      await navigate({ to: "/$lang/settings", params: { lang: next }, replace: true });
+      // Same page in another language: keep the reader's place in <main>.
+      await navigate({
+        to: "/$lang/settings",
+        params: { lang: next },
+        replace: true,
+        resetScroll: false,
+      });
       toast.success(t("settings:locale.saved"));
     } catch (error) {
       console.error("[settings.update locale]", error);

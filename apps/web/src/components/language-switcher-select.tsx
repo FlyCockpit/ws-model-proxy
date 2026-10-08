@@ -60,6 +60,8 @@ export default function LanguageSwitcherSelect() {
         params: (p: Record<string, unknown>) => ({ ...p, lang: value }),
         search: (s: Record<string, unknown>) => s,
         replace: true,
+        // Same page in another language: keep the reader's place in <main>.
+        resetScroll: false,
       });
     } else {
       // First load (the visitor is sitting on `/` mid-redirect) — point at

@@ -55,6 +55,8 @@ export function usePinWelcomeStep(
       params: { lang },
       search: { step: pick },
       replace: true,
+      // Only records the open step in the URL; the page itself does not change.
+      resetScroll: false,
     });
   }, [pick, lang, navigate]);
 }

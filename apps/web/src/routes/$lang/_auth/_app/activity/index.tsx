@@ -64,7 +64,11 @@ function ActivityMetricsPage() {
   const { t } = useTranslation(["activity"]);
   const metricLabel = useMetricLabel();
   const update = (patch: Partial<ActivityMetricsSearch>) =>
-    void navigate({ search: (prev) => compact({ ...prev, ...patch }), replace: true });
+    void navigate({
+      search: (prev) => compact({ ...prev, ...patch }),
+      replace: true,
+      resetScroll: false,
+    });
 
   const scope: MetricScope = search.scope ?? "pool";
   const metricWanted: Metric = search.metric ?? "requests";
