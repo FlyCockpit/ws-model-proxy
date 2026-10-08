@@ -83,6 +83,7 @@ vi.mock("@/utils/orpc", () => ({
     nodes: { key: () => ["nodes"] },
     pools: { key: () => ["pools"] },
     models: { key: () => ["models"] },
+    activity: { needsYou: { key: () => ["activity", "needsYou"] } },
   },
 }));
 

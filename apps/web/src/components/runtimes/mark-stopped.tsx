@@ -124,12 +124,13 @@ export function MarkStoppedAction({
       form.reset();
       toast.success(t("dashboard:runtime.markStopped.done"));
       // The instance settles STOPPED: runtimes list it, nodes their parts, pools and models its
-      // availability.
+      // availability; Needs you (Overview and the nav badge) no longer lists it.
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: orpc.runtimes.key() }),
         queryClient.invalidateQueries({ queryKey: orpc.nodes.key() }),
         queryClient.invalidateQueries({ queryKey: orpc.pools.key() }),
         queryClient.invalidateQueries({ queryKey: orpc.models.key() }),
+        queryClient.invalidateQueries({ queryKey: orpc.activity.needsYou.key() }),
       ]);
     },
   });

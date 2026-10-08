@@ -170,11 +170,16 @@ describe("BottomNav", () => {
     fireEvent.click(more);
     const terminals = await waitFor(() => {
       const link = document.querySelector<HTMLAnchorElement>(
-        'a[aria-label="items.terminals, needsYou.badge:4"]',
+        '[role="dialog"] a[href="/$lang/terminals"]',
       );
       if (!link) throw new Error("no Terminals link yet");
       return link;
     });
+    // The count joins the visible label and hint in the link's name.
+    expect(terminals.getAttribute("aria-label")).toBeNull();
+    expect(terminals.textContent).toContain("items.terminals");
+    expect(terminals.textContent).toContain("hints.terminals");
+    expect(terminals.textContent).toContain("needsYou.badge:4");
     expect(terminals.getAttribute("href")).toBe("/$lang/terminals");
   });
 

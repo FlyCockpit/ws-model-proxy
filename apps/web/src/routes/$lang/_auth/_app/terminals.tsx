@@ -426,7 +426,8 @@ function WaitingStep({
   );
   const invalidate = async () => {
     await Promise.all([
-      queryClient.invalidateQueries({ queryKey: orpc.activity.needsYou.list.key() }),
+      // The list and the nav badge.
+      queryClient.invalidateQueries({ queryKey: orpc.activity.needsYou.key() }),
       queryClient.invalidateQueries({
         queryKey: orpc.runtimes.get.key({ input: { runtimeId: item.runtimeId } }),
       }),
@@ -496,7 +497,8 @@ function QueuedCommands({
   const invalidate = async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: orpc.nodes.queued.list.key() }),
-      queryClient.invalidateQueries({ queryKey: orpc.activity.needsYou.list.key() }),
+      // The list and the nav badge.
+      queryClient.invalidateQueries({ queryKey: orpc.activity.needsYou.key() }),
     ]);
   };
   const run = useMutation(

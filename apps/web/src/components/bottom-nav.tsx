@@ -91,9 +91,6 @@ export default function BottomNav({ hidden }: { hidden?: boolean }) {
                   params={{ lang }}
                   activeOptions={{ exact: item.exact }}
                   onClick={() => setMoreOpen(false)}
-                  aria-label={
-                    badgeOf(item.id) > 0 ? withBadge(t(item.labelKey), badgeOf(item.id)) : undefined
-                  }
                   className={cn(
                     buttonVariants({ variant: "ghost", size: "touch" }),
                     "h-auto justify-start gap-3 py-2 text-muted-foreground",
@@ -110,6 +107,12 @@ export default function BottomNav({ hidden }: { hidden?: boolean }) {
                     ) : null}
                   </span>
                   <NeedsYouBadge count={badgeOf(item.id)} className="ms-auto" />
+                  {badgeOf(item.id) > 0 ? (
+                    // In the name after the visible label and hint, not instead of them.
+                    <span className="sr-only">
+                      , {t("needsYou.badge", { count: badgeOf(item.id) })}
+                    </span>
+                  ) : null}
                 </Link>
               ))}
             </div>

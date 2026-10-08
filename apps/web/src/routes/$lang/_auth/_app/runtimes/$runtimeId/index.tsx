@@ -55,6 +55,8 @@ function useRuntimeInvalidation() {
     await queryClient.invalidateQueries({ queryKey: orpc.runtimes.key() });
     await queryClient.invalidateQueries({ queryKey: orpc.pools.key() });
     await queryClient.invalidateQueries({ queryKey: orpc.models.key() });
+    // A restart or stop changes what needs the person (Overview and the nav badge).
+    await queryClient.invalidateQueries({ queryKey: orpc.activity.needsYou.key() });
   };
 }
 
