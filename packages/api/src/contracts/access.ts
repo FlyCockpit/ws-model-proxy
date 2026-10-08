@@ -73,6 +73,8 @@ export const shareViewSchema = z
       .object({ limit: moneySchema, currency: currencySchema, spentThisMonth: moneySchema })
       .strict()
       .nullable(),
+    /** The pool's model type (an own key must be a provider model of this type). */
+    modelType: z.enum(MODEL_TYPE),
     /** The model the owner lets share holders use their own key for; null: not allowed. */
     ownKeyEquivalentModel: z.string().nullable(),
     /** The grantee's own-key choice (only while the pool owner consents). */

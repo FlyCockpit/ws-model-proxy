@@ -98,8 +98,27 @@ vi.mock("@/utils/orpc", () => {
         models: {
           list: query(["providers", "models", "list"], () => ({
             models: [
-              { id: "pm-1", upstreamModelId: "gpt-x", displayName: "GPT X", enabled: true },
-              { id: "pm-off", upstreamModelId: "old", displayName: null, enabled: false },
+              {
+                id: "pm-1",
+                upstreamModelId: "gpt-x",
+                displayName: "GPT X",
+                enabled: true,
+                type: "LLM",
+              },
+              {
+                id: "pm-off",
+                upstreamModelId: "old",
+                displayName: null,
+                enabled: false,
+                type: "LLM",
+              },
+              {
+                id: "pm-embed",
+                upstreamModelId: "embed",
+                displayName: "Embed",
+                enabled: true,
+                type: "EMBEDDINGS",
+              },
             ],
           })),
         },
@@ -210,6 +229,7 @@ function withMe(id: string, ownKeyEquivalentModel: string | null) {
     priorityClass: null,
     protectionPercent: null,
     monthlyCap: null,
+    modelType: "LLM",
     ownKeyEquivalentModel,
     ownKeyProviderModelId: null,
     ownKeyProtocolAdaptation: false,
@@ -219,7 +239,7 @@ function withMe(id: string, ownKeyEquivalentModel: string | null) {
 }
 
 describe("Access → Shares: own key for a pool shared with me", { timeout: 30_000 }, () => {
-  it("offers my enabled provider models only where the owner allows my own key", async () => {
+  it("offers my enabled provider models of the pool's type only where the owner allows my own key", async () => {
     state.withMe = [withMe("chat", "openai/gpt-x"), withMe("plain", null)];
     await mount();
     const select = await screen.findByLabelText("access:ownKey.label");

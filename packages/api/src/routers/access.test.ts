@@ -108,7 +108,7 @@ const shareRow = {
   ownKeyProviderModelId: null,
   ownKeyProtocolAdaptation: false,
   createdAt: now,
-  Pool: { slug: "chat", Fallback: null },
+  Pool: { slug: "chat", modelType: "LLM" as const, Fallback: null },
   Owner: { email: "owner@example.test", slug: "owner" },
   Grantee: { email: "friend@example.test" },
   SpendCap: null,
@@ -1175,13 +1175,21 @@ describe("shares", () => {
 
   it("tells a share holder which model the owner lets them bring their own key for", async () => {
     db.share.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([
-      { ...shareRow, Pool: { slug: "chat", Fallback: { ownKeyEquivalentModel: "openai/gpt" } } },
-      { ...shareRow, id: "share2", Pool: { slug: "chat", Fallback: null } },
+      {
+        ...shareRow,
+        Pool: {
+          slug: "chat",
+          modelType: "LLM",
+          Fallback: { ownKeyEquivalentModel: "openai/gpt" },
+        },
+      },
+      { ...shareRow, id: "share2", Pool: { slug: "chat", modelType: "LLM", Fallback: null } },
     ] as never);
     db.shareInvite.findMany.mockResolvedValue([]);
     const listed = await client().shares.list();
     expect(db.share.findMany.mock.calls[1]?.[0]?.where).toEqual({ granteeUserId: "owner" });
     expect(listed.withMe.map((share) => share.ownKeyEquivalentModel)).toEqual(["openai/gpt", null]);
+    expect(listed.withMe[0]?.modelType).toBe("LLM");
   });
 
   it("sets an own key only from the share holder's own provider models", async () => {
@@ -1211,9 +1219,9 @@ describe("shares", () => {
       .mockResolvedValueOnce({ id: "share1", ownerUserId: "pool-owner" } as never)
       .mockResolvedValueOnce({
         ownKeyProtocolAdaptation: false,
-        Pool: { Fallback: { ownKeyEquivalentModel: "openai/gpt" } },
+        Pool: { modelType: "LLM", Fallback: { ownKeyEquivalentModel: "openai/gpt" } },
       } as never);
-    db.providerModel.findFirst.mockResolvedValue({ id: "mine" } as never);
+    db.providerModel.findFirst.mockResolvedValue({ id: "mine", type: "LLM" } as never);
     db.share.findUnique.mockResolvedValue(shareRow as never);
     await client().shares.setOwnKey({ shareId: "share1", providerModelId: "mine" });
     expect(heldFences()).toEqual(["00:owner:owner", "00:owner:pool-owner"]);
@@ -1228,11 +1236,25 @@ describe("shares", () => {
       .mockResolvedValueOnce({ id: "share1", ownerUserId: "pool-owner" } as never)
       .mockResolvedValueOnce({
         ownKeyProtocolAdaptation: false,
-        Pool: { Fallback: null },
+        Pool: { modelType: "LLM", Fallback: null },
       } as never);
     await expect(
       client().shares.setOwnKey({ shareId: "share1", providerModelId: "mine" }),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(db.share.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses an own key of another type than the pool's", async () => {
+    db.share.findFirst
+      .mockResolvedValueOnce({ id: "share1", ownerUserId: "pool-owner" } as never)
+      .mockResolvedValueOnce({
+        ownKeyProtocolAdaptation: false,
+        Pool: { modelType: "EMBEDDINGS", Fallback: { ownKeyEquivalentModel: "openai/embed" } },
+      } as never);
+    db.providerModel.findFirst.mockResolvedValue({ id: "mine", type: "LLM" } as never);
+    await expect(
+      client().shares.setOwnKey({ shareId: "share1", providerModelId: "mine" }),
+    ).rejects.toMatchObject({ data: { reason: "model_type_mismatch" } });
     expect(db.share.update).not.toHaveBeenCalled();
   });
 

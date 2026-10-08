@@ -42,8 +42,10 @@ export function OwnKeyChoice({ shareId }: { shareId: string }) {
   });
   if (!share || equivalent === null) return null;
   const fieldId = `own-key-${share.id}`;
+  // Enabled models of the pool's type (the server refuses another type).
   const usable = (models.data?.models ?? []).filter(
-    (model) => model.enabled || model.id === share.ownKeyProviderModelId,
+    (model) =>
+      model.type === share.modelType && (model.enabled || model.id === share.ownKeyProviderModelId),
   );
   // A chosen model that is gone from the list still shows as chosen (and can be cleared).
   const missing =
