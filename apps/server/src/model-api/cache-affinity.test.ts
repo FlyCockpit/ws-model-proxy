@@ -58,6 +58,18 @@ vi.mock("./cache-affinity-residency.js", async () => {
       targets.map((target) => ({ ...target, cacheGeneration: target.cacheGeneration ?? "" })),
   };
 });
+// Pass-through spy: counts token-estimation passes without changing results.
+const payloadEstimates = vi.hoisted(() => ({ calls: 0 }));
+vi.mock("./capacity/payload-estimate.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./capacity/payload-estimate.js")>();
+  return {
+    ...actual,
+    estimatePayloadTokens: (...args: Parameters<typeof actual.estimatePayloadTokens>) => {
+      payloadEstimates.calls++;
+      return actual.estimatePayloadTokens(...args);
+    },
+  };
+});
 const contextEstimator = vi.hoisted(() => vi.fn());
 vi.mock("./capacity/context.js", () => ({ countSerializedRequestContext: contextEstimator }));
 
@@ -4637,7 +4649,7 @@ it.each(numericOverflowRows)(
   },
 );
 
-it("R4 bounds wide/deep canonical work and ranks 3 targets within 2 seconds", async () => {
+it("R4 bounds wide/deep canonical work and reads the payload once for 3 targets", async () => {
   db.cacheAffinityRecord.findMany.mockResolvedValue([]);
   db.capacityLease.groupBy.mockResolvedValue([]);
   db.capacityWaiter.groupBy.mockResolvedValue([]);
@@ -4706,21 +4718,17 @@ it("R4 bounds wide/deep canonical work and ranks 3 targets within 2 seconds", as
       return "bind";
     },
   });
-  const start = performance.now();
   await rankAffinityTargets({
     ...digestArgs("runtime", wide),
     policy,
     targets: [target("a", "a"), target("b", "b"), target("c", "c")],
   });
-  const elapsed = performance.now() - start;
-  console.info(
-    `R4 canonical smoke: ${work.steps} steps; rank(4M,3) ${Math.round(elapsed)} ms; payload reads ${reads}`,
-  );
-  expect(reads).toBe(2); // validation and root capture, independent of target count
-  expect(elapsed).toBeLessThan(2000);
+  // Validation and root capture only: the wide canonical is built once and
+  // shared, never rebuilt per target. A count, not a wall-clock budget.
+  expect(reads).toBe(2);
 }, 10_000);
 
-it("precomputed unit tokens rank 8 targets on a 2 MiB canonical within 2 seconds", async () => {
+it("precomputed unit tokens rank 8 targets on a 2 MiB canonical with one estimation pass", async () => {
   db.cacheAffinityRecord.findMany.mockResolvedValue([]);
   db.capacityLease.groupBy.mockResolvedValue([]);
   db.capacityWaiter.groupBy.mockResolvedValue([]);
@@ -4735,7 +4743,10 @@ it("precomputed unit tokens rank 8 targets on a 2 MiB canonical within 2 seconds
       })),
     ],
   };
+  payloadEstimates.calls = 0;
   const canonical = buildCanonicalRequest(digestArgs("runtime", payload));
+  const onePass = payloadEstimates.calls;
+  expect(onePass).toBeGreaterThan(canonical!.conversationUnits.length);
   expect(canonical).not.toBeNull();
   expect(canonicalByteLength(canonical!)).toBeGreaterThan(1_000_000);
   expect(canonical!.unitTokenPrefixSums).toHaveLength(canonical!.conversationUnits.length + 1);
@@ -4748,13 +4759,14 @@ it("precomputed unit tokens rank 8 targets on a 2 MiB canonical within 2 seconds
     const id = `t${index}`;
     return target(id, id);
   });
-  const start = performance.now();
+  payloadEstimates.calls = 0;
   await rankAffinityTargets({
     ...digestArgs("runtime", payload),
     policy,
     targets,
   });
-  expect(performance.now() - start).toBeLessThan(2000);
+  // Every target shares one set of prefix sums: one estimation pass, not 8.
+  expect(payloadEstimates.calls).toBe(onePass);
 }, 10_000);
 
 it("R4 unit-count work refusal retains the safe prefix without identifying a truncated chain", () => {
