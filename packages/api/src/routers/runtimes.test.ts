@@ -1226,10 +1226,14 @@ describe("runtimes.instances.markStopped", () => {
       ...stopping(["HELD_UNKNOWN", "HELD_UNKNOWN"], "STOPPED"),
       phaseChangedAt: new Date("2026-10-07T20:00:00Z"),
     };
-    const ranks = marked.Ranks.map((rank) => ({
-      ...rank,
-      markedStoppedAt: new Date("2026-10-07T19:59:00Z"),
-    }));
+    const ranks = [
+      ...marked.Ranks.map((rank) => ({
+        ...rank,
+        markedStoppedAt: new Date("2026-10-07T19:59:00Z"),
+      })),
+      // A third rank whose node was removed: no check can run for it.
+      { id: "rank-2", rank: 2, claim: "HELD_UNKNOWN", markedStoppedAt: null, Node: null },
+    ];
     db.runtimeInstance.findFirst.mockResolvedValueOnce({ ...marked, Ranks: ranks } as never);
     db.instanceStep.findFirst.mockImplementation((async (args: { where: { rank: number } }) =>
       args.where.rank === 0
@@ -1241,18 +1245,15 @@ describe("runtimes.instances.markStopped", () => {
             updatedAt: new Date("2026-10-07T20:05:00Z"),
           }
         : null) as never);
-    let message = "";
-    try {
-      await client().instances.markStopped({ instanceId: "inst-1" });
-    } catch (error) {
-      if (!(error instanceof ORPCError)) throw error;
-      expect(error.code).toBe("CONFLICT");
-      message = error.message;
-    }
+    const refused = client().instances.markStopped({ instanceId: "inst-1" });
+    await expect(refused).rejects.toMatchObject({ code: "CONFLICT" });
+    const message = await refused.catch((error: unknown) =>
+      error instanceof ORPCError ? error.message : "",
+    );
     expect(message).toContain("Already marked stopped");
     expect(message).toContain("every 5 minutes");
     expect(message).toContain(
-      "node 1: not proven at 2026-10-07T20:05:00.000Z (health_failed); node 2: no check has finished yet",
+      "node 1: not proven at 2026-10-07T20:05:00.000Z (health_failed); node 2: no check has finished yet; node 3: its node was removed, so no check can run",
     );
     expect(db.instanceRank.updateMany).not.toHaveBeenCalled();
   });

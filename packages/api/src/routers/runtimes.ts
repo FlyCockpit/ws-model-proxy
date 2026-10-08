@@ -296,7 +296,12 @@ async function markStoppedConflict(
     id: string;
     phase: string;
     phaseChangedAt: Date;
-    Ranks: ReadonlyArray<{ rank: number; claim: string; markedStoppedAt: Date | null }>;
+    Ranks: ReadonlyArray<{
+      rank: number;
+      claim: string;
+      markedStoppedAt: Date | null;
+      Node: { id: string } | null;
+    }>;
   },
   nodeNumber: number | undefined,
 ): Promise<string> {
@@ -308,14 +313,16 @@ async function markStoppedConflict(
   const checks = await latestStopChecks(tx, [{ ...instance, Ranks: marked }]);
   const results = marked.map((rank) => {
     const check = checks.get(stopCheckKey(instance.id, rank.rank));
-    const result = !check
-      ? "no check has finished yet"
-      : check.proven
-        ? `proven at ${check.at}`
-        : `not proven at ${check.at} (${check.errorCode ?? "not_stopped"})`;
+    const result = !rank.Node
+      ? "its node was removed, so no check can run"
+      : !check
+        ? "no check has finished yet"
+        : check.proven
+          ? `proven at ${check.at}`
+          : `not proven at ${check.at} (${check.errorCode ?? "not_stopped"})`;
     return `node ${rank.rank + 1}: ${result}`;
   });
-  return `Already marked stopped. While its node is online, wsmp checks every 5 minutes whether the stop is proven and then frees the resources. Last check: ${results.join("; ")}.`;
+  return `Already marked stopped. While its node is online, wsmp checks every 5 minutes whether the stop is proven and then frees the resources. Last check, ${results.join("; ")}.`;
 }
 
 export const runtimesRouter = {
