@@ -1353,6 +1353,18 @@
         "forgotten": "Se olvidaron los ajustes aprendidos."
       }
     },
+    "kindChoice": {
+      "label": "¿Cómo se ejecuta?",
+      "ALWAYS_ON": {
+        "title": "Ya en ejecución (siempre activo)",
+        "hint": "Un servidor que ejecutas tú. wsmp se conecta a su dirección y nunca lo inicia ni lo detiene."
+      },
+      "STARTABLE": {
+        "title": "Iniciable",
+        "hint": "wsmp lo inicia y lo detiene en tus nodos cuando tú o un perfil lo piden."
+      },
+      "serviceStartable": "Un servicio sin modelos siempre es iniciable."
+    },
     "specForm": {
       "view": "Vista de la definición",
       "formTab": "Formulario",

@@ -1353,6 +1353,18 @@
         "forgotten": "Learned fixes forgotten."
       }
     },
+    "kindChoice": {
+      "label": "How does it run?",
+      "ALWAYS_ON": {
+        "title": "Already running (always-on)",
+        "hint": "A server you run yourself. wsmp connects to its address and never starts or stops it."
+      },
+      "STARTABLE": {
+        "title": "Startable",
+        "hint": "wsmp starts and stops it on your nodes when you or a profile ask."
+      },
+      "serviceStartable": "A service without models is always startable."
+    },
     "specForm": {
       "view": "Definition view",
       "formTab": "Form",

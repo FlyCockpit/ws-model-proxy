@@ -1,7 +1,5 @@
-import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { runtimeSpecSchema } from "@ws-model-proxy/api/lib/runtime-spec";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
@@ -15,7 +13,6 @@ import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -25,7 +22,16 @@ import { FieldErrors } from "@/components/field-errors";
 import { InlineRetry } from "@/components/inline-retry";
 import { NativeSelect } from "@/components/native-select";
 import { PageHeading } from "@/components/page-stub";
+import { RuntimeSpecFields } from "@/components/runtimes/runtime-spec-fields";
+import { useAppForm } from "@/hooks/use-app-form";
 import { refusalText } from "@/lib/refusal-text";
+import {
+  editorValues,
+  type RuntimeKind,
+  readSpecEditor,
+  type SpecEditorValues,
+  switchEditorKind,
+} from "@/lib/runtime-spec-draft";
 import { SLUG_PATTERN, slugify } from "@/lib/slugify";
 import { orpc } from "@/utils/orpc";
 
@@ -88,68 +94,72 @@ function NewRuntimePage() {
   );
 }
 
+/** A service (no models) is startable only: wsmp cannot connect to it as a server. */
+function isService(preset: Preset): boolean {
+  return preset.spec.models === undefined && preset.spec.address === undefined;
+}
+
 function RuntimeForm({ preset }: { preset: Preset }) {
   const { t } = useTranslation(["dashboard", "common"]);
   const { lang } = Route.useParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const alwaysOn = preset.kind === "ALWAYS_ON";
-  const nodes = useQuery({ ...orpc.nodes.list.queryOptions(), enabled: alwaysOn, retry: false });
+  const nodes = useQuery({ ...orpc.nodes.list.queryOptions(), retry: false });
   const create = useMutation({
     ...orpc.runtimes.create.mutationOptions(),
     meta: { skipGlobalErrorToast: true },
   });
-
-  const schema = z.object({
-    name: z.string().trim().min(1, t("dashboard:runtime.form.nameRequired")).max(120),
-    slug: z
-      .string()
-      .regex(SLUG_PATTERN, t("dashboard:pool.form.slugInvalid"))
-      .refine((slug) => !/^i-[a-z0-9]{12}$/.test(slug), t("dashboard:runtime.form.slugReserved")),
-    nodeId: alwaysOn
-      ? z.string().trim().min(1, t("dashboard:runtime.form.nodeRequired"))
-      : z.string(),
-    spec: z.string().superRefine((text, ctx) => {
-      let value: unknown;
-      try {
-        value = JSON.parse(text);
-      } catch {
-        ctx.addIssue({ code: "custom", message: t("dashboard:runtime.form.specNotJson") });
-        return;
-      }
-      const parsed = runtimeSpecSchema.safeParse(value);
-      if (!parsed.success) {
-        const issue = parsed.error.issues[0];
-        ctx.addIssue({
-          code: "custom",
-          message: t("dashboard:runtime.form.specInvalid", {
-            path: issue?.path.join(".") || "spec",
-            detail: issue?.message ?? "",
-          }),
-        });
-      }
-    }),
-    note: z.string().max(500),
+  const messages = (kind: RuntimeKind) => ({
+    notJson: t("dashboard:runtime.form.specNotJson"),
+    wrongKind: t(`dashboard:runtime.specForm.wrongKind.${kind}`),
   });
 
-  const form = useForm({
+  const schema = z
+    .object({
+      name: z.string().trim().min(1, t("dashboard:runtime.form.nameRequired")).max(120),
+      slug: z
+        .string()
+        .regex(SLUG_PATTERN, t("dashboard:pool.form.slugInvalid"))
+        .refine((slug) => !/^i-[a-z0-9]{12}$/.test(slug), t("dashboard:runtime.form.slugReserved")),
+      kind: z.enum(["ALWAYS_ON", "STARTABLE"]),
+      nodeId: z.string(),
+      spec: z.custom<SpecEditorValues>(),
+      note: z.string().max(500),
+    })
+    .superRefine((value, ctx) => {
+      if (value.kind === "ALWAYS_ON" && value.nodeId.trim() === "")
+        ctx.addIssue({
+          code: "custom",
+          path: ["nodeId"],
+          message: t("dashboard:runtime.form.nodeRequired"),
+        });
+      const reading = readSpecEditor(value.spec, value.kind, messages(value.kind));
+      if (!reading.ok)
+        for (const issue of reading.issues)
+          ctx.addIssue({ code: "custom", path: ["spec", ...issue.path], message: issue.message });
+    });
+
+  const form = useAppForm({
     defaultValues: {
       name: "",
       slug: "",
+      kind: preset.kind as RuntimeKind,
       nodeId: "",
-      spec: JSON.stringify(preset.spec, null, 2),
+      spec: editorValues(preset.spec),
       note: "",
     },
     validators: { onSubmit: schema },
     onSubmit: async ({ value }) => {
-      const spec = runtimeSpecSchema.parse(JSON.parse(value.spec));
+      const reading = readSpecEditor(value.spec, value.kind, messages(value.kind));
+      if (!reading.ok) return;
+      const alwaysOn = value.kind === "ALWAYS_ON";
       try {
         const result = await create.mutateAsync({
           slug: value.slug,
           name: value.name.trim(),
-          kind: preset.kind,
+          kind: value.kind,
           preset: preset.id,
-          spec,
+          spec: reading.spec,
           ...(alwaysOn ? { nodeId: value.nodeId.trim() } : {}),
           ...(value.note.trim() ? { note: value.note.trim() } : {}),
         });
@@ -226,64 +236,63 @@ function RuntimeForm({ preset }: { preset: Preset }) {
               </div>
             )}
           </form.Field>
-          {alwaysOn ? (
-            <form.Field name="nodeId">
-              {(field) => (
-                <div className="space-y-1.5">
-                  <Label htmlFor="runtime-node">{t("dashboard:runtime.form.node")}</Label>
-                  {nodes.isPending ? (
-                    <Skeleton className="h-11 w-full" />
-                  ) : nodes.isSuccess ? (
-                    <NativeSelect
-                      id="runtime-node"
-                      value={field.state.value}
-                      onChange={(event) => field.handleChange(event.target.value)}
-                    >
-                      <option value="">{t("dashboard:runtime.form.pickNode")}</option>
-                      {nodes.data.nodes.map((node) => (
-                        <option key={node.id} value={node.id}>
-                          {node.name ?? node.slug}
-                        </option>
-                      ))}
-                    </NativeSelect>
-                  ) : (
-                    <>
-                      <Input
-                        id="runtime-node"
-                        className="h-11 font-mono"
-                        value={field.state.value}
-                        onChange={(event) => field.handleChange(event.target.value)}
-                      />
-                      <p className="text-xs text-muted-foreground">
-                        {t("dashboard:runtime.form.nodeIdHint")}
-                      </p>
-                    </>
-                  )}
-                  <FieldErrors field={field} />
-                </div>
-              )}
-            </form.Field>
-          ) : null}
-          <form.Field name="spec">
+          <form.Field name="kind">
             {(field) => (
-              <div className="space-y-1.5">
-                <Label htmlFor="runtime-spec">{t("dashboard:runtime.form.spec")}</Label>
-                <Textarea
-                  id="runtime-spec"
-                  rows={18}
-                  spellCheck={false}
-                  className="font-mono text-xs"
-                  value={field.state.value}
-                  onBlur={field.handleBlur}
-                  onChange={(event) => field.handleChange(event.target.value)}
-                />
-                <p className="text-xs text-muted-foreground">
-                  {t("dashboard:runtime.form.specHint")}
-                </p>
-                <FieldErrors field={field} />
-              </div>
+              <KindChoice
+                value={field.state.value}
+                serviceOnly={isService(preset)}
+                onChange={(kind) => {
+                  field.handleChange(kind);
+                  form.setFieldValue("spec", switchEditorKind(form.getFieldValue("spec"), kind));
+                }}
+              />
             )}
           </form.Field>
+          <form.Subscribe selector={(state) => state.values.kind}>
+            {(kind) => (
+              <>
+                {kind === "ALWAYS_ON" ? (
+                  <form.Field name="nodeId">
+                    {(field) => (
+                      <div className="space-y-1.5">
+                        <Label htmlFor="runtime-node">{t("dashboard:runtime.form.node")}</Label>
+                        {nodes.isPending ? (
+                          <Skeleton className="h-11 w-full" />
+                        ) : nodes.isSuccess ? (
+                          <NativeSelect
+                            id="runtime-node"
+                            value={field.state.value}
+                            onChange={(event) => field.handleChange(event.target.value)}
+                          >
+                            <option value="">{t("dashboard:runtime.form.pickNode")}</option>
+                            {nodes.data.nodes.map((node) => (
+                              <option key={node.id} value={node.id}>
+                                {node.name ?? node.slug}
+                              </option>
+                            ))}
+                          </NativeSelect>
+                        ) : (
+                          <>
+                            <Input
+                              id="runtime-node"
+                              className="h-11 font-mono"
+                              value={field.state.value}
+                              onChange={(event) => field.handleChange(event.target.value)}
+                            />
+                            <p className="text-xs text-muted-foreground">
+                              {t("dashboard:runtime.form.nodeIdHint")}
+                            </p>
+                          </>
+                        )}
+                        <FieldErrors field={field} />
+                      </div>
+                    )}
+                  </form.Field>
+                ) : null}
+                <RuntimeSpecFields form={form} fields="spec" kind={kind} idPrefix="runtime-spec" />
+              </>
+            )}
+          </form.Subscribe>
           <form.Field name="note">
             {(field) => (
               <div className="space-y-1.5">
@@ -307,5 +316,65 @@ function RuntimeForm({ preset }: { preset: Preset }) {
         </form>
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * Always-on or startable (owner decision: until servers are detected automatically, always-on
+ * is how a person adds a server they already run). wsmp never starts or stops an always-on one.
+ */
+function KindChoice({
+  value,
+  serviceOnly,
+  onChange,
+}: {
+  value: RuntimeKind;
+  serviceOnly: boolean;
+  onChange: (kind: RuntimeKind) => void;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  const options: RuntimeKind[] = ["ALWAYS_ON", "STARTABLE"];
+  return (
+    <fieldset className="flex min-w-0 flex-col gap-2">
+      <legend className="mb-1 text-sm font-medium">
+        {t("dashboard:runtime.kindChoice.label")}
+      </legend>
+      <div className="grid min-w-0 gap-2 sm:grid-cols-2">
+        {options.map((kind) => {
+          const disabled = kind === "ALWAYS_ON" && serviceOnly;
+          return (
+            <label
+              key={kind}
+              className={cn(
+                "flex min-h-11 min-w-0 cursor-pointer items-start gap-3 rounded-xl border p-4",
+                "has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring",
+                value === kind ? "border-primary bg-muted" : "hover:bg-muted/50",
+                disabled && "cursor-not-allowed opacity-60",
+              )}
+            >
+              <input
+                type="radio"
+                name="runtime-kind"
+                value={kind}
+                className="mt-1 size-4 shrink-0 accent-primary"
+                checked={value === kind}
+                disabled={disabled}
+                onChange={() => onChange(kind)}
+              />
+              <span className="flex min-w-0 flex-col gap-1">
+                <span className="font-medium">
+                  {t(`dashboard:runtime.kindChoice.${kind}.title`)}
+                </span>
+                <span className="text-sm text-muted-foreground">
+                  {disabled
+                    ? t("dashboard:runtime.kindChoice.serviceStartable")
+                    : t(`dashboard:runtime.kindChoice.${kind}.hint`)}
+                </span>
+              </span>
+            </label>
+          );
+        })}
+      </div>
+    </fieldset>
   );
 }
