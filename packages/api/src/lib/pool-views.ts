@@ -10,6 +10,7 @@ import type { z } from "zod";
 import type { poolAdvancedViewSchema } from "../contracts/advanced";
 import type { MEMBER_STATUS, poolMemberViewSchema, poolViewSchema } from "../contracts/pools";
 import { embeddingContractSchema } from "./embedding-contract";
+import { type InstanceLiveLoad, NO_LIVE_LOAD } from "./live-load";
 import { jsonObject, registryView } from "./registry-view";
 
 export const MEMBER_INCLUDE = {
@@ -26,6 +27,7 @@ export const MEMBER_INCLUDE = {
           Instances: {
             where: { OR: [{ desiredState: "RUNNING" }, { desiredState: null }] },
             select: {
+              id: true,
               phase: true,
               Ranks: {
                 where: { claim: "HELD" },
@@ -92,7 +94,42 @@ export function memberStatus(
   return "unavailable";
 }
 
-export function memberView(member: MemberRow): z.infer<typeof poolMemberViewSchema> {
+/** What the member views read live: the relay's engine load and each member's recent p95. */
+export type MembersLive = {
+  load: ReadonlyMap<string, InstanceLiveLoad>;
+  /** p95 latency (ms) by `memberLatencyKey`, over the recent window. */
+  p95: ReadonlyMap<string, number>;
+};
+export const NO_MEMBERS_LIVE: MembersLive = { load: NO_LIVE_LOAD, p95: new Map() };
+
+/** A member's key in the usage rollups of its pool: its runtime model, or its cloud model. */
+export function memberLatencyKey(
+  poolId: string,
+  member: { runtimeModelId?: string | null; providerModelId?: string | null },
+): string {
+  return `${poolId}\u0000${member.runtimeModelId ?? ""}\u0000${member.providerModelId ?? ""}`;
+}
+
+/**
+ * Requests waiting on the member's instances, from the readings the relay holds. Null when no
+ * instance has a known reading (another server process, an engine that does not report it).
+ */
+function memberWaiting(
+  instances: ReadonlyArray<{ id: string }>,
+  load: ReadonlyMap<string, InstanceLiveLoad>,
+): number | null {
+  let waiting: number | null = null;
+  for (const instance of instances) {
+    const value = load.get(instance.id)?.waiting;
+    if (value != null) waiting = (waiting ?? 0) + value;
+  }
+  return waiting;
+}
+
+export function memberView(
+  member: MemberRow,
+  live: MembersLive = NO_MEMBERS_LIVE,
+): z.infer<typeof poolMemberViewSchema> {
   const model = member.RuntimeModel;
   const instances = model?.Runtime.Instances ?? [];
   const health =
@@ -117,9 +154,8 @@ export function memberView(member: MemberRow): z.infer<typeof poolMemberViewSche
     live: {
       instances: instances.length,
       running: instances.filter((instance) => instance.phase === "READY").length,
-      // TODO(lane A, hot path): queue depth and latency come from the relay's live state.
-      waiting: 0,
-      p95LatencyMs: null,
+      waiting: memberWaiting(instances, live.load),
+      p95LatencyMs: live.p95.get(memberLatencyKey(member.poolId, member)) ?? null,
     },
   };
 }
@@ -208,6 +244,7 @@ export function poolView(
   callerId: string,
   traffic: Traffic = EMPTY_TRAFFIC,
   cloudEnabled = false,
+  live: MembersLive = NO_MEMBERS_LIVE,
 ): z.infer<typeof poolViewSchema> {
   const mode = pool.Fallback?.mode ?? "OFF";
   const embedding = embeddingContractSchema.safeParse(pool.Fallback?.embeddingContract);
@@ -279,7 +316,7 @@ export function poolView(
     })),
     advanced: poolAdvancedView(pool.Advanced),
     rules: pool.RoutingRules.map(ruleView),
-    members: pool.Members.map(memberView),
+    members: pool.Members.map((member) => memberView(member, live)),
     sharesCount: pool._count.Shares,
     runsOn: [...runsOn.values()],
     traffic24h: traffic,

@@ -310,6 +310,7 @@ function contextServices(request: HonoContext | null): ContextServices {
     nodeFiles: nodeFileServices,
     runtimeSteps: runtimeStepServices,
     modelTest: runModelTest,
+    liveLoad: (instanceIds) => relaySessionManager.getInstanceLiveLoad(instanceIds),
     onAccessRevoked: (event) =>
       handleAccessRevoked(event, {
         terminateRealtimeForApiKey: (apiKeyId) =>

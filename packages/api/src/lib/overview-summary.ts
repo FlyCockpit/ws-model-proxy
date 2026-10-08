@@ -9,6 +9,7 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import { nodeTrustView } from "../nodes/trust";
 import { callableIdOf } from "./access-views";
 import { compactNumber } from "./metrics-query";
+import { memberLatencyKey } from "./pool-views";
 import { realTraffic } from "./test-traffic";
 
 export type OverviewRange = "24h" | "7d";
@@ -93,6 +94,42 @@ export async function poolTraffic(
       entry.sparkline[index] = (entry.sparkline[index] ?? 0) + requests;
   }
   return byPool;
+}
+
+/** The window a pool member's p95 latency covers. */
+const MEMBER_LATENCY_WINDOW_MS = 15 * 60_000;
+
+/**
+ * p95 latency of each member of the owner's pools over the last 15 minutes of real traffic,
+ * keyed by `memberLatencyKey` (minute rollups, one bounded query; agent tests excluded).
+ */
+export async function memberLatencyP95(
+  ownerId: string,
+  poolIds: readonly string[],
+  now = new Date(),
+): Promise<Map<string, number>> {
+  const byMember = new Map<string, number>();
+  if (poolIds.length === 0) return byMember;
+  const from = new Date(now.getTime() - MEMBER_LATENCY_WINDOW_MS);
+  const rows = await prisma.$queryRaw<KpiRow[]>`SELECT "poolId" AS pool,
+      "runtimeModelId" AS runtime_model, "providerModelId" AS provider_model,
+      ${Prisma.join(histogramColumns("latencyHistogram", "l"), ", ")}
+    FROM usage_rollup_minute
+    WHERE "ownerUserId" = ${ownerId} AND "poolId" = ANY(${[...poolIds]}::text[])
+      AND "bucketStart" >= ${from} AND ${realTraffic()}
+    GROUP BY 1, 2, 3`;
+  for (const row of rows) {
+    const value = p95(row, "l");
+    if (value === null) continue;
+    byMember.set(
+      memberLatencyKey(String(row.pool), {
+        runtimeModelId: row.runtime_model ? String(row.runtime_model) : null,
+        providerModelId: row.provider_model ? String(row.provider_model) : null,
+      }),
+      value,
+    );
+  }
+  return byMember;
 }
 
 export async function overviewSummary(userId: string, range: OverviewRange, now = new Date()) {

@@ -7,6 +7,7 @@
  * - Socket lifecycle (./websocket.ts): `acceptAuthenticatedSocket`, `handleTextFrame`,
  *   `handleBinaryFrame`, `removeSession`.
  * - Routing: `getOnlineNodeIds()`, `getLiveNodeState(nodeId)`, `getLiveNodeTelemetry(nodeIds)`,
+ *   `getInstanceLiveLoad(instanceIds)` (runtime and pool views),
  *   `supportsCountContext(nodeId)`.
  * - Model requests (../model-api/relay-executor.ts): `registerRelayResponseHandlers`,
  *   `sendRelayRequest` (frame names the runtime `handle`), `cancelRelayRequest`,
@@ -31,6 +32,7 @@
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import { evaluateEngineLoad } from "@ws-model-proxy/api/lib/engine-load";
+import { aggregateInstanceLoad, type InstanceLiveLoad } from "@ws-model-proxy/api/lib/live-load";
 import {
   ENDPOINT_LOAD_STALE_AFTER_MS,
   type NodeMetricsSample,
@@ -2644,6 +2646,25 @@ export class RelaySessionManager {
       });
     }
     return snapshots;
+  }
+
+  /**
+   * Fresh engine load of the given instances, from the `runtime.load` readings of the
+   * registered sessions this process holds (in memory, no I/O). An instance on a node whose
+   * session another process holds is absent: unknown, not idle.
+   */
+  getInstanceLiveLoad(
+    instanceIds: readonly string[],
+    now = Date.now(),
+  ): Map<string, InstanceLiveLoad> {
+    const wanted = new Set(instanceIds);
+    const readings: LiveRuntimeLoadEntry[] = [];
+    for (const session of this.sessionsByNodeId.values()) {
+      if (!session.registered) continue;
+      for (const entry of session.runtimeLoad.values())
+        if (wanted.has(entry.instanceId)) readings.push(entry);
+    }
+    return aggregateInstanceLoad(readings, wanted, now, ENDPOINT_LOAD_STALE_AFTER_MS);
   }
 
   /** The node's live session state, or null while it has no registered session. */

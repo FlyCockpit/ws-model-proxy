@@ -9,11 +9,13 @@ import { poolsContract as c, type routingRulesSchema } from "../contracts/pools"
 import { type CallerActor, callerActor } from "../lib/caller-actor";
 import { cloudEgressEnabled } from "../lib/cloud-egress";
 import { graphDelete, graphWrite, modelTargetFences, poolTargetFences } from "../lib/graph-write";
-import { poolTraffic } from "../lib/overview-summary";
+import { readLiveLoad } from "../lib/live-load";
+import { memberLatencyP95, poolTraffic } from "../lib/overview-summary";
 import { invalidatePoolRouting } from "../lib/pool-routing-invalidation";
 import {
   callableIdsFor,
   MEMBER_INCLUDE,
+  type MembersLive,
   memberView,
   POOL_INCLUDE,
   type PoolRow,
@@ -61,10 +63,34 @@ async function ownedPoolRow(userId: string, poolId: string): Promise<PoolRow> {
   return pool;
 }
 
-async function ownedPoolView(userId: string, poolId: string) {
+/** Live member state: the relay's in-memory engine load and each member's recent p95. */
+async function membersLive(
+  context: SignedInContext,
+  ownerId: string,
+  pools: readonly PoolRow[],
+): Promise<MembersLive> {
+  const instanceIds = pools.flatMap((pool) =>
+    pool.Members.flatMap(
+      (member) => member.RuntimeModel?.Runtime.Instances.map((instance) => instance.id) ?? [],
+    ),
+  );
+  return {
+    load: readLiveLoad(context.services?.liveLoad, instanceIds),
+    p95: await memberLatencyP95(
+      ownerId,
+      pools.map((pool) => pool.id),
+    ),
+  };
+}
+
+async function ownedPoolView(context: SignedInContext, poolId: string) {
+  const userId = userIdOf(context);
   const pool = await ownedPoolRow(userId, poolId);
-  const traffic = await trafficOf(userId, [pool.id]);
-  return poolView(pool, userId, traffic.get(pool.id), cloudEgressEnabled());
+  const [traffic, live] = await Promise.all([
+    trafficOf(userId, [pool.id]),
+    membersLive(context, userId, [pool]),
+  ]);
+  return poolView(pool, userId, traffic.get(pool.id), cloudEgressEnabled(), live);
 }
 
 async function audit(
@@ -424,7 +450,7 @@ async function humanSetter(
     },
     (tx) => poolTargetFences(tx, poolId),
   );
-  return ownedPoolView(userId, poolId);
+  return ownedPoolView(context, poolId);
 }
 
 /** Shares of the pool that hold an own-key choice (the grantee's consent to the equivalent). */
@@ -483,7 +509,7 @@ async function setOwnKeyEquivalent(context: SignedInContext, poolId: string, mod
     },
     (tx) => poolTargetFences(tx, poolId),
   );
-  return ownedPoolView(userId, poolId);
+  return ownedPoolView(context, poolId);
 }
 
 function rethrowSlugTaken(error: unknown): never {
@@ -521,13 +547,16 @@ export const poolsRouter = {
         orderBy: { createdAt: "asc" },
       }),
     ]);
-    const traffic = await trafficOf(
-      userId,
-      pools.map((pool) => pool.id),
-    );
+    const [traffic, live] = await Promise.all([
+      trafficOf(
+        userId,
+        pools.map((pool) => pool.id),
+      ),
+      membersLive(context, userId, pools),
+    ]);
     return {
       pools: pools.map((pool) =>
-        poolView(pool, userId, traffic.get(pool.id), cloudEgressEnabled()),
+        poolView(pool, userId, traffic.get(pool.id), cloudEgressEnabled(), live),
       ),
       sharedWithMe: shares.map((share) => ({
         poolId: share.poolId,
@@ -549,7 +578,7 @@ export const poolsRouter = {
   }),
 
   get: contractProcedure(c.get).handler(async ({ input, context }) =>
-    ownedPoolView(userIdOf(context), input.poolId),
+    ownedPoolView(context, input.poolId),
   ),
 
   history: {
@@ -625,7 +654,7 @@ export const poolsRouter = {
     } catch (error) {
       rethrowSlugTaken(error);
     }
-    return ownedPoolView(userId, poolId);
+    return ownedPoolView(context, poolId);
   }),
 
   update: contractProcedure(c.update).handler(async ({ input, context }) => {
@@ -718,7 +747,7 @@ export const poolsRouter = {
     }
     if (rules || input.members?.remove?.length)
       await invalidatePoolRouting(context.services, [pool.id]);
-    return ownedPoolView(userId, pool.id);
+    return ownedPoolView(context, pool.id);
   }),
 
   delete: contractProcedure(c.delete).handler(async ({ input, context }) => {

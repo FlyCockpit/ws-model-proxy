@@ -14,6 +14,7 @@ import type {
   runtimeVersionSummarySchema,
 } from "../contracts/runtimes";
 import { rankCommands, renderStepCommand, type StepCommandPhase } from "./command-render";
+import { type InstanceLiveLoad, NO_LIVE_LOAD } from "./live-load";
 import { jsonObject, registryView } from "./registry-view";
 import {
   COMPAT_ENDPOINTS,
@@ -381,7 +382,9 @@ function safeSpec(value: unknown): RuntimeSpec | null {
 export function instanceView(
   row: InstanceRow,
   stopChecks: ReadonlyMap<string, StopCheck> = new Map(),
+  liveLoad: ReadonlyMap<string, InstanceLiveLoad> = NO_LIVE_LOAD,
 ): InstanceView {
+  const load = liveLoad.get(row.id) ?? null;
   const advanced = advancedView(row.Version.advanced);
   const context = stepViewContext(row);
   return {
@@ -417,13 +420,14 @@ export function instanceView(
           : null,
     })),
     openSteps: row.Steps.map((step) => stepView(step, context)),
-    // TODO(lane A, hot path): live load comes from the relay's in-memory engine-load cache.
+    // Load from the relay's in-memory cache (null: unknown here); `at` is the reading's time,
+    // or the engine facts' while no reading is known.
     live: {
-      running: null,
-      waiting: null,
-      kvUsage: null,
+      running: load?.running ?? null,
+      waiting: load?.waiting ?? null,
+      kvUsage: load?.kvUsage ?? null,
       slots: row.engineSlots,
-      at: row.factsAt?.toISOString() ?? null,
+      at: (load?.at ?? row.factsAt)?.toISOString() ?? null,
     },
   };
 }

@@ -121,7 +121,9 @@ export const poolMemberViewSchema = z
       .object({
         instances: z.number().int(),
         running: z.number().int(),
-        waiting: z.number().int(),
+        /** Requests queued on its instances, as the relay last heard; null: unknown. */
+        waiting: z.number().int().nullable(),
+        /** Over the last 15 minutes of real traffic; null: no requests. */
         p95LatencyMs: z.number().nullable(),
       })
       .strict(),
