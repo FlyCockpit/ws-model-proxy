@@ -122,6 +122,7 @@ vi.mock("@/utils/orpc", () => ({
     nodes: { key: () => ["nodes"] },
     pools: { key: () => ["pools"] },
     models: { key: () => ["models"] },
+    activity: { needsYou: { key: () => ["activity", "needsYou"] } },
   },
 }));
 
@@ -183,7 +184,15 @@ describe("MarkStoppedAction", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(state.toast.success).toHaveBeenCalledWith("dashboard:runtime.markStopped.done");
     const keys = invalidate.mock.calls.map(([filters]) => filters?.queryKey);
-    expect(keys).toEqual(expect.arrayContaining([["runtimes"], ["nodes"], ["pools"], ["models"]]));
+    expect(keys).toEqual(
+      expect.arrayContaining([
+        ["runtimes"],
+        ["nodes"],
+        ["pools"],
+        ["models"],
+        ["activity", "needsYou"],
+      ]),
+    );
   });
 
   it("leaves an empty note out and sends a node number for one node's part", async () => {

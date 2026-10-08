@@ -1,0 +1,16 @@
+{
+  "heading": "Algo te necesita",
+  "stepSubject": "{{name}}: un paso te está esperando",
+  "stepBody": "Un paso interactivo del runtime {{name}} te está esperando: un comando que tú mismo ejecutas en una terminal del nodo (por ejemplo, uno que pide una contraseña de sudo).",
+  "stepCta": "Abrir Terminales",
+  "restartSubject": "{{name}} necesita reiniciarse",
+  "restartBody": "El runtime {{name}} se detuvo. Su inicio lo ejecutas tú mismo, así que WS Model Proxy no lo reinicia por su cuenta: reinícialo cuando estés listo.",
+  "restartCta": "Abrir el runtime",
+  "markStoppedSubject": "{{name}}: marcar como detenida",
+  "markStoppedBody": "Una instancia del runtime {{name}} perdió contacto con su nodo y WS Model Proxy no puede comprobar que se detuvo. Cuando sepas que está apagada, elige Marcar como detenida en la página del runtime.",
+  "markStoppedCta": "Abrir el runtime",
+  "queuedCommandSubject": "Un agente te dejó un comando en {{name}}",
+  "queuedCommandBody": "Un agente te dejó un comando para que lo ejecutes en el nodo {{name}}. Revísalo en Terminales y luego ejecútalo o descártalo.",
+  "queuedCommandCta": "Abrir Terminales",
+  "footer": "Recibes este correo porque las alertas operativas están activadas en tu configuración. Los agentes no pueden responder esto por ti."
+}

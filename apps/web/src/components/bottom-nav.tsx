@@ -5,14 +5,19 @@ import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { NeedsYouBadge } from "@/components/needs-you-badge";
 import { useAuthSession } from "@/hooks/use-auth-session";
+import { useNeedsYouCount } from "@/hooks/use-needs-you-count";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
 import { getNavItems, moreNavIcon as MoreIcon, toLangRoute } from "@/lib/nav-items";
 
 const TAB_CLASS =
   "flex flex-col items-center justify-center gap-0.5 px-3 py-1.5 transition-colors min-w-[64px] min-h-[44px]";
 
-/** The one mobile nav bar: Overview · Models · Pools · Runtimes · More (sheet with the rest). */
+/**
+ * The one mobile nav bar: Overview · Models · Pools · Runtimes · More (sheet with the rest).
+ * More, and Terminals inside it, carry the Needs-you badge (spec §7.4).
+ */
 export default function BottomNav({ hidden }: { hidden?: boolean }) {
   // `strict: false` keeps this safe to render under any matched route (the top-level `/`
   // redirect leaves no `lang` param). Fall back to the default locale rather than crashing.
@@ -22,12 +27,17 @@ export default function BottomNav({ hidden }: { hidden?: boolean }) {
   const session = state.session;
   const { t } = useTranslation("nav");
   const [moreOpen, setMoreOpen] = useState(false);
+  const needsYou = useNeedsYouCount(Boolean(session));
   const visible = { isAuthenticated: Boolean(session), role: session?.user.role };
   const tabs = getNavItems({ placement: "mobile", ...visible });
   const tabIds = new Set(tabs.map((item) => item.id));
   const rest = getNavItems({ placement: "sidebar", ...visible }).filter(
     (item) => !tabIds.has(item.id),
   );
+  const badgeOf = (id: string) => (id === "terminals" ? needsYou : 0);
+  const moreBadge = rest.reduce((sum, item) => sum + badgeOf(item.id), 0);
+  const withBadge = (label: string, count: number) =>
+    count > 0 ? `${label}, ${t("needsYou.badge", { count })}` : label;
 
   if (hidden || tabs.length === 0) return null;
 
@@ -55,10 +65,14 @@ export default function BottomNav({ hidden }: { hidden?: boolean }) {
             type="button"
             aria-haspopup="dialog"
             aria-expanded={moreOpen}
+            aria-label={withBadge(t("items.more"), moreBadge)}
             className={cn(TAB_CLASS, "text-muted-foreground")}
             onClick={() => setMoreOpen(true)}
           >
-            <MoreIcon className="size-5" />
+            <span className="relative">
+              <MoreIcon aria-hidden="true" className="size-5" />
+              <NeedsYouBadge count={moreBadge} className="absolute -end-3 -top-2" />
+            </span>
             <span className="text-[10px] font-medium leading-tight">{t("items.more")}</span>
           </button>
           <SheetContent
@@ -92,6 +106,13 @@ export default function BottomNav({ hidden }: { hidden?: boolean }) {
                       </span>
                     ) : null}
                   </span>
+                  <NeedsYouBadge count={badgeOf(item.id)} className="ms-auto" />
+                  {badgeOf(item.id) > 0 ? (
+                    // In the name after the visible label and hint, not instead of them.
+                    <span className="sr-only">
+                      , {t("needsYou.badge", { count: badgeOf(item.id) })}
+                    </span>
+                  ) : null}
                 </Link>
               ))}
             </div>

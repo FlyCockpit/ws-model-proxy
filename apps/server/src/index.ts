@@ -27,6 +27,7 @@ import { realtimeSessionRegistry } from "./model-api/realtime/registry.js";
 import { startRelayAttempt } from "./model-api/relay-executor.js";
 import { startRelayTelemetryRecovery } from "./model-api/relay-telemetry-recovery.js";
 import { startUsageRetention } from "./model-api/usage-retention.js";
+import { startNeedsYouMail } from "./needs-you-mail.js";
 import { warnMissingProviderCredentialKeyring } from "./provider-keyring-startup.js";
 import { flushNodeAudit, stopNodeAuditWriter } from "./relay/node-audit.js";
 import { sweepExpiredNodeCommands } from "./relay/node-commands.js";
@@ -174,6 +175,9 @@ const stopOauthCleanup = startOauthCleanup();
 // Better Auth does not remove expired browser sessions eagerly. This bounded,
 // idempotent sweep uses the same shutdown-fenced lifecycle as OAuth cleanup.
 const stopSessionCleanup = startSessionCleanup();
+// Needs-you e-mail (spec §7.4): one e-mail per new interactive step, restart or Mark as stopped,
+// when SMTP is configured and the owner's operational alerts are on; see needs-you-mail.ts.
+const stopNeedsYouMail = startNeedsYouMail();
 // Accepted user deletions whose completion failed transiently or was cut
 // short by a restart: the durable marker (User.deletionRequestedAt) is
 // resumed here until the user is gone (see user-deletion-sweep.ts). The sweep
@@ -223,6 +227,7 @@ installServerShutdown({
     stopProviderAttemptExpiry,
     stopOauthCleanup,
     stopSessionCleanup,
+    stopNeedsYouMail,
     stopUsageRetention,
     stopKvEvictionFeedback,
     stopRuntimeLoadRollup,

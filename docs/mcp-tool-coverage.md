@@ -59,6 +59,7 @@ READ credentials see the READ tools; FULL credentials see all.
 | `access.oauthGrants.list` | Agent connections are managed by people. |
 | `access.shares.list` | Sharing is for people only; pools_get shows the count. |
 | `activity.commands.list` | Agents follow their own commands with node_command_get. |
+| `activity.needsYou.count` | The web nav badge; agents read needs in runtimes_get and nodes_get. |
 | `activity.needsYou.list` | Needs-you items are in runtimes_get (instances) and nodes_get. |
 | `activity.overview.summary` | Use metrics_query. |
 | `app.flags` | Web app switches. |

@@ -15,6 +15,8 @@ vi.mock("@ws-model-proxy/auth", () => ({ auth: { api: {} } }));
 vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
   isForceTwoFactorRequired: vi.fn(async () => false),
 }));
+const notifyQueuedCommand = vi.hoisted(() => vi.fn(async () => true));
+vi.mock("../lib/needs-you-mail", () => ({ notifyQueuedCommand }));
 
 import prisma from "@ws-model-proxy/db";
 import type { Context, NodeOperatorServices } from "../context";
@@ -114,6 +116,7 @@ const queuedRow = {
 
 beforeEach(() => {
   mockReset(db);
+  notifyQueuedCommand.mockClear();
   db.$transaction.mockImplementation((async (work: (tx: typeof db) => unknown) =>
     work(db)) as never);
   // The caller's credential and owner are live unless a test says otherwise.
@@ -492,6 +495,11 @@ describe("browser terminals and queued commands", () => {
       userId: "owner",
       agentTokenId: "tok1",
     });
+    // Needs you: the owner hears about it once, when the row is created.
+    expect(notifyQueuedCommand).toHaveBeenCalledTimes(1);
+    expect(notifyQueuedCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: "owner", nodeSlug: fullNode.slug }),
+    );
   });
 
   it("runs a queued command: the terminal opens with the text typed", async () => {

@@ -10,6 +10,8 @@ vi.mock("@ws-model-proxy/db", () => ({
 vi.mock("@ws-model-proxy/db/node-security", () => ({
   credentialDigest: vi.fn((purpose: string, secret: string) => `hmac:${purpose}:${secret}`),
 }));
+// The queued-command notice pulls in the mailer; without SMTP it sends nothing.
+vi.mock("@ws-model-proxy/env/shared", () => ({ env: {} }));
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: { BETTER_AUTH_URL: "https://proxy.example.com/" },
 }));

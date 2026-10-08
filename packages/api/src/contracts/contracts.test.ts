@@ -165,6 +165,7 @@ const INVENTORY = [
   "activity.commands.list",
   "activity.overview.summary",
   "activity.needsYou.list",
+  "activity.needsYou.count",
 ];
 
 /** Spec §1.2 (case-insensitive unless noted). "Relay only" is the trust name and allowed. */

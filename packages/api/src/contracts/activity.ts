@@ -221,5 +221,11 @@ export const activityContract = {
       z.object({ items: z.array(needsYouItemSchema), queuedCommands: z.number().int() }).strict(),
       "Everything waiting for a person: interactive steps, restarts, unproven stops to mark stopped; queued agent commands.",
     ),
+    count: query(
+      "session",
+      noInputSchema,
+      z.object({ count: z.number().int() }).strict(),
+      "How many things wait for a person (the nav badge): instance needs plus queued agent commands.",
+    ),
   },
 } as const;

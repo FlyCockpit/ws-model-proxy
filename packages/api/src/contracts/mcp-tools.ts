@@ -570,6 +570,7 @@ export const MCP_EXCLUDED_SESSION_PROCEDURES: Readonly<Record<string, string>> =
   "providers.attempts.list": "Use requests_list (cloud attempts are requests with route cloud).",
   "activity.overview.summary": "Use metrics_query.",
   "activity.needsYou.list": "Needs-you items are in runtimes_get (instances) and nodes_get.",
+  "activity.needsYou.count": "The web nav badge; agents read needs in runtimes_get and nodes_get.",
   "activity.commands.list": "Agents follow their own commands with node_command_get.",
   "settings.get": "Account settings are for people.",
   "app.flags": "Web app switches.",
