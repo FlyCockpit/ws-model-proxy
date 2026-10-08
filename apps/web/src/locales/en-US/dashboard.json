@@ -1778,7 +1778,7 @@
         "discrete": "GPUs",
         "unified": "Unified memory",
         "cpu": "CPU and RAM",
-        "none": "Nothing (reserves nothing)"
+        "none": "Nothing reserved"
       },
       "memoryGb": "Memory (GiB)",
       "gpuCount": "GPUs",

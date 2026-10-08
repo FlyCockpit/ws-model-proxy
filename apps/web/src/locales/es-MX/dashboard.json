@@ -1485,7 +1485,7 @@
       "already_shared": "Este pool ya está compartido con esta persona. Cambia el compartido existente.",
       "invite_pending": "Este correo ya tiene una invitación pendiente. Reenvíala en su lugar.",
       "too_many_invites": "Demasiadas invitaciones pendientes. Retira algunas antes de invitar a más personas.",
-      "invite_accepted": "Esa invitación se acaba de aceptar, así que ahora es un compartido.",
+      "invite_accepted": "Esa invitación se acaba de aceptar, así que ahora ya está compartido.",
       "port_range_in_use": "Una instancia en ejecución en este nodo usa un puerto fuera del nuevo rango. Detenla primero.",
       "node_online": "El nodo está en línea. Los agentes solo eliminan nodos sin conexión; una persona puede eliminarlo aquí.",
       "alias_shadowed": "Ese nombre ya es uno de tus ID invocables.",
@@ -1778,7 +1778,7 @@
         "discrete": "GPU",
         "unified": "Memoria unificada",
         "cpu": "CPU y RAM",
-        "none": "Nada (no reserva nada)"
+        "none": "Nada reservado"
       },
       "memoryGb": "Memoria (GiB)",
       "gpuCount": "GPU",

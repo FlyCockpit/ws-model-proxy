@@ -63,7 +63,6 @@ function useUpdateNode(successKey: string) {
   });
 }
 
-/** Shown instead of a form when the node is Relay only. */
 /** Where the first metric-command issue is and what it says, in the active language. */
 function metricCommandsIssueDetail(
   issue: { path: PropertyKey[]; message: string; params?: unknown } | undefined,
@@ -74,6 +73,7 @@ function metricCommandsIssueDetail(
   return where ? `${where}: ${text}` : text;
 }
 
+/** Shown instead of a form when the node is Relay only. */
 function FrozenNote() {
   const { t } = useTranslation(["dashboard"]);
   return <p className="text-sm text-muted-foreground">{t("dashboard:nodes.definition.frozen")}</p>;
