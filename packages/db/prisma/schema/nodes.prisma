@@ -52,7 +52,8 @@ model Node {
   /// RELAY; it sends `trust.lower` until the node reports RELAY, then clears the time.
   trustLowerRequestedAt   DateTime?
   /// Who lowered it (the owner). Kept after the node confirms, while the node stays RELAY
-  /// from that lowering: the trust card's "changed by". Any other trust change clears it.
+  /// from that lowering: the trust card's "changed by". Any other trust change the server sees
+  /// clears it (a raise and re-lower on the node while offline reports RELAY→RELAY and keeps it).
   trustLowerRequestedBy   String?
   /// Node-reported: every runtime version it holds (several per runtime are normal),
   /// [{ runtimeId, versionId, launchHash }]. Frozen while trust is RELAY (no separate flag).

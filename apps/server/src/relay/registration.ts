@@ -51,7 +51,8 @@ export function trustLowerColumns(
   reported: "FULL" | "RELAY",
   lowerPending: boolean,
 ): { trustLowerRequestedAt?: null; trustLowerRequestedBy?: null } {
-  if (lowerPending && reported === "RELAY") return { trustLowerRequestedAt: null };
+  // While a person's lowering is pending, who asked stays (a first hello may still say FULL).
+  if (lowerPending) return reported === "RELAY" ? { trustLowerRequestedAt: null } : {};
   if (stored !== reported) return { trustLowerRequestedBy: null };
   return {};
 }
