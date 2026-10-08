@@ -1498,6 +1498,16 @@
       "removed": "Removed: "
     },
     "capabilities": {
+      "title": "Capabilities:",
+      "none": "none",
+      "detected": "Detected",
+      "overridden": "Set by you",
+      "change": "Change",
+      "dialogTitle": "Capabilities of {{model}}",
+      "dialogHint": "Pools route only the requests a model can serve. Override what the node detected when it is wrong.",
+      "detectedList": "Detected: {{list}}",
+      "useDetected": "Use detected",
+      "saved": "Capabilities saved.",
       "values": {
         "text_generation": "Text",
         "vision_input": "Images in",
@@ -1507,6 +1517,29 @@
         "audio_output": "Audio out",
         "responses_api": "Responses API"
       }
+    },
+    "metrics": {
+      "title": "Metrics by version",
+      "hint": "Requests, latency and load of this runtime in Activity, per version.",
+      "compare": "Compare versions",
+      "current": "Current version (v{{version}})",
+      "running": "v{{version}} (still running)"
+    },
+    "sharing": {
+      "title": "Sharing",
+      "hint": "Share this definition (read-only, every version) with people. They can fork it to their own nodes; your nodes and instances stay yours.",
+      "none": "Not shared with anyone.",
+      "email": "E-mail",
+      "emailInvalid": "Enter an e-mail address.",
+      "share": "Share",
+      "invitesLink": "Pending invites are on Access · Shares"
+    },
+    "nodePicker": {
+      "multiHint_one": "Pick a node, or leave it on any eligible node.",
+      "multiHint_other": "Pick one node for each of the {{count}} nodes (node 1 leads), or leave all on any eligible node.",
+      "rank": "Node {{number}}",
+      "pickEveryRank": "Pick a node for every position, or none.",
+      "pickDistinct": "Pick a different node for each position."
     }
   },
   "overview": {

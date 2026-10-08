@@ -24,6 +24,8 @@ import {
   MarkStoppedAction,
   StopNotConfirmedHelp,
 } from "@/components/runtimes/mark-stopped";
+import { RuntimeSharingCard } from "@/components/runtimes/runtime-sharing-card";
+import { ServedModelCapabilities } from "@/components/runtimes/served-model-capabilities";
 import { type PillTone, StatusPill } from "@/components/status-pill";
 import { refusalText } from "@/lib/refusal-text";
 import { slugify } from "@/lib/slugify";
@@ -91,6 +93,7 @@ function RuntimeOverviewPage() {
 
 function RuntimeOverview({ runtime }: { runtime: RuntimeDetail }) {
   const { t } = useTranslation(["dashboard", "common"]);
+  const { lang } = Route.useParams();
   return (
     <div className="flex min-w-0 flex-col gap-4">
       <div className="min-w-0 space-y-1">
@@ -117,6 +120,8 @@ function RuntimeOverview({ runtime }: { runtime: RuntimeDetail }) {
         <ServedModelsCard runtime={runtime} />
       )}
       <InstancesCard runtime={runtime} />
+      {runtime.service ? null : <MetricsByVersionCard runtime={runtime} />}
+      <RuntimeSharingCard lang={lang} runtime={runtime} />
       <DeleteRuntime runtime={runtime} />
     </div>
   );
@@ -207,6 +212,7 @@ function ServedModelRow({ runtime, model }: { runtime: RuntimeDetail; model: Ser
         <span className="break-all font-mono text-sm">{model.upstreamModelId}</span>
         <StatusPill tone="info">{t(`dashboard:models.type.${model.type}`)}</StatusPill>
       </div>
+      <ServedModelCapabilities model={model} />
       {model.pools.length > 0 ? (
         model.pools.map((pool) => (
           <div key={pool.poolId} className="flex min-w-0 flex-wrap items-center gap-2">
@@ -392,17 +398,25 @@ function StartDialog({
   const { t } = useTranslation(["dashboard", "common"]);
   const invalidate = useRuntimeInvalidation();
   const nodes = useQuery({ ...orpc.nodes.list.queryOptions(), retry: false });
-  const [nodeId, setNodeId] = useState("");
+  const groupSize = runtime.current.spec.launch?.groupSize ?? 1;
+  // One node per rank, in rank order; all empty: the planner picks.
+  const [nodeIds, setNodeIds] = useState<string[]>(() => Array(groupSize).fill(""));
   const [preview, setPreview] = useState<StartPreview | null>(null);
   const start = useMutation({
     ...orpc.runtimes.start.mutationOptions(),
     meta: { skipGlobalErrorToast: true },
   });
-  const groupSize = runtime.current.spec.launch?.groupSize ?? 1;
+  const chosen = nodeIds.filter((nodeId) => nodeId !== "");
+  const pickProblem =
+    chosen.length > 0 && chosen.length < groupSize
+      ? "pickEveryRank"
+      : new Set(chosen).size < chosen.length
+        ? "pickDistinct"
+        : null;
   const target = instanceId
     ? { instanceId }
-    : nodeId && groupSize === 1
-      ? { nodeIds: [nodeId] }
+    : chosen.length === groupSize
+      ? { nodeIds: chosen }
       : {};
 
   const requestPreview = async () => {
@@ -448,7 +462,11 @@ function StartDialog({
               {t("dashboard:runtime.confirmStart")}
             </Button>
           ) : (
-            <Button size="touch" disabled={start.isPending} onClick={requestPreview}>
+            <Button
+              size="touch"
+              disabled={start.isPending || pickProblem !== null}
+              onClick={requestPreview}
+            >
               {t("dashboard:runtime.preview")}
             </Button>
           )}
@@ -456,25 +474,19 @@ function StartDialog({
       }
     >
       <div className="flex min-w-0 flex-col gap-3 pb-4 text-sm">
-        {!instanceId && groupSize === 1 && nodes.isSuccess ? (
-          <div className="space-y-1.5">
-            <Label htmlFor="start-node">{t("dashboard:runtime.startOn")}</Label>
-            <NativeSelect
-              id="start-node"
-              value={nodeId}
-              onChange={(event) => {
-                setNodeId(event.target.value);
-                setPreview(null);
-              }}
-            >
-              <option value="">{t("dashboard:runtime.anyNode")}</option>
-              {nodes.data.nodes.map((node) => (
-                <option key={node.id} value={node.id}>
-                  {node.name ?? node.slug}
-                </option>
-              ))}
-            </NativeSelect>
-          </div>
+        {!instanceId && nodes.isSuccess ? (
+          <NodePicker
+            groupSize={groupSize}
+            nodes={nodes.data.nodes}
+            value={nodeIds}
+            onChange={(next) => {
+              setNodeIds(next);
+              setPreview(null);
+            }}
+          />
+        ) : null}
+        {pickProblem ? (
+          <p className="text-destructive">{t(`dashboard:runtime.nodePicker.${pickProblem}`)}</p>
         ) : null}
         {preview ? (
           <>
@@ -526,6 +538,105 @@ function StartDialog({
         )}
       </div>
     </ResponsiveDialog>
+  );
+}
+
+/**
+ * Load and request metrics of this runtime per version, in the Activity explorer: all versions
+ * compared, or one version (the current one and any other an instance still runs).
+ */
+function MetricsByVersionCard({ runtime }: { runtime: RuntimeDetail }) {
+  const { t } = useTranslation(["dashboard"]);
+  const { lang } = Route.useParams();
+  const versions = new Map<string, number>([
+    [runtime.currentVersion.id, runtime.currentVersion.version],
+  ]);
+  for (const instance of runtime.instanceList)
+    if (instance.phase !== "STOPPED") versions.set(instance.versionId, instance.versionNumber);
+  const linkClass = "inline-flex min-h-11 items-center text-sm underline underline-offset-4";
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">{t("dashboard:runtime.metrics.title")}</CardTitle>
+        <CardDescription>{t("dashboard:runtime.metrics.hint")}</CardDescription>
+      </CardHeader>
+      <CardContent className="flex min-w-0 flex-wrap items-center gap-x-4">
+        <Link
+          to="/$lang/activity"
+          params={{ lang }}
+          search={{ scope: "runtime", id: runtime.id, groupBy: "version" }}
+          className={linkClass}
+        >
+          {t("dashboard:runtime.metrics.compare")}
+        </Link>
+        {[...versions].map(([versionId, version]) => (
+          <Link
+            key={versionId}
+            to="/$lang/activity"
+            params={{ lang }}
+            search={{ scope: "version", runtime: runtime.id, id: versionId }}
+            className={linkClass}
+          >
+            {versionId === runtime.currentVersion.id
+              ? t("dashboard:runtime.metrics.current", { version })
+              : t("dashboard:runtime.metrics.running", { version })}
+          </Link>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * Where a start runs: any eligible node (the planner picks), or one node per rank, in rank
+ * order (a multi-node runtime's rank 1 is its head). The API takes exactly one node per rank.
+ */
+function NodePicker({
+  groupSize,
+  nodes,
+  value,
+  onChange,
+}: {
+  groupSize: number;
+  nodes: ReadonlyArray<{ id: string; slug: string; name: string | null }>;
+  value: readonly string[];
+  onChange: (next: string[]) => void;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <div className="flex min-w-0 flex-col gap-3">
+      {groupSize > 1 ? (
+        <p className="text-muted-foreground">
+          {t("dashboard:runtime.nodePicker.multiHint", { count: groupSize })}
+        </p>
+      ) : null}
+      {value.map((nodeId, index) => {
+        const id = `start-node-${index}`;
+        return (
+          <div key={index} className="space-y-1.5">
+            <Label htmlFor={id}>
+              {groupSize > 1
+                ? t("dashboard:runtime.nodePicker.rank", { number: index + 1 })
+                : t("dashboard:runtime.startOn")}
+            </Label>
+            <NativeSelect
+              id={id}
+              value={nodeId}
+              onChange={(event) =>
+                onChange(value.map((item, at) => (at === index ? event.target.value : item)))
+              }
+            >
+              <option value="">{t("dashboard:runtime.anyNode")}</option>
+              {nodes.map((node) => (
+                <option key={node.id} value={node.id}>
+                  {node.name ?? node.slug}
+                </option>
+              ))}
+            </NativeSelect>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 

@@ -1498,6 +1498,16 @@
       "removed": "Quitado: "
     },
     "capabilities": {
+      "title": "Capacidades:",
+      "none": "ninguna",
+      "detected": "Detectadas",
+      "overridden": "Definidas por ti",
+      "change": "Cambiar",
+      "dialogTitle": "Capacidades de {{model}}",
+      "dialogHint": "Los pools solo envían las solicitudes que un modelo puede atender. Corrige lo que detectó el nodo si está mal.",
+      "detectedList": "Detectadas: {{list}}",
+      "useDetected": "Usar las detectadas",
+      "saved": "Capacidades guardadas.",
       "values": {
         "text_generation": "Texto",
         "vision_input": "Imágenes de entrada",
@@ -1507,6 +1517,29 @@
         "audio_output": "Audio de salida",
         "responses_api": "API Responses"
       }
+    },
+    "metrics": {
+      "title": "Métricas por versión",
+      "hint": "Solicitudes, latencia y carga de este runtime en Actividad, por versión.",
+      "compare": "Comparar versiones",
+      "current": "Versión actual (v{{version}})",
+      "running": "v{{version}} (aún en ejecución)"
+    },
+    "sharing": {
+      "title": "Compartir",
+      "hint": "Comparte esta definición (solo lectura, todas las versiones) con personas. Pueden copiarla a sus propios nodos; tus nodos e instancias siguen siendo tuyos.",
+      "none": "No se comparte con nadie.",
+      "email": "Correo electrónico",
+      "emailInvalid": "Escribe un correo electrónico.",
+      "share": "Compartir",
+      "invitesLink": "Las invitaciones pendientes están en Acceso · Compartidos"
+    },
+    "nodePicker": {
+      "multiHint_one": "Elige un nodo, o déjalo en cualquier nodo apto.",
+      "multiHint_other": "Elige un nodo para cada uno de los {{count}} nodos (el nodo 1 dirige), o deja todos en cualquier nodo apto.",
+      "rank": "Nodo {{number}}",
+      "pickEveryRank": "Elige un nodo para cada posición, o ninguno.",
+      "pickDistinct": "Elige un nodo distinto para cada posición."
     }
   },
   "overview": {
