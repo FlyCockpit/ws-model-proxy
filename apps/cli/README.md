@@ -157,6 +157,13 @@ security boundary against other code running as your user**: anything that runs 
 your files, including this CLI's configuration. If you do not trust the code on this account,
 Relay only does not make it safe.
 
+The same refusal covers every command that changes wsmp itself: `wsmp login`, `wsmp secret set|remove`,
+the `wsmp config` setters (`init`, `set-…`, `clear-file-roots`), `wsmp service
+install|uninstall|env-sync`, `wsmp logout`, `wsmp run`, `wsmp terminal approve` and `wsmp recover
+--apply`. Reading (`wsmp config show|path`, `wsmp service status|env-path`, listings) and lowering
+(`wsmp trust relay`, `wsmp terminal approvals revoke`) work from anywhere. So an agent cannot widen
+its own file roots or other settings through `wsmp config`; the same caveat applies.
+
 Lowering only stops new agent access through wsmp. It does not undo or contain software an agent
 already left on the node while it had Full control, such as a systemd user service: that software
 runs as the same user and can even raise trust again locally. If you distrust what an agent did,

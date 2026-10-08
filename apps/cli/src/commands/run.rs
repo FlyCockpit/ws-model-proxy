@@ -6,5 +6,6 @@ use anyhow::Result;
 pub struct Args {}
 
 pub fn run(_args: &Args) -> Result<()> {
+    crate::trust::refuse_in_job("wsmp run")?;
     crate::daemon::connect_foreground()
 }

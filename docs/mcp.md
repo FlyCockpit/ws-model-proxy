@@ -294,10 +294,12 @@ secret files.
   config, credentials, secrets, runtime stores, state directory, service unit
   and binary are off limits (writes) or read-only (config).
 - **Roots are node-only.** Only a person at the node sets the roots. No MCP
-  tool changes them, and `wsmp config set-…` (like `wsmp login`, `wsmp trust
-  full`, `wsmp secret`, `wsmp logout`, `wsmp terminal approve` and `wsmp
-  service install|uninstall|env-sync`) refuses to run from a command, job or
-  terminal wsmp started, so `node_command_run` cannot widen them.
+  tool changes them, and `wsmp config set-…` (like the other commands that
+  change wsmp itself: `login`, `trust full`, `secret`, `logout`, `run`,
+  `terminal approve`, `recover --apply` and `service
+  install|uninstall|env-sync`) refuses to run from a command, job or terminal
+  wsmp started. Do not try to widen them through `node_command_run`; ask the
+  person.
 - **Reads paginate.** A read returns at most 400 lines and 32 KiB at a time
   (`limit` up to 2,000 lines), never `too_large` for files up to 64 MiB. When the file goes on, the
   result has `more: {startLine, byteOffset?}`: call again with

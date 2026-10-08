@@ -962,6 +962,8 @@ fn commands_wsmp_started_cannot_change_wsmp_itself() {
         &["service", "env-sync"],
         &["logout"],
         &["terminal", "approve", "ABCD-EFGH"],
+        &["run"],
+        &["recover", "--apply"],
     ];
     for args in refused {
         cli(&config, &state)
@@ -982,7 +984,10 @@ fn commands_wsmp_started_cannot_change_wsmp_itself() {
         &["config", "path"],
         &["service", "env-path"],
         &["terminal", "approvals", "list"],
+        &["recover"],
         &["trust"],
+        // Lowering works from anywhere.
+        &["trust", "relay"],
     ];
     for args in allowed {
         cli(&config, &state)
@@ -992,6 +997,13 @@ fn commands_wsmp_started_cannot_change_wsmp_itself() {
             .assert()
             .success();
     }
+    // Revoking narrows access too: not refused (the code is just unknown).
+    cli(&config, &state)
+        .args(["terminal", "approvals", "revoke", "ABCD-EFGH"])
+        .env("WSMP_JOB", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot run from").not());
 }
 
 #[test]

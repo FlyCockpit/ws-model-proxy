@@ -117,9 +117,12 @@ pub fn persist_full() -> Result<()> {
 }
 
 /// Refuse `command` when a process wsmp started runs it (`WSMP_JOB`): the
-/// commands that change wsmp's own settings, credential, service or terminal
-/// approvals, so a command, job or terminal on the node cannot widen what
-/// the server may do here.
+/// commands that change wsmp's own settings, credential, service, relay,
+/// file recovery or terminal approvals. Like the other `WSMP_JOB` checks
+/// this is a best-effort guard against agents widening their own access, not
+/// a boundary against code running as the user (it can drop the marker, or
+/// edit wsmp's files). Lowering (`wsmp trust relay`, revoking an approval)
+/// stays allowed from anywhere.
 pub fn refuse_in_job(command: &str) -> Result<()> {
     if std::env::var_os(JOB_MARKER_ENV).is_some() {
         anyhow::bail!("`{command}` cannot run from a command, job or terminal wsmp started");
