@@ -127,7 +127,7 @@ describe("settings locale", { timeout: 30_000 }, () => {
     expect(state.calls).toEqual([{ locale: "es-MX" }]);
     expect(state.languages).toEqual(["es-MX"]);
     expect(state.navigations).toEqual([
-      { to: "/$lang/settings", params: { lang: "es-MX" }, replace: true },
+      { to: "/$lang/settings", params: { lang: "es-MX" }, replace: true, resetScroll: false },
     ]);
     expect(window.localStorage.getItem("locale")).toBe("es-MX");
     expect(state.sessionRefetches).toBe(1);

@@ -21,7 +21,9 @@ function TestRoute() {
     <TestPage
       lang={lang}
       target={target}
-      onTargetChange={(next) => void navigate({ search: { target: next }, replace: true })}
+      onTargetChange={(next) =>
+        void navigate({ search: { target: next }, replace: true, resetScroll: false })
+      }
     />
   );
 }

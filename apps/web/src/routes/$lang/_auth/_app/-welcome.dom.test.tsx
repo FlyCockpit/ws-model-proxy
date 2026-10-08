@@ -263,6 +263,7 @@ describe("Welcome", { timeout: 30_000 }, () => {
           params: { lang: "en-US" },
           search: { step: "runtime" },
           replace: true,
+          resetScroll: false,
         },
       ]),
     );
