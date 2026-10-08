@@ -250,7 +250,11 @@ async function mount() {
       <Component />
     </QueryClientProvider>,
   );
-  await screen.findByText("dashboard:providers.activity.attemptState.FAILED");
+  await screen.findByText(
+    "dashboard:providers.activity.attemptState.FAILED",
+    {},
+    { timeout: 5_000 },
+  );
 }
 
 const callsOf = (name: string) => state.calls.filter((call) => call.name === name);

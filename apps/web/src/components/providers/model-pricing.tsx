@@ -85,15 +85,18 @@ function PriceVersionRow({ version }: { version: PriceVersion }) {
     ...orpc.providers.pricing.delete.mutationOptions(),
     meta: { skipGlobalErrorToast: true },
   });
-  const rates = RATES.flatMap((rate) =>
-    version.pricing[rate] === undefined
-      ? []
-      : [
-          t(`dashboard:providers.pricing.rateValue.${rate}`, {
-            value: version.pricing[rate],
-          }),
-        ],
-  );
+  // Known rates by name; any other key a catalog price carries is shown as written.
+  const known: readonly string[] = RATES;
+  const rates = [
+    ...RATES.flatMap((rate) =>
+      version.pricing[rate] === undefined
+        ? []
+        : [t(`dashboard:providers.pricing.rateValue.${rate}`, { value: version.pricing[rate] })],
+    ),
+    ...Object.entries(version.pricing)
+      .filter(([key]) => !known.includes(key))
+      .map(([key, value]) => `${key} ${value}`),
+  ];
   return (
     <li className="flex min-w-0 flex-col gap-2 py-2">
       <div className="flex min-w-0 flex-wrap items-center gap-2">

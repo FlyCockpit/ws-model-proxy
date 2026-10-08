@@ -240,7 +240,7 @@ function ActivityRequestsPage() {
         title={t("activity:requests.clearTitle")}
         description={t("activity:requests.clearDescription")}
         confirmLabel={t("activity:requests.clear")}
-        isPending={clear.isPending}
+        isPending={clear.isPending || deleteOlder.isPending}
         onConfirm={() => clear.mutate()}
       />
       <ConfirmAction
@@ -251,7 +251,7 @@ function ActivityRequestsPage() {
         })}
         description={t("activity:requests.deleteOlderDescription")}
         confirmLabel={t("activity:requests.deleteOlder")}
-        isPending={deleteOlder.isPending}
+        isPending={deleteOlder.isPending || clear.isPending}
         onConfirm={() => deleteOlder.mutate(olderThan)}
       />
     </div>
