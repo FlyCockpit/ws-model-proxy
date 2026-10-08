@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { OpenAiCompatibleCapabilities } from "../relay/protocol.js";
 import {
+  externalModelListFlags,
   multimodalFlagsFromCapabilities,
   openAiModelListExtensions,
   openAiModelListExtensionsFromCapabilities,
@@ -219,6 +220,7 @@ describe("poolModelListFlags", () => {
         model: {
           id: "voxtral",
           capabilities: [],
+          type: "TRANSCRIPTION",
           transcriptionProfile: { realtime: { adapter: "segmented", maxItemSeconds: 30 } },
         },
       },
@@ -226,6 +228,10 @@ describe("poolModelListFlags", () => {
     expect(openAiModelListExtensions(flags)).toMatchObject({
       supports_audio_transcription: true,
       supports_realtime_transcription: true,
+    });
+    expect(openAiModelListExtensions(externalModelListFlags(flags))).toMatchObject({
+      supports_audio_transcription: true,
+      supports_realtime_transcription: false,
     });
   });
 });

@@ -162,6 +162,7 @@ import {
 } from "./media-transform.js";
 import { applyMetricRoutingVerdicts } from "./metric-routing-order.js";
 import {
+  externalModelListFlags,
   multimodalFlagsFromCapabilities,
   openAiModelListExtensions,
   poolModelListFlags,
@@ -3693,12 +3694,12 @@ async function modelListResponse(
       }),
       ...targets.pools.flatMap((pool) => {
         const flags = poolFlagsById.get(pool.id) ?? multimodalFlagsFromCapabilities(null);
-        const entry = (id: string) => ({
+        const entry = (id: string, entryFlags = flags) => ({
           id,
           object: "model" as const,
           created: 0,
           owned_by: pool.ownerUserSlug,
-          ...openAiModelListExtensions(flags),
+          ...openAiModelListExtensions(entryFlags),
         });
         const plain = servingPoolIds.has(pool.id) ? [entry(pool.modelId)] : [];
         // `owner/pool:external` is listed only when this caller could be served
@@ -3716,7 +3717,9 @@ async function modelListResponse(
             requester: external.requester,
             pool,
           }).granted;
-        return externalListed ? [...plain, entry(externalModelId(pool.modelId))] : plain;
+        return externalListed
+          ? [...plain, entry(externalModelId(pool.modelId), externalModelListFlags(flags))]
+          : plain;
       }),
       // The caller's aliases, listed like the pool they name (hard-coded harness names).
       ...(targets.aliases ?? []).flatMap((alias) => {

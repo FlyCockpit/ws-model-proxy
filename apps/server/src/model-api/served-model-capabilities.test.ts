@@ -15,6 +15,7 @@ describe("servedModelCapabilities", () => {
   it("routes transcriptions by the profile the runtime definition declares", () => {
     const capabilities = servedModelCapabilities({
       capabilities: [],
+      type: "TRANSCRIPTION",
       embeddingContract: null,
       transcriptionProfile: {
         streaming: true,
@@ -48,6 +49,7 @@ describe("servedModelCapabilities", () => {
   it("keeps speech next to a declared profile", () => {
     const capabilities = servedModelCapabilities({
       capabilities: ["AUDIO_OUTPUT"],
+      type: "TRANSCRIPTION",
       embeddingContract: null,
       transcriptionProfile: { languages: ["fr"] },
     });
@@ -55,5 +57,16 @@ describe("servedModelCapabilities", () => {
       transcriptions: { supported: true, languages: ["fr"] },
       speech: true,
     });
+  });
+
+  it("ignores a profile left on a model that is no longer a transcription model", () => {
+    const capabilities = servedModelCapabilities({
+      capabilities: ["TEXT_GENERATION"],
+      type: "LLM",
+      embeddingContract: null,
+      transcriptionProfile: { languages: ["fr"], realtime: { adapter: "segmented" } },
+    });
+    expect(capabilities.version).toBe(1);
+    expect(capabilities.audio).toBeUndefined();
   });
 });

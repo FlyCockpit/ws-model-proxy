@@ -55,8 +55,8 @@ export type MultimodalFlags = {
   audioTranslation: boolean;
   /**
    * The capability advertises live transcription (`audio.transcriptions.realtime`
-   * with `supported: true`; never translations). Sessions still open only on
-   * recipe-managed, healthy members.
+   * with `supported: true`; never translations). Sessions still open only on a ready
+   * instance whose target is healthy or not yet judged, and never on `:external`.
    */
   realtimeTranscription?: boolean;
 };
@@ -182,6 +182,7 @@ export function poolModelListFlags(
     model: {
       id: string;
       capabilities: readonly string[];
+      type?: string;
       embeddingContract?: unknown;
       transcriptionProfile?: unknown;
     };
@@ -195,6 +196,11 @@ export function poolModelListFlags(
       multimodalFlagsFromCapabilities(servedModelCapabilities(model)),
     ),
   );
+}
+
+/** The flags of a pool's `owner/pool:external` entry: live sessions never take `:external`. */
+export function externalModelListFlags(flags: MultimodalFlags): MultimodalFlags {
+  return { ...flags, realtimeTranscription: false };
 }
 
 export function inputModalitiesFromFlags(flags: MultimodalFlags): ModelInputModality[] {

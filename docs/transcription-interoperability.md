@@ -136,11 +136,21 @@ Engine notes:
 
 The runtime definition is the only source: a node that reports `realtime` for a
 served model its definition does not declare is never routed to. A session opens
-only on a pool member whose instance is ready on an online node and fully healthy;
-a pool whose members are all degraded or recovering refuses it with close code 1013. A member that refuses sessions for a configuration
-reason (for example no `/v1/realtime` route) is logged and is not marked
-unhealthy for HTTP traffic. `GET /v1/models` marks models with a live-capable
-member with `supports_realtime_transcription` (a hint; routing decides).
+only on a pool member whose instance is ready on an online node and whose health is
+good or not yet known (a fresh runtime; members that already served go first). An open
+the engine accepts marks the member healthy; one that fails marks it degraded, and a
+degraded member takes no live sessions until an HTTP transcription request succeeds on
+it (live sessions never take the recovery trial). A pool whose members are all degraded
+or recovering refuses the session with close code 1013. A member that refuses sessions
+for a configuration reason (for example no `/v1/realtime` route) is logged and is not
+marked unhealthy for HTTP traffic. `GET /v1/models` marks a pool with a live-capable
+member with `supports_realtime_transcription` (a hint; routing decides); its
+`:external` entry never has it, since live sessions do not go to the cloud.
+
+The transcription profile also decides HTTP routing: a request with a language hint,
+`stream`, a response format or timestamp granularities goes only to members whose
+profile declares them, and `/v1/models` sets `supports_audio_transcription` for a pool
+of a transcription runtime.
 
 ### Client usage
 

@@ -31,12 +31,17 @@ vi.mock("../resolve.js", async () => {
 
 const health = vi.hoisted(() => ({
   recordTargetRelayFailure: vi.fn(async () => ({ retryable: false, update: null })),
+  markTargetRelaySuccess: vi.fn(async () => undefined),
 }));
 vi.mock("@ws-model-proxy/api/lib/pool-routing", async () => {
   const actual = await vi.importActual<typeof import("@ws-model-proxy/api/lib/pool-routing")>(
     "@ws-model-proxy/api/lib/pool-routing",
   );
-  return { ...actual, recordTargetRelayFailure: health.recordTargetRelayFailure };
+  return {
+    ...actual,
+    recordTargetRelayFailure: health.recordTargetRelayFailure,
+    markTargetRelaySuccess: health.markTargetRelaySuccess,
+  };
 });
 
 const { default: prisma } = await import("@ws-model-proxy/db");
@@ -67,7 +72,7 @@ type RouteOverrides = {
   node?: string | null;
   profile?: unknown;
   ready?: boolean;
-  health?: "UNKNOWN" | "HEALTHY" | "HALF_OPEN" | "UNHEALTHY";
+  health?: "UNKNOWN" | "HEALTHY" | "DEGRADED" | "HALF_OPEN" | "UNHEALTHY";
   active?: boolean;
   owner?: string;
   shareId?: string | null;
@@ -129,6 +134,7 @@ function testRoute({
       userId: owner,
       upstreamModelId: "whisper-large",
       capabilities: ["AUDIO_INPUT"],
+      type: "TRANSCRIPTION",
       transcriptionProfile: profile as TestRoute["model"]["transcriptionProfile"],
       embeddingContract: null,
     },
@@ -169,6 +175,7 @@ beforeEach(() => {
   callable.userCalls = [];
   callable.keyCalls = [];
   health.recordTargetRelayFailure.mockClear();
+  health.markTargetRelaySuccess.mockClear();
 });
 
 describe("live capability (from the served model's transcription profile)", () => {
@@ -231,6 +238,29 @@ describe("pool candidates", () => {
       ],
     });
     expect(candidates.map((candidate) => candidate.memberId)).toEqual(["ok"]);
+  });
+
+  it("tries targets that served before ahead of unjudged ones", async () => {
+    const candidates = await poolCandidates({
+      pool: POOL,
+      config: {},
+      onlineNodeIds: ["node-1"],
+      routes: async () => [
+        poolRoute({ member: "fresh", target: "et-fresh", health: "UNKNOWN" }),
+        poolRoute({ member: "proven", target: "et-proven" }),
+      ],
+    });
+    expect(candidates.map((candidate) => candidate.memberId)).toEqual(["proven", "fresh"]);
+  });
+
+  it("drops degraded targets", async () => {
+    const candidates = await poolCandidates({
+      pool: POOL,
+      config: {},
+      onlineNodeIds: ["node-1"],
+      routes: async () => [poolRoute({ member: "degraded", health: "DEGRADED" })],
+    });
+    expect(candidates).toEqual([]);
   });
 
   it("takes a fresh target nothing has judged yet, as HTTP routing does", async () => {
@@ -352,6 +382,24 @@ describe("test candidates and model resolution", () => {
       failure: "timeout",
       trialStartedAt: null,
     });
+  });
+
+  it("marks the target healthy when its engine opens a session, never as a trial", async () => {
+    const router = createRealtimeRouter({
+      access: { kind: "dashboard", userId: "u" },
+      onlineNodeIds: () => ["node-1"],
+    });
+    const [candidate] = await poolCandidates({
+      pool: POOL,
+      config: {},
+      onlineNodeIds: ["node-1"],
+      routes: async () => [poolRoute({ health: "UNKNOWN" })],
+    });
+    if (!candidate) throw new Error("no candidate");
+    router.memberOpened?.(candidate);
+    router.memberOpened?.({ ...candidate, route: undefined });
+    expect(health.markTargetRelaySuccess).toHaveBeenCalledTimes(1);
+    expect(health.markTargetRelaySuccess).toHaveBeenCalledWith("et-1", { trialStartedAt: null });
   });
 
   it("the router reports no_live_member when nothing is eligible", async () => {

@@ -1,14 +1,11 @@
-import {
-  type OpenAiCompatibleCapabilities,
-  parseOpenAiCompatibleCapabilities,
-} from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import {
   buildPoolRouteSequence,
+  markTargetRelaySuccess,
   recordTargetRelayFailure,
   routeKey,
   type SmoothWeightedRoundRobinState,
 } from "@ws-model-proxy/api/lib/pool-routing";
-import { transcriptionProfileSchema } from "@ws-model-proxy/api/lib/transcription-profile";
 import prisma from "@ws-model-proxy/db";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import type { RelayFailure } from "../../relay/relay-failure.js";
@@ -28,6 +25,7 @@ import {
   type TestTarget,
   testRoutes,
 } from "../resolve.js";
+import { servedModelCapabilities } from "../served-model-capabilities.js";
 import { recheckRealtimePermission } from "./authorize.js";
 import { checkDashboardSession } from "./dashboard-session.js";
 import type { RealtimeCredentialRef, RealtimeTargetAccess } from "./requester.js";
@@ -55,18 +53,13 @@ import type {
  * sees the person's own served models (TEST targets).
  */
 
-/** The live-session capabilities of a served model, or null when it takes none. */
+/**
+ * The live-session capabilities of a served model, or null when it takes none: its request
+ * capabilities (`servedModelCapabilities`, the same view HTTP routing and `/v1/models` use)
+ * when they carry a live profile.
+ */
 export function liveCapabilities(model: RouteServedModel): OpenAiCompatibleCapabilities | null {
-  const profile = transcriptionProfileSchema.safeParse(model.transcriptionProfile);
-  if (!profile.success || !profile.data.realtime) return null;
-  const { realtime, ...file } = profile.data;
-  const capabilities = parseOpenAiCompatibleCapabilities({
-    version: 2,
-    protocol: "openai-compatible",
-    audio: {
-      transcriptions: { supported: true, ...file, realtime: { supported: true, ...realtime } },
-    },
-  });
+  const capabilities = servedModelCapabilities(model);
   return realtimeTranscriptionCapability(capabilities) ? capabilities : null;
 }
 
@@ -186,7 +179,7 @@ export async function poolCandidates({
   });
   if (!sequence.ok) return [];
   rememberRoundRobin(pool.id, sequence.state);
-  const candidates: RealtimeCandidate[] = [];
+  const candidates: Array<{ candidate: RealtimeCandidate; judged: boolean }> = [];
   for (const routed of sequence.candidates) {
     if (routed.health !== "HEALTHY") continue;
     const entry = byKey.get(routeKey(routed));
@@ -196,9 +189,23 @@ export async function poolCandidates({
       entry.capabilities,
       poolIdentity(pool, entry.route),
     );
-    if (candidate) candidates.push(candidate);
+    if (candidate) candidates.push({ candidate, judged: entry.route.target.health === "HEALTHY" });
   }
-  return candidates;
+  return provenFirst(candidates);
+}
+
+/**
+ * Targets that served before go first, in their routing order, then targets nothing has
+ * judged yet: an open that fails for a configuration reason leaves a target unjudged, and it
+ * must not take every session's first attempt.
+ */
+function provenFirst(
+  candidates: ReadonlyArray<{ candidate: RealtimeCandidate; judged: boolean }>,
+): RealtimeCandidate[] {
+  return [
+    ...candidates.filter((entry) => entry.judged),
+    ...candidates.filter((entry) => !entry.judged),
+  ].map((entry) => entry.candidate);
 }
 
 function testIdentity(
@@ -234,15 +241,15 @@ export async function testCandidates({
   routes?: (runtimeModelId: string, ownerUserId: string, now?: Date) => Promise<TestRoute[]>;
 }): Promise<RealtimeCandidate[]> {
   const online = new Set(onlineNodeIds);
-  const candidates: RealtimeCandidate[] = [];
+  const candidates: Array<{ candidate: RealtimeCandidate; judged: boolean }> = [];
   for (const route of await routes(target.id, target.ownerUserId, now)) {
     if (!routeServes(route, online)) continue;
     const capabilities = modelEligible(route, config);
     if (!capabilities) continue;
     const candidate = candidateFor(route, capabilities, testIdentity(target, route));
-    if (candidate) candidates.push(candidate);
+    if (candidate) candidates.push({ candidate, judged: route.target.health === "HEALTHY" });
   }
-  return candidates;
+  return provenFirst(candidates);
 }
 
 /** Which callable target a model name names, for routing and rechecks. */
@@ -306,6 +313,18 @@ export function createRealtimeRouter({
         instanceHandle: candidate.handle,
         failure,
       });
+    },
+    memberOpened(candidate: RealtimeCandidate) {
+      const executionTargetId = candidate.route?.executionTargetId;
+      if (!executionTargetId) return;
+      void markTargetRelaySuccess(executionTargetId, { trialStartedAt: null }).catch(
+        (error: unknown) => {
+          console.error(
+            "[realtime] target health write failed",
+            error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+          );
+        },
+      );
     },
     memberOpenFailed(candidate: RealtimeCandidate, failure: RelayFailure) {
       const executionTargetId = candidate.route?.executionTargetId;

@@ -4,7 +4,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { RUNTIME_LIMIT_COLUMNS } from "@ws-model-proxy/config/runtime-defaults";
-import prisma, { type Prisma } from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import type { z } from "zod";
 import type { runtimeAdvancedPatchSchema, runtimeLimitsPatchSchema } from "../contracts/advanced";
 import { type CallerActor } from "./caller-actor";
@@ -196,7 +196,18 @@ export async function syncRuntimeModels(
           | Prisma.InputJsonValue
           | undefined,
       },
-      update: { type, detectedCapabilities, retired: false },
+      // The definition is the only source of both: a new version replaces or clears them.
+      update: {
+        type,
+        detectedCapabilities,
+        retired: false,
+        embeddingContract: (model.embeddingContract ?? Prisma.DbNull) as
+          | Prisma.InputJsonValue
+          | typeof Prisma.DbNull,
+        transcriptionProfile: (model.transcription ?? Prisma.DbNull) as
+          | Prisma.InputJsonValue
+          | typeof Prisma.DbNull,
+      },
     });
   }
   await tx.runtimeModel.updateMany({

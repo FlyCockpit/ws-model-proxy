@@ -134,6 +134,11 @@ export interface RealtimeRouter {
    * member's health, which HTTP shares (review 6b L2).
    */
   memberMisconfigured?(candidate: RealtimeCandidate, failure: RelayFailure): void;
+  /**
+   * The member's engine opened the session: it served, so a target nothing had judged yet
+   * counts as healthy (never claims or ends a half-open trial; live sessions take none).
+   */
+  memberOpened?(candidate: RealtimeCandidate): void;
 }
 
 export type RealtimeCandidateLease = {
@@ -822,6 +827,7 @@ export class RealtimeTranscriptionSession {
     this.clearRoutingTimer();
     this.routingAbort = null;
     this.openedOn = candidate;
+    this.hook(() => this.deps.router.memberOpened?.(candidate));
     this.hook(() =>
       this.deps.hooks?.opened?.(candidate, {
         adapter: outcome.adapter,
