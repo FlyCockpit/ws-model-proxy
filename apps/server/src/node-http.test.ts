@@ -24,11 +24,11 @@ const {
   CLI_PREVIEW_BRANCH,
   CLI_RELEASE_BINARIES_BY_DEFAULT,
   CLI_REPOSITORY,
-  SERVER_VERSION,
   cliInstallSource,
   installScript,
   registerNodeHttpRoutes,
 } = await import("./node-http.js");
+const { SERVER_VERSION } = await import("./version.js");
 const { env } = await import("@ws-model-proxy/env/server");
 
 const CODE = `wsmp_enr_${"A".repeat(26)}`;

@@ -1,10 +1,14 @@
+import { createHash } from "node:crypto";
 import {
   createMcpHandler,
   type McpHttpHandler,
   type McpRequestContext,
   McpServer,
 } from "@modelcontextprotocol/server";
+import { advertisedInputSchema, MCP_TOOLS } from "@ws-model-proxy/api/contracts";
+import { canonicalJson, compareCodePoints } from "@ws-model-proxy/api/lib/canonical-json";
 
+import { SERVER_VERSION } from "../version";
 import { registerMcpTools } from "./tools";
 
 /**
@@ -33,8 +37,34 @@ import { registerMcpTools } from "./tools";
  * from `createApp`.
  */
 
-/** Advertised server identity (stable wire contract for `initialize`). */
-export const MCP_SERVER_INFO = { name: "ws-model-proxy", version: "1.0.0" } as const;
+/**
+ * A short, deterministic hash of the tool manifest: every tool's name and advertised input
+ * schema (whatever the caller's level may list), so a changed tool list shows in the version.
+ */
+export function mcpToolManifestHash(
+  tools: ReadonlyArray<{ name: string; inputSchema: unknown }> = MCP_TOOLS.map((contract) => ({
+    name: contract.name,
+    inputSchema: advertisedInputSchema(contract),
+  })),
+): string {
+  const manifest = tools
+    .map((tool) => ({ name: tool.name, inputSchema: tool.inputSchema }))
+    .sort((a, b) => compareCodePoints(a.name, b.name));
+  return createHash("sha256").update(canonicalJson(manifest)).digest("hex").slice(0, 12);
+}
+
+/** Advertised server identity: the app version plus the tool manifest hash (build metadata). */
+export const MCP_SERVER_INFO = {
+  name: "ws-model-proxy",
+  version: `${SERVER_VERSION}+tools.${mcpToolManifestHash()}`,
+} as const;
+
+/**
+ * Honest capabilities: the server is stateless and JSON-only with no subscriptions
+ * (`maxSubscriptions: 0`), so it never sends `notifications/tools/list_changed` (the SDK would
+ * advertise `listChanged: true` by default). Clients see a changed tool list in the version.
+ */
+export const MCP_SERVER_CAPABILITIES = { tools: { listChanged: false } } as const;
 
 /**
  * The exact transport options (pinned by transport tests): modern-only
@@ -77,10 +107,10 @@ export function createMcpTransport({
       if (isShuttingDown() || ctx.requestInfo?.signal?.aborted === true) {
         throw new Error("MCP exchange aborted or shutting down");
       }
-      const server = new McpServer({
-        name: MCP_SERVER_INFO.name,
-        version: MCP_SERVER_INFO.version,
-      });
+      const server = new McpServer(
+        { name: MCP_SERVER_INFO.name, version: MCP_SERVER_INFO.version },
+        { capabilities: { tools: { ...MCP_SERVER_CAPABILITIES.tools } } },
+      );
       registerTools(server, ctx);
       return server;
     },

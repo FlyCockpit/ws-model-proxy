@@ -31,11 +31,11 @@ const {
   CLI_RELEASE_BINARIES_BY_DEFAULT,
   CLI_RELEASE_TARGETS,
   CLI_REPOSITORY,
-  SERVER_VERSION,
   cliInstallSource,
   defaultCliReleaseBaseUrl,
   installScript,
 } = await import("./node-http.js");
+const { SERVER_VERSION } = await import("./version.js");
 
 const ORIGIN = "https://proxy.example.com";
 const REV = "0123456789abcdef0123456789abcdef01234567";
