@@ -14,6 +14,7 @@ pub struct Args {
 }
 
 pub fn run(args: &Args) -> Result<()> {
+    crate::trust::refuse_in_job("wsmp logout")?;
     let removed_credential = remove_node_credential()?;
     if args.json {
         output::json(&LogoutOutput { removed_credential })?;

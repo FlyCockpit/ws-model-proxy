@@ -47,6 +47,7 @@ pub fn run(args: &Args) -> Result<()> {
     let state_dir = crate::paths::state_dir()?;
     match &args.command {
         Sub::Approve { code } => {
+            crate::trust::refuse_in_job("wsmp terminal approve")?;
             let code = approvals::approve(&state_dir, code)?;
             if args.json {
                 output::json(&CodeResult {

@@ -60,10 +60,19 @@ enum CommandName {
 
 pub fn run(args: &Args) -> Result<()> {
     match &args.command {
-        CommandName::Install => install(),
-        CommandName::Uninstall => uninstall(),
+        CommandName::Install => {
+            crate::trust::refuse_in_job("wsmp service install")?;
+            install()
+        }
+        CommandName::Uninstall => {
+            crate::trust::refuse_in_job("wsmp service uninstall")?;
+            uninstall()
+        }
         CommandName::Status => status(),
-        CommandName::EnvSync => env_sync(),
+        CommandName::EnvSync => {
+            crate::trust::refuse_in_job("wsmp service env-sync")?;
+            env_sync()
+        }
         CommandName::EnvPath => env_path(),
     }
 }

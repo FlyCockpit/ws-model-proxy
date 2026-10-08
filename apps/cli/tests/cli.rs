@@ -900,6 +900,81 @@ fn trust_lowers_without_a_relay_and_refuses_to_raise_without_a_terminal() {
     assert_eq!(cfg["trust"], "relay");
 }
 
+/// A command, job or terminal wsmp started cannot change wsmp's own
+/// settings, credential, service or terminal approvals; reads still work.
+#[test]
+fn commands_wsmp_started_cannot_change_wsmp_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({
+            "version": 1,
+            "serverUrl": "https://wsmp.example.com",
+            "cliSlug": "spark-1",
+            "trust": "full",
+            "endpoints": []
+        }),
+    );
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        state.join("node-credential.json"),
+        json!({ "nodeId": "node-1", "slug": "spark-1", "server": "https://wsmp.example.com", "credential": "c".repeat(48) })
+            .to_string(),
+    )
+    .unwrap();
+    let before = fs::read(&config).unwrap();
+    let home = tmp.path().display().to_string();
+    let refused: &[&[&str]] = &[
+        &["config", "init"],
+        &["config", "set-server", "https://evil.example.com"],
+        &["config", "set-slug", "other"],
+        &["config", "set-human-terminal", "on"],
+        &["config", "set-runtime-hosts", "10.0.0.5"],
+        &["config", "set-file-roots", "/"],
+        &["config", "clear-file-roots"],
+        &["config", "set-file-tools", "on"],
+        &["config", "set-terminal-approval", "off"],
+        &["config", "set-max-terminals", "32"],
+        &["config", "set-file-tools-as-root", "on"],
+        &["service", "install"],
+        &["service", "uninstall"],
+        &["service", "env-sync"],
+        &["logout"],
+        &["terminal", "approve", "ABCD-EFGH"],
+    ];
+    for args in refused {
+        cli(&config, &state)
+            .args(*args)
+            .env("WSMP_JOB", "1")
+            .env("HOME", &home)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "cannot run from a command, job or terminal wsmp started",
+            ));
+    }
+    assert_eq!(fs::read(&config).unwrap(), before, "the config changed");
+    assert!(state.join("node-credential.json").exists());
+    // Reads stay allowed.
+    let allowed: &[&[&str]] = &[
+        &["config", "show"],
+        &["config", "path"],
+        &["service", "env-path"],
+        &["terminal", "approvals", "list"],
+        &["trust"],
+    ];
+    for args in allowed {
+        cli(&config, &state)
+            .args(*args)
+            .env("WSMP_JOB", "1")
+            .env("HOME", &home)
+            .assert()
+            .success();
+    }
+}
+
 #[test]
 fn secrets_need_a_terminal_and_list_names_only() {
     let tmp = tempfile::tempdir().unwrap();

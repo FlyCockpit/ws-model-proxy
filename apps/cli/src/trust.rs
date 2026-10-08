@@ -116,6 +116,17 @@ pub fn persist_full() -> Result<()> {
     .context("persisting trust `full` to the config")
 }
 
+/// Refuse `command` when a process wsmp started runs it (`WSMP_JOB`): the
+/// commands that change wsmp's own settings, credential, service or terminal
+/// approvals, so a command, job or terminal on the node cannot widen what
+/// the server may do here.
+pub fn refuse_in_job(command: &str) -> Result<()> {
+    if std::env::var_os(JOB_MARKER_ENV).is_some() {
+        anyhow::bail!("`{command}` cannot run from a command, job or terminal wsmp started");
+    }
+    Ok(())
+}
+
 /// Why a local process may not raise trust, if it may not.
 pub fn caller_marker_refusal() -> Option<&'static str> {
     std::env::var_os(JOB_MARKER_ENV)
