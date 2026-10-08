@@ -31,6 +31,8 @@ function answer(rows: {
   loadSeries?: Record<string, unknown>[];
   nodeTotals?: Record<string, unknown>[];
   nodeSeries?: Record<string, unknown>[];
+  /** Tests the request metrics left out (SUM over no rows is NULL). */
+  tests?: number;
 }) {
   const queries: unknown[] = [];
   db.$queryRaw.mockImplementation((async (strings: TemplateStringsArray, ...parts: unknown[]) => {
@@ -38,6 +40,7 @@ function answer(rows: {
     queries.push(query);
     const sql = text(query);
     const series = sql.includes("date_bin");
+    if (sql.includes("source IN (")) return [{ requests: rows.tests ?? null }];
     if (sql.includes("usage_rollup_minute"))
       return (series ? rows.requestSeries : rows.requestTotals) ?? [];
     if (sql.includes("FROM runtime_load_minute l"))
@@ -152,7 +155,8 @@ describe("metrics_query scope", () => {
       }),
       NOW,
     );
-    expect(queries).toHaveLength(6);
+    // Request totals, series and the left-out agent tests; load and node totals and series.
+    expect(queries).toHaveLength(7);
     for (const query of queries) {
       expect(text(query)).toMatch(/"ownerUserId" = /);
       expect(values(query)).toContain("owner");
@@ -365,6 +369,79 @@ describe("metrics_query values", () => {
       "custom:x": [10],
     });
     expect(result.totals).toEqual({ cpu_pct: 50, memory_available_gb: 2 });
+  });
+
+  it("leaves tests (agent and Test page) out of the request metrics and counts them apart", async () => {
+    const queries = answer({
+      requestTotals: [{ g: "", requests: 2 }],
+      requestSeries: [{ t: minute(3), g: "", requests: 2 }],
+      tests: 3,
+    });
+    const input = { scope: { pool: "pool1" }, metrics: ["requests"], range: "1h", step: "1m" };
+    const result = await runMetricsQuery("owner", parse(input), NOW);
+    expect(metricsQueryOutputSchema.safeParse(result).success).toBe(true);
+    expect(result.series).toEqual([{ at: [3], values: { requests: [2] } }]);
+    expect(result.totals).toEqual({ requests: 2, tests: 3 });
+    expect(queries).toHaveLength(3);
+    const tests = queries.find((query) => text(query).includes("source IN ("));
+    for (const query of queries.filter((query) => query !== tests))
+      expect(text(query)).toContain(
+        `source NOT IN ('TEST'::"RequestSource", 'AGENT_TEST'::"RequestSource")`,
+      );
+    // The count reads the same pool, owner and range as the metrics: same filter but the source.
+    const filter = (query: unknown) =>
+      /FROM usage_rollup_minute WHERE (.*?)\) r\b/s
+        .exec(text(query))?.[1]
+        ?.replace(/source (NOT )?IN \([^)]*\)/, "<source>");
+    const totals = queries.find((query) => query !== tests && !text(query).includes("date_bin"));
+    expect(filter(tests)).toContain('"poolId" =');
+    expect(filter(tests)).toContain("<source>");
+    expect(filter(tests)).toBe(filter(totals));
+    expect(values(tests)).toEqual(values(totals));
+
+    // Hour and day steps count the hourly rows too.
+    const hourly = answer({ tests: 1 });
+    await runMetricsQuery("owner", parse({ ...input, range: "7d", step: "1h" }), NOW);
+    expect(hourly.find((query) => text(query).includes("source IN ("))).toSatisfy(
+      (query: unknown) => text(query).includes("usage_rollup_hour"),
+    );
+
+    // Only tests in the range: requests 0 and still the tests, so an agent sees why.
+    answer({ tests: 1 });
+    expect((await runMetricsQuery("owner", parse(input), NOW)).totals).toEqual({
+      requests: 0,
+      tests: 1,
+    });
+
+    // No tests: no `tests` key.
+    answer({ requestTotals: [{ g: "", requests: 2 }] });
+    expect((await runMetricsQuery("owner", parse(input), NOW)).totals).toEqual({ requests: 2 });
+  });
+
+  it("counts tests like any request when asked, and skips the count without request metrics", async () => {
+    const included = answer({ requestTotals: [{ g: "", requests: 5 }], tests: 3 });
+    const result = await runMetricsQuery(
+      "owner",
+      parse({
+        scope: { pool: "pool1" },
+        metrics: ["requests"],
+        range: "1h",
+        step: "1m",
+        includeTests: true,
+      }),
+      NOW,
+    );
+    expect(result.totals).toEqual({ requests: 5 });
+    expect(included.some((query) => text(query).includes("'TEST'"))).toBe(false);
+
+    const loadOnly = answer({ tests: 3 });
+    const load = await runMetricsQuery(
+      "owner",
+      parse({ scope: { pool: "pool1" }, metrics: ["kv_usage_max"], range: "1h", step: "1m" }),
+      NOW,
+    );
+    expect(load.totals).toEqual({});
+    expect(loadOnly.some((query) => text(query).includes("'TEST'"))).toBe(false);
   });
 
   it("reads the hourly rows only for hour and day steps", async () => {

@@ -88,10 +88,12 @@ describe("overview summary", () => {
     });
   });
 
-  it("scopes every read to the caller and leaves out agent tests", async () => {
+  it("scopes every read to the caller and leaves out tests (Test page and agent)", async () => {
     await overviewSummary("u1", "7d", NOW);
     for (const query of queries) {
-      expect(query.sql).toContain("<> 'AGENT_TEST'");
+      expect(query.sql).toContain(
+        `source NOT IN ('TEST'::"RequestSource", 'AGENT_TEST'::"RequestSource")`,
+      );
       expect(query.values).toContain("u1");
     }
     expect(queries[0]?.sql).toMatch(/\("ownerUserId" = \S+ OR "requesterUserId" = \S+\)/);

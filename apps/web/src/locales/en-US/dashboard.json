@@ -1391,8 +1391,8 @@
     "kpi": {
       "title": "Traffic",
       "description": {
-        "24h": "Your pools and runtimes, and your own requests, in the last 24 hours. Agent tests are left out.",
-        "7d": "Your pools and runtimes, and your own requests, in the last 7 days. Agent tests are left out."
+        "24h": "Your pools and runtimes, and your own requests, in the last 24 hours. Tests are left out.",
+        "7d": "Your pools and runtimes, and your own requests, in the last 7 days. Tests are left out."
       },
       "none": "—",
       "requests": "Requests",
