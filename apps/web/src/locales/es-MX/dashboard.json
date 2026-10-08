@@ -822,7 +822,12 @@
       "noMembers": "Sin miembros de nube.",
       "add": "Agregar un modelo de proveedor activo",
       "pickModel": "Elige un modelo de proveedor",
-      "noCandidates": "No hay modelos de proveedor activos de este tipo. Activa uno en Proveedores."
+      "noCandidates": "No hay modelos de proveedor activos de este tipo. Activa uno en Proveedores.",
+      "moveUp": "Subir {{member}}",
+      "moveDown": "Bajar {{member}}",
+      "externalNote": "Las solicitudes a {{id}} van a la nube cuando se agota la espera máxima del pool.",
+      "maxWait": "Espera máxima: {{value}} ({{source}}).",
+      "setOnAdvanced": "Configúrala en Avanzado"
     },
     "advanced": {
       "intro": "Estos ajustes son automáticos salvo que se sobrescriban. Los agentes pueden ajustarlos; cada cambio queda en el historial del pool.",
@@ -993,6 +998,59 @@
       "aria": "Peso de {{member}}",
       "save": "Fijar",
       "invalid": "Un número entero de 1 a 1000."
+    },
+    "contract": {
+      "title": "Contrato de embeddings",
+      "hint": "Los miembros de nube atienden los embeddings de este pool solo si producen los mismos vectores: mismo modelo, revisión, dimensiones, normalización y espacio vectorial.",
+      "required": "Completa este campo.",
+      "dimensionsInvalid": "Un número entero de 1 a 1,000,000.",
+      "fields": {
+        "model": "Modelo",
+        "revision": "Revisión",
+        "dimensions": "Dimensiones",
+        "normalization": "Normalización",
+        "vectorSpace": "Espacio vectorial"
+      },
+      "normalizations": {
+        "none": "Ninguna",
+        "l2": "L2"
+      },
+      "clear": "Quitar contrato"
+    },
+    "ownKey": {
+      "title": "Consentimiento de clave propia",
+      "hint": "Permite que quienes comparten contigo paguen las solicitudes :external con su propia clave de OpenRouter, solo para este modelo.",
+      "current": "Modelo con consentimiento:",
+      "none": "Sin consentimiento: quienes tienen acceso usan tus miembros de nube.",
+      "model": "Modelo de OpenRouter",
+      "save": "Dar consentimiento",
+      "withdraw": "Retirar",
+      "clears": "Cambiar o retirar el modelo borra la elección de clave propia de cada persona con acceso.",
+      "required": "Escribe un ID de modelo de OpenRouter (256 caracteres como máximo)."
+    },
+    "history": {
+      "title": "Historial",
+      "hint": "Cada cambio a este pool, de personas y agentes.",
+      "loadFailed": "No se pudo cargar el historial.",
+      "empty": "Aún no hay cambios.",
+      "more": "Mostrar más",
+      "actor": {
+        "USER": "Persona",
+        "AGENT": "Agente",
+        "SYSTEM": "Sistema"
+      },
+      "actions": {
+        "pool_create": "Pool creado",
+        "pool_update": "Configuración cambiada",
+        "pool_delete": "Pool eliminado",
+        "pool_fallback_mode": "Modo de nube cambiado",
+        "pool_fallback_paid_warm_protection": "Protección pagada de caché caliente cambiada",
+        "pool_fallback_own_key_equivalent": "Consentimiento de clave propia cambiado",
+        "pool_routing_own_hardware_only": "Solo mi hardware cambiado",
+        "pool_member_contribute": "Miembro contribuido",
+        "pool_member_withdraw": "Miembro contribuido quitado",
+        "pool_rule_delete": "Regla de enrutamiento eliminada"
+      }
     }
   },
   "runtime": {
