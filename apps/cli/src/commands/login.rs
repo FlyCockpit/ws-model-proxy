@@ -207,9 +207,19 @@ pub fn run(args: &Args) -> Result<()> {
         clear_refused = true;
     }
     let may_clear = wants_clear && !clear_refused;
-    // Not asked when the node will stay Relay only (rechecked under the lock).
-    let human_terminal = if lowering(&Config::load()?, prior, may_clear) == Lowering::Keep {
+    // Not asked when the node will stay Relay only (rechecked under the lock),
+    // nor from a process wsmp started while terminals are off: that "yes" would
+    // only be skipped (also rechecked under the lock).
+    let before = Config::load()?;
+    let mut terminal_skipped = false;
+    let human_terminal = if lowering(&before, prior, may_clear) == Lowering::Keep {
         choose_human_terminal(args, TrustValue::Relay)?
+    } else if let Some(reason) = started_by_wsmp
+        .filter(|_| args.human_terminal.is_none() && asks(args) && !before.allow_human_terminal)
+    {
+        output::diagnostic(terminal_skip_line(reason))?;
+        terminal_skipped = true;
+        None
     } else {
         choose_human_terminal(args, trust)?
     };
@@ -220,6 +230,8 @@ pub fn run(args: &Args) -> Result<()> {
     {
         let _lock = ConfigLock::exclusive()?;
         let mut config = Config::load()?;
+        // Shadowed on purpose: the outer choice stays as asked, so the "not
+        // asked" warning below stays quiet after a skip line.
         let (human_terminal, skipped) =
             terminal_choice(human_terminal, config.allow_human_terminal, started_by_wsmp);
         if let Some(line) = skipped {
@@ -294,7 +306,7 @@ pub fn run(args: &Args) -> Result<()> {
     let config = Config::load_required()?;
     let trust = crate::trust::configured(&config);
     let allow_human_terminal = config.allow_human_terminal;
-    if human_terminal.is_none() && trust == TrustValue::Full {
+    if human_terminal.is_none() && !terminal_skipped && trust == TrustValue::Full {
         output::diagnostic(format!(
             "warning: {}, so browser terminals stay {}; set them with `--human-terminal on|off` or `wsmp config set-human-terminal on|off`",
             if args.yes {
@@ -681,13 +693,7 @@ fn terminal_choice(
     started_by_wsmp: Option<&str>,
 ) -> (Option<bool>, Option<String>) {
     match (requested, started_by_wsmp) {
-        (Some(true), Some(reason)) if !saved => (
-            None,
-            Some(format!(
-                "skipped turning browser terminals on: {}; run `wsmp config set-human-terminal on` on a terminal",
-                crate::trust::refusal("wsmp config set-human-terminal on", reason)
-            )),
-        ),
+        (Some(true), Some(reason)) if !saved => (None, Some(terminal_skip_line(reason))),
         _ => (requested, None),
     }
 }
@@ -698,9 +704,14 @@ fn terminal_choice(
 fn service_skip(would_offer: bool, started_by_wsmp: Option<&str>) -> Option<String> {
     let reason = started_by_wsmp.filter(|_| would_offer)?;
     Some(format!(
-        "skipped installing the service: {}; run `wsmp service install` on a terminal",
-        crate::trust::refusal("wsmp service install", reason)
+        "skipped installing the service ({reason}); run `wsmp service install` on a terminal"
     ))
+}
+
+fn terminal_skip_line(reason: &str) -> String {
+    format!(
+        "skipped turning browser terminals on ({reason}); run `wsmp config set-human-terminal on` on a terminal"
+    )
 }
 
 /// A `[Y/n]` answer: empty takes `default`; anything else unclear is `None`.
@@ -721,13 +732,17 @@ fn offer_service(args: &Args, started_by_wsmp: Option<&str>) -> Result<bool> {
     if args.no_service {
         return Ok(false);
     }
-    if let Some(line) = service_skip(args.service || args.yes || interactive(), started_by_wsmp) {
+    // `--yes` takes the default only where a per-user service exists.
+    let yes_installs = args.yes && cfg!(any(target_os = "linux", target_os = "macos"));
+    if let Some(line) = service_skip(
+        args.service || yes_installs || interactive(),
+        started_by_wsmp,
+    ) {
         output::diagnostic(line)?;
         return Ok(false);
     }
-    // `--yes` takes the default only where a per-user service exists.
     let install = args.service
-        || (args.yes && cfg!(any(target_os = "linux", target_os = "macos")))
+        || yes_installs
         || (interactive()
             && matches!(
                 ask("Install as a service so it starts at boot? [Y/n]: ")?
@@ -764,10 +779,10 @@ mod tests {
         assert_eq!(choice, None);
         let line = line.expect("a skip line");
         assert!(
-            line.starts_with("skipped turning browser terminals on"),
+            line.starts_with("skipped turning browser terminals on ("),
             "{line}"
         );
-        assert!(line.contains("cannot run from a command, job or terminal wsmp started"));
+        assert!(line.contains("do not lead back to a terminal"));
         // Off, unchanged, or not asked: kept.
         assert_eq!(terminal_choice(Some(false), true, why), (Some(false), None));
         assert_eq!(terminal_choice(Some(true), true, why), (Some(true), None));
