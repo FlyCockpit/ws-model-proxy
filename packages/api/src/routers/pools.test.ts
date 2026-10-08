@@ -211,6 +211,13 @@ describe("pools.create", () => {
       userId: OWNER,
     });
     expect(db.pool.create).not.toHaveBeenCalled();
+
+    db.modelAlias.findFirst.mockResolvedValue(null);
+    db.pool.create.mockResolvedValue({ id: "pool-1", userId: OWNER, modelType: "LLM" } as never);
+    db.pool.findFirst.mockResolvedValue(poolRow() as never);
+    const view = await client().create({ slug: "chat", name: "C", type: "LLM" });
+    expect(view.callableIds).toEqual(["ann/chat"]);
+    expect(db.pool.create).toHaveBeenCalledTimes(1);
   });
 
   it("answers slug_taken", async () => {
