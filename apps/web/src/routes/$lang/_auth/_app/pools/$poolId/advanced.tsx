@@ -1,5 +1,6 @@
+import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import {
   POOL_ADVANCED_COLUMNS,
   POOL_ADVANCED_OVERRIDES,
@@ -13,15 +14,22 @@ import {
   CardHeader,
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
+import { Input } from "@ws-model-proxy/ui/components/input";
+import { Label } from "@ws-model-proxy/ui/components/label";
+import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { Trash2 } from "lucide-react";
+import { Trash2, TriangleAlert } from "lucide-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import z from "zod";
 
+import { FieldErrors } from "@/components/field-errors";
 import { InlineRetry } from "@/components/inline-retry";
 import { RegistryOverrideRow } from "@/components/registry-override-row";
 import type { PoolView } from "@/lib/pool-ui";
-import { refusalText } from "@/lib/refusal-text";
+import { refusalReason, refusalText } from "@/lib/refusal-text";
+import { SLUG_PATTERN } from "@/lib/slugify";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/pools/$poolId/advanced")({
@@ -85,6 +93,7 @@ function PoolAdvancedPage() {
         </Card>
       ))}
       <RulesCard pool={pool.data} />
+      <DangerZone pool={pool.data} />
     </div>
   );
 }
@@ -177,5 +186,234 @@ function RulesCard({ pool }: { pool: PoolView }) {
         )}
       </CardContent>
     </Card>
+  );
+}
+
+// ── Danger zone ──
+
+function DangerZone({ pool }: { pool: PoolView }) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  const [dialog, setDialog] = useState<"slug" | "delete" | null>(null);
+  return (
+    <Card className="border-destructive/50">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <TriangleAlert aria-hidden="true" className="size-4 text-destructive" />
+          {t("dashboard:pool.danger.title")}
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="flex min-w-0 flex-col divide-y">
+        <div className="flex min-w-0 flex-wrap items-center gap-3 pb-4">
+          <div className="min-w-0 flex-1 space-y-1">
+            <p className="text-sm font-medium">{t("dashboard:pool.danger.slug")}</p>
+            <p className="text-sm text-muted-foreground">
+              {t("dashboard:pool.danger.slugHint", { id: pool.callableIds[0] ?? pool.slug })}
+            </p>
+          </div>
+          <Button variant="outline" size="touch" onClick={() => setDialog("slug")}>
+            {t("dashboard:pool.danger.slugButton")}
+          </Button>
+        </div>
+        <div className="flex min-w-0 flex-wrap items-center gap-3 pt-4">
+          <div className="min-w-0 flex-1 space-y-1">
+            <p className="text-sm font-medium">{t("dashboard:pool.delete")}</p>
+            <p className="text-sm text-muted-foreground">{t("dashboard:pool.deleteHint")}</p>
+          </div>
+          <Button variant="destructive" size="touch" onClick={() => setDialog("delete")}>
+            {t("dashboard:pool.delete")}
+          </Button>
+        </div>
+      </CardContent>
+      {/* Mounted per opening, so each starts empty. */}
+      {dialog === "slug" ? <ChangeSlugDialog pool={pool} onClose={() => setDialog(null)} /> : null}
+      {dialog === "delete" ? (
+        <DeletePoolDialog pool={pool} onClose={() => setDialog(null)} />
+      ) : null}
+    </Card>
+  );
+}
+
+function ChangeSlugDialog({ pool, onClose }: { pool: PoolView; onClose: () => void }) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  const queryClient = useQueryClient();
+  const update = useMutation({
+    ...orpc.pools.update.mutationOptions(),
+    meta: { skipGlobalErrorToast: true },
+  });
+  const form = useForm({
+    defaultValues: { slug: "", confirm: "" },
+    validators: {
+      onSubmit: z
+        .object({
+          slug: z
+            .string()
+            .trim()
+            .regex(SLUG_PATTERN, t("dashboard:pool.form.slugInvalid"))
+            .refine((slug) => slug !== pool.slug, t("dashboard:pool.danger.slugSame")),
+          confirm: z.string(),
+        })
+        .refine((value) => value.confirm.trim() === value.slug.trim(), {
+          message: t("dashboard:pool.danger.slugConfirmMismatch"),
+          path: ["confirm"],
+        }),
+    },
+    onSubmit: async ({ value }) => {
+      try {
+        await update.mutateAsync({ poolId: pool.id, slug: value.slug.trim() });
+        await queryClient.invalidateQueries({ queryKey: orpc.pools.key() });
+        await queryClient.invalidateQueries({ queryKey: orpc.models.key() });
+        toast.success(t("dashboard:pool.danger.slugChanged"));
+        onClose();
+      } catch (error) {
+        toast.error(
+          refusalReason(error) === "alias_shadowed"
+            ? t("dashboard:pool.danger.slugAliased")
+            : refusalText(error),
+        );
+      }
+    },
+  });
+  const owner = pool.owner.slug;
+  return (
+    <ResponsiveDialog
+      open
+      onOpenChange={(next) => {
+        if (!next) onClose();
+      }}
+      title={t("dashboard:pool.danger.slugTitle")}
+      description={t("dashboard:pool.danger.slugWarning", { id: `${owner}/${pool.slug}` })}
+    >
+      <form
+        className="flex flex-col gap-4 pb-4"
+        onSubmit={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          form.handleSubmit();
+        }}
+      >
+        <form.Field name="slug">
+          {(field) => (
+            <div className="space-y-1.5">
+              <Label htmlFor="pool-new-slug">{t("dashboard:pool.danger.newSlug")}</Label>
+              <Input
+                id="pool-new-slug"
+                className="h-11 font-mono"
+                autoCapitalize="none"
+                autoComplete="off"
+                spellCheck={false}
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.value)}
+              />
+              <form.Subscribe selector={(state) => state.values.slug.trim()}>
+                {(slug) =>
+                  slug ? (
+                    <p className="break-all text-xs text-muted-foreground">
+                      {t("dashboard:pool.danger.newId", { id: `${owner}/${slug}` })}
+                    </p>
+                  ) : null
+                }
+              </form.Subscribe>
+              <FieldErrors field={field} />
+            </div>
+          )}
+        </form.Field>
+        <form.Field name="confirm">
+          {(field) => (
+            <div className="space-y-1.5">
+              <Label htmlFor="pool-new-slug-confirm">
+                {t("dashboard:pool.danger.slugConfirm")}
+              </Label>
+              <Input
+                id="pool-new-slug-confirm"
+                className="h-11 font-mono"
+                autoCapitalize="none"
+                autoComplete="off"
+                spellCheck={false}
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.value)}
+              />
+              <FieldErrors field={field} />
+            </div>
+          )}
+        </form.Field>
+        <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+          <Button type="button" variant="outline" size="touch" onClick={onClose}>
+            {t("common:actions.cancel")}
+          </Button>
+          <form.Subscribe
+            selector={(state) =>
+              [
+                state.isSubmitting,
+                state.values.slug.trim() !== "" &&
+                  state.values.confirm.trim() === state.values.slug.trim(),
+              ] as const
+            }
+          >
+            {([submitting, typed]) => (
+              <Button
+                type="submit"
+                variant="destructive"
+                size="touch"
+                disabled={submitting || !typed}
+              >
+                {submitting ? t("common:actions.saving") : t("dashboard:pool.danger.slugButton")}
+              </Button>
+            )}
+          </form.Subscribe>
+        </div>
+      </form>
+    </ResponsiveDialog>
+  );
+}
+
+function DeletePoolDialog({ pool, onClose }: { pool: PoolView; onClose: () => void }) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  const { lang } = Route.useParams();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const remove = useMutation({
+    ...orpc.pools.delete.mutationOptions(),
+    meta: { skipGlobalErrorToast: true },
+  });
+  return (
+    <ResponsiveDialog
+      open
+      onOpenChange={(next) => {
+        if (!next) onClose();
+      }}
+      title={t("dashboard:pool.deleteTitle", { name: pool.name })}
+      description={t("dashboard:pool.deleteHint")}
+      footer={
+        <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+          <Button variant="outline" size="touch" onClick={onClose}>
+            {t("common:actions.cancel")}
+          </Button>
+          <Button
+            variant="destructive"
+            size="touch"
+            disabled={remove.isPending}
+            onClick={async () => {
+              try {
+                await remove.mutateAsync({ poolId: pool.id });
+                onClose();
+                // Leave first: the deleted pool's own query must not refetch.
+                await navigate({ to: "/$lang/pools", params: { lang } });
+                await queryClient.invalidateQueries({ queryKey: orpc.pools.key() });
+                await queryClient.invalidateQueries({ queryKey: orpc.models.key() });
+                await queryClient.invalidateQueries({ queryKey: orpc.runtimes.key() });
+              } catch (error) {
+                toast.error(refusalText(error));
+              }
+            }}
+          >
+            {remove.isPending ? t("common:actions.deleting") : t("common:actions.delete")}
+          </Button>
+        </div>
+      }
+    >
+      <span />
+    </ResponsiveDialog>
   );
 }

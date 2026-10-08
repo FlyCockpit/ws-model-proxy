@@ -949,6 +949,21 @@
         "nameExternal": "Leave out :external; callers add it.",
         "nameRuntime": "Names starting with runtime: are for direct tests."
       }
+    },
+    "danger": {
+      "title": "Danger zone",
+      "slug": "Change the slug",
+      "slugHint": "Callers use {{id}} today.",
+      "slugButton": "Change slug",
+      "slugTitle": "Change the pool's slug?",
+      "slugWarning": "The callable ID {{id}} stops working at once. Every client, API key example and sidecar link that names it breaks until it uses the new ID.",
+      "newSlug": "New slug",
+      "newId": "New callable ID: {{id}}",
+      "slugConfirm": "Type the new slug again to confirm",
+      "slugSame": "That is the current slug.",
+      "slugConfirmMismatch": "The two slugs differ.",
+      "slugChanged": "Slug changed. Update your clients.",
+      "slugAliased": "A model-name alias already uses that callable ID. Pick another slug or remove the alias."
     }
   },
   "runtime": {

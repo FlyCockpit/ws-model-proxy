@@ -949,6 +949,21 @@
         "nameExternal": "No incluyas :external; quien llama lo agrega.",
         "nameRuntime": "Los nombres que empiezan con runtime: son para pruebas directas."
       }
+    },
+    "danger": {
+      "title": "Zona de peligro",
+      "slug": "Cambiar el identificador",
+      "slugHint": "Hoy se llama como {{id}}.",
+      "slugButton": "Cambiar identificador",
+      "slugTitle": "¿Cambiar el identificador del pool?",
+      "slugWarning": "El ID invocable {{id}} deja de funcionar de inmediato. Todo cliente, ejemplo de clave de API y enlace auxiliar que lo use fallará hasta que use el nuevo ID.",
+      "newSlug": "Nuevo identificador",
+      "newId": "Nuevo ID invocable: {{id}}",
+      "slugConfirm": "Escribe de nuevo el identificador para confirmar",
+      "slugSame": "Ese es el identificador actual.",
+      "slugConfirmMismatch": "Los dos identificadores no coinciden.",
+      "slugChanged": "Identificador cambiado. Actualiza tus clientes.",
+      "slugAliased": "Un alias de nombre de modelo ya usa ese ID invocable. Elige otro identificador o elimina el alias."
     }
   },
   "runtime": {
