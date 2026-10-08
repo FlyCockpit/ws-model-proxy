@@ -14,6 +14,7 @@ import { type ChangeEvent, type KeyboardEvent, useId, useRef, useState } from "r
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
+import { FieldErrors } from "@/components/field-errors";
 import { NativeSelect } from "@/components/native-select";
 import { SegmentedControl } from "@/components/segmented-control";
 import { TestErrorNotice } from "@/components/test/test-error";
@@ -88,8 +89,13 @@ export function ChatPanel({ target }: { target: TestTarget }) {
     },
     onSubmit: async ({ value, formApi }) => {
       const text = value.text.trim();
-      if (!text && attachments.length === 0) return;
       const sent = attachments.filter((attachment) => modalities[attachment.modality]);
+      if (sent.length !== attachments.length) {
+        // Attached before the API changed: say so rather than dropping them silently.
+        setNotice(t("dashboard:test.chat.attachments.notForApi"));
+        return;
+      }
+      if (!text && sent.length === 0) return;
       const estimate = new Blob([JSON.stringify({ messages: chat.messages, text, sent, system })])
         .size;
       if (estimate > TOTAL_REQUEST_HARD_MAX_BYTES) {
@@ -133,7 +139,13 @@ export function ChatPanel({ target }: { target: TestTarget }) {
           const result = await processImageFile(file, { maxBytes: attachmentMax });
           if (!result.ok) {
             problems.add(
-              t("dashboard:test.chat.attachments.tooLarge", { size: formatBytes(attachmentMax) }),
+              result.reason === "oversize"
+                ? t("dashboard:test.chat.attachments.tooLarge", {
+                    size: formatBytes(attachmentMax),
+                  })
+                : result.reason === "unsupported"
+                  ? t("dashboard:test.chat.attachments.unsupported")
+                  : t("dashboard:test.chat.attachments.unreadable", { name: file.name }),
             );
             continue;
           }
@@ -192,15 +204,18 @@ export function ChatPanel({ target }: { target: TestTarget }) {
         {target.surfaces.length > 1 ? (
           <div className="flex min-w-0 flex-col gap-2">
             <span className="text-sm font-medium">{t("dashboard:test.surface.label")}</span>
-            <SegmentedControl
-              ariaLabel={t("dashboard:test.surface.label")}
-              value={surface}
-              onChange={setChosenSurface}
-              items={target.surfaces.map((value) => ({
-                value,
-                label: t(SURFACE_LABEL_KEY[value]),
-              }))}
-            />
+            {/* The API stays put while an answer streams. */}
+            <fieldset disabled={busy} className="min-w-0">
+              <SegmentedControl
+                ariaLabel={t("dashboard:test.surface.label")}
+                value={surface}
+                onChange={setChosenSurface}
+                items={target.surfaces.map((value) => ({
+                  value,
+                  label: t(SURFACE_LABEL_KEY[value]),
+                }))}
+              />
+            </fieldset>
           </div>
         ) : (
           <p className="text-sm text-muted-foreground">
@@ -336,6 +351,7 @@ export function ChatPanel({ target }: { target: TestTarget }) {
                 placeholder={t("dashboard:test.chat.placeholder")}
                 rows={3}
               />
+              <FieldErrors field={field} />
             </div>
           )}
         </form.Field>
@@ -409,57 +425,63 @@ function Transcript({ messages }: { messages: TestChatMessage[] }) {
     );
   }
   return (
-    <ol className="flex min-w-0 flex-col gap-3" aria-live="polite">
-      {messages.map((message) => (
-        <li
-          key={message.id}
-          className={cn(
-            "flex min-w-0 flex-col gap-2 rounded-lg border p-3",
-            message.role === "user" ? "bg-muted/50 md:ms-12" : "md:me-12",
-          )}
-          data-role={message.role}
-        >
-          <p className="text-xs font-medium text-muted-foreground">
-            {message.role === "user"
-              ? t("dashboard:test.chat.you")
-              : t("dashboard:test.chat.model")}
-          </p>
-          {message.thinking ? (
-            <details
-              className="min-w-0 rounded-md bg-muted/60"
-              open={message.status === "streaming"}
-            >
-              <summary className="flex min-h-11 cursor-pointer items-center gap-2 px-3 text-sm">
-                <Brain aria-hidden="true" className="size-4 shrink-0" />
-                {t("dashboard:test.chat.reasoning")}
-              </summary>
-              <p className="whitespace-pre-wrap break-words px-3 pb-3 text-sm text-muted-foreground">
-                {message.thinking}
+    <>
+      <ol className="flex min-w-0 flex-col gap-3">
+        {messages.map((message) => (
+          <li
+            key={message.id}
+            className={cn(
+              "flex min-w-0 flex-col gap-2 rounded-lg border p-3",
+              message.role === "user" ? "bg-muted/50 md:ms-12" : "md:me-12",
+            )}
+            data-role={message.role}
+          >
+            <p className="text-xs font-medium text-muted-foreground">
+              {message.role === "user"
+                ? t("dashboard:test.chat.you")
+                : t("dashboard:test.chat.model")}
+            </p>
+            {message.thinking ? (
+              <details
+                className="min-w-0 rounded-md bg-muted/60"
+                open={message.status === "streaming"}
+              >
+                <summary className="flex min-h-11 cursor-pointer items-center gap-2 px-3 text-sm">
+                  <Brain aria-hidden="true" className="size-4 shrink-0" />
+                  {t("dashboard:test.chat.reasoning")}
+                </summary>
+                <p className="whitespace-pre-wrap break-words px-3 pb-3 text-sm text-muted-foreground">
+                  {message.thinking}
+                </p>
+              </details>
+            ) : null}
+            {message.content ? (
+              <p className="whitespace-pre-wrap break-words text-sm">{message.content}</p>
+            ) : null}
+            {message.attachments.length > 0 ? (
+              <p className="break-words text-xs text-muted-foreground">
+                {message.attachments.map((attachment) => attachment.name).join(", ")}
               </p>
-            </details>
-          ) : null}
-          {message.content ? (
-            <p className="whitespace-pre-wrap break-words text-sm">{message.content}</p>
-          ) : null}
-          {message.attachments.length > 0 ? (
-            <p className="break-words text-xs text-muted-foreground">
-              {message.attachments.map((attachment) => attachment.name).join(", ")}
-            </p>
-          ) : null}
-          {message.status === "streaming" && !message.content && !message.thinking ? (
-            <p className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2 aria-hidden="true" className="size-4 animate-spin" />
-              {t("dashboard:test.chat.waiting")}
-            </p>
-          ) : null}
-          {message.status === "stopped" ? (
-            <p className="text-xs text-muted-foreground">{t("dashboard:test.chat.stopped")}</p>
-          ) : null}
-          {message.error ? <TestErrorNotice error={message.error} /> : null}
-          {message.metrics ? <Metrics metrics={message.metrics} /> : null}
-        </li>
-      ))}
-    </ol>
+            ) : null}
+            {message.status === "streaming" && !message.content && !message.thinking ? (
+              <p className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 aria-hidden="true" className="size-4 animate-spin" />
+                {t("dashboard:test.chat.waiting")}
+              </p>
+            ) : null}
+            {message.status === "stopped" ? (
+              <p className="text-xs text-muted-foreground">{t("dashboard:test.chat.stopped")}</p>
+            ) : null}
+            {message.error ? <TestErrorNotice error={message.error} /> : null}
+            {message.metrics ? <Metrics metrics={message.metrics} /> : null}
+          </li>
+        ))}
+      </ol>
+      {/* One announcement per answer, not every streamed token. */}
+      <p className="sr-only" role="status">
+        {t(`dashboard:test.chat.announce.${messages.at(-1)?.status ?? "ready"}`)}
+      </p>
+    </>
   );
 }
 

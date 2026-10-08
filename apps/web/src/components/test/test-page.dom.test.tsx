@@ -240,6 +240,26 @@ describe("Test page", () => {
     expect(within(alert).getByText("max_tokens must be at most 4096")).toBeTruthy();
   });
 
+  it("leaves a failed exchange out of the next turn's history", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: "Too many requests." }), { status: 429 }),
+      )
+      .mockResolvedValueOnce(sse(['data: {"choices":[{"delta":{"content":"Fine."}}]}\n\n']));
+    renderPage();
+    const box = await screen.findByLabelText("dashboard:test.chat.message");
+    fireEvent.change(box, { target: { value: "first" } });
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:test.chat.send" }));
+    // The app's own guards answer { error: "..." }.
+    expect(await screen.findByText("Too many requests.")).toBeTruthy();
+    fireEvent.change(box, { target: { value: "second" } });
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:test.chat.send" }));
+    expect(await screen.findByText("Fine.")).toBeTruthy();
+    expect(JSON.parse(String(lastRequest().init.body)).messages).toEqual([
+      { role: "user", content: "second" },
+    ]);
+  });
+
   it("summarizes an embeddings answer", async () => {
     state.targets = [
       target({ model: "me/embed", label: "me/embed", type: "EMBEDDINGS", surfaces: [] }),

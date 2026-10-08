@@ -1515,7 +1515,15 @@
         "tooLarge": "Cada adjunto puede pesar como máximo {{size}}.",
         "list": "Adjuntos",
         "remove": "Quitar {{name}}",
-        "add": "Adjuntar"
+        "add": "Adjuntar",
+        "notForApi": "Algunos adjuntos no pueden ir con esta API. Quítalos o vuelve a la anterior.",
+        "unreadable": "No se pudo leer {{name}} como imagen."
+      },
+      "announce": {
+        "streaming": "El modelo está respondiendo.",
+        "ready": "La respuesta está completa.",
+        "error": "La solicitud falló.",
+        "stopped": "La respuesta se detuvo."
       }
     },
     "metrics": {

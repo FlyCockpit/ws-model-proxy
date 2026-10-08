@@ -128,6 +128,8 @@ export async function readTestError(response: Response): Promise<TestRequestErro
   const error = record(record(parsed)?.error);
   const message =
     str(error?.message) ??
+    // The app's own guards (rate limit, CSRF, body limit) answer `{ "error": "…" }`.
+    str(record(parsed)?.error) ??
     str(record(parsed)?.message) ??
     str(record(parsed)?.detail) ??
     (raw.trim().slice(0, RAW_ERROR_CHARS) || response.statusText || `HTTP ${response.status}`);
@@ -168,6 +170,23 @@ function dataUrlParts(dataUrl: string): { mediaType: string; data: string } {
   return { mediaType: match?.[1] ?? "application/octet-stream", data: match?.[2] ?? "" };
 }
 
+/** OpenAI's `input_audio` takes base64 wav or mp3; other audio goes as an `audio_url` data URL. */
+const INPUT_AUDIO_FORMATS: Record<string, string> = {
+  "audio/wav": "wav",
+  "audio/x-wav": "wav",
+  "audio/wave": "wav",
+  "audio/mpeg": "mp3",
+  "audio/mp3": "mp3",
+};
+
+function audioPart(dataUrl: string) {
+  const { mediaType, data } = dataUrlParts(dataUrl);
+  const format = INPUT_AUDIO_FORMATS[mediaType];
+  return format
+    ? { type: "input_audio", input_audio: { data, format } }
+    : { type: "audio_url", audio_url: { url: dataUrl } };
+}
+
 function chatCompletionsMessages(turns: TestChatTurn[], system: string) {
   const messages = turns.map((turn) => {
     if (!turn.attachments?.length) return { role: turn.role, content: turn.content };
@@ -179,7 +198,7 @@ function chatCompletionsMessages(turns: TestChatTurn[], system: string) {
           attachment.modality === "image"
             ? { type: "image_url", image_url: { url: attachment.dataUrl } }
             : attachment.modality === "audio"
-              ? { type: "input_audio_url", input_audio: { url: attachment.dataUrl } }
+              ? audioPart(attachment.dataUrl)
               : { type: "video_url", video_url: { url: attachment.dataUrl } },
         ),
       ],

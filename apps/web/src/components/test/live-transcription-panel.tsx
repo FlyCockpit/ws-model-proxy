@@ -1,5 +1,6 @@
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { CornerDownLeft, Mic, Square } from "lucide-react";
+import { useId } from "react";
 import { useTranslation } from "react-i18next";
 
 import { useRealtimeTranscription } from "@/hooks/use-realtime-transcription";
@@ -16,15 +17,16 @@ import {
  */
 export function LiveTranscriptionPanel({ model }: { model: string }) {
   const { t } = useTranslation(["dashboard"]);
-  const { state, start, commit, reset } = useRealtimeTranscription();
+  const { state, start, commit, stop } = useRealtimeTranscription();
+  const titleId = useId();
   const running = state.phase === "starting" || state.phase === "live";
   return (
     <section
       className="flex min-w-0 flex-col gap-3 rounded-lg border p-3"
-      aria-labelledby="test-live-title"
+      aria-labelledby={titleId}
     >
       <div className="min-w-0 space-y-1">
-        <h2 id="test-live-title" className="text-base font-semibold">
+        <h2 id={titleId} className="text-base font-semibold">
           {t("dashboard:test.live.title")}
         </h2>
         <p className="text-sm text-muted-foreground">{t("dashboard:test.live.description")}</p>
@@ -32,7 +34,7 @@ export function LiveTranscriptionPanel({ model }: { model: string }) {
       <div className="flex flex-wrap gap-2">
         {running ? (
           <>
-            <Button type="button" variant="destructive" size="touch" onClick={reset}>
+            <Button type="button" variant="destructive" size="touch" onClick={stop}>
               <Square aria-hidden="true" className="size-4" />
               {t("dashboard:test.live.stop")}
             </Button>
@@ -82,7 +84,7 @@ function TranscriptList({ items }: { items: RealtimeItem[] }) {
     return <p className="text-sm text-muted-foreground">{t("dashboard:test.live.empty")}</p>;
   }
   return (
-    <ol className="flex min-w-0 flex-col gap-2" aria-live="polite">
+    <ol className="flex min-w-0 flex-col gap-2">
       {items.map((item) => (
         <li key={item.id} className="min-w-0 rounded-md border p-3 text-sm">
           <p className="whitespace-pre-wrap break-words">

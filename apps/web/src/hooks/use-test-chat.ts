@@ -37,13 +37,21 @@ function newId(prefix: string) {
   return `${prefix}_${crypto.randomUUID()}`;
 }
 
-/** The finished turns sent as history (answers that failed or were stopped are left out). */
+/**
+ * The finished exchanges sent as history: a turn whose answer failed or was stopped is left out
+ * with its answer, so roles keep alternating (strict chat templates refuse two user turns).
+ */
 function historyTurns(messages: TestChatMessage[]): TestChatTurn[] {
-  return messages.flatMap((message) =>
-    message.status === "ready" && (message.content || message.attachments.length > 0)
-      ? [{ role: message.role, content: message.content, attachments: message.attachments }]
-      : [],
-  );
+  const turns: TestChatTurn[] = [];
+  for (let at = 0; at < messages.length; at += 1) {
+    const message = messages[at];
+    if (message?.role !== "user") continue;
+    const answer = messages[at + 1];
+    if (answer?.role !== "assistant" || answer.status !== "ready") continue;
+    turns.push({ role: "user", content: message.content, attachments: message.attachments });
+    turns.push({ role: "assistant", content: answer.content });
+  }
+  return turns;
 }
 
 /**
@@ -81,7 +89,10 @@ export function useTestChat() {
         attachments: [],
         status: "streaming",
       };
-      const turns = historyTurns([...messages, user]);
+      const turns: TestChatTurn[] = [
+        ...historyTurns(messages),
+        { role: "user", content: input.text, attachments: input.attachments },
+      ];
       setMessages((current) => [...current, user, answer]);
       const controller = new AbortController();
       abortRef.current = controller;

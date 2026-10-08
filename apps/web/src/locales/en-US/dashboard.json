@@ -1515,7 +1515,15 @@
         "tooLarge": "Attachments can be at most {{size}} each.",
         "list": "Attachments",
         "remove": "Remove {{name}}",
-        "add": "Attach"
+        "add": "Attach",
+        "notForApi": "Some attachments can't go with this API. Remove them or switch back.",
+        "unreadable": "Couldn't read {{name}} as an image."
+      },
+      "announce": {
+        "streaming": "The model is answering.",
+        "ready": "The answer is complete.",
+        "error": "The request failed.",
+        "stopped": "The answer was stopped."
       }
     },
     "metrics": {

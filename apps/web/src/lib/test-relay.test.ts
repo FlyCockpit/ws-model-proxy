@@ -106,6 +106,31 @@ describe("Test page requests", () => {
     });
   });
 
+  it("sends wav and mp3 as input_audio and other audio as an audio_url", () => {
+    const audio = (mime: string) => ({
+      ...IMAGE,
+      modality: "audio" as const,
+      dataUrl: `data:${mime};base64,UklG`,
+    });
+    const parts = (mime: string) =>
+      (
+        chatRequest({
+          surface: "OPENAI_CHAT_COMPLETIONS",
+          model: "m",
+          turns: [{ role: "user", content: "", attachments: [audio(mime)] }],
+          system: "",
+          reasoning: {},
+          maxTokens: 1,
+        }).body.messages as Array<{ content: unknown[] }>
+      )[0]?.content;
+    expect(parts("audio/wav")).toEqual([
+      { type: "input_audio", input_audio: { data: "UklG", format: "wav" } },
+    ]);
+    expect(parts("audio/ogg")).toEqual([
+      { type: "audio_url", audio_url: { url: "data:audio/ogg;base64,UklG" } },
+    ]);
+  });
+
   it("streams a Responses answer with its reasoning summary and token count", async () => {
     vi.stubGlobal(
       "fetch",
