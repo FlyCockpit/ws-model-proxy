@@ -16,13 +16,18 @@ import type { Prisma } from "@ws-model-proxy/db";
  * can only over-match, and the parse rejects those rows.
  *
  * Fail closed: a marker-matching row that cannot be parsed, or more candidates than the cap,
- * aborts the revoke (the transaction rolls back and the person retries) instead of reporting
- * a disconnect that may have missed a code.
+ * aborts the sweep (its transaction rolls back and the person retries) instead of reporting a
+ * disconnect that may have missed a code.
  */
 
-const BATCH = 200;
-/** A person holds a handful of pending codes (each lives minutes and needs a consent). */
-const TOTAL_CAP = 2_000;
+const BATCH = 500;
+/**
+ * A person holds a handful of pending codes (each lives minutes and needs a consent). The
+ * markers can over-match rows of other people whose authorize query names this person's id,
+ * so the bound is generous; the caller revokes tokens before sweeping, so even a crowded
+ * sweep cannot hold a disconnect back.
+ */
+const SCAN_CAP = 10_000;
 /** Real code values are a few KiB; the unbounded `state` parameter is the only large part. */
 const VALUE_MAX_LENGTH = 1024 * 1024;
 
@@ -30,7 +35,8 @@ const TYPE_MARKER = JSON.stringify({ type: "authorization_code" }).slice(1, -1);
 
 function incomplete() {
   return new ORPCError("CONFLICT", {
-    message: "Could not check every pending sign-in for this connection. Retry the request.",
+    message:
+      "Disconnected, but not every pending sign-in for this connection could be checked. Retry to finish.",
   });
 }
 
@@ -77,13 +83,18 @@ export async function sweepPendingAuthorizationCodes(
 ): Promise<number> {
   const markers = authorizationCodeMarkers(input.userId);
   const matched: string[] = [];
-  let cursor: string | undefined;
+  // Keyset pagination (`id > last`): a cursor row redeemed or deleted between pages must not
+  // end the scan early (a Prisma `cursor` on a vanished row returns nothing).
+  let lastId: string | undefined;
   for (let scanned = 0; ; ) {
     const rows = await tx.verification.findMany({
-      where: { expiresAt: { gt: input.now }, AND: markers },
+      where: {
+        expiresAt: { gt: input.now },
+        AND: markers,
+        ...(lastId === undefined ? {} : { id: { gt: lastId } }),
+      },
       orderBy: { id: "asc" },
       take: BATCH,
-      ...(cursor === undefined ? {} : { cursor: { id: cursor }, skip: 1 }),
       select: { id: true, value: true },
     });
     for (const row of rows) {
@@ -93,8 +104,8 @@ export async function sweepPendingAuthorizationCodes(
     }
     scanned += rows.length;
     if (rows.length < BATCH) break;
-    if (scanned >= TOTAL_CAP) throw incomplete();
-    cursor = rows[rows.length - 1]?.id;
+    if (scanned >= SCAN_CAP) throw incomplete();
+    lastId = rows[rows.length - 1]?.id;
   }
   if (matched.length === 0) return 0;
   const deleted = await tx.verification.deleteMany({

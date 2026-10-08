@@ -419,9 +419,8 @@ const oauthGrants = {
     if (!grant || isMcpPatClientId(grant.clientId))
       throw notFound("That key, token, connection, share or invite does not exist.");
     const now = new Date();
-    // Revoke every live token this client holds for the person, forget the consent (so
-    // reconnecting asks again) and drop the client's pending authorization codes, which could
-    // otherwise still be exchanged. Under the person's fence; every write names the person.
+    // Revoke every live token this client holds for the person and forget the consent (so
+    // reconnecting asks again), under the person's fence; every write names the person.
     await runAccessTransaction({ owners: [userId] }, async (tx) => {
       await tx.mcpGrant.updateMany({
         where: { id: grant.id, userId, revokedAt: null },
@@ -436,7 +435,6 @@ const oauthGrants = {
         data: { revoked: now },
       });
       await tx.oauthConsent.deleteMany({ where: { userId, clientId: grant.clientId } });
-      await sweepPendingAuthorizationCodes(tx, { userId, clientId: grant.clientId, now });
     });
     if (!grant.revokedAt) {
       await notifyRevoked(context, {
@@ -446,6 +444,12 @@ const oauthGrants = {
         clientId: grant.clientId,
       });
     }
+    // Then drop the client's pending authorization codes, which could otherwise still be
+    // exchanged. Its own step, so rows it cannot clear (fail closed: CONFLICT, retry) never
+    // hold back the token revocation above; a retry runs the whole revoke again.
+    await runAccessTransaction({ owners: [userId] }, (tx) =>
+      sweepPendingAuthorizationCodes(tx, { userId, clientId: grant.clientId, now }),
+    );
     return { ok: true as const };
   }),
 

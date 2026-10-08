@@ -443,7 +443,8 @@ describe("OAuth disconnect sweeps pending authorization codes", () => {
     db.verification.deleteMany.mockResolvedValue({ count: 1 });
     await client().oauthGrants.revoke({ grantId: "g1" });
 
-    expect(heldFences()).toEqual(["00:owner:owner"]);
+    // The revocation and the sweep each run under the person's fence.
+    expect(heldFences()).toEqual(["00:owner:owner", "00:owner:owner"]);
     const scan = db.verification.findMany.mock.calls[0]?.[0];
     expect(scan?.where).toMatchObject({
       AND: [
@@ -477,7 +478,7 @@ describe("OAuth disconnect sweeps pending authorization codes", () => {
     expect(db.mcpGrant.updateMany).toHaveBeenCalled();
   });
 
-  it("fails closed on a pending code it cannot read, and reports no disconnect", async () => {
+  it("fails closed on a pending code it cannot read, after revoking the tokens", async () => {
     grant();
     const onAccessRevoked = vi.fn();
     db.verification.findMany.mockResolvedValueOnce([
@@ -487,22 +488,48 @@ describe("OAuth disconnect sweeps pending authorization codes", () => {
       client(PERSON, { onAccessRevoked }).oauthGrants.revoke({ grantId: "g1" }),
     ).rejects.toMatchObject({ code: "CONFLICT" });
     expect(db.verification.deleteMany).not.toHaveBeenCalled();
-    expect(onAccessRevoked).not.toHaveBeenCalled();
+    // A crowded or unreadable sweep never holds back the disconnect itself.
+    expect(db.mcpGrant.updateMany).toHaveBeenCalled();
+    expect(db.oauthAccessToken.updateMany).toHaveBeenCalled();
+    expect(db.oauthConsent.deleteMany).toHaveBeenCalled();
+    expect(onAccessRevoked).toHaveBeenCalledTimes(1);
   });
 
-  it("pages through candidates and gives up loudly past the cap", async () => {
+  it("pages by id, so a code redeemed between pages cannot end the scan early", async () => {
     grant();
-    const page = (start: number) =>
-      Array.from({ length: 200 }, (_, index) => ({
-        id: `v${String(start + index).padStart(5, "0")}`,
+    const other = code("owner", "https://other.example.com/meta");
+    const firstPage = Array.from({ length: 500 }, (_, index) => ({
+      id: `v${String(index).padStart(5, "0")}`,
+      value: other,
+    }));
+    db.verification.findMany
+      .mockResolvedValueOnce(firstPage as never)
+      .mockResolvedValueOnce([{ id: "v99999", value: code("owner", CLIENT) }] as never);
+    db.verification.deleteMany.mockResolvedValue({ count: 1 });
+    await client().oauthGrants.revoke({ grantId: "g1" });
+    const second = db.verification.findMany.mock.calls[1]?.[0];
+    expect(second?.where).toMatchObject({ id: { gt: "v00499" } });
+    expect(second).not.toHaveProperty("cursor");
+    expect(second).not.toHaveProperty("skip");
+    expect(db.verification.deleteMany.mock.calls[0]?.[0]?.where).toMatchObject({
+      id: { in: ["v99999"] },
+    });
+  });
+
+  it("gives up loudly past the scan cap", async () => {
+    grant();
+    let page = 0;
+    db.verification.findMany.mockImplementation((async () => {
+      page += 1;
+      return Array.from({ length: 500 }, (_, index) => ({
+        id: `p${String(page).padStart(3, "0")}-${String(index).padStart(3, "0")}`,
         value: code("owner", "https://other.example.com/meta"),
       }));
-    db.verification.findMany.mockImplementation((async (args: { skip?: number }) =>
-      page(args.skip ? 1 : 0)) as never);
+    }) as never);
     await expect(client().oauthGrants.revoke({ grantId: "g1" })).rejects.toMatchObject({
       code: "CONFLICT",
     });
-    expect(db.verification.findMany.mock.calls[1]?.[0]).toMatchObject({ skip: 1 });
+    expect(db.verification.findMany).toHaveBeenCalledTimes(20);
     expect(db.verification.deleteMany).not.toHaveBeenCalled();
   });
 
