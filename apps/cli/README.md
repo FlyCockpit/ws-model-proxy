@@ -96,7 +96,10 @@ new code and a new name, or use a Replace code.
 Logging in over an earlier enrollment for another server, or over leftovers of wsmp 0.3, is a
 fresh enrollment: `--trust` (or your answer) applies and the old node name is not reused (you are
 asked for a name, or it comes from the hostname). A node you lowered to Relay only stays Relay
-only; raise it with `wsmp trust full`.
+only when you log in to the same server again; raise it with `wsmp trust full`. A Relay-only
+setting left by an earlier enrollment is kept too, unless this fresh enrollment explicitly chooses
+Full control (`--trust full`, or choosing it at the prompt): that clears it, and `wsmp login`
+says so. It is not cleared while a relay is running here; stop it first.
 
 ## Run the relay
 

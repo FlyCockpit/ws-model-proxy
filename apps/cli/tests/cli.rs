@@ -464,7 +464,9 @@ fn a_fresh_login_takes_the_chosen_trust_and_a_lowered_node_stays_lowered() {
         "--no-service",
         "--json",
     ]);
+    // A same-server re-login keeps the person's lowering, even with `--trust full`.
     assert_eq!(json_stdout(again)["trust"], "relay");
+    assert!(state.join("frozen-definitions.json").exists());
     server.join();
     // Not from a process wsmp started.
     cli(&config, &state)
@@ -532,6 +534,87 @@ fn a_login_over_leftover_0_3_state_is_a_fresh_enrollment() {
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(cfg["trust"], "full");
     assert_eq!(cfg["cliSlug"], "fresh-box");
+}
+
+/// A Relay-only setting an earlier enrollment (another server) left: a fresh
+/// enrollment keeps it without an explicit choice and clears it with
+/// `--trust full`.
+#[test]
+fn a_fresh_enrollment_clears_a_leftover_lowering_only_when_full_is_chosen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let frozen = state.join("frozen-definitions.json");
+    write_config(
+        &config,
+        json!({
+            "version": 1,
+            "serverUrl": "https://old.example.com",
+            "cliSlug": "old-box",
+            "trust": "full",
+            "endpoints": []
+        }),
+    );
+    cli(&config, &state)
+        .args(["trust", "relay"])
+        .assert()
+        .success();
+    assert!(frozen.exists());
+    let login = |extra: &[&str]| {
+        let server = TestServer::start(vec![
+            (
+                "/.well-known/wsmp",
+                200,
+                well_known("https://wsmp.example.com"),
+            ),
+            ("/api/node/enroll", 200, enrolled("fresh-box")),
+        ]);
+        let mut cmd = cli(&config, &state);
+        cmd.args([
+            "login",
+            &server.base_url,
+            "--code",
+            CODE,
+            "--slug",
+            "fresh-box",
+            "--no-service",
+            "--json",
+        ]);
+        cmd.args(extra);
+        let output = cmd.assert().success().get_output().clone();
+        server.join();
+        // Next login is to another server again: forget this enrollment.
+        fs::remove_file(state.join("node-credential.json")).unwrap();
+        let mut cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        cfg["serverUrl"] = "https://old.example.com".into();
+        cfg.as_object_mut().unwrap().remove("publicOrigin");
+        write_config(&config, cfg);
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        (value, String::from_utf8(output.stderr).unwrap())
+    };
+    // No explicit choice (no terminal, no `--trust`): stays Relay only.
+    let (value, stderr) = login(&[]);
+    assert_eq!(value["trust"], "relay");
+    assert!(
+        stderr.contains("pass `--trust full` to clear that"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("full control"), "{stderr}");
+    assert!(frozen.exists());
+    // An explicit `--trust relay` keeps it too.
+    let (value, _) = login(&["--trust", "relay"]);
+    assert_eq!(value["trust"], "relay");
+    assert!(frozen.exists());
+    // An explicit `--trust full` clears it, and says so.
+    let (value, stderr) = login(&["--trust", "full"]);
+    assert_eq!(value["trust"], "full", "{stderr}");
+    assert!(
+        stderr.contains("cleared the Relay-only setting"),
+        "{stderr}"
+    );
+    assert!(!frozen.exists());
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["trust"], "full");
 }
 
 #[test]

@@ -9,6 +9,10 @@
 //!    control, with a warning when nobody was asked), then browser
 //!    terminals (prompt on a terminal unless `--human-terminal`; default
 //!    yes; without a terminal the saved value, off unless set, is kept).
+//!    A person's lowering survives a same-server re-login. A Relay-only
+//!    setting an earlier enrollment left is kept too, unless this fresh
+//!    enrollment explicitly chooses Full (`--trust full` or the prompt),
+//!    which clears it.
 //! 4. Write `config.json` and `node-credential.json` (0600).
 //! 5. Offer the per-user service (`--service`/`--no-service`).
 //!
@@ -100,6 +104,7 @@ pub fn run(args: &Args) -> Result<()> {
     let saved = Config::load()?;
     let prior = prior_enrollment(
         saved.server_url.as_deref(),
+        saved.public_origin.as_deref(),
         saved.trust,
         crate::state::load_node_credential(),
         &[server_url.as_str(), public_origin.as_str()],
@@ -162,7 +167,8 @@ pub fn run(args: &Args) -> Result<()> {
             EnrollOutcome::Refused(refusal) => anyhow::bail!(refusal_message(&refusal)),
         }
     };
-    let trust = choose_trust(args, &known.origin)?;
+    let leftover = prior != Prior::SameServer && frozen_exists();
+    let (trust, explicit) = choose_trust(args, &known.origin, leftover)?;
     // Trust from a Relay-only node this one replaces: the server lowers it on
     // the first hello; start lowered so nothing Full-only runs before that.
     let trust = if enrolled.trust_lower_pending {
@@ -170,8 +176,22 @@ pub fn run(args: &Args) -> Result<()> {
     } else {
         trust
     };
+    // A fresh enrollment's explicit Full choice clears a Relay-only setting
+    // an earlier enrollment left, unless a running relay would undo it.
+    let may_clear = leftover
+        && explicit
+        && trust == TrustValue::Full
+        && match leftover_clear_refusal() {
+            None => true,
+            Some(reason) => {
+                output::diagnostic(format!(
+                    "not clearing the Relay-only setting an earlier enrollment left: {reason}"
+                ))?;
+                false
+            }
+        };
     // Not asked when the node will stay Relay only (rechecked under the lock).
-    let human_terminal = if keeps_relay(&Config::load()?, prior) {
+    let human_terminal = if lowering(&Config::load()?, prior, may_clear) == Lowering::Keep {
         choose_human_terminal(args, TrustValue::Relay)?
     } else {
         choose_human_terminal(args, trust)?
@@ -179,15 +199,27 @@ pub fn run(args: &Args) -> Result<()> {
     // Set only when this re-login changed it: a running relay needs a restart.
     let human_terminal_changed;
     let kept_relay;
+    let mut cleared = false;
     {
         let _lock = ConfigLock::exclusive()?;
         let mut config = Config::load()?;
         human_terminal_changed = config.server_url.is_some()
             && human_terminal.is_some_and(|allow| allow != config.allow_human_terminal);
-        let chosen = if keeps_relay(&config, prior) {
-            TrustValue::Relay
-        } else {
-            trust
+        let chosen = match lowering(&config, prior, may_clear) {
+            Lowering::Keep => TrustValue::Relay,
+            Lowering::Clear => match crate::runtime_store::unfreeze() {
+                Ok(()) => {
+                    cleared = true;
+                    trust
+                }
+                Err(error) => {
+                    output::diagnostic(format!(
+                        "warning: clearing the earlier Relay-only setting failed ({error:#})"
+                    ))?;
+                    TrustValue::Relay
+                }
+            },
+            Lowering::None => trust,
         };
         kept_relay = chosen != trust;
         if chosen == TrustValue::Relay {
@@ -209,10 +241,16 @@ pub fn run(args: &Args) -> Result<()> {
         server: server_url.clone(),
         credential: enrolled.credential.clone(),
     })?;
-    if kept_relay {
+    if cleared {
         output::diagnostic(
-            "this node stays Relay only: it was lowered on this machine before; raise it with `wsmp trust full` on a terminal",
+            "cleared the Relay-only setting an earlier enrollment left on this machine",
         )?;
+    } else if kept_relay {
+        output::diagnostic(if prior == Prior::SameServer {
+            "this node stays Relay only: it was lowered on this machine before; raise it with `wsmp trust full` on a terminal"
+        } else {
+            "this node stays Relay only: an earlier enrollment on this machine was lowered; pass `--trust full` to clear that, or raise it with `wsmp trust full` on a terminal"
+        })?;
     }
     let config = Config::load_required()?;
     let trust = crate::trust::configured(&config);
@@ -383,18 +421,27 @@ fn requested_slug(args: &Args, saved: Option<&str>) -> Result<String> {
     }
 }
 
-fn choose_trust(args: &Args, origin: &str) -> Result<TrustValue> {
+/// The trust to enroll with, and whether a person chose it (`--trust`, or an
+/// answer at the prompt) rather than it being the unattended default.
+/// `leftover`: an earlier enrollment left this machine Relay only.
+fn choose_trust(args: &Args, origin: &str, leftover: bool) -> Result<(TrustValue, bool)> {
     if let Some(trust) = args.trust {
-        return Ok(match trust {
-            TrustArg::Full => TrustValue::Full,
-            TrustArg::Relay => TrustValue::Relay,
-        });
+        return Ok((
+            match trust {
+                TrustArg::Full => TrustValue::Full,
+                TrustArg::Relay => TrustValue::Relay,
+            },
+            true,
+        ));
     }
     if !interactive() {
-        output::diagnostic(
-            "warning: no terminal to ask, so this node gives the server full control; lower it any time with `wsmp trust relay`",
-        )?;
-        return Ok(TrustValue::Full);
+        // With a leftover lowering the node stays Relay only (said later).
+        if !leftover {
+            output::diagnostic(
+                "warning: no terminal to ask, so this node gives the server full control; lower it any time with `wsmp trust relay`",
+            )?;
+        }
+        return Ok((TrustValue::Full, false));
     }
     let host = url::Url::parse(origin)
         .ok()
@@ -404,10 +451,15 @@ fn choose_trust(args: &Args, origin: &str) -> Result<TrustValue> {
     output::diagnostic(format!(
         "What may {host} do on this machine?\n  1) Full control (recommended for your own machines)\n     It can define and start model servers, run commands, read and write files in folders\n     you allow, and open terminals. Anyone who controls that server or your account can do\n     the same.\n  2) Relay only\n     It can only send requests to model servers on this machine, and start or stop the ones\n     already defined. Change later with `wsmp trust`."
     ))?;
+    if leftover {
+        output::diagnostic(
+            "  An earlier enrollment left this machine Relay only; choosing 1 clears that.",
+        )?;
+    }
     loop {
         match ask("Choice [1]: ")?.trim() {
-            "" | "1" => return Ok(TrustValue::Full),
-            "2" => return Ok(TrustValue::Relay),
+            "" | "1" => return Ok((TrustValue::Full, true)),
+            "2" => return Ok((TrustValue::Relay, true)),
             _ => output::diagnostic("type 1 or 2")?,
         }
     }
@@ -439,9 +491,12 @@ fn origin_of(url: &str) -> Option<String> {
 }
 
 /// `this_server` holds every name of the server being logged into (the URL
-/// given and its announced public origin).
+/// given and its announced public origin). The saved enrollment is this
+/// server when its URL or its pinned public origin is one of them (one
+/// server reached through another address).
 fn prior_enrollment(
     saved_server: Option<&str>,
+    saved_public: Option<&str>,
     saved_trust: Option<TrustValue>,
     credential: Result<Option<crate::state::NodeCredential>>,
     this_server: &[&str],
@@ -453,32 +508,76 @@ fn prior_enrollment(
                 .any(|name| origin_of(name).as_deref() == Some(origin.as_str()))
         })
     };
+    let saved_here = |server: &str| here(server) || saved_public.is_some_and(&here);
     match credential {
-        Ok(Some(credential)) if here(&credential.server) => Prior::SameServer,
+        Ok(Some(credential))
+            if here(&credential.server)
+                || (saved_server.and_then(origin_of) == origin_of(&credential.server)
+                    && saved_here(&credential.server)) =>
+        {
+            Prior::SameServer
+        }
         Ok(Some(_)) | Err(_) => Prior::Stale,
         // `wsmp logout` keeps the 0.4 config (it has `trust`): logging back
         // in to the same server is a re-login, not a fresh enrollment.
         Ok(None) => match saved_server {
             None => Prior::None,
-            Some(server) if saved_trust.is_some() && here(server) => Prior::SameServer,
+            Some(server) if saved_trust.is_some() && saved_here(server) => Prior::SameServer,
             Some(_) => Prior::Stale,
         },
     }
 }
 
-/// Whether a login must keep this node Relay only. A person's explicit
-/// lowering always holds: a frozen copy exists (every lowering writes one),
-/// or this same server's node was saved as `relay`. An absent trust (a 0.3
-/// config) is not a lowering, and a fresh enrollment takes the chosen trust.
-fn keeps_relay(config: &Config, prior: Prior) -> bool {
-    let frozen = crate::runtime_store::frozen_path()
+/// Whether a frozen copy exists (every lowering writes one); unknown reads as yes.
+fn frozen_exists() -> bool {
+    crate::runtime_store::frozen_path()
         .map(|path| path.exists())
-        .unwrap_or(true);
-    keeps_relay_with(frozen, prior, config.trust)
+        .unwrap_or(true)
 }
 
-fn keeps_relay_with(frozen: bool, prior: Prior, saved: Option<TrustValue>) -> bool {
-    frozen || (prior == Prior::SameServer && saved == Some(TrustValue::Relay))
+/// What a login does with an earlier Relay-only setting on this machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lowering {
+    /// Nothing to keep: the node takes the chosen trust.
+    None,
+    /// The node stays Relay only.
+    Keep,
+    /// A fresh enrollment's explicit Full choice: drop the frozen copy.
+    Clear,
+}
+
+/// A same-server re-login keeps a person's lowering: a frozen copy, or this
+/// server's node saved as `relay`. A fresh enrollment keeps a frozen copy
+/// unless `may_clear` (an explicit Full choice, no relay running). An
+/// absent trust (a 0.3 config) is not a lowering.
+fn lowering(config: &Config, prior: Prior, may_clear: bool) -> Lowering {
+    lowering_with(frozen_exists(), prior, config.trust, may_clear)
+}
+
+fn lowering_with(
+    frozen: bool,
+    prior: Prior,
+    saved: Option<TrustValue>,
+    may_clear: bool,
+) -> Lowering {
+    match prior {
+        Prior::SameServer if frozen || saved == Some(TrustValue::Relay) => Lowering::Keep,
+        Prior::None | Prior::Stale if frozen && may_clear => Lowering::Clear,
+        Prior::None | Prior::Stale if frozen => Lowering::Keep,
+        _ => Lowering::None,
+    }
+}
+
+/// Why this login may not clear an earlier lowering now: a relay running
+/// here keeps its Relay-only latch and writes `relay` back. (A process wsmp
+/// started never gets here: `wsmp login` refuses `WSMP_JOB` first.)
+fn leftover_clear_refusal() -> Option<&'static str> {
+    match crate::control::request_if_running(crate::control::ControlCommand::Status) {
+        Ok(None) => None,
+        Ok(Some(_)) | Err(_) => {
+            Some("a relay is running here; stop it, then raise with `wsmp trust full`")
+        }
+    }
 }
 
 /// The browser terminal setting to write: `Some` sets it, `None` keeps the
@@ -600,15 +699,19 @@ mod tests {
         let here = "https://models.example.com";
         let names = [here, "https://public.example.com"];
         let full = Some(TrustValue::Full);
-        assert_eq!(prior_enrollment(None, None, Ok(None), &names), Prior::None);
         assert_eq!(
-            prior_enrollment(Some(here), full, Ok(Some(credential(here))), &names),
+            prior_enrollment(None, None, None, Ok(None), &names),
+            Prior::None
+        );
+        assert_eq!(
+            prior_enrollment(Some(here), None, full, Ok(Some(credential(here))), &names),
             Prior::SameServer
         );
         // Another spelling of this server (as typed, or its public origin).
         assert_eq!(
             prior_enrollment(
                 Some(here),
+                None,
                 full,
                 Ok(Some(credential("https://public.example.com/"))),
                 &names
@@ -617,7 +720,7 @@ mod tests {
         );
         // After `wsmp logout`: the 0.4 config (with trust) stays, the credential goes.
         assert_eq!(
-            prior_enrollment(Some(here), full, Ok(None), &names),
+            prior_enrollment(Some(here), None, full, Ok(None), &names),
             Prior::SameServer
         );
         // Another server, a 0.3 credential (unreadable here), a 0.3 config
@@ -625,6 +728,7 @@ mod tests {
         assert_eq!(
             prior_enrollment(
                 Some(here),
+                None,
                 full,
                 Ok(Some(credential("https://old.example"))),
                 &names
@@ -632,39 +736,93 @@ mod tests {
             Prior::Stale
         );
         assert_eq!(
-            prior_enrollment(Some(here), None, Err(anyhow::anyhow!("0.3 format")), &names),
+            prior_enrollment(
+                Some(here),
+                None,
+                None,
+                Err(anyhow::anyhow!("0.3 format")),
+                &names
+            ),
             Prior::Stale
         );
         assert_eq!(
-            prior_enrollment(Some(here), None, Ok(None), &names),
+            prior_enrollment(Some(here), None, None, Ok(None), &names),
             Prior::Stale
         );
         assert_eq!(
-            prior_enrollment(Some("https://old.example"), full, Ok(None), &names),
+            prior_enrollment(Some("https://old.example"), None, full, Ok(None), &names),
+            Prior::Stale
+        );
+        // This server reached through another address: the saved enrollment
+        // pinned the public origin this server announces.
+        let lan = "http://10.0.0.5:3000";
+        let public = Some("https://public.example.com");
+        assert_eq!(
+            prior_enrollment(Some(lan), public, full, Ok(Some(credential(lan))), &names),
+            Prior::SameServer
+        );
+        assert_eq!(
+            prior_enrollment(Some(lan), public, full, Ok(None), &names),
+            Prior::SameServer
+        );
+        // A pinned origin of another server is not this one; nor is a
+        // credential for another server than the saved one.
+        assert_eq!(
+            prior_enrollment(
+                Some(lan),
+                Some("https://old.example"),
+                full,
+                Ok(Some(credential(lan))),
+                &names
+            ),
+            Prior::Stale
+        );
+        assert_eq!(
+            prior_enrollment(
+                Some(lan),
+                public,
+                full,
+                Ok(Some(credential("https://old.example"))),
+                &names
+            ),
             Prior::Stale
         );
     }
 
     #[test]
     fn only_an_explicit_lowering_keeps_a_login_relay_only() {
-        // A 0.3 config has no trust: not a lowering.
-        assert!(!keeps_relay_with(false, Prior::SameServer, None));
-        assert!(!keeps_relay_with(false, Prior::Stale, None));
-        // This server's node saved as relay stays relay; a fresh enrollment
-        // takes the chosen trust.
-        assert!(keeps_relay_with(
-            false,
-            Prior::SameServer,
-            Some(TrustValue::Relay)
-        ));
-        assert!(!keeps_relay_with(
-            false,
-            Prior::Stale,
-            Some(TrustValue::Relay)
-        ));
-        // A frozen copy is a person's lowering, whatever the server.
-        for prior in [Prior::None, Prior::SameServer, Prior::Stale] {
-            assert!(keeps_relay_with(true, prior, None));
+        let relay = Some(TrustValue::Relay);
+        for may_clear in [false, true] {
+            // A 0.3 config has no trust: not a lowering.
+            assert_eq!(
+                lowering_with(false, Prior::SameServer, None, may_clear),
+                Lowering::None
+            );
+            assert_eq!(
+                lowering_with(false, Prior::Stale, None, may_clear),
+                Lowering::None
+            );
+            // This server's node saved as relay stays relay, even when Full is
+            // asked for; a fresh enrollment takes the chosen trust.
+            assert_eq!(
+                lowering_with(false, Prior::SameServer, relay, may_clear),
+                Lowering::Keep
+            );
+            assert_eq!(
+                lowering_with(false, Prior::Stale, relay, may_clear),
+                Lowering::None
+            );
+            // A same-server re-login keeps a frozen copy.
+            assert_eq!(
+                lowering_with(true, Prior::SameServer, None, may_clear),
+                Lowering::Keep
+            );
+        }
+        // A fresh enrollment keeps a leftover frozen copy without an explicit
+        // Full choice, and clears it with one.
+        for prior in [Prior::None, Prior::Stale] {
+            assert_eq!(lowering_with(true, prior, relay, false), Lowering::Keep);
+            assert_eq!(lowering_with(true, prior, relay, true), Lowering::Clear);
         }
     }
 
