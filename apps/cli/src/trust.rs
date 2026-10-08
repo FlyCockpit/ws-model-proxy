@@ -159,8 +159,10 @@ pub fn self_started_by_wsmp() -> Option<&'static str> {
 }
 
 const STARTED: &str = "it or a parent process belongs to wsmp";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const USER_SERVICE: &str =
     "it runs in a service of your systemd user manager; run it from a terminal or an SSH session";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const UNTRACED: &str = "its parent processes do not lead back to a terminal or an SSH session";
 
 /// Whether `pid` was started by wsmp (a command, job, runtime or terminal),

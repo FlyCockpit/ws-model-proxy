@@ -5,11 +5,9 @@
 //! Secrets reach a unit through `systemd-run --setenv=NAME` (value taken from
 //! systemd-run's own environment), never on a command line.
 
-#[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -814,6 +812,7 @@ impl Runtime for NativeRuntime {
 
 /// `systemctl show` of a unit whose main process exited with status 0
 /// (`ExecMainCode=1` is CLD_EXITED; a signal is 2 or more).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn main_exited_cleanly(output: &str) -> bool {
     let fields = output
         .lines()

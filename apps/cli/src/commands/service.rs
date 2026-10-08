@@ -349,6 +349,7 @@ fn xml_escape(value: &str) -> String {
 
 /// A line of install output: stdout, or stderr when the caller's stdout
 /// carries JSON (`wsmp login --json`).
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 fn say(to_stderr: bool, text: impl std::fmt::Display) -> Result<()> {
     if to_stderr {
         output::diagnostic(text)

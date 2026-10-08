@@ -1772,7 +1772,6 @@ impl TerminalRegistry {
         }
         #[cfg(not(unix))]
         {
-            let _ = config;
             vec![*handshake_rejected(&handshake, REASON_UNSUPPORTED)]
         }
         #[cfg(unix)]

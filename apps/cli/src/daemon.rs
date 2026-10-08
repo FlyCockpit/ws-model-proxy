@@ -2008,7 +2008,7 @@ where
     }
     #[cfg(not(unix))]
     {
-        let _ = (rendered, config);
+        let _ = rendered;
         send_control(
             socket,
             &refusal(JobError::ExecutionMechanismUnavailable, None),

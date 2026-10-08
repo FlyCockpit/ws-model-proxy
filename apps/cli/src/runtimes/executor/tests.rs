@@ -386,6 +386,8 @@ fn health_hysteresis_marks_unhealthy_then_ready() {
     );
 }
 
+// The result frame comes from the runner, which is Unix-only.
+#[cfg(unix)]
 #[test]
 fn a_failed_health_probe_says_why() {
     let root = tempfile::tempdir().expect("root");
