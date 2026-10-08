@@ -3,7 +3,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDeep, mockReset } from "vitest-mock-extended";
 import type { PrismaClient } from "../../../db/prisma/generated/client";
 
-vi.mock("@ws-model-proxy/db", () => ({ default: mockDeep<PrismaClient>() }));
+vi.mock("@ws-model-proxy/db", () => ({
+  default: mockDeep<PrismaClient>(),
+  Prisma: { DbNull: "DbNull" },
+}));
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     BETTER_AUTH_URL: "https://proxy.example.com",
@@ -276,6 +279,11 @@ describe("runtimes.create", () => {
       engineLoadGate: "AUTO",
     });
     expect(db.runtimeModel.upsert).toHaveBeenCalledTimes(1);
+    // A later version replaces or clears what the definition says about each model.
+    expect(db.runtimeModel.upsert.mock.calls[0]?.[0].update).toMatchObject({
+      embeddingContract: "DbNull",
+      transcriptionProfile: "DbNull",
+    });
     expect(result.runtime.service).toBe(false);
     expect(result.version.version).toBe(1);
     expect(result.define).toEqual([]);

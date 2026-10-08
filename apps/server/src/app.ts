@@ -287,11 +287,8 @@ const endLoweredGrantWork = (event: AccessLevelLoweredEvent): Promise<void> =>
 onMcpGrantLevelLowered((event) => endLoweredGrantWork({ kind: "oauth_grant", ...event }));
 
 /**
- * The server hooks procedures may call (packages/api context). S0 wires the pool-routing
- * push; the lanes add theirs (credential revocation, relay pushes, live node state) next to
- * the procedures that need them.
- */
-/**
+ * The server hooks procedures may call (packages/api `ContextServices`).
+ *
  * `request`: the HTTP request the procedures serve (per-request services such as the invite
  * lookup limit need its client address); null for MCP, whose services are built once (no MCP
  * tool reaches those procedures, and they fail closed without the service).

@@ -14,23 +14,29 @@
 
 # WS Model Proxy
 
-Self-hosted web app plus CLI for exposing locally hosted OpenAI-compatible model endpoints through a VPS without router port forwarding.
+Self-hosted web app plus a node client (`wsmp`) that serves the models running on your own
+computers through one OpenAI-compatible API on a VPS, without router port forwarding.
 
-The 0.4.0 workflow uses durable recipe revisions and group-aware deployment plans.
-Open Dashboard → Deployments to edit recipes, preview a start/switch/stop plan, grant
-node deployment permission, or confirm an agent's supervised plan. A conflict on one
-rank stops the entire old group; unrelated groups remain serving. Measured memory
-budgets and port claims determine placement. Readiness gates publication, and
-unproven stops retain their claims.
+- **Nodes** are computers running `wsmp`. Each keeps one outbound websocket to the server and
+  gives it one trust level: **Full control** (the server may define and start runtimes, run
+  commands, edit files and open terminals there) or **Relay only** (it only relays requests to
+  the runtimes the node already holds, which people can still start and stop).
+- **Runtimes** are inference server definitions: **always-on** (an address on a node that is
+  just there) or **startable** (commands that start it on one or more nodes, from a preset such
+  as vLLM, SGLang or llama.cpp). Every edit is a new version; a start previews the placement
+  (free memory, ports, labels) before you confirm. **Profiles** switch a set of nodes between
+  runtime versions in one click.
+- **Pools** are what clients call: `owner/pool` routes to served models of your runtimes (and of
+  people who contribute theirs), and `owner/pool:external` may also use cloud **providers** under
+  a monthly cap when local runtimes are busy. Pools can be shared by e-mail; a person you share
+  with can use the pool, contribute their own runtimes to it, or both, and either side can stop.
+- **Agents** connect over MCP (OAuth or an agent token, Read-only or Full). With Full they can
+  define, start and stop runtimes and manage pools; raising a node's trust, provider accounts
+  and Forget stay with people.
 
-Friends can offer specific serving inference to your pools with explicit two-party
-consent, without granting shell or deployment control of their hardware. Either
-party can revoke. Pool listings require connected, published local service.
-`:external` is local-first; paid cache-only protection is separately opt-in and off
-by default. External embeddings require an exact vector-space identity contract.
-WMP keeps content-free usage/routing metadata, never chat content. Native Responses
-defaults to `store: false`; backend storage requires explicit caller opt-in.
-See [external fallback](docs/external-fallback.md).
+WMP keeps content-free usage and routing metadata, never chat content. Native Responses defaults
+to `store: false`; backend storage requires explicit caller opt-in. External embeddings need an
+exact vector-space contract. See [external fallback](docs/external-fallback.md).
 
 ## Current Direction
 
@@ -42,15 +48,17 @@ See [external fallback](docs/external-fallback.md).
 - Auth works with email/password even when SMTP is not configured. When SMTP
   is configured, email verification is required and the full verification UX
   (safe callback URLs, resend, localized mail) is enabled.
-- The `wsmp` CLI authenticates with device auth or an API token, then holds an outbound websocket connection to the server.
-- A single CLI instance can forward to multiple local or network model endpoints.
-- Request images are forwarded through the proxy request and not stored by the app.
+- A node logs in once with `wsmp login` and a one-time enrollment code from the **Nodes** page,
+  then holds an outbound websocket connection to the server.
+- One node can hold many runtimes, and a multi-node runtime spans several nodes.
+- Request media passes through the proxy. With upload storage configured, chat attachments are
+  kept only for the retention window an admin sets (Admin → Settings).
 
 ## Runtime Shape
 
 - `apps/web`: React/TanStack Router web dashboard.
 - `apps/server`: Hono API/server entrypoint.
-- `apps/cli`: Rust CLI workspace for the websocket relay client.
+- `apps/cli`: Rust workspace for `wsmp`, the node client.
 - `packages/api`: oRPC routers and procedures.
 - `packages/auth`: Better Auth configuration.
 - `packages/db`: Prisma schema/client.
@@ -74,7 +82,7 @@ pnpm dev
 Use the repository `pnpm db:push` wrapper for every schema application. It
 runs Prisma and then installs the database constraints/backfills in
 `packages/db/prisma/schema-hardening.sql`; invoking raw `prisma db push` alone
-is unsupported for deployments.
+is unsupported.
 
 ### Environment files
 
@@ -127,7 +135,7 @@ The usual way to install the CLI on a node is the server's own installer, which 
 curl -fsSL https://wsmp.example.com/install.sh | sh
 ```
 
-From the 0.4.0 release on, it installs the release binary of the server's version into `~/.cargo/bin` (`$CARGO_HOME/bin` when set) on Linux x86_64 and ARM64 (glibc 2.34 or newer) and macOS, after checking its SHA-256 against the release's `sha256.sum` (it refuses to install on a mismatch or a missing checksum). Other machines build the release tag from source with cargo (Rust 1.88 or newer). `WMP_CLI_RELEASE_BASE_URL` points it at a mirror of the release assets; `WMP_CLI_SOURCE_REV` makes it build that commit from source instead.
+From the 0.4.0 release on, it installs the release binary of the server's version into `~/.cargo/bin` (`$CARGO_HOME/bin` when set) on Linux x86_64 and ARM64 (glibc 2.34 or newer) and macOS, after checking its SHA-256 against the release's `sha256.sum` (it refuses to install on a mismatch or a missing checksum). Other systems build the release tag from source with cargo (Rust 1.88 or newer). `WMP_CLI_RELEASE_BASE_URL` points it at a mirror of the release assets; `WMP_CLI_SOURCE_REV` makes it build that commit from source instead.
 
 Alternatively, after the first release, install the CLI with Homebrew (remove it before using `/install.sh`, or it can shadow `~/.cargo/bin/wsmp` on your `PATH`):
 
@@ -170,7 +178,7 @@ pipeline, docs app, or separate queue process is required in v1.
 Required production values:
 
 - `DATABASE_URL`: Postgres connection string.
-- `BETTER_AUTH_SECRET`: 32+ byte random secret. Model API tokens, CLI tokens, durable device credentials, and Responses API sticky-routing digests derive purpose-specific HMAC keys from this value. Rotating it invalidates those credentials and sticky mappings.
+- `BETTER_AUTH_SECRET`: 32+ byte random secret. API keys, agent tokens, node credentials, enrollment codes, share invites, signed media URLs and the Responses and cache-affinity routing digests derive purpose-specific HMAC keys from this value. Rotating it invalidates all of those: every node must log in again with a new enrollment code, and every API key and agent token must be recreated.
 - `BETTER_AUTH_URL`: public HTTPS app URL.
 - `NODE_ENV=production`.
 
@@ -178,7 +186,7 @@ Optional values include SMTP settings (enables verification, password reset, and
 
 Schema sync is handled by the server container entrypoint with `APPLY_SCHEMA=off|safe|dangerous`; keep it `off` for normal deploys and use `safe` for additive schema deploys. Each release's notes say which setting it needs; see [`docs/release-notes/`](docs/release-notes/).
 
-### Deployment requirements
+### Server requirements
 
 - **Stop grace of at least 52 s.** On `SIGTERM` the server drains HTTP, closes relay sessions and stops its background sweeps, and exits within 47 s (`PROCESS_SHUTDOWN_DEADLINE_MS` in `apps/server/src/shutdown-timeouts.ts`). Docker's default stop grace is 10 s, which cuts that sequence short with `SIGKILL`. Use `docker stop -t 52`, compose `stop_grace_period: 52s` (the shipped `docker-compose.agent.yml` app services set it), or your platform's equivalent (for example Kubernetes `terminationGracePeriodSeconds: 52`).
 - **Database sessions run in UTC.** Every Prisma connection the server opens (all application queries, including the sweepers) is forced to `TimeZone=UTC` on connect (`packages/db/src/client-factory.ts`), whatever the URL options, `PGOPTIONS`, or role/database/server defaults say. Raw-SQL clocks (`now()`, `clock_timestamp()`) are compared with `timestamp without time zone` columns written from JavaScript in UTC, so do not change `TimeZone` from application SQL.
@@ -186,53 +194,65 @@ Schema sync is handled by the server container entrypoint with `APPLY_SCHEMA=off
 
 Schema sync never queues behind live traffic for long. `prisma db push` runs with a 5s `lock_timeout` and is retried as a whole on a lock timeout or deadlock (`packages/db/scripts/push-schema.mjs`). Schema hardening locks every table it touches up front with `NOWAIT` and retries until it gets them all at once, and it is skipped entirely when neither `schema-hardening.sql` nor the database catalog changed since its last apply (`SCHEMA_HARDENING_FORCE=1` re-applies anyway).
 
-CLI operator flow:
+Getting started (the **Get started** page walks through the same steps):
 
 1. Deploy the web service and Postgres.
 2. With public signup disabled, configure `ADMIN_EMAIL` before first use, then create the first admin from that address.
-3. On the **Nodes** page, choose **Add a node** and run the command it shows on the machine that can reach the local model endpoints. It installs `wsmp` through the server's `/install.sh` and logs in with a one-time install code.
+3. **Add a node**: on the **Nodes** page, choose **Add a node** and run the command it shows on
+   the computer that runs (or will run) your models. It installs `wsmp` through the server's
+   `/install.sh` and runs `wsmp login` with a one-time enrollment code, which asks for the trust
+   level and offers to install the per-user service. See [apps/cli/README.md](apps/cli/README.md).
+4. **Add a runtime**: on **Runtimes**, choose **New runtime**: a detected or always-on server
+   (an address on the node), or a preset (vLLM, SGLang, llama.cpp, ...) that the server starts
+   for you.
+5. **Create a pool** from one of the runtime's served models. Its callable ID (`you/pool`) is the
+   model name clients send.
+6. **Create an API key** under **Access → API keys**, and try the pool on the **Test** page.
 
 Model API clients call `/v1/*` with `Authorization: Bearer ...`. Cookie/session auth and permissive browser CORS are intentionally not supported for those bearer routes in v1.
 
 ### OpenAI-compatible client API
 
-Create an API token in the dashboard (API tokens), then use the public server URL as the
-OpenAI-compatible base URL. Browser-dashboard login cookies do not authenticate
-these routes.
+Create an API key under **Access → API keys** (for all your pools or selected ones), then use
+the public server URL as the OpenAI-compatible base URL. Browser login cookies do not
+authenticate these routes.
 
 ```sh
 export WSMP_SERVER_URL="https://models.example.invalid"
-export WSMP_MODEL_API_TOKEN="…"
+export WSMP_API_KEY="wsmp_key_…"
 curl --fail-with-body \
-  -H "Authorization: Bearer $WSMP_MODEL_API_TOKEN" \
+  -H "Authorization: Bearer $WSMP_API_KEY" \
   "$WSMP_SERVER_URL/v1/models"
 ```
 
 For OpenWebUI and other OpenAI-compatible clients, set the API base URL to
-`$WSMP_SERVER_URL/v1` and provide the same bearer token. Use the exact client
-model ID returned by `/v1/models`; dashboard labels and upstream model IDs are
-search aids, not always the client ID. `/v1/models` lists only ids this token
-can call now: live published local members, and `owner/pool:external` when
-the token has access.
+`$WSMP_SERVER_URL/v1` and provide the same key. The model name is a callable ID, exactly as
+the **Models** page and `/v1/models` show it: `owner/pool`, or `owner/pool:external` where the
+pool's cloud mode covers you. `/v1/models` lists the callable IDs this key may call. The public
+API serves pools only; to try one of your served models directly, use the **Test** page.
 
 Dedicated speech-to-text requests use `POST /v1/audio/transcriptions` (and
 translations use `/v1/audio/translations`) with the standard multipart OpenAI
-shape. This is protocol proxying to the configured upstream transcription
-server; it is separate from `input_audio` inside chat requests. WMP does not run
+shape. This is protocol proxying to the transcription runtimes in the pool; it is separate
+from `input_audio` inside chat requests. WMP does not run
 ASR, diarization, alignment, language detection, or transcoding. It forwards
 supported timestamps, diarization fields, provider extensions, response
-formats, and SSE bytes unchanged, while configured per-model capabilities
-control direct and pool eligibility.
+formats, and SSE bytes unchanged, while each served model's capabilities decide which pool
+members may take the request.
 
-### Why is my model missing from the dashboard?
+### Why is my model missing?
 
-1. On the node, run `wsmp status`. It must show a connected relay, and the
-   runtime among the runtimes the node holds (or, for a startable runtime, an
-   instance that is `ready`).
-2. Run `wsmp runtime test <slug>` on the node. It sends one small request to
-   the runtime and reports the status and latency; a runtime that does not
-   answer there is not executable from the server either.
-3. Check the intended account/org and dashboard search.
+1. **Is the node online?** The **Nodes** page shows it. On the node, `wsmp status` must show a
+   connected relay; if not, check `wsmp service status` and `wsmp service logs`.
+2. **Does the node hold the runtime?** `wsmp runtime list` on the node lists the runtimes and
+   instances it holds, with their phase. A startable runtime serves only while an instance is
+   `ready`: start it from its runtime page (or apply a profile), and read why a start failed
+   there or in `wsmp service logs`.
+3. **Does the runtime answer?** `wsmp runtime test <slug>` sends one small request from the node
+   and reports the status and latency. A runtime that does not answer there cannot serve through
+   the server either. The **Test** page tries the same served model from the browser.
+4. **Is it in a pool?** Clients and `/v1/models` see pools, never runtimes: add the served model
+   to a pool, and check that your API key covers that pool (**Access → API keys**).
 
 ## License
 

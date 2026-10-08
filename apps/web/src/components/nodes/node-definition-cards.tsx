@@ -37,6 +37,7 @@ import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
 import { Help } from "@/components/help";
+import { specIssueText } from "@/lib/spec-issue-text";
 import { orpc } from "@/utils/orpc";
 
 import { parseLabels } from "./add-node-dialog";
@@ -60,6 +61,16 @@ function useUpdateNode(successKey: string) {
     }),
     ...refusalToastOptions(t),
   });
+}
+
+/** Where the first metric-command issue is and what it says, in the active language. */
+function metricCommandsIssueDetail(
+  issue: { path: PropertyKey[]; message: string; params?: unknown } | undefined,
+): string {
+  if (!issue) return "";
+  const where = issue.path.map(String).join(".");
+  const text = specIssueText(issue);
+  return where ? `${where}: ${text}` : text;
 }
 
 /** Shown instead of a form when the node is Relay only. */
@@ -274,7 +285,7 @@ export function MetricCommandsCard({ node }: { node: NodeDetail }) {
             code: "custom",
             path: ["json"],
             message: t("dashboard:nodes.definition.metricCommandsInvalid", {
-              detail: result.error.issues[0]?.path.join(".") || result.error.issues[0]?.message,
+              detail: metricCommandsIssueDetail(result.error.issues[0]),
             }),
           });
       }),

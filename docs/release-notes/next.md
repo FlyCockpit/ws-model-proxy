@@ -41,8 +41,8 @@ redirects from the old routes (`/dashboard/**`, `/device`, `/admin/devices`,
 
 | 0.3 | 0.4.0 |
 |---|---|
-| CLI, device, machine | **Node**: a machine running `wsmp`, logged in to this server. |
-| Per-node feature switches (`set-deployments`, `set-mcp-commands`, `set-file-read`, `set-deployment-operator-terminal`, remote metric sources and engine adapters), MCP command modes, "Ask first"/supervised | **Trust**: one level per node, Full control or Relay only (below). |
+| CLI, device, machine | **Node**: a computer running `wsmp`, logged in to this server. |
+| Per-node capability switches (`set-deployments`, `set-mcp-commands`, `set-file-read`, `set-deployment-operator-terminal`, remote metric sources and engine adapters), MCP command modes, "Ask first"/supervised | **Trust**: one level per node, Full control or Relay only (below). The node's other `wsmp config` settings stay (file roots, file tools, browser terminals, runtime hosts; see [Relay protocol 3.0](#relay-protocol-30-upgrade-every-wsmp)). |
 | Endpoint, recipe, recipe revision, template, variant, deployment | **Runtime**: one inference server definition, either always-on (an address on a node) or startable (commands that start it on one or more nodes). Every edit is a new **version**. Built-in starting points are **presets**. |
 | Deployment instance, capacity | **Instance**: a running copy of a runtime on a node or a group of nodes. |
 | Deployment plan, layout, switch | **Profile**: a named set of runtime versions on a set of nodes; **Apply** is the one-click switch, with a preview you confirm. |
@@ -73,7 +73,7 @@ curl -fsSL https://wsmp.example.com/install.sh | sh && ~/.cargo/bin/wsmp login h
   matches; a missing checksum, a mismatch or a failed download stops the
   install. No Rust toolchain is needed. The binary lands in `~/.cargo/bin`
   (`$CARGO_HOME/bin` when that is set).
-- Other machines (musl, older glibc, other architectures) build the `v0.4.0`
+- Other systems (musl, older glibc, other architectures) build the `v0.4.0`
   tag from source with `cargo install`; they need Rust 1.88 or newer and a C
   toolchain (`cc`, for example `build-essential`).
 - `WMP_CLI_RELEASE_BASE_URL` points `/install.sh` at another copy of the
@@ -93,8 +93,8 @@ curl -fsSL https://wsmp.example.com/install.sh | sh && ~/.cargo/bin/wsmp login h
 - Codes expire after 1 hour by default (at most 7 days), can be revoked, and
   can be used by up to 50 nodes. A multi-use code can add labels to every node
   it enrolls.
-- **Replace codes** move an existing node to a new machine: same node, runtimes
-  and traffic, new identity and credential; the old machine's credential stops
+- **Replace codes** move an existing node to a new computer: same node, runtimes
+  and traffic, new identity and credential; the old computer's credential stops
   working. `wsmp login` names the node it replaces and asks you to confirm
   (`--replace` to skip the prompt). A Relay-only node stays Relay only after a
   Replace. A plain code never takes over an existing node name
@@ -133,10 +133,11 @@ capability switches `config set-mcp-commands`, `set-file-read`,
 and `set-deployment-operator-terminal`. Use `wsmp run`, `wsmp service` and
 `wsmp trust`; runtimes are defined in the web app or through MCP, not with the
 CLI. A 0.3 `config.json` `endpoints` list is ignored and dropped on the next
-write. The remaining `wsmp config` setters are `set-server`, `set-slug`,
-`set-runtime-hosts`, `set-file-roots` / `clear-file-roots`, `set-file-tools`,
-`set-file-tools-as-root`, `set-human-terminal`, `set-terminal-approval` and
-`set-max-terminals`.
+write. The rest of `wsmp config` stays: `path`, `init` and `show`, and the
+setters `set-server`, `set-slug`, `set-runtime-hosts`, `set-file-roots` /
+`clear-file-roots`, `set-file-tools`, `set-file-tools-as-root`,
+`set-human-terminal`, `set-terminal-approval` and `set-max-terminals` (see
+`wsmp config --help` and [apps/cli/README.md](../../apps/cli/README.md)).
 
 New on the node: `wsmp runtime list` (the runtimes and instances the node
 holds, with phase, ports, units and stop proof) and `wsmp runtime test
@@ -162,7 +163,7 @@ in the node's own configuration:
 - **Full control** (default): the server may define and start runtimes, run
   commands, read and write files inside the folders you allow, open terminals
   and set node secrets.
-- **Relay only**: the server may only send requests to the model servers on the
+- **Relay only**: the server may only send requests to the runtimes on the
   node and start or stop the runtimes it already holds. Definitions are frozen
   when trust is lowered; nothing new can be defined, run or read, and running
   node commands are stopped. People can still start and stop those runtimes
@@ -261,7 +262,7 @@ What does not hold:
 - On a browser's first use of a node there is no earlier pin to compare with;
   check the fingerprint if it matters.
 
-If that is not acceptable for a machine, do not type its sudo password into a
+If that is not acceptable for a node, do not type its sudo password into a
 web terminal: give the exact command a `NOPASSWD` sudoers rule instead, and use
 Full control only where trusting the server with a shell is fine.
 
@@ -398,5 +399,5 @@ refunded), and 20 exchanges per code owner per hour, successes included.
 - **Removed:** every `RATE_LIMIT_*` variable, `MODEL_API_ANTHROPIC_ENABLED`,
   `MODEL_API_GLOBAL_CAPACITY_ENABLED`, `MODEL_API_PROTOCOL_ADAPTATION_ENABLED`.
 
-Run `pnpm env:check` against your deployment's variable list, or compare it
+Run `pnpm env:check` against your server's variable list, or compare it
 with the regenerated `.env.example`.

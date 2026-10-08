@@ -8,10 +8,7 @@ import {
   getConfiguredMediaAttachmentMaxBytes,
   resolveAttachmentLimit,
 } from "@ws-model-proxy/api/lib/media-attachment-limits";
-import {
-  normalizeTranscriptionCapabilities,
-  openAiCapabilitiesFromCoarse,
-} from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import { normalizeTranscriptionCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import {
   buildPoolRouteSequence,
   isRetryableTargetRelayFailure,
@@ -165,6 +162,7 @@ import {
 } from "./media-transform.js";
 import { applyMetricRoutingVerdicts } from "./metric-routing-order.js";
 import {
+  externalModelListFlags,
   multimodalFlagsFromCapabilities,
   openAiModelListExtensions,
   poolModelListFlags,
@@ -269,6 +267,7 @@ import {
   storedResponseUnavailable,
   unsupportedCapabilityMessage,
 } from "./responses-storage.js";
+import { servedModelCapabilities } from "./served-model-capabilities.js";
 import {
   isBasicTranscriptionRequest,
   TranscriptionRequestError,
@@ -1517,19 +1516,6 @@ async function transcriptionUploadLimitResponse({
 
 function relayRequestHeaders(request: Request): Headers {
   return nativeRequestHeaders(request, "openai");
-}
-
-/**
- * A served model's request capabilities: its effective coarse capabilities (the owner's
- * override, else detected) with its embedding vector-space contract. Surface-level (v3/v4)
- * metadata such as Anthropic Messages is not modelled on RuntimeModel yet.
- */
-function servedModelCapabilities(model: RouteServedModel): OpenAiCompatibleCapabilities {
-  const capabilities = openAiCapabilitiesFromCoarse(model.capabilities);
-  const contract = parseEmbeddingContract(model.embeddingContract);
-  if (capabilities.version === 1 && capabilities.embeddings && contract)
-    return { ...capabilities, embeddings: { ...capabilities.embeddings, contract } };
-  return capabilities;
 }
 
 function effectiveDirectCapabilities(row: ContextCountModelRow): OpenAiCompatibleCapabilities {
@@ -3676,9 +3662,7 @@ async function modelListResponse(
       const model = routes[0]?.model;
       directFlagsById.set(
         test.id,
-        multimodalFlagsFromCapabilities(
-          model ? openAiCapabilitiesFromCoarse(model.capabilities) : null,
-        ),
+        multimodalFlagsFromCapabilities(model ? servedModelCapabilities(model) : null),
       );
     }),
   );
@@ -3710,12 +3694,12 @@ async function modelListResponse(
       }),
       ...targets.pools.flatMap((pool) => {
         const flags = poolFlagsById.get(pool.id) ?? multimodalFlagsFromCapabilities(null);
-        const entry = (id: string) => ({
+        const entry = (id: string, entryFlags = flags) => ({
           id,
           object: "model" as const,
           created: 0,
           owned_by: pool.ownerUserSlug,
-          ...openAiModelListExtensions(flags),
+          ...openAiModelListExtensions(entryFlags),
         });
         const plain = servingPoolIds.has(pool.id) ? [entry(pool.modelId)] : [];
         // `owner/pool:external` is listed only when this caller could be served
@@ -3733,7 +3717,9 @@ async function modelListResponse(
             requester: external.requester,
             pool,
           }).granted;
-        return externalListed ? [...plain, entry(externalModelId(pool.modelId))] : plain;
+        return externalListed
+          ? [...plain, entry(externalModelId(pool.modelId), externalModelListFlags(flags))]
+          : plain;
       }),
       // The caller's aliases, listed like the pool they name (hard-coded harness names).
       ...(targets.aliases ?? []).flatMap((alias) => {

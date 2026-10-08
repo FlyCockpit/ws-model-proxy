@@ -47,13 +47,15 @@ type Filters = {
   since: { range: RangeKey; iso: string } | null;
 };
 const NO_FILTERS: Filters = { poolId: "", runtimeId: "", versionId: "", nodeId: "", since: null };
+/** `RelayRequest.rejection` values the server writes (model-api `rejectionForFailure`). */
 const KNOWN_REASONS = new Set([
-  "over_capacity",
-  "wait_expired",
+  "capacity_wait_expired",
+  "capacity_lease_lost",
   "context_too_large",
-  "no_member",
-  "cloud_cap_reached",
-  "unauthorized_external",
+  "not_found",
+  "unsupported_capability",
+  "access_denied",
+  "disconnected",
 ]);
 
 type RequestRow = {

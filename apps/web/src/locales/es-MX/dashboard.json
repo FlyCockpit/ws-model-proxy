@@ -36,7 +36,7 @@
   "pages": {
     "welcome": {
       "title": "Primeros pasos",
-      "description": "Agrega un nodo, agrega tus servidores de modelos, crea un pool, conecta un agente y crea una clave de API."
+      "description": "Agrega un nodo, agrega tus runtimes, crea un pool, conecta un agente y crea una clave de API."
     },
     "overview": {
       "title": "Resumen",
@@ -108,7 +108,7 @@
     },
     "nodes": {
       "title": "Nodos",
-      "description": "Tus equipos con wsmp: confianza, hardware y lo que corre ahí."
+      "description": "Tus computadoras con wsmp: confianza, hardware y lo que corre ahí."
     },
     "nodeDetail": {
       "title": "Nodo",
@@ -209,7 +209,7 @@
       "addNode": "Agregar nodo",
       "loadFailed": "No se pudieron cargar tus nodos.",
       "emptyTitle": "Aún no hay nodos",
-      "emptyDescription": "Un nodo es una máquina que ejecuta wsmp. Agrégalo con un comando de instalación de una línea; aparece aquí cuando se conecta."
+      "emptyDescription": "Un nodo es una computadora que ejecuta wsmp. Agrégalo con un comando de instalación de una línea; aparece aquí cuando se conecta."
     },
     "card": {
       "hardware": "Hardware",
@@ -224,13 +224,13 @@
     },
     "add": {
       "title": "Agregar un nodo",
-      "description": "Ejecuta un comando en la máquina. El código que contiene es tu aprobación: los nodos que lo usan se unen a tu cuenta sin otro clic.",
+      "description": "Ejecuta un comando en la computadora. El código que contiene es tu aprobación: los nodos que lo usan se unen a tu cuenta sin otro clic.",
       "replaceTitle": "Reemplazar {{slug}}",
-      "replaceDescription": "Ejecútalo en la máquina nueva (o tras reinstalar). Toma los runtimes, etiquetas y ajustes de este nodo, y el inicio de sesión anterior deja de funcionar.",
-      "howMany": "Cuántas máquinas",
-      "modeOne": "Una máquina",
-      "modeMany": "Varias máquinas",
-      "maxUses": "Hasta cuántas máquinas",
+      "replaceDescription": "Ejecútalo en la computadora nueva (o tras reinstalar). Toma los runtimes, etiquetas y ajustes de este nodo, y el inicio de sesión anterior deja de funcionar.",
+      "howMany": "Cuántos nodos",
+      "modeOne": "Un nodo",
+      "modeMany": "Varios nodos",
+      "maxUses": "Hasta cuántos nodos",
       "maxUsesInvalid": "Entre 2 y 50.",
       "ttl": "Código válido por",
       "ttlOption": {
@@ -251,7 +251,7 @@
       "commandLabel": "Comando de instalación",
       "secretOnce": "Este código se muestra una sola vez.",
       "installsWhere": "Instala wsmp en ~/.cargo/bin ($CARGO_HOME/bin si está definido). Cuando el servidor ofrece compilaciones publicadas, Linux (x86_64 o ARM64, glibc 2.34 o posterior) y macOS reciben un binario verificado con suma de verificación; si no, compila wsmp desde el código fuente, lo que requiere Rust 1.88 o posterior.",
-      "terminalsAsked": "Con control total, `wsmp login` luego pregunta si se permiten terminales del navegador en esa máquina (sí, de forma predeterminada). Solo la máquina puede cambiarlo más adelante, con `wsmp config set-human-terminal on|off`.",
+      "terminalsAsked": "Con control total, `wsmp login` luego pregunta si se permiten terminales del navegador en ese nodo (sí, de forma predeterminada). Solo el nodo puede cambiarlo más adelante, con `wsmp config set-human-terminal on|off`.",
       "waiting": "Esperando a que el nodo se conecte…",
       "joined": "{{slug}} se unió",
       "joinedDeleted": "Un nodo se unió y ya fue quitado",
@@ -259,11 +259,11 @@
       "expiresIn": "Vence en {{time}}.",
       "expired": "Este código venció; obtén uno nuevo.",
       "newCode": "Código nuevo",
-      "onMachine": "Qué pasa en la máquina",
+      "onMachine": "Qué pasa en la computadora",
       "machineSteps": {
         "install": "El script instala wsmp (dónde y cómo, abajo).",
-        "login": "`wsmp login` usa el código: la máquina se une a tu cuenta como nodo, sin otra aprobación.",
-        "trust": "Pregunta cuánto control tiene este servidor: control total (el predeterminado) o solo retransmisión, donde los agentes no pueden cambiar nada en la máquina.",
+        "login": "`wsmp login` usa el código: la computadora se une a tu cuenta como nodo, sin otra aprobación.",
+        "trust": "Pregunta cuánto control tiene este servidor: control total (el predeterminado) o solo retransmisión, donde los agentes no pueden cambiar nada en el nodo.",
         "service": "Ofrece instalar un servicio de usuario para que el nodo arranque al iniciar el sistema."
       },
       "readingHardware": "Conectado. Leyendo su hardware…"
@@ -325,7 +325,7 @@
       "nameTooLong": "Máximo 120 caracteres.",
       "replace": "Reemplazar",
       "deleteTitle": "Eliminar nodo",
-      "deleteDescription": "Sus runtimes siempre activos se van, todo lo reservado en él se libera y los runtimes con una parte en él se detienen. La máquina no se modifica.",
+      "deleteDescription": "Sus runtimes siempre activos se van, todo lo reservado en él se libera y los runtimes con una parte en él se detienen. La computadora no se modifica.",
       "typeSlug": "Escribe el slug del nodo para confirmar",
       "deleted_one": "Nodo eliminado; {{count}} runtime detenido.",
       "deleted_other": "Nodo eliminado; {{count}} runtimes detenidos."
@@ -337,7 +337,7 @@
       "changed": "Cambió",
       "lower": "Bajar a solo retransmisión",
       "lowerTitle": "¿Bajar {{slug}} a solo retransmisión?",
-      "lowerDescription": "Esto queda fijo en el nodo. Solo ejecutar `wsmp trust full` en la máquina lo vuelve a subir.",
+      "lowerDescription": "Esto queda fijo en el nodo. Solo ejecutar `wsmp trust full` en el nodo lo vuelve a subir.",
       "keepsRunning": "Sigue corriendo, congelado",
       "nothingFrozen": "No hay definiciones ni comandos de métricas en este nodo.",
       "running": "en ejecución",
@@ -449,7 +449,7 @@
       "delete": "Eliminar {{name}}",
       "deleted": "Secreto eliminado.",
       "offline": "El nodo está sin conexión. Los secretos solo se envían a un nodo conectado.",
-      "relayHint": "Este nodo es solo retransmisión. Configura los secretos en la máquina:",
+      "relayHint": "Este nodo es solo retransmisión. Configura los secretos en el nodo:",
       "deleteTitle": "¿Eliminar {{name}}?",
       "deleteDescription": "Los comandos y runtimes que lo usan dejan de recibirlo. No se puede mostrar ni recuperar."
     },
@@ -649,7 +649,8 @@
     "alias_limit": "Demasiados alias. Elimina uno primero.",
     "alias_key_not_allowed": "Esa clave no puede llamar a este pool. Agrega el pool a la clave primero.",
     "always_on_runtime": "Un runtime siempre activo se ejecuta por su cuenta; no hay nada que iniciar.",
-    "fabric_port_ranges_disjoint": "Los rangos de puertos de estos nodos no comparten ningún puerto; haz que se superpongan."
+    "fabric_port_ranges_disjoint": "Los rangos de puertos de estos nodos no comparten ningún puerto; haz que se superpongan.",
+    "identity_mismatch": "El nodo presentó una clave de identidad distinta."
   },
   "models": {
     "loadFailed": "No se pudieron cargar tus modelos.",
@@ -662,7 +663,7 @@
     "emptyHint": "Crea un pool y agrégale un modelo servido. Su ID invocable aparecerá aquí.",
     "goToPools": "Ir a pools",
     "external": ":external",
-    "externalHint": "puede usar modelos en la nube cuando la capacidad local está ocupada",
+    "externalHint": "puede usar modelos en la nube cuando los runtimes locales están ocupados",
     "yourPool": "Tu pool",
     "sharedBy": "Compartido por {{owner}}",
     "snippet": "Solicitud de ejemplo",
@@ -757,7 +758,7 @@
       "unreachable": "No se pudo contactar al proveedor.",
       "invalid_credential": "El proveedor rechazó la clave.",
       "insufficient_permission": "No se pudo confirmar: la clave quizá no lista modelos, pero puede funcionar.",
-      "unverified": "No se pudo confirmar: este punto de acceso responde sin revisar claves.",
+      "unverified": "No se pudo confirmar: esta URL responde sin revisar claves.",
       "unexpected_status": "El proveedor dio una respuesta inesperada."
     },
     "details": "Cuenta",
@@ -872,7 +873,7 @@
     "canContribute": "Puede contribuir",
     "callAsHint": "Usa esto como nombre de modelo con una clave de API.",
     "members": "Miembros",
-    "membersHint": "Modelos servidos a los que enruta este pool. Las solicitudes van a miembros con capacidad libre.",
+    "membersHint": "Modelos servidos a los que enruta este pool. Las solicitudes van a miembros con un espacio libre.",
     "noMembers": "Aún no hay miembros. Agrega un modelo servido abajo.",
     "memberStatus": {
       "serving": "Sirviendo",
@@ -1017,13 +1018,13 @@
       "deleteRule": "Eliminar regla {{rule}}",
       "values": {
         "tokenizer": "Tokenizador",
-        "template_aware": "Con plantilla",
+        "template_aware": "Tokenizador con plantilla de chat",
         "engine_reported": "Reportado por el motor",
         "conservative_estimate": "Estimación conservadora",
         "calibrated_estimate": "Estimación calibrada",
         "AUTO": "Automático",
         "ENFORCE": "Aplicar",
-        "OBSERVE": "Solo observar",
+        "OBSERVE": "Solo registrar",
         "equal_share": "Partes iguales",
         "first_come": "Por orden de llegada",
         "fixed_percent": "Porcentaje fijo",
@@ -1032,7 +1033,7 @@
         "anthropic_messages": "Anthropic Messages"
       },
       "help": {
-        "maxWaitMs": "Cuánto puede esperar una solicitud por capacidad local. Después, una solicitud normal se rechaza y una :external va a la nube.",
+        "maxWaitMs": "Cuánto puede esperar una solicitud por un espacio local libre. Después, una solicitud normal se rechaza y una :external va a la nube.",
         "contextCeiling": "El contexto más grande (prompt más salida) que acepta este pool, para todos los miembros. Automático: se calcula a partir de los miembros.",
         "contextMargin": "Tokens que se dejan libres bajo el contexto de cada miembro, como margen para las estimaciones de tokens.",
         "protocolAdaptation": "Traduce entre OpenAI Chat, OpenAI Responses y Anthropic Messages cuando un miembro no sirve la API de quien llama. Los miembros que la sirven de forma nativa siempre se prueban primero.",
@@ -1130,7 +1131,7 @@
       "share": "Compartir este pool",
       "laterHint": "El tope mensual de nube y la protección de caché caliente se ajustan con Editar cuando la persona ya tiene el compartido.",
       "contributedTitle": "Modelos contribuidos",
-      "othersHardware": "Los modelos contribuidos corren en el hardware de otras personas. Pueden detenerlos o retirarlos en cualquier momento, así que no cuentes con ellos para la capacidad que necesitas.",
+      "othersHardware": "Los modelos contribuidos corren en el hardware de otras personas. Pueden detenerlos o retirarlos en cualquier momento, así que no cuentes con ellos para nada que necesites.",
       "ownHardwareOnly": "Este pool enruta solo a tu propio hardware: los modelos contribuidos siguen en la lista pero no reciben tráfico.",
       "contributedEmpty": "Nadie contribuye un modelo a este pool.",
       "removeContributedTitle": "¿Quitar {{model}} contribuido por {{email}}?",
@@ -1426,7 +1427,7 @@
     "startRequested": "Inicio solicitado.",
     "warnings": {
       "low_free_memory": "Poca memoria libre en el nodo.",
-      "frozen_version": "Un nodo solo relé ejecuta su versión congelada.",
+      "frozen_version": "Un nodo solo retransmisión ejecuta su versión congelada.",
       "pins_outdated": "Un perfil fija una versión anterior.",
       "interactive_needs_person": "Un paso te esperará en una terminal de operador.",
       "definition_not_on_node": "El nodo aún no tiene esta definición.",
@@ -1435,19 +1436,19 @@
     },
     "refusals": {
       "human_only": "Solo una persona puede hacer esto, en el navegador.",
-      "trust_relay": "Este nodo es solo relé: los agentes no pueden iniciar ni detener runtimes ahí. Tú sí, en el navegador.",
+      "trust_relay": "Este nodo es solo retransmisión: los agentes no pueden iniciar ni detener runtimes ahí. Tú sí, en el navegador.",
       "preview_required": "Primero ve la vista previa y luego confirma.",
       "preview_stale": "Algo cambió desde la vista previa. Vuelve a generarla.",
       "definition_frozen": "El nodo tiene congelada una definición de este runtime.",
       "definition_missing": "El nodo aún no tiene esta definición.",
-      "launch_change_on_relay_only": "Este nodo es solo relé, así que su definición siempre activa está congelada. Cámbiala en el nodo o sube la confianza ahí.",
+      "launch_change_on_relay_only": "Este nodo es solo retransmisión, así que su definición siempre activa está congelada. Cámbiala en el nodo o sube la confianza ahí.",
       "launch_change_on_node_origin": "Definido en el nodo; edítalo ahí. Los límites y la configuración avanzada se pueden cambiar aquí.",
       "no_frozen_peer_set": "Este nodo no tiene un conjunto de pares congelado.",
       "instances_running": "Primero detén las instancias en ejecución.",
       "pinned_by_profile": "Un perfil fija este runtime. Quítalo del perfil primero.",
       "interactive_needs_person": "Un paso espera a una persona en una terminal de operador.",
       "launch_changed": "El arranque cambió: reinicia para aplicarlo.",
-      "invalid_node_count": "Elige un nodo por cada rango de este runtime.",
+      "invalid_node_count": "Elige un nodo para cada parte de este runtime.",
       "unknown_node": "Ese nodo no existe.",
       "label_mismatch": "Al nodo le falta una etiqueta que este runtime requiere.",
       "head_address_unavailable": "El nodo principal no tiene dirección en la red.",
@@ -1484,7 +1485,12 @@
       "already_shared": "Este pool ya está compartido con esta persona. Cambia el compartido existente.",
       "invite_pending": "Este correo ya tiene una invitación pendiente. Reenvíala en su lugar.",
       "too_many_invites": "Demasiadas invitaciones pendientes. Retira algunas antes de invitar a más personas.",
-      "invite_accepted": "Esa invitación se acaba de aceptar, así que ahora es un compartido."
+      "invite_accepted": "Esa invitación se acaba de aceptar, así que ahora ya está compartido.",
+      "port_range_in_use": "Una instancia en ejecución en este nodo usa un puerto fuera del nuevo rango. Detenla primero.",
+      "node_online": "El nodo está en línea. Los agentes solo eliminan nodos sin conexión; una persona puede eliminarlo aquí.",
+      "alias_shadowed": "Ese nombre ya es uno de tus ID invocables.",
+      "alias_limit": "Demasiados alias. Elimina uno primero.",
+      "alias_key_not_allowed": "Esa clave no puede llamar a este pool. Agrega el pool a la clave primero."
     },
     "delete": "Eliminar runtime",
     "deleteTitle": "¿Eliminar {{name}}?",
@@ -1541,7 +1547,7 @@
         "contextLimit": "El contexto más grande (prompt más salida) que acepta una instancia. Automático: lo que reporta el motor.",
         "kvBudgetTokens": "Tokens de caché KV que tiene una instancia. Automático: lo que reporta el motor.",
         "kvFullThreshold": "Cuando el uso de la caché KV llega a esta fracción (0.95 = 95 %), la instancia cuenta como llena.",
-        "engineLoadGate": "Si la admisión también sigue el reporte de carga del propio motor. Aplicar: siempre. Solo observar: lo registra, nunca espera por él. Automático: decide el servidor.",
+        "engineLoadGate": "Si la admisión también sigue el reporte de carga del propio motor. Aplicar: siempre. Solo registrar: lo anota, nunca espera por él. Automático: decide el servidor.",
         "countStrategy": "Cómo cuenta el servidor los tokens de una solicitud antes de enviarla.",
         "imageTokenAllowance": "Tokens que se cuentan por cada imagen. Automático: según los ajustes de visión del modelo servido.",
         "maxAttachmentBytes": "El adjunto más grande que puede llevar una solicitud a este runtime. Automático: el ajuste de medios del servidor.",
@@ -1595,7 +1601,7 @@
           "mapRole": "Cambiar el rol de un mensaje"
         },
         "endpoint": "Se aplica a",
-        "everyEndpoint": "Todos los endpoints",
+        "everyEndpoint": "Todas las rutas de API",
         "onlyEndpoint": "Solo {{endpoint}}",
         "path": "Ruta del campo",
         "to": "Clave nueva",
@@ -1685,7 +1691,7 @@
         "engine": "Motor",
         "engineUnknown": "Desconocido",
         "probedAt": "Revisado",
-        "described": "Endpoints descritos",
+        "described": "Rutas de API descritas",
         "describedNone": "Ninguno descrito.",
         "learned": "Ajustes aprendidos",
         "learnedNone": "Ninguno aprendido.",
@@ -1766,13 +1772,13 @@
       "fabric": "Red de interconexión",
       "fabricHint": "Opcional: la red que deben compartir todos los nodos de una instancia.",
       "resources": "Recursos",
-      "resourcesHint": "Lo que una posición reserva en su nodo mientras se ejecuta.",
+      "resourcesHint": "Lo que cada parte reserva en su nodo mientras se ejecuta.",
       "resourceKind": "Tipo",
       "resourceKinds": {
         "discrete": "GPU",
         "unified": "Memoria unificada",
         "cpu": "CPU y RAM",
-        "none": "Nada (sin presupuesto)"
+        "none": "Nada reservado"
       },
       "memoryGb": "Memoria (GiB)",
       "gpuCount": "GPU",
@@ -2033,18 +2039,18 @@
     "finish": "Terminar",
     "node": {
       "title": "Agrega un nodo",
-      "description": "Un nodo es una máquina que ejecuta modelos para ti: un servidor con GPU, una estación de trabajo o una laptop.",
-      "intro": "Un comando instala wsmp y conecta la máquina a tu cuenta con un código que funciona una vez, durante una hora. El código es tu aprobación.",
+      "description": "Un nodo es una computadora que ejecuta modelos para ti: un servidor con GPU, una estación de trabajo o una laptop.",
+      "intro": "Un comando instala wsmp y conecta la computadora a tu cuenta con un código que funciona una vez, durante una hora. El código es tu aprobación.",
       "mint": "Obtener el comando de instalación",
       "mintAnother": "Agregar otro nodo",
       "yours_one": "Tu nodo",
       "yours_other": "Tus {{count}} nodos",
-      "moreOptions": "Varias máquinas a la vez, etiquetas o nodos temporales:",
+      "moreOptions": "Varios nodos a la vez, etiquetas o nodos temporales:",
       "nodesPage": "Nodos → Agregar un nodo"
     },
     "runtime": {
-      "title": "Tus servidores de modelos",
-      "description": "Un runtime es un servidor de modelos al que wsmp puede llamar: uno que inicia cuando se necesita, o uno que siempre está en marcha.",
+      "title": "Tus runtimes",
+      "description": "Un runtime es un servidor de inferencia al que wsmp puede llamar: uno que inicia cuando se necesita, o uno que siempre está en marcha.",
       "presetTitle": "Inicia uno desde un preajuste",
       "presetHint": "vLLM, SGLang o llama.cpp, iniciado en uno de tus nodos cuando un pool lo necesita.",
       "presetAction": "Nuevo runtime",
@@ -2064,7 +2070,7 @@
       "fromModel": "Modelos servidos que aún no están en un pool",
       "createNamed": "Crear pool {{slug}}",
       "customize": "Elegir un nombre…",
-      "noModels": "Aún no hay modelos servidos. Agrega un servidor de modelos en el paso anterior: los runtimes que se inician listan sus modelos al definirlos; los siempre activos, cuando el nodo los reporta.",
+      "noModels": "Aún no hay modelos servidos. Agrega un runtime en el paso anterior: los runtimes que se inician listan sus modelos al definirlos; los siempre activos, cuando el nodo los reporta.",
       "allPooled": "Todos los modelos servidos están en un pool.",
       "loadFailed": "No se pudieron cargar tus runtimes o pools."
     },
@@ -2093,13 +2099,13 @@
     "emptyHint": "Inicia un runtime en uno de tus nodos o crea un pool. Sus modelos servidos e IDs invocables aparecen aquí.",
     "goToWelcome": "Abrir Bienvenida",
     "errors": {
-      "upstream": "El servidor del modelo dijo:",
+      "upstream": "El runtime dijo:",
       "empty": "El modelo respondió sin texto."
     },
     "target": {
       "label": "Destino",
       "pools": "IDs invocables",
-      "direct": "Modelos servidos de tus runtimes (directo)",
+      "direct": "Modelos servidos de tus runtimes",
       "directPill": "Directo",
       "poolPill": "Pool",
       "notServing": "Nada sirve este destino ahora; una solicitud puede esperarlo o fallar.",

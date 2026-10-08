@@ -147,24 +147,13 @@ function neutralDeletionConflictKey(
       return "errors:deletionConflict.deletePending";
     case "delete_contended":
       return "errors:deletionConflict.deleteContended";
-    case "still_attached":
-      return "errors:deletionConflict.stillAttached";
-    case "not_stale":
-      return "errors:deletionConflict.notStale";
     case "deletion_in_progress":
       return "errors:deletionConflict.deletionInProgress";
   }
 }
 
 /** What a delete mutation removes; picks the "do this instead" copy. */
-export type DeletionEntity =
-  | "user"
-  | "cliDevice"
-  | "endpoint"
-  | "discoveredModel"
-  | "pool"
-  | "poolMember"
-  | "capacity";
+export type DeletionEntity = "user";
 
 /**
  * i18n key (errors namespace) for a deletion-related CONFLICT on `entity`, or

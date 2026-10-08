@@ -151,6 +151,7 @@ function route(requestCompat: PoolRoute["instance"]["requestCompat"] = {}): Pool
       userId: "owner",
       upstreamModelId: "engine-model",
       capabilities: ["TEXT_GENERATION"],
+      type: "LLM",
       transcriptionProfile: null,
       embeddingContract: null,
     },

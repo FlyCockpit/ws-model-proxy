@@ -402,6 +402,8 @@ export type RouteServedModel = {
   upstreamModelId: string;
   /** Effective capabilities (override when set, else detected). */
   capabilities: string[];
+  /** LLM, EMBEDDINGS or TRANSCRIPTION (the runtime's modelType). */
+  type: string;
   transcriptionProfile: Prisma.JsonValue | null;
   embeddingContract: Prisma.JsonValue | null;
 };
@@ -582,6 +584,7 @@ const TARGET_SELECT = {
       detectedCapabilities: true,
       capabilities: true,
       capabilitiesOverridden: true,
+      type: true,
       transcriptionProfile: true,
       embeddingContract: true,
       Runtime: {
@@ -665,6 +668,7 @@ function routeParts(row: TargetSelected, now: Date): TestRoute | null {
       userId: model.userId,
       upstreamModelId: model.upstreamModelId,
       capabilities: model.capabilitiesOverridden ? model.capabilities : model.detectedCapabilities,
+      type: model.type,
       transcriptionProfile: model.transcriptionProfile,
       embeddingContract: model.embeddingContract,
     },

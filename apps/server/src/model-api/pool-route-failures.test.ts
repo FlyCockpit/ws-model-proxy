@@ -131,6 +131,7 @@ const RESPONSES_ONLY_ROUTE: PoolRoute = {
     userId: "owner",
     upstreamModelId: "m",
     capabilities: ["RESPONSES_API"],
+    type: "LLM",
     transcriptionProfile: null,
     embeddingContract: null,
   },

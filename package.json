@@ -15,7 +15,7 @@
     "test:postgres": "sh scripts/test-postgres-integration.sh",
     "test:pg": "bash scripts/test-pg.sh",
     "test:e2e:transcription": "pnpm --filter server build && cargo build --quiet --manifest-path apps/cli/Cargo.toml && node scripts/e2e/transcription-relay.mjs",
-    "test:e2e:realtime-transcription": "pnpm --filter server build && node scripts/e2e/realtime-transcription-relay.mjs",
+    "test:e2e:realtime-transcription": "pnpm --filter server build && cargo build --quiet --manifest-path apps/cli/Cargo.toml && node scripts/e2e/realtime-transcription-relay.mjs",
     "test:e2e:file-tools": "pnpm --filter server build && cargo build --quiet --manifest-path apps/cli/Cargo.toml && node scripts/e2e/file-tools-relay.mjs",
     "check-types": "turbo check-types",
     "lint": "biome lint .",

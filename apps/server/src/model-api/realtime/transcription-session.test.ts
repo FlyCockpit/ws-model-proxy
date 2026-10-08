@@ -113,6 +113,10 @@ class FakeRouter implements RealtimeRouter {
   memberOpenFailed(candidate: RealtimeCandidate, failure: RelayFailure) {
     this.failures.push([candidate.nodeId, failure]);
   }
+  openedOn: string[] = [];
+  memberOpened(candidate: RealtimeCandidate) {
+    this.openedOn.push(candidate.nodeId);
+  }
 }
 
 function caps(adapter: "segmented" | "vllm"): OpenAiCompatibleCapabilities {
@@ -267,6 +271,7 @@ describe("realtime transcription session: setup and routing", () => {
     await t.openOn(good);
     expect(t.session.status).toBe("open");
     expect(t.router.failures).toEqual([["cli-broken", "upstream_5xx"]]);
+    expect(t.router.openedOn).toEqual([good.nodeId]);
   });
 
   it("tries at most three opens, then closes 1011", async () => {

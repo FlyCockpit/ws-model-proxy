@@ -11,6 +11,8 @@ import {
   runtimeSpecSchema,
 } from "@ws-model-proxy/api/lib/runtime-spec";
 
+import { specIssueText } from "./spec-issue-text";
+
 /**
  * The Definition form's model of a runtime spec (`runtimeSpecSchema`). Text inputs hold
  * strings (numbers too, so an empty input means "not set"); `draftToSpec` turns a draft back
@@ -461,12 +463,13 @@ export function readSpecEditor(
       ok: false,
       issues: parsed.error.issues.map((issue) => {
         const where = issue.path.join(".");
+        const text = specIssueText(issue);
         if (values.tab === "json")
-          return { path: ["json"], message: where ? `${where}: ${issue.message}` : issue.message };
+          return { path: ["json"], message: where ? `${where}: ${text}` : text };
         const draftPath = draftPathOf(issue.path);
         return draftPath
-          ? { path: ["draft", ...draftPath], message: issue.message }
-          : { path: ["check"], message: where ? `${where}: ${issue.message}` : issue.message };
+          ? { path: ["draft", ...draftPath], message: text }
+          : { path: ["check"], message: where ? `${where}: ${text}` : text };
       }),
     };
   }

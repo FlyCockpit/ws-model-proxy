@@ -24,8 +24,8 @@
   "workspaceDescription": "Terminal input and output are encrypted between this browser and the node. The server cannot read them or type into them.",
   "workspaceEmpty": "Open a terminal on a node, or run a queued command, and it appears here.",
   "socket": {
-    "connecting": "Connecting to the relay…",
-    "closed": "Not connected to the relay. Reconnecting…",
+    "connecting": "Connecting to the server…",
+    "closed": "Not connected to the server. Reconnecting…",
     "unauthorized": "Your session ended. Sign in again to use terminals."
   },
   "phase": {
@@ -41,7 +41,7 @@
   "closeTab": "Close tab",
   "endSession": "End session",
   "ending": "Ending…",
-  "endFailed": "The relay could not end this session. Try again.",
+  "endFailed": "The server could not end this session. Try again.",
   "typedCommandHint": "The command is typed into the terminal. Check it, then press Enter to run it.",
   "typedCommandNotTyped": "This command has more than one line or characters other than plain ASCII, so it was not typed. Copy it from the queue and paste it into the terminal.",
   "trustNewKey": "Trust the new key",
@@ -57,7 +57,7 @@
     "unsupported": "Browser terminals are not enabled on this node.",
     "cli_too_old": "Upgrade wsmp on this node to use browser terminals.",
     "limit": "Terminal limit reached. End a session and try again.",
-    "invalid": "The relay refused this terminal request.",
+    "invalid": "The server refused this terminal request.",
     "ticket_invalid": "This terminal link expired or was already used. Open the terminal again.",
     "bad_handshake": "The secure handshake with the node failed.",
     "other": "The terminal was refused ({{reason}}).",
@@ -119,7 +119,7 @@
       "node_fill_ambiguous": "This command contains text that looks like a value the node fills in but is not one, so it is not shown filled in here."
     },
     "unavailableHint": "The terminal on the node shows the exact command before it runs.",
-    "template": "Command template",
+    "template": "Command as written",
     "refusedButOpen": "The server expected the node to refuse this step (bad value: {{field}}), yet its terminal opened, so the command cannot be confirmed here."
   }
 }

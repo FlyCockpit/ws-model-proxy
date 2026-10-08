@@ -1,116 +1,40 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import {
-  createHmac,
-  createPrivateKey,
-  generateKeyPairSync,
-  randomBytes,
-  randomUUID,
-  sign,
-} from "node:crypto";
-import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import { createRequire } from "node:module";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { waitForExit } from "../lib/wait-for-exit.mjs";
+import {
+  eventually,
+  pg,
+  requiredEnv,
+  root,
+  rpcClient,
+  signUp,
+  startNode,
+  startServer,
+  waitForReadyRuntime,
+} from "./lib/stack.mjs";
 
-// Live transcription (`/v1/realtime?intent=transcription`) full-stack test:
-// a prebuilt WMP server and an isolated Postgres database, an OpenAI-shaped
-// WebSocket client, and a protocol-faithful fake CLI that speaks the relay
-// WebSocket protocol (hello identity, inventory, `stt.*` frames). The fake
-// CLI stands in for the Rust relay because live sessions open only on
-// recipe-managed endpoints, and running a real recipe needs the deployment
-// runtime and an engine; the Rust session code is covered by the CLI's own
-// tests against fake vLLM and file engines. Everything else is production:
-// upgrade auth, routing over database deployment ownership, capacity
-// admission, the locked send claim, credit flow, metering and rollups.
+// Live transcription (`/v1/realtime?intent=transcription`) full stack: a prebuilt WMP server on
+// an isolated Postgres database, a real `wsmp` node, and a mock speech-to-text server as an
+// always-on runtime whose served model declares a `segmented` live profile. `wsmp` collects
+// each committed turn and posts it to the mock's `/v1/audio/transcriptions` as a WAV file.
+// Setup uses the browser's own paths (sign-up, oRPC, enrollment code, `wsmp login`). The
+// relay wire itself (audio frames, credits, seq) is covered by the server's stt tests and
+// `wsmp`'s own tests against fake engines.
 
-const requireFromDb = createRequire(new URL("../../packages/db/package.json", import.meta.url));
-const pg = requireFromDb("pg");
-const requireFromServer = createRequire(new URL("../../apps/server/package.json", import.meta.url));
+const requireFromServer = createRequire(join(root, "apps/server/package.json"));
 const { WebSocket } = requireFromServer("ws");
 
-const required = (name) => {
-  const value = process.env[name]?.trim();
-  if (!value) throw new Error(`${name} is required`);
-  return value;
-};
-
-const databaseUrl = required("WSMP_E2E_DATABASE_URL");
-const root = resolve(import.meta.dirname, "../..");
+const databaseUrl = requiredEnv("WSMP_E2E_DATABASE_URL");
 const scratch = await mkdtemp(join(tmpdir(), "wsmp-realtime-e2e-"));
-const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v2";
 const upstreamModel = "live-asr-e2e";
-const endpointSlug = `inst-${randomBytes(6).toString("hex")}`;
-const cliSlug = `rt-${randomBytes(4).toString("hex")}`;
+const nodeSlug = `rt-${randomUUID().slice(0, 8)}`;
 const transcriptPrivacyMarker = `private live transcript ${randomUUID()}`;
 const audioPrivacyMarker = `PRIVATE_LIVE_AUDIO_${randomUUID().replaceAll("-", "")}`;
-
-// The relay protocol version this checkout speaks, read from its source so a
-// version consolidation never needs this test to change.
-async function relayProtocolVersion() {
-  const source = await readFile(
-    join(root, "packages/api/src/lib/relay-protocol-version.ts"),
-    "utf8",
-  );
-  const versions = /RELAY_PROTOCOL_VERSIONS\s*=\s*\[([^\]]*)\]/.exec(source)?.[1];
-  const listed = [...(versions ?? "").matchAll(/"([^"]+)"/g)].map((match) => match[1]);
-  assert(listed.length > 0, "relay protocol versions not found");
-  return listed.at(-1);
-}
-
-function lp16(bytes) {
-  const out = Buffer.allocUnsafe(2 + bytes.length);
-  out.writeUInt16BE(bytes.length, 0);
-  bytes.copy(out, 2);
-  return out;
-}
-
-/** The CLI's P-256 hello identity (apps/server/src/relay/hello-identity.ts). */
-function helloIdentity() {
-  const { publicKey, privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
-  const spki = publicKey.export({ type: "spki", format: "der" });
-  const signingKey = createPrivateKey({
-    key: privateKey.export({ type: "pkcs8", format: "der" }),
-    format: "der",
-    type: "pkcs8",
-  });
-  return {
-    publicKey: Buffer.from(spki.subarray(spki.length - 65)).toString("base64url"),
-    sign(nonce, slug, origin) {
-      const statement = Buffer.concat([
-        lp16(Buffer.from("wsmp-relay-hello-v1")),
-        Buffer.from(nonce, "base64url"),
-        lp16(Buffer.from(slug, "utf8")),
-        lp16(Buffer.from(origin, "utf8")),
-      ]);
-      return sign("sha256", statement, { key: signingKey, dsaEncoding: "ieee-p1363" }).toString(
-        "base64url",
-      );
-    },
-  };
-}
-
-function parseBinaryFrame(data) {
-  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  const length = buffer.readUInt32BE(0);
-  return {
-    metadata: JSON.parse(buffer.subarray(4, 4 + length).toString("utf8")),
-    body: buffer.subarray(4 + length),
-  };
-}
-
-async function freePort() {
-  const probe = createServer();
-  await new Promise((resolveListen, reject) => {
-    probe.once("error", reject);
-    probe.listen(0, "127.0.0.1", resolveListen);
-  });
-  const { port } = probe.address();
-  await new Promise((resolveClose) => probe.close(resolveClose));
-  return port;
-}
 
 function waitFor(predicate, label, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
@@ -143,354 +67,164 @@ function realtimeClient(url, options) {
   });
   socket.on("error", () => {});
   const send = (event) => socket.send(JSON.stringify(event));
-  const next = (type) => waitFor(() => events.find((event) => event.type === type), type);
+  const next = (type) =>
+    waitFor(() => events.find((event) => event.type === type), type).catch((error) => {
+      throw new Error(`${error.message}; events: ${JSON.stringify(events).slice(0, 2_000)}`);
+    });
   return { socket, events, state, send, next };
 }
 
-const userId = randomUUID();
-const ids = {
-  pool: randomUUID(),
-  config: randomUUID(),
-  revision: randomUUID(),
-  plan: randomUUID(),
-  run: randomUUID(),
-  instance: randomUUID(),
-  node: randomUUID(),
-};
+/** One committed turn: 0.25 s of 24 kHz s16 mono in 2 400 B appends, carrying a marker. */
+function sendTurn(client, pcm) {
+  for (let offset = 0; offset < pcm.length; offset += 2_400) {
+    client.send({
+      type: "input_audio_buffer.append",
+      audio: pcm.subarray(offset, offset + 2_400).toString("base64"),
+    });
+  }
+  client.send({ type: "input_audio_buffer.commit" });
+}
+
 let db;
 let server;
-let cli;
-let heartbeat;
+let upstream;
+let relay;
+let userId;
+let failureLogs;
 try {
-  const serverEntry = resolve(process.env.WSMP_E2E_SERVER_ENTRY || "apps/server/dist/index.mjs");
-  await access(serverEntry);
-  const protocolVersion = await relayProtocolVersion();
-  const betterAuthSecret = randomBytes(48).toString("base64url");
-  const credential = (prefix, purpose) => {
-    const secret = `${prefix}${randomBytes(32).toString("base64url")}`;
-    const key = createHmac("sha256", betterAuthSecret)
-      .update(`ws-model-proxy:${purpose}:v1`)
-      .digest();
-    return {
-      secret,
-      lookupPrefix: secret.slice(0, prefix.length + 12),
-      digest: createHmac("sha256", key).update(secret).digest("base64url"),
-    };
-  };
-  const cliCredential = credential("wsmp_cli_", "cli-token");
-  const modelCredential = credential("wsmp_model_", "model-api-token");
-  const serverPort = await freePort();
-  const serverUrl = `http://127.0.0.1:${serverPort}`;
-  const wsUrl = `ws://127.0.0.1:${serverPort}`;
-
-  // Seed rows bypass the graph-write fence triggers (test fixtures only), like
-  // createFixturePrismaClient (packages/db/src/test-fixture-client.ts).
-  db = new pg.Pool({ connectionString: databaseUrl, max: 1, options: "-c wsmp.fences=,*," });
-  await db.query(
-    `INSERT INTO "user" (id, "createdAt", "updatedAt", name, email, slug, "emailVerified", role, locale)
-   VALUES ($1, now(), now(), $2, $3, $4, true, 'user', 'en-US')`,
-    [userId, "Realtime E2E", `realtime-e2e-${userId}@invalid.test`, `e2e-${userId}`],
-  );
-  await db.query(
-    `INSERT INTO cli_token (id, "createdAt", "updatedAt", "userId", name, "lookupPrefix", "secretDigest")
-   VALUES ($1, now(), now(), $2, $3, $4, $5)`,
-    [randomUUID(), userId, "Realtime E2E", cliCredential.lookupPrefix, cliCredential.digest],
-  );
-  const modelTokenId = randomUUID();
-  await db.query(
-    `INSERT INTO model_api_token (id, "createdAt", "updatedAt", "userId", name, "scopeMode", "lookupPrefix", "secretDigest")
-   VALUES ($1, now(), now(), $2, $3, 'ALL_VISIBLE', $4, $5)`,
-    [modelTokenId, userId, "Realtime E2E", modelCredential.lookupPrefix, modelCredential.digest],
-  );
-
-  const childBaseEnv = Object.fromEntries(
-    ["PATH", "HOME", "TMPDIR", "SystemRoot"].flatMap((key) =>
-      process.env[key] ? [[key, process.env[key]]] : [],
-    ),
-  );
-  server = spawn(process.execPath, [serverEntry], {
-    cwd: root,
-    detached: process.platform !== "win32",
-    env: {
-      ...childBaseEnv,
-      WSMP_DISABLE_DOTENV: "1",
-      NODE_ENV: "test",
-      DATABASE_URL: databaseUrl,
-      SERVER_PORT: String(serverPort),
-      BETTER_AUTH_SECRET: betterAuthSecret,
-      BETTER_AUTH_URL: serverUrl,
-      SIGNUP_ENABLED: "false",
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let serverLog = "";
-  server.stdout.setEncoding("utf8");
-  server.stdout.on("data", (chunk) => {
-    serverLog += chunk;
-  });
-  server.stderr.setEncoding("utf8");
-  server.stderr.on("data", (chunk) => {
-    serverLog += chunk;
-  });
-  await waitFor(
-    async () => {
-      if (server.exitCode !== null) throw new Error(`WSMP server exited early:\n${serverLog}`);
-      const response = await fetch(`${serverUrl}/v1/models`, {
-        headers: { authorization: `Bearer ${modelCredential.secret}` },
-        signal: AbortSignal.timeout(1_000),
-      }).catch(() => null);
-      return response?.ok;
-    },
-    "server readiness",
-    30_000,
-  );
-
-  // ---- the fake CLI ----
-  const identity = helloIdentity();
-  const cliFrames = [];
-  const sessions = new Map();
-  const cliState = { registered: false, inventoryOk: 0 };
-  /** What the fake engine does for the next `stt.open`. */
-  const behaviour = { refuseNextOpen: null };
-  cli = new WebSocket(`${wsUrl}/api/cli/ws`, [RELAY_SUBPROTOCOL], {
-    headers: { authorization: `Bearer ${cliCredential.secret}` },
-  });
-  const cliSend = (frame) => cli.send(JSON.stringify(frame));
-  const managedEndpoint = {
-    slug: endpointSlug,
-    deploymentInstanceId: ids.instance,
-    label: "Live ASR (fake engine)",
-    kind: "openai-compatible",
-    status: "online",
-    defaultCapabilities: {
-      version: 2,
-      protocol: "openai-compatible",
-      audio: {
-        transcriptions: {
-          supported: true,
-          realtime: { supported: true, adapter: "segmented", maxItemSeconds: 30 },
-        },
-      },
-    },
-    models: [{ upstreamModelId: upstreamModel }],
-  };
-  cli.on("message", (data, binary) => {
-    if (binary) {
-      const { metadata, body } = parseBinaryFrame(data);
-      cliFrames.push({ type: metadata.type, seq: metadata.seq, bytes: body.length });
-      const session = sessions.get(metadata.sessionId);
-      assert(session, "audio for an unknown session");
-      assert.equal(metadata.seq, session.nextSeq, "audio seq must increase by exactly one");
-      session.nextSeq += 1;
-      session.audio.push(body);
-      cliSend({ type: "stt.audio.ack", sessionId: metadata.sessionId, bytes: body.length });
+  // ---- the mock speech-to-text server ----
+  const uploads = [];
+  upstream = createServer(async (request, response) => {
+    if (request.method === "GET" && request.url === "/v1/models") {
+      response.setHeader("content-type", "application/json");
+      response.end(
+        JSON.stringify({ object: "list", data: [{ id: upstreamModel, object: "model" }] }),
+      );
       return;
     }
-    const frame = JSON.parse(data.toString());
-    cliFrames.push(frame);
-    switch (frame.type) {
-      case "hello.challenge":
-        cliSend({
-          type: "hello",
-          id: randomUUID(),
-          protocolVersion,
-          cli: {
-            slug: cliSlug,
-            hostname: "realtime-e2e",
-            identityPublicKey: identity.publicKey,
-            identitySignature: identity.sign(frame.nonce, cliSlug, frame.origin),
-            capabilities: {
-              terminalPublicKey: identity.publicKey,
-              features: {
-                humanTerminal: false,
-                mcpCommandMode: "off",
-                terminalApproval: false,
-                terminalSupported: false,
-                remoteMetricSources: false,
-                remoteEngineAdapters: false,
-                mcpFileRead: false,
-                fileRootsConfigured: false,
-                allowFileToolsAsRoot: false,
-              },
-            },
-          },
-          endpoints: [],
-        });
-        return;
-      case "hello.ok":
-        cliState.registered = true;
-        return;
-      case "inventory.ok":
-        cliState.inventoryOk += 1;
-        return;
-      case "stt.open": {
-        if (behaviour.refuseNextOpen) {
-          const failure = behaviour.refuseNextOpen;
-          behaviour.refuseNextOpen = null;
-          cliSend({ type: "stt.error", sessionId: frame.sessionId, failure });
-          return;
-        }
-        sessions.set(frame.sessionId, { open: frame, nextSeq: 0, audio: [], closed: null });
-        cliSend({ type: "stt.opened", sessionId: frame.sessionId });
-        return;
-      }
-      case "stt.commit": {
-        const session = sessions.get(frame.sessionId);
-        const words = transcriptPrivacyMarker.split(" ");
-        cliSend({
-          type: "stt.event",
-          sessionId: frame.sessionId,
-          event: { kind: "delta", itemSeq: frame.itemSeq, text: `${words[0]} ` },
-        });
-        cliSend({
-          type: "stt.event",
-          sessionId: frame.sessionId,
-          event: {
-            kind: "completed",
-            itemSeq: frame.itemSeq,
-            text: transcriptPrivacyMarker,
-            engineUsage: { inputTokens: 21, outputTokens: 7 },
-          },
-        });
-        if (session) session.committed = frame.itemSeq;
-        return;
-      }
-      case "stt.close": {
-        const session = sessions.get(frame.sessionId);
-        if (session) session.closed = frame.reason;
-        cliSend({ type: "stt.closed", sessionId: frame.sessionId });
-        return;
-      }
-      default:
+    if (request.method !== "POST" || request.url !== "/v1/audio/transcriptions") {
+      response.writeHead(404).end();
+      return;
     }
-  });
-  cli.on("error", () => {});
-  await waitFor(() => cliState.registered, "CLI registration");
-  heartbeat = setInterval(() => {
-    if (cli.readyState === WebSocket.OPEN) cliSend({ type: "heartbeat", id: randomUUID() });
-  }, 10_000);
-
-  // ---- recipe-managed deployment ownership, as the reconciler would hold it ----
-  const device = await db.query(`SELECT id FROM cli_device WHERE "userId" = $1 AND slug = $2`, [
-    userId,
-    cliSlug,
-  ]);
-  const cliDeviceId = device.rows[0]?.id;
-  assert(cliDeviceId, "the fake CLI did not register a device");
-  // A recipe is attached to a pool (detached recipes cannot start instances).
-  await db.query(
-    `INSERT INTO model_pool (id, "createdAt", "updatedAt", "userId", slug, name)
-     VALUES ($1, now(), now(), $2, $3, 'Live ASR recipe pool')`,
-    [ids.pool, userId, `live-asr-pool-${randomBytes(4).toString("hex")}`],
-  );
-  await db.query(
-    `INSERT INTO deployment_config (id, "userId", "poolId", slug, name)
-     VALUES ($1, $2, $3, $4, 'Live ASR')`,
-    [ids.config, userId, ids.pool, `live-asr-${randomBytes(4).toString("hex")}`],
-  );
-  await db.query(
-    `INSERT INTO deployment_config_revision
-       (id, "configId", revision, "editorId", "editorKind", "contentHash", spec)
-     VALUES ($1, $2, 1, $3, 'USER', $4, $5)`,
-    [
-      ids.revision,
-      ids.config,
-      userId,
-      "a".repeat(64),
-      JSON.stringify({ variants: [{ key: "one", models: [upstreamModel] }] }),
-    ],
-  );
-  await db.query(
-    `INSERT INTO deployment_plan
-       (id, "userId", "requesterId", "requesterKind", state, "expiresAt", fingerprint, contents)
-     VALUES ($1, $2, $2, 'USER', 'APPLIED', now() + interval '1 hour', $3, $4)`,
-    [ids.plan, userId, "b".repeat(64), JSON.stringify({ affectedNodeIds: [cliDeviceId] })],
-  );
-  await db.query(`INSERT INTO deployment_run (id, "planId") VALUES ($1, $2)`, [ids.run, ids.plan]);
-  await db.query(
-    `INSERT INTO deployment_instance
-       (id, "userId", "configId", "revisionId", "runId", "variantKey", "endpointSlug",
-        "startedBy", "desiredState", "observedState")
-     VALUES ($1, $2, $3, $4, $5, 'one', $6, 'USER', 'RUNNING', 'RUNNING')`,
-    [ids.instance, userId, ids.config, ids.revision, ids.run, endpointSlug],
-  );
-  await db.query(
-    `INSERT INTO deployment_instance_node
-       (id, "instanceId", "cliDeviceId", rank, port, resources, "claimHeld")
-     VALUES ($1, $2, $3, 0, 30000, $4, true)`,
-    [
-      ids.node,
-      ids.instance,
-      cliDeviceId,
-      JSON.stringify({ kind: "unified", memoryGb: 1, ramGb: 0, gpus: [] }),
-    ],
-  );
-  cliSend({ type: "inventory.update", id: randomUUID(), endpoints: [managedEndpoint] });
-  await waitFor(() => cliState.inventoryOk > 0, "managed inventory");
-
-  const liveModel = await waitFor(async () => {
-    const response = await fetch(`${serverUrl}/v1/models`, {
-      headers: { authorization: `Bearer ${modelCredential.secret}` },
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const wire = Buffer.concat(chunks).toString("latin1");
+    uploads.push({
+      model: /name="model"\r\n\r\n([^\r]+)\r\n/.exec(wire)?.[1],
+      wav: wire.includes("RIFF") && wire.includes("WAVE"),
     });
-    const listed = await response.json();
-    return listed.data?.find(
-      (model) =>
-        model.supports_realtime_transcription === true && model.id.endsWith(`/${upstreamModel}`),
-    )?.id;
-  }, "the live model in /v1/models");
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ text: transcriptPrivacyMarker }));
+  });
+  await new Promise((resolveListen, reject) => {
+    upstream.once("error", reject);
+    upstream.listen(0, "127.0.0.1", resolveListen);
+  });
+  const upstreamPort = upstream.address().port;
+
+  // ---- server, person, node, runtime, pool and API key ----
+  server = await startServer({ databaseUrl });
+  const serverUrl = server.url;
+  const wsUrl = serverUrl.replace("http", "ws");
+  failureLogs = () => `server:\n${server.log.text}`;
+  const person = await signUp(serverUrl, "realtime-e2e");
+  userId = person.userId;
+  const client = await rpcClient(serverUrl, person.cookie);
+  const node = await startNode({
+    client,
+    serverUrl,
+    scratch: join(scratch, "node"),
+    slug: nodeSlug,
+  });
+  relay = node.child;
+  failureLogs = () => `server:\n${server.log.text}\nwsmp:\n${node.log.text}`;
+  const logs = failureLogs;
+  db = new pg.Pool({ connectionString: databaseUrl, max: 1 });
+
+  const runtime = await client.runtimes.create({
+    slug: "live-asr",
+    name: "Live ASR (mock)",
+    kind: "ALWAYS_ON",
+    nodeId: node.nodeId,
+    spec: {
+      api: "openai",
+      engine: "other",
+      modelType: "transcription",
+      models: [
+        {
+          id: upstreamModel,
+          transcription: { realtime: { adapter: "segmented", maxItemSeconds: 30, maxSessions: 1 } },
+        },
+      ],
+      address: { baseUrl: `http://127.0.0.1:${upstreamPort}/v1` },
+    },
+  });
+  const ready = await waitForReadyRuntime(client, runtime.runtime.id, logs);
+  const servedModel = ready.servedModels.find((model) => model.upstreamModelId === upstreamModel);
+  assert(servedModel, "the served model is missing");
+  const pool = await client.pools.create({
+    slug: "live-asr",
+    name: "Live ASR",
+    type: "TRANSCRIPTION",
+    members: [{ runtimeModelId: servedModel.id }],
+  });
+  const { key: apiKeyView, secret: apiKey } = await client.access.apiKeys.create({
+    name: "Realtime E2E",
+    scope: "ALL_POOLS",
+    poolIds: [],
+    expiresAt: null,
+  });
+
+  const liveModel = pool.callableIds[0];
+  await eventually(`${liveModel} was not advertised as live\n${logs()}`, async () => {
+    const response = await fetch(`${serverUrl}/v1/models`, {
+      headers: { authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(1_000),
+    }).catch(() => null);
+    const listed = response?.ok ? await response.json().catch(() => null) : null;
+    return listed?.data?.some(
+      (model) => model.id === liveModel && model.supports_realtime_transcription === true,
+    );
+  });
   const realtimeUrl = `${wsUrl}/v1/realtime?intent=transcription&model=${encodeURIComponent(liveModel)}`;
-  const bearer = { authorization: `Bearer ${modelCredential.secret}` };
+  const bearer = { authorization: `Bearer ${apiKey}` };
+  const pcm = Buffer.alloc(12_000);
+  Buffer.from(audioPrivacyMarker).copy(pcm, 64);
 
   // ---- upgrade refusals: no credential, a credential in the URL ----
   const anonymous = realtimeClient(realtimeUrl, {});
   await waitFor(() => anonymous.state.refused, "anonymous refusal");
   assert.equal(anonymous.state.refused, 401);
-  const keyInUrl = realtimeClient(`${realtimeUrl}&api_key=${modelCredential.secret}`, {});
+  const keyInUrl = realtimeClient(`${realtimeUrl}&api_key=${apiKey}`, {});
   await waitFor(() => keyInUrl.state.refused, "key-in-URL refusal");
   assert.equal(keyInUrl.state.refused, 400);
 
-  // ---- session 1: bearer header, one committed item, client close ----
+  // ---- session 1: bearer header, one committed turn ----
   const first = realtimeClient(realtimeUrl, { headers: bearer });
   await first.next("session.created");
-  await waitFor(() => sessions.size === 1, "stt.open on the CLI");
-  const firstSession = [...sessions.values()][0];
-  assert.equal(firstSession.open.adapter, "segmented");
-  assert.equal(firstSession.open.endpointSlug, endpointSlug);
-  assert.equal(firstSession.open.upstreamModel, upstreamModel);
-  // 0.25 s of 24 kHz s16 mono, carrying a privacy marker in the samples.
-  const pcm = Buffer.alloc(12_000);
-  Buffer.from(audioPrivacyMarker).copy(pcm, 64);
-  for (let offset = 0; offset < pcm.length; offset += 2_400) {
-    first.send({
-      type: "input_audio_buffer.append",
-      audio: pcm.subarray(offset, offset + 2_400).toString("base64"),
-    });
-  }
-  first.send({ type: "input_audio_buffer.commit" });
+  sendTurn(first, pcm);
   const committed = await first.next("input_audio_buffer.committed");
-  const delta = await first.next("conversation.item.input_audio_transcription.delta");
   const completed = await first.next("conversation.item.input_audio_transcription.completed");
   await first.next("conversation.item.done");
-  assert.equal(delta.item_id, committed.item_id);
   assert.equal(completed.item_id, committed.item_id);
   assert.equal(completed.transcript, transcriptPrivacyMarker);
   assert.deepEqual(completed.usage, { type: "duration", seconds: 0.25 });
-  assert.deepEqual(Buffer.concat(firstSession.audio), pcm, "audio must reach the CLI intact");
-  // 2 400 B appends are coalesced into 4 800 B frames; the remainder is
-  // flushed ahead of the commit.
-  assert.deepEqual(
-    cliFrames.filter((frame) => frame.type === "stt.audio").map((frame) => frame.bytes),
-    [4_800, 4_800, 2_400],
-  );
-  const closedAt = Date.now();
-  first.socket.close(1000);
-  await waitFor(() => firstSession.closed, "stt.close after the client closed", 2_000);
-  assert.equal(firstSession.closed, "cancelled");
-  assert(Date.now() - closedAt < 2_000);
+  assert.deepEqual(uploads, [{ model: upstreamModel, wav: true }], "one WAV upload per turn");
 
-  // ---- session 2: browser subprotocol credential, the key is never echoed ----
+  // ---- session 2 while session 1 is open: the instance serves at most 1 (maxSessions) ----
+  // The engine session opens on the node with the first audio, so the refusal comes then.
+  const busy = realtimeClient(realtimeUrl, { headers: bearer });
+  await busy.next("session.created");
+  sendTurn(busy, pcm);
+  await waitFor(() => busy.state.closed, `busy close; events: ${JSON.stringify(busy.events)}`);
+  assert.equal(busy.state.closed.code, 1013);
+  assert.equal(busy.events.find((event) => event.type === "error")?.error.code, "server_busy");
+  first.socket.close(1000);
+  await waitFor(() => first.state.closed, "session 1 close");
+
+  // ---- session 3: browser subprotocol credential, the key is never echoed ----
   const browser = realtimeClient(`${wsUrl}/v1/realtime?intent=transcription`, {
-    protocols: ["realtime", `openai-insecure-api-key.${modelCredential.secret}`],
+    protocols: ["realtime", `openai-insecure-api-key.${apiKey}`],
   });
   const created = await browser.next("session.created");
   assert.equal(browser.socket.protocol, "realtime");
@@ -506,72 +240,78 @@ try {
   assert.equal(vad.error.code, "unsupported_parameter");
   assert.equal(vad.error.param, "session.audio.input.turn_detection");
   browser.socket.close(1000);
+  await waitFor(() => browser.state.closed, "session 3 close");
 
-  // ---- session 3: a member refuses its open at capacity (no health mark) ----
-  behaviour.refuseNextOpen = "rate_limited";
-  const busy = realtimeClient(realtimeUrl, { headers: bearer });
-  await waitFor(() => busy.state.closed, "busy close");
-  assert.equal(busy.state.closed.code, 1013);
-  assert.equal(busy.events.find((event) => event.type === "error")?.error.code, "server_busy");
-
-  // ---- session 3b: Chat Test, signed in with the dashboard cookie ----
-  // The same live session behind the dashboard session: attributed as HTTP
-  // Chat Test (source CHAT_TEST, no token), refused cross-site and signed out.
-  const dashboardSessionId = randomUUID();
-  const dashboardToken = randomBytes(32).toString("base64url");
-  await db.query(
-    `INSERT INTO session (id, "createdAt", "updatedAt", "expiresAt", token, "userId")
-     VALUES ($1, now(), now(), now() + interval '1 hour', $2, $3)`,
-    [dashboardSessionId, dashboardToken, userId],
-  );
-  const dashboardSignature = createHmac("sha256", betterAuthSecret)
-    .update(dashboardToken)
-    .digest("base64");
-  const cookie = `better-auth.session_token=${encodeURIComponent(`${dashboardToken}.${dashboardSignature}`)}`;
-  const chatTestUrl = `${wsUrl}/api/internal/chat-test/realtime?intent=transcription&model=${encodeURIComponent(liveModel)}`;
-  const crossSite = realtimeClient(chatTestUrl, {
-    headers: { cookie, origin: "https://evil.example" },
+  // ---- session 4: the Test page, signed in with the browser session ----
+  const testUrl = `${wsUrl}/api/internal/chat-test/realtime?intent=transcription&model=${encodeURIComponent(liveModel)}`;
+  const crossSite = realtimeClient(testUrl, {
+    headers: { cookie: person.cookie, origin: "https://evil.example" },
   });
   await waitFor(() => crossSite.state.refused, "cross-site refusal");
   assert.equal(crossSite.state.refused, 403);
-  const signedOut = realtimeClient(chatTestUrl, { headers: { origin: serverUrl } });
+  const signedOut = realtimeClient(testUrl, { headers: { origin: serverUrl } });
   await waitFor(() => signedOut.state.refused, "signed-out refusal");
   assert.equal(signedOut.state.refused, 401);
-  const chatTest = realtimeClient(chatTestUrl, { headers: { cookie, origin: serverUrl } });
-  await chatTest.next("session.created");
-  assert.equal(chatTest.socket.protocol, "");
-  await waitFor(() => sessions.size === 2, "stt.open for the Chat Test session");
-  for (let offset = 0; offset < pcm.length; offset += 2_400) {
-    chatTest.send({
-      type: "input_audio_buffer.append",
-      audio: pcm.subarray(offset, offset + 2_400).toString("base64"),
-    });
-  }
-  chatTest.send({ type: "input_audio_buffer.commit" });
-  const chatTestCompleted = await chatTest.next(
-    "conversation.item.input_audio_transcription.completed",
+  // The instance takes one session (maxSessions): the node frees session 1's slot once its
+  // close arrives there, so a turn may meet the busy refusal first; try again until it lands.
+  let testPage;
+  const testCompleted = await eventually(
+    "the Test page session got no transcript",
+    async () => {
+      testPage = realtimeClient(testUrl, { headers: { cookie: person.cookie, origin: serverUrl } });
+      await testPage.next("session.created");
+      assert.equal(testPage.socket.protocol, "");
+      sendTurn(testPage, pcm);
+      await waitFor(
+        () =>
+          testPage.state.closed ||
+          testPage.events.find(
+            (event) => event.type === "conversation.item.input_audio_transcription.completed",
+          ),
+        "Test page turn outcome",
+        20_000,
+      );
+      return testPage.events.find(
+        (event) => event.type === "conversation.item.input_audio_transcription.completed",
+      );
+    },
+    { timeoutMs: 60_000, intervalMs: 1_000 },
   );
-  assert.equal(chatTestCompleted.transcript, transcriptPrivacyMarker);
-  chatTest.socket.close(1000);
-  await waitFor(() => [...sessions.values()][1].closed, "Chat Test stt.close", 2_000);
+  assert.equal(testCompleted.transcript, transcriptPrivacyMarker);
+  testPage.socket.close(1000);
+  await waitFor(() => testPage.state.closed, "session 4 close");
 
-  // ---- session 4: the CLI disconnects mid-session ----
-  const doomed = realtimeClient(realtimeUrl, { headers: bearer });
-  await doomed.next("session.created");
-  await waitFor(() => sessions.size === 3, "third stt.open");
+  // ---- session 5: the node goes away mid-session ----
+  // The engine session opens on the node with the first turn; a transcribed turn proves it is
+  // open (and the instance's one slot is free again), so the kill lands mid-session, not
+  // during the open (that would be `upstream_unavailable`, a failed open).
+  let doomed;
+  await eventually(
+    "session 5 got no transcript",
+    async () => {
+      doomed = realtimeClient(realtimeUrl, { headers: bearer });
+      await doomed.next("session.created");
+      sendTurn(doomed, pcm);
+      await waitFor(
+        () =>
+          doomed.state.closed ||
+          doomed.events.find(
+            (event) => event.type === "conversation.item.input_audio_transcription.completed",
+          ),
+        "session 5 turn outcome",
+        20_000,
+      );
+      return !doomed.state.closed;
+    },
+    { timeoutMs: 60_000, intervalMs: 1_000 },
+  );
   doomed.send({
     type: "input_audio_buffer.append",
     audio: pcm.subarray(0, 4_800).toString("base64"),
   });
-  await waitFor(
-    () =>
-      cliFrames.filter((frame) => frame.type === "stt.audio").length > 0 &&
-      [...sessions.values()][2].audio.length > 0,
-    "audio of the second session",
-  );
-  clearInterval(heartbeat);
-  cli.terminate();
-  await waitFor(() => doomed.state.closed, "client close after the CLI left");
+  await new Promise((resolveWait) => setTimeout(resolveWait, 500));
+  process.kill(-relay.pid, "SIGKILL");
+  await waitFor(() => doomed.state.closed, "client close after the node left", 20_000);
   assert.equal(doomed.state.closed.code, 1011);
   assert.equal(
     doomed.events.find((event) => event.type === "error")?.error.code,
@@ -579,43 +319,49 @@ try {
   );
 
   // ---- metering: one row per opened session, rollups with audio ----
-  const rows = await waitFor(async () => {
-    const result = await db.query(
-      `SELECT * FROM relay_request WHERE "userId" = $1 AND operation = 'audio.realtime_transcription'
-        ORDER BY "createdAt" ASC`,
-      [userId],
-    );
-    return result.rows.length === 3 && result.rows.every((row) => row.status !== "PENDING")
-      ? result.rows
-      : null;
-  }, "finalized live session rows");
-  const [served, chatTestRow, failed] = rows;
-  assert.equal(chatTestRow.source, "CHAT_TEST");
-  assert.equal(chatTestRow.modelApiTokenId, null);
-  assert.equal(chatTestRow.status, "SUCCEEDED");
-  assert.equal(chatTestRow.audioInputMs, 250);
+  const rows = await waitFor(
+    async () => {
+      const result = await db.query(
+        `SELECT * FROM relay_request WHERE "userId" = $1 AND operation = 'audio.realtime_transcription'
+          ORDER BY "createdAt" ASC`,
+        [userId],
+      );
+      const finished = result.rows.filter((row) => row.status !== "PENDING");
+      return finished.length === result.rows.length && result.rows.length >= 3 ? result.rows : null;
+    },
+    "finalized live session rows",
+    20_000,
+  );
+  // A refused open (session 2) may or may not leave a row; the three opened sessions do.
+  const served = rows.find((row) => row.source === "API_KEY" && row.status === "SUCCEEDED");
+  const testRow = rows.find((row) => row.source === "TEST");
+  const failed = rows.at(-1);
+  assert(served, "the first API-key session was not recorded");
+  assert.equal(served.source, "API_KEY");
+  assert.equal(served.apiKeyId, apiKeyView.id);
+  assert.equal(served.poolId, pool.id);
   assert.equal(served.status, "SUCCEEDED");
   assert.equal(served.errorClass, null);
   assert.equal(served.audioInputMs, 250);
   assert.equal(Number(served.requestBytes), 12_000);
-  assert.equal(served.promptTokens, 21);
-  assert.equal(served.completionTokens, 7);
-  assert.equal(served.modelApiTokenId, modelTokenId);
+  assert(testRow, "the Test page session was not recorded");
+  assert.equal(testRow.apiKeyId, null);
+  assert.equal(testRow.status, "SUCCEEDED");
+  assert.equal(testRow.audioInputMs, 250);
   assert.equal(failed.status, "FAILED");
   assert.equal(failed.errorClass, "upstream_disconnected");
-  assert.equal(failed.audioInputMs, 100);
   const rollup = await waitFor(async () => {
     const result = await db.query(
       `SELECT sum("audioInputMs")::bigint AS audio, sum(requests)::int AS requests
          FROM usage_rollup_minute WHERE "requesterUserId" = $1`,
       [userId],
     );
-    return Number(result.rows[0]?.requests) === 3 ? result.rows[0] : null;
+    return Number(result.rows[0]?.requests) === rows.length ? result.rows[0] : null;
   }, "usage rollups");
-  assert.equal(Number(rollup.audio), 600);
+  assert(Number(rollup.audio) >= 500, `rollup audio ${rollup.audio}`);
 
   // ---- privacy: no audio or transcript in logs or stored metadata ----
-  const haystacks = [serverLog, JSON.stringify(rows)];
+  const haystacks = [server.log.text, node.log.text, JSON.stringify(rows)];
   for (const marker of [audioPrivacyMarker, transcriptPrivacyMarker]) {
     assert(
       haystacks.every((haystack) => !haystack.includes(marker)),
@@ -623,35 +369,18 @@ try {
     );
   }
   process.stdout.write("realtime transcription relay E2E passed\n");
+} catch (error) {
+  if (process.env.WSMP_E2E_VERBOSE && failureLogs) process.stderr.write(failureLogs());
+  throw error;
 } finally {
-  if (heartbeat) clearInterval(heartbeat);
-  if (cli && cli.readyState === WebSocket.OPEN) cli.terminate();
-  if (server) await waitForExit(server, "server");
+  if (relay) await waitForExit(relay, "wsmp");
+  if (server) await waitForExit(server.child, "server");
+  if (upstream) {
+    upstream.closeAllConnections();
+    await new Promise((resolveClose) => upstream.close(resolveClose));
+  }
   if (db) {
-    // policy: bounded-delete -- generated test rows only, children first.
-    await db
-      .query(`DELETE FROM deployment_instance_node WHERE id = $1`, [ids.node])
-      .catch(() => undefined);
-    await db
-      .query(`DELETE FROM deployment_instance WHERE id = $1`, [ids.instance])
-      .catch(() => undefined);
-    await db.query(`DELETE FROM deployment_run WHERE id = $1`, [ids.run]).catch(() => undefined); // policy: bounded-delete -- generated test row only
-    await db.query(`DELETE FROM deployment_plan WHERE id = $1`, [ids.plan]).catch(() => undefined); // policy: bounded-delete -- generated test row only
-    await db
-      .query(`DELETE FROM deployment_config_revision WHERE id = $1`, [ids.revision])
-      .catch(() => undefined);
-    await db
-      .query(`DELETE FROM deployment_config WHERE id = $1`, [ids.config])
-      .catch(() => undefined);
-    for (const table of ["usage_rollup_minute", "usage_rollup_hour"]) {
-      await db
-        .query(`DELETE FROM ${table} WHERE "ownerUserId" = $1 OR "requesterUserId" = $1`, [userId])
-        .catch(() => undefined); // policy: bounded-delete -- generated test user's rollups only
-    }
-    await db
-      .query(`DELETE FROM relay_request WHERE "userId" = $1`, [userId])
-      .catch(() => undefined); // policy: bounded-delete -- generated test user's rows only
-    await db.query(`DELETE FROM "user" WHERE id = $1`, [userId]).catch(() => undefined); // policy: bounded-delete -- generated test user only
+    if (userId) await db.query(`DELETE FROM "user" WHERE id = $1`, [userId]).catch(() => undefined); // policy: bounded-delete -- generated test user only
     await db.end();
   }
   await rm(scratch, { recursive: true, force: true });

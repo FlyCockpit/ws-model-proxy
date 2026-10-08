@@ -48,7 +48,7 @@
   "title": "Configuración",
   "locale": {
     "title": "Idioma",
-    "description": "El idioma de esta app y de los correos que te enviamos. Te sigue a otros dispositivos.",
+    "description": "El idioma de esta app y de los correos que te enviamos. Sigue a tu cuenta dondequiera que inicies sesión.",
     "label": "Idioma",
     "saved": "Idioma guardado",
     "saveError": "No se pudo guardar tu idioma. Inténtalo de nuevo."

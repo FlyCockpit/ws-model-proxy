@@ -339,7 +339,7 @@ fn file_errors_become_file_rejected_with_only_the_documented_detail() {
     }
     for bad in [
         "h:x",
-        "wsmp_cli_secretsecretsecretsecret",
+        "wsmp_node_secretsecretsecretsecret",
         "x:AAAAAAAAAAAAAAAAAAAAAA",
         "",
     ] {

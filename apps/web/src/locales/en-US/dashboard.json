@@ -36,7 +36,7 @@
   "pages": {
     "welcome": {
       "title": "Get started",
-      "description": "Add a node, add your model servers, create a pool, connect an agent and create an API key."
+      "description": "Add a node, add your runtimes, create a pool, connect an agent and create an API key."
     },
     "overview": {
       "title": "Overview",
@@ -108,7 +108,7 @@
     },
     "nodes": {
       "title": "Nodes",
-      "description": "Your machines running wsmp: trust, hardware and what runs there."
+      "description": "Your computers running wsmp: trust, hardware and what runs there."
     },
     "nodeDetail": {
       "title": "Node",
@@ -209,7 +209,7 @@
       "addNode": "Add node",
       "loadFailed": "Your nodes could not be loaded.",
       "emptyTitle": "No nodes yet",
-      "emptyDescription": "A node is a machine running wsmp. Add one with a one-line install command; it shows up here when it connects."
+      "emptyDescription": "A node is a computer running wsmp. Add one with a one-line install command; it shows up here when it connects."
     },
     "card": {
       "hardware": "Hardware",
@@ -224,13 +224,13 @@
     },
     "add": {
       "title": "Add a node",
-      "description": "Run one command on the machine. The code in it is your approval: nodes that use it join your account without another click.",
+      "description": "Run one command on the computer. The code in it is your approval: nodes that use it join your account without another click.",
       "replaceTitle": "Replace {{slug}}",
-      "replaceDescription": "Run this on the new machine (or after reinstalling). It takes over this node's runtimes, labels and settings, and the old login stops working.",
-      "howMany": "How many machines",
-      "modeOne": "One machine",
-      "modeMany": "Several machines",
-      "maxUses": "Up to how many machines",
+      "replaceDescription": "Run this on the new computer (or after reinstalling). It takes over this node's runtimes, labels and settings, and the old login stops working.",
+      "howMany": "How many nodes",
+      "modeOne": "One node",
+      "modeMany": "Several nodes",
+      "maxUses": "Up to how many nodes",
       "maxUsesInvalid": "Between 2 and 50.",
       "ttl": "Code valid for",
       "ttlOption": {
@@ -251,7 +251,7 @@
       "commandLabel": "Install command",
       "secretOnce": "This code is shown only once.",
       "installsWhere": "It installs wsmp into ~/.cargo/bin ($CARGO_HOME/bin when set). When the server offers release builds, Linux (x86_64 or ARM64, glibc 2.34 or newer) and macOS get a checksummed binary; otherwise it builds wsmp from source, which needs Rust 1.88 or newer.",
-      "terminalsAsked": "With Full control, `wsmp login` then asks whether to allow browser terminals on that machine (yes by default). Only the machine can change it later, with `wsmp config set-human-terminal on|off`.",
+      "terminalsAsked": "With Full control, `wsmp login` then asks whether to allow browser terminals on that node (yes by default). Only the node can change it later, with `wsmp config set-human-terminal on|off`.",
       "waiting": "Waiting for the node to connect…",
       "joined": "{{slug}} joined",
       "joinedDeleted": "A node joined and was removed since",
@@ -259,11 +259,11 @@
       "expiresIn": "It expires in {{time}}.",
       "expired": "This code has expired; get a new one.",
       "newCode": "New code",
-      "onMachine": "What happens on the machine",
+      "onMachine": "What happens on the computer",
       "machineSteps": {
         "install": "The script installs wsmp (where and how is below).",
-        "login": "`wsmp login` uses the code: the machine joins your account as a node, with no other approval.",
-        "trust": "It asks how much control this server gets: Full control (the default) or Relay only, where agents cannot change anything on the machine.",
+        "login": "`wsmp login` uses the code: the computer joins your account as a node, with no other approval.",
+        "trust": "It asks how much control this server gets: Full control (the default) or Relay only, where agents cannot change anything on the node.",
         "service": "It offers to install a per-user service, so the node starts at boot."
       },
       "readingHardware": "Connected. Reading its hardware…"
@@ -325,7 +325,7 @@
       "nameTooLong": "At most 120 characters.",
       "replace": "Replace",
       "deleteTitle": "Delete node",
-      "deleteDescription": "Its always-on runtimes go, everything reserved on it is released and runtimes with a part on it stop. The machine itself is not changed.",
+      "deleteDescription": "Its always-on runtimes go, everything reserved on it is released and runtimes with a part on it stop. The computer itself is not changed.",
       "typeSlug": "Type the node's slug to confirm",
       "deleted_one": "Node deleted; {{count}} runtime stopped.",
       "deleted_other": "Node deleted; {{count}} runtimes stopped."
@@ -337,7 +337,7 @@
       "changed": "Changed",
       "lower": "Lower to Relay only",
       "lowerTitle": "Lower {{slug}} to Relay only?",
-      "lowerDescription": "This sticks on the node. Only running `wsmp trust full` on the machine raises it again.",
+      "lowerDescription": "This sticks on the node. Only running `wsmp trust full` on the node raises it again.",
       "keepsRunning": "Keeps running, frozen",
       "nothingFrozen": "No definitions or metric commands on this node.",
       "running": "running",
@@ -449,7 +449,7 @@
       "delete": "Delete {{name}}",
       "deleted": "Secret deleted.",
       "offline": "The node is offline. Secrets are sent only to a connected node.",
-      "relayHint": "This node is Relay only. Set secrets on the machine:",
+      "relayHint": "This node is Relay only. Set secrets on the node:",
       "deleteTitle": "Delete {{name}}?",
       "deleteDescription": "Commands and runtimes that use it stop getting it. It cannot be shown or restored."
     },
@@ -649,7 +649,8 @@
     "alias_limit": "Too many aliases. Remove one first.",
     "alias_key_not_allowed": "That key cannot call this pool. Add the pool to the key first.",
     "always_on_runtime": "An always-on runtime runs on its own; there is nothing to start.",
-    "fabric_port_ranges_disjoint": "These nodes' port ranges share no port; make them overlap."
+    "fabric_port_ranges_disjoint": "These nodes' port ranges share no port; make them overlap.",
+    "identity_mismatch": "The node presented a different identity key."
   },
   "models": {
     "loadFailed": "Couldn't load your models.",
@@ -662,7 +663,7 @@
     "emptyHint": "Create a pool and add a served model to it. Its callable ID shows up here.",
     "goToPools": "Go to pools",
     "external": ":external",
-    "externalHint": "may use cloud models when local capacity is busy",
+    "externalHint": "may use cloud models when local runtimes are busy",
     "yourPool": "Your pool",
     "sharedBy": "Shared by {{owner}}",
     "snippet": "Example request",
@@ -757,7 +758,7 @@
       "unreachable": "The provider could not be reached.",
       "invalid_credential": "The provider refused the key.",
       "insufficient_permission": "Couldn't confirm: the key may not list models, but it may still work.",
-      "unverified": "Couldn't confirm: this endpoint answers without checking keys.",
+      "unverified": "Couldn't confirm: this URL answers without checking keys.",
       "unexpected_status": "The provider gave an unexpected answer."
     },
     "details": "Account",
@@ -872,7 +873,7 @@
     "canContribute": "Can contribute",
     "callAsHint": "Use this as the model name with an API key.",
     "members": "Members",
-    "membersHint": "Served models this pool routes to. Requests go to members with free capacity.",
+    "membersHint": "Served models this pool routes to. Requests go to members with a free slot.",
     "noMembers": "No members yet. Add a served model below.",
     "memberStatus": {
       "serving": "Serving",
@@ -1017,13 +1018,13 @@
       "deleteRule": "Delete rule {{rule}}",
       "values": {
         "tokenizer": "Tokenizer",
-        "template_aware": "Template-aware",
+        "template_aware": "Tokenizer with chat template",
         "engine_reported": "Engine-reported",
         "conservative_estimate": "Conservative estimate",
         "calibrated_estimate": "Calibrated estimate",
         "AUTO": "Automatic",
         "ENFORCE": "Enforce",
-        "OBSERVE": "Observe only",
+        "OBSERVE": "Record only",
         "equal_share": "Equal share",
         "first_come": "First come",
         "fixed_percent": "Fixed percent",
@@ -1032,7 +1033,7 @@
         "anthropic_messages": "Anthropic Messages"
       },
       "help": {
-        "maxWaitMs": "How long a request may wait for local capacity. Then a plain request is refused and an :external request goes to the cloud.",
+        "maxWaitMs": "How long a request may wait for a free local slot. Then a plain request is refused and an :external request goes to the cloud.",
         "contextCeiling": "The largest context (prompt plus output) this pool accepts, for every member. Automatic: worked out from the members.",
         "contextMargin": "Tokens kept free below each member's context, as a safety margin for token estimates.",
         "protocolAdaptation": "Translate between OpenAI Chat, OpenAI Responses and Anthropic Messages when a member does not serve the caller's API. Members that serve it natively are always tried first.",
@@ -1130,7 +1131,7 @@
       "share": "Share this pool",
       "laterHint": "A monthly cloud cap and warm protection are set with Edit once the person has the share.",
       "contributedTitle": "Contributed models",
-      "othersHardware": "Contributed models run on other people's hardware. They may stop or withdraw them at any time, so do not count on them for capacity you need.",
+      "othersHardware": "Contributed models run on other people's hardware. They may stop or withdraw them at any time, so do not count on them for anything you need.",
       "ownHardwareOnly": "This pool routes to your own hardware only: contributed models stay listed but get no traffic.",
       "contributedEmpty": "Nobody contributes a model to this pool.",
       "removeContributedTitle": "Remove {{model}} contributed by {{email}}?",
@@ -1447,7 +1448,7 @@
       "pinned_by_profile": "A profile pins this runtime. Remove it from the profile first.",
       "interactive_needs_person": "A step waits in an operator terminal for a person.",
       "launch_changed": "The launch changed: restart to apply it.",
-      "invalid_node_count": "Pick one node per rank of this runtime.",
+      "invalid_node_count": "Pick one node for each part of this runtime.",
       "unknown_node": "That node does not exist.",
       "label_mismatch": "The node lacks a label this runtime requires.",
       "head_address_unavailable": "The head node has no address on the fabric.",
@@ -1461,7 +1462,7 @@
       "not_enough_memory": "Not enough free memory on the node.",
       "resources_held": "The resources are held by another instance.",
       "no_free_ports": "The node has no free port in its range.",
-      "port_in_use": "The port is already claimed on the node.",
+      "port_in_use": "The port is already reserved on the node.",
       "contribute_not_allowed": "This share does not allow contributing.",
       "own_hardware_only": "The owner routes this pool to their own hardware only.",
       "model_type_mismatch": "The model type does not match the pool type.",
@@ -1484,7 +1485,12 @@
       "already_shared": "This pool is already shared with this person. Change the existing share.",
       "invite_pending": "This e-mail already has a pending invite. Resend it instead.",
       "too_many_invites": "Too many pending invites. Withdraw some before inviting more people.",
-      "invite_accepted": "That invite was just accepted, so it is a share now."
+      "invite_accepted": "That invite was just accepted, so it is a share now.",
+      "port_range_in_use": "A running instance on this node uses a port outside the new range. Stop it first.",
+      "node_online": "The node is online. Agents delete only offline nodes; a person can delete it here.",
+      "alias_shadowed": "That name is already one of your callable IDs.",
+      "alias_limit": "Too many aliases. Remove one first.",
+      "alias_key_not_allowed": "That key cannot call this pool. Add the pool to the key first."
     },
     "delete": "Delete runtime",
     "deleteTitle": "Delete {{name}}?",
@@ -1541,7 +1547,7 @@
         "contextLimit": "Largest context (prompt plus output) one instance accepts. Automatic: what the engine reports.",
         "kvBudgetTokens": "Tokens of KV cache one instance has. Automatic: what the engine reports.",
         "kvFullThreshold": "When KV cache use reaches this fraction (0.95 = 95 %), the instance counts as full.",
-        "engineLoadGate": "Whether admission also follows the engine's own load report. Enforce: always. Observe only: record it, never wait on it. Automatic: the server decides.",
+        "engineLoadGate": "Whether admission also follows the engine's own load report. Enforce: always. Record only: log it, never wait on it. Automatic: the server decides.",
         "countStrategy": "How the server counts a request's tokens before sending it.",
         "imageTokenAllowance": "Tokens counted for each image. Automatic: from the served model's vision settings.",
         "maxAttachmentBytes": "Largest attachment one request to this runtime may carry. Automatic: the server's media setting.",
@@ -1595,7 +1601,7 @@
           "mapRole": "Change a message role"
         },
         "endpoint": "Applies to",
-        "everyEndpoint": "Every endpoint",
+        "everyEndpoint": "Every API path",
         "onlyEndpoint": "Only {{endpoint}}",
         "path": "Field path",
         "to": "New key",
@@ -1685,7 +1691,7 @@
         "engine": "Engine",
         "engineUnknown": "Unknown",
         "probedAt": "Checked",
-        "described": "Described endpoints",
+        "described": "Described API paths",
         "describedNone": "None described.",
         "learned": "Learned fixes",
         "learnedNone": "None learned.",
@@ -1766,13 +1772,13 @@
       "fabric": "Fabric",
       "fabricHint": "Optional: the network every node of an instance must share.",
       "resources": "Resources",
-      "resourcesHint": "What one rank claims on its node while it runs.",
+      "resourcesHint": "What each part reserves on its node while it runs.",
       "resourceKind": "Kind",
       "resourceKinds": {
         "discrete": "GPUs",
         "unified": "Unified memory",
         "cpu": "CPU and RAM",
-        "none": "Nothing (no budget)"
+        "none": "Nothing reserved"
       },
       "memoryGb": "Memory (GiB)",
       "gpuCount": "GPUs",
@@ -2033,18 +2039,18 @@
     "finish": "Finish",
     "node": {
       "title": "Add a node",
-      "description": "A node is a machine that runs models for you: a GPU server, a workstation or a laptop.",
-      "intro": "One command installs wsmp and logs the machine in with a code that works once, for an hour. The code is your approval.",
+      "description": "A node is a computer that runs models for you: a GPU server, a workstation or a laptop.",
+      "intro": "One command installs wsmp and logs the computer in with a code that works once, for an hour. The code is your approval.",
       "mint": "Get the install command",
       "mintAnother": "Add another node",
       "yours_one": "Your node",
       "yours_other": "Your {{count}} nodes",
-      "moreOptions": "Several machines at once, labels or temporary nodes:",
+      "moreOptions": "Several nodes at once, labels or temporary nodes:",
       "nodesPage": "Nodes → Add a node"
     },
     "runtime": {
-      "title": "Your model servers",
-      "description": "A runtime is a model server wsmp can call: one it starts when needed, or one that is always running.",
+      "title": "Your runtimes",
+      "description": "A runtime is an inference server wsmp can call: one it starts when needed, or one that is always running.",
       "presetTitle": "Start one from a preset",
       "presetHint": "vLLM, SGLang or llama.cpp, started on one of your nodes when a pool needs it.",
       "presetAction": "New runtime",
@@ -2064,7 +2070,7 @@
       "fromModel": "Served models not in a pool yet",
       "createNamed": "Create pool {{slug}}",
       "customize": "Choose a name…",
-      "noModels": "No served models yet. Add a model server in the previous step: startable runtimes list their models once defined, always-on ones once the node reports them.",
+      "noModels": "No served models yet. Add a runtime in the previous step: startable runtimes list their models once defined, always-on ones once the node reports them.",
       "allPooled": "Every served model is in a pool.",
       "loadFailed": "Your runtimes or pools could not be loaded."
     },
@@ -2093,13 +2099,13 @@
     "emptyHint": "Start a runtime on one of your nodes, or create a pool. Its served models and callable IDs show up here.",
     "goToWelcome": "Open Welcome",
     "errors": {
-      "upstream": "The model server said:",
+      "upstream": "The runtime said:",
       "empty": "The model answered with no text."
     },
     "target": {
       "label": "Target",
       "pools": "Callable IDs",
-      "direct": "Your runtimes' served models (direct)",
+      "direct": "Your runtimes' served models",
       "directPill": "Direct",
       "poolPill": "Pool",
       "notServing": "Nothing serves this target right now; a request may wait for it or fail.",
