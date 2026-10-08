@@ -161,8 +161,11 @@ function RootComponent() {
             }}
           >
             <Header />
-            {/* [container-type:size] lets the sidebar use 100cqh; fixed descendants must be portaled. */}
-            <main className="min-h-0 min-w-0 overflow-y-auto overflow-x-clip [container-type:size]">
+            {/* The only page scroller. [container-type:size] lets the sidebar use 100cqh; fixed
+                descendants must be portaled. `relative` makes main the containing block of
+                absolutely positioned page content (sr-only labels and live regions), so it scrolls
+                and clips with the page instead of extending the document below the viewport. */}
+            <main className="relative min-h-0 min-w-0 overflow-y-auto overflow-x-clip [container-type:size]">
               <Outlet />
             </main>
             <BottomNav hidden={mobileKeyboardOpen} />
