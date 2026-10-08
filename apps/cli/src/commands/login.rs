@@ -90,7 +90,9 @@ struct LoginOutput<'a> {
 }
 
 pub fn run(args: &Args) -> Result<()> {
-    crate::trust::refuse_in_job("wsmp login")?;
+    // Enrolling raises nothing by itself (provisioning from a system service
+    // works); clearing a leftover lowering is checked like `wsmp trust full`.
+    crate::trust::refuse_marked("wsmp login")?;
     let server_url = normalize_server_url(&args.url)?;
     if let Some(warning) = server_url_http_warning(&server_url) {
         output::diagnostic(warning)?;
@@ -593,11 +595,13 @@ fn lowering_with(
 }
 
 /// Why this login may not clear an earlier lowering now: a relay running
-/// here keeps its Relay-only latch and writes `relay` back. (A process wsmp
-/// started never gets here: `wsmp login` refuses one first, by the same
-/// check as `wsmp trust full`.)
+/// here keeps its Relay-only latch and writes `relay` back; and a process
+/// wsmp started may not raise trust (the check of `wsmp trust full`).
 #[cfg(unix)]
 fn leftover_clear_refusal() -> Option<&'static str> {
+    if let Some(reason) = crate::trust::self_started_by_wsmp() {
+        return Some(reason);
+    }
     match crate::control::request_if_running(crate::control::ControlCommand::Status) {
         Ok(None) => None,
         Ok(Some(_)) | Err(_) => {

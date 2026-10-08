@@ -123,8 +123,8 @@ fn lower(json: bool) -> Result<()> {
 
 fn raise(json: bool) -> Result<()> {
     // Checked before asking, and again by a running relay on its socket peer.
-    if crate::trust::self_started_by_wsmp().is_some() {
-        anyhow::bail!("`wsmp trust full` cannot run from a command, job or terminal wsmp started");
+    if let Some(reason) = crate::trust::self_started_by_wsmp() {
+        anyhow::bail!("{}", crate::trust::refusal("wsmp trust full", reason));
     }
     anyhow::ensure!(
         std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),

@@ -122,10 +122,15 @@ pub fn persist_full() -> Result<()> {
 /// Lowering (`wsmp trust relay`, revoking an approval) stays allowed from
 /// anywhere.
 pub fn refuse_in_job(command: &str) -> Result<()> {
-    if self_started_by_wsmp().is_some() {
-        anyhow::bail!("`{command}` cannot run from a command, job or terminal wsmp started");
+    if let Some(reason) = self_started_by_wsmp() {
+        anyhow::bail!("{}", refusal(command, reason));
     }
     Ok(())
+}
+
+/// The message for `command` refused because `reason`.
+pub fn refusal(command: &str, reason: &str) -> String {
+    format!("`{command}` cannot run from a command, job or terminal wsmp started ({reason})")
 }
 
 /// Refuse `command` when this process carries `WSMP_JOB`, and nothing more:
@@ -153,7 +158,10 @@ pub fn self_started_by_wsmp() -> Option<&'static str> {
     }
 }
 
-const STARTED: &str = "a process wsmp started cannot do this";
+const STARTED: &str = "it or a parent process belongs to wsmp";
+const USER_SERVICE: &str =
+    "it runs in a service of your systemd user manager; run it from a terminal or an SSH session";
+const UNTRACED: &str = "its parent processes do not lead back to a terminal or an SSH session";
 
 /// Whether `pid` was started by wsmp (a command, job, runtime or terminal),
 /// as far as this machine can tell: `Err` names why it counts as started.
@@ -165,31 +173,36 @@ const STARTED: &str = "a process wsmp started cannot do this";
 ///   (`run-*.service`, `run-*.scope`), or the relay's own service cgroup;
 /// - (c) an ancestor is the relay (`daemon_pid`, or any `wsmp … run`);
 /// - (d) it runs in a service of the user's systemd manager
-///   (`user@UID.service/…/x.service`): a person's shell runs in a session
+///   (`user@UID.service/…/x.service/…`): a person's shell runs in a session
 ///   or app scope, while `systemd-run --user --unit=x` makes a service.
 ///
 /// The walk goes up the parents to pid 1. An ancestor whose environment
-/// cannot be read (non-dumpable, more capabilities, another uid) ends it
-/// with a pass only when it is the user's systemd manager
-/// (`user@UID.service/init.scope`) or outside that manager (sshd, login,
-/// root's units, which a job cannot create); any other one is refused.
+/// cannot be read (non-dumpable, more capabilities, another uid) is passed
+/// (environments above it are not read; cgroups and the relay still are)
+/// only when it is the user's systemd manager
+/// (`user@UID.service/init.scope`) or in a logind session
+/// (`session-N.scope`); any other one is refused, so commands from cron,
+/// at or a system service (cloud-init) are refused too.
 ///
-/// This stops agents and `env -u WSMP_JOB`; it is no boundary against code
-/// running as the user, which can name a scope like a terminal's, or `ssh`
-/// back in to this machine.
+/// This stops `env -u WSMP_JOB`, `systemd-run --user`, cron and at, and an
+/// orphan of a relay that runs as its service. It is no boundary against
+/// code running as the user, which can still move itself into a cgroup
+/// named like a terminal's, ask the person's tmux to run a command, or `ssh`
+/// back in; nor against an orphan (`setsid -f`) of a relay run by hand.
 #[cfg(target_os = "linux")]
 pub fn started_by_wsmp(pid: i32, daemon_pid: u32) -> Result<(), &'static str> {
     started_by_wsmp_in(std::path::Path::new("/proc"), pid, daemon_pid)
 }
 
-/// The systemd cgroup path of a `/proc/<pid>/cgroup` text: the unified
-/// (`0::`) line, else the `name=systemd` line, else the first.
+/// The systemd cgroup path of a `/proc/<pid>/cgroup` text: the
+/// `name=systemd` line (v1 and hybrid, where `0::` may say just `/`), else
+/// the unified (`0::`) line, else the first.
 #[cfg(target_os = "linux")]
 fn systemd_path(cgroup: &str) -> &str {
     let pick = cgroup
         .lines()
-        .find(|line| line.starts_with("0::"))
-        .or_else(|| cgroup.lines().find(|line| line.contains(":name=systemd:")))
+        .find(|line| line.contains(":name=systemd:"))
+        .or_else(|| cgroup.lines().find(|line| line.starts_with("0::")))
         .or_else(|| cgroup.lines().next())
         .unwrap_or("");
     pick.splitn(3, ':').nth(2).unwrap_or(pick)
@@ -200,32 +213,42 @@ fn is_user_manager_unit(unit: &str) -> bool {
     unit.starts_with("user@") && unit.ends_with(".service")
 }
 
-/// (d): a service unit under the user's systemd manager.
 #[cfg(target_os = "linux")]
-fn in_user_service(cgroup: &str) -> bool {
-    let units: Vec<&str> = systemd_path(cgroup)
+fn units(cgroup: &str) -> Vec<&str> {
+    systemd_path(cgroup)
         .split('/')
         .filter(|unit| !unit.is_empty())
-        .collect();
-    let Some(manager) = units.iter().position(|unit| is_user_manager_unit(unit)) else {
-        return false;
-    };
+        .collect()
+}
+
+/// (d): inside a service unit of the user's systemd manager, at any depth
+/// (a service may make sub-cgroups of its own).
+#[cfg(target_os = "linux")]
+fn in_user_service(cgroup: &str) -> bool {
+    let units = units(cgroup);
     units
-        .last()
-        .is_some_and(|leaf| units.len() > manager + 1 && leaf.ends_with(".service"))
+        .iter()
+        .position(|unit| is_user_manager_unit(unit))
+        .is_some_and(|manager| {
+            units[manager + 1..]
+                .iter()
+                .any(|unit| unit.ends_with(".service"))
+        })
 }
 
 /// Where a walk may end at an unreadable ancestor: the user's systemd
-/// manager itself, or anything outside it.
+/// manager itself (`user@UID.service/init.scope`), or a logind session
+/// (`session-N.scope`: SSH, a console, `su`), which only a login creates.
+/// Anything else (cron, at, other system services, an unreadable cgroup) is
+/// a place a job can reach.
 #[cfg(target_os = "linux")]
 fn unreadable_may_end_walk(cgroup: &str) -> bool {
-    let units: Vec<&str> = systemd_path(cgroup)
-        .split('/')
-        .filter(|unit| !unit.is_empty())
-        .collect();
+    let units = units(cgroup);
     match units.iter().position(|unit| is_user_manager_unit(unit)) {
-        None => true,
         Some(manager) => units.len() == manager + 2 && units[manager + 1] == "init.scope",
+        None => units
+            .last()
+            .is_some_and(|leaf| leaf.starts_with("session-") && leaf.ends_with(".scope")),
     }
 }
 
@@ -234,7 +257,9 @@ fn cgroup_refused(cgroup: &str, daemon_cgroup: Option<&str>) -> bool {
     cgroup.lines().any(|line| {
         let path = line.splitn(3, ':').nth(2).unwrap_or(line);
         path.split('/').any(|unit| {
-            unit.starts_with("wsmp-")
+            // Seen from inside another cgroup namespace (`unshare -C`).
+            unit == ".."
+                || unit.starts_with("wsmp-")
                 || unit.starts_with("wsmp_i_")
                 || unit == "wsmp.service"
                 || (unit.starts_with("run-") && unit.ends_with(".service"))
@@ -275,45 +300,60 @@ pub(crate) fn started_by_wsmp_in(
     if pid == 0 {
         return Err(UNKNOWN);
     }
+    // Read once: the caller's own checks below use this same text.
     let caller_cgroup = std::fs::read_to_string(proc_root.join(pid.to_string()).join("cgroup"))
         .map_err(|_| UNKNOWN)?;
-    if in_user_service(&caller_cgroup) {
+    if cgroup_refused(&caller_cgroup, daemon_cgroup.as_deref()) {
         return Err(STARTED);
     }
+    if in_user_service(&caller_cgroup) {
+        return Err(USER_SERVICE);
+    }
+    // Past a login or user-manager boundary, environments are no longer
+    // read (they belong to sshd, logind or the manager), but the relay and
+    // wsmp's cgroups are still looked for: a helper made non-dumpable under a
+    // relay started from SSH does not end the walk before the relay.
+    let mut past_boundary = false;
     for depth in 0..256 {
         if pid == daemon_pid {
             return Err(STARTED);
         }
         let dir = proc_root.join(pid.to_string());
-        // A process that is gone cannot be judged.
-        let parent = parent_pid(&dir).ok_or(STARTED)?;
-        let cgroup = std::fs::read_to_string(dir.join("cgroup")).unwrap_or_default();
+        // A process that is gone (or hidden) cannot be judged.
+        let parent = parent_pid(&dir).ok_or(UNTRACED)?;
+        let cgroup = if depth == 0 {
+            caller_cgroup.clone()
+        } else {
+            std::fs::read_to_string(dir.join("cgroup")).map_err(|_| UNTRACED)?
+        };
         if cgroup_refused(&cgroup, daemon_cgroup.as_deref()) {
             return Err(STARTED);
         }
         if depth > 0 && std::fs::read(dir.join("cmdline")).is_ok_and(|line| is_relay(&line)) {
             return Err(STARTED);
         }
-        match std::fs::read(dir.join("environ")) {
-            Ok(environ) => {
-                if environ
-                    .split(|b| *b == 0)
-                    .any(|entry| entry.starts_with(format!("{JOB_MARKER_ENV}=").as_bytes()))
-                {
-                    return Err(STARTED);
+        if !past_boundary {
+            match std::fs::read(dir.join("environ")) {
+                Ok(environ) => {
+                    if environ
+                        .split(|b| *b == 0)
+                        .any(|entry| entry.starts_with(format!("{JOB_MARKER_ENV}=").as_bytes()))
+                    {
+                        return Err(STARTED);
+                    }
                 }
+                // The caller itself must be readable; an unreadable ancestor
+                // is passed only where a job cannot put one.
+                Err(_) if depth > 0 && unreadable_may_end_walk(&cgroup) => past_boundary = true,
+                Err(_) => return Err(UNTRACED),
             }
-            // The caller itself must be readable; an ancestor ends the walk
-            // only where a job cannot put one.
-            Err(_) if depth > 0 && unreadable_may_end_walk(&cgroup) => return Ok(()),
-            Err(_) => return Err(STARTED),
         }
         if parent <= 1 {
             return Ok(());
         }
         pid = parent;
     }
-    Err(STARTED)
+    Err(UNTRACED)
 }
 
 #[cfg(target_os = "linux")]
@@ -396,15 +436,29 @@ mod tests {
         unreadable(root.path(), 59, 58, session);
         unreadable(root.path(), 58, 1, "0::/system.slice/ssh.service\n");
         assert_eq!(started_by_wsmp_in(root.path(), 60, 0), Ok(()));
-        // A root-owned system service (provisioning) is not the user's.
-        process(
-            root.path(),
-            70,
-            1,
-            &[],
-            "0::/system.slice/cloud-final.service\n",
-        );
-        assert_eq!(started_by_wsmp_in(root.path(), 70, 0), Ok(()));
+        // A relay started from SSH, and a helper of its command made
+        // non-dumpable: the walk goes on past the helper to the relay.
+        process(root.path(), 90, 89, &["HOME=/h"], session);
+        unreadable(root.path(), 89, 88, session);
+        process(root.path(), 88, 59, &["HOME=/h"], session);
+        std::fs::write(root.path().join("88").join("cmdline"), b"wsmp\0run\0").expect("cmdline");
+        assert!(started_by_wsmp_in(root.path(), 90, 0).is_err());
+        // An ancestor that went away between reads is not a boundary.
+        process(root.path(), 95, 94, &["HOME=/h"], session);
+        process(root.path(), 94, 1, &[], session);
+        std::fs::remove_file(root.path().join("94").join("cgroup")).expect("cgroup");
+        assert!(started_by_wsmp_in(root.path(), 95, 0).is_err());
+        // cron or at: the job's crontab runs under the unreadable cron
+        // daemon, outside any session.
+        let cron = "0::/system.slice/cron.service\n";
+        process(root.path(), 70, 69, &["HOME=/h"], cron);
+        unreadable(root.path(), 69, 68, cron);
+        unreadable(root.path(), 68, 1, cron);
+        assert!(started_by_wsmp_in(root.path(), 70, 0).is_err());
+        // An unreadable ancestor whose cgroup cannot be read either.
+        process(root.path(), 80, 79, &["HOME=/h"], session);
+        unreadable(root.path(), 79, 1, "");
+        assert!(started_by_wsmp_in(root.path(), 80, 0).is_err());
     }
 
     #[test]
@@ -430,6 +484,22 @@ mod tests {
             &format!("{APP}/wsmp_i_abcdefabcdef_r0.slice/app-x.scope\n"),
         );
         assert!(started_by_wsmp_in(root.path(), 60, 0).is_err());
+        // A sub-cgroup the service made of its own.
+        process(root.path(), 65, 30, &[], &format!("{APP}/x.service/sub\n"));
+        assert!(started_by_wsmp_in(root.path(), 65, 0).is_err());
+        // Hybrid hierarchy: the unified line says `/`, systemd's says where.
+        process(
+            root.path(),
+            66,
+            30,
+            &[],
+            &format!("0::/\n1:name=systemd:{}/x.service\n", &APP[3..]),
+        );
+        assert!(started_by_wsmp_in(root.path(), 66, 0).is_err());
+        // Inside another cgroup namespace (`unshare -C`), ancestors read `/..`.
+        process(root.path(), 67, 68, &[], "0::/\n");
+        process(root.path(), 68, 30, &[], "0::/../../app-x.scope\n");
+        assert!(started_by_wsmp_in(root.path(), 67, 0).is_err());
         // An unreadable ancestor inside the manager that is not the manager.
         let scope = format!("{APP}/app-x.scope\n");
         process(root.path(), 70, 69, &[], &scope);
@@ -470,7 +540,13 @@ mod tests {
         assert!(!in_user_service(&format!("{APP}/x.scope")));
         assert!(!in_user_service("0::/system.slice/x.service"));
         assert!(unreadable_may_end_walk(MANAGER));
-        assert!(unreadable_may_end_walk("0::/system.slice/ssh.service"));
+        assert!(unreadable_may_end_walk(
+            "0::/user.slice/user-1000.slice/session-3.scope"
+        ));
+        assert!(!unreadable_may_end_walk("0::/system.slice/ssh.service"));
+        assert!(!unreadable_may_end_walk("0::/system.slice/cron.service"));
+        assert!(!unreadable_may_end_walk(""));
+        assert!(in_user_service(&format!("{APP}/x.service/sub")));
         assert!(!unreadable_may_end_walk(&format!("{APP}/x.scope")));
     }
 

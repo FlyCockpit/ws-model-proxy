@@ -154,8 +154,12 @@ wsmp trust full     # raise: needs you at this machine's terminal
 refuses to run from any process the relay started (its commands, jobs, runtimes and terminals).
 It counts as started by wsmp when it or an ancestor carries `WSMP_JOB`, runs in one of wsmp's
 cgroups (`wsmp.service`, `wsmp-*` units, `wsmp_i_*` runtime slices, `systemd-run` transient
-units), descends from a running relay, or itself runs as a service of your systemd user manager
-(`systemd-run --user --unit=…`). A shell in a terminal, tmux or an SSH session passes.
+units), descends from a running relay, runs as a service of your systemd user manager
+(`systemd-run --user --unit=…`), or cannot be traced back to your systemd user manager or a login
+session (so cron, at and system services such as cloud-init are refused). A shell in a terminal,
+tmux or an SSH session passes; a terminal that a user service runs (some compositors, editors)
+does not, so use another terminal or SSH. `wsmp login` itself only checks `WSMP_JOB`, so it works
+from provisioning, but clearing an earlier Relay-only setting takes this check.
 
 The same refusal covers every command that changes wsmp itself: `wsmp login`, `wsmp secret
 set|remove`, the `wsmp config` setters (`init`, `set-…`, `clear-file-roots`), `wsmp service
@@ -165,10 +169,12 @@ show|path`, `wsmp service status|env-path`, listings) and lowering (`wsmp trust 
 terminal approvals revoke`) work from anywhere.
 
 This is a **best-effort guard against agents** raising or widening their own access through the
-server: dropping `WSMP_JOB` does not get past it. It is **not a security boundary against other
-code running as your user**: such code can name a unit like a terminal's scope, `ssh` back in to
-this machine, or simply edit your files, including this CLI's configuration. If you do not trust
-the code on this account, Relay only does not make it safe.
+server: dropping `WSMP_JOB`, `systemd-run --user` or a crontab does not get past it. It is **not a
+security boundary against other code running as your user**: such code can move itself into a
+cgroup named like a terminal's, ask your tmux to run a command, `ssh` back in to this machine, or
+simply edit your files, including this CLI's configuration. Run the relay as its service (`wsmp
+service install`): a command of a relay you started by hand can detach (`setsid`) from it. If you do
+not trust the code on this account, Relay only does not make it safe.
 
 Lowering only stops new agent access through wsmp. It does not undo or contain software an agent
 already left on the node while it had Full control, such as a systemd user service: that software
