@@ -664,3 +664,52 @@ fn a_run_outside_the_nodes_units_needs_its_status_to_say_stopped() {
     probe.step_id = "p2".into();
     assert!(executor.execute(probe, &runtime, deadline()).stopped);
 }
+
+#[test]
+fn a_service_whose_unit_is_empty_still_needs_its_status_to_say_stopped() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(service(stubbed(job(JobPhase::Start))), &runtime, deadline());
+    // The start handed off (docker run -d): the unit has no task, the port is not bound yet.
+    runtime.units.borrow_mut().clear();
+    runtime.status_alive.set(Some(true));
+    let short = Deadline::new(Duration::from_millis(1_200));
+    let stop = executor.execute(service(stubbed(job(JobPhase::Stop))), &runtime, short);
+    assert_eq!((stop.status, stop.stopped), (JobStatus::Failed, false));
+    let mut probe = service(stubbed(job(JobPhase::Status)));
+    probe.step_id = "p1".into();
+    assert_eq!(
+        executor
+            .execute(probe, &runtime, deadline())
+            .detail
+            .as_deref(),
+        Some("status_running")
+    );
+    runtime.status_alive.set(Some(false));
+    let mut probe = service(stubbed(job(JobPhase::Status)));
+    probe.step_id = "p2".into();
+    assert!(executor.execute(probe, &runtime, deadline()).stopped);
+}
+
+#[test]
+fn a_prepare_a_person_ran_does_not_make_a_process_runtime_need_its_status() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    runtime.status_alive.set(Some(true));
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(stubbed(job(JobPhase::Start)), &runtime, deadline());
+    executor
+        .state
+        .records
+        .get_mut("in1:0")
+        .expect("record")
+        .invocations
+        .insert("wsmp-i-abcdefabcdef-r0-prepare".into(), "external".into());
+    runtime.units.borrow_mut().clear();
+    let mut probe = stubbed(job(JobPhase::Status));
+    probe.step_id = "p1".into();
+    assert!(executor.execute(probe, &runtime, deadline()).stopped);
+}

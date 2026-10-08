@@ -74,11 +74,12 @@ terminal. Only the person runs or dismisses it, so `cancel` refuses.
 A stopping instance keeps its resources and port until its node proves the
 stop. The node proves it from what it observes itself: no process is left in
 the rank's units (their control groups are empty) and the rank's port is
-free. For a run the node started in its own units, the `status` command is not
-needed for that proof and cannot block it (a stub `status: "true"` would say
-"alive" forever). A run the node did not start in a unit of its own (a start a
-person ran in a terminal) also needs its `status` command to say stopped
-(exit 3). A stop step completes as soon as this proof holds. When the stop
+free. For a `process` runtime (its processes stay in the node's units) the
+`status` command is not needed for that proof and cannot block it (a stub
+`status: "true"` would say "alive" forever). A run whose processes may live
+outside the node's units also needs its `status` command to say stopped (exit
+3): a `service` runtime, a start a person ran in a terminal, and any run on a
+node without systemd units. A stop step completes as soon as this proof holds. When the stop
 steps fail, the server asks the node for a status probe that checks the same
 proof; the stop then completes with no person involved. Only when the node
 cannot prove it (still alive, or offline for 10 minutes) does the instance
@@ -99,7 +100,8 @@ probes go on after that, also on a STOPPED instance, and the first one that
 proves the stop releases the claim; `lastStopCheck` keeps showing why.
 `runtimes_get` keeps listing a STOPPED or FAILED instance while any of its
 ranks is still reserved, with that `reserved` state and `lastStopCheck`
-(instance rows leave out null fields and empty lists). Marking such a rank
+(instance rows leave out null fields and empty lists: an absent field is
+null, e.g. no `nodeSlug` means the node was removed). Marking such a rank
 stopped again answers CONFLICT with the last automatic check's result. Each
 node marked stopped writes a `marked_stopped` row in the node's activity.
 
@@ -124,9 +126,10 @@ A spec has exactly one of:
   `always_on_runtime`. Its health is probed automatically; `model_test`
   checks it now.
 - `launch` (a **startable** runtime: commands that start one):
-  - `management`: `process` (the node owns the process) or `service` (the start
-    may hand off to a service; its `status` command says whether it runs: exit 0
-    alive, exit 3 stopped).
+  - `management`: `process` (the node owns the process: every process stays in
+    the unit the node starts; a start that hands off to docker or a service
+    manager must be `service`) or `service` (stop and a `status` command prove
+    it; exit 0 alive, exit 3 stopped).
   - `groupSize` (1–64 nodes), `resources` (one entry, or one per rank:
     `{kind: "none"}`, `{kind: "unified", memoryGb}`, `{kind: "cpu", ramGb}` or
     `{kind: "discrete", gpuCount, vramGb, ramGb?, vendor?}`), `labels` the node

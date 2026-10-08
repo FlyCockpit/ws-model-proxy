@@ -839,23 +839,24 @@ impl Executor {
         self.complete(job, outcome)
     }
 
-    /// Why the rank's stop is not proven, or `None` when it is. Stops, status
-    /// probes and the re-check of a recorded stop all ask this one question.
+    /// Why the rank's stop is not proven, or `None` when it is. Stops and
+    /// status probes ask this one question.
     ///
     /// The proof rests on what the node observes itself: no unit of the rank
     /// (owned, or recorded by its launch) has a task left in its control group,
-    /// and the rank's port is free. For a run the node launched in its own
-    /// units (`KillMode=control-group`), those facts are the proof and the
-    /// definition's status command is not needed: its answer can neither block
-    /// nor replace them (a stub `true`, "alive" forever, must not hold a claim
-    /// forever). A run the node did not launch in a unit of its own (an
-    /// operator-run start, `external`; a platform without units,
-    /// `self-detached`) has no unit to observe: there the status command must
-    /// also say stopped (exit 3).
+    /// and the rank's port is free. A `process` runtime runs in the node's own
+    /// units (`KillMode=control-group`): those facts are its proof, and its
+    /// status command can neither block nor replace them (a stub `true`, "alive"
+    /// forever, must not hold a claim forever). A run whose processes may live
+    /// outside the node's units also needs its status command to say stopped
+    /// (exit 3): a `service` runtime (its start may hand off to docker or a
+    /// service manager, so an empty unit and a port not yet bound prove
+    /// nothing), a serving step a person ran in an operator terminal
+    /// (`external`), and any run on a platform without units (`self-detached`).
     ///
     /// Reasons: `process_alive`, `process_unknown` (the user manager could not
-    /// say), `port_in_use`, `unowned_service` (no unit and no status command),
-    /// `status_running`, `status_unknown`.
+    /// say), `port_in_use`, `unowned_service` (outside the node's units with no
+    /// status command), `status_running`, `status_unknown`.
     fn stop_unproven(
         &self,
         job: &Job,
@@ -867,14 +868,16 @@ impl Executor {
         // port or status command, so both the probe's and the record's are checked.
         let mut statuses: Vec<(&Job, &str)> = Vec::new();
         let mut ports = vec![(job.host.as_str(), job.port)];
-        // No record (lost): a service may have been started outside the node's units.
-        let mut detached = job.management() == Management::Service;
+        let mut detached =
+            job.management() == Management::Service || cfg!(not(target_os = "linux"));
         if let Some(record) = self.state.records.get(&job.key()) {
             units.extend(record.invocations.keys().cloned());
-            detached = record
-                .invocations
-                .values()
-                .any(|invocation| invocation == "external" || invocation == "self-detached");
+            let prepare = format!("{}-prepare", record.job.unit_name);
+            // A prepare a person ran leaves nothing serving; a serving step they ran may.
+            detached |= record.job.management() == Management::Service
+                || record.invocations.iter().any(|(unit, invocation)| {
+                    *unit != prepare && (invocation == "external" || invocation == "self-detached")
+                });
             if let Some(status) = record.job.status_command.as_deref() {
                 statuses.push((&record.job, status));
             }
@@ -1003,16 +1006,22 @@ impl Executor {
             }
         }
         // A stop command that exits at once (`true`) leaves nothing to wait for once the
-        // node's own observations prove the stop; a status command that keeps saying
-        // "alive" does not hold an owned run's stop until its deadline.
+        // proof holds; a status command that keeps saying "alive" does not hold a process
+        // runtime's stop until its deadline. Checks back off to one every 5 seconds.
+        let mut pause = Duration::from_millis(250);
         loop {
             if runtime.cancelled() {
                 return Err(fail(JobError::SessionDisconnected));
             }
-            let Some(reason) = self.stop_unproven(job, runtime, deadline)? else {
-                break;
+            let reason = match self.stop_unproven(job, runtime, deadline) {
+                Ok(None) => break,
+                Ok(Some(reason)) => reason,
+                // Out of time inside a check: the same answer as out of time between checks.
+                Err(_) if deadline.remaining().is_err() && !runtime.cancelled() => "deadline",
+                Err(error) => return Err(error),
             };
-            if deadline.sleep(Duration::from_millis(500)).is_err() {
+            pause = (pause * 2).min(Duration::from_secs(5));
+            if deadline.sleep(pause).is_err() {
                 tracing::warn!(
                     instance_id = job.instance_id,
                     rank = job.rank,
