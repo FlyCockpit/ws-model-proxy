@@ -21,12 +21,19 @@ const db = vi.hoisted(() => {
   };
 });
 vi.mock("@ws-model-proxy/db", () => ({ default: db.client }));
+vi.mock("@ws-model-proxy/env/server", () => ({ env: { BETTER_AUTH_SECRET: "x".repeat(32) } }));
 
 const { createNodeOperatorServices, NodeCommandStartError } = await import(
   "./node-operator-services.js"
 );
 const { NodeCommandTracker, NODE_COMMAND_SWEEP_PAGE } = await import("./node-command-tracker.js");
 const { TerminalTicketStore } = await import("./terminal-tickets.js");
+const { PRODUCT_CREDENTIAL_PREFIXES, generateProductCredentialSecret } = await import(
+  "@ws-model-proxy/db/node-security"
+);
+const { CLI_OUTPUT_CREDENTIAL_PREFIXES } = await import(
+  "@ws-model-proxy/config/cli-command-output"
+);
 
 import type { ServerToNodeControlFrame } from "./frames.js";
 import type { NodeSessionRef, SendGuard } from "./session-manager.js";
@@ -233,6 +240,21 @@ describe("node operator services: commands", () => {
     await s.handlers["exec.status"]?.(ref({ connectionGeneration: 2 }), status("running", "old"));
     await s.handlers["exec.status"]?.(ref(), status("running"));
     await expect(polled).resolves.toEqual({ state: "RUNNING", output: "" });
+  });
+
+  it("removes product credentials and terminal sequences from the output", async () => {
+    const nodeCredential = generateProductCredentialSecret("nodeCredential");
+    const apiKey = generateProductCredentialSecret("apiKey");
+    const s = setup();
+    const polled = s.services.pollCommand({ ...startArgs, waitMs: 0, cancel: false });
+    await s.handlers["exec.status"]?.(
+      ref(),
+      status("running", `\u001b[1mcred=${nodeCredential}\u001b[0m\nAuthorization: ${apiKey} ok\n`),
+    );
+    const answer = await polled;
+    expect(answer?.output).toBe("cred=[redacted]\nAuthorization: [redacted] ok\n");
+    expect(answer?.output).not.toContain(nodeCredential);
+    expect(answer?.output).not.toContain(apiKey);
   });
 
   it("waits for the end, answering at once when it arrives before waitMs", async () => {
@@ -595,5 +617,13 @@ describe("node operator services: the node's owner", () => {
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
     expect(s.tickets.size).toBe(0);
     expect(warn.mock.calls).toEqual([[REFUSED, "terminal_ticket"]]);
+  });
+});
+
+describe("command output credential prefixes", () => {
+  it("equal the product credential prefixes, so every minted secret is removed", () => {
+    expect([...CLI_OUTPUT_CREDENTIAL_PREFIXES].sort()).toEqual(
+      Object.values(PRODUCT_CREDENTIAL_PREFIXES).sort(),
+    );
   });
 });

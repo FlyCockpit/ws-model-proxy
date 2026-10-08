@@ -25,6 +25,7 @@ import {
   NODE_COMMAND_MAX_MS,
   NODE_COMMAND_TAIL_MAX_BYTES,
 } from "@ws-model-proxy/api/lib/runtime-spec";
+import { cleanText } from "@ws-model-proxy/config/cli-command-output";
 import prisma from "@ws-model-proxy/db";
 import type {
   NodeToServerControlFrame,
@@ -91,7 +92,9 @@ function liveStatus(frame: ExecStatusFrame): NodeCommandLiveStatus {
   return {
     state: nodeCommandStateFromWire(frame.state),
     ...(frame.exitCode !== undefined ? { exitCode: frame.exitCode } : {}),
-    output: frame.tail ?? "",
+    // The node masks secrets it recognizes; the server strips terminal sequences again and
+    // removes product credentials (`CLI_OUTPUT_CREDENTIAL_PREFIXES`) before anyone sees it.
+    output: cleanText(frame.tail ?? ""),
     ...(frame.truncated !== undefined ? { truncated: frame.truncated } : {}),
     ...(frame.finishedAt !== undefined ? { finishedAt: new Date(frame.finishedAt) } : {}),
   };
