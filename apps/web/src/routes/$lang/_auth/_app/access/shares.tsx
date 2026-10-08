@@ -1,5 +1,5 @@
 import { useForm } from "@tanstack/react-form";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@ws-model-proxy/ui/components/card";
@@ -16,7 +16,12 @@ import { useTranslation } from "react-i18next";
 import z from "zod";
 
 import { ConfirmAction } from "@/components/access/confirm-action";
-import { SecretReveal } from "@/components/access/secret-reveal";
+import {
+  type InviteLink,
+  InviteLinkDialog,
+  RuntimeShareRow,
+  useInvalidateShares,
+} from "@/components/access/runtime-shares";
 import { InlineRetry } from "@/components/inline-retry";
 import { PageHeading } from "@/components/page-stub";
 import { SegmentedControl } from "@/components/segmented-control";
@@ -52,7 +57,6 @@ type InviteView = {
   expiresAt: string;
   emailSentAt: string | null;
 };
-type InviteLink = { email: string; link: string; expiresAt: string };
 
 function AccessSharesPage() {
   const { t } = useTranslation(["access"]);
@@ -126,17 +130,6 @@ function Empty({ text }: { text: string }) {
   return <p className="text-sm text-muted-foreground">{text}</p>;
 }
 
-function useInvalidateShares() {
-  const queryClient = useQueryClient();
-  return () =>
-    Promise.all([
-      queryClient.invalidateQueries({ queryKey: orpc.access.shares.list.key() }),
-      queryClient.invalidateQueries({ queryKey: orpc.runtimes.shares.list.key() }),
-      // A runtime's page lists its shares too.
-      queryClient.invalidateQueries({ queryKey: orpc.runtimes.get.key() }),
-    ]);
-}
-
 /** Runtime definitions you share (read-only, every version), with stop sharing. */
 function RuntimeSharesByMe() {
   const { t } = useTranslation(["access"]);
@@ -163,49 +156,6 @@ function RuntimeSharesByMe() {
         ))
       )}
     </Section>
-  );
-}
-
-function RuntimeShareRow({
-  share,
-  name,
-}: {
-  share: { id: string; runtimeId: string; email: string };
-  name: string;
-}) {
-  const { t } = useTranslation(["access"]);
-  const invalidate = useInvalidateShares();
-  const [confirmOpen, setConfirmOpen] = useState(false);
-  const remove = useMutation(
-    orpc.runtimes.shares.delete.mutationOptions({
-      onSuccess: async () => {
-        setConfirmOpen(false);
-        toast.success(t("access:shares.removed"));
-        await invalidate();
-      },
-    }),
-  );
-  return (
-    <div className="flex min-w-0 flex-wrap items-start justify-between gap-2 py-3 first:pt-0 last:pb-0">
-      <div className="min-w-0 space-y-0.5">
-        <p className="truncate font-medium">{share.email}</p>
-        <p className="truncate text-xs text-muted-foreground">
-          {t("access:shares.runtimeTarget", { name })}
-        </p>
-      </div>
-      <Button type="button" variant="outline" size="touch" onClick={() => setConfirmOpen(true)}>
-        {t("access:shares.remove")}
-      </Button>
-      <ConfirmAction
-        open={confirmOpen}
-        onOpenChange={setConfirmOpen}
-        title={t("access:shares.removeRuntimeTitle", { runtime: name, email: share.email })}
-        description={t("access:shares.removeRuntimeDescription")}
-        confirmLabel={t("access:shares.remove")}
-        isPending={remove.isPending}
-        onConfirm={() => remove.mutate({ shareId: share.id })}
-      />
-    </div>
   );
 }
 
@@ -475,32 +425,6 @@ function InviteRow({ invite, onLink }: { invite: InviteView; onLink: (link: Invi
         onConfirm={() => withdraw.mutate({ inviteId: invite.id })}
       />
     </div>
-  );
-}
-
-function InviteLinkDialog({ value, onClose }: { value: InviteLink | null; onClose: () => void }) {
-  const { t, i18n } = useTranslation(["access"]);
-  return (
-    <ResponsiveDialog
-      open={value !== null}
-      onOpenChange={(next) => (next ? undefined : onClose())}
-      title={t("access:shares.inviteLinkTitle")}
-    >
-      {value ? (
-        <SecretReveal
-          value={value.link}
-          title={t("access:shares.inviteLinkTitle")}
-          description={t("access:shares.inviteLinkDescription", {
-            email: value.email,
-            date: new Date(value.expiresAt).toLocaleDateString(i18n.language, {
-              dateStyle: "medium",
-            }),
-          })}
-          copyLabel={t("access:shares.copyInviteLink")}
-          onDone={onClose}
-        />
-      ) : null}
-    </ResponsiveDialog>
   );
 }
 
