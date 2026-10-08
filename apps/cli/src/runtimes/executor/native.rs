@@ -392,13 +392,14 @@ impl Runtime for NativeRuntime {
                     anyhow::ensure!(!self.cancelled(), "launch incomplete");
                     let current = self.identity(unit, owner, deadline)?;
                     // A `process` start whose command exited 0 (the unit stays active with
-                    // no task) while its port is taken handed its server off (`docker
+                    // no task) while its port answers handed its server off (`docker
                     // compose up -d`): nothing of it runs where wsmp can watch or stop it.
                     if current.is_some()
                         && job.action == JobPhase::Start
                         && job.management() == Management::Process
+                        && self.exited_cleanly(unit, deadline)?
                         && !self.tasks_alive(unit, deadline)?
-                        && !self.port_free(&job.host, job.port)
+                        && self.port_answers(&job.host, job.port)
                     {
                         return Err(super::fail(
                             crate::protocol::frames::JobError::ProcessDetached,
@@ -672,6 +673,42 @@ impl Runtime for NativeRuntime {
         port_free(host, port)
     }
 
+    fn exited_cleanly(&self, unit: &str, deadline: Deadline) -> Result<bool> {
+        deadline.remaining()?;
+        #[cfg(target_os = "linux")]
+        {
+            let output = manager_until(
+                "systemctl",
+                &[
+                    "--user".into(),
+                    "show".into(),
+                    unit.into(),
+                    "--property=SubState,ExecMainCode,ExecMainStatus".into(),
+                ],
+                deadline,
+                self.cancel_flag(),
+                &[],
+            )?;
+            Ok(main_exited_cleanly(&output))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = unit;
+            Ok(false)
+        }
+    }
+
+    fn port_answers(&self, host: &str, port: u16) -> bool {
+        let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::new(ip, port),
+            Duration::from_secs(1),
+        )
+        .is_ok()
+    }
+
     fn stop_slice(&self, slice: &str, deadline: Deadline) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -775,6 +812,18 @@ impl Runtime for NativeRuntime {
     }
 }
 
+/// `systemctl show` of a unit whose main process exited with status 0
+/// (`ExecMainCode=1` is CLD_EXITED; a signal is 2 or more).
+fn main_exited_cleanly(output: &str) -> bool {
+    let fields = output
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    fields.get("SubState") == Some(&"exited")
+        && fields.get("ExecMainCode") == Some(&"1")
+        && fields.get("ExecMainStatus") == Some(&"0")
+}
+
 /// Why a readiness request failed before any answer.
 fn health_miss(error: &ureq::Error) -> HealthMiss {
     match error {
@@ -793,6 +842,23 @@ fn health_miss(error: &ureq::Error) -> HealthMiss {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_main_process_that_exited_zero_exited_cleanly() {
+        assert!(main_exited_cleanly(
+            "SubState=exited\nExecMainCode=1\nExecMainStatus=0\n"
+        ));
+        // Killed by a signal (SIGKILL: an OOM kill), a non-zero exit, still running.
+        assert!(!main_exited_cleanly(
+            "SubState=exited\nExecMainCode=2\nExecMainStatus=9\n"
+        ));
+        assert!(!main_exited_cleanly(
+            "SubState=failed\nExecMainCode=1\nExecMainStatus=1\n"
+        ));
+        assert!(!main_exited_cleanly(
+            "SubState=running\nExecMainCode=0\nExecMainStatus=0\n"
+        ));
+    }
 
     #[test]
     fn a_unit_with_no_task_runs_nothing() {

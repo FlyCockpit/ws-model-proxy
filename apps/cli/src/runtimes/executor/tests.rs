@@ -65,6 +65,8 @@ struct Fake {
     /// Once the port answers, the start unit has no task left (a start that
     /// handed its server off, like `docker compose up -d`).
     detach_on_probe: Cell<bool>,
+    /// The start unit's main process exited with status 0.
+    exited_cleanly: Cell<bool>,
 }
 
 impl Fake {
@@ -84,6 +86,7 @@ impl Fake {
             status_alive: Cell::new(None),
             tasks_unknown: Cell::new(false),
             detach_on_probe: Cell::new(false),
+            exited_cleanly: Cell::new(false),
         }
     }
 }
@@ -142,6 +145,12 @@ impl Runtime for Fake {
     }
     fn port_free(&self, _: &str, port: u16) -> bool {
         !self.port_busy.get() && !self.busy_ports.borrow().contains(&port)
+    }
+    fn exited_cleanly(&self, _: &str, _: Deadline) -> Result<bool> {
+        Ok(self.exited_cleanly.get())
+    }
+    fn port_answers(&self, _: &str, _: u16) -> bool {
+        self.ready.get()
     }
     fn forget_slice(&self, slice: &str, _: Deadline) {
         self.forgotten.borrow_mut().push(slice.into());
@@ -412,6 +421,59 @@ fn a_failed_health_probe_says_why() {
     assert!(text.contains(r#""detail":"serving_unconfirmed""#), "{text}");
 }
 
+/// A probe that uses up all the time it is given.
+struct Stalling {
+    inner: Fake,
+}
+
+impl Runtime for Stalling {
+    fn launch(&self, job: &Job, owner: &str, unit: &str, deadline: Deadline) -> Result<String> {
+        self.inner.launch(job, owner, unit, deadline)
+    }
+    fn identity(&self, unit: &str, owner: &str, deadline: Deadline) -> Result<Option<String>> {
+        self.inner.identity(unit, owner, deadline)
+    }
+    fn shell_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<()> {
+        self.inner.shell_until(job, command, deadline)
+    }
+    fn status_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<bool> {
+        self.inner.status_until(job, command, deadline)
+    }
+    fn stop(&self, unit: &str, owner: &str, invocation: &str, deadline: Deadline) -> Result<()> {
+        self.inner.stop(unit, owner, invocation, deadline)
+    }
+    fn healthy_until(&self, _: &Job, deadline: Deadline) -> std::result::Result<(), HealthMiss> {
+        while deadline.remaining().is_ok() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Err(HealthMiss::Timeout)
+    }
+    fn tasks_alive(&self, unit: &str, deadline: Deadline) -> Result<bool> {
+        self.inner.tasks_alive(unit, deadline)
+    }
+    fn port_free(&self, host: &str, port: u16) -> bool {
+        self.inner.port_free(host, port)
+    }
+}
+
+#[test]
+fn a_stalled_health_probe_answers_timeout_within_its_deadline() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Stalling {
+        inner: Fake::new(path.clone()),
+    };
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(job(JobPhase::Start), &runtime, deadline());
+    let mut health = job(JobPhase::Health);
+    health.step_id = "h1".into();
+    let outcome = executor.execute(health, &runtime, Deadline::new(Duration::from_secs(3)));
+    assert_eq!(
+        (outcome.error, outcome.detail.as_deref()),
+        (Some(JobError::HealthFailed), Some("timeout"))
+    );
+}
+
 #[test]
 fn health_miss_details_are_plain_codes() {
     for (miss, detail) in [
@@ -435,6 +497,7 @@ fn a_process_start_that_hands_its_server_off_fails_detached() {
     let mut executor = Executor::load(path).expect("load");
     executor.execute(job(JobPhase::Start), &runtime, deadline());
     runtime.detach_on_probe.set(true);
+    runtime.exited_cleanly.set(true);
     let outcome = executor.execute(job(JobPhase::Readiness), &runtime, deadline());
     assert_eq!(outcome.error, Some(JobError::ProcessDetached));
     assert_ne!(
@@ -450,8 +513,10 @@ fn a_process_start_already_handed_off_at_readiness_fails_detached() {
     let runtime = Fake::new(path.clone());
     let mut executor = Executor::load(path).expect("load");
     executor.execute(job(JobPhase::Start), &runtime, deadline());
-    // The start unit emptied before readiness began, and the port answers.
+    // The start unit emptied before readiness began (its command exited 0), and the port
+    // answers.
     runtime.units.borrow_mut().clear();
+    runtime.exited_cleanly.set(true);
     let outcome = executor.execute(job(JobPhase::Readiness), &runtime, deadline());
     assert_eq!(outcome.error, Some(JobError::ProcessDetached));
     // Nothing answers either: an ordinary readiness failure, at once.
@@ -462,6 +527,19 @@ fn a_process_start_already_handed_off_at_readiness_fails_detached() {
     executor.execute(job(JobPhase::Start), &runtime, deadline());
     runtime.units.borrow_mut().clear();
     runtime.ready.set(false);
+    let outcome = executor.execute(job(JobPhase::Readiness), &runtime, deadline());
+    assert_eq!(outcome.error, Some(JobError::ReadinessFailed));
+}
+
+#[test]
+fn a_process_that_crashes_after_answering_is_not_a_hand_off() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(job(JobPhase::Start), &runtime, deadline());
+    // The server answered once, then died (a crash or an OOM kill, not an exit 0).
+    runtime.detach_on_probe.set(true);
     let outcome = executor.execute(job(JobPhase::Readiness), &runtime, deadline());
     assert_eq!(outcome.error, Some(JobError::ReadinessFailed));
 }

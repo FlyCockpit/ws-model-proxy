@@ -27,11 +27,11 @@ import { randomBytes } from "node:crypto";
 import { sameStoredInstanceFacts, storedInstanceFacts } from "@ws-model-proxy/api/lib/engine-facts";
 import { graphWrite, instanceCapacityFences } from "@ws-model-proxy/api/lib/graph-write";
 import { type RuntimeLaunch, runtimeLaunchSchema } from "@ws-model-proxy/api/lib/runtime-spec";
+import { healthFailureDetail } from "@ws-model-proxy/config/health-reasons";
 import { RUNTIME_ADVANCED } from "@ws-model-proxy/config/runtime-defaults";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import {
-  healthFailureDetail,
   type InstanceRecord,
   type NodeToServerControlFrame,
   type NodeTrustWire,
@@ -2399,8 +2399,12 @@ export class RuntimeLifecycle {
         healthFailures: failures,
         healthSuccesses: successes,
         lastHealthAt: now,
-        // The last failure's reason stays while the instance is unhealthy; READY clears it.
-        ...(success ? (phase === "READY" ? { healthDetail: null } : {}) : { healthDetail: detail }),
+        // Why the last probe failed, kept while the instance is UNHEALTHY; READY clears it.
+        ...(phase === "UNHEALTHY"
+          ? success
+            ? {}
+            : { healthDetail: detail }
+          : { healthDetail: null }),
         ...(phase !== instance.phase
           ? {
               phase,

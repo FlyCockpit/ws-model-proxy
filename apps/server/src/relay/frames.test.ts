@@ -16,7 +16,6 @@ import {
 import { describe, expect, it } from "vitest";
 import type { z } from "zod";
 import {
-  healthFailureDetail,
   NODE_TO_SERVER_CONTROL_TYPES,
   nodeToServerBinaryMetadataSchema,
   nodeToServerControlFrameSchema,
@@ -272,13 +271,5 @@ describe("runtime job results", () => {
     expect(
       nodeToServerControlFrameSchema.safeParse({ ...result, error: "process_detached" }).success,
     ).toBe(true);
-  });
-
-  it("keeps only the health reasons it knows", () => {
-    expect(healthFailureDetail("http_404")).toBe("http_404");
-    expect(healthFailureDetail("serving_unconfirmed")).toBe("serving_unconfirmed");
-    expect(healthFailureDetail("http_99")).toBeNull();
-    expect(healthFailureDetail("port_in_use")).toBeNull();
-    expect(healthFailureDetail(undefined)).toBeNull();
   });
 });

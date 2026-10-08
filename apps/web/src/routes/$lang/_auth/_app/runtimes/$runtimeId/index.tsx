@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
+import { healthHttpStatus, isHealthFailure } from "@ws-model-proxy/config/health-reasons";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
@@ -269,30 +270,16 @@ function ServedModelRow({ runtime, model }: { runtime: RuntimeDetail; model: Ser
   );
 }
 
-const HEALTH_REASONS = [
-  "serving_unconfirmed",
-  "connect_refused",
-  "timeout",
-  "unreachable",
-  "command_failed",
-  "status_not_running",
-] as const;
-type HealthReason = (typeof HEALTH_REASONS)[number];
-
-function isHealthReason(value: string): value is HealthReason {
-  return (HEALTH_REASONS as readonly string[]).includes(value);
-}
-
 /** Why the instance is unhealthy or failed to start, when the node said. */
 function InstanceReasonNote({ instance }: { instance: Instance }) {
   const { t } = useTranslation();
   const detail = instance.healthDetail;
-  const status = detail ? /^http_(\d{3})$/.exec(detail)?.[1] : undefined;
+  const status = detail ? healthHttpStatus(detail) : null;
   const reason = !detail
     ? null
     : status
       ? t("dashboard:runtime.healthReason.http", { status })
-      : isHealthReason(detail)
+      : isHealthFailure(detail)
         ? t(`dashboard:runtime.healthReason.${detail}`)
         : detail;
   return (

@@ -168,7 +168,7 @@ export const instanceViewSchema = z
     phaseChangedAt: isoDateSchema,
     /**
      * Why the last health probe failed (`serving_unconfirmed`, `http_<code>`, `connect_refused`,
-     * `timeout`, `unreachable`, `command_failed`, `status_not_running`); null once READY again.
+     * `timeout`, `unreachable`, `command_failed`, `status_not_running`); null unless UNHEALTHY.
      */
     healthDetail: z.string().nullable(),
     needsOperator: z.enum(OPERATOR_NEED).nullable(),

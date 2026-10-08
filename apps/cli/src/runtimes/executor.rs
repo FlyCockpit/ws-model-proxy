@@ -172,6 +172,9 @@ impl Outcome {
     }
 }
 
+/// What a health step keeps of its deadline to record and answer its probe.
+const HEALTH_ANSWER_RESERVE: Duration = Duration::from_secs(2);
+
 /// Why a health (or readiness) probe failed; a health result sends it as its
 /// `detail`. Plain codes only, never the response or command output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,6 +430,15 @@ pub trait Runtime {
     fn tasks_alive(&self, unit: &str, deadline: Deadline) -> Result<bool>;
     /// Whether nothing listens on `port` (any address, and `host`).
     fn port_free(&self, host: &str, port: u16) -> bool;
+    /// Whether the unit's main process exited with status 0 (a `RemainAfterExit` unit stays
+    /// active after that). A crash, a signal or a unit still running is not. Errors are unknown.
+    fn exited_cleanly(&self, _unit: &str, _deadline: Deadline) -> Result<bool> {
+        Ok(false)
+    }
+    /// Whether something accepts a connection on `host:port` now.
+    fn port_answers(&self, _host: &str, _port: u16) -> bool {
+        false
+    }
     /// The rank's slice was proven empty: let the manager forget it (best effort).
     fn forget_slice(&self, _slice: &str, _deadline: Deadline) {}
     /// A stop ends whatever still runs in the rank's slice: SIGTERM, then SIGKILL after a grace
@@ -880,11 +892,13 @@ impl Executor {
                         "the start handed its server off out of wsmp's units; use management \"service\" with stop and status commands",
                     )
                 };
+                // Handed off, not crashed: the start command exited 0 and the server answers.
+                let handed_off = || -> Result<bool> {
+                    Ok(runtime.exited_cleanly(&phase_unit(job), deadline)?
+                        && probe_once(job, runtime, deadline.cap(Duration::from_secs(10))).is_ok())
+                };
                 if !serving_confirmed(record, &self.state.owner_id, runtime, deadline)? {
-                    // Already gone: a server that answers anyway runs elsewhere.
-                    if watched
-                        && probe_once(job, runtime, deadline.cap(Duration::from_secs(10))).is_ok()
-                    {
+                    if watched && handed_off()? {
                         return detached();
                     }
                     anyhow::bail!("serving process unconfirmed");
@@ -905,7 +919,12 @@ impl Executor {
                         deadline,
                     )?
                 {
-                    return detached();
+                    // A server that answered and then crashed is an ordinary failed
+                    // readiness (restarted as usual), not a hand-off.
+                    if handed_off()? {
+                        return detached();
+                    }
+                    anyhow::bail!("serving process unconfirmed");
                 }
                 self.state.records.get_mut(&key).context("record")?.phase = InstancePhase::Ready;
                 Outcome::ok(false)
@@ -918,7 +937,13 @@ impl Executor {
                     runtime,
                     deadline,
                 )? {
-                    probe_once(job, runtime, deadline).err()
+                    // Keep time to answer: a probe that runs out of it is a `timeout`,
+                    // not a step past its deadline.
+                    let reserve = deadline
+                        .remaining()?
+                        .saturating_sub(HEALTH_ANSWER_RESERVE)
+                        .max(Duration::from_millis(100));
+                    probe_once(job, runtime, deadline.cap(reserve)).err()
                 } else {
                     Some(HealthMiss::ServingUnconfirmed)
                 };
