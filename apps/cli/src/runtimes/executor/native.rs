@@ -169,11 +169,13 @@ fn unit_tasks_alive(output: &str, populated: impl FnOnce(&str) -> Option<bool>) 
         .is_none_or(|tasks| tasks > 0)
 }
 
-/// `populated` of a control group (cgroup v2 `cgroup.events`), or `None` when it cannot be read
-/// (cgroup v1, or a path that is not a plain absolute group path). A group that does not exist
-/// any more holds nothing.
+/// Whether a control group (and every group below it) has a process, read from the cgroup
+/// file system at `root` (`/sys/fs/cgroup`): cgroup v2 `cgroup.events` (`populated`), the
+/// unified hierarchy of a hybrid host, else the v1 `systemd` hierarchy's `cgroup.procs`, walked.
+/// `None` when it cannot be read (not a plain absolute path, the group not found there): the
+/// caller then decides from systemd's own task count.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn cgroup_populated(group: &str) -> Option<bool> {
+fn cgroup_populated_at(root: &std::path::Path, group: &str) -> Option<bool> {
     let plain = group.starts_with('/')
         && group
             .split('/')
@@ -182,19 +184,46 @@ fn cgroup_populated(group: &str) -> Option<bool> {
     if !plain {
         return None;
     }
-    let root = std::path::Path::new("/sys/fs/cgroup");
-    if !root.join("cgroup.controllers").exists() {
+    let relative = &group[1..];
+    for unified in [root.to_path_buf(), root.join("unified")] {
+        if !unified.join("cgroup.controllers").exists() && !unified.join("cgroup.procs").exists() {
+            continue;
+        }
+        if let Ok(events) = std::fs::read_to_string(unified.join(relative).join("cgroup.events")) {
+            return events.lines().find_map(|line| match line.trim() {
+                "populated 1" => Some(true),
+                "populated 0" => Some(false),
+                _ => None,
+            });
+        }
+    }
+    let legacy = root.join("systemd").join(relative);
+    if legacy.is_dir() {
+        return v1_has_process(&legacy, 0);
+    }
+    None
+}
+
+/// A v1 group or any group below it lists a process (`None`: unreadable or too deep).
+fn v1_has_process(dir: &std::path::Path, depth: usize) -> Option<bool> {
+    if depth > 32 {
         return None;
     }
-    match std::fs::read_to_string(root.join(&group[1..]).join("cgroup.events")) {
-        Ok(events) => events.lines().find_map(|line| match line.trim() {
-            "populated 1" => Some(true),
-            "populated 0" => Some(false),
-            _ => None,
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
-        Err(_) => None,
+    let procs = std::fs::read_to_string(dir.join("cgroup.procs")).ok()?;
+    if procs.lines().any(|line| !line.trim().is_empty()) {
+        return Some(true);
     }
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        if entry.file_type().ok()?.is_dir() && v1_has_process(&entry.path(), depth + 1)? {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cgroup_populated(group: &str) -> Option<bool> {
+    cgroup_populated_at(std::path::Path::new("/sys/fs/cgroup"), group)
 }
 
 /// `/bin/sh -c script` with the rank's environment, inside a transient scope of the rank's
@@ -682,6 +711,54 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_populated_reads_v2_hybrid_and_v1_hierarchies() {
+        let write = |path: std::path::PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, text).expect("write");
+        };
+        // cgroup v2.
+        let v2 = tempfile::tempdir().expect("v2");
+        write(v2.path().join("cgroup.controllers"), "pids");
+        write(
+            v2.path().join("a/s.slice/cgroup.events"),
+            "populated 1\nfrozen 0\n",
+        );
+        write(
+            v2.path().join("a/e.slice/cgroup.events"),
+            "populated 0\nfrozen 0\n",
+        );
+        assert_eq!(cgroup_populated_at(v2.path(), "/a/s.slice"), Some(true));
+        assert_eq!(cgroup_populated_at(v2.path(), "/a/e.slice"), Some(false));
+        // A group systemd names but the file system does not have: not known.
+        assert_eq!(cgroup_populated_at(v2.path(), "/a/gone.slice"), None);
+        assert_eq!(cgroup_populated_at(v2.path(), "/a/../etc"), None);
+        assert_eq!(cgroup_populated_at(v2.path(), "relative"), None);
+        // Hybrid: the unified hierarchy under `unified/`.
+        let hybrid = tempfile::tempdir().expect("hybrid");
+        write(hybrid.path().join("unified/cgroup.procs"), "");
+        write(
+            hybrid.path().join("unified/a/s.slice/cgroup.events"),
+            "populated 1\n",
+        );
+        assert_eq!(cgroup_populated_at(hybrid.path(), "/a/s.slice"), Some(true));
+        // v1: the `systemd` hierarchy, walked below the group.
+        let v1 = tempfile::tempdir().expect("v1");
+        write(v1.path().join("systemd/a/s.slice/cgroup.procs"), "");
+        write(
+            v1.path().join("systemd/a/s.slice/run-1.scope/cgroup.procs"),
+            "4242\n",
+        );
+        write(v1.path().join("systemd/a/e.slice/cgroup.procs"), "");
+        write(
+            v1.path().join("systemd/a/e.slice/run-2.scope/cgroup.procs"),
+            "",
+        );
+        assert_eq!(cgroup_populated_at(v1.path(), "/a/s.slice"), Some(true));
+        assert_eq!(cgroup_populated_at(v1.path(), "/a/e.slice"), Some(false));
+        assert_eq!(cgroup_populated_at(v1.path(), "/a/gone.slice"), None);
+    }
+
+    #[test]
     fn a_listening_port_is_not_free() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
@@ -876,7 +953,10 @@ mod tests {
         // The port is taken again: neither the re-delivered stop nor the inventory says stopped.
         let taken = std::net::TcpListener::bind(("127.0.0.1", port)).expect("port");
         let again = executor.execute(job(JobPhase::Stop, "s5", daemon), &runtime, deadline(10));
-        assert_eq!((again.status, again.stopped), (JobStatus::Failed, false));
+        assert_eq!(
+            (again.stopped, again.detail.as_deref()),
+            (false, Some("port_in_use"))
+        );
         assert_eq!(
             executor.observations(&runtime, deadline(10))[0].1.phase,
             InstancePhase::Unknown

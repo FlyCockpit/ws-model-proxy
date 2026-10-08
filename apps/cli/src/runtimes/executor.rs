@@ -341,6 +341,7 @@ pub struct OperatorMark {
     phase: InstancePhase,
     pending: Option<Job>,
     job: Job,
+    outside_units: bool,
 }
 
 /// Executes the steps of one instance rank (one state file).
@@ -484,6 +485,7 @@ impl Executor {
                     phase: record.phase,
                     pending: record.pending.clone(),
                     job: record.job.clone(),
+                    outside_units: record.outside_units,
                 };
                 if matches!(job.action, JobPhase::Prepare | JobPhase::Start)
                     && record.invocations.is_empty()
@@ -524,6 +526,7 @@ impl Executor {
                     phase: InstancePhase::Unknown,
                     pending: None,
                     job: job.clone(),
+                    outside_units: false,
                 }
             }
         };
@@ -563,6 +566,7 @@ impl Executor {
             record.pending = mark.pending;
             record.phase = mark.phase;
             record.job = mark.job;
+            record.outside_units = mark.outside_units;
         }
         if let Err(error) = self.persist() {
             tracing::warn!(error = %format!("{error:#}"), "clearing an operator step failed");
@@ -642,10 +646,19 @@ impl Executor {
                     }
                     // Answered again only while the stop still holds, proven afresh (the
                     // port may have been taken since, a process may have come back).
-                    if let Some(reason) =
-                        self.stop_unproven(job, runtime, deadline.cap(Duration::from_secs(30)))?
-                    {
-                        anyhow::bail!("the stopped run is not proven stopped any more ({reason})");
+                    if let Some(reason) = self.stop_unproven(
+                        job,
+                        runtime,
+                        deadline.cap(Duration::from_secs(30)),
+                        true,
+                    )? {
+                        tracing::warn!(
+                            instance_id = job.instance_id,
+                            rank = job.rank,
+                            reason,
+                            "a stopped run is not proven stopped any more"
+                        );
+                        return Ok(Outcome::unproven(reason));
                     }
                 }
                 return Ok(done.outcome.clone());
@@ -881,11 +894,15 @@ impl Executor {
     /// Reasons: `process_alive`, `process_unknown` (the user manager could not
     /// say), `port_in_use`, `unowned_service` (outside the node's units with no
     /// status command), `status_running`, `status_unknown`.
+    ///
+    /// `run_status`: false for the inventory, which runs nothing in a rank's slice (it holds no
+    /// rank lock): a run that needs its status command is then simply not reported stopped.
     fn stop_unproven(
         &self,
         job: &Job,
         runtime: &impl Runtime,
         deadline: Deadline,
+        run_status: bool,
     ) -> Result<Option<&'static str>> {
         let record = self.state.records.get(&job.key());
         // Every unit of the rank and its slice (every command the node ran for it: start,
@@ -923,6 +940,9 @@ impl Executor {
             });
         if detached && statuses.is_empty() {
             return Ok(Some("unowned_service"));
+        }
+        if detached && !run_status {
+            return Ok(Some("status_unknown"));
         }
         if detached {
             for (owner, status) in statuses {
@@ -977,7 +997,7 @@ impl Executor {
         deadline: Deadline,
     ) -> Result<Outcome> {
         let key = job.key();
-        if let Some(reason) = self.stop_unproven(job, runtime, deadline)? {
+        if let Some(reason) = self.stop_unproven(job, runtime, deadline, true)? {
             return Ok(Outcome::unproven(reason));
         }
         deadline.remaining()?;
@@ -1051,7 +1071,7 @@ impl Executor {
             if runtime.cancelled() {
                 return Err(fail(JobError::SessionDisconnected));
             }
-            let reason = match self.stop_unproven(job, runtime, deadline) {
+            let reason = match self.stop_unproven(job, runtime, deadline, true) {
                 Ok(None) => break,
                 Ok(Some(reason)) => reason,
                 // Out of time inside a check: the same answer as out of time between checks.
@@ -1185,7 +1205,7 @@ impl Executor {
                             .identity(unit, &self.state.owner_id, deadline)
                             .is_ok_and(|seen| seen.is_none())
                     })
-                    && matches!(self.stop_unproven(job, runtime, deadline), Ok(None));
+                    && matches!(self.stop_unproven(job, runtime, deadline, false), Ok(None));
                 let phase = if absent {
                     InstancePhase::Stopped
                 } else if record.pending.is_some() || !owned {
