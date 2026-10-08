@@ -175,8 +175,11 @@ export const metricsQueryInputSchema = z
     ]),
     step: z.enum(METRIC_STEPS),
     groupBy: z.enum(GROUP_BY).optional(),
-    /** Include AGENT_TEST traffic (default: true here, false on the Overview). */
-    includeAgentTests: z.boolean().default(true),
+    /**
+     * Count agent tests (`model_test`) in the request metrics. Off by default (as on the
+     * Overview): metrics describe real load, and the tests left out are counted in `totals.tests`.
+     */
+    includeAgentTests: z.boolean().default(false),
   })
   .strict()
   .superRefine((input, ctx) => {
@@ -224,7 +227,8 @@ export const metricsQueryInputSchema = z
  * is left out (`at` lists the buckets that have some), a metric with no data is left out of
  * `totals`, and only the largest groups are returned (`truncated`). A point's time is
  * `start + at × step`. Units: ms (latency, ttft, queue wait), tokens/s, GB, percent (`*_pct`),
- * fractions 0–1 (kv usage, ratios, shares).
+ * fractions 0–1 (kv usage, ratios, shares). `totals.tests` (not a metric) counts the agent tests
+ * the request metrics left out, when there are any.
  */
 export const metricsQueryOutputSchema = z
   .object({

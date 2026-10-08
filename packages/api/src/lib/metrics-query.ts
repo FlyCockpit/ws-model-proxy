@@ -9,6 +9,11 @@
  * `ownerUserId` (they are the node owner's). A pool shared with the caller gives request metrics
  * of the caller's own requests to it only (`requesterUserId`), ungrouped or by source.
  *
+ * Agent tests (`AGENT_TEST`, MCP `model_test`) are not load: unless `includeAgentTests`, they are
+ * left out of every request metric and only counted, as `totals.tests` when there are any. A test
+ * of a runtime (`runtime:<id>:<model>`) is direct traffic: it has no pool, so it counts in the
+ * runtime, version, node and instance scopes, never in a pool the runtime serves.
+ *
  * Bounds: the contract caps buckets and buckets × metrics; here a grouped answer keeps the
  * largest groups that fit `METRICS_MAX_VALUES` values (two queries per family: totals by group,
  * then the series of the kept groups).
@@ -234,17 +239,21 @@ function bucketExpr(alias: string, stepMs: number): Prisma.Sql {
 
 type Window = { from: Date; to: Date; stepMs: number };
 
+/** Which request sources a request query reads: all, all but agent tests, or agent tests only. */
+type SourceFilter = "all" | "notTests" | "tests";
+
 function requestWhere(
   userId: string,
   scope: ResolvedScope,
   window: Window,
-  includeAgentTests: boolean,
+  sources: SourceFilter,
 ): Prisma.Sql {
   const parts: Prisma.Sql[] = [
     Prisma.sql`"bucketStart" >= ${window.from}`,
     Prisma.sql`"bucketStart" < ${window.to}`,
   ];
-  if (!includeAgentTests) parts.push(Prisma.sql`source <> 'AGENT_TEST'::"RequestSource"`);
+  if (sources === "notTests") parts.push(Prisma.sql`source <> 'AGENT_TEST'::"RequestSource"`);
+  if (sources === "tests") parts.push(Prisma.sql`source = 'AGENT_TEST'::"RequestSource"`);
   // Placement scopes count traffic of the caller's own pools and direct calls only (as the
   // request log does): a runtime contributed to someone else's pool serves that owner's users.
   if (scope.kind !== "pool") parts.push(Prisma.sql`"ownerUserId" = ${userId}`);
@@ -343,6 +352,28 @@ type FamilyPlan = {
   series: (keys: readonly string[] | null) => Promise<Row[]>;
 };
 
+/**
+ * The request rollup rows of a query. Hour and day steps also read the hourly rows compaction
+ * moved out of the minute table.
+ */
+function requestRows(where: Prisma.Sql, columns: Prisma.Sql, window: Window): Prisma.Sql {
+  return window.stepMs >= STEP_MS["1h"]
+    ? Prisma.sql`(SELECT ${columns} FROM usage_rollup_minute WHERE ${where} UNION ALL SELECT ${columns} FROM usage_rollup_hour WHERE ${where})`
+    : Prisma.sql`(SELECT ${columns} FROM usage_rollup_minute WHERE ${where})`;
+}
+
+/** Agent tests in the scope and range that the request metrics left out. */
+async function agentTestCount(
+  userId: string,
+  scope: ResolvedScope,
+  window: Window,
+): Promise<number> {
+  const where = requestWhere(userId, scope, window, "tests");
+  const rows = await prisma.$queryRaw<Row[]>`SELECT SUM(r.requests)::float8 AS requests
+    FROM ${requestRows(where, Prisma.raw(`"requests"`), window)} r`;
+  return num(rows[0], "requests");
+}
+
 function requestPlan(
   userId: string,
   scope: ResolvedScope,
@@ -350,13 +381,8 @@ function requestPlan(
   input: MetricsQueryInput,
   histograms: readonly HistogramName[],
 ): FamilyPlan {
-  const where = requestWhere(userId, scope, window, input.includeAgentTests);
-  const columns = requestColumns(histograms);
-  // Hour and day steps also read the hourly rows compaction moved out of the minute table.
-  const withHours = window.stepMs >= STEP_MS["1h"];
-  const source = withHours
-    ? Prisma.sql`(SELECT ${columns} FROM usage_rollup_minute WHERE ${where} UNION ALL SELECT ${columns} FROM usage_rollup_hour WHERE ${where})`
-    : Prisma.sql`(SELECT ${columns} FROM usage_rollup_minute WHERE ${where})`;
+  const where = requestWhere(userId, scope, window, input.includeAgentTests ? "all" : "notTests");
+  const source = requestRows(where, requestColumns(histograms), window);
   const group = requestGroup(input.groupBy, userId, scope.kind === "pool");
   const aggregates = requestAggregates(histograms);
   return {
@@ -770,7 +796,10 @@ export async function runMetricsQuery(
   const primary = metricFamily(metrics[0] as Metric);
   plans.sort((a, b) => Number(b.family === primary) - Number(a.family === primary));
 
-  const totalsByFamily = await Promise.all(plans.map((plan) => plan.totals()));
+  const [totalsByFamily, tests] = await Promise.all([
+    Promise.all(plans.map((plan) => plan.totals())),
+    families.has("request") && !input.includeAgentTests ? agentTestCount(userId, scope, window) : 0,
+  ]);
 
   const points = metricBuckets(window.from.getTime(), window.to.getTime(), window.stepMs);
   const maxGroups = Math.max(
@@ -810,6 +839,7 @@ export async function runMetricsQuery(
       if (value !== null) totals[metric] = compactNumber(value);
     }
   });
+  if (tests > 0) totals.tests = tests;
 
   // Series: per group, per bucket, per family.
   type Cell = Map<MetricFamily, Row[]>;

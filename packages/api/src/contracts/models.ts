@@ -105,7 +105,7 @@ export const modelsContract = {
           .optional(),
       })
       .strict(),
-    "Send a test (source AGENT_TEST, counted in metrics). Transcription uses a built-in silent WAV. :external cannot be tested; benches run only on your own pools and runtimes.",
+    "Send a test (source AGENT_TEST: metrics count it as tests, apart from load; a runtime test is not pool traffic). Transcription uses a built-in silent WAV. :external cannot be tested; benches run only on your own pools and runtimes.",
     ["model_test"],
   ),
 } as const;
