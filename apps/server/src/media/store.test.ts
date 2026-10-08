@@ -76,6 +76,7 @@ describe("LocalMediaStore.stage", () => {
     await staged.commit("asset-big");
     const object = await store.getStream("asset-big");
     expect(object?.sizeBytes).toBe(chunk.length * count);
+    object?.stream.destroy();
   });
 
   it("aborts and cleans up when the source exceeds maxBytes, leaking no temp file", async () => {

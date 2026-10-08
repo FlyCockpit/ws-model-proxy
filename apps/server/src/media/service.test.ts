@@ -73,6 +73,7 @@ describe("uploadMedia", () => {
     const object = await store.getStream(result.id);
     expect(object).not.toBeNull();
     expect(object?.sizeBytes).toBe(PNG.length);
+    object?.stream.destroy();
   });
 
   it("commits bytes BEFORE creating the row, and removes the object if create fails", async () => {
@@ -87,7 +88,11 @@ describe("uploadMedia", () => {
     // its object. Then throw to exercise the failure cleanup.
     prisma.mediaAsset.create.mockImplementation(async ({ data }: { data: { id: string } }) => {
       idAtCreate = data.id;
-      bytesPresentAtCreate = (await store.getStream(data.id)) !== null;
+      const object = await store.getStream(data.id);
+      bytesPresentAtCreate = object !== null;
+      // Close the probe's lazy read stream before the cleanup removes the file: left open, it
+      // opens later and its ENOENT surfaces as an uncaught error in whichever test runs next.
+      object?.stream.destroy();
       throw new Error("db exploded");
     });
 

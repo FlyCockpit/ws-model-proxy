@@ -176,7 +176,9 @@ describe("POST /v1/files (upload)", () => {
     expect(body.url_expires_at).toBe(Math.floor((NOW + 10 * 60 * 1000) / 1000));
     expect(body.url_expires_at).toBeLessThan(body.expires_at);
     // The bytes actually landed under the asset id.
-    expect(await new LocalMediaStore(root).getStream(body.id)).not.toBeNull();
+    const object = await new LocalMediaStore(root).getStream(body.id);
+    expect(object).not.toBeNull();
+    object?.stream.destroy();
   });
 
   it("uses the configured admin cap when it is lower than the deployment ceiling", async () => {
