@@ -299,11 +299,36 @@ export function MetricCommandsCard({ node }: { node: NodeDetail }) {
         {!full ? (
           <div className="space-y-2">
             <FrozenNote />
-            <ul className="font-mono text-xs">
-              {node.metricCommands.map((command) => (
-                <li key={command.name}>{command.name}</li>
-              ))}
-            </ul>
+            {node.metricCommands.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                {t("dashboard:nodes.definition.metricCommandsNone")}
+              </p>
+            ) : (
+              <ul className="min-w-0 space-y-3">
+                {node.metricCommands.map((command) => (
+                  <li key={command.name} className="min-w-0 space-y-1">
+                    <p className="flex min-w-0 flex-wrap items-baseline gap-x-2 text-sm">
+                      <span className="break-all font-mono font-medium">{command.name}</span>
+                      <span className="text-xs text-muted-foreground">
+                        {t("dashboard:nodes.definition.metricCommandSchedule", {
+                          interval: command.intervalSecs,
+                          timeout: command.timeoutSecs,
+                          format: command.format,
+                        })}
+                      </span>
+                    </p>
+                    <pre
+                      aria-label={t("dashboard:nodes.definition.metricCommandBody", {
+                        name: command.name,
+                      })}
+                      className="max-h-48 min-w-0 overflow-x-auto overflow-y-auto overscroll-contain whitespace-pre-wrap break-all rounded-md border bg-muted/40 p-2 font-mono text-xs"
+                    >
+                      {command.command}
+                    </pre>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
         ) : (
           <form

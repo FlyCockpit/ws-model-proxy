@@ -150,7 +150,11 @@ function AddAccountDialog({
     },
     onSubmit: async ({ value }) => {
       try {
-        const account = await create.mutateAsync({ ...value, label: value.label.trim() });
+        const account = await create.mutateAsync({
+          ...value,
+          label: value.label.trim(),
+          allowDataCollection: value.providerType === "openrouter" && value.allowDataCollection,
+        });
         await queryClient.invalidateQueries({ queryKey: orpc.providers.key() });
         toast.success(t("dashboard:providers.added"));
         onOpenChange(false);
@@ -274,20 +278,27 @@ function AddAccountDialog({
             </div>
           )}
         </form.Field>
-        <form.Field name="allowDataCollection">
-          {(field) => (
-            <div className="flex min-h-11 items-center gap-3">
-              <Checkbox
-                id="provider-collection"
-                checked={field.state.value}
-                onCheckedChange={(checked) => field.handleChange(checked === true)}
-              />
-              <Label htmlFor="provider-collection">
-                {t("dashboard:providers.form.dataCollection")}
-              </Label>
-            </div>
-          )}
-        </form.Field>
+        <form.Subscribe selector={(state) => state.values.providerType}>
+          {(providerType) =>
+            // Only OpenRouter routes by data policy; other providers ignore the setting.
+            providerType === "openrouter" ? (
+              <form.Field name="allowDataCollection">
+                {(field) => (
+                  <div className="flex min-h-11 items-center gap-3">
+                    <Checkbox
+                      id="provider-collection"
+                      checked={field.state.value}
+                      onCheckedChange={(checked) => field.handleChange(checked === true)}
+                    />
+                    <Label htmlFor="provider-collection">
+                      {t("dashboard:providers.form.dataCollection")}
+                    </Label>
+                  </div>
+                )}
+              </form.Field>
+            ) : null
+          }
+        </form.Subscribe>
         <form.Subscribe selector={(state) => state.isSubmitting}>
           {(submitting) => (
             <Button type="submit" size="touch" disabled={submitting}>

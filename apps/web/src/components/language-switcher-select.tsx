@@ -1,4 +1,4 @@
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, useRouter } from "@tanstack/react-router";
 import {
   Select,
@@ -34,7 +34,13 @@ export default function LanguageSwitcherSelect() {
   // Silent server-side sync of the signed-in user's preference. The router's
   // global error toast handles failures — the URL switch already succeeded by
   // the time the mutation resolves, so a network error doesn't block the UI.
-  const updateLocale = useMutation(orpc.auth.updateLocale.mutationOptions());
+  const queryClient = useQueryClient();
+  const updateLocale = useMutation(
+    orpc.auth.updateLocale.mutationOptions({
+      // Settings shows the saved locale: keep it in step.
+      onSuccess: () => queryClient.invalidateQueries({ queryKey: orpc.settings.get.key() }),
+    }),
+  );
 
   const current: Locale = isSupportedLocale(i18n.language) ? i18n.language : "en-US";
 

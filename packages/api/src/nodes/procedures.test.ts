@@ -505,9 +505,12 @@ describe("trust lowering", () => {
     const lowerTrust = vi.fn(async () => undefined);
     db.node.findFirst.mockResolvedValueOnce({
       id: "node-1",
+      userId: "owner-1",
       trust: "FULL",
       trustChangedAt: null,
       trustLowerRequestedAt: null,
+      trustLowerRequestedBy: null,
+      User: { name: "Ada" },
       heldDefinitions: [{ runtimeId: "rt-1", versionId: "v-1", launchHash: "b".repeat(64) }],
       metricCommands: [],
     } as never);
@@ -530,7 +533,11 @@ describe("trust lowering", () => {
       kind: "trust_lower",
       actor: "USER",
     });
-    expect(out.trust).toMatchObject({ effective: "RELAY", lowerPending: true });
+    expect(out.trust).toMatchObject({
+      effective: "RELAY",
+      lowerPending: true,
+      changedBy: { actor: "USER", userId: "owner-1", agentTokenId: null, label: "Ada" },
+    });
     expect(out.frozenAgentWritten).toEqual([{ kind: "runtime", id: "rt-1@v-1", label: "Qwen" }]);
     expect(lowerTrust).toHaveBeenCalledWith("node-1");
   });

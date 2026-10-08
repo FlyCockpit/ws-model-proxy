@@ -41,6 +41,22 @@ export function trustToDb(value: NodeTrustWire): "FULL" | "RELAY" {
   return value === "full" ? "FULL" : "RELAY";
 }
 
+/**
+ * The lower-request columns after the node reports `reported` (was `stored`). The node
+ * confirming a person's lowering ends the request but keeps who lowered it (the trust card's
+ * "changed by"); any other trust change was made on the node, so it clears who.
+ */
+export function trustLowerColumns(
+  stored: "FULL" | "RELAY" | null,
+  reported: "FULL" | "RELAY",
+  lowerPending: boolean,
+): { trustLowerRequestedAt?: null; trustLowerRequestedBy?: null } {
+  // While a person's lowering is pending, who asked stays (a first hello may still say FULL).
+  if (lowerPending) return reported === "RELAY" ? { trustLowerRequestedAt: null } : {};
+  if (stored !== reported) return { trustLowerRequestedBy: null };
+  return {};
+}
+
 export type NodeHelloFacts = {
   slug: string;
   hostname?: string;
@@ -135,10 +151,7 @@ export async function registerNodeHello(input: {
       rejectedAt: null,
       trust: reportedTrust,
       ...(node.trust !== reportedTrust ? { trustChangedAt: now } : {}),
-      // The node confirmed a person's lowering: it is RELAY now and keeps it.
-      ...(lowerPending && reportedTrust === "RELAY"
-        ? { trustLowerRequestedAt: null, trustLowerRequestedBy: null }
-        : {}),
+      ...trustLowerColumns(node.trust, reportedTrust, lowerPending),
       features: hello.features as Prisma.InputJsonValue,
       featuresAt: now,
       heldDefinitions: hello.definitions as Prisma.InputJsonValue,
@@ -210,9 +223,7 @@ export async function writeNodeState(input: {
     data: {
       trust: reportedTrust,
       ...(node.trust !== reportedTrust ? { trustChangedAt: input.now } : {}),
-      ...(lowerPending && reportedTrust === "RELAY"
-        ? { trustLowerRequestedAt: null, trustLowerRequestedBy: null }
-        : {}),
+      ...trustLowerColumns(node.trust, reportedTrust, lowerPending),
       features: input.features as Prisma.InputJsonValue,
       featuresAt: input.now,
     },

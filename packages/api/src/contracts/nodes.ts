@@ -16,6 +16,7 @@ import {
 } from "../lib/runtime-spec";
 import {
   ACTOR,
+  actorRefSchema,
   CLAIM_STATE,
   confirmDeleteSchema,
   confirmRunSchema,
@@ -54,7 +55,13 @@ export const nodeTrustViewSchema = z
     /** A person lowered trust; the node has not confirmed yet. */
     lowerPending: z.boolean(),
     frozen: z.boolean(),
+    /** When trust last changed: a pending lowering's request, else the node's last report. */
     changedAt: isoDateSchema.nullable(),
+    /**
+     * The person whose browser lowering holds the node at Relay only (pending or confirmed).
+     * Null: the node set its own trust (`wsmp trust`), or it never changed.
+     */
+    changedBy: actorRefSchema.nullable(),
   })
   .strict();
 

@@ -46,6 +46,32 @@
       "cloud_cap_reached": "se alcanzó el tope de gasto en la nube",
       "unauthorized_external": "el uso de nube no está permitido para quien llama",
       "other": "{{code}}"
+    },
+    "olderThan": "Más antiguas que",
+    "deleteOlder": "Borrar antiguas",
+    "deleteOlderTitle": "¿Borrar las solicitudes de hace más de {{range}}?",
+    "deleteOlderDescription": "Se borran las solicitudes terminadas que hiciste a tus propios pools y modelos de antes de ese momento (las que siguen en curso se quedan). Las solicitudes que hiciste a pools de otras personas se quedan en los registros de sus dueños.",
+    "range": {
+      "1h": "1 hora",
+      "24h": "1 día",
+      "7d": "7 días",
+      "30d": "30 días"
+    },
+    "filter": {
+      "poolId": "Pool",
+      "runtimeId": "Runtime",
+      "versionId": "Versión",
+      "nodeId": "Nodo",
+      "since": "Desde",
+      "anyTime": "Cualquier momento",
+      "versionNumber": "Versión {{version}}",
+      "reset": "Quitar filtros"
+    },
+    "sinceRange": {
+      "1h": "Última hora",
+      "24h": "Último día",
+      "7d": "Últimos 7 días",
+      "30d": "Últimos 30 días"
     }
   },
   "commands": {

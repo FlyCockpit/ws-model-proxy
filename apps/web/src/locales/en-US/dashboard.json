@@ -355,7 +355,10 @@
       "sticky": "Lowering protects against future problems only: what already runs keeps running.",
       "lowerConfirm": "Lower to Relay only",
       "lowered": "Lowering requested. The node confirms when it is online.",
-      "raiseHint": "To give the server full control again, run this on the machine:"
+      "raiseHint": "To give this server full control again, run on {{slug}}:",
+      "changedBy": "by {{name}}",
+      "aPerson": "a person",
+      "changedOnNode": "on the node"
     },
     "hold": {
       "title": "Hold",
@@ -428,7 +431,10 @@
       "metricCommandsDescription": "Commands the node runs on a schedule to report extra metrics.",
       "metricCommandsJson": "Commands (JSON list)",
       "jsonInvalid": "This is not valid JSON.",
-      "metricCommandsInvalid": "Not a valid list of metric commands ({{detail}})."
+      "metricCommandsInvalid": "Not a valid list of metric commands ({{detail}}).",
+      "metricCommandsNone": "No metric commands.",
+      "metricCommandSchedule": "every {{interval}} s · timeout {{timeout}} s · {{format}}",
+      "metricCommandBody": "Command of {{name}}"
     },
     "secrets": {
       "title": "Secrets",
@@ -572,7 +578,8 @@
       "stopReason": {
         "preempted": "makes room",
         "profile_owned_node": "not in this profile"
-      }
+      },
+      "startVersion": "version {{version}}"
     },
     "editor": {
       "back": "All profiles",
@@ -599,7 +606,6 @@
       "addItem": "Add runtime",
       "removeItem": "Remove this runtime",
       "pinned": "Pinned to version {{version}}",
-      "onlyOn": "only on {{nodes}}",
       "updatePins": "Use newest versions",
       "applyHint": "Saving does not change what runs. Apply to switch.",
       "saved": "Profile saved.",
@@ -607,7 +613,15 @@
       "deleteDescription": "Nothing stops. Nodes it holds stay held until you release them.",
       "typeSlug": "Type the profile's short name to confirm",
       "deleted": "Profile deleted.",
-      "saveFirst": "Save your changes before applying."
+      "saveFirst": "Save your changes before applying.",
+      "version": "Version",
+      "versionNewest": "Current version ({{version}})",
+      "versionNewestUnknown": "Current version",
+      "versionCurrent": "Version {{version}} (current)",
+      "versionOption": "Version {{version}}",
+      "itemNodes": "Runs on",
+      "itemNodesAny": "None checked: any of this profile's nodes.",
+      "itemNodesSome": "Only on the checked nodes."
     }
   },
   "refusals": {
@@ -745,6 +759,92 @@
       "insufficient_permission": "Couldn't confirm: the key may not list models, but it may still work.",
       "unverified": "Couldn't confirm: this endpoint answers without checking keys.",
       "unexpected_status": "The provider gave an unexpected answer."
+    },
+    "details": "Account",
+    "addModel": "Add a model",
+    "modelIdRequired": "Enter the model ID the provider uses.",
+    "contextWindow": "Context (tokens)",
+    "contextWindowInvalid": "A whole number of tokens, or empty.",
+    "deleteModel": "Delete {{model}}",
+    "deleteModelTitle": "Delete {{model}}?",
+    "deleteModelHint": "It leaves every pool it is a cloud member of. Its usage and price history stay.",
+    "modelDeleted": "Model deleted.",
+    "pricing": {
+      "title": "Prices of {{model}}",
+      "toggle": "Prices",
+      "loadFailed": "Couldn't load the prices.",
+      "none": "No prices yet.",
+      "noActive": "No active price",
+      "status": {
+        "DRAFT": "Draft",
+        "ACTIVE": "Active",
+        "RETIRED": "Retired"
+      },
+      "rate": {
+        "input": "Input",
+        "output": "Output",
+        "cacheRead": "Cache read",
+        "cacheWrite": "Cache write"
+      },
+      "rateValue": {
+        "input": "input {{value}}",
+        "output": "output {{value}}",
+        "cacheRead": "cache read {{value}}",
+        "cacheWrite": "cache write {{value}}"
+      },
+      "currency": "Currency",
+      "effective": "Effective",
+      "newHint": "New draft price, per million tokens. Cache prices are optional.",
+      "addDraft": "Add draft",
+      "draftAdded": "Draft price added. Activate it to use it.",
+      "rateInvalid": "A plain amount, like 0.15.",
+      "currencyInvalid": "A three-letter code, like USD.",
+      "activate": "Activate",
+      "activated": "Price activated.",
+      "retire": "Retire",
+      "retireTitle": "Retire price {{version}}?",
+      "retireHint": "The model has no active price until you activate another one.",
+      "deleteTitle": "Delete draft {{version}}?",
+      "deleteHint": "The draft is removed. Active and retired prices stay."
+    },
+    "catalog": {
+      "label": "Search the OpenRouter catalog",
+      "placeholder": "qwen, llama, embedding…",
+      "search": "Search",
+      "failed": "Couldn't search the catalog.",
+      "none": "Nothing in the catalog matches “{{query}}”.",
+      "results": "Catalog results",
+      "context": "{{tokens}} tokens of context",
+      "use": "Use",
+      "useModel": "Use {{model}}"
+    },
+    "activity": {
+      "title": "Activity",
+      "hint": "Cloud attempts and the usage they were charged for, newest first.",
+      "attempts": "Attempts",
+      "usage": "Usage",
+      "unknownModel": "Unknown model",
+      "removedModel": "Deleted model",
+      "loadFailed": "Couldn't load the activity.",
+      "noAttempts": "No cloud attempts yet.",
+      "noUsage": "No usage yet.",
+      "attemptState": {
+        "ACTIVE": "Running",
+        "COMPLETED": "Completed",
+        "FAILED": "Failed",
+        "CANCELLED": "Canceled",
+        "EXPIRED": "Expired"
+      },
+      "http": "HTTP {{status}}",
+      "tokens": "{{input}} in / {{output}} out",
+      "cost": "{{cost}} {{currency}}",
+      "noCost": "no cost recorded",
+      "confidence": {
+        "REPORTED": "reported by the provider",
+        "CALCULATED": "calculated from the price",
+        "ESTIMATED": "estimated"
+      },
+      "loadMore": "Load more"
     }
   },
   "pool": {
@@ -930,6 +1030,35 @@
         "openai_chat_completions": "OpenAI Chat Completions",
         "openai_responses": "OpenAI Responses",
         "anthropic_messages": "Anthropic Messages"
+      },
+      "help": {
+        "maxWaitMs": "How long a request may wait for local capacity. Then a plain request is refused and an :external request goes to the cloud.",
+        "contextCeiling": "The largest context (prompt plus output) this pool accepts, for every member. Automatic: worked out from the members.",
+        "contextMargin": "Tokens kept free below each member's context, as a safety margin for token estimates.",
+        "protocolAdaptation": "Translate between OpenAI Chat, OpenAI Responses and Anthropic Messages when a member does not serve the caller's API. Members that serve it natively are always tried first.",
+        "allowLossyDeveloperRoleCollapse": "When translating for a member without a developer role, merge developer messages into system messages. Their separate meaning is lost.",
+        "recommendedSurface": "The API callers are pointed to first for this pool. Automatic: worked out from what the members serve.",
+        "maxAttachmentBytes": "Largest attachment (image, audio, file) one request may carry. Automatic: the server's media setting.",
+        "optimisticBasicTranscription": "Also send basic transcription requests to members whose transcription support is not known yet, after the known ones.",
+        "affinity": {
+          "enabled": "Send a conversation back to the member that already holds its prompt cache.",
+          "ttlSeconds": "How long the server remembers which member holds a conversation's cache.",
+          "maxRecords": "How many conversations the server remembers for this pool.",
+          "prefixWeight": "How much a shared prompt prefix counts when picking a member.",
+          "conversationWeight": "How much continuing the same conversation counts when picking a member.",
+          "confirmedCacheWeight": "How much a cache hit the engine confirmed counts when picking a member.",
+          "loadPenaltyWeight": "How strongly a busy member is avoided, even when it holds the cache.",
+          "residencyWeight": "How strongly a new conversation avoids pushing other conversations' cache out. 0 turns it off."
+        },
+        "protection": {
+          "enabled": "Keep recent conversations' cache from being pushed out by other requests.",
+          "evictionFeedback": "Learn from the evictions the engine reports how much cache really fits. Off: use the engine's reported size as is.",
+          "windowSeconds": "How long after its last request a conversation stays protected.",
+          "minTokens": "Conversations shorter than this are not protected.",
+          "share": "How protected cache is split between the people using this pool.",
+          "fixedPercent": "With the fixed-percent mode: each person's share of the protected cache.",
+          "ownerPercent": "Your own share of the protected cache. Automatic: follows the share mode."
+        }
       }
     },
     "media": {
@@ -1395,6 +1524,20 @@
         "restartWindowMin": "Restart window",
         "unhealthyRestartMs": "Restart after unhealthy for",
         "unavailableStopMs": "Stop other nodes after one is offline for"
+      },
+      "help": {
+        "concurrencyLimit": "Requests one instance runs at once. Automatic: what the engine reports.",
+        "contextLimit": "Largest context (prompt plus output) one instance accepts. Automatic: what the engine reports.",
+        "kvBudgetTokens": "Tokens of KV cache one instance has. Automatic: what the engine reports.",
+        "kvFullThreshold": "When KV cache use reaches this fraction (0.95 = 95 %), the instance counts as full.",
+        "engineLoadGate": "Whether admission also follows the engine's own load report. Enforce: always. Observe only: record it, never wait on it. Automatic: the server decides.",
+        "countStrategy": "How the server counts a request's tokens before sending it.",
+        "imageTokenAllowance": "Tokens counted for each image. Automatic: from the served model's vision settings.",
+        "maxAttachmentBytes": "Largest attachment one request to this runtime may carry. Automatic: the server's media setting.",
+        "restartBudget": "Automatic restarts allowed within the restart window. After that, a restart needs you.",
+        "restartWindowMin": "The window the automatic restarts are counted over.",
+        "unhealthyRestartMs": "An instance unhealthy this long is restarted automatically.",
+        "unavailableStopMs": "Multi-node: when one node is offline this long, the instance's other nodes are stopped."
       }
     },
     "answerInTerminals": "Answer it on the Terminals page",

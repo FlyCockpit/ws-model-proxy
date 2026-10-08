@@ -1,6 +1,6 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
@@ -19,6 +19,10 @@ import { useTranslation } from "react-i18next";
 import z from "zod";
 
 import { InlineRetry } from "@/components/inline-retry";
+import { NativeSelect } from "@/components/native-select";
+import { useAuthSession } from "@/hooks/use-auth-session";
+import { isSupportedLocale, type Locale, SUPPORTED_LOCALES } from "@/i18n/config";
+import { LOCALE_LABELS } from "@/i18n/labels";
 import { useNamespaceT } from "@/i18n/use-namespace-t";
 import { orpc } from "@/utils/orpc";
 
@@ -56,6 +60,7 @@ type UserSettings = {
   name: string;
   email: string;
   slug: string;
+  locale: Locale;
   operationalAlerts: boolean;
 };
 
@@ -172,6 +177,8 @@ function ProfileForm({ settings }: { settings: UserSettings }) {
         </CardContent>
       </Card>
 
+      <LocaleCard locale={settings.locale} />
+
       <Card>
         <CardHeader>
           <CardTitle>{t("settings:profile.slugTitle")}</CardTitle>
@@ -184,5 +191,61 @@ function ProfileForm({ settings }: { settings: UserSettings }) {
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+/** The saved UI language: it follows the account to other devices; this page switches now. */
+function LocaleCard({ locale }: { locale: Locale }) {
+  const { t, i18n } = useTranslation(["settings"]);
+  const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const { actions: session } = useAuthSession();
+  const update = useMutation({
+    ...orpc.settings.update.mutationOptions(),
+    meta: { skipGlobalErrorToast: true },
+  });
+  const choose = async (next: string) => {
+    if (!isSupportedLocale(next) || next === locale) return;
+    try {
+      const saved = await update.mutateAsync({ locale: next });
+      queryClient.setQueryData(orpc.settings.get.queryKey(), saved);
+      // The session carries user.locale too (the header switcher compares against it).
+      void session.refetch();
+      try {
+        window.localStorage.setItem("locale", next);
+      } catch {
+        // Storage can be unavailable (private mode); the saved account locale still applies.
+      }
+      void i18n.changeLanguage(next);
+      await navigate({ to: "/$lang/settings", params: { lang: next }, replace: true });
+      toast.success(t("settings:locale.saved"));
+    } catch (error) {
+      console.error("[settings.update locale]", error);
+      toast.error(t("settings:locale.saveError"));
+    }
+  };
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{t("settings:locale.title")}</CardTitle>
+        <CardDescription>{t("settings:locale.description")}</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        <Label htmlFor="settings-locale">{t("settings:locale.label")}</Label>
+        <NativeSelect
+          id="settings-locale"
+          className="sm:max-w-xs"
+          value={locale}
+          disabled={update.isPending}
+          onChange={(event) => void choose(event.target.value)}
+        >
+          {SUPPORTED_LOCALES.map((value) => (
+            <option key={value} value={value}>
+              {LOCALE_LABELS[value]}
+            </option>
+          ))}
+        </NativeSelect>
+      </CardContent>
+    </Card>
   );
 }

@@ -45,5 +45,12 @@
     "changingPassword": "Changing…",
     "changePasswordSuccess": "Password changed",
     "changePasswordError": "Couldn't change your password. Check your current password and try again."
+  },
+  "locale": {
+    "title": "Language",
+    "description": "The language of this app and of the emails we send you. It follows your account to other devices.",
+    "label": "Language",
+    "saved": "Language saved",
+    "saveError": "Couldn't save your language. Try again."
   }
 }

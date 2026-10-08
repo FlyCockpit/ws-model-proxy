@@ -27,6 +27,7 @@ import { z } from "zod";
 
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { Help } from "@/components/help";
+import { NativeSelect } from "@/components/native-select";
 import { FieldError } from "@/components/nodes/field-error";
 import type { NodeSummary, ProfileView } from "@/components/nodes/node-types";
 import { refusalToastOptions } from "@/components/nodes/refusal";
@@ -36,7 +37,14 @@ import { ApplyProfileDialog } from "./apply-profile-dialog";
 
 export const PROFILE_SLUG_PATTERN = /^[a-z](?:[a-z0-9]|-(?=[a-z0-9])){0,40}$/;
 
-type ItemRow = { runtimeId: string; versionId: string | null; count: string; nodeIds: string[] };
+/** `key`: the saved item's id, or a fresh one for a new line (rows keep it when others move). */
+type ItemRow = {
+  key: string;
+  runtimeId: string;
+  versionId: string | null;
+  count: string;
+  nodeIds: string[];
+};
 type HoldRow = { nodeId: string; note: string };
 
 /** A slug from a name: "Evening gaming" → "evening-gaming". */
@@ -100,6 +108,7 @@ export function ProfileEditor({
         note: hold.note ?? "",
       })) as HoldRow[],
       items: profile.items.map((item) => ({
+        key: item.id,
         runtimeId: item.runtimeId,
         versionId: item.versionId,
         count: String(item.count),
@@ -115,6 +124,7 @@ export function ProfileEditor({
         holds: z.array(z.object({ nodeId: z.string(), note: z.string().max(500) })),
         items: z.array(
           z.object({
+            key: z.string(),
             runtimeId: z.string().min(1, t("dashboard:profiles.editor.runtimeRequired")),
             versionId: z.string().nullable(),
             count: z
@@ -132,8 +142,19 @@ export function ProfileEditor({
   });
 
   type Values = typeof form.state.values;
+  const currentVersionOf = (runtimeId: string) =>
+    startable.find((runtime) => runtime.id === runtimeId)?.currentVersion.id ?? null;
   const saveWith = async (value: Values, updatePins: boolean) => {
     const owned = new Set(value.nodeIds);
+    // Omitting a version keeps the line's old pin on the server: never do that for a line set
+    // to "Current version" whose current version is not known here.
+    if (
+      !updatePins &&
+      value.items.some((item) => item.versionId === null && !currentVersionOf(item.runtimeId))
+    ) {
+      toast.error(t("dashboard:profiles.editor.runtimesUnavailable"));
+      return;
+    }
     await save.mutateAsync({
       profileId: profile.id,
       slug: value.slug,
@@ -146,12 +167,16 @@ export function ProfileEditor({
           nodeId: hold.nodeId,
           ...(hold.note.trim() ? { note: hold.note.trim() } : {}),
         })),
-      items: value.items.map((item) => ({
-        runtimeId: item.runtimeId,
-        ...(item.versionId && !updatePins ? { versionId: item.versionId } : {}),
-        count: Number(item.count),
-        nodeIds: item.nodeIds.filter((nodeId) => owned.has(nodeId)),
-      })),
+      items: value.items.map((item) => {
+        // "Current version" means the runtime's current version, never the line's old pin.
+        const versionId = item.versionId ?? currentVersionOf(item.runtimeId);
+        return {
+          runtimeId: item.runtimeId,
+          ...(versionId && !updatePins ? { versionId } : {}),
+          count: Number(item.count),
+          nodeIds: item.nodeIds.filter((nodeId) => owned.has(nodeId)),
+        };
+      }),
       ...(updatePins ? { updatePins: true } : {}),
     });
   };
@@ -321,14 +346,14 @@ export function ProfileEditor({
             {(field) => (
               <div className="space-y-2">
                 {field.state.value.map((row, index) => {
+                  // The saved line this row came from, while it still names the same runtime.
                   const item = profile.items.find(
                     (candidate) =>
-                      candidate.runtimeId === row.runtimeId &&
-                      candidate.versionId === row.versionId,
+                      candidate.id === row.key && candidate.runtimeId === row.runtimeId,
                   );
                   return (
                     <div
-                      key={`${row.runtimeId}-${index}`}
+                      key={row.key}
                       className="flex min-w-0 flex-wrap items-end gap-2 border-b pb-2"
                     >
                       <form.Field name={`items[${index}].runtimeId`}>
@@ -388,19 +413,41 @@ export function ProfileEditor({
                       >
                         <Trash aria-hidden="true" />
                       </Button>
+                      <form.Field name={`items[${index}].versionId`}>
+                        {(sub) => (
+                          <ItemVersionField
+                            id={`item-version-${index}`}
+                            runtimeId={row.runtimeId}
+                            currentVersion={
+                              startable.find((runtime) => runtime.id === row.runtimeId)
+                                ?.currentVersion ?? null
+                            }
+                            saved={item ?? null}
+                            value={sub.state.value}
+                            onChange={sub.handleChange}
+                          />
+                        )}
+                      </form.Field>
                       {item ? (
                         <p className="w-full text-xs text-muted-foreground">
                           {t("dashboard:profiles.editor.pinned", { version: item.versionNumber })}
                           {item.pinOutdated ? ` · ${t("dashboard:profiles.pinsOutdated")}` : ""}
-                          {item.nodeIds.length > 0
-                            ? ` · ${t("dashboard:profiles.editor.onlyOn", {
-                                nodes: item.nodeIds
-                                  .map((id) => nodes.find((node) => node.id === id)?.slug ?? id)
-                                  .join(", "),
-                              })}`
-                            : ""}
                         </p>
                       ) : null}
+                      <form.Subscribe selector={(state) => state.values.nodeIds}>
+                        {(ownedIds) => (
+                          <form.Field name={`items[${index}].nodeIds`}>
+                            {(sub) => (
+                              <ItemNodesField
+                                index={index}
+                                owned={nodes.filter((node) => ownedIds.includes(node.id))}
+                                value={sub.state.value}
+                                onChange={sub.handleChange}
+                              />
+                            )}
+                          </form.Field>
+                        )}
+                      </form.Subscribe>
                     </div>
                   );
                 })}
@@ -412,6 +459,7 @@ export function ProfileEditor({
                   disabled={startable.length === 0}
                   onClick={() =>
                     field.pushValue({
+                      key: `new-${crypto.randomUUID()}`,
                       runtimeId: startable[0]?.id ?? "",
                       versionId: null,
                       count: "1",
@@ -431,20 +479,32 @@ export function ProfileEditor({
       <div className="flex flex-wrap gap-2">
         <form.Subscribe selector={(state) => [state.canSubmit, state.isSubmitting] as const}>
           {([canSubmit, isSubmitting]) => (
-            <Button type="submit" className="min-h-[44px]" disabled={!canSubmit || isSubmitting}>
+            <Button
+              type="submit"
+              className="min-h-[44px]"
+              // "Current version" needs the runtimes' current versions to save as chosen.
+              disabled={!canSubmit || isSubmitting || runtimes.isPending || runtimes.isError}
+            >
               {t("common:actions.save")}
             </Button>
           )}
         </form.Subscribe>
-        <Button
-          type="button"
-          variant="outline"
-          className="min-h-[44px]"
-          disabled={save.isPending || !profile.items.some((item) => item.pinOutdated)}
-          onClick={() => saveWith(form.state.values, true)}
-        >
-          {t("dashboard:profiles.editor.updatePins")}
-        </Button>
+        <form.Subscribe selector={(state) => state.isDirty}>
+          {(dirty) => (
+            // Moves every saved line to its runtime's current version; unsaved picks would be
+            // lost, so it waits for a save.
+            <Button
+              type="button"
+              variant="outline"
+              className="min-h-[44px]"
+              disabled={dirty || save.isPending || !profile.items.some((item) => item.pinOutdated)}
+              title={dirty ? t("dashboard:profiles.editor.saveFirst") : undefined}
+              onClick={() => saveWith(form.state.values, true)}
+            >
+              {t("dashboard:profiles.editor.updatePins")}
+            </Button>
+          )}
+        </form.Subscribe>
         <form.Subscribe selector={(state) => state.isDirty}>
           {(dirty) => (
             <Button
@@ -491,5 +551,111 @@ export function ProfileEditor({
         onConfirm={() => remove.mutate({ profileId: profile.id })}
       />
     </form>
+  );
+}
+
+type RuntimeVersionRef = { id: string; version: number };
+
+/**
+ * The pinned version of one line: the runtime's current version (the default for a new line)
+ * or any older one, so a profile can keep running a version that worked.
+ */
+function ItemVersionField({
+  id,
+  runtimeId,
+  currentVersion,
+  saved,
+  value,
+  onChange,
+}: {
+  id: string;
+  runtimeId: string;
+  currentVersion: RuntimeVersionRef | null;
+  saved: { versionId: string; versionNumber: number } | null;
+  value: string | null;
+  onChange: (next: string | null) => void;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  const versions = useQuery({
+    ...orpc.runtimes.versions.list.queryOptions({ input: { runtimeId, limit: 200 } }),
+    enabled: runtimeId !== "",
+    retry: false,
+  });
+  const options: RuntimeVersionRef[] = (versions.data?.items ?? []).map((version) => ({
+    id: version.id,
+    version: version.version,
+  }));
+  // The saved pin may sit beyond the loaded page; keep it selectable.
+  if (saved && saved.versionId === value && !options.some((option) => option.id === value))
+    options.push({ id: saved.versionId, version: saved.versionNumber });
+  return (
+    <div className="w-full min-w-0 space-y-1 sm:w-56">
+      <Label htmlFor={id}>{t("dashboard:profiles.editor.version")}</Label>
+      <NativeSelect
+        id={id}
+        value={value ?? ""}
+        disabled={runtimeId === ""}
+        onChange={(event) => onChange(event.target.value === "" ? null : event.target.value)}
+      >
+        <option value="">
+          {currentVersion
+            ? t("dashboard:profiles.editor.versionNewest", { version: currentVersion.version })
+            : t("dashboard:profiles.editor.versionNewestUnknown")}
+        </option>
+        {options.map((option) => (
+          <option key={option.id} value={option.id}>
+            {option.id === currentVersion?.id
+              ? t("dashboard:profiles.editor.versionCurrent", { version: option.version })
+              : t("dashboard:profiles.editor.versionOption", { version: option.version })}
+          </option>
+        ))}
+      </NativeSelect>
+    </div>
+  );
+}
+
+/** Where one line may run: some of the profile's nodes, or none checked for any of them. */
+function ItemNodesField({
+  index,
+  owned,
+  value,
+  onChange,
+}: {
+  index: number;
+  owned: readonly NodeSummary[];
+  value: string[];
+  onChange: (next: string[]) => void;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  if (owned.length === 0) return null;
+  return (
+    <fieldset className="w-full min-w-0 space-y-1">
+      <legend className="text-sm font-medium">{t("dashboard:profiles.editor.itemNodes")}</legend>
+      <div className="flex min-w-0 flex-wrap gap-x-4">
+        {owned.map((node) => (
+          <label
+            key={node.id}
+            htmlFor={`item-node-${index}-${node.id}`}
+            className="flex min-h-[44px] min-w-0 items-center gap-2 text-sm"
+          >
+            <Checkbox
+              id={`item-node-${index}-${node.id}`}
+              checked={value.includes(node.id)}
+              onCheckedChange={(checked) =>
+                onChange(
+                  checked ? [...value, node.id] : value.filter((nodeId) => nodeId !== node.id),
+                )
+              }
+            />
+            <span className="truncate">{node.name ?? node.slug}</span>
+          </label>
+        ))}
+      </div>
+      <p className="text-xs text-muted-foreground">
+        {value.some((nodeId) => owned.some((node) => node.id === nodeId))
+          ? t("dashboard:profiles.editor.itemNodesSome")
+          : t("dashboard:profiles.editor.itemNodesAny")}
+      </p>
+    </fieldset>
   );
 }

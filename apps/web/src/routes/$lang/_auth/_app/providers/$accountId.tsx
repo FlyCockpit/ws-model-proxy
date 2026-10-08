@@ -1,6 +1,5 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
@@ -19,9 +18,15 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
-import { NativeSelect } from "@/components/native-select";
+import { AccountDetailsCard } from "@/components/providers/account-details-card";
+import { ModelsCard } from "@/components/providers/models-card";
+import {
+  type ProviderAccountDetail,
+  useProviderAction,
+  useProviderInvalidation,
+} from "@/components/providers/provider-action";
+import { ProviderActivity } from "@/components/providers/provider-activity";
 import { StatusPill } from "@/components/status-pill";
-import { MODEL_TYPES, type ModelType } from "@/lib/pool-ui";
 import { refusalText } from "@/lib/refusal-text";
 import { orpc } from "@/utils/orpc";
 
@@ -29,33 +34,8 @@ export const Route = createFileRoute("/$lang/_auth/_app/providers/$accountId")({
   component: ProviderDetailPage,
 });
 
-type Account = Awaited<ReturnType<AppRouterClient["providers"]["accounts"]["get"]>>;
+type Account = ProviderAccountDetail;
 const MONEY = /^(0|[1-9][0-9]{0,20})(\.[0-9]{1,9})?$/;
-
-function useProviderInvalidation() {
-  const queryClient = useQueryClient();
-  return async () => {
-    await queryClient.invalidateQueries({ queryKey: orpc.providers.key() });
-    await queryClient.invalidateQueries({ queryKey: orpc.pools.key() });
-  };
-}
-
-/** Runs a mutation with a success toast and localized refusal copy; true on success. */
-function useAction() {
-  const { t } = useTranslation(["dashboard"]);
-  const invalidate = useProviderInvalidation();
-  return async (work: () => Promise<unknown>, success = t("dashboard:pool.saved")) => {
-    try {
-      await work();
-      await invalidate();
-      toast.success(success);
-      return true;
-    } catch (error) {
-      toast.error(refusalText(error));
-      return false;
-    }
-  };
-}
 
 function ProviderDetailPage() {
   const { t } = useTranslation(["dashboard", "common"]);
@@ -80,7 +60,7 @@ function ProviderDetailPage() {
 
 function ProviderDetail({ account }: { account: Account }) {
   const { t } = useTranslation(["dashboard", "common"]);
-  const action = useAction();
+  const action = useProviderAction();
   const setEnabled = useMutation({
     ...orpc.providers.accounts.setEnabled.mutationOptions(),
     meta: { skipGlobalErrorToast: true },
@@ -133,9 +113,11 @@ function ProviderDetail({ account }: { account: Account }) {
           ) : null}
         </CardContent>
       </Card>
+      <AccountDetailsCard key={`${account.label}|${account.baseUrl}`} account={account} />
       <KeyCard account={account} />
       <CapCard account={account} />
       <ModelsCard account={account} />
+      <ProviderActivity account={account} />
       <DeleteAccount account={account} />
     </div>
   );
@@ -143,7 +125,7 @@ function ProviderDetail({ account }: { account: Account }) {
 
 function KeyCard({ account }: { account: Account }) {
   const { t } = useTranslation(["dashboard", "common"]);
-  const action = useAction();
+  const action = useProviderAction();
   const [secret, setSecret] = useState("");
   const [probe, setProbe] = useState<string | null>(null);
   const [confirmRevoke, setConfirmRevoke] = useState(false);
@@ -272,7 +254,7 @@ function KeyCard({ account }: { account: Account }) {
 
 function CapCard({ account }: { account: Account }) {
   const { t } = useTranslation(["dashboard", "common"]);
-  const action = useAction();
+  const action = useProviderAction();
   const [limit, setLimit] = useState(account.spend.monthlyLimit ?? "");
   const set = useMutation({
     ...orpc.providers.spendCaps.set.mutationOptions(),
@@ -336,108 +318,6 @@ function CapCard({ account }: { account: Account }) {
               {t("dashboard:providers.clearCap")}
             </Button>
           ) : null}
-        </form>
-      </CardContent>
-    </Card>
-  );
-}
-
-function ModelsCard({ account }: { account: Account }) {
-  const { t } = useTranslation(["dashboard", "common"]);
-  const action = useAction();
-  const [upstream, setUpstream] = useState("");
-  const [type, setType] = useState<ModelType>("LLM");
-  const create = useMutation({
-    ...orpc.providers.models.create.mutationOptions(),
-    meta: { skipGlobalErrorToast: true },
-  });
-  const update = useMutation({
-    ...orpc.providers.models.update.mutationOptions(),
-    meta: { skipGlobalErrorToast: true },
-  });
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base">{t("dashboard:providers.models")}</CardTitle>
-        <CardDescription>{t("dashboard:providers.modelsHint")}</CardDescription>
-      </CardHeader>
-      <CardContent className="flex min-w-0 flex-col gap-4">
-        {account.models.length === 0 ? (
-          <p className="text-sm text-muted-foreground">{t("dashboard:providers.noModels")}</p>
-        ) : (
-          <ul className="flex min-w-0 flex-col divide-y">
-            {account.models.map((model) => (
-              <li key={model.id} className="flex min-w-0 flex-wrap items-center gap-2 py-2">
-                <span className="min-w-0 flex-1 break-all font-mono text-sm">
-                  {model.upstreamModelId}
-                </span>
-                <StatusPill tone="info">{t(`dashboard:models.type.${model.type}`)}</StatusPill>
-                {model.price ? (
-                  <span className="text-xs text-muted-foreground">
-                    {t("dashboard:providers.price", {
-                      input: model.price.input,
-                      output: model.price.output,
-                      currency: model.price.currency,
-                    })}
-                  </span>
-                ) : null}
-                <Switch
-                  aria-label={t("dashboard:providers.enableModel", {
-                    model: model.upstreamModelId,
-                  })}
-                  checked={model.enabled}
-                  disabled={update.isPending}
-                  onCheckedChange={(checked) =>
-                    action(() =>
-                      update.mutateAsync({ modelId: model.id, enabled: checked === true }),
-                    )
-                  }
-                />
-              </li>
-            ))}
-          </ul>
-        )}
-        <form
-          className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-end"
-          onSubmit={async (event) => {
-            event.preventDefault();
-            const id = upstream.trim();
-            if (!id) return;
-            const ok = await action(
-              () => create.mutateAsync({ accountId: account.id, upstreamModelId: id, type }),
-              t("dashboard:providers.modelAdded"),
-            );
-            if (ok) setUpstream("");
-          }}
-        >
-          <div className="min-w-0 flex-1 space-y-1.5">
-            <Label htmlFor="model-id">{t("dashboard:providers.modelId")}</Label>
-            <Input
-              id="model-id"
-              className="h-11 font-mono"
-              value={upstream}
-              onChange={(event) => setUpstream(event.target.value)}
-            />
-          </div>
-          <div className="space-y-1.5 sm:w-48">
-            <Label htmlFor="model-type">{t("dashboard:pool.form.type")}</Label>
-            <NativeSelect
-              id="model-type"
-              value={type}
-              onChange={(event) =>
-                setType(MODEL_TYPES.find((value) => value === event.target.value) ?? "LLM")
-              }
-            >
-              {MODEL_TYPES.map((value) => (
-                <option key={value} value={value}>
-                  {t(`dashboard:models.type.${value}`)}
-                </option>
-              ))}
-            </NativeSelect>
-          </div>
-          <Button type="submit" size="touch" disabled={!upstream.trim() || create.isPending}>
-            {t("dashboard:pool.add")}
-          </Button>
         </form>
       </CardContent>
     </Card>

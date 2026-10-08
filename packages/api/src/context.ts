@@ -30,9 +30,9 @@ export type ContextServices = {
   /** Lane B: node and profile relay hooks (`lib/node-relay-services.ts`). */
   nodes?: NodeRelayServices;
   /**
-   * TODO(server, lane C hook): a runtime got a new version (create, update, fork). Push
-   * `runtime.define` to the nodes that need it and answer per node. Absent: the procedures
-   * answer `define: []` and nodes pick the version up on their next definition sync.
+   * A runtime got a new version (create, update, fork). Push `runtime.define` to the nodes
+   * that need it and answer per node. Absent (tests): the procedures answer `define: []` and
+   * nodes pick the version up on their next definition sync.
    */
   pushRuntimeDefinitions?: (input: { userId: string; runtimeId: string }) => Promise<
     Array<{
@@ -42,16 +42,16 @@ export type ContextServices = {
     }>
   >;
   /**
-   * TODO(server, lane C hook): a start, restart or stop operation was recorded (instances,
-   * ranks and claims written; desired state set). Create and dispatch its steps. Absent: the
-   * rows wait for the server's lifecycle sweep.
+   * A start, restart or stop operation was recorded (instances, ranks and claims written;
+   * desired state set). Create and dispatch its steps. Absent (tests): the rows wait for the
+   * server's lifecycle sweep.
    */
   dispatchRuntimeOperation?: (input: { userId: string; operationId: string }) => Promise<void>;
   /**
    * Lane D (access): a credential or grant was revoked and committed. The server drops any
-   * cached admission for it and closes live MCP sessions or terminals it authorized.
-   * TODO(server): wire in apps/server; until then a revoked credential stops working on the
-   * next lookup (every lookup reads `revokedAt`).
+   * cached admission for it and closes live MCP sessions or terminals it authorized. Absent
+   * (tests): a revoked credential still stops working on the next lookup (every lookup reads
+   * `revokedAt`).
    */
   onAccessRevoked?: (event: AccessRevokedEvent) => Promise<void>;
   /**

@@ -73,7 +73,7 @@ Gated by the `admin` layout; non-admins see a 404.
 | Path | Description |
 |------|-------------|
 | `/{lang}/admin` | Admin overview. |
-| `/{lang}/admin/users` | Invite, role, ban, remove. |
+| `/{lang}/admin/users` | Invite, role, archive, remove. |
 | `/{lang}/admin/observability` | Every node, runtime, pool and the request log across accounts. |
 | `/{lang}/admin/settings` | Sign-up, forced 2FA, media retention and attachment cap. |
 

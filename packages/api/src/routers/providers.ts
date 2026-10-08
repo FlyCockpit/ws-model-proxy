@@ -200,7 +200,8 @@ export const providersRouter = {
               endpointVersion: 1,
               authType: input.authType,
               enabled: false,
-              allowDataCollection: input.allowDataCollection,
+              // Only OpenRouter honours a data policy; never store one for other providers.
+              allowDataCollection: input.providerType === "openrouter" && input.allowDataCollection,
             },
             select: { id: true, authType: true },
           });
