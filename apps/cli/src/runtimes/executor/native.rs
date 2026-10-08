@@ -126,13 +126,25 @@ pub fn mechanism_until(deadline: Deadline, cancel: Option<&AtomicBool>) -> &'sta
 }
 
 /// Launching steps need a user manager that outlives logins (linger); the
-/// node on macOS only wraps services it can prove with `status`.
+/// node on macOS only wraps services it can prove with `status`. On Linux every
+/// other step runs its commands in the rank's slice, so it needs a user manager
+/// that answers now.
 pub fn activation_supported(action: JobPhase, mechanism: &str) -> bool {
-    !matches!(
+    if matches!(
         action,
         JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin
-    ) || matches!(mechanism, "systemd+linger" | "macos")
+    ) {
+        return matches!(mechanism, "systemd+linger" | "macos");
+    }
+    !cfg!(target_os = "linux") || mechanism != "unsupported"
 }
+
+/// What a node without a reachable systemd user manager is told.
+pub const USER_MANAGER_NEEDED: &str = "runtimes need the systemd user manager: enable lingering (`loginctl enable-linger`) or run wsmp as the installed wsmp.service";
+
+/// How long a stop gives the rank's leftovers after SIGTERM before SIGKILL.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const SLICE_STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// `wsmp-runtime:<owner>:<unit without phase suffix>`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -239,6 +251,8 @@ fn run_in_rank_slice(
     let env = command_env(job)?;
     #[cfg(target_os = "linux")]
     {
+        let bus = format!("/run/user/{}/bus", nix::unistd::Uid::effective().as_raw());
+        anyhow::ensure!(std::path::Path::new(&bus).exists(), USER_MANAGER_NEEDED);
         let args: Vec<String> = vec![
             format!(
                 "XDG_RUNTIME_DIR=/run/user/{}",
@@ -643,6 +657,59 @@ impl Runtime for NativeRuntime {
         port_free(host, port)
     }
 
+    fn stop_slice(&self, slice: &str, deadline: Deadline) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let signal = |name: &str| {
+                manager_until(
+                    "systemctl",
+                    &[
+                        "--user".into(),
+                        "kill".into(),
+                        format!("--signal={name}"),
+                        slice.into(),
+                    ],
+                    deadline,
+                    None,
+                    &[],
+                )
+                .map(|_| ())
+            };
+            // Wait until the slice is empty, at most `wait` (and within the step's deadline).
+            let empty_within = |wait: Duration| -> Result<bool> {
+                let until = std::time::Instant::now() + wait;
+                loop {
+                    if !self.tasks_alive(slice, deadline)? {
+                        return Ok(true);
+                    }
+                    if std::time::Instant::now() >= until || deadline.remaining().is_err() {
+                        return Ok(false);
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            };
+            if !self.tasks_alive(slice, deadline)? {
+                return Ok(());
+            }
+            signal("SIGTERM")?;
+            let grace = SLICE_STOP_GRACE.min(deadline.remaining()? / 2);
+            if empty_within(grace)? {
+                return Ok(());
+            }
+            signal("SIGKILL")?;
+            anyhow::ensure!(
+                empty_within(Duration::from_secs(5))?,
+                "a process of the rank's slice survived SIGKILL"
+            );
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (slice, deadline);
+            Ok(())
+        }
+    }
+
     fn forget_slice(&self, slice: &str, deadline: Deadline) {
         // Proven empty just before: stopping it ends nothing, it only unloads the slice.
         #[cfg(target_os = "linux")]
@@ -773,7 +840,12 @@ mod tests {
         assert!(!user_manager_live("offline"));
         assert!(linger_enabled("Linger=yes\n"));
         assert!(!linger_enabled("Linger=no"));
-        assert!(activation_supported(JobPhase::Stop, "unsupported"));
+        // Every step runs its commands in the rank's slice on Linux: a manager must answer.
+        assert_eq!(
+            activation_supported(JobPhase::Stop, "unsupported"),
+            !cfg!(target_os = "linux")
+        );
+        assert!(activation_supported(JobPhase::Stop, "systemd-no-linger"));
         assert!(!activation_supported(JobPhase::Start, "systemd-no-linger"));
         assert!(activation_supported(JobPhase::Start, "systemd+linger"));
     }
@@ -852,9 +924,10 @@ mod tests {
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
     }
 
-    /// Real systemd user units (`--ignored`): every way a stop could be released without a
-    /// fresh proof is refused. A `setsid` descendant of the stop command stays in the rank's
-    /// slice; a re-delivered stop and the inventory check the port again; the dist port counts.
+    /// Real systemd user units (`--ignored`): a stop ends what its command left in the rank's
+    /// slice (a `setsid` daemon ignoring SIGTERM: SIGKILL after the grace) and is then proven;
+    /// a probe kills nothing; the dist port counts; a re-delivered stop and the inventory check
+    /// the port again.
     #[test]
     #[ignore = "needs a systemd user manager"]
     fn a_real_stop_is_proven_only_with_an_empty_slice_and_free_ports() {
@@ -916,43 +989,63 @@ mod tests {
                 .expect("manager")
         );
         // The stop command leaves a `setsid` daemon behind while the marker exists.
-        let marker = root.path().join("leave-a-daemon");
-        std::fs::write(&marker, b"").expect("marker");
-        let daemon = format!(
-            "if [ -e '{}' ]; then setsid sleep 120 </dev/null >/dev/null 2>&1 & fi",
-            marker.display()
-        );
-        let daemon = daemon.as_str();
+        // The stop command leaves a `setsid` daemon behind that ignores SIGTERM.
+        // (`sleep 1`: the daemon has left the command's process group before the command ends.)
+        let daemon =
+            "setsid sh -c \"trap '' TERM; exec sleep 121\" </dev/null >/dev/null 2>&1 & sleep 1";
+        let slice = format!("{}.slice", unit.replace('-', "_"));
+        let slice_alive = || runtime.tasks_alive(&slice, deadline(10)).expect("manager");
         assert_eq!(
             executor
                 .execute(job(JobPhase::Start, "s1", daemon), &runtime, deadline(20))
                 .status,
             JobStatus::Succeeded
         );
-        // The stop command leaves a `setsid` daemon behind: never proven.
-        let stop = executor.execute(job(JobPhase::Stop, "s2", daemon), &runtime, deadline(4));
-        assert_eq!((stop.status, stop.stopped), (JobStatus::Failed, false));
-        let probe = executor.execute(job(JobPhase::Status, "s3", daemon), &runtime, deadline(10));
-        assert_eq!(probe.detail.as_deref(), Some("process_alive"), "{probe:?}");
-        std::fs::remove_file(&marker).expect("marker");
-        let slice = format!("{}.slice", unit.replace('-', "_"));
-        let _ = std::process::Command::new("systemctl")
-            .args(["--user", "stop", &slice])
-            .status();
-        // The dist port is held: still not proven.
-        let held = std::net::TcpListener::bind(("127.0.0.1", dist)).expect("dist");
-        let probe = executor.execute(job(JobPhase::Status, "s4", daemon), &runtime, deadline(10));
-        assert_eq!(probe.detail.as_deref(), Some("port_in_use"), "{probe:?}");
-        drop(held);
-        let stop = executor.execute(job(JobPhase::Stop, "s5", daemon), &runtime, deadline(10));
+        // The stop ends the slice (SIGTERM, then SIGKILL after the grace), then proves it.
+        let started = std::time::Instant::now();
+        let stop = executor.execute(job(JobPhase::Stop, "s2", daemon), &runtime, deadline(30));
         assert!(stop.stopped, "{stop:?}");
+        assert!(!slice_alive());
+        assert!(
+            started.elapsed() >= SLICE_STOP_GRACE,
+            "the daemon ignored SIGTERM: only SIGKILL after the grace ended it"
+        );
+        let left = std::process::Command::new("pgrep")
+            .args(["-f", "^sleep 121$"])
+            .status()
+            .expect("pgrep");
+        assert!(!left.success(), "the stop command's daemon is gone");
         assert_eq!(
             executor.observations(&runtime, deadline(10))[0].1.phase,
             InstancePhase::Stopped
         );
+        // Something of the rank runs in its slice again: a status probe says so and kills nothing.
+        let planted = std::process::Command::new("systemd-run")
+            .args(["--user", "--scope", "--quiet", "--collect"])
+            .arg(format!("--slice={slice}"))
+            .args([
+                "--",
+                "/bin/sh",
+                "-c",
+                "setsid sleep 120 </dev/null >/dev/null 2>&1 &",
+            ])
+            .status()
+            .expect("systemd-run");
+        assert!(planted.success());
+        let probe = executor.execute(job(JobPhase::Status, "s3", daemon), &runtime, deadline(10));
+        assert_eq!(probe.detail.as_deref(), Some("process_alive"), "{probe:?}");
+        assert!(slice_alive(), "a probe never kills anything");
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "stop", &slice])
+            .status();
+        // The dist port is held: not proven.
+        let held = std::net::TcpListener::bind(("127.0.0.1", dist)).expect("dist");
+        let probe = executor.execute(job(JobPhase::Status, "s4", daemon), &runtime, deadline(10));
+        assert_eq!(probe.detail.as_deref(), Some("port_in_use"), "{probe:?}");
+        drop(held);
         // The port is taken again: neither the re-delivered stop nor the inventory says stopped.
         let taken = std::net::TcpListener::bind(("127.0.0.1", port)).expect("port");
-        let again = executor.execute(job(JobPhase::Stop, "s5", daemon), &runtime, deadline(10));
+        let again = executor.execute(job(JobPhase::Stop, "s2", daemon), &runtime, deadline(10));
         assert_eq!(
             (again.stopped, again.detail.as_deref()),
             (false, Some("port_in_use"))

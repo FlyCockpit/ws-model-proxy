@@ -54,6 +54,10 @@ struct Fake {
     busy_ports: RefCell<Vec<u16>>,
     /// Slices the executor let the manager forget.
     forgotten: RefCell<Vec<String>>,
+    /// Slices a stop ended.
+    slice_stops: RefCell<Vec<String>>,
+    /// A process of the slice survives a stop of the slice.
+    slice_survives: Cell<bool>,
     /// What the status command answers: alive, stopped, or (None) an error.
     status_alive: Cell<Option<bool>>,
     /// Whether the user manager errors when asked for a unit's tasks.
@@ -72,6 +76,8 @@ impl Fake {
             port_busy: Cell::new(false),
             busy_ports: RefCell::new(Vec::new()),
             forgotten: RefCell::new(Vec::new()),
+            slice_stops: RefCell::new(Vec::new()),
+            slice_survives: Cell::new(false),
             status_alive: Cell::new(None),
             tasks_unknown: Cell::new(false),
         }
@@ -128,6 +134,12 @@ impl Runtime for Fake {
     }
     fn forget_slice(&self, slice: &str, _: Deadline) {
         self.forgotten.borrow_mut().push(slice.into());
+    }
+    fn stop_slice(&self, slice: &str, _: Deadline) -> Result<()> {
+        self.slice_stops.borrow_mut().push(slice.into());
+        anyhow::ensure!(!self.slice_survives.get(), "a process survived SIGKILL");
+        self.orphans.borrow_mut().retain(|orphan| orphan != slice);
+        Ok(())
     }
 }
 
@@ -762,20 +774,42 @@ fn a_prepare_a_person_ran_keeps_the_status_requirement() {
 }
 
 #[test]
-fn a_process_left_in_the_ranks_slice_keeps_the_stop_unproven() {
+fn a_stop_ends_what_its_command_left_in_the_ranks_slice() {
     let root = tempfile::tempdir().expect("root");
     let path = root.path().join("in1-r0.json");
     let runtime = Fake::new(path.clone());
     let mut executor = Executor::load(path).expect("load");
     executor.execute(stubbed(job(JobPhase::Start)), &runtime, deadline());
-    // The stop command forked a `setsid` daemon: its unit is gone, the slice is not empty.
+    // The stop command forked a `setsid` daemon: the stop ends the slice, then proves it.
     runtime
         .orphans
         .borrow_mut()
         .push("wsmp_i_abcdefabcdef_r0.slice".into());
+    let stop = executor.execute(stubbed(job(JobPhase::Stop)), &runtime, deadline());
+    assert_eq!((stop.status, stop.stopped), (JobStatus::Succeeded, true));
+    assert_eq!(
+        *runtime.slice_stops.borrow(),
+        vec!["wsmp_i_abcdefabcdef_r0.slice".to_string()]
+    );
+}
+
+#[test]
+fn a_process_that_survives_the_slice_stop_keeps_the_stop_unproven() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(stubbed(job(JobPhase::Start)), &runtime, deadline());
+    runtime
+        .orphans
+        .borrow_mut()
+        .push("wsmp_i_abcdefabcdef_r0.slice".into());
+    runtime.slice_survives.set(true);
     let short = Deadline::new(Duration::from_millis(1_200));
     let stop = executor.execute(stubbed(job(JobPhase::Stop)), &runtime, short);
     assert_eq!((stop.status, stop.stopped), (JobStatus::Failed, false));
+    // A status probe kills nothing: it only says why.
+    let stops = runtime.slice_stops.borrow().len();
     let mut probe = stubbed(job(JobPhase::Status));
     probe.step_id = "p1".into();
     assert_eq!(
@@ -785,6 +819,8 @@ fn a_process_left_in_the_ranks_slice_keeps_the_stop_unproven() {
             .as_deref(),
         Some("process_alive")
     );
+    assert_eq!(runtime.slice_stops.borrow().len(), stops);
+    // Gone later (a person ended it): the next probe proves the stop.
     runtime.orphans.borrow_mut().clear();
     let mut probe = stubbed(job(JobPhase::Status));
     probe.step_id = "p2".into();
@@ -893,6 +929,7 @@ fn a_ranks_slice_is_flat_and_forgotten_only_once_proven_empty() {
         .orphans
         .borrow_mut()
         .push("wsmp_i_abcdefabcdef_r0.slice".into());
+    runtime.slice_survives.set(true);
     let short = Deadline::new(Duration::from_millis(600));
     assert!(
         !executor

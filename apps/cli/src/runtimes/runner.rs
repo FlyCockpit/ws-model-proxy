@@ -355,6 +355,11 @@ fn run_operator_step(
         Some(cancel.as_ref()),
     );
     if !super::executor::native::activation_supported(job.action, mechanism) {
+        tracing::warn!(
+            mechanism,
+            "{}",
+            super::executor::native::USER_MANAGER_NEEDED
+        );
         return Some(Outcome::failed(JobError::ExecutionMechanismUnavailable));
     }
     let _lock = match file_lock(dir, key) {
@@ -413,7 +418,8 @@ fn run_step(
     if !super::executor::native::activation_supported(job.action, mechanism) {
         tracing::warn!(
             mechanism,
-            "runtimes need a systemd user manager that outlives logins; run `loginctl enable-linger`"
+            "{}",
+            super::executor::native::USER_MANAGER_NEEDED
         );
         return Outcome::failed(JobError::ExecutionMechanismUnavailable);
     }

@@ -75,6 +75,10 @@ A stopping instance keeps its resources and ports until its node proves the
 stop. Every command the node runs for a rank (prepare, start, after-join,
 stop, status, health) runs in that rank's systemd user slice, so whatever a
 command leaves behind (a fork, a `setsid` daemon) stays where the node looks.
+A stop runs the stop command, stops the rank's units, then ends everything
+left in the slice (SIGTERM, then SIGKILL after 10 seconds); status and health
+checks never kill anything. On Linux these commands need the systemd user
+manager (lingering, or wsmp running as the installed `wsmp.service`).
 The node proves the stop from what it observes itself: no process is left in
 the rank's units or its slice, and every port reserved for the rank (`port`
 and the distributed port) is free. For a `process` runtime the `status`

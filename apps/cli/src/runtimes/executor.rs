@@ -384,6 +384,11 @@ pub trait Runtime {
     fn port_free(&self, host: &str, port: u16) -> bool;
     /// The rank's slice was proven empty: let the manager forget it (best effort).
     fn forget_slice(&self, _slice: &str, _deadline: Deadline) {}
+    /// A stop ends whatever still runs in the rank's slice: SIGTERM, then SIGKILL after a grace
+    /// period. Errors are logged; the proof that follows decides.
+    fn stop_slice(&self, _slice: &str, _deadline: Deadline) -> Result<()> {
+        Ok(())
+    }
 }
 
 fn owner_ok(owner: &str) -> bool {
@@ -1047,14 +1052,12 @@ impl Executor {
                 );
             }
         }
+        let mut failed_units = Vec::new();
         for (unit, invocation) in units {
             if invocation != "external" && invocation != "self-detached" {
                 if let Err(error) = runtime.stop(&unit, &self.state.owner_id, &invocation, deadline)
                 {
-                    // The process is already gone (the unit was relaunched under another
-                    // invocation, or its leftovers cannot be stopped): an empty process tree is
-                    // the proof. Anything still running keeps the stop unproven.
-                    anyhow::ensure!(!runtime.tasks_alive(&unit, deadline)?, error);
+                    failed_units.push((unit, error));
                 }
             } else {
                 anyhow::ensure!(
@@ -1062,6 +1065,23 @@ impl Executor {
                     "detached stop requires status proof"
                 );
             }
+        }
+        // Then everything else wsmp launched for the rank: the slice holds nothing but the
+        // rank's own commands and what they left behind (a `setsid` daemon of the stop
+        // command, say). Only a stop ends it; status and health checks never kill anything.
+        if let Err(error) = runtime.stop_slice(&rank_slice(job), deadline) {
+            tracing::warn!(
+                instance_id = job.instance_id,
+                rank = job.rank,
+                error = %format!("{error:#}"),
+                "stopping the rank's slice failed"
+            );
+        }
+        for (unit, error) in failed_units {
+            // The process is already gone (the unit was relaunched under another invocation,
+            // or its leftovers cannot be stopped): an empty process tree is the proof.
+            // Anything still running keeps the stop unproven.
+            anyhow::ensure!(!runtime.tasks_alive(&unit, deadline)?, error);
         }
         // A stop command that exits at once (`true`) leaves nothing to wait for once the
         // proof holds; a status command that keeps saying "alive" does not hold a process
@@ -1304,6 +1324,9 @@ impl<R: Runtime> Runtime for OperatorRan<'_, R> {
     }
     fn forget_slice(&self, slice: &str, deadline: Deadline) {
         self.inner.forget_slice(slice, deadline);
+    }
+    fn stop_slice(&self, slice: &str, deadline: Deadline) -> Result<()> {
+        self.inner.stop_slice(slice, deadline)
     }
 }
 
