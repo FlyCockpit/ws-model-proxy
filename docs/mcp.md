@@ -241,6 +241,15 @@ buckets × metrics per query; a grouped answer keeps the largest groups that fit
 shared with you answers request metrics of your own requests only, ungrouped or
 by `source`.
 
+Agent tests (`model_test`, source `AGENT_TEST`) are not load: request metrics
+leave them out, and `totals.tests` counts the ones left out (absent when there
+are none). Pass `includeAgentTests: true` to count them like any other request,
+for example to group a bench by `source`. A test of a runtime
+(`runtime:<id>:<model>`) does not go through a pool: it counts in that runtime's
+(version, node, instance) metrics, never in a pool the runtime serves. Test the
+pool's callable ID to exercise the pool. Rollups are written with each
+request's completion, so a finished test shows up at once.
+
 ### Node files
 
 `node_file_read` reads, stats, lists or searches under the folders the node
