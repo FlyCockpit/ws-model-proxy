@@ -54,7 +54,9 @@
     "poolCount_other": "{{count}} pools",
     "loadFailed": "Could not load your API keys.",
     "revokeTitle": "Revoke {{name}}?",
-    "revokeDescription": "Programs using this key stop working at once. This cannot be undone."
+    "revokeDescription": "Programs using this key stop working at once. This cannot be undone.",
+    "canUse": "Can use",
+    "poolGone": "A pool you can no longer use"
   },
   "agents": {
     "mcpUrl": "MCP URL",

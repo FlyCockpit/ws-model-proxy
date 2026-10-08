@@ -54,7 +54,9 @@
     "poolCount_other": "{{count}} pools",
     "loadFailed": "No se pudieron cargar tus claves de API.",
     "revokeTitle": "¿Revocar {{name}}?",
-    "revokeDescription": "Los programas que usan esta clave dejan de funcionar de inmediato. No se puede deshacer."
+    "revokeDescription": "Los programas que usan esta clave dejan de funcionar de inmediato. No se puede deshacer.",
+    "canUse": "Puede usar",
+    "poolGone": "Un pool que ya no puedes usar"
   },
   "agents": {
     "mcpUrl": "URL de MCP",

@@ -4,6 +4,7 @@ import { Button } from "@ws-model-proxy/ui/components/button";
 import { Card, CardContent } from "@ws-model-proxy/ui/components/card";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { KeyRound, Plus } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -99,6 +100,50 @@ function ApiKeyList({ keys }: { keys: ApiKeyView[] }) {
   );
 }
 
+/** What a key can call: all pools, or one chip per selected pool, named by its callable id. */
+function CanUseChips({ apiKey }: { apiKey: ApiKeyView }) {
+  const { t } = useTranslation(["access"]);
+  const pools = useQuery({
+    ...orpc.pools.list.queryOptions(),
+    enabled: apiKey.scope === "SELECTED_POOLS",
+  });
+  const names = new Map<string, string>();
+  for (const pool of pools.data?.pools ?? []) names.set(pool.id, pool.callableIds[0] ?? pool.slug);
+  for (const pool of pools.data?.sharedWithMe ?? [])
+    names.set(pool.poolId, pool.callableIds[0] ?? pool.poolId);
+  const chips =
+    apiKey.scope === "ALL_POOLS"
+      ? [{ key: "all", label: t("access:apiKeys.allPools"), known: true }]
+      : apiKey.poolIds.map((poolId) => {
+          const name = names.get(poolId);
+          return { key: poolId, label: name ?? t("access:apiKeys.poolGone"), known: !!name };
+        });
+  return (
+    <div className="flex min-w-0 flex-col gap-1">
+      <p className="text-xs text-muted-foreground">{t("access:apiKeys.canUse")}</p>
+      {apiKey.scope === "SELECTED_POOLS" && pools.isPending ? (
+        <Skeleton className="h-6 w-40" />
+      ) : apiKey.scope === "SELECTED_POOLS" && pools.isError ? (
+        <p className="text-xs">{t("access:apiKeys.poolCount", { count: apiKey.poolIds.length })}</p>
+      ) : (
+        <ul className="flex min-w-0 flex-wrap gap-1.5">
+          {chips.map((chip) => (
+            <li
+              key={chip.key}
+              className={cn(
+                "inline-flex min-w-0 max-w-full items-center rounded-full border px-2 py-0.5 text-xs",
+                chip.known ? "font-mono" : "text-muted-foreground italic",
+              )}
+            >
+              <span className="truncate">{chip.label}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function ApiKeyRow({ apiKey, now }: { apiKey: ApiKeyView; now: number }) {
   const { t } = useTranslation(["access"]);
   const queryClient = useQueryClient();
@@ -124,11 +169,7 @@ function ApiKeyRow({ apiKey, now }: { apiKey: ApiKeyView; now: number }) {
           <p className="break-all font-mono text-xs text-muted-foreground">
             {apiKey.lookupPrefix}…
           </p>
-          <p className="text-xs text-muted-foreground">
-            {apiKey.scope === "ALL_POOLS"
-              ? t("access:apiKeys.allPools")
-              : t("access:apiKeys.poolCount", { count: apiKey.poolIds.length })}
-          </p>
+          <CanUseChips apiKey={apiKey} />
           <CredentialDatesList row={apiKey} />
         </div>
         {status !== "revoked" ? (
