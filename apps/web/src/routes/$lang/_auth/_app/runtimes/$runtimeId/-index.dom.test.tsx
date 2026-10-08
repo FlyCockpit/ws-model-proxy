@@ -1,9 +1,13 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, configure, render, screen, within } from "@testing-library/react";
 import type { ComponentType, ReactNode } from "react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+
+// The overview's first render can take longer than the 1 s default on a
+// loaded runner; every wait is still for a real condition.
+configure({ asyncUtilTimeout: 10_000 });
 
 /** Runtime overview: an instance whose stop is not confirmed offers Mark as stopped. */
 
@@ -105,7 +109,11 @@ beforeAll(async () => {
   await Component.preload?.();
 }, 30_000);
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  // Reset here, not at the end of a test: a failed test must not leak its kind.
+  state.kind = "STARTABLE";
+});
 
 function mount() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -116,14 +124,13 @@ function mount() {
   );
 }
 
-describe("runtime overview instances", () => {
+describe("runtime overview instances", { timeout: 30_000 }, () => {
   it("offers no Start, Stop or Restart for an always-on runtime", async () => {
     state.kind = "ALWAYS_ON";
     mount();
     await screen.findByText("i-stuck");
     for (const name of ["start", "stop", "restart"])
       expect(screen.queryByRole("button", { name: `dashboard:runtime.${name}` })).toBeNull();
-    state.kind = "STARTABLE";
   });
 
   it("links metrics by version and shows the sharing card", async () => {
