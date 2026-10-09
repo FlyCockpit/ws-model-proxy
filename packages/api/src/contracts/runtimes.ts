@@ -715,7 +715,7 @@ export const runtimesContract = {
         })
         .strict(),
       releaseRequestStatusSchema,
-      "Ask a person to release a node's part marked stopped whose stop the node cannot prove, with what you checked. One pending request per part; expires in 24 h.",
+      "Ask a person to release a node's part marked stopped whose stop the node cannot prove, with what you checked. Full-control nodes only (trust_relay); one pending request per part; expires in 24 h.",
       ["runtime_stop"],
     ),
     withdraw: mutation(

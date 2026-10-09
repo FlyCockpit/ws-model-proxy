@@ -424,6 +424,11 @@ BEGIN
          "phaseChangedAt" = now(), "needsOperator" = NULL, "needsOperatorSince" = NULL
    WHERE i."desiredState" IS NOT NULL AND i.phase <> 'STOPPED'
      AND EXISTS (SELECT 1 FROM instance_rank r WHERE r."instanceId" = i.id AND r."nodeId" = OLD.id);
+  -- Agents' release requests for those claims have nothing left to release.
+  UPDATE claim_release_request
+     SET state = 'CLEARED', "pendingRankId" = NULL, "decidedAt" = now()
+   WHERE state = 'PENDING'
+     AND "rankId" IN (SELECT id FROM instance_rank WHERE "nodeId" = OLD.id AND claim <> 'RELEASED');
   UPDATE instance_rank
      SET claim = 'RELEASED', "claimChangedAt" = now(), "stoppedAt" = COALESCE("stoppedAt", now())
    WHERE "nodeId" = OLD.id AND claim <> 'RELEASED';
@@ -679,7 +684,7 @@ ALTER TABLE claim_release_request ADD CONSTRAINT claim_release_request_shape CHE
   char_length(findings) BETWEEN 1 AND 4000
   AND num_nonnulls("agentTokenId", "mcpGrantId") = 1
   AND (evidence IS NULL OR (jsonb_typeof(evidence) = 'array' AND jsonb_array_length(evidence) <= 8
-    AND octet_length(evidence::text) <= 65536))
+    AND octet_length(evidence::text) <= 262144))
   AND "expiresAt" > "createdAt"
   AND "expiresAt" <= "createdAt" + interval '7 days'
   AND (state = 'PENDING') = ("pendingRankId" IS NOT NULL)

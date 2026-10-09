@@ -129,16 +129,18 @@ process still holds the port, the next start there fails with the usual
 reasons. Agents, API keys and the CLI relay can never release.
 
 An agent may ask instead: `runtime_stop {instanceId, nodeNumber?,
-requestRelease: {findings, evidence?}}` on a part marked stopped, with what it
-checked (`findings` up to 4,000 characters; `evidence` up to 8 `{command,
-output}` pairs). The text is cleaned like node command output (control
-characters removed, wsmp credentials redacted) and shown to the person as the
-agent's unverified words. One request may wait per part
+requestRelease: {findings, evidence?}}` on a part marked stopped on a
+Full-control node (`trust_relay` otherwise), with what it checked (`findings`
+up to 4,000 characters; `evidence` up to 8 `{command, output}` pairs). The text is cleaned like node command output (control
+characters removed, wsmp credentials redacted, clipped to those lengths) and
+shown to the person as the agent's unverified words; a command that is empty
+once cleaned is refused. One request may wait per part
 (`release_request_pending`); it shows on the runtime page, in Needs you and as
 the rank's `releaseRequestId`. The person approves (the same release) or
 declines. `requestRelease: "withdraw"` takes back the calling agent's own
 request. A request expires after 24 hours and is cleared when the hold ends by
-itself (a proof, a restart) or the agent's credential is revoked.
+itself (a proof, a restart, the node deleted) or the agent's credential is
+revoked.
 
 ### Runtime definitions
 

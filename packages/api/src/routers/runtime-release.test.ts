@@ -89,6 +89,8 @@ function instanceWith(
         markedStoppedAt: new Date(NOW - 1_800_000),
         Node: {
           id: "node-1",
+          trust: "FULL",
+          trustLowerRequestedAt: null,
           connection,
           lastConnectedAt: new Date(NOW - 7_200_000),
           lastDisconnectedAt: connection === "OFFLINE" ? new Date(NOW - 600_000) : null,
@@ -392,6 +394,7 @@ describe("runtimes.releaseRequests.create / withdraw (agents)", () => {
       ),
     ).toBe("NOT_FOUND");
     expect(db.claimReleaseRequest.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      userId: OWNER,
       pendingRankId: "rank-0",
       state: "PENDING",
       agentTokenId: null,
@@ -401,11 +404,19 @@ describe("runtimes.releaseRequests.create / withdraw (agents)", () => {
       id: "req-1",
       expiresAt: new Date(NOW + 1_000),
     } as never);
+    db.claimReleaseRequest.updateMany.mockResolvedValueOnce({ count: 1 });
     await expect(
       client(CALLERS.fullAgent()).releaseRequests.withdraw({ instanceId: "inst-1" }),
     ).resolves.toMatchObject({ requestId: "req-1", state: "WITHDRAWN" });
-    expect(db.claimReleaseRequest.update).toHaveBeenCalledWith({
-      where: { id: "req-1" },
+    // Conditional on still pending and still this credential's.
+    expect(db.claimReleaseRequest.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: "req-1",
+        userId: OWNER,
+        state: "PENDING",
+        agentTokenId: "tok-1",
+        mcpGrantId: null,
+      },
       data: expect.objectContaining({ state: "WITHDRAWN", pendingRankId: null }),
     });
     expect(db.nodeAuditEvent.create.mock.calls[0]?.[0]?.data).toMatchObject({
@@ -414,6 +425,80 @@ describe("runtimes.releaseRequests.create / withdraw (agents)", () => {
       kind: "claim_release_request",
       outcome: "cancelled",
     });
+  });
+});
+
+describe("runtimes.releaseRequests: what an agent's text and node may be", () => {
+  it("answers a conflict when the sweep or a revocation settled the request before the withdrawal", async () => {
+    db.runtimeInstance.findFirst.mockResolvedValue(instanceWith("HELD_UNKNOWN") as never);
+    db.claimReleaseRequest.findFirst.mockResolvedValueOnce({
+      id: "req-1",
+      expiresAt: new Date(NOW + 1_000),
+    } as never);
+    db.claimReleaseRequest.updateMany.mockResolvedValueOnce({ count: 0 });
+    expect(
+      await reasonOf(
+        client(CALLERS.fullAgent()).releaseRequests.withdraw({ instanceId: "inst-1" }),
+      ),
+    ).toBe("CONFLICT");
+    expect(db.nodeAuditEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses an agent on a Relay-only node, as marking it stopped does", async () => {
+    const relay = instanceWith("HELD_UNKNOWN");
+    const [part] = relay.Ranks;
+    if (part) part.Node.trust = "RELAY";
+    db.runtimeInstance.findFirst.mockResolvedValueOnce(relay as never);
+    expect(
+      await reasonOf(
+        client(CALLERS.fullAgent()).releaseRequests.create({
+          instanceId: "inst-1",
+          findings: "checked",
+        }),
+      ),
+    ).toBe("trust_relay");
+    expect(db.claimReleaseRequest.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses evidence whose command is empty once cleaned", async () => {
+    expect(
+      await reasonOf(
+        client(CALLERS.fullAgent()).releaseRequests.create({
+          instanceId: "inst-1",
+          findings: "checked",
+          evidence: [{ command: "\u001b[31m", output: "" }],
+        }),
+      ),
+    ).toBe("BAD_REQUEST");
+    expect(db.claimReleaseRequest.create).not.toHaveBeenCalled();
+  });
+
+  it("stores the largest evidence within the stored bounds, even when cleaning lengthens it", async () => {
+    db.runtimeInstance.findFirst.mockResolvedValueOnce(instanceWith("HELD_UNKNOWN") as never);
+    db.claimReleaseRequest.create.mockResolvedValue({
+      id: "req-1",
+      state: "PENDING",
+      expiresAt: new Date(NOW + 86_400_000),
+    } as never);
+    // A leading credential prefix grows by one character when redacted; quotes and
+    // non-ASCII text grow as JSON bytes.
+    const findings = `wsmp_key_${"x".repeat(3_991)}`;
+    const entry = { command: `wsmp_key_${'"'.repeat(1_991)}`, output: '\u00e9"'.repeat(2_000) };
+    await client(CALLERS.fullAgent()).releaseRequests.create({
+      instanceId: "inst-1",
+      findings,
+      evidence: Array(8).fill(entry),
+    });
+    const data = db.claimReleaseRequest.create.mock.calls[0]?.[0]?.data;
+    expect([...(data?.findings ?? "")].length).toBeLessThanOrEqual(4_000);
+    const evidence = data?.evidence as Array<{ command: string; output: string }>;
+    expect(evidence).toHaveLength(8);
+    for (const stored of evidence) {
+      expect(stored.command.length).toBeLessThanOrEqual(2_000);
+      expect(stored.output.length).toBeLessThanOrEqual(4_000);
+    }
+    // Well inside claim_release_request_shape's 256 KiB.
+    expect(Buffer.byteLength(JSON.stringify(evidence))).toBeLessThan(262_144);
   });
 });
 

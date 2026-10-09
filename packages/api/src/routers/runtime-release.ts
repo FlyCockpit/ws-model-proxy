@@ -31,8 +31,9 @@ import { type CallerActor, callerActor } from "../lib/caller-actor";
 import { RELEASE_REQUEST_TTL_MS, releaseClaim } from "../lib/claim-release";
 import { graphWrite, instanceCapacityFences } from "../lib/graph-write";
 import { readLiveLoad } from "../lib/live-load";
-import { isUniqueViolation, notFound, refuse } from "../lib/refuse";
+import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
 import { isHiddenCodePoint } from "../lib/runtime-spec";
+import { effectiveTrust } from "../lib/runtime-store";
 import { INSTANCE_INCLUDE, instanceView } from "../lib/runtime-views";
 import {
   latestStopChecks,
@@ -84,13 +85,36 @@ export function shownAgentText(value: string): string {
   return out;
 }
 
-function storedEvidence(evidence: readonly Evidence[] | undefined): Evidence[] {
-  return (evidence ?? []).map((entry) => ({
-    command: shownAgentText(entry.command),
-    output: shownAgentText(entry.output),
-  }));
+/** Stored and shown bounds (contract and `claim_release_request_shape`). */
+const FINDINGS_MAX = 4_000;
+const COMMAND_MAX = 2_000;
+const OUTPUT_MAX = 4_000;
+
+/**
+ * At most `max` UTF-16 units, never splitting a surrogate pair: cleaning may lengthen text (a
+ * redacted credential prefix), and what is stored must still fit its bound.
+ */
+function clip(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let end = max - 1;
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${text.slice(0, end)}\u2026`;
 }
 
+/** The agent's evidence as stored: cleaned, clipped, and every command still non-empty. */
+function storedEvidence(evidence: readonly Evidence[] | undefined): Evidence[] {
+  return (evidence ?? []).map((entry) => {
+    const command = clip(shownAgentText(entry.command).trim(), COMMAND_MAX);
+    if (command.length === 0)
+      throw new ORPCError("BAD_REQUEST", {
+        message: "An evidence command is empty once control characters are removed.",
+      });
+    return { command, output: clip(shownAgentText(entry.output), OUTPUT_MAX) };
+  });
+}
+
+/** Stored evidence read back; an entry that is not a well-formed pair is left out. */
 function evidenceOf(value: Prisma.JsonValue | null): Evidence[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((entry) =>
@@ -98,8 +122,14 @@ function evidenceOf(value: Prisma.JsonValue | null): Evidence[] {
     typeof entry === "object" &&
     !Array.isArray(entry) &&
     typeof entry.command === "string" &&
+    entry.command.length > 0 &&
     typeof entry.output === "string"
-      ? [{ command: entry.command, output: entry.output }]
+      ? [
+          {
+            command: clip(entry.command, COMMAND_MAX),
+            output: clip(entry.output, OUTPUT_MAX),
+          },
+        ]
       : [],
   );
 }
@@ -112,6 +142,8 @@ const RANK_SELECT = {
   Node: {
     select: {
       id: true,
+      trust: true,
+      trustLowerRequestedAt: true,
       connection: true,
       lastConnectedAt: true,
       lastDisconnectedAt: true,
@@ -324,7 +356,7 @@ export const runtimeReleaseRequests = {
   create: contractProcedure(c.releaseRequests.create).handler(async ({ input, context }) => {
     const userId = userIdOf(context);
     const actor = agentOf(context);
-    const findings = shownAgentText(input.findings).trim();
+    const findings = clip(shownAgentText(input.findings).trim(), FINDINGS_MAX);
     if (findings.length === 0)
       throw new ORPCError("BAD_REQUEST", { message: "Say what you checked on the node." });
     const evidence = storedEvidence(input.evidence);
@@ -343,9 +375,17 @@ export const runtimeReleaseRequests = {
               );
             throw notMarkedStopped(rank.claim);
           }
+          // Agents act on Full-control nodes only, as with marking it stopped (a removed node
+          // counts as not Full).
+          if (!rank.Node || effectiveTrust(rank.Node) !== "FULL")
+            throw refuseAbout(
+              "trust_relay",
+              rank.Node?.id ?? input.instanceId,
+              "Agents may only ask about parts on nodes at Full control. A person can release it in the browser.",
+            );
           // A pending request past its expiry gives its slot back now.
           await tx.claimReleaseRequest.updateMany({
-            where: { pendingRankId: rank.id, state: "PENDING", expiresAt: { lte: now } },
+            where: { userId, pendingRankId: rank.id, state: "PENDING", expiresAt: { lte: now } },
             data: { state: "EXPIRED", pendingRankId: null, decidedAt: now },
           });
           const row = await tx.claimReleaseRequest.create({
@@ -404,6 +444,7 @@ export const runtimeReleaseRequests = {
         // Only the agent credential that asked takes its request back.
         const row = await tx.claimReleaseRequest.findFirst({
           where: {
+            userId,
             pendingRankId: rank.id,
             state: "PENDING",
             agentTokenId: actor.agentTokenId,
@@ -412,10 +453,22 @@ export const runtimeReleaseRequests = {
           select: { id: true, expiresAt: true },
         });
         if (!row) throw notFound("You have no pending release request for this part.");
-        await tx.claimReleaseRequest.update({
-          where: { id: row.id },
+        // Conditional: the sweep or a credential revocation (outside these fences) may have
+        // settled it since the read.
+        const withdrawn = await tx.claimReleaseRequest.updateMany({
+          where: {
+            id: row.id,
+            userId,
+            state: "PENDING",
+            agentTokenId: actor.agentTokenId,
+            mcpGrantId: actor.mcpGrantId,
+          },
           data: { state: "WITHDRAWN", pendingRankId: null, decidedAt: now },
         });
+        if (withdrawn.count === 0)
+          throw new ORPCError("CONFLICT", {
+            message: "This request expired or was cleared meanwhile.",
+          });
         if (rank.Node)
           await tx.nodeAuditEvent.create({
             data: {

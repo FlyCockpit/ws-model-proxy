@@ -272,5 +272,23 @@ integration("releasing a claim whose stop cannot be proven, on PostgreSQL", () =
     expect(
       await modules.prisma.instanceRank.count({ where: { nodeId, claim: { not: "RELEASED" } } }),
     ).toBe(0);
+
+    // Restarting the released instance retakes its claim: the release record is cleared (the
+    // claim shape allows it only on a released claim).
+    const instance = await modules.prisma.runtimeInstance.findUniqueOrThrow({
+      where: { id: leftover.instanceId },
+      select: { runtimeId: true },
+    });
+    const restarted = await agent().start({
+      runtimeId: instance.runtimeId,
+      instanceId: leftover.instanceId,
+    });
+    expect(restarted.mode).toBe("applied");
+    expect(
+      await modules.prisma.instanceRank.findUniqueOrThrow({
+        where: { id: leftover.id },
+        select: { claim: true, releasedUnprovenAt: true, releasedUnprovenBy: true },
+      }),
+    ).toEqual({ claim: "HELD", releasedUnprovenAt: null, releasedUnprovenBy: null });
   });
 });

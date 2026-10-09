@@ -199,6 +199,8 @@ const GRAPH_WRITERS: Record<string, string> = {
     "H status: node held definitions and held hashes for the current connection generation (no fenced column)",
   "apps/server/src/model-api/provider-attempt-runtime.ts":
     "H status: provider health and fencing (account -> model)",
+  "packages/api/src/lib/claim-release.ts":
+    "M: a claim's release (proven stop or a person's release without proof) and its release requests, inside the caller's graphWrite (owner fence, then the instance's capacity fence); the request sweep writes only claim_release_request, which no fence covers",
   "packages/api/src/lib/runtime-store.ts":
     "M: runtime versions, written inside lane C's graphWrite (owner fence, then capacity fences of the runtime's instances)",
   "packages/api/src/lib/share-invite-accept.ts":
