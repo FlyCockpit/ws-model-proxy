@@ -784,7 +784,8 @@ describe("shares", () => {
     expect(heldFences()).toEqual(["00:owner:friend", "00:owner:owner"]);
   });
 
-  it("refuses a share whose callable ID is one of the person's names, saying neither which nor whose", async () => {
+  it("shares for use whatever aliases the person has, without looking at them", async () => {
+    // Their alias of the same name keeps winning for them (resolve.ts); the owner learns nothing.
     db.pool.findFirst.mockResolvedValue(pool as never);
     db.user.findFirst.mockResolvedValue({
       id: "friend",
@@ -792,18 +793,12 @@ describe("shares", () => {
       provedEmail: "friend@example.test",
     } as never);
     db.modelAlias.findMany.mockResolvedValue([{ userId: "friend", name: "owner/chat" }] as never);
-    const refused = await client()
-      .shares.create(input)
-      .catch((error: unknown) => error);
-    expect(refused).toMatchObject({ code: "CONFLICT", data: { reason: "name_unavailable" } });
-    expect((refused as Error).message).not.toContain("owner/chat");
-    // Checked in the person's namespace under both owners' fences, before any write.
-    expect(heldFences()).toEqual(["00:owner:friend", "00:owner:owner"]);
-    expect(db.modelAlias.findMany.mock.calls[0]?.[0]?.where).toEqual({
-      OR: [{ userId: "friend", name: { in: ["owner/chat"] } }],
-    });
-    expect(db.share.create).not.toHaveBeenCalled();
-    expect(db.shareInvite.updateMany).not.toHaveBeenCalled();
+    db.share.create.mockResolvedValue({ id: "share1" } as never);
+    db.share.findUnique.mockResolvedValue(shareRow as never);
+    await client().shares.create(input);
+    expect(db.share.create).toHaveBeenCalledTimes(1);
+    expect(db.modelAlias.findMany).not.toHaveBeenCalled();
+    expect(db.modelAlias.findFirst).not.toHaveBeenCalled();
   });
 
   it("a share without can use names nothing in the person's namespace", async () => {
@@ -1403,8 +1398,8 @@ describe("shares", () => {
     expect(heldFences()).toEqual(["00:owner:friend", "00:owner:owner"]);
   });
 
-  it("turning can use on claims the pool's callable ID for the person", async () => {
-    const stored = {
+  it("turning can use on never looks at the person's aliases", async () => {
+    db.share.findFirst.mockResolvedValue({
       id: "share1",
       poolId: "pool1",
       granteeUserId: "friend",
@@ -1412,27 +1407,13 @@ describe("shares", () => {
       canContribute: true,
       priorityClass: null,
       SpendCap: null,
-    };
-    db.share.findFirst.mockResolvedValue(stored as never);
-    db.pool.findFirst.mockResolvedValue({ slug: "chat", User: { slug: "owner" } } as never);
+    } as never);
     db.modelAlias.findMany.mockResolvedValue([{ userId: "friend", name: "owner/chat" }] as never);
-    await expect(client().shares.update({ shareId: "share1", canUse: true })).rejects.toMatchObject(
-      { data: { reason: "name_unavailable" } },
-    );
-    expect(db.share.update).not.toHaveBeenCalled();
-    expect(db.modelAlias.findMany.mock.calls[0]?.[0]?.where).toEqual({
-      OR: [{ userId: "friend", name: { in: ["owner/chat"] } }],
-    });
-
-    // Free: written. A share that already has can use claims nothing new.
-    db.modelAlias.findMany.mockResolvedValue([]);
     db.share.findUnique.mockResolvedValue(shareRow as never);
     await client().shares.update({ shareId: "share1", canUse: true });
     expect(db.share.update).toHaveBeenCalledTimes(1);
-    db.modelAlias.findMany.mockClear();
-    db.share.findFirst.mockResolvedValue({ ...stored, canUse: true } as never);
-    await client().shares.update({ shareId: "share1", canUse: true });
     expect(db.modelAlias.findMany).not.toHaveBeenCalled();
+    expect(db.modelAlias.findFirst).not.toHaveBeenCalled();
   });
 
   it("takes the pool's capacity-policy fences when a permission changes", async () => {

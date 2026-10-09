@@ -2,6 +2,7 @@ import { ORPCError } from "@orpc/server";
 import { POOL_ADVANCED_COLUMNS } from "@ws-model-proxy/config/pool-defaults";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { FenceSetChangedError } from "@ws-model-proxy/db/capacity-lock-order";
+import { poolOwnerActive } from "@ws-model-proxy/db/user-deletion-access";
 import type { z } from "zod";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import type { poolAdvancedPatchSchema } from "../contracts/advanced";
@@ -11,7 +12,7 @@ import { type CallerActor, callerActor } from "../lib/caller-actor";
 import { cloudEgressEnabled } from "../lib/cloud-egress";
 import { graphDelete, graphWrite, modelTargetFences, poolTargetFences } from "../lib/graph-write";
 import { readLiveLoad } from "../lib/live-load";
-import { canUseHolders, modelNameClashes, refuseCallableIdClash } from "../lib/model-names";
+import { modelNameClashes, refuseCallableIdClash, sessionNames } from "../lib/model-names";
 import { memberRecentTraffic, poolTraffic } from "../lib/overview-summary";
 import { invalidatePoolRouting } from "../lib/pool-routing-invalidation";
 import {
@@ -519,34 +520,19 @@ async function setOwnKeyEquivalent(context: SignedInContext, poolId: string, mod
 }
 
 /**
- * Claims the callable ID `owner/slug` (lib/model-names.ts) for the pool's owner and every
- * can-use share holder: callable IDs always win over aliases, so a slug that made it equal to
- * one of their aliases would silently take that alias's traffic. The transaction holds the owner
- * fences of `fenced`; a holder outside it (a share created since the plan) retries the attempt.
+ * Claims the callable ID `owner/slug` (lib/model-names.ts) in the owner's own namespace: a slug
+ * that made it equal to one of the owner's aliases is refused (name_aliased). Share holders'
+ * aliases are never looked at: one with this name keeps winning for its holder (resolve.ts), and
+ * the owner learns nothing about it. The transaction holds the owner's fence.
  */
-async function claimPoolCallableId(
-  tx: Tx,
-  pool: { ownerUserId: string; poolId: string | null },
-  slug: string,
-  fenced: ReadonlySet<string>,
-) {
-  const owner = await tx.user.findUnique({
-    where: { id: pool.ownerUserId },
-    select: { slug: true },
-  });
+async function claimPoolCallableId(tx: Tx, ownerUserId: string, slug: string) {
+  const owner = await tx.user.findUnique({ where: { id: ownerUserId }, select: { slug: true } });
   // No owner row: the pool write that follows fails on its reference, so nothing is named.
   if (!owner) return;
-  const holders = pool.poolId
-    ? (await canUseHolders(tx, [pool.poolId])).map((share) => share.granteeUserId)
-    : [];
-  if (holders.some((userId) => !fenced.has(userId))) throw new FenceSetChangedError();
-  const callableIds = [callableIdOf(owner.slug, slug)];
   refuseCallableIdClash(
-    await modelNameClashes(
-      tx,
-      [pool.ownerUserId, ...holders].map((userId) => ({ userId, callableIds })),
-    ),
-    pool.ownerUserId,
+    await modelNameClashes(tx, [
+      { userId: ownerUserId, callableIds: [callableIdOf(owner.slug, slug)] },
+    ]),
   );
 }
 
@@ -560,7 +546,8 @@ export const poolsRouter = {
   aliases: modelAliasesRouter,
   list: contractProcedure(c.list).handler(async ({ context }) => {
     const userId = userIdOf(context);
-    const [pools, shares] = await Promise.all([
+    const now = new Date();
+    const [pools, shares, names] = await Promise.all([
       prisma.pool.findMany({
         where: { userId },
         include: POOL_INCLUDE,
@@ -577,13 +564,16 @@ export const poolsRouter = {
             select: {
               slug: true,
               modelType: true,
-              User: { select: { slug: true } },
+              User: {
+                select: { slug: true, banned: true, banExpires: true, deletionRequestedAt: true },
+              },
               Fallback: { select: { mode: true } },
             },
           },
         },
         orderBy: { createdAt: "asc" },
       }),
+      sessionNames(prisma, userId),
     ]);
     const [traffic, live] = await Promise.all([
       trafficOf(
@@ -611,6 +601,11 @@ export const poolsRouter = {
         modelType: share.Pool.modelType,
         canUse: share.canUse,
         canContribute: share.canContribute,
+        // Only while the pool is callable (routing skips an inactive owner's pools).
+        hiddenByAlias:
+          share.canUse &&
+          poolOwnerActive(share.Pool.User, now) &&
+          names.hides(callableIdOf(share.Pool.User.slug, share.Pool.slug), share.poolId),
       })),
     };
   }),
@@ -661,12 +656,7 @@ export const poolsRouter = {
       poolId = await graphWrite(
         [userId],
         async (tx) => {
-          await claimPoolCallableId(
-            tx,
-            { ownerUserId: userId, poolId: null },
-            input.slug,
-            new Set([userId]),
-          );
+          await claimPoolCallableId(tx, userId, input.slug);
           const pool = await tx.pool.create({
             data: {
               userId,
@@ -717,20 +707,14 @@ export const poolsRouter = {
           select: { RuntimeModel: { select: { userId: true } } },
         })
       : [];
-    const owners = new Set([
+    const owners = [
       userId,
       ...removed.flatMap((member) => (member.RuntimeModel ? [member.RuntimeModel.userId] : [])),
-    ]);
+    ];
     try {
       await graphWrite(
-        // A slug may rename a name in every can-use holder's namespace: their fences too.
-        // Whether it changes is decided under the fences (a rename may have landed since).
-        async (tx) => {
-          if (input.slug === undefined) return owners;
-          const holders = await canUseHolders(tx, [pool.id]);
-          for (const share of holders) owners.add(share.granteeUserId);
-          return owners;
-        },
+        owners,
+        // Whether the slug changes is decided under the fences (a rename may have landed since).
         async (tx) => {
           const current =
             input.slug === undefined
@@ -741,13 +725,7 @@ export const poolsRouter = {
                 });
           if (input.slug !== undefined && !current) throw notFound("That pool does not exist.");
           const newSlug = current && current.slug !== input.slug ? input.slug : undefined;
-          if (newSlug)
-            await claimPoolCallableId(
-              tx,
-              { ownerUserId: userId, poolId: pool.id },
-              newSlug,
-              owners,
-            );
+          if (newSlug) await claimPoolCallableId(tx, userId, newSlug);
           const fields = {
             ...(input.name !== undefined ? { name: input.name } : {}),
             ...(newSlug !== undefined ? { slug: newSlug } : {}),

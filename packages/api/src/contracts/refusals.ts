@@ -82,7 +82,7 @@ export const REFUSAL_REASONS = [
   /** An agent deletes only an offline node (people delete any in the browser). */
   "node_online",
   // Request compatibility.
-  /** An alias named like one of the caller's callable IDs (those always win). */
+  /** A new alias named like a callable ID the caller can call now. */
   "alias_shadowed",
   /** At most MODEL_ALIASES_MAX_PER_USER aliases per user. */
   "alias_limit",
@@ -109,13 +109,8 @@ export const REFUSAL_REASONS = [
   /** invites.revoke lost to an acceptance: it is a share now. */
   "invite_accepted",
   // Model-name collisions (packages/api/src/lib/model-names.ts).
-  /** A new callable ID (pool slug, account slug, a share) equals one of the caller's aliases. */
+  /** A new callable ID of the caller's own pools (pool or account slug) equals their alias. */
   "name_aliased",
-  /**
-   * A new callable ID equals a model name of someone the pool is or would be shared with. Says
-   * neither who nor which of their names.
-   */
-  "name_unavailable",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

@@ -184,37 +184,40 @@ export type ModelNameResolution =
  * `user-slug/pool-slug[:external]`; a suffix is recognised only when the part
  * before it exactly matches a visible pool (pool-shaped by construction). TEST
  * targets (`runtime:<runtimeId>:<upstreamModelId>`) match exactly and take no suffix.
+ *
+ * An alias of the caller wins over a callable ID of the same name, in every form (also
+ * `name:external`): `shadowed` lists the callable IDs any alias of the person hides, so such a
+ * name never reaches the pool, also through a key that cannot use the alias.
  */
 export function resolveRequestedModelName(
   targets: {
     tests: readonly TestTarget[];
     pools: readonly CallablePool[];
     aliases?: readonly { name: string; poolId: string }[];
+    shadowed?: ReadonlySet<string>;
   },
   model: string,
 ): ModelNameResolution {
   const test = targets.tests.find((target) => target.modelId === model);
   if (test) return { kind: "test", target: test };
-  const pool = targets.pools.find((target) => target.modelId === model);
-  if (pool) return { kind: "pool", target: pool, externalRequested: false };
-  // A caller's alias (only ever one of their callable pools; callable IDs win over it).
-  const aliased = (name: string) => {
-    // A callable ID always wins, in every form (also `name:external`).
-    if (targets.pools.some((target) => target.modelId === name)) return undefined;
+  // The caller's alias (only ever one of their callable pools), else an unshadowed callable ID.
+  const named = (name: string) => {
     const alias = targets.aliases?.find((entry) => entry.name === name);
-    return alias ? targets.pools.find((target) => target.id === alias.poolId) : undefined;
+    if (alias) return targets.pools.find((target) => target.id === alias.poolId);
+    if (targets.shadowed?.has(name)) return undefined;
+    return targets.pools.find((target) => target.modelId === name);
   };
-  const aliasPool = aliased(model);
-  if (aliasPool) return { kind: "pool", target: aliasPool, externalRequested: false };
+  const pool = named(model);
+  if (pool) return { kind: "pool", target: pool, externalRequested: false };
   // An alias may itself hold a colon (`qwen3:8b`): its `:external` form is the whole suffix.
   const externalSuffix = `:${EXTERNAL_MODEL_VARIANT}`;
-  const externalAlias = model.endsWith(externalSuffix)
-    ? aliased(model.slice(0, -externalSuffix.length))
+  const external = model.endsWith(externalSuffix)
+    ? named(model.slice(0, -externalSuffix.length))
     : undefined;
-  if (externalAlias) return { kind: "pool", target: externalAlias, externalRequested: true };
+  if (external) return { kind: "pool", target: external, externalRequested: true };
   const { base, variant } = splitModelVariant(model);
   if (variant === null) return { kind: "not_found" };
-  const basePool = targets.pools.find((target) => target.modelId === base) ?? aliased(base);
+  const basePool = named(base);
   if (basePool) {
     if (variant === EXTERNAL_MODEL_VARIANT)
       return { kind: "pool", target: basePool, externalRequested: true };

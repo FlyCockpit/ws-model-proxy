@@ -104,7 +104,7 @@ export const modelsContract = {
         models: z.array(callableModelSchema),
       })
       .strict(),
-    "Every callable ID you may use (own pools and pools shared with you with can use).",
+    "Every callable ID you may use (own pools and pools shared with you with can use), except one an alias of yours hides.",
   ),
   testTargets: query(
     "session",

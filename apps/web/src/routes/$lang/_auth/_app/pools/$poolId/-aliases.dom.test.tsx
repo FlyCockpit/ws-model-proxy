@@ -38,6 +38,7 @@ const alias = (overrides: Record<string, unknown>) => ({
   apiKeyId: null,
   apiKeyName: null,
   usable: true,
+  hides: null,
   ...overrides,
 });
 
@@ -61,6 +62,17 @@ vi.mock("@/utils/orpc", () => ({
                   callableId: null,
                 }),
                 alias({ id: "a-3", name: "elsewhere", poolId: "pool-2" }),
+                alias({
+                  id: "a-4",
+                  name: "ann/chat",
+                  hides: { callableId: "ann/chat", shared: true },
+                }),
+                alias({
+                  id: "a-5",
+                  name: "cy/gone",
+                  usable: false,
+                  hides: { callableId: "cy/gone", shared: true },
+                }),
               ],
             }),
           }),
@@ -149,10 +161,22 @@ describe("pool aliases tab", () => {
     expect(screen.getByText("claude-sonnet-4-5")).toBeTruthy();
     expect(screen.queryByText("elsewhere")).toBeNull();
     expect(screen.getByText(`${K}.onlyKey:laptop`)).toBeTruthy();
-    expect(screen.getAllByText(`${K}.unusable`)).toHaveLength(1);
+    expect(screen.getAllByText(`${K}.unusable`)).toHaveLength(2);
     // Only keys that may call this pool are offered.
     const keySelect = screen.getByLabelText(`${K}.key`) as HTMLSelectElement;
     expect([...keySelect.options].map((option) => option.value)).toEqual(["", "k-1"]);
+  });
+
+  it("marks an alias that hides a pool as hiding it, not as unusable", async () => {
+    await mount();
+    expect(screen.getByText("ann/chat")).toBeTruthy();
+    expect(screen.getByText(`${K}.hides:ann/chat`)).toBeTruthy();
+    expect(screen.getByText(`${K}.hidesHint:ann/chat`)).toBeTruthy();
+    // Hiding a pool is not being unusable: only claude-sonnet-4-5 and cy/gone are.
+    expect(screen.getAllByText(`${K}.unusable`)).toHaveLength(2);
+    // An unusable alias that hides a pool says requests find nothing.
+    expect(screen.getByText(`${K}.hides:cy/gone`)).toBeTruthy();
+    expect(screen.getByText(`${K}.hidesUnusableHint:cy/gone`)).toBeTruthy();
   });
 
   it("validates the name, then points it at this pool", async () => {

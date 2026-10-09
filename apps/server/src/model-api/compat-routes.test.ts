@@ -248,7 +248,12 @@ beforeEach(() => {
     expiresAt: null,
     lastUsedAt: null,
   });
-  resolve.listCallableTargetsForApiKey.mockResolvedValue({ pools: [POOL], tests: [] });
+  resolve.listCallableTargetsForApiKey.mockResolvedValue({
+    pools: [POOL],
+    tests: [],
+    aliases: [],
+    shadowed: new Set(),
+  });
   resolve.poolRoutes.mockResolvedValue([route()]);
 });
 
@@ -447,6 +452,7 @@ describe("model-name aliases", () => {
       pools: [POOL],
       tests: [],
       aliases: [{ name: "gpt-4o", poolId: "pool-1" }],
+      shadowed: new Set(),
     });
     relay.answers.push({ status: 200, body: OK });
     const response = await chat({ model: "gpt-4o" });
@@ -459,6 +465,45 @@ describe("model-name aliases", () => {
       (entry) => entry.id,
     );
     expect(ids).toEqual(["owner/chat", "gpt-4o"]);
+  });
+
+  it("an alias named like a shared pool's ID wins: routed to the alias's pool, listed once", async () => {
+    const shared = { ...POOL, id: "pool-2", modelId: "ann/chat", ownerUserSlug: "ann" };
+    resolve.listCallableTargetsForApiKey.mockResolvedValue({
+      pools: [POOL, shared],
+      tests: [],
+      aliases: [{ name: "ann/chat", poolId: "pool-1" }],
+      shadowed: new Set(["ann/chat"]),
+    });
+    relay.answers.push({ status: 200, body: OK });
+    const response = await chat({ model: "ann/chat" });
+    expect(response.status).toBe(200);
+    expect(resolve.poolRoutes.mock.calls.map((call) => (call as unknown[])[0])).toEqual(["pool-1"]);
+    const models = await app().request("/models", {
+      headers: { authorization: "Bearer wsmp_key_test" },
+    });
+    const data = ((await models.json()) as { data: Array<{ id: string; owned_by: string }> }).data;
+    // The hidden pool is not listed; its ID is listed as the alias (owned like pool-1).
+    expect(data.map((entry) => [entry.id, entry.owned_by])).toEqual([
+      ["owner/chat", "owner"],
+      ["ann/chat", "owner"],
+    ]);
+  });
+
+  it("lists an alias named like the pool it points at once", async () => {
+    resolve.listCallableTargetsForApiKey.mockResolvedValue({
+      pools: [POOL],
+      tests: [],
+      aliases: [{ name: "owner/chat", poolId: "pool-1" }],
+      shadowed: new Set(),
+    });
+    const models = await app().request("/models", {
+      headers: { authorization: "Bearer wsmp_key_test" },
+    });
+    const ids = ((await models.json()) as { data: Array<{ id: string }> }).data.map(
+      (entry) => entry.id,
+    );
+    expect(ids).toEqual(["owner/chat"]);
   });
 });
 

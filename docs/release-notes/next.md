@@ -308,17 +308,22 @@ with the clients you already use, including harnesses you cannot change:
   `anthropic-beta`, `OpenAI-Beta`, ...) and response shaping (reasoning field,
   strict-SDK cleanup). Agents can edit them; every edit is a version.
 - **Model-name aliases**: map `gpt-4o` or `claude-sonnet-4-5` to one of your
-  pools, for all keys or one key. `/v1/models` lists them. An alias can never
-  share a name with one of your callable IDs: setting the alias, creating or
-  renaming a pool, sharing a pool with you (or turning on can use), accepting an
-  invite, and changing an account slug are each refused when they would make
-  one equal, also when two of them happen at once. An owner whose share or
-  rename clashes with someone else's alias is told only that the name is not
-  available to a person the pool is shared with. A clash already in a database
-  from an earlier preview keeps routing to the pool (callable IDs win), and the
-  alias shows as not usable until it is removed. The account slug now changes
-  only through the settings API (`settings.update`), not through Better Auth's
-  update routes.
+  pools, for all keys or one key. `/v1/models` lists them. Your own actions
+  never create a clash in your own names: setting an alias named like a pool
+  ID you can call, and creating or renaming one of your pools (or changing your
+  account slug) onto one of your own aliases, are refused, also when two happen
+  at once. Nobody else's alias ever refuses anything: sharing a pool, turning on
+  can use, accepting an invite and renaming never look at a recipient's
+  aliases, so an owner learns nothing about them. When a pool shared with you
+  gets an ID one of your aliases already has, **your alias wins, for you only,
+  until you rename or delete it**: requests for that name (also `:external`) go
+  to the alias's pool, never the shared one (through a key that cannot use the
+  alias, to nothing); `/v1/models`, the models list, the
+  Test page and agent model tests list or use that name as the alias's pool;
+  and the Overview warns which alias hides which pool,
+  linking to its Aliases tab (where the alias is marked "hides pool ..."). The
+  account slug now changes only through the settings API
+  (`settings.update`), not through Better Auth's update routes.
 - **Auth styles**: the model API accepts `Authorization: Bearer`, `x-api-key`
   and `api-key`.
 - Requests show what was dropped or rewritten, and usage an engine did not

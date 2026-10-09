@@ -1,5 +1,5 @@
 import { useForm } from "@tanstack/react-form";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, redirect, useNavigate } from "@tanstack/react-router";
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import { INVITE_IN_USE_CODE, SHARE_INVITE_HEADER } from "@ws-model-proxy/config/share-invite";
@@ -291,8 +291,11 @@ function AcceptInviteCard({
   target: { kind: "pool" | "runtime"; name: string } | null;
 }) {
   const { t } = useTranslation(["auth"]);
+  const queryClient = useQueryClient();
   const acceptInvite = useMutation({
     ...orpc.auth.acceptInvite.mutationOptions(),
+    // A new share changes pools, models and which aliases hide a pool (the Overview warning).
+    onSuccess: () => queryClient.invalidateQueries(),
     onError: (error) => {
       toast.error(friendly(error, t("auth:invite.acceptFailed")));
     },
@@ -342,11 +345,9 @@ function AcceptInviteCard({
           {refusal ??
             (result === "in_use"
               ? t("auth:invite.inUse")
-              : result === "name_taken"
-                ? t("auth:invite.nameTaken", { callableId: name })
-                : runtime
-                  ? t("auth:invite.runtimeSignedInDescription", { ownerName, name })
-                  : t("auth:invite.signedInDescription", { ownerName, callableId: name }))}
+              : runtime
+                ? t("auth:invite.runtimeSignedInDescription", { ownerName, name })
+                : t("auth:invite.signedInDescription", { ownerName, callableId: name }))}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">

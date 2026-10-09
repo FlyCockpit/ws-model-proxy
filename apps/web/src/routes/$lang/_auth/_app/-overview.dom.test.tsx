@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({
   summary: null as Record<string, unknown> | null,
   needsYou: { items: [] as Array<Record<string, unknown>>, queuedCommands: 0 },
+  aliases: [] as Array<Record<string, unknown>>,
   ranges: [] as string[],
   dismissed: 0,
   navigations: [] as Array<Record<string, unknown>>,
@@ -55,7 +56,11 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
     t: (key: string, opts?: Record<string, unknown>) =>
-      opts && "count" in opts ? `${key}:${String(opts.count)}` : key,
+      opts && "name" in opts
+        ? `${key}:${String(opts.name)}|${String(opts.callableId)}`
+        : opts && "count" in opts
+          ? `${key}:${String(opts.count)}`
+          : key,
     i18n: { language: "en-US" },
   }),
 }));
@@ -81,6 +86,16 @@ vi.mock("@/utils/orpc", () => ({
           queryOptions: () => ({
             queryKey: ["activity", "needsYou"],
             queryFn: async () => state.needsYou,
+          }),
+        },
+      },
+    },
+    pools: {
+      aliases: {
+        list: {
+          queryOptions: () => ({
+            queryKey: ["pools", "aliases", "list"],
+            queryFn: async () => ({ aliases: state.aliases }),
           }),
         },
       },
@@ -155,6 +170,7 @@ afterEach(() => {
   cleanup();
   state.summary = null;
   state.needsYou = { items: [], queuedCommands: 0 };
+  state.aliases = [];
   state.ranges = [];
   state.dismissed = 0;
   state.navigations = [];
@@ -319,5 +335,57 @@ describe("Overview", () => {
     state.summary = summary();
     await mount();
     await waitFor(() => expect(screen.queryByText("dashboard:overview.needsYou.title")).toBeNull());
+  });
+
+  it("warns about each alias that hides a pool, linking to its Aliases tab", async () => {
+    state.summary = summary();
+    const alias = (overrides: Record<string, unknown>) => ({
+      id: "a1",
+      name: "gpt-4o",
+      poolId: "p-own",
+      callableId: "me/own",
+      apiKeyId: null,
+      apiKeyName: null,
+      usable: true,
+      hides: null,
+      ...overrides,
+    });
+    state.aliases = [
+      alias({}),
+      alias({ id: "a2", name: "ann/chat", hides: { callableId: "ann/chat", shared: true } }),
+      alias({
+        id: "a3",
+        name: "me/old",
+        poolId: "p-2",
+        hides: { callableId: "me/old", shared: false },
+      }),
+    ];
+    await mount();
+    const K = "dashboard:overview.aliasShadows";
+    expect(await screen.findByText(`${K}.title:2`)).toBeTruthy();
+    const shared = screen.getByText(`${K}.row:ann/chat|ann/chat`);
+    expect(shared.closest("a")?.getAttribute("href")).toBe("/en-US/pools/p-own/aliases");
+    const own = screen.getByText(`${K}.rowOwn:me/old|me/old`);
+    expect(own.closest("a")?.getAttribute("href")).toBe("/en-US/pools/p-2/aliases");
+    // An alias that hides nothing is not mentioned.
+    expect(screen.queryByText(/gpt-4o/)).toBeNull();
+  });
+
+  it("shows no alias warning when no alias hides a pool", async () => {
+    state.summary = summary();
+    state.aliases = [
+      {
+        id: "a1",
+        name: "gpt-4o",
+        poolId: "p1",
+        callableId: "alex/chat",
+        apiKeyId: null,
+        apiKeyName: null,
+        usable: true,
+        hides: null,
+      },
+    ];
+    await mount();
+    expect(screen.queryByText(/dashboard:overview\.aliasShadows/)).toBeNull();
   });
 });

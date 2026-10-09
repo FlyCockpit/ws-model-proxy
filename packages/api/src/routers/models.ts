@@ -7,7 +7,9 @@ import { contractProcedure } from "../contract-procedure";
 import { type AnonymousAuth, agentRulesApply, type CallerAuth } from "../contracts/auth-context";
 import type { MODEL_CAPABILITY, MODEL_TYPE } from "../contracts/common";
 import { modelsContract as c, type TEST_SURFACES } from "../contracts/models";
+import { callableIdOf } from "../lib/access-views";
 import { cloudEgressEnabled } from "../lib/cloud-egress";
+import { type SessionNames, sessionNames } from "../lib/model-names";
 import { callableIdsFor, MEMBER_INCLUDE, poolStatus } from "../lib/pool-views";
 import { notFound, refuse } from "../lib/refuse";
 import { transcriptionProfileSchema } from "../lib/transcription-profile";
@@ -57,6 +59,28 @@ function ownFirst<T extends { userId: string }>(pools: T[], userId: string): T[]
   ];
 }
 
+/**
+ * Per-pool entries in `pools` order, where a callable ID an alias of the person hides becomes that
+ * name's entry for the pool the alias reaches (the alias wins, as on the request path), or
+ * nothing when no alias of theirs for every key reaches a pool they may use. `entries(pool)[0]`
+ * is the plain callable ID's entry.
+ */
+function withAliasesWinning<P extends { id: string; slug: string; User: { slug: string } }, E>(
+  pools: readonly P[],
+  names: SessionNames,
+  entries: (pool: P) => E[],
+  rename: (entry: E, name: string) => E,
+): E[] {
+  const byId = new Map(pools.map((pool) => [pool.id, pool]));
+  return pools.flatMap((pool) => {
+    const name = callableIdOf(pool.User.slug, pool.slug);
+    if (!names.hides(name, pool.id)) return entries(pool);
+    const target = byId.get(names.aliasPool(name) ?? "");
+    const plain = target ? entries(target)[0] : undefined;
+    return plain ? [rename(plain, name)] : [];
+  });
+}
+
 export const modelsRouter = {
   /**
    * Every callable ID the person may use: own pools and pools shared with them with can use.
@@ -65,40 +89,46 @@ export const modelsRouter = {
   list: contractProcedure(c.list).handler(async ({ context }) => {
     const userId = context.session.user.id;
     const cloudEnabled = cloudEgressEnabled();
-    const ordered = ownFirst(
-      await prisma.pool.findMany({
+    const [pools, names] = await Promise.all([
+      prisma.pool.findMany({
         where: usablePoolsWhere(userId),
         select: POOL_SELECT,
         orderBy: [{ createdAt: "asc" }],
       }),
-      userId,
-    );
+      sessionNames(prisma, userId),
+    ]);
     return {
       baseUrl: `${env.BETTER_AUTH_URL.replace(/\/+$/, "")}/v1`,
-      models: ordered.flatMap((pool) => {
-        const you = pool.userId === userId;
-        const local = poolStatus(pool.Members, pool.Routing?.ownHardwareOnly ?? false);
-        const hasCloud = pool.Members.some(
-          (member) => member.kind === "CLOUD" && member.state === "ACTIVE",
-        );
-        return callableIdsFor({
-          ownerSlug: pool.User.slug,
-          poolSlug: pool.slug,
-          mode: pool.Fallback?.mode ?? "OFF",
-          callerIsOwner: you,
-          cloudEnabled,
-        }).map((callableId) => {
-          const external = callableId.endsWith(":external");
-          return {
-            callableId,
-            poolId: pool.id,
-            external,
-            type: pool.modelType,
-            owner: { slug: pool.User.slug, you, email: you ? null : pool.User.email },
-            status: external && hasCloud && local === "unavailable" ? ("serving" as const) : local,
-          };
-        });
-      }),
+      models: withAliasesWinning(
+        ownFirst(pools, userId),
+        names,
+        (pool) => {
+          const you = pool.userId === userId;
+          const local = poolStatus(pool.Members, pool.Routing?.ownHardwareOnly ?? false);
+          const hasCloud = pool.Members.some(
+            (member) => member.kind === "CLOUD" && member.state === "ACTIVE",
+          );
+          return callableIdsFor({
+            ownerSlug: pool.User.slug,
+            poolSlug: pool.slug,
+            mode: pool.Fallback?.mode ?? "OFF",
+            callerIsOwner: you,
+            cloudEnabled,
+          }).map((callableId) => {
+            const external = callableId.endsWith(":external");
+            return {
+              callableId,
+              poolId: pool.id,
+              external,
+              type: pool.modelType,
+              owner: { slug: pool.User.slug, you, email: you ? null : pool.User.email },
+              status:
+                external && hasCloud && local === "unavailable" ? ("serving" as const) : local,
+            };
+          });
+        },
+        (entry, name) => ({ ...entry, callableId: name }),
+      ),
     };
   }),
   /**
@@ -109,7 +139,7 @@ export const modelsRouter = {
   testTargets: contractProcedure(c.testTargets).handler(async ({ context }) => {
     const userId = context.session.user.id;
     const cloudEnabled = cloudEgressEnabled();
-    const [pools, runtimes] = await Promise.all([
+    const [pools, runtimes, names] = await Promise.all([
       prisma.pool
         .findMany({
           where: usablePoolsWhere(userId),
@@ -141,59 +171,68 @@ export const modelsRouter = {
         },
         orderBy: [{ createdAt: "asc" }],
       }),
+      sessionNames(prisma, userId),
     ]);
-    const poolTargets = pools.flatMap((pool) => {
-      const you = pool.userId === userId;
-      const local = poolStatus(pool.Members, pool.Routing?.ownHardwareOnly ?? false);
-      const hasCloud = pool.Members.some(
-        (member) => member.kind === "CLOUD" && member.state === "ACTIVE",
-      );
-      const localModels = pool.Members.flatMap((member) =>
-        member.kind === "LOCAL" &&
-        member.state === "ACTIVE" &&
-        member.RuntimeModel &&
-        !member.RuntimeModel.retired &&
-        !(pool.Routing?.ownHardwareOnly && member.shareId)
-          ? [member.RuntimeModel]
-          : [],
-      );
-      const capabilities = unionCapabilities(localModels.map(effectiveCapabilities));
-      const overrides = advancedOverrides(pool.Advanced?.overrides);
-      const adaptation =
-        typeof overrides.protocolAdaptation === "boolean"
-          ? overrides.protocolAdaptation
-          : POOL_ADVANCED_OVERRIDES.protocolAdaptation.auto.default;
-      const surfaces = testSurfaces(pool.modelType, capabilities, adaptation);
-      const live =
-        pool.modelType === "TRANSCRIPTION" &&
-        localModels.some((model) => declaresLiveTranscription(model.transcriptionProfile));
-      return callableIdsFor({
-        ownerSlug: pool.User.slug,
-        poolSlug: pool.slug,
-        mode: pool.Fallback?.mode ?? "OFF",
-        callerIsOwner: you,
-        cloudEnabled,
-      }).map((callableId) => {
-        const external = callableId.endsWith(":external");
-        return {
-          model: callableId,
-          source: "pool" as const,
-          label: callableId,
-          servedModel: null,
-          runtimeId: null,
-          type: pool.modelType,
-          status: external && hasCloud && local === "unavailable" ? ("serving" as const) : local,
-          external,
-          capabilities,
-          surfaces,
-          recommendedSurface: recommendedSurface(surfaces, overrides.recommendedSurface),
-          // Live sessions run on local members only.
-          liveTranscription: live && !external,
-          maxAttachmentBytes:
-            typeof overrides.maxAttachmentBytes === "number" ? overrides.maxAttachmentBytes : null,
-        };
-      });
-    });
+    // The Test page sends the name: one an alias of the person hides reaches the alias's pool.
+    const poolTargets = withAliasesWinning(
+      pools,
+      names,
+      (pool) => {
+        const you = pool.userId === userId;
+        const local = poolStatus(pool.Members, pool.Routing?.ownHardwareOnly ?? false);
+        const hasCloud = pool.Members.some(
+          (member) => member.kind === "CLOUD" && member.state === "ACTIVE",
+        );
+        const localModels = pool.Members.flatMap((member) =>
+          member.kind === "LOCAL" &&
+          member.state === "ACTIVE" &&
+          member.RuntimeModel &&
+          !member.RuntimeModel.retired &&
+          !(pool.Routing?.ownHardwareOnly && member.shareId)
+            ? [member.RuntimeModel]
+            : [],
+        );
+        const capabilities = unionCapabilities(localModels.map(effectiveCapabilities));
+        const overrides = advancedOverrides(pool.Advanced?.overrides);
+        const adaptation =
+          typeof overrides.protocolAdaptation === "boolean"
+            ? overrides.protocolAdaptation
+            : POOL_ADVANCED_OVERRIDES.protocolAdaptation.auto.default;
+        const surfaces = testSurfaces(pool.modelType, capabilities, adaptation);
+        const live =
+          pool.modelType === "TRANSCRIPTION" &&
+          localModels.some((model) => declaresLiveTranscription(model.transcriptionProfile));
+        return callableIdsFor({
+          ownerSlug: pool.User.slug,
+          poolSlug: pool.slug,
+          mode: pool.Fallback?.mode ?? "OFF",
+          callerIsOwner: you,
+          cloudEnabled,
+        }).map((callableId) => {
+          const external = callableId.endsWith(":external");
+          return {
+            model: callableId,
+            source: "pool" as const,
+            label: callableId,
+            servedModel: null,
+            runtimeId: null,
+            type: pool.modelType,
+            status: external && hasCloud && local === "unavailable" ? ("serving" as const) : local,
+            external,
+            capabilities,
+            surfaces,
+            recommendedSurface: recommendedSurface(surfaces, overrides.recommendedSurface),
+            // Live sessions run on local members only.
+            liveTranscription: live && !external,
+            maxAttachmentBytes:
+              typeof overrides.maxAttachmentBytes === "number"
+                ? overrides.maxAttachmentBytes
+                : null,
+          };
+        });
+      },
+      (entry, name) => ({ ...entry, model: name, label: name }),
+    );
     const runtimeTargets = runtimes.flatMap((runtime) => {
       const phases = runtime.Instances.map((instance) => instance.phase);
       // As a pool member's status (pool-views memberStatus).
@@ -385,15 +424,19 @@ async function resolvePoolTarget(userId: string, callableId: string): Promise<Re
   const [ownerSlug, poolSlug] = callableId.split("/");
   const missing = notFound(`No pool you can use is called ${callableId}.`);
   if (!ownerSlug || !poolSlug) throw missing;
+  // As the request path resolves the name: the person's alias for every key wins.
+  const names = await sessionNames(prisma, userId);
+  const aliasPool = names.aliasPool(callableId);
   const pool = await prisma.pool.findFirst({
     where: {
-      slug: poolSlug,
-      User: { slug: ownerSlug },
-      OR: [{ userId }, { Shares: { some: { granteeUserId: userId, canUse: true } } }],
+      ...(aliasPool ? { id: aliasPool } : { slug: poolSlug, User: { slug: ownerSlug } }),
+      ...usablePoolsWhere(userId),
     },
     select: { id: true, userId: true, modelType: true },
   });
   if (!pool) throw missing;
+  // Hidden by an alias the request path would not use here (another key's).
+  if (!aliasPool && names.hides(callableId, pool.id)) throw missing;
   return {
     target: { kind: "pool", poolId: pool.id, callableId },
     modelType: pool.modelType,

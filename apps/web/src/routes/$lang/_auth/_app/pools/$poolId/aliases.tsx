@@ -121,6 +121,11 @@ function AliasRow({ alias }: { alias: AliasView }) {
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <code className="min-w-0 break-all font-mono text-sm">{alias.name}</code>
           {alias.usable ? null : <StatusPill tone="busy">{t(`${K}.unusable`)}</StatusPill>}
+          {alias.hides ? (
+            <StatusPill tone="busy">
+              {t(`${K}.hides`, { callableId: alias.hides.callableId })}
+            </StatusPill>
+          ) : null}
         </div>
         <p className="break-all text-xs text-muted-foreground">
           {alias.apiKeyId === null
@@ -132,6 +137,18 @@ function AliasRow({ alias }: { alias: AliasView }) {
         {alias.usable ? null : (
           <p className="text-xs text-muted-foreground">{t(`${K}.unusableHint`)}</p>
         )}
+        {alias.hides ? (
+          <p className="text-xs text-muted-foreground">
+            {t(
+              !alias.usable
+                ? `${K}.hidesUnusableHint`
+                : alias.hides.shared
+                  ? `${K}.hidesHint`
+                  : `${K}.hidesOwnHint`,
+              { callableId: alias.hides.callableId },
+            )}
+          </p>
+        ) : null}
       </div>
       <Button
         type="button"

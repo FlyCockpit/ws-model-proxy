@@ -96,7 +96,26 @@ vi.mock("@/utils/orpc", () => ({
                 ],
               }),
             ],
-            sharedWithMe: [],
+            sharedWithMe: [
+              {
+                poolId: "p-ann",
+                callableIds: ["ann/big"],
+                ownerEmail: "ann@x.test",
+                modelType: "LLM",
+                canUse: true,
+                canContribute: false,
+                hiddenByAlias: true,
+              },
+              {
+                poolId: "p-bo",
+                callableIds: ["bo/embed"],
+                ownerEmail: "bo@x.test",
+                modelType: "EMBEDDINGS",
+                canUse: true,
+                canContribute: false,
+                hiddenByAlias: false,
+              },
+            ],
           }),
         }),
       },
@@ -192,6 +211,16 @@ afterEach(() => {
 });
 
 describe("pools page", () => {
+  it("marks a shared pool one of the person's aliases hides", async () => {
+    await mount();
+    const pill = screen.getByText("dashboard:pool.hiddenByAlias");
+    // On ann's shared pool, not on bo's.
+    expect(pill.closest("li")?.textContent).toContain("ann@x.test");
+    // The hidden ID reaches the alias's pool: it is not offered for copying.
+    expect(screen.queryByText("ann/big")).toBeNull();
+    expect(screen.getByText("bo/embed")).toBeTruthy();
+  });
+
   it("draws each pool's flow: local, contributed, then cloud", async () => {
     await mount();
     const flow = screen.getByRole("list", { name: "dashboard:pool.flow.label" });

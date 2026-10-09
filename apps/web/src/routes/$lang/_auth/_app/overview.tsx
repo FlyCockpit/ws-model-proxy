@@ -11,7 +11,7 @@ import {
 } from "@ws-model-proxy/ui/components/card";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { ArrowRight, Check, Server } from "lucide-react";
+import { ArrowRight, Check, Server, TriangleAlert } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -33,6 +33,7 @@ export const Route = createFileRoute("/$lang/_auth/_app/overview")({
 type Range = "24h" | "7d";
 type Summary = Awaited<ReturnType<AppRouterClient["activity"]["overview"]["summary"]>>;
 type NeedsYou = Awaited<ReturnType<AppRouterClient["activity"]["needsYou"]["list"]>>;
+type Aliases = Awaited<ReturnType<AppRouterClient["pools"]["aliases"]["list"]>>;
 
 /** The Overview refreshes while it is open. */
 const REFRESH_MS = 30_000;
@@ -49,6 +50,11 @@ function OverviewPage() {
   });
   const needsYou = useQuery({
     ...orpc.activity.needsYou.list.queryOptions(),
+    refetchInterval: REFRESH_MS,
+  });
+  // Refreshed like the rest: a share or rename elsewhere can make an alias hide a pool.
+  const aliases = useQuery({
+    ...orpc.pools.aliases.list.queryOptions(),
     refetchInterval: REFRESH_MS,
   });
   // A first sign-in lands here: send it to Welcome once.
@@ -73,6 +79,7 @@ function OverviewPage() {
       ) : null}
       {/* What needs a person shows even when the summary fails. */}
       <NeedsYouCard lang={lang} query={needsYou} />
+      <AliasShadowsCard lang={lang} aliases={aliases.data} />
       {summary.isPending ? (
         <OverviewSkeleton />
       ) : summary.isError ? (
@@ -282,6 +289,58 @@ function NeedsYouRow({ item }: { item: NeedsYou["items"][number] }) {
       </span>
       <ArrowRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
     </>
+  );
+}
+
+// ── Aliases hiding pools ──
+
+/**
+ * The person's aliases named like a pool ID they could call: the alias wins for them, so the
+ * pool is out of reach by its ID until they rename or delete the alias (on the alias's pool's
+ * Aliases tab). Nothing shows while loading or when the list fails: it is a warning, not a gate.
+ */
+function AliasShadowsCard({ lang, aliases }: { lang: string; aliases: Aliases | undefined }) {
+  const { t } = useTranslation(["dashboard"]);
+  const hiding = (aliases?.aliases ?? []).flatMap((alias) =>
+    alias.hides ? [{ ...alias, hides: alias.hides }] : [],
+  );
+  if (hiding.length === 0) return null;
+  return (
+    <Card className="border-amber-500/40">
+      <CardHeader>
+        <CardTitle className="flex min-w-0 items-center gap-2 text-base">
+          <TriangleAlert aria-hidden="true" className="size-4 shrink-0 text-amber-600" />
+          {t("dashboard:overview.aliasShadows.title", { count: hiding.length })}
+        </CardTitle>
+        <CardDescription>{t("dashboard:overview.aliasShadows.description")}</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <ul className="flex min-w-0 flex-col divide-y">
+          {hiding.map((alias) => (
+            <li key={alias.id} className="min-w-0">
+              <Link
+                to="/$lang/pools/$poolId/aliases"
+                params={{ lang, poolId: alias.poolId }}
+                className="flex min-h-[44px] min-w-0 items-center gap-3 py-2 text-sm hover:underline"
+              >
+                <span className="min-w-0 flex-1 break-all">
+                  {t(
+                    alias.hides.shared
+                      ? "dashboard:overview.aliasShadows.row"
+                      : "dashboard:overview.aliasShadows.rowOwn",
+                    { name: alias.name, callableId: alias.hides.callableId },
+                  )}
+                </span>
+                <span className="shrink-0 text-xs font-medium text-primary">
+                  {t("dashboard:overview.aliasShadows.fix")}
+                </span>
+                <ArrowRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+              </Link>
+            </li>
+          ))}
+        </ul>
+      </CardContent>
+    </Card>
   );
 }
 

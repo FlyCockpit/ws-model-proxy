@@ -137,6 +137,7 @@ beforeEach(() => {
   db.$queryRaw.mockResolvedValue([] as never);
   db.executionTarget.findMany.mockResolvedValue([]);
   db.runtimeModel.findMany.mockResolvedValue([]);
+  db.modelAlias.findMany.mockResolvedValue([]);
 });
 
 describe("callable ids", () => {
@@ -378,86 +379,52 @@ describe("pools.update (agent-editable)", () => {
     expect(db.poolRouting.upsert).toHaveBeenCalledTimes(1);
   });
 
-  it("changes the slug unless an alias of the owner or a can-use holder has that callable ID", async () => {
+  it("changes the slug unless the owner's own alias has that callable ID, never looking at holders'", async () => {
     const owned = { id: "pool-1", userId: OWNER, modelType: "LLM", slug: "chat" };
     db.pool.findFirst.mockResolvedValue(owned as never);
     db.user.findUnique.mockResolvedValue({ slug: "ann" } as never);
     db.share.findMany.mockResolvedValue([{ poolId: "pool-1", granteeUserId: "bob" }] as never);
-    // The holder's alias: the owner hears only that the name is unavailable to someone.
-    db.modelAlias.findMany.mockResolvedValue([{ userId: "bob", name: "ann/talk" }] as never);
-    const refused = await client()
-      .update({ poolId: "pool-1", slug: "talk" })
-      .catch((error: unknown) => error);
-    expect(refused).toBeInstanceOf(ORPCError);
-    expect((refused as ORPCError<string, { reason: string }>).data?.reason).toBe(
-      "name_unavailable",
-    );
-    expect((refused as Error).message).not.toContain("bob");
-    // Every can-use holder's namespace is fenced and checked with the owner's.
-    expect(fenceLog.held).toEqual([`00:owner:${OWNER}`, "00:owner:bob"]);
-    expect(db.modelAlias.findMany.mock.calls[0]?.[0]?.where).toEqual({
-      OR: [
-        { userId: OWNER, name: { in: ["ann/talk"] } },
-        { userId: "bob", name: { in: ["ann/talk"] } },
-      ],
-    });
-    expect(db.share.findMany.mock.calls[0]?.[0]?.where).toEqual({
-      poolId: { in: ["pool-1"] },
-      canUse: true,
-    });
-    expect(db.pool.update).not.toHaveBeenCalled();
-
-    // The owner's own alias is named as theirs.
-    db.modelAlias.findMany.mockResolvedValue([{ userId: OWNER, name: "ann/talk" }] as never);
+    // Answers like the database: only the aliases of the people the read asks about.
+    const aliases = [
+      { userId: OWNER, name: "ann/talk" },
+      { userId: "bob", name: "ann/next" },
+    ];
+    db.modelAlias.findMany.mockImplementation((async (args: {
+      where: { OR: Array<{ userId: string; name: { in: string[] } }> };
+    }) =>
+      aliases.filter((alias) =>
+        args.where.OR.some(
+          (claim) => claim.userId === alias.userId && claim.name.in.includes(alias.name),
+        ),
+      )) as never);
+    // The owner's own alias is refused by name.
     expect(await reasonOf(client().update({ poolId: "pool-1", slug: "talk" }))).toBe(
       "name_aliased",
     );
+    expect(db.modelAlias.findMany.mock.calls[0]?.[0]?.where).toEqual({
+      OR: [{ userId: OWNER, name: { in: ["ann/talk"] } }],
+    });
+    // Only the owner's fence: share holders' namespaces are not part of the rename.
+    expect(fenceLog.held).toEqual([`00:owner:${OWNER}`]);
+    expect(db.pool.update).not.toHaveBeenCalled();
 
-    db.modelAlias.findMany.mockResolvedValue([]);
+    // bob's alias `ann/next` keeps winning for bob; the owner is never told.
     db.pool.findFirst.mockReset();
     db.pool.findFirst
       .mockResolvedValueOnce(owned as never)
       .mockResolvedValueOnce(owned as never)
-      .mockResolvedValue(poolRow({ slug: "talk" }) as never);
-    const view = await client().update({ poolId: "pool-1", slug: "talk" });
-    expect(db.pool.update.mock.calls[0]?.[0]?.data).toEqual({ slug: "talk" });
-    expect(view.callableIds).toEqual(["ann/talk"]);
-  });
-
-  it("a share created after the fence plan retries the rename with that holder fenced", async () => {
-    const owned = { id: "pool-1", userId: OWNER, modelType: "LLM", slug: "chat" };
-    db.pool.findFirst
-      .mockResolvedValueOnce(owned as never)
-      .mockResolvedValueOnce(owned as never)
-      .mockResolvedValueOnce(owned as never)
-      .mockResolvedValue(poolRow({ slug: "talk" }) as never);
-    db.user.findUnique.mockResolvedValue({ slug: "ann" } as never);
-    // The plan sees no holder; under the fences bob's new share appears; the retry fences him.
-    db.share.findMany
-      .mockResolvedValueOnce([] as never)
-      .mockResolvedValue([{ poolId: "pool-1", granteeUserId: "bob" }] as never);
-    db.modelAlias.findMany.mockResolvedValue([]);
-    const { runCapacityOrderedTransaction } = await import(
-      "@ws-model-proxy/db/capacity-lock-order"
+      .mockResolvedValue(poolRow({ slug: "next" }) as never);
+    const view = await client().update({ poolId: "pool-1", slug: "next" });
+    expect(db.pool.update.mock.calls[0]?.[0]?.data).toEqual({ slug: "next" });
+    expect(view.callableIds).toEqual(["ann/next"]);
+    expect(db.share.findMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ canUse: true }) }),
     );
-    vi.mocked(runCapacityOrderedTransaction).mockImplementationOnce(async (runner, work) => {
-      // The real runner retries a FenceSetChangedError (no row was written yet).
-      try {
-        return await runner.$transaction(work);
-      } catch (error) {
-        expect((error as Error).name).toBe("FenceSetChangedError");
-        expect(db.pool.update).not.toHaveBeenCalled();
-        return runner.$transaction(work);
-      }
-    });
-    await client().update({ poolId: "pool-1", slug: "talk" });
-    expect(fenceLog.held).toEqual([`00:owner:${OWNER}`, `00:owner:${OWNER}`, "00:owner:bob"]);
-    expect(db.pool.update).toHaveBeenCalledTimes(1);
   });
 
   it("decides whether the slug changes under the fences, not from the first read", async () => {
     // Read as `chat` before the transaction; a rename to `talk` landed before the fences, so
-    // asking for `chat` again is a rename back: fenced for holders and checked.
+    // asking for `chat` again is a rename back: checked against the owner's aliases.
     db.pool.findFirst
       .mockResolvedValueOnce({
         id: "pool-1",
@@ -468,12 +435,11 @@ describe("pools.update (agent-editable)", () => {
       .mockResolvedValueOnce({ slug: "talk" } as never)
       .mockResolvedValue(poolRow() as never);
     db.user.findUnique.mockResolvedValue({ slug: "ann" } as never);
-    db.share.findMany.mockResolvedValue([{ poolId: "pool-1", granteeUserId: "bob" }] as never);
-    db.modelAlias.findMany.mockResolvedValue([{ userId: "bob", name: "ann/chat" }] as never);
+    db.modelAlias.findMany.mockResolvedValue([{ userId: OWNER, name: "ann/chat" }] as never);
     expect(await reasonOf(client().update({ poolId: "pool-1", slug: "chat" }))).toBe(
-      "name_unavailable",
+      "name_aliased",
     );
-    expect(fenceLog.held).toEqual([`00:owner:${OWNER}`, "00:owner:bob"]);
+    expect(fenceLog.held).toEqual([`00:owner:${OWNER}`]);
     expect(db.pool.update).not.toHaveBeenCalled();
   });
 
@@ -656,6 +622,81 @@ describe("models.list", () => {
     expect(db.pool.findMany.mock.calls[0]?.[0]?.where).toEqual({
       OR: [{ userId: OWNER }, { Shares: { some: { granteeUserId: OWNER, canUse: true } } }],
     });
+  });
+  it("lists a callable ID one of the caller's aliases hides as the alias's pool", async () => {
+    const shared = {
+      id: "pool-2",
+      slug: "shared",
+      userId: "bob",
+      modelType: "LLM",
+      User: { slug: "bob", email: "bob@example.test" },
+      Fallback: { mode: "OWNER_AND_SHARES" },
+      Members: [],
+    };
+    const own = {
+      id: "pool-1",
+      slug: "chat",
+      userId: OWNER,
+      modelType: "LLM",
+      User: { slug: "ann", email: "ann@example.test" },
+      Fallback: { mode: "OFF" },
+      Members: [],
+    };
+    db.pool.findMany.mockResolvedValue([shared, own] as never);
+    db.modelAlias.findMany.mockResolvedValue([
+      { name: "bob/shared", poolId: "pool-1", apiKeyId: null },
+      // Named like the pool it points at: hides nothing.
+      { name: "ann/chat", poolId: "pool-1", apiKeyId: null },
+    ] as never);
+    const models = createRouterClient(modelsRouter, { context: contextFor(CALLERS.person()) });
+    const result = await models.list();
+    // `bob/shared` is listed once, as the pool the alias reaches (pool-1), owned first.
+    expect(result.models.map((model) => [model.callableId, model.poolId])).toEqual([
+      ["ann/chat", "pool-1"],
+      ["bob/shared", "pool-1"],
+    ]);
+    expect(db.modelAlias.findMany).toHaveBeenCalledWith({
+      where: { userId: OWNER },
+      select: { name: true, poolId: true, apiKeyId: true },
+    });
+  });
+});
+
+describe("pools.list shared with me", () => {
+  it("flags a can-use share whose callable ID one of the caller's aliases hides", async () => {
+    db.pool.findMany.mockResolvedValue([]);
+    const active = { banned: false, banExpires: null, deletionRequestedAt: null };
+    const share = (poolId: string, slug: string, canUse = true, user = active) => ({
+      poolId,
+      canUse,
+      canContribute: !canUse,
+      Owner: { email: "bob@example.test" },
+      Pool: {
+        slug,
+        modelType: "LLM",
+        User: { slug: "bob", ...user },
+        Fallback: { mode: "OFF" },
+      },
+    });
+    db.share.findMany.mockResolvedValue([
+      share("pool-a", "hidden"),
+      share("pool-b", "free"),
+      share("pool-c", "contrib", false),
+      share("pool-d", "banned", true, { ...active, banned: true }),
+    ] as never);
+    db.modelAlias.findMany.mockResolvedValue([
+      { name: "bob/hidden", poolId: "pool-own", apiKeyId: null },
+      { name: "bob/contrib", poolId: "pool-own", apiKeyId: null },
+      { name: "bob/banned", poolId: "pool-own", apiKeyId: null },
+    ] as never);
+    const { sharedWithMe } = await client(CALLERS.person()).list();
+    expect(sharedWithMe.map((entry) => [entry.poolId, entry.hiddenByAlias])).toEqual([
+      ["pool-a", true],
+      ["pool-b", false],
+      // Not callable for the caller (no can use, or the owner is inactive): nothing to hide.
+      ["pool-c", false],
+      ["pool-d", false],
+    ]);
   });
 });
 

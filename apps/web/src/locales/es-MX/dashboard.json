@@ -651,7 +651,6 @@
     "alias_limit": "Demasiados alias. Elimina uno primero.",
     "alias_key_not_allowed": "Esa clave no puede llamar a este pool. Agrega el pool a la clave primero.",
     "name_aliased": "Uno de tus alias de nombre de modelo ya usa ese ID invocable. Elimina el alias o elige otro nombre.",
-    "name_unavailable": "Ese ID invocable no está disponible para alguien con quien este pool está o estaría compartido. Elige otro nombre.",
     "always_on_runtime": "Un runtime siempre activo se ejecuta por su cuenta; no hay nada que iniciar.",
     "fabric_port_ranges_disjoint": "Los rangos de puertos de estos nodos no comparten ningún puerto; haz que se superpongan.",
     "identity_mismatch": "El nodo presentó una clave de identidad distinta."
@@ -875,6 +874,7 @@
     "sharedWithMe": "Compartidos contigo",
     "canUse": "Puede usar",
     "canContribute": "Puede contribuir",
+    "hiddenByAlias": "Oculto por tu alias",
     "callAsHint": "Usa esto como nombre de modelo con una clave de API.",
     "members": "Miembros",
     "membersHint": "Modelos servidos a los que enruta este pool. Las solicitudes van a miembros con un espacio libre.",
@@ -1110,6 +1110,10 @@
       "empty": "Todavía no hay alias que apunten a este pool.",
       "unusable": "No disponible",
       "unusableHint": "Por ahora no puedes llamar a este pool (se revocó el acceso compartido o la clave no lo permite).",
+      "hides": "Oculta el pool {{callableId}}",
+      "hidesHint": "Este alias gana: las solicitudes a {{callableId}} llegan a este pool, no al pool compartido contigo con ese ID. Cambia el nombre del alias o elimínalo para llamar a ese pool.",
+      "hidesOwnHint": "Este alias gana: las solicitudes a {{callableId}} llegan a este pool, no a tu pool con ese ID. Cambia el nombre del alias o elimínalo para llamar a ese pool.",
+      "hidesUnusableHint": "Las solicitudes a {{callableId}} no encuentran nada mientras el pool de este alias no esté disponible para ti, y nunca llegan al pool con ese ID. Elimina el alias para llamar a ese pool.",
       "allKeys": "Todas las claves",
       "onlyKey": "Solo la clave {{name}}",
       "oneKey": "Solo una de tus claves",
@@ -1511,8 +1515,7 @@
       "alias_shadowed": "Ese nombre ya es uno de tus ID invocables.",
       "alias_limit": "Demasiados alias. Elimina uno primero.",
       "alias_key_not_allowed": "Esa clave no puede llamar a este pool. Agrega el pool a la clave primero.",
-      "name_aliased": "Uno de tus alias de nombre de modelo ya usa ese ID invocable. Elimina el alias o elige otro nombre.",
-      "name_unavailable": "Ese ID invocable no está disponible para alguien con quien este pool está o estaría compartido. Elige otro nombre."
+      "name_aliased": "Uno de tus alias de nombre de modelo ya usa ese ID invocable. Elimina el alias o elige otro nombre."
     },
     "delete": "Eliminar runtime",
     "deleteTitle": "¿Eliminar {{name}}?",
@@ -2009,6 +2012,14 @@
         "RESTART": "Reinicio",
         "MARK_STOPPED": "Marcar como detenida"
       }
+    },
+    "aliasShadows": {
+      "title_one": "Uno de tus alias oculta un pool",
+      "title_other": "Algunos de tus alias ocultan pools",
+      "description": "Un alias gana sobre un ID de pool con el mismo nombre, así que las solicitudes a ese ID van al pool del alias. Cambia el nombre del alias o elimínalo para volver a llamar al pool por su ID.",
+      "row": "Tu alias {{name}} oculta el pool compartido {{callableId}}.",
+      "rowOwn": "Tu alias {{name}} oculta tu pool {{callableId}}.",
+      "fix": "Abrir alias"
     },
     "kpi": {
       "title": "Tráfico",

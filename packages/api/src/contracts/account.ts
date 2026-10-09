@@ -107,8 +107,8 @@ export const authContract = {
   acceptInvite: mutation(
     "human",
     z.object({ token: z.string().regex(SHARE_INVITE_TOKEN_PATTERN) }).strict(),
-    z.object({ result: z.enum(["accepted", "invalid", "own", "in_use", "name_taken"]) }).strict(),
-    "Accept a pool or runtime invite link as the signed-in person, whatever their e-mail (the token is the proof). own: the invite is to something you own. name_taken: one of your model-name aliases has the pool's callable ID; remove it, then accept again.",
+    z.object({ result: z.enum(["accepted", "invalid", "own", "in_use"]) }).strict(),
+    "Accept a pool or runtime invite link as the signed-in person, whatever their e-mail (the token is the proof). own: the invite is to something you own.",
   ),
   verifyEmailTransport: query(
     "public",
@@ -152,7 +152,7 @@ export const settingsContract = {
         /**
          * Your account slug, the first half of every callable ID of your pools (also for the
          * people they are shared with). Refused when a new callable ID would equal a model-name
-         * alias of yours (name_aliased) or of a share holder (name_unavailable).
+         * alias of yours (name_aliased); a share holder's alias of that name keeps winning for them.
          */
         slug: userSlugSchema.optional(),
         locale: localeSchema.optional(),

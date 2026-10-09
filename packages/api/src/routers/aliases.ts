@@ -7,6 +7,7 @@
  */
 
 import prisma, { type Prisma } from "@ws-model-proxy/db";
+import { poolOwnerActive } from "@ws-model-proxy/db/user-deletion-access";
 import type { SignedInContext } from "../contract-procedure";
 import { contractProcedure } from "../contract-procedure";
 import { agentRulesApply } from "../contracts/auth-context";
@@ -23,13 +24,34 @@ function userIdOf(context: SignedInContext): string {
   return context.session.user.id;
 }
 
+/** `active`: the owner's account is active, so routing reaches the pool now (#76). */
+type CallablePools = Map<string, { callableId: string; own: boolean; active: boolean }>;
+
 /** Pools the user may call (own, or shared with them with can use), by id. */
-async function callablePools(userId: string, db: Pick<Prisma.TransactionClient, "pool"> = prisma) {
+async function callablePools(
+  userId: string,
+  db: Pick<Prisma.TransactionClient, "pool"> = prisma,
+  now = new Date(),
+): Promise<CallablePools> {
   const pools = await db.pool.findMany({
     where: { OR: [{ userId }, { Shares: { some: { granteeUserId: userId, canUse: true } } }] },
-    select: { id: true, slug: true, User: { select: { slug: true } } },
+    select: {
+      id: true,
+      slug: true,
+      userId: true,
+      User: { select: { slug: true, banned: true, banExpires: true, deletionRequestedAt: true } },
+    },
   });
-  return new Map(pools.map((pool) => [pool.id, callableIdOf(pool.User.slug, pool.slug)]));
+  return new Map(
+    pools.map((pool) => [
+      pool.id,
+      {
+        callableId: callableIdOf(pool.User.slug, pool.slug),
+        own: pool.userId === userId,
+        active: pool.userId === userId || poolOwnerActive(pool.User, now),
+      },
+    ]),
+  );
 }
 
 const ALIAS_SELECT = {
@@ -54,22 +76,34 @@ function keyAllowsPool(key: NonNullable<AliasRow["ApiKey"]>, poolId: string, now
   return key.scope === "ALL_POOLS" || key.Pools.some((pool) => pool.poolId === poolId);
 }
 
-function aliasView(row: AliasRow, callable: Map<string, string>, agent: boolean, now = new Date()) {
-  // A callable ID wins over a same-named alias (a clash from before the namespace check).
-  const shadowed = [...callable.values()].includes(row.name);
+/**
+ * The pool an alias hides: one the caller may call now whose callable ID is the alias's name (shared
+ * with them after they made the alias, or a clash from before the namespace check). The alias
+ * wins for the caller until they rename or delete it (lib/model-names.ts). An alias named like
+ * the very pool it points at hides nothing.
+ */
+function hiddenPool(row: Pick<AliasRow, "name" | "poolId">, callable: CallablePools) {
+  for (const [poolId, pool] of callable)
+    if (pool.active && pool.callableId === row.name && poolId !== row.poolId)
+      return { poolId, callableId: pool.callableId, shared: !pool.own };
+  return null;
+}
+
+function aliasView(row: AliasRow, callable: CallablePools, agent: boolean, now = new Date()) {
+  const hidden = hiddenPool(row, callable);
   return {
     id: row.id,
     name: row.name,
     poolId: row.poolId,
     // Only what the caller may see: a pool no longer callable shows nothing of itself.
-    callableId: callable.get(row.poolId) ?? null,
+    callableId: callable.get(row.poolId)?.callableId ?? null,
     apiKeyId: row.apiKeyId,
     // Keys are managed by people: agents see which key an alias is for, not its name.
     apiKeyName: agent ? null : (row.ApiKey?.name ?? null),
     usable:
-      !shadowed &&
-      callable.has(row.poolId) &&
+      callable.get(row.poolId)?.active === true &&
       (!row.ApiKey || keyAllowsPool(row.ApiKey, row.poolId, now)),
+    hides: hidden ? { callableId: hidden.callableId, shared: hidden.shared } : null,
   };
 }
 
@@ -119,7 +153,8 @@ export const modelAliasesRouter = {
     const { row, callable } = await runAccessTransaction({ owners: [userId] }, async (tx) => {
       const callable = await callablePools(userId, tx);
       if (!callable.has(input.poolId)) throw notFound("That pool does not exist.");
-      // Callable IDs always win over an alias: one that equals one would never be used.
+      // A new alias may not take a callable ID the caller can call now (their own namespace
+      // only; an existing alias that a later share collides with wins instead).
       if ((await modelNameClashes(tx, [{ userId, alias: input.name }])).length > 0)
         throw refuse(
           "alias_shadowed",

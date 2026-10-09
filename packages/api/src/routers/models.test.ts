@@ -77,6 +77,7 @@ const pool = (overrides: Partial<{ userId: string; modelType: string }> = {}) =>
 
 beforeEach(() => {
   mockReset(db);
+  db.modelAlias.findMany.mockResolvedValue([]);
 });
 
 describe("models.test", () => {
@@ -121,6 +122,37 @@ describe("models.test", () => {
         target: { kind: "pool", poolId: "pool1", callableId: "me/chat" },
       }),
     );
+  });
+
+  it("tests the pool the caller's alias reaches when it is named like a pool ID (it wins)", async () => {
+    db.modelAlias.findMany.mockResolvedValue([
+      { name: "owner/chat", poolId: "pool1", apiKeyId: null },
+    ] as never);
+    db.pool.findFirst.mockResolvedValue(pool() as never);
+    const modelTest = hook();
+    await client(PERSON, { modelTest }).test({ target: { pool: "owner/chat" } });
+    // Looked up by the alias's pool, as the request path resolves the name.
+    expect(db.pool.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      id: "pool1",
+      OR: [{ userId: "me" }, { Shares: { some: { granteeUserId: "me", canUse: true } } }],
+    });
+    expect(modelTest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        target: { kind: "pool", poolId: "pool1", callableId: "owner/chat" },
+      }),
+    );
+  });
+
+  it("does not test a pool ID hidden by another key's alias (a session reaches nothing)", async () => {
+    db.modelAlias.findMany.mockResolvedValue([
+      { name: "owner/chat", poolId: "pool1", apiKeyId: "key-1" },
+    ] as never);
+    db.pool.findFirst.mockResolvedValue({ ...pool({ userId: "owner" }), id: "pool9" } as never);
+    const modelTest = hook();
+    await expect(
+      client(PERSON, { modelTest }).test({ target: { pool: "owner/chat" } }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(modelTest).not.toHaveBeenCalled();
   });
 
   it("does not reveal a pool the caller cannot use", async () => {
@@ -359,6 +391,43 @@ describe("models.testTargets", () => {
       maxAttachmentBytes: null,
     });
     expect(db.runtime.findMany.mock.calls[0]?.[0]?.where).toEqual({ userId: "me" });
+  });
+
+  it("offers a hidden callable ID as the pool the caller's alias reaches", async () => {
+    db.pool.findMany.mockResolvedValue([
+      {
+        id: "p2",
+        slug: "shared",
+        userId: "owner",
+        modelType: "LLM",
+        User: { slug: "owner", email: "o@example.test" },
+        Fallback: null,
+        Routing: null,
+        Advanced: null,
+        Members: [],
+      },
+      {
+        id: "p1",
+        slug: "chat",
+        userId: "me",
+        modelType: "LLM",
+        User: { slug: "me", email: "me@example.test" },
+        Fallback: null,
+        Routing: null,
+        Advanced: null,
+        Members: [],
+      },
+    ] as never);
+    db.runtime.findMany.mockResolvedValue([]);
+    db.modelAlias.findMany.mockResolvedValue([
+      { name: "owner/shared", poolId: "p1", apiKeyId: null },
+    ] as never);
+    const { targets } = await client(PERSON).testTargets();
+    // `owner/shared` reaches p1 through the alias: offered as p1, never as owner's pool.
+    expect(targets.map((target) => [target.model, target.label, target.type])).toEqual([
+      ["me/chat", "me/chat", "LLM"],
+      ["owner/shared", "owner/shared", "LLM"],
+    ]);
   });
 
   it("offers every API on an adapting pool and keeps its recommended surface", async () => {

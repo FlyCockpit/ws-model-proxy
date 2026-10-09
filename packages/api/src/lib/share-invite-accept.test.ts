@@ -16,20 +16,12 @@ const db = vi.hoisted(() => ({
   share: { findUnique: vi.fn(), create: vi.fn() },
   runtimeShare: { findUnique: vi.fn(), create: vi.fn() },
   user: { findUnique: vi.fn() },
-  pool: { findUnique: vi.fn() },
-  modelAlias: { findMany: vi.fn() },
+  // Never read: an invite is accepted whatever aliases the person has (their alias wins).
+  modelAlias: { findMany: vi.fn(), findFirst: vi.fn(), count: vi.fn() },
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
 const lockOrder = vi.hoisted(() => ({
   fenceOwners: vi.fn(async () => undefined),
-  // The model-name check asserts the owner fences: here, against what fenceOwners took.
-  requireOwnerFences: vi.fn(async (_tx: unknown, userIds: Iterable<string>) => {
-    const held = lockOrder.fenceOwners.mock.calls.flatMap((call) => [
-      ...((call as unknown[])[1] as string[]),
-    ]);
-    const missing = [...userIds].filter((id) => !held.includes(id));
-    if (missing.length > 0) throw new Error(`missing owner fences: ${missing.join(",")}`);
-  }),
   runCapacityOrderedTransaction: vi.fn(
     async (client: unknown, work: (tx: unknown) => Promise<unknown>) => work(client),
   ),
@@ -82,8 +74,6 @@ const claimedBy = (email: string, at: Date = new Date()) => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
-  db.pool.findUnique.mockResolvedValue({ slug: "chat", User: { slug: "owner" } });
-  db.modelAlias.findMany.mockResolvedValue([]);
 });
 
 describe("share invite acceptance", () => {
@@ -139,50 +129,18 @@ describe("share invite acceptance", () => {
     });
   });
 
-  it("leaves an invite pending when its share would clash with one of the person's aliases", async () => {
-    const second = { ...invite, id: "inv2", poolId: "pool2" };
-    db.shareInvite.findMany
-      .mockResolvedValueOnce([invite, second])
-      .mockResolvedValueOnce([invite, second]);
-    db.share.findUnique.mockResolvedValue(null);
-    db.pool.findUnique
-      .mockResolvedValueOnce({ slug: "chat", User: { slug: "owner" } })
-      .mockResolvedValueOnce({ slug: "big", User: { slug: "owner" } });
-    db.modelAlias.findMany
-      .mockResolvedValueOnce([{ userId: "friend", name: "owner/chat" }])
-      .mockResolvedValueOnce([]);
-    db.share.create.mockResolvedValue({ id: "share2" });
-    db.shareInvite.updateMany.mockResolvedValue({ count: 1 });
-    await expect(acceptShareInvitesForProvenEmail({ ...user, emailVerified: true })).resolves.toBe(
-      1,
-    );
-    expect(db.modelAlias.findMany.mock.calls[0]?.[0]?.where).toEqual({
-      OR: [{ userId: "friend", name: { in: ["owner/chat"] } }],
-    });
-    // Only the free one became a share; the clashing invite stays pending for its link.
-    expect(db.share.create).toHaveBeenCalledTimes(1);
-    expect(db.share.create.mock.calls[0]?.[0].data).toMatchObject({ poolId: "pool2" });
-    expect(db.shareInvite.updateMany).toHaveBeenCalledTimes(1);
-    expect(db.shareInvite.updateMany.mock.calls[0]?.[0].where).toMatchObject({ id: "inv2" });
-  });
-
-  it("answers name_taken through the link and writes nothing", async () => {
+  it("accepts a can-use invite through its link without looking at the person's aliases", async () => {
+    // Their alias of the same name keeps winning for them (resolve.ts) and the Overview warns;
+    // the accept itself never refuses.
     db.shareInvite.findFirst.mockResolvedValue(invite);
-    db.share.findUnique.mockResolvedValue(null);
-    db.modelAlias.findMany.mockResolvedValue([{ userId: "friend", name: "owner/chat" }]);
-    await expect(acceptShareInviteByLink(other, TOKEN)).resolves.toBe("name_taken");
-    expect(lockOrder.fenceOwners).toHaveBeenCalledWith(db, ["friend", "owner"]);
-    expect(db.share.create).not.toHaveBeenCalled();
-    expect(db.shareInvite.updateMany).not.toHaveBeenCalled();
-  });
-
-  it("a can-contribute-only invite names nothing in the person's namespace", async () => {
-    db.shareInvite.findFirst.mockResolvedValue({ ...invite, canUse: false });
     db.share.findUnique.mockResolvedValue(null);
     db.share.create.mockResolvedValue({ id: "share1" });
     db.shareInvite.updateMany.mockResolvedValue({ count: 1 });
     await expect(acceptShareInviteByLink(other, TOKEN)).resolves.toBe("accepted");
+    expect(db.share.create.mock.calls[0]?.[0].data).toMatchObject({ canUse: true });
     expect(db.modelAlias.findMany).not.toHaveBeenCalled();
+    expect(db.modelAlias.findFirst).not.toHaveBeenCalled();
+    expect(db.modelAlias.count).not.toHaveBeenCalled();
   });
 
   it("creates the runtime share for a runtime invite, under both owners' fences", async () => {

@@ -156,40 +156,56 @@ export type CallableTargets = {
   pools: CallablePool[];
   tests: TestTarget[];
   aliases: ModelAliasTarget[];
-  /** Every callable ID in the user's namespace, also those this caller cannot use now. */
-  shadowing?: ReadonlySet<string>;
+  /**
+   * Callable IDs of `pools` that one of the person's aliases (any scope) is named like: the alias
+   * wins for this person until they delete it, so the ID never names the pool for them, through
+   * any key, and is not listed (packages/api lib/model-names.ts).
+   */
+  shadowed: ReadonlySet<string>;
 };
 
-/**
- * The aliases a caller may use: the user's (and the key's, which win), pointing only at pools
- * in `pools` (an alias never widens access). `shadowing` holds every callable ID in the user's
- * namespace (own pools and can-use shares, whatever the key's scope or the owner's state): an
- * alias with one of those names is never used. Writers keep such clashes from arising
- * (packages/api lib/model-names.ts); one from before that check thus routes the same through
- * every key, to the pool or nowhere, and aliases.list shows the alias as not usable.
- */
-async function effectiveAliases(
-  userId: string,
-  apiKeyId: string | null,
-  pools: readonly CallablePool[],
-  shadowing: ReadonlySet<string>,
-): Promise<ModelAliasTarget[]> {
-  const rows = await prisma.modelAlias.findMany({
-    where: { userId, OR: [{ apiKeyId: null }, ...(apiKeyId ? [{ apiKeyId }] : [])] },
+type AliasRow = { name: string; poolId: string; apiKeyId: string | null };
+
+/** Every alias of the person, any scope (at most MODEL_ALIASES_MAX_PER_USER). */
+function aliasRowsOf(userId: string): Promise<AliasRow[]> {
+  return prisma.modelAlias.findMany({
+    where: { userId },
     select: { name: true, poolId: true, apiKeyId: true },
     orderBy: { id: "asc" },
     take: 256,
   });
+}
+
+/**
+ * The aliases a caller may use: the user's (and the key's, which win), pointing only at pools
+ * in `pools` (an alias never widens access).
+ */
+function effectiveAliases(
+  rows: readonly AliasRow[],
+  apiKeyId: string | null,
+  pools: readonly CallablePool[],
+): ModelAliasTarget[] {
   const callable = new Set(pools.map((pool) => pool.id));
   const byName = new Map<string, ModelAliasTarget>();
   // User-level first, then the key's: a usable key-level alias replaces a user-level one (one
   // whose pool the key cannot call never hides a working user-level alias).
-  for (const row of [...rows].sort(
-    (a, b) => Number(a.apiKeyId !== null) - Number(b.apiKeyId !== null),
-  ))
-    if (callable.has(row.poolId) && !shadowing.has(row.name))
-      byName.set(row.name, { name: row.name, poolId: row.poolId });
+  for (const row of rows
+    .filter((row) => row.apiKeyId === null || row.apiKeyId === apiKeyId)
+    .sort((a, b) => Number(a.apiKeyId !== null) - Number(b.apiKeyId !== null)))
+    if (callable.has(row.poolId)) byName.set(row.name, { name: row.name, poolId: row.poolId });
   return [...byName.values()];
+}
+
+/**
+ * The callable IDs of `pools` an alias of the person (any scope) hides: one named like the ID
+ * and pointing at another pool (one pointing at that very pool changes nothing).
+ */
+function shadowedIds(rows: readonly AliasRow[], pools: readonly CallablePool[]): Set<string> {
+  return new Set(
+    pools.flatMap((pool) =>
+      rows.some((row) => row.name === pool.modelId && row.poolId !== pool.id) ? [pool.modelId] : [],
+    ),
+  );
 }
 
 export function testTargetModelId(runtimeId: string, upstreamModelId: string): string {
@@ -284,7 +300,14 @@ export async function listCallableTargetsForUser(
   userId: string,
   now = new Date(),
 ): Promise<CallableTargets> {
-  const [owned, shares, models] = await Promise.all([
+  return (await userTargets(userId, now)).targets;
+}
+
+async function userTargets(
+  userId: string,
+  now: Date,
+): Promise<{ targets: CallableTargets; aliasRows: AliasRow[] }> {
+  const [owned, shares, models, aliasRows] = await Promise.all([
     prisma.pool.findMany({ where: { userId }, select: POOL_SELECT, orderBy: { slug: "asc" } }),
     prisma.share.findMany({
       where: { granteeUserId: userId, canUse: true },
@@ -301,6 +324,7 @@ export async function listCallableTargetsForUser(
       },
       orderBy: [{ runtimeId: "asc" }, { upstreamModelId: "asc" }],
     }),
+    aliasRowsOf(userId),
   ]);
   const pools = [
     ...owned.map((pool) => callablePool(pool, null)),
@@ -308,7 +332,6 @@ export async function listCallableTargetsForUser(
       .filter((share) => poolOwnerActive(share.Pool.User, now))
       .map((share) => callablePool(share.Pool, share)),
   ];
-  const shadowing = callableIdsOf(owned, shares);
   const tests: TestTarget[] = models.map((model) => ({
     target: "TEST",
     id: model.id,
@@ -320,23 +343,14 @@ export async function listCallableTargetsForUser(
     maxAttachmentBytes: null,
   }));
   return {
-    pools,
-    tests,
-    aliases: await effectiveAliases(userId, null, pools, shadowing),
-    shadowing,
+    targets: {
+      pools,
+      tests,
+      aliases: effectiveAliases(aliasRows, null, pools),
+      shadowed: shadowedIds(aliasRows, pools),
+    },
+    aliasRows,
   };
-}
-
-/** Every callable ID in a user's namespace (own pools, can-use shares, owner active or not). */
-function callableIdsOf(
-  owned: readonly PoolSelected[],
-  shares: readonly { Pool: PoolSelected }[],
-): ReadonlySet<string> {
-  return new Set(
-    [...owned, ...shares.map((share) => share.Pool)].map(
-      (pool) => `${pool.User.slug}/${pool.slug}`,
-    ),
-  );
 }
 
 /** An API key reaches pools only (ALL_POOLS: every callable pool; SELECTED_POOLS: its list). */
@@ -344,7 +358,7 @@ export async function listCallableTargetsForApiKey(
   key: ApiKeyIdentity,
   now = new Date(),
 ): Promise<CallableTargets> {
-  const all = await listCallableTargetsForUser(key.userId, now);
+  const { targets: all, aliasRows } = await userTargets(key.userId, now);
   let pools = all.pools;
   if (key.scope !== "ALL_POOLS") {
     const selected = new Set(
@@ -354,12 +368,13 @@ export async function listCallableTargetsForApiKey(
     );
     pools = all.pools.filter((pool) => selected.has(pool.id));
   }
-  const shadowing = all.shadowing ?? new Set<string>();
+  // Hidden from the person's whole namespace, not only this key's pools: a name means the same
+  // through every key.
   return {
     pools,
     tests: [],
-    aliases: await effectiveAliases(key.userId, key.id, pools, shadowing),
-    shadowing,
+    aliases: effectiveAliases(aliasRows, key.id, pools),
+    shadowed: all.shadowed,
   };
 }
 

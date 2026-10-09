@@ -95,13 +95,12 @@ describe("model name grammar", () => {
     });
   });
 
-  it("resolves the caller's aliases, never over a callable ID, only to callable pools", () => {
+  it("resolves the caller's aliases, only to callable pools", () => {
     const withAliases = {
       ...targets,
       aliases: [
         { name: "gpt-4o", poolId: "pool-id" },
         { name: "qwen3:8b", poolId: "pool-id" },
-        { name: "owner/pool.v2", poolId: "other-pool" },
         { name: "ghost", poolId: "invisible-pool" },
       ],
     };
@@ -119,15 +118,39 @@ describe("model name grammar", () => {
       kind: "pool",
       externalRequested: true,
     });
-    // The callable ID wins over an alias of the same name.
-    expect(resolveRequestedModelName(withAliases, "owner/pool.v2")).toMatchObject({
-      target: { id: "pool-id" },
-    });
     expect(resolveRequestedModelName(withAliases, "ghost")).toEqual({ kind: "not_found" });
-    // Also in the :external form, the callable ID wins.
-    expect(resolveRequestedModelName(withAliases, "owner/pool.v2:external")).toMatchObject({
-      target: { id: "pool-id" },
+  });
+
+  it("an alias wins over the callable ID it is named like, in every form", () => {
+    const shared: CallablePool = { ...pool, id: "shared-id", modelId: "ann/chat", shareId: "s" };
+    const own: CallablePool = { ...pool, id: "own-id", modelId: "me/own" };
+    const withClash = {
+      tests: [],
+      pools: [own, shared],
+      aliases: [{ name: "ann/chat", poolId: "own-id" }],
+      shadowed: new Set(["ann/chat"]),
+    };
+    expect(resolveRequestedModelName(withClash, "ann/chat")).toMatchObject({
+      kind: "pool",
+      target: { id: "own-id" },
+      externalRequested: false,
+    });
+    expect(resolveRequestedModelName(withClash, "ann/chat:external")).toMatchObject({
+      target: { id: "own-id" },
       externalRequested: true,
+    });
+    // The variant error names the alias's pool, never the hidden one.
+    expect(resolveRequestedModelName(withClash, "ann/chat:bogus")).toMatchObject({
+      kind: "error",
+      error: { message: expect.stringContaining("me/own") },
+    });
+    // A key that cannot use the alias (no effective alias) still never reaches the hidden pool.
+    const viaOtherKey = { ...withClash, pools: [shared], aliases: [] };
+    for (const name of ["ann/chat", "ann/chat:external", "ann/chat:bogus"])
+      expect(resolveRequestedModelName(viaOtherKey, name)).toEqual({ kind: "not_found" });
+    // Other callable IDs are untouched.
+    expect(resolveRequestedModelName(withClash, "me/own")).toMatchObject({
+      target: { id: "own-id" },
     });
   });
 

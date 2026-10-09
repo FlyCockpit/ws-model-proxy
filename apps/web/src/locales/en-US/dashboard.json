@@ -651,7 +651,6 @@
     "alias_limit": "Too many aliases. Remove one first.",
     "alias_key_not_allowed": "That key cannot call this pool. Add the pool to the key first.",
     "name_aliased": "One of your model-name aliases already uses that callable ID. Remove the alias or pick another name.",
-    "name_unavailable": "That callable ID is not available to someone this pool is or would be shared with. Pick another name.",
     "always_on_runtime": "An always-on runtime runs on its own; there is nothing to start.",
     "fabric_port_ranges_disjoint": "These nodes' port ranges share no port; make them overlap.",
     "identity_mismatch": "The node presented a different identity key."
@@ -875,6 +874,7 @@
     "sharedWithMe": "Shared with you",
     "canUse": "Can use",
     "canContribute": "Can contribute",
+    "hiddenByAlias": "Hidden by your alias",
     "callAsHint": "Use this as the model name with an API key.",
     "members": "Members",
     "membersHint": "Served models this pool routes to. Requests go to members with a free slot.",
@@ -1110,6 +1110,10 @@
       "empty": "No aliases point at this pool yet.",
       "unusable": "Unusable",
       "unusableHint": "This pool is not callable for you right now (share revoked, or the key does not allow it).",
+      "hides": "Hides pool {{callableId}}",
+      "hidesHint": "This alias wins: requests for {{callableId}} come to this pool, not to the pool shared with you under that ID. Rename or delete the alias to call that pool.",
+      "hidesOwnHint": "This alias wins: requests for {{callableId}} come to this pool, not to your pool with that ID. Rename or delete the alias to call that pool.",
+      "hidesUnusableHint": "Requests for {{callableId}} find nothing while this alias's pool is not callable for you, and never reach the pool with that ID. Delete the alias to call that pool.",
       "allKeys": "All keys",
       "onlyKey": "Only key {{name}}",
       "oneKey": "Only one of your keys",
@@ -1511,8 +1515,7 @@
       "alias_shadowed": "That name is already one of your callable IDs.",
       "alias_limit": "Too many aliases. Remove one first.",
       "alias_key_not_allowed": "That key cannot call this pool. Add the pool to the key first.",
-      "name_aliased": "One of your model-name aliases already uses that callable ID. Remove the alias or pick another name.",
-      "name_unavailable": "That callable ID is not available to someone this pool is or would be shared with. Pick another name."
+      "name_aliased": "One of your model-name aliases already uses that callable ID. Remove the alias or pick another name."
     },
     "delete": "Delete runtime",
     "deleteTitle": "Delete {{name}}?",
@@ -2009,6 +2012,14 @@
         "RESTART": "Restart",
         "MARK_STOPPED": "Mark as stopped"
       }
+    },
+    "aliasShadows": {
+      "title_one": "An alias of yours hides a pool",
+      "title_other": "Aliases of yours hide pools",
+      "description": "An alias wins over a pool ID with the same name, so requests for that ID go to the alias's pool instead. Rename or delete the alias to call the pool by its ID again.",
+      "row": "Your alias {{name}} hides the shared pool {{callableId}}.",
+      "rowOwn": "Your alias {{name}} hides your pool {{callableId}}.",
+      "fix": "Open aliases"
     },
     "kpi": {
       "title": "Traffic",

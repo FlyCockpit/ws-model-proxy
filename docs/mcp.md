@@ -247,8 +247,11 @@ Harnesses that hard-code a model name (`gpt-4o`, `claude-sonnet-4-5`) can call a
 pool through an alias: `pool_update {poolId, aliases: {set: [{name,
 apiKeyId?}], remove: [aliasId]}}`; `pools_get {aliases: true}` lists them. An
 alias lives in your own namespace (for every key, or one key, which wins), only
-resolves to a pool the key in use can call, never wins over a callable ID, and
-is listed by `/v1/models`. Agents may manage aliases; API keys stay
+resolves to a pool the key in use can call, and is listed by `/v1/models`. A new
+alias may not take a pool ID you can call; when a pool shared with you later
+gets an ID one of your aliases has, the alias wins for you until you rename or
+delete it: that name reaches the alias's pool everywhere (also `model_test`),
+and `pools_get` marks the alias `hides` and the share `hiddenByAlias`. Agents may manage aliases; API keys stay
 people-only. The model API accepts the key as `Authorization: Bearer`,
 `x-api-key` or `api-key`.
 

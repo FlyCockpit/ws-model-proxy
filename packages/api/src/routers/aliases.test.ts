@@ -29,9 +29,10 @@ async function reasonOf(promise: Promise<unknown>): Promise<string | undefined> 
   return undefined;
 }
 
+const ACTIVE = { banned: false, banExpires: null, deletionRequestedAt: null };
 const POOLS = [
-  { id: "pool-own", slug: "chat", User: { slug: "me" } },
-  { id: "pool-shared", slug: "big", User: { slug: "friend" } },
+  { id: "pool-own", slug: "chat", userId: OWNER, User: { slug: "me", ...ACTIVE } },
+  { id: "pool-shared", slug: "big", userId: "friend-id", User: { slug: "friend", ...ACTIVE } },
 ];
 
 function aliasRow(overrides: Record<string, unknown> = {}) {
@@ -140,7 +141,7 @@ describe("model-name aliases", () => {
   });
 
   it("refuses a name that is a callable ID, a key it cannot use, and past the limit", async () => {
-    db.pool.findFirst.mockResolvedValueOnce({ id: "pool-own" } as never);
+    db.pool.findFirst.mockResolvedValueOnce({ userId: OWNER, User: ACTIVE } as never);
     expect(await reasonOf(client().set({ name: "me/chat", poolId: "pool-own" }))).toBe(
       "alias_shadowed",
     );
@@ -187,10 +188,39 @@ describe("model-name aliases", () => {
     expect(db.modelAlias.upsert).toHaveBeenCalledTimes(2);
   });
 
-  it("shows an alias a callable ID shadows (a clash from before the check) as not usable", async () => {
-    db.modelAlias.findMany.mockResolvedValue([aliasRow({ name: "friend/big" })] as never);
+  it("marks an alias named like a pool it hides (the alias wins), keeping it usable", async () => {
+    db.modelAlias.findMany.mockResolvedValue([
+      // Hides friend's pool shared with the caller.
+      aliasRow({ name: "friend/big" }),
+      // Hides the caller's own pool (a clash from before the check).
+      aliasRow({ id: "alias-2", name: "me/chat", poolId: "pool-shared" }),
+      // Named like the pool it points at: hides nothing.
+      aliasRow({ id: "alias-3", name: "me/chat" }),
+      aliasRow({ id: "alias-4", name: "gpt-4o" }),
+    ] as never);
     const { aliases } = await client().list({});
-    expect(aliases[0]).toMatchObject({ name: "friend/big", callableId: "me/chat", usable: false });
+    expect(aliases.map(({ id, usable, hides }) => ({ id, usable, hides }))).toEqual([
+      { id: "alias-1", usable: true, hides: { callableId: "friend/big", shared: true } },
+      { id: "alias-2", usable: true, hides: { callableId: "me/chat", shared: false } },
+      { id: "alias-3", usable: true, hides: null },
+      { id: "alias-4", usable: true, hides: null },
+    ]);
+  });
+
+  it("an inactive owner's pool is neither hidden nor reachable now", async () => {
+    db.pool.findMany.mockResolvedValue([
+      POOLS[0],
+      { ...POOLS[1], User: { slug: "friend", ...ACTIVE, deletionRequestedAt: new Date() } },
+    ] as never);
+    db.modelAlias.findMany.mockResolvedValue([
+      aliasRow({ name: "friend/big" }),
+      aliasRow({ id: "alias-2", name: "gpt-4o", poolId: "pool-shared" }),
+    ] as never);
+    const { aliases } = await client().list({});
+    expect(aliases.map(({ id, usable, hides }) => ({ id, usable, hides }))).toEqual([
+      { id: "alias-1", usable: true, hides: null },
+      { id: "alias-2", usable: false, hides: null },
+    ]);
   });
 
   it("refuses names that are variants or direct tests", async () => {

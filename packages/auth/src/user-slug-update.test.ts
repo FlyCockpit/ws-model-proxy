@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 
 /**
- * The account slug names every callable ID of the person's pools (also in their share holders'
- * namespaces): only `settings.update` changes it, under the owner fences of everyone it renames
- * for (packages/api lib/model-names.ts). Better Auth's update routes refuse it.
+ * The account slug names every callable ID of the person's pools: only `settings.update`
+ * changes it, checked against the person's own aliases under their owner fence (packages/api
+ * lib/model-names.ts). Better Auth's update routes refuse it.
  */
 
 vi.mock("@ws-model-proxy/env/server", () => ({

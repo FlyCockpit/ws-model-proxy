@@ -1,7 +1,7 @@
 /**
  * settings.update with a new account slug: it renames every callable ID of the person's pools,
- * in their namespace and in every can-use share holder's, so it claims the new names
- * (lib/model-names.ts) under all their owner fences.
+ * so it claims the new names in their own namespace (lib/model-names.ts) under their owner
+ * fence. Share holders' aliases are never looked at: one with a renamed ID wins for its holder.
  */
 import { createRouterClient, ORPCError } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
@@ -35,7 +35,6 @@ vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => {
 });
 
 import prisma from "@ws-model-proxy/db";
-import { runCapacityOrderedTransaction } from "@ws-model-proxy/db/capacity-lock-order";
 import type { Context } from "../context";
 import { settingsRouter } from "./settings";
 
@@ -99,31 +98,21 @@ beforeEach(() => {
 });
 
 describe("settings.update slug", () => {
-  it("claims every renamed callable ID for the person and each can-use holder, fenced", async () => {
+  it("claims every renamed callable ID in the person's own namespace, under their fence only", async () => {
     await client().update({ slug: "anna" });
-    expect(fenceLog.held).toEqual(["00:owner:user-1", "00:owner:bob", "00:owner:cy"]);
+    expect(fenceLog.held).toEqual(["00:owner:user-1"]);
     expect(db.modelAlias.findMany.mock.calls[0]?.[0]?.where).toEqual({
-      OR: [
-        { userId: ME, name: { in: ["anna/chat", "anna/embed"] } },
-        { userId: "bob", name: { in: ["anna/chat"] } },
-        { userId: "cy", name: { in: ["anna/embed"] } },
-      ],
+      OR: [{ userId: ME, name: { in: ["anna/chat", "anna/embed"] } }],
     });
+    // Share holders are not even listed.
+    expect(db.share.findMany).not.toHaveBeenCalled();
     expect(db.user.update).toHaveBeenCalledWith({ where: { id: ME }, data: { slug: "anna" } });
   });
 
-  it("refuses a slug that renames onto an alias: the person's own by name, a holder's generically", async () => {
-    db.modelAlias.findMany.mockResolvedValue([{ userId: "bob", name: "anna/chat" }] as never);
-    const refused = await client()
-      .update({ slug: "anna" })
-      .catch((error: unknown) => error);
-    expect(refused).toMatchObject({ data: { reason: "name_unavailable" } });
-    expect((refused as Error).message).not.toMatch(/bob|anna\/chat/);
-    // The refusal rolls the transaction back: no audit, nothing else written after the slug.
-    expect(db.auditEvent.create).not.toHaveBeenCalled();
-
+  it("refuses a slug that renames onto the person's own alias, rolling everything back", async () => {
     db.modelAlias.findMany.mockResolvedValue([{ userId: ME, name: "anna/embed" }] as never);
     expect(await reasonOf(client().update({ slug: "anna", name: "Anna" }))).toBe("name_aliased");
+    // The refusal rolls the transaction back: no audit, nothing else written after the slug.
     expect(db.auditEvent.create).not.toHaveBeenCalled();
     expect(db.user.update).not.toHaveBeenCalledWith(
       expect.objectContaining({ data: { name: "Anna" } }),
@@ -132,8 +121,8 @@ describe("settings.update slug", () => {
 
   it("answers slug_taken for another account's slug before looking at any alias", async () => {
     db.user.update.mockRejectedValue(Object.assign(new Error("dup"), { code: "P2002" }));
-    // Even when a holder's alias would clash: no probing of names under someone else's slug.
-    db.modelAlias.findMany.mockResolvedValue([{ userId: "bob", name: "anna/chat" }] as never);
+    // Even when the person's own alias would clash: the unique slug decides first.
+    db.modelAlias.findMany.mockResolvedValue([{ userId: ME, name: "anna/chat" }] as never);
     expect(await reasonOf(client().update({ slug: "anna" }))).toBe("slug_taken");
     expect(db.modelAlias.findMany).not.toHaveBeenCalled();
   });
@@ -169,25 +158,5 @@ describe("settings.update slug", () => {
     expect(await reasonOf(client().update({ slug: "Bad Slug" }))).toBe("BAD_REQUEST");
     expect(await reasonOf(client().update({ slug: "admin" }))).toBe("BAD_REQUEST");
     expect(db.pool.findMany).not.toHaveBeenCalled();
-  });
-
-  it("a share created after the fence plan retries with that holder fenced", async () => {
-    db.share.findMany
-      .mockResolvedValueOnce([] as never)
-      .mockResolvedValue([{ poolId: "pool-1", granteeUserId: "bob" }] as never);
-    vi.mocked(runCapacityOrderedTransaction).mockImplementationOnce(async (runner, work) => {
-      // The real runner retries a FenceSetChangedError (no row was written yet).
-      try {
-        return await runner.$transaction(work);
-      } catch (error) {
-        expect((error as Error).name).toBe("FenceSetChangedError");
-        expect(db.user.update).not.toHaveBeenCalled();
-        return runner.$transaction(work);
-      }
-    });
-    await client().update({ slug: "anna" });
-    expect(fenceLog.held).toEqual(["00:owner:user-1", "00:owner:user-1", "00:owner:bob"]);
-    expect(db.user.update).toHaveBeenCalledTimes(1);
-    expect(db.auditEvent.create).toHaveBeenCalledTimes(1);
   });
 });

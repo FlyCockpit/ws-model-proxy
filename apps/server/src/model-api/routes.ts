@@ -3701,6 +3701,8 @@ async function modelListResponse(
           owned_by: pool.ownerUserSlug,
           ...openAiModelListExtensions(entryFlags),
         });
+        // A callable ID one of the caller's aliases is named like is the alias's (listed below).
+        if (targets.shadowed.has(pool.modelId)) return [];
         const plain = servingPoolIds.has(pool.id) ? [entry(pool.modelId)] : [];
         // `owner/pool:external` is listed only when this caller could be served
         // that way, from static configuration (never live health): switch on,
@@ -3721,12 +3723,13 @@ async function modelListResponse(
           ? [...plain, entry(externalModelId(pool.modelId), externalModelListFlags(flags))]
           : plain;
       }),
-      // The caller's aliases, listed like the pool they name (hard-coded harness names).
+      // The caller's aliases, listed like the pool they name (hard-coded harness names). An
+      // alias named like a callable ID wins over that pool (resolveRequestedModelName), whose
+      // entry is left out above; one named like the very pool it points at is that entry.
       ...(targets.aliases ?? []).flatMap((alias) => {
         const pool = targets.pools.find((candidate) => candidate.id === alias.poolId);
-        // A callable ID always wins over an alias of the same name.
-        if (targets.pools.some((candidate) => candidate.modelId === alias.name)) return [];
         if (!pool || !servingPoolIds.has(pool.id)) return [];
+        if (pool.modelId === alias.name && !targets.shadowed.has(alias.name)) return [];
         const flags = poolFlagsById.get(pool.id) ?? multimodalFlagsFromCapabilities(null);
         return [
           {
@@ -8564,7 +8567,8 @@ export async function poolMemberDiagnosticHandler({
   return relayPreparedModeledRequest({
     request,
     requester: { ...requesterFromChatTestUser(userId), limitKey: `pool-member-test:${userId}` },
-    targets,
+    // A member probe names this pool by id: no alias of the owner can take its callable ID.
+    targets: { ...targets, aliases: [], shadowed: new Set() },
     prepared,
     operation: embeddings
       ? {

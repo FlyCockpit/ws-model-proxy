@@ -10,7 +10,10 @@ vi.mock("@ws-model-proxy/db", async () => {
 });
 
 const callable = vi.hoisted(() => ({
-  targets: { pools: [] as unknown[], tests: [] as unknown[] },
+  targets: {
+    pools: [] as unknown[],
+    tests: [] as unknown[],
+  } as { pools: unknown[]; tests: unknown[]; aliases?: unknown[]; shadowed?: Set<string> },
   userCalls: [] as string[],
   keyCalls: [] as string[],
 }));
@@ -409,6 +412,27 @@ describe("test candidates and model resolution", () => {
     ).toEqual({ kind: "test", target: testTarget });
     expect(callable.keyCalls).toEqual(["k", "k", "k", "k"]);
     expect(callable.userCalls).toEqual(["u"]);
+  });
+
+  it("an alias named like a pool ID wins for live sessions too", async () => {
+    const hidden = { ...poolTarget, id: "pool-hidden", modelId: "ann/asr" };
+    callable.targets = {
+      pools: [poolTarget, hidden],
+      tests: [],
+      aliases: [{ name: "ann/asr", poolId: poolTarget.id }],
+      shadowed: new Set(["ann/asr"]),
+    };
+    const dashboard = { kind: "dashboard" as const, userId: "u" };
+    expect(await resolveRealtimeModel(dashboard, "ann/asr")).toEqual({
+      kind: "pool",
+      target: poolTarget,
+    });
+    expect(await resolveRealtimeModel(dashboard, "ann/asr:external")).toEqual({
+      error: "external_variant_unsupported",
+    });
+    // Without the alias in effect (another key's), the hidden pool is still never reached.
+    callable.targets = { ...callable.targets, aliases: [] };
+    expect(await resolveRealtimeModel(dashboard, "ann/asr")).toEqual({ error: "model_not_found" });
   });
 
   it("reports a configuration refusal without touching target health", () => {

@@ -55,6 +55,12 @@ export const modelAliasViewSchema = z
     apiKeyName: z.string().nullable(),
     /** False while the pool is not callable for you (share revoked, key not allowed it). */
     usable: z.boolean(),
+    /**
+     * A pool you may call whose callable ID is this alias's name: the alias wins for you, so that
+     * ID reaches this alias's pool (and is not listed) until you rename or delete the alias.
+     * `shared`: the hidden pool is shared with you (else it is yours).
+     */
+    hides: z.object({ callableId: z.string(), shared: z.boolean() }).strict().nullable(),
   })
   .strict();
 
@@ -270,6 +276,11 @@ export const poolsContract = {
               modelType: z.enum(MODEL_TYPE),
               canUse: z.boolean(),
               canContribute: z.boolean(),
+              /**
+               * One of your aliases is named like this pool's callable ID and wins for you: the ID
+               * reaches the alias's pool until you rename or delete the alias (aliases.list).
+               */
+              hiddenByAlias: z.boolean(),
             })
             .strict(),
         ),

@@ -46,7 +46,6 @@ import {
   shareSelect,
   shareView,
 } from "../lib/access-views";
-import { modelNameClashes, refuseCallableIdClash } from "../lib/model-names";
 import { sweepPendingAuthorizationCodes } from "../lib/oauth-code-sweep";
 import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
@@ -516,30 +515,6 @@ const oauthGrants = {
 
 // ── Shares and invites ──
 
-/**
- * Claims a pool's callable ID for the person it is (newly) shared with for use
- * (lib/model-names.ts), under the owner fences of both. The owner learns only that the name is
- * unavailable to this person, never which of their names it is.
- */
-async function claimSharedCallableId(
-  tx: Prisma.TransactionClient,
-  poolId: string,
-  granteeUserId: string,
-  ownerUserId: string,
-) {
-  const pool = await tx.pool.findFirst({
-    where: { id: poolId, userId: ownerUserId },
-    select: { slug: true, User: { select: { slug: true } } },
-  });
-  if (!pool) throw notFound("That key, token, connection, share or invite does not exist.");
-  refuseCallableIdClash(
-    await modelNameClashes(tx, [
-      { userId: granteeUserId, callableIds: [callableIdOf(pool.User.slug, pool.slug)] },
-    ]),
-    ownerUserId,
-  );
-}
-
 async function ownedPool(userId: string, poolId: string) {
   const pool = await prisma.pool.findFirst({
     where: { id: poolId, userId },
@@ -626,7 +601,6 @@ const shares = {
     let shareId: string;
     try {
       shareId = await runAccessTransaction({ owners: [ownerUserId, grantee.id] }, async (tx) => {
-        if (input.canUse) await claimSharedCallableId(tx, pool.id, grantee.id, ownerUserId);
         // The share replaces a pending invite to this address: its link stops working.
         await tx.shareInvite.updateMany({
           where: { poolId: pool.id, email, ownerUserId, acceptedAt: null, revokedAt: null },
@@ -703,8 +677,6 @@ const shares = {
       if (!canUse && !canContribute) {
         throw badRequest("A share needs can use, can contribute, or both. Delete it instead.");
       }
-      if (canUse && !share.canUse)
-        await claimSharedCallableId(tx, found.poolId, found.granteeUserId, ownerUserId);
       await tx.share.update({
         where: { id: found.id },
         data: {

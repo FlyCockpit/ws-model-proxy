@@ -1,12 +1,15 @@
 /**
- * Model-name collisions cannot be raced (lib/model-names.ts), against real PostgreSQL with the
- * schema hardening (`pnpm test:postgres`). Every writer that adds a name to a person's
- * namespace holds that person's owner fence while it checks and writes, so of two concurrent
- * writers that would each pass the check alone, exactly one wins and the other is refused.
+ * Model-name collisions (lib/model-names.ts), against real PostgreSQL with the schema hardening
+ * (`pnpm test:postgres`).
  *
- * Each race starts both writers while a blocker transaction holds the share holder's owner
- * fence, so both have read their plan and wait at the same point; the blocker then lets go.
- * Before the fences, both passed the check and both committed.
+ * - A person's own actions cannot be raced into a clash in their own namespace: each writer
+ *   holds their owner fence while it checks and writes, so of two concurrent writers that would
+ *   each pass the check alone, exactly one wins and the other is refused.
+ * - Someone else's alias never refuses an action (sharing, can use, invites, renames): an alias
+ *   named like a pool ID shared with its person wins for them, and they see it marked.
+ *
+ * Each race starts both writers while a blocker transaction holds a fence both need, so both
+ * have read their plan and wait at the same point; the blocker then lets go.
  */
 import { createRouterClient } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
@@ -98,12 +101,6 @@ integration("model-name collisions on PostgreSQL", () => {
     });
   }
 
-  async function share(owner: Person, grantee: Person, poolId: string) {
-    await need().fixtures.share.create({
-      data: { poolId, ownerUserId: owner.id, granteeUserId: grantee.id, canUse: true },
-    });
-  }
-
   function as(user: Person) {
     const session = {
       user: { ...user, role: "user", emailVerified: true, twoFactorEnabled: false },
@@ -179,15 +176,13 @@ integration("model-name collisions on PostgreSQL", () => {
     expect([...refusals, "CONFLICT"]).toContain(reasonOf(lost));
   }
 
-  /** Whether `user` has an alias named like one of their callable IDs (the invariant). */
-  async function clashes(user: Person): Promise<string[]> {
+  /** Aliases of `user` named like one of their OWN pools' callable IDs (the invariant). */
+  async function ownClashes(user: Person): Promise<string[]> {
     const { fixtures } = need();
     const [aliases, pools] = await Promise.all([
       fixtures.modelAlias.findMany({ where: { userId: user.id }, select: { name: true } }),
       fixtures.pool.findMany({
-        where: {
-          OR: [{ userId: user.id }, { Shares: { some: { granteeUserId: user.id, canUse: true } } }],
-        },
+        where: { userId: user.id },
         select: { slug: true, User: { select: { slug: true } } },
       }),
     ]);
@@ -195,22 +190,77 @@ integration("model-name collisions on PostgreSQL", () => {
     return aliases.map((alias) => alias.name).filter((name) => ids.has(name));
   }
 
-  it("a pool rename and a share holder's alias of the new callable ID: one wins", async () => {
+  it("a person's pool rename and their own alias of the new callable ID: one wins", async () => {
     const ann = await person("ann1");
-    const bob = await person("bob1");
     const chat = await pool(ann, "chat");
-    await share(ann, bob, chat.id);
-    const outcomes = await race(bob, [
+    const other = await pool(ann, "other");
+    const outcomes = await race(ann, [
       () => as(ann).pools.update({ poolId: chat.id, slug: "talk" }),
-      () => as(bob).pools.aliases.set({ name: `${ann.slug}/talk`, poolId: chat.id }),
+      () => as(ann).pools.aliases.set({ name: `${ann.slug}/talk`, poolId: other.id }),
     ]);
-    oneWon(outcomes, ["name_unavailable", "alias_shadowed"]);
-    expect(await clashes(bob)).toEqual([]);
+    oneWon(outcomes, ["name_aliased", "alias_shadowed"]);
+    expect(await ownClashes(ann)).toEqual([]);
   });
 
-  it("a share grant and the recipient's alias of the pool's callable ID: one wins", async () => {
+  it("a person's pool create and their own alias of its callable ID: one wins", async () => {
     const ann = await person("ann2");
-    const bob = await person("bob2");
+    const other = await pool(ann, "other");
+    const outcomes = await race(ann, [
+      () => as(ann).pools.create({ slug: "next", name: "Next", type: "LLM" }),
+      () => as(ann).pools.aliases.set({ name: `${ann.slug}/next`, poolId: other.id }),
+    ]);
+    oneWon(outcomes, ["name_aliased", "alias_shadowed"]);
+    expect(await ownClashes(ann)).toEqual([]);
+  });
+
+  it("a person's account slug change and their own alias of a renamed callable ID: one wins", async () => {
+    const ann = await person("ann3");
+    await pool(ann, "chat");
+    const other = await pool(ann, "other");
+    const renamed = `ann3-new-${suffix}`;
+    people.push({ ...ann, slug: renamed });
+    const outcomes = await race(ann, [
+      () => as(ann).settings.update({ slug: renamed }),
+      () => as(ann).pools.aliases.set({ name: `${renamed}/chat`, poolId: other.id }),
+    ]);
+    // The alias is not a callable ID until the rename commits, so if it went first the rename
+    // is refused; if the rename went first, the alias is.
+    oneWon(outcomes, ["name_aliased", "alias_shadowed"]);
+    expect(await ownClashes(ann)).toEqual([]);
+  });
+
+  /**
+   * The share (or can use, or accepted invite) always lands; the recipient's alias either came
+   * first and now wins for them (marked as hiding the pool; models.list names the alias's pool
+   * under that ID), or came second and was refused. Never both refused, never an unmarked clash.
+   */
+  async function shareAlwaysLands(
+    bob: Person,
+    callableId: string,
+    pools: { shared: string; own: string },
+    outcomes: PromiseSettledResult<unknown>[],
+  ) {
+    expect(outcomes[0]?.status).toBe("fulfilled");
+    const aliasOutcome = outcomes[1];
+    const { aliases } = await as(bob).pools.aliases.list({});
+    const { models } = await as(bob).models.list();
+    const listed = models.filter((model) => model.callableId === callableId);
+    if (aliasOutcome?.status === "fulfilled") {
+      expect(aliases.find((alias) => alias.name === callableId)?.hides).toEqual({
+        callableId,
+        shared: true,
+      });
+      expect(listed.map((model) => model.poolId)).toEqual([pools.own]);
+    } else {
+      expect(reasonOf(aliasOutcome)).toBe("alias_shadowed");
+      expect(aliases.some((alias) => alias.name === callableId)).toBe(false);
+      expect(listed.map((model) => model.poolId)).toEqual([pools.shared]);
+    }
+  }
+
+  it("a share grant racing the recipient's alias of its callable ID: the share always lands", async () => {
+    const ann = await person("ann4");
+    const bob = await person("bob4");
     const chat = await pool(ann, "chat");
     const own = await pool(bob, "own");
     const outcomes = await race(bob, [
@@ -226,62 +276,13 @@ integration("model-name collisions on PostgreSQL", () => {
         }),
       () => as(bob).pools.aliases.set({ name: `${ann.slug}/chat`, poolId: own.id }),
     ]);
-    oneWon(outcomes, ["name_unavailable", "alias_shadowed"]);
-    expect(await clashes(bob)).toEqual([]);
+    await shareAlwaysLands(bob, `${ann.slug}/chat`, { shared: chat.id, own: own.id }, outcomes);
   });
 
-  it("an account slug change and a holder's alias of a renamed callable ID: one wins", async () => {
-    const ann = await person("ann3");
-    const bob = await person("bob3");
-    const chat = await pool(ann, "chat");
-    await share(ann, bob, chat.id);
-    const renamed = `ann3-new-${suffix}`;
-    people.push({ ...ann, slug: renamed });
-    const outcomes = await race(bob, [
-      () => as(ann).settings.update({ slug: renamed }),
-      () => as(bob).pools.aliases.set({ name: `${renamed}/chat`, poolId: chat.id }),
-    ]);
-    // The alias is not a callable ID until the rename commits, so if it went first the rename
-    // is refused; if the rename went first, the alias is.
-    oneWon(outcomes, ["name_unavailable", "alias_shadowed"]);
-    expect(await clashes(bob)).toEqual([]);
-  });
-
-  it("an invite link acceptance and the recipient's alias of the pool's callable ID: one wins", async () => {
+  it("turning can use on racing the holder's alias of its callable ID: it always lands", async () => {
     const { fixtures } = need();
-    const { acceptShareInviteByLink } = await import("../lib/share-invite-accept");
-    const { generateShareInviteToken, shareInviteDigest } = await import("../lib/share-invites");
     const ann = await person("ann5");
     const bob = await person("bob5");
-    const chat = await pool(ann, "chat");
-    const own = await pool(bob, "own");
-    const token = generateShareInviteToken();
-    await fixtures.shareInvite.create({
-      data: {
-        poolId: chat.id,
-        ownerUserId: ann.id,
-        email: `someone-${suffix}@example.test`,
-        tokenDigest: shareInviteDigest(token),
-        expiresAt: new Date(Date.now() + 86_400_000),
-      },
-    });
-    let accepted: unknown;
-    const outcomes = await race(bob, [
-      async () => {
-        accepted = await acceptShareInviteByLink(bob, token);
-        if (accepted === "name_taken")
-          throw Object.assign(new Error("taken"), { code: "name_taken" });
-      },
-      () => as(bob).pools.aliases.set({ name: `${ann.slug}/chat`, poolId: own.id }),
-    ]);
-    oneWon(outcomes, ["name_taken", "alias_shadowed"]);
-    expect(await clashes(bob)).toEqual([]);
-  });
-
-  it("turning can use on and the holder's alias of the pool's callable ID: one wins", async () => {
-    const { fixtures } = need();
-    const ann = await person("ann6");
-    const bob = await person("bob6");
     const chat = await pool(ann, "chat");
     const own = await pool(bob, "own");
     const row = await fixtures.share.create({
@@ -298,8 +299,35 @@ integration("model-name collisions on PostgreSQL", () => {
       () => as(ann).access.shares.update({ shareId: row.id, canUse: true }),
       () => as(bob).pools.aliases.set({ name: `${ann.slug}/chat`, poolId: own.id }),
     ]);
-    oneWon(outcomes, ["name_unavailable", "alias_shadowed"]);
-    expect(await clashes(bob)).toEqual([]);
+    await shareAlwaysLands(bob, `${ann.slug}/chat`, { shared: chat.id, own: own.id }, outcomes);
+  });
+
+  it("an invite link acceptance racing the recipient's alias: the accept always lands", async () => {
+    const { fixtures } = need();
+    const { acceptShareInviteByLink } = await import("../lib/share-invite-accept");
+    const { generateShareInviteToken, shareInviteDigest } = await import("../lib/share-invites");
+    const ann = await person("ann6");
+    const bob = await person("bob6");
+    const chat = await pool(ann, "chat");
+    const own = await pool(bob, "own");
+    const token = generateShareInviteToken();
+    await fixtures.shareInvite.create({
+      data: {
+        poolId: chat.id,
+        ownerUserId: ann.id,
+        email: `someone-${suffix}@example.test`,
+        tokenDigest: shareInviteDigest(token),
+        expiresAt: new Date(Date.now() + 86_400_000),
+      },
+    });
+    const outcomes = await race(bob, [
+      async () => {
+        const accepted = await acceptShareInviteByLink(bob, token);
+        if (accepted !== "accepted") throw new Error(`not accepted: ${accepted}`);
+      },
+      () => as(bob).pools.aliases.set({ name: `${ann.slug}/chat`, poolId: own.id }),
+    ]);
+    await shareAlwaysLands(bob, `${ann.slug}/chat`, { shared: chat.id, own: own.id }, outcomes);
   });
 
   it("the check refuses to run without the claimant's owner fence", async () => {
@@ -319,24 +347,13 @@ integration("model-name collisions on PostgreSQL", () => {
     ).resolves.toEqual([]);
   });
 
-  it("refuses every writer against a name already taken", async () => {
-    const ann = await person("ann4");
-    const bob = await person("bob4");
+  it("never refuses an owner over a recipient's alias; still refuses the person's own", async () => {
+    const ann = await person("ann8");
+    const bob = await person("bob8");
     const chat = await pool(ann, "chat");
     const own = await pool(bob, "own");
     await as(bob).pools.aliases.set({ name: `${ann.slug}/chat`, poolId: own.id });
-    await expect(
-      as(ann).access.shares.create({
-        poolId: chat.id,
-        email: bob.email,
-        canUse: true,
-        canContribute: false,
-        priorityClass: null,
-        protectionPercent: null,
-        monthlyCap: null,
-      }),
-    ).rejects.toMatchObject({ data: { reason: "name_unavailable" } });
-    // A can-contribute share names nothing; turning can use on is refused.
+    await as(bob).pools.aliases.set({ name: `${ann.slug}/talk`, poolId: own.id });
     const created = await as(ann).access.shares.create({
       poolId: chat.id,
       email: bob.email,
@@ -347,10 +364,27 @@ integration("model-name collisions on PostgreSQL", () => {
       monthlyCap: null,
     });
     if (created.kind !== "share") throw new Error("expected a direct share");
-    await expect(
-      as(ann).access.shares.update({ shareId: created.share.id, canUse: true }),
-    ).rejects.toMatchObject({ data: { reason: "name_unavailable" } });
-    // The owner's own alias is named as theirs.
+    // Can use on, then a rename onto bob's other alias: neither looks at bob's names.
+    await as(ann).access.shares.update({ shareId: created.share.id, canUse: true });
+    await as(ann).pools.update({ poolId: chat.id, slug: "talk" });
+    const { aliases } = await as(bob).pools.aliases.list({});
+    expect(
+      aliases.map((alias) => [alias.name, alias.hides?.callableId ?? null, alias.usable]).sort(),
+    ).toEqual([
+      [`${ann.slug}/chat`, null, true],
+      [`${ann.slug}/talk`, `${ann.slug}/talk`, true],
+    ]);
+    // `ann/talk` is listed once, as the pool bob's alias reaches.
+    expect(
+      (await as(bob).models.list()).models.map((model) => [model.callableId, model.poolId]),
+    ).toEqual([
+      [`${bob.slug}/own`, own.id],
+      [`${ann.slug}/talk`, own.id],
+    ]);
+    const { sharedWithMe } = await as(bob).pools.list();
+    expect(sharedWithMe.find((entry) => entry.poolId === chat.id)?.hiddenByAlias).toBe(true);
+
+    // The person's own aliases still refuse their own renames and creates.
     await as(ann).pools.aliases.set({ name: `${ann.slug}/next`, poolId: chat.id });
     await expect(as(ann).pools.update({ poolId: chat.id, slug: "next" })).rejects.toMatchObject({
       data: { reason: "name_aliased" },
@@ -358,7 +392,11 @@ integration("model-name collisions on PostgreSQL", () => {
     await expect(
       as(ann).pools.create({ slug: "next", name: "Next", type: "LLM" }),
     ).rejects.toMatchObject({ data: { reason: "name_aliased" } });
-    expect(await clashes(ann)).toEqual([]);
-    expect(await clashes(bob)).toEqual([]);
+    // And a new alias may not take a pool ID the person can call now.
+    await expect(
+      as(bob).pools.aliases.set({ name: `${bob.slug}/own`, poolId: own.id }),
+    ).rejects.toMatchObject({ data: { reason: "alias_shadowed" } });
+    expect(await ownClashes(ann)).toEqual([]);
+    expect(await ownClashes(bob)).toEqual([]);
   });
 });

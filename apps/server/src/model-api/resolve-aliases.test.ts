@@ -45,28 +45,35 @@ beforeEach(() => {
   db.pool.findMany.mockResolvedValue([pool("a"), pool("b")] as never);
   db.share.findMany.mockResolvedValue([]);
   db.runtimeModel.findMany.mockResolvedValue([]);
-  const rows = [
+  db.modelAlias.findMany.mockResolvedValue([
     { name: "gpt-4o", poolId: "a", apiKeyId: null },
     { name: "gpt-4o", poolId: "b", apiKeyId: "key-1" },
     { name: "claude", poolId: "a", apiKeyId: null },
-  ];
-  db.modelAlias.findMany.mockImplementation((async (args: {
-    where: { OR: Array<{ apiKeyId: string | null }> };
-  }) =>
-    rows.filter((row) => args.where.OR.some((scope) => scope.apiKeyId === row.apiKeyId))) as never);
+    { name: "other-key", poolId: "a", apiKeyId: "key-2" },
+  ] as never);
+});
+
+const sharedPool = (id: string, ownerSlug: string, user: Record<string, unknown> = {}) => ({
+  id: `s-${id}`,
+  ownKeyProviderModelId: null,
+  Pool: { ...pool(id), userId: "o", User: { slug: ownerSlug, ...active, ...user } },
 });
 
 describe("caller aliases", () => {
+  it("reads every alias of the person once, whatever the key", async () => {
+    db.apiKeyPool.findMany.mockResolvedValue([{ poolId: "b" }] as never);
+    await listCallableTargetsForApiKey(key);
+    expect(db.modelAlias.findMany).toHaveBeenCalledTimes(1);
+    expect(db.modelAlias.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { userId: "u" } }),
+    );
+  });
+
   it("a key's alias wins over the user's, and only callable pools count", async () => {
     db.apiKeyPool.findMany.mockResolvedValue([{ poolId: "b" }] as never);
     const targets = await listCallableTargetsForApiKey(key);
-    expect(db.modelAlias.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { userId: "u", OR: [{ apiKeyId: null }, { apiKeyId: "key-1" }] },
-      }),
-    );
     expect(targets.pools.map((entry) => entry.id)).toEqual(["b"]);
-    // "claude" names pool a, which this key cannot call: dropped.
+    // "claude" names pool a, which this key cannot call: dropped. Another key's alias never counts.
     expect(targets.aliases).toEqual([{ name: "gpt-4o", poolId: "b" }]);
   });
 
@@ -80,42 +87,50 @@ describe("caller aliases", () => {
     ]);
   });
 
-  it("an alias named like a callable ID is never used, through any key (a clash from before the check)", async () => {
-    const rows = [
-      // Shadowed by the user's own pool a (`me/a`), which this key cannot call.
-      { name: "me/a", poolId: "b", apiKeyId: null },
-      // Shadowed by a share whose owner is inactive: still in the namespace.
-      { name: "gone/x", poolId: "b", apiKeyId: "key-1" },
-      { name: "free", poolId: "b", apiKeyId: null },
-    ];
-    db.modelAlias.findMany.mockResolvedValue(rows as never);
-    db.share.findMany.mockResolvedValue([
-      {
-        id: "s1",
-        ownKeyProviderModelId: null,
-        Pool: {
-          ...pool("x"),
-          userId: "o",
-          User: { slug: "gone", banned: true, banExpires: null, deletionRequestedAt: null },
-        },
-      },
-    ] as never);
-    db.apiKeyPool.findMany.mockResolvedValue([{ poolId: "b" }] as never);
-    const viaKey = await listCallableTargetsForApiKey(key);
-    expect(viaKey.pools.map((entry) => entry.id)).toEqual(["b"]);
-    expect(viaKey.aliases).toEqual([{ name: "free", poolId: "b" }]);
-    const viaSession = await listCallableTargetsForUser("u");
-    expect(viaSession.aliases).toEqual([{ name: "free", poolId: "b" }]);
-  });
-
   it("sessions see the user's aliases only", async () => {
     const targets = await listCallableTargetsForUser("u");
-    expect(db.modelAlias.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { userId: "u", OR: [{ apiKeyId: null }] } }),
-    );
     expect(targets.aliases).toEqual([
       { name: "gpt-4o", poolId: "a" },
       { name: "claude", poolId: "a" },
     ]);
+  });
+});
+
+describe("an alias wins over the callable ID it is named like", () => {
+  it("hides the shared pool's ID for the person, through every key, and keeps the alias", async () => {
+    db.share.findMany.mockResolvedValue([sharedPool("chat", "ann")] as never);
+    db.modelAlias.findMany.mockResolvedValue([
+      // bob's alias from before ann shared `ann/chat` with him.
+      { name: "ann/chat", poolId: "a", apiKeyId: null },
+      // A key-scoped alias of another key hides it too: a name means the same everywhere.
+      { name: "me/b", poolId: "a", apiKeyId: "key-2" },
+      // Named like the pool it points at: hides nothing.
+      { name: "me/a", poolId: "a", apiKeyId: null },
+    ] as never);
+    const viaSession = await listCallableTargetsForUser("u");
+    expect([...viaSession.shadowed].sort()).toEqual(["ann/chat", "me/b"]);
+    expect(viaSession.aliases).toEqual([
+      { name: "ann/chat", poolId: "a" },
+      { name: "me/a", poolId: "a" },
+    ]);
+    // The pools stay callable (by id, and as other aliases' targets).
+    expect(viaSession.pools.map((entry) => entry.id)).toEqual(["a", "b", "chat"]);
+
+    db.apiKeyPool.findMany.mockResolvedValue([{ poolId: "chat" }] as never);
+    const viaKey = await listCallableTargetsForApiKey(key);
+    // This key cannot call pool a, so the alias is not usable through it, and the ID stays hidden.
+    expect(viaKey.aliases).toEqual([]);
+    expect([...viaKey.shadowed].sort()).toEqual(["ann/chat", "me/b"]);
+  });
+
+  it("a share whose owner is inactive is not callable, so nothing of it is hidden", async () => {
+    db.share.findMany.mockResolvedValue([sharedPool("x", "gone", { banned: true })] as never);
+    db.modelAlias.findMany.mockResolvedValue([
+      { name: "gone/x", poolId: "a", apiKeyId: null },
+    ] as never);
+    const targets = await listCallableTargetsForUser("u");
+    expect(targets.pools.map((entry) => entry.id)).toEqual(["a", "b"]);
+    expect(targets.shadowed.size).toBe(0);
+    expect(targets.aliases).toEqual([{ name: "gone/x", poolId: "a" }]);
   });
 });

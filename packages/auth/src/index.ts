@@ -509,10 +509,10 @@ export const auth = betterAuth({
         },
       },
       update: {
-        // The account slug is the first half of every callable ID of the person's pools, in
-        // their share holders' namespaces too: it changes only through `settings.update`, which
-        // claims the renamed IDs under everyone's owner fences (packages/api lib/model-names.ts).
-        // Better Auth's update routes (`/update-user`, `/admin/update-user`) cannot take them.
+        // The account slug is the first half of every callable ID of the person's pools: it
+        // changes only through `settings.update`, which claims the renamed IDs against the
+        // person's own aliases under their owner fence (packages/api lib/model-names.ts).
+        // Better Auth's update routes (`/update-user`, `/admin/update-user`) cannot take it.
         before: async (data) => {
           if ((data as { slug?: unknown }).slug !== undefined) throw slugChangeRefused();
         },

@@ -44,8 +44,9 @@ model ApiKeyPool {
 
 /// A model name a caller's harness hard-codes (`gpt-4o`, `claude-sonnet-4-5`) mapped to one of
 /// the pools the caller may use. Lives in the caller's namespace: for every key of the user, or
-/// for one key (which wins). Resolves only while the pool is callable with the key in use;
-/// callable IDs always win over an alias. Configuration, not access: agents may manage it.
+/// for one key (which wins). Resolves only while the pool is callable with the key in use; an
+/// alias named like a callable ID of its person wins over that pool for them (api
+/// lib/model-names.ts). Configuration, not access: agents may manage it.
 model ModelAlias {
   id        String   @id @default(cuid(2))
   createdAt DateTime @default(now())

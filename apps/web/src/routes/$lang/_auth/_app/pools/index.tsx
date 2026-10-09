@@ -141,7 +141,8 @@ function PoolsPage() {
                         <p className="text-sm text-muted-foreground">
                           {t("dashboard:models.sharedBy", { owner: shared.ownerEmail })}
                         </p>
-                        {shared.canUse
+                        {/* A hidden ID reaches the alias's pool: nothing to copy. */}
+                        {shared.canUse && !shared.hiddenByAlias
                           ? shared.callableIds.map((id) => (
                               <CopyableCode
                                 key={id}
@@ -156,6 +157,9 @@ function PoolsPage() {
                           ) : null}
                           {shared.canContribute ? (
                             <StatusPill tone="info">{t("dashboard:pool.canContribute")}</StatusPill>
+                          ) : null}
+                          {shared.hiddenByAlias ? (
+                            <StatusPill tone="busy">{t("dashboard:pool.hiddenByAlias")}</StatusPill>
                           ) : null}
                         </div>
                       </CardContent>
