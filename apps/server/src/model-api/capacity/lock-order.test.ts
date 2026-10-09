@@ -81,7 +81,7 @@ const ADVISORY_SITES: Record<string, string> = {
 /** Files allowed to name the fence protocol (function or setting), and why. */
 const FENCE_PROTOCOL_SITES: Record<string, string> = {
   "packages/db/src/capacity-lock-order.ts":
-    "acquireFences, the only caller of wsmp_acquire_fences.",
+    "acquireFences, the only caller of wsmp_acquire_fences; requireOwnerFences reads the held set.",
   "packages/db/prisma/schema-hardening.sql":
     "Defines the protocol, the graph-write fence triggers and the deploy's bypass marker.",
   "packages/db/src/test-fixture-client.ts":

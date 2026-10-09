@@ -156,16 +156,23 @@ export type CallableTargets = {
   pools: CallablePool[];
   tests: TestTarget[];
   aliases: ModelAliasTarget[];
+  /** Every callable ID in the user's namespace, also those this caller cannot use now. */
+  shadowing?: ReadonlySet<string>;
 };
 
 /**
  * The aliases a caller may use: the user's (and the key's, which win), pointing only at pools
- * in `pools` (an alias never widens access).
+ * in `pools` (an alias never widens access). `shadowing` holds every callable ID in the user's
+ * namespace (own pools and can-use shares, whatever the key's scope or the owner's state): an
+ * alias with one of those names is never used. Writers keep such clashes from arising
+ * (packages/api lib/model-names.ts); one from before that check thus routes the same through
+ * every key, to the pool or nowhere, and aliases.list shows the alias as not usable.
  */
 async function effectiveAliases(
   userId: string,
   apiKeyId: string | null,
   pools: readonly CallablePool[],
+  shadowing: ReadonlySet<string>,
 ): Promise<ModelAliasTarget[]> {
   const rows = await prisma.modelAlias.findMany({
     where: { userId, OR: [{ apiKeyId: null }, ...(apiKeyId ? [{ apiKeyId }] : [])] },
@@ -180,7 +187,8 @@ async function effectiveAliases(
   for (const row of [...rows].sort(
     (a, b) => Number(a.apiKeyId !== null) - Number(b.apiKeyId !== null),
   ))
-    if (callable.has(row.poolId)) byName.set(row.name, { name: row.name, poolId: row.poolId });
+    if (callable.has(row.poolId) && !shadowing.has(row.name))
+      byName.set(row.name, { name: row.name, poolId: row.poolId });
   return [...byName.values()];
 }
 
@@ -300,6 +308,7 @@ export async function listCallableTargetsForUser(
       .filter((share) => poolOwnerActive(share.Pool.User, now))
       .map((share) => callablePool(share.Pool, share)),
   ];
+  const shadowing = callableIdsOf(owned, shares);
   const tests: TestTarget[] = models.map((model) => ({
     target: "TEST",
     id: model.id,
@@ -310,7 +319,24 @@ export async function listCallableTargetsForUser(
     ownerUserSlug: model.Runtime.User.slug,
     maxAttachmentBytes: null,
   }));
-  return { pools, tests, aliases: await effectiveAliases(userId, null, pools) };
+  return {
+    pools,
+    tests,
+    aliases: await effectiveAliases(userId, null, pools, shadowing),
+    shadowing,
+  };
+}
+
+/** Every callable ID in a user's namespace (own pools, can-use shares, owner active or not). */
+function callableIdsOf(
+  owned: readonly PoolSelected[],
+  shares: readonly { Pool: PoolSelected }[],
+): ReadonlySet<string> {
+  return new Set(
+    [...owned, ...shares.map((share) => share.Pool)].map(
+      (pool) => `${pool.User.slug}/${pool.slug}`,
+    ),
+  );
 }
 
 /** An API key reaches pools only (ALL_POOLS: every callable pool; SELECTED_POOLS: its list). */
@@ -328,7 +354,13 @@ export async function listCallableTargetsForApiKey(
     );
     pools = all.pools.filter((pool) => selected.has(pool.id));
   }
-  return { pools, tests: [], aliases: await effectiveAliases(key.userId, key.id, pools) };
+  const shadowing = all.shadowing ?? new Set<string>();
+  return {
+    pools,
+    tests: [],
+    aliases: await effectiveAliases(key.userId, key.id, pools, shadowing),
+    shadowing,
+  };
 }
 
 // ── Route rows ──

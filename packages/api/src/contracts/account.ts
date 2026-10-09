@@ -2,6 +2,7 @@
  * Account, admin and kept plumbing: `app`, `auth` (kept unchanged), `settings` (per user),
  * `users` (admin, kept), `adminObservability`, `adminSettings`.
  */
+import { isValidForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import { SUPPORTED_LOCALES } from "@ws-model-proxy/config/locales";
 import { SHARE_INVITE_TOKEN_PATTERN } from "@ws-model-proxy/config/share-invite";
 import { z } from "zod";
@@ -21,6 +22,11 @@ import {
 import { mutation, query } from "./procedure";
 
 const successSchema = z.object({ success: z.literal(true) }).strict();
+/** An account slug a person chooses (as at sign-up): the forwarder slug shape, not reserved. */
+const userSlugSchema = z
+  .string()
+  .trim()
+  .refine(isValidForwarderSlug, "3–63 lowercase letters, digits and inner hyphens; not reserved.");
 const localeSchema = z.enum(SUPPORTED_LOCALES);
 
 const adminPageInput = {
@@ -101,8 +107,8 @@ export const authContract = {
   acceptInvite: mutation(
     "human",
     z.object({ token: z.string().regex(SHARE_INVITE_TOKEN_PATTERN) }).strict(),
-    z.object({ result: z.enum(["accepted", "invalid", "own", "in_use"]) }).strict(),
-    "Accept a pool or runtime invite link as the signed-in person, whatever their e-mail (the token is the proof). own: the invite is to something you own.",
+    z.object({ result: z.enum(["accepted", "invalid", "own", "in_use", "name_taken"]) }).strict(),
+    "Accept a pool or runtime invite link as the signed-in person, whatever their e-mail (the token is the proof). own: the invite is to something you own. name_taken: one of your model-name aliases has the pool's callable ID; remove it, then accept again.",
   ),
   verifyEmailTransport: query(
     "public",
@@ -143,12 +149,18 @@ export const settingsContract = {
     z
       .object({
         name: nameSchema.optional(),
+        /**
+         * Your account slug, the first half of every callable ID of your pools (also for the
+         * people they are shared with). Refused when a new callable ID would equal a model-name
+         * alias of yours (name_aliased) or of a share holder (name_unavailable).
+         */
+        slug: userSlugSchema.optional(),
         locale: localeSchema.optional(),
         operationalAlerts: z.boolean().optional(),
       })
       .strict(),
     userSettingsSchema,
-    "Change your name, locale or alert e-mails.",
+    "Change your name, slug, locale or alert e-mails.",
   ),
   onboarding: {
     complete: mutation(

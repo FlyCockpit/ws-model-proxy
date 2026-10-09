@@ -342,9 +342,11 @@ function AcceptInviteCard({
           {refusal ??
             (result === "in_use"
               ? t("auth:invite.inUse")
-              : runtime
-                ? t("auth:invite.runtimeSignedInDescription", { ownerName, name })
-                : t("auth:invite.signedInDescription", { ownerName, callableId: name }))}
+              : result === "name_taken"
+                ? t("auth:invite.nameTaken", { callableId: name })
+                : runtime
+                  ? t("auth:invite.runtimeSignedInDescription", { ownerName, name })
+                  : t("auth:invite.signedInDescription", { ownerName, callableId: name }))}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">

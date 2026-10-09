@@ -308,7 +308,17 @@ with the clients you already use, including harnesses you cannot change:
   `anthropic-beta`, `OpenAI-Beta`, ...) and response shaping (reasoning field,
   strict-SDK cleanup). Agents can edit them; every edit is a version.
 - **Model-name aliases**: map `gpt-4o` or `claude-sonnet-4-5` to one of your
-  pools, for all keys or one key. `/v1/models` lists them.
+  pools, for all keys or one key. `/v1/models` lists them. An alias can never
+  share a name with one of your callable IDs: setting the alias, creating or
+  renaming a pool, sharing a pool with you (or turning on can use), accepting an
+  invite, and changing an account slug are each refused when they would make
+  one equal, also when two of them happen at once. An owner whose share or
+  rename clashes with someone else's alias is told only that the name is not
+  available to a person the pool is shared with. A clash already in a database
+  from an earlier preview keeps routing to the pool (callable IDs win), and the
+  alias shows as not usable until it is removed. The account slug now changes
+  only through the settings API (`settings.update`), not through Better Auth's
+  update routes.
 - **Auth styles**: the model API accepts `Authorization: Bearer`, `x-api-key`
   and `api-key`.
 - Requests show what was dropped or rewritten, and usage an engine did not

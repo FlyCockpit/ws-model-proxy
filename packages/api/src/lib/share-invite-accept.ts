@@ -22,7 +22,9 @@ import {
 } from "@ws-model-proxy/auth/share-invite-acceptance";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { fenceOwners, runCapacityOrderedTransaction } from "@ws-model-proxy/db/capacity-lock-order";
+import { callableIdOf } from "./access-views";
 import { type InviteAcceptance, inviteAcceptance, inviteEmailKey } from "./invite-acceptance";
+import { modelNameClashes } from "./model-names";
 import {
   claimUnchangedWhere,
   pendingInviteWhere,
@@ -60,9 +62,10 @@ type InviteRow = Prisma.ShareInviteGetPayload<{ select: typeof inviteSelect }>;
 
 /**
  * What became of an invite link: accepted (now or already a share), or not (`own`: the invite
- * is to the person's own pool or runtime).
+ * is to the person's own pool or runtime; `name_taken`: one of the person's model-name aliases
+ * has the pool's callable ID, and the invite stays pending until they remove it).
  */
-export type LinkAcceptance = "accepted" | "invalid" | "own" | "in_use";
+export type LinkAcceptance = "accepted" | "invalid" | "own" | "in_use" | "name_taken";
 
 /** Pending, plus whatever extra condition the caller holds the invite under. */
 function liveInviteWhere(now: Date, guard: InviteWhere): InviteWhere {
@@ -77,12 +80,16 @@ function linkHoldWhere(tokenDigest: string, claim: SignupClaim): InviteWhere {
   return { tokenDigest, ...claimUnchangedWhere(claim) };
 }
 
-/** The pool share, or runtime share, the invite becomes; `created` when it did not exist. */
+/**
+ * The pool share, or runtime share, the invite becomes; `created` when it did not exist. Null
+ * when a new can-use pool share would give the person a callable ID one of their aliases already
+ * has (lib/model-names.ts; the caller holds their owner fence): nothing is written.
+ */
 async function shareFor(
   tx: Tx,
   invite: InviteRow,
   userId: string,
-): Promise<{ data: { shareId: string } | { runtimeShareId: string }; created: boolean }> {
+): Promise<{ data: { shareId: string } | { runtimeShareId: string }; created: boolean } | null> {
   if (invite.runtimeId !== null) {
     const where = {
       runtimeId_granteeUserId: { runtimeId: invite.runtimeId, granteeUserId: userId },
@@ -102,6 +109,18 @@ async function shareFor(
     select: { id: true },
   });
   if (existing) return { data: { shareId: existing.id }, created: false };
+  if (invite.canUse) {
+    const pool = await tx.pool.findUnique({
+      where: { id: invite.poolId },
+      select: { slug: true, User: { select: { slug: true } } },
+    });
+    const clashes = pool
+      ? await modelNameClashes(tx, [
+          { userId, callableIds: [callableIdOf(pool.User.slug, pool.slug)] },
+        ])
+      : [];
+    if (clashes.length > 0) return null;
+  }
   const created = await tx.share.create({
     data: {
       poolId: invite.poolId,
@@ -116,15 +135,22 @@ async function shareFor(
   return { data: { shareId: created.id }, created: true };
 }
 
+/**
+ * `created` / `existing`: the invite is accepted as a new or an existing share. `name_taken`:
+ * left pending, since the share would clash with one of the person's aliases.
+ */
+type AcceptOutcome = "created" | "existing" | "own" | "name_taken";
+
 async function acceptOne(
   tx: Tx,
   invite: InviteRow,
   userId: string,
   now: Date,
   guard: InviteWhere = {},
-): Promise<boolean> {
-  if (invite.ownerUserId === userId) return false;
+): Promise<AcceptOutcome> {
+  if (invite.ownerUserId === userId) return "own";
   const share = await shareFor(tx, invite, userId);
+  if (!share) return "name_taken";
   // Guarded on still pending (and the caller's hold): a concurrent accept or revoke wins and
   // this one rolls back.
   const updated = await tx.shareInvite.updateMany({
@@ -132,7 +158,7 @@ async function acceptOne(
     data: { acceptedAt: now, ...share.data },
   });
   if (updated.count !== 1) throw new InviteChangedError();
-  return share.created;
+  return share.created ? "created" : "existing";
 }
 
 /** Applies a decision under the fences of the account and every inviting owner. */
@@ -154,7 +180,10 @@ async function applyAcceptance(
       select: inviteSelect,
     });
     let created = 0;
-    for (const invite of current) if (await acceptOne(tx, invite, userId, now)) created += 1;
+    // An invite whose share would clash with one of the person's aliases stays pending: they
+    // accept it through its link once the alias is gone, and the link page says why.
+    for (const invite of current)
+      if ((await acceptOne(tx, invite, userId, now)) === "created") created += 1;
     return created;
   });
 }
@@ -245,8 +274,8 @@ async function acceptLink(
         select: inviteSelect,
       });
       if (!current) return "invalid";
-      await acceptOne(tx, current, user.id, now, guard);
-      return "accepted";
+      const outcome = await acceptOne(tx, current, user.id, now, guard);
+      return outcome === "name_taken" ? "name_taken" : "accepted";
     });
   } catch (error) {
     // Lost the guarded write to a concurrent change: the transaction rolled back.

@@ -266,7 +266,7 @@ function ChangeSlugDialog({ pool, onClose }: { pool: PoolView; onClose: () => vo
         onClose();
       } catch (error) {
         toast.error(
-          refusalReason(error) === "alias_shadowed"
+          refusalReason(error) === "name_aliased"
             ? t("dashboard:pool.danger.slugAliased")
             : refusalText(error),
         );

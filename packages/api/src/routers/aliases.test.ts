@@ -46,11 +46,22 @@ function aliasRow(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/** Every fence requested through `wsmp_acquire_fences`, in request order. */
+function heldFences(): string[] {
+  return db.$queryRaw.mock.calls.flatMap((call) => (Array.isArray(call[1]) ? call[1] : []));
+}
+
 beforeEach(() => {
   mockReset(db);
   db.pool.findMany.mockResolvedValue(POOLS as never);
+  db.pool.findFirst.mockResolvedValue(null);
   db.$transaction.mockImplementation((async (work: unknown) =>
     typeof work === "function" ? work(db) : undefined) as never);
+  // The fence protocol: requireOwnerFences reads back what acquireFences took.
+  db.$queryRaw.mockImplementation((async (query: TemplateStringsArray) =>
+    query.join("").includes("current_setting('wsmp.fences'")
+      ? [{ held: `,${heldFences().join(",")},` }]
+      : [{ acquired: true }]) as never);
 });
 
 describe("model-name aliases", () => {
@@ -129,9 +140,17 @@ describe("model-name aliases", () => {
   });
 
   it("refuses a name that is a callable ID, a key it cannot use, and past the limit", async () => {
+    db.pool.findFirst.mockResolvedValueOnce({ id: "pool-own" } as never);
     expect(await reasonOf(client().set({ name: "me/chat", poolId: "pool-own" }))).toBe(
       "alias_shadowed",
     );
+    // Checked under the caller's owner fence, against pools they own or may use.
+    expect(heldFences()).toEqual([`00:owner:${OWNER}`]);
+    expect(db.pool.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      slug: "chat",
+      User: { slug: "me" },
+      OR: [{ userId: OWNER }, { Shares: { some: { granteeUserId: OWNER, canUse: true } } }],
+    });
     db.apiKey.findFirst.mockResolvedValueOnce(null);
     expect(
       await reasonOf(client().set({ name: "gpt-4o", poolId: "pool-own", apiKeyId: "key-x" })),
@@ -156,6 +175,22 @@ describe("model-name aliases", () => {
       "alias_limit",
     );
     expect(db.modelAlias.upsert).not.toHaveBeenCalled();
+  });
+
+  it("checks only `a/b` names against callable IDs", async () => {
+    db.modelAlias.findUnique.mockResolvedValue(null);
+    db.modelAlias.count.mockResolvedValue(0);
+    db.modelAlias.upsert.mockResolvedValue(aliasRow({ name: "org/team/model" }) as never);
+    await client().set({ name: "org/team/model", poolId: "pool-own" });
+    await client().set({ name: "gpt-4o", poolId: "pool-own" });
+    expect(db.pool.findFirst).not.toHaveBeenCalled();
+    expect(db.modelAlias.upsert).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows an alias a callable ID shadows (a clash from before the check) as not usable", async () => {
+    db.modelAlias.findMany.mockResolvedValue([aliasRow({ name: "friend/big" })] as never);
+    const { aliases } = await client().list({});
+    expect(aliases[0]).toMatchObject({ name: "friend/big", callableId: "me/chat", usable: false });
   });
 
   it("refuses names that are variants or direct tests", async () => {
