@@ -274,7 +274,8 @@ shows `features.files.source`: `default`, `configured` or `disabled`). wsmp's ow
 files stay protected by the node's deny-list. `wsmp config clear-file-roots`
 returns to this default; it no longer turns the file tools off. To keep agents
 out of files, run `wsmp config set-file-tools off` (or lower the node to Relay
-only).
+only). The node page shows the roots and their source read-only; they are set
+only on the node, with `wsmp config set-file-roots`.
 
 ## Pools translate between API protocols by default
 
@@ -365,6 +366,11 @@ a "marked as stopped" row in the node's activity.
   server that daemonizes) now fails with **process_detached** instead of
   looking healthy while the node can neither watch nor stop it. Define such a
   runtime as `management: "service"` with real stop and status commands.
+- New presets: **vLLM speech-to-text** (Whisper large-v3 turbo, with a
+  transcription profile and segmented live transcription), **vLLM embeddings**
+  (Qwen3-Embedding-0.6B with `--runner pooling` and its embedding contract) and
+  **Docker Compose** (a service that runs `docker compose up -d` / `down`, with
+  a status that succeeds only while a container of the project runs).
 - An unhealthy instance shows why its last health check failed (for example
   "answered HTTP 503" or "the serving process is not running in its unit") on
   the runtime page and as `healthDetail` in `runtimes_get`.

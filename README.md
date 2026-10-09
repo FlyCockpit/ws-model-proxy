@@ -23,7 +23,7 @@ computers through one OpenAI-compatible API on a VPS, without router port forwar
   the runtimes the node already holds, which people can still start and stop).
 - **Runtimes** are inference server definitions: **always-on** (an address on a node that is
   just there) or **startable** (commands that start it on one or more nodes, from a preset such
-  as vLLM, SGLang or llama.cpp). Every edit is a new version; a start previews the placement
+  as vLLM (chat, embeddings or speech-to-text), SGLang, llama.cpp or Docker Compose). Every edit is a new version; a start previews the placement
   (free memory, ports, labels) before you confirm. **Profiles** switch a set of nodes between
   runtime versions in one click.
 - **Pools** are what clients call: `owner/pool` routes to served models of your runtimes (and of
@@ -203,7 +203,7 @@ Getting started (the **Get started** page walks through the same steps):
    `/install.sh` and runs `wsmp login` with a one-time enrollment code, which asks for the trust
    level and offers to install the per-user service. See [apps/cli/README.md](apps/cli/README.md).
 4. **Add a runtime**: on **Runtimes**, choose **New runtime**: a detected or always-on server
-   (an address on the node), or a preset (vLLM, SGLang, llama.cpp, ...) that the server starts
+   (an address on the node), or a preset (vLLM, SGLang, llama.cpp, Docker Compose, ...) that the server starts
    for you.
 5. **Create a pool** from one of the runtime's served models. Its callable ID (`you/pool`) is the
    model name clients send.

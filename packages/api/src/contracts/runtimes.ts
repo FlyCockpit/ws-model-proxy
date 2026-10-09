@@ -43,10 +43,13 @@ import { refusalReasonSchema, refusalSchema } from "./refusals";
 export const RUNTIME_PRESETS = [
   "detected",
   "vllm",
+  "vllm_transcription",
+  "vllm_embeddings",
   "sglang",
   "llama_cpp",
   "ollama_service",
   "systemd_unit",
+  "docker_compose",
 ] as const;
 
 /** Runtime slugs never look like an instance handle (`i-<id12>`). */

@@ -48,6 +48,7 @@ vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
 import prisma from "@ws-model-proxy/db";
 import { credentialDigest } from "@ws-model-proxy/db/node-security";
 import type { DeepMockProxy } from "vitest-mock-extended";
+import { RUNTIME_PRESETS } from "../contracts/runtimes";
 import { runtimeLaunchHash } from "../lib/runtime-launch-hash";
 import { RUNTIME_PRESET_LIST } from "../lib/runtime-presets";
 import { type RuntimeSpec, runtimeSpecSchema } from "../lib/runtime-spec";
@@ -192,6 +193,59 @@ describe("runtimes.presets", () => {
       expect(runtimeSpecSchema.safeParse(preset.spec).success, preset.id).toBe(true);
       expect(preset.kind === "STARTABLE", preset.id).toBe(preset.spec.launch !== undefined);
     }
+  });
+
+  it("lists every preset id once, in the contract's order", () => {
+    expect(RUNTIME_PRESET_LIST.map((preset) => preset.id)).toEqual([...RUNTIME_PRESETS]);
+  });
+
+  const byId = (id: (typeof RUNTIME_PRESETS)[number]) => {
+    const preset = RUNTIME_PRESET_LIST.find((entry) => entry.id === id);
+    if (!preset) throw new Error(`no preset ${id}`);
+    return { ...preset, parsed: runtimeSpecSchema.parse(preset.spec) };
+  };
+
+  it("vllm_transcription serves Whisper with a segmented live profile", () => {
+    const { kind, parsed } = byId("vllm_transcription");
+    expect(kind).toBe("STARTABLE");
+    expect(parsed.engine).toBe("vllm");
+    expect(parsed.modelType).toBe("transcription");
+    const model = parsed.models?.[0];
+    expect(model?.id).toBe("openai/whisper-large-v3-turbo");
+    expect(model?.transcription?.realtime?.adapter).toBe("segmented");
+    expect(model?.transcription?.responseFormats).toContain("verbose_json");
+    expect(model?.transcription?.languages).toContain("en");
+    const start = parsed.launch?.commands[0]?.start ?? "";
+    expect(start).toContain("vllm serve openai/whisper-large-v3-turbo");
+    expect(start).toContain("--host 127.0.0.1 --port {{port}}");
+    expect(start).toContain("--gpu-memory-utilization {{memory_fraction}}");
+    expect(parsed.launch?.readiness?.path).toBe("/v1/models");
+    expect(parsed.launch?.resources).toEqual([{ kind: "discrete", gpuCount: 1, vramGb: 12 }]);
+  });
+
+  it("vllm_embeddings runs a pooling model and declares its embedding contract", () => {
+    const { parsed } = byId("vllm_embeddings");
+    expect(parsed.modelType).toBe("embeddings");
+    const model = parsed.models?.[0];
+    expect(model?.embeddingContract?.model).toBe(model?.id);
+    expect(model?.embeddingContract?.dimensions).toBe(1024);
+    expect(parsed.launch?.commands[0]?.start).toContain("--runner pooling");
+    expect(parsed.launch?.commands[0]?.start).toContain("{{port}}");
+    expect(parsed.launch?.readiness?.path).toBe("/v1/models");
+  });
+
+  it("docker_compose is a service with real stop and status commands", () => {
+    const { parsed } = byId("docker_compose");
+    expect(parsed.models).toBeUndefined();
+    expect(parsed.launch?.management).toBe("service");
+    const commands = parsed.launch?.commands[0];
+    expect(commands?.start).toMatch(/^docker compose -f \S+ up -d$/);
+    expect(commands?.stop).toMatch(/^docker compose -f \S+ down$/);
+    // A status that only succeeds when a container runs, never a constant like `true`.
+    // Docker failing is "unknown" (1), never "stopped" (3), which would free the claim.
+    expect(commands?.status).toMatch(
+      /^out=\$\(docker compose -f \S+ ps --status running -q\) \|\| exit 1; \[ -n "\$out" \] \|\| exit 3$/,
+    );
   });
 });
 

@@ -455,6 +455,20 @@
       "deleteTitle": "¿Eliminar {{name}}?",
       "deleteDescription": "Los comandos y runtimes que lo usan dejan de recibirlo. No se puede mostrar ni recuperar."
     },
+    "fileRoots": {
+      "title": "Carpetas de archivos",
+      "description": "Carpetas que las herramientas de archivos pueden usar en este nodo, según lo que reporta el nodo.",
+      "source": {
+        "default": "Predeterminado: la carpeta personal",
+        "configured": "Configuradas en el nodo",
+        "disabled": "Las herramientas de archivos están desactivadas"
+      },
+      "unusable": "El nodo no reporta carpetas de archivos utilizables.",
+      "unknown": "El nodo aún no ha reportado sus carpetas de archivos.",
+      "asRoot": "wsmp se ejecuta como root en este nodo.",
+      "cliHint": "Las carpetas de archivos solo se configuran en el nodo; después reinicia wsmp:",
+      "disabledHint": "Las herramientas de archivos solo se configuran en el nodo. Actívalas y reinicia wsmp:"
+    },
     "runs": {
       "title": "Qué corre aquí",
       "description": "Runtimes con una parte en este nodo, definiciones que tiene y servidores que encontró.",
@@ -1324,6 +1338,14 @@
         "title": "vLLM",
         "hint": "Se inicia en un nodo con GPU cuando se necesita."
       },
+      "vllm_transcription": {
+        "title": "Voz a texto con vLLM",
+        "hint": "Whisper en un nodo con GPU, con transcripción en vivo."
+      },
+      "vllm_embeddings": {
+        "title": "Embeddings con vLLM",
+        "hint": "Un modelo de embeddings en un nodo con GPU."
+      },
       "sglang": {
         "title": "SGLang",
         "hint": "Se inicia en un nodo con GPU cuando se necesita."
@@ -1339,6 +1361,10 @@
       "systemd_unit": {
         "title": "Unidad systemd",
         "hint": "Cualquier servicio en un nodo, sin proxy."
+      },
+      "docker_compose": {
+        "title": "Docker Compose",
+        "hint": "Un proyecto de Compose en un nodo, sin proxy."
       }
     },
     "form": {

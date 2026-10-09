@@ -455,6 +455,20 @@
       "deleteTitle": "Delete {{name}}?",
       "deleteDescription": "Commands and runtimes that use it stop getting it. It cannot be shown or restored."
     },
+    "fileRoots": {
+      "title": "File roots",
+      "description": "Folders the file tools may use on this node, as the node reports them.",
+      "source": {
+        "default": "Default: the home directory",
+        "configured": "Set on the node",
+        "disabled": "File tools are off"
+      },
+      "unusable": "The node reports no usable file roots.",
+      "unknown": "The node has not reported its file roots yet.",
+      "asRoot": "wsmp runs as root on this node.",
+      "cliHint": "File roots are set on the node only, then wsmp is restarted:",
+      "disabledHint": "File tools are set on the node only. Turn them on, then restart wsmp:"
+    },
     "runs": {
       "title": "What runs here",
       "description": "Runtimes with a part on this node, definitions it holds and servers it found.",
@@ -1324,6 +1338,14 @@
         "title": "vLLM",
         "hint": "Started on a GPU node when needed."
       },
+      "vllm_transcription": {
+        "title": "vLLM speech-to-text",
+        "hint": "Whisper on a GPU node, with live transcription."
+      },
+      "vllm_embeddings": {
+        "title": "vLLM embeddings",
+        "hint": "An embedding model on a GPU node."
+      },
       "sglang": {
         "title": "SGLang",
         "hint": "Started on a GPU node when needed."
@@ -1339,6 +1361,10 @@
       "systemd_unit": {
         "title": "systemd unit",
         "hint": "Any service on a node, without proxying."
+      },
+      "docker_compose": {
+        "title": "Docker Compose",
+        "hint": "A Compose project on a node, without proxying."
       }
     },
     "form": {

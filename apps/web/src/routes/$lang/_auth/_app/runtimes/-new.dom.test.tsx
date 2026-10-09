@@ -49,6 +49,12 @@ vi.mock("@/utils/orpc", () => ({
             queryKey: ["runtimes", "presets"],
             queryFn: async () => ({
               presets: [
+                // The real built-in presets that are not stubbed below.
+                ...(
+                  await import("@ws-model-proxy/api/lib/runtime-presets")
+                ).RUNTIME_PRESET_LIST.filter(
+                  (preset) => preset.id !== "vllm" && preset.id !== "systemd_unit",
+                ),
                 {
                   id: "vllm",
                   kind: "STARTABLE",
@@ -183,6 +189,42 @@ describe("new runtime", { timeout: 20_000 }, () => {
     fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.create" }));
     expect(await screen.findByText("dashboard:runtime.form.nodeRequired")).toBeTruthy();
     expect(state.create).not.toHaveBeenCalled();
+  });
+
+  it("offers every built-in preset", async () => {
+    mount();
+    const { RUNTIME_PRESET_LIST } = await import("@ws-model-proxy/api/lib/runtime-presets");
+    for (const { id } of RUNTIME_PRESET_LIST)
+      expect(
+        await screen.findByRole("button", { name: new RegExp(`presets\\.${id}\\.title`) }),
+      ).toBeTruthy();
+  });
+
+  it("creates speech-to-text from its preset with the transcription profile kept", async () => {
+    mount();
+    fireEvent.click(
+      await screen.findByRole("button", { name: /presets\.vllm_transcription\.title/ }),
+    );
+    expect(radio("STARTABLE").checked).toBe(true);
+    fireEvent.change(screen.getByLabelText("dashboard:runtime.form.name"), {
+      target: { value: "Whisper" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:runtime.create" }));
+    await waitFor(() => expect(state.create).toHaveBeenCalledTimes(1));
+    const { RUNTIME_PRESET_LIST } = await import("@ws-model-proxy/api/lib/runtime-presets");
+    const preset = RUNTIME_PRESET_LIST.find((entry) => entry.id === "vllm_transcription");
+    expect(state.create.mock.calls[0]?.[0]).toMatchObject({
+      kind: "STARTABLE",
+      preset: "vllm_transcription",
+      spec: { modelType: "transcription", models: preset?.spec.models },
+    });
+  });
+
+  it("keeps a Docker Compose project startable only", async () => {
+    mount();
+    fireEvent.click(await screen.findByRole("button", { name: /presets\.docker_compose\.title/ }));
+    expect(radio("ALWAYS_ON").disabled).toBe(true);
+    expect(radio("STARTABLE").checked).toBe(true);
   });
 
   it("keeps a service startable only", async () => {
