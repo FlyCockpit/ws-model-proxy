@@ -274,9 +274,15 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     for (const old of engines.splice(0)) await old.stop();
   }
 
-  async function engine() {
+  /**
+   * `scoped`: the relay lists this file's node as its only online node, as production's does
+   * for its own sessions, so the passes that look at online nodes only leave other suites' rows
+   * in the same database alone.
+   */
+  async function engine({ scoped = false }: { scoped?: boolean } = {}) {
     await retireEngines();
     const created = new m.lifecycle.RuntimeLifecycle({
+      ...(scoped ? { onlineNodeIds: () => (session.online ? [nodeId] : []) } : {}),
       sendToNode: (_nodeId, frame) => {
         if (frame.type === "runtime.job") sent.push(frame);
         return true;
@@ -779,9 +785,11 @@ integration("runtime lifecycle (PostgreSQL)", () => {
   });
 
   it("reaches every rank marked stopped when there are more than one pass takes, oldest first", async () => {
-    const lc = await engine();
+    // Scoped to this file's node: ranks other suites left in the database never take a slot.
+    const lc = await engine({ scoped: true });
+    const count = 66;
     const ids: string[] = [];
-    for (let index = 0; index < 70; index++) ids.push(await startInstance(31_000 + index));
+    for (let index = 0; index < count; index++) ids.push(await startInstance(31_000 + index));
     await m.fixture.runtimeInstance.updateMany({
       where: { id: { in: ids } },
       data: { desiredState: "STOPPED", phase: "STOPPED", phaseReason: "stop_requested" },
@@ -805,27 +813,35 @@ integration("runtime lifecycle (PostgreSQL)", () => {
         ).map((step) => step.instanceId),
       );
     try {
-      // One pass takes 64 at most: some are left for the next one, which reaches them.
+      // One pass takes 64 at most (this node's earlier ranks marked stopped may take some):
+      // the rest are reached by the next passes, within a bounded number of them.
       await lc.runOnce();
       const first = (await ranks()).filter((rank) => rank.lastStopCheckAt !== null);
-      expect(first.length).toBeGreaterThan(0);
       expect(first.length).toBeLessThanOrEqual(64);
-      await lc.runOnce();
+      expect(first.length).toBeLessThan(count);
+      let passes = 1;
+      while (passes < 3 && (await ranks()).some((rank) => rank.lastStopCheckAt === null)) {
+        await lc.runOnce();
+        passes++;
+      }
       expect((await ranks()).every((rank) => rank.lastStopCheckAt !== null)).toBe(true);
-      expect((await probed()).size).toBe(70);
-      // Later, the least recently checked go first: ids[69] oldest, ids[0] newest of the old.
+      expect((await probed()).size).toBe(count);
+      // Later, the least recently checked go first: the last id oldest, ids[0] newest of the old.
       const base = Date.now() - 10 * 60_000;
-      for (const [index, id] of ids.entries())
-        await m.fixture.instanceRank.updateMany({
-          where: { instanceId: id },
-          data: { lastStopCheckAt: new Date(base - index * 1_000) },
-        });
+      await Promise.all(
+        ids.map((id, index) =>
+          m.fixture.instanceRank.updateMany({
+            where: { instanceId: id },
+            data: { lastStopCheckAt: new Date(base - index * 1_000) },
+          }),
+        ),
+      );
       await lc.runOnce();
       const stale = (await ranks())
         .filter((rank) => (rank.lastStopCheckAt?.getTime() ?? 0) <= base)
         .map((rank) => rank.instanceId)
         .sort();
-      expect(stale).toEqual(ids.slice(0, 6).sort());
+      expect(stale).toEqual(ids.slice(0, count - 64).sort());
     } finally {
       await m.fixture.instanceStep.updateMany({
         where: { instanceId: { in: ids }, state: { in: ["PENDING", "RUNNING"] } },
