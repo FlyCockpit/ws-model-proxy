@@ -29,6 +29,7 @@ import { useAppUpdate } from "@/hooks/use-app-update";
 import { useDocumentLang } from "@/hooks/use-document-lang";
 import { useHashTargetScroll } from "@/hooks/use-hash-target-scroll";
 import { useMobileKeyboard } from "@/hooks/use-mobile-keyboard";
+import { useStaleBuildRecovery } from "@/hooks/use-stale-build-recovery";
 import { useUserLocaleSync } from "@/hooks/use-user-locale-sync";
 import i18n from "@/i18n";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
@@ -137,6 +138,7 @@ function RootShell({ children }: { children: ReactNode }) {
 
 function RootComponent() {
   useAppUpdate();
+  useStaleBuildRecovery();
   useDocumentLang();
   useHashTargetScroll();
   useUserLocaleSync();
