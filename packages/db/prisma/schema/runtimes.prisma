@@ -388,6 +388,9 @@ model InstanceRank {
   stoppedAt       DateTime?
   markedStoppedAt DateTime?
   markedStoppedBy String?
+  /// When the held-unknown probe pass last looked at this claim (null: never). The pass takes the
+  /// oldest first, so every claim marked stopped is reached however many there are.
+  lastStopCheckAt DateTime?
 
   Instance RuntimeInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Node     Node?           @relation(fields: [nodeId], references: [id], onDelete: SetNull, onUpdate: Cascade)

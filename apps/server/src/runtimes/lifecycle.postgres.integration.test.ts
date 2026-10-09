@@ -375,6 +375,19 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     });
   }
 
+  /** Five minutes on: the instance's status probes, and its ranks' last checks, are old. */
+  async function ageProbes(id: string) {
+    const ago = new Date(Date.now() - 6 * 60_000);
+    await m.fixture.instanceStep.updateMany({
+      where: { instanceId: id, phase: "STATUS" },
+      data: { updatedAt: ago },
+    });
+    await m.fixture.instanceRank.updateMany({
+      where: { instanceId: id, lastStopCheckAt: { not: null } },
+      data: { lastStopCheckAt: ago },
+    });
+  }
+
   /** A STATUS step's error code (what the stop evidence shows as the check's reason). */
   const stepCode = async (stepId: string) =>
     (await m.fixture.instanceStep.findUniqueOrThrow({ where: { id: stepId } })).errorCode;
@@ -575,10 +588,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     expect(row.needsOperator).toBeNull();
     expect(row.Ranks[0]?.claim).toBe("HELD_UNKNOWN");
     // The sweep probes it again on the online node (5 minutes on: one pass queues, one sends).
-    await m.fixture.instanceStep.updateMany({
-      where: { instanceId: id, phase: "STATUS" },
-      data: { updatedAt: new Date(Date.now() - 6 * 60_000) },
-    });
+    await ageProbes(id);
     const before = sent.length;
     await lc.runOnce();
     await lc.runOnce();
@@ -588,20 +598,14 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     expect(await stepCode(probe.stepId)).toBe("process_alive");
     expect((await instance(id)).Ranks[0]?.claim).toBe("HELD_UNKNOWN");
     // An older node gives no reason: the code stays not_stopped.
-    await m.fixture.instanceStep.updateMany({
-      where: { instanceId: id, phase: "STATUS" },
-      data: { updatedAt: new Date(Date.now() - 6 * 60_000) },
-    });
+    await ageProbes(id);
     await lc.runOnce();
     await lc.runOnce();
     const old = lastJob(id, "status");
     await answer(lc, old, "succeeded", { stopped: false });
     expect(await stepCode(old.stepId)).toBe("not_stopped");
     // Later the process is gone and the port free: the proof releases the hold at once.
-    await m.fixture.instanceStep.updateMany({
-      where: { instanceId: id, phase: "STATUS" },
-      data: { updatedAt: new Date(Date.now() - 6 * 60_000) },
-    });
+    await ageProbes(id);
     await lc.runOnce();
     await lc.runOnce();
     const proof = lastJob(id, "status");
@@ -671,10 +675,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     expect(row.Ranks[0]?.claim).toBe("HELD_UNKNOWN");
     expect(row.needsOperator).toBeNull();
     // Deployed with the fixed node: the next sweep (5 minutes on, node online) probes again.
-    await m.fixture.instanceStep.updateMany({
-      where: { instanceId: id, phase: "STATUS" },
-      data: { updatedAt: new Date(Date.now() - 6 * 60_000) },
-    });
+    await ageProbes(id);
     const before = sent.length;
     await lc.runOnce();
     await lc.runOnce();
@@ -729,10 +730,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     expect(row.needsOperator).toBe("MARK_STOPPED");
     expect(sent.filter((job) => job.instanceId === id && job.phase === "status")).toHaveLength(1);
     // Later the probe is repeated; its proof completes the stop with no person.
-    await m.fixture.instanceStep.updateMany({
-      where: { instanceId: id, phase: "STATUS" },
-      data: { updatedAt: new Date(Date.now() - 6 * 60_000) },
-    });
+    await ageProbes(id);
     await lc.runOnce();
     const second = lastJob(id, "status");
     expect(second.stepId).not.toBe(first.stepId);
@@ -778,6 +776,73 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     row = await instance(id);
     expect(row.Ranks[0]?.claim).toBe("RELEASED");
     expect(row.phase).toBe("FAILED");
+  });
+
+  it("reaches every rank marked stopped when there are more than one pass takes, oldest first", async () => {
+    const lc = await engine();
+    const ids: string[] = [];
+    for (let index = 0; index < 70; index++) ids.push(await startInstance(31_000 + index));
+    await m.fixture.runtimeInstance.updateMany({
+      where: { id: { in: ids } },
+      data: { desiredState: "STOPPED", phase: "STOPPED", phaseReason: "stop_requested" },
+    });
+    await m.fixture.instanceRank.updateMany({
+      where: { instanceId: { in: ids } },
+      data: { claim: "HELD_UNKNOWN", markedStoppedAt: new Date(), markedStoppedBy: userId },
+    });
+    const ranks = () =>
+      m.fixture.instanceRank.findMany({
+        where: { instanceId: { in: ids } },
+        select: { instanceId: true, lastStopCheckAt: true },
+      });
+    const probed = async () =>
+      new Set(
+        (
+          await m.fixture.instanceStep.findMany({
+            where: { instanceId: { in: ids }, phase: "STATUS" },
+            select: { instanceId: true },
+          })
+        ).map((step) => step.instanceId),
+      );
+    try {
+      // One pass takes 64 at most: some are left for the next one, which reaches them.
+      await lc.runOnce();
+      const first = (await ranks()).filter((rank) => rank.lastStopCheckAt !== null);
+      expect(first.length).toBeGreaterThan(0);
+      expect(first.length).toBeLessThanOrEqual(64);
+      await lc.runOnce();
+      expect((await ranks()).every((rank) => rank.lastStopCheckAt !== null)).toBe(true);
+      expect((await probed()).size).toBe(70);
+      // Later, the least recently checked go first: ids[69] oldest, ids[0] newest of the old.
+      const base = Date.now() - 10 * 60_000;
+      for (const [index, id] of ids.entries())
+        await m.fixture.instanceRank.updateMany({
+          where: { instanceId: id },
+          data: { lastStopCheckAt: new Date(base - index * 1_000) },
+        });
+      await lc.runOnce();
+      const stale = (await ranks())
+        .filter((rank) => (rank.lastStopCheckAt?.getTime() ?? 0) <= base)
+        .map((rank) => rank.instanceId)
+        .sort();
+      expect(stale).toEqual(ids.slice(0, 6).sort());
+    } finally {
+      await m.fixture.instanceStep.updateMany({
+        where: { instanceId: { in: ids }, state: { in: ["PENDING", "RUNNING"] } },
+        data: {
+          state: "FAILED",
+          errorCode: "superseded",
+          ownerEpoch: null,
+          deadline: null,
+          leaseExpiresAt: null,
+        },
+      });
+      const now = new Date();
+      await m.fixture.instanceRank.updateMany({
+        where: { instanceId: { in: ids } },
+        data: { claim: "RELEASED", claimChangedAt: now, stoppedAt: now },
+      });
+    }
   });
 
   it("asks a person to mark stopped a stop whose node stays offline", async () => {
