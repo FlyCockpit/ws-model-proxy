@@ -87,7 +87,11 @@ command is not needed for that proof and cannot block it (a stub `status:
 the slice also needs its `status` command to say stopped (exit 3): a
 `service` runtime (a start that hands off to docker or a service manager
 escapes the slice on purpose), any step a person ran in a terminal (a
-prepare too), and any run on a node without systemd units. The same proof is
+prepare too), and any run on a node without systemd units. A `status`
+command that can never say stopped (`true`, `:`, `exit 0`; new definitions
+refuse it) counts as none on a node with systemd units, so a version saved
+earlier with one is proven by its empty units and free ports; on a node
+without units such a run stays unproven. The same proof is
 required again before a repeated stop answers stopped and before the node's
 inventory reports a rank stopped. A stop step completes as soon as this proof holds. When the stop
 steps fail, the server asks the node for a status probe that checks the same

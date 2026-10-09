@@ -917,6 +917,11 @@ fn a_run_outside_the_nodes_units_needs_its_status_to_say_stopped() {
     let path = root.path().join("in1-r0.json");
     let runtime = Fake::new(path.clone());
     let mut executor = Executor::load(path).expect("load");
+    let stubbed = |job: Job| {
+        let mut job = stubbed(job);
+        job.status_command = Some("systemctl --user is-active --quiet llm".into());
+        job
+    };
     executor.execute(stubbed(job(JobPhase::Start)), &runtime, deadline());
     // A person started it in an operator terminal: no unit of the node holds it.
     executor
@@ -949,14 +954,19 @@ fn a_service_whose_unit_is_empty_still_needs_its_status_to_say_stopped() {
     let path = root.path().join("in1-r0.json");
     let runtime = Fake::new(path.clone());
     let mut executor = Executor::load(path).expect("load");
-    executor.execute(service(stubbed(job(JobPhase::Start))), &runtime, deadline());
+    let service = |job: Job| {
+        let mut job = service(stubbed(job));
+        job.status_command = Some("systemctl --user is-active --quiet llm".into());
+        job
+    };
+    executor.execute(service(job(JobPhase::Start)), &runtime, deadline());
     // The start handed off (docker run -d): the unit has no task, the port is not bound yet.
     runtime.units.borrow_mut().clear();
     runtime.status_alive.set(Some(true));
     let short = Deadline::new(Duration::from_millis(1_200));
-    let stop = executor.execute(service(stubbed(job(JobPhase::Stop))), &runtime, short);
+    let stop = executor.execute(service(job(JobPhase::Stop)), &runtime, short);
     assert_eq!((stop.status, stop.stopped), (JobStatus::Failed, false));
-    let mut probe = service(stubbed(job(JobPhase::Status)));
+    let mut probe = service(job(JobPhase::Status));
     probe.step_id = "p1".into();
     assert_eq!(
         executor
@@ -966,7 +976,7 @@ fn a_service_whose_unit_is_empty_still_needs_its_status_to_say_stopped() {
         Some("status_running")
     );
     runtime.status_alive.set(Some(false));
-    let mut probe = service(stubbed(job(JobPhase::Status)));
+    let mut probe = service(job(JobPhase::Status));
     probe.step_id = "p2".into();
     assert!(executor.execute(probe, &runtime, deadline()).stopped);
 }
@@ -978,6 +988,11 @@ fn a_prepare_a_person_ran_keeps_the_status_requirement() {
     let runtime = Fake::new(path.clone());
     runtime.status_alive.set(Some(true));
     let mut executor = Executor::load(path).expect("load");
+    let stubbed = |job: Job| {
+        let mut job = stubbed(job);
+        job.status_command = Some("systemctl --user is-active --quiet llm".into());
+        job
+    };
     executor.execute(stubbed(job(JobPhase::Start)), &runtime, deadline());
     // A prepare run in an operator terminal may leave a helper outside the node's units.
     executor
@@ -1202,6 +1217,74 @@ fn a_port_held_after_the_ranks_units_emptied_is_named_as_held_outside_them() {
     runtime.busy_ports.borrow_mut().clear();
     let probe = executor.execute(compose(JobPhase::Status, "p4"), &runtime, deadline());
     assert!(probe.stopped, "{probe:?}");
+}
+
+/// A launch recorded with `status: "true"` (exit 0 forever) held its claim with
+/// `status_running`. Such a status command proves nothing: where the runtime contains its
+/// ranks the empty units, slice and free ports decide, so the next probe clears the hold.
+#[test]
+fn a_status_command_that_can_never_say_stopped_is_ignored_where_units_contain_the_rank() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut executor = Executor::load(path).expect("load");
+    // The launch record carries the constant status; the probe is rendered from it too.
+    executor.execute(service(stubbed(job(JobPhase::Start))), &runtime, deadline());
+    runtime.status_alive.set(Some(true));
+    runtime.units.borrow_mut().clear();
+    let probe = |step: &str| {
+        let mut probe = service(stubbed(job(JobPhase::Status)));
+        probe.step_id = step.into();
+        probe
+    };
+    // A port still held: not proven (whatever holds it is outside the units).
+    runtime.busy_ports.borrow_mut().push(30001);
+    let held = executor.execute(probe("p1"), &runtime, deadline());
+    assert_eq!(
+        (held.stopped, held.detail.as_deref()),
+        (false, Some("port_held_outside_runtime"))
+    );
+    // A process left in the rank's slice: not proven.
+    runtime.busy_ports.borrow_mut().clear();
+    runtime
+        .orphans
+        .borrow_mut()
+        .push("wsmp_i_abcdefabcdef_r0.slice".into());
+    let alive = executor.execute(probe("p2"), &runtime, deadline());
+    assert_eq!(alive.detail.as_deref(), Some("process_alive"));
+    // Empty units and slice, free ports: proven, although `true` still says "alive".
+    runtime.orphans.borrow_mut().clear();
+    let proven = executor.execute(probe("p3"), &runtime, deadline());
+    assert!(proven.stopped, "{proven:?}");
+    // The probe alone carrying a real status command still asks it.
+    let mut real = probe("p4");
+    real.status_command = Some("systemctl --user is-active --quiet llm".into());
+    assert_eq!(
+        executor
+            .execute(real, &runtime, deadline())
+            .detail
+            .as_deref(),
+        Some("status_running")
+    );
+}
+
+#[test]
+fn a_status_command_that_can_never_say_stopped_proves_nothing_without_units() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    runtime.contains_ranks.set(false);
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(service(stubbed(job(JobPhase::Start))), &runtime, deadline());
+    runtime.status_alive.set(Some(true));
+    runtime.units.borrow_mut().clear();
+    let mut probe = service(stubbed(job(JobPhase::Status)));
+    probe.step_id = "p1".into();
+    let unproven = executor.execute(probe, &runtime, deadline());
+    assert_eq!(
+        (unproven.stopped, unproven.detail.as_deref()),
+        (false, Some("status_running"))
+    );
 }
 
 #[test]
