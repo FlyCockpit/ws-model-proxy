@@ -37,18 +37,21 @@ function contended(error: unknown): never {
 
 /**
  * Runs `work` under the owner fences of `owners`, then the fences `policyFences` names
- * (computed under the owner fences, before any write).
+ * (computed under the owner fences, before any write). `owners` may be planned per attempt
+ * with plain reads (a function): `work` re-reads the set under the fences and throws
+ * FenceSetChangedError when it grew, and the next attempt plans it again.
  */
 export async function graphWrite<T>(
-  owners: Iterable<string>,
+  owners: Iterable<string> | ((tx: Tx) => Promise<Iterable<string>>),
   work: (tx: Tx) => Promise<T>,
   policyFences?: (tx: Tx) => Promise<Fence[]>,
 ): Promise<T> {
   try {
     return await runCapacityOrderedTransaction(prisma, async (tx) => {
+      const planned = typeof owners === "function" ? await owners(tx) : owners;
       await acquireFences(
         tx,
-        [...new Set(owners)].map((userId) => fences.owner(userId)),
+        [...new Set(planned)].map((userId) => fences.owner(userId)),
       );
       if (policyFences) await acquireFences(tx, await policyFences(tx));
       return work(tx);

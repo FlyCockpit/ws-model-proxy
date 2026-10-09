@@ -110,6 +110,14 @@ function signupInviteToken(
  */
 const inviteClaims = new WeakMap<object, string>();
 
+/** A slug change through Better Auth's update routes (see `databaseHooks.user.update`). */
+function slugChangeRefused(): APIError {
+  return new APIError("BAD_REQUEST", {
+    message: "Change the account slug in the settings (settings.update), not here.",
+    code: "SLUG_CHANGE_UNSUPPORTED",
+  });
+}
+
 /** A second sign-up with an invite link another e-mail's sign-up holds right now. */
 function inviteInUseError(): APIError {
   return new APIError("CONFLICT", {
@@ -501,6 +509,13 @@ export const auth = betterAuth({
         },
       },
       update: {
+        // The account slug is the first half of every callable ID of the person's pools, in
+        // their share holders' namespaces too: it changes only through `settings.update`, which
+        // claims the renamed IDs under everyone's owner fences (packages/api lib/model-names.ts).
+        // Better Auth's update routes (`/update-user`, `/admin/update-user`) cannot take them.
+        before: async (data) => {
+          if ((data as { slug?: unknown }).slug !== undefined) throw slugChangeRefused();
+        },
         // A user row that now carries an ACTIVE ban (`/admin/ban-user`, or an
         // `/admin/update-user` that sets `banned`) ends the user's in-flight
         // relay work. Better Auth runs `after` once the update's transaction

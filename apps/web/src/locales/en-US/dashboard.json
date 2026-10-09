@@ -648,6 +648,8 @@
     "alias_shadowed": "That name is already one of your callable IDs.",
     "alias_limit": "Too many aliases. Remove one first.",
     "alias_key_not_allowed": "That key cannot call this pool. Add the pool to the key first.",
+    "name_aliased": "One of your model-name aliases already uses that callable ID. Remove the alias or pick another name.",
+    "name_unavailable": "That callable ID is not available to someone this pool is or would be shared with. Pick another name.",
     "always_on_runtime": "An always-on runtime runs on its own; there is nothing to start.",
     "fabric_port_ranges_disjoint": "These nodes' port ranges share no port; make them overlap.",
     "identity_mismatch": "The node presented a different identity key."
@@ -1490,7 +1492,9 @@
       "node_online": "The node is online. Agents delete only offline nodes; a person can delete it here.",
       "alias_shadowed": "That name is already one of your callable IDs.",
       "alias_limit": "Too many aliases. Remove one first.",
-      "alias_key_not_allowed": "That key cannot call this pool. Add the pool to the key first."
+      "alias_key_not_allowed": "That key cannot call this pool. Add the pool to the key first.",
+      "name_aliased": "One of your model-name aliases already uses that callable ID. Remove the alias or pick another name.",
+      "name_unavailable": "That callable ID is not available to someone this pool is or would be shared with. Pick another name."
     },
     "delete": "Delete runtime",
     "deleteTitle": "Delete {{name}}?",

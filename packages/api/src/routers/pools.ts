@@ -6,10 +6,12 @@ import type { z } from "zod";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import type { poolAdvancedPatchSchema } from "../contracts/advanced";
 import { poolsContract as c, type routingRulesSchema } from "../contracts/pools";
+import { callableIdOf } from "../lib/access-views";
 import { type CallerActor, callerActor } from "../lib/caller-actor";
 import { cloudEgressEnabled } from "../lib/cloud-egress";
 import { graphDelete, graphWrite, modelTargetFences, poolTargetFences } from "../lib/graph-write";
 import { readLiveLoad } from "../lib/live-load";
+import { canUseHolders, modelNameClashes, refuseCallableIdClash } from "../lib/model-names";
 import { memberLatencyP95, poolTraffic } from "../lib/overview-summary";
 import { invalidatePoolRouting } from "../lib/pool-routing-invalidation";
 import {
@@ -517,42 +519,35 @@ async function setOwnKeyEquivalent(context: SignedInContext, poolId: string, mod
 }
 
 /**
- * Callable IDs always win over model-name aliases (aliases.set refuses a name equal to one), so
- * a pool slug that makes `owner/slug` equal to an alias of the owner, or of a share holder who
- * may use the pool, would silently take that alias's traffic: refuse it.
+ * Claims the callable ID `owner/slug` (lib/model-names.ts) for the pool's owner and every
+ * can-use share holder: callable IDs always win over aliases, so a slug that made it equal to
+ * one of their aliases would silently take that alias's traffic. The transaction holds the owner
+ * fences of `fenced`; a holder outside it (a share created since the plan) retries the attempt.
  */
-async function refuseShadowedAlias(
-  db: Tx,
+async function claimPoolCallableId(
+  tx: Tx,
   pool: { ownerUserId: string; poolId: string | null },
   slug: string,
+  fenced: ReadonlySet<string>,
 ) {
-  const owner = await db.user.findUnique({
+  const owner = await tx.user.findUnique({
     where: { id: pool.ownerUserId },
     select: { slug: true },
   });
+  // No owner row: the pool write that follows fails on its reference, so nothing is named.
   if (!owner) return;
-  const grantees = pool.poolId
-    ? await db.share.findMany({
-        where: { poolId: pool.poolId, canUse: true },
-        select: { granteeUserId: true },
-      })
+  const holders = pool.poolId
+    ? (await canUseHolders(tx, [pool.poolId])).map((share) => share.granteeUserId)
     : [];
-  const shadowed = await db.modelAlias.findFirst({
-    where: {
-      name: `${owner.slug}/${slug}`,
-      userId:
-        grantees.length > 0
-          ? { in: [pool.ownerUserId, ...grantees.map((share) => share.granteeUserId)] }
-          : pool.ownerUserId,
-    },
-    select: { id: true },
-  });
-  if (shadowed)
-    throw refuse(
-      "alias_shadowed",
-      "A model-name alias already uses this callable ID; pick another slug.",
-      "BAD_REQUEST",
-    );
+  if (holders.some((userId) => !fenced.has(userId))) throw new FenceSetChangedError();
+  const callableIds = [callableIdOf(owner.slug, slug)];
+  refuseCallableIdClash(
+    await modelNameClashes(
+      tx,
+      [pool.ownerUserId, ...holders].map((userId) => ({ userId, callableIds })),
+    ),
+    pool.ownerUserId,
+  );
 }
 
 function rethrowSlugTaken(error: unknown): never {
@@ -666,7 +661,12 @@ export const poolsRouter = {
       poolId = await graphWrite(
         [userId],
         async (tx) => {
-          await refuseShadowedAlias(tx, { ownerUserId: userId, poolId: null }, input.slug);
+          await claimPoolCallableId(
+            tx,
+            { ownerUserId: userId, poolId: null },
+            input.slug,
+            new Set([userId]),
+          );
           const pool = await tx.pool.create({
             data: {
               userId,
@@ -709,7 +709,6 @@ export const poolsRouter = {
       select: { id: true, userId: true, modelType: true, slug: true },
     });
     if (!pool) throw notFound("That pool does not exist.");
-    const newSlug = input.slug !== undefined && input.slug !== pool.slug ? input.slug : null;
     const { rules, ...advancedPatch } = input.advanced ?? {};
     // Removing a contributed member writes the contributor's graph too (owner fence).
     const removed = input.members?.remove?.length
@@ -718,19 +717,40 @@ export const poolsRouter = {
           select: { RuntimeModel: { select: { userId: true } } },
         })
       : [];
-    const owners = [
+    const owners = new Set([
       userId,
       ...removed.flatMap((member) => (member.RuntimeModel ? [member.RuntimeModel.userId] : [])),
-    ];
+    ]);
     try {
       await graphWrite(
-        owners,
+        // A slug may rename a name in every can-use holder's namespace: their fences too.
+        // Whether it changes is decided under the fences (a rename may have landed since).
         async (tx) => {
+          if (input.slug === undefined) return owners;
+          const holders = await canUseHolders(tx, [pool.id]);
+          for (const share of holders) owners.add(share.granteeUserId);
+          return owners;
+        },
+        async (tx) => {
+          const current =
+            input.slug === undefined
+              ? null
+              : await tx.pool.findFirst({
+                  where: { id: pool.id, userId },
+                  select: { slug: true },
+                });
+          if (input.slug !== undefined && !current) throw notFound("That pool does not exist.");
+          const newSlug = current && current.slug !== input.slug ? input.slug : undefined;
           if (newSlug)
-            await refuseShadowedAlias(tx, { ownerUserId: userId, poolId: pool.id }, newSlug);
+            await claimPoolCallableId(
+              tx,
+              { ownerUserId: userId, poolId: pool.id },
+              newSlug,
+              owners,
+            );
           const fields = {
             ...(input.name !== undefined ? { name: input.name } : {}),
-            ...(input.slug !== undefined ? { slug: input.slug } : {}),
+            ...(newSlug !== undefined ? { slug: newSlug } : {}),
             ...(input.description !== undefined ? { description: input.description || null } : {}),
           };
           if (Object.keys(fields).length > 0)

@@ -396,6 +396,33 @@ export async function fenceOwners(tx: Tx, userIds: Iterable<string>): Promise<vo
   );
 }
 
+/** A check that rests on owner fences ran without one of them (a programming error). */
+export class MissingOwnerFenceError extends Error {
+  readonly code = "MISSING_OWNER_FENCE";
+  constructor(readonly userIds: readonly string[]) {
+    super("A check that needs owner fences ran without them.");
+    this.name = "MissingOwnerFenceError";
+  }
+}
+
+/**
+ * Throws unless this transaction holds the `owner` fence of every user in `userIds`. For a
+ * check-then-write whose exactness rests on the fence rather than on a write the fence trigger
+ * guards (the model-name namespace, packages/api/src/lib/model-names.ts): a forgotten fence
+ * fails at once instead of letting two writers race past the check. The test fixtures'
+ * wildcard counts as every fence.
+ */
+export async function requireOwnerFences(tx: Tx, userIds: Iterable<string>): Promise<void> {
+  const wanted = [...new Set(userIds)];
+  if (wanted.length === 0) return;
+  const rows = await tx.$queryRaw<Array<{ held: string | null }>>`
+    SELECT current_setting('wsmp.fences', true) AS held`;
+  const held = rows?.[0]?.held ?? "";
+  if (held.includes(",*,")) return;
+  const missing = wanted.filter((userId) => !held.includes(`,${fences.owner(userId)},`));
+  if (missing.length > 0) throw new MissingOwnerFenceError(missing);
+}
+
 // ---------------------------------------------------------------------------
 // Admission-internal order (the admission store)
 // ---------------------------------------------------------------------------

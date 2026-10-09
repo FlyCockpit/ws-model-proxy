@@ -47,6 +47,7 @@ vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => {
   return {
     ...real,
     acquireFences: vi.fn(async () => true),
+    requireOwnerFences: vi.fn(async () => undefined),
     fenceParentDelete: vi.fn(async () => []),
     runCapacityOrderedTransaction: vi.fn(
       (db: { $transaction: (work: unknown) => unknown }, work: (tx: unknown) => unknown) =>

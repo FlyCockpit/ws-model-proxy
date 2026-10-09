@@ -156,7 +156,7 @@ describe("pool advanced danger zone", () => {
 
   it("explains a slug an alias already uses", async () => {
     state.updateError = Object.assign(new Error("shadowed"), {
-      data: { reason: "alias_shadowed", subjectId: null },
+      data: { reason: "name_aliased", subjectId: null },
     });
     await mount();
     const dialog = await openSlugDialog();

@@ -108,6 +108,14 @@ export const REFUSAL_REASONS = [
   "too_many_invites",
   /** invites.revoke lost to an acceptance: it is a share now. */
   "invite_accepted",
+  // Model-name collisions (packages/api/src/lib/model-names.ts).
+  /** A new callable ID (pool slug, account slug, a share) equals one of the caller's aliases. */
+  "name_aliased",
+  /**
+   * A new callable ID equals a model name of someone the pool is or would be shared with. Says
+   * neither who nor which of their names.
+   */
+  "name_unavailable",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

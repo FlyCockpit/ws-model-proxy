@@ -648,6 +648,8 @@
     "alias_shadowed": "Ese nombre ya es uno de tus ID invocables.",
     "alias_limit": "Demasiados alias. Elimina uno primero.",
     "alias_key_not_allowed": "Esa clave no puede llamar a este pool. Agrega el pool a la clave primero.",
+    "name_aliased": "Uno de tus alias de nombre de modelo ya usa ese ID invocable. Elimina el alias o elige otro nombre.",
+    "name_unavailable": "Ese ID invocable no está disponible para alguien con quien este pool está o estaría compartido. Elige otro nombre.",
     "always_on_runtime": "Un runtime siempre activo se ejecuta por su cuenta; no hay nada que iniciar.",
     "fabric_port_ranges_disjoint": "Los rangos de puertos de estos nodos no comparten ningún puerto; haz que se superpongan.",
     "identity_mismatch": "El nodo presentó una clave de identidad distinta."
@@ -1490,7 +1492,9 @@
       "node_online": "El nodo está en línea. Los agentes solo eliminan nodos sin conexión; una persona puede eliminarlo aquí.",
       "alias_shadowed": "Ese nombre ya es uno de tus ID invocables.",
       "alias_limit": "Demasiados alias. Elimina uno primero.",
-      "alias_key_not_allowed": "Esa clave no puede llamar a este pool. Agrega el pool a la clave primero."
+      "alias_key_not_allowed": "Esa clave no puede llamar a este pool. Agrega el pool a la clave primero.",
+      "name_aliased": "Uno de tus alias de nombre de modelo ya usa ese ID invocable. Elimina el alias o elige otro nombre.",
+      "name_unavailable": "Ese ID invocable no está disponible para alguien con quien este pool está o estaría compartido. Elige otro nombre."
     },
     "delete": "Eliminar runtime",
     "deleteTitle": "¿Eliminar {{name}}?",
