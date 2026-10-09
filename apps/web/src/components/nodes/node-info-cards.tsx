@@ -1,4 +1,7 @@
-/** Read-mostly node detail cards: secrets, what runs, detected servers, credentials, activity. */
+/**
+ * Read-mostly node detail cards: secrets, file roots, what runs, detected servers, credentials,
+ * activity.
+ */
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
@@ -180,6 +183,68 @@ export function SecretsCard({ node }: { node: NodeDetail }) {
             <CommandBlock command="wsmp secret set WSMP_SECRET_NAME" />
           </div>
         )}
+      </CardContent>
+    </Card>
+  );
+}
+
+const ROOTS_TONE = { default: "muted", configured: "info", disabled: "warning" } as const;
+
+/**
+ * The folders the node's file tools may use, as the node reports them (`features.files`).
+ * Read-only by owner decision: roots are set on the node with the CLI, never from here.
+ */
+export function FileRootsCard({ node }: { node: NodeDetail }) {
+  const { t } = useTranslation(["dashboard"]);
+  const files = node.features?.files ?? null;
+  return (
+    <Card className="min-w-0">
+      <CardHeader>
+        <CardTitle className="text-base">{t("dashboard:nodes.fileRoots.title")}</CardTitle>
+        <CardDescription>{t("dashboard:nodes.fileRoots.description")}</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {files === null ? (
+          <p className="text-sm text-muted-foreground">{t("dashboard:nodes.fileRoots.unknown")}</p>
+        ) : (
+          <>
+            <div className="flex flex-wrap gap-2">
+              <StatusPill tone={ROOTS_TONE[files.source]}>
+                {t(`dashboard:nodes.fileRoots.source.${files.source}`)}
+              </StatusPill>
+              {files.asRoot ? (
+                <StatusPill tone="warning">{t("dashboard:nodes.fileRoots.asRoot")}</StatusPill>
+              ) : null}
+            </div>
+            {files.source === "disabled" ? null : files.roots === null ||
+              files.roots.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                {t("dashboard:nodes.fileRoots.unusable")}
+              </p>
+            ) : (
+              <ul className="divide-y">
+                {files.roots.map((root) => (
+                  <li key={root} className="min-w-0 py-1 font-mono text-xs break-all">
+                    {root}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
+        )}
+        <div className="space-y-1.5">
+          {files?.source === "disabled" ? (
+            <>
+              <p className="text-sm">{t("dashboard:nodes.fileRoots.disabledHint")}</p>
+              <CommandBlock command="wsmp config set-file-tools on" />
+            </>
+          ) : (
+            <>
+              <p className="text-sm">{t("dashboard:nodes.fileRoots.cliHint")}</p>
+              <CommandBlock command="wsmp config set-file-roots ~/models" />
+            </>
+          )}
+        </div>
       </CardContent>
     </Card>
   );

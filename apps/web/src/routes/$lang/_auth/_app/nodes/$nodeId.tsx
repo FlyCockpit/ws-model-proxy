@@ -14,6 +14,7 @@ import {
 import { NodeDetailHeader, NodeDetailSkeleton } from "@/components/nodes/node-detail-header";
 import {
   CredentialsCard,
+  FileRootsCard,
   NodeActivityCard,
   RunsHereCard,
   SecretsCard,
@@ -96,6 +97,7 @@ function NodeDetailPage() {
               node={node.data}
             />
             <SecretsCard node={node.data} />
+            <FileRootsCard node={node.data} />
             <TemporaryCard key={String(node.data.removeAfterOfflineMs)} node={node.data} />
             <CredentialsCard node={node.data} />
           </div>
