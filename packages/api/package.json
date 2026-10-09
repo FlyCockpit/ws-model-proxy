@@ -5,6 +5,9 @@
     "./lib/runtime-spec": {
       "default": "./src/lib/runtime-spec.ts"
     },
+    "./lib/runtime-presets": {
+      "default": "./src/lib/runtime-presets.ts"
+    },
     "./lib/spec-issues": {
       "default": "./src/lib/spec-issues.ts"
     },

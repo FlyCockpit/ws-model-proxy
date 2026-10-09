@@ -1,3 +1,4 @@
+import { RUNTIME_PRESET_LIST } from "@ws-model-proxy/api/lib/runtime-presets";
 import { runtimeSpecSchema } from "@ws-model-proxy/api/lib/runtime-spec";
 import { describe, expect, it } from "vitest";
 
@@ -106,6 +107,16 @@ describe("runtime spec draft", () => {
     expect(back).toEqual(spec);
     expect(sameSpec(back, spec)).toBe(true);
   });
+
+  it.each(RUNTIME_PRESET_LIST.map((preset) => [preset.id, preset] as const))(
+    "creates the %s preset unchanged from the form",
+    (_id, preset) => {
+      const reading = readSpecEditor(editorValues(preset.spec), preset.kind, MESSAGES);
+      expect(reading.ok).toBe(true);
+      if (!reading.ok) return;
+      expect(reading.spec).toEqual(preset.spec);
+    },
+  );
 
   it("writes form edits into the spec, timeouts per command included", () => {
     const values = editorValues(SPECS.vllm);

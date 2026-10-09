@@ -281,7 +281,8 @@ function commandsFromDraft(draft: CommandDraft, base: Record<string, unknown>): 
   );
   return compact({
     start: draft.start,
-    stop: draft.stop,
+    // A process runtime may leave stop out (the node stops the rank itself).
+    stop: optionalText(draft.stop),
     prepare: optionalText(draft.prepare),
     afterJoin: optionalText(draft.afterJoin),
     status: optionalText(draft.status),
