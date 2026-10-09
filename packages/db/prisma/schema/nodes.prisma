@@ -326,6 +326,8 @@ enum NodeAuditKind {
   node_update
   trust_lower
   marked_stopped
+  claim_released
+  claim_release_request
 }
 
 enum NodeAuditOutcome {

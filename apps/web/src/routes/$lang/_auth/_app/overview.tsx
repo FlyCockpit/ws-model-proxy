@@ -221,8 +221,8 @@ function NeedsYouCard({
         onRetry={() => query.refetch()}
       />
     );
-  const { items, queuedCommands } = query.data;
-  if (items.length === 0 && queuedCommands === 0) return null;
+  const { items, queuedCommands, releaseRequests } = query.data;
+  if (items.length === 0 && queuedCommands === 0 && releaseRequests.length === 0) return null;
   return (
     <Card className="border-amber-500/40">
       <CardHeader>
@@ -250,6 +250,24 @@ function NeedsYouCard({
                   <NeedsYouRow item={item} />
                 </Link>
               )}
+            </li>
+          ))}
+          {releaseRequests.slice(0, 10).map((request) => (
+            <li key={request.requestId} className="min-w-0">
+              <Link
+                to="/$lang/runtimes/$runtimeId"
+                params={{ lang, runtimeId: request.runtimeId }}
+                className="flex min-h-[44px] min-w-0 items-center gap-3 py-2 text-sm hover:underline"
+              >
+                <StatusPill tone="busy">
+                  {t("dashboard:overview.needsYou.releaseRequest")}
+                </StatusPill>
+                <span className="min-w-0 flex-1 truncate">{request.runtimeName}</span>
+                <span className="shrink-0 text-xs text-muted-foreground">
+                  <TimeAgo value={request.since} />
+                </span>
+                <ArrowRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+              </Link>
             </li>
           ))}
           {queuedCommands > 0 ? (

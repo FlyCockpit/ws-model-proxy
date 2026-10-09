@@ -524,7 +524,9 @@
         "metric_commands_define": "metric commands sent",
         "node_update": "settings changed",
         "trust_lower": "trust lowered",
-        "marked_stopped": "marked as stopped"
+        "marked_stopped": "marked as stopped",
+        "claim_released": "resources released without proof",
+        "claim_release_request": "release request"
       },
       "outcome": {
         "completed": "done",
@@ -1543,7 +1545,10 @@
       "alias_limit": "Too many aliases. Remove one first.",
       "alias_key_not_allowed": "That key cannot call this pool. Add the pool to the key first.",
       "name_aliased": "One of your model-name aliases already uses that callable ID. Remove the alias or pick another name.",
-      "not_your_command": "Only the agent credential that queued this command can withdraw it."
+      "not_your_command": "Only the agent credential that queued this command can withdraw it.",
+      "not_marked_stopped": "Only a part marked stopped can be released. Mark it stopped first.",
+      "already_released": "These resources are already released.",
+      "release_request_pending": "An agent's release request for this part is already waiting."
     },
     "delete": "Delete runtime",
     "deleteTitle": "Delete {{name}}?",
@@ -2004,6 +2009,35 @@
       "needsYou": "Needs you",
       "node": "On {{node}}",
       "notRunning": "Not running"
+    },
+    "releaseUnproven": {
+      "action": "Release resources…",
+      "review": "Review agent request…",
+      "title": "Release these resources without proof?",
+      "description": "wsmp still can't confirm that the old process on this node stopped, so its port, memory and GPUs stay reserved. Releasing frees them for new instances right away. The old process may still be running: check on the node first that it is gone (no process of it, nothing listening on its port). If it is still running, the next start there fails until you stop it.",
+      "confirm": "Release resources",
+      "approve": "Approve and release",
+      "decline": "Decline request",
+      "pending": "Releasing…",
+      "done": "Resources released.",
+      "declined": "Request declined. The resources stay reserved.",
+      "where": "Where",
+      "place": "{{node}}, port {{port}}",
+      "reasonLabel": "Why the stop isn't confirmed",
+      "reason": {
+        "node_offline": "The node is offline, so it can't check",
+        "node_removed": "The node was removed from wsmp",
+        "no_check": "No automatic check has finished yet",
+        "proven": "The last check confirmed the stop"
+      },
+      "requested": "An agent asks to release",
+      "request": {
+        "title": "The agent's findings",
+        "untrusted": "Written by an agent. wsmp did not check any of it.",
+        "untrustedNamed": "Written by the agent {{agent}}. wsmp did not check any of it.",
+        "command": "Command it ran",
+        "loadFailed": "Couldn't load the agent's request. It may have been withdrawn or have expired."
+      }
     }
   },
   "overview": {
@@ -2039,7 +2073,8 @@
         "STEP": "Step",
         "RESTART": "Restart",
         "MARK_STOPPED": "Mark as stopped"
-      }
+      },
+      "releaseRequest": "Release request"
     },
     "aliasShadows": {
       "title_one": "An alias of yours hides a pool",

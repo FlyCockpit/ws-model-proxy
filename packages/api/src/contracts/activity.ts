@@ -97,6 +97,19 @@ export const needsYouItemSchema = z
   })
   .strict();
 
+/** An agent's pending request that a person release a claim whose stop cannot be proven. */
+export const needsYouReleaseRequestSchema = z
+  .object({
+    requestId: idSchema,
+    instanceId: idSchema,
+    runtimeId: idSchema,
+    runtimeName: z.string(),
+    nodeId: idSchema.nullable(),
+    nodeNumber: z.number().int().min(1),
+    since: isoDateSchema,
+  })
+  .strict();
+
 export const activityContract = {
   metrics: {
     query: query(
@@ -218,14 +231,20 @@ export const activityContract = {
     list: query(
       "session",
       noInputSchema,
-      z.object({ items: z.array(needsYouItemSchema), queuedCommands: z.number().int() }).strict(),
-      "Everything waiting for a person: interactive steps, restarts, unproven stops to mark stopped; queued agent commands.",
+      z
+        .object({
+          items: z.array(needsYouItemSchema),
+          queuedCommands: z.number().int(),
+          releaseRequests: z.array(needsYouReleaseRequestSchema),
+        })
+        .strict(),
+      "Everything waiting for a person: interactive steps, restarts, unproven stops to mark stopped; queued agent commands; agents' release requests.",
     ),
     count: query(
       "session",
       noInputSchema,
       z.object({ count: z.number().int() }).strict(),
-      "How many things wait for a person (the nav badge): instance needs plus queued agent commands.",
+      "How many things wait for a person (the nav badge): instance needs, queued agent commands and release requests.",
     ),
   },
 } as const;

@@ -292,11 +292,21 @@ const commands = {
   }),
 };
 
+/** Agents' release requests still waiting for a person (not expired, the claim still marked stopped). */
+function pendingReleaseRequests(userId: string, now: Date) {
+  return {
+    userId,
+    state: "PENDING" as const,
+    expiresAt: { gt: now },
+    Rank: { claim: "HELD_UNKNOWN" as const },
+  };
+}
+
 const needsYou = {
   list: contractProcedure(c.needsYou.list).handler(async ({ context }) => {
     const userId = context.session.user.id;
     const now = new Date();
-    const [instances, queuedCommands] = await Promise.all([
+    const [instances, queuedCommands, releaseRequests] = await Promise.all([
       prisma.runtimeInstance.findMany({
         where: { userId, needsOperator: { not: null } },
         orderBy: { needsOperatorSince: "asc" },
@@ -332,8 +342,35 @@ const needsYou = {
       prisma.queuedNodeCommand.count({
         where: { userId, state: "QUEUED", expiresAt: { gt: now } },
       }),
+      prisma.claimReleaseRequest.findMany({
+        where: pendingReleaseRequests(userId, now),
+        orderBy: { createdAt: "asc" },
+        take: 200,
+        select: {
+          id: true,
+          createdAt: true,
+          Rank: {
+            select: {
+              rank: true,
+              nodeId: true,
+              Instance: {
+                select: { id: true, runtimeId: true, Runtime: { select: { name: true } } },
+              },
+            },
+          },
+        },
+      }),
     ]);
     return {
+      releaseRequests: releaseRequests.map((request) => ({
+        requestId: request.id,
+        instanceId: request.Rank.Instance.id,
+        runtimeId: request.Rank.Instance.runtimeId,
+        runtimeName: request.Rank.Instance.Runtime.name,
+        nodeId: request.Rank.nodeId,
+        nodeNumber: request.Rank.rank + 1,
+        since: request.createdAt.toISOString(),
+      })),
       items: instances.flatMap((instance) =>
         instance.needsOperator
           ? [
@@ -356,13 +393,15 @@ const needsYou = {
   /** The nav badge: two counts, polled from every page (cheaper than the list). */
   count: contractProcedure(c.needsYou.count).handler(async ({ context }) => {
     const userId = context.session.user.id;
-    const [instances, queued] = await Promise.all([
+    const now = new Date();
+    const [instances, queued, releaseRequests] = await Promise.all([
       prisma.runtimeInstance.count({ where: { userId, needsOperator: { not: null } } }),
       prisma.queuedNodeCommand.count({
-        where: { userId, state: "QUEUED", expiresAt: { gt: new Date() } },
+        where: { userId, state: "QUEUED", expiresAt: { gt: now } },
       }),
+      prisma.claimReleaseRequest.count({ where: pendingReleaseRequests(userId, now) }),
     ]);
-    return { count: instances + queued };
+    return { count: instances + queued + releaseRequests };
   }),
 };
 

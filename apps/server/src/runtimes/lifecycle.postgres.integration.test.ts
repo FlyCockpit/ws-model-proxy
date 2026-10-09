@@ -747,6 +747,66 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     expect(row.Ranks[0]?.claim).toBe("RELEASED");
   });
 
+  it("an automatic restart clears the old run's mark as stopped, release record and requests", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_108);
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "start"), "failed", { error: "command_failed" });
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "stop"), "succeeded", { stopped: true });
+    let row = await instance(id);
+    expect(row.phase).toBe("STOPPED");
+    const rankId = row.Ranks[0]?.id ?? "";
+    // As if the run had been marked stopped and then released by a person without proof, with
+    // an agent's request still pending.
+    const at = new Date(Date.now() - 60_000);
+    await m.fixture.instanceRank.update({
+      where: { id: rankId },
+      data: {
+        markedStoppedAt: at,
+        markedStoppedBy: userId,
+        lastStopCheckAt: at,
+        releasedUnprovenAt: at,
+        releasedUnprovenBy: userId,
+        releasedUnprovenReason: "status_running",
+      },
+    });
+    const request = await m.fixture.claimReleaseRequest.create({
+      data: {
+        userId,
+        rankId,
+        pendingRankId: rankId,
+        agentTokenId: "tok-restart",
+        findings: "checked",
+        expiresAt: new Date(Date.now() + 3_600_000),
+      },
+      select: { id: true },
+    });
+    await m.fixture.runtimeInstance.update({
+      where: { id },
+      data: { nextRestartAt: new Date(Date.now() - 1_000) },
+    });
+    await lc.runOnce();
+    row = await instance(id);
+    expect(row.phase).toBe("STARTING");
+    expect(row.Ranks[0]).toMatchObject({
+      claim: "HELD",
+      stoppedAt: null,
+      markedStoppedAt: null,
+      markedStoppedBy: null,
+      lastStopCheckAt: null,
+      releasedUnprovenAt: null,
+      releasedUnprovenBy: null,
+      releasedUnprovenReason: null,
+    });
+    expect(
+      await m.fixture.claimReleaseRequest.findUniqueOrThrow({
+        where: { id: request.id },
+        select: { state: true, pendingRankId: true },
+      }),
+    ).toEqual({ state: "CLEARED", pendingRankId: null });
+  });
+
   it("probes a stop again in a later run of the same instance (probe sequences never clash)", async () => {
     const lc = await engine();
     const id = await startInstance(30_110);

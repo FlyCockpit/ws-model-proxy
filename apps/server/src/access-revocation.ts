@@ -85,7 +85,8 @@ export async function handleAccessRevoked(
 /**
  * The agent credentials' in-flight node file ops end now (and admissions still reading for
  * them refuse), synchronously before anything awaits; their queued commands expire
- * (`credential_revoked`, or `credential_lowered` for a grant lowered to Read-only). Their
+ * (`credential_revoked`, or `credential_lowered` for a grant lowered to Read-only), and their
+ * pending release requests are cleared. Their
  * running node commands are cancelled by the node command tracker
  * (`cancelNodeCommandsForCredentials`).
  */
@@ -104,5 +105,15 @@ export async function endAgentWork(input: EndAgentWorkInput): Promise<void> {
       decidedBy: null,
       outcome: input.outcome ?? "credential_revoked",
     },
+  });
+  // Their release requests no longer speak for a working agent: a person can still release the
+  // claim directly.
+  await prisma.claimReleaseRequest.updateMany({
+    where: {
+      userId: input.userId,
+      state: "PENDING",
+      OR: [{ agentTokenId: { in: ids } }, { mcpGrantId: { in: ids } }],
+    },
+    data: { state: "CLEARED", pendingRankId: null, decidedAt: new Date() },
   });
 }

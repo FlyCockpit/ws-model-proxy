@@ -301,7 +301,9 @@ function record(value: unknown): Record<string, unknown> {
  * - runtime_update: runtimes.update, then runtimes.models.setCapabilities per entry;
  * - pool_update: `contribute` → addContributed / removeContributed per id, any other change
  *   → pools.update first;
- * - runtime_stop: `markStopped` → runtimes.instances.markStopped, else runtimes.stop;
+ * - runtime_stop: `requestRelease` → runtimes.releaseRequests.create (or `"withdraw"` →
+ *   runtimes.releaseRequests.withdraw), `markStopped` → runtimes.instances.markStopped, else
+ *   runtimes.stop;
  * - node_secret_set: value null → nodes.secrets.delete, else nodes.secrets.set.
  */
 export function routeToolCall(name: string, args: Record<string, unknown>): ProcedureCall[] {
@@ -397,6 +399,17 @@ export function routeToolCall(name: string, args: Record<string, unknown>): Proc
       return calls;
     }
     case "runtime_stop":
+      if (args.requestRelease !== undefined) {
+        const target = pick(args, ["instanceId", "nodeNumber"]);
+        return args.requestRelease === "withdraw"
+          ? [{ path: "runtimes.releaseRequests.withdraw", input: target }]
+          : [
+              {
+                path: "runtimes.releaseRequests.create",
+                input: { ...target, ...record(args.requestRelease) },
+              },
+            ];
+      }
       if (args.markStopped === true)
         return [
           {

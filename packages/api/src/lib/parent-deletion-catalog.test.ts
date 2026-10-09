@@ -98,6 +98,7 @@ const GRAPH_TABLES: Record<string, string> = {
   node_enrollment_use: "one row per enrolled node",
   node_command: "node command state, 30-day retention",
   queued_node_command: "commands queued for a person, expire",
+  claim_release_request: "release requests for a person, at most one pending per claim, expire",
   fabric: "configuration",
   fabric_member: "configuration",
   runtime: "configuration",
@@ -159,6 +160,8 @@ const REACHED_DELETE_TRIGGERS: Record<string, string> = {
  */
 const PLAIN_USER_ID_EXEMPT: Record<string, string> = {
   node_enrollment_use: "cascades with its enrollment code (node_enrollment_code → user)",
+  claim_release_request:
+    "cascades with its rank (instance_rank → runtime_instance → runtime → user); userId scopes reads",
 };
 
 /** Tables with a plain `userId` column (owner) and no relation on it. */

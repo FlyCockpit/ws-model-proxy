@@ -13,7 +13,7 @@ BEGIN;
 LOCK TABLE "user", session, node, node_credential, node_enrollment_code, node_enrollment_use,
   fabric, fabric_member, node_command, node_audit_event,
   queued_node_command, runtime, runtime_version, runtime_model, runtime_share, runtime_instance,
-  instance_rank, instance_step, runtime_operation, execution_target, profile, profile_node,
+  instance_rank, claim_release_request, instance_step, runtime_operation, execution_target, profile, profile_node,
   profile_item, pool, pool_routing, pool_fallback, pool_advanced, pool_sidecar, pool_member,
   pool_routing_rule, api_key, api_key_pool, agent_token, share, share_invite, provider_account,
   provider_model,
@@ -424,6 +424,11 @@ BEGIN
          "phaseChangedAt" = now(), "needsOperator" = NULL, "needsOperatorSince" = NULL
    WHERE i."desiredState" IS NOT NULL AND i.phase <> 'STOPPED'
      AND EXISTS (SELECT 1 FROM instance_rank r WHERE r."instanceId" = i.id AND r."nodeId" = OLD.id);
+  -- Agents' release requests for those claims have nothing left to release.
+  UPDATE claim_release_request
+     SET state = 'CLEARED', "pendingRankId" = NULL, "decidedAt" = now()
+   WHERE state = 'PENDING'
+     AND "rankId" IN (SELECT id FROM instance_rank WHERE "nodeId" = OLD.id AND claim <> 'RELEASED');
   UPDATE instance_rank
      SET claim = 'RELEASED', "claimChangedAt" = now(), "stoppedAt" = COALESCE("stoppedAt", now())
    WHERE "nodeId" = OLD.id AND claim <> 'RELEASED';
@@ -663,11 +668,48 @@ ALTER TABLE instance_rank ADD CONSTRAINT instance_rank_claim_shape CHECK (
   (claim <> 'HELD_UNKNOWN' OR "markedStoppedAt" IS NOT NULL)
   AND (claim <> 'RELEASED' OR "stoppedAt" IS NOT NULL)
   AND ("markedStoppedAt" IS NULL) = ("markedStoppedBy" IS NULL)
+  -- Released without proof by a person: who and when together, and only on a released claim.
+  AND ("releasedUnprovenAt" IS NULL) = ("releasedUnprovenBy" IS NULL)
+  AND ("releasedUnprovenAt" IS NULL OR claim = 'RELEASED')
 );
 -- The held-unknown probe sweep takes these rows least recently checked first.
 DROP INDEX IF EXISTS instance_rank_held_unknown_id;
 CREATE INDEX IF NOT EXISTS instance_rank_held_unknown_check
   ON instance_rank ("lastStopCheckAt" ASC NULLS FIRST, id) WHERE claim = 'HELD_UNKNOWN';
+-- An agent's request that a person release a claim marked stopped: through exactly one agent
+-- credential, bounded text, PENDING exactly while it holds the claim's one pending slot
+-- ("pendingRankId" is unique), decided once, the agent's words never change.
+ALTER TABLE claim_release_request DROP CONSTRAINT IF EXISTS claim_release_request_shape;
+ALTER TABLE claim_release_request ADD CONSTRAINT claim_release_request_shape CHECK (
+  char_length(findings) BETWEEN 1 AND 4000
+  AND num_nonnulls("agentTokenId", "mcpGrantId") = 1
+  AND (evidence IS NULL OR (jsonb_typeof(evidence) = 'array' AND jsonb_array_length(evidence) <= 8
+    AND octet_length(evidence::text) <= 262144))
+  AND "expiresAt" > "createdAt"
+  AND "expiresAt" <= "createdAt" + interval '7 days'
+  AND (state = 'PENDING') = ("pendingRankId" IS NOT NULL)
+  AND ("pendingRankId" IS NULL OR "pendingRankId" = "rankId")
+  AND (state = 'PENDING') = ("decidedAt" IS NULL)
+  AND (state NOT IN ('APPROVED', 'DECLINED') OR "decidedBy" IS NOT NULL)
+);
+CREATE OR REPLACE FUNCTION enforce_claim_release_request_transition()
+RETURNS trigger LANGUAGE plpgsql AS $claim_release_request_transition$
+BEGIN
+  IF (NEW.findings, NEW.evidence, NEW."rankId", NEW."userId", NEW."agentTokenId",
+      NEW."mcpGrantId", NEW."expiresAt", NEW."createdAt")
+     IS DISTINCT FROM (OLD.findings, OLD.evidence, OLD."rankId", OLD."userId",
+      OLD."agentTokenId", OLD."mcpGrantId", OLD."expiresAt", OLD."createdAt") THEN
+    RAISE EXCEPTION 'a release request is immutable' USING ERRCODE = '55000';
+  END IF;
+  IF OLD.state <> 'PENDING' AND NEW.state IS DISTINCT FROM OLD.state THEN
+    RAISE EXCEPTION 'a release request is decided once' USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END;
+$claim_release_request_transition$;
+DROP TRIGGER IF EXISTS claim_release_request_transition ON claim_release_request;
+CREATE TRIGGER claim_release_request_transition BEFORE UPDATE ON claim_release_request
+FOR EACH ROW EXECUTE FUNCTION enforce_claim_release_request_transition();
 -- A rank claims, and a step runs on, a node of the instance's owner only: the relay sends a
 -- step's job to its node, so this keeps one user's commands off another user's nodes. A step's
 -- node is checked when it is written (no foreign key: a deleted node leaves its steps).

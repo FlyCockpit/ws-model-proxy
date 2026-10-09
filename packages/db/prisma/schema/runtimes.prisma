@@ -371,36 +371,90 @@ enum ClaimState {
 
 /// One rank of an instance on one node: its resource and port claim.
 model InstanceRank {
-  id              String     @id @default(cuid(2))
-  instanceId      String
+  id                     String     @id @default(cuid(2))
+  instanceId             String
   /// Null after the node was deleted (claim RELEASED by node_delete_release; the row keeps the
   /// rank so the gang stop of the other ranks completes).
-  nodeId          String?
+  nodeId                 String?
   /// Deterministic from (handle, rank): `wsmp-<handle>-r<rank>`; the held-unknown probe
   /// needs no local record.
-  unitName        String
-  rank            Int
-  resources       Json
-  port            Int
-  distPort        Int?
-  portFixed       Boolean    @default(false)
-  claim           ClaimState @default(HELD)
-  claimChangedAt  DateTime   @default(now())
+  unitName               String
+  rank                   Int
+  resources              Json
+  port                   Int
+  distPort               Int?
+  portFixed              Boolean    @default(false)
+  claim                  ClaimState @default(HELD)
+  claimChangedAt         DateTime   @default(now())
   /// New claims may queue behind this stopping instance, never dispatched before it releases.
-  blockedBy       String[]   @default([])
-  stoppedAt       DateTime?
-  markedStoppedAt DateTime?
-  markedStoppedBy String?
+  blockedBy              String[]   @default([])
+  stoppedAt              DateTime?
+  markedStoppedAt        DateTime?
+  markedStoppedBy        String?
   /// When the held-unknown probe pass last looked at this claim (null: never). The pass takes the
   /// oldest first, so every claim marked stopped is reached however many there are.
-  lastStopCheckAt DateTime?
+  lastStopCheckAt        DateTime?
+  /// A person released this claim without proof the service stopped ("I've checked, release
+  /// it"): when, who (user id) and the stop check's reason at that moment (`status_running`,
+  /// `port_in_use`, `node_offline`, ...). Cleared when a restart retakes the claim.
+  releasedUnprovenAt     DateTime?
+  releasedUnprovenBy     String?
+  releasedUnprovenReason String?
 
-  Instance RuntimeInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Node     Node?           @relation(fields: [nodeId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  Instance        RuntimeInstance       @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Node            Node?                 @relation(fields: [nodeId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  ReleaseRequests ClaimReleaseRequest[]
 
   @@unique([instanceId, rank])
   @@index([nodeId, claim])
   @@map("instance_rank")
+}
+
+enum ClaimReleaseRequestState {
+  PENDING
+  /// A person approved it: the claim was released without proof.
+  APPROVED
+  DECLINED
+  /// The requesting agent took it back.
+  WITHDRAWN
+  EXPIRED
+  /// The hold ended without this request: a stop proof released the claim, a restart retook
+  /// it, a person released it directly, or the agent's credential was revoked.
+  CLEARED
+}
+
+/// An agent's request that a person release a claim whose stop cannot be proven (a rank marked
+/// stopped, HELD_UNKNOWN), with what the agent found on the node. Only a person approves it
+/// (`runtimes.releaseRequests.approve`, the same release as `runtimes.instances.releaseUnproven`).
+/// The findings are the agent's words: untrusted data, shown as such.
+model ClaimReleaseRequest {
+  id            String                   @id @default(cuid(2))
+  createdAt     DateTime                 @default(now())
+  updatedAt     DateTime                 @default(now()) @updatedAt
+  userId        String
+  rankId        String
+  /// The rank id while PENDING, null once decided: at most one pending request per claim.
+  pendingRankId String?                  @unique
+  agentTokenId  String?
+  /// The agent's OAuth grant when an OAuth client asked; `agentTokenId` when an agent token did.
+  mcpGrantId    String?
+  /// ≤ 4,000 characters, cleaned like node command output (controls removed, credentials redacted).
+  findings      String
+  /// [{ command, output }] the agent ran, cleaned the same way; at most 8 entries.
+  evidence      Json?
+  state         ClaimReleaseRequestState @default(PENDING)
+  /// 24 h after creation.
+  expiresAt     DateTime
+  decidedAt     DateTime?
+  /// The person who approved or declined it.
+  decidedBy     String?
+
+  Rank InstanceRank @relation(fields: [rankId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([userId, state, expiresAt])
+  @@index([rankId])
+  @@index([state, expiresAt])
+  @@map("claim_release_request")
 }
 
 enum StepPhase {

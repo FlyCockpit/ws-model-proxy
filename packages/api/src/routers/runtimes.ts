@@ -60,6 +60,7 @@ import { deliverInvite, writeInvite } from "../lib/share-invite-write";
 import { latestStopChecks, stopCheckKey } from "../lib/stop-evidence";
 import { normalizeBaseUrl, parseDetectedServers } from "../nodes/views";
 import { runtimeStart, runtimeStop } from "./runtime-lifecycle";
+import { runtimeReleaseRequests, runtimeReleaseUnproven } from "./runtime-release";
 import { runtimeSteps } from "./runtime-steps";
 
 function userIdOf(context: SignedInContext): string {
@@ -931,7 +932,9 @@ export const runtimesRouter = {
         readLiveLoad(context.services?.liveLoad, [row.id]),
       );
     }),
+    releaseUnproven: runtimeReleaseUnproven,
   },
+  releaseRequests: runtimeReleaseRequests,
 
   models: {
     setCapabilities: contractProcedure(c.models.setCapabilities).handler(

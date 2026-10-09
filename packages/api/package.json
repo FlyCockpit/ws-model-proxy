@@ -32,6 +32,9 @@
     "./lib/graph-write": {
       "default": "./src/lib/graph-write.ts"
     },
+    "./lib/claim-release": {
+      "default": "./src/lib/claim-release.ts"
+    },
     "./lib/runtime-store": {
       "default": "./src/lib/runtime-store.ts"
     },

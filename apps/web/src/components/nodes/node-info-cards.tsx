@@ -25,6 +25,7 @@ import { z } from "zod";
 
 import { InlineRetry } from "@/components/inline-retry";
 import { MarkStoppedAction, StopNotConfirmedHelp } from "@/components/runtimes/mark-stopped";
+import { ReleaseUnprovenAction } from "@/components/runtimes/release-unproven";
 import { TimeAgo } from "@/components/time-ago";
 import { orpc } from "@/utils/orpc";
 
@@ -314,6 +315,14 @@ export function RunsHereCard({ node, lang }: { node: NodeDetail; lang: string })
                   </>
                 ) : instance.needsOperator ? (
                   <StatusPill tone="warning">{t("dashboard:nodes.runs.needsYou")}</StatusPill>
+                ) : null}
+                {/* Marked stopped, its stop still not proven: a person may release it. */}
+                {instance.reserved === "HELD_UNKNOWN" ? (
+                  <ReleaseUnprovenAction
+                    runtimeId={instance.runtimeId}
+                    instanceId={instance.instanceId}
+                    nodeNumber={instance.nodeNumber}
+                  />
                 ) : null}
               </li>
             ))}
