@@ -1541,7 +1541,8 @@
       "alias_shadowed": "Ese nombre ya es uno de tus ID invocables.",
       "alias_limit": "Demasiados alias. Elimina uno primero.",
       "alias_key_not_allowed": "Esa clave no puede llamar a este pool. Agrega el pool a la clave primero.",
-      "name_aliased": "Uno de tus alias de nombre de modelo ya usa ese ID invocable. Elimina el alias o elige otro nombre."
+      "name_aliased": "Uno de tus alias de nombre de modelo ya usa ese ID invocable. Elimina el alias o elige otro nombre.",
+      "not_your_command": "Solo la credencial de agente que puso este comando en espera puede retirarlo."
     },
     "delete": "Eliminar runtime",
     "deleteTitle": "¿Eliminar {{name}}?",

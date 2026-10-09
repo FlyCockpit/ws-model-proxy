@@ -464,7 +464,7 @@ ALTER TABLE queued_node_command ADD CONSTRAINT queued_node_command_shape CHECK (
   AND (state = 'QUEUED') = ("decidedAt" IS NULL)
   AND (state = 'QUEUED' OR "decidedBy" IS NOT NULL OR state = 'EXPIRED')
 );
--- QUEUED → RUN | DISMISSED | EXPIRED | REFUSED, once; the text never changes.
+-- QUEUED → RUN | DISMISSED | EXPIRED | REFUSED | WITHDRAWN, once; the text never changes.
 CREATE OR REPLACE FUNCTION enforce_queued_node_command_transition()
 RETURNS trigger LANGUAGE plpgsql AS $queued_node_command_transition$
 BEGIN

@@ -111,6 +111,9 @@ export const REFUSAL_REASONS = [
   // Model-name collisions (packages/api/src/lib/model-names.ts).
   /** A new callable ID of the caller's own pools (pool or account slug) equals their alias. */
   "name_aliased",
+  // Queued command expiry and withdrawal.
+  /** An agent withdraws only a command its own credential queued for a person. */
+  "not_your_command",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

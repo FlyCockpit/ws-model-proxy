@@ -37,6 +37,9 @@
  *     ENGINE_LOAD_ROLLUP_MINUTE_RETENTION_DAYS (per-instance engine load).
  *  9. Delete node_metrics_minute rows older than
  *     NODE_METRICS_MINUTE_RETENTION_DAYS (CLI node-card sparklines).
+ * 10. Commands agents queued for a person (queued_node_command): store EXPIRED on QUEUED rows
+ *     past `expiresAt` (readers already show them as expired), then delete rows decided more
+ *     than QUEUED_NODE_COMMAND_RETENTION_DAYS ago (the audit event keeps the digest).
  *
  * Multi-replica safety: every batch selects its rows with
  * `FOR UPDATE SKIP LOCKED`, so concurrent sweepers work on disjoint rows; the
@@ -87,6 +90,8 @@ export const USAGE_RETENTION_INTERVAL_MS = 60 * 60 * 1000;
 /** Node audit events (agent and person actions on nodes, operator terminals) are kept this long. */
 export const NODE_AUDIT_RETENTION_DAYS = 90;
 export const USAGE_RETENTION_BATCH = 1000;
+/** A queued command is deleted this long after it was decided (run, dismissed, expired, ...). */
+export const QUEUED_NODE_COMMAND_RETENTION_DAYS = 7;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
@@ -112,6 +117,8 @@ export type UsageRetentionResult = {
   kvEvictionsDeleted: number;
   runtimeLoadMinutesDeleted: number;
   nodeMetricsMinutesDeleted: number;
+  queuedCommandsExpired: number;
+  queuedCommandsDeleted: number;
   admissionHistoryPruned: number;
   deletedUserRowsPurged: number;
   orphanSchedulersDeleted: number;
@@ -465,6 +472,72 @@ export async function deleteExpiredNodeMetricsMinutes({
   }
 }
 
+/**
+ * Stores EXPIRED on QUEUED commands past their expiry. Same settlement as the read path
+ * (routers/node-operator.ts): no `decidedBy`, no outcome. The state guard is repeated on the
+ * outer UPDATE so a row a person ran or dismissed meanwhile is never overwritten (the
+ * `queued_node_command_transition` trigger refuses it too).
+ */
+export async function expireOverdueQueuedNodeCommands({
+  prisma = defaultPrisma as RetentionPrisma,
+  now,
+  batch = USAGE_RETENTION_BATCH,
+}: {
+  prisma?: RetentionPrisma;
+  now: Date;
+  batch?: number;
+}): Promise<number> {
+  let expired = 0;
+  for (;;) {
+    if (isDbShutdownFenceArmed()) return expired;
+    const count = await prisma.$executeRaw`
+      UPDATE queued_node_command
+         SET state = 'EXPIRED'::"QueuedCommandState", "decidedAt" = ${now},
+             "decidedBy" = NULL, outcome = NULL, "updatedAt" = ${now}
+       WHERE state = 'QUEUED'::"QueuedCommandState"
+         AND "expiresAt" <= ${now}
+         AND id = ANY(ARRAY(
+           SELECT id FROM queued_node_command
+            WHERE state = 'QUEUED'::"QueuedCommandState" AND "expiresAt" <= ${now}
+            ORDER BY "expiresAt"
+            LIMIT ${batch}
+            FOR UPDATE SKIP LOCKED))`;
+    expired += count;
+    if (count < batch) return expired;
+  }
+}
+
+/** Deletes queued commands decided more than `retentionDays` ago (never a QUEUED one). */
+export async function deleteDecidedQueuedNodeCommands({
+  prisma = defaultPrisma as RetentionPrisma,
+  now,
+  retentionDays = QUEUED_NODE_COMMAND_RETENTION_DAYS,
+  batch = USAGE_RETENTION_BATCH,
+}: {
+  prisma?: RetentionPrisma;
+  now: Date;
+  retentionDays?: number;
+  batch?: number;
+}): Promise<number> {
+  const cutoff = new Date(now.getTime() - retentionDays * DAY_MS);
+  let deleted = 0;
+  for (;;) {
+    if (isDbShutdownFenceArmed()) return deleted;
+    const count = await prisma.$executeRaw`
+      DELETE FROM queued_node_command
+       WHERE state <> 'QUEUED'::"QueuedCommandState"
+         AND "decidedAt" < ${cutoff}
+         AND id = ANY(ARRAY(
+           SELECT id FROM queued_node_command
+            WHERE state <> 'QUEUED'::"QueuedCommandState" AND "decidedAt" < ${cutoff}
+            ORDER BY "decidedAt"
+            LIMIT ${batch}
+            FOR UPDATE SKIP LOCKED))`;
+    deleted += count;
+    if (count < batch) return deleted;
+  }
+}
+
 export async function runUsageRetention({
   prisma = defaultPrisma as RetentionPrisma,
   retentionDays,
@@ -503,6 +576,9 @@ export async function runUsageRetention({
   const kvEvictionsDeleted = await deleteExpiredKvEvictions({ prisma, now, batch });
   const runtimeLoadMinutesDeleted = await deleteExpiredRuntimeLoadMinutes({ prisma, now, batch });
   const nodeMetricsMinutesDeleted = await deleteExpiredNodeMetricsMinutes({ prisma, now, batch });
+  // Expire first: a row expired now is deleted 7 days later, by a later sweep.
+  const queuedCommandsExpired = await expireOverdueQueuedNodeCommands({ prisma, now, batch });
+  const queuedCommandsDeleted = await deleteDecidedQueuedNodeCommands({ prisma, now, batch });
   const admissionHistoryPruned = await pruneTerminalCapacityHistory(prisma, {
     before: new Date(now.getTime() - retentionDays * DAY_MS),
     batch: sweepBatch,
@@ -526,6 +602,8 @@ export async function runUsageRetention({
     kvEvictionsDeleted,
     runtimeLoadMinutesDeleted,
     nodeMetricsMinutesDeleted,
+    queuedCommandsExpired,
+    queuedCommandsDeleted,
     admissionHistoryPruned,
     deletedUserRowsPurged: purged.rows,
     orphanSchedulersDeleted,
@@ -565,10 +643,12 @@ export function startUsageRetention({
         result.routingVerdictsDeleted +
         result.kvEvictionsDeleted +
         result.runtimeLoadMinutesDeleted +
-        result.nodeMetricsMinutesDeleted;
+        result.nodeMetricsMinutesDeleted +
+        result.queuedCommandsExpired +
+        result.queuedCommandsDeleted;
       if (total > 0)
         console.log(
-          `[metrics] retention: reaped ${result.abandonedReaped}, deleted ${result.relayRequestsDeleted} relay request(s), compacted ${result.minuteRowsCompacted} minute rollup(s), deleted ${result.hourRowsDeleted} hourly rollup(s), deleted ${result.nodeAuditEventsDeleted} node audit event(s), deleted ${result.nodeCommandsDeleted} node command(s), pruned ${result.admissionHistoryPruned} admission request(s), purged ${result.deletedUserRowsPurged} deleted-user row(s), deleted ${result.orphanSchedulersDeleted} orphan scheduler row(s), deleted ${result.expiredStickinessDeleted} expired stickiness binding(s), deleted ${result.routingVerdictsDeleted} expired routing verdict(s), deleted ${result.kvEvictionsDeleted} expired KV feedback row(s), deleted ${result.runtimeLoadMinutesDeleted} runtime-load minute row(s), deleted ${result.nodeMetricsMinutesDeleted} node-metrics minute row(s).`,
+          `[metrics] retention: reaped ${result.abandonedReaped}, deleted ${result.relayRequestsDeleted} relay request(s), compacted ${result.minuteRowsCompacted} minute rollup(s), deleted ${result.hourRowsDeleted} hourly rollup(s), deleted ${result.nodeAuditEventsDeleted} node audit event(s), deleted ${result.nodeCommandsDeleted} node command(s), pruned ${result.admissionHistoryPruned} admission request(s), purged ${result.deletedUserRowsPurged} deleted-user row(s), deleted ${result.orphanSchedulersDeleted} orphan scheduler row(s), deleted ${result.expiredStickinessDeleted} expired stickiness binding(s), deleted ${result.routingVerdictsDeleted} expired routing verdict(s), deleted ${result.kvEvictionsDeleted} expired KV feedback row(s), deleted ${result.runtimeLoadMinutesDeleted} runtime-load minute row(s), deleted ${result.nodeMetricsMinutesDeleted} node-metrics minute row(s), expired ${result.queuedCommandsExpired} and deleted ${result.queuedCommandsDeleted} queued command(s).`,
         );
     } catch (error) {
       // Prisma errors can carry SQL and parameters; log the class only.

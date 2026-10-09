@@ -1541,7 +1541,8 @@
       "alias_shadowed": "That name is already one of your callable IDs.",
       "alias_limit": "Too many aliases. Remove one first.",
       "alias_key_not_allowed": "That key cannot call this pool. Add the pool to the key first.",
-      "name_aliased": "One of your model-name aliases already uses that callable ID. Remove the alias or pick another name."
+      "name_aliased": "One of your model-name aliases already uses that callable ID. Remove the alias or pick another name.",
+      "not_your_command": "Only the agent credential that queued this command can withdraw it."
     },
     "delete": "Delete runtime",
     "deleteTitle": "Delete {{name}}?",

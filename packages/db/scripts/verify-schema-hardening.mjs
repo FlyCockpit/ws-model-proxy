@@ -772,6 +772,23 @@ try {
     `UPDATE queued_node_command SET state = 'RUN' WHERE id = 'q-1'`,
     "55000",
   );
+  // An agent withdraws its own QUEUED command, naming its credential; it is decided once too.
+  await client.query(`
+    INSERT INTO queued_node_command (id, "userId", "nodeId", "agentTokenId", command, "expiresAt")
+    VALUES ('q-2', 'owner-a', 'node-a1', 'tok-1', 'sudo apt install x', now() + interval '1 day')`);
+  await expectFailure(
+    "queued_node_command_shape withdrawn without who decided",
+    `UPDATE queued_node_command SET state = 'WITHDRAWN', "decidedAt" = now() WHERE id = 'q-2'`,
+    "23514",
+  );
+  await client.query(
+    `UPDATE queued_node_command SET state = 'WITHDRAWN', "decidedAt" = now(), "decidedBy" = 'tok-1' WHERE id = 'q-2'`,
+  );
+  await expectFailure(
+    "queued_node_command_transition after a withdrawal",
+    `UPDATE queued_node_command SET state = 'DISMISSED', "decidedBy" = 'owner-a' WHERE id = 'q-2'`,
+    "55000",
+  );
 
   // ── runtimes ──
   await expectFailure(

@@ -279,7 +279,7 @@ export function toQueuedCommandView(row: {
   nodeId: string;
   command: string;
   note: string | null;
-  state: "QUEUED" | "RUN" | "DISMISSED" | "EXPIRED" | "REFUSED";
+  state: z.infer<typeof queuedCommandViewSchema>["state"];
   agentTokenId: string | null;
   createdAt: Date;
   expiresAt: Date;
