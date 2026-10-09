@@ -11,6 +11,7 @@ import {
 } from "./advanced";
 import {
   actorRefSchema,
+  CLAIM_RELEASE_REQUEST_STATE,
   CLAIM_STATE,
   confirmDeleteSchema,
   DESIRED_STATE,
@@ -98,6 +99,54 @@ export const instanceRankViewSchema = z
       .object({ at: isoDateSchema, proven: z.boolean(), errorCode: z.string().nullable() })
       .strict()
       .nullable(),
+    /**
+     * A person released this claim without proof the service stopped: when, and the stop
+     * check's reason then (`status_running`, `port_in_use`, `node_offline`, ...). Null otherwise.
+     */
+    releasedUnproven: z.object({ at: isoDateSchema, reason: z.string() }).strict().nullable(),
+    /** An agent's pending request that a person release this claim (marked stopped). */
+    releaseRequestId: idSchema.nullable(),
+  })
+  .strict();
+
+/** A command an agent ran on the node and what it printed (cleaned, bounded). */
+export const releaseEvidenceSchema = z
+  .object({ command: z.string().min(1).max(2_000), output: z.string().max(4_000) })
+  .strict();
+
+/** Findings an agent gives a person with a release request: its own words, untrusted. */
+export const releaseFindingsSchema = z.string().trim().min(1).max(4_000);
+
+/**
+ * An agent's request that a person release a claim whose stop cannot be proven. `findings` and
+ * `evidence` are the agent's words (cleaned like node command output): untrusted data.
+ */
+export const releaseRequestViewSchema = z
+  .object({
+    id: idSchema,
+    instanceId: idSchema,
+    runtimeId: idSchema,
+    runtimeName: z.string(),
+    nodeNumber: z.number().int().min(1),
+    nodeId: idSchema.nullable(),
+    nodeSlug: z.string().nullable(),
+    state: z.enum(CLAIM_RELEASE_REQUEST_STATE),
+    /** Display only: the agent token's name, or the OAuth client's. */
+    agentName: z.string().nullable(),
+    findings: z.string(),
+    evidence: z.array(releaseEvidenceSchema),
+    createdAt: isoDateSchema,
+    expiresAt: isoDateSchema,
+    decidedAt: isoDateSchema.nullable(),
+  })
+  .strict();
+
+/** What an agent gets back for its request (compact). */
+export const releaseRequestStatusSchema = z
+  .object({
+    requestId: idSchema,
+    state: z.enum(CLAIM_RELEASE_REQUEST_STATE),
+    expiresAt: isoDateSchema,
   })
   .strict();
 
@@ -628,6 +677,65 @@ export const runtimesContract = {
       instanceViewSchema,
       "Mark stopped an instance whose stop cannot be proven: resources stay counted until a probe proves the stop. Agents: Full-control nodes only (trust_relay), with confirm MARK_STOPPED; audited on the node.",
       ["runtime_stop"],
+    ),
+    /**
+     * People only: "I've checked, release it". Frees the resources and ports of a node's part
+     * marked stopped (HELD_UNKNOWN) whose stop the node cannot prove; the old process may still
+     * run. Audited on the node (`claim_released`).
+     */
+    releaseUnproven: mutation(
+      "human",
+      z
+        .object({
+          instanceId: idSchema,
+          nodeNumber: z.number().int().min(1),
+          note: noteSchema.optional(),
+        })
+        .strict(),
+      instanceViewSchema,
+      "Release the resources of a node's part marked stopped whose stop cannot be proven (the person checked the node).",
+    ),
+  },
+  /** Agents ask; only a person approves (the same release as `instances.releaseUnproven`). */
+  releaseRequests: {
+    list: query(
+      "session",
+      z.object({ instanceId: idSchema.optional() }).strict(),
+      z.object({ items: z.array(releaseRequestViewSchema) }).strict(),
+      "Pending agent requests to release a claim whose stop cannot be proven.",
+    ),
+    create: mutation(
+      "agent",
+      z
+        .object({
+          instanceId: idSchema,
+          nodeNumber: z.number().int().min(1).default(1),
+          findings: releaseFindingsSchema,
+          evidence: z.array(releaseEvidenceSchema).max(8).optional(),
+        })
+        .strict(),
+      releaseRequestStatusSchema,
+      "Ask a person to release a node's part marked stopped whose stop the node cannot prove, with what you checked. One pending request per part; expires in 24 h.",
+      ["runtime_stop"],
+    ),
+    withdraw: mutation(
+      "agent",
+      z.object({ instanceId: idSchema, nodeNumber: z.number().int().min(1).default(1) }).strict(),
+      releaseRequestStatusSchema,
+      "Take back your own pending release request.",
+      ["runtime_stop"],
+    ),
+    approve: mutation(
+      "human",
+      z.object({ requestId: idSchema, note: noteSchema.optional() }).strict(),
+      instanceViewSchema,
+      "Approve an agent's release request: the same release as releaseUnproven.",
+    ),
+    decline: mutation(
+      "human",
+      z.object({ requestId: idSchema }).strict(),
+      releaseRequestViewSchema,
+      "Decline an agent's release request; the claim stays held.",
     ),
   },
   models: {

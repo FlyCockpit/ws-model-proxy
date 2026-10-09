@@ -78,6 +78,8 @@ export const NODE_AUDIT_KIND = [
   "node_update",
   "trust_lower",
   "marked_stopped",
+  "claim_released",
+  "claim_release_request",
 ] as const;
 export const NODE_AUDIT_OUTCOME = [
   "completed",
@@ -129,6 +131,14 @@ export const INSTANCE_PHASE = [
 ] as const;
 export const OPERATOR_NEED = ["STEP", "RESTART", "MARK_STOPPED"] as const;
 export const CLAIM_STATE = ["HELD", "RELEASED", "HELD_UNKNOWN"] as const;
+export const CLAIM_RELEASE_REQUEST_STATE = [
+  "PENDING",
+  "APPROVED",
+  "DECLINED",
+  "WITHDRAWN",
+  "EXPIRED",
+  "CLEARED",
+] as const;
 export const STEP_PHASE = [
   "PREPARE",
   "START",
@@ -192,6 +202,7 @@ export const PRISMA_ENUM_MIRRORS = {
   InstancePhase: INSTANCE_PHASE,
   OperatorNeed: OPERATOR_NEED,
   ClaimState: CLAIM_STATE,
+  ClaimReleaseRequestState: CLAIM_RELEASE_REQUEST_STATE,
   StepPhase: STEP_PHASE,
   StepState: STEP_STATE,
   OperationKind: OPERATION_KIND,

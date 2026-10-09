@@ -115,6 +115,31 @@ null, e.g. no `nodeSlug` means the node was removed). Marking such a rank
 stopped again answers CONFLICT with the last automatic check's result. Each
 node marked stopped writes a `marked_stopped` row in the node's activity.
 
+When the node can never prove the stop (a run launched with a status command
+that always says running, a node that is gone), only a person can free that
+capacity: **Release resources** on the runtime or node page ("I've checked,
+release it"). It frees the reserved port, memory and GPUs at once, through the
+same release a proven stop uses; the old process may still be running, so the
+dialog asks the person to check the node first and shows why the stop is not
+proven (`status_running`, `port_in_use`, node offline, ...). The rank records
+who released it, when and that reason (`releasedUnproven` in `runtimes_get`),
+the node's activity gets a `claim_released` row, and the rank leaves the
+5-minute stop checks. A proof that arrives later changes nothing; if the old
+process still holds the port, the next start there fails with the usual
+reasons. Agents, API keys and the CLI relay can never release.
+
+An agent may ask instead: `runtime_stop {instanceId, nodeNumber?,
+requestRelease: {findings, evidence?}}` on a part marked stopped, with what it
+checked (`findings` up to 4,000 characters; `evidence` up to 8 `{command,
+output}` pairs). The text is cleaned like node command output (control
+characters removed, wsmp credentials redacted) and shown to the person as the
+agent's unverified words. One request may wait per part
+(`release_request_pending`); it shows on the runtime page, in Needs you and as
+the rank's `releaseRequestId`. The person approves (the same release) or
+declines. `requestRelease: "withdraw"` takes back the calling agent's own
+request. A request expires after 24 hours and is cleared when the hold ends by
+itself (a proof, a restart) or the agent's credential is revoked.
+
 ### Runtime definitions
 
 `runtime_create` and `runtime_update` take the definition as `spec`

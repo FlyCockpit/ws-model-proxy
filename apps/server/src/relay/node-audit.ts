@@ -57,6 +57,8 @@ export const NODE_AUDIT_KINDS = [
   "node_update",
   "trust_lower",
   "marked_stopped",
+  "claim_released",
+  "claim_release_request",
 ] as const satisfies readonly NodeAuditKind[];
 
 export const NODE_AUDIT_OUTCOMES = [

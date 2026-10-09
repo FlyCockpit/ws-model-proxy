@@ -24,6 +24,11 @@
  * `./always-on.ts`; the engine facts of managed instances are recorded here.
  */
 import { randomBytes } from "node:crypto";
+import {
+  clearInstanceReleaseRequests,
+  releaseClaim,
+  sweepReleaseRequests,
+} from "@ws-model-proxy/api/lib/claim-release";
 import { sameStoredInstanceFacts, storedInstanceFacts } from "@ws-model-proxy/api/lib/engine-facts";
 import { graphWrite, instanceCapacityFences } from "@ws-model-proxy/api/lib/graph-write";
 import { type RuntimeLaunch, runtimeLaunchSchema } from "@ws-model-proxy/api/lib/runtime-spec";
@@ -442,6 +447,14 @@ export class RuntimeLifecycle {
     await this.expireSteps();
     await this.dispatchSteps();
     await this.probeHeldUnknown();
+    await this.sweepReleaseRequests();
+  }
+
+  /** Release requests past their expiry, or whose hold already ended, are settled. */
+  private async sweepReleaseRequests() {
+    await sweepReleaseRequests(prisma, this.now()).catch((error: unknown) =>
+      console.error("[lifecycle] sweeping release requests failed", errorName(error)),
+    );
   }
 
   // ── Starts ──
@@ -855,11 +868,9 @@ export class RuntimeLifecycle {
     return since !== null && since.getTime() <= this.now().getTime() - ms;
   }
 
+  /** A proven stop releases the claim (the same release a person's unproven release uses). */
   private async release(tx: Tx, rankId: string, now: Date) {
-    await tx.instanceRank.updateMany({
-      where: { id: rankId, claim: { in: ["HELD", "HELD_UNKNOWN"] } },
-      data: { claim: "RELEASED", claimChangedAt: now, stoppedAt: now },
-    });
+    await releaseClaim(tx, rankId, now);
   }
 
   /** Every claim is released or marked stopped: STOPPED, then the restart rule for RUNNING. */
@@ -1044,9 +1055,14 @@ export class RuntimeLifecycle {
         markedStoppedAt: null,
         markedStoppedBy: null,
         lastStopCheckAt: null,
+        releasedUnprovenAt: null,
+        releasedUnprovenBy: null,
+        releasedUnprovenReason: null,
         blockedBy: [],
       },
     });
+    // The claims are held by the new run: a request to release the old one has nothing left.
+    await clearInstanceReleaseRequests(tx, instance.id, now);
     await tx.runtimeInstance.update({
       where: { id: instance.id },
       data: {

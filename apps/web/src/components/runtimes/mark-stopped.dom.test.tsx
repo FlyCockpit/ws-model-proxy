@@ -117,6 +117,11 @@ vi.mock("@/utils/orpc", () => ({
             },
           }),
         },
+        releaseUnproven: { mutationOptions: () => ({ mutationFn: async () => ({}) }) },
+      },
+      releaseRequests: {
+        approve: { mutationOptions: () => ({ mutationFn: async () => ({}) }) },
+        decline: { mutationOptions: () => ({ mutationFn: async () => ({}) }) },
       },
     },
     nodes: { key: () => ["nodes"] },
@@ -265,5 +270,9 @@ describe("RunsHereCard", () => {
     expect(screen.getAllByText("dashboard:runtime.needsOperator.MARK_STOPPED")).toHaveLength(2);
     expect(screen.getAllByRole("button", { name: ACTION })).toHaveLength(1);
     expect(screen.getByText("dashboard:nodes.runs.needsYou")).toBeTruthy();
+    // The part already marked stopped offers the person-only release instead.
+    expect(
+      screen.getAllByRole("button", { name: "dashboard:runtime.releaseUnproven.action" }),
+    ).toHaveLength(1);
   });
 });

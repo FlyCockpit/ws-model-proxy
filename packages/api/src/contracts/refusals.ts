@@ -111,6 +111,13 @@ export const REFUSAL_REASONS = [
   // Model-name collisions (packages/api/src/lib/model-names.ts).
   /** A new callable ID of the caller's own pools (pool or account slug) equals their alias. */
   "name_aliased",
+  // Releasing a claim whose stop cannot be proven.
+  /** Only a node part marked stopped (its stop not proven) can be released or asked about. */
+  "not_marked_stopped",
+  /** The resources are already released. */
+  "already_released",
+  /** A release request for this node part already waits for a person. */
+  "release_request_pending",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

@@ -9,7 +9,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
   summary: null as Record<string, unknown> | null,
-  needsYou: { items: [] as Array<Record<string, unknown>>, queuedCommands: 0 },
+  needsYou: {
+    items: [] as Array<Record<string, unknown>>,
+    queuedCommands: 0,
+    releaseRequests: [] as Array<Record<string, unknown>>,
+  },
   aliases: [] as Array<Record<string, unknown>>,
   ranges: [] as string[],
   dismissed: 0,
@@ -169,7 +173,7 @@ async function mount() {
 afterEach(() => {
   cleanup();
   state.summary = null;
-  state.needsYou = { items: [], queuedCommands: 0 };
+  state.needsYou = { items: [], queuedCommands: 0, releaseRequests: [] };
   state.aliases = [];
   state.ranges = [];
   state.dismissed = 0;
@@ -266,6 +270,7 @@ describe("Overview", () => {
         },
       ],
       queuedCommands: 2,
+      releaseRequests: [],
     };
     await mount();
     expect(await screen.findByText("Qwen")).toBeTruthy();
@@ -291,6 +296,17 @@ describe("Overview", () => {
         item("MARK_STOPPED", "r3", "Stopper"),
       ],
       queuedCommands: 1,
+      releaseRequests: [
+        {
+          requestId: "q1",
+          instanceId: "i-r4",
+          runtimeId: "r4",
+          runtimeName: "Releaser",
+          nodeId: "n1",
+          nodeNumber: 1,
+          since: new Date().toISOString(),
+        },
+      ],
     };
     await mount();
     const hrefOf = async (text: string) =>
@@ -298,6 +314,9 @@ describe("Overview", () => {
     expect(await hrefOf("Stepper")).toBe("/en-US/terminals");
     expect(await hrefOf("Restarter")).toBe("/en-US/runtimes/r2");
     expect(await hrefOf("Stopper")).toBe("/en-US/runtimes/r3");
+    // An agent's release request is decided on the runtime page.
+    expect(await hrefOf("Releaser")).toBe("/en-US/runtimes/r4");
+    expect(screen.getByText("dashboard:overview.needsYou.releaseRequest")).toBeTruthy();
     expect(await hrefOf("dashboard:overview.needsYou.queuedCount:1")).toBe("/en-US/terminals");
   });
 
@@ -316,6 +335,7 @@ describe("Overview", () => {
         },
       ],
       queuedCommands: 0,
+      releaseRequests: [],
     };
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const Component = Route.options.component as ComponentType & {

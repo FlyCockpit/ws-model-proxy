@@ -61,6 +61,12 @@ export const INSTANCE_INCLUDE = {
           lastHeartbeatAt: true,
         },
       },
+      // An agent's pending request that a person release the claim (at most one).
+      ReleaseRequests: {
+        where: { state: "PENDING" },
+        select: { id: true, expiresAt: true },
+        take: 1,
+      },
     },
     orderBy: { rank: "asc" },
   },
@@ -410,6 +416,19 @@ function safeSpec(value: unknown): RuntimeSpec | null {
 }
 
 /**
+ * The pending release request of a claim marked stopped, unless it expired (the sweep settles it
+ * soon). Rows read without the include (older callers' fixtures) have none.
+ */
+function pendingReleaseRequest(
+  rank: { claim: string; ReleaseRequests?: ReadonlyArray<{ id: string; expiresAt: Date }> },
+  now: Date,
+): string | null {
+  if (rank.claim !== "HELD_UNKNOWN") return null;
+  const request = rank.ReleaseRequests?.[0];
+  return request && request.expiresAt > now ? request.id : null;
+}
+
+/**
  * `stopChecks` (`latestStopChecks`): the last finished status probe per rank of STOPPING
  * instances, for callers that show why a stop is not confirmed; others pass none and report null.
  */
@@ -418,6 +437,7 @@ export function instanceView(
   stopChecks: ReadonlyMap<string, StopCheck> = new Map(),
   liveLoad: ReadonlyMap<string, InstanceLiveLoad> = NO_LIVE_LOAD,
 ): InstanceView {
+  const now = new Date();
   const load = liveLoad.get(row.id) ?? null;
   const advanced = advancedView(row.Version.advanced);
   const context = stepViewContext(row);
@@ -454,6 +474,14 @@ export function instanceView(
         row.phase === "STOPPING" || rank.claim === "HELD_UNKNOWN"
           ? (stopChecks.get(stopCheckKey(row.id, rank.rank)) ?? null)
           : null,
+      releasedUnproven:
+        rank.claim === "RELEASED" && rank.releasedUnprovenAt
+          ? {
+              at: rank.releasedUnprovenAt.toISOString(),
+              reason: rank.releasedUnprovenReason ?? "unknown",
+            }
+          : null,
+      releaseRequestId: pendingReleaseRequest(rank, now),
     })),
     openSteps: row.Steps.map((step) => stepView(step, context)),
     // Load from the relay's in-memory cache (null: unknown here); `at` is the reading's time,

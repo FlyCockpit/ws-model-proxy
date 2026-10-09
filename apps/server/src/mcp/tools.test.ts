@@ -182,6 +182,57 @@ describe("routing to procedures", () => {
     expect(stop.safeParse({ instanceId: "i", runtimeId: "r" }).success).toBe(false);
   });
 
+  it("runtime_stop with requestRelease asks a person to release a part, or withdraws the ask", () => {
+    expect(
+      routeToolCall("runtime_stop", {
+        instanceId: "i",
+        nodeNumber: 2,
+        requestRelease: {
+          findings: "ss -ltnp shows nothing on 30001",
+          evidence: [{ command: "ss -ltnp", output: "" }],
+        },
+      }),
+    ).toEqual([
+      {
+        path: "runtimes.releaseRequests.create",
+        input: {
+          instanceId: "i",
+          nodeNumber: 2,
+          findings: "ss -ltnp shows nothing on 30001",
+          evidence: [{ command: "ss -ltnp", output: "" }],
+        },
+      },
+    ]);
+    expect(routeToolCall("runtime_stop", { instanceId: "i", requestRelease: "withdraw" })).toEqual([
+      { path: "runtimes.releaseRequests.withdraw", input: { instanceId: "i" } },
+    ]);
+    const stop = tool("runtime_stop").input;
+    expect(
+      stop.safeParse({ instanceId: "i", requestRelease: { findings: "checked" } }).success,
+    ).toBe(true);
+    // Never with a runtime-wide stop, markStopped or a confirm literal.
+    expect(
+      stop.safeParse({ runtimeId: "r", requestRelease: { findings: "checked" } }).success,
+    ).toBe(false);
+    expect(
+      stop.safeParse({
+        instanceId: "i",
+        markStopped: true,
+        confirm: "MARK_STOPPED",
+        requestRelease: "withdraw",
+      }).success,
+    ).toBe(false);
+    expect(
+      stop.safeParse({
+        instanceId: "i",
+        requestRelease: { findings: "x", evidence: Array(9).fill({ command: "a", output: "" }) },
+      }).success,
+    ).toBe(false);
+    expect(
+      stop.safeParse({ instanceId: "i", requestRelease: { findings: "x".repeat(4_001) } }).success,
+    ).toBe(false);
+  });
+
   it("every route stays inside the tool's own procedures", async () => {
     for (const contract of MCP_TOOLS) {
       for (const entry of routeToolCall(contract.name, {}))

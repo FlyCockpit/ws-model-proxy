@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 const db = vi.hoisted(() => ({
   queuedNodeCommand: { updateMany: vi.fn(async () => ({ count: 1 })) },
+  claimReleaseRequest: { updateMany: vi.fn(async () => ({ count: 1 })) },
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
 const files = vi.hoisted(() => ({ cancelFileOpsForToken: vi.fn() }));
@@ -77,6 +78,18 @@ describe("endAgentWork", () => {
         decidedBy: null,
         outcome: "credential_revoked",
       }),
+    });
+  });
+
+  it("clears the credentials' pending release requests", async () => {
+    await endAgentWork({ userId: "u", credentialIds: ["t1", "g1"] });
+    expect(db.claimReleaseRequest.updateMany).toHaveBeenCalledWith({
+      where: {
+        userId: "u",
+        state: "PENDING",
+        OR: [{ agentTokenId: { in: ["t1", "g1"] } }, { mcpGrantId: { in: ["t1", "g1"] } }],
+      },
+      data: expect.objectContaining({ state: "CLEARED", pendingRankId: null }),
     });
   });
 });

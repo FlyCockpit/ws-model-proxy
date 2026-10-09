@@ -220,17 +220,59 @@ describe("needs you", () => {
   it("counts the caller's waiting queued commands", async () => {
     db.runtimeInstance.findMany.mockResolvedValue([]);
     db.queuedNodeCommand.count.mockResolvedValue(3);
-    await expect(client().needsYou.list()).resolves.toEqual({ items: [], queuedCommands: 3 });
+    db.claimReleaseRequest.findMany.mockResolvedValue([]);
+    await expect(client().needsYou.list()).resolves.toEqual({
+      items: [],
+      queuedCommands: 3,
+      releaseRequests: [],
+    });
     expect(db.queuedNodeCommand.count.mock.calls[0]?.[0]?.where).toMatchObject({
       userId: "owner",
       state: "QUEUED",
     });
   });
 
-  it("counts the caller's instance needs and queued commands for the nav badge", async () => {
+  it("lists agents' pending release requests with their runtime and node", async () => {
+    db.runtimeInstance.findMany.mockResolvedValue([]);
+    db.queuedNodeCommand.count.mockResolvedValue(0);
+    const createdAt = new Date("2026-10-09T10:00:00Z");
+    db.claimReleaseRequest.findMany.mockResolvedValue([
+      {
+        id: "req1",
+        createdAt,
+        Rank: {
+          rank: 1,
+          nodeId: "node2",
+          Instance: { id: "inst1", runtimeId: "rt1", Runtime: { name: "Qwen" } },
+        },
+      },
+    ] as never);
+    await expect(client().needsYou.list()).resolves.toMatchObject({
+      releaseRequests: [
+        {
+          requestId: "req1",
+          instanceId: "inst1",
+          runtimeId: "rt1",
+          runtimeName: "Qwen",
+          nodeId: "node2",
+          nodeNumber: 2,
+          since: createdAt.toISOString(),
+        },
+      ],
+    });
+    // Only the caller's, still pending, not expired, and only while the claim is marked stopped.
+    expect(db.claimReleaseRequest.findMany.mock.calls[0]?.[0]?.where).toMatchObject({
+      userId: "owner",
+      state: "PENDING",
+      Rank: { claim: "HELD_UNKNOWN" },
+    });
+  });
+
+  it("counts the caller's instance needs, queued commands and release requests for the nav badge", async () => {
     db.runtimeInstance.count.mockResolvedValue(2);
     db.queuedNodeCommand.count.mockResolvedValue(3);
-    await expect(client().needsYou.count()).resolves.toEqual({ count: 5 });
+    db.claimReleaseRequest.count.mockResolvedValue(1);
+    await expect(client().needsYou.count()).resolves.toEqual({ count: 6 });
     expect(db.runtimeInstance.count.mock.calls[0]?.[0]?.where).toEqual({
       userId: "owner",
       needsOperator: { not: null },

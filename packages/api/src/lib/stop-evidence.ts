@@ -94,3 +94,20 @@ export async function latestStopChecks(
       });
   return checks;
 }
+
+/**
+ * Why a rank's stop is not proven right now, as one code for the person releasing it without
+ * proof (recorded on the rank and in the audit): `node_removed`, `node_offline`, the last
+ * automatic check's `errorCode` (`status_running`, `port_in_use`, ...; `not_stopped` from older
+ * nodes), or `no_check` when none has finished yet.
+ */
+export function stopUnprovenReason(
+  connection: NodeConnectionView,
+  check: StopCheck | undefined,
+): string {
+  if (connection === null) return "node_removed";
+  if (connection.state === "OFFLINE") return "node_offline";
+  if (!check) return "no_check";
+  if (check.proven) return "proven";
+  return check.errorCode ?? "not_stopped";
+}

@@ -30,6 +30,8 @@ import { modelAliasNameSchema, poolsContract, poolViewSchema } from "./pools";
 import { profilesContract, profileViewSchema } from "./profiles";
 import { providersContract } from "./providers";
 import {
+  releaseEvidenceSchema,
+  releaseFindingsSchema,
   runtimeDetailSchema,
   runtimeModelViewSchema,
   runtimeSummarySchema,
@@ -155,10 +157,22 @@ const runtimeStopInput = z
     runtimeId: idSchema.optional(),
     nodeId: idSchema.optional(),
     markStopped: z.literal(true).optional(),
-    /** markStopped: only this node of a multi-node instance (1-based). */
+    /** markStopped / requestRelease: only this node of a multi-node instance (1-based). */
     nodeNumber: z.number().int().min(1).optional(),
     confirm: z.literal("MARK_STOPPED").optional(),
     note: noteSchema.optional(),
+    /** Ask a person to free a part marked stopped (what you checked), or "withdraw" yours. */
+    requestRelease: z
+      .union([
+        z
+          .object({
+            findings: releaseFindingsSchema,
+            evidence: z.array(releaseEvidenceSchema).max(8).optional(),
+          })
+          .strict(),
+        z.literal("withdraw"),
+      ])
+      .optional(),
   })
   .strict()
   .refine((input) => (input.instanceId === undefined) !== (input.runtimeId === undefined), {
@@ -166,13 +180,22 @@ const runtimeStopInput = z
   })
   .refine(
     (input) =>
-      input.markStopped
-        ? input.instanceId !== undefined && input.confirm === "MARK_STOPPED" && !input.nodeId
-        : input.confirm === undefined &&
-          input.nodeNumber === undefined &&
+      input.requestRelease !== undefined
+        ? input.instanceId !== undefined &&
+          !input.markStopped &&
+          input.confirm === undefined &&
           input.note === undefined &&
-          (input.instanceId === undefined || input.nodeId === undefined),
-    { message: 'markStopped takes instanceId and confirm "MARK_STOPPED"; a stop takes neither.' },
+          input.nodeId === undefined
+        : input.markStopped
+          ? input.instanceId !== undefined && input.confirm === "MARK_STOPPED" && !input.nodeId
+          : input.confirm === undefined &&
+            input.nodeNumber === undefined &&
+            input.note === undefined &&
+            (input.instanceId === undefined || input.nodeId === undefined),
+    {
+      message:
+        'markStopped takes instanceId and confirm "MARK_STOPPED"; requestRelease takes instanceId (and nodeNumber); a stop takes neither.',
+    },
   );
 
 const runtimeUpdateInput = z
@@ -427,10 +450,19 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
   tool({
     name: "runtime_stop",
     description:
-      'Stop an instance, or every instance of a runtime (optionally on one node). markStopped with confirm "MARK_STOPPED" marks stopped an instance whose stop its node cannot prove (Full-control nodes).',
+      'Stop an instance, or every instance of a runtime (optionally on one node). markStopped with confirm "MARK_STOPPED" marks stopped an instance whose stop its node cannot prove (Full-control nodes). requestRelease asks a person to free a part marked stopped; only they can.',
     input: runtimeStopInput,
-    output: z.union([runtimesContract.stop.output, runtimesContract.instances.markStopped.output]),
-    procedures: ["runtimes.stop", "runtimes.instances.markStopped"],
+    output: z.union([
+      runtimesContract.stop.output,
+      runtimesContract.instances.markStopped.output,
+      runtimesContract.releaseRequests.create.output,
+    ]),
+    procedures: [
+      "runtimes.stop",
+      "runtimes.instances.markStopped",
+      "runtimes.releaseRequests.create",
+      "runtimes.releaseRequests.withdraw",
+    ],
     rateLimit: { perMinute: 10, key: "start_stop_apply" },
   }),
   tool({
@@ -556,6 +588,8 @@ export const MCP_EXCLUDED_SESSION_PROCEDURES: Readonly<Record<string, string>> =
   "nodes.queued.list": "Queued items are shown in nodes_get.",
   "nodes.fabrics.list": "nodes_get shows each node's fabrics and peers.",
   "runtimes.detected.add": "Agents use runtime_create with preset detected.",
+  "runtimes.releaseRequests.list":
+    "runtimes_get shows each part's pending request (releaseRequestId).",
   "models.list": "Callable IDs are part of pools_get.",
   "models.testTargets": "The web Test page's picker; agents name targets in model_test.",
   "access.apiKeys.list": "API keys are managed by people.",

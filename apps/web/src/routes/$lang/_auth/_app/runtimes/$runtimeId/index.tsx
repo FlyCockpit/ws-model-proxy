@@ -27,6 +27,7 @@ import {
   MarkStoppedAction,
   StopNotConfirmedHelp,
 } from "@/components/runtimes/mark-stopped";
+import { HeldPartsRelease } from "@/components/runtimes/release-unproven";
 import { RuntimeSharingCard } from "@/components/runtimes/runtime-sharing-card";
 import { ServedModelCapabilities } from "@/components/runtimes/served-model-capabilities";
 import { type PillTone, StatusPill } from "@/components/status-pill";
@@ -405,6 +406,7 @@ function InstancesCard({ runtime }: { runtime: RuntimeDetail }) {
                     {t("dashboard:runtime.restart")}
                   </Button>
                 ) : null}
+                <HeldPartsRelease runtimeId={runtime.id} instance={instance} />
               </li>
             ))}
           </ul>

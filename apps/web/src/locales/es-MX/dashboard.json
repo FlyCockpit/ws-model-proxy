@@ -510,7 +510,9 @@
         "metric_commands_define": "comandos de métricas enviados",
         "node_update": "ajustes cambiados",
         "trust_lower": "confianza bajada",
-        "marked_stopped": "marcada como detenida"
+        "marked_stopped": "marcada como detenida",
+        "claim_released": "recursos liberados sin confirmación",
+        "claim_release_request": "solicitud de liberación"
       },
       "outcome": {
         "completed": "hecho",
@@ -1436,6 +1438,35 @@
         "help": "Se indicó a wsmp que este proceso se detuvo, pero aún no ha confirmado que terminó, así que su puerto, memoria y GPU siguen reservados. Mientras el nodo esté en línea, wsmp vuelve a comprobarlo cada 5 minutos y los libera en cuanto una comprobación confirma la detención."
       }
     },
+    "releaseUnproven": {
+      "action": "Liberar recursos…",
+      "review": "Revisar solicitud del agente…",
+      "title": "¿Liberar estos recursos sin confirmación?",
+      "description": "wsmp todavía no puede confirmar que el proceso anterior se detuvo en este nodo, así que su puerto, memoria y GPUs siguen reservados. Al liberarlos quedan disponibles de inmediato para nuevas instancias. El proceso anterior podría seguir en ejecución: revisa primero en el nodo que ya no exista (ningún proceso suyo, nada escuchando en su puerto). Si sigue en ejecución, el siguiente inicio ahí fallará hasta que lo detengas.",
+      "confirm": "Liberar recursos",
+      "approve": "Aprobar y liberar",
+      "decline": "Rechazar solicitud",
+      "pending": "Liberando…",
+      "done": "Recursos liberados.",
+      "declined": "Solicitud rechazada. Los recursos siguen reservados.",
+      "where": "Dónde",
+      "place": "{{node}}, puerto {{port}}",
+      "reasonLabel": "Por qué no se confirma la detención",
+      "reason": {
+        "node_offline": "El nodo está desconectado, así que no puede revisarlo",
+        "node_removed": "El nodo se eliminó de wsmp",
+        "no_check": "Aún no termina ninguna revisión automática",
+        "proven": "La última revisión confirmó la detención"
+      },
+      "requested": "Un agente pide liberar",
+      "request": {
+        "title": "Lo que encontró el agente",
+        "untrusted": "Escrito por un agente. wsmp no verificó nada de esto.",
+        "untrustedNamed": "Escrito por el agente {{agent}}. wsmp no verificó nada de esto.",
+        "command": "Comando que ejecutó",
+        "loadFailed": "No se pudo cargar la solicitud del agente. Quizá se retiró o expiró."
+      }
+    },
     "nodeGone": "nodo eliminado",
     "start": "Iniciar",
     "restart": "Reiniciar",
@@ -1515,7 +1546,10 @@
       "alias_shadowed": "Ese nombre ya es uno de tus ID invocables.",
       "alias_limit": "Demasiados alias. Elimina uno primero.",
       "alias_key_not_allowed": "Esa clave no puede llamar a este pool. Agrega el pool a la clave primero.",
-      "name_aliased": "Uno de tus alias de nombre de modelo ya usa ese ID invocable. Elimina el alias o elige otro nombre."
+      "name_aliased": "Uno de tus alias de nombre de modelo ya usa ese ID invocable. Elimina el alias o elige otro nombre.",
+      "not_marked_stopped": "Solo se puede liberar una parte marcada como detenida. Márcala como detenida primero.",
+      "already_released": "Estos recursos ya se liberaron.",
+      "release_request_pending": "Ya hay una solicitud de liberación de un agente esperando para esta parte."
     },
     "delete": "Eliminar runtime",
     "deleteTitle": "¿Eliminar {{name}}?",
@@ -2011,7 +2045,8 @@
         "STEP": "Paso",
         "RESTART": "Reinicio",
         "MARK_STOPPED": "Marcar como detenida"
-      }
+      },
+      "releaseRequest": "Solicitud de liberación"
     },
     "aliasShadows": {
       "title_one": "Uno de tus alias oculta un pool",

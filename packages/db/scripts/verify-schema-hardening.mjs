@@ -104,6 +104,8 @@ const REQUIRED_OBJECTS = [
   "instance_rank_reserved_port",
   "instance_rank_claim_shape",
   "instance_rank_held_unknown_check",
+  "claim_release_request_shape",
+  "claim_release_request_transition",
   "instance_rank_node_owner",
   "instance_step_node_owner",
   "instance_step_shape",
@@ -858,6 +860,34 @@ try {
     "instance_rank_claim_shape",
     `UPDATE instance_rank SET claim = 'HELD_UNKNOWN' WHERE id = 'rank-w0'`,
     "23514",
+  );
+  await expectFailure(
+    "instance_rank_claim_shape released without proof on a held claim",
+    `UPDATE instance_rank SET "releasedUnprovenAt" = now(), "releasedUnprovenBy" = 'owner-a' WHERE id = 'rank-w0'`,
+    "23514",
+  );
+  await expectFailure(
+    "claim_release_request_shape without the agent's credential",
+    `INSERT INTO claim_release_request (id, "userId", "rankId", "pendingRankId", findings, "expiresAt")
+     VALUES ('crr-0', 'owner-a', 'rank-w0', 'rank-w0', 'checked', now() + interval '1 day')`,
+    "23514",
+  );
+  await client.query(`
+    INSERT INTO claim_release_request (id, "userId", "rankId", "pendingRankId", "agentTokenId", findings, "expiresAt")
+    VALUES ('crr-1', 'owner-a', 'rank-w0', 'rank-w0', 'tok-1', 'checked', now() + interval '1 day')`);
+  await expectFailure(
+    "claim_release_request one pending per claim",
+    `INSERT INTO claim_release_request (id, "userId", "rankId", "pendingRankId", "agentTokenId", findings, "expiresAt")
+     VALUES ('crr-2', 'owner-a', 'rank-w0', 'rank-w0', 'tok-1', 'again', now() + interval '1 day')`,
+    "23505",
+  );
+  await client.query(
+    `UPDATE claim_release_request SET state = 'DECLINED', "pendingRankId" = NULL, "decidedAt" = now(), "decidedBy" = 'owner-a' WHERE id = 'crr-1'`,
+  );
+  await expectFailure(
+    "claim_release_request_transition",
+    `UPDATE claim_release_request SET state = 'APPROVED' WHERE id = 'crr-1'`,
+    "55000",
   );
   await expectFailure(
     "instance_step_shape cancelled after dispatch",
