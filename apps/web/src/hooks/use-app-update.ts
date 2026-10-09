@@ -19,7 +19,14 @@ import { useMountEffect } from "@/hooks/use-mount-effect";
  * `registerSW.js` <script> tag is never emitted — registration must be wired
  * explicitly. `registerSW({ immediate: true })`
  * registers on mount and is idempotent across re-renders.
+ *
+ * `onNeedReload` MUST stay a no-op: in autoUpdate mode the plugin's
+ * `registerSW` calls `window.location.reload()` whenever a new SW activates
+ * (every deploy) unless this callback is passed.
  */
+// The new SW already controls the page; its assets load on the next navigation.
+function ignoreActivatedUpdate() {}
+
 export function useAppUpdate() {
   useMountEffect(() => {
     // Defer registration off the initial hydration window: SW registration kicks
@@ -29,7 +36,7 @@ export function useAppUpdate() {
     // `immediate: false` would wait for a `load` event that may have already fired
     // by the time this mount effect runs — leaving the SW unregistered). Idle is
     // the safe middle: guaranteed to run (3s timeout), just not during hydration.
-    const register = () => registerSW({ immediate: true });
+    const register = () => registerSW({ immediate: true, onNeedReload: ignoreActivatedUpdate });
     if (typeof window.requestIdleCallback === "function") {
       const id = window.requestIdleCallback(register, { timeout: 3000 });
       return () => window.cancelIdleCallback?.(id);
