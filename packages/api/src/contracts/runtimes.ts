@@ -1,7 +1,11 @@
 import { z } from "zod";
 import { NODE_LOCAL_PLACEHOLDERS } from "../lib/command-render";
 import { COMPAT_ENDPOINTS, requestCompatSchema } from "../lib/request-compat";
-import { RUNTIME_SPEC_WARNINGS, runtimeSpecSchema } from "../lib/runtime-spec";
+import {
+  authoredRuntimeSpecSchema,
+  RUNTIME_SPEC_WARNINGS,
+  runtimeSpecSchema,
+} from "../lib/runtime-spec";
 import { shareInviteViewSchema } from "./access";
 import {
   runtimeAdvancedPatchSchema,
@@ -94,8 +98,9 @@ export const instanceRankViewSchema = z
      * The rank's last automatic stop check (status probe) that finished, while the instance is
      * STOPPING or the rank is still held after it was marked stopped (HELD_UNKNOWN, also on a
      * STOPPED instance): `proven` false means the node could not confirm the process is gone,
-     * and `errorCode` says why (`port_in_use`, `process_alive`, `process_unknown`, `status_running`,
-     * `status_unknown`, `unowned_service`; `not_stopped` from older nodes). Null when none ran.
+     * and `errorCode` says why (`port_in_use`, `port_held_outside_runtime`, `process_alive`,
+     * `process_unknown`, `status_running`, `status_unknown`, `unowned_service`; `not_stopped`
+     * from older nodes). Null when none ran.
      */
     lastStopCheck: z
       .object({ at: isoDateSchema, proven: z.boolean(), errorCode: z.string().nullable() })
@@ -484,7 +489,7 @@ export const runtimesContract = {
          * only; `spec` is always complete and is what gets validated.
          */
         preset: z.enum(RUNTIME_PRESETS).optional(),
-        spec: runtimeSpecSchema,
+        spec: authoredRuntimeSpecSchema,
         limits: limitsInput,
         advanced: advancedInput,
         compat: compatInput,
@@ -509,7 +514,7 @@ export const runtimesContract = {
       .object({
         runtimeId: idSchema,
         name: nameSchema.optional(),
-        spec: runtimeSpecSchema.optional(),
+        spec: authoredRuntimeSpecSchema.optional(),
         limits: limitsInput,
         advanced: advancedInput,
         compat: compatInput,

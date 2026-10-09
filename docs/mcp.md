@@ -101,7 +101,11 @@ command is not needed for that proof and cannot block it (a stub `status:
 the slice also needs its `status` command to say stopped (exit 3): a
 `service` runtime (a start that hands off to docker or a service manager
 escapes the slice on purpose), any step a person ran in a terminal (a
-prepare too), and any run on a node without systemd units. The same proof is
+prepare too), and any run on a node without systemd units. A `status`
+command that can never say stopped (`true`, `:`, `exit 0`; new definitions
+refuse it) counts as none on a node with systemd units, so a version saved
+earlier with one is proven by its empty units and free ports; on a node
+without units such a run stays unproven. The same proof is
 required again before a repeated stop answers stopped and before the node's
 inventory reports a rank stopped. A stop step completes as soon as this proof holds. When the stop
 steps fail, the server asks the node for a status probe that checks the same
@@ -110,7 +114,11 @@ cannot prove it (still alive, or offline for 10 minutes) does the instance
 show `needsOperator: "MARK_STOPPED"`; the probe is repeated every 5 minutes, so
 a later proof still completes it. Each rank's `lastStopCheck.errorCode` says
 why the last probe failed: `process_alive`, `process_unknown` (the node could
-not read its units), `port_in_use`, `status_running`, `status_unknown`,
+not read its units), `port_in_use`, `port_held_outside_runtime` (nothing is
+left in the rank's units, yet a reserved port is still held: usually
+something the run started escaped them, such as containers from `docker
+compose up -d` or a server that daemonizes; any other process on that port
+reads the same), `status_running`, `status_unknown`,
 `unowned_service` (runs outside the node's units with no `status` command), or
 `not_stopped` from a node too old to say.
 
@@ -153,13 +161,41 @@ A spec has exactly one of:
   - `management`: `process` (the node owns the process: every process stays in
     the unit the node starts; a start that hands off to docker or a service
     manager must be `service`) or `service` (stop and a `status` command prove
-    it; exit 0 alive, exit 3 stopped). <a id="process-detached"></a>A
+    it; exit 0 alive, exit 3 stopped). A `status` command must be able to say
+    stopped: `true`, `:`, `exit 0` and the like are refused (`systemctl
+    is-active --quiet <unit>` exits 3 for a stopped unit). <a id="process-detached"></a>A
     `process` start that hands off anyway (`docker compose up -d`, a server
     that daemonizes) is caught once its port answers while nothing is left in
     its unit: the start fails with `phaseReason: "process_detached"` and is not
     restarted. Whatever it started runs outside the node's control, so the
     stop cannot be proven while it holds the port; stop it by hand and redefine
     the runtime as `service` with real `stop` and `status` commands.
+  - <a id="docker-compose"></a>A Docker Compose stack is a `service` with
+    detached commands:
+
+    ```json
+    {
+      "management": "service",
+      "commands": [{
+        "start": "docker compose up -d",
+        "stop": "docker compose down",
+        "status": "out=$(docker compose ps --status running -q) || exit 1; [ -n \"$out\" ] || exit 3"
+      }]
+    }
+    ```
+
+    The status command exits 0 while a container of the project runs and 3
+    once none does; when `docker compose ps` itself fails (the daemon is down,
+    no compose file in the working directory) it exits 1, which the node reads
+    as "cannot tell" rather than stopped. A plain `... | grep -q . || exit 3`
+    would answer stopped on such a failure. Run the commands from the
+    project's directory (e.g. `cd /srv/llm && docker compose up -d`) or pass
+    `-f <file>` to each. Avoid a foreground `docker compose up` as a `process`
+    start: the containers run under dockerd, outside the rank's slice, so the
+    node cannot see or stop them itself; compose's own 10 s stop timeout races
+    wsmp's 10 s grace before it kills the slice, which can leave containers
+    running; and a container with no published port (a GPU-only worker) can be
+    reported stopped while it still runs and holds the GPU.
   - `groupSize` (1–64 nodes), `resources` (one entry, or one per rank:
     `{kind: "none"}`, `{kind: "unified", memoryGb}`, `{kind: "cpu", ramGb}` or
     `{kind: "discrete", gpuCount, vramGb, ramGb?, vendor?}`), `labels` the node

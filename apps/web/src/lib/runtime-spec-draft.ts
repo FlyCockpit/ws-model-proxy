@@ -1,5 +1,6 @@
 import { canonicalJson } from "@ws-model-proxy/api/lib/canonical-json";
 import {
+  authoredRuntimeSpecSchema,
   type EngineWire,
   type GpuVendor,
   type ModelCapabilityWire,
@@ -8,7 +9,6 @@ import {
   type RuntimeApiWire,
   type RuntimeSpec,
   runtimeSpecKind,
-  runtimeSpecSchema,
 } from "@ws-model-proxy/api/lib/runtime-spec";
 
 import { specIssueText } from "./spec-issue-text";
@@ -458,7 +458,7 @@ export function readSpecEditor(
   } else {
     candidate = draftToSpec(values.draft, parseBase(values.base), kind);
   }
-  const parsed = runtimeSpecSchema.safeParse(candidate);
+  const parsed = authoredRuntimeSpecSchema.safeParse(candidate);
   if (!parsed.success) {
     return {
       ok: false,

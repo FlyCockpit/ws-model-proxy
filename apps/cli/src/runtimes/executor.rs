@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::protocol::frames::{InstancePhase, InstanceRecord, JobError, JobPhase, JobStatus};
-use crate::protocol::runtime_spec::{Management, Readiness, RuntimeSpec};
+use crate::protocol::runtime_spec::{
+    Management, Readiness, RuntimeSpec, status_can_report_stopped,
+};
 
 const STATE_LIMIT: usize = 2 * 1024 * 1024;
 const INSTANCES_DIR: &str = "runtime-instances";
@@ -1003,9 +1005,17 @@ impl Executor {
     /// (`external`), and any run on a runtime without units (`self-detached`;
     /// [`Runtime::contains_ranks`]).
     ///
+    /// A status command that can never say stopped ([`status_can_report_stopped`]) counts as
+    /// none where the runtime contains its ranks: the units, slice and ports decide (a hold
+    /// left by an old `status: "true"` clears on the next probe). Without units it is still
+    /// asked and keeps the stop unproven.
+    ///
     /// Reasons: `process_alive`, `process_unknown` (the user manager could not
-    /// say), `port_in_use`, `unowned_service` (outside the node's units with no
-    /// status command), `status_running`, `status_unknown`.
+    /// say), `port_in_use`, `port_held_outside_runtime` (a reserved port is
+    /// held while the rank's units and slice have no process left: what holds
+    /// it escaped them, e.g. `docker compose up -d` or a daemon that
+    /// re-parents), `unowned_service` (outside the node's units with no status
+    /// command), `status_running`, `status_unknown`.
     ///
     /// `run_status`: false for the inventory, which runs nothing in a rank's slice (it holds no
     /// rank lock): a run that needs its status command is then never reported stopped (a held
@@ -1032,25 +1042,37 @@ impl Executor {
         }
         let mut ports: Vec<(&str, u16)> = Vec::new();
         let mut statuses: Vec<(&Job, &str)> = Vec::new();
+        // A status command that can never say stopped (`true`, `exit 0`, ...: the rule a new
+        // definition is refused by) proves nothing. Where the runtime contains its ranks it is
+        // left out and the units, slice and ports decide; without units it is still asked, so
+        // such a run is never claimed stopped.
+        let contains = runtime.contains_ranks();
+        let mut constant_status = false;
         for owner in &jobs {
             for port in std::iter::once(owner.port).chain(owner.dist_port) {
                 if !ports.contains(&(owner.host.as_str(), port)) {
                     ports.push((owner.host.as_str(), port));
                 }
             }
-            if let Some(status) = owner.status_command.as_deref()
-                && !statuses.iter().any(|(_, seen)| *seen == status)
-            {
-                statuses.push((owner, status));
+            match owner.status_command.as_deref() {
+                Some(status) if contains && !status_can_report_stopped(status) => {
+                    constant_status = true;
+                }
+                Some(status) if !statuses.iter().any(|(_, seen)| *seen == status) => {
+                    statuses.push((owner, status));
+                }
+                _ => {}
             }
         }
-        let detached = !runtime.contains_ranks()
+        let detached = !contains
             || jobs
                 .iter()
                 .any(|owner| owner.management() == Management::Service)
             || record.is_some_and(|record| {
                 record.outside_units || record.invocations.values().any(|i| outside(i))
             });
+        // Only constant status commands: the empty units and slice and the free ports decide.
+        let detached = detached && !(constant_status && statuses.is_empty());
         if detached && statuses.is_empty() {
             return Ok(Some("unowned_service"));
         }
@@ -1097,7 +1119,14 @@ impl Executor {
             }
         }
         if port_held() {
-            return Ok(Some("port_in_use"));
+            // Nothing is left in the rank's units: on a runtime that contains its ranks, what
+            // holds the port runs outside them (usually something the run started that escaped,
+            // or another process). Without units the node cannot tell where it runs.
+            return Ok(Some(if runtime.contains_ranks() {
+                "port_held_outside_runtime"
+            } else {
+                "port_in_use"
+            }));
         }
         Ok(None)
     }

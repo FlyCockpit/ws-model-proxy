@@ -1233,14 +1233,18 @@ mod tests {
         // The dist port is held: not proven.
         let held = std::net::TcpListener::bind(("127.0.0.1", dist)).expect("dist");
         let probe = executor.execute(job(JobPhase::Status, "s4", daemon), &runtime, deadline(10));
-        assert_eq!(probe.detail.as_deref(), Some("port_in_use"), "{probe:?}");
+        assert_eq!(
+            probe.detail.as_deref(),
+            Some("port_held_outside_runtime"),
+            "{probe:?}"
+        );
         drop(held);
         // The port is taken again: neither the re-delivered stop nor the inventory says stopped.
         let taken = std::net::TcpListener::bind(("127.0.0.1", port)).expect("port");
         let again = executor.execute(job(JobPhase::Stop, "s2", daemon), &runtime, deadline(10));
         assert_eq!(
             (again.stopped, again.detail.as_deref()),
-            (false, Some("port_in_use"))
+            (false, Some("port_held_outside_runtime"))
         );
         assert_eq!(
             executor.observations(&runtime, deadline(10))[0].1.phase,

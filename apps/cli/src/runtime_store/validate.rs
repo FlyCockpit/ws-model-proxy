@@ -11,7 +11,7 @@ use crate::protocol::runtime_spec::{
     Address, Commands, FABRIC_MEMBERS_MAX, Launch, Management, MetricsReader, ModelType,
     NODE_FABRICS_MAX, NODE_METRIC_COMMANDS_MAX, NodeMetricCommand, RUNTIME_COMMAND_MAX_BYTES,
     RUNTIME_PLACEHOLDERS, ReaderMapEntry, Resource, RuntimeApi, RuntimeSpec, SpecModel,
-    TranscriptionProfile,
+    TranscriptionProfile, status_can_report_stopped,
 };
 
 /// Why a put was refused: the reason and the JSON path.
@@ -514,6 +514,10 @@ fn validate_commands(commands: &Commands, management: Management, index: usize) 
             ensure(command_ok(command), || path(field))?;
         }
     }
+    // A status command that can never say stopped (exit 3) would hold a stop forever.
+    if let Some(status) = &commands.status {
+        ensure(status_can_report_stopped(status), || path("status"))?;
+    }
     if management == Management::Service {
         ensure(commands.stop.is_some(), || path("stop"))?;
         ensure(commands.status.is_some(), || path("status"))?;
@@ -798,7 +802,7 @@ mod tests {
         assert_eq!(validate_spec(&spec(process.clone()), &[]), Ok(()));
         // A stop a person runs in a terminal needs its command.
         let mut interactive = process.clone();
-        interactive["launch"]["commands"][0]["status"] = "true".into();
+        interactive["launch"]["commands"][0]["status"] = "systemctl is-active --quiet llm".into();
         interactive["launch"]["commands"][0]["interactive"] = serde_json::json!({ "stop": true });
         assert_eq!(
             validate_spec(&spec(interactive), &[]),
@@ -809,13 +813,47 @@ mod tests {
         // A service is stopped by its stop command (and proven by status).
         let mut service = process;
         service["launch"]["management"] = "service".into();
-        service["launch"]["commands"][0]["status"] = "true".into();
+        service["launch"]["commands"][0]["status"] = "systemctl is-active --quiet llm".into();
         assert_eq!(
             validate_spec(&spec(service.clone()), &[]),
             Err(SpecIssue::Invalid("launch.commands[0].stop".into()))
         );
         service["launch"]["commands"][0]["stop"] = "docker compose down".into();
         assert_eq!(validate_spec(&spec(service), &[]), Ok(()));
+    }
+
+    #[test]
+    fn a_status_command_that_can_never_say_stopped_is_refused() {
+        let mut runtime = startable("vllm serve m --port {{port}}");
+        runtime["launch"]["management"] = "service".into();
+        runtime["launch"]["commands"][0]["stop"] = "docker compose down".into();
+        for never in [
+            "true",
+            " true; ",
+            ":",
+            "exit 0",
+            "exit 0;",
+            "/bin/true",
+            "/usr/bin/true",
+        ] {
+            runtime["launch"]["commands"][0]["status"] = never.into();
+            assert_eq!(
+                validate_spec(&spec(runtime.clone()), &[]),
+                Err(SpecIssue::Invalid("launch.commands[0].status".into())),
+                "{never:?}"
+            );
+        }
+        // Also where a status command is only accepted (a process runtime).
+        let mut process = startable("vllm serve m --port {{port}}");
+        process["launch"]["commands"][0]["status"] = "true".into();
+        assert_eq!(
+            validate_spec(&spec(process), &[]),
+            Err(SpecIssue::Invalid("launch.commands[0].status".into()))
+        );
+        runtime["launch"]["commands"][0]["status"] =
+            "out=$(docker compose ps --status running -q) || exit 1; [ -n \"$out\" ] || exit 3"
+                .into();
+        assert_eq!(validate_spec(&spec(runtime), &[]), Ok(()));
     }
 
     #[test]

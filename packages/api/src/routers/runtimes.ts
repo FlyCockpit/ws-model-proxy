@@ -24,7 +24,12 @@ import {
 import { jsonObject } from "../lib/registry-view";
 import { type RequestCompat, storedRequestCompat } from "../lib/request-compat";
 import { RUNTIME_PRESET_LIST } from "../lib/runtime-presets";
-import { type RuntimeSpec, runtimeSpecSchema, runtimeSpecWarnings } from "../lib/runtime-spec";
+import {
+  authoredRuntimeSpecSchema,
+  type RuntimeSpec,
+  runtimeSpecSchema,
+  runtimeSpecWarnings,
+} from "../lib/runtime-spec";
 import {
   AUTOMATIC_LIMITS,
   applyAdvancedPatch,
@@ -1155,12 +1160,21 @@ export const runtimesRouter = {
       select: VERSION_SELECT,
     });
     if (!version) throw notFound("That version does not exist.");
+    // A copy is a new definition: it meets today's rules (a version saved before a rule, such as
+    // a status command that can never say stopped, is refused here with that rule's issue).
+    const authored = authoredRuntimeSpecSchema.safeParse(storedSpec(version.spec));
+    if (!authored.success)
+      throw new ORPCError("BAD_REQUEST", {
+        message: authored.error.issues
+          .map((issue) => `${["spec", ...issue.path].join(".")}: ${issue.message}`)
+          .join(" "),
+      });
     const result = await createRuntime(context, {
       slug: input.slug,
       name: input.name,
       kind: share.Runtime.kind,
       nodeId: input.nodeId,
-      spec: storedSpec(version.spec),
+      spec: authored.data,
       limits: applyLimitsPatch(
         {
           concurrencyLimit: version.concurrencyLimit,

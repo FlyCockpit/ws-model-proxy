@@ -67,7 +67,8 @@ pub struct InstanceRow {
     pub units: Vec<String>,
     pub models: Vec<String>,
     /// Stopping or stopped ranks, when asked: `proven`, or why the stop is
-    /// not proven (`port_in_use`, `process_alive`, `status_unknown`, ...).
+    /// not proven (`port_in_use`, `port_held_outside_runtime`, `process_alive`,
+    /// `status_unknown`, ...).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_proof: Option<String>,
 }

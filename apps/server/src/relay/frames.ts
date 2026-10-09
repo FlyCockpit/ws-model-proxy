@@ -764,7 +764,8 @@ export const RUNTIME_JOB_ERRORS = [
 /**
  * Why a status probe (stop proof) answered not stopped, in its `detail`: a process of the
  * rank's units still runs, the status command says running (or could not tell), the port is
- * still in use, or the service runs outside the node's units and has no status command.
+ * still in use (`port_held_outside_runtime`: while nothing is left in the rank's units, so what
+ * holds it escaped them), or the service runs outside the node's units and has no status command.
  */
 export const STOP_PROOF_FAILURES = [
   "process_alive",
@@ -772,6 +773,7 @@ export const STOP_PROOF_FAILURES = [
   "status_running",
   "status_unknown",
   "port_in_use",
+  "port_held_outside_runtime",
   "unowned_service",
 ] as const;
 export const RUNTIME_JOB_OPERATOR_STATUSES = [

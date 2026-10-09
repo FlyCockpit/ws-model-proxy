@@ -1,0 +1,41 @@
+{
+  "rules": "see packages/api/src/lib/runtime-spec.ts statusCanReportStopped and apps/cli/src/protocol/runtime_spec.rs status_can_report_stopped: after collapsing spaces, tabs and line breaks and dropping trailing semicolons, a status command that is empty, true, :, exit 0, /bin/true or /usr/bin/true can never exit 3 (stopped)",
+  "refused": [
+    "",
+    "   ",
+    ";",
+    " ; ; ",
+    "true",
+    " true ",
+    "\ttrue\n",
+    "true;",
+    "true ;",
+    "true;;",
+    ":",
+    ": ;",
+    "exit 0",
+    "exit  0",
+    "exit\t0",
+    "exit 0;",
+    " exit 0 ; ",
+    "/bin/true",
+    "/usr/bin/true",
+    "/usr/bin/true;"
+  ],
+  "accepted": [
+    "systemctl is-active --quiet ollama",
+    "systemctl --user is-active --quiet llm",
+    "docker compose ps --status running -q | grep -q . || exit 3",
+    "out=$(docker compose ps --status running -q) || exit 1; [ -n \"$out\" ] || exit 3",
+    "exit 3",
+    "false",
+    "True",
+    "truex",
+    "true && exit 3",
+    "exit 0 || exit 3",
+    "test -e /run/llm.pid || exit 3",
+    "/bin/true-ish",
+    "exit 01",
+    ":;exit 3"
+  ]
+}

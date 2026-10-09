@@ -4,6 +4,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import enDashboard from "@/locales/en-US/dashboard.json";
+import esDashboard from "@/locales/es-MX/dashboard.json";
 
 /** Mark as stopped: who sees the action, the evidence in its dialog, and what it sends. */
 
@@ -79,7 +81,7 @@ const RUNTIME = {
           lastStopCheck: {
             at: "2026-10-07T10:05:00.000Z",
             proven: false,
-            errorCode: null,
+            errorCode: null as string | null,
           },
         },
         {
@@ -193,6 +195,27 @@ describe("MarkStoppedAction", () => {
         ["activity", "needsYou"],
       ]),
     );
+  });
+
+  it("says when the port is held by something that escaped the service's units", async () => {
+    const check = RUNTIME.instanceList[0]?.ranks[0]?.lastStopCheck;
+    if (!check) throw new Error("fixture");
+    check.errorCode = "port_held_outside_runtime";
+    try {
+      mount(<MarkStoppedAction runtimeId="rt-1" instanceId="inst-1" />);
+      fireEvent.click(screen.getByRole("button", { name: ACTION }));
+      const dialog = screen.getByRole("dialog");
+      expect(
+        await within(dialog).findByText(
+          "dashboard:runtime.markStopped.evidence.reason.port_held_outside_runtime:port_held_outside_runtime",
+        ),
+      ).toBeTruthy();
+    } finally {
+      check.errorCode = null;
+    }
+    // Worded in every locale (the code is never shown as is).
+    for (const bundle of [enDashboard, esDashboard])
+      expect(bundle.runtime.markStopped.evidence.reason.port_held_outside_runtime).toMatch(/\S/);
   });
 
   it("leaves an empty note out and sends a node number for one node's part", async () => {

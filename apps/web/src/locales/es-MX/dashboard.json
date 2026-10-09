@@ -1453,6 +1453,7 @@
           "status_running": "El comando de estado indica que está en ejecución",
           "status_unknown": "El comando de estado no pudo determinarlo",
           "port_in_use": "El puerto sigue en uso",
+          "port_held_outside_runtime": "El puerto sigue en uso, aunque ya no queda nada en las unidades del servicio: por lo general, algo que inició (un contenedor o un daemon) se ejecuta fuera de ellas",
           "unowned_service": "El servicio se ejecuta fuera del control del nodo y no tiene comando de estado",
           "not_stopped": "El nodo no pudo confirmarlo (actualiza el nodo si esto continúa)"
         }
