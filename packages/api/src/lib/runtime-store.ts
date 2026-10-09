@@ -338,6 +338,7 @@ export async function writePlannedStarts(
             claim: "HELD",
             claimChangedAt: now,
             stoppedAt: null,
+            lastStopCheckAt: null,
             port: placement.port,
             distPort: start.distPort,
             resources: placement.resources as Prisma.InputJsonObject,

@@ -1013,6 +1013,7 @@ export class RuntimeLifecycle {
         stoppedAt: null,
         markedStoppedAt: null,
         markedStoppedBy: null,
+        lastStopCheckAt: null,
         blockedBy: [],
       },
     });
@@ -2423,12 +2424,23 @@ export class RuntimeLifecycle {
    * Ranks marked stopped are probed with a status step every 5 minutes while the node is online,
    * whatever the instance's phase (a STOPPED instance's hold is proven and released the same
    * way). Only ranks on connected nodes are read, so ranks on offline nodes never crowd them out.
+   * A pass takes at most {@link BATCH} ranks that are due, least recently checked first, and
+   * stamps each one it checks (`lastStopCheckAt`), so every rank is reached however many there
+   * are. Each rank is re-read under its owner's fence: another server process that checked it in
+   * the meantime leaves it not due, and it is skipped.
    */
   private async probeHeldUnknown() {
     const online = this.relay.onlineNodeIds?.();
     if (online && online.length === 0) return;
+    const due = (): Prisma.InstanceRankWhereInput => ({
+      claim: "HELD_UNKNOWN",
+      OR: [
+        { lastStopCheckAt: null },
+        { lastStopCheckAt: { lte: new Date(this.now().getTime() - HELD_UNKNOWN_PROBE_MS) } },
+      ],
+    });
     const ranks = await prisma.instanceRank.findMany({
-      where: { claim: "HELD_UNKNOWN", nodeId: online ? { in: online } : { not: null } },
+      where: { ...due(), nodeId: online ? { in: online } : { not: null } },
       select: {
         id: true,
         nodeId: true,
@@ -2436,48 +2448,78 @@ export class RuntimeLifecycle {
         instanceId: true,
         Instance: { select: { userId: true } },
       },
+      orderBy: [{ lastStopCheckAt: { sort: "asc", nulls: "first" } }, { id: "asc" }],
       take: BATCH,
     });
     for (const rank of ranks) {
       if (!rank.nodeId || !this.relay.nodeSession(rank.nodeId)) continue;
       await this.write(rank.Instance.userId, rank.instanceId, async (tx) => {
-        const recent = await tx.instanceStep.count({
-          where: {
-            instanceId: rank.instanceId,
-            rank: rank.rank,
-            phase: "STATUS",
-            OR: [
-              { state: { in: [...LIVE_STEP_STATES] } },
-              { updatedAt: { gt: new Date(this.now().getTime() - HELD_UNKNOWN_PROBE_MS) } },
-            ],
-          },
+        const still = await tx.instanceRank.findFirst({
+          where: { id: rank.id, ...due() },
+          select: { id: true },
         });
-        if (recent > 0) return;
-        const instance = await tx.runtimeInstance.findUnique({
-          where: { id: rank.instanceId },
-          include: INSTANCE_INCLUDE,
+        if (!still) return;
+        const checkedAt = await this.probeHeldRank(tx, rank);
+        await tx.instanceRank.updateMany({
+          where: { id: rank.id, claim: "HELD_UNKNOWN" },
+          data: { lastStopCheckAt: checkedAt },
         });
-        const launch = instance ? launchOf(instance) : null;
-        const row = instance?.Ranks.find((candidate) => candidate.id === rank.id);
-        if (!instance || !launch || !row) return;
-        const generation = Math.max(await this.currentGeneration(tx, instance.id), 1);
-        const attempts = await this.nextStatusAttempt(tx, instance.id, row.rank);
-        await this.insertSteps(tx, instance, [
-          stopStep({
-            instance: instanceInput(instance),
-            rank: rankInput(row),
-            nnodes: instance.Ranks.length,
-            launch,
-            generation,
-            attempt: attempts,
-            operationId: null,
-            phase: "STATUS",
-          }),
-        ]);
       }).catch((error: unknown) =>
         console.error("[lifecycle] probing a rank marked stopped failed", errorName(error)),
       );
     }
+  }
+
+  /**
+   * One check of a rank marked stopped: a status probe goes out unless one is on its way or
+   * finished within {@link HELD_UNKNOWN_PROBE_MS}. Returns the rank's check time: the last
+   * probe's when one finished recently (the next check falls due as that probe ages out), now
+   * otherwise.
+   */
+  private async probeHeldRank(
+    tx: Tx,
+    rank: { id: string; rank: number; instanceId: string },
+  ): Promise<Date> {
+    const now = this.now();
+    const recent = await tx.instanceStep.findMany({
+      where: {
+        instanceId: rank.instanceId,
+        rank: rank.rank,
+        phase: "STATUS",
+        OR: [
+          { state: { in: [...LIVE_STEP_STATES] } },
+          { updatedAt: { gt: new Date(now.getTime() - HELD_UNKNOWN_PROBE_MS) } },
+        ],
+      },
+      select: { state: true, updatedAt: true },
+    });
+    if (recent.length > 0) {
+      if (recent.some((step) => (LIVE_STEP_STATES as readonly string[]).includes(step.state)))
+        return now;
+      return new Date(Math.max(...recent.map((step) => step.updatedAt.getTime())));
+    }
+    const instance = await tx.runtimeInstance.findUnique({
+      where: { id: rank.instanceId },
+      include: INSTANCE_INCLUDE,
+    });
+    const launch = instance ? launchOf(instance) : null;
+    const row = instance?.Ranks.find((candidate) => candidate.id === rank.id);
+    if (!instance || !launch || !row) return now;
+    const generation = Math.max(await this.currentGeneration(tx, instance.id), 1);
+    const attempts = await this.nextStatusAttempt(tx, instance.id, row.rank);
+    await this.insertSteps(tx, instance, [
+      stopStep({
+        instance: instanceInput(instance),
+        rank: rankInput(row),
+        nnodes: instance.Ranks.length,
+        launch,
+        generation,
+        attempt: attempts,
+        operationId: null,
+        phase: "STATUS",
+      }),
+    ]);
+    return now;
   }
 
   // ── Sessions ──

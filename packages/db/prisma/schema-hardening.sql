@@ -664,9 +664,10 @@ ALTER TABLE instance_rank ADD CONSTRAINT instance_rank_claim_shape CHECK (
   AND (claim <> 'RELEASED' OR "stoppedAt" IS NOT NULL)
   AND ("markedStoppedAt" IS NULL) = ("markedStoppedBy" IS NULL)
 );
--- The held-unknown probe sweep pages these rows by id.
-CREATE INDEX IF NOT EXISTS instance_rank_held_unknown_id
-  ON instance_rank (id) WHERE claim = 'HELD_UNKNOWN';
+-- The held-unknown probe sweep takes these rows least recently checked first.
+DROP INDEX IF EXISTS instance_rank_held_unknown_id;
+CREATE INDEX IF NOT EXISTS instance_rank_held_unknown_check
+  ON instance_rank ("lastStopCheckAt" ASC NULLS FIRST, id) WHERE claim = 'HELD_UNKNOWN';
 -- A rank claims, and a step runs on, a node of the instance's owner only: the relay sends a
 -- step's job to its node, so this keeps one user's commands off another user's nodes. A step's
 -- node is checked when it is written (no foreign key: a deleted node leaves its steps).

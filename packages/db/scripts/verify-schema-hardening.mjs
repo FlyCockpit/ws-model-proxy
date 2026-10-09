@@ -103,7 +103,7 @@ const REQUIRED_OBJECTS = [
   "instance_rank_bounds",
   "instance_rank_reserved_port",
   "instance_rank_claim_shape",
-  "instance_rank_held_unknown_id",
+  "instance_rank_held_unknown_check",
   "instance_rank_node_owner",
   "instance_step_node_owner",
   "instance_step_shape",
