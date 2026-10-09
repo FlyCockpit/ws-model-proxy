@@ -1,5 +1,6 @@
 import { createRouterClient } from "@orpc/server";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { retryAnswers } from "../integration/retry-answers";
 import type { RuntimeSpec } from "../lib/runtime-spec";
 import { CALLERS, contextFor } from "./lane-c-test-helpers";
 
@@ -117,8 +118,12 @@ integration("placement writes on PostgreSQL", () => {
     }
   });
 
+  // Writes that answer "retry" on a loaded machine are retried as callers do.
   const client = (auth = CALLERS.person(USER)) =>
-    createRouterClient(modules.runtimes.runtimesRouter, { context: contextFor(auth) });
+    createRouterClient(modules.runtimes.runtimesRouter, {
+      context: contextFor(auth),
+      interceptors: [retryAnswers],
+    });
 
   /** What the relay does once a node proves a stop: the claims are released. */
   async function nodeProvesStops() {
@@ -273,6 +278,7 @@ integration("placement writes on PostgreSQL", () => {
     const profileRuntime = await createRuntime(`${RUN}-profile`, 1, 8);
     const profiles = createRouterClient(modules.profiles.profileProcedures, {
       context: contextFor(CALLERS.person(USER)),
+      interceptors: [retryAnswers],
     });
     const saved = await profiles.save({
       slug: `${RUN}-p`,

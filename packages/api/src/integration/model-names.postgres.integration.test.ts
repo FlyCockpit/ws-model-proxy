@@ -8,13 +8,18 @@
  * - Someone else's alias never refuses an action (sharing, can use, invites, renames): an alias
  *   named like a pool ID shared with its person wins for them, and they see it marked.
  *
- * Each race starts both writers while a blocker transaction holds a fence both need, so both
- * have read their plan and wait at the same point; the blocker then lets go.
+ * Each race starts both writers while a blocker transaction holds a fence both need, so they
+ * usually have read their plan and wait at the same point; the blocker then lets go. The
+ * assertions are the invariants, whatever the interleaving: each writer retries the "retry"
+ * answer as callers do (./retry-answers.ts; on a loaded machine a fence wait or statement can pass
+ * its server-side bound), so a race ends with one winner and the other refused by name, or with
+ * the share landing.
  */
 import { createRouterClient } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Context } from "../context";
+import { retryAnswers, untilAnswered } from "./retry-answers";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
@@ -115,7 +120,7 @@ integration("model-name collisions on PostgreSQL", () => {
       },
       session,
     };
-    return createRouterClient(need().appRouter, { context });
+    return createRouterClient(need().appRouter, { context, interceptors: [retryAnswers] });
   }
 
   /**
@@ -135,11 +140,16 @@ integration("model-name collisions on PostgreSQL", () => {
     const fenced = new Promise<void>((resolve) => {
       held = resolve;
     });
-    const blocker = prisma.$transaction(async (tx) => {
-      await lockOrder.acquireFences(tx, [lockOrder.fences.owner(holder.id)]);
-      held();
-      await released;
-    });
+    // A test fixture, not a bounded write: its own client-side limits must not end it early on
+    // a slow machine (the writers' bounds are the ones under test).
+    const blocker = prisma.$transaction(
+      async (tx) => {
+        await lockOrder.acquireFences(tx, [lockOrder.fences.owner(holder.id)]);
+        held();
+        await released;
+      },
+      { maxWait: 30_000, timeout: 30_000 },
+    );
     await fenced;
     let settled = 0;
     const outcomes = Promise.allSettled(
@@ -149,12 +159,17 @@ integration("model-name collisions on PostgreSQL", () => {
         }),
       ),
     );
-    // Long enough for both to reach the fence; well inside the 2 s fence wait bound.
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    // Both wait on the holder's fence: neither could check or write meanwhile.
-    expect(settled).toBe(0);
-    release();
-    await blocker;
+    // Usually long enough for both to reach the fence. A writer that waits past its 2 s bound
+    // answers retry and tries again; the assertions do not depend on who got there first.
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      // Nothing can be written while the holder's fence is held.
+      expect(settled).toBe(0);
+    } finally {
+      // Never left holding the fence into the next test.
+      release();
+      await blocker;
+    }
     return outcomes;
   }
 
@@ -165,15 +180,14 @@ integration("model-name collisions on PostgreSQL", () => {
   }
 
   /**
-   * Exactly one writer won; the other got one of `refusals` (by which side lost), or CONFLICT
-   * when its wait on the winner's fence passed the 2 s bound (a cold first run): asked to retry,
-   * never written.
+   * Exactly one writer won; the other was refused by name, one of `refusals` (by which side
+   * lost). A "retry" answer is never the end of a race: the writer retried it.
    */
   function oneWon(outcomes: PromiseSettledResult<unknown>[], refusals: readonly string[]) {
     const fulfilled = outcomes.filter((outcome) => outcome.status === "fulfilled");
     expect(fulfilled).toHaveLength(1);
     const lost = outcomes.find((outcome) => outcome.status === "rejected");
-    expect([...refusals, "CONFLICT"]).toContain(reasonOf(lost));
+    expect(refusals).toContain(reasonOf(lost));
   }
 
   /** Aliases of `user` named like one of their OWN pools' callable IDs (the invariant). */
@@ -322,7 +336,7 @@ integration("model-name collisions on PostgreSQL", () => {
     });
     const outcomes = await race(bob, [
       async () => {
-        const accepted = await acceptShareInviteByLink(bob, token);
+        const accepted = await untilAnswered(() => acceptShareInviteByLink(bob, token));
         if (accepted !== "accepted") throw new Error(`not accepted: ${accepted}`);
       },
       () => as(bob).pools.aliases.set({ name: `${ann.slug}/chat`, poolId: own.id }),

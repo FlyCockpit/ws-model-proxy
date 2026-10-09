@@ -15,6 +15,13 @@ type RefusalCode =
 
 type RefusalError = ORPCError<RefusalCode, { reason: RefusalReason; subjectId: string | null }>;
 
+/**
+ * The message of every "nothing was written, retry" CONFLICT: a capacity-ordered or serializable
+ * write that exhausted its deadlock / serialization retries or passed its server-side lock or
+ * statement bound, and rolled back. Callers (and the PostgreSQL suites) retry on it.
+ */
+export const RETRY_CONFLICT_MESSAGE = "Configuration changed concurrently. Retry the request.";
+
 /** Status for each refusal family when the caller does not choose one (the reason is what callers read). */
 const REFUSAL_STATUS: Partial<Record<RefusalReason, RefusalCode>> = {
   human_only: "FORBIDDEN",
