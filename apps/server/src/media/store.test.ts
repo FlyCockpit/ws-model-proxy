@@ -167,3 +167,26 @@ describe("LocalMediaStore.sweepStaleTmp", () => {
     expect(await store.sweepStaleTmp(60 * 60 * 1000)).toBe(0);
   });
 });
+
+describe("LocalMediaStore.getStream", () => {
+  it("delivers every byte even when the object is deleted after it returns", async () => {
+    const store = new LocalMediaStore(root);
+    const bytes = Buffer.alloc(256 * 1024, 7);
+    const staged = await store.stage(Readable.from([bytes]));
+    await staged.commit("asset-gone");
+    const object = await store.getStream("asset-gone");
+    expect(object?.sizeBytes).toBe(bytes.length);
+    // An expiry or purge unlinks the object before anyone reads it.
+    await store.delete("asset-gone");
+    expect(await store.getStream("asset-gone")).toBeNull();
+    expect((await collect(object!.stream)).equals(bytes)).toBe(true);
+  });
+
+  it("answers null for a missing object or a directory", async () => {
+    const store = new LocalMediaStore(root);
+    expect(await store.getStream("missing")).toBeNull();
+    // Where the object would live (`objects/<first two chars>/<id>`), a directory instead.
+    await mkdir(join(root, "objects", "as", "asset-dir"), { recursive: true });
+    expect(await store.getStream("asset-dir")).toBeNull();
+  });
+});
