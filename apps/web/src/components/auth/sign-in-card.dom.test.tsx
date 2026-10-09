@@ -52,12 +52,14 @@ vi.mock("@/hooks/use-auth-session", () => ({
 
 vi.mock("@/utils/orpc", () => ({
   orpc: {
-    appConfig: {
-      queryOptions: () => ({
-        queryKey: ["appConfig"],
-        queryFn: async () => state.config,
-        initialData: state.config,
-      }),
+    app: {
+      config: {
+        queryOptions: () => ({
+          queryKey: ["appConfig"],
+          queryFn: async () => state.config,
+          initialData: state.config,
+        }),
+      },
     },
     auth: {},
   },
@@ -152,18 +154,6 @@ describe("SignInCard mode parity", () => {
     expect(description?.textContent).toBe("auth:mcpLogin.clientDescription:LongUnbrokenClientName");
   });
 
-  it("forceSso renders the SSO button and no credentials form in both modes", () => {
-    state.config = { ssoEnabled: true, forceSso: true, ssoProviderName: "Acme" };
-    const { unmount } = renderCard({ mode: "standard" });
-    expect(screen.getByText("auth:login.ssoContinue:Acme")).toBeTruthy();
-    expect(screen.queryByLabelText("auth:fields.email")).toBeNull();
-    unmount();
-
-    renderCard({ mode: "mcp" });
-    expect(screen.getByText("auth:login.ssoContinue:Acme")).toBeTruthy();
-    expect(screen.queryByLabelText("auth:fields.email")).toBeNull();
-  });
-
   it("routes a twoFactorRedirect response into the shared 2FA branch (mcp mode)", async () => {
     const user = userEvent.setup();
     signInEmailMock.mockResolvedValueOnce({ data: { twoFactorRedirect: true }, error: null });
@@ -182,10 +172,10 @@ describe("SignInCard mode parity", () => {
     signInEmailMock.mockResolvedValueOnce({ data: { user: { id: "u1" } }, error: null });
     renderCard({ mode: "standard", redirectTo: undefined });
     await submitCredentials(user);
-    // The dashboard destination keeps its historical SPA navigation.
+    // The overview destination keeps its historical SPA navigation.
     await waitFor(() => {
       expect(navigateMock).toHaveBeenCalledWith({
-        to: "/$lang/dashboard",
+        to: "/$lang/overview",
         params: { lang: "en-US" },
       });
     });

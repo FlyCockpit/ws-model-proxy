@@ -8,126 +8,84 @@ import {
   toLangRoute,
 } from "./nav-items";
 
+const paths = (input: Parameters<typeof getNavItems>[0]) =>
+  getNavItems(input).map((item) => item.path);
+
 describe("nav-items", () => {
-  it("returns no desktop app nav items for signed-out visitors", () => {
-    const items = getNavItems({
-      placement: "desktop",
-      isAuthenticated: false,
-    }).map((item) => item.path);
-
-    expect(items).toEqual([]);
+  it("returns no app nav items for signed-out visitors", () => {
+    for (const placement of ["desktop", "mobile", "sidebar", "userMenu"] as const)
+      expect(paths({ placement, isAuthenticated: false })).toEqual([]);
   });
 
-  it("returns authenticated desktop app items for signed-in users", () => {
-    const items = getNavItems({
-      placement: "desktop",
-      isAuthenticated: true,
-      role: "user",
-    }).map((item) => item.path);
-
-    expect(items).toEqual(["/dashboard", "/settings"]);
-    expect(items).not.toContain("/admin");
+  it("lists the 0.4.0 sections in sidebar order, admin only for admins", () => {
+    expect(paths({ placement: "sidebar", isAuthenticated: true, role: "user" })).toEqual([
+      "/overview",
+      "/models",
+      "/pools",
+      "/runtimes",
+      "/profiles",
+      "/nodes",
+      "/providers",
+      "/access/api-keys",
+      "/activity",
+      "/terminals",
+      "/settings",
+    ]);
+    expect(paths({ placement: "sidebar", isAuthenticated: true, role: "user, admin" })).toContain(
+      "/admin",
+    );
+    expect(paths({ placement: "sidebar", isAuthenticated: true, role: "manager" })).not.toContain(
+      "/admin",
+    );
   });
 
-  it("adds admin destinations only when the shared admin role helper matches", () => {
-    const nonAdminItems = getNavItems({
-      placement: "desktop",
-      isAuthenticated: true,
-      role: "manager",
-    }).map((item) => item.path);
-    const adminItems = getNavItems({
-      placement: "desktop",
-      isAuthenticated: true,
-      role: "user, admin",
-    }).map((item) => item.path);
-
-    expect(nonAdminItems).not.toContain("/admin");
-    expect(adminItems).toContain("/admin");
-  });
-
-  it("keeps mobile navigation compact and role-aware", () => {
-    const signedOutItems = getNavItems({
-      placement: "mobile",
-      isAuthenticated: false,
-    }).map((item) => item.path);
-    const adminItems = getNavItems({
-      placement: "mobile",
-      isAuthenticated: true,
-      role: "admin",
-    }).map((item) => item.path);
-
-    expect(signedOutItems).toEqual([]);
-    expect(adminItems).toEqual(["/dashboard", "/settings", "/admin"]);
+  it("keeps the BottomNav to four sections (the rest is in More)", () => {
+    expect(paths({ placement: "mobile", isAuthenticated: true, role: "admin" })).toEqual([
+      "/overview",
+      "/models",
+      "/pools",
+      "/runtimes",
+    ]);
   });
 
   it("derives user-menu destinations from the shared nav model", () => {
-    const userItems = getNavItems({
-      placement: "userMenu",
-      isAuthenticated: true,
-      role: "user",
-    }).map((item) => item.path);
-    const adminItems = getNavItems({
-      placement: "userMenu",
-      isAuthenticated: true,
-      role: "admin",
-    }).map((item) => item.path);
-
-    expect(userItems).toEqual(["/settings"]);
-    expect(adminItems).toEqual(["/settings", "/admin"]);
+    expect(paths({ placement: "userMenu", isAuthenticated: true, role: "user" })).toEqual([
+      "/settings",
+    ]);
+    expect(paths({ placement: "userMenu", isAuthenticated: true, role: "admin" })).toEqual([
+      "/settings",
+      "/admin",
+    ]);
   });
 
   it("builds typed locale-prefixed routes", () => {
     expect(toLangRoute("/")).toBe("/$lang");
-    expect(toLangRoute("/dashboard")).toBe("/$lang/dashboard");
+    expect(toLangRoute("/overview")).toBe("/$lang/overview");
+    expect(toLangRoute("/access/api-keys")).toBe("/$lang/access/api-keys");
   });
 
-  it("returns forward for later items in the composed app nav list", () => {
-    expect(getNavDirection("/dashboard", "/settings")).toBe("forward");
-    expect(getNavDirection("/settings", "/admin")).toBe("forward");
-  });
-
-  it("returns back for earlier items in the composed app nav list", () => {
-    expect(getNavDirection("/settings", "/dashboard")).toBe("back");
-    expect(getNavDirection("/admin", "/settings")).toBe("back");
-  });
-
-  it("returns none for same-path navigation", () => {
+  it("slides by sidebar order between sections", () => {
+    expect(getNavDirection("/overview", "/pools")).toBe("forward");
+    expect(getNavDirection("/pools", "/overview")).toBe("back");
     expect(getNavDirection("/settings", "/settings")).toBe("none");
   });
 
-  it("returns forward for off-nav child routes", () => {
+  it("lists the settings sub-nav in visual order", () => {
+    expect(settingsNavItems.map((item) => item.path)).toEqual(["/settings", "/settings/security"]);
     expect(getNavDirection("/settings", "/settings/security")).toBe("forward");
-  });
-
-  it("lists the settings sub-nav in visual order incl. the MCP grants tab", () => {
-    expect(settingsNavItems.map((item) => item.path)).toEqual([
-      "/settings",
-      "/settings/security",
-      "/settings/mcp",
-    ]);
-    expect(getNavDirection("/settings/security", "/settings/mcp")).toBe("forward");
-    expect(getNavDirection("/settings/mcp", "/settings/security")).toBe("back");
-    expect(toLangRoute("/settings/mcp")).toBe("/$lang/settings/mcp");
-  });
-
-  it("returns back from child routes to their parent", () => {
     expect(getNavDirection("/settings/security", "/settings")).toBe("back");
   });
 
-  it("defaults unrelated routes to forward", () => {
-    expect(getNavDirection("/dashboard", "/login")).toBe("forward");
+  it("goes forward into child routes and back out of them", () => {
+    expect(getNavDirection("/pools", "/pools/p1/routing")).toBe("forward");
+    expect(getNavDirection("/pools/p1/routing", "/pools")).toBe("back");
+    expect(getNavDirection("/overview", "/login")).toBe("forward");
   });
 
-  it("strips the locale prefix from top-level routes", () => {
-    expect(stripLangPrefix("/en-US/dashboard")).toBe("/dashboard");
-  });
-
-  it("returns root when only the locale segment is present", () => {
+  it("strips the locale prefix", () => {
+    expect(stripLangPrefix("/en-US/overview")).toBe("/overview");
     expect(stripLangPrefix("/en-US")).toBe("/");
     expect(stripLangPrefix("/en-US/")).toBe("/");
-  });
-
-  it("preserves nested segments after stripping the locale prefix", () => {
     expect(stripLangPrefix("/en-US/settings/security")).toBe("/settings/security");
   });
 });

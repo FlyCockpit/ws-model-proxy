@@ -6,39 +6,50 @@ import { RPCHandler } from "@orpc/server/fetch";
 import { SimpleCsrfProtectionHandlerPlugin } from "@orpc/server/plugins";
 import { ZodToJsonSchemaConverter } from "@orpc/zod/zod4";
 import {
+  type AccessLevelLoweredEvent,
   type Context as ApiContext,
   type ContextServices,
   createContext,
 } from "@ws-model-proxy/api/context";
+import {
+  CSRF_REQUIRED_PROCEDURES,
+  SENSITIVE_INPUT_PROCEDURES,
+} from "@ws-model-proxy/api/contracts";
 import { appRouter } from "@ws-model-proxy/api/routers/index";
 import type { Session } from "@ws-model-proxy/auth";
 import { auth as defaultAuth } from "@ws-model-proxy/auth";
 import { armAuthDbShutdownFence } from "@ws-model-proxy/auth/auth-db-shutdown-fence";
 import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
+import { onMcpGrantLevelLowered } from "@ws-model-proxy/auth/mcp-grant-level";
 import { onUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import { onUserDeleted, onUserDeletionMarked } from "@ws-model-proxy/auth/user-deletion-listeners";
 import { THEME_INIT_SCRIPT } from "@ws-model-proxy/config/theme-init";
 import prismaDefault from "@ws-model-proxy/db";
 import { env as defaultEnv } from "@ws-model-proxy/env/server";
-import { Hono } from "hono";
+import { Hono, type Context as HonoContext } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
+import {
+  endAgentWork,
+  handleAccessLevelLowered,
+  handleAccessRevoked,
+} from "./access-revocation.js";
 import { betterAuthAdminGate } from "./better-auth-admin-gate.js";
 import { resolveClientIp } from "./client-ip.js";
 import { CORS_ALLOW_HEADERS } from "./cors-headers.js";
-import { ALWAYS_CSRF_PROTECTED_PROCEDURES } from "./csrf-policy.js";
-import { deviceCodeBodyCap, deviceCodeUpgradeGate } from "./device-code-upgrade-gate.js";
 import {
   EMAIL_RECIPIENT_PATHS,
   emailRecipientLimit,
   SIGNUP_MEDIA_TYPES,
   SIGNUP_RECIPIENT_PATH,
 } from "./email-recipient-limit.js";
+import { consumeInviteAccept } from "./invite-accept-limit.js";
 import { createMcpAdmissionGate } from "./mcp/admission.js";
 import { createMcpRequestHandler, type McpAuthInstance } from "./mcp/auth.js";
 import { createMcpTransport } from "./mcp/handler.js";
 import { bindMcpToolDispatch } from "./mcp/tool-dispatch.js";
+import { cancelMcpToolCallsForToken, cancelMcpWriteToolCallsForGrant } from "./mcp/tools.js";
 import { mcpAuthorizeScopeGuard } from "./mcp-authorize-scope-guard.js";
 import { createMcpDiscoveryForwarder, MCP_WELL_KNOWN_PATHS } from "./mcp-discovery.js";
 import {
@@ -85,9 +96,9 @@ import {
   createModelApiFileUploadHandler,
 } from "./model-api/files.js";
 import { MODEL_API_MAX_REQUEST_BODY_BYTES } from "./model-api/limits.js";
+import { runModelTest } from "./model-api/model-test.js";
 import { openAiErrorBody } from "./model-api/openai-errors.js";
 import { createPoolMemberTestRoutes } from "./model-api/pool-member-test.js";
-import { repairExpiredProviderBudgets } from "./model-api/provider-budget.js";
 import {
   DASHBOARD_REALTIME_PATH,
   dashboardRealtimeRoutes,
@@ -101,14 +112,13 @@ import {
 } from "./model-api/realtime/websocket.js";
 import { createModelApiRoutes } from "./model-api/routes.js";
 import { transcriptionContentLengthGuard } from "./model-api/transcription-body-guard.js";
-import { logOrpcError } from "./orpc-error-log.js";
+import { registerNodeHttpRoutes } from "./node-http.js";
+import { logOrpcError, sensitiveProcedureErrors } from "./orpc-error-log.js";
 import {
   authLimiter,
-  consumeDeviceCodeExchange,
+  consumeInviteLookup,
   createRateLimiterMiddleware,
-  deviceCodeMintLimiter,
   emailRecipientLimiter,
-  isDeviceCodeMintRequest,
   mcpClientRegistrationLimiter,
   rpcLimiter,
   signinFailureLimiter,
@@ -116,12 +126,16 @@ import {
   signupRecipientLimiter,
 } from "./rate-limit.js";
 import { readinessResponse } from "./readiness.js";
+import { cancelNodeCommandsForCredentials } from "./relay/node-commands.js";
+import type { NodeIdentity } from "./relay/node-credential-auth.js";
+import { nodeFileServices } from "./relay/node-file-ops.js";
 import {
-  cancelCommandsForToken,
-  listPendingSupervised,
-  submitSupervisedOutput,
-} from "./relay/cli-commands.js";
-import { cancelFileOpsForToken } from "./relay/cli-file-ops.js";
+  dispatchRuntimeOperation,
+  nodeOperatorServices,
+  nodeServices,
+  pushRuntimeDefinitions,
+  runtimeStepServices,
+} from "./relay/node-wiring.js";
 import { relaySessionManager } from "./relay/session-manager.js";
 import {
   createTerminalWebsocketMiddleware,
@@ -180,7 +194,7 @@ import { getUserDeletionSweepHealth } from "./user-deletion-sweep.js";
 type AppVariables = {
   requestId: string;
   session: Session | null;
-  relayIdentity: import("@ws-model-proxy/api/lib/cli-credential-access").CliWebsocketIdentity;
+  relayIdentity: NodeIdentity;
 };
 
 /** The auth dependency shape consumed by the app: only `handler` is used. */
@@ -257,39 +271,55 @@ onUserBanned(cancelRelayWorkForBannedUser);
 // or pools serve, at once (not at the next 60 s recheck).
 onUserBanned((userId) => realtimeSessionRegistry.terminateForUser(userId));
 
-function cliContextServices() {
+/**
+ * A grant lowered from Full to Read-only (committed): its Full work ends now
+ * (./access-revocation.ts). Shared by the Access page (`onAccessLevelLowered`) and the consent
+ * page's re-approval (`onMcpGrantLevelLowered`, packages/auth/src/mcp-grant-level.ts).
+ */
+const endLoweredGrantWork = (event: AccessLevelLoweredEvent): Promise<void> =>
+  handleAccessLevelLowered(event, {
+    cancelMcpWriteToolCalls: (grantId) => cancelMcpWriteToolCallsForGrant(grantId),
+    endAgentWork: async (input) => {
+      await endAgentWork(input);
+      await cancelNodeCommandsForCredentials(input);
+    },
+  });
+onMcpGrantLevelLowered((event) => endLoweredGrantWork({ kind: "oauth_grant", ...event }));
+
+/**
+ * The server hooks procedures may call (packages/api `ContextServices`).
+ *
+ * `request`: the HTTP request the procedures serve (per-request services such as the invite
+ * lookup limit need its client address); null for MCP, whose services are built once (no MCP
+ * tool reaches those procedures, and they fail closed without the service).
+ */
+function contextServices(request: HonoContext | null): ContextServices {
   return {
-    repairExpiredProviderBudgets: (scope: { userId: string; providerAccountId: string }) =>
-      repairExpiredProviderBudgets(new Date(), scope),
-    onCliFeatureGrantsChanged: (cliDeviceId: string) =>
-      relaySessionManager.onCliFeatureGrantsChanged(cliDeviceId),
-    onRemoteMetricSourcesChanged: (cliDeviceId: string) =>
-      relaySessionManager.onRemoteMetricSourcesChanged(cliDeviceId),
-    onRemoteEngineAdaptersChanged: (cliDeviceId: string) =>
-      relaySessionManager.onRemoteEngineAdaptersChanged(cliDeviceId),
+    // Public invite lookups are charged to the caller's address (like sign-in).
+    ...(request ? { limitInviteLookup: () => consumeInviteLookup(resolveClientIp(request)) } : {}),
+    limitInviteAccept: (userId: string) => consumeInviteAccept(userId),
     onPoolRoutingRulesChanged: (poolId: string) =>
       relaySessionManager.onPoolRoutingRulesChanged(poolId),
-    onModelApiTokenRevoked: (tokenId: string) => realtimeSessionRegistry.terminateForToken(tokenId),
-    onCliCredentialsRevoked: (revoked: {
-      kind: "cliToken" | "deviceCredential";
-      ids: readonly string[];
-    }) => relaySessionManager.closeSessionsForRevokedCredentials(revoked),
-    cancelMcpTokenCommands: (tokenId: string) => {
-      cancelCommandsForToken(tokenId);
-      cancelFileOpsForToken(tokenId);
-    },
-    getLiveCliFeatures: (cliDeviceIds: readonly string[]) =>
-      relaySessionManager.getLiveCliFeatures(cliDeviceIds),
-    getLiveNodeTelemetry: (cliDeviceIds: readonly string[]) =>
-      relaySessionManager.getLiveNodeTelemetry(cliDeviceIds),
-    getLiveEngineLoadHistory: (
-      keys: Parameters<NonNullable<ContextServices["getLiveEngineLoadHistory"]>>[0],
-      now?: Date,
-    ) => relaySessionManager.getLiveEngineLoadHistory(keys, now),
-    supervisedCommands: {
-      listPending: listPendingSupervised,
-      submitOutput: submitSupervisedOutput,
-    },
+    nodes: nodeServices,
+    pushRuntimeDefinitions,
+    dispatchRuntimeOperation,
+    nodeOperator: nodeOperatorServices,
+    nodeFiles: nodeFileServices,
+    runtimeSteps: runtimeStepServices,
+    modelTest: runModelTest,
+    liveLoad: (instanceIds) => relaySessionManager.getInstanceLiveLoad(instanceIds),
+    onAccessRevoked: (event) =>
+      handleAccessRevoked(event, {
+        terminateRealtimeForApiKey: (apiKeyId) =>
+          realtimeSessionRegistry.terminateForToken(apiKeyId),
+        cancelMcpToolCalls: (id) => cancelMcpToolCallsForToken(id),
+        recheckRealtime: (userId) => realtimeSessionRegistry.recheckForUser(userId),
+        endAgentWork: async (input) => {
+          await endAgentWork(input);
+          await cancelNodeCommandsForCredentials(input);
+        },
+      }),
+    onAccessLevelLowered: endLoweredGrantWork,
   };
 }
 
@@ -620,7 +650,7 @@ export async function createApp(options: CreateAppOptions = {}) {
       prisma,
       isForceTwoFactorRequired,
       admissionGate: mcpAdmissionGate,
-      services: cliContextServices(),
+      services: contextServices(null),
       // Phase 5 tool dispatch binding: after every admission check passes,
       // the verified AuthInfo (passed VERBATIM by the SDK into the transport
       // factory's request context) is bound to the per-request oRPC context,
@@ -634,11 +664,6 @@ export async function createApp(options: CreateAppOptions = {}) {
         bindMcpToolDispatch(authInfo, { orpcContext, requestId, signal, credential }),
     }),
   );
-
-  // `wsmp login`'s public, unauthenticated start: its 16 KiB cap must run
-  // BEFORE the global limit below, which buffers a body without
-  // Content-Length (up to 10 MB) before calling the next middleware.
-  app.use("/api/auth/device/code", deviceCodeBodyCap);
 
   // Body-limit — reject oversized payloads early (before JSON parsing) to
   // prevent memory exhaustion. 10 MB covers image uploads and large form
@@ -716,6 +741,12 @@ export async function createApp(options: CreateAppOptions = {}) {
   // `/$lang/...` router never swallows them and returns the SPA HTML shell.
   registerSeoRoutes(app);
 
+  // Node bootstrap (contracts/http.ts): /.well-known/wsmp, /install.sh, POST /api/node/enroll.
+  // No session, no CSRF (the enrollment code is the credential); rate-limited inside.
+  registerNodeHttpRoutes(app, {
+    closeRevokedSessions: (ids) => relaySessionManager.closeSessionsForRevokedCredentials({ ids }),
+  });
+
   app.use("/api/cli/ws", createRelayWebsocketMiddleware());
   app.get("/api/cli/ws", relayUpgradeHandler());
   // Browser terminal socket. No subprotocol; the shared upgrade server already
@@ -723,16 +754,18 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.use("/api/dashboard/terminal/ws", createTerminalWebsocketMiddleware());
   app.get("/api/dashboard/terminal/ws", terminalUpgradeHandler());
 
-  // Signup kill-switch — reject email/password signup before it reaches
-  // Better-Auth when runtime signup is disabled. Production bootstrap requires
-  // the configured canonical ADMIN_EMAIL; local and test retain first-user
-  // bootstrap. The auth database hook repeats the authorization boundary.
-  app.use("/api/auth/sign-up/*", signupAccessGate);
-
   // Signup-specific rate limiter — stricter than the general auth limiter.
   // Must be mounted BEFORE the general authLimiter so signup traffic is throttled
-  // at the tighter limit first.
+  // at the tighter limit first, and before the kill-switch below, whose invite
+  // token lookup reads the database.
   app.use("/api/auth/sign-up/*", createRateLimiterMiddleware(signupLimiter));
+
+  // Signup kill-switch — reject email/password signup before it reaches
+  // Better-Auth when runtime signup is disabled (an invite link's pending token
+  // lets its sign-up through). Production bootstrap requires the configured
+  // canonical ADMIN_EMAIL; local and test retain first-user bootstrap. The auth
+  // database hook repeats the authorization boundary.
+  app.use("/api/auth/sign-up/*", signupAccessGate);
 
   // `get-session` is a benign, cookie-authenticated read that the SPA polls on
   // navigation/focus — many calls per minute under normal use. It must NOT be
@@ -815,23 +848,12 @@ export async function createApp(options: CreateAppOptions = {}) {
     app.use("/api/auth/*", mcpOauthRateLimits);
   }
 
-  // `wsmp login`'s device-code mint gets its own per-IP budget without the
-  // strict limiter's 15-minute block: approval is human, so a minted code
-  // grants nothing by itself (see `deviceCodeMintLimiter`).
-  const deviceCodeMintLimit = createRateLimiterMiddleware(deviceCodeMintLimiter, {
-    resolveKey: resolveClientIp,
-  });
-  app.use("/api/auth/device/code", async (c, next) =>
-    isDeviceCodeMintRequest(c) ? deviceCodeMintLimit(c, next) : next(),
-  );
-
   // Rate limit auth endpoints (credential-stuffing defense), EXCEPT get-session
-  // (handled above), the device-code mint (handled above) and the flag-on MCP
-  // OAuth allowlist (handled by the MCP OAuth limiters above). Must be mounted
-  // BEFORE the auth handler so every auth request is throttled.
+  // (handled above) and the flag-on MCP OAuth allowlist (handled by the MCP
+  // OAuth limiters above). Must be mounted BEFORE the auth handler so every auth
+  // request is throttled.
   app.use("/api/auth/*", async (c, next) => {
     if (c.req.path.endsWith("/get-session")) return next();
-    if (isDeviceCodeMintRequest(c)) return next();
     if (env.WMP_MCP_ENABLED && isMcpOauthRateLimitedRequest(c)) return next();
     return createRateLimiterMiddleware(authLimiter)(c, next);
   });
@@ -848,12 +870,6 @@ export async function createApp(options: CreateAppOptions = {}) {
   // reservation only after a 401 password failure here, so rotating IPs cannot
   // multiply guesses against a single account.
   app.use(SIGNIN_FAILURE_PATH, signinFailureLimit(signinFailureLimiter));
-
-  // Better Auth's `/device`, `/device/approve`, `/device/deny` and
-  // `/device/token` are disabled (`DISABLED_DEVICE_AUTHORIZATION_PATHS`): the
-  // approval page claims and approves in `cliCredentials.approveDeviceLogin`.
-  // A `wsmp login` too old to name its CLI slug gets an upgrade message it prints.
-  app.use("/api/auth/device/code", deviceCodeUpgradeGate);
 
   // Admin gate for Better-Auth's admin plugin endpoints. The plugin role-checks
   // by default, but these routes can set roles, reset passwords, impersonate
@@ -954,19 +970,23 @@ export async function createApp(options: CreateAppOptions = {}) {
 
   // When CORS_ORIGIN is set (cross-origin deployment), validate the x-csrf-token
   // header sent by the client's SimpleCsrfProtectionLinkPlugin on every
-  // procedure. Same-origin deployments check it only on the procedures in
-  // ALWAYS_CSRF_PROTECTED_PROCEDURES: a cross-origin page (a same-site
-  // sibling subdomain, whose request still carries the SameSite=Lax session
-  // cookie) cannot add the header without a CORS preflight, which a
-  // same-origin deployment never grants.
+  // procedure. Same-origin deployments check it on every human and human_admin
+  // procedure (CSRF_REQUIRED_PROCEDURES, derived from the contract): a
+  // cross-origin page (a same-site sibling subdomain, whose request still
+  // carries the SameSite=Lax session cookie) cannot add the header without a
+  // CORS preflight, which a same-origin deployment never grants. The context
+  // also records whether the header was present (CallerAuth.csrfVerified), so a
+  // human procedure refuses a cookie caller without it even where this plugin
+  // is bypassed.
   const csrfPlugins = [
     new SimpleCsrfProtectionHandlerPlugin<ApiContext>({
       exclude: env.CORS_ORIGIN
         ? false
-        : ({ path }) => !ALWAYS_CSRF_PROTECTED_PROCEDURES.has(path.join(".")),
+        : ({ path }) => !CSRF_REQUIRED_PROCEDURES.has(path.join(".")),
     }),
   ];
 
+  const sensitiveErrors = sensitiveProcedureErrors(SENSITIVE_INPUT_PROCEDURES);
   const apiHandler = new OpenAPIHandler(appRouter, {
     plugins: [
       new OpenAPIReferencePlugin({
@@ -975,6 +995,7 @@ export async function createApp(options: CreateAppOptions = {}) {
       ...csrfPlugins,
     ],
     interceptors: [onError(logOrpcError)],
+    clientInterceptors: [sensitiveErrors],
   });
 
   // `maxSize` is an operation-count protocol contract shared with the client via
@@ -983,18 +1004,11 @@ export async function createApp(options: CreateAppOptions = {}) {
   const rpcHandler = new RPCHandler(appRouter, {
     plugins: [createRpcBatchHandlerPlugin(), ...csrfPlugins],
     interceptors: [onError(logOrpcError)],
+    clientInterceptors: [sensitiveErrors],
   });
 
   app.use("/*", async (c, next) => {
-    const context = await createContext({
-      context: c,
-      services: {
-        ...cliContextServices(),
-        // `cliCredentials.exchangeDeviceCode`, per call (a batch is several).
-        limitDeviceCodeExchange: (deviceCode: string) =>
-          consumeDeviceCodeExchange(resolveClientIp(c), deviceCode),
-      },
-    });
+    const context = await createContext({ context: c, services: contextServices(c) });
 
     const rpcResult = await rpcHandler.handle(c.req.raw, {
       prefix: "/rpc",
@@ -1043,6 +1057,12 @@ export async function createApp(options: CreateAppOptions = {}) {
       await next();
     });
     app.use("/assets/*", serveStatic({ root: join(webDist, "client") }));
+    // Browsers already bypass their HTTP cache for the SW script; this keeps
+    // proxies/CDNs from caching it heuristically and serving a stale SW.
+    app.use("/sw.js", async (c, next) => {
+      c.header("Cache-Control", "no-cache");
+      await next();
+    });
     app.use("/*", serveStatic({ root: join(webDist, "client") }));
 
     // Mount TanStack Start for SSR — handles all non-static requests. The bundle

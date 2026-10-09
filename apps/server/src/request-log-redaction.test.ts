@@ -16,8 +16,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     BETTER_AUTH_URL: "https://proxy.example.com",
     CORS_ORIGIN: undefined,
-    RATE_LIMIT_MCP_POINTS: 120,
-    RATE_LIMIT_MCP_DURATION: 60,
+    WMP_RATE_LIMIT_SCALE: 1,
   },
 }));
 
@@ -26,6 +25,17 @@ describe("request-log redaction (OAuth query stripping)", () => {
     expect(stripsOAuthQuery("/v1/realtime")).toBe(true);
     expect(stripsOAuthQuery("/v1/realtime/")).toBe(true);
     expect(stripsOAuthQuery("/v1/realtimeish")).toBe(false);
+  });
+
+  it("strips the sign-up and login page queries (an invite link carries its token) for every locale", () => {
+    expect(stripsOAuthQuery("/en-US/signup")).toBe(true);
+    expect(stripsOAuthQuery("/es-MX/signup")).toBe(true);
+    expect(stripsOAuthQuery("/en-US/signup/")).toBe(true);
+    expect(stripsOAuthQuery("/en-US/login")).toBe(true);
+    expect(stripsOAuthQuery("/es-MX/login")).toBe(true);
+    expect(stripsOAuthQuery("/en-US/loginish")).toBe(false);
+    expect(stripsOAuthQuery("/en-US/signupish")).toBe(false);
+    expect(stripsOAuthQuery("/xx-XX/signup")).toBe(false);
   });
 
   it("flags exactly the /api/auth/oauth2/ prefix family", () => {

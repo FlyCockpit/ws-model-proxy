@@ -67,7 +67,6 @@ export const CLI_AGENT_WIRE_REASONS = [
   "approval_required",
   "bad_signature",
   "bad_command",
-  "invalid_input",
   "bad_cwd",
   "not_found",
   "already_open",
@@ -75,8 +74,7 @@ export const CLI_AGENT_WIRE_REASONS = [
   "bad_handshake",
   "bad_frame",
   "expired",
-  "supervised_only",
-  "cwd_not_utf8",
+  "trust_relay",
 ] as const;
 
 /** Stored for a rejection reason outside {@link CLI_AGENT_WIRE_REASONS}. */

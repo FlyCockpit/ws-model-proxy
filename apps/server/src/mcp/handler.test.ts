@@ -5,6 +5,7 @@ import {
   type McpRequestContext,
   McpServer,
   PROTOCOL_VERSION_META_KEY,
+  SERVER_INFO_META_KEY,
 } from "@modelcontextprotocol/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -24,7 +25,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * instance).
  */
 
-import { createMcpTransport, MCP_TRANSPORT_OPTIONS } from "./handler";
+import {
+  createMcpTransport,
+  MCP_SERVER_INFO,
+  MCP_TRANSPORT_OPTIONS,
+  mcpToolManifestHash,
+} from "./handler";
 
 // Phase 5: the default registration imports the tool manifest → appRouter →
 // Prisma client and env validation chains. Mock both so no real environment
@@ -50,23 +56,11 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
-vi.mock("../relay/cli-commands.js", () => ({
-  startCliCommand: vi.fn(),
-  waitCliCommand: vi.fn(),
-  snapshotCliCommand: vi.fn(),
-}));
-vi.mock("../relay/cli-file-ops.js", () => ({
-  runFileOp: vi.fn(),
-  cancelFileOpsForToken: vi.fn(),
-  sweepExpiredFileOps: vi.fn(),
-  auditRefusedFileInput: vi.fn(),
-}));
-
 /** Minimal well-typed CallToolResult for the probe tool. */
 type ProbeToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 
-import { isCliTool } from "./cli-tool-access";
-import { MCP_TOOL_MANIFEST } from "./tool-manifest";
+import { MCP_READ_TOOLS } from "@ws-model-proxy/api/contracts";
+import { SERVER_VERSION } from "../version";
 import { registerMcpTools } from "./tools";
 
 const ENVELOPE = {
@@ -155,25 +149,58 @@ describe("createMcpTransport — pinned configuration", () => {
     });
   });
 
-  it("the Phase 5 tool manifest backs the default registration: tools/list advertises the catalog except credential-gated CLI commands", () => {
-    expect(MCP_TOOL_MANIFEST.length).toBeGreaterThan(0);
+  it("the default registration lists only the read tools when no verified credential is bound", () => {
     const server = new McpServer({ name: "t", version: "1" });
     registerMcpTools(server);
     const handler = createMcpTransport();
     return handler.fetch(modernRequest("tools/list", 1), undefined).then(async (res) => {
-      // No authInfo is bound, so the CLI command and node file tools are not
-      // registered. Every other catalog name is advertised.
       expect(res.status).toBe(200);
       const body = (await res.json()) as {
         result?: { tools?: { name: string }[] };
       };
       const names = body.result?.tools?.map((tool) => tool.name).sort();
-      expect(names).toEqual(
-        MCP_TOOL_MANIFEST.map((tool) => tool.name)
-          .filter((name) => !isCliTool(name))
-          .sort(),
-      );
+      expect(names).toEqual([...MCP_READ_TOOLS].sort());
     });
+  });
+});
+
+describe("createMcpTransport — advertised identity and capabilities", () => {
+  it("never advertises tools.listChanged: a stateless JSON-only server sends no notifications", async () => {
+    const res = await createMcpTransport().fetch(modernRequest("server/discover", 1));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result?: { capabilities?: { tools?: { listChanged?: boolean } } };
+    };
+    expect(body.result?.capabilities?.tools).toEqual({ listChanged: false });
+  });
+
+  it("carries the app version plus the tool manifest hash in serverInfo", async () => {
+    expect(MCP_SERVER_INFO.version).toBe(`${SERVER_VERSION}+tools.${mcpToolManifestHash()}`);
+    expect(mcpToolManifestHash()).toMatch(/^[0-9a-f]{12}$/);
+    const res = await createMcpTransport().fetch(modernRequest("tools/list", 2));
+    const body = (await res.json()) as {
+      result?: { _meta?: Record<string, { name?: string; version?: string } | undefined> };
+    };
+    expect(body.result?._meta?.[SERVER_INFO_META_KEY]).toEqual(MCP_SERVER_INFO);
+  });
+
+  it("hashes names and input schemas deterministically, whatever their order", () => {
+    const a = { name: "a_get", inputSchema: { type: "object", properties: { id: {} } } };
+    const b = { name: "b_get", inputSchema: { type: "object" } };
+    expect(mcpToolManifestHash([a, b])).toBe(mcpToolManifestHash([b, a]));
+    // Key order inside a schema does not matter either.
+    expect(mcpToolManifestHash([a, b])).toBe(
+      mcpToolManifestHash([
+        { inputSchema: { properties: { id: {} }, type: "object" }, name: "a_get" },
+        b,
+      ]),
+    );
+    expect(mcpToolManifestHash()).toBe(mcpToolManifestHash());
+    expect(mcpToolManifestHash([a, b])).not.toBe(mcpToolManifestHash([a]));
+    expect(mcpToolManifestHash([a, b])).not.toBe(
+      mcpToolManifestHash([a, { ...b, inputSchema: { type: "object", required: ["id"] } }]),
+    );
+    expect(mcpToolManifestHash([a, b])).not.toBe(mcpToolManifestHash([a, { ...b, name: "c_get" }]));
   });
 });
 

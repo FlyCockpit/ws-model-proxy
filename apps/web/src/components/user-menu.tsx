@@ -28,7 +28,7 @@ export default function UserMenu() {
   const params = useParams({ strict: false });
   const lang = isSupportedLocale(params.lang) ? params.lang : DEFAULT_LOCALE;
   const { state } = useAuthSession();
-  const config = useQuery(orpc.appConfig.queryOptions());
+  const config = useQuery(orpc.app.config.queryOptions());
   const { t } = useTranslation("nav");
   const [mounted, setMounted] = useState(false);
 

@@ -133,12 +133,8 @@ fn config_init_and_show_use_explicit_config_file() {
     let mut show = cli(&config, &state);
     show.args(["config", "--json", "show"]);
     let show_value = json_stdout(show);
-    assert_eq!(show_value["version"], 1);
-    assert!(
-        show_value["endpoints"]
-            .as_array()
-            .is_some_and(Vec::is_empty)
-    );
+    assert_eq!(show_value["version"], 3);
+    assert!(show_value.get("endpoints").is_none());
 }
 
 #[test]
@@ -272,23 +268,7 @@ fn config_set_server_pins_and_clears_a_public_origin() {
 }
 
 #[test]
-fn token_login_records_env_var_name_not_secret_value() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    let mut cmd = cli(&config, &state);
-    cmd.args(["token", "--json", "login", "WSMP_TEST_TOKEN"])
-        .env("WSMP_TEST_TOKEN", "wsmp_cli_secret_for_test");
-    let value = json_stdout(cmd);
-    assert_eq!(value["cliTokenEnv"], "WSMP_TEST_TOKEN");
-
-    let text = fs::read_to_string(&config).unwrap();
-    assert!(text.contains("WSMP_TEST_TOKEN"));
-    assert!(!text.contains("wsmp_cli_secret_for_test"));
-}
-
-#[test]
-fn connect_persists_generated_slug_before_auth_failure() {
+fn run_persists_generated_slug_before_auth_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
@@ -304,12 +284,12 @@ fn connect_persists_generated_slug_before_auth_failure() {
     // As under the systemd unit: a definitely missing credential exits 4
     // (elsewhere the relay keeps retrying in-process).
     cli(&config, &state)
-        .arg("connect")
+        .arg("run")
         .env("WSMP_STOP_ON_REJECTED_CREDENTIAL", "1")
         .timeout(std::time::Duration::from_secs(60))
         .assert()
         .code(4)
-        .stderr(predicate::str::contains("no CLI token env var"));
+        .stderr(predicate::str::contains("not enrolled"));
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     let slug = cfg["cliSlug"].as_str().expect("slug");
     assert!(slug.starts_with("cli-"));
@@ -317,7 +297,7 @@ fn connect_persists_generated_slug_before_auth_failure() {
 }
 
 #[test]
-fn connect_without_the_stop_marker_keeps_retrying_a_missing_credential() {
+fn run_without_the_stop_marker_keeps_retrying_a_missing_credential() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
@@ -328,7 +308,7 @@ fn connect_without_the_stop_marker_keeps_retrying_a_missing_credential() {
     // A macOS LaunchAgent or detached daemon: exiting would only relaunch.
     // The generous timeout leaves room for slow CI startup before the warning.
     let output = cli(&config, &state)
-        .arg("connect")
+        .arg("run")
         .env_remove("WSMP_STOP_ON_REJECTED_CREDENTIAL")
         .timeout(std::time::Duration::from_secs(10))
         .output()
@@ -345,729 +325,164 @@ fn connect_without_the_stop_marker_keeps_retrying_a_missing_credential() {
     assert_eq!(output.status.code(), None, "{stderr}");
 }
 
+const CODE: &str = "wsmp_enr_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const IDENTITY_PREFIX: &str = "B";
+
+fn well_known(origin: &str) -> Value {
+    json!({
+        "serverVersion": "0.4.0", "protocolVersion": "3.0", "origin": origin,
+        "installScript": "/install.sh", "enrollPath": "/api/node/enroll"
+    })
+}
+
+fn enrolled(slug: &str) -> Value {
+    json!({
+        "ok": true, "nodeId": "node-1", "slug": slug, "credential": "c".repeat(48),
+        "replaced": null, "trustLowerPending": false
+    })
+}
+
 #[test]
-fn login_rejects_invalid_slug_before_device_authorization_request() {
+fn login_enrolls_with_a_code_and_stores_a_private_credential() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({
-            "version": 1,
-            "serverUrl": "http://127.0.0.1:9"
-        }),
+    // The server announces a public origin other than the URL: it is pinned.
+    let server = TestServer::start(vec![
+        (
+            "/.well-known/wsmp",
+            200,
+            well_known("https://wsmp.example.com"),
+        ),
+        ("/api/node/enroll", 200, enrolled("spark-1")),
+    ]);
+    let mut cmd = cli(&config, &state);
+    cmd.args([
+        "login",
+        &server.base_url,
+        "--code",
+        CODE,
+        "--slug",
+        "spark-1",
+        "--trust",
+        "relay",
+        "--no-service",
+        "--json",
+    ]);
+    let value = json_stdout(cmd);
+    assert_eq!(value["slug"], "spark-1");
+    assert_eq!(value["trust"], "relay");
+    let well_known_request = server.requests.recv().unwrap();
+    assert!(well_known_request.starts_with("GET /.well-known/wsmp "));
+    let enroll_request = server.requests.recv().unwrap();
+    assert!(enroll_request.starts_with("POST /api/node/enroll "));
+    let body: Value =
+        serde_json::from_str(enroll_request.split("\r\n\r\n").nth(1).expect("body")).unwrap();
+    assert_eq!(body["code"], CODE);
+    assert_eq!(body["slug"], "spark-1");
+    assert_eq!(body["replaceConfirmed"], false);
+    assert!(
+        body["identityPublicKey"]
+            .as_str()
+            .unwrap()
+            .starts_with(IDENTITY_PREFIX)
     );
-
-    cli(&config, &state)
-        .args(["login", "--slug", "desk.01"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("validating CLI slug"));
-
+    server.join();
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert!(cfg.get("cliSlug").is_none());
-    assert!(!state.join("device-auth.json").exists());
-}
-
-#[test]
-fn login_rejects_the_removed_name_flag() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({
-            "version": 1,
-            "serverUrl": "http://127.0.0.1:9"
-        }),
-    );
-
-    cli(&config, &state)
-        .args(["login", "--name", "Desk", "--slug", "desk-01"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("--name"));
-}
-
-#[test]
-fn non_interactive_login_defaults_the_slug_from_the_hostname() {
-    let Some(expected) = wsmp::hostname::hostname_slug() else {
-        // No usable hostname here: login must ask for `--slug` instead.
-        let tmp = tempfile::tempdir().unwrap();
-        let config = tmp.path().join("config.json");
-        let state = tmp.path().join("state");
-        write_config(
-            &config,
-            json!({ "version": 1, "serverUrl": "http://127.0.0.1:9" }),
-        );
-        cli(&config, &state)
-            .arg("login")
-            .write_stdin("")
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains("pass `--slug <slug>`"));
-        return;
-    };
-    let server = TestServer::start(vec![
-        (
-            "/api/auth/device/code",
-            200,
-            json!({
-                "device_code": "device-code-1",
-                "user_code": "ABCD-EFGH",
-                "verification_uri": "http://example.test/en-US/device",
-                "expires_in": 30,
-                "interval": 1
-            }),
-        ),
-        (
-            "/rpc/cliCredentials/exchangeDeviceCode",
-            200,
-            json!({
-                "json": {
-                    "credentialId": "credential-1",
-                    "userId": "user-1",
-                    "secret": "wsmp_device_secret_for_test"
-                }
-            }),
-        ),
-    ]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({ "version": 1, "serverUrl": server.base_url }),
-    );
-
-    // assert_cmd gives the child a non-terminal stdin.
-    cli(&config, &state)
-        .arg("login")
-        .write_stdin("")
-        .assert()
-        .success();
-    let start_request = server.requests.recv().unwrap();
-    assert!(start_request.contains("POST /api/auth/device/code"));
-    let exchange_request = server.requests.recv().unwrap();
-    assert!(exchange_request.contains(&format!(r#""cliSlug":"{expected}""#)));
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["cliSlug"], expected.as_str());
-    server.join();
-}
-
-#[test]
-fn login_waits_out_a_short_device_code_rate_limit_once() {
-    let started = json!({
-        "device_code": "device-code-1",
-        "user_code": "ABCD-EFGH",
-        "verification_uri": "http://example.test/en-US/device",
-        "expires_in": 30,
-        "interval": 1
-    });
-    let server = TestServer::start(vec![
-        (
-            "/api/auth/device/code",
-            429,
-            json!({ "error": "Too many attempts." }),
-        ),
-        ("/api/auth/device/code", 200, started),
-        (
-            "/rpc/cliCredentials/exchangeDeviceCode",
-            200,
-            json!({
-                "json": {
-                    "credentialId": "credential-1",
-                    "userId": "user-1",
-                    "secret": "wsmp_device_secret_for_test"
-                }
-            }),
-        ),
-    ]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({ "version": 1, "serverUrl": server.base_url }),
-    );
-    cli(&config, &state)
-        .args(["login", "--slug", "desk-01"])
-        .write_stdin("")
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("rate limited, retry in 1 s"));
-    server.join();
-}
-
-#[test]
-fn login_reports_a_repeated_device_code_rate_limit_with_its_wait() {
-    let server = TestServer::start(vec![
-        (
-            "/api/auth/device/code",
-            429,
-            json!({ "error": "Too many attempts." }),
-        ),
-        (
-            "/api/auth/device/code",
-            429,
-            json!({ "error": "Too many attempts." }),
-        ),
-    ]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({ "version": 1, "serverUrl": server.base_url }),
-    );
-    cli(&config, &state)
-        .args(["login", "--slug", "desk-01"])
-        .write_stdin("")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("rate limited, retry in 1 s"));
-    server.join();
-}
-
-#[test]
-fn login_rejection_does_not_overwrite_local_slug_or_save_credential() {
-    let server = TestServer::start(vec![
-        (
-            "/api/auth/device/code",
-            200,
-            json!({
-                "device_code": "device-code-1",
-                "user_code": "ABCD-EFGH",
-                "verification_uri": "http://example.test/en-US/device",
-                "expires_in": 30,
-                "interval": 1
-            }),
-        ),
-        (
-            "/rpc/cliCredentials/exchangeDeviceCode",
-            400,
-            json!({
-                "json": {
-                    "defined": false,
-                    "code": "BAD_REQUEST",
-                    "status": 400,
-                    "message": "Device authorization was requested for a different CLI slug."
-                }
-            }),
-        ),
-    ]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({
-            "version": 1,
-            "serverUrl": server.base_url,
-            "cliSlug": "existing-cli"
-        }),
-    );
-
-    cli(&config, &state)
-        .args(["login", "--slug", "desk-01"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("different CLI slug"));
-
-    let start_request = server.requests.recv().unwrap();
-    assert!(start_request.contains("POST /api/auth/device/code"));
-    let exchange_request = server.requests.recv().unwrap();
-    assert!(exchange_request.contains(r#""cliSlug":"desk-01""#));
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["cliSlug"], "existing-cli");
-    assert!(!state.join("device-auth.json").exists());
-    server.join();
-}
-
-#[test]
-fn login_untagged_error_fails_fast_even_when_the_message_says_pending() {
-    // Only one exchange response is served. Classifying by message text (it
-    // says "pending") instead of `data.deviceFlowError` would poll again, hit
-    // a closed server, and fail with a transport error instead of this error.
-    let server = TestServer::start(vec![
-        (
-            "/api/auth/device/code",
-            200,
-            json!({
-                "device_code": "device-code-1",
-                "user_code": "ABCD-EFGH",
-                "verification_uri": "http://example.test/en-US/device",
-                "expires_in": 30,
-                "interval": 1
-            }),
-        ),
-        (
-            "/rpc/cliCredentials/exchangeDeviceCode",
-            400,
-            json!({
-                "json": {
-                    "defined": false,
-                    "code": "BAD_REQUEST",
-                    "status": 400,
-                    "message": "Device authorization is pending, but for a different CLI slug."
-                }
-            }),
-        ),
-    ]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({ "version": 1, "serverUrl": server.base_url }),
-    );
-
-    let started = std::time::Instant::now();
-    cli(&config, &state)
-        .args(["login", "--slug", "pending-ci"])
-        .timeout(std::time::Duration::from_secs(10))
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("for a different CLI slug"));
-    // One poll interval (1s), not a poll loop until the 30s expiry.
-    assert!(started.elapsed() < std::time::Duration::from_secs(8));
-    assert!(!state.join("device-auth.json").exists());
-    server.join();
-}
-
-#[test]
-fn relogin_with_the_saved_slug_overwrites_the_device_credential() {
-    let server = TestServer::start(vec![
-        (
-            "/api/auth/device/code",
-            200,
-            json!({
-                "device_code": "device-code-2",
-                "user_code": "WXYZ-2345",
-                "verification_uri": "http://example.test/en-US/device",
-                "expires_in": 30,
-                "interval": 1
-            }),
-        ),
-        (
-            "/rpc/cliCredentials/exchangeDeviceCode",
-            200,
-            json!({
-                "json": {
-                    "credentialId": "credential-2",
-                    "userId": "user-1",
-                    "secret": "wsmp_device_new_secret"
-                }
-            }),
-        ),
-    ]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({ "version": 1, "serverUrl": server.base_url, "cliSlug": "desk-01" }),
-    );
-    fs::create_dir_all(&state).unwrap();
-    fs::write(
-        state.join("device-auth.json"),
-        serde_json::to_string(&json!({
-            "credentialId": "credential-1",
-            "userId": "user-1",
-            "secret": "wsmp_device_old_secret"
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
-    cli(&config, &state)
-        .arg("login")
-        .write_stdin("")
-        .assert()
-        .success();
-
-    // The approval request names the saved slug, so the approver sees which
-    // device this login replaces.
-    let start_request = server.requests.recv().unwrap();
-    assert!(start_request.contains(r#""scope":"cli-slug:desk-01""#));
-    let exchange_request = server.requests.recv().unwrap();
-    assert!(exchange_request.contains(r#""cliSlug":"desk-01""#));
-    let credential_text = fs::read_to_string(state.join("device-auth.json")).unwrap();
-    assert!(credential_text.contains("wsmp_device_new_secret"));
-    assert!(!credential_text.contains("wsmp_device_old_secret"));
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["cliSlug"], "desk-01");
-    server.join();
-}
-
-#[test]
-fn non_interactive_login_defaults_to_the_saved_slug() {
-    let server = TestServer::start(vec![
-        (
-            "/api/auth/device/code",
-            200,
-            json!({
-                "device_code": "device-code-1",
-                "user_code": "ABCD-EFGH",
-                "verification_uri": "http://example.test/en-US/device",
-                "expires_in": 30,
-                "interval": 1
-            }),
-        ),
-        (
-            "/rpc/cliCredentials/exchangeDeviceCode",
-            200,
-            json!({
-                "json": {
-                    "credentialId": "credential-1",
-                    "userId": "user-1",
-                    "secret": "wsmp_device_secret_for_test"
-                }
-            }),
-        ),
-    ]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({ "version": 1, "serverUrl": server.base_url, "cliSlug": "saved-cli" }),
-    );
-
-    cli(&config, &state)
-        .arg("login")
-        .write_stdin("")
-        .assert()
-        .success();
-    let _start_request = server.requests.recv().unwrap();
-    let exchange_request = server.requests.recv().unwrap();
-    assert!(exchange_request.contains(r#""cliSlug":"saved-cli""#));
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["cliSlug"], "saved-cli");
-    server.join();
-}
-
-#[test]
-fn login_writes_device_credential_to_state_dir() {
-    let server = TestServer::start(vec![
-        (
-            "/api/auth/device/code",
-            200,
-            json!({
-                "device_code": "device-code-1",
-                "user_code": "ABCD-EFGH",
-                "verification_uri": "http://example.test/en-US/device",
-                "expires_in": 30,
-                "interval": 1
-            }),
-        ),
-        (
-            "/rpc/cliCredentials/exchangeDeviceCode",
-            400,
-            json!({
-                "json": {
-                    "defined": false,
-                    "code": "BAD_REQUEST",
-                    "status": 400,
-                    "message": "Device authorization is pending.",
-                    "data": { "deviceFlowError": "authorization_pending" }
-                }
-            }),
-        ),
-        (
-            "/rpc/cliCredentials/exchangeDeviceCode",
-            200,
-            json!({
-                "json": {
-                    "credentialId": "credential-1",
-                    "userId": "user-1",
-                    "secret": "wsmp_device_secret_for_test"
-                }
-            }),
-        ),
-    ]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({
-            "version": 1,
-            "serverUrl": server.base_url
-        }),
-    );
-
-    cli(&config, &state)
-        .args(["login", "--slug", "desk-01"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("device login complete"));
-    let start_request = server.requests.recv().unwrap();
-    assert!(start_request.contains("POST /api/auth/device/code"));
-    assert!(start_request.contains(r#""scope":"cli-slug:desk-01""#));
-    let pending_request = server.requests.recv().unwrap();
-    assert!(pending_request.contains(r#""cliSlug":"desk-01""#));
-    // The device's name is dashboard-owned; login sends none.
-    assert!(!pending_request.contains(r#""name""#));
-    let success_request = server.requests.recv().unwrap();
-    assert!(success_request.contains(r#""cliSlug":"desk-01""#));
-    assert!(success_request.contains(r#""identityPublicKey":"#));
-
-    let credential_path = state.join("device-auth.json");
-    let credential_text = fs::read_to_string(&credential_path).unwrap();
-    assert!(credential_text.contains("wsmp_device_secret_for_test"));
-    assert!(!config.parent().unwrap().join("device-auth.json").exists());
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["cliSlug"], "desk-01");
+    assert_eq!(cfg["serverUrl"], value["server"]);
+    assert_eq!(cfg["publicOrigin"], "https://wsmp.example.com");
+    assert_eq!(cfg["cliSlug"], "spark-1");
+    assert_eq!(cfg["trust"], "relay");
+    let credential = state.join("node-credential.json");
+    let saved: Value = serde_json::from_slice(&fs::read(&credential).unwrap()).unwrap();
+    assert_eq!(saved["credential"], "c".repeat(48));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(&credential_path).unwrap().permissions().mode() & 0o777;
+        let mode = fs::metadata(&credential).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
-    server.join();
+    // The code never reaches stdout or the config.
+    assert!(!fs::read_to_string(&config).unwrap().contains(CODE));
 }
 
 #[test]
-fn endpoints_add_list_remove_json() {
+fn a_fresh_login_takes_the_chosen_trust_and_a_lowered_node_stays_lowered() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
-    cli(&config, &state)
-        .args([
-            "endpoints",
-            "add",
-            "--slug",
-            "local",
-            "--label",
-            "Local",
-            "--base-url",
-            "http://127.0.0.1:11434/v1",
-            "--header-env",
-            "OpenAI-Organization=LOCAL_LLM_ORG",
-        ])
-        .assert()
-        .success();
-
-    let mut list = cli(&config, &state);
-    list.args(["endpoints", "--json", "list"]);
-    let value = json_stdout(list);
-    assert_eq!(value["endpoints"][0]["slug"], "local");
-    assert_eq!(value["endpoints"][0]["headers"][0]["env"], "LOCAL_LLM_ORG");
-
-    cli(&config, &state)
-        .args(["endpoints", "remove", "local"])
-        .assert()
-        .success();
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["endpoints"].as_array().unwrap().len(), 0);
-}
-
-#[test]
-fn endpoints_concurrency_and_engine_round_trip() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    cli(&config, &state)
-        .args([
-            "endpoints",
-            "add",
-            "--slug",
-            "local",
-            "--label",
-            "Local",
-            "--base-url",
-            "http://127.0.0.1:8080/v1",
-            "--concurrency-limit",
-            "4",
-            "--engine",
-            "llama.cpp",
-        ])
-        .assert()
-        .success();
-    let mut list = cli(&config, &state);
-    list.args(["endpoints", "--json", "list"]);
-    let value = json_stdout(list);
-    assert_eq!(value["endpoints"][0]["concurrencyLimit"], 4);
-    assert_eq!(value["endpoints"][0]["engine"], "llama.cpp");
-
-    cli(&config, &state)
-        .args(["endpoints", "concurrency", "local", "--clear"])
-        .assert()
-        .success();
-    cli(&config, &state)
-        .args(["endpoints", "engine", "local", "vllm"])
-        .assert()
-        .success();
-    let mut list = cli(&config, &state);
-    list.args(["endpoints", "--json", "list"]);
-    let value = json_stdout(list);
-    assert!(value["endpoints"][0].get("concurrencyLimit").is_none());
-    assert_eq!(value["endpoints"][0]["engine"], "vllm");
-
-    for engine in ["sglang", "ollama", "lm-studio", "generic"] {
-        cli(&config, &state)
-            .args(["endpoints", "engine", "local", engine])
-            .assert()
-            .success();
-        let mut list = cli(&config, &state);
-        list.args(["endpoints", "--json", "list"]);
-        assert_eq!(json_stdout(list)["endpoints"][0]["engine"], engine);
-    }
-    // `auto` is the default and is not written to the config.
-    cli(&config, &state)
-        .args(["endpoints", "engine", "local", "auto"])
-        .assert()
-        .success();
-    let mut list = cli(&config, &state);
-    list.args(["endpoints", "--json", "list"]);
-    assert!(json_stdout(list)["endpoints"][0].get("engine").is_none());
-
-    cli(&config, &state)
-        .args(["endpoints", "concurrency", "missing", "2"])
-        .assert()
-        .failure()
-        .code(3)
-        .stderr(predicate::str::contains("endpoint `missing` not found"));
-}
-
-#[test]
-fn endpoints_kv_tokens_round_trip_json_and_llama_cpp_warning() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    cli(&config, &state)
-        .args([
-            "endpoints",
-            "add",
-            "--slug",
-            "local",
-            "--label",
-            "Local",
-            "--base-url",
-            "http://127.0.0.1:8080/v1",
-            "--engine",
-            "generic",
-        ])
-        .assert()
-        .success();
-
-    let mut set = cli(&config, &state);
-    set.args(["endpoints", "--json", "kv-tokens", "local", "262144"]);
-    let value = json_stdout(set);
-    assert_eq!(value["kvTokens"], 262144);
-
-    cli(&config, &state)
-        .args(["endpoints", "kv-tokens", "local", "--clear"])
-        .assert()
-        .success();
-    let mut list = cli(&config, &state);
-    list.args(["endpoints", "--json", "list"]);
-    assert!(json_stdout(list)["endpoints"][0].get("kvTokens").is_none());
-
-    cli(&config, &state)
-        .args(["endpoints", "engine", "local", "llama.cpp"])
-        .assert()
-        .success();
-    cli(&config, &state)
-        .args(["endpoints", "kv-tokens", "local", "4096"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("llama.cpp stays slot-based"));
-
-    cli(&config, &state)
-        .args(["endpoints", "kv-tokens", "missing", "2"])
-        .assert()
-        .failure()
-        .code(3)
-        .stderr(predicate::str::contains("endpoint `missing` not found"));
-}
-
-#[test]
-fn endpoints_adapter_set_show_clear_round_trip_json() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    cli(&config, &state)
-        .args([
-            "endpoints",
-            "add",
-            "--slug",
-            "local",
-            "--label",
-            "Local",
-            "--base-url",
-            "http://127.0.0.1:8080/v1",
-            "--engine",
-            "generic",
-        ])
-        .assert()
-        .success();
-
-    let mut set = cli(&config, &state);
-    set.args([
-        "endpoints",
-        "--json",
-        "adapter",
-        "set",
-        "local",
-        "--route",
-        "/stats",
-        "--format",
-        "json",
-        "--interval",
-        "3",
-        "--timeout",
-        "2",
+    let server = TestServer::start(vec![
+        (
+            "/.well-known/wsmp",
+            200,
+            well_known("https://wsmp.example.com"),
+        ),
+        ("/api/node/enroll", 200, enrolled("spark-1")),
     ]);
-    let value = json_stdout(set);
-    assert_eq!(value["engineAdapter"]["format"], "json");
-    assert_eq!(value["engineAdapter"]["intervalSecs"], 3);
-    assert_eq!(value["engineAdapter"]["input"]["route"], "/stats");
-
-    let mut show = cli(&config, &state);
-    show.args(["endpoints", "--json", "adapter", "show", "local"]);
-    let shown = json_stdout(show);
-    assert_eq!(shown["input"]["route"], "/stats");
-    assert_eq!(shown["format"], "json");
-
+    let mut cmd = cli(&config, &state);
+    cmd.args([
+        "login",
+        &server.base_url,
+        "--code",
+        CODE,
+        "--slug",
+        "spark-1",
+        "--trust",
+        "full",
+        "--no-service",
+        "--json",
+    ]);
+    assert_eq!(json_stdout(cmd)["trust"], "full");
+    server.join();
+    // Lowered, then logged in again asking for full: stays relay.
     cli(&config, &state)
-        .args([
-            "endpoints",
-            "adapter",
-            "set",
-            "local",
-            "--route",
-            "http://127.0.0.1/metrics",
-            "--format",
-            "json",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("adapter route is invalid"));
-
-    cli(&config, &state)
-        .args(["endpoints", "adapter", "clear", "local"])
+        .args(["trust", "relay"])
         .assert()
         .success();
-    let mut list = cli(&config, &state);
-    list.args(["endpoints", "--json", "list"]);
-    assert!(
-        json_stdout(list)["endpoints"][0]
-            .get("engineAdapter")
-            .is_none()
-    );
-
+    let server = TestServer::start(vec![
+        (
+            "/.well-known/wsmp",
+            200,
+            well_known("https://wsmp.example.com"),
+        ),
+        ("/api/node/enroll", 200, enrolled("spark-1")),
+    ]);
+    let mut again = cli(&config, &state);
+    again.args([
+        "login",
+        &server.base_url,
+        "--code",
+        CODE,
+        "--slug",
+        "spark-1",
+        "--trust",
+        "full",
+        "--no-service",
+        "--json",
+    ]);
+    // A same-server re-login keeps the person's lowering, even with `--trust full`.
+    assert_eq!(json_stdout(again)["trust"], "relay");
+    assert!(state.join("frozen-definitions.json").exists());
+    server.join();
+    // Not from a process wsmp started.
     cli(&config, &state)
-        .args(["endpoints", "adapter", "show", "missing"])
+        .args([
+            "login",
+            "http://127.0.0.1:9",
+            "--code",
+            CODE,
+            "--no-service",
+        ])
+        .env("WSMP_JOB", "1")
         .assert()
         .failure()
-        .code(3)
-        .stderr(predicate::str::contains("endpoint `missing` not found"));
+        .stderr(predicate::str::contains("cannot run from a command"));
 }
 
+/// Leftover 0.3 state (a config without `trust`, an old credential) is not
+/// a lowering and not this node: the login takes `--trust` and a new name.
 #[test]
-fn remote_engine_adapters_need_separate_opt_in_and_hash() {
+fn a_login_over_leftover_0_3_state_is_a_fresh_enrollment() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
@@ -1075,314 +490,437 @@ fn remote_engine_adapters_need_separate_opt_in_and_hash() {
         &config,
         json!({
             "version": 1,
-            "allowRemoteMetricSources": true
+            "serverUrl": "https://old.example.com",
+            "cliSlug": "old-box",
+            "endpoints": []
         }),
     );
-    cli(&config, &state)
-        .args([
-            "endpoints",
-            "add",
-            "--slug",
-            "gpu",
-            "--label",
-            "GPU",
-            "--base-url",
-            "http://127.0.0.1:8080/v1",
-            "--engine",
-            "generic",
-        ])
-        .assert()
-        .success();
-    write_remote_adapters(
-        &state,
-        json!([{
-            "endpointSlug": "gpu",
-            "input": { "command": "echo 1" },
-            "format": "json",
-            "intervalSecs": 2,
-            "timeoutSecs": 2
-        }]),
-    );
-
-    let shown = json_stdout({
-        let mut cmd = cli(&config, &state);
-        cmd.args(["endpoints", "--json", "adapter", "show", "gpu"]);
-        cmd
-    });
-    assert_eq!(shown["origin"], "remote");
-    assert_eq!(
-        shown["state"], "refused",
-        "metric-source opt-in does not allow adapters"
-    );
-    assert_eq!(shown["allowRemoteEngineAdapters"], false);
-    let hash = shown["specSha256"].as_str().expect("hash").to_string();
-    assert_eq!(hash.len(), 64);
-
-    cli(&config, &state)
-        .args(["config", "set-remote-engine-adapters", "on"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Restart wsmp to apply."));
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        state.join("node-credential.json"),
+        json!({ "token": "old-0.3-credential", "server": "https://old.example.com" }).to_string(),
+    )
+    .unwrap();
+    let server = TestServer::start(vec![
+        (
+            "/.well-known/wsmp",
+            200,
+            well_known("https://wsmp.example.com"),
+        ),
+        ("/api/node/enroll", 200, enrolled("fresh-box")),
+    ]);
+    let mut cmd = cli(&config, &state);
+    cmd.args([
+        "login",
+        &server.base_url,
+        "--code",
+        CODE,
+        "--trust",
+        "full",
+        "--no-service",
+        "--json",
+    ]);
+    assert_eq!(json_stdout(cmd)["trust"], "full");
+    server.requests.recv().unwrap();
+    let enroll_request = server.requests.recv().unwrap();
+    let body: Value =
+        serde_json::from_str(enroll_request.split("\r\n\r\n").nth(1).expect("body")).unwrap();
+    assert_ne!(body["slug"], "old-box", "the old node's name was reused");
+    server.join();
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["allowRemoteEngineAdapters"], true);
-    assert_eq!(cfg["allowRemoteMetricSources"], true);
-
-    let shown = json_stdout({
-        let mut cmd = cli(&config, &state);
-        cmd.args(["endpoints", "--json", "adapter", "show", "gpu"]);
-        cmd
-    });
-    assert_eq!(shown["state"], "pending_approval");
-
-    cli(&config, &state)
-        .args(["endpoints", "adapter", "approve", "gpu"])
-        .assert()
-        .failure();
-    cli(&config, &state)
-        .args([
-            "endpoints",
-            "adapter",
-            "approve",
-            "gpu",
-            "--sha256",
-            "deadbeef",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(&hash));
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert!(cfg.get("approvedRemoteAdapters").is_none());
-
-    cli(&config, &state)
-        .args(["endpoints", "adapter", "approve", "gpu", "--sha256", &hash])
-        .assert()
-        .success();
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["approvedRemoteAdapters"]["gpu"], hash);
-
-    let shown = json_stdout({
-        let mut cmd = cli(&config, &state);
-        cmd.args(["endpoints", "--json", "adapter", "show", "gpu"]);
-        cmd
-    });
-    assert_eq!(shown["state"], "active");
-    assert!(!shown.to_string().contains("engineAdapters"));
-
-    cli(&config, &state)
-        .args(["endpoints", "adapter", "revoke", "gpu"])
-        .assert()
-        .success();
-    cli(&config, &state)
-        .args(["config", "set-remote-engine-adapters", "off"])
-        .assert()
-        .success();
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert!(cfg.get("allowRemoteEngineAdapters").is_none());
+    assert_eq!(cfg["trust"], "full");
+    assert_eq!(cfg["cliSlug"], "fresh-box");
 }
 
+/// A Relay-only setting an earlier enrollment (another server) left: a fresh
+/// enrollment keeps it without an explicit choice and clears it with
+/// `--trust full`.
+// Clearing needs to know no relay runs; Windows cannot tell, so it always keeps the lowering.
 #[cfg(unix)]
 #[test]
-fn endpoints_adapter_test_never_prints_raw_output() {
+fn a_fresh_enrollment_clears_a_leftover_lowering_only_when_full_is_chosen() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
+    let frozen = state.join("frozen-definitions.json");
+    write_config(
+        &config,
+        json!({
+            "version": 1,
+            "serverUrl": "https://old.example.com",
+            "cliSlug": "old-box",
+            "trust": "full",
+            "endpoints": []
+        }),
+    );
     cli(&config, &state)
-        .args([
-            "endpoints",
-            "add",
+        .args(["trust", "relay"])
+        .assert()
+        .success();
+    assert!(frozen.exists());
+    let login = |extra: &[&str]| {
+        let server = TestServer::start(vec![
+            (
+                "/.well-known/wsmp",
+                200,
+                well_known("https://wsmp.example.com"),
+            ),
+            ("/api/node/enroll", 200, enrolled("fresh-box")),
+        ]);
+        let mut cmd = cli(&config, &state);
+        cmd.args([
+            "login",
+            &server.base_url,
+            "--code",
+            CODE,
             "--slug",
-            "local",
-            "--label",
-            "Local",
-            "--base-url",
-            "http://127.0.0.1:8080/v1",
-            "--engine",
-            "generic",
-        ])
-        .assert()
-        .success();
-    cli(&config, &state)
-        .args([
-            "endpoints",
-            "adapter",
-            "set",
-            "local",
-            "--command",
-            r#"printf '{"running":3,"kvUsage":0.4}\n'; echo ADAPTER-SECRET >&2"#,
-            "--format",
-            "json",
-        ])
-        .assert()
-        .success();
-
-    let mut test = cli(&config, &state);
-    test.args(["endpoints", "--json", "adapter", "test", "local"]);
-    let output = test.assert().success().get_output().clone();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid JSON");
-    assert_eq!(value["ok"], true);
-    assert_eq!(value["running"], 3);
-    assert_eq!(value["kvUsage"], 0.4);
+            "fresh-box",
+            "--no-service",
+            "--json",
+        ]);
+        cmd.args(extra);
+        let output = cmd.assert().success().get_output().clone();
+        server.join();
+        // Next login is to another server again: forget this enrollment.
+        fs::remove_file(state.join("node-credential.json")).unwrap();
+        let mut cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        cfg["serverUrl"] = "https://old.example.com".into();
+        cfg.as_object_mut().unwrap().remove("publicOrigin");
+        write_config(&config, cfg);
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        (value, String::from_utf8(output.stderr).unwrap())
+    };
+    // No explicit choice (no terminal, no `--trust`): stays Relay only.
+    let (value, stderr) = login(&[]);
+    assert_eq!(value["trust"], "relay");
     assert!(
-        !stdout.contains("ADAPTER-SECRET") && !stderr.contains("ADAPTER-SECRET"),
-        "adapter test never prints raw command output: {stdout} {stderr}"
+        stderr.contains("pass `--trust full` to clear that"),
+        "{stderr}"
     );
+    assert!(!stderr.contains("full control"), "{stderr}");
+    assert!(frozen.exists());
+    // An explicit `--trust relay` keeps it too.
+    let (value, _) = login(&["--trust", "relay"]);
+    assert_eq!(value["trust"], "relay");
+    assert!(frozen.exists());
+    // Not while a relay runs here: its reload would write `relay` back.
+    #[cfg(unix)]
+    {
+        let listener = std::os::unix::net::UnixListener::bind(state.join("relay-control.sock"))
+            .expect("bind a stand-in relay control socket");
+        let relay = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("control request");
+            let mut request = String::new();
+            stream.read_to_string(&mut request).expect("read request");
+            stream.write_all(br#"{"ok":true}"#).expect("answer");
+        });
+        let (value, stderr) = login(&["--trust", "full"]);
+        relay.join().unwrap();
+        fs::remove_file(state.join("relay-control.sock")).unwrap();
+        assert_eq!(value["trust"], "relay", "{stderr}");
+        assert!(stderr.contains("a relay is running here"), "{stderr}");
+        assert!(!stderr.contains("pass `--trust full`"), "{stderr}");
+        assert!(frozen.exists());
+    }
+    // An explicit `--trust full` clears it, and says so.
+    let (value, stderr) = login(&["--trust", "full"]);
+    assert_eq!(value["trust"], "full", "{stderr}");
     assert!(
-        !value.to_string().contains("printf"),
-        "command text stays off the wire"
+        stderr.contains("cleared the Relay-only setting"),
+        "{stderr}"
     );
+    assert!(!frozen.exists());
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["trust"], "full");
 }
 
 #[test]
-fn endpoints_remove_unknown_slug_exits_3_not_found() {
+fn login_sets_browser_terminals_by_flag_and_keeps_them_without_a_terminal() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
-    write_config(&config, json!({ "version": 1, "endpoints": [] }));
+    let login = |extra: &[&str]| {
+        let server = TestServer::start(vec![
+            (
+                "/.well-known/wsmp",
+                200,
+                well_known("https://wsmp.example.com"),
+            ),
+            ("/api/node/enroll", 200, enrolled("spark-1")),
+        ]);
+        let mut cmd = cli(&config, &state);
+        cmd.args([
+            "login",
+            &server.base_url,
+            "--code",
+            CODE,
+            "--slug",
+            "spark-1",
+            "--trust",
+            "full",
+            "--no-service",
+        ]);
+        cmd.args(extra);
+        let output = cmd.assert().success().get_output().clone();
+        server.join();
+        let saved: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        (
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+            saved["allowHumanTerminal"].as_bool().unwrap_or(false),
+        )
+    };
+    // No terminal, no flag: off, and the output says so.
+    let (stdout, stderr, saved) = login(&["--json"]);
+    let value: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["allowHumanTerminal"], false);
+    assert!(!saved);
+    assert!(
+        stderr.contains("no terminal to ask, so browser terminals stay off"),
+        "{stderr}"
+    );
+    // The flag turns them on, without the warning.
+    let (stdout, stderr, saved) = login(&["--human-terminal", "on"]);
+    assert!(stdout.contains("browser terminals: on"), "{stdout}");
+    assert!(saved);
+    assert!(!stderr.contains("no terminal to ask"), "{stderr}");
+    // A re-login that changes it reminds a running relay to restart.
+    assert!(
+        stderr.contains("restart wsmp if it is already running"),
+        "{stderr}"
+    );
+    // A later login without the flag keeps the saved choice.
+    let (stdout, stderr, saved) = login(&["--json"]);
+    let value: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["allowHumanTerminal"], true);
+    assert!(saved);
+    assert!(stderr.contains("browser terminals stay on"), "{stderr}");
+    assert!(!stderr.contains("restart wsmp"), "{stderr}");
+    // `off` turns them off again; the config command still works after.
+    let (_, _, saved) = login(&["--human-terminal", "off"]);
+    assert!(!saved);
+    // Relay only: nothing to warn about, but an explicit flag is still saved
+    // and the output says terminals need full control.
+    let relay = tmp.path().join("relay");
+    let relay_config = relay.join("config.json");
+    let relay_state = relay.join("state");
+    let relay_login = |extra: &[&str]| {
+        let server = TestServer::start(vec![
+            (
+                "/.well-known/wsmp",
+                200,
+                well_known("https://wsmp.example.com"),
+            ),
+            ("/api/node/enroll", 200, enrolled("spark-2")),
+        ]);
+        let mut cmd = cli(&relay_config, &relay_state);
+        cmd.args([
+            "login",
+            &server.base_url,
+            "--code",
+            CODE,
+            "--slug",
+            "spark-2",
+            "--trust",
+            "relay",
+            "--no-service",
+        ]);
+        cmd.args(extra);
+        let output = cmd.assert().success().get_output().clone();
+        server.join();
+        (
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+    let (stdout, stderr) = relay_login(&[]);
+    assert!(stdout.contains("browser terminals: off"), "{stdout}");
+    assert!(
+        !stderr.contains("no terminal to ask, so browser"),
+        "{stderr}"
+    );
+    let (stdout, _) = relay_login(&["--human-terminal", "on"]);
+    assert!(
+        stdout.contains("browser terminals: on (they need full control)"),
+        "{stdout}"
+    );
+    let cfg: Value = serde_json::from_slice(&fs::read(&relay_config).unwrap()).unwrap();
+    assert_eq!(cfg["allowHumanTerminal"], true);
     cli(&config, &state)
-        .args(["endpoints", "remove", "missing"])
+        .args(["config", "set-human-terminal", "on"])
+        .assert()
+        .success();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["allowHumanTerminal"], true);
+    // Anything but on|off is refused before contacting a server.
+    cli(&config, &state)
+        .args([
+            "login",
+            "http://127.0.0.1:9",
+            "--code",
+            CODE,
+            "--human-terminal",
+            "yes",
+        ])
         .assert()
         .failure()
-        .code(3)
-        .stderr(predicate::str::contains("endpoint `missing` not found"));
+        .stderr(predicate::str::contains("--human-terminal"));
 }
 
 #[test]
-fn endpoints_probe_success_applies_model_suggestions_and_uses_secret_env_header() {
-    let server = TestServer::start(vec![(
-        "/v1/models",
-        200,
-        json!({
-            "data": [
-                { "id": "llama-3.2-vision" },
-                { "id": "text-embedding-3-small" }
-            ]
-        }),
-    )]);
+fn login_refuses_a_malformed_code_before_any_exchange() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({
-            "version": 1,
-            "endpoints": [{
-                "slug": "local",
-                "label": "Local",
-                "kind": "openai-compatible",
-                "baseUrl": server.base_url,
-                "enabled": true,
-                "defaultCapabilities": {
-                    "version": 1,
-                    "protocol": "openai-compatible",
-                    "models": { "list": true },
-                    "chatCompletions": { "supported": true, "streaming": true }
-                },
-                "headers": [],
-                "auth": { "mode": "bearer", "env": "LOCAL_LLM_AUTH" },
-                "models": []
-            }]
-        }),
-    );
-
-    let mut probe = cli(&config, &state);
-    probe
-        .args(["endpoints", "--json", "probe", "local", "--apply"])
-        .env("LOCAL_LLM_AUTH", "upstream-secret");
-    let value = json_stdout(probe);
-    assert_eq!(value["reports"][0]["status"], "online");
-    assert_eq!(
-        value["reports"][0]["discoveredModelIds"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-    let request = server.requests.recv().unwrap();
-    assert!(
-        request
-            .to_ascii_lowercase()
-            .contains("authorization: bearer upstream-secret"),
-        "request did not contain typed auth header: {request:?}"
-    );
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["endpoints"][0]["models"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        cfg["endpoints"][0]["models"][1]["capabilityOverrideMode"],
-        "inherit"
-    );
-    assert!(
-        !fs::read_to_string(&config)
-            .unwrap()
-            .contains("upstream-secret")
-    );
-    server.join();
-}
-
-#[test]
-fn endpoints_probe_stores_reasoning_metadata_as_an_advisory_v4_suggestion() {
     let server = TestServer::start(vec![(
-        "/v1/models",
+        "/.well-known/wsmp",
         200,
-        json!({
-            "data": [{
-                "id": "provider/reasoner",
-                "supported_parameters": ["reasoning_effort"],
-                "reasoning": {
-                    "supported_efforts": ["high", "medium", "unknown"]
-                }
-            }]
-        }),
+        well_known("https://wsmp.example.com"),
     )]);
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({
-            "version": 1,
-            "endpoints": [{
-                "slug": "local",
-                "label": "Local",
-                "baseUrl": server.base_url,
-                "enabled": true,
-                "models": [{
-                    "upstreamModelId": "provider/reasoner",
-                    "capabilityOverrideMode": "override",
-                    "capabilities": {
-                        "version": 1,
-                        "protocol": "openai-compatible",
-                        "chatCompletions": { "supported": true, "streaming": true }
-                    }
-                }]
-            }]
-        }),
-    );
-
     cli(&config, &state)
-        .args(["endpoints", "probe", "local", "--apply"])
+        .args([
+            "login",
+            &server.base_url,
+            "--code",
+            "nope",
+            "--slug",
+            "node-a",
+            "--no-service",
+        ])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("not an enrollment code"));
+    server.join();
+    assert!(!state.join("node-credential.json").exists());
+}
 
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    let model = &cfg["endpoints"][0]["models"][0];
-    assert_eq!(model["capabilityOverrideMode"], "override");
-    assert_eq!(model["capabilities"]["version"], 1);
-    assert_eq!(model["probeSuggestions"]["version"], 4);
-    assert_eq!(
-        model["probeSuggestions"]["surfaces"]["openaiChatCompletions"]["reasoning"],
-        true
-    );
-    assert_eq!(
-        model["probeSuggestions"]["surfaces"]["openaiChatCompletions"]["reasoningConfig"]["supportedLevels"],
-        json!(["medium", "high"])
-    );
+#[test]
+fn login_refuses_a_server_on_another_protocol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let mut old = well_known("https://wsmp.example.com");
+    old["protocolVersion"] = json!("2.4");
+    let server = TestServer::start(vec![("/.well-known/wsmp", 200, old)]);
+    cli(&config, &state)
+        .args([
+            "login",
+            &server.base_url,
+            "--code",
+            CODE,
+            "--slug",
+            "node-a",
+            "--no-service",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("upgrade the server"));
     server.join();
 }
 
 #[test]
-fn endpoints_probe_failure_reports_without_panic() {
+fn login_needs_replace_confirmation_without_a_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let server = TestServer::start(vec![
+        (
+            "/.well-known/wsmp",
+            200,
+            well_known("https://wsmp.example.com"),
+        ),
+        (
+            "/api/node/enroll",
+            409,
+            json!({ "ok": false, "error": "replace_confirmation_required", "replaces": { "slug": "old-1" } }),
+        ),
+    ]);
+    cli(&config, &state)
+        .args([
+            "login",
+            &server.base_url,
+            "--code",
+            CODE,
+            "--slug",
+            "node-a",
+            "--no-service",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("This replaces node old-1"))
+        .stderr(predicate::str::contains("--replace"));
+    server.join();
+    assert!(!state.join("node-credential.json").exists());
+}
+
+#[test]
+fn login_reports_a_taken_slug() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let server = TestServer::start(vec![
+        (
+            "/.well-known/wsmp",
+            200,
+            well_known("https://wsmp.example.com"),
+        ),
+        (
+            "/api/node/enroll",
+            409,
+            json!({ "ok": false, "error": "slug_taken" }),
+        ),
+    ]);
+    cli(&config, &state)
+        .args([
+            "login",
+            &server.base_url,
+            "--code",
+            CODE,
+            "--slug",
+            "node-a",
+            "--no-service",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--slug"));
+    server.join();
+}
+
+#[test]
+fn trust_lowers_without_a_relay_and_refuses_to_raise_without_a_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(&config, json!({ "version": 3, "trust": "full" }));
+    cli(&config, &state)
+        .args(["trust", "relay"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("now relay only"));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["trust"], "relay");
+    assert!(state.join("frozen-definitions.json").exists());
+    // No terminal: refused, and the file still says relay.
+    cli(&config, &state)
+        .args(["trust", "full"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("terminal"));
+    // From a process wsmp started: refused before anything else.
+    cli(&config, &state)
+        .args(["trust", "full"])
+        .env("WSMP_JOB", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot run from a command"));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["trust"], "relay");
+}
+
+/// A command, job or terminal wsmp started cannot change wsmp's own
+/// settings, credential, service or terminal approvals; reads still work.
+#[test]
+fn commands_wsmp_started_cannot_change_wsmp_itself() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
@@ -1390,27 +928,115 @@ fn endpoints_probe_failure_reports_without_panic() {
         &config,
         json!({
             "version": 1,
-            "endpoints": [{
-                "slug": "local",
-                "label": "Local",
-                "baseUrl": "http://127.0.0.1:9",
-                "enabled": true
-            }]
+            "serverUrl": "https://wsmp.example.com",
+            "cliSlug": "spark-1",
+            "trust": "full",
+            "endpoints": []
         }),
     );
-    let mut probe = cli(&config, &state);
-    probe.args(["endpoints", "--json", "probe", "local"]);
-    let value = json_stdout(probe);
-    assert_eq!(value["reports"][0]["status"], "offline");
-    assert!(value["reports"][0]["error"].as_str().is_some());
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        state.join("node-credential.json"),
+        json!({ "nodeId": "node-1", "slug": "spark-1", "server": "https://wsmp.example.com", "credential": "c".repeat(48) })
+            .to_string(),
+    )
+    .unwrap();
+    let before = fs::read(&config).unwrap();
+    let home = tmp.path().display().to_string();
+    let refused: &[&[&str]] = &[
+        &["config", "init"],
+        &["config", "set-server", "https://evil.example.com"],
+        &["config", "set-slug", "other"],
+        &["config", "set-human-terminal", "on"],
+        &["config", "set-runtime-hosts", "10.0.0.5"],
+        &["config", "set-file-roots", "/"],
+        &["config", "clear-file-roots"],
+        &["config", "set-file-tools", "on"],
+        &["config", "set-terminal-approval", "off"],
+        &["config", "set-max-terminals", "32"],
+        &["config", "set-file-tools-as-root", "on"],
+        &["service", "install"],
+        &["service", "uninstall"],
+        &["service", "restart"],
+        &["logout"],
+        &["terminal", "approve", "ABCD-EFGH"],
+        &["run"],
+        // File recovery exists on Unix only (elsewhere it is refused as unsupported first).
+        #[cfg(unix)]
+        &["recover", "--apply"],
+    ];
+    for args in refused {
+        cli(&config, &state)
+            .args(*args)
+            .env("WSMP_JOB", "1")
+            .env("HOME", &home)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "cannot run from a command, job or terminal wsmp started",
+            ));
+    }
+    assert_eq!(fs::read(&config).unwrap(), before, "the config changed");
+    assert!(state.join("node-credential.json").exists());
+    // Reads stay allowed.
+    let allowed: &[&[&str]] = &[
+        &["config", "show"],
+        &["config", "path"],
+        &["terminal", "approvals", "list"],
+        &["runtime", "list"],
+        // File recovery exists on Unix only (elsewhere `wsmp recover` refuses as unsupported).
+        #[cfg(unix)]
+        &["recover"],
+        &["trust"],
+        // Lowering works from anywhere.
+        &["trust", "relay"],
+    ];
+    for args in allowed {
+        cli(&config, &state)
+            .args(*args)
+            .env("WSMP_JOB", "1")
+            .env("HOME", &home)
+            .assert()
+            .success();
+    }
+    // Revoking narrows access too: not refused (the code is just unknown).
+    cli(&config, &state)
+        .args(["terminal", "approvals", "revoke", "ABCD-EFGH"])
+        .env("WSMP_JOB", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot run from").not());
+}
+
+#[test]
+fn secrets_need_a_terminal_and_list_names_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args(["secret", "set", "WSMP_SECRET_HF"])
+        .write_stdin("hf_value\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("terminal"));
+    cli(&config, &state)
+        .args(["secret", "set", "HF_TOKEN"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("WSMP_SECRET_"));
+    cli(&config, &state)
+        .args(["secret", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no secrets"));
 }
 
 #[test]
 fn protocol_helpers_reject_oversized_binary_chunk() {
-    let metadata = wsmp::protocol::RelayBinaryFrameMetadata::ResponseBody {
+    let metadata = wsmp::protocol::NodeBinaryMetadata::RelayResponseBody {
         request_id: "request-1".to_string(),
         chunk_id: "0".to_string(),
-        final_chunk: Some(true),
+        is_final: Some(true),
     };
     let body = vec![0_u8; wsmp::protocol::RELAY_BINARY_CHUNK_MAX_BYTES + 1];
     assert!(wsmp::protocol::encode_binary_frame(&metadata, &body).is_err());
@@ -1426,44 +1052,50 @@ fn config_terminal_flags_persist_and_ask_for_a_restart() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Restart wsmp to apply."));
-    cli(&config, &state)
-        .args(["config", "--json", "set-mcp-commands", "supervised"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(r#""key":"mcpCommandMode""#))
-        .stdout(predicate::str::contains(r#""value":"supervised""#));
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(cfg["allowHumanTerminal"], true);
-    assert_eq!(cfg["mcpCommandMode"], "supervised");
-    assert!(cfg.get("allowMcpCommands").is_none());
     assert!(cfg.get("requireTerminalApproval").is_none());
+    // The 0.3 command switches are gone: trust is the one switch.
     cli(&config, &state)
-        .args(["config", "set-mcp-commands", "off"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Restart wsmp to apply."));
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert!(cfg.get("mcpCommandMode").is_none());
-    cli(&config, &state)
-        .args(["config", "set-mcp-commands", "on"])
+        .args(["config", "set-mcp-commands", "unsupervised"])
         .assert()
         .failure();
-
-    // A config from an older wsmp keeps its MCP commands switch, as a mode.
-    fs::write(&config, r#"{"version":1,"allowMcpCommands":true}"#).unwrap();
+    // A config from an older wsmp loses its old switches on the next write.
+    fs::write(
+        &config,
+        r#"{"version":1,"allowMcpCommands":true,"mcpCommandMode":"unsupervised"}"#,
+    )
+    .unwrap();
     cli(&config, &state)
         .args(["config", "set-terminal-approval", "on"])
         .assert()
         .success();
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["mcpCommandMode"], "unsupervised");
+    assert!(cfg.get("mcpCommandMode").is_none());
     assert!(cfg.get("allowMcpCommands").is_none());
-
+    assert!(cfg.get("trust").is_none());
     cli(&config, &state)
         .args(["config", "set-terminal-approval", "off"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Restart wsmp to apply."));
+}
+
+#[test]
+fn config_runtime_hosts_take_ip_literals_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args(["config", "set-runtime-hosts", "10.0.0.5:8000", "[fd00::1]"])
+        .assert()
+        .success();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["runtimeHosts"], json!(["10.0.0.5:8000", "[fd00::1]"]));
+    cli(&config, &state)
+        .args(["config", "set-runtime-hosts", "gpu.lan"])
+        .assert()
+        .failure();
 }
 
 #[test]
@@ -1543,7 +1175,7 @@ fn config_max_terminals_defaults_to_four_and_accepts_one_to_thirty_two() {
     cfg["maxTerminals"] = json!(0);
     fs::write(&config, serde_json::to_vec(&cfg).unwrap()).unwrap();
     cli(&config, &state)
-        .args(["connect"])
+        .args(["run"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -1558,46 +1190,8 @@ fn config_max_terminals_defaults_to_four_and_accepts_one_to_thirty_two() {
         .stderr(predicate::str::contains("the relay will not start"));
 }
 
-#[cfg(unix)]
 #[test]
-fn supervised_run_without_the_daemon_env_fails_and_runs_nothing() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    let witness = tmp.path().join("ran");
-    // Only a command: the rest of the daemon-provided env is missing.
-    cli(&config, &state)
-        .args(["terminal", "supervised-run"])
-        .env(
-            "WSMP_SUPERVISED_COMMAND",
-            format!("touch {}", witness.display()),
-        )
-        .env_remove("WSMP_SUPERVISED_REASON")
-        .env_remove("WSMP_SUPERVISED_REQUESTER")
-        .env_remove("WSMP_SUPERVISED_SHARE")
-        .env_remove("WSMP_SUPERVISED_MARKER")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("started by the relay daemon"));
-    // Every variable set, but stdin is not a terminal: still nothing runs.
-    cli(&config, &state)
-        .args(["terminal", "supervised-run"])
-        .env(
-            "WSMP_SUPERVISED_COMMAND",
-            format!("touch {}", witness.display()),
-        )
-        .env("WSMP_SUPERVISED_REASON", "")
-        .env("WSMP_SUPERVISED_REQUESTER", "agent")
-        .env("WSMP_SUPERVISED_SHARE", "0")
-        .env("WSMP_SUPERVISED_MARKER", "0123456789abcdef0123456789abcdef")
-        .write_stdin("\n")
-        .assert()
-        .failure();
-    assert!(!witness.exists());
-}
-
-#[test]
-fn approve_and_daemon_status_use_the_state_dir() {
+fn approve_uses_the_state_dir() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
@@ -1614,29 +1208,12 @@ fn approve_and_daemon_status_use_the_state_dir() {
         "{\n  \"entries\": {\n    \"QSOWJSS6\": \"AQ\"\n  }\n}\n",
     )
     .unwrap();
-    let pid = "version=1\npid=2147483646\ntoken=state-dir-token\n";
-    fs::write(state.join("relay.pid"), pid).unwrap();
-    fs::write(decoy.join("relay.pid"), pid).unwrap();
-
     cli(&config, &state)
         .args(["terminal", "--json", "approve", "QSOWJSS6"])
         .assert()
         .success();
     assert!(state.join("terminal-approvals.json").is_file());
     assert!(!decoy.join("terminal-approvals.json").exists());
-
-    cli(&config, &state)
-        .args(["daemon", "status"])
-        .assert()
-        .failure();
-    assert!(
-        !state.join("relay.pid").exists(),
-        "daemon status did not read the PID file in WSMP_STATE_DIR"
-    );
-    assert!(
-        decoy.join("relay.pid").is_file(),
-        "daemon status touched a state dir other than WSMP_STATE_DIR"
-    );
 }
 
 #[test]
@@ -1663,100 +1240,130 @@ fn help_lists_ready_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains("login"))
-        .stdout(predicate::str::contains("token"))
-        .stdout(predicate::str::contains("endpoints"))
-        .stdout(predicate::str::contains("connect"))
-        .stdout(predicate::str::contains("daemon"))
+        .stdout(predicate::str::contains("run"))
+        .stdout(predicate::str::contains("status"))
         .stdout(predicate::str::contains("service"))
-        .stdout(predicate::str::contains("reload"))
-        .stdout(predicate::str::contains("metrics"))
         .stdout(predicate::str::contains("recover"))
-        .stdout(predicate::str::contains("logout"));
+        .stdout(predicate::str::contains("logout"))
+        .stdout(predicate::str::contains("endpoints").not())
+        .stdout(predicate::str::contains("daemon").not());
 }
 
 #[test]
-fn daemon_status_requires_the_live_control_socket() {
+fn status_reports_a_relay_that_is_not_running() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
     cli(&config, &state)
-        .args(["daemon", "status"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "relay daemon is not running (control socket unavailable",
-        ))
-        .stderr(predicate::str::contains("wsmp daemon start"));
-}
-
-#[test]
-fn daemon_stop_explains_that_it_only_stops_detached_relays() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    cli(&config, &state)
-        .args(["daemon", "stop"])
+        .args(["status", "--json"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("no detached relay is running"))
-        .stdout(predicate::str::contains("wsmp service status"));
+        .stdout(predicate::str::contains(r#""state":"not_running""#));
 }
 
-#[test]
-fn service_env_path_points_under_config_dir() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config").join("config.json");
-    let state = tmp.path().join("state");
-    let stdout = cli(&config, &state)
-        .args(["service", "env-path"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let path = String::from_utf8_lossy(&stdout);
-    assert!(
-        path.contains("service.env"),
-        "expected service.env path, got {path}"
-    );
-}
-
-#[test]
-fn service_env_sync_writes_private_file_without_echoing_secret() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config").join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({
-            "version": 1,
-            "cliTokenEnv": "WSMP_SERVICE_SYNC_TOKEN",
-            "endpoints": []
-        }),
-    );
-    let secret = "super-secret-service-token-value";
-    let assert = cli(&config, &state)
-        .args(["service", "env-sync"])
-        .env("WSMP_SERVICE_SYNC_TOKEN", secret)
-        .assert()
-        .success();
-    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
-    assert!(stdout.contains("WSMP_SERVICE_SYNC_TOKEN"));
-    assert!(
-        !stdout.contains(secret),
-        "env-sync must not print secret values"
-    );
-
-    let env_path = tmp.path().join("config").join("service.env");
-    let body = fs::read_to_string(&env_path).expect("service.env written");
-    assert!(body.contains("WSMP_SERVICE_SYNC_TOKEN="));
-    assert!(body.contains(secret));
+fn write_held_always_on(state: &Path, base_url: &str) {
+    fs::create_dir_all(state).expect("state dir");
+    let store = json!({
+        "version": 1,
+        "held": [{
+            "runtimeId": "rt-1", "versionId": "ver-1", "launchHash": "h", "kind": "always_on",
+            "slug": "local-llm",
+            "spec": {
+                "api": "openai", "engine": "ollama", "modelType": "llm",
+                "models": [{ "id": "llama3" }],
+                "address": { "baseUrl": base_url }
+            }
+        }]
+    });
+    let path = state.join("runtime-store.json");
+    fs::write(&path, serde_json::to_vec(&store).expect("json")).expect("write store");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(&env_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "service.env must be mode 0600");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
     }
+}
+
+#[test]
+fn runtime_list_and_status_show_the_held_runtimes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(&config, json!({ "version": 1, "trust": "full" }));
+    write_held_always_on(&state, "http://127.0.0.1:9");
+    let mut list = cli(&config, &state);
+    list.args(["runtime", "list", "--json"]);
+    let view = json_stdout(list);
+    assert_eq!(view["trust"], "full");
+    assert_eq!(view["definitions"], "live");
+    assert_eq!(view["runtimes"][0]["slug"], "local-llm");
+    assert_eq!(view["runtimes"][0]["kind"], "always_on");
+    assert_eq!(view["runtimes"][0]["models"][0], "llama3");
+    assert_eq!(view["instances"], json!([]));
+    cli(&config, &state)
+        .args(["runtime", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("local-llm  always_on"));
+    let mut status = cli(&config, &state);
+    status.args(["status", "--json"]);
+    let status = json_stdout(status);
+    assert_eq!(status["state"], "not_running");
+    assert_eq!(status["runtimes"][0]["slug"], "local-llm");
+    cli(&config, &state)
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("relay: not running"))
+        .stdout(predicate::str::contains("local-llm  always_on"));
+}
+
+#[test]
+fn runtime_test_asks_the_model_list_and_reports_status_and_latency() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(&config, json!({ "version": 1, "trust": "relay" }));
+    let server = TestServer::start(vec![(
+        "/v1/models",
+        200,
+        json!({ "data": [{ "id": "llama3" }, { "id": "qwen" }] }),
+    )]);
+    write_held_always_on(&state, &server.base_url);
+    let mut test = cli(&config, &state);
+    test.args(["runtime", "test", "local-llm", "--json"]);
+    let results = json_stdout(test);
+    assert_eq!(results[0]["target"], "local-llm");
+    assert_eq!(results[0]["ok"], true);
+    assert_eq!(results[0]["status"], 200);
+    assert_eq!(results[0]["models"], 2);
+    assert!(results[0]["latencyMs"].is_u64());
+    let request = server.requests.recv().expect("one request");
+    assert!(request.starts_with("GET /v1/models "), "{request}");
+    server.join();
+    cli(&config, &state)
+        .args(["runtime", "test", "nope"])
+        .assert()
+        .code(3);
+}
+
+#[test]
+fn service_offers_restart_and_logs_and_no_env_file_commands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args(["service", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("restart"))
+        .stdout(predicate::str::contains("logs"))
+        .stdout(predicate::str::contains("env-sync").not())
+        .stdout(predicate::str::contains("env-path").not());
+    cli(&config, &state)
+        .args(["service", "env-sync"])
+        .assert()
+        .code(2);
 }
 
 #[test]
@@ -1824,8 +1431,6 @@ mod signal_shutdown {
     use std::path::PathBuf;
     use std::process::{Child, Stdio};
     use std::time::{Duration, Instant};
-
-    const TOKEN_ENV: &str = "WSMP_SIGNAL_TEST_TOKEN";
 
     /// SHA-1, only for the websocket handshake's `Sec-WebSocket-Accept`.
     fn sha1(data: &[u8]) -> [u8; 20] {
@@ -1984,7 +1589,7 @@ mod signal_shutdown {
                     format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes(),
                 ));
                 let response = format!(
-                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: ws-model-proxy.relay.v2\r\n\r\n"
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: ws-model-proxy.relay.v3\r\n\r\n"
                 );
                 stream
                     .write_all(response.as_bytes())
@@ -2111,20 +1716,6 @@ mod signal_shutdown {
         }
     }
 
-    /// Linux only: whether this test process inherited `signal` as ignored,
-    /// in which case the relay honours that and the test cannot run.
-    fn inherited_ignored(signal: u32) -> bool {
-        fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|status| {
-                let mask = status
-                    .lines()
-                    .find_map(|line| line.strip_prefix("SigIgn:"))?;
-                u64::from_str_radix(mask.trim(), 16).ok()
-            })
-            .is_some_and(|mask| mask & (1 << (signal - 1)) != 0)
-    }
-
     struct Setup {
         _tmp: tempfile::TempDir,
         dir: PathBuf,
@@ -2149,29 +1740,50 @@ mod signal_shutdown {
         env: &[(&str, &str)],
         stderr: Stdio,
     ) -> Setup {
+        start_relay_prepared(args, extra, env, stderr, &|_| {})
+    }
+
+    /// `start_relay_logged`, with `prepare` run on the state dir first.
+    fn start_relay_prepared(
+        args: &[&str],
+        extra: Value,
+        env: &[(&str, &str)],
+        stderr: Stdio,
+        prepare: &dyn Fn(&Path),
+    ) -> Setup {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().canonicalize().expect("canonical tempdir");
         let config = dir.join("config.json");
         let state = dir.join("state");
+        fs::create_dir_all(&state).expect("state dir");
+        prepare(&state);
         let relay = FakeRelay::start();
         let mut value = json!({
             "version": 1,
             "serverUrl": relay.server_url,
             "cliSlug": "cli-signal-test",
-            "cliTokenEnv": TOKEN_ENV,
-            "allowMcpCommands": true,
+            "trust": "full",
             "endpoints": []
         });
         if let (Some(base), Some(extra)) = (value.as_object_mut(), extra.as_object()) {
             base.extend(extra.clone());
         }
         write_config(&config, value);
+        fs::create_dir_all(&state).expect("state dir");
+        fs::write(
+            state.join("node-credential.json"),
+            json!({
+                "nodeId": "node-1", "slug": "cli-signal-test", "server": relay.server_url,
+                "credential": "signal-test-token"
+            })
+            .to_string(),
+        )
+        .expect("credential");
         let child = std::process::Command::new(env!("CARGO_BIN_EXE_wsmp"))
             .args(args)
             .env("WSMP_CONFIG", &config)
             .env("WSMP_STATE_DIR", &state)
             .env("HOME", &dir)
-            .env(TOKEN_ENV, "signal-test-token")
             .env_remove("WSMP_LOG")
             .env_remove("RUST_LOG")
             .envs(env.iter().copied())
@@ -2197,6 +1809,7 @@ mod signal_shutdown {
             .socket
             .recv_timeout(Duration::from_secs(5))
             .expect("relay socket");
+        hello_ok(&mut socket);
         let shell_pid = setup.dir.join("shell.pid");
         let grand_pid = setup.dir.join("grand.pid");
         let command = format!(
@@ -2206,7 +1819,7 @@ mod signal_shutdown {
         );
         write_text(
             &mut socket,
-            &json!({ "type": "exec.start", "commandId": "sig-1", "command": command }).to_string(),
+            &json!({ "type": "exec.start", "commandId": "sig-1", "command": command, "timeoutMs": 600_000 }).to_string(),
         );
         setup.relay.next_text("exec.started");
         (wait_for_file(&shell_pid), wait_for_file(&grand_pid))
@@ -2222,7 +1835,7 @@ mod signal_shutdown {
         wait_until_gone(grand);
         let rest = setup.relay.rest(Duration::from_secs(5));
         let done = rest.iter().find_map(|frame| match frame {
-            Seen::Text(value) if value["type"] == "exec.done" => Some(value),
+            Seen::Text(value) if value["type"] == "exec.status" => Some(value),
             _ => None,
         });
         assert_eq!(
@@ -2243,7 +1856,7 @@ mod signal_shutdown {
 
     #[test]
     fn sigterm_kills_running_exec_commands_and_cleans_up() {
-        let mut setup = start_relay(&["connect"]);
+        let mut setup = start_relay(&["run"]);
         let (shell, grand) = start_exec(&setup);
         assert!(process_alive(&shell) && process_alive(&grand));
         assert_takes_shutdown_signals(&shell);
@@ -2298,8 +1911,7 @@ mod signal_shutdown {
         ))
         .expect("join PATH");
         let path = path.to_str().expect("utf-8 PATH");
-        let mut setup =
-            start_relay_logged(&["connect"], json!({}), &[("PATH", path)], Stdio::null());
+        let mut setup = start_relay_logged(&["run"], json!({}), &[("PATH", path)], Stdio::null());
         let (shell, grand) = start_exec(&setup);
         assert!(process_alive(&shell) && process_alive(&grand));
         assert_takes_shutdown_signals(&shell);
@@ -2315,7 +1927,7 @@ mod signal_shutdown {
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(
-            setup.relay.next_text("exec.done")["commandId"],
+            setup.relay.next_text("exec.status")["commandId"],
             "sig-1",
             "the command ends once its program does"
         );
@@ -2328,182 +1940,12 @@ mod signal_shutdown {
         );
     }
 
-    /// A relay whose custom metric source is running: hello.ok has been sent
-    /// (which starts telemetry), and the command's shell and background child
-    /// pids are known.
-    struct SourceRun {
-        setup: Setup,
-        socket: TcpStream,
-        shell: String,
-        grand: String,
-        _pids: tempfile::TempDir,
-    }
-
-    fn start_relay_with_running_source() -> SourceRun {
-        // The source's environment is scrubbed, so the command names its files.
-        let pids = tempfile::tempdir().expect("tempdir");
-        let dir = pids.path().canonicalize().expect("canonical tempdir");
-        let setup = start_relay_with(
-            &["connect"],
-            json!({ "metrics": { "sources": { "slow": {
-                "command": format!(
-                    "echo $$ > '{}'; sleep 300 & echo $! > '{}'; wait",
-                    dir.join("shell.pid").display(),
-                    dir.join("grand.pid").display()
-                ),
-                "intervalSecs": 5,
-                "timeoutSecs": 300,
-                "format": "number"
-            } } } }),
-        );
-        let hello = setup.relay.next_text("hello");
-        let mut socket = setup
-            .relay
-            .socket
-            .recv_timeout(Duration::from_secs(5))
-            .expect("relay socket");
-        // Registering starts the telemetry thread, which starts the source.
-        write_text(
-            &mut socket,
-            &json!({
-                "type": "hello.ok",
-                "id": hello["id"],
-                "protocolVersion": "2.4",
-                "revision": {
-                    "inventorySeq": 1,
-                    "inventoryDigest": "d",
-                    "inventoryAcknowledgedAt": "2026-09-28T12:00:00.000Z"
-                }
-            })
-            .to_string(),
-        );
-        let shell = wait_for_file(&dir.join("shell.pid"));
-        let grand = wait_for_file(&dir.join("grand.pid"));
-        assert!(process_alive(&shell) && process_alive(&grand));
-        SourceRun {
-            setup,
-            socket,
-            shell,
-            grand,
-            _pids: pids,
-        }
-    }
-
-    /// Daemon exit by a signal during a custom metric source run must not
-    /// orphan the command's process group (it runs arbitrary commands, in its
-    /// own group).
-    #[test]
-    fn sigterm_kills_a_running_metric_source_group() {
-        let mut run = start_relay_with_running_source();
-        signal(run.setup.child.id(), "TERM");
-        let status = wait_for_exit(&mut run.setup.child);
-        assert!(
-            status.signal() == Some(15) || status.code() == Some(143),
-            "unexpected relay status {status:?}"
-        );
-        wait_until_gone(&run.shell);
-        wait_until_gone(&run.grand);
-    }
-
-    /// The same for an exit that is not a signal: a fatal relay error ends the
-    /// daemon at once, before the sampler thread notices its session is gone.
-    #[test]
-    fn a_fatal_relay_error_kills_a_running_metric_source_group() {
-        let mut run = start_relay_with_running_source();
-        write_text(
-            &mut run.socket,
-            &json!({ "type": "protocol.error", "failure": "protocol_error", "message": "boom" })
-                .to_string(),
-        );
-        let status = wait_for_exit(&mut run.setup.child);
-        assert!(
-            status.code().is_some_and(|code| code != 0),
-            "the daemon exits with an error: {status:?}"
-        );
-        wait_until_gone(&run.shell);
-        wait_until_gone(&run.grand);
-    }
-
-    /// `wsmp metrics test` runs the command in its own process group, which a
-    /// terminal's Ctrl-C does not reach: a signal must still end it.
-    #[test]
-    fn a_signal_during_metrics_test_kills_the_command_group() {
-        if inherited_ignored(15) {
-            return;
-        }
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path().canonicalize().expect("canonical tempdir");
-        let config = dir.join("config.json");
-        write_config(
-            &config,
-            json!({
-                "version": 1,
-                "metrics": { "sources": { "slow": {
-                    "command": format!(
-                        "echo $$ > '{}'; sleep 300 & echo $! > '{}'; wait",
-                        dir.join("shell.pid").display(),
-                        dir.join("grand.pid").display()
-                    ),
-                    "timeoutSecs": 300
-                } } }
-            }),
-        );
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_wsmp"))
-            .args(["metrics", "test", "slow"])
-            .env("WSMP_CONFIG", &config)
-            .env("WSMP_STATE_DIR", dir.join("state"))
-            .env("HOME", &dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start metrics test");
-        let shell = wait_for_file(&dir.join("shell.pid"));
-        let grand = wait_for_file(&dir.join("grand.pid"));
-        signal(child.id(), "TERM");
-        let status = wait_for_exit(&mut child);
-        assert!(
-            status.signal() == Some(15) || status.code() == Some(143),
-            "unexpected status {status:?}"
-        );
-        wait_until_gone(&shell);
-        wait_until_gone(&grand);
-    }
-
-    #[test]
-    fn sigint_stops_a_detached_style_relay_and_removes_its_pid_file() {
-        if inherited_ignored(2) {
-            return;
-        }
-        let mut setup = start_relay(&[
-            "daemon",
-            "start",
-            "--foreground",
-            "--detach-token",
-            "signal-test-token",
-        ]);
-        let (shell, grand) = start_exec(&setup);
-        let pid_file = setup.state.join("relay.pid");
-        assert!(pid_file.is_file(), "detached relay claims the PID file");
-        signal(setup.child.id(), "INT");
-        assert_clean_shutdown(&mut setup, &shell, &grand, 2);
-        assert!(!pid_file.exists(), "PID file removed");
-    }
-
     /// Two signals back to back may take the immediate-exit path instead of
     /// the normal unwind. Either way the children and runtime files are gone.
     #[test]
     fn a_second_signal_still_kills_children_and_removes_runtime_files() {
-        let mut setup = start_relay(&[
-            "daemon",
-            "start",
-            "--foreground",
-            "--detach-token",
-            "signal-test-token-2",
-        ]);
+        let mut setup = start_relay(&["run"]);
         let (shell, grand) = start_exec(&setup);
-        let pid_file = setup.state.join("relay.pid");
-        assert!(pid_file.is_file(), "detached relay claims the PID file");
         signal(setup.child.id(), "TERM");
         signal(setup.child.id(), "TERM");
         let status = wait_for_exit(&mut setup.child);
@@ -2513,7 +1955,6 @@ mod signal_shutdown {
         );
         wait_until_gone(&shell);
         wait_until_gone(&grand);
-        assert!(!pid_file.exists(), "PID file removed");
         assert!(
             !setup.state.join("relay-control.sock").exists(),
             "control socket removed"
@@ -2530,9 +1971,9 @@ mod signal_shutdown {
         /// Arguments, then extra environment.
         type Case<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)]);
         let cases: [Case; 3] = [
-            (&["-vv", "connect"], &[]),
-            (&["connect"], &[("RUST_LOG", "trace")]),
-            (&["connect"], &[("WSMP_LOG", "trace")]),
+            (&["-vv", "run"], &[]),
+            (&["run"], &[("RUST_LOG", "trace")]),
+            (&["run"], &[("WSMP_LOG", "trace")]),
         ];
         for (args, env) in cases {
             let log = tempfile::NamedTempFile::new().expect("log file");
@@ -2585,39 +2026,34 @@ mod signal_shutdown {
     /// serving, every other terminal and command) keeps running.
     #[test]
     fn a_frame_with_a_lone_surrogate_fails_only_its_own_request() {
-        let mut setup = start_relay(&["connect"]);
+        let mut setup = start_relay(&["run"]);
         setup.relay.next_text("hello");
         let mut socket = setup
             .relay
             .socket
             .recv_timeout(Duration::from_secs(5))
             .expect("relay socket");
+        hello_ok(&mut socket);
         write_text(
             &mut socket,
-            r#"{"type":"exec.start","commandId":"bad-1","command":"echo \ud800"}"#,
+            r#"{"type":"exec.start","commandId":"bad-1","command":"echo \ud800","timeoutMs":60000}"#,
         );
         let rejected = setup.relay.next_text("exec.rejected");
         assert_eq!(rejected["commandId"], "bad-1");
         assert_eq!(rejected["reason"], "bad_command");
-        write_text(
-            &mut socket,
-            r#"{"type":"term.spawn","terminalId":"AAAAAAAAAAAAAAAAAAAAAA","commandId":"bad-2","command":"true","reason":"x\udc00","requester":"agent","shareOutput":false}"#,
-        );
-        let rejected = setup.relay.next_text("supervised.rejected");
-        assert_eq!(rejected["commandId"], "bad-2");
         // A cancel for an unknown command names nothing live: nothing happens.
         write_text(
             &mut socket,
-            r#"{"type":"supervised.cancel","commandId":"\udbff"}"#,
+            r#"{"type":"exec.cancel","commandId":"\udbff"}"#,
         );
         // Still serving: a well-formed command runs.
         write_text(
             &mut socket,
-            &json!({ "type": "exec.start", "commandId": "good-1", "command": "echo ok" })
+            &json!({ "type": "exec.start", "commandId": "good-1", "command": "echo ok", "timeoutMs": 60_000 })
                 .to_string(),
         );
         assert_eq!(setup.relay.next_text("exec.started")["commandId"], "good-1");
-        assert_eq!(setup.relay.next_text("exec.done")["commandId"], "good-1");
+        assert_eq!(setup.relay.next_text("exec.status")["commandId"], "good-1");
         assert!(
             setup.child.try_wait().expect("poll relay").is_none(),
             "the daemon exited on a malformed frame"
@@ -2625,567 +2061,323 @@ mod signal_shutdown {
         signal(setup.child.id(), "TERM");
         let _ = wait_for_exit(&mut setup.child);
     }
-}
 
-/// Runs the real confirm child in a PTY, as the relay daemon does.
-#[cfg(unix)]
-struct ConfirmChild {
-    child: Box<dyn portable_pty::Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
-    output: mpsc::Receiver<Vec<u8>>,
-    seen: Vec<u8>,
-    master: Box<dyn portable_pty::MasterPty + Send>,
-}
-
-#[cfg(unix)]
-impl ConfirmChild {
-    const MARKER: &'static str = "00112233445566778899aabbccddeeff";
-
-    fn spawn(command: &str, share: bool, cwd: &Path) -> Self {
-        let system = portable_pty::native_pty_system();
-        let pair = system
-            .openpty(portable_pty::PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("open a pty");
-        let mut builder = portable_pty::CommandBuilder::new(assert_cmd::cargo::cargo_bin("wsmp"));
-        builder.args(["terminal", "supervised-run"]);
-        builder.cwd(cwd);
-        builder.env("WSMP_SUPERVISED_COMMAND", command);
-        builder.env("WSMP_SUPERVISED_REASON", "because\u{202e}txt.exe");
-        builder.env("WSMP_SUPERVISED_REQUESTER", "test agent");
-        builder.env("WSMP_SUPERVISED_SHARE", if share { "1" } else { "0" });
-        builder.env("WSMP_SUPERVISED_MARKER", Self::MARKER);
-        Self::start(pair, builder)
-    }
-
-    /// The deployment operator screen (`--deployment`) for `request` (the
-    /// JSON the daemon hands over).
-    fn spawn_operator(request: &serde_json::Value, cwd: &Path) -> Self {
-        let pair = portable_pty::native_pty_system()
-            .openpty(portable_pty::PtySize {
-                rows: 40,
-                cols: 100,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("open a pty");
-        let mut builder = portable_pty::CommandBuilder::new(assert_cmd::cargo::cargo_bin("wsmp"));
-        builder.args(["terminal", "supervised-run", "--deployment"]);
-        builder.cwd(cwd);
-        builder.env("WSMP_SUPERVISED_OPERATOR", request.to_string());
-        // The marker comes in a private file the child removes, never in env.
-        let marker_file = cwd.join("operator-marker");
-        fs::write(&marker_file, Self::MARKER).expect("marker file");
-        builder.env("WSMP_SUPERVISED_MARKER_FILE", marker_file.as_os_str());
-        Self::start(pair, builder)
-    }
-
-    fn start(pair: portable_pty::PtyPair, mut builder: portable_pty::CommandBuilder) -> Self {
-        builder.env_remove("WSMP_LOG");
-        builder.env_remove("RUST_LOG");
-        let child = pair.slave.spawn_command(builder).expect("spawn wsmp");
-        drop(pair.slave);
-        let mut reader = pair.master.try_clone_reader().expect("pty reader");
-        let writer = pair.master.take_writer().expect("pty writer");
-        let (tx, output) = mpsc::channel();
+    /// A one-request HTTP upstream; returns its base URL and the request it saw.
+    fn upstream(body: &'static str) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let mut buf = [0_u8; 4096];
-            while let Ok(count) = reader.read(&mut buf) {
-                if count == 0 || tx.send(buf[..count].to_vec()).is_err() {
-                    return;
-                }
+            while let Ok((mut stream, _)) = listener.accept() {
+                let request = read_request(&mut stream);
+                let _ = tx.send(request);
+                write_response(&mut stream, 200, body.as_bytes());
             }
         });
-        Self {
-            child,
-            writer,
-            output,
-            seen: Vec::new(),
-            master: pair.master,
+        (base, rx)
+    }
+
+    fn hello_ok(socket: &mut TcpStream) {
+        write_text(
+            socket,
+            r#"{"type":"hello.ok","id":"h-1","protocolVersion":"3.0","nodeId":"node-1","definitionSync":"expect"}"#,
+        );
+    }
+
+    fn define_always_on(socket: &mut TcpStream, op: &str, base_url: &str, auth: Option<&str>) {
+        let mut spec = json!({
+            "api": "openai", "engine": "vllm", "modelType": "llm",
+            "models": [{ "id": "tiny" }],
+            "address": { "baseUrl": base_url }
+        });
+        if let Some(env) = auth {
+            spec["address"]["auth"] = json!({ "mode": "bearer", "env": env });
         }
-    }
-
-    fn marker(kind: &str) -> Vec<u8> {
-        format!("\x1b]7717;wsmp-supervised;{kind};{}\x07", Self::MARKER).into_bytes()
-    }
-
-    fn wait_for(&mut self, needle: &[u8]) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            if self
-                .seen
-                .windows(needle.len())
-                .any(|window| window == needle)
-            {
-                return true;
-            }
-            if let Ok(bytes) = self
-                .output
-                .recv_timeout(std::time::Duration::from_millis(50))
-            {
-                self.seen.extend(bytes);
-            }
-        }
-        false
-    }
-
-    /// Waits until `needle` was seen at least `count` times.
-    fn wait_for_count(&mut self, needle: &[u8], count: usize) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            if self
-                .seen
-                .windows(needle.len())
-                .filter(|window| *window == needle)
-                .count()
-                >= count
-            {
-                return true;
-            }
-            self.pump(std::time::Duration::from_millis(50));
-        }
-        false
-    }
-
-    fn pump(&mut self, wait: std::time::Duration) {
-        if let Ok(bytes) = self.output.recv_timeout(wait) {
-            self.seen.extend(bytes);
-        }
-    }
-
-    fn type_keys(&mut self, bytes: &[u8]) {
-        self.writer.write_all(bytes).expect("type keys");
-        self.writer.flush().expect("flush keys");
-    }
-
-    /// The relay daemon's go-ahead after it took `accepted`.
-    fn release(&mut self) {
-        let go = Self::marker("go");
-        self.type_keys(&go);
-    }
-
-    fn resize(&self, cols: u16, rows: u16) {
-        self.master
-            .resize(portable_pty::PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
+        let hash = wsmp::protocol::canonical::launch_hash(&spec).expect("hash");
+        write_text(
+            socket,
+            &json!({
+                "type": "runtime.define", "opId": op, "chunkIndex": 0, "final": true,
+                "put": [{
+                    "runtimeId": "rt1", "versionId": "vr1", "launchHash": hash,
+                    "kind": "always_on", "slug": "tiny", "spec": spec
+                }]
             })
-            .expect("resize the pty");
+            .to_string(),
+        );
     }
 
-    /// How many paints (each starts with home + clear) were seen so far.
-    fn paints(&self) -> usize {
-        self.seen
-            .windows(Self::CLEAR.len())
-            .filter(|window| *window == Self::CLEAR)
-            .count()
-    }
-
-    /// Waits for a paint that started after the first `after` paints and was
-    /// written in full (its last row ends the prompt, which is always drawn
-    /// last), and returns its rows. A paint still arriving in pieces never
-    /// qualifies, whatever its length so far.
-    fn wait_for_paint(&mut self, after: usize) -> Vec<String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if self.paints() > after {
-                let paint = self.last_paint();
-                if paint.last().is_some_and(|row| row.ends_with("decline")) {
-                    return paint;
-                }
+    /// Enrolled node, Full control: the server defines an always-on runtime,
+    /// the node holds it, reports it, and relays a request to it, with the
+    /// node secret as the bearer credential and never in the log.
+    #[test]
+    fn end_to_end_define_hold_and_relay_to_an_always_on_runtime() {
+        let log = tempfile::NamedTempFile::new().expect("log file");
+        let stderr = Stdio::from(log.reopen().expect("reopen log"));
+        let mut setup = start_relay_logged(&["-vv", "run"], json!({}), &[], stderr);
+        let hello = setup.relay.next_text("hello");
+        assert_eq!(hello["trust"]["value"], "full");
+        assert_eq!(hello["definitions"], json!([]));
+        let mut socket = setup
+            .relay
+            .socket
+            .recv_timeout(Duration::from_secs(5))
+            .expect("relay socket");
+        hello_ok(&mut socket);
+        setup.relay.next_text("runtime.inventory");
+        // The secret arrives over the relay; its value must never be logged.
+        const SECRET: &str = "secret-value-7f3a9c";
+        write_text(
+            &mut socket,
+            &json!({ "type": "secret.set", "id": "s1", "name": "WSMP_SECRET_TINY", "value": SECRET })
+                .to_string(),
+        );
+        let result = setup.relay.next_text("secret.result");
+        assert_eq!(result["status"], "set");
+        assert!(!result.to_string().contains(SECRET));
+        let (base, seen) = upstream(r#"{"id":"c1","choices":[]}"#);
+        define_always_on(
+            &mut socket,
+            "op1",
+            &format!("{base}/v1"),
+            Some("WSMP_SECRET_TINY"),
+        );
+        let defined = setup.relay.next_text("runtime.define.result");
+        assert_eq!(defined["results"][0]["status"], "applied", "{defined}");
+        assert_eq!(defined["held"][0]["versionId"], "vr1");
+        let inventory = setup.relay.next_text("runtime.inventory");
+        assert_eq!(inventory["alwaysOn"][0]["slug"], "tiny");
+        assert_eq!(inventory["alwaysOn"][0]["models"][0]["id"], "tiny");
+        write_text(
+            &mut socket,
+            &json!({
+                "type": "relay.request", "requestId": "r1", "family": "chat.completions",
+                "method": "POST", "path": "/v1/chat/completions", "headers": {}, "timeoutMs": 10_000,
+                "handle": "tiny", "expectBody": false
+            })
+            .to_string(),
+        );
+        let headers = setup.relay.next_text("relay.response.headers");
+        assert_eq!(headers["status"], 200);
+        let request = loop {
+            let request = seen
+                .recv_timeout(Duration::from_secs(10))
+                .expect("upstream saw it");
+            if request.starts_with("POST ") {
+                break request;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "no complete repaint after paint {after}: {:?}",
-                String::from_utf8_lossy(&self.seen)
-            );
-            self.pump(std::time::Duration::from_millis(50));
+        };
+        assert!(
+            request.starts_with("POST /v1/chat/completions "),
+            "{request}"
+        );
+        assert!(request.contains(&format!("Bearer {SECRET}")));
+        setup.relay.next_text("relay.complete");
+        // An engine admin route is refused before any connection.
+        write_text(
+            &mut socket,
+            &json!({
+                "type": "relay.request", "requestId": "r3", "family": "generic",
+                "method": "POST", "path": "/api/pull", "headers": {}, "timeoutMs": 10_000,
+                "handle": "tiny", "expectBody": false
+            })
+            .to_string(),
+        );
+        let refused = setup.relay.next_text("relay.error");
+        assert_eq!(refused["requestId"], "r3");
+        assert_eq!(refused["failure"], "access_denied");
+        assert_eq!(refused["message"], "path_not_allowed");
+        assert!(
+            seen.recv_timeout(Duration::from_millis(300))
+                .map_or(true, |request| !request.contains("/api/pull")),
+            "the refused path reached the upstream"
+        );
+        // An unknown handle is refused without reaching anything.
+        write_text(
+            &mut socket,
+            &json!({
+                "type": "relay.request", "requestId": "r2", "family": "chat.completions",
+                "method": "GET", "path": "/v1/models", "headers": {}, "timeoutMs": 10_000,
+                "handle": "nope", "expectBody": false
+            })
+            .to_string(),
+        );
+        assert_eq!(setup.relay.next_text("relay.error")["requestId"], "r2");
+        signal(setup.child.id(), "TERM");
+        let _ = wait_for_exit(&mut setup.child);
+        let output = fs::read_to_string(log.path()).expect("read log");
+        assert!(
+            !output.contains(SECRET),
+            "the secret reached the log:\n{output}"
+        );
+        // The definition survives a restart: a new relay reports it held.
+        let stored = fs::read_to_string(setup.state.join("runtime-store.json")).expect("store");
+        assert!(stored.contains("vr1"));
+        assert!(!stored.contains(SECRET));
+    }
+
+    /// A startable definition is held; a job naming it with a value outside
+    /// the node's rules is refused before admission, and a job naming a
+    /// version the node does not hold is `definition_missing`.
+    #[test]
+    fn runtime_jobs_render_only_from_held_definitions() {
+        let mut setup = start_relay(&["run"]);
+        setup.relay.next_text("hello");
+        let mut socket = setup
+            .relay
+            .socket
+            .recv_timeout(Duration::from_secs(5))
+            .expect("relay socket");
+        hello_ok(&mut socket);
+        setup.relay.next_text("runtime.inventory");
+        let spec = json!({
+            "api": "openai", "engine": "vllm", "modelType": "llm",
+            "models": [{ "id": "m" }],
+            "launch": {
+                "management": "process", "groupSize": 1,
+                "resources": [{ "kind": "none" }], "labels": [],
+                "commands": [{ "start": "vllm serve m --host 127.0.0.1 --port {{port}}", "stop": "true" }],
+                "readiness": { "path": "/health", "expectedStatus": 200, "timeoutMs": 60000 },
+                "health": { "intervalMs": 30000, "failureThreshold": 3, "successThreshold": 1 }
+            }
+        });
+        let hash = wsmp::protocol::canonical::launch_hash(&spec).expect("hash");
+        let commands = json!([]);
+        let fabrics = json!([]);
+        write_text(
+            &mut socket,
+            &json!({
+                "type": "runtime.define", "opId": "op1", "chunkIndex": 0, "final": true,
+                "put": [{
+                    "runtimeId": "rt1", "versionId": "vr1", "launchHash": hash,
+                    "kind": "startable", "slug": "qwen", "spec": spec
+                }],
+                "node": {
+                    "portRange": [30000, 30999],
+                    "metricCommands": {
+                        "hash": wsmp::protocol::canonical::canonical_sha256(&commands).expect("hash"),
+                        "commands": commands
+                    },
+                    "fabrics": {
+                        "hash": wsmp::protocol::canonical::canonical_sha256(&fabrics).expect("hash"),
+                        "sets": fabrics
+                    },
+                    "commandMaxMs": 86_400_000
+                }
+            })
+            .to_string(),
+        );
+        let defined = setup.relay.next_text("runtime.define.result");
+        assert_eq!(defined["results"][0]["status"], "applied", "{defined}");
+        assert_eq!(defined["heldPortRange"], json!([30000, 30999]));
+        let job = |step: &str, version: &str, port: u16| {
+            json!({
+                "type": "runtime.job", "stepId": step, "instanceId": "in1",
+                "runtimeId": "rt1", "launchVersionId": version, "launchHash": hash,
+                "generation": 1, "rank": 0, "nnodes": 1, "phase": "start",
+                "handle": "i-abcdefabcdef", "unitName": "wsmp-i-abcdefabcdef-r0",
+                "placeholders": { "port": port }, "timeoutMs": 60_000,
+                "ownerEpoch": "epoch:1", "intentHash": "a".repeat(64)
+            })
+            .to_string()
+        };
+        write_text(&mut socket, &job("st1", "vr1", 22_000));
+        let refused = setup.relay.next_text("runtime.job.result");
+        assert_eq!(refused["error"], "bad_job", "{refused}");
+        assert_eq!(refused["detail"], "placeholders.port");
+        write_text(&mut socket, &job("st2", "vr-not-held", 30_001));
+        let missing = setup.relay.next_text("runtime.job.result");
+        assert_eq!(missing["error"], "definition_missing", "{missing}");
+        signal(setup.child.id(), "TERM");
+        let _ = wait_for_exit(&mut setup.child);
+    }
+
+    /// A node that was lowered stays lowered across a restart even when
+    /// config.json was edited back to `full`: only `wsmp trust full` raises.
+    #[test]
+    fn a_frozen_copy_keeps_a_hand_raised_node_relay_only() {
+        let mut setup = start_relay_prepared(&["run"], json!({}), &[], Stdio::null(), &|state| {
+            fs::write(
+                state.join("frozen-definitions.json"),
+                r#"{"version":1,"held":[]}"#,
+            )
+            .expect("frozen");
+        });
+        let hello = setup.relay.next_text("hello");
+        assert_eq!(hello["trust"], json!({ "value": "relay", "frozen": true }));
+        let config: Value =
+            serde_json::from_slice(&fs::read(setup.dir.join("config.json")).expect("config"))
+                .expect("json");
+        assert_eq!(config["trust"], "relay");
+        signal(setup.child.id(), "TERM");
+        let _ = wait_for_exit(&mut setup.child);
+    }
+
+    /// `trust.lower` sticks: persisted, frozen, reported; defines are refused.
+    #[test]
+    fn trust_lower_persists_freezes_and_refuses_defines() {
+        let mut setup = start_relay(&["run"]);
+        setup.relay.next_text("hello");
+        let mut socket = setup
+            .relay
+            .socket
+            .recv_timeout(Duration::from_secs(5))
+            .expect("relay socket");
+        hello_ok(&mut socket);
+        setup.relay.next_text("runtime.inventory");
+        write_text(
+            &mut socket,
+            r#"{"type":"trust.lower","id":"t1","requestedAt":"2026-10-06T00:00:00Z"}"#,
+        );
+        let state = setup.relay.next_text("node.state");
+        assert_eq!(state["trust"], json!({ "value": "relay", "frozen": true }));
+        let config: Value =
+            serde_json::from_slice(&fs::read(setup.dir.join("config.json")).expect("config"))
+                .expect("json");
+        assert_eq!(config["trust"], "relay");
+        assert!(setup.state.join("frozen-definitions.json").exists());
+        define_always_on(&mut socket, "op1", "http://127.0.0.1:9/v1", None);
+        let refused = setup.relay.next_text("runtime.define.result");
+        assert_eq!(refused["results"][0]["reason"], "trust_relay");
+        assert_eq!(refused["frozen"], true);
+        // Commands are refused at Relay only.
+        write_text(
+            &mut socket,
+            &json!({ "type": "exec.start", "commandId": "c1", "command": "true", "timeoutMs": 60_000 })
+                .to_string(),
+        );
+        assert_eq!(
+            setup.relay.next_text("exec.rejected")["reason"],
+            "trust_relay"
+        );
+        // Remote secret writes are refused at Relay only (set them on the node).
+        write_text(
+            &mut socket,
+            &json!({ "type": "secret.set", "id": "s9", "name": "WSMP_SECRET_X", "value": "v-123" })
+                .to_string(),
+        );
+        let refused = setup.relay.next_text("secret.result");
+        assert_eq!(refused["status"], "refused");
+        assert_eq!(refused["reason"], "trust_relay");
+        assert!(!setup.state.join("node-secrets.json").exists());
+        // A hand edit back to `full` does not raise: the daemon writes relay back.
+        let mut edited = config.clone();
+        edited["trust"] = json!("full");
+        write_config(&setup.dir.join("config.json"), edited);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let now: Value =
+                serde_json::from_slice(&fs::read(setup.dir.join("config.json")).expect("config"))
+                    .expect("json");
+            if now["trust"] == "relay" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the hand-edited raise stuck");
+            thread::sleep(Duration::from_millis(100));
         }
+        signal(setup.child.id(), "TERM");
+        let _ = wait_for_exit(&mut setup.child);
     }
-
-    const CLEAR: &[u8] = b"\x1b[H\x1b[2J";
-
-    /// The rows of the most recent paint of the confirm screen, as far as it
-    /// arrived (use `wait_for_paint` to know it is complete).
-    fn last_paint(&self) -> Vec<String> {
-        let text = String::from_utf8_lossy(&self.seen).to_string();
-        let start = text.rfind("\x1b[H\x1b[2J").expect("a paint") + "\x1b[H\x1b[2J".len();
-        let paint = &text[start..];
-        let end = paint.find('\x1b').unwrap_or(paint.len());
-        paint[..end]
-            .split('\n')
-            .map(|row| row.trim_end_matches('\r').to_string())
-            .collect()
-    }
-
-    fn exit_code(&mut self) -> u32 {
-        self.child.wait().expect("wait for wsmp").exit_code()
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn confirm_screen_ignores_type_ahead_and_runs_only_after_enter() {
-    let tmp = tempfile::tempdir().unwrap();
-    let witness = tmp.path().join("ran");
-    let command = format!(
-        "touch {} && printf 'hello-%s\\n' supervised",
-        witness.display()
-    );
-    let mut child = ConfirmChild::spawn(&command, true, tmp.path());
-    // Enter typed before the screen is drawn must not run the command.
-    child.type_keys(b"\r\r\r");
-    assert!(child.wait_for(&ConfirmChild::marker("ready")));
-    assert!(!witness.exists());
-    let screen = String::from_utf8_lossy(&child.seen).to_string();
-    assert!(screen.contains("Requested by: test agent"), "{screen}");
-    assert!(screen.contains("because\\u{202e}txt.exe"), "{screen}");
-    assert!(screen.contains("Output will be shared with the requesting agent."));
-    assert!(screen.contains(&witness.display().to_string()));
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    assert!(!witness.exists(), "type-ahead ran the command");
-    child.type_keys(b"x \x1b[A\r");
-    assert!(child.wait_for(&ConfirmChild::marker("accepted")));
-    // Enter alone does not start it: the daemon's go does.
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    assert!(!witness.exists(), "the command ran before the go");
-    child.type_keys(b"\r\r");
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    assert!(
-        !witness.exists(),
-        "keys other than the go started the command"
-    );
-    child.release();
-    assert!(child.wait_for(b"hello-supervised"));
-    assert_eq!(child.exit_code(), 0);
-    assert!(witness.exists());
-}
-
-#[cfg(unix)]
-fn operator_request(command: &str) -> serde_json::Value {
-    json!({
-        "endpoint": "inst-abc123",
-        "models": ["org/model"],
-        "node": "test-node",
-        "rank": 1,
-        "action": "start",
-        "requestedBy": "AGENT",
-        "humanApproved": true,
-        "commandAuthor": "unknown",
-        "command": command,
-    })
-}
-
-#[cfg(unix)]
-#[test]
-fn operator_screen_runs_after_go_retries_a_failure_and_ends_on_success() {
-    let tmp = tempfile::tempdir().unwrap();
-    let count = tmp.path().join("runs");
-    // Fails on the first run, succeeds on the second.
-    let command = format!(
-        "# \u{202e}gpj\nn=$(cat {count} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {count}; echo run-$n; [ $n -ge 2 ]",
-        count = count.display()
-    );
-    let mut child = ConfirmChild::spawn_operator(&operator_request(&command), tmp.path());
-    // Type-ahead before the screen is drawn runs nothing.
-    child.type_keys(b"\r\r");
-    assert!(child.wait_for(&ConfirmChild::marker("ready")));
-    let screen = String::from_utf8_lossy(&child.seen).to_string();
-    for part in [
-        "a deployment step needs you to run a command",
-        "Endpoint: inst-abc123",
-        "Node: test-node (rank 1)",
-        "# \\u{202e}gpj",
-        "Step: start the service",
-        "Requested by: an agent; you confirmed the plan",
-        "Command written by: not known.",
-        "Enter to run · Ctrl-C, Ctrl-D or q to close",
-    ] {
-        assert!(screen.contains(part), "missing {part:?} in {screen}");
-    }
-    assert!(!screen.contains('\u{202e}'), "bidi override drawn raw");
-    assert!(
-        !tmp.path().join("operator-marker").exists(),
-        "the child removes the marker file before drawing"
-    );
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    assert!(!count.exists(), "type-ahead ran the command");
-    child.type_keys(b"\r");
-    assert!(child.wait_for(&ConfirmChild::marker("accepted")));
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    assert!(!count.exists(), "the command ran before the go");
-    child.release();
-    assert!(child.wait_for(b"run-1"));
-    assert!(child.wait_for(&ConfirmChild::marker("exited;1")));
-    assert!(child.wait_for(b"exited with code 1. Press any key to continue."));
-    // The terminal state the command left is reset before the child draws.
-    let mut reset = b"\x1b[!p\x1b[0m\x1b(B\x1b[r\x1b[?7h\x1b[?25h".to_vec();
-    reset.extend(ConfirmChild::marker("exited;1"));
-    assert!(child.wait_for(&reset));
-    // The output stays until a key; the retry screen is a new `ready`.
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    child.type_keys(b"x");
-    assert!(child.wait_for_count(&ConfirmChild::marker("ready"), 2));
-    let retry = child.last_paint().join("\n");
-    assert!(
-        retry.contains("the deployment command exited with code 1"),
-        "{retry}"
-    );
-    assert!(
-        retry.ends_with("Enter to run it again · Ctrl-C, Ctrl-D or q to close"),
-        "{retry}"
-    );
-    child.type_keys(b"\r");
-    assert!(child.wait_for_count(&ConfirmChild::marker("accepted"), 2));
-    // The retry needs its own go: the first one does not run it again.
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    assert_eq!(std::fs::read_to_string(&count).unwrap().trim(), "1");
-    child.release();
-    assert!(child.wait_for(b"run-2"));
-    assert!(child.wait_for(&ConfirmChild::marker("exited;0")));
-    assert_eq!(child.exit_code(), 0);
-    assert_eq!(std::fs::read_to_string(&count).unwrap().trim(), "2");
-}
-
-#[cfg(unix)]
-#[test]
-fn operator_ctrl_c_ends_only_the_command_and_q_closes() {
-    let tmp = tempfile::tempdir().unwrap();
-    let started = tmp.path().join("started");
-    let command = format!("touch {}; sleep 30", started.display());
-    let mut child = ConfirmChild::spawn_operator(&operator_request(&command), tmp.path());
-    assert!(child.wait_for(&ConfirmChild::marker("ready")));
-    child.type_keys(b"\r");
-    assert!(child.wait_for(&ConfirmChild::marker("accepted")));
-    child.release();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !started.exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the command never started"
-        );
-        child.pump(std::time::Duration::from_millis(50));
-    }
-    // Ctrl-C reaches the command (130 = 128 + SIGINT); the screen survives.
-    child.type_keys(b"\x03");
-    assert!(child.wait_for(&ConfirmChild::marker("exited;130")));
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    child.type_keys(b" ");
-    assert!(child.wait_for_count(&ConfirmChild::marker("ready"), 2));
-    child.type_keys(b"q");
-    assert!(child.wait_for(b"Declined."));
-    assert_eq!(child.exit_code(), 0);
-    // Only the first screen was accepted; the retry screen was closed.
-    let accepted = ConfirmChild::marker("accepted");
-    let accepts = child
-        .seen
-        .windows(accepted.len())
-        .filter(|window| *window == accepted)
-        .count();
-    assert_eq!(accepts, 1);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn operator_command_cannot_read_the_marker_or_the_daemon_env() {
-    let tmp = tempfile::tempdir().unwrap();
-    // $PPID is the confirm child, whose initial env holds the marker.
-    let command = "if cat /proc/$PPID/environ >/dev/null 2>&1; then echo ENV_READ\"ABLE\"; \
-                   else echo ENV_NOT_\"READABLE\"; fi; \
-                   env | grep -q WSMP_SUPERVISED || echo NO_DAEMON_\"ENV\"";
-    let mut child = ConfirmChild::spawn_operator(&operator_request(command), tmp.path());
-    assert!(child.wait_for(&ConfirmChild::marker("ready")));
-    child.type_keys(b"\r");
-    assert!(child.wait_for(&ConfirmChild::marker("accepted")));
-    child.release();
-    assert!(child.wait_for(&ConfirmChild::marker("exited;0")));
-    assert_eq!(child.exit_code(), 0);
-    let output = String::from_utf8_lossy(&child.seen).to_string();
-    assert!(output.contains("ENV_NOT_READABLE"), "{output}");
-    assert!(!output.contains("ENV_READABLE"), "{output}");
-    assert!(output.contains("NO_DAEMON_ENV"), "{output}");
-}
-
-#[cfg(unix)]
-#[test]
-fn operator_terminal_gone_during_a_run_leaves_no_command_behind() {
-    let tmp = tempfile::tempdir().unwrap();
-    let pid_file = tmp.path().join("pid");
-    let command = format!("echo $$ > {}; exec sleep 30", pid_file.display());
-    let mut child = ConfirmChild::spawn_operator(&operator_request(&command), tmp.path());
-    assert!(child.wait_for(&ConfirmChild::marker("ready")));
-    child.type_keys(b"\r");
-    assert!(child.wait_for(&ConfirmChild::marker("accepted")));
-    child.release();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let pid = loop {
-        if let Some(pid) = fs::read_to_string(&pid_file)
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok())
-        {
-            break pid;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the command never started"
-        );
-        child.pump(std::time::Duration::from_millis(50));
-    };
-    // The confirm child (the terminal's session leader) goes away, as when the
-    // terminal closes: the kernel hangs up its foreground group, the command.
-    child.child.kill().expect("end the confirm child");
-    let _ = child.child.wait();
-    let alive = || {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while alive() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the command outlived its terminal"
-        );
-        thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(!child.seen.windows(7).any(|window| window == b"exited;"));
-}
-
-#[cfg(unix)]
-#[test]
-fn operator_screen_refuses_a_bad_request_before_drawing() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    let witness = tmp.path().join("ran");
-    let mut request = operator_request(&format!("touch {}", witness.display()));
-    request["action"] = json!("status");
-    let marker_file = tmp.path().join("marker");
-    fs::write(&marker_file, "0123456789abcdef0123456789abcdef").unwrap();
-    cli(&config, &state)
-        .args(["terminal", "supervised-run", "--deployment"])
-        .env("WSMP_SUPERVISED_OPERATOR", request.to_string())
-        .env("WSMP_SUPERVISED_MARKER_FILE", marker_file.as_os_str())
-        .write_stdin("\n")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("cannot be interactive"));
-    assert!(!marker_file.exists(), "taken before the request is checked");
-    // A marker in env is not taken: only the private file counts.
-    cli(&config, &state)
-        .args(["terminal", "supervised-run", "--deployment"])
-        .env(
-            "WSMP_SUPERVISED_OPERATOR",
-            operator_request("true").to_string(),
-        )
-        .env("WSMP_SUPERVISED_MARKER", "0123456789abcdef0123456789abcdef")
-        .env_remove("WSMP_SUPERVISED_MARKER_FILE")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("started by the relay daemon"));
-    fs::write(&marker_file, "not-a-marker").unwrap();
-    cli(&config, &state)
-        .args(["terminal", "supervised-run", "--deployment"])
-        .env(
-            "WSMP_SUPERVISED_OPERATOR",
-            operator_request("true").to_string(),
-        )
-        .env("WSMP_SUPERVISED_MARKER_FILE", marker_file.as_os_str())
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("malformed"));
-    fs::write(&marker_file, "0123456789abcdef0123456789abcdef").unwrap();
-    cli(&config, &state)
-        .args(["terminal", "supervised-run", "--deployment"])
-        .env_remove("WSMP_SUPERVISED_OPERATOR")
-        .env("WSMP_SUPERVISED_MARKER_FILE", marker_file.as_os_str())
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("started by the relay daemon"));
-    assert!(!witness.exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn confirm_screen_declines_on_q_and_runs_nothing() {
-    let tmp = tempfile::tempdir().unwrap();
-    let witness = tmp.path().join("ran");
-    let mut child = ConfirmChild::spawn(&format!("touch {}", witness.display()), false, tmp.path());
-    assert!(child.wait_for(&ConfirmChild::marker("ready")));
-    assert!(String::from_utf8_lossy(&child.seen).contains("Output stays in this terminal."));
-    child.type_keys(b"q");
-    assert!(child.wait_for(b"Declined."));
-    assert_eq!(child.exit_code(), 0);
-    assert!(!child.seen.windows(8).any(|window| window == b"accepted"));
-    assert!(!witness.exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn a_confirmed_command_without_the_go_never_runs() {
-    let tmp = tempfile::tempdir().unwrap();
-    let witness = tmp.path().join("ran");
-    let mut child = ConfirmChild::spawn(&format!("touch {}", witness.display()), false, tmp.path());
-    assert!(child.wait_for(&ConfirmChild::marker("ready")));
-    child.type_keys(b"\r");
-    assert!(child.wait_for(&ConfirmChild::marker("accepted")));
-    // A wrong go (another request's marker) is not the go.
-    child.type_keys(b"\x1b]7717;wsmp-supervised;go;ffffffffffffffffffffffffffffffff\x07");
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    assert!(!witness.exists());
-    // The daemon ends it instead (a server expiry won the race).
-    child.child.kill().expect("kill the confirm child");
-    let _ = child.child.wait();
-    assert!(!witness.exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn a_tall_command_fits_the_screen_and_follows_a_resize() {
-    let tmp = tempfile::tempdir().unwrap();
-    let command = (0..300)
-        .map(|n| format!("echo line-{n}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut child = ConfirmChild::spawn(&command, false, tmp.path());
-    assert!(child.wait_for(&ConfirmChild::marker("ready")));
-    let first = child.last_paint();
-    assert!(first.len() <= 24, "{first:?}");
-    let joined = first.join("\n");
-    assert!(joined.contains("Requested by: test agent"), "{joined}");
-    assert!(joined.contains("echo line-0"), "{joined}");
-    assert!(joined.contains("the rest is not shown"), "{joined}");
-    assert!(joined.contains("300 lines"), "{joined}");
-    assert!(joined.ends_with("Enter to run · Ctrl-C, Ctrl-D or q to decline"));
-
-    // A narrower, shorter terminal gets a new layout that still fits.
-    let before = child.paints();
-    child.resize(40, 12);
-    let narrow = child.wait_for_paint(before);
-    assert!(narrow.len() <= 12, "{narrow:?}");
-    assert!(
-        narrow.iter().all(|row| row.chars().count() < 40),
-        "{narrow:?}"
-    );
-    assert!(narrow.join(" ").contains("not shown"), "{narrow:?}");
-
-    // Scrolling to the end shows the output notice; `q` still declines.
-    let before = child.paints();
-    child.type_keys(b"G");
-    let end = child.wait_for_paint(before).join(" ");
-    assert!(end.contains("Output stays in this terminal."), "{end}");
-    assert!(end.contains("echo line-299"), "{end}");
-    child.type_keys(b"q");
-    assert!(child.wait_for(b"Declined."));
-    assert_eq!(child.exit_code(), 0);
 }
 
 #[test]
@@ -3199,18 +2391,20 @@ fn config_read_grant_is_explicit_and_roots_are_validated() {
         .args(["config", "init"])
         .assert()
         .success();
-    let mut show = cli(&config, &state);
-    show.args(["config", "--json", "show"]);
-    let value = json_stdout(show);
-    assert_eq!(value["mcpFileRead"], false);
-    assert_eq!(value["fileRoots"], json!([]));
+    let home_root = fs::canonicalize(tmp.path()).expect("home root");
+    let show_roots = || {
+        let mut show = cli(&config, &state);
+        show.env("HOME", tmp.path())
+            .args(["config", "--json", "show"]);
+        let value = json_stdout(show);
+        (value["fileRoots"].clone(), value["fileRootsSource"].clone())
+    };
+    // Unset roots: the home directory, said to be the default.
+    if cfg!(unix) {
+        assert_eq!(show_roots(), (json!([home_root]), json!("default")));
+    }
     let disk: Value = serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
-    assert!(disk.get("mcpFileRead").is_none());
     assert!(disk.get("fileRoots").is_none());
-    cli(&config, &state)
-        .args(["config", "set-file-read", "on"])
-        .assert()
-        .success();
     // `~` expands through the platform home directory, which HOME redirects on Unix only.
     let root_arg = if cfg!(unix) {
         "~/models".to_string()
@@ -3223,7 +2417,6 @@ fn config_read_grant_is_explicit_and_roots_are_validated() {
         .assert()
         .success();
     let disk: Value = serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
-    assert_eq!(disk["mcpFileRead"], true);
     assert_eq!(
         disk["fileRoots"],
         json!([fs::canonicalize(&models).expect("root")])
@@ -3232,7 +2425,6 @@ fn config_read_grant_is_explicit_and_roots_are_validated() {
         vec!["config", "set-file-roots"],
         vec!["config", "set-file-roots", "/"],
         vec!["config", "set-file-roots", "relative"],
-        vec!["config", "set-file-read", "maybe"],
     ] {
         cli(&config, &state).args(args).assert().failure();
         let unchanged: Value =
@@ -3245,229 +2437,101 @@ fn config_read_grant_is_explicit_and_roots_are_validated() {
         .success()
         .stdout(predicate::str::contains("~/models"))
         .stdout(predicate::str::contains("~/deploy"))
-        .stdout(predicate::str::contains("~/.config/llama-swap"))
-        .stdout(predicate::str::contains("~/.local/state/wsmp/logs"));
+        .stdout(predicate::str::contains("~/.config/llama-swap"));
+    assert_eq!(show_roots().1, json!("configured"));
     cli(&config, &state)
         .args(["config", "clear-file-roots"])
         .assert()
         .success();
+    if cfg!(unix) {
+        assert_eq!(show_roots(), (json!([home_root]), json!("default")));
+    }
     cli(&config, &state)
-        .args(["config", "set-file-read", "off"])
+        .args(["config", "set-file-tools", "off"])
         .assert()
         .success();
-    let mut show = cli(&config, &state);
-    show.args(["config", "--json", "show"]);
-    let value = json_stdout(show);
-    assert_eq!(value["mcpFileRead"], false);
-    assert_eq!(value["fileRoots"], json!([]));
-}
-
-fn sha256_hex(text: &str) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(text.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn write_remote_sources(state: &Path, sources: Value) {
-    fs::create_dir_all(state).expect("state dir");
-    fs::write(
-        state.join("remote-metric-sources.json"),
-        serde_json::to_vec_pretty(&json!({ "sources": sources })).expect("json"),
-    )
-    .expect("write remote sources");
-}
-
-fn write_remote_adapters(state: &Path, adapters: Value) {
-    fs::create_dir_all(state).expect("state dir");
-    fs::write(
-        state.join("remote-engine-adapters.json"),
-        serde_json::to_vec_pretty(&json!({ "adapters": adapters })).expect("json"),
-    )
-    .expect("write remote adapters");
+    assert_eq!(show_roots(), (json!([]), json!("disabled")));
+    let disk: Value = serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
+    assert_eq!(disk["disableFileTools"], json!(true));
 }
 
 #[test]
-fn config_metric_sources_round_trip_and_opt_in_flag() {
+fn hardware_reports_this_machine_as_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let mut cmd = cli(&config, &state);
+    cmd.args(["hardware", "--json"]);
+    let report = json_stdout(cmd);
+    let detected = &report["detected"];
+    assert!(
+        ["cpu", "discrete", "unified"].contains(&detected["nodeKind"].as_str().unwrap_or("")),
+        "{report}"
+    );
+    assert!(detected["gpus"].is_array(), "{report}");
+    assert!(detected["notes"].is_array(), "{report}");
+}
+
+/// Real system (Linux with a systemd user manager; run with `--ignored`):
+/// `wsmp trust full` works from a person's ordinary terminal, whose
+/// ancestors include the unreadable user manager or sshd, and is refused
+/// from a `systemd-run --user --unit` service that dropped `WSMP_JOB`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs a systemd user manager and `script`"]
+fn trust_full_from_a_terminal_but_not_from_a_user_service() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
     write_config(
         &config,
-        json!({
-            "version": 1,
-            "metrics": { "sources": { "gpu_temp": { "command": "echo 70", "format": "number" } } }
-        }),
+        json!({ "version": 1, "serverUrl": "https://wsmp.example.com", "trust": "full", "endpoints": [] }),
     );
     cli(&config, &state)
-        .args(["config", "set-remote-metric-sources", "on"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Restart wsmp to apply."));
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(cfg["allowRemoteMetricSources"], true);
-    let source = &cfg["metrics"]["sources"]["gpu_temp"];
-    assert_eq!(source["command"], "echo 70");
-    assert_eq!(source["intervalSecs"], 10, "default interval");
-    assert_eq!(source["timeoutSecs"], 5, "default timeout");
-    assert_eq!(source["format"], "number");
-    cli(&config, &state)
-        .args(["config", "set-remote-metric-sources", "off"])
+        .args(["trust", "relay"])
         .assert()
         .success();
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert!(cfg.get("allowRemoteMetricSources").is_none());
-}
-
-#[cfg(unix)]
-#[test]
-fn metrics_list_and_test_report_local_sources() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(
-        &config,
-        json!({
-            "version": 1,
-            "metrics": { "sources": {
-                "gpu": { "command": "printf 'gpu_temp{gpu=\"0\"} 71\\n'; echo leak >&2", "format": "prometheus" },
-                "fast": { "command": "echo 1", "intervalSecs": 2 }
-            } }
-        }),
-    );
-    let listed = json_stdout({
-        let mut cmd = cli(&config, &state);
-        cmd.args(["metrics", "list", "--json"]);
-        cmd
-    });
-    let sources = listed["sources"].as_array().expect("sources");
-    let state_of = |name: &str| {
-        sources
-            .iter()
-            .find(|source| source["name"] == name)
-            .map(|source| source["state"].clone())
-    };
-    assert_eq!(state_of("gpu"), Some(json!("active")));
-    assert_eq!(state_of("fast"), Some(json!("disabled")));
-    let tested = json_stdout({
-        let mut cmd = cli(&config, &state);
-        cmd.args(["metrics", "test", "gpu", "--json"]);
-        cmd
-    });
-    assert_eq!(tested["ok"], true);
-    assert_eq!(tested["series"][0]["name"], "gpu_temp");
-    assert_eq!(tested["series"][0]["labels"]["gpu"], "0");
-    assert_eq!(tested["series"][0]["value"], 71.0);
+    let wsmp = assert_cmd::cargo::cargo_bin("wsmp");
+    // A user service, with the marker dropped: refused before any prompt.
+    let unit = format!("provtest-{}", std::process::id());
+    let refused = std::process::Command::new("systemd-run")
+        .args(["--user", "--quiet", "--wait", "--pipe", "--collect"])
+        .arg(format!("--unit={unit}"))
+        .arg(format!("--setenv=WSMP_CONFIG={}", config.display()))
+        .arg(format!("--setenv=WSMP_STATE_DIR={}", state.display()))
+        .args(["env", "-u", "WSMP_JOB"])
+        .arg(&wsmp)
+        .args(["trust", "full"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("systemd-run");
+    assert!(!refused.status.success());
     assert!(
-        !tested.to_string().contains("leak"),
-        "stderr is never captured"
+        String::from_utf8_lossy(&refused.stderr).contains("cannot run from a command"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
     );
-}
-
-#[test]
-fn metrics_approve_pins_the_exact_remote_command() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("config.json");
-    let state = tmp.path().join("state");
-    write_config(&config, json!({ "version": 1 }));
-    write_remote_sources(
-        &state,
-        json!([{ "name": "fans", "command": "echo 3", "intervalSecs": 10, "timeoutSecs": 5, "format": "number" }]),
+    // A terminal (a pty from `script`) in this shell: raised.
+    let command = format!(
+        "WSMP_CONFIG='{}' WSMP_STATE_DIR='{}' '{}' trust full",
+        config.display(),
+        state.display(),
+        wsmp.display()
     );
-    let listed = json_stdout({
-        let mut cmd = cli(&config, &state);
-        cmd.args(["metrics", "list", "--json"]);
-        cmd
-    });
-    assert_eq!(listed["sources"][0]["state"], "refused", "no opt-in yet");
-
-    cli(&config, &state)
-        .args(["config", "set-remote-metric-sources", "on"])
-        .assert()
-        .success();
-    let listed = json_stdout({
-        let mut cmd = cli(&config, &state);
-        cmd.args(["metrics", "list", "--json"]);
-        cmd
-    });
-    assert_eq!(listed["sources"][0]["state"], "pending_approval");
-    cli(&config, &state)
-        .args(["metrics", "test", "fans"])
-        .assert()
-        .failure();
-
-    // Approval by name alone (no reviewed hash) is refused and pins nothing:
-    // it would bind to whatever command the server stored last.
-    cli(&config, &state)
-        .args(["metrics", "approve", "fans"])
-        .assert()
-        .failure();
+    let raised = std::process::Command::new("script")
+        .args(["-qec", &command, "/dev/null"])
+        .env_remove("WSMP_JOB")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            child.stdin.take().expect("stdin").write_all(b"full\n")?;
+            child.wait_with_output()
+        })
+        .expect("script");
+    let out = String::from_utf8_lossy(&raised.stdout);
+    assert!(out.contains("trust: now full control"), "{out}");
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert!(
-        cfg.pointer("/metrics/approvedRemoteSources/fans").is_none(),
-        "nothing is pinned without a reviewed hash"
-    );
-
-    // The server swaps the command after the person read `echo 4`: the
-    // approval of the reviewed hash is refused and pins nothing.
-    cli(&config, &state)
-        .args([
-            "metrics",
-            "approve",
-            "fans",
-            "--sha256",
-            &sha256_hex("echo 4"),
-        ])
-        .assert()
-        .failure();
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert!(cfg.pointer("/metrics/approvedRemoteSources/fans").is_none());
-    let approved = json_stdout({
-        let mut cmd = cli(&config, &state);
-        cmd.args([
-            "metrics",
-            "approve",
-            "fans",
-            "--sha256",
-            &sha256_hex("echo 3"),
-            "--json",
-        ]);
-        cmd
-    });
-    assert_eq!(approved["commandSha256"], sha256_hex("echo 3"));
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert_eq!(
-        cfg["metrics"]["approvedRemoteSources"]["fans"],
-        sha256_hex("echo 3")
-    );
-    let listed = json_stdout({
-        let mut cmd = cli(&config, &state);
-        cmd.args(["metrics", "list", "--json"]);
-        cmd
-    });
-    assert_eq!(listed["sources"][0]["state"], "active");
-
-    // The server changes the command: it needs a new approval.
-    write_remote_sources(
-        &state,
-        json!([{ "name": "fans", "command": "echo 3; rm -rf ~", "intervalSecs": 10, "timeoutSecs": 5, "format": "number" }]),
-    );
-    let listed = json_stdout({
-        let mut cmd = cli(&config, &state);
-        cmd.args(["metrics", "list", "--json"]);
-        cmd
-    });
-    assert_eq!(listed["sources"][0]["state"], "pending_approval");
-
-    cli(&config, &state)
-        .args(["metrics", "revoke", "fans"])
-        .assert()
-        .success();
-    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    assert!(cfg.get("metrics").is_none());
-    cli(&config, &state)
-        .args(["metrics", "approve", "missing"])
-        .assert()
-        .failure();
+    assert_eq!(cfg["trust"], "full");
 }

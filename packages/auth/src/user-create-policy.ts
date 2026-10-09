@@ -4,12 +4,19 @@ const DEFAULT_ROLE = "user";
 const FIRST_USER_ROLE = "admin";
 /** Exact Better Auth admin-plugin endpoint path (HTTP and `auth.api.createUser`). */
 const ADMIN_CREATE_USER_PATH = "/admin/create-user";
+/** Exact Better Auth e-mail sign-up endpoint path. */
+const PUBLIC_SIGNUP_PATH = "/sign-up/email";
 
 export type UserCreatePolicyInput = {
   signupEnabled: boolean;
   userCount: number;
   /** Whether this submitted address is authorized for a production bootstrap. */
   adminBootstrapAllowed?: boolean;
+  /**
+   * Whether the request carries the token of a pending share invite (the `x-wsmp-invite`
+   * header). It opens only the public sign-up route while open sign-up is off.
+   */
+  inviteTokenPending?: boolean;
   emailConfigured: boolean;
   requestedRole?: unknown;
   contextPath?: string | null;
@@ -25,6 +32,7 @@ export type UserCreateHookMappingInput = {
   signupEnabled: boolean;
   userCount: number;
   adminBootstrapAllowed?: boolean;
+  inviteTokenPending?: boolean;
   emailConfigured: boolean;
   user: object;
   context?: { path?: unknown } | null;
@@ -40,6 +48,11 @@ export function isAdminCreateUserPath(path: string | null | undefined): boolean 
   return stripBenignPathDecorators(path) === ADMIN_CREATE_USER_PATH;
 }
 
+/** The public e-mail sign-up route (exact, like {@link isAdminCreateUserPath}). */
+export function isPublicSignupPath(path: string | null | undefined): boolean {
+  return typeof path === "string" && stripBenignPathDecorators(path) === PUBLIC_SIGNUP_PATH;
+}
+
 /**
  * Map Better Auth `user.create.before` hook args onto the pure policy input.
  * Missing / non-string paths stay `undefined` so the policy fails closed.
@@ -49,6 +62,7 @@ export function toUserCreatePolicyInput(input: UserCreateHookMappingInput): User
     signupEnabled: input.signupEnabled,
     userCount: input.userCount,
     adminBootstrapAllowed: input.adminBootstrapAllowed,
+    inviteTokenPending: input.inviteTokenPending,
     emailConfigured: input.emailConfigured,
     requestedRole: "role" in input.user ? input.user.role : undefined,
     contextPath: typeof input.context?.path === "string" ? input.context.path : undefined,
@@ -62,8 +76,12 @@ export function resolveUserCreatePolicy(input: UserCreatePolicyInput): UserCreat
   // denial, so a future creation path cannot accidentally recreate the public
   // production bootstrap bypass by forgetting this field.
   const mayBootstrapAdmin = isFirstUser && input.adminBootstrapAllowed === true;
+  // An invite link is the invitation: it opens the public sign-up route only, with the
+  // default role (resolveCreateRole), never another creation path.
+  const mayInviteSignup =
+    input.inviteTokenPending === true && isPublicSignupPath(input.contextPath);
 
-  if (!input.signupEnabled && !mayBootstrapAdmin && !isAdminCreate) {
+  if (!input.signupEnabled && !mayBootstrapAdmin && !isAdminCreate && !mayInviteSignup) {
     throw new SignupDisabledError();
   }
 

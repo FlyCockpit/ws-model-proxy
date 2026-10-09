@@ -1,40 +1,37 @@
 /**
- * Central MCP tool wrappers (Phase 5).
+ * The 0.4.0 MCP tools: exactly the 28 tools of `MCP_TOOLS`
+ * (packages/api/src/contracts/mcp-tools.ts), registered on every per-request server.
  *
- * `registerMcpTools` is the production `registerTools` seam the transport
- * factory calls once per request (mcp/handler.ts). For every manifest
- * descriptor it registers ONE tool on the per-request `McpServer` whose
- * callback passes through this wrapper chain — in order:
+ * Exports for the server wiring:
+ * - `registerMcpTools(server, ctx)`: the transport factory's `registerTools` seam
+ *   (mcp/handler.ts). It lists the tools the request's level may call: READ tokens the 7
+ *   read tools, FULL tokens all 28.
+ * - `cancelMcpToolCallsForToken(credentialId)`: aborts the in-flight tool calls of one
+ *   agent token or OAuth grant (call it when the token is revoked).
+ * - `cancelMcpWriteToolCallsForGrant(grantId)`: aborts the in-flight write tool calls of an
+ *   OAuth grant lowered from Full to Read-only.
+ * - `runMcpTool(contract, state)`: one call through the wrapper chain (tests drive it).
  *
- *   1. DISPATCH: resolve the per-request oRPC context bound by the Phase 4
- *      `onVerified` seam (mcp/auth.ts → app.ts wiring). No binding (an
- *      unverified request somehow reaching dispatch) fails CLOSED with a
- *      generic internal error and NO procedure call.
- *   2. SCOPE: read tools require the read baseline (`mcp:read` or
- *      `mcp:write`); write tools require the LITERAL `mcp:write` — enforced
- *      with the SAME pure predicate the endpoint admission uses
- *      (`mcpScopesAllow`). Insufficient scope is an in-band tool error with
- *      a stable message (the HTTP-level 403 challenge answers requests that
- *      lack even the read baseline; a tool-level denial surfaces where the
- *      client can see WHICH scope to step up to).
- *   3. CONFIRMATION: gated tools require the exact literal
- *      (`confirm: "DELETE"` / `confirm: "RUN"`); the field is then STRIPPED
- *      so it can never reach a procedure input.
- *   4. INPUT: the (remaining) arguments go through the descriptor's input
- *      adapter, then to `createRouterClient(appRouter, { context })` — MCP
- *      does NOT repeat ownership or validation checks; the oRPC layer owns
- *      them. Extracted diagnostic cores are invoked with the VERIFIED user
- *      id only.
- *   5. OUTPUT: descriptor projector → defense-in-depth secret redactor →
- *      JSON-safe serialization → byte cap.
- *   6. ERRORS: ONLY allowlisted oRPC error codes map to stable MCP tool
- *      errors. Messages stay on the server (they can carry SQL and
- *      credential material) except an argument-shaped BAD_REQUEST, which
- *      copies a sanitized static message alongside the failing field names.
- *      Ownership-hiding `NOT_FOUND` keeps its indistinguishable "Not found";
- *      every unknown failure is a
- *      generic internal error carrying the request id, with a sanitized log
- *      line (constructor name + tool name + request id ONLY).
+ * The wrapper chain of one call:
+ *   1. dispatch: the verified request's oRPC context (mcp/tool-dispatch.ts); none → fail closed;
+ *   2. level: a FULL tool on a READ credential answers like an unknown tool;
+ *   3. rate limit (`contract.rateLimit`, per credential and key);
+ *   4. input: the tool's contract schema; errors name the field path, never the value;
+ *   5. route: the procedures in `contract.procedures` (see `routeToolCall`), each called
+ *      through the bound oRPC router with the agent `CallerAuth`, inside the DB abort fence
+ *      and raced against the request's signal;
+ *   6. output: redact → JSON-safe → size cap; errors: refusals keep their fixed message and
+ *      reason, validation failures list `{path, message}` issues, other 4xx codes keep the
+ *      procedure's (developer-written) message; a sensitive tool gets static text only.
+ *
+ * Secrets: a tool with `sensitiveInput` (node_secret_set) and the procedures in
+ * `SENSITIVE_INPUT_PROCEDURES` never have their input logged, audited or echoed. No tool's
+ * arguments are ever logged; validation errors carry paths and messages (sensitive tools: paths
+ * and codes only).
+ *
+ * tools/list advertises the name, the contract description and the compact input schema
+ * (`advertisedInputSchema`), nothing else (no titles, annotations or output schemas): the
+ * token budget is pinned by mcp/tools-budget.test.ts.
  */
 
 import type {
@@ -43,106 +40,510 @@ import type {
   McpServer,
   StandardSchemaWithJSON,
 } from "@modelcontextprotocol/server";
-import { createRouterClient, ORPCError } from "@orpc/server";
-import { isDeploymentRefusalReason } from "@ws-model-proxy/api/lib/deployment-refusal-reasons";
-import { isGuardedPoolCreateFailureReason } from "@ws-model-proxy/api/lib/guarded-pool-create-reasons";
-import { type AppRouterClient, appRouter } from "@ws-model-proxy/api/routers/index";
-import { mcpScopesAllow } from "@ws-model-proxy/auth/mcp-config";
+import { call, getRouter, isProcedure, ORPCError } from "@orpc/server";
 import {
-  type DeletionConflictReason,
-  isDeletionConflictReason,
-} from "@ws-model-proxy/config/deletion-conflict";
+  advertisedInputSchema,
+  MCP_READ_TOOLS,
+  MCP_TOOLS,
+  type McpToolContract,
+  SENSITIVE_INPUT_PROCEDURES,
+} from "@ws-model-proxy/api/contracts";
+import { appRouter } from "@ws-model-proxy/api/routers/index";
 import { runWithDbAbortFence } from "@ws-model-proxy/db/shutdown-fence";
-import { McpCliCommandRejectedError } from "./cli-command-tools";
-import { McpCliFileError } from "./cli-file-tools";
-import { cliToolAllowed, isCliTool } from "./cli-tool-access";
+import { RateLimiterMemory, RateLimiterRes } from "rate-limiter-flexible";
+import { z } from "zod";
+import type { McpContext, McpRequestCredential } from "./context";
 import { mcpSanitizedLog } from "./errors";
-import {
-  collectSchemaPropertyNames,
-  fieldsFromValidationIssues,
-  formatValidationIssues,
-  type McpValidationIssue,
-  sanitizeArgumentMessage,
-  sanitizeDeclaredFields,
-  sanitizeValidationIssues,
-} from "./input-errors";
 import { redactSecrets } from "./redaction";
 import { toJsonSafe } from "./serialization";
-import { resolveMcpToolDispatch } from "./tool-dispatch";
-import {
-  MCP_TOOL_MANIFEST,
-  McpInvalidDateInputError,
-  type McpToolDescriptor,
-} from "./tool-manifest";
+import { type McpToolDispatch, resolveMcpToolDispatch } from "./tool-dispatch";
 
-/** One router client per request — the oRPC layer is the ownership boundary. */
-type RouterClient = AppRouterClient;
-
-/** In-band tool results use the SDK's own CallToolResult shape verbatim. */
 type ToolResult = CallToolResult;
 
-/**
- * Hard cap on one tool's serialized output (bytes of the JSON encoding).
- * Procedures already paginate (limit ≤ 200); this bound exists so a future
- * unbounded select cannot blow up a JSON-RPC response.
- */
+/** Hard cap on one tool's serialized output. */
 export const MCP_TOOL_OUTPUT_MAX_BYTES = 256 * 1024;
-
-/**
- * G5: fixed headroom reserved for the fields the installed SDK adds to the
- * wrapper's measured result AFTER the size check (resultType, server-info
- * `_meta`; the installed SDK measured 115 bytes — 1 KiB keeps generous
- * slack across SDK patch bumps). Both size checks below bound the tool's
- * result to `MCP_TOOL_OUTPUT_MAX_BYTES - MCP_TOOL_OUTPUT_SDK_HEADROOM_BYTES`
- * so the EMITTED (post-SDK) result stays within the advertised cap.
- */
+/** Headroom for the fields the SDK adds after the check (resultType, `_meta`). */
 export const MCP_TOOL_OUTPUT_SDK_HEADROOM_BYTES = 1024;
+const OUTPUT_BUDGET_BYTES = MCP_TOOL_OUTPUT_MAX_BYTES - MCP_TOOL_OUTPUT_SDK_HEADROOM_BYTES;
+
+const READ_TOOL_NAMES: ReadonlySet<string> = new Set(MCP_READ_TOOLS);
+
+// ── tools/list ──
 
 /**
- * The budget the wrapper's own checks enforce: the advertised cap minus the
- * SDK headroom. `OUTPUT_TOO_LARGE` still reports the advertised cap.
+ * A standard schema that advertises the compact JSON Schema and accepts any arguments: the
+ * wrapper validates with the contract schema itself, so the SDK never echoes a validation
+ * message (which could carry an argument).
  */
-const MCP_TOOL_OUTPUT_EMITTED_BUDGET_BYTES =
-  MCP_TOOL_OUTPUT_MAX_BYTES - MCP_TOOL_OUTPUT_SDK_HEADROOM_BYTES;
+function advertisedSchema(contract: McpToolContract): StandardSchemaWithJSON {
+  // The contract input as JSON Schema, compact fields replaced (the procedure validates them).
+  const json = advertisedInputSchema(contract);
+  return {
+    "~standard": {
+      version: 1,
+      vendor: "ws-model-proxy",
+      validate: (value: unknown) => ({ value }),
+      jsonSchema: { input: () => json, output: () => json },
+    },
+  };
+}
+
+/** Whether a credential of this level may see and call the tool. */
+export function mcpToolAllowed(name: string, level: "READ" | "FULL"): boolean {
+  return level === "FULL" || READ_TOOL_NAMES.has(name);
+}
 
 /**
- * Allowlisted oRPC error codes → stable tool-error messages. Codes outside
- * this map (and non-ORPCError failures) become the generic internal error.
- * A procedure message is copied only for an argument-shaped BAD_REQUEST
- * that names declared fields (#200), or for a deployment planning refusal
- * whose `data.reason` is a known code (its message is fixed planner text),
- * and only after it is sanitized.
+ * Registers the tools this request's credential may call. Without a verified dispatch only
+ * the read tools are listed, and every call fails closed.
  */
-const ORPC_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
-  BAD_REQUEST: "Invalid input",
-  UNAUTHORIZED: "Unauthorized",
-  FORBIDDEN: "Forbidden",
-  NOT_FOUND: "Not found",
-  CONFLICT: "Conflict",
-  PRECONDITION_FAILED: "Precondition failed",
-  TOO_MANY_REQUESTS: "Too many requests",
-});
+export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): void {
+  const dispatch = resolveMcpToolDispatch(ctx?.authInfo);
+  const level = dispatch?.credential.level ?? "READ";
+  for (const contract of MCP_TOOLS) {
+    if (!mcpToolAllowed(contract.name, level)) continue;
+    server.registerTool<StandardSchemaWithJSON, StandardSchemaWithJSON>(
+      contract.name,
+      { description: contract.description, inputSchema: advertisedSchema(contract) },
+      async (args: unknown): Promise<ToolResult> => runMcpTool(contract, { dispatch, args }),
+    );
+  }
+}
 
-/** Codes a deployment planning refusal may carry. */
-const DEPLOYMENT_REFUSAL_CODES: ReadonlySet<string> = new Set([
-  "BAD_REQUEST",
-  "CONFLICT",
-  "FORBIDDEN",
-  "PRECONDITION_FAILED",
-]);
-/** The only tools whose errors can be deployment planning refusals. */
-const DEPLOYMENT_PLAN_TOOLS: ReadonlySet<string> = new Set([
-  "deployment_plan_start",
-  "deployment_plan_stop",
-  "deployment_plan_apply",
-]);
-/** Planner messages may list skipped nodes, so they get a larger cap. */
-const DEPLOYMENT_REFUSAL_MESSAGE_MAX_LENGTH = 2000;
-const DEPLOYMENT_REFUSAL_MAX_NODES = 64;
-/** Node (CLI device) ids as the planner reports them: never free text. */
-const NODE_ID_SHAPE = /^[A-Za-z0-9_-]{1,128}$/;
+// ── in-flight calls per credential (revocation) ──
 
-const GENERIC_TOOL_ERROR_MESSAGE = "Internal error";
+/** One in-flight call; `write`: a FULL-only tool (lowering a grant ends these). */
+type InFlightCall = { controller: AbortController; write: boolean };
+const inFlight = new Map<string, Set<InFlightCall>>();
+
+function credentialId(credential: McpRequestCredential): string {
+  return credential.kind === "agent_token" ? credential.tokenId : credential.grantId;
+}
+
+/**
+ * Credentials revoked recently: a call that passed its credential check before the revocation
+ * committed but registers after it (the rate-limit read sits in between) is aborted at once.
+ * Revocation is permanent, so a few minutes covers every request already past its check.
+ * Per process, like `inFlight` (one server instance per deployment).
+ */
+const REVOKED_REMEMBER_MS = 5 * 60_000;
+const recentlyRevoked = new Map<string, number>();
+
+/** Insertion order is expiry order (one window for all): stop at the first live entry. */
+function pruneRevoked(now: number) {
+  for (const [key, until] of recentlyRevoked) {
+    if (until > now) return;
+    recentlyRevoked.delete(key);
+  }
+}
+
+function revokedRecently(id: string, now = Date.now()): boolean {
+  pruneRevoked(now);
+  return (recentlyRevoked.get(id) ?? 0) > now;
+}
+
+/** Aborts every in-flight tool call of one agent token id or OAuth grant id. */
+export function cancelMcpToolCallsForToken(id: string): number {
+  const now = Date.now();
+  pruneRevoked(now);
+  // Re-inserted at the end so the map stays in expiry order.
+  recentlyRevoked.delete(id);
+  recentlyRevoked.set(id, now + REVOKED_REMEMBER_MS);
+  const calls = inFlight.get(id);
+  if (!calls) return 0;
+  for (const call of calls) call.controller.abort();
+  inFlight.delete(id);
+  return calls.size;
+}
+
+/**
+ * OAuth grants lowered from Full to Read-only recently: grant id → `performance.now()` taken
+ * after the lowering committed. A write call whose request read the grant's level BEFORE that
+ * (`levelReadAt`, taken before the read) still carries the stale FULL; it is aborted when it
+ * registers. Requests that read the level later see READ and never reach a write tool. A few
+ * minutes covers every request between its level read and its call registration.
+ */
+const LOWERED_REMEMBER_MS = 5 * 60_000;
+const recentlyLowered = new Map<string, number>();
+
+/** Insertion order is lowering order (one window for all): stop at the first live entry. */
+function pruneLowered(now: number) {
+  for (const [key, at] of recentlyLowered) {
+    if (at + LOWERED_REMEMBER_MS > now) return;
+    recentlyLowered.delete(key);
+  }
+}
+
+function loweredSinceLevelRead(credential: McpRequestCredential): boolean {
+  if (credential.kind !== "oauth") return false;
+  pruneLowered(performance.now());
+  const at = recentlyLowered.get(credential.grantId);
+  return at !== undefined && at >= credential.levelReadAt;
+}
+
+/**
+ * An OAuth grant was lowered from Full to Read-only (committed): aborts its in-flight write
+ * (FULL-only) tool calls and any write call still registering with the stale level. Read calls
+ * go on; a later raise is honored from the next request (its level read is newer).
+ */
+export function cancelMcpWriteToolCallsForGrant(grantId: string): number {
+  const now = performance.now();
+  pruneLowered(now);
+  // Re-inserted at the end so the map stays in lowering order.
+  recentlyLowered.delete(grantId);
+  recentlyLowered.set(grantId, now);
+  const calls = inFlight.get(grantId);
+  if (!calls) return 0;
+  let aborted = 0;
+  for (const call of calls) {
+    if (!call.write) continue;
+    call.controller.abort();
+    aborted += 1;
+  }
+  return aborted;
+}
+
+function trackCall(
+  credential: McpRequestCredential,
+  parent: AbortSignal | undefined,
+  write: boolean,
+) {
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  if (
+    parent?.aborted ||
+    revokedRecently(credentialId(credential)) ||
+    (write && loweredSinceLevelRead(credential))
+  )
+    controller.abort();
+  else parent?.addEventListener("abort", onAbort, { once: true });
+  const id = credentialId(credential);
+  const set = inFlight.get(id) ?? new Set<InFlightCall>();
+  const call: InFlightCall = { controller, write };
+  set.add(call);
+  inFlight.set(id, set);
+  return {
+    signal: controller.signal,
+    done: () => {
+      parent?.removeEventListener("abort", onAbort);
+      set.delete(call);
+      if (set.size === 0 && inFlight.get(id) === set) inFlight.delete(id);
+    },
+  };
+}
+
+// ── rate limits ──
+
+const limiters = new Map<string, RateLimiterMemory>();
+
+function limiterFor(key: string, perMinute: number): RateLimiterMemory {
+  const name = `${key}:${perMinute}`;
+  let limiter = limiters.get(name);
+  if (!limiter) {
+    limiter = new RateLimiterMemory({ points: perMinute, duration: 60 });
+    limiters.set(name, limiter);
+  }
+  return limiter;
+}
+
+/** Test-only: forget every rate-limit counter. */
+export function resetMcpToolRateLimitsForTests(): void {
+  limiters.clear();
+}
+
+async function consumeRateLimit(
+  contract: McpToolContract,
+  credential: McpRequestCredential,
+  args: Record<string, unknown>,
+): Promise<number | null> {
+  const limit = contract.rateLimit;
+  if (!limit) return null;
+  if (limit.onlyWhen !== undefined && !args[limit.onlyWhen]) return null;
+  try {
+    await limiterFor(limit.key, limit.perMinute).consume(credentialId(credential));
+    return null;
+  } catch (rejection) {
+    if (rejection instanceof RateLimiterRes) return Math.ceil(rejection.msBeforeNext / 1000);
+    throw rejection;
+  }
+}
+
+// ── routing to procedures ──
+
+/** One procedure call a tool makes. */
+export type ProcedureCall = { path: string; input: Record<string, unknown> };
+
+function pick(source: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of keys) if (source[key] !== undefined) out[key] = source[key];
+  return out;
+}
+
+function omit(source: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source))
+    if (!keys.includes(key) && value !== undefined) out[key] = value;
+  return out;
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+/**
+ * The procedure calls of one validated tool input, in order. A single-procedure tool passes
+ * its input as is (`confirm` included: the procedures check it too); the others pick by input:
+ * - *_get tools: an id → `get` (with `versions` / `history` → the list beside it), else `list`;
+ * - runtime_create: `forkFrom` → runtimes.fork, else runtimes.create (kind defaults from
+ *   nodeId: always-on with a node, else startable);
+ * - runtime_update: runtimes.update, then runtimes.models.setCapabilities per entry;
+ * - pool_update: `contribute` → addContributed / removeContributed per id, any other change
+ *   → pools.update first;
+ * - runtime_stop: `requestRelease` → runtimes.releaseRequests.create (or `"withdraw"` →
+ *   runtimes.releaseRequests.withdraw), `markStopped` → runtimes.instances.markStopped, else
+ *   runtimes.stop;
+ * - node_secret_set: value null → nodes.secrets.delete, else nodes.secrets.set.
+ */
+export function routeToolCall(name: string, args: Record<string, unknown>): ProcedureCall[] {
+  switch (name) {
+    case "nodes_get":
+      return args.nodeId === undefined
+        ? [{ path: "nodes.list", input: {} }]
+        : [{ path: "nodes.get", input: pick(args, ["nodeId"]) }];
+    case "runtimes_get": {
+      if (args.presets) return [{ path: "runtimes.presets.list", input: {} }];
+      if (args.shared) return [{ path: "runtimes.shares.list", input: pick(args, ["runtimeId"]) }];
+      if (args.versionId !== undefined)
+        return [{ path: "runtimes.versions.get", input: pick(args, ["versionId"]) }];
+      if (args.runtimeId === undefined) return [{ path: "runtimes.list", input: {} }];
+      const get: ProcedureCall = { path: "runtimes.get", input: pick(args, ["runtimeId"]) };
+      return args.versions
+        ? [get, { path: "runtimes.versions.list", input: pick(args, ["runtimeId"]) }]
+        : [get];
+    }
+    case "pools_get": {
+      if (args.aliases) return [{ path: "pools.aliases.list", input: {} }];
+      if (args.poolId === undefined) return [{ path: "pools.list", input: {} }];
+      const get: ProcedureCall = { path: "pools.get", input: pick(args, ["poolId"]) };
+      return args.history
+        ? [get, { path: "pools.history.list", input: pick(args, ["poolId"]) }]
+        : [get];
+    }
+    case "profiles_get":
+      return args.profileId === undefined
+        ? [{ path: "profiles.list", input: {} }]
+        : [{ path: "profiles.get", input: pick(args, ["profileId"]) }];
+    case "providers_get":
+      return [
+        { path: "providers.accounts.list", input: {} },
+        { path: "providers.models.list", input: {} },
+      ];
+    case "runtime_create": {
+      const fork = record(args.forkFrom);
+      if (args.forkFrom !== undefined)
+        return [
+          {
+            path: "runtimes.fork",
+            input: {
+              ...pick(fork, ["runtimeId", "versionId"]),
+              ...pick(args, ["slug", "name", "nodeId", "limits", "advanced", "compat", "note"]),
+            },
+          },
+        ];
+      return [
+        {
+          path: "runtimes.create",
+          input: {
+            kind: args.nodeId === undefined ? "STARTABLE" : "ALWAYS_ON",
+            ...omit(args, ["forkFrom"]),
+          },
+        },
+      ];
+    }
+    case "runtime_update": {
+      const calls: ProcedureCall[] = [
+        { path: "runtimes.update", input: omit(args, ["modelCapabilities"]) },
+      ];
+      const note = args.note;
+      for (const entry of Array.isArray(args.modelCapabilities) ? args.modelCapabilities : [])
+        calls.push({
+          path: "runtimes.models.setCapabilities",
+          input: { ...record(entry), ...(note === undefined ? {} : { note }) },
+        });
+      return calls;
+    }
+    case "pool_update": {
+      const calls: ProcedureCall[] = [];
+      const update = omit(args, ["contribute", "aliases"]);
+      if (Object.keys(omit(update, ["poolId", "note"])).length > 0)
+        calls.push({ path: "pools.update", input: update });
+      const contribute = record(args.contribute);
+      const note = args.note === undefined ? {} : { note: args.note };
+      for (const runtimeModelId of Array.isArray(contribute.add) ? contribute.add : [])
+        calls.push({
+          path: "pools.members.addContributed",
+          input: { poolId: args.poolId, runtimeModelId, ...note },
+        });
+      for (const memberId of Array.isArray(contribute.withdraw) ? contribute.withdraw : [])
+        calls.push({ path: "pools.members.removeContributed", input: { memberId, ...note } });
+      const aliases = record(args.aliases);
+      for (const entry of Array.isArray(aliases.set) ? aliases.set : [])
+        calls.push({
+          path: "pools.aliases.set",
+          input: { ...record(entry), poolId: args.poolId, ...note },
+        });
+      for (const aliasId of Array.isArray(aliases.remove) ? aliases.remove : [])
+        calls.push({ path: "pools.aliases.delete", input: { aliasId, ...note } });
+      return calls;
+    }
+    case "runtime_stop":
+      if (args.requestRelease !== undefined) {
+        const target = pick(args, ["instanceId", "nodeNumber"]);
+        return args.requestRelease === "withdraw"
+          ? [{ path: "runtimes.releaseRequests.withdraw", input: target }]
+          : [
+              {
+                path: "runtimes.releaseRequests.create",
+                input: { ...target, ...record(args.requestRelease) },
+              },
+            ];
+      }
+      if (args.markStopped === true)
+        return [
+          {
+            path: "runtimes.instances.markStopped",
+            input: pick(args, ["instanceId", "nodeNumber", "confirm", "note"]),
+          },
+        ];
+      return [
+        {
+          path: "runtimes.stop",
+          input:
+            args.instanceId === undefined
+              ? pick(args, ["runtimeId", "nodeId"])
+              : pick(args, ["instanceId"]),
+        },
+      ];
+    case "node_secret_set":
+      return args.value === null
+        ? [{ path: "nodes.secrets.delete", input: pick(args, ["nodeId", "name", "note"]) }]
+        : [{ path: "nodes.secrets.set", input: pick(args, ["nodeId", "name", "value", "note"]) }];
+    default:
+      return [];
+  }
+}
+
+/** A value without null fields and empty lists, at any depth (compact list rows). */
+function withoutEmpty(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutEmpty);
+  if (value === null || typeof value !== "object") return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry === null || (Array.isArray(entry) && entry.length === 0)) continue;
+    out[key] = withoutEmpty(entry);
+  }
+  return out;
+}
+
+/** A pool whose members' live load leaves out what is unknown (null waiting, p95, share or slots). */
+function withCompactMemberLive(pool: unknown): unknown {
+  const members = record(pool).members;
+  if (!Array.isArray(members)) return pool;
+  return {
+    ...record(pool),
+    members: members.map((member) => ({
+      ...record(member),
+      live: withoutEmpty(record(member).live),
+    })),
+  };
+}
+
+/** Combines the outputs of a tool's procedure calls into its result. */
+function combineOutputs(name: string, calls: ProcedureCall[], outputs: unknown[]): unknown {
+  switch (name) {
+    case "nodes_get":
+      // The list is read for every node at once: rows leave out nulls and empty lists.
+      return calls[0]?.path === "nodes.list" ? withoutEmpty(outputs[0]) : outputs[0];
+    case "runtimes_get": {
+      // Instance rows and list rows leave out nulls and empty lists (a held STOPPED instance
+      // stays listed; a runtime on no node has no `nodes`).
+      const runtime =
+        calls[0]?.path === "runtimes.get"
+          ? { ...record(outputs[0]), instanceList: withoutEmpty(record(outputs[0]).instanceList) }
+          : calls[0]?.path === "runtimes.list"
+            ? withoutEmpty(outputs[0])
+            : outputs[0];
+      return outputs.length === 2 ? { ...record(runtime), versions: outputs[1] } : runtime;
+    }
+    case "pools_get": {
+      // Member live load leaves out what is unknown (null waiting, p95, share or slots).
+      const list = record(outputs[0]).pools;
+      const first =
+        calls[0]?.path === "pools.get"
+          ? withCompactMemberLive(outputs[0])
+          : calls[0]?.path === "pools.list" && Array.isArray(list)
+            ? { ...record(outputs[0]), pools: list.map(withCompactMemberLive) }
+            : outputs[0];
+      return outputs.length === 2 ? { ...record(first), history: outputs[1] } : first;
+    }
+    case "providers_get":
+      return { accounts: record(outputs[0]).accounts, models: record(outputs[1]).models };
+    case "runtime_update":
+      return outputs.length > 1 ? { ...record(outputs[0]), models: outputs.slice(1) } : outputs[0];
+    case "pool_update":
+      return {
+        ...(calls[0]?.path === "pools.update" ? { pool: outputs[0] } : {}),
+        contributed: outputs.filter((_, index) => calls[index]?.path.endsWith("addContributed")),
+        withdrawn: calls
+          .filter((entry) => entry.path.endsWith("removeContributed"))
+          .map((entry) => entry.input.memberId),
+        ...(calls.some((entry) => entry.path.startsWith("pools.aliases."))
+          ? {
+              aliases: outputs.filter((_, index) => calls[index]?.path === "pools.aliases.set"),
+              aliasesRemoved: calls
+                .filter((entry) => entry.path === "pools.aliases.delete")
+                .map((entry) => entry.input.aliasId),
+            }
+          : {}),
+      };
+    case "node_secret_set":
+      return { name: calls[0]?.input.name, deleted: calls[0]?.path === "nodes.secrets.delete" };
+    default:
+      return outputs[0];
+  }
+}
+
+/** Calls one procedure of the bound router as the request's agent caller. */
+export type ProcedureInvoker = (
+  path: string,
+  input: Record<string, unknown>,
+  context: McpContext,
+  signal: AbortSignal,
+) => Promise<unknown>;
+
+export const invokeBoundProcedure: ProcedureInvoker = async (path, input, context, signal) => {
+  const procedure = getRouter(appRouter, path.split("."));
+  if (!isProcedure(procedure)) throw new McpUnknownProcedureError(path);
+  return call(procedure, input, { context, signal });
+};
+
+class McpUnknownProcedureError extends Error {
+  constructor(path: string) {
+    super(`MCP tool names an unknown procedure (${path.length} chars)`);
+    this.name = "McpUnknownProcedureError";
+  }
+}
+
+// ── results and errors ──
+
+class McpToolAbortedError extends Error {
+  constructor() {
+    super("MCP tool call aborted");
+    this.name = "McpToolAbortedError";
+  }
+}
 
 function toolError(message: string, structured: Record<string, unknown>): ToolResult {
   return {
@@ -152,647 +553,229 @@ function toolError(message: string, structured: Record<string, unknown>): ToolRe
   };
 }
 
-function insufficientScopeError(descriptor: McpToolDescriptor): ToolResult {
-  return toolError(
-    `Insufficient scope: ${descriptor.name} requires mcp:${descriptor.scope === "write" ? "write" : "read"}.`,
-    {
-      error: {
-        code: "INSUFFICIENT_SCOPE",
-        requiredScope: descriptor.scope === "write" ? "mcp:write" : "mcp:read",
-      },
-    },
-  );
-}
-
-function confirmationRequiredError(descriptor: McpToolDescriptor): ToolResult {
-  const literal = descriptor.confirmation;
-  return toolError(`Confirmation required: pass confirm="${literal}" to run ${descriptor.name}.`, {
-    error: { code: "CONFIRMATION_REQUIRED", requiredConfirm: literal },
-  });
-}
-
-function internalToolError(requestId: string): ToolResult {
-  return toolError(GENERIC_TOOL_ERROR_MESSAGE, {
-    error: { code: "INTERNAL_ERROR" },
-    requestId,
-  });
-}
-
-/**
- * Same text the installed SDK uses when a name was never registered
- * (`Tool ${name} not found`). Does not say the tool is hidden or disabled.
- */
+/** The SDK's own text for an unregistered tool: a hidden tool looks the same. */
 function unknownToolError(name: string): ToolResult {
   return toolError(`Tool ${name} not found`, { error: { code: "NOT_FOUND" } });
 }
 
-/** Strip the ceremonial `confirm` field so it never reaches a procedure. */
-function stripConfirmation(input: unknown): unknown {
-  if (input === null || typeof input !== "object" || Array.isArray(input)) return input;
-  const { confirm: _confirm, ...rest } = input as Record<string, unknown>;
-  return rest;
-}
+const STATIC_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  BAD_REQUEST: "Invalid input",
+  UNAUTHORIZED: "Unauthorized",
+  FORBIDDEN: "Forbidden",
+  NOT_FOUND: "Not found",
+  CONFLICT: "Conflict",
+  PRECONDITION_FAILED: "Precondition failed",
+  TOO_MANY_REQUESTS: "Too many requests",
+});
 
-/** Serialize + cap. Returns null when the payload exceeds the emitted budget. */
-function serializeBounded(payload: unknown): string | null {
-  const serialized = JSON.stringify(payload);
-  if (serialized === undefined) return null;
-  if (new TextEncoder().encode(serialized).length > MCP_TOOL_OUTPUT_EMITTED_BUDGET_BYTES) {
-    return null;
+const REFUSAL_REASON_SHAPE = /^[a-z][a-z0-9_]{1,63}$/;
+const SUBJECT_ID_SHAPE = /^[A-Za-z0-9_-]{1,128}$/;
+
+/** One line, bounded: refusal messages are fixed server text, never caller input. */
+function sanitizeMessage(message: string): string {
+  let out = "";
+  for (const char of message.slice(0, 500)) {
+    const code = char.codePointAt(0) ?? 0;
+    out += code < 0x20 || code === 0x7f ? " " : char;
   }
-  return serialized;
+  return out;
 }
 
-/**
- * Register every manifest tool on one per-request server. `ctx` is the
- * transport factory's request context; the dispatch context is resolved
- * from its `authInfo` (bound by the Phase 4 `onVerified` seam). When no
- * dispatch resolves, tools are still registered but every call fails
- * closed — `tools/list` stays stable while `tools/call` can never reach a
- * procedure without a verified, admitted request.
- */
-export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): void {
-  const dispatch = resolveMcpToolDispatch(ctx?.authInfo);
-  const scopes = ctx?.authInfo?.scopes;
-  // One router client per request, shared by every tool closure below. MCP
-  // never re-checks ownership: the oRPC procedures own those checks against
-  // this per-request synthetic-session context.
-  const client: RouterClient | undefined = dispatch
-    ? createRouterClient(appRouter, { context: dispatch.orpcContext })
-    : undefined;
+/** `{path, message}`; a sensitive tool gets `{path, code}` (a message could echo a value). */
+type ValidationIssue = { path: string; message: string } | { path: string; code: string };
 
-  for (const descriptor of MCP_TOOL_MANIFEST) {
-    // CLI tools (commands and node file tools) stay unregistered unless this
-    // request's credential has the PAT consent and scopes for this capability.
-    // OAuth, a PAT without the required consent/scope, and an unbound
-    // dispatch do not see them. Call time checks
-    // the same predicate again.
-    if (
-      isCliTool(descriptor.name) &&
-      !cliToolAllowed(descriptor.name, dispatch?.credential, scopes)
-    ) {
-      continue;
-    }
-    // Explicit type arguments: the SDK's first overload cannot infer
-    // OutputArgs when no outputSchema is passed (tools deliberately declare
-    // none — no output validation, no SEP-2106 result wrapping), and InputArgs
-    // is the erased descriptor schema. The callback receives `unknown` args
-    // (audited tools defer their schema validation to the wrapper) and
-    // returns the SDK's own CallToolResult shape.
-    server.registerTool<StandardSchemaWithJSON, StandardSchemaWithJSON>(
-      descriptor.name,
-      {
-        title: descriptor.name,
-        description: toolDescription(descriptor),
-        inputSchema:
-          descriptor.auditInputRefusal !== undefined
-            ? deferInputValidation(descriptor.inputSchema)
-            : descriptor.inputSchema,
-        annotations: {
-          readOnlyHint: descriptor.scope === "read",
-          destructiveHint:
-            descriptor.confirmation === "DELETE" ||
-            descriptor.name === "forwarder_cli_command_run" ||
-            descriptor.name === "forwarder_cli_supervised_command_start",
-          idempotentHint: descriptor.scope === "read",
-          openWorldHint:
-            descriptor.classification === "external" || descriptor.classification === "cost",
-        },
-      },
-      async (args: unknown): Promise<ToolResult> =>
-        runManifestTool(descriptor, { dispatch, scopes, client, args }),
+const MAX_ISSUES = 20;
+
+function issueOf(path: string, code: string, message: unknown, sensitive: boolean) {
+  const at = path || "(root)";
+  if (sensitive || typeof message !== "string" || message === "") return { path: at, code };
+  return { path: at, message: sanitizeMessage(message).slice(0, 200) };
+}
+
+function validationIssues(error: z.ZodError, sensitive: boolean): ValidationIssue[] {
+  return error.issues
+    .slice(0, MAX_ISSUES)
+    .map((issue) =>
+      issueOf(issue.path.map(String).join("."), issue.code, issue.message, sensitive),
     );
-  }
 }
 
-/**
- * Advertise the same schema, but let the wrapper validate audited tools. The
- * SDK's own validation errors have no stable structured code. The wrapper
- * enforces the original validator before confirmation or invocation, audits
- * its refusal once, and returns a sanitized in-band error.
- */
-function deferInputValidation(schema: StandardSchemaWithJSON): StandardSchemaWithJSON {
-  return {
-    "~standard": {
-      ...schema["~standard"],
-      validate: (input: unknown) => ({ value: input }),
-    },
-  };
+function validationError(issues: ValidationIssue[]): ToolResult {
+  const fields = issues.map((issue) => issue.path).join(", ");
+  return toolError(`Invalid input: ${fields}.`, { error: { code: "invalid_input", issues } });
 }
 
-function toolDescription(descriptor: McpToolDescriptor): string {
-  const parts = [`Target: ${descriptor.target}.`];
-  parts.push(
-    descriptor.scope === "write"
-      ? "Requires the mcp:write scope (literal)."
-      : "Requires the mcp:read or mcp:write scope.",
-  );
-  if (descriptor.confirmation !== null) {
-    parts.push(`Requires confirm: "${descriptor.confirmation}".`);
-  }
-  if (descriptor.featureDependencies !== undefined && descriptor.featureDependencies.length > 0) {
-    parts.push(`Depends on ${descriptor.featureDependencies.join(", ")}.`);
-  }
-  if (descriptor.descriptionNote !== undefined) {
-    parts.push(descriptor.descriptionNote);
-  }
-  return parts.join(" ");
-}
-
-/**
- * The wrapper chain for one manifest tool invocation (see module docblock).
- * Exported for tests to drive directly with a synthetic dispatch.
- */
-export async function runManifestTool(
-  descriptor: McpToolDescriptor,
-  state: {
-    dispatch: ReturnType<typeof resolveMcpToolDispatch>;
-    scopes: readonly string[] | undefined;
-    client: RouterClient | undefined;
-    args: unknown;
-  },
-): Promise<ToolResult> {
-  const { dispatch, scopes, client, args } = state;
-
-  // 1. Dispatch: fail CLOSED without a verified, admitted request context.
-  if (dispatch === undefined) {
-    mcpSanitizedLog("tool dispatch rejected: no verified context", {
-      toolName: descriptor.name,
-    });
-    return toolError(GENERIC_TOOL_ERROR_MESSAGE, { error: { code: "INTERNAL_ERROR" } });
-  }
-  const requestId = dispatch.requestId;
-  // G1: the verified request's OWNED admission signal — the invocation and
-  // every post-await pipeline stage race/fence against it, so a client
-  // abort or gate.close() never leaves a tool continuation that can START
-  // new work (the DB-seam fence covers continuations that resume anyway).
-  const signal = dispatch.signal;
-  const credential = dispatch.credential ?? { kind: "oauth" as const };
-
-  // CLI tools are re-checked before scope and confirmation so a credential
-  // that cannot see them gets the same not-found answer as an unregistered
-  // name, not an insufficient-scope or confirmation error that would reveal
-  // the tool.
-  if (isCliTool(descriptor.name) && !cliToolAllowed(descriptor.name, credential, scopes)) {
-    mcpSanitizedLog("tool call rejected: unknown tool", {
-      toolName: descriptor.name,
-      requestId,
-    });
-    return unknownToolError(descriptor.name);
-  }
-
-  // 2. Scope: write tools require the literal mcp:write; read tools accept
-  //    either scope through the shared endpoint predicate.
-  const scopeOk =
-    descriptor.scope === "write"
-      ? mcpScopesAllow(scopes ?? [], "write")
-      : mcpScopesAllow(scopes ?? [], "read");
-  if (!scopeOk) {
-    mcpSanitizedLog("tool call denied: insufficient scope", {
-      toolName: descriptor.name,
-      requestId,
-    });
-    return insufficientScopeError(descriptor);
-  }
-
-  // Audited tools enforce their original SDK validator here, including the
-  // first-stage size bound, so refusals also carry the stable error contract.
-  if (descriptor.auditInputRefusal !== undefined) {
-    let validationFailure: unknown;
-    try {
-      const validated = await descriptor.inputSchema["~standard"].validate(args);
-      if (validated.issues !== undefined) validationFailure = validated;
-    } catch {
-      // A validator/serializer exception is a refusal too. Do not let the
-      // SDK echo its message, or skip the metadata-only refusal audit.
-      validationFailure = {};
-    }
-    if (validationFailure !== undefined) {
-      descriptor.auditInputRefusal(args, {
-        userId: dispatch.orpcContext.session.user.id,
-        credential,
-      });
-      const issues = sanitizeValidationIssues(validationFailure, declaredInputKeys(descriptor));
-      return issues === null
-        ? toolError("Invalid input", { error: { code: "invalid_input" } })
-        : validationToolError("invalid_input", issues);
-    }
-  }
-
-  // 3. Confirmation gate + field stripping.
-  const argsRecord =
-    args !== null && typeof args === "object" && !Array.isArray(args)
-      ? (args as Record<string, unknown>)
-      : {};
-  if (descriptor.confirmation !== null && argsRecord.confirm !== descriptor.confirmation) {
-    mcpSanitizedLog("tool call denied: missing confirmation", {
-      toolName: descriptor.name,
-      requestId,
-    });
-    descriptor.auditInputRefusal?.(argsRecord, {
-      userId: dispatch.orpcContext.session.user.id,
-      credential,
-    });
-    return confirmationRequiredError(descriptor);
-  }
-
-  // 4-6. The ENTIRE pipeline (adapt → invoke → project → redact →
-  //    serialize → size → build) runs inside ONE sanitizing boundary (G4):
-  //    ANY throw — input adaptation, the procedure/core, projection,
-  //    redaction, serialization, or sizing — becomes a stable in-band tool
-  //    error. NOTHING reaches the installed SDK, whose own catch would
-  //    copy `Error.message` verbatim into tool output.
-  const deliverDespiteAbort = descriptor.deliverDespiteAbort === true;
-  // Kept outside the try: an error mapping checks refinement messages against
-  // what the procedure actually received, not only the raw arguments.
-  let receivedInput: unknown;
-  try {
-    if ((!deliverDespiteAbort || descriptor.deliverDespiteAbortWhen) && signal?.aborted)
-      throw new McpToolAbortedError();
-    const adaptedInput = descriptor.inputAdapter
-      ? descriptor.inputAdapter(stripConfirmation(argsRecord))
-      : stripConfirmation(argsRecord);
-    receivedInput = adaptedInput;
-
-    // Invoke (procedure through the per-request client, or extracted core),
-    // raced against the admission signal (G1): abort settles THIS wrapper
-    // promptly, and the invocation runs inside the PER-REQUEST DB ABORT
-    // FENCE (runWithDbAbortFence): the shared Prisma client rejects any NEW
-    // database operation by this call's continuations once the signal
-    // aborts (ALS propagates through the await tree, covering resumed
-    // procedure continuations and transaction callbacks alike; an in-flight
-    // single operation may still complete — atomic semantics). Normal HTTP
-    // traffic runs outside the fence context and is unaffected.
-    //
-    // Commands preserve their id on abort. File writes race normally until
-    // the synchronous supervised registration claims id delivery; headless
-    // calls and admission reads retain their prompt abort semantics.
-    let output: unknown;
-    const invokeCore = descriptor.invokeCore;
-    const invokeProcedure = descriptor.invokeProcedure;
-    if (invokeCore !== undefined) {
-      let claimed = false;
-      const selectiveDelivery = descriptor.deliverDespiteAbortWhen !== undefined;
-      const invoke = () =>
-        runWithDbAbortFence(signal, () =>
-          invokeCore(adaptedInput, {
-            userId: dispatch.orpcContext.session.user.id,
-            signal,
-            credential,
-            ...(selectiveDelivery
-              ? {
-                  claimDeliverDespiteAbort: () => {
-                    claimed = true;
-                  },
-                }
-              : {}),
-          }),
-        );
-      output = selectiveDelivery
-        ? await raceAbort(invoke(), signal, () => claimed)
-        : deliverDespiteAbort
-          ? await invoke()
-          : await raceAbort(invoke(), signal);
-    } else if (invokeProcedure !== undefined && client !== undefined) {
-      output = await raceAbort(
-        runWithDbAbortFence(signal, () => invokeProcedure(client, adaptedInput)),
-        signal,
-      );
-    } else {
-      // A descriptor with no invocation is a manifest bug; fail closed.
-      mcpSanitizedLog("tool dispatch rejected: descriptor has no invocation", {
-        toolName: descriptor.name,
-        requestId,
-      });
-      return internalToolError(requestId);
-    }
-    // Supervised file starts must deliver their id. Headless file results
-    // retain the abort fence, even though the core was awaited to learn its kind.
-    const deliverOutputDespiteAbort =
-      deliverDespiteAbort && (descriptor.deliverDespiteAbortWhen?.(output) ?? true);
-    if (!deliverOutputDespiteAbort && signal?.aborted) throw new McpToolAbortedError();
-
-    // Project → redact → serialize → cap (G5: the FINAL serialized result —
-    // text + structuredContent combined — is what must stay within the
-    // advertised cap; the payload pre-check below is only the fast fail for
-    // grossly oversized payloads).
-    const projected = descriptor.outputProjector ? descriptor.outputProjector(output) : output;
-    if (!deliverOutputDespiteAbort && signal?.aborted) throw new McpToolAbortedError();
-    const safe = toJsonSafe(redactSecrets(projected));
-    const serialized = serializeBounded(safe);
-    if (serialized === null) {
-      mcpSanitizedLog("tool output exceeded the size cap", {
-        toolName: descriptor.name,
-        requestId,
-      });
-      return outputTooLargeError();
-    }
-    const result: ToolResult = {
-      content: [{ type: "text", text: serialized }],
-      structuredContent: { result: safe },
-    };
-    // G5: the emitted budget (cap minus SDK headroom) — the SDK adds
-    // resultType/_meta AFTER this check, so the post-encoding result stays
-    // within the advertised cap.
-    if (byteLength(JSON.stringify(result)) > MCP_TOOL_OUTPUT_EMITTED_BUDGET_BYTES) {
-      mcpSanitizedLog("tool output exceeded the size cap", {
-        toolName: descriptor.name,
-        requestId,
-      });
-      return outputTooLargeError();
-    }
-    return result;
-  } catch (error) {
-    if (
-      error instanceof McpToolAbortedError ||
-      (descriptor.deliverDespiteAbortWhen !== undefined && signal?.aborted)
-    ) {
-      mcpSanitizedLog("tool call aborted", { toolName: descriptor.name, requestId });
-      return toolError("Request cancelled.", { error: { code: "REQUEST_ABORTED" } });
-    }
-    if (error instanceof McpInvalidDateInputError) {
-      mcpSanitizedLog("tool input rejected: invalid timestamp", {
-        toolName: descriptor.name,
-        requestId,
-      });
-      return toolError(`Invalid input: field "${error.field}" must be an ISO-8601 timestamp.`, {
-        error: { code: "invalid_input", fields: [error.field] },
-      });
-    }
-    if (error instanceof McpCliCommandRejectedError) {
-      // reason is a fixed runtime code. Command text and output are not logged.
-      mcpSanitizedLog(`tool call rejected: cli command ${error.reason}`, {
-        toolName: descriptor.name,
-        requestId,
-      });
-      return toolError(error.message, { error: { code: error.code } });
-    }
-    if (error instanceof McpCliFileError) {
-      // The code is a fixed runtime value. Paths and file content are not logged.
-      mcpSanitizedLog(`tool call rejected: cli file ${error.code}`, {
-        toolName: descriptor.name,
-        requestId,
-      });
-      // #117: an invalid_input names the failing field(s) (sanitized issues only).
-      const issues =
-        error.validation === null
-          ? null
-          : sanitizeValidationIssues(error.validation, declaredInputKeys(descriptor));
-      if (issues !== null) {
-        const fields = fieldsFromValidationIssues(issues);
-        return toolError(`${error.message}: ${formatValidationIssues(issues)}`, {
-          error: {
-            code: error.code,
-            ...error.extra,
-            ...(fields.length === 0 ? {} : { fields }),
-            message: formatValidationIssues(issues),
-            issues,
-          },
-        });
-      }
-      return toolError(error.message, { error: { code: error.code, ...error.extra } });
-    }
-    return mapToolError(error, descriptor, requestId, [args, receivedInput]);
-  }
-}
-
-/** Module-private sentinel: the request's admission signal aborted. */
-class McpToolAbortedError extends Error {
-  constructor() {
-    super("MCP tool call aborted");
-    this.name = "McpToolAbortedError";
-  }
-}
-
-/**
- * Race one invocation promise against the admission signal (G1). The
- * underlying promise is never cancelled by the race itself (procedure
- * continuations are not cancellable) — its residual DB work is fenced by
- * the db-seam shutdown fence, its network work by the signal threading in
- * the diagnostic cores. A no-op catch keeps a losing-but-rejecting
- * continuation from surfacing as an unhandled rejection.
- */
-async function raceAbort<T>(
-  promise: Promise<T>,
-  signal: AbortSignal | undefined,
-  preserve: () => boolean = () => false,
-): Promise<T> {
-  if (signal === undefined) return promise;
-  void promise.catch(() => undefined);
-  if (signal.aborted && !preserve()) throw new McpToolAbortedError();
-  return await Promise.race([
-    promise,
-    new Promise<never>((_, reject) => {
-      const rejectAborted = () => {
-        if (!preserve()) reject(new McpToolAbortedError());
-      };
-      if (signal.aborted) {
-        rejectAborted();
-        return;
-      }
-      signal.addEventListener("abort", rejectAborted, { once: true });
-    }),
-  ]);
-}
-
-/** UTF-8 byte length of a string (edge-neutral). */
-function byteLength(text: string): number {
-  return new TextEncoder().encode(text).length;
-}
-
-function outputTooLargeError(): ToolResult {
-  return toolError("Tool output exceeded the maximum size.", {
-    error: { code: "OUTPUT_TOO_LARGE", maxBytes: MCP_TOOL_OUTPUT_MAX_BYTES },
-  });
-}
-
-/**
- * Allowlisted oRPC error mapping. `BAD_REQUEST` from input validation adds the
- * sanitized issue list (input-errors.ts). `NOT_FOUND` keeps the SAME stable message
- * whether the target does not exist or belongs to another user — the
- * ownership-hiding convention survives the bridge intact. The lookup is
- * PROTOTYPE-SAFE (G6): `Object.hasOwn` keeps inherited properties
- * (`"toString"`, `"constructor"`, `"hasOwnProperty"`) out of the mapping,
- * so `new ORPCError("toString")` collapses to the generic internal error
- * like every other unknown code. Unknown codes and non-ORPCError failures
- * NEVER copy their message (SQL, stack, or provider detail) into tool
- * output: they become the generic internal error with the request id, plus
- * one sanitized log line.
- */
-/**
- * The stable deletion reason of a CONFLICT (`data.reason`, one of
- * DELETION_CONFLICT_REASONS), or null. Only that enum crosses the bridge:
- * any other `data` (and every message) stays on the server.
- */
-function deletionConflictReasonOf(
+/** Issues from an oRPC input validation failure (its cause carries the schema issues). */
+function orpcValidationIssues(
   error: ORPCError<string, unknown>,
-): DeletionConflictReason | null {
-  if (error.code !== "CONFLICT") return null;
-  const data: unknown = error.data;
-  if (typeof data !== "object" || data === null || !Object.hasOwn(data, "reason")) return null;
-  const reason: unknown = Reflect.get(data, "reason");
-  return isDeletionConflictReason(reason) ? reason : null;
-}
-
-/** Per-descriptor cache of the property names its advertised schema declares. */
-const declaredKeysCache = new WeakMap<McpToolDescriptor, ReadonlySet<string>>();
-
-/**
- * Argument-shaped failure (#200): `fields` names the keys, `message` says
- * why. Zod issues keep their sanitized list; a procedure BAD_REQUEST with
- * no issue list uses `data.fields` plus its static message.
- */
-function validationToolError(code: string, issues: readonly McpValidationIssue[]): ToolResult {
-  const fields = fieldsFromValidationIssues(issues);
-  const message = formatValidationIssues(issues);
-  return toolError(`Invalid input: ${message}`, {
-    error: {
-      code,
-      ...(fields.length === 0 ? {} : { fields }),
-      message,
-      issues,
-    },
+  sensitive: boolean,
+): ValidationIssue[] | null {
+  const cause: unknown = error.cause;
+  if (cause === null || typeof cause !== "object" || !("issues" in cause)) return null;
+  const issues: unknown = cause.issues;
+  if (!Array.isArray(issues)) return null;
+  return issues.slice(0, MAX_ISSUES).map((issue: unknown) => {
+    const entry = record(issue);
+    const path = Array.isArray(entry.path)
+      ? entry.path.map((segment) => String(record(segment).key ?? segment)).join(".")
+      : "";
+    const code = typeof entry.code === "string" ? entry.code : "invalid";
+    return issueOf(path, code, entry.message, sensitive);
   });
-}
-
-function declaredFieldToolError(
-  fields: readonly string[],
-  message: string,
-  reason?: string,
-): ToolResult {
-  return toolError(`Invalid input: ${fields.join(", ")}: ${message}`, {
-    error: {
-      code: "invalid_input",
-      fields: [...fields],
-      message,
-      ...(reason === undefined ? {} : { reason }),
-    },
-  });
-}
-
-/** Guarded-pool-create `data.reason` enum, or null. Any other value stays on the server. */
-function guardedPoolCreateReasonOf(error: ORPCError<string, unknown>): string | null {
-  const data: unknown = error.data;
-  if (typeof data !== "object" || data === null || !Object.hasOwn(data, "reason")) return null;
-  const reason: unknown = Reflect.get(data, "reason");
-  return isGuardedPoolCreateFailureReason(reason) ? reason : null;
-}
-
-function ownData(error: ORPCError<string, unknown>, key: string): unknown {
-  const data: unknown = error.data;
-  if (typeof data !== "object" || data === null || !Object.hasOwn(data, key)) return undefined;
-  return Reflect.get(data, key);
-}
-
-function refusalNodeIds(value: unknown): string[] | null {
-  if (!Array.isArray(value)) return null;
-  const ids = value
-    .filter((id): id is string => typeof id === "string" && NODE_ID_SHAPE.test(id))
-    .slice(0, DEPLOYMENT_REFUSAL_MAX_NODES);
-  return ids.length === 0 ? null : ids;
-}
-
-function refusalSkippedNodes(
-  value: unknown,
-): { nodeId: string; reason: string; message: string }[] | null {
-  if (!Array.isArray(value)) return null;
-  const skipped: { nodeId: string; reason: string; message: string }[] = [];
-  for (const entry of value.slice(0, DEPLOYMENT_REFUSAL_MAX_NODES)) {
-    if (typeof entry !== "object" || entry === null) continue;
-    const nodeId: unknown = Reflect.get(entry, "nodeId");
-    const reason: unknown = Reflect.get(entry, "reason");
-    const message = sanitizeArgumentMessage(Reflect.get(entry, "message"));
-    if (typeof nodeId !== "string" || !NODE_ID_SHAPE.test(nodeId)) continue;
-    if (!isDeploymentRefusalReason(reason) || message === null) continue;
-    skipped.push({ nodeId, reason, message });
-  }
-  return skipped.length === 0 ? null : skipped;
 }
 
 /**
- * A deployment planning refusal (#15): its fixed message, reason, node ids
- * and, when the planner picked nodes itself, the skipped nodes with their
- * reasons. Null when the error is not one.
+ * An error as a tool result. A refusal keeps its fixed message and reason; for a sensitive
+ * tool even that message is replaced by the reason (a procedure message must never be able
+ * to carry a secret back). Everything else gets a static message.
  */
-function deploymentRefusalToolError(
-  error: ORPCError<string, unknown>,
-  stable: string,
-  knownKeys: ReadonlySet<string>,
-): ToolResult | null {
-  if (!DEPLOYMENT_REFUSAL_CODES.has(error.code)) return null;
-  const reason = ownData(error, "reason");
-  if (!isDeploymentRefusalReason(reason)) return null;
-  const message = sanitizeArgumentMessage(error.message, DEPLOYMENT_REFUSAL_MESSAGE_MAX_LENGTH);
-  const fields = sanitizeDeclaredFields(error.data, knownKeys);
-  const nodeIds = refusalNodeIds(ownData(error, "nodeIds"));
-  const skippedNodes = refusalSkippedNodes(ownData(error, "skippedNodes"));
-  return toolError(`${stable}: ${message ?? reason}`, {
-    error: {
-      code: error.code === "BAD_REQUEST" ? "invalid_input" : error.code,
-      reason,
-      ...(message === null ? {} : { message }),
-      ...(fields === null ? {} : { fields }),
-      ...(nodeIds === null ? {} : { nodeIds }),
-      ...(skippedNodes === null ? {} : { skippedNodes }),
-    },
-  });
-}
-
-function declaredInputKeys(descriptor: McpToolDescriptor): ReadonlySet<string> {
-  let keys = declaredKeysCache.get(descriptor);
-  if (keys === undefined) {
-    keys = collectSchemaPropertyNames(
-      descriptor.inputSchema["~standard"].jsonSchema.input({ target: "draft-2020-12" }),
-    );
-    declaredKeysCache.set(descriptor, keys);
-  }
-  return keys;
-}
-
-function mapToolError(
+function mapError(
   error: unknown,
-  descriptor: McpToolDescriptor,
   requestId: string,
-  callerInput: unknown,
+  toolName: string,
+  sensitive: boolean,
 ): ToolResult {
+  if (error instanceof McpToolAbortedError) {
+    return toolError("Request cancelled.", { error: { code: "REQUEST_ABORTED" } });
+  }
   if (error instanceof ORPCError) {
-    if (Object.hasOwn(ORPC_ERROR_MESSAGES, error.code)) {
-      const stable = ORPC_ERROR_MESSAGES[error.code];
-      if (stable !== undefined) {
-        const refusal = DEPLOYMENT_PLAN_TOOLS.has(descriptor.name)
-          ? deploymentRefusalToolError(error, stable, declaredInputKeys(descriptor))
+    const data = record(error.data);
+    const reason = data.reason;
+    if (typeof reason === "string" && REFUSAL_REASON_SHAPE.test(reason)) {
+      const subjectId =
+        typeof data.subjectId === "string" && SUBJECT_ID_SHAPE.test(data.subjectId)
+          ? data.subjectId
           : null;
-        if (refusal !== null) return refusal;
-        if (error.code === "BAD_REQUEST") {
-          // #117 / #200: name the failing field(s). Sanitized issues never
-          // carry input values. A procedure rejection whose input was
-          // schema-valid still names the key via data.fields.
-          const knownKeys = declaredInputKeys(descriptor);
-          const issues = sanitizeValidationIssues(error.data, knownKeys, callerInput);
-          if (issues !== null) return validationToolError("invalid_input", issues);
-          const fields = sanitizeDeclaredFields(error.data, knownKeys);
-          if (fields !== null) {
-            return declaredFieldToolError(
-              fields,
-              sanitizeArgumentMessage(error.message) ?? "Invalid value",
-              guardedPoolCreateReasonOf(error) ?? undefined,
-            );
-          }
-          const argumentReason = guardedPoolCreateReasonOf(error);
-          if (argumentReason !== null)
-            return toolError(stable, { error: { code: "invalid_input", reason: argumentReason } });
-        }
-        const reason = deletionConflictReasonOf(error);
-        if (reason !== null) {
-          return toolError(`${stable}: ${reason}`, { error: { code: error.code, reason } });
-        }
-        return toolError(stable, { error: { code: error.code } });
-      }
+      const message = sensitive ? `Refused: ${reason}.` : sanitizeMessage(error.message);
+      return toolError(message, { error: { code: error.code, reason, subjectId, message } });
+    }
+    if (error.code === "BAD_REQUEST") {
+      const issues = orpcValidationIssues(error, sensitive);
+      if (issues) return validationError(issues);
+    }
+    if (Object.hasOwn(STATIC_MESSAGES, error.code)) {
+      // Procedure messages are developer-written (they may name ids, never secrets): an agent
+      // needs "an always-on runtime is not started", not a bare "Invalid input".
+      const own = sensitive ? "" : sanitizeMessage(error.message).trim();
+      const message = own || (STATIC_MESSAGES[error.code] ?? "Internal error");
+      return toolError(message, {
+        error: { code: error.code, ...(own ? { message: own } : {}) },
+      });
     }
   }
   mcpSanitizedLog(
-    `tool invocation failed (${error instanceof Error ? error.constructor.name : typeof error})`,
-    { toolName: descriptor.name, requestId },
+    `tool call failed (${error instanceof Error ? error.constructor.name : typeof error})`,
+    { toolName, requestId },
   );
-  return internalToolError(requestId);
+  return toolError("Internal error", { error: { code: "INTERNAL_ERROR" }, requestId });
+}
+
+async function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  void promise.catch(() => undefined);
+  if (signal.aborted) throw new McpToolAbortedError();
+  let onAbort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        onAbort = () => reject(new McpToolAbortedError());
+        signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+function serializeResult(output: unknown): ToolResult | null {
+  const safe = toJsonSafe(redactSecrets(output));
+  const text = JSON.stringify(safe);
+  if (text === undefined) return { content: [{ type: "text", text: "null" }] };
+  const result: ToolResult = {
+    content: [{ type: "text", text }],
+    structuredContent: { result: safe },
+  };
+  return new TextEncoder().encode(JSON.stringify(result)).length > OUTPUT_BUDGET_BYTES
+    ? null
+    : result;
+}
+
+// ── one call ──
+
+/** Whether a tool's input must never be logged, audited or echoed. */
+export function toolInputIsSensitive(contract: McpToolContract): boolean {
+  return (
+    contract.sensitiveInput === true ||
+    contract.procedures.some((path) => SENSITIVE_INPUT_PROCEDURES.has(path))
+  );
+}
+
+/** Runs one tool call through the wrapper chain (see the module docblock). */
+export async function runMcpTool(
+  contract: McpToolContract,
+  state: {
+    dispatch: McpToolDispatch | undefined;
+    args: unknown;
+    invoke?: ProcedureInvoker;
+  },
+): Promise<ToolResult> {
+  const { dispatch } = state;
+  if (dispatch === undefined) {
+    mcpSanitizedLog("tool dispatch rejected: no verified context", { toolName: contract.name });
+    return toolError("Internal error", { error: { code: "INTERNAL_ERROR" } });
+  }
+  const { requestId, credential } = dispatch;
+  if (!mcpToolAllowed(contract.name, credential.level)) return unknownToolError(contract.name);
+
+  const sensitive = toolInputIsSensitive(contract);
+  const parsed = contract.input.safeParse(state.args ?? {});
+  if (!parsed.success) return validationError(validationIssues(parsed.error, sensitive));
+  const input = record(parsed.data);
+
+  const retryAfterSeconds = await consumeRateLimit(contract, credential, input);
+  if (retryAfterSeconds !== null)
+    return toolError("Too many requests for this tool; try again shortly.", {
+      error: { code: "TOO_MANY_REQUESTS", retryAfterSeconds },
+    });
+
+  const calls = routeToolCall(contract.name, input);
+  if (calls.length === 0 && contract.procedures.length === 1)
+    calls.push({ path: contract.procedures[0] ?? "", input });
+  if (calls.length === 0 || calls.some((entry) => !contract.procedures.includes(entry.path))) {
+    mcpSanitizedLog("tool dispatch rejected: no procedure route", {
+      toolName: contract.name,
+      requestId,
+    });
+    return toolError("Internal error", { error: { code: "INTERNAL_ERROR" }, requestId });
+  }
+
+  const tracked = trackCall(credential, dispatch.signal, !READ_TOOL_NAMES.has(contract.name));
+  const invoke = state.invoke ?? invokeBoundProcedure;
+  try {
+    const outputs: unknown[] = [];
+    for (const entry of calls) {
+      if (tracked.signal.aborted) throw new McpToolAbortedError();
+      outputs.push(
+        await raceAbort(
+          runWithDbAbortFence(tracked.signal, () =>
+            invoke(entry.path, entry.input, dispatch.orpcContext, tracked.signal),
+          ),
+          tracked.signal,
+        ),
+      );
+    }
+    if (tracked.signal.aborted) throw new McpToolAbortedError();
+    const result = serializeResult(combineOutputs(contract.name, calls, outputs));
+    if (result === null) {
+      mcpSanitizedLog("tool output exceeded the size cap", { toolName: contract.name, requestId });
+      return toolError("Tool output exceeded the maximum size.", {
+        error: { code: "OUTPUT_TOO_LARGE", maxBytes: MCP_TOOL_OUTPUT_MAX_BYTES },
+      });
+    }
+    return result;
+  } catch (error) {
+    return mapError(error, requestId, contract.name, sensitive);
+  } finally {
+    tracked.done();
+  }
 }

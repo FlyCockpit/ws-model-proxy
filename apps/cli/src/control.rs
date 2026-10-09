@@ -27,10 +27,9 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
 const CONTROL_MAX_REQUEST_BYTES: usize = 4096;
-/// Status includes one row per locally configured endpoint, so it needs a
-/// materially larger bound than the tiny command request. Keep this finite to
-/// prevent a compromised local daemon from making the CLI allocate without
-/// limit.
+/// Status gains runtime and instance rows (C2), so it keeps a materially
+/// larger bound than the tiny command request. Keep this finite to prevent a
+/// compromised local daemon from making the CLI allocate without limit.
 #[cfg(unix)]
 const CONTROL_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 #[cfg(unix)]
@@ -41,8 +40,13 @@ const CONTROL_MAX_CLIENTS: usize = 32;
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlCommand {
-    Reload,
     Status,
+    /// Re-read `config.json` and the node secrets now (lower-only for trust).
+    Reload,
+    /// `wsmp trust relay`: lower now (persisted, frozen, reported).
+    TrustRelay,
+    /// `wsmp trust full`: raise, after the peer check (never from the job tree).
+    TrustFull,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -57,45 +61,21 @@ pub struct ControlResponse<'a> {
     pub state: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoints: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inventory_seq: Option<u64>,
     /// Live websocket state reported by the daemon, never inferred from a PID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection: Option<&'a str>,
-    /// Digest of the daemon's desired local inventory snapshot. This is
-    /// intentionally separate from the server acknowledgement below.
+    /// This node's slug.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub desired_inventory_digest: Option<String>,
-    /// Last modification timestamp of the desired config file, as Unix epoch
-    /// milliseconds so the JSON schema is stable without locale formatting.
+    pub node: Option<&'a str>,
+    /// The node's effective trust (`full` or `relay`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub config_modified_at_ms: Option<u64>,
-    /// Desired local endpoint/probe state from the daemon's active config.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub desired_endpoints: Option<Vec<ControlEndpointStatus<'a>>>,
-    /// Server-authoritative acknowledgement fields. They are absent until hello
-    /// or an inventory update has been durably accepted by the server.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inventory_digest: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inventory_acknowledged_at: Option<&'a str>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ControlEndpointStatus<'a> {
-    pub slug: &'a str,
-    pub enabled: bool,
-    pub local_probe: &'a str,
-    pub model_count: usize,
-    pub published: &'a str,
+    pub trust: Option<&'a str>,
 }
 
 #[cfg(unix)]
 struct ControlClient {
     stream: UnixStream,
+    peer_pid: Option<i32>,
     buffer: Vec<u8>,
     deadline: Instant,
 }
@@ -110,6 +90,8 @@ pub struct ControlServer {
 #[cfg(unix)]
 pub struct PendingRequest {
     pub request: ControlRequest,
+    /// The peer's process id where the platform reports it.
+    pub peer_pid: Option<i32>,
     stream: UnixStream,
 }
 
@@ -166,8 +148,10 @@ impl ControlServer {
                         tracing::warn!(error = %error, "rejecting unauthenticated relay control peer");
                     } else {
                         stream.set_nonblocking(true)?;
+                        let peer_pid = peer_pid(&stream);
                         self.clients.push(ControlClient {
                             stream,
+                            peer_pid,
                             buffer: Vec::new(),
                             deadline: Instant::now() + CONTROL_READ_DEADLINE,
                         });
@@ -215,11 +199,40 @@ impl ControlServer {
                 Ok(stream) => stream,
                 Err(_) => return false,
             };
-            requests.push(PendingRequest { request, stream });
+            requests.push(PendingRequest {
+                request,
+                peer_pid: client.peer_pid,
+                stream,
+            });
             false
         });
         Ok(requests)
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_pid(stream: &UnixStream) -> Option<i32> {
+    getsockopt(stream, sockopt::PeerCredentials)
+        .ok()
+        .map(|peer| peer.pid())
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn peer_pid(stream: &UnixStream) -> Option<i32> {
+    getsockopt(stream, sockopt::LocalPeerPid).ok()
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn peer_pid(_stream: &UnixStream) -> Option<i32> {
+    None
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -276,14 +289,9 @@ fn respond_busy(mut stream: UnixStream) -> Result<()> {
             ok: false,
             state: "busy",
             message: Some("relay control plane is busy; retry shortly"),
-            endpoints: None,
-            inventory_seq: None,
             connection: None,
-            desired_inventory_digest: None,
-            config_modified_at_ms: None,
-            desired_endpoints: None,
-            inventory_digest: None,
-            inventory_acknowledged_at: None,
+            node: None,
+            trust: None,
         },
     )?;
     stream.write_all(b"\n")?;
@@ -311,14 +319,44 @@ pub fn respond(mut pending: PendingRequest, response: &ControlResponse<'_>) -> R
     pending.stream.shutdown(Shutdown::Both)?;
     Ok(())
 }
+/// Send `command` to the running relay; `None` when no relay runs here.
+#[cfg(unix)]
+pub fn request_if_running(command: ControlCommand) -> Result<Option<serde_json::Value>> {
+    let path = crate::paths::state_dir()?.join("relay-control.sock");
+    match UnixStream::connect(&path) {
+        Ok(stream) => exchange(stream, command).map(Some),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("connecting to relay control socket `{}`", path.display())),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn request_if_running(_command: ControlCommand) -> Result<Option<serde_json::Value>> {
+    Ok(None)
+}
+
 #[cfg(unix)]
 pub fn request(command: ControlCommand) -> Result<serde_json::Value> {
     let path = crate::paths::state_dir()?.join("relay-control.sock");
-    let mut stream = UnixStream::connect(&path)
+    let stream = UnixStream::connect(&path)
         .with_context(|| format!("connecting to relay control socket `{}`", path.display()))?;
+    exchange(stream, command)
+}
+
+#[cfg(unix)]
+fn exchange(mut stream: UnixStream, command: ControlCommand) -> Result<serde_json::Value> {
     let read_timeout = match command {
-        ControlCommand::Reload => Duration::from_secs(5 * 60),
-        ControlCommand::Status => Duration::from_secs(5),
+        ControlCommand::Status | ControlCommand::Reload => Duration::from_secs(5),
+        // Lowering kills commands and writes files before it answers.
+        ControlCommand::TrustRelay | ControlCommand::TrustFull => Duration::from_secs(30),
     };
     stream.set_read_timeout(Some(read_timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -374,32 +412,20 @@ mod tests {
     }
 
     #[test]
-    fn response_limit_allows_a_multi_endpoint_status_payload() {
-        let endpoints = (0..128)
-            .map(|index| ControlEndpointStatus {
-                slug: "endpoint-with-a-deliberately-long-name",
-                enabled: true,
-                local_probe: "online",
-                model_count: index,
-                published: "current",
-            })
-            .collect();
-        let digest = "b".repeat(64);
+    fn status_response_uses_camel_case_and_skips_absent_fields() {
         let response = ControlResponse {
             ok: true,
-            state: "connected",
+            state: "running",
             message: None,
-            endpoints: Some(128),
-            inventory_seq: Some(42),
             connection: Some("connected"),
-            desired_inventory_digest: Some("a".repeat(64)),
-            config_modified_at_ms: Some(1),
-            desired_endpoints: Some(endpoints),
-            inventory_digest: Some(&digest),
-            inventory_acknowledged_at: Some("2026-08-05T00:00:00Z"),
+            node: Some("spark-1"),
+            trust: Some("full"),
         };
-        let serialized = serde_json::to_vec(&response).expect("serialize status response");
-        assert!(serialized.len() > CONTROL_MAX_REQUEST_BYTES);
+        let serialized = serde_json::to_string(&response).expect("serialize status response");
+        assert_eq!(
+            serialized,
+            r#"{"ok":true,"state":"running","connection":"connected","node":"spark-1","trust":"full"}"#
+        );
         assert!(serialized.len() <= CONTROL_MAX_RESPONSE_BYTES);
     }
 }

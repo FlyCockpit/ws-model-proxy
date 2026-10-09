@@ -15,8 +15,8 @@ export const LOCAL_RELAY_ATTEMPT_MAX_IN_FLIGHT_MS = MODEL_API_RELAY_TIMEOUT_MS +
  * Liveness of locally owned relay attempts.
  *
  * Predicate (the only thing that keeps an attempt row ACTIVE):
- *   an ACTIVE relay_execution_attempt row owned by this process epoch is
- *   heartbeated iff its attemptId is in `inFlightLocalAttempts` and was
+ *   an ACTIVE LOCAL `attempt` row owned by this process epoch is
+ *   heartbeated iff its id is in `inFlightLocalAttempts` and was
  *   registered less than LOCAL_RELAY_ATTEMPT_MAX_IN_FLIGHT_MS ago.
  *
  * An entry is registered before its ATTEMPT_STARTED row is written and leaves
@@ -125,9 +125,10 @@ export async function heartbeatOwnedLocalRelayAttempts(nowMs: number = Date.now(
   if (attemptIds.length === 0) return { count: 0 };
   return prisma.$transaction(async (tx) => {
     const now = await databaseNow(tx);
-    return tx.relayExecutionAttempt.updateMany({
+    return tx.attempt.updateMany({
       where: {
-        attemptId: { in: attemptIds },
+        id: { in: attemptIds },
+        kind: "LOCAL",
         ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
         state: "ACTIVE",
       },
@@ -148,90 +149,73 @@ export async function reconcileStaleLocalRelayTelemetry({
 } = {}) {
   const now = await databaseNow(prisma);
   const held = heldLocalAttempts(nowMs);
-  const candidates = await prisma.relayExecutionAttempt.findMany({
+  // Cloud attempts are not repaired here: their liability settles with the spend ledger
+  // (provider-budget repair owns them).
+  const candidates = await prisma.attempt.findMany({
     where: {
+      kind: "LOCAL",
       state: "ACTIVE",
       expiresAt: { lte: now },
       OR: [
         { ownerEpoch: { not: LOCAL_RELAY_PROCESS_EPOCH } },
         // Own attempts this process no longer holds (finalization never
         // committed before the in-flight deadline): repaired like a crash.
-        { ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH, attemptId: { notIn: held.attemptIds } },
+        { ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH, id: { notIn: held.attemptIds } },
       ],
     },
+    select: { id: true, userId: true, requestId: true, ownerEpoch: true, purpose: true },
     orderBy: { expiresAt: "asc" },
     take: limit,
   });
   let recovered = 0;
   for (const attempt of candidates) {
-    if (
-      attempt.ownerEpoch === LOCAL_RELAY_PROCESS_EPOCH &&
-      held.attemptIds.includes(attempt.attemptId)
-    )
+    if (attempt.ownerEpoch === LOCAL_RELAY_PROCESS_EPOCH && held.attemptIds.includes(attempt.id))
       continue;
     recovered += await prisma.$transaction(async (tx) => {
       const claimTime = await databaseNow(tx);
-      const claimed = await tx.relayExecutionAttempt.updateMany({
+      const claimed = await tx.attempt.updateMany({
         where: {
-          attemptId: attempt.attemptId,
+          id: attempt.id,
           ownerEpoch: attempt.ownerEpoch,
           state: "ACTIVE",
           expiresAt: { lte: claimTime },
         },
         data: {
           ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
-          state: "FAILED",
+          state: "EXPIRED",
           terminalAt: claimTime,
-          terminalState: "FAILED",
-          requestBytes: attempt.requestBytes ?? 0n,
-          responseBytes: attempt.responseBytes ?? 0n,
+          terminalReason: "crash_recovered",
+          errorClass: "crash_recovered",
         },
       });
       if (claimed.count === 0) return 0;
-      await tx.relayExecutionEvent.createMany({
-        data: [
-          {
-            userId: attempt.userId,
-            relayRequestId: attempt.relayRequestId,
-            attemptId: attempt.attemptId,
-            eventType: "CRASH_RECOVERED",
-            attemptKind: attempt.attemptKind,
-            requestedSurface: attempt.requestedSurface,
-            nativeSurface: attempt.nativeSurface,
-            adapterMode: attempt.adapterMode,
-            adapterVersion: attempt.adapterVersion,
-            poolId: attempt.poolId,
-            poolMemberId: attempt.poolMemberId,
-            executionTargetId: attempt.executionTargetId,
-            memberTier: attempt.memberTier,
-            terminalState: "FAILED",
-            errorClass: "crash_recovered",
-          },
-        ],
-        skipDuplicates: true,
+      const last = await tx.attemptEvent.findFirst({
+        where: { attemptId: attempt.id },
+        orderBy: { sequence: "desc" },
+        select: { sequence: true },
       });
-      if (attempt.attemptKind === "CONTEXT_COUNT") {
-        await tx.relayRequest.update({
-          where: { id: attempt.relayRequestId },
-          data: { auxiliaryAttemptCount: { increment: 1 } },
-        });
-      } else if (!held.relayRequestIds.has(attempt.relayRequestId)) {
-        // A request that still has a held attempt in this process is being
-        // finalized by that attempt; repair only closes the leaked attempt.
-        // Status-guarded terminal transition; the rollup increment is written
-        // in this same transaction only when this repair performed it, so a
-        // normal completion that already won is never counted twice.
+      await tx.attemptEvent.create({
+        data: {
+          userId: attempt.userId,
+          attemptId: attempt.id,
+          requestId: attempt.requestId,
+          sequence: (last?.sequence ?? 0) + 1,
+          eventType: "repair",
+          reason: "crash_recovered",
+        },
+      });
+      // A count or probe attempt never decides its request's outcome, and a request that
+      // still has a held attempt in this process is being finalized by that attempt: repair
+      // only closes the leaked attempt. Otherwise a status-guarded terminal transition; the
+      // rollup increment is written in this same transaction only when this repair performed
+      // it, so a normal completion that already won is never counted twice.
+      if (attempt.purpose === "EXECUTION" && !held.relayRequestIds.has(attempt.requestId)) {
         const transitioned = await tx.relayRequest.updateMany({
-          where: { id: attempt.relayRequestId, status: "PENDING" },
-          data: {
-            status: "FAILED",
-            completedAt: claimTime,
-            errorClass: "crash_recovered",
-            admissionTerminalState: "CRASH_RECOVERED",
-          },
+          where: { id: attempt.requestId, status: "PENDING" },
+          data: { status: "FAILED", completedAt: claimTime, errorClass: "crash_recovered" },
         });
         if (transitioned.count === 1)
-          await recordRollupsForTransitionedRequests(tx, [attempt.relayRequestId], claimTime);
+          await recordRollupsForTransitionedRequests(tx, [attempt.requestId], claimTime);
       }
       return 1;
     });

@@ -1,4 +1,3 @@
-import { REQUEST_JSON_DEPTH_ERROR, requestJsonDepthExceeded } from "./request-json-depth.js";
 /**
  * User-bound diagnostic cores shared by Hono and MCP. Member probes use
  * production pool routing, original physical capacity, final send permission
@@ -7,12 +6,11 @@ import { REQUEST_JSON_DEPTH_ERROR, requestJsonDepthExceeded } from "./request-js
  * Synthetic requests and responses are never persisted as content.
  */
 
-import { markPoolMemberRelaySuccess } from "@ws-model-proxy/api/lib/model-pool-routing";
 import {
-  resolveEffectiveCapabilityMetadata,
+  openAiCapabilitiesFromCoarse,
   supportsChatCompletions,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
-import prisma, { Prisma } from "@ws-model-proxy/db";
+import prisma from "@ws-model-proxy/db";
 import { type RelaySessionManager, relaySessionManager } from "../relay/session-manager.js";
 import { PostgresCapacityAdmissionStore } from "./capacity/postgres-store.js";
 import { withCapacityRequestScope } from "./capacity/request-scope.js";
@@ -20,11 +18,11 @@ import {
   type CapacityAdmissionRuntime,
   StoreCapacityAdmissionRuntime,
 } from "./capacity/runtime.js";
-import { splitModelVariant } from "./external-route.js";
 import { type ModelApiConcurrencyLimiter, modelApiConcurrencyLimiter } from "./limits.js";
 import { extractAssistantTextFromChatCompletion, readResponseUtf8 } from "./media-transform.js";
 import { PROBE_MAX_TOKENS, probeReasoningFields } from "./probe-settings.js";
-import { chatTestCompletionsHandler, poolMemberDiagnosticHandler } from "./routes.js";
+import { poolRoutes } from "./resolve.js";
+import { poolMemberDiagnosticHandler } from "./routes.js";
 
 const TEST_TIMEOUT_MS = 20_000;
 const EXPECTED_PROBE_WORD = /\bpong\b/i;
@@ -112,7 +110,7 @@ function classifyEmbeddingProbeReply(status: number, raw: string): ChatProbeRepl
 
 type DiagnosticsManager = Pick<
   RelaySessionManager,
-  | "getActiveCliDeviceIds"
+  | "getOnlineNodeIds"
   | "registerRelayResponseHandlers"
   | "sendRelayRequest"
   | "cancelRelayRequest"
@@ -166,41 +164,6 @@ export type PoolMemberTestResult =
   | { outcome: "probe-failed"; status: number; latencyMs: number; reason: string }
   | { outcome: "probe-error"; latencyMs: number; reason: string };
 
-/** One relay-capable model view (shared by both resolution arms below). */
-const poolMemberModelSelect = {
-  id: true,
-  published: true,
-  upstreamModelId: true,
-  capabilityOverrideMode: true,
-  capabilityOverrides: true,
-  capabilityOverrideMetadata: true,
-  Endpoint: {
-    select: {
-      published: true,
-      slug: true,
-      cliDeviceId: true,
-      capabilityMetadata: true,
-      defaultCapabilities: true,
-      CliDevice: { select: { status: true } },
-    },
-  },
-} satisfies Prisma.DiscoveredModelSelect;
-
-/** EXACT select from the original Hono route (ownership + capability views). */
-const poolMemberTestSelect = {
-  id: true,
-  poolId: true,
-  ModelPool: { select: { userId: true } },
-  ExecutionTarget: {
-    select: {
-      DiscoveredModel: { select: poolMemberModelSelect },
-    },
-  },
-  DiscoveredModel: { select: poolMemberModelSelect },
-} satisfies Prisma.PoolMemberSelect;
-
-type PoolMemberTestRow = Prisma.PoolMemberGetPayload<{ select: typeof poolMemberTestSelect }>;
-
 /**
  * Run the chat-completions probe against one pool member, owned by `userId`.
  * The `tokenId` used for the global concurrency lease is the SAME stable
@@ -232,9 +195,9 @@ async function poolMemberTest({
    */
   signal?: AbortSignal;
 } & DiagnosticCoreDependencies): Promise<PoolMemberTestResult> {
-  const member: PoolMemberTestRow | null = await prisma.poolMember.findUnique({
+  const member = await prisma.poolMember.findUnique({
     where: { id: memberId },
-    select: poolMemberTestSelect,
+    select: { id: true, poolId: true, kind: true, Pool: { select: { userId: true } } },
   });
   // G1: post-lookup cancellation check. The ownership lookup is the core's
   // first await — a caller (or the shutdown gate) that aborted while it was
@@ -244,31 +207,31 @@ async function poolMemberTest({
   if (signal?.aborted) {
     return { outcome: "probe-error", latencyMs: 0, reason: "Member test was cancelled." };
   }
-  if (!member || member.ModelPool.userId !== userId) {
+  if (!member || member.Pool.userId !== userId) {
     return { outcome: "not-found" };
   }
-  const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
+  // A LOCAL member is probed through its pool's routes (one per instance serving it).
+  const routes =
+    member.kind === "LOCAL"
+      ? (await poolRoutes(member.poolId)).filter((route) => route.member.id === member.id)
+      : [];
+  const model = routes[0]?.model;
   if (!model) {
     return { outcome: "not-relay-capable" };
   }
-  if (!model.published || !model.Endpoint.published) {
-    return { outcome: "unpublished" };
-  }
-  const effectiveCapabilities = resolveEffectiveCapabilityMetadata({
-    capabilityOverrideMode: model.capabilityOverrideMode,
-    capabilityOverrideMetadata: model.capabilityOverrideMetadata,
-    endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
-  });
+  const effectiveCapabilities = openAiCapabilitiesFromCoarse(model.capabilities);
   const supportsChat = supportsChatCompletions({
     capabilities: effectiveCapabilities,
-    coarse:
-      model.capabilityOverrideMode === "OVERRIDE"
-        ? model.capabilityOverrides
-        : model.Endpoint.defaultCapabilities,
+    coarse: model.capabilities,
   });
-  const embeddings = !supportsChat && effectiveCapabilities?.embeddings?.supported === true;
+  const embeddings = !supportsChat && effectiveCapabilities.embeddings?.supported === true;
   if (!supportsChat && !embeddings) return { outcome: "not-chat-capable" };
-  if (!manager.getActiveCliDeviceIds().includes(model.Endpoint.cliDeviceId)) {
+  const online = new Set(manager.getOnlineNodeIds());
+  if (
+    !routes.some(
+      (route) => route.instance.ready && route.instance.nodeId && online.has(route.instance.nodeId),
+    )
+  ) {
     return { outcome: "cli-disconnected" };
   }
 
@@ -326,7 +289,7 @@ async function poolMemberTest({
         reason: "Member did not return a valid diagnostic response.",
       };
     }
-    await markPoolMemberRelaySuccess(member.id, { trialStartedAt: null });
+    // Target health was already settled by the relay path that served the probe.
     return {
       outcome: "ok",
       status,
@@ -353,196 +316,5 @@ async function poolMemberTest({
   }
 }
 
-// ---------------------------------------------------------------------------
-// Chat completion diagnostic core
-// ---------------------------------------------------------------------------
-
-/** Bounded, provider-safe assistant excerpt length for diagnostic summaries. */
-export const CHAT_DIAGNOSTIC_MAX_TEXT_CHARS = 2_000;
-
-/** Cap on the raw upstream body the diagnostic will read before projecting. */
-const CHAT_DIAGNOSTIC_MAX_BODY_BYTES = 256 * 1024;
-
-/** Typed, JSON-safe outcome of a chat completion diagnostic (never the raw body). */
-export type ChatCompletionDiagnosticResult =
-  | {
-      outcome: "ok";
-      status: number;
-      model: string | null;
-      finishReason: string | null;
-      assistantText: string | null;
-      usage: { promptTokens: number | null; completionTokens: number | null } | null;
-    }
-  | { outcome: "upstream-rejected"; status: number; errorType: string | null }
-  | { outcome: "invalid-request"; reason: string }
-  | { outcome: "unparseable-response"; status: number }
-  | { outcome: "no-completion"; status: number }
-  | { outcome: "error" };
-
-interface ChatCompletionDiagnosticInput {
-  /** OpenAI-compatible chat completion request body (model, messages, ...). */
-  body: Record<string, unknown>;
-}
-
-/**
- * Run one chat completion through the production chat-test core
- * (`chatTestCompletionsHandler`) as `userId`, through the SINGLETON relay
- * manager, concurrency limiter, and the SHARED diagnostics capacity runtime.
- *
- * `stream` is forced to `false`: the diagnostic must terminate with one JSON
- * body (the MCP transport is JSON-response-mode only; an SSE completion would
- * be dropped mid-stream).
- *
- * The upstream body is read ONLY to project the bounded summary below — the
- * raw provider response, headers, and error messages never leave this
- * function. Upstream failures surface as the provider's OpenAI error
- * `type`/status (stable enums), never the provider's message text.
- */
-export function runChatCompletionDiagnostic(
-  input: Parameters<typeof chatCompletionDiagnostic>[0],
-): Promise<ChatCompletionDiagnosticResult> {
-  // F2-CAP-6: the diagnostic reads (or cancels) the whole response before it
-  // returns, so any capacity lease owner still alive at return was leaked.
-  return withCapacityRequestScope(() => chatCompletionDiagnostic(input));
-}
-
-async function chatCompletionDiagnostic({
-  userId,
-  body,
-  signal,
-  manager = relaySessionManager,
-  concurrencyLimiter = modelApiConcurrencyLimiter,
-  capacityRuntime,
-}: {
-  userId: string;
-  /**
-   * Caller-owned cancellation (G1): threaded into the synthetic Request so
-   * the production chat-test core (which dispatches on `request.signal`)
-   * tears the relay attempt down on client abort / shutdown.
-   */
-  signal?: AbortSignal;
-} & DiagnosticCoreDependencies &
-  ChatCompletionDiagnosticInput): Promise<ChatCompletionDiagnosticResult> {
-  // C2: MCP has no external-consent channel in v1. The chat core rejects the
-  // variant too (MCP source); this keeps the diagnostic's reason explicit.
-  if (typeof body.model === "string" && splitModelVariant(body.model).variant !== null)
-    return {
-      outcome: "invalid-request",
-      reason: "model variants such as :external are not available to MCP diagnostics",
-    };
-  if (requestJsonDepthExceeded(body))
-    return { outcome: "invalid-request", reason: REQUEST_JSON_DEPTH_ERROR };
-  const headers = new Headers({ "content-type": "application/json" });
-  const request = new Request("http://diagnostic.internal/v1/chat/completions", {
-    method: "POST",
-    headers,
-    body: new TextEncoder().encode(JSON.stringify({ ...body, stream: false })),
-    signal,
-  });
-  const response = await chatTestCompletionsHandler({
-    request,
-    userId,
-    manager,
-    limiter: concurrencyLimiter,
-    capacityRuntime: capacityRuntime ?? diagnosticsCapacityRuntime(),
-    source: "MCP",
-  });
-
-  if (response.status === 400) {
-    // G7: an upstream 400 is NOT necessarily local validation — a relayed
-    // upstream rejection can carry a CAPACITY LEASE whose release requires
-    // the response body reaching EOF, being cancelled, or the signal
-    // aborting (holdCapacityLeaseForResponse). Consume/cancel the body on
-    // this exit (and let the signal abort do the same) so the lease never
-    // leaks with a heartbeat running. For the core's OWN app-authored 400
-    // the cancel is a no-op on an already-terminal small body.
-    await response.body?.cancel().catch(() => undefined);
-    // The core's own request validation failure (missing model, malformed
-    // body). Its error body is app-authored, but stay structural: a stable
-    // reason is derived from whether a model field was present at all.
-    return { outcome: "invalid-request", reason: "chat completion request rejected" };
-  }
-
-  const raw = await readResponseUtf8(response.body, {
-    maxBytes: CHAT_DIAGNOSTIC_MAX_BODY_BYTES,
-  });
-  let parsed: unknown = null;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    parsed = null;
-  }
-  if (parsed === null || typeof parsed !== "object") {
-    return { outcome: "unparseable-response", status: response.status };
-  }
-  if (!response.ok) {
-    const errorType = readErrorType(parsed);
-    return { outcome: "upstream-rejected", status: response.status, errorType };
-  }
-  const completion = parsed as {
-    model?: unknown;
-    choices?: unknown;
-    usage?: { prompt_tokens?: unknown; completion_tokens?: unknown };
-  };
-  const assistantText = extractAssistantTextFromChatCompletion(completion);
-  if (assistantText === null) {
-    return { outcome: "no-completion", status: response.status };
-  }
-  const firstChoice = Array.isArray(completion.choices)
-    ? (completion.choices[0] as { finish_reason?: unknown } | undefined)
-    : undefined;
-  return {
-    outcome: "ok",
-    status: response.status,
-    model: typeof completion.model === "string" ? completion.model : null,
-    finishReason: typeof firstChoice?.finish_reason === "string" ? firstChoice.finish_reason : null,
-    assistantText: assistantText.slice(0, CHAT_DIAGNOSTIC_MAX_TEXT_CHARS),
-    usage:
-      completion.usage && typeof completion.usage === "object"
-        ? {
-            promptTokens: numberOrNull(completion.usage.prompt_tokens),
-            completionTokens: numberOrNull(completion.usage.completion_tokens),
-          }
-        : null,
-  };
-}
-
-function numberOrNull(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-/**
- * Provider error `type` values treated as stable enums (G2). Anything a
- * provider sends that is NOT in this set is mapped to the generic
- * `provider_error` kind — an arbitrary upstream string (which could carry
- * provider-internal detail) never crosses the diagnostic boundary as-is.
- */
-const KNOWN_PROVIDER_ERROR_TYPES: ReadonlySet<string> = new Set([
-  "invalid_request_error",
-  "authentication_error",
-  "permission_error",
-  "not_found_error",
-  "rate_limit_error",
-  "rate_limit_exceeded",
-  "insufficient_quota",
-  "server_error",
-  "api_error",
-  "overloaded_error",
-  "context_length_exceeded",
-  "request_too_large",
-]);
-
-/** Generic stable kind substituted for unknown provider error types (G2). */
+/** Stable kind the model test reports for a provider error type that is not a stable code (G2). */
 export const GENERIC_PROVIDER_ERROR_TYPE = "provider_error";
-
-/** OpenAI-style `error.type` from a non-2xx body (allowlisted enum only). */
-function readErrorType(parsed: object): string | null {
-  const error = (parsed as { error?: unknown }).error;
-  if (error !== null && typeof error === "object" && error !== undefined) {
-    const type = (error as { type?: unknown }).type;
-    if (typeof type === "string") {
-      return KNOWN_PROVIDER_ERROR_TYPES.has(type) ? type : GENERIC_PROVIDER_ERROR_TYPE;
-    }
-  }
-  return null;
-}

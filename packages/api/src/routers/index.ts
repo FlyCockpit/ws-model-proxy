@@ -1,110 +1,83 @@
 import type { RouterClient } from "@orpc/server";
 import { getSignupAccessState } from "@ws-model-proxy/auth/signup-policy";
 import { env } from "@ws-model-proxy/env/server";
-import { adminProcedure, authenticatedProcedure, publicProcedure } from "../index";
+import { contractProcedure, publicContractProcedure } from "../contract-procedure";
+import { appContract } from "../contracts/account";
 import { providerCredentialKeyringConfigured } from "../lib/provider-credential-crypto";
+// Registers share-invite acceptance with the Better Auth hooks (side effect).
+import "../lib/share-invite-accept";
+import { accessRouter } from "./access";
+import { activityRouter } from "./activity";
 import { adminObservabilityRouter } from "./admin-observability";
+import { adminSettingsRouter } from "./admin-settings";
 import { authRouter } from "./auth";
-import { capacityManagementRouter } from "./capacity-management";
-import { cliAgentActivityRouter } from "./cli-agent-activity";
-import { cliCredentialsRouter } from "./cli-credentials";
-import { deploymentsRouter } from "./deployments";
-import { devicesRouter } from "./devices";
-import { forwarderManagementRouter } from "./forwarder-management";
-import { inferenceContributionsRouter } from "./inference-contributions";
-import { mcpGrantsRouter } from "./mcp-grants";
-import { mcpTokensRouter } from "./mcp-tokens";
-import { modelApiTokensRouter } from "./model-api-tokens";
-import { overviewRouter } from "./overview";
-import { poolFallbackRouter } from "./pool-fallback";
-import { poolFallbackPreferencesRouter } from "./pool-fallback-preferences";
-import { providerCatalogRouter } from "./provider-catalog";
-import { providerManagementRouter } from "./provider-management";
-import { relayMetadataRouter } from "./relay-metadata";
+import { modelsRouter } from "./models";
+import { nodesRouter } from "./nodes";
+import { poolsRouter } from "./pools";
+import { profilesRouter } from "./profiles";
+import { providersRouter } from "./providers";
+import { runtimesRouter } from "./runtimes";
 import { settingsRouter } from "./settings";
-import { supervisedCommandsRouter } from "./supervised-commands";
 import { usersRouter } from "./users";
 
-async function deploymentFeatureSnapshot() {
-  const signupAccess = await getSignupAccessState();
-  const keyringConfigured = providerCredentialKeyringConfigured(
-    env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS,
+function cloudEnabled(): boolean {
+  return (
+    env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED &&
+    providerCredentialKeyringConfigured(env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS)
   );
-  return {
-    signupAccess,
-    features: {
-      WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: {
-        enabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
-        keyringConfigured,
-        ready: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED && keyringConfigured,
-      },
-      WMP_MCP_ENABLED: env.WMP_MCP_ENABLED,
-      WMP_MCP_PAT_ALLOW_NO_EXPIRY: env.WMP_MCP_PAT_ALLOW_NO_EXPIRY,
-      WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS,
-      SIGNUP_ENABLED: signupAccess.signupEnabled,
-    },
-  };
 }
 
-export const appRouter = {
-  appConfig: publicProcedure.handler(async () => {
-    const { signupAccess, features } = await deploymentFeatureSnapshot();
+const appRouterApp = {
+  config: publicContractProcedure(appContract.config).handler(async () => {
+    const signupAccess = await getSignupAccessState();
     return {
-      ssoEnabled: false,
-      forceSso: false,
-      ssoProviderName: "SSO",
-      signupEnabled: features.SIGNUP_ENABLED,
+      signupEnabled: signupAccess.signupEnabled,
       adminBootstrapSignupEnabled: signupAccess.adminBootstrapSignupEnabled,
-      // Gates the login challenge's "email me a code" affordance. The delivery
-      // unreliability of Better-Auth's send-otp endpoint (it swallows SMTP
-      // failures) is handled separately by the `auth.verifyEmailTransport`
-      // preflight; this flag only reflects whether email is configured at all.
+      // Gates the login challenge's "email me a code" affordance; delivery itself is checked
+      // by `auth.verifyEmailTransport`.
       emailEnabled: Boolean(env.SMTP_HOST),
     };
   }),
-  /** Product gates for a signed-in user. No keyring status and no feature inventory. */
-  deploymentFlags: authenticatedProcedure.handler(async () => {
-    const { features } = await deploymentFeatureSnapshot();
+  flags: contractProcedure(appContract.flags).handler(async () => ({
+    cloudEnabled: cloudEnabled(),
+    privateNetworksAllowed: env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS,
+    mcpEnabled: env.WMP_MCP_ENABLED,
+    agentTokenNoExpiryAllowed: env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY,
+  })),
+  features: contractProcedure(appContract.features).handler(async () => {
+    const signupAccess = await getSignupAccessState();
     return {
-      providerEgressEnabled: features.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED.enabled,
-      privateNetworksAllowed: features.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS,
+      WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: {
+        enabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
+        keyringConfigured: providerCredentialKeyringConfigured(
+          env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS,
+        ),
+        ready: cloudEnabled(),
+      },
+      WMP_MCP_ENABLED: env.WMP_MCP_ENABLED,
+      WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY: env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY,
+      WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS,
+      SIGNUP_ENABLED: signupAccess.signupEnabled,
     };
   }),
-  /** Admin inventory, including whether the credential keyring is configured. */
-  deploymentFeatures: adminProcedure.handler(async () => {
-    const { features } = await deploymentFeatureSnapshot();
-    return features;
-  }),
+};
+
+/** The 0.4.0 router: one key per contract router (`contracts/index.ts`). */
+export const appRouter = {
+  app: appRouterApp,
   auth: authRouter,
-  adminObservability: adminObservabilityRouter,
   settings: settingsRouter,
-  devices: devicesRouter,
-  deployments: deploymentsRouter,
-  inferenceContributions: inferenceContributionsRouter,
-  forwarderManagement: forwarderManagementRouter,
-  cliCredentials: cliCredentialsRouter,
-  // Owner-scoped agent audit log (metadata only); MCP read tool
-  // `forwarder_cli_activity_list`, visible under the CLI-tool access rule.
-  cliAgentActivity: cliAgentActivityRouter,
-  capacityManagement: capacityManagementRouter,
-  modelApiTokens: modelApiTokensRouter,
-  overview: overviewRouter,
-  providerManagement: providerManagementRouter,
-  // Human-only OpenRouter public catalog (search, import, pool equivalent).
-  // Never MCP tools; see MCP_TOOL_EXCLUSIONS.
-  providerCatalog: providerCatalogRouter,
-  poolFallback: poolFallbackRouter,
-  poolFallbackPreferences: poolFallbackPreferencesRouter,
-  relayMetadata: relayMetadataRouter,
   users: usersRouter,
-  // Human-only: confirm/review agent-requested commands. Never MCP tools.
-  supervisedCommands: supervisedCommandsRouter,
-  // Human-only MCP grant management (Phase 7): never exposed as MCP tools —
-  // see MCP_TOOL_EXCLUSIONS in apps/server/src/mcp/tool-manifest.ts.
-  mcpGrants: mcpGrantsRouter,
-  // Human-only MCP personal tokens: hashed Bearer credentials for headless
-  // clients. Never exposed as MCP tools (same exclusion invariant as mcpGrants).
-  mcpTokens: mcpTokensRouter,
+  adminObservability: adminObservabilityRouter,
+  adminSettings: adminSettingsRouter,
+  nodes: nodesRouter,
+  runtimes: runtimesRouter,
+  profiles: profilesRouter,
+  pools: poolsRouter,
+  models: modelsRouter,
+  access: accessRouter,
+  providers: providersRouter,
+  activity: activityRouter,
 };
 export type AppRouter = typeof appRouter;
 export type AppRouterClient = RouterClient<typeof appRouter>;

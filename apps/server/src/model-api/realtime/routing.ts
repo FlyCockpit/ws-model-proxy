@@ -1,27 +1,35 @@
-import {
-  listVisibleModelTargetsForUser,
-  listVisibleModelTargetsWithExternalPermissionForToken,
-  type VisibleDirectModelTarget,
-  type VisibleModelPoolTarget,
-} from "@ws-model-proxy/api/lib/model-api-token-access";
+import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import {
   buildPoolRouteSequence,
-  isPublishedEndpointExecutable,
-  type PoolMemberRouteRow,
-  recordPoolMemberRelayFailure,
+  markTargetHalfOpenTrial,
+  markTargetRelaySuccess,
+  recordTargetRelayFailure,
+  releaseTargetHalfOpenTrial,
+  returnTargetTrial,
+  routeKey,
   type SmoothWeightedRoundRobinState,
-} from "@ws-model-proxy/api/lib/model-pool-routing";
-import {
-  type OpenAiCompatibleCapabilities,
-  parseOpenAiCompatibleCapabilities,
-  resolveEffectiveCapabilityMetadata,
-} from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
-import prisma, { type Prisma } from "@ws-model-proxy/db";
+  targetRoutingHealth,
+} from "@ws-model-proxy/api/lib/pool-routing";
+import prisma from "@ws-model-proxy/db";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import type { RelayFailure } from "../../relay/relay-failure.js";
 import type { SttConfig } from "../../relay/stt-protocol.js";
 import { realtimeTranscriptionCapability } from "../../relay/stt-relay.js";
 import { resolveRequestedModelName } from "../external-route.js";
+import {
+  type ApiKeyIdentity,
+  type CallablePool,
+  listCallableTargetsForApiKey,
+  listCallableTargetsForUser,
+  type PoolRoute,
+  poolRouteRow,
+  poolRoutes,
+  type RouteServedModel,
+  type TestRoute,
+  type TestTarget,
+  testRoutes,
+} from "../resolve.js";
+import { servedModelCapabilities } from "../served-model-capabilities.js";
 import { recheckRealtimePermission } from "./authorize.js";
 import { checkDashboardSession } from "./dashboard-session.js";
 import type { RealtimeCredentialRef, RealtimeTargetAccess } from "./requester.js";
@@ -32,179 +40,73 @@ import type {
 } from "./transcription-session.js";
 
 /**
- * Routing for live transcription (design §3): the token's visible targets,
- * then live-capable members, read from the database.
+ * Routing for live transcription (design §3): the caller's callable targets, then live-capable
+ * routes, read from the database.
  *
- * A member is eligible only when all of these hold:
- * - its endpoint is **recipe-managed per the database**: the endpoint row
- *   links a deployment instance of the same owner and slug, whose rank-0 node
- *   on the endpoint's CLI holds its claim, desired and observed RUNNING (the
- *   same ownership rule registration applies). The slug is never trusted;
- * - the CLI-advertised endpoint capabilities and the effective (override
- *   aware) capabilities both carry `audio.transcriptions.realtime` with
- *   `supported: true` and the same adapter;
- * - model, endpoint and CLI are published, online and connected here; the
- *   member is ACTIVE, OPEN, HEALTHY, its contribution (if any) is active and
- *   its engine owner may use credentials;
+ * A route (one served model on one runtime instance) is eligible only when all of these hold:
+ * - the served model's transcription profile declares `realtime` (the runtime definition is
+ *   the only source; the node's `stt.open` is checked against the same capability);
+ * - the instance is READY, its head node is online here, the member (pools) is ACTIVE and the
+ *   execution target is HEALTHY or not yet judged (UNKNOWN, as the HTTP path treats it: a
+ *   fresh target has served nothing yet); a live session never takes the HTTP half-open trial;
+ * - the served model's owner may use credentials;
  * - a vLLM adapter only when no language or prompt is set.
  *
- * Pools are ordered by the HTTP path's weighted round robin and health.
- * Unknown and forbidden models are both `model_not_found`.
+ * Pool routes are ordered by the HTTP path's weighted round robin. Unknown and forbidden
+ * models are both `model_not_found`. An API key sees pools only; the dashboard Chat Test also
+ * sees the person's own served models (TEST targets).
  */
-
-const endpointSelect = {
-  id: true,
-  userId: true,
-  slug: true,
-  published: true,
-  cliDeviceId: true,
-  status: true,
-  capabilityMetadata: true,
-  CliDevice: { select: { status: true } },
-  DeploymentInstance: {
-    select: {
-      userId: true,
-      endpointSlug: true,
-      desiredState: true,
-      observedState: true,
-      Nodes: { where: { rank: 0, claimHeld: true }, select: { cliDeviceId: true } },
-    },
-  },
-} satisfies Prisma.EndpointSelect;
-
-const modelSelect = {
-  id: true,
-  userId: true,
-  published: true,
-  upstreamModelId: true,
-  capabilityOverrideMode: true,
-  capabilityOverrideMetadata: true,
-  User: { select: { banned: true, banExpires: true, deletionRequestedAt: true } },
-  Endpoint: { select: endpointSelect },
-  ExecutionTarget: { select: { id: true, inferenceCapacityId: true } },
-} satisfies Prisma.DiscoveredModelSelect;
-
-const memberSelect = {
-  id: true,
-  poolId: true,
-  weight: true,
-  healthStatus: true,
-  routingStatus: true,
-  instanceGate: true,
-  lastFailureClass: true,
-  consecutiveRetryableFailures: true,
-  lastFailureAt: true,
-  nextRetryAt: true,
-  halfOpenTrialStartedAt: true,
-  inferenceContributionId: true,
-  InferenceContribution: {
-    select: { state: true, poolId: true, discoveredModelId: true, contributorUserId: true },
-  },
-  ModelPool: { select: { userId: true } },
-  ExecutionTarget: {
-    select: { id: true, inferenceCapacityId: true, DiscoveredModel: { select: modelSelect } },
-  },
-} satisfies Prisma.PoolMemberSelect;
-
-type ModelRow = Prisma.DiscoveredModelGetPayload<{ select: typeof modelSelect }>;
-type MemberRow = Prisma.PoolMemberGetPayload<{ select: typeof memberSelect }>;
-
-/** The recipe-managed ownership rule, on database rows only. */
-export function endpointIsRecipeManaged(endpoint: ModelRow["Endpoint"]): boolean {
-  const instance = endpoint.DeploymentInstance;
-  return (
-    instance !== null &&
-    instance.userId === endpoint.userId &&
-    instance.endpointSlug === endpoint.slug &&
-    instance.desiredState === "RUNNING" &&
-    instance.observedState === "RUNNING" &&
-    instance.Nodes.some((node) => node.cliDeviceId === endpoint.cliDeviceId)
-  );
-}
 
 /**
- * The capabilities a live session is routed by: the CLI's own advertisement
- * (what `stt.open` is checked against), only when the effective capabilities
- * agree that the model takes live sessions with the same adapter.
+ * The live-session capabilities of a served model, or null when it takes none: its request
+ * capabilities (`servedModelCapabilities`, the same view HTTP routing and `/v1/models` use)
+ * when they carry a live profile.
  */
-export function liveCapabilities(model: ModelRow): OpenAiCompatibleCapabilities | null {
-  const advertised = parseOpenAiCompatibleCapabilities(model.Endpoint.capabilityMetadata);
-  const effective = resolveEffectiveCapabilityMetadata({
-    capabilityOverrideMode: model.capabilityOverrideMode,
-    capabilityOverrideMetadata: model.capabilityOverrideMetadata,
-    endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
-  });
-  const live = realtimeTranscriptionCapability(advertised);
-  const allowed = realtimeTranscriptionCapability(effective);
-  if (!live || !allowed || live.adapter !== allowed.adapter) return null;
-  return advertised;
+export function liveCapabilities(model: RouteServedModel): OpenAiCompatibleCapabilities | null {
+  const capabilities = servedModelCapabilities(model);
+  return realtimeTranscriptionCapability(capabilities) ? capabilities : null;
 }
 
 function configNeedsOptions(config: SttConfig): boolean {
   return config.language !== undefined || config.prompt !== undefined;
 }
 
-/** Static eligibility of one model row (no health, no connection). */
+/** Static eligibility of one route's served model (no health, no connection). */
 function modelEligible(
-  model: ModelRow,
+  route: Pick<TestRoute, "model">,
   config: SttConfig,
-  now: Date,
 ): OpenAiCompatibleCapabilities | null {
-  if (!endpointIsRecipeManaged(model.Endpoint)) return null;
-  if (model.User && userCredentialAccessBlocked(model.User, now)) return null;
-  const capabilities = liveCapabilities(model);
+  const capabilities = liveCapabilities(route.model);
   if (!capabilities) return null;
   const live = realtimeTranscriptionCapability(capabilities);
   if (live?.adapter === "vllm" && configNeedsOptions(config)) return null;
   return capabilities;
 }
 
-function memberContributionValid(row: MemberRow, model: ModelRow, poolId: string): boolean {
-  const contribution = row.InferenceContribution;
-  if (
-    row.inferenceContributionId &&
-    (contribution?.state !== "ACTIVE" ||
-      contribution.poolId !== poolId ||
-      contribution.discoveredModelId !== model.id ||
-      contribution.contributorUserId !== model.userId)
-  ) {
-    return false;
-  }
-  return !(
-    row.ModelPool?.userId &&
-    model.userId !== row.ModelPool.userId &&
-    !row.inferenceContributionId
+/** Ready instance on an online node (target health is judged by {@link targetRoutingHealth}). */
+function routeServes(route: TestRoute, onlineNodeIds: ReadonlySet<string>): boolean {
+  return (
+    route.instance.ready &&
+    route.instance.nodeId !== null &&
+    onlineNodeIds.has(route.instance.nodeId)
   );
 }
 
 function candidateFor(
-  model: ModelRow,
+  route: TestRoute,
   capabilities: OpenAiCompatibleCapabilities,
-  route: NonNullable<RealtimeCandidate["route"]>,
-): RealtimeCandidate {
+  identity: NonNullable<RealtimeCandidate["route"]>,
+): RealtimeCandidate | null {
+  const nodeId = route.instance.nodeId;
+  if (!nodeId) return null;
   return {
-    cliDeviceId: model.Endpoint.cliDeviceId,
-    endpointSlug: model.Endpoint.slug,
-    upstreamModel: model.upstreamModelId,
+    nodeId,
+    handle: route.instance.handle,
+    upstreamModel: route.model.upstreamModelId,
     capabilities,
-    // From the deployment ownership rows above, never from the slug.
-    deploymentManaged: true,
-    memberId: route.poolMemberId,
-    route,
+    memberId: identity.poolMemberId,
+    route: identity,
   };
-}
-
-async function poolMembers(poolId: string): Promise<MemberRow[]> {
-  return prisma.poolMember.findMany({
-    where: {
-      poolId,
-      tier: "PRIMARY",
-      instanceGate: "OPEN",
-      ExecutionTarget: { DiscoveredModel: { isNot: null } },
-    },
-    orderBy: { id: "asc" },
-    select: memberSelect,
-  });
 }
 
 /** Round-robin state per pool, bounded. */
@@ -220,152 +122,186 @@ function rememberRoundRobin(poolId: string, state: SmoothWeightedRoundRobinState
   }
 }
 
+function poolIdentity(
+  pool: Pick<CallablePool, "id" | "ownerUserId" | "shareId">,
+  route: PoolRoute,
+): NonNullable<RealtimeCandidate["route"]> {
+  return {
+    kind: "pool",
+    poolId: pool.id,
+    poolMemberId: route.member.id,
+    runtimeModelId: route.model.id,
+    executionTargetId: route.target.id,
+    instanceId: route.instance.id,
+    ownerUserId: pool.ownerUserId,
+    engineOwnerUserId: route.model.userId,
+    shareId: pool.shareId,
+    contributedShareId: route.member.shareId,
+  };
+}
+
+/** The live-eligible routes of a pool (active members, healthy, served, capable). */
+async function eligiblePoolRoutes(
+  poolId: string,
+  config: SttConfig,
+  onlineNodeIds: ReadonlySet<string>,
+  now: Date,
+  routes: (poolId: string, now?: Date) => Promise<PoolRoute[]> = poolRoutes,
+): Promise<Array<{ route: PoolRoute; capabilities: OpenAiCompatibleCapabilities }>> {
+  const eligible: Array<{ route: PoolRoute; capabilities: OpenAiCompatibleCapabilities }> = [];
+  for (const route of await routes(poolId, now)) {
+    if (!route.member.active || !routeServes(route, onlineNodeIds)) continue;
+    const capabilities = modelEligible(route, config);
+    if (capabilities) eligible.push({ route, capabilities });
+  }
+  return eligible;
+}
+
 export async function poolCandidates({
   pool,
   config,
-  activeCliDeviceIds,
+  onlineNodeIds,
   now = new Date(),
+  routes = poolRoutes,
 }: {
-  pool: Pick<VisibleModelPoolTarget, "id" | "ownerUserId" | "accessGrantId">;
+  pool: Pick<CallablePool, "id" | "ownerUserId" | "shareId">;
   config: SttConfig;
-  activeCliDeviceIds: readonly string[];
+  onlineNodeIds: readonly string[];
   now?: Date;
+  routes?: (poolId: string, now?: Date) => Promise<PoolRoute[]>;
 }): Promise<RealtimeCandidate[]> {
-  const rows = await poolMembers(pool.id);
-  const eligible = new Map<
-    string,
-    { row: MemberRow; model: ModelRow; capabilities: OpenAiCompatibleCapabilities }
-  >();
-  const routeRows: PoolMemberRouteRow[] = [];
-  for (const row of rows) {
-    const model = row.ExecutionTarget?.DiscoveredModel;
-    if (!model || !memberContributionValid(row, model, pool.id)) continue;
-    const capabilities = modelEligible(model, config, now);
-    if (!capabilities) continue;
-    eligible.set(row.id, { row, model, capabilities });
-    routeRows.push({
-      id: row.id,
-      poolId: row.poolId,
-      discoveredModelId: model.id,
-      weight: row.weight,
-      healthStatus: row.healthStatus,
-      routingStatus: row.routingStatus,
-      lastFailureClass: row.lastFailureClass,
-      consecutiveRetryableFailures: row.consecutiveRetryableFailures,
-      lastFailureAt: row.lastFailureAt,
-      nextRetryAt: row.nextRetryAt,
-      halfOpenTrialStartedAt: row.halfOpenTrialStartedAt,
-      DiscoveredModel: {
-        published: model.published,
-        upstreamModelId: model.upstreamModelId,
-        Endpoint: {
-          id: model.Endpoint.id,
-          slug: model.Endpoint.slug,
-          published: model.Endpoint.published,
-          cliDeviceId: model.Endpoint.cliDeviceId,
-          status: model.Endpoint.status,
-          CliDevice: model.Endpoint.CliDevice,
-        },
-      },
-    });
-  }
-  if (routeRows.length === 0) return [];
+  const online = new Set(onlineNodeIds);
+  const eligible = await eligiblePoolRoutes(pool.id, config, online, now, routes);
+  if (eligible.length === 0) return [];
+  const byKey = new Map(eligible.map((entry) => [routeKey(poolRouteRow(entry.route)), entry]));
   const sequence = buildPoolRouteSequence({
-    members: routeRows,
-    activeCliDeviceIds,
+    routes: eligible.map((entry) => poolRouteRow(entry.route)),
+    onlineNodeIds: online,
     now,
     state: roundRobin.get(pool.id) ?? {},
+    degradedTrials: true,
   });
   if (!sequence.ok) return [];
   rememberRoundRobin(pool.id, sequence.state);
-  const candidates: RealtimeCandidate[] = [];
-  for (const route of sequence.candidates) {
-    // A half-open member's single trial belongs to the HTTP path's claim
-    // protocol; a 30-minute live session never takes it.
-    if (route.healthStatus !== "HEALTHY") continue;
-    const entry = eligible.get(route.poolMemberId);
+  const candidates: RankedCandidate[] = [];
+  for (const routed of sequence.candidates) {
+    const entry = byKey.get(routeKey(routed));
     if (!entry) continue;
+    const candidate = candidateFor(
+      entry.route,
+      entry.capabilities,
+      poolIdentity(pool, entry.route),
+    );
+    if (!candidate) continue;
     candidates.push(
-      candidateFor(entry.model, entry.capabilities, {
-        kind: "pool",
-        poolId: pool.id,
-        poolMemberId: route.poolMemberId,
-        discoveredModelId: entry.model.id,
-        endpointId: entry.model.Endpoint.id,
-        executionTargetId: entry.row.ExecutionTarget?.id ?? null,
-        capacityId: entry.row.ExecutionTarget?.inferenceCapacityId ?? null,
-        ownerUserId: pool.ownerUserId,
-        engineOwnerUserId: entry.model.userId,
-        accessGrantId: pool.accessGrantId,
-        contributionId: entry.row.inferenceContributionId,
-      }),
+      routed.health === "HALF_OPEN"
+        ? {
+            candidate: {
+              ...candidate,
+              trial: { degradedFallback: routed.degradedFallback === true },
+            },
+            rank: "trial",
+          }
+        : { candidate, rank: entry.route.target.health === "HEALTHY" ? "proven" : "unjudged" },
     );
   }
-  return candidates;
+  return liveOrder(candidates);
 }
 
-export async function directCandidates({
+type RankedCandidate = {
+  candidate: RealtimeCandidate;
+  rank: "trial" | "proven" | "unjudged";
+};
+
+/**
+ * The order a session tries its candidates in:
+ * 1. at most one target whose recovery window is open (its half-open trial: no recovery
+ *    probe covers live transcription, so live sessions are what bring a target back; the
+ *    session falls back to the others when the trial fails);
+ * 2. targets that served before, in their routing order;
+ * 3. targets nothing has judged yet: an open that fails for a configuration reason leaves a
+ *    target unjudged, and it must not take every session's first attempt.
+ */
+function liveOrder(candidates: readonly RankedCandidate[]): RealtimeCandidate[] {
+  const trial = candidates.find((entry) => entry.rank === "trial");
+  return [
+    ...(trial ? [trial] : []),
+    ...candidates.filter((entry) => entry.rank === "proven"),
+    ...candidates.filter((entry) => entry.rank === "unjudged"),
+  ].map((entry) => entry.candidate);
+}
+
+function testIdentity(
+  target: Pick<TestTarget, "id" | "ownerUserId">,
+  route: TestRoute,
+): NonNullable<RealtimeCandidate["route"]> {
+  return {
+    kind: "test",
+    poolId: null,
+    poolMemberId: null,
+    runtimeModelId: target.id,
+    executionTargetId: route.target.id,
+    instanceId: route.instance.id,
+    ownerUserId: target.ownerUserId,
+    engineOwnerUserId: route.model.userId,
+    shareId: null,
+    contributedShareId: null,
+  };
+}
+
+/** The live-eligible routes of one of the caller's own served models (dashboard only). */
+export async function testCandidates({
   target,
   config,
-  activeCliDeviceIds,
+  onlineNodeIds,
   now = new Date(),
+  routes = testRoutes,
 }: {
-  target: Pick<VisibleDirectModelTarget, "id">;
+  target: Pick<TestTarget, "id" | "ownerUserId">;
   config: SttConfig;
-  activeCliDeviceIds: readonly string[];
+  onlineNodeIds: readonly string[];
   now?: Date;
+  routes?: (runtimeModelId: string, ownerUserId: string, now?: Date) => Promise<TestRoute[]>;
 }): Promise<RealtimeCandidate[]> {
-  const model = await prisma.discoveredModel.findUnique({
-    where: { id: target.id },
-    select: modelSelect,
-  });
-  if (!model) return [];
-  const capabilities = modelEligible(model, config, now);
-  if (!capabilities) return [];
-  if (
-    !isPublishedEndpointExecutable({
-      modelPublished: model.published,
-      endpointPublished: model.Endpoint.published,
-      endpointStatus: model.Endpoint.status,
-      cliDeviceId: model.Endpoint.cliDeviceId,
-      cliDeviceStatus: model.Endpoint.CliDevice?.status,
-      activeCliDeviceIds: new Set(activeCliDeviceIds),
-    })
-  ) {
-    return [];
+  const online = new Set(onlineNodeIds);
+  const candidates: RankedCandidate[] = [];
+  for (const route of await routes(target.id, target.ownerUserId, now)) {
+    if (!routeServes(route, online)) continue;
+    const health = targetRoutingHealth(route.target, now, true);
+    if (health === null) continue;
+    const capabilities = modelEligible(route, config);
+    if (!capabilities) continue;
+    const candidate = candidateFor(route, capabilities, testIdentity(target, route));
+    if (!candidate) continue;
+    candidates.push(
+      health === "HALF_OPEN"
+        ? {
+            candidate: {
+              ...candidate,
+              trial: { degradedFallback: route.target.health === "DEGRADED" },
+            },
+            rank: "trial",
+          }
+        : { candidate, rank: route.target.health === "HEALTHY" ? "proven" : "unjudged" },
+    );
   }
-  return [
-    candidateFor(model, capabilities, {
-      kind: "direct",
-      poolId: null,
-      poolMemberId: null,
-      discoveredModelId: model.id,
-      endpointId: model.Endpoint.id,
-      executionTargetId: model.ExecutionTarget?.id ?? null,
-      capacityId: model.ExecutionTarget?.inferenceCapacityId ?? null,
-      ownerUserId: model.userId,
-      engineOwnerUserId: model.userId,
-      accessGrantId: null,
-      contributionId: null,
-    }),
-  ];
+  return liveOrder(candidates);
 }
 
-/** Which visible target a model name names, for routing and rechecks. */
+/** Which callable target a model name names, for routing and rechecks. */
 export type RealtimeResolvedTarget =
-  | { kind: "pool"; target: VisibleModelPoolTarget }
-  | { kind: "direct"; target: VisibleDirectModelTarget };
+  | { kind: "pool"; target: CallablePool }
+  | { kind: "test"; target: TestTarget };
 
 export async function resolveRealtimeModel(
   access: RealtimeTargetAccess,
   model: string,
 ): Promise<RealtimeResolvedTarget | { error: "model_not_found" | "external_variant_unsupported" }> {
-  // A token sees its allowlist; Chat Test sees every model the user can see,
-  // as HTTP Chat Test does.
+  // An API key calls its pools; Chat Test also calls the person's own served models.
   const targets =
     access.kind === "token"
-      ? (await listVisibleModelTargetsWithExternalPermissionForToken(access.token)).targets
-      : await listVisibleModelTargetsForUser(access.userId);
+      ? await listCallableTargetsForApiKey(access.token)
+      : await listCallableTargetsForUser(access.userId);
   const resolution = resolveRequestedModelName(targets, model);
   if (resolution.kind === "not_found" || resolution.kind === "error") {
     return { error: "model_not_found" };
@@ -375,17 +311,17 @@ export async function resolveRealtimeModel(
     if (resolution.externalRequested) return { error: "external_variant_unsupported" };
     return { kind: "pool", target: resolution.target };
   }
-  return { kind: "direct", target: resolution.target };
+  return { kind: "test", target: resolution.target };
 }
 
 /** The production router for one session. */
 export function createRealtimeRouter({
   access,
-  activeCliDeviceIds,
+  onlineNodeIds,
   onResolved,
 }: {
   access: RealtimeTargetAccess;
-  activeCliDeviceIds: () => readonly string[];
+  onlineNodeIds: () => readonly string[];
   /** The target the model resolved to (for the access rechecks). */
   onResolved?: (resolved: RealtimeResolvedTarget, model: string) => void;
 }): RealtimeRouter {
@@ -396,41 +332,70 @@ export function createRealtimeRouter({
       onResolved?.(resolved, model);
       const candidates =
         resolved.kind === "pool"
-          ? await poolCandidates({
-              pool: resolved.target,
-              config,
-              activeCliDeviceIds: activeCliDeviceIds(),
-            })
-          : await directCandidates({
+          ? await poolCandidates({ pool: resolved.target, config, onlineNodeIds: onlineNodeIds() })
+          : await testCandidates({
               target: resolved.target,
               config,
-              activeCliDeviceIds: activeCliDeviceIds(),
+              onlineNodeIds: onlineNodeIds(),
             });
       if (candidates.length === 0) return { ok: false, code: "no_live_member" };
       return { ok: true, candidates };
     },
     memberMisconfigured(candidate: RealtimeCandidate, failure: RelayFailure) {
-      // A recipe that claims live transcription its engine does not serve:
-      // reported for the operator, never written to the shared member health.
+      // A runtime that claims live transcription its engine does not serve: reported for the
+      // operator, never written to the shared target health.
       console.warn("[realtime] member refused live sessions (configuration)", {
         poolMemberId: candidate.route?.poolMemberId ?? null,
-        endpointSlug: candidate.endpointSlug,
+        instanceHandle: candidate.handle,
         failure,
       });
     },
-    memberOpenFailed(candidate: RealtimeCandidate, failure: RelayFailure) {
-      const poolMemberId = candidate.route?.poolMemberId;
-      if (!poolMemberId) return;
-      void recordPoolMemberRelayFailure({ poolMemberId, failure, trialStartedAt: null }).catch(
-        (error: unknown) => {
-          console.error(
-            "[realtime] member health write failed",
-            error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
-          );
-        },
+    async claimTrial(candidate: RealtimeCandidate) {
+      const executionTargetId = candidate.route?.executionTargetId;
+      if (!executionTargetId || !candidate.trial) return null;
+      // The same claim HTTP takes: one trial in flight per target (the timestamp is the fence).
+      const trialStartedAt = new Date();
+      const claimed = await markTargetHalfOpenTrial({
+        executionTargetId,
+        now: trialStartedAt,
+        allowDegradedFallback: candidate.trial.degradedFallback,
+      });
+      return claimed === 1 ? trialStartedAt : null;
+    },
+    releaseTrial(candidate: RealtimeCandidate, trialStartedAt: Date, outcome) {
+      const executionTargetId = candidate.route?.executionTargetId;
+      if (!executionTargetId) return;
+      healthWrite(
+        outcome === "unused"
+          ? releaseTargetHalfOpenTrial({ executionTargetId, trialStartedAt })
+          : returnTargetTrial({ executionTargetId, trialStartedAt, now: new Date() }),
       );
     },
+    memberOpened(candidate: RealtimeCandidate, trialStartedAt: Date | null = null) {
+      const executionTargetId = candidate.route?.executionTargetId;
+      if (!executionTargetId) return;
+      healthWrite(markTargetRelaySuccess(executionTargetId, { trialStartedAt }));
+    },
+    memberOpenFailed(
+      candidate: RealtimeCandidate,
+      failure: RelayFailure,
+      trialStartedAt: Date | null = null,
+    ) {
+      const executionTargetId = candidate.route?.executionTargetId;
+      if (!executionTargetId) return;
+      healthWrite(recordTargetRelayFailure({ executionTargetId, failure, trialStartedAt }));
+    },
   };
+}
+
+/** A target health write off the session's path; a failure is logged, never thrown. */
+function healthWrite(write: Promise<unknown>) {
+  void write.catch((error: unknown) => {
+    console.error(
+      "[realtime] target health write failed",
+      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+    );
+  });
 }
 
 export type RealtimeAccessVerdict =
@@ -438,15 +403,13 @@ export type RealtimeAccessVerdict =
   | { ok: false; reason: "credential" | "model" | "member" };
 
 /**
- * The 60 s recheck of an open (or routing) session (release decision 6):
- * the token is still valid and its owner may use credentials (for Chat Test:
- * the dashboard session still exists for an unblocked, 2FA-compliant user,
- * {@link checkDashboardSession}); the model
- * still resolves to the same target with the same access; and the member the
- * session opened on is still a recipe-managed, live-capable, published
- * member of it. Health is not rechecked: a degraded member keeps its session.
- * A missing row is a denial; a read that throws propagates (the registry
- * skips that sweep, as the terminal rechecks do).
+ * The 60 s recheck of an open (or routing) session (release decision 6): the API key is still
+ * valid and its owner may use credentials (for Chat Test: the dashboard session still exists
+ * for an unblocked, 2FA-compliant user, {@link checkDashboardSession}); the model still
+ * resolves to the same target through the same share; and the route the session opened on is
+ * still a live-capable route of it (health is not rechecked: a degraded member keeps its
+ * session). A missing row is a denial; a read that throws propagates (the registry skips that
+ * sweep, as the terminal rechecks do).
  */
 export async function recheckRealtimeAccess({
   credential,
@@ -458,9 +421,10 @@ export async function recheckRealtimeAccess({
   now = new Date(),
   permission = recheckRealtimePermission,
   dashboardSession = checkDashboardSession,
+  routes = { pool: poolRoutes, test: testRoutes },
 }: {
   credential: RealtimeCredentialRef;
-  /** The session's user (a token's own user is read from its row). */
+  /** The session's user (an API key's own user is read from its row). */
   userId: string;
   model: string | null;
   resolved: RealtimeResolvedTarget | null;
@@ -470,6 +434,10 @@ export async function recheckRealtimeAccess({
   /** The HTTP send claim's permission check, without a send (review 6b M1). */
   permission?: typeof recheckRealtimePermission;
   dashboardSession?: typeof checkDashboardSession;
+  routes?: {
+    pool: (poolId: string, now?: Date) => Promise<PoolRoute[]>;
+    test: (runtimeModelId: string, ownerUserId: string, now?: Date) => Promise<TestRoute[]>;
+  };
 }): Promise<RealtimeAccessVerdict> {
   const requester = await recheckCredential(credential, userId, now, dashboardSession);
   if (!requester) return { ok: false, reason: "credential" };
@@ -479,48 +447,20 @@ export async function recheckRealtimeAccess({
     "error" in current ||
     current.kind !== resolved.kind ||
     current.target.id !== resolved.target.id ||
+    current.target.ownerUserId !== resolved.target.ownerUserId ||
     (current.kind === "pool" &&
       resolved.kind === "pool" &&
-      (current.target.accessGrantId !== resolved.target.accessGrantId ||
-        current.target.ownerUserId !== resolved.target.ownerUserId))
+      current.target.shareId !== resolved.target.shareId)
   ) {
     return { ok: false, reason: "model" };
   }
   const route = candidate?.route;
   if (!candidate || !route) return { ok: true };
-  if (route.kind === "pool" && route.poolMemberId && route.poolId) {
-    const row = await prisma.poolMember.findFirst({
-      where: {
-        id: route.poolMemberId,
-        poolId: route.poolId,
-        tier: "PRIMARY",
-        instanceGate: "OPEN",
-      },
-      select: memberSelect,
-    });
-    const model_ = row?.ExecutionTarget?.DiscoveredModel;
-    if (
-      !row ||
-      !model_ ||
-      row.routingStatus === "DISABLED" ||
-      model_.id !== route.discoveredModelId ||
-      !memberContributionValid(row, model_, route.poolId) ||
-      !memberStillServes(model_, candidate, config, now)
-    ) {
-      return { ok: false, reason: "member" };
-    }
-  } else {
-    const direct = await prisma.discoveredModel.findUnique({
-      where: { id: route.discoveredModelId },
-      select: modelSelect,
-    });
-    if (!direct || !memberStillServes(direct, candidate, config, now)) {
-      return { ok: false, reason: "member" };
-    }
+  if (!(await routeStillServes(candidate, route, config, now, routes))) {
+    return { ok: false, reason: "member" };
   }
-  // The same locked permission check an HTTP send takes: CLI device of the
-  // model owner and connected, the token's allowlist entry for this exact
-  // target (none for Chat Test), the grant row, every user active.
+  // The same locked permission check an HTTP send takes: the head node connected and the
+  // model owner's, the key's pool access (none for Chat Test), the share row, every user active.
   const denied = await permission(
     { tokenId: requester.tokenId, userId: requester.userId },
     candidate,
@@ -529,6 +469,39 @@ export async function recheckRealtimeAccess({
   if (denied === "access") return { ok: false, reason: "model" };
   if (denied === "member") return { ok: false, reason: "member" };
   return { ok: true };
+}
+
+/** The route the session opened on is still a member's served model on that instance. */
+async function routeStillServes(
+  candidate: RealtimeCandidate,
+  route: NonNullable<RealtimeCandidate["route"]>,
+  config: SttConfig,
+  now: Date,
+  routes: {
+    pool: (poolId: string, now?: Date) => Promise<PoolRoute[]>;
+    test: (runtimeModelId: string, ownerUserId: string, now?: Date) => Promise<TestRoute[]>;
+  },
+): Promise<boolean> {
+  const current: TestRoute | undefined =
+    route.kind === "pool" && route.poolId
+      ? (await routes.pool(route.poolId, now)).find(
+          (entry) =>
+            entry.member.id === route.poolMemberId &&
+            entry.member.active &&
+            entry.member.shareId === route.contributedShareId &&
+            entry.target.id === route.executionTargetId,
+        )
+      : (await routes.test(route.runtimeModelId, route.ownerUserId, now)).find(
+          (entry) => entry.target.id === route.executionTargetId,
+        );
+  return (
+    current !== undefined &&
+    current.instance.id === route.instanceId &&
+    current.instance.handle === candidate.handle &&
+    current.instance.nodeId === candidate.nodeId &&
+    current.model.id === route.runtimeModelId &&
+    modelEligible(current, config) !== null
+  );
 }
 
 /** The credential's current state; null when it no longer authorizes the session. */
@@ -543,53 +516,35 @@ async function recheckCredential(
     if (verdict !== "ok") return null;
     return { userId, tokenId: null, access: { kind: "dashboard", userId } };
   }
-  const token = await prisma.modelApiToken.findUnique({
+  const key = await prisma.apiKey.findUnique({
     where: { id: credential.tokenId },
     select: {
       id: true,
       userId: true,
-      scopeMode: true,
-      allowExternal: true,
-      revokedAt: true,
+      scope: true,
+      lookupPrefix: true,
       expiresAt: true,
+      lastUsedAt: true,
+      revokedAt: true,
       User: { select: { banned: true, banExpires: true, deletionRequestedAt: true } },
     },
   });
   if (
-    !token ||
-    token.revokedAt ||
-    (token.expiresAt && token.expiresAt <= now) ||
-    !token.User ||
-    userCredentialAccessBlocked(token.User, now)
+    !key ||
+    key.revokedAt ||
+    (key.expiresAt && key.expiresAt <= now) ||
+    !key.User ||
+    userCredentialAccessBlocked(key.User, now)
   ) {
     return null;
   }
-  return {
-    userId: token.userId,
-    tokenId: token.id,
-    access: {
-      kind: "token",
-      token: {
-        id: token.id,
-        userId: token.userId,
-        scopeMode: token.scopeMode,
-        allowExternal: token.allowExternal === true,
-      },
-    },
+  const token: ApiKeyIdentity = {
+    id: key.id,
+    userId: key.userId,
+    scope: key.scope,
+    lookupPrefix: key.lookupPrefix,
+    expiresAt: key.expiresAt,
+    lastUsedAt: key.lastUsedAt,
   };
-}
-
-function memberStillServes(
-  model: ModelRow,
-  candidate: RealtimeCandidate,
-  config: SttConfig,
-  now: Date,
-): boolean {
-  return (
-    model.published &&
-    model.Endpoint.published &&
-    model.Endpoint.slug === candidate.endpointSlug &&
-    model.Endpoint.cliDeviceId === candidate.cliDeviceId &&
-    modelEligible(model, config, now) !== null
-  );
+  return { userId: key.userId, tokenId: key.id, access: { kind: "token", token } };
 }

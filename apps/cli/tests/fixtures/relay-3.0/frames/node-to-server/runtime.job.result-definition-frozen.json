@@ -1,0 +1,12 @@
+{
+  "type": "runtime.job.result",
+  "stepId": "st4m5n6b7v8c9x0z1l2k3j4h5",
+  "instanceId": "in3k4j5h6g7f8d9s0a1q2w3e4",
+  "rank": 1,
+  "intentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "ownerEpoch": "0b0c3a5e-1111-4222-8333-944445555666:7",
+  "status": "failed",
+  "stopped": false,
+  "error": "definition_frozen",
+  "detail": "launchHash"
+}

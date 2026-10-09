@@ -31,51 +31,9 @@ export const env = createEnv({
     // into the exact database identity used by the auth hook, so case and
     // surrounding whitespace cannot create a second bootstrap account.
     ADMIN_EMAIL: z.string().trim().email().toLowerCase().optional(),
-    RATE_LIMIT_RPC_POINTS: z.coerce.number().int().positive().default(100),
-    RATE_LIMIT_RPC_DURATION: z.coerce.number().int().positive().default(60),
-    RATE_LIMIT_AUTH_POINTS: z.coerce.number().int().positive().default(10),
-    RATE_LIMIT_AUTH_DURATION: z.coerce.number().int().positive().default(60),
-    RATE_LIMIT_AUTH_BLOCK_DURATION: z.coerce.number().int().positive().default(900),
-    // Per-account failed password checks. This complements the IP-keyed auth
-    // limiter: IP rotation must not multiply password guesses against one
-    // account. It is intentionally non-zero; disabling it reopens that gap.
-    RATE_LIMIT_SIGNIN_FAILURE_POINTS: z.coerce.number().int().positive().default(10),
-    RATE_LIMIT_SIGNIN_FAILURE_DURATION: z.coerce
-      .number()
-      .int()
-      .positive()
-      .default(15 * 60),
-    RATE_LIMIT_SIGNIN_FAILURE_BLOCK_DURATION: z.coerce
-      .number()
-      .int()
-      .positive()
-      .default(10 * 60),
-    RATE_LIMIT_SIGNUP_POINTS: z.coerce.number().int().positive().default(3),
-    RATE_LIMIT_SIGNUP_DURATION: z.coerce.number().int().positive().default(3600),
-    RATE_LIMIT_SIGNUP_BLOCK_DURATION: z.coerce.number().int().positive().default(3600),
-    // Per-RECIPIENT cap on anonymous endpoints that mail an arbitrary address
-    // (verification resend, password reset). IP-keyed limiters alone do not
-    // bound how much mail one mailbox receives from rotating IPs. POINTS=0
-    // disables. blockDuration defaults to 0 so attacker-supplied addresses
-    // cannot be used as an unauthenticated lockout lever on resets.
-    RATE_LIMIT_EMAIL_RECIPIENT_POINTS: z.coerce.number().int().min(0).default(3),
-    RATE_LIMIT_EMAIL_RECIPIENT_DURATION: z.coerce.number().int().positive().default(3600),
-    RATE_LIMIT_EMAIL_RECIPIENT_BLOCK_DURATION: z.coerce.number().int().min(0).default(0),
-    // Same idea for signup (also mails a caller-supplied address). Higher
-    // budget so shared-NAT offices still work.
-    RATE_LIMIT_SIGNUP_RECIPIENT_POINTS: z.coerce.number().int().min(0).default(6),
-    // MCP endpoint limiters, enforced by the mounted /mcp request chain
-    // (apps/server/src/app.ts). Unconditional IP-keyed /mcp quota and a
-    // tighter session-keyed budget for the human login/consent forms.
-    // Durations are seconds.
-    RATE_LIMIT_MCP_POINTS: z.coerce.number().int().positive().default(120),
-    RATE_LIMIT_MCP_DURATION: z.coerce.number().int().positive().default(60),
-    RATE_LIMIT_MCP_CONSENT_POINTS: z.coerce.number().int().positive().default(30),
-    RATE_LIMIT_MCP_CONSENT_DURATION: z.coerce.number().int().positive().default(60),
-    // Public RFC 7591 registration creates a durable OAuth client row. This
-    // whole-service budget remains effective when an attacker rotates IPs.
-    RATE_LIMIT_MCP_REGISTRATION_POINTS: z.coerce.number().int().positive().default(60),
-    RATE_LIMIT_MCP_REGISTRATION_DURATION: z.coerce.number().int().positive().default(3600),
+    // One multiplier for every built-in rate-limit budget (apps/server/src/rate-limit.ts).
+    // Points scale, rounded, at least 1; windows and block durations do not.
+    WMP_RATE_LIMIT_SCALE: z.coerce.number().min(0.1).max(100).default(1),
     SSR_CACHE_TTL_SECONDS: z.coerce.number().int().min(0).default(60),
     /** Raw RelayRequest retention in days; the hourly retention sweep deletes older rows. */
     RELAY_REQUEST_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(14),
@@ -172,13 +130,29 @@ export const env = createEnv({
     // to omit those plugins and answer the MCP surface with real 404s. Human
     // grant listing/revocation stays available while disabled.
     WMP_MCP_ENABLED: strictBooleanFlag(true),
-    // MCP personal tokens default to 90 days when expiresAt is omitted.
+    // The full 40-character commit /install.sh builds the CLI from (`cargo install --rev`:
+    // cargo fetches only a full hash directly). Set, /install.sh always builds from source.
+    WMP_CLI_SOURCE_REV: z
+      .string()
+      .regex(/^[0-9a-f]{40}$/)
+      .optional(),
+    // Where /install.sh downloads wsmp-<target>.tar.xz and sha256.sum from (checksum-verified
+    // release binaries). Unset: the GitHub Release of this server's version once
+    // CLI_RELEASE_BINARIES_BY_DEFAULT is flipped at release (apps/server/src/node-http.ts),
+    // a source build of the preview branch before that. https only, and a plain URL: the
+    // script embeds it in single quotes, so quotes, spaces and shell metacharacters are refused.
+    WMP_CLI_RELEASE_BASE_URL: z
+      .string()
+      .regex(/^https:\/\/[A-Za-z0-9.-]+(:[0-9]{1,5})?(\/[A-Za-z0-9._~%+@-]+)*\/?$/)
+      .transform((url) => url.replace(/\/+$/, ""))
+      .optional(),
+    // Agent tokens default to 90 days when expiresAt is omitted.
     // This flag still allows an explicit no-expiry (null) mint. Turn it off
     // to refuse that choice; an omitted expiry stays 90 days, and a chosen
     // timestamp must still fall within MCP_PAT_MAX_TTL_DAYS (see
     // packages/auth/src/mcp-config.ts). Mint time only; existing tokens are
     // unaffected. The flag's own default stays true.
-    WMP_MCP_PAT_ALLOW_NO_EXPIRY: strictBooleanFlag(true),
+    WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY: strictBooleanFlag(true),
     WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: strictBooleanFlag(),
     // Browser terminals one user may have open at once, across all CLIs.
     // Supervised and operator terminals have their own limits.
@@ -206,6 +180,13 @@ export const env = createEnv({
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,
 });
+
+/** 0.4.0 replaced the RATE_LIMIT_* settings with WMP_RATE_LIMIT_SCALE: say so once. */
+const legacyRateLimitKeys = Object.keys(process.env).filter((key) => key.startsWith("RATE_LIMIT_"));
+if (legacyRateLimitKeys.length > 0)
+  console.warn(
+    `[env] ${legacyRateLimitKeys.join(", ")} ${legacyRateLimitKeys.length === 1 ? "is" : "are"} no longer read: rate limits are built in, scaled by WMP_RATE_LIMIT_SCALE.`,
+  );
 
 export const SIGNUP_ENABLED: boolean = env.SIGNUP_ENABLED;
 

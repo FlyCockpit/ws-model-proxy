@@ -1,11 +1,14 @@
 import { upgradeWebSocket, type WebSocketLike } from "@hono/node-server";
-import {
-  authenticateCliWebsocketSecret,
-  type CliWebsocketIdentity,
-} from "@ws-model-proxy/api/lib/cli-credential-access";
 import type { Context, MiddlewareHandler } from "hono";
 import type { WSContext, WSEvents } from "hono/ws";
-import { authLimiter, createRateLimiterMiddleware } from "../rate-limit.js";
+import { resolveClientIp } from "../client-ip.js";
+import {
+  chargeRelayUpgradeFailure,
+  createRateLimiterMiddleware,
+  relayUpgradeFailureBudget,
+  relayUpgradeNodeLimiter,
+} from "../rate-limit.js";
+import { authenticateNodeCredential, type NodeIdentity } from "./node-credential-auth.js";
 import {
   parseRelaySubprotocolHeader,
   protocolErrorMessage,
@@ -15,7 +18,7 @@ import { type RelaySocket, relaySessionManager } from "./session-manager.js";
 import { settleSocketHandler } from "./socket-handler.js";
 
 type RelayVariables = {
-  relayIdentity: CliWebsocketIdentity;
+  relayIdentity: NodeIdentity;
 };
 
 function bearerSecret(header: string | undefined): string | null {
@@ -24,9 +27,16 @@ function bearerSecret(header: string | undefined): string | null {
   return match?.[1] ?? null;
 }
 
-export function createRelayWebsocketMiddleware(): MiddlewareHandler<{ Variables: RelayVariables }> {
-  const rateLimit = createRateLimiterMiddleware(authLimiter);
+const relayIpKey = (c: Context) => `ip:${resolveClientIp(c)}`;
 
+/**
+ * Relay upgrades have their own limiters, never the sign-in bucket. An address whose failed
+ * upgrades used up its relay budget is refused before the credential is checked; only failures
+ * spend that budget, so many honest nodes behind one NAT connecting at once never do. An
+ * authenticated upgrade is charged to its node, keyed by the verified id (never by the presented
+ * secret's bytes, so a caller cannot pick a bucket).
+ */
+export function createRelayWebsocketMiddleware(): MiddlewareHandler<{ Variables: RelayVariables }> {
   return async (c, next) => {
     if (c.req.header("upgrade")?.toLowerCase() !== "websocket") {
       return c.json({ error: "WebSocket upgrade required." }, 426);
@@ -35,11 +45,16 @@ export function createRelayWebsocketMiddleware(): MiddlewareHandler<{ Variables:
       return c.json({ error: "Server is shutting down." }, 503);
     }
 
-    const limited = await rateLimit(c, async () => undefined);
-    if (limited instanceof Response) return limited;
+    const ipKey = relayIpKey(c);
+    const budget = await relayUpgradeFailureBudget(ipKey);
+    if (!budget.allowed) {
+      c.header("Retry-After", String(Math.max(1, Math.ceil(budget.retryAfterMs / 1000))));
+      return c.json({ error: "Too many attempts. Please wait a moment and try again." }, 429);
+    }
 
     const requestedProtocol = parseRelaySubprotocolHeader(c.req.header("sec-websocket-protocol"));
     if (!requestedProtocol.supported) {
+      await chargeRelayUpgradeFailure(ipKey);
       return c.json(
         {
           ...protocolErrorMessage({
@@ -54,13 +69,20 @@ export function createRelayWebsocketMiddleware(): MiddlewareHandler<{ Variables:
 
     const secret = bearerSecret(c.req.header("authorization"));
     if (!secret) {
-      return c.json({ error: "CLI websocket authentication required." }, 401);
+      await chargeRelayUpgradeFailure(ipKey);
+      return c.json({ error: "Node credential required." }, 401);
     }
 
-    const identity = await authenticateCliWebsocketSecret(secret);
+    const identity = await authenticateNodeCredential(secret);
     if (!identity) {
-      return c.json({ error: "Invalid or revoked CLI websocket credential." }, 401);
+      await chargeRelayUpgradeFailure(ipKey);
+      return c.json({ error: "Invalid or revoked node credential." }, 401);
     }
+    const nodeRateLimit = createRateLimiterMiddleware(relayUpgradeNodeLimiter, {
+      resolveKey: () => `node:${identity.nodeId}`,
+    });
+    const nodeLimited = await nodeRateLimit(c, async () => undefined);
+    if (nodeLimited instanceof Response) return nodeLimited;
     c.set("relayIdentity", identity);
     await next();
   };
@@ -102,12 +124,12 @@ function relaySocketFor(ws: RelayWsContext): RelaySocket {
 }
 
 /**
- * The socket events of one upgraded CLI relay connection, for the identity the
+ * The socket events of one upgraded node relay connection, for the identity the
  * middleware authenticated. Exported for the wiring tests. `onOpen` runs after
  * the awaited authentication, so it is where a socket that authenticated
  * during shutdown is refused ({@link RelaySessionManager.acceptAuthenticatedSocket}).
  */
-export function relaySocketEvents(identity: CliWebsocketIdentity): WSEvents<WebSocketLike> {
+export function relaySocketEvents(identity: NodeIdentity): WSEvents<WebSocketLike> {
   return {
     onOpen(_event, ws) {
       const socket = relaySocketFor(ws);
@@ -118,7 +140,7 @@ export function relaySocketEvents(identity: CliWebsocketIdentity): WSEvents<WebS
     onMessage(event, ws) {
       const socket = relaySocketFor(ws);
       if (typeof event.data === "string") {
-        settleSocketHandler("cli text", relaySessionManager.handleTextFrame(socket, event.data));
+        settleSocketHandler("node text", relaySessionManager.handleTextFrame(socket, event.data));
         return;
       }
       if (event.data instanceof ArrayBuffer) {
@@ -128,7 +150,7 @@ export function relaySocketEvents(identity: CliWebsocketIdentity): WSEvents<WebS
     onClose(_event, ws) {
       const socket = relaySocketFor(ws);
       settleSocketHandler(
-        "cli close",
+        "node close",
         relaySessionManager.removeSession(socket).finally(() => {
           relaySockets.delete(ws);
         }),
@@ -137,7 +159,7 @@ export function relaySocketEvents(identity: CliWebsocketIdentity): WSEvents<WebS
     onError(_event, ws) {
       const socket = relaySocketFor(ws);
       settleSocketHandler(
-        "cli error",
+        "node error",
         relaySessionManager.removeSession(socket).finally(() => {
           relaySockets.delete(ws);
         }),

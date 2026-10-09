@@ -2,17 +2,56 @@
   "name": "@ws-model-proxy/api",
   "type": "module",
   "exports": {
-    "./lib/deployment-service": {
-      "default": "./src/lib/deployment-service.ts"
+    "./lib/runtime-spec": {
+      "default": "./src/lib/runtime-spec.ts"
     },
-    "./lib/deployment-spec": {
-      "default": "./src/lib/deployment-spec.ts"
+    "./lib/runtime-presets": {
+      "default": "./src/lib/runtime-presets.ts"
     },
-    "./lib/deployment-operator-notify": {
-      "default": "./src/lib/deployment-operator-notify.ts"
+    "./lib/spec-issues": {
+      "default": "./src/lib/spec-issues.ts"
     },
-    "./lib/deployment-planner": {
-      "default": "./src/lib/deployment-planner.ts"
+    "./lib/canonical-json": {
+      "default": "./src/lib/canonical-json.ts"
+    },
+    "./lib/step-intent": {
+      "default": "./src/lib/step-intent.ts"
+    },
+    "./lib/runtime-launch-hash": {
+      "default": "./src/lib/runtime-launch-hash.ts"
+    },
+    "./lib/node-relay-services": {
+      "default": "./src/lib/node-relay-services.ts"
+    },
+    "./lib/live-load": {
+      "default": "./src/lib/live-load.ts"
+    },
+    "./lib/node-command-settle": {
+      "default": "./src/lib/node-command-settle.ts"
+    },
+    "./lib/graph-write": {
+      "default": "./src/lib/graph-write.ts"
+    },
+    "./lib/claim-release": {
+      "default": "./src/lib/claim-release.ts"
+    },
+    "./lib/runtime-store": {
+      "default": "./src/lib/runtime-store.ts"
+    },
+    "./lib/needs-you-mail": {
+      "default": "./src/lib/needs-you-mail.ts"
+    },
+    "./nodes/fabrics": {
+      "default": "./src/nodes/fabrics.ts"
+    },
+    "./nodes/enroll-exchange": {
+      "default": "./src/nodes/enroll-exchange.ts"
+    },
+    "./contracts": {
+      "default": "./src/contracts/index.ts"
+    },
+    "./contracts/metrics": {
+      "default": "./src/contracts/metrics.ts"
     },
     ".": {
       "default": "./src/index.ts"
@@ -20,29 +59,17 @@
     "./context": {
       "default": "./src/context.ts"
     },
-    "./lib/cli-credential-access": {
-      "default": "./src/lib/cli-credential-access.ts"
-    },
-    "./lib/mcp-token-access": {
-      "default": "./src/lib/mcp-token-access.ts"
-    },
-    "./lib/mcp-token-active": {
-      "default": "./src/lib/mcp-token-active.ts"
-    },
-    "./lib/model-pool-routing": {
-      "default": "./src/lib/model-pool-routing.ts"
-    },
     "./lib/model-connection-type": {
       "default": "./src/lib/model-connection-type.ts"
-    },
-    "./lib/model-api-token-access": {
-      "default": "./src/lib/model-api-token-access.ts"
     },
     "./lib/caller-external-wait": {
       "default": "./src/lib/caller-external-wait.ts"
     },
     "./lib/media-attachment-limits": {
       "default": "./src/lib/media-attachment-limits.ts"
+    },
+    "./lib/request-compat": {
+      "default": "./src/lib/request-compat.ts"
     },
     "./lib/openai-compatible-capabilities": {
       "default": "./src/lib/openai-compatible-capabilities.ts"
@@ -59,29 +86,14 @@
     "./lib/pool-recommended-surface": {
       "default": "./src/lib/pool-recommended-surface.ts"
     },
-    "./lib/declared-context-window": {
-      "default": "./src/lib/declared-context-window.ts"
-    },
     "./lib/provider-type": {
       "default": "./src/lib/provider-type.ts"
     },
     "./lib/effective-provider-egress": {
       "default": "./src/lib/effective-provider-egress.ts"
     },
-    "./lib/guarded-pool-create-reasons": {
-      "default": "./src/lib/guarded-pool-create-reasons.ts"
-    },
-    "./lib/deployment-refusal-reasons": {
-      "default": "./src/lib/deployment-refusal-reasons.ts"
-    },
     "./lib/serializable-transaction": {
       "default": "./src/lib/serializable-transaction.ts"
-    },
-    "./lib/capacity-policy-safety": {
-      "default": "./src/lib/capacity-policy-safety.ts"
-    },
-    "./lib/discovered-inference-capacity": {
-      "default": "./src/lib/discovered-inference-capacity.ts"
     },
     "./lib/engine-facts": {
       "default": "./src/lib/engine-facts.ts"
@@ -94,15 +106,6 @@
     },
     "./lib/metric-routing": {
       "default": "./src/lib/metric-routing.ts"
-    },
-    "./lib/node-inventory": {
-      "default": "./src/lib/node-inventory.ts"
-    },
-    "./lib/pool-grant-spend-cap-schema": {
-      "default": "./src/lib/pool-grant-spend-cap-schema.ts"
-    },
-    "./lib/remote-engine-adapters": {
-      "default": "./src/lib/remote-engine-adapters.ts"
     },
     "./lib/reasoning-contract": {
       "default": "./src/lib/reasoning-contract.ts"
@@ -125,35 +128,21 @@
     "./lib/relay-protocol-version": {
       "default": "./src/lib/relay-protocol-version.ts"
     },
-    "./lib/cli-file-access": {
-      "default": "./src/lib/cli-file-access.ts"
-    },
-    "./lib/mcp-command-mode": {
-      "default": "./src/lib/mcp-command-mode.ts"
-    },
-    "./lib/supervised-command-types": {
-      "default": "./src/lib/supervised-command-types.ts"
-    },
     "./routers/index": {
       "default": "./src/routers/index.ts"
     },
-    "./lib/cli-token-capability": {
-      "default": "./src/lib/cli-token-capability.ts"
-    },
-    "./lib/engine-process-capacity": {
-      "default": "./src/lib/engine-process-capacity.ts"
+    "./lib/pool-routing": {
+      "default": "./src/lib/pool-routing.ts"
     }
   },
   "scripts": {
     "check-types": "tsc -p tsconfig.check-types.json --noEmit",
     "test": "vitest run --passWithNoTests",
-    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism src/lib/capacity-policy-races.postgres.integration.test.ts src/lib/capacity-lock-order.postgres.integration.test.ts src/lib/model-pool-trial-lease.postgres.integration.test.ts src/lib/writer-classes.postgres.integration.test.ts src/lib/capacity-cycles.postgres.integration.test.ts src/lib/parent-deletion.postgres.integration.test.ts src/lib/deletion-commit-point.postgres.integration.test.ts src/routers/forwarder-management.postgres.integration.test.ts src/routers/model-api-tokens.postgres.integration.test.ts src/routers/mcp-tokens.postgres.integration.test.ts src/lib/cli-credential-access.postgres.integration.test.ts src/lib/mcp-file-read-defaults.postgres.integration.test.ts src/lib/model-pool-routing.disconnect-fence.postgres.integration.test.ts src/routers/overview.postgres.integration.test.ts src/routers/provider-catalog.postgres.integration.test.ts src/routers/cli-agent-activity.postgres.integration.test.ts src/routers/forwarder-cli-devices.postgres.integration.test.ts src/routers/inference-contributions.postgres.integration.test.ts",
-    "test:postgres:volume": "WMP_PARENT_DELETE_ROWS=1400000 vitest run --maxWorkers=1 --no-file-parallelism src/lib/parent-deletion.postgres.integration.test.ts"
+    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism --hookTimeout=60000 --testTimeout=60000 --passWithNoTests postgres.integration"
   },
   "dependencies": {
     "@orpc/openapi": "catalog:",
     "@orpc/server": "catalog:",
-    "@orpc/zod": "catalog:",
     "@ws-model-proxy/auth": "workspace:*",
     "@ws-model-proxy/config": "workspace:*",
     "@ws-model-proxy/db": "workspace:*",
@@ -162,7 +151,6 @@
     "zod": "catalog:"
   },
   "devDependencies": {
-    "@orpc/client": "catalog:",
     "hono": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:",

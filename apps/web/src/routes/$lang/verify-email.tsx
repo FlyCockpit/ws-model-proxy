@@ -43,11 +43,11 @@ function VerifyEmailPage() {
     isPending: configPending,
     isError: configError,
     refetch: refetchConfig,
-  } = useQuery(orpc.appConfig.queryOptions());
+  } = useQuery(orpc.app.config.queryOptions());
   const { t } = useTranslation(["auth", "common"]);
 
   const isAuthenticated = authSession.state.status === "authenticated";
-  const canResend = configData?.emailEnabled === true && configData?.forceSso !== true;
+  const canResend = configData?.emailEnabled === true;
 
   if (error || !ok) {
     return (
@@ -107,7 +107,7 @@ function VerifyEmailPage() {
     >
       {isAuthenticated ? (
         <Link
-          to="/$lang/dashboard"
+          to="/$lang/overview"
           params={{ lang }}
           className={cn(buttonVariants(), "min-h-[44px] w-full")}
         >

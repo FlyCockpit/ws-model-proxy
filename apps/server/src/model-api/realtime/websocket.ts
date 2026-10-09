@@ -1,8 +1,4 @@
 import { upgradeWebSocket, type WebSocketLike } from "@hono/node-server";
-import {
-  authenticateModelApiTokenSecret,
-  type ModelApiTokenIdentity,
-} from "@ws-model-proxy/api/lib/model-api-token-access";
 import type { Context, MiddlewareHandler } from "hono";
 import type { WSContext, WSEvents } from "hono/ws";
 import { WebSocket } from "ws";
@@ -10,7 +6,9 @@ import { resolveClientIp } from "../../client-ip.js";
 import { createRateLimiterMiddleware, realtimeUpgradeLimiter } from "../../rate-limit.js";
 import { relaySessionManager } from "../../relay/session-manager.js";
 import type { CapacityAdmissionRuntime } from "../capacity/runtime.js";
+import { clientCredential } from "../client-credential.js";
 import { openAiErrorBody } from "../openai-errors.js";
+import { type ApiKeyIdentity, authenticateApiKey } from "../resolve.js";
 import { createRealtimeAuthorizer } from "./authorize.js";
 import { createRealtimeAdmit } from "./capacity.js";
 import { REALTIME_KEY_SUBPROTOCOL_PREFIX, REALTIME_PATH } from "./constants.js";
@@ -46,17 +44,17 @@ import {
 
 /**
  * `GET /v1/realtime?intent=transcription` (design §2): the OpenAI Realtime
- * transcription subset over a WebSocket, for model API tokens.
+ * transcription subset over a WebSocket, for API keys.
  *
  * Upgrade checks, in order: an upgrade request (426), not draining (503), the
  * per-IP pre-auth limiter (429, failed authentications count), a query of
  * only `intent=transcription` and an optional `model` (400; a credential in
  * the URL is refused, never read), the credential (401), then the live
- * session caps per token, user and server (429). The credential is the
+ * session caps per key, user and server (429). The credential is the
  * `Authorization: Bearer` header or, for browsers, the subprotocol pair
- * `realtime` + `openai-insecure-api-key.<token>`; the server selects only
+ * `realtime` + `openai-insecure-api-key.<key>`; the server selects only
  * `realtime` and never echoes the key. It goes through the same
- * `authenticateModelApiTokenSecret` as every `/v1` route; no cookie session
+ * `authenticateApiKey` as every `/v1` route; no cookie session
  * is ever read here, so there is no CSRF surface.
  *
  * The admission taken before the upgrade is released exactly once: by the
@@ -73,12 +71,12 @@ export const REALTIME_OPEN_GUARD_MS = 10_000;
 
 export type RealtimeEndpointDeps = {
   relay: RealtimeRelay & {
-    getActiveCliDeviceIds(): string[];
+    getOnlineNodeIds(): string[];
     isDraining(): boolean;
   };
   counters: RealtimeSessionCounters;
   registry: RealtimeSessionRegistry;
-  authenticate: (secret: string) => Promise<ModelApiTokenIdentity | null>;
+  authenticate: (secret: string) => Promise<ApiKeyIdentity | null>;
   capacityRuntime?: CapacityAdmissionRuntime;
   /** Tests replace the send claim (the default is the HTTP send's locked check). */
   authorizeOpen?: (requester: {
@@ -103,7 +101,7 @@ export function productionRealtimeDeps(
     relay: relaySessionManager,
     counters: realtimeSessionCounters,
     registry: realtimeSessionRegistry,
-    authenticate: authenticateModelApiTokenSecret,
+    authenticate: (secret) => authenticateApiKey(secret),
     ...(capacityRuntime ? { capacityRuntime } : {}),
   };
 }
@@ -127,10 +125,16 @@ function errorResponse(
   return c.json(openAiErrorBody({ message, type, code }), status);
 }
 
-function bearerSecret(header: string | undefined): string | null {
-  if (!header) return null;
-  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
-  return match?.[1] ?? null;
+/**
+ * The key from the headers (Bearer, x-api-key, api-key) or the subprotocol; null when absent or
+ * when two different keys were offered (refused, never resolved in favor of one).
+ */
+function realtimeSecret(headers: Headers): string | null {
+  const credential = clientCredential(headers);
+  if (credential.kind === "conflict") return null;
+  const offered = subprotocolSecret(headers.get("sec-websocket-protocol") ?? undefined);
+  if (credential.kind === "key" && offered !== null && offered !== credential.key) return null;
+  return credential.kind === "key" ? credential.key : offered;
 }
 
 /** The offered subprotocols, trimmed. */
@@ -226,9 +230,7 @@ export function createRealtimeWebsocketMiddleware(
     if (limited instanceof Response) return limited;
     const query = readRealtimeQuery(c.req.url);
     if (!query.ok) return errorResponse(c, 400, "invalid_request_error", query.code, query.message);
-    const secret =
-      bearerSecret(c.req.header("authorization")) ??
-      subprotocolSecret(c.req.header("sec-websocket-protocol"));
+    const secret = realtimeSecret(c.req.raw.headers);
     if (!secret) {
       return errorResponse(c, 401, "invalid_request_error", "invalid_api_key", "Missing API key.");
     }
@@ -320,16 +322,16 @@ export function realtimeSocketEvents(
       ? deps.router({ requester: identity, onResolved })
       : createRealtimeRouter({
           access: targetAccess(identity),
-          activeCliDeviceIds: () => deps.relay.getActiveCliDeviceIds(),
+          onlineNodeIds: () => deps.relay.getOnlineNodeIds(),
           onResolved,
         });
     const requester = { tokenId: requesterTokenId(identity), userId: identity.userId };
     const token = identity.credential.kind === "token" ? identity.credential.token : null;
-    // Attributed as the HTTP request of the same credential: a token's
-    // request, or a Chat Test request with no token.
+    // Attributed as the HTTP request of the same credential: an API key's
+    // request, or a Chat Test request with no key.
     const meterRequester = {
       userId: identity.userId,
-      source: token ? ("API_TOKEN" as const) : ("CHAT_TEST" as const),
+      source: token ? ("API_KEY" as const) : ("TEST" as const),
       tokenId: token?.id ?? null,
       tokenLookupPrefix: token?.lookupPrefix ?? null,
     };

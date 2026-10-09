@@ -1,0 +1,11 @@
+{
+  "subject": "{{owner}} shared a pool with you",
+  "heading": "A pool was shared with you",
+  "body": "{{owner}} shared the pool {{pool}} with this e-mail address on WS Model Proxy. Create an account with this address to start using it.",
+  "runtimeSubject": "{{owner}} shared a runtime definition with you",
+  "runtimeHeading": "A runtime definition was shared with you",
+  "runtimeBody": "{{owner}} shared the runtime definition {{runtime}} with this e-mail address on WS Model Proxy. Create an account with this address, or sign in, to see it and copy it into your own runtimes.",
+  "cta": "Create your account",
+  "expiry": "This link works until {{expiresAt}} and can be used once.",
+  "ignoreFooter": "If you weren't expecting this invitation, you can safely ignore this email."
+}

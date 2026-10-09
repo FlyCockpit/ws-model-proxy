@@ -46,22 +46,7 @@ const envMock = vi.hoisted(() => ({
   BETTER_AUTH_URL: "https://proxy.example.com",
   BETTER_AUTH_SECRET: "chain-test-secret-at-least-thirty-two-characters",
   CORS_ORIGIN: "https://app.example.com",
-  RATE_LIMIT_AUTH_POINTS: 500,
-  RATE_LIMIT_AUTH_DURATION: 60,
-  RATE_LIMIT_AUTH_BLOCK_DURATION: 0,
-  RATE_LIMIT_SIGNUP_POINTS: 3,
-  RATE_LIMIT_SIGNUP_DURATION: 3600,
-  RATE_LIMIT_SIGNUP_BLOCK_DURATION: 3600,
-  RATE_LIMIT_RPC_POINTS: 1000,
-  RATE_LIMIT_RPC_DURATION: 60,
-  RATE_LIMIT_EMAIL_RECIPIENT_POINTS: 3,
-  RATE_LIMIT_EMAIL_RECIPIENT_DURATION: 3600,
-  RATE_LIMIT_EMAIL_RECIPIENT_BLOCK_DURATION: 0,
-  RATE_LIMIT_SIGNUP_RECIPIENT_POINTS: 6,
-  RATE_LIMIT_MCP_POINTS: 2,
-  RATE_LIMIT_MCP_DURATION: 60,
-  RATE_LIMIT_MCP_CONSENT_POINTS: 2,
-  RATE_LIMIT_MCP_CONSENT_DURATION: 60,
+  WMP_RATE_LIMIT_SCALE: 1,
   TRUST_PROXY_HOPS: undefined,
   MEDIA_MAX_UPLOAD_BYTES: 5 * 1024 * 1024,
   MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES: 1024 * 1024,
@@ -69,6 +54,20 @@ const envMock = vi.hoisted(() => ({
   SSR_CACHE_TTL_SECONDS: 0,
 }));
 vi.mock("@ws-model-proxy/env/server", () => ({ env: envMock }));
+
+// Small MCP buckets (2 points) so a few requests exhaust them. The MCP
+// limiter modules build their buckets from these exported constants at import.
+vi.mock("./rate-limit.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./rate-limit.js")>();
+  return {
+    ...actual,
+    DEFAULTS: {
+      ...actual.DEFAULTS,
+      mcp: { points: 2, duration: 60 },
+      mcpConsent: { points: 2, duration: 60 },
+    },
+  };
+});
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -217,7 +216,7 @@ describe("createApp /mcp chain — order pins (flag on)", () => {
 
   it("IP limiter BEFORE body cap: exhausted mcp:ip: bucket answers 429 to an oversized body, not 413", async () => {
     const app = await buildApp(true);
-    // Exhaust the bucket (RATE_LIMIT_MCP_POINTS = 2 in the env mock).
+    // Exhaust the bucket (DEFAULTS.mcp.points = 2 in the rate-limit mock).
     for (let i = 0; i < 2; i++) {
       const warm = await app.request(MCP, {
         method: "POST",

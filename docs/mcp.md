@@ -1,623 +1,456 @@
 # MCP server
 
-WS Model Proxy exposes its dashboard operations to MCP (Model Context Protocol)
-clients as an OAuth-protected resource. The surface is on by default.
-`WMP_MCP_ENABLED` is the kill switch (`false` closes it). Everything else — the canonical URL,
-protocol profile, scopes, token lifetimes, and registration policy — is derived
-from configuration in code, not operator tuning.
+WS Model Proxy exposes its operations to MCP (Model Context Protocol) clients as
+an OAuth-protected resource at `/mcp`. The surface is on by default.
+`WMP_MCP_ENABLED` is the kill switch (`false` closes it). Everything else — the
+canonical URL, protocol profile, scopes, token lifetimes, and registration
+policy — is derived from configuration in code, not operator tuning.
 
-The tool catalog (every exposed tool, its scope, confirmation literal, and every
-excluded procedure) is maintained in the generated, test-enforced artifact
-[docs/mcp-tool-coverage.md](./mcp-tool-coverage.md). This document describes the
-server behavior around it; it does not duplicate the catalog.
+The tool catalog (all 28 tools, their procedures, confirmation literals and rate
+limits, and every procedure kept off MCP with its reason) is the generated,
+test-enforced [docs/mcp-tool-coverage.md](./mcp-tool-coverage.md). The tool
+definitions themselves are `MCP_TOOLS` in
+`packages/api/src/contracts/mcp-tools.ts`; `apps/server/src/mcp/tools.ts`
+registers them. This document holds the longer guidance the tool descriptions
+point to, and the server behavior around the tools.
 
-Node telemetry (relay protocol 2.4) is read-only over MCP. Node file tools
-(relay protocol 2.4) are described in [CLI file tools](#cli-file-tools-relay-protocol-24).
-`forwarder_device_metrics_get` (`{ cliDeviceId }`) returns a CLI device's static
-`node.info`, its freshest `node.metrics` (live from the relay session, else the
-stored once-a-minute snapshot, with `nodeMetricsSource`), the live
-`endpoint.load` readings the relay holds in memory, a `node` snapshot (kind,
-GPUs, live memory, labels, usable budgets, health warnings), and last-hour
-`minuteHistory` min/avg/max gauges. Labels and usable budgets are human-only
-dashboard writes; this tool is read-only. Health warnings are informational
-and never preflight gates. Detected engine facts
-(`engineKind`, `engineSlots`, `kvBudgetTokens`, `maxModelLen`,
-`engineFactsSource`, `engineFactsAt`) and the derived `enginePreset` appear on
-every capacity in `capacity_records_list`. `effectiveKvBudgetTokens` is the
-capacity-card cut (live prefix-eviction applied to reported K, or the reported
-K when the eviction read fails). Neither ever contains prompt text:
-the CLI reads only slot ids, context sizes and busy flags from llama.cpp
-`/slots`.
+## Tools
 
-Discovery shares one capacity for a llama.cpp, vLLM, or SGLang endpoint only
-when the CLI proves that at least two inventory model ids are aliases served
-by that process. Ollama, LM Studio, and llama.cpp router mode retain separate
-capacities. Model-swapping front ends are excluded only through engine detection
-and router-role proof. Owner assignments are recorded per target only when the
-capacity FK changes, including a real detach to null or a move to an existing AUTO
-capacity. Equal-FK and policy-only inputs preserve provenance; an untouched web
-attachment field preserves the target's current capacity. USER limits remain owner
-controlled. Removed aliases split on a later idle inventory. Discovery defers each
-connected move group while its source or destination capacities have ACTIVE leases
-or WAITING waiters. Unrelated capacities and independent endpoint groups do not block
-it. Every later inventory retries deferred groups; the CLI sends inventory on reconnect
-or operator reload, so an involved busy capacity can defer moves until an idle inventory.
-Existing handles keep their original capacity.
-Every join and split must fit direct and effective pool concurrency and context policies.
-Shared AUTO limits follow engine slots, otherwise the sum of current automatic member
-limits; incompatible lowerings wait for a policy change and the next inventory.
-Startup leaves unknown shared AUTO limits for that complete inventory aggregate.
-Empty AUTO discovery capacities are removed with model, endpoint, and device
-deletes, and an idempotent startup sweep repairs existing idle orphans. The sweep skips
-contended owners and capacities for the next registration or startup.
-Owner-created empty capacities remain visible in `capacity_records_list`.
-Automatic capacity labels get a numeric suffix when an owner's existing label
-collides; repeated discovery preserves the capacity identity and its label.
+Agents work with the user's nouns: nodes, runtimes, pools, profiles, providers,
+requests and metrics.
 
-`forwarder_device_metrics_get` also lists `series`: every metric a pool routing
-rule can name on that device (built-in `node.*` series such as
-`node.cpu.usage_percent`, `node.memory.used_percent` or
-`node.gpu.temperature_c{gpu="0"}`, and the CLI's custom series), with its
-labels, latest value and whether it is stale. It also returns the remote metric
-source definitions the server holds (`remoteMetricSources`, each with the
-`commandSha256` the CLI pins) next to the CLI's own view of every source in
-`nodeMetrics.sources` (`active`, `pending_approval`, `refused`, ...).
+- **Levels.** A credential is Read-only (`READ`) or Full (`FULL`). READ
+  credentials see the 7 read tools (`*_get`, `requests_list`, `metrics_query`);
+  FULL credentials see all 28. A FULL tool called with a READ credential answers
+  exactly like an unknown tool. Even Full cannot touch sharing, API keys,
+  agent tokens, provider accounts, enrollment, hold lines or node trust; those
+  stay with people. An agent token's level is chosen when it is created; an
+  OAuth connection's level is chosen by the person on the consent page and can
+  be changed in Access → Agents (see [Scopes](#scopes)).
+- **Node trust.** Commands, files, secrets, metric commands and definition
+  changes need a node at Full control. A Relay-only node relays inference for
+  the definitions it held when it entered Relay only; agents cannot start,
+  stop or change anything there. Lowering only stops new agent access through
+  wsmp: software an agent already left on the node at Full control (a systemd
+  user service, say) keeps running as the same user and can even raise trust
+  locally. If you distrust what an agent did, reinstall the node.
+- **Notes.** Most writes take an optional `note` (1–500 characters);
+  `node_command_queue_for_user` requires one, and the deletes,
+  `runtime_start`, `runtime_stop` (except with `markStopped`), `profile_apply` and
+  `model_test` take none.
+  Say what you are trying; people see it beside the change (runtime version
+  history, node activity, command log, queued commands).
+- **Deleting nodes.** `node_delete` removes an offline node only (refused with
+  `node_online` while it is connected, with no override); its always-on
+  runtimes go and instances with a part there stop. It is audited with the
+  node's slug and id. People delete any node in the browser.
+- **Confirmation.** Deletes take `confirm: "DELETE"`, `node_command_run`
+  takes `confirm: "RUN"` and `runtime_stop` with `markStopped` takes
+  `confirm: "MARK_STOPPED"`. The literal only proves intent; it never replaces a
+  person's confirmation where one is required.
+- **Previews.** `runtime_start` and `profile_apply` accept a preview first: it
+  shows placements, what stops and hold changes. Preview when unsure.
 
-Metric routing rules (S-B part 2):
+### Commands versus runtimes
 
-- `forwarder_pool_routing_rules_get` (`{ poolId }`) returns the pool's rules,
-  each primary member's current verdict (`full`, `avoid` or none), its state
-  (`active`, `stale`, `unevaluated`), a per-rule `triggered` / `clear` /
-  `stale` state, the member's `endpoint.*` load series (`endpoint.running`,
-  `endpoint.waiting`, `endpoint.kv_usage`, ...) and the series of each member's
-  device. Each member also carries `engineLoad` (S-D): its override `mode`
-  (`auto` / `off`), `customMode` (`observe` / `enforce`; custom FULL starts
-  observe-only), `loadSource`, `signals`, `enforced`, the engine kind and slots,
-  the live reading (`running`, `waiting`, `kvUsage`, `kvOccupancy`, `slotsBusy`,
-  `deferred`, age, `stale`, prefix cache totals) and the verdict state
-  (`full_waiting`, `full_kv`, `full_slots`, `full_deferred`, `clear`, `stale`,
-  `none`, `off`). `kvOccupancy` is display only: it never marks FULL and is not
-  eviction evidence. `engineLoad.kvBudget` includes `reportedTokens`,
-  `effectiveTokens` (warm-protection K for this pool; equals reported when
-  protection is off), `placementTokens` (residency spreading K; always the
-  live cut), `source` (`PROBE` / `CONFIG` / `CUSTOM` — provenance of the
-  **reported** K, null when K is unknown), `cutFraction` (0–0.5), `floorFraction` (0.5),
-  `lastObservedAt`, `expiresAt`, and `active`. Prefix-eviction feedback
-  temporarily lowers token-mode warm-protection and residency-placement
-  budgets; slot mode (including
-  llama.cpp) has null effective tokens and is inactive. Failed feedback reads
-  fall back to the reported budget. `endpoint.kv_occupancy` is also available as
-  an explicit routing-rule series.
-- `forwarder_pool_member_engine_load_set` (`{ poolMemberId, mode: "auto" |
-  "off", customMode?: "observe" | "enforce", kvFullThreshold?, confirm: "RUN" }`)
-  turns "use engine load" off for a member, sets whether custom FULL gates
-  admission, or overrides its vLLM/SGLang KV threshold (default 0.95). Engine
-  load only adds FULL (lease counts stay authoritative), a stale reading is
-  ignored, and when every candidate is FULL a plain-name request is admitted by
-  leases alone. Classified `cost` like the rules.
-- `forwarder_pool_routing_rules_set` (`{ poolId, rules, confirm: "RUN" }`)
-  replaces the whole list (at most 16). A rule is a flat record
-  `{ metric, labels?, aggregate: "max" | "min" | "avg", op: ">" | ">=" |
-  "<" | "<=", threshold, effect: "full" | "avoid", memberId?,
-  excludeMemberId? }`; there is no expression language. `memberId` limits
-  the rule to that pool member; `excludeMemberId` applies it to every other
-  member; the two must not both be set. Label keys and values use the
-  metric-name charset, and `__proto__` is not accepted as a label key (the
-  rule is rejected, never widened).
-  `full` makes the member FULL: the request queues, goes to another member, or
-  (for `:external` callers only) goes external after `externalAfterWaitMs`.
-  `avoid` ranks the member last among free members and never makes it
-  ineligible. A stale or missing metric makes its rule inert, and when every
-  candidate is metric-FULL a plain-name request is admitted by leases alone
-  (fail open), so metrics never make a pool sit idle. It is confirmed and
-  classified `cost` because a `full` rule can send `:external` traffic to paid
-  providers.
-- `forwarder_device_metric_sources_set` (`{ cliDeviceId, sources, confirm:
-  "RUN" }`) replaces a device's remotely defined metric sources
-  (`{ name, command, intervalSecs >= 5, timeoutSecs, format: "number" | "json"
-  | "prometheus" }`). The server accepts it only while the device's MCP command
-  mode is `unsupervised`, only for a personal token minted with the CLI
-  commands option (`allowCliCommands`; OAuth clients and other tokens neither
-  see nor can call it), and sends an empty list to the CLI whenever the mode
-  is anything else. The CLI refuses remote sources unless its local
-  `allowRemoteMetricSources` opt-in is on, and runs a command only after the
-  person approves that exact command string on the machine
-  (`wsmp metrics approve <name> --sha256 <hash>`, the hash of the command they
-  read); a changed command stops until it is approved
-  again. stderr and command output never leave the CLI; only parsed numbers do.
-- `forwarder_device_engine_adapters_set` (`{ cliDeviceId, adapters, confirm:
-  "RUN" }`) replaces a device's remotely defined engine adapters
-  (`{ endpointSlug, input: { route } | { command }, format: "json" |
-  "prometheus", intervalSecs 2..5, timeoutSecs 1..4, map? }`). Same
-  unsupervised-mode and CLI-commands credential gate as metric sources. The
-  CLI refuses remote adapters unless its separate local
-  `allowRemoteEngineAdapters` opt-in is on (metric-source opt-in is not
-  enough), and runs a spec only after the person approves that exact
-  canonical JSON on the machine (`wsmp endpoints adapter approve <slug>
-  --sha256 <hash>`); a changed spec stops until it is approved again. Custom
-  FULL starts observe-only. Occupancy is display only.
-- `forwarder_device_engine_adapters_clear` (`{ cliDeviceId, confirm: "RUN" }`)
-  clears those remote adapters and sends an empty list to the live CLI.
+`node_command_run` is for one-off work: downloads while experimenting, builds,
+diagnostics, benchmarks. It answers within about 15 seconds with the command's
+state; poll `node_command_get` (`waitMs` waits up to 30 s, `cancel` stops the
+command and everything it started). A command lives at most its timeout
+(default 1 hour) and never longer than the node's command lifetime (1 minute to
+24 hours). Each poll returns at most a 64 KiB output tail.
 
-`forwarder_engine_load_history_get` (`{ poolId } | { capacityId }`) returns the
-30-minute live engine-load history (10 s buckets) for a pool or capacity the
-caller owns. Each member includes `series` (max `running` / `waiting` /
-`kvUsage` / `kvOccupancy` / `slotsBusy`, summed prefix deltas, `source`, and
-`gap` markers), `signals`, the effective KV FULL threshold, and reported K.
-`kvOccupancy` is display only. A foreign pool or capacity returns `NOT_FOUND`.
+Anything that should keep running or serve traffic must be a runtime. A server
+started with a command is invisible to the proxy and dies with the command. When
+a step needs a person (for example a `sudo` password), queue it with
+`node_command_queue_for_user`; it runs only when they press Run and Enter in
+Terminals. Poll its `id` with `node_command_get` as well: the answer has
+`queuedForUser: true` and the queued state (`QUEUED`, `RUN`, `DISMISSED`,
+`EXPIRED`, `REFUSED` or `WITHDRAWN`) and never output, since the person runs it
+in their terminal.
 
-`forwarder_pool_cache_stats_get` (`{ poolId, poolMemberId?, lastMinutes | lastDays,
-bucket?, split? }`) returns the prompt-cache hit rate for a pool, or one member,
-over a window ending now. `hitRate` is `cacheReadTokens / cacheKnownInputTokens`,
-capped at 1, or `null` when nothing reported cache usage (never 0 for unknown).
-`continuationHitRate` is the same ratio for requests that continued a known
-session (matched affinity); it is `null` for windows that predate those rollup
-columns. `coverage` is `cacheKnownRequests / requests` — check it first.
-Compare `continuationHitRate` for equal windows before and after a change.
-`notes` may include `low_coverage`, `window_truncated_by_retention`,
-`hour_resolution`, and `engine_reports_no_cache_fields`. Minutes read minute
-rollups; days read minute rollups up to 30 days and hour rollups beyond.
-Owners see every requester on their pools; grantees see only their own. A
-foreign pool or member returns `NOT_FOUND`. Engine prefix-cache counters stay
-on the engine-load charts and are not mixed into this tool.
+- **Expiry.** A queued command expires `expiresInHours` after it was queued
+  (default 24, at most 168). Past that it reads as `EXPIRED` at once, and the
+  hourly retention sweep stores `EXPIRED`. Revoking or lowering the agent
+  credential that queued it expires it too. Decided commands (run, dismissed,
+  expired, refused or withdrawn) are deleted 7 days later; the node audit keeps
+  the command's digest for 90 days.
+- **Withdraw.** `node_command_get` with `cancel: true` withdraws a command that
+  is still `QUEUED` (`WITHDRAWN`, audited). Only the agent credential that
+  queued it (the same agent token, or the same OAuth client grant) can withdraw
+  it; another credential gets `not_your_command`. A command the person already
+  ran, dismissed or that expired cannot be withdrawn (`command_not_running`).
+- **Run and dismiss are human-only.** Only the person runs or dismisses a
+  queued command, on the Terminals page; there is no MCP tool for either.
 
-## CLI file tools (relay protocol 2.4)
+### Stops that cannot be proven
 
-Nine PAT-only tools read and change files on a CLI device (a node): `forwarder_cli_file_read`,
-`forwarder_cli_file_stat`, `forwarder_cli_dir_list`, `forwarder_cli_file_search`
-(read class, scope `read`, no confirmation) and `forwarder_cli_file_edit`,
-`forwarder_cli_file_write`, `forwarder_cli_file_rename`, `forwarder_cli_dir_create`
-(write class, `confirm: "RUN"`) and `forwarder_cli_file_delete` (`confirm: "DELETE"`).
-All take `cliDeviceId`. The CLI runs the operations itself, fd-based and symlink-safe;
-it does not compose shell commands. Every result that touches a file carries an
-`etag`, results are bounded windows, and write-class calls take an optional `reason`
-(500 characters) that goes to the CLI log and is shown on the CLI confirm screen
-on a supervised node.
+A stopping instance keeps its resources and ports until its node proves the
+stop. Every command the node runs for a rank (prepare, start, after-join,
+stop, status, health) runs in that rank's systemd user slice, so whatever a
+command leaves behind (a fork, a `setsid` daemon) stays where the node looks.
+A stop runs the stop command, stops the rank's units, then ends everything
+left in the slice (SIGTERM, then SIGKILL after 10 seconds); status and health
+checks never kill anything. On Linux these commands need the systemd user
+manager (lingering, or wsmp running as the installed `wsmp.service`).
+The node proves the stop from what it observes itself: no process is left in
+the rank's units or its slice, and every port reserved for the rank (`port`
+and the distributed port) is free. For a `process` runtime the `status`
+command is not needed for that proof and cannot block it (a stub `status:
+"true"` would say "alive" forever). A run whose processes may live outside
+the slice also needs its `status` command to say stopped (exit 3): a
+`service` runtime (a start that hands off to docker or a service manager
+escapes the slice on purpose), any step a person ran in a terminal (a
+prepare too), and any run on a node without systemd units. A `status`
+command that can never say stopped (`true`, `:`, `exit 0`; new definitions
+refuse it) counts as none on a node with systemd units, so a version saved
+earlier with one is proven by its empty units and free ports; on a node
+without units such a run stays unproven. The same proof is
+required again before a repeated stop answers stopped and before the node's
+inventory reports a rank stopped. A stop step completes as soon as this proof holds. When the stop
+steps fail, the server asks the node for a status probe that checks the same
+proof; the stop then completes with no person involved. Only when the node
+cannot prove it (still alive, or offline for 10 minutes) does the instance
+show `needsOperator: "MARK_STOPPED"`; the probe is repeated every 5 minutes, so
+a later proof still completes it. Each rank's `lastStopCheck.errorCode` says
+why the last probe failed: `process_alive`, `process_unknown` (the node could
+not read its units), `port_in_use`, `port_held_outside_runtime` (nothing is
+left in the rank's units, yet a reserved port is still held: usually
+something the run started escaped them, such as containers from `docker
+compose up -d` or a server that daemonizes; any other process on that port
+reads the same), `status_running`, `status_unknown`,
+`unowned_service` (runs outside the node's units with no `status` command), or
+`not_stopped` from a node too old to say.
 
-**Who may call.** The four read tools accept a personal access token with either
-`allowCliCommands` + literal `mcp:write`, or `allowCliFileRead` + `mcp:read`.
-Write tools and command tools require `allowCliCommands` + literal `mcp:write`.
-OAuth never gets these tools. A read-grant-only PAT sees exactly the four read file
-tools; calling a hidden write or command tool returns unknown-tool. Token flags
-and scopes are reread at admission, and narrowing cancels pending operations.
+To mark such an instance stopped, call `runtime_stop {instanceId,
+markStopped: true, confirm: "MARK_STOPPED"}` (optionally `nodeNumber` for one
+node of a multi-node instance, and a `note`). It touches nothing on the node.
+Agents may do this only on Full-control nodes (`trust_relay` otherwise). The
+claim stays counted until a status probe proves the stop, but the instance
+settles STOPPED and later starts stop waiting for it (`waits_for_stop`). The
+probes go on after that, also on a STOPPED instance, and the first one that
+proves the stop releases the claim; `lastStopCheck` keeps showing why.
+`runtimes_get` keeps listing a STOPPED or FAILED instance while any of its
+ranks is still reserved, with that `reserved` state and `lastStopCheck`
+(instance rows leave out null fields and empty lists: an absent field is
+null, e.g. no `nodeSlug` means the node was removed). Marking such a rank
+stopped again answers CONFLICT with the last automatic check's result. Each
+node marked stopped writes a `marked_stopped` row in the node's activity.
 
-**Permission matrix.** The effective mode is the lowest of the dashboard grant
-and the CLI's own `wsmp config set-mcp-commands` mode in its live hello.
-The read grant requires ALL of dashboard `mcpFileRead`, live CLI `mcpFileRead`,
-and live `fileRootsConfigured`; missing or stale features never authorize it.
-If a post-commit device-grant refresh cannot read the current policy, live terminal, command, and file authority (including unsupervised access) is withdrawn and pending work is cancelled until a successful refresh or reconnect.
-A reconnect whose hello began before a device policy change installs no terminal,
-command, or file authority until a serialized refresh establishes the current
-policy. Admissions opened before the change are refused even if a later enable
-restores authority; a fresh request may use the restored grant. Changes to another
-device do not affect these admissions or require an extra hello policy read.
+When the node can never prove the stop (a run launched with a status command
+that always says running, a node that is gone), only a person can free that
+capacity: **Release resources** on the runtime or node page ("I've checked,
+release it"). It frees the reserved port, memory and GPUs at once, through the
+same release a proven stop uses; the old process may still be running, so the
+dialog asks the person to check the node first and shows why the stop is not
+proven (`status_running`, `port_in_use`, node offline, ...). The rank records
+who released it, when and that reason (`releasedUnproven` in `runtimes_get`),
+the node's activity gets a `claim_released` row, and the rank leaves the
+5-minute stop checks. A proof that arrives later changes nothing; if the old
+process still holds the port, the next start there fails with the usual
+reasons. Agents, API keys and the CLI relay can never release.
 
-| Effective mode | Read grant | read, stat, list, search | edit, write, rename, mkdir, delete |
-| --- | --- | --- | --- |
-| `unsupervised` | either | headless | headless |
-| `supervised` | on | headless | CLI keypress required |
-| `supervised` | off | refused `supervised_only` | CLI keypress required |
-| `off` | on | headless | refused `grant_disabled` / `feature_disabled` |
-| `off` | off | refused `grant_disabled` / `feature_disabled` | refused (same) |
+An agent may ask instead: `runtime_stop {instanceId, nodeNumber?,
+requestRelease: {findings, evidence?}}` on a part marked stopped on a
+Full-control node (`trust_relay` otherwise), with what it checked (`findings`
+up to 4,000 characters; `evidence` up to 8 `{command, output}` pairs). The text is cleaned like node command output (control
+characters removed, wsmp credentials redacted, clipped to those lengths) and
+shown to the person as the agent's unverified words; a command that is empty
+once cleaned is refused. One request may wait per part
+(`release_request_pending`); it shows on the runtime page, in Needs you and as
+the rank's `releaseRequestId`. The person approves (the same release) or
+declines. `requestRelease: "withdraw"` takes back the calling agent's own
+request. A request expires after 24 hours and is cleared when the hold ends by
+itself (a proof, a restart, the node deleted) or the agent's credential is
+revoked.
 
-Supervised writes return `{commandId, kind:"supervised", status:"awaiting_user", waitingUntil, next}`.
-A person opens the pending request in the dashboard Terminals screen and presses Enter
-on the CLI-drawn screen to apply it, or `q` to decline. Pending list and browser Decline
-use the same mechanism as supervised commands. `confirm: "RUN"` / `"DELETE"` expresses
-the agent's intent; it does not replace the person's keypress. The screen shows the
-operation, resolved physical path, optional reason, and a unified diff with one context
-line computed independently from the real file on disk; the server cannot supply
-or forge it. Disk-derived removed/context lines are masked. Every after-side byte
-is tracked as requester-authored or carried from disk. If an added line carries
-any masked disk byte (including a whole-line or continuation mask), the request is
-blocked with `redacted_span` after the person dismisses the cannot-apply screen.
-Pure requester-authored additions stay verbatim, with controls/invisible characters
-escaped. Diff and mask lines split only on LF: a lone CR is escaped content; CRLF
-stays one line ending. Unmappable line counts block with `redacted_span`. A diff
-whose complete escaped display exceeds 8 KiB is blocked with `too_large` after the
-person dismisses the cannot-apply screen; no hidden hunk can be approved. Details
-show byte counts, mode in octal (explicit, effective default, or all preserved permission bits), `ifExists`, parent
-creation and rename overwrite where applicable. Secret-class paths remain read-only and are
-refused `secret_file`. Path policy is checked before display and again at apply, and
-the daemon rechecks the etag: a file changed between display and approval returns
-`conflict` and nothing is written for that mismatch. Since this apply-time error
-arrives after acceptance with only a code, the server still reports an unknown outcome.
-Supervised `edit.dryRun:true` returns `invalid_input`. On macOS, supervised rename
-of a directory without replacement is refused `unsupported` (file/symlink overwrite
-uses exchange or safe fail-if-exists publication). On platforms with neither Linux renameat2 nor macOS exchange, overwrite
-is refused `unsupported` too: no unsafe rename fallback is used. Regular-file no-replace
-moves remain available when the filesystem supports hard links.
-Supervised approval implies no read grant.
+### Runtime definitions
 
-Poll `forwarder_cli_command_result` with the returned id. It reports the shared
-supervised statuses, plus `file:{op,result}` on success or `error:{code,message,outcome?}`.
-Edit/write results omit `diff` and `hunks`; file errors have no path, current etag or
-other detail. State-dependent refusals (including `not_found`, `exists`, `conflict`,
-`hard_linked` and `owner_mismatch`) appear on a cannot-apply screen and reach the
-agent only after a person dismisses it. This includes outside-root paths, escaping
-symlinks and unavailable roots (`path_denied`), and disk-derived normalized arguments
-above the 128 KiB child-input cap (`too_large`). The cap on the original request is
-checked before disk access; an oversized normalized input uses a minimal blocked
-input with the original paths. The child uses the daemon’s strict startup root
-snapshot, including deny-all for unusable configured roots. Roots are judged on
-resolved physical paths before display and again at apply; aliases resolving inside
-a root are allowed. Apply-time policy stays authoritative.
-Path-string/input refusals may arrive before display: `invalid_input`, `secret_file`,
-protected/staging names (`path_denied`), special-tree text (`special_file`), declared
-input/body size, `limit` and `disabled`. Root confinement is never a pre-display
-text refusal. Decline returns code `declined`, definitively applying nothing.
+`runtime_create` and `runtime_update` take the definition as `spec`
+(advertised as a plain object to keep `tools/list` small; the server validates
+it in full and refusals name the failing path). Start from
+`runtimes_get {presets: true}`, or copy a definition shared with you with
+`forkFrom`. The schema is `runtimeSpecSchema` in
+`packages/api/src/lib/runtime-spec.ts`, and the node validates the same rules.
 
-Confirm waits expire after 15 minutes, using the same stop grace as commands.
-After `supervised.accepted`, apply has a 30-second deadline; on expiry the server
-sends unconditional `supervised.cancel` and reports `timeout` with `outcome:"unknown"`.
-Session loss reports `offline`. Once `term.spawn` was dispatched, server termination
-without authoritative CLI settlement carries `outcome:"unknown"`. It reports
-`started:true` if the server received acceptance, otherwise `started:null`: acceptance
-and apply may be in flight.
-This includes confirm expiry/stop grace, token revoke/expiry, and grant changes.
-The audit records unknown exactly once; late frames cannot change a finished result.
-Every non-success after acceptance has `outcome:"unknown"`, including CLI
-`conflict`, `not_found`, `io_error`, `cancelled` and `timeout`, token inactivity and
-mode changes. The CLI sends only the error code, so the server cannot distinguish
-an apply-time pinned-etag mismatch before commit from an ambiguous failure after
-commit. Undispatched admission/spawn-send failures, CLI decline/rejection and a
-blocked-screen `done{fileError}` before acceptance are definitively not applied.
-The daemon honors cancellation only before the atomic commit point. Ask the person to inspect the file
-before retrying an unknown result; use file_stat only if a read grant permits it.
-The earliest expiry carried by the token row or the admitted credential ends a
-supervised file request immediately, with `token_inactive`; after acceptance its
-outcome is unknown. Results arriving at or after that expiry are not delivered.
+A spec has exactly one of:
 
-Enable `wsmp config set-file-read on` and choose explicit directories with
-`wsmp config set-file-roots <path>…`, restart wsmp, then grant “Agents may read
-files (read-only)” on the dashboard. Suggested roots `~/models`, `~/deploy`,
-`~/.config/llama-swap`, `~/.local/state/wsmp/logs` are help text only and never
-applied automatically. Roots must be absolute existing directories after `~`
-expansion, UTF-8, distinct, other than `/`, at most 32, and at most 64 KiB serialized in total (escapes count as their serialized form); a larger set is refused when saved or loaded. `clear-file-roots` clears them.
-Restart applies both switches. A broken root reports roots unavailable and
-retains a denying confinement policy, with no whole-filesystem fallback.
-When roots are set, every operation, including rename destinations and list/search,
-is confined on physical paths; symlinks and `..` cannot escape them. Linux also
-uses a safe `openat2` RESOLVE_BENEATH/RESOLVE_NO_MAGICLINKS second guard where
-supported. A concurrent local process that moves directories can still race a
-held fd after resolution; these tools do not confine arbitrary local processes.
-Without roots, unsupervised retains whole-filesystem access minus the protected set.
+- `address` (an **always-on** runtime: a server that is already running):
+  `{ baseUrl, auth?, headers? }`. `baseUrl` is `http(s)://host[:port][/prefix]`
+  with `localhost` or an IP literal as host, written in normalized form.
+  `auth` is `{ mode: "bearer" }` or `{ mode: "header", header }` plus
+  `env: "WSMP_SECRET_…"`; `headers` are `{ name, env }` pairs. Secrets are
+  referenced by name only. The proxy never starts or stops it:
+  `runtime_start` (with or without `instanceId` or `preview`) refuses with
+  `always_on_runtime`. Its health is probed automatically; `model_test`
+  checks it now.
+- `launch` (a **startable** runtime: commands that start one):
+  - `management`: `process` (the node owns the process: every process stays in
+    the unit the node starts; a start that hands off to docker or a service
+    manager must be `service`) or `service` (stop and a `status` command prove
+    it; exit 0 alive, exit 3 stopped). A `status` command must be able to say
+    stopped: `true`, `:`, `exit 0` and the like are refused (`systemctl
+    is-active --quiet <unit>` exits 3 for a stopped unit). <a id="process-detached"></a>A
+    `process` start that hands off anyway (`docker compose up -d`, a server
+    that daemonizes) is caught once its port answers while nothing is left in
+    its unit: the start fails with `phaseReason: "process_detached"` and is not
+    restarted. Whatever it started runs outside the node's control, so the
+    stop cannot be proven while it holds the port; stop it by hand and redefine
+    the runtime as `service` with real `stop` and `status` commands.
+  - <a id="docker-compose"></a>A Docker Compose stack is a `service` with
+    detached commands:
 
-`forwarder_cli_devices_list` returns summaries (id, slug, status, grants, endpoint
-slugs and probe status) and still reports `fileTools: {read, write}` (`headless`,
-`supervised`, `off`), `mcpFileRead`, `reportedMcpFileRead`, `reportedFileRoots`, and
-`allowFileToolsAsRoot`. It does not include `models[]` or capability JSON. Pages are
-`{ items, nextCursor }` (`limit` default 20, max 50). `forwarder_cli_device_get`
-`{ cliDeviceId }` returns one full device. `forwarder_model_pools_list` is the same
-kind of page (pool id, slug, name, grants, member endpoint slugs, routing and health
-status); `forwarder_model_pool_get` `{ poolId }` returns the full pool.
-`supervised` writes need a person's keypress. For a supervised read
-without the grant, request `cat` via a supervised command or enable the grant.
-The CLI independently checks local mode, read switch, roots and UID at every op;
-a server request never overrides local consent. Root refuses `unsupported` unless
-`wsmp config set-file-tools-as-root on`. The protected wsmp state files,
-`service.env`, writes to `config.json`, and special trees remain inaccessible.
+    ```json
+    {
+      "management": "service",
+      "commands": [{
+        "start": "docker compose up -d",
+        "stop": "docker compose down",
+        "status": "out=$(docker compose ps --status running -q) || exit 1; [ -n \"$out\" ] || exit 3"
+      }]
+    }
+    ```
 
-**Masking boundary.** The CLI masks, before anything is windowed: (1) in dotenv and env
-files (`.env`, `*.env`, `.envrc`, `service.env`) every value, shown as `KEY=⟦redacted:N⟧`
-(other lines that are not blanks, comments or a simple `KEY=` are masked whole); (2) in
-any other file, every line containing a secret-name word (ending in `_TOKEN`, `_KEY`,
-`_SECRET`, `_PASSWORD`, `apikey`, `api-key`, `hf-token`, or equal to `PASSWORD`), the
-following non-blank line, and every line indented deeper than it, each shown as
-`⟦redacted line⟧`, plus the value of `--api-key` / `--hf-token` style flags; (3) private
-key blocks (PEM BEGIN to the matching END) and SSH private key files; (4) the Hugging Face
-token files. There is no vendor-prefix scanner. A construct that opens further back than
-the bounded lookback of a windowed read is a documented residual. Edits cannot target a
-masked span, and the etag is keyed. **On a read-grant-only node without exec, masking plus roots IS the security boundary.** **On an `unsupervised` node masking is not a security
-boundary**: an agent with command access can `cat .env`. It keeps those secrets out of
-transcripts on the normal path. Secret-class files (dotenv, key and token files, and their
-directories) are read-only masked views: every write, edit, rename, delete or mkdir that
-touches one is refused as `secret_file` (compared case-insensitively on every OS); use a
-command to change such a file. The server never logs or stores file content, and it
-additionally removes `wsmp_` credential substrings from every returned string.
+    The status command exits 0 while a container of the project runs and 3
+    once none does; when `docker compose ps` itself fails (the daemon is down,
+    no compose file in the working directory) it exits 1, which the node reads
+    as "cannot tell" rather than stopped. A plain `... | grep -q . || exit 3`
+    would answer stopped on such a failure. Run the commands from the
+    project's directory (e.g. `cd /srv/llm && docker compose up -d`) or pass
+    `-f <file>` to each. Avoid a foreground `docker compose up` as a `process`
+    start: the containers run under dockerd, outside the rank's slice, so the
+    node cannot see or stop them itself; compose's own 10 s stop timeout races
+    wsmp's 10 s grace before it kills the slice, which can leave containers
+    running; and a container with no published port (a GPU-only worker) can be
+    reported stopped while it still runs and holds the GPU.
+  - `groupSize` (1–64 nodes), `resources` (one entry, or one per rank:
+    `{kind: "none"}`, `{kind: "unified", memoryGb}`, `{kind: "cpu", ramGb}` or
+    `{kind: "discrete", gpuCount, vramGb, ramGb?, vendor?}`), `labels` the node
+    must carry, optional `port: {fixed}` (≥ 1024, single node only), and
+    `fabric` (multi-node only).
+  - `commands` (one entry, or one per rank): `start` required; `stop`
+    required for `service` and for an interactive stop, optional for `process`
+    (the node's stop ends everything in the rank's slice and proves it, so a
+    process runtime needs no stop command of its own); `prepare`, `afterJoin`,
+    `status`, `health`, `interactive` (steps a person completes in a
+    terminal; they need `management: "service"` for start or afterJoin, and a
+    `status` command) and `timeoutsSec` (prepare ≤ 24 h,
+    default 1 h; start and afterJoin ≤ 1 h, default 15 min; stop default 5 min;
+    status default 1 min). Commands may use `{{port}}`, `{{node_rank}}`,
+    `{{nnodes}}`, `{{dist_port}}`, `{{memory_gb}}`, `{{gpu_ids}}`,
+    `{{vram_gb}}`, `{{memory_fraction}}`, `{{head_addr}}`, `{{fabric_ip}}`,
+    `{{fabric_iface}}` and `{{fabric_rdma_device}}`.
+  - `secrets`: node secret names exported to every command.
+  - `readiness: {path, expectedStatus, timeoutMs}` (required when the runtime
+    serves models) and the required `health: {intervalMs, failureThreshold,
+    successThreshold}`. An UNHEALTHY instance (`phaseReason:
+    "health_failed"`) shows why its last probe failed in `healthDetail`:
+    `serving_unconfirmed` (the serving process is gone from its unit),
+    `http_<code>`, `connect_refused`, `timeout`, `unreachable`,
+    `command_failed` (the `health` command) or `status_not_running`.
 
-**ETag workflow.** Read a file, then pass its `etag` as `expectedEtag` to `edit`, to `write`
-with `ifExists: "replace"`, to `rename` with `overwrite`, and to `delete`. Line-range edits
-and replaces require it. A headless stale-etag failure returns `error.code` `conflict`
-with `currentEtag` (an etag, or the word `gone` when the file was removed): re-read
-and retry. Supervised failures report only the code after the person's keypress.
-`read` with `ifNoneMatch` answers `{unchanged: true, etag}`. Etags reset when the wsmp
-daemon restarts, which costs one extra `conflict`. A write-class call that fails with
-`error.outcome: "unknown"` may have changed the file, with any code: `timeout`,
-`offline`, `cancelled`, `token_inactive`, a mode change, `io_error`,
-`uncertain_outcome`, `not_found` on rename/delete, or `conflict` when a file was swapped
-during the change. Headless
-`replaced` conflicts are unknown and omit `currentEtag`. For supervised requests,
-every non-success after acceptance is unknown, even a `conflict` caused by the
-pinned pre-image changing before commit, because the error frame has only a code.
-Ask the person to inspect the file, or call `forwarder_cli_file_stat` with `hash: true`
-and a read grant to compare the etag before retrying. A retry
-that carries `expectedEtag` is safe (a stale etag returns `conflict`); an exact-match edit
-without `expectedEtag` is not idempotent, so check with `file_stat` first.
+A runtime that serves models also declares `api` (`openai` or `anthropic`),
+`engine` (`vllm`, `sglang`, `llama_cpp`, `ollama`, `lm_studio`, `other`),
+`modelType` (`llm`, `embeddings`, `transcription`) and `models` (`{id,
+capabilities?, embeddingContract?, transcription?}`), and may set a
+`metricsReader` (`builtin`, a `route`, or a `command`) and `expandMedia`
+(inline remote media for servers that cannot fetch URLs). A startable runtime
+without models is a **service**: it claims its resources but is never a pool
+member.
 
-**Manual file recovery.** Atomic replace, exclusive create, plain rename,
-overwrite rename and file/symlink delete use recovery when needed. They capture
-compensation objects into one mode-0700 `.wsmp-recover-<10 alnum>` directory beside
-the destination, with at most two captured data objects per operation, plus private
-capability probes and preflight dummies. Replace creates its temp
-inside this directory and first tries an atomic exchange with the destination;
-no public staging name exists. If exchange is unavailable, private probes choose
-no-replace rename or hard-link publication before any public name is changed.
-The original is captured and checked against the held identity before publishing
-the temp at the vacant name. A concurrent save captured instead of the original
-is restored without overwriting another object, or retained and reported. A
-concurrent create at the vacant name survives; the original stays in recovery
-and the tool returns `uncertain_outcome`. If no safe publish primitive works,
-`unsafe_filesystem` is a definitive headless refusal: nothing was changed. A
-supervised error after acceptance remains unknown under the code-only outcome
-contract, including `unsafe_filesystem`. Overwrite rename first preflights privately.
-It exchanges the captured source with the destination when supported. Otherwise
-no-replace, and link publication on mounts that present a different inode per name
-(noino, sshfs), capture and prove both objects and publish the source fail-if-exists.
-Stable-inode link publication, including Linux NFS, links the still-public source
-onto the destination and then captures the source. Unpublished user sources
-are never disposed: they return only to the source name or stay named in recovery. Every captured
-object has a recorded origin; undo restores only to that origin, using identity
-proof to return a moved source to its original source name. An unsettled
-headless compensation returns `uncertain_outcome` with `error.outcome: "unknown"`,
-`recovery` (an absolute directory path) and `kept` (up to four absolute paths,
-including public names when capture failed). Successful headless edit/write/rename/delete
-results may include `recovered` paths if cleanup failed or an exposed source alias
-became its object's last name before cleanup. Supervised operations
-use the same recovery and compensation primitives, with pin verification and
-cancellation honored only before commit. Their error frame carries
-only a closed error `code` (including `uncertain_outcome` and `unsafe_filesystem`);
-every non-success after acceptance still has
-`outcome: "unknown"`. Supervised success results omit `recovered`, including delete. A preview-time
-`unsafe_filesystem` refusal uses the cannot-apply screen and reaches the agent only
-after dismissal; it is never a pre-display rejection. The confirm child rejects
-`uncertain_outcome` markers because only daemon apply can produce that verdict. Every retained
-location reaches the person's daemon warning log (paths only, never content), including
-when the confirmation child has exited. The child remains display-only; approval
-creates no read grant and recovery paths never reach the agent through these results.
-Inspect those paths using a shell, compare file contents, and restore them manually
-without overwriting newer files before retrying. Find crash leftovers by listing
-`.wsmp-recover-*` beside the target (a partial replace temp, probe, or `INTENT` file is inside it). File tools
-permit reads and listing, but refuse writes, deletes, renames and creates inside recovery directories.
-Recovered objects are never automatically deleted. Startup reports `.wsmp-recover-*` under
-configured roots and does not delete them.
+Put model downloads and other setup in an idempotent `prepare` step, so applying
+a profile on a fresh node fetches weights by itself. A spec is at most 48 KiB as
+canonical JSON and one command at most 4 KiB. `limits` (null: automatic) and
+`advanced` settings are separate inputs; `runtimes_get` shows their keys and
+effective values. Limit edits apply live; a changed definition saves a new
+version and needs `restartRunning` to reach running instances.
 
-**Delete rule.** On every filesystem, files and symlinks are first captured into
-recovery, checked against a live held identity, and only that proven object is
-disposed. The symlink target is never deleted. A replacement captured instead of
-the inspected object is restored without overwriting a newer name, or kept and
-reported. A concurrent create at the now-vacant name survives. This adds one
-mkdir/rmdir pair per file/symlink delete. Any recovery mkdir failure, including
-ENOSPC, EDQUOT or EMLINK, fails closed with `io_error` and leaves the file unchanged;
-free space with the shell. On macOS and other Unix, a file the CLI user cannot open
-read-only (for example mode 000 or 0200) cannot be held and refuses before capture
-with its real open errno (`io_error`, e.g. EACCES), public name unchanged; so does a
-symlink on Unix targets other than Linux and macOS. Linux's O_PATH hold is unaffected. Directories are never captured for delete: a held
-identity recheck is followed by rmdir by name. The kernel can remove only an
-empty directory, so this cannot destroy a concurrent save; at worst it removes
-a racer's empty directory. Non-empty directories are refused, and delete never
-recurses.
+### Request compatibility
 
-**Exchange-less filesystems.** Fallback replace and overwrite rename leave the destination name
-vacant between capture and safe publication. The window contains a bounded
-number of syscalls, with no time bound: scheduling, network delays or a crash
-can extend it. Readers see ENOENT, and concurrent creates survive. Publishing
-is only as atomic as the filesystem's no-replace rename or link primitive;
-the CLI cannot verify a daemon's emulation. Capability detection is per
-operation and errno-driven, with probes at absent private names. Rename link
-probes use the actual source and destination objects before capture, since link
-permissions and link-count limits depend on the object. NFS and 9p
-reject rename flags but usually support links. exFAT and CIFS support
-no-replace rename only; exFAT has no hard links. Linux vfat supports both
-exchange and no-replace rename. macOS HFS+ supports RENAME_EXCL but not
-RENAME_SWAP. Overwrite rename works on no-replace-capable and link-only mounts.
-No-replace and noino/sshfs link publication capture and prove source and destination,
-then publish source into the vacant destination. Stable-inode link publication links
-the still-public source onto the destination before capturing the source, so that
-name stays until the destination holds the object. On mounts with neither primitive,
-`unsafe_filesystem` refuses before moving anything; the unchanged public snapshot has
-no recovery residue. Plain file/symlink rename uses direct no-replace where supported
-(including supervised macOS files); otherwise it uses that same link order. A direct
-rename that returns EINVAL while no-replace works inside R is `invalid_input` (the
-destination name is not valid on this filesystem) and captures nothing. EINVAL while
-no-replace is also rejected stays `unsafe_filesystem`. Directories move only with
-no-replace, never overwrite even an empty directory, and a directory moved into its
-resolved physical subtree refuses `invalid_input` before allocating R.
-Private aliases are proven at their own names, including mounts where hard-link
-names present different inode numbers. A successful link syscall commits; a rename
-link error with ambiguous effect keeps/restores source and keeps destination, with
-`uncertain_outcome`. Only a no-replace rename transfers a dentry for held-fd/name
-reply reconciliation. After link rename the returned etag uses the published name
-only when its bytes/mtime bind to the admitted source etag; a later save or failed
-bounded read yields null. Clean publication removes the private alias and R;
-failed cleanup reports `recovered`. Allocating R fails closed with `io_error`
-(EEXIST) after 16 name collisions.
+Engines differ in what they accept, and harnesses send what they send. Every
+runtime version has a `compat` setting (`runtime_create` / `runtime_update`
+take it as a plain object that **replaces** the whole setting; `null` returns it
+to automatic; schema `requestCompatSchema` in
+`packages/api/src/lib/request-compat.ts`). The same policy applies to every
+request the runtime receives, forwarded natively or translated between
+protocols:
 
-POSIX does not exclude other same-user processes. Every disposal compares the
-private slot with a live held fd, which pins the inode during identity proof;
-all of this operation's descriptors on the object are closed before its final
-private unlink, avoiding an NFS silly rename caused by those descriptors.
-A path-derived dev+ino snapshot alone never authorizes deletion. The
-exact remaining windows are: (a) a same-user process that guessed the unpredictable
-private directory can rename a new object onto a slot between the held-fd fstat
-comparison, descriptor close and final unlinkat and lose that replacement (the link
-probe also proves the alias only by a proof opened on that name, so the same actor can
-swap the probe alias between its link and that proof; the temp is checked, against its
-own still-open descriptor, to be the object the operation created before the link and
-after the alias unlink); (a2) on filesystems without
-NOREPLACE, capture uses plain rename into a private slot checked absent, and a
-squatter arriving between the check and rename can be overwritten. These are the
-private-slot deleting windows in recovery compensation. (b) undo briefly vacates public
-names, and a concurrent create makes restoration fail EEXIST, retaining displaced
-data with `uncertain_outcome`; for edit, write and overwrite rename the newest captured
-external write is restored to its public name while an older displaced object stays in
-recovery (plain rename verification and exclusive-create cleanup instead keep a
-foreign object in recovery and report it). Unsupported
-NOREPLACE restore uses EEXIST-safe linkat followed by held-fd-proven private-slot
-unlink; directories and unsupported links stay in recovery with `uncertain_outcome`.
-(b2) vacate-first recovery rename and exchange-less no-replace overwrite leave the
-source name vacant from its capture until the operation ends. Link-first leaves the
-source name in place until the destination holds that object, and vacates only the
-destination on overwrite. A concurrent create remains at a vacant name on success;
-if it prevents a restore, it is kept and reported with `uncertain_outcome`. Independently of the
-filesystem, an in-place write into the inspected inode after the etag read can
-be lost on replace or delete: the etag proves content only up to that read.
-(d) a crash leaves `.wsmp-recover-*`, including a partial replace temp or
-`probe`, preflight dummies, or both links. Before the first capture, every R-using
-op (rename, replace, delete, including exchange overwrite) writes `INTENT` in that
-directory and fsyncs the file; directory fsync `EINVAL`/`ENOTSUP` is best-effort.
-`INTENT` is a versioned JSON object (`version` 2): `op`, `phase`
-(`prepared`/`captured`/`committed`), `order` (`link-first`, `vacate-first`, or
-`exchange-first`), `source`/`destination` as `{display, bytes}` (hex path bytes next
-to a lossy display string), `slots` mapping `slot-1`/`slot-2` to `{origin, dev, ino,
-kind, size}`, plus `pid`, `host`, `createdAt`, and `cliVersion`. Link-first overwrite
-stores the destination in `slot-1` and the source in `slot-2`; exchange-first
-overwrite stores the destination in `slot-1` (swap `from <-> to` first, then capture
-D from `from`, so D is briefly visible under the source name); other orders store
-the source in `slot-1`. Success removes `INTENT` only when R is empty. There is no
-automatic replay. A rename crash can leave source and destination in R with both
-public names vacant (vacate-first), only the destination vacant (link-first, before
-the link), or D under the source name (exchange-first, after the swap). Live R
-directories are indexed in the CLI state directory (`file-recovery/`). Startup reads
-that registry (O(registered)) and never walks file roots. `wsmp recover` lists
-abandoned R dirs; `wsmp recover --apply` rolls back (`mv -n` from slots) when phase
-is prepared/captured and rolls forward (dispose leftovers) when committed;
-`--scan` walks configured roots for unregistered dirs. Find R beside the
-destination, in the registry, or in the startup log: wsmp reports each abandoned
-`.wsmp-recover-<10 alnum>` directory and never deletes it. If INTENT is absent, the
-log lists present slots; it does not say "read INTENT". `mv -n` a missing public
-path back from its slot, and do not overwrite a newer file. If both public names
-exist and the destination is a hard link of the source, the link may already have
-committed: compare, then remove only the private slots, `INTENT`, and the empty
-directory. On stable-inode NFS, plain rename uses link-first when rename flags are
-rejected; no-replace-capable mounts keep direct rename and do not write `INTENT`. A
-crash during replace can leave the original and temp in recovery with the public
-name vacant; a delete crash can leave the captured file or symlink in recovery with
-its public name vacant.
-(e) unheld objects are never deleted and remain reported in recovery;
-(f) on NFS a file that another process still holds open keeps a `.nfs*` entry in the
-recovery directory after its unlink, so the directory is retained and listed in `recovered`;
-the link probe's alias unlink keeps the temp's own descriptor open (it pins the inode against
-number reuse), so a client that silly-renames per vnode (macOS/BSD NFS) may briefly keep a
-`.nfs*` alias there until that descriptor closes, retained and reported the same way.
-(g) after replace or rename hard-link publication, a process can open and write the
-public temp/source,
-then another save can replace that name before the private alias is unlinked;
-where this mount's link counts can be believed, a count below 2 retains the last alias
-and reports it (a veto, never a proof). Belief is decided per operation from the link probe:
-right after the probe link the object has two names, so a count of 1 or an unreadable count
-means counts cannot be used here (sshfs always reports 1) and the veto is off, exactly as
-for replace in #169. The count is read by name with `statx` and `AT_STATX_FORCE_SYNC` on
-Linux, so the kernel's attribute cache (FUSE, NFS, SMB) cannot make it stale (kernels
-without statx, and other Unix systems such as macOS, use a plain stat, which can be); a
-daemon's own cache can too, and then the veto is no better than none. A third save after the final
-observation but before unlink, or on a mount whose counts mean nothing, can still orphan
-the inode and discard the writes: this is the residual, narrowed where counts are real.
-If alias cleanup fails instead, the published file has two hard links (nlink 2)
-and edit/replace refuses `hard_linked` until manual cleanup of the reported alias.
-Public file and symlink compensation names are never unlinked on an earlier
-stat's authority; directory delete follows the empty-directory rule above.
+- `unknownFieldPolicy`: `auto` (default) drops unknown **non-semantic** fields
+  the engine does not accept; `forward` sends everything as written; `strict`
+  refuses unknown fields with a 400 naming the field.
+- Semantic fields are never dropped automatically: `model`, `messages`,
+  `input`, `instructions`, `system`, `prompt`, `tools`, `tool_choice`,
+  `response_format`, `text.format`, `stream`, `max_tokens`,
+  `max_output_tokens`, `max_completion_tokens`, `temperature`, `top_p`,
+  `top_k`, `min_p`, penalties, `stop`, `n`, `seed`, `logprobs`, `reasoning`,
+  `reasoning_effort`, `thinking`, `prediction`, `parallel_tool_calls`,
+  output constraints (`guided_*`, `structured_outputs`, `grammar`,
+  `json_schema`, `logit_bias`), `chat_template_kwargs`, conversation state
+  (`previous_response_id`, `conversation`) and embedding `dimensions` /
+  `encoding_format` (the list is `SEMANTIC_FIELDS`). When the engine rejects
+  one, the caller gets a clear 400 naming it with the engine's words.
+  `allowDropSemanticFields: [path]` accepts losing one.
+- `rewriteRules` (at most 32, applied in order, optionally per `endpoint`):
+  `{op: "rename", path, to}`, `{op: "drop", path}`, `{op: "default", path,
+  value}` (only when the caller did not send it), `{op: "clamp", path, min?,
+  max?}` and `{op: "mapRole", from, to}`. Paths are dotted, with `[]` for every
+  element of an array: `messages[].cache_control`. Rules cannot touch `model`
+  or `stream`, credential- or address-like keys, and defaults cannot add
+  content, adapters, files or media.
+- `headers`: per client header (`anthropic-beta`, `anthropic-version`,
+  `openai-beta`, `openai-version`, `idempotency-key`, `x-request-id`,
+  `request-id`) `forward` or `strip`. Auth headers are never forwarded; the
+  node adds its own upstream credentials from its secrets.
+- `extras`: `streamUsage` and `topK` override whether the proxy adds
+  `stream_options.include_usage` or renders `top_k` (automatic: from the
+  engine's description, what was learned and the engine kind; unknown engines
+  get neither). Missing usage is estimated and marked as estimated.
+- `response`: `reasoningField` (`auto`, `reasoning`, `reasoning_content`,
+  `strip`) and `stripNonStandard` shape native Chat and Messages answers;
+  finish reasons, thinking signatures and missing Anthropic usage are always
+  normalized.
 
-**Separate create residuals.** Exclusive create uses O_EXCL at a public name,
-then writes its content there; concurrent readers can observe the intermediate
-file, and a concurrent write to that created inode before the tool finishes
-writing can be overwritten. Failed-parent cleanup (`rollback_created`) retains
-its separate check-to-rmdir-by-name race; the kernel removes only empty
-directories.
-These paths, the case-only rename below, recovery-directory privacy and the
-existing recovery reporting bounds are separate from the exchange-less replace
-and file/symlink delete rules.
+What the engine accepts is learned per runtime launch: from its OpenAPI
+description (`GET /openapi.json`, read through the node from a loopback engine
+when an instance becomes ready) and, without one, from its 400s (the named
+field is dropped and the request sent once more, before anything reached the
+client). `runtimes_get` shows it as `requestProfile`; `runtime_update
+{relearn: true}` forgets it. Requests record what was dropped or rewritten
+(names only) in `requests_list` as `compat`.
 
-**Case-only renames.** `rename` with `overwrite` refuses a destination that is the same
-file as the source (`invalid_input`), except a case-only respelling of one directory
-entry (for example `Foo.txt` to `foo.txt` on a case-insensitive macOS volume: same
-directory, one hard link, names equal after case folding), which is done by a plain
-atomic rename that replaces nothing; the supervised confirm screen labels it `overwrite: false (case-only rename ...)` for the same reason. A real hard-link alias (link count above 1) is
-still refused. The one residual window: a same-user process that creates a second entry
-under the other spelling between the check and the rename can lose that entry.
-On a case-insensitive mount without stable inode numbers, two spellings may fail
-same-object admission and proceed to vacate-both: capturing source also vacates
-destination, so destination capture returns `conflict("gone")` and source is
-restored to its source name. A true hard-link alias pair hidden by noino can instead
-complete vacate-both without losing its data (where link counts can be believed, the shared object keeps a name even if a writer
-and a third save leave only the private names: one is kept and reported);
-stable-inode alias pairs still refuse.
+### Model-name aliases
 
+Harnesses that hard-code a model name (`gpt-4o`, `claude-sonnet-4-5`) can call a
+pool through an alias: `pool_update {poolId, aliases: {set: [{name,
+apiKeyId?}], remove: [aliasId]}}`; `pools_get {aliases: true}` lists them. An
+alias lives in your own namespace (for every key, or one key, which wins), only
+resolves to a pool the key in use can call, and is listed by `/v1/models`. A new
+alias may not take a pool ID you can call; when a pool shared with you later
+gets an ID one of your aliases has, the alias wins for you until you rename or
+delete it: that name reaches the alias's pool everywhere (also `model_test`),
+and `pools_get` marks the alias `hides` and the share `hiddenByAlias`. Agents may manage aliases; API keys stay
+people-only. The model API accepts the key as `Authorization: Bearer`,
+`x-api-key` or `api-key`.
 
-**Version skew.** `uncertain_outcome` and `unsafe_filesystem` are new file error
-codes of relay protocol 2.4. Upgrade the server and every CLI together (relay protocol 2.4 only).
+### Node metric commands
 
-**Revocation and bans.** Revoking or narrowing a personal token, revoking a CLI
-credential or device, and deleting a user end that principal's in-flight file operations and
-commands (`token_inactive` or `offline`; a write-class call carries `error.outcome: "unknown"`).
-Banning a user (the dashboard archive action, the admin ban, or an admin update that sets the
-ban) does the same for every token the user holds and refuses calls still being admitted; the
-CLI's relay connection stays up. Everything ends on the server at once, including supervised
-commands and supervised file requests still waiting for a person's confirmation or already applying (a file request ends `token_inactive`, with `outcome: "unknown"` once dispatched per the outcome contract; if its confirm deadline had already passed and the server was waiting for the CLI to stop, it ends `timeout`): a call waiting for a headless command returns
-`cancelled`, and the CLI's late output and exit are dropped and never reported as a success. The
-CLI is asked to stop the process, and the command keeps its execution slot only until the CLI
-answers or 15 seconds pass. The cancel runs in the server process that performed the ban: another
-replica ends the work at its deadline and refuses the user's next call.
+`node_update` takes `metricCommands`: at most 16 entries (32 KiB together) of
+`{ name, command, intervalSecs (5–3600), timeoutSecs (1–60), format, map? }`.
+`format` is `lines` (`<metric> <value>` per line), `json` or `prometheus`.
+Without `map`, `json` reads a top-level number and `prometheus` the first sample,
+recorded as `name`. `map` names up to 16 metrics, each `{ series, labels?,
+aggregate?, scale?, divideBy? }`, where `series` is a Prometheus series name or
+a JSON pointer.
 
-**Limits.** Supervised writes share command limits: one awaiting per CLI, two awaiting
-per user, and two live per CLI. Headless limits are 120 file operations per minute per user, of which at most 30 change files;
-4 in flight per CLI and 16 per user. Headless limits return `limit` with `retryAfterMs`;
-supervised admission limits return `limit`. Operations are never queued. Headless
-operations time out after 30 seconds (search and hashing have shorter CLI budgets);
-an MCP abort sends `file.cancel`, honored before a mutation's rename. Once a supervised
-request is registered, an MCP abort preserves its id and the person's pending decision. Read
-windows are held to 96 KiB by the 256 KiB tool output cap (`too_large` asks for a narrower
-request; escape-dense text needs a smaller `maxBytes`), write content is at most 1 MiB
-DECODED, and the whole request of stat, list, search and edit must fit one 64 KiB relay
-frame. The 1 MB `/mcp` request-body cap that every call shares is the
-real ceiling on the encoded form, so a base64 write arrives at roughly 768 KiB (786,432 bytes)
-decoded or less (it encodes to 4/3 of that); larger bodies cannot be written with the
-current tools. Admission and headless errors are in-band `isError` results;
-completed supervised failures appear in the polled `result.error`. Both use a
-stable `error.code`: the command codes
-(`not_found`, `grant_disabled`, `offline`, `feature_disabled`, `supervised_only`,
-`unsupported`, `limit`, `token_inactive`, `upgrade_required`), `invalid_input`, and the
-file codes (`path_denied`, `secret_file`, `not_a_file`, `not_a_dir`, `binary_file`,
-`too_large`, `conflict`, `uncertain_outcome`, `unsafe_filesystem`, `match_count`, `no_match`, `redacted_span`, `exists`,
-`hard_linked`, `owner_mismatch`, `setuid`, `special_file`, `io_error`, `timeout`,
-`cancelled`, `declined`). The CLI re-checks its own startup mode, read switch and roots on every
-op and can refuse one itself; its `file.rejected` reason is either a file code above or
-one of `bad_frame`, `supervised_only`, `grant_disabled` (the dashboard grant is off) and
-`feature_disabled` (the CLI's `wsmp config set-mcp-commands` mode is off), and the
-server passes that reason through as the same `error.code`, except `bad_frame`, which settles as `io_error` because the op never ran. A CLI that speaks an older
-relay protocol returns `upgrade_required`
-("this CLI speaks relay <v>; upgrade wsmp").
+### Metrics
+
+`metrics_query` reads the minute and hour rollups, never the request log.
+The answer is `{ start, series: [{ group?, at, values }], totals, truncated? }`:
+a point's time is `start + at × step`, buckets with no data are left out, and a
+metric with no data is left out of `totals`. Values are ms (latency, TTFT,
+queue wait), tokens/s, GB, percent (`*_pct`) or fractions 0–1 (KV usage,
+`full_ratio`, `cache_hit_rate`, `cloud_share`). At most 720 buckets and 2,880
+buckets × metrics per query; a grouped answer keeps the largest groups that fit
+(at most 10) and says `truncated`. Group key `""` collects rows without one
+(cloud traffic has no node). Engine load and node gauges are kept 8 and 7 days;
+`custom:<name>` reads node metric command values (average per bucket). A pool
+shared with you answers request metrics of your own requests only, ungrouped or
+by `source`.
+
+Tests are not load: `model_test` (source `AGENT_TEST`) and the web Test page
+(source `TEST`). Request metrics leave them out, as the Overview does, and
+`totals.tests` counts the ones left out (absent when there are none). Pass
+`includeTests: true` to count them like any other request, for example to group
+a bench by `source`. A test of a runtime
+(`runtime:<id>:<model>`) does not go through a pool: it counts in that runtime's
+(version, node, instance) metrics, never in a pool the runtime serves. Test the
+pool's callable ID to exercise the pool. Rollups are written with each
+request's completion, so a finished test shows up at once.
+
+### Node files
+
+`node_file_read` reads, stats, lists or searches under the folders the node
+allows and returns an `etag`. `node_file_write` (write, mkdir, rename, delete)
+and `node_file_edit` (exact-text replacements, at most 20 per call) change
+files; pass the etag you read as `ifMatch` so a file that changed since is
+refused instead of overwritten. The node enforces its own roots and refuses
+secret files.
+
+- **Who.** A Full agent token on the caller's own node at Full control.
+  People signed in to the web app use a browser terminal instead.
+- **Paths.** Absolute paths under the node's file roots only: `~` and relative
+  paths are refused, not expanded. `nodes_get` lists the roots under
+  `features.files.roots` and where they come from under `features.files.source`:
+  `default` (the user's home directory, used until a person sets roots),
+  `configured` (`wsmp config set-file-roots`) or `disabled`
+  (`wsmp config set-file-tools off`). A refused path's error lists them too. wsmp's own
+  config, credentials, secrets, runtime stores, state directory, service unit
+  and binary are off limits (writes) or read-only (config).
+- **Roots are node-only.** Only a person at the node sets the roots. No MCP
+  tool changes them, and `wsmp config set-…` (like the other commands that
+  change wsmp itself: `login`, `trust full`, `secret`, `logout`, `run`,
+  `terminal approve`, `recover --apply` and `service
+  install|uninstall|env-sync`) refuses to run from a command, job or terminal
+  wsmp started. Do not try to widen them through `node_command_run`; ask the
+  person.
+- **Reads paginate.** A read returns at most 400 lines and 32 KiB at a time
+  (`limit` up to 2,000 lines), never `too_large` for files up to 64 MiB. When the file goes on, the
+  result has `more: {startLine, byteOffset?}`: call again with
+  `offset: more.startLine` (and `byteOffset: more.byteOffset` when a single long
+  line was cut). A 2 MiB text file is read in pages this way.
+- **Writes.** `node_file_write` without `ifMatch` only creates a new file; with
+  `ifMatch` it replaces exactly the version you read. `node_file_edit`
+  requires `ifMatch`. Content is at most 1 MiB (UTF-8 text or base64, measured
+  decoded); a larger write is refused as invalid input (`content`). The MCP
+  request body is capped at 1 MiB as well, so the largest write that fits is a
+  little under 1 MiB of plain text, or about 750 KiB (decoded) as base64.
+- **Errors.** `data.reason` carries the file error code (`path_denied`,
+  `conflict` with the current etag, `exists`, `not_found`, `too_large`, ...).
+  An `outcome: "unknown"` means the change may or may not have happened: stat
+  the path before retrying.
+- **Audit.** Every operation writes a node activity row with the path, size,
+  outcome and credential, never the content. Revoking the token or banning the
+  owner cancels operations in flight.
+
+### Results and errors
+
+A result is JSON in the text content and in `structuredContent.result`. Output
+is redacted (no secret WMP holds ever appears), made JSON-safe, and capped at
+256 KiB; a larger result fails with `OUTPUT_TOO_LARGE`. The `nodes_get` list
+rows (hostname, `fabrics` as name, ip and `peerCount`, `gpus` as vendor and
+name, `secretNames`, counts) leave out null fields and empty lists: a missing
+field is null or empty.
+
+A failed call returns `isError: true` with `structuredContent.error`:
+
+- **Refusals** keep their fixed message and carry `code`, a stable `reason`
+  and, when it helps, a `subjectId`. The message says what to do next.
+  `node_secret_set` replaces even that message with the reason, so nothing a
+  procedure says can carry a secret back.
+- **Invalid input** is `invalid_input` with up to 20 `issues`, each `path` and
+  `message` (sensitive tools get `path` and `code` only). A message may quote
+  part of your own input; a sensitive tool's input is never echoed.
+- `TOO_MANY_REQUESTS` (tool rate limit, with `retryAfterSeconds`) and
+  `REQUEST_ABORTED` (the request or credential went away). `BAD_REQUEST`,
+  `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `CONFLICT` and
+  `PRECONDITION_FAILED` keep the procedure's own message (sensitive tools: a
+  static one). Anything else is `INTERNAL_ERROR` with a `requestId`.
+
+No tool's arguments are logged. A tool with secret input (`node_secret_set`)
+and the procedures in `SENSITIVE_INPUT_PROCEDURES` are never logged, audited
+(the secret's name only) or echoed.
+
+### Audit
+
+Agent actions are recorded with the agent token (`agentTokenId`) or OAuth
+grant (`mcpGrantId`) that made them: runtime versions and operations, node
+commands, node activity (files, secrets, commands), queued commands and the
+general audit log. Node commands and node activity store an HMAC of the
+command text plus the program name, never the text; a queued command keeps its
+text so the person can read it before pressing Run. People read them under
+Activity, the node's activity, Terminals and the runtime's version history.
 
 ## Setup
-
-### Durable deployments and inference contributions (0.4.0)
-
-Recipe tools (`deployment_configs_list`, `deployment_config_get`,
-`deployment_config_create`, `deployment_config_update`) read and save immutable
-specifications; updates require `expectedRevision`. Deployment lists return
-`{items, nextCursor}` with `limit` default 50, maximum 100; use `cursor` for the
-next page. Config reads return the latest immutable revision; a plan's preview
-resolves its exact start revision and stopped groups rather than substituting a
-newer revision. Instance and plan step detail includes the latest 100 steps,
-with `stepsTruncated` and database step counts when history is longer.
-Deployment lifecycle tools
-(`deployment_plan_start`, `deployment_plan_stop`, `deployment_plan_apply`) require
-a command-enabled personal token, `mcp:write`, and live node command permissions.
-OAuth or a general write token never grants machine execution. Apply additionally
-requires `confirm: "RUN"`; this MCP literal does not replace a required person's
-confirmation. Read `deployment_plan_status` for the immutable commands and whole
-groups affected. Human confirmation, node grants and protected-instance preemption
-permission are dashboard-only. CLI local policy always remains authoritative.
-
-Inference tools list, offer and revoke a specific serving model contribution.
-`inferenceContributions.accept` is human-only. A pool contribution grants inference,
-not shell or deployment rights, and either party may revoke it.
-
-Pool summaries load at most 20 grants and 20 members per pool in the database.
-`grantCount` and `memberCount` are full database counts; `grantsTruncated` and
-`membersTruncated` explicitly report abbreviated inline lists. Budget policies are
-queried only for those selected grants, so truncation never drops their spend cap.
-Use the owner-scoped full pool read when detailed configuration is required.
 
 Required environment:
 
@@ -631,7 +464,8 @@ Required environment:
   secret, and already-issued JWT signatures remain valid — but a rotated
   secret can **break private-key decryption for subsequent token issuance**
   until the JWKS keys are cleaned up or re-minted. Emergency revocation is the
-  flag plus `Settings → MCP` grant revocation, never secret rotation.
+  flag plus disconnecting connections and revoking agent tokens in
+  Access → Agents, never secret rotation.
 - `BETTER_AUTH_URL`: the canonical **public** origin of the server
   (for example `https://wmp.example.test`). The MCP resource URL, OAuth issuer,
   and DPoP `htu` validation are all derived from this value (see below).
@@ -646,13 +480,10 @@ Optional:
   login work and email verification is off; with SMTP configured, verification
   is required — the MCP login page follows the same behavior because it reuses
   the standard sign-in flow.
-- Rate-limit tuning: `RATE_LIMIT_MCP_POINTS` (default 120),
-  `RATE_LIMIT_MCP_DURATION` (default 60 s), `RATE_LIMIT_MCP_CONSENT_POINTS`
-  (default 30), `RATE_LIMIT_MCP_CONSENT_DURATION` (default 60 s), and the
-  whole-service registration bucket
-  `RATE_LIMIT_MCP_REGISTRATION_POINTS`/`RATE_LIMIT_MCP_REGISTRATION_DURATION`
-  (default 60 requests / 3600 s). See
-  [Rate limits](#rate-limits-process-local).
+- Rate-limit tuning: the limits are built in (`/mcp` 120 requests / 60 s,
+  consent 30 / 60 s, whole-service registration 60 / 3600 s).
+  `WMP_RATE_LIMIT_SCALE` (default 1, range 0.1–100) multiplies every budget;
+  the windows stay fixed. See [Rate limits](#rate-limits-process-local).
 
 The generated `.env.example` files track these keys
 (`pnpm env:sync` / `pnpm env:check`); do not hand-edit them.
@@ -671,9 +502,10 @@ With `WMP_MCP_ENABLED=false`:
   well-known aliases, and the MCP login/consent pages return **real 404s** for
   every HTTP method. The paths stay reserved ahead of static assets and SSR, so
   nothing falls through to the SPA shell.
-- The human grant list and revocation page (`Settings → MCP`) **stays
-  available** — it only requires a normal browser session — so outstanding
-  access can be killed during an emergency shutdown. Existing access JWTs also
+- Access → Agents **stays available** (listing and revoking connections and
+  agent tokens only require a normal browser session), so outstanding access
+  can be killed during an emergency shutdown. New agent tokens cannot be
+  created. Existing access JWTs also
   stop working immediately at the `/mcp` gate itself.
 
 Emergency rollback is therefore: set the flag to `false` and restart. Do not
@@ -709,7 +541,7 @@ rebuilt onto the configured canonical origin:
   including every header nominated by `Connection` — while method, path,
   query, body, `Authorization`, and the allowed `Origin` are preserved.
 
-Deployments behind a proxy must preserve `Host` (or configure the ingress so
+Servers behind a proxy must preserve `Host` (or configure the ingress so
 the direct host is allowlisted and `X-Forwarded-Host` is exactly the canonical
 public host).
 
@@ -770,10 +602,15 @@ separate policy change.
 
 Three scopes exist: `mcp:read`, `mcp:write`, and `offline_access`.
 
-- Read tools accept `mcp:read` **or** `mcp:write` (`mcp:write` semantically
+- `/mcp` accepts `mcp:read` **or** `mcp:write` (`mcp:write` semantically
   includes read).
-- Write tools require the literal `mcp:write`. Scope matching is exact-token:
-  padded or case-variant tokens never match.
+- An unauthenticated `/mcp` request gets a `WWW-Authenticate` challenge with
+  `scope="mcp:read mcp:write"`, the same scopes as `scopes_supported` in
+  `/.well-known/oauth-protected-resource`, so a client asks for both and the
+  consent page can offer Full. Read-only stays the consent default.
+- Write tools need a FULL request level, which for OAuth requires the literal
+  `mcp:write` (below). Scope matching is exact-token: padded or case-variant
+  tokens never match.
 - At the authorization endpoint, a missing or blank `scope` is rejected locally
   with a non-redirecting OAuth `invalid_scope` error; the requested `resource`
   set must contain the canonical `/mcp` URL or the request is rejected locally
@@ -781,228 +618,48 @@ Three scopes exist: `mcp:read`, `mcp:write`, and `offline_access`.
   caller-supplied redirect URI. Every present, well-formed request is forwarded
   to Better Auth unchanged for client/redirect validation.
 
-## Confirmation literals
+An OAuth request's level is FULL only when its grant is Full and the access
+token carries `mcp:write`; otherwise it is READ. A client can therefore ask for
+less than the person allowed (omit `mcp:write`), never for more. The grant's
+level is the person's choice:
 
-Destructive operations (remove/delete/revoke/clear) require the caller to pass
-`confirm: "DELETE"`. Cost-bearing or externally-visible diagnostic operations
-(pricing activation/retirement, credential tests, pool-member and chat
-completion tests) require `confirm: "RUN"`. Ordinary reversible writes need no
-ceremonial confirmation. The exact per-tool policy is in the
-[coverage artifact](./mcp-tool-coverage.md); the wrapper strips the
-confirmation field before the underlying procedure runs.
+- **Consent page.** When the client asks for `mcp:write`, the page offers
+  Read-only or Full, starting at Read-only (the agent token dialog's default)
+  and explaining Full in the dialog's words. A request without `mcp:write` is
+  approved Read-only and the page says so. The choice travels as the `level`
+  field of the person's `POST /api/auth/oauth2/consent` body (a cookie session
+  behind Better Auth's origin check, pinned by the signed `oauth_query`); a
+  missing `level` means Read-only. No authorize parameter, scope or signed-query
+  value is ever read as a level, so a client cannot pick Full. `FULL` without
+  `mcp:write` among the approved scopes, or any other value, is refused (400)
+  before a code is issued. When the approval issues a code, the level is
+  recorded on the exact grant generation the code exchanges into before the
+  response reaches the browser; if it cannot be recorded, the code is withheld
+  (500) and the remembered approval is forgotten, so the next authorize asks
+  again. A concurrent change to the same grant is retried on the fresh row.
+- **Access → Agents.** A person changes a connection between Read-only and
+  Full (`access.oauthGrants.setLevel`, a human procedure: cookie session with a
+  verified CSRF header; agents and agent tokens are refused). Raising asks for
+  confirmation, showing what Full allows. Full is offered (and accepted) only
+  for a connection whose remembered approval includes `mcp:write`
+  (`fullAvailable` in the list); otherwise the page says the agent must
+  reconnect asking for `mcp:write`.
 
-## External fallback tools
+Lowering to Read-only (in Access → Agents, or by choosing Read-only when the
+person approves the client again) takes effect at once: the next `/mcp`
+request and every node admission read the grant and see READ; the grant's
+in-flight write tool calls are aborted (read calls finish), and so is a write
+call whose request read the level just before the lowering; its running node
+commands and file ops are cancelled and the commands it queued for a person
+expire (`credential_lowered`). Nothing caches a grant's level, so there is no
+cached admission to drop. Runtime operations the grant already started (start,
+stop, restart) are not undone, as with a revocation. Raising takes effect on
+the next call. Every level
+write is audited (`audit_event`, actor USER, resource `mcp_grant`:
+`mcp_grant.consent` for the consent page, `mcp_grant.level` for Access →
+Agents, with the level before and after).
 
-`forwarder_pool_fallback_get` (read) returns a pool's external-fallback state.
-Owners get `fallbackEnabled`, `fallbackForGrantees`, `externalAfterWaitMs`,
-`externalEquivalentModel`, the external members in fallback order and the
-aggregate own-key request count. Grantees get whether owner-paid fallback is
-available to them (provider types only, never the owner's account labels) and
-their own-key route.
-
-`forwarder_pool_fallback_update` (write, literal `mcp:write`, no confirmation
-literal) changes `fallbackEnabled`, `fallbackForGrantees` and
-`externalAfterWaitMs`. These settings cost money: turning fallback on sends
-`:external` requests to the owner's paid provider accounts, and
-`fallbackForGrantees` makes the owner pay for every grantee's external use.
-The tool description states this. The procedure applies the same checks as the
-dashboard (deployment switch, audited protection policy on every external
-member, wait within the local budget), and every change, from MCP or the
-dashboard, is recorded as a `POOL_FALLBACK_UPDATED` provider audit event
-(`metadata.source` is `mcp` or `dashboard`), readable with
-`provider_audit_events_list` (`poolId` filters one pool's history) and shown
-as the fallback change history on the pool's Fallback tab in the dashboard.
-The tool description lists those preconditions. When they fail, the error
-names `fallbackEnabled` or `externalAfterWaitMs`. The general pool tools reject
-the two switches (the advertised schema describes each as forbidden and names
-this tool); they still accept `externalAfterWaitMs`, and their descriptions
-state its cost.
-
-`model_api_token_external_wait_update` (`{ id, externalAfterWaitMs }`, write,
-no confirmation) stores how long this token's `:external` requests wait for
-local capacity. Null uses each pool's `externalAfterWaitMs`. Pool
-`externalAfterWaitMs` is an owner floor: callers may only lengthen, up to the
-local capacity wait budget. A request may also send
-`x-wsmp-external-after-wait-ms`; that override cannot go below the pool floor
-or past the local wait budget. Neither owners nor grantees can shorten requests below the pool floor.
-The stored value is 0..600000; each request still applies the floor and budget
-for that pool. Every change records `TOKEN_EXTERNAL_WAIT_UPDATED` in the content-free
-provider audit log. MCP diagnostics cannot use `:external`.
-
-Still human-only: token external consent (`allowExternal`, `includeExternal`),
-own-key preferences, the pool external-equivalent picker, catalog search,
-the OpenRouter "providers that may collect data" account setting, and moving
-an OpenRouter account to another provider type (`provider_account_update`
-refuses it, since the privacy preference is keyed on the type).
-
-No tool output can contain a secret value WMP holds (provider API keys,
-encrypted credential material, token secrets or hashes, device-flow and 2FA
-backup codes). Projections pick safe fields, a recursive redactor removes
-secret-bearing keys and product credentials under any key, and the serializer
-elides byte values. A test drives every tool with secret-laden results and
-searches the output for every seeded secret value in every encoding. The CLI
-command tools return a masked copy of what a command printed on your own CLI
-device (behind the separate `allowCliCommands` consent). The CLI masks headless
-stdout/stderr and the shared/review capture of supervised output before it
-leaves the node; the person's encrypted terminal viewer is unchanged.
-
-Masking scans the terminal-cleaned view, including indentation. Terminal parser
-state carries across lines and chunks, including control strings containing LF.
-A line with any mask emits masked cleaned text with CR/LF terminators preserved;
-an unmasked line keeps its raw bytes. Control strings hiding LF are held through
-the next terminal ground-state LF so names cannot be joined after scanning.
-Masked groups spanning hidden LFs emit opaque physical-line markers with their
-CR/LF bytes preserved. The server's `cleanText` still runs afterwards.
-The person's encrypted terminal viewer keeps the original bytes.
-
-The file tools' restartable scanner masks private-key PEM blocks through the
-matching END label (missing or mismatched END stays masked); whole lines with
-secret-name tokens as `⟦redacted line⟧`, the following non-blank line and deeper
-indentation continuation (including blanks within the run); secret flag value
-tails such as `--api-key` / `--hf-token` and their continuation; and every
-non-blank output line when the command text names `.cache/huggingface/token`
-or `.huggingface/token`. Token words are case-insensitive and end in `_TOKEN`,
-`_KEY`, `_SECRET`, `_PASSWORD`, `apikey`, `api-key`, `api_key`, `hf-token` or
-`hf_token`, or equal `PASSWORD`. Open quotes/backslashes on token/value lines
-continue until a blank line. Printed dotenv-style token lines are masked whole;
-`KEY=⟦redacted:N⟧` applies only to the file tools' dotenv view.
-
-Each normal line is scanned once, held until a terminal ground-state LF or
-EOF/completion, with at most
-64 KiB held per stream and no filesystem access. An overlong line is scanned
-in bounded pieces with retained private-key labels and overlap across piece boundaries,
-and masked whole, never emitting a prefix or unbroken token tail. When the overlong line begins inside a live multi-line
-secret run — an open private-key PEM block, an open quote or backslash
-continuation, an indentation run from the output itself — that run's remaining output is opaque through
-EOF, like the 1 MiB case, because the state a fresh scanner would drop is what
-masks the lines that follow. Otherwise, at its terminating LF a fresh scanner is
-primed with every unclosed private-key BEGIN label from that line and an
-unconditional until-blank opener. Every non-blank output line stays masked until
-the next blank line, including output after an overlong public line or closed
-quote. (The recovery's own synthetic guard is exempt: a second overlong line right after it recovers again, masking at least as much.) A matching END closes the corresponding carried PEM block.
-Recovery also treats that line as a column-0 secret-name token line: the next
-non-blank line is masked whole, and subsequent lines indented deeper than column
-0 stay masked. Blank lines do not consume the next-line protection; PEM and other
-opener detection still run on protected lines. Normal scanning resumes after
-the blank unless PEM, indentation, or next-value protection extends masking. CR/LF
-bytes are preserved. Opaque fallbacks stay closed through EOF: more than
-1 MiB of input contributing live masking state bounds PEM/indentation state, and
-an over-long line inside a live run fails closed instead of dropping the opener.
-A PEM marker exceeding the 1 KiB recovery overlap on an overlong line stays
-opaque through EOF, since its exact label cannot safely be reconstructed.
-A cleaned LF inside an overlong terminal group, including LF executed inside
-unfinished CSI, also makes the remaining stream opaque through EOF.
-The latency bound is in bytes; a silent
-process has no wall-clock flush deadline. Invalid UTF-8 passes through when its
-cleaned lossy scan finds no mask. EOF flushes partial output; teardown flushes exec tails or
-discards unshared capture. Masking precedes the 8 KiB head / 40 KiB tail cuts,
-and `output_bytes`/stream totals count masked bytes. WMP credentials are still
-scrubbed by the server. Other secrets (vendor tokens, JWTs, cloud credentials)
-are returned as printed, and on an `unsupervised` node this masking is not a
-security boundary. The threat model is accidental disclosure, not crafted evasion.
-
-Three independent switches gate each command (the token, the device's dashboard
-grant and the CLI's own config); see [CLI command switches](cli-command-switches.md).
-
-## Tool input schemas
-
-Each procedure-backed tool advertises the JSON Schema of its real oRPC input
-(generated from the procedure's zod schema, so required fields such as
-`poolId` show up in `tools/list`), plus the few fields MCP itself owns:
-
-- `confirm`: the exact literal (`DELETE` or `RUN`), required on gated tools;
-- fields an agent must not use, advertised as `{ "not": {} }` with a
-  `description` that names the tool to use instead (the pool fallback switches
-  point to `forwarder_pool_fallback_update`; `allowDataCollection` is
-  dashboard-only);
-- timestamp filters, advertised as RFC 3339 UTC strings.
-
-The generator lives in `apps/server/src/mcp/input-schema.ts`, and a test
-compares every tool's advertised schema with its procedure schema. The schema
-is advisory: the oRPC procedure still validates every call, so a client that
-ignores the schema gets the same checks.
-
-## Tool errors
-
-A failed tool call returns `isError: true`, a short stable text, and
-`structuredContent.error.code`. Application messages are not copied into
-tool output except sanitized static argument-shaped `BAD_REQUEST` messages described below.
-Allowlisted oRPC codes keep their name (`BAD_REQUEST`,
-`UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `CONFLICT`, `TOO_MANY_REQUESTS`);
-anything else is `INTERNAL_ERROR` with a `requestId`. Wrapper-level errors
-use their own codes (for example `INSUFFICIENT_SCOPE`, `CONFIRMATION_REQUIRED`,
-`invalid_input`, `OUTPUT_TOO_LARGE`, `REQUEST_ABORTED`).
-
-A deletion-related `CONFLICT` also carries a stable `reason`
-(`@ws-model-proxy/config/deletion-conflict`), in the text (`Conflict:
-<reason>`) and in `structuredContent`:
-
-```json
-{ "error": { "code": "CONFLICT", "reason": "retained_history" } }
-```
-
-| `reason` | Meaning | What to do |
-| --- | --- | --- |
-| `retained_history` | Provider accounting history must be kept, so the user can never be deleted. | Archive the user instead. |
-| `delete_pending` | The user's request history could not be drained yet; nothing was deleted. | Retry once requests finish. |
-| `delete_contended` | The set of affected owners kept changing under the delete, or it kept deadlocking (including a server-side lock or statement timeout); nothing was deleted. | Retry. |
-| `still_attached` | A capacity is still attached to a pool member. | Detach it first. |
-| `not_stale` | A stale-only delete found the item reporting recently. | Nothing; it is live. |
-| `deletion_in_progress` | The user is being deleted and cannot be restored. | Nothing. |
-
-Only these values are forwarded; any other `data` on a `CONFLICT` is dropped.
-
-An argument-shaped failure uses `invalid_input` and names the failing fields,
-in the text and in `structuredContent`:
-
-A schema rejection includes `issues`:
-
-```json
-{
-  "error": {
-    "code": "invalid_input",
-    "fields": ["poolId"],
-    "message": "poolId: Invalid input: expected string, received undefined",
-    "issues": [{ "path": ["poolId"], "code": "invalid_type", "message": "Invalid input: expected string, received undefined" }]
-  }
-}
-```
-
-A schema-valid rejection names the procedure's fields and keeps its static message:
-
-```json
-{
-  "error": {
-    "code": "invalid_input",
-    "fields": ["capacityConcurrencyLimit"],
-    "message": "Effective concurrency limit exceeds physical capacity."
-  }
-}
-```
-
-`fields` contains only failing dotted caller-input paths (for example
-`advanced.contextMargin` or `rules.0.threshold`), never suggested replacement names.
-Suggestions remain separately on each issue; their total comparison work is bounded
-independently of tool-schema size. `unknownKeyCount` is the total count, not the number
-of suggestions. Safe declared reason enums survive even when no field can be named.
-Timestamp adapter failures use the same `invalid_input` / `fields` contract.
-`fields` is present whenever the failure is argument-shaped and at least one
-key can be named: missing or out-of-range values, a key that is not on this
-object (`unrecognized_keys`, counted on the issue as `unknownKeyCount` with
-`suggestions` drawn from the tool's declared names), and a
-schema-valid rejection such as a concurrency limit past physical capacity
-(`data.fields` on the procedure error, kept only when that tool advertises
-the name). `message` is the explanation. Validator `issues` are included when
-the failure came from the schema: `path` names the failing field (array
-indexes are numbers; a segment that is not a field the tool declares is
-`"?"`), `code` is the validator's issue code (anything outside a short
-allowlist of standard codes is reported as `invalid`), and each issue
-`message` is the validator's own text. Input values and caller-chosen key
-names are never echoed: messages that could quote a value (`custom`,
-`unrecognized_keys`, unknown codes) are replaced by fixed text, unrecognized
-keys become a count plus server-chosen suggestions, and at most 20 issues
-are returned. A `BAD_REQUEST` that is not about an argument (for example a
-failed precondition with no field list) stays the plain "Invalid input".
+An agent token's level is the one it was created with.
 
 ## Login, consent, and scope step-up
 
@@ -1016,17 +673,23 @@ The authorization flow uses Better Auth's signed OAuth transaction
   page offers "Sign in again to reauthorize": signing out (preserving the
   signed query) and signing in again creates a new session-derived grant
   generation that requires fresh consent.
-- `/{lang}/mcp-consent` — the consent page. First use always prompts; expanded
-  scopes (for example stepping up from `mcp:read` to `mcp:write`) prompt again
-  for the full requested set. A remembered consent is reused only when the
+- `/{lang}/mcp-consent` — the consent page. It shows the requesting client,
+  the requested scopes and the access level (Read-only or Full, see
+  [Scopes](#scopes)), with Authorize and Deny. The level is part of what the
+  person approves. First use always prompts;
+  expanded scopes (for example stepping up from `mcp:read` to `mcp:write`)
+  prompt again for the full requested set, and the level chosen on that prompt
+  replaces the grant's level. A remembered consent is reused only when the
   client, the user, the session-derived reference, the requested scopes
   (every requested scope must be inside the remembered set), and the requested
   resources all match the stored consent row — and an explicit `prompt=consent`
-  overrides reuse and forces the page. Denial is honored: the consent endpoint
+  overrides reuse and forces the page (whose choice again replaces the level).
+  A reused consent never changes the level: re-authorization keeps the level
+  the person last chose on the page or in Access → Agents. Denial is honored: the consent endpoint
   answers HTTP 200 `{redirect: true, url}` pointing at the validated callback
   with `error=access_denied` — no code and no grant are minted. The page
-  explains read/write and `offline_access` (background renewal, 72-hour
-  inactivity expiry, revocable in Settings). Remote client logos are never
+  explains `offline_access` (background renewal, 72-hour inactivity expiry,
+  revocable in Access → Agents). Remote client logos are never
   fetched or rendered.
 - Tampered, expired, or unsigned OAuth queries fail closed.
 
@@ -1051,86 +714,59 @@ flag is off.
 
 ## Grants and revocation
 
-Every access JWT carries a private `mcp_grant_id` claim bound to an
+Every OAuth access JWT carries a private `mcp_grant_id` claim bound to an
 application-owned `McpGrant` generation keyed by
 `(userId, clientId, referenceId)`, where the reference is an HMAC of the
-consenting session and the validated client. On every `/mcp` request the exact
-grant is loaded and must be active:
+consenting session and the validated client. Each grant records a level
+(the person's choice on the consent page, created when the approval issues its
+code; Read-only for a grant created without the page). On every `/mcp` request
+the exact grant is loaded and must be active:
 
-- **Human revocation** (Settings → MCP, `confirm: "REVOKE"`) tombstones every
-  collected generation for the user/client — including pending authorization
-  codes discovered from bounded, validated scans — marks matching refresh rows
-  revoked (revocation itself never deletes rows — rotated/expired refresh rows
-  are removed later by the retention cleanup once eligible — so replay
-  evidence survives), deletes remembered consent, and is idempotent.
+- **Disconnecting** a connection (Access → Agents, `access.oauthGrants.revoke`)
+  tombstones the grant, marks the client's refresh and access token rows for
+  that person revoked (rows are not deleted, so replay evidence survives until
+  the retention cleanup), deletes the remembered consent so reconnecting asks
+  again. It also aborts the grant's in-flight tool calls, cancels its running
+  node commands and expires the commands it queued for a person. Authorization
+  codes still pending are not swept; they expire within minutes.
 - **Refresh** requires the exact grant generation to remain active. A revoked
   generation can never refresh again.
 - **Self-contained JWTs** cannot be deleted server-side. Their residual
-  lifetime is bounded to at most 10 minutes, and only while the grant remains
-  active: the live per-request grant check makes a token from a tombstoned
-  generation unusable at `/mcp` immediately, even if a raced or cached
-  issuance left an inert token row behind.
-- The exact guarantee: a **tombstoned generation** can never refresh again
-  and never passes `/mcp`. Re-authorization does not always require a new
-  browser session and fresh consent: one accepted interval exists. If a
-  reference is **artifact-free** at revocation time (the authorization code
-  was already consumed, no consent row carries it, and no grant row exists
-  yet) and its connection was revoked mid-exchange, the resumed exchange can
-  mint a **new active generation** — grant creation checks only the exact
-  persisted reference, and with none of the three artifacts collected the
-  revoke had nothing to tombstone (pinned by the integration suite's
-  skip-consent fixture, which has zero consent/verification/grant rows for
-  the reference). Conversely, when a consent row (or pending code) DOES
-  carry the reference, revocation collects and tombstones it and the
-  resumed exchange fails. A genuinely new browser session (new reference
-  generation) also works and requires fresh consent (the
-  remembered-consent row was deleted by the revoke).
-- Within the 30-second retry window there is a second accepted branch: after
-  revocation, retrying the **rotated (cached) ancestor** refresh token
-  returns HTTP 200 with the byte-identical cached token pair, while that
-  cached access token gets 403 at `/mcp` — cached delivery, not restored
-  authorization. Presenting the revoked **current** refresh token fails and
-  terminally deletes the whole refresh family.
+  lifetime is at most 10 minutes, and the live per-request grant check makes a
+  token from a tombstoned generation unusable at `/mcp` immediately.
+- Within the 30-second retry window, retrying the **rotated (cached) ancestor**
+  refresh token after a disconnect returns the byte-identical cached token
+  pair, while that cached access token gets 403 at `/mcp` — cached delivery,
+  not restored authorization. Presenting the revoked **current** refresh token
+  fails and deletes the whole refresh family.
+- A new browser session (a new reference) can authorize again and requires
+  fresh consent.
 - Deleting the user, an active ban, or a forced-2FA requirement also fails
   live checks immediately regardless of token expiry.
 
-Observed upstream behavior (pinned by the integration suite): exchanging an
-authorization code whose generation was revoked while the code was pending
-surfaces as a bare 500 with an empty body from the installed provider, and
-mints nothing. The acceptance invariant — no token from a tombstoned
-generation can refresh or pass `/mcp` — holds either way.
+## Agent tokens and connections
 
-## Human grant listing and revocation page
+Access → Agents shows the MCP URL, the OAuth connections (client name, redirect
+host, level) with a Read-only / Full control and a Disconnect action, and agent
+tokens.
 
-`Settings → MCP` lists, per connected client: safe name/URI, the internal
-client record ID, deduplicated scopes, first/latest authorization activity,
-the latest rolling inactivity expiry, the active refresh count, and DPoP state
-(`all | some | none`). Clients whose grants are all revoked are hidden from
-the list. Revocation uses an `AlertDialog` with the `REVOKE` confirmation
-literal and returns only `{ revoked: true }`. Token hashes, reference IDs,
-session IDs, redirect URIs, and key material are never returned. The CIMD
-client cache row is preserved because other users may share the client.
+An **agent token** (`wsmp_agent_…`) is for a headless client; send it as
+`Authorization: Bearer <token>` to `/mcp`. A person creates it in the browser
+(`access.agentTokens.create` is a human procedure, never an MCP tool), choosing
+Read-only or Full and an expiry. The secret is shown once; the server keeps a
+digest.
 
-## Personal access tokens
-
-`Settings → MCP` can also mint a personal access token (`wsmp_mcp_…`) for a
-headless client. The secret is shown once, creation requires a browser
-session, and `mcpTokens.create` is not an MCP tool. This is separate from the
-10-minute OAuth access JWTs above.
-
-- Omitting `expiresAt` mints a token that expires **90 days** later, measured
-  as exactly 90 × 24 hours (`90 * 86_400_000` ms) from the server clock at
-  creation. That is the product default, including the settings form, whether
-  or not no-expiry is allowed.
-- An explicit `null` means no expiry. That choice is allowed only while
-  `WMP_MCP_PAT_ALLOW_NO_EXPIRY` is on (the flag's default stays `true`).
-  Turning the flag off refuses explicit no-expiry mints; omission still means
-  90 days. The form keeps the "No expiry" option only while the flag is on.
-- An explicit timestamp is stored as given when it is strictly in the future
-  and at most 365 days (`MCP_PAT_MAX_TTL_DAYS`) from now.
-- Changing the flag or the default does not rewrite tokens that already
-  exist. List and revoke stay available while MCP is disabled; create does
-  not.
+- The expiry is a timestamp strictly in the future and at most 365 days
+  (`MCP_PAT_MAX_TTL_DAYS`) ahead. `null` (no expiry) is accepted only while
+  `WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY` is on (its default). The form proposes 90
+  days.
+- A person may hold at most 10 active tokens; revoke one before creating
+  another.
+- Revoking a token aborts its in-flight tool calls, cancels its running node
+  commands and expires the commands it queued. Expired and revoked tokens fail
+  at `/mcp` like unknown ones.
+- Tokens cannot be created while MCP is turned off; listing and revoking stay
+  available.
 
 ## DPoP (optional, preferred)
 
@@ -1180,68 +816,22 @@ starts an immediate sweep that will remove artifacts already past eligibility
   schedule can retain records well past eligibility — that is safe, only
   late. Authorization-code candidates are validated by bounded
   JSON parsing plus an exact `type === "authorization_code"` check before
-  deletion — the scan does **not** match stored user/client ownership (that
-  stronger validation belongs to human revocation, which uses validated
-  scans). Unrelated email/OTP verification records are never swept.
+  deletion — the scan does **not** match stored user/client ownership.
+  Unrelated email/OTP verification records are never swept.
 - Automatic CIMD-client deletion and JWKS key deletion are deliberately
   deferred pending a separately reviewed policy.
-
-## Agent audit log
-
-Every command an MCP agent runs on a CLI device (`forwarder_cli_command_run`,
-`forwarder_cli_supervised_command_start`), including refused ones, is recorded
-in `cli_agent_action_event`, along with file operations. Supervised edit, write,
-rename, mkdir and delete requests each record exactly one `supervised_file_write`
-event, including admission refusals; they do not also record a headless file
-event. Its path is the requested path (the source for rename), its reason is
-`<op>:<code>` (`write:completed`, `edit:conflict`, etc.), and available etags and
-write byte counts are metadata. Accepted writes whose apply deadline or session
-loss leaves the result uncertain record `unknown`, and so does any dispatched
-request the server ends (revocation, policy change, session loss, confirm expiry)
-before the CLI has authoritatively settled it. A file error the CLI reports before
-acceptance records `failed`, a spawn/admission rejection `refused`, and a
-CLI-acknowledged confirm expiry or decline records `expired` or `declined`;
-requests never dispatched to the CLI record `cancelled` or `refused`. Headless file operations retain their per-tool
-`file_*` kinds and use `<code>` for their reason. Both reason shapes are returned
-by `forwarder_cli_activity_list`. Unverified device ids are stored as `unknown`. The
-log is **metadata only**: who (user, device, token), what (kind, and for a
-command a keyed HMAC-SHA256 of the command text plus its program name — never
-the command text itself), when, and how it ended (`completed`, `refused`, `failed`,
-`cancelled`, `declined`, `expired`, `unknown`, with a stable reason such as
-`exit:1` or `limit`). The reason is a stable machine code: a CLI rejection frame
-(`exec.rejected`, `supervised.rejected`) whose reason is not a known code is
-stored as `rejected`, so CLI-supplied text never reaches the column. File
-content, diffs and command output are never stored, and the command's arguments
-are never stored: the server reduces the command text to its program name: it skips leading plain
-`NAME=value` assignments (never stored), removes one layer of quotes, takes the
-basename of a path and lowercases it, and stores the result only when it is in a
-fixed, code-reviewed allowlist of common program names
-(`CLI_AGENT_PROGRAM_ALLOWLIST` in `packages/config/src/cli-agent-audit.ts`), else `?`
-(an unknown program, a non-plain assignment value, a flag, a redirection or a
-command cut for length; a wrapper such as `sudo` or `env` is stored by its own
-name), so only allowlisted strings ever reach the row; the server also hashes the whole text (the first 16384 characters of an oversized, refused command). The digest is
-HMAC-SHA256 under a key derived from the server auth secret via HKDF-SHA256
-(fixed info `wsmp-cli-agent-audit-v1`), so a copy of the table alone cannot be
-used to check a guessed command; when the key cannot be derived the hash is
-stored as `hmac-sha256:unavailable` and still leaks nothing. Writing an
-event never blocks or fails the operation (a bounded in-process queue, dropped
-and counted when the database cannot keep up). Rows are deleted after **90
-days** by the hourly retention sweep, and with the user on account deletion
-(the deletion drain removes them; a row recorded or skipped after that drain,
-such as the cancellation of a command still running when the account is
-deleted, is removed by the deleted-user purge within its grace period, and the
-hourly retention sweep deletes any event whose user no longer exists).
-The owner reads them under `Dashboard → CLIs → Agent activity` and through
-`forwarder_cli_activity_list` (read scope; visible only to a personal token
-minted with CLI commands, like the other CLI tools).
 
 ## Rate limits (process-local)
 
 - `/mcp`: an unconditional, pre-authentication IP-keyed bucket
-  (`RATE_LIMIT_MCP_POINTS`/`RATE_LIMIT_MCP_DURATION`, default 120 requests /
-  60 s), a 1 MB body cap, then — after token verification — an identity-keyed
+  (120 requests / 60 s, times `WMP_RATE_LIMIT_SCALE`), a 1 MB body cap, then — after token verification — an identity-keyed
   quota on `sub + client_id` with the same budget. Pre-auth buckets are never
   keyed by token bytes.
+- Tools: some tools have a stricter per-credential limit (`runtime_start`,
+  `runtime_stop` and `profile_apply` share 10 per minute; `node_command_run`
+  and `node_command_queue_for_user` share 30 per minute; `model_test` with
+  `bench` 2 per minute). The [coverage table](./mcp-tool-coverage.md) lists
+  them. A limited call fails with `TOO_MANY_REQUESTS` and `retryAfterSeconds`.
 - MCP OAuth endpoints (authorize, consent, continue, token, revoke,
   public-client, public-client-prelogin, JWKS) use an exact method+path
   allowlist with a protocol bucket and a tighter **user-keyed** bucket for the
@@ -1251,8 +841,7 @@ minted with CLI commands, like the other CLI tools).
   not both). Small form-body caps run before the limiters. Everything else
   under `/api/auth/*` keeps the general auth limiter.
 - The RFC 7591 register endpoint has its own **whole-service** bucket
-  (`RATE_LIMIT_MCP_REGISTRATION_POINTS`/`RATE_LIMIT_MCP_REGISTRATION_DURATION`,
-  default 60 requests / 3600 s) keyed globally rather than by IP — DCR is
+  (60 requests / 3600 s, times `WMP_RATE_LIMIT_SCALE`) keyed globally rather than by IP — DCR is
   intentionally unauthenticated, so an IP key would let rotating source
   addresses persist unbounded OAuth client rows. It runs before the general
   auth limiter on that path.
@@ -1260,10 +849,15 @@ minted with CLI commands, like the other CLI tools).
   restart, and clients exceeding a bucket get `429` with a `Retry-After`
   header. Statelessness removes session affinity, not the need for
   distributed limiting: the documented ceilings assume a **single-process
-  deployment** — when replicas scale horizontally, every in-memory ceiling
+  server** — when replicas scale horizontally, every in-memory ceiling
   effectively multiplies by the replica count, so arrange shared enforcement
   before relying on fleet-wide ceilings. Distributed rate limiting is out of
   scope for this release.
+- The node relay (`/api/cli/ws`) has its own buckets, apart from sign-in:
+  10 authenticated connections per node per minute and 30 failed
+  (unauthenticated) connections per address per minute, each then blocked for
+  5 minutes (times `WMP_RATE_LIMIT_SCALE`). Only failed connections count
+  against an address.
 
 ## Client examples
 
@@ -1384,14 +978,14 @@ Let `ISSUER` = `<BETTER_AUTH_URL>/api/auth` and `RESOURCE` =
    Authorization: Bearer <access JWT>
    MCP-Protocol-Version: 2026-07-28
    Mcp-Method: tools/call
-   Mcp-Name: forwarder_model_pools_list
+   Mcp-Name: pools_get
 
    {
      "jsonrpc": "2.0",
      "id": 1,
      "method": "tools/call",
      "params": {
-       "name": "forwarder_model_pools_list",
+       "name": "pools_get",
        "arguments": {},
        "_meta": {
          "io.modelcontextprotocol/protocolVersion": "2026-07-28",
@@ -1477,7 +1071,7 @@ When bumping the Better Auth family (`better-auth`, `@better-auth/mcp`,
 
 ## Manual MCP Inspector smoke checklist
 
-Operator procedure, not a unit test. Run against a deployment that leaves
+Operator procedure, not a unit test. Run against a server that leaves
 `WMP_MCP_ENABLED` at its default of true:
 
 1. Discovery — all four well-known aliases return metadata; the RFC 7591
@@ -1486,24 +1080,23 @@ Operator procedure, not a unit test. Run against a deployment that leaves
 3. Login with 2FA.
 4. Consent including `offline_access`.
 5. Read — a read tool succeeds.
-6. Read-only write denial / step-up — write denied without `mcp:write`;
-   re-consent for the expanded full scope set.
-7. Confirmation denial / success — write tool without `confirm`, then with
-   the literal.
+6. Read-only write denial / step-up — a connection approved Read-only lists
+   only the read tools and a write tool answers as unknown, even with
+   `mcp:write`. Raise it to Full in Access → Agents (or re-authorize with
+   `prompt=consent` and choose Full) and repeat the write; lower it again and
+   the next write answers as unknown.
+7. Confirmation denial / success (Full agent token) — a delete without
+   `confirm`, then with `confirm: "DELETE"`.
 8. Refresh rotation and retry — tokens rotate; a retried refresh within the
    window returns the cached response.
-9. Settings grant listing / revocation.
+9. Access → Agents connection listing, level change / disconnect.
 10. Post-revoke refresh, both branches — ORDER MATTERS: within the
     30-second window, first retry the **rotated ancestor** (it returns the
     cached pair whose access token gets 403 at `/mcp` — cached delivery, not
     restored authorization); only THEN present the revoked **current**
     refresh token (rejected, and it wipes the whole refresh family — doing
     this first makes the cached branch unobservable).
-11. Reauthorization — sign in again after revocation; fresh consent required
-    (this path created a remembered consent row in step 4, so the narrow
-    artifact-free exception — consumed code, no consent row, no grant yet,
-    revoked mid-exchange — does not apply here; see
-    [Grants and revocation](#grants-and-revocation)).
+11. Reauthorization — sign in again after revocation; fresh consent required.
 12. Wrong-resource denial — a token for a foreign resource/audience is
     rejected.
 13. Bearer / DPoP interoperability — a plain Bearer client works; a

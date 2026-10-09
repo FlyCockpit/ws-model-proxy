@@ -14,15 +14,14 @@ pub mod config;
 pub mod control;
 pub mod count_context;
 pub mod daemon;
-pub mod deployments;
 pub mod display_escape;
 pub mod engine;
-pub mod engine_adapter;
 pub mod exit;
 #[cfg(unix)]
 pub mod file_ops;
 #[cfg(unix)]
 pub mod file_relay;
+pub mod hardware;
 pub mod hostname;
 #[cfg(windows)]
 mod job_tree;
@@ -35,6 +34,9 @@ pub mod paths;
 pub mod probe;
 pub mod protocol;
 pub mod relay_bus;
+pub mod runtime_store;
+pub mod runtimes;
+pub mod secrets;
 pub mod sessions;
 pub mod shutdown;
 pub mod slug;
@@ -42,9 +44,7 @@ pub mod startup;
 pub mod state;
 pub mod stt;
 pub mod stt_wire;
-pub mod supervised_file;
-pub mod supervised_run;
-pub mod supervised_screen;
+pub mod subreaper;
 pub mod telemetry;
 pub mod telemetry_bounds;
 pub mod terminal_crypto;
@@ -52,6 +52,7 @@ pub mod terminal_identity;
 pub mod terminal_parse;
 pub mod tls;
 pub mod tokens;
+pub mod trust;
 
 #[cfg(all(test, windows))]
 #[path = "../tests/support/windows_tree.rs"]

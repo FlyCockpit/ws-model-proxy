@@ -426,23 +426,22 @@ export interface WarmProtectionSource {
 export async function authorizedKvEvictionRows<T extends { capacityId: string; userId: string }>(
   rows: readonly T[],
   ownerId: string,
-  now: Date,
+  /** Shares carry no expiry in 0.4.0; kept for the callers' signature. */
+  _now: Date,
   db: Pick<typeof prisma, "$queryRaw"> = prisma,
   poolId?: string,
 ): Promise<T[]> {
   const foreign = rows.filter((row) => row.userId !== ownerId);
   if (!foreign.length) return [...rows];
   const allowed = await db.$queryRaw<Array<{ id: string }>>(Prisma.sql`
-    SELECT DISTINCT t."inferenceCapacityId" AS id FROM execution_target t
-    JOIN pool_member m ON m."executionTargetId" = t.id
-    JOIN inference_contribution c ON c.id = m."inferenceContributionId"
-    JOIN model_pool p ON p.id = m."poolId"
-    WHERE t."inferenceCapacityId" = ANY(${foreign.map((row) => row.capacityId)}::text[])
-      AND p."userId" = ${ownerId} AND c."poolOwnerUserId" = p."userId"
-      AND c."poolId" = p.id AND c."contributorUserId" = t."userId"
-      AND c."discoveredModelId" = t."discoveredModelId"
-      AND m."discoveredModelId" = t."discoveredModelId"
-      AND c.state = 'ACTIVE' AND c."expiresAt" > ${now}
+    SELECT DISTINCT t."instanceId" AS id FROM execution_target t
+    JOIN pool_member m ON m."runtimeModelId" = t."runtimeModelId"
+    JOIN share s ON s.id = m."shareId"
+    JOIN pool p ON p.id = m."poolId"
+    WHERE t."instanceId" = ANY(${foreign.map((row) => row.capacityId)}::text[])
+      AND p."userId" = ${ownerId} AND s."ownerUserId" = p."userId"
+      AND s."poolId" = p.id AND s."granteeUserId" = t."userId"
+      AND s."canContribute" AND m.state = 'ACTIVE'
       ${poolId === undefined ? Prisma.empty : Prisma.sql`AND p.id = ${poolId}`}`);
   const ids = new Set(allowed.map((row) => row.id));
   return rows.filter((row) => row.userId === ownerId || ids.has(row.capacityId));
@@ -497,25 +496,23 @@ export async function loadWarmSessions({
       SELECT r.id, r."sessionId" AS "sessionKey",
              r."tenantUserId", r."poolId", r."userId", r."lastUsedAt",
              COALESCE(r."reportedTokens", r."estimatedTokens") AS "footprintTokens",
-             r."executionTargetId", t."inferenceCapacityId" AS "capacityId"
+             r."executionTargetId", t."instanceId" AS "capacityId"
         FROM cache_affinity_record r
         JOIN execution_target t ON t.id = r."executionTargetId"
         LEFT JOIN cache_affinity_residency b ON b."executionTargetId" = t.id
        WHERE (t."userId" = ${ownerId} OR EXISTS (
+         -- A contributed member: the share's grantee serves this model on this instance.
          SELECT 1 FROM pool_member m
-         JOIN inference_contribution c ON c.id = m."inferenceContributionId"
-         JOIN execution_target allowed ON allowed.id = m."executionTargetId"
-         WHERE allowed."inferenceCapacityId" = t."inferenceCapacityId"
-           AND c."poolOwnerUserId" = ${ownerId} AND c."poolId" = m."poolId"
-           AND c."contributorUserId" = allowed."userId"
-           AND c."discoveredModelId" = allowed."discoveredModelId"
-           AND m."discoveredModelId" = allowed."discoveredModelId"
-           AND c.state = 'ACTIVE' AND c."expiresAt" > ${now}
+         JOIN share s ON s.id = m."shareId"
+         WHERE m."runtimeModelId" = t."runtimeModelId"
+           AND s."ownerUserId" = ${ownerId} AND s."poolId" = m."poolId"
+           AND s."granteeUserId" = t."userId" AND s."canContribute"
+           AND m.state = 'ACTIVE'
          LIMIT 1 OFFSET 0
        ))
            AND r."cacheGeneration" = COALESCE(wsmp_affinity_scope_generation(t.id, r."poolId"), '')
          AND ${affinityGenerationReadySql(Prisma.sql`t.id`)}
-         AND t."inferenceCapacityId" IN (${Prisma.join([...capacityIds])})
+         AND t."instanceId" IN (${Prisma.join([...capacityIds])})
          AND r."lastUsedAt" >= ${since}
          AND r."expiresAt" > ${now}
          -- Sub-floor records never make a session eligible on their own, so
@@ -556,8 +553,8 @@ export async function loadWarmSessions({
                         AND v."executionTargetId" = s."executionTargetId"
                         AND v."sessionKey" = s."sessionKey") AS "inFlight",
              CASE WHEN s."tenantUserId" = s."userId"
-                  THEN p."ownerProtectionPercent"
-                  ELSE g."protectionOverridePercent" END AS "overridePercent"
+                  THEN (a.overrides #>> '{protection,ownerPercent}')::int
+                  ELSE g."protectionPercent" END AS "overridePercent"
         FROM session s
         LEFT JOIN LATERAL (
           SELECT r."sharedWithSessionId", r."sharedPrefixTokens"
@@ -572,8 +569,9 @@ export async function loadWarmSessions({
            LIMIT 1
            OFFSET 0
         ) f ON true
-        JOIN model_pool p ON p.id = s."poolId"
-        LEFT JOIN pool_grant g ON g."poolId" = s."poolId" AND g."granteeUserId" = s."tenantUserId"
+        JOIN pool p ON p.id = s."poolId"
+        LEFT JOIN pool_advanced a ON a."poolId" = p.id
+        LEFT JOIN share g ON g."poolId" = s."poolId" AND g."granteeUserId" = s."tenantUserId"
        WHERE s.tokens >= ${policy.minTokens}
     ),
     ranked AS (

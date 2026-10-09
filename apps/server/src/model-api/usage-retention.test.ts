@@ -13,26 +13,28 @@ vi.mock("@ws-model-proxy/env/shared", () => ({
 // their wiring into the retention run is under test.
 const sweeps = vi.hoisted(() => ({
   HOT_PATH_SWEEP_BATCH: 1_000,
+  NODE_COMMAND_RETENTION_MS: 30 * 24 * 60 * 60 * 1000,
   pruneTerminalCapacityHistory: vi.fn(),
   purgeDeletedUsersHistory: vi.fn(),
-  pruneOrphanCapacityRuntime: vi.fn(),
+  pruneOrphanCapacityScheduler: vi.fn(),
   pruneExpiredStickiness: vi.fn(),
+  pruneOldNodeCommands: vi.fn(),
 }));
 vi.mock("@ws-model-proxy/db/hot-path-sweeps", () => sweeps);
 
 const {
   ABANDONED_PENDING_AFTER_MS,
   compactMinuteRollups,
-  deleteExpiredCliAgentActions,
-  deleteExpiredDeploymentOperatorEvents,
-  deleteOrphanCliAgentActions,
-  deleteOrphanDeploymentOperatorEvents,
+  deleteExpiredNodeAuditEvents,
+  deleteOrphanNodeAuditEvents,
   deleteExpiredHourRollups,
   deleteExpiredRelayRequests,
   deleteExpiredRoutingVerdicts,
   deleteExpiredKvEvictions,
-  deleteExpiredEngineLoadMinutes,
+  deleteExpiredRuntimeLoadMinutes,
   deleteExpiredNodeMetricsMinutes,
+  deleteDecidedQueuedNodeCommands,
+  expireOverdueQueuedNodeCommands,
   KV_EVICTION_RETENTION_MS,
   hourIncrementsFromMinuteRows,
   ROUTING_VERDICT_RETENTION_MS,
@@ -69,9 +71,13 @@ function minuteRow(overrides: Record<string, unknown> = {}) {
     ownerUserId: "owner-1",
     requesterUserId: "user-1",
     poolId: "pool-1",
-    poolMemberId: "member-1",
-    executionTargetId: "target-1",
-    source: "API_TOKEN",
+    runtimeId: "",
+    versionId: "version-1",
+    nodeId: "node-1",
+    instanceId: "instance-1",
+    runtimeModelId: "model-1",
+    providerModelId: "",
+    source: "API_KEY",
     requests: 2,
     successes: 2,
     errors: 0,
@@ -104,8 +110,9 @@ describe("usage retention", () => {
     sweeps.purgeDeletedUsersHistory
       .mockReset()
       .mockResolvedValue({ users: 0, rows: 0, completed: 0 });
-    sweeps.pruneOrphanCapacityRuntime.mockReset().mockResolvedValue(0);
+    sweeps.pruneOrphanCapacityScheduler.mockReset().mockResolvedValue(0);
     sweeps.pruneExpiredStickiness.mockReset().mockResolvedValue(0);
+    sweeps.pruneOldNodeCommands.mockReset().mockResolvedValue(0);
   });
   afterEach(() => disarmDbShutdownFence());
 
@@ -123,49 +130,42 @@ describe("usage retention", () => {
       relayRequestsDeleted: 0,
       minuteRowsCompacted: 0,
       hourRowsDeleted: 0,
-      agentActionsDeleted: 0,
-      operatorEventsDeleted: 0,
+      nodeAuditEventsDeleted: 0,
+      nodeCommandsDeleted: 0,
       admissionHistoryPruned: 0,
       deletedUserRowsPurged: 0,
-      orphanCapacityRuntimeDeleted: 0,
+      orphanSchedulersDeleted: 0,
       expiredStickinessDeleted: 0,
       routingVerdictsDeleted: 0,
       kvEvictionsDeleted: 0,
-      engineLoadMinutesDeleted: 0,
+      runtimeLoadMinutesDeleted: 0,
       nodeMetricsMinutesDeleted: 0,
+      queuedCommandsExpired: 0,
+      queuedCommandsDeleted: 0,
     });
     expect(tx.$executeRaw).not.toHaveBeenCalled();
   });
 
-  it("runs the agent audit step in every sweep and reports its count", async () => {
+  it("runs the node audit and node command steps in every sweep and reports their counts", async () => {
     const { prisma, tx } = fakePrisma();
     prisma.$queryRaw.mockImplementation(async (strings: TemplateStringsArray) =>
       strings.join("").includes("clock_timestamp") ? [{ now: NOW }] : [],
     );
     prisma.$executeRaw.mockImplementation(async (strings: TemplateStringsArray) =>
-      strings.join("?").includes("cli_agent_action_event") ? 4 : 0,
+      strings.join("?").includes("node_audit_event") ? 4 : 0,
     );
+    sweeps.pruneOldNodeCommands.mockResolvedValue(2);
     tx.$queryRaw.mockResolvedValue([]);
     await expect(
-      runUsageRetention({ prisma: prisma as never, retentionDays: 14, batch: 100 }),
-    ).resolves.toMatchObject({ agentActionsDeleted: 8 }); // 4 expired + 4 orphaned
+      runUsageRetention({ prisma: prisma as never, retentionDays: 14, batch: 100, sweepBatch: 50 }),
+    ).resolves.toMatchObject({ nodeAuditEventsDeleted: 8, nodeCommandsDeleted: 2 }); // 4 expired + 4 orphaned
+    expect(sweeps.pruneOldNodeCommands).toHaveBeenCalledWith(prisma, {
+      before: new Date(NOW.getTime() - 30 * DAY_MS),
+      batch: 50,
+    });
   });
 
-  it("runs the deployment operator audit steps in every sweep and reports their count", async () => {
-    const { prisma, tx } = fakePrisma();
-    prisma.$queryRaw.mockImplementation(async (strings: TemplateStringsArray) =>
-      strings.join("").includes("clock_timestamp") ? [{ now: NOW }] : [],
-    );
-    prisma.$executeRaw.mockImplementation(async (strings: TemplateStringsArray) =>
-      strings.join("?").includes("deployment_operator_event") ? 3 : 0,
-    );
-    tx.$queryRaw.mockResolvedValue([]);
-    await expect(
-      runUsageRetention({ prisma: prisma as never, retentionDays: 14, batch: 100 }),
-    ).resolves.toMatchObject({ operatorEventsDeleted: 6, agentActionsDeleted: 0 });
-  });
-
-  it("deletes expired and orphaned operator audit events in SKIP LOCKED batches, fence-checked", async () => {
+  it("deletes expired and orphaned node audit events in SKIP LOCKED batches, fence-checked", async () => {
     const { prisma } = fakePrisma();
     const statements: Array<{ sql: string; values: unknown[] }> = [];
     let round = 0;
@@ -177,15 +177,17 @@ describe("usage retention", () => {
       },
     );
     await expect(
-      deleteExpiredDeploymentOperatorEvents({ prisma: prisma as never, now: NOW, batch: 2 }),
+      deleteExpiredNodeAuditEvents({ prisma: prisma as never, now: NOW, batch: 2 }),
     ).resolves.toBe(3);
-    expect(statements[0]?.sql).toContain("DELETE FROM deployment_operator_event");
+    expect(statements).toHaveLength(2);
+    expect(statements[0]?.sql).toContain("DELETE FROM node_audit_event");
     expect(statements[0]?.sql).toContain("FOR UPDATE SKIP LOCKED");
-    expect(statements[0]?.values[0]).toEqual(new Date(NOW.getTime() - 90 * 24 * 60 * 60 * 1000));
+    expect(statements[0]?.values[0]).toEqual(new Date(NOW.getTime() - 90 * DAY_MS));
+    expect(statements[0]?.values[1]).toBe(2);
     statements.length = 0;
-    await expect(
-      deleteOrphanDeploymentOperatorEvents({ prisma: prisma as never, batch: 2 }),
-    ).resolves.toBe(3);
+    await expect(deleteOrphanNodeAuditEvents({ prisma: prisma as never, batch: 2 })).resolves.toBe(
+      3,
+    );
     expect(statements[0]?.sql).toContain(
       'NOT EXISTS (SELECT 1 FROM "user" u WHERE u.id = e."userId")',
     );
@@ -193,35 +195,94 @@ describe("usage retention", () => {
     armDbShutdownFence();
     statements.length = 0;
     await expect(
-      deleteExpiredDeploymentOperatorEvents({ prisma: prisma as never, now: NOW, batch: 2 }),
+      deleteExpiredNodeAuditEvents({ prisma: prisma as never, now: NOW, batch: 2 }),
     ).resolves.toBe(0);
+    await expect(deleteOrphanNodeAuditEvents({ prisma: prisma as never, batch: 2 })).resolves.toBe(
+      0,
+    );
+    expect(statements).toEqual([]);
+  });
+
+  it("expires overdue QUEUED commands in guarded SKIP LOCKED batches, fence-checked", async () => {
+    const { prisma } = fakePrisma();
+    const statements: Sql[] = [];
+    let round = 0;
+    prisma.$executeRaw.mockImplementation(
+      async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        statements.push({ sql: strings.join("?"), values });
+        round += 1;
+        return round === 1 ? 2 : 1;
+      },
+    );
     await expect(
-      deleteOrphanDeploymentOperatorEvents({ prisma: prisma as never, batch: 2 }),
+      expireOverdueQueuedNodeCommands({ prisma: prisma as never, now: NOW, batch: 2 }),
+    ).resolves.toBe(3);
+    expect(statements).toHaveLength(2);
+    const sql = statements[0]?.sql.replace(/\s+/g, " ") ?? "";
+    expect(sql).toContain("UPDATE queued_node_command SET state = 'EXPIRED'");
+    expect(sql).toContain('"decidedBy" = NULL');
+    // The guard is on the outer UPDATE too: a row decided meanwhile is never rewritten.
+    expect(sql).toMatch(
+      /WHERE state = 'QUEUED'::"QueuedCommandState" AND "expiresAt" <= \? AND id = ANY\(ARRAY\(/,
+    );
+    expect(sql).toContain('ORDER BY "expiresAt" LIMIT ? FOR UPDATE SKIP LOCKED');
+    expect(statements[0]?.values).toContain(NOW);
+    expect(statements[0]?.values).toContain(2);
+    armDbShutdownFence();
+    statements.length = 0;
+    await expect(
+      expireOverdueQueuedNodeCommands({ prisma: prisma as never, now: NOW, batch: 2 }),
     ).resolves.toBe(0);
     expect(statements).toEqual([]);
   });
 
-  it("deletes orphaned audit events (no such user) in SKIP LOCKED batches, fence-checked", async () => {
+  it("deletes only decided queued commands past their 7 days, in SKIP LOCKED batches", async () => {
     const { prisma } = fakePrisma();
-    const statements: string[] = [];
+    const statements: Sql[] = [];
     let round = 0;
+    prisma.$executeRaw.mockImplementation(
+      async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        statements.push({ sql: strings.join("?"), values });
+        round += 1;
+        return round < 3 ? 5 : 0;
+      },
+    );
+    await expect(
+      deleteDecidedQueuedNodeCommands({ prisma: prisma as never, now: NOW, batch: 5 }),
+    ).resolves.toBe(10);
+    expect(statements).toHaveLength(3);
+    const sql = statements[0]?.sql.replace(/\s+/g, " ") ?? "";
+    expect(sql).toMatch(
+      /DELETE FROM queued_node_command WHERE state <> 'QUEUED'::"QueuedCommandState" AND "decidedAt" < \? AND id = ANY\(ARRAY\(/,
+    );
+    expect(sql).toContain("FOR UPDATE SKIP LOCKED");
+    expect(statements[0]?.values[0]).toEqual(new Date(NOW.getTime() - 7 * DAY_MS));
+    expect(statements[0]?.values).toContain(5);
+  });
+
+  it("runs the queued command sweeps in every retention run and reports their counts", async () => {
+    const { prisma, tx } = fakePrisma();
+    const order: string[] = [];
+    prisma.$queryRaw.mockImplementation(async (strings: TemplateStringsArray) =>
+      strings.join("").includes("clock_timestamp") ? [{ now: NOW }] : [],
+    );
     prisma.$executeRaw.mockImplementation(async (strings: TemplateStringsArray) => {
-      statements.push(strings.join("?"));
-      round += 1;
-      return round === 1 ? 2 : 1;
+      const sql = strings.join("?");
+      if (sql.includes("UPDATE queued_node_command")) {
+        order.push("expire");
+        return 3;
+      }
+      if (sql.includes("DELETE FROM queued_node_command")) {
+        order.push("delete");
+        return 4;
+      }
+      return 0;
     });
-    await expect(deleteOrphanCliAgentActions({ prisma: prisma as never, batch: 2 })).resolves.toBe(
-      3,
-    );
-    expect(statements).toHaveLength(2);
-    expect(statements[0]).toContain('NOT EXISTS (SELECT 1 FROM "user" u WHERE u.id = e."userId")');
-    expect(statements[0]).toContain("FOR UPDATE OF e SKIP LOCKED");
-    armDbShutdownFence();
-    statements.length = 0;
-    await expect(deleteOrphanCliAgentActions({ prisma: prisma as never, batch: 2 })).resolves.toBe(
-      0,
-    );
-    expect(statements).toEqual([]);
+    tx.$queryRaw.mockResolvedValue([]);
+    await expect(
+      runUsageRetention({ prisma: prisma as never, retentionDays: 14, batch: 100 }),
+    ).resolves.toMatchObject({ queuedCommandsExpired: 3, queuedCommandsDeleted: 4 });
+    expect(order).toEqual(["expire", "delete"]);
   });
 
   it("runs the hot-path history sweeps after the rollup retention and reports their counts", async () => {
@@ -243,8 +304,8 @@ describe("usage retention", () => {
       order.push("deleted-users");
       return { users: 2, rows: 7, completed: 1 };
     });
-    sweeps.pruneOrphanCapacityRuntime.mockImplementation(async () => {
-      order.push("orphan-runtime");
+    sweeps.pruneOrphanCapacityScheduler.mockImplementation(async () => {
+      order.push("orphan-scheduler");
       return 3;
     });
     sweeps.pruneExpiredStickiness.mockImplementation(async () => {
@@ -261,7 +322,7 @@ describe("usage retention", () => {
     ).resolves.toMatchObject({
       admissionHistoryPruned: 4,
       deletedUserRowsPurged: 7,
-      orphanCapacityRuntimeDeleted: 3,
+      orphanSchedulersDeleted: 3,
       expiredStickinessDeleted: 5,
     });
     // Terminal admission history uses the relay-request retention window.
@@ -270,12 +331,12 @@ describe("usage retention", () => {
       batch: 50,
     });
     expect(sweeps.purgeDeletedUsersHistory).toHaveBeenCalledWith(prisma, { now: NOW, batch: 50 });
-    expect(sweeps.pruneOrphanCapacityRuntime).toHaveBeenCalledWith(prisma, { batch: 50 });
+    expect(sweeps.pruneOrphanCapacityScheduler).toHaveBeenCalledWith(prisma, { batch: 50 });
     expect(sweeps.pruneExpiredStickiness).toHaveBeenCalledWith(prisma, { now: NOW, batch: 50 });
     expect(order.slice(-4)).toEqual([
       "admission-history",
       "deleted-users",
-      "orphan-runtime",
+      "orphan-scheduler",
       "expired-stickiness",
     ]);
   });
@@ -317,14 +378,10 @@ describe("usage retention", () => {
     expect(pickStrings.join("?")).not.toContain("PENDING");
     expect(cutoff).toEqual(new Date(NOW.getTime() - 14 * DAY_MS));
     expect(batch).toBe(2);
-    // Capacity lock order: the referencing admission_request rows are taken
-    // first, then the relay rows; both SKIP LOCKED, so the delete never waits
-    // on a row an in-flight admission holds.
-    const [pick, lockAdmissions, countAdmissions, remove] = statements;
+    // No admission row references a request any more (0.4.0): the delete takes only the
+    // relay rows, SKIP LOCKED, so it never waits on a row a finalizer holds.
+    const [pick, remove] = statements;
     expect(pick).toContain("FROM relay_request");
-    expect(lockAdmissions).toContain("FROM admission_request");
-    expect(lockAdmissions).toContain("FOR NO KEY UPDATE SKIP LOCKED");
-    expect(countAdmissions).toContain("count(*)");
     expect(remove).toContain("DELETE FROM relay_request");
     expect(remove).toContain("FOR UPDATE SKIP LOCKED");
     expect(remove).toContain("status IN ('SUCCEEDED', 'FAILED', 'CANCELED')");
@@ -372,11 +429,11 @@ describe("usage retention", () => {
 
   it.each([
     ["before-send", "local", "owner", "pool", ""],
-    ["send-intent", "own-key", "requester", "", "own-target"],
-    ["superseded-intent", "local", "owner", "pool", "local-target"],
+    ["send-intent", "own_key", "requester", "", "own-instance"],
+    ["superseded-intent", "local", "owner", "pool", "local-instance"],
   ])(
     "reaps %s using the durable route identity without attributing unsent own-key work",
-    async (_stage, route, owner, pool, target) => {
+    async (_stage, route, owner, pool, instance) => {
       const { prisma, tx } = fakePrisma();
       prisma.$queryRaw.mockResolvedValue([{ id: "request" }]);
       tx.$queryRaw.mockResolvedValue([{ now: NOW }]);
@@ -385,16 +442,22 @@ describe("usage retention", () => {
           id: "request",
           userId: "requester",
           status: "FAILED",
-          source: "API_TOKEN",
-          fallbackRoute: route,
+          source: "API_KEY",
+          route,
+          external: false,
+          rejection: null,
           startedAt: new Date(NOW.getTime() - 3_600_000),
           completedAt: NOW,
           firstClientByteAt: null,
           durationMs: null,
-          requestedModelPoolId: "pool",
-          selectedPoolMemberId: route === "local" && target ? "local-member" : null,
-          requestedExecutionTargetId: null,
-          selectedExecutionTargetId: target || null,
+          queueWaitMs: null,
+          poolId: "pool",
+          runtimeModelId: null,
+          selectedTargetId: null,
+          selectedInstanceId: instance || null,
+          selectedVersionId: null,
+          selectedNodeId: null,
+          selectedProviderModelId: null,
           attemptCount: 0,
           promptTokens: null,
           completionTokens: null,
@@ -413,13 +476,9 @@ describe("usage retention", () => {
         }),
       );
       const [sql] = tx.$executeRaw.mock.calls[0] as [Sql];
-      expect(sql.values.slice(1, 6)).toEqual([
-        owner,
-        "requester",
-        pool,
-        route === "local" && target ? "local-member" : "",
-        target,
-      ]);
+      // owner, requester, then the dimensions: pool … instance (index 7).
+      expect(sql.values.slice(1, 4)).toEqual([owner, "requester", pool]);
+      expect(sql.values[7]).toBe(instance);
     },
   );
 
@@ -467,7 +526,7 @@ describe("usage retention", () => {
       Date,
       number,
     ];
-    expect(strings.join("?")).toContain("DELETE FROM pool_member_routing_verdict");
+    expect(strings.join("?")).toContain("DELETE FROM routing_verdict");
     expect(strings.join("?")).toContain("FOR UPDATE SKIP LOCKED");
     expect(cutoff).toEqual(new Date(NOW.getTime() - ROUTING_VERDICT_RETENTION_MS));
     expect(batch).toBe(2);
@@ -493,24 +552,24 @@ describe("usage retention", () => {
     expect(prisma.$executeRaw).not.toHaveBeenCalled();
   });
 
-  it("deletes engine-load minutes older than 8 days in SKIP LOCKED batches", async () => {
+  it("deletes runtime-load minutes older than 8 days in SKIP LOCKED batches", async () => {
     const { prisma } = fakePrisma();
     prisma.$executeRaw.mockResolvedValueOnce(2).mockResolvedValueOnce(1);
     expect(
-      await deleteExpiredEngineLoadMinutes({ prisma: prisma as never, now: NOW, batch: 2 }),
+      await deleteExpiredRuntimeLoadMinutes({ prisma: prisma as never, now: NOW, batch: 2 }),
     ).toBe(3);
     const [strings, cutoff, batch] = prisma.$executeRaw.mock.calls[0] as [
       TemplateStringsArray,
       Date,
       number,
     ];
-    expect(strings.join("?")).toContain("DELETE FROM engine_load_rollup_minute");
+    expect(strings.join("?")).toContain("DELETE FROM runtime_load_minute");
     expect(strings.join("?")).toContain("FOR UPDATE SKIP LOCKED");
     expect(cutoff).toEqual(new Date(NOW.getTime() - 8 * DAY_MS));
     expect(batch).toBe(2);
     armDbShutdownFence();
     prisma.$executeRaw.mockClear();
-    expect(await deleteExpiredEngineLoadMinutes({ prisma: prisma as never, now: NOW })).toBe(0);
+    expect(await deleteExpiredRuntimeLoadMinutes({ prisma: prisma as never, now: NOW })).toBe(0);
     expect(prisma.$executeRaw).not.toHaveBeenCalled();
   });
 
@@ -557,8 +616,9 @@ describe("usage retention", () => {
     const tenOClock = statements.find(
       (sql) => (sql.values[0] as Date).toISOString() === "2026-08-01T10:00:00.000Z",
     )!;
-    // requests summed across the two 10:xx minute rows.
-    expect(tenOClock.values[7]).toBe(4);
+    // requests (after bucket, owner, requester, 7 dimensions, source) summed across the
+    // two 10:xx minute rows.
+    expect(tenOClock.values[11]).toBe(4);
   });
 
   it("re-keys minute rows to their hour without losing counters", () => {
@@ -584,12 +644,12 @@ describe("usage retention", () => {
     expect(legacy?.audioInputMs).toBe(0n);
   });
 
-  it("selects audioInputMs when it moves minute rows", async () => {
+  it("returns every column when it moves minute rows", async () => {
     const { prisma, tx } = fakePrisma();
     tx.$queryRaw.mockResolvedValueOnce([]);
     await compactMinuteRollups({ prisma: prisma as never, now: NOW });
     const [strings] = tx.$queryRaw.mock.calls[0] as [TemplateStringsArray];
-    expect(strings.join("?")).toContain('m."audioInputMs"');
+    expect(strings.join("?")).toContain("m.*");
   });
 
   it("reaps abandoned PENDING requests through the guarded transition and counts them once", async () => {
@@ -604,15 +664,22 @@ describe("usage retention", () => {
         id: "relay-1",
         userId: "user-1",
         status: "FAILED",
-        source: "API_TOKEN",
+        source: "API_KEY",
         startedAt: new Date(NOW.getTime() - 3 * 60 * 60 * 1000),
         completedAt: NOW,
         durationMs: null,
         firstClientByteAt: null,
-        requestedModelPoolId: "pool-1",
-        selectedPoolMemberId: null,
-        requestedExecutionTargetId: null,
-        selectedExecutionTargetId: null,
+        route: "local",
+        external: false,
+        rejection: null,
+        queueWaitMs: null,
+        poolId: "pool-1",
+        runtimeModelId: null,
+        selectedTargetId: null,
+        selectedInstanceId: null,
+        selectedVersionId: null,
+        selectedNodeId: null,
+        selectedProviderModelId: null,
         attemptCount: 0,
         promptTokens: null,
         completionTokens: null,
@@ -625,8 +692,8 @@ describe("usage retention", () => {
       1,
     );
     const [strings, cutoff] = prisma.$queryRaw.mock.calls[0] as [TemplateStringsArray, Date];
-    expect(strings.join("?")).toContain("relay_execution_attempt");
-    expect(strings.join("?")).toContain("provider_attempt");
+    expect(strings.join("?")).toContain("FROM attempt a");
+    expect(strings.join("?")).toContain("'ACTIVE'::\"AttemptState\"");
     expect(cutoff).toEqual(new Date(NOW.getTime() - ABANDONED_PENDING_AFTER_MS));
     expect(tx.relayRequest.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -639,45 +706,16 @@ describe("usage retention", () => {
     expect(tx.$executeRaw).toHaveBeenCalledTimes(1);
   });
 
-  it("deletes agent audit events past 90 days in SKIP LOCKED batches and stops at the fence", async () => {
-    const { prisma } = fakePrisma();
-    const statements: Array<{ sql: string; values: unknown[] }> = [];
-    let round = 0;
-    prisma.$executeRaw.mockImplementation(
-      async (strings: TemplateStringsArray, ...values: unknown[]) => {
-        statements.push({ sql: strings.join("?"), values });
-        round += 1;
-        return round === 1 ? 2 : 1;
-      },
-    );
-    await expect(
-      deleteExpiredCliAgentActions({ prisma: prisma as never, now: NOW, batch: 2 }),
-    ).resolves.toBe(3);
-    expect(statements).toHaveLength(2);
-    const [first] = statements;
-    expect(first?.sql).toContain("DELETE FROM cli_agent_action_event");
-    expect(first?.sql).toContain("FOR UPDATE SKIP LOCKED");
-    expect(first?.values[0]).toEqual(new Date(NOW.getTime() - 90 * 24 * 60 * 60 * 1000));
-    expect(first?.values[1]).toBe(2);
-
-    armDbShutdownFence();
-    statements.length = 0;
-    await expect(
-      deleteExpiredCliAgentActions({ prisma: prisma as never, now: NOW, batch: 2 }),
-    ).resolves.toBe(0);
-    expect(statements).toEqual([]);
-  });
-
   it("schedules one guarded run and stops cleanly", async () => {
     const run = vi.fn().mockResolvedValue({
       abandonedReaped: 0,
       relayRequestsDeleted: 0,
       minuteRowsCompacted: 0,
       hourRowsDeleted: 0,
-      agentActionsDeleted: 0,
+      nodeAuditEventsDeleted: 0,
       routingVerdictsDeleted: 0,
       kvEvictionsDeleted: 0,
-      engineLoadMinutesDeleted: 0,
+      runtimeLoadMinutesDeleted: 0,
       nodeMetricsMinutesDeleted: 0,
     });
     const stop = startUsageRetention({ retentionDays: 14, intervalMs: 60_000, run });

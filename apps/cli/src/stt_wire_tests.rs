@@ -1,14 +1,14 @@
 use super::*;
 use crate::protocol::{
-    FrameFault, ServerControlMessage, control_frame_fault, encode_control, parse_binary_frame,
-    parse_server_control,
+    FrameFault, NodeFrame, ServerBinaryMetadata, control_frame_fault, encode_control,
+    parse_binary_frame, parse_server_control,
 };
 
 const SESSION: &str = "AAECAwQFBgcICQoLDA0ODw";
 
 fn fixture(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/relay-current")
+        .join("tests/fixtures/relay-3.0/stt")
         .join(name)
 }
 
@@ -22,31 +22,31 @@ fn session() -> String {
 }
 
 /// Every CLI to server `stt.*` frame shape the server must accept.
-fn accepted_client_frames() -> Vec<(&'static str, ClientControlMessage)> {
+fn accepted_client_frames() -> Vec<(&'static str, NodeFrame)> {
     vec![
         (
             "opened",
-            ClientControlMessage::SttOpened {
+            NodeFrame::SttOpened {
                 session_id: session(),
             },
         ),
         (
             "ack",
-            ClientControlMessage::SttAudioAck {
+            NodeFrame::SttAudioAck {
                 session_id: session(),
                 bytes: 32 * 1024,
             },
         ),
         (
             "ackWholeWindow",
-            ClientControlMessage::SttAudioAck {
+            NodeFrame::SttAudioAck {
                 session_id: session(),
                 bytes: STT_AUDIO_WINDOW_MAX_BYTES,
             },
         ),
         (
             "delta",
-            ClientControlMessage::SttEvent {
+            NodeFrame::SttEvent {
                 session_id: session(),
                 event: SttEvent::Delta {
                     item_seq: 0,
@@ -56,7 +56,7 @@ fn accepted_client_frames() -> Vec<(&'static str, ClientControlMessage)> {
         ),
         (
             "deltaAtLimit",
-            ClientControlMessage::SttEvent {
+            NodeFrame::SttEvent {
                 session_id: session(),
                 event: SttEvent::Delta {
                     item_seq: 1,
@@ -66,7 +66,7 @@ fn accepted_client_frames() -> Vec<(&'static str, ClientControlMessage)> {
         ),
         (
             "completed",
-            ClientControlMessage::SttEvent {
+            NodeFrame::SttEvent {
                 session_id: session(),
                 event: SttEvent::Completed {
                     item_seq: 2,
@@ -80,7 +80,7 @@ fn accepted_client_frames() -> Vec<(&'static str, ClientControlMessage)> {
         ),
         (
             "completedEmptyWithoutUsage",
-            ClientControlMessage::SttEvent {
+            NodeFrame::SttEvent {
                 session_id: session(),
                 event: SttEvent::Completed {
                     item_seq: u32::MAX,
@@ -91,7 +91,7 @@ fn accepted_client_frames() -> Vec<(&'static str, ClientControlMessage)> {
         ),
         (
             "completedAtLimit",
-            ClientControlMessage::SttEvent {
+            NodeFrame::SttEvent {
                 session_id: session(),
                 event: SttEvent::Completed {
                     item_seq: 3,
@@ -105,7 +105,7 @@ fn accepted_client_frames() -> Vec<(&'static str, ClientControlMessage)> {
         ),
         (
             "failed",
-            ClientControlMessage::SttEvent {
+            NodeFrame::SttEvent {
                 session_id: session(),
                 event: SttEvent::Failed {
                     item_seq: 4,
@@ -116,14 +116,14 @@ fn accepted_client_frames() -> Vec<(&'static str, ClientControlMessage)> {
         ),
         (
             "autoCommitted",
-            ClientControlMessage::SttEvent {
+            NodeFrame::SttEvent {
                 session_id: session(),
                 event: SttEvent::AutoCommitted { item_seq: 5 },
             },
         ),
         (
             "error",
-            ClientControlMessage::SttError {
+            NodeFrame::SttError {
                 session_id: session(),
                 failure: RelayFailure::UnsupportedCapability,
                 message: Some("live transcription is not available on this node".into()),
@@ -131,7 +131,7 @@ fn accepted_client_frames() -> Vec<(&'static str, ClientControlMessage)> {
         ),
         (
             "errorWithoutMessage",
-            ClientControlMessage::SttError {
+            NodeFrame::SttError {
                 session_id: session(),
                 failure: RelayFailure::Transport,
                 message: None,
@@ -139,7 +139,7 @@ fn accepted_client_frames() -> Vec<(&'static str, ClientControlMessage)> {
         ),
         (
             "closed",
-            ClientControlMessage::SttClosed {
+            NodeFrame::SttClosed {
                 session_id: session(),
             },
         ),
@@ -147,28 +147,28 @@ fn accepted_client_frames() -> Vec<(&'static str, ClientControlMessage)> {
 }
 
 /// Frames the CLI refuses to encode; the server must refuse them too.
-fn rejected_client_frames() -> Vec<(&'static str, ClientControlMessage)> {
-    let event = |event| ClientControlMessage::SttEvent {
+fn rejected_client_frames() -> Vec<(&'static str, NodeFrame)> {
+    let event = |event| NodeFrame::SttEvent {
         session_id: session(),
         event,
     };
     vec![
         (
             "nonCanonicalSession",
-            ClientControlMessage::SttOpened {
+            NodeFrame::SttOpened {
                 session_id: "AAECAwQFBgcICQoLDA0ODx".into(),
             },
         ),
         (
             "ackZero",
-            ClientControlMessage::SttAudioAck {
+            NodeFrame::SttAudioAck {
                 session_id: session(),
                 bytes: 0,
             },
         ),
         (
             "ackOverWindow",
-            ClientControlMessage::SttAudioAck {
+            NodeFrame::SttAudioAck {
                 session_id: session(),
                 bytes: STT_AUDIO_WINDOW_MAX_BYTES + 1,
             },
@@ -217,7 +217,7 @@ fn rejected_client_frames() -> Vec<(&'static str, ClientControlMessage)> {
         ),
         (
             "errorMessageOverLimit",
-            ClientControlMessage::SttError {
+            NodeFrame::SttError {
                 session_id: session(),
                 failure: RelayFailure::Unknown,
                 message: Some("é".repeat(STT_MESSAGE_MAX_BYTES / 2 + 1)),
@@ -296,11 +296,12 @@ fn current_stt_frames_match_shared_golden() {
     assert!(!frames.is_empty());
     for (name, wire) in frames {
         let wire = wire.as_str().expect("wire text");
-        let ServerControlMessage::Stt(message) =
-            parse_server_control(wire).unwrap_or_else(|error| panic!("{name}: {error:#}"))
-        else {
-            panic!("{name} is not an stt frame");
-        };
+        let message =
+            parse_server_control(wire).unwrap_or_else(|error| panic!("{name}: {error:#}"));
+        assert!(
+            SttServerMessage::from_frame(&message).is_some(),
+            "{name} is not an stt frame"
+        );
         // Decoding and re-encoding is byte for byte, so nothing is lost.
         assert_eq!(
             serde_json::to_string(&message).expect("encode"),
@@ -327,10 +328,7 @@ fn current_stt_frames_match_shared_golden() {
         let (metadata, body) = parse_binary_frame(&audio_frame(case))
             .unwrap_or_else(|error| panic!("{name}: {error}"));
         assert!(
-            matches!(
-                metadata,
-                crate::protocol::RelayBinaryFrameMetadata::SttAudio { .. }
-            ),
+            matches!(metadata, ServerBinaryMetadata::SttAudio { .. }),
             "{name}"
         );
         assert_eq!(body.len() as u64, case["bodyBytes"], "{name}");

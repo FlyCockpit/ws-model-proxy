@@ -16,9 +16,10 @@ use tempfile::NamedTempFile;
 #[cfg(unix)]
 use nix::fcntl::{Flock, FlockArg};
 
+use crate::protocol::frames::TrustValue;
 use crate::slug::validate_slug;
 
-pub const CONFIG_VERSION: u8 = 1;
+pub const CONFIG_VERSION: u8 = 3;
 
 /// Largest Anthropic thinking budget that remains exactly representable after
 /// the TypeScript encoder reserves 1,024 visible-output tokens.
@@ -161,6 +162,38 @@ pub fn file_roots_usable(roots: &[PathBuf]) -> bool {
     validate_file_roots(roots, None).is_ok()
 }
 
+/// Where the node's file roots come from (the hello `features.files.source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileRootsSource {
+    /// No `fileRoots`: the user's home directory. File ops still need Full
+    /// control, and wsmp's own files stay protected inside it.
+    Default,
+    /// `wsmp config set-file-roots`.
+    Configured,
+    /// `wsmp config set-file-tools off`: no roots at all.
+    Disabled,
+}
+
+/// The roots file ops are confined to, and where they come from. A Full
+/// node's commands can already do anything as this user, so the home
+/// directory adds no authority; the deny-list keeps wsmp's own state out.
+pub fn effective_file_roots(
+    config: &Config,
+    home: Option<&Path>,
+) -> (Vec<PathBuf>, FileRootsSource) {
+    if config.disable_file_tools {
+        return (Vec::new(), FileRootsSource::Disabled);
+    }
+    if !config.file_roots.is_empty() {
+        return (config.file_roots.clone(), FileRootsSource::Configured);
+    }
+    let roots = home
+        .and_then(|home| validate_file_roots(&[home.to_path_buf()], None).ok())
+        .unwrap_or_default();
+    (roots, FileRootsSource::Default)
+}
+
 /// A short-lived advisory lock shared by every local config mutation.  The
 /// daemon still owns the future control-plane mutation API; this is the
 /// transitional guard that prevents a standalone command from overwriting a
@@ -211,47 +244,6 @@ impl ConfigLock {
     }
 }
 
-/// What MCP agents may run on this CLI. Read once when the relay starts.
-///
-/// For MCP commands, `supervised` only allows commands a person confirms in a
-/// browser terminal (Enter on a confirm screen); `unsupervised` also allows
-/// headless exec. Deployment jobs (`allow_deployments`) are not MCP commands:
-/// a job the server reports as person-approved runs in every mode, and an
-/// agent job in `supervised` relies on the server's approval flag, not a local
-/// confirm screen.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum McpCommandMode {
-    #[default]
-    Off,
-    Supervised,
-    Unsupervised,
-}
-
-impl McpCommandMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Supervised => "supervised",
-            Self::Unsupervised => "unsupervised",
-        }
-    }
-
-    pub fn is_off(&self) -> bool {
-        matches!(self, Self::Off)
-    }
-
-    /// Headless `exec.start` is allowed.
-    pub fn allows_exec(self) -> bool {
-        matches!(self, Self::Unsupervised)
-    }
-
-    /// Supervised terminals (`term.spawn`) are allowed.
-    pub fn allows_supervised(self) -> bool {
-        !matches!(self, Self::Off)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", from = "ConfigWire")]
 pub struct Config {
@@ -265,8 +257,16 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_origin: Option<String>,
     pub cli_slug: Option<String>,
-    pub cli_token_env: Option<String>,
-    pub endpoints: Vec<EndpointConfig>,
+    /// The node's trust (`full` or `relay`), the authority for what the
+    /// server may do here. Lowering sticks: only `wsmp trust full` on a TTY
+    /// raises it, and a hot reload of this file never does. Unset means
+    /// Relay only (fail closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<TrustValue>,
+    /// Extra hosts (`ip[:port]`, IP literals only) an always-on runtime the
+    /// server defines may use besides loopback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_hosts: Vec<String>,
     /// Extra HTTP(S) origins whose signed `/media/{id}` URLs the relay may fetch
     /// and inline when an endpoint enables `expandMedia`. The connected server's
     /// own origin is always trusted; these are additive.
@@ -275,9 +275,6 @@ pub struct Config {
     /// Browser terminal master switch. Read once when the relay starts.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_human_terminal: bool,
-    /// MCP command policy. Read once when the relay starts.
-    #[serde(default, skip_serializing_if = "McpCommandMode::is_off")]
-    pub mcp_command_mode: McpCommandMode,
     /// Require a locally approved browser identity before opening a terminal.
     #[serde(default, skip_serializing_if = "is_false")]
     pub require_terminal_approval: bool,
@@ -291,56 +288,14 @@ pub struct Config {
     /// once when the relay starts; off by default.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_file_tools_as_root: bool,
-    /// Local read grant. Restart applies; off by default.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub mcp_file_read: bool,
-    /// Explicit directory allowlist for every file operation.
+    /// Explicit directory allowlist for every file operation. Unset: the
+    /// user's home directory ([`effective_file_roots`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_roots: Vec<PathBuf>,
-    /// Accept remotely defined metric sources (`metrics.sources.set`). Only
-    /// settable locally; read once when the relay starts. Each remote source
-    /// still needs `wsmp metrics approve` of its exact command.
+    /// Turn the node file tools off (no roots at all). Read once when the
+    /// relay starts.
     #[serde(default, skip_serializing_if = "is_false")]
-    pub allow_remote_metric_sources: bool,
-    /// Accept remotely defined engine adapters (`engine.adapters.set`). Separate
-    /// from metric-source opt-in; read once when the relay starts. Each remote
-    /// adapter still needs `wsmp endpoints adapter approve` of its canonical spec.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub allow_remote_engine_adapters: bool,
-    /// Local deployment execution opt-in; every job rechecks the file.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub allow_deployments: bool,
-    /// Local opt-in for interactive recipe steps: an operator terminal in
-    /// which a person runs the step's command (e.g. one that asks for a sudo
-    /// password) from the dashboard. Separate from browser terminals (it
-    /// never opens a shell). Needs `allow_deployments` too; read fresh for
-    /// every job, every Enter and every viewer.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub allow_deployment_operator_terminal: bool,
-    /// Remote adapter endpoint slug -> SHA-256 (hex) of the approved canonical spec.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub approved_remote_adapters: std::collections::BTreeMap<String, String>,
-    /// Custom metric sources and remote-source approvals.
-    #[serde(default, skip_serializing_if = "MetricsConfig::is_empty")]
-    pub metrics: MetricsConfig,
-}
-
-/// `metrics` in the config file.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct MetricsConfig {
-    /// Local sources, keyed by source name (`[A-Za-z0-9_.:-]{1,64}`).
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub sources: std::collections::BTreeMap<String, MetricSourceConfig>,
-    /// Remote source name -> SHA-256 (hex) of the exact approved command.
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub approved_remote_sources: std::collections::BTreeMap<String, String>,
-}
-
-impl MetricsConfig {
-    pub fn is_empty(&self) -> bool {
-        self.sources.is_empty() && self.approved_remote_sources.is_empty()
-    }
+    pub disable_file_tools: bool,
 }
 
 impl Config {
@@ -489,33 +444,10 @@ pub const DEFAULT_MAX_TERMINALS: u32 = 4;
 /// Accepted `maxTerminals` values (`wsmp config set-max-terminals`).
 pub const MAX_TERMINALS_RANGE: std::ops::RangeInclusive<u32> = 1..=32;
 
-pub const METRIC_SOURCE_DEFAULT_INTERVAL_SECS: u32 = 10;
-pub const METRIC_SOURCE_DEFAULT_TIMEOUT_SECS: u32 = 5;
-
-fn default_metric_interval() -> u32 {
-    METRIC_SOURCE_DEFAULT_INTERVAL_SECS
-}
-
-fn default_metric_timeout() -> u32 {
-    METRIC_SOURCE_DEFAULT_TIMEOUT_SECS
-}
-
-/// One local metric source: a command run every `intervalSecs`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MetricSourceConfig {
-    pub command: String,
-    #[serde(default = "default_metric_interval")]
-    pub interval_secs: u32,
-    #[serde(default = "default_metric_timeout")]
-    pub timeout_secs: u32,
-    #[serde(default)]
-    pub format: crate::protocol::MetricSourceFormat,
-}
-
-/// The on-disk shape, including the legacy `allowMcpCommands` switch that
-/// older wsmp releases wrote. `true` there loads as `unsupervised`; the key is
-/// never written back.
+/// The on-disk shape. Keys of older releases (`cliTokenEnv`,
+/// `mcpCommandMode`, `allowMcpCommands`, `mcpFileRead`, and the 0.3
+/// `endpoints` list) are ignored and never written back: trust is the one
+/// switch now, and runtimes are defined on the server.
 #[derive(Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct ConfigWire {
@@ -523,24 +455,16 @@ struct ConfigWire {
     server_url: Option<String>,
     public_origin: Option<String>,
     cli_slug: Option<String>,
-    cli_token_env: Option<String>,
-    endpoints: Vec<EndpointConfig>,
+    trust: Option<TrustValue>,
+    runtime_hosts: Vec<String>,
     media_trusted_origins: Vec<String>,
     allow_human_terminal: bool,
-    mcp_command_mode: Option<McpCommandMode>,
-    allow_mcp_commands: Option<bool>,
     require_terminal_approval: bool,
     max_terminals: Option<u32>,
     allow_file_tools_as_root: bool,
-    mcp_file_read: bool,
     #[serde(deserialize_with = "deserialize_file_roots")]
     file_roots: Vec<PathBuf>,
-    allow_remote_metric_sources: bool,
-    allow_remote_engine_adapters: bool,
-    allow_deployments: bool,
-    allow_deployment_operator_terminal: bool,
-    approved_remote_adapters: std::collections::BTreeMap<String, String>,
-    metrics: MetricsConfig,
+    disable_file_tools: bool,
 }
 
 impl Default for ConfigWire {
@@ -551,56 +475,35 @@ impl Default for ConfigWire {
             server_url: None,
             public_origin: None,
             cli_slug: None,
-            cli_token_env: None,
-            endpoints: Vec::new(),
+            trust: None,
+            runtime_hosts: Vec::new(),
             media_trusted_origins: Vec::new(),
             allow_human_terminal: false,
-            mcp_command_mode: None,
-            allow_mcp_commands: None,
             require_terminal_approval: false,
             max_terminals: None,
             allow_file_tools_as_root: false,
-            mcp_file_read: false,
             file_roots: Vec::new(),
-            allow_remote_metric_sources: false,
-            allow_remote_engine_adapters: false,
-            allow_deployments: false,
-            allow_deployment_operator_terminal: false,
-            approved_remote_adapters: std::collections::BTreeMap::new(),
-            metrics: MetricsConfig::default(),
+            disable_file_tools: false,
         }
     }
 }
 
 impl From<ConfigWire> for Config {
     fn from(wire: ConfigWire) -> Self {
-        let mcp_command_mode = wire
-            .mcp_command_mode
-            .unwrap_or(match wire.allow_mcp_commands {
-                Some(true) => McpCommandMode::Unsupervised,
-                _ => McpCommandMode::Off,
-            });
         Self {
             version: wire.version,
             server_url: wire.server_url,
             public_origin: wire.public_origin,
             cli_slug: wire.cli_slug,
-            cli_token_env: wire.cli_token_env,
-            endpoints: wire.endpoints,
+            trust: wire.trust,
+            runtime_hosts: wire.runtime_hosts,
             media_trusted_origins: wire.media_trusted_origins,
             allow_human_terminal: wire.allow_human_terminal,
-            mcp_command_mode,
             require_terminal_approval: wire.require_terminal_approval,
             max_terminals: wire.max_terminals,
             allow_file_tools_as_root: wire.allow_file_tools_as_root,
-            mcp_file_read: wire.mcp_file_read,
             file_roots: wire.file_roots,
-            allow_remote_metric_sources: wire.allow_remote_metric_sources,
-            allow_remote_engine_adapters: wire.allow_remote_engine_adapters,
-            allow_deployments: wire.allow_deployments,
-            allow_deployment_operator_terminal: wire.allow_deployment_operator_terminal,
-            approved_remote_adapters: wire.approved_remote_adapters,
-            metrics: wire.metrics,
+            disable_file_tools: wire.disable_file_tools,
         }
     }
 }
@@ -612,22 +515,15 @@ impl Default for Config {
             server_url: None,
             public_origin: None,
             cli_slug: None,
-            cli_token_env: None,
-            endpoints: Vec::new(),
+            trust: None,
+            runtime_hosts: Vec::new(),
             media_trusted_origins: Vec::new(),
             allow_human_terminal: false,
-            mcp_command_mode: McpCommandMode::Off,
             require_terminal_approval: false,
             max_terminals: None,
             allow_file_tools_as_root: false,
-            mcp_file_read: false,
             file_roots: Vec::new(),
-            allow_remote_metric_sources: false,
-            allow_remote_engine_adapters: false,
-            allow_deployments: false,
-            allow_deployment_operator_terminal: false,
-            approved_remote_adapters: std::collections::BTreeMap::new(),
-            metrics: MetricsConfig::default(),
+            disable_file_tools: false,
         }
     }
 }
@@ -653,10 +549,6 @@ pub struct EndpointConfig {
     /// `concurrencyLimit`; when set it wins over a probed K.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_tokens: Option<u64>,
-    /// Custom engine adapter. Digest-excluded; when set it replaces the
-    /// built-in load scrape for this endpoint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub engine_adapter: Option<crate::engine_adapter::EngineAdapterConfig>,
     /// Upstream engine. `auto` (the default) detects it at probe time; an
     /// explicit value overrides detection. llama.cpp and vLLM advertise
     /// `top_k` in the inventory only when declared explicitly.
@@ -681,7 +573,6 @@ impl Default for EndpointConfig {
             expand_media: false,
             concurrency_limit: None,
             kv_tokens: None,
-            engine_adapter: None,
             engine: EndpointEngine::Auto,
             default_capabilities: OpenAiCompatibleCapabilities::default(),
             headers: Vec::new(),
@@ -820,10 +711,6 @@ pub struct ProbeSnapshot {
     /// the inventory and never part of the inventory digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<crate::engine::DetectedEngine>,
-    /// Integer facts from the last successful adapter run. Kept across a
-    /// failing run so K does not flap to null.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub adapter: Option<crate::engine_adapter::AdapterCachedFacts>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1092,7 +979,9 @@ impl OpenAiCompatibleCapabilities {
     /// A speech-to-text server: transcriptions only, with the options its
     /// recipe declares. Version 2 is the first that carries a detailed
     /// transcription profile (version 1 accepts only a boolean there).
-    pub fn transcription(profile: Option<&crate::deployments::TranscriptionProfile>) -> Self {
+    pub fn transcription(
+        profile: Option<&crate::protocol::runtime_spec::TranscriptionProfile>,
+    ) -> Self {
         let profile = profile.cloned().unwrap_or_default();
         Self {
             version: 2,
@@ -1115,12 +1004,19 @@ impl OpenAiCompatibleCapabilities {
                         languages: profile.languages,
                         language_detection: profile.language_detection,
                         multiple_language_hints: profile.multiple_language_hints,
-                        max_upload_bytes: profile.max_upload_bytes,
+                        max_upload_bytes: profile.max_upload_bytes.map(u64::from),
                         accepted_mime_types: profile.accepted_mime_types,
                         realtime: profile.realtime.map(|realtime| {
                             RealtimeTranscriptionCapabilities {
                                 supported: Some(true),
-                                adapter: realtime.adapter,
+                                adapter: match realtime.adapter {
+                                    crate::protocol::runtime_spec::RealtimeAdapter::Vllm => {
+                                        RealtimeAdapter::Vllm
+                                    }
+                                    crate::protocol::runtime_spec::RealtimeAdapter::Segmented => {
+                                        RealtimeAdapter::Segmented
+                                    }
+                                },
                                 max_item_seconds: realtime.max_item_seconds,
                                 max_sessions: realtime.max_sessions,
                             }
@@ -1624,7 +1520,7 @@ pub struct EmbeddingsCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supported: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub contract: Option<crate::deployments::EmbeddingContract>,
+    pub contract: Option<crate::protocol::runtime_spec::EmbeddingContract>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1839,16 +1735,6 @@ impl Config {
         Ok(true)
     }
 
-    pub fn endpoint(&self, slug: &str) -> Option<&EndpointConfig> {
-        self.endpoints.iter().find(|endpoint| endpoint.slug == slug)
-    }
-
-    pub fn endpoint_mut(&mut self, slug: &str) -> Option<&mut EndpointConfig> {
-        self.endpoints
-            .iter_mut()
-            .find(|endpoint| endpoint.slug == slug)
-    }
-
     pub fn validate(&self) -> Result<()> {
         validate_file_root_shape(&self.file_roots)?;
         if let Some(origin) = &self.public_origin {
@@ -1859,197 +1745,12 @@ impl Config {
         if let Some(slug) = &self.cli_slug {
             validate_slug(slug).with_context(|| format!("validating CLI slug `{slug}`"))?;
         }
-        for endpoint in &self.endpoints {
-            anyhow::ensure!(
-                !endpoint.slug.starts_with("inst-"),
-                "endpoint slug prefix `inst-` is reserved for managed deployments"
-            );
-            validate_slug(&endpoint.slug)
-                .with_context(|| format!("validating endpoint slug `{}`", endpoint.slug))?;
-            if let Some(limit) = endpoint.concurrency_limit
-                && !(1..=10_000).contains(&limit)
-            {
-                anyhow::bail!(
-                    "endpoint `{}` concurrency limit must be an integer from 1 to 10000",
-                    endpoint.slug
-                );
-            }
-            if let Some(tokens) = endpoint.kv_tokens
-                && !(1..=1_000_000_000_000).contains(&tokens)
-            {
-                anyhow::bail!(
-                    "endpoint `{}` kvTokens must be an integer from 1 to 1000000000000",
-                    endpoint.slug
-                );
-            }
-            if let Some(adapter) = &endpoint.engine_adapter {
-                adapter.validate().with_context(|| {
-                    format!("validating engine adapter for endpoint `{}`", endpoint.slug)
-                })?;
-            }
-            if let Some(auth) = &endpoint.auth {
-                validate_env_name(&auth.env)?;
-            }
-            let mut endpoint_header_names = std::collections::BTreeSet::new();
-            for header in &endpoint.headers {
-                validate_env_name(&header.env)?;
-                validate_endpoint_header_name(&endpoint.slug, &endpoint.kind, &header.name)?;
-                if !endpoint_header_names.insert(header.name.to_ascii_lowercase()) {
-                    anyhow::bail!(
-                        "endpoint `{}` configures duplicate custom header `{}`",
-                        endpoint.slug,
-                        header.name
-                    );
-                }
-            }
-            let profiles = std::iter::once(&endpoint.default_capabilities)
-                .chain(
-                    endpoint
-                        .last_probe
-                        .iter()
-                        .map(|probe| &probe.suggested_capabilities),
-                )
-                .chain(endpoint.models.iter().flat_map(|model| {
-                    [
-                        model.capabilities.as_ref(),
-                        model.probe_suggestions.as_ref(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                }));
-            for profile in profiles {
-                let expected_protocol = match endpoint.kind {
-                    EndpointKind::OpenAiCompatible => "openai-compatible",
-                    EndpointKind::AnthropicCompatible => "anthropic-compatible",
-                };
-                if !(1..=4).contains(&profile.version) {
-                    anyhow::bail!(
-                        "endpoint `{}` has unsupported capability inventory version {}",
-                        endpoint.slug,
-                        profile.version
-                    );
-                }
-                if profile.version < 3 && profile.protocol != "openai-compatible" {
-                    anyhow::bail!(
-                        "endpoint `{}` capability inventory versions 1 and 2 require protocol `openai-compatible`",
-                        endpoint.slug
-                    );
-                }
-                if profile.version < 3 && endpoint.kind != EndpointKind::OpenAiCompatible {
-                    anyhow::bail!(
-                        "endpoint `{}` is anthropic-compatible and requires capability inventory version 3",
-                        endpoint.slug
-                    );
-                }
-                if profile.version >= 3 && profile.protocol != expected_protocol {
-                    anyhow::bail!(
-                        "endpoint `{}` kind `{expected_protocol}` does not match capability protocol `{}`",
-                        endpoint.slug,
-                        profile.protocol
-                    );
-                }
-                if profile.version >= 3 && profile.surfaces.is_none() {
-                    anyhow::bail!(
-                        "version {} capabilities require `surfaces`",
-                        profile.version
-                    );
-                }
-            }
-            for model in &endpoint.models {
-                if let Some(slug) = &model.slug {
-                    validate_slug(slug)
-                        .with_context(|| format!("validating model slug `{slug}`"))?;
-                }
-            }
-        }
         Ok(())
     }
 }
 
-/// Environment-backed endpoint headers are deliberately much narrower than
-/// relayed request headers. Protocol headers belong to the server and
-/// credentials belong to `EndpointAuthConfig`, so configuration cannot replace
-/// either one after the server has sanitized and validated a request.
-fn validate_endpoint_header_name(slug: &str, kind: &EndpointKind, raw_name: &str) -> Result<()> {
-    reqwest::header::HeaderName::from_bytes(raw_name.as_bytes())
-        .with_context(|| format!("validating custom header `{raw_name}` for endpoint `{slug}`"))?;
-    let name = raw_name.trim().to_ascii_lowercase();
-
-    const FORBIDDEN: &[&str] = &[
-        "authorization",
-        "proxy-authorization",
-        "proxy-authenticate",
-        "www-authenticate",
-        "cookie",
-        "cookie2",
-        "set-cookie",
-        "set-cookie2",
-        "host",
-        "connection",
-        "keep-alive",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-        "content-length",
-        "x-api-key",
-        "api-key",
-        "openai-api-key",
-        "anthropic-api-key",
-        "openai-version",
-        "openai-beta",
-        "anthropic-version",
-        "anthropic-beta",
-    ];
-    let credential_like = ["token", "secret", "credential", "password"]
-        .iter()
-        .any(|part| name.contains(part));
-    if name.is_empty()
-        || FORBIDDEN.contains(&name.as_str())
-        || name.starts_with("proxy-")
-        || name.starts_with("sec-")
-        || credential_like
-    {
-        anyhow::bail!(
-            "endpoint `{slug}` cannot configure protected custom header `{raw_name}`; use typed `auth` for credentials"
-        );
-    }
-
-    let allowed = match kind {
-        EndpointKind::OpenAiCompatible => {
-            matches!(name.as_str(), "openai-organization" | "openai-project")
-        }
-        // Anthropic version, beta, and authentication headers are owned by the
-        // validated protocol/auth path. There are currently no safe static
-        // Anthropic endpoint headers whose values should come from secrets.
-        EndpointKind::AnthropicCompatible => false,
-    };
-    if !allowed {
-        anyhow::bail!(
-            "endpoint `{slug}` custom header `{raw_name}` is not allowed for this endpoint kind"
-        );
-    }
-    Ok(())
-}
-
 fn is_false(value: &bool) -> bool {
     !*value
-}
-
-pub fn validate_env_name(name: &str) -> Result<()> {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        anyhow::bail!("environment variable name cannot be empty");
-    };
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        anyhow::bail!("environment variable name `{name}` must start with a letter or `_`");
-    }
-    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
-        anyhow::bail!(
-            "environment variable name `{name}` may only contain letters, numbers, and `_`"
-        );
-    }
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -2242,13 +1943,10 @@ mod tests {
         assert!(file_roots_usable(&good));
         assert!(!file_roots_usable(&[models, alias]));
         let default: Config = serde_json::from_str("{}").expect("default");
-        assert!(!default.mcp_file_read);
         assert!(default.file_roots.is_empty());
         let sparse = serde_json::to_value(&default).expect("serialize");
-        assert!(sparse.get("mcpFileRead").is_none());
         assert!(sparse.get("fileRoots").is_none());
         let enabled = Config {
-            mcp_file_read: true,
             file_roots: good,
             ..Config::default()
         };
@@ -2259,13 +1957,11 @@ mod tests {
         .expect("field order");
         assert_eq!(reordered, enabled);
         let value = serde_json::to_value(&enabled).expect("serialize");
-        assert_eq!(value["mcpFileRead"], true);
         assert_eq!(
             serde_json::from_value::<Config>(value).expect("roundtrip"),
             enabled
         );
         for text in [
-            r#"{"mcpFileRead":"true"}"#,
             r#"{"fileRoots":"/tmp"}"#,
             r#"{"fileRoots":[{"path":"/tmp"}]}"#,
             r#"{"fileRoots":[["/tmp"]]}"#,
@@ -2274,7 +1970,7 @@ mod tests {
             r#"{"fileRoots":["/"]}"#,
             r#"{"fileRoots":["/tmp/../tmp"]}"#,
             r#"{"fileRoots":["/tmp","/tmp/"]}"#,
-            r#"{"mcpFileRead":true,"mcpFileRead":false}"#,
+            r#"{"fileRoots":["/tmp"],"fileRoots":["/tmp"]}"#,
         ] {
             assert!(serde_json::from_str::<Config>(text).is_err(), "{text}");
         }
@@ -2457,42 +2153,18 @@ mod tests {
             v3_serialized["surfaces"]["openaiChatCompletions"]["supported"],
             true
         );
+    }
 
+    #[test]
+    fn a_0_3_endpoints_list_is_ignored_and_not_written_back() {
         let config: Config = serde_json::from_value(serde_json::json!({
             "version": 1,
-            "endpoints": [{
-                "slug": "local",
-                "label": "Local",
-                "kind": "openai-compatible",
-                "baseUrl": "http://127.0.0.1:11434/v1",
-                "defaultCapabilities": {
-                    "version": 4,
-                    "protocol": "openai-compatible",
-                    "surfaces": {
-                        "openaiChatCompletions": {
-                            "source": "declared",
-                            "confidence": "exact",
-                            "operations": ["create"],
-                            "streaming": true
-                        },
-                        "openaiCompletions": {
-                            "source": "declared",
-                            "confidence": "exact",
-                            "operations": ["create"],
-                            "streaming": true
-                        }
-                    }
-                }
-            }]
+            "endpoints": [{ "slug": "local", "baseUrl": "http://127.0.0.1:11434/v1" }]
         }))
-        .expect("config with legacy completions");
+        .expect("0.3 config loads");
+        config.validate().expect("valid");
         let written = serde_json::to_value(&config).expect("serialize config");
-        let capabilities = &written["endpoints"][0]["defaultCapabilities"];
-        assert!(capabilities["surfaces"].get("openaiCompletions").is_none());
-        assert_eq!(
-            capabilities["surfaces"]["openaiChatCompletions"]["operations"][0],
-            "create"
-        );
+        assert!(written.get("endpoints").is_none());
     }
 
     #[test]
@@ -2587,33 +2259,31 @@ mod tests {
     }
 
     #[test]
-    fn legacy_allow_mcp_commands_loads_as_a_mode_and_is_not_written_back() {
-        let on: Config =
-            serde_json::from_value(serde_json::json!({ "version": 1, "allowMcpCommands": true }))
-                .expect("legacy on");
-        assert_eq!(on.mcp_command_mode, McpCommandMode::Unsupervised);
-        let written = serde_json::to_value(&on).expect("serialize");
-        assert!(written.get("allowMcpCommands").is_none());
-        assert_eq!(written["mcpCommandMode"], "unsupervised");
-        let off: Config =
-            serde_json::from_value(serde_json::json!({ "version": 1, "allowMcpCommands": false }))
-                .expect("legacy off");
-        assert_eq!(off.mcp_command_mode, McpCommandMode::Off);
-        assert!(
-            serde_json::to_value(&off)
-                .expect("serialize")
-                .get("mcpCommandMode")
-                .is_none()
-        );
-        let explicit: Config = serde_json::from_value(serde_json::json!({
-            "version": 1, "allowMcpCommands": true, "mcpCommandMode": "supervised"
+    fn trust_is_read_and_legacy_switches_are_dropped() {
+        let legacy: Config = serde_json::from_value(serde_json::json!({
+            "version": 1, "allowMcpCommands": true, "mcpCommandMode": "unsupervised",
+            "cliTokenEnv": "WSMP_TOKEN", "mcpFileRead": true
         }))
-        .expect("explicit wins");
-        assert_eq!(explicit.mcp_command_mode, McpCommandMode::Supervised);
-        assert!(
-            serde_json::from_value::<Config>(serde_json::json!({ "mcpCommandMode": "sometimes" }))
-                .is_err()
+        .expect("legacy keys load");
+        assert_eq!(legacy.trust, None);
+        let written = serde_json::to_value(&legacy).expect("serialize");
+        for key in [
+            "allowMcpCommands",
+            "mcpCommandMode",
+            "cliTokenEnv",
+            "mcpFileRead",
+            "trust",
+        ] {
+            assert!(written.get(key).is_none(), "{key}");
+        }
+        let relay: Config =
+            serde_json::from_value(serde_json::json!({ "trust": "relay" })).expect("trust relay");
+        assert_eq!(relay.trust, Some(TrustValue::Relay));
+        assert_eq!(
+            serde_json::to_value(&relay).expect("serialize")["trust"],
+            "relay"
         );
+        assert!(serde_json::from_value::<Config>(serde_json::json!({ "trust": "root" })).is_err());
     }
 
     #[test]
@@ -2621,134 +2291,12 @@ mod tests {
         let cfg = Config {
             server_url: Some("https://example.test".to_string()),
             cli_slug: Some("desk-01".to_string()),
-            endpoints: vec![EndpointConfig {
-                slug: "local".to_string(),
-                label: "Local".to_string(),
-                base_url: "http://127.0.0.1:11434/v1".to_string(),
-                ..EndpointConfig::default()
-            }],
+            runtime_hosts: vec!["10.0.0.5:8000".to_string()],
             ..Config::default()
         };
         let text = serde_json::to_string_pretty(&cfg).expect("serialize");
         let parsed: Config = serde_json::from_str(&text).expect("parse");
         assert_eq!(parsed, cfg);
-    }
-
-    #[test]
-    fn validates_env_name_shape() {
-        validate_env_name("WSMP_TOKEN").expect("valid");
-        assert!(validate_env_name("1TOKEN").is_err());
-        assert!(validate_env_name("TOKEN-NAME").is_err());
-    }
-
-    #[test]
-    fn endpoint_headers_use_kind_specific_allowlists_and_protect_transport() {
-        let mut config = Config::default();
-        config.endpoints.push(EndpointConfig {
-            slug: "openai".to_string(),
-            headers: vec![HeaderEnvRef {
-                name: "Authorization".to_string(),
-                env: "OTHER_KEY".to_string(),
-            }],
-            ..EndpointConfig::default()
-        });
-        assert!(config.validate().is_err());
-        for protected in [
-            "Content-Length",
-            "Cookie",
-            "Host",
-            "Proxy-Authorization",
-            "OpenAI-Version",
-            "OpenAI-Beta",
-            "Anthropic-Version",
-            "Anthropic-Beta",
-            "X-Custom-Token",
-            " OpenAI-Project",
-        ] {
-            config.endpoints[0].headers[0].name = protected.to_string();
-            assert!(
-                config.validate().is_err(),
-                "accepted protected `{protected}`"
-            );
-        }
-        config.endpoints[0].headers[0].name = "OpenAI-Organization".to_string();
-        config
-            .validate()
-            .expect("OpenAI account-routing header is allowlisted");
-        config.endpoints[0].headers.push(HeaderEnvRef {
-            name: "openai-organization".to_string(),
-            env: "SECOND_ORG".to_string(),
-        });
-        assert!(
-            config.validate().is_err(),
-            "accepted duplicate header names"
-        );
-        config.endpoints[0].headers.pop();
-
-        config.endpoints[0].kind = EndpointKind::AnthropicCompatible;
-        config.endpoints[0].default_capabilities = serde_json::from_value(serde_json::json!({
-            "version": 3,
-            "protocol": "anthropic-compatible",
-            "surfaces": {}
-        }))
-        .expect("Anthropic capabilities");
-        for protocol_owned in ["Anthropic-Version", "Anthropic-Beta", "OpenAI-Organization"] {
-            config.endpoints[0].headers[0].name = protocol_owned.to_string();
-            assert!(
-                config.validate().is_err(),
-                "accepted non-allowlisted `{protocol_owned}`"
-            );
-        }
-    }
-
-    #[test]
-    fn endpoint_kind_matches_every_capability_profile() {
-        let anthropic: OpenAiCompatibleCapabilities = serde_json::from_value(serde_json::json!({
-            "version": 3,
-            "protocol": "anthropic-compatible",
-            "surfaces": {}
-        }))
-        .expect("Anthropic capabilities");
-        let mut endpoint = EndpointConfig {
-            slug: "anthropic".to_string(),
-            kind: EndpointKind::AnthropicCompatible,
-            default_capabilities: anthropic.clone(),
-            ..EndpointConfig::default()
-        };
-        let mut config = Config {
-            endpoints: vec![endpoint.clone()],
-            ..Config::default()
-        };
-        config.validate().expect("matching endpoint kind");
-
-        endpoint.models.push(ModelConfig {
-            upstream_model_id: "model".to_string(),
-            probe_suggestions: Some(OpenAiCompatibleCapabilities::default()),
-            ..ModelConfig::default()
-        });
-        config.endpoints[0] = endpoint;
-        assert!(config.validate().is_err());
-
-        config.endpoints[0].models.clear();
-        config.endpoints[0].last_probe = Some(ProbeSnapshot {
-            status: ProbeStatus::Online,
-            models: Vec::new(),
-            suggested_capabilities: OpenAiCompatibleCapabilities::default(),
-            engine: None,
-            adapter: None,
-        });
-        assert!(config.validate().is_err());
-
-        config.endpoints[0].last_probe = None;
-        config.endpoints[0].kind = EndpointKind::OpenAiCompatible;
-        config.endpoints[0].default_capabilities = OpenAiCompatibleCapabilities {
-            protocol: "anthropic-compatible".to_string(),
-            ..OpenAiCompatibleCapabilities::default()
-        };
-        assert!(
-            config.validate().is_err(),
-            "accepted a programmatically constructed legacy protocol mismatch"
-        );
     }
 
     #[test]

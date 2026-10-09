@@ -25,7 +25,7 @@ const NOW = new Date("2026-09-30T12:00:30.000Z");
 function sample(overrides: Partial<NodeMetricsRollupSample> = {}): NodeMetricsRollupSample {
   return {
     ownerUserId: "owner",
-    cliDeviceId: "cli-1",
+    nodeId: "cli-1",
     receivedAt: NOW,
     cpuPercent: 20,
     memoryAvailableMiB: 80_000,
@@ -70,9 +70,50 @@ describe("node-metrics rollup merge", () => {
     expect(merged.sumCpuPercent).toBe(20);
   });
 
+  it("keeps the minimum free accelerator memory", () => {
+    const merged = mergeNodeMetricsIncrements(
+      mergeNodeMetricsIncrements(
+        mergeNodeMetricsIncrements(undefined, sample({ acceleratorFreeMiB: 9_000 })),
+        sample({ acceleratorFreeMiB: null }),
+      ),
+      sample({ acceleratorFreeMiB: 4_000 }),
+    );
+    expect(merged.minAcceleratorFreeMiB).toBe(4_000);
+  });
+
+  it("aggregates custom metric values per name, every label set a sample, up to 256 names", () => {
+    const first = mergeNodeMetricsIncrements(
+      undefined,
+      sample({
+        custom: [
+          { name: "gpu_power", value: 100 },
+          { name: "gpu_power", value: 300 },
+          { name: "bad name", value: 1 },
+          { name: "queue", value: Number.NaN },
+          { name: "huge", value: 1e300 },
+        ],
+      }),
+    );
+    expect(first.custom).toEqual({ gpu_power: { min: 100, sum: 400, max: 300, samples: 2 } });
+    const second = mergeNodeMetricsIncrements(
+      first,
+      sample({ custom: [{ name: "gpu_power", value: 50 }] }),
+    );
+    expect(second.custom.gpu_power).toEqual({ min: 50, sum: 450, max: 300, samples: 3 });
+    const many = mergeNodeMetricsIncrements(
+      undefined,
+      sample({
+        custom: Array.from({ length: 300 }, (_, index) => ({ name: `m${index}`, value: 1 })),
+      }),
+    );
+    expect(Object.keys(many.custom)).toHaveLength(256);
+    // The first merge's object is not mutated by later samples.
+    expect(first.custom.gpu_power?.samples).toBe(2);
+  });
+
   it("sorts upserts by a stable key", () => {
-    const left = mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "a" }));
-    const right = mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "b" }));
+    const left = mergeNodeMetricsIncrements(undefined, sample({ nodeId: "a" }));
+    const right = mergeNodeMetricsIncrements(undefined, sample({ nodeId: "b" }));
     expect(incrementKeyString(left) < incrementKeyString(right)).toBe(true);
   });
 });
@@ -122,7 +163,7 @@ describe("node-metrics rollup writer", () => {
     await Promise.resolve();
     expect(release).toBeTypeOf("function");
     for (let index = 0; index < NODE_METRICS_ROLLUP_MAX_PENDING + 5; index += 1) {
-      writer.observe(sample({ cliDeviceId: `cli-${index}`, receivedAt: NOW }));
+      writer.observe(sample({ nodeId: `cli-${index}`, receivedAt: NOW }));
     }
     release?.();
     await flushing;
@@ -133,8 +174,8 @@ describe("node-metrics rollup writer", () => {
     const calls: unknown[] = [];
     const written = await writeNodeMetricsIncrements(
       [
-        mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "a" })),
-        mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "b" })),
+        mergeNodeMetricsIncrements(undefined, sample({ nodeId: "a" })),
+        mergeNodeMetricsIncrements(undefined, sample({ nodeId: "b" })),
       ],
       {
         $executeRaw: async (sql) => {
@@ -152,8 +193,8 @@ describe("node-metrics rollup writer", () => {
     await expect(
       writeNodeMetricsIncrements(
         [
-          mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "a" })),
-          mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "b" })),
+          mergeNodeMetricsIncrements(undefined, sample({ nodeId: "a" })),
+          mergeNodeMetricsIncrements(undefined, sample({ nodeId: "b" })),
         ],
         {
           $executeRaw: async () => {
@@ -184,7 +225,7 @@ describe("node-metrics rollup writer", () => {
     await writer.flushNow();
     expect(log).toHaveBeenCalledWith({ written: 0, failed: 1 });
     fail = false;
-    writer.observe(sample({ cliDeviceId: "restored" }));
+    writer.observe(sample({ nodeId: "restored" }));
     const flushing = writer.flushNow();
     await Promise.resolve();
     const stopping = writer.stop();
@@ -194,7 +235,7 @@ describe("node-metrics rollup writer", () => {
     });
     await Promise.resolve();
     expect(settled).toBe(false);
-    writer.observe(sample({ cliDeviceId: "late" }));
+    writer.observe(sample({ nodeId: "late" }));
     finish?.();
     await stopping;
     await flushing;

@@ -29,6 +29,12 @@ Only the latest release is supported.
   API and WebSocket surfaces.
 - Tiered rate limiting for signup and auth routes.
 - Production boot guards for weak or missing `BETTER_AUTH_SECRET`.
+- Sharing a pool or runtime definition by e-mail shares directly only with an
+  account whose mailbox the verify-email flow proved; any other address gets an
+  invite that needs its link. Known, deliberate behavior: because the answer
+  differs, a signed-in person who shares can learn whether an address belongs
+  to an account with a proved e-mail. An unproved account and an unknown
+  address get the same answer.
 
 See `AGENTS.md` for the guardrails an AI coding agent must respect when
 working in this repo.

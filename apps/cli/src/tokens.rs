@@ -7,7 +7,10 @@
 
 use tiktoken_rs::cl100k_base_singleton;
 
-use crate::protocol::{RelayMetricTokenizer, RelayMetrics};
+use crate::protocol::frames::RelayMetrics;
+
+/// The one tokenizer relay metrics name.
+pub const RELAY_METRIC_TOKENIZER: &str = "cl100k_base";
 
 /// Memory retained for an otherwise unbounded upstream completion. Large
 /// responses simply omit the fallback estimate instead of risking relay OOM.
@@ -23,8 +26,8 @@ pub fn count_completion_tokens(text: &str) -> u32 {
 /// Build standardized TPS metrics without altering upstream usage fields.
 pub fn standardized_completion_metrics(completion_text: Option<&str>) -> Option<RelayMetrics> {
     completion_text.map(|text| RelayMetrics {
-        completion_tokens: count_completion_tokens(text),
-        tokenizer: RelayMetricTokenizer::Cl100kBase,
+        completion_tokens: u64::from(count_completion_tokens(text)),
+        tokenizer: RELAY_METRIC_TOKENIZER.to_string(),
     })
 }
 
@@ -192,9 +195,9 @@ mod tests {
         let metrics = standardized_completion_metrics(Some("longer text")).expect("metrics");
         assert_eq!(
             metrics.completion_tokens,
-            count_completion_tokens("longer text")
+            u64::from(count_completion_tokens("longer text"))
         );
-        assert_eq!(metrics.tokenizer, RelayMetricTokenizer::Cl100kBase);
+        assert_eq!(metrics.tokenizer, RELAY_METRIC_TOKENIZER);
     }
 
     #[test]

@@ -20,7 +20,7 @@ import type {
  *
  * - Created PENDING when the session opens (`opened` hook), with the
  *   requester, source and token (none for Chat Test, as its HTTP rows), pool
- *   or direct model, member and execution target.
+ *   or (Chat Test) served model, instance, node and execution target.
  * - Finalized through THE terminal transition (`transitionRelayRequestTerminal`:
  *   PENDING -> terminal plus its rollup increment, exactly once) when the
  *   session ends (`ended` hook): the wall time measured in the hooks, the PCM
@@ -129,8 +129,8 @@ export class RealtimeSessionMeter {
   constructor(
     private readonly requester: {
       userId: string;
-      /** `API_TOKEN` for `/v1/realtime`; `CHAT_TEST` (no token) as HTTP Chat Test rows. */
-      source: "API_TOKEN" | "CHAT_TEST";
+      /** `API_KEY` for `/v1/realtime`; `TEST` (no key) as HTTP Chat Test rows. */
+      source: "API_KEY" | "TEST";
       tokenId: string | null;
       tokenLookupPrefix: string | null;
     },
@@ -149,16 +149,15 @@ export class RealtimeSessionMeter {
     const data: Prisma.RelayRequestUncheckedCreateInput = {
       userId: this.requester.userId,
       source: this.requester.source,
-      modelApiTokenId: this.requester.tokenId,
-      modelApiTokenLookupPrefix: this.requester.tokenLookupPrefix,
-      requestedModelPoolId: pool ? route.poolId : null,
-      requestedDiscoveredModelId: pool ? null : route.discoveredModelId,
-      requestedExecutionTargetId: pool ? null : route.executionTargetId,
-      selectedDiscoveredModelId: route.discoveredModelId,
-      selectedExecutionTargetId: route.executionTargetId,
-      selectedPoolMemberId: route.poolMemberId,
-      selectedPoolMemberTier: pool ? "PRIMARY" : null,
-      fallbackRoute: pool ? "local" : null,
+      apiKeyId: this.requester.tokenId,
+      apiKeyPrefix: this.requester.tokenLookupPrefix,
+      // The requested resource: the pool, or (Chat Test) the served model.
+      poolId: pool ? route.poolId : null,
+      runtimeModelId: pool ? null : route.runtimeModelId,
+      selectedTargetId: route.executionTargetId,
+      selectedInstanceId: route.instanceId,
+      selectedNodeId: candidate.nodeId,
+      route: "local",
       operation: REALTIME_TRANSCRIPTION_OPERATION,
       attemptCount: 1,
       startedAt: openedAt,

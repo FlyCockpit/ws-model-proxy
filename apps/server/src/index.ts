@@ -9,16 +9,12 @@ import { env } from "@ws-model-proxy/env/server";
 import { WebSocketServer } from "ws";
 import { createApp } from "./app.js";
 import { installBetterCallErrorLogShim } from "./better-call-error-log-shim.js";
-import {
-  flushDeploymentOperatorAudit,
-  stopDeploymentOperatorAuditWriter,
-} from "./deployments/operator-audit.js";
-import { DeploymentReconciler } from "./deployments/reconciler.js";
 import { startOauthCleanup } from "./mcp/oauth-cleanup.js";
 import { startMediaCleanup } from "./media/cleanup.js";
 import { startAffinityAuthorityMaintenance } from "./model-api/cache-affinity-maintenance.js";
 import { startAffinityResidencyRepair } from "./model-api/cache-affinity-residency.js";
 import { startCacheAffinityCleanup } from "./model-api/cache-affinity-runtime.js";
+import { startRequestProfileProbes } from "./model-api/compat/probe.js";
 import { closeDiagnosticsCapacityRuntime } from "./model-api/diagnostics.js";
 import { stopKvEvictionFeedback } from "./model-api/kv-eviction-feedback.js";
 import {
@@ -28,22 +24,24 @@ import {
 import { startProviderBudgetRepair } from "./model-api/provider-budget-runtime.js";
 import { flushRealtimeMetering } from "./model-api/realtime/metering.js";
 import { realtimeSessionRegistry } from "./model-api/realtime/registry.js";
+import { startRelayAttempt } from "./model-api/relay-executor.js";
 import { startRelayTelemetryRecovery } from "./model-api/relay-telemetry-recovery.js";
 import { startUsageRetention } from "./model-api/usage-retention.js";
+import { startNeedsYouMail } from "./needs-you-mail.js";
 import { warnMissingProviderCredentialKeyring } from "./provider-keyring-startup.js";
-import { flushCliAgentAudit, stopCliAgentAuditWriter } from "./relay/cli-agent-audit.js";
-import { sweepExpiredTokenCommands } from "./relay/cli-commands.js";
-import { sweepExpiredFileOps } from "./relay/cli-file-ops.js";
-import { stopEngineLoadRollup } from "./relay/engine-load-rollup.js";
-import { stopNodeMetricsRollup } from "./relay/node-metrics-rollup.js";
+import { flushNodeAudit, stopNodeAuditWriter } from "./relay/node-audit.js";
+import { sweepExpiredNodeCommands } from "./relay/node-commands.js";
+import { sweepExpiredFileOps } from "./relay/node-file-ops.js";
+import { flushNodeMetricsRollup, stopNodeMetricsRollup } from "./relay/node-metrics-rollup.js";
+import { installNodeFrameHandlers, startRuntimeLifecycle } from "./relay/node-wiring.js";
 import { RELAY_WS_MAX_PAYLOAD_BYTES } from "./relay/protocol.js";
+import { flushRuntimeLoadRollup, stopRuntimeLoadRollup } from "./relay/runtime-load-rollup.js";
 import { relaySessionManager } from "./relay/session-manager.js";
 import { terminalBrowserHub } from "./relay/terminal-websocket.js";
 import { startRelayMaintenance } from "./relay-maintenance.js";
 import { installServerShutdown } from "./server-shutdown.js";
 import { configureHttpServerTimeouts } from "./server-timeouts.js";
 import { startSessionCleanup } from "./session-cleanup.js";
-import { runStartupCapacityRepairs } from "./startup-capacity-repairs.js";
 import { createUserDeletionSweepClient, startUserDeletionSweep } from "./user-deletion-sweep.js";
 import { selectWebSocketSubprotocol } from "./websocket-subprotocols.js";
 
@@ -114,20 +112,6 @@ async function waitForDependencies() {
 
 await waitForDependencies();
 
-// Attach missing discovered capacities and fill a null hard limit on an
-// auto-created one. Finish before listen so admission does not fail those
-// requests or treat a trigger-created null as unlimited. Then repair idle
-// orphan discovery rows left by older model/device deletes.
-try {
-  await runStartupCapacityRepairs();
-} catch (error) {
-  console.error(
-    "[server] FATAL: discovered inference capacity backfill/cleanup failed.",
-    error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
-  );
-  process.exit(1);
-}
-
 // ---------------------------------------------------------------------------
 // Start listening
 // ---------------------------------------------------------------------------
@@ -163,23 +147,20 @@ configureHttpServerTimeouts(server as { keepAliveTimeout: number; headersTimeout
 // bytes). No-op when media storage is not configured. Complements the lazy
 // delete-on-GET in media/routes.ts.
 const stopMediaCleanup = startMediaCleanup();
-const deploymentReconciler = new DeploymentReconciler({
-  current: (deviceId) => relaySessionManager.deploymentSocket(deviceId),
-  send: (socket, job) => relaySessionManager.sendDeploymentJob(socket, job),
-  closeOperatorStep: (stepId, options) =>
-    relaySessionManager.closeDeploymentOperatorStep(stepId, options),
-});
-relaySessionManager.setDeploymentHandlers({
-  result: (socket, result) => deploymentReconciler.acceptResult(socket, result),
-  inventory: (socket, instances) => deploymentReconciler.acceptInventory(socket, instances),
-  ready: () => deploymentReconciler.wake(),
-});
-deploymentReconciler.start();
-const stopDeploymentReconciler = () => deploymentReconciler.stop();
+// Unhealthy-target recovery probes send through the same executor as model requests.
+relaySessionManager.setRelayAttemptStarter((input) => startRelayAttempt(input));
+// Node frame handlers: secret results, detected servers, runtime-definition sync
+// (relay/node-wiring.ts).
+installNodeFrameHandlers();
+// Runtime instances: steps, dispatch, results, restarts, health (runtimes/lifecycle.ts).
+const stopRuntimeLifecycle = startRuntimeLifecycle();
 const stopCacheAffinityCleanup = startCacheAffinityCleanup();
 const stopAffinityResidencyRepair = startAffinityResidencyRepair();
 const stopAffinityAuthorityMaintenance = startAffinityAuthorityMaintenance();
 const stopRelayTelemetryRecovery = startRelayTelemetryRecovery();
+// What each READY engine accepts in a request, from its own OpenAPI description (through the
+// head node, loopback only); see model-api/compat/probe.ts.
+const stopRequestProfileProbes = startRequestProfileProbes(relaySessionManager);
 const stopProviderBudgetRepair = startProviderBudgetRepair();
 const stopProviderAttemptExpiry = providerAttemptExpiryEnabled(
   env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
@@ -194,6 +175,9 @@ const stopOauthCleanup = startOauthCleanup();
 // Better Auth does not remove expired browser sessions eagerly. This bounded,
 // idempotent sweep uses the same shutdown-fenced lifecycle as OAuth cleanup.
 const stopSessionCleanup = startSessionCleanup();
+// Needs-you e-mail (spec §7.4): one e-mail per new interactive step, restart or Mark as stopped,
+// when SMTP is configured and the owner's operational alerts are on; see needs-you-mail.ts.
+const stopNeedsYouMail = startNeedsYouMail();
 // Accepted user deletions whose completion failed transiently or was cut
 // short by a restart: the durable marker (User.deletionRequestedAt) is
 // resumed here until the user is gone (see user-deletion-sweep.ts). The sweep
@@ -211,19 +195,16 @@ const stopUsageRetention = startUsageRetention({
 });
 
 // Relay maintenance: stale relay sessions and expired pending terminals
-// (15 s), expired token-scoped CLI commands (60 s), and browser terminal
+// (15 s), expired agent node commands and file ops (60 s), and browser terminal
 // session rechecks (60 s); see relay-maintenance.ts.
 const stopRelayMaintenance = startRelayMaintenance({
   relaySessions: relaySessionManager,
-  // Token-scoped CLI work: commands and (relay 2.8) node file ops.
-  sweepExpiredTokenCommands: () => {
-    sweepExpiredTokenCommands();
-    sweepExpiredFileOps();
-  },
+  sweepExpiredNodeCommands,
+  sweepExpiredFileOps,
   terminalHub: terminalBrowserHub,
   realtimeSessions: realtimeSessionRegistry,
-  stopCliAgentAudit: stopCliAgentAuditWriter,
-  stopDeploymentOperatorAudit: stopDeploymentOperatorAuditWriter,
+  stopNodeAudit: stopNodeAuditWriter,
+  flushRollups: [flushRuntimeLoadRollup, flushNodeMetricsRollup],
 });
 
 // ---------------------------------------------------------------------------
@@ -236,27 +217,28 @@ const stopRelayMaintenance = startRelayMaintenance({
 // process deadline that sums them live in ./shutdown-timeouts.ts.
 installServerShutdown({
   periodicJobStops: [
-    stopDeploymentReconciler,
     stopMediaCleanup,
     stopCacheAffinityCleanup,
     stopAffinityResidencyRepair,
     stopAffinityAuthorityMaintenance,
     stopRelayTelemetryRecovery,
+    stopRequestProfileProbes,
     stopProviderBudgetRepair,
     stopProviderAttemptExpiry,
     stopOauthCleanup,
     stopSessionCleanup,
+    stopNeedsYouMail,
     stopUsageRetention,
     stopKvEvictionFeedback,
-    stopEngineLoadRollup,
+    stopRuntimeLoadRollup,
     stopNodeMetricsRollup,
     stopRelayMaintenance,
+    stopRuntimeLifecycle,
   ],
   stopUserDeletionSweep,
   userDeletionSweepClient,
   relaySessions: relaySessionManager,
-  flushAgentAudit: flushCliAgentAudit,
-  flushDeploymentOperatorAudit,
+  flushAgentAudit: flushNodeAudit,
   terminalHub: terminalBrowserHub,
   realtimeSessions: realtimeSessionRegistry,
   flushRealtimeMetering,

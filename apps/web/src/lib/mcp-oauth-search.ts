@@ -85,22 +85,18 @@ export function explainableMcpScopes(
 /**
  * Narrow display-safe projection of the public-client / prelogin responses.
  *
- * The REAL wire shape (probed in the installed
- * @better-auth/oauth-provider@1.7.3 dist, authorize-9whjxVLJ.mjs):
- * getClientPublicEndpoint (:2303-2322) returns schemaToOAuth's output
- * (:2237-2256), whose display fields are snake_case — `client_id`,
- * `client_name`, `client_uri`, `logo_uri` (plus contacts/tos_uri/policy_uri).
- * A valid provider response therefore carries the canonical name/uri under
- * `client_name`/`client_uri`; the camelCase spellings are tolerated only as
- * defense in depth against client-shape drift. The `logo_uri` (icon) is
- * DELIBERATELY DROPPED: rendering it would mean fetching an untrusted remote
- * image on every consent view. Only the text fields survive, and only when
- * structurally valid (missing optional fields project to null).
+ * The wire shape (installed @better-auth/oauth-provider, getClientPublicEndpoint →
+ * schemaToOAuth) carries snake_case display fields — `client_id`, `client_name`,
+ * `client_uri`, `logo_uri` (plus contacts/tos_uri/policy_uri); the camelCase spellings are
+ * tolerated only as defense in depth against client-shape drift. Only the id and the name
+ * survive. `client_uri` is DELIBERATELY DROPPED: the client declares it about itself, so it
+ * says nothing about where the browser goes next (the consent page shows the signed
+ * `redirect_uri` host instead, see `signedRedirectHost`). The `logo_uri` is dropped too:
+ * rendering it would mean fetching an untrusted remote image on every consent view.
  */
 export interface McpPublicClientInfo {
   clientId: string;
   name: string | null;
-  uri: string | null;
 }
 
 export function toMcpPublicClientInfo(data: unknown): McpPublicClientInfo | null {
@@ -111,8 +107,43 @@ export function toMcpPublicClientInfo(data: unknown): McpPublicClientInfo | null
   return {
     clientId,
     name: nonEmptyString(record.client_name ?? record.name),
-    uri: nonEmptyString(record.client_uri ?? record.uri),
   };
+}
+
+/**
+ * Where the browser goes after the consent answer: the host of the transaction's
+ * `redirect_uri`, read exactly as the server will use it, or null.
+ *
+ * The authorize endpoint accepts only a `redirect_uri` registered for the client and signs it
+ * into the page URL. On consent, Better Auth's client plugin forwards from the RAW
+ * `window.location.search` exactly the parameters the `ba_param` list names (plus `sig` and
+ * `ba_param`) — installed @better-auth/oauth-provider `buildSignedOAuthQuery` — and the server
+ * verifies the signature over them before redirecting to that `redirect_uri` (approval and
+ * denial alike). This reads the same raw query the same way, so the host shown is the host
+ * the server redirects to whenever the server redirects at all; a URL whose signature fails
+ * redirects nowhere.
+ *
+ * Fail closed (null): no `sig`, `redirect_uri` not among the signed names, missing, repeated
+ * (which copy the server would use is not this page's guess to make), or not a URL. The page
+ * treats null as an invalid request.
+ *
+ * Web schemes show the host (with any port); another scheme shows itself too
+ * (`cursor://callback`, `com.example.app:`), so an app link never passes for a website.
+ */
+export function signedRedirectHost(rawSearch: string): string | null {
+  const params = new URLSearchParams(rawSearch);
+  if (!params.get("sig")) return null;
+  if (!params.getAll("ba_param").includes("redirect_uri")) return null;
+  const values = params.getAll("redirect_uri");
+  if (values.length !== 1 || !values[0]) return null;
+  let url: URL;
+  try {
+    url = new URL(values[0]);
+  } catch {
+    return null;
+  }
+  if (url.protocol === "https:" || url.protocol === "http:") return url.host || null;
+  return url.host ? `${url.protocol}//${url.host}` : url.protocol;
 }
 
 // ---------------------------------------------------------------------------

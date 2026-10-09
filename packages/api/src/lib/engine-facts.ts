@@ -1,26 +1,12 @@
+/**
+ * Engine facts a node observes for a running instance (relay 3.0 `engineFacts`), and the
+ * instance columns they fill. They are automatic limit sources only: the effective limit is
+ * the version's override ?? the instance's observed fact ?? the built-in default
+ * (`runtime-defaults.ts`), so a fact never overwrites a person's setting.
+ */
 import type { Prisma } from "@ws-model-proxy/db";
-import {
-  assertDirectCapacityPolicy,
-  assertEffectiveConcurrencyPolicy,
-} from "./capacity-policy-safety";
+import { type EngineWire, READER_SIGNALS, type ReaderSignal } from "./runtime-spec";
 
-/** Relay 2.7 engine kinds, as the CLI names them. */
-export const ENGINE_KIND_NAMES = [
-  "generic",
-  "llama.cpp",
-  "vllm",
-  "sglang",
-  "ollama",
-  "lm-studio",
-] as const;
-export type EngineKindName = (typeof ENGINE_KIND_NAMES)[number];
-
-/** Prisma `EngineKind` values. */
-export type EngineKind = "GENERIC" | "LLAMA_CPP" | "VLLM" | "SGLANG" | "OLLAMA" | "LM_STUDIO";
-/** Prisma `EngineFactsSource` values. */
-export type EngineFactsSource = "PROBE" | "CONFIG" | "MIXED" | "CUSTOM";
-/** Prisma `EngineFactSource` values (per-fact provenance). */
-export type EngineFactSource = "PROBE" | "CONFIG" | "CUSTOM";
 /** Prisma `EngineCountContext` values. */
 export type EngineCountContext =
   | "UNSUPPORTED"
@@ -28,7 +14,7 @@ export type EngineCountContext =
   | "TGI_CHAT_TOKENIZE"
   | "LLAMA_APPLY_TEMPLATE"
   | "LLAMA_INPUT_TOKENS"
-  | "ADAPTER_COUNT";
+  | "READER_COUNT";
 
 export const ENGINE_COUNT_CONTEXT_NAMES = [
   "unsupported",
@@ -36,56 +22,37 @@ export const ENGINE_COUNT_CONTEXT_NAMES = [
   "tgi_chat_tokenize",
   "llama_apply_template",
   "llama_input_tokens",
-  "adapter_count",
+  "reader_count",
 ] as const;
 export type EngineCountContextName = (typeof ENGINE_COUNT_CONTEXT_NAMES)[number];
 
-type WireFact<T> = { value: T; source: "probe" | "config" | "custom" };
+type WireFact<T> = { value: T; source: "probe" | "config" | "reader" };
 
-/** The relay 2.7 `engineFacts` object (validated by the relay's strict schema). */
+/** The relay 3.0 `engineFacts` object (validated by the relay's strict frame schema). */
 export type WireEngineFacts = {
-  engine?: WireFact<EngineKindName>;
+  engine?: WireFact<EngineWire>;
   slots?: WireFact<number>;
   ctxPerSlot?: WireFact<number>;
   kvTokens?: WireFact<number>;
   maxModelLen?: WireFact<number>;
   hostPromptCacheMiB?: WireFact<number>;
-  servedModelAliases?: WireFact<string[]>;
-  loadAdapter?: {
-    value: { input: "route" | "command"; signals: string[] };
+  loadReader?: {
+    value: { input: "route" | "command"; signals: ReaderSignal[] };
     source: "config";
   };
   countContext?: WireFact<EngineCountContextName>;
 };
 
-/** Prisma `EngineLoadSource` values. */
-export type EngineLoadSource = "BUILTIN" | "CUSTOM";
-
-/** The facts an inference capacity stores (Int columns cap the numbers). */
-export type StoredEngineFacts = {
-  engineKind: EngineKind | null;
+/** The `runtime_instance` fact columns. */
+export type StoredInstanceFacts = {
   engineSlots: number | null;
-  engineSlotsSource: EngineFactSource | null;
-  kvBudgetTokens: number | null;
-  kvBudgetTokensSource: EngineFactSource | null;
+  observedKvBudgetTokens: number | null;
   maxModelLen: number | null;
-  maxModelLenSource: EngineFactSource | null;
-  engineFactsSource: EngineFactsSource;
-  engineLoadSource: EngineLoadSource | null;
-  engineLoadSignals: string[];
-  engineCountContext: EngineCountContext | null;
+  countContext: EngineCountContext | null;
+  loadSignals: ReaderSignal[];
 };
 
 const INT_COLUMN_MAX = 2 ** 31 - 1;
-
-const KIND_TO_DB: Record<EngineKindName, EngineKind> = {
-  generic: "GENERIC",
-  "llama.cpp": "LLAMA_CPP",
-  vllm: "VLLM",
-  sglang: "SGLANG",
-  ollama: "OLLAMA",
-  "lm-studio": "LM_STUDIO",
-};
 
 const COUNT_CONTEXT_TO_DB: Record<EngineCountContextName, EngineCountContext> = {
   unsupported: "UNSUPPORTED",
@@ -93,18 +60,14 @@ const COUNT_CONTEXT_TO_DB: Record<EngineCountContextName, EngineCountContext> = 
   tgi_chat_tokenize: "TGI_CHAT_TOKENIZE",
   llama_apply_template: "LLAMA_APPLY_TEMPLATE",
   llama_input_tokens: "LLAMA_INPUT_TOKENS",
-  adapter_count: "ADAPTER_COUNT",
+  reader_count: "READER_COUNT",
 };
-
-export function engineKindToDb(kind: EngineKindName): EngineKind {
-  return KIND_TO_DB[kind];
-}
 
 export function engineCountContextToDb(method: EngineCountContextName): EngineCountContext {
   return COUNT_CONTEXT_TO_DB[method];
 }
 
-/** True when the stored fact is a tokenize method the CLI can run. */
+/** True when the stored fact is a tokenize method the node can run. */
 export function engineCountContextSupportsNative(
   method: EngineCountContext | null | undefined,
 ): boolean {
@@ -112,22 +75,22 @@ export function engineCountContextSupportsNative(
 }
 
 /**
- * The defaults for engines that expose no parallel count: Ollama runs one
- * request at a time unless told otherwise, LM Studio four.
+ * The defaults for engines that expose no parallel count: Ollama runs one request at a time
+ * unless told otherwise, LM Studio four.
  */
-export function engineDefaultConcurrency(kind: EngineKindName | null | undefined): number | null {
-  if (kind === "ollama") return 1;
-  if (kind === "lm-studio") return 4;
+export function engineDefaultConcurrency(engine: EngineWire | null | undefined): number | null {
+  if (engine === "ollama") return 1;
+  if (engine === "lm_studio") return 4;
   return null;
 }
 
-/** Endpoint facts with each model fact layered on top. */
+/** Runtime-level facts with each served model's facts layered on top. */
 export function mergeEngineFacts(
-  endpoint: WireEngineFacts | undefined,
+  runtime: WireEngineFacts | undefined,
   model: WireEngineFacts | undefined,
 ): WireEngineFacts | undefined {
-  if (!endpoint && !model) return undefined;
-  return { ...endpoint, ...model };
+  if (!runtime && !model) return undefined;
+  return { ...runtime, ...model };
 }
 
 function storedInt(fact: WireFact<number> | undefined): number | null {
@@ -135,211 +98,95 @@ function storedInt(fact: WireFact<number> | undefined): number | null {
   return Math.min(fact.value, INT_COLUMN_MAX);
 }
 
-function storedFactSource(source: WireFact<unknown>["source"]): EngineFactSource {
-  if (source === "config") return "CONFIG";
-  if (source === "custom") return "CUSTOM";
-  return "PROBE";
-}
+const READER_SIGNAL_SET: ReadonlySet<string> = new Set(READER_SIGNALS);
 
-function storedIntWithSource(fact: WireFact<number> | undefined): {
-  value: number | null;
-  source: EngineFactSource | null;
-} {
-  const value = storedInt(fact);
-  if (value === null || !fact) return { value: null, source: null };
-  return { value, source: storedFactSource(fact.source) };
-}
-
-/**
- * The capacity columns for one model's facts, or null when the CLI reported
- * none that a capacity stores. servedModelAliases is process identity proof
- * consumed by planEngineProcessCapacity directly from endpoint wire facts;
- * it must not be projected away before that decision.
- */
-export function storedEngineFacts(facts: WireEngineFacts | undefined): StoredEngineFacts | null {
+/** The instance columns for one instance's facts, or null when none were reported. */
+export function storedInstanceFacts(
+  facts: WireEngineFacts | undefined,
+): StoredInstanceFacts | null {
   if (!facts) return null;
-  const slots = storedIntWithSource(facts.slots);
-  const kv = storedIntWithSource(facts.kvTokens);
-  const maxModelLen = storedIntWithSource(facts.maxModelLen);
-  const stored = {
-    engineKind: facts.engine ? engineKindToDb(facts.engine.value) : null,
-    engineSlots: slots.value,
-    engineSlotsSource: slots.source,
-    kvBudgetTokens: kv.value,
-    kvBudgetTokensSource: kv.source,
-    maxModelLen: maxModelLen.value,
-    maxModelLenSource: maxModelLen.source,
-    engineCountContext: facts.countContext
-      ? engineCountContextToDb(facts.countContext.value)
-      : null,
+  const stored: StoredInstanceFacts = {
+    engineSlots: storedInt(facts.slots),
+    observedKvBudgetTokens: storedInt(facts.kvTokens),
+    maxModelLen: storedInt(facts.maxModelLen),
+    countContext: facts.countContext ? engineCountContextToDb(facts.countContext.value) : null,
+    loadSignals: (facts.loadReader?.value.signals ?? []).filter((signal) =>
+      READER_SIGNAL_SET.has(signal),
+    ),
   };
-  const sources = new Set(
-    [facts.engine, facts.slots, facts.kvTokens, facts.maxModelLen, facts.countContext]
-      .filter((fact) => fact !== undefined)
-      .map((fact) => fact.source),
-  );
-  if (sources.size === 0 && !facts.loadAdapter) return null;
-  const signals = facts.loadAdapter?.value.signals.filter((signal) => signal.length > 0) ?? [];
-  return {
-    ...stored,
-    engineFactsSource:
-      sources.size === 0
-        ? facts.loadAdapter
-          ? "CONFIG"
-          : "PROBE"
-        : sources.size > 1
-          ? "MIXED"
-          : sources.has("config")
-            ? "CONFIG"
-            : sources.has("custom")
-              ? "CUSTOM"
-              : "PROBE",
-    engineLoadSource: facts.loadAdapter ? "CUSTOM" : null,
-    engineLoadSignals: signals,
-  };
+  const empty =
+    stored.engineSlots === null &&
+    stored.observedKvBudgetTokens === null &&
+    stored.maxModelLen === null &&
+    stored.countContext === null &&
+    stored.loadSignals.length === 0;
+  return empty ? null : stored;
 }
 
-export function sameStoredEngineFacts(left: StoredEngineFacts, right: StoredEngineFacts): boolean {
-  return (
-    left.engineKind === right.engineKind &&
-    left.engineSlots === right.engineSlots &&
-    left.engineSlotsSource === right.engineSlotsSource &&
-    left.kvBudgetTokens === right.kvBudgetTokens &&
-    left.kvBudgetTokensSource === right.kvBudgetTokensSource &&
-    left.maxModelLen === right.maxModelLen &&
-    left.maxModelLenSource === right.maxModelLenSource &&
-    left.engineFactsSource === right.engineFactsSource &&
-    left.engineLoadSource === right.engineLoadSource &&
-    left.engineLoadSignals.length === right.engineLoadSignals.length &&
-    left.engineLoadSignals.every((signal, index) => signal === right.engineLoadSignals[index]) &&
-    left.engineCountContext === right.engineCountContext
-  );
-}
-
-/** One capacity's dependents, for checking a hard-limit refresh. */
-export type HardLimitRefreshDependent =
-  | { kind: "direct"; concurrencyLimit: number | null; reservedSlots: number }
-  | {
-      kind: "member";
-      mode: "INHERIT" | "LIMITED" | "UNLIMITED";
-      limit: number | null;
-      reserved: number | null;
-      poolLimit: number | null;
-      poolReserved: number;
-    };
-
-/**
- * Whether engine-reported slots may replace an AUTO hard limit: every
- * direct and pool policy on the capacity must still fit (the same checks a
- * user edit of the limit passes).
- */
-export function isHardLimitRefreshAdmissible(
-  slots: number,
-  dependents: readonly HardLimitRefreshDependent[],
+export function sameStoredInstanceFacts(
+  left: StoredInstanceFacts,
+  right: StoredInstanceFacts,
 ): boolean {
-  if (!Number.isInteger(slots) || slots < 1 || slots > 10_000) return false;
-  try {
-    for (const dependent of dependents) {
-      if (dependent.kind === "direct") {
-        assertDirectCapacityPolicy({
-          hardLimit: slots,
-          concurrencyLimit: dependent.concurrencyLimit,
-          reservedSlots: dependent.reservedSlots,
-          physicalMaxContext: null,
-          contextCeiling: null,
-          contextMargin: null,
-        });
-      } else {
-        assertEffectiveConcurrencyPolicy({
-          hardLimit: slots,
-          poolLimit: dependent.poolLimit,
-          poolReserved: dependent.poolReserved,
-          memberMode: dependent.mode,
-          memberLimit: dependent.limit,
-          memberReserved: dependent.reserved,
-        });
-      }
-    }
-    return true;
-  } catch {
-    return false;
-  }
+  return (
+    left.engineSlots === right.engineSlots &&
+    left.observedKvBudgetTokens === right.observedKvBudgetTokens &&
+    left.maxModelLen === right.maxModelLen &&
+    left.countContext === right.countContext &&
+    left.loadSignals.length === right.loadSignals.length &&
+    left.loadSignals.every((signal, index) => signal === right.loadSignals[index])
+  );
 }
 
 /**
- * Writes engine facts to a capacity and, while its hard limit is still
- * AUTO-sourced, refreshes that limit from the reported slots. A USER limit
- * (including USER null = unlimited) is never touched. The caller holds the
- * `06:capacity-policy:<target>` fence of every target on the capacity and the
- * `08:capacity:<capacity>` fence of the capacity itself
- * (`fences.capacityPolicy` / `fences.capacity`,
- * packages/db/src/capacity-lock-order.ts).
+ * Writes an instance's observed facts. The caller holds the `08:capacity:<instance>` fence
+ * (`fences.capacity`, packages/db/src/capacity-lock-order.ts): admission reads them.
  */
-export async function applyEngineFactsToCapacity(
+export async function applyFactsToInstance(
   tx: Prisma.TransactionClient,
-  input: {
-    userId: string;
-    capacityId: string;
-    facts: StoredEngineFacts;
-    dependents: readonly HardLimitRefreshDependent[];
-    now: Date;
-  },
-): Promise<{ limitRefreshed: boolean }> {
-  await tx.inferenceCapacity.updateMany({
-    where: { id: input.capacityId, userId: input.userId },
-    data: { ...input.facts, engineFactsAt: input.now },
+  input: { userId: string; instanceId: string; facts: StoredInstanceFacts; now: Date },
+): Promise<void> {
+  await tx.runtimeInstance.updateMany({
+    where: { id: input.instanceId, userId: input.userId },
+    data: { ...input.facts, factsAt: input.now },
   });
-  const slots = input.facts.engineSlots;
-  if (slots === null || !isHardLimitRefreshAdmissible(slots, input.dependents)) {
-    return { limitRefreshed: false };
-  }
-  const refreshed = await tx.inferenceCapacity.updateMany({
-    where: {
-      id: input.capacityId,
-      userId: input.userId,
-      hardConcurrencyLimitSource: "AUTO",
-      NOT: { hardConcurrencyLimit: slots },
-    },
-    data: { hardConcurrencyLimit: slots, hardConcurrencyLimitSource: "AUTO" },
-  });
-  return { limitRefreshed: refreshed.count > 0 };
 }
 
-/** Display presets per engine (S-B stores and shows them; S-C and S-D use them). */
+/** Display presets per engine. */
 export type EnginePreset = {
   preset: "llama.cpp" | "vllm-sglang" | "ollama-lm-studio" | "generic";
-  /** When a member counts as FULL. */
+  /** When an instance counts as FULL. */
   fullWhen:
     | "active_at_slots"
     | "user_cap_or_engine_load"
     | "active_at_user_parallel"
     | "active_at_user_cap";
-  /** What warm-session protection (S-C) counts. */
+  /** What warm-session protection counts. */
   protectionUnit: "slots" | "tokens";
 };
 
 export type EnginePresetOptions = {
   kvBudgetTokens?: number | null;
-  loadSource?: EngineLoadSource | null;
+  /** The runtime has a metrics reader. */
+  hasReader?: boolean;
 };
 
 export function enginePreset(
-  kind: EngineKind | null | undefined,
+  engine: EngineWire | null | undefined,
   options?: EnginePresetOptions,
 ): EnginePreset {
   const preset = ((): EnginePreset => {
-    switch (kind) {
-      case "LLAMA_CPP":
+    switch (engine) {
+      case "llama_cpp":
         return { preset: "llama.cpp", fullWhen: "active_at_slots", protectionUnit: "slots" };
-      case "VLLM":
-      case "SGLANG":
+      case "vllm":
+      case "sglang":
         return {
           preset: "vllm-sglang",
           fullWhen: "user_cap_or_engine_load",
           protectionUnit: "tokens",
         };
-      case "OLLAMA":
-      case "LM_STUDIO":
+      case "ollama":
+      case "lm_studio":
         return {
           preset: "ollama-lm-studio",
           fullWhen: "active_at_user_parallel",
@@ -350,11 +197,11 @@ export function enginePreset(
     }
   })();
   const withLoad =
-    options?.loadSource === "CUSTOM" && preset.fullWhen !== "user_cap_or_engine_load"
+    options?.hasReader === true && preset.fullWhen !== "user_cap_or_engine_load"
       ? { ...preset, fullWhen: "user_cap_or_engine_load" as const }
       : preset;
   if (
-    kind !== "LLAMA_CPP" &&
+    engine !== "llama_cpp" &&
     options?.kvBudgetTokens != null &&
     Number.isInteger(options.kvBudgetTokens) &&
     options.kvBudgetTokens > 0

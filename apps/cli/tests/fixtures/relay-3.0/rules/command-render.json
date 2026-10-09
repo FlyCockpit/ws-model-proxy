@@ -1,0 +1,488 @@
+{
+  "rules": "see apps/cli/src/runtimes/render.rs (substitute, gpu_ids, positive_decimal, fraction) and packages/api/src/lib/command-render.ts; substitution is raw (no quoting)",
+  "values": {
+    "port": "30001",
+    "node_rank": "0",
+    "nnodes": "2",
+    "head_addr": "10.0.0.5",
+    "gpu_ids": "0,1",
+    "memory_gb": "64",
+    "dist_port": "30002"
+  },
+  "substitute": [
+    {
+      "text": "vllm serve m --port {{port}}",
+      "rendered": "vllm serve m --port 30001"
+    },
+    {
+      "text": "{{port}}{{port}}",
+      "rendered": "3000130001"
+    },
+    {
+      "text": "echo {{head_addr}}:{{dist_port}} rank {{node_rank}}/{{nnodes}}",
+      "rendered": "echo 10.0.0.5:30002 rank 0/2"
+    },
+    {
+      "text": "a\n{{port}}\n",
+      "rendered": "a\n30001\n"
+    },
+    {
+      "text": "CUDA_VISIBLE_DEVICES={{gpu_ids}} run --mem {{memory_gb}}G",
+      "rendered": "CUDA_VISIBLE_DEVICES=0,1 run --mem 64G"
+    },
+    {
+      "text": "no placeholders here",
+      "rendered": "no placeholders here"
+    },
+    {
+      "text": "",
+      "rendered": ""
+    },
+    {
+      "text": "a {{ port }} b",
+      "rendered": "a {{ port }} b"
+    },
+    {
+      "text": "{{{port}}}",
+      "rendered": "{{{port}}}"
+    },
+    {
+      "text": "x {{port",
+      "rendered": "x {{port"
+    },
+    {
+      "text": "{{port}} {{",
+      "rendered": "30001 {{"
+    },
+    {
+      "text": "{{}}",
+      "rendered": "{{}}"
+    },
+    {
+      "text": "{{Port}}",
+      "rendered": "{{Port}}"
+    },
+    {
+      "text": "{{port2}}",
+      "rendered": "{{port2}}"
+    },
+    {
+      "text": "{{ {{port}}",
+      "rendered": "{{ 30001"
+    },
+    {
+      "text": "${PORT:-{{port}}}",
+      "rendered": "${PORT:-30001}"
+    },
+    {
+      "text": "ünï {{port}} ✓",
+      "rendered": "ünï 30001 ✓"
+    },
+    {
+      "text": "{{pört}} {{port}}",
+      "rendered": "{{pört}} 30001"
+    },
+    {
+      "text": "{{port}} }} {{port}}",
+      "rendered": "30001 }} 30001"
+    },
+    {
+      "text": "'{{port}}' \"{{port}}\" $({{node_rank}})",
+      "rendered": "'30001' \"30001\" $(0)"
+    },
+    {
+      "text": "{{gpu_ids}}",
+      "values": {
+        "gpu_ids": "{{port}}"
+      },
+      "rendered": "{{port}}"
+    },
+    {
+      "text": "{{gpu_ids}} {{unknown_name}}",
+      "missing": "unknown_name"
+    },
+    {
+      "text": "--host {{fabric_ip}}",
+      "missing": "fabric_ip"
+    },
+    {
+      "text": "{{vram_gb}} {{port}}",
+      "missing": "vram_gb"
+    },
+    {
+      "text": "{{a}}}",
+      "missing": "a"
+    },
+    {
+      "text": "{{port}} {{_}}",
+      "missing": "_"
+    },
+    {
+      "text": "{{port}} {{fabric_iface}} {{fabric_ip}}",
+      "missing": "fabric_iface"
+    }
+  ],
+  "gpuIds": {
+    "valid": [
+      "0",
+      "0,1",
+      "255",
+      "3,1,2",
+      "9,10,100,200",
+      "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63"
+    ],
+    "invalid": [
+      "",
+      "00",
+      "01",
+      "256",
+      "1000",
+      "1,1",
+      "1,,2",
+      ",1",
+      "1,",
+      " 1",
+      "1 ",
+      "a",
+      "-1",
+      "+1",
+      "1;2",
+      "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64"
+    ]
+  },
+  "positiveDecimal": {
+    "valid": ["1", "0.5", "24", "1.000001", "0.000001", "64.25", "100000000000000000000000"],
+    "invalid": [
+      "0",
+      "0.0",
+      "0.000000",
+      "01",
+      "1.",
+      "1.0000001",
+      ".5",
+      "-1",
+      "1e3",
+      "+1",
+      " 1",
+      "1 ",
+      "1000000000000000000000000",
+      "",
+      "0x1",
+      "1,5",
+      "Infinity",
+      "NaN"
+    ]
+  },
+  "jobs": {
+    "rules": "whole jobs: Rust render() with a store whose fabric fab1 is named qsfp (members 10.0.0.5, 10.0.0.6; self 10.0.0.6), port range 30000-30999, node facts below and no RDMA device; the server renders the same job and the node values replace its nodeFills",
+    "nodeValues": {
+      "fabric_ip": "10.0.0.6",
+      "fabric_iface": "eth0"
+    },
+    "cases": [
+      {
+        "name": "single-node start",
+        "groupSize": 1,
+        "rank": 0,
+        "nnodes": 1,
+        "phase": "start",
+        "interactive": false,
+        "commands": [
+          {
+            "start": "vllm serve m --port {{port}} --gpus {{gpu_ids}} --vram {{vram_gb}} --rank {{node_rank}}/{{nnodes}}"
+          }
+        ],
+        "placeholders": {
+          "port": 30001,
+          "gpu_ids": "0,1",
+          "vram_gb": "79.5"
+        },
+        "command": "vllm serve m --port 30001 --gpus 0,1 --vram 79.5 --rank 0/1"
+      },
+      {
+        "name": "interactive prepare",
+        "groupSize": 1,
+        "rank": 0,
+        "nnodes": 1,
+        "phase": "prepare",
+        "interactive": true,
+        "commands": [
+          {
+            "start": "serve",
+            "prepare": "sudo apt-get install -y x # {{port}}",
+            "interactive": {
+              "prepare": true
+            }
+          }
+        ],
+        "placeholders": {
+          "port": 30001,
+          "gpu_ids": "0,1",
+          "vram_gb": "79.5"
+        },
+        "command": "sudo apt-get install -y x # 30001"
+      },
+      {
+        "name": "interactive stop",
+        "groupSize": 1,
+        "rank": 0,
+        "nnodes": 1,
+        "phase": "stop",
+        "interactive": true,
+        "commands": [
+          {
+            "start": "serve",
+            "interactive": {
+              "stop": true
+            }
+          }
+        ],
+        "placeholders": {
+          "port": 30001,
+          "gpu_ids": "0,1",
+          "vram_gb": "79.5"
+        },
+        "command": "pkill -f 30001"
+      },
+      {
+        "name": "interactive flag without a terminal",
+        "groupSize": 1,
+        "rank": 0,
+        "nnodes": 1,
+        "phase": "start",
+        "interactive": false,
+        "commands": [
+          {
+            "start": "sudo serve {{port}}",
+            "interactive": {
+              "start": true
+            }
+          }
+        ],
+        "placeholders": {
+          "port": 30001,
+          "gpu_ids": "0,1",
+          "vram_gb": "79.5"
+        },
+        "refused": "operator"
+      },
+      {
+        "name": "terminal without the interactive flag",
+        "groupSize": 1,
+        "rank": 0,
+        "nnodes": 1,
+        "phase": "start",
+        "interactive": true,
+        "commands": [
+          {
+            "start": "sudo serve {{port}}"
+          }
+        ],
+        "placeholders": {
+          "port": 30001,
+          "gpu_ids": "0,1",
+          "vram_gb": "79.5"
+        },
+        "refused": "operator"
+      },
+      {
+        "name": "multi-node rank 1",
+        "groupSize": 2,
+        "rank": 1,
+        "nnodes": 2,
+        "phase": "start",
+        "interactive": false,
+        "commands": [
+          {
+            "start": "serve --host {{fabric_ip}} --if {{fabric_iface}} --head {{head_addr}}:{{dist_port}} --rank {{node_rank}}"
+          }
+        ],
+        "placeholders": {
+          "port": 30001,
+          "dist_port": 30002,
+          "head_addr": "10.0.0.5"
+        },
+        "command": "serve --host 10.0.0.6 --if eth0 --head 10.0.0.5:30002 --rank 1"
+      },
+      {
+        "name": "per-rank commands",
+        "groupSize": 2,
+        "rank": 1,
+        "nnodes": 2,
+        "phase": "start",
+        "interactive": false,
+        "commands": [
+          {
+            "start": "head {{node_rank}}"
+          },
+          {
+            "start": "worker {{node_rank}} {{head_addr}}"
+          }
+        ],
+        "placeholders": {
+          "port": 30001,
+          "dist_port": 30002,
+          "head_addr": "10.0.0.5"
+        },
+        "command": "worker 1 10.0.0.5"
+      },
+      {
+        "name": "no rdma device on the node",
+        "groupSize": 2,
+        "rank": 0,
+        "nnodes": 2,
+        "phase": "start",
+        "interactive": false,
+        "commands": [
+          {
+            "start": "serve --ib {{fabric_rdma_device}}"
+          }
+        ],
+        "placeholders": {
+          "port": 30001,
+          "dist_port": 30002,
+          "head_addr": "10.0.0.5"
+        },
+        "refused": "placeholders.fabric_rdma_device"
+      },
+      {
+        "name": "fabric value on a single node",
+        "groupSize": 1,
+        "rank": 0,
+        "nnodes": 1,
+        "phase": "start",
+        "interactive": false,
+        "commands": [
+          {
+            "start": "serve --host {{fabric_ip}}"
+          }
+        ],
+        "placeholders": {
+          "port": 30001,
+          "gpu_ids": "0,1",
+          "vram_gb": "79.5"
+        },
+        "refused": "placeholders.fabric_ip"
+      },
+      {
+        "name": "a status command that cannot render",
+        "groupSize": 1,
+        "rank": 0,
+        "nnodes": 1,
+        "phase": "start",
+        "interactive": false,
+        "commands": [
+          {
+            "start": "serve",
+            "status": "check {{memory_gb}}"
+          }
+        ],
+        "placeholders": {
+          "port": 30001,
+          "gpu_ids": "0,1",
+          "vram_gb": "79.5"
+        },
+        "refused": "placeholders.memory_gb"
+      },
+      {
+        "name": "duplicate gpu ids",
+        "groupSize": 1,
+        "rank": 0,
+        "nnodes": 1,
+        "phase": "start",
+        "interactive": false,
+        "commands": [
+          {
+            "start": "serve {{gpu_ids}}"
+          }
+        ],
+        "placeholders": {
+          "port": 30001,
+          "gpu_ids": "1,1"
+        },
+        "refused": "placeholders.gpu_ids"
+      },
+      {
+        "name": "group size mismatch",
+        "groupSize": 1,
+        "rank": 0,
+        "nnodes": 2,
+        "phase": "start",
+        "interactive": false,
+        "commands": [
+          {
+            "start": "serve"
+          }
+        ],
+        "placeholders": {
+          "port": 30001,
+          "dist_port": 30002,
+          "head_addr": "10.0.0.5"
+        },
+        "refused": "nnodes"
+      },
+      {
+        "name": "rendered past the size limit",
+        "groupSize": 1,
+        "rank": 0,
+        "nnodes": 1,
+        "phase": "start",
+        "interactive": false,
+        "commands": [
+          {
+            "start": "x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}x{{gpu_ids}}"
+          }
+        ],
+        "placeholders": {
+          "port": 30001,
+          "gpu_ids": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63"
+        },
+        "refused": "command"
+      },
+      {
+        "name": "literal braces around a fabric placeholder",
+        "groupSize": 2,
+        "rank": 0,
+        "nnodes": 2,
+        "phase": "start",
+        "interactive": false,
+        "commands": [
+          {
+            "start": "echo {{{fabric_ip}} {{fabric_ip}}"
+          }
+        ],
+        "placeholders": {
+          "port": 30001,
+          "dist_port": 30002,
+          "head_addr": "10.0.0.5"
+        },
+        "command": "echo {{{fabric_ip}} 10.0.0.6",
+        "serverAmbiguous": true
+      },
+      {
+        "name": "literal braces around another fabric placeholder",
+        "groupSize": 2,
+        "rank": 0,
+        "nnodes": 2,
+        "phase": "start",
+        "interactive": false,
+        "commands": [
+          {
+            "start": "echo {{{fabric_iface}} {{fabric_ip}}"
+          }
+        ],
+        "placeholders": {
+          "port": 30001,
+          "dist_port": 30002,
+          "head_addr": "10.0.0.5"
+        },
+        "command": "echo {{{fabric_iface}} 10.0.0.6",
+        "serverAmbiguous": true
+      }
+    ]
+  },
+  "fraction": {
+    "valid": ["1", "0.5", "1.0", "1.000000", "0.000001", "0.9"],
+    "invalid": ["0", "1.5", "2", "1.0000001", "0.0", "1.01", "01", "0.", "10", ""]
+  }
+}

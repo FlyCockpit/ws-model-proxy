@@ -1,0 +1,12 @@
+{
+  "type": "exec.status",
+  "commandId": "UnecweYLMFV6n8TpDjNYfQ",
+  "state": "succeeded",
+  "exitCode": 0,
+  "startedAt": "2026-10-06T12:00:00.000Z",
+  "endsBy": "2026-10-06T13:00:00.000Z",
+  "finishedAt": "2026-10-06T12:20:00.000Z",
+  "tail": "done\n",
+  "truncated": false,
+  "outputBytes": 2097152
+}

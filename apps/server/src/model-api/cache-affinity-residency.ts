@@ -22,8 +22,8 @@ const RESET_LEDGER_PER_OWNER_MAX = 1024;
  * connection. An owner may hold at most a quarter of the process ledger, so a
  * tenant whose devices keep resetting is refused before others are.
  */
-export function beginAffinityReset(cliDeviceId: string, slug: string, ownerUserId: string) {
-  const key = `${cliDeviceId}\u0001${slug}`;
+export function beginAffinityReset(nodeId: string, handle: string, ownerUserId: string) {
+  const key = `${nodeId}\u0001${handle}`;
   if (!pendingResets.has(key)) {
     if (pendingResets.size >= RESET_LEDGER_MAX) throw new Error("reset observation capacity");
     const ownerKeys = pendingResetKeysByOwner.get(ownerUserId) ?? 0;
@@ -52,11 +52,10 @@ export function affinityGenerationReadySql(targetId: Prisma.Sql): Prisma.Sql {
   const durable = Prisma.sql`COALESCE(wsmp_affinity_generation_ready(${targetId}), false)`;
   if (!pendingResets.size) return durable;
   return Prisma.sql`${durable} AND NOT EXISTS (
-    SELECT 1 FROM execution_target observed
-    JOIN discovered_model observed_model ON observed_model.id = observed."discoveredModelId"
-    JOIN endpoint observed_endpoint ON observed_endpoint.id = observed_model."endpointId"
-    WHERE observed."inferenceCapacityId" = (SELECT "inferenceCapacityId" FROM execution_target WHERE id = ${targetId})
-      AND observed_endpoint."cliDeviceId" || chr(1) || observed_endpoint.slug = ANY(${[...pendingResets.keys()]}::text[])
+    SELECT 1 FROM runtime_instance observed
+    JOIN node observed_node ON observed_node."userId" = observed."userId"
+    WHERE observed.id = (SELECT "instanceId" FROM execution_target WHERE id = ${targetId})
+      AND observed_node.id || chr(1) || observed.handle = ANY(${[...pendingResets.keys()]}::text[])
   )`;
 }
 
@@ -109,7 +108,7 @@ export async function reconcileAffinityForCapacities(capacityIds: readonly strin
   await client().$executeRaw`
     INSERT INTO cache_affinity_residency ("executionTargetId", "userId", "cacheGeneration", complete)
     SELECT id, "userId", wsmp_affinity_generation(id), true FROM execution_target
-    WHERE "inferenceCapacityId" = ANY(${[...capacityIds]}::text[]) ORDER BY id
+    WHERE "instanceId" = ANY(${[...capacityIds]}::text[]) ORDER BY id
     ON CONFLICT ("executionTargetId") DO UPDATE SET
       "cacheGeneration" = EXCLUDED."cacheGeneration", entries = '[]'::jsonb, complete = true,
       revision = cache_affinity_residency.revision + 1,

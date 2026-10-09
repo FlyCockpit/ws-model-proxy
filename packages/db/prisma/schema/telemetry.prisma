@@ -1,0 +1,385 @@
+// ───────────────────────────── Telemetry (one pipeline, local + cloud) ─────────────────────────────
+
+enum RequestSource {
+  API_KEY
+  /// Web chat test (pool or direct runtime model).
+  TEST
+  /// MCP model_test.
+  AGENT_TEST
+  /// Internal media → text hop of a pool sidecar (parentRequestId is set).
+  SIDECAR
+}
+
+enum RequestStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  CANCELED
+}
+
+enum AttemptKind {
+  LOCAL
+  CLOUD
+}
+
+enum AttemptPurpose {
+  EXECUTION
+  COUNT
+  PROBE
+}
+
+enum AttemptState {
+  ACTIVE
+  COMPLETED
+  FAILED
+  CANCELLED
+  EXPIRED
+}
+
+/// One client request (prompt-free). Trimmed from ~70 columns: per-attempt facts moved to
+/// Attempt; legacy discovered-model keys are gone.
+model RelayRequest {
+  id                      String        @id @default(cuid(2))
+  createdAt               DateTime      @default(now())
+  updatedAt               DateTime      @default(now()) @updatedAt
+  userId                  String
+  apiKeyId                String?
+  apiKeyPrefix            String?
+  source                  RequestSource
+  parentRequestId         String?
+  /// Requested pool (API, pool tests, sidecar hops) or runtime model (direct tests).
+  poolId                  String?
+  runtimeModelId          String?
+  /// The caller asked for `:external`.
+  external                Boolean       @default(false)
+  status                  RequestStatus @default(PENDING)
+  operation               String?
+  requestedSurface        String?
+  startedAt               DateTime      @default(now())
+  completedAt             DateTime?
+  durationMs              Int?
+  firstClientByteAt       DateTime?
+  /// Total time queued for local capacity across attempts.
+  queueWaitMs             Int?
+  /// Why the request was refused before any upstream answered (over_capacity,
+  /// wait_expired, context_too_large, no_member, cloud_cap_reached, unauthorized_external, …).
+  rejection               String?
+  /// "local" | "cloud" | "own_key": the route that served or finally failed.
+  route                   String?
+  selectedTargetId        String?
+  selectedInstanceId      String?
+  selectedVersionId       String?
+  selectedNodeId          String?
+  selectedProviderModelId String?
+  attemptCount            Int           @default(0)
+  promptTokens            Int?
+  completionTokens        Int?
+  totalTokens             Int?
+  cacheReadTokens         Int?
+  cacheWriteTokens        Int?
+  usageKnown              Boolean       @default(false)
+  /// Usage counted or estimated by the proxy because the engine reported none.
+  usageEstimated          Boolean       @default(false)
+  /// Request compatibility applied to what was sent: dropped field paths, rewrites, stripped
+  /// headers and whether a learned fix retried it ({dropped, rewrites, headers, retried}).
+  /// Names and counts only, never values.
+  compat                  Json?
+  httpStatusCode          Int?
+  upstreamStatusCode      Int?
+  errorClass              String?
+  /// A local runtime's error answer (HTTP >= 400): one redacted line, at most 300 characters.
+  /// Messages only (never echoed input); see apps/server/src/model-api/upstream-error-excerpt.ts.
+  upstreamErrorExcerpt    String?
+  contextTokenCount       Int?
+  contextCountMethod      String?
+  contextCountExact       Boolean?
+  affinityOutcome         String?
+  affinityScore           Int?
+  affinityPrefixDepth     Int?
+  affinityWaitMs          Int?
+  sidecarLatencyMs        Int?
+  audioInputMs            Int?
+  requestBytes            BigInt?
+  responseBytes           BigInt?
+  /// Owner of the requested resource (pool owner, else runtime owner, else requester); derived
+  /// at insert by trigger, immutable. Plain id.
+  resourceOwnerUserId     String?
+
+  Attempts Attempt[]
+
+  @@index([userId, createdAt, id])
+  @@index([apiKeyId, createdAt])
+  @@index([poolId, createdAt])
+  @@index([selectedTargetId, createdAt])
+  @@index([selectedVersionId, createdAt])
+  @@index([selectedNodeId, createdAt])
+  @@index([resourceOwnerUserId, createdAt])
+  @@index([status, createdAt])
+  @@index([createdAt])
+  @@map("relay_request")
+}
+
+/// One upstream attempt, local (relay to a node) or cloud (provider), with fenced live state
+/// and terminal facts. Replaces RelayExecutionAttempt + ProviderAttempt and the terminal
+/// half of RelayExecutionEvent / PublicProviderAttemptEvent. Terminal rows are immutable.
+model Attempt {
+  id                 String         @id
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @default(now()) @updatedAt
+  userId             String
+  requestId          String
+  kind               AttemptKind
+  purpose            AttemptPurpose @default(EXECUTION)
+  state              AttemptState   @default(ACTIVE)
+  ownerEpoch         String
+  fencingToken       BigInt
+  heartbeatAt        DateTime       @default(now())
+  expiresAt          DateTime
+  terminalAt         DateTime?
+  terminalReason     String?
+  poolId             String?
+  poolMemberId       String?
+  targetId           String?
+  instanceId         String?
+  versionId          String?
+  nodeId             String?
+  providerAccountId  String?
+  providerModelId    String?
+  credentialId       String?
+  /// CLOUD, owner-paid share traffic: the share whose monthly cap it counts against. Plain id.
+  shareId            String?
+  requestedSurface   String
+  nativeSurface      String?
+  adapterMode        String?
+  adapterVersion     String?
+  admissionLeaseId   String?
+  queueWaitMs        Int?
+  contextTokens      Int?
+  firstByteAt        DateTime?
+  streamCommitted    Boolean        @default(false)
+  httpStatusCode     Int?
+  upstreamStatusCode Int?
+  errorClass         String?
+  promptTokens       Int?
+  completionTokens   Int?
+  usageSource        String?
+  requestBytes       BigInt?
+  responseBytes      BigInt?
+  /// CLOUD only: the liability snapshot reserved against spend caps.
+  liabilityTokens    BigInt?
+  liabilitySpend     Decimal?       @db.Decimal(30, 9)
+  liabilityCurrency  String?
+  pricingVersion     String?
+  accountingVersion  String?
+
+  Request RelayRequest   @relation(fields: [requestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Events  AttemptEvent[]
+
+  @@unique([id, fencingToken])
+  @@index([state, expiresAt])
+  @@index([ownerEpoch, state])
+  @@index([requestId, createdAt])
+  @@index([userId])
+  @@map("attempt")
+}
+
+/// Append-only lifecycle events of an attempt (admitted, dispatched, first_byte, retry,
+/// fallback_triggered, terminal, repair, …). Prompt-free.
+model AttemptEvent {
+  id        String   @id @default(cuid(2))
+  createdAt DateTime @default(now())
+  userId    String
+  attemptId String
+  requestId String
+  sequence  Int
+  eventType String
+  reason    String?
+  metadata  Json?
+
+  Attempt Attempt @relation(fields: [attemptId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([attemptId, sequence])
+  @@index([userId, createdAt])
+  @@map("attempt_event")
+}
+
+/// Per-minute aggregates, one increment per terminal request, keyed so an agent can compare
+/// pools, runtimes, runtime versions, nodes, instances and served models (version and node stay
+/// denormalised so history survives instance deletion). Histogram bounds are the fixed,
+/// versioned constants in @ws-model-proxy/config/usage-metrics (HISTOGRAM_BOUNDS_V1). '' sentinels instead of NULL (real PK).
+model UsageRollupMinute {
+  bucketStart                 DateTime
+  ownerUserId                 String
+  requesterUserId             String
+  poolId                      String        @default("")
+  runtimeId                   String        @default("")
+  versionId                   String        @default("")
+  nodeId                      String        @default("")
+  instanceId                  String        @default("")
+  runtimeModelId              String        @default("")
+  providerModelId             String        @default("")
+  source                      RequestSource
+  updatedAt                   DateTime      @default(now())
+  requests                    Int           @default(0)
+  successes                   Int           @default(0)
+  errors                      Int           @default(0)
+  cancels                     Int           @default(0)
+  retries                     Int           @default(0)
+  cloudRequests               Int           @default(0)
+  /// Refused before any upstream answered, by reason family.
+  rejectedCapacity            Int           @default(0)
+  rejectedContext             Int           @default(0)
+  rejectedSpend               Int           @default(0)
+  rejectedOther               Int           @default(0)
+  usageKnownRequests          Int           @default(0)
+  inputTokens                 BigInt        @default(0)
+  outputTokens                BigInt        @default(0)
+  cacheReadTokens             BigInt        @default(0)
+  cacheWriteTokens            BigInt        @default(0)
+  cacheKnownRequests          Int           @default(0)
+  cacheKnownInputTokens       BigInt        @default(0)
+  continuationRequests        Int           @default(0)
+  continuationInputTokens     BigInt        @default(0)
+  continuationCacheReadTokens BigInt        @default(0)
+  durationCount               Int           @default(0)
+  durationSumMs               BigInt        @default(0)
+  latencyHistogram            Int[]         @default([])
+  ttftCount                   Int           @default(0)
+  ttftSumMs                   BigInt        @default(0)
+  ttftHistogram               Int[]         @default([])
+  queueWaitCount              Int           @default(0)
+  queueWaitSumMs              BigInt        @default(0)
+  queueWaitHistogram          Int[]         @default([])
+  /// Throughput: output tokens of requests with a known first byte, over their
+  /// first-byte→complete time.
+  generationTokens            BigInt        @default(0)
+  generationMs                BigInt        @default(0)
+  /// Prefill throughput: context tokens over (TTFT − queue wait) of requests where both are known.
+  prefillTokens               BigInt        @default(0)
+  prefillMs                   BigInt        @default(0)
+  audioInputMs                BigInt        @default(0)
+
+  @@id([bucketStart, ownerUserId, requesterUserId, poolId, runtimeId, versionId, nodeId, instanceId, runtimeModelId, providerModelId, source])
+  @@index([ownerUserId, bucketStart])
+  @@index([requesterUserId, bucketStart])
+  @@index([versionId, bucketStart])
+  @@map("usage_rollup_minute")
+}
+
+/// Hourly compaction of UsageRollupMinute (same key and counters), kept 13 months.
+model UsageRollupHour {
+  bucketStart                 DateTime
+  ownerUserId                 String
+  requesterUserId             String
+  poolId                      String        @default("")
+  runtimeId                   String        @default("")
+  versionId                   String        @default("")
+  nodeId                      String        @default("")
+  instanceId                  String        @default("")
+  runtimeModelId              String        @default("")
+  providerModelId             String        @default("")
+  source                      RequestSource
+  updatedAt                   DateTime      @default(now())
+  requests                    Int           @default(0)
+  successes                   Int           @default(0)
+  errors                      Int           @default(0)
+  cancels                     Int           @default(0)
+  retries                     Int           @default(0)
+  cloudRequests               Int           @default(0)
+  rejectedCapacity            Int           @default(0)
+  rejectedContext             Int           @default(0)
+  rejectedSpend               Int           @default(0)
+  rejectedOther               Int           @default(0)
+  usageKnownRequests          Int           @default(0)
+  inputTokens                 BigInt        @default(0)
+  outputTokens                BigInt        @default(0)
+  cacheReadTokens             BigInt        @default(0)
+  cacheWriteTokens            BigInt        @default(0)
+  cacheKnownRequests          Int           @default(0)
+  cacheKnownInputTokens       BigInt        @default(0)
+  continuationRequests        Int           @default(0)
+  continuationInputTokens     BigInt        @default(0)
+  continuationCacheReadTokens BigInt        @default(0)
+  durationCount               Int           @default(0)
+  durationSumMs               BigInt        @default(0)
+  latencyHistogram            Int[]         @default([])
+  ttftCount                   Int           @default(0)
+  ttftSumMs                   BigInt        @default(0)
+  ttftHistogram               Int[]         @default([])
+  queueWaitCount              Int           @default(0)
+  queueWaitSumMs              BigInt        @default(0)
+  queueWaitHistogram          Int[]         @default([])
+  generationTokens            BigInt        @default(0)
+  generationMs                BigInt        @default(0)
+  /// Prefill throughput: context tokens over (TTFT − queue wait) of requests where both are known.
+  prefillTokens               BigInt        @default(0)
+  prefillMs                   BigInt        @default(0)
+  audioInputMs                BigInt        @default(0)
+
+  @@id([bucketStart, ownerUserId, requesterUserId, poolId, runtimeId, versionId, nodeId, instanceId, runtimeModelId, providerModelId, source])
+  @@index([ownerUserId, bucketStart])
+  @@index([requesterUserId, bucketStart])
+  @@index([versionId, bucketStart])
+  @@map("usage_rollup_hour")
+}
+
+/// Per-minute engine load per instance (from runtime.load). Kept 8 days.
+model RuntimeLoadMinute {
+  bucketStart        DateTime
+  ownerUserId        String
+  instanceId         String
+  runtimeId          String
+  versionId          String
+  nodeId             String
+  updatedAt          DateTime @default(now())
+  samples            Int      @default(0)
+  maxRunning         Int      @default(0)
+  /// Samples that carried kvUsage (sumKvUsage / kvSamples is the unbiased average).
+  kvSamples          Int      @default(0)
+  maxWaiting         Int?
+  sumKvUsage         Float?
+  maxKvUsage         Float?
+  maxKvOccupancy     Float?
+  maxSlotsBusy       Int?
+  fullSamples        Int      @default(0)
+  prefixCacheHits    Int      @default(0)
+  prefixCacheQueries Int      @default(0)
+  lastSource         String?
+
+  @@id([bucketStart, ownerUserId, instanceId])
+  @@index([ownerUserId, bucketStart])
+  @@index([versionId, bucketStart])
+  @@index([runtimeId, bucketStart])
+  @@map("runtime_load_minute")
+}
+
+/// Per-minute node gauges (from node.metrics). Kept 7 days.
+model NodeMetricsMinute {
+  bucketStart              DateTime
+  ownerUserId              String
+  nodeId                   String
+  updatedAt                DateTime @default(now())
+  samples                  Int      @default(0)
+  cpuSamples               Int      @default(0)
+  minCpuPercent            Float?
+  sumCpuPercent            Float?
+  maxCpuPercent            Float?
+  memorySamples            Int      @default(0)
+  minMemoryAvailableMiB    Float?
+  sumMemoryAvailableMiB    Float?
+  maxMemoryAvailableMiB    Float?
+  minMemoryUsedPercent     Float?
+  sumMemoryUsedPercent     Float?
+  maxMemoryUsedPercent     Float?
+  minAcceleratorFreeMiB    Float?
+  maxGpuTemperatureC       Float?
+  maxGpuUtilizationPercent Float?
+  /// Node metric commands: { "<name>": { "min": n, "sum": n, "max": n, "samples": n } } (≤ 256
+  /// names, as one frame carries). Serves metrics_query `custom:<name>` over any retained range.
+  custom                   Json     @default("{}")
+
+  @@id([bucketStart, ownerUserId, nodeId])
+  @@index([ownerUserId, bucketStart])
+  @@index([nodeId, bucketStart])
+  @@map("node_metrics_minute")
+}

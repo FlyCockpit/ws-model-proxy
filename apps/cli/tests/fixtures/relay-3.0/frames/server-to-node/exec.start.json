@@ -1,0 +1,7 @@
+{
+  "type": "exec.start",
+  "commandId": "UnecweYLMFV6n8TpDjNYfQ",
+  "command": "nvidia-smi",
+  "cwd": "/tmp",
+  "timeoutMs": 3600000
+}

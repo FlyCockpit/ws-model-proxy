@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::config::{Config, McpCommandMode, normalize_public_origin, server_url_http_warning};
+use crate::config::{Config, normalize_public_origin, server_url_http_warning};
 use crate::output;
 use crate::slug::validate_slug;
 
@@ -21,24 +21,6 @@ pub struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 enum Sub {
-    /// Opt in to durable model deployment jobs (off by default). Each job
-    /// rechecks this flag; reconnect to refresh the server's feature report.
-    ///
-    /// Turning this on lets the server run shell commands on this machine
-    /// (`/bin/sh -c`, as the user running wsmp) for deployment jobs. The MCP
-    /// command mode does not limit jobs the server reports as approved by a
-    /// person: they run even when `set-mcp-commands` is `off`. Only jobs the
-    /// server reports as agent-authored are checked against the mode, and in
-    /// `supervised` their approval is the server's word, not a confirm screen
-    /// on this machine. Turn it on only for a server you would trust with a
-    /// shell here.
-    SetDeployments { state: Switch },
-    /// Allow operator terminals for interactive recipe steps (off by default).
-    /// Needs deployments on and terminal support; it never enables browser
-    /// shells. The owner runs each step's exact command after pressing Enter in
-    /// a terminal opened from the dashboard. Without it the server refuses to
-    /// plan interactive recipes on this node.
-    SetDeploymentOperatorTerminal { state: Switch },
     /// Print the path to the config file.
     Path,
     /// Create a default JSON config file if one does not already exist.
@@ -64,32 +46,34 @@ enum Sub {
     },
     /// Set this CLI connection's slug.
     SetSlug { slug: String },
-    /// Allow browser terminals. Takes effect the next time wsmp starts.
+    /// Allow browser terminals (also asked at `wsmp login`). Takes effect
+    /// the next time wsmp starts.
     SetHumanTerminal { state: Switch },
-    /// Choose what MCP agents may run: `off`, `supervised` (a person confirms
-    /// each command in a browser terminal), or `unsupervised` (headless exec
-    /// too). Takes effect the next time wsmp starts. This does not limit
-    /// person-approved deployment jobs; see `set-deployments`.
-    SetMcpCommands { mode: McpMode },
-    /// Opt in to headless read-only file access with the dashboard grant.
-    /// Requires explicit file roots. Restart wsmp to apply.
-    SetFileRead { state: Switch },
-    /// Confine every file tool to these directories. Suggested roots (never
-    /// applied automatically): ~/models, ~/deploy, ~/.config/llama-swap,
-    /// ~/.local/state/wsmp/logs. Restart wsmp to apply.
+    /// Extra hosts (`ip` or `ip:port`, IP literals) a server-defined
+    /// always-on runtime may use besides loopback. Applies at once.
+    SetRuntimeHosts {
+        #[arg(num_args = 0..)]
+        hosts: Vec<String>,
+    },
+    /// Confine every file tool to these directories (unset: your home
+    /// directory; wsmp's own files stay off limits). For example ~/models,
+    /// ~/deploy, ~/.config/llama-swap. Restart wsmp to apply.
     SetFileRoots {
         #[arg(required = true, num_args = 1..)]
         paths: Vec<PathBuf>,
     },
-    /// Clear the file allowlist; headless reads outside unsupervised then refuse.
+    /// Clear the file allowlist: file tools go back to your home directory.
     /// Restart wsmp to apply.
     ClearFileRoots,
+    /// Turn the node file tools on or off (on by default; off refuses every
+    /// file op with `no_roots`). Restart wsmp to apply.
+    SetFileTools { state: Switch },
     /// Require approval before a browser can open a terminal.
     SetTerminalApproval { state: Switch },
     /// Cap the browser terminals open at once on this machine (1 to 32,
     /// default 4). The server also caps terminals per CLI and per user; the
-    /// lowest limit applies. Supervised commands and operator terminals have
-    /// their own slots. Takes effect the next time wsmp starts.
+    /// lowest limit applies. Operator terminals have their own slots. Takes
+    /// effect the next time wsmp starts.
     SetMaxTerminals {
         #[arg(value_parser = clap::value_parser!(u32).range(1..=32))]
         count: u32,
@@ -97,81 +81,45 @@ enum Sub {
     /// Let the MCP node file tools run when wsmp itself runs as root (they
     /// refuse `unsupported` by default). Takes effect the next time wsmp starts.
     SetFileToolsAsRoot { state: Switch },
-    /// Accept metric sources defined remotely (dashboard or MCP). Each one
-    /// still needs `wsmp metrics approve`. Takes effect the next time wsmp
-    /// starts.
-    SetRemoteMetricSources { state: Switch },
-    /// Accept engine adapters defined remotely (dashboard or MCP). Separate
-    /// from metric-source opt-in. Each one still needs
-    /// `wsmp endpoints adapter approve`. Takes effect the next time wsmp
-    /// starts.
-    SetRemoteEngineAdapters { state: Switch },
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum Switch {
+pub(crate) enum Switch {
     On,
     Off,
 }
 
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum McpMode {
-    Off,
-    Supervised,
-    Unsupervised,
-}
-
-impl McpMode {
-    fn mode(self) -> McpCommandMode {
-        match self {
-            Self::Off => McpCommandMode::Off,
-            Self::Supervised => McpCommandMode::Supervised,
-            Self::Unsupervised => McpCommandMode::Unsupervised,
-        }
-    }
-}
-
 impl Switch {
-    fn enabled(self) -> bool {
+    pub(crate) fn enabled(self) -> bool {
         matches!(self, Self::On)
     }
 }
 
+impl Sub {
+    /// The command, when it changes the config (`None`: read-only).
+    fn mutation(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::Path | Self::Show => return None,
+            Self::Init => "wsmp config init",
+            Self::SetServer { .. } => "wsmp config set-server",
+            Self::SetSlug { .. } => "wsmp config set-slug",
+            Self::SetHumanTerminal { .. } => "wsmp config set-human-terminal",
+            Self::SetRuntimeHosts { .. } => "wsmp config set-runtime-hosts",
+            Self::SetFileRoots { .. } => "wsmp config set-file-roots",
+            Self::ClearFileRoots => "wsmp config clear-file-roots",
+            Self::SetFileTools { .. } => "wsmp config set-file-tools",
+            Self::SetTerminalApproval { .. } => "wsmp config set-terminal-approval",
+            Self::SetMaxTerminals { .. } => "wsmp config set-max-terminals",
+            Self::SetFileToolsAsRoot { .. } => "wsmp config set-file-tools-as-root",
+        })
+    }
+}
+
 pub fn run(args: &Args) -> Result<()> {
+    if let Some(command) = args.command.mutation() {
+        crate::trust::refuse_in_job(command)?;
+    }
     match &args.command {
-        Sub::SetDeployments { state } => {
-            Config::update(false, |config| {
-                config.allow_deployments = state.enabled();
-                Ok(())
-            })?;
-            if args.json {
-                output::json(
-                    &serde_json::json!({"key":"allowDeployments","value":state.enabled()}),
-                )?;
-            } else {
-                output::line(format!(
-                    "set `allowDeployments` to `{}`; reconnect to refresh server preflight",
-                    state.enabled()
-                ))?;
-            }
-        }
-        Sub::SetDeploymentOperatorTerminal { state } => {
-            Config::update(false, |config| {
-                config.allow_deployment_operator_terminal = state.enabled();
-                Ok(())
-            })?;
-            if args.json {
-                output::json(&serde_json::json!({
-                    "key": "allowDeploymentOperatorTerminal",
-                    "value": state.enabled()
-                }))?;
-            } else {
-                output::line(format!(
-                    "set `allowDeploymentOperatorTerminal` to `{}`; reconnect to refresh server preflight",
-                    state.enabled()
-                ))?;
-            }
-        }
         Sub::Path => {
             let path = crate::paths::config_file()?;
             if args.json {
@@ -196,8 +144,10 @@ pub fn run(args: &Args) -> Result<()> {
         Sub::Show => {
             let cfg = Config::load_required()?;
             let mut shown = serde_json::to_value(&cfg)?;
-            shown["mcpFileRead"] = cfg.mcp_file_read.into();
-            shown["fileRoots"] = serde_json::to_value(&cfg.file_roots)?;
+            let (roots, source) =
+                crate::config::effective_file_roots(&cfg, dirs::home_dir().as_deref());
+            shown["fileRoots"] = serde_json::to_value(&roots)?;
+            shown["fileRootsSource"] = serde_json::to_value(source)?;
             shown["maxTerminals"] = cfg.effective_max_terminals().into();
             // The origin the relay hello signs (pinned, else the server URL's).
             if cfg.server_url.is_some() || cfg.public_origin.is_some() {
@@ -286,31 +236,23 @@ pub fn run(args: &Args) -> Result<()> {
                 cfg.allow_human_terminal = state.enabled();
             })?;
         }
-        Sub::SetMcpCommands { mode } => {
-            let mode = mode.mode();
+        Sub::SetRuntimeHosts { hosts } => {
+            for host in hosts {
+                anyhow::ensure!(
+                    crate::runtime_store::validate::parse_runtime_host(host).is_some(),
+                    "`{host}` is not an IP literal with an optional port"
+                );
+            }
             Config::update(false, |cfg| {
-                cfg.mcp_command_mode = mode;
+                cfg.runtime_hosts = hosts.clone();
                 Ok(())
             })?;
+            let _ = crate::control::request_if_running(crate::control::ControlCommand::Reload);
             if args.json {
-                output::json(&SetValue {
-                    key: "mcpCommandMode",
-                    value: mode.as_str(),
-                })?;
+                output::json(&serde_json::json!({"key": "runtimeHosts", "value": hosts}))?;
             } else {
-                output::line(format!("set `mcpCommandMode` to `{}`", mode.as_str()))?;
-                if mode == McpCommandMode::Supervised {
-                    output::line(
-                        "Tip: `wsmp config set-terminal-approval on` makes browsers prove an approved identity before they can confirm a command.",
-                    )?;
-                }
-                output::line("Restart wsmp to apply.")?;
+                output::line("set `runtimeHosts`")?;
             }
-        }
-        Sub::SetFileRead { state } => {
-            set_flag(args.json, "mcpFileRead", state.enabled(), |cfg| {
-                cfg.mcp_file_read = state.enabled()
-            })?;
         }
         Sub::SetFileRoots { paths } => {
             let roots = crate::config::validate_file_roots(paths, dirs::home_dir().as_deref())?;
@@ -332,8 +274,15 @@ pub fn run(args: &Args) -> Result<()> {
             if args.json {
                 output::json(&serde_json::json!({"key":"fileRoots", "value":[]}))?;
             } else {
-                output::line("cleared `fileRoots`; restart wsmp to apply")?;
+                output::line(
+                    "cleared `fileRoots` (file tools use your home directory); restart wsmp to apply",
+                )?;
             }
+        }
+        Sub::SetFileTools { state } => {
+            set_flag(args.json, "fileTools", state.enabled(), |cfg| {
+                cfg.disable_file_tools = !state.enabled();
+            })?;
         }
         Sub::SetTerminalApproval { state } => {
             set_flag(
@@ -363,26 +312,6 @@ pub fn run(args: &Args) -> Result<()> {
             set_flag(args.json, "allowFileToolsAsRoot", state.enabled(), |cfg| {
                 cfg.allow_file_tools_as_root = state.enabled();
             })?;
-        }
-        Sub::SetRemoteMetricSources { state } => {
-            set_flag(
-                args.json,
-                "allowRemoteMetricSources",
-                state.enabled(),
-                |cfg| {
-                    cfg.allow_remote_metric_sources = state.enabled();
-                },
-            )?;
-        }
-        Sub::SetRemoteEngineAdapters { state } => {
-            set_flag(
-                args.json,
-                "allowRemoteEngineAdapters",
-                state.enabled(),
-                |cfg| {
-                    cfg.allow_remote_engine_adapters = state.enabled();
-                },
-            )?;
         }
     }
     Ok(())

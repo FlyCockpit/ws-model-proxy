@@ -1,0 +1,37 @@
+{
+  "type": "runtime.define.result",
+  "opId": "def-1",
+  "chunkIndex": 1,
+  "final": true,
+  "results": [
+    {
+      "runtimeId": "rt2p9o8i7u6y5t4r3e2w1q0a9",
+      "versionId": "vr2z9y8x7w6v5u4t3s2r1q0p9",
+      "status": "unchanged"
+    }
+  ],
+  "node": {
+    "status": "applied"
+  },
+  "held": [
+    {
+      "runtimeId": "rt1q8m3k2v9x7c4b6n0z5h1j8",
+      "versionId": "vr1a2b3c4d5e6f7g8h9i0j1k2",
+      "launchHash": "c0c00e47e26769d58cf675d378acbd85b35d00a73c45ecee9a9aaa3327d99668"
+    },
+    {
+      "runtimeId": "rt1q8m3k2v9x7c4b6n0z5h1j8",
+      "versionId": "vr1b2c3d4e5f6g7h8i9j0k1l2",
+      "launchHash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    {
+      "runtimeId": "rt2p9o8i7u6y5t4r3e2w1q0a9",
+      "versionId": "vr2z9y8x7w6v5u4t3s2r1q0p9",
+      "launchHash": "d8b3af4568eb3cc97e9e01b12efd48442772061d343ea5b7b98d3ecbc45a405f"
+    }
+  ],
+  "heldMetricCommandsHash": "bab560648992cf2cac00bd361ddee7bf69baab83e9712853ccae40558fae6eca",
+  "heldPortRange": [30000, 30999],
+  "heldFabricsHash": "1e5aa34eaf9b94a1606582c936ff2280e53acee41d898c18a842f934acdc60a6",
+  "frozen": false
+}

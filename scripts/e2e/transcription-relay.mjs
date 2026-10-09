@@ -1,55 +1,37 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { createHmac, randomBytes, randomUUID } from "node:crypto";
-import { access, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { createServer } from "node:http";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { waitForExit } from "../lib/wait-for-exit.mjs";
+import {
+  eventually,
+  pg,
+  requiredEnv,
+  rpcClient,
+  signUp,
+  startNode,
+  startServer,
+  waitForReadyRuntime,
+} from "./lib/stack.mjs";
 
-// `pg` is an existing @ws-model-proxy/db dependency. Resolve it from that
-// workspace without adding a duplicate root dependency solely for this test.
-const requireFromDb = createRequire(new URL("../../packages/db/package.json", import.meta.url));
-const pg = requireFromDb("pg");
+// Multipart transcription through the public model API, end to end: a deterministic mock ASR
+// server as an always-on runtime on a real `wsmp` node, pools of its served models, and an API
+// key. Setup uses the browser's own paths (sign-up, oRPC, enrollment code, `wsmp login`).
 
-const required = (name) => {
-  const value = process.env[name]?.trim();
-  if (!value) throw new Error(`${name} is required`);
-  return value;
-};
-
-const databaseUrl = required("WSMP_E2E_DATABASE_URL");
-const cliSlug = process.env.WSMP_E2E_CLI_SLUG?.trim() || "transcription-e2e";
-const root = resolve(import.meta.dirname, "../..");
-// Allocate every test-owned filesystem resource before bootstrapping external
-// processes or database rows so all child paths (including the server spool)
-// are isolated from the repository and the developer environment.
+const databaseUrl = requiredEnv("WSMP_E2E_DATABASE_URL");
+const nodeSlug = process.env.WSMP_E2E_NODE_SLUG?.trim() || "transcription-e2e";
+// Allocate every test-owned filesystem resource before starting processes so all child paths
+// (including the server spool) are isolated from the repository and the developer environment.
 const scratch = await mkdtemp(join(tmpdir(), "wsmp-transcription-e2e-"));
 let db;
 let server;
 let upstream;
 let relay;
-const userId = randomUUID();
+let userId;
+let failureLogs;
 try {
-  const cliBinary = resolve(process.env.WSMP_E2E_CLI_BINARY || "apps/cli/target/debug/wsmp");
-  const serverEntry = resolve(process.env.WSMP_E2E_SERVER_ENTRY || "apps/server/dist/index.mjs");
-  await access(cliBinary);
-  await access(serverEntry);
-  const betterAuthSecret = randomBytes(48).toString("base64url");
-  const credential = (prefix, purpose) => {
-    const secret = `${prefix}${randomBytes(32).toString("base64url")}`;
-    const key = createHmac("sha256", betterAuthSecret)
-      .update(`ws-model-proxy:${purpose}:v1`)
-      .digest();
-    return {
-      secret,
-      lookupPrefix: secret.slice(0, prefix.length + 12),
-      digest: createHmac("sha256", key).update(secret).digest("base64url"),
-    };
-  };
-  const cliCredential = credential("wsmp_cli_", "cli-token");
-  const modelCredential = credential("wsmp_model_", "model-api-token");
   const upstreamModel = "deterministic-asr";
   const failingUpstreamModel = "retryable-asr";
   const audioPrivacyMarker = `PRIVATE_AUDIO_${randomUUID()}`;
@@ -98,76 +80,6 @@ try {
   let resolveAbortedUpstream;
   const abortedUpstream = new Promise((resolveAbort) => {
     resolveAbortedUpstream = resolveAbort;
-  });
-
-  const portProbe = createServer();
-  await new Promise((resolveListen, reject) => {
-    portProbe.once("error", reject);
-    portProbe.listen(0, "127.0.0.1", resolveListen);
-  });
-  const portAddress = portProbe.address();
-  assert(portAddress && typeof portAddress === "object");
-  const serverPort = portAddress.port;
-  await new Promise((resolveClose) => portProbe.close(resolveClose));
-  const serverUrl = `http://127.0.0.1:${serverPort}`;
-
-  // Seed rows bypass the graph-write fence triggers (test fixtures only), like
-  // createFixturePrismaClient (packages/db/src/test-fixture-client.ts).
-  db = new pg.Pool({ connectionString: databaseUrl, max: 1, options: "-c wsmp.fences=,*," });
-  const cliTokenId = randomUUID();
-  const modelTokenId = randomUUID();
-  await db.query(
-    `INSERT INTO "user" (id, "createdAt", "updatedAt", name, email, slug, "emailVerified", role, locale)
-   VALUES ($1, now(), now(), $2, $3, $4, true, 'user', 'en-US')`,
-    [userId, "Transcription E2E", `transcription-e2e-${userId}@invalid.test`, `e2e-${userId}`],
-  );
-  await db.query(
-    `INSERT INTO cli_token (id, "createdAt", "updatedAt", "userId", name, "lookupPrefix", "secretDigest")
-   VALUES ($1, now(), now(), $2, $3, $4, $5)`,
-    [cliTokenId, userId, "Transcription E2E", cliCredential.lookupPrefix, cliCredential.digest],
-  );
-  await db.query(
-    `INSERT INTO model_api_token (id, "createdAt", "updatedAt", "userId", name, "scopeMode", "lookupPrefix", "secretDigest")
-   VALUES ($1, now(), now(), $2, $3, 'ALL_VISIBLE', $4, $5)`,
-    [
-      modelTokenId,
-      userId,
-      "Transcription E2E",
-      modelCredential.lookupPrefix,
-      modelCredential.digest,
-    ],
-  );
-
-  const childBaseEnv = Object.fromEntries(
-    ["PATH", "HOME", "TMPDIR", "SystemRoot"].flatMap((key) =>
-      process.env[key] ? [[key, process.env[key]]] : [],
-    ),
-  );
-
-  server = spawn(process.execPath, [serverEntry], {
-    cwd: root,
-    detached: process.platform !== "win32",
-    env: {
-      ...childBaseEnv,
-      WSMP_DISABLE_DOTENV: "1",
-      NODE_ENV: "test",
-      DATABASE_URL: databaseUrl,
-      SERVER_PORT: String(serverPort),
-      BETTER_AUTH_SECRET: betterAuthSecret,
-      BETTER_AUTH_URL: serverUrl,
-      SIGNUP_ENABLED: "false",
-      MODEL_API_TRANSCRIPTION_SPOOL_DIR: spoolRoot,
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let serverLog = "";
-  server.stdout.setEncoding("utf8");
-  server.stdout.on("data", (chunk) => {
-    serverLog += chunk;
-  });
-  server.stderr.setEncoding("utf8");
-  server.stderr.on("data", (chunk) => {
-    serverLog += chunk;
   });
 
   upstream = createServer(async (request, response) => {
@@ -230,7 +142,6 @@ try {
       response.writeHead(500).end(JSON.stringify({ error: String(error) }));
     }
   });
-
   await new Promise((resolveListen, reject) => {
     upstream.once("error", reject);
     upstream.listen(0, "127.0.0.1", resolveListen);
@@ -238,82 +149,98 @@ try {
   const address = upstream.address();
   assert(address && typeof address === "object");
 
-  const configPath = join(scratch, "config.json");
-  const stateDir = join(scratch, "state");
-  await writeFile(
-    configPath,
-    JSON.stringify({
-      version: 1,
-      serverUrl,
-      cliSlug,
-      cliTokenEnv: "WSMP_E2E_CLI_TOKEN",
-      endpoints: [
-        {
-          slug: "mock-asr",
-          label: "Deterministic mock ASR",
-          kind: "openai-compatible",
-          baseUrl: `http://127.0.0.1:${address.port}/v1`,
-          enabled: true,
-          defaultCapabilities: {
-            version: 2,
-            protocol: "openai-compatible",
-            audio: {
-              transcriptions: { supported: true, streaming: true, languages: ["fr"] },
-            },
-          },
-          headers: [],
-          models: [{ upstreamModelId: upstreamModel }, { upstreamModelId: failingUpstreamModel }],
-        },
+  server = await startServer({
+    databaseUrl,
+    extraEnv: { MODEL_API_TRANSCRIPTION_SPOOL_DIR: spoolRoot },
+  });
+  const serverUrl = server.url;
+  failureLogs = () => `server:\n${server.log.text}`;
+  const person = await signUp(serverUrl, "transcription-e2e");
+  userId = person.userId;
+  const client = await rpcClient(serverUrl, person.cookie);
+  const node = await startNode({
+    client,
+    serverUrl,
+    scratch: join(scratch, "node"),
+    slug: nodeSlug,
+  });
+  relay = node.child;
+  failureLogs = () => `server:\n${server.log.text}\nwsmp:\n${node.log.text}`;
+  const logs = failureLogs;
+
+  // The mock ASR server as an always-on runtime on the node, serving both models.
+  const transcription = { streaming: true, languages: ["fr"] };
+  const runtime = await client.runtimes.create({
+    slug: "mock-asr",
+    name: "Deterministic mock ASR",
+    kind: "ALWAYS_ON",
+    nodeId: node.nodeId,
+    spec: {
+      api: "openai",
+      engine: "other",
+      modelType: "transcription",
+      models: [
+        { id: upstreamModel, transcription },
+        { id: failingUpstreamModel, transcription },
       ],
-      mediaTrustedOrigins: [],
-    }),
-    { mode: 0o600 },
-  );
-
-  relay = spawn(cliBinary, ["connect"], {
-    cwd: root,
-    detached: process.platform !== "win32",
-    env: {
-      ...childBaseEnv,
-      WSMP_CONFIG: configPath,
-      WSMP_STATE_DIR: stateDir,
-      WSMP_E2E_CLI_TOKEN: cliCredential.secret,
+      address: { baseUrl: `http://127.0.0.1:${address.port}/v1` },
     },
-    stdio: ["ignore", "pipe", "pipe"],
   });
-  let relayLog = "";
-  relay.stdout.setEncoding("utf8");
-  relay.stdout.on("data", (chunk) => {
-    relayLog += chunk;
+  const runtimeId = runtime.runtime.id;
+  const ready = await waitForReadyRuntime(client, runtimeId, logs);
+  const servedModel = (id) => ready.servedModels.find((model) => model.upstreamModelId === id);
+  assert(servedModel(upstreamModel) && servedModel(failingUpstreamModel), "served models missing");
+
+  // One pool of the healthy model, and a failover pool that tries the failing one first.
+  const single = await client.pools.create({
+    slug: "asr",
+    name: "Transcription E2E",
+    type: "TRANSCRIPTION",
+    members: [{ runtimeModelId: servedModel(upstreamModel).id }],
   });
-  relay.stderr.setEncoding("utf8");
-  relay.stderr.on("data", (chunk) => {
-    relayLog += chunk;
+  const failover = await client.pools.create({
+    slug: `failover-${randomUUID().slice(0, 8)}`,
+    name: "Transcription failover E2E",
+    type: "TRANSCRIPTION",
+    members: [
+      { runtimeModelId: servedModel(failingUpstreamModel).id },
+      { runtimeModelId: servedModel(upstreamModel).id },
+    ],
+  });
+  const failingMember = failover.members.find(
+    (member) => member.upstreamModelId === failingUpstreamModel,
+  );
+  const healthyMember = failover.members.find((member) => member.upstreamModelId === upstreamModel);
+  await client.pools.update({
+    poolId: failover.id,
+    members: {
+      set: [
+        { memberId: failingMember.id, weight: 100 },
+        { memberId: healthyMember.id, weight: 1 },
+      ],
+    },
+  });
+  const { secret: apiKey } = await client.access.apiKeys.create({
+    name: "Transcription E2E",
+    scope: "ALL_POOLS",
+    poolIds: [],
+    expiresAt: null,
   });
 
-  const deadline = Date.now() + 30_000;
-  let listed = false;
-  let publishedModel;
-  while (Date.now() < deadline) {
-    if (relay.exitCode !== null) throw new Error(`Rust relay exited early:\n${relayLog}`);
-    if (server.exitCode !== null) throw new Error(`WSMP server exited early:\n${serverLog}`);
+  const publishedModel = single.callableIds[0];
+  const poolModel = failover.callableIds[0];
+  await eventually(`${publishedModel} was not listed by /v1/models\n${logs()}`, async () => {
     const response = await fetch(`${serverUrl}/v1/models`, {
-      headers: { authorization: `Bearer ${modelCredential.secret}` },
+      headers: { authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(1_000),
     }).catch(() => null);
-    if (response?.ok) {
-      const models = await response.json();
-      const candidates = models.data?.filter(
-        (model) => model.supports_audio_transcription === true,
-      );
-      assert((candidates?.length ?? 0) <= 2, "E2E user unexpectedly published audio models");
-      publishedModel = candidates?.find((model) => model.id.endsWith(`/${upstreamModel}`))?.id;
-      listed = typeof publishedModel === "string";
-      if (listed) break;
-    }
-    await new Promise((resolveWait) => setTimeout(resolveWait, 250));
-  }
-  assert(listed, `published model did not appear within 30s; relay log:\n${relayLog}`);
+    if (!response?.ok) return false;
+    const models = await response.json().catch(() => null);
+    return models?.data?.some((model) => model.id === publishedModel);
+  });
+
+  // Read-only: the request log the requests below write.
+  db = new pg.Pool({ connectionString: databaseUrl, max: 1 });
 
   const form = new FormData();
   form.append("model", publishedModel);
@@ -321,53 +248,22 @@ try {
   form.append("file", new Blob([sentinel], { type: "audio/wav" }), filenamePrivacyMarker);
   const response = await fetch(`${serverUrl}/v1/audio/transcriptions`, {
     method: "POST",
-    headers: { authorization: `Bearer ${modelCredential.secret}` },
+    headers: { authorization: `Bearer ${apiKey}` },
     body: form,
     signal: AbortSignal.timeout(10_000),
   });
   const text = await response.text();
   assert.equal(response.status, 200, text);
   assert.deepEqual(JSON.parse(text), { text: transcriptPrivacyMarker, language: "fr" });
-  await waitForCleanSpool("successful direct request");
+  await waitForCleanSpool("successful single-member pool request");
 
-  const discovered = await db.query(
-    `SELECT id, "upstreamModelId" FROM discovered_model
-     WHERE "userId" = $1 AND "upstreamModelId" = ANY($2::text[])`,
-    [userId, [upstreamModel, failingUpstreamModel]],
-  );
-  const discoveredByModel = new Map(discovered.rows.map((row) => [row.upstreamModelId, row.id]));
-  assert(discoveredByModel.has(upstreamModel), "successful pool member was not discovered");
-  assert(discoveredByModel.has(failingUpstreamModel), "failing pool member was not discovered");
-  const poolId = randomUUID();
-  const poolSlug = `failover-${randomUUID()}`;
-  await db.query(
-    `INSERT INTO model_pool
-       (id, "createdAt", "updatedAt", "userId", slug, name, "optimisticBasicTranscription")
-     VALUES ($1, now(), now(), $2, $3, $4, false)`,
-    [poolId, userId, poolSlug, "Transcription failover E2E"],
-  );
-  await db.query(
-    `INSERT INTO pool_member
-       (id, "createdAt", "updatedAt", "poolId", "discoveredModelId", weight)
-     VALUES
-       ($1, now(), now(), $3, $4, 100),
-       ($2, now(), now(), $3, $5, 1)`,
-    [
-      `a-fail-${randomUUID()}`,
-      `z-success-${randomUUID()}`,
-      poolId,
-      discoveredByModel.get(failingUpstreamModel),
-      discoveredByModel.get(upstreamModel),
-    ],
-  );
-  const poolModel = `e2e-${userId}/${poolSlug}`;
   const poolForm = new FormData();
   poolForm.append("model", poolModel);
   poolForm.append("language", "fr");
   poolForm.append("file", new Blob([sentinel], { type: "audio/wav" }), filenamePrivacyMarker);
   const poolResponse = await fetch(`${serverUrl}/v1/audio/transcriptions`, {
     method: "POST",
-    headers: { authorization: `Bearer ${modelCredential.secret}` },
+    headers: { authorization: `Bearer ${apiKey}` },
     body: poolForm,
     signal: AbortSignal.timeout(10_000),
   });
@@ -389,7 +285,7 @@ try {
   streamingForm.append("file", new Blob([sentinel], { type: "audio/wav" }), "stream.wav");
   const streamingResponse = await fetch(`${serverUrl}/v1/audio/transcriptions`, {
     method: "POST",
-    headers: { authorization: `Bearer ${modelCredential.secret}` },
+    headers: { authorization: `Bearer ${apiKey}` },
     body: streamingForm,
     signal: AbortSignal.timeout(10_000),
   });
@@ -422,7 +318,7 @@ try {
   abortForm.append("file", new Blob([sentinel], { type: "audio/wav" }), "abort.wav");
   const abortResponse = await fetch(`${serverUrl}/v1/audio/transcriptions`, {
     method: "POST",
-    headers: { authorization: `Bearer ${modelCredential.secret}` },
+    headers: { authorization: `Bearer ${apiKey}` },
     body: abortForm,
     signal: callerAbort.signal,
   });
@@ -465,22 +361,20 @@ try {
     relayRows.every((row) => row.responseBytes !== null && Number(row.responseBytes) >= 0),
     "metadata must count response bytes without retaining response content",
   );
-  const poolRelayRow = relayRows.find((row) => row.requestedModelPoolId === poolId);
+  const poolRelayRow = relayRows.find((row) => row.poolId === failover.id);
   assert(poolRelayRow, "pool relay metadata was not persisted");
   assert.equal(poolRelayRow.attemptCount, 2);
-  assert.equal(poolRelayRow.selectedDiscoveredModelId, discoveredByModel.get(upstreamModel));
-  const smallestDirectRequestBytes = Math.min(
-    ...relayRows
-      .filter((row) => row.requestedModelPoolId === null)
-      .map((row) => Number(row.requestBytes)),
+  assert.equal(poolRelayRow.route, "local");
+  const smallestSingleRequestBytes = Math.min(
+    ...relayRows.filter((row) => row.poolId === single.id).map((row) => Number(row.requestBytes)),
   );
   assert(
-    Number(poolRelayRow.requestBytes) > smallestDirectRequestBytes + sentinel.byteLength,
+    Number(poolRelayRow.requestBytes) > smallestSingleRequestBytes + sentinel.byteLength,
     "pool request byte count must accumulate both replay attempts",
   );
   assert(Number(poolRelayRow.responseBytes) > 0, "pool response byte count was not persisted");
 
-  const privacyHaystacks = [serverLog, relayLog, JSON.stringify(relayRows)];
+  const privacyHaystacks = [server.log.text, node.log.text, JSON.stringify(relayRows)];
   for (const marker of [audioPrivacyMarker, filenamePrivacyMarker, transcriptPrivacyMarker]) {
     assert(
       privacyHaystacks.every((haystack) => !haystack.includes(marker)),
@@ -489,15 +383,18 @@ try {
   }
   if (upstreamAssertion) throw upstreamAssertion;
   process.stdout.write("transcription relay E2E passed\n");
+} catch (error) {
+  if (process.env.WSMP_E2E_VERBOSE && failureLogs) process.stderr.write(failureLogs());
+  throw error;
 } finally {
-  if (relay) await waitForExit(relay, "relay");
-  if (server) await waitForExit(server, "server");
+  if (relay) await waitForExit(relay, "wsmp");
+  if (server) await waitForExit(server.child, "server");
   if (upstream) {
     upstream.closeAllConnections();
     await new Promise((resolveClose) => upstream.close(resolveClose));
   }
   if (db) {
-    await db.query(`DELETE FROM "user" WHERE id = $1`, [userId]).catch(() => undefined); // policy: bounded-delete -- generated test user only
+    if (userId) await db.query(`DELETE FROM "user" WHERE id = $1`, [userId]).catch(() => undefined); // policy: bounded-delete -- generated test user only
     await db.end();
   }
   await rm(scratch, { recursive: true, force: true });

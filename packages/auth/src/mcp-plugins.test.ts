@@ -46,13 +46,18 @@ vi.mock("@ws-model-proxy/db", () => ({
 const httpsBase = "https://ws-model-proxy.example.com";
 
 describe("resolveMcpPlugins (WMP_MCP_ENABLED decision)", () => {
-  it("is empty while disabled so the plugin list stays exactly admin/twoFactor/deviceAuthorization", () => {
+  it("is empty while disabled so the plugin list stays exactly admin/twoFactor", () => {
     expect(resolveMcpPlugins({ enabled: false, baseUrl: httpsBase })).toEqual([]);
   });
 
-  it("adds exactly jwt (mcp/oauth-provider) and cimd when enabled", () => {
+  it("adds exactly jwt, mcp (oauth-provider), the consent level hooks and cimd when enabled", () => {
     const plugins = resolveMcpPlugins({ enabled: true, baseUrl: httpsBase });
-    expect(plugins.map((plugin) => plugin.id)).toEqual(["jwt", "oauth-provider", "cimd"]);
+    expect(plugins.map((plugin) => plugin.id)).toEqual([
+      "jwt",
+      "oauth-provider",
+      "wsmp-mcp-consent-level",
+      "cimd",
+    ]);
   });
 
   it("binds the MCP resource to the canonical public origin plus /mcp", () => {
@@ -90,7 +95,7 @@ describe("resolveMcpPlugins (WMP_MCP_ENABLED decision)", () => {
       enabled: true,
       baseUrl: "http://localhost:3000",
     });
-    expect(plugins).toHaveLength(3);
+    expect(plugins).toHaveLength(4);
     const mcpPlugin = plugins.find((plugin) => plugin.id === "oauth-provider");
     expect(mcpPlugin && "options" in mcpPlugin ? mcpPlugin.options.resources : undefined).toContain(
       canonicalMcpResource("http://localhost:3000"),

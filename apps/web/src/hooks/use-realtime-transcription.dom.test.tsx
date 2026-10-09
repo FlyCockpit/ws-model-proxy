@@ -3,6 +3,11 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+// A split-origin deploy: the socket goes to the server, not the page's origin.
+vi.mock("@ws-model-proxy/env/web", () => ({
+  env: { VITE_SERVER_URL: "https://api.example.test" },
+}));
+
 import { useRealtimeTranscription } from "./use-realtime-transcription";
 
 class FakePort {
@@ -118,7 +123,7 @@ async function started() {
 }
 
 describe("useRealtimeTranscription", () => {
-  it("opens the mic, then the dashboard-signed Chat Test socket with no token or subprotocol", async () => {
+  it("opens the mic, then the dashboard-signed Test page socket with no token or subprotocol", async () => {
     const { hook, socket } = await started();
     expect(getUserMedia).toHaveBeenCalledWith({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
@@ -127,7 +132,7 @@ describe("useRealtimeTranscription", () => {
       "/realtime-pcm-worklet.js",
     );
     expect(socket.url).toBe(
-      "ws://localhost:3000/api/internal/chat-test/realtime?intent=transcription&model=owner%2Fasr",
+      "wss://api.example.test/api/internal/chat-test/realtime?intent=transcription&model=owner%2Fasr",
     );
     expect(socket.protocols).toBeUndefined();
     expect(hook.result.current.state.phase).toBe("starting");

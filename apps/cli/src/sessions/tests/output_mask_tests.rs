@@ -16,64 +16,80 @@ fn case(name: &str) -> Case {
     cases.into_iter().find(|row| row.name == name).expect("row")
 }
 
-fn exec_streams(frames: &[OutboundFrame]) -> (Vec<u8>, Vec<u8>) {
-    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-    let (mut stdout_seq, mut stderr_seq) = (0, 0);
-    for frame in frames {
-        match frame {
-            OutboundFrame::Binary(RelayBinaryFrameMetadata::ExecStdout { seq, .. }, bytes) => {
-                assert_eq!(*seq, stdout_seq + 1);
-                stdout_seq = *seq;
-                stdout.extend(bytes);
-            }
-            OutboundFrame::Binary(RelayBinaryFrameMetadata::ExecStderr { seq, .. }, bytes) => {
-                assert_eq!(*seq, stderr_seq + 1);
-                stderr_seq = *seq;
-                stderr.extend(bytes);
+/// The command's status as `exec.poll` answers it (the whole masked tail).
+fn polled(execs: &ExecRegistry, command_id: &str) -> ExecStatus {
+    match execs.status(command_id, NODE_COMMAND_TAIL_MAX_BYTES).pop() {
+        Some(OutboundFrame::Control(NodeFrame::ExecStatus(status))) => status,
+        _ => panic!("expected an exec.status frame"),
+    }
+}
+
+fn tail(execs: &ExecRegistry, command_id: &str) -> String {
+    polled(execs, command_id).tail.unwrap_or_default()
+}
+
+/// Feed worker output until the command has ended.
+fn run_to_end(execs: &mut ExecRegistry, rx: &mpsc::Receiver<FromWorker>) -> Vec<OutboundFrame> {
+    let mut frames = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !execs.sessions.is_empty() {
+        assert!(Instant::now() < deadline, "command did not complete");
+        match rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(FromWorker::ExecBytes {
+                command_id,
+                stderr,
+                bytes,
+            }) => execs.on_bytes(&command_id, stderr, &bytes),
+            Ok(FromWorker::ExecEof { command_id, stderr }) => {
+                execs.on_eof(&command_id, stderr);
             }
             _ => {}
         }
+        frames.extend(execs.poll(Instant::now()));
     }
-    (stdout, stderr)
+    frames
 }
 
 #[test]
-fn exec_has_independent_stream_state_and_flushes_before_done_without_eof() {
+fn exec_has_independent_stream_state_and_flushes_before_the_end_without_eof() {
     let (tx, rx) = channel();
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
     let started = execs.start(
         &enabled_startup(false),
-        &Config::default(),
         "mask-exec",
         slow_command(),
         None,
+        TEST_TIMEOUT_MS,
     );
     assert!(matches!(
         controls(&started)[0],
-        ClientControlMessage::ExecStarted { .. }
+        NodeFrame::ExecStarted { .. }
     ));
     let pem = case("missing-pem-end");
     let eof = case("eof");
-    let mut frames = Vec::new();
     for byte in pem.input.as_bytes() {
-        frames.extend(execs.on_bytes("mask-exec", false, &[*byte]));
+        execs.on_bytes("mask-exec", false, &[*byte]);
     }
-    frames.extend(execs.on_bytes("mask-exec", true, b"stderr-public\n"));
+    execs.on_bytes("mask-exec", true, b"stderr-public\n");
     for byte in eof.input.as_bytes() {
-        assert!(execs.on_bytes("mask-exec", true, &[*byte]).is_empty());
+        execs.on_bytes("mask-exec", true, &[*byte]);
     }
-    frames.extend(execs.cancel("mask-exec"));
-    assert!(matches!(
-        frames.last(),
-        Some(OutboundFrame::Control(
-            ClientControlMessage::ExecDone { .. }
-        ))
-    ));
-    let (out, err) = exec_streams(&frames);
-    assert_eq!(out, pem.expected.as_bytes());
-    assert_eq!(err, format!("stderr-public\n{}", eof.expected).as_bytes());
+    let frames = execs.cancel("mask-exec");
+    let [OutboundFrame::Control(NodeFrame::ExecStatus(ended))] = frames.as_slice() else {
+        panic!("one exec.status ends the command");
+    };
+    assert_eq!(ended.state, ExecState::Cancelled);
     assert!(execs.sessions.is_empty());
-    assert!(execs.on_bytes("mask-exec", false, b"late\n").is_empty());
+    // Each stream was masked on its own (stdout held its unfinished PEM
+    // until the end) and flushed at the end.
+    let output = tail(&execs, "mask-exec");
+    assert!(output.contains("stderr-public\n"), "{output}");
+    assert_eq!(
+        output.replacen("stderr-public\n", "", 1),
+        format!("{}{}", pem.expected, eof.expected)
+    );
+    execs.on_bytes("mask-exec", false, b"late\n");
+    assert!(!tail(&execs, "mask-exec").contains("late"));
     drop(execs);
     drop(rx);
 }
@@ -84,33 +100,30 @@ fn exec_flushes_each_eof_immediately_while_the_child_is_running() {
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
     let _ = execs.start(
         &enabled_startup(false),
-        &Config::default(),
         "mask-eof",
         slow_command(),
         None,
+        TEST_TIMEOUT_MS,
     );
     let eof = case("eof");
-    for stderr in [false, true] {
-        assert!(
-            execs
-                .on_bytes("mask-eof", stderr, eof.input.as_bytes())
-                .is_empty()
-        );
-        let frames = execs.on_eof("mask-eof", stderr);
-        let (out, err) = exec_streams(&frames);
-        let (data, other) = if stderr { (err, out) } else { (out, err) };
-        assert_eq!(data, eof.expected.as_bytes());
-        assert!(other.is_empty());
-        assert!(execs.on_eof("mask-eof", stderr).is_empty());
-    }
+    execs.on_bytes("mask-eof", false, eof.input.as_bytes());
+    execs.on_eof("mask-eof", false);
+    assert_eq!(tail(&execs, "mask-eof"), eof.expected);
+    assert_eq!(polled(&execs, "mask-eof").state, ExecState::Running);
+    execs.on_eof("mask-eof", false);
+    assert_eq!(tail(&execs, "mask-eof"), eof.expected, "flushed once");
     assert_eq!(
         execs.sessions.len(),
         1,
         "pipe EOF is not process completion"
     );
-    assert!(execs.on_bytes("mask-eof", false, b"late\n").is_empty());
     let frames = execs.cancel("mask-eof");
-    assert_eq!(frames.len(), 1, "EOF tails must not be sent twice");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        tail(&execs, "mask-eof"),
+        eof.expected,
+        "not doubled at the end"
+    );
     drop(execs);
     drop(rx);
 }
@@ -121,27 +134,28 @@ fn exec_recovers_after_a_long_line_without_hiding_later_results() {
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
     let _ = execs.start(
         &enabled_startup(false),
-        &Config::default(),
         "mask-long",
         slow_command(),
         None,
+        TEST_TIMEOUT_MS,
     );
     let input = format!(
         "{}\r\nnext\n  continuation\nordinary output\n\nresult: 42\n",
         "z".repeat(crate::output_mask::MAX_HELD_BYTES + 1)
     );
-    let mut frames = Vec::new();
     for chunk in input.as_bytes().chunks(997) {
-        frames.extend(execs.on_bytes("mask-long", false, chunk));
+        execs.on_bytes("mask-long", false, chunk);
     }
-    frames.extend(execs.on_bytes("mask-long", true, b"stderr-visible\n"));
-    frames.extend(execs.cancel("mask-long"));
-    let (out, err) = exec_streams(&frames);
-    assert_eq!(
-        out,
-        "⟦redacted line⟧\r\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nresult: 42\n".as_bytes()
+    execs.on_bytes("mask-long", true, b"stderr-visible\n");
+    let _ = execs.cancel("mask-long");
+    let output = tail(&execs, "mask-long");
+    assert!(
+        output.starts_with(
+            "⟦redacted line⟧\r\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nresult: 42\n"
+        ),
+        "{output}"
     );
-    assert_eq!(err, b"stderr-visible\n");
+    assert!(output.ends_with("stderr-visible\n"), "{output}");
     assert!(execs.sessions.is_empty());
     drop(execs);
     drop(rx);
@@ -152,37 +166,25 @@ fn real_exec_pipe_output_uses_the_masker_on_both_streams() {
     let (tx, rx) = channel();
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
     let command = include_str!("../../../tests/fixtures/masking/stream-exec-colored.sh");
-    let mut frames = execs.start(
+    let _ = execs.start(
         &enabled_startup(false),
-        &Config::default(),
         "mask-real",
         command,
         None,
+        TEST_TIMEOUT_MS,
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !execs.sessions.is_empty() {
-        assert!(Instant::now() < deadline, "command did not complete");
-        match rx.recv_timeout(Duration::from_millis(10)) {
-            Ok(FromWorker::ExecBytes {
-                command_id,
-                stderr,
-                bytes,
-            }) => {
-                frames.extend(execs.on_bytes(&command_id, stderr, &bytes));
-            }
-            Ok(FromWorker::ExecEof { command_id, stderr }) => {
-                frames.extend(execs.on_eof(&command_id, stderr));
-            }
-            _ => {}
-        }
-        frames.extend(execs.poll(Instant::now()));
-    }
-    let (out, err) = exec_streams(&frames);
-    assert_eq!(out, "⟦redacted line⟧\n⟦redacted line⟧".as_bytes());
-    assert_eq!(
-        err,
-        "stderr-visible\nserve --api-key ⟦redacted:22⟧".as_bytes()
-    );
+    let frames = run_to_end(&mut execs, &rx);
+    assert!(frames.iter().any(|frame| matches!(
+        frame,
+        OutboundFrame::Control(NodeFrame::ExecStatus(status))
+            if matches!(status.state, ExecState::Succeeded | ExecState::Failed)
+    )));
+    let output = tail(&execs, "mask-real");
+    // The streams interleave in the ring; each is masked on its own.
+    assert_eq!(output.matches("⟦redacted line⟧").count(), 2, "{output}");
+    assert!(!output.contains("session-value"), "{output}");
+    assert!(output.contains("stderr-visible\n"), "{output}");
+    assert!(output.contains("serve --api-key ⟦redacted:22⟧"), "{output}");
 }
 
 #[test]
@@ -190,236 +192,41 @@ fn exec_command_text_naming_the_hf_token_file_selects_the_hf_class() {
     let (tx, rx) = channel();
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
     // The command only NAMES the token file (in a comment); nothing reads it.
-    let mut frames = execs.start(
+    let _ = execs.start(
         &enabled_startup(false),
-        &Config::default(),
         "mask-hf",
         "printf 'plainword\\n'; printf 'other\\n' >&2 # ~/.cache/huggingface/token",
         None,
+        TEST_TIMEOUT_MS,
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !execs.sessions.is_empty() {
-        assert!(Instant::now() < deadline, "command did not complete");
-        match rx.recv_timeout(Duration::from_millis(10)) {
-            Ok(FromWorker::ExecBytes {
-                command_id,
-                stderr,
-                bytes,
-            }) => frames.extend(execs.on_bytes(&command_id, stderr, &bytes)),
-            Ok(FromWorker::ExecEof { command_id, stderr }) => {
-                frames.extend(execs.on_eof(&command_id, stderr));
-            }
-            _ => {}
-        }
-        frames.extend(execs.poll(Instant::now()));
-    }
-    let (out, err) = exec_streams(&frames);
-    assert_eq!(out, "⟦redacted:9⟧\n".as_bytes());
-    assert_eq!(err, "⟦redacted:5⟧\n".as_bytes());
-}
-
-fn shared_parts(frames: &[OutboundFrame]) -> (Vec<u8>, Vec<u8>, u64) {
-    let (mut head, mut tail, mut total) = (Vec::new(), Vec::new(), None);
-    for frame in frames {
-        match frame {
-            OutboundFrame::Binary(
-                RelayBinaryFrameMetadata::SupervisedOutput { part, .. },
-                bytes,
-            ) => match part {
-                SupervisedOutputPart::Head => head.extend(bytes),
-                SupervisedOutputPart::Tail => tail.extend(bytes),
-            },
-            OutboundFrame::Control(ClientControlMessage::SupervisedDone {
-                output_bytes, ..
-            }) => {
-                total = *output_bytes;
-            }
-            _ => {}
-        }
-    }
-    (head, tail, total.expect("masked output byte count"))
-}
-
-fn accept(
-    terminals: &mut TerminalRegistry,
-    rx: &mpsc::Receiver<FromWorker>,
-    frames: &mut Vec<OutboundFrame>,
-    viewer: &mut TestViewer,
-) {
-    pump_until(terminals, rx, frames, |terminals, _| {
-        phase(terminals) == Some(SupervisedPhase::Confirm)
-    });
-    let label = viewer.id.clone();
-    frames.extend(send(
-        terminals,
-        viewer,
-        &label,
-        &TermPlaintextV2::Data(b"ok\r".to_vec()),
-    ));
-    pump_until(terminals, rx, frames, |terminals, _| {
-        phase(terminals) == Some(SupervisedPhase::Running)
-    });
+    run_to_end(&mut execs, &rx);
+    let output = tail(&execs, "mask-hf");
+    assert!(output.contains("⟦redacted:9⟧\n"), "{output}");
+    assert!(output.contains("⟦redacted:5⟧\n"), "{output}");
+    assert!(!output.contains("plainword") && !output.contains("other"));
 }
 
 #[test]
-fn supervised_masks_before_head_tail_cuts_and_counts_masked_bytes() {
+fn an_unknown_command_polls_as_unknown_and_tails_fit_one_frame() {
     let (tx, rx) = channel();
-    let mut terminals = supervised_registry(tx, &fake_confirm_output(None, "sleep 30"));
-    let startup = supervised_startup(McpCommandMode::Supervised, false);
-    let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
-    let mut viewer = TestViewer::new(81);
-    let _ = attach_viewer(&mut terminals, &startup, &mut viewer);
-    accept(&mut terminals, &rx, &mut frames, &mut viewer);
-
-    let head_cap = terminal_crypto::CAPTURE_HEAD_MAX;
-    let tail_cap = terminal_crypto::CAPTURE_TAIL_MAX;
-    let secret = include_str!("../../../tests/fixtures/masking/stream-boundary.txt");
-    let prefix = "x\n".repeat((head_cap - 24) / 2);
-    let middle = "m\n".repeat(tail_cap / 2);
-    let suffix = "t\n".repeat((tail_cap - 20) / 2);
-    // The two raw boundaries both land inside the seeded value. A test that
-    // only masks retained head/tail bytes necessarily leaves a visible remnant.
-    let input = format!("{prefix}{secret}\n{middle}{secret}\n{suffix}");
-    let second_start = prefix.len() + secret.len() + 1 + middle.len();
-    let raw_tail_start = input.len() - tail_cap;
-    assert!(head_cap > prefix.len() && head_cap < prefix.len() + secret.len());
-    assert!(raw_tail_start > second_start && raw_tail_start < second_start + secret.len());
-    for chunk in input.as_bytes().chunks(997) {
-        frames.extend(terminals.on_bytes(MULTI_TERMINAL, chunk));
-    }
-    frames.extend(terminals.on_eof(MULTI_TERMINAL));
-    frames.extend(terminals.finish_supervised(MULTI_TERMINAL, Instant::now()));
-    let (head, tail, total) = shared_parts(&frames);
-    let expected = format!("{prefix}⟦redacted line⟧\n\n{middle}⟦redacted line⟧\n\n{suffix}");
-    assert_eq!(total, expected.len() as u64);
-    assert!(head == expected.as_bytes()[..head_cap], "wrong masked head");
-    // Capture advances the retained tail to a complete UTF-8/parser boundary.
-    let mut tail_start = expected.len() - tail_cap;
-    while !expected.is_char_boundary(tail_start) {
-        tail_start += 1;
-    }
-    assert!(
-        tail == expected.as_bytes()[tail_start..],
-        "wrong masked tail"
+    let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
+    let unknown = polled(&execs, "never-started");
+    assert_eq!(unknown.state, ExecState::Unknown);
+    assert!(NodeFrame::ExecStatus(unknown).validate().is_ok());
+    let _ = execs.start(
+        &enabled_startup(false),
+        "big",
+        slow_command(),
+        None,
+        TEST_TIMEOUT_MS,
     );
-    assert!(head.len() <= head_cap && tail.len() <= tail_cap);
-    assert!(terminals.sessions.is_empty());
-}
-
-#[test]
-fn supervised_capture_recovers_after_a_long_line_and_counts_visible_results() {
-    let (tx, rx) = channel();
-    let mut terminals = supervised_registry(tx, &fake_confirm_output(None, "sleep 30"));
-    let startup = supervised_startup(McpCommandMode::Supervised, false);
-    let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
-    let mut viewer = TestViewer::new(84);
-    let _ = attach_viewer(&mut terminals, &startup, &mut viewer);
-    accept(&mut terminals, &rx, &mut frames, &mut viewer);
-    let input = format!(
-        "{}\r\nnext\n  continuation\nordinary output\n\nresult: 42",
-        "z".repeat(crate::output_mask::MAX_HELD_BYTES + 1)
-    );
-    for chunk in input.as_bytes().chunks(997) {
-        frames.extend(terminals.on_bytes(MULTI_TERMINAL, chunk));
-    }
-    frames.extend(terminals.on_eof(MULTI_TERMINAL));
-    frames.extend(terminals.finish_supervised(MULTI_TERMINAL, Instant::now()));
-    let (head, tail, total) = shared_parts(&frames);
-    assert_eq!(
-        head,
-        "⟦redacted line⟧\r\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nresult: 42".as_bytes()
-    );
-    assert!(tail.is_empty());
-    assert_eq!(total, head.len() as u64);
-    assert!(terminals.sessions.is_empty());
-}
-
-#[test]
-fn supervised_viewer_stays_raw_and_shared_partial_line_flushes_at_completion() {
-    let (tx, rx) = channel();
-    let mut terminals = supervised_registry(tx, &fake_confirm_output(None, "sleep 30"));
-    let startup = supervised_startup(McpCommandMode::Supervised, false);
-    let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
-    let mut viewer = TestViewer::new(82);
-    let joined = attach_viewer(&mut terminals, &startup, &mut viewer);
-    let mut seen = viewer.receive(MULTI_TERMINAL, &joined);
-    accept(&mut terminals, &rx, &mut frames, &mut viewer);
-    let input = include_str!("../../../tests/fixtures/masking/stream-session-colored.txt");
-    for byte in input.as_bytes() {
-        frames.extend(terminals.on_bytes(MULTI_TERMINAL, &[*byte]));
-    }
-    // Completion without an EOF must flush the final secret flag line.
-    frames.extend(terminals.finish_supervised(MULTI_TERMINAL, Instant::now()));
-    let (head, tail, total) = shared_parts(&frames);
-    assert_eq!(head, "public-first\n⟦redacted line⟧\n⟦redacted line⟧\n\nmax_tokens=4096\nserve --api-key ⟦redacted:22⟧".as_bytes());
-    assert!(tail.is_empty());
-    assert_eq!(total, head.len() as u64);
-    seen.extend(viewer.receive(MULTI_TERMINAL, &frames));
-    let shown = seen_data(&seen);
-    assert!(
-        contains(&shown, input.as_bytes()),
-        "encrypted viewer did not get original output"
-    );
-}
-
-#[test]
-fn supervised_hf_review_capture_is_masked_at_eof_and_reuses_the_same_copy() {
-    let (tx, rx) = channel();
-    let mut terminals = supervised_registry(tx, &fake_confirm_output(None, "sleep 30"));
-    let startup = supervised_startup(McpCommandMode::Supervised, false);
-    let mut request = spawn_request(true);
-    request.command = "cat ~/.huggingface/token".to_string();
-    let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &request);
-    let mut viewer = TestViewer::new(83);
-    let joined = attach_viewer(&mut terminals, &startup, &mut viewer);
-    let mut seen = viewer.receive(MULTI_TERMINAL, &joined);
-    accept(&mut terminals, &rx, &mut frames, &mut viewer);
-    let label = viewer.id.clone();
-    frames.extend(send(
-        &mut terminals,
-        &mut viewer,
-        &label,
-        &TermPlaintextV2::ReviewToggle(true),
-    ));
-    let hf = case("hf");
-    for byte in hf.input.as_bytes() {
-        frames.extend(terminals.on_bytes(MULTI_TERMINAL, &[*byte]));
-    }
-    let eof = case("eof");
-    frames.extend(terminals.on_bytes(MULTI_TERMINAL, eof.input.as_bytes()));
-    frames.extend(terminals.on_eof(MULTI_TERMINAL));
-    let supervised = terminals
-        .sessions
-        .get(MULTI_TERMINAL)
-        .expect("session")
-        .supervised
-        .as_ref()
-        .expect("supervised");
-    assert_eq!(
-        supervised.mask.held(),
-        0,
-        "EOF kept a tail until process exit"
-    );
-    frames.extend(terminals.finish_supervised(MULTI_TERMINAL, Instant::now()));
-    assert!(
-        !frames.iter().any(|f| matches!(
-            f,
-            OutboundFrame::Binary(RelayBinaryFrameMetadata::SupervisedOutput { .. }, _)
-        )),
-        "review output was sent to the server before the person reviewed it"
-    );
-    seen.extend(viewer.receive(MULTI_TERMINAL, &frames));
-    let expected = format!("{}⟦redacted:{}⟧", hf.expected, eof.input.chars().count());
-    let (total, head, tail) = seen
-        .iter()
-        .find_map(|s| match s {
-            Seen::Capture(total, head, tail) => Some((*total, head, tail)),
-            _ => None,
-        })
-        .expect("review capture");
-    assert_eq!(*head, expected.as_bytes());
-    assert!(tail.is_empty());
-    assert_eq!(total, expected.len() as u64);
-    let _ = terminals.close(MULTI_TERMINAL);
-    assert!(terminals.sessions.is_empty());
+    // Quotes escape to two bytes each: the tail shrinks to fit one frame.
+    execs.on_bytes("big", false, &b"\"\"\"\n".repeat(60_000));
+    let status = polled(&execs, "big");
+    assert_eq!(status.truncated, Some(true));
+    let frame = NodeFrame::ExecStatus(status);
+    assert!(crate::protocol::encode_control(&frame).is_ok());
+    let _ = execs.cancel("big");
+    drop(execs);
+    drop(rx);
 }

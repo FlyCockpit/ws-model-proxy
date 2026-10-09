@@ -1,0 +1,7 @@
+{
+  "type": "protocol.error",
+  "failure": "protocol_error",
+  "code": "upgrade_cli",
+  "message": "This server requires relay protocol 3.0. Upgrade wsmp.",
+  "supportedVersions": ["3.0"]
+}

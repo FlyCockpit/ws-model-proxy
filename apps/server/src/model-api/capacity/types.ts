@@ -36,16 +36,19 @@ export type AdmissionAttempt = {
   requestId: string;
   relayRequestId?: string;
   ownerId: string;
-  sourceKind: "DIRECT" | "POOL";
+  /** POOL: a pool request; TEST: a direct served-model test (D1, one target, NORMAL, no scope). */
+  sourceKind: "POOL" | "TEST";
   poolId?: string;
-  /** Recorded on the request; the scheduler uses each waiter's effective priority. */
+  /**
+   * Class rank recorded on the request (NORMAL_PRIORITY_RANK unless a grant
+   * class applies); the scheduler uses each waiter's effective priority.
+   */
   basePriority: number;
   /**
-   * The pool grant the requester was resolved under (grantees only). Its
-   * `queuePriority` (S-C), when set, replaces the pool/member capacity
-   * priority for every candidate of this attempt; null inherits it.
+   * The share the requester was resolved under (share holders only). Its `priorityClass`, when
+   * set, replaces the pool's class for every candidate of this attempt; null inherits it.
    */
-  accessGrantId?: string | null;
+  priorityShareId?: string | null;
   /**
    * Warm sessions (S-C) this request continues, across its candidate targets
    * (`AffinityDecision.matchedSessionIds`). Recorded on the admission request
@@ -130,8 +133,21 @@ export interface CapacityAdmissionStore {
   reclaimExpired(now: Date, limit: number): Promise<number>;
 }
 
+/** Priority classes, in rank order: the rank is what hot-path rows store. */
+export const PRIORITY_CLASSES = ["BACKGROUND", "NORMAL", "HIGH"] as const;
+export type PriorityClass = (typeof PRIORITY_CLASSES)[number];
+export const PRIORITY_CLASS_COUNT = PRIORITY_CLASSES.length;
+/** The rank of NORMAL, the class of a request that names no other. */
+export const NORMAL_PRIORITY_RANK = 1;
+
+export function priorityClassRank(priorityClass: PriorityClass): number {
+  return PRIORITY_CLASSES.indexOf(priorityClass);
+}
+
 export function assertPriority(priority: number): number {
-  if (!Number.isInteger(priority) || priority < 0 || priority > 31)
-    throw new RangeError("Admission priority must be an integer from 0 through 31.");
+  if (!Number.isInteger(priority) || priority < 0 || priority >= PRIORITY_CLASS_COUNT)
+    throw new RangeError(
+      `Admission priority must be a class rank from 0 through ${PRIORITY_CLASS_COUNT - 1}.`,
+    );
   return priority;
 }

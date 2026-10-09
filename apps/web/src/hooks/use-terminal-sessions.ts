@@ -10,14 +10,13 @@ import {
   deriveTerminalSessionKeysV2,
   encodeTerminalData,
   encodeTerminalResize,
-  encodeTerminalReviewToggle,
   generateEphemeralHandshake,
   importEcdhPublicRaw,
   importTerminalOutputKey,
   openTerminalBroadcast,
   openTerminalBytesV2,
   sealTerminalBytesV2,
-  type TerminalPlaintextV2,
+  type TerminalPlaintext,
   useTerminalIdentity,
 } from "@/hooks/use-terminal-crypto";
 import {
@@ -41,15 +40,13 @@ import {
 import { takePendingByTerminalId } from "@/lib/terminal-pending";
 import {
   clampTerminalAxis,
-  type DeploymentTerminalInfo,
   encodeSealedFrame,
   type ListedCli,
   type SealedTerminalFrame,
-  type SupervisedInfo,
   type TerminalClientMessage,
-  type TerminalOrigin,
   type TerminalServerMessage,
   type TerminalWriterLabel,
+  typableCommand,
 } from "@/lib/terminal-protocol";
 import {
   canSendResize,
@@ -78,6 +75,13 @@ const EARLY_FRAME_QUEUE = 64;
 const OUTPUT_BUFFER_EVENTS = 256;
 /** Open a terminal anyway if the relay does not answer a CLI list request. */
 const CLI_LIST_REFRESH_TIMEOUT_MS = 5_000;
+/**
+ * A ticket's command is typed once the shell's output has been quiet this long, so it lands
+ * after the prompt and not inside a login banner or an rc file's output. A heuristic: a shell
+ * that pauses longer mid-startup still gets the text early, which the line discipline buffers
+ * and echoes; the person reads it before pressing Enter either way.
+ */
+const TYPED_COMMAND_QUIET_MS = 300;
 /** Refusals that "Trust new key" can lift. A key swapped mid-handshake cannot. */
 const IDENTITY_RETRY_REASONS = new Set(["identity_changed", "identity_invalid"]);
 /** The CLI refuses a handshake that carries no browser identity with this reason. */
@@ -94,17 +98,6 @@ type InputBatch = {
   timer: ReturnType<typeof setTimeout> | null;
 };
 
-/** The output capture a supervised command left for review, as the CLI sent it. */
-export type ReviewCapture = { head: Uint8Array; tail: Uint8Array; totalBytes: number };
-
-/** Supervised statuses in which the command can still take keystrokes. */
-const SUPERVISED_INPUT_STATUSES: ReadonlySet<string> = new Set(["awaiting_user", "running"]);
-
-/** Terminals this page lists but attaches only when the person picks them. */
-export function pickedToAttach(origin: TerminalOrigin): boolean {
-  return origin !== "user";
-}
-
 export type TerminalTab = {
   localId: string;
   terminalId: string | null;
@@ -112,24 +105,13 @@ export type TerminalTab = {
   /** This tab's own fitted size. */
   cols: number;
   rows: number;
+  phase: "opening" | "live" | "rejected" | "exited";
   /**
-   * `waiting`: an agent request this page lists but does not view. It
-   * attaches only when the user selects it.
+   * The interactive runtime step whose operator terminal this tab attached to
+   * (`runtimes.steps.attach`), or null for a shell. An operator terminal ends
+   * with its command; it is cancelled by its step, never by End session.
    */
-  phase: "waiting" | "opening" | "live" | "rejected" | "exited";
-  /**
-   * `agent`: a supervised command an MCP agent requested. `deployment`: an operator terminal
-   * of an interactive recipe step. Both are listed and attach only when picked.
-   */
-  origin: TerminalOrigin;
-  /** Request details from the relay's list (agent terminals only). */
-  supervised: SupervisedInfo | null;
-  /** The recipe step from the relay's list (deployment terminals only). */
-  deployment: DeploymentTerminalInfo | null;
-  /** The CLI-reported output review flag; null until the CLI reports it. */
-  reviewOutput: boolean | null;
-  /** The capture awaiting this person's review, once the CLI sent it. */
-  reviewCapture: ReviewCapture | null;
+  stepId: string | null;
   /** How the terminal's process ended, from the relay's exit message. */
   exitCode: number | null;
   exitSignal: string | null;
@@ -144,25 +126,6 @@ export type TerminalTab = {
   ptyRows: number | null;
   /** This tab asked the CLI to spawn the terminal and it has not gone live yet. */
   opener: boolean;
-  /**
-   * Agent requests, this tab's Decline:
-   * - `unsent`: pressed, but no open socket took it, or the socket closed
-   *   before the relay answered (the relay forgets a closed socket's
-   *   Decline). It is sent again once a list on a new socket still shows the
-   *   request waiting; a list showing it started makes it `started`; a list
-   *   without it ends the tab. Pressing Decline again also retries.
-   * - `sent`: the socket took it (it may still wait in the socket's rate
-   *   budget); the answer is the exit (declined), `started`, or an error
-   *   naming this Decline's request id. Only an answer naming that id (or
-   *   the terminal's exit or `started`) moves it; the socket closing makes it
-   *   `unsent`.
-   * - `started`: an Enter came first, so the command started anyway. A
-   *   Decline never ends a command that started.
-   * - `failed`: the relay refused this Decline (for example the CLI is
-   *   offline, or too many messages). Nothing is pending; Decline can be
-   *   pressed again.
-   */
-  decline: "unsent" | "sent" | "started" | "failed" | null;
   /**
    * End session on this tab:
    * - `pending`: pressed, and the relay has not yet said the terminal ended
@@ -278,6 +241,9 @@ function patchTab(
   return changed ? next : tabs;
 }
 
+/** A step's operator-terminal tab lost its attachment: attach again from the step. */
+export const STEP_DETACHED = "step_detached";
+
 function newTab(input: {
   localId: string;
   terminalId: string | null;
@@ -286,21 +252,14 @@ function newTab(input: {
   rows: number;
   opener: boolean;
   viewerCount: number;
-  origin?: TerminalOrigin;
-  supervised?: SupervisedInfo | null;
-  deployment?: DeploymentTerminalInfo | null;
+  stepId?: string | null;
 }): TerminalTab {
-  const origin = input.origin ?? "user";
   return {
     ...input,
-    origin,
-    supervised: input.supervised ?? null,
-    deployment: input.deployment ?? null,
-    reviewOutput: null,
-    reviewCapture: null,
+    stepId: input.stepId ?? null,
     exitCode: null,
     exitSignal: null,
-    phase: pickedToAttach(origin) ? "waiting" : "opening",
+    phase: "opening",
     approvalCode: null,
     rejectionReason: null,
     error: null,
@@ -309,10 +268,19 @@ function newTab(input: {
     writer: input.opener ? "you" : "none",
     ptyCols: null,
     ptyRows: null,
-    decline: null,
     ending: null,
   };
 }
+
+/** A terminal ticket to open, for the node `cliDeviceId` names. */
+export type OpenTicketInput = {
+  cliDeviceId: string;
+  ticket: string;
+  /** Typed into the shell once it shows output; never with a newline. */
+  typedCommand?: string;
+  /** An attach ticket for this interactive step's operator terminal. */
+  stepId?: string;
+};
 
 export type UseTerminalSessionsOptions = {
   /** Pinned CLI identity keys. Defaults to IndexedDB. */
@@ -341,19 +309,18 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   tabs: TerminalTab[];
   activeLocalId: string | null;
   selectTab: (localId: string) => void;
-  /** Refreshes the CLI list first, so a CLI that just came online can open. */
-  openCli: (cliDeviceId: string) => void;
+  /**
+   * Open a terminal from a ticket (`nodes.terminals.openTicket` / `nodes.queued.run`). Refreshes
+   * the CLI list first, so a node that just came online can open. `typedCommand` is typed into
+   * the shell once it shows output, without a newline: the person presses Enter.
+   */
+  openTicket: (input: OpenTicketInput) => void;
   /** Ask the relay for the current CLI list; resolves when it arrives (or times out). */
   refreshClis: () => Promise<void>;
   /** X button: stop viewing. The shell keeps running for other viewers. */
   detachTab: (localId: string) => void;
   /** End session: close the shell for everyone. */
   endSession: (localId: string) => void;
-  /**
-   * Decline an agent request. Not a kill: the CLI declines it unless an
-   * Enter came first, and the tab stays to show which happened.
-   */
-  declineRequest: (localId: string) => void;
   subscribeOutput: (
     localId: string,
     listener: (event: TerminalOutputEvent) => void,
@@ -361,10 +328,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   ) => () => void;
   sendInput: (localId: string, data: string) => void;
   sendResize: (localId: string, cols: number, rows: number) => void;
-  /** Ask the CLI to withhold (or release) a supervised command's output for review. */
-  setReviewOutput: (localId: string, on: boolean) => void;
-  /** Forget a capture once its review was submitted (or another viewer's was). */
-  clearReviewCapture: (localId: string) => void;
 } {
   const identity = useTerminalIdentity();
   const pinStore = options.pinStore ?? indexedDbCliPinStore;
@@ -423,10 +386,19 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const generationRef = useRef(0);
   /** Tabs whose handshake waits for the browser identity to load. */
   const awaitingIdentityRef = useRef(new Set<string>());
+  /**
+   * localId -> the ticket its `open` redeems. Gone once the relay answered the open (`opening`
+   * or a refusal it read): a ticket opens one terminal, so a used one is never sent again.
+   */
+  const ticketsRef = useRef(new Map<string, string>());
+  /** localId -> a command to type (no newline) once the tab's shell shows output. */
+  const typedCommandsRef = useRef(new Map<string, string>());
+  /** localId -> the quiet-period timer before its command is typed. */
+  const typedTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  /** `sendInput`, for the output path defined before it. */
+  const sendInputRef = useRef<(localId: string, data: string) => void>(() => undefined);
   /** `open` frames not yet answered by `opening`, in the order sent. */
   const inflightOpensRef = useRef<{ localId: string; requestId: string }[]>([]);
-  /** localId -> request id of the Decline this tab has out (state `sent`). */
-  const declineRequestsRef = useRef(new Map<string, string>());
   /**
    * terminalId -> an End session (or an internal close of a shell no tab
    * shows) the relay has not confirmed. See `CloseIntent`.
@@ -468,17 +440,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
    * one the relay registered later may be missing from it.
    */
   const knownSinceRef = useRef(new Map<string, number>());
-  /**
-   * Agent tabs the user chose to view. Only these attach again after a
-   * reconnect; other agent requests stay listed but unattached.
-   */
-  const userAttachedRef = useRef(new Set<string>());
-  /**
-   * Agent tabs that have delivered output to their pane since they attached.
-   * Keystrokes before that are dropped, so nothing typed before the confirm
-   * screen was shown can reach the CLI.
-   */
-  const outputSeenRef = useRef(new Set<string>());
 
   const viewOf = useCallback((localId: string): TerminalWriterState => {
     return viewRef.current.get(localId) ?? { writer: "you" };
@@ -525,34 +486,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     if (!sendTaken(sendRef.current({ type: "list" }))) listRequestsRef.current.pop();
   }, [noteListRequest]);
 
-  /**
-   * A Decline this tab could not confirm, against the request's listed
-   * status: still waiting, so send it again (the relay joins it to a stop
-   * already under way); started, so the Enter came first.
-   */
-  const sendDecline = useCallback((localId: string, terminalId: string): boolean => {
-    const requestId = newId("decline");
-    if (!sendTaken(sendRef.current({ type: "decline", terminalId, requestId }))) {
-      declineRequestsRef.current.delete(localId);
-      return false;
-    }
-    declineRequestsRef.current.set(localId, requestId);
-    return true;
-  }, []);
-
-  const redecline = useCallback(
-    (
-      localId: string,
-      terminalId: string,
-      status: SupervisedInfo["status"],
-    ): TerminalTab["decline"] => {
-      if (status === "running" || status === "awaiting_output_review") return "started";
-      if (status !== "awaiting_user") return "unsent";
-      return sendDecline(localId, terminalId) ? "sent" : "unsent";
-    },
-    [sendDecline],
-  );
-
   const removeTab = useCallback(
     (tab: TerminalTab) => {
       const localId = tab.localId;
@@ -561,7 +494,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       }
       pendingRef.current.delete(localId);
       establishingRef.current.delete(localId);
-      declineRequestsRef.current.delete(localId);
+      ticketsRef.current.delete(localId);
+      typedCommandsRef.current.delete(localId);
+      clearTimer(typedTimersRef.current, localId);
       if (tab.terminalId) {
         // A close still owed for it goes on without the tab.
         const intent = closesRef.current.get(tab.terminalId);
@@ -583,8 +518,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       clearTimer(reattachTimersRef.current, localId);
       reattachRef.current.delete(localId);
       viewRef.current.delete(localId);
-      userAttachedRef.current.delete(localId);
-      outputSeenRef.current.delete(localId);
       ownSizeRef.current.delete(localId);
       lastSentSizeRef.current.delete(localId);
       pendingResizeRef.current.delete(localId);
@@ -673,11 +606,29 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const emitOutput = useCallback((localId: string, event: TerminalOutputEvent) => {
     // A frame that was mid-decryption when its tab closed has nowhere to go.
     if (!tabsRef.current.some((tab) => tab.localId === localId)) return;
+    if (event.kind === "data" && typedCommandsRef.current.has(localId)) {
+      // The shell is starting: type the command once its output settles (the prompt).
+      const timers = typedTimersRef.current;
+      const previous = timers.get(localId);
+      if (previous) clearTimeout(previous);
+      timers.set(
+        localId,
+        setTimeout(() => {
+          timers.delete(localId);
+          const typed = typedCommandsRef.current.get(localId);
+          const tab = tabsRef.current.find((item) => item.localId === localId);
+          // Not live now (the socket dropped): wait for output after the reattach.
+          if (typed === undefined || !tab?.terminalId || !sessionsRef.current.has(tab.terminalId))
+            return;
+          typedCommandsRef.current.delete(localId);
+          sendInputRef.current(localId, typed);
+        }, TYPED_COMMAND_QUIET_MS),
+      );
+    }
     const listener = listenersRef.current.get(localId);
     if (listener) {
       if (resetBeforeOutputRef.current.delete(localId)) resettersRef.current.get(localId)?.();
       listener(event);
-      if (event.kind === "data") outputSeenRef.current.add(localId);
       return;
     }
     const queued = buffersRef.current.get(localId) ?? [];
@@ -946,6 +897,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       const trust = await ensureTrust(input.cliDeviceId);
       if (stale()) return;
       if (!tabsRef.current.some((tab) => tab.localId === input.localId)) return;
+      if (input.mode === "open" && !ticketsRef.current.has(input.localId)) {
+        // Its ticket was used (the relay read the open): only a new ticket opens a terminal.
+        refuseTab(input.localId, "ticket_invalid");
+        return;
+      }
       const gate = trustAllowsHandshake(trust);
       if (!gate.ok) {
         if (input.mode === "attach") attachingRef.current.delete(input.terminalId);
@@ -985,12 +941,18 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       // A socket that closed first drops nothing that matters: the next one
       // opens and attaches again. A full queue refused it: start again later.
       if (input.mode === "open") {
+        const ticket = ticketsRef.current.get(input.localId);
+        if (ticket === undefined) {
+          pendingRef.current.delete(input.localId);
+          refuseTab(input.localId, "ticket_invalid");
+          return;
+        }
         const requestId = newId("open");
         inflightOpensRef.current.push({ localId: input.localId, requestId });
         const result = sendRef.current({
           type: "open",
           requestId,
-          cliDeviceId: input.cliDeviceId,
+          ticket,
           cols,
           rows,
           ...shared,
@@ -1019,8 +981,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (!tab.terminalId) return;
       clearTimer(reattachTimersRef.current, tab.localId);
       attachingRef.current.add(tab.terminalId);
-      // The attach replays the screen; keystrokes wait for it again.
-      outputSeenRef.current.delete(tab.localId);
       const own = ownSizeRef.current.get(tab.localId);
       void beginHandshake({
         mode: "attach",
@@ -1038,8 +998,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     if (!tab.terminalId || tab.phase === "exited" || tab.phase === "rejected") return false;
     // Being ended: no new viewer slot for it.
     if (closesRef.current.has(tab.terminalId)) return false;
-    // An agent request or a deployment step's terminal attaches only once the user picked it.
-    if (pickedToAttach(tab.origin) && !userAttachedRef.current.has(tab.localId)) return false;
     if (sessionsRef.current.has(tab.terminalId)) return false;
     // An attach may still be checking the CLI identity before its handshake.
     if (attachingRef.current.has(tab.terminalId)) return false;
@@ -1127,20 +1085,13 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       awaitingIdentityRef.current.delete(localId);
       establishingRef.current.delete(localId);
       pendingRef.current.delete(localId);
-      declineRequestsRef.current.delete(localId);
       takePendingByTerminalId(pendingRef.current, terminalId);
       attachingRef.current.delete(terminalId);
       knownSinceRef.current.delete(terminalId);
       const session = sessionsRef.current.get(terminalId);
       if (session) retireAfterDrain(terminalId, session);
       else earlySealedRef.current.delete(terminalId);
-      const decline = tabsRef.current.find((item) => item.localId === localId)?.decline;
-      patchTabNow(localId, {
-        phase: "exited",
-        approvalCode: null,
-        error: TERMINAL_GONE,
-        ...(decline === "sent" || decline === "unsent" ? { decline: null } : {}),
-      });
+      patchTabNow(localId, { phase: "exited", approvalCode: null, error: TERMINAL_GONE });
     },
     [clearTimer, patchTabNow, retireAfterDrain],
   );
@@ -1159,11 +1110,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         // A terminal with a close out is settled by the close's own answers.
         for (const tab of tabsRef.current) {
           const terminalId = tab.terminalId;
-          if (!terminalId || listed.has(terminalId)) continue;
+          // Operator terminals are never listed: their tabs end by exit, never by a list.
+          if (!terminalId || tab.stepId || listed.has(terminalId)) continue;
           if (closesRef.current.has(terminalId)) continue;
-          const settled =
-            pickedToAttach(tab.origin) || tab.phase === "live" || tab.phase === "waiting";
-          if (!settled || tab.phase === "exited" || tab.phase === "rejected") continue;
+          if (tab.phase !== "live") continue;
           if (!knownSinceRef.current.has(terminalId)) continue;
           markTerminalGone(tab.localId, terminalId);
         }
@@ -1180,7 +1130,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       }
       for (const tab of tabsRef.current) {
         const terminalId = tab.terminalId;
-        if (!terminalId || listed.has(terminalId)) continue;
+        if (!terminalId || tab.stepId || listed.has(terminalId)) continue;
         if (tab.phase === "exited" || tab.phase === "rejected") continue;
         const knownSince = knownSinceRef.current.get(terminalId);
         if (knownSince === undefined || knownSince >= requestedAt) continue;
@@ -1218,20 +1168,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           }
           const known = tabByTerminal(remote.terminalId);
           if (known) {
-            patchTabNow(known.localId, {
-              viewerCount: remote.viewerCount,
-              ...(remote.origin === "agent"
-                ? { origin: "agent" as const, supervised: remote.supervised }
-                : {}),
-              ...(remote.origin === "deployment"
-                ? { origin: "deployment" as const, deployment: remote.deployment ?? null }
-                : {}),
-              ...(known.decline === "unsent" && remote.supervised
-                ? {
-                    decline: redecline(known.localId, remote.terminalId, remote.supervised.status),
-                  }
-                : {}),
-            });
+            patchTabNow(known.localId, { viewerCount: remote.viewerCount });
             if (canAttach(known)) toAttach.push(known);
             continue;
           }
@@ -1247,16 +1184,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
             rows: remote.rows,
             opener: false,
             viewerCount: remote.viewerCount,
-            origin: remote.origin,
-            supervised: remote.supervised,
-            deployment: remote.deployment,
           });
           noteTerminalKnown(remote.terminalId);
           viewRef.current.set(tab.localId, { writer: tab.writer });
           additions.push(tab);
-          // Agent requests and deployment steps are listed, not attached: attaching takes a
-          // viewer slot and is the step the person chooses.
-          if (!pickedToAttach(tab.origin)) toAttach.push(tab);
+          toAttach.push(tab);
         }
         if (additions.length > 0) {
           tabsRef.current = [
@@ -1285,6 +1217,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         if (index === -1) return;
         const localId = inflight.splice(index, 1)[0]?.localId;
         if (!localId) return;
+        ticketsRef.current.delete(localId);
         if (closedOpensRef.current.delete(localId)) {
           // The tab is gone. Close the shell, or it would hold a slot unseen,
           // until the relay confirms. Its later `pending` / `opened` find no
@@ -1416,21 +1349,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         }
         clearTimer(reattachTimersRef.current, localId);
         clearTimer(resizeTimersRef.current, localId);
-        const exited = tabByTerminal(terminalId);
-        const supervised = exited?.supervised ?? null;
-        // The exit answers any Decline still out; nothing is pending any more.
-        declineRequestsRef.current.delete(localId);
         // Mark it exited now; frames that arrive from here on are dropped.
         patchTabNow(localId, {
           phase: "exited",
           exitCode: message.exitCode,
           exitSignal: message.signal,
-          ...(exited?.decline === "sent" || exited?.decline === "unsent" ? { decline: null } : {}),
-          // The request's final status comes with the exit, so the tab does
-          // not wait for a list push to say whether the command ran.
-          ...(supervised && message.supervisedStatus
-            ? { supervised: { ...supervised, status: message.supervisedStatus } }
-            : {}),
         });
         if (session) {
           // Frames received before the exit may still be decrypting.
@@ -1441,19 +1364,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           attachingRef.current.delete(terminalId);
           earlySealedRef.current.delete(terminalId);
         }
-        return;
-      }
-      if (message.type === "decline") {
-        // An Enter beat this tab's Decline: the command runs.
-        const tab = tabByTerminal(message.terminalId);
-        if (!tab || tab.phase === "exited" || tab.phase === "rejected") return;
-        declineRequestsRef.current.delete(tab.localId);
-        patchTabNow(tab.localId, {
-          decline: "started",
-          ...(tab.supervised?.status === "awaiting_user"
-            ? { supervised: { ...tab.supervised, status: "running" as const } }
-            : {}),
-        });
         return;
       }
       if (message.type === "closed") {
@@ -1470,6 +1380,16 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         // `self` answers this tab's own detach; the tab is already gone.
         if (message.reason === "self") return;
         dropSession(tab.localId, message.terminalId);
+        if (tab.stepId) {
+          // Re-attaching an operator terminal needs a fresh ticket from its step.
+          patchTabNow(tab.localId, {
+            phase: "rejected",
+            rejectionReason: STEP_DETACHED,
+            error: null,
+            writer: "none",
+          });
+          return;
+        }
         setView(
           tab.localId,
           { writer: "none" },
@@ -1502,24 +1422,14 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           } else failClose(terminalId);
           return;
         }
-        // An answer to one Decline: only that Decline fails. The tab itself
-        // is unaffected (a refused Decline says nothing about its viewing).
-        for (const [localId, requestId] of declineRequestsRef.current) {
-          if (requestId !== message.requestId) continue;
-          declineRequestsRef.current.delete(localId);
-          const declined = tabsRef.current.find((item) => item.localId === localId);
-          if (declined?.decline !== "sent") return;
-          patchTabNow(localId, { decline: "failed" });
-          // A request the relay no longer knows has ended; a fresh list ends the tab.
-          if (message.code === "not_found") requestList();
-          return;
-        }
         // A refused `open`: it made no terminal, so no `opening` follows.
         const inflight = inflightOpensRef.current;
         const index = inflight.findIndex((open) => open.requestId === message.requestId);
         if (index !== -1 && !message.terminalId) {
           const localId = inflight.splice(index, 1)[0]?.localId;
           if (!localId) return;
+          // Refused unread (rate) keeps the ticket for the retry; any other answer used it.
+          if (message.code !== "rate_limited") ticketsRef.current.delete(localId);
           pendingRef.current.delete(localId);
           establishingRef.current.delete(localId);
           if (closedOpensRef.current.delete(localId)) return;
@@ -1590,7 +1500,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       noteTerminalKnown,
       patchTabNow,
       reconcileListedTerminals,
-      redecline,
       refuseSubstitutedKey,
       requestClose,
       requestList,
@@ -1614,7 +1523,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     reattachTimersRef.current.clear();
     lastSentSizeRef.current.clear();
     inputRef.current.clear();
-    outputSeenRef.current.clear();
     sessionsRef.current.clear();
     pendingRef.current.clear();
     attachingRef.current.clear();
@@ -1623,9 +1531,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     closedOpensRef.current.clear();
     // Lists asked on the closed socket are never answered.
     listRequestsRef.current = [];
-    // Nor are its Declines: `sent` becomes `unsent` below.
-    declineRequestsRef.current.clear();
-    // Nor its closes (a queued one never left). The next socket's list sends
+    // Nor are its closes (a queued one never left). The next socket's list sends
     // each again while it still names the terminal.
     for (const intent of closesRef.current.values()) {
       if (intent.retry) clearTimeout(intent.retry);
@@ -1640,9 +1546,19 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     }
     const settle = (tabs: TerminalTab[]) =>
       tabs.flatMap((tab) => {
-        // The relay drops a closed socket's Decline: its answer never comes.
-        const decline = tab.decline === "sent" ? ("unsent" as const) : tab.decline;
         if (!tab.terminalId && tab.phase === "opening") return [];
+        // An operator terminal is re-attached only with a fresh ticket from its step.
+        if (tab.stepId && (tab.phase === "live" || tab.phase === "opening")) {
+          return [
+            {
+              ...tab,
+              phase: "rejected" as const,
+              rejectionReason: STEP_DETACHED,
+              error: null,
+              writer: "none" as const,
+            },
+          ];
+        }
         if (tab.phase === "live" || tab.phase === "opening") {
           return [
             {
@@ -1650,11 +1566,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
               phase: "opening" as const,
               error: null,
               writer: "none" as const,
-              decline,
             },
           ];
         }
-        return [decline === tab.decline ? tab : { ...tab, decline }];
+        return [tab];
       });
     tabsRef.current = settle(tabsRef.current);
     setTabs(settle);
@@ -1680,28 +1595,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   }, [noteListRequest, retryTab]);
 
   const applyPlaintext = useCallback(
-    (session: LiveSession, decoded: TerminalPlaintextV2, unicast: boolean) => {
+    (session: LiveSession, decoded: TerminalPlaintext) => {
       if (decoded.kind === "data")
         emitOutput(session.localId, { kind: "data", data: decoded.data });
-      else if (decoded.kind === "resize") {
-        applyPtySize(session.localId, decoded.cols, decoded.rows);
-      } else if (decoded.kind === "reviewState") {
-        patchTabNow(session.localId, { reviewOutput: decoded.on });
-      } else if (decoded.kind === "reviewCapture") {
-        // The capture is for this viewer alone; a broadcast one is not the CLI's.
-        if (!unicast) return;
-        const tab = tabsRef.current.find((item) => item.localId === session.localId);
-        if (tab?.origin !== "agent") return;
-        patchTabNow(session.localId, {
-          reviewCapture: {
-            head: decoded.head,
-            tail: decoded.tail,
-            totalBytes: decoded.totalBytes,
-          },
-        });
-      }
+      else applyPtySize(session.localId, decoded.cols, decoded.rows);
     },
-    [applyPtySize, emitOutput, patchTabNow],
+    [applyPtySize, emitOutput],
   );
 
   const openBroadcast = useCallback(
@@ -1728,7 +1627,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       const decoded = decodeTerminalPlaintextV2(plaintext);
       // An output key only ever arrives unicast.
       if (decoded.kind === "outputKey") return;
-      applyPlaintext(session, decoded, false);
+      applyPlaintext(session, decoded);
     },
     [applyPlaintext],
   );
@@ -1764,7 +1663,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       session.recvSeq = seq;
       const decoded = decodeTerminalPlaintextV2(plaintext);
       if (decoded.kind !== "outputKey") {
-        applyPlaintext(session, decoded, true);
+        applyPlaintext(session, decoded);
         return;
       }
       // A new key drops the old epoch. A stale or repeated key is ignored.
@@ -1846,21 +1745,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     (localId: string) => {
       setActiveLocalId(localId);
       const tab = tabsRef.current.find((item) => item.localId === localId);
-      if (!tab) return;
-      if (
-        pickedToAttach(tab.origin) &&
-        tab.phase !== "exited" &&
-        tab.phase !== "rejected" &&
-        tab.ending !== "pending"
-      ) {
-        userAttachedRef.current.add(localId);
-        if (tab.phase === "waiting") patchTabNow(localId, { phase: "opening", error: null });
-      }
-      const current = tabsRef.current.find((item) => item.localId === localId);
-      if (!current || !canAttach(current)) return;
-      attach(current);
+      if (!tab || !canAttach(tab)) return;
+      attach(tab);
     },
-    [attach, canAttach, patchTabNow],
+    [attach, canAttach],
   );
 
   const socketStatusRef = useLatestRef(socket.status);
@@ -1881,18 +1769,23 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   }, [requestList, socketStatusRef]);
 
   const startOpen = useCallback(
-    (cliDeviceId: string) => {
+    ({ cliDeviceId, ticket, typedCommand, stepId }: OpenTicketInput) => {
       if (!readyRef.current) return;
       const tab = newTab({
         localId: newId("local"),
         terminalId: null,
         cliDeviceId,
+        stepId: stepId ?? null,
         cols: 80,
         rows: 24,
         opener: true,
         viewerCount: 1,
       });
       viewRef.current.set(tab.localId, { writer: tab.writer });
+      ticketsRef.current.set(tab.localId, ticket);
+      if (typedCommand !== undefined && typableCommand(typedCommand)) {
+        typedCommandsRef.current.set(tab.localId, typedCommand);
+      }
       tabsRef.current = [...tabsRef.current, tab];
       setTabs((current) => [...current, tab]);
       setActiveLocalId(tab.localId);
@@ -1908,12 +1801,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     [beginHandshake],
   );
 
-  const openCli = useCallback(
-    (cliDeviceId: string) => {
+  const openTicket = useCallback(
+    (input: OpenTicketInput) => {
       if (!readyRef.current) return;
       // The relay does not push CLI changes. A CLI that came online after the
       // last list is missing from it, and its handshake would fail as offline.
-      void refreshClis().then(() => startOpen(cliDeviceId));
+      void refreshClis().then(() => startOpen(input));
     },
     [refreshClis, startOpen],
   );
@@ -1927,27 +1820,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         removeTab(tab);
         return;
       }
-      if (
-        pickedToAttach(tab.origin) &&
-        tab.terminalId &&
-        tab.phase !== "exited" &&
-        tab.phase !== "rejected"
-      ) {
-        // An agent request or a deployment step stays pending when this page stops viewing
-        // it: keep it listed, unattached, so it can be picked again. Only End session ends it.
-        const terminalId = tab.terminalId;
-        if (tab.phase !== "waiting") sendRef.current({ type: "detach", terminalId });
-        userAttachedRef.current.delete(localId);
-        outputSeenRef.current.delete(localId);
-        dropSession(localId, terminalId);
-        const batch = inputRef.current.get(localId);
-        if (batch?.timer) clearTimeout(batch.timer);
-        inputRef.current.delete(localId);
-        patchTabNow(localId, { phase: "waiting", error: null, approvalCode: null });
-        return;
-      }
       if (tab.terminalId && tab.phase !== "exited" && tab.phase !== "rejected") {
-        if (tab.opener && tab.phase !== "live") {
+        // An operator terminal is never closed from a tab (its step is cancelled instead).
+        if (tab.opener && tab.phase !== "live" && !tab.stepId) {
           // An open that never went live has no other viewers: cancel it
           // outright, and keep at it until the relay confirms.
           requestClose(tab.terminalId, null);
@@ -1959,7 +1834,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       }
       removeTab(tab);
     },
-    [dropSession, patchTabNow, removeTab, requestClose],
+    [removeTab, requestClose],
   );
 
   const endSession = useCallback(
@@ -1981,20 +1856,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     [patchTabNow, removeTab, requestClose],
   );
 
-  const declineRequest = useCallback(
-    (localId: string) => {
-      const tab = tabsRef.current.find((item) => item.localId === localId);
-      if (tab?.origin !== "agent" || !tab.terminalId) return;
-      if (tab.phase === "exited" || tab.phase === "rejected") return;
-      if (tab.ending === "pending") return;
-      // One Decline at a time; a started command cannot be declined.
-      if (tab.decline === "sent" || tab.decline === "started") return;
-      const sent = sendDecline(localId, tab.terminalId);
-      patchTabNow(localId, { decline: sent ? "sent" : "unsent" });
-    },
-    [patchTabNow, sendDecline],
-  );
-
   const subscribeOutput = useCallback(
     (localId: string, listener: (event: TerminalOutputEvent) => void, reset?: () => void) => {
       listenersRef.current.set(localId, listener);
@@ -2003,7 +1864,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       const queued = buffersRef.current.get(localId) ?? [];
       buffersRef.current.delete(localId);
       for (const event of queued) listener(event);
-      if (queued.some((event) => event.kind === "data")) outputSeenRef.current.add(localId);
       return () => {
         if (listenersRef.current.get(localId) === listener) listenersRef.current.delete(localId);
       };
@@ -2016,7 +1876,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       const tab = tabsRef.current.find((item) => item.localId === localId);
       // A session being ended takes no more keystrokes.
       if (tab?.ending === "pending") return;
-      if (tab?.origin === "agent" && !agentInputAllowed(tab, outputSeenRef.current)) return;
       const live =
         tab?.terminalId && tab.phase !== "exited" ? sessionsRef.current.has(tab.terminalId) : false;
       if (tab && live && needsTakeover(viewOf(localId))) {
@@ -2046,6 +1905,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     },
     [clearTimer, flushInput, sendPlaintext, setView, viewOf],
   );
+  // `emitOutput` types a ticket's command through it; it is defined before `sendInput`.
+  useLayoutEffect(() => {
+    sendInputRef.current = sendInput;
+  }, [sendInput]);
 
   const sendResize = useCallback(
     (localId: string, cols: number, rows: number) => {
@@ -2064,25 +1927,6 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       );
     },
     [clearTimer, flushResize, viewOf],
-  );
-
-  const setReviewOutput = useCallback(
-    (localId: string, on: boolean) => {
-      const tab = tabsRef.current.find((item) => item.localId === localId);
-      if (tab?.origin !== "agent" || tab.phase !== "live") return;
-      const supervised = tab.supervised;
-      if (!supervised?.shareOutput || !SUPERVISED_INPUT_STATUSES.has(supervised.status)) return;
-      // The checkbox shows what the CLI reports back (0x06); nothing is set here.
-      sendPlaintext(localId, encodeTerminalReviewToggle(on));
-    },
-    [sendPlaintext],
-  );
-
-  const clearReviewCapture = useCallback(
-    (localId: string) => {
-      patchTabNow(localId, { reviewCapture: null });
-    },
-    [patchTabNow],
   );
 
   const trustNewKey = useCallback(
@@ -2122,31 +1966,14 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     tabs,
     activeLocalId,
     selectTab,
-    openCli,
+    openTicket,
     refreshClis,
     detachTab,
     endSession,
-    declineRequest,
     subscribeOutput,
     sendInput,
     sendResize,
-    setReviewOutput,
-    clearReviewCapture,
   };
-}
-
-/**
- * Keystrokes reach an agent request only while its command can take them,
- * and only after this tab has shown output (the CLI's confirm screen), so a
- * key pressed before the screen was on the page is never sent.
- */
-export function agentInputAllowed(tab: TerminalTab, outputSeen: ReadonlySet<string>): boolean {
-  if (tab.phase !== "live") return false;
-  if (!tab.supervised || !SUPERVISED_INPUT_STATUSES.has(tab.supervised.status)) return false;
-  // While its Decline is out (or waits to be sent again) this tab sends
-  // nothing, so it cannot press Enter itself.
-  if (tab.decline === "sent" || tab.decline === "unsent") return false;
-  return outputSeen.has(tab.localId);
 }
 
 type SendRef = { readonly current: (message: TerminalClientMessage) => TerminalSendResult };

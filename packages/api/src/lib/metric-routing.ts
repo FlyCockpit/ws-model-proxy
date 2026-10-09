@@ -257,6 +257,7 @@ export const nodeMetricsSampleSchema = z.object({
         index: z.number().int(),
         vramUsedMiB: optionalNumber,
         vramTotalMiB: optionalNumber,
+        gttUsedMiB: optionalNumber,
         utilizationPercent: optionalNumber,
         temperatureC: optionalNumber,
         powerW: optionalNumber,
@@ -371,6 +372,7 @@ export function nodeMetricSeries(
         labels,
       );
     }
+    builtin("node.gpu.gtt_used_mib", gpu.gttUsedMiB, labels);
     builtin("node.gpu.utilization_percent", gpu.utilizationPercent, labels);
     builtin("node.gpu.temperature_c", gpu.temperatureC, labels);
     builtin("node.gpu.power_w", gpu.powerW, labels);

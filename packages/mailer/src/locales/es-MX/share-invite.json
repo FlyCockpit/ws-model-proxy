@@ -1,0 +1,11 @@
+{
+  "subject": "{{owner}} compartió un pool contigo",
+  "heading": "Compartieron un pool contigo",
+  "body": "{{owner}} compartió el pool {{pool}} con esta dirección de correo en WS Model Proxy. Crea una cuenta con esta dirección para empezar a usarlo.",
+  "runtimeSubject": "{{owner}} compartió una definición de runtime contigo",
+  "runtimeHeading": "Compartieron una definición de runtime contigo",
+  "runtimeBody": "{{owner}} compartió la definición de runtime {{runtime}} con esta dirección de correo en WS Model Proxy. Crea una cuenta con esta dirección, o inicia sesión, para verla y copiarla a tus propios runtimes.",
+  "cta": "Crear tu cuenta",
+  "expiry": "Este enlace funciona hasta el {{expiresAt}} y se puede usar una sola vez.",
+  "ignoreFooter": "Si no esperabas esta invitación, puedes ignorar este correo de forma segura."
+}

@@ -46,7 +46,7 @@ use super::{
     EngineEndpoint, EngineSocket, Input, SessionThread, ack, emit, emit_event, error, resample,
     segmented,
 };
-use crate::protocol::{ClientControlMessage, RelayFailure};
+use crate::protocol::{NodeFrame, RelayFailure};
 use crate::stt_wire::{STT_COMPLETED_TEXT_MAX_BYTES, SttEvent};
 
 /// Connecting, the WebSocket handshake, and each handshake answer.
@@ -149,7 +149,7 @@ struct Bridge {
 impl Bridge {
     fn run(&mut self, inbox: &super::SessionInput) -> Result<(), Stop> {
         self.connect()?;
-        self.send_relay(ClientControlMessage::SttOpened {
+        self.send_relay(NodeFrame::SttOpened {
             session_id: self.session_id.clone(),
         })?;
         tracing::info!(
@@ -514,7 +514,7 @@ impl Bridge {
         }
     }
 
-    fn send_relay(&self, message: ClientControlMessage) -> Result<(), Stop> {
+    fn send_relay(&self, message: NodeFrame) -> Result<(), Stop> {
         if emit(&self.tx, &self.session_id, message) {
             Ok(())
         } else {

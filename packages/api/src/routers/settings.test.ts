@@ -1,4 +1,4 @@
-import { createRouterClient, ORPCError } from "@orpc/server";
+import { createRouterClient } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,407 +8,150 @@ const forceTwoFactorPolicy = vi.hoisted(() => ({
   isForceTwoFactorRequired: vi.fn(),
 }));
 vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => forceTwoFactorPolicy);
-
-import type { Context } from "../context";
-import { settingsRouter } from "./settings";
-
-// Mock @ws-model-proxy/db before importing the module
+const signupPolicy = vi.hoisted(() => ({
+  SIGNUP_ENABLED_SETTING_KEY: "signupEnabled",
+  getRuntimeSignupEnabled: vi.fn(async () => true),
+}));
+vi.mock("@ws-model-proxy/auth/signup-policy", () => signupPolicy);
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
   return { default: mockDeep() };
 });
+vi.mock("@ws-model-proxy/env/server", () => ({ env: {} }));
 
-// Mock @ws-model-proxy/env/server so adminOr404Procedure can load without a real .env.
-vi.mock("@ws-model-proxy/env/server", () => ({
-  env: {},
-}));
+import type { Context } from "../context";
+import { adminSettingsRouter } from "./admin-settings";
+import { settingsRouter } from "./settings";
 
-// Re-import the mocked module so we can configure return values
 const { default: prisma } = await import("@ws-model-proxy/db");
-
-// Type-safe handle to the mocked Prisma methods
 const db = prisma as unknown as {
-  appSetting: {
-    findMany: MockInstance;
-    upsert: MockInstance;
-  };
-  user: {
-    findUnique: MockInstance;
-    update: MockInstance;
-  };
+  appSetting: { findMany: MockInstance; upsert: MockInstance };
+  user: { findUnique: MockInstance; update: MockInstance; updateMany: MockInstance };
 };
 
-/** Build a minimal oRPC context for testing. */
-function buildContext(
-  sessionOverride?: Partial<{
-    user: Partial<Session["user"]>;
-    session: Partial<Session["session"]>;
-  }> | null,
-): Context {
-  if (sessionOverride === null) return { session: null };
-
+function context(user: Partial<Session["user"]> = {}, csrfVerified = true): Context {
+  const id = user.id ?? "user-1";
   return {
+    auth: { kind: "cookie_session", userId: id, sessionId: "s", csrfVerified },
     session: {
       user: {
-        id: "test-user-id",
-        email: "test@example.com",
-        name: "Test User",
+        id,
+        email: "u@example.test",
+        name: "U",
         emailVerified: true,
         role: "user",
         twoFactorEnabled: false,
-        image: null,
-        banned: false,
-        banReason: null,
-        banExpires: null,
-        createdAt: new Date("2025-01-01"),
-        updatedAt: new Date("2025-01-01"),
-        ...sessionOverride?.user,
+        ...user,
       },
-      session: {
-        id: "test-session-id",
-        userId: sessionOverride?.user?.id ?? "test-user-id",
-        token: "test-token",
-        expiresAt: new Date(Date.now() + 86_400_000),
-        ipAddress: "127.0.0.1",
-        userAgent: "vitest",
-        createdAt: new Date("2025-01-01"),
-        updatedAt: new Date("2025-01-01"),
-        ...sessionOverride?.session,
-      },
+      session: { id: "s", userId: id, expiresAt: new Date(Date.now() + 60_000) },
     } as Session,
   };
 }
 
-describe("settingsRouter", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    forceTwoFactorPolicy.isForceTwoFactorRequired.mockResolvedValue(false);
+const row = {
+  name: "U",
+  email: "u@example.test",
+  slug: "u",
+  locale: "en-US",
+  operationalAlerts: true,
+  twoFactorEnabled: null,
+  onboardingDoneAt: null,
+};
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  forceTwoFactorPolicy.isForceTwoFactorRequired.mockResolvedValue(false);
+});
+
+describe("settings (per person)", () => {
+  it("reads the signed-in person's settings", async () => {
+    db.user.findUnique.mockResolvedValue(row);
+    const client = createRouterClient(settingsRouter, { context: context() });
+    await expect(client.get()).resolves.toEqual({
+      ...row,
+      twoFactorEnabled: false,
+      onboardingDoneAt: null,
+    });
+    expect(db.user.findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "user-1" } }),
+    );
   });
 
-  describe("getAll", () => {
-    it("returns allowlisted settings as a key-value map and filters at the DB", async () => {
-      db.appSetting.findMany.mockResolvedValue([
-        { key: "force2fa", value: "false" },
-        { key: "signupEnabled", value: "true" },
-      ]);
-
-      const ctx = buildContext(); // authenticated user
-      const client = createRouterClient(settingsRouter, { context: ctx });
-
-      const result = await client.getAll();
-
-      expect(result).toEqual({ force2fa: "false", signupEnabled: "true" });
-      expect(db.appSetting.findMany).toHaveBeenCalledOnce();
-      // Verify the allowlist is enforced at the query level so non-allowlisted
-      // keys (e.g. future secrets/integration flags) never leave the DB.
-      const call = db.appSetting.findMany.mock.calls[0]?.[0] as {
-        where: { key: { in: string[] } };
-      };
-      expect(call.where.key.in).toContain("force2fa");
-      expect(call.where.key.in).toContain("signupEnabled");
-      expect(call.where.key.in).not.toContain("siteName");
-    });
-
-    it("remains readable when force2fa is enabled and the user has not enrolled yet", async () => {
-      db.appSetting.findMany.mockResolvedValue([{ key: "force2fa", value: "true" }]);
-
-      const ctx = buildContext({ user: { twoFactorEnabled: false } });
-      const client = createRouterClient(settingsRouter, { context: ctx });
-
-      await expect(client.getAll()).resolves.toEqual({ force2fa: "true" });
-    });
-
-    it("returns an empty object when no settings exist", async () => {
-      db.appSetting.findMany.mockResolvedValue([]);
-
-      const ctx = buildContext();
-      const client = createRouterClient(settingsRouter, { context: ctx });
-
-      const result = await client.getAll();
-
-      expect(result).toEqual({});
-    });
-
-    it("throws UNAUTHORIZED for unauthenticated requests", async () => {
-      const ctx = buildContext(null);
-      const client = createRouterClient(settingsRouter, { context: ctx });
-
-      await expect(client.getAll()).rejects.toSatisfy((error: ORPCError) => {
-        expect(error).toBeInstanceOf(ORPCError);
-        expect(error.code).toBe("UNAUTHORIZED");
-        return true;
-      });
-    });
+  it("updates only the fields given, for the caller only", async () => {
+    db.user.update.mockResolvedValue({ ...row, operationalAlerts: false });
+    const client = createRouterClient(settingsRouter, { context: context() });
+    await client.update({ operationalAlerts: false });
+    expect(db.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "user-1" }, data: { operationalAlerts: false } }),
+    );
   });
 
-  describe("myNotificationPreferences", () => {
-    it("returns the user's operational alert preference", async () => {
-      db.user.findUnique.mockResolvedValue({ operationalAlerts: false });
-
-      const client = createRouterClient(settingsRouter, { context: buildContext() });
-
-      await expect(client.myNotificationPreferences()).resolves.toEqual({
-        operationalAlerts: false,
-      });
-      expect(db.user.findUnique).toHaveBeenCalledWith({
-        where: { id: "test-user-id" },
-        select: { operationalAlerts: true },
-      });
+  it("refuses an update without the CSRF header (not a person)", async () => {
+    const client = createRouterClient(settingsRouter, { context: context({}, false) });
+    await expect(client.update({ operationalAlerts: false })).rejects.toMatchObject({
+      code: "FORBIDDEN",
     });
-
-    it("defaults operational alerts on when the row is unavailable", async () => {
-      db.user.findUnique.mockResolvedValue(null);
-
-      const client = createRouterClient(settingsRouter, { context: buildContext() });
-
-      await expect(client.myNotificationPreferences()).resolves.toEqual({
-        operationalAlerts: true,
-      });
-    });
+    expect(db.user.update).not.toHaveBeenCalled();
   });
 
-  describe("updateMyNotificationPreferences", () => {
-    it("updates the user's operational alert preference", async () => {
-      db.user.update.mockResolvedValue({});
+  it("completes onboarding once (the first time is kept)", async () => {
+    db.user.findUnique.mockResolvedValue({ ...row, onboardingDoneAt: new Date("2026-10-01") });
+    const client = createRouterClient(settingsRouter, { context: context() });
+    const result = await client.onboarding.complete();
+    expect(db.user.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "user-1", onboardingDoneAt: null } }),
+    );
+    expect(result.onboardingDoneAt).toBe("2026-10-01T00:00:00.000Z");
+  });
+});
 
-      const client = createRouterClient(settingsRouter, { context: buildContext() });
+describe("adminSettings", () => {
+  const admin = { id: "admin-1", role: "admin", twoFactorEnabled: true };
 
-      await expect(
-        client.updateMyNotificationPreferences({ operationalAlerts: false }),
-      ).resolves.toEqual({ success: true });
-      expect(db.user.update).toHaveBeenCalledWith({
-        where: { id: "test-user-id" },
-        data: { operationalAlerts: false },
-      });
-    });
+  it("hides itself from people who are not admins", async () => {
+    const client = createRouterClient(adminSettingsRouter, { context: context() });
+    await expect(client.get()).rejects.toMatchObject({ code: "NOT_FOUND" });
   });
 
-  describe("update", () => {
-    it("upserts the setting and returns success", async () => {
-      db.appSetting.upsert.mockResolvedValue({
-        key: "force2fa",
-        value: "false",
-      });
+  it("reads the server settings with clamped media values", async () => {
+    db.appSetting.findMany.mockResolvedValue([{ key: "mediaAssetTtlHours", value: "999" }]);
+    const client = createRouterClient(adminSettingsRouter, { context: context(admin) });
+    const settings = await client.get();
+    expect(settings.mediaAssetTtlHours).toBe(168);
+    expect(settings.signupEnabled).toBe(true);
+  });
 
-      const ctx = buildContext({ user: { role: "admin" } });
-      const client = createRouterClient(settingsRouter, { context: ctx });
+  it("refuses forced 2FA while the admin has no second factor", async () => {
+    const client = createRouterClient(adminSettingsRouter, {
+      context: context({ ...admin, twoFactorEnabled: false }),
+    });
+    await expect(client.update({ forceTwoFactor: true })).rejects.toMatchObject({
+      code: "FORBIDDEN",
+    });
+    expect(db.appSetting.upsert).not.toHaveBeenCalled();
+  });
 
-      const result = await client.update({
-        key: "force2fa",
-        value: "false",
-      });
-
-      expect(result).toEqual({ success: true });
-      expect(db.appSetting.upsert).toHaveBeenCalledWith({
+  it("stores forced 2FA and drops the policy cache", async () => {
+    db.appSetting.findMany.mockResolvedValue([]);
+    const client = createRouterClient(adminSettingsRouter, { context: context(admin) });
+    await client.update({ forceTwoFactor: true });
+    expect(db.appSetting.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
         where: { key: "force2fa" },
-        update: { value: "false" },
-        create: { key: "force2fa", value: "false" },
-      });
-      expect(forceTwoFactorPolicy.invalidateForceTwoFactorPolicyCache).toHaveBeenCalledOnce();
-    });
-
-    it("permits admins to update signupEnabled", async () => {
-      db.appSetting.upsert.mockResolvedValue({
-        key: "signupEnabled",
-        value: "false",
-      });
-
-      const ctx = buildContext({ user: { role: "admin" } });
-      const client = createRouterClient(settingsRouter, { context: ctx });
-
-      await expect(
-        client.update({
-          key: "signupEnabled",
-          value: "false",
-        }),
-      ).resolves.toEqual({ success: true });
-      expect(db.appSetting.upsert).toHaveBeenCalledWith({
-        where: { key: "signupEnabled" },
-        update: { value: "false" },
-        create: { key: "signupEnabled", value: "false" },
-      });
-      expect(forceTwoFactorPolicy.invalidateForceTwoFactorPolicyCache).not.toHaveBeenCalled();
-    });
-
-    it("rejects unknown setting keys", async () => {
-      const ctx = buildContext({ user: { role: "admin" } });
-      const client = createRouterClient(settingsRouter, { context: ctx });
-      const update = client.update as (input: { key: string; value: string }) => Promise<unknown>;
-
-      await expect(update({ key: "siteName", value: "Nope" })).rejects.toThrow();
-      expect(db.appSetting.upsert).not.toHaveBeenCalled();
-    });
-
-    it("throws FORBIDDEN when enabling force2fa without 2FA on own account", async () => {
-      const ctx = buildContext({
-        user: { role: "admin", twoFactorEnabled: false },
-      });
-      const client = createRouterClient(settingsRouter, { context: ctx });
-
-      await expect(client.update({ key: "force2fa", value: "true" })).rejects.toSatisfy(
-        (error: ORPCError) => {
-          expect(error).toBeInstanceOf(ORPCError);
-          expect(error.code).toBe("FORBIDDEN");
-          expect(error.message).toMatch(/enable 2FA/i);
-          return true;
-        },
-      );
-
-      expect(db.appSetting.upsert).not.toHaveBeenCalled();
-    });
-
-    it("throws NOT_FOUND for unauthenticated requests", async () => {
-      const ctx = buildContext(null);
-      const client = createRouterClient(settingsRouter, { context: ctx });
-
-      await expect(client.update({ key: "force2fa", value: "false" })).rejects.toSatisfy(
-        (error: ORPCError) => {
-          expect(error).toBeInstanceOf(ORPCError);
-          expect(error.code).toBe("NOT_FOUND");
-          return true;
-        },
-      );
-    });
-
-    it("throws NOT_FOUND for non-admin users", async () => {
-      const ctx = buildContext({ user: { role: "user" } });
-      const client = createRouterClient(settingsRouter, { context: ctx });
-
-      await expect(client.update({ key: "force2fa", value: "false" })).rejects.toSatisfy(
-        (error: ORPCError) => {
-          expect(error).toBeInstanceOf(ORPCError);
-          expect(error.code).toBe("NOT_FOUND");
-          return true;
-        },
-      );
-    });
-
-    it("throws NOT_FOUND when admin email is not verified", async () => {
-      const ctx = buildContext({ user: { role: "admin", emailVerified: false } });
-      const client = createRouterClient(settingsRouter, { context: ctx });
-
-      await expect(client.update({ key: "force2fa", value: "false" })).rejects.toSatisfy(
-        (error: ORPCError) => {
-          expect(error).toBeInstanceOf(ORPCError);
-          expect(error.code).toBe("NOT_FOUND");
-          return true;
-        },
-      );
-    });
+        create: { key: "force2fa", value: "true" },
+      }),
+    );
+    expect(forceTwoFactorPolicy.invalidateForceTwoFactorPolicyCache).toHaveBeenCalled();
   });
 
-  describe("update (mediaAssetTtlHours)", () => {
-    it("stores a valid in-range TTL as a string and never touches the 2FA cache", async () => {
-      db.appSetting.upsert.mockResolvedValue({ key: "mediaAssetTtlHours", value: "48" });
-      const ctx = buildContext({ user: { role: "admin" } });
-      const client = createRouterClient(settingsRouter, { context: ctx });
-
-      await expect(client.update({ key: "mediaAssetTtlHours", value: 48 })).resolves.toEqual({
-        success: true,
-      });
-      expect(db.appSetting.upsert).toHaveBeenCalledWith({
-        where: { key: "mediaAssetTtlHours" },
-        update: { value: "48" },
-        create: { key: "mediaAssetTtlHours", value: "48" },
-      });
-      expect(forceTwoFactorPolicy.invalidateForceTwoFactorPolicyCache).not.toHaveBeenCalled();
-    });
-
-    it("clamps a value above the max down to 168", async () => {
-      db.appSetting.upsert.mockResolvedValue({});
-      const ctx = buildContext({ user: { role: "admin" } });
-      const client = createRouterClient(settingsRouter, { context: ctx });
-
-      await client.update({ key: "mediaAssetTtlHours", value: 10_000 });
-      expect(db.appSetting.upsert).toHaveBeenCalledWith(
-        expect.objectContaining({ update: { value: "168" } }),
-      );
-    });
-
-    it("clamps a value below the min up to 1", async () => {
-      db.appSetting.upsert.mockResolvedValue({});
-      const ctx = buildContext({ user: { role: "admin" } });
-      const client = createRouterClient(settingsRouter, { context: ctx });
-
-      await client.update({ key: "mediaAssetTtlHours", value: 0 });
-      expect(db.appSetting.upsert).toHaveBeenCalledWith(
-        expect.objectContaining({ update: { value: "1" } }),
-      );
-    });
-
-    it("rejects a non-integer TTL at input validation", async () => {
-      const ctx = buildContext({ user: { role: "admin" } });
-      const client = createRouterClient(settingsRouter, { context: ctx });
-      const update = client.update as (input: { key: string; value: number }) => Promise<unknown>;
-
-      await expect(update({ key: "mediaAssetTtlHours", value: 1.5 })).rejects.toThrow();
-      expect(db.appSetting.upsert).not.toHaveBeenCalled();
-    });
-
-    it("rejects a string value for the numeric TTL key", async () => {
-      const ctx = buildContext({ user: { role: "admin" } });
-      const client = createRouterClient(settingsRouter, { context: ctx });
-      const update = client.update as (input: { key: string; value: unknown }) => Promise<unknown>;
-
-      await expect(update({ key: "mediaAssetTtlHours", value: "48" })).rejects.toThrow();
-      expect(db.appSetting.upsert).not.toHaveBeenCalled();
-    });
-
-    it("throws NOT_FOUND for non-admins updating the TTL", async () => {
-      const ctx = buildContext({ user: { role: "user" } });
-      const client = createRouterClient(settingsRouter, { context: ctx });
-
-      await expect(client.update({ key: "mediaAssetTtlHours", value: 12 })).rejects.toSatisfy(
-        (error: ORPCError) => {
-          expect(error.code).toBe("NOT_FOUND");
-          return true;
-        },
-      );
-      expect(db.appSetting.upsert).not.toHaveBeenCalled();
-    });
-  });
-
-  describe("update (mediaAttachmentMaxBytes)", () => {
-    it("stores the admin attachment limit as a clamped byte value", async () => {
-      db.appSetting.upsert.mockResolvedValue({});
-      const client = createRouterClient(settingsRouter, {
-        context: buildContext({ user: { role: "admin" } }),
-      });
-
-      await expect(
-        client.update({ key: "mediaAttachmentMaxBytes", value: 8 * 1024 * 1024 }),
-      ).resolves.toEqual({
-        success: true,
-      });
-      expect(db.appSetting.upsert).toHaveBeenCalledWith({
-        where: { key: "mediaAttachmentMaxBytes" },
-        update: { value: String(8 * 1024 * 1024) },
-        create: { key: "mediaAttachmentMaxBytes", value: String(8 * 1024 * 1024) },
-      });
-    });
-
-    it("clamps a too-small admin attachment limit to 256 KiB", async () => {
-      db.appSetting.upsert.mockResolvedValue({});
-      const client = createRouterClient(settingsRouter, {
-        context: buildContext({ user: { role: "admin" } }),
-      });
-
-      await client.update({ key: "mediaAttachmentMaxBytes", value: 1 });
-      expect(db.appSetting.upsert).toHaveBeenCalledWith(
-        expect.objectContaining({ update: { value: String(256 * 1024) } }),
-      );
-    });
-
-    it("does not expose attachment-limit updates to non-admin users", async () => {
-      const client = createRouterClient(settingsRouter, { context: buildContext() });
-
-      await expect(
-        client.update({ key: "mediaAttachmentMaxBytes", value: 1024 * 1024 }),
-      ).rejects.toSatisfy((error: ORPCError) => {
-        expect(error.code).toBe("NOT_FOUND");
-        return true;
-      });
-      expect(db.appSetting.upsert).not.toHaveBeenCalled();
-    });
+  it("clamps the attachment limit before storing it", async () => {
+    db.appSetting.findMany.mockResolvedValue([]);
+    const client = createRouterClient(adminSettingsRouter, { context: context(admin) });
+    await client.update({ mediaAttachmentMaxBytes: 1 });
+    expect(db.appSetting.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: { key: "mediaAttachmentMaxBytes", value: String(256 * 1024) },
+      }),
+    );
   });
 });

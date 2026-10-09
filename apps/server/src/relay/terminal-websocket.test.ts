@@ -1,6 +1,5 @@
 import { once } from "node:events";
 import type { WebSocketLike } from "@hono/node-server";
-import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import type { Session } from "@ws-model-proxy/auth";
 import {
   TERMINAL_BROWSER_JSON_BUDGET,
@@ -13,11 +12,8 @@ import { WSContext } from "hono/ws";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { generateTestHelloIdentity } from "./hello-identity.js";
-import {
-  encodeRelayBinaryFrame,
-  parseRelayBinaryFrame,
-  RELAY_MIN_PROTOCOL_VERSION,
-} from "./protocol.js";
+import type { NodeIdentity } from "./node-credential-auth.js";
+import { encodeRelayBinaryFrame, RELAY_PROTOCOL_VERSION } from "./protocol.js";
 
 const limiterState = vi.hoisted(() => ({ fail: false }));
 const twoFactorPolicy = vi.hoisted(() => ({ required: vi.fn(async () => false) }));
@@ -53,6 +49,12 @@ vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
   isForceTwoFactorRequired: twoFactorPolicy.required,
 }));
 
+const audit = vi.hoisted(() => ({ record: vi.fn() }));
+vi.mock("./node-audit.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./node-audit.js")>()),
+  recordNodeAuditEvent: audit.record,
+}));
+
 vi.mock("../rate-limit.js", () => ({
   rpcLimiter: {},
   createRateLimiterMiddleware:
@@ -75,39 +77,43 @@ const {
   terminalSocketEvents,
 } = await import("./terminal-websocket.js");
 const { settleSocketHandler } = await import("./socket-handler.js");
+const { terminalTicketStore } = await import("./terminal-tickets.js");
+
+/** A ticket as `nodes.terminals.openTicket` mints it (for the test browser's session). */
+function ticketFor(nodeId: string, userId = "user-id", sessionId = "session-id"): string {
+  return terminalTicketStore.mint({ userId, sessionId, nodeId }).ticket;
+}
 
 const db = prisma as unknown as {
   $transaction: MockInstance;
-  cliDevice: {
-    upsert: MockInstance;
+  nodeCredential: { findUnique: MockInstance; update: MockInstance; updateMany: MockInstance };
+  node: {
     update: MockInstance;
+    updateMany: MockInstance;
     findFirst: MockInstance;
     findMany: MockInstance;
-  };
-  cliToken: { update: MockInstance; updateMany: MockInstance; findUnique: MockInstance };
-  endpoint: { upsert: MockInstance; findUnique: MockInstance; updateMany: MockInstance };
-  discoveredModel: {
     findUnique: MockInstance;
-    findMany: MockInstance;
-    upsert: MockInstance;
-    updateMany: MockInstance;
   };
-  poolMember: { findMany: MockInstance; updateMany: MockInstance };
-  executionTarget: { findMany: MockInstance; upsert: MockInstance };
-  inferenceCapacity: { findMany: MockInstance; updateMany: MockInstance };
+  runtimeInstance: { findMany: MockInstance; findFirst: MockInstance };
+  executionTarget: { findMany: MockInstance; updateMany: MockInstance };
   session: { findUnique: MockInstance };
   user: { findUnique: MockInstance };
 };
 
-const identity: CliWebsocketIdentity = {
-  kind: "cliToken",
-  id: "token-id",
-  userId: "user-id",
-  cliDeviceId: null,
-  lookupPrefix: "wsmp_cli_lookup",
-};
 const now = new Date("2026-01-01T00:00:00.000Z");
+/** Connection generations only grow (the manager remembers the highest per node). */
+let generation = 0;
 const testIdentity = generateTestHelloIdentity();
+
+/** The node credential a node named `slug` authenticated with (one node per slug). */
+function identityFor(slug: string): NodeIdentity {
+  return {
+    credentialId: `cred-${slug}`,
+    userId: "user-id",
+    nodeId: slug,
+    identityPublicKey: testIdentity.publicKey,
+  };
+}
 
 class FakeSocket {
   readyState = 1;
@@ -144,18 +150,20 @@ function nonce(): string {
 }
 
 type CliFeatures = {
-  humanTerminal?: boolean;
-  mcpCommandMode?: "off" | "supervised" | "unsupervised";
+  /** false: the node reports Relay only (browser shells are refused there). */
+  fullControl?: boolean;
   terminalSupported?: boolean;
   terminalApproval?: boolean;
+  /** The node runs interactive steps in operator terminals. */
+  operatorTerminals?: boolean;
 };
 
 /**
- * "current" speaks the relay's minimum (and only accepted) protocol; "identified"
- * adds the CLI identity proof; "below-minimum" is a CLI the relay refuses.
+ * "current" speaks relay 3.0; "identified" adds the terminal identity proof; "below-minimum"
+ * is a 2.x CLI the relay refuses.
  */
 type CliKind = "current" | "identified" | "below-minimum";
-const BELOW_MINIMUM_PROTOCOL = "2.1";
+const BELOW_MINIMUM_PROTOCOL = "2.9";
 
 function challengeNonce(socket: FakeSocket): string {
   for (const send of socket.sends) {
@@ -174,57 +182,53 @@ function hello(socket: FakeSocket, slug: string, kind: CliKind, features?: CliFe
       type: "hello",
       id: `hello-${slug}`,
       protocolVersion: BELOW_MINIMUM_PROTOCOL,
-      cli: {
-        slug,
-        hostname: `${slug}.local`,
-        capabilities: {
-          protocolVersion: BELOW_MINIMUM_PROTOCOL,
-        },
-      },
+      cli: { slug, hostname: `${slug}.local`, version: "0.3.9" },
       endpoints: [],
     });
   }
-  // Every accepted CLI speaks the minimum protocol; `kind` only picks whether it
-  // carries an identity proof. Bind key is always required; terminalIdentity is
-  // the extra ECDH proof browsers pin.
+  const full = features?.fullControl ?? true;
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: RELAY_MIN_PROTOCOL_VERSION,
-    cli: {
+    protocolVersion: RELAY_PROTOCOL_VERSION,
+    node: {
       slug,
       hostname: `${slug}.local`,
+      version: "9.9.9",
       identityPublicKey: testIdentity.publicKey,
       identitySignature: testIdentity.sign(
         challengeNonce(socket),
         slug,
         "https://proxy.example.com",
       ),
-      version: "9.9.9",
-      capabilities: {
-        features: {
-          humanTerminal: features?.humanTerminal ?? true,
-          mcpCommandMode: features?.mcpCommandMode ?? "off",
-          terminalApproval: features?.terminalApproval ?? false,
-          terminalSupported: features?.terminalSupported ?? true,
-          remoteMetricSources: false,
-          remoteEngineAdapters: false,
-          mcpFileRead: false,
-          fileRootsConfigured: false,
-          allowFileToolsAsRoot: false,
-        },
-        terminalPublicKey: uncompressedKey(),
-        ...(kind === "identified"
-          ? {
-              terminalIdentity: {
-                publicKey: testIdentity.publicKey,
-                signature: cliIdentity().signature,
-              },
-            }
-          : {}),
-      },
+      terminalPublicKey: uncompressedKey(),
+      ...(kind === "identified"
+        ? {
+            terminalIdentity: {
+              publicKey: testIdentity.publicKey,
+              signature: cliIdentity().signature,
+            },
+          }
+        : {}),
     },
-    endpoints: [],
+    trust: { value: full ? "full" : "relay", frozen: !full },
+    features: {
+      terminals: {
+        supported: features?.terminalSupported ?? true,
+        max: 4,
+        approvalRequired: features?.terminalApproval ?? false,
+      },
+      operatorTerminals: features?.operatorTerminals ?? false,
+      files: { roots: null, asRoot: false, source: "disabled" },
+      runtimeHosts: [],
+      mediaExpand: false,
+      liveStt: false,
+      secrets: [],
+    },
+    definitions: [],
+    heldMetricCommandsHash: null,
+    heldPortRange: null,
+    heldFabricsHash: null,
   });
 }
 
@@ -242,11 +246,9 @@ function device(id: string, overrides: Record<string, unknown> = {}) {
   return {
     id,
     slug: id,
-    status: "CONNECTED",
-    allowHumanTerminal: true,
-    reportedHumanTerminal: true,
-    reportedTerminalSupported: true,
-    relayProtocolVersion: RELAY_MIN_PROTOCOL_VERSION,
+    trust: "FULL",
+    trustLowerRequestedAt: null,
+    rejectedProtocolVersion: null,
     ...overrides,
   };
 }
@@ -271,7 +273,7 @@ function middlewareApp() {
 
 async function connectCli(slug: string, kind: CliKind = "current", features?: CliFeatures) {
   const socket = new FakeSocket();
-  relaySessionManager.acceptAuthenticatedSocket({ socket, identity, now });
+  relaySessionManager.acceptAuthenticatedSocket({ socket, identity: identityFor(slug), now });
   await relaySessionManager.handleTextFrame(socket, hello(socket, slug, kind, features), now);
   return socket;
 }
@@ -433,46 +435,33 @@ describe("terminal browser hub", () => {
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
-    // An unbound CLI token: every hello's conditional bind claims it.
-    db.cliToken.findUnique.mockResolvedValue({
-      revokedAt: null,
-      expiresAt: null,
-      cliDeviceId: null,
-      identityPublicKey: null,
+    db.nodeCredential.findUnique.mockImplementation(async (args: { where: { id: string } }) => {
+      const slug = args.where.id.replace(/^cred-/, "");
+      return {
+        revokedAt: null,
+        identityPublicKey: testIdentity.publicKey,
+        User: { banned: false, banExpires: null, deletionRequestedAt: null },
+        Node: { id: slug, userId: "user-id", slug, trust: "FULL", trustLowerRequestedAt: null },
+      };
     });
-    db.cliToken.updateMany.mockResolvedValue({ count: 1 });
+    db.nodeCredential.update.mockResolvedValue({});
+    db.node.update.mockImplementation(async () => {
+      generation += 1;
+      return { connectionGeneration: generation };
+    });
+    db.node.updateMany.mockResolvedValue({ count: 1 });
     db.user.findUnique.mockResolvedValue({ slug: "owner" });
-    db.cliDevice.upsert.mockImplementation(async (args: { create: { slug: string } }) => ({
-      id: args.create.slug,
-      userId: "user-id",
-      slug: args.create.slug,
-      allowHumanTerminal: true,
-      mcpCommandMode: "OFF",
-      inventorySeq: 0,
-      inventoryDigest: null,
-      inventoryAcknowledgedAt: null,
-    }));
-    db.cliDevice.update.mockResolvedValue({
-      inventorySeq: 1,
-      inventoryDigest: "digest",
-      inventoryAcknowledgedAt: now,
-      id: "one",
-    });
-    db.cliDevice.findFirst.mockImplementation(
+    db.node.findFirst.mockImplementation(
       async (args: { where: { id?: string; userId?: string } }) => {
         const id = args.where.id;
         if (!id || id === "missing" || id === "foreign") return null;
         if (args.where.userId && args.where.userId !== "user-id") return null;
-        if (id === "foreign") return device("foreign", { slug: "foreign-secret" });
-        return device(id, id === "ungranted" ? { allowHumanTerminal: false } : {});
+        return device(id, id === "ungranted" ? { trust: "RELAY" } : {});
       },
     );
-    db.cliDevice.findMany.mockResolvedValue([]);
-    db.endpoint.findUnique.mockResolvedValue(null);
-    db.discoveredModel.findMany.mockResolvedValue([]);
+    db.node.findMany.mockResolvedValue([]);
+    db.runtimeInstance.findMany.mockResolvedValue([]);
     db.executionTarget.findMany.mockResolvedValue([]);
-    db.inferenceCapacity.findMany.mockResolvedValue([]);
-    db.poolMember.findMany.mockResolvedValue([]);
     db.session.findUnique.mockResolvedValue({
       userId: "user-id",
       expiresAt: new Date("2026-02-01T00:00:00.000Z"),
@@ -502,7 +491,7 @@ describe("terminal browser hub", () => {
       browser,
       JSON.stringify({
         type: "open",
-        cliDeviceId,
+        ticket: ticketFor(cliDeviceId),
         cols: 80,
         rows: 24,
         publicKey: uncompressedKey(),
@@ -510,6 +499,181 @@ describe("terminal browser hub", () => {
       }),
     );
   }
+
+  function openFrame(ticket: string, requestId = "open_1") {
+    return JSON.stringify({
+      type: "open",
+      requestId,
+      ticket,
+      cols: 80,
+      rows: 24,
+      publicKey: uncompressedKey(),
+      nonce: nonce(),
+    });
+  }
+
+  it("opens the ticket's terminal id on the ticket's node, once", async () => {
+    const cli = await connectCli("one");
+    const browser = attachBrowser();
+    const minted = terminalTicketStore.mint({
+      userId: "user-id",
+      sessionId: "session-id",
+      nodeId: "one",
+    });
+    await terminalBrowserHub.handleText(browser, openFrame(minted.ticket));
+    expect(browser.jsonSends()[0]).toMatchObject({
+      type: "opening",
+      terminalId: minted.terminalId,
+      requestId: "open_1",
+    });
+    const opens = cli.jsonSends().filter((message) => message.type === "term.open");
+    expect(opens).toEqual([expect.objectContaining({ terminalId: minted.terminalId })]);
+    // Audited once the ticket became a terminal (not when it was minted).
+    expect(audit.record.mock.calls.map(([event]) => event)).toEqual([
+      expect.objectContaining({
+        userId: "user-id",
+        nodeId: "one",
+        actor: "USER",
+        kind: "browser_terminal",
+        subject: `terminal:${minted.terminalId}`,
+        outcome: "opened",
+      }),
+    ]);
+    // The same ticket again: used up, nothing reaches the node.
+    await terminalBrowserHub.handleText(browser, openFrame(minted.ticket, "open_2"));
+    expect(browser.jsonSends().at(-1)).toMatchObject({
+      type: "error",
+      code: "ticket_invalid",
+      requestId: "open_2",
+    });
+    expect(cli.jsonSends().filter((message) => message.type === "term.open")).toHaveLength(1);
+  });
+
+  it("attaches a step's ticket to its operator terminal, also on a Relay-only node", async () => {
+    const cli = await connectCli("relay-op", "current", {
+      fullControl: false,
+      operatorTerminals: true,
+    });
+    const terminalId = Buffer.alloc(16, 4).toString("base64url");
+    const step = {
+      stepId: "step-1",
+      instanceId: "inst-1",
+      rank: 0,
+      intentHash: "a".repeat(64),
+      ownerEpoch: "e1:1",
+    };
+    expect(
+      relaySessionManager.sendToNode("relay-op", {
+        type: "runtime.job",
+        ...step,
+        runtimeId: "rt-1",
+        launchVersionId: "v-1",
+        launchHash: "b".repeat(64),
+        generation: 1,
+        nnodes: 1,
+        phase: "start",
+        handle: "i-abcdefabcdef",
+        unitName: "wsmp-i-abcdefabcdef-r0",
+        placeholders: { port: 30_000 },
+        timeoutMs: 60_000,
+        operator: { terminalId, commandAuthor: "agent" },
+      }),
+    ).toBe(true);
+    await relaySessionManager.handleTextFrame(
+      cli,
+      JSON.stringify({
+        type: "runtime.job.result",
+        ...step,
+        status: "awaiting_operator",
+        stopped: false,
+        terminalId,
+      }),
+    );
+    const browser = attachBrowser();
+    // A ticket naming another terminal of the step (an earlier dispatch) is refused.
+    const stale = terminalTicketStore.mint({
+      userId: "user-id",
+      sessionId: "session-id",
+      nodeId: "relay-op",
+      attach: { stepId: "step-1", terminalId: Buffer.alloc(16, 8).toString("base64url") },
+    });
+    await terminalBrowserHub.handleText(browser, openFrame(stale.ticket, "open_stale"));
+    expect(browser.jsonSends().at(-1)).toMatchObject({
+      type: "error",
+      code: "ticket_invalid",
+      requestId: "open_stale",
+    });
+    const minted = terminalTicketStore.mint({
+      userId: "user-id",
+      sessionId: "session-id",
+      nodeId: "relay-op",
+      attach: { stepId: "step-1", terminalId },
+    });
+    await terminalBrowserHub.handleText(browser, openFrame(minted.ticket));
+    expect(browser.jsonSends().at(-1)).toMatchObject({
+      type: "opening",
+      terminalId,
+      requestId: "open_1",
+    });
+    // An attach, never a shell.
+    expect(cli.jsonSends().filter((message) => message.type === "term.open")).toEqual([]);
+    expect(cli.jsonSends().filter((message) => message.type === "term.attach")).toEqual([
+      expect.objectContaining({ terminalId }),
+    ]);
+    // A browser `attach` naming the terminal directly, or a `close`, reaches nothing.
+    await terminalBrowserHub.handleText(
+      browser,
+      JSON.stringify({ type: "close", requestId: "close_1", terminalId }),
+    );
+    expect(browser.jsonSends().at(-1)).toMatchObject({ type: "error", code: "not_found" });
+    await terminalBrowserHub.handleText(browser, openFrame(minted.ticket, "open_again"));
+    expect(browser.jsonSends().at(-1)).toMatchObject({ code: "ticket_invalid" });
+  });
+
+  it("refuses a ticket of another user or another session, and burns it", async () => {
+    const cli = await connectCli("one");
+    const browser = attachBrowser();
+    const otherSession = ticketFor("one", "user-id", "session-other");
+    const otherUser = ticketFor("one", "user-other", "session-id");
+    await terminalBrowserHub.handleText(browser, openFrame(otherSession, "open_session"));
+    await terminalBrowserHub.handleText(browser, openFrame(otherUser, "open_user"));
+    await terminalBrowserHub.handleText(browser, openFrame("x".repeat(43), "open_unknown"));
+    const errors = browser.jsonSends().filter((message) => message.type === "error");
+    expect(errors.map((error) => [error.code, error.requestId])).toEqual([
+      ["ticket_invalid", "open_session"],
+      ["ticket_invalid", "open_user"],
+      ["ticket_invalid", "open_unknown"],
+    ]);
+    expect(browser.jsonSends().some((message) => message.type === "opening")).toBe(false);
+    expect(cli.jsonSends().some((message) => message.type === "term.open")).toBe(false);
+    expect(audit.record).not.toHaveBeenCalled();
+    // Shown once to the wrong session, the ticket is gone for the right one too.
+    const owner = new FakeSocket();
+    terminalBrowserHub.accept({ socket: owner, userId: "user-id", sessionId: "session-other" });
+    await terminalBrowserHub.handleText(owner, openFrame(otherSession));
+    expect(owner.jsonSends().at(-1)).toMatchObject({ code: "ticket_invalid" });
+  });
+
+  it("refuses an open that names a node instead of a ticket", async () => {
+    const browser = attachBrowser();
+    await terminalBrowserHub.handleText(
+      browser,
+      JSON.stringify({
+        type: "open",
+        requestId: "open_node",
+        cliDeviceId: "one",
+        cols: 80,
+        rows: 24,
+        publicKey: uncompressedKey(),
+        nonce: nonce(),
+      }),
+    );
+    expect(browser.jsonSends().at(-1)).toMatchObject({
+      type: "error",
+      code: "invalid",
+      requestId: "open_node",
+    });
+  });
 
   it("returns the same not-found error for an unknown CLI and a foreign CLI", async () => {
     const browser = attachBrowser();
@@ -520,44 +684,42 @@ describe("terminal browser hub", () => {
     expect(errors[0]).toMatchObject({
       type: "error",
       code: "not_found",
-      message: "CLI device not found.",
+      message: "Node not found.",
     });
     expect(errors[1]).toMatchObject({
       type: "error",
       code: "not_found",
-      message: "CLI device not found.",
+      message: "Node not found.",
     });
     expect(errors[0]?.terminalId).not.toBe(errors[1]?.terminalId);
     expect(typeof errors[0]?.terminalId).toBe("string");
     expect(JSON.stringify(errors)).not.toContain("Foreign");
   });
 
-  it("refuses a CLI below the minimum protocol, a missing grant, and a disabled feature without sending frames", async () => {
+  it("refuses an old wsmp, a node stored at Relay only, a live Relay-only node and disabled terminals without sending frames", async () => {
     const old = await connectCli("old", "below-minimum");
     const ungranted = await connectCli("ungranted");
-    const disabled = await connectCli("disabled", "current", { humanTerminal: false });
-    db.cliDevice.findFirst.mockImplementation(async (args: { where: { id?: string } }) => {
-      if (args.where.id === "old")
-        return device("old", {
-          relayProtocolVersion: BELOW_MINIMUM_PROTOCOL,
-          reportedHumanTerminal: null,
-          reportedTerminalSupported: null,
-        });
-      if (args.where.id === "ungranted") return device("ungranted", { allowHumanTerminal: false });
-      if (args.where.id === "disabled") return device("disabled", { reportedHumanTerminal: false });
+    const relayOnly = await connectCli("relay-only", "current", { fullControl: false });
+    const disabled = await connectCli("disabled", "current", { terminalSupported: false });
+    db.node.findFirst.mockImplementation(async (args: { where: { id?: string } }) => {
+      if (args.where.id === "old") return device("old", { rejectedProtocolVersion: "2.9" });
+      if (args.where.id === "ungranted") return device("ungranted", { trust: "RELAY" });
+      if (args.where.id === "relay-only") return device("relay-only");
+      if (args.where.id === "disabled") return device("disabled");
       return null;
     });
     const browser = attachBrowser();
     await open(browser, "old");
     await open(browser, "ungranted");
+    await open(browser, "relay-only");
     await open(browser, "disabled");
     expect(
       browser
         .jsonSends()
         .filter((message) => message.type === "error")
         .map((message) => message.code),
-    ).toEqual(["cli_too_old", "not_granted", "device_disabled"]);
-    for (const socket of [old, ungranted, disabled]) {
+    ).toEqual(["cli_too_old", "not_granted", "not_granted", "unsupported"]);
+    for (const socket of [old, ungranted, relayOnly, disabled]) {
       expect(socket.jsonSends().some((message) => String(message.type).startsWith("term."))).toBe(
         false,
       );
@@ -622,7 +784,7 @@ describe("terminal browser hub", () => {
       }),
     );
     expect(browser.jsonSends().some((message) => message.type === "opened")).toBe(true);
-    db.cliDevice.findMany.mockResolvedValue([device("one")]);
+    db.node.findMany.mockResolvedValue([device("one")]);
     await terminalBrowserHub.handleText(browser, JSON.stringify({ type: "list" }));
     const listed = browser.jsonSends().find((message) => message.type === "terminals");
     expect(listed?.clis).toEqual([
@@ -723,7 +885,7 @@ describe("terminal browser hub", () => {
       browser,
       JSON.stringify({
         type: "open",
-        cliDeviceId: "one",
+        ticket: ticketFor("one"),
         cols: 80,
         rows: 24,
         publicKey: uncompressedKey(),
@@ -806,7 +968,7 @@ describe("terminal browser hub", () => {
     await admission;
     expect(browser.closes).toHaveLength(1);
     expect(registered(browser)).toBe(false);
-    db.cliDevice.findMany.mockResolvedValue([device("one")]);
+    db.node.findMany.mockResolvedValue([device("one")]);
     await terminalBrowserHub.handleText(browser, JSON.stringify({ type: "list" }));
     expect(browser.sends).toHaveLength(0);
   });
@@ -817,7 +979,7 @@ describe("terminal browser hub", () => {
     db.session.findUnique.mockResolvedValueOnce(admissionRow());
     await admitBrowserConnection({ socket: browser, userId: "user-id", sessionId: "session-id" });
     expect(browser.closes).toEqual([]);
-    db.cliDevice.findMany.mockResolvedValue([device("one")]);
+    db.node.findMany.mockResolvedValue([device("one")]);
     await terminalBrowserHub.handleText(browser, JSON.stringify({ type: "list" }));
     expect(browser.jsonSends()).toEqual([expect.objectContaining({ type: "terminals" })]);
   });
@@ -830,7 +992,7 @@ describe("terminal browser hub", () => {
     await admitBrowserConnection({ socket: gone, userId: "user-id", sessionId: "session-id" });
     expect(gone.closes).toEqual([{ code: 4401, reason: "session_expired" }]);
     expect(registered(gone)).toBe(false);
-    db.cliDevice.findMany.mockResolvedValue([device("one")]);
+    db.node.findMany.mockResolvedValue([device("one")]);
     await terminalBrowserHub.handleText(gone, JSON.stringify({ type: "list" }));
     expect(gone.sends).toHaveLength(0);
 
@@ -853,7 +1015,7 @@ describe("terminal browser hub", () => {
       userId: "user-id",
       sessionId: "session-id",
     });
-    db.cliDevice.findMany.mockResolvedValue([device("one")]);
+    db.node.findMany.mockResolvedValue([device("one")]);
     const listed = terminalBrowserHub.handleText(
       browser,
       JSON.stringify({ type: "list", requestId: "on-open" }),
@@ -1034,7 +1196,7 @@ describe("terminal browser hub", () => {
     expect(db.session.findUnique).toHaveBeenCalledWith(
       expect.objectContaining({ where: { id: "session-id" } }),
     );
-    db.cliDevice.findMany.mockResolvedValue([device("one")]);
+    db.node.findMany.mockResolvedValue([device("one")]);
     events.onMessage?.(new MessageEvent("message", { data: '{"type":"list"}' }), ws);
     terminalBrowserHub.revokeTerminalAccessForUser("admin-id");
     expect(socket.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
@@ -1125,7 +1287,7 @@ describe("terminal browser hub", () => {
     const browser = attachBrowser();
     let releaseLookup: (() => void) | undefined;
     const lookupStarted = new Promise<void>((started) => {
-      db.cliDevice.findFirst.mockImplementationOnce(
+      db.node.findFirst.mockImplementationOnce(
         () =>
           new Promise((resolve) => {
             releaseLookup = () => resolve(device("one"));
@@ -1142,7 +1304,10 @@ describe("terminal browser hub", () => {
 
     expect(cli.jsonSends().some((message) => message.type === "term.open")).toBe(false);
     expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([]);
-    expect(relaySessionManager.terminalCounts("user-id", "one")).toMatchObject({ user: 0, cli: 0 });
+    expect(relaySessionManager.terminalCounts("user-id", "one")).toMatchObject({
+      user: 0,
+      node: 0,
+    });
   });
 
   it("reports offline for a disconnected CLI and not-found for a foreign terminal id", async () => {
@@ -1216,7 +1381,7 @@ describe("terminal browser hub", () => {
       {
         type: "open",
         requestId: "open_missing",
-        cliDeviceId: "missing",
+        ticket: ticketFor("missing"),
         cols: 80,
         rows: 24,
         publicKey: uncompressedKey(),
@@ -1246,7 +1411,7 @@ describe("terminal browser hub", () => {
     // An open to a known CLI that is not connected: `offline`, with the request.
     await terminalBrowserHub.handleText(
       offline,
-      JSON.stringify({ ...frames[0], requestId: "open_offline", cliDeviceId: "one" }),
+      JSON.stringify({ ...frames[0], requestId: "open_offline", ticket: ticketFor("one") }),
     );
     expect(offline.jsonSends().at(-1)).toMatchObject({
       type: "error",
@@ -1271,7 +1436,7 @@ describe("terminal browser hub", () => {
 
   it("catches a throwing list without rejecting the socket handler", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    db.cliDevice.findMany.mockRejectedValue(new Error("SECRET_DB_MESSAGE"));
+    db.node.findMany.mockRejectedValue(new Error("SECRET_DB_MESSAGE"));
     const browser = attachBrowser();
     settleSocketHandler("browser text", terminalBrowserHub.handleText(browser, '{"type":"list"}'));
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1284,7 +1449,7 @@ describe("terminal browser hub", () => {
   it("rejects an oversized text frame on receipt without queueing it behind a stalled lookup", async () => {
     const browser = attachBrowser();
     let releaseList: (() => void) | undefined;
-    db.cliDevice.findMany.mockImplementationOnce(
+    db.node.findMany.mockImplementationOnce(
       () =>
         new Promise((resolve) => {
           releaseList = () => resolve([]);
@@ -1307,14 +1472,14 @@ describe("terminal browser hub", () => {
       "error",
       "terminals",
     ]);
-    expect(db.cliDevice.findMany).toHaveBeenCalledTimes(1);
+    expect(db.node.findMany).toHaveBeenCalledTimes(1);
   });
 
   it("answers a text frame past the pending cap with rate_limited and keeps the socket (F2-08)", async () => {
     const browser = attachBrowser();
     let releaseList: (() => void) | undefined;
     const lookupStarted = new Promise<void>((started) => {
-      db.cliDevice.findMany.mockImplementationOnce(
+      db.node.findMany.mockImplementationOnce(
         () =>
           new Promise((resolve) => {
             releaseList = () => resolve([]);
@@ -1349,7 +1514,7 @@ describe("terminal browser hub", () => {
 
   it("a frame refused at the pending cap consumes no rate-window slot (F2-08)", async () => {
     const browser = attachBrowser();
-    db.cliDevice.findMany.mockResolvedValue([]);
+    db.node.findMany.mockResolvedValue([]);
     // Freeze time so the rate window can be filled and then aged out
     // deterministically: the pending cap counts frames, the rate window
     // counts stamps in the last TERMINAL_BROWSER_JSON_WINDOW_MS.
@@ -1358,7 +1523,7 @@ describe("terminal browser hub", () => {
     try {
       // One stalled lookup; the frames behind it pile up as pending.
       let release: (() => void) | undefined;
-      db.cliDevice.findMany.mockImplementationOnce(
+      db.node.findMany.mockImplementationOnce(
         () =>
           new Promise((resolve) => {
             release = () => resolve([]);
@@ -1435,7 +1600,7 @@ describe("terminal browser hub", () => {
   async function stallQueue(browser: FakeSocket) {
     let release: (() => void) | undefined;
     const started = new Promise<void>((resolve) => {
-      db.cliDevice.findMany.mockImplementationOnce(
+      db.node.findMany.mockImplementationOnce(
         () =>
           new Promise((settle) => {
             release = () => settle([]);
@@ -1503,7 +1668,7 @@ describe("terminal browser hub", () => {
     const cli = await connectCli("one");
     const browser = attachBrowser();
     const terminalId = await openLive(browser, cli, "one");
-    db.cliDevice.findMany.mockResolvedValue([]);
+    db.node.findMany.mockResolvedValue([]);
     // `open` took one slot; spend the rest of the window.
     for (let index = 1; index < TERMINAL_BROWSER_JSON_LIMIT; index += 1) {
       await terminalBrowserHub.handleText(browser, '{"type":"list"}');
@@ -1568,7 +1733,7 @@ describe("terminal browser hub", () => {
 
   it("paces on the monotonic clock: a wall-clock jump neither resets nor fills a window (PACE-CLK-SRV)", async () => {
     const browser = attachBrowser();
-    db.cliDevice.findMany.mockResolvedValue([]);
+    db.node.findMany.mockResolvedValue([]);
     vi.useFakeTimers({ toFake: ["Date", "performance"] });
     try {
       for (let index = 0; index < TERMINAL_BROWSER_JSON_LIMIT; index += 1) {
@@ -1600,7 +1765,7 @@ describe("terminal browser hub", () => {
     const terminalId = await openLive(browser, cli, "one");
     const before = browser.sends.length;
     browser.bufferedAmount = 8 * 1024 * 1024 + 1;
-    db.cliDevice.findMany.mockResolvedValue([device("one")]);
+    db.node.findMany.mockResolvedValue([device("one")]);
     await terminalBrowserHub.handleText(browser, '{"type":"list","requestId":"slow"}');
     // Nothing more was written to the backed-up socket; it is closed instead.
     expect(browser.sends.length).toBe(before);
@@ -1619,7 +1784,7 @@ describe("terminal browser hub", () => {
   it("keeps sending to a socket below the JSON send limit (CI-1)", async () => {
     const browser = attachBrowser();
     browser.bufferedAmount = 8 * 1024 * 1024;
-    db.cliDevice.findMany.mockResolvedValue([]);
+    db.node.findMany.mockResolvedValue([]);
     await terminalBrowserHub.handleText(browser, '{"type":"list","requestId":"ok"}');
     expect(browser.closes).toEqual([]);
     expect(browser.jsonSends().at(-1)).toMatchObject({ type: "terminals", requestId: "ok" });
@@ -1630,7 +1795,7 @@ describe("terminal browser hub", () => {
     const browser = attachBrowser();
     const other = attachBrowser();
     const terminalId = await openLive(browser, oldCli, "one");
-    db.cliDevice.findMany.mockResolvedValue([device("one")]);
+    db.node.findMany.mockResolvedValue([device("one")]);
     const replacement = await connectCli("one");
     expect(oldCli.closes).toEqual([{ code: 1000, reason: "replaced" }]);
     expect(browser.jsonSends()).toContainEqual({ type: "exit", terminalId });
@@ -1722,7 +1887,7 @@ describe("terminal browser hub", () => {
 
     function stallFirstList() {
       let release: (() => void) | undefined;
-      db.cliDevice.findMany.mockImplementationOnce(
+      db.node.findMany.mockImplementationOnce(
         () =>
           new Promise((resolve) => {
             release = () => resolve([]);
@@ -1797,7 +1962,11 @@ describe("terminal browser hub", () => {
     function binaryFrames(socket: FakeSocket) {
       return socket.sends
         .filter((send): send is ArrayBuffer => typeof send !== "string")
-        .map((send) => parseRelayBinaryFrame(send).metadata);
+        .map((send) => {
+          // Server → node metadata, as the node reads it.
+          const length = new DataView(send).getUint32(0, false);
+          return JSON.parse(new TextDecoder().decode(new Uint8Array(send, 4, length))) as Json;
+        });
     }
 
     async function send(browser: FakeSocket, message: Json) {
@@ -1890,7 +2059,7 @@ describe("terminal browser hub", () => {
         { type: "term.sealed", terminalId, seq: 7, epoch: 2 },
       ]);
 
-      db.cliDevice.findMany.mockResolvedValue([device("one")]);
+      db.node.findMany.mockResolvedValue([device("one")]);
       await send(b, { type: "list" });
       const listed = b.jsonSends().find((message) => message.type === "terminals");
       expect(listed?.clis).toEqual([

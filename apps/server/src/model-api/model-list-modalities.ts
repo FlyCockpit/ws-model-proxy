@@ -15,6 +15,7 @@
 import { audioOperationSupported } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import type { OpenAiCompatibleCapabilities } from "../relay/protocol.js";
 import { realtimeTranscriptionCapability } from "../relay/stt-relay.js";
+import { servedModelCapabilities } from "./served-model-capabilities.js";
 
 export type ModelInputModality = "text" | "image" | "audio" | "video" | "file";
 export type ModelOutputModality = "text" | "image" | "audio" | "embedding";
@@ -54,8 +55,8 @@ export type MultimodalFlags = {
   audioTranslation: boolean;
   /**
    * The capability advertises live transcription (`audio.transcriptions.realtime`
-   * with `supported: true`; never translations). Sessions still open only on
-   * recipe-managed, healthy members.
+   * with `supported: true`; never translations). Sessions still open only on a ready
+   * instance whose target is healthy or not yet judged, and never on `:external`.
    */
   realtimeTranscription?: boolean;
 };
@@ -167,6 +168,39 @@ export function unionMultimodalFlags(flags: MultimodalFlags[]): MultimodalFlags 
       audioTranslation: false,
     },
   );
+}
+
+/**
+ * What `/v1/models` advertises for a pool: the union of its ACTIVE members' served-model
+ * capabilities (the owner's override, else what the node detected), never a guess from the
+ * model's name or a catalog. A disabled member (say a vision model switched off) does not
+ * make the text-only members still serving look multimodal.
+ */
+export function poolModelListFlags(
+  rows: ReadonlyArray<{
+    active?: boolean;
+    model: {
+      id: string;
+      capabilities: readonly string[];
+      type?: string;
+      embeddingContract?: unknown;
+      transcriptionProfile?: unknown;
+    };
+  }>,
+): MultimodalFlags {
+  const byModel = new Map(
+    rows.filter((row) => row.active !== false).map((row) => [row.model.id, row.model] as const),
+  );
+  return unionMultimodalFlags(
+    [...byModel.values()].map((model) =>
+      multimodalFlagsFromCapabilities(servedModelCapabilities(model)),
+    ),
+  );
+}
+
+/** The flags of a pool's `owner/pool:external` entry: live sessions never take `:external`. */
+export function externalModelListFlags(flags: MultimodalFlags): MultimodalFlags {
+  return { ...flags, realtimeTranscription: false };
 }
 
 export function inputModalitiesFromFlags(flags: MultimodalFlags): ModelInputModality[] {

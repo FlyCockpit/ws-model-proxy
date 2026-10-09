@@ -37,7 +37,7 @@ describe("hello identity statement", () => {
         identityPublicKey: identity.publicKey,
         signature,
         nonce: nonceB64,
-        cliSlug: slug,
+        nodeSlug: slug,
         origin,
       }),
     ).toBe(true);
@@ -46,7 +46,7 @@ describe("hello identity statement", () => {
         identityPublicKey: identity.publicKey,
         signature,
         nonce: nonceB64,
-        cliSlug: slug,
+        nodeSlug: slug,
         origin: "http://localhost:3000",
       }),
     ).toBe(false);

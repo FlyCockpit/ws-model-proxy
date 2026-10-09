@@ -147,6 +147,8 @@ afterEach(() => {
   vi.mocked(toast.error).mockClear();
 });
 
+// The first test pays the cold load of the code-split route; under a full workspace run that
+// alone can pass the 5 s default.
 describe("admin users deletion conflicts", () => {
   it("shows the retained-history copy when removing a user is refused", async () => {
     state.users = [user()];

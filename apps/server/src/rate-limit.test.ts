@@ -15,26 +15,11 @@ vi.mock("@ws-model-proxy/auth", () => ({
   },
 }));
 
-vi.mock("@ws-model-proxy/env/server", () => ({
-  env: {
-    RATE_LIMIT_AUTH_POINTS: 3,
-    RATE_LIMIT_AUTH_DURATION: 60,
-    RATE_LIMIT_AUTH_BLOCK_DURATION: 120,
-    RATE_LIMIT_SIGNIN_FAILURE_POINTS: 10,
-    RATE_LIMIT_SIGNIN_FAILURE_DURATION: 900,
-    RATE_LIMIT_SIGNIN_FAILURE_BLOCK_DURATION: 600,
-    RATE_LIMIT_SIGNUP_POINTS: 3,
-    RATE_LIMIT_SIGNUP_DURATION: 3600,
-    RATE_LIMIT_SIGNUP_BLOCK_DURATION: 3600,
-    RATE_LIMIT_RPC_POINTS: 5,
-    RATE_LIMIT_RPC_DURATION: 60,
-    RATE_LIMIT_EMAIL_RECIPIENT_POINTS: 3,
-    RATE_LIMIT_EMAIL_RECIPIENT_DURATION: 3600,
-    RATE_LIMIT_EMAIL_RECIPIENT_BLOCK_DURATION: 0,
-    RATE_LIMIT_SIGNUP_RECIPIENT_POINTS: 6,
-    TRUST_PROXY_HOPS: undefined,
-  },
+const envMock = vi.hoisted(() => ({
+  WMP_RATE_LIMIT_SCALE: 1,
+  TRUST_PROXY_HOPS: undefined,
 }));
+vi.mock("@ws-model-proxy/env/server", () => ({ env: envMock }));
 
 const mockGetConnInfo = vi.fn(() => ({ remote: { address: "10.0.0.1" } }));
 
@@ -54,12 +39,16 @@ vi.mock("rate-limiter-flexible", async (importOriginal) => {
 });
 
 const {
-  consumeDeviceCodeExchange,
+  authLimiter,
+  relayUpgradeIpLimiter,
+  relayUpgradeNodeLimiter,
+  consumeEnrollmentExchange,
   createRateLimiterMiddleware,
-  DEVICE_CODE_EXCHANGE_CODE_POINTS,
-  DEVICE_CODE_EXCHANGE_IP_POINTS,
-  deviceCodeExchangeCodeLimiter,
-  deviceCodeExchangeIpLimiter,
+  DEFAULTS,
+  emailRecipientLimiter,
+  enrollmentExchangeIpLimiter,
+  rpcLimiter,
+  scaledPoints,
 } = await import("./rate-limit.js");
 
 // ---------------------------------------------------------------------------
@@ -265,83 +254,101 @@ describe("createRateLimiterMiddleware resolveKey option", () => {
   });
 });
 
-describe("consumeDeviceCodeExchange (cliCredentials.exchangeDeviceCode, CI-2)", () => {
-  function limiters(ipPoints: number, codePoints: number) {
-    return {
-      ip: new RateLimiterMemory({
-        keyPrefix: `t-ip-${Math.random()}`,
-        points: ipPoints,
-        duration: 60,
-      }),
-      code: new RateLimiterMemory({
-        keyPrefix: `t-code-${Math.random()}`,
-        points: codePoints,
-        duration: 60,
-      }),
-    };
-  }
+describe("consumeEnrollmentExchange (node enrollment, lane A1)", () => {
+  const bucket = (points: number) =>
+    new RateLimiterMemory({ keyPrefix: `t-enroll-${Math.random()}`, points, duration: 60 });
 
-  it("limits one device code whatever address polls it", async () => {
-    const buckets = limiters(100, 2);
-    await expect(consumeDeviceCodeExchange("203.0.113.1", "code-a", buckets)).resolves.toEqual({
+  it("limits one key and leaves other keys their own budget", async () => {
+    const limiter = bucket(2);
+    await expect(consumeEnrollmentExchange(limiter, "203.0.113.1")).resolves.toEqual({
       allowed: true,
     });
-    await expect(consumeDeviceCodeExchange("203.0.113.2", "code-a", buckets)).resolves.toEqual({
+    await expect(consumeEnrollmentExchange(limiter, "203.0.113.1")).resolves.toEqual({
       allowed: true,
     });
-    const refused = await consumeDeviceCodeExchange("203.0.113.3", "code-a", buckets);
+    const refused = await consumeEnrollmentExchange(limiter, "203.0.113.1");
     expect(refused.allowed).toBe(false);
     if (!refused.allowed) expect(refused.retryAfterMs).toBeGreaterThan(0);
-    // Another code keeps its own budget.
-    await expect(consumeDeviceCodeExchange("203.0.113.3", "code-b", buckets)).resolves.toEqual({
+    await expect(consumeEnrollmentExchange(limiter, "203.0.113.2")).resolves.toEqual({
       allowed: true,
     });
   });
 
-  it("limits one address across made-up codes, before charging any code bucket", async () => {
-    const buckets = limiters(2, 100);
-    await consumeDeviceCodeExchange("198.51.100.7", "guess-1", buckets);
-    await consumeDeviceCodeExchange("198.51.100.7", "guess-2", buckets);
-    const refused = await consumeDeviceCodeExchange("198.51.100.7", "guess-3", buckets);
-    expect(refused.allowed).toBe(false);
-    // The refused call never reached the code bucket.
-    expect((await buckets.code.get(createHashKey("guess-3")))?.consumedPoints ?? 0).toBe(0);
-    // Another address still exchanges.
-    await expect(consumeDeviceCodeExchange("198.51.100.8", "guess-3", buckets)).resolves.toEqual({
-      allowed: true,
-    });
-  });
-
-  it("keys the code bucket by a digest, never the raw code", async () => {
-    const buckets = limiters(10, 10);
-    await consumeDeviceCodeExchange("192.0.2.1", "secret-device-code", buckets);
-    expect(await buckets.code.get("secret-device-code")).toBeNull();
-    expect((await buckets.code.get(createHashKey("secret-device-code")))?.consumedPoints).toBe(1);
+  it("keys the bucket by a digest, never the raw key", async () => {
+    const limiter = bucket(10);
+    await consumeEnrollmentExchange(limiter, "user-secretish");
+    expect(await limiter.get("user-secretish")).toBeNull();
+    expect((await limiter.get(createHashKey("user-secretish")))?.consumedPoints).toBe(1);
   });
 
   it("fails open on an unexpected limiter error", async () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const broken = {
-      ip: { points: 1, consume: vi.fn(async () => Promise.reject(new TypeError("boom"))) },
-      code: limiters(1, 1).code,
-    };
-    await expect(consumeDeviceCodeExchange("192.0.2.1", "code", broken)).resolves.toEqual({
+    const broken = { points: 1, consume: vi.fn(async () => Promise.reject(new TypeError("boom"))) };
+    await expect(consumeEnrollmentExchange(broken, "192.0.2.1")).resolves.toEqual({
       allowed: true,
     });
     errors.mockRestore();
   });
 
-  it("allows an honest 5 s poller a full minute on the default limiters", async () => {
-    expect(DEVICE_CODE_EXCHANGE_CODE_POINTS).toBeGreaterThanOrEqual(12);
-    expect(DEVICE_CODE_EXCHANGE_IP_POINTS).toBeGreaterThanOrEqual(DEVICE_CODE_EXCHANGE_CODE_POINTS);
-    const defaults = { ip: deviceCodeExchangeIpLimiter, code: deviceCodeExchangeCodeLimiter };
-    for (let poll = 0; poll < 12; poll += 1)
-      await expect(
-        consumeDeviceCodeExchange("192.0.2.50", "honest-code", defaults),
-      ).resolves.toEqual({ allowed: true });
+  it("leaves room for an installer's retries and a fleet behind one address", () => {
+    expect(DEFAULTS.enrollmentExchangeIp.points).toBeGreaterThanOrEqual(10);
+    expect(DEFAULTS.enrollmentExchangeUser.points).toBeGreaterThanOrEqual(
+      DEFAULTS.enrollmentExchangeIp.points,
+    );
   });
 });
 
-function createHashKey(deviceCode: string): string {
-  return createHash("sha256").update(deviceCode).digest("base64url");
+function createHashKey(key: string): string {
+  return createHash("sha256").update(key).digest("base64url");
 }
+
+describe("built-in limits and WMP_RATE_LIMIT_SCALE", () => {
+  beforeEach(() => {
+    envMock.WMP_RATE_LIMIT_SCALE = 1;
+  });
+
+  it("keeps the documented defaults", () => {
+    expect(DEFAULTS).toEqual({
+      rpc: { points: 100, duration: 60 },
+      auth: { points: 10, duration: 60, blockDuration: 900 },
+      signinFailure: { points: 10, duration: 900, blockDuration: 600 },
+      signup: { points: 3, duration: 3600, blockDuration: 3600 },
+      emailRecipient: { points: 3, duration: 3600, blockDuration: 0 },
+      signupRecipient: { points: 6, duration: 3600, blockDuration: 0 },
+      mcp: { points: 120, duration: 60 },
+      mcpConsent: { points: 30, duration: 60 },
+      mcpRegistration: { points: 60, duration: 3600 },
+      enrollmentExchangeIp: { points: 10, duration: 900 },
+      enrollmentExchangeUser: { points: 20, duration: 3600 },
+      inviteInfo: { points: 10, duration: 60, blockDuration: 900 },
+      relayUpgradeIp: { points: 30, duration: 60, blockDuration: 300 },
+      relayUpgradeNode: { points: 10, duration: 60, blockDuration: 300 },
+    });
+  });
+
+  it("builds every limiter from the table at scale 1", () => {
+    expect(authLimiter.points).toBe(DEFAULTS.auth.points);
+    expect(authLimiter.duration).toBe(DEFAULTS.auth.duration);
+    expect(authLimiter.blockDuration).toBe(DEFAULTS.auth.blockDuration);
+    expect(rpcLimiter.points).toBe(DEFAULTS.rpc.points);
+    expect(emailRecipientLimiter.points).toBe(DEFAULTS.emailRecipient.points);
+    expect(emailRecipientLimiter.blockDuration).toBe(0);
+    expect(enrollmentExchangeIpLimiter.points).toBe(DEFAULTS.enrollmentExchangeIp.points);
+    expect(relayUpgradeIpLimiter.points).toBe(DEFAULTS.relayUpgradeIp.points);
+    expect(relayUpgradeNodeLimiter.points).toBe(DEFAULTS.relayUpgradeNode.points);
+    expect(relayUpgradeNodeLimiter.keyPrefix).not.toBe(authLimiter.keyPrefix);
+  });
+
+  it.each([
+    [1, 3, 3],
+    [2.5, 10, 25],
+    [1.5, 3, 5],
+    [0.5, 3, 2],
+    [0.1, 3, 1],
+    [0.1, 10, 1],
+    [100, 120, 12_000],
+  ])("scale %s turns %s points into %s (rounded, never below 1)", (scale, points, expected) => {
+    envMock.WMP_RATE_LIMIT_SCALE = scale;
+    expect(scaledPoints(points)).toBe(expected);
+  });
+});

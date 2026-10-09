@@ -1,9 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import {
-  isPermanentParentDeletionFailure,
-  RetainedHistoryError,
-} from "@ws-model-proxy/db/parent-deletion";
+import { isPermanentParentDeletionFailure } from "@ws-model-proxy/db/parent-deletion";
 import { describe, expect, it } from "vitest";
 
 /** How a Prisma driver-adapter error carries a PostgreSQL failure. */
@@ -35,8 +32,8 @@ function adapterError(code: string, message: string) {
  */
 const PERMANENT_55000 = new Set([
   "% is append-only",
-  "provider_attempt is durable history",
-  "provider budget reservations cannot be deleted",
+  "node_enrollment_use is append-only",
+  "spend reservations cannot be deleted",
 ]);
 
 function hardening55000Messages(): string[] {
@@ -50,12 +47,11 @@ function hardening55000Messages(): string[] {
 }
 
 describe("isPermanentParentDeletionFailure", () => {
-  it("retries a relay execution attempt 55000 instead of archiving", () => {
+  it("retries a state-check 55000 instead of archiving", () => {
     for (const message of [
-      "terminal relay execution attempt is immutable",
-      "active relay execution ownership is immutable",
-      "relay execution attempt identity is immutable",
-      "invalid relay execution heartbeat",
+      "a reservation only settles, once",
+      "a finished node command stays finished",
+      "instance identity is immutable",
     ])
       expect(isPermanentParentDeletionFailure(adapterError("55000", message)), message).toBe(false);
   });
@@ -67,20 +63,16 @@ describe("isPermanentParentDeletionFailure", () => {
 
   it("keeps a trigger that refuses every delete permanent", () => {
     expect(
-      isPermanentParentDeletionFailure(
-        adapterError("55000", "provider_budget_rule is append-only"),
-      ),
+      isPermanentParentDeletionFailure(adapterError("55000", "usage_ledger is append-only")),
     ).toBe(true);
     expect(
-      isPermanentParentDeletionFailure(
-        adapterError("55000", "provider budget rules are immutable"),
-      ),
+      isPermanentParentDeletionFailure(adapterError("55000", "runtime versions are immutable")),
     ).toBe(false);
     // A raw query reports the SQLSTATE and message in `meta`.
     expect(
       isPermanentParentDeletionFailure({
         code: "P2010",
-        meta: { code: "55000", message: "provider_attempt is durable history" },
+        meta: { code: "55000", message: "spend reservations cannot be deleted" },
       }),
     ).toBe(true);
   });
@@ -88,13 +80,12 @@ describe("isPermanentParentDeletionFailure", () => {
   it("does not take a permanent message from a different SQLSTATE", () => {
     expect(
       isPermanentParentDeletionFailure(
-        adapterError("40001", "provider budget rules are immutable"),
+        adapterError("40001", "spend reservations cannot be deleted"),
       ),
     ).toBe(false);
   });
 
   it("keeps the other permanent failures", () => {
-    expect(isPermanentParentDeletionFailure(new RetainedHistoryError("capacity lease"))).toBe(true);
     expect(isPermanentParentDeletionFailure(adapterError("23503", "fk"))).toBe(true);
     expect(isPermanentParentDeletionFailure(adapterError("23514", "check"))).toBe(true);
     expect(isPermanentParentDeletionFailure(adapterError("40P01", "deadlock"))).toBe(false);
@@ -106,7 +97,7 @@ describe("isPermanentParentDeletionFailure", () => {
     // classifier) when it refuses every delete; otherwise it is transient.
     for (const permanent of PERMANENT_55000) expect(messages).toContain(permanent);
     for (const message of messages) {
-      const sample = message.replace("%", "provider_budget_settlement");
+      const sample = message.replace("%", "spend_settlement");
       expect(
         isPermanentParentDeletionFailure(adapterError("55000", sample)),
         `55000 "${message}"`,

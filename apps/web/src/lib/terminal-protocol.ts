@@ -3,69 +3,8 @@ const TERMINAL_FRAME_METADATA_MAX_BYTES = 64 * 1024;
 
 export type TerminalWriterLabel = "you" | "other" | "none";
 
-export type SupervisedStatus =
-  | "awaiting_user"
-  | "running"
-  | "awaiting_output_review"
-  | "exited"
-  | "declined"
-  | "expired"
-  | "cancelled"
-  | "rejected";
-
-const SUPERVISED_STATUSES: ReadonlySet<string> = new Set<SupervisedStatus>([
-  "awaiting_user",
-  "running",
-  "awaiting_output_review",
-  "exited",
-  "declined",
-  "expired",
-  "cancelled",
-  "rejected",
-]);
-
-/** A command an MCP agent asked to run in a supervised terminal. Server-asserted. */
-export type SupervisedInfo = {
-  commandId: string;
-  status: SupervisedStatus;
-  /** The MCP token name. */
-  requester: string;
-  /** Agent-written; shown as the agent's words. */
-  reason: string | null;
-  command: string;
-  cwd: string | null;
-  shareOutput: boolean;
-  createdAt: string | null;
-  expiresAt: string | null;
-  exitCode: number | null;
-  signal: string | null;
-};
-
-/**
- * `user`: a shell this person opened. `agent`: a supervised command an MCP agent requested.
- * `deployment`: an operator terminal of an interactive recipe step, waiting for this person to
- * run the step's exact command. Only `user` terminals are attached automatically.
- */
-export type TerminalOrigin = "user" | "agent" | "deployment";
-
-/** Which recipe step a deployment operator terminal runs (the relay sends no command text). */
-export type DeploymentTerminalInfo = {
-  stepId: string;
-  instanceId: string;
-  rank: number;
-  action: "prepare" | "start" | "after_join" | "stop";
-  /** `awaiting`: the confirm screen waits for Enter; `running`: the command runs. */
-  state: "awaiting" | "running";
-};
-
 export type ListedTerminal = {
   terminalId: string;
-  /** `agent`: a supervised command request. It is never attached automatically. */
-  origin: TerminalOrigin;
-  /** Present on agent terminals. */
-  supervised: SupervisedInfo | null;
-  /** Present on deployment operator terminals (the parser always sets it). */
-  deployment?: DeploymentTerminalInfo | null;
   cliDeviceId: string;
   cols: number;
   rows: number;
@@ -97,7 +36,12 @@ export type TerminalClientMessage =
       type: "open";
       /** Echoed by the `opening` answer and by any refusal of this frame. */
       requestId: string;
-      cliDeviceId: string;
+      /**
+       * One-use ticket from `nodes.terminals.openTicket` / `nodes.queued.run`. It names the node
+       * and the terminal id; the relay refuses it (`ticket_invalid`) once used, after 60 s, or
+       * from another session.
+       */
+      ticket: string;
       cols: number;
       rows: number;
       publicKey: string;
@@ -117,11 +61,6 @@ export type TerminalClientMessage =
    * once it ended the terminal, or an error.
    */
   | { type: "close"; terminalId: string; requestId: string }
-  /**
-   * Agent requests only. Never ends a command whose Enter came first.
-   * `requestId` is echoed by every direct answer to this Decline.
-   */
-  | { type: "decline"; terminalId: string; requestId: string }
   | { type: "detach"; terminalId: string };
 
 export type TerminalServerMessage =
@@ -129,7 +68,7 @@ export type TerminalServerMessage =
       type: "terminals";
       terminals: ListedTerminal[];
       clis: ListedCli[];
-      /** Sent by the relay unasked, as a full snapshot, when agent terminals change. */
+      /** Sent by the relay unasked, as a full snapshot, when the terminals change. */
       pushed?: boolean;
     }
   | { type: "opening"; terminalId: string; viewerId: string | null; requestId?: string | null }
@@ -155,15 +94,7 @@ export type TerminalServerMessage =
       terminalId: string;
       exitCode: number | null;
       signal: string | null;
-      /** An agent terminal: its command's status once the terminal ended. */
-      supervisedStatus?: SupervisedStatus | null;
     }
-  /**
-   * A Decline lost to an Enter: the command started and keeps running.
-   * `requestId` is set on the direct answer to one Decline, and null on the
-   * later event sent to every tab whose Decline was out.
-   */
-  | { type: "decline"; terminalId: string; outcome: "started"; requestId?: string | null }
   /** The relay ended this terminal for this socket's `close` (named by `requestId`). */
   | { type: "closed"; terminalId: string; requestId: string | null }
   /** `self`: this tab stopped viewing. `slow`: this tab fell behind. None: 2.4 steal. */
@@ -208,72 +139,14 @@ function readWriter(value: unknown): TerminalWriterLabel | null {
   return value === "you" || value === "other" || value === "none" ? value : null;
 }
 
-function readNullableString(record: Record<string, unknown>, key: string): string | null {
-  const value = record[key];
-  return typeof value === "string" ? value : null;
-}
-
-export function readSupervisedInfo(value: unknown): SupervisedInfo | null {
-  if (!isRecord(value)) return null;
-  const commandId = readString(value, "commandId");
-  const status = readString(value, "status");
-  const command = readNullableString(value, "command");
-  if (!commandId || !status || !SUPERVISED_STATUSES.has(status) || command === null) return null;
-  return {
-    commandId,
-    status: status as SupervisedStatus,
-    requester: readNullableString(value, "requester") ?? "",
-    reason: readString(value, "reason"),
-    command,
-    cwd: readString(value, "cwd"),
-    shareOutput: value.shareOutput === true,
-    createdAt: readString(value, "createdAt"),
-    expiresAt: readString(value, "expiresAt"),
-    exitCode:
-      typeof value.exitCode === "number" && Number.isInteger(value.exitCode)
-        ? value.exitCode
-        : null,
-    signal: readString(value, "signal"),
-  };
-}
-
-const DEPLOYMENT_ACTIONS: ReadonlySet<string> = new Set(["prepare", "start", "after_join", "stop"]);
-
-export function readDeploymentInfo(value: unknown): DeploymentTerminalInfo | null {
-  if (!isRecord(value)) return null;
-  const stepId = readString(value, "stepId");
-  const instanceId = readString(value, "instanceId");
-  const action = readString(value, "action");
-  const rank = value.rank;
-  if (!stepId || !instanceId || !action || !DEPLOYMENT_ACTIONS.has(action)) return null;
-  if (typeof rank !== "number" || !Number.isInteger(rank) || rank < 0) return null;
-  return {
-    stepId,
-    instanceId,
-    rank,
-    action: action as DeploymentTerminalInfo["action"],
-    state: value.state === "running" ? "running" : "awaiting",
-  };
-}
-
-function readOrigin(value: unknown): TerminalOrigin {
-  // An agent or deployment terminal without readable details stays one: never treat it as
-  // the user's own shell (that would auto-attach).
-  return value === "agent" || value === "deployment" ? value : "user";
-}
-
 function readListedTerminal(value: unknown): ListedTerminal | null {
   if (!isRecord(value)) return null;
   const terminalId = readString(value, "terminalId");
   const cliDeviceId = readString(value, "cliDeviceId") ?? readString(value, "id");
   if (!terminalId || !cliDeviceId) return null;
   const viewerAttached = value.viewerAttached === true;
-  const origin = readOrigin(value.origin);
   return {
     terminalId,
-    origin,
-    supervised: origin === "agent" ? readSupervisedInfo(value.supervised) : null,
-    deployment: origin === "deployment" ? readDeploymentInfo(value.deployment) : null,
     cliDeviceId,
     cols: readDimension(value.cols, 80),
     rows: readDimension(value.rows, 24),
@@ -382,21 +255,6 @@ export function parseTerminalServerMessage(value: unknown): TerminalServerMessag
         terminalId,
         exitCode: typeof value.exitCode === "number" ? value.exitCode : null,
         signal: typeof value.signal === "string" ? value.signal : null,
-        supervisedStatus:
-          typeof value.supervisedStatus === "string" &&
-          SUPERVISED_STATUSES.has(value.supervisedStatus)
-            ? (value.supervisedStatus as SupervisedStatus)
-            : null,
-      };
-    }
-    case "decline": {
-      const terminalId = readString(value, "terminalId");
-      if (!terminalId || value.outcome !== "started") return null;
-      return {
-        type: "decline",
-        terminalId,
-        outcome: "started",
-        requestId: readString(value, "requestId"),
       };
     }
     case "closed": {
@@ -424,6 +282,17 @@ export function parseTerminalServerMessage(value: unknown): TerminalServerMessag
     default:
       return null;
   }
+}
+
+/**
+ * Whether a command can be typed into a shell for a person to confirm: one line of printable
+ * ASCII. A newline would run it (or part of it) before anyone pressed Enter, and a tab or
+ * escape would drive the shell's line editor. Characters past ASCII are refused too: readline
+ * in a C locale reads their bytes as Meta keys (M-C-e is shell-expand-line) or strips the high
+ * bit, which turns 0x8A / 0x8D into LF / CR. Anything else is shown for the person to copy.
+ */
+export function typableCommand(command: string): boolean {
+  return /^[\x20-\x7e]+$/.test(command);
 }
 
 /** Clamp a terminal axis to the protocol range, or reject a non-positive value. */

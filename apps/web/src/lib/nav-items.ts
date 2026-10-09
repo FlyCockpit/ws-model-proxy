@@ -1,24 +1,47 @@
 import { isAdminRole } from "@ws-model-proxy/auth/roles";
 import type { LucideIcon } from "lucide-react";
-import { Cable, LayoutDashboard, Settings, Shield } from "lucide-react";
+import {
+  Activity,
+  Boxes,
+  Cloud,
+  Cpu,
+  KeyRound,
+  Layers,
+  LayoutDashboard,
+  ListChecks,
+  Network,
+  Server,
+  Settings,
+  Shield,
+  SquareTerminal,
+} from "lucide-react";
 
 export type NavDirection = "forward" | "back" | "none";
 type NavAudience = "public" | "authenticated" | "admin";
-type NavPlacement = "desktop" | "mobile" | "userMenu";
+/**
+ * - `sidebar`: the signed-in app sidebar (desktop) and the More sheet (mobile).
+ * - `mobile`: the BottomNav tabs (the rest goes into More).
+ * - `desktop`: the header's main nav.
+ * - `userMenu`: the account menu.
+ */
+type NavPlacement = "desktop" | "mobile" | "sidebar" | "userMenu";
+
 export type AppNavPath =
   | "/"
-  | "/dashboard"
+  | "/overview"
+  | "/models"
+  | "/pools"
+  | "/runtimes"
+  | "/profiles"
+  | "/nodes"
+  | "/providers"
+  | "/access/api-keys"
+  | "/activity"
+  | "/terminals"
   | "/settings"
   | "/admin"
-  | "/settings/security"
-  | "/settings/mcp";
-export type LangNavRoute =
-  | "/$lang"
-  | "/$lang/dashboard"
-  | "/$lang/settings"
-  | "/$lang/admin"
-  | "/$lang/settings/security"
-  | "/$lang/settings/mcp";
+  | "/settings/security";
+export type LangNavRoute = "/$lang" | `/$lang${Exclude<AppNavPath, "/">}`;
 
 export type RouteNavItem = {
   /** Path WITHOUT the `/$lang/` prefix, starts with "/". Use "/" for root. */
@@ -31,10 +54,28 @@ export type RouteNavItem = {
   exact: boolean;
 };
 
+export type AppNavId =
+  | "overview"
+  | "models"
+  | "pools"
+  | "runtimes"
+  | "profiles"
+  | "nodes"
+  | "providers"
+  | "access"
+  | "activity"
+  | "terminals"
+  | "settings"
+  | "admin";
+
 export type AppNavItem = RouteNavItem & {
-  id: "dashboard" | "settings" | "admin";
+  id: AppNavId;
   audience: NavAudience;
   placements: readonly NavPlacement[];
+  /** Sidebar group: the main sections, or the footer (terminals, settings, admin). */
+  group: "main" | "footer";
+  /** One-line hint shown under the label in the sidebar (`nav:hints.<id>`). */
+  hintKey?: string;
 };
 
 type VisibleNavInput = {
@@ -43,34 +84,41 @@ type VisibleNavInput = {
   role?: unknown;
 };
 
+function section(
+  id: AppNavId,
+  path: AppNavPath,
+  icon: LucideIcon,
+  placements: readonly NavPlacement[],
+  group: "main" | "footer" = "main",
+  audience: NavAudience = "authenticated",
+): AppNavItem {
+  return {
+    id,
+    path,
+    labelKey: `items.${id}`,
+    hintKey: `hints.${id}`,
+    icon,
+    exact: false,
+    audience,
+    placements,
+    group,
+  };
+}
+
+/** Spec §7.1: one list, in sidebar order. */
 const appNavItems: AppNavItem[] = [
-  {
-    id: "dashboard",
-    path: "/dashboard",
-    labelKey: "items.dashboard",
-    icon: LayoutDashboard,
-    exact: false,
-    audience: "authenticated",
-    placements: ["desktop", "mobile"],
-  },
-  {
-    id: "settings",
-    path: "/settings",
-    labelKey: "items.settings",
-    icon: Settings,
-    exact: false,
-    audience: "authenticated",
-    placements: ["desktop", "mobile", "userMenu"],
-  },
-  {
-    id: "admin",
-    path: "/admin",
-    labelKey: "items.admin",
-    icon: Shield,
-    exact: false,
-    audience: "admin",
-    placements: ["desktop", "mobile", "userMenu"],
-  },
+  section("overview", "/overview", LayoutDashboard, ["desktop", "mobile", "sidebar"]),
+  section("models", "/models", Boxes, ["mobile", "sidebar"]),
+  section("pools", "/pools", Network, ["mobile", "sidebar"]),
+  section("runtimes", "/runtimes", Cpu, ["mobile", "sidebar"]),
+  section("profiles", "/profiles", ListChecks, ["sidebar"]),
+  section("nodes", "/nodes", Server, ["sidebar"]),
+  section("providers", "/providers", Cloud, ["sidebar"]),
+  section("access", "/access/api-keys", KeyRound, ["sidebar"]),
+  section("activity", "/activity", Activity, ["sidebar"]),
+  section("terminals", "/terminals", SquareTerminal, ["sidebar"], "footer"),
+  section("settings", "/settings", Settings, ["desktop", "sidebar", "userMenu"], "footer"),
+  section("admin", "/admin", Shield, ["desktop", "sidebar", "userMenu"], "footer", "admin"),
 ];
 
 function canSeeNavItem(item: AppNavItem, input: Pick<VisibleNavInput, "isAuthenticated" | "role">) {
@@ -88,13 +136,13 @@ export function getNavItems(input: VisibleNavInput): AppNavItem[] {
 
 export function toLangRoute(path: AppNavPath): LangNavRoute {
   if (path === "/") return "/$lang";
-  return `/$lang${path}` as LangNavRoute;
+  return `/$lang${path}`;
 }
 
 /**
- * Settings sub-nav tabs, in left→right visual order. The array order is the
- * source of truth for `getNavDirection`'s sibling slide direction, so it MUST
- * match the order rendered in `settings.tsx`. Reuses the existing i18n keys.
+ * Settings sub-nav tabs, in left→right visual order. The array order is the source of truth
+ * for `getNavDirection`'s sibling slide direction, so it MUST match the order rendered in
+ * `settings.tsx`.
  */
 export const settingsNavItems: RouteNavItem[] = [
   {
@@ -109,13 +157,10 @@ export const settingsNavItems: RouteNavItem[] = [
     icon: Shield,
     exact: false,
   },
-  {
-    path: "/settings/mcp",
-    labelKey: "settings:navMcp",
-    icon: Cable,
-    exact: true,
-  },
 ];
+
+/** Icon for the mobile More sheet trigger. */
+export const moreNavIcon: LucideIcon = Layers;
 
 const NAV_LISTS: RouteNavItem[][] = [appNavItems, settingsNavItems];
 

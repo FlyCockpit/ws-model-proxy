@@ -15,6 +15,9 @@ const PROVIDER_PROTOCOL_BY_TYPE = {
   // Docs: openrouter.ai/docs/cookbook/coding-agents/claude-code-integration
   // and openrouter.ai/docs/api_reference/responses/overview.
   openrouter: "openai",
+  // The 0.4.0 "any compatible URL" type: OpenAI-compatible unless its model's capability
+  // inventory declares Anthropic Messages (the model API reads the inventory per model).
+  generic: "openai",
 } as const satisfies Record<string, ProviderProtocol>;
 
 export type ProviderType = keyof typeof PROVIDER_PROTOCOL_BY_TYPE;
@@ -93,6 +96,7 @@ const PROVIDER_CREDENTIAL_PROBE = {
     headers: { "anthropic-version": ANTHROPIC_DEFAULT_API_VERSION },
     verifiesCredential: false,
   },
+  generic: { path: "/v1/models", verifiesCredential: false },
 } as const satisfies Record<ProviderType, CredentialProbe>;
 
 /**

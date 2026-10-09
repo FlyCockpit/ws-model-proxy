@@ -25,7 +25,6 @@ import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
-import { DeploymentFeaturesPanel } from "@/components/deployment-features-panel";
 import { InlineRetry } from "@/components/inline-retry";
 import { orpc } from "@/utils/orpc";
 
@@ -84,9 +83,7 @@ function formatBytes(bytes: number): string {
 function AdminSettings() {
   const { session } = Route.useRouteContext();
   const queryClient = useQueryClient();
-  const appSettings = useQuery(orpc.settings.getAll.queryOptions());
-  const appConfig = useQuery(orpc.appConfig.queryOptions());
-  const deploymentFeatures = useQuery(orpc.deploymentFeatures.queryOptions());
+  const serverSettings = useQuery(orpc.adminSettings.get.queryOptions());
   const mediaStats = useQuery({
     queryKey: MEDIA_STATS_QUERY_KEY,
     queryFn: ({ signal }) => fetchMediaAdminStats(signal),
@@ -95,11 +92,10 @@ function AdminSettings() {
   const { t } = useTranslation(["admin", "common"]);
 
   const updateSetting = useMutation({
-    ...orpc.settings.update.mutationOptions({
-      onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: orpc.settings.key() });
-        queryClient.invalidateQueries({ queryKey: orpc.appConfig.queryKey() });
-        queryClient.invalidateQueries({ queryKey: orpc.deploymentFeatures.queryKey() });
+    ...orpc.adminSettings.update.mutationOptions({
+      onSuccess: (next) => {
+        queryClient.setQueryData(orpc.adminSettings.get.queryKey(), next);
+        queryClient.invalidateQueries({ queryKey: orpc.app.config.queryKey() });
       },
     }),
     meta: { errorFallbackKey: "admin:settings.updateFailed" },
@@ -112,35 +108,27 @@ function AdminSettings() {
         <p className="mt-2 text-muted-foreground">{t("admin:settings.description")}</p>
       </div>
 
-      {appSettings.isPending || appConfig.isPending || deploymentFeatures.isPending ? (
+      {serverSettings.isPending ? (
         <SettingsSkeleton />
-      ) : appSettings.isError || appConfig.isError || deploymentFeatures.isError ? (
+      ) : serverSettings.isError ? (
         <Card>
           <CardContent>
             <InlineRetry
               className="py-12"
               message={t("admin:settings.loadFailed")}
-              onRetry={() => {
-                appSettings.refetch();
-                appConfig.refetch();
-                deploymentFeatures.refetch();
-              }}
+              onRetry={() => serverSettings.refetch()}
             />
           </CardContent>
         </Card>
       ) : (
         <SecurityPolicyCard
-          force2FA={appSettings.data.force2fa === "true"}
-          signupEnabled={
-            appSettings.data.signupEnabled === undefined
-              ? appConfig.data.signupEnabled
-              : appSettings.data.signupEnabled === "true"
-          }
+          force2FA={serverSettings.data.forceTwoFactor}
+          signupEnabled={serverSettings.data.signupEnabled}
           adminHas2FA={adminHas2FA}
           isUpdating={updateSetting.isPending}
           onForce2FAToggle={(newValue) => {
             updateSetting.mutate(
-              { key: "force2fa", value: newValue },
+              { forceTwoFactor: newValue === "true" },
               {
                 onSuccess: () => {
                   toast.success(
@@ -154,7 +142,7 @@ function AdminSettings() {
           }}
           onSignupToggle={(newValue) => {
             updateSetting.mutate(
-              { key: "signupEnabled", value: newValue },
+              { signupEnabled: newValue === "true" },
               {
                 onSuccess: () => {
                   toast.success(
@@ -168,10 +156,6 @@ function AdminSettings() {
           }}
         />
       )}
-
-      {deploymentFeatures.data ? (
-        <DeploymentFeaturesPanel features={deploymentFeatures.data} />
-      ) : null}
 
       {mediaStats.isPending ? (
         <MediaPolicySkeleton />
@@ -275,7 +259,12 @@ function MediaPolicyCard({ data }: { data: MediaAdminStats }) {
   };
 
   const updateTtl = useMutation({
-    ...orpc.settings.update.mutationOptions({ onSuccess: invalidateStats }),
+    ...orpc.adminSettings.update.mutationOptions({
+      onSuccess: (next) => {
+        queryClient.setQueryData(orpc.adminSettings.get.queryKey(), next);
+        invalidateStats();
+      },
+    }),
     meta: { errorFallbackKey: "admin:settings.updateFailed" },
   });
 
@@ -320,7 +309,7 @@ function MediaPolicyCard({ data }: { data: MediaAdminStats }) {
     },
     onSubmit: ({ value }) => {
       updateTtl.mutate(
-        { key: "mediaAssetTtlHours", value: Number(value.hours) },
+        { mediaAssetTtlHours: Number(value.hours) },
         {
           onSuccess: () => toast.success(t("admin:settings.media.ttlSavedToast")),
         },
@@ -351,7 +340,7 @@ function MediaPolicyCard({ data }: { data: MediaAdminStats }) {
     },
     onSubmit: ({ value }) => {
       updateTtl.mutate(
-        { key: "mediaAttachmentMaxBytes", value: Number(value.bytes) },
+        { mediaAttachmentMaxBytes: Number(value.bytes) },
         {
           onSuccess: () => toast.success(t("admin:settings.media.attachmentLimitSavedToast")),
         },

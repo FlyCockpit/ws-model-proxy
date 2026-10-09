@@ -66,9 +66,7 @@ vi.mock("@ws-model-proxy/mailer", () => ({
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { auth } = await import("@ws-model-proxy/auth");
 const { renderInviteUser, sendEmail } = await import("@ws-model-proxy/mailer");
-const { deleteUserDurably, RetainedHistoryError } = await import(
-  "@ws-model-proxy/db/parent-deletion"
-);
+const { deleteUserDurably } = await import("@ws-model-proxy/db/parent-deletion");
 
 const db = prisma as unknown as {
   user: {
@@ -97,8 +95,10 @@ function buildContext(
     session: Partial<Session["session"]>;
   }> | null,
 ): Context {
-  if (sessionOverride === null) return { session: null };
+  if (sessionOverride === null) return { session: null, auth: { kind: "anonymous" } };
+  const userId = sessionOverride?.user?.id ?? "admin-user-id";
   return {
+    auth: { kind: "cookie_session", userId, sessionId: "test-session-id", csrfVerified: true },
     session: {
       user: {
         id: "admin-user-id",
@@ -207,7 +207,22 @@ describe("usersRouter", () => {
 
   describe("list", () => {
     it("returns users + total without a search filter", async () => {
-      db.user.findMany.mockResolvedValue([{ id: "1", email: "a@x.com", name: "A", role: "user" }]);
+      db.user.findMany.mockResolvedValue([
+        {
+          id: "1",
+          email: "a@x.com",
+          slug: "a",
+          name: "A",
+          role: "user",
+          emailVerified: true,
+          banned: null,
+          banReason: null,
+          banExpires: null,
+          deletionRequestedAt: null,
+          twoFactorEnabled: null,
+          createdAt: new Date("2026-01-01"),
+        },
+      ]);
       db.user.count.mockResolvedValue(1);
 
       const client = createRouterClient(usersRouter, { context: buildContext() });
@@ -568,22 +583,6 @@ describe("usersRouter", () => {
       const res = await client.remove({ userId: "other-user-id" });
 
       expect(res).toEqual({ success: true, pending: true });
-      expect(deletedUsers).toEqual([]);
-    });
-
-    it("maps retained history to a CONFLICT with archive guidance", async () => {
-      db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
-      vi.mocked(deleteUserDurably).mockRejectedValueOnce(
-        new RetainedHistoryError("capacity lease"),
-      );
-
-      const client = createRouterClient(usersRouter, { context: buildContext() });
-      await expect(client.remove({ userId: "other-user-id" })).rejects.toSatisfy((e: ORPCError) => {
-        expect(e.code).toBe("CONFLICT");
-        expect(e.message).toMatch(/archive/i);
-        expect(e.data).toEqual({ reason: "retained_history" });
-        return true;
-      });
       expect(deletedUsers).toEqual([]);
     });
 

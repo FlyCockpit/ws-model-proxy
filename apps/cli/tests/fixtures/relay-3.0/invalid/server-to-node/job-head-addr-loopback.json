@@ -1,0 +1,26 @@
+{
+  "type": "runtime.job",
+  "stepId": "st4m5n6b7v8c9x0z1l2k3j4h5",
+  "instanceId": "in3k4j5h6g7f8d9s0a1q2w3e4",
+  "runtimeId": "rt1q8m3k2v9x7c4b6n0z5h1j8",
+  "launchVersionId": "vr1a2b3c4d5e6f7g8h9i0j1k2",
+  "launchHash": "c0c00e47e26769d58cf675d378acbd85b35d00a73c45ecee9a9aaa3327d99668",
+  "generation": 1,
+  "rank": 1,
+  "nnodes": 2,
+  "phase": "start",
+  "handle": "i-in3k4j5h6g7f",
+  "unitName": "wsmp-i-in3k4j5h6g7f-r1",
+  "placeholders": {
+    "port": 30001,
+    "dist_port": 30002,
+    "head_addr": "127.0.0.1",
+    "gpu_ids": "0",
+    "vram_gb": "79.5",
+    "memory_fraction": "0.9"
+  },
+  "fabricId": "fab_qsfp1",
+  "timeoutMs": 1800000,
+  "ownerEpoch": "0b0c3a5e-1111-4222-8333-944445555666:7",
+  "intentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

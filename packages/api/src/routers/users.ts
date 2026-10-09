@@ -7,38 +7,17 @@ import {
   notifyUserDeleted,
   notifyUserDeletionMarked,
 } from "@ws-model-proxy/auth/user-deletion-listeners";
-import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
 import {
   type DurableUserDeletionResult,
   deleteUserDurably,
   isPermanentParentDeletionFailure,
-  RetainedHistoryError,
 } from "@ws-model-proxy/db/parent-deletion";
 import { env } from "@ws-model-proxy/env/server";
 import { renderInviteUser, sendEmail } from "@ws-model-proxy/mailer";
-import { z } from "zod";
-
-import { adminOr404Procedure } from "../index";
+import { contractProcedure } from "../contract-procedure";
+import { usersContract as c } from "../contracts/account";
 import { deletionConflict } from "../lib/deletion-conflict";
-
-// Roles surfaced in the admin UI. Better-auth itself stores `role` as a free-
-// form string (and supports comma-separated lists), but the admin dashboard
-// only ever assigns one of these two — anything else came from custom code or
-// a database edit and we leave it untouched.
-const ASSIGNABLE_ROLES = ["user", "admin"] as const;
-const assignableRoleSchema = z.enum(ASSIGNABLE_ROLES);
-const forwarderSlugSchema = z
-  .string()
-  .trim()
-  .superRefine((value, ctx) => {
-    const result = validateForwarderSlug(value);
-    if (!result.ok) {
-      ctx.addIssue({ code: "custom", message: `forwarderSlug.${result.reason}` });
-    }
-  });
-
-const userIdInput = z.object({ userId: z.string().min(1) });
 
 function generateTempPassword(): string {
   // 24 url-safe bytes → ~32 chars. Long enough to satisfy any reasonable
@@ -58,9 +37,7 @@ const USER_SELECT = {
   banExpires: true,
   deletionRequestedAt: true,
   twoFactorEnabled: true,
-  image: true,
   createdAt: true,
-  updatedAt: true,
 } as const;
 
 /** Better Auth (admin plugin) codes for an email that is already taken. */
@@ -97,202 +74,177 @@ function inviteFailureCode(err: unknown): "duplicate" | "signup_disabled" | null
 }
 
 export const usersRouter = {
-  list: adminOr404Procedure
-    .input(
-      z
-        .object({
-          limit: z.number().min(1).max(200).default(50),
-          offset: z.number().min(0).default(0),
-          search: z.string().trim().max(200).optional(),
-        })
-        .optional(),
-    )
-    .handler(async ({ input }) => {
-      const limit = input?.limit ?? 50;
-      const offset = input?.offset ?? 0;
-      const search = input?.search;
-      const where = search
-        ? {
-            OR: [
-              { email: { contains: search, mode: "insensitive" as const } },
-              { name: { contains: search, mode: "insensitive" as const } },
-            ],
-          }
-        : {};
-      const [users, total] = await Promise.all([
-        prisma.user.findMany({
-          where,
-          orderBy: { createdAt: "desc" },
-          take: limit,
-          skip: offset,
-          select: USER_SELECT,
-        }),
-        prisma.user.count({ where }),
-      ]);
-      return { users, total, limit, offset };
-    }),
-
-  invite: adminOr404Procedure
-    .input(
-      z.object({
-        email: z.string().email().toLowerCase(),
-        name: z.string().trim().min(1).max(100),
-        slug: forwarderSlugSchema.optional(),
-        role: assignableRoleSchema.default("user"),
+  list: contractProcedure(c.list).handler(async ({ input }) => {
+    const { limit, offset, search } = input;
+    const where = search
+      ? {
+          OR: [
+            { email: { contains: search, mode: "insensitive" as const } },
+            { name: { contains: search, mode: "insensitive" as const } },
+          ],
+        }
+      : {};
+    const [users, total] = await Promise.all([
+      prisma.user.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        take: limit,
+        skip: offset,
+        select: USER_SELECT,
       }),
-    )
-    .handler(async ({ input }) => {
-      const tempPassword = generateTempPassword();
-      const createUserBody = {
-        email: input.email,
-        password: tempPassword,
-        name: input.name,
-        role: input.role,
-        ...(input.slug ? { slug: input.slug } : {}),
-      };
+      prisma.user.count({ where }),
+    ]);
+    return {
+      users: users.map((user) => ({
+        ...user,
+        banExpires: user.banExpires?.toISOString() ?? null,
+        deletionRequestedAt: user.deletionRequestedAt?.toISOString() ?? null,
+        createdAt: user.createdAt.toISOString(),
+      })),
+      total,
+      limit,
+      offset,
+    };
+  }),
 
-      // `auth.api.createUser` is the only admin-plugin endpoint that accepts
-      // server-side calls without a session in headers (verified in the
-      // better-auth source). It hashes the password, enforces email
-      // uniqueness, and writes through the Prisma adapter so it stays in
-      // sync with auth database hooks.
-      let userId: string;
-      let recipientLocale: string;
-      try {
-        const created = await auth.api.createUser({
-          body: createUserBody,
+  invite: contractProcedure(c.invite).handler(async ({ input }) => {
+    const tempPassword = generateTempPassword();
+    const createUserBody = {
+      email: input.email,
+      password: tempPassword,
+      name: input.name,
+      role: input.role,
+      ...(input.slug ? { slug: input.slug } : {}),
+    };
+
+    // `auth.api.createUser` is the only admin-plugin endpoint that accepts
+    // server-side calls without a session in headers (verified in the
+    // better-auth source). It hashes the password, enforces email
+    // uniqueness, and writes through the Prisma adapter so it stays in
+    // sync with auth database hooks.
+    let userId: string;
+    let recipientLocale: string;
+    try {
+      const created = await auth.api.createUser({
+        body: createUserBody,
+      });
+      userId = created.user.id;
+      // The User row was just created with the Prisma `@default("en-US")`
+      // for `locale`. Read it back so a future change to the default (or a
+      // hook that overrides it) flows through to the email render without
+      // additional plumbing here.
+      const fresh = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { locale: true },
+      });
+      recipientLocale = fresh?.locale ?? "en-US";
+    } catch (err) {
+      const code = inviteFailureCode(err);
+      if (code === "duplicate") {
+        throw new ORPCError("CONFLICT", {
+          message: "A user with that email already exists.",
         });
-        userId = created.user.id;
-        // The User row was just created with the Prisma `@default("en-US")`
-        // for `locale`. Read it back so a future change to the default (or a
-        // hook that overrides it) flows through to the email render without
-        // additional plumbing here.
-        const fresh = await prisma.user.findUnique({
-          where: { id: userId },
-          select: { locale: true },
-        });
-        recipientLocale = fresh?.locale ?? "en-US";
-      } catch (err) {
-        const code = inviteFailureCode(err);
-        if (code === "duplicate") {
-          throw new ORPCError("CONFLICT", {
-            message: "A user with that email already exists.",
-          });
-        }
-        if (code === "signup_disabled") {
-          throw new ORPCError("BAD_REQUEST", {
-            message:
-              "Account creation is disabled by the auth configuration. Ask an admin to check the invite setup.",
-          });
-        }
-        // Log the error's constructor name ONLY. The generated temp
-        // password (and, in future better-auth releases, request context
-        // like client_secret=… strings) was just handed to
-        // auth.api.createUser — the raw message/stack must never reach
-        // the console (invariant 10; probe evidence in R35/R36).
-        const errLabel = err instanceof Error ? (err.constructor?.name ?? "Error") : typeof err;
-        console.error(`[users.invite] auth.api.createUser failed: ${errLabel}`);
-        throw new ORPCError("INTERNAL_SERVER_ERROR", {
+      }
+      if (code === "signup_disabled") {
+        throw new ORPCError("BAD_REQUEST", {
           message:
-            "Couldn't create that account. Try again, or contact an admin if it keeps happening.",
+            "Account creation is disabled by the auth configuration. Ask an admin to check the invite setup.",
         });
       }
+      // Log the error's constructor name ONLY. The generated temp
+      // password (and, in future better-auth releases, request context
+      // like client_secret=… strings) was just handed to
+      // auth.api.createUser — the raw message/stack must never reach
+      // the console (invariant 10; probe evidence in R35/R36).
+      const errLabel = err instanceof Error ? (err.constructor?.name ?? "Error") : typeof err;
+      console.error(`[users.invite] auth.api.createUser failed: ${errLabel}`);
+      throw new ORPCError("INTERNAL_SERVER_ERROR", {
+        message:
+          "Couldn't create that account. Try again, or contact an admin if it keeps happening.",
+      });
+    }
 
-      // Email send is best-effort: if SMTP is not configured (or fails) we
-      // still return the temp password to the admin so they can share it
-      // out of band. The email failure is logged but does not roll back the
-      // user creation — undoing it would race against any concurrent admin
-      // who is already looking at the new row.
-      let emailSent = false;
-      try {
-        const { subject, html } = renderInviteUser({
-          name: input.name,
-          email: input.email,
-          tempPassword,
-          signInUrl: `${env.BETTER_AUTH_URL}/login`,
-          locale: recipientLocale,
-        });
-        await sendEmail({ to: input.email, subject, html });
-        emailSent = true;
-      } catch (err) {
-        // Constructor name only — SMTP/transport rejections can embed
-        // recipient addresses and auth material in their messages.
-        const errLabel = err instanceof Error ? (err.constructor?.name ?? "Error") : typeof err;
-        console.warn(`[users.invite] failed to send invite email: ${errLabel}`);
-      }
+    // Email send is best-effort: if SMTP is not configured (or fails) we
+    // still return the temp password to the admin so they can share it
+    // out of band. The email failure is logged but does not roll back the
+    // user creation — undoing it would race against any concurrent admin
+    // who is already looking at the new row.
+    let emailSent = false;
+    try {
+      const { subject, html } = renderInviteUser({
+        name: input.name,
+        email: input.email,
+        tempPassword,
+        signInUrl: `${env.BETTER_AUTH_URL}/login`,
+        locale: recipientLocale,
+      });
+      await sendEmail({ to: input.email, subject, html });
+      emailSent = true;
+    } catch (err) {
+      // Constructor name only — SMTP/transport rejections can embed
+      // recipient addresses and auth material in their messages.
+      const errLabel = err instanceof Error ? (err.constructor?.name ?? "Error") : typeof err;
+      console.warn(`[users.invite] failed to send invite email: ${errLabel}`);
+    }
 
-      return { userId, tempPassword, emailSent };
-    }),
+    return { userId, tempPassword, emailSent };
+  }),
 
-  setRole: adminOr404Procedure
-    .input(
-      z.object({
-        userId: z.string().min(1),
-        role: assignableRoleSchema,
+  setRole: contractProcedure(c.setRole).handler(async ({ input, context }) => {
+    // Don't let an admin demote themselves — if they're the only admin
+    // they'd lock themselves (and everyone) out of /admin.
+    if (input.userId === context.session.user.id && input.role !== "admin") {
+      throw new ORPCError("FORBIDDEN", {
+        message: "You cannot remove your own admin role.",
+      });
+    }
+    const target = await prisma.user.findUnique({
+      where: { id: input.userId },
+      select: { id: true },
+    });
+    if (!target) throw new ORPCError("NOT_FOUND", { message: "User not found" });
+
+    await prisma.user.update({
+      where: { id: input.userId },
+      data: { role: input.role },
+    });
+    return { success: true as const };
+  }),
+
+  archive: contractProcedure(c.archive).handler(async ({ input, context }) => {
+    if (input.userId === context.session.user.id) {
+      throw new ORPCError("FORBIDDEN", {
+        message: "You cannot archive your own account.",
+      });
+    }
+    const target = await prisma.user.findUnique({
+      where: { id: input.userId },
+      select: { id: true },
+    });
+    if (!target) throw new ORPCError("NOT_FOUND", { message: "User not found" });
+
+    // Set banned=true so better-auth treats the user as locked, and revoke
+    // every active session so the next page-load signs them out. We mirror
+    // what the admin plugin's banUser endpoint does internally — no expiry
+    // (banExpires=null), no auto-unban.
+    await prisma.$transaction([
+      prisma.user.update({
+        where: { id: input.userId },
+        data: {
+          banned: true,
+          banReason: input.reason ?? null,
+          banExpires: null,
+        },
       }),
-    )
-    .handler(async ({ input, context }) => {
-      // Don't let an admin demote themselves — if they're the only admin
-      // they'd lock themselves (and everyone) out of /admin.
-      if (input.userId === context.session.user.id && input.role !== "admin") {
-        throw new ORPCError("FORBIDDEN", {
-          message: "You cannot remove your own admin role.",
-        });
-      }
-      const target = await prisma.user.findUnique({
-        where: { id: input.userId },
-        select: { id: true },
-      });
-      if (!target) throw new ORPCError("NOT_FOUND", { message: "User not found" });
+      prisma.session.deleteMany({ where: { userId: input.userId } }),
+    ]);
+    // Post-commit: end the user's in-flight relay file ops and commands
+    // (#159). A listener failure is logged, never thrown: the ban stands.
+    await notifyUserBanned(input.userId);
+    return { success: true as const };
+  }),
 
-      await prisma.user.update({
-        where: { id: input.userId },
-        data: { role: input.role },
-      });
-      return { success: true };
-    }),
-
-  archive: adminOr404Procedure
-    .input(
-      z.object({
-        userId: z.string().min(1),
-        reason: z.string().trim().max(500).optional(),
-      }),
-    )
-    .handler(async ({ input, context }) => {
-      if (input.userId === context.session.user.id) {
-        throw new ORPCError("FORBIDDEN", {
-          message: "You cannot archive your own account.",
-        });
-      }
-      const target = await prisma.user.findUnique({
-        where: { id: input.userId },
-        select: { id: true },
-      });
-      if (!target) throw new ORPCError("NOT_FOUND", { message: "User not found" });
-
-      // Set banned=true so better-auth treats the user as locked, and revoke
-      // every active session so the next page-load signs them out. We mirror
-      // what the admin plugin's banUser endpoint does internally — no expiry
-      // (banExpires=null), no auto-unban.
-      await prisma.$transaction([
-        prisma.user.update({
-          where: { id: input.userId },
-          data: {
-            banned: true,
-            banReason: input.reason ?? null,
-            banExpires: null,
-          },
-        }),
-        prisma.session.deleteMany({ where: { userId: input.userId } }),
-      ]);
-      // Post-commit: end the user's in-flight relay file ops and commands
-      // (#159). A listener failure is logged, never thrown: the ban stands.
-      await notifyUserBanned(input.userId);
-      return { success: true };
-    }),
-
-  unarchive: adminOr404Procedure.input(userIdInput).handler(async ({ input }) => {
+  unarchive: contractProcedure(c.unarchive).handler(async ({ input }) => {
     // One conditional statement, so a deletion marked between a read and the
     // write cannot be un-banned: the write only matches an unmarked row.
     // (Access is refused on the marker alone anyway; see
@@ -301,7 +253,7 @@ export const usersRouter = {
       where: { id: input.userId, deletionRequestedAt: null },
       data: { banned: false, banReason: null, banExpires: null },
     });
-    if (restored.count === 1) return { success: true };
+    if (restored.count === 1) return { success: true as const };
     const target = await prisma.user.findUnique({
       where: { id: input.userId },
       select: { id: true },
@@ -313,7 +265,7 @@ export const usersRouter = {
     );
   }),
 
-  remove: adminOr404Procedure.input(userIdInput).handler(async ({ input, context }) => {
+  remove: contractProcedure(c.remove).handler(async ({ input, context }) => {
     if (input.userId === context.session.user.id) {
       throw new ORPCError("FORBIDDEN", {
         message: "You cannot delete your own account.",
@@ -325,20 +277,13 @@ export const usersRouter = {
     });
     if (!target) throw new ORPCError("NOT_FOUND", { message: "User not found" });
 
-    // Sessions, accounts, two-factors, api keys, device codes and push subs
-    // cascade, and so do the user's CLI devices and CLI credentials. Retained
-    // provider accounting (OWNER_RETAINED_HISTORY_TABLES) is refused up front
-    // with a friendly message suggesting "archive" instead.
-    //
-    // The delete is durable and bounded (packages/db/src/parent-deletion.ts):
-    // a preflight refuses retained history before anything changes, then the
-    // user is marked for deletion (and banned, sessions revoked), the request
-    // history is drained in short batches, and only the graph is deleted,
-    // under the owner fences of every user it writes (DL-1 writer class M).
-    // Hot-path history left behind (no foreign key reaches it) is removed by
-    // the deleted-user purge. If the last step fails transiently the marker
-    // stays and the user-deletion sweeper finishes it, so the response
-    // reports `pending`.
+    // The delete is durable and bounded (packages/db/src/parent-deletion.ts): the user is
+    // marked for deletion (banned, sessions revoked), their history is drained in short
+    // batches, and the graph is deleted in the fixed order (instances, profiles, runtimes,
+    // nodes, pools, providers) under the owner fences of every user it writes (DL-1 writer
+    // class M). Hot-path history left behind is removed by the deleted-user purge. If the
+    // last step fails transiently the marker stays and the user-deletion sweeper finishes
+    // it, so the response reports `pending`. A permanent database refusal archives the user.
     const label = (err: unknown) =>
       // Constructor name only — Prisma rejections embed SQL + params.
       err instanceof Error ? (err.constructor?.name ?? "Error") : typeof err;
@@ -356,10 +301,10 @@ export const usersRouter = {
       // (RETAINED_HISTORY, P2003, P2014, 23503, 23514), and for 55000 by the
       // hardening trigger's message: a permanent refusal only when it matches
       // one (see `isPermanentParentDeletionFailure`), otherwise transient.
-      if (err instanceof RetainedHistoryError || isPermanentParentDeletionFailure(err)) {
+      if (isPermanentParentDeletionFailure(err)) {
         throw deletionConflict(
           "retained_history",
-          "This user has retained history and cannot be deleted. Archive them instead, or reassign their content first.",
+          "This account could not be deleted and was archived instead. Contact support if it keeps happening.",
         );
       }
       console.error(`[users.remove] prisma delete failed: ${label(err)}`);
@@ -369,12 +314,12 @@ export const usersRouter = {
       });
     }
     if (result === "missing") throw new ORPCError("NOT_FOUND", { message: "User not found" });
-    if (result === "pending") return { success: true, pending: true };
+    if (result === "pending") return { success: true as const, pending: true };
     if (result === "abandoned") {
       // A permanent refusal archived the user before this call finished.
       throw deletionConflict(
         "retained_history",
-        "This user has retained history and cannot be deleted. Archive them instead, or reassign their content first.",
+        "This account could not be deleted and was archived instead. Contact support if it keeps happening.",
       );
     }
     // Close the deleted user's live relay sessions, matched by the
@@ -383,6 +328,6 @@ export const usersRouter = {
     // notification Better Auth's admin remove-user fires; in-process only
     // (see @ws-model-proxy/auth/user-deletion-listeners).
     await notifyUserDeleted(input.userId);
-    return { success: true, pending: false };
+    return { success: true as const, pending: false };
   }),
 };

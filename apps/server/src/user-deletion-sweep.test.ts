@@ -1,7 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { RetainedHistoryError } from "@ws-model-proxy/db/parent-deletion";
 import { armDbShutdownFence, disarmDbShutdownFence } from "@ws-model-proxy/db/shutdown-fence";
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import { mockDeep } from "vitest-mock-extended";
@@ -218,7 +217,7 @@ describe("sweepPendingUserDeletions", () => {
   it("abandons the marker (the user stays archived) on a permanent refusal", async () => {
     db.user.findMany.mockResolvedValue([row("retained")]);
     const complete = vi.fn(async () => {
-      throw new RetainedHistoryError("capacity lease");
+      throw Object.assign(new Error("foreign key"), { code: "23503" });
     });
     const notify = vi.fn(async () => undefined);
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -285,7 +284,7 @@ describe("sweepPendingUserDeletions", () => {
     db.user.findMany.mockResolvedValue([row("replaced")]);
     db.$executeRaw.mockResolvedValue(0);
     const complete = vi.fn(async () => {
-      throw new RetainedHistoryError("capacity lease");
+      throw Object.assign(new Error("foreign key"), { code: "23503" });
     });
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
     await expect(sweepPendingUserDeletions({ prisma, now: NOW, complete })).resolves.toEqual({
@@ -360,7 +359,7 @@ describe("sweepPendingUserDeletions", () => {
     db.user.findMany.mockResolvedValue([row("refused"), row("next")]);
     db.$executeRaw.mockRejectedValueOnce(Object.assign(new Error("timeout"), { code: "57014" }));
     const complete = vi.fn(async (_db: unknown, userId: string) => {
-      if (userId === "refused") throw new RetainedHistoryError("provider accounting");
+      if (userId === "refused") throw Object.assign(new Error("foreign key"), { code: "23503" });
       return true;
     });
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -386,7 +385,7 @@ describe("sweepPendingUserDeletions", () => {
       () =>
         Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }),
     ],
-    ["a permanent refusal", () => new RetainedHistoryError("provider accounting")],
+    ["a permanent refusal", () => Object.assign(new Error("foreign key"), { code: "23503" })],
   ])(
     "a completion failure after the fence armed (%s) stops the tick without a recovery write",
     async (_label, failure) => {

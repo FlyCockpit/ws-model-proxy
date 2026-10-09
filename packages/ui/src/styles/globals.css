@@ -264,18 +264,28 @@
     @apply border-border outline-ring/50;
     -webkit-tap-highlight-color: transparent;
   }
+  /* The document never scrolls: the app shell (h-svh) owns the page and its
+     <main> is the only page scroller. html/body are pinned to the viewport and
+     body clips (`clip`, not `hidden`, so it is not a scroll container that
+     focus/scrollIntoView could move). body is `relative` so absolutely
+     positioned content that escapes every in-shell containing block (an
+     sr-only label, a Base UI popup portaled to body) is clipped by it instead
+     of resolving against the viewport and stretching the document, which
+     would add a second, window-level scrollbar. */
   html {
     @apply font-sans;
+    height: 100%;
     overscroll-behavior: none;
-    /* Defense-in-depth backstop: never let a child produce page-level
-       horizontal scroll. `clip` (not `hidden`) so it doesn't create a scroll
-       container that would break position: sticky / scroll anchoring. */
+    /* Also never page-level horizontal scroll. Keeping html non-visible stops
+       body's overflow from propagating to the viewport. */
     overflow-x: clip;
   }
   body {
     @apply font-sans bg-background text-foreground;
+    position: relative;
+    height: 100%;
     overscroll-behavior: none;
-    overflow-x: clip;
+    overflow: clip;
   }
   button,
   a,

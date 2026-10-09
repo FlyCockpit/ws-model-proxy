@@ -57,12 +57,11 @@ export const SIGNUP_RECIPIENT_PATH = "/api/auth/sign-up/email";
  * account exists or is already verified.
  */
 /**
- * The middleware needs only these two members, so it asks for only these two —
- * both `emailRecipientLimiter` and `signupRecipientLimiter` satisfy it, and a
- * test can supply a plain object without casting through `unknown`.
+ * The middleware needs only `consume`, so it asks for only that — both
+ * `emailRecipientLimiter` and `signupRecipientLimiter` satisfy it, and a test
+ * can supply a plain object without casting through `unknown`.
  */
 type RecipientLimiter = {
-  readonly points: number;
   consume(key: string): Promise<unknown>;
 };
 
@@ -89,9 +88,6 @@ export function emailRecipientLimit(
   allowedMediaTypes: readonly string[] = JSON_ONLY,
 ) {
   return async (c: Context, next: Next) => {
-    // Disabled → no work at all.
-    if (limiter.points <= 0) return next();
-
     // No body at all: better-call returns early before it ever looks at the
     // media type, so Better-Auth answers with its own 400 validation error.
     // Mirror that — a bodyless POST names no recipient and must not 415.

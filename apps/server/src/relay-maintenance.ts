@@ -4,13 +4,16 @@
  *
  * - every 15 s: stale relay sessions (`checkStaleSessions`) and expired
  *   pending terminals (`sweepExpiredPendingTerminals`);
- * - every 60 s: expired token-scoped CLI commands (`sweepExpiredTokenCommands`);
+ * - every 60 s: expired token-scoped node commands (`sweepExpiredNodeCommands`) and file
+ *   ops (`sweepExpiredFileOps`);
  * - every 60 s: browser terminal session rechecks (`recheckSessions`) and
  *   live transcription session rechecks (credential, model, member).
  *
- * - on stop: the agent audit queue is flushed (`stopCliAgentAuditWriter`), so
+ * - on stop: the node audit queue is flushed (`stopNodeAuditWriter`), so
  *   events recorded so far reach the database before the relay sessions close
  *   and the database fence arms; later events flush without the batching delay.
+ *   The telemetry rollups (`runtime_load_minute`, `node_metrics_minute`) are
+ *   flushed too, best effort.
  *
  * Each tick logs a failure by error class only (L19) and never throws, so one
  * failing sweep does not stop the others. Returns one stop for all timers: it
@@ -22,7 +25,7 @@
  */
 
 export const RELAY_STALE_SESSION_SWEEP_INTERVAL_MS = 15_000;
-export const CLI_COMMAND_SWEEP_INTERVAL_MS = 60_000;
+export const NODE_COMMAND_SWEEP_INTERVAL_MS = 60_000;
 export const TERMINAL_SESSION_RECHECK_INTERVAL_MS = 60_000;
 
 export type RelayMaintenanceDeps = {
@@ -30,14 +33,19 @@ export type RelayMaintenanceDeps = {
     checkStaleSessions(): Promise<unknown>;
     sweepExpiredPendingTerminals(): void;
   };
-  sweepExpiredTokenCommands: () => void;
+  sweepExpiredNodeCommands: () => void;
+  /** Expired tokens end their in-flight file ops (./relay/node-file-ops.ts). */
+  sweepExpiredFileOps?: () => void;
   terminalHub: { recheckSessions(): Promise<unknown> };
   /** Live transcription sessions: credential, model access and member (60 s). */
   realtimeSessions?: { recheckSessions(): Promise<unknown> };
-  /** Flushes the agent audit queue at stop (see ./relay/cli-agent-audit.ts). */
-  stopCliAgentAudit?: () => Promise<void>;
-  /** Flushes the deployment operator audit queue at stop (../deployments/operator-audit.ts). */
-  stopDeploymentOperatorAudit?: () => Promise<void>;
+  /** Flushes the node audit queue at stop (see ./relay/node-audit.ts). */
+  stopNodeAudit?: () => Promise<void>;
+  /**
+   * Flushes the telemetry rollups at stop (./relay/runtime-load-rollup.ts,
+   * ./relay/node-metrics-rollup.ts). Best effort: a rollup is a disposable aggregate.
+   */
+  flushRollups?: Array<() => Promise<unknown>>;
 };
 
 function errorClass(error: unknown): string {
@@ -82,11 +90,16 @@ export function startRelayMaintenance(deps: RelayMaintenanceDeps): () => Promise
     }, RELAY_STALE_SESSION_SWEEP_INTERVAL_MS),
     schedule(() => {
       try {
-        deps.sweepExpiredTokenCommands();
+        deps.sweepExpiredNodeCommands();
       } catch (error) {
-        console.error("[server] CLI command sweep failed", errorClass(error));
+        console.error("[server] node command sweep failed", errorClass(error));
       }
-    }, CLI_COMMAND_SWEEP_INTERVAL_MS),
+      try {
+        deps.sweepExpiredFileOps?.();
+      } catch (error) {
+        console.error("[server] file op sweep failed", errorClass(error));
+      }
+    }, NODE_COMMAND_SWEEP_INTERVAL_MS),
     schedule(() => {
       track(() => deps.terminalHub.recheckSessions(), "[server] terminal session recheck failed");
       const realtime = deps.realtimeSessions;
@@ -98,18 +111,18 @@ export function startRelayMaintenance(deps: RelayMaintenanceDeps): () => Promise
   return async () => {
     for (const timer of timers) clearInterval(timer);
     await Promise.all([...inFlight]);
-    if (deps.stopCliAgentAudit !== undefined) {
+    if (deps.stopNodeAudit !== undefined) {
       try {
-        await deps.stopCliAgentAudit();
+        await deps.stopNodeAudit();
       } catch (error) {
-        console.error("[server] agent audit flush failed", errorClass(error));
+        console.error("[server] node audit flush failed", errorClass(error));
       }
     }
-    if (deps.stopDeploymentOperatorAudit !== undefined) {
+    for (const flush of deps.flushRollups ?? []) {
       try {
-        await deps.stopDeploymentOperatorAudit();
+        await flush();
       } catch (error) {
-        console.error("[server] operator audit flush failed", errorClass(error));
+        console.error("[server] rollup flush failed", errorClass(error));
       }
     }
   };

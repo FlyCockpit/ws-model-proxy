@@ -1,0 +1,5 @@
+{
+  "type": "context.count.error",
+  "requestId": "req-3",
+  "failure": "timeout"
+}

@@ -4,7 +4,6 @@ import {
   effectiveMediaAttachmentMaxBytes,
   getConfiguredMediaAttachmentMaxBytes,
 } from "@ws-model-proxy/api/lib/media-attachment-limits";
-import type { ModelApiTokenIdentity } from "@ws-model-proxy/api/lib/model-api-token-access";
 import defaultPrisma from "@ws-model-proxy/db";
 import type { Context } from "hono";
 import { getMediaConfig, type MediaConfig } from "../media/config.js";
@@ -19,6 +18,7 @@ import {
 } from "../media/store.js";
 import { getMediaAssetTtlHours } from "../media/ttl.js";
 import { openAiErrorBody, openAiFailureJsonResponse } from "./openai-errors.js";
+import type { ApiKeyIdentity } from "./resolve.js";
 import { authenticateRequest } from "./routes.js";
 
 // ===========================================================================
@@ -36,7 +36,7 @@ type MediaPrisma = Pick<typeof defaultPrisma, "appSetting" | "mediaAsset">;
 
 /** Dependency seam so tests can inject auth, a temp-dir store, mock prisma, and clock. */
 export interface ModelApiFilesDeps {
-  authenticate?: (request: Request) => Promise<ModelApiTokenIdentity | null>;
+  authenticate?: (request: Request) => Promise<ApiKeyIdentity | null>;
   getConfig?: () => MediaConfig | null;
   makeStore?: (config: MediaConfig) => MediaStore;
   prisma?: MediaPrisma;
@@ -172,7 +172,7 @@ export function createModelApiFileUploadHandler(deps: ModelApiFilesDeps = {}) {
   return async (c: Context): Promise<Response> => {
     const token = await authenticate(c.req.raw);
     if (!token) {
-      return openAiFailureJsonResponse("access_denied", "Missing or invalid model API token.");
+      return openAiFailureJsonResponse("access_denied", "Missing or invalid API key.");
     }
 
     const config = getConfig();
@@ -275,7 +275,7 @@ export function createModelApiFileGetHandler(deps: ModelApiFilesDeps = {}) {
   return async (c: Context): Promise<Response> => {
     const token = await authenticate(c.req.raw);
     if (!token) {
-      return openAiFailureJsonResponse("access_denied", "Missing or invalid model API token.");
+      return openAiFailureJsonResponse("access_denied", "Missing or invalid API key.");
     }
 
     const id = c.req.param("id");

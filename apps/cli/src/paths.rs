@@ -41,6 +41,6 @@ pub fn state_dir() -> Result<PathBuf> {
     Ok(home.join(".local").join("state").join(APP))
 }
 
-pub fn device_credential_file() -> Result<PathBuf> {
-    Ok(state_dir()?.join("device-auth.json"))
+pub fn node_credential_file() -> Result<PathBuf> {
+    Ok(state_dir()?.join("node-credential.json"))
 }

@@ -6,7 +6,7 @@ export const Route = createFileRoute("/$lang/")({
     const resolution = await getRouteSession();
     if (resolution.status === "error") throw new Error("Route session unavailable");
     throw redirect({
-      to: resolution.session ? "/$lang/dashboard" : "/$lang/login",
+      to: resolution.session ? "/$lang/overview" : "/$lang/login",
       params: { lang: params.lang },
     });
   },

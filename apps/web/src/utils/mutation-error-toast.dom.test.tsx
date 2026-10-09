@@ -65,20 +65,8 @@ afterEach(() => {
 describe("app mutation error toast for deletes", () => {
   const cases: Array<[string, DeletionEntity, string]> = [
     ["retained_history", "user", "errors:deletionConflict.retainedHistory.user"],
-    ["retained_history", "cliDevice", "errors:deletionConflict.retainedHistory.cliDevice"],
-    ["retained_history", "endpoint", "errors:deletionConflict.retainedHistory.endpoint"],
-    [
-      "retained_history",
-      "discoveredModel",
-      "errors:deletionConflict.retainedHistory.discoveredModel",
-    ],
-    ["retained_history", "pool", "errors:deletionConflict.retainedHistory.pool"],
-    ["retained_history", "poolMember", "errors:deletionConflict.retainedHistory.poolMember"],
-    ["retained_history", "capacity", "errors:deletionConflict.retainedHistory.capacity"],
-    ["delete_pending", "pool", "errors:deletionConflict.deletePending"],
-    ["delete_contended", "endpoint", "errors:deletionConflict.deleteContended"],
-    ["still_attached", "capacity", "errors:deletionConflict.stillAttached"],
-    ["not_stale", "cliDevice", "errors:deletionConflict.notStale"],
+    ["delete_pending", "user", "errors:deletionConflict.deletePending"],
+    ["delete_contended", "user", "errors:deletionConflict.deleteContended"],
     ["deletion_in_progress", "user", "errors:deletionConflict.deletionInProgress"],
   ];
 
@@ -91,7 +79,7 @@ describe("app mutation error toast for deletes", () => {
   }
 
   it("keeps the generic conflict copy for a CONFLICT without a known reason", async () => {
-    renderDelete(conflict(), "pool");
+    renderDelete(conflict(), "user");
     await waitFor(() => expect(toast.error).toHaveBeenCalledWith(enErrors.friendly.conflict));
   });
 
@@ -101,7 +89,7 @@ describe("app mutation error toast for deletes", () => {
   });
 
   it("uses the context fallback for other failures", async () => {
-    renderDelete({ status: 500, code: "INTERNAL_SERVER_ERROR" }, "pool");
+    renderDelete({ status: 500, code: "INTERNAL_SERVER_ERROR" }, "user");
     await waitFor(() => expect(toast.error).toHaveBeenCalledWith("t(test:deleteFailed)"));
   });
 });

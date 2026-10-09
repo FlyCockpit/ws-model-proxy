@@ -1,10 +1,20 @@
 {
   "items": {
+    "overview": "Resumen",
+    "models": "Modelos",
+    "pools": "Pools",
+    "runtimes": "Runtimes",
+    "profiles": "Perfiles",
+    "nodes": "Nodos",
+    "providers": "Proveedores",
+    "access": "Acceso",
+    "activity": "Actividad",
+    "terminals": "Terminales",
+    "settings": "Ajustes",
+    "admin": "Administración",
+    "more": "Más",
     "about": "Acerca de",
-    "cookiePolicy": "Política de cookies",
-    "dashboard": "Panel de control",
-    "settings": "Configuración",
-    "admin": "Administración"
+    "cookiePolicy": "Política de cookies"
   },
   "languageLabel": "Idioma",
   "mainNav": {
@@ -22,5 +32,23 @@
     "signIn": "Iniciar sesión",
     "signOut": "Cerrar sesión",
     "signUp": "Registrarse"
+  },
+  "hints": {
+    "overview": "Qué pasa y qué te necesita",
+    "models": "IDs invocables y cómo llamarlos",
+    "pools": "Distribuye solicitudes entre tus runtimes",
+    "runtimes": "Servidores de inferencia en tus nodos",
+    "profiles": "Qué corre dónde, en un paso",
+    "nodes": "Tus computadoras con wsmp",
+    "providers": "Cuentas en la nube y gasto",
+    "access": "Claves de API, agentes y compartir",
+    "activity": "Métricas y registro de solicitudes",
+    "terminals": "Terminales y comandos en cola",
+    "settings": "Tu cuenta",
+    "admin": "Administración del servidor"
+  },
+  "needsYou": {
+    "badge_one": "{{count}} cosa te necesita",
+    "badge_other": "{{count}} cosas te necesitan"
   }
 }

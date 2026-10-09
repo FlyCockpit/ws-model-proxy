@@ -1,26 +1,41 @@
-import { createHash } from "node:crypto";
+/**
+ * Cloud spend admission and accounting (monthly spend caps, spec §2.7 / §3.13), writer class H.
+ *
+ * A cloud attempt is an `attempt` row of kind CLOUD (the anchor: identity, fence and liability
+ * snapshot). Before any provider I/O, admission reserves the attempt's liability against every
+ * cap that applies (the provider account's cap and, for owner-paid share traffic, the share's)
+ * and refuses it when this month's settled spend plus what is reserved now plus this liability
+ * would exceed a cap. After the attempt, reconciliation appends a `usage_ledger` revision,
+ * settles the reservations (`spend_settlement`, reservation RESERVED → SETTLED) and ends the
+ * attempt, in one transaction. An attempt that was never sent settles at zero (the release); one
+ * whose real cost is unknown keeps its liability. The repair sweep settles crashed attempts at
+ * their liability. Every accounting error fails closed: admission throws (the dispatcher skips
+ * the member, nothing is sent), so money is never spent without a reservation.
+ *
+ * Locks (packages/db/src/capacity-lock-order.ts, writer class H): admission takes the
+ * `spend-attempt` fence, then the cap-subject fences (`spend-account`, and `spend-share` for
+ * owner-paid share traffic) whether or not a cap exists, before any row lock or write. Every
+ * admission on a subject therefore runs after the previous one committed, and its consumption
+ * read sees that attempt. A cap edit committing concurrently linearizes before or after the
+ * admission. Reconciliation takes the `spend-attempt` fence, then the attempt row FOR UPDATE
+ * (the heartbeat's renewal takes the same row); repair settles through it, or, for an attempt
+ * that already has a ledger revision, only ends its state under the same fence. Provider account and model rows are
+ * read without a lock, and the rows written here (attempt, reservations, settlements, ledger)
+ * are hot-path rows with no foreign key into the graph. Consumption is read in one statement
+ * (@ws-model-proxy/db/spend), so a settlement committing concurrently is counted either as
+ * reserved or as settled, never as neither.
+ *
+ * Known limit: an attempt admitted without a price (an uncapped account with no active
+ * pricing) carries no liability; if a cap is set while it is in flight, its unknown cost is not
+ * reserved against that cap (a provider-reported cost still lands in the ledger).
+ */
+import { createHash, randomUUID } from "node:crypto";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { runWithDbShutdownPermit } from "@ws-model-proxy/db/shutdown-fence";
-import {
-  type BudgetPeriod,
-  budgetWindow,
-  type ProviderTokenUsage,
-  providerBillableTokens,
-} from "./provider-budget-accounting.js";
+import { providerAccountSpend, shareSpend } from "@ws-model-proxy/db/spend";
+import { type ProviderTokenUsage, providerBillableTokens } from "./provider-budget-accounting.js";
 
-const RETRYABLE_TRANSACTION_CODES = new Set(["P2034", "40001", "40P01"]);
-const MAX_TRANSACTION_ATTEMPTS = 5;
-
-let terminalPersistenceTestFailure: (() => unknown) | undefined;
-
-export function setTerminalPersistenceTestFailureInjector(injector: (() => unknown) | undefined) {
-  if (process.env.NODE_ENV !== "test")
-    throw new Error("Terminal persistence failure injection is test-only");
-  terminalPersistenceTestFailure = injector;
-}
-
-export type BudgetMetric = "CONCURRENCY" | "TOKENS" | "SPEND";
 export type UsageConfidence = "REPORTED" | "CALCULATED" | "ESTIMATED";
 
 export interface ProviderLiability {
@@ -35,18 +50,25 @@ export interface ProviderLiability {
 }
 
 export interface ProviderBudgetAttempt {
+  /** The payer: the pool owner, or the share holder for own-key traffic. */
   userId: string;
   providerAccountId: string;
   providerModelId: string;
   credentialId?: string;
   poolId?: string;
-  /** Exact live grant for owner-paid grantee traffic; never own-key or owner. */
-  poolGrantId?: string;
-  /** Grantee identity for the live grant; spend is summed by pool + grantee. */
+  poolMemberId?: string;
+  /** The provider model's execution target. */
+  targetId?: string;
+  /** The share owner-paid grantee traffic runs under (its cap applies); never own-key or owner. */
+  shareId?: string;
+  /** The share's grantee (diagnostic; caps key on the share). */
   granteeUserId?: string;
+  /** The relay request the attempt serves (`relay_request.id`). */
   requestId: string;
   attemptId: string;
   fencingToken: bigint;
+  /** The caller's surface (attempt telemetry). */
+  requestedSurface?: string;
   liability: ProviderLiability;
   expiresAt: Date;
 }
@@ -64,8 +86,8 @@ export type ProviderBudgetAdmission =
         | "CURRENCY_UNAVAILABLE"
         | "PRICING_UNAVAILABLE"
         | "TOKEN_BOUND_UNAVAILABLE";
-      policyId?: string;
-      ruleId?: string;
+      /** The cap that refused (internal; never shown to a grantee). */
+      capId?: string;
     };
 
 export interface RawProviderUsage extends ProviderTokenUsage {
@@ -107,9 +129,9 @@ export interface ProviderBudgetTerminal {
   reason: "COMPLETED" | "FAILED" | "CANCELLED" | "TIMEOUT" | "CRASH_RECOVERY";
   /** Explicit proof that provider I/O never began. Omission conservatively assumes it may have. */
   dispatchOutcome?: "NOT_SENT";
-  /** Stable upstream usage revision identity. Duplicate delivery is idempotent. */
+  /** Stable upstream usage revision identity. */
   sourceVersion?: string;
-  /** Provider-scoped, strictly increasing sequence for this attempt. */
+  /** Strictly increasing per attempt fence; a duplicate delivery is idempotent. */
   revisionSequence: bigint;
   /** SNAPSHOT replaces the known total; DELTA adds newly reported usage. */
   revisionKind: "SNAPSHOT" | "DELTA";
@@ -117,19 +139,32 @@ export interface ProviderBudgetTerminal {
   /** Whether the provider transport reached its terminal response boundary. */
   observationComplete?: boolean;
   usage?: RawProviderUsage;
-  /** Internal crash-sweeper cutoff, rechecked under the attempt advisory lock. */
+  /** Internal crash-sweeper cutoff, rechecked under the attempt fence. */
   crashExpiredAt?: Date;
 }
 
 export class ProviderBudgetConfigurationError extends Error {}
 
+/** Cloud attempts are fenced by their token; the epoch only names the admitting process. */
+export const PROVIDER_ATTEMPT_OWNER_EPOCH = `cloud:${randomUUID()}`;
+
+const RETRYABLE_TRANSACTION_CODES = new Set(["P2034", "40001", "40P01"]);
+const MAX_TRANSACTION_ATTEMPTS = 5;
+const MAX_SIGNED_BIGINT = 9_223_372_036_854_775_807n;
+const REPAIR_BATCH = 500;
+const REPAIR_MAX_PER_RUN = 5_000;
+
 function decimal(value: string | number | Prisma.Decimal): Prisma.Decimal {
-  const result = new Prisma.Decimal(value);
-  if (!result.isFinite() || result.isNegative()) throw new ProviderBudgetConfigurationError();
+  let result: Prisma.Decimal;
+  try {
+    result = new Prisma.Decimal(value);
+  } catch {
+    throw new ProviderBudgetConfigurationError("Invalid amount");
+  }
+  if (!result.isFinite() || result.isNegative())
+    throw new ProviderBudgetConfigurationError("Invalid amount");
   return result;
 }
-
-const MAX_SIGNED_BIGINT = 9_223_372_036_854_775_807n;
 
 function normalizedVersion(value: string | undefined, label: string): string {
   const normalized = value?.trim();
@@ -149,7 +184,7 @@ function validToken(value: bigint | undefined): boolean {
   return value === undefined || (value >= 0n && value <= MAX_SIGNED_BIGINT);
 }
 
-function assertUsage(usage: RawProviderUsage | undefined): void {
+export function assertUsage(usage: RawProviderUsage | undefined): void {
   if (!usage) return;
   const tokens = [
     usage.inputTokens,
@@ -190,10 +225,9 @@ function canonicalPayloadHash(value: unknown): string {
     if (Array.isArray(input)) return input.map(normalize);
     if (input && typeof input === "object")
       return Object.fromEntries(
-        Object.entries(input as Record<string, unknown>)
+        Object.entries(input)
           .filter(([, item]) => item !== undefined)
-          // JSON object keys are UTF-16 strings. Compare code units directly so
-          // revision identity cannot vary with a replica's ICU locale.
+          // Code-unit order: revision identity must not vary with a replica's ICU locale.
           .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
           .map(([key, item]) => [key, normalize(item)]),
       );
@@ -204,123 +238,17 @@ function canonicalPayloadHash(value: unknown): string {
     .digest("hex");
 }
 
-export function reservationIdentityWhere(
-  policy: { id: string; scopeType: string },
-  rule: { id: string; metric: BudgetMetric; period: BudgetPeriod; currency: string | null },
-  grantPolicyIds: readonly string[],
-): Prisma.ProviderBudgetReservationWhereInput {
-  if (policy.scopeType === "POOL_GRANT") {
-    return {
-      policyId: { in: [...grantPolicyIds] },
-      metric: rule.metric,
-      ...(rule.currency ? { currency: rule.currency } : {}),
-    };
-  }
-  return { policyId: policy.id, ruleId: rule.id };
-}
-
-export function reservationWindowWhere(
-  policy: { scopeType: string },
-  rule: { metric: BudgetMetric; period: BudgetPeriod },
-  window: { windowStart: Date | null; windowEnd: Date | null },
-  attemptId: string,
-): Prisma.ProviderBudgetReservationWhereInput {
-  if (rule.metric === "CONCURRENCY") return {};
-  if (rule.period === "PER_ATTEMPT") return { attemptId };
-  if (policy.scopeType === "POOL_GRANT") {
-    if (rule.period === "LIFETIME") {
-      return window.windowStart ? { createdAt: { gte: window.windowStart } } : {};
-    }
-    if (!window.windowStart) return {};
-    return {
-      createdAt: {
-        gte: window.windowStart,
-        ...(window.windowEnd ? { lt: window.windowEnd } : {}),
-      },
-    };
-  }
-  if (rule.period === "LIFETIME") return { windowStart: window.windowStart, windowEnd: null };
-  return { windowStart: window.windowStart, windowEnd: window.windowEnd };
-}
-
-export function grantCapDenial(
-  policy: { id: string; scopeType: string },
-  ruleId: string,
-  reason: Exclude<ProviderBudgetAdmission, { admitted: true }>["reason"],
-): Exclude<ProviderBudgetAdmission, { admitted: true }> {
-  if (policy.scopeType !== "POOL_GRANT") {
-    return { admitted: false, reason, policyId: policy.id, ruleId };
-  }
-  if (reason === "BUDGET_EXCEEDED") {
-    return { admitted: false, reason: "GRANTEE_BUDGET_EXCEEDED", policyId: policy.id, ruleId };
-  }
-  if (reason === "CURRENCY_UNAVAILABLE" || reason === "PRICING_UNAVAILABLE") {
-    return { admitted: false, reason: "GRANTEE_CAP_UNPRICEABLE", policyId: policy.id, ruleId };
-  }
-  return { admitted: false, reason, policyId: policy.id, ruleId };
-}
-
 /**
- * Hash only the normalized semantics that this service persists. In particular,
- * callers may attach transport metadata without changing revision identity, and
- * equivalent currency/version/source spelling must remain idempotent.
+ * Hashes the normalized semantics this service persists: transport metadata a caller attaches
+ * does not change revision identity, and equivalent spellings stay idempotent.
  */
 function terminalPayloadHash(
   terminal: ProviderBudgetTerminal,
   sourceVersion: string,
   usageSource: string,
-  accountingMatches: boolean,
   observationComplete: boolean | undefined,
 ): string {
   const usage = terminal.usage;
-  const sourceUsageAccountingVersion = usage
-    ? normalizedVersion(usage.accountingVersion, "accountingVersion")
-    : undefined;
-  const normalizedUsage = usage
-    ? {
-        inputTokens: usage.inputTokens,
-        outputTokens: usage.outputTokens,
-        cacheReadTokens: usage.cacheReadTokens,
-        cacheWriteTokens: usage.cacheWriteTokens,
-        reasoningTokens: usage.reasoningTokens,
-        toolTokens: usage.toolTokens,
-        additionalBillableTokens: usage.additionalBillableTokens,
-        authoritativeBillableTokens: usage.authoritativeBillableTokens,
-        reportedTotalTokens: usage.reportedTotalTokens,
-        categoriesComplete: usage.categoriesComplete,
-        rawUsage: usage.rawUsage,
-        reportedCost: usage.reportedCost === undefined ? undefined : decimal(usage.reportedCost),
-        reportedCostCurrency: normalizedCurrency(usage.reportedCostCurrency ?? usage.currency),
-        reportedCostPricingVersion:
-          usage.reportedCostPricingVersion === undefined && usage.pricingVersion === undefined
-            ? undefined
-            : normalizedVersion(
-                usage.reportedCostPricingVersion ?? usage.pricingVersion,
-                "reportedCostPricingVersion",
-              ),
-        reportedCostSource:
-          usage.reportedCost === undefined
-            ? undefined
-            : normalizedVersion(usage.reportedCostSource ?? usageSource, "reportedCostSource"),
-        calculatedCost:
-          usage.calculatedCost === undefined ? undefined : decimal(usage.calculatedCost),
-        calculatedCostCurrency: normalizedCurrency(usage.calculatedCostCurrency ?? usage.currency),
-        calculatedCostPricingVersion:
-          usage.calculatedCostPricingVersion === undefined && usage.pricingVersion === undefined
-            ? undefined
-            : normalizedVersion(
-                usage.calculatedCostPricingVersion ?? usage.pricingVersion,
-                "calculatedCostPricingVersion",
-              ),
-        calculatedCostSource:
-          usage.calculatedCost === undefined
-            ? undefined
-            : normalizedVersion(usage.calculatedCostSource ?? usageSource, "calculatedCostSource"),
-        billableTotal: accountingMatches ? providerBillableTokens(usage) : undefined,
-        sourceUsageAccountingVersion,
-        confidence: usage.confidence,
-      }
-    : undefined;
   return canonicalPayloadHash({
     userId: terminal.userId,
     providerAccountId: terminal.providerAccountId,
@@ -337,18 +265,41 @@ function terminalPayloadHash(
     revisionKind: terminal.revisionKind,
     observationComplete,
     usageSource,
-    usage: normalizedUsage,
+    usage: usage
+      ? {
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          cacheReadTokens: usage.cacheReadTokens,
+          cacheWriteTokens: usage.cacheWriteTokens,
+          reasoningTokens: usage.reasoningTokens,
+          toolTokens: usage.toolTokens,
+          additionalBillableTokens: usage.additionalBillableTokens,
+          authoritativeBillableTokens: usage.authoritativeBillableTokens,
+          reportedTotalTokens: usage.reportedTotalTokens,
+          categoriesComplete: usage.categoriesComplete,
+          rawUsage: usage.rawUsage,
+          reportedCost: usage.reportedCost === undefined ? undefined : decimal(usage.reportedCost),
+          reportedCostCurrency: normalizedCurrency(usage.reportedCostCurrency ?? usage.currency),
+          reportedCostPricingVersion: (
+            usage.reportedCostPricingVersion ?? usage.pricingVersion
+          )?.trim(),
+          calculatedCost:
+            usage.calculatedCost === undefined ? undefined : decimal(usage.calculatedCost),
+          calculatedCostCurrency: normalizedCurrency(
+            usage.calculatedCostCurrency ?? usage.currency,
+          ),
+          calculatedCostPricingVersion: (
+            usage.calculatedCostPricingVersion ?? usage.pricingVersion
+          )?.trim(),
+          calculatedCostConfidence: usage.calculatedCostConfidence,
+          sourceUsageAccountingVersion: normalizedVersion(
+            usage.accountingVersion,
+            "accountingVersion",
+          ),
+          confidence: usage.confidence,
+        }
+      : undefined,
   });
-}
-
-function reservationValue(
-  metric: BudgetMetric,
-  liability: ProviderLiability,
-): Prisma.Decimal | null {
-  if (metric === "CONCURRENCY") return new Prisma.Decimal(1);
-  if (metric === "TOKENS")
-    return liability.tokens === undefined ? null : new Prisma.Decimal(liability.tokens.toString());
-  return liability.spend === undefined ? null : decimal(liability.spend);
 }
 
 function retryable(error: unknown): boolean {
@@ -361,16 +312,13 @@ function retryable(error: unknown): boolean {
   );
 }
 
-async function serializedByAdvisoryLocks<T>(
-  work: (tx: Prisma.TransactionClient) => Promise<T>,
-): Promise<T> {
+/**
+ * READ COMMITTED, serialized by the spend fences: each statement after a fence wait sees what
+ * the previous holder committed (SERIALIZABLE would pin the snapshot before the wait).
+ */
+async function serializedSpend<T>(work: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      // The first statement acquires an account/attempt advisory lock. Under
-      // PostgreSQL SERIALIZABLE that statement also fixes a snapshot before a
-      // contending policy replacement commits, leaving subsequent reads stale
-      // after the lock is granted. READ COMMITTED refreshes the snapshot after
-      // each waited lock; the advisory locks provide the serialization here.
       return await prisma.$transaction(work, { isolationLevel: "ReadCommitted" });
     } catch (error) {
       if (attempt + 1 >= MAX_TRANSACTION_ATTEMPTS || !retryable(error)) throw error;
@@ -379,10 +327,75 @@ async function serializedByAdvisoryLocks<T>(
   }
 }
 
+async function databaseNow(tx: Prisma.TransactionClient): Promise<Date> {
+  const rows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+  const now = rows[0]?.now;
+  if (!now) throw new ProviderBudgetConfigurationError("Database clock unavailable");
+  return now;
+}
+
+type CapRow = {
+  id: string;
+  userId: string;
+  scope: "PROVIDER_ACCOUNT" | "SHARE";
+  monthlyLimit: Prisma.Decimal;
+  currency: string;
+  version: number;
+};
+
+/** The caps that bind this attempt, account cap first. A plain read: no lock. */
+async function readCaps(
+  tx: Prisma.TransactionClient,
+  attempt: ProviderBudgetAttempt,
+): Promise<CapRow[]> {
+  // By subject only: a cap paid by anyone but this attempt's payer is a broken invariant, and
+  // a cap is never skipped silently.
+  const caps = await tx.spendCap.findMany({
+    where: {
+      OR: [
+        { scope: "PROVIDER_ACCOUNT", providerAccountId: attempt.providerAccountId },
+        ...(attempt.shareId ? [{ scope: "SHARE" as const, shareId: attempt.shareId }] : []),
+      ],
+    },
+    select: {
+      id: true,
+      userId: true,
+      scope: true,
+      monthlyLimit: true,
+      currency: true,
+      version: true,
+    },
+  });
+  if (caps.some((cap) => cap.userId !== attempt.userId))
+    throw new ProviderBudgetConfigurationError("A spend cap is not paid by the attempt's payer");
+  return caps.sort((left, right) =>
+    left.scope === right.scope
+      ? left.id < right.id
+        ? -1
+        : 1
+      : left.scope === "PROVIDER_ACCOUNT"
+        ? -1
+        : 1,
+  );
+}
+
+function capDenial(
+  cap: CapRow,
+  reason: "BUDGET_EXCEEDED" | "CURRENCY_UNAVAILABLE" | "PRICING_UNAVAILABLE",
+): Extract<ProviderBudgetAdmission, { admitted: false }> {
+  if (cap.scope === "SHARE")
+    return {
+      admitted: false,
+      reason: reason === "BUDGET_EXCEEDED" ? "GRANTEE_BUDGET_EXCEEDED" : "GRANTEE_CAP_UNPRICEABLE",
+      capId: cap.id,
+    };
+  return { admitted: false, reason, capId: cap.id };
+}
+
 /**
- * Atomic admission across the attachment policy and shared account policy.
- * Capacity admission must be released before calling this function; callers
- * must never hold both a local capacity lease and these provider reservations.
+ * Reserves one cloud attempt's liability against every cap that applies, or refuses it.
+ * Capacity admission must be released before calling this function; callers never hold a local
+ * capacity lease and these reservations at once. Throws on any accounting error (fail closed).
  */
 export async function admitProviderBudget(
   attempt: ProviderBudgetAttempt,
@@ -392,394 +405,227 @@ export async function admitProviderBudget(
     attempt.fencingToken > MAX_SIGNED_BIGINT ||
     !Number.isFinite(attempt.expiresAt.getTime()) ||
     !validToken(attempt.liability.tokens)
-  ) {
+  )
     throw new ProviderBudgetConfigurationError("Invalid provider attempt identity");
-  }
   const accountingVersion = normalizedVersion(
     attempt.liability.accountingVersion,
     "accountingVersion",
   );
-  const pricingVersion = attempt.liability.pricingVersion
-    ? normalizedVersion(attempt.liability.pricingVersion, "pricingVersion")
-    : undefined;
   const currency = normalizedCurrency(attempt.liability.currency);
+  const pricingVersion =
+    attempt.liability.pricingVersion === undefined
+      ? undefined
+      : normalizedVersion(attempt.liability.pricingVersion, "pricingVersion");
   const liabilitySpend =
     attempt.liability.spend === undefined ? undefined : decimal(attempt.liability.spend);
-  return serializedByAdvisoryLocks(async (tx) => {
-    // Writer class H (@ws-model-proxy/db/capacity-lock-order): fences only,
-    // attempt then account then grant (same level 03, "account" < "grant")
-    // then (below) policy, before any row lock or write. The provider account
-    // and model are read without a lock, and the attempt, reservation and
-    // ledger rows it writes have no foreign key into the provider graph, so
-    // no insert takes an implicit account/model lock.
+  if (liabilitySpend !== undefined && (currency === undefined || pricingVersion === undefined))
+    throw new ProviderBudgetConfigurationError(
+      "A spend liability needs its currency and pricing version",
+    );
+  // A spend liability is priced only with its currency and pricing version; a currency or
+  // version without an amount (an unpriceable category) is no price at all.
+  const priced = liabilitySpend !== undefined;
+
+  return serializedSpend(async (tx) => {
+    // Writer class H, before any row lock or write: the attempt fence, then the cap SUBJECT
+    // fences (the account, and the share for owner-paid share traffic), taken whether or not a
+    // cap exists. Every admission on the subject serializes here, so the consumption read below
+    // sees every earlier admission's attempt, including one admitted before a cap was created.
     await acquireFences(tx, [
-      fences.budgetAttempt(attempt.attemptId),
-      fences.budgetAccount(attempt.userId, attempt.providerAccountId),
-      ...(attempt.poolId && attempt.granteeUserId
-        ? [fences.budgetGrant(attempt.userId, attempt.poolId, attempt.granteeUserId)]
-        : []),
+      fences.spendAttempt(attempt.attemptId),
+      fences.spendAccount(attempt.providerAccountId),
+      ...(attempt.shareId ? [fences.spendShare(attempt.shareId)] : []),
     ]);
-    // This statement runs after possibly waiting for the account lock. Use the
-    // actual post-wait database clock, not this transaction's start time, when
-    // evaluating newly committed activation/effective/expiry boundaries.
-    const nowRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
-    const now = nowRows[0]?.now;
-    if (!now) throw new ProviderBudgetConfigurationError("Database clock unavailable");
-    const hasCostIdentity =
-      liabilitySpend !== undefined || currency !== undefined || pricingVersion !== undefined;
-    if (
-      hasCostIdentity &&
-      (liabilitySpend === undefined || currency === undefined || pricingVersion === undefined)
-    )
-      throw new ProviderBudgetConfigurationError(
-        "Spend liability, currency, and pricingVersion must be supplied together",
-      );
-    // A dispatch attempt ID is globally stable across delivery retries. A new
-    // fencing token must use a new attempt ID; otherwise reservations from the
-    // first fence could be orphaned or charged to the second execution.
-    const attemptAnchor = await tx.providerAttempt.findFirst({
-      where: { attemptId: attempt.attemptId },
-      orderBy: { createdAt: "asc" },
-    });
-    if (attemptAnchor) {
+    // A cap edit committing concurrently linearizes before or after this admission; either
+    // order is a valid outcome.
+    const caps = await readCaps(tx, attempt);
+    // The post-wait database clock, not the transaction start.
+    const now = await databaseNow(tx);
+    if (attempt.expiresAt.getTime() <= now.getTime())
+      throw new ProviderBudgetConfigurationError("Provider attempt expiry is not in the future");
+
+    // An attempt id is stable across delivery retries: replay returns the same reservations,
+    // anything else under the same id is a conflict.
+    const anchor = await tx.attempt.findUnique({ where: { id: attempt.attemptId } });
+    if (anchor) {
       const exact =
-        attemptAnchor.fencingToken === attempt.fencingToken &&
-        attemptAnchor.userId === attempt.userId &&
-        attemptAnchor.providerAccountId === attempt.providerAccountId &&
-        attemptAnchor.providerModelId === attempt.providerModelId &&
-        attemptAnchor.credentialId === (attempt.credentialId ?? null) &&
-        attemptAnchor.poolId === (attempt.poolId ?? null) &&
-        attemptAnchor.requestId === attempt.requestId &&
-        attemptAnchor.expiresAt.getTime() === attempt.expiresAt.getTime() &&
-        attemptAnchor.liabilityTokens === (attempt.liability.tokens ?? null) &&
-        (attemptAnchor.liabilitySpend?.equals(liabilitySpend ?? 0) ??
-          liabilitySpend === undefined) &&
-        attemptAnchor.liabilityCurrency === (currency ?? null) &&
-        attemptAnchor.pricingVersion === (pricingVersion ?? null) &&
-        attemptAnchor.accountingVersion === accountingVersion;
-      if (!exact)
-        throw new ProviderBudgetConfigurationError("Attempt identity or liability conflict");
-      const replay = await tx.providerBudgetReservation.findMany({
+        anchor.kind === "CLOUD" &&
+        anchor.fencingToken === attempt.fencingToken &&
+        anchor.userId === attempt.userId &&
+        anchor.requestId === attempt.requestId &&
+        anchor.providerAccountId === attempt.providerAccountId &&
+        anchor.providerModelId === attempt.providerModelId &&
+        anchor.credentialId === (attempt.credentialId ?? null) &&
+        anchor.poolId === (attempt.poolId ?? null) &&
+        anchor.shareId === (attempt.shareId ?? null) &&
+        anchor.liabilityTokens === (attempt.liability.tokens ?? null) &&
+        (anchor.liabilitySpend === null
+          ? liabilitySpend === undefined
+          : liabilitySpend !== undefined && anchor.liabilitySpend.equals(liabilitySpend)) &&
+        anchor.liabilityCurrency === (currency ?? null) &&
+        anchor.pricingVersion === (pricingVersion ?? null) &&
+        anchor.accountingVersion === accountingVersion;
+      if (!exact) throw new ProviderBudgetConfigurationError("Attempt identity conflict");
+      const settled = await tx.usageLedger.count({
         where: { attemptId: attempt.attemptId, fencingToken: attempt.fencingToken },
+      });
+      if (anchor.state !== "ACTIVE" || anchor.expiresAt <= now || settled > 0)
+        throw new ProviderBudgetConfigurationError("Provider attempt is no longer replayable");
+      const replay = await tx.spendReservation.findMany({
+        where: { attemptId: attempt.attemptId, fencingToken: attempt.fencingToken },
+        select: { id: true, state: true },
         orderBy: { id: "asc" },
-        select: { id: true, policyId: true, ruleId: true, state: true, expiresAt: true },
       });
-      const hasTerminal = await tx.providerUsageLedger.count({
-        where: { attemptId: attempt.attemptId, fencingToken: attempt.fencingToken },
-      });
-      const completeLiveReservedSet =
-        attemptAnchor.expiresAt.getTime() > now.getTime() &&
-        hasTerminal === 0 &&
-        replay.every(
-          (row) =>
-            row.state === "RESERVED" &&
-            row.expiresAt !== null &&
-            row.expiresAt.getTime() > now.getTime(),
-        );
-      if (!completeLiveReservedSet)
+      if (replay.some((row) => row.state !== "RESERVED"))
         throw new ProviderBudgetConfigurationError("Provider attempt is no longer replayable");
       return {
         admitted: true,
-        providerAttemptId: attemptAnchor.id,
-        reservationIds: replay.map(({ id }) => id),
+        providerAttemptId: anchor.id,
+        reservationIds: replay.map((row) => row.id),
       };
     }
-    // The provider model's physical concurrency ceiling is admitted under the
-    // same account lock and transaction as financial/token budgets. Live
-    // attempt anchors remain liabilities until terminal reconciliation or
-    // expiry, including attempts with no explicit budget policies.
-    const providerModel = await tx.providerModel.findFirst({
+
+    const model = await tx.providerModel.findFirst({
       where: {
         id: attempt.providerModelId,
         userId: attempt.userId,
         providerAccountId: attempt.providerAccountId,
         enabled: true,
         deletedAt: null,
+        Account: { enabled: true, deletedAt: null },
       },
-      select: { concurrencyLimit: true },
+      select: { id: true },
     });
-    if (!providerModel) throw new ProviderBudgetConfigurationError("Provider model is unavailable");
-    if (providerModel.concurrencyLimit !== null) {
-      const live = await tx.$queryRaw<Array<{ count: bigint }>>`
-        SELECT COUNT(*)::bigint AS count
-          FROM provider_attempt attempt
-         WHERE attempt."userId" = ${attempt.userId}
-           AND attempt."providerModelId" = ${attempt.providerModelId}
-           AND attempt."expiresAt" > ${now}
-           AND NOT EXISTS (
-             SELECT 1 FROM provider_usage_ledger ledger
-              WHERE ledger."attemptId" = attempt."attemptId"
-                AND ledger."fencingToken" = attempt."fencingToken"
-           )`;
-      if ((live[0]?.count ?? 0n) >= BigInt(providerModel.concurrencyLimit)) {
-        return { admitted: false, reason: "PROVIDER_CONCURRENCY_EXCEEDED" };
-      }
-    }
-    const policies = (
-      await tx.providerBudgetPolicy.findMany({
+    if (!model) throw new ProviderBudgetConfigurationError("Provider model is unavailable");
+
+    if (caps.length > 0) {
+      // A cap is enforced only on a priced liability in its currency, under a pricing version
+      // that is in effect now. Anything else fails closed.
+      if (!priced || !currency || !pricingVersion)
+        return capDenial(caps[0]!, "PRICING_UNAVAILABLE");
+      const mismatched = caps.find((cap) => cap.currency !== currency);
+      if (mismatched) return capDenial(mismatched, "CURRENCY_UNAVAILABLE");
+      const pricing = await tx.providerPricingVersion.findFirst({
         where: {
-          userId: attempt.userId,
-          active: true,
-          OR: [
-            {
-              scopeType: "PROVIDER_ACCOUNT",
-              providerAccountId: attempt.providerAccountId,
-              poolId: null,
-              providerModelId: null,
-            },
-            ...(attempt.poolId
-              ? [
-                  {
-                    scopeType: "POOL_PROVIDER_MODEL" as const,
-                    providerAccountId: attempt.providerAccountId,
-                    poolId: attempt.poolId,
-                    providerModelId: attempt.providerModelId,
-                  },
-                ]
-              : []),
-            ...(attempt.poolId && attempt.granteeUserId
-              ? [
-                  {
-                    scopeType: "POOL_GRANT" as const,
-                    poolId: attempt.poolId,
-                    granteeUserId: attempt.granteeUserId,
-                    providerAccountId: null,
-                  },
-                ]
-              : []),
-          ],
-        },
-        include: { Rules: true },
-      })
-    ).sort((left, right) => {
-      const rank = (scopeType: string) =>
-        scopeType === "POOL_GRANT" ? 0 : scopeType === "POOL_PROVIDER_MODEL" ? 1 : 2;
-      return rank(left.scopeType) - rank(right.scopeType) || left.id.localeCompare(right.id);
-    });
-    // Public egress is fail-closed: an account-wide policy may add additional
-    // limits, but it does not constitute consent for a particular pool/model
-    // attachment. That attachment needs its own active policy, including an
-    // explicit concurrency decision. LIMITED is enforced below; UNLIMITED is
-    // an intentional persisted rule (and its policy creation is audited by the
-    // management API), never an implicit null/default.
-    const attachmentPolicies = policies.filter(
-      (policy) =>
-        policy.scopeType === "POOL_PROVIDER_MODEL" &&
-        policy.poolId === attempt.poolId &&
-        policy.providerModelId === attempt.providerModelId,
-    );
-    if (
-      attempt.poolId !== undefined &&
-      (attachmentPolicies.length === 0 ||
-        !attachmentPolicies.some((policy) =>
-          policy.Rules.some(
-            (rule) => rule.metric === "CONCURRENCY" && rule.period === "PER_ATTEMPT",
-          ),
-        ))
-    ) {
-      return { admitted: false, reason: "PROTECTION_POLICY_MISSING" };
-    }
-    await acquireFences(
-      tx,
-      policies.map((policy) => fences.budgetPolicy(policy.id)),
-    );
-    if (attempt.expiresAt.getTime() <= now.getTime())
-      throw new ProviderBudgetConfigurationError(
-        "Provider reservation expiry is not in the future",
-      );
-    const existing = await tx.providerBudgetReservation.findMany({
-      where: { attemptId: attempt.attemptId },
-      orderBy: { id: "asc" },
-    });
-    const pending: Array<{
-      policy: (typeof policies)[number];
-      rule: (typeof policies)[number]["Rules"][number];
-      value: Prisma.Decimal;
-      windowStart: Date | null;
-      windowEnd: Date | null;
-    }> = [];
-
-    const grantCapPolicies = policies.filter((policy) => policy.scopeType === "POOL_GRANT");
-    const grantPolicyIds =
-      grantCapPolicies.length === 0
-        ? []
-        : [
-            ...new Set([
-              ...grantCapPolicies.map((policy) => policy.id),
-              ...(
-                await tx.providerBudgetPolicy.findMany({
-                  where: {
-                    userId: attempt.userId,
-                    scopeType: "POOL_GRANT",
-                    poolId: attempt.poolId,
-                    granteeUserId: attempt.granteeUserId,
-                  },
-                  select: { id: true },
-                })
-              ).map((row) => row.id),
-            ]),
-          ];
-    for (const policy of policies) {
-      if (!policy.activatedAt)
-        throw new ProviderBudgetConfigurationError("Active policy has no activation");
-      for (const rule of policy.Rules.sort((left, right) => left.id.localeCompare(right.id))) {
-        if (rule.mode === "UNLIMITED") continue;
-        const value = reservationValue(rule.metric, attempt.liability);
-        if (value === null) {
-          return grantCapDenial(
-            policy,
-            rule.id,
-            rule.metric === "TOKENS" ? "TOKEN_BOUND_UNAVAILABLE" : "PRICING_UNAVAILABLE",
-          );
-        }
-        if (rule.metric === "SPEND" && rule.currency !== currency) {
-          return grantCapDenial(policy, rule.id, "CURRENCY_UNAVAILABLE");
-        }
-        if (rule.metric === "SPEND" && !pricingVersion) {
-          return grantCapDenial(policy, rule.id, "PRICING_UNAVAILABLE");
-        }
-        if (rule.metric === "SPEND") {
-          const pricing = await tx.providerPricingVersion.findFirst({
-            where: {
-              userId: attempt.userId,
-              providerAccountId: attempt.providerAccountId,
-              providerModelId: attempt.providerModelId,
-              version: pricingVersion,
-              currency,
-              status: { in: ["ACTIVE", "RETIRED"] },
-              activatedAt: { not: null },
-              effectiveAt: { lte: now },
-              OR: [{ retiredAt: null }, { retiredAt: { gt: now } }],
-            },
-            select: { id: true },
-          });
-          if (!pricing) return grantCapDenial(policy, rule.id, "PRICING_UNAVAILABLE");
-        }
-        const window = budgetWindow(rule.period, policy.activatedAt, now);
-        const identity = reservationIdentityWhere(policy, rule, grantPolicyIds);
-        const windowWhere = reservationWindowWhere(policy, rule, window, attempt.attemptId);
-        const aggregate = await tx.providerBudgetReservation.aggregate({
-          where: {
-            ...identity,
-            ...(rule.metric === "CONCURRENCY"
-              ? {
-                  state: "RESERVED",
-                  OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
-                }
-              : { OR: [{ state: "RESERVED" }, { state: "SETTLED" }] }),
-            ...windowWhere,
-          },
-          _sum: { reservedValue: true },
-        });
-        const reserved = aggregate._sum.reservedValue ?? new Prisma.Decimal(0);
-        const settledReserved =
-          rule.metric === "CONCURRENCY"
-            ? null
-            : await tx.providerBudgetReservation.aggregate({
-                where: {
-                  ...identity,
-                  state: "SETTLED",
-                  ...windowWhere,
-                },
-                _sum: { reservedValue: true },
-              });
-        const settlementAggregate =
-          rule.metric === "CONCURRENCY"
-            ? null
-            : await tx.providerBudgetSettlement.aggregate({
-                where: {
-                  Reservation: {
-                    ...identity,
-                    ...windowWhere,
-                  },
-                },
-                _sum: { settledValue: true },
-              });
-        const consumed = reserved
-          .minus(settledReserved?._sum.reservedValue ?? 0)
-          .plus(settlementAggregate?._sum.settledValue ?? 0);
-        if (
-          existing.length === 0 &&
-          (!rule.limitValue || consumed.plus(value).greaterThan(rule.limitValue))
-        ) {
-          return grantCapDenial(policy, rule.id, "BUDGET_EXCEEDED");
-        }
-        pending.push({ policy, rule, value, ...window });
-      }
-    }
-
-    if (existing.length > 0) {
-      throw new ProviderBudgetConfigurationError(
-        "Budget reservations exist without their provider attempt anchor",
-      );
-    }
-
-    const providerAttempt = await tx.providerAttempt.create({
-      data: {
-        userId: attempt.userId,
-        providerAccountId: attempt.providerAccountId,
-        providerModelId: attempt.providerModelId,
-        credentialId: attempt.credentialId,
-        poolId: attempt.poolId,
-        requestId: attempt.requestId,
-        attemptId: attempt.attemptId,
-        fencingToken: attempt.fencingToken,
-        expiresAt: attempt.expiresAt,
-        liabilityTokens: attempt.liability.tokens,
-        liabilitySpend,
-        liabilityCurrency: currency,
-        pricingVersion,
-        accountingVersion,
-      },
-    });
-    const ids: string[] = [];
-    for (const item of pending) {
-      const row = await tx.providerBudgetReservation.create({
-        data: {
           userId: attempt.userId,
           providerAccountId: attempt.providerAccountId,
           providerModelId: attempt.providerModelId,
-          poolId: attempt.poolId,
-          policyId: item.policy.id,
-          ruleId: item.rule.id,
-          credentialId: attempt.credentialId,
+          version: pricingVersion,
+          currency,
+          status: { in: ["ACTIVE", "RETIRED"] },
+          activatedAt: { not: null },
+          effectiveAt: { lte: now },
+          OR: [{ retiredAt: null }, { retiredAt: { gt: now } }],
+        },
+        select: { id: true },
+      });
+      if (!pricing) return capDenial(caps[0]!, "PRICING_UNAVAILABLE");
+      for (const cap of caps) {
+        const usage =
+          cap.scope === "SHARE"
+            ? await shareSpend(tx, { shareId: attempt.shareId ?? "", currency, now })
+            : await providerAccountSpend(tx, {
+                providerAccountId: attempt.providerAccountId,
+                currency,
+                now,
+              });
+        const committed = usage.spentThisMonth.plus(usage.reservedNow).plus(liabilitySpend);
+        if (committed.greaterThan(cap.monthlyLimit)) return capDenial(cap, "BUDGET_EXCEEDED");
+      }
+    }
+
+    await tx.attempt.create({
+      data: {
+        id: attempt.attemptId,
+        userId: attempt.userId,
+        requestId: attempt.requestId,
+        kind: "CLOUD",
+        purpose: "EXECUTION",
+        ownerEpoch: PROVIDER_ATTEMPT_OWNER_EPOCH,
+        fencingToken: attempt.fencingToken,
+        heartbeatAt: now,
+        expiresAt: attempt.expiresAt,
+        poolId: attempt.poolId ?? null,
+        poolMemberId: attempt.poolMemberId ?? null,
+        targetId: attempt.targetId ?? null,
+        providerAccountId: attempt.providerAccountId,
+        providerModelId: attempt.providerModelId,
+        credentialId: attempt.credentialId ?? null,
+        shareId: attempt.shareId ?? null,
+        requestedSurface: attempt.requestedSurface ?? "unknown",
+        liabilityTokens: attempt.liability.tokens ?? null,
+        liabilitySpend: liabilitySpend ?? null,
+        liabilityCurrency: currency ?? null,
+        pricingVersion: pricingVersion ?? null,
+        accountingVersion,
+      },
+    });
+    const window = {
+      windowStart: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)),
+      windowEnd: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)),
+    };
+    const reservationIds: string[] = [];
+    for (const cap of caps) {
+      const row = await tx.spendReservation.create({
+        data: {
+          userId: attempt.userId,
+          capId: cap.id,
+          capVersion: cap.version,
           requestId: attempt.requestId,
           attemptId: attempt.attemptId,
           fencingToken: attempt.fencingToken,
-          metric: item.rule.metric,
-          period: item.rule.period,
-          policyVersion: item.policy.version,
-          windowStart: item.windowStart,
-          windowEnd: item.windowEnd,
-          reservedValue: item.value,
-          liabilityTokens: attempt.liability.tokens,
-          liabilitySpend,
-          liabilityCurrency: currency,
-          currency: item.rule.currency,
-          pricingVersion,
-          accountingVersion,
+          ...window,
+          // Caps exist only on priced attempts (checked above).
+          reservedValue: liabilitySpend ?? new Prisma.Decimal(0),
+          currency: cap.currency,
           expiresAt: attempt.expiresAt,
         },
         select: { id: true },
       });
-      ids.push(row.id);
+      reservationIds.push(row.id);
     }
-    return { admitted: true, providerAttemptId: providerAttempt.id, reservationIds: ids.sort() };
+    return {
+      admitted: true,
+      providerAttemptId: attempt.attemptId,
+      reservationIds: reservationIds.sort(),
+    };
   });
 }
 
-function terminalValue(metric: BudgetMetric, usage: RawProviderUsage | undefined): Prisma.Decimal {
-  if (metric === "CONCURRENCY") return new Prisma.Decimal(0);
-  if (metric === "TOKENS") {
-    const tokens = usage && providerBillableTokens(usage);
-    return tokens === undefined ? new Prisma.Decimal(0) : new Prisma.Decimal(tokens.toString());
+type LedgerRevision = {
+  revisionSequence: bigint;
+  revisionKind: "SNAPSHOT" | "DELTA";
+  settledCost: Prisma.Decimal | null;
+};
+
+/** An attempt's settled total: its latest SNAPSHOT plus every DELTA after it. */
+function revisionTotal(revisions: readonly LedgerRevision[]): Prisma.Decimal | null {
+  const ordered = [...revisions].sort((left, right) =>
+    left.revisionSequence < right.revisionSequence ? -1 : 1,
+  );
+  let total: Prisma.Decimal | null = null;
+  for (const revision of ordered) {
+    if (revision.revisionKind === "SNAPSHOT") total = revision.settledCost;
+    else if (revision.settledCost !== null)
+      total = (total ?? new Prisma.Decimal(0)).plus(revision.settledCost);
   }
-  if (!usage) return new Prisma.Decimal(0);
-  const value = usage.reportedCost ?? usage.calculatedCost;
-  return value === undefined ? new Prisma.Decimal(0) : decimal(value);
+  return total;
 }
 
-/** Append one immutable accounting revision. Duplicate source revisions are safe. */
+function terminalState(
+  reason: ProviderBudgetTerminal["reason"] | string,
+): "COMPLETED" | "FAILED" | "CANCELLED" | "EXPIRED" {
+  if (reason === "COMPLETED") return "COMPLETED";
+  if (reason === "CANCELLED") return "CANCELLED";
+  if (reason === "CRASH_RECOVERY") return "EXPIRED";
+  return "FAILED";
+}
+
+/**
+ * Appends one immutable accounting revision for an admitted attempt, settles its reservations
+ * and ends the attempt, in one transaction. A duplicate delivery of a revision is a no-op; a
+ * different payload under the same revision is a conflict.
+ */
 export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal): Promise<void> {
   if (
     terminal.fencingToken <= 0n ||
@@ -805,8 +651,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     terminal.observationComplete !== terminal.usage.observationComplete
   )
     throw new ProviderBudgetConfigurationError("Conflicting terminal observation completeness");
-  const normalizedObservationComplete =
-    terminal.observationComplete ?? terminal.usage?.observationComplete;
+  const observationComplete = terminal.observationComplete ?? terminal.usage?.observationComplete;
   const sourceVersion = normalizedVersion(
     terminal.sourceVersion ??
       (terminal.reason === "CRASH_RECOVERY" ? "crash-recovery-v1" : "terminal-v1"),
@@ -816,46 +661,31 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     terminal.usageSource ?? (terminal.reason === "CRASH_RECOVERY" ? "crash-repair" : "terminal"),
     "usageSource",
   );
-  // G2n (durable-cleanup permit, pass 4): cancellation-path reconciliation
-  // runs AFTER the request's abort (public-overflow cancellation cleanup).
-  // Reservation settlement and attempt terminalization are REQUIRED durable
-  // transitions and must execute even when the abort/shutdown fences are
-  // active. The permit is scoped to this settlement transaction only;
-  // surrounding new work stays fenced.
+  const payloadHash = terminalPayloadHash(
+    terminal,
+    sourceVersion,
+    usageSource,
+    observationComplete,
+  );
+  // Settlement is a required durable transition: it runs even while the shutdown fence is armed
+  // (the cancellation path reconciles after the request's abort). The permit covers this
+  // transaction only.
   await runWithDbShutdownPermit(() =>
-    serializedByAdvisoryLocks(async (tx) => {
-      // Fences first (writer class H): the attempt fence, then the budget
-      // policy fences of the attempt's reservations. Reservations are written
-      // only under the attempt fence, so the set read between the two calls
-      // is final. Then the attempt row.
-      await acquireFences(tx, [fences.budgetAttempt(terminal.attemptId)]);
-      const reservedPolicies = await tx.providerBudgetReservation.findMany({
-        where: {
-          userId: terminal.userId,
-          attemptId: terminal.attemptId,
-          fencingToken: terminal.fencingToken,
-        },
-        select: { policyId: true },
-      });
-      await acquireFences(
-        tx,
-        reservedPolicies.map((reservation) => fences.budgetPolicy(reservation.policyId)),
-      );
-      await tx.$queryRaw`SELECT id FROM provider_attempt WHERE "attemptId" = ${terminal.attemptId} AND "fencingToken" = ${terminal.fencingToken} FOR UPDATE`;
-      const anchor = await tx.providerAttempt.findUnique({
-        where: {
-          attemptId_fencingToken: {
-            attemptId: terminal.attemptId,
-            fencingToken: terminal.fencingToken,
-          },
-        },
-      });
-      if (!anchor)
+    serializedSpend(async (tx) => {
+      // Reservations are written only under this fence, so the set read below is final.
+      await acquireFences(tx, [fences.spendAttempt(terminal.attemptId)]);
+      // The heartbeat renews this row; holding it makes the expiry checked below final.
+      await tx.$queryRaw`SELECT id FROM attempt WHERE id = ${terminal.attemptId} FOR UPDATE`;
+      const anchor = await tx.attempt.findUnique({ where: { id: terminal.attemptId } });
+      if (anchor?.kind !== "CLOUD" || anchor.fencingToken !== terminal.fencingToken)
         throw new ProviderBudgetConfigurationError("No admitted provider attempt exists");
+      const now = await databaseNow(tx);
+      // A crash settlement needs the attempt expired by the database clock (not the sweeping
+      // replica's) and not renewed by its heartbeat since the sweep selected it.
       if (
         terminal.reason === "CRASH_RECOVERY" &&
-        terminal.crashExpiredAt &&
-        anchor.expiresAt > terminal.crashExpiredAt
+        (anchor.expiresAt > now ||
+          (terminal.crashExpiredAt !== undefined && anchor.expiresAt > terminal.crashExpiredAt))
       )
         return;
       if (
@@ -867,106 +697,57 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         anchor.requestId !== terminal.requestId
       )
         throw new ProviderBudgetConfigurationError("Terminal attempt identity conflict");
-
-      const expireCrashAnchor = async () => {
-        if (terminal.reason !== "CRASH_RECOVERY") return;
-        const terminalAt = new Date();
-        await tx.providerAttempt.updateMany({
-          where: { id: anchor.id, state: "ACTIVE" },
+      const finalize = async () => {
+        if (anchor.state !== "ACTIVE") return;
+        await tx.attempt.updateMany({
+          where: { id: anchor.id, fencingToken: anchor.fencingToken, state: "ACTIVE" },
           data: {
-            state: "EXPIRED",
-            terminalAt,
-            terminalReason: "CRASH_RECOVERY",
-            heartbeatAt: terminalAt,
-          },
-        });
-      };
-      const finalizeNonCrashAnchor = async () => {
-        if (terminal.reason === "CRASH_RECOVERY" || anchor.state !== "ACTIVE") return;
-        const terminalAt = new Date();
-        const finalized = await tx.providerAttempt.updateMany({
-          where: { id: anchor.id, state: "ACTIVE" },
-          data: {
-            state:
-              terminal.reason === "COMPLETED"
-                ? "COMPLETED"
-                : terminal.reason === "CANCELLED"
-                  ? "CANCELLED"
-                  : "FAILED",
+            state: terminalState(terminal.reason),
+            terminalAt: now,
             terminalReason: terminal.reason,
-            terminalAt,
-            heartbeatAt: terminalAt,
           },
         });
-        if (finalized.count !== 1)
-          throw new ProviderBudgetConfigurationError(
-            "Provider attempt was not active at terminal settlement",
-          );
       };
 
-      const usage = terminal.usage;
-      const observationComplete = normalizedObservationComplete;
-      const sourceUsageAccountingVersion = usage
-        ? normalizedVersion(usage.accountingVersion, "accountingVersion")
-        : undefined;
-      const billableTotal = usage && providerBillableTokens(usage);
-      const accountingMatches = usage?.accountingVersion.trim() === anchor.accountingVersion;
-      const payloadHash = terminalPayloadHash(
-        terminal,
-        sourceVersion,
-        usageSource,
-        accountingMatches,
-        observationComplete,
-      );
-      const priorRevision = await tx.providerUsageLedger.findUnique({
-        where: {
-          attemptId_fencingToken_sourceVersion: {
-            attemptId: terminal.attemptId,
-            fencingToken: terminal.fencingToken,
-            sourceVersion,
-          },
+      const previous = await tx.usageLedger.findMany({
+        where: { attemptId: terminal.attemptId, fencingToken: terminal.fencingToken },
+        select: {
+          revisionSequence: true,
+          revisionKind: true,
+          settledCost: true,
+          payloadHash: true,
         },
-        select: { payloadHash: true, revisionSequence: true, revisionKind: true },
       });
-      if (priorRevision) {
+      const duplicate = previous.find((row) => row.revisionSequence === terminal.revisionSequence);
+      if (duplicate) {
         if (
-          priorRevision.payloadHash !== payloadHash ||
-          priorRevision.revisionSequence !== terminal.revisionSequence ||
-          priorRevision.revisionKind !== terminal.revisionKind
+          duplicate.payloadHash !== payloadHash ||
+          duplicate.revisionKind !== terminal.revisionKind
         )
-          throw new ProviderBudgetConfigurationError("Accounting source revision conflict");
-        await finalizeNonCrashAnchor();
-        await expireCrashAnchor();
+          throw new ProviderBudgetConfigurationError("Accounting revision conflict");
+        await finalize();
         return;
       }
-      const previousLedgers = await tx.providerUsageLedger.findMany({
-        where: { attemptId: terminal.attemptId, fencingToken: terminal.fencingToken },
-        orderBy: { revisionSequence: "desc" },
-        select: { revisionSequence: true },
-      });
-      // A completed terminal observation always wins a crash sweep that selected
-      // the row just before the terminal transaction committed.
-      if (terminal.reason === "CRASH_RECOVERY" && previousLedgers.length > 0) return;
-      if (previousLedgers[0] && terminal.revisionSequence <= previousLedgers[0].revisionSequence)
+      // A terminal observation that committed first always wins a crash sweep.
+      if (terminal.reason === "CRASH_RECOVERY" && previous.length > 0) return;
+      if (previous.some((row) => row.revisionSequence > terminal.revisionSequence))
         throw new ProviderBudgetConfigurationError("Stale accounting revision");
 
-      const reservations = await tx.providerBudgetReservation.findMany({
-        where: {
-          userId: terminal.userId,
-          attemptId: terminal.attemptId,
-          fencingToken: terminal.fencingToken,
-        },
-        orderBy: { id: "asc" },
-      });
-
+      const usage = terminal.usage;
+      const notSent = terminal.dispatchOutcome === "NOT_SENT";
+      const accountingMatches = usage?.accountingVersion.trim() === anchor.accountingVersion;
+      const billableTotal = usage && providerBillableTokens(usage);
       const reportedCurrency = normalizedCurrency(usage?.reportedCostCurrency ?? usage?.currency);
-      const reportedPricingVersion =
-        usage?.reportedCostPricingVersion?.trim() ?? usage?.pricingVersion?.trim();
+      const reportedPricingVersion = (
+        usage?.reportedCostPricingVersion ?? usage?.pricingVersion
+      )?.trim();
       const calculatedCurrency = normalizedCurrency(
         usage?.calculatedCostCurrency ?? usage?.currency,
       );
-      const calculatedPricingVersion =
-        usage?.calculatedCostPricingVersion?.trim() ?? usage?.pricingVersion?.trim();
+      const calculatedPricingVersion = (
+        usage?.calculatedCostPricingVersion ?? usage?.pricingVersion
+      )?.trim();
+      const liability = anchor.liabilitySpend;
       const reportedMatches = Boolean(
         usage?.reportedCost !== undefined &&
           anchor.pricingVersion &&
@@ -986,61 +767,47 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         : calculatedMatches
           ? usage?.calculatedCost
           : undefined;
-      // Cost and token observations from an incomplete stream remain useful
-      // evidence, but cannot safely reduce the admitted liability.
-      // Cost provenance is independent when completeness is unspecified: some
-      // non-streaming providers report an authoritative charge without a full
-      // token-category breakdown. An explicit false, however, marks a truncated
-      // observation and must retain the conservative admitted liability.
-      const costKnown = suppliedCost !== undefined && observationComplete === true;
-      const suppliedCostConfidence: UsageConfidence = reportedMatches
-        ? "REPORTED"
-        : calculatedMatches
-          ? (usage?.calculatedCostConfidence ?? "CALCULATED")
-          : "ESTIMATED";
-      const settledCost = costKnown ? decimal(suppliedCost) : null;
-
-      for (const reservation of reservations) {
-        const notSent = terminal.dispatchOutcome === "NOT_SENT";
-        const trustworthy =
-          notSent ||
-          reservation.metric === "CONCURRENCY" ||
-          (reservation.metric === "TOKENS" &&
-            accountingMatches &&
-            observationComplete === true &&
-            billableTotal !== undefined) ||
-          (reservation.metric === "SPEND" && costKnown);
-        const prior = await tx.providerBudgetSettlement.aggregate({
-          where: { reservationId: reservation.id },
-          _sum: { settledValue: true },
-        });
-        const priorTotal = prior._sum.settledValue ?? new Prisma.Decimal(0);
-        const observation = notSent
-          ? new Prisma.Decimal(0)
-          : trustworthy
-            ? reservation.metric === "SPEND" && settledCost
-              ? settledCost
-              : terminalValue(reservation.metric, usage)
-            : reservation.reservedValue;
-        const delta =
+      // Cost observed on an incomplete stream is evidence, but cannot reduce the admitted
+      // liability: only a complete observation in the attempt's own price makes cost known.
+      const costKnown = !notSent && suppliedCost !== undefined && observationComplete === true;
+      const priorTotal = revisionTotal(previous);
+      let revisionCost: Prisma.Decimal | null;
+      let costCurrency = anchor.liabilityCurrency;
+      let confidence: UsageConfidence = "ESTIMATED";
+      if (notSent) revisionCost = new Prisma.Decimal(0);
+      else if (costKnown && suppliedCost !== undefined) {
+        revisionCost = decimal(suppliedCost);
+        confidence = reportedMatches
+          ? "REPORTED"
+          : (usage?.calculatedCostConfidence ?? "CALCULATED");
+      } else if (liability !== null) {
+        // Unknown cost keeps the admitted liability (a DELTA tops the total up to it).
+        revisionCost =
           terminal.revisionKind === "SNAPSHOT"
-            ? observation.minus(priorTotal)
-            : trustworthy
-              ? observation
-              : priorTotal.lessThan(reservation.reservedValue)
-                ? reservation.reservedValue.minus(priorTotal)
-                : new Prisma.Decimal(0);
-        const desiredTotal = priorTotal.plus(delta);
-        if (desiredTotal.isNegative())
-          throw new ProviderBudgetConfigurationError("Accounting correction underflows zero");
-        await tx.providerBudgetSettlement.create({
+            ? liability
+            : Prisma.Decimal.max(0, liability.minus(priorTotal ?? 0));
+      } else if (usage?.reportedCost !== undefined && reportedCurrency) {
+        // An unpriced (uncapped) attempt: keep the provider's own figure for the spend view.
+        revisionCost = decimal(usage.reportedCost);
+        costCurrency = reportedCurrency;
+        confidence = "REPORTED";
+      } else revisionCost = null;
+      const total =
+        terminal.revisionKind === "SNAPSHOT"
+          ? revisionCost
+          : revisionCost === null
+            ? priorTotal
+            : (priorTotal ?? new Prisma.Decimal(0)).plus(revisionCost);
+
+      const reservations = await tx.spendReservation.findMany({
+        where: { attemptId: terminal.attemptId, fencingToken: terminal.fencingToken },
+        orderBy: { id: "asc" },
+      });
+      for (const reservation of reservations) {
+        // Mirrors the ledger revision: the same SNAPSHOT/DELTA rule sums both.
+        await tx.spendSettlement.create({
           data: {
-            userId: terminal.userId,
-            providerAccountId: anchor.providerAccountId,
-            providerModelId: anchor.providerModelId,
-            credentialId: anchor.credentialId,
-            poolId: anchor.poolId,
-            requestId: anchor.requestId,
+            userId: reservation.userId,
             reservationId: reservation.id,
             attemptId: terminal.attemptId,
             fencingToken: terminal.fencingToken,
@@ -1048,35 +815,32 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
             revisionSequence: terminal.revisionSequence,
             revisionKind: terminal.revisionKind,
             payloadHash,
-            sourceUsageAccountingVersion,
-            accountingVersion: anchor.accountingVersion,
             pricingVersion: anchor.pricingVersion,
-            settledValue: delta,
-            currency: reservation.metric === "SPEND" ? reservation.currency : null,
-            confidence:
-              trustworthy && reservation.metric === "SPEND"
-                ? suppliedCostConfidence
-                : trustworthy
-                  ? (usage?.confidence ?? "ESTIMATED")
-                  : "ESTIMATED",
+            settledValue: revisionCost ?? new Prisma.Decimal(0),
+            currency: reservation.currency,
+            confidence,
             reason: terminal.reason,
           },
         });
         if (reservation.state === "RESERVED")
-          await tx.providerBudgetReservation.update({
+          await tx.spendReservation.update({
             where: { id: reservation.id },
-            data: { state: "SETTLED", settledValue: desiredTotal, settledAt: new Date() },
+            data: {
+              state: "SETTLED",
+              settledValue: total ?? new Prisma.Decimal(0),
+              settledAt: now,
+            },
           });
       }
 
-      await tx.providerUsageLedger.create({
+      await tx.usageLedger.create({
         data: {
-          userId: terminal.userId,
-          providerAccountId: anchor.providerAccountId,
-          providerModelId: anchor.providerModelId,
+          userId: anchor.userId,
+          providerAccountId: terminal.providerAccountId,
+          providerModelId: terminal.providerModelId,
           credentialId: anchor.credentialId,
-          reservationId: reservations[0]?.id,
           poolId: anchor.poolId,
+          shareId: anchor.shareId,
           requestId: anchor.requestId,
           attemptId: terminal.attemptId,
           fencingToken: terminal.fencingToken,
@@ -1093,28 +857,19 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
           categoriesComplete: usage?.categoriesComplete,
           observationComplete,
           rawUsage: usage?.rawUsage,
-          reportedCost: usage?.reportedCost,
+          reportedCost: usage?.reportedCost === undefined ? undefined : decimal(usage.reportedCost),
           reportedCostCurrency: reportedCurrency,
-          reportedCostPricingVersion: reportedPricingVersion,
-          reportedCostSource:
-            usage?.reportedCost === undefined
-              ? undefined
-              : normalizedVersion(usage.reportedCostSource ?? usageSource, "reportedCostSource"),
-          calculatedCost: usage?.calculatedCost,
+          calculatedCost:
+            usage?.calculatedCost === undefined ? undefined : decimal(usage.calculatedCost),
           calculatedCostCurrency: calculatedCurrency,
           calculatedCostPricingVersion: calculatedPricingVersion,
-          calculatedCostSource:
-            usage?.calculatedCost === undefined
-              ? undefined
-              : normalizedVersion(
-                  usage.calculatedCostSource ?? usageSource,
-                  "calculatedCostSource",
-                ),
-          settledCost,
-          currency: anchor.liabilityCurrency,
+          settledCost: revisionCost,
+          currency: revisionCost === null ? null : costCurrency,
           pricingVersion: anchor.pricingVersion,
-          sourceUsageAccountingVersion,
-          accountingVersion: anchor.accountingVersion,
+          sourceUsageAccountingVersion: usage
+            ? normalizedVersion(usage.accountingVersion, "accountingVersion")
+            : undefined,
+          accountingVersion: anchor.accountingVersion ?? "provider-billable-v1",
           sourceVersion,
           revisionSequence: terminal.revisionSequence,
           revisionKind: terminal.revisionKind,
@@ -1126,92 +881,119 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
           costKnown,
           terminalReason: terminal.reason,
           confidence: costKnown
-            ? suppliedCostConfidence
+            ? confidence
             : accountingMatches
               ? (usage?.confidence ?? "ESTIMATED")
               : "ESTIMATED",
         },
       });
-      if (terminalPersistenceTestFailure?.() === "SIMULATE_LEGACY_SPLIT") return;
-      await finalizeNonCrashAnchor();
-      await expireCrashAnchor();
+      await finalize();
     }),
   );
 }
 
-/** Crash repair is conservative: expired liability is settled, never silently refunded. */
+/**
+ * Crash repair: an ACTIVE cloud attempt past its expiry is settled at its liability (never
+ * silently refunded); one that already has a ledger revision only has its state ended.
+ */
 export async function repairExpiredProviderBudgets(
   now = new Date(),
   scope?: { userId: string; providerAccountId: string },
 ): Promise<number> {
   if (!Number.isFinite(now.getTime()))
     throw new ProviderBudgetConfigurationError("Invalid repair date");
-  const expired = await prisma.$queryRaw<
-    Array<{
-      userId: string;
-      providerAccountId: string;
-      providerModelId: string;
-      credentialId: string | null;
-      poolId: string | null;
-      requestId: string;
-      attemptId: string;
-      fencingToken: bigint;
-      ledgerTerminalReason: string | null;
-    }>
-  >`SELECT a."userId", a."providerAccountId", a."providerModelId", a."credentialId",
-           a."poolId", a."requestId", a."attemptId", a."fencingToken",
-           (SELECT l."terminalReason" FROM provider_usage_ledger l
-             WHERE l."attemptId" = a."attemptId" AND l."fencingToken" = a."fencingToken"
-             ORDER BY l."revisionSequence" DESC, l."createdAt" DESC LIMIT 1) AS "ledgerTerminalReason"
-     FROM provider_attempt a
-     WHERE a.state = 'ACTIVE' AND a."expiresAt" <= ${now}
-       AND (${scope?.userId ?? null}::text IS NULL OR a."userId" = ${scope?.userId ?? null})
-       AND (${scope?.providerAccountId ?? null}::text IS NULL OR a."providerAccountId" = ${scope?.providerAccountId ?? null})
-     ORDER BY a."attemptId"`;
-  for (const row of expired) {
-    if (row.ledgerTerminalReason) {
-      await prisma.$transaction(async (tx) => {
-        await acquireFences(tx, [fences.budgetAttempt(row.attemptId)]);
-        const latest = await tx.providerUsageLedger.findFirst({
-          where: { attemptId: row.attemptId, fencingToken: row.fencingToken },
-          orderBy: [{ revisionSequence: "desc" }, { createdAt: "desc" }],
-          select: { terminalReason: true },
-        });
-        if (!latest) return;
-        const terminalAt = new Date();
-        await tx.providerAttempt.updateMany({
-          where: { attemptId: row.attemptId, fencingToken: row.fencingToken, state: "ACTIVE" },
-          data: {
-            state:
-              latest.terminalReason === "COMPLETED"
-                ? "COMPLETED"
-                : latest.terminalReason === "CANCELLED"
-                  ? "CANCELLED"
-                  : latest.terminalReason === "CRASH_RECOVERY"
-                    ? "EXPIRED"
-                    : "FAILED",
-            terminalReason: latest.terminalReason,
-            terminalAt,
-            heartbeatAt: terminalAt,
-          },
-        });
-      });
-      continue;
-    }
-    await reconcileProviderBudget({
-      userId: row.userId,
-      providerAccountId: row.providerAccountId,
-      providerModelId: row.providerModelId,
-      credentialId: row.credentialId ?? undefined,
-      poolId: row.poolId ?? undefined,
-      requestId: row.requestId,
-      attemptId: row.attemptId,
-      fencingToken: row.fencingToken,
-      reason: "CRASH_RECOVERY",
-      crashExpiredAt: now,
-      revisionSequence: 0n,
-      revisionKind: "SNAPSHOT",
+  // Pages past every attempt it has seen this run (settled, renewed or failing), so a stuck
+  // one never starves newer ones and a renewed one is not revisited.
+  const seen: string[] = [];
+  let repaired = 0;
+  for (;;) {
+    const expired = await prisma.attempt.findMany({
+      where: {
+        kind: "CLOUD",
+        state: "ACTIVE",
+        expiresAt: { lte: now },
+        ...(seen.length > 0 ? { id: { notIn: seen } } : {}),
+        ...(scope ? { userId: scope.userId, providerAccountId: scope.providerAccountId } : {}),
+      },
+      select: {
+        id: true,
+        userId: true,
+        requestId: true,
+        fencingToken: true,
+        providerAccountId: true,
+        providerModelId: true,
+        credentialId: true,
+        poolId: true,
+      },
+      orderBy: { expiresAt: "asc" },
+      take: REPAIR_BATCH,
     });
+    for (const row of expired) {
+      seen.push(row.id);
+      try {
+        await repairExpiredAttempt(row, now);
+        repaired += 1;
+      } catch {
+        // The next run retries it; this run moves on.
+        console.warn("[provider-budget] could not repair an expired cloud attempt");
+      }
+    }
+    if (expired.length < REPAIR_BATCH || seen.length >= REPAIR_MAX_PER_RUN) return repaired;
   }
-  return expired.length;
 }
+
+async function repairExpiredAttempt(
+  row: {
+    id: string;
+    userId: string;
+    requestId: string;
+    fencingToken: bigint;
+    providerAccountId: string | null;
+    providerModelId: string | null;
+    credentialId: string | null;
+    poolId: string | null;
+  },
+  now: Date,
+): Promise<void> {
+  if (!row.providerAccountId || !row.providerModelId) return;
+  {
+    const latest = await prisma.usageLedger.findFirst({
+      where: { attemptId: row.id, fencingToken: row.fencingToken },
+      orderBy: { revisionSequence: "desc" },
+      select: { terminalReason: true },
+    });
+    if (latest) {
+      await runWithDbShutdownPermit(() =>
+        serializedSpend(async (tx) => {
+          await acquireFences(tx, [fences.spendAttempt(row.id)]);
+          const terminalAt = await databaseNow(tx);
+          await tx.attempt.updateMany({
+            where: { id: row.id, fencingToken: row.fencingToken, state: "ACTIVE" },
+            data: {
+              state: terminalState(latest.terminalReason),
+              terminalAt,
+              terminalReason: latest.terminalReason,
+            },
+          });
+        }),
+      );
+    } else {
+      await reconcileProviderBudget({
+        userId: row.userId,
+        providerAccountId: row.providerAccountId,
+        providerModelId: row.providerModelId,
+        credentialId: row.credentialId ?? undefined,
+        poolId: row.poolId ?? undefined,
+        requestId: row.requestId,
+        attemptId: row.id,
+        fencingToken: row.fencingToken,
+        reason: "CRASH_RECOVERY",
+        crashExpiredAt: now,
+        revisionSequence: 0n,
+        revisionKind: "SNAPSHOT",
+      });
+    }
+  }
+}
+
+export type { ProviderTokenUsage };

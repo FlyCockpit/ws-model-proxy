@@ -7,7 +7,6 @@ import { providerHealthCoolingDown } from "./provider-health-state.js";
 // five minutes so a provider response cannot disable a configured target
 // indefinitely; repeated failures re-enter the same bounded cooldown.
 export const PROVIDER_MAX_COOLDOWN_MS = 5 * 60_000;
-export { PROVIDER_HALF_OPEN_LEASE_MS } from "./provider-health-state.js";
 
 const BASE_COOLDOWN_MS = 1_000;
 
@@ -40,16 +39,17 @@ export async function heartbeatProviderAttempt(input: {
   extensionMs: number;
 }): Promise<boolean> {
   return prisma.$transaction(async (tx) => {
-    const attempt = await tx.providerAttempt.findUnique({
-      where: {
-        attemptId_fencingToken: {
-          attemptId: input.attemptId,
-          fencingToken: input.fencingToken,
-        },
-      },
+    // One attempt pipeline (lane B4): a cloud attempt is an `attempt` row of kind CLOUD.
+    const row = await tx.attempt.findUnique({
+      where: { id_fencingToken: { id: input.attemptId, fencingToken: input.fencingToken } },
       select: { userId: true, providerAccountId: true, providerModelId: true },
     });
-    if (!attempt) return false;
+    if (!row?.providerAccountId || !row.providerModelId) return false;
+    const attempt = {
+      userId: row.userId,
+      providerAccountId: row.providerAccountId,
+      providerModelId: row.providerModelId,
+    };
     await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${attempt.providerAccountId} AND "userId" = ${attempt.userId} FOR UPDATE`;
     await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${attempt.providerModelId} AND "userId" = ${attempt.userId} FOR UPDATE`;
     const [accountHealth, modelHealth] = await Promise.all([
@@ -75,9 +75,9 @@ export async function heartbeatProviderAttempt(input: {
     // Evaluate expiry only after every contended ownership lock is held. A
     // timestamp captured before the wait could renew an already-expired lease.
     const now = new Date();
-    const updated = await tx.providerAttempt.updateMany({
+    const updated = await tx.attempt.updateMany({
       where: {
-        attemptId: input.attemptId,
+        id: input.attemptId,
         fencingToken: input.fencingToken,
         state: "ACTIVE",
         expiresAt: { gt: now },
@@ -216,8 +216,9 @@ export async function recordProviderOutcome(input: {
     if (input.attemptId !== undefined && input.fencingToken !== undefined) {
       const lockedAttempt = await tx.$queryRaw<Array<{ id: string }>>`
         SELECT id
-        FROM provider_attempt
-        WHERE "attemptId" = ${input.attemptId}
+        FROM attempt
+        WHERE id = ${input.attemptId}
+          AND kind = 'CLOUD'::"AttemptKind"
           AND "fencingToken" = ${input.fencingToken}
           AND "userId" = ${input.userId}
           AND "providerAccountId" = ${input.providerAccountId}
@@ -232,13 +233,14 @@ export async function recordProviderOutcome(input: {
       const authoritative = await tx.$queryRaw<Array<{ eligible: boolean }>>`
         SELECT EXISTS (
           SELECT 1
-          FROM provider_attempt
-          WHERE "attemptId" = ${input.attemptId}
+          FROM attempt
+          WHERE id = ${input.attemptId}
+            AND kind = 'CLOUD'::"AttemptKind"
             AND "fencingToken" = ${input.fencingToken}
             AND "userId" = ${input.userId}
             AND "providerAccountId" = ${input.providerAccountId}
             AND "providerModelId" = ${input.providerModelId}
-            AND state = 'ACTIVE'::"ProviderAttemptState"
+            AND state = 'ACTIVE'::"AttemptState"
             AND "expiresAt" > clock_timestamp()
         ) AS eligible
       `;
@@ -289,7 +291,7 @@ export async function recordProviderOutcome(input: {
         : ("DEGRADED" as const);
     const data = input.success
       ? {
-          healthStatus: modelHealth,
+          health: modelHealth,
           healthCheckedAt: now,
           healthFailureCount: 0,
           healthNextRetryAt: null,
@@ -301,7 +303,7 @@ export async function recordProviderOutcome(input: {
             : {}),
         }
       : {
-          healthStatus: modelHealth,
+          health: modelHealth,
           healthCheckedAt: now,
           healthFailureCount: failures,
           healthNextRetryAt: new Date(now.getTime() + backoffMs(failures, input.retryAfterMs)),
@@ -319,7 +321,7 @@ export async function recordProviderOutcome(input: {
     await tx.providerAccount.update({
       where: { id: input.providerAccountId, userId: input.userId },
       data: {
-        healthStatus: input.success ? "HEALTHY" : "DEGRADED",
+        health: input.success ? "HEALTHY" : "DEGRADED",
         healthCheckedAt: now,
         ...(input.success
           ? {
@@ -448,11 +450,35 @@ export async function recordProviderAttemptEvent(input: {
   usage?: Record<string, string | number | boolean | null>;
   metadata?: Record<string, string | number | boolean | null>;
 }): Promise<void> {
-  await prisma.publicProviderAttemptEvent.create({
-    data: {
-      ...input,
-      reservationIds: input.reservationIds ? [...input.reservationIds] : undefined,
-    },
+  // One event stream for every attempt (`attempt_event`): the identity columns are plain, the
+  // rest is metadata (no prompts, no secrets). The sequence is the next one of the attempt.
+  const { userId, requestId, attemptId, eventType, reason, metadata, usage, ...details } = input;
+  const facts: Record<string, string | number | boolean | null> = { ...metadata };
+  for (const [key, value] of Object.entries(details)) {
+    if (value === undefined) continue;
+    if (value instanceof Date) facts[key] = value.toISOString();
+    else if (typeof value === "bigint") facts[key] = value.toString();
+    else if (typeof value === "object") facts[key] = value.join(",");
+    else facts[key] = value;
+  }
+  if (usage) for (const [key, value] of Object.entries(usage)) facts[`usage.${key}`] = value;
+  await prisma.$transaction(async (tx) => {
+    const last = await tx.attemptEvent.findFirst({
+      where: { attemptId },
+      orderBy: { sequence: "desc" },
+      select: { sequence: true },
+    });
+    await tx.attemptEvent.create({
+      data: {
+        userId,
+        attemptId,
+        requestId,
+        sequence: (last?.sequence ?? 0) + 1,
+        eventType,
+        reason: reason ?? null,
+        metadata: facts,
+      },
+    });
   });
 }
 

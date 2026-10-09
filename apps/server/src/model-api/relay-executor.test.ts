@@ -65,8 +65,8 @@ function harness(abortSignal?: AbortSignal) {
   };
   const attempt = startRelayAttempt({
     manager,
-    cliDeviceId: "cli-1",
-    endpointSlug: "neutral-upstream",
+    nodeId: "cli-1",
+    handle: "neutral-upstream",
     family: "audio",
     method: "POST",
     path: "/v1/audio/transcriptions",
@@ -92,8 +92,8 @@ describe("relay response backpressure", () => {
     };
     const attempt = startRelayAttempt({
       manager,
-      cliDeviceId: "cli-1",
-      endpointSlug: "neutral-upstream",
+      nodeId: "cli-1",
+      handle: "neutral-upstream",
       family: "audio",
       method: "POST",
       path: "/v1/audio/transcriptions",
@@ -116,7 +116,7 @@ describe("relay response backpressure", () => {
       type: "relay.response.headers",
       requestId: attempt.requestId,
       status: 200,
-      headers: { "content-type": "text/event-stream" },
+      headers: [["content-type", "text/event-stream"]],
     });
     const { body } = await attempt.started;
     const chunk = new Uint8Array(1024 * 1024);
@@ -136,7 +136,7 @@ describe("relay response backpressure", () => {
     await expect(attempt.terminal).resolves.toMatchObject({ ok: false, failure: "cancelled" });
     await expect(body.getReader().read()).rejects.toThrow("buffer limit");
     expect(manager.cancelRelayRequest).toHaveBeenCalledWith({
-      cliDeviceId: "cli-1",
+      nodeId: "cli-1",
       requestId: attempt.requestId,
       reason: "cancelled",
     });
@@ -148,7 +148,7 @@ describe("relay response backpressure", () => {
       type: "relay.response.headers",
       requestId: attempt.requestId,
       status: 200,
-      headers: {},
+      headers: [],
     });
     const { body } = await attempt.started;
     const reader = body.getReader();
@@ -163,8 +163,30 @@ describe("relay response backpressure", () => {
       expect(read.value?.byteLength).toBe(chunk.byteLength);
     }
     handlers.onComplete({ type: "relay.complete", requestId: attempt.requestId });
-    await expect(attempt.terminal).resolves.toMatchObject({ ok: true });
+    await expect(attempt.terminal).resolves.toMatchObject({ ok: true, upstreamErrorExcerpt: null });
     expect(manager.cancelRelayRequest).not.toHaveBeenCalled();
+  });
+
+  it("keeps a redacted excerpt of an upstream 4xx answer on the terminal", async () => {
+    const { attempt, handlers } = harness();
+    handlers.onHeaders({
+      type: "relay.response.headers",
+      requestId: attempt.requestId,
+      status: 400,
+      headers: [["content-type", "application/json"]],
+    });
+    handlers.onBody(new TextEncoder().encode('{"detail":"messages must be a list"}'), {
+      type: "relay.response.body",
+      requestId: attempt.requestId,
+      chunkId: "0",
+    });
+    handlers.onComplete({ type: "relay.complete", requestId: attempt.requestId });
+    await expect(attempt.terminal).resolves.toMatchObject({
+      ok: false,
+      failure: "upstream_4xx",
+      upstreamStatusCode: 400,
+      upstreamErrorExcerpt: "messages must be a list",
+    });
   });
 });
 
@@ -180,8 +202,8 @@ describe("G1 — an ALREADY-aborted signal starts nothing (synchronous entry che
     controller.abort();
     const attempt = startRelayAttempt({
       manager,
-      cliDeviceId: "cli-1",
-      endpointSlug: "neutral-upstream",
+      nodeId: "cli-1",
+      handle: "neutral-upstream",
       family: "chat.completions",
       method: "POST",
       path: "/v1/chat/completions",
@@ -224,7 +246,7 @@ describe("capacity lease loss is not a client cancellation", () => {
     });
     // The wire protocol has no lease-loss reason; the CLI is told to stop.
     expect(manager.cancelRelayRequest).toHaveBeenCalledWith({
-      cliDeviceId: "cli-1",
+      nodeId: "cli-1",
       requestId: attempt.requestId,
       reason: "cancelled",
     });
@@ -237,7 +259,7 @@ describe("capacity lease loss is not a client cancellation", () => {
       type: "relay.response.headers",
       requestId: attempt.requestId,
       status: 200,
-      headers: { "content-type": "text/event-stream" },
+      headers: [["content-type", "text/event-stream"]],
     });
     const { body } = await attempt.started;
     lease.abort(new CapacityLeaseLostError("heartbeat_timeout"));
@@ -267,8 +289,8 @@ describe("capacity lease loss is not a client cancellation", () => {
     lease.abort(new CapacityLeaseLostError("ownership_lost"));
     const attempt = startRelayAttempt({
       manager,
-      cliDeviceId: "cli-1",
-      endpointSlug: "neutral-upstream",
+      nodeId: "cli-1",
+      handle: "neutral-upstream",
       family: "chat.completions",
       method: "POST",
       path: "/v1/chat/completions",
@@ -283,5 +305,71 @@ describe("capacity lease loss is not a client cancellation", () => {
       httpStatusCode: 503,
     });
     expect(manager.sendRelayRequest).not.toHaveBeenCalled();
+  });
+});
+
+// Production crash: the timeout settled an attempt nobody was awaiting, and the unobserved
+// `started` rejection ended the whole process.
+describe("an unobserved attempt failure never becomes an unhandled rejection", () => {
+  async function unhandledDuring(run: () => void): Promise<unknown[]> {
+    const seen: unknown[] = [];
+    const listener = (reason: unknown) => seen.push(reason);
+    process.on("unhandledRejection", listener);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      run();
+      // Node reports unhandled rejections once the microtask queue has drained.
+      for (let turn = 0; turn < 3; turn += 1) await new Promise((r) => setImmediate(r));
+    } finally {
+      vi.useRealTimers();
+      process.off("unhandledRejection", listener);
+    }
+    return seen;
+  }
+
+  it("times out with no listener on `started` without an unhandled rejection", async () => {
+    let attempt: ReturnType<typeof startRelayAttempt> | undefined;
+    const seen = await unhandledDuring(() => {
+      attempt = harness().attempt;
+      vi.advanceTimersByTime(30_000);
+    });
+    expect(seen).toEqual([]);
+    // A caller that does await it still sees the failure.
+    await expect(attempt?.started).rejects.toThrow("timeout");
+    await expect(attempt?.terminal).resolves.toMatchObject({ ok: false, failure: "timeout" });
+  });
+
+  it("refuses an attempt without a body before arming its timeout or abort listener", async () => {
+    const manager = {
+      registerRelayResponseHandlers: vi.fn(),
+      sendRelayRequest: vi.fn(),
+      cancelRelayRequest: vi.fn(),
+      completeRelayRequest: vi.fn(),
+    };
+    const controller = new AbortController();
+    const addListener = vi.spyOn(controller.signal, "addEventListener");
+    const seen = await unhandledDuring(() => {
+      expect(() =>
+        // @ts-expect-error -- the runtime guard behind the type: exactly one body is required.
+        startRelayAttempt({
+          manager,
+          nodeId: "cli-1",
+          handle: "neutral-upstream",
+          family: "generic",
+          method: "GET",
+          path: "/openapi.json",
+          headers: new Headers(),
+          timeoutMs: 10_000,
+          abortSignal: controller.signal,
+        }),
+      ).toThrow("exactly one request body");
+      expect(vi.getTimerCount()).toBe(0);
+      vi.advanceTimersByTime(10_000);
+    });
+    expect(seen).toEqual([]);
+    expect(addListener).not.toHaveBeenCalled();
+    expect(manager.registerRelayResponseHandlers).not.toHaveBeenCalled();
+    expect(manager.cancelRelayRequest).not.toHaveBeenCalled();
+    expect(manager.completeRelayRequest).not.toHaveBeenCalled();
   });
 });

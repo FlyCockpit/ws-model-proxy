@@ -1,7 +1,7 @@
 /**
  * Sweepers over the hot-path (writer class H) tables, DL-1 design (d) (#78).
  *
- * H tables reference graph rows (users, pools, targets, capacities) by plain
+ * H tables reference graph rows (users, pools, targets, instances) by plain
  * id, with no foreign key (./capacity-lock-order.ts). A graph delete therefore
  * leaves their rows behind; these sweepers (writer class S) clean them up.
  * Every statement takes its rows with SKIP LOCKED and none takes a fence, so
@@ -17,7 +17,8 @@
  * - {@link pruneTerminalCapacityHistory}: retention of terminal admission
  *   history (requests with their waiters and lease), which no longer blocks a
  *   parent delete and so needs its own bound.
- * - {@link pruneOrphanCapacityRuntime}: scheduler state of deleted capacities.
+ * - {@link pruneOrphanCapacityScheduler}: scheduler state of deleted instances.
+ * - {@link pruneOldNodeCommands}: node command state past its retention.
  *
  * Live admission rows of a deleted parent are terminalized by the admission
  * store's orphan sweep (apps/server/src/model-api/capacity/postgres-store.ts,
@@ -152,18 +153,38 @@ export async function pruneExpiredStickiness(
   );
 }
 
-/** Deletes `capacity_runtime` rows whose capacity no longer exists. */
-export async function pruneOrphanCapacityRuntime(
+/** Deletes `capacity_scheduler` rows whose instance (capacityId) no longer exists. */
+export async function pruneOrphanCapacityScheduler(
   db: SweepDb,
   { batch = HOT_PATH_SWEEP_BATCH }: { batch?: number } = {},
 ): Promise<number> {
   return sweepLoop(
     () => db.$executeRaw`
-      DELETE FROM capacity_runtime
+      DELETE FROM capacity_scheduler
        WHERE "capacityId" IN (
-         SELECT runtime."capacityId" FROM capacity_runtime runtime
+         SELECT scheduler."capacityId" FROM capacity_scheduler scheduler
           WHERE NOT EXISTS (
-            SELECT 1 FROM inference_capacity capacity WHERE capacity.id = runtime."capacityId")
+            SELECT 1 FROM runtime_instance instance WHERE instance.id = scheduler."capacityId")
+          LIMIT ${batch}
+            FOR UPDATE SKIP LOCKED)`,
+    batch,
+  );
+}
+
+/** Node command state (`node_command`) is kept 30 days after the command started. */
+export const NODE_COMMAND_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Deletes finished node commands older than `before` (never a running one). */
+export async function pruneOldNodeCommands(
+  db: SweepDb,
+  { before, batch = HOT_PATH_SWEEP_BATCH }: { before: Date; batch?: number },
+): Promise<number> {
+  return sweepLoop(
+    () => db.$executeRaw`
+      DELETE FROM node_command
+       WHERE id IN (
+         SELECT id FROM node_command
+          WHERE state <> 'RUNNING' AND "startedAt" < ${before}
           LIMIT ${batch}
             FOR UPDATE SKIP LOCKED)`,
     batch,
@@ -230,7 +251,7 @@ export async function purgeDeletedUserHistory(
     batch,
   );
   processed += await sweepLoop(
-    () => deleteOwnedBatch(db, "capacity_runtime", "capacityId", "userId", userId, batch),
+    () => deleteOwnedBatch(db, "capacity_scheduler", "capacityId", "userId", userId, batch),
     batch,
   );
   processed += await sweepLoop(
@@ -256,7 +277,7 @@ export async function purgeDeletedUserHistory(
   for (const table of [
     "usage_rollup_minute",
     "usage_rollup_hour",
-    "engine_load_rollup_minute",
+    "runtime_load_minute",
     "node_metrics_minute",
   ])
     processed += await sweepLoop(
@@ -278,8 +299,31 @@ export async function purgeDeletedUserHistory(
       throw error;
     }
   }, batch);
-  // History keyed by a plain user id outside the hot path (the agent audit
-  // log and the deployment operator audit). A row the drain skipped (locked)
+  // The user's cloud spend: settlements, then reservations (the user-deletion writer
+  // setting lets their trigger allow the delete), then the ledger.
+  processed += await sweepLoop(
+    () => deleteOwnedBatch(db, "spend_settlement", "ctid", "userId", userId, batch),
+    batch,
+  );
+  processed += await sweepLoop(
+    () =>
+      db.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT set_config('wsmp.user_deletion_writer', 'on', true)`;
+        return tx.$executeRaw`
+          DELETE FROM spend_reservation WHERE ctid = ANY(ARRAY(
+            SELECT r.ctid FROM spend_reservation r
+             WHERE r."userId" = ${userId}
+               AND NOT EXISTS (SELECT 1 FROM spend_settlement s WHERE s."reservationId" = r.id)
+             LIMIT ${batch} FOR UPDATE SKIP LOCKED))`;
+      }),
+    batch,
+  );
+  processed += await sweepLoop(
+    () => deleteOwnedBatch(db, "usage_ledger", "ctid", "userId", userId, batch),
+    batch,
+  );
+  // History keyed by a plain user id outside the hot path (node and account audit). A row
+  // the drain skipped (locked)
   // or an event written after the drain (a queued audit write, another
   // replica) is taken here, and counts as remaining until it is gone, so the
   // entry is not retired early.
@@ -309,8 +353,10 @@ export async function purgeDeletedUserHistory(
                     WHERE "ownerUserId" = ${userId} OR "requesterUserId" = ${userId})
         OR EXISTS (SELECT 1 FROM usage_rollup_hour
                     WHERE "ownerUserId" = ${userId} OR "requesterUserId" = ${userId})
-        OR EXISTS (SELECT 1 FROM engine_load_rollup_minute WHERE "ownerUserId" = ${userId})
+        OR EXISTS (SELECT 1 FROM runtime_load_minute WHERE "ownerUserId" = ${userId})
         OR EXISTS (SELECT 1 FROM node_metrics_minute WHERE "ownerUserId" = ${userId})
+        OR EXISTS (SELECT 1 FROM spend_reservation WHERE "userId" = ${userId})
+        OR EXISTS (SELECT 1 FROM usage_ledger WHERE "userId" = ${userId})
         AS remaining`;
   return { processed, remaining: plainRemaining || (left?.remaining ?? true) };
 }

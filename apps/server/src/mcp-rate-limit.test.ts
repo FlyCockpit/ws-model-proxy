@@ -13,25 +13,24 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     BETTER_AUTH_URL: "https://proxy.example.com",
     BETTER_AUTH_SECRET: "parity-test-secret-at-least-thirty-two-characters",
     CORS_ORIGIN: undefined,
-    RATE_LIMIT_AUTH_POINTS: 10,
-    RATE_LIMIT_AUTH_DURATION: 60,
-    RATE_LIMIT_AUTH_BLOCK_DURATION: 900,
-    RATE_LIMIT_SIGNUP_POINTS: 3,
-    RATE_LIMIT_SIGNUP_DURATION: 3600,
-    RATE_LIMIT_SIGNUP_BLOCK_DURATION: 3600,
-    RATE_LIMIT_RPC_POINTS: 100,
-    RATE_LIMIT_RPC_DURATION: 60,
-    RATE_LIMIT_EMAIL_RECIPIENT_POINTS: 3,
-    RATE_LIMIT_EMAIL_RECIPIENT_DURATION: 3600,
-    RATE_LIMIT_EMAIL_RECIPIENT_BLOCK_DURATION: 0,
-    RATE_LIMIT_SIGNUP_RECIPIENT_POINTS: 6,
-    RATE_LIMIT_MCP_POINTS: 2,
-    RATE_LIMIT_MCP_DURATION: 60,
-    RATE_LIMIT_MCP_CONSENT_POINTS: 2,
-    RATE_LIMIT_MCP_CONSENT_DURATION: 60,
+    WMP_RATE_LIMIT_SCALE: 1,
     TRUST_PROXY_HOPS: undefined,
   },
 }));
+
+// Small MCP buckets (2 points) so a few requests exhaust them. The MCP
+// limiter modules build their buckets from these exported constants at import.
+vi.mock("./rate-limit.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./rate-limit.js")>();
+  return {
+    ...actual,
+    DEFAULTS: {
+      ...actual.DEFAULTS,
+      mcp: { points: 2, duration: 60 },
+      mcpConsent: { points: 2, duration: 60 },
+    },
+  };
+});
 
 const mockGetConnInfo = vi.hoisted(() => vi.fn(() => ({ remote: { address: "10.0.0.1" } })));
 vi.mock("@hono/node-server/conninfo", () => ({ getConnInfo: mockGetConnInfo }));
@@ -127,7 +126,7 @@ describe("key builders and prefixes", () => {
 
   it("identity buckets are independent per (sub, client_id) pair", async () => {
     await mcpIdentityQuotaLimiter.consume(mcpIdentityKey("u1", "c1"), 1);
-    // Exhaust u1/c1 (points = 2 in the mocked env).
+    // Exhaust u1/c1 (DEFAULTS.mcp.points = 2 in the rate-limit mock).
     await mcpIdentityQuotaLimiter.consume(mcpIdentityKey("u1", "c1"), 1);
     await expect(
       mcpIdentityQuotaLimiter.consume(mcpIdentityKey("u1", "c1"), 1),

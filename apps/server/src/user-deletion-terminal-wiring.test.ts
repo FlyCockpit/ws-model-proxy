@@ -6,18 +6,13 @@ import {
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("./relay/cli-commands.js", () => ({
-  startCliCommand: vi.fn(),
-  waitCliCommand: vi.fn(),
-  snapshotCliCommand: vi.fn(),
-  cancelCommandsForToken: vi.fn(),
-  cancelCommandsForUser: vi.fn(),
-  startSupervisedCommand: vi.fn(),
-  snapshotSupervisedCommand: vi.fn(),
-  listPendingSupervised: vi.fn(() => []),
-  submitSupervisedOutput: vi.fn(),
+vi.mock("./relay/node-commands.js", () => ({
+  nodeCommandTracker: {},
+  cancelNodeCommandsForCredentials: vi.fn(async () => 0),
+  cancelNodeCommandsForUser: vi.fn(),
+  sweepExpiredNodeCommands: vi.fn(async () => 0),
 }));
-vi.mock("./relay/cli-file-ops.js", () => ({
+vi.mock("./relay/node-file-ops.js", () => ({
   runFileOp: vi.fn(),
   cancelFileOpsForToken: vi.fn(),
   cancelFileOpsForUser: vi.fn(),
@@ -33,27 +28,7 @@ const envMock = vi.hoisted(() => ({
   BETTER_AUTH_URL: "https://proxy.example.com",
   BETTER_AUTH_SECRET: "contract-test-secret-at-least-thirty-two-characters",
   CORS_ORIGIN: "https://app.example.com",
-  RATE_LIMIT_AUTH_POINTS: 500,
-  RATE_LIMIT_AUTH_DURATION: 60,
-  RATE_LIMIT_AUTH_BLOCK_DURATION: 0,
-  RATE_LIMIT_SIGNIN_FAILURE_POINTS: 10,
-  RATE_LIMIT_SIGNIN_FAILURE_DURATION: 900,
-  RATE_LIMIT_SIGNIN_FAILURE_BLOCK_DURATION: 600,
-  RATE_LIMIT_SIGNUP_POINTS: 3,
-  RATE_LIMIT_SIGNUP_DURATION: 3600,
-  RATE_LIMIT_SIGNUP_BLOCK_DURATION: 3600,
-  RATE_LIMIT_RPC_POINTS: 1000,
-  RATE_LIMIT_RPC_DURATION: 60,
-  RATE_LIMIT_EMAIL_RECIPIENT_POINTS: 3,
-  RATE_LIMIT_EMAIL_RECIPIENT_DURATION: 3600,
-  RATE_LIMIT_EMAIL_RECIPIENT_BLOCK_DURATION: 0,
-  RATE_LIMIT_SIGNUP_RECIPIENT_POINTS: 6,
-  RATE_LIMIT_MCP_POINTS: 2,
-  RATE_LIMIT_MCP_DURATION: 60,
-  RATE_LIMIT_MCP_CONSENT_POINTS: 2,
-  RATE_LIMIT_MCP_CONSENT_DURATION: 60,
-  RATE_LIMIT_MCP_REGISTRATION_POINTS: 2,
-  RATE_LIMIT_MCP_REGISTRATION_DURATION: 60,
+  WMP_RATE_LIMIT_SCALE: 1,
   TRUST_PROXY_HOPS: undefined,
   MEDIA_MAX_UPLOAD_BYTES: 5 * 1024 * 1024,
   MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES: 1024 * 1024,
@@ -100,8 +75,10 @@ const { admitBrowserConnection, terminalBrowserHub } = await import(
   "./relay/terminal-websocket.js"
 );
 const { relaySessionManager } = await import("./relay/session-manager.js");
-const { cancelCommandsForUser } = await import("./relay/cli-commands.js");
-const { cancelFileOpsForUser } = await import("./relay/cli-file-ops.js");
+const { cancelNodeCommandsForUser: cancelCommandsForUser } = await import(
+  "./relay/node-commands.js"
+);
+const { cancelFileOpsForUser } = await import("./relay/node-file-ops.js");
 
 const db = prisma as unknown as { session: { findUnique: MockInstance } };
 

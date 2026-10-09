@@ -1,11 +1,11 @@
-// Client-side image attachment helpers for the chat-test composer.
+// Client-side attachment helpers for the Test page composer (ported from the 0.3 Chat Test).
 //
 // Multimodal encode policy lives in `@ws-model-proxy/config/media-policy`.
 // This module performs browser I/O (decode, canvas, FileReader) and applies
 // that pure policy so model payloads stay compatible with local vision servers.
 //
 // Size budget rationale (see asset-plan.md "Size limits"):
-//   - The internal chat-test route enforces a global 10 MB Hono body limit.
+//   - The session Test routes enforce the global 10 MB Hono body limit.
 //   - The CLI relay streams request bodies; the 10 MB internal route body limit
 //     is the remaining ceiling for base64-through-relay.
 //   - Multi-turn history RE-SENDS every prior image as base64 each turn.
@@ -23,20 +23,15 @@ import {
   type MediaInputModality,
   type ModelInlineSafeImageMime,
   mediaInputInfo,
-  mediaModalityForMime,
   reencodeMimeChain,
 } from "@ws-model-proxy/config/media-policy";
 
 export type AttachmentModality = MediaInputModality;
 export type AttachmentModalities = Record<AttachmentModality, boolean>;
-export type AttachmentFileInfo = MediaInputInfo;
+type AttachmentFileInfo = MediaInputInfo;
 
 export function acceptedAttachmentAcceptAttr(modalities: AttachmentModalities): string {
   return acceptedMediaInputAcceptAttr(modalities);
-}
-
-export function attachmentModalityForType(type: string): AttachmentModality | null {
-  return mediaModalityForMime(type);
 }
 
 export function attachmentFileInfo(file: Pick<File, "name" | "type">): AttachmentFileInfo | null {
@@ -44,10 +39,10 @@ export function attachmentFileInfo(file: Pick<File, "name" | "type">): Attachmen
 }
 
 /** Longest edge after downscaling; matches the shared media-policy default. */
-export const MAX_IMAGE_EDGE = DEFAULT_IMAGE_MAX_EDGE;
+const MAX_IMAGE_EDGE = DEFAULT_IMAGE_MAX_EDGE;
 
 /** Re-encode quality for lossy JPEG output. */
-export const IMAGE_ENCODE_QUALITY = DEFAULT_IMAGE_ENCODE_QUALITY;
+const IMAGE_ENCODE_QUALITY = DEFAULT_IMAGE_ENCODE_QUALITY;
 
 /** Max number of images that may be attached to a single composer message. */
 export const MAX_ATTACHMENTS_PER_MESSAGE = 8;
@@ -56,20 +51,12 @@ export const MAX_ATTACHMENTS_PER_MESSAGE = 8;
 // prior inline attachment is re-sent with each chat turn.
 export const INLINE_ATTACHMENT_MAX_BYTES = 2 * 1024 * 1024; // ~2 MB
 
-// Soft warning threshold for the estimated total request body (JSON incl. all
-// base64 images across the whole thread). Warn as we approach the route limit.
-export const TOTAL_REQUEST_SOFT_WARN_BYTES = 8 * 1024 * 1024; // ~8 MB
-
 // Hard block: never send a request whose estimated body could exceed the
 // internal chat-test route's 10 MB Hono body limit. We stop below it to leave
 // headroom for JSON framing and non-image message content.
 export const TOTAL_REQUEST_HARD_MAX_BYTES = 9.5 * 1024 * 1024; // ~9.5 MB
 
-// Post-compression size at/below which we keep the Phase 0 base64 path even when
-// media upload is available. Small images stay embedded (offline-friendly,
-// fewer round trips); anything larger is uploaded so history stops re-sending
-// multi-hundred-KB base64 each turn. (Phase 1 / decision 3B.)
-export type ProcessedImage = {
+type ProcessedImage = {
   id: string;
   dataUrl: string;
   name: string;
@@ -77,11 +64,11 @@ export type ProcessedImage = {
   byteSize: number;
 };
 
-export type ProcessImageResult =
+type ProcessImageResult =
   | { ok: true; image: ProcessedImage }
   | { ok: false; reason: "unsupported" | "oversize" | "decodeFailed"; name: string };
 
-export type ProcessImageOptions = {
+type ProcessImageOptions = {
   /**
    * Encode profile for the model payload. Defaults to `model-inline-safe`
    * (JPEG/PNG only) so local OpenAI-compatible servers accept the data URL.
@@ -94,7 +81,7 @@ export type ProcessImageOptions = {
 };
 
 // Decoded byte size of a base64 `data:` URL payload (excludes the header).
-export function dataUrlByteSize(dataUrl: string): number {
+function dataUrlByteSize(dataUrl: string): number {
   const comma = dataUrl.indexOf(",");
   if (comma === -1) return 0;
   const base64 = dataUrl.slice(comma + 1);
@@ -129,7 +116,7 @@ export function readFileAsDataUrl(file: File, mime?: string): Promise<string> {
 }
 
 /** Replace a browser-supplied data URL MIME with the shared canonical MIME. */
-export function rewriteDataUrlMime(dataUrl: string, mime: string): string {
+function rewriteDataUrlMime(dataUrl: string, mime: string): string {
   if (!dataUrl.startsWith("data:")) return dataUrl;
   const comma = dataUrl.indexOf(",");
   return comma === -1 ? dataUrl : `data:${mime};base64,${dataUrl.slice(comma + 1)}`;

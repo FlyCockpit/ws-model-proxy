@@ -1,0 +1,20 @@
+{
+  "type": "runtime.define.result",
+  "opId": "def-2",
+  "chunkIndex": 0,
+  "final": true,
+  "results": [
+    {
+      "runtimeId": "rt2p9o8i7u6y5t4r3e2w1q0a9",
+      "versionId": "vr2z9y8x7w6v5u4t3s2r1q0p9",
+      "status": "rejected",
+      "reason": "base_url_not_allowed",
+      "detail": "address.baseUrl"
+    }
+  ],
+  "held": [],
+  "heldMetricCommandsHash": null,
+  "heldPortRange": null,
+  "heldFabricsHash": null,
+  "frozen": false
+}

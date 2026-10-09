@@ -1,0 +1,16 @@
+{
+  "heading": "Something needs you",
+  "stepSubject": "{{name}}: a step waits for you",
+  "stepBody": "An interactive step of the runtime {{name}} waits for you: a command you run yourself in a terminal on the node (for example one that asks for a sudo password).",
+  "stepCta": "Open Terminals",
+  "restartSubject": "{{name}} needs a restart",
+  "restartBody": "The runtime {{name}} stopped. Its start is one you run yourself, so WS Model Proxy does not restart it on its own: restart it when you are ready.",
+  "restartCta": "Open the runtime",
+  "markStoppedSubject": "{{name}}: mark as stopped",
+  "markStoppedBody": "An instance of the runtime {{name}} lost touch with its node, and WS Model Proxy cannot prove it stopped. When you know it is down, choose Mark as stopped on the runtime page.",
+  "markStoppedCta": "Open the runtime",
+  "queuedCommandSubject": "An agent queued a command for you on {{name}}",
+  "queuedCommandBody": "An agent queued a command for you to run on the node {{name}}. Review it in Terminals, then run it or dismiss it.",
+  "queuedCommandCta": "Open Terminals",
+  "footer": "You get this email because operational alerts are on in your settings. Agents cannot answer these for you."
+}

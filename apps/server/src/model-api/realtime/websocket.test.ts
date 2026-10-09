@@ -1,21 +1,14 @@
 import type { WebSocketLike } from "@hono/node-server";
-import type { ModelApiTokenIdentity } from "@ws-model-proxy/api/lib/model-api-token-access";
 import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
+import type { ApiKeyIdentity } from "../resolve.js";
 import { dashboardRequester, tokenRequester } from "./requester.js";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     BETTER_AUTH_URL: "https://proxy.example.test",
-    RATE_LIMIT_AUTH_POINTS: 100,
-    RATE_LIMIT_AUTH_DURATION: 60,
-    RATE_LIMIT_AUTH_BLOCK_DURATION: 60,
-    RATE_LIMIT_SIGNUP_POINTS: 100,
-    RATE_LIMIT_SIGNUP_DURATION: 60,
-    RATE_LIMIT_SIGNUP_BLOCK_DURATION: 60,
-    RATE_LIMIT_RPC_POINTS: 100,
-    RATE_LIMIT_RPC_DURATION: 60,
+    WMP_RATE_LIMIT_SCALE: 1,
     TRUST_PROXY_HOPS: undefined,
   },
 }));
@@ -61,17 +54,15 @@ const {
 
 type Deps = Parameters<typeof realtimeSocketEvents>[1];
 
-const TOKEN: ModelApiTokenIdentity = {
+const TOKEN: ApiKeyIdentity = {
   id: "token-1",
   userId: "user-1",
-  scopeMode: "ALL_VISIBLE",
-  allowExternal: false,
-  externalAfterWaitMs: null,
-  lookupPrefix: "wsmp_model_abc",
+  scope: "ALL_POOLS",
+  lookupPrefix: "wsmp_key_abc",
   expiresAt: null,
   lastUsedAt: null,
 };
-const SECRET = "wsmp_model_secret";
+const SECRET = "wsmp_key_secret";
 
 function deps(overrides: Partial<Deps> = {}) {
   const hub = new SttRelayHub({ resolveLink: () => ({ ok: false, reason: "offline" }) });
@@ -83,7 +74,7 @@ function deps(overrides: Partial<Deps> = {}) {
   const value: Deps = {
     relay: {
       createSttSession: (input) => hub.createSession(input),
-      getActiveCliDeviceIds: () => [],
+      getOnlineNodeIds: () => [],
       isDraining: () => draining.value,
     },
     counters,
@@ -149,10 +140,26 @@ describe("realtime upgrade middleware", () => {
     const path = "/v1/realtime?intent=transcription";
     expect((await app(t.deps).request(path, upgrade())).status).toBe(401);
     expect(
-      (await app(t.deps).request(path, upgrade({ Authorization: "Bearer wsmp_model_wrong" })))
-        .status,
+      (await app(t.deps).request(path, upgrade({ Authorization: "Bearer wsmp_key_wrong" }))).status,
     ).toBe(401);
     expect(t.counters.count("server")).toBe(0);
+  });
+
+  it("accepts x-api-key and api-key, and refuses two different keys", async () => {
+    const t = deps();
+    const path = "/v1/realtime?intent=transcription&model=owner%2Fasr";
+    const single: Record<string, string>[] = [{ "x-api-key": SECRET }, { "api-key": SECRET }];
+    for (const headers of single)
+      expect(await (await app(t.deps).request(path, upgrade(headers))).text()).toBe("upgraded");
+    const conflicting: Record<string, string>[] = [
+      { Authorization: `Bearer ${SECRET}`, "x-api-key": "wsmp_key_other" },
+      {
+        Authorization: `Bearer ${SECRET}`,
+        "Sec-WebSocket-Protocol": "realtime, openai-insecure-api-key.wsmp_key_other",
+      },
+    ];
+    for (const headers of conflicting)
+      expect((await app(t.deps).request(path, upgrade(headers))).status).toBe(401);
   });
 
   it("accepts the bearer header or the browser subprotocol key, and holds an admission", async () => {
@@ -294,11 +301,10 @@ describe("realtime socket events", () => {
           ok: true,
           candidates: [
             {
-              cliDeviceId: "cli",
-              endpointSlug: "inst-aaaaaaaaaaaaaaaa",
+              nodeId: "node",
+              handle: "i-aaaaaaaaaaaa",
               upstreamModel: "m",
               capabilities: null,
-              deploymentManaged: true,
               memberId: null,
             },
           ],
@@ -322,7 +328,7 @@ describe("realtime socket events", () => {
     events.onOpen?.(new Event("open"), ws);
     events.onClose?.(new CloseEvent("close"), ws);
     expect(createMeter).toHaveBeenCalledWith({
-      source: "API_TOKEN",
+      source: "API_KEY",
       tokenId: TOKEN.id,
       userId: TOKEN.userId,
       tokenLookupPrefix: TOKEN.lookupPrefix,
@@ -357,12 +363,12 @@ describe("realtime socket events", () => {
       [
         {
           userId: TOKEN.userId,
-          source: "API_TOKEN",
+          source: "API_KEY",
           tokenId: TOKEN.id,
           tokenLookupPrefix: TOKEN.lookupPrefix,
         },
       ],
-      [{ userId: "user-1", source: "CHAT_TEST", tokenId: null, tokenLookupPrefix: null }],
+      [{ userId: "user-1", source: "TEST", tokenId: null, tokenLookupPrefix: null }],
     ]);
     expect(authorizeOpen.mock.calls).toEqual([
       [{ tokenId: TOKEN.id, userId: TOKEN.userId }],

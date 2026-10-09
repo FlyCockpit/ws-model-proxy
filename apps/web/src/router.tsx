@@ -7,6 +7,7 @@ import { getRequestHeader } from "@tanstack/react-start/server";
 import ErrorState from "./components/error-state";
 import Loader from "./components/loader";
 import i18n from "./i18n";
+import { MAIN_SCROLLER_SELECTOR } from "./lib/main-scroller";
 import { routeTree } from "./routeTree.gen";
 import { type DeletionEntity } from "./utils/friendly-error";
 import { createAppMutationCache } from "./utils/mutation-error-toast";
@@ -55,7 +56,14 @@ export function getRouter() {
     defaultPendingComponent: () => <Loader />,
     defaultErrorComponent: ErrorState,
     context: { orpc, queryClient },
+    // The document never scrolls; <main> does. Back/forward restore its position (keyed by
+    // its data-scroll-restoration-id) and a new navigation starts it at the top. In-page
+    // search-param updates pass `resetScroll: false` to keep the reader's place.
     scrollRestoration: true,
+    scrollToTopSelectors: [MAIN_SCROLLER_SELECTOR],
+    // `#id` targets are revealed by useHashTargetScroll (root component), which waits for gated
+    // content to mount and leaves back/forward to the restored position.
+    defaultHashScrollIntoView: false,
     // CSP nonce for SSR-injected inline scripts (hydration, etc.). Matches the
     // nonce in the script-src CSP header set by the API server. undefined on
     // the client (the document already carries the server-rendered nonce).

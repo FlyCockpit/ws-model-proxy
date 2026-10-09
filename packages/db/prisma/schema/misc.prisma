@@ -1,0 +1,52 @@
+// ───────────────────────────── Misc ─────────────────────────────
+
+/// Owner-scoped history of configuration changes (pools, runtimes, profiles, access,
+/// providers, spend caps, node trust grants). Replaces CapacityAuditEvent and
+/// ProviderAuditEvent. Plain ids, append-only; drained on user deletion.
+model AuditEvent {
+  id           String   @id @default(cuid(2))
+  createdAt    DateTime @default(now())
+  userId       String
+  actor        Actor
+  actorUserId  String
+  agentTokenId String?
+  /// The OAuth grant (`McpGrant.id`) when an OAuth client acted; at most one of the two is set.
+  mcpGrantId   String?
+  /// e.g. pool.update, pool.fallback.mode, runtime.version.create, share.create,
+  /// spend_cap.update, provider.credential.replace, node.trust_lower.
+  action       String
+  resourceType String
+  resourceId   String
+  before       Json?
+  after        Json?
+
+  @@index([userId, createdAt])
+  @@index([resourceType, resourceId, createdAt])
+  @@map("audit_event")
+}
+
+/// Metadata only; bytes live in the MediaStore.
+model MediaAsset {
+  id        String   @id @default(cuid(2))
+  createdAt DateTime @default(now())
+  userId    String
+  mime      String
+  sizeBytes Int
+  sha256    String
+  expiresAt DateTime
+
+  User User @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([expiresAt])
+  @@index([userId, sha256])
+  @@map("media_asset")
+}
+
+/// A deleted user whose hot-path history may still hold rows; the purge sweeper finishes it.
+model DeletedUserPurge {
+  userId    String   @id
+  deletedAt DateTime @default(now())
+
+  @@index([deletedAt])
+  @@map("deleted_user_purge")
+}
