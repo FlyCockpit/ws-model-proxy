@@ -579,14 +579,44 @@ export class RuntimeLifecycle {
     await this.settleStopping(tx, { ...instance, phase: "STOPPING", phaseReason: reason });
   }
 
+  /**
+   * Settles up to `BATCH * 4` STOPPING instances a tick, least recently taken first
+   * (`lastStopReconcileAt`, never taken first), so every stopping instance is reached however
+   * many there are. When a pass is full, each is claimed before its settle runs, in its own write
+   * that only succeeds while the stamp is the one read: an instance whose settle keeps failing
+   * still goes to the back of the line, and one another server process took first is skipped.
+   */
   private async reconcileStopping() {
     const rows = await prisma.runtimeInstance.findMany({
       where: { phase: "STOPPING", desiredState: { not: null } },
-      select: { id: true, userId: true },
-      orderBy: { phaseChangedAt: "asc" },
+      select: { id: true, userId: true, lastStopReconcileAt: true },
+      orderBy: [
+        { lastStopReconcileAt: { sort: "asc", nulls: "first" } },
+        { phaseChangedAt: "asc" },
+        { id: "asc" },
+      ],
       take: BATCH * 4,
     });
+    // Rotation only matters once a pass cannot take them all; below that every one settles each
+    // tick and nothing is written.
+    const rotate = rows.length === BATCH * 4;
     for (const row of rows) {
+      const claimed = !rotate
+        ? { count: 1 }
+        : await prisma.runtimeInstance
+            .updateMany({
+              where: {
+                id: row.id,
+                phase: "STOPPING",
+                lastStopReconcileAt: row.lastStopReconcileAt,
+              },
+              data: { lastStopReconcileAt: this.now() },
+            })
+            .catch((error: unknown) => {
+              console.error("[lifecycle] claiming a stop to reconcile failed", errorName(error));
+              return { count: 0 };
+            });
+      if (claimed.count === 0) continue;
       await this.write(row.userId, row.id, async (tx) => {
         const instance = await tx.runtimeInstance.findUnique({
           where: { id: row.id },
@@ -2094,6 +2124,7 @@ export class RuntimeLifecycle {
           claimChangedAt: now,
           markedStoppedAt: now,
           markedStoppedBy: MARKED_STOPPED_OWNER_INACTIVE,
+          lastStopCheckAt: null,
         },
       });
       marked += changed.count;
@@ -2425,9 +2456,9 @@ export class RuntimeLifecycle {
    * whatever the instance's phase (a STOPPED instance's hold is proven and released the same
    * way). Only ranks on connected nodes are read, so ranks on offline nodes never crowd them out.
    * A pass takes at most {@link BATCH} ranks that are due, least recently checked first, and
-   * stamps each one it checks (`lastStopCheckAt`), so every rank is reached however many there
-   * are. Each rank is re-read under its owner's fence: another server process that checked it in
-   * the meantime leaves it not due, and it is skipped.
+   * claims each one before checking it by stamping `lastStopCheckAt` while it is still due, so
+   * every rank is reached however many there are, a rank whose check fails waits its turn like
+   * the rest, and a rank another server process claimed first is skipped.
    */
   private async probeHeldUnknown() {
     const online = this.relay.onlineNodeIds?.();
@@ -2452,13 +2483,17 @@ export class RuntimeLifecycle {
       take: BATCH,
     });
     for (const rank of ranks) {
-      if (!rank.nodeId || !this.relay.nodeSession(rank.nodeId)) continue;
-      await this.write(rank.Instance.userId, rank.instanceId, async (tx) => {
-        const still = await tx.instanceRank.findFirst({
-          where: { id: rank.id, ...due() },
-          select: { id: true },
+      // Claimed first, in its own write: a rank whose check keeps failing (or whose node has no
+      // session here after all) still goes to the back of the line, and a rank another server
+      // process just claimed is no longer due here.
+      const claimed = await prisma.instanceRank
+        .updateMany({ where: { id: rank.id, ...due() }, data: { lastStopCheckAt: this.now() } })
+        .catch((error: unknown) => {
+          console.error("[lifecycle] claiming a rank marked stopped failed", errorName(error));
+          return { count: 0 };
         });
-        if (!still) return;
+      if (claimed.count === 0 || !rank.nodeId || !this.relay.nodeSession(rank.nodeId)) continue;
+      await this.write(rank.Instance.userId, rank.instanceId, async (tx) => {
         const checkedAt = await this.probeHeldRank(tx, rank);
         await tx.instanceRank.updateMany({
           where: { id: rank.id, claim: "HELD_UNKNOWN" },

@@ -303,6 +303,9 @@ model RuntimeInstance {
   /// Stable machine code for the last phase change (startup_failed, readiness_timeout,
   /// health_failed, node_offline, preempted, restart_budget_exhausted, …).
   phaseReason                 String?
+  /// When the stop reconciler last took this STOPPING instance (null: never). A pass takes the
+  /// least recently taken first, so every stopping instance is reached however many there are.
+  lastStopReconcileAt         DateTime?
   /// Windowed restart budget (non-interactive starts only).
   restartWindowStartedAt      DateTime?
   restartsInWindow            Int                 @default(0)

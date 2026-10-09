@@ -876,6 +876,7 @@ export const runtimesRouter = {
               claimChangedAt: now,
               markedStoppedAt: now,
               markedStoppedBy: userId,
+              lastStopCheckAt: null,
             },
           });
           for (const rank of ranks)
