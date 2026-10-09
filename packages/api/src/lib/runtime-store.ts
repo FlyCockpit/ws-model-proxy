@@ -9,7 +9,7 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import type { z } from "zod";
 import type { runtimeAdvancedPatchSchema, runtimeLimitsPatchSchema } from "../contracts/advanced";
 import { type CallerActor } from "./caller-actor";
-import { clearInstanceReleaseRequests } from "./claim-release";
+import { clearInstanceReleaseRequests, retakenClaim } from "./claim-release";
 import { refuseAbout } from "./refuse";
 import { applyJsonPatch } from "./registry-view";
 import type { RequestCompat } from "./request-compat";
@@ -336,14 +336,10 @@ export async function writePlannedStarts(
           where: {
             instanceId_rank: { instanceId: start.instanceId, rank: placement.nodeNumber - 1 },
           },
+          // The same retake as the engine's automatic restart: the old run's mark as
+          // stopped and release record go with it.
           data: {
-            claim: "HELD",
-            claimChangedAt: now,
-            stoppedAt: null,
-            lastStopCheckAt: null,
-            releasedUnprovenAt: null,
-            releasedUnprovenBy: null,
-            releasedUnprovenReason: null,
+            ...retakenClaim(now),
             port: placement.port,
             distPort: start.distPort,
             resources: placement.resources as Prisma.InputJsonObject,

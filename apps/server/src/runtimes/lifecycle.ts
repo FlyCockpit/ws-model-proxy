@@ -27,6 +27,7 @@ import { randomBytes } from "node:crypto";
 import {
   clearInstanceReleaseRequests,
   releaseClaim,
+  retakenClaim,
   sweepReleaseRequests,
 } from "@ws-model-proxy/api/lib/claim-release";
 import { sameStoredInstanceFacts, storedInstanceFacts } from "@ws-model-proxy/api/lib/engine-facts";
@@ -1048,18 +1049,7 @@ export class RuntimeLifecycle {
     }
     await tx.instanceRank.updateMany({
       where: { instanceId: instance.id },
-      data: {
-        claim: "HELD",
-        claimChangedAt: now,
-        stoppedAt: null,
-        markedStoppedAt: null,
-        markedStoppedBy: null,
-        lastStopCheckAt: null,
-        releasedUnprovenAt: null,
-        releasedUnprovenBy: null,
-        releasedUnprovenReason: null,
-        blockedBy: [],
-      },
+      data: { ...retakenClaim(now), blockedBy: [] },
     });
     // The claims are held by the new run: a request to release the old one has nothing left.
     await clearInstanceReleaseRequests(tx, instance.id, now);

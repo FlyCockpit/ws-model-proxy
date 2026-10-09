@@ -291,4 +291,65 @@ integration("releasing a claim whose stop cannot be proven, on PostgreSQL", () =
       }),
     ).toEqual({ claim: "HELD", releasedUnprovenAt: null, releasedUnprovenBy: null });
   });
+
+  it("a person's restart of a part marked stopped clears the mark, as the automatic restart does", async () => {
+    // The previous case restarted its instance: stop it, mark it stopped, ask for a release.
+    const rank = await modules.prisma.instanceRank.findFirstOrThrow({
+      where: { nodeId, claim: "HELD" },
+      select: { id: true, instanceId: true, Instance: { select: { runtimeId: true } } },
+    });
+    await agent().stop({ instanceId: rank.instanceId });
+    await client().instances.markStopped({ instanceId: rank.instanceId, note: "gone" });
+    const asked = await agent().releaseRequests.create({
+      instanceId: rank.instanceId,
+      findings: "looks gone",
+    });
+    expect(
+      await modules.prisma.instanceRank.findUniqueOrThrow({
+        where: { id: rank.id },
+        select: { claim: true, markedStoppedBy: true },
+      }),
+    ).toEqual({ claim: "HELD_UNKNOWN", markedStoppedBy: USER });
+
+    // A person restarts it: preview, then apply exactly that preview.
+    const preview = await client().start({
+      runtimeId: rank.Instance.runtimeId,
+      instanceId: rank.instanceId,
+      preview: true,
+    });
+    if (preview.mode !== "preview") throw new Error("expected a preview");
+    const applied = await client().start({
+      runtimeId: rank.Instance.runtimeId,
+      instanceId: rank.instanceId,
+      fingerprint: preview.preview.fingerprint,
+    });
+    expect(applied.mode).toBe("applied");
+    expect(
+      await modules.prisma.instanceRank.findUniqueOrThrow({
+        where: { id: rank.id },
+        select: {
+          claim: true,
+          stoppedAt: true,
+          markedStoppedAt: true,
+          markedStoppedBy: true,
+          lastStopCheckAt: true,
+          releasedUnprovenAt: true,
+        },
+      }),
+    ).toEqual({
+      claim: "HELD",
+      stoppedAt: null,
+      markedStoppedAt: null,
+      markedStoppedBy: null,
+      lastStopCheckAt: null,
+      releasedUnprovenAt: null,
+    });
+    // The new run holds the claim: the old request has nothing left to release.
+    expect(
+      await modules.prisma.claimReleaseRequest.findUniqueOrThrow({
+        where: { id: asked.requestId },
+        select: { state: true },
+      }),
+    ).toEqual({ state: "CLEARED" });
+  });
 });

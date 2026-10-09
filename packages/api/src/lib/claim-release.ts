@@ -65,6 +65,26 @@ export async function clearReleaseRequests(
   });
 }
 
+/**
+ * A rank's claim as a new run of its instance retakes it: held again, with nothing left of the
+ * old run's stop (no stop time, no mark as stopped, no stop check, no release without proof).
+ * Every restart writes these fields: the engine's automatic restart and a person's or agent's
+ * restart (`writePlannedStarts`).
+ */
+export function retakenClaim(now: Date) {
+  return {
+    claim: "HELD",
+    claimChangedAt: now,
+    stoppedAt: null,
+    markedStoppedAt: null,
+    markedStoppedBy: null,
+    lastStopCheckAt: null,
+    releasedUnprovenAt: null,
+    releasedUnprovenBy: null,
+    releasedUnprovenReason: null,
+  } as const satisfies Prisma.InstanceRankUpdateManyMutationInput;
+}
+
 /** A restart retakes every claim of the instance: its pending release requests end (CLEARED). */
 export async function clearInstanceReleaseRequests(
   tx: Tx,
