@@ -39,6 +39,9 @@ export const Route = createFileRoute("/$lang/_auth/_app/terminals")({
 /** The size a terminal opens at before the browser pane fits it. */
 const INITIAL_SIZE = { cols: 120, rows: 32 };
 
+/** Recently closed queued commands listed under the waiting ones. */
+const RECENTLY_CLOSED_SHOWN = 10;
+
 const APPROVAL_COMMAND_PREFIX = "wsmp terminal approve";
 
 /** Refusal reasons with their own copy; anything else shows the generic line. */
@@ -494,6 +497,14 @@ function QueuedCommands({
   const { t } = useTranslation(["terminals"]);
   const queryClient = useQueryClient();
   const queued = useQuery(orpc.nodes.queued.list.queryOptions({ input: { state: "QUEUED" } }));
+  // Recently closed ones with how they ended (decided rows are deleted after 7 days; the list
+  // comes most recently decided first, after the waiting ones); a failed load only hides them.
+  const recent = useQuery(orpc.nodes.queued.list.queryOptions({ input: {} }));
+  const closedAt = (item: { decidedAt: string | null; expiresAt: string }) =>
+    item.decidedAt ?? item.expiresAt;
+  const closed = (recent.data?.items.filter((item) => item.state !== "QUEUED") ?? [])
+    .sort((a, b) => closedAt(b).localeCompare(closedAt(a)))
+    .slice(0, RECENTLY_CLOSED_SHOWN);
   const invalidate = async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: orpc.nodes.queued.list.key() }),
@@ -570,6 +581,25 @@ function QueuedCommands({
             </div>
           ))
         )}
+        {closed.length > 0 ? (
+          <div className="flex min-w-0 flex-col gap-2 pt-3">
+            <h3 className="text-sm font-medium">{t("terminals:queuedClosedTitle")}</h3>
+            <ul className="flex min-w-0 flex-col gap-2">
+              {closed.map((item) => (
+                <li key={item.id} className="flex min-w-0 flex-col gap-0.5">
+                  <code className="truncate font-mono text-xs">{item.command}</code>
+                  <p className="text-xs text-muted-foreground">
+                    {t(`terminals:queuedState.${item.state}`)} ·{" "}
+                    {t("terminals:onNode", {
+                      node: slugOf(item.nodeId) ?? t("terminals:unknownNode"),
+                    })}{" "}
+                    · <TimeAgo value={closedAt(item)} />
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   );

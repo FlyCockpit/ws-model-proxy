@@ -108,6 +108,7 @@ const queuedRow = {
   note: "needs sudo",
   state: "QUEUED" as const,
   agentTokenId: "tok1",
+  mcpGrantId: null,
   createdAt: new Date(),
   expiresAt: new Date(Date.now() + 3_600_000),
   decidedAt: null,
@@ -438,6 +439,125 @@ describe("node_command_get on a queued command", () => {
   });
 });
 
+describe("node_command_get cancel withdraws a queued command", () => {
+  const queuedId = "x9k2m4p6r8t0v1w3y5z7a9b1";
+  const OAUTH_AGENT: CallerAuth = {
+    kind: "oauth_access_token",
+    userId: "owner",
+    grantId: "grant1",
+    level: "FULL",
+  };
+
+  function queued(overrides: Record<string, unknown> = {}) {
+    return { ...queuedRow, id: queuedId, ...overrides };
+  }
+
+  beforeEach(() => {
+    db.nodeCommand.findFirst.mockResolvedValue(null);
+  });
+
+  it("withdraws the caller's own QUEUED command, guarded and audited", async () => {
+    db.queuedNodeCommand.findFirst.mockResolvedValue(queued() as never);
+    db.queuedNodeCommand.updateMany.mockResolvedValue({ count: 1 });
+    db.queuedNodeCommand.findUnique.mockResolvedValue(
+      queued({ state: "WITHDRAWN", decidedAt: new Date() }) as never,
+    );
+    await expect(
+      client(FULL_AGENT, operator()).commands.get({ commandId: queuedId, cancel: true }),
+    ).resolves.toMatchObject({ commandId: queuedId, queuedForUser: true, state: "WITHDRAWN" });
+    const update = db.queuedNodeCommand.updateMany.mock.calls[0]?.[0];
+    expect(update?.where).toMatchObject({
+      id: queuedId,
+      userId: "owner",
+      state: "QUEUED",
+      agentTokenId: "tok1",
+      mcpGrantId: null,
+    });
+    expect(update?.where?.expiresAt).toEqual({ gt: expect.any(Date) });
+    expect(update?.data).toMatchObject({ state: "WITHDRAWN", decidedBy: "tok1" });
+    expect(db.nodeAuditEvent.create.mock.calls[0]?.[0].data).toMatchObject({
+      userId: "owner",
+      nodeId: "node1",
+      actor: "AGENT",
+      agentTokenId: "tok1",
+      mcpGrantId: null,
+      kind: "command_queued_for_user",
+      outcome: "cancelled",
+    });
+  });
+
+  it("withdraws through the same OAuth grant that queued it", async () => {
+    db.queuedNodeCommand.findFirst.mockResolvedValue(
+      queued({ agentTokenId: null, mcpGrantId: "grant1" }) as never,
+    );
+    db.queuedNodeCommand.updateMany.mockResolvedValue({ count: 1 });
+    db.queuedNodeCommand.findUnique.mockResolvedValue(
+      queued({ agentTokenId: null, mcpGrantId: "grant1", state: "WITHDRAWN" }) as never,
+    );
+    await expect(
+      client(OAUTH_AGENT, operator()).commands.get({ commandId: queuedId, cancel: true }),
+    ).resolves.toMatchObject({ state: "WITHDRAWN" });
+    expect(db.queuedNodeCommand.updateMany.mock.calls[0]?.[0]?.where).toMatchObject({
+      agentTokenId: null,
+      mcpGrantId: "grant1",
+    });
+    expect(db.queuedNodeCommand.updateMany.mock.calls[0]?.[0]?.data).toMatchObject({
+      decidedBy: "grant1",
+    });
+  });
+
+  it("refuses a command another credential queued, changing nothing", async () => {
+    for (const [auth, row] of [
+      [FULL_AGENT, queued({ agentTokenId: "tok2" })],
+      [FULL_AGENT, queued({ agentTokenId: null, mcpGrantId: "grant1" })],
+      [OAUTH_AGENT, queued()],
+      [OAUTH_AGENT, queued({ agentTokenId: null, mcpGrantId: "grant2" })],
+    ] as const) {
+      db.queuedNodeCommand.findFirst.mockResolvedValue(row as never);
+      await expect(
+        client(auth, operator()).commands.get({ commandId: queuedId, cancel: true }),
+      ).rejects.toMatchObject({ code: "FORBIDDEN", data: { reason: "not_your_command" } });
+    }
+    expect(db.queuedNodeCommand.updateMany).not.toHaveBeenCalled();
+    expect(db.nodeAuditEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses a person (they dismiss it on the Terminals page) and a Read-only agent", async () => {
+    db.queuedNodeCommand.findFirst.mockResolvedValue(queued() as never);
+    await expect(
+      client(PERSON, operator()).commands.get({ commandId: queuedId, cancel: true }),
+    ).rejects.toMatchObject({ data: { reason: "not_your_command" } });
+    await expect(
+      client(READ_AGENT, operator()).commands.get({ commandId: queuedId, cancel: true }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(db.queuedNodeCommand.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("never changes a command a person already decided", async () => {
+    for (const state of ["RUN", "DISMISSED", "REFUSED", "EXPIRED", "WITHDRAWN"] as const) {
+      db.queuedNodeCommand.findFirst.mockResolvedValue(
+        queued({ state, decidedAt: new Date() }) as never,
+      );
+      await expect(
+        client(FULL_AGENT, operator()).commands.get({ commandId: queuedId, cancel: true }),
+      ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "command_not_running" } });
+    }
+    expect(db.queuedNodeCommand.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("refuses when a person decides it between the read and the guarded update", async () => {
+    db.queuedNodeCommand.findFirst.mockResolvedValue(queued() as never);
+    db.queuedNodeCommand.updateMany.mockResolvedValue({ count: 0 });
+    db.queuedNodeCommand.findUnique.mockResolvedValue(
+      queued({ state: "RUN", decidedAt: new Date() }) as never,
+    );
+    await expect(
+      client(FULL_AGENT, operator()).commands.get({ commandId: queuedId, cancel: true }),
+    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "command_not_running" } });
+    expect(db.nodeAuditEvent.create).not.toHaveBeenCalled();
+  });
+});
+
 describe("browser terminals and queued commands", () => {
   it("never opens a terminal or runs a queued command for an agent", async () => {
     for (const call of [
@@ -469,6 +589,20 @@ describe("browser terminals and queued commands", () => {
     });
     // The terminal is audited when the socket redeems the ticket (apps/server), not at mint.
     expect(db.nodeAuditEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("lists waiting commands first, then the most recently decided", async () => {
+    db.queuedNodeCommand.findMany.mockResolvedValue([
+      queuedRow,
+      { ...queuedRow, id: "q2", state: "WITHDRAWN", decidedAt: new Date() },
+    ] as never);
+    await expect(client(PERSON).queued.list({})).resolves.toMatchObject({
+      items: [{ state: "QUEUED" }, { id: "q2", state: "WITHDRAWN" }],
+    });
+    expect(db.queuedNodeCommand.findMany.mock.calls[0]?.[0]?.orderBy).toEqual([
+      { decidedAt: { sort: "desc", nulls: "first" } },
+      { createdAt: "desc" },
+    ]);
   });
 
   it("refuses a queued command from a person before writing anything", async () => {

@@ -33,6 +33,8 @@ const {
   deleteExpiredKvEvictions,
   deleteExpiredRuntimeLoadMinutes,
   deleteExpiredNodeMetricsMinutes,
+  deleteDecidedQueuedNodeCommands,
+  expireOverdueQueuedNodeCommands,
   KV_EVICTION_RETENTION_MS,
   hourIncrementsFromMinuteRows,
   ROUTING_VERDICT_RETENTION_MS,
@@ -138,6 +140,8 @@ describe("usage retention", () => {
       kvEvictionsDeleted: 0,
       runtimeLoadMinutesDeleted: 0,
       nodeMetricsMinutesDeleted: 0,
+      queuedCommandsExpired: 0,
+      queuedCommandsDeleted: 0,
     });
     expect(tx.$executeRaw).not.toHaveBeenCalled();
   });
@@ -197,6 +201,88 @@ describe("usage retention", () => {
       0,
     );
     expect(statements).toEqual([]);
+  });
+
+  it("expires overdue QUEUED commands in guarded SKIP LOCKED batches, fence-checked", async () => {
+    const { prisma } = fakePrisma();
+    const statements: Sql[] = [];
+    let round = 0;
+    prisma.$executeRaw.mockImplementation(
+      async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        statements.push({ sql: strings.join("?"), values });
+        round += 1;
+        return round === 1 ? 2 : 1;
+      },
+    );
+    await expect(
+      expireOverdueQueuedNodeCommands({ prisma: prisma as never, now: NOW, batch: 2 }),
+    ).resolves.toBe(3);
+    expect(statements).toHaveLength(2);
+    const sql = statements[0]?.sql.replace(/\s+/g, " ") ?? "";
+    expect(sql).toContain("UPDATE queued_node_command SET state = 'EXPIRED'");
+    expect(sql).toContain('"decidedBy" = NULL');
+    // The guard is on the outer UPDATE too: a row decided meanwhile is never rewritten.
+    expect(sql).toMatch(
+      /WHERE state = 'QUEUED'::"QueuedCommandState" AND "expiresAt" <= \? AND id = ANY\(ARRAY\(/,
+    );
+    expect(sql).toContain('ORDER BY "expiresAt" LIMIT ? FOR UPDATE SKIP LOCKED');
+    expect(statements[0]?.values).toContain(NOW);
+    expect(statements[0]?.values).toContain(2);
+    armDbShutdownFence();
+    statements.length = 0;
+    await expect(
+      expireOverdueQueuedNodeCommands({ prisma: prisma as never, now: NOW, batch: 2 }),
+    ).resolves.toBe(0);
+    expect(statements).toEqual([]);
+  });
+
+  it("deletes only decided queued commands past their 7 days, in SKIP LOCKED batches", async () => {
+    const { prisma } = fakePrisma();
+    const statements: Sql[] = [];
+    let round = 0;
+    prisma.$executeRaw.mockImplementation(
+      async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        statements.push({ sql: strings.join("?"), values });
+        round += 1;
+        return round < 3 ? 5 : 0;
+      },
+    );
+    await expect(
+      deleteDecidedQueuedNodeCommands({ prisma: prisma as never, now: NOW, batch: 5 }),
+    ).resolves.toBe(10);
+    expect(statements).toHaveLength(3);
+    const sql = statements[0]?.sql.replace(/\s+/g, " ") ?? "";
+    expect(sql).toMatch(
+      /DELETE FROM queued_node_command WHERE state <> 'QUEUED'::"QueuedCommandState" AND "decidedAt" < \? AND id = ANY\(ARRAY\(/,
+    );
+    expect(sql).toContain("FOR UPDATE SKIP LOCKED");
+    expect(statements[0]?.values[0]).toEqual(new Date(NOW.getTime() - 7 * DAY_MS));
+    expect(statements[0]?.values).toContain(5);
+  });
+
+  it("runs the queued command sweeps in every retention run and reports their counts", async () => {
+    const { prisma, tx } = fakePrisma();
+    const order: string[] = [];
+    prisma.$queryRaw.mockImplementation(async (strings: TemplateStringsArray) =>
+      strings.join("").includes("clock_timestamp") ? [{ now: NOW }] : [],
+    );
+    prisma.$executeRaw.mockImplementation(async (strings: TemplateStringsArray) => {
+      const sql = strings.join("?");
+      if (sql.includes("UPDATE queued_node_command")) {
+        order.push("expire");
+        return 3;
+      }
+      if (sql.includes("DELETE FROM queued_node_command")) {
+        order.push("delete");
+        return 4;
+      }
+      return 0;
+    });
+    tx.$queryRaw.mockResolvedValue([]);
+    await expect(
+      runUsageRetention({ prisma: prisma as never, retentionDays: 14, batch: 100 }),
+    ).resolves.toMatchObject({ queuedCommandsExpired: 3, queuedCommandsDeleted: 4 });
+    expect(order).toEqual(["expire", "delete"]);
   });
 
   it("runs the hot-path history sweeps after the rollup retention and reports their counts", async () => {

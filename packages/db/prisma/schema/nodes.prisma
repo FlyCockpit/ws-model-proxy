@@ -384,12 +384,16 @@ enum QueuedCommandState {
   DISMISSED
   EXPIRED
   REFUSED
+  /// The agent credential that queued it took it back (`node_command_get` with `cancel`).
+  WITHDRAWN
 }
 
 /// A command an agent queued for a person (`node_command_queue_for_user`). The Terminals page
 /// lists QUEUED rows; "Run" opens a browser terminal with the text typed (the person presses
-/// Enter), "Dismiss" closes it. Holds the command text (unlike NodeAuditEvent). Rows are
-/// deleted 7 days after leaving QUEUED (the audit event keeps the digest for 90 days).
+/// Enter), "Dismiss" closes it; the agent credential that queued it may withdraw it while it is
+/// QUEUED. Holds the command text (unlike NodeAuditEvent). The hourly retention sweep
+/// (apps/server model-api/usage-retention.ts) stores EXPIRED on rows past `expiresAt` and deletes
+/// rows 7 days after they leave QUEUED (the audit event keeps the digest for 90 days).
 model QueuedNodeCommand {
   id           String             @id @default(cuid(2))
   createdAt    DateTime           @default(now())
@@ -407,6 +411,8 @@ model QueuedNodeCommand {
   /// Default 24 h after creation.
   expiresAt    DateTime
   decidedAt    DateTime?
+  /// The person (user id) who ran, dismissed or refused it; for WITHDRAWN the agent credential
+  /// (`agentTokenId` or `mcpGrantId`); null for EXPIRED.
   decidedBy    String?
   /// REFUSED reason (node became Relay only, node offline at Run) or the browser terminal id.
   outcome      String?

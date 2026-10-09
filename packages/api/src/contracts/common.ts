@@ -92,7 +92,14 @@ export const NODE_AUDIT_OUTCOME = [
   "closed",
   "auto_settled",
 ] as const;
-export const QUEUED_COMMAND_STATE = ["QUEUED", "RUN", "DISMISSED", "EXPIRED", "REFUSED"] as const;
+export const QUEUED_COMMAND_STATE = [
+  "QUEUED",
+  "RUN",
+  "DISMISSED",
+  "EXPIRED",
+  "REFUSED",
+  "WITHDRAWN",
+] as const;
 export const NODE_COMMAND_STATE = [
   "RUNNING",
   "SUCCEEDED",

@@ -66,8 +66,22 @@ a step needs a person (for example a `sudo` password), queue it with
 `node_command_queue_for_user`; it runs only when they press Run and Enter in
 Terminals. Poll its `id` with `node_command_get` as well: the answer has
 `queuedForUser: true` and the queued state (`QUEUED`, `RUN`, `DISMISSED`,
-`EXPIRED` or `REFUSED`) and never output, since the person runs it in their
-terminal. Only the person runs or dismisses it, so `cancel` refuses.
+`EXPIRED`, `REFUSED` or `WITHDRAWN`) and never output, since the person runs it
+in their terminal.
+
+- **Expiry.** A queued command expires `expiresInHours` after it was queued
+  (default 24, at most 168). Past that it reads as `EXPIRED` at once, and the
+  hourly retention sweep stores `EXPIRED`. Revoking or lowering the agent
+  credential that queued it expires it too. Decided commands (run, dismissed,
+  expired, refused or withdrawn) are deleted 7 days later; the node audit keeps
+  the command's digest for 90 days.
+- **Withdraw.** `node_command_get` with `cancel: true` withdraws a command that
+  is still `QUEUED` (`WITHDRAWN`, audited). Only the agent credential that
+  queued it (the same agent token, or the same OAuth client grant) can withdraw
+  it; another credential gets `not_your_command`. A command the person already
+  ran, dismissed or that expired cannot be withdrawn (`command_not_running`).
+- **Run and dismiss are human-only.** Only the person runs or dismisses a
+  queued command, on the Terminals page; there is no MCP tool for either.
 
 ### Stops that cannot be proven
 

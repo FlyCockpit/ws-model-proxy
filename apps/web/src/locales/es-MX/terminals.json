@@ -14,6 +14,15 @@
   "run": "Ejecutar",
   "dismiss": "Descartar",
   "dismissed": "Descartado.",
+  "queuedClosedTitle": "Cerrados recientemente",
+  "queuedState": {
+    "QUEUED": "En espera",
+    "RUN": "Abierto en una terminal",
+    "DISMISSED": "Descartado",
+    "EXPIRED": "Vencido",
+    "REFUSED": "Rechazado",
+    "WITHDRAWN": "Retirado por el agente"
+  },
   "onNode": "En {{node}}",
   "fromAgent": "Puesto en espera por un agente",
   "expires": "Vence",

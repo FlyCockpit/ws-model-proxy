@@ -263,7 +263,7 @@ const commands = {
       where: { id: input.commandId, userId },
       select: nodeCommandSelect,
     });
-    if (!row) return queuedCommandStatus(userId, input.commandId, input.cancel === true);
+    if (!row) return queuedCommandStatus(context, userId, input.commandId, input.cancel === true);
     if (input.cancel && row.state !== "RUNNING") {
       throw refuseAbout(
         "command_not_running",
@@ -284,9 +284,11 @@ const commands = {
 
 /**
  * `node_command_get` on a `node_command_queue_for_user` id: its state, never output (a person
- * types it into a browser terminal). Only that person runs or dismisses it, so cancel refuses.
+ * types it into a browser terminal). Only that person runs or dismisses it; `cancel` withdraws it
+ * (WITHDRAWN), and only for the agent credential that queued it while it is still QUEUED.
  */
 async function queuedCommandStatus(
+  context: SignedInContext,
   userId: string,
   queuedCommandId: string,
   cancel: boolean,
@@ -296,15 +298,7 @@ async function queuedCommandStatus(
     select: queuedSelect,
   });
   if (!queuedRow) throw notFound("That node or command does not exist.");
-  const view = queuedView(queuedRow, new Date());
-  if (cancel) {
-    throw refuseAbout(
-      "command_not_running",
-      queuedRow.id,
-      `Command ${queuedRow.id} is queued for a person (${view.state}); only they run or dismiss it.`,
-      "CONFLICT",
-    );
-  }
+  const view = queuedView(cancel ? await withdrawQueued(context, userId, queuedRow) : queuedRow);
   return {
     commandId: view.id,
     queuedForUser: true,
@@ -315,6 +309,87 @@ async function queuedCommandStatus(
     decidedAt: view.decidedAt,
     outcome: view.outcome,
   };
+}
+
+/**
+ * The agent takes back a command it queued for a person. The credential match and the QUEUED,
+ * unexpired state are part of the guarded update, so a person's Run or Dismiss (or the expiry
+ * sweep) racing it wins or loses as a whole: a decided command is never changed.
+ */
+async function withdrawQueued(
+  context: SignedInContext,
+  userId: string,
+  row: QueuedRow,
+): Promise<QueuedRow> {
+  const { actor, agentTokenId, mcpGrantId } = callerActor(context.auth, userId);
+  if (actor !== "AGENT") {
+    throw refuseAbout(
+      "not_your_command",
+      row.id,
+      `Command ${row.id} is queued for you: run or dismiss it on the Terminals page.`,
+      "FORBIDDEN",
+    );
+  }
+  if (row.agentTokenId !== agentTokenId || row.mcpGrantId !== mcpGrantId) {
+    throw refuseAbout(
+      "not_your_command",
+      row.id,
+      `Command ${row.id} was queued by another agent credential; only that one withdraws it.`,
+      "FORBIDDEN",
+    );
+  }
+  const now = new Date();
+  const state = queuedView(row, now).state;
+  if (state !== "QUEUED") {
+    throw refuseAbout(
+      "command_not_running",
+      row.id,
+      `Command ${row.id} is already ${state}; there is nothing to withdraw.`,
+      "CONFLICT",
+    );
+  }
+  const credentialId = agentTokenId ?? mcpGrantId;
+  // The withdrawal and its audit row commit together.
+  const withdrawn = await prisma.$transaction(async (tx) => {
+    const decided = await tx.queuedNodeCommand.updateMany({
+      where: {
+        id: row.id,
+        userId,
+        state: "QUEUED",
+        expiresAt: { gt: now },
+        agentTokenId,
+        mcpGrantId,
+      },
+      data: { state: "WITHDRAWN", decidedAt: now, decidedBy: credentialId, outcome: null },
+    });
+    if (decided.count !== 1) return false;
+    await tx.nodeAuditEvent.create({
+      data: {
+        userId,
+        nodeId: row.nodeId,
+        actor: "AGENT",
+        agentTokenId,
+        mcpGrantId,
+        kind: "command_queued_for_user",
+        subject: commandAuditSubject(row.command),
+        outcome: "cancelled",
+        reason: "withdrawn",
+        startedAt: now,
+        finishedAt: now,
+      },
+    });
+    return true;
+  });
+  const after = await reloadQueued(row.id);
+  if (!withdrawn) {
+    throw refuseAbout(
+      "command_not_running",
+      row.id,
+      `Command ${row.id} is already ${queuedView(after).state}; there is nothing to withdraw.`,
+      "CONFLICT",
+    );
+  }
+  return after;
 }
 
 // ── Browser terminals ──
@@ -377,6 +452,7 @@ const queuedSelect = {
   note: true,
   state: true,
   agentTokenId: true,
+  mcpGrantId: true,
   createdAt: true,
   expiresAt: true,
   decidedAt: true,
@@ -390,19 +466,20 @@ type QueuedRow = {
   note: string | null;
   state: QueuedCommandView["state"];
   agentTokenId: string | null;
+  mcpGrantId: string | null;
   createdAt: Date;
   expiresAt: Date;
   decidedAt: Date | null;
   outcome: string | null;
 };
 
-function queuedView(row: QueuedRow, now: Date): QueuedCommandView {
+function queuedView(row: QueuedRow, now = new Date()): QueuedCommandView {
   return {
     id: row.id,
     nodeId: row.nodeId,
     command: row.command,
     note: row.note,
-    // A queued item past its expiry is shown as expired before the sweeper settles it.
+    // A queued item past its expiry is shown as expired before the retention sweep stores it.
     state: row.state === "QUEUED" && row.expiresAt <= now ? "EXPIRED" : row.state,
     agentTokenId: row.agentTokenId,
     createdAt: row.createdAt.toISOString(),
@@ -469,7 +546,9 @@ const queued = {
               ? { state: input.state }
               : {}),
       },
-      orderBy: { createdAt: "desc" },
+      // Waiting first (newest first), then the most recently decided: a command decided just
+      // now stays inside the limit however long ago it was queued.
+      orderBy: [{ decidedAt: { sort: "desc", nulls: "first" } }, { createdAt: "desc" }],
       take: 200,
       select: queuedSelect,
     });

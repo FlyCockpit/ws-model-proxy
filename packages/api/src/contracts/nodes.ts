@@ -818,7 +818,7 @@ export const nodesContract = {
         })
         .strict(),
       z.union([nodeCommandViewSchema, queuedCommandStatusSchema]),
-      "A command's state and output tail (or a queued command's state); optionally wait for it or cancel it.",
+      "A command's state and output tail (or a queued command's state); optionally wait for it or cancel it (a queued one is withdrawn, by the credential that queued it).",
       ["node_command_get"],
     ),
   },
