@@ -1057,6 +1057,12 @@ export async function createApp(options: CreateAppOptions = {}) {
       await next();
     });
     app.use("/assets/*", serveStatic({ root: join(webDist, "client") }));
+    // Browsers already bypass their HTTP cache for the SW script; this keeps
+    // proxies/CDNs from caching it heuristically and serving a stale SW.
+    app.use("/sw.js", async (c, next) => {
+      c.header("Cache-Control", "no-cache");
+      await next();
+    });
     app.use("/*", serveStatic({ root: join(webDist, "client") }));
 
     // Mount TanStack Start for SSR — handles all non-static requests. The bundle
