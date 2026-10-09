@@ -29,6 +29,7 @@ export const MEMBER_INCLUDE = {
             select: {
               id: true,
               phase: true,
+              engineSlots: true,
               Ranks: {
                 where: { claim: "HELD" },
                 select: { nodeId: true, Node: { select: { slug: true, userId: true } } },
@@ -94,13 +95,22 @@ export function memberStatus(
   return "unavailable";
 }
 
-/** What the member views read live: the relay's engine load and each member's recent p95. */
+/** What the member views read live: the relay's engine load and each member's recent traffic. */
 export type MembersLive = {
   load: ReadonlyMap<string, InstanceLiveLoad>;
   /** p95 latency (ms) by `memberLatencyKey`, over the recent window. */
   p95: ReadonlyMap<string, number>;
+  /** Requests by `memberLatencyKey`, over the share window. */
+  requests: ReadonlyMap<string, number>;
+  /** Requests by pool id, over the share window. */
+  poolRequests: ReadonlyMap<string, number>;
 };
-export const NO_MEMBERS_LIVE: MembersLive = { load: NO_LIVE_LOAD, p95: new Map() };
+export const NO_MEMBERS_LIVE: MembersLive = {
+  load: NO_LIVE_LOAD,
+  p95: new Map(),
+  requests: new Map(),
+  poolRequests: new Map(),
+};
 
 /**
  * A member's key in its pool's usage rollups: the runtime that served (pool traffic records the
@@ -130,6 +140,26 @@ function memberWaiting(
   return waiting;
 }
 
+/**
+ * Engine slots of the member's ready instances: requests running on them (null: no ready
+ * instance has a known reading) out of their slot limits (null: none ready, or one's limit is
+ * unknown).
+ */
+function memberSlots(
+  instances: ReadonlyArray<{ id: string; phase: string; engineSlots: number | null }>,
+  load: ReadonlyMap<string, InstanceLiveLoad>,
+): { active: number | null; slots: number | null } {
+  const ready = instances.filter((instance) => instance.phase === "READY");
+  let active: number | null = null;
+  let slots: number | null = ready.length > 0 ? 0 : null;
+  for (const instance of ready) {
+    const running = load.get(instance.id)?.running;
+    if (running != null) active = (active ?? 0) + running;
+    slots = slots === null || instance.engineSlots == null ? null : slots + instance.engineSlots;
+  }
+  return { active, slots };
+}
+
 export function memberView(
   member: MemberRow,
   live: MembersLive = NO_MEMBERS_LIVE,
@@ -140,6 +170,15 @@ export function memberView(
     member.kind === "CLOUD"
       ? (member.ProviderModel?.Target?.health ?? "UNKNOWN")
       : bestHealth((model?.Targets ?? []).map((target) => target.health));
+  const key = memberLatencyKey(member.poolId, {
+    runtimeId: model?.runtimeId,
+    providerModelId: member.providerModelId,
+  });
+  const poolRequests = live.poolRequests.get(member.poolId) ?? 0;
+  // A contributed member runs on the contributor's engine (their other traffic included): its
+  // slots stay unknown here, like its queue.
+  const slots =
+    member.shareId === null ? memberSlots(instances, live.load) : { active: null, slots: null };
   return {
     id: member.id,
     kind: member.kind,
@@ -159,13 +198,9 @@ export function memberView(
       instances: instances.length,
       running: instances.filter((instance) => instance.phase === "READY").length,
       waiting: memberWaiting(instances, live.load),
-      p95LatencyMs:
-        live.p95.get(
-          memberLatencyKey(member.poolId, {
-            runtimeId: model?.runtimeId,
-            providerModelId: member.providerModelId,
-          }),
-        ) ?? null,
+      p95LatencyMs: live.p95.get(key) ?? null,
+      share: poolRequests > 0 ? (live.requests.get(key) ?? 0) / poolRequests : null,
+      ...slots,
     },
   };
 }

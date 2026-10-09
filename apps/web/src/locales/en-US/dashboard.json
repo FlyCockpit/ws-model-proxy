@@ -162,7 +162,9 @@
     "waiting_other": "+{{count}} waiting",
     "waiting_one": "+{{count}} waiting",
     "unlimited": "{{active}} running, no limit",
-    "label": "{{active}} of {{slots}} slots in use"
+    "label": "{{active}} of {{slots}} slots in use",
+    "kept_one": "Up to {{count}} kept for this pool",
+    "kept_other": "Up to {{count}} kept for this pool"
   },
   "time": {
     "never": "Never"
@@ -1177,13 +1179,7 @@
         "anthropic": "Anthropic SDK"
       }
     },
-    "live": {
-      "p95": "p95 {{value}} (15 min)",
-      "waiting_one": "{{count}} waiting",
-      "waiting_other": "{{count}} waiting"
-    },
     "weight": {
-      "label": "Weight",
       "aria": "Weight of {{member}}",
       "save": "Set",
       "invalid": "A whole number from 1 to 1000."
@@ -1267,6 +1263,28 @@
       "noCloudMember": "None yet",
       "cloudFailed": "The pool was created, but its cloud settings were not saved.",
       "noServedModels": "No served model yet. Create a runtime first."
+    },
+    "table": {
+      "local": "Your models",
+      "cloud": "Cloud fallback, used in this order",
+      "model": "Model",
+      "status": "Status",
+      "share": "Traffic share (24 h)",
+      "weight": "Weight",
+      "slots": "Runtime slots",
+      "p95": "p95 (15 min)",
+      "actions": "Actions"
+    },
+    "share": {
+      "percent": "{{percent}}%",
+      "none": "No requests yet",
+      "aria": "Traffic share of {{member}}: {{percent}}%"
+    },
+    "slots": {
+      "none": "No runtime",
+      "unknown": "No reading",
+      "contributed": "On the contributor's hardware",
+      "limitOnly": "{{slots}} slots, no reading"
     }
   },
   "runtime": {

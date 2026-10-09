@@ -125,6 +125,15 @@ export const poolMemberViewSchema = z
         waiting: z.number().int().nullable(),
         /** Over the last 15 minutes of real traffic; null: no requests. */
         p95LatencyMs: z.number().nullable(),
+        /**
+         * 0..1 of the pool's real requests a member served over the last 24 h; null: none. Keyed
+         * by runtime like the p95: two members on one runtime each show the runtime's share.
+         */
+        share: z.number().nullable(),
+        /** Requests running on its ready instances' engines; null: unknown. */
+        active: z.number().int().nullable(),
+        /** Slot limit of its ready instances' engines; null: none ready, or unknown. */
+        slots: z.number().int().nullable(),
       })
       .strict(),
   })

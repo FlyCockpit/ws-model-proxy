@@ -209,39 +209,149 @@ describe("pool overview", () => {
     );
   });
 
-  it("lists local, contributed, then cloud members with live p95 and waiting; delete lives on Advanced", async () => {
+  const cloudMember = memberFixture({
+    id: "cloud-1",
+    kind: "CLOUD",
+    status: "cloud_standby",
+    runtimeId: null,
+    runtimeSlug: null,
+    runtimeModelId: null,
+    upstreamModelId: "openai/gpt-4o",
+    providerModelId: "pm-1",
+    cloudOrder: 0,
+    live: {
+      instances: 0,
+      running: 0,
+      waiting: null,
+      p95LatencyMs: 2100,
+      share: 0.1,
+      active: null,
+      slots: null,
+    },
+  });
+  const contributed = memberFixture({
+    id: "mem-2",
+    upstreamModelId: "theirs",
+    runtimeSlug: "bob-rt",
+    shareId: "share-1",
+    contributorEmail: "bob@example.test",
+    live: {
+      instances: 1,
+      running: 1,
+      waiting: null,
+      p95LatencyMs: null,
+      share: 0.25,
+      active: null,
+      slots: null,
+    },
+  });
+  const own = memberFixture({
+    live: {
+      instances: 2,
+      running: 2,
+      waiting: 3,
+      p95LatencyMs: 1500,
+      share: 0.654,
+      active: 5,
+      slots: 8,
+    },
+  });
+
+  function rowOf(label: string): HTMLElement {
+    const row = screen.getByText(label, { exact: false }).closest("tr");
+    if (!row) throw new Error(`no row for ${label}`);
+    return row;
+  }
+
+  it("splits members into your models (own, then contributed) and cloud fallback, in wide tables", async () => {
+    await mount(poolFixture({ members: [cloudMember, contributed, own] }));
+    const [local, cloud] = screen.getAllByRole("table");
+    if (!local || !cloud) throw new Error("expected two tables");
+    expect(within(local).getByText("dashboard:pool.table.local")).toBeTruthy();
+    expect(within(cloud).getByText("dashboard:pool.table.cloud")).toBeTruthy();
+    const localRows = within(local)
+      .getAllByRole("row")
+      .slice(1)
+      .map((row) => row.textContent ?? "");
+    expect(localRows).toHaveLength(2);
+    expect(localRows[0]).toContain("Qwen/Qwen3-8B");
+    expect(localRows[1]).toContain("theirs");
+    expect(within(cloud).getAllByRole("row")).toHaveLength(2);
+    expect(within(cloud).getByText(/openai\/gpt-4o/)).toBeTruthy();
+    // Each table scrolls on its own, never the page.
+    for (const table of [local, cloud])
+      expect(table.parentElement?.className).toContain("overflow-x-auto");
+    expect(screen.queryByRole("button", { name: "dashboard:pool.delete" })).toBeNull();
+  });
+
+  it("shows each member's traffic share next to its weight, and p95", async () => {
+    await mount(poolFixture({ members: [cloudMember, contributed, own] }));
+    const row = rowOf("Qwen/Qwen3-8B");
+    const share = within(row).getByRole("meter", {
+      name: "dashboard:pool.share.aria:qwen · Qwen/Qwen3-8B|65",
+    });
+    expect(share.getAttribute("aria-valuenow")).toBe("65");
+    expect(within(row).getByText("dashboard:pool.share.percent:65")).toBeTruthy();
+    expect(
+      within(row).getByLabelText("dashboard:pool.weight.aria:qwen · Qwen/Qwen3-8B"),
+    ).toBeTruthy();
+    expect(within(row).getByText("1.5 sec")).toBeTruthy();
+    expect(
+      within(rowOf("openai/gpt-4o")).getByRole("meter", {
+        name: "dashboard:pool.share.aria:openai/gpt-4o|10",
+      }),
+    ).toBeTruthy();
+    expect(within(rowOf("openai/gpt-4o")).getByText("2.1 sec")).toBeTruthy();
+  });
+
+  it("says when the pool had no requests instead of drawing an empty share", async () => {
+    await mount();
+    const row = rowOf("Qwen/Qwen3-8B");
+    expect(within(row).getByText("dashboard:pool.share.none")).toBeTruthy();
+    expect(within(row).queryByRole("meter")).toBeNull();
+  });
+
+  it("draws the runtime slot meter with the waiting queue and this pool's kept slice", async () => {
+    await mount(
+      poolFixture({
+        members: [cloudMember, contributed, own],
+        routing: { ...poolFixture().routing, keptSlots: 2 },
+      }),
+    );
+    const row = rowOf("Qwen/Qwen3-8B");
+    const slots = within(row)
+      .getAllByRole("meter")
+      .find((meter) => meter.getAttribute("aria-valuemax") === "8");
+    expect(slots?.getAttribute("aria-valuenow")).toBe("5");
+    // Two kept slots on each of the two ready instances.
+    expect(slots?.getAttribute("aria-label")).toContain("dashboard:slots.kept:4");
+    expect(within(row).getByText(/dashboard:slots\.waiting/)).toBeTruthy();
+    expect(within(rowOf("openai/gpt-4o")).getByText("dashboard:pool.slots.none")).toBeTruthy();
+    // A contributed member runs on its contributor's engine: its load stays theirs.
+    expect(within(rowOf("theirs")).getByText("dashboard:pool.slots.contributed")).toBeTruthy();
+  });
+
+  it("states a known slot limit without a live reading, and nothing known as no reading", async () => {
     await mount(
       poolFixture({
         members: [
+          own,
           memberFixture({
-            id: "cloud-1",
-            kind: "CLOUD",
-            status: "cloud_standby",
-            runtimeId: null,
-            runtimeSlug: null,
-            runtimeModelId: null,
-            upstreamModelId: "openai/gpt-4o",
-            providerModelId: "pm-1",
-            cloudOrder: 0,
+            id: "mem-3",
+            upstreamModelId: "other",
+            runtimeSlug: "other-rt",
+            live: { ...own.live, active: null, slots: 8 },
           }),
           memberFixture({
-            id: "mem-2",
-            upstreamModelId: "theirs",
-            runtimeSlug: "bob-rt",
-            shareId: "share-1",
-            contributorEmail: "bob@example.test",
+            id: "mem-4",
+            upstreamModelId: "idle",
+            runtimeSlug: "idle-rt",
+            live: { ...own.live, active: null, slots: null },
           }),
-          memberFixture({ live: { instances: 2, running: 2, waiting: 3, p95LatencyMs: 1500 } }),
         ],
       }),
     );
-    const rows = screen.getAllByRole("listitem").map((row) => row.textContent ?? "");
-    const order = ["Qwen/Qwen3-8B", "theirs", "openai/gpt-4o"].map((label) =>
-      rows.findIndex((row) => row.includes(label)),
-    );
-    expect(order).toEqual([...order].sort((a, b) => a - b));
-    expect(screen.getByText(/dashboard:pool\.live\.p95:1\.5 sec/)).toBeTruthy();
-    expect(screen.getByText(/dashboard:pool\.live\.waiting:3/)).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "dashboard:pool.delete" })).toBeNull();
+    expect(within(rowOf("other")).getByText("dashboard:pool.slots.limitOnly:8")).toBeTruthy();
+    expect(within(rowOf("idle")).getByText("dashboard:pool.slots.unknown")).toBeTruthy();
   });
 });

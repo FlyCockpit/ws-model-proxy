@@ -12,7 +12,7 @@ import { cloudEgressEnabled } from "../lib/cloud-egress";
 import { graphDelete, graphWrite, modelTargetFences, poolTargetFences } from "../lib/graph-write";
 import { readLiveLoad } from "../lib/live-load";
 import { canUseHolders, modelNameClashes, refuseCallableIdClash } from "../lib/model-names";
-import { memberLatencyP95, poolTraffic } from "../lib/overview-summary";
+import { memberRecentTraffic, poolTraffic } from "../lib/overview-summary";
 import { invalidatePoolRouting } from "../lib/pool-routing-invalidation";
 import {
   callableIdsFor,
@@ -65,7 +65,7 @@ async function ownedPoolRow(userId: string, poolId: string): Promise<PoolRow> {
   return pool;
 }
 
-/** Live member state: the relay's in-memory engine load and each member's recent p95. */
+/** Live member state: the relay's in-memory engine load and each member's recent traffic. */
 async function membersLive(
   context: SignedInContext,
   ownerId: string,
@@ -82,10 +82,10 @@ async function membersLive(
   );
   return {
     load: readLiveLoad(context.services?.liveLoad, instanceIds),
-    p95: await memberLatencyP95(
+    ...(await memberRecentTraffic(
       ownerId,
       pools.map((pool) => pool.id),
-    ),
+    )),
   };
 }
 

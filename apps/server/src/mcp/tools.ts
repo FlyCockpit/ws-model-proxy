@@ -434,7 +434,7 @@ function withoutEmpty(value: unknown): unknown {
   return out;
 }
 
-/** A pool whose members' live load leaves out what is unknown (null waiting or p95). */
+/** A pool whose members' live load leaves out what is unknown (null waiting, p95, share or slots). */
 function withCompactMemberLive(pool: unknown): unknown {
   const members = record(pool).members;
   if (!Array.isArray(members)) return pool;
@@ -465,7 +465,7 @@ function combineOutputs(name: string, calls: ProcedureCall[], outputs: unknown[]
       return outputs.length === 2 ? { ...record(runtime), versions: outputs[1] } : runtime;
     }
     case "pools_get": {
-      // Member live load leaves out what is unknown (null waiting or p95).
+      // Member live load leaves out what is unknown (null waiting, p95, share or slots).
       const list = record(outputs[0]).pools;
       const first =
         calls[0]?.path === "pools.get"
