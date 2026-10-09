@@ -20,6 +20,7 @@ import {
   isRetryableCapacityTransactionError,
   runCapacityOrderedTransaction,
 } from "@ws-model-proxy/db/capacity-lock-order";
+import { RETRY_CONFLICT_MESSAGE } from "./refuse";
 
 type Tx = Prisma.TransactionClient;
 
@@ -102,7 +103,7 @@ export async function runAccessTransaction<T>(
       isRetryableCapacityTransactionError(error)
     ) {
       throw new ORPCError("CONFLICT", {
-        message: "Configuration changed concurrently. Retry the request.",
+        message: RETRY_CONFLICT_MESSAGE,
       });
     }
     throw error;

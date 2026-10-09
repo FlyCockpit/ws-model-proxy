@@ -26,7 +26,11 @@ const lockOrder = vi.hoisted(() => ({
     async (client: unknown, work: (tx: unknown) => Promise<unknown>) => work(client),
   ),
 }));
-vi.mock("@ws-model-proxy/db/capacity-lock-order", () => lockOrder);
+// The real error classes and predicates (runAccessTransaction maps contention to CONFLICT).
+vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>()),
+  ...lockOrder,
+}));
 const registry = vi.hoisted(() => ({
   registerShareInviteAcceptor: vi.fn(),
   registerShareInviteLinkAcceptor: vi.fn(),
@@ -244,6 +248,21 @@ describe("share invite acceptance", () => {
     db.share.create.mockResolvedValue({ id: "share1" });
     db.shareInvite.updateMany.mockResolvedValue({ count: 0 });
     await expect(acceptShareInviteByLink(other, TOKEN)).resolves.toBe("invalid");
+  });
+
+  it("asks to retry when its transaction passes a server-side bound (nothing was written)", async () => {
+    // The class the module under test sees (the mock keeps the real one).
+    const { CapacityOrderedTransactionTimeoutError } = await import(
+      "@ws-model-proxy/db/capacity-lock-order"
+    );
+    db.shareInvite.findFirst.mockResolvedValue(invite);
+    lockOrder.runCapacityOrderedTransaction.mockRejectedValueOnce(
+      new CapacityOrderedTransactionTimeoutError("57014"),
+    );
+    await expect(acceptShareInviteByLink(other, TOKEN)).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: "Configuration changed concurrently. Retry the request.",
+    });
   });
 
   it("finds nothing to accept when the invite expired or was revoked after the check", async () => {

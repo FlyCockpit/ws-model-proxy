@@ -8,7 +8,9 @@
  *   → pool with a member → profile save → apply preview/apply → runtime start/stop → deletes.
  *
  * Fixtures that stand in for the relay (the node's hello sets trust and connection) use the
- * fixture client, which carries the deploy bypass marker.
+ * fixture client, which carries the deploy bypass marker. Writes that answer "retry" (a
+ * server-side lock or statement bound passed on a loaded machine) are retried as callers do
+ * (./retry-answers.ts).
  */
 import { createRouterClient } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
@@ -17,6 +19,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Context } from "../context";
 import type { CallerAuth } from "../contracts/auth-context";
 import type { RuntimeSpec } from "../lib/runtime-spec";
+import type { NodeEnrollRequest } from "../nodes/enroll-exchange";
+import { retryAnswers, untilAnswered } from "./retry-answers";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
@@ -90,7 +94,16 @@ integration("core flows on PostgreSQL with the schema hardening", () => {
     } as Session;
     const context: Context = { auth, session };
     if (!modules) throw new Error("modules unavailable");
-    return createRouterClient(modules.appRouter, { context });
+    return createRouterClient(modules.appRouter, { context, interceptors: [retryAnswers] });
+  }
+  /** The node's exchange, retried while it answers `rate_limited` (the code took no use). */
+  function exchange(request: NodeEnrollRequest) {
+    if (!modules) throw new Error("modules unavailable");
+    const { exchangeEnrollmentCode } = modules.enroll;
+    return untilAnswered(
+      () => exchangeEnrollmentCode(request),
+      (outcome) => !outcome.response.ok && outcome.response.error === "rate_limited",
+    );
   }
   const person = (): CallerAuth => ({
     kind: "cookie_session",
@@ -106,18 +119,19 @@ integration("core flows on PostgreSQL with the schema hardening", () => {
     // ── Enrollment: a person mints a code, the node exchanges it ──
     const minted = await me.nodes.enrollmentCodes.create({ labels: ["gpu"] });
     expect(minted.installCommand).toContain(minted.secret);
-    const enrolled = await modules.enroll.exchangeEnrollmentCode({
+    const enrolled = await exchange({
       code: minted.secret,
       identityPublicKey: IDENTITY_KEY,
       slug: `desk-${suffix}`,
       replaceConfirmed: false,
     });
-    expect(enrolled.response.ok).toBe(true);
-    if (!enrolled.response.ok) throw new Error("enrollment refused");
+    // A refusal names its reason (and retry hint) in the failure.
+    if (!enrolled.response.ok)
+      expect.fail(`enrollment refused: ${JSON.stringify(enrolled.response)}`);
     expect(enrolled.response.removeAfterOfflineMs).toBeNull();
     const nodeId = enrolled.response.nodeId;
     // A second exchange of the single-use code is refused by name.
-    const again = await modules.enroll.exchangeEnrollmentCode({
+    const again = await exchange({
       code: minted.secret,
       identityPublicKey: IDENTITY_KEY,
       slug: `desk2-${suffix}`,
@@ -126,7 +140,7 @@ integration("core flows on PostgreSQL with the schema hardening", () => {
     expect(again.response).toMatchObject({ ok: false, error: "used" });
     // A code never takes over an existing node, not even with its (public) identity key.
     const second = await me.nodes.enrollmentCodes.create({});
-    const relogin = await modules.enroll.exchangeEnrollmentCode({
+    const relogin = await exchange({
       code: second.secret,
       identityPublicKey: IDENTITY_KEY,
       slug: `desk-${suffix}`,
@@ -136,7 +150,7 @@ integration("core flows on PostgreSQL with the schema hardening", () => {
     expect(relogin.revokedCredentialIds).toEqual([]);
     // A Replace code (the person's approval for this node) moves it to a new identity.
     const replace = await me.nodes.enrollmentCodes.create({ replaceNodeId: nodeId });
-    const unconfirmed = await modules.enroll.exchangeEnrollmentCode({
+    const unconfirmed = await exchange({
       code: replace.secret,
       identityPublicKey: IDENTITY_KEY,
       slug: `ignored-${suffix}`,
@@ -147,7 +161,7 @@ integration("core flows on PostgreSQL with the schema hardening", () => {
       error: "replace_confirmation_required",
       replaces: { slug: `desk-${suffix}` },
     });
-    const replaced = await modules.enroll.exchangeEnrollmentCode({
+    const replaced = await exchange({
       code: replace.secret,
       identityPublicKey: IDENTITY_KEY,
       slug: `ignored-${suffix}`,

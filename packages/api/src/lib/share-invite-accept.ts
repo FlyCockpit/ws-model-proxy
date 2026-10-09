@@ -13,7 +13,8 @@
  *   registry.
  * - `acceptShareInviteByLink`: a signed-in person opening an invite link (`auth.acceptInvite`).
  *
- * Share and invite writes take the owner fences of both people before the first write.
+ * Share and invite writes take the owner fences of both people before the first write
+ * (`runAccessTransaction`: contention past its bounds is the retry CONFLICT).
  */
 import {
   registerShareInviteAcceptor,
@@ -21,7 +22,7 @@ import {
   type ShareInviteClaimResult,
 } from "@ws-model-proxy/auth/share-invite-acceptance";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
-import { fenceOwners, runCapacityOrderedTransaction } from "@ws-model-proxy/db/capacity-lock-order";
+import { runAccessTransaction } from "./access-transaction";
 import { type InviteAcceptance, inviteAcceptance, inviteEmailKey } from "./invite-acceptance";
 import {
   claimUnchangedWhere,
@@ -146,8 +147,7 @@ async function applyAcceptance(
   const chosen = candidates.filter((invite) => decision.inviteIds.includes(invite.id));
   if (chosen.length === 0) return 0;
   const ownerIds = [...new Set(chosen.map((invite) => invite.ownerUserId))];
-  return runCapacityOrderedTransaction(prisma, async (tx) => {
-    await fenceOwners(tx, [userId, ...ownerIds]);
+  return runAccessTransaction({ owners: [userId, ...ownerIds] }, async (tx) => {
     // Re-read under the fences: only invites still pending are accepted.
     const current = await tx.shareInvite.findMany({
       where: { id: { in: chosen.map((invite) => invite.id) }, ...pendingInviteWhere(now) },
@@ -236,8 +236,7 @@ async function acceptLink(
   if (!decision.accept) return "invalid";
   const guard = linkHoldWhere(tokenDigest, linkInvite);
   try {
-    return await runCapacityOrderedTransaction(prisma, async (tx) => {
-      await fenceOwners(tx, [user.id, linkInvite.ownerUserId]);
+    return await runAccessTransaction({ owners: [user.id, linkInvite.ownerUserId] }, async (tx) => {
       // Re-read under the fences: a revoke, expiry, resend (new token), other acceptance or new
       // claim since wins.
       const current = await tx.shareInvite.findFirst({

@@ -15,6 +15,7 @@ import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-clien
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Context } from "../context";
 import type { CallerAuth } from "../contracts/auth-context";
+import { retryAnswers } from "./retry-answers";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
@@ -116,7 +117,8 @@ integration("cloud spend on PostgreSQL with the schema hardening", () => {
     };
     const context: Context = { auth, session };
     if (!modules) throw new Error("modules unavailable");
-    return createRouterClient(modules.appRouter, { context });
+    // Writes that answer "retry" on a loaded machine are retried as callers do.
+    return createRouterClient(modules.appRouter, { context, interceptors: [retryAnswers] });
   }
 
   async function providerModel(user: User, label: string) {

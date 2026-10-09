@@ -20,6 +20,7 @@ import {
   isRetryableCapacityTransactionError,
   runCapacityOrderedTransaction,
 } from "@ws-model-proxy/db/capacity-lock-order";
+import { RETRY_CONFLICT_MESSAGE } from "./refuse";
 import { runCapacityDeleteTransaction } from "./serializable-transaction";
 
 type Tx = Prisma.TransactionClient;
@@ -30,7 +31,7 @@ function contended(error: unknown): never {
     isRetryableCapacityTransactionError(error)
   )
     throw new ORPCError("CONFLICT", {
-      message: "Configuration changed concurrently. Retry the request.",
+      message: RETRY_CONFLICT_MESSAGE,
     });
   throw error;
 }
