@@ -69,6 +69,7 @@
     "fabricSingleNode": "Solo un runtime de varios nodos indica un fabric.",
     "fixedPortGroup": "Un puerto fijo requiere groupSize 1.",
     "secretTwice": "Nombra cada secreto una sola vez.",
+    "serviceStop": "Los runtimes de servicio necesitan un comando de detención.",
     "serviceStatus": "Los runtimes de servicio necesitan un comando de estado (sale con 0 si está activo, 3 si está detenido).",
     "interactiveStatus": "Los comandos interactivos necesitan un comando de estado.",
     "statusNeverStopped": "Un comando de estado sale con 0 mientras se ejecuta y con 3 cuando se detuvo; este nunca indica detenido, así que nunca se podría confirmar una detención. Por ejemplo: systemctl is-active --quiet <unit>, o out=$(docker compose ps --status running -q) || exit 1; [ -n \"$out\" ] || exit 3.",

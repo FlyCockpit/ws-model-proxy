@@ -479,7 +479,7 @@ export const runtimeLaunchSchema = z
         ctx.addIssue({
           code: "custom",
           path: [...path, "stop"],
-          message: "Service runtimes need a stop command.",
+          ...specIssue("serviceStop"),
         });
       if (launch.management === "service" && !commands.status?.trim())
         ctx.addIssue({

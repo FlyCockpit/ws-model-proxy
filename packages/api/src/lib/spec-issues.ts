@@ -29,6 +29,7 @@ export const RUNTIME_SPEC_ISSUES = {
   fabricSingleNode: "Only a multi-node runtime names a fabric.",
   fixedPortGroup: "A fixed port needs groupSize 1.",
   secretTwice: "Name each secret once.",
+  serviceStop: "Service runtimes need a stop command.",
   serviceStatus: "Service runtimes need a status command (exit 0 alive, exit 3 stopped).",
   interactiveStatus: "Interactive commands need a status command.",
   statusNeverStopped:

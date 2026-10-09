@@ -92,6 +92,16 @@ describe("status commands that can never say stopped (shared with Rust)", () => 
     expect(statusPaths(update)).toContain("spec.launch.commands.0.status");
   });
 
+  it("keys a missing service stop command for the locale bundles", () => {
+    const spec = service({ status: COMPOSE_STATUS });
+    delete (spec.launch.commands[0] as { stop?: string }).stop;
+    const parsed = authoredRuntimeSpecSchema.safeParse(spec);
+    const issue = parsed.success
+      ? undefined
+      : parsed.error.issues.find((item) => item.path.join(".") === "launch.commands.0.stop");
+    expect((issue as { params?: { i18n?: string } } | undefined)?.params?.i18n).toBe("serviceStop");
+  });
+
   it("no preset ships one", () => {
     for (const preset of RUNTIME_PRESET_LIST)
       for (const commands of preset.spec.launch?.commands ?? [])
