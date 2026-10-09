@@ -652,6 +652,40 @@ export const runtimeSpecSchema = z
   });
 export type RuntimeSpec = z.infer<typeof runtimeSpecSchema>;
 
+const NEVER_STOPPED_STATUS = new Set(["", "true", ":", "exit 0", "/bin/true", "/usr/bin/true"]);
+
+/**
+ * Whether a status command could ever say stopped (exit 3). Refused: an empty command, `true`,
+ * `:`, `exit 0`, `/bin/true` and `/usr/bin/true`, compared after collapsing spaces, tabs and
+ * line breaks and dropping trailing semicolons. Nothing else is parsed. The node's twin is
+ * `status_can_report_stopped` (`apps/cli/src/protocol/runtime_spec.rs`); shared vectors in
+ * `apps/cli/tests/fixtures/relay-3.0/rules/status-command.json`.
+ */
+export function statusCanReportStopped(command: string): boolean {
+  let text = command
+    .split(/[ \t\n\r]+/)
+    .filter(Boolean)
+    .join(" ");
+  while (text.endsWith(";")) text = text.slice(0, -1).replace(/ $/, "");
+  return !NEVER_STOPPED_STATUS.has(text);
+}
+
+/**
+ * A definition as written now (create, update, the Definition form): `runtimeSpecSchema` plus a
+ * status command that can say stopped. Stored versions are read with `runtimeSpecSchema`, so a
+ * version saved before this rule still opens and can be fixed; the node refuses to take it.
+ */
+export const authoredRuntimeSpecSchema = runtimeSpecSchema.superRefine((spec, ctx) => {
+  spec.launch?.commands.forEach((commands, index) => {
+    if (commands.status !== undefined && !statusCanReportStopped(commands.status))
+      ctx.addIssue({
+        code: "custom",
+        path: ["launch", "commands", index, "status"],
+        ...specIssue("statusNeverStopped"),
+      });
+  });
+});
+
 export function runtimeSpecKind(spec: Pick<RuntimeSpec, "launch">): RuntimeKindWire {
   return spec.launch ? "startable" : "always_on";
 }

@@ -1224,6 +1224,27 @@ describe("runtimes.shares.list (shared with me)", () => {
 });
 
 describe("runtimes.fork (create-shaped output)", () => {
+  it("refuses to copy a version whose status command can never say stopped", async () => {
+    const launch = SPEC.launch;
+    if (!launch) throw new Error("fixture");
+    const spec: RuntimeSpec = {
+      ...SPEC,
+      launch: { ...launch, commands: [{ ...launch.commands[0], start: "serve", status: "true" }] },
+    };
+    db.runtimeShare.findFirst.mockResolvedValue({
+      Runtime: { id: "rt-9", kind: "STARTABLE", currentVersionId: "ver-9" },
+    } as never);
+    db.runtimeVersion.findFirst.mockResolvedValue(versionRow({ id: "ver-9", spec }) as never);
+    const refused = await client()
+      .fork({ runtimeId: "rt-9", slug: "mine", name: "Mine" })
+      .catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(ORPCError);
+    expect((refused as ORPCError<string, unknown>).message).toContain(
+      "spec.launch.commands.0.status",
+    );
+    expect(db.runtime.create).not.toHaveBeenCalled();
+  });
+
   it("copies a shared version, applies the given limits and answers like create", async () => {
     db.runtimeShare.findFirst.mockResolvedValue({
       Runtime: { id: "rt-9", kind: "STARTABLE", currentVersionId: "ver-9" },

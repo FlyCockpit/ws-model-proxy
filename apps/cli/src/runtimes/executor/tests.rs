@@ -293,7 +293,7 @@ fn a_status_probe_proves_a_stop_the_stops_could_not() {
     probe.step_id = "s2".into();
     let busy = executor.execute(probe, &runtime, deadline());
     assert!(!busy.stopped);
-    assert_eq!(busy.detail.as_deref(), Some("port_in_use"));
+    assert_eq!(busy.detail.as_deref(), Some("port_held_outside_runtime"));
     // The process tree is gone and the port is free: proven, and the record resolves.
     runtime.port_busy.set(false);
     let mut probe = job(JobPhase::Status);
@@ -847,7 +847,7 @@ fn a_stop_is_never_proven_while_its_unit_runs_or_its_port_is_taken() {
             .execute(probe, &runtime, deadline())
             .detail
             .as_deref(),
-        Some("port_in_use")
+        Some("port_held_outside_runtime")
     );
     // The user manager cannot say whether a task is left: unproven, saying so.
     runtime.port_busy.set(false);
@@ -1085,7 +1085,7 @@ fn a_re_delivered_stop_is_proven_again_before_it_answers_stopped() {
     let again = executor.execute(stubbed(job(JobPhase::Stop)), &runtime, deadline());
     assert_eq!(
         (again.stopped, again.detail.as_deref()),
-        (false, Some("port_in_use"))
+        (false, Some("port_held_outside_runtime"))
     );
     runtime.busy_ports.borrow_mut().clear();
     assert!(
@@ -1137,7 +1137,7 @@ fn a_held_dist_port_keeps_the_stop_unproven() {
             .execute(probe, &runtime, deadline())
             .detail
             .as_deref(),
-        Some("port_in_use")
+        Some("port_held_outside_runtime")
     );
     // A probe rendered without it still checks the launched run's dist port.
     let mut probe = stubbed(job(JobPhase::Status));
@@ -1147,12 +1147,61 @@ fn a_held_dist_port_keeps_the_stop_unproven() {
             .execute(probe, &runtime, deadline())
             .detail
             .as_deref(),
-        Some("port_in_use")
+        Some("port_held_outside_runtime")
     );
     runtime.busy_ports.borrow_mut().clear();
     let mut probe = with_dist(JobPhase::Status);
     probe.step_id = "p3".into();
     assert!(executor.execute(probe, &runtime, deadline()).stopped);
+}
+
+/// A `service` started with `docker compose up -d`: its containers run under dockerd, outside
+/// the rank's units. Once those units are empty a held port says so, distinct from `port_in_use`.
+#[test]
+fn a_port_held_after_the_ranks_units_emptied_is_named_as_held_outside_them() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let compose = |phase: JobPhase, step: &str| {
+        let mut job = service(job(phase));
+        job.step_id = step.into();
+        job.stop_command = "docker compose down".into();
+        job.status_command = Some(
+            "out=$(docker compose ps --status running -q) || exit 1; [ -n \"$out\" ] || exit 3"
+                .into(),
+        );
+        job
+    };
+    let mut executor = Executor::load(path).expect("load");
+    executor.execute(compose(JobPhase::Start, "s0"), &runtime, deadline());
+    runtime.units.borrow_mut().clear();
+    // The status command says stopped and no unit has a process, yet the port is held.
+    runtime.status_alive.set(Some(false));
+    runtime.busy_ports.borrow_mut().push(30001);
+    let probe = executor.execute(compose(JobPhase::Status, "p1"), &runtime, deadline());
+    assert_eq!(
+        (probe.stopped, probe.detail.as_deref()),
+        (false, Some("port_held_outside_runtime"))
+    );
+    // The inventory runs no status command and looks at no unit first: a bare `port_in_use`.
+    assert_eq!(
+        executor
+            .stop_unproven_now(&compose(JobPhase::Status, "p2"), &runtime, deadline())
+            .expect("proof"),
+        Some("port_in_use")
+    );
+    // A process still in a unit is named first.
+    runtime
+        .orphans
+        .borrow_mut()
+        .push("wsmp_i_abcdefabcdef_r0.slice".into());
+    let probe = executor.execute(compose(JobPhase::Status, "p3"), &runtime, deadline());
+    assert_eq!(probe.detail.as_deref(), Some("process_alive"));
+    runtime.orphans.borrow_mut().clear();
+    // Released by hand: the next probe proves the stop.
+    runtime.busy_ports.borrow_mut().clear();
+    let probe = executor.execute(compose(JobPhase::Status, "p4"), &runtime, deadline());
+    assert!(probe.stopped, "{probe:?}");
 }
 
 #[test]

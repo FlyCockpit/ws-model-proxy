@@ -71,6 +71,7 @@
     "secretTwice": "Name each secret once.",
     "serviceStatus": "Service runtimes need a status command (exit 0 alive, exit 3 stopped).",
     "interactiveStatus": "Interactive commands need a status command.",
+    "statusNeverStopped": "A status command exits 0 while running and 3 once stopped; this one never says stopped, so a stop could never be proven. For example: systemctl is-active --quiet <unit>, or out=$(docker compose ps --status running -q) || exit 1; [ -n \"$out\" ] || exit 3.",
     "interactiveService": "An interactive start or afterJoin needs management service.",
     "interactiveCommand": "An interactive {{field}} needs a {{field}} command.",
     "labelsMax16": "At most 16 labels.",

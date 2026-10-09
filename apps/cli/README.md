@@ -245,7 +245,11 @@ a running instance's readiness route (else its model list, or a TCP connect for 
 readiness) and an always-on runtime's model list, and exits non-zero when the answer is not the
 expected one (3 when nothing matches). The stop proof `wsmp runtime list` shows for a stopping or
 stopped part of an instance is the one the inventory reports: `proven`, or why not (`port_in_use`,
-`process_alive`, `status_unknown`, ...). To check the ports it binds each one for an instant, as
+`process_alive`, `port_held_outside_runtime`, `status_unknown`, ...). `port_held_outside_runtime`
+means the port is held while nothing is left in the rank's units, usually because what holds it
+escaped them (containers from `docker compose up -d`, a daemon that re-parents). For a `service`
+runtime the inventory runs no status command and checks no unit first, so it names a held port
+`port_in_use`. To check the ports it binds each one for an instant, as
 the relay does; it writes nothing and runs no definition command. Runtimes are defined in the web app or through MCP.
 
 ## Other commands

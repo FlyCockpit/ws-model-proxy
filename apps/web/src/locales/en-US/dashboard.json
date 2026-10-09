@@ -1453,6 +1453,7 @@
           "status_running": "The status command says it is running",
           "status_unknown": "The status command couldn't tell",
           "port_in_use": "The port is still in use",
+          "port_held_outside_runtime": "The port is still in use, though nothing is left in the service's units: usually something it started (a container or a daemon) runs outside them",
           "unowned_service": "The service runs outside the node's control and has no status command",
           "not_stopped": "The node couldn't confirm it (update the node if this keeps happening)"
         }

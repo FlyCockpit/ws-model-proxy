@@ -1004,8 +1004,11 @@ impl Executor {
     /// [`Runtime::contains_ranks`]).
     ///
     /// Reasons: `process_alive`, `process_unknown` (the user manager could not
-    /// say), `port_in_use`, `unowned_service` (outside the node's units with no
-    /// status command), `status_running`, `status_unknown`.
+    /// say), `port_in_use`, `port_held_outside_runtime` (a reserved port is
+    /// held while the rank's units and slice have no process left: what holds
+    /// it escaped them, e.g. `docker compose up -d` or a daemon that
+    /// re-parents), `unowned_service` (outside the node's units with no status
+    /// command), `status_running`, `status_unknown`.
     ///
     /// `run_status`: false for the inventory, which runs nothing in a rank's slice (it holds no
     /// rank lock): a run that needs its status command is then never reported stopped (a held
@@ -1097,7 +1100,14 @@ impl Executor {
             }
         }
         if port_held() {
-            return Ok(Some("port_in_use"));
+            // Nothing is left in the rank's units: on a runtime that contains its ranks, what
+            // holds the port runs outside them (usually something the run started that escaped,
+            // or another process). Without units the node cannot tell where it runs.
+            return Ok(Some(if runtime.contains_ranks() {
+                "port_held_outside_runtime"
+            } else {
+                "port_in_use"
+            }));
         }
         Ok(None)
     }

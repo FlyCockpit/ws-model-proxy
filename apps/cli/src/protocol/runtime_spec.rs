@@ -382,6 +382,27 @@ pub struct Commands {
     pub timeouts_sec: Option<Timeouts>,
 }
 
+/// Whether a status command could ever say stopped (exit 3). Refused: an
+/// empty command, `true`, `:`, `exit 0`, `/bin/true` and `/usr/bin/true`,
+/// compared after collapsing spaces, tabs and line breaks and dropping
+/// trailing semicolons. Nothing else is parsed. Twin of the server's
+/// `statusCanReportStopped` (`packages/api/src/lib/runtime-spec.ts`); shared
+/// vectors in `tests/fixtures/relay-3.0/rules/status-command.json`.
+pub fn status_can_report_stopped(command: &str) -> bool {
+    let mut text = command
+        .split([' ', '\t', '\n', '\r'])
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    while let Some(rest) = text.strip_suffix(';') {
+        text = rest.strip_suffix(' ').unwrap_or(rest).to_owned();
+    }
+    !matches!(
+        text.as_str(),
+        "" | "true" | ":" | "exit 0" | "/bin/true" | "/usr/bin/true"
+    )
+}
+
 /// Each flag is `true` or absent on the wire.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -611,4 +632,37 @@ pub struct FileFeatures {
     /// Where the roots come from: the home directory by default, the
     /// configured list, or none (file tools turned off).
     pub source: crate::config::FileRootsSource,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_can_report_stopped;
+
+    #[test]
+    fn status_commands_match_the_shared_vectors() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/relay-3.0/rules/status-command.json");
+        let text = std::fs::read_to_string(path).expect("status-command vectors");
+        let vectors: serde_json::Value = serde_json::from_str(&text).expect("vectors are JSON");
+        let list = |key: &str| -> Vec<String> {
+            vectors[key]
+                .as_array()
+                .expect("a list")
+                .iter()
+                .map(|value| value.as_str().expect("a string").to_owned())
+                .collect()
+        };
+        for command in list("refused") {
+            assert!(
+                !status_can_report_stopped(&command),
+                "{command:?} should be refused"
+            );
+        }
+        for command in list("accepted") {
+            assert!(
+                status_can_report_stopped(&command),
+                "{command:?} should be accepted"
+            );
+        }
+    }
 }

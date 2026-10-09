@@ -123,7 +123,8 @@ export function advertisedToolList(): Array<{
   }));
 }
 
-const SPEC = "Runtime definition; shape in docs/mcp.md, start from runtimes_get presets.";
+const SPEC =
+  "Runtime definition; shape in docs/mcp.md, start from runtimes_get presets. A status command exits 0 running, 3 stopped.";
 const LIMITS = "Limit overrides (null: automatic); runtimes_get shows effective values.";
 const ADVANCED = "Advanced settings by key; pools_get / runtimes_get show keys and defaults.";
 const COMPAT = "Request compatibility (replaces; null: automatic); shape in docs/mcp.md.";
