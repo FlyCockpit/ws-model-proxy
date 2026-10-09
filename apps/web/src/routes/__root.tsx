@@ -27,6 +27,7 @@ import { ThemeColorSync } from "@/components/theme-color-sync";
 import { ThemeProvider } from "@/components/theme-provider";
 import { useAppUpdate } from "@/hooks/use-app-update";
 import { useDocumentLang } from "@/hooks/use-document-lang";
+import { useHashTargetScroll } from "@/hooks/use-hash-target-scroll";
 import { useMobileKeyboard } from "@/hooks/use-mobile-keyboard";
 import { useUserLocaleSync } from "@/hooks/use-user-locale-sync";
 import i18n from "@/i18n";
@@ -137,6 +138,7 @@ function RootShell({ children }: { children: ReactNode }) {
 function RootComponent() {
   useAppUpdate();
   useDocumentLang();
+  useHashTargetScroll();
   useUserLocaleSync();
   const mobileKeyboardOpen = useMobileKeyboard();
 

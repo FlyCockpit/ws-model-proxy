@@ -61,6 +61,9 @@ export function getRouter() {
     // search-param updates pass `resetScroll: false` to keep the reader's place.
     scrollRestoration: true,
     scrollToTopSelectors: [MAIN_SCROLLER_SELECTOR],
+    // `#id` targets are revealed by useHashTargetScroll (root component), which waits for gated
+    // content to mount and leaves back/forward to the restored position.
+    defaultHashScrollIntoView: false,
     // CSP nonce for SSR-injected inline scripts (hydration, etc.). Matches the
     // nonce in the script-src CSP header set by the API server. undefined on
     // the client (the document already carries the server-rendered nonce).
