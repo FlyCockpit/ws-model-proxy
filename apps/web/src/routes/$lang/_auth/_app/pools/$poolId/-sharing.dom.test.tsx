@@ -202,7 +202,15 @@ function member(id: string, model: string, shareId: string | null, email: string
     providerModelId: null,
     cloudOrder: null,
     health: "HEALTHY",
-    live: { instances: 1, running: 0, waiting: 0, p95LatencyMs: null },
+    live: {
+      instances: 1,
+      running: 0,
+      waiting: 0,
+      p95LatencyMs: null,
+      share: null,
+      active: null,
+      slots: null,
+    },
   };
 }
 

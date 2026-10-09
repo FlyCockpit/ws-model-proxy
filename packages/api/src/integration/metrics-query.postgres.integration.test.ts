@@ -544,17 +544,25 @@ integration("metrics_query on PostgreSQL", () => {
     expect(grantee.nodes).toEqual([]);
   });
 
-  it("gives a pool member its p95 over the last 15 minutes, through the serving version", async () => {
-    const { memberLatencyP95 } = await import("../lib/overview-summary");
+  it("gives a pool member its 15-minute p95 and 24-hour requests, through the serving version", async () => {
+    const { memberRecentTraffic } = await import("../lib/overview-summary");
     const { memberLatencyKey } = await import("../lib/pool-views");
-    const recent = await memberLatencyP95(OWNER, [ids.pool], at(10));
+    const recent = await memberRecentTraffic(OWNER, [ids.pool], at(10));
     const key = memberLatencyKey(ids.pool, { runtimeId: ids.runtime });
     // Only the owner's real traffic with latencies: tests, cloud rows without them and other
     // owners' rows give no member a value.
-    expect([...recent.keys()]).toEqual([key]);
-    expect(recent.get(key)).toBeGreaterThanOrEqual(2_000);
-    expect((await memberLatencyP95(OWNER, [ids.pool], at(30))).size).toBe(0);
-    expect((await memberLatencyP95(STRANGER, [ids.pool], at(10))).size).toBe(0);
+    expect([...recent.p95.keys()]).toEqual([key]);
+    expect(recent.p95.get(key)).toBeGreaterThanOrEqual(2_000);
+    // Requests: the owner's real traffic a member served (tests, other owners' rows and the
+    // cloud row naming no provider model left out).
+    expect(recent.requests).toEqual(new Map([[key, 5]]));
+    expect(recent.poolRequests).toEqual(new Map([[ids.pool, 5]]));
+    // Past the p95 window the requests still count; past the share window nothing does.
+    const later = await memberRecentTraffic(OWNER, [ids.pool], at(30));
+    expect(later.p95.size).toBe(0);
+    expect(later.poolRequests.get(ids.pool)).toBe(5);
+    expect((await memberRecentTraffic(OWNER, [ids.pool], at(25 * 60))).poolRequests.size).toBe(0);
+    expect((await memberRecentTraffic(STRANGER, [ids.pool], at(10))).requests.size).toBe(0);
   });
 
   it("puts pool traffic into fixed sparkline buckets, the oldest at the window start", async () => {

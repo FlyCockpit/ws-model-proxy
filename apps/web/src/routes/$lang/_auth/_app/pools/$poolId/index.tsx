@@ -24,10 +24,13 @@ import z from "zod";
 import { CodeSnippet } from "@/components/code-snippet";
 import { CopyableCode } from "@/components/copy-button";
 import { FieldErrors } from "@/components/field-errors";
+import { FillMeter } from "@/components/fill-meter";
 import { InlineRetry } from "@/components/inline-retry";
 import { NativeSelect } from "@/components/native-select";
 import { SegmentedControl } from "@/components/segmented-control";
+import { SlotMeter } from "@/components/slot-meter";
 import { StatusPill } from "@/components/status-pill";
+import { WideContent } from "@/components/wide-content";
 import { callSnippet, type SnippetKind, snippetKinds } from "@/lib/call-snippets";
 import { formatMs } from "@/lib/format-metrics";
 import {
@@ -90,12 +93,32 @@ function PoolOverviewPage() {
           ))}
         </div>
         <Skeleton className="h-40 w-full rounded-xl" />
-        <Skeleton className="h-48 w-full rounded-xl" />
+        <MembersSkeleton />
       </div>
     );
   if (pool.isError)
     return <InlineRetry message={t("dashboard:pool.loadFailed")} onRetry={() => pool.refetch()} />;
   return <PoolOverview pool={pool.data} />;
+}
+
+/** The members card while the pool loads: title, one table header and three member rows. */
+function MembersSkeleton() {
+  return (
+    <div className="flex min-w-0 flex-col gap-3 rounded-xl border p-4">
+      <Skeleton className="h-5 w-32" />
+      <Skeleton className="h-4 w-2/3" />
+      <Skeleton className="h-4 w-24" />
+      {[0, 1, 2].map((row) => (
+        <div key={row} className="flex min-w-0 items-center gap-4">
+          <Skeleton className="h-10 w-48 shrink-0" />
+          <Skeleton className="h-6 w-20 shrink-0 rounded-full" />
+          <Skeleton className="h-2 min-w-0 flex-1" />
+          <Skeleton className="hidden h-11 w-32 shrink-0 sm:block" />
+          <Skeleton className="hidden h-3 w-40 shrink-0 md:block" />
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function PoolOverview({ pool }: { pool: PoolView }) {
@@ -354,7 +377,7 @@ function memberRank(member: PoolMemberView): number {
 }
 
 function MembersCard({ pool }: { pool: PoolView }) {
-  const { t, i18n } = useTranslation(["dashboard", "common"]);
+  const { t } = useTranslation(["dashboard", "common"]);
   const { lang } = Route.useParams();
   const write = usePoolWrite();
   const runtimes = useQuery(orpc.runtimes.list.queryOptions());
@@ -374,7 +397,42 @@ function MembersCard({ pool }: { pool: PoolView }) {
     (option) => !inPool.has(option.value),
   );
   const members = [...pool.members].sort((a, b) => memberRank(a) - memberRank(b));
-  const none = t("dashboard:overview.kpi.none");
+  const local = members.filter((member) => member.kind !== "CLOUD");
+  const cloud = members.filter((member) => member.kind === "CLOUD");
+  const pending = update.isPending || removeContributed.isPending;
+  const actions: MemberActions = {
+    pending,
+    setWeight: (member, weight) =>
+      write(
+        () =>
+          update.mutateAsync({
+            poolId: pool.id,
+            members: { set: [{ memberId: member.id, weight }] },
+          }),
+        t("dashboard:pool.saved"),
+      ),
+    toggle: (member) =>
+      write(
+        () =>
+          update.mutateAsync({
+            poolId: pool.id,
+            members: {
+              set: [
+                { memberId: member.id, state: member.state === "ACTIVE" ? "DISABLED" : "ACTIVE" },
+              ],
+            },
+          }),
+        t("dashboard:pool.saved"),
+      ),
+    remove: (member) =>
+      write(
+        () =>
+          member.shareId
+            ? removeContributed.mutateAsync({ memberId: member.id })
+            : update.mutateAsync({ poolId: pool.id, members: { remove: [member.id] } }),
+        t("dashboard:pool.memberRemoved"),
+      ),
+  };
 
   return (
     <Card>
@@ -386,112 +444,24 @@ function MembersCard({ pool }: { pool: PoolView }) {
         {members.length === 0 ? (
           <p className="text-sm text-muted-foreground">{t("dashboard:pool.noMembers")}</p>
         ) : (
-          <ul className="flex min-w-0 flex-col divide-y">
-            {members.map((member) => (
-              <li key={member.id} className="flex min-w-0 flex-wrap items-center gap-2 py-2">
-                <div className="min-w-0 flex-1">
-                  <p className="break-all font-mono text-sm">
-                    {member.runtimeId ? (
-                      <Link
-                        to="/$lang/runtimes/$runtimeId"
-                        params={{ lang, runtimeId: member.runtimeId }}
-                        className="underline-offset-4 hover:underline"
-                      >
-                        {memberLabel(member)}
-                      </Link>
-                    ) : (
-                      memberLabel(member)
-                    )}
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    {member.kind === "CLOUD"
-                      ? t("dashboard:pool.cloudMember", { order: (member.cloudOrder ?? 0) + 1 })
-                      : member.contributorEmail
-                        ? t("dashboard:pool.contributedBy", { email: member.contributorEmail })
-                        : t("dashboard:pool.instancesLive", {
-                            running: member.live.running,
-                            total: member.live.instances,
-                          })}
-                    {member.live.p95LatencyMs !== null
-                      ? ` · ${t("dashboard:pool.live.p95", {
-                          value: formatMs(member.live.p95LatencyMs, i18n.language, none),
-                        })}`
-                      : ""}
-                    {member.live.waiting !== null && member.live.waiting > 0
-                      ? ` · ${t("dashboard:pool.live.waiting", { count: member.live.waiting })}`
-                      : ""}
-                  </p>
-                </div>
-                <StatusPill tone={MEMBER_STATUS_TONE[member.status]}>
-                  {t(`dashboard:pool.memberStatus.${member.status}`)}
-                </StatusPill>
-                {member.kind === "LOCAL" ? (
-                  <MemberWeightForm
-                    member={member}
-                    pending={update.isPending || removeContributed.isPending}
-                    onSave={(weight) =>
-                      write(
-                        () =>
-                          update.mutateAsync({
-                            poolId: pool.id,
-                            members: { set: [{ memberId: member.id, weight }] },
-                          }),
-                        t("dashboard:pool.saved"),
-                      )
-                    }
-                  />
-                ) : null}
-                {member.kind === "LOCAL" && !member.shareId ? (
-                  <Button
-                    variant="outline"
-                    size="touch"
-                    disabled={update.isPending}
-                    onClick={() =>
-                      write(
-                        () =>
-                          update.mutateAsync({
-                            poolId: pool.id,
-                            members: {
-                              set: [
-                                {
-                                  memberId: member.id,
-                                  state: member.state === "ACTIVE" ? "DISABLED" : "ACTIVE",
-                                },
-                              ],
-                            },
-                          }),
-                        t("dashboard:pool.saved"),
-                      )
-                    }
-                  >
-                    {member.state === "ACTIVE"
-                      ? t("dashboard:pool.disableMember")
-                      : t("dashboard:pool.enableMember")}
-                  </Button>
-                ) : null}
-                <Button
-                  variant="ghost"
-                  size="icon-touch"
-                  aria-label={t("dashboard:pool.removeMember", { member: memberLabel(member) })}
-                  disabled={update.isPending || removeContributed.isPending}
-                  onClick={() =>
-                    write(
-                      () =>
-                        member.shareId
-                          ? removeContributed.mutateAsync({ memberId: member.id })
-                          : update.mutateAsync({
-                              poolId: pool.id,
-                              members: { remove: [member.id] },
-                            }),
-                      t("dashboard:pool.memberRemoved"),
-                    )
-                  }
-                >
-                  <Trash2 aria-hidden="true" />
-                </Button>
-              </li>
-            ))}
-          </ul>
+          <>
+            {local.length > 0 ? (
+              <MemberTable
+                title={t("dashboard:pool.table.local")}
+                members={local}
+                keptSlots={pool.routing.keptSlots}
+                actions={actions}
+              />
+            ) : null}
+            {cloud.length > 0 ? (
+              <MemberTable
+                title={t("dashboard:pool.table.cloud")}
+                members={cloud}
+                keptSlots={0}
+                actions={actions}
+              />
+            ) : null}
+          </>
         )}
         <form
           className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-end"
@@ -543,6 +513,192 @@ function MembersCard({ pool }: { pool: PoolView }) {
   );
 }
 
+type MemberActions = {
+  /** A write to this pool's members is running. */
+  pending: boolean;
+  setWeight: (member: PoolMemberView, weight: number) => Promise<boolean>;
+  toggle: (member: PoolMemberView) => Promise<boolean>;
+  remove: (member: PoolMemberView) => Promise<boolean>;
+};
+
+const MEMBER_COLUMNS = ["model", "status", "share", "weight", "slots", "p95"] as const;
+
+/** One member table: the pool's own and contributed models, or its cloud members in order. */
+function MemberTable({
+  title,
+  members,
+  keptSlots,
+  actions,
+}: {
+  title: string;
+  members: PoolMemberView[];
+  /** The pool's kept slots per instance (0: none). */
+  keptSlots: number;
+  actions: MemberActions;
+}) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  return (
+    <section className="flex min-w-0 flex-col gap-1">
+      <h3 className="text-sm font-medium">{title}</h3>
+      {/* Relative: the sr-only (absolute) header text of the last column stays clipped by the
+          scroller instead of widening the page's scroll area at phone width. */}
+      <WideContent className="relative">
+        <table className="w-full min-w-max text-sm">
+          <caption className="sr-only">{title}</caption>
+          <thead>
+            <tr className="border-b text-left text-xs text-muted-foreground">
+              {MEMBER_COLUMNS.map((column) => (
+                <th key={column} scope="col" className="py-2 pr-4 font-medium">
+                  {t(`dashboard:pool.table.${column}`)}
+                </th>
+              ))}
+              <th scope="col" className="py-2 font-medium">
+                <span className="sr-only">{t("dashboard:pool.table.actions")}</span>
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {members.map((member) => (
+              <MemberRow key={member.id} member={member} keptSlots={keptSlots} actions={actions} />
+            ))}
+          </tbody>
+        </table>
+      </WideContent>
+    </section>
+  );
+}
+
+function MemberRow({
+  member,
+  keptSlots,
+  actions,
+}: {
+  member: PoolMemberView;
+  keptSlots: number;
+  actions: MemberActions;
+}) {
+  const { t, i18n } = useTranslation(["dashboard", "common"]);
+  const { lang } = Route.useParams();
+  const none = t("dashboard:overview.kpi.none");
+  const { live } = member;
+  return (
+    <tr className="border-b align-middle last:border-b-0">
+      <th scope="row" className="py-2 pr-4 text-left font-normal">
+        <div className="w-48 max-w-72 min-w-0 sm:w-auto">
+          <p className="break-all font-mono text-sm">
+            {member.runtimeId ? (
+              <Link
+                to="/$lang/runtimes/$runtimeId"
+                params={{ lang, runtimeId: member.runtimeId }}
+                className="underline-offset-4 hover:underline"
+              >
+                {memberLabel(member)}
+              </Link>
+            ) : (
+              memberLabel(member)
+            )}
+          </p>
+          <p className="text-xs text-muted-foreground">
+            {member.kind === "CLOUD"
+              ? t("dashboard:pool.cloudMember", { order: (member.cloudOrder ?? 0) + 1 })
+              : member.contributorEmail
+                ? t("dashboard:pool.contributedBy", { email: member.contributorEmail })
+                : t("dashboard:pool.instancesLive", {
+                    running: live.running,
+                    total: live.instances,
+                  })}
+          </p>
+        </div>
+      </th>
+      <td className="py-2 pr-4">
+        <StatusPill tone={MEMBER_STATUS_TONE[member.status]}>
+          {t(`dashboard:pool.memberStatus.${member.status}`)}
+        </StatusPill>
+      </td>
+      <td className="py-2 pr-4">
+        {live.share === null ? (
+          <span className="text-xs text-muted-foreground">{t("dashboard:pool.share.none")}</span>
+        ) : (
+          <FillMeter
+            fraction={live.share}
+            label={t("dashboard:pool.share.percent", { percent: Math.round(live.share * 100) })}
+            ariaLabel={t("dashboard:pool.share.aria", {
+              member: memberLabel(member),
+              percent: Math.round(live.share * 100),
+            })}
+            className="w-32"
+          />
+        )}
+      </td>
+      <td className="py-2 pr-4">
+        {member.kind === "LOCAL" ? (
+          <MemberWeightForm
+            member={member}
+            pending={actions.pending}
+            onSave={(weight) => actions.setWeight(member, weight)}
+          />
+        ) : (
+          <span className="text-xs text-muted-foreground">{none}</span>
+        )}
+      </td>
+      <td className="py-2 pr-4">
+        {member.kind === "CLOUD" ? (
+          <span className="text-xs text-muted-foreground">{t("dashboard:pool.slots.none")}</span>
+        ) : member.shareId ? (
+          // The contributor's engine (their other traffic included): its load stays theirs.
+          <span className="text-xs text-muted-foreground">
+            {t("dashboard:pool.slots.contributed")}
+          </span>
+        ) : live.active === null ? (
+          <span className="text-xs text-muted-foreground">
+            {live.slots === null
+              ? t("dashboard:pool.slots.unknown")
+              : t("dashboard:pool.slots.limitOnly", { slots: live.slots })}
+          </span>
+        ) : (
+          <SlotMeter
+            active={live.active}
+            slots={live.slots}
+            waiting={live.waiting ?? 0}
+            // The pool keeps its slots on each ready instance (fewer when pools sharing an
+            // instance keep more than it has: hence "up to").
+            kept={keptSlots * live.running}
+            className="w-60"
+          />
+        )}
+      </td>
+      <td className="py-2 pr-4 tabular-nums whitespace-nowrap">
+        {formatMs(live.p95LatencyMs, i18n.language, none)}
+      </td>
+      <td className="py-2">
+        <div className="flex items-center justify-end gap-1">
+          {member.kind === "LOCAL" && !member.shareId ? (
+            <Button
+              variant="outline"
+              size="touch"
+              disabled={actions.pending}
+              onClick={() => actions.toggle(member)}
+            >
+              {member.state === "ACTIVE"
+                ? t("dashboard:pool.disableMember")
+                : t("dashboard:pool.enableMember")}
+            </Button>
+          ) : null}
+          <Button
+            variant="ghost"
+            size="icon-touch"
+            aria-label={t("dashboard:pool.removeMember", { member: memberLabel(member) })}
+            disabled={actions.pending}
+            onClick={() => actions.remove(member)}
+          >
+            <Trash2 aria-hidden="true" />
+          </Button>
+        </div>
+      </td>
+    </tr>
+  );
+}
+
 /** A member's routing weight (1–1000; higher gets more requests). */
 function MemberWeightForm({
   member,
@@ -587,9 +743,6 @@ function MemberWeightForm({
         {(field) => (
           <div className="flex flex-col gap-1">
             <div className="flex items-center gap-1">
-              <Label htmlFor={id} className="text-xs text-muted-foreground">
-                {t("dashboard:pool.weight.label")}
-              </Label>
               <Input
                 id={id}
                 inputMode="numeric"

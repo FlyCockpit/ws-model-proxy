@@ -151,7 +151,12 @@ describe("instanceView live load", () => {
   });
 });
 
-function memberRow(instanceIds: string[], kind: "LOCAL" | "CLOUD" = "LOCAL"): MemberRow {
+function memberRow(
+  instanceIds: string[],
+  kind: "LOCAL" | "CLOUD" = "LOCAL",
+  engineSlots: number | null = 4,
+  shareId: string | null = null,
+): MemberRow {
   return {
     id: "mem1",
     poolId: "pool1",
@@ -160,7 +165,7 @@ function memberRow(instanceIds: string[], kind: "LOCAL" | "CLOUD" = "LOCAL"): Me
     weight: 1,
     runtimeModelId: kind === "LOCAL" ? "rm1" : null,
     providerModelId: kind === "CLOUD" ? "pm1" : null,
-    shareId: null,
+    shareId,
     cloudOrder: kind === "CLOUD" ? 0 : null,
     Share: null,
     ProviderModel:
@@ -175,7 +180,7 @@ function memberRow(instanceIds: string[], kind: "LOCAL" | "CLOUD" = "LOCAL"): Me
               slug: "rt",
               nodeId: null,
               Node: null,
-              Instances: instanceIds.map((id) => ({ id, phase: "READY", Ranks: [] })),
+              Instances: instanceIds.map((id) => ({ id, phase: "READY", engineSlots, Ranks: [] })),
             },
             Targets: [],
           }
@@ -184,35 +189,66 @@ function memberRow(instanceIds: string[], kind: "LOCAL" | "CLOUD" = "LOCAL"): Me
 }
 
 describe("memberView live", () => {
-  const p95 = new Map([[memberLatencyKey("pool1", { runtimeId: "rt1" }), 840]]);
+  const key = memberLatencyKey("pool1", { runtimeId: "rt1" });
+  const traffic = {
+    p95: new Map([[key, 840]]),
+    requests: new Map([[key, 30]]),
+    poolRequests: new Map([["pool1", 40]]),
+  };
 
-  it("adds the waiting of instances with a known reading, and shows the member's p95", () => {
+  it("adds the load of instances with a known reading, with the member's p95 and share", () => {
     const load = new Map([
       ["i1", LOAD],
       ["i2", { ...LOAD, waiting: 1 }],
-      ["i3", { ...LOAD, waiting: null }],
+      ["i3", { ...LOAD, running: null, waiting: null }],
     ]);
-    expect(memberView(memberRow(["i1", "i2", "i3", "i4"]), { load, p95 }).live).toEqual({
+    expect(memberView(memberRow(["i1", "i2", "i3", "i4"]), { load, ...traffic }).live).toEqual({
       instances: 4,
       running: 4,
       waiting: 6,
       p95LatencyMs: 840,
+      share: 0.75,
+      active: 2 * (LOAD.running ?? 0),
+      slots: 16,
     });
   });
 
-  it("keeps waiting and p95 unknown when nothing is known", () => {
+  it("keeps load, p95 and share unknown when nothing is known", () => {
     expect(memberView(memberRow(["i1"])).live).toEqual({
       instances: 1,
       running: 1,
       waiting: null,
       p95LatencyMs: null,
+      share: null,
+      active: null,
+      slots: 4,
     });
   });
 
-  it("keys a cloud member's p95 by its provider model", () => {
-    const cloud = new Map([[memberLatencyKey("pool1", { providerModelId: "pm1" }), 1200]]);
+  it("gives a member without pool traffic of its own a zero share", () => {
+    const quiet = { ...traffic, requests: new Map() };
+    expect(memberView(memberRow(["i1"]), { load: new Map(), ...quiet }).live.share).toBe(0);
+  });
+
+  it("knows no slot limit when an instance's limit is unknown, nor any of a contributed one", () => {
+    const load = new Map([["i1", LOAD]]);
+    expect(memberView(memberRow(["i1"], "LOCAL", null), { load, ...traffic }).live).toMatchObject({
+      active: LOAD.running,
+      slots: null,
+    });
     expect(
-      memberView(memberRow([], "CLOUD"), { load: new Map(), p95: cloud }).live.p95LatencyMs,
-    ).toBe(1200);
+      memberView(memberRow(["i1"], "LOCAL", 4, "share1"), { load, ...traffic }).live,
+    ).toMatchObject({ active: null, slots: null, share: 0.75 });
+  });
+
+  it("keys a cloud member's p95 and share by its provider model", () => {
+    const cloudKey = memberLatencyKey("pool1", { providerModelId: "pm1" });
+    const live = memberView(memberRow([], "CLOUD"), {
+      load: new Map(),
+      p95: new Map([[cloudKey, 1200]]),
+      requests: new Map([[cloudKey, 10]]),
+      poolRequests: new Map([["pool1", 40]]),
+    }).live;
+    expect(live).toMatchObject({ p95LatencyMs: 1200, share: 0.25, active: null, slots: null });
   });
 });

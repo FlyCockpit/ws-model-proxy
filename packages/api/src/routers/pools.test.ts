@@ -97,6 +97,7 @@ function servingMember(phase = "READY") {
           {
             id: "inst-1",
             phase,
+            engineSlots: 8,
             Ranks: [{ nodeId: "node-1", Node: { slug: "box", userId: OWNER } }],
           },
         ],
@@ -158,13 +159,14 @@ describe("pools.get: member live load", () => {
       pool: "pool-1",
       runtime: "rt-1",
       provider_model: "",
+      requests: 6,
     };
     for (let index = 1; index <= LATENCY_HISTOGRAM_BUCKETS; index += 1)
       row[`l${index}`] = bucketCounts[index] ?? 0;
     return row;
   }
 
-  it("adds the relay's waiting and the member's recent p95 from the owner's rollups", async () => {
+  it("adds the relay's load and the member's recent p95 and share from the owner's rollups", async () => {
     db.pool.findFirst.mockResolvedValue(poolRow({ Members: [servingMember()] }) as never);
     db.$queryRaw.mockImplementation(((strings: TemplateStringsArray) =>
       Promise.resolve(
@@ -177,7 +179,7 @@ describe("pools.get: member live load", () => {
       context: contextFor(CALLERS.person(), { liveLoad }),
     }).get({ poolId: "pool-1" });
     expect(liveLoad).toHaveBeenCalledWith(["inst-1"]);
-    expect(view.members[0]?.live.waiting).toBe(4);
+    expect(view.members[0]?.live).toMatchObject({ waiting: 4, active: 1, slots: 8, share: 1 });
     expect(view.members[0]?.live.p95LatencyMs).toEqual(expect.any(Number));
     const p95Call = db.$queryRaw.mock.calls.find((call) =>
       (call[0] as unknown as TemplateStringsArray).join("").includes("provider_model"),
@@ -196,13 +198,19 @@ describe("pools.get: member live load", () => {
       context: contextFor(CALLERS.person(), { liveLoad }),
     }).get({ poolId: "pool-1" });
     expect(liveLoad).not.toHaveBeenCalled();
-    expect(view.members[0]?.live.waiting).toBeNull();
+    expect(view.members[0]?.live).toMatchObject({ waiting: null, active: null, slots: null });
   });
 
   it("keeps load unknown without the relay service and p95 unknown without traffic", async () => {
     db.pool.findFirst.mockResolvedValue(poolRow({ Members: [servingMember()] }) as never);
     const view = await client().get({ poolId: "pool-1" });
-    expect(view.members[0]?.live).toMatchObject({ waiting: null, p95LatencyMs: null });
+    expect(view.members[0]?.live).toMatchObject({
+      waiting: null,
+      p95LatencyMs: null,
+      share: null,
+      active: null,
+      slots: 8,
+    });
   });
 });
 

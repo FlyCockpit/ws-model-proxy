@@ -31,11 +31,12 @@ function num(row: KpiRow | undefined, column: string): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function histogramColumns(column: string, prefix: string): Prisma.Sql[] {
+/** One summed column per histogram bucket; `filter` limits the rows each sum adds. */
+function histogramColumns(column: string, prefix: string, filter = Prisma.empty): Prisma.Sql[] {
   return Array.from(
     { length: LATENCY_HISTOGRAM_BUCKETS },
     (_, index) =>
-      Prisma.sql`SUM(COALESCE(${Prisma.raw(`"${column}"`)}[${Prisma.raw(String(index + 1))}], 0))::float8 AS ${Prisma.raw(`"${prefix}${index + 1}"`)}`,
+      Prisma.sql`SUM(COALESCE(${Prisma.raw(`"${column}"`)}[${Prisma.raw(String(index + 1))}], 0)) ${filter}::float8 AS ${Prisma.raw(`"${prefix}${index + 1}"`)}`,
   );
 }
 
@@ -98,42 +99,74 @@ export async function poolTraffic(
 
 /** The window a pool member's p95 latency covers. */
 const MEMBER_LATENCY_WINDOW_MS = 15 * 60_000;
+/** The window a pool member's traffic share covers (the length of the pool page's stats row's). */
+const MEMBER_SHARE_WINDOW_MS = RANGES["24h"].rangeMs;
+
+/** Recent traffic of the members of the owner's pools, keyed by `memberLatencyKey`. */
+export type MemberRecentTraffic = {
+  /** p95 latency (ms) over the last 15 minutes. */
+  p95: Map<string, number>;
+  /** Requests over the last 24 hours. */
+  requests: Map<string, number>;
+  /**
+   * Each pool's requests over the last 24 hours that a member served (members since removed
+   * included; requests refused before reaching one left out), so the shares add up to 1.
+   */
+  poolRequests: Map<string, number>;
+};
 
 /**
- * p95 latency of each member of the owner's pools over the last 15 minutes of real traffic,
- * keyed by `memberLatencyKey` (minute rollups, one bounded query; agent tests excluded).
+ * Each member of the owner's pools: its p95 latency over the last 15 minutes and its requests
+ * over the last 24 hours, of real traffic (minute rollups, one bounded query; agent tests
+ * excluded).
  */
-export async function memberLatencyP95(
+export async function memberRecentTraffic(
   ownerId: string,
   poolIds: readonly string[],
   now = new Date(),
-): Promise<Map<string, number>> {
-  const byMember = new Map<string, number>();
-  if (poolIds.length === 0) return byMember;
-  const from = new Date(now.getTime() - MEMBER_LATENCY_WINDOW_MS);
+): Promise<MemberRecentTraffic> {
+  const traffic: MemberRecentTraffic = {
+    p95: new Map(),
+    requests: new Map(),
+    poolRequests: new Map(),
+  };
+  if (poolIds.length === 0) return traffic;
+  const latencyFrom = new Date(now.getTime() - MEMBER_LATENCY_WINDOW_MS);
+  const shareFrom = new Date(now.getTime() - MEMBER_SHARE_WINDOW_MS);
   // Pool traffic records the serving version (and instance), not the runtime model: the
   // version names the runtime.
   const rows = await prisma.$queryRaw<KpiRow[]>`SELECT "poolId" AS pool,
       COALESCE(NULLIF("runtimeId", ''),
         (SELECT v."runtimeId" FROM runtime_version v WHERE v.id = "versionId"), '') AS runtime,
       "providerModelId" AS provider_model,
-      ${Prisma.join(histogramColumns("latencyHistogram", "l"), ", ")}
+      SUM(requests)::float8 AS requests,
+      ${Prisma.join(
+        histogramColumns(
+          "latencyHistogram",
+          "l",
+          Prisma.sql`FILTER (WHERE "bucketStart" >= ${latencyFrom})`,
+        ),
+        ", ",
+      )}
     FROM usage_rollup_minute
     WHERE "ownerUserId" = ${ownerId} AND "poolId" = ANY(${[...poolIds]}::text[])
-      AND "bucketStart" >= ${from} AND "bucketStart" <= ${now} AND ${realTraffic()}
+      AND "bucketStart" >= ${shareFrom} AND "bucketStart" <= ${now} AND ${realTraffic()}
     GROUP BY 1, 2, 3`;
   for (const row of rows) {
+    const pool = String(row.pool);
+    const key = memberLatencyKey(pool, {
+      runtimeId: row.runtime ? String(row.runtime) : null,
+      providerModelId: row.provider_model ? String(row.provider_model) : null,
+    });
+    const requests = num(row, "requests");
+    if (row.runtime || row.provider_model) {
+      traffic.requests.set(key, (traffic.requests.get(key) ?? 0) + requests);
+      traffic.poolRequests.set(pool, (traffic.poolRequests.get(pool) ?? 0) + requests);
+    }
     const value = p95(row, "l");
-    if (value === null) continue;
-    byMember.set(
-      memberLatencyKey(String(row.pool), {
-        runtimeId: row.runtime ? String(row.runtime) : null,
-        providerModelId: row.provider_model ? String(row.provider_model) : null,
-      }),
-      value,
-    );
+    if (value !== null) traffic.p95.set(key, value);
   }
-  return byMember;
+  return traffic;
 }
 
 export async function overviewSummary(userId: string, range: OverviewRange, now = new Date()) {
