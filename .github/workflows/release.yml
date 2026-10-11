@@ -396,6 +396,9 @@ jobs:
         run: |
           set -euo pipefail
           cd apps/cli/artifacts
+          # cargo-dist ends sha256.sum with a blank line, which `sha256sum --strict` refuses as
+          # improperly formatted. Drop blank lines so the published file passes a strict check.
+          sed -i '/^[[:space:]]*$/d' sha256.sum
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
             archive="wsmp-$target.tar.xz"
             if [ ! -f "$archive" ]; then
