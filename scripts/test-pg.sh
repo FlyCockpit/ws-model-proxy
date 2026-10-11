@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# test-pg.sh — disposable-PostgreSQL runner for the MCP OAuth integration
-# suite (MCP plan Phase 9b / Part K2).
+# test-pg.sh — disposable-PostgreSQL runner for every PostgreSQL integration
+# suite of the API and the server.
 #
 # Spins up a THROWAWAY postgres:17 container (same image as
 # docker-compose.dev.yml) under a UNIQUE name with a RANDOM loopback host
-# port, waits for TCP readiness, pushes the schema non-destructively through
-# the repo's OWN db:push package pipeline (so future pipeline additions are
-# inherited automatically), runs the MCP integration suite with the
-# disposable URL, and tears the container down — including its ANONYMOUS
-# VOLUMES — on exit, on failure, and on interruption.
+# port, waits for TCP readiness, runs scripts/test-postgres-integration.sh
+# (the same gate CI runs: db:push plus hardening, then the API and server
+# `test:postgres` suites) against the disposable URL, and tears the container
+# down — including its ANONYMOUS VOLUMES — on exit, on failure, and on
+# interruption.
 #
 # SAFETY (container ownership — R119 F4 / R120 F1 protocol):
 # - Every run carries a unique RUN_ID embedded in BOTH the container NAME
@@ -51,8 +51,8 @@
 # OPT-OUT (bring your own database): if SCHEMA_VALIDATION_DATABASE_URL is
 # already exported when this script starts, provisioning is SKIPPED and the
 # suite runs against that URL directly — no container is created or removed.
-# The URL must already have the schema pushed (e.g. via `pnpm db:push` with
-# DATABASE_URL set to it). REQUIRE_POSTGRES_INTEGRATION=1 is always set so a
+# The database is changed in place (schema push plus suite fixtures), so it
+# must be disposable. REQUIRE_POSTGRES_INTEGRATION=1 is always set so a
 # missing/unreachable URL fails loudly instead of silently skipping tests.
 #
 # Usage:
@@ -65,20 +65,15 @@
 set -euo pipefail
 
 SCRIPT_NAME="test-pg"
-echo "[$SCRIPT_NAME] disposable-PostgreSQL MCP integration runner"
+echo "[$SCRIPT_NAME] disposable-PostgreSQL integration runner"
 
 # ---------------------------------------------------------------------------
 # Locate the repo root from this script's location (works from any cwd).
 # ---------------------------------------------------------------------------
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# ---------------------------------------------------------------------------
-# Suite to run (kept in one place; the *.integration.test.ts convention skips
-# itself when SCHEMA_VALIDATION_DATABASE_URL is unset in normal runs).
-# ---------------------------------------------------------------------------
-MCP_INTEGRATION_FILES=(
-  "src/mcp/oauth-mcp.integration.test.ts"
-)
+# The suites to run live in one place: the shared CI gate script.
+INTEGRATION_SCRIPT="$REPO_ROOT/scripts/test-postgres-integration.sh"
 
 # ---------------------------------------------------------------------------
 # Time bounds (R118 S4; R119 F5 + R120 F2): attempts-bounded loops are ALSO
@@ -284,9 +279,7 @@ if [ -n "${SCHEMA_VALIDATION_DATABASE_URL:-}" ]; then
   echo "[$SCRIPT_NAME] running the integration suite against the provided URL."
   cd "$REPO_ROOT"
   SUITE_STATUS=0
-  REQUIRE_POSTGRES_INTEGRATION=1 \
-    pnpm --filter server exec vitest run --maxWorkers=1 --no-file-parallelism \
-    "${MCP_INTEGRATION_FILES[@]}" || SUITE_STATUS=$?
+  sh "$INTEGRATION_SCRIPT" || SUITE_STATUS=$?
   exit "$SUITE_STATUS"
 fi
 
@@ -432,33 +425,14 @@ fi
 echo "[$SCRIPT_NAME] postgres is ready (TCP)."
 
 # ---------------------------------------------------------------------------
-# Schema sync — the repo's OWN pipeline (R118 S6).
-#
-# `pnpm --filter @ws-model-proxy/db run db:push` IS what `pnpm db:push` runs
-# (prisma db push && node scripts/apply-schema-hardening.mjs); invoking the
-# package script instead of re-listing its commands means any future pipeline
-# addition is inherited here automatically. DATABASE_URL is scoped to this
-# invocation only (env-prefix form — never exported into the environment).
-# Safe, non-destructive sync only; the AGENTS.md-prohibited commands are
-# never used.
+# Schema sync and suites — the shared gate script pushes the schema through
+# the repo's OWN db:push pipeline (prisma db push plus hardening; safe,
+# non-destructive) and runs every suite. The URL is scoped to this invocation
+# only (env-prefix form — never exported into the environment).
 # ---------------------------------------------------------------------------
 cd "$REPO_ROOT"
-echo "[$SCRIPT_NAME] pushing Prisma schema through the db:push package pipeline..."
-PUSH_STATUS=0
-DATABASE_URL="$DATABASE_URL" pnpm --filter @ws-model-proxy/db run db:push || PUSH_STATUS=$?
-if [ "$PUSH_STATUS" -ne 0 ]; then
-  echo "[$SCRIPT_NAME] error: db:push pipeline failed ($PUSH_STATUS)" >&2
-  exit "$PUSH_STATUS"
-fi
-
-# ---------------------------------------------------------------------------
-# Run the MCP integration suite against the disposable database.
-# ---------------------------------------------------------------------------
-echo "[$SCRIPT_NAME] running the MCP OAuth integration suite..."
+echo "[$SCRIPT_NAME] running the PostgreSQL integration suites..."
 SUITE_STATUS=0
-SCHEMA_VALIDATION_DATABASE_URL="$DATABASE_URL" \
-REQUIRE_POSTGRES_INTEGRATION=1 \
-  pnpm --filter server exec vitest run --maxWorkers=1 --no-file-parallelism \
-  "${MCP_INTEGRATION_FILES[@]}" || SUITE_STATUS=$?
-echo "[$SCRIPT_NAME] suite finished with exit status $SUITE_STATUS."
+SCHEMA_VALIDATION_DATABASE_URL="$DATABASE_URL" sh "$INTEGRATION_SCRIPT" || SUITE_STATUS=$?
+echo "[$SCRIPT_NAME] suites finished with exit status $SUITE_STATUS."
 exit "$SUITE_STATUS"

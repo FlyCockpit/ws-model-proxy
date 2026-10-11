@@ -20,7 +20,7 @@ use super::read::{binary_error, load_all};
 use super::redact::{self, MASK_OPEN, MaskedView};
 use super::resolve::{ResolveOpts, resolve};
 use super::text::{self, Eol};
-use super::{Cancel, FileOps, Step, check_reason};
+use super::{Cancel, FileOps, check_reason};
 
 pub const MAX_EDITS: usize = 20;
 /// Edits load the whole file, so the result is capped (config and script files).
@@ -110,36 +110,7 @@ impl SizeBudget {
 
 pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditResult> {
     validate_args(args)?;
-    edit_validated(ops, args, None, cancel, DiffAudience::Mcp).map(|(result, _)| result)
-}
-
-pub(crate) fn edit_supervised(
-    ops: &FileOps,
-    args: &EditArgs,
-    pin: &super::supervised::PinnedPath,
-    cancel: &Cancel,
-) -> FileResult<EditResult> {
-    validate_args(args)?;
-    edit_validated(ops, args, Some(pin), cancel, DiffAudience::Mcp).map(|(result, _)| result)
-}
-
-#[derive(Clone, Copy)]
-enum DiffAudience {
-    Mcp,
-    Consent,
-}
-
-/// This entry point always previews; it can never commit a filesystem change.
-pub(crate) fn consent_preview(
-    ops: &FileOps,
-    args: &EditArgs,
-    cancel: &Cancel,
-) -> FileResult<(EditResult, usize)> {
-    validate_args(args)?;
-    let mut args = args.clone();
-    args.dry_run = Some(true);
-    args.return_diff = Some(true);
-    edit_validated(ops, &args, None, cancel, DiffAudience::Consent)
+    edit_validated(ops, args, cancel)
 }
 
 pub(crate) fn validate_args(args: &EditArgs) -> FileResult<()> {
@@ -182,13 +153,7 @@ pub(crate) fn validate_args(args: &EditArgs) -> FileResult<()> {
     Ok(())
 }
 
-fn edit_validated(
-    ops: &FileOps,
-    args: &EditArgs,
-    pin: Option<&super::supervised::PinnedPath>,
-    cancel: &Cancel,
-    audience: DiffAudience,
-) -> FileResult<(EditResult, usize)> {
+fn edit_validated(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditResult> {
     let _namespace = ops.namespace_shared(cancel)?;
     let resolved = resolve(
         &args.path,
@@ -197,8 +162,6 @@ fn edit_validated(
             make_parents: None,
             policy: &ops.policy,
             access: Access::Write,
-            preview_missing: false,
-            pin: pin.map(|pin| &pin.ancestor),
             cancel: Some(cancel),
         },
     )?;
@@ -206,20 +169,7 @@ fn edit_validated(
     // one ahead of it committed, instead of failing its re-check on a stale inode.
     let full = resolved.full_path();
     let _lock = ops.lock_path(full.clone(), cancel)?;
-    if let Some(pin) = pin {
-        ops.step(Step::SupervisedBeforePin)?;
-        pin.verify(ops, &resolved, Access::Write, cancel)?;
-        ops.step(Step::SupervisedPinVerified)?;
-    }
-    if pin.is_some() {
-        ops.step(Step::SupervisedBeforeOpen)?;
-    }
     let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
-    if let Some(pin) = pin {
-        ops.step(Step::SupervisedOpened)?;
-        pin.verify_opened(&stat)?;
-        ops.step(Step::SupervisedOpenedVerified)?;
-    }
 
     let original = load_all(&mut file, &stat, MAX_EDIT_FILE_BYTES, cancel)?;
     let previous_etag = ops.key.strong(&stat, &original);
@@ -285,15 +235,20 @@ fn edit_validated(
     }
 
     budget.check()?;
-    let mut updated = super::diff::ConsentText::new(original_text);
+    let disk = |range: Range<usize>| {
+        original_text
+            .get(range)
+            .ok_or_else(|| FileError::new(ErrorCode::RedactedSpan, "cannot map copied disk bytes"))
+    };
+    let mut updated = String::new();
     let mut cursor = 0;
     for plan in &planned {
-        updated.push_disk(cursor..plan.orig.start)?;
-        updated.push_agent(&new_texts[plan.edit]);
+        updated.push_str(disk(cursor..plan.orig.start)?);
+        updated.push_str(&new_texts[plan.edit]);
         cursor = plan.orig.end;
     }
-    updated.push_disk(cursor..original.len())?;
-    if updated.as_str().len() as u64 > MAX_EDIT_FILE_BYTES {
+    updated.push_str(disk(cursor..original.len())?);
+    if updated.len() as u64 > MAX_EDIT_FILE_BYTES {
         return Err(FileError::new(
             ErrorCode::TooLarge,
             "the edited file would exceed 16 MiB",
@@ -318,10 +273,7 @@ fn edit_validated(
             "the edit would expose a redacted value; masked text cannot change context",
         ));
     }
-    let mut summary = diff_lines(&view.text, &after_view.text);
-    if matches!(audience, DiffAudience::Consent) {
-        summary.diff = super::diff::consent_diff(&updated, class)?;
-    }
+    let summary = diff_lines(&view.text, &after_view.text);
     let (diff, hunks) = if args.return_diff.unwrap_or(true) {
         (Some(summary.diff.clone()), None)
     } else {
@@ -330,81 +282,55 @@ fn edit_validated(
     let echo = resolved.echo(&args.path);
 
     if updated_text.as_bytes() == original {
-        if let Some(pin) = pin {
-            pin.verify(ops, &resolved, Access::Write, cancel)?;
-        }
-        return Ok((
-            EditResult {
-                etag: previous_etag.clone(),
-                previous_etag,
-                added: 0,
-                removed: 0,
-                applied: false,
-                diff,
-                hunks,
-                resolved_path: echo,
-                recovered: Vec::new(),
-            },
-            updated.as_str().len(),
-        ));
-    }
-    if args.dry_run.unwrap_or(false) {
-        return Ok((
-            EditResult {
-                etag: previous_etag.clone(),
-                previous_etag,
-                added: summary.added,
-                removed: summary.removed,
-                applied: false,
-                diff,
-                hunks,
-                resolved_path: echo,
-                recovered: Vec::new(),
-            },
-            updated.as_str().len(),
-        ));
-    }
-
-    cancel.check()?;
-    let (new_stat, recovered) = match pin {
-        Some(pin) => atomic::replace_supervised(
-            ops,
-            &resolved.dir,
-            &resolved.name,
-            &resolved.dir_path,
-            file,
-            &stat,
-            &previous_etag,
-            updated_text.as_bytes(),
-            pin,
-            cancel,
-        )?,
-        None => atomic::replace(
-            ops,
-            &resolved.dir,
-            &resolved.name,
-            &resolved.dir_path,
-            file,
-            &stat,
-            &previous_etag,
-            updated_text.as_bytes(),
-            cancel,
-        )?,
-    };
-    Ok((
-        EditResult {
-            etag: ops.key.strong(&new_stat, updated_text.as_bytes()),
+        return Ok(EditResult {
+            etag: previous_etag.clone(),
             previous_etag,
-            added: summary.added,
-            removed: summary.removed,
-            applied: true,
+            added: 0,
+            removed: 0,
+            applied: false,
             diff,
             hunks,
             resolved_path: echo,
-            recovered,
-        },
-        updated.as_str().len(),
-    ))
+            recovered: Vec::new(),
+        });
+    }
+    if args.dry_run.unwrap_or(false) {
+        return Ok(EditResult {
+            etag: previous_etag.clone(),
+            previous_etag,
+            added: summary.added,
+            removed: summary.removed,
+            applied: false,
+            diff,
+            hunks,
+            resolved_path: echo,
+            recovered: Vec::new(),
+        });
+    }
+
+    cancel.check()?;
+    let (new_stat, recovered) = atomic::replace(
+        ops,
+        &resolved.dir,
+        &resolved.name,
+        &resolved.dir_path,
+        file,
+        &stat,
+        &previous_etag,
+        updated_text.as_bytes(),
+        cancel,
+    )?;
+    Ok(EditResult {
+        etag: ops.key.strong(&new_stat, updated_text.as_bytes()),
+        previous_etag,
+        added: summary.added,
+        removed: summary.removed,
+        applied: true,
+        diff,
+        hunks,
+        resolved_path: echo,
+        recovered,
+    })
 }
 
 /// In a uniformly CRLF file, a bare `\n` in the request means `\r\n`.

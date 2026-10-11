@@ -120,6 +120,17 @@ describe("SignInCard mode parity", () => {
     expect(screen.queryByText("auth:mcpLogin.title")).toBeNull();
   });
 
+  it("offers the forgot-password link only when email delivery is configured", () => {
+    renderCard();
+    expect(screen.queryByText("auth:login.forgotPassword")).toBeNull();
+    cleanup();
+
+    state.config = { emailEnabled: true };
+    renderCard();
+    const link = screen.getByText("auth:login.forgotPassword");
+    expect(link.closest("a")?.getAttribute("href")).toBe("/$lang/forgot-password");
+  });
+
   it("mcp mode renders the MCP title/description and NO signup hint, same form", () => {
     renderCard({ mode: "mcp" });
     expect(screen.getByText("auth:mcpLogin.title")).toBeTruthy();

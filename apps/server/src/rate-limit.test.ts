@@ -17,7 +17,7 @@ vi.mock("@ws-model-proxy/auth", () => ({
 
 const envMock = vi.hoisted(() => ({
   WMP_RATE_LIMIT_SCALE: 1,
-  TRUST_PROXY_HOPS: undefined,
+  TRUST_PROXY_HOPS: 0,
 }));
 vi.mock("@ws-model-proxy/env/server", () => ({ env: envMock }));
 
@@ -40,6 +40,8 @@ vi.mock("rate-limiter-flexible", async (importOriginal) => {
 
 const {
   authLimiter,
+  clientNetworkKey,
+  passwordResetRequestLimiter,
   relayUpgradeIpLimiter,
   relayUpgradeNodeLimiter,
   consumeEnrollmentExchange,
@@ -139,29 +141,53 @@ describe("createRateLimiterMiddleware", () => {
     expect(allowedB.status).toBe(200);
   });
 
-  it("behind a private-network proxy, keys on the proxy-appended client IP — not the spoofable leftmost X-Forwarded-For", async () => {
-    // Socket peer is the proxy (private). A trusted proxy appends the real
-    // client IP as the rightmost entry; the client controls only the left.
+  it("behind one proxy (TRUST_PROXY_HOPS=1), keys on the proxy-appended client IP — not the spoofable leftmost X-Forwarded-For", async () => {
+    // Socket peer is the proxy. It appends the real client IP as the
+    // rightmost entry; the client controls only the left.
+    envMock.TRUST_PROXY_HOPS = 1;
     mockGetConnInfo.mockReturnValue({ remote: { address: "10.0.0.5" } });
+
+    try {
+      for (let i = 0; i < LIMIT; i++) {
+        const res = await app.request("/ping", {
+          // Vary the spoofed leftmost entry every request; the proxy-appended
+          // real client (198.51.100.7) stays constant.
+          headers: { "x-forwarded-for": `203.0.113.${i}, 198.51.100.7` },
+        });
+        expect(res.status).toBe(200);
+      }
+
+      const rejected = await app.request("/ping", {
+        headers: { "x-forwarded-for": "203.0.113.99, 198.51.100.7" },
+      });
+      // Throttled despite a fresh spoofed leftmost value: the key is the constant
+      // proxy-appended client IP, so X-Forwarded-For spoofing can't escape it.
+      expect(rejected.status).toBe(429);
+    } finally {
+      envMock.TRUST_PROXY_HOPS = 0;
+    }
+  });
+
+  it("with clients connecting directly (TRUST_PROXY_HOPS=0), a private socket peer cannot rotate X-Forwarded-For to escape", async () => {
+    // The pre-0.4.0 heuristic trusted X-Forwarded-For whenever the socket peer
+    // was private (LAN, Docker bridge gateway), so a fresh public value per
+    // request was a fresh key. With an explicit hop count it is ignored.
+    mockGetConnInfo.mockReturnValue({ remote: { address: "172.17.0.1" } });
 
     for (let i = 0; i < LIMIT; i++) {
       const res = await app.request("/ping", {
-        // Vary the spoofed leftmost entry every request; the proxy-appended
-        // real client (198.51.100.7) stays constant.
-        headers: { "x-forwarded-for": `203.0.113.${i}, 198.51.100.7` },
+        headers: { "x-forwarded-for": `203.0.113.${i}` },
       });
       expect(res.status).toBe(200);
     }
 
     const rejected = await app.request("/ping", {
-      headers: { "x-forwarded-for": "203.0.113.99, 198.51.100.7" },
+      headers: { "x-forwarded-for": "203.0.113.99" },
     });
-    // Throttled despite a fresh spoofed leftmost value: the key is the constant
-    // proxy-appended client IP, so X-Forwarded-For spoofing can't escape it.
     expect(rejected.status).toBe(429);
   });
 
-  it("on a bare deployment (public socket peer), ignores X-Forwarded-For entirely", async () => {
+  it("with clients connecting directly (TRUST_PROXY_HOPS=0), ignores X-Forwarded-For from a public peer", async () => {
     // No proxy: the socket peer is the real, public client. A forged
     // X-Forwarded-For must not let it dodge the limit.
     mockGetConnInfo.mockReturnValue({ remote: { address: "198.51.100.50" } });
@@ -323,6 +349,7 @@ describe("built-in limits and WMP_RATE_LIMIT_SCALE", () => {
       inviteInfo: { points: 10, duration: 60, blockDuration: 900 },
       relayUpgradeIp: { points: 30, duration: 60, blockDuration: 300 },
       relayUpgradeNode: { points: 10, duration: 60, blockDuration: 300 },
+      passwordResetRequest: { points: 3, duration: 60 },
     });
   });
 
@@ -337,6 +364,8 @@ describe("built-in limits and WMP_RATE_LIMIT_SCALE", () => {
     expect(relayUpgradeIpLimiter.points).toBe(DEFAULTS.relayUpgradeIp.points);
     expect(relayUpgradeNodeLimiter.points).toBe(DEFAULTS.relayUpgradeNode.points);
     expect(relayUpgradeNodeLimiter.keyPrefix).not.toBe(authLimiter.keyPrefix);
+    expect(passwordResetRequestLimiter.points).toBe(DEFAULTS.passwordResetRequest.points);
+    expect(passwordResetRequestLimiter.duration).toBe(DEFAULTS.passwordResetRequest.duration);
   });
 
   it.each([
@@ -350,5 +379,51 @@ describe("built-in limits and WMP_RATE_LIMIT_SCALE", () => {
   ])("scale %s turns %s points into %s (rounded, never below 1)", (scale, points, expected) => {
     envMock.WMP_RATE_LIMIT_SCALE = scale;
     expect(scaledPoints(points)).toBe(expected);
+  });
+});
+
+describe("clientNetworkKey", () => {
+  it("keeps an IPv4 address", () => {
+    expect(clientNetworkKey("198.51.100.7")).toBe("198.51.100.7");
+  });
+
+  it.each([
+    "::ffff:192.0.2.1",
+    "::ffff:c000:201",
+    "0:0:0:0:0:ffff:c000:201",
+    "0000:0000:0000:0000:0000:FFFF:192.0.2.1",
+    "::FFFF:C000:0201",
+    "::ffff:192.0.2.1%eth0",
+    "::ffff:c000:201%1",
+  ])("keys the IPv4-mapped spelling %s as its IPv4 address", (ip) => {
+    expect(clientNetworkKey(ip)).toBe("192.0.2.1");
+  });
+
+  it("does not let different IPv4-mapped clients share a key", () => {
+    expect(clientNetworkKey("::ffff:192.0.2.2")).toBe("192.0.2.2");
+    expect(clientNetworkKey("::ffff:c000:202")).not.toBe(clientNetworkKey("::ffff:c000:201"));
+  });
+
+  it.each([
+    "2001:db8::1:2:3:192.0.2.1",
+    "2001:db8:0:1:2:3:c000:201",
+    "2001:0db8:0000:0001:0002:0003:c000:0201",
+    "2001:DB8:0:1::9",
+    "2001:db8:0:1:ffff:ffff:ffff:ffff",
+    "2001:db8:0:1::1%eth0",
+  ])("keys the IPv6 spelling %s by its canonical /64", (ip) => {
+    expect(clientNetworkKey(ip)).toBe("2001:db8:0:1::/64");
+  });
+
+  it("keeps different /64s and special addresses apart", () => {
+    expect(clientNetworkKey("2001:db8:0:2::1")).toBe("2001:db8:0:2::/64");
+    expect(clientNetworkKey("::1")).toBe("0:0:0:0::/64");
+    expect(clientNetworkKey("2001:db8::")).toBe("2001:db8:0:0::/64");
+    expect(clientNetworkKey("fe80::1%eth0")).toBe("fe80:0:0:0::/64");
+    expect(clientNetworkKey("64:ff9b::192.0.2.1")).toBe("64:ff9b:0:0::/64");
+  });
+
+  it("returns a non-IP value unchanged", () => {
+    expect(clientNetworkKey("unknown")).toBe("unknown");
   });
 });

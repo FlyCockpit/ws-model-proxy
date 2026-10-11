@@ -87,7 +87,7 @@ export interface EnvVar {
   default?: string;
   defaultFrom?: "schema" | "app";
   choices?: Array<{ value: string; label?: string; description?: string }>;
-  format?: "origin" | "push-subject";
+  format?: "origin" | "push-subject" | "count";
   reusable?: boolean;
   blueprintExempt?: boolean;
   omittable?: boolean;
@@ -363,7 +363,7 @@ export const ENV_VARS: EnvVar[] = [
     comment: [
       "Optional. Where /install.sh downloads wsmp-<target>.tar.xz and sha256.sum (https only) and",
       "installs the checksum-verified binary. Unset: released versions use their GitHub Release;",
-      "pre-release builds build the redesign-0.4.0 branch from source. Ignored when WMP_CLI_SOURCE_REV is set.",
+      "pre-release builds build the master branch from source. Ignored when WMP_CLI_SOURCE_REV is set.",
     ],
   },
   {
@@ -459,12 +459,21 @@ export const ENV_VARS: EnvVar[] = [
   {
     key: "TRUST_PROXY_HOPS",
     group: "auth",
-    source: "manual",
+    source: "prompt",
+    required: true,
+    format: "count",
+    prompt: "Reverse proxies in front of the app (TRUST_PROXY_HOPS)",
+    hint: "1 behind one reverse proxy (Dokploy/Traefik, Caddy, nginx) or a platform ingress that appends one entry; 0 if clients connect directly; 2 for Cloudflare in front of your proxy",
     example: "1",
     comment: [
-      "Reverse-proxy hop count for the anonymous rate-limit IP. Leave UNSET for",
-      "auto-detect behind a private-network proxy. Set only when a proxy has a",
-      "PUBLIC IP (e.g. Cloudflare). 0 disables X-Forwarded-For.",
+      "REQUIRED in production (the server refuses to start without it); defaults",
+      "to 0 in development and test. The number of reverse proxies between the",
+      "internet and the app; the client IP (anonymous rate-limit key) is the",
+      "X-Forwarded-For entry this many hops from the right. 1 behind one reverse",
+      "proxy (Dokploy/Traefik, Caddy, nginx); 0 when clients connect directly",
+      "(X-Forwarded-For ignored); more for chained proxies (2 for Cloudflare in",
+      "front of your proxy). Too high lets clients forge their IP; too low makes",
+      "all clients share the proxy's rate-limit bucket.",
     ],
   },
 

@@ -1,7 +1,6 @@
 //! Command-output masking for accidental disclosure (issue #107).
 //!
-//! Every server-visible exec stream and supervised shared/review capture uses
-//! [`StreamMasker`]. The encrypted PTY viewer still receives the original bytes.
+//! Every server-visible exec stream uses [`StreamMasker`]. The encrypted PTY viewer still receives the original bytes.
 //! Detection uses the terminal/control-filtered view and unchanged file-tool
 //! [`LineMasker`] rules. Bounded unmasked output passes through byte for byte;
 //! ordinary masked lines emit cleaned text with their exact trailing CR/LF.

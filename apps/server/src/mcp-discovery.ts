@@ -1,4 +1,4 @@
-import type { MiddlewareHandler } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 import { cloneRequestOntoPublicOrigin, PublicRequestError } from "./public-request-url.js";
 
 /**
@@ -60,7 +60,7 @@ const ALLOW_GET_HEAD = "GET, HEAD";
  */
 export function createMcpDiscoveryForwarder(options: {
   enabled: boolean;
-  handler: (request: Request) => Response | Promise<Response>;
+  handler: (request: Request, c: Context) => Response | Promise<Response>;
 }): MiddlewareHandler {
   const { enabled, handler } = options;
   return async (c) => {
@@ -97,10 +97,10 @@ export function createMcpDiscoveryForwarder(options: {
       // the same status + headers and a null body. Never forwards a HEAD
       // (upstream HEAD handling exists but is not relied upon).
       const getRequest = new Request(canonical, { method: "GET" });
-      const response = await handler(getRequest);
+      const response = await handler(getRequest, c);
       return new Response(null, { status: response.status, headers: response.headers });
     }
 
-    return handler(canonical);
+    return handler(canonical, c);
   };
 }

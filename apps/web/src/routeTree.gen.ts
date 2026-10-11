@@ -14,9 +14,11 @@ import { Route as LangRouteImport } from './routes/$lang'
 import { Route as LangIndexRouteImport } from './routes/$lang/index'
 import { Route as LangAuthRouteImport } from './routes/$lang/_auth'
 import { Route as LangAdminRouteImport } from './routes/$lang/admin'
+import { Route as LangForgotPasswordRouteImport } from './routes/$lang/forgot-password'
 import { Route as LangLoginRouteImport } from './routes/$lang/login'
 import { Route as LangMcpConsentRouteImport } from './routes/$lang/mcp-consent'
 import { Route as LangMcpLoginRouteImport } from './routes/$lang/mcp-login'
+import { Route as LangResetPasswordRouteImport } from './routes/$lang/reset-password'
 import { Route as LangSignupRouteImport } from './routes/$lang/signup'
 import { Route as LangVerifyEmailRouteImport } from './routes/$lang/verify-email'
 import { Route as LangAuthAppRouteImport } from './routes/$lang/_auth/_app'
@@ -88,6 +90,11 @@ const LangAdminRoute = LangAdminRouteImport.update({
   path: '/admin',
   getParentRoute: () => LangRoute,
 } as any)
+const LangForgotPasswordRoute = LangForgotPasswordRouteImport.update({
+  id: '/forgot-password',
+  path: '/forgot-password',
+  getParentRoute: () => LangRoute,
+} as any)
 const LangLoginRoute = LangLoginRouteImport.update({
   id: '/login',
   path: '/login',
@@ -101,6 +108,11 @@ const LangMcpConsentRoute = LangMcpConsentRouteImport.update({
 const LangMcpLoginRoute = LangMcpLoginRouteImport.update({
   id: '/mcp-login',
   path: '/mcp-login',
+  getParentRoute: () => LangRoute,
+} as any)
+const LangResetPasswordRoute = LangResetPasswordRouteImport.update({
+  id: '/reset-password',
+  path: '/reset-password',
   getParentRoute: () => LangRoute,
 } as any)
 const LangSignupRoute = LangSignupRouteImport.update({
@@ -360,9 +372,11 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/$lang': typeof LangRouteWithChildren
   '/$lang/admin': typeof LangAdminRouteWithChildren
+  '/$lang/forgot-password': typeof LangForgotPasswordRoute
   '/$lang/login': typeof LangLoginRoute
   '/$lang/mcp-consent': typeof LangMcpConsentRoute
   '/$lang/mcp-login': typeof LangMcpLoginRoute
+  '/$lang/reset-password': typeof LangResetPasswordRoute
   '/$lang/signup': typeof LangSignupRoute
   '/$lang/verify-email': typeof LangVerifyEmailRoute
   '/$lang/': typeof LangIndexRoute
@@ -413,9 +427,11 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/$lang': typeof LangIndexRoute
+  '/$lang/forgot-password': typeof LangForgotPasswordRoute
   '/$lang/login': typeof LangLoginRoute
   '/$lang/mcp-consent': typeof LangMcpConsentRoute
   '/$lang/mcp-login': typeof LangMcpLoginRoute
+  '/$lang/reset-password': typeof LangResetPasswordRoute
   '/$lang/signup': typeof LangSignupRoute
   '/$lang/verify-email': typeof LangVerifyEmailRoute
   '/$lang/admin/observability': typeof LangAdminObservabilityRoute
@@ -463,9 +479,11 @@ export interface FileRoutesById {
   '/$lang': typeof LangRouteWithChildren
   '/$lang/_auth': typeof LangAuthRouteWithChildren
   '/$lang/admin': typeof LangAdminRouteWithChildren
+  '/$lang/forgot-password': typeof LangForgotPasswordRoute
   '/$lang/login': typeof LangLoginRoute
   '/$lang/mcp-consent': typeof LangMcpConsentRoute
   '/$lang/mcp-login': typeof LangMcpLoginRoute
+  '/$lang/reset-password': typeof LangResetPasswordRoute
   '/$lang/signup': typeof LangSignupRoute
   '/$lang/verify-email': typeof LangVerifyEmailRoute
   '/$lang/': typeof LangIndexRoute
@@ -520,9 +538,11 @@ export interface FileRouteTypes {
     | '/'
     | '/$lang'
     | '/$lang/admin'
+    | '/$lang/forgot-password'
     | '/$lang/login'
     | '/$lang/mcp-consent'
     | '/$lang/mcp-login'
+    | '/$lang/reset-password'
     | '/$lang/signup'
     | '/$lang/verify-email'
     | '/$lang/'
@@ -573,9 +593,11 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/$lang'
+    | '/$lang/forgot-password'
     | '/$lang/login'
     | '/$lang/mcp-consent'
     | '/$lang/mcp-login'
+    | '/$lang/reset-password'
     | '/$lang/signup'
     | '/$lang/verify-email'
     | '/$lang/admin/observability'
@@ -622,9 +644,11 @@ export interface FileRouteTypes {
     | '/$lang'
     | '/$lang/_auth'
     | '/$lang/admin'
+    | '/$lang/forgot-password'
     | '/$lang/login'
     | '/$lang/mcp-consent'
     | '/$lang/mcp-login'
+    | '/$lang/reset-password'
     | '/$lang/signup'
     | '/$lang/verify-email'
     | '/$lang/'
@@ -716,6 +740,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAdminRouteImport
       parentRoute: typeof LangRoute
     }
+    '/$lang/forgot-password': {
+      id: '/$lang/forgot-password'
+      path: '/forgot-password'
+      fullPath: '/$lang/forgot-password'
+      preLoaderRoute: typeof LangForgotPasswordRouteImport
+      parentRoute: typeof LangRoute
+    }
     '/$lang/login': {
       id: '/$lang/login'
       path: '/login'
@@ -735,6 +766,13 @@ declare module '@tanstack/react-router' {
       path: '/mcp-login'
       fullPath: '/$lang/mcp-login'
       preLoaderRoute: typeof LangMcpLoginRouteImport
+      parentRoute: typeof LangRoute
+    }
+    '/$lang/reset-password': {
+      id: '/$lang/reset-password'
+      path: '/reset-password'
+      fullPath: '/$lang/reset-password'
+      preLoaderRoute: typeof LangResetPasswordRouteImport
       parentRoute: typeof LangRoute
     }
     '/$lang/signup': {
@@ -1238,9 +1276,11 @@ const LangAdminRouteWithChildren = LangAdminRoute._addFileChildren(
 interface LangRouteChildren {
   LangAuthRoute: typeof LangAuthRouteWithChildren
   LangAdminRoute: typeof LangAdminRouteWithChildren
+  LangForgotPasswordRoute: typeof LangForgotPasswordRoute
   LangLoginRoute: typeof LangLoginRoute
   LangMcpConsentRoute: typeof LangMcpConsentRoute
   LangMcpLoginRoute: typeof LangMcpLoginRoute
+  LangResetPasswordRoute: typeof LangResetPasswordRoute
   LangSignupRoute: typeof LangSignupRoute
   LangVerifyEmailRoute: typeof LangVerifyEmailRoute
   LangIndexRoute: typeof LangIndexRoute
@@ -1249,9 +1289,11 @@ interface LangRouteChildren {
 const LangRouteChildren: LangRouteChildren = {
   LangAuthRoute: LangAuthRouteWithChildren,
   LangAdminRoute: LangAdminRouteWithChildren,
+  LangForgotPasswordRoute: LangForgotPasswordRoute,
   LangLoginRoute: LangLoginRoute,
   LangMcpConsentRoute: LangMcpConsentRoute,
   LangMcpLoginRoute: LangMcpLoginRoute,
+  LangResetPasswordRoute: LangResetPasswordRoute,
   LangSignupRoute: LangSignupRoute,
   LangVerifyEmailRoute: LangVerifyEmailRoute,
   LangIndexRoute: LangIndexRoute,

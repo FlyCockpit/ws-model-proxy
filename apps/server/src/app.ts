@@ -21,6 +21,12 @@ import { auth as defaultAuth } from "@ws-model-proxy/auth";
 import { armAuthDbShutdownFence } from "@ws-model-proxy/auth/auth-db-shutdown-fence";
 import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
 import { onMcpGrantLevelLowered } from "@ws-model-proxy/auth/mcp-grant-level";
+import {
+  createPasswordResetRequestHandler,
+  createPasswordResetRequestValidator,
+  PASSWORD_RESET_REQUEST_PATH,
+  type PasswordResetRequestAuth,
+} from "@ws-model-proxy/auth/password-reset-request";
 import { onUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import { onUserDeleted, onUserDeletionMarked } from "@ws-model-proxy/auth/user-deletion-listeners";
 import { THEME_INIT_SCRIPT } from "@ws-model-proxy/config/theme-init";
@@ -36,7 +42,7 @@ import {
   handleAccessRevoked,
 } from "./access-revocation.js";
 import { betterAuthAdminGate } from "./better-auth-admin-gate.js";
-import { resolveClientIp } from "./client-ip.js";
+import { resolveClientIp, withResolvedClientIp } from "./client-ip.js";
 import { CORS_ALLOW_HEADERS } from "./cors-headers.js";
 import {
   EMAIL_RECIPIENT_PATHS,
@@ -116,10 +122,12 @@ import { registerNodeHttpRoutes } from "./node-http.js";
 import { logOrpcError, sensitiveProcedureErrors } from "./orpc-error-log.js";
 import {
   authLimiter,
+  clientNetworkKey,
   consumeInviteLookup,
   createRateLimiterMiddleware,
   emailRecipientLimiter,
   mcpClientRegistrationLimiter,
+  passwordResetRequestLimiter,
   rpcLimiter,
   signinFailureLimiter,
   signupLimiter,
@@ -223,6 +231,12 @@ export interface CreateAppOptions {
    * /api/auth surface keeps its narrow contract.
    */
   mcpAuth?: McpAuthInstance;
+  /**
+   * Better Auth instance whose options and trusted origins the uniform `/request-password-reset`
+   * handler checks (the request itself goes to `auth.handler`). Defaults to the shared instance;
+   * tests inject a memory one.
+   */
+  passwordResetAuth?: PasswordResetRequestAuth;
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -551,7 +565,7 @@ export async function createApp(options: CreateAppOptions = {}) {
       wellKnownPath,
       createMcpDiscoveryForwarder({
         enabled: env.WMP_MCP_ENABLED,
-        handler: (request) => auth.handler(request),
+        handler: (request, c) => auth.handler(withResolvedClientIp(request, resolveClientIp(c))),
       }),
     );
   }
@@ -858,6 +872,29 @@ export async function createApp(options: CreateAppOptions = {}) {
     return createRateLimiterMiddleware(authLimiter)(c, next);
   });
 
+  // Reset requests per client: 3/min, keyed by the resolved client IP with
+  // IPv6 grouped by /64 (Better Auth's own limit, applied in the handler too,
+  // keys the single address). Before the per-recipient cap, so a request this
+  // refuses never spends a recipient's budget.
+  app.use(
+    PASSWORD_RESET_REQUEST_PATH,
+    createRateLimiterMiddleware(passwordResetRequestLimiter, {
+      resolveKey: (c) => clientNetworkKey(resolveClientIp(c)),
+    }),
+  );
+
+  // Password-reset request checks (body, Origin/Referer, redirectTo) BEFORE
+  // the per-recipient cap, so a refused request never spends an address's
+  // hourly budget (the uniform handler below repeats them).
+  const passwordResetRequestValidator = createPasswordResetRequestValidator(
+    options.passwordResetAuth ?? defaultAuth,
+  );
+  app.use(PASSWORD_RESET_REQUEST_PATH, async (c, next) => {
+    const refusal = await passwordResetRequestValidator(c.req.raw);
+    if (refusal) return refusal;
+    await next();
+  });
+
   // Per-recipient caps on anonymous endpoints that mail a caller-supplied
   // address. Mounted AFTER the IP-keyed auth limiter (security control); this
   // layer stops rotating-IP mail cannons. See email-recipient-limit.ts.
@@ -870,6 +907,23 @@ export async function createApp(options: CreateAppOptions = {}) {
   // reservation only after a 401 password failure here, so rotating IPs cannot
   // multiply guesses against a single account.
   app.use(SIGNIN_FAILURE_PATH, signinFailureLimit(signinFailureLimiter));
+
+  // Uniform password-reset request (enumeration defense), after the IP-keyed
+  // limiters and the per-recipient cap above. It checks the request, forwards
+  // it to Better Auth's real HTTP handler (so Better Auth's own 3/min per-IP
+  // limit applies) and answers the same padded 200 whatever the account work
+  // did. Falls through only for what Better Auth refuses before any account
+  // work (reset disabled without SMTP, no body, non-JSON).
+  const passwordResetRequest = createPasswordResetRequestHandler(
+    options.passwordResetAuth ?? defaultAuth,
+  );
+  app.use(PASSWORD_RESET_REQUEST_PATH, async (c, next) => {
+    const response = await passwordResetRequest(c.req.raw, (request) =>
+      auth.handler(withResolvedClientIp(request, resolveClientIp(c))),
+    );
+    if (response) return response;
+    await next();
+  });
 
   // Admin gate for Better-Auth's admin plugin endpoints. The plugin role-checks
   // by default, but these routes can set roles, reset passwords, impersonate
@@ -885,7 +939,11 @@ export async function createApp(options: CreateAppOptions = {}) {
   // Mounted immediately before the auth handler.
   app.use("/api/auth/oauth2/authorize", mcpAuthorizeScopeGuard);
 
-  app.on(["POST", "GET"], "/api/auth/*", (c) => auth.handler(c.req.raw));
+  // Better Auth sees only the client IP resolved from TRUST_PROXY_HOPS, never
+  // a raw client-supplied X-Forwarded-For (it keys its own limiter on it).
+  app.on(["POST", "GET"], "/api/auth/*", (c) =>
+    auth.handler(withResolvedClientIp(c.req.raw, resolveClientIp(c))),
+  );
 
   app.use("/api/internal/chat-test/*", sessionMiddleware);
   // Same-origin guard as on the media mutators. Chat-test is less exposed (its

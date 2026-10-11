@@ -9,6 +9,36 @@ again.
 Rename this file to the version when the release is cut, and paste the sections
 below into the GitHub release body.
 
+## Highlights
+
+- **Clearer concepts.** Nodes, Runtimes, Profiles, Pools, Providers and Access
+  replace the 0.3 devices, endpoints, recipes and deployments (see
+  [Removed and renamed concepts](#removed-and-renamed-concepts)).
+- **One-click switching.** A Profile names which runtimes run on which nodes;
+  Apply shows a preview, then stops and starts what is needed.
+- **Agents set up your hardware.** Over MCP, an agent with a Full token can
+  define runtimes, start them, run long commands, read and write files and set
+  node secrets on Full-control nodes, without SSH access.
+- **Two trust levels per node.** Full control or Relay only. Lowering trust is
+  instant; raising it needs the node's own terminal.
+- **Smarter placement.** Starts check memory, GPUs and fast-network fabrics,
+  so one runtime can span many nodes.
+- **Speech-to-text and embeddings**, including live transcription over a
+  WebSocket, next to chat models.
+- **Any engine, any client.** Pools translate between OpenAI Chat, OpenAI
+  Responses and Anthropic Messages, and adapt requests to what each engine
+  accepts.
+- **Cloud fallback with monthly caps** per provider and per share.
+- **Sharing.** Share a pool so other people can use it, contribute their own
+  hardware to it, or both, including invites by email or link.
+- **Enrollment codes** replace device login for adding nodes, with optional
+  temporary nodes that remove themselves.
+- **Password reset by email.** When SMTP is configured, the sign-in page
+  offers "Forgot password?". The link expires in one hour, works once, and
+  signs the account out on every device. Reset requests count toward the
+  per-recipient email cap, and the response never reveals whether an account
+  exists.
+
 ## Before you deploy: a fresh database is required
 
 There is no migration from 0.3. The 0.4.0 schema is a new baseline, and the
@@ -23,7 +53,8 @@ To deploy:
    read by 0.4.0.
 2. Create a new, empty Postgres database and point `DATABASE_URL` at it.
 3. Update the environment (see [Configuration](#configuration)): remove every
-   `RATE_LIMIT_*` variable; set `ADMIN_EMAIL` when public sign-up is off (it is
+   `RATE_LIMIT_*` variable; set `TRUST_PROXY_HOPS` (required, usually `1`
+   behind a reverse proxy); set `ADMIN_EMAIL` when public sign-up is off (it is
    required to bootstrap the first admin on a fresh production database); leave
    `WMP_CLI_SOURCE_REV` unset so nodes install the release binary (see below).
 4. Start the container once with `APPLY_SCHEMA=safe`. On an empty database
@@ -330,12 +361,6 @@ with the clients you already use, including harnesses you cannot change:
 - Requests show what was dropped or rewritten, and usage an engine did not
   report is estimated and marked.
 
-The schema gains `runtime_version.compat`, `runtime_request_profile`,
-`model_alias`, `relay_request.compat` and `relay_request.usageEstimated`:
-redeploy with `APPLY_SCHEMA=safe` once. Nodes need the new `wsmp` to let the
-server read engine descriptions; older nodes keep working and learn from 400s
-only.
-
 ## Stops that can't be confirmed
 
 A stopping instance keeps its port, memory and GPUs until its node proves the
@@ -387,8 +412,7 @@ The `RATE_LIMIT_*` settings are gone and no longer read (the server warns at
 startup when one is still set). Every limit uses its built-in budget, and one
 setting, `WMP_RATE_LIMIT_SCALE` (default 1, 0.1-100), multiplies every budget;
 windows and block durations stay fixed. The per-recipient email caps and the
-failed-password cap are always on (on unreleased master builds, setting their
-points to 0 turned them off; that is gone).
+failed-password cap are always on.
 
 Relay connections (`/api/cli/ws`) have their own limits and no longer share
 the sign-in bucket, so a node reconnecting in a loop cannot lock its owner out
@@ -405,20 +429,37 @@ The anonymous endpoints that send mail to an address in the request body
 (resend verification, request password reset) allow 3 mails per address per hour;
 sign-up has its own cap of 6 per address per hour. Both are always on, with or
 without SMTP configured, and `WMP_RATE_LIMIT_SCALE` can raise them but never
-below 1. The enrollment-code exchange is new: 10 attempts per IP per 15
+below 1. Password-reset requests are also limited to 3 per minute per
+client IP address (per /64 for IPv6). The enrollment-code exchange is new: 10 attempts per IP per 15
 minutes, where only failures use up the budget (a successful exchange is
 refunded), and 20 exchanges per code owner per hour, successes included.
 
 ### Other environment changes
 
+- **Required:** `TRUST_PROXY_HOPS` in production; the server refuses to start
+  without it. Set `1` behind one reverse proxy (Dokploy/Traefik, Caddy,
+  nginx), `0` for direct connections, `2` for Cloudflare in front of your
+  proxy. Automatic proxy detection is gone: it let clients on a private
+  network, or behind Docker's userland proxy, choose their own rate-limit
+  address. Defaults to `0` in development and test.
 - **Added:** `WMP_RATE_LIMIT_SCALE`, `WMP_CLI_RELEASE_BASE_URL` (where
   `/install.sh` downloads the CLI), `WMP_CLI_SOURCE_REV` (a commit
   `/install.sh` builds instead), `WMP_TERMINAL_USER_LIMIT`, `WMP_TERMINAL_CLI_LIMIT`,
-  `WMP_MCP_ENABLED` (MCP kill switch, on by default), `WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY`
-  (was `WMP_MCP_PAT_ALLOW_NO_EXPIRY` on unreleased master builds), `ADMIN_EMAIL`,
+  `WMP_MCP_ENABLED` (MCP kill switch, on by default), `WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY`, `ADMIN_EMAIL`,
   `RELAY_REQUEST_RETENTION_DAYS`.
 - **Removed:** every `RATE_LIMIT_*` variable, `MODEL_API_ANTHROPIC_ENABLED`,
   `MODEL_API_GLOBAL_CAPACITY_ENABLED`, `MODEL_API_PROTOCOL_ADAPTATION_ENABLED`.
 
 Run `pnpm env:check` against your server's variable list, or compare it
 with the regenerated `.env.example`.
+
+## Known issues
+
+- **No migration from 0.3.** Plan 0.4.0 as a new installation (see
+  [Before you deploy](#before-you-deploy-a-fresh-database-is-required)).
+- **Password reset needs SMTP.** Without SMTP there is no self-service way to
+  recover a forgotten password.
+- **Operator terminals trust the server.** With terminal approval off (the
+  default), a compromised server can confirm and type into an operator
+  terminal for an interactive step. The command itself stays the frozen one.
+  See [Threat model](#threat-model-passwords-typed-into-a-terminal).

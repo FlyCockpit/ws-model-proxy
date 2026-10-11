@@ -148,51 +148,6 @@ pub(crate) fn replace(
     content: &[u8],
     cancel: &Cancel,
 ) -> FileResult<(Stat, Vec<String>)> {
-    replace_impl(
-        ops, dir, name, dir_path, orig, orig_stat, orig_etag, content, None, cancel,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn replace_supervised(
-    ops: &FileOps,
-    dir: &OwnedFd,
-    name: &OsStr,
-    dir_path: &Path,
-    orig: File,
-    orig_stat: &Stat,
-    orig_etag: &str,
-    content: &[u8],
-    pin: &super::supervised::PinnedPath,
-    cancel: &Cancel,
-) -> FileResult<(Stat, Vec<String>)> {
-    replace_impl(
-        ops,
-        dir,
-        name,
-        dir_path,
-        orig,
-        orig_stat,
-        orig_etag,
-        content,
-        Some(pin),
-        cancel,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn replace_impl(
-    ops: &FileOps,
-    dir: &OwnedFd,
-    name: &OsStr,
-    dir_path: &Path,
-    orig: File,
-    orig_stat: &Stat,
-    orig_etag: &str,
-    content: &[u8],
-    pin: Option<&super::supervised::PinnedPath>,
-    cancel: &Cancel,
-) -> FileResult<(Stat, Vec<String>)> {
     check_replaceable(ops, orig_stat)?;
     let mut recovery = RecoveryDir::new(dir, dir_path)?;
     let result = replace_inner(
@@ -204,7 +159,6 @@ fn replace_impl(
         orig_stat,
         orig_etag,
         content,
-        pin,
         cancel,
         &mut recovery,
     );
@@ -232,7 +186,6 @@ fn replace_inner(
     orig_stat: &Stat,
     orig_etag: &str,
     content: &[u8],
-    pin: Option<&super::supervised::PinnedPath>,
     cancel: &Cancel,
     recovery: &mut RecoveryDir,
 ) -> FileResult<Stat> {
@@ -266,10 +219,6 @@ fn replace_inner(
         let new_stat = Stat::from_metadata(&tmp_file.metadata()?);
         recheck(ops, dir, name, &mut orig, orig_stat, orig_etag, cancel)?;
         ops.step(Step::EtagRechecked)?;
-        if let Some(pin) = pin {
-            pin.verify_at(ops, dir, name, super::policy::Access::Write, cancel)?;
-            ops.step(Step::SupervisedPinVerified)?;
-        }
         cancel.check()?;
         let mut intent = super::intent::Intent::replace(&dir_path.join(name));
         intent.published =

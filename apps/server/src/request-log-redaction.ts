@@ -87,6 +87,15 @@ const SIGNUP_PAGE_LOG_PATHS = new Set(
   ),
 );
 
+/**
+ * The reset-password page carries a live reset token in its query (`?token=<token>`, from Better
+ * Auth's reset-link redirect). Unlike the pages above it is matched by SHAPE, not by the
+ * supported-locale list: a hand-edited link such as `/reset-password?token=…` or
+ * `/fr-FR/reset-password?token=…` reaches the request logger before the web app's locale guard
+ * redirects it (query kept) to the default locale. Any single leading segment, any case.
+ */
+const RESET_PASSWORD_PAGE_LOG_PATH = /^(?:\/[^/]+)?\/reset-password\/?$/i;
+
 /** true when the request-log line for this pathname must strip the query. */
 export function stripsOAuthQuery(pathname: string): boolean {
   return (
@@ -95,7 +104,8 @@ export function stripsOAuthQuery(pathname: string): boolean {
     ROOT_DISCOVERY_LOG_PATHS.has(pathname) ||
     MCP_ENDPOINT_LOG_PATHS.has(pathname) ||
     MCP_WEB_PAGE_LOG_PATHS.has(pathname) ||
-    SIGNUP_PAGE_LOG_PATHS.has(pathname)
+    SIGNUP_PAGE_LOG_PATHS.has(pathname) ||
+    RESET_PASSWORD_PAGE_LOG_PATH.test(pathname)
   );
 }
 

@@ -113,17 +113,7 @@ pub(crate) fn decode_content(args: &WriteArgs) -> FileResult<Vec<u8>> {
 
 pub(crate) fn write(ops: &FileOps, args: &WriteArgs, cancel: &Cancel) -> FileResult<WriteResult> {
     let (content, mode, if_exists) = validate_args(args)?;
-    write_validated(ops, args, &content, mode, if_exists, None, cancel)
-}
-
-pub(crate) fn write_supervised(
-    ops: &FileOps,
-    args: &WriteArgs,
-    pin: &super::supervised::PinnedPath,
-    cancel: &Cancel,
-) -> FileResult<WriteResult> {
-    let (content, mode, if_exists) = validate_args(args)?;
-    write_validated(ops, args, &content, mode, if_exists, Some(pin), cancel)
+    write_validated(ops, args, &content, mode, if_exists, cancel)
 }
 
 pub(crate) fn validate_args(args: &WriteArgs) -> FileResult<(Vec<u8>, Option<u32>, IfExists)> {
@@ -155,7 +145,6 @@ fn write_validated(
     content: &[u8],
     mode: Option<u32>,
     if_exists: IfExists,
-    pin: Option<&super::supervised::PinnedPath>,
     cancel: &Cancel,
 ) -> FileResult<WriteResult> {
     let _namespace = ops.namespace_shared(cancel)?;
@@ -169,20 +158,10 @@ fn write_validated(
                 .then_some(DEFAULT_PARENT_MODE),
             policy: &ops.policy,
             access: Access::Write,
-            preview_missing: false,
-            pin: pin.map(|pin| &pin.ancestor),
             cancel: Some(cancel),
         },
     )?;
-    let outcome = write_resolved(
-        ops,
-        args,
-        content,
-        (mode, if_exists),
-        &mut resolved,
-        pin,
-        cancel,
-    );
+    let outcome = write_resolved(ops, args, content, (mode, if_exists), &mut resolved, cancel);
     if outcome.is_err() {
         resolved.rollback_created();
     }
@@ -195,7 +174,6 @@ fn write_resolved(
     content: &[u8],
     create: (Option<u32>, IfExists),
     resolved: &mut super::resolve::Resolved,
-    pin: Option<&super::supervised::PinnedPath>,
     cancel: &Cancel,
 ) -> FileResult<WriteResult> {
     let (mode, if_exists) = create;
@@ -204,11 +182,6 @@ fn write_resolved(
     }
     let full = resolved.full_path();
     let _lock = ops.lock_path(full.clone(), cancel)?;
-    if let Some(pin) = pin {
-        ops.step(Step::SupervisedBeforePin)?;
-        pin.verify(ops, resolved, Access::Write, cancel)?;
-        ops.step(Step::SupervisedPinVerified)?;
-    }
     let echo = resolved.echo(&args.path);
     let existing = resolved.lstat()?;
 
@@ -220,9 +193,6 @@ fn write_resolved(
             ));
         }
         ops.step(Step::EtagRechecked)?;
-        if let Some(pin) = pin {
-            pin.verify(ops, resolved, Access::Write, cancel)?;
-        }
         cancel.check()?;
         let (created, recovered) = atomic::create_new(
             ops,
@@ -258,13 +228,9 @@ fn write_resolved(
             "path is not a regular file",
         ));
     }
-    if pin.is_some() {
-        ops.step(Step::SupervisedBeforeOpen)?;
-    }
     let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
-    // The atomic recheck binds this fd to the named object, and verify_at
-    // binds that object to the preview. No early return can report success
-    // before those checks on the replace path.
+    // The atomic recheck binds this fd to the named object. No early return
+    // can report success before that check on the replace path.
     let previous_etag = current_etag(ops, &mut file, &stat, cancel)?;
     if args.expected_etag.as_deref() != Some(previous_etag.as_str()) {
         return Err(FileError::conflict(&previous_etag));
@@ -289,31 +255,17 @@ fn write_resolved(
     }
     atomic::check_replaceable(ops, &stat)?;
     cancel.check()?;
-    let (new_stat, recovered) = match pin {
-        Some(pin) => atomic::replace_supervised(
-            ops,
-            &resolved.dir,
-            &resolved.name,
-            &resolved.dir_path,
-            file,
-            &stat,
-            &previous_etag,
-            content,
-            pin,
-            cancel,
-        )?,
-        None => atomic::replace(
-            ops,
-            &resolved.dir,
-            &resolved.name,
-            &resolved.dir_path,
-            file,
-            &stat,
-            &previous_etag,
-            content,
-            cancel,
-        )?,
-    };
+    let (new_stat, recovered) = atomic::replace(
+        ops,
+        &resolved.dir,
+        &resolved.name,
+        &resolved.dir_path,
+        file,
+        &stat,
+        &previous_etag,
+        content,
+        cancel,
+    )?;
 
     let mut result = WriteResult {
         etag: ops.key.strong(&new_stat, content),

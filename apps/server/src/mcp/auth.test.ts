@@ -30,7 +30,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     BETTER_AUTH_SECRET: "decision-test-secret-at-least-thirty-two-characters",
     CORS_ORIGIN: "https://app.example.com",
     WMP_RATE_LIMIT_SCALE: 1,
-    TRUST_PROXY_HOPS: undefined,
+    TRUST_PROXY_HOPS: 0,
   },
 }));
 

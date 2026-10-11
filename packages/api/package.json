@@ -125,9 +125,6 @@
     "./lib/provider-catalog-model": {
       "default": "./src/lib/provider-catalog-model.ts"
     },
-    "./lib/relay-protocol-version": {
-      "default": "./src/lib/relay-protocol-version.ts"
-    },
     "./routers/index": {
       "default": "./src/routers/index.ts"
     },

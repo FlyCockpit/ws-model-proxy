@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     WMP_RATE_LIMIT_SCALE: 1,
-    TRUST_PROXY_HOPS: undefined,
+    TRUST_PROXY_HOPS: 0,
   },
 }));
 

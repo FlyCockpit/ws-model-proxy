@@ -16,7 +16,6 @@
     "@better-auth/oauth-provider": "catalog:",
     "@fontsource-variable/inter": "catalog:",
     "@orpc/client": "catalog:",
-    "@orpc/server": "catalog:",
     "@orpc/tanstack-query": "^1.15.4",
     "@prisma/client": "catalog:",
     "@tanstack/react-form": "catalog:",
@@ -33,7 +32,6 @@
     "@xterm/addon-web-links": "catalog:",
     "@xterm/xterm": "catalog:",
     "better-auth": "catalog:",
-    "crossws": "^0.4.12",
     "i18next": "catalog:",
     "i18next-browser-languagedetector": "catalog:",
     "lucide-react": "catalog:",
@@ -52,6 +50,7 @@
     "zustand": "^5.0.15"
   },
   "devDependencies": {
+    "@orpc/server": "catalog:",
     "@tailwindcss/vite": "^4.3.3",
     "@tanstack/react-query-devtools": "catalog:",
     "@tanstack/react-router-devtools": "catalog:",
