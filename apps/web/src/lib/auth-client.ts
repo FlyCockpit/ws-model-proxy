@@ -2,12 +2,7 @@ import { oauthProviderClient } from "@better-auth/oauth-provider/client";
 import type { auth } from "@ws-model-proxy/auth";
 import { APP_LOCALE_HEADER } from "@ws-model-proxy/config/locales";
 import { env } from "@ws-model-proxy/env/web";
-import {
-  adminClient,
-  deviceAuthorizationClient,
-  inferAdditionalFields,
-  twoFactorClient,
-} from "better-auth/client/plugins";
+import { adminClient, inferAdditionalFields, twoFactorClient } from "better-auth/client/plugins";
 import { createAuthClient } from "better-auth/react";
 
 import i18n from "@/i18n";
@@ -38,6 +33,5 @@ export const authClient = createAuthClient({
     // Better Auth 1.7 removed `genericOAuthClient`. This plugin carries the
     // signed `oauth_query` through sign-in, 2FA, consent, and continuation.
     oauthProviderClient(),
-    deviceAuthorizationClient(),
   ],
 });

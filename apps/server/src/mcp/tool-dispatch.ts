@@ -27,8 +27,7 @@
  */
 
 import type { AuthInfo } from "@modelcontextprotocol/server";
-import type { McpRequestCredential } from "./cli-tool-access";
-import type { McpContext } from "./context";
+import type { McpContext, McpRequestCredential } from "./context";
 
 /** Everything a tool wrapper needs to execute on behalf of one verified request. */
 export interface McpToolDispatch {
@@ -44,12 +43,8 @@ export interface McpToolDispatch {
    * dispatches (and older bindings) keep working; production always sets it.
    */
   signal?: AbortSignal;
-  /**
-   * Admission credential (PAT vs OAuth). Optional so direct unit-test
-   * dispatches keep working; a missing value is treated as OAuth, which
-   * hides the CLI command tools. Production always sets it.
-   */
-  credential?: McpRequestCredential;
+  /** Admission credential (agent token or OAuth) with its READ/FULL level. */
+  credential: McpRequestCredential;
 }
 
 const dispatchByAuthInfo = new WeakMap<AuthInfo, McpToolDispatch>();

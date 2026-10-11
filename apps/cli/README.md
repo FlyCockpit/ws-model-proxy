@@ -1,7 +1,7 @@
 <a href="https://github.com/FlyCockpit/ws-model-proxy">
   <picture>
-    <source media="(prefers-color-scheme: light)" srcset="https://shieldcn.dev/header/dots.svg?title=WS+Model+Proxy+CLI&subtitle=Outbound+relay+client+for+local+LLM+endpoints&logo=rust&logoColor=brand&size=wide&theme=orange&mode=light&align=left">
-    <img src="https://shieldcn.dev/header/dots.svg?title=WS+Model+Proxy+CLI&subtitle=Outbound+relay+client+for+local+LLM+endpoints&logo=rust&logoColor=brand&size=wide&theme=orange&mode=dark&align=left" alt="WS Model Proxy CLI">
+    <source media="(prefers-color-scheme: light)" srcset="https://shieldcn.dev/header/dots.svg?title=WS+Model+Proxy+CLI&subtitle=Node+client+for+WS+Model+Proxy&logo=rust&logoColor=brand&size=wide&theme=orange&mode=light&align=left">
+    <img src="https://shieldcn.dev/header/dots.svg?title=WS+Model+Proxy+CLI&subtitle=Node+client+for+WS+Model+Proxy&logo=rust&logoColor=brand&size=wide&theme=orange&mode=dark&align=left" alt="WS Model Proxy CLI">
   </picture>
 </a>
 
@@ -12,381 +12,269 @@
   <a href="#license"><img alt="License" src="https://shieldcn.dev/github/license/FlyCockpit/ws-model-proxy.svg?variant=secondary&mode=light&size=sm"></a>
 </p>
 
-> Command-line relay client for WS Model Proxy.
+> The node client for WS Model Proxy 0.4.0.
 
-The `wsmp` CLI authenticates with the web app, holds an outbound websocket connection to the server, and forwards local or network OpenAI-compatible model endpoints without router port forwarding.
+`wsmp` turns a computer into a **node** of your WS Model Proxy server. It keeps one outbound
+websocket to the server (no port forwarding), relays model requests to the runtimes on this
+node, and, when you allow it, runs the runtimes, commands, file operations and terminals the
+server asks for.
 
-## Start Here
+0.4.0 speaks relay protocol 3.0 only.
+A 0.3 CLI cannot connect to a 0.4.0 server, and this CLI cannot connect to a 0.3 server.
 
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --locked
-cargo test --workspace --doc --locked
-cargo xtask sync-docs --check
-```
+## Install
 
-## What You Get
-
-- A clap-based CLI with config, auth, endpoint inventory, probing, and relay commands.
-- Clean stdout/stderr boundaries, JSON output support, structured logging, and stable process exit codes.
-- Cross-platform config/state paths and TOML config load/save helpers.
-- Focused black-box CLI tests plus unit tests next to pure logic.
-- CI for fmt, clippy, tests, docs drift, dependency policy, typos, MSRV, and lightweight repository policy checks.
-- Cross-platform releases through `dist`, including shell, PowerShell, and Homebrew installer artifacts.
-
-## CLI
+From your server:
 
 ```sh
-wsmp login                         # device-code login; slug defaults to the configured slug, else the hostname
-wsmp login --slug desk-01          # choose the CLI slug used in model ids
-wsmp token login WSMP_TOKEN         # store the env var name for a CLI token
-wsmp config path                    # where the config file lives
-wsmp config --json show             # print config as JSON
-wsmp config init                    # write a default config
-wsmp config set-server https://wsmp.example.com   # the server this CLI connects to
-wsmp config set-server http://10.0.0.5:3000 --public-origin https://wsmp.example.com  # connect over the LAN, sign the public origin
-wsmp config set-slug desk-01        # set this CLI connection's slug
-wsmp endpoints add local http://127.0.0.1:11434
-wsmp endpoints add local http://127.0.0.1:11434 --expand-media  # inline WMP media URLs
-wsmp endpoints concurrency local 4          # register this limit for every model
-wsmp endpoints engine local llama.cpp       # declare the engine; llama.cpp and vllm advertise top_k
-                                            # (also: auto, generic, sglang, ollama, lm-studio)
-wsmp endpoints probe local
-wsmp connect                        # open the outbound websocket relay
-wsmp daemon start --detach          # background relay (new session; owns a PID file)
-wsmp daemon status                  # inspect the live relay (non-zero if absent)
-wsmp status                         # top-level live relay status alias
-wsmp reload                         # probe and publish the complete inventory; waits for server ack
-wsmp reload --offline               # probe and save local state only; never publishes
-wsmp daemon stop                    # stop a detached relay
-wsmp service install                # install, enable, and start a Linux/macOS user service
-wsmp service status                 # inspect the installed user service
-wsmp service env-sync               # copy required env vars into the private service env file
-wsmp terminal fingerprint           # print this CLI's terminal identity fingerprint
-wsmp config set-max-terminals 8     # browser terminals open at once on this machine (1-32, default 4)
-wsmp config set-mcp-commands supervised  # agents may request commands you confirm (off|supervised|unsupervised)
-wsmp metrics list                   # custom metric sources and their state
-wsmp metrics test gpu_fan           # run one source now and print what it reports
-wsmp metrics approve gpu_fan --sha256 <hash>  # approve the exact command you reviewed (hash from `metrics list`)
-wsmp recover                        # list abandoned `.wsmp-recover-*` dirs from the CLI registry
-wsmp recover --apply                # restore or dispose from INTENT (roll back or forward)
-wsmp recover --scan                 # also walk configured file roots (can hang on a dead NFS mount)
-wsmp config set-remote-metric-sources on  # accept remotely defined sources (each still needs approval)
-wsmp config set-remote-engine-adapters on  # accept remotely defined engine adapters (separate opt-in; each still needs approval)
-wsmp completions zsh                # shell completions
+curl -fsSL https://wsmp.example.com/install.sh | sh
 ```
 
-Configuration is stored in a JSON file. `wsmp config path` prints the resolved path for the current platform. `WSMP_CONFIG` selects that file. `WSMP_STATE_DIR` selects the state directory used by the daemon (PID file, control socket, `terminal-identity.json`, and durable `load-counters.json`) and by `wsmp terminal approve` (pending and approved browser identities). When it is unset, the CLI uses `$XDG_STATE_HOME/ws-model-proxy` or `~/.local/state/ws-model-proxy`. The state directory must be writable: connecting fails if the persistent identity key cannot be loaded or created. Logs go to stderr; pass `-v`/`-vv` for more, `--quiet` for less, or set `WSMP_LOG`. HTTP and WebSocket client libraries (`tungstenite`, `ureq`, `reqwest`, `hyper`) stay at INFO even at trace, because their debug output contains credentials and relay traffic; name one explicitly (for example `WSMP_LOG=tungstenite=trace`) only when you need it and will not share the output.
+The script installs the release binary of the server's version on Linux x86_64 and ARM64 (glibc
+2.34 or newer, such as Ubuntu 22.04+ and DGX OS) and on macOS. It verifies the archive's SHA-256
+against the release's `sha256.sum` and refuses to install on any mismatch or missing checksum.
+On other systems, or when the server pins a commit (`WMP_CLI_SOURCE_REV`), it builds from source
+with `cargo install`, which needs Rust 1.88 or newer (<https://rustup.rs>) and a C compiler.
 
-The relay hello signs the server's origin, and the CLI signs only the origin
-configured on this machine: `--public-origin` when set, else the server URL's
-origin. The server never chooses it. If this machine reaches the server
-through another address than its public URL (a LAN IP or an internal
-hostname), pin the server's public origin (the origin of its
-`BETTER_AUTH_URL`) with `wsmp config set-server <connect URL> --public-origin
-<origin>` and restart wsmp; no new login is needed. The public origin is
-`scheme://host[:port]` with no path or credentials, and its host must be an IP
-address or a DNS name of ASCII letters, digits and hyphens. A plain-http
-origin is accepted, for a LAN server whose `BETTER_AUTH_URL` is http: it is
-only the name the signature binds. `set-server` warns when the connect URL
-itself is plain http off loopback, since the credential and relay traffic go
-there unencrypted.
-`wsmp config show` prints the effective `helloOrigin`, and `wsmp login` warns
-when the server's origin differs from it. That warning and the relay's refusal
-suggest the exact command, with its arguments single-quoted (for PowerShell on
-Windows), but only when the server's origin is a valid public origin.
+Either way the binary lands in `~/.cargo/bin` (`$CARGO_HOME/bin` when set); add it to your `PATH`
+if `wsmp` is not found.
 
-### MCP commands
+Until v0.4.0 is released, a server's script builds from source by default: the
+`redesign-0.4.0` branch, or the commit in `WMP_CLI_SOURCE_REV`. The server opts into release
+binaries with `WMP_CLI_RELEASE_BASE_URL`; from the release on, that is the default. To check a
+downloaded archive yourself:
 
-`wsmp config set-file-read on|off` controls the CLI's read-only file consent (`mcpFileRead`, default off).
-Use `wsmp config set-file-roots <path>…` to choose absolute existing UTF-8 directories after `~` expansion; `/`, `..`, duplicate roots, lists over 32 entries and lists whose serialized size (escapes count as their serialized form, for example `\u0001` is six bytes) exceeds 64 KiB in total are rejected, so the supervised confirm screen can always receive the set. Suggested roots (`~/models`, `~/deploy`, `~/.config/llama-swap`, `~/.local/state/wsmp/logs`) are printed only in help and never applied. `wsmp config clear-file-roots` clears the allowlist; `wsmp config show` displays both settings. Restart wsmp to apply. The dashboard must also grant file reading, and the PAT needs `allowCliFileRead` + `mcp:read` (or command consent + `mcp:write`). On supervised/off nodes every headless read requires both read switches and usable roots. The read grant never admits a write: on a supervised node writes need a person's keypress on the confirm screen, and on an off node they are refused. Unsupervised admits reads/writes by mode, but configured roots still confine every operation including rename destinations. A root that disappears before startup disables grant reads and keeps confinement, never falling back to the whole filesystem. Symlink and `..` escapes are denied, protected files remain protected, and the narrow masking set is unchanged. On a read-grant-only node without exec, masking plus roots is the security boundary; on unsupervised it keeps secrets out of transcripts. Linux adds a safe `openat2` beneath/magic-link guard where supported; existing fd-based confinement remains on other systems.
-
-`wsmp config set-mcp-commands <off|supervised|unsupervised>` chooses what MCP agents may run on this machine (restart wsmp to apply; the dashboard grant for the device must allow it too). `unsupervised` allows headless commands (`sh -c`, no TTY, no stdin). `supervised` allows only supervised commands: the agent's request opens a terminal on the dashboard's Terminals page that shows who asked, the agent's reason, the working directory and the exact command, with every control or invisible character shown as `\u{..}`. The screen always fits the terminal: a request taller than it scrolls (arrow keys, PgUp/PgDn, Home/End) above a footer that stays next to the Enter prompt and says, when part is not shown, how many lines and bytes the command has. Read the command on this screen: it is drawn by wsmp inside the end-to-end encrypted terminal and is exactly what runs. The dashboard panel also shows the whole command, but that copy is relayed by the server, as a convenience. Below about 12 rows or 20 columns the status line may be cut, but the Enter prompt row is always kept; if the terminal size cannot be read, the screen is laid out for 40 columns by 16 rows, so it fits any terminal at least that big. Nothing runs until someone presses Enter on that screen; Ctrl-C, Ctrl-D or `q` declines, and keys typed before the screen was drawn are discarded. Enter hands the decision to the relay daemon, which starts the command only if the request is still waiting: when the server's 15-minute confirm deadline (or a Decline in the dashboard) reaches it first, the request is declined and the command never starts, and when the Enter came first the command runs to its end. A Decline never kills a command: if the Enter came first, the tab that declined says the command started, and only End session stops it. End session is an explicit kill at any point, including of a command that just started. The command then runs in that terminal (so `sudo` and other prompts work) and the terminal ends when it exits. `unsupervised` also allows supervised commands. Supervised commands need a Unix PTY but not `allowHumanTerminal`. Browser approval is optional, but recommended with `supervised`: without `wsmp config set-terminal-approval on`, this CLI admits any browser the WS Model Proxy server sends it, so "nothing runs without a person's keypress" and "the server never sees unreviewed output" hold only while the server is honest (a compromised server could attach its own viewer, press Enter, and read the output). With approval on, only browsers you approved on this machine can view or answer the request, and both guarantees hold even against a compromised server, provided the dashboard code your browser runs is genuine: that same server serves the code, and the approved browser key is used by it, so a compromised server that also serves you altered dashboard code could act as your approved browser. At most one request waits for confirmation and at most two supervised terminals run per CLI. When the agent asked to see the output, the terminal offers "Review output before sending": the output is then held on this machine and shown only to the reviewing browser, which decides what (if anything) the agent receives. A config written by an older wsmp with `allowMcpCommands: true` loads as `unsupervised`. This setting is switch 3 of 3; the token and the dashboard grant are the others, and the effective mode is the stricter of the grant and this setting (see `../../docs/cli-command-switches.md`). Supervised commands do not need the dashboard's terminal grant: each one needs a person to press Enter on the confirm screen.
-
-Headless command lifetime: a headless command (`forwarder_cli_command_run`) keeps running after the MCP tool returns, but when its `sh -c` shell exits, every process still in the command's process group is killed with SIGKILL, so `cmd &` and `nohup cmd &` end with the shell (on Windows the command's whole job tree ends). The whole group is also killed at the 10-minute cap. Long-lived servers must run as a systemd unit or a deployment, not from a headless command.
-
-Child environment: headless commands, terminals, metric sources, engine adapters and deployment commands start from a scrubbed copy of the daemon's environment: only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `SHELL`, `TZ`, `TERM`, `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` pass, never a `WSMP_*` name, the CLI token or endpoint header variables, or a value that looks like a WS Model Proxy credential. `PATH` also gains the directory holding the running wsmp binary, appended when it is not already listed, so `wsmp ...` works from a headless command even when the service manager's default `PATH` lacks `~/.local/bin` or `~/.cargo/bin`. On Linux, when the daemon has no `XDG_RUNTIME_DIR` and `/run/user/$UID` exists, children get that directory, and when it has no `DBUS_SESSION_BUS_ADDRESS` and `$XDG_RUNTIME_DIR/bus` is a socket, children get `unix:path=$XDG_RUNTIME_DIR/bus`, so `systemctl --user` works from a headless command.
-
-Command output is masked on this machine before it enters the server/MCP copy: headless exec stdout/stderr and the shared/review capture of supervised output. The person's encrypted terminal viewer is unchanged. Masking scans the terminal-cleaned view, including indentation, with terminal parser state carried across lines and chunks. If a scan masks anything, that line emits masked cleaned text with its CR/LF terminators preserved; otherwise its raw bytes pass through unchanged. Control strings that hide LF are held through the next LF in terminal ground state so names cannot be joined after scanning; a masked group spanning such LFs emits opaque physical-line markers with its CR/LF bytes preserved. The server's `cleanText` still runs afterwards. The same restartable scanner as the file tools masks private-key PEM blocks through the matching END label (a missing or mismatched END stays masked), whole lines containing secret-name tokens as `⟦redacted line⟧`, the following non-blank line, and deeper indentation continuation, including blanks inside the run. Tokens are case-insensitive words ending in `_TOKEN`, `_KEY`, `_SECRET`, `_PASSWORD`, `apikey`, `api-key`, `api_key`, `hf-token` or `hf_token`, or equal to `PASSWORD`; dash-prefixed words use the secret-flag rule. Open quotes/backslashes on the token or following value line continue to a blank line. Secret flags such as `--api-key` / `--hf-token` mask their value tail and continuation. A command naming `.cache/huggingface/token` or `.huggingface/token` has every non-blank output line masked with the Hugging Face token-file class; nothing is read from disk by the masker. A printed dotenv-style token line is masked whole; `KEY=⟦redacted:N⟧` belongs only to the file tools' dotenv view.
-
-Each normal line is scanned once and held until a terminal ground-state LF or EOF/completion, with at most 64 KiB held per stream. A longer line is scanned in bounded pieces with retained private-key labels and overlap across piece boundaries, and masked whole, so no prefix or unbroken token tail can leak. An over-long line that starts while a multi-line secret run is live — an open private-key PEM block, an open quote or backslash continuation, an indentation run — leaves the rest of that stream opaque through EOF, for the same reason as the 1 MiB case: the state a fresh scanner would drop is what masks the lines that follow, so recovering there would print them raw. With no prior live opener, at its terminating LF a fresh scanner is primed with the private-key BEGIN labels still open on that line and an unconditional until-blank opener. Every non-blank output line stays masked until the next blank line, even when the over-long line contains only public text or a closed quote. Matching END labels close the carried PEM blocks. Recovery also treats the over-long line as a column-0 secret-name token line: the next non-blank line is masked whole, and subsequent lines indented deeper than column 0 stay masked. Blank lines do not consume the next-line protection; PEM and other opener detection still run on protected lines. Normal scanning resumes after the blank unless PEM, indentation, or next-value protection extends masking. CR/LF bytes survive. Opaque fallbacks have no recovery before EOF: more than 1 MiB of input contributing live masking state bounds PEM/indentation state; an over-long line inside a live run fails closed rather than dropping the opener; a PEM marker longer than the 1 KiB recovery overlap on an overlong line also fails closed; and a cleaned LF inside an overlong terminal group (including LF executed inside unfinished CSI) makes the remaining stream opaque through EOF. This is a byte latency bound, not a wall-clock timeout when a process stops writing. EOF flushes the partial last line; teardown flushes exec output or discards an unshared capture. Masking precedes the 8 KiB head / 40 KiB tail retention; `output_bytes` and stream totals count masked bytes. Invalid UTF-8 passes through unless the cleaned lossy scan finds a mask. Other secrets (vendor tokens, JWTs, cloud credentials) are not masked, and on an `unsupervised` node masking is not a security boundary. The server's WMP credential-substring scrubber still applies.
-
-This release speaks relay protocol 2.4 (v0.3.1 spoke 2.3). Upgrade the server and every CLI together; older protocol versions are not supported for this release.
-
-### Managed model deployments
-
-`wsmp config set-deployments on` permits the server to execute owner-authorized recipe jobs on this node (off by default). **Turning it on lets the server run shell commands on this machine** (`/bin/sh -c`, as the user running wsmp) for any job it reports as approved by a person, whatever `wsmp config set-mcp-commands` says, including `off`. The command mode applies only to jobs the server reports as agent-authored: they are rejected in `off`, need the server's human-approval flag in `supervised`, and are permitted in `unsupervised`. Who authored and who approved a job are the server's claims; the CLI cannot verify them, and supervised approval of a deployment is not a confirm screen on this machine. Turn deployments on only for a server you would trust with a shell on this node. Every job rechecks the local switch, and the server also checks its deployment grants. Turning a grant off does not silently kill an existing model; authorized cleanup is still required.
-
-Interactive recipe commands (for example one that runs `sudo` and asks for a password) need a person. `wsmp config set-deployment-operator-terminal on` (off by default; it also needs `set-deployments on` and terminal support, and it does not enable browser terminals) lets this node open an operator terminal for such a step: the owner attaches from the dashboard, the screen shows the exact command and who wrote it, and the command runs with `/bin/sh -c` only after Enter (a fresh confirmation for every retry), never as a shell. Before opening a terminal the CLI checks the recipe's status command: a start whose service is already alive, or a stop whose service is already stopped, settles without anyone. After the command exits 0 the same status check decides whether the step succeeded. Closing the terminal ends the command in it, and so does a lost connection to the server. Without the switch the node refuses interactive jobs and the server refuses to plan interactive recipes on it. The fully automatic alternative is to allow the exact absolute command in sudoers with `NOPASSWD` and leave it non-interactive in the recipe.
-
-On Linux, deployment activation requires a running user systemd manager and user lingering. The manager counts as running when `systemctl --user is-system-running` prints `running`, `degraded` (some unit failed) or `starting`, whatever its exit status; linger is on when `loginctl show-user <uid> -p Linger` prints `Linger=yes`. The CLI reports `systemd+linger`, `systemd-no-linger`, or `unsupported`; it does not change host settings. Each rank declares `management`: `ownedProcess` promises the backend stays in its unit cgroup (foreground and background children are supported); `externalService` requires reliable stop and status commands for a backend managed outside that cgroup, such as a detached container. Empty active-exited units do not prove an owned backend is running. On macOS, recipes require the `externalService` contract and must self-detach; the CLI never signals a reusable PID. Windows deployment execution is unsupported.
-
-Durable private `instances.json` records execution intent before launch. Linux transient units carry a local ownership description and exact invocation identity, with separate prepare/start/after-join units and null stdout/stderr. Reconnect observes persisted instances instead of blindly relaunching them; offline operation never autonomously starts or stops models. Stop succeeds only after owned units are gone and an external service's status command positively reports absence (exit 3; exit 0 means alive; any other result is unknown). Owner-authored commands are trusted declarations under the explicit management contract; shell text is never inspected as ownership proof. Unknown ownership, deadline expiry, or pending child settlement retains claims and withdraws publication. One monotonic job deadline includes queue admission, manager IPC, commands, readiness, stop, and cancellation settlement. Pending reaping retains a bounded subprocess permit instead of adding another cleanup budget. Each command in a job is limited to 4,096 bytes; the server applies the same limit when a recipe is saved and after placeholders are filled in. `instances.json` stays bounded: a verified-stopped instance is kept for an hour so a retried stop still gets its recorded answer, then removed. At most 256 instances are tracked, and the oldest stopped instances make room first. Starts and checks leave 2 MiB of the 8 MiB state limit free for stops, so a stop is never refused because state is full; when only running instances remain, a new start is refused instead.
-
-Only a ready rank-0 deployment advertises its managed endpoint. The `inst-` slug namespace is reserved and cannot be assigned to a manual endpoint. Recipes explicitly declare LLM or embedding attachment, engine kind, and any embedding compatibility contract. Native engine/count facts are probed rather than inferred from a recipe label. Health jobs preserve the recipe's failure/success thresholds. Operational records and errors contain no prompts, completions, or backend output; deployment stdout/stderr are discarded, including systemd journal output.
-
-`wsmp login` binds the device credential to this CLI's persistent P-256 identity key (`terminal-identity.json` in the same state directory as `device-auth.json`). Hello must present the same key and prove possession. Copying only a bound credential to another machine produces an identity refusal and leaves the original session up. A CLI token binds on its first connection: a never-used token is claimed by whichever copy connects first. Copying the whole state directory transfers the identity key and the device. If a token's identity key is lost, use the dashboard's reset identity bind action, then connect the intended machine first. Reset is recovery; revoke the token to cut off access after a leak. Run `wsmp login` on the machine that should connect with a device credential.
-
-> **Never copy `service.env` or the state directory between machines.** Each machine needs its own `wsmp login`. A copied state directory carries the identity key and the device credential, so both machines claim to be the same device: each connection replaces the other's session, and the dashboard cannot tell which machine it is talking to. A copied `service.env` carries a CLI token, which binds to whichever copy connects first. To set up another machine, install wsmp there and run `wsmp login` (or mint it its own CLI token); give it its own slug unless it is replacing the old machine. The hostname is only a display label. The signed hello origin is the server's canonical deployment origin, so proxy and tunnel addresses can differ from that origin.
-
-### Node file tools
-
-The `file.op` frames support MCP node file tools (read, stat, list, search, edit, write, rename, mkdir, delete). Hello reports `capabilities.fileOps`, `features.mcpFileRead`, `features.fileRootsConfigured` (the startup switch and usable-root snapshot) and `features.allowFileToolsAsRoot`. Upgrade server and CLI together to relay protocol 2.4.
-
-- File tools follow the lowest dashboard and CLI command mode, carried explicitly in `file.op` with `readGrant`. wsmp independently re-checks local consent on every op, whatever the server asks: `unsupervised` runs reads and writes headless, `off` refuses writes and admits reads only with the full read grant (dashboard grant, local read switch and usable roots), and `supervised` admits reads with that same full grant. The read grant never admits a write. Supervised writes require a person’s keypress: wsmp opens an end-to-end encrypted terminal confirmation screen (`term.spawn` with `kind: "file"`) for edit, write, rename, mkdir, and delete. The screen ignores the server's command summary and spawn-level reason. Instead, a local child independently reads the real disk, masks disk-derived removed/context lines, and shows the operation, physical path(s), requester, the reason from the strict file arguments, and a one-context unified diff or operation description. Every after-side byte is tracked as requester-authored or carried from disk. An added line carrying any masked disk byte (including whole-line and continuation masks) is blocked with redacted_span after dismissal; pure requester-authored additions are displayed verbatim. Diff and mask lines split only on LF: a lone CR is escaped content, and CRLF stays one line ending; unmappable line counts block with redacted_span. Details includes octal mode (including all preserved permission bits), ifExists, parent creation, overwrite and byte counts where applicable. Every control, bidi, and invisible character is escaped. A complete escaped diff above 8 KiB is blocked with too_large when the person dismisses it, with no mutation. Long previews scroll above a pinned `Enter to apply` footer; Ctrl-C, Ctrl-D, or `q` declines. Configured roots are checked on resolved physical paths before display and again at apply; an alias that resolves inside a root is allowed. Outside-root paths, escaping symlinks, unavailable roots and disk-derived argument growth above 128 KiB get a cannot-apply screen, and their codes (path_denied for root confinement, too_large for argument growth) reach the agent only after dismissal. The confirm child uses the daemon’s startup root snapshot; apply-time policy remains authoritative. A file-state refusal gets a cannot-apply screen; Enter, Ctrl-C, Ctrl-D, or `q` dismisses it without accepting. Enter on an allowed preview only signals the daemon and waits for its go token: the child never writes the file or launches another command, and the daemon rechecks the pinned disk state before applying exactly once. Write bodies travel through a private 0600 temporary file which the child securely opens and unlinks; one body is limited to 1 MiB, and one environment input is limited to 128 KiB. The strict supervised inputs remain confined to this short-lived child and disappear when it exits. Supervised file confirmation requires a Unix PTY. File operations log metadata and a stable outcome, without content; the server records the persistent audit trail. After dispatch, server termination without authoritative CLI settlement is unknown; started is true when the server received acceptance and null otherwise; late frames do not revise finished file results. CLI decline/rejection/blocked done before acceptance and undispatched admission/spawn-send failures remain definitive.
-- Supervised file and symlink renames on Linux and macOS use the same preflight as headless ones, including destination replacement when atomic exchange is unavailable: no-replace or hard-link publication. Stable-inode link publication links the source onto the destination before capturing it; no-replace and noino/sshfs still vacate the source (and the destination, for overwrite) into the recovery directory, prove the held fd, and publish fail-if-exists. Other Unix still refuses a supervised overwrite. macOS refuses a supervised directory no-replace move with unsupported, and directories never overwrite or link. The publisher refuses with `unsafe_filesystem`, changing nothing, only when no safe primitive exists for the objects. Headless (`unsupervised`) rename on a filesystem without atomic exchange (NFS, FUSE, WSL2 `/mnt/c`) uses that same preflight.
-- Supervised mutations use the same per-operation `.wsmp-recover-<10 alnum>` recovery and compensation as headless operations, with pin checks and cancellation honored only before commit. An unsettled operation sends only `fileError.code: "uncertain_outcome"`; the server reports every non-success after acceptance as `outcome: "unknown"`. Supervised success results omit `recovered`. Retained `recovery`/`kept` paths and successful cleanup leftovers are shown to the person in the daemon warning log (paths only, never content), even if the display-only child has exited. The agent receives no recovery paths and gains no read grant. Inspect retained objects with a shell and recover manually before retrying. Startup reports durable recovery registry entries without statting recovery paths. `wsmp recover` inspects them; its default is read-only, and `--apply` removes stale rows. Recovery uses INTENT v3 private hardlink anchors, not recyclable inode snapshots. Legacy intents, missing anchors, directories, and filesystems without usable stable hardlinks retain ambiguous data for manual resolution. Committed intent never resurrects acknowledged deletes or rename source aliases. Unsupported cleanup locking may use a live local PID to identify an active operation, but automatic apply/final cleanup fails closed without the stable sibling lock. Upgrade server and CLI together. Exchange-less replace and rename probe safe no-replace/link publication before vacating a name; they refuse (nothing changed) when no safe primitive is available. File/symlink delete captures and proves the held object before disposal; delete cleanup leftovers also stay in the daemon log. A preview-time `unsafe_filesystem` refusal is shown on a blocked screen and reaches the agent only after dismissal; it is never a pre-display rejection.
-- Root: when wsmp runs as root (euid 0) every file op is refused as `unsupported`. `wsmp config set-file-tools-as-root on` (restart wsmp to apply) allows it; `wsmp config show` lists `allowFileToolsAsRoot` when it is on.
-- Ops run on a small worker pool (two threads, at most four ops in flight) and never on the relay loop, so a slow hash or search cannot stall heartbeats. A write's content arrives as one binary `file.body` frame of at most 1 MiB, and a result text field above 48 KiB goes back as a binary `file.data` frame.
-- wsmp logs every op at `info` on stderr: `file op op=edit target=/path outcome=ok reason=...`. `target` is the path (or `from -> to`, or the first of several stat paths, or the search root), `outcome` is `ok` or the error code, and `reason` is the agent's optional note, escaped and cut to 200 characters. File content and error messages are never logged.
-
-Filesystem recovery records pending capture/publication and compensation before
-effects. I/O failures retain evidence and cannot acknowledge durable success;
-unsupported directory sync requires manual resolution. See
-[file recovery and durability limits](docs/file-recovery.md) for phase meanings,
-ordering, cancellation ownership, and platform qualification limits.
-
-### Engine facts and node telemetry
-
-An endpoint's `engine` defaults to `auto`: at probe time (connect, reconnect, `wsmp reload`) wsmp asks the engine's server root (the base URL without `/v1`) for `GET /props` (llama.cpp: `total_slots`, per-slot `n_ctx`), `GET /get_server_info` (SGLang: `max_running_requests`, `max_total_num_tokens`), `GET /metrics` (vLLM: `vllm:cache_config_info` blocks × block size; SGLang by its `sglang:` prefix), `GET /api/version` (Ollama) and `GET /api/v0/models` (LM Studio), each with a 3-second timeout and the endpoint's configured headers. After detection, a matching engine may get one Chat Completions count POST (with the endpoint's credentials; prompt text is never logged): vLLM `POST /tokenize`, TGI `POST /chat_tokenize` only when `GET /info` matched, llama.cpp `POST /v1/chat/completions/input_tokens` (then `/apply-template` plus `/tokenize`). Ollama, SGLang, LM Studio, `generic`, and undetected hosted OpenAI-compatible endpoints stay on the server's estimate unless a custom adapter declares `--count-route`. The probed fact is tri-state (`method` / `unsupported` / not probed) and is kept across reconnect when the engine kind is unchanged. `wsmp endpoints engine <slug> <engine>` declares the engine instead and probes only its own route; `generic` turns detection and load sampling off (use it for remote providers). The detected engine, slot count, KV capacity, context limits and the endpoint's `concurrencyLimit` (sent as `slots`; when set it wins over the engine's reported slots, which only fill an unset value) go to the server as engine facts, each marked `probe` or `config`. `wsmp endpoints kv-tokens <slug> <tokens>` declares the engine's total KV capacity (source `config`); it wins over a probed K. Declare the real KV capacity, not a guess on the high side. llama.cpp stays slot-based: a declared K is stored but does not switch protection to token mode, and wsmp warns. The server stores them on the model's inference capacity and, while that capacity's hard limit is still automatic, keeps the limit equal to the reported slots; a limit you set in the dashboard is never changed.
-
-After registration a sampling thread sends, never blocking the relay:
-
-- `node.info` once per connection: OS, kernel, architecture, CPU model and count, total RAM, GPUs from `nvidia-smi` (name, UUID, driver, VRAM), whether memory is unified (for example GB10), per-interface addresses, link speed and MTU, and the verified deployment execution mechanism;
-- `node.metrics` every 20 seconds: CPU use and load averages, `MemAvailable` and swap from `/proc/meminfo`, free space on `/`, per-GPU VRAM, utilization, temperature, power and SM clock, and per-interface byte counters (lifetime totals since boot, reported at most as 9007199254740991, the largest integer JSON numbers carry without loss);
-- `endpoint.load` every 2 seconds when it changes (and every 5 seconds regardless) for llama.cpp (`/slots`, and `/metrics` when started with `--metrics`), vLLM and SGLang (`/metrics`): running and waiting requests, KV use and prefix-cache deltas. llama.cpp `llamacpp:kv_cache_usage_ratio` is sent as `kvOccupancy` (display only). A custom engine adapter on an endpoint replaces that built-in scrape (`source: "custom"`).
-
-Each endpoint is scraped on its own schedule, 2 seconds after its previous scrape finished (adapter interval 2–5 s), with at most 16 scrapes in flight, so a slow endpoint never delays another endpoint's load or the node metrics. Linux reads `/proc` and `/sys`; other platforms send what they can. `nvidia-smi` runs with a 5-second timeout (the run is over within about a second of it even if `nvidia-smi` is hung in the driver) and its stderr is discarded, and any helper it leaves behind is killed with its process group; HTTP scrapes time out after 2 seconds, and a body over its size limit after decompression is refused. Every reading is held to the server's limits before it is sent (for example CPU use at most 100%, over-long GPU text cut); an out-of-range reading is left out rather than sent. From llama.cpp `/slots` wsmp keeps only each slot's id, `n_ctx` and `is_processing`: prompt text and generated text in that response are never kept or sent. Custom metric sources (below) add their own series to `node.metrics`. Adapter status in `node.metrics.engineAdapters` never includes command text, raw output, stderr, route bodies, or label values.
-
-### Custom engine adapter
-
-A per-endpoint adapter turns a JSON object or Prometheus text into the same engine signals the built-in scrapes send. Set one with `wsmp endpoints adapter set <slug> (--route <path> | --command <cmd>) --format json|prometheus [--map signal=series[{k="v"}][*scale]]... [--interval S] [--timeout S] [--count-route <path>]`. `show` / `clear` / `test` inspect, remove, or run once. `test` prints normalized signals and drop reasons; it never prints raw output. `--count-route` is an optional POST on the endpoint origin (same path rules as `--route`) that counts Chat Completions tokens; probe uses it only when that path is set.
-
-`--route` is an HTTP GET on the endpoint origin with the endpoint's own headers and auth. The path must start with a single `/` (no scheme, host, whitespace, `..`, query, or fragment). After joining, the request must stay on that origin; redirects are not followed. `--command` runs through the same bounded runner as metric sources. `format: json` with canonical keys (`running`, `waiting`, `kvUsage`, …) needs no `--map`. Prometheus needs a map. Interval 2–5 s, timeout 1–4 s. Values outside their range are dropped, not clamped. A reading without `running` is not sent. Config `kvTokens` / `concurrencyLimit` still win over adapter facts, which win over probe.
-
-| Signal | Kind | Unit and range | Meaning | Drives |
-|---|---|---|---|---|
-| `kvTokens` | fact | integer tokens, 1..1e12 (stored capped at 2^31-1) | Total KV the engine can hold across all sequences on its accelerators. Not host-RAM prompt caches. | Warm protection token mode (not llama.cpp) |
-| `slots` | fact | integer 1..10,000 | Most sequences the engine runs at once | AUTO hard limit, slot-mode protection, `full_slots` |
-| `maxModelLen`, `ctxPerSlot` | fact | integer tokens | Context limits (as today) | Context seeding, display |
-| `running` | load | integer ≥ 0 | Sequences in prefill or decode now | Display, charts |
-| `waiting` | load | integer ≥ 0, **optional for custom** | Requests accepted but not yet scheduled | `full_waiting` (sustained 2 frames) |
-| `kvUsage` | load | fraction 0..1 | **Active** KV: blocks held by running or waiting sequences. Idle cached prefixes count as **free**. Same meaning as vLLM `kv_cache_usage_perc` and SGLang `token_usage`. | `full_kv` at the member threshold (default 0.95) |
-| `kvOccupancy` | load | fraction 0..1 | Active plus idle cached prefixes (everything that is not empty). | **Display only.** Never FULL, never KV-eviction evidence. |
-| `slotsBusy` | load | integer ≥ 0 | Slots running a request | `full_slots` when `slots` is known |
-| `deferred` | load | integer ≥ 0 | Requests the engine deferred (llama.cpp style) | `full_deferred` |
-| `prefixCacheHitsTotal`, `prefixCacheQueriesTotal` | load | cumulative **tokens**, monotonic | Prefix-cache counters. The CLI turns them into deltas. | Display (hit rate) |
-
-Declare the real KV capacity, not a guess on the high side. Custom FULL does not gate admission until the pool member is set to enforce it.
-
-Remote adapters are defined over MCP or the API, only for a device whose MCP command mode is `unsupervised` on the server. This CLI still refuses them unless both hold:
-
-1. the local opt-in: `wsmp config set-remote-engine-adapters on` (off by default; only settable on this machine; restart wsmp to apply). Metric-source opt-in does not allow adapters.
-2. a local approval of the canonical spec: `wsmp endpoints adapter approve <slug> --sha256 <hash>`, where `<hash>` is the SHA-256 `wsmp endpoints adapter show` prints for the spec you read. A changed spec shows `pending_approval` until you approve the new one. `wsmp endpoints adapter revoke <slug>` removes an approval.
-
-Received definitions are stored in `remote-engine-adapters.json` in the state directory. A local adapter on the same endpoint wins; the remote one is `refused`. Adapter status in `node.metrics.engineAdapters` never includes command text, raw output, or the hash.
-
-### Custom metric sources
-
-A metric source is a command that wsmp runs every `intervalSecs` seconds; its numbers go to the server in `node.metrics` (`custom`), where pool routing rules can use them. Local sources live in the config file:
-
-```json
-{
-  "metrics": {
-    "sources": {
-      "gpu_fan": { "command": "nvidia-smi --query-gpu=fan.speed --format=csv,noheader,nounits | head -1", "intervalSecs": 10, "timeoutSecs": 5, "format": "number" },
-      "queue": { "command": "curl -s http://127.0.0.1:9000/stats", "format": "json" },
-      "exporter": { "command": "curl -s http://127.0.0.1:9100/metrics", "format": "prometheus" }
-    }
-  }
-}
+```sh
+gh attestation verify wsmp-aarch64-unknown-linux-gnu.tar.xz --repo FlyCockpit/ws-model-proxy
 ```
 
-Formats: `number` (one number; the series is named after the source), `json` (an object of `name: number`) and `prometheus` (text exposition, `name{label="value"} 1.5`, comments and timestamps allowed). Only finite numbers are sent. Series names, label keys and label values must match `[A-Za-z0-9_.:-]{1,64}`, with at most 16 labels, and `__proto__` is not accepted as a label key; anything else is dropped, as are names starting with `node.` or `endpoint.` (reserved for built-in metrics). At most 50 series per device are sent. Defaults: `intervalSecs` 10 (5 to 86400), `timeoutSecs` 5 (1 to 300), `format` `number`; a source outside these bounds is reported `disabled` and never runs. Config changes apply within a few seconds without a restart.
+Or build a release tag with cargo directly:
 
-Every run is bounded: the command runs with `sh -c` in its own process group, with stdin closed and a scrubbed environment; stdout is capped at 64 KiB (more is reported `output_too_large` and nothing is sent); after the timeout the whole process group is killed (on Windows the whole tree, via a job object) and so is the command itself even if it left the group, and the run is over within about a second of the timeout even if the command does not die (one stuck in the kernel is left to a background reaper; while 8 such processes are still stuck, or 64 runs are in flight or stuck, new runs are refused). On Unix, a helper that left the group and keeps the output pipe open cannot be killed with the group; it leaks nothing in wsmp (no thread, no descriptor) but keeps running until it exits. Windows children are assigned to a job before they start; detached grandchildren and descendants of an exited root stay in that job. Closing its last handle also kills the tree, including when the CLI exits abruptly. When wsmp exits, every run in flight is killed with its process group or Windows job. On Unix, `SIGKILL` of wsmp itself cannot be caught and can leave a command running until it exits by itself (nothing enforces its timeout once wsmp is gone). A panic in a release build kills the runs in flight first (panic hook). stderr is discarded: it is never read, logged or uploaded, and neither is the command's output. Only the parsed numbers, the source names, a state and an error code (`spawn`, `timeout`, `exit_status`, `output_too_large`, `parse`) leave the machine, plus the SHA-256 of each command. Commands run as the OS user that runs wsmp. `wsmp metrics list` shows every source and its state; `wsmp metrics test <name>` runs one now with the same limits and prints what it would report.
+```sh
+cargo install --git https://github.com/FlyCockpit/ws-model-proxy --tag v0.4.0 --locked wsmp
+```
 
-On Windows, a contended job lock does not count as process exit. If termination cannot acquire the lock within the cleanup grace, the background reaper retains the run's registration and budget permit and retries termination until it succeeds. Registry identities are unique per run, independent of reusable process IDs. After termination, reaper polling backs off from 5 ms to a 250 ms cap; pending kills keep retrying every 5 ms.
+## Log in
 
-Remote sources are defined over MCP or the API (the dashboard lists them), only for a device whose MCP command mode is `unsupervised` on the server. This CLI still refuses them unless both hold:
+On the server's **Nodes** page, create an enrollment code, then on this computer run:
 
-1. the local opt-in: `wsmp config set-remote-metric-sources on` (off by default; only settable on this machine; restart wsmp to apply);
-2. a local approval of the exact command: `wsmp metrics approve <name> --sha256 <hash>`, where `<hash>` is the SHA-256 `wsmp metrics list` shows for the command you read. The approval pins that hash in the config and is refused if the stored command is no longer the one you reviewed (the flag is required for that reason). When the server changes the command string, the source stops running and shows `pending_approval` until you approve the new one. `wsmp metrics revoke <name>` removes an approval.
+```sh
+wsmp login https://wsmp.example.com --code wsmp_enr_...
+```
 
-Received definitions are stored in `remote-metric-sources.json` in the state directory so `wsmp metrics list` can show them. A local source with the same name wins; the remote one is `refused`.
+`wsmp login` asks for anything you leave out (the code can also come from `WSMP_ENROLL_CODE`).
+Useful flags:
 
-### Browser terminal viewers
+| Flag | Meaning |
+| ---- | ------- |
+| `--slug <name>` | This node's name. Defaults to the saved name, else one derived from the hostname. |
+| `--trust full\|relay` | What the server may do here (see [Trust](#trust)). Prompted on a terminal; without one, `full`. |
+| `--human-terminal on\|off` | Allow browser terminals on this node. Asked next to trust on a terminal (default yes; not asked at Relay only, where they cannot open); without a terminal, the saved setting stays (`off` unless set) and login says so. |
+| `--service` / `--no-service` | Install and start the per-user service without asking, or skip it. |
+| `--replace` | Confirm a Replace code (below) without the prompt. |
+| `--yes`, `-y` | Ask nothing and take the defaults: the saved or hostname node name, and installing the service (unless `--no-service`). It never makes a security choice for you: it needs `--trust`, browser terminals stay as saved (`off` unless set) unless you pass `--human-terminal on`, and a Replace code still needs `--replace`. |
+| `--json` | Print the result as JSON. |
 
-At most 4 browser terminals are open on one machine at a time. `wsmp config set-max-terminals <n>` (1 to 32; restart wsmp to apply) changes that; `wsmp config show` lists the value in effect as `maxTerminals`. The server has its own limits, per CLI and per user (`WMP_TERMINAL_CLI_LIMIT`, default 4, and `WMP_TERMINAL_USER_LIMIT`, default 8), and the lowest one applies: opening one more terminal than that reports "Terminal limit reached". Supervised commands and operator terminals do not count toward these limits; they have their own slots.
+**Node names** are 3 to 63 characters: lowercase letters, digits and single hyphens, starting
+and ending with a letter or digit. A few names are reserved because they collide with routes
+(`api`, `v1`, `admin`, `auth`, `login`, `logout`, `signup`, `settings`, `dashboard`, `health`,
+`model`, `models`, `cli`, `clis`, `endpoint`, `endpoints`, `pool`, `pools`, `token`, `tokens`).
+Names are unique per account; a name that is taken is refused (`slug_taken`).
 
-Several browser tabs can view one terminal at once (up to 8, counting tabs waiting for approval). The tab that typed most recently is the writer, and the terminal takes that tab's size; other tabs show the terminal at the writer's size until someone types in them. The CLI encrypts each output frame once under a shared output key, which it sends to each tab under that tab's own end-to-end key and replaces when a tab leaves. Input keys stay separate per tab. With `requireTerminalApproval`, every tab is approved on its own. Closing a tab only stops that tab viewing; "End session" on the terminals page ends the shell for everyone.
+**Replace codes** move an existing node to this computer: same node, same runtimes and traffic,
+new identity and credential (the old computer's credential stops working). Create one from the
+node's page. `wsmp login` shows which node it replaces and asks you to type `yes`; pass
+`--replace` to confirm non-interactively. If the replaced node was Relay only, this one starts
+Relay only as well.
 
-Typed or pasted input goes through a per-terminal queue of up to 256 KiB, so a program that stops reading its input never stalls the relay. When that queue is full, further input is dropped and the tab shows an "input dropped" notice.
+**Temporary nodes**: a code can mark the nodes it enrolls as temporary. The server deletes such
+a node after it has been offline for the code's window (one hour unless set), and `wsmp login`
+says so.
 
-Ending a terminal session (or the idle timeout, or stopping the daemon) kills every process in the shell's session, not only the shell's process group: background jobs, jobs in their own process groups, and `nohup` or disowned jobs all end with it. A process that calls `setsid()` itself (for example `setsid`, or a daemon that detaches) starts a new session and is not killed. Terminals are Unix-only.
+A plain code never takes over an existing node, even on the same computer: log in again with a
+new code and a new name, or use a Replace code.
 
-### Terminal identity
+Logging in over an earlier enrollment for another server, or over leftovers of wsmp 0.3, is a
+fresh enrollment: `--trust` (or your answer) applies and the old node name is not reused (you are
+asked for a name, or it comes from the hostname). A node you lowered to Relay only stays Relay
+only when you log in to the same server again; raise it with `wsmp trust full`. A Relay-only
+setting left by an earlier enrollment is kept too, unless this fresh enrollment explicitly chooses
+Full control (`--trust full`, or choosing it at the prompt): that clears it, and `wsmp login`
+says so. It is not cleared while a relay is running here; stop it first.
 
-Each CLI has a long-lived terminal identity key in `terminal-identity.json` in the state directory (mode 0600). The CLI creates it the first time the daemon starts or `wsmp terminal fingerprint` runs, and never replaces it; a damaged file is an error. The CLI signs its per-start terminal key and its CLI slug with this key. The browser checks that signature before any terminal handshake and pins the identity key for that CLI the first time it sees it.
+## Run the relay
 
-The terminals page shows each CLI's fingerprint: base32 of the first 20 bytes of SHA-256 of the identity public key, in groups of 4. `wsmp terminal fingerprint` prints the same value (`--json` adds the public key and file path). If the page reports that a CLI's identity key changed, compare the new fingerprint with this command on that machine before you choose "Trust new key". Deleting `terminal-identity.json` creates a new key, and every browser that pinned the old one will ask again.
+```sh
+wsmp service install     # install, enable and start the per-user service
+wsmp service status      # what the service manager reports
+wsmp service restart     # restart it (after `wsmp login`, or to apply a setting read at start)
+wsmp service logs        # its logs; -f to follow, -n <lines> (default 100)
+wsmp service uninstall   # stop, disable and remove it
+wsmp status              # whether the relay runs and is connected, plus its runtimes and instances
+wsmp hardware            # what this node detects (memory, GPUs, unified pool); --json
+wsmp run                 # run the relay in the foreground (what the service runs)
+wsmp logout              # forget this node's credential
+```
 
-### Background daemon and user services
+`wsmp hardware` shows what placement falls back to when no hardware is declared: NVIDIA GPUs
+(a GB10 with no dedicated VRAM makes the node unified), AMD GPUs from sysfs (an APU such as Strix
+Halo reports VRAM carve-out plus GTT as its pool), and Apple silicon (the GPU wired limit). Check
+it before declaring overrides on the node's page in the web app (or through MCP); hardware is
+never declared on the node itself.
 
-- `wsmp daemon start --detach` starts a session-detached relay that owns
-  `$WSMP_STATE_DIR/relay.pid` (with a pid + ownership token). Only that detached
-  process claims the PID file; foreground `wsmp connect` / `wsmp daemon start`
-  and OS services do not. `wsmp status` communicates with the live relay control
-  socket, so it also sees foreground and service-managed relays; it exits
-  non-zero when no live acknowledged relay is available. `stop` refuses to signal a PID that no longer looks
-  like this CLI's daemon (PID-reuse guard).
-- The live control socket is Unix-only: it is private to the state directory
-  and verifies the connecting process has the daemon's UID using OS peer
-  credentials. Windows does not expose this control plane yet. On Windows,
-  `wsmp reload --offline` is the explicit safe fallback: it probes and saves
-  local state, then reports `published: false`; run the relay on Unix and use
-  its live `wsmp reload` to publish. It requires an
-  authenticated named-pipe equivalent before it can be supported safely.
-- `wsmp service install` installs a **per-user** systemd unit (Linux) or
-  LaunchAgent (macOS). Re-running install rewrites the unit/plist and restarts.
-- **Device credentials** (`wsmp login`) live in the state directory and work
-  under services without extra setup. `wsmp service install` pins the config
-  file and state directory it resolved (`WSMP_CONFIG`, `WSMP_STATE_DIR`) into
-  the unit or wrapper, so the service reads the same `device-auth.json` as the
-  installing shell even when that shell set `WSMP_STATE_DIR` or
-  `XDG_STATE_HOME`. It also pins the installing shell's `PATH`, so commands
-  the relay starts find the same programs as that shell; only absolute,
-  existing directories that other users cannot write to are kept, each once. Re-run
-  `wsmp service install` after changing any of them.
-  `wsmp config show` prints `configFile` and `stateDir`, and `wsmp status`
-  prints the state directory in use.
-- **A rejected or missing credential.** The server answers the relay
-  handshake with 401 when the credential was revoked, replaced by a newer
-  `wsmp login`, is invalid, or is temporarily banned. "Missing" means the CLI
-  token variable is unset or empty, or no device credential is saved in an
-  existing state directory. What happens then depends on where the relay runs:
-  - **Linux systemd user service** (`wsmp service install`): the relay exits
-    with code 4, which the unit lists in `RestartPreventExitStatus=`, so the
-    service stays stopped instead of restarting every 5 seconds. This also
-    applies to a temporary ban: the relay stays down until you restart it. Run
-    `wsmp login` if needed, then `systemctl --user restart wsmp.service`.
-  - **Interactive terminal** (`wsmp connect` or `wsmp daemon start
-    --foreground` with stderr on a terminal): the relay exits with code 4 and
-    the message.
-  - **Everywhere else** (macOS LaunchAgent, whose `KeepAlive` would relaunch
-    any exit; a detached daemon; a unit installed by an older wsmp): the relay
-    logs the error and retries in-process with the normal backoff, capped at 5
-    minutes, and connects by itself once `wsmp login` has saved a credential.
+The service is a systemd user unit on Linux and a launchd agent on macOS. It needs no
+environment file: the node credential and node secrets (`wsmp secret`) are files the relay reads
+itself, and the unit pins only the config and state paths and the installing shell's `PATH`.
+`wsmp service logs` reads journald on Linux (`journalctl --user -u wsmp.service`; on a host whose
+journal is not persistent, user units may log only to the system journal, which needs
+`journalctl --user-unit wsmp.service` with journal read access) and tails
+`~/Library/Logs/ws-model-proxy/relay.*.log` on macOS. Upgrading from 0.3: run `wsmp service
+install` again so the unit stops loading `service.env`, then delete that file.
 
-  Anything else is always retried with backoff: network errors, 403 (which
-  comes from a proxy or firewall, not the WS Model Proxy server), 429, 5xx,
-  and a credential that cannot be read yet (an I/O or parse error, or a state
-  directory that does not exist, such as an encrypted home before it is
-  mounted).
-- **Logging in again.** `wsmp login` names its CLI slug in the approval
-  request, and the browser approval page shows it. Approving a slug you
-  already use replaces that device's login: the device keeps its name,
-  grants, pools, endpoints, and model ids; its previous device credential is
-  revoked and any relay still using it is disconnected (its reconnects are
-  refused with 401). If two logins for one slug are approved at about the same
-  time, the one approved last wins and the other CLI must log in again. If the
-  login moved to another machine, browser terminals ask you to trust the new
-  identity key.
-- **Deleting a device** in the dashboard deletes its device credentials,
-  revokes CLI tokens bound to it, and disconnects its relay. Run `wsmp login`
-  on that machine to add it again (as a new device).
-- **Device names.** The relay reports this machine's hostname. The dashboard
-  shows the name you give the device there, else that hostname, else the CLI
-  slug. The slug stays fixed because model ids use it.
-- **CLI tokens and endpoint header secrets** are env-var *names* in config, not
-  values. User services do not inherit your interactive shell, so export those
-  variables and run `wsmp service env-sync` to write them into the private
-  `service.env` file (mode `0600` under the config dir). Installers load that
-  file via systemd `EnvironmentFile=` or a macOS wrapper script — secrets are
-  never embedded in unit/plist files and never printed. `wsmp service env-path`
-  prints the file path.
-- Linux tip: `loginctl enable-linger "$USER"` keeps a user service running after
-  logout.
-- **Shutdown (Unix).** SIGTERM (`wsmp daemon stop`, `systemctl stop`), SIGINT
-  (Ctrl-C), and SIGHUP stop the relay cleanly in foreground, detached, and
-  service modes: it kills every running MCP exec command (its whole process
-  group) and every terminal (every process in the shell's session), tells the
-  server they ended, closes the websocket, and removes the control socket and
-  PID file. It then exits from the same signal (status 143, 130, or 129). A
-  signal the relay inherited as ignored, such as SIGHUP under `nohup`, stays
-  ignored. Cleanup gets 5 seconds; after that, or on a second signal, the relay
-  kills the tracked process groups and sessions directly, removes its files,
-  and exits at once.
-- **SIGKILL (`kill -9`) cannot be caught.** It is the one way to stop the relay
-  that leaves exec commands and terminal processes running, untracked. Prefer
-  SIGTERM; if a relay was killed with SIGKILL, find leftovers with
-  `ps -o pid,pgid,sid,args` and end them yourself.
-- **Shutdown (Windows).** Ctrl-C, Ctrl-Break, closing the console window, and
-  a system shutdown start the same cleanup: running MCP exec commands are
-  ended, the server hears they finished, and the websocket closes. Cleanup
-  gets 5 seconds (Windows itself may end the process sooner after a console
-  close); after that, or on a second Ctrl-C, the relay kills the tracked
-  commands with their child processes and exits at once. The exit status is
-  130 for Ctrl-C, 149 for Ctrl-Break, and 143 otherwise.
+**Linux: enable lingering.** A user service stops when you log out, and runtimes are started as
+transient user units, which need a user manager that outlives your sessions. Enable it once:
 
-### Media expansion for local upstreams
+```sh
+loginctl enable-linger $USER
+```
 
-The relay normally forwards request bodies untouched, so a signed
-`{server}/media/{id}` URL in a chat request is fetched by the upstream model
-server. Many local OpenAI-compatible servers (llama.cpp, LM Studio, some vLLM
-builds) cannot fetch remote URLs and only accept base64 `data:` URLs.
+Without linger the node refuses to start runtimes (the server shows why); relaying to always-on
+runtimes still works.
 
-Opt in per endpoint with `expandMedia` (config key) or `--expand-media` on
-`endpoints add`. When enabled, the relay buffers chat-shaped JSON request bodies
-(`Content-Type: application/json`), walks `image_url` / `video_url` /
-`input_audio` content parts, fetches each media URL, and inlines it as a
-`data:{mime};base64,…` URL before forwarding upstream. Still-image `image_url`
-parts are normalized to JPEG/PNG when inlined (WebP/GIF and other non-safe
-formats are re-encoded to JPEG) so local vision servers that reject WebP still
-work. Video/audio keep their stored mime. Non-JSON bodies and body-less
-requests always take the untouched streaming path.
+## Trust
 
-Multipart `/v1/audio/transcriptions` and `/v1/audio/translations` requests are
-also relayed to the selected OpenAI-compatible upstream. These dedicated ASR
-operations are independent of chat `input_audio`; capability metadata should
-describe each separately. Advanced transcription behavior (streaming,
-timestamps, diarization, languages, formats, and accepted MIME types) belongs
-to the upstream and is forwarded without transcript normalization.
+Each node gives the server one of two levels. You choose at login and can change it any time.
 
-Each upstream request has three backend-neutral timeout layers: a 10-second
-connection timeout, a 30-second response-body idle timeout (reset after every
-received chunk), and the operation timeout sent by the WMP server. Pool retries
-share one server-side operation deadline; adding members does not multiply it.
+- **Full control** (default): the server may define and start runtimes, run commands, read and
+  write files in your home directory or the folders you allow (`wsmp config set-file-roots`;
+  wsmp's own files stay off limits), open terminals, and
+  set node secrets.
+- **Relay only**: the server may only send requests to runtimes here and start or stop the
+  runtimes this node already holds. Definitions are frozen at the moment you lower trust; nothing
+  new can be defined, run or read. Lowering also stops node commands that are running.
 
-### Reasoning capability metadata
+```sh
+wsmp trust          # show the current level
+wsmp trust relay    # lower: works from anywhere, takes effect at once
+wsmp trust full     # raise: needs you at this node's terminal
+```
 
-Capability inventories at version 3 or 4 may declare `reasoningConfig` on a
-surface when its native reasoning ladder and encoding are known. Omit it when
-they are unknown; `reasoning: true` remains the routing gate. Upgrade the WMP
-server before publishing this optional field, because older servers reject it
-as an unknown capability property.
+`wsmp trust full` asks you to type `full`, takes no `--yes` flag and no environment override, and
+refuses to run from any process the relay started (its commands, jobs, runtimes and terminals).
+It counts as started by wsmp when it or an ancestor carries `WSMP_JOB`, runs in one of wsmp's
+cgroups (`wsmp.service`, `wsmp-*` units, `wsmp_i_*` runtime slices, `systemd-run` transient
+units), descends from a running relay, runs as a service of your systemd user manager
+(`systemd-run --user --unit=…`), or cannot be traced back to your systemd user manager or a login
+session (so cron, at and system services such as cloud-init are refused). A shell in a terminal,
+tmux or an SSH session passes; a terminal that a user service runs (some compositors, editors)
+does not, so use another terminal or SSH. `wsmp login` refuses only on `WSMP_JOB`, so it works
+from provisioning, but clearing an earlier Relay-only setting takes this check, and from a process
+that fails it login skips installing the service and turning browser terminals on (it says which
+step it skipped; run `wsmp service install` or `wsmp config set-human-terminal on` on a terminal).
 
-### Stream usage opt-out
+The same refusal covers every command that changes wsmp itself: `wsmp login`, `wsmp secret
+set|remove`, the `wsmp config` setters (`init`, `set-…`, `clear-file-roots`), `wsmp service
+install|uninstall|restart`, `wsmp logout`, `wsmp terminal approve` and `wsmp recover --apply`.
+`wsmp run` checks only `WSMP_JOB`, since the relay's own service starts it. Reading (`wsmp config
+show|path`, `wsmp service status|logs`, `wsmp runtime list|test`, listings) and lowering (`wsmp trust relay`, `wsmp
+terminal approvals revoke`) work from anywhere.
 
-A version 3 or 4 `openaiChatCompletions` surface may declare `streamUsage: false`
-when the endpoint rejects `stream_options.include_usage`; adapted streaming
-requests then omit it, and settlement keeps the conservative liability because
-no stream usage is reported. Absent means `true`. The CLI rejects `streamUsage`
-on any other surface. Upgrade the WMP server first: older servers reject the
-field as an unknown capability property.
+This is a **best-effort guard against agents** raising or widening their own access through the
+server: dropping `WSMP_JOB`, `systemd-run --user` or a crontab does not get past it. It is **not a
+security boundary against other code running as your user**: such code can move itself into a
+cgroup named like a terminal's, ask your tmux to run a command, `ssh` back in to this node, or
+simply edit your files, including this CLI's configuration. On Linux the relay adopts what its
+commands leave behind (a `setsid` or double-forked process re-parents to it, not to init; if it
+cannot, it logs an error at startup), so that stays refused while the relay runs. That includes a
+daemon a command or browser terminal started, such as a tmux server, and everything it starts later:
+a new pane of that tmux cannot raise trust. Prefer the service (`wsmp service install`): when a relay you
+started by hand stops, those processes re-parent away from it and are no longer caught, while the
+service's cgroup still holds them. On macOS only the relay's descendants are refused (the `ps` parent
+walk), so a detached process escapes. If you do not trust the code on this account, Relay only does
+not make it safe.
 
-Only URLs whose origin matches the connected WMP server (derived from
-`serverUrl`) and whose path is `/media/{id}` are fetched — arbitrary URLs from
-request bodies are never followed (SSRF guard). Add extra trusted origins with
-the `mediaTrustedOrigins` config array. The media fetcher follows no redirects,
-so a trusted origin cannot 30x-redirect the relay to an arbitrary internal URL
-after the origin check. Each individual asset fetch is capped at 64 MiB, and the
-buffered body (with its base64-inflated result) is capped at 256 MiB overall;
-over-cap or failed fetches return an OpenAI-shaped relay error naming the media
-path (never the URL signature).
+Lowering only stops new agent access through wsmp. It does not undo or contain software an agent
+already left on the node while it had Full control, such as a systemd user service: that software
+runs as the same user and can even raise trust again locally. If you distrust what an agent did,
+reinstall the node.
 
-### Exit Codes
+## Secrets
+
+Runtimes often need tokens. Node secrets are named `WSMP_SECRET_` followed by
+1 to 64 of `A-Z`, `0-9` and `_`. Values stay on this node; the server only ever sees names.
+
+```sh
+wsmp secret set WSMP_SECRET_HF_TOKEN   # the value is typed at a hidden prompt
+wsmp secret list                       # names and when they were set, never values
+wsmp secret remove WSMP_SECRET_HF_TOKEN
+```
+
+`wsmp secret` works at either trust level (it is how a Relay-only node gets secrets) and, like
+`wsmp trust full`, only from a person's terminal. At Full control the server can also set them.
+A runtime names the secrets its commands receive in `launch.secrets`; an always-on runtime's
+address can use one for its auth header.
+
+## Commands and runtimes
+
+The server asks a node to do two different kinds of work:
+
+- **Runtimes** are definitions the server stores and versions: an always-on inference server
+  already running here, or a startable one (or a service) with start, readiness and health
+  commands, and a stop command where it needs one (a `process` runtime may leave it out: the
+  node's stop ends everything in that part's systemd slice and proves it). The server sends the
+  definitions to the node, then starts and stops instances by
+  version; the node renders each command from the definition it holds, so a start never runs
+  text it was not given in a definition. At Relay only, the held definitions are frozen and can
+  still be started and stopped.
+- **Commands** are one-off shell commands a person or an agent runs here through the server
+  (inspect a GPU, pull a model). They need Full control, run as your user, are recorded in the
+  node's activity, and stop when trust is lowered. An agent can also queue a command for you
+  (one that needs a password, for example); it runs only when you choose Run on the Terminals
+  page.
+
+To see what this node holds and runs, read from its own files (the frozen copy at Relay only;
+both commands are read only and work at either trust level):
+
+```sh
+wsmp runtime list              # runtimes, and instances with phase, ports, units and stop proof
+wsmp runtime test <target>     # one small request: status and latency
+```
+
+`wsmp runtime test` takes a runtime slug, an instance handle (`i-...`) or an instance id. It asks
+a running instance's readiness route (else its model list, or a TCP connect for a service without
+readiness) and an always-on runtime's model list, and exits non-zero when the answer is not the
+expected one (3 when nothing matches). The stop proof `wsmp runtime list` shows for a stopping or
+stopped part of an instance is the one the inventory reports: `proven`, or why not (`port_in_use`,
+`process_alive`, `port_held_outside_runtime`, `status_unknown`, ...). `port_held_outside_runtime`
+means the port is held while nothing is left in the rank's units, usually because what holds it
+escaped them (containers from `docker compose up -d`, a daemon that re-parents). For a `service`
+runtime the inventory runs no status command and checks no unit first, so it names a held port
+`port_in_use`. To check the ports it binds each one for an instant, as
+the relay does; it writes nothing and runs no definition command. Runtimes are defined in the web app or through MCP.
+
+## Other commands
+
+| Command | What it does |
+| ------- | ------------ |
+| `wsmp config path\|init\|show` | Where the config lives, create it, print it. |
+| `wsmp config set-server <url> [--public-origin <origin>]` | Point at another server address (restart to apply). |
+| `wsmp config set-slug <name>` | Change the saved node name. |
+| `wsmp config set-file-roots <dir>...` / `clear-file-roots` | Folders the file tools may use (default: your home directory). |
+| `wsmp config set-file-tools on\|off` | Turn the node file tools on or off (on by default). |
+| `wsmp config set-runtime-hosts [host...]` | Extra hosts an always-on runtime may use besides loopback. |
+| `wsmp config set-human-terminal on\|off` | Allow browser terminals (the same setting `wsmp login` asks about). |
+| `wsmp config set-terminal-approval on\|off` | Require approval before a browser opens a terminal. |
+| `wsmp config set-max-terminals <1-32>` | Cap browser terminals open at once. |
+| `wsmp config set-file-tools-as-root on\|off` | Allow the file tools when wsmp runs as root. |
+| `wsmp terminal fingerprint` | This node's terminal identity, as browsers show it. |
+| `wsmp terminal approve <code>` / `approvals list\|revoke` | Manage approved browser identities. |
+| `wsmp recover [--apply] [--scan]` | List or finish interrupted file writes ([guide](docs/file-recovery.md)). |
+| `wsmp completions <shell>` | Shell completion scripts. |
+
+Commands that print data take `--json` (`wsmp service` does not). Logs go to stderr (`-v`, `-vv`, `-q`,
+`--log-format json`).
+
+## Exit Codes
 
 | Code | Meaning |
 | ---- | ------- |
@@ -394,40 +282,9 @@ path (never the URL signature).
 | 1 | runtime error |
 | 2 | usage error |
 | 3 | not found |
-| 4 | the relay has no usable credential (none saved, or the server rejected it with HTTP 401); run `wsmp login`. Only under the systemd unit and in an interactive terminal; elsewhere the relay retries instead. The systemd unit does not restart on this code. |
+| 4 | the relay has no usable credential (none saved, rejected with HTTP 401, or refused at hello as revoked or enrolled with another identity); run `wsmp login`. Only under the systemd unit and in an interactive terminal; elsewhere the relay retries instead. The systemd unit does not restart on this code. |
+| 5 | the server refused this wsmp's relay protocol (HTTP 426 or an `upgrade_cli`/`upgrade_server` refusal at hello). Re-run the server's `install.sh` to install the matching wsmp (or upgrade the server), then restart wsmp. Only under a systemd unit written by this version's `wsmp service install` (it does not restart on this code) and in an interactive terminal; elsewhere, including an older unit, the relay logs it and retries every 5 minutes (re-run `wsmp service install` to update an older unit). |
 | 128 + signal | the relay stopped on SIGHUP (129), SIGINT (130), or SIGTERM (143); on Unix it dies from that signal after cleanup |
-
-## Install After Release
-
-These commands work after the first public GitHub release.
-
-> **This server needs wsmp 0.4.0 or newer** (relay protocol 2.4). Until 0.4.0 is released, `releases/latest` and Homebrew still serve 0.3.x, which the server refuses at connect (`This server requires wsmp 0.4.0 or newer`). Until then, build the CLI from this repository: `cargo install --path apps/cli --bin wsmp`.
-
-**Shell:**
-
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/FlyCockpit/ws-model-proxy/releases/latest/download/wsmp-installer.sh | sh
-```
-
-**PowerShell:**
-
-```powershell
-irm https://github.com/FlyCockpit/ws-model-proxy/releases/latest/download/wsmp-installer.ps1 | iex
-```
-
-**Homebrew:**
-
-```sh
-brew install flycockpit/tap/wsmp
-```
-
-**From source:**
-
-```sh
-git clone https://github.com/FlyCockpit/ws-model-proxy
-cd ws-model-proxy
-cargo install --path apps/cli --bin wsmp
-```
 
 ## Development
 
@@ -436,7 +293,6 @@ cargo build
 cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt
-cargo run -- config path
 ```
 
 Before considering a change done, run the full local gate:
@@ -449,43 +305,21 @@ cargo test --workspace --doc --locked
 cargo xtask sync-docs --check
 ```
 
-See [AGENTS.md](AGENTS.md) for repository conventions and [CONTRIBUTING.md](CONTRIBUTING.md) for the PR checklist.
+The relay protocol is shared with the server through the fixtures in
+`tests/fixtures/relay-3.0`; the contract is described in `docs/contracts/0.4.0.md` at the
+repository root. See [AGENTS.md](AGENTS.md) for conventions and [CONTRIBUTING.md](CONTRIBUTING.md)
+for the PR checklist.
 
 ## Guides
 
 - [Error handling](docs/error-handling.md)
+- [File recovery](docs/file-recovery.md)
 - [Releasing](docs/releasing.md)
-
-## Project Layout
-
-```text
-src/
-  lib.rs         shared implementation modules
-  main.rs        entry: parse -> log -> dispatch -> exit code
-  cli.rs         clap argument definitions
-  commands/      one file per subcommand
-  config.rs      TOML config load/save
-  state.rs       local auth and relay state
-  daemon.rs      websocket relay session
-  probe.rs       endpoint/model probing
-  paths.rs       cross-platform config/data dirs
-  logging.rs     tracing setup; logs go to stderr
-  exit.rs        stable exit codes
-tests/cli.rs     black-box CLI tests
-xtask/           project automation: sync-docs
-docs/            error handling and release notes
-tap/             notes for publishing a Homebrew tap
-```
 
 ## Agent Docs
 
-`AGENTS.md` is the source of truth for CLI contributor and agent instructions. `CLAUDE.md` and `.cursorrules` are generated mirrors. Edit `AGENTS.md`, then run:
-
-```sh
-cargo xtask sync-docs
-```
-
-Do not hand-edit generated mirrors. Release orchestration lives in the root `.github/workflows/release.yml`.
+`AGENTS.md` is the source of truth for CLI contributor and agent instructions. `CLAUDE.md` and
+`.cursorrules` are generated mirrors. Edit `AGENTS.md`, then run `cargo xtask sync-docs`.
 
 ## License
 

@@ -1,0 +1,6 @@
+{
+  "type": "context.count.result",
+  "requestId": "req-3",
+  "tokens": 1234,
+  "method": "vllm_tokenize"
+}

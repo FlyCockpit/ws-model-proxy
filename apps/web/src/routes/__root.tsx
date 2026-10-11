@@ -27,11 +27,14 @@ import { ThemeColorSync } from "@/components/theme-color-sync";
 import { ThemeProvider } from "@/components/theme-provider";
 import { useAppUpdate } from "@/hooks/use-app-update";
 import { useDocumentLang } from "@/hooks/use-document-lang";
+import { useHashTargetScroll } from "@/hooks/use-hash-target-scroll";
 import { useMobileKeyboard } from "@/hooks/use-mobile-keyboard";
+import { useStaleBuildRecovery } from "@/hooks/use-stale-build-recovery";
 import { useUserLocaleSync } from "@/hooks/use-user-locale-sync";
 import i18n from "@/i18n";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
 import { I18nReady } from "@/i18n/I18nReady";
+import { MAIN_SCROLLER_ID } from "@/lib/main-scroller";
 import { orpc } from "@/utils/orpc";
 
 import "../index.css";
@@ -135,7 +138,9 @@ function RootShell({ children }: { children: ReactNode }) {
 
 function RootComponent() {
   useAppUpdate();
+  useStaleBuildRecovery();
   useDocumentLang();
+  useHashTargetScroll();
   useUserLocaleSync();
   const mobileKeyboardOpen = useMobileKeyboard();
 
@@ -161,8 +166,16 @@ function RootComponent() {
             }}
           >
             <Header />
-            {/* [container-type:size] lets the sidebar use 100cqh; fixed descendants must be portaled. */}
-            <main className="min-h-0 min-w-0 overflow-y-auto overflow-x-clip [container-type:size]">
+            {/* The only page scroller. [container-type:size] lets the sidebar use 100cqh; fixed
+                descendants must be portaled. `relative` makes main the containing block of
+                absolutely positioned page content (sr-only labels and live regions), so it scrolls
+                and clips with the page instead of extending the document below the viewport. The
+                router saves and restores its scroll per history entry under this id and resets it
+                to the top on new navigations (router.tsx `scrollToTopSelectors`). */}
+            <main
+              data-scroll-restoration-id={MAIN_SCROLLER_ID}
+              className="relative min-h-0 min-w-0 overflow-y-auto overflow-x-clip [container-type:size]"
+            >
               <Outlet />
             </main>
             <BottomNav hidden={mobileKeyboardOpen} />

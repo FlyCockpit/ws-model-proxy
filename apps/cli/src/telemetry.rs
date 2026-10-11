@@ -1,4 +1,4 @@
-//! Relay 2.7 telemetry: `node.info`, `node.metrics` and `endpoint.load`.
+//! Relay 3.0 telemetry: `node.info`, `node.metrics` and `runtime.load`.
 //!
 //! One sampling thread per relay session collects everything. The relay loop
 //! is a single blocking thread, so nothing here runs on it: the sampler hands
@@ -10,9 +10,14 @@
 //! Linux reads `/proc`, `/sys/class/net` and `statvfs`; other platforms send
 //! what they can (architecture, CPU count, CLI version).
 //!
-//! Custom metric sources ([`crate::metric_sources`]) run on their own
+//! Node metric commands ([`crate::metric_sources`]) run on their own
 //! short-lived threads; this thread only schedules them and reports their
 //! latest values in `node.metrics.custom`.
+//!
+//! `runtime.load` is keyed by the runtime handle. Until the runtime store
+//! lands (C2), the sampled targets are the configured endpoints, whose slug
+//! stands in for the handle; only built-in engine scrapes run (`source:
+//! builtin`); route and command readers come with the metrics reader (C4).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,26 +30,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::config::EndpointConfig;
-use crate::engine::LoadReading;
-use crate::engine_adapter::{
-    EngineAdapterStatus, LoadPlan, RemoteAdapterEligibility, remote_adapter_eligibility,
-    status_for_eligibility,
+use crate::engine::{EngineKind, LoadReading};
+use crate::metric_sources::Runner;
+use crate::protocol::frames::{
+    ExecutionMechanism, LoadSource, NodeCpu, NodeCpuMetrics, NodeDiskMetrics, NodeGpuMetrics,
+    NodeInfo, NodeInterfaceInfo, NodeInterfaceMetrics, NodeMemoryMetrics, NodeMetrics, NodeOs,
+    RuntimeLoad,
 };
-use crate::metric_sources::{Runner, RunnerSettings};
-use crate::protocol::{
-    ClientControlMessage, EndpointLoad, ExecutionMechanism, NODE_ENGINE_ADAPTERS_MAX, NODE_GPU_MAX,
-    NODE_INTERFACE_MAX, NODE_METRICS_SOURCES_MAX, NodeCpu, NodeCpuMetrics, NodeDiskMetrics,
-    NodeGpuInfo, NodeGpuMetrics, NodeInfo, NodeInterfaceInfo, NodeInterfaceMetrics, NodeKind,
-    NodeMemoryMetrics, NodeMetrics, NodeOs, RemoteEngineAdapter, RemoteMetricSource,
-    encode_control,
-};
+use crate::protocol::runtime_spec::NodeMetricCommand;
+use crate::protocol::{NODE_GPU_MAX, NODE_INTERFACE_MAX, NodeFrame, encode_control};
 use crate::relay_bus::FromWorker;
 
 /// Built-in `node.metrics` cadence (the protocol allows 20–30 s).
 pub const NODE_METRICS_INTERVAL: Duration = Duration::from_secs(20);
 /// The server drops `node.metrics` frames closer together than this.
 pub const NODE_METRICS_MIN_GAP: Duration = Duration::from_secs(5);
-/// `endpoint.load` sampling cadence.
+/// `runtime.load` sampling cadence.
 pub const LOAD_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 /// An unchanged load is re-sent this often so the server's copy stays fresh.
 pub const LOAD_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -55,9 +56,6 @@ const STOP_POLL: Duration = Duration::from_millis(200);
 /// bounded by the engine request timeouts (llama.cpp: two requests).
 const LOAD_SCRAPE_CONCURRENCY: usize = 16;
 const TEXT_FIELD_MAX: usize = 256;
-/// A metric source's interval bounds (`intervalSecs` on both wire directions).
-pub const METRIC_SOURCE_INTERVAL_MIN_SECS: u32 = 5;
-pub const METRIC_SOURCE_INTERVAL_MAX_SECS: u32 = 86_400;
 
 /// Handle owned by one relay session. Dropping it stops the thread; the relay
 /// loop never joins it (a scrape may still be finishing).
@@ -71,46 +69,30 @@ struct Shared {
     endpoints: Vec<EndpointConfig>,
     /// Bumped whenever `endpoints` changes, so the load scheduler resyncs.
     endpoints_generation: u64,
-    /// A `metrics.sources.set` list the thread has not applied yet.
-    remote_sources: Option<Vec<RemoteMetricSource>>,
-    /// Applied remote engine adapters for this session.
-    remote_adapters: Vec<RemoteEngineAdapter>,
-    allow_remote_engine_adapters: bool,
-    approved_remote_adapters: BTreeMap<String, String>,
-    /// Latest adapter statuses, keyed by endpoint slug. No command text.
-    adapter_statuses: BTreeMap<String, EngineAdapterStatus>,
+    /// Node metric commands the thread has not applied yet.
+    metric_commands: Option<Vec<NodeMetricCommand>>,
 }
 
 impl Telemetry {
     /// Start sampling after `hello.ok`. `node.info` is the first frame.
-    pub(crate) fn start(
-        tx: SyncSender<FromWorker>,
-        endpoints: &[EndpointConfig],
-        sources: RunnerSettings,
-        allow_remote_engine_adapters: bool,
-    ) -> Self {
+    pub(crate) fn start(tx: SyncSender<FromWorker>, endpoints: &[EndpointConfig]) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let approved_remote_adapters = crate::config::Config::load()
-            .map(|config| config.approved_remote_adapters)
-            .unwrap_or_default();
         let shared = Arc::new(Mutex::new(Shared {
             endpoints: endpoints.to_vec(),
-            allow_remote_engine_adapters,
-            approved_remote_adapters,
             ..Shared::default()
         }));
         let thread_stop = Arc::clone(&stop);
         let thread_shared = Arc::clone(&shared);
         let spawned = thread::Builder::new()
             .name("wsmp-telemetry".to_string())
-            .spawn(move || run(tx, thread_stop, thread_shared, sources));
+            .spawn(move || run(tx, thread_stop, thread_shared));
         if let Err(error) = spawned {
             tracing::warn!(error = %error, "starting the telemetry thread failed; node metrics are off");
         }
         Self { stop, shared }
     }
 
-    /// Replace the endpoints whose load is sampled (after an acknowledged reload).
+    /// Replace the targets whose load is sampled.
     pub fn set_endpoints(&self, endpoints: &[EndpointConfig]) {
         if let Ok(mut shared) = self.shared.lock()
             && shared.endpoints != endpoints
@@ -120,25 +102,10 @@ impl Telemetry {
         }
     }
 
-    /// `metrics.sources.set`: replace the remote definitions. They run only
-    /// with the local opt-in and an approval of each exact command. More than
-    /// [`NODE_METRICS_SOURCES_MAX`] entries are dropped so a hostile or buggy
-    /// server cannot grow the status list past the server's own schema bound.
-    pub fn set_remote_sources(&self, sources: Vec<RemoteMetricSource>) {
+    /// Replace the node metric commands (from the node definition).
+    pub fn set_metric_commands(&self, commands: Vec<NodeMetricCommand>) {
         if let Ok(mut shared) = self.shared.lock() {
-            shared.remote_sources = Some(bounded_remote_sources(&sources));
-        }
-    }
-
-    /// `engine.adapters.set`: replace the remote definitions. They run only
-    /// with the separate local opt-in and an approval of each canonical spec.
-    pub fn set_remote_adapters(&self, adapters: Vec<RemoteEngineAdapter>) {
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.remote_adapters = adapters
-                .into_iter()
-                .take(NODE_ENGINE_ADAPTERS_MAX)
-                .collect();
-            shared.endpoints_generation = shared.endpoints_generation.wrapping_add(1);
+            shared.metric_commands = Some(commands);
         }
     }
 }
@@ -162,7 +129,7 @@ enum Sent {
 /// Hand one frame to the relay loop without waiting. Every telemetry frame
 /// passes [`crate::telemetry_bounds::conform`] here, so nothing the sampler
 /// read can fall outside the server's strict schema.
-fn offer(tx: &SyncSender<FromWorker>, mut message: ClientControlMessage) -> Sent {
+fn offer(tx: &SyncSender<FromWorker>, mut message: NodeFrame) -> Sent {
     let Some(text) = encode_telemetry(&mut message) else {
         return Sent::Dropped;
     };
@@ -177,8 +144,23 @@ fn offer(tx: &SyncSender<FromWorker>, mut message: ClientControlMessage) -> Sent
 }
 
 /// Conform and encode one telemetry frame; `None` (logged) if it cannot be.
-pub fn encode_telemetry(message: &mut ClientControlMessage) -> Option<String> {
+pub fn encode_telemetry(message: &mut NodeFrame) -> Option<String> {
     crate::telemetry_bounds::conform(message);
+    // `node.metrics` stays within the chunk budget: drop custom values, last
+    // command first, until it fits.
+    if let NodeFrame::NodeMetrics(metrics) = message {
+        while serde_json::to_vec(&NodeFrame::NodeMetrics(metrics.clone()))
+            .map_or(usize::MAX, |bytes| bytes.len())
+            > crate::protocol::frames::CHUNK_BUDGET_BYTES
+        {
+            match metrics.custom.as_mut() {
+                Some(custom) if !custom.is_empty() => {
+                    custom.pop();
+                }
+                _ => break,
+            }
+        }
+    }
     match encode_control(message) {
         Ok(text) => Some(text),
         Err(error) => {
@@ -188,16 +170,11 @@ pub fn encode_telemetry(message: &mut ClientControlMessage) -> Option<String> {
     }
 }
 
-fn run(
-    tx: SyncSender<FromWorker>,
-    stop: Arc<AtomicBool>,
-    shared: Arc<Mutex<Shared>>,
-    sources: RunnerSettings,
-) {
-    let mut runner = Runner::new(sources);
+fn run(tx: SyncSender<FromWorker>, stop: Arc<AtomicBool>, shared: Arc<Mutex<Shared>>) {
+    let mut runner = Runner::new();
     let mut gpu = GpuQuery::default();
     let info = collect_node_info(&mut gpu);
-    if offer(&tx, ClientControlMessage::NodeInfo(info)) == Sent::Gone {
+    if offer(&tx, NodeFrame::NodeInfo(info)) == Sent::Gone {
         return;
     }
     // Endpoint load has its own scheduler thread: a slow scrape never delays
@@ -209,12 +186,12 @@ fn run(
         .name("wsmp-load".to_string())
         .spawn(move || {
             let agent = crate::engine::http_agent(crate::engine::LOAD_TIMEOUT);
-            run_loads(&load_tx, &load_stop, &load_shared, move |endpoint, plan| {
-                sample_plan(&agent, endpoint, plan)
+            run_loads(&load_tx, &load_stop, &load_shared, move |endpoint, kind| {
+                crate::engine::sample_load(&agent, endpoint, *kind)
             });
         });
     if let Err(error) = spawned {
-        tracing::warn!(error = %error, "starting the load sampler failed; endpoint load is off");
+        tracing::warn!(error = %error, "starting the load sampler failed; runtime load is off");
     }
     let mut cpu = CpuSampler::default();
     // Prime the CPU counters so the first metrics frame has a usage figure.
@@ -224,27 +201,22 @@ fn run(
     let mut next_metrics = Instant::now() + Duration::from_secs(2);
     while !stop.load(Ordering::SeqCst) {
         let now = Instant::now();
-        if let Some(remote) = shared
+        if let Some(commands) = shared
             .lock()
             .ok()
-            .and_then(|mut shared| shared.remote_sources.take())
+            .and_then(|mut shared| shared.metric_commands.take())
         {
-            runner.set_remote(remote);
+            runner.set_commands(&commands);
         }
         runner.tick(now);
-        // A finished source run or a changed source state goes out as soon
+        // A finished command run or a changed command state goes out as soon
         // as the minimum gap allows.
         sources_changed |= runner.take_changed();
         let gap_ok = last_metrics.is_none_or(|at| now.duration_since(at) >= NODE_METRICS_MIN_GAP);
         if gap_ok && (now >= next_metrics || sources_changed) {
             sources_changed = false;
-            let adapter_statuses = shared
-                .lock()
-                .ok()
-                .map(|shared| shared.adapter_statuses.values().cloned().collect())
-                .unwrap_or_default();
-            let metrics = collect_node_metrics(&mut cpu, &mut gpu, &runner, adapter_statuses);
-            if offer(&tx, ClientControlMessage::NodeMetrics(metrics)) == Sent::Gone {
+            let metrics = collect_node_metrics(&mut cpu, &mut gpu, &runner);
+            if offer(&tx, NodeFrame::NodeMetrics(metrics)) == Sent::Gone {
                 return;
             }
             last_metrics = Some(Instant::now());
@@ -409,142 +381,18 @@ impl LoadState {
     }
 }
 
-/// One scrape result: a load reading and, for adapters, a status row.
-pub struct LoadSample {
-    pub reading: Option<LoadReading>,
-    pub adapter_status: Option<EngineAdapterStatus>,
-}
-
-impl From<Option<LoadReading>> for LoadSample {
-    fn from(reading: Option<LoadReading>) -> Self {
-        Self {
-            reading,
-            adapter_status: None,
-        }
-    }
-}
-
-fn sample_plan(agent: &ureq::Agent, endpoint: &EndpointConfig, plan: &LoadPlan) -> LoadSample {
-    match plan {
-        LoadPlan::BuiltIn(kind) => crate::engine::sample_load(agent, endpoint, *kind).into(),
-        LoadPlan::Adapter(spec) => {
-            let result = crate::engine_adapter::sample(endpoint, spec, None);
-            let adapter_status = Some(crate::engine_adapter::status_for(
-                &endpoint.slug,
-                spec,
-                result.as_ref().map_err(|error| *error),
-            ));
-            LoadSample {
-                reading: result.ok().and_then(|sample| sample.reading),
-                adapter_status,
-            }
-        }
-    }
-}
-
-/// Endpoints with a scrapeable engine or a custom adapter.
-pub fn load_targets(endpoints: &[EndpointConfig]) -> Vec<(EndpointConfig, LoadPlan)> {
-    load_targets_with_remote(endpoints, &[], false, &BTreeMap::new()).0
-}
-
-pub fn load_targets_with_remote(
-    endpoints: &[EndpointConfig],
-    remote: &[RemoteEngineAdapter],
-    allow_remote: bool,
-    approved: &BTreeMap<String, String>,
-) -> (Vec<(EndpointConfig, LoadPlan)>, Vec<EngineAdapterStatus>) {
-    let mut targets = Vec::new();
-    let mut statuses = Vec::new();
-    let mut handled = std::collections::BTreeSet::new();
-    for endpoint in endpoints.iter().filter(|endpoint| endpoint.enabled) {
-        if let Some(spec) = endpoint.engine_adapter.clone() {
-            handled.insert(endpoint.slug.as_str());
-            if spec.validate().is_err() {
-                continue;
-            }
-            warn_adapter_replaces_builtin(endpoint);
-            targets.push((endpoint.clone(), LoadPlan::Adapter(spec)));
-            continue;
-        }
-        if let Some(adapter) = remote
-            .iter()
-            .find(|adapter| adapter.endpoint_slug == endpoint.slug)
-        {
-            handled.insert(adapter.endpoint_slug.as_str());
-            let spec = adapter.to_config();
-            let eligibility = remote_adapter_eligibility(
-                &spec,
-                &adapter.endpoint_slug,
-                allow_remote,
-                false,
-                approved.get(&adapter.endpoint_slug).map(String::as_str),
-            );
-            if eligibility == RemoteAdapterEligibility::Run {
-                warn_adapter_replaces_builtin(endpoint);
-                targets.push((endpoint.clone(), LoadPlan::Adapter(spec)));
-                continue;
-            }
-            statuses.push(status_for_eligibility(
-                &adapter.endpoint_slug,
-                &spec,
-                eligibility,
-            ));
-        }
-        if let Some(kind) = crate::engine::effective_kind(endpoint)
-            .map(|(kind, _)| kind)
-            .filter(|kind| kind.has_load_source())
-        {
-            targets.push((endpoint.clone(), LoadPlan::BuiltIn(kind)));
-        }
-    }
-    for adapter in remote {
-        if !handled.insert(adapter.endpoint_slug.as_str()) {
-            continue;
-        }
-        let spec = adapter.to_config();
-        let local = endpoints
-            .iter()
-            .find(|endpoint| endpoint.slug == adapter.endpoint_slug);
-        if local.is_some_and(|endpoint| endpoint.engine_adapter.is_some()) {
-            continue;
-        }
-        statuses.push(status_for_eligibility(
-            &adapter.endpoint_slug,
-            &spec,
-            if local.is_some_and(|endpoint| endpoint.enabled) {
-                remote_adapter_eligibility(
-                    &spec,
-                    &adapter.endpoint_slug,
-                    allow_remote,
-                    false,
-                    approved.get(&adapter.endpoint_slug).map(String::as_str),
-                )
-            } else {
-                RemoteAdapterEligibility::Refused
-            },
-        ));
-    }
-    (targets, statuses)
-}
-
-fn warn_adapter_replaces_builtin(endpoint: &EndpointConfig) {
-    use std::sync::Mutex;
-    static WARNED: Mutex<BTreeMap<String, ()>> = Mutex::new(BTreeMap::new());
-    let Some((kind, _)) = crate::engine::effective_kind(endpoint) else {
-        return;
-    };
-    if !kind.has_load_source() {
-        return;
-    }
-    if let Ok(mut warned) = WARNED.lock()
-        && warned.insert(endpoint.slug.clone(), ()).is_none()
-    {
-        tracing::warn!(
-            slug = %endpoint.slug,
-            engine = ?kind,
-            "engine adapter replaces the built-in load scrape for this endpoint"
-        );
-    }
+/// Configured endpoints with a scrapeable (declared or detected) engine.
+pub fn load_targets(endpoints: &[EndpointConfig]) -> Vec<(EndpointConfig, EngineKind)> {
+    endpoints
+        .iter()
+        .filter(|endpoint| endpoint.enabled)
+        .filter_map(|endpoint| {
+            crate::engine::effective_kind(endpoint)
+                .map(|(kind, _)| kind)
+                .filter(|kind| kind.has_load_source())
+                .map(|kind| (endpoint.clone(), kind))
+        })
+        .collect()
 }
 
 /// One endpoint's place in the load scheduler.
@@ -552,7 +400,7 @@ struct LoadSchedule {
     /// Unique per schedule instance: a result is accepted only by the
     /// schedule that started it (not by a same-looking one re-added later).
     epoch: u64,
-    target: (EndpointConfig, LoadPlan),
+    target: (EndpointConfig, EngineKind),
     state: LoadState,
     next_due: Instant,
     in_flight: bool,
@@ -564,16 +412,8 @@ struct LoadDone {
     slug: String,
     epoch: u64,
     reading: Option<LoadReading>,
-    adapter_status: Option<EngineAdapterStatus>,
     finished: Instant,
     ts: String,
-}
-
-fn plan_interval(plan: &LoadPlan) -> Duration {
-    match plan {
-        LoadPlan::BuiltIn(_) => LOAD_SAMPLE_INTERVAL,
-        LoadPlan::Adapter(spec) => Duration::from_secs(u64::from(spec.interval_secs)),
-    }
 }
 
 /// Per-endpoint load scheduling. Each endpoint is scraped every
@@ -587,25 +427,14 @@ fn plan_interval(plan: &LoadPlan) -> Duration {
 /// removed) while it was in flight is discarded.
 fn run_loads<F>(tx: &SyncSender<FromWorker>, stop: &AtomicBool, shared: &Mutex<Shared>, sample: F)
 where
-    F: Fn(&EndpointConfig, &LoadPlan) -> LoadSample + Clone + Send + 'static,
+    F: Fn(&EndpointConfig, &EngineKind) -> Option<LoadReading> + Clone + Send + 'static,
 {
     let (done_tx, done_rx) = mpsc::channel::<LoadDone>();
     let mut schedules = BTreeMap::<String, LoadSchedule>::new();
     let mut seen_generation = None;
     let mut in_flight = 0_usize;
     let mut next_epoch = 0_u64;
-    let mut next_approval_check = Instant::now();
     while !stop.load(Ordering::SeqCst) {
-        if Instant::now() >= next_approval_check {
-            next_approval_check = Instant::now() + Duration::from_secs(3);
-            if let Ok(config) = crate::config::Config::load()
-                && let Ok(mut shared) = shared.lock()
-                && shared.approved_remote_adapters != config.approved_remote_adapters
-            {
-                shared.approved_remote_adapters = config.approved_remote_adapters.clone();
-                shared.endpoints_generation = shared.endpoints_generation.wrapping_add(1);
-            }
-        }
         let (generation, endpoints) = match shared.lock() {
             Ok(shared) if seen_generation != Some(shared.endpoints_generation) => {
                 (shared.endpoints_generation, Some(shared.endpoints.clone()))
@@ -615,16 +444,7 @@ where
         };
         if let Some(endpoints) = endpoints {
             seen_generation = Some(generation);
-            let (allow_remote, remote, approved) = match shared.lock() {
-                Ok(shared) => (
-                    shared.allow_remote_engine_adapters,
-                    shared.remote_adapters.clone(),
-                    shared.approved_remote_adapters.clone(),
-                ),
-                Err(_) => return,
-            };
-            let (targets, remote_statuses) =
-                load_targets_with_remote(&endpoints, &remote, allow_remote, &approved);
+            let targets = load_targets(&endpoints);
             schedules.retain(|slug, _| targets.iter().any(|(endpoint, _)| endpoint.slug == *slug));
             if let Ok(mut map) = persisted_load_counters().lock() {
                 let path = if cfg!(test) {
@@ -637,25 +457,6 @@ where
                     path.as_deref(),
                 );
             }
-            if let Ok(mut shared) = shared.lock() {
-                let live: std::collections::BTreeSet<_> = targets
-                    .iter()
-                    .map(|(endpoint, _)| endpoint.slug.clone())
-                    .chain(
-                        remote_statuses
-                            .iter()
-                            .map(|status| status.endpoint_slug.clone()),
-                    )
-                    .collect();
-                shared
-                    .adapter_statuses
-                    .retain(|slug, _| live.contains(slug));
-                for status in remote_statuses {
-                    shared
-                        .adapter_statuses
-                        .insert(status.endpoint_slug.clone(), status);
-                }
-            }
             for target in targets {
                 let slug = target.0.slug.clone();
                 let replace = schedules
@@ -663,7 +464,7 @@ where
                     .is_none_or(|schedule| schedule.target != target);
                 if replace {
                     next_epoch += 1;
-                    let interval = plan_interval(&target.1);
+                    let interval = LOAD_SAMPLE_INTERVAL;
                     let restored = LoadState::restore(&slug);
                     schedules.insert(
                         slug,
@@ -709,12 +510,11 @@ where
             let spawned = thread::Builder::new()
                 .name("wsmp-load-scrape".to_string())
                 .spawn(move || {
-                    let result = sample(&target.0, &target.1);
+                    let reading = sample(&target.0, &target.1);
                     let _ = done_tx.send(LoadDone {
                         slug,
                         epoch,
-                        reading: result.reading,
-                        adapter_status: result.adapter_status,
+                        reading,
                         finished: Instant::now(),
                         ts: now_rfc3339(),
                     });
@@ -745,11 +545,6 @@ where
             }
             schedule.in_flight = false;
             schedule.next_due = done.finished + schedule.interval;
-            if let Some(status) = done.adapter_status
-                && let Ok(mut shared) = shared.lock()
-            {
-                shared.adapter_statuses.insert(done.slug.clone(), status);
-            }
             let Some(reading) = done.reading else {
                 continue;
             };
@@ -764,7 +559,7 @@ where
             };
             let counter_epoch = frame.counter_epoch;
             let reset = frame.prefix_cache_reset == Some(true);
-            match offer(tx, ClientControlMessage::EndpointLoad(frame)) {
+            match offer(tx, NodeFrame::RuntimeLoad(frame)) {
                 Sent::Queued => {
                     schedule
                         .state
@@ -804,11 +599,11 @@ fn counter_reset(previous: Option<f64>, current: Option<f64>) -> bool {
 /// the reading ([`LoadState::commit`]) only once the frame was queued.
 fn next_load_frame(
     state: &LoadState,
-    endpoint_slug: &str,
+    handle: &str,
     reading: &LoadReading,
     now: Instant,
     ts: &str,
-) -> Option<EndpointLoad> {
+) -> Option<RuntimeLoad> {
     let identity_changed = match (
         state.process_start_time_seconds,
         reading.process_start_time_seconds,
@@ -857,20 +652,22 @@ fn next_load_frame(
     if !due {
         return None;
     }
-    Some(EndpointLoad {
-        endpoint_slug: endpoint_slug.to_string(),
-        model_slug: None,
-        running: reading.running,
-        waiting: reading.waiting,
+    let count = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+    Some(RuntimeLoad {
+        handle: handle.to_string(),
+        model: None,
+        running: count(reading.running),
+        waiting: reading.waiting.map(count),
         kv_usage: reading.kv_usage,
         kv_occupancy: reading.kv_occupancy,
-        slots_busy: reading.slots_busy,
-        deferred: reading.deferred,
+        slots_busy: reading.slots_busy.map(count),
+        deferred: reading.deferred.map(count),
         prefix_cache_hits_delta: hits_delta,
         prefix_cache_queries_delta: queries_delta,
         prefix_cache_reset: prefix_cache_reset.then_some(true),
         counter_epoch,
-        source: reading.source,
+        // Built-in engine scrapes only until the metrics reader (C4).
+        source: LoadSource::Builtin,
         ts: ts.to_string(),
     })
 }
@@ -892,18 +689,6 @@ fn same_load(left: &LoadReading, right: &LoadReading) -> bool {
         && close_fraction(left.kv_occupancy, right.kv_occupancy)
 }
 
-/// Cap a remotely defined source list at the server's schema bound. Invalid
-/// names are dropped first (as the source runner does), so they
-/// cannot use up slots that valid sources after them need.
-fn bounded_remote_sources(sources: &[RemoteMetricSource]) -> Vec<RemoteMetricSource> {
-    sources
-        .iter()
-        .filter(|source| is_metric_name(&source.name))
-        .take(NODE_METRICS_SOURCES_MAX)
-        .cloned()
-        .collect()
-}
-
 /// `[A-Za-z0-9_.:-]{1,64}`: the only metric and label text on the wire.
 pub fn is_metric_name(value: &str) -> bool {
     (1..=64).contains(&value.len())
@@ -922,11 +707,20 @@ pub fn is_label_key(value: &str) -> bool {
     is_metric_name(value) && !RESERVED_LABEL_KEYS.contains(&value)
 }
 
+/// Label values are free text (GPU names have spaces): 1 to 128 characters,
+/// no control characters.
+pub fn is_label_value(value: &str) -> bool {
+    (1..=128).contains(&value.chars().count()) && !value.chars().any(char::is_control)
+}
+
 /// UTC `YYYY-MM-DDTHH:MM:SS.mmmZ`.
 pub fn now_rfc3339() -> String {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    rfc3339(SystemTime::now())
+}
+
+/// `at` as UTC `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+pub fn rfc3339(at: SystemTime) -> String {
+    let elapsed = at.duration_since(UNIX_EPOCH).unwrap_or_default();
     format_rfc3339(elapsed.as_secs(), elapsed.subsec_millis())
 }
 
@@ -1023,6 +817,9 @@ pub struct GpuRow {
     pub uuid: Option<String>,
     pub driver_version: Option<String>,
     pub memory_total_mib: Option<u64>,
+    /// `memory.total` read exactly `[N/A]` (a unified-memory GPU such as
+    /// GB10), not an error like `[Unknown Error]`.
+    pub memory_not_applicable: bool,
     pub memory_used_mib: Option<u64>,
     pub utilization_percent: Option<f64>,
     pub temperature_c: Option<f64>,
@@ -1054,6 +851,7 @@ pub fn parse_nvidia_smi(text: &str) -> Vec<GpuRow> {
                 uuid: gpu_field(fields[2]).and_then(clip),
                 driver_version: gpu_field(fields[3]).and_then(clip),
                 memory_total_mib: number(4).map(|value| value as u64),
+                memory_not_applicable: fields[4].trim().eq_ignore_ascii_case("[n/a]"),
                 memory_used_mib: number(5).map(|value| value as u64),
                 utilization_percent: number(6),
                 temperature_c: number(7),
@@ -1069,6 +867,9 @@ pub fn parse_nvidia_smi(text: &str) -> Vec<GpuRow> {
 #[derive(Default)]
 struct GpuQuery {
     unavailable: bool,
+    /// It answered with GPUs at least once: an NVIDIA node, so a failed
+    /// query later must not fall back to AMD rows ([`gpu_metrics`]).
+    nvidia_seen: bool,
 }
 
 impl GpuQuery {
@@ -1086,7 +887,11 @@ impl GpuQuery {
             GPU_QUERY_TIMEOUT,
             GPU_QUERY_OUTPUT_LIMIT,
         ) {
-            Bounded::Output(output) => parse_nvidia_smi(&output),
+            Bounded::Output(output) => {
+                let rows = parse_nvidia_smi(&output);
+                self.nvidia_seen |= !rows.is_empty();
+                rows
+            }
             Bounded::Failed => Vec::new(),
             Bounded::Unavailable => {
                 self.unavailable = true;
@@ -1122,29 +927,65 @@ pub fn run_bounded(program: &str, args: &[String], timeout: Duration, limit: u64
     }
 }
 
-fn node_kind(gpus: &[GpuRow]) -> (NodeKind, bool) {
-    if gpus.is_empty() {
-        // Apple silicon shares memory between CPU and GPU.
-        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            return (NodeKind::Unified, true);
+/// How managed runtime units would run here: a live systemd user manager
+/// (with or without linger), launchd on macOS, or nothing usable.
+fn execution_mechanism() -> ExecutionMechanism {
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let manager = |args: &[&str], any_status: bool| -> Option<String> {
+            let mut invocation = vec![format!("XDG_RUNTIME_DIR=/run/user/{uid}")];
+            invocation.extend(args.iter().map(|arg| (*arg).to_string()));
+            let run = if any_status {
+                crate::bounded_run::run_until_any_status
+            } else {
+                crate::bounded_run::run_until
+            };
+            run("env", &invocation, deadline, 8192, None)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+        };
+        let live = manager(&["systemctl", "--user", "is-system-running"], true)
+            .is_some_and(|state| user_manager_live(&state));
+        if !live {
+            return ExecutionMechanism::Unsupported;
         }
-        return (NodeKind::Cpu, false);
+        let uid_text = uid.to_string();
+        if manager(&["loginctl", "show-user", &uid_text, "-p", "Linger"], false)
+            .is_some_and(|text| linger_enabled(&text))
+        {
+            ExecutionMechanism::SystemdLinger
+        } else {
+            ExecutionMechanism::SystemdNoLinger
+        }
     }
-    // GB10 and other unified-memory GPUs report no dedicated VRAM total.
-    if gpus.iter().any(|gpu| gpu.memory_total_mib.is_none()) {
-        (NodeKind::Unified, true)
-    } else {
-        (NodeKind::Discrete, false)
+    #[cfg(target_os = "macos")]
+    {
+        ExecutionMechanism::Macos
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        ExecutionMechanism::Unsupported
     }
 }
 
-fn execution_mechanism() -> ExecutionMechanism {
-    match crate::deployments::mechanism() {
-        "systemd+linger" => ExecutionMechanism::SystemdLinger,
-        "systemd-no-linger" => ExecutionMechanism::SystemdNoLinger,
-        "macos" => ExecutionMechanism::Macos,
-        _ => ExecutionMechanism::Unsupported,
-    }
+/// Whether `systemctl --user is-system-running` describes a live user
+/// manager. It exits nonzero for every state but `running`, so the state is
+/// read from stdout: `degraded` and `starting` managers run user services too.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn user_manager_live(state: &str) -> bool {
+    matches!(state.trim(), "running" | "degraded" | "starting")
+}
+
+/// Whether `loginctl show-user <uid> -p Linger` says linger is on.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linger_enabled(output: &str) -> bool {
+    output.lines().any(|line| {
+        line.trim()
+            .split_once('=')
+            .is_some_and(|(key, value)| key.trim() == "Linger" && value.trim() == "yes")
+    })
 }
 
 /// `/etc/os-release` `NAME` and `VERSION_ID`.
@@ -1158,7 +999,9 @@ pub fn parse_os_release(text: &str) -> (Option<String>, Option<String>) {
     (value("NAME"), value("VERSION_ID"))
 }
 
-/// `/proc/cpuinfo` model name (x86 `model name`, Arm `Model` or `Hardware`).
+/// `/proc/cpuinfo` model name (x86 `model name`, Arm `Model` or `Hardware`),
+/// else the Arm core mix from `CPU implementer` / `CPU part` (server and
+/// workstation Arm kernels, e.g. GB10, print no model name).
 pub fn parse_cpu_model(text: &str) -> Option<String> {
     ["model name", "Model", "Hardware", "cpu model"]
         .iter()
@@ -1168,6 +1011,69 @@ pub fn parse_cpu_model(text: &str) -> Option<String> {
                 (name.trim() == *key).then(|| clip(value)).flatten()
             })
         })
+        .or_else(|| arm_core_mix(text))
+}
+
+/// Arm Ltd (`0x41`) part numbers of cores found in inference machines.
+const ARM_PARTS: &[(&str, &str)] = &[
+    ("0xd03", "Cortex-A53"),
+    ("0xd05", "Cortex-A55"),
+    ("0xd08", "Cortex-A72"),
+    ("0xd0b", "Cortex-A76"),
+    ("0xd0c", "Neoverse-N1"),
+    ("0xd40", "Neoverse-V1"),
+    ("0xd41", "Cortex-A78"),
+    ("0xd44", "Cortex-X1"),
+    ("0xd49", "Neoverse-N2"),
+    ("0xd4f", "Neoverse-V2"),
+    ("0xd80", "Cortex-A520"),
+    ("0xd81", "Cortex-A720"),
+    ("0xd82", "Cortex-X4"),
+    ("0xd84", "Neoverse-V3"),
+    ("0xd85", "Cortex-X925"),
+    ("0xd87", "Cortex-A725"),
+];
+
+/// `10x Arm Cortex-X925 + 10x Arm Cortex-A725`, in first-seen order.
+fn arm_core_mix(text: &str) -> Option<String> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    let mut implementer: Option<String> = None;
+    for line in text.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().to_ascii_lowercase();
+        match name.trim() {
+            "CPU implementer" => implementer = Some(value),
+            "CPU part" => {
+                let core = match implementer.as_deref() {
+                    Some("0x41") => ARM_PARTS
+                        .iter()
+                        .find(|(part, _)| *part == value)
+                        .map_or_else(
+                            || format!("Arm part {value}"),
+                            |(_, core)| format!("Arm {core}"),
+                        ),
+                    Some(other) => format!("implementer {other} part {value}"),
+                    None => continue,
+                };
+                match counts.iter_mut().find(|(known, _)| *known == core) {
+                    Some((_, count)) => *count += 1,
+                    None => counts.push((core, 1)),
+                }
+            }
+            _ => {}
+        }
+    }
+    if counts.is_empty() {
+        return None;
+    }
+    let mix = counts
+        .iter()
+        .map(|(core, count)| format!("{count}x {core}"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    clip(&mix)
 }
 
 fn interface_names() -> Vec<String> {
@@ -1204,7 +1110,7 @@ fn saturating_byte_counter(value: u64) -> u64 {
 }
 
 #[cfg(unix)]
-fn interface_addresses() -> BTreeMap<String, Vec<String>> {
+pub(crate) fn interface_addresses() -> BTreeMap<String, Vec<String>> {
     let mut addresses = BTreeMap::<String, Vec<String>>::new();
     let Ok(interfaces) = nix::ifaddrs::getifaddrs() else {
         return addresses;
@@ -1229,13 +1135,12 @@ fn interface_addresses() -> BTreeMap<String, Vec<String>> {
 }
 
 #[cfg(not(unix))]
-fn interface_addresses() -> BTreeMap<String, Vec<String>> {
+pub(crate) fn interface_addresses() -> BTreeMap<String, Vec<String>> {
     BTreeMap::new()
 }
 
 fn collect_node_info(gpu: &mut GpuQuery) -> NodeInfo {
-    let gpus = gpu.rows();
-    let (kind, unified) = node_kind(&gpus);
+    let hardware = crate::hardware::detect(gpu.rows());
     let (os_name, os_version) = read_text("/etc/os-release")
         .map(|text| parse_os_release(&text))
         .unwrap_or((None, None));
@@ -1243,10 +1148,12 @@ fn collect_node_info(gpu: &mut GpuQuery) -> NodeInfo {
     let interfaces = interface_names()
         .into_iter()
         .map(|name| NodeInterfaceInfo {
-            addresses: addresses.get(&name).cloned().unwrap_or_default(),
+            addresses: addresses.get(&name).cloned(),
             // `speed` is -1 (or unreadable) for links without one.
             link_speed_mbps: sys_net_number(&name, "speed").filter(|speed| *speed > 0),
             mtu: sys_net_number(&name, "mtu").and_then(|mtu| u32::try_from(mtu).ok()),
+            // RDMA detection lands with fabrics (C5).
+            rdma: None,
             name,
         })
         .collect();
@@ -1258,30 +1165,26 @@ fn collect_node_info(gpu: &mut GpuQuery) -> NodeInfo {
             arch: clip(std::env::consts::ARCH),
         }),
         cpu: Some(NodeCpu {
-            model: read_text("/proc/cpuinfo").and_then(|text| parse_cpu_model(&text)),
+            model: hardware.cpu_model.as_deref().and_then(clip),
             cores: thread::available_parallelism()
                 .ok()
                 .and_then(|count| u32::try_from(count.get()).ok()),
         }),
-        memory_total_mib: read_text("/proc/meminfo")
-            .map(|text| parse_meminfo(&text))
-            .and_then(|fields| fields.get("MemTotal").copied()),
-        gpus: gpus
-            .iter()
-            .map(|row| NodeGpuInfo {
-                index: row.index,
-                name: row.name.clone(),
-                uuid: row.uuid.clone(),
-                driver_version: row.driver_version.clone(),
-                vram_total_mib: row.memory_total_mib,
-            })
-            .collect(),
-        unified_memory: Some(unified),
-        node_kind: Some(kind),
-        interfaces,
+        memory_total_mib: hardware.memory_total_mib,
+        unified_memory_mib: hardware.unified_memory_mib,
+        accelerator_memory_mib: hardware.accelerator_memory_mib,
+        gpus: Some(hardware.gpus),
+        node_kind: Some(hardware.node_kind),
+        interfaces: Some(interfaces),
         execution_mechanism: Some(execution_mechanism()),
-        cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        declared: None,
     }
+}
+
+/// One `nvidia-smi` query now (empty when it is missing or fails).
+pub fn query_nvidia() -> Vec<GpuRow> {
+    GpuQuery::default().rows()
 }
 
 // `c_ulong` and `fsblkcnt_t` differ in width across Unix targets.
@@ -1307,13 +1210,42 @@ fn root_disk() -> Option<NodeDiskMetrics> {
     None
 }
 
+/// `nvidia-smi` rows, else (on a node where it never answered with GPUs)
+/// AMD sysfs memory use. Metrics rows carry no vendor, so a mixed node
+/// reports its NVIDIA GPUs only, and a failed query on an NVIDIA node
+/// reports none rather than AMD rows under NVIDIA indexes.
+fn gpu_metrics(nvidia: Vec<GpuRow>, nvidia_seen: bool) -> Vec<NodeGpuMetrics> {
+    if nvidia.is_empty() {
+        if nvidia_seen || !cfg!(target_os = "linux") {
+            return Vec::new();
+        }
+        return crate::hardware::amd_metrics(&crate::hardware::read_amd_sysfs(
+            std::path::Path::new("/"),
+        ));
+    }
+    nvidia
+        .into_iter()
+        .filter_map(|row| {
+            Some(NodeGpuMetrics {
+                index: u8::try_from(row.index).ok()?,
+                vram_used_mib: row.memory_used_mib,
+                vram_total_mib: row.memory_total_mib,
+                gtt_used_mib: None,
+                utilization_percent: row.utilization_percent,
+                temperature_c: row.temperature_c,
+                power_w: row.power_w,
+                sm_clock_mhz: row.sm_clock_mhz,
+            })
+        })
+        .collect()
+}
+
 fn collect_node_metrics(
     cpu: &mut CpuSampler,
     gpu: &mut GpuQuery,
-    sources: &Runner,
-    mut engine_adapters: Vec<EngineAdapterStatus>,
+    commands: &Runner,
 ) -> NodeMetrics {
-    let (custom, sources) = sources.report(Instant::now());
+    let (custom, statuses) = commands.report(Instant::now());
     let load = read_text("/proc/loadavg").and_then(|text| parse_loadavg(&text));
     let memory = read_text("/proc/meminfo").map(|text| parse_meminfo(&text));
     let interfaces = interface_names()
@@ -1340,27 +1272,14 @@ fn collect_node_metrics(
             swap_total_mib: fields.get("SwapTotal").copied(),
             swap_free_mib: fields.get("SwapFree").copied(),
         }),
-        disks: root_disk().into_iter().collect(),
-        gpus: gpu
-            .rows()
-            .into_iter()
-            .map(|row| NodeGpuMetrics {
-                index: row.index,
-                vram_used_mib: row.memory_used_mib,
-                vram_total_mib: row.memory_total_mib,
-                utilization_percent: row.utilization_percent,
-                temperature_c: row.temperature_c,
-                power_w: row.power_w,
-                sm_clock_mhz: row.sm_clock_mhz,
-            })
-            .collect(),
-        interfaces,
-        custom,
-        sources,
-        engine_adapters: {
-            engine_adapters.truncate(NODE_ENGINE_ADAPTERS_MAX);
-            engine_adapters
-        },
+        disks: Some(root_disk().into_iter().collect()),
+        gpus: Some({
+            let rows = gpu.rows();
+            gpu_metrics(rows, gpu.nvidia_seen)
+        }),
+        interfaces: Some(interfaces),
+        custom: (!custom.is_empty()).then_some(custom),
+        metric_commands: (!statuses.is_empty()).then_some(statuses),
         abandoned_recovery: {
             #[cfg(unix)]
             {
@@ -1376,6 +1295,52 @@ fn collect_node_metrics(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_failed_nvidia_query_never_reports_amd_rows_on_an_nvidia_node() {
+        assert!(super::gpu_metrics(Vec::new(), true).is_empty());
+        let rows = super::parse_nvidia_smi(
+            "0, NVIDIA GeForce RTX 3090, GPU-1, 550.54, 24576, 1024, 7, 40, 30.5, 210",
+        );
+        let metrics = super::gpu_metrics(rows, true);
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].vram_used_mib, Some(1024));
+    }
+
+    #[test]
+    fn node_metrics_drop_custom_values_to_fit_the_chunk_budget() {
+        let labels: std::collections::BTreeMap<String, String> = (0..16)
+            .map(|index| (format!("label_{index:02}"), "x".repeat(128)))
+            .collect();
+        let custom = (0..256)
+            .map(|index| crate::protocol::frames::CustomMetric {
+                name: format!("metric_{index}"),
+                labels: Some(labels.clone()),
+                value: 1.0,
+                ts: "2026-10-06T00:00:00.000Z".to_string(),
+            })
+            .collect();
+        let mut frame = NodeFrame::NodeMetrics(crate::protocol::frames::NodeMetrics {
+            ts: "2026-10-06T00:00:00.000Z".to_string(),
+            cpu: None,
+            memory: None,
+            disks: None,
+            gpus: None,
+            interfaces: None,
+            custom: Some(custom),
+            metric_commands: None,
+            abandoned_recovery: None,
+        });
+        let text = encode_telemetry(&mut frame).expect("fits once trimmed");
+        assert!(text.len() <= crate::protocol::frames::CHUNK_BUDGET_BYTES);
+        let NodeFrame::NodeMetrics(metrics) = &frame else {
+            panic!("node.metrics");
+        };
+        let kept = metrics.custom.as_ref().map_or(0, Vec::len);
+        assert!(kept > 0 && kept < 256, "{kept}");
+        assert!(frame.validate().is_ok());
+    }
+
     #[cfg(unix)]
     #[test]
     fn counter_store_filesystem_update_prune_and_idle_retries() {
@@ -1415,8 +1380,7 @@ mod tests {
         assert!(!durable.contains_key("remove"));
     }
     use super::*;
-    use crate::engine::{EngineKind, LoadSource};
-    use crate::protocol::MetricSourceFormat;
+    use crate::engine::LoadSource as EngineLoadSource;
 
     #[test]
     fn byte_counters_saturate_at_the_json_safe_integer() {
@@ -1449,10 +1413,10 @@ mod tests {
         assert_eq!(rows[0].memory_total_mib, Some(24_564));
         assert_eq!(rows[0].power_w, Some(61.25));
         assert_eq!(rows[1].memory_total_mib, None);
+        assert!(rows[1].memory_not_applicable);
+        assert!(!rows[0].memory_not_applicable);
         assert_eq!(rows[1].power_w, None);
         assert_eq!(rows[1].name.as_deref(), Some("NVIDIA GB10"));
-        assert_eq!(node_kind(&rows).0, NodeKind::Unified);
-        assert_eq!(node_kind(&rows[..1]).0, NodeKind::Discrete);
     }
 
     #[test]
@@ -1485,7 +1449,7 @@ mod tests {
             running,
             waiting: Some(0),
             prefix_cache_hits_total: hits,
-            source: LoadSource::VllmMetrics,
+            source: EngineLoadSource::VllmMetrics,
             ..LoadReading::default()
         }
     }
@@ -1496,7 +1460,7 @@ mod tests {
         reading: LoadReading,
         at: Instant,
         ts: &str,
-    ) -> Option<EndpointLoad> {
+    ) -> Option<RuntimeLoad> {
         let frame = next_load_frame(state, "vllm", &reading, at, ts)?;
         state.commit("vllm", reading, at, frame.counter_epoch);
         Some(frame)
@@ -1751,10 +1715,7 @@ mod tests {
 
     fn load_slug(text: &str) -> String {
         let value: serde_json::Value = serde_json::from_str(text).expect("frame json");
-        value["endpointSlug"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string()
+        value["handle"].as_str().unwrap_or_default().to_string()
     }
 
     #[test]
@@ -1782,10 +1743,9 @@ mod tests {
                 }
                 Some(LoadReading {
                     running: 1,
-                    source: LoadSource::VllmMetrics,
+                    source: EngineLoadSource::VllmMetrics,
                     ..LoadReading::default()
                 })
-                .into()
             });
         });
         let mut fast_at = None;
@@ -1835,7 +1795,7 @@ mod tests {
                 worker_peak.fetch_max(now, Ordering::SeqCst);
                 thread::sleep(Duration::from_millis(300));
                 worker_live.fetch_sub(1, Ordering::SeqCst);
-                None.into()
+                None
             });
         });
         thread::sleep(Duration::from_millis(1_000));
@@ -1870,10 +1830,9 @@ mod tests {
                 };
                 Some(LoadReading {
                     running,
-                    source: LoadSource::VllmMetrics,
+                    source: EngineLoadSource::VllmMetrics,
                     ..LoadReading::default()
                 })
-                .into()
             });
         });
         thread::sleep(Duration::from_millis(150));
@@ -1898,34 +1857,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn remote_sources_are_capped_at_the_schema_bound() {
-        // A server may not send more than NODE_METRICS_SOURCES_MAX; a buggy or
-        // hostile one must not grow the CLI's stored list (or the reported
-        // statuses) past the same bound.
-        let source = |index: usize| RemoteMetricSource {
-            name: format!("m{index}"),
-            command: "echo 1".to_string(),
-            interval_secs: 10,
-            timeout_secs: 5,
-            format: MetricSourceFormat::Number,
-        };
-        let many = (0..NODE_METRICS_SOURCES_MAX + 10)
-            .map(source)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            bounded_remote_sources(&many).len(),
-            NODE_METRICS_SOURCES_MAX
-        );
-        assert_eq!(bounded_remote_sources(&many[..2]).len(), 2);
-    }
-
     /// Run the scheduler over one vLLM endpoint whose sampler returns the
     /// given readings in order (repeating the last), collecting frames.
     fn run_scheduler_for(
         endpoints: Vec<EndpointConfig>,
         tx: SyncSender<FromWorker>,
-        sample: impl Fn(&EndpointConfig, &LoadPlan) -> LoadSample + Clone + Send + 'static,
+        sample: impl Fn(&EndpointConfig, &EngineKind) -> Option<LoadReading> + Clone + Send + 'static,
     ) -> (Arc<AtomicBool>, Arc<Mutex<Shared>>, thread::JoinHandle<()>) {
         let shared = Arc::new(Mutex::new(Shared {
             endpoints,
@@ -1949,7 +1886,7 @@ mod tests {
             run_scheduler_for(vec![load_endpoint("vllm")], tx, move |_, _| {
                 let call = sampler_calls.fetch_add(1, Ordering::SeqCst);
                 let hits = [100.0, 150.0, 170.0][call.min(2)];
-                Some(reading(1, Some(hits))).into()
+                Some(reading(1, Some(hits)))
             });
         let text = |message: FromWorker| match message {
             FromWorker::Telemetry(text) => text,
@@ -1989,9 +1926,9 @@ mod tests {
             run_scheduler_for(vec![load_endpoint("vllm")], tx, move |_, _| {
                 if sampler_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     thread::sleep(Duration::from_millis(700));
-                    return Some(reading(7, None)).into();
+                    return Some(reading(7, None));
                 }
-                Some(reading(1, None)).into()
+                Some(reading(1, None))
             });
         let set = |endpoints: Vec<EndpointConfig>| {
             let mut shared = shared.lock().expect("shared");
@@ -2071,116 +2008,28 @@ mod tests {
                 kind: Some(EngineKind::LlamaCpp),
                 ..crate::engine::DetectedEngine::default()
             }),
-            adapter: None,
         });
-        let mut adapter = EndpointConfig {
-            slug: "adapter".to_string(),
-            engine: crate::config::EndpointEngine::Generic,
-            engine_adapter: Some(crate::engine_adapter::EngineAdapterConfig {
-                input: crate::engine_adapter::AdapterInput::Route {
-                    route: "/stats".to_string(),
-                },
-                format: crate::engine_adapter::AdapterFormat::Json,
-                interval_secs: 2,
-                timeout_secs: 2,
-                map: Default::default(),
-                count_route: None,
-            }),
-            ..EndpointConfig::default()
-        };
-        let targets = load_targets(&[vllm.clone(), auto, ollama, detected, adapter.clone()]);
+        let targets = load_targets(&[vllm.clone(), auto, ollama, detected]);
         let slugs = targets
             .iter()
-            .map(|(endpoint, plan)| {
-                (
-                    endpoint.slug.as_str(),
-                    matches!(plan, LoadPlan::BuiltIn(EngineKind::Vllm)),
-                    matches!(plan, LoadPlan::BuiltIn(EngineKind::LlamaCpp)),
-                    matches!(plan, LoadPlan::Adapter(_)),
-                )
-            })
+            .map(|(endpoint, kind)| (endpoint.slug.as_str(), *kind))
             .collect::<Vec<_>>();
         assert_eq!(
             slugs,
             [
-                ("vllm", true, false, false),
-                ("detected", false, true, false),
-                ("adapter", false, false, true),
+                ("vllm", EngineKind::Vllm),
+                ("detected", EngineKind::LlamaCpp)
             ]
         );
         vllm.enabled = false;
         assert!(load_targets(&[vllm]).is_empty());
-        adapter.enabled = false;
-        assert!(load_targets(&[adapter]).is_empty());
-    }
-
-    fn remote_json_adapter(slug: &str, command: &str) -> RemoteEngineAdapter {
-        RemoteEngineAdapter {
-            endpoint_slug: slug.to_string(),
-            input: crate::engine_adapter::AdapterInput::Command {
-                command: command.to_string(),
-            },
-            format: crate::engine_adapter::AdapterFormat::Json,
-            interval_secs: 2,
-            timeout_secs: 2,
-            map: Default::default(),
-            count_route: None,
-        }
     }
 
     #[test]
-    fn remote_adapter_runs_only_with_opt_in_and_matching_hash() {
-        let endpoint = EndpointConfig {
-            slug: "gpu".to_string(),
-            engine: crate::config::EndpointEngine::Vllm,
-            ..EndpointConfig::default()
-        };
-        let remote = remote_json_adapter("gpu", "echo 1");
-        let spec = remote.to_config();
-        let hash = crate::engine_adapter::spec_sha256("gpu", &spec);
-        let mut approved = BTreeMap::new();
-        approved.insert("gpu".to_string(), hash.clone());
-        let endpoints = [endpoint];
-        let remotes = [remote];
-
-        let (targets, statuses) = load_targets_with_remote(&endpoints, &remotes, false, &approved);
-        assert!(
-            matches!(targets[0].1, LoadPlan::BuiltIn(EngineKind::Vllm)),
-            "metric-source opt-in is a different flag; without adapter opt-in the built-in scrape stays"
-        );
-        assert_eq!(
-            statuses[0].state,
-            crate::engine_adapter::AdapterState::Refused
-        );
-
-        let (targets, statuses) =
-            load_targets_with_remote(&endpoints, &remotes, true, &BTreeMap::new());
-        assert!(matches!(targets[0].1, LoadPlan::BuiltIn(EngineKind::Vllm)));
-        assert_eq!(
-            statuses[0].state,
-            crate::engine_adapter::AdapterState::PendingApproval
-        );
-
-        let mut wrong = BTreeMap::new();
-        wrong.insert("gpu".to_string(), "ab".repeat(32));
-        let (targets, statuses) = load_targets_with_remote(&endpoints, &remotes, true, &wrong);
-        assert!(matches!(targets[0].1, LoadPlan::BuiltIn(EngineKind::Vllm)));
-        assert_eq!(
-            statuses[0].state,
-            crate::engine_adapter::AdapterState::PendingApproval
-        );
-
-        let (targets, statuses) = load_targets_with_remote(&endpoints, &remotes, true, &approved);
-        assert!(matches!(targets[0].1, LoadPlan::Adapter(_)));
-        assert!(statuses.is_empty());
-
-        let mut local = endpoints[0].clone();
-        local.engine_adapter = Some(spec);
-        let (targets, statuses) = load_targets_with_remote(&[local], &remotes, true, &approved);
-        assert!(matches!(targets[0].1, LoadPlan::Adapter(_)));
-        assert!(
-            statuses.is_empty(),
-            "a local adapter shadows the remote definition"
-        );
+    fn linger_and_user_manager_states_are_read_from_stdout() {
+        assert!(user_manager_live("degraded\n"));
+        assert!(!user_manager_live("offline"));
+        assert!(linger_enabled("UID=1000\nLinger=yes\n"));
+        assert!(!linger_enabled("Linger=no"));
     }
 }

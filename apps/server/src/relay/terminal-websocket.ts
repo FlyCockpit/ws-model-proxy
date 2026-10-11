@@ -1,6 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { upgradeWebSocket, type WebSocketLike } from "@hono/node-server";
-import type { LiveCliFeatureSnapshot } from "@ws-model-proxy/api/context";
 import type { Session } from "@ws-model-proxy/auth";
 import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
 import {
@@ -18,13 +17,14 @@ import { resolveClientIp } from "../client-ip.js";
 import { createRateLimiterMiddleware, rpcLimiter } from "../rate-limit.js";
 import { sessionMiddleware } from "../session-middleware.js";
 import {
-  base64Url16ByteSchema,
-  encodeRelayBinaryFrame,
-  parseRelayBinaryFrame,
-  relayProtocolAtLeast,
-  uncompressedP256PublicKeySchema,
-} from "./protocol.js";
+  base64Url16Schema as base64Url16ByteSchema,
+  p256PublicKeySchema as uncompressedP256PublicKeySchema,
+} from "./frames.js";
+import { recordNodeAuditEvent } from "./node-audit.js";
+import { nodeOwnerMatches } from "./node-owner.js";
+import { encodeRelayBinaryFrame, parseRelayBinaryFrame } from "./protocol.js";
 import {
+  type LiveNodeState,
   type RelaySocket,
   registerTerminalBridge,
   relaySessionManager,
@@ -32,6 +32,11 @@ import {
   terminalLimitReached,
 } from "./session-manager.js";
 import { settleSocketHandler } from "./socket-handler.js";
+import {
+  TERMINAL_TICKET_PATTERN,
+  type TerminalTicketStore,
+  terminalTicketStore,
+} from "./terminal-tickets.js";
 
 const BROWSER_BUFFER_DETACH_BYTES = 4 * 1024 * 1024;
 /**
@@ -80,7 +85,7 @@ const BROWSER_JSON_ECHO_MAX_BYTES = 4096;
 /**
  * Client-chosen, echoed by every answer the relay gives that frame directly
  * (`terminals` to a list, `opening`, `attaching`, `closed`, `detached` self,
- * a Decline's immediate `started`, and every error, including a rate-limit
+ * and every error, including a rate-limit
  * or validation refusal), so the browser can tell which of its frames an
  * answer is for. Later events about a terminal (`pending`, `opened`,
  * `attached`, `rejected`, `exit`, pushes) are not answers to one frame and
@@ -106,7 +111,11 @@ const browserClientMessageSchema = z.discriminatedUnion("type", [
     .object({
       type: z.literal("open"),
       ...requestIdField,
-      cliDeviceId: z.string().trim().min(1).max(128),
+      /**
+       * A one-use ticket from `nodes.terminals.openTicket` / `nodes.queued.run`: it names the
+       * node and the terminal id, for this user and this Better Auth session only.
+       */
+      ticket: z.string().regex(TERMINAL_TICKET_PATTERN),
       cols: z.number().int().min(1).max(1000),
       rows: z.number().int().min(1).max(1000),
       publicKey: uncompressedP256PublicKeySchema,
@@ -134,9 +143,6 @@ const browserClientMessageSchema = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({ type: z.literal("close"), ...requestIdField, terminalId: base64Url16ByteSchema })
-    .strict(),
-  z
-    .object({ type: z.literal("decline"), ...requestIdField, terminalId: base64Url16ByteSchema })
     .strict(),
   z
     .object({ type: z.literal("detach"), ...requestIdField, terminalId: base64Url16ByteSchema })
@@ -204,7 +210,9 @@ type TerminalErrorCode =
   | "limit"
   | "invalid"
   | "rate_limited"
-  | "input_dropped";
+  | "input_dropped"
+  /** The open's ticket is unknown, used, expired, or another user's or session's. */
+  | "ticket_invalid";
 
 type BrowserConn = {
   id: string;
@@ -249,24 +257,24 @@ function admissionGate(): BrowserConn["admission"] {
   return { promise, settle };
 }
 
-type CliListRow = {
+/**
+ * A node as the terminal list shows it. The browser wire still names it `cliDeviceId` (the
+ * web client's field); the value is the node id.
+ */
+type NodeListRow = {
   id: string;
   slug: string;
-  status: string;
-  allowHumanTerminal: boolean;
-  reportedHumanTerminal: boolean | null;
-  reportedTerminalSupported: boolean | null;
-  relayProtocolVersion: string | null;
+  trust: "RELAY" | "FULL" | null;
+  trustLowerRequestedAt: Date | null;
+  rejectedProtocolVersion: string | null;
 };
 
-const cliListSelect = {
+const nodeListSelect = {
   id: true,
   slug: true,
-  status: true,
-  allowHumanTerminal: true,
-  reportedHumanTerminal: true,
-  reportedTerminalSupported: true,
-  relayProtocolVersion: true,
+  trust: true,
+  trustLowerRequestedAt: true,
+  rejectedProtocolVersion: true,
 } as const;
 
 function originOf(value: string | undefined): string | null {
@@ -290,7 +298,7 @@ export function terminalAllowedOrigins(): Set<string> {
 /** Identity only travels with the terminal key it signs. */
 function identityFields(
   publicKey: string | null,
-  live: LiveCliFeatureSnapshot | null,
+  live: LiveNodeState | null,
 ): { identityPublicKey: string | null; identitySignature: string | null } {
   const identity = publicKey ? (live?.terminalIdentity ?? null) : null;
   return {
@@ -299,30 +307,33 @@ function identityFields(
   };
 }
 
+/**
+ * Whether a browser shell can open on a node. A node at Relay only refuses `term.open`
+ * (spec), so the stored trust (a pending lowering counts as Relay) and the live session's
+ * trust must both be Full control.
+ */
 export function classifyTerminalAvailability(input: {
-  status: string;
-  allowHumanTerminal: boolean;
-  relayProtocolVersion: string | null;
-  reportedHumanTerminal: boolean | null;
-  reportedTerminalSupported: boolean | null;
-  live: LiveCliFeatureSnapshot | null;
+  trust: "RELAY" | "FULL" | null;
+  trustLowerPending: boolean;
+  rejectedProtocolVersion: string | null;
+  live: LiveNodeState | null;
 }): { available: boolean; reason: TerminalAvailabilityReason; publicKey: string | null } {
   const live = input.live;
   const publicKey = live?.terminalPublicKey ?? null;
-  if (input.status === "REVOKED") {
-    return { available: false, reason: "device_disabled", publicKey };
-  }
-  if (!input.allowHumanTerminal) {
+  if (input.trust !== "FULL" || input.trustLowerPending) {
     return { available: false, reason: "not_granted", publicKey };
   }
   if (!live) {
-    const neverReported =
-      !relayProtocolAtLeast(input.relayProtocolVersion, "2.4") ||
-      input.reportedHumanTerminal === null;
-    return { available: false, reason: neverReported ? "cli_too_old" : "offline", publicKey };
+    return {
+      available: false,
+      reason: input.rejectedProtocolVersion !== null ? "cli_too_old" : "offline",
+      publicKey,
+    };
   }
-  if (!live.humanTerminal) return { available: false, reason: "device_disabled", publicKey };
-  if (!live.terminalSupported) return { available: false, reason: "unsupported", publicKey };
+  if (live.trust !== "full") return { available: false, reason: "not_granted", publicKey };
+  if (!live.features.terminals.supported) {
+    return { available: false, reason: "unsupported", publicKey };
+  }
   return { available: true, reason: "ok", publicKey };
 }
 
@@ -331,25 +342,24 @@ function errorKind(error: unknown): string {
 }
 
 function errorMessage(code: TerminalErrorCode): string {
-  if (code === "not_found") return "CLI device not found.";
-  if (code === "not_granted") return "Browser terminal is not granted for this CLI.";
-  if (code === "device_disabled") return "Browser terminal is disabled for this CLI.";
-  if (code === "cli_too_old") return "This CLI does not support browser terminals.";
-  if (code === "unsupported") return "Browser terminal is not supported on this CLI.";
-  if (code === "offline") return "CLI is offline.";
+  if (code === "not_found") return "Node not found.";
+  if (code === "not_granted") return "Browser terminals need the node at Full control.";
+  if (code === "device_disabled") return "Browser terminals are disabled on this node.";
+  if (code === "cli_too_old") return "Upgrade wsmp on this node to use browser terminals.";
+  if (code === "unsupported") return "Browser terminals are not enabled on this node.";
+  if (code === "offline") return "The node is offline.";
   if (code === "limit") return "Terminal limit reached.";
   if (code === "input_dropped") return "Terminal input was dropped.";
   if (code === "rate_limited") return "Too many terminal messages; try again shortly.";
+  if (code === "ticket_invalid") return "This terminal ticket expired or was already used.";
   return "Invalid terminal message.";
 }
 
-function availabilityFor(row: CliListRow, live: LiveCliFeatureSnapshot | null) {
+function availabilityFor(row: NodeListRow, live: LiveNodeState | null) {
   return classifyTerminalAvailability({
-    status: row.status,
-    allowHumanTerminal: row.allowHumanTerminal,
-    relayProtocolVersion: row.relayProtocolVersion,
-    reportedHumanTerminal: row.reportedHumanTerminal,
-    reportedTerminalSupported: row.reportedTerminalSupported,
+    trust: row.trust,
+    trustLowerPending: row.trustLowerRequestedAt !== null,
+    rejectedProtocolVersion: row.rejectedProtocolVersion,
     live,
   });
 }
@@ -363,6 +373,8 @@ function utf8ByteLengthExceeds(frame: string, maxBytes: number): boolean {
 }
 
 export class TerminalBrowserHub {
+  constructor(private readonly tickets: TerminalTicketStore = terminalTicketStore) {}
+
   private bySocket = new Map<RelaySocket, BrowserConn>();
   private byId = new Map<string, BrowserConn>();
   private jsonAt = new Map<string, number[]>();
@@ -387,6 +399,7 @@ export class TerminalBrowserHub {
    * marker or the missing session ({@link admitBrowserConnection}).
    */
   revokeTerminalAccessForUser(userId: string) {
+    this.tickets.revokeForUser(userId);
     for (const conn of [...this.bySocket.values()]) {
       if (conn.userId !== userId && conn.impersonatedBy !== userId) continue;
       this.detachAll(conn);
@@ -492,7 +505,7 @@ export class TerminalBrowserHub {
       return Promise.resolve();
     }
     if (!this.allowJson(conn)) {
-      // Answer the refused frame itself: a Decline refused here must reach a
+      // Answer the refused frame itself: a close refused here must reach a
       // state the person can retry, and an open must not shift the browser's
       // matching of later `opening` answers.
       this.sendError(conn, "rate_limited", rawFrameRef(frame));
@@ -634,7 +647,22 @@ export class TerminalBrowserHub {
       return;
     }
     if (data.type === "open") {
-      const terminalId = this.allocateTerminalId();
+      // Used up here, whatever follows: a ticket opens at most one terminal.
+      const redeemed = this.tickets.redeem({
+        ticket: data.ticket,
+        userId: conn.userId,
+        sessionId: conn.sessionId,
+      });
+      if (redeemed?.kind === "attach") {
+        this.attachOperatorStep(conn, data, redeemed, ref);
+        return;
+      }
+      if (!redeemed || relaySessionManager.hasTerminal(redeemed.terminalId)) {
+        this.sendError(conn, "ticket_invalid", ref);
+        return;
+      }
+      // The id the procedure minted (and audited) with the ticket.
+      const { terminalId, nodeId } = redeemed;
       // A new terminal has no viewers yet, so a fresh id cannot collide.
       const viewerId = randomBytes(16).toString("base64url");
       // From here on the terminal id names this open too.
@@ -645,7 +673,7 @@ export class TerminalBrowserHub {
         viewerId,
         ...(ref.requestId ? { requestId: ref.requestId } : {}),
       });
-      await this.openTerminal(conn, data, terminalId, viewerId, ref);
+      await this.openTerminal(conn, data, nodeId, terminalId, viewerId, ref);
       return;
     }
     if (data.type === "auth") {
@@ -669,29 +697,6 @@ export class TerminalBrowserHub {
         terminalId: data.terminalId,
         ...(ref.requestId ? { requestId: ref.requestId } : {}),
       });
-      return;
-    }
-    if (data.type === "decline") {
-      // Decline an agent request: never ends a command whose Enter came first.
-      const terminalId = data.terminalId;
-      const answer = relaySessionManager.declineTerminalFromBrowser(
-        terminalId,
-        conn.userId,
-        conn.id,
-      );
-      // Every answer names this Decline (`requestId`). `requested` is
-      // answered later, to every socket whose Decline is out: the exit, or a
-      // `decline` event saying the command started.
-      if (answer === "started") {
-        this.send(conn, {
-          type: "decline",
-          terminalId,
-          outcome: "started",
-          ...(ref.requestId ? { requestId: ref.requestId } : {}),
-        });
-      } else if (answer !== "requested") {
-        this.sendError(conn, answer, ref);
-      }
       return;
     }
     // Stop viewing (X button). `close` above ends the session for everyone.
@@ -864,18 +869,7 @@ export class TerminalBrowserHub {
           terminalId: event.terminalId,
           ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
           ...(event.signal !== undefined ? { signal: event.signal } : {}),
-          ...(event.supervisedStatus !== undefined
-            ? { supervisedStatus: event.supervisedStatus }
-            : {}),
         });
-      }
-      return;
-    }
-    if (event.type === "decline") {
-      for (const connId of event.connIds) {
-        const conn = this.byId.get(connId);
-        if (!conn) continue;
-        this.send(conn, { type: "decline", terminalId: event.terminalId, outcome: event.outcome });
       }
       return;
     }
@@ -925,10 +919,7 @@ export class TerminalBrowserHub {
         reason: event.reason,
         ...(event.approvalCode ? { approvalCode: event.approvalCode } : {}),
       });
-      return;
     }
-    // 2.4: another tab took this terminal.
-    this.send(conn, { type: "detached", terminalId: event.terminalId });
   }
 
   /**
@@ -960,7 +951,7 @@ export class TerminalBrowserHub {
   }
 
   /**
-   * Supervised requests appear, change, and end without a browser asking.
+   * Nodes come and go (and terminals with them) without a browser asking.
    * Every open socket of that user gets a fresh list, marked `pushed`. The
    * list is a full snapshot as of its arrival.
    */
@@ -978,13 +969,18 @@ export class TerminalBrowserHub {
   }
 
   private async sendTerminalList(conn: BrowserConn, pushed = false, requestId?: string) {
-    const rows = await prisma.cliDevice.findMany({
+    const rows = await prisma.node.findMany({
       where: { userId: conn.userId },
       orderBy: { createdAt: "asc" },
-      select: cliListSelect,
+      select: nodeListSelect,
     });
     if (pushed && !this.isLive(conn)) return;
-    const live = relaySessionManager.getLiveCliFeatures(rows.map((row) => row.id));
+    const live = new Map(
+      rows.flatMap((row) => {
+        const state = relaySessionManager.getLiveNodeState(row.id);
+        return state && state.userId === conn.userId ? [[row.id, state] as const] : [];
+      }),
+    );
     this.send(conn, {
       type: "terminals",
       ...(pushed ? { pushed: true } : {}),
@@ -997,23 +993,20 @@ export class TerminalBrowserHub {
           available: availability.available,
           publicKey: availability.publicKey,
           reason: availability.reason,
-          // 2.5 CLIs: several tabs can view one terminal (v2 terminal crypto).
+          // Several tabs can view one terminal (v2 terminal crypto).
           terminalViewers: live.get(row.id) != null,
-          // 2.5 CLI identity, relayed unverified. Browsers check the signature
-          // over `publicKey` and this slug, then pin the key per cliDeviceId.
+          // The node identity, relayed unverified. Browsers check the signature
+          // over `publicKey` and this slug, then pin the key per node.
           ...identityFields(availability.publicKey, live.get(row.id) ?? null),
         };
       }),
-      terminals: relaySessionManager.listTerminalsForUser(conn.userId, conn.id),
+      terminals: relaySessionManager
+        .listTerminalsForUser(conn.userId, conn.id)
+        .map(({ nodeId, ...terminal }) => ({
+          ...terminal,
+          cliDeviceId: nodeId,
+        })),
     });
-  }
-
-  private allocateTerminalId(): string {
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      const terminalId = randomBytes(16).toString("base64url");
-      if (!relaySessionManager.hasTerminal(terminalId)) return terminalId;
-    }
-    return randomBytes(16).toString("base64url");
   }
 
   private forwardAuth(conn: BrowserConn, terminalId: string, signature: string, ref: FrameRef) {
@@ -1029,12 +1022,14 @@ export class TerminalBrowserHub {
   private async openTerminal(
     conn: BrowserConn,
     message: Extract<z.infer<typeof browserClientMessageSchema>, { type: "open" }>,
+    /** The redeemed ticket's node; ownership and availability are checked again here. */
+    nodeId: string,
     terminalId: string,
     viewerId: string,
     /** Names the frame and, since `opening`, the terminal made for it. */
     ref: FrameRef,
   ) {
-    const row = await this.ownedDevice(conn.userId, message.cliDeviceId);
+    const row = await this.ownedNode(conn.userId, nodeId);
     // The browser may have gone while the lookup ran. Starting now would leave
     // a shell with a phantom viewer holding a terminal slot.
     if (!this.isLive(conn)) return;
@@ -1042,13 +1037,15 @@ export class TerminalBrowserHub {
       this.sendError(conn, "not_found", ref);
       return;
     }
-    const live = relaySessionManager.getLiveCliFeatures([row.id]).get(row.id) ?? null;
+    const state = relaySessionManager.getLiveNodeState(row.id);
+    // Defence in depth: a live session of another owner is never opened (as if offline).
+    const live = nodeOwnerMatches(state, conn.userId, "terminal_open") ? state : null;
     const availability = availabilityFor(row, live);
     if (!availability.available) {
       this.sendError(conn, availability.reason, ref);
       return;
     }
-    const approvalRequired = live?.terminalApproval === true;
+    const approvalRequired = live?.features.terminals.approvalRequired === true;
     const counts = relaySessionManager.terminalCounts(conn.userId, row.id);
     if (!approvalRequired && terminalLimitReached(counts)) {
       this.sendError(conn, "limit", ref);
@@ -1057,7 +1054,7 @@ export class TerminalBrowserHub {
     const started = relaySessionManager.startTerminal({
       terminalId,
       userId: conn.userId,
-      cliDeviceId: row.id,
+      nodeId: row.id,
       cols: message.cols,
       rows: message.rows,
       browserPublicKey: message.publicKey,
@@ -1066,7 +1063,66 @@ export class TerminalBrowserHub {
       connId: conn.id,
       viewerId,
     });
-    if (!started) this.sendError(conn, "offline", ref);
+    if (!started) {
+      this.sendError(conn, "offline", ref);
+      return;
+    }
+    // The ticket became a terminal: audited here, not when it was minted.
+    const now = new Date();
+    recordNodeAuditEvent({
+      userId: conn.userId,
+      nodeId: row.id,
+      actor: "USER",
+      kind: "browser_terminal",
+      subject: `terminal:${terminalId}`,
+      outcome: "opened",
+      startedAt: now,
+      finishedAt: now,
+    });
+  }
+
+  /**
+   * An attach ticket from `runtimes.steps.attach`: join the operator terminal the node opened
+   * for that step (also on a Relay-only node). The ticket is used up; it still has to name the
+   * step's current terminal, on its node. Answered like an open (`opening`, then `attached`),
+   * so the browser's ticket flow needs nothing else.
+   */
+  private attachOperatorStep(
+    conn: BrowserConn,
+    message: Extract<z.infer<typeof browserClientMessageSchema>, { type: "open" }>,
+    ticket: { nodeId: string; terminalId: string; stepId: string },
+    ref: FrameRef,
+  ) {
+    if (!this.isLive(conn)) return;
+    const current = relaySessionManager.operatorStepTerminal(ticket.stepId, conn.userId);
+    if (current?.terminalId !== ticket.terminalId || current.nodeId !== ticket.nodeId) {
+      this.sendError(conn, "ticket_invalid", ref);
+      return;
+    }
+    const result = relaySessionManager.attachOperatorTerminal({
+      terminalId: ticket.terminalId,
+      stepId: ticket.stepId,
+      userId: conn.userId,
+      connId: conn.id,
+      browserPublicKey: message.publicKey,
+      browserNonce: message.nonce,
+      ...(message.identity ? { identity: message.identity } : {}),
+    });
+    if (!result.ok) {
+      this.sendError(
+        conn,
+        result.error === "limit" ? "limit" : result.error === "offline" ? "offline" : "not_found",
+        ref,
+      );
+      return;
+    }
+    ref.terminalId = ticket.terminalId;
+    this.send(conn, {
+      type: "opening",
+      terminalId: ticket.terminalId,
+      viewerId: result.viewerId,
+      ...(ref.requestId ? { requestId: ref.requestId } : {}),
+    });
   }
 
   private attachTerminal(
@@ -1095,10 +1151,10 @@ export class TerminalBrowserHub {
     });
   }
 
-  private async ownedDevice(userId: string, cliDeviceId: string): Promise<CliListRow | null> {
-    return prisma.cliDevice.findFirst({
-      where: { id: cliDeviceId, userId },
-      select: cliListSelect,
+  private async ownedNode(userId: string, nodeId: string): Promise<NodeListRow | null> {
+    return prisma.node.findFirst({
+      where: { id: nodeId, userId },
+      select: nodeListSelect,
     });
   }
 

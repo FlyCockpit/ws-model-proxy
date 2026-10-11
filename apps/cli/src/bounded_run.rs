@@ -67,8 +67,9 @@ use crate::job_tree::{Child, JobTree};
 use std::collections::BTreeMap;
 #[cfg(not(windows))]
 use std::collections::BTreeSet;
+/// Registered with the subreaper, so its scan never reaps the run's child.
 #[cfg(not(windows))]
-use std::process::Child;
+type Child = crate::subreaper::Owned<std::process::Child>;
 use std::process::{ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -380,7 +381,7 @@ pub fn run(
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, RunError> {
     let deadline = Instant::now() + timeout;
-    run_inner(program, args, deadline, limit, cancel, None, false)
+    run_inner(program, args, deadline, limit, cancel, None, false, &[])
 }
 
 /// Total budget variant: settlement shares the caller's absolute deadline.
@@ -400,6 +401,29 @@ pub fn run_until(
         cancel,
         Some(deadline),
         false,
+        &[],
+    )
+}
+
+/// [`run_until`] with extra environment on top of the scrubbed parent
+/// environment (runtime commands: node secrets). Never log `env`.
+pub fn run_until_env(
+    program: &str,
+    args: &[String],
+    deadline: Instant,
+    limit: usize,
+    cancel: Option<&AtomicBool>,
+    env: &[(String, String)],
+) -> Result<Vec<u8>, RunError> {
+    run_inner(
+        program,
+        args,
+        deadline,
+        limit,
+        cancel,
+        Some(deadline),
+        false,
+        env,
     )
 }
 
@@ -414,9 +438,19 @@ pub fn run_until_any_status(
     limit: usize,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, RunError> {
-    run_inner(program, args, deadline, limit, cancel, Some(deadline), true)
+    run_inner(
+        program,
+        args,
+        deadline,
+        limit,
+        cancel,
+        Some(deadline),
+        true,
+        &[],
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     program: &str,
     args: &[String],
@@ -425,6 +459,7 @@ fn run_inner(
     cancel: Option<&AtomicBool>,
     settlement: Option<Instant>,
     any_status: bool,
+    extra_env: &[(String, String)],
 ) -> Result<Vec<u8>, RunError> {
     let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
     if cancelled() {
@@ -446,6 +481,11 @@ fn run_inner(
         .args(args)
         .env_clear()
         .envs(crate::child_env::scrub_parent_env(&[]))
+        .envs(
+            extra_env
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // Never read, never uploaded.
@@ -465,7 +505,7 @@ fn run_inner(
         });
     }
     #[cfg(not(windows))]
-    let mut child = match command.spawn() {
+    let mut child = match crate::subreaper::spawn(|| command.spawn(), |child| Some(child.id())) {
         Ok(child) => child,
         Err(_) => {
             spawn_failed();
@@ -1386,11 +1426,11 @@ mod tests {
     #[cfg(unix)]
     fn own_group_sleeper() -> Child {
         use std::os::unix::process::CommandExt;
-        Command::new("sleep")
-            .arg("30")
-            .process_group(0)
-            .spawn()
-            .expect("sleep")
+        crate::subreaper::spawn(
+            || Command::new("sleep").arg("30").process_group(0).spawn(),
+            |child| Some(child.id()),
+        )
+        .expect("sleep")
     }
 
     /// A run that already passed the shutdown check but is not registered

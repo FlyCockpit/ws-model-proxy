@@ -1,0 +1,39 @@
+processor	: 0
+vendor_id	: AuthenticAMD
+cpu family	: 25
+model		: 97
+model name	: AMD Ryzen 9 7950X 16-Core Processor
+stepping	: 2
+cpu MHz		: 4500.000
+cache size	: 1024 KB
+cpu cores	: 16
+
+processor	: 1
+vendor_id	: AuthenticAMD
+cpu family	: 25
+model		: 97
+model name	: AMD Ryzen 9 7950X 16-Core Processor
+stepping	: 2
+cpu MHz		: 4500.000
+cache size	: 1024 KB
+cpu cores	: 16
+
+processor	: 2
+vendor_id	: AuthenticAMD
+cpu family	: 25
+model		: 97
+model name	: AMD Ryzen 9 7950X 16-Core Processor
+stepping	: 2
+cpu MHz		: 4500.000
+cache size	: 1024 KB
+cpu cores	: 16
+
+processor	: 3
+vendor_id	: AuthenticAMD
+cpu family	: 25
+model		: 97
+model name	: AMD Ryzen 9 7950X 16-Core Processor
+stepping	: 2
+cpu MHz		: 4500.000
+cache size	: 1024 KB
+cpu cores	: 16

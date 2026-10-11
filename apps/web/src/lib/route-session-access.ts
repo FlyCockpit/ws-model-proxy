@@ -32,12 +32,6 @@ export type AdminRouteDecision =
   | { kind: "not-found" }
   | { kind: "error" };
 
-export type DeviceRouteDecision =
-  | { kind: "allow"; session: RouteSession }
-  | { kind: "redirect-to-login" }
-  | { kind: "redirect-to-dashboard" }
-  | { kind: "error" };
-
 export type McpConsentRouteDecision =
   | { kind: "allow"; session: RouteSession }
   | { kind: "redirect-to-mcp-login" }
@@ -70,7 +64,7 @@ export function failedRouteSessionResolution(): RouteSessionResolution {
  * Gate for the ordinary authenticated app (`_auth`: dashboard, settings).
  *
  * Checks only "is there a session" — NOT `emailVerified`. Verification gates
- * privilege escalation (admin/device), not basic use — matching the server
+ * privilege escalation (admin), not basic use — matching the server
  * (`protectedProcedure` has no verification check; admin gates do).
  */
 export function decideProtectedRouteAccess(
@@ -94,16 +88,6 @@ export function decideAdminRouteAccess(resolution: RouteSessionResolution): Admi
   const user = resolution.session?.user;
   if (!resolution.session || !user?.emailVerified || !isAdminRole(user.role)) {
     return { kind: "not-found" };
-  }
-  return { kind: "allow", session: resolution.session };
-}
-
-export function decideDeviceRouteAccess(resolution: RouteSessionResolution): DeviceRouteDecision {
-  if (resolution.status === "error") return { kind: "error" };
-  const user = resolution.session?.user;
-  if (!resolution.session) return { kind: "redirect-to-login" };
-  if (!user?.emailVerified || !isAdminRole(user.role)) {
-    return { kind: "redirect-to-dashboard" };
   }
   return { kind: "allow", session: resolution.session };
 }

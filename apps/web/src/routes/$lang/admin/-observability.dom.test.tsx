@@ -1,92 +1,94 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, waitFor } from "@testing-library/react";
-import type { ComponentType, ReactNode } from "react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { ComponentType } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { ObservabilitySearch } from "@/lib/observability-search";
+/** Admin → Observability: nodes, runtimes, pools and requests across accounts, paged. */
 
-const routeState = vi.hoisted(() => ({
-  search: {
-    tab: "clis",
-    page: 1,
-    owner: "",
-    cliStatus: "all",
-    endpointStatus: "all",
-    capability: "all",
-    poolHealth: "all",
-    relayStatus: "all",
-    errorClass: "",
-    createdAfter: "",
-    createdBefore: "",
-  },
-}));
-
-const calls = vi.hoisted(() => ({
-  clis: [] as Array<Record<string, unknown>>,
-  endpoints: [] as Array<Record<string, unknown>>,
-  models: [] as Array<Record<string, unknown>>,
-  pools: [] as Array<Record<string, unknown>>,
-  relays: [] as Array<Record<string, unknown>>,
+const state = vi.hoisted(() => ({
+  inputs: [] as Array<{ list: string; input: Record<string, unknown> }>,
 }));
 
 vi.mock("@tanstack/react-router", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@tanstack/react-router")>();
   return {
     ...actual,
-    createFileRoute: () => (options: { component: ComponentType }) => ({
-      options,
-      useSearch: () => routeState.search,
-      useNavigate: () => vi.fn(),
-    }),
-    stripSearchParams: () => undefined,
+    createFileRoute: () => (options: { component: ComponentType }) => ({ options }),
   };
 });
 
 vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({
+    t: (key: string, opts?: Record<string, unknown>) =>
+      opts && "count" in opts ? `${key}:${String(opts.count)}` : key,
+    i18n: { language: "en-US" },
+  }),
 }));
 
-vi.mock("@/components/segmented-control", () => ({
-  SegmentedControl: () => null,
-}));
-
-vi.mock("@ws-model-proxy/ui/components/select", () => ({
-  Select: ({ children }: { children: ReactNode }) => <div>{children}</div>,
-  SelectContent: ({ children }: { children: ReactNode }) => <div>{children}</div>,
-  SelectItem: ({ children }: { children: ReactNode }) => <div>{children}</div>,
-  SelectTrigger: ({ children }: { children: ReactNode }) => <div>{children}</div>,
-  SelectValue: () => null,
-}));
+const owner = { id: "u1", email: "u1@example.test", name: "U One", slug: "u-one" };
+const rows: Record<string, Array<Record<string, unknown>>> = {
+  nodes: [
+    {
+      id: "n1",
+      slug: "desk",
+      owner,
+      connection: "ONLINE",
+      trust: "FULL",
+      version: "0.4.0",
+      lastHeartbeatAt: null,
+      runningInstances: 2,
+    },
+  ],
+  runtimes: [
+    {
+      id: "r1",
+      slug: "qwen",
+      owner,
+      kind: "STARTABLE",
+      modelType: null,
+      instances: [{ id: "i1", phase: "READY" }],
+    },
+  ],
+  pools: [],
+  relay: [
+    {
+      id: "q1",
+      createdAt: new Date().toISOString(),
+      owner,
+      status: "FAILED",
+      callableId: "u-one/chat",
+      durationMs: 950,
+      errorClass: "upstream_5xx",
+    },
+  ],
+};
 
 vi.mock("@/utils/orpc", () => {
-  const queryOptions =
-    (name: keyof typeof calls) => (options: { input: Record<string, unknown> }) => ({
-      queryKey: [name, options.input],
+  const list = (name: string) => ({
+    queryOptions: ({ input }: { input: Record<string, unknown> }) => ({
+      queryKey: ["adminObservability", name, input],
       queryFn: async () => {
-        calls[name].push(options.input);
+        state.inputs.push({ list: name, input });
+        const items = rows[name] ?? [];
         return {
-          items: [],
-          total: 0,
-          pageCount: 1,
-          summary: {
-            durationMs: { average: null },
-            tokens: { total: 0 },
-            statusCounts: [],
-          },
+          ...(name === "relay" ? { partial: true } : {}),
+          items,
+          total: name === "nodes" ? 60 : items.length,
+          page: input.page,
+          pageSize: 25,
         };
       },
-    });
-
+    }),
+  });
   return {
     orpc: {
       adminObservability: {
-        listCliDevices: { queryOptions: queryOptions("clis") },
-        listEndpoints: { queryOptions: queryOptions("endpoints") },
-        listModels: { queryOptions: queryOptions("models") },
-        listPools: { queryOptions: queryOptions("pools") },
-        listRelayMetadataSummaries: { queryOptions: queryOptions("relays") },
+        nodes: list("nodes"),
+        runtimes: list("runtimes"),
+        pools: list("pools"),
+        relay: list("relay"),
       },
     },
   };
@@ -94,114 +96,57 @@ vi.mock("@/utils/orpc", () => {
 
 import { Route } from "./observability";
 
-const defaultSearch: ObservabilitySearch = {
-  tab: "clis",
-  page: 1,
-  owner: "",
-  cliStatus: "all",
-  endpointStatus: "all",
-  capability: "all",
-  poolHealth: "all",
-  relayStatus: "all",
-  errorClass: "",
-  createdAfter: "",
-  createdBefore: "",
-};
-
-async function mount(search: ObservabilitySearch) {
-  routeState.search = search;
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false, staleTime: 1000 * 60 * 5 } },
-  });
+async function mount() {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const Component = Route.options.component as ComponentType & {
     preload?: () => Promise<unknown>;
   };
   await Component.preload?.();
-  const view = render(
+  render(
     <QueryClientProvider client={client}>
       <Component />
     </QueryClientProvider>,
   );
-  const rerender = (nextSearch: ObservabilitySearch) => {
-    routeState.search = nextSearch;
-    view.rerender(
-      <QueryClientProvider client={client}>
-        <Component />
-      </QueryClientProvider>,
-    );
-  };
-  return { rerender };
-}
-
-function totalCalls() {
-  return Object.values(calls).reduce((total, procedureCalls) => total + procedureCalls.length, 0);
+  await screen.findByText("desk");
 }
 
 afterEach(() => {
   cleanup();
-  for (const procedureCalls of Object.values(calls)) procedureCalls.length = 0;
-  routeState.search = { ...defaultSearch };
+  state.inputs = [];
 });
 
-describe("admin observability query activation", () => {
-  it("fetches only the default or deep-linked active tab", async () => {
-    await mount({ ...defaultSearch });
-    await waitFor(() => expect(calls.clis).toHaveLength(1));
-    expect(totalCalls()).toBe(1);
-
-    cleanup();
-    for (const procedureCalls of Object.values(calls)) procedureCalls.length = 0;
-
-    await mount({ ...defaultSearch, tab: "relays" });
-    await waitFor(() => expect(calls.relays).toHaveLength(1));
-    expect(totalCalls()).toBe(1);
+describe("Admin observability", () => {
+  it("lists nodes with owners and pages through them", async () => {
+    await mount();
+    expect(screen.getByText("U One · u1@example.test")).toBeTruthy();
+    expect(screen.getByText(/admin:observability.running:2/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "admin:observability.next" }));
+    await waitFor(() =>
+      expect(state.inputs).toContainEqual({
+        list: "nodes",
+        input: { page: 2, pageSize: 25 },
+      }),
+    );
   });
 
-  it("fetches a newly active tab without fetching hidden tabs on that render", async () => {
-    const view = await mount({ ...defaultSearch });
-    await waitFor(() => expect(calls.clis).toHaveLength(1));
-
-    view.rerender({ ...defaultSearch, tab: "models" });
-    await waitFor(() => expect(calls.models).toHaveLength(1));
-
-    expect(calls.clis).toHaveLength(1);
-    expect(calls.endpoints).toHaveLength(0);
-    expect(calls.pools).toHaveLength(0);
-    expect(calls.relays).toHaveLength(0);
-  });
-
-  it("defers hidden filters until activation and reuses a fresh tab/input cache", async () => {
-    const view = await mount({ ...defaultSearch });
-    await waitFor(() => expect(calls.clis).toHaveLength(1));
-
-    view.rerender({ ...defaultSearch, endpointStatus: "OFFLINE" });
-    await Promise.resolve();
-    expect(calls.endpoints).toHaveLength(0);
-    expect(calls.clis).toHaveLength(1);
-
-    view.rerender({ ...defaultSearch, tab: "endpoints", endpointStatus: "OFFLINE" });
-    await waitFor(() => expect(calls.endpoints).toHaveLength(1));
-    expect(calls.endpoints[0]).toMatchObject({ status: "OFFLINE" });
-
-    view.rerender({ ...defaultSearch });
-    await Promise.resolve();
-    expect(calls.clis).toHaveLength(1);
-  });
-
-  it("fetches when an active tab filter or page changes", async () => {
-    const view = await mount({ ...defaultSearch, tab: "pools" });
-    await waitFor(() => expect(calls.pools).toHaveLength(1));
-
-    view.rerender({ ...defaultSearch, tab: "pools", poolHealth: "DEGRADED" });
-    await waitFor(() => expect(calls.pools).toHaveLength(2));
-
-    view.rerender({
-      ...defaultSearch,
-      tab: "pools",
-      poolHealth: "DEGRADED",
-      page: 2,
+  it("switches lists and narrows them to an owner", async () => {
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: "admin:observability.tabs.runtimes" }));
+    expect(await screen.findByText("qwen")).toBeTruthy();
+    expect(screen.getByText("admin:observability.service")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "admin:observability.tabs.pools" }));
+    expect(await screen.findByText("admin:observability.empty")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "admin:observability.tabs.requests" }));
+    expect(await screen.findByText("u-one/chat")).toBeTruthy();
+    expect(screen.getByText("admin:observability.totalAtLeast:1")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("admin:observability.ownerLabel"), {
+      target: { value: " one " },
     });
-    await waitFor(() => expect(calls.pools).toHaveLength(3));
-    expect(calls.pools[2]).toMatchObject({ memberHealth: "DEGRADED", page: 2 });
+    await waitFor(() =>
+      expect(state.inputs).toContainEqual({
+        list: "relay",
+        input: { page: 1, pageSize: 25, ownerQuery: "one" },
+      }),
+    );
   });
 });

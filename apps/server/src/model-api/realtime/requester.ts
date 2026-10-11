@@ -1,19 +1,19 @@
-import type { ModelApiTokenIdentity } from "@ws-model-proxy/api/lib/model-api-token-access";
+import type { ApiKeyIdentity } from "../resolve.js";
 
 /**
- * Who a live transcription session acts for. `/v1/realtime` sessions carry a
- * model API token; Chat Test sessions (`/api/internal/chat-test/realtime`)
- * carry the person's dashboard session and are attributed exactly as HTTP
- * Chat Test requests are: the user, source `CHAT_TEST`, no token, every
- * model the user can see, and `chat-test:<userId>` as the per-credential key.
+ * Who a live transcription session acts for. `/v1/realtime` sessions carry an
+ * API key; Chat Test sessions (`/api/internal/chat-test/realtime`) carry the
+ * person's dashboard session and are attributed exactly as HTTP Chat Test
+ * requests are: the user, source `TEST`, no key, every pool and served model
+ * the user can call, and `chat-test:<userId>` as the per-credential key.
  */
 export type RealtimeCredential =
-  | { kind: "token"; token: ModelApiTokenIdentity }
+  | { kind: "token"; token: ApiKeyIdentity }
   | { kind: "dashboard"; sessionId: string };
 
 export type RealtimeRequester = {
   userId: string;
-  /** The per-credential session cap's key: the token id, or `chat-test:<userId>`. */
+  /** The per-credential session cap's key: the API key id, or `chat-test:<userId>`. */
   limitKey: string;
   credential: RealtimeCredential;
 };
@@ -23,12 +23,9 @@ export type RealtimeCredentialRef =
   | { kind: "token"; tokenId: string }
   | { kind: "dashboard"; sessionId: string };
 
-/** The visible-model scope: a token's (allowlist, external consent) or the user's own. */
+/** The callable scope: an API key's pools, or everything the user can call. */
 export type RealtimeTargetAccess =
-  | {
-      kind: "token";
-      token: Pick<ModelApiTokenIdentity, "id" | "userId" | "scopeMode" | "allowExternal">;
-    }
+  | { kind: "token"; token: ApiKeyIdentity }
   | { kind: "dashboard"; userId: string };
 
 /** The HTTP Chat Test limit key (`requesterFromChatTestUser`). */
@@ -36,7 +33,7 @@ export function chatTestLimitKey(userId: string): string {
   return `chat-test:${userId}`;
 }
 
-export function tokenRequester(token: ModelApiTokenIdentity): RealtimeRequester {
+export function tokenRequester(token: ApiKeyIdentity): RealtimeRequester {
   return { userId: token.userId, limitKey: token.id, credential: { kind: "token", token } };
 }
 
@@ -48,7 +45,7 @@ export function dashboardRequester(userId: string, sessionId: string): RealtimeR
   };
 }
 
-/** The token id the send claim binds (null for Chat Test, as on HTTP). */
+/** The API key id the send claim binds (null for Chat Test, as on HTTP). */
 export function requesterTokenId(requester: RealtimeRequester): string | null {
   return requester.credential.kind === "token" ? requester.credential.token.id : null;
 }

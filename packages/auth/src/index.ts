@@ -1,10 +1,13 @@
 import { randomBytes } from "node:crypto";
-import { CLI_DEVICE_CODE_EXPIRES_IN } from "@ws-model-proxy/config/cli-device-login";
 import {
   FORWARDER_SLUG_MAX_LENGTH,
   slugifyForwarderSeed,
   validateForwarderSlug,
 } from "@ws-model-proxy/config/forwarder-identifiers";
+import {
+  INVITE_IN_USE_CODE,
+  shareInviteTokenFromHeaders,
+} from "@ws-model-proxy/config/share-invite";
 import prisma from "@ws-model-proxy/db";
 import { deleteUserDurably } from "@ws-model-proxy/db/parent-deletion";
 import { env } from "@ws-model-proxy/env/server";
@@ -16,21 +19,34 @@ import {
 } from "@ws-model-proxy/mailer";
 import { betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
-import { createAuthMiddleware } from "better-auth/api";
-import { admin, deviceAuthorization, twoFactor } from "better-auth/plugins";
+import { APIError, createAuthMiddleware } from "better-auth/api";
+import { admin, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
 import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
-import {
-  DISABLED_DEVICE_AUTHORIZATION_PATHS,
-  requireCliDeviceLoginScope,
-} from "./cli-device-login-scope";
 import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
+import { recordProvedEmail } from "./proved-email";
+import {
+  acceptClaimedShareInviteToken,
+  acceptShareInvitesForProvenEmail,
+  claimShareInviteToken,
+  isEmailVerificationPath,
+  isPendingShareInviteToken,
+} from "./share-invite-acceptance";
 import { resolveSignupLocale } from "./signup-locale";
-import { getSignupAccessState, resolveBootstrapAdminIdentity } from "./signup-policy";
+import {
+  getSignupAccessState,
+  resolveBootstrapAdminIdentity,
+  SignupDisabledError,
+} from "./signup-policy";
 import { notifyUserBanned } from "./user-ban-listeners";
-import { resolveUserCreatePolicy, toUserCreatePolicyInput } from "./user-create-policy";
+import {
+  isAdminCreateUserPath,
+  isPublicSignupPath,
+  resolveUserCreatePolicy,
+  toUserCreatePolicyInput,
+} from "./user-create-policy";
 import {
   mapSessionRefusalToForbidden,
   refuseAdminRestoreOfDeletingUser,
@@ -43,6 +59,92 @@ import { withVerificationCallback } from "./verification-callback";
 const isCrossOrigin = !!env.CORS_ORIGIN;
 /** Email/SMTP is optional; when configured, verification is required. */
 const emailConfigured = isEmailConfigured();
+
+/** Invite acceptance never fails the sign-up or update that triggered it. */
+async function acceptInvitesQuietly(user: unknown): Promise<void> {
+  const row = user as { id?: unknown; email?: unknown; emailVerified?: unknown } | null;
+  if (!row || typeof row.id !== "string" || typeof row.email !== "string") return;
+  try {
+    // Without SMTP every account is created "verified" without proof, so an e-mail match
+    // counts only when verification is on (inviteAcceptance: otherwise the link is needed).
+    await acceptShareInvitesForProvenEmail({
+      id: row.id,
+      email: row.email,
+      emailVerified: emailConfigured && row.emailVerified === true,
+    });
+  } catch (error) {
+    console.error("share invite acceptance failed", error instanceof Error ? error.name : "error");
+  }
+}
+
+/**
+ * A verify-email route verified this address: record it as proved. Without SMTP no verification
+ * link reaches a mailbox, so nothing is proved. A failure leaves the address unproved (shares by
+ * e-mail then go through an invite) and never fails the verification.
+ */
+async function recordProvedEmailQuietly(user: unknown): Promise<void> {
+  const row = user as { id?: unknown; email?: unknown; emailVerified?: unknown } | null;
+  if (!row || typeof row.id !== "string" || typeof row.email !== "string") return;
+  if (!emailConfigured || row.emailVerified !== true) return;
+  try {
+    await recordProvedEmail({ id: row.id, email: row.email });
+  } catch (error) {
+    console.error("proved e-mail record failed", error instanceof Error ? error.name : "error");
+  }
+}
+
+/**
+ * The invite token of a public sign-up request (the `x-wsmp-invite` header the sign-up page
+ * sends); null on every other route, so the header opens nothing else.
+ */
+function signupInviteToken(
+  context: { path?: unknown; headers?: Headers; request?: Request } | null | undefined,
+): string | null {
+  if (!isPublicSignupPath(typeof context?.path === "string" ? context.path : null)) return null;
+  return shareInviteTokenFromHeaders(context?.headers ?? context?.request?.headers);
+}
+
+/**
+ * The invite token each sign-up claimed in the user-create `before` hook, for its `after` hook.
+ * Better Auth hands both hooks the same endpoint context object.
+ */
+const inviteClaims = new WeakMap<object, string>();
+
+/** A slug change through Better Auth's update routes (see `databaseHooks.user.update`). */
+function slugChangeRefused(): APIError {
+  return new APIError("BAD_REQUEST", {
+    message: "Change the account slug in the settings (settings.update), not here.",
+    code: "SLUG_CHANGE_UNSUPPORTED",
+  });
+}
+
+/** A second sign-up with an invite link another e-mail's sign-up holds right now. */
+function inviteInUseError(): APIError {
+  return new APIError("CONFLICT", {
+    code: INVITE_IN_USE_CODE,
+    message: "This invite link is in use. Try again shortly.",
+  });
+}
+
+/**
+ * The invite link acceptance never fails the sign-up that carried it. A failure is logged with
+ * the user id and the error class (never the token). The claim stays with this account's
+ * e-mail, so the person can still accept the invite signed in (`auth.acceptInvite`).
+ */
+async function acceptClaimedInviteQuietly(user: unknown, token: string): Promise<void> {
+  const row = user as { id?: unknown; email?: unknown } | null;
+  if (!row || typeof row.id !== "string" || typeof row.email !== "string") return;
+  try {
+    const accepted = await acceptClaimedShareInviteToken({ id: row.id, email: row.email }, token);
+    if (!accepted) console.error("share invite link acceptance refused", `user=${row.id}`);
+  } catch (error) {
+    console.error(
+      "share invite link acceptance failed",
+      `user=${row.id}`,
+      error instanceof Error ? error.name : "error",
+    );
+  }
+}
 
 const userSlugInputSchema = z
   .string()
@@ -243,9 +345,6 @@ export const auth = betterAuth({
       ? { sameSite: "none", secure: true, httpOnly: true }
       : { httpOnly: true, secure: env.NODE_ENV === "production" },
   },
-  // The device-flow paths this PR replaces with the atomic claim+approve
-  // procedure; see DISABLED_DEVICE_AUTHORIZATION_PATHS.
-  disabledPaths: [...DISABLED_DEVICE_AUTHORIZATION_PATHS],
   plugins: [
     admin({
       defaultRole: "user",
@@ -292,28 +391,11 @@ export const auth = betterAuth({
           }
         : {}),
     }),
-    // OAuth 2.0 Device Authorization Grant (RFC 8628) for `wsmp login`. The
-    // plugin handles the request and approval steps; the approved code is
-    // redeemed only by `cliCredentials.exchangeDeviceCode` for one device
-    // credential. Its session-minting `/device/token` is disabled above.
-    // The plugin's options schema uses `z.custom(() => true)` for the
-    // `schema` field without `.optional()`, so we have to pass it explicitly
-    // (even as `undefined`) or zod rejects the call at startup.
-    deviceAuthorization({
-      expiresIn: CLI_DEVICE_CODE_EXPIRES_IN,
-      interval: "5s",
-      // Every request names the CLI slug it is for (`cli-slug:<slug>`); the
-      // approval page shows it and the exchange mints for that slug only.
-      onDeviceAuthRequest: requireCliDeviceLoginScope,
-      // The adapter looks up `db.deviceCode` by the schema key `deviceCode`,
-      // and the options-schema parser marks `schema` as nonoptional, so pass
-      // the Prisma model mapping explicitly.
-      schema: { deviceCode: { modelName: "deviceCode" } },
-    }),
+    // Nodes enroll with a one-time code minted in the browser (`nodes.enrollmentCodes`,
+    // plain-HTTP exchange); there is no device-authorization flow in 0.4.0.
     // MCP/OAuth surface. Installed while WMP_MCP_ENABLED is true (the default):
     // jwt/mcp/cimd from Better Auth 1.7.3. The kill switch leaves this spread
-    // empty, so the plugin list above is exactly admin, twoFactor, and
-    // deviceAuthorization.
+    // empty, so the plugin list above is exactly admin and twoFactor.
     ...resolveMcpPlugins({
       enabled: env.WMP_MCP_ENABLED,
       baseUrl: env.BETTER_AUTH_URL,
@@ -357,11 +439,22 @@ export const auth = betterAuth({
         before: async (user, context) => {
           const { signupEnabled, userCount } = await getSignupAccessState();
           const bootstrapAdminIdentity = resolveBootstrapAdminIdentity(user.email);
+          // An invite link (the `x-wsmp-invite` header, public sign-up route only). With open
+          // sign-up off it is what lets this sign-up through, so it must be pending here and
+          // reserved below.
+          const inviteToken = signupInviteToken(context);
+          const reliesOnInvite =
+            !signupEnabled && !(userCount === 0 && bootstrapAdminIdentity.allowed);
+          const inviteTokenPending =
+            !signupEnabled &&
+            inviteToken !== null &&
+            (await isPendingShareInviteToken(inviteToken));
           const policy = resolveUserCreatePolicy(
             toUserCreatePolicyInput({
               signupEnabled,
               userCount,
               adminBootstrapAllowed: bootstrapAdminIdentity.allowed,
+              inviteTokenPending,
               emailConfigured,
               user,
               context,
@@ -372,6 +465,17 @@ export const auth = betterAuth({
             name: typeof user.name === "string" ? user.name : undefined,
             email: typeof user.email === "string" ? user.email : undefined,
           });
+          // Reserve the invite for this sign-up's e-mail (compare-and-swap), after every other
+          // refusal so a refused request does not hold it. The claim is written outside the
+          // sign-up transaction: if the insert rolls back, the same e-mail can retry at once.
+          // Another e-mail inside the claim window gets "in use"; an invite that is no longer
+          // available refuses the sign-up only when the invite is what admits it.
+          if (inviteToken !== null && context && typeof user.email === "string") {
+            const claim = await claimShareInviteToken(inviteToken, user.email);
+            if (claim === "claimed") inviteClaims.set(context, inviteToken);
+            else if (claim === "in_use") throw inviteInUseError();
+            else if (reliesOnInvite) throw new SignupDisabledError();
+          }
           const locale = resolveSignupLocale(context?.headers);
           return {
             data: {
@@ -388,15 +492,44 @@ export const auth = betterAuth({
             },
           };
         },
+        // The invite link the person signed up through becomes a share (the token is the
+        // proof); pending share invites to this e-mail become shares once the e-mail is proven.
+        after: async (user, context) => {
+          // An admin-created account's e-mail is marked verified without proof (the admin
+          // knows its temporary password), so its invites wait for the invite link.
+          if (isAdminCreateUserPath(typeof context?.path === "string" ? context.path : null)) {
+            return;
+          }
+          const claimedToken = context ? inviteClaims.get(context) : undefined;
+          if (context && claimedToken) {
+            inviteClaims.delete(context);
+            await acceptClaimedInviteQuietly(user, claimedToken);
+          }
+          await acceptInvitesQuietly(user);
+        },
       },
       update: {
+        // The account slug is the first half of every callable ID of the person's pools: it
+        // changes only through `settings.update`, which claims the renamed IDs against the
+        // person's own aliases under their owner fence (packages/api lib/model-names.ts).
+        // Better Auth's update routes (`/update-user`, `/admin/update-user`) cannot take it.
+        before: async (data) => {
+          if ((data as { slug?: unknown }).slug !== undefined) throw slugChangeRefused();
+        },
         // A user row that now carries an ACTIVE ban (`/admin/ban-user`, or an
         // `/admin/update-user` that sets `banned`) ends the user's in-flight
         // relay work. Better Auth runs `after` once the update's transaction
         // committed. Any later update of a still-banned user notifies again;
         // the cancel is idempotent. An unban or an expired ban notifies nothing.
-        after: async (user) => {
+        after: async (user, context) => {
           if (!user) return;
+          // Verifying the e-mail proves it (for direct shares) and accepts the invites sent to
+          // it — only on the verification routes: an admin-created account is "verified"
+          // without proof.
+          if (isEmailVerificationPath(context?.path)) {
+            await recordProvedEmailQuietly(user);
+            await acceptInvitesQuietly(user);
+          }
           const row = user as { id: string; banned?: unknown; banExpires?: unknown };
           if (
             isUserBanned(

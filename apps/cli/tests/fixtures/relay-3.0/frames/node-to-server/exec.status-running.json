@@ -1,0 +1,10 @@
+{
+  "type": "exec.status",
+  "commandId": "UnecweYLMFV6n8TpDjNYfQ",
+  "state": "running",
+  "startedAt": "2026-10-06T12:00:00.000Z",
+  "endsBy": "2026-10-06T13:00:00.000Z",
+  "tail": "[####      ] 42% Qwen3-32B-Q4_K_M.gguf\n",
+  "truncated": true,
+  "outputBytes": 1048576
+}

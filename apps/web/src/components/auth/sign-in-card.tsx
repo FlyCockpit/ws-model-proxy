@@ -51,7 +51,7 @@ export interface SignInOutcome {
   url: string;
   /**
    * Standard mode keeps its historical SPA navigation for the exact
-   * dashboard path; every other destination (and every mcp-mode
+   * overview path; every other destination (and every mcp-mode
    * destination) is a full document load so OAuth redirects work.
    */
   preferRouterNavigate: boolean;
@@ -81,15 +81,11 @@ export function SignInCard({ lang, mode, redirectTo, mcpDescription }: SignInCar
   const [otpSent, setOtpSent] = useState(false);
   const [isSendingOtp, setIsSendingOtp] = useState(false);
   const { state } = useAuthSession();
-  const config = useQuery(orpc.appConfig.queryOptions());
+  const config = useQuery(orpc.app.config.queryOptions());
   const { t } = useTranslation(["auth", "common"]);
 
-  const ssoEnabled = config.data?.ssoEnabled ?? false;
-  const forceSso = config.data?.forceSso === true;
-  const ssoProviderName = config.data?.ssoProviderName ?? "SSO";
   const signupEnabled =
-    !forceSso &&
-    ((config.data?.signupEnabled ?? true) || config.data?.adminBootstrapSignupEnabled === true);
+    (config.data?.signupEnabled ?? true) || config.data?.adminBootstrapSignupEnabled === true;
   const emailEnabled = config.data?.emailEnabled ?? false;
   const postAuthRedirect = safeRedirectTo(redirectTo, lang);
 
@@ -108,14 +104,12 @@ export function SignInCard({ lang, mode, redirectTo, mcpDescription }: SignInCar
     }
     return {
       url: postAuthRedirect,
-      preferRouterNavigate: postAuthRedirect === `/${lang}/dashboard`,
+      preferRouterNavigate: postAuthRedirect === `/${lang}/overview`,
     };
   };
 
   // In mcp mode the SSO callback returns to THIS page (signed query kept in
   // the URL) so the authenticated branch can continue the transaction.
-  const ssoCallbackURL =
-    mode === "mcp" && typeof window !== "undefined" ? window.location.href : postAuthRedirect;
 
   if (state.status === "pending" || config.isPending) {
     return (
@@ -152,17 +146,6 @@ export function SignInCard({ lang, mode, redirectTo, mcpDescription }: SignInCar
       </div>
     );
   }
-
-  const handleSsoLogin = async () => {
-    const result = await authClient.signIn.social({
-      provider: "sso",
-      callbackURL: ssoCallbackURL,
-    });
-    if (result.error) {
-      console.error("[login.sso]", result.error);
-      toast.error(t("auth:login.ssoFailed"));
-    }
-  };
 
   const handle2FAVerify = async () => {
     setIsVerifying2FA(true);
@@ -309,42 +292,16 @@ export function SignInCard({ lang, mode, redirectTo, mcpDescription }: SignInCar
           >
             {mode === "mcp"
               ? (mcpDescription ?? t("auth:mcpLogin.description"))
-              : forceSso
-                ? t("auth:login.ssoOnlyDescription", { provider: ssoProviderName })
-                : t("auth:login.signinDescription")}
+              : t("auth:login.signinDescription")}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          {ssoEnabled && (
-            <>
-              <Button variant="outline" className="min-h-[44px] w-full" onClick={handleSsoLogin}>
-                {t("auth:login.ssoContinue", { provider: ssoProviderName })}
-              </Button>
-              {!forceSso && (
-                <div className="relative">
-                  <div className="absolute inset-0 flex items-center">
-                    <span className="w-full border-t" />
-                  </div>
-                  <div className="relative flex justify-center text-xs uppercase">
-                    <span className="bg-card px-2 text-muted-foreground">{t("auth:login.or")}</span>
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-          {!forceSso && (
-            <SignInForm
-              lang={lang}
-              redirectTo={postAuthRedirect}
-              onNeeds2FA={() => setNeeds2FA(true)}
-              resolveOutcome={resolveOutcome}
-            />
-          )}
-          {forceSso && !ssoEnabled && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
-              {t("auth:login.ssoUnavailable")}
-            </div>
-          )}
+          <SignInForm
+            lang={lang}
+            redirectTo={postAuthRedirect}
+            onNeeds2FA={() => setNeeds2FA(true)}
+            resolveOutcome={resolveOutcome}
+          />
           {mode === "standard" && signupEnabled && (
             <div className="text-center">
               <Link
@@ -403,8 +360,8 @@ function SignInForm({
       }
       toast.success(t("auth:signedInSuccess"));
       const outcome = resolveOutcome(result.data as Record<string, unknown> | undefined);
-      if (outcome.preferRouterNavigate && redirectTo === `/${lang}/dashboard`) {
-        navigate({ to: "/$lang/dashboard", params: { lang } });
+      if (outcome.preferRouterNavigate && redirectTo === `/${lang}/overview`) {
+        navigate({ to: "/$lang/overview", params: { lang } });
       } else {
         window.location.assign(outcome.url);
       }

@@ -1,0 +1,134 @@
+{
+  "cases": [
+    {
+      "name": "vLLM pydantic v2 errors rendered in an OpenAI error",
+      "status": 400,
+      "body": "{\"error\":{\"message\":\"[{'type': 'extra_forbidden', 'loc': ('body', 'stream_options'), 'msg': 'Extra inputs are not permitted', 'input': {'include_usage': True}}]\",\"type\":\"BadRequestError\",\"param\":null,\"code\":400}}",
+      "request": {
+        "model": "m",
+        "messages": [],
+        "stream": true,
+        "stream_options": { "include_usage": true }
+      },
+      "expect": { "kind": "field", "path": "stream_options" }
+    },
+    {
+      "name": "FastAPI 422 detail list with a union tag in the location",
+      "status": 422,
+      "body": "{\"detail\":[{\"type\":\"extra_forbidden\",\"loc\":[\"body\",\"messages\",1,\"ChatCompletionUserMessageParam\",\"cache_control\"],\"msg\":\"Extra inputs are not permitted\",\"input\":{\"type\":\"ephemeral\"}}]}",
+      "request": {
+        "model": "m",
+        "messages": [
+          { "role": "system", "content": "s" },
+          { "role": "user", "content": "hi", "cache_control": { "type": "ephemeral" } }
+        ]
+      },
+      "expect": { "kind": "field", "path": "messages[].cache_control" }
+    },
+    {
+      "name": "SGLang pydantic text form",
+      "status": 400,
+      "body": "{\"object\":\"error\",\"message\":\"1 validation error for ChatCompletionRequest\\nstream_options.include_usage\\n  Extra inputs are not permitted [type=extra_forbidden, input_value=True, input_type=bool]\",\"type\":\"BadRequestError\",\"param\":null,\"code\":400}",
+      "request": { "model": "m", "messages": [], "stream_options": { "include_usage": true } },
+      "expect": { "kind": "field", "path": "stream_options.include_usage" }
+    },
+    {
+      "name": "pydantic v1 (older vLLM) extra fields not permitted",
+      "status": 400,
+      "body": "{\"object\":\"error\",\"message\":\"[{'loc': ('body', 'parallel_tool_calls'), 'msg': 'extra fields not permitted', 'type': 'value_error.extra'}]\",\"type\":\"BadRequestError\",\"param\":null,\"code\":400}",
+      "request": { "model": "m", "messages": [], "parallel_tool_calls": false },
+      "expect": { "kind": "field", "path": "parallel_tool_calls" }
+    },
+    {
+      "name": "TGI serde unknown field",
+      "status": 422,
+      "body": "{\"error\":\"Failed to deserialize the JSON body into the target type: unknown field `store`, expected one of `frequency_penalty`, `logit_bias`, `messages`, `model` at line 1 column 58\",\"error_type\":\"validation\"}",
+      "request": { "model": "m", "messages": [], "store": false },
+      "expect": { "kind": "field", "path": "store" }
+    },
+    {
+      "name": "Ollama Go encoding/json unknown field",
+      "status": 400,
+      "body": "{\"error\":{\"message\":\"json: unknown field \\\"metadata\\\"\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}",
+      "request": { "model": "m", "messages": [], "metadata": { "a": "b" } },
+      "expect": { "kind": "field", "path": "metadata" }
+    },
+    {
+      "name": "llama.cpp unsupported param",
+      "status": 400,
+      "body": "{\"error\":{\"code\":400,\"message\":\"Unsupported param: tools\",\"type\":\"invalid_request_error\"}}",
+      "request": { "model": "m", "messages": [], "tools": [] },
+      "expect": { "kind": "field", "path": "tools" }
+    },
+    {
+      "name": "OpenAI unrecognized request argument",
+      "status": 400,
+      "body": "{\"error\":{\"message\":\"Unrecognized request argument supplied: user_id\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}",
+      "request": { "model": "m", "messages": [], "user_id": "x" },
+      "expect": { "kind": "field", "path": "user_id" }
+    },
+    {
+      "name": "OpenAI asks for another spelling",
+      "status": 400,
+      "body": "{\"error\":{\"message\":\"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.\",\"type\":\"invalid_request_error\",\"param\":\"max_tokens\",\"code\":\"unsupported_parameter\"}}",
+      "request": { "model": "m", "messages": [], "max_tokens": 10 },
+      "expect": { "kind": "replace", "path": "max_tokens", "with": "max_completion_tokens" }
+    },
+    {
+      "name": "Anthropic-style dotted location",
+      "status": 400,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages.0.content.0.citations: Extra inputs are not permitted\"}}",
+      "request": {
+        "model": "m",
+        "max_tokens": 5,
+        "messages": [
+          { "role": "user", "content": [{ "type": "text", "text": "hi", "citations": [] }] }
+        ]
+      },
+      "expect": { "kind": "field", "path": "messages[].content[].citations" }
+    },
+    {
+      "name": "Anthropic beta header",
+      "status": 400,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Unexpected value(s) `fancy-2025-01-01` for the `anthropic-beta` header. Please consult our documentation.\"}}",
+      "request": { "model": "m", "max_tokens": 5, "messages": [] },
+      "headers": { "anthropic-beta": "fancy-2025-01-01" },
+      "expect": { "kind": "header", "name": "anthropic-beta", "reason": "value" }
+    },
+    {
+      "name": "pydantic union tag for an unknown role",
+      "status": 400,
+      "body": "{\"object\":\"error\",\"message\":\"1 validation error for ChatCompletionRequest\\nmessages.0\\n  Input tag 'developer' found using 'role' does not match any of the expected tags: 'system', 'user', 'assistant', 'tool' [type=union_tag_invalid]\",\"type\":\"BadRequestError\",\"param\":null,\"code\":400}",
+      "request": { "model": "m", "messages": [{ "role": "developer", "content": "be brief" }] },
+      "expect": { "kind": "role", "value": "developer" }
+    },
+    {
+      "name": "a field the request does not have is not learned",
+      "status": 400,
+      "body": "{\"error\":{\"message\":\"Unrecognized request argument supplied: ghost\",\"type\":\"invalid_request_error\"}}",
+      "request": { "model": "m", "messages": [] },
+      "expect": null
+    },
+    {
+      "name": "an unrelated 400",
+      "status": 400,
+      "body": "{\"error\":{\"message\":\"This model's maximum context length is 4096 tokens.\",\"type\":\"invalid_request_error\"}}",
+      "request": { "model": "m", "messages": [] },
+      "expect": null
+    },
+    {
+      "name": "a non-JSON body",
+      "status": 400,
+      "body": "Bad Request",
+      "request": { "model": "m", "messages": [] },
+      "expect": null
+    },
+    {
+      "name": "a 500 is never parsed",
+      "status": 500,
+      "body": "{\"error\":{\"message\":\"Unrecognized request argument supplied: user_id\"}}",
+      "request": { "model": "m", "messages": [], "user_id": "x" },
+      "expect": null
+    }
+  ]
+}

@@ -31,16 +31,22 @@ function row(overrides: Partial<RelayRollupRow> = {}): RelayRollupRow {
     id: "relay-1",
     userId: "user-1",
     status: "SUCCEEDED",
-    fallbackRoute: null,
-    source: "API_TOKEN",
+    route: "local",
+    external: false,
+    rejection: null,
+    source: "API_KEY",
     startedAt,
     completedAt: new Date("2026-09-24T10:15:01.250Z"),
     durationMs: 1250,
     firstClientByteAt: new Date("2026-09-24T10:15:00.400Z"),
-    requestedModelPoolId: "pool-1",
-    selectedPoolMemberId: "member-1",
-    requestedExecutionTargetId: null,
-    selectedExecutionTargetId: "target-1",
+    queueWaitMs: null,
+    poolId: "pool-1",
+    runtimeModelId: "model-1",
+    selectedTargetId: "target-1",
+    selectedInstanceId: "instance-1",
+    selectedVersionId: "version-1",
+    selectedNodeId: "node-1",
+    selectedProviderModelId: null,
     attemptCount: 1,
     promptTokens: 100,
     completionTokens: 20,
@@ -50,6 +56,7 @@ function row(overrides: Partial<RelayRollupRow> = {}): RelayRollupRow {
     affinityOutcome: "PREDICTED_MATCH",
     operation: null,
     audioInputMs: null,
+    contextTokenCount: null,
     // Derived by the database at insert (schema-hardening.sql): the pool owner.
     resourceOwnerUserId: "owner-1",
     ...overrides,
@@ -97,9 +104,12 @@ describe("rollupIncrementForRequest", () => {
       ownerUserId: "owner-1",
       requesterUserId: "user-1",
       poolId: "pool-1",
-      poolMemberId: "member-1",
-      executionTargetId: "target-1",
-      source: "API_TOKEN",
+      instanceId: "instance-1",
+      runtimeModelId: "model-1",
+      versionId: "version-1",
+      nodeId: "node-1",
+      providerModelId: "",
+      source: "API_KEY",
       requests: 1,
       successes: 1,
       errors: 0,
@@ -127,22 +137,35 @@ describe("rollupIncrementForRequest", () => {
   it("maps missing identities to the '' sentinel (never NULL)", () => {
     const increment = rollupIncrementForRequest(
       row({
-        requestedModelPoolId: null,
-        selectedPoolMemberId: null,
-        selectedExecutionTargetId: null,
-        requestedExecutionTargetId: null,
+        poolId: null,
+        runtimeModelId: null,
+        selectedInstanceId: null,
+        selectedVersionId: null,
+        selectedNodeId: null,
       }),
     )!;
     expect(increment.poolId).toBe("");
-    expect(increment.poolMemberId).toBe("");
-    expect(increment.executionTargetId).toBe("");
+    expect(increment.instanceId).toBe("");
+    expect(increment.runtimeModelId).toBe("");
+    expect(increment.versionId).toBe("");
+    expect(increment.nodeId).toBe("");
+    // B5 fills the runtime from the instance; until then it is the '' sentinel.
+    expect(increment.runtimeId).toBe("");
   });
 
-  it("falls back to the requested execution target for direct requests", () => {
-    const increment = rollupIncrementForRequest(
-      row({ selectedExecutionTargetId: null, requestedExecutionTargetId: "requested" }),
-    )!;
-    expect(increment.executionTargetId).toBe("requested");
+  it("counts cloud requests and refusals by reason family", () => {
+    expect(rollupIncrementForRequest(row({ external: true, route: "cloud" }))).toMatchObject({
+      cloudRequests: 1,
+    });
+    expect(
+      rollupIncrementForRequest(row({ status: "FAILED", rejection: "context_too_large" })),
+    ).toMatchObject({ rejectedContext: 1, rejectedCapacity: 0, rejectedOther: 0 });
+    expect(
+      rollupIncrementForRequest(row({ status: "FAILED", rejection: "capacity_wait_expired" })),
+    ).toMatchObject({ rejectedCapacity: 1 });
+    expect(
+      rollupIncrementForRequest(row({ status: "FAILED", rejection: "no_member" })),
+    ).toMatchObject({ rejectedOther: 1 });
   });
 
   it("keys the stored resource owner (else the requester) and the requester", () => {
@@ -151,13 +174,13 @@ describe("rollupIncrementForRequest", () => {
     const pooled = rollupIncrementForRequest(row())!;
     expect([pooled.ownerUserId, pooled.requesterUserId]).toEqual(["owner-1", "user-1"]);
     const direct = rollupIncrementForRequest(
-      row({ requestedModelPoolId: null, resourceOwnerUserId: "target-owner" }),
+      row({ poolId: null, resourceOwnerUserId: "target-owner" }),
     )!;
     expect(direct.ownerUserId).toBe("target-owner");
     const unresolved = rollupIncrementForRequest(
       row({
-        requestedModelPoolId: null,
-        selectedExecutionTargetId: null,
+        poolId: null,
+        selectedTargetId: null,
         resourceOwnerUserId: null,
       }),
     )!;
@@ -170,17 +193,16 @@ describe("rollupIncrementForRequest", () => {
     const orphaned = rollupIncrementForRequest(
       row({
         resourceOwnerUserId: "owner-1",
-        requestedModelPoolId: null,
-        selectedPoolMemberId: null,
-        selectedExecutionTargetId: null,
+        poolId: null,
+        selectedTargetId: null,
+        selectedInstanceId: null,
       }),
     )!;
     expect(orphaned).toMatchObject({
       ownerUserId: "owner-1",
       requesterUserId: "user-1",
       poolId: "",
-      poolMemberId: "",
-      executionTargetId: "",
+      instanceId: "",
     });
     // Own-key traffic stays with the requester even though the stored owner
     // is the pool owner.
@@ -188,7 +210,7 @@ describe("rollupIncrementForRequest", () => {
       rollupIncrementForRequest(
         row({
           resourceOwnerUserId: "owner-1",
-          fallbackRoute: "own-key",
+          route: "own_key",
         }),
       )!.ownerUserId,
     ).toBe("user-1");
@@ -263,10 +285,10 @@ describe("merge and SQL", () => {
   it("merges increments with the same composite key", () => {
     const first = rollupIncrementForRequest(row())!;
     const second = rollupIncrementForRequest(row({ id: "relay-2", status: "FAILED" }))!;
-    const other = rollupIncrementForRequest(row({ selectedPoolMemberId: "member-2" }))!;
+    const other = rollupIncrementForRequest(row({ selectedInstanceId: "instance-2" }))!;
     const merged = mergeRollupIncrements([first, second, other]);
     expect(merged).toHaveLength(2);
-    const combined = merged.find((increment) => increment.poolMemberId === "member-1")!;
+    const combined = merged.find((increment) => increment.instanceId === "instance-1")!;
     expect(combined.requests).toBe(2);
     expect(combined.errors).toBe(1);
     expect(combined.latencyHistogram[latencyBucketIndex(1250)]).toBe(2);
@@ -279,7 +301,7 @@ describe("merge and SQL", () => {
     const text = sql.sql.replace(/\s+/g, " ");
     expect(text).toContain("INSERT INTO usage_rollup_minute");
     expect(text).toContain(
-      'ON CONFLICT ("bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId", "executionTargetId", "source") DO UPDATE SET',
+      'ON CONFLICT ("bucketStart", "ownerUserId", "requesterUserId", "poolId", "runtimeId", "versionId", "nodeId", "instanceId", "runtimeModelId", "providerModelId", "source") DO UPDATE SET',
     );
     expect(text).toContain('"requests" = usage_rollup_minute."requests" + EXCLUDED."requests"');
     // The owner key is a plain durable id: a deleted owner's increment is skipped.
@@ -297,13 +319,14 @@ describe("merge and SQL", () => {
   it("writes one statement per merged key in sorted order", async () => {
     const tx = { $executeRaw: vi.fn().mockResolvedValue(1) };
     const written = await writeRollupIncrements(tx, "usage_rollup_hour", [
-      rollupIncrementForRequest(row({ selectedPoolMemberId: "b" }))!,
-      rollupIncrementForRequest(row({ selectedPoolMemberId: "a" }))!,
-      rollupIncrementForRequest(row({ selectedPoolMemberId: "a" }))!,
+      rollupIncrementForRequest(row({ selectedInstanceId: "b" }))!,
+      rollupIncrementForRequest(row({ selectedInstanceId: "a" }))!,
+      rollupIncrementForRequest(row({ selectedInstanceId: "a" }))!,
     ]);
     expect(written).toBe(2);
     expect(tx.$executeRaw).toHaveBeenCalledTimes(2);
-    const members = tx.$executeRaw.mock.calls.map(([sql]) => (sql as Prisma.Sql).values[4]);
+    // Values: bucket, owner, requester, then pool, runtime, version, node, instance (index 7).
+    const members = tx.$executeRaw.mock.calls.map(([sql]) => (sql as Prisma.Sql).values[7]);
     expect(members).toEqual(["a", "b"]);
   });
 
@@ -311,10 +334,10 @@ describe("merge and SQL", () => {
     const tx = { $executeRaw: vi.fn().mockResolvedValue(1) };
     // localeCompare would put "a" before "B"; code-point order is "B" < "a".
     await writeRollupIncrements(tx, "usage_rollup_minute", [
-      rollupIncrementForRequest(row({ selectedPoolMemberId: "a" }))!,
-      rollupIncrementForRequest(row({ selectedPoolMemberId: "B" }))!,
+      rollupIncrementForRequest(row({ selectedInstanceId: "a" }))!,
+      rollupIncrementForRequest(row({ selectedInstanceId: "B" }))!,
     ]);
-    const members = tx.$executeRaw.mock.calls.map(([sql]) => (sql as Prisma.Sql).values[4]);
+    const members = tx.$executeRaw.mock.calls.map(([sql]) => (sql as Prisma.Sql).values[7]);
     expect(members).toEqual(["B", "a"]);
   });
 
@@ -393,13 +416,11 @@ describe("transitionRelayRequestTerminal (exactly-once claim)", () => {
   });
 });
 
-it("own-key rollups belong to requester and omit owner pool/member identities", () => {
-  const increment = rollupIncrementForRequest(row({ fallbackRoute: "own-key" }));
+it("own-key rollups belong to requester and omit the owner's pool", () => {
+  const increment = rollupIncrementForRequest(row({ route: "own_key" }));
   expect(increment).toMatchObject({
     ownerUserId: "user-1",
     requesterUserId: "user-1",
     poolId: "",
-    poolMemberId: "",
-    executionTargetId: "target-1",
   });
 });

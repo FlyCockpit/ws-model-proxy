@@ -1,4 +1,3 @@
-import { DEVICE_LOGIN_REFUSAL_REASONS } from "@ws-model-proxy/config/cli-device-login";
 import { describe, expect, it } from "vitest";
 import enAuth from "../locales/en-US/auth.json";
 import esAuth from "../locales/es-MX/auth.json";
@@ -25,30 +24,6 @@ describe("auth locale key parity (en-US / es-MX)", () => {
     expect(keyTree(esAuth.mcpConsent)).toEqual(keyTree(enAuth.mcpConsent));
   });
 
-  it("has identical key trees for the device approval page", () => {
-    expect(keyTree(esAuth.device)).toEqual(keyTree(enAuth.device));
-  });
-
-  it("ships a title and next step for every refusal reason, plus reload, in both bundles", () => {
-    // Reads the REAL bundles (not a mocked `t`), so dropping a key such as
-    // `expired` from either locale fails here even though the dom test's
-    // mocked translator would still render the raw key.
-    for (const bundle of [enAuth, esAuth]) {
-      const refusal = bundle.device.refusal as Record<string, unknown>;
-      for (const reason of DEVICE_LOGIN_REFUSAL_REASONS) {
-        const copy = refusal[reason];
-        expect(copy).toBeTypeOf("object");
-        const { title, next } = copy as { title: unknown; next: unknown };
-        expect(typeof title).toBe("string");
-        expect((title as string).length).toBeGreaterThan(0);
-        expect(typeof next).toBe("string");
-        expect((next as string).length).toBeGreaterThan(0);
-      }
-      expect(typeof refusal.reload).toBe("string");
-      expect((refusal.reload as string).length).toBeGreaterThan(0);
-    }
-  });
-
   it("contains the full MCP login/consent key sets in both bundles", () => {
     for (const bundle of [enAuth, esAuth]) {
       expect(keyTree(bundle.mcpLogin).sort()).toEqual(
@@ -72,6 +47,7 @@ describe("auth locale key parity (en-US / es-MX)", () => {
           "unknownClient",
           "scopesTitle",
           "noScopes",
+          "readOnlyRequested",
           "accept",
           "deny",
           "submitting",
@@ -80,6 +56,7 @@ describe("auth locale key parity (en-US / es-MX)", () => {
           "invalidTitle",
           "invalidDescription",
           "manageNote",
+          "returnsTo",
           "scopes.read.name",
           "scopes.read.description",
           "scopes.write.name",

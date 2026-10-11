@@ -18,12 +18,22 @@ wsmp = "wsmp"
 fo = "fo"
 foob = "foob"
 fooba = "fooba"
+# Speaches, the speech-to-text server `runtime.detect` recognizes (`src/runtimes/detect.rs`).
+speaches = "speaches"
 
 [default]
-# One P-256 public key test vector (base64url) in `src/terminal_crypto.rs`
-# happens to contain `Iy`. Ignore that exact literal only.
+# Random test data that happens to contain a "typo". Ignore those exact
+# literals only.
 extend-ignore-re = [
+    # P-256 public key test vector (base64url) in `src/terminal_crypto.rs`: `Iy`.
     "BKY-mMGIyQrkQbdHpLC2Bkwv4JZwX7l3KzA4_gtn942ZrFQaA2B35fNmWvCS964gZtG7NjDNIbDwES_GuVhy6hY",
+    # P-256 public key (base64url) in the relay-3.0 fixtures: `fof`.
+    "BDVaf6TJ7hM4XYKnzPEWO2CFqs_0GT5jiK3S9xxBZouw1fofRGmOs9j9IkdskbbbACVKb5S53gMoTXKXvOEGK1A",
+    # A cuid node id in `tests/fixtures/relay-3.0/frames/server-to-node/hello.ok.json`
+    # (shared with the server's TS tests): `nd`.
+    "nd5q6w7e8r9t0y1u2i3o4p5a6",
     # A Spanish transcript in the live speech-to-text tests (`src/stt/tests.rs`).
     "primera frase",
+    # A TGI build label in `tests/fixtures/detect/tgi-info.json`: `ba`.
+    "sha-8801ba1",
 ]

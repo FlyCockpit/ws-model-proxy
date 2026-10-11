@@ -1,6 +1,6 @@
 import { ORPCError } from "@orpc/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { logOrpcError } from "./orpc-error-log";
+import { logOrpcError, sensitiveProcedureErrors } from "./orpc-error-log";
 
 /**
  * Pass-11 regression (R37 finding 2): the oRPC onError interceptor is a
@@ -75,5 +75,49 @@ describe("logOrpcError — sentinel Prisma-shaped rejection (unknown Error)", ()
   it("non-Error rejections log a typeof label only — never the value", () => {
     logOrpcError({ client_secret: SENTINEL });
     expect(calls).toEqual([{ method: "error", line: "[orpc] non-Error rejection (object)" }]);
+  });
+});
+
+describe("sensitiveProcedureErrors", () => {
+  const intercept = sensitiveProcedureErrors(new Set(["nodes.secrets.set"]));
+
+  it("strips the cause of a sensitive procedure's error and logs its code only", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const thrown = await intercept({
+      path: ["nodes", "secrets", "set"],
+      next: async () => {
+        throw new ORPCError("BAD_GATEWAY", {
+          message: "The node did not answer.",
+          cause: new Error(SENTINEL),
+        });
+      },
+    }).catch((caught: unknown) => caught);
+    expect(thrown).toBeInstanceOf(ORPCError);
+    if (!(thrown instanceof ORPCError)) return;
+    expect(thrown.code).toBe("BAD_GATEWAY");
+    expect(JSON.stringify(thrown.cause)).not.toContain(SENTINEL);
+    logOrpcError(thrown);
+    expect(error).toHaveBeenCalledWith("[orpc] sensitive procedure failed: BAD_GATEWAY");
+    // An unknown error leaves as a plain internal error.
+    const unknown = await intercept({
+      path: ["nodes", "secrets", "set"],
+      next: async () => {
+        throw new Error(SENTINEL);
+      },
+    }).catch((caught: unknown) => caught);
+    expect(unknown).toBeInstanceOf(ORPCError);
+    expect(JSON.stringify(unknown)).not.toContain(SENTINEL);
+    error.mockRestore();
+  });
+
+  it("leaves other procedures alone", async () => {
+    const original = new Error("x");
+    const thrown = await intercept({
+      path: ["nodes", "list"],
+      next: async () => {
+        throw original;
+      },
+    }).catch((caught: unknown) => caught);
+    expect(thrown).toBe(original);
   });
 });

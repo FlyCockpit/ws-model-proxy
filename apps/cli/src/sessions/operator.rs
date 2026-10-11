@@ -1,938 +1,484 @@
-//! Operator terminals: the PTY in which a person runs an interactive
-//! deployment step (relay 2.4, `DeploymentJob.operator`).
+//! Operator terminals on the relay loop (see `crate::runtimes::operator`).
 //!
-//! The deployment worker persists the pending step and checks status first;
-//! only a step that still needs a person reaches [`TerminalRegistry::spawn_operator`].
-//! The terminal runs `wsmp terminal supervised-run --deployment`, whose
-//! markers (`ready -> accepted -> exited;<code>`, retried while the code is
-//! not 0) become deployment progress for the server:
-//!
-//! - `ready` (the first, or after a failed run): `awaiting_operator`;
-//! - `accepted`: a fresh `go` is written, then `operator_running`;
-//! - `exited;<n>` with n != 0: `awaiting_operator` again (the child shows the
-//!   failure and its retry screen);
-//! - `exited;0` and the child itself exiting 0: only a trigger: the worker
-//!   checks the recipe's status proof and sends the final result;
-//! - anything else (declined, the terminal closed or cancelled, a malformed
-//!   marker): `operator_closed` with the last attempt's exit code.
-//!
-//! The terminal is announced by its `awaiting_operator` result, not by
-//! `term.spawned` (that frame names an agent command). Viewers attach with
-//! the ordinary `term.attach` handshake under the job's `operator.terminalId`.
-//! Operator terminals are gated by their own local switch
-//! (`allowDeploymentOperatorTerminal`, plus `allowDeployments`), read fresh
-//! for every job, Enter and viewer, and by terminal support; not by the
-//! browser terminal switch or the MCP command mode. They never offer a shell
-//! and never idle-close: a step may wait for its person indefinitely.
+//! An operator terminal is a [`TerminalSession`] with [`OperatorState`]. It
+//! opens in the confirm stage with no PTY: viewers attach with the ordinary
+//! `term.attach` handshake (at every trust level) and see the confirm screen
+//! the daemon draws; the writer's keys are read here and never reach a
+//! process. Enter spawns a fresh PTY running only the step's command (in
+//! the `sudo -k` wrapper); from then on the terminal is an ordinary PTY
+//! terminal whose input reaches that command until it exits. The terminal
+//! then ends: no prompt, nothing more to type into.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::SyncSender;
 
-use super::{
-    Config, OutboundFrame, OutputKey, PrivateBody, SUPERVISED_ENV_MARKER_FILE,
-    SUPERVISED_ENV_OPERATOR, TerminalRegistry, TerminalSession, push_scrollback, spawn_pty,
-    supervised_pty, terminal_crypto, terminal_env, user_home, valid_id,
+#[cfg(unix)]
+use super::valid_id;
+use super::{OutboundFrame, TerminalRegistry, TerminalSession};
+use crate::protocol::frames::JobStatus;
+#[cfg(unix)]
+use crate::protocol::{frames::JobError, terminal_supported};
+use crate::runtimes::operator::{
+    self as op, ConfirmKey, OperatorEvent, OperatorIds, OperatorScreen,
 };
-use crate::deployments::{Job, OperatorOpen, OperatorProgress};
-use crate::supervised_run::operator::OperatorRequest;
+#[cfg(unix)]
+use crate::runtimes::operator::{MAX_OPERATOR_TERMINALS, OperatorOpen};
+use crate::terminal_crypto::TermPlaintextV2;
 
-/// Live operator terminals per CLI. The server opens at most a few per node
-/// (one per instance at a time); this only bounds a misbehaving server.
-pub(super) const MAX_OPERATOR_TERMINALS: usize = 8;
-/// Ended operator terminals remembered, so a re-sent job reports its
-/// outcome instead of reopening the same terminal id.
-const ENDED_OPERATOR_MEMORY: usize = 64;
-/// Stops held at once; the oldest is dropped beyond this (the server
-/// re-sends an unanswered stop).
-const DEFERRED_JOBS_MAX: usize = 32;
-/// How often waiting operator terminals re-check the local deployments switch.
-pub(super) const OPERATOR_GATE_RECHECK: Duration = Duration::from_secs(2);
-
-/// Whether operator terminals are allowed now: local deployments and the
-/// operator-terminal switch are both on (read fresh from the config).
-pub(super) fn operator_terminals_allowed() -> bool {
-    Config::load()
-        .is_ok_and(|config| config.allow_deployments && config.allow_deployment_operator_terminal)
-}
-
-/// What an operator terminal reports to the session loop, which turns it
-/// into deployment frames and worker requests.
-#[derive(Debug, Clone)]
-pub(crate) enum OperatorEvent {
-    /// Send this progress result for the job.
-    Progress(Job, OperatorProgress),
-    /// A person pressed Enter (the `go` is already written): persist it.
-    Accepted(Job),
-    /// The command exited 0 and the child exited cleanly: check the proof.
-    Verify(Job),
-}
-
-/// An operator terminal's state, beside its PTY in the `TerminalSession`.
-pub(super) struct OperatorTerminal {
-    pub(super) job: Job,
-    pub(super) child: supervised_pty::ChildLink,
-    /// The child drew its screen at least once; input may reach the PTY.
-    pub(super) ready_seen: bool,
-    /// `awaiting_operator` was reported since the last `operator_running`.
-    awaiting_reported: bool,
-    /// Between `accepted` and `exited`.
+/// The step behind an operator terminal.
+pub(super) struct OperatorState {
+    ids: OperatorIds,
+    screen: OperatorScreen,
+    /// Node secrets included: never logged.
+    #[cfg(unix)]
+    env: Vec<(String, String)>,
+    events: SyncSender<OperatorEvent>,
+    /// A person accepted and the command's PTY was spawned.
     running: bool,
-    /// The last failed attempt's exit code.
-    last_exit: Option<u8>,
-    /// The child reported `exited;0`.
-    exited_ok: bool,
-    /// The child broke the marker grammar (or `go` could not be written).
-    pub(super) invalid: bool,
-    /// A stop for the instance arrived while the command ran: end the
-    /// terminal once this run ends instead of offering a retry.
-    cancel_after_run: bool,
-    /// Kept until the terminal ends; the child removes the file itself.
-    _marker_file: PrivateBody,
 }
 
-impl OperatorTerminal {
-    /// The event that ends this terminal, given the confirm child's exit
-    /// status: `Verify` only when the command reported exit 0 and the child
-    /// itself exited 0 (its exit status cannot come from command output).
-    fn ending(&self, status: (Option<i32>, Option<i32>)) -> OperatorEvent {
-        if self.exited_ok && !self.invalid && status == (Some(0), None) {
-            OperatorEvent::Verify(self.job.clone())
-        } else {
-            OperatorEvent::Progress(self.job.clone(), OperatorProgress::Closed(self.last_exit))
+impl OperatorState {
+    /// The terminal ended (`ran`: the command's PTY existed; `status` its
+    /// exit). A clean exit of the command hands the step back to its runner
+    /// thread for the proof; anything else answers `operator_closed`.
+    pub(super) fn ended(self, ran: bool, status: (Option<i32>, Option<i32>)) -> Vec<OutboundFrame> {
+        if ran && status == (Some(0), None) {
+            tracing::info!(step_id = self.ids.step_id, "operator command exited 0");
+            let _ = self.events.try_send(OperatorEvent::ExitedOk);
+            return Vec::new();
+        }
+        let exit = if ran { op::exit_code(status) } else { None };
+        tracing::info!(
+            step_id = self.ids.step_id,
+            ran,
+            exit_code = exit,
+            "operator terminal closed"
+        );
+        let _ = self.events.try_send(OperatorEvent::Closed);
+        vec![OutboundFrame::Control(
+            self.ids.result(JobStatus::OperatorClosed, exit),
+        )]
+    }
+}
+
+/// Operator terminal ids a runner thread has but has not opened yet, and
+/// every id this session took. An id opens at most once: a re-delivery
+/// while it is pending or after it ended changes nothing.
+#[derive(Default)]
+pub(crate) struct OperatorBook {
+    /// Terminal id → (step id, cancelled before it opened).
+    pending: std::collections::BTreeMap<String, (String, bool)>,
+    used: std::collections::HashSet<String>,
+    #[cfg(unix)]
+    used_order: std::collections::VecDeque<String>,
+}
+
+/// Ids remembered as used (oldest forgotten first; the server never
+/// re-sends one that old).
+#[cfg(unix)]
+const USED_IDS_MAX: usize = 4096;
+
+impl OperatorBook {
+    #[cfg(unix)]
+    fn take(&mut self, terminal_id: &str, step_id: &str) {
+        self.pending
+            .insert(terminal_id.to_string(), (step_id.to_string(), false));
+        if self.used.insert(terminal_id.to_string()) {
+            self.used_order.push_back(terminal_id.to_string());
+            while self.used_order.len() > USED_IDS_MAX {
+                if let Some(old) = self.used_order.pop_front() {
+                    self.used.remove(&old);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn live(&self) -> usize {
+        self.pending
+            .values()
+            .filter(|(_, cancelled)| !cancelled)
+            .count()
+    }
+
+    fn cancel_where(&mut self, select: impl Fn(&str, &str) -> bool) {
+        for (terminal_id, (step_id, cancelled)) in &mut self.pending {
+            if select(terminal_id, step_id) {
+                *cancelled = true;
+            }
         }
     }
 }
 
-/// This machine's name for the confirm screen: the reported hostname when
-/// the screen can show it as plain text, else a neutral fallback.
-fn node_name() -> String {
-    crate::hostname::reported_hostname()
-        .filter(|name| {
-            !name.is_empty()
-                && name.len() <= 256
-                && !name
-                    .chars()
-                    .any(|ch| ch == '\n' || crate::display_escape::needs_escape(ch))
-        })
-        .unwrap_or_else(|| "this machine".to_string())
+/// What a received operator job is, before anything is rendered.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OperatorDelivery {
+    /// A terminal id this session has not seen.
+    New,
+    /// A re-delivery: re-report this state, or (`None`) nothing (it is still
+    /// pending or it already ended and answered).
+    Repeat(Option<JobStatus>),
+    /// The id belongs to another step.
+    Clash,
+}
+
+/// The scrubbed environment an operator command starts from (the browser
+/// terminal environment: denied names removed, `TERM`, `WSMP_JOB=1`).
+#[cfg(unix)]
+pub(crate) fn operator_base_env() -> Vec<(String, String)> {
+    super::terminal_env()
+}
+
+/// The screen bytes, cut for sealing.
+fn chunks(bytes: &[u8]) -> impl Iterator<Item = Vec<u8>> + '_ {
+    bytes.chunks(super::SEAL_CHUNK).map(<[u8]>::to_vec)
+}
+
+impl TerminalSession {
+    /// An operator terminal still on its confirm screen.
+    pub(super) fn confirming(&self) -> bool {
+        self.operator.as_ref().is_some_and(|state| !state.running)
+    }
+
+    fn screen_bytes(&self) -> Option<Vec<u8>> {
+        let state = self.operator.as_ref().filter(|state| !state.running)?;
+        Some(op::paint(&state.screen, self.pty_size.0, self.pty_size.1))
+    }
+
+    /// The confirm screen for one joining viewer (after its join frames).
+    pub(super) fn confirm_screen_for(
+        &mut self,
+        terminal_id: &str,
+        viewer_id: &str,
+    ) -> Vec<OutboundFrame> {
+        let Some(bytes) = self.screen_bytes() else {
+            return Vec::new();
+        };
+        chunks(&bytes)
+            .filter_map(|chunk| {
+                self.seal_unicast(terminal_id, viewer_id, &TermPlaintextV2::Data(chunk))
+            })
+            .collect()
+    }
+
+    /// The confirm screen again, for every viewer (after a resize).
+    pub(super) fn confirm_repaint(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
+        let Some(bytes) = self.screen_bytes() else {
+            return Vec::new();
+        };
+        chunks(&bytes)
+            .filter_map(|chunk| self.seal_broadcast(terminal_id, &TermPlaintextV2::Data(chunk)))
+            .collect()
+    }
 }
 
 impl TerminalRegistry {
-    /// Opens the operator terminal for `open.job` (its `operator.terminalId`).
-    /// A repeated delivery of the same terminal re-reports its state; a new
-    /// terminal for a step that already has one replaces it (the server
-    /// minted a new one: the old one can no longer be accepted). `Err` names
-    /// why no terminal opened; nothing ran.
-    pub(crate) fn spawn_operator(
-        &mut self,
-        config: &Config,
-        open: &OperatorOpen,
-    ) -> Result<Vec<OutboundFrame>, &'static str> {
-        let job = &open.job;
-        let Some(operator) = job
-            .operator
-            .as_ref()
-            .filter(|_| job.interactive == Some(true))
-        else {
-            return Err("bad_job");
-        };
-        let terminal_id = operator.terminal_id.as_str();
-        if self.shut_down || !crate::protocol::terminal_supported() {
-            return Err("operator_terminal_unavailable");
-        }
-        if !valid_id(terminal_id) {
-            return Err("bad_job");
-        }
-        // A terminal id is used once: a job re-sent after its terminal ended
-        // gets that terminal's outcome again, never a second terminal.
-        if let Some((_, ended)) = self
-            .ended_operators
-            .iter()
-            .find(|(id, _)| id == terminal_id)
-        {
-            let ended_job = match ended {
-                OperatorEvent::Progress(job, _)
-                | OperatorEvent::Accepted(job)
-                | OperatorEvent::Verify(job) => job,
-            };
-            if ended_job.step_id != job.step_id || ended_job.intent_hash != job.intent_hash {
-                return Err("operator_terminal_conflict");
-            }
-            let again = ended.clone();
-            self.operator_events.push(again);
-            return Ok(Vec::new());
-        }
-        if let Some(session) = self.sessions.get(terminal_id) {
-            return match session.operator.as_ref() {
-                Some(existing)
-                    if existing.job.step_id == job.step_id
-                        && existing.job.intent_hash == job.intent_hash =>
-                {
-                    if existing.ready_seen && !existing.running {
-                        self.operator_events.push(OperatorEvent::Progress(
-                            existing.job.clone(),
-                            OperatorProgress::Awaiting,
-                        ));
-                    }
-                    Ok(Vec::new())
-                }
-                _ => Err("operator_terminal_conflict"),
-            };
-        }
-        let request = OperatorRequest::from_job(job, &node_name(), open.previous_run_unknown)
-            .map_err(|_| "bad_job")?;
-        let request = serde_json::to_string(&request).map_err(|_| "bad_job")?;
-        // A step has one terminal: the server's newest.
-        let mut frames = Vec::new();
-        let stale = self
-            .sessions
-            .iter()
-            .filter(|(_, session)| {
-                session
-                    .operator
-                    .as_ref()
-                    .is_some_and(|existing| existing.job.step_id == job.step_id)
-            })
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        for id in stale {
-            frames.extend(self.close(&id));
-        }
-        if self.operator_count() >= MAX_OPERATOR_TERMINALS {
-            return Err("operator_terminal_limit");
-        }
-        let marker = terminal_crypto::random_nonce()
-            .map_err(|_| "operator_terminal_failed")?
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let marker_file =
-            PrivateBody::create(marker.as_bytes()).map_err(|_| "operator_terminal_failed")?;
-        let out = OutputKey::first().map_err(|_| "operator_terminal_failed")?;
-        let (program, args) = match self.operator_program.clone() {
-            Some(program) => program,
-            None => (
-                std::env::current_exe()
-                    .map_err(|_| "operator_terminal_failed")?
-                    .to_string_lossy()
-                    .into_owned(),
-                vec![
-                    "terminal".to_string(),
-                    "supervised-run".to_string(),
-                    "--deployment".to_string(),
-                ],
-            ),
-        };
-        let cwd = user_home().map_err(|_| "operator_terminal_failed")?;
-        let mut env = terminal_env(config);
-        env.push((SUPERVISED_ENV_OPERATOR.to_string(), request));
-        env.push((
-            SUPERVISED_ENV_MARKER_FILE.to_string(),
-            marker_file.path.to_string_lossy().into_owned(),
-        ));
-        let (cols, rows) = (80, 24);
-        let pty = spawn_pty(
-            &program,
-            &args,
-            &cwd,
-            &env,
-            cols,
-            rows,
-            &self.tx,
-            terminal_id,
-        )
-        .map_err(|error| {
-            tracing::warn!(error = %error, terminal_id, "starting an operator terminal failed");
-            "operator_terminal_failed"
-        })?;
-        self.sessions.insert(
-            terminal_id.to_string(),
-            TerminalSession {
-                viewers: BTreeMap::new(),
-                writer: None,
-                pty_size: (cols, rows),
-                out: Some(out),
-                detached_at: Some(Instant::now()),
-                scrollback: VecDeque::new(),
-                pty: Some(pty),
-                supervised: None,
-                operator: Some(OperatorTerminal {
-                    job: job.clone(),
-                    child: supervised_pty::ChildLink::operator(&marker),
-                    ready_seen: false,
-                    awaiting_reported: false,
-                    running: false,
-                    last_exit: None,
-                    exited_ok: false,
-                    invalid: false,
-                    cancel_after_run: false,
-                    _marker_file: marker_file,
-                }),
-            },
-        );
-        tracing::info!(
-            terminal_id,
-            step_id = %job.step_id,
-            "opened a deployment operator terminal"
-        );
-        Ok(frames)
-    }
-
-    pub(super) fn operator_count(&self) -> usize {
+    /// Live operator terminals.
+    #[cfg(unix)]
+    pub(crate) fn operator_count(&self) -> usize {
         self.sessions
             .values()
             .filter(|session| session.operator.is_some())
             .count()
     }
 
-    /// A stop for `instance_id` arrived (step `keep_step`): closes the
-    /// instance's other operator terminals still waiting for their person.
-    /// A terminal whose command is running is never killed: it ends after
-    /// that run (no retry is offered), and `true` says the stop must wait for
-    /// it (see [`TerminalRegistry::defer_until_runs_end`]).
-    pub(crate) fn close_operator_for_instance(
-        &mut self,
-        instance_id: &str,
-        keep_step: &str,
-    ) -> (Vec<OutboundFrame>, bool) {
-        let mut waiting = Vec::new();
-        let mut busy = false;
-        for (id, session) in &mut self.sessions {
-            let Some(operator) = session.operator.as_mut() else {
-                continue;
-            };
-            if operator.job.instance_id != instance_id || operator.job.step_id == keep_step {
-                continue;
-            }
-            if operator.running || operator.exited_ok || operator.cancel_after_run {
-                operator.cancel_after_run = true;
-                busy = true;
+    /// A re-delivered job whose terminal is already open: its current state.
+    pub(crate) fn operator_status(&self, step_id: &str, terminal_id: &str) -> Option<JobStatus> {
+        let session = self.sessions.get(terminal_id)?;
+        let state = session.operator.as_ref()?;
+        (state.ids.step_id == step_id).then_some(if state.running {
+            JobStatus::OperatorRunning
+        } else {
+            JobStatus::AwaitingOperator
+        })
+    }
+
+    /// What a received operator job is (see [`OperatorDelivery`]).
+    pub(crate) fn operator_delivery(&self, step_id: &str, terminal_id: &str) -> OperatorDelivery {
+        if let Some(state) = self
+            .sessions
+            .get(terminal_id)
+            .and_then(|session| session.operator.as_ref())
+        {
+            return if state.ids.step_id == step_id {
+                OperatorDelivery::Repeat(self.operator_status(step_id, terminal_id))
             } else {
-                waiting.push(id.clone());
-            }
+                OperatorDelivery::Clash
+            };
+        }
+        if self.sessions.contains_key(terminal_id) {
+            return OperatorDelivery::Clash;
+        }
+        match self.operators.pending.get(terminal_id) {
+            Some((pending_step, _)) if pending_step == step_id => OperatorDelivery::Repeat(None),
+            Some(_) => OperatorDelivery::Clash,
+            None if self.operators.used.contains(terminal_id) => OperatorDelivery::Repeat(None),
+            None => OperatorDelivery::New,
+        }
+    }
+
+    /// Take `terminal_id` for a step about to go to its runner thread. A
+    /// newer dispatch of the same step replaces the older one: its terminal
+    /// still on the confirm screen closes, and one not opened yet never
+    /// opens, so the older thread lets go of the rank. Refused when no PTY
+    /// can be offered, at the cap, or while shutting down.
+    #[cfg(unix)]
+    pub(crate) fn reserve_operator(
+        &mut self,
+        step_id: &str,
+        terminal_id: &str,
+    ) -> Result<Vec<OutboundFrame>, JobError> {
+        if !valid_id(terminal_id) {
+            return Err(JobError::BadJob);
+        }
+        let frames = self.close_confirming(|state| {
+            state.ids.step_id == step_id && state.ids.terminal_id != terminal_id
+        });
+        self.operators.cancel_where(|pending_id, pending_step| {
+            pending_step == step_id && pending_id != terminal_id
+        });
+        if self.shut_down
+            || !terminal_supported()
+            || self.operator_count() + self.operators.live() >= MAX_OPERATOR_TERMINALS
+        {
+            return Err(JobError::OperatorTerminalsDisabled);
+        }
+        self.operators.take(terminal_id, step_id);
+        Ok(frames)
+    }
+
+    /// The step's runner thread is done with `terminal_id` (or never got it).
+    #[cfg(unix)]
+    pub(crate) fn release_operator(&mut self, terminal_id: &str) {
+        self.operators.pending.remove(terminal_id);
+    }
+
+    /// A server `term.close`. A terminal still pending never opens; one on
+    /// its confirm screen closes; a person's run already under way (Enter
+    /// raced the close) is left alone and answers when it ends.
+    pub(crate) fn close_from_server(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
+        if let Some((_, cancelled)) = self.operators.pending.get_mut(terminal_id) {
+            *cancelled = true;
+            return Vec::new();
+        }
+        if self
+            .sessions
+            .get(terminal_id)
+            .and_then(|session| session.operator.as_ref())
+            .is_some_and(|state| state.running)
+        {
+            tracing::info!(terminal_id, "kept a running operator command on a close");
+            return Vec::new();
+        }
+        self.close(terminal_id)
+    }
+
+    /// Open the confirm stage of an operator terminal and answer
+    /// `awaiting_operator`. Only a reserved, uncancelled id opens; anything
+    /// else answers `operator_closed` (nothing ran) and the runner thread
+    /// hears `Closed`.
+    #[cfg(unix)]
+    pub(crate) fn open_operator(&mut self, open: OperatorOpen) -> Vec<OutboundFrame> {
+        let terminal_id = open.ids.terminal_id.clone();
+        let reserved = self
+            .operators
+            .pending
+            .remove(&terminal_id)
+            .is_some_and(|(step_id, cancelled)| step_id == open.ids.step_id && !cancelled);
+        if !reserved || self.sessions.contains_key(&terminal_id) || self.shut_down {
+            tracing::info!(
+                step_id = open.ids.step_id,
+                "an operator terminal was cancelled before it opened"
+            );
+            let _ = open.events.try_send(OperatorEvent::Closed);
+            return vec![OutboundFrame::Control(
+                open.ids.result(JobStatus::OperatorClosed, None),
+            )];
         }
         let mut frames = Vec::new();
-        for id in waiting {
-            frames.extend(self.close(&id));
-        }
-        (frames, busy)
+        let out = match super::OutputKey::first() {
+            Ok(out) => out,
+            Err(error) => {
+                tracing::warn!(error = %error, "generating a terminal output key failed");
+                let _ = open.events.try_send(OperatorEvent::Closed);
+                frames.push(OutboundFrame::Control(
+                    open.ids.failed(JobError::OperatorTerminalsDisabled),
+                ));
+                return frames;
+            }
+        };
+        tracing::info!(
+            step_id = open.ids.step_id,
+            "operator terminal waits for its person"
+        );
+        frames.push(OutboundFrame::Control(
+            open.ids.result(JobStatus::AwaitingOperator, None),
+        ));
+        self.sessions.insert(
+            terminal_id,
+            TerminalSession {
+                viewers: std::collections::BTreeMap::new(),
+                writer: None,
+                pty_size: (80, 24),
+                out: Some(out),
+                detached_at: None,
+                scrollback: std::collections::VecDeque::new(),
+                #[cfg(unix)]
+                pty: None,
+                operator: Some(OperatorState {
+                    ids: open.ids,
+                    screen: open.screen,
+                    env: open.env,
+                    events: open.events,
+                    running: false,
+                }),
+            },
+        );
+        frames
     }
 
-    /// Holds `job` (a stop) until no other operator terminal of its instance
-    /// is left: a person's run is never cut off, and the stop never settles
-    /// from status while that run may still be starting the service. A newer
-    /// delivery of the same step replaces a held one.
-    pub(crate) fn defer_until_runs_end(&mut self, job: Job) {
-        self.deferred_jobs
-            .retain(|held| held.step_id != job.step_id || held.instance_id != job.instance_id);
-        if self.deferred_jobs.len() >= DEFERRED_JOBS_MAX {
-            let dropped = self.deferred_jobs.remove(0);
-            tracing::warn!(step_id = %dropped.step_id, "dropping the oldest held deployment stop");
-        }
-        self.deferred_jobs.push(job);
-    }
-
-    /// Held jobs whose instance has no other operator terminal left.
-    pub(crate) fn take_released_jobs(&mut self) -> Vec<Job> {
-        let (released, held): (Vec<Job>, Vec<Job>) = std::mem::take(&mut self.deferred_jobs)
-            .into_iter()
-            .partition(|job| {
-                !self.sessions.values().any(|session| {
-                    session.operator.as_ref().is_some_and(|operator| {
-                        operator.job.instance_id == job.instance_id
-                            && operator.job.step_id != job.step_id
-                    })
-                })
-            });
-        self.deferred_jobs = held;
-        released
-    }
-
-    /// With local deployments or operator terminals switched off, waiting
-    /// operator terminals close
-    /// (a running command is left to finish). Checked every
-    /// [`OPERATOR_GATE_RECHECK`] while any operator terminal is open.
-    pub(super) fn recheck_operator_gate(&mut self, now: Instant) -> Vec<OutboundFrame> {
-        if self.operator_count() == 0 || self.next_operator_gate_check.is_some_and(|at| now < at) {
-            return Vec::new();
-        }
-        self.next_operator_gate_check = Some(now + OPERATOR_GATE_RECHECK);
-        if (self.operator_allowed)() {
-            return Vec::new();
-        }
-        let waiting = self
+    /// Close every operator terminal still on its confirm screen that
+    /// `select` picks. Terminals whose command runs are left alone.
+    fn close_confirming(&mut self, select: impl Fn(&OperatorState) -> bool) -> Vec<OutboundFrame> {
+        let ids = self
             .sessions
             .iter()
             .filter(|(_, session)| {
-                session.operator.as_ref().is_some_and(|operator| {
-                    !operator.running && !operator.exited_ok && !operator.cancel_after_run
-                })
+                session
+                    .operator
+                    .as_ref()
+                    .is_some_and(|state| !state.running && select(state))
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
-        let mut frames = Vec::new();
-        for id in waiting {
-            tracing::info!(terminal_id = %id, "deployments are off; closing an operator terminal");
-            frames.extend(self.close(&id));
+        ids.iter().flat_map(|id| self.close(id)).collect()
+    }
+
+    /// The step's runner thread was cancelled (a stop): close its terminal
+    /// unless a person's run already started.
+    #[cfg(unix)]
+    pub(crate) fn close_operator_if_confirming(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
+        self.close_confirming(|state| state.ids.terminal_id == terminal_id)
+    }
+
+    /// A stop for this rank arrived: its operator steps still on their
+    /// confirm screen close; a person's run in progress is not cut off.
+    pub(crate) fn close_confirming_for_rank(
+        &mut self,
+        instance_id: &str,
+        rank: u8,
+    ) -> Vec<OutboundFrame> {
+        self.close_confirming(|state| {
+            state.ids.instance_id == instance_id && state.ids.rank == rank
+        })
+    }
+
+    /// Trust lowering: browser shells end, and so do operator terminals still
+    /// on (or not yet at) their confirm screen: they were rendered under the
+    /// higher trust, and the person reopens them from the frozen copy. A
+    /// person's run already under way stays; the registry stays usable.
+    pub(crate) fn on_trust_lowered(&mut self) -> Vec<OutboundFrame> {
+        let ids = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.operator.is_none())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let mut frames: Vec<OutboundFrame> = ids.iter().flat_map(|id| self.close(id)).collect();
+        frames.extend(self.close_confirming(|_| true));
+        // Approvals waiting to join survive only for operator terminals still
+        // here (running commands); a queued browser-shell open never spawns.
+        let sessions = &self.sessions;
+        self.pending.retain(|(terminal_id, _), pending| {
+            pending.attach
+                && sessions
+                    .get(terminal_id)
+                    .is_some_and(|session| session.operator.is_some())
+        });
+        self.operators.cancel_where(|_, _| true);
+        frames
+    }
+
+    /// A key on the confirm screen, from a viewer that becomes the writer.
+    pub(super) fn confirm_input(
+        &mut self,
+        terminal_id: &str,
+        viewer_key: &str,
+        bytes: &[u8],
+    ) -> Vec<OutboundFrame> {
+        let mut frames = match self.claim_writer(terminal_id, viewer_key) {
+            Ok(frames) => frames,
+            Err(_) => return self.close(terminal_id),
+        };
+        match op::confirm_key(bytes) {
+            Some(ConfirmKey::Accept) => frames.extend(self.accept_operator(terminal_id)),
+            Some(ConfirmKey::Decline) => {
+                tracing::info!(terminal_id, "a person declined an operator step");
+                frames.extend(self.close(terminal_id));
+            }
+            None => {}
         }
         frames
     }
 
-    /// Events for the session loop, oldest first.
-    pub(crate) fn take_operator_events(&mut self) -> Vec<OperatorEvent> {
-        std::mem::take(&mut self.operator_events)
-    }
-
-    /// Operator PTY output: markers become events and never reach viewers;
-    /// everything else is ordinary terminal output.
-    pub(super) fn operator_bytes(&mut self, terminal_id: &str, bytes: &[u8]) -> Vec<OutboundFrame> {
+    /// Enter: spawn a fresh PTY that runs only the step's command, then
+    /// answer `operator_running`. A spawn failure closes the terminal.
+    #[cfg(unix)]
+    fn accept_operator(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
+        let Some(session) = self.sessions.get(terminal_id) else {
+            return Vec::new();
+        };
+        let Some(state) = session.operator.as_ref().filter(|state| !state.running) else {
+            return Vec::new();
+        };
+        let (cols, rows) = session.pty_size;
+        let (program, args) = op::wrapper_argv(&state.screen.command);
+        let spawned = super::user_home()
+            .ok()
+            .and_then(|home| crate::child_env::resolve_cwd(None, &home).ok())
+            .ok_or_else(|| anyhow::anyhow!("no home directory"))
+            .and_then(|cwd| {
+                super::spawn_pty(
+                    &program,
+                    &args,
+                    &cwd,
+                    &state.env,
+                    cols,
+                    rows,
+                    &self.tx,
+                    terminal_id,
+                )
+            });
+        let pty = match spawned {
+            Ok(pty) => pty,
+            Err(error) => {
+                tracing::warn!(error = %error, terminal_id, "starting an operator command failed");
+                return self.close(terminal_id);
+            }
+        };
         let Some(session) = self.sessions.get_mut(terminal_id) else {
             return Vec::new();
         };
-        let Some(operator) = session.operator.as_mut() else {
+        let Some(state) = session.operator.as_mut() else {
             return Vec::new();
         };
-        let mut display = Vec::new();
-        let mut events = Vec::new();
-        for piece in operator.child.scanner.feed(bytes) {
-            // Ending: nothing after this counts (the terminal closes below).
-            if operator.invalid {
-                break;
-            }
-            match piece {
-                supervised_pty::Piece::Bytes(bytes) => display.extend(bytes),
-                supervised_pty::Piece::Event(event) => match event {
-                    supervised_pty::MarkerEvent::Ready => {
-                        operator.ready_seen = true;
-                        if !operator.awaiting_reported {
-                            operator.awaiting_reported = true;
-                            events.push(OperatorEvent::Progress(
-                                operator.job.clone(),
-                                OperatorProgress::Awaiting,
-                            ));
-                        }
-                    }
-                    supervised_pty::MarkerEvent::Accepted => {
-                        // The scanner's grammar guarantees a drawn screen.
-                        // Local deployments must still be on when Enter
-                        // starts the command; otherwise nothing runs.
-                        if !(self.operator_allowed)() {
-                            tracing::info!(
-                                terminal_id,
-                                "deployments are off; the operator command does not start"
-                            );
-                            operator.invalid = true;
-                            continue;
-                        }
-                        let released = session
-                            .pty
-                            .as_ref()
-                            .map(|pty| pty.input.push_control(operator.child.go.clone()));
-                        if let Some(Ok(())) = released {
-                            operator.running = true;
-                            operator.awaiting_reported = false;
-                            events.push(OperatorEvent::Accepted(operator.job.clone()));
-                            events.push(OperatorEvent::Progress(
-                                operator.job.clone(),
-                                OperatorProgress::Running,
-                            ));
-                        } else {
-                            // The PTY is going away; nothing starts.
-                            operator.invalid = true;
-                        }
-                    }
-                    supervised_pty::MarkerEvent::Exited(0) => {
-                        operator.running = false;
-                        operator.exited_ok = true;
-                    }
-                    supervised_pty::MarkerEvent::Exited(code) => {
-                        operator.running = false;
-                        operator.last_exit = Some(code);
-                        if operator.cancel_after_run {
-                            // A stop is waiting for this run: no retry.
-                            operator.invalid = true;
-                            continue;
-                        }
-                        // Waiting for the person again: the child shows the
-                        // failure, then its retry screen.
-                        operator.awaiting_reported = true;
-                        events.push(OperatorEvent::Progress(
-                            operator.job.clone(),
-                            OperatorProgress::Awaiting,
-                        ));
-                    }
-                    supervised_pty::MarkerEvent::Blocked(_)
-                    | supervised_pty::MarkerEvent::Invalid => {
-                        operator.invalid = true;
-                    }
-                },
-            }
-        }
-        let invalid = operator.invalid;
-        self.operator_events.extend(events);
-        let mut frames = Vec::new();
-        if !display.is_empty() {
-            push_scrollback(&mut session.scrollback, &display);
-            frames.extend(session.broadcast_data(terminal_id, &display));
-        }
-        if invalid {
-            tracing::info!(terminal_id, "closing an operator terminal");
-            frames.extend(self.close(terminal_id));
-        }
-        frames
-    }
-
-    /// Ends an operator session removed by `close`: reports `Verify` or
-    /// `operator_closed` once, given the child's exit status.
-    pub(super) fn finish_operator(
-        &mut self,
-        operator: &OperatorTerminal,
-        status: (Option<i32>, Option<i32>),
-    ) {
-        let event = operator.ending(status);
+        state.running = true;
+        let _ = state.events.try_send(OperatorEvent::Accepted);
+        let running = state.ids.result(JobStatus::OperatorRunning, None);
         tracing::info!(
-            step_id = %operator.job.step_id,
-            verify = matches!(event, OperatorEvent::Verify(_)),
-            "deployment operator terminal ended"
+            step_id = state.ids.step_id,
+            "a person started an operator command"
         );
-        if let Some(operator_ref) = operator.job.operator.as_ref() {
-            if self.ended_operators.len() >= ENDED_OPERATOR_MEMORY {
-                self.ended_operators.pop_front();
-            }
-            self.ended_operators
-                .push_back((operator_ref.terminal_id.clone(), event.clone()));
-        }
-        self.operator_events.push(event);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    use super::*;
-    use crate::relay_bus::FromWorker;
-
-    fn golden(name: &str) -> Job {
-        let golden: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/relay-current/deployment-jobs.json"
-        ))
-        .expect("golden JSON");
-        serde_json::from_value(golden["jobs"][name].clone()).expect(name)
-    }
-
-    fn open(job: Job) -> OperatorOpen {
-        OperatorOpen {
-            job,
-            previous_run_unknown: false,
-        }
-    }
-
-    /// Stands in for `wsmp terminal supervised-run --deployment`: takes the
-    /// marker file, then per attempt draws, waits for a line (`q` declines),
-    /// prints `accepted`, waits for the exact `go`, and reports the next exit
-    /// code from `codes`. After `exited;0` it exits with `final_exit`.
-    fn fake_operator(codes: &[u8], final_exit: u8) -> String {
-        let go_len =
-            crate::sessions::supervised_marker("go", "00112233445566778899aabbccddeeff").len();
-        let codes = codes
-            .iter()
-            .map(u8::to_string)
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!(
-            r#"marker=$(cat "$WSMP_SUPERVISED_MARKER_FILE") || exit 98
-rm -f "$WSMP_SUPERVISED_MARKER_FILE"
-printf '%s' "$WSMP_SUPERVISED_OPERATOR" | grep -q '"commandAuthor":"user"' || exit 97
-m() {{ printf '\033]7717;wsmp-supervised;%s;%s\007' "$1" "$marker"; }}
-for code in {codes}; do
-  printf 'SCREEN\n'
-  m ready
-  IFS= read -r line
-  case "$line" in q*) printf 'Declined\n'; exit 0;; esac
-  stty -echo -icanon min 1 time 0
-  m accepted
-  go=$(head -c {go_len})
-  stty echo icanon
-  [ "$go" = "$(printf '\033]7717;wsmp-supervised;go;%s\007' "$marker")" ] || exit 99
-  printf 'ran-%s\n' "$code"
-  m "exited;$code"
-  [ "$code" = 0 ] && exit {final_exit}
-done
-exit 0
-"#
-        )
-    }
-
-    fn registry(tx: mpsc::SyncSender<FromWorker>, script: &str) -> TerminalRegistry {
-        crate::logging::init_test_subscriber();
-        let mut terminals = TerminalRegistry::with_shell(
-            tx,
-            Duration::from_millis(1),
-            "/bin/sh",
-            &["-c", "sleep 30"],
-        );
-        terminals.operator_program = Some((
-            "/bin/sh".to_string(),
-            vec!["-c".to_string(), script.to_string()],
-        ));
-        terminals.operator_allowed = || true;
-        terminals
-    }
-
-    fn label(event: &OperatorEvent) -> String {
-        match event {
-            OperatorEvent::Progress(_, OperatorProgress::Awaiting) => "awaiting".into(),
-            OperatorEvent::Progress(_, OperatorProgress::Running) => "running".into(),
-            OperatorEvent::Progress(_, OperatorProgress::Closed(code)) => {
-                format!("closed:{code:?}")
-            }
-            OperatorEvent::Accepted(_) => "accepted".into(),
-            OperatorEvent::Verify(_) => "verify".into(),
-        }
-    }
-
-    /// Runs the relay loop's terminal steps until `events` (labels) holds
-    /// `want` events, typing the next of `answers` whenever a screen waits.
-    fn pump(
-        terminals: &mut TerminalRegistry,
-        rx: &mpsc::Receiver<FromWorker>,
-        events: &mut Vec<String>,
-        want: usize,
-        answers: &[&[u8]],
-    ) -> Vec<OutboundFrame> {
-        let mut answers = answers.iter();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut frames = Vec::new();
-        while events.len() < want {
-            assert!(Instant::now() < deadline, "timed out: {events:?}");
-            match rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(FromWorker::TerminalBytes { terminal_id, bytes }) => {
-                    frames.extend(terminals.on_bytes(&terminal_id, &bytes));
-                }
-                Ok(FromWorker::TerminalEof { terminal_id }) => {
-                    frames.extend(terminals.on_eof(&terminal_id));
-                }
-                _ => {}
-            }
-            frames.extend(terminals.poll(Instant::now() + Duration::from_secs(3600)));
-            for event in terminals.take_operator_events() {
-                let label = label(&event);
-                if label == "awaiting" {
-                    let id = match &event {
-                        OperatorEvent::Progress(job, _) => job
-                            .operator
-                            .as_ref()
-                            .map(|operator| operator.terminal_id.clone())
-                            .expect("operator"),
-                        _ => unreachable!("progress"),
-                    };
-                    if let Some(answer) = answers.next() {
-                        let _ = terminals.enqueue_input(&id, answer.to_vec());
-                    }
-                }
-                events.push(label);
-            }
-        }
+        session.pty = Some(pty);
+        // The command's output starts on a clean screen.
+        let clear = b"\x1b[H\x1b[2J";
+        super::push_scrollback(&mut session.scrollback, clear);
+        let mut frames = session.broadcast_data(terminal_id, clear);
+        frames.push(OutboundFrame::Control(running));
         frames
     }
 
-    fn terminal_id(job: &Job) -> String {
-        job.operator.as_ref().expect("operator").terminal_id.clone()
-    }
-
-    #[test]
-    fn a_failed_run_waits_again_and_a_clean_success_asks_for_the_proof() {
-        let (tx, rx) = mpsc::sync_channel(64);
-        let mut terminals = registry(tx, &fake_operator(&[1, 0], 0));
-        let job = golden("interactiveStart");
-        let frames = terminals
-            .spawn_operator(&Config::default(), &open(job.clone()))
-            .expect("spawned");
-        assert!(frames.is_empty());
-        let id = terminal_id(&job);
-        let session = terminals.sessions.get(&id).expect("session");
-        assert!(!session.accepts_input(), "no input before the screen");
-        // Operator terminals are not human terminals and never idle-close.
-        assert_eq!(terminals.human_count(), 0);
-        let mut events = Vec::new();
-        pump(&mut terminals, &rx, &mut events, 7, &[b"\n", b"\n"]);
-        assert_eq!(
-            events,
-            [
-                "awaiting", "accepted", "running", "awaiting", "accepted", "running", "verify"
-            ]
-        );
-        assert!(!terminals.sessions.contains_key(&id));
-    }
-
-    #[test]
-    fn exit_zero_without_a_clean_child_exit_is_not_a_success() {
-        let (tx, rx) = mpsc::sync_channel(64);
-        let mut terminals = registry(tx, &fake_operator(&[0], 5));
-        let job = golden("interactiveStart");
-        terminals
-            .spawn_operator(&Config::default(), &open(job))
-            .expect("spawned");
-        let mut events = Vec::new();
-        pump(&mut terminals, &rx, &mut events, 4, &[b"\n"]);
-        assert_eq!(events, ["awaiting", "accepted", "running", "closed:None"]);
-    }
-
-    #[test]
-    fn a_decline_after_a_failure_closes_with_the_last_exit_code() {
-        let (tx, rx) = mpsc::sync_channel(64);
-        let mut terminals = registry(tx, &fake_operator(&[2, 0], 0));
-        let job = golden("interactiveStart");
-        terminals
-            .spawn_operator(&Config::default(), &open(job))
-            .expect("spawned");
-        let mut events = Vec::new();
-        pump(&mut terminals, &rx, &mut events, 5, &[b"\n", b"q\n"]);
-        assert_eq!(events[..4], ["awaiting", "accepted", "running", "awaiting"]);
-        assert_eq!(events[4], "closed:Some(2)");
-    }
-
-    #[test]
-    fn cancelling_or_replacing_a_terminal_closes_it_without_running_anything() {
-        let (tx, rx) = mpsc::sync_channel(64);
-        let mut terminals = registry(tx, &fake_operator(&[0], 0));
-        let job = golden("interactiveStart");
-        terminals
-            .spawn_operator(&Config::default(), &open(job.clone()))
-            .expect("spawned");
-        let mut events = Vec::new();
-        // No answer typed: the screen waits.
-        pump(&mut terminals, &rx, &mut events, 1, &[]);
-        assert_eq!(events, ["awaiting"]);
-        // The same terminal delivered again re-reports, and opens nothing new.
-        assert!(
-            terminals
-                .spawn_operator(&Config::default(), &open(job.clone()))
-                .expect("duplicate")
-                .is_empty()
-        );
-        assert_eq!(
-            terminals
-                .take_operator_events()
-                .iter()
-                .map(label)
-                .collect::<Vec<_>>(),
-            ["awaiting"]
-        );
-        assert_eq!(terminals.operator_count(), 1);
-        // A new terminal for the same step replaces the old one.
-        let mut reopened = job.clone();
-        if let Some(operator) = reopened.operator.as_mut() {
-            operator.terminal_id = "AAECAwQFBgcICQoLDA0OAA".into();
-        }
-        let frames = terminals
-            .spawn_operator(&Config::default(), &open(reopened.clone()))
-            .expect("reopened");
-        assert!(!frames.is_empty(), "the old terminal exits");
-        assert!(!terminals.sessions.contains_key(&terminal_id(&job)));
-        assert!(terminals.sessions.contains_key(&terminal_id(&reopened)));
-        assert_eq!(
-            terminals
-                .take_operator_events()
-                .iter()
-                .map(label)
-                .collect::<Vec<_>>(),
-            ["closed:None"]
-        );
-        // A stop for the instance cancels it.
-        let stop = golden("interactiveStop");
-        let (frames, busy) =
-            terminals.close_operator_for_instance(&stop.instance_id, &stop.step_id);
-        assert!(!frames.is_empty());
-        assert!(!busy, "a waiting terminal holds nothing");
-        assert_eq!(terminals.operator_count(), 0);
-        assert_eq!(
-            terminals
-                .take_operator_events()
-                .iter()
-                .map(label)
-                .collect::<Vec<_>>(),
-            ["closed:None"]
-        );
-        drop(rx);
-    }
-
-    #[test]
-    fn a_marker_out_of_order_closes_the_terminal() {
-        let (tx, rx) = mpsc::sync_channel(64);
-        let script = r#"marker=$(cat "$WSMP_SUPERVISED_MARKER_FILE")
-printf '\033]7717;wsmp-supervised;accepted;%s\007' "$marker"
-sleep 5
-"#;
-        let mut terminals = registry(tx, script);
-        let job = golden("interactiveStart");
-        terminals
-            .spawn_operator(&Config::default(), &open(job.clone()))
-            .expect("spawned");
-        let mut events = Vec::new();
-        pump(&mut terminals, &rx, &mut events, 1, &[]);
-        assert_eq!(events, ["closed:None"]);
-        assert!(!terminals.sessions.contains_key(&terminal_id(&job)));
-    }
-
-    #[test]
-    fn only_interactive_jobs_open_terminals() {
-        let (tx, _rx) = mpsc::sync_channel(64);
-        let mut terminals = registry(tx, "exit 0");
-        assert_eq!(
-            terminals
-                .spawn_operator(&Config::default(), &open(golden("plainStart")))
-                .err(),
-            Some("bad_job")
-        );
-        assert_eq!(terminals.operator_count(), 0);
-        let _ = terminals.kill_all();
-        assert_eq!(
-            terminals
-                .spawn_operator(&Config::default(), &open(golden("interactiveStart")))
-                .err(),
-            Some("operator_terminal_unavailable")
-        );
-    }
-
-    #[test]
-    fn a_stop_never_kills_a_running_command_and_waits_for_the_run_to_end() {
-        let (tx, rx) = mpsc::sync_channel(64);
-        let go_len =
-            crate::sessions::supervised_marker("go", "00112233445566778899aabbccddeeff").len();
-        let script = format!(
-            r#"marker=$(cat "$WSMP_SUPERVISED_MARKER_FILE")
-rm -f "$WSMP_SUPERVISED_MARKER_FILE"
-m() {{ printf '\033]7717;wsmp-supervised;%s;%s\007' "$1" "$marker"; }}
-while :; do
-  m ready
-  IFS= read -r line
-  stty -echo -icanon min 1 time 0
-  m accepted
-  go=$(head -c {go_len})
-  stty echo icanon
-  sleep 0.6
-  m "exited;1"
-done
-"#
-        );
-        let mut terminals = registry(tx, &script);
-        let job = golden("interactiveStart");
-        terminals
-            .spawn_operator(&Config::default(), &open(job.clone()))
-            .expect("spawned");
-        let mut events = Vec::new();
-        pump(&mut terminals, &rx, &mut events, 3, &[b"\n"]);
-        assert_eq!(events, ["awaiting", "accepted", "running"]);
-        // The stop arrives mid-run: nothing is killed, and it is held.
-        let stop = golden("interactiveStop");
-        let (frames, busy) =
-            terminals.close_operator_for_instance(&stop.instance_id, &stop.step_id);
-        assert!(frames.is_empty() && busy);
-        assert!(terminals.sessions.contains_key(&terminal_id(&job)));
-        terminals.defer_until_runs_end(stop.clone());
-        terminals.defer_until_runs_end(stop.clone());
-        assert!(terminals.take_released_jobs().is_empty());
-        // The run ends: no retry is offered, the terminal closes, and the
-        // stop goes ahead (once).
-        pump(&mut terminals, &rx, &mut events, 4, &[]);
-        assert_eq!(events[3], "closed:Some(1)");
-        assert!(!terminals.sessions.contains_key(&terminal_id(&job)));
-        let released = terminals.take_released_jobs();
-        assert_eq!(released.len(), 1);
-        assert_eq!(released[0].step_id, stop.step_id);
-    }
-
-    #[test]
-    fn a_job_resent_after_its_terminal_ended_reports_the_outcome_again() {
-        let (tx, rx) = mpsc::sync_channel(64);
-        let mut terminals = registry(tx, &fake_operator(&[0], 0));
-        let job = golden("interactiveStart");
-        terminals
-            .spawn_operator(&Config::default(), &open(job.clone()))
-            .expect("spawned");
-        let mut events = Vec::new();
-        pump(&mut terminals, &rx, &mut events, 2, &[b"q\n"]);
-        assert_eq!(events, ["awaiting", "closed:None"]);
-        assert!(
-            terminals
-                .spawn_operator(&Config::default(), &open(job.clone()))
-                .expect("re-sent")
-                .is_empty()
-        );
-        assert_eq!(terminals.operator_count(), 0, "never reopened");
-        assert_eq!(
-            terminals
-                .take_operator_events()
-                .iter()
-                .map(label)
-                .collect::<Vec<_>>(),
-            ["closed:None"]
-        );
-        // The same id for another step is a conflict.
-        let mut other = golden("interactiveStop");
-        other.operator = job.operator.clone();
-        assert_eq!(
-            terminals
-                .spawn_operator(&Config::default(), &open(other))
-                .err(),
-            Some("operator_terminal_conflict")
-        );
-    }
-
-    #[test]
-    fn with_deployments_off_enter_runs_nothing_and_waiting_terminals_close() {
-        let (tx, rx) = mpsc::sync_channel(64);
-        let mut terminals = registry(tx, &fake_operator(&[0], 0));
-        terminals.operator_allowed = || false;
-        // Only the Enter-time check: the periodic one is far away.
-        terminals.next_operator_gate_check = Some(Instant::now() + Duration::from_secs(100_000));
-        let job = golden("interactiveStart");
-        terminals
-            .spawn_operator(&Config::default(), &open(job.clone()))
-            .expect("spawned");
-        let mut events = Vec::new();
-        pump(&mut terminals, &rx, &mut events, 2, &[b"\n"]);
-        assert_eq!(events, ["awaiting", "closed:None"], "no go, nothing ran");
-
-        // The periodic check closes a terminal still waiting.
-        let (tx, rx) = mpsc::sync_channel(64);
-        let mut terminals = registry(tx, &fake_operator(&[0], 0));
-        terminals
-            .spawn_operator(&Config::default(), &open(job))
-            .expect("spawned");
-        let mut events = Vec::new();
-        pump(&mut terminals, &rx, &mut events, 1, &[]);
-        assert_eq!(events, ["awaiting"]);
-        terminals.operator_allowed = || false;
-        let frames = terminals.poll(Instant::now() + Duration::from_secs(7200));
-        assert!(!frames.is_empty());
-        assert_eq!(terminals.operator_count(), 0);
-        assert_eq!(
-            terminals
-                .take_operator_events()
-                .iter()
-                .map(label)
-                .collect::<Vec<_>>(),
-            ["closed:None"]
-        );
-    }
-
-    #[test]
-    fn held_stops_are_bounded() {
-        let (tx, _rx) = mpsc::sync_channel(64);
-        let mut terminals = registry(tx, "exit 0");
-        let stop = golden("interactiveStop");
-        for n in 0..(DEFERRED_JOBS_MAX + 5) {
-            let mut held = stop.clone();
-            held.step_id = format!("held-{n}");
-            terminals.defer_until_runs_end(held);
-        }
-        assert_eq!(terminals.deferred_jobs.len(), DEFERRED_JOBS_MAX);
-        assert_eq!(terminals.deferred_jobs[0].step_id, "held-5");
-        // Nothing runs for the instance, so all are released at once.
-        assert_eq!(terminals.take_released_jobs().len(), DEFERRED_JOBS_MAX);
+    #[cfg(not(unix))]
+    fn accept_operator(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
+        self.close(terminal_id)
     }
 }

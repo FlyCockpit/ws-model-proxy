@@ -119,7 +119,7 @@ function McpPageSkeleton() {
  * (attached by oauthProviderClient()); the server rejects an invalid or
  * expired signature, so any error here renders the invalid-request card —
  * the flow can NOT continue without a valid transaction. The response's
- * text fields (name/uri) are the only thing rendered; the `icon` field is
+ * text field (the name) is the only thing rendered; the `icon` field is
  * deliberately dropped at the projection boundary (never fetched, never
  * shown — an untrusted remote logo).
  */
@@ -176,9 +176,6 @@ function McpAnonymousLogin({
   // another frame inside it duplicated shell geometry (R83/R84 F6).
   return (
     <div className="mx-auto w-full min-w-0 max-w-md space-y-4 px-4">
-      {client?.uri != null ? (
-        <p className="min-w-0 truncate text-center text-xs text-muted-foreground">{client.uri}</p>
-      ) : null}
       <SignInCard lang={lang} mode="mcp" mcpDescription={description} />
     </div>
   );

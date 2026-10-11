@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { STT_MAX_SESSION_MS } from "../../relay/stt-relay.js";
 import type { CapacityAdmissionRuntime } from "../capacity/runtime.js";
+import { NORMAL_PRIORITY_RANK } from "../capacity/types.js";
 import type { RealtimeAdmitResult, RealtimeCandidate } from "./transcription-session.js";
 
 /**
@@ -19,22 +20,22 @@ export function createRealtimeAdmit(
 ): (candidate: RealtimeCandidate, signal: AbortSignal) => Promise<RealtimeAdmitResult> {
   return async (candidate, signal) => {
     const route = candidate.route;
-    if (!route?.capacityId || !route.executionTargetId) return { ok: false };
+    if (!route?.instanceId || !route.executionTargetId) return { ok: false };
     const deadlineAt = new Date(Date.now() + REALTIME_ADMISSION_WAIT_MS);
     const result = await runtime.acquire(
       {
         requestId: randomUUID(),
         attemptId: randomUUID(),
         ownerId: route.ownerUserId,
-        sourceKind: route.kind === "pool" ? "POOL" : "DIRECT",
+        sourceKind: route.kind === "pool" ? "POOL" : "TEST",
         ...(route.poolId ? { poolId: route.poolId } : {}),
-        basePriority: 16,
-        ...(route.kind === "pool" ? { accessGrantId: route.accessGrantId } : {}),
+        basePriority: NORMAL_PRIORITY_RANK,
+        ...(route.kind === "pool" ? { priorityShareId: route.shareId } : {}),
         connectionOwner: "model-api-realtime",
         deadlineAt,
         candidates: [
           {
-            capacityId: route.capacityId,
+            capacityId: route.instanceId,
             executionTargetId: route.executionTargetId,
             ...(route.poolMemberId ? { poolMemberId: route.poolMemberId } : {}),
             candidateOrder: 0,

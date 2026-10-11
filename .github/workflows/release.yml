@@ -316,6 +316,12 @@ jobs:
       - build-cli-local-artifacts
       - build-cli-global-artifacts
     if: ${{ always() && needs.plan-cli-release.result == 'success' && (needs.build-cli-global-artifacts.result == 'skipped' || needs.build-cli-global-artifacts.result == 'success') && (needs.build-cli-local-artifacts.result == 'skipped' || needs.build-cli-local-artifacts.result == 'success') }}
+    # Job-level permissions replace the workflow's: contents to upload the release, id-token and
+    # attestations to sign build provenance for the CLI archives (no repository secret involved).
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: ubuntu-22.04
@@ -371,6 +377,36 @@ jobs:
 
       - name: Cleanup
         run: rm -f apps/cli/artifacts/*-dist-manifest.json
+
+      # /install.sh downloads these archives and verifies them against sha256.sum (fail closed).
+      # Refuse to publish a release that lacks either, so a node never meets a half-published one.
+      - name: Check CLI archives and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd apps/cli/artifacts
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
+            archive="wsmp-$target.tar.xz"
+            if [ ! -f "$archive" ]; then
+              echo "::error::$archive is missing from the release artifacts."
+              exit 1
+            fi
+            if ! awk -v f="$archive" '($2 == f || $2 == "*" f) && $1 ~ /^[0-9a-f]+$/ && length($1) == 64 { found = 1 } END { exit !found }' sha256.sum; then
+              echo "::error::sha256.sum has no entry for $archive."
+              exit 1
+            fi
+          done
+          sha256sum --check --strict sha256.sum
+
+      # Signed SLSA build provenance for every archive and the checksum file. Verify with
+      # `gh attestation verify <file> --repo FlyCockpit/ws-model-proxy`.
+      - name: Attest CLI build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            apps/cli/artifacts/wsmp-*.tar.xz
+            apps/cli/artifacts/wsmp-*.zip
+            apps/cli/artifacts/sha256.sum
 
       - name: Create or update GitHub Release
         env:
@@ -484,7 +520,7 @@ jobs:
           {
             echo "## Release ${{ needs.validate.outputs.tag }}"
             echo
-            echo "- Container: `${{ needs.validate.outputs.image }}:${{ needs.validate.outputs.tag }}`"
-            echo "- CLI artifacts: GitHub Release `${{ needs.validate.outputs.tag }}`"
-            echo "- Homebrew: `brew install flycockpit/tap/wsmp`"
+            echo "- Container: \`${{ needs.validate.outputs.image }}:${{ needs.validate.outputs.tag }}\`"
+            echo "- CLI artifacts: GitHub Release \`${{ needs.validate.outputs.tag }}\` (sha256.sum, build provenance attested)"
+            echo "- Homebrew: \`brew install flycockpit/tap/wsmp\`"
           } >> "$GITHUB_STEP_SUMMARY"

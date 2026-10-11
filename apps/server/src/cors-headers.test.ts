@@ -1,4 +1,5 @@
 import { APP_LOCALE_HEADER } from "@ws-model-proxy/config/locales";
+import { SHARE_INVITE_HEADER } from "@ws-model-proxy/config/share-invite";
 import { betterAuth } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
 import { describe, expect, it, vi } from "vitest";
@@ -27,22 +28,7 @@ const envMock = vi.hoisted(() => ({
   BETTER_AUTH_URL: "https://proxy.example.com",
   BETTER_AUTH_SECRET: "contract-test-secret-at-least-thirty-two-characters",
   CORS_ORIGIN: "https://app.example.com",
-  RATE_LIMIT_AUTH_POINTS: 500,
-  RATE_LIMIT_AUTH_DURATION: 60,
-  RATE_LIMIT_AUTH_BLOCK_DURATION: 0,
-  RATE_LIMIT_SIGNUP_POINTS: 3,
-  RATE_LIMIT_SIGNUP_DURATION: 3600,
-  RATE_LIMIT_SIGNUP_BLOCK_DURATION: 3600,
-  RATE_LIMIT_RPC_POINTS: 1000,
-  RATE_LIMIT_RPC_DURATION: 60,
-  RATE_LIMIT_EMAIL_RECIPIENT_POINTS: 3,
-  RATE_LIMIT_EMAIL_RECIPIENT_DURATION: 3600,
-  RATE_LIMIT_EMAIL_RECIPIENT_BLOCK_DURATION: 0,
-  RATE_LIMIT_SIGNUP_RECIPIENT_POINTS: 6,
-  RATE_LIMIT_MCP_POINTS: 2,
-  RATE_LIMIT_MCP_DURATION: 60,
-  RATE_LIMIT_MCP_CONSENT_POINTS: 2,
-  RATE_LIMIT_MCP_CONSENT_DURATION: 60,
+  WMP_RATE_LIMIT_SCALE: 1,
   TRUST_PROXY_HOPS: undefined,
   MEDIA_MAX_UPLOAD_BYTES: 5 * 1024 * 1024,
   MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES: 1024 * 1024,
@@ -139,6 +125,12 @@ describe("createApp CORS preflight (CORS_ALLOW_HEADERS wiring)", () => {
     expect(CORS_ALLOW_HEADERS).toContain(APP_LOCALE_HEADER);
     const res = await preflight(`content-type,${APP_LOCALE_HEADER}`);
     expect(allowedHeaders(res)).toContain(APP_LOCALE_HEADER);
+  });
+
+  it("allows the invite header the sign-up page sets on an invite sign-up", async () => {
+    expect(CORS_ALLOW_HEADERS).toContain(SHARE_INVITE_HEADER);
+    const res = await preflight(`content-type,${SHARE_INVITE_HEADER}`);
+    expect(allowedHeaders(res)).toContain(SHARE_INVITE_HEADER);
   });
 
   it("allows the CSRF header Better-Auth's client plugin sets", async () => {

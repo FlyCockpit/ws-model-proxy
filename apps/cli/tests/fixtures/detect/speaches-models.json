@@ -1,0 +1,21 @@
+{
+  "data": [
+    {
+      "id": "Systran/faster-whisper-large-v3",
+      "created": 0,
+      "object": "model",
+      "owned_by": "Systran",
+      "language": ["en", "de", "fr"],
+      "task": "automatic-speech-recognition"
+    },
+    {
+      "id": "deepdml/faster-whisper-large-v3-turbo-ct2",
+      "created": 0,
+      "object": "model",
+      "owned_by": "deepdml",
+      "language": [],
+      "task": "automatic-speech-recognition"
+    }
+  ],
+  "object": "list"
+}

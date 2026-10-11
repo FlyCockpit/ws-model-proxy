@@ -1,0 +1,212 @@
+{
+  "requests": {
+    "status": "Estado",
+    "source": "Origen",
+    "all": "Todas",
+    "statusValue": {
+      "PENDING": "En curso",
+      "SUCCEEDED": "Exitosa",
+      "FAILED": "Fallida",
+      "CANCELED": "Cancelada"
+    },
+    "sourceValue": {
+      "API_KEY": "Clave de API",
+      "TEST": "Página de prueba",
+      "AGENT_TEST": "Prueba de agente",
+      "SIDECAR": "Paso de medios"
+    },
+    "routeValue": {
+      "local": "Local",
+      "cloud": "Nube",
+      "own_key": "Clave propia"
+    },
+    "direct": "Modelo servido (prueba)",
+    "queueWait": "Cola {{ms}} ms",
+    "ttft": "Primer token {{ms}} ms",
+    "duration": "{{ms}} ms",
+    "tokens": "{{prompt}} entrada / {{completion}} salida",
+    "attempts_one": "{{count}} intento",
+    "attempts_other": "{{count}} intentos",
+    "rejection": "Rechazada: {{reason}}",
+    "error": "Error: {{reason}}",
+    "upstreamError": "El runtime respondió: {{message}}",
+    "empty": "Ninguna solicitud coincide.",
+    "loadMore": "Cargar más",
+    "loadFailed": "No se pudo cargar el registro de solicitudes.",
+    "clear": "Borrar mi registro",
+    "clearTitle": "¿Borrar tu registro de solicitudes?",
+    "clearDescription": "Se borra cada solicitud terminada que hiciste a tus propios pools y modelos (las que siguen en curso se quedan). Las solicitudes que hiciste a pools de otras personas se quedan en los registros de sus dueños.",
+    "cleared_one": "{{count}} solicitud borrada.",
+    "cleared_other": "{{count}} solicitudes borradas.",
+    "reason": {
+      "capacity_wait_expired": "esperó demasiado por un espacio libre",
+      "capacity_lease_lost": "perdió su espacio antes de enviarse",
+      "context_too_large": "la entrada es más grande que el contexto del modelo",
+      "not_found": "no se encontró el modelo",
+      "unsupported_capability": "ningún miembro admite este tipo de solicitud",
+      "access_denied": "se negó el acceso",
+      "disconnected": "el nodo se desconectó antes de enviarla",
+      "other": "{{code}}"
+    },
+    "olderThan": "Más antiguas que",
+    "deleteOlder": "Borrar antiguas",
+    "deleteOlderTitle": "¿Borrar las solicitudes de hace más de {{range}}?",
+    "deleteOlderDescription": "Se borran las solicitudes terminadas que hiciste a tus propios pools y modelos de antes de ese momento (las que siguen en curso se quedan). Las solicitudes que hiciste a pools de otras personas se quedan en los registros de sus dueños.",
+    "range": {
+      "1h": "1 hora",
+      "24h": "1 día",
+      "7d": "7 días",
+      "30d": "30 días"
+    },
+    "filter": {
+      "poolId": "Pool",
+      "runtimeId": "Runtime",
+      "versionId": "Versión",
+      "nodeId": "Nodo",
+      "since": "Desde",
+      "anyTime": "Cualquier momento",
+      "versionNumber": "Versión {{version}}",
+      "reset": "Quitar filtros"
+    },
+    "sinceRange": {
+      "1h": "Última hora",
+      "24h": "Último día",
+      "7d": "Últimos 7 días",
+      "30d": "Últimos 30 días"
+    }
+  },
+  "commands": {
+    "title": "Comandos",
+    "description": "Comandos que agentes y personas ejecutaron en tus nodos. La salida llega en vivo desde el nodo y solo se guarda ahí.",
+    "state": {
+      "RUNNING": "En ejecución",
+      "SUCCEEDED": "Exitoso",
+      "FAILED": "Fallido",
+      "CANCELLED": "Cancelado",
+      "TIMED_OUT": "Tiempo agotado",
+      "INTERRUPTED": "Interrumpido",
+      "UNKNOWN": "Desconocido"
+    },
+    "interruptedHint": "Se detuvo cuando el nodo bajó a solo retransmisión o su servicio se reinició.",
+    "byAgent": "Agente {{name}}",
+    "byUnknownAgent": "Un agente",
+    "byPerson": "Tú",
+    "bySystem": "Sistema",
+    "exit": "Salida {{code}}",
+    "endsBy": "Se detiene a más tardar",
+    "output": "Salida",
+    "showOutput": "Ver salida",
+    "refresh": "Actualizar",
+    "cancel": "Cancelar comando",
+    "cancelled": "Cancelación enviada.",
+    "offline": "El nodo está desconectado, así que no hay salida disponible.",
+    "truncated": "Solo se muestra el final de la salida.",
+    "noOutput": "Todavía no hay salida.",
+    "empty": "Todavía no hay comandos.",
+    "loadFailed": "No se pudo cargar el registro de comandos.",
+    "loadMore": "Cargar más"
+  },
+  "metrics": {
+    "requestLog": "Registro de solicitudes",
+    "scope": "Alcance",
+    "scopeValue": {
+      "pool": "Pool",
+      "runtime": "Runtime",
+      "version": "Versión",
+      "node": "Nodo",
+      "instance": "Instancia"
+    },
+    "runtimeOf": "Runtime",
+    "noTargets": {
+      "pool": "Aún no hay pools.",
+      "runtime": "Aún no hay runtimes.",
+      "version": "Aún no hay runtimes.",
+      "node": "Aún no hay nodos.",
+      "instance": "Este runtime no tiene instancias ahora."
+    },
+    "targetsFailed": "No se pudieron cargar las opciones.",
+    "metric": "Métrica",
+    "family": {
+      "request": "Solicitudes",
+      "load": "Carga del motor",
+      "node": "Nodo",
+      "custom": "Personalizada"
+    },
+    "metricValue": {
+      "requests": "Solicitudes",
+      "errors": "Errores",
+      "rejections": "Rechazos",
+      "rejections_capacity": "Rechazos: sin espacio libre",
+      "rejections_context": "Rechazos: contexto demasiado grande",
+      "rejections_spend": "Rechazos: límite de gasto",
+      "rejections_other": "Rechazos: otros",
+      "ttft_p50": "Primer token p50",
+      "ttft_p95": "Primer token p95",
+      "latency_p50": "Latencia p50",
+      "latency_p95": "Latencia p95",
+      "queue_wait_p50": "Espera en cola p50",
+      "queue_wait_p95": "Espera en cola p95",
+      "decode_tps": "Velocidad de decodificación",
+      "prefill_tps": "Velocidad de prellenado",
+      "input_tokens": "Tokens de entrada",
+      "output_tokens": "Tokens de salida",
+      "cache_hit_rate": "Aciertos de caché de prompt",
+      "cloud_share": "Proporción en la nube",
+      "kv_usage_avg": "Uso de caché KV (prom.)",
+      "kv_usage_max": "Uso de caché KV (máx.)",
+      "running_max": "Solicitudes en ejecución (máx.)",
+      "waiting_max": "Solicitudes en espera (máx.)",
+      "full_ratio": "Tiempo lleno",
+      "cpu_pct": "Uso de CPU",
+      "memory_available_gb": "Memoria disponible",
+      "accelerator_free_gb": "Memoria libre del acelerador",
+      "gpu_util_pct": "Uso de GPU",
+      "gpu_temp_c": "Temperatura de GPU"
+    },
+    "groupBy": "Dividir por",
+    "groupByNone": "Nada",
+    "groupByValue": {
+      "runtime": "Runtime",
+      "version": "Versión",
+      "node": "Nodo",
+      "instance": "Instancia",
+      "model": "Modelo",
+      "member": "Miembro del pool",
+      "source": "Origen"
+    },
+    "range": "Rango",
+    "rangeValue": {
+      "1h": "1 hora",
+      "24h": "24 horas",
+      "7d": "7 días",
+      "30d": "30 días"
+    },
+    "step": "Paso",
+    "stepValue": {
+      "1m": "1 min",
+      "5m": "5 min",
+      "1h": "1 hora",
+      "1d": "1 día"
+    },
+    "compareVersions": "Comparar versiones",
+    "includeTests": "Incluir pruebas",
+    "sharedPool": "Un pool compartido contigo: métricas de tus propias solicitudes, sin dividir o por origen.",
+    "loadFailed": "No se pudieron cargar las métricas.",
+    "totals": "Totales",
+    "testsLeftOut_one": "{{count}} solicitud de prueba excluida. Activa “Incluir pruebas” para contarla.",
+    "testsLeftOut_other": "{{count}} solicitudes de prueba excluidas. Activa “Incluir pruebas” para contarlas.",
+    "view": "Vista",
+    "viewValue": {
+      "chart": "Gráfica",
+      "table": "Tabla"
+    },
+    "truncated": "Solo se muestran los grupos más grandes.",
+    "empty": "No hay datos para este alcance y rango.",
+    "emptyHint": "Las métricas aparecen cuando se ejecutan solicitudes. El registro de solicitudes muestra cada una.",
+    "noGroup": "(ninguno)",
+    "chartLabel_one": "{{metric}} en el tiempo, {{count}} línea. La vista de tabla muestra los valores.",
+    "chartLabel_other": "{{metric}} en el tiempo, {{count}} líneas. La vista de tabla muestra los valores.",
+    "time": "Hora",
+    "tokensPerSecond": "{{value}} tok/s"
+  }
+}

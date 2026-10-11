@@ -19,7 +19,16 @@ const ALLOWED_EXACT: &[&str] = &[
     "XDG_RUNTIME_DIR",
     "DBUS_SESSION_BUS_ADDRESS",
 ];
-const VALUE_PREFIXES: &[&str] = &["wsmp_model_", "wsmp_cli_", "wsmp_device_", "wsmp_mcp_"];
+/// Product credential prefixes (`PRODUCT_CREDENTIAL_PREFIXES` in
+/// `packages/db/src/node-security.ts`; `CLI_OUTPUT_CREDENTIAL_PREFIXES` in
+/// `packages/config/src/cli-command-output.ts` is the same list).
+const VALUE_PREFIXES: &[&str] = &[
+    "wsmp_key_",
+    "wsmp_node_",
+    "wsmp_agent_",
+    "wsmp_enr_",
+    "wsmp_inv_",
+];
 
 pub struct ScrubOptions<'a> {
     pub case_insensitive_names: bool,
@@ -28,8 +37,8 @@ pub struct ScrubOptions<'a> {
 
 /// Keep the allowlist, then apply the denylist on top.
 ///
-/// Denied names are the CLI token env var, `required_service_env_names`, and
-/// anything starting with `WSMP_`. Values that start with a `wsmp_*` credential
+/// Denied names are the caller's `denied_names` and anything starting with
+/// `WSMP_`. Values that start with a `wsmp_*` credential
 /// prefix are dropped even when the name is allowlisted.
 pub fn scrub_env(entries: &[(&str, &str)], options: &ScrubOptions<'_>) -> Vec<(String, String)> {
     entries
@@ -108,6 +117,9 @@ pub fn scrub_parent_env(denied_names: &[String]) -> Vec<(String, String)> {
         },
     );
     complete_child_env(&mut env, &HostEnvFacts::current(), is_socket);
+    // Every child the node starts carries the job marker, so `wsmp trust
+    // full` and `wsmp secret` refuse to run from it.
+    env.push((crate::trust::JOB_MARKER_ENV.to_string(), "1".to_string()));
     env
 }
 
@@ -610,27 +622,36 @@ mod tests {
     }
 
     #[test]
-    fn drops_wsmp_model_prefixed_values() {
-        let kept = scrub(&[("HOME", "wsmp_model_example")], &[], false);
-        assert!(kept.is_empty());
+    fn value_prefixes_equal_the_server_product_credential_prefixes() {
+        let source = include_str!("../../../packages/db/src/node-security.ts");
+        let start = source
+            .find("PRODUCT_CREDENTIAL_PREFIXES = {")
+            .expect("PRODUCT_CREDENTIAL_PREFIXES");
+        let block = &source[start..start + source[start..].find('}').expect("end of object")];
+        let mut server: Vec<&str> = block
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .filter(|value| value.starts_with("wsmp_"))
+            .collect();
+        let mut ours = VALUE_PREFIXES.to_vec();
+        server.sort_unstable();
+        ours.sort_unstable();
+        assert_eq!(ours, server);
     }
 
     #[test]
-    fn drops_wsmp_cli_prefixed_values() {
-        let kept = scrub(&[("HOME", "wsmp_cli_example")], &[], false);
-        assert!(kept.is_empty());
-    }
-
-    #[test]
-    fn drops_wsmp_device_prefixed_values() {
-        let kept = scrub(&[("HOME", "wsmp_device_example")], &[], false);
-        assert!(kept.is_empty());
-    }
-
-    #[test]
-    fn drops_wsmp_mcp_prefixed_values() {
-        let kept = scrub(&[("HOME", "wsmp_mcp_example")], &[], false);
-        assert!(kept.is_empty());
+    fn drops_product_credential_prefixed_values() {
+        for value in [
+            "wsmp_key_example",
+            "wsmp_node_example",
+            "wsmp_agent_example",
+            "wsmp_enr_example",
+            "wsmp_inv_example",
+        ] {
+            let kept = scrub(&[("HOME", value)], &[], false);
+            assert!(kept.is_empty(), "{value}");
+        }
     }
 
     #[test]

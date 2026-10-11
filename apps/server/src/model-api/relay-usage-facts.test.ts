@@ -21,6 +21,7 @@ const {
   usageFactsFromProviderUsage,
   usageFactsFromRelayTerminal,
   UNKNOWN_USAGE_FACTS,
+  withEstimatedUsage,
 } = await import("./relay-usage-facts.js");
 const { engineCacheConfirmedFromRetainedResponse } = await import("./public-overflow.js");
 
@@ -207,5 +208,40 @@ describe("engineCacheConfirmedFromUsageFacts", () => {
         engineCacheConfirmedFromRetainedResponse(sample.prefix, sample.tail, sample.totalBytes),
       );
     }
+  });
+});
+
+describe("withEstimatedUsage", () => {
+  const unknown = {
+    promptTokens: null,
+    completionTokens: null,
+    totalTokens: null,
+    cacheReadTokens: null,
+    cacheWriteTokens: null,
+    usageKnown: false,
+  };
+  it("estimates a successful request's missing usage and marks it", () => {
+    expect(withEstimatedUsage(unknown, { ok: true, metrics: { completionTokens: 7 } }, 12)).toEqual(
+      {
+        ...unknown,
+        promptTokens: 12,
+        completionTokens: 7,
+        totalTokens: 19,
+        usageEstimated: true,
+      },
+    );
+  });
+  it("never replaces reported usage or estimates a failure", () => {
+    const known = { ...unknown, promptTokens: 3, usageKnown: true };
+    expect(withEstimatedUsage(known, { ok: true, metrics: { completionTokens: 7 } }, 12)).toEqual({
+      ...known,
+      usageEstimated: false,
+    });
+    expect(withEstimatedUsage(unknown, { ok: false, metrics: null }, 12).usageEstimated).toBe(
+      false,
+    );
+    expect(withEstimatedUsage(unknown, { ok: true, metrics: null }, undefined).usageEstimated).toBe(
+      false,
+    );
   });
 });

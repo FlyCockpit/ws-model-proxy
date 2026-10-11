@@ -23,26 +23,25 @@ export function realtimeLocalSendBinding(
   candidate: RealtimeCandidate,
 ): LocalSendBinding | null {
   const route = candidate.route;
-  if (!route?.executionTargetId || !route.capacityId) return null;
+  if (!route?.executionTargetId || !route.instanceId) return null;
   return {
     requesterUserId: requester.userId,
-    modelApiTokenId: requester.tokenId,
+    apiKeyId: requester.tokenId,
     engineOwnerUserId: route.engineOwnerUserId,
-    discoveredModelId: route.discoveredModelId,
+    runtimeModelId: route.runtimeModelId,
     executionTargetId: route.executionTargetId,
-    capacityId: route.capacityId,
-    endpointId: route.endpointId,
-    cliDeviceId: candidate.cliDeviceId,
-    endpointSlug: candidate.endpointSlug,
+    capacityId: route.instanceId,
+    nodeId: candidate.nodeId,
+    handle: candidate.handle,
     upstreamModelId: candidate.upstreamModel,
     ...(route.kind === "pool" && route.poolId
       ? {
           pool: {
             id: route.poolId,
             ownerUserId: route.ownerUserId,
-            accessGrantId: route.accessGrantId,
+            shareId: route.shareId,
             memberId: route.poolMemberId,
-            contributionId: route.contributionId,
+            contributedShareId: route.contributedShareId,
           },
         }
       : {}),

@@ -275,7 +275,11 @@ export async function parseMultipartToSpool(
       });
       stream.pipe(output);
       parts.push(part);
-      writes.push(finished(output));
+      const written = finished(output);
+      // Observed now: it may reject while the request body is still being read, long before
+      // the awaits below, and an unobserved rejection ends the process.
+      void written.catch(() => undefined);
+      writes.push(written);
     });
     const parserDone = new Promise<void>((resolvePromise, rejectPromise) => {
       parser.once("error", rejectPromise);

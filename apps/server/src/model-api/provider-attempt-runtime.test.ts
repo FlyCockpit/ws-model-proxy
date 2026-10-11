@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 const db = vi.hoisted(() => ({
   $transaction: vi.fn(),
-  publicProviderAttemptEvent: { create: vi.fn() },
+  attemptEvent: { findFirst: vi.fn(), create: vi.fn() },
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
 
@@ -20,7 +20,7 @@ describe("provider attempt failure policy", () => {
   it("renews only the fenced account and model half-open owner", async () => {
     const tx = {
       $queryRaw: vi.fn().mockResolvedValue([]),
-      providerAttempt: {
+      attempt: {
         findUnique: vi.fn().mockResolvedValue({
           userId: "owner",
           providerAccountId: "account",
@@ -73,7 +73,7 @@ describe("provider attempt failure policy", () => {
   it("rejects an orphan heartbeat after a successor fence is installed", async () => {
     const tx = {
       $queryRaw: vi.fn().mockResolvedValue([]),
-      providerAttempt: {
+      attempt: {
         findUnique: vi.fn().mockResolvedValue({
           userId: "owner",
           providerAccountId: "account",
@@ -103,7 +103,7 @@ describe("provider attempt failure policy", () => {
     await expect(
       heartbeatProviderAttempt({ attemptId: "orphan", fencingToken: 7n, extensionMs: 900_000 }),
     ).resolves.toBe(false);
-    expect(tx.providerAttempt.updateMany).not.toHaveBeenCalled();
+    expect(tx.attempt.updateMany).not.toHaveBeenCalled();
     expect(tx.providerAccount.updateMany).not.toHaveBeenCalled();
     expect(tx.providerModel.updateMany).not.toHaveBeenCalled();
   });
@@ -159,14 +159,14 @@ describe("provider attempt failure policy", () => {
     expect(tx.providerModel.update).toHaveBeenCalledWith({
       where: { id: "model", userId: "owner" },
       data: expect.objectContaining({
-        healthStatus: "DEGRADED",
+        health: "DEGRADED",
         healthNextRetryAt: new Date("2026-08-25T00:00:45.000Z"),
       }),
     });
     expect(tx.providerAccount.update).toHaveBeenCalledWith({
       where: { id: "account", userId: "owner" },
       data: expect.objectContaining({
-        healthStatus: "DEGRADED",
+        health: "DEGRADED",
         healthNextRetryAt: new Date("2026-08-25T00:00:45.000Z"),
       }),
     });
@@ -220,7 +220,9 @@ describe("provider attempt failure policy", () => {
       $queryRaw: vi.fn(async (parts: TemplateStringsArray) => {
         const sql = parts.join("");
         if (sql.includes("SELECT EXISTS")) return [{ eligible: true }];
-        return sql.includes("FROM provider_attempt") ? [{ id: "durable-attempt" }] : [];
+        return sql.includes("FROM attempt") && sql.includes('"AttemptKind"')
+          ? [{ id: "durable-attempt" }]
+          : [];
       }),
       providerAccount: {
         findUniqueOrThrow: vi.fn().mockResolvedValue(healthy),
@@ -464,6 +466,10 @@ describe("provider attempt failure policy", () => {
 
   it("persists a prompt-free, fully correlated append-only attempt event", async () => {
     const firstClientByteAt = new Date("2026-08-25T00:00:00.000Z");
+    db.attemptEvent.findFirst.mockResolvedValue({ sequence: 2 });
+    db.$transaction.mockImplementationOnce(async (callback: (client: typeof db) => unknown) =>
+      callback(db),
+    );
     await recordProviderAttemptEvent({
       userId: "owner",
       providerAccountId: "account",
@@ -494,16 +500,23 @@ describe("provider attempt failure policy", () => {
       streamCommitted: true,
     });
 
-    expect(db.publicProviderAttemptEvent.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
+    expect(db.attemptEvent.create).toHaveBeenCalledWith({
+      data: {
+        userId: "owner",
         attemptId: "attempt",
-        fencingToken: 17n,
-        poolMemberId: "member",
-        executionTargetId: "target",
-        reservationIds: ["reservation-a", "reservation-b"],
-        firstClientByteAt,
-        streamCommitted: true,
-      }),
+        requestId: "request",
+        sequence: 3,
+        eventType: "FIRST_CLIENT_BYTE",
+        reason: "RESPONSE_COMMITTED",
+        metadata: expect.objectContaining({
+          fencingToken: "17",
+          poolMemberId: "member",
+          executionTargetId: "target",
+          reservationIds: "reservation-a,reservation-b",
+          firstClientByteAt: firstClientByteAt.toISOString(),
+          streamCommitted: true,
+        }),
+      },
     });
   });
 });

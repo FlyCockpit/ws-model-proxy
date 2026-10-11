@@ -4,7 +4,22 @@ import {
   decodeSealedFrame,
   encodeSealedFrame,
   parseTerminalServerMessage,
+  typableCommand,
 } from "./terminal-protocol";
+
+describe("typableCommand", () => {
+  it("types one line of printable ASCII only", () => {
+    expect(typableCommand("nvidia-smi -L | head -n 2 && echo '~$HOME'")).toBe(true);
+    expect(typableCommand("")).toBe(false);
+    // Past ASCII: readline may read it as Meta keys or strip the high bit (0x8A -> LF).
+    expect(typableCommand("echo 'héllo'")).toBe(false);
+    expect(typableCommand("ls\u008a")).toBe(false);
+    expect(typableCommand("lså")).toBe(false);
+    for (const control of ["\n", "\r", "\t", "\u001b", "\u007f", "\u0085"]) {
+      expect(typableCommand(`ls${control}rm -rf ~`)).toBe(false);
+    }
+  });
+});
 
 function frameWithMetadata(metadata: unknown, body = new Uint8Array([1, 2, 3])): ArrayBuffer {
   const meta = new TextEncoder().encode(JSON.stringify(metadata));
@@ -69,26 +84,10 @@ describe("parseTerminalServerMessage", () => {
     expect(parseTerminalServerMessage({ type: "closed" })).toBeNull();
   });
 
-  it("reads a decline outcome and ignores unknown outcomes", () => {
+  it("reads the request id an error answers, with or without a terminal", () => {
     expect(
-      parseTerminalServerMessage({ type: "decline", terminalId: "t1", outcome: "started" }),
-    ).toEqual({ type: "decline", terminalId: "t1", outcome: "started", requestId: null });
-    expect(
-      parseTerminalServerMessage({
-        type: "decline",
-        terminalId: "t1",
-        outcome: "started",
-        requestId: "decline_1",
-      }),
-    ).toMatchObject({ requestId: "decline_1" });
-    // An error names the frame it answers, with or without a terminal.
-    expect(
-      parseTerminalServerMessage({ type: "error", code: "rate_limited", requestId: "decline_1" }),
-    ).toMatchObject({ code: "rate_limited", terminalId: null, requestId: "decline_1" });
-    expect(
-      parseTerminalServerMessage({ type: "decline", terminalId: "t1", outcome: "stopped" }),
-    ).toBeNull();
-    expect(parseTerminalServerMessage({ type: "decline", outcome: "started" })).toBeNull();
+      parseTerminalServerMessage({ type: "error", code: "rate_limited", requestId: "close_1" }),
+    ).toMatchObject({ code: "rate_limited", terminalId: null, requestId: "close_1" });
   });
 
   it("reads viewer fields on listed terminals and the CLI identity", () => {
@@ -139,9 +138,6 @@ describe("parseTerminalServerMessage", () => {
       terminals: [
         {
           terminalId: "t1",
-          origin: "user",
-          supervised: null,
-          deployment: null,
           cliDeviceId: "c1",
           cols: 80,
           rows: 24,
@@ -152,9 +148,6 @@ describe("parseTerminalServerMessage", () => {
         },
         {
           terminalId: "t2",
-          origin: "user",
-          supervised: null,
-          deployment: null,
           cliDeviceId: "c2",
           cols: 80,
           rows: 24,
@@ -163,84 +156,6 @@ describe("parseTerminalServerMessage", () => {
           writerHere: false,
           viewerAttached: true,
         },
-      ],
-    });
-  });
-});
-
-describe("agent terminals", () => {
-  const supervised = {
-    commandId: "cmd",
-    status: "awaiting_user",
-    requester: "laptop agent",
-    reason: "installs deps",
-    command: "sudo apt install jq",
-    cwd: "/home/me",
-    shareOutput: true,
-    createdAt: "2026-09-24T00:00:00.000Z",
-    expiresAt: "2026-09-24T00:15:00.000Z",
-    exitCode: null,
-    signal: null,
-  };
-
-  it("reads origin, request details, and the pushed flag", () => {
-    const parsed = parseTerminalServerMessage({
-      type: "terminals",
-      pushed: true,
-      clis: [],
-      terminals: [{ terminalId: "t1", cliDeviceId: "c1", origin: "agent", supervised }],
-    });
-    expect(parsed).toMatchObject({
-      type: "terminals",
-      pushed: true,
-      terminals: [{ terminalId: "t1", origin: "agent", supervised }],
-    });
-  });
-
-  it("keeps an agent terminal an agent terminal even with unreadable details", () => {
-    const parsed = parseTerminalServerMessage({
-      type: "terminals",
-      clis: [],
-      terminals: [
-        { terminalId: "t1", cliDeviceId: "c1", origin: "agent", supervised: { status: "?" } },
-        { terminalId: "t2", cliDeviceId: "c1", origin: "martian" },
-      ],
-    });
-    expect(parsed).toMatchObject({
-      pushed: false,
-      terminals: [
-        { terminalId: "t1", origin: "agent", supervised: null },
-        { terminalId: "t2", origin: "user", supervised: null },
-      ],
-    });
-  });
-});
-
-describe("deployment operator terminals", () => {
-  it("reads the step a deployment terminal runs, never auto-attachable as a user shell", () => {
-    const parsed = parseTerminalServerMessage({
-      type: "terminals",
-      clis: [],
-      terminals: [
-        {
-          terminalId: "t1",
-          cliDeviceId: "c1",
-          origin: "deployment",
-          deployment: { stepId: "s1", instanceId: "i1", rank: 1, action: "stop", state: "running" },
-        },
-        { terminalId: "t2", cliDeviceId: "c1", origin: "deployment", deployment: { rank: -1 } },
-      ],
-    });
-    expect(parsed).toMatchObject({
-      terminals: [
-        {
-          terminalId: "t1",
-          origin: "deployment",
-          supervised: null,
-          deployment: { stepId: "s1", instanceId: "i1", rank: 1, action: "stop", state: "running" },
-        },
-        // Unreadable details: still a deployment terminal, never the user's own shell.
-        { terminalId: "t2", origin: "deployment", deployment: null },
       ],
     });
   });

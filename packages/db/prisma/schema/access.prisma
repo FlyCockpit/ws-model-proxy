@@ -1,0 +1,216 @@
+// ───────────────────────────── Access ─────────────────────────────
+
+enum ApiKeyScope {
+  /// Every pool the user owns or has a share of, now and later.
+  ALL_POOLS
+  /// Only the pools in ApiKeyPool.
+  SELECTED_POOLS
+}
+
+/// Caller credential for /v1. Pools only (D1); no cloud flag (callers opt in with `:external`).
+model ApiKey {
+  id           String      @id @default(cuid(2))
+  createdAt    DateTime    @default(now())
+  userId       String
+  name         String
+  scope        ApiKeyScope @default(ALL_POOLS)
+  lookupPrefix String      @unique
+  secretDigest String      @unique
+  lastUsedAt   DateTime?
+  revokedAt    DateTime?
+  expiresAt    DateTime?
+
+  User    User         @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Pools   ApiKeyPool[]
+  Aliases ModelAlias[]
+
+  @@unique([id, userId])
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+  @@map("api_key")
+}
+
+model ApiKeyPool {
+  apiKeyId String
+  poolId   String
+
+  ApiKey ApiKey @relation(fields: [apiKeyId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Pool   Pool   @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@id([apiKeyId, poolId])
+  @@index([poolId])
+  @@map("api_key_pool")
+}
+
+/// A model name a caller's harness hard-codes (`gpt-4o`, `claude-sonnet-4-5`) mapped to one of
+/// the pools the caller may use. Lives in the caller's namespace: for every key of the user, or
+/// for one key (which wins). Resolves only while the pool is callable with the key in use; an
+/// alias named like a callable ID of its person wins over that pool for them (api
+/// lib/model-names.ts). Configuration, not access: agents may manage it.
+model ModelAlias {
+  id        String   @id @default(cuid(2))
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+  userId    String
+  /// Null: every key of the user. Set: only this key.
+  apiKeyId  String?
+  /// `apiKeyId ?? ""`, so a name is unique per scope (NULLs are distinct in unique indexes).
+  scopeKey  String   @default("")
+  name      String
+  poolId    String
+
+  User   User    @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ApiKey ApiKey? @relation(fields: [apiKeyId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Pool   Pool    @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([userId, scopeKey, name])
+  @@index([poolId])
+  @@index([apiKeyId])
+  @@map("model_alias")
+}
+
+/// MCP OAuth/PAT grant tombstone (unchanged; not a Better Auth model).
+model McpGrant {
+  id          String     @id @default(cuid(2))
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @default(now()) @updatedAt
+  userId      String
+  clientId    String
+  referenceId String
+  /// READ or FULL, the person's choice (consent page, Access → Agents). An OAuth request is
+  /// FULL only while this is FULL and its token carries `mcp:write`.
+  level       AgentLevel @default(READ)
+  revokedAt   DateTime?
+
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  AgentToken AgentToken?
+
+  @@unique([userId, clientId, referenceId])
+  @@index([userId, clientId])
+  @@map("mcp_grant")
+}
+
+enum AgentLevel {
+  /// Every *_get tool, metrics_query, requests_list.
+  READ
+  /// Everything an agent may do (configure, start/stop/preempt, node commands and files on
+  /// FULL-trust nodes). Never grants anything (§6.3).
+  FULL
+}
+
+/// Human-minted agent (MCP) token. Replaces McpPersonalToken (scopes + allowCliCommands +
+/// allowCliFileRead collapse into `level`).
+model AgentToken {
+  id           String     @id
+  createdAt    DateTime   @default(now())
+  userId       String
+  name         String
+  level        AgentLevel
+  lookupPrefix String     @unique
+  secretDigest String     @unique
+  grantId      String     @unique
+  lastUsedAt   DateTime?
+  revokedAt    DateTime?
+  expiresAt    DateTime?
+
+  user  User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  grant McpGrant @relation(fields: [grantId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+  @@map("agent_token")
+}
+
+/// A person's access to the owner's pool. Two permissions: "can use" (call it) and "can
+/// contribute" (add their own runtime models as members directly; replaces the 0.3 offer/accept
+/// contribution flow). Human-only.
+model Share {
+  id                       String         @id @default(cuid(2))
+  createdAt                DateTime       @default(now())
+  updatedAt                DateTime       @default(now()) @updatedAt
+  poolId                   String
+  ownerUserId              String
+  granteeUserId            String
+  canUse                   Boolean        @default(true)
+  canContribute            Boolean        @default(false)
+  /// Replaces the pool's class for this person. Null = the pool's class.
+  priorityClass            PriorityClass?
+  /// Advanced: warm-cache protection share for this person (0 = none, 1..100 %). Null = pool rule.
+  protectionPercent        Int?
+  /// Grantee-chosen own-key provider model (BYOK), allowed only while the pool declares
+  /// ownKeyEquivalentModel. Must belong to the grantee.
+  ownKeyProviderModelId    String?
+  ownKeyProtocolAdaptation Boolean        @default(false)
+
+  Pool        Pool           @relation(fields: [poolId, ownerUserId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Owner       User           @relation("ShareOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Grantee     User           @relation("ShareGrantee", fields: [granteeUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  OwnKeyModel ProviderModel? @relation(fields: [ownKeyProviderModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  SpendCap    SpendCap?
+  Contributed PoolMember[]
+  Invites     ShareInvite[]
+
+  @@unique([poolId, granteeUserId])
+  @@index([granteeUserId])
+  @@index([ownKeyProviderModelId])
+  @@map("share")
+}
+
+/// Sharing a pool, or a runtime definition, with an e-mail whose mailbox is not proved (owner
+/// decision round 3; runtimes since the proved-mailbox rule). Exactly one target is set: `poolId`
+/// or `runtimeId` (hardening `share_invite_target_shape`). The invite carries the share's
+/// settings (pool invites only; a runtime share has none); when the person accepts it (the
+/// link, or a proved e-mail match) the share is created for them and the invite is marked
+/// accepted. The link lets that person sign up even when open sign-up is off. E-mailed when SMTP
+/// is configured; otherwise the owner copies the link (shown once).
+model ShareInvite {
+  id                 String         @id @default(cuid(2))
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @default(now()) @updatedAt
+  /// A pool invite's pool (null for a runtime invite).
+  poolId             String?
+  /// A runtime invite's runtime definition (null for a pool invite).
+  runtimeId          String?
+  ownerUserId        String
+  /// Lower-cased, trimmed.
+  email              String
+  /// sha256 of the invite token (`wsmp_inv_` + 26 base32 characters); the token is shown once.
+  /// Resending rotates it (and `expiresAt`) while the invite is pending.
+  tokenDigest        String         @unique
+  canUse             Boolean        @default(true)
+  canContribute      Boolean        @default(false)
+  priorityClass      PriorityClass?
+  expiresAt          DateTime
+  emailSentAt        DateTime?
+  acceptedAt         DateTime?
+  /// The pool share the acceptance created (null until then, or after it was deleted).
+  shareId            String?
+  /// The runtime share the acceptance created (null until then, or after it was deleted).
+  runtimeShareId     String?
+  revokedAt          DateTime?
+  /// An invite-link sign-up reserved the invite (user-create `before` hook, outside Better Auth's
+  /// sign-up transaction). Another e-mail's sign-up with the same token is refused while the
+  /// claim is fresh (10 minutes), and after that too if an account with `signupClaimedEmail`
+  /// exists (it keeps the invite and can accept it signed in). Resend clears the claim.
+  signupClaimedAt    DateTime?
+  /// The e-mail (lower-cased, trimmed) of the sign-up that holds the claim; the same e-mail may
+  /// take the claim over at any time (e-mails are unique, so it is the same person).
+  signupClaimedEmail String?
+
+  Pool         Pool?         @relation(fields: [poolId, ownerUserId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Runtime      Runtime?      @relation(fields: [runtimeId, ownerUserId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Owner        User          @relation(fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Share        Share?        @relation(fields: [shareId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  RuntimeShare RuntimeShare? @relation(fields: [runtimeShareId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  /// One PENDING invite per target and e-mail (partial unique indexes in schema-hardening.sql);
+  /// accepted and revoked ones stay as history, so the same e-mail can be invited again.
+  @@index([poolId, email])
+  @@index([runtimeId, email])
+  @@index([shareId])
+  @@index([runtimeShareId])
+  @@index([email])
+  @@index([ownerUserId])
+  @@index([expiresAt])
+  @@map("share_invite")
+}

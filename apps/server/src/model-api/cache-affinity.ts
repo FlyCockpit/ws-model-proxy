@@ -21,7 +21,7 @@ import {
   fences,
   serverTimeoutSqlState,
 } from "@ws-model-proxy/db/capacity-lock-order";
-import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
+import { hmacDigestForPurpose } from "@ws-model-proxy/db/node-security";
 import {
   budgetedStableJson,
   CanonicalSizeError,
@@ -173,7 +173,7 @@ export function buildAffinityTargetIdentity(parts: {
   mode: string;
   adapterVersion: string;
 }) {
-  return hmacDigestForForwarderPurpose({
+  return hmacDigestForPurpose({
     purpose: "cacheAffinity",
     value: stableJson({ version: 2, ...parts }),
   });
@@ -282,7 +282,7 @@ export const AFFINITY_EXPIRY_BATCH = 8;
 const AFFINITY_RETENTION_BATCH = 200;
 
 function hmacValue(value: string) {
-  return hmacDigestForForwarderPurpose({ purpose: "cacheAffinity", value });
+  return hmacDigestForPurpose({ purpose: "cacheAffinity", value });
 }
 
 function cumulativePrefixDigests(
@@ -998,24 +998,23 @@ export function affinityResidencySql(
 ): Prisma.Sql {
   return Prisma.sql`
     WITH selected_targets AS MATERIALIZED (
-      SELECT id, "userId", "inferenceCapacityId" FROM execution_target
-      WHERE "inferenceCapacityId" IN (${Prisma.join([...capacityIds])})
+      SELECT id, "userId", "instanceId" FROM execution_target
+      WHERE "instanceId" IN (${Prisma.join([...capacityIds])})
         AND ("userId" = ${ownerUserId} OR EXISTS (
+          -- A contributed member: the share's grantee serves this model on this instance.
           SELECT 1 FROM pool_member m
-          JOIN inference_contribution c ON c.id = m."inferenceContributionId"
-          JOIN execution_target allowed ON allowed.id = m."executionTargetId"
-          WHERE allowed."inferenceCapacityId" = execution_target."inferenceCapacityId"
-            AND c."poolOwnerUserId" = ${ownerUserId}
+          JOIN share s ON s.id = m."shareId"
+          WHERE m."runtimeModelId" = execution_target."runtimeModelId"
+            AND s."ownerUserId" = ${ownerUserId}
             ${poolId === undefined ? Prisma.empty : Prisma.sql`AND m."poolId" = ${poolId}`}
-            AND c."poolId" = m."poolId" AND c."discoveredModelId" = allowed."discoveredModelId"
-            AND m."discoveredModelId" = allowed."discoveredModelId"
-            AND c."contributorUserId" = allowed."userId"
-            AND c.state = 'ACTIVE' AND c."expiresAt" > ${now}
+            AND s."poolId" = m."poolId" AND s."canContribute"
+            AND s."granteeUserId" = execution_target."userId"
+            AND m.state = 'ACTIVE'
           LIMIT 1 OFFSET 0
         ))
       LIMIT 9
     ), buckets AS MATERIALIZED (
-      SELECT t."inferenceCapacityId" AS "capacityId", COALESCE(b.entries, '[]'::jsonb) AS entries,
+      SELECT t."instanceId" AS "capacityId", COALESCE(b.entries, '[]'::jsonb) AS entries,
         -- cache_affinity_residency_bound guarantees every entry carries poolId.
         COALESCE(b.complete AND b."cacheGeneration" = wsmp_affinity_generation(t.id)
           AND ${affinityGenerationReadySql(Prisma.sql`t.id`)}, false) AS complete
@@ -1028,7 +1027,7 @@ export function affinityResidencySql(
         ${
           includeStatus
             ? Prisma.sql`AND NOT EXISTS (SELECT 1 FROM unnest(${[...capacityIds]}::text[]) requested(capacity_id)
-          WHERE NOT EXISTS (SELECT 1 FROM selected_targets t WHERE t."inferenceCapacityId" = requested.capacity_id))`
+          WHERE NOT EXISTS (SELECT 1 FROM selected_targets t WHERE t."instanceId" = requested.capacity_id))`
             : Prisma.empty
         }
         AS complete
@@ -1678,24 +1677,6 @@ export async function rankAffinityTargets({
   };
 }
 
-/** Cheap placement remainder after admission. Must not run inside the hot fence. */
-export async function markPoolMemberLastRoutedAt(
-  poolMemberId: string | null | undefined,
-  at = new Date(),
-  db: {
-    poolMember: {
-      update: (args: { where: { id: string }; data: { lastRoutedAt: Date } }) => Promise<unknown>;
-    };
-  } = prisma,
-): Promise<void> {
-  if (!poolMemberId) return;
-  try {
-    await db.poolMember.update({ where: { id: poolMemberId }, data: { lastRoutedAt: at } });
-  } catch {
-    // A missed stamp must not fail a granted request.
-  }
-}
-
 export function isAffinityTargetWarm(
   decision: Pick<AffinityDecision, "prefixDepths" | "conversationMatches">,
   executionTargetId: string,
@@ -1819,7 +1800,7 @@ export async function rememberAffinity({
       // pool is read without a lock and its records carry plain ids, so a pool
       // deleted meanwhile leaves records the expiry sweep removes.
       await acquireFences(tx, [fences.cacheAffinity(resourceOwnerId, poolId)]);
-      const pool = await tx.modelPool.findFirst({
+      const pool = await tx.pool.findFirst({
         where: { id: poolId, userId: resourceOwnerId },
         select: { id: true },
       });

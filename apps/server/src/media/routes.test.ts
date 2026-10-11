@@ -400,6 +400,47 @@ describe("GET /media/:id (signed fetch)", () => {
     expect(buf.equals(PNG)).toBe(true);
   });
 
+  it("answers HEAD with the headers and closes the object's file", async () => {
+    const prisma = fakePrisma();
+    await seedFile("asset-head");
+    prisma.mediaAsset.findUnique.mockResolvedValue({
+      mime: "image/png",
+      expiresAt: new Date(NOW + 60_000),
+    });
+    const opened: Readable[] = [];
+    const original = LocalMediaStore.prototype.getStream;
+    const spy = vi.spyOn(LocalMediaStore.prototype, "getStream").mockImplementation(async function (
+      this: InstanceType<typeof LocalMediaStore>,
+      id,
+    ) {
+      const object = await original.call(this, id);
+      if (object) opened.push(object.stream);
+      return object;
+    });
+    try {
+      const app = new Hono();
+      app.get(
+        "/media/:id",
+        createMediaGetHandler({ getConfig: () => config, prisma: prisma as never, now: () => NOW }),
+      );
+      const signed = buildSignedMediaUrl({
+        id: "asset-head",
+        publicBaseUrl: config.publicBaseUrl,
+        now: NOW,
+      });
+      const res = await app.request(new URL(signed.url).pathname + new URL(signed.url).search, {
+        method: "HEAD",
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("Content-Length")).toBe(String(PNG.length));
+      expect(await res.text()).toBe("");
+      expect(opened).toHaveLength(1);
+      expect(opened[0]!.destroyed).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("404s when media is not configured", async () => {
     const prisma = fakePrisma();
     const app = new Hono();

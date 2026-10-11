@@ -1,147 +1,101 @@
-import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+// The node_metrics_minute upsert on real PostgreSQL: two flushes into one node-minute merge
+// the gauges, the free accelerator minimum and the custom aggregates per name (the 256-name cap
+// keeps the names stored first). Rows are removed afterwards, scoped to this run's owner.
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
-  throw new Error("SCHEMA_VALIDATION_DATABASE_URL is required");
+  throw new Error("SCHEMA_VALIDATION_DATABASE_URL is required for PostgreSQL integration tests");
 const integration = databaseUrl ? describe : describe.skip;
 
-integration("node metrics failure settlement with real PostgreSQL", () => {
-  let db: ReturnType<typeof createFixturePrismaClient>;
-  let metrics: typeof import("./node-metrics-rollup.js");
-  const ownerId = `metrics-write-${crypto.randomUUID()}`;
-  const now = new Date("2026-10-03T12:00:20Z");
+type Modules = {
+  rollup: typeof import("./node-metrics-rollup.js");
+  prisma: typeof import("@ws-model-proxy/db")["default"];
+};
+
+integration("node metrics rollup upsert (PostgreSQL)", () => {
+  let m: Modules;
+  const ownerUserId = `nm-${randomUUID().slice(0, 8)}`;
+  const at = new Date("2026-10-01T10:00:05.000Z");
+
   beforeAll(async () => {
     process.env.DATABASE_URL = databaseUrl;
-    process.env.NODE_ENV = "test";
-    db = createFixturePrismaClient(databaseUrl!);
-    metrics = await import("./node-metrics-rollup.js");
-  }, 120_000);
-  afterAll(async () => {
-    if (!db) return;
-    await db.nodeMetricsMinute.deleteMany({ where: { ownerUserId: ownerId } });
-    await db.$disconnect();
-    const { default: production } = await import("@ws-model-proxy/db");
-    await production.$disconnect();
-  });
-  const sample = (cliDeviceId: string) => ({
-    ownerUserId: ownerId,
-    cliDeviceId,
-    receivedAt: now,
-    cpuPercent: 20,
-    memoryAvailableMiB: 1000,
-    memoryTotalMiB: 2000,
-  });
-
-  it("routes a real int4 rejection, writes only successful siblings once, and restores normal writes", async () => {
-    const good = metrics.mergeNodeMetricsIncrements(undefined, sample("a-good"));
-    const bad = {
-      ...metrics.mergeNodeMetricsIncrements(undefined, sample("b-bad")),
-      samples: 2147483648,
+    m = {
+      rollup: await import("./node-metrics-rollup.js"),
+      prisma: (await import("@ws-model-proxy/db")).default,
     };
-    await expect(metrics.writeNodeMetricsIncrements([bad, good], db)).rejects.toMatchObject({
-      written: 1,
-      failed: 1,
+  });
+
+  afterAll(async () => {
+    await m?.prisma.nodeMetricsMinute.deleteMany({ where: { ownerUserId } });
+  });
+
+  it("merges free accelerator memory and custom aggregates across flushes", async () => {
+    const { mergeNodeMetricsIncrements, writeNodeMetricsIncrements } = m.rollup;
+    const sample = {
+      ownerUserId,
+      nodeId: "node-1",
+      receivedAt: at,
+      cpuPercent: 10,
+    };
+    const first = mergeNodeMetricsIncrements(undefined, {
+      ...sample,
+      acceleratorFreeMiB: 8_000,
+      custom: [
+        { name: "gpu_power", value: 100 },
+        { name: "gpu_power", value: 200 },
+        ...Array.from({ length: 255 }, (_, index) => ({ name: `a${index}`, value: index })),
+      ],
     });
-    expect(await db.nodeMetricsMinute.findMany({ where: { ownerUserId: ownerId } })).toEqual([
-      expect.objectContaining({ cliDeviceId: "a-good", samples: 1, sumCpuPercent: 20 }),
+    expect(await writeNodeMetricsIncrements([first], m.prisma)).toBe(1);
+    const second = mergeNodeMetricsIncrements(undefined, {
+      ...sample,
+      receivedAt: new Date(at.getTime() + 20_000),
+      cpuPercent: 30,
+      acceleratorFreeMiB: 3_000,
+      custom: [
+        { name: "gpu_power", value: 50 },
+        { name: "zz_new", value: 1 },
+      ],
+    });
+    expect(await writeNodeMetricsIncrements([second], m.prisma)).toBe(1);
+
+    const row = await m.prisma.nodeMetricsMinute.findFirstOrThrow({
+      where: { ownerUserId, nodeId: "node-1" },
+    });
+    expect(row.samples).toBe(2);
+    expect(row.sumCpuPercent).toBe(40);
+    expect(row.minAcceleratorFreeMiB).toBe(3_000);
+    const custom = row.custom as Record<
+      string,
+      { min: number; sum: number; max: number; samples: number }
+    >;
+    expect(custom.gpu_power).toEqual({ min: 50, sum: 350, max: 200, samples: 3 });
+    // 256 names stored by the first flush: the new name does not displace them.
+    expect(Object.keys(custom)).toHaveLength(256);
+    expect(custom.zz_new).toBeUndefined();
+  });
+
+  it("stores a row with no custom values as an empty object", async () => {
+    const { mergeNodeMetricsIncrements, writeNodeMetricsIncrements } = m.rollup;
+    const increment = mergeNodeMetricsIncrements(undefined, {
+      ownerUserId,
+      nodeId: "node-2",
+      receivedAt: at,
+      cpuPercent: 5,
+    });
+    await writeNodeMetricsIncrements([increment, { ...increment, nodeId: "node-3" }], m.prisma);
+    await writeNodeMetricsIncrements([increment], m.prisma);
+    const rows = await m.prisma.nodeMetricsMinute.findMany({
+      where: { ownerUserId, nodeId: { in: ["node-2", "node-3"] } },
+      orderBy: { nodeId: "asc" },
+    });
+    expect(rows.map((row) => [row.nodeId, row.samples, row.custom])).toEqual([
+      ["node-2", 2, {}],
+      ["node-3", 1, {}],
     ]);
-    // Recovery writes new increments only. Replaying a partially committed
-    // batch would double a-good: this is deliberately not a retry contract.
-    await expect(
-      metrics.writeNodeMetricsIncrements(
-        [metrics.mergeNodeMetricsIncrements(undefined, sample("b-bad"))],
-        db,
-      ),
-    ).resolves.toBe(1);
-    expect(
-      (
-        await db.nodeMetricsMinute.findMany({
-          where: { ownerUserId: ownerId },
-          orderBy: { cliDeviceId: "asc" },
-        })
-      ).map((r) => r.samples),
-    ).toEqual([1, 1]);
-  });
-
-  it("never duplicates real additive rows after the commit acknowledgement is lost", async () => {
-    let calls = 0;
-    await expect(
-      metrics.writeNodeMetricsIncrements(
-        [metrics.mergeNodeMetricsIncrements(undefined, sample("ack-lost"))],
-        {
-          $executeRaw: async (query) => {
-            calls++;
-            await db.$executeRaw(query);
-            throw new Error("injected connection acknowledgement loss");
-          },
-        },
-      ),
-    ).rejects.toMatchObject({ written: 0, failed: 1, uncertain: 1 });
-    expect(calls).toBe(1);
-    expect(
-      await db.nodeMetricsMinute.findFirst({
-        where: { ownerUserId: ownerId, cliDeviceId: "ack-lost" },
-      }),
-    ).toMatchObject({ samples: 1 });
-  });
-
-  it("logs only operational failure counts, recovers, and shutdown joins the actual write", async () => {
-    const log = vi.fn();
-    let failing = true;
-    let release: (() => void) | undefined;
-    const writer = metrics.createNodeMetricsRollupWriter({
-      clock: () => now.getTime(),
-      log,
-      write: async (increments) => {
-        if (failing)
-          return metrics.writeNodeMetricsIncrements(
-            increments.map((i) => ({ ...i, samples: 2147483648 })),
-            db,
-          );
-        await new Promise<void>((resolve) => {
-          release = resolve;
-        });
-        return metrics.writeNodeMetricsIncrements(increments, db);
-      },
-    });
-    try {
-      writer.observe(sample("writer"));
-      await writer.flushNow();
-      expect(log).toHaveBeenCalledWith({ written: 0, failed: 1 });
-      expect(
-        await db.nodeMetricsMinute.count({
-          where: { ownerUserId: ownerId, cliDeviceId: "writer" },
-        }),
-      ).toBe(0);
-      failing = false;
-      writer.observe(sample("writer"));
-      const flushing = writer.flushNow();
-      await Promise.resolve();
-      let stopped = false;
-      const stop = writer.stop().then(() => {
-        stopped = true;
-      });
-      await Promise.resolve();
-      expect(stopped).toBe(false);
-      release?.();
-      await flushing;
-      await stop;
-      expect(stopped).toBe(true);
-      expect(
-        await db.nodeMetricsMinute.findFirst({
-          where: { ownerUserId: ownerId, cliDeviceId: "writer" },
-        }),
-      ).toMatchObject({ samples: 1 });
-      writer.observe(sample("writer-late"));
-      await writer.flushNow();
-      expect(
-        await db.nodeMetricsMinute.count({
-          where: { ownerUserId: ownerId, cliDeviceId: "writer-late" },
-        }),
-      ).toBe(0);
-    } finally {
-      await writer.stop();
-    }
+    expect(rows[0]?.minAcceleratorFreeMiB).toBeNull();
   });
 });

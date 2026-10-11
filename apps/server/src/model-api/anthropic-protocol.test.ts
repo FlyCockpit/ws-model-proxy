@@ -104,11 +104,14 @@ describe("Anthropic protocol boundary", () => {
         "anthropic-version": "2023-06-01",
       },
     });
-    expect(parseAnthropicIngress(request.headers)).toBeInstanceOf(Response);
+    // x-api-key is an accepted way to send the WSMP key; it never reaches the engine.
+    expect(parseAnthropicIngress(request.headers)).not.toBeInstanceOf(Response);
     const clean = new Request(request.url, {
       headers: {
         authorization: "Bearer wsmp-secret",
         cookie: "private",
+        "x-api-key": "wsmp-secret",
+        "api-key": "wsmp-secret",
         "anthropic-version": "2023-06-01",
         "anthropic-beta": "one, two",
       },
@@ -118,6 +121,7 @@ describe("Anthropic protocol boundary", () => {
     const relayed = anthropicRelayHeaders(clean, ingress);
     expect(relayed.get("authorization")).toBeNull();
     expect(relayed.get("x-api-key")).toBeNull();
+    expect(relayed.get("api-key")).toBeNull();
     expect(relayed.get("cookie")).toBeNull();
     expect(relayed.get("anthropic-beta")).toBe("one,two");
   });

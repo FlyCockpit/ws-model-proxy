@@ -26,14 +26,7 @@ export function anthropicErrorResponse(
 }
 
 export function parseAnthropicIngress(headers: Headers): AnthropicIngress | Response {
-  // x-api-key is an upstream credential header, never an alternate WSMP client
-  // authentication mechanism.
-  if (headers.has("x-api-key")) {
-    return anthropicErrorResponse(
-      400,
-      "x-api-key is not accepted for WSMP authentication; use Authorization: Bearer.",
-    );
-  }
+  // x-api-key carries the caller's WSMP key (client-credential.ts); it never reaches an engine.
   const rawVersion = headers.get("anthropic-version")?.trim();
   if (!rawVersion) return anthropicErrorResponse(400, "anthropic-version header is required.");
   if (!(SUPPORTED_ANTHROPIC_VERSIONS as readonly string[]).includes(rawVersion)) {

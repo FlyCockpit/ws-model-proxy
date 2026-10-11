@@ -26,6 +26,7 @@ const ALWAYS_DENIED = new Set([
   "transfer-encoding",
   "upgrade",
   "x-api-key",
+  "api-key",
 ]);
 
 function connectionNominatedHeaders(headers: Headers): Set<string> {

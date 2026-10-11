@@ -9,13 +9,25 @@ import {
 } from "./scheduler.js";
 import { assertPriority } from "./types.js";
 
-const emptyState = () => ({ cursor: 0, deficits: Array(PRIORITY_CLASS_COUNT).fill(0), version: 1 });
+const emptyState = () => ({
+  cursor: 0,
+  deficits: Array(PRIORITY_CLASS_COUNT).fill(0),
+  version: SCHEDULER_VERSION,
+});
 
 describe("durable capacity scheduler", () => {
-  it("validates the fixed priority range and positive quanta", () => {
+  it("validates the three priority classes and positive quanta", () => {
+    expect(PRIORITY_CLASS_COUNT).toBe(3);
+    expect(defaultPriorityQuanta()).toEqual([1, 4, 16]);
     expect(assertPriority(0)).toBe(0);
-    expect(assertPriority(31)).toBe(31);
-    expect(() => assertPriority(32)).toThrow(RangeError);
+    expect(assertPriority(2)).toBe(2);
+    expect(() => assertPriority(3)).toThrow(RangeError);
+    expect(() =>
+      scheduleWeightedDeficitRoundRobin({
+        candidates: [],
+        state: { ...emptyState(), deficits: Array(32).fill(0) },
+      }),
+    ).toThrow("3 priority classes");
     expect(() =>
       scheduleWeightedDeficitRoundRobin({
         candidates: [],
@@ -103,22 +115,24 @@ describe("durable capacity scheduler", () => {
 
   it("resets empty-class credit and advances a durable cursor", () => {
     const state = emptyState();
-    state.deficits[5] = 99;
+    state.deficits[0] = 99;
     const result = scheduleWeightedDeficitRoundRobin({
       state,
       candidates: [
         {
-          admissionRequestId: "p7",
-          waiterId: "p7",
+          admissionRequestId: "high",
+          waiterId: "high",
           candidateOrder: 0,
-          priority: 7,
+          priority: 2,
           enqueueSequence: 1n,
           eligible: true,
         },
       ],
     });
-    expect(result.state.deficits[5]).toBe(0);
-    expect(result.state.cursor).toBe(7);
+    expect(result.state.deficits[0]).toBe(0);
+    // HIGH keeps the cursor while it has quantum left (16 - 1).
+    expect(result.state.cursor).toBe(2);
+    expect(result.state.deficits[2]).toBe(15);
   });
 
   it("gives every continuously eligible class service across repeated releases", () => {
@@ -140,7 +154,7 @@ describe("durable capacity scheduler", () => {
             admissionRequestId: `high-${round}`,
             waiterId: `high-${round}`,
             candidateOrder: 0,
-            priority: 31,
+            priority: 2,
             enqueueSequence: 0n,
             eligible: true,
           },
@@ -150,8 +164,29 @@ describe("durable capacity scheduler", () => {
       if (result.winner) winners.push(result.winner.priority);
     }
     expect(winners).toContain(0);
-    expect(winners).toContain(31);
+    expect(winners).toContain(2);
     expect(defaultPriorityQuanta().every((quantum) => quantum > 0)).toBe(true);
+  });
+
+  it("splits freed slots 1 : 4 : 16 when all three classes keep waiting", () => {
+    let state: SchedulerState = emptyState();
+    const served = [0, 0, 0];
+    for (let round = 0; round < 21 * 10; round++) {
+      const result = scheduleWeightedDeficitRoundRobin({
+        state,
+        candidates: [0, 1, 2].map((priority) => ({
+          admissionRequestId: `${priority}-${round}`,
+          waiterId: `${priority}-${round}`,
+          candidateOrder: 0,
+          priority,
+          enqueueSequence: BigInt(round),
+          eligible: true,
+        })),
+      });
+      state = result.state;
+      if (result.winner) served[result.winner.priority]! += 1;
+    }
+    expect(served).toEqual([10, 40, 160]);
   });
 
   it("enforces physical, member, and reserved borrowing constraints without preemption", () => {
@@ -162,7 +197,7 @@ describe("durable capacity scheduler", () => {
         memberLimit: 3,
         memberActive: 1,
         reservedSlots: 0,
-        higherPriorityWaiting: false,
+        reservationOwnerWaiting: false,
         borrowing: false,
       }),
     ).toBe(false);
@@ -173,7 +208,7 @@ describe("durable capacity scheduler", () => {
         memberLimit: 2,
         memberActive: 2,
         reservedSlots: 0,
-        higherPriorityWaiting: false,
+        reservationOwnerWaiting: false,
         borrowing: false,
       }),
     ).toBe(false);
@@ -183,7 +218,7 @@ describe("durable capacity scheduler", () => {
         physicalActive: 2,
         memberActive: 0,
         reservedSlots: 2,
-        higherPriorityWaiting: true,
+        reservationOwnerWaiting: true,
         borrowing: true,
       }),
     ).toBe(false);

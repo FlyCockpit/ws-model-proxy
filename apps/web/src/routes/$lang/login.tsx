@@ -1,6 +1,7 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
 import { SignInCard } from "@/components/auth/sign-in-card";
 import { decideAnonymousOnlyRouteAccess } from "@/lib/route-session-access";
+import { stripInviteFromAddressBar } from "@/lib/signup-search";
 import { getRouteSession } from "@/server/auth-session";
 import { safeRedirectTo } from "@/utils/safe-redirect";
 
@@ -18,6 +19,14 @@ export const Route = createFileRoute("/$lang/login")({
   component: LoginPage,
 });
 
+/**
+ * "Sign in" on an invite link arrives with `redirectTo=/{lang}/signup?invite=<token>`: the page
+ * keeps it (router state) and takes it out of the address bar and history entry on mount.
+ */
+function stripInviteRef(element: HTMLDivElement | null): void {
+  if (element) stripInviteFromAddressBar();
+}
+
 function LoginPage() {
   const { lang } = Route.useParams();
   const { redirectTo } = Route.useSearch();
@@ -26,5 +35,9 @@ function LoginPage() {
   // the shared SignInCard — the same component the MCP login route
   // (/$lang/mcp-login) renders in "mcp" mode. This route passes mode
   // "standard", which preserves the pre-Phase-6 behavior byte-for-byte.
-  return <SignInCard lang={lang} mode="standard" redirectTo={redirectTo} />;
+  return (
+    <div ref={stripInviteRef} className="contents">
+      <SignInCard lang={lang} mode="standard" redirectTo={redirectTo} />
+    </div>
+  );
 }

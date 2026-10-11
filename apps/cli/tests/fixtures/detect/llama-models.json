@@ -1,0 +1,41 @@
+{
+  "models": [
+    {
+      "name": "gpt-oss-120b-mxfp4.gguf",
+      "model": "gpt-oss-120b-mxfp4.gguf",
+      "modified_at": "",
+      "size": "",
+      "digest": "",
+      "type": "model",
+      "description": "",
+      "tags": [""],
+      "capabilities": ["completion"],
+      "parameters": "",
+      "details": {
+        "parent_model": "",
+        "format": "gguf",
+        "family": "",
+        "families": [""],
+        "parameter_size": "",
+        "quantization_level": ""
+      }
+    }
+  ],
+  "object": "list",
+  "data": [
+    {
+      "id": "gpt-oss-120b-mxfp4.gguf",
+      "object": "model",
+      "created": 1759752000,
+      "owned_by": "llamacpp",
+      "meta": {
+        "vocab_type": 2,
+        "n_vocab": 201088,
+        "n_ctx_train": 131072,
+        "n_embd": 2880,
+        "n_params": 116829156672,
+        "size": 63387346944
+      }
+    }
+  ]
+}

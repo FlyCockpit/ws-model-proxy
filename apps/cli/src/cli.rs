@@ -47,38 +47,34 @@ pub enum LogFormat {
 /// The subcommands. Add new ones here, then implement them in `src/commands/`.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Start device-code login and store the approved device credential.
+    /// Enroll this machine as a node with a code from the Nodes page.
     Login(crate::commands::login::Args),
 
-    /// Configure a manually created CLI token env var.
-    Token(crate::commands::token::Args),
+    /// Show or set what the server may do on this machine.
+    Trust(crate::commands::trust::Args),
+
+    /// Set, list or remove node secrets (`WSMP_SECRET_*`).
+    Secret(crate::commands::secret::Args),
 
     /// Inspect the configuration file and resolved paths.
     Config(crate::commands::config::Args),
 
-    /// Manage local OpenAI-compatible endpoints.
-    Endpoints(crate::commands::endpoints::Args),
+    /// Run the relay in the foreground (what the service runs).
+    Run(crate::commands::run::Args),
 
-    /// Run the foreground websocket relay daemon.
-    Connect(crate::commands::connect::Args),
-
-    /// Manage a local background relay daemon.
-    Daemon(crate::commands::daemon::Args),
+    /// List the runtimes and instances this node holds, or test one.
+    Runtime(crate::commands::runtime::Args),
 
     /// Install or inspect a per-user operating-system service for the relay.
     Service(crate::commands::service::Args),
 
-    /// Publish the current endpoint inventory through the running relay daemon.
-    Reload(crate::commands::reload::Args),
+    /// Show whether the relay is running and connected.
+    Status(crate::commands::status::Args),
 
-    /// Show live relay, local endpoint, and acknowledged inventory status.
-    Status {
-        /// Emit a stable JSON status object.
-        #[arg(long)]
-        json: bool,
-    },
+    /// Show the hardware this node detects (memory, GPUs, unified pool).
+    Hardware(crate::commands::hardware::Args),
 
-    /// Remove stored local authentication state.
+    /// Forget this node's credential.
     Logout(crate::commands::logout::Args),
 
     /// Generate shell completion scripts.
@@ -86,9 +82,6 @@ pub enum Command {
 
     /// Approve browser identities and show the CLI identity for terminals.
     Terminal(crate::commands::terminal::Args),
-
-    /// List, test and approve custom metric sources.
-    Metrics(crate::commands::metrics::Args),
 
     /// List or apply crash-safe file recovery from abandoned `.wsmp-recover-*` directories.
     Recover(crate::commands::recover::Args),

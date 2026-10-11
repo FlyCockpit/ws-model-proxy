@@ -6,7 +6,10 @@ use super::*;
 use crate::config::{ModelConfig, OpenAiCompatibleCapabilities};
 
 mod vllm;
-use crate::deployments::{RealtimeTranscriptionProfile, TranscriptionProfile};
+use crate::protocol::runtime_spec::{
+    RealtimeAdapter as SpecAdapter, RealtimeProfile as RealtimeTranscriptionProfile,
+    TranscriptionProfile,
+};
 
 const SESSION: &str = "AAECAwQFBgcICQoLDA0ODw";
 const MODEL: &str = "fixture/whisper";
@@ -171,7 +174,7 @@ fn segmented(
     max_sessions: Option<u32>,
 ) -> Option<RealtimeTranscriptionProfile> {
     Some(RealtimeTranscriptionProfile {
-        adapter: RealtimeAdapter::Segmented,
+        adapter: SpecAdapter::Segmented,
         max_item_seconds,
         max_sessions,
     })
@@ -180,7 +183,7 @@ fn segmented(
 fn open(session_id: &str, slug: &str) -> SttServerMessage {
     SttServerMessage::Open {
         session_id: session_id.to_string(),
-        endpoint_slug: slug.to_string(),
+        handle: slug.to_string(),
         upstream_model: MODEL.to_string(),
         adapter: RealtimeAdapter::Segmented,
         config: SttConfig {
@@ -207,8 +210,8 @@ fn registry() -> (SttRegistry, Receiver<FromWorker>) {
 fn pump(
     registry: &mut SttRegistry,
     rx: &Receiver<FromWorker>,
-    done: impl Fn(&[ClientControlMessage]) -> bool,
-) -> Vec<ClientControlMessage> {
+    done: impl Fn(&[NodeFrame]) -> bool,
+) -> Vec<NodeFrame> {
     let mut sent = Vec::new();
     let until = Instant::now() + WAIT;
     while !done(&sent) && Instant::now() < until {
@@ -224,21 +227,21 @@ fn pump(
     sent
 }
 
-fn events(sent: &[ClientControlMessage]) -> Vec<&SttEvent> {
+fn events(sent: &[NodeFrame]) -> Vec<&SttEvent> {
     sent.iter()
         .filter_map(|message| match message {
-            ClientControlMessage::SttEvent { event, .. } => Some(event),
+            NodeFrame::SttEvent { event, .. } => Some(event),
             _ => None,
         })
         .collect()
 }
 
-fn has_event(predicate: impl Fn(&SttEvent) -> bool) -> impl Fn(&[ClientControlMessage]) -> bool {
+fn has_event(predicate: impl Fn(&SttEvent) -> bool) -> impl Fn(&[NodeFrame]) -> bool {
     move |sent| events(sent).into_iter().any(&predicate)
 }
 
-fn is_error(message: &ClientControlMessage, expected: RelayFailure) -> bool {
-    matches!(message, ClientControlMessage::SttError { failure, .. } if *failure == expected)
+fn is_error(message: &NodeFrame, expected: RelayFailure) -> bool {
+    matches!(message, NodeFrame::SttError { failure, .. } if *failure == expected)
 }
 
 /// `seconds` of a 24 kHz sine as s16le frames of 100 ms (4 800 bytes).
@@ -260,7 +263,7 @@ fn stream_audio(
     id: &str,
     first_seq: u64,
     frames: Vec<Vec<u8>>,
-) -> Vec<ClientControlMessage> {
+) -> Vec<NodeFrame> {
     let mut sent = Vec::new();
     for (offset, frame) in frames.into_iter().enumerate() {
         // Like the server: send only within the credit returned so far.
@@ -321,7 +324,7 @@ fn opens_only_on_a_recipe_endpoint_that_advertises_the_requested_adapter() {
         "inst-a",
         "http://127.0.0.1:9",
         Some(RealtimeTranscriptionProfile {
-            adapter: RealtimeAdapter::Vllm,
+            adapter: SpecAdapter::Vllm,
             max_item_seconds: None,
             max_sessions: None,
         }),
@@ -411,7 +414,7 @@ fn transcribes_committed_turns_through_the_file_endpoint_in_order() {
             .is_empty()
     );
     let opened = pump(&mut registry, &rx, |sent| !sent.is_empty());
-    assert!(matches!(opened[0], ClientControlMessage::SttOpened { .. }));
+    assert!(matches!(opened[0], NodeFrame::SttOpened { .. }));
 
     let mut sent = stream_audio(&mut registry, &rx, SESSION, 0, speech(1));
     let commit = |registry: &mut SttRegistry, seq| {
@@ -454,7 +457,7 @@ fn transcribes_committed_turns_through_the_file_endpoint_in_order() {
     let acked: u64 = sent
         .iter()
         .filter_map(|message| match message {
-            ClientControlMessage::SttAudioAck { bytes, .. } => Some(u64::from(*bytes)),
+            NodeFrame::SttAudioAck { bytes, .. } => Some(u64::from(*bytes)),
             _ => None,
         })
         .sum();
@@ -608,7 +611,7 @@ fn a_bad_sequence_or_credit_or_commit_fails_only_that_session() {
     });
     assert!(sent.iter().any(|message| matches!(
         message,
-        ClientControlMessage::SttError { session_id, .. } if *session_id == c
+        NodeFrame::SttError { session_id, .. } if *session_id == c
     )));
     assert!(registry.is_empty());
     // A malformed frame for a live session fails it; for an unknown one, nothing.
@@ -661,10 +664,7 @@ fn close_and_abort_end_sessions_and_cancel_the_engine_request() {
         &[],
         Instant::now(),
     );
-    assert!(matches!(
-        closed[..],
-        [ClientControlMessage::SttClosed { .. }]
-    ));
+    assert!(matches!(closed[..], [NodeFrame::SttClosed { .. }]));
     // The engine sees its connection close well before its reply was due.
     let until = Instant::now() + Duration::from_secs(5);
     while !engine.hung_up() && Instant::now() < until {
@@ -676,7 +676,7 @@ fn close_and_abort_end_sessions_and_cancel_the_engine_request() {
         registry
             .outbound(
                 SESSION,
-                ClientControlMessage::SttOpened {
+                NodeFrame::SttOpened {
                     session_id: SESSION.into(),
                 },
             )
@@ -725,7 +725,7 @@ fn poll_ends_sessions_past_their_deadline_or_whose_deployment_stopped() {
     let stopped = registry.poll(now + Duration::from_secs(2), || managed[..1].to_vec());
     assert!(matches!(
         &stopped[..],
-        [ClientControlMessage::SttError { failure: RelayFailure::NotFound, message: Some(message), .. }]
+        [NodeFrame::SttError { failure: RelayFailure::NotFound, message: Some(message), .. }]
             if message == "model_unavailable"
     ));
     // 60 s + grace later the other one has outlived maxSessionMs.
@@ -744,7 +744,7 @@ fn poll_ends_sessions_past_their_deadline_or_whose_deployment_stopped() {
 fn escape_heavy_transcripts_fail_only_their_item_and_deltas_fit_a_frame() {
     let text = |text: String| segmented::Outcome::Text { text, usage: None };
     let encodes = |event: SttEvent| {
-        crate::protocol::encode_control(&ClientControlMessage::SttEvent {
+        crate::protocol::encode_control(&NodeFrame::SttEvent {
             session_id: SESSION.into(),
             event,
         })
@@ -823,7 +823,7 @@ fn turn_events_stay_within_the_wire_contract() {
         },
     );
     for event in events.into_iter().chain(too_long).chain(failed) {
-        let frame = ClientControlMessage::SttEvent {
+        let frame = NodeFrame::SttEvent {
             session_id: SESSION.into(),
             event,
         };
@@ -888,7 +888,7 @@ fn a_burst_of_small_frames_within_credit_stalls_instead_of_failing() {
             {
                 let message = registry.outbound(&session_id, *message);
                 assert!(
-                    !matches!(message, Some(ClientControlMessage::SttError { .. })),
+                    !matches!(message, Some(NodeFrame::SttError { .. })),
                     "{message:?}"
                 );
             }
@@ -1109,7 +1109,7 @@ fn a_stop_job_ends_the_endpoints_sessions_before_it_runs() {
     assert_eq!(ended.len(), 2);
     assert!(ended.iter().all(|frame| matches!(
         frame,
-        ClientControlMessage::SttError { failure: RelayFailure::NotFound, message: Some(message), .. }
+        NodeFrame::SttError { failure: RelayFailure::NotFound, message: Some(message), .. }
             if message == "model_unavailable"
     )));
     assert!(registry.is_live(&session_id(3)));

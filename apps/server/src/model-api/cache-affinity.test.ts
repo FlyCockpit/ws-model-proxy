@@ -35,7 +35,7 @@ const db = vi.hoisted(() => ({
   },
   capacityLease: { groupBy: vi.fn() },
   capacityWaiter: { groupBy: vi.fn() },
-  modelPool: { findFirst: vi.fn() },
+  pool: { findFirst: vi.fn() },
   $transaction: vi.fn(),
   $queryRaw: vi.fn(),
   $executeRaw: vi.fn(),
@@ -56,6 +56,18 @@ vi.mock("./cache-affinity-residency.js", async () => {
     ],
     captureAffinityTargetGenerations: async (targets: Array<{ cacheGeneration?: string }>) =>
       targets.map((target) => ({ ...target, cacheGeneration: target.cacheGeneration ?? "" })),
+  };
+});
+// Pass-through spy: counts token-estimation passes without changing results.
+const payloadEstimates = vi.hoisted(() => ({ calls: 0 }));
+vi.mock("./capacity/payload-estimate.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./capacity/payload-estimate.js")>();
+  return {
+    ...actual,
+    estimatePayloadTokens: (...args: Parameters<typeof actual.estimatePayloadTokens>) => {
+      payloadEstimates.calls++;
+      return actual.estimatePayloadTokens(...args);
+    },
   };
 });
 const contextEstimator = vi.hoisted(() => vi.fn());
@@ -80,7 +92,6 @@ import {
   extractClientConversationId,
   FREE_SAMPLING_PARAMS,
   instructionTokens,
-  markPoolMemberLastRoutedAt,
   prefixBytesAtDepth,
   prefixPayloadTokensAtDepth,
   prefixTokensAtDepth,
@@ -181,7 +192,7 @@ function querySql(query: { strings?: TemplateStringsArray; sql?: string } | stri
 
 function isResidencyQuery(query: { strings?: TemplateStringsArray; sql?: string } | string) {
   const sql = querySql(query);
-  return sql.includes("inferenceCapacityId") && sql.includes("cache_affinity_residency");
+  return sql.includes("instanceId") && sql.includes("cache_affinity_residency");
 }
 
 function isShareProbe(query: { strings?: TemplateStringsArray; sql?: string } | string) {
@@ -257,7 +268,7 @@ describe("cache affinity", () => {
     db.cacheAffinityNode.findFirst.mockResolvedValue(null);
     db.cacheAffinityNode.deleteMany.mockResolvedValue({ count: 0 });
     db.cacheAffinityNode.updateMany.mockResolvedValue({ count: 0 });
-    db.modelPool.findFirst.mockResolvedValue({ id: "pool" });
+    db.pool.findFirst.mockResolvedValue({ id: "pool" });
     db.cacheAffinityRecord.findMany.mockResolvedValue([]);
     db.cacheAffinityRecord.findFirst.mockResolvedValue(null);
     db.cacheAffinityRecord.deleteMany.mockResolvedValue({ count: 0 });
@@ -626,6 +637,8 @@ describe("cache affinity", () => {
       expect(overCap.nodes).toEqual([]);
       expect(overCap.parentTipDigest).toBeUndefined();
     },
+    // 100k-key objects are CPU-bound; a full workspace run shares the cores.
+    30_000,
   );
 
   it.each([true, false])(
@@ -889,7 +902,7 @@ describe("cache affinity", () => {
               bindingDigest: state === "bound" ? bindingDigest : "wrong-scope",
             }
           : undefined;
-      if (state === "deleted pool") db.modelPool.findFirst.mockResolvedValue(null);
+      if (state === "deleted pool") db.pool.findFirst.mockResolvedValue(null);
       const binding = await rememberAffinity({
         ...args,
         sessionBinding,
@@ -3209,9 +3222,9 @@ describe("cache affinity", () => {
       expect((call[0].strings ?? call[0]).join("?")).not.toMatch(/FOR (NO KEY )?UPDATE/);
     }
     expect(db.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
-      db.modelPool.findFirst.mock.invocationCallOrder[0] ?? Number.NaN,
+      db.pool.findFirst.mock.invocationCallOrder[0] ?? Number.NaN,
     );
-    expect(db.modelPool.findFirst).toHaveBeenCalledWith({
+    expect(db.pool.findFirst).toHaveBeenCalledWith({
       where: { id: "pool", userId: "resource-owner" },
       select: { id: true },
     });
@@ -3231,7 +3244,7 @@ describe("cache affinity", () => {
     db.cacheAffinityNode.findFirst.mockResolvedValue(null);
     db.cacheAffinityNode.deleteMany.mockResolvedValue({ count: 0 });
     db.cacheAffinityNode.updateMany.mockResolvedValue({ count: 0 });
-    db.modelPool.findFirst.mockResolvedValue(null);
+    db.pool.findFirst.mockResolvedValue(null);
     await rememberAffinity(rememberArgs);
     expect(db.$queryRaw).toHaveBeenCalledTimes(1);
     expect(db.cacheAffinityRecord.deleteMany).not.toHaveBeenCalled();
@@ -4340,19 +4353,6 @@ describe("cache affinity", () => {
     expect(ranked.conversationMatches["target-a"]).toBe(true);
     expect(ranked.scores["target-b"]).toBe(ranked.scores["target-c"]);
   });
-
-  it("writes lastRoutedAt outside the grant fence", async () => {
-    const at = new Date("2026-01-02T00:00:00.000Z");
-    await markPoolMemberLastRoutedAt("member-a", at, db);
-    expect(db.poolMember.update).toHaveBeenCalledWith({
-      where: { id: "member-a" },
-      data: { lastRoutedAt: at },
-    });
-    db.poolMember.update.mockRejectedValueOnce(new Error("unavailable"));
-    await expect(markPoolMemberLastRoutedAt("member-a", at, db)).resolves.toBeUndefined();
-    await markPoolMemberLastRoutedAt(undefined, at, db);
-    expect(db.poolMember.update).toHaveBeenCalledTimes(2);
-  });
 });
 
 describe("R2 adversarial identity material", () => {
@@ -4602,8 +4602,8 @@ it("R2 wire __proto__ in legacy Chat function schemas binds the root", () => {
 });
 
 it("R3 affinityPrefixDigests catches HMAC failures after successful conversion", async () => {
-  const security = await import("@ws-model-proxy/db/forwarder-security");
-  const hmac = vi.spyOn(security, "hmacDigestForForwarderPurpose").mockImplementation(() => {
+  const security = await import("@ws-model-proxy/db/node-security");
+  const hmac = vi.spyOn(security, "hmacDigestForPurpose").mockImplementation(() => {
     throw new Error("HMAC unavailable");
   });
   try {
@@ -4649,7 +4649,7 @@ it.each(numericOverflowRows)(
   },
 );
 
-it("R4 bounds wide/deep canonical work and ranks 3 targets within 2 seconds", async () => {
+it("R4 bounds wide/deep canonical work and reads the payload once for 3 targets", async () => {
   db.cacheAffinityRecord.findMany.mockResolvedValue([]);
   db.capacityLease.groupBy.mockResolvedValue([]);
   db.capacityWaiter.groupBy.mockResolvedValue([]);
@@ -4718,21 +4718,19 @@ it("R4 bounds wide/deep canonical work and ranks 3 targets within 2 seconds", as
       return "bind";
     },
   });
-  const start = performance.now();
   await rankAffinityTargets({
     ...digestArgs("runtime", wide),
     policy,
     targets: [target("a", "a"), target("b", "b"), target("c", "c")],
   });
-  const elapsed = performance.now() - start;
-  console.info(
-    `R4 canonical smoke: ${work.steps} steps; rank(4M,3) ${Math.round(elapsed)} ms; payload reads ${reads}`,
-  );
-  expect(reads).toBe(2); // validation and root capture, independent of target count
-  expect(elapsed).toBeLessThan(2000);
-}, 10_000);
+  // Validation and root capture only: the wide canonical is built once and
+  // shared, never rebuilt per target. A count, not a wall-clock budget.
+  expect(reads).toBe(2);
+  // Four CPU-bound passes over a 4M-element fixture (about 1 s each idle,
+  // over 10 s in total at gate load); the timeout only guards against a hang.
+}, 60_000);
 
-it("precomputed unit tokens rank 8 targets on a 2 MiB canonical within 2 seconds", async () => {
+it("precomputed unit tokens rank 8 targets on a 2 MiB canonical with one estimation pass", async () => {
   db.cacheAffinityRecord.findMany.mockResolvedValue([]);
   db.capacityLease.groupBy.mockResolvedValue([]);
   db.capacityWaiter.groupBy.mockResolvedValue([]);
@@ -4747,7 +4745,10 @@ it("precomputed unit tokens rank 8 targets on a 2 MiB canonical within 2 seconds
       })),
     ],
   };
+  payloadEstimates.calls = 0;
   const canonical = buildCanonicalRequest(digestArgs("runtime", payload));
+  const onePass = payloadEstimates.calls;
+  expect(onePass).toBeGreaterThan(canonical!.conversationUnits.length);
   expect(canonical).not.toBeNull();
   expect(canonicalByteLength(canonical!)).toBeGreaterThan(1_000_000);
   expect(canonical!.unitTokenPrefixSums).toHaveLength(canonical!.conversationUnits.length + 1);
@@ -4760,13 +4761,14 @@ it("precomputed unit tokens rank 8 targets on a 2 MiB canonical within 2 seconds
     const id = `t${index}`;
     return target(id, id);
   });
-  const start = performance.now();
+  payloadEstimates.calls = 0;
   await rankAffinityTargets({
     ...digestArgs("runtime", payload),
     policy,
     targets,
   });
-  expect(performance.now() - start).toBeLessThan(2000);
+  // Every target shares one set of prefix sums: one estimation pass, not 8.
+  expect(payloadEstimates.calls).toBe(onePass);
 }, 10_000);
 
 it("R4 unit-count work refusal retains the safe prefix without identifying a truncated chain", () => {
@@ -4777,21 +4779,30 @@ it("R4 unit-count work refusal retains the safe prefix without identifying a tru
       content: "x",
     })),
   };
+  payloadEstimates.calls = 0;
   const refused = affinityPrefixDigests(digestArgs("runtime", request));
+  const refusedPasses = payloadEstimates.calls;
   expect(refused.identifiable).toBe(false);
   expect(refused.nodes).toEqual([]);
   expect(refused.routingNodes).toHaveLength(64);
   expect(refused.routingNodes.at(-1)?.depth).toBe(4096);
   expect(refused.clientSessionId).toBeDefined();
+  payloadEstimates.calls = 0;
   expect(
     affinityPrefixDigests(
       digestArgs("runtime", { ...request, messages: request.messages.slice(0, 4096) }),
     ).identifiable,
   ).toBe(true);
-});
+  // The refusal is a work bound, asserted as a count: the 4097th unit is
+  // never sized, so the refused request costs exactly what the cap does.
+  expect(refusedPasses).toBe(4096);
+  expect(payloadEstimates.calls).toBe(refusedPasses);
+  // Two passes of 4096 units and HMAC chain steps (about 1 s idle, several
+  // seconds at gate load); the timeout only guards against a hang.
+}, 60_000);
 
 it("R4 ordinary request roots and nodes retain the previous v5 digest bytes", async () => {
-  const { hmacDigestForForwarderPurpose } = await import("@ws-model-proxy/db/forwarder-security");
+  const { hmacDigestForPurpose } = await import("@ws-model-proxy/db/node-security");
   const previous = (value: JsonValue): string => {
     if (value === null || typeof value !== "object") return JSON.stringify(value);
     if (Array.isArray(value)) return `[${value.map(previous).join(",")}]`;
@@ -4800,8 +4811,7 @@ it("R4 ordinary request roots and nodes retain the previous v5 digest bytes", as
       .map((key) => `${JSON.stringify(key)}:${previous(value[key]!)}`)
       .join(",")}}`;
   };
-  const hash = (value: string) =>
-    hmacDigestForForwarderPurpose({ purpose: "cacheAffinity", value });
+  const hash = (value: string) => hmacDigestForPurpose({ purpose: "cacheAffinity", value });
   for (const surface of ["openai-chat", "anthropic-messages", "openai-responses"]) {
     for (let seed = 0; seed < 40; seed++) {
       const extension: JsonValue = {

@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { specIssue } from "./spec-issues";
+
 /** A short capability token (language code, response format, MIME type). */
 const profileToken = z.string().regex(/^[A-Za-z0-9_.+/-]{1,64}$/);
 
@@ -51,7 +53,7 @@ function segmentedItemBound(
     ctx.addIssue({
       code: "custom",
       path: ["maxItemSeconds"],
-      message: `The segmented adapter allows at most ${REALTIME_SEGMENTED_MAX_ITEM_SECONDS_MAX} seconds per turn.`,
+      ...specIssue("segmentedMaxSeconds", { maxSeconds: REALTIME_SEGMENTED_MAX_ITEM_SECONDS_MAX }),
     });
 }
 

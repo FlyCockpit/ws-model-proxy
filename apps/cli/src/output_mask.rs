@@ -1093,27 +1093,45 @@ mod tests {
     #[test]
     fn streamed_scanning_stays_linear_on_two_mebibytes() {
         use std::time::{Duration, Instant};
+        // A wall-clock budget fails under machine load, so compare against
+        // the same workload at one sixteenth the size, measured in the same run.
+        // Linear scanning costs about 16x; quadratic scanning costs about 256x.
+        // Interleaved rounds, keeping each size's fastest, cancel out load
+        // that rises or falls while the test runs.
+        const LARGE: usize = 2 * 1024 * 1024;
+        const SMALL: usize = LARGE / 16;
+        const ROUNDS: usize = 3;
+        const MAX_RATIO: f64 = 48.0;
+        fn scan(data: &[u8]) -> Duration {
+            let mut masker = StreamMasker::new("show");
+            let started = Instant::now();
+            let mut emitted = 0;
+            for chunk in data.chunks(16 * 1024) {
+                emitted += masker.push(chunk).len();
+            }
+            emitted += masker.finish().len();
+            std::hint::black_box(emitted);
+            started.elapsed()
+        }
         let mixed = include_str!("../tests/fixtures/masking/stream-session.txt");
         for (label, block) in [
             ("mixed", format!("{mixed}\n\n")),
             ("plain", "INFO request completed in 12 ms\n".to_string()),
         ] {
-            let data = block.repeat(2 * 1024 * 1024 / block.len());
-            let mut masker = StreamMasker::new("show");
-            let started = Instant::now();
-            let mut emitted = 0;
-            for chunk in data.as_bytes().chunks(16 * 1024) {
-                emitted += masker.push(chunk).len();
+            let large = block.repeat(LARGE / block.len());
+            let small = block.repeat(SMALL / block.len());
+            let (mut small_best, mut large_best) = (Duration::MAX, Duration::MAX);
+            for _ in 0..ROUNDS {
+                small_best = small_best.min(scan(small.as_bytes()));
+                large_best = large_best.min(scan(large.as_bytes()));
             }
-            emitted += masker.finish().len();
-            std::hint::black_box(emitted);
-            let elapsed = started.elapsed();
-            let bound = if cfg!(debug_assertions) {
-                Duration::from_secs(5)
-            } else {
-                Duration::from_millis(250)
-            };
-            assert!(elapsed < bound, "{label}: {elapsed:?}");
+            let size_ratio = large.len() as f64 / small.len() as f64;
+            let ratio = large_best.as_secs_f64() / small_best.as_secs_f64().max(1e-9);
+            assert!(
+                ratio < MAX_RATIO,
+                "{label}: {size_ratio:.1}x input took {ratio:.1}x time \
+                 ({small_best:?} -> {large_best:?})"
+            );
         }
     }
 }

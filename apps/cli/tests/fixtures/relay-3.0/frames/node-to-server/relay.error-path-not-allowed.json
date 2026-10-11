@@ -1,0 +1,6 @@
+{
+  "type": "relay.error",
+  "requestId": "req-2",
+  "failure": "access_denied",
+  "message": "path_not_allowed"
+}

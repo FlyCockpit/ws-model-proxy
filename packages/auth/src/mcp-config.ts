@@ -49,6 +49,13 @@ export const MCP_SCOPES = ["mcp:read", "mcp:write", "offline_access"] as const;
 
 export type McpScope = (typeof MCP_SCOPES)[number];
 
+/**
+ * The resource scopes: `scopes_supported` in /.well-known/oauth-protected-resource and the
+ * `scope` of the /mcp `WWW-Authenticate` challenge. Naming `mcp:write` there lets an OAuth
+ * client request it, so the consent page can offer Full; Read-only stays its default.
+ */
+export const MCP_RESOURCE_SCOPES = ["mcp:read", "mcp:write"] as const;
+
 /** CIMD client-registration ceiling: default scopes granted at registration. */
 export const MCP_CLIENT_REGISTRATION_DEFAULT_SCOPES = ["mcp:read", "offline_access"] as const;
 

@@ -1,594 +1,424 @@
-# Next release (after v0.3.1): upgrade notes
+# WS Model Proxy 0.4.0: upgrade notes
 
-## 0.4.0 managed inference
+0.4.0 is a redesign, not an incremental upgrade from 0.3. The data model, the
+web app, the relay protocol and the CLI's commands change together, and none of
+them is backwards compatible. Plan it as a new installation: a new database,
+every node logged in again, and every API key, agent token and pool created
+again.
 
-Durable recipe revisions, group-aware deployment plans, human confirmations and
-per-node deployment grants are available in Dashboard → Deployments. A switch
-stops every rank of each conflicting group, leaving unrelated groups untouched.
-Claims remain held until authoritative stop proof; readiness and health gate serving.
-Recipes declare measured resources rather than hardcoded model/hardware assumptions.
-Every rank's command set explicitly declares `management: ownedProcess | externalService`.
-Externally managed services require a reliable status command: exit 0 means alive,
-exit 3 proves stopped; other results remain unknown and cannot release claims.
-Inference contributions are two-party, revocable offers of specific serving models;
-accepting inference never grants control of a contributor's machines.
+Rename this file to the version when the release is cut, and paste the sections
+below into the GitHub release body.
 
-**`wsmp config set-deployments on` gives the server a shell on that machine.**
-For a job the server reports as approved by a person, the CLI runs its commands
-(`/bin/sh -c`, as the user running wsmp) whatever the MCP command mode is,
-including `off`. The mode applies only to jobs reported as agent-authored, and
-in `supervised` it accepts the server's approval flag; there is no confirm
-screen on the node. Turn deployments on only on nodes whose server you would
-trust with a shell there. Deployments stay off by default.
+## Before you deploy: a fresh database is required
 
-Interactive recipe commands (a command a person must run, e.g. one asking for
-a sudo password) are marked `interactive` in the recipe. When such a step is
-due, the deployment waits for you: the node opens an operator terminal that
-shows the exact command, runs it only after you press Enter there (never a
-shell), and for starts and stops checks the recipe's status command before the
-step counts as done.
-An interactive start or `afterJoin` requires `management: externalService`, and
-any interactive command requires a `status` command. Automatic stops (a failed
-start, a node going offline, preemption) also wait for you, with the
-deployment's resources held; an instance whose start is interactive is never
-restarted automatically, it waits for you to restart it. Agents can write and
-plan such recipes but can never answer, reopen or restart these steps.
-Each node must opt in with `wsmp config set-deployment-operator-terminal on`
-(off by default; it also needs deployments on and terminal support, and does not
-enable browser shells). Planning refuses an interactive recipe on a node
-without it, naming the setting. A sudoers `NOPASSWD` rule for the exact
-absolute command remains the fully automatic alternative.
+There is no migration from 0.3. The 0.4.0 schema is a new baseline, and the
+server, the schema hardening and the relay all assume it. Do not point 0.4.0 at
+a 0.3 database, and do not use `APPLY_SCHEMA=dangerous` to force the new schema
+onto an old one: that drops data and still leaves you with an unsupported
+database.
 
-Browser terminal limits are configurable and higher by default: 8 open per
-user (`WMP_TERMINAL_USER_LIMIT`, was 4) and 4 per CLI (`WMP_TERMINAL_CLI_LIMIT`,
-was 2), each 1 to 64, and each node caps its own with
-`wsmp config set-max-terminals <n>` (1 to 32, default 4, was 2). The lowest
-limit applies; supervised command and operator terminals are not counted.
+To deploy:
 
-Recipe commands are limited to 4,096 UTF-8 bytes when saved and again after
-placeholder substitution, the same limit the CLI enforces, so a long command is
-refused at save or plan time instead of leaving an instance stuck stopping.
-Revisions saved earlier with longer commands can still be read, but planning
-refuses them. The CLI keeps its deployment state bounded: verified-stopped
-instances are dropped an hour after their stop, or sooner (oldest first) when
-the 256-instance cap needs room, and stops always have 2 MiB of state reserved,
-so state growth can no longer block a stop.
+1. Back up the 0.3 database if you want to keep its history. Nothing in it is
+   read by 0.4.0.
+2. Create a new, empty Postgres database and point `DATABASE_URL` at it.
+3. Update the environment (see [Configuration](#configuration)): remove every
+   `RATE_LIMIT_*` variable; set `ADMIN_EMAIL` when public sign-up is off (it is
+   required to bootstrap the first admin on a fresh production database); leave
+   `WMP_CLI_SOURCE_REV` unset so nodes install the release binary (see below).
+4. Start the container once with `APPLY_SCHEMA=safe`. On an empty database
+   `safe` creates every table and installs the schema hardening (triggers and
+   CHECKs); nothing destructive is involved.
+5. Set `APPLY_SCHEMA=off` again for normal restarts.
+6. Sign in, then add your nodes, providers, pools, API keys and agent tokens
+   again. Callers need their new API keys.
 
-Upgrade the server and every CLI together to relay protocol 2.4, the one protocol
-bump since v0.3.1 (relay 2.3). Deployment inventory is a complete snapshot
-framed by `snapshotId`, sequential `chunkIndex` and `final`; chunks carry at most 512
-records and the CLI also bounds encoded frame bytes. The server acknowledges only
-after durable current-session commit; the CLI then waits for endpoint-inventory
-acknowledgement before consuming the next queued deployment update. One absolute
-30-second deadline covers both publication phases and interrupts stalled socket
-writes; durable-commit timeout reconnects without authorizing partial inventory. A partial
-snapshot is not a complete inventory. Earlier CLI protocols are refused, not silently downgraded.
+## Removed and renamed concepts
 
-CLI credential identity is bound to the credential, not a WebSocket session.
-Identity reset is a human-only audited action. Unbound CLI tokens bind once on
-first valid use; device credentials minted before identity binding are refused
-and need `wsmp login`. A pool-grantee spend cap survives revoke/re-grant;
-changing a grant's ID does not silently reset the owner's monetary protection.
-Databases built from master: the schema push drops the disposable cache column
-`capacity_kv_eviction.lastSessionId`, which `APPLY_SCHEMA=safe` refuses when
-rows exist; use `APPLY_SCHEMA=dangerous` once. Schema hardening (behavioral
-triggers and ownership/claim guards) is installed by `safe`/`dangerous` and
-`pnpm db:push`; `APPLY_SCHEMA=off` skips schema sync entirely and is not a way
-to remove it. Databases without hardening are unsupported. Hardening takes its
-table locks with NOWAIT and retries for about a minute; if a long autovacuum
-on a large cache table outlasts that, the deploy stops with a retryable lock
-conflict (55P03) and changes nothing. Re-run it, or run `VACUUM` on the named
-table first.
+The 0.3 nouns are gone from the web app, MCP, the CLI and the docs. There are no
+redirects from the old routes (`/dashboard/**`, `/device`, `/admin/devices`,
+`/settings/mcp`).
 
-External fallback is local-first, with separate human-only, default-off consent for
-paid cache-only protection. Embedding fallback requires an exact vector-space contract.
-Pools without connected published local service are absent from model listings.
-WMP stores no chat content; native Responses defaults to `store: false`, while an
-explicit caller may opt into the backend's storage.
+| 0.3 | 0.4.0 |
+|---|---|
+| CLI, device, machine | **Node**: a computer running `wsmp`, logged in to this server. |
+| Per-node capability switches (`set-deployments`, `set-mcp-commands`, `set-file-read`, `set-deployment-operator-terminal`, remote metric sources and engine adapters), MCP command modes, "Ask first"/supervised | **Trust**: one level per node, Full control or Relay only (below). The node's other `wsmp config` settings stay (file roots, file tools, browser terminals, runtime hosts; see [Relay protocol 3.0](#relay-protocol-30-upgrade-every-wsmp)). |
+| Endpoint, recipe, recipe revision, template, variant, deployment | **Runtime**: one inference server definition, either always-on (an address on a node) or startable (commands that start it on one or more nodes). Every edit is a new **version**. Built-in starting points are **presets**. |
+| Deployment instance, capacity | **Instance**: a running copy of a runtime on a node or a group of nodes. |
+| Deployment plan, layout, switch | **Profile**: a named set of runtime versions on a set of nodes; **Apply** is the one-click switch, with a preview you confirm. |
+| Pool grant, inference contribution (offer/accept) | **Share**: a person may *use* your pool, *contribute* their own runtimes to it, or both. |
+| Frozen peer sets for multi-node runs | **Fabric**: a named set of nodes with the IP each uses to reach the others; multi-node instances run inside one fabric. |
+| Model API token / MCP token | **API key** (callers, pools only) and **agent token** (MCP, Read-only or Full). |
+| Device login (`/device`) | Enrollment codes (below). |
 
-Clearing affinity now invalidates a pool's private hint incarnation immediately
-and returns `{cleared: true, reclamation: "pending"}` instead of a deleted-row
-count. Physical metadata is reclaimed in durable bounded batches; concurrent
-requests captured after the clear may establish new warmth. Physical reset
-confidence across relay processes uses database-clock observer leases: failed
-reset-receipt writes become unknown when the last admitted two-second lease
-expires, not through an instantaneous guarantee during a network partition.
-This optional confidence never controls permission to perform local inference.
+**Pools** stay the thing clients call (`owner/pool`, `owner/pool:external`);
+their members are now served models of runtimes. The public API serves pools
+only.
 
-Draft notes for the release after v0.3.1 (2026-08-27). They cover the
-`:external` consent redesign (#56), the OpenRouter provider type and catalog
-(#57), the capacity lease owner (#58), provider URL fixes (#60), the web and MCP
-consent surface (#59), and own-key routing (#61). Rename this file to the
-version when the release is cut, and paste the sections below into the GitHub
-release body (the generated installer notes follow them).
+## Nodes: logging in with an enrollment code
 
-Full behaviour reference: [`docs/external-fallback.md`](../external-fallback.md).
+Device login is gone. To add a node, create an enrollment code on the
+**Nodes** page and run the one-liner it shows. Written with the full path, so
+it works before `~/.cargo/bin` is on your `PATH` (on a node with `CARGO_HOME`
+set, run `$CARGO_HOME/bin/wsmp login` instead; the installer prints the path):
 
-## Discovery capacity lifecycle (#91, #114)
+```sh
+curl -fsSL https://wsmp.example.com/install.sh | sh && ~/.cargo/bin/wsmp login https://wsmp.example.com --code wsmp_enr_...
+```
 
-Slot-sharing llama.cpp, vLLM and SGLang processes now share a capacity when the
-CLI reports multiple served aliases. Owner assignments and explicit detach choices
-are durable per target when the capacity FK actually changes, including changes to
-existing AUTO capacities. Saving the same capacity or only a policy keeps the target's
-provenance. Untouched pool-member attachment fields preserve the target's current
-capacity; deployment marks a target owner-assigned only when its latest audited capacity change (to a non-null capacity) is still in effect; legacy "Not attached" saves are re-attached automatically. Removed aliases
-split once idle. Only a connected move group's source and destination capacities gate
-its ACTIVE lease / WAITING waiter preflight; unrelated capacities and independent
-endpoint groups keep progressing. A busy involved group retries on each later
-inventory (CLI reconnect or operator reload), and may remain deferred until idle.
-Direct and effective pool concurrency/context policies must
-fit every destination. Shared AUTO limits follow engine slots, otherwise the current
-automatic member sum; inadmissible lowerings retain the existing limit. Parent deletes
-refresh surviving shared aggregates and remove empty AUTO discovery rows atomically.
-Startup repairs idle orphans in bounded batches and skips contended owners for retry.
-Shared AUTO limits with unknown values wait for a complete inventory aggregate.
-Owner-created empty rows remain. Automatic labels choose the lowest free numeric
-suffix even when a 120-character preferred label already ends in that suffix.
-SERIALIZABLE automatic creators retry collisions on the capacity label unique index
-with a fresh transaction after an owner-fence wait; other unique conflicts still surface.
-Apply the schema and hardening before starting the new server; this adds target
-assignment provenance and automatic concurrency seed columns.
+- `/install.sh` installs the `wsmp` 0.4.0 release binary for the node:
+  Linux x86_64 or ARM64 (glibc 2.34 or newer: Ubuntu 22.04 and later, DGX OS)
+  and macOS (Apple silicon or Intel). It downloads `wsmp-<target>.tar.xz` and
+  `sha256.sum` from the GitHub Release and installs only when the SHA-256
+  matches; a missing checksum, a mismatch or a failed download stops the
+  install. No Rust toolchain is needed. The binary lands in `~/.cargo/bin`
+  (`$CARGO_HOME/bin` when that is set).
+- Other systems (musl, older glibc, other architectures) build the `v0.4.0`
+  tag from source with `cargo install`; they need Rust 1.88 or newer and a C
+  toolchain (`cc`, for example `build-essential`).
+- `WMP_CLI_RELEASE_BASE_URL` points `/install.sh` at another copy of the
+  release assets (an internal mirror, https only). Unset, it is this
+  version's GitHub Release.
+- `WMP_CLI_SOURCE_REV` makes every node build that exact commit from source
+  instead (a full 40-character hash), whatever `WMP_CLI_RELEASE_BASE_URL`
+  says. Use it only for a build that has no release; it no longer needs to
+  be set for 0.4.0.
+- Each archive and `sha256.sum` carries a signed build-provenance attestation:
+  `gh attestation verify wsmp-x86_64-unknown-linux-gnu.tar.xz --repo FlyCockpit/ws-model-proxy`.
+- Remove a Homebrew 0.3 `wsmp` (`brew uninstall wsmp`) if one is installed:
+  it can shadow `~/.cargo/bin/wsmp` on your `PATH` (the installer warns).
+- `wsmp login <url>` takes the code from `--code`, a prompt, or
+  `WSMP_ENROLL_CODE`. It asks for the node's trust level and offers to
+  install the per-user service.
+- Codes expire after 1 hour by default (at most 7 days), can be revoked, and
+  can be used by up to 50 nodes. A multi-use code can add labels to every node
+  it enrolls.
+- **Replace codes** move an existing node to a new computer: same node, runtimes
+  and traffic, new identity and credential; the old computer's credential stops
+  working. `wsmp login` names the node it replaces and asks you to confirm
+  (`--replace` to skip the prompt). A Relay-only node stays Relay only after a
+  Replace. A plain code never takes over an existing node name
+  (`slug_taken`).
+- **Temporary nodes**: a code can mark the nodes it enrolls as temporary. The
+  server deletes such a node once it has been offline for the code's window
+  (1 hour unless set), and `wsmp login` says so.
+- Node names are 3 to 63 characters (lowercase letters, digits, single
+  hyphens); a few route names are reserved.
 
-## Before you deploy
+Full details: [`apps/cli/README.md`](../../apps/cli/README.md).
 
-- **Schema: every install with endpoints needs one `APPLY_SCHEMA=dangerous`
-  deploy for 0.4.0, after a backup.** Managed deployments add
-  `endpoint.deploymentInstanceId`, a new nullable column with a unique
-  constraint. The column starts all NULL, so the constraint cannot fail, but
-  Prisma treats any new unique constraint on a table with rows as possible
-  data loss: `APPLY_SCHEMA=safe` and `pnpm db:push` stop on it for any
-  database with at least one endpoint, whether it was built from v0.3.1 or
-  from master. (Prisma needs the constraint for the one-to-one relation, so
-  it cannot move into the schema hardening.) From a master-built database,
-  the only data the push drops is two columns: `capacity_kv_eviction.lastSessionId`
-  (a disposable cache value) and `model_pool.routingRules` (re-enter metric
-  routing rules afterwards; see below). From v0.3.1, the push also makes the
-  changes the items below list. Run `safe` first and read every warning it
-  prints, deploy once with `APPLY_SCHEMA=dangerous`, then go back to
-  `APPLY_SCHEMA=off`. One dangerous push applies every schema item in this
-  section at once; follow their conditions too (every server stopped).
+## Relay protocol 3.0: upgrade every wsmp
 
-- **Schema: `cli_device.connectionGeneration` is added (#129).** An additive
-  non-null `int` with a default of `0`, so `APPLY_SCHEMA=safe` applies it
-  without a "possible data loss" stop. It fences disconnect writes to the
-  connection a session was accepted under, so a close delivered after a
-  reconnect cannot re-open the pool members of a live device.
+A 0.3 node cannot reach a 0.4.0 server at all: its credential does not exist in
+the new database, so it is refused at authentication. Every node needs the new
+`wsmp` and a new `wsmp login` with an enrollment code.
 
-- **Set a stop grace of at least 52 s.** The server can take up to 47 s to shut
-  down (`PROCESS_SHUTDOWN_DEADLINE_MS`). Docker's default of 10 s cuts the HTTP
-  drain and relay close short. Use `docker stop -t 52`, compose
-  `stop_grace_period: 52s`, or your platform's equivalent. See
-  [README "Deployment requirements"](../../README.md#deployment-requirements).
-- **Database sessions are forced to UTC.** Every Prisma connection (all
-  application queries) sets `TimeZone=UTC` on connect. Raw-SQL clocks (`now()`, `clock_timestamp()`) are
-  compared with JavaScript-written `timestamp without time zone` columns and
-  depend on it.
-- **Transaction-mode poolers are unsupported.** PgBouncer
-  `pool_mode=transaction` loses the session settings (`TimeZone`, the sweeper's
-  `statement_timeout`). Connect directly or use session pooling.
-- **Schema: deploy once with `APPLY_SCHEMA=dangerous`, after a backup.** #61
-  adds a unique constraint on `pool_grant (id, poolId, granteeUserId)`. It
-  cannot fail (`id` is already the primary key), but Prisma treats every new
-  unique constraint as possible data loss, so `APPLY_SCHEMA=safe` stops with
-  "A unique constraint covering the columns `[id,poolId,granteeUserId]` on the
-  table `pool_grant` will be added" and the container exits. The other schema
-  changes from #56–#61 are additive (`publicEgressEnabled` became
-  `fallbackEnabled` on the same column). If you upgrade straight from v0.3.1,
-  the same push also applies #51 and #53, which drop `cli_device.label` and
-  `cli_device_credential.name`; `dangerous` deletes those values. It also
-  deletes CLI credentials whose device was deleted (their `cliDeviceId` is
-  now required), so those CLIs must log in again; `safe` stops on those rows
-  before Prisma lists its warnings. Run `safe` first and read every warning it
-  prints before switching to `dangerous`, then go back to `APPLY_SCHEMA=off`. The schema deploy also re-applies the
-  schema hardening that carries the grantee trigger fix below; with
-  `APPLY_SCHEMA=off` that fix is not installed.
+The server accepts only relay protocol 3.0, and a 0.4.0 `wsmp` connects only to
+a server that speaks it. A node that is enrolled but runs an older `wsmp` is
+refused at hello with "This server requires relay protocol 3.0. Upgrade wsmp
+and restart it.", and the web app says "Upgrade wsmp on the node first."
 
-- **Capacity lock redesign and legacy storage drop (#78, #74): one more
-  `APPLY_SCHEMA=dangerous` deploy, after a backup, with every server stopped.**
-  The push drops the foreign keys between request history (admission,
-  capacity leases, relay requests, stickiness, usage rollups, provider
-  attempts and accounting) and the dashboard graph, moves the capacity
-  scheduler state and fencing counter from `inference_capacity` into the new
-  `capacity_runtime` table (the hardening re-seeds each fencing counter from
-  its highest lease token; scheduler fairness restarts once), and drops
-  `model_pool."publicEgressAcknowledged"`, the `dashboard_notice` table and an
-  unused `user` index. `APPLY_SCHEMA=safe` stops listing exactly those
-  columns and that table. Stop every running server first: an old server
-  writes the dropped columns. Then start the new image once with
-  `APPLY_SCHEMA=dangerous` and go back to `APPLY_SCHEMA=off`.
+**Replace the old service unit.** A 0.3.1 service runs `wsmp daemon start
+--foreground`, which no longer exists. Accept the service offer at
+`wsmp login`, or run `wsmp service install`, to rewrite it. If you log in with
+`--no-service`, run `wsmp service uninstall` first so the old unit stops
+restarting.
 
-## Breaking changes
+Removed CLI commands: `connect`, `daemon *`, `token`, `endpoints *`, `reload`,
+`service env-sync` and `service env-path` (the service needs no environment
+file: the node credential and node secrets are files the relay reads; re-run
+`wsmp service install` and delete an old `service.env`), and the
+capability switches `config set-mcp-commands`, `set-file-read`,
+`set-remote-metric-sources`, `set-remote-engine-adapters`, `set-deployments`
+and `set-deployment-operator-terminal`. Use `wsmp run`, `wsmp service` and
+`wsmp trust`; runtimes are defined in the web app or through MCP, not with the
+CLI. A 0.3 `config.json` `endpoints` list is ignored and dropped on the next
+write. The rest of `wsmp config` stays: `path`, `init` and `show`, and the
+setters `set-server`, `set-slug`, `set-runtime-hosts`, `set-file-roots` /
+`clear-file-roots`, `set-file-tools`, `set-file-tools-as-root`,
+`set-human-terminal`, `set-terminal-approval` and `set-max-terminals` (see
+`wsmp config --help` and [apps/cli/README.md](../../apps/cli/README.md)).
 
-- **Plain pool names never leave the deployment.** Provider-backed PRIMARY
-  members were moved to the external fallback tier, and fallback was enabled
-  on those pools. A pool whose members are all providers must be called as
-  `owner/pool:external`; its plain name answers `400 external_required`.
-- **API tokens are private-only until a person opts in.** Tokens are created
-  local only; nothing can use external providers until someone turns on
-  **Cloud access** for the token (Dashboard → API tokens). Allowlist tokens
-  also choose which pools may go external. The first time an existing
-  allowlist token is enabled it includes **no** pools; check each pool you
-  want.
-- **`fallbackForGrantees` is off for every pool,** including existing ones.
-  Owners must opt in to pay for grantees' external use.
-- **Stored-Responses bindings to provider members created before this release
-  are invalidated.** Their follow-ups return "not found".
-- **The grant-time egress acknowledgement, grantee notices and email are
-  gone.** The old oRPC and MCP arguments (`publicEgressAcknowledged`,
-  `publicEgressEnabled`, the privacy-confirm flags) are silently stripped. Use
-  `fallbackEnabled`, `fallbackForGrantees` and `externalAfterWaitMs` on the
-  pool procedures in the dashboard or oRPC API. Over MCP only
-  `externalAfterWaitMs` is accepted: MCP rejects `fallbackEnabled` and
-  `fallbackForGrantees` (only a person may change them, in the dashboard).
-- **Context-ceiling requests on plain names now fail** instead of falling back
-  to a provider. A request that is too large for one local member is first
-  retried once on each other local member that could fit it (members with the
-  same engine identity only when their usable ceiling is large enough). With
-  `:external` and token consent it may then go external.
-- **Grantee spend caps are set only through the pool grant.** The cap is keyed
-  by owner, pool and grantee: its recorded spend survives revoke/re-grant and
-  period edits, and a currency change starts a new cap. `providerManagement`
-  budget procedures now refuse `POOL_GRANT` scopes; use
-  `forwarderManagement.updatePoolGrant` or its MCP tool.
-- **A wait budget of 0 means "admit only if a slot is free right now"**
-  (measured on the database clock). Before, it effectively never admitted.
-- **New response headers:** `x-wsmp-route` (`local | pool-fallback |
-  own-key`), `x-wsmp-fallback-reason`, `x-wsmp-served-model`, and
-  `x-wsmp-fallback: unavailable`. The response `model` field is the served
-  upstream model id.
-- **Own-key routing (BYOK).** Grantees can route `owner/pool:external`
-  through their own provider key. The pool owner must first declare an
-  external-equivalent model. Own-key traffic is billed to the grantee; the
-  owner sees only an aggregate count. The own-key provider receives the
-  payload **after** the pool's media transformer.
-- **OpenRouter accounting is conservative for now.** Until OpenRouter usage
-  normalization lands (#62), budgets over-count OpenRouter spend.
+New on the node: `wsmp runtime list` (the runtimes and instances the node
+holds, with phase, ports, units and stop proof) and `wsmp runtime test
+<slug|handle>` (one small request: status and latency), both read only and
+available at Relay only too; `wsmp status` lists the same runtimes and
+instances. `wsmp service restart` and `wsmp service logs [-f] [-n N]` manage
+the service, and `wsmp login --yes` takes the defaults without asking (it
+still needs `--trust`, and never turns browser terminals on). Hardware is
+declared on the node's page in the web app or through MCP; `wsmp hardware`
+only shows what the node detects.
 
-- **Deleting a device, endpoint, model, pool, capacity or user no longer
-  waits for or is refused by its request history.** History keeps the deleted
-  ids and is removed by the retention sweeps; a deleted user's remaining history is purged after 24 h.
-  Accounts with provider accounting still cannot be deleted (archive them).
+**Request bodies are sent with a Content-Length.** A node relays every request
+body with its exact length instead of chunked framing, so strict
+OpenAI-compatible servers (TensorFold, gufo and similar) no longer answer 400.
+When a runtime does answer with an error, the request log and MCP
+(`requests_list`, `model_test`) show one redacted line of what it said.
 
-- **Browser requests from another site are refused on the API.** Every
-  cookie-authenticated `/rpc` and `/api-reference` request that a browser
-  marks as cross-site (a foreign `Origin`, or `Sec-Fetch-Site: cross-site` /
-  `same-site` without an allowed `Origin`) is refused with 403, whatever the
-  procedure or body encoding. Non-browser clients (the CLI) are unaffected.
-- **Consent, credential and paid-egress actions refuse agents in the
-  procedure itself,** not only by being left out of the MCP tool list.
-  `inferenceContributions.offer` is now human-only and no longer an MCP tool.
-- **Inference contributions lend spare capacity.** On a contributor's machine
-  a pool gets the lowest priority, no reserved slots and may always borrow:
-  the pool owner's priority, reservation and borrow settings never hold back
-  the contributor's own traffic. Pool owners no longer see a contributor's
-  live telemetry, device name or engine-load history.
-- **Agents set recipes up; people stay in control.** While MCP commands are
-  allowed on a CLI, an agent can write recipes and start or stop them. A
-  person can always start or stop any recipe from the dashboard, also after
-  turning that CLI's MCP commands off: command modes govern agents only.
-  When a person starts commands an agent wrote (tracked per command text
-  across revisions, so editing one field does not relabel the rest), the
-  dashboard shows them for review and asks for confirmation first.
+## Trust: Full control and Relay only
 
-- **Speech-to-text recipes.** A recipe's `attachment.type` can be `llm`,
-  `embeddings` or `transcription`. A transcription deployment joins its pool
-  as a speech-to-text model for `/audio/transcriptions`, including streamed
-  results. Without a profile it receives plain JSON requests; declare an
-  optional `attachment.transcription` profile (languages, response formats,
-  timestamp granularities, diarization, language detection, upload size and
-  MIME types) so requests that use those options route to it — and note that
-  a profile also narrows what it accepts (for example a lower upload limit).
-  Agents create these recipes through the MCP recipe tools like any other.
-  Upgrade the server and every CLI together (relay protocol 2.4 only). After
-  downgrading a CLI that ran one, remove its deployment state file.
+Each node gives the server one of two levels, chosen at `wsmp login` and kept
+in the node's own configuration:
 
-- **Recipes can be renamed while stopped.** A recipe's slug can be changed
-  while none of its deployments are running, in the dashboard or by an agent
-  over MCP (`updateConfig`, while MCP commands are allowed on a CLI). A rename
-  is refused while any deployment of the recipe runs, and a slug another
-  recipe uses is refused.
-- **Legacy recipe slugs must be renamed before starting.** A recipe saved
-  earlier whose slug ends with `-` or repeats `-` (`--`) is refused at start
-  (`invalid_recipe_slug`) because nodes refuse the endpoint it would create.
-  Rename it while it is stopped, then start it.
-- **A start that stops running models asks first.** When a start or switch
-  would stop running deployments, the dashboard shows a confirm dialog naming
-  each one before anything is stopped; cancelling leaves them running.
-- **File-tool writes need a filesystem that can sync directories.** The CLI
-  now journals file-tool writes so an interrupted one can be recovered. Where
-  a file root or the CLI state directory is on a filesystem that cannot sync
-  directories (some NFS, FUSE or sshfs mounts), writes are refused with
-  `unsafe_filesystem` before anything changes. `wsmp recover` lists
-  interrupted work; `--apply` undoes only an interrupted capture or an
-  unacknowledged delete, and a rename or replace that may have published stays
-  manual. See [`apps/cli/docs/file-recovery.md`](../../apps/cli/docs/file-recovery.md).
+- **Full control** (default): the server may define and start runtimes, run
+  commands, read and write files inside the folders you allow, open terminals
+  and set node secrets.
+- **Relay only**: the server may only send requests to the runtimes on the
+  node and start or stop the runtimes it already holds. Definitions are frozen
+  when trust is lowered; nothing new can be defined, run or read, and running
+  node commands are stopped. People can still start and stop those runtimes
+  from the browser; agents cannot.
 
-- **Live transcription profile.** A transcription profile may add
-  an opt-in `realtime` block, `{adapter, maxItemSeconds?, maxSessions?}`, that
-  marks the endpoint for live speech-to-text sessions. `adapter` is `vllm` (the
-  engine serves vLLM's own `/v1/realtime`; needs engine `vllm` or `other`) or
-  `segmented` (each turn the client ends goes to the endpoint's
-  `/v1/audio/transcriptions`). `maxItemSeconds` (5–600, at most 120 for
-  `segmented`; default 300 for `vllm`, 30 for `segmented`) is when an unfinished
-  turn is ended for the client, since there is no voice activity detection;
-  `maxSessions` (1–8) caps live sessions per endpoint. Without the block an
-  endpoint takes no live sessions. The CLI advertises the block in its
-  transcription capability; this is part of relay protocol 2.4, not a new
-  version. Live sessions open only on recipe-managed endpoints.
-  For a Voxtral realtime model, the whole turn shares one context, so a small
-  `--max-model-len` can fail a long turn part-way; keep `maxItemSeconds` well
-  inside it (600 s is roughly 7.5k audio tokens). Qwen3-ASR realtime is not
-  affected.
-  Version skew (development builds only, since 2.4 is unreleased): upgrade
-  every CLI before adding a `realtime` block, because an older CLI cannot read
-  the job and the start fails only at its deadline (up to 15 minutes). After
-  downgrading a CLI that ran one, remove its deployment state file. Do not roll
-  the server back while a realtime deployment exists: an older server refuses
-  that node's whole inventory, and the node stays offline.
+Lowering works from the browser or with `wsmp trust relay` and sticks on the
+node. Only `wsmp trust full`, typed at the node's terminal, raises it; no frame
+from the server can. Lowering protects against a *future* compromise: commands
+written while the node was Full control (frozen start commands, node metric
+commands) keep running, which is why the Lower dialog lists them.
 
-- **Live transcription routing (`/v1/realtime`).** A live session opens only on
-  a recipe-managed member that is fully healthy. A pool whose members are all
-  degraded or recovering (half-open) refuses live sessions with close code
-  1013 (`model_not_available`) until one is healthy again, even when ordinary
-  HTTP requests can still use a degraded single member. An endpoint that
-  refuses live sessions for a configuration reason (for example a `vllm`
-  realtime claim on an engine without `/v1/realtime`) is reported in the
-  server log and is not counted against the member's health, so a wrong
-  `realtime` block cannot take the member out of HTTP routing.
+Lowering only stops new agent access through wsmp. It does not undo or contain
+software an agent already left on the node while it had Full control, such as a
+systemd user service: that software runs as the same user and can even raise
+trust again locally. If you distrust what an agent did, reinstall the node.
 
-- **Live transcription test panel.** Chat Test has a microphone button that
-  opens a live transcription panel for a live-capable model you can use. It
-  signs in with your dashboard session (no token to paste) and runs the same
-  live session as `/v1/realtime`, as you: every model you can see, the same
-  limits and access checks, and usage recorded as Chat Test. The socket only
-  accepts the dashboard's own origin; signing out or revoking the session ends
-  a live session within 60 seconds, and a ban ends it at once. The microphone
-  needs HTTPS or localhost. Stop ends the session without transcribing the
-  turn in progress; use End turn first.
+## Sharing pools and runtime definitions
 
-- **Chat Test follows the force-2FA policy.** While two-factor authentication
-  is required, Chat Test requests (`/api/internal/chat-test/*`) from a user who
-  has not enrolled are refused with 403 `two_factor_required`, as the rest of
-  the dashboard already is.
+Share a pool or a runtime definition from **Access → Shares** by e-mail. The
+person gets it at once only when their account's e-mail address was verified
+through the verification e-mail (which needs SMTP). Anyone else, including an
+address with no account yet, gets an invite link instead: e-mailed when SMTP is
+configured, otherwise shown to you once to pass on. The link works for 14 days
+and is accepted by signing up or signing in through it, whatever address that
+account uses. An address with an unverified account and one with no account
+get the same answer (a direct share does show that the address belongs to an
+account with a verified e-mail). Pending invites are listed on the same page,
+where you can resend (a new link; the old one stops working) or withdraw them.
+Deleting a runtime removes its invites.
 
-- **Live transcription sessions (`GET /v1/realtime?intent=transcription`).**
-  A WebSocket API following the OpenAI Realtime GA transcription events
-  (`session.update`, `input_audio_buffer.append/commit/clear`; transcription
-  `delta`/`completed`/`failed` with `usage: {type: "duration", seconds}`).
-  Authenticate with `Authorization: Bearer <model API token>`, or from a
-  browser with the subprotocols `realtime` and
-  `openai-insecure-api-key.<token>` (only `realtime` is echoed). A key in the
-  URL is refused. Input is `audio/pcm` at 24 kHz only, at most 512 KiB of
-  base64 per append; turns end when the client commits (`turn_detection`
-  must be null; there is no voice activity detection) or at the profile's
-  `maxItemSeconds`. Limits: 4 sessions per token, 8 per user, 30 minutes per
-  session, 120 s without audio. More than 64 clears or `session.update`s
-  with no audio after them get `rate_limited` ("Too many pending commands")
-  until the node catches up; the session stays open. `:external` model
-  names are refused: live audio never leaves your nodes. There is no
-  failover once a session has opened; clients reconnect. `GET /v1/models` marks live models with
-  `supports_realtime_transcription`.
-  Access is checked when the session opens (under the same locked send check
-  as HTTP requests) and again every 60 seconds. Revoking the token, banning
-  or deleting a user ends live sessions at once in the server process that
-  made the change (other processes end theirs within 60 seconds); a token
-  that expires, or an allowlist edit that removes the model, ends them within
-  60 seconds.
-  Each opened session is one request row (`audio.realtime_transcription`)
-  with the forwarded audio in `audioInputMs`; its wall time is kept out of
-  request latency statistics. The `segmented` adapter returns one result per
-  turn; live partial results need a vLLM realtime model. With vLLM, audio
-  appended after the engine ended a turn on its own (its token limit), but
-  before the CLI read that, can be lost (a few hundred milliseconds).
-  See `docs/transcription-interoperability.md` for client usage and recipe
-  notes (whisper.cpp needs `--inference-path /v1/audio/transcriptions`).
-  Database: three additive columns (`relay_request."audioInputMs"`,
-  `usage_rollup_minute/_hour."audioInputMs"`); `APPLY_SCHEMA=safe` adds them.
+## Browser terminals and interactive steps
 
-## Fixed
+**Browser terminals** open a shell on a node from the **Terminals** page. They
+need Full control and the node's own opt-in. At Full control, `wsmp login` asks
+for it next to the trust question (default yes). Without a terminal, pass
+`--human-terminal on|off`; otherwise the saved setting stays (off unless set)
+and login says so. Change it later with `wsmp config set-human-terminal
+on|off`; the server cannot. Limits are configurable and higher by default: 8 open per
+user and 4 per node. The server settings are `WMP_TERMINAL_USER_LIMIT` and
+`WMP_TERMINAL_CLI_LIMIT` (each 1 to 64), and each node caps its own with `wsmp config set-max-terminals` (1 to
+32, default 4). The lowest limit applies; operator terminals are not counted.
 
-- **Commands the CLI starts can be stopped with signals again (since #51).**
-  The relay blocked SIGTERM, SIGINT and SIGHUP for its own shutdown handling,
-  and every command it started (exec commands, metric sources, engine
-  adapters, deployment start/stop/status commands) inherited that mask. Where
-  `/bin/sh` is bash (macOS, Fedora/RHEL, Arch) those commands then ignored
-  `kill`, `pkill` and `timeout`, and a stop command could not end a `nohup`'d
-  backend. The CLI now takes shutdown signals with a handler instead, so its
-  commands start with nothing blocked; relay shutdown behaves as before.
-- **A disconnect that arrives just after a CLI reconnects no longer re-opens
-  its pool members (#113, #129).** The reconnect hello had already made the
-  members due, but the old socket's close could still be processed during the
-  new registration and re-impose the full 60 s circuit-open (and a
-  `DISCONNECTED` device status) over the live session. Disconnect writes now
-  carry the connection generation they were issued under and apply only while
-  the device still holds it, so the stale close matches no row.
-- **Grantees of shared pools could not use local members.** Since #26
-  (2026-08-25), on databases with schema hardening applied, a grantee's
-  request to a shared pool's local member failed: the database rejected the
-  request's start record and the request errored. Grantee `:external`
-  responses paid by the pool owner were delivered, but their request record
-  stayed pending until crash recovery. The `relay_request` consistency trigger
-  now checks the selected target against the pool owner for pool routes, and
-  against the requester for own-key and direct routes (#61). The schema deploy
-  above installs it.
+**Interactive steps** are runtime commands a person must run, typically one
+that asks for a sudo password. A startable runtime marks them `interactive`;
+such a command needs a `status` command, and an interactive start needs
+`management: service`. When one is due, the instance shows **Needs you** and
+the node opens an operator terminal, which you open from the Terminals page or
+the runtime. It shows the exact command and who wrote it, and runs it only
+after you press Enter. The node then:
 
-## Security fixes
+- runs only that command on a fresh PTY (under `/bin/sh -c`), never an
+  interactive shell or prompt: when it exits the terminal ends, with nothing
+  left to type into;
+- runs `sudo -k` before and after it, and strips `SUDO_ASKPASS`, so no sudo
+  credential survives between steps;
+- forwards your keystrokes only while the command runs.
 
-- **`wsmp -vv` and trace log filters no longer print credentials or relay
-  traffic.** At trace level, the CLI used to log the WebSocket client's relay
-  connection request, including the device credential (`authorization`
-  header), and every relay frame (model requests, completions, transcripts) to
-  stderr. The HTTP and WebSocket client crates (`tungstenite`, `ureq`,
-  `reqwest`, `hyper`) are now capped at INFO unless `WSMP_LOG`/`RUST_LOG`
-  names one of them explicitly. If you have shared or stored trace logs from
-  an earlier CLI, treat them as sensitive and revoke the credential or CLI
-  token they contain from the dashboard.
+Operator terminals work at both trust levels (at Relay only, for frozen
+definitions) and need no setting on the node. Agents can write runtimes with
+interactive steps but can never answer, reopen or cancel them. A sudoers
+`NOPASSWD` rule for the exact command remains the fully automatic alternative.
 
-## Security notes
+### Threat model: passwords typed into a terminal
 
-Follow-ups from the final 0.4.0 security review. All are rated low, except
-SEC-14, which is medium on Windows only and predates 0.4.0.
+A sudo password you type into a browser terminal or an operator terminal passes
+through the server, in encrypted form. What holds today:
 
-Fixed in this release:
+- **Keystrokes are encrypted between your browser and the node.** Each viewer
+  agrees a key with the node (P-256 ECDH, then HKDF), and every input and
+  output frame is sealed with AES-GCM as a `term.sealed` frame; the server
+  accepts only sealed frames from the browser and forwards their bytes
+  unchanged.
+- **The server never stores or logs terminal bytes.** The node's activity
+  records terminal events (a terminal opened; an interactive step's outcome
+  and exit code), never what was typed or shown.
+- **Your browser pins each node's identity key** the first time it opens a
+  terminal there and checks the node's signature over its terminal key on
+  every open, so a server that later substitutes the key is shown as "identity
+  changed". `wsmp terminal fingerprint` prints the value to compare.
 
-- **`wsmp login` no longer passes the server's approval URL through
-  `cmd.exe` on Windows (SEC-14).** The CLI ran `cmd /C start "" <url>` with
-  the server-supplied verification URL. Its `&` and other cmd metacharacters
-  were shell syntax, so a malicious or compromised server could run commands
-  on the Windows machine, and ordinary `&user_code=` URLs broke. Now, on every
-  platform, the browser opens only for an https URL (http only on a loopback
-  host) on the configured server's origin with no embedded credentials. On
-  Windows it opens through `rundll32 url.dll,FileProtocolHandler`, with no
-  shell in between. Any other URL is printed for you to open yourself. Not yet
-  run on a real Windows machine.
-- **The CLI signs only the hello origin configured on its machine (SEC-13).**
-  The hello signature binds the server origin, but the CLI used to sign
-  whatever origin the challenge named. A relay or wrong-URL server that
-  receives the bearer credential could therefore forward a valid signature to
-  the real server. The CLI now signs only its own expected origin: a public
-  origin pinned with `wsmp config set-server <URL> --public-origin <origin>`,
-  else the server URL's origin. The server never chooses it. On any other
-  origin the relay stops with an error, without signing. `wsmp config show`
-  prints the effective `helloOrigin`, and `wsmp login` warns when the
-  server's origin differs from it. Both the error and the warning suggest the
-  exact command, with its arguments single-quoted (for PowerShell on
-  Windows), but only when the server's origin is itself a valid public
-  origin; otherwise they suggest nothing.
-  **Action for a CLI that reaches the server through another address** (a LAN
-  IP or an internal hostname) than its public URL (the origin of the server's
-  `BETTER_AUTH_URL`): pin the public origin and restart wsmp. No new login is
-  needed. For example:
-  `wsmp config set-server 'http://10.0.0.5:3000' --public-origin 'https://wsmp.example.com'`.
-  The public origin is `scheme://host[:port]` with no path or credentials. Its
-  host must be an IP address or a DNS name of ASCII letters, digits and
-  hyphens (internationalized names in punycode), so a server-chosen host with
-  shell characters can never be pinned or suggested. A plain-http origin is
-  accepted, for a LAN server whose `BETTER_AUTH_URL` is http. `set-server`
-  warns when the connect URL is plain http off loopback, since the CLI's
-  credential and relay traffic go there unencrypted. Setting
-  the server again without `--public-origin` clears the pin and says so. Until
-  it is pinned, the relay exits on each connection attempt, so a service
-  manager keeps restarting it (every 5 seconds under the systemd unit), as
-  with the CLI's other configuration errors.
-- **`wsmp login` prints the server's URL and user code escaped.** A hostile
-  server could otherwise send terminal escape sequences, such as an OSC 8
-  link that shows one URL and opens another. On Windows the browser opener
-  also runs `%SystemRoot%\System32\rundll32.exe` by full path.
-- **Terminal approval codes are never moved to another browser identity
-  (SEC-15).** Recording a pending browser identity used to replace any pending
-  entry with the same 8-character (40-bit) code, and approving it replaced an
-  approved identity that had that code. Now a code approved for one identity
-  is never re-approved for another. If two identities ask for the same pending
-  code, neither can be approved until `wsmp terminal approvals revoke <code>`
-  clears it.
-- **MCP output redacts product tokens embedded in text (SEC-17g).** A
-  `wsmp_…` token inside a longer string, such as a recipe command, used to
-  pass through because redaction only checked whether the string started with
-  a token prefix.
+What does not hold:
 
-Known limitations, not fixed in 0.4.0:
+- **A compromised server can capture the password anyway.** It serves the web
+  page that encrypts your keystrokes, so it can serve a modified page that
+  reads them before encryption.
+- **A compromised server can type into the running command.** Unless the node
+  requires approval of each browser identity (`wsmp config
+  set-terminal-approval on`, off by default), the node accepts any browser key
+  the server relays, so the server can join an operator terminal itself, press
+  Enter on its confirm screen, and send input while the command runs.
+  Approval stops a key the server makes up; it does not stop a modified page
+  running in a browser you already approved.
+- **The server sees the size and timing of every frame.** Each keystroke is
+  its own sealed frame, so a password's length and typing rhythm are visible
+  to the server even though the characters are not.
+- On a browser's first use of a node there is no earlier pin to compare with;
+  check the fingerprint if it matters.
 
-- **SEC-15 (rest):** codes are still 40 bits, and `wsmp terminal approve`
-  shows no key fingerprint. Approve only a code your own browser is showing
-  right now.
-- **SEC-11:** the inference-contribution accept list shows only the pool and
-  model IDs. It does not name the contributor or their device, and it does not
-  say that accepting sends your pool's prompts to that user's hardware. Accept
-  only offers you expected.
-- **SEC-17**, grouped:
-  - Overview metrics and health label contributed members with the
-    contributor's device name or hostname.
-  - `offer` reveals whether a pool ID exists (NOT_FOUND vs BAD_REQUEST) and
-    returns the pool owner's user ID.
-  - Warm protection on a contributed node counts every pool's sessions with
-    that pool's own protection percent, so one pool owner can push other
-    owners' warm sessions off the node. This redirects them; it does not deny
-    them.
-  - The cache-affinity reset ledger holds 4,096 keys, at most 1,024 per owner.
-    A few colluding accounts can fill it, after which another owner's CLI that
-    sends a reset is disconnected (1011) and reconnects.
-  - Setting a CLI device's feature grants, labels or usable budgets takes the
-    device's advisory lock before checking ownership, so another user can
-    briefly hold it.
-  - Removing a pool member leaves its inference contribution ACTIVE with no
-    member.
-  - All MCP credentials of one user act as one actor. Any of that user's MCP
-    tokens can apply a plan another of their tokens created, even after the
-    creating token is revoked, and recipe revisions do not record which token
-    edited them.
-  - KV-eviction feedback is stored per capacity, not per owner. On a shared
-    node, the first owner's evidence affects another pool's budget until it
-    expires.
-  - MCP output redaction catches product tokens embedded in text only when at
-    least 32 characters follow the prefix. Real tokens have about 43, so a
-    truncated token can still appear.
+If that is not acceptable for a node, do not type its sudo password into a
+web terminal: give the exact command a `NOPASSWD` sudoers rule instead, and use
+Full control only where trusting the server with a shell is fine.
 
-## Per-caller `:external` wait (#181)
+## File tools default to the home directory
 
-A model-API token can store `externalAfterWaitMs` (null uses each pool's wait).
-`:external` requests may also send `x-wsmp-external-after-wait-ms`. The pool
-value is an owner floor: callers may only lengthen, up to the local capacity
-wait budget, and cannot shorten below the floor. When fallback is off, the
-caller waits the full local budget. MCP:
-`model_api_token_external_wait_update`. The column is additive and nullable
-(`APPLY_SCHEMA=safe`).
+On a Full control node, agents' file tools now work out of the box: with no
+roots configured they use the home directory of the user wsmp runs as (`nodes_get`
+shows `features.files.source`: `default`, `configured` or `disabled`). wsmp's own
+files stay protected by the node's deny-list. `wsmp config clear-file-roots`
+returns to this default; it no longer turns the file tools off. To keep agents
+out of files, run `wsmp config set-file-tools off` (or lower the node to Relay
+only). The node page shows the roots and their source read-only; they are set
+only on the node, with `wsmp config set-file-roots`.
 
-## CLI identity bind and native count
+## Pools translate between API protocols by default
 
-- **CLI devices and CLI tokens bind to the CLI identity key, not `/etc/machine-id`.**
-  Hello signs a server nonce mixed with the server origin. Every existing
-  device credential is refused until `wsmp login` is run once per machine.
-  CLI tokens TOFU-bind the identity key on first hello; the owner can reset
-  that bind from the dashboard without revoking the token. A copied
-  `service.env` cannot take over another machine once its token has
-  connected; a never-used token binds to whichever copy connects first.
-  The CLI state directory must be writable: it holds the identity key, and
-  `wsmp connect` fails without it. Hello reports
-  `identity_mismatch` when the bound key does not match. A 2.4 CLI against an
-  older server exits with an upgrade-the-server error. Unexpected server
-  failures send `protocol.error` `internal` and the CLI reconnects.
-- **Metric routing rules live in `pool_routing_rule`.** Databases built from
-  v0.3.1 never stored `model_pool.routingRules` JSON. Unreleased master
-  databases that did lose those rules on the schema push (`APPLY_SCHEMA=safe`
-  stops on the column drop; `dangerous` drops them). Re-enter the rules in
-  the dashboard after upgrading a master-built DB.
-- **Native Chat Completions counting is per endpoint.** The CLI probe writes
-  `engineFacts.countContext` onto the inference capacity (`engineCountContext`,
-  additive, `APPLY_SCHEMA=safe`). Near-ceiling Chat Completions skip native
-  count when the method is missing or `unsupported` (Ollama, SGLang, generic,
-  failed probes). When a method exists, the same `relay.request` carries
-  `countFirst` and `countCeiling`: the CLI tokenizes, then either forwards the
-  body once or returns structured `request_too_large`. Estimates never reject.
-- **Reconnect keeps the probed count method** when the engine kind is unchanged.
-  Tokenize counts above `1e12` are refused instead of closing the relay session.
-- **Engine-load history survives a reconnect.** Disconnect no longer wipes the
-  30-minute rings. New keys at the 2000-ring (or 64-per-device) cap are refused
-  while existing live rings stay; rings older than the window are pruned.
-- **`GET /v1/models` lists only ids this token can call now.** Plain pool and
-  direct ids need a published PRIMARY local member (or the direct model) with
-  a live CLI session. Empty, unpublished, and disconnected ids are omitted.
-  FULL or saturated pools stay listed. `owner/pool:external` stays when the
-  token has access, even if no local member is live.
-- **MCP `fields` for nested argument errors are dotted paths** (`rules.0.threshold`).
-  Guarded pool-create policy errors name the create input keys (`reservedSlots`,
-  `memberConcurrencyLimit`, `memberContextCeiling`, `advanced.contextMargin`).
-- **Callers that match `context_exceeded` must switch to `context_length_exceeded`.**
-  Grant spend caps use the pool's pricing currency (`POOL_GRANT` scope). OpenRouter
-  inventories may declare Chat Completions, Responses, and Anthropic Messages.
-- **Prefix-cache resets send `delta = current` with `prefixCacheReset`.** A dropped
-  reset frame is retried on the next scrape so post-restart counts are not lost.
+A pool now answers OpenAI Chat Completions, OpenAI Responses and Anthropic
+Messages callers even when a member serves only one of them: **API adaptation**
+(pool Advanced) is on by default. A member that serves the caller's protocol
+natively is always tried first; translation is used only when no native member
+can take the request. Translation is strict: a request feature it cannot carry
+over (for example `logprobs`, audio output or a vendor-specific field) is
+refused with a 400 that names the feature, never silently dropped. Merging a
+developer message into the system prompt for Anthropic targets stays off unless
+you turn on **lossy developer-role collapse**. Turn API adaptation off on a pool
+to serve only native requests.
 
-## Post-deploy verification
+## Request compatibility: any engine, any harness
 
-The trigger fix is covered by the PostgreSQL CI suites but has not yet been
-observed on a real deployment. After deploying:
+Pools now adapt each request to the engine that serves it, so vLLM, SGLang,
+llama.cpp, Ollama, LM Studio and other OpenAI- or Anthropic-style servers work
+with the clients you already use, including harnesses you cannot change:
 
-- [ ] As a grantee, send one request to a shared pool that a local member
-      serves. It succeeds.
-- [ ] As a grantee with a token that allows external providers, send one
-      `owner/pool:external` request that the pool owner pays for
-      (`fallbackEnabled` and `fallbackForGrantees` on). It succeeds with
-      `x-wsmp-route: pool-fallback`.
-- [ ] Both `relay_request` rows reach a terminal state (not `PENDING`), and
-      their selected execution target belongs to the pool owner.
-- [ ] Record the result on issue #92.
+- **Unknown fields**: per runtime, `auto` (default) drops fields the engine does
+  not accept, `forward` sends everything, `strict` refuses them. What an engine
+  accepts is read from its OpenAPI description when an instance becomes ready
+  (through the node, loopback only) and otherwise learned from its 400s: the
+  named field is dropped and the request retried once, before anything reached
+  the client. Semantic fields (messages, tools, sampling, output constraints,
+  reasoning, ...) are never dropped silently: the caller gets a 400 naming the
+  field.
+- **Rewrite rules** per runtime version (rename, drop, default, clamp, role
+  mapping such as developer to system), header modes (forward or strip
+  `anthropic-beta`, `OpenAI-Beta`, ...) and response shaping (reasoning field,
+  strict-SDK cleanup). Agents can edit them; every edit is a version.
+- **Model-name aliases**: map `gpt-4o` or `claude-sonnet-4-5` to one of your
+  pools, for all keys or one key. `/v1/models` lists them. Your own actions
+  never create a clash in your own names: setting an alias named like a pool
+  ID you can call, and creating or renaming one of your pools (or changing your
+  account slug) onto one of your own aliases, are refused, also when two happen
+  at once. Nobody else's alias ever refuses anything: sharing a pool, turning on
+  can use, accepting an invite and renaming never look at a recipient's
+  aliases, so an owner learns nothing about them. When a pool shared with you
+  gets an ID one of your aliases already has, **your alias wins, for you only,
+  until you rename or delete it**: requests for that name (also `:external`) go
+  to the alias's pool, never the shared one (through a key that cannot use the
+  alias, to nothing); `/v1/models`, the models list, the
+  Test page and agent model tests list or use that name as the alias's pool;
+  and the Overview warns which alias hides which pool,
+  linking to its Aliases tab (where the alias is marked "hides pool ..."). The
+  account slug now changes only through the settings API
+  (`settings.update`), not through Better Auth's update routes.
+- **Auth styles**: the model API accepts `Authorization: Bearer`, `x-api-key`
+  and `api-key`.
+- Requests show what was dropped or rewritten, and usage an engine did not
+  report is estimated and marked.
+
+The schema gains `runtime_version.compat`, `runtime_request_profile`,
+`model_alias`, `relay_request.compat` and `relay_request.usageEstimated`:
+redeploy with `APPLY_SCHEMA=safe` once. Nodes need the new `wsmp` to let the
+server read engine descriptions; older nodes keep working and learn from 400s
+only.
+
+## Stops that can't be confirmed
+
+A stopping instance keeps its port, memory and GPUs until its node proves the
+process is gone. When the stop command fails, the server asks the node to
+check (no process of the runtime left, `status` says stopped, port free) and
+finishes the stop on its own when the check passes. If it can't confirm the
+stop (the process still runs, or the node has been offline for 10 minutes),
+the instance shows **Stop not confirmed**. While the node is online, the check
+repeats every 5 minutes.
+
+After checking on the node that the process is really gone, press **Mark as
+stopped…** on the runtime or node page. The dialog shows when the stop was
+requested, the last automatic check and the node's connection. Marking runs
+nothing on the node: the instance settles stopped, while its port, memory and
+GPUs stay counted until a later check proves the process gone or the instance
+starts again (an instance that should keep running is restarted). Full agents
+can do the same on Full-control nodes with
+`runtime_stop {markStopped: true, confirm: "MARK_STOPPED"}`. Each mark writes
+a "marked as stopped" row in the node's activity.
+
+## Runtime starts and health
+
+- A `management: "process"` runtime no longer needs a stop command: the node's
+  stop ends everything in the rank's slice and proves it. The vLLM, SGLang and
+  llama.cpp presets drop their `stop: "true"` stub. Service runtimes still
+  need `stop` and `status`.
+- A `process` start that hands its server off (`docker compose up -d`, a
+  server that daemonizes) now fails with **process_detached** instead of
+  looking healthy while the node can neither watch nor stop it. Define such a
+  runtime as `management: "service"` with real stop and status commands.
+- New presets: **vLLM speech-to-text** (Whisper large-v3 turbo, with a
+  transcription profile and segmented live transcription), **vLLM embeddings**
+  (Qwen3-Embedding-0.6B with `--runner pooling` and its embedding contract) and
+  **Docker Compose** (a service that runs `docker compose up -d` / `down`, with
+  a status that succeeds only while a container of the project runs).
+- An unhealthy instance shows why its last health check failed (for example
+  "answered HTTP 503" or "the serving process is not running in its unit") on
+  the runtime page and as `healthDetail` in `runtimes_get`.
+- A wsmp the server refuses for its relay protocol no longer restarts every 5
+  seconds: under a service unit written by `wsmp service install` it stops
+  with exit code 5, and under an older unit it retries every 5 minutes. Re-run
+  the server's install.sh, then `wsmp service install` to update the unit.
+
+## Configuration
+
+### Rate limits
+
+The `RATE_LIMIT_*` settings are gone and no longer read (the server warns at
+startup when one is still set). Every limit uses its built-in budget, and one
+setting, `WMP_RATE_LIMIT_SCALE` (default 1, 0.1-100), multiplies every budget;
+windows and block durations stay fixed. The per-recipient email caps and the
+failed-password cap are always on (on unreleased master builds, setting their
+points to 0 turned them off; that is gone).
+
+Relay connections (`/api/cli/ws`) have their own limits and no longer share
+the sign-in bucket, so a node reconnecting in a loop cannot lock its owner out
+of sign-in from the same address. Each node may open 10 relay connections per
+minute (then it waits 5 minutes), and each address may fail 30 relay
+connections per minute before authenticating (then 5 minutes); only failed
+connections count against an address, so many nodes behind one NAT can
+connect at once. A refused connection
+answers 429 with `Retry-After`, and `wsmp` waits at least that long.
+
+### Email recipient caps
+
+The anonymous endpoints that send mail to an address in the request body
+(resend verification, request password reset) allow 3 mails per address per hour;
+sign-up has its own cap of 6 per address per hour. Both are always on, with or
+without SMTP configured, and `WMP_RATE_LIMIT_SCALE` can raise them but never
+below 1. The enrollment-code exchange is new: 10 attempts per IP per 15
+minutes, where only failures use up the budget (a successful exchange is
+refunded), and 20 exchanges per code owner per hour, successes included.
+
+### Other environment changes
+
+- **Added:** `WMP_RATE_LIMIT_SCALE`, `WMP_CLI_RELEASE_BASE_URL` (where
+  `/install.sh` downloads the CLI), `WMP_CLI_SOURCE_REV` (a commit
+  `/install.sh` builds instead), `WMP_TERMINAL_USER_LIMIT`, `WMP_TERMINAL_CLI_LIMIT`,
+  `WMP_MCP_ENABLED` (MCP kill switch, on by default), `WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY`
+  (was `WMP_MCP_PAT_ALLOW_NO_EXPIRY` on unreleased master builds), `ADMIN_EMAIL`,
+  `RELAY_REQUEST_RETENTION_DAYS`.
+- **Removed:** every `RATE_LIMIT_*` variable, `MODEL_API_ANTHROPIC_ENABLED`,
+  `MODEL_API_GLOBAL_CAPACITY_ENABLED`, `MODEL_API_PROTOCOL_ADAPTATION_ENABLED`.
+
+Run `pnpm env:check` against your server's variable list, or compare it
+with the regenerated `.env.example`.

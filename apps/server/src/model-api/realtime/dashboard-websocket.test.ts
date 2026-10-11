@@ -6,14 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     BETTER_AUTH_URL: "https://proxy.example.test",
-    RATE_LIMIT_AUTH_POINTS: 100,
-    RATE_LIMIT_AUTH_DURATION: 60,
-    RATE_LIMIT_AUTH_BLOCK_DURATION: 60,
-    RATE_LIMIT_SIGNUP_POINTS: 100,
-    RATE_LIMIT_SIGNUP_DURATION: 60,
-    RATE_LIMIT_SIGNUP_BLOCK_DURATION: 60,
-    RATE_LIMIT_RPC_POINTS: 100,
-    RATE_LIMIT_RPC_DURATION: 60,
+    WMP_RATE_LIMIT_SCALE: 1,
     TRUST_PROXY_HOPS: undefined,
   },
 }));
@@ -62,7 +55,7 @@ function deps(overrides: Partial<Deps> = {}) {
   const value: Deps = {
     relay: {
       createSttSession: (input) => hub.createSession(input),
-      getActiveCliDeviceIds: () => [],
+      getOnlineNodeIds: () => [],
       isDraining: () => false,
     },
     counters,
@@ -230,7 +223,7 @@ describe("Chat Test realtime sessions", () => {
     return { requester, admission: result.admission, model };
   }
 
-  it("claims sends with no token and meters as CHAT_TEST", async () => {
+  it("claims sends with no token and meters as TEST", async () => {
     const meter = { opened: vi.fn(), itemFinished: vi.fn(), ended: vi.fn() };
     const createMeter = vi.fn(() => meter);
     const authorizeOpen = vi.fn(() => async () => ({
@@ -242,11 +235,10 @@ describe("Chat Test realtime sessions", () => {
         ok: true as const,
         candidates: [
           {
-            cliDeviceId: "cli",
-            endpointSlug: "inst-aaaaaaaaaaaaaaaa",
+            nodeId: "node",
+            handle: "i-aaaaaaaaaaaa",
             upstreamModel: "m",
             capabilities: null,
-            deploymentManaged: true,
             memberId: null,
           },
         ],
@@ -264,7 +256,7 @@ describe("Chat Test realtime sessions", () => {
     expect(authorizeOpen).toHaveBeenCalledWith({ tokenId: null, userId: "user-1" });
     expect(createMeter).toHaveBeenCalledWith({
       userId: "user-1",
-      source: "CHAT_TEST",
+      source: "TEST",
       tokenId: null,
       tokenLookupPrefix: null,
     });

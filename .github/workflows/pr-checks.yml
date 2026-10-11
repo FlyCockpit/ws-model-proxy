@@ -386,20 +386,8 @@ jobs:
           DATABASE_URL: ${{ env.SCHEMA_VALIDATION_DATABASE_URL }}
         run: pnpm --filter @ws-model-proxy/db db:push
 
-      - name: Prove capacity admission PostgreSQL primitives
+      - name: Server PostgreSQL integration suites
         run: pnpm --filter server test:postgres
-
-      - name: Prove provider attempt lifecycle recovery
-        run: pnpm --filter server exec vitest run src/model-api/provider-attempt-runtime.integration.test.ts
-
-      - name: Prove cache affinity concurrency and retention
-        run: pnpm --filter server exec vitest run src/model-api/cache-affinity.integration.test.ts
-
-      - name: Prove cache affinity identity chain, isolation and index bounds
-        run: pnpm --filter server exec vitest run --no-file-parallelism src/model-api/cache-affinity-identity.postgres.integration.test.ts
-
-      - name: Prove cache affinity cohorts, reset fencing and bounded fanout
-        run: pnpm --filter server exec vitest run --no-file-parallelism src/model-api/cache-affinity-cohorts.integration.test.ts
 
   postgres-api:
     # Split from prisma-validate so the slowest PostgreSQL suite runs in parallel.
@@ -454,7 +442,7 @@ jobs:
           DATABASE_URL: ${{ env.SCHEMA_VALIDATION_DATABASE_URL }}
         run: pnpm --filter @ws-model-proxy/db db:push
 
-      - name: Prove provider management and capacity policy races
+      - name: API PostgreSQL integration suites (core flows)
         run: pnpm --filter @ws-model-proxy/api test:postgres
 
   # ── React Doctor (React health scan: hooks, a11y, perf, security) ─

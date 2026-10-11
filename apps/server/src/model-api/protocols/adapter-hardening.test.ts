@@ -23,6 +23,12 @@ import {
 import { ignoreUnknownEnvelopeFields, MAX_LOGGED_FIELDS_PER_STREAM } from "./parse-utils.js";
 
 describe("strict cross-surface rendering", () => {
+  it("says what to do when a translated Responses request asks to be stored", () => {
+    expect(() =>
+      parseCanonicalRequest("openai-responses", { model: "m", input: "hello", store: true }),
+    ).toThrow(/stores responses natively.*"store": false/u);
+  });
+
   it("requires an explicit single-call policy whenever OpenAI tools are adapted", () => {
     const request = {
       model: "m",

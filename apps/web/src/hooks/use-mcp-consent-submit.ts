@@ -19,6 +19,14 @@ import { resolveOauthRedirectUrl } from "@/lib/mcp-oauth-search";
  */
 export type ConsentPhase = "review" | "submitting" | "denied" | "invalid";
 
+/**
+ * Better Auth's consent body plus `level`, which its endpoint schema does not declare: the
+ * server's consent hooks read it from the request body (packages/auth/src/mcp-consent-level.ts).
+ */
+type ConsentBody = NonNullable<Parameters<typeof authClient.oauth2.consent>[0]> & {
+  level?: "READ" | "FULL";
+};
+
 export function useMcpConsentSubmit() {
   const [phase, setPhase] = useState<ConsentPhase>("review");
   const disposed = useRef(false);
@@ -39,12 +47,17 @@ export function useMcpConsentSubmit() {
     };
   }, []);
 
-  const submit = useCallback(async (accept: boolean) => {
+  /**
+   * `level`: the access the person chose on the page (approval only). The server records it on
+   * the grant (packages/auth/src/mcp-consent-level.ts); a denial carries none.
+   */
+  const submit = useCallback(async (accept: boolean, level?: "READ" | "FULL") => {
     setPhase("submitting");
     try {
       // The signed oauth_query is attached by oauthProviderClient() from
-      // window.location.search; this call sends ONLY the accept decision.
-      const result = await authClient.oauth2.consent({ accept });
+      // window.location.search; this call sends ONLY the person's decision.
+      const body: ConsentBody = accept && level !== undefined ? { accept, level } : { accept };
+      const result = await authClient.oauth2.consent(body);
       if (disposed.current) return;
       if (result.error) {
         // invalid_signature / expired transaction / missing oauth query: the

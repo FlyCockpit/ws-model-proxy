@@ -1,14 +1,18 @@
-//! Custom metric sources (relay 2.7 `node.metrics.custom`, S-B part 2).
+//! Node metric commands (relay 3.0 `node.metrics.custom`).
 //!
-//! A source is a shell command that runs every `intervalSecs` and prints
-//! numbers in one of three formats. Local sources come from the config file.
-//! Remote sources arrive in `metrics.sources.set`; the daemon stores them in
-//! `<state dir>/remote-metric-sources.json` and they run only when
+//! The server defines them in the node part of `runtime.define`
+//! (`node.metricCommands`, at most 16, frozen with the rest at Relay only).
+//! There is no local hash approval any more: what the server may define
+//! follows the node's trust. The daemon hands the held (frozen at Relay
+//! only) list to [`Runner`] through the telemetry thread.
 //!
-//! - the local opt-in `allowRemoteMetricSources` was on when wsmp started, and
-//! - the person approved the exact command locally (`wsmp metrics approve`),
-//!   which pins its SHA-256 in the config. A changed command string needs a
-//!   new approval; until then the source does not run.
+//! A command runs every `intervalSecs` and prints numbers in one of three
+//! formats: `json` (an object of numbers), `prometheus` (text exposition) or
+//! `lines` (`<name> <number>` per line, or one bare number named after the
+//! command). Without a `map` every valid series is reported as printed; with
+//! one, each mapped metric is read from its series (a JSON pointer for
+//! `json`, a series name with optional labels otherwise), aggregated
+//! (default sum), scaled and optionally divided by another series.
 //!
 //! Every run is bounded: its own process group (killed as a whole on
 //! timeout), stdin closed, stderr discarded (never read, never uploaded),
@@ -17,22 +21,24 @@
 //! do. Commands run as the OS user that runs wsmp.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::bounded_run::RunError;
-use crate::config::{Config, MetricSourceConfig, MetricsConfig};
+use crate::protocol::frames::{
+    CustomMetric, MetricCommandError, MetricCommandState, MetricCommandStatus,
+};
+use crate::protocol::runtime_spec::{
+    Aggregate, MetricCommandFormat, NodeMetricCommand, ReaderMapEntry,
+};
 use crate::protocol::{
-    CustomMetric, MetricSourceError, MetricSourceFormat, MetricSourceOrigin, MetricSourceState,
-    MetricSourceStatus, NODE_METRICS_CUSTOM_MAX, NODE_METRICS_SOURCES_MAX, RemoteMetricSource,
+    NODE_METRIC_COMMAND_VALUES_MAX, NODE_METRIC_COMMANDS_MAX, NODE_METRICS_CUSTOM_MAX,
 };
 use crate::telemetry::{is_label_key, is_metric_name};
 
@@ -47,12 +53,7 @@ pub const TIMEOUT_MAX_SECS: u32 = 300;
 /// Series older than this many intervals are no longer reported.
 pub const STALE_INTERVALS: u32 = 3;
 /// Name prefixes the server reserves for built-in metrics.
-pub const RESERVED_PREFIXES: [&str; 2] = ["node.", "endpoint."];
-/// Remote definitions, in the state directory.
-pub const REMOTE_SOURCES_FILE: &str = "remote-metric-sources.json";
-/// How often the runner checks the config file for changed local sources or
-/// approvals.
-const RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+pub const RESERVED_PREFIXES: [&str; 3] = ["node.", "endpoint.", "runtime."];
 
 /// One parsed series.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -83,7 +84,7 @@ fn series(name: &str, labels: BTreeMap<String, String>, value: f64) -> Option<Se
         && labels.len() <= LABELS_MAX
         && labels
             .iter()
-            .all(|(key, value)| is_label_key(key) && is_metric_name(value)))
+            .all(|(key, value)| is_label_key(key) && crate::telemetry::is_label_value(value)))
     .then(|| Series {
         name: name.to_string(),
         labels,
@@ -92,38 +93,59 @@ fn series(name: &str, labels: BTreeMap<String, String>, value: f64) -> Option<Se
 }
 
 /// Parse one run's stdout. Invalid series are dropped; output with nothing
-/// usable is a parse error. At most [`NODE_METRICS_CUSTOM_MAX`] series.
+/// usable is a parse error. At most [`NODE_METRIC_COMMAND_VALUES_MAX`] series.
 pub fn parse_output(
-    format: MetricSourceFormat,
-    source_name: &str,
+    format: MetricCommandFormat,
+    command_name: &str,
     bytes: &[u8],
-) -> Result<Vec<Series>, MetricSourceError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| MetricSourceError::Parse)?;
+) -> Result<Vec<Series>, MetricCommandError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| MetricCommandError::Parse)?;
     let mut parsed = match format {
-        MetricSourceFormat::Number => {
-            let value = text
-                .trim()
-                .parse::<f64>()
-                .map_err(|_| MetricSourceError::Parse)?;
-            series(source_name, BTreeMap::new(), value)
-                .into_iter()
-                .collect()
-        }
-        MetricSourceFormat::Json => parse_json(text)?,
-        MetricSourceFormat::Prometheus => parse_prometheus(text),
+        MetricCommandFormat::Lines => parse_lines(command_name, text)?,
+        MetricCommandFormat::Json => parse_json(text)?,
+        MetricCommandFormat::Prometheus => parse_prometheus(text),
     };
     if parsed.is_empty() {
-        return Err(MetricSourceError::Parse);
+        return Err(MetricCommandError::Parse);
     }
-    parsed.truncate(NODE_METRICS_CUSTOM_MAX);
+    parsed.truncate(NODE_METRIC_COMMAND_VALUES_MAX);
     Ok(parsed)
 }
 
-fn parse_json(text: &str) -> Result<Vec<Series>, MetricSourceError> {
+/// `<name> <number>` per line, or exactly one bare number (named after the
+/// command). Blank lines and `#` comments are skipped.
+fn parse_lines(command_name: &str, text: &str) -> Result<Vec<Series>, MetricCommandError> {
+    let lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    if let [only] = lines.as_slice()
+        && let Ok(value) = only.parse::<f64>()
+    {
+        return Ok(series(command_name, BTreeMap::new(), value)
+            .into_iter()
+            .collect());
+    }
+    Ok(lines
+        .iter()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let name = fields.next()?;
+            let value = fields.next()?.parse::<f64>().ok()?;
+            if fields.next().is_some() {
+                return None;
+            }
+            series(name, BTreeMap::new(), value)
+        })
+        .collect())
+}
+
+fn parse_json(text: &str) -> Result<Vec<Series>, MetricCommandError> {
     let value: serde_json::Value =
-        serde_json::from_str(text).map_err(|_| MetricSourceError::Parse)?;
+        serde_json::from_str(text).map_err(|_| MetricCommandError::Parse)?;
     let serde_json::Value::Object(map) = value else {
-        return Err(MetricSourceError::Parse);
+        return Err(MetricCommandError::Parse);
     };
     Ok(map
         .iter()
@@ -213,197 +235,221 @@ pub fn run_command(
     command: &str,
     timeout: Duration,
     cancel: Option<&AtomicBool>,
-) -> Result<Vec<u8>, MetricSourceError> {
+) -> Result<Vec<u8>, MetricCommandError> {
     if crate::child_env::validate_command(command).is_err() || command.trim().is_empty() {
-        return Err(MetricSourceError::Spawn);
+        return Err(MetricCommandError::Spawn);
     }
     let (shell, flag) = crate::child_env::exec_shell();
     let args = [flag.to_string(), command.to_string()];
     crate::bounded_run::run(shell, &args, timeout, OUTPUT_LIMIT, cancel).map_err(
         |error| match error {
-            RunError::Spawn | RunError::Resources | RunError::Cancelled => MetricSourceError::Spawn,
-            RunError::Timeout => MetricSourceError::Timeout,
-            RunError::OutputTooLarge => MetricSourceError::OutputTooLarge,
-            RunError::ExitStatus => MetricSourceError::ExitStatus,
+            RunError::Spawn | RunError::Resources | RunError::Cancelled => {
+                MetricCommandError::Spawn
+            }
+            RunError::Timeout => MetricCommandError::Timeout,
+            RunError::OutputTooLarge => MetricCommandError::OutputTooLarge,
+            RunError::ExitStatus => MetricCommandError::ExitStatus,
         },
     )
 }
 
-/// Run a source once and parse its output.
-pub fn run_source(
-    spec: &SourceSpec,
+/// A command as the runner sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandSpec {
+    pub name: String,
+    pub command: String,
+    pub interval_secs: u32,
+    pub timeout_secs: u32,
+    pub format: MetricCommandFormat,
+    pub command_sha256: String,
+    pub map: Option<BTreeMap<String, ReaderMapEntry>>,
+}
+
+impl CommandSpec {
+    /// `None` for a command this node will not run (bad name or bounds).
+    pub fn from_definition(definition: &NodeMetricCommand) -> Option<Self> {
+        let interval_secs = u32::from(definition.interval_secs);
+        let timeout_secs = u32::from(definition.timeout_secs);
+        let valid = is_metric_name(&definition.name)
+            && (INTERVAL_MIN_SECS..=INTERVAL_MAX_SECS).contains(&interval_secs)
+            && (TIMEOUT_MIN_SECS..=TIMEOUT_MAX_SECS).contains(&timeout_secs)
+            && !definition.command.trim().is_empty()
+            && crate::child_env::validate_command(&definition.command).is_ok();
+        valid.then(|| Self {
+            name: definition.name.clone(),
+            command: definition.command.clone(),
+            interval_secs,
+            timeout_secs,
+            format: definition.format,
+            command_sha256: sha256_hex(definition.command.as_bytes()),
+            map: definition.map.clone(),
+        })
+    }
+}
+
+/// Run a command once and parse its output.
+pub fn run_spec(
+    spec: &CommandSpec,
     cancel: Option<&AtomicBool>,
-) -> Result<Vec<Series>, MetricSourceError> {
+) -> Result<Vec<Series>, MetricCommandError> {
     let output = run_command(
         &spec.command,
         Duration::from_secs(u64::from(spec.timeout_secs)),
         cancel,
     )?;
-    parse_output(spec.format, &spec.name, &output)
-}
-
-/// A source as the runner sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceSpec {
-    pub name: String,
-    pub origin: MetricSourceOrigin,
-    pub command: String,
-    pub interval_secs: u32,
-    pub timeout_secs: u32,
-    pub format: MetricSourceFormat,
-    pub command_sha256: String,
-}
-
-/// Why a source runs or not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Eligibility {
-    Run,
-    /// Local source with an invalid name, interval, timeout or command.
-    Disabled,
-    /// Remote source without the local opt-in, or shadowed by a local one.
-    Refused,
-    /// Remote source whose exact command has no local approval.
-    PendingApproval,
-}
-
-fn valid_bounds(command: &str, interval_secs: u32, timeout_secs: u32) -> bool {
-    (INTERVAL_MIN_SECS..=INTERVAL_MAX_SECS).contains(&interval_secs)
-        && (TIMEOUT_MIN_SECS..=TIMEOUT_MAX_SECS).contains(&timeout_secs)
-        && !command.trim().is_empty()
-        && crate::child_env::validate_command(command).is_ok()
-}
-
-fn local_spec(name: &str, source: &MetricSourceConfig) -> SourceSpec {
-    SourceSpec {
-        name: name.to_string(),
-        origin: MetricSourceOrigin::Local,
-        command: source.command.clone(),
-        interval_secs: source.interval_secs,
-        timeout_secs: source.timeout_secs,
-        format: source.format,
-        command_sha256: sha256_hex(source.command.as_bytes()),
+    match &spec.map {
+        Some(map) => map_output(spec.format, map, &output),
+        None => parse_output(spec.format, &spec.name, &output),
     }
 }
 
-fn remote_spec(source: &RemoteMetricSource) -> SourceSpec {
-    SourceSpec {
-        name: source.name.clone(),
-        origin: MetricSourceOrigin::Remote,
-        command: source.command.clone(),
-        interval_secs: source.interval_secs,
-        timeout_secs: source.timeout_secs,
-        format: source.format,
-        command_sha256: sha256_hex(source.command.as_bytes()),
+fn aggregate(values: &[f64], how: Option<Aggregate>) -> Option<f64> {
+    match how.unwrap_or(Aggregate::Sum) {
+        Aggregate::Sum => (!values.is_empty()).then(|| values.iter().sum()),
+        Aggregate::Max => values.iter().copied().reduce(f64::max),
+        Aggregate::First => values.first().copied(),
     }
 }
 
-/// Every local and remote source with its eligibility, locals first, each
-/// group sorted by name. Sources whose names cannot be reported are left out.
-pub fn effective_sources(
-    metrics: &MetricsConfig,
-    remote: &[RemoteMetricSource],
-    allow_remote: bool,
-) -> Vec<(SourceSpec, Eligibility)> {
-    let mut sources = Vec::new();
-    for (name, source) in &metrics.sources {
-        if !is_metric_name(name) {
-            tracing::warn!("a local metric source has an invalid name; skipped");
-            continue;
-        }
-        let eligibility =
-            if valid_bounds(&source.command, source.interval_secs, source.timeout_secs) {
-                Eligibility::Run
-            } else {
-                Eligibility::Disabled
-            };
-        sources.push((local_spec(name, source), eligibility));
+/// Numbers at a JSON pointer: one number (booleans count 1/0), or every
+/// number in an array there.
+fn json_numbers(document: &serde_json::Value, pointer: &str) -> Vec<f64> {
+    let number = |value: &serde_json::Value| match value {
+        serde_json::Value::Bool(flag) => Some(if *flag { 1.0 } else { 0.0 }),
+        other => other.as_f64(),
+    };
+    match document.pointer(pointer) {
+        Some(serde_json::Value::Array(items)) => items.iter().filter_map(number).collect(),
+        Some(value) => number(value).into_iter().collect(),
+        None => Vec::new(),
     }
-    let mut remote = remote
+}
+
+/// The values a series selector picks from parsed text series.
+fn series_numbers(
+    parsed: &[Series],
+    name: &str,
+    labels: Option<&BTreeMap<String, String>>,
+) -> Vec<f64> {
+    parsed
         .iter()
-        .filter(|source| is_metric_name(&source.name))
-        .collect::<Vec<_>>();
-    remote.sort_by(|left, right| left.name.cmp(&right.name));
-    remote.dedup_by(|left, right| left.name == right.name);
-    for source in remote {
-        let spec = remote_spec(source);
-        let eligibility = if !allow_remote
-            || metrics.sources.contains_key(&source.name)
-            || !valid_bounds(&source.command, source.interval_secs, source.timeout_secs)
-        {
-            Eligibility::Refused
-        } else if metrics
-            .approved_remote_sources
-            .get(&source.name)
-            .is_some_and(|hash| hash.eq_ignore_ascii_case(&spec.command_sha256))
-        {
-            Eligibility::Run
-        } else {
-            Eligibility::PendingApproval
+        .filter(|series| {
+            series.name == name
+                && labels.is_none_or(|wanted| {
+                    wanted
+                        .iter()
+                        .all(|(key, value)| series.labels.get(key) == Some(value))
+                })
+        })
+        .map(|series| series.value)
+        .collect()
+}
+
+/// Picks the numbers a selector (pointer or series name, plus labels) names.
+type SeriesPicker = dyn Fn(&str, Option<&BTreeMap<String, String>>) -> Vec<f64>;
+
+/// Apply a command's `map`: one series per mapped metric that resolved.
+pub fn map_output(
+    format: MetricCommandFormat,
+    map: &BTreeMap<String, ReaderMapEntry>,
+    bytes: &[u8],
+) -> Result<Vec<Series>, MetricCommandError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| MetricCommandError::Parse)?;
+    // Input series are read as printed (free-text labels, any name): only
+    // the mapped output names and values must follow the wire rules.
+    let pick: Box<SeriesPicker> = match format {
+        MetricCommandFormat::Json => {
+            let document: serde_json::Value =
+                serde_json::from_str(text).map_err(|_| MetricCommandError::Parse)?;
+            Box::new(move |pointer, _| {
+                // A bare name means the top-level key.
+                if pointer.starts_with('/') {
+                    json_numbers(&document, pointer)
+                } else {
+                    json_numbers(&document, &format!("/{pointer}"))
+                }
+            })
+        }
+        MetricCommandFormat::Prometheus => {
+            let parsed = raw_prometheus(text);
+            Box::new(move |name, labels| series_numbers(&parsed, name, labels))
+        }
+        MetricCommandFormat::Lines => {
+            let parsed = raw_lines(text);
+            Box::new(move |name, labels| series_numbers(&parsed, name, labels))
+        }
+    };
+    let mut out = Vec::new();
+    for (metric, entry) in map {
+        let Some(mut value) =
+            aggregate(&pick(&entry.series, entry.labels.as_ref()), entry.aggregate)
+        else {
+            continue;
         };
-        sources.push((spec, eligibility));
+        if let Some(scale) = entry.scale {
+            value *= scale;
+        }
+        if let Some(divide_by) = &entry.divide_by {
+            let Some(divisor) = aggregate(&pick(divide_by, entry.labels.as_ref()), entry.aggregate)
+            else {
+                continue;
+            };
+            if divisor == 0.0 {
+                continue;
+            }
+            value /= divisor;
+        }
+        out.extend(series(metric, BTreeMap::new(), value));
     }
-    sources.truncate(NODE_METRICS_SOURCES_MAX);
-    sources
-}
-
-/// `<state dir>/remote-metric-sources.json`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoteSourcesFile {
-    pub sources: Vec<RemoteMetricSource>,
-}
-
-pub fn remote_sources_path() -> Result<PathBuf> {
-    Ok(crate::paths::state_dir()?.join(REMOTE_SOURCES_FILE))
-}
-
-pub fn load_remote_sources_from(path: &Path) -> Result<Vec<RemoteMetricSource>> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(serde_json::from_str::<RemoteSourcesFile>(&text)
-            .with_context(|| format!("parsing `{}`", path.display()))?
-            .sources),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(error) => Err(error).with_context(|| format!("reading `{}`", path.display())),
+    if out.is_empty() {
+        return Err(MetricCommandError::Parse);
     }
+    out.truncate(NODE_METRIC_COMMAND_VALUES_MAX);
+    Ok(out)
 }
 
-pub fn load_remote_sources() -> Result<Vec<RemoteMetricSource>> {
-    load_remote_sources_from(&remote_sources_path()?)
+/// Prometheus lines as printed, without the output-name rules.
+fn raw_prometheus(text: &str) -> Vec<Series> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let name_end = line
+                .find(|c: char| c == '{' || c.is_whitespace())
+                .unwrap_or(line.len());
+            let mut rest = &line[name_end..];
+            let mut labels = BTreeMap::new();
+            if let Some(after) = rest.strip_prefix('{') {
+                let (parsed, remaining) = parse_labels(after)?;
+                labels = parsed;
+                rest = remaining;
+            }
+            let value = rest.split_whitespace().next()?.parse::<f64>().ok()?;
+            value.is_finite().then(|| Series {
+                name: line[..name_end].to_string(),
+                labels,
+                value,
+            })
+        })
+        .collect()
 }
 
-/// Replace the stored remote definitions (atomic, private permissions).
-pub fn save_remote_sources_to(path: &Path, sources: &[RemoteMetricSource]) -> Result<()> {
-    let dir = path
-        .parent()
-        .context("remote metric sources path has no parent directory")?;
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("creating state directory `{}`", dir.display()))?;
-    let text = serde_json::to_string_pretty(&RemoteSourcesFile {
-        sources: sources.to_vec(),
-    })
-    .context("serializing remote metric sources")?;
-    let mut file = tempfile::NamedTempFile::new_in(dir)
-        .with_context(|| format!("creating a temporary file in `{}`", dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))
-            .context("setting private permissions on remote metric sources")?;
-    }
-    std::io::Write::write_all(&mut file, text.as_bytes())
-        .context("writing remote metric sources")?;
-    file.as_file()
-        .sync_all()
-        .context("syncing remote metric sources")?;
-    file.persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("replacing `{}`", path.display()))?;
-    Ok(())
-}
-
-pub fn save_remote_sources(sources: &[RemoteMetricSource]) -> Result<()> {
-    save_remote_sources_to(&remote_sources_path()?, sources)
+/// `<name> <number>` lines as printed.
+fn raw_lines(text: &str) -> Vec<Series> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let name = fields.next()?;
+            let value = fields.next()?.parse::<f64>().ok()?;
+            value.is_finite().then(|| Series {
+                name: name.to_string(),
+                labels: BTreeMap::new(),
+                value,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -414,24 +460,23 @@ struct LastValues {
 }
 
 #[derive(Debug)]
-struct SourceState {
-    spec: SourceSpec,
-    eligibility: Eligibility,
+struct CommandState {
+    spec: CommandSpec,
     next_due: Instant,
     /// The id of THIS state's run in flight, if any. A result counts only
     /// when it carries this id (a run of a replaced definition never does).
     attempt: Option<u64>,
     last: Option<LastValues>,
-    error: Option<MetricSourceError>,
+    error: Option<MetricCommandError>,
 }
 
 /// A run that has not reported yet, live or already cancelled. The runner
-/// owns every such run until it reports (or is given up on), so a
-/// replaced or withdrawn source's dying run stays cancellable and blocks a
-/// new run of the same source.
+/// owns every such run until it reports (or is given up on), so a replaced
+/// or withdrawn command's dying run stays cancellable and blocks a new run
+/// of the same command.
 #[derive(Debug)]
 struct Attempt {
-    key: SourceKey,
+    name: String,
     /// Ends this run only (each attempt owns its flag).
     cancel: Arc<AtomicBool>,
     /// A run always returns within its timeout plus the reap grace; past
@@ -441,68 +486,33 @@ struct Attempt {
 
 const ATTEMPT_GRACE: Duration = Duration::from_secs(10);
 
-type SourceKey = (bool, String);
-
-/// End every unreported run of this source (idempotent).
-fn cancel_key(attempts: &BTreeMap<u64, Attempt>, key: &SourceKey) {
-    for attempt in attempts.values().filter(|attempt| attempt.key == *key) {
+/// End every unreported run of this command (idempotent).
+fn cancel_name(attempts: &BTreeMap<u64, Attempt>, name: &str) {
+    for attempt in attempts.values().filter(|attempt| attempt.name == name) {
         attempt.cancel.store(true, Ordering::SeqCst);
     }
 }
 
-fn key(spec: &SourceSpec) -> SourceKey {
-    (spec.origin == MetricSourceOrigin::Remote, spec.name.clone())
-}
-
 struct RunResult {
-    key: SourceKey,
+    name: String,
     attempt: u64,
     command_sha256: String,
-    outcome: Result<Vec<Series>, MetricSourceError>,
+    outcome: Result<Vec<Series>, MetricCommandError>,
     ts: String,
     at: Instant,
 }
 
-/// Where the runner reads its inputs.
-#[derive(Debug, Clone)]
-pub struct RunnerSettings {
-    /// The opt-in as read when wsmp started.
-    pub allow_remote: bool,
-    /// Config file for local sources and approvals (re-read on change).
-    pub config_path: Option<PathBuf>,
-}
-
-impl RunnerSettings {
-    pub fn from_environment(allow_remote: bool) -> Self {
-        Self {
-            allow_remote,
-            config_path: crate::paths::config_file().ok(),
-        }
-    }
-}
-
-/// Schedules source runs on short-lived threads and keeps their latest
+/// Schedules command runs on short-lived threads and keeps their latest
 /// values. Owned by the telemetry thread; nothing here blocks.
 pub struct Runner {
-    settings: RunnerSettings,
-    metrics: MetricsConfig,
-    remote: Vec<RemoteMetricSource>,
-    config_mtime: Option<SystemTime>,
-    next_reload_check: Instant,
-    states: BTreeMap<SourceKey, SourceState>,
+    states: BTreeMap<String, CommandState>,
     results_tx: Sender<RunResult>,
     results_rx: Receiver<RunResult>,
     changed: bool,
     /// Every unreported run, by attempt id: the one place runs are ended
-    /// early (`cancel_key`, `Drop`) and the one place "in flight" is read.
+    /// early (`cancel_name`, `Drop`) and the one place "in flight" is read.
     attempts: BTreeMap<u64, Attempt>,
     next_attempt: u64,
-}
-
-fn modified(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
 }
 
 impl Drop for Runner {
@@ -515,112 +525,50 @@ impl Drop for Runner {
     }
 }
 
+impl Default for Runner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Runner {
-    pub fn new(settings: RunnerSettings) -> Self {
+    pub fn new() -> Self {
         let (results_tx, results_rx) = mpsc::channel();
-        // Remote definitions come ONLY from this session's
-        // `metrics.sources.set` ([`Runner::set_remote`]): the server sends
-        // one after every hello and fails closed with an empty list, so a
-        // definition stored by an earlier session (mode since downgraded,
-        // another server) never runs before the server's word arrives. The
-        // stored file is only for `wsmp metrics list` / `approve`.
-        let mut runner = Self {
-            settings,
-            metrics: MetricsConfig::default(),
-            remote: Vec::new(),
-            config_mtime: None,
-            next_reload_check: Instant::now(),
+        Self {
             states: BTreeMap::new(),
             results_tx,
             results_rx,
             changed: false,
             attempts: BTreeMap::new(),
             next_attempt: 0,
-        };
-        runner.reload_config(true);
-        runner.rebuild(Instant::now());
-        runner
-    }
-
-    /// For tests and callers that already hold the config.
-    pub fn with_inputs(
-        settings: RunnerSettings,
-        metrics: MetricsConfig,
-        remote: Vec<RemoteMetricSource>,
-    ) -> Self {
-        let (results_tx, results_rx) = mpsc::channel();
-        let mut runner = Self {
-            settings,
-            metrics,
-            remote,
-            config_mtime: None,
-            next_reload_check: Instant::now() + RELOAD_CHECK_INTERVAL,
-            states: BTreeMap::new(),
-            results_tx,
-            results_rx,
-            changed: false,
-            attempts: BTreeMap::new(),
-            next_attempt: 0,
-        };
-        runner.rebuild(Instant::now());
-        runner
-    }
-
-    /// `metrics.sources.set` replaced the remote definitions.
-    pub fn set_remote(&mut self, remote: Vec<RemoteMetricSource>) {
-        self.remote = remote;
-        self.rebuild(Instant::now());
-        self.changed = true;
-    }
-
-    /// Replace the local sources and approvals (the config changed).
-    pub fn set_metrics_config(&mut self, metrics: MetricsConfig) {
-        if self.metrics != metrics {
-            self.metrics = metrics;
-            self.rebuild(Instant::now());
         }
     }
 
-    /// True once after a run finished or a source's state changed.
-    pub fn take_changed(&mut self) -> bool {
-        std::mem::take(&mut self.changed)
-    }
-
-    fn reload_config(&mut self, force: bool) {
-        let Some(path) = self.settings.config_path.clone() else {
-            return;
-        };
-        let mtime = modified(&path);
-        if !force && mtime == self.config_mtime {
-            return;
-        }
-        self.config_mtime = mtime;
-        match Config::load_from_path(&path) {
-            Ok(config) => self.set_metrics_config(config.metrics),
-            Err(error) => {
-                tracing::warn!(error = %format!("{error:#}"), "re-reading metric sources from the config failed; keeping the previous ones");
-            }
-        }
-    }
-
-    fn rebuild(&mut self, now: Instant) {
-        let effective = effective_sources(&self.metrics, &self.remote, self.settings.allow_remote);
+    /// Replace the node's metric commands (a define or a frozen copy).
+    /// Commands this node will not run are left out; at most 16 run.
+    pub fn set_commands(&mut self, definitions: &[NodeMetricCommand]) {
+        let now = Instant::now();
         let mut next = BTreeMap::new();
-        for (spec, eligibility) in effective {
-            let source_key = key(&spec);
-            let state = match self.states.remove(&source_key) {
-                Some(state) if state.spec == spec && state.eligibility == eligibility => state,
+        for spec in definitions
+            .iter()
+            .filter_map(CommandSpec::from_definition)
+            .take(NODE_METRIC_COMMANDS_MAX)
+        {
+            let name = spec.name.clone();
+            if next.contains_key(&name) {
+                continue;
+            }
+            let state = match self.states.remove(&name) {
+                Some(state) if state.spec == spec => state,
                 previous => {
                     self.changed = true;
-                    // The definition or its authority changed (command,
-                    // withdrawal is handled below, approval revoked, opt-in):
-                    // the run of the old one must not keep executing.
+                    // The definition changed: the run of the old one must
+                    // not keep executing.
                     if previous.is_some() {
-                        cancel_key(&self.attempts, &source_key);
+                        cancel_name(&self.attempts, &name);
                     }
-                    SourceState {
+                    CommandState {
                         spec,
-                        eligibility,
                         next_due: now,
                         // A run of the old definition is being ended; its
                         // result is ignored (it carries another attempt id)
@@ -631,12 +579,11 @@ impl Runner {
                     }
                 }
             };
-            next.insert(source_key, state);
+            next.insert(name, state);
         }
-        // What is left in the old map was withdrawn (or is no longer
-        // reportable): end its run too.
+        // What is left in the old map was withdrawn: end its run too.
         for withdrawn in self.states.keys() {
-            cancel_key(&self.attempts, withdrawn);
+            cancel_name(&self.attempts, withdrawn);
         }
         if !self.states.is_empty() {
             self.changed = true;
@@ -644,25 +591,26 @@ impl Runner {
         self.states = next;
     }
 
-    /// Reload inputs when due, collect finished runs and start due ones.
+    /// True once after a run finished or a command's state changed.
+    pub fn take_changed(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
+    }
+
+    /// Collect finished runs and start due ones.
     pub fn tick(&mut self, now: Instant) {
-        if now >= self.next_reload_check {
-            self.next_reload_check = now + RELOAD_CHECK_INTERVAL;
-            self.reload_config(false);
-        }
         // A run that never reported (a lost thread) is forgotten after its
-        // bound, so its source is not blocked forever.
+        // bound, so its command is not blocked forever.
         let mut given_up = Vec::new();
         self.attempts.retain(|id, attempt| {
             if now < attempt.give_up_at {
                 return true;
             }
             attempt.cancel.store(true, Ordering::SeqCst);
-            given_up.push((*id, attempt.key.clone()));
+            given_up.push((*id, attempt.name.clone()));
             false
         });
-        for (id, key) in given_up {
-            if let Some(state) = self.states.get_mut(&key)
+        for (id, name) in given_up {
+            if let Some(state) = self.states.get_mut(&name)
                 && state.attempt == Some(id)
             {
                 state.attempt = None;
@@ -670,7 +618,7 @@ impl Runner {
         }
         while let Ok(result) = self.results_rx.try_recv() {
             self.attempts.remove(&result.attempt);
-            let Some(state) = self.states.get_mut(&result.key) else {
+            let Some(state) = self.states.get_mut(&result.name) else {
                 continue;
             };
             // Only this state's own run counts: a cancelled run of a
@@ -680,9 +628,7 @@ impl Runner {
                 continue;
             }
             state.attempt = None;
-            if state.spec.command_sha256 != result.command_sha256
-                || state.eligibility != Eligibility::Run
-            {
+            if state.spec.command_sha256 != result.command_sha256 {
                 continue;
             }
             match result.outcome {
@@ -695,7 +641,7 @@ impl Runner {
                     state.error = None;
                 }
                 Err(error) => {
-                    tracing::debug!(source = %state.spec.name, ?error, "metric source run failed");
+                    tracing::debug!(command = %state.spec.name, ?error, "metric command run failed");
                     // A failed run reports nothing: earlier values are not
                     // passed off as current.
                     state.last = None;
@@ -704,14 +650,10 @@ impl Runner {
             }
             self.changed = true;
         }
-        for (source_key, state) in &mut self.states {
-            if state.eligibility != Eligibility::Run
-                || state.attempt.is_some()
+        for (name, state) in &mut self.states {
+            if state.attempt.is_some()
                 || now < state.next_due
-                || self
-                    .attempts
-                    .values()
-                    .any(|attempt| attempt.key == *source_key)
+                || self.attempts.values().any(|attempt| attempt.name == *name)
             {
                 continue;
             }
@@ -721,14 +663,14 @@ impl Runner {
             let spec = state.spec.clone();
             let tx = self.results_tx.clone();
             let cancel = Arc::new(AtomicBool::new(false));
-            let key_for_thread = source_key.clone();
+            let name_for_thread = name.clone();
             let cancel_for_thread = Arc::clone(&cancel);
             let spawned = thread::Builder::new()
-                .name("wsmp-metric-source".to_string())
+                .name("wsmp-metric-command".to_string())
                 .spawn(move || {
-                    let outcome = run_source(&spec, Some(&cancel_for_thread));
+                    let outcome = run_spec(&spec, Some(&cancel_for_thread));
                     let _ = tx.send(RunResult {
-                        key: key_for_thread,
+                        name: name_for_thread,
                         attempt: attempt_id,
                         command_sha256: spec.command_sha256,
                         outcome,
@@ -737,14 +679,14 @@ impl Runner {
                     });
                 });
             if spawned.is_err() {
-                state.error = Some(MetricSourceError::Spawn);
+                state.error = Some(MetricCommandError::Spawn);
                 continue;
             }
             state.attempt = Some(attempt_id);
             self.attempts.insert(
                 attempt_id,
                 Attempt {
-                    key: source_key.clone(),
+                    name: name.clone(),
                     cancel,
                     give_up_at: now
                         + Duration::from_secs(u64::from(state.spec.timeout_secs))
@@ -755,34 +697,21 @@ impl Runner {
         }
     }
 
-    /// Series to report and every source's status.
-    pub fn report(&self, now: Instant) -> (Vec<CustomMetric>, Vec<MetricSourceStatus>) {
+    /// Series to report and every command's status.
+    pub fn report(&self, now: Instant) -> (Vec<CustomMetric>, Vec<MetricCommandStatus>) {
         let mut custom = Vec::new();
         let mut statuses = Vec::new();
         for state in self.states.values() {
             let spec = &state.spec;
-            let (state_name, error) = match state.eligibility {
-                Eligibility::Run => match state.error {
-                    Some(error) => (MetricSourceState::Failing, Some(error)),
-                    None => (MetricSourceState::Active, None),
-                },
-                Eligibility::Disabled => (MetricSourceState::Disabled, None),
-                Eligibility::Refused => (MetricSourceState::Refused, None),
-                Eligibility::PendingApproval => (MetricSourceState::PendingApproval, None),
-            };
-            statuses.push(MetricSourceStatus {
+            statuses.push(MetricCommandStatus {
                 name: spec.name.clone(),
-                origin: spec.origin,
-                state: state_name,
-                command_sha256: Some(spec.command_sha256.clone()),
-                error,
-                interval_secs: (INTERVAL_MIN_SECS..=INTERVAL_MAX_SECS)
-                    .contains(&spec.interval_secs)
-                    .then_some(spec.interval_secs),
+                state: if state.error.is_some() {
+                    MetricCommandState::Failing
+                } else {
+                    MetricCommandState::Active
+                },
+                error: state.error,
             });
-            if state.eligibility != Eligibility::Run {
-                continue;
-            }
             let Some(last) = &state.last else { continue };
             let stale_after =
                 Duration::from_secs(u64::from(spec.interval_secs) * u64::from(STALE_INTERVALS));
@@ -791,73 +720,133 @@ impl Runner {
             }
             for series in &last.series {
                 custom.push(CustomMetric {
-                    source: spec.name.clone(),
                     name: series.name.clone(),
-                    labels: series.labels.clone(),
+                    labels: (!series.labels.is_empty()).then(|| series.labels.clone()),
                     value: series.value,
                     ts: last.ts.clone(),
                 });
             }
         }
         custom.truncate(NODE_METRICS_CUSTOM_MAX);
-        statuses.truncate(NODE_METRICS_SOURCES_MAX);
         (custom, statuses)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mapped_metrics_select_aggregate_scale_and_divide() {
+        use crate::protocol::runtime_spec::{Aggregate, ReaderMapEntry};
+        let entry = |series: &str| ReaderMapEntry {
+            series: series.to_string(),
+            labels: None,
+            aggregate: None,
+            scale: None,
+            divide_by: None,
+        };
+        let mut map = BTreeMap::new();
+        map.insert("gpu_busy".to_string(), entry("/gpus"));
+        map.insert(
+            "mem_used_fraction".to_string(),
+            ReaderMapEntry {
+                divide_by: Some("/mem/total".into()),
+                ..entry("/mem/used")
+            },
+        );
+        map.insert(
+            "first_gpu".to_string(),
+            ReaderMapEntry {
+                aggregate: Some(Aggregate::First),
+                scale: Some(0.5),
+                ..entry("/gpus")
+            },
+        );
+        map.insert("missing".to_string(), entry("/nope"));
+        let output = br#"{"gpus":[10,20,true],"mem":{"used":3,"total":4}}"#;
+        let series = map_output(MetricCommandFormat::Json, &map, output).expect("mapped");
+        let value = |name: &str| series.iter().find(|s| s.name == name).map(|s| s.value);
+        assert_eq!(value("gpu_busy"), Some(31.0));
+        assert_eq!(value("mem_used_fraction"), Some(0.75));
+        assert_eq!(value("first_gpu"), Some(5.0));
+        assert_eq!(value("missing"), None);
+
+        let mut prom = BTreeMap::new();
+        prom.insert(
+            "busy".to_string(),
+            ReaderMapEntry {
+                labels: Some([("gpu".to_string(), "1".to_string())].into()),
+                aggregate: Some(Aggregate::Max),
+                ..entry("dcgm_util")
+            },
+        );
+        let text = b"dcgm_util{gpu=\"0\"} 5\ndcgm_util{gpu=\"1\"} 7\n";
+        let series = map_output(MetricCommandFormat::Prometheus, &prom, text).expect("mapped");
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].value, 7.0);
+        assert!(map_output(MetricCommandFormat::Json, &map, b"not json").is_err());
+        // Inputs are read as printed: free-text labels and any input name.
+        let mut free = BTreeMap::new();
+        free.insert(
+            "h100_util".to_string(),
+            ReaderMapEntry {
+                labels: Some([("model".to_string(), "NVIDIA H100".to_string())].into()),
+                ..entry("dcgm_util")
+            },
+        );
+        free.insert("busy".to_string(), entry("node.busy"));
+        let text = b"dcgm_util{model=\"NVIDIA H100\"} 9\nnode.busy 3\n";
+        let series = map_output(MetricCommandFormat::Prometheus, &free, text).expect("mapped");
+        assert_eq!(series.len(), 2, "{series:?}");
+        let mut bare = BTreeMap::new();
+        bare.insert("util".to_string(), entry("util"));
+        let series = map_output(MetricCommandFormat::Json, &bare, br#"{"util":3}"#).expect("bare");
+        assert_eq!(series[0].value, 3.0);
+    }
+
     use super::*;
 
-    fn remote(name: &str, command: &str) -> RemoteMetricSource {
-        RemoteMetricSource {
+    fn definition(name: &str, command: &str) -> NodeMetricCommand {
+        NodeMetricCommand {
             name: name.to_string(),
             command: command.to_string(),
             interval_secs: 10,
             timeout_secs: 5,
-            format: MetricSourceFormat::Number,
+            format: MetricCommandFormat::Lines,
+            map: None,
         }
-    }
-
-    fn settings(allow_remote: bool) -> RunnerSettings {
-        RunnerSettings {
-            allow_remote,
-            config_path: None,
-        }
-    }
-
-    fn state_of(runner: &Runner, name: &str) -> MetricSourceStatus {
-        runner
-            .report(Instant::now())
-            .1
-            .into_iter()
-            .find(|status| status.name == name)
-            .expect("status")
     }
 
     #[test]
-    fn number_format_uses_the_source_name() {
-        let parsed = parse_output(MetricSourceFormat::Number, "fan_rpm", b" 1200.5\n").expect("ok");
+    fn lines_format_names_a_bare_number_after_the_command() {
+        let parsed = parse_output(MetricCommandFormat::Lines, "fan_rpm", b" 1200.5\n").expect("ok");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "fan_rpm");
         assert_eq!(parsed[0].value, 1200.5);
-        for bad in [&b"NaN"[..], b"inf", b"hot", b"", b"1 2"] {
+        let named = parse_output(
+            MetricCommandFormat::Lines,
+            "fans",
+            b"# fans\nfan0 1200\nfan1 900.5\nbad line here\nnode.cpu 3\n",
+        )
+        .expect("ok");
+        let names = named.iter().map(|s| s.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, ["fan0", "fan1"]);
+        for bad in [&b"NaN"[..], b"inf", b"hot", b"", b"1 2 3"] {
             assert_eq!(
-                parse_output(MetricSourceFormat::Number, "fan_rpm", bad),
-                Err(MetricSourceError::Parse),
+                parse_output(MetricCommandFormat::Lines, "fan_rpm", bad),
+                Err(MetricCommandError::Parse),
                 "{bad:?}"
             );
         }
         assert_eq!(
-            parse_output(MetricSourceFormat::Number, "x", &[0xff, 0xfe]),
-            Err(MetricSourceError::Parse)
+            parse_output(MetricCommandFormat::Lines, "x", &[0xff, 0xfe]),
+            Err(MetricCommandError::Parse)
         );
     }
 
     #[test]
     fn json_format_keeps_valid_numeric_entries() {
         let parsed = parse_output(
-            MetricSourceFormat::Json,
+            MetricCommandFormat::Json,
             "src",
             br#"{"queue.depth": 3, "bad name": 1, "text": "7", "node.cpu": 5, "ok": 1e3}"#,
         )
@@ -865,12 +854,8 @@ mod tests {
         let names = parsed.iter().map(|s| s.name.as_str()).collect::<Vec<_>>();
         assert_eq!(names, ["ok", "queue.depth"]);
         assert_eq!(
-            parse_output(MetricSourceFormat::Json, "src", b"[1,2]"),
-            Err(MetricSourceError::Parse)
-        );
-        assert_eq!(
-            parse_output(MetricSourceFormat::Json, "src", br#"{"a": "x"}"#),
-            Err(MetricSourceError::Parse)
+            parse_output(MetricCommandFormat::Json, "src", b"[1,2]"),
+            Err(MetricCommandError::Parse)
         );
     }
 
@@ -881,40 +866,42 @@ mod tests {
 gpu_temp{gpu="0"} 71
 gpu_temp{gpu="1",slot="a"} 64.5 1700000000000
 up 1
-bad{gpu="has space"} 2
+spaced{gpu="NVIDIA H100"} 2
+bad{gpu="line\nbreak"} 2
 nan_metric NaN
 inf_metric +Inf
 endpoint.running 3
+runtime.running 3
 weird{gpu="0"} 1 notatimestamp
 escaped{v="a\"b"} 1
 "#;
         let parsed =
-            parse_output(MetricSourceFormat::Prometheus, "src", text.as_bytes()).expect("ok");
-        assert_eq!(parsed.len(), 3);
+            parse_output(MetricCommandFormat::Prometheus, "src", text.as_bytes()).expect("ok");
+        assert_eq!(parsed.len(), 5, "{parsed:?}");
         assert_eq!(parsed[0].name, "gpu_temp");
         assert_eq!(parsed[0].labels.get("gpu").map(String::as_str), Some("0"));
         assert_eq!(parsed[1].labels.len(), 2);
         assert_eq!(parsed[1].value, 64.5);
         assert_eq!(parsed[2].name, "up");
+        // Label values are free text without control characters.
+        assert_eq!(
+            parsed[3].labels.get("gpu").map(String::as_str),
+            Some("NVIDIA H100")
+        );
+        assert_eq!(parsed[4].name, "escaped");
     }
 
     #[test]
-    fn a_reserved_label_key_drops_the_series_in_every_format() {
-        // `__proto__` matches the name pattern but the server would drop it
-        // silently, so the series never leaves the machine.
+    fn a_reserved_label_key_drops_the_series() {
         let prometheus = "bad{__proto__=\"x\"} 1\ngood{proto=\"x\"} 2\n";
-        let parsed =
-            parse_output(MetricSourceFormat::Prometheus, "src", prometheus.as_bytes()).expect("ok");
+        let parsed = parse_output(
+            MetricCommandFormat::Prometheus,
+            "src",
+            prometheus.as_bytes(),
+        )
+        .expect("ok");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "good");
-        assert_eq!(
-            parse_output(
-                MetricSourceFormat::Prometheus,
-                "src",
-                b"bad{__proto__=\"x\"} 1\n"
-            ),
-            Err(MetricSourceError::Parse)
-        );
         let labels = |key: &str| [(key.to_string(), "v".to_string())].into_iter().collect();
         assert!(series("s", labels("__proto__"), 1.0).is_none());
         assert!(series("s", labels("_proto__"), 1.0).is_some());
@@ -927,29 +914,42 @@ escaped{v="a\"b"} 1
             text.push_str(&format!("m{index} {index}\n"));
         }
         let parsed =
-            parse_output(MetricSourceFormat::Prometheus, "src", text.as_bytes()).expect("ok");
-        assert_eq!(parsed.len(), NODE_METRICS_CUSTOM_MAX);
+            parse_output(MetricCommandFormat::Prometheus, "src", text.as_bytes()).expect("ok");
+        assert_eq!(parsed.len(), NODE_METRIC_COMMAND_VALUES_MAX);
         let labels = (0..17)
             .map(|index| format!("l{index}=\"v\""))
             .collect::<Vec<_>>()
             .join(",");
         assert_eq!(
             parse_output(
-                MetricSourceFormat::Prometheus,
+                MetricCommandFormat::Prometheus,
                 "src",
                 format!("many{{{labels}}} 1\n").as_bytes()
             ),
-            Err(MetricSourceError::Parse)
+            Err(MetricCommandError::Parse)
         );
-        let long = "x".repeat(65);
+    }
+
+    #[test]
+    fn invalid_definitions_never_run_and_names_are_unique() {
+        let mut fast = definition("fast", "echo 1");
+        fast.interval_secs = 2;
+        let mut runner = Runner::new();
+        runner.set_commands(&[
+            definition("fans", "echo 1"),
+            definition("fans", "echo 2"),
+            fast,
+            definition("bad name", "echo 1"),
+        ]);
+        let (_, statuses) = runner.report(Instant::now());
         assert_eq!(
-            parse_output(
-                MetricSourceFormat::Prometheus,
-                "src",
-                format!("{long} 1\n").as_bytes()
-            ),
-            Err(MetricSourceError::Parse)
+            statuses
+                .iter()
+                .map(|status| status.name.as_str())
+                .collect::<Vec<_>>(),
+            ["fans"]
         );
+        assert_eq!(statuses[0].state, MetricCommandState::Active);
     }
 
     #[cfg(unix)]
@@ -966,7 +966,7 @@ escaped{v="a\"b"} 1
         assert!(!text.contains("super-secret-stderr"));
         assert_eq!(
             run_command("exit 3", Duration::from_secs(5), None),
-            Err(MetricSourceError::ExitStatus)
+            Err(MetricCommandError::ExitStatus)
         );
     }
 
@@ -975,183 +975,26 @@ escaped{v="a\"b"} 1
     fn oversized_output_is_dropped() {
         assert_eq!(
             run_command("head -c 70000 /dev/zero", Duration::from_secs(5), None),
-            Err(MetricSourceError::OutputTooLarge)
+            Err(MetricCommandError::OutputTooLarge)
         );
-        // An endless writer is stopped at the limit, not at the timeout.
         let started = Instant::now();
         assert_eq!(
             run_command("yes 1", Duration::from_secs(20), None),
-            Err(MetricSourceError::OutputTooLarge)
-        );
-        assert!(started.elapsed() < Duration::from_secs(10));
-        // A command that keeps running after printing too much is stopped as
-        // soon as the limit is crossed, not at its timeout.
-        let started = Instant::now();
-        assert_eq!(
-            run_command(
-                "head -c 70000 /dev/zero; sleep 30",
-                Duration::from_secs(20),
-                None
-            ),
-            Err(MetricSourceError::OutputTooLarge)
+            Err(MetricCommandError::OutputTooLarge)
         );
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[cfg(unix)]
-    #[test]
-    fn timeout_kills_the_whole_process_group() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let pid_file = dir.path().join("bg.pid");
-        let command = format!("sleep 30 & echo $! > '{}'; sleep 30", pid_file.display());
-        let started = Instant::now();
-        assert_eq!(
-            run_command(&command, Duration::from_secs(1), None),
-            Err(MetricSourceError::Timeout)
-        );
-        assert!(started.elapsed() < Duration::from_secs(5));
-        let pid: i32 = std::fs::read_to_string(&pid_file)
-            .expect("pid file")
-            .trim()
-            .parse()
-            .expect("pid");
-        // The background sleep was in the group: it is gone (or a zombie
-        // reaped by init shortly).
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
-                && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                    .map(|stat| stat.contains(") Z "))
-                    .unwrap_or(false);
-            if !alive {
-                break;
-            }
-            assert!(Instant::now() < deadline, "background child survived");
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    #[test]
-    fn remote_sources_need_opt_in_and_the_exact_approved_hash() {
-        let sources = vec![remote("fans", "echo 1")];
-        let refused =
-            Runner::with_inputs(settings(false), MetricsConfig::default(), sources.clone());
-        assert_eq!(state_of(&refused, "fans").state, MetricSourceState::Refused);
-
-        let mut runner =
-            Runner::with_inputs(settings(true), MetricsConfig::default(), sources.clone());
-        let pending = state_of(&runner, "fans");
-        assert_eq!(pending.state, MetricSourceState::PendingApproval);
-        assert_eq!(
-            pending.command_sha256.as_deref(),
-            Some(sha256_hex(b"echo 1").as_str())
-        );
-        assert_eq!(pending.interval_secs, Some(10));
-        runner.tick(Instant::now());
-        assert!(runner.attempts.is_empty(), "a pending source never runs");
-
-        let mut approved = MetricsConfig::default();
-        approved
-            .approved_remote_sources
-            .insert("fans".to_string(), sha256_hex(b"echo 1"));
-        runner.set_metrics_config(approved);
-        assert_eq!(state_of(&runner, "fans").state, MetricSourceState::Active);
-
-        runner.set_remote(vec![remote("fans", "echo 2")]);
-        assert_eq!(
-            state_of(&runner, "fans").state,
-            MetricSourceState::PendingApproval,
-            "a changed command needs a new approval"
-        );
-    }
-
-    #[test]
-    fn a_local_source_shadows_a_remote_one_and_invalid_locals_are_disabled() {
-        let mut metrics = MetricsConfig::default();
-        metrics.sources.insert(
-            "fans".to_string(),
-            MetricSourceConfig {
-                command: "echo 1".to_string(),
-                interval_secs: 10,
-                timeout_secs: 5,
-                format: MetricSourceFormat::Number,
-            },
-        );
-        metrics.sources.insert(
-            "fast".to_string(),
-            MetricSourceConfig {
-                command: "echo 1".to_string(),
-                interval_secs: 2,
-                timeout_secs: 5,
-                format: MetricSourceFormat::Number,
-            },
-        );
-        metrics
-            .approved_remote_sources
-            .insert("fans".to_string(), sha256_hex(b"echo remote"));
-        let runner =
-            Runner::with_inputs(settings(true), metrics, vec![remote("fans", "echo remote")]);
-        let (_, statuses) = runner.report(Instant::now());
-        let local = statuses
-            .iter()
-            .find(|s| s.name == "fans" && s.origin == MetricSourceOrigin::Local)
-            .expect("local");
-        let remote_status = statuses
-            .iter()
-            .find(|s| s.name == "fans" && s.origin == MetricSourceOrigin::Remote)
-            .expect("remote");
-        assert_eq!(local.state, MetricSourceState::Active);
-        assert_eq!(remote_status.state, MetricSourceState::Refused);
-        let fast = statuses.iter().find(|s| s.name == "fast").expect("fast");
-        assert_eq!(fast.state, MetricSourceState::Disabled);
-        assert_eq!(fast.interval_secs, None);
+    fn is_alive(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+            && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|stat| stat.contains(") Z "))
+                .unwrap_or(false)
     }
 
     #[cfg(unix)]
-    #[test]
-    fn runner_reports_values_of_active_sources() {
-        let mut metrics = MetricsConfig::default();
-        metrics.sources.insert(
-            "temp".to_string(),
-            MetricSourceConfig {
-                command: "echo 71".to_string(),
-                interval_secs: 10,
-                timeout_secs: 5,
-                format: MetricSourceFormat::Number,
-            },
-        );
-        let mut runner = Runner::with_inputs(settings(false), metrics, Vec::new());
-        runner.take_changed();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            runner.tick(Instant::now());
-            let (custom, _) = runner.report(Instant::now());
-            if let Some(metric) = custom.first() {
-                assert_eq!(metric.source, "temp");
-                assert_eq!(metric.name, "temp");
-                assert_eq!(metric.value, 71.0);
-                assert!(runner.take_changed());
-                break;
-            }
-            assert!(Instant::now() < deadline, "no value reported");
-            thread::sleep(Duration::from_millis(20));
-        }
-        // Stale after 3 intervals.
-        let (custom, _) = runner.report(Instant::now() + Duration::from_secs(31));
-        assert!(custom.is_empty());
-    }
-
-    #[cfg(unix)]
-    fn approved_remote(command: &str) -> (MetricsConfig, RemoteMetricSource) {
-        let mut metrics = MetricsConfig::default();
-        metrics
-            .approved_remote_sources
-            .insert("slow".to_string(), sha256_hex(command.as_bytes()));
-        (metrics, remote("slow", command))
-    }
-
-    #[cfg(unix)]
-    fn wait_for_pid(pid_file: &Path) -> i32 {
+    fn wait_for_pid(pid_file: &std::path::Path) -> i32 {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(pid) = std::fs::read_to_string(pid_file)
@@ -1166,49 +1009,77 @@ escaped{v="a\"b"} 1
     }
 
     #[cfg(unix)]
-    fn is_alive(pid: i32) -> bool {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
-            && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                .map(|stat| stat.contains(") Z "))
-                .unwrap_or(false)
+    #[test]
+    fn timeout_kills_the_whole_process_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("bg.pid");
+        let command = format!("sleep 30 & echo $! > '{}'; sleep 30", pid_file.display());
+        let started = Instant::now();
+        assert_eq!(
+            run_command(&command, Duration::from_secs(1), None),
+            Err(MetricCommandError::Timeout)
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = wait_for_pid(&pid_file);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while is_alive(pid) {
+            assert!(Instant::now() < deadline, "background child survived");
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
-    /// Any change that removes a run's authority ends the run in flight at
-    /// once: a changed command, a withdrawal, a revoked approval. An
-    /// unchanged rebuild leaves it alone.
     #[cfg(unix)]
     #[test]
-    fn a_run_in_flight_ends_when_its_authority_changes() {
+    fn runner_reports_values_and_drops_stale_ones() {
+        let mut runner = Runner::new();
+        runner.set_commands(&[definition("temp", "echo 71")]);
+        runner.take_changed();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            runner.tick(Instant::now());
+            let (custom, _) = runner.report(Instant::now());
+            if let Some(metric) = custom.first() {
+                assert_eq!(metric.name, "temp");
+                assert_eq!(metric.value, 71.0);
+                assert!(runner.take_changed());
+                break;
+            }
+            assert!(Instant::now() < deadline, "no value reported");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let (custom, _) = runner.report(Instant::now() + Duration::from_secs(31));
+        assert!(custom.is_empty());
+    }
+
+    /// A changed or withdrawn definition ends the run in flight at once; an
+    /// unchanged one leaves it alone; dropping the runner ends it too.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_in_flight_ends_when_its_definition_changes() {
         #[derive(Clone, Copy, Debug)]
         enum Change {
             Command,
             Withdraw,
-            Revoke,
             Unchanged,
         }
-        for change in [
-            Change::Command,
-            Change::Withdraw,
-            Change::Revoke,
-            Change::Unchanged,
-        ] {
+        for change in [Change::Command, Change::Withdraw, Change::Unchanged] {
             let dir = tempfile::tempdir().expect("tempdir");
             let pid_file = dir.path().join("run.pid");
             let command = format!("echo $$ > '{}'; sleep 60 & wait", pid_file.display());
-            let (metrics, definition) = approved_remote(&command);
-            let mut runner = Runner::with_inputs(settings(true), metrics.clone(), vec![definition]);
+            let mut slow = definition("slow", &command);
+            slow.timeout_secs = 60;
+            let mut runner = Runner::new();
+            runner.set_commands(std::slice::from_ref(&slow));
             runner.tick(Instant::now());
             let pid = wait_for_pid(&pid_file);
             match change {
                 Change::Command => {
-                    runner.set_remote(vec![remote("slow", &format!("{command}; echo 2"))]);
+                    let mut changed = slow.clone();
+                    changed.command = format!("{command}; echo 2");
+                    runner.set_commands(&[changed]);
                 }
-                Change::Withdraw => runner.set_remote(Vec::new()),
-                Change::Revoke => runner.set_metrics_config(MetricsConfig::default()),
-                Change::Unchanged => {
-                    runner.set_remote(vec![remote("slow", &command)]);
-                    runner.set_metrics_config(metrics);
-                }
+                Change::Withdraw => runner.set_commands(&[]),
+                Change::Unchanged => runner.set_commands(std::slice::from_ref(&slow)),
             }
             let deadline = Instant::now() + Duration::from_secs(3);
             let survived = loop {
@@ -1221,9 +1092,7 @@ escaped{v="a\"b"} 1
                 thread::sleep(Duration::from_millis(50));
             };
             match change {
-                Change::Unchanged => {
-                    assert!(survived, "{change:?}: an unchanged source was killed")
-                }
+                Change::Unchanged => assert!(survived, "{change:?}: an unchanged run was killed"),
                 _ => assert!(!survived, "{change:?}: the old command kept running"),
             }
             drop(runner);
@@ -1238,203 +1107,17 @@ escaped{v="a\"b"} 1
         }
     }
 
-    /// A run whose report never arrives is given up after its bound: the
-    /// attempt is forgotten, its run is cancelled, and the source runs
-    /// again instead of staying blocked forever.
-    #[cfg(unix)]
-    #[test]
-    fn a_lost_report_is_given_up_and_the_source_runs_again() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let pid_file = dir.path().join("runs.pid");
-        // Exits by itself after 1 s; its 5 s timeout never matters.
-        let command = format!("echo $$ >> '{}'; sleep 1", pid_file.display());
-        let (metrics, definition) = approved_remote(&command);
-        let mut runner = Runner::with_inputs(settings(true), metrics, vec![definition]);
-        let started = Instant::now();
-        runner.tick(started);
-        let _ = wait_for_pid(&pid_file);
-        let (old_id, old_cancel) = runner
-            .attempts
-            .iter()
-            .next()
-            .map(|(id, attempt)| (*id, Arc::clone(&attempt.cancel)))
-            .expect("an attempt");
-        // The report is lost: take it off the channel before the runner sees it.
-        runner
-            .results_rx
-            .recv_timeout(Duration::from_secs(15))
-            .expect("the run reports");
-        // Before the bound the attempt is still owned (nothing restarts).
-        runner.tick(started + Duration::from_secs(12));
-        assert!(runner.attempts.contains_key(&old_id));
-        assert!(!old_cancel.load(Ordering::SeqCst));
-        // Past timeout (5) + reap grace (1) + slack (10): forgotten and cancelled,
-        // and the source (due again) starts a new run.
-        runner.tick(started + Duration::from_secs(17));
-        assert!(
-            old_cancel.load(Ordering::SeqCst),
-            "the lost run was not cancelled"
-        );
-        assert!(
-            !runner.attempts.contains_key(&old_id),
-            "the lost attempt was kept"
-        );
-        assert_eq!(runner.attempts.len(), 1, "the source did not run again");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while std::fs::read_to_string(&pid_file)
-            .unwrap_or_default()
-            .lines()
-            .count()
-            < 2
-        {
-            assert!(Instant::now() < deadline, "the new run never started");
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    /// A cancelled run reports late. It must neither start alongside the
-    /// re-added source's new run, nor strip that run's cancel handle (so a
-    /// later withdrawal still ends it).
-    #[cfg(unix)]
-    #[test]
-    fn a_dying_run_neither_overlaps_nor_disarms_its_successor() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let pid_file = dir.path().join("runs.pid");
-        let command = format!("echo $$ >> '{}'; sleep 60 & wait", pid_file.display());
-        let (metrics, definition) = approved_remote(&command);
-        let mut runner = Runner::with_inputs(settings(true), metrics, vec![definition.clone()]);
-        runner.tick(Instant::now());
-        let pids = |count: usize| -> Vec<i32> {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                let pids: Vec<i32> = std::fs::read_to_string(&pid_file)
-                    .unwrap_or_default()
-                    .lines()
-                    .filter_map(|line| line.trim().parse().ok())
-                    .collect();
-                if pids.len() >= count {
-                    return pids;
-                }
-                assert!(Instant::now() < deadline, "run {count} never started");
-                thread::sleep(Duration::from_millis(20));
-            }
-        };
-        let first = pids(1)[0];
-        // Withdrawn and re-added before the cancelled run has reported.
-        runner.set_remote(Vec::new());
-        runner.set_remote(vec![definition]);
-        runner.tick(Instant::now());
-        assert_eq!(
-            runner.attempts.len(),
-            1,
-            "a new run started while the old one was still unreported"
-        );
-        // Tick until the old run has reported and the new one is running.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while runner.attempts.len() != 1
-            || !runner
-                .attempts
-                .values()
-                .all(|attempt| attempt.key.1 == "slow")
-            || std::fs::read_to_string(&pid_file)
-                .unwrap_or_default()
-                .lines()
-                .count()
-                < 2
-        {
-            assert!(Instant::now() < deadline, "the re-added source never ran");
-            runner.tick(Instant::now());
-            thread::sleep(Duration::from_millis(20));
-        }
-        let second = pids(2)[1];
-        assert!(!is_alive(first), "the cancelled run is still running");
-        assert!(is_alive(second));
-        // The old run's `Cancelled` report was drained by those ticks: it must
-        // not have been applied to the successor (attempt id check).
-        let successor = runner.states.values().next().expect("the re-added source");
-        assert!(
-            successor.error.is_none(),
-            "a stale report failed the successor"
-        );
-        assert!(
-            successor.attempt.is_some(),
-            "a stale report cleared the successor's run"
-        );
-        // The old run's report must not have disarmed the new run: a later
-        // withdrawal still ends it.
-        runner.set_remote(Vec::new());
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while is_alive(second) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(!is_alive(second), "the successor survived its withdrawal");
-    }
-
-    /// The session ended (the runner is dropped): a run in flight is killed
-    /// with its process group at once, not left to run out its timeout.
-    #[cfg(unix)]
-    #[test]
-    fn dropping_the_runner_kills_runs_in_flight() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let pid_file = dir.path().join("run.pid");
-        let mut metrics = MetricsConfig::default();
-        metrics.sources.insert(
-            "slow".to_string(),
-            MetricSourceConfig {
-                command: format!("echo $$ > '{}'; sleep 60 & wait", pid_file.display()),
-                interval_secs: 10,
-                timeout_secs: 60,
-                format: MetricSourceFormat::Number,
-            },
-        );
-        let mut runner = Runner::with_inputs(settings(false), metrics, Vec::new());
-        runner.tick(Instant::now());
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let pid: i32 = loop {
-            if let Some(pid) = std::fs::read_to_string(&pid_file)
-                .ok()
-                .and_then(|text| text.trim().parse().ok())
-            {
-                break pid;
-            }
-            assert!(Instant::now() < deadline, "the command never started");
-            thread::sleep(Duration::from_millis(20));
-        };
-        drop(runner);
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
-                && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                    .map(|stat| stat.contains(") Z "))
-                    .unwrap_or(false);
-            if !alive {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "a run outlived its dropped runner"
-            );
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
-
     #[cfg(unix)]
     #[test]
     fn a_failed_run_drops_the_previous_values() {
         let dir = tempfile::tempdir().expect("tempdir");
         let flag = dir.path().join("ok");
         std::fs::write(&flag, "").expect("flag");
-        let mut metrics = MetricsConfig::default();
-        metrics.sources.insert(
-            "flaky".to_string(),
-            MetricSourceConfig {
-                command: format!("test -f '{}' && echo 5 || exit 3", flag.display()),
-                interval_secs: 10,
-                timeout_secs: 5,
-                format: MetricSourceFormat::Number,
-            },
-        );
-        let mut runner = Runner::with_inputs(settings(false), metrics, Vec::new());
+        let mut runner = Runner::new();
+        runner.set_commands(&[definition(
+            "flaky",
+            &format!("test -f '{}' && echo 5 || exit 3", flag.display()),
+        )]);
         let deadline = Instant::now() + Duration::from_secs(10);
         while runner.report(Instant::now()).0.is_empty() {
             runner.tick(Instant::now());
@@ -1448,32 +1131,13 @@ escaped{v="a\"b"} 1
         loop {
             runner.tick(Instant::now());
             let (custom, statuses) = runner.report(Instant::now());
-            if statuses[0].state == MetricSourceState::Failing {
-                assert!(
-                    custom.is_empty(),
-                    "values of the last good run are not reported"
-                );
-                assert_eq!(statuses[0].error, Some(MetricSourceError::ExitStatus));
+            if statuses[0].state == MetricCommandState::Failing {
+                assert!(custom.is_empty());
+                assert_eq!(statuses[0].error, Some(MetricCommandError::ExitStatus));
                 break;
             }
             assert!(Instant::now() < deadline, "the failed run was not observed");
             thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    #[test]
-    fn remote_sources_file_round_trips() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("state").join(REMOTE_SOURCES_FILE);
-        assert!(load_remote_sources_from(&path).expect("missing").is_empty());
-        save_remote_sources_to(&path, &[remote("fans", "echo 1")]).expect("save");
-        let loaded = load_remote_sources_from(&path).expect("load");
-        assert_eq!(loaded, vec![remote("fans", "echo 1")]);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
         }
     }
 }

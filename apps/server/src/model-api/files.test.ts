@@ -5,18 +5,19 @@ import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // files.ts imports ./routes.ts (for the default bearer-auth seam), which pulls
-// in db/env/token-access at load. Mock those so the suite never runs real env
-// validation or hits a database. Every test injects `authenticate` + `prisma`
+// in db/env/API-key resolution at load. Mock those so the suite never runs real
+// env validation or hits a database. Every test injects `authenticate` + `prisma`
 // through the handler deps, so these mocks only need to satisfy module load.
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: { BETTER_AUTH_SECRET: "test-better-auth-secret-value-32chars!" },
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: {} }));
-vi.mock("@ws-model-proxy/api/lib/model-api-token-access", () => ({
-  authenticateModelApiTokenSecret: vi.fn(),
-  listVisibleModelTargetsForUser: vi.fn(),
-  listVisibleModelTargetsForToken: vi.fn(),
-  listVisibleModelTargetsWithExternalPermissionForToken: vi.fn(),
+vi.mock("./resolve.js", () => ({
+  authenticateApiKey: vi.fn(),
+  listCallableTargetsForUser: vi.fn(),
+  listCallableTargetsForApiKey: vi.fn(),
+  poolRoutes: vi.fn(),
+  testRoutes: vi.fn(),
 }));
 
 const { createModelApiFileUploadHandler, createModelApiFileGetHandler } = await import(
@@ -175,7 +176,9 @@ describe("POST /v1/files (upload)", () => {
     expect(body.url_expires_at).toBe(Math.floor((NOW + 10 * 60 * 1000) / 1000));
     expect(body.url_expires_at).toBeLessThan(body.expires_at);
     // The bytes actually landed under the asset id.
-    expect(await new LocalMediaStore(root).getStream(body.id)).not.toBeNull();
+    const object = await new LocalMediaStore(root).getStream(body.id);
+    expect(object).not.toBeNull();
+    object?.stream.destroy();
   });
 
   it("uses the configured admin cap when it is lower than the deployment ceiling", async () => {

@@ -5,11 +5,11 @@ import { describe, expect, it } from "vitest";
 /**
  * PRODUCTION WIRING GUARD: index.ts is the boot module (it starts timers and
  * listens), so its wiring object is not importable in a unit test. The relay
- * maintenance stop flushes the agent audit queue only when index.ts passes the
- * real writer (see relay-maintenance.ts and relay/cli-agent-audit.ts); without
- * that line the queue is dropped at shutdown. The maintenance unit tests inject
- * their own fake `stopCliAgentAudit`, so only this guard pins the production
- * object. Mutating the wiring out of index.ts fails here.
+ * maintenance stop flushes the node audit queue and the telemetry rollups only
+ * when index.ts passes the real writers (see relay-maintenance.ts and
+ * relay/node-audit.ts); without those lines the queues are dropped at shutdown.
+ * The maintenance unit tests inject their own fakes, so only this guard pins the
+ * production object.
  */
 const source = readFileSync(fileURLToPath(new URL("./index.ts", import.meta.url)), "utf8");
 
@@ -21,31 +21,24 @@ function maintenanceOptions(): string {
 }
 
 describe("index.ts relay maintenance wiring", () => {
-  it("imports the agent audit stop from its module", () => {
+  it("imports the node audit stop and flush from their module", () => {
     expect(source).toMatch(
-      /import \{ flushCliAgentAudit, stopCliAgentAuditWriter \} from "\.\/relay\/cli-agent-audit\.js";/,
+      /import \{ flushNodeAudit, stopNodeAuditWriter \} from "\.\/relay\/node-audit\.js";/,
     );
   });
 
-  it("passes the real audit writer stop to relay maintenance", () => {
-    // Property value must be the imported writer, not an inline no-op.
-    expect(maintenanceOptions()).toMatch(/stopCliAgentAudit:\s*stopCliAgentAuditWriter\b/);
+  it("passes the real audit writer stop and the rollup flushes to relay maintenance", () => {
+    const options = maintenanceOptions();
+    expect(options).toMatch(/stopNodeAudit:\s*stopNodeAuditWriter\b/);
+    expect(options).toMatch(
+      /flushRollups:\s*\[\s*flushRuntimeLoadRollup,\s*flushNodeMetricsRollup\s*\]/,
+    );
+    expect(options).toMatch(/\bsweepExpiredNodeCommands\b/);
+    expect(options).toMatch(/\bsweepExpiredFileOps\b/);
   });
 
   it("passes the real audit flush to the shutdown, after the relay close", () => {
-    expect(source).toMatch(
-      /installServerShutdown\(\{[\s\S]*?flushAgentAudit:\s*flushCliAgentAudit\b/,
-    );
-  });
-
-  it("wires the deployment operator audit stop and flush", () => {
-    expect(source).toMatch(
-      /import \{\s*flushDeploymentOperatorAudit,\s*stopDeploymentOperatorAuditWriter,\s*\} from "\.\/deployments\/operator-audit\.js";/,
-    );
-    expect(maintenanceOptions()).toMatch(
-      /stopDeploymentOperatorAudit:\s*stopDeploymentOperatorAuditWriter\b/,
-    );
-    expect(source).toMatch(/installServerShutdown\(\{[\s\S]*?\bflushDeploymentOperatorAudit\b/);
+    expect(source).toMatch(/installServerShutdown\(\{[\s\S]*?flushAgentAudit:\s*flushNodeAudit\b/);
   });
 
   it("keeps the relay maintenance stop in the shutdown periodic-job list", () => {

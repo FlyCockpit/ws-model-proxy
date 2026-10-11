@@ -1,0 +1,9 @@
+{
+  "type": "file.op",
+  "opId": "aI2y1_whRmuQtdr_JElukw",
+  "op": "read",
+  "args": {
+    "path": "/home/me/models/config.json",
+    "maxLines": 200
+  }
+}

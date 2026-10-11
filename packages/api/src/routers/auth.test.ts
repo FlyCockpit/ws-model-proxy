@@ -34,8 +34,10 @@ function buildContext(
     session: Partial<Session["session"]>;
   }> | null,
 ): Context {
-  if (sessionOverride === null) return { session: null };
+  if (sessionOverride === null) return { session: null, auth: { kind: "anonymous" } };
+  const userId = sessionOverride?.user?.id ?? "test-user-id";
   return {
+    auth: { kind: "cookie_session", userId, sessionId: "test-session-id", csrfVerified: true },
     session: {
       user: {
         id: "test-user-id",

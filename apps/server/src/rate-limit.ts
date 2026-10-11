@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import type { DeviceCodeExchangeLimit } from "@ws-model-proxy/api/context";
 import type { Session } from "@ws-model-proxy/auth";
 import { env } from "@ws-model-proxy/env/server";
 import type { Context, Next } from "hono";
@@ -24,6 +23,40 @@ export type RateLimiter = Pick<RateLimiterMemory, "consume" | "points">;
 // ---------------------------------------------------------------------------
 
 /**
+ * Built-in limits. Durations are seconds. Operators tune only the budget, with
+ * `WMP_RATE_LIMIT_SCALE`: every `points` value goes through `scaledPoints`,
+ * while windows and block durations stay fixed.
+ */
+export const DEFAULTS = {
+  rpc: { points: 100, duration: 60 },
+  auth: { points: 10, duration: 60, blockDuration: 15 * 60 },
+  signinFailure: { points: 10, duration: 15 * 60, blockDuration: 10 * 60 },
+  signup: { points: 3, duration: 60 * 60, blockDuration: 60 * 60 },
+  emailRecipient: { points: 3, duration: 60 * 60, blockDuration: 0 },
+  signupRecipient: { points: 6, duration: 60 * 60, blockDuration: 0 },
+  mcp: { points: 120, duration: 60 },
+  mcpConsent: { points: 30, duration: 60 },
+  mcpRegistration: { points: 60, duration: 60 * 60 },
+  enrollmentExchangeIp: { points: 10, duration: 15 * 60 },
+  enrollmentExchangeUser: { points: 20, duration: 60 * 60 },
+  /** Public invite lookups (`auth.inviteInfo`), per client IP: like sign-in. */
+  inviteInfo: { points: 10, duration: 60, blockDuration: 15 * 60 },
+  /**
+   * Relay websocket upgrades (`/api/cli/ws`) that fail before a node is known (no or bad
+   * credential, unsupported subprotocol), per client IP. Only failures spend it, so honest
+   * nodes behind one NAT never share this budget, however many connect at once.
+   */
+  relayUpgradeIp: { points: 30, duration: 60, blockDuration: 5 * 60 },
+  /** Authenticated relay upgrades, per node: bounds one node's reconnect storm. */
+  relayUpgradeNode: { points: 10, duration: 60, blockDuration: 5 * 60 },
+} as const;
+
+/** A built-in points budget times `WMP_RATE_LIMIT_SCALE`, rounded, never below 1. */
+export function scaledPoints(points: number): number {
+  return Math.max(1, Math.round(points * env.WMP_RATE_LIMIT_SCALE));
+}
+
+/**
  * Auth limiter — strict, applied to /api/auth/* to defend against
  * credential-stuffing and account-enumeration attacks.
  *
@@ -31,9 +64,9 @@ export type RateLimiter = Pick<RateLimiterMemory, "consume" | "points">;
  */
 export const authLimiter = new RateLimiterMemory({
   keyPrefix: "rl:auth",
-  points: env.RATE_LIMIT_AUTH_POINTS,
-  duration: env.RATE_LIMIT_AUTH_DURATION,
-  blockDuration: env.RATE_LIMIT_AUTH_BLOCK_DURATION,
+  points: scaledPoints(DEFAULTS.auth.points),
+  duration: DEFAULTS.auth.duration,
+  blockDuration: DEFAULTS.auth.blockDuration,
 });
 
 /**
@@ -46,12 +79,9 @@ export const authLimiter = new RateLimiterMemory({
  */
 export const signinFailureLimiter = new RateLimiterMemory({
   keyPrefix: "rl:signin-fail",
-  // `env` validates these defaults in real processes. Keep the same concrete
-  // defaults here as a defensive construction boundary for focused test
-  // module mocks that predate this limiter and omit the new optional fields.
-  points: env.RATE_LIMIT_SIGNIN_FAILURE_POINTS ?? 10,
-  duration: env.RATE_LIMIT_SIGNIN_FAILURE_DURATION ?? 15 * 60,
-  blockDuration: env.RATE_LIMIT_SIGNIN_FAILURE_BLOCK_DURATION ?? 10 * 60,
+  points: scaledPoints(DEFAULTS.signinFailure.points),
+  duration: DEFAULTS.signinFailure.duration,
+  blockDuration: DEFAULTS.signinFailure.blockDuration,
 });
 
 /**
@@ -62,8 +92,8 @@ export const signinFailureLimiter = new RateLimiterMemory({
  */
 export const mcpClientRegistrationLimiter = new RateLimiterMemory({
   keyPrefix: "rl:mcp-registration",
-  points: env.RATE_LIMIT_MCP_REGISTRATION_POINTS ?? 60,
-  duration: env.RATE_LIMIT_MCP_REGISTRATION_DURATION ?? 60 * 60,
+  points: scaledPoints(DEFAULTS.mcpRegistration.points),
+  duration: DEFAULTS.mcpRegistration.duration,
 });
 
 /**
@@ -75,9 +105,9 @@ export const mcpClientRegistrationLimiter = new RateLimiterMemory({
  */
 export const signupLimiter = new RateLimiterMemory({
   keyPrefix: "rl:signup",
-  points: env.RATE_LIMIT_SIGNUP_POINTS,
-  duration: env.RATE_LIMIT_SIGNUP_DURATION,
-  blockDuration: env.RATE_LIMIT_SIGNUP_BLOCK_DURATION,
+  points: scaledPoints(DEFAULTS.signup.points),
+  duration: DEFAULTS.signup.duration,
+  blockDuration: DEFAULTS.signup.blockDuration,
 });
 
 /**
@@ -87,8 +117,8 @@ export const signupLimiter = new RateLimiterMemory({
  */
 export const rpcLimiter = new RateLimiterMemory({
   keyPrefix: "rl:rpc",
-  points: env.RATE_LIMIT_RPC_POINTS,
-  duration: env.RATE_LIMIT_RPC_DURATION,
+  points: scaledPoints(DEFAULTS.rpc.points),
+  duration: DEFAULTS.rpc.duration,
 });
 
 /**
@@ -105,82 +135,120 @@ export const realtimeUpgradeLimiter = new RateLimiterMemory({
 });
 
 /**
- * `POST /api/auth/device/code` (the start of `wsmp login`), per client IP.
- * Minting a device code grants nothing: a person still has to approve it in
- * the dashboard. So it leaves the strict credential-stuffing bucket and its
- * 15-minute block, which a fleet re-login behind one NAT tripped. 20 per
- * minute and no block: an over-eager caller recovers within one window.
+ * Relay websocket upgrades. Their own buckets, never `authLimiter`: a node reconnecting in a
+ * loop must not lock its owner out of sign-in from the same address. An address whose failed
+ * upgrades (bad or missing credential, unsupported subprotocol) used up the per-IP bucket is
+ * refused before the credential is checked; an authenticated upgrade is charged to the node's
+ * own bucket instead (see `relayUpgradeFailureBudget` / `chargeRelayUpgradeFailure`).
  */
-export const DEVICE_CODE_MINT_PATH = "/api/auth/device/code";
-export const DEVICE_CODE_MINT_POINTS = 20;
-export const DEVICE_CODE_MINT_DURATION_SECONDS = 60;
+export const relayUpgradeIpLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:relay-ip",
+  points: scaledPoints(DEFAULTS.relayUpgradeIp.points),
+  duration: DEFAULTS.relayUpgradeIp.duration,
+  blockDuration: DEFAULTS.relayUpgradeIp.blockDuration,
+});
 
-export const deviceCodeMintLimiter = new RateLimiterMemory({
-  keyPrefix: "rl:device-code",
-  points: DEVICE_CODE_MINT_POINTS,
-  duration: DEVICE_CODE_MINT_DURATION_SECONDS,
+export const relayUpgradeNodeLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:relay-node",
+  points: scaledPoints(DEFAULTS.relayUpgradeNode.points),
+  duration: DEFAULTS.relayUpgradeNode.duration,
+  blockDuration: DEFAULTS.relayUpgradeNode.blockDuration,
 });
 
 /**
- * Exactly `POST /api/auth/device/code` on the raw pathname. Any other method
- * or spelling (`/api/%61uth/...`, a trailing slash) keeps the strict limiter.
+ * Whether this address may still try a relay upgrade: its failures have not used up the
+ * per-IP bucket. Only reads the bucket, so concurrent honest upgrades spend nothing. An
+ * unexpected limiter error fails open, like the middleware.
  */
-export function isDeviceCodeMintRequest(c: Context): boolean {
-  return c.req.method === "POST" && new URL(c.req.url).pathname === DEVICE_CODE_MINT_PATH;
+export async function relayUpgradeFailureBudget(key: string): Promise<ExchangeLimit> {
+  try {
+    const state = await relayUpgradeIpLimiter.get(key);
+    if (state && state.consumedPoints >= relayUpgradeIpLimiter.points) {
+      return { allowed: false, retryAfterMs: state.msBeforeNext };
+    }
+  } catch {
+    // Fail open.
+  }
+  return { allowed: true };
+}
+
+/** Charges one failed relay upgrade to its address (blocking it once the budget is spent). */
+export async function chargeRelayUpgradeFailure(key: string): Promise<void> {
+  try {
+    await relayUpgradeIpLimiter.consume(key);
+  } catch {
+    // Over the budget (now blocked), or a limiter error: nothing else to do.
+  }
 }
 
 /**
- * `cliCredentials.exchangeDeviceCode` limiters: the public device-flow
- * redemption a `wsmp login` polls (every 5 s for up to 30 min). One bucket per
- * client IP and one per device code; see {@link consumeDeviceCodeExchange}.
- * A released CLI answers the refusal (`slow_down`) by polling more slowly, so
- * the budgets sit well above an honest poller: 12/min per code, a few
- * concurrent logins behind one address. Per process, like every limiter here.
+ * Enrollment-code exchanges (`POST /api/node/enroll`, lane A1), per client IP. A code is a
+ * pre-approved secret, so a caller guessing codes spends its own IP budget; the exchange also
+ * charges the code's owner (per user) once the code is known. No `blockDuration`: an honest
+ * installer that retried too fast recovers within one window. Per process, like every limiter
+ * here. Budgets from contracts/http.ts: 10 per IP per 15 minutes, 20 per code owner per hour
+ * (before `WMP_RATE_LIMIT_SCALE`).
  */
-export const DEVICE_CODE_EXCHANGE_IP_POINTS = 60;
-export const DEVICE_CODE_EXCHANGE_CODE_POINTS = 20;
-export const DEVICE_CODE_EXCHANGE_DURATION_SECONDS = 60;
-
-export const deviceCodeExchangeIpLimiter = new RateLimiterMemory({
-  keyPrefix: "rl:device-exchange-ip",
-  points: DEVICE_CODE_EXCHANGE_IP_POINTS,
-  duration: DEVICE_CODE_EXCHANGE_DURATION_SECONDS,
+export const enrollmentExchangeIpLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:enroll-ip",
+  points: scaledPoints(DEFAULTS.enrollmentExchangeIp.points),
+  duration: DEFAULTS.enrollmentExchangeIp.duration,
 });
 
-export const deviceCodeExchangeCodeLimiter = new RateLimiterMemory({
-  keyPrefix: "rl:device-exchange-code",
-  points: DEVICE_CODE_EXCHANGE_CODE_POINTS,
-  duration: DEVICE_CODE_EXCHANGE_DURATION_SECONDS,
+export const enrollmentExchangeUserLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:enroll-user",
+  points: scaledPoints(DEFAULTS.enrollmentExchangeUser.points),
+  duration: DEFAULTS.enrollmentExchangeUser.duration,
 });
+
+export const inviteInfoLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:invite-info",
+  points: scaledPoints(DEFAULTS.inviteInfo.points),
+  duration: DEFAULTS.inviteInfo.duration,
+  blockDuration: DEFAULTS.inviteInfo.blockDuration,
+});
+
+/** Charges one invite lookup to this client address; false when it is over its budget. */
+export async function consumeInviteLookup(clientIp: string): Promise<boolean> {
+  try {
+    await inviteInfoLimiter.consume(clientIp);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export type ExchangeLimit = { allowed: true } | { allowed: false; retryAfterMs: number };
+
+/** Gives back one point of a successful exchange (an honest fleet's enrollments do not add up). */
+export async function refundEnrollmentExchange(
+  limiter: Pick<RateLimiterMemory, "reward">,
+  key: string,
+): Promise<void> {
+  try {
+    await limiter.reward(createHash("sha256").update(key).digest("base64url"), 1);
+  } catch {
+    // A failed refund only keeps the point charged.
+  }
+}
 
 /**
- * Charges one exchange to the client IP, then to the device code. The IP
- * bucket comes first so a caller spraying made-up codes spends its own budget
- * before creating code buckets. The device code is a secret only its CLI
- * holds, so its bucket is no lockout lever for anyone else; it is keyed by a
- * digest so limiter memory never holds the code and each key has a fixed size.
- * No `blockDuration`: an honest CLI that polled too fast recovers within one
- * window. An unexpected limiter error fails open, like the middleware.
+ * Charges one enrollment exchange to a limiter key (the client IP, then the code owner's
+ * user id). An unexpected limiter error fails open, like the middleware.
  */
-export async function consumeDeviceCodeExchange(
-  clientIp: string,
-  deviceCode: string,
-  limiters: { ip: RateLimiter; code: RateLimiter } = {
-    ip: deviceCodeExchangeIpLimiter,
-    code: deviceCodeExchangeCodeLimiter,
-  },
-): Promise<DeviceCodeExchangeLimit> {
-  const codeKey = createHash("sha256").update(deviceCode).digest("base64url");
+export async function consumeEnrollmentExchange(
+  limiter: RateLimiter,
+  key: string,
+): Promise<ExchangeLimit> {
   try {
-    await limiters.ip.consume(clientIp);
-    await limiters.code.consume(codeKey);
+    await limiter.consume(createHash("sha256").update(key).digest("base64url"));
     return { allowed: true };
   } catch (rejection: unknown) {
     if (rejection instanceof RateLimiterRes) {
       return { allowed: false, retryAfterMs: rejection.msBeforeNext };
     }
     console.error(
-      `[rate-limit] Unexpected device-code exchange limiter error, failing open: (${
+      `[rate-limit] Unexpected enrollment limiter error, failing open: (${
         rejection instanceof Error ? (rejection.constructor?.name ?? "Error") : typeof rejection
       })`,
     );
@@ -196,16 +264,16 @@ export async function consumeDeviceCodeExchange(
  *
  * Other limiters key on client IP (or user id). That bounds one caller, not
  * one mailbox. Rotating IPs multiply the IP ceiling into a victim's inbox.
- * Keyed on normalized recipient (lowercased + trimmed). POINTS=0 disables.
+ * Keyed on normalized recipient (lowercased + trimmed). Always on.
  *
- * `blockDuration` defaults to 0: keying on an attacker-supplied identifier
+ * `blockDuration` is 0: keying on an attacker-supplied identifier
  * must not become an unauthenticated lockout lever on password reset.
  */
 export const emailRecipientLimiter = new RateLimiterMemory({
   keyPrefix: "rl:email-to",
-  points: env.RATE_LIMIT_EMAIL_RECIPIENT_POINTS,
-  duration: env.RATE_LIMIT_EMAIL_RECIPIENT_DURATION,
-  blockDuration: env.RATE_LIMIT_EMAIL_RECIPIENT_BLOCK_DURATION,
+  points: scaledPoints(DEFAULTS.emailRecipient.points),
+  duration: DEFAULTS.emailRecipient.duration,
+  blockDuration: DEFAULTS.emailRecipient.blockDuration,
 });
 
 /**
@@ -214,9 +282,9 @@ export const emailRecipientLimiter = new RateLimiterMemory({
  */
 export const signupRecipientLimiter = new RateLimiterMemory({
   keyPrefix: "rl:signup-to",
-  points: env.RATE_LIMIT_SIGNUP_RECIPIENT_POINTS,
-  duration: env.RATE_LIMIT_EMAIL_RECIPIENT_DURATION,
-  blockDuration: env.RATE_LIMIT_EMAIL_RECIPIENT_BLOCK_DURATION,
+  points: scaledPoints(DEFAULTS.signupRecipient.points),
+  duration: DEFAULTS.signupRecipient.duration,
+  blockDuration: DEFAULTS.signupRecipient.blockDuration,
 });
 
 /**

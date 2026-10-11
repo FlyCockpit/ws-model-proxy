@@ -61,20 +61,12 @@ function listing(terminals: "running" | "gone") {
             {
               terminalId: TERMINAL_ID,
               cliDeviceId: "cli",
-              origin: "agent",
               cols: 80,
               rows: 24,
               viewerCount: 0,
               attachedHere: false,
               writerHere: false,
               viewerAttached: false,
-              supervised: {
-                commandId: "Y29tbWFuZC1pZC0wMDAwMQ",
-                status: "running",
-                command: "sleep 600",
-                requester: "agent",
-                shareOutput: false,
-              },
             },
           ],
   };
@@ -86,7 +78,7 @@ function closesSent() {
     .filter((entry) => entry.type === "close" && entry.terminalId === TERMINAL_ID);
 }
 
-/** End session on a running agent terminal while the socket's rate budget is spent. */
+/** End session on a running terminal while the socket's rate budget is spent. */
 function endSessionBehindTheBudget() {
   vi.useFakeTimers();
   vi.stubGlobal("WebSocket", FakeWebSocket);

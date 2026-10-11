@@ -21,11 +21,10 @@ function fakeSession() {
 }
 
 const candidate = {
-  cliDeviceId: "cli",
-  endpointSlug: "inst-aaaaaaaaaaaaaaaa",
+  nodeId: "node",
+  handle: "i-aaaaaaaaaaaa",
   upstreamModel: "m",
   capabilities: null,
-  deploymentManaged: true,
   memberId: "m1",
 };
 
@@ -59,18 +58,45 @@ describe("realtime session registry", () => {
     expect(sessions.fine?.terminate).not.toHaveBeenCalled();
   });
 
+  it("rechecks one person's sessions now, and again after a check that was running", async () => {
+    let release: (verdict: { ok: true }) => void = () => undefined;
+    let calls = 0;
+    const recheck = vi.fn(async ({ userId }: { userId: string }) => {
+      calls += 1;
+      if (calls === 1)
+        return new Promise<{ ok: true }>((resolve) => {
+          release = resolve;
+        });
+      return userId === "grantee"
+        ? { ok: false as const, reason: "member" as const }
+        : { ok: true as const };
+    });
+    const registry = new RealtimeSessionRegistry(recheck);
+    const mine = fakeSession();
+    const other = fakeSession();
+    registry.add(mine, token("t1"), "grantee");
+    registry.add(other, token("t2"), "someone");
+    // The 60 s sweep is mid-check of the grantee's session when the share is revoked.
+    const sweep = registry.recheckSessions();
+    await registry.recheckForUser("grantee");
+    release({ ok: true });
+    await sweep;
+    await vi.waitFor(() => expect(mine.terminate).toHaveBeenCalled());
+    expect(other.terminate).not.toHaveBeenCalled();
+  });
+
   it("passes the resolved model and opened member to the recheck", async () => {
     const recheck = vi.fn(async () => ({ ok: true as const }));
     const registry = new RealtimeSessionRegistry(recheck);
     const registration = registry.add(fakeSession(), token("t"), "user");
-    registration?.resolved({ kind: "direct", target: { id: "dm" } as never }, "owner/asr");
+    registration?.resolved({ kind: "test", target: { id: "rm" } as never }, "owner/asr");
     registration?.opened(candidate, null);
     await registry.recheckSessions();
     expect(recheck).toHaveBeenCalledWith({
       credential: { kind: "token", tokenId: "t" },
       userId: "user",
       model: "owner/asr",
-      resolved: { kind: "direct", target: { id: "dm" } },
+      resolved: { kind: "test", target: { id: "rm" } },
       candidate,
     });
   });
@@ -139,14 +165,13 @@ describe("realtime session registry", () => {
           kind: "pool",
           poolId: "p",
           poolMemberId: "m1",
-          discoveredModelId: "dm",
-          endpointId: "ep",
+          runtimeModelId: "rm",
           executionTargetId: "et",
-          capacityId: "cap",
+          instanceId: "inst",
           ownerUserId: "pool-owner",
           engineOwnerUserId: "banned",
-          accessGrantId: "g",
-          contributionId: "ic",
+          shareId: "s",
+          contributedShareId: "sc",
         },
       },
       null,

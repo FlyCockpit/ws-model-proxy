@@ -12,6 +12,7 @@ import { isCapacityLeaseLost } from "./capacity/lease-loss.js";
 import type { ModelApiFailure } from "./openai-errors.js";
 import type { RelayBodySource } from "./request-body-source.js";
 import { ResponseUsageRecorder, type ResponseUsageSample } from "./response-usage-sample.js";
+import { upstreamErrorExcerpt } from "./upstream-error-excerpt.js";
 
 type RelayUsage = {
   promptTokens?: number;
@@ -50,6 +51,8 @@ export type RelayAttemptTerminal = {
    * Absent for synthesized terminals that never received a response.
    */
   usageSample?: ResponseUsageSample | null;
+  /** A bounded, redacted excerpt of an upstream error answer (HTTP >= 400); null otherwise. */
+  upstreamErrorExcerpt?: string | null;
 };
 
 type RelayAttemptStarted = {
@@ -73,12 +76,22 @@ type RelayManager = Pick<
   | "completeRelayRequest"
 >;
 
+/** Exactly one request body; a bodiless request (a GET) sends an empty `body`. */
+type RelayAttemptBody =
+  | { body: Uint8Array; bodySource?: undefined }
+  | { body?: undefined; bodySource: RelayBodySource };
+
 type Deferred<T> = {
   promise: Promise<T>;
   resolve(value: T): void;
   reject(error: Error): void;
 };
 
+/**
+ * A promise settled from outside. It is marked handled at creation: a rejection nobody awaits
+ * (a caller that never reached `await`, or one that stopped listening) must not become an
+ * unhandled rejection, which ends the whole process. Callers that await it still see it.
+ */
 function deferred<T>(): Deferred<T> {
   let resolve: (value: T) => void = () => undefined;
   let reject: (error: Error) => void = () => undefined;
@@ -86,6 +99,7 @@ function deferred<T>(): Deferred<T> {
     resolve = promiseResolve;
     reject = promiseReject;
   });
+  void promise.catch(() => undefined);
   return { promise, resolve, reject };
 }
 
@@ -164,8 +178,8 @@ function failureForHttpStatus(status: number): RelayFailure | null {
 export function startRelayAttempt({
   requestId = crypto.randomUUID(),
   manager,
-  cliDeviceId,
-  endpointSlug,
+  nodeId,
+  handle,
   family,
   method,
   path,
@@ -178,18 +192,18 @@ export function startRelayAttempt({
   countFirst,
   countCeiling,
   onCountResult,
-}: {
+}: RelayAttemptBody & {
   /** Caller-supplied only when durable telemetry must exist before dispatch. */
   requestId?: string;
   manager: RelayManager;
-  cliDeviceId: string;
-  endpointSlug: string;
+  /** The head node the request is relayed to. */
+  nodeId: string;
+  /** The instance handle the node routes by. */
+  handle: string;
   family: Extract<RelayServerControlMessage, { type: "relay.request" }>["family"];
-  method: string;
+  method: "GET" | "POST" | "DELETE";
   path: string;
   headers: Headers;
-  body?: Uint8Array;
-  bodySource?: RelayBodySource;
   timeoutMs: number;
   abortSignal?: AbortSignal;
   onResponseBodyChunk?: (chunk: Uint8Array) => void;
@@ -197,6 +211,11 @@ export function startRelayAttempt({
   countCeiling?: number;
   onCountResult?: (message: CountContextResultMessage) => void;
 }): RelayAttempt {
+  // Checked before anything is armed: a throw after the timeout or abort listener exist would
+  // leave them settling an attempt its caller never received.
+  if ((body === undefined) === (bodySource === undefined)) {
+    throw new Error("A relay attempt requires exactly one request body representation.");
+  }
   const started = deferred<RelayAttemptStarted>();
   const terminal = deferred<RelayAttemptTerminal>();
 
@@ -251,7 +270,7 @@ export function startRelayAttempt({
           usage: null,
           metrics: null,
         });
-        manager.cancelRelayRequest({ cliDeviceId, requestId, reason: "cancelled" });
+        manager.cancelRelayRequest({ nodeId, requestId, reason: "cancelled" });
       },
     },
     {
@@ -261,7 +280,7 @@ export function startRelayAttempt({
   );
 
   const timeout = setTimeout(() => {
-    manager.cancelRelayRequest({ cliDeviceId, requestId, reason: "timeout" });
+    manager.cancelRelayRequest({ nodeId, requestId, reason: "timeout" });
     finish({
       ok: false,
       failure: "timeout",
@@ -274,7 +293,7 @@ export function startRelayAttempt({
 
   const abort = () => {
     // The wire protocol has no lease-loss reason: the CLI only needs to stop.
-    manager.cancelRelayRequest({ cliDeviceId, requestId, reason: "cancelled" });
+    manager.cancelRelayRequest({ nodeId, requestId, reason: "cancelled" });
     finish({
       ok: false,
       ...abortedRelayFailure(abortSignal),
@@ -303,11 +322,16 @@ export function startRelayAttempt({
       started.reject(new Error(result.failure ?? "unknown"));
       responseController?.error(new Error(result.failure ?? "unknown"));
     }
+    const usageSample = responseBytes > 0 ? usageRecorder.sample() : null;
     terminal.resolve({
       ...result,
       responseBytes,
       requestBytes,
-      usageSample: responseBytes > 0 ? usageRecorder.sample() : null,
+      usageSample,
+      upstreamErrorExcerpt:
+        result.upstreamStatusCode !== null && result.upstreamStatusCode >= 400
+          ? upstreamErrorExcerpt(usageSample)
+          : null,
     });
   }
 
@@ -336,7 +360,7 @@ export function startRelayAttempt({
       const bodyChunk = new Uint8Array(chunk);
       const available = responseController?.desiredSize;
       if (available !== null && available !== undefined && bodyChunk.byteLength > available) {
-        manager.cancelRelayRequest({ cliDeviceId, requestId, reason: "cancelled" });
+        manager.cancelRelayRequest({ nodeId, requestId, reason: "cancelled" });
         // Headers may already have committed a 2xx response. Error the body so
         // a slow caller observes truncation instead of receiving a clean EOF.
         responseStreamCancelled = true;
@@ -391,15 +415,11 @@ export function startRelayAttempt({
     },
   };
 
-  if ((body === undefined) === (bodySource === undefined)) {
-    throw new Error("A relay attempt requires exactly one request body representation.");
-  }
-
-  manager.registerRelayResponseHandlers({ cliDeviceId, requestId, handlers });
+  manager.registerRelayResponseHandlers({ nodeId, requestId, handlers });
   try {
     manager.sendRelayRequest({
-      cliDeviceId,
-      endpointSlug,
+      nodeId,
+      handle,
       requestId,
       family,
       method,
@@ -429,7 +449,9 @@ export function startRelayAttempt({
     started: started.promise,
     terminal: terminal.promise,
     cancel(reason) {
-      manager.cancelRelayRequest({ cliDeviceId, requestId, reason });
+      // A settled attempt is over on the node too: a second cancel frame would be noise.
+      if (terminalSettled) return;
+      manager.cancelRelayRequest({ nodeId, requestId, reason });
       finish({
         ok: false,
         failure: reason,

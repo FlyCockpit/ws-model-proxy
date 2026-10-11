@@ -35,6 +35,9 @@ pub fn run(args: &Args) -> Result<()> {
 
 #[cfg(unix)]
 fn run_unix(args: &Args) -> Result<()> {
+    if args.apply {
+        crate::trust::refuse_in_job("wsmp recover --apply")?;
+    }
     #[derive(serde::Serialize)]
     #[serde(rename_all = "camelCase")]
     struct RecoverOutput {

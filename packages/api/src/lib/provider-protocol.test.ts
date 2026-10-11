@@ -18,6 +18,7 @@ describe("provider protocol mapping", () => {
     ["openai-compatible", "openai", "openai-compatible"],
     ["openrouter", "openai", "openai-compatible"],
     [" OpenRouter ", "openai", "openai-compatible"],
+    ["generic", "openai", "openai-compatible"],
   ] as const)("maps the recognized provider type %s", (providerType, wire, inventory) => {
     expect(providerProtocolForType(providerType)).toBe(wire);
     expect(inventoryProtocolForProviderType(providerType)).toBe(inventory);

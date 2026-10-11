@@ -23,11 +23,23 @@ const freshScheduler = (): SchedulerState => ({
 });
 
 let counter = 0;
-/** A waiter of its own request unless `request` is given. Owner defaults to its own member. */
-function waiter(id: string, overrides: Partial<PlannerWaiter> & { seq?: number } = {}) {
-  const { seq, ...rest } = overrides;
+/**
+ * A waiter of its own request unless `request` is given. Owner defaults to its
+ * own member. `limit` + `scopeKey` is shorthand for one scope limit (null or
+ * undefined = none).
+ */
+function waiter(
+  id: string,
+  overrides: Partial<PlannerWaiter> & {
+    seq?: number;
+    limit?: number | null;
+    scopeKey?: string;
+  } = {},
+) {
+  const { seq, limit, scopeKey, ...rest } = overrides;
   counter++;
   const ownerKey = rest.ownerKey ?? `member:${id}`;
+  const key = scopeKey ?? `MEMBER:${ownerKey.replace("member:", "")}`;
   return {
     waiterId: id,
     admissionRequestId: `req-${id}`,
@@ -38,10 +50,9 @@ function waiter(id: string, overrides: Partial<PlannerWaiter> & { seq?: number }
     deadlineAt: null,
     requestDeadlineAt: null,
     ownerKey,
-    memberLimit: null,
-    scopeKey: `MEMBER:${ownerKey.replace("member:", "")}`,
-    borrowPolicy: "WHEN_IDLE",
-    leaseScopeKeys: [`MEMBER:${ownerKey.replace("member:", "")}`],
+    scopeLimits: limit === null || limit === undefined ? [] : [{ key, limit }],
+    borrowReserved: true,
+    leaseScopeKeys: [key],
     ...rest,
   } satisfies PlannerWaiter;
 }
@@ -76,15 +87,15 @@ type Row = {
 const rows: Row[] = [
   {
     name: "DRR order across priorities, FIFO within a class",
-    // cursor 0: class 0 first, then class 5 spends its quantum (6) before class 0 returns.
+    // cursor 0: class 0 first, then class 1 spends its quantum (4) before class 0 returns.
     snapshot: () =>
       snapshot([
         waiter("p0-old", { seq: 1, priority: 0 }),
         waiter("p0-new", { seq: 2, priority: 0 }),
-        waiter("p5-old", { seq: 3, priority: 5 }),
-        waiter("p5-new", { seq: 4, priority: 5 }),
+        waiter("p1-old", { seq: 3, priority: 1 }),
+        waiter("p1-new", { seq: 4, priority: 1 }),
       ]),
-    granted: ["p0-old", "p5-old", "p5-new", "p0-new"],
+    granted: ["p0-old", "p1-old", "p1-new", "p0-new"],
     stoppedBy: "none",
   },
   {
@@ -148,8 +159,8 @@ const rows: Row[] = [
     snapshot: () =>
       snapshot(
         [
-          waiter("full", { seq: 1, memberLimit: 1, scopeKey: "MEMBER:x" }),
-          waiter("free", { seq: 2, memberLimit: 1, scopeKey: "MEMBER:y" }),
+          waiter("full", { seq: 1, limit: 1, scopeKey: "MEMBER:x" }),
+          waiter("free", { seq: 2, limit: 1, scopeKey: "MEMBER:y" }),
         ],
         {
           scopeActive: new Map([
@@ -167,7 +178,7 @@ const rows: Row[] = [
         [1, 2, 3].map((n) =>
           waiter(`m${n}`, {
             seq: n,
-            memberLimit: 2,
+            limit: 2,
             scopeKey: "POOL:p",
             leaseScopeKeys: ["POOL:p"],
           }),
@@ -175,6 +186,55 @@ const rows: Row[] = [
         { scopeActive: new Map([["POOL:p", 0]]) },
       ),
     granted: ["m1", "m2"],
+  },
+  {
+    name: "pool-wide cap binds a member with its own cap: a full pool scope blocks it",
+    snapshot: () =>
+      snapshot(
+        [
+          waiter("capped", {
+            seq: 1,
+            scopeLimits: [
+              { key: "MEMBER:a", limit: 4 },
+              { key: "POOL:p", limit: 2 },
+            ],
+            leaseScopeKeys: ["POOL:p", "MEMBER:a"],
+          }),
+          waiter("other-pool", { seq: 2 }),
+        ],
+        {
+          scopeActive: new Map([
+            ["MEMBER:a", 0],
+            ["POOL:p", 2],
+          ]),
+        },
+      ),
+    granted: ["other-pool"],
+  },
+  {
+    name: "pool-wide cap is consumed by grants to members with their own caps",
+    snapshot: () =>
+      snapshot(
+        ["a", "b", "c"].map((member, n) =>
+          waiter(member, {
+            seq: n + 1,
+            scopeLimits: [
+              { key: `MEMBER:${member}`, limit: 5 },
+              { key: "POOL:p", limit: 2 },
+            ],
+            leaseScopeKeys: ["POOL:p", `MEMBER:${member}`],
+          }),
+        ),
+        {
+          scopeActive: new Map([
+            ["MEMBER:a", 0],
+            ["MEMBER:b", 0],
+            ["MEMBER:c", 0],
+            ["POOL:p", 0],
+          ]),
+        },
+      ),
+    granted: ["a", "b"],
   },
   {
     name: "deferred waiters are not granted before notBefore and do not block others",
@@ -226,12 +286,12 @@ const rows: Row[] = [
     granted: ["creating"],
   },
   {
-    name: "reservations: a borrowing waiter with policy NEVER is blocked, WHEN_IDLE is granted as borrowed",
+    name: "reservations: a waiter that may not borrow is blocked, one that may is granted as borrowed",
     snapshot: () =>
       snapshot(
         [
-          waiter("never", { seq: 1, ownerKey: "member:b1", borrowPolicy: "NEVER" }),
-          waiter("idle", { seq: 2, ownerKey: "member:b2", borrowPolicy: "WHEN_IDLE" }),
+          waiter("never", { seq: 1, ownerKey: "member:b1", borrowReserved: false }),
+          waiter("idle", { seq: 2, ownerKey: "member:b2", borrowReserved: true }),
         ],
         {
           capacityLimit: 2,
@@ -247,7 +307,7 @@ const rows: Row[] = [
   {
     name: "reservations: not borrowing while enough slots stay free for the reservation",
     snapshot: () =>
-      snapshot([waiter("b", { seq: 1, ownerKey: "member:b", borrowPolicy: "NEVER" })], {
+      snapshot([waiter("b", { seq: 1, ownerKey: "member:b", borrowReserved: false })], {
         capacityLimit: 2,
         active: 0,
         reservationsByOwner: new Map([["member:owner", 1]]),
@@ -256,25 +316,43 @@ const rows: Row[] = [
     borrowed: [],
   },
   {
-    name: "reservations: a higher-priority queued reservation owner blocks borrowing",
+    name: "reservations: a queued reservation owner of a LOWER class still blocks borrowing (guarantee)",
     snapshot: () =>
       snapshot(
         [
           waiter("borrower", {
             seq: 1,
             ownerKey: "member:b",
-            priority: 1,
-            borrowPolicy: "WHEN_IDLE",
+            priority: 2,
+            borrowReserved: true,
           }),
-          waiter("owner", { seq: 2, ownerKey: "member:owner", priority: 10 }),
+          waiter("owner", { seq: 2, ownerKey: "member:owner", priority: 0 }),
         ],
         {
           capacityLimit: 2,
           active: 1,
           activeByOwner: new Map([["member:b", 1]]),
           reservationsByOwner: new Map([["member:owner", 1]]),
-          // the scheduler would otherwise pick the borrower's class 1 first
-          scheduler: { cursor: 1, deficits: Array(PRIORITY_CLASS_COUNT).fill(0), version: 1 },
+          // the scheduler would otherwise pick the borrower's class 2 first
+          scheduler: { cursor: 2, deficits: Array(PRIORITY_CLASS_COUNT).fill(0), version: 1 },
+        },
+      ),
+    granted: ["owner"],
+    borrowed: [],
+  },
+  {
+    name: "reservations: a queued reservation owner of the same class blocks borrowing",
+    snapshot: () =>
+      snapshot(
+        [
+          waiter("borrower", { seq: 1, ownerKey: "member:b", priority: 1 }),
+          waiter("owner", { seq: 2, ownerKey: "member:owner", priority: 1 }),
+        ],
+        {
+          capacityLimit: 2,
+          active: 1,
+          activeByOwner: new Map([["member:b", 1]]),
+          reservationsByOwner: new Map([["member:owner", 1]]),
         },
       ),
     granted: ["owner"],
@@ -285,8 +363,8 @@ const rows: Row[] = [
     snapshot: () =>
       snapshot(
         [
-          waiter("borrower", { seq: 1, ownerKey: "member:b", priority: 1 }),
-          waiter("owner", { seq: 2, ownerKey: "member:owner", priority: 10, notBefore: at(5) }),
+          waiter("borrower", { seq: 1, ownerKey: "member:b", priority: 0 }),
+          waiter("owner", { seq: 2, ownerKey: "member:owner", priority: 2, notBefore: at(5) }),
         ],
         {
           capacityLimit: 2,
@@ -303,12 +381,12 @@ const rows: Row[] = [
     snapshot: () =>
       snapshot(
         [
-          waiter("borrower", { seq: 1, ownerKey: "member:b", priority: 1 }),
+          waiter("borrower", { seq: 1, ownerKey: "member:b", priority: 0 }),
           waiter("owner", {
             seq: 2,
             ownerKey: "member:owner",
-            priority: 10,
-            memberLimit: 1,
+            priority: 2,
+            limit: 1,
             scopeKey: "MEMBER:owner",
           }),
         ],
@@ -324,21 +402,25 @@ const rows: Row[] = [
     borrowed: ["borrower"],
   },
   {
-    name: "reservations: a lower-priority queued owner does not block borrowing",
+    name: "reservations: an owner whose kept slots are all in use does not block borrowing",
     snapshot: () =>
       snapshot(
         [
-          waiter("borrower", { seq: 1, ownerKey: "member:b", priority: 5 }),
-          waiter("owner", { seq: 2, ownerKey: "member:owner", priority: 1 }),
+          waiter("borrower", { seq: 1, ownerKey: "member:b", priority: 0 }),
+          waiter("owner", { seq: 2, ownerKey: "member:owner", priority: 2 }),
         ],
         {
-          capacityLimit: 2,
-          active: 1,
-          activeByOwner: new Map([["member:b", 1]]),
-          reservationsByOwner: new Map([["member:owner", 1]]),
-          scheduler: { cursor: 5, deficits: Array(PRIORITY_CLASS_COUNT).fill(0), version: 1 },
+          capacityLimit: 3,
+          active: 2,
+          activeByOwner: new Map([["member:owner", 1]]),
+          reservationsByOwner: new Map([
+            ["member:owner", 1],
+            ["member:other", 1],
+          ]),
         },
       ),
+    // The last slot is kept for member:other, which has no waiter: both may
+    // borrow it, and DRR from cursor 0 serves class 0 first.
     granted: ["borrower"],
     borrowed: ["borrower"],
   },
@@ -347,8 +429,8 @@ const rows: Row[] = [
     snapshot: () =>
       snapshot(
         [
-          waiter("mine-low", { seq: 1, ownerKey: "member:b", priority: 1 }),
-          waiter("mine-high", { seq: 2, ownerKey: "member:b", priority: 10 }),
+          waiter("mine-low", { seq: 1, ownerKey: "member:b", priority: 0 }),
+          waiter("mine-high", { seq: 2, ownerKey: "member:b", priority: 2 }),
         ],
         {
           capacityLimit: 2,
@@ -421,9 +503,9 @@ describe("planGrants: state and bounds", () => {
   it("advances DRR state exactly like repeated scheduler calls, per grant and finally", () => {
     const waiters = [
       waiter("a", { seq: 1, priority: 0 }),
-      waiter("b", { seq: 2, priority: 3 }),
-      waiter("c", { seq: 3, priority: 3 }),
-      waiter("d", { seq: 4, priority: 9 }),
+      waiter("b", { seq: 2, priority: 1 }),
+      waiter("c", { seq: 3, priority: 1 }),
+      waiter("d", { seq: 4, priority: 2 }),
     ];
     const plan = planGrants(snapshot(waiters), NOW);
     let state = freshScheduler();
@@ -447,7 +529,7 @@ describe("planGrants: state and bounds", () => {
 
   it("returns the input scheduler state when nothing is granted", () => {
     const input = snapshot([waiter("deferred", { notBefore: at(1) })], {
-      scheduler: { cursor: 7, deficits: Array(PRIORITY_CLASS_COUNT).fill(2), version: 1 },
+      scheduler: { cursor: 1, deficits: Array(PRIORITY_CLASS_COUNT).fill(2), version: 1 },
     });
     const plan = planGrants(input, NOW);
     expect(plan.grants).toEqual([]);
@@ -460,7 +542,7 @@ describe("planGrants: state and bounds", () => {
     const plan = planGrants(
       snapshot(
         Array.from({ length: count }, (_, index) =>
-          waiter(`w${index}`, { seq: index + 1, priority: index % 4 }),
+          waiter(`w${index}`, { seq: index + 1, priority: index % PRIORITY_CLASS_COUNT }),
         ),
         { capacityLimit: 300 },
       ),
@@ -479,7 +561,8 @@ describe("planGrants: state and bounds", () => {
 /**
  * A literal, unoptimized transcription of the decision the store made in one
  * `#admitOne` pass before the planner existed (eligibility + borrow checks +
- * one DRR pick), over the same snapshot shape.
+ * one DRR pick), over the same snapshot shape, with the limits-redesign rules
+ * (every scope limit binds; a needy reservation owner blocks any borrower).
  */
 function oldDecision(
   input: AdmissionSnapshot,
@@ -509,9 +592,9 @@ function oldDecision(
   const borrowedBy = new Map<string, boolean>();
   for (const entry of waiters) {
     if (!grantable(entry)) continue;
-    if (entry.memberLimit !== null && entry.memberLimit !== undefined) {
-      if ((input.scopeActive.get(entry.scopeKey) ?? 0) >= entry.memberLimit) continue;
-    }
+    const scopeRoom = (candidate: PlannerWaiter) =>
+      candidate.scopeLimits.every(({ key, limit }) => (input.scopeActive.get(key) ?? 0) < limit);
+    if (!scopeRoom(entry)) continue;
     const ownerKey = entry.ownerKey;
     const reservedForOthers = Math.min(
       limit ?? Number.MAX_SAFE_INTEGER,
@@ -536,16 +619,13 @@ function oldDecision(
       (other) =>
         other.waiterId !== entry.waiterId &&
         grantable(other) &&
-        other.priority > entry.priority &&
         other.ownerKey !== ownerKey &&
         (input.reservationsByOwner.get(other.ownerKey) ?? 0) >
           (input.activeByOwner.get(other.ownerKey) ?? 0) &&
-        (other.memberLimit === null ||
-          other.memberLimit === undefined ||
-          (input.scopeActive.get(other.scopeKey) ?? 0) < other.memberLimit),
+        scopeRoom(other),
     );
     if (borrowed && queuedReservationOwnerNeedsSlot) continue;
-    if (borrowed && entry.borrowPolicy === "NEVER") continue;
+    if (borrowed && !entry.borrowReserved) continue;
     eligible.push({
       admissionRequestId: entry.admissionRequestId,
       waiterId: entry.waiterId,
@@ -587,23 +667,26 @@ function randomSnapshot(seed: number): { input: AdmissionSnapshot; options: Plan
   const waiters = Array.from({ length: count }, (_, index) => {
     const owner = pick(owners);
     const limited = random() < 0.3;
+    const scopeKey = `POOL:${pick(["pa", "pb"])}`;
+    const memberCapped = random() < 0.2;
     return waiter(`w${index}`, {
       seq: 1 + Math.floor(random() * 8),
       admissionRequestId: pick(requests),
       candidateOrder: Math.floor(random() * 3),
-      priority: pick([0, 1, 5, 10, 31]),
+      priority: pick([0, 1, 2]),
       ownerKey: owner,
       notBefore: random() < 0.2 ? at(pick([-5, 0, 5])) : null,
       deadlineAt: random() < 0.25 ? at(pick([-5, 0, 5])) : null,
       requestDeadlineAt: random() < 0.1 ? at(pick([-5, 0, 5])) : null,
-      memberLimit: limited ? pick([1, 2]) : null,
-      scopeKey: `POOL:${pick(["pa", "pb"])}`,
-      borrowPolicy: pick(["NEVER", "WHEN_IDLE"] as const),
-      leaseScopeKeys: [`POOL:${pick(["pa", "pb"])}`],
+      scopeLimits: [
+        ...(limited ? [{ key: scopeKey, limit: pick([1, 2]) }] : []),
+        ...(memberCapped ? [{ key: `MEMBER:${owner}`, limit: pick([1, 2]) }] : []),
+      ],
+      borrowReserved: pick([false, true]),
+      // The lease scopes of a grant are the waiter's own pool and member.
+      leaseScopeKeys: [scopeKey, `MEMBER:${owner}`],
     });
   });
-  // The lease scope of a grant is the waiter's own pool.
-  for (const entry of waiters) (entry.leaseScopeKeys as string[])[0] = entry.scopeKey;
   const capacityLimit = random() < 0.25 ? null : 1 + Math.floor(random() * 6);
   const activeByOwner = new Map(
     owners.filter(() => random() < 0.5).map((o) => [o, 1 + Math.floor(random() * 2)]),
@@ -621,6 +704,7 @@ function randomSnapshot(seed: number): { input: AdmissionSnapshot; options: Plan
       scopeActive: new Map([
         ["POOL:pa", Math.floor(random() * 3)],
         ["POOL:pb", Math.floor(random() * 3)],
+        ...owners.map((owner) => [`MEMBER:${owner}`, Math.floor(random() * 2)] as const),
       ]),
       scheduler: { cursor: Math.floor(random() * PRIORITY_CLASS_COUNT), deficits, version: 1 },
     }),
@@ -659,7 +743,7 @@ function naivePlan(input: AdmissionSnapshot, options: PlannerOptions) {
   return granted;
 }
 
-describe("planGrants: equivalence with the previous single-step decision", () => {
+describe("planGrants: equivalence with the single-step decision", () => {
   it("the first grant equals the old #admitOne decision (borrowed flag and DRR state too), 600 random snapshots", () => {
     let decided = 0;
     for (let seed = 1; seed <= 600; seed++) {
@@ -694,7 +778,7 @@ describe("planGrants: equivalence with the previous single-step decision", () =>
 
 // Seeded scenarios exercise interactions, while the fixed rows above pin the
 // named boundary cases independently of the frozen implementation.
-describe("indexed planner matches the frozen bc0c677 planner", () => {
+describe("indexed planner matches the reference planner", () => {
   it.each(rows)("reference: $name", (row) => {
     const input = row.snapshot();
     expect(planGrants(input, NOW, row.options)).toEqual(
@@ -702,18 +786,18 @@ describe("indexed planner matches the frozen bc0c677 planner", () => {
     );
   });
 
-  it("preserves all 32 classes with a nonzero cursor and carried deficits", () => {
+  it("preserves all 3 classes with a nonzero cursor and carried deficits", () => {
     const input = snapshot(
       Array.from({ length: 96 }, (_, i) =>
         waiter(`all-${i}`, {
           seq: 96 - i,
-          priority: i % 32,
+          priority: i % PRIORITY_CLASS_COUNT,
         }),
       ),
       {
         scheduler: {
-          cursor: 19,
-          deficits: Array.from({ length: 32 }, (_, i) => i % 7),
+          cursor: 1,
+          deficits: Array.from({ length: PRIORITY_CLASS_COUNT }, (_, i) => i % 7),
           version: 1,
         },
       },
@@ -728,17 +812,17 @@ describe("indexed planner matches the frozen bc0c677 planner", () => {
         waiter("borrower-b", { seq: 2, priority: 0, ownerKey: "member:b" }),
         waiter("needy", {
           seq: 3,
-          priority: 31,
+          priority: 2,
           ownerKey: "member:n",
-          memberLimit: 1,
+          limit: 1,
           scopeKey: "POOL:needy",
           leaseScopeKeys: ["POOL:needy"],
         }),
         waiter("needy-sibling", {
           seq: 3,
-          priority: 31,
+          priority: 2,
           ownerKey: "member:n",
-          memberLimit: 1,
+          limit: 1,
           scopeKey: "POOL:needy",
           leaseScopeKeys: ["POOL:needy"],
         }),
@@ -778,9 +862,9 @@ describe("indexed planner matches the frozen bc0c677 planner", () => {
           ownerKey: owners[pick(owners.length)]!,
           scopeKey,
           leaseScopeKeys: [scopeKey],
-          memberLimit: [null, undefined, 0, 1, 3, 8][pick(6)],
-          priority: pick(32),
-          borrowPolicy: pick(2) ? "NEVER" : "WHEN_IDLE",
+          limit: [null, undefined, 0, 1, 3, 8][pick(6)],
+          priority: pick(PRIORITY_CLASS_COUNT),
+          borrowReserved: pick(2) === 0,
           notBefore: time(),
           deadlineAt: time(),
           requestDeadlineAt: time(),
@@ -793,8 +877,8 @@ describe("indexed planner matches the frozen bc0c677 planner", () => {
         reservationsByOwner: new Map(owners.map((owner) => [owner, pick(6)])),
         scopeActive: new Map(scopes.map((scope) => [scope, pick(4)])),
         scheduler: {
-          cursor: pick(32),
-          deficits: Array.from({ length: 32 }, () => pick(9)),
+          cursor: pick(PRIORITY_CLASS_COUNT),
+          deficits: Array.from({ length: PRIORITY_CLASS_COUNT }, () => pick(9)),
           version: 1,
         },
       });
@@ -818,10 +902,10 @@ it.each([null, 2500])(
       Array.from({ length: 5000 }, (_, i) =>
         waiter(`load-${i}`, {
           seq: i,
-          priority: i % 32,
+          priority: i % PRIORITY_CLASS_COUNT,
           ownerKey: "member:load",
           scopeKey: "POOL:load",
-          memberLimit: scopeLimit,
+          limit: scopeLimit,
           leaseScopeKeys: ["POOL:load"],
         }),
       ),

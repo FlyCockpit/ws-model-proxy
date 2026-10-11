@@ -15,16 +15,12 @@
  *   nothing was deleted, retry once requests finish.
  * - `delete_contended`: the set of owners the delete must fence kept
  *   changing (or it kept deadlocking); nothing was deleted, retry.
- * - `still_attached`: a capacity is still attached to a pool member.
- * - `not_stale`: a stale-only delete found the item reporting recently.
  * - `deletion_in_progress`: the user is being deleted and cannot be restored.
  */
 export const DELETION_CONFLICT_REASONS = [
   "retained_history",
   "delete_pending",
   "delete_contended",
-  "still_attached",
-  "not_stale",
   "deletion_in_progress",
 ] as const;
 

@@ -13,26 +13,24 @@ const { audioInputMsFromBytes, flushRealtimeMetering, RealtimeSessionMeter, real
   await import("./metering.js");
 type Candidate = Parameters<InstanceType<typeof RealtimeSessionMeter>["opened"]>[0];
 
-function candidate(kind: "pool" | "direct" = "pool"): Candidate {
+function candidate(kind: "pool" | "test" = "pool"): Candidate {
   return {
-    cliDeviceId: "cli",
-    endpointSlug: "inst-aaaaaaaaaaaaaaaa",
+    nodeId: "node-1",
+    handle: "i-aaaaaaaaaaaa",
     upstreamModel: "whisper",
     capabilities: null,
-    deploymentManaged: true,
     memberId: kind === "pool" ? "m1" : null,
     route: {
       kind,
       poolId: kind === "pool" ? "pool-1" : null,
       poolMemberId: kind === "pool" ? "m1" : null,
-      discoveredModelId: "dm-1",
-      endpointId: "ep-1",
+      runtimeModelId: "rm-1",
       executionTargetId: "et-1",
-      capacityId: "cap-1",
+      instanceId: "inst-1",
       ownerUserId: "owner",
       engineOwnerUserId: "owner",
-      accessGrantId: null,
-      contributionId: null,
+      shareId: null,
+      contributedShareId: null,
     },
   };
 }
@@ -65,9 +63,9 @@ function clock(...times: string[]) {
 
 const requester = {
   userId: "user-1",
-  source: "API_TOKEN" as const,
+  source: "API_KEY" as const,
   tokenId: "token-1",
-  tokenLookupPrefix: "wsmp_model_abc",
+  tokenLookupPrefix: "wsmp_key_abc",
 };
 const item = {
   itemSeq: 0,
@@ -98,17 +96,15 @@ describe("live transcription usage rows", () => {
     expect(db.relayRequest.create).toHaveBeenCalledWith({
       data: {
         userId: "user-1",
-        source: "API_TOKEN",
-        modelApiTokenId: "token-1",
-        modelApiTokenLookupPrefix: "wsmp_model_abc",
-        requestedModelPoolId: "pool-1",
-        requestedDiscoveredModelId: null,
-        requestedExecutionTargetId: null,
-        selectedDiscoveredModelId: "dm-1",
-        selectedExecutionTargetId: "et-1",
-        selectedPoolMemberId: "m1",
-        selectedPoolMemberTier: "PRIMARY",
-        fallbackRoute: "local",
+        source: "API_KEY",
+        apiKeyId: "token-1",
+        apiKeyPrefix: "wsmp_key_abc",
+        poolId: "pool-1",
+        runtimeModelId: null,
+        selectedTargetId: "et-1",
+        selectedInstanceId: "inst-1",
+        selectedNodeId: "node-1",
+        route: "local",
         operation: "audio.realtime_transcription",
         attemptCount: 1,
         startedAt: new Date("2026-10-05T10:00:00.000Z"),
@@ -118,10 +114,10 @@ describe("live transcription usage rows", () => {
     });
   });
 
-  it("writes a Chat Test session as a CHAT_TEST row with no token, like HTTP Chat Test", async () => {
+  it("writes a Chat Test session as a TEST row with no key, like HTTP Chat Test", async () => {
     const { db } = fakeDb();
     new RealtimeSessionMeter(
-      { userId: "user-1", source: "CHAT_TEST", tokenId: null, tokenLookupPrefix: null },
+      { userId: "user-1", source: "TEST", tokenId: null, tokenLookupPrefix: null },
       db as never,
     ).opened(candidate());
     await flushRealtimeMetering();
@@ -129,26 +125,25 @@ describe("live transcription usage rows", () => {
       expect.objectContaining({
         data: expect.objectContaining({
           userId: "user-1",
-          source: "CHAT_TEST",
-          modelApiTokenId: null,
-          modelApiTokenLookupPrefix: null,
+          source: "TEST",
+          apiKeyId: null,
+          apiKeyPrefix: null,
         }),
       }),
     );
   });
 
-  it("names a direct model as the requested target", async () => {
+  it("names a test target's served model as the requested resource", async () => {
     const { db } = fakeDb();
-    new RealtimeSessionMeter(requester, db as never).opened(candidate("direct"));
+    new RealtimeSessionMeter(requester, db as never).opened(candidate("test"));
     await flushRealtimeMetering();
     expect(db.relayRequest.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          requestedModelPoolId: null,
-          requestedDiscoveredModelId: "dm-1",
-          requestedExecutionTargetId: "et-1",
-          fallbackRoute: null,
-          selectedPoolMemberTier: null,
+          poolId: null,
+          runtimeModelId: "rm-1",
+          selectedTargetId: "et-1",
+          route: "local",
         }),
       }),
     );

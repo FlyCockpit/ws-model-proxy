@@ -1,38 +1,21 @@
-import type { VisibleModels } from "@/components/chat-test/chat-test-types";
-
 /**
- * Pure pieces of the Chat Test live transcription panel: the socket address,
+ * Pure pieces of the Test page's live transcription panel: the socket address,
  * PCM encoding, and the reducer that turns the realtime transcription events
  * (the `/v1/realtime` protocol) into a short transcript list.
  *
  * The panel's socket is the dashboard's own: the session cookie signs it in,
- * as for every other Chat Test request. No token is typed, sent or stored.
+ * as for every other Test request. No token is typed, sent or stored.
  */
 
-export type LiveModelOption = { modelId: string; label: string };
-
-/** Models whose capabilities advertise live transcription (a hint; the server decides). */
-export function liveModelOptions(visibleModels: VisibleModels | undefined): LiveModelOption[] {
-  if (!visibleModels) return [];
-  return [
-    ...visibleModels.directModels
-      .filter((model) => model.realtimeTranscription)
-      .map((model) => ({ modelId: model.modelId, label: model.upstreamModelId })),
-    ...visibleModels.modelPools
-      .filter((pool) => pool.realtimeTranscription)
-      .map((pool) => ({ modelId: pool.modelId, label: pool.name })),
-  ];
-}
-
-export const CHAT_TEST_REALTIME_PATH = "/api/internal/chat-test/realtime";
+const TEST_REALTIME_PATH = "/api/internal/chat-test/realtime";
 export const REALTIME_WORKLET_URL = "/realtime-pcm-worklet.js";
 export const REALTIME_WORKLET_NAME = "realtime-pcm";
 /** Transcript entries kept on screen. */
 export const REALTIME_ITEMS_MAX = 50;
 
-/** The same-origin Chat Test socket, with only the intent and the model in the query. */
+/** The Test socket at `location` (the server URL), with only the intent and the model in the query. */
 export function realtimeSocketUrl(model: string, location: Pick<Location, "href" | "protocol">) {
-  const url = new URL(CHAT_TEST_REALTIME_PATH, location.href);
+  const url = new URL(TEST_REALTIME_PATH, location.href);
   url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
   url.search = "";
   url.searchParams.set("intent", "transcription");
@@ -212,7 +195,7 @@ const CLOSE_PROBLEM_KEYS: Record<number, string> = {
 };
 
 /**
- * The `dashboard:chatTest.live.problems.*` key for a problem. An abnormal
+ * The `dashboard:test.live.problems.*` key for a problem. An abnormal
  * close (1006) is how a browser reports a refused upgrade (signed out, too
  * many sessions, the server restarting): it cannot see the HTTP status.
  */

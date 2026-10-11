@@ -1,23 +1,28 @@
-//! Auth helpers for CLI-token and device-code credentials.
+//! Node enrollment (`wsmp login <url> --code`) and the stored node credential.
+//!
+//! A node enrolls once with a one-time (or multi-use) enrollment code the
+//! browser minted: `GET /.well-known/wsmp` pins the server's public origin and
+//! protocol, then `POST /api/node/enroll` exchanges the code, the identity
+//! public key and a slug for a credential (`node-credential.json`, 0600). The
+//! relay presents that credential as a bearer token and signs the hello
+//! challenge with the identity key, so copying the credential alone cannot
+//! take over another machine.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::config::{Config, validate_env_name};
-use crate::state::{DeviceCredential, load_device_credential};
+use crate::state::load_node_credential;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResolvedCredential {
-    CliToken { env: String, secret: String },
-    Device { secret: String },
-}
+/// The relay protocol `/.well-known/wsmp` must announce.
+pub const WELL_KNOWN_PATH: &str = "/.well-known/wsmp";
+pub const ENROLL_PATH: &str = "/api/node/enroll";
 
-/// Definitely no credential: the CLI token variable is unset or empty, or no
-/// device credential is saved in an existing state directory. Waiting cannot
-/// fix it; the user must log in. Every other resolution failure (an I/O or
-/// parse error, a state directory that is not there yet, such as an encrypted
-/// home before it is mounted) may clear up and is retried.
+/// Definitely no credential: no node credential is saved in an existing
+/// state directory. Waiting cannot fix it; the person must enroll. Every
+/// other resolution failure (an I/O or parse error, a state directory that is
+/// not there yet, such as an encrypted home before it is mounted) may clear
+/// up and is retried.
 #[derive(Debug)]
 pub struct MissingCredential(String);
 
@@ -36,326 +41,216 @@ pub fn is_missing_credential(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<MissingCredential>().is_some())
 }
 
-pub fn resolve_credential(config: &Config) -> Result<ResolvedCredential> {
-    if let Some(env) = &config.cli_token_env {
-        validate_env_name(env)?;
-        let secret = match std::env::var(env) {
-            Ok(secret) => secret,
-            Err(std::env::VarError::NotPresent) => {
-                return Err(MissingCredential(format!(
-                    "CLI token environment variable `{env}` is not set; export it (and run `wsmp service env-sync` for the service) or run `wsmp login`"
-                ))
-                .into());
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("reading CLI token from environment variable `{env}`")
-                });
-            }
-        };
-        if secret.trim().is_empty() {
-            return Err(MissingCredential(format!(
-                "CLI token environment variable `{env}` is empty"
-            ))
-            .into());
-        }
-        return Ok(ResolvedCredential::CliToken {
-            env: env.clone(),
-            secret,
-        });
-    }
-    let Some(credential) = load_device_credential()? else {
+/// The relay bearer credential from `node-credential.json`.
+pub fn resolve_credential() -> Result<String> {
+    let Some(credential) = load_node_credential()? else {
         let state_dir = crate::paths::state_dir()?;
         if !state_dir.is_dir() {
             anyhow::bail!(
-                "state directory `{}` does not exist (not mounted yet?); no device credential can be read",
+                "state directory `{}` does not exist (not mounted yet?); no node credential can be read",
                 state_dir.display()
             );
         }
         return Err(MissingCredential(
-            "no CLI token env var is configured and no device credential exists; run `wsmp login` or `wsmp token login <ENV_VAR>`".to_string(),
+            "this node is not enrolled; run `wsmp login <url> --code <code>` (the code comes from the Nodes page)"
+                .to_string(),
         )
         .into());
     };
-    Ok(ResolvedCredential::Device {
-        secret: credential.secret,
-    })
+    Ok(credential.credential)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeviceCodeStartResponse {
-    #[serde(alias = "deviceCode")]
-    pub device_code: String,
-    #[serde(alias = "userCode")]
-    pub user_code: String,
-    #[serde(alias = "verificationUri")]
-    pub verification_uri: Option<String>,
-    #[serde(alias = "verificationUriComplete")]
-    pub verification_uri_complete: Option<String>,
-    #[serde(alias = "expiresIn")]
-    pub expires_in: Option<u64>,
-    pub interval: Option<u64>,
+/// `GET /.well-known/wsmp` (strict: an unknown field is refused).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WellKnown {
+    pub server_version: String,
+    pub protocol_version: String,
+    pub origin: String,
+    pub install_script: String,
+    pub enroll_path: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeviceCredentialExchangeResponse {
-    credential_id: Option<String>,
-    user_id: Option<String>,
-    secret: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum RpcResponse<T> {
-    Envelope { json: T },
-    Plain(T),
-}
-
-impl<T> RpcResponse<T> {
-    fn into_inner(self) -> T {
-        match self {
-            Self::Envelope { json } | Self::Plain(json) => json,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct RpcErrorEnvelope {
-    json: RpcErrorBody,
-}
-
-#[derive(Debug, Deserialize)]
-struct RpcErrorBody {
-    code: Option<String>,
-    message: Option<String>,
-    data: Option<RpcErrorData>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RpcErrorData {
-    device_flow_error: Option<String>,
-}
-
-/// A device-flow state the server tags on an exchange error
-/// (`data.deviceFlowError`, RFC 8628 §3.5 names). Login classifies polling
-/// results by this field only, never by message text, since a message can
-/// echo the user's slug.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeviceFlowState {
-    /// `authorization_pending`: the user has not approved yet; keep polling.
-    Pending,
-    /// `slow_down`: polled too soon; keep polling, more slowly.
-    SlowDown,
-    /// `access_denied`: the user denied the request.
-    Denied,
-    /// `expired_token`: the device code expired.
-    Expired,
-}
-
-impl DeviceFlowState {
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "authorization_pending" => Some(Self::Pending),
-            "slow_down" => Some(Self::SlowDown),
-            "access_denied" => Some(Self::Denied),
-            "expired_token" => Some(Self::Expired),
-            _ => None,
-        }
-    }
-}
-
-/// Why exchanging a device code did not produce a credential.
-#[derive(Debug)]
-pub enum ExchangeError {
-    /// A tagged device-flow state (see `DeviceFlowState`).
-    DeviceFlow(DeviceFlowState),
-    /// Anything else (bad slug, slug mismatch, unknown or already used code,
-    /// transport failure). Login stops with this error.
-    Other(anyhow::Error),
-}
-
-impl From<anyhow::Error> for ExchangeError {
-    fn from(error: anyhow::Error) -> Self {
-        Self::Other(error)
-    }
-}
-
-/// The device authorization `scope` naming the one CLI slug this login is
-/// for. The server stores it, shows it on the approval page, and mints the
-/// credential for this slug only. Mirrors `cliDeviceLoginScope` in
-/// `packages/config/src/cli-device-login.ts`.
-pub fn device_login_scope(cli_slug: &str) -> String {
-    format!("cli-slug:{cli_slug}")
-}
-
-/// Longest `Retry-After` that `wsmp login` waits out by itself (once) when
-/// the server rate limits the device-code request.
-pub const DEVICE_CODE_RETRY_WAIT_MAX_SECS: u64 = 30;
-
-enum DeviceCodeStart {
-    Started(DeviceCodeStartResponse),
-    /// HTTP 429, with the `Retry-After` seconds when the server sent them.
-    RateLimited(Option<u64>),
-}
-
-pub fn start_device_authorization(
-    server_url: &str,
-    cli_slug: &str,
-) -> Result<DeviceCodeStartResponse> {
-    let url = join(server_url, "/api/auth/device/code")?;
-    let body = serde_json::to_vec(&serde_json::json!({
-        "client_id": "ws-model-proxy",
-        "scope": device_login_scope(cli_slug),
-    }))
-    .context("serializing device authorization request")?;
-    let retry_after = match request_device_code(&url, &body)? {
-        DeviceCodeStart::Started(started) => return Ok(started),
-        DeviceCodeStart::RateLimited(retry_after) => retry_after,
-    };
-    // A short wait is cheaper than making the user run login again.
-    let Some(wait) = retry_after.filter(|secs| *secs <= DEVICE_CODE_RETRY_WAIT_MAX_SECS) else {
-        anyhow::bail!(rate_limited_message(retry_after));
-    };
-    crate::output::diagnostic(format!(
-        "device login is rate limited, retry in {wait} s; waiting"
-    ))?;
-    std::thread::sleep(std::time::Duration::from_secs(wait.max(1)));
-    match request_device_code(&url, &body)? {
-        DeviceCodeStart::Started(started) => Ok(started),
-        DeviceCodeStart::RateLimited(retry_after) => {
-            anyhow::bail!(rate_limited_message(retry_after))
-        }
-    }
-}
-
-fn request_device_code(url: &Url, body: &[u8]) -> Result<DeviceCodeStart> {
-    let mut response = ureq::post(url.as_str())
+pub fn fetch_well_known(server_url: &str) -> Result<WellKnown> {
+    let url = join(server_url, WELL_KNOWN_PATH)?;
+    let mut response = ureq::get(url.as_str())
         .header("Accept", "application/json")
-        .header("Content-Type", "application/json")
         .config()
         .http_status_as_error(false)
+        .max_redirects(0)
         .build()
-        .send(body)
-        .with_context(|| format!("starting device authorization at `{}`", url.as_str()))?;
+        .call()
+        .with_context(|| format!("reaching `{}`", url.as_str()))?;
     let status = response.status().as_u16();
-    if status == 429 {
-        let retry_after = parse_retry_after(
-            response
-                .headers()
-                .get("retry-after")
-                .and_then(|value| value.to_str().ok()),
-        );
-        return Ok(DeviceCodeStart::RateLimited(retry_after));
-    }
-    if !response.status().is_success() {
-        let text = response.body_mut().read_to_string().unwrap_or_default();
-        anyhow::bail!(
-            "starting device authorization at `{}` failed with HTTP status {status}{}",
-            url.as_str(),
-            server_error_detail(&text)
-                .map(|detail| format!(": {detail}"))
-                .unwrap_or_default()
-        );
-    }
-    response
+    anyhow::ensure!(
+        response.status().is_success(),
+        "`{}` answered HTTP status {status}; is this a WS Model Proxy 0.4 server?",
+        url.as_str()
+    );
+    let known: WellKnown = response
         .body_mut()
         .read_json()
-        .map(DeviceCodeStart::Started)
-        .context("parsing device authorization response")
-}
-
-/// `Retry-After` as delay-seconds; an HTTP-date or junk is ignored.
-fn parse_retry_after(value: Option<&str>) -> Option<u64> {
-    value?.trim().parse().ok()
-}
-
-fn rate_limited_message(retry_after: Option<u64>) -> String {
-    match retry_after {
-        Some(secs) => format!(
-            "the server rate limited device login (HTTP 429): rate limited, retry in {secs} s"
-        ),
-        None => "the server rate limited device login (HTTP 429): rate limited, retry in a minute"
-            .to_string(),
-    }
-}
-
-/// A short message from a JSON error body (`message`, `error_description`
-/// or `error`), if there is one.
-fn server_error_detail(body: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    ["message", "error_description", "error"]
-        .iter()
-        .find_map(|key| value.get(key).and_then(serde_json::Value::as_str))
-        .map(|text| text.chars().take(300).collect())
-}
-
-pub fn exchange_device_code(
-    server_url: &str,
-    device_code: &str,
-    cli_slug: &str,
-    identity_public_key: &str,
-) -> std::result::Result<DeviceCredential, ExchangeError> {
-    let url = join(server_url, "/rpc/cliCredentials/exchangeDeviceCode")?;
-    let request = serde_json::json!({
-        "json": {
-            "deviceCode": device_code,
-            "cliSlug": cli_slug,
-            "identityPublicKey": identity_public_key,
+        .with_context(|| format!("reading `{}`", url.as_str()))?;
+    anyhow::ensure!(
+        known.protocol_version == crate::protocol::RELAY_PROTOCOL_VERSION,
+        "the server speaks relay protocol `{}`, this wsmp speaks `{}`; {}",
+        crate::display_escape::escape_single_line(&known.protocol_version),
+        crate::protocol::RELAY_PROTOCOL_VERSION,
+        if known.protocol_version.as_str() < crate::protocol::RELAY_PROTOCOL_VERSION {
+            "upgrade the server"
+        } else {
+            "upgrade wsmp"
         }
-    });
-    let body = serde_json::to_vec(&request).context("serializing device credential request")?;
+    );
+    anyhow::ensure!(
+        known.enroll_path == ENROLL_PATH,
+        "the server announces an unexpected enrollment path"
+    );
+    Ok(known)
+}
+
+/// `POST /api/node/enroll`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrollRequest<'a> {
+    pub code: &'a str,
+    pub identity_public_key: &'a str,
+    pub slug: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<&'a str>,
+    pub replace_confirmed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReplacedNode {
+    pub slug: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Enrolled {
+    pub ok: bool,
+    pub node_id: String,
+    pub slug: String,
+    pub credential: String,
+    pub replaced: Option<ReplacedNode>,
+    pub trust_lower_pending: bool,
+    /// Set when the node is temporary: the server deletes it after this long
+    /// offline. Absent from older servers.
+    #[serde(default)]
+    pub remove_after_offline_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrollError {
+    InvalidCode,
+    Expired,
+    Used,
+    Revoked,
+    SlugTaken,
+    ReplaceConfirmationRequired,
+    RateLimited,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnrollRefusal {
+    pub ok: bool,
+    pub error: EnrollError,
+    #[serde(default)]
+    pub replaces: Option<ReplacedNode>,
+    #[serde(default)]
+    pub retry_after_sec: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnrollOutcome {
+    Enrolled(Enrolled),
+    Refused(EnrollRefusal),
+}
+
+/// The enrollment code shape (`wsmp_enr_` + 26 base32 characters, 130 bits).
+pub fn is_enrollment_code(code: &str) -> bool {
+    code.strip_prefix("wsmp_enr_").is_some_and(|rest| {
+        rest.len() == 26
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b))
+    })
+}
+
+pub fn enroll(server_url: &str, request: &EnrollRequest<'_>) -> Result<EnrollOutcome> {
+    let url = join(server_url, ENROLL_PATH)?;
+    let body = serde_json::to_vec(request).context("serializing the enrollment request")?;
     let mut response = ureq::post(url.as_str())
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
         .config()
         .http_status_as_error(false)
+        .max_redirects(0)
         .build()
         .send(body)
-        .with_context(|| format!("exchanging approved device code at `{}`", url.as_str()))?;
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let body = response.body_mut().read_to_string().unwrap_or_default();
-        return Err(classify_exchange_error(status, &body));
-    }
-    let parsed = response
+        .with_context(|| format!("enrolling at `{}`", url.as_str()))?;
+    let status = response.status().as_u16();
+    let text = response
         .body_mut()
-        .read_json::<RpcResponse<DeviceCredentialExchangeResponse>>()
-        .context("parsing device credential response")?;
-    let parsed = parsed.into_inner();
-    Ok(DeviceCredential {
-        credential_id: parsed.credential_id,
-        user_id: parsed.user_id,
-        secret: parsed.secret,
-    })
+        .with_config()
+        .limit(64 * 1024)
+        .read_to_string()
+        .with_context(|| format!("reading the enrollment answer from `{}`", url.as_str()))?;
+    parse_enroll_answer(status, &text)
 }
 
-/// Classifies a failed exchange by the error body's structured fields.
-fn classify_exchange_error(status: u16, body: &str) -> ExchangeError {
-    let Ok(parsed) = serde_json::from_str::<RpcErrorEnvelope>(body) else {
-        return ExchangeError::Other(anyhow::anyhow!(
-            "device credential exchange failed with HTTP status {status}"
-        ));
-    };
-    let error = parsed.json;
-    if let Some(state) = error
-        .data
-        .and_then(|data| data.device_flow_error)
-        .as_deref()
-        .and_then(DeviceFlowState::parse)
-    {
-        return ExchangeError::DeviceFlow(state);
+fn parse_enroll_answer(status: u16, text: &str) -> Result<EnrollOutcome> {
+    let value: serde_json::Value = serde_json::from_str(text).with_context(|| {
+        format!("the server answered the enrollment with HTTP status {status} and no JSON body")
+    })?;
+    match value.get("ok").and_then(serde_json::Value::as_bool) {
+        Some(true) => {
+            let enrolled: Enrolled =
+                serde_json::from_value(value).context("reading the enrollment answer")?;
+            anyhow::ensure!(
+                (32..=256).contains(&enrolled.credential.len()),
+                "the server sent a malformed credential"
+            );
+            crate::slug::validate_slug(&enrolled.slug)
+                .context("the server sent a malformed node slug")?;
+            Ok(EnrollOutcome::Enrolled(enrolled))
+        }
+        Some(false) => Ok(EnrollOutcome::Refused(
+            serde_json::from_value(value).context("reading the enrollment refusal")?,
+        )),
+        None => anyhow::bail!("the server answered the enrollment with HTTP status {status}"),
     }
-    ExchangeError::Other(match (error.message, error.code) {
-        (Some(message), _) => anyhow::anyhow!("{message}"),
-        (None, Some(code)) => {
-            anyhow::anyhow!("device credential exchange failed: {code} (HTTP status {status})")
+}
+
+/// What a person reads for a refused enrollment.
+pub fn refusal_message(refusal: &EnrollRefusal) -> String {
+    match refusal.error {
+        EnrollError::InvalidCode => {
+            "the enrollment code is not valid; copy it again from the Nodes page".to_string()
         }
-        (None, None) => {
-            anyhow::anyhow!("device credential exchange failed with HTTP status {status}")
+        EnrollError::Expired => {
+            "the enrollment code expired; mint a new one on the Nodes page".to_string()
         }
-    })
+        EnrollError::Used => {
+            "the enrollment code was already used; mint a new one on the Nodes page".to_string()
+        }
+        EnrollError::Revoked => "the enrollment code was revoked".to_string(),
+        EnrollError::SlugTaken => {
+            "another node already uses this name; choose another with `--slug`, or mint a Replace code"
+                .to_string()
+        }
+        EnrollError::ReplaceConfirmationRequired => {
+            "this code replaces another node; confirm with `--replace`".to_string()
+        }
+        EnrollError::RateLimited => match refusal.retry_after_sec {
+            Some(secs) => format!("too many enrollment attempts; retry in {secs} s"),
+            None => "too many enrollment attempts; retry later".to_string(),
+        },
+    }
 }
 
 pub fn join(server_url: &str, path: &str) -> Result<Url> {
@@ -374,102 +269,77 @@ pub fn join(server_url: &str, path: &str) -> Result<Url> {
 mod tests {
     use super::*;
 
-    fn error_body(code: &str, message: &str, device_flow_error: Option<&str>) -> String {
-        let mut json = serde_json::json!({
-            "defined": false,
-            "code": code,
-            "status": 400,
-            "message": message,
-        });
-        if let Some(state) = device_flow_error {
-            json["data"] = serde_json::json!({ "deviceFlowError": state });
-        }
-        serde_json::json!({ "json": json }).to_string()
-    }
-
     #[test]
-    fn classifies_tagged_device_flow_states() {
-        for (tag, expected) in [
-            ("authorization_pending", DeviceFlowState::Pending),
-            ("slow_down", DeviceFlowState::SlowDown),
-            ("access_denied", DeviceFlowState::Denied),
-            ("expired_token", DeviceFlowState::Expired),
+    fn enrollment_codes_have_the_minted_shape() {
+        assert!(is_enrollment_code("wsmp_enr_ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+        assert!(is_enrollment_code("wsmp_enr_234567ABCDEFGHIJKLMNOPQRST"));
+        for bad in [
+            "wsmp_enr_ABCDEFGHIJKLMNOPQRSTUVWXY",
+            "wsmp_enr_abcdefghijklmnopqrstuvwxyz",
+            "wsmp_enr_ABCDEFGHIJKLMNOPQRSTUVWXY1",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "",
         ] {
-            let body = error_body("BAD_REQUEST", "anything", Some(tag));
-            assert!(matches!(
-                classify_exchange_error(400, &body),
-                ExchangeError::DeviceFlow(state) if state == expected
-            ));
+            assert!(!is_enrollment_code(bad), "{bad}");
         }
     }
 
     #[test]
-    fn untagged_errors_are_fatal_whatever_the_message_says() {
-        // A message can say "pending", "denied", or "expired" (it can echo a
-        // slug); only the structured tag counts.
-        let body = error_body(
-            "BAD_REQUEST",
-            "Device authorization for `pending-denied-expired` is pending, denied, or expired.",
-            None,
-        );
-        match classify_exchange_error(400, &body) {
-            ExchangeError::Other(error) => {
-                assert!(error.to_string().contains("pending-denied-expired"));
-            }
-            ExchangeError::DeviceFlow(state) => panic!("classified as {state:?}"),
-        }
-    }
-
-    #[test]
-    fn an_unset_token_variable_is_a_definite_missing_credential() {
-        let config = Config {
-            cli_token_env: Some("WSMP_TEST_TOKEN_NEVER_SET_6F3A".to_string()),
-            ..Config::default()
+    fn enroll_answers_parse_strictly() {
+        let ok = parse_enroll_answer(
+            200,
+            &serde_json::json!({
+                "ok": true, "nodeId": "node-1", "slug": "spark-1",
+                "credential": "c".repeat(40), "replaced": null, "trustLowerPending": false
+            })
+            .to_string(),
+        )
+        .expect("enrolled");
+        assert!(matches!(ok, EnrollOutcome::Enrolled(ref e)
+            if e.slug == "spark-1" && e.remove_after_offline_ms.is_none()));
+        let temporary = parse_enroll_answer(
+            200,
+            &serde_json::json!({
+                "ok": true, "nodeId": "node-1", "slug": "spark-1",
+                "credential": "c".repeat(40), "replaced": null, "trustLowerPending": false,
+                "removeAfterOfflineMs": 3_600_000
+            })
+            .to_string(),
+        )
+        .expect("enrolled");
+        assert!(matches!(temporary, EnrollOutcome::Enrolled(ref e)
+            if e.remove_after_offline_ms == Some(3_600_000)));
+        let refused = parse_enroll_answer(
+            409,
+            r#"{"ok":false,"error":"replace_confirmation_required","replaces":{"slug":"old-1"}}"#,
+        )
+        .expect("refused");
+        let EnrollOutcome::Refused(refusal) = refused else {
+            panic!("refusal");
         };
-        let error = resolve_credential(&config).expect_err("unset token");
-        assert!(is_missing_credential(&error));
-        assert!(!is_missing_credential(&anyhow::anyhow!(
-            "reading device credential: permission denied"
-        )));
-    }
-
-    #[test]
-    fn retry_after_is_read_as_seconds_only() {
-        assert_eq!(parse_retry_after(Some("12")), Some(12));
-        assert_eq!(parse_retry_after(Some(" 7 ")), Some(7));
-        assert_eq!(
-            parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
-            None
+        assert_eq!(refusal.error, EnrollError::ReplaceConfirmationRequired);
+        assert_eq!(refusal.replaces.map(|r| r.slug).as_deref(), Some("old-1"));
+        // A short credential, an unknown field or a missing `ok` is refused.
+        assert!(
+            parse_enroll_answer(
+                200,
+                r#"{"ok":true,"nodeId":"n","slug":"a1","credential":"short","replaced":null,"trustLowerPending":false}"#
+            )
+            .is_err()
         );
-        assert_eq!(parse_retry_after(None), None);
-        assert!(rate_limited_message(Some(42)).contains("rate limited, retry in 42 s"));
-        assert!(rate_limited_message(None).contains("rate limited"));
+        assert!(parse_enroll_answer(200, r#"{"ok":false,"error":"used","extra":1}"#).is_err());
+        assert!(parse_enroll_answer(500, "oops").is_err());
+        assert!(parse_enroll_answer(500, "{}").is_err());
     }
 
     #[test]
-    fn server_error_detail_reads_json_messages_only() {
-        assert_eq!(
-            server_error_detail(r#"{"error":"Too many attempts."}"#).as_deref(),
-            Some("Too many attempts.")
-        );
-        assert_eq!(server_error_detail("<html>bad gateway</html>"), None);
-    }
-
-    #[test]
-    fn device_login_scope_names_the_slug() {
-        assert_eq!(device_login_scope("desk-01"), "cli-slug:desk-01");
-    }
-
-    #[test]
-    fn unknown_tags_and_unparsable_bodies_are_fatal() {
-        let body = error_body("BAD_REQUEST", "odd", Some("something_new"));
-        assert!(matches!(
-            classify_exchange_error(400, &body),
-            ExchangeError::Other(_)
-        ));
-        match classify_exchange_error(502, "<html>bad gateway</html>") {
-            ExchangeError::Other(error) => assert!(error.to_string().contains("502")),
-            ExchangeError::DeviceFlow(state) => panic!("classified as {state:?}"),
-        }
+    fn refusals_read_as_next_steps() {
+        let refusal = EnrollRefusal {
+            ok: false,
+            error: EnrollError::RateLimited,
+            replaces: None,
+            retry_after_sec: Some(60),
+        };
+        assert!(refusal_message(&refusal).contains("60 s"));
     }
 }

@@ -1,5 +1,4 @@
 import type { Session } from "@ws-model-proxy/auth";
-import { env } from "@ws-model-proxy/env/server";
 import type { Context, MiddlewareHandler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { RateLimiterMemory } from "rate-limiter-flexible";
@@ -10,7 +9,7 @@ import {
   MCP_OAUTH_CONSENT_PATH,
   MCP_OAUTH_CONTINUE_PATH,
 } from "./mcp-oauth-route-match.js";
-import { createRateLimiterMiddleware } from "./rate-limit.js";
+import { createRateLimiterMiddleware, DEFAULTS, scaledPoints } from "./rate-limit.js";
 
 /**
  * MCP OAuth endpoint rate limits (Phase 3).
@@ -37,28 +36,27 @@ import { createRateLimiterMiddleware } from "./rate-limit.js";
 /**
  * Anonymous/protocol endpoints (authorize GET+POST, token, revoke,
  * public-client read, public-client-prelogin, JWKS read) — IP-keyed bucket
- * from RATE_LIMIT_MCP_POINTS / RATE_LIMIT_MCP_DURATION (defaults 120/60s).
+ * from `DEFAULTS.mcp` (120/60s before `WMP_RATE_LIMIT_SCALE`).
  * No blockDuration: a protocol endpoint must not lock an IP out of the
  * discovery/token flow entirely. Read-ish endpoints (public-client,
  * public-client-prelogin, JWKS) share this one generous read ceiling.
  */
 const mcpOauthLimiter = new RateLimiterMemory({
   keyPrefix: "mcp:oauth:ip",
-  points: env.RATE_LIMIT_MCP_POINTS,
-  duration: env.RATE_LIMIT_MCP_DURATION,
+  points: scaledPoints(DEFAULTS.mcp.points),
+  duration: DEFAULTS.mcp.duration,
 });
 
 /**
  * Human form submissions (consent, continue) — session/user-keyed bucket
- * from RATE_LIMIT_MCP_CONSENT_POINTS / RATE_LIMIT_MCP_CONSENT_DURATION
- * (defaults 30/60s), falling back to the client IP when no session is
- * resolved. Session keying bounds one account's consent-flooding across
- * IPs; IP fallback bounds anonymous flooders.
+ * from `DEFAULTS.mcpConsent` (30/60s before `WMP_RATE_LIMIT_SCALE`), falling
+ * back to the client IP when no session is resolved. Session keying bounds one
+ * account's consent-flooding across IPs; IP fallback bounds anonymous flooders.
  */
 const mcpConsentLimiter = new RateLimiterMemory({
   keyPrefix: "mcp:consent",
-  points: env.RATE_LIMIT_MCP_CONSENT_POINTS,
-  duration: env.RATE_LIMIT_MCP_CONSENT_DURATION,
+  points: scaledPoints(DEFAULTS.mcpConsent.points),
+  duration: DEFAULTS.mcpConsent.duration,
 });
 
 /** IP key for the anonymous MCP OAuth bucket (prefixed key domain). */

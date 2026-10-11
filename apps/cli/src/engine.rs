@@ -1,6 +1,6 @@
 //! Inference engine detection and live load parsing.
 //!
-//! Detection runs at probe time (connect, reconnect, `wsmp reload`) and reads
+//! Detection runs at probe time (connect, reconnect) and reads
 //! static facts: slot count, per-slot context, KV capacity. Load sampling runs
 //! on the telemetry thread (`crate::telemetry`) and reads running/waiting
 //! counts. Every parser here is pure so recorded fixtures can test it.
@@ -133,7 +133,7 @@ pub(crate) fn route_url(base_url: &str, route: &str) -> Result<Url> {
 pub(crate) fn endpoint_header_pairs(endpoint: &EndpointConfig) -> Result<Vec<(String, String)>> {
     let mut pairs = Vec::new();
     for header in &endpoint.headers {
-        let value = std::env::var(&header.env).with_context(|| {
+        let value = crate::secrets::credential(&header.env).with_context(|| {
             format!(
                 "reading endpoint header `{}` from `{}`",
                 header.name, header.env
@@ -142,7 +142,7 @@ pub(crate) fn endpoint_header_pairs(endpoint: &EndpointConfig) -> Result<Vec<(St
         pairs.push((header.name.clone(), value));
     }
     if let Some(auth) = &endpoint.auth {
-        let value = std::env::var(&auth.env)
+        let value = crate::secrets::credential(&auth.env)
             .with_context(|| format!("reading typed endpoint credential from `{}`", auth.env))?;
         match auth.mode {
             crate::config::EndpointAuthMode::ApiKey => {

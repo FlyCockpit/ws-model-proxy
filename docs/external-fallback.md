@@ -1,17 +1,17 @@
 # External fallback (`owner/pool:external`)
 
-Request data leaves a WSMP deployment for an external provider only when the
+Request data leaves this server for an external (cloud) provider only when the
 caller asks for it in the model name and every party allows it.
 
 ## Model names
 
 - `owner/pool` (plain name): served by the pool's local members only. It never
-  leaves the deployment.
-- `owner/pool:external`: may use the pool's external (provider) fallback
-  members or your own-key model when local service is unavailable.
-  - The variant is lowercase and used once. Unknown, uppercase, or stacked
-    variants, and any suffix on a direct model id, return `404 model_not_found`
-    with a message naming the correct id.
+  leaves this server.
+- `owner/pool:external`: may use the pool's cloud members or your own-key
+  model when local service is unavailable.
+  - The variant is lowercase and used once. An unknown, uppercase, or stacked
+    variant on a pool's name returns `404 model_not_found` with a message naming the
+    correct id; a suffix on a name that is not a pool gets the plain `404 model_not_found`.
   - Accepted on `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, and `/v1/embeddings`.
     `count_tokens` treats it as the plain name and never contacts a provider;
     on a pool with only external members it returns
@@ -23,11 +23,12 @@ caller asks for it in the model name and every party allows it.
 
 Local service comes first. After a bounded cache-holder wait, eligible local alternatives
 are used before paid fallback. Cache protection alone permits a paid redirect only when
-the pool owner explicitly enables `paidWarmProtectionEnabled` (default false, human-only).
-Token/provider consent is still required; rate limits and authorization failures never
-authorize a fallback bypass. Connected, published, eligible local serving members are
-required for every pool model variant to appear in `/v1/models`; saturation alone does
-not hide an actively served pool.
+the pool owner turns on paid warm protection (the pool's Cloud tab,
+`pools.cloud.setPaidWarmProtection`; off by default, people only). The pool's cloud mode
+must still cover the caller; rate limits and authorization failures never authorize a
+fallback bypass. A pool's names appear in `/v1/models` only while at least one active
+member runs on a ready instance whose node is connected; saturation alone does not hide
+an actively served pool.
 
 ### Embedding identity and privacy
 
@@ -44,43 +45,65 @@ storage to that backend. Content-free routing/usage metadata remains bounded. Pr
 privacy controls remain enforced; this is not a guarantee about an arbitrary provider's
 independent logging practices.
 
+### Stored responses
+
+`/v1/responses` without `store` sends `store: false` upstream: nothing is stored, and
+`GET` / `DELETE /v1/responses/{id}` answer 404 "This response is not stored here". A
+response is stored only when created with `store: true` on a model that stores
+responses natively (`RESPONSES_API` in its served-model capabilities, or a provider
+model with the native Responses surface); WMP then keeps only its routing (which
+model on which instance or provider served it, for the same API key) for 7 days, and
+`GET` / `DELETE` reach that backend. A follow-up (`previous_response_id`) keeps its
+routing too, so the chain continues; `GET` / `DELETE` of its id reach the backend, which
+answers for what it stored. Past 7 days the routing is pruned (within the hour) and the
+answer is the not-stored one. In a pool, `store: true` cannot go to a member reached by
+translation (a wrap of a chat-only engine, where WMP translates Responses onto chat
+completions); when no member can take it the answer is 400 `unsupported_capability`
+saying so. A served model tested directly (the Test page) without native Responses
+refuses every `/v1/responses` request with 400 `unsupported_capability`.
+
 For owner-paid pool fallback, all of these must hold:
 
-1. The deployment switch `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` is on.
-2. The model name is `owner/pool:external`.
-3. The API token allows external providers (`allowExternal`, off by default).
-   Allowlist tokens also need the pool's `includeExternal` entry. All-visible
-   tokens are all-or-nothing. Only a signed-in person can change these settings;
-   MCP agents cannot. A signed-in user's own Chat Test counts as that user's
-   consent. MCP diagnostics cannot use `:external`.
-4. The pool owner enabled fallback (`fallbackEnabled`).
-5. The requester is the pool owner, or the owner enabled `fallbackForGrantees`
-   (off by default for every pool).
+1. The server switch `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` is on (the server's
+   environment).
+2. The model name is `owner/pool:external`, sent with an API key or from the
+   signed-in person's own Test page (asking for it there is that person's
+   consent). API keys have no separate cloud switch: any key that may call the
+   pool may ask for `:external`. Agent tests (`model_test`) cannot use it:
+   `400 external_not_supported_for_mcp` (with the server switch off, the switch's
+   `403 external_providers_disabled` answers first).
+3. The pool's cloud mode covers the requester: **For me** (`OWNER`) covers the
+   owner, **For me and people I share with** (`OWNER_AND_SHARES`) also covers
+   share holders, **Off** (the default for every pool) covers nobody. Only a
+   person sets it, on the pool's Cloud tab (`pools.cloud.setMode`); agents
+   cannot.
 
-Own-key routing shares conditions 1–3, plus the exact live grant, owner equivalent declaration, and requester-owned active provider resources; the owner-paid flags do not apply.
+Own-key routing shares conditions 1–2, plus the requester's exact live share, the
+owner's own-key consent (an equivalent model), and requester-owned active provider
+resources; the cloud mode does not apply.
 
 These conditions are checked when the request arrives, and checked again against
 current database state immediately before any request data is sent (the
-switch, the owner's two settings, the token's consent and revocation or
-expiry, the requester's account (not banned, no pending deletion), and, for
-someone other than the owner, the exact pool grant the request was resolved
-under; a revoked and re-created grant does not count). That last check runs
-in the same database transaction that claims the provider credential for the
-send, and it holds those settings unchanged until the send is claimed; token
+switch, the pool's cloud mode, the API key's revocation or expiry, the
+requester's account (not banned, no pending deletion), and, for someone other
+than the owner, the exact share the request was resolved under; a deleted and
+re-created share does not count). That last check runs
+in the same database transaction that reserves the provider credential for the
+send, and it holds those settings unchanged until the send is reserved; key
 expiry and the account state are evaluated together against the database's
 statement clock, again after that transaction's last lock wait. If any of them no longer holds, nothing is sent. A change
 saved after that point applies from the next send.
 
-The owner's two settings are also checked before the request takes a provider
-capacity slot, so a request whose owner turned fallback (or grantee coverage)
-off after it arrived does not wait on the owner's provider capacity; it gets
-the same refusal the send check would give.
+The cloud mode is also checked before the request takes a provider slot, so a
+request whose owner turned the cloud mode off (or down to **For me**) after it
+arrived does not wait on the owner's provider slots; it gets the same refusal
+the send check would give.
 
 Each lock wait of the send check is bounded (2 s). If it cannot get its locks
-in time (for example while budget accounting holds the same provider account),
+in time (for example while spend accounting holds the same provider account),
 nothing is sent, the reservation is released, and the attempt counts as
 temporarily unavailable (`503 external_unavailable` on a provider-only pool).
-Using a token for local traffic never waits on that check: the token's
+Using an API key for local traffic never waits on that check: the key's
 "last used" time is recorded at most once a minute and skipped while the row
 is busy.
 
@@ -89,8 +112,8 @@ is busy.
 While a pool owner's account is banned (until a temporary ban expires) or has
 a pending deletion, the owner's pools are unavailable to everyone:
 
-- grantees no longer see them in `/v1/models`, the dashboard's model lists,
-  token allowlist choices, or the own-key fallback settings (a saved own-key
+- people they are shared with no longer see them in `/v1/models`, the web
+  app's model lists, API key pool choices, or the own-key settings (a saved own-key
   choice is kept and applies again when the owner's access returns); the
   usage overview labels them like a pool no longer shared with you;
 - requests that name them get the not-found error any unknown model gets
@@ -98,13 +121,13 @@ a pending deletion, the owner's pools are unavailable to everyone:
 - the send check above re-checks the owner's account against the database
   clock, own-key sends included; a ban or deletion mark saved while a request
   is in flight stops the send;
-- one local-send check runs before every send to the owner's machines. It
+- one local-send check runs before every send to the owner's nodes. It
   reads the owner's account, the requester's account (a requester banned or
   marked for deletion while the request waited gets `401`, nothing is sent),
-  the exact grant the request was resolved under (revoked: `404`) and the
+  the exact share the request was resolved under (deleted: `404`) and the
   member (removed or disabled: skipped): each local attempt (including after a wait in the local queue and
   before each retry on another member), the native context count, each media
-  transformer hop, and stored-Responses follow-ups bound to a local member;
+  sidecar hop, and stored-Responses follow-ups bound to a local member;
   a follow-up to a pool you can no longer see gets `404`, never `401` (a
   visible pool reached through different access than the binding's is `401`);
 - a request that finds the owner inactive after it arrived (at a local send,
@@ -113,21 +136,21 @@ a pending deletion, the owner's pools are unavailable to everyone:
   the external check instead finds the requester's own account banned or
   marked for deletion, the request also ends without those headers: `401` on
   pool requests, `403 external_not_permitted` on stored-Responses operations
-  bound to an external provider. Work already sent to the owner's machine or a
+  bound to an external provider. Work already sent to the owner's node or a
   provider is not recalled.
 
 When a temporary ban expires, or an admin lifts the ban, the pools are
-available again under the same grants.
+available again under the same shares.
 
 ### Provider target changes
 
 The same send check also confirms that the external member is still in the
 pool (and enabled for routing), that its provider model and account are still
-enabled, and that the provider endpoint and model are the ones the request was
+enabled, and that the provider URL and model are the ones the request was
 prepared for. If one of them changed since the request was routed, nothing is
 sent: the next external member is tried only when the operation can be safely
 retried; otherwise the request gets `503 external_unavailable` (a stored
-Responses follow-up whose member or endpoint is gone gets `404`, a disabled
+Responses follow-up whose member or provider URL is gone gets `404`, a disabled
 provider `503`).
 
 One availability condition is not re-checked at the send: a stored-Responses
@@ -136,28 +159,24 @@ honoured once.
 
 The request goes external only after local routing could not serve it:
 
-- the local wait expired (an `:external` caller waits at least the pool's
-  `externalAfterWaitMs` owner floor, default 2000 ms, and never longer than the
-  local wait budget; 0 means "go external at once when no local member is free
-  now"). A model-API token may store its own `externalAfterWaitMs` (null uses
-  each pool's wait). A request may send `x-wsmp-external-after-wait-ms`; that
-  override cannot go below the pool floor, and may lengthen up to the local
-  capacity wait budget. Owners and grantees cannot shorten below the pool
-  floor. Invalid header values are ignored. When `fallbackEnabled` or
-  `fallbackForGrantees` is off, there is no external plan and the caller waits
-  the full local budget.
+- the local wait expired: an `:external` caller with an external route waits
+  the pool's one max wait (Advanced, `maxWaitMs`, 30 s unless overridden; 0
+  means "go external at once when no local member is free now"), then goes
+  external. When the cloud mode does not cover the caller (and there is no
+  own-key route), there is no external plan and the caller waits the max wait
+  like the plain name.
   When the request's prefix is warm on a busy member, the other local members
   are held back for the pool's cache-holder wait first (see
   [Waiting for the cache holder](#waiting-for-the-cache-holder)); the external
   wait then counts from the end of that hold, so a request never goes external
   while a cold local member is free. Pre-commit retry rounds keep the original
-  external deadline instead of waiting another `externalAfterWaitMs` each;
+  external deadline instead of waiting another max wait each;
 - no local member is free for a new conversation because the members with an
   idle slot hold protected warm sessions (including your own; see
   [Warm-session protection](#warm-session-protection)). A pool is saturated
   for a request when no member is free for it, and "protected" counts as not
-  free for cache-protection scoring: with the owner's explicit
-  `paidWarmProtectionEnabled` consent, a new `:external` conversation may go external while a local
+  free for cache-protection scoring: with the owner's explicit paid warm
+  protection consent, a new `:external` conversation may go external while a local
   slot is technically idle but holds protected sessions. The reason is
   `local_saturated_protected`. A continuation of a conversation is never
   sent away by protection;
@@ -167,28 +186,26 @@ The request goes external only after local routing could not serve it:
 - the request is larger than every local context window (only for
   `:external`; a plain name keeps the context error).
 
-Hitting your own concurrency caps (per token, per user) is never a reason to go
+Hitting your own concurrency caps (per API key, per user) is never a reason to go
 external: you get `429` as before, and external requests (including stored
 Responses operations on externally served responses) count against those caps.
 
 A request has at most one external phase; precommit failover across external
 members follows the existing retry rules.
 
-On a pool that also has local members, an owner-paid external phase waits for
-provider capacity at most `min(provider member budget, 10 s)`. If no provider
-slot frees by then, the attempt counts as "provider busy" and the request goes
-back to its local queue for the rest of the local budget (see the table below).
-The 10 s cap covers the whole external phase: a pre-commit retry on the next
-external member gets only what is left of it.
-Pools with only external members keep the provider member's own budget.
+On a pool that also has local members, an owner-paid external phase waits a
+bounded time for a provider slot. If no provider slot frees by then, the attempt
+counts as "provider busy" and the request goes back to the local members (see the
+table below). A pre-commit retry on the next external member gets only what is
+left of that phase.
 
 ### New-conversation placement
 
 When a request is not affine on any member (no scored conversation-prefix depth
-and no conversation match), ranking spreads it by how full each member KV pool
+and no conversation match), scoring spreads it by how full each member KV pool
 already is. The resident set is unique unexpired sessions
-(`prefixDigest IS NULL`) on that capacity, newest 2,000 footprints per
-execution target, counted only above a one-token floor. Continuations still
+(`prefixDigest IS NULL`) on that instance, newest 2,000 footprints per
+instance, counted only above a one-token floor. Continuations still
 pin with prefix, conversation, and confirmed-cache weights; residency is not
 consulted when any member is affine.
 
@@ -207,20 +224,20 @@ Every mode is normalized to `[0, 1]` before member `weight` is applied, so a
 packed llama.cpp member cannot outscore a full vLLM member by raw session
 count. Member `weight` is a proportional share of new conversations, not a
 strict preference: a member with twice the weight receives about twice as many
-first turns when members are equally full. The pool setting
-`affinityResidencyWeight` (0–10000, default 100) scales that term; 0 turns
+first turns when members are equally full. The pool's Advanced setting
+`affinity.residencyWeight` (0–10000, default 100) scales that term; 0 turns
 spreading off. Ties break by instruction depth, then least-recent
-`lastRoutedAt` (written on grant), then the incoming member order
-(`publicOrder` / local weight order), then member id only on this residency
+`lastRoutedAt` (written on admission), then the incoming member order, then
+member id only on this residency
 branch. With spreading off, ties follow that incoming order, not member id.
 Warm-session protection still runs after placement and can redirect a new
 conversation away from a protected member.
 
 Residency spreading reads a maintained bucket of at most 2,000 newest footprint
-records per execution target (expiry, then record id), with strict expiry filtering.
+records per instance (expiry, then record id), with strict expiry filtering.
 Request completions update only these bounded metadata buckets. When deletion or
 an expiry reduction requires older records to be promoted, the bucket becomes
-unknown and spreading is suppressed for that ranking snapshot. Unknown is not
+unknown and spreading is suppressed for that scoring snapshot. Unknown is not
 evidence that a target is cold or unavailable and never authorizes paid fallback.
 A background worker discovers dormant targets in durable 32-target pages and repairs
 unknown buckets in durable 256-record pages; concurrent writes restart that repair.
@@ -234,21 +251,16 @@ budgets; the metadata bound does not promise a fixed number of physical database
 pages under arbitrary bloat, statistics or storage conditions.
 
 Private affinity belongs to the routing pool and remains isolated by requester,
-token/security scope, access grant and pool. A friend's active contribution can
-publish hints for that pool without granting machine or deployment control.
+API key scope, share and pool. A friend's active contribution can publish hints
+for that pool without giving the pool owner any control of the friend's nodes.
 Physical occupancy and warm protection aggregate bounded metadata from all pools
 sharing the target; they never match conversations across those private scopes.
 Revoking a contribution prevents new sends and may discard an in-flight request's
-optional cache metadata at completion. Clearing a pool or deleting its owner
-invalidates that pool's hints even when they reside on contributed hardware.
-Clear atomically advances the pool's private affinity incarnation. Its API/MCP
-receipt is `{cleared: true, reclamation: "pending"}`: old hints are immediately
-ineligible, while bounded background batches reclaim stored metadata after a
-restart too. Requests captured before clear cannot republish those hints;
-requests captured afterward can establish new warmth. Other pools retain their
-private hints and the backend's logical Responses state is unaffected.
+optional cache metadata at completion. Deleting a pool or its owner invalidates
+that pool's hints even when they reside on contributed hardware. Other pools retain
+their private hints and the backend's logical Responses state is unaffected.
 
-An observed cache reset commits the physical capacity's durable cache incarnation
+An observed cache reset commits the instance's durable cache incarnation
 before attempting optional residency cleanup. Bucket contention cannot restore
 old warmth: canonical/session hints, occupancy and protection compare against
 the committed authority. A relay reconnect is also a conservative physical-cache
@@ -278,7 +290,7 @@ A client-id fork stores `sharedWithSessionId` and `sharedPrefixTokens` on its
 first footprint write when another live session on the same target already owns
 that prefix. Warm protection and new-conversation residency then count the
 shared history once when the sharer is still an eligible session on the same
-capacity. Chains subtract only against the direct sharer. A resumed A↔F cycle
+instance. Chains subtract only against the direct sharer. A resumed A↔F cycle
 bills the shared prefix once (the back-pointer is ignored). If the sharer later
 drops out of the protected set because of a share cap, the child is slightly
 undercounted.
@@ -290,18 +302,16 @@ prefix. When that member is busy, the other members are not used at once: they
 become eligible only after the pool's cache-holder wait, so the warm member can
 take the request if it frees in time. Without an affinity hit nothing waits.
 
-- Automatic (the default): the re-prefill time the warm member saves, from the
-  matched prefix size and the member's measured cold prefill speed (recent
-  requests with at least 2000 prompt tokens and at most 5 % cache hits), capped
-  at 30 s; 2 s until the speed is measured.
-- A fixed value from 0 to 30000 ms (0 turns the wait off). Set it on the pool's
-  routing tab, `cacheHolderWaitMs` on `forwarderManagement.createModelPool` /
-  `updateModelPool` and `capacityManagement.updatePoolPolicy`, or the
-  `forwarder_model_pool_update` MCP tool (`null` = automatic).
+The wait is the re-prefill time the warm member saves, from the matched prefix
+size and the member's measured cold prefill speed (recent requests with at least
+2000 prompt tokens and at most 5 % cache hits), capped at 30 s; 2 s until the
+speed is measured. It has no setting of its own. Turning cache affinity
+off (the pool's Advanced tab, `affinity.enabled`) removes it, since without an
+affinity hit nothing waits.
 
-Relay metadata records `affinityWaitMs` (how long the request was held for the
-warm member) and `affinityOutcome` `HOLDER_WAITED` (the warm member was granted
-by the held admission) or `HOLDER_SPILLED` (another member was granted after the
+The request log records `affinityWaitMs` (how long the request was held for the
+warm member) and `affinityOutcome` `HOLDER_WAITED` (the warm member was admitted
+by the held admission) or `HOLDER_SPILLED` (another member was admitted after the
 wait). A member that serves only after a pre-commit failover keeps the ordinary
 affinity outcome (`PREDICTED_MATCH` / `NO_MATCH`).
 
@@ -314,15 +324,15 @@ both start counting after the hold.
 A new conversation should not evict a protected warm session's recently used,
 large prompt cache (including your own conversations') when another member, or
 an external provider, can take it. No engine
-reports how old its cached prefixes are, so WSMP estimates "warm" from its own
+reports how old its cached prefixes are, so WMP estimates "warm" from its own
 routing records (sizes and times only, never prompt content). Traffic that
-bypasses WSMP is not seen.
+bypasses WMP is not seen.
 
 A session is protected when it was used within the pool's protection window
 (default 5 minutes) and is at least the minimum size (default 8192 tokens).
 Eligibility uses that raw size; the tokens charged against a user's share and
 the member's protected total subtract `sharedPrefixTokens` when the direct
-sharer is also eligible on the same capacity, so a fork does not count the
+sharer is also eligible on the same instance, so a fork does not count the
 shared history twice. If the sharer later loses protection to a share cap, the
 child is slightly undercounted.
 For each request, every local member that has no affinity hit for it is:
@@ -330,7 +340,7 @@ For each request, every local member that has no affinity hit for it is:
 - **full** when all its slots are busy;
 - **protected** when it is not full but every idle slot holds a protected warm
   session (slot mode), or, when the engine reports its KV budget (vLLM, SGLang:
-  protocol 2.7 engine facts), when the protected tokens plus the request exceed
+  engine facts the node reports), when the protected tokens plus the request exceed
   90% of its effective budget (token mode). In slot mode a session whose next
   turn is running right now is served by one of the active leases, so it does not
   also fill an idle slot: only protected sessions no active lease is serving
@@ -342,7 +352,7 @@ Token-mode KV eviction feedback lowers the effective budget when a successful
 local pooled request continues a digest-proven, live-tip warm session whose
 previous matched record confirmed engine caching. Warm protection and
 residency placement both read that effective K. Both the expected prefix and
-the actual reported prompt must be at least `protectMinTokens`; the record must
+the actual reported prompt must be at least `minTokens`; the record must
 be within that engine's protection window and not older than an engine restart
 or prefix-cache counter drop. A reported cache read of at most 5% of the
 **reusable prompt prefix** (not prompt+completion) is a miss; a higher cache
@@ -380,10 +390,10 @@ the resolver picks the earliest-expiring tip. If another session last stamped
 the shared hint, that turn yields no evidence, failing closed. At most one
 observation is lost per tied session; its own identifiable write restamps the
 hints and restores evidence. No other session's footprint is accepted. These
-checks apply **as of the ranking snapshot** and do not establish engine residency
+checks apply **as of the scoring snapshot** and do not establish engine residency
 at dispatch or response time; a later unrelated writer does not affect that snapshot.
-The bound Responses `previous_response_id` path is excluded: it has neither a ranked
-decision nor the matched record's age. Endpoint prefix-cache counters are also
+The bound Responses `previous_response_id` path is excluded: it has neither a scored
+decision nor the matched record's age. Engine prefix-cache counters are also
 excluded: they are cumulative, include bypass traffic and cannot be attributed
 to a matched prefix. Unconfirmed records cannot count; remembering a zero-read
 miss removes confirmation from that prefix.
@@ -412,11 +422,11 @@ including llama.cpp, is unaffected. Budgets must be positive int32 counts;
 malformed budgets select slot mode, and corrupt stored cuts are clamped.
 
 Feedback is buffered without request-path I/O and flushed at most once per second
-per capacity per process, with one trailing timer. At most 1024 capacities are
+per instance per process, with one trailing timer. At most 1024 instances are
 pending; observations for new keys beyond that bound are dropped. Failed flushes
 are dropped and logged at most once per minute; feedback never affects response
 finalization. The owner-guarded atomic SQL upsert combines concurrent process
-writers without graph/capacity locks or transactions. Application time is passed
+writers without graph or instance locks or transactions. Application time is passed
 explicitly; negative elapsed time is clamped to zero and observation/expiry times
 use `GREATEST`, bounding clock skew. A write against an expired row is a new
 first miss, so the pending window is the 30-minute expiry rather than hourly
@@ -424,9 +434,6 @@ cleanup. Rows are an expiring class-H cache without
 foreign keys, never drained during parent deletion. Readers ignore expired rows
 and fall back to reported K if the read fails; retention deletes rows expired
 more than an hour ago. Shutdown clears timers and the DB fence prevents writes.
-The dashboard warns when the KV budget is lowered. The MCP pool-rules read
-shows reported/effective budgets, current cut/floor and observation/expiry times. This adds one table only;
-there is no destructive schema change.
 
 llama.cpp is always slot mode, and its sessions are protected for half the
 pool's window: it restores evicted slot prompts from host RAM, so evicting
@@ -438,7 +445,7 @@ Then:
    tried last.
 2. With only protected members, or protected and full ones, a new `:external`
    conversation may go external (`local_saturated_protected`) only with the owner's
-   explicit default-off `paidWarmProtectionEnabled` consent. Without that consent or an
+   explicit, default-off paid warm protection consent. Without that consent or an
    external route (plain name, or the attempt does not dispatch), the request is
    admitted on the protected member whose protected sessions are oldest (then
    smallest), with the full local wait budget: protection never makes a request
@@ -448,22 +455,19 @@ Then:
 With an opted-in paid cache-protection route, protected members sit out only the first local
 admission; after the external attempt they are ordinary (last) candidates.
 
-Protection is on by default. The pool's routing tab ("Protect active
-conversations"), `forwarderManagement.updateModelPool` and the
-`forwarder_model_pool_update` MCP tool set `protectionEnabled`,
-`evictionFeedbackEnabled` (on by default; off uses the reported K and ignores
-stored cuts while protection stays on; unfreeze resumes from stored state),
-`protectionWindowSeconds` (1–3600),
-`protectMinTokens`, and how one member's
-capacity is shared between the people whose sessions are warm
-(`protectionShare`):
+Protection is on by default. The pool's Advanced tab, `pools.update`
+(`advanced.protection`) and the `pool_update` MCP tool set `enabled`,
+`evictionFeedback` (on by default; off uses the reported K and ignores
+stored cuts while protection stays on; turning it on again resumes from stored state),
+`windowSeconds` (1–3600), `minTokens`, and how one member's slots are shared
+between the people whose sessions are warm (`share`):
 
-- `EQUAL_SHARE` (default): each active user may keep `max(1, slots / active
+- `equal_share` (default): each active user may keep `max(1, slots / active
   users)` sessions protected. An active user has at least one session inside the
   window and above the minimum size; small or idle sessions do not dilute
   anyone's share.
-- `FIXED_PERCENT`: each user may keep `protectionFixedPercent` % of the slots.
-- `FIRST_COME`: no per-user cap.
+- `fixed_percent`: each user may keep `fixedPercent` % of the slots.
+- `first_come`: no per-user cap.
 
 A valid client conversation id is authoritative, even when instructions change.
 Without one, continuity uses the last 64 digest-chain nodes, deepest first: a
@@ -490,7 +494,7 @@ The first valid carrier wins: body `conversation`, then `conversation_id`
 `_session_<uuid>` (only the UUID). Header names ignore case. Ids are trimmed
 strings of 1–256 characters from `[A-Za-z0-9._:/@=+-]`; invalid carriers fall
 through without errors. Only the original authenticated request supplies ids.
-They are HMACed with requester tenant, resource owner, token scope, grant,
+They are HMACed with requester tenant, resource owner, API key scope, share,
 pool, target/runtime and surface, so the same string cannot cross those
 boundaries. Raw ids are never stored. Session headers are read separately from
 the upstream header allowlist, including external fallback.
@@ -536,7 +540,7 @@ depth 0; each object property or array entry adds one level). Exceeding that
 limit or a converter/HMAC/work-budget error makes the whole request unidentifiable:
 no nodes, hints, client session footprint or Responses lineage.
 
-Ranking builds canonical request material once and reuses it across targets;
+Scoring builds canonical request material once and reuses it across targets;
 only binding and HMAC work depends on the target. A shared **16,777,216 visited-node
 budget (8 × 2 MiB)** bounds validation, extraction and incremental serialization.
 Work-budget exhaustion makes the whole advisory request unidentifiable. Arrays
@@ -564,7 +568,7 @@ per-turn footprint. Routing hints never establish resolver identity.
 
 Model API JSON acceptance has a separate **256-level request nesting limit**,
 measured iteratively with parallel container/depth stacks immediately after JSON
-parsing, before model lookup, counting, affinity ranking or dispatch. Depth 257 and above return HTTP 400 with
+parsing, before model lookup, counting, affinity scoring or dispatch. Depth 257 and above return HTTP 400 with
 a protocol-appropriate invalid-request error: `request JSON nesting exceeds 256
 levels`. Depth 129 through 256 is served with affinity advisory identity off,
 including bound Responses follow-ups. Realistic tool/JSON schemas are far below
@@ -582,17 +586,17 @@ JSON bodies, SSE stream `data` JSON, and embedded tool arguments decoded during
 response adaptation. Overflow is an upstream failure:
 `response_json_depth_exceeded` / `provider response JSON nesting exceeds 256 levels`.
 It returns HTTP 502 before any output, or a terminal protocol error event after
-output; the relay finishes `FAILED` with `protocol_error`. Native argument strings
+output; the request is recorded `FAILED` with `protocol_error`. Native argument strings
 passed through without decoding retain their existing behavior.
 
 The shared parser covers `/chat/completions`, `/messages`,
 `/messages/count_tokens`, `/responses` (create and bound input follow-ups),
 `/responses/count_tokens`, `/embeddings` and `/audio/speech`, including local,
-public-overflow and authenticated Chat Test paths. MCP tool arguments use the
+`:external` and signed-in Test page paths. MCP tool arguments use the
 same guard before their first size serialization, and the chat diagnostic core
 checks again before creating its synthetic model API request. Multipart audio
 routes do not parse JSON bodies. Responses retrieve/delete/cancel/input-items/
-compact use empty relay bodies. Other JSON reads in routing, public overflow,
+compact use empty forwarded bodies. Other JSON reads in routing, external dispatch,
 privacy, diagnostics and protocol adapters inspect already accepted internal
 requests, upstream responses/SSE, or embedded tool argument strings; they are
 not separate HTTP JSON acceptance paths.
@@ -620,29 +624,27 @@ ids in `admission_request.warmSessionIds`.
 
 The records of
 every pool of the owner on the member count; each session's override comes from
-its own pool (grant, or the owner's percent), each distinct override is its own
-budget (the share mode, window and minimum size are the requesting pool's), and one user's total never exceeds their largest share. `UNPROTECTED`
+its own pool (the share, or the owner's percent), each distinct override is its own
+allowance (the share mode, window and minimum size are the requesting pool's), and one user's total never exceeds their largest share. `UNPROTECTED`
 sessions are never shielded and never count. Reads are bounded per user per
 member and override value (2000 newest sessions), so one busy user or pool cannot hide another's
 sessions.
 
 Over the share, a user's oldest sessions lose protection first. The owner has
-no grant, so `ownerProtectionPercent` sets the owner's own share (null = the
-share mode, 0 = unprotected, 1–100 = percent). Each grant has the same override
-(`protectionOverridePercent`) plus a queue priority (`queuePriority`, 0–31)
-that replaces the pool and member capacity priority for that grantee's waiting
-requests (null inherits). The owner can also set a per-grant owner-paid
-`:external` spend cap (`BudgetScopeType.POOL_GRANT`, keyed by the owner, the
-pool and the grantee). Admission and settlement charge that cap first, then
-the owner's account and attachment budgets. Exhausting it fails `:external`
-for that grantee (`429 grantee_spend_cap`) without amounts or policy ids;
-local members still serve. The recorded spend survives revoking and
-re-granting the pool and editing the cap's period; changing its currency
-starts a new cap. The cap's currency must match the pool's provider pricing.
-Own-key traffic and the pool owner are not charged against it. Only the pool
-owner sets these: the pool's Sharing tab, `forwarderManagement.updatePoolGrant`,
-or the matching MCP tool. `providerManagement` budget procedures refuse
-`POOL_GRANT` scopes.
+no share, so the Advanced setting `protection.ownerPercent` sets the owner's own
+share (automatic = the share mode, 0 = unprotected, 1–100 = percent). Each share
+has the same override (`protectionPercent`) plus a priority class
+(`priorityClass`: background, normal or high) that replaces the pool's class for
+that person's waiting requests (null inherits). The owner can also set a
+per-share monthly cap on owner-paid `:external` spend (`monthlyCap`, a `SHARE`
+spend cap). Admission and settlement charge that cap first, then the owner's
+provider account cap. Exhausting it fails `:external` for that person
+(`429 grantee_spend_cap`) without amounts or cap ids; local members still serve.
+A cap's currency changes only while it has no spend or reservation this month
+(`cap_currency_has_spend`). Own-key traffic and the pool owner are not charged
+against it. Only the pool owner sets these, and only as a person: the pool's
+Sharing tab or `access.shares.update` (no MCP tool). `providers.spendCaps.set`
+sets provider account caps only.
 
 ### When the external attempt does not happen
 
@@ -655,13 +657,13 @@ preserve the upstream status as described under [Own-key failure and accounting]
 
 | Situation | Result |
 | --- | --- |
-| Local wait expired, pool has local members (including a capped provider wait that expired) | Waits again for the rest of the local budget, `B - min(B, E)` (B = local wait budget, E = `externalAfterWaitMs`; no budget stays unbounded; 0 means "only if free now"). If still no slot: `429 rate_limited`, like the plain name. The place in the local queue is not kept. |
+| Local wait expired, pool has local members (including a capped provider wait that expired) | Tries the local members again for the rest of the pool's max wait. The `:external` caller already waited all of it, so a slot must be free right now. If not: `429 rate_limited`, like the plain name after the same wait. The place in the local queue is not kept. |
 | No compatible or healthy local member, context too large, or local failures after every member was tried | The same error the plain name gets. |
 | Pool has only external members, no external member fits the request | `400 unsupported_capability` |
 | Pool has only external members, the compatible ones are all in a provider health cooldown | `503 external_unavailable` |
 | Pool has only external members, provider busy | `429 rate_limited` |
-| Pool has only external members, this grantee's owner-paid spend cap is exhausted | `429 grantee_spend_cap` (no remaining amount, policy id, or account label) |
-| Pool has only external members, anything else (unhealthy, failure before the first byte, send check timed out, fallback or consent withdrawn) | `503 external_unavailable` |
+| Pool has only external members, this share holder's monthly cap is used up | `429 grantee_spend_cap` (no remaining amount, cap id, or account label) |
+| Pool has only external members, anything else (unhealthy, failure before the first byte, send check timed out, cloud mode or own-key consent withdrawn) | `503 external_unavailable` |
 | Owner account banned or deletion pending (any pool shape) | `404`, the request ends (see [Pool owner account state](#pool-owner-account-state)) |
 | Requester account banned or deletion pending, seen by the external check | `401`, the request ends, no `x-wsmp-fallback` |
 | Client cancels before a provider response is committed | `499 cancelled` (also recorded as 499, irrespective of a rejected upstream status, and also when the external attempt had already ended as busy or unavailable) |
@@ -670,10 +672,6 @@ All of these except the two account rows carry `x-wsmp-fallback: unavailable`.
 
 ## Responses and headers
 
-- `x-wsmp-external-after-wait-ms` (request): optional per-request wait in
-  milliseconds for `:external` callers. Invalid values are ignored. Pool
-  `externalAfterWaitMs` is an owner floor: callers may only lengthen, up to
-  the local capacity wait budget, and cannot shorten below the floor.
 - `x-wsmp-route: local | pool-fallback | own-key`
 - `x-wsmp-fallback-reason` and `x-wsmp-served-model` on external responses.
   The reason is `local_wait_expired`, `local_saturated_protected`,
@@ -681,25 +679,26 @@ All of these except the two account rows carry `x-wsmp-fallback: unavailable`.
   The response `model` field is the provider's served model id.
 - `x-wsmp-fallback: unavailable` when `:external` was requested, the response
   did not come from an external provider, and either no external route exists
-  for this caller (owner settings, or no external members) or an external
+  for this caller (cloud mode, or no cloud members) or an external
   attempt was needed but did not happen. A `:external` request that local
   members served before any trigger fired carries no such header.
 - With the switch off, `:external` requests get `403 external_providers_disabled`
   (OpenAI error shape, or an Anthropic `permission_error` on `/v1/messages`) and
   `/v1/models` does not list `:external` names.
-- A token that does not allow external providers gets
-  `403 external_not_permitted` for `:external` names.
+- With the switch on, an agent test (`model_test`) of an `:external` name gets
+  `400 external_not_supported_for_mcp`.
 - A pool with only external members answers its plain name with
   `400 external_required`, naming the `:external` id.
 
-`/v1/models` lists only ids this token can call now. Plain pool and direct ids
-need a published PRIMARY local member (or the direct model) with a live CLI
-session; empty, unpublished, and disconnected ids are omitted. FULL or
-saturated local pools stay listed. `owner/pool:external` is listed when this
-token could be served that way (switch, token, owner consent, and a configured
-pool fallback or own-key route), even if no local member is live.
+`/v1/models` lists the callable IDs this API key may call now (and the caller's
+model-name aliases). A plain pool name needs at least one active member on a ready
+instance whose node is connected; empty and disconnected pools are omitted. Full or
+saturated pools stay listed. `owner/pool:external` is listed next to a listed plain
+name when this caller could be served that way (switch on, the cloud mode covers the
+caller, and at least one cloud member or an own-key route), from configuration, not
+provider health.
 
-Attempts that are refused before provider I/O settle their token and spend
+Attempts that are refused before provider I/O settle their token-count and spend
 reservations at zero. If bytes may have reached the provider and no trustworthy
 usage is available, settlement retains the conservative reserved amount.
 
@@ -707,122 +706,65 @@ usage is available, settlement retains the conservative reserved amount.
 
 A response served externally can be continued, retrieved, cancelled, compacted,
 listed, or deleted only with `owner/pool:external`-level consent that still
-holds (switch, token, and owner settings), checked on arrival and again
+holds (switch and cloud mode, or own-key consent), checked on arrival and again
 before sending. Withdrawing these restorable permissions gives `403 external_not_permitted` (or
 `403 external_providers_disabled` with the switch off). A plain-name follow-up
 gets `400 external_required`. A busy provider gives `429`. A provider that is
 temporarily unavailable (a disabled model or account, health cooldown, a recovery
 probe already in flight, a failure before anything was sent) gives
 `503 external_unavailable`; retry later. Only a binding
-that can never be served again (its member, endpoint identity or version,
-upstream model, or native Responses support changed, or its exact grant was
-revoked or replaced) gives `404`, whether detected on arrival or at the send
-boundary. Re-granting access cannot revive an old binding. `:external`
+that can never be served again (its member, provider URL identity or version,
+upstream model, or native Responses support changed, or its exact share was
+deleted or replaced) gives `404`, whether detected on arrival or at the send
+boundary. Sharing the pool again cannot revive an old binding. `:external`
 follow-ups to locally served responses stay on their local member.
 
-Locally served responses work the same way for owners and grantees: a
+Locally served responses work the same way for owners and share holders: a
 follow-up returns to the member (and backend) that stored the response. A
-grantee's binding is tied to their exact grant, so revoking or replacing the
-grant removes it (`404` afterwards). A member that was removed from the pool or
+share holder's binding is tied to their exact share, so deleting or replacing the
+share removes it (`404` afterwards). A member that was removed from the pool or
 disabled is no longer reachable through the binding (`404`); a draining member
 still serves its follow-ups. These checks run again right before the request is
-sent, so a revoke or removal while a request waits for capacity also gives
+sent, so a share deletion or member removal while a request waits for a slot also gives
 `404`. A locally served response ends only once its follow-up binding is
 saved. If the binding cannot be saved (for example, the member was removed or
-the grant revoked while the response was generated), the response ends with a
+the share deleted while the response was generated), the response ends with a
 stream error instead of a clean end, because it could not be continued.
 
-## Breaking changes in this release
+## Upgrading from 0.3
 
-The consolidated upgrade notes, including deploy requirements and the grantee
-local-member fix, are in [`release-notes/next.md`](release-notes/next.md).
+0.4.0 starts from a fresh database (see [`release-notes/next.md`](release-notes/next.md)).
+For cloud fallback: the pool's cloud mode replaces the owner's fallback and
+"also for people I share with" switches, API keys no longer carry a cloud
+switch or a per-key wait (the pool's max wait applies), and monthly caps on
+provider accounts and shares replace budget policies.
 
-- Plain pool names never leave the deployment. Provider-backed PRIMARY members
-  were moved to the external fallback tier, and fallback was enabled on those
-  pools. Pools with only provider members must be called as
-  `owner/pool:external`.
-- Existing API tokens are private-only until a person enables "Allow external
-  providers" on the token (and, for allowlist tokens, per pool).
-- `fallbackForGrantees` is off for every pool, including existing ones. Owners
-  must opt in to pay for grantees' external use.
-- Stored-Responses bindings to provider members created before this release
-  are invalidated; their follow-ups return "not found".
-- The grant-time egress acknowledgement is gone. The pool create/update and
-  grant procedures (oRPC and MCP) no longer take `publicEgressAcknowledged` or
-  `publicEgressEnabled`; unknown arguments are stripped, so old clients
-  silently lose them. Use `fallbackEnabled`, `fallbackForGrantees`, and
-  `externalAfterWaitMs` on the pool procedures. Over MCP, the general pool
-  tools reject `fallbackEnabled` and `fallbackForGrantees`; change them with
-  `forwarder_pool_fallback_update` (literal `mcp:write`, no confirmation, cost
-  stated in its description, every change audited). The guarded pool tool
-  creates local-only pools. A new
-  `externalAfterWaitMs` must not exceed the pool's local wait budget; a save
-  that does not change it is never rejected because of it. The guarded pool wizard also strips the old arguments and rejects provider models
-  at the PRIMARY tier.
-- Owners can turn fallback off without removing external members.
-- Wait budgets are measured on the database clock. A budget of 0 now means
-  "admit only if a slot is free right now" instead of never admitting.
-- With the deployment switch off, provider keys and configuration can still be
-  listed, revoked, and deleted.
+## In the web app
 
+On a pool's **Cloud** tab (`/{lang}/pools/{poolId}/cloud`), choose the cloud mode:
+**Off**, **For me**, or **For me and people I share with**. The last one lets the
+people you share the pool with use your providers at your expense, up to each
+share's monthly cap (set on the pool's **Sharing** tab). Only a person changes the
+cloud mode, paid warm protection and own-key consent; agents cannot. The same tab
+lists the cloud members in the order they are tried: only provider models a person
+enabled on the **Providers** page qualify (`pools.update` `cloudMembers`, or the
+`pool_update` MCP tool). A new pool starts with the cloud mode off.
 
-### Legacy storage removed (one `APPLY_SCHEMA=dangerous` deploy)
+Turning on a cloud mode lets prompts, attachments, tools, and generated output
+leave this server for third-party providers when a request uses
+`owner/pool:external` and local members cannot serve it. API keys have no
+separate cloud switch.
 
-The release that removes the retired acknowledgement storage requires
-`APPLY_SCHEMA=dangerous` once. Back up the database first. It drops
-`model_pool."publicEgressAcknowledged"` and the `dashboard_notice` table
-(legacy grantee notices, unused since the fallback redesign), and the unused
-`user` index on `("deletionSweepNextAttemptAt", "deletionRequestedAt")`. No
-user-visible behaviour changes. The pool field `fallbackEnabled` keeps its
-stored column name `publicEgressEnabled`. The same deploy carries the capacity
-lock redesign (DL-1): it drops the foreign keys between request history and
-the dashboard graph and moves the capacity scheduler state into
-`capacity_runtime`. Stop every running server before the apply; an old server
-writes columns the apply removes.
+Pools shared with you show coarse provider types at most, never the owner's
+account labels, identifiers, URLs or credential metadata. Shared request history
+also withholds the owner's target, member, instance and attempt identifiers.
+The **Test** page lists a separate `:external` entry for eligible pools;
+selecting it provides the signed-in person's consent for that test.
 
-## Dashboard flow
-
-On a pool’s **Fallback** page, enable **Allow external fallback** and optionally
-**Also for grantees**. The second setting lets shared users use your providers
-at your expense; their token and request must still opt in. The page shows both
-model names with copy buttons. Selecting provider models in the setup wizard
-enables fallback for the owner; sharing it stays off. No additional confirmation,
-grantee notice, or email is sent.
-
-API tokens are always created local only. Cloud access is a separate human
-choice made afterwards with **API tokens → Cloud access**, which saves the
-switch, the pools and the optional wait together. Allowlist tokens choose
-which of their pools may use the cloud; only pools with cloud providers are
-offered. Turning cloud access off and back on preserves the saved per-pool
-choices, including an empty selection. All-visible tokens allow all pools
-with cloud providers or none.
-Enabling the permission lets prompts, attachments, tools, and generated output
-leave this deployment for third-party providers when the request uses
-`<pool>:external` and local members cannot serve it.
-
-The **Fallback available** badge (a static **Local only** chip otherwise)
-describes availability for the viewer, based on the deployment switch, pool
-settings, configured provider members and, for grantees, their own provider
-key. Tapping, clicking, hovering or keyboard-focusing it opens a hint that lists
-the routes open to this viewer: the pool's fallback providers and/or the
-viewer's own provider key (billed to them). It does not promise current provider
-health or imply that plain-name requests go external.
-Owners see their provider account labels. Eligible grantees see only coarse provider
-types, never the owner's account labels, identifiers, URLs or credential metadata;
-ineligible grantees receive neither labels nor types. Shared request history also
-withholds the owner's target, member, capacity and attempt identifiers.
-Chat Test lists a separate `:external` entry for eligible pools; selecting it
-provides the signed-in person’s consent for that test.
-
-Provider management remains on the Pools and Fallback pages when the deployment
-switch is off. Stored account and key details remain visible, with revoke and
-delete actions available. Creation, edits, imports, and credential tests are
-hidden or disabled. Token and pool consent can still be withdrawn: turn external
-access off, uncheck per-pool consent, and disable pool fallback or grantee
-coverage; wait-time edits still save. Turning consent on or enabling fallback
-while the switch is off is blocked in the UI with feedback. Saved choices
-remain intact. While deployment flags load, the UI shows skeletons; a failed
-fetch shows a retry state. Secrets are never returned.
+With the server switch off, provider accounts and keys can still be listed,
+revoked and deleted, and cloud modes can still be turned off; catalog searches
+and credential tests refuse because they would contact a provider. Secrets are
+never returned.
 
 
 ## OpenRouter privacy (`data_collection: "deny"`)
@@ -830,20 +772,20 @@ fetch shows a retry state. Secrets are never returned.
 Every request WMP sends to an **OpenRouter** provider account carries
 OpenRouter's provider-routing preference `provider: { data_collection: "deny" }`.
 OpenRouter then routes only to upstream providers that do not store or train
-on prompts. This covers owner-paid pool fallback and own-key (BYOK) traffic,
+on prompts. This covers owner-paid pool fallback and own-key traffic,
 native pass-through and adapted requests alike. Other provider types never get
 the field. If the rendered body already has a `provider` object, its other keys
 are kept and `data_collection` is overwritten, so a caller cannot relax it.
 
-Each OpenRouter account has the setting **Allow OpenRouter providers that may
-collect data** (off by default) on the Cloud providers page. The owner sets it for
-owner-paid accounts; grantees set it on their own accounts. It is human-only:
-MCP cannot change it, and MCP cannot move an OpenRouter account to another
-provider type either (that would drop the preference, which is keyed on the
-type). Changing an account's provider type in the dashboard resets the setting
-to off. Turning it off takes effect for requests not yet sent: the send step
-re-reads it under the account lock. Changes are recorded as `ACCOUNT_UPDATED`
-provider audit events.
+Each OpenRouter account has the setting **Allow the provider to collect data
+(OpenRouter)** (off by default) on its page under **Providers**
+(`/{lang}/providers/{accountId}`, `providers.accounts.setDataCollection`). The
+owner sets it for owner-paid accounts; share holders set it on their own accounts.
+It is human-only: MCP cannot change it, and an account's provider type cannot
+change after it is created (the preference is keyed on the type). Turning it off
+takes effect for requests not yet sent: the send step re-reads it under the
+account lock. Changes are recorded as `provider.account.data_collection` audit
+events.
 
 With `deny` on, some models (often `:free` ones) have no eligible provider.
 OpenRouter then answers 404 ("No endpoints found matching your data policy");
@@ -852,53 +794,54 @@ that names the cause, instead of the bare 404 (an OpenAI error object, or an
 Anthropic `api_error` envelope on the Messages surface). Choose another model or allow
 data collection on that account.
 
-## Own-key routing (BYOK)
+## Own-key routing (your own key)
 
-`/{lang}/dashboard/cloud-providers` manages your provider keys. Its **Pools** tab
-lets a grantee choose a model from their own account for each shared pool.
-The owner must declare `externalEquivalentModel`; it is the picker's initial
-suggestion, not a required upstream id. An owner uses their own keys as pool
-members, never through a grantee preference. Clearing a choice is always
-available, including while the deployment switch is off.
+**Providers** (`/{lang}/providers`) manages your provider keys. On **Access →
+Shares** (`/{lang}/access/shares`, `access.shares.setOwnKey`) a share holder
+chooses a model from their own account for each pool shared with them. The owner
+must first declare an equivalent OpenRouter model on the pool's Cloud tab
+(`pools.cloud.setOwnKeyEquivalent`; null withdraws the consent); it is the picker's
+initial suggestion, not a required upstream id. An owner uses their own keys as
+cloud members, never through an own-key choice. Clearing a choice is always
+available, including while the server switch is off.
 
 Local members are always tried first. At the existing external triggers
-(no healthy compatible local member, wait budget, pre-first-byte local
-failure after other locals, or an oversized `:external` context), a grantee's
-own-key route is tried before owner-paid fallback. Only a failure before any
-client bytes permits another route, and owner-paid fallback still requires
-`fallbackEnabled` and `fallbackForGrantees`. Streams never switch midway.
+(no healthy compatible local member, max wait, pre-first-byte local
+failure after other locals, or an oversized `:external` context), a share
+holder's own-key route is tried before owner-paid fallback. Only a failure before
+any client bytes permits another route, and owner-paid fallback still requires the
+cloud mode **For me and people I share with**. Streams never switch midway.
 
-Own-key egress requires the deployment switch, the `:external` name, a valid
-requester, token `allowExternal` (and ALLOWLIST `includeExternal` for the pool),
-the exact live grant, the owner's equivalent declaration, and a requester-owned
-enabled model/account/current credential. Signed-in Chat Test follows the
-same explicit-name consent as other external requests. MCP cannot set these
-preferences. The send claim rechecks consent under the documented C1–C6 lock
-order after capacity and budget waits, with a fresh requester-validity read
-after the final lock wait. Revoking and replacing a grant never revives an old
+Own-key egress requires the server switch, the `:external` name, a valid
+requester, the exact live share, the owner's equivalent declaration, and a
+requester-owned enabled model/account/current credential. The signed-in Test page
+follows the same explicit-name consent as other external requests. MCP cannot set
+these preferences. The send check rechecks consent under the server's lock order
+after the slot and spend waits, with a fresh requester-validity read after
+the final lock wait. Deleting and re-creating a share never revives an old
 preference or Responses binding.
 
-Own-key dispatch uses **DIRECT admission on the requester's capacity**.
-Budgets, pricing, reservations, attempts and usage belong to the requester;
-the owner's pool budget is not charged. Cache affinity is skipped. Usage
+Own-key dispatch is admitted directly on the requester's own provider account.
+Caps, pricing, reservations, attempts and usage belong to the requester; the
+owner's caps are not charged. Cache affinity is skipped. Usage
 rollups omit the owner's pool/member keys. Owners receive only an aggregate
-own-key request count, with no grantee provider or target details. Raw counts
+own-key request count, with no share holder provider or target details. Raw counts
 follow RelayRequest retention. Durable own-key route identity is written
 before provider I/O, so crash repair retains requester ownership.
 
-**Media:** the pool's media transformer runs before routing. Your own provider
-receives that transformed payload, including any transformer results. Original
+**Media:** the pool's media sidecars run before routing. Your own provider
+receives the payload after them, including the sidecars' results. Original
 media is not buffered for a separate external route. Protocol adaptation for
-your model is opt-in on your Pools choice; it does not inherit the owner's
-adaptation switch or lossy developer-role setting.
+your model is opt-in on your own-key choice (`protocolAdaptation`); it does not
+inherit the owner's adaptation switch or lossy developer-role setting.
 
-Native Responses bindings store the route and exact provider endpoint tuple.
+Native Responses bindings store the route and exact provider URL tuple.
 Own-key follow-ups require `:external` and current own-key consent. Stored
 response operations revalidate consent too: withdrawals return 403, permanent
-identity/grant loss 404, and temporary provider unavailability 503. Bindings
-never fail over to another route. The HTTP route header uses `pool-fallback`;
-existing durable owner-paid records retain `pool-external` for additive schema
-compatibility. Own-key durable records and headers use `own-key`.
+identity/share loss 404, and temporary provider unavailability 503. Bindings
+never fail over to another route. The `x-wsmp-route` header uses `local`,
+`pool-fallback` or `own-key`; stored request records use `local`, `cloud` or
+`own_key`.
 
 Catalog pricing bounds include base and tiered one-hour cache writes and audio
 tokens; any variable (`-1`) or malformed supported rate makes pricing unknown.
@@ -917,7 +860,7 @@ response on the conservative liability path. Spend settles from OpenRouter's
 `cost` ("the total amount charged to your account"). With `is_byok: true` the
 upstream provider also bills the key owner, so spend is `cost +
 cost_details.upstream_inference_cost` ("the actual cost charged by the upstream
-AI provider"); a BYOK usage without a valid upstream cost keeps the liability.
+AI provider"); an `is_byok` usage without a valid upstream cost keeps the liability.
 `is_byok` must be present as a boolean (every capture carries one): a missing,
 null or non-boolean value is invalid usage and keeps the liability.
 A response settles only from its one authoritative usage record: Chat, the
@@ -952,12 +895,12 @@ text outside a record (for example in SSE comments or a truncated body) is
 never read. Other provider types do not accept this
 vocabulary: the same payload from an `openai` or `*-compatible` account still
 fails closed. Provider
-search, image and audio service charges can be non-token charges: token prices
-and token-based budgets are not a bound on the provider's total bill. The
+search, image and audio service charges can be non-token charges: token prices,
+and monthly caps reckoned from them, are not a bound on the provider's total bill. The
 picker and import summary disclose this limitation.
 
 ### Own-key failure and accounting
 
-Own-key capacity admission tries only capacity available now, preserving time for the owner-paid tier and any remaining local wait. A skipped own-key tier permits an independently consented owner-paid attempt even for non-retry-safe operations; after provider I/O may have started, the operation's retry policy applies. No tier changes after a response commits. On a provider-only pool, when the owner-paid plan is disabled or empty, an own-key provider error retains its status and safe Retry-After header. Cancellation retains the relay's cancellation status. Unserved failures have no `x-wsmp-route` header. Owner-paid failures retain the status table above, including `503 external_unavailable` for transport errors and retryable upstream failures before the first byte.
+Own-key admission tries only provider slots available now, preserving time for the owner-paid route and any remaining local wait. A skipped own-key route permits an independently consented owner-paid attempt even for non-retry-safe operations; after provider I/O may have started, the operation's retry policy applies. No route changes after a response commits. On a provider-only pool, when the owner-paid plan is disabled or empty, an own-key provider error retains its status and safe Retry-After header. Cancellation retains the server's cancellation status (499). Unserved failures have no `x-wsmp-route` header. Owner-paid failures retain the status table above, including `503 external_unavailable` for transport errors and retryable upstream failures before the first byte.
 
-Own-key route/target intent is persisted after consent and request setup, immediately before transport I/O. Known no-send failures leave the prior route intact. A failed, uncommitted tier durably restores the prior route and target before pool fallback or local resumption. Terminal metadata uses that same identity. Crash recovery attributes a pending send intent to the requester because the transport may have run; a crash before intent or after supersession uses the prior route. The owner's aggregate counts successful own-key requests only.
+Own-key route/target intent is persisted after consent and request setup, immediately before transport I/O. Known no-send failures leave the prior route intact. A failed, uncommitted route attempt durably restores the prior route and target before pool fallback or local resumption. Terminal metadata uses that same identity. Crash recovery attributes a pending send intent to the requester because the transport may have run; a crash before intent or after supersession uses the prior route. The owner's aggregate counts successful own-key requests only.

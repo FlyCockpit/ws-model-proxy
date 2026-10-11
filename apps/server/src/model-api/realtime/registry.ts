@@ -20,10 +20,10 @@ import { REALTIME_CLOSE_CODES } from "./transcription-session.js";
  *
  * - `closeAll()` (shutdown) ends each with 1001 and refuses later additions.
  * - `recheckSessions()` (every 60 s, relay maintenance) rechecks the
- *   credential (a model API token, or a Chat Test dashboard session),
+ *   credential (an API key, or a Chat Test dashboard session),
  *   model access and the opened member for each session and ends a session
  *   that lost any of them: 1008 for the credential or the model, 1011 for a
- *   member that is no longer published or recipe-managed. A lookup that
+ *   member that is no longer a live-capable route of its target. A lookup that
  *   throws skips that session for one sweep (the terminal rechecks' rule).
  * - A lost capacity lease ends its session with 1011.
  */
@@ -46,6 +46,8 @@ type Entry = {
   resolved: RealtimeResolvedTarget | null;
   candidate: RealtimeCandidate | null;
   checking: boolean;
+  /** Asked to recheck while a check was running (it may have read the old state). */
+  again?: boolean;
 };
 
 export type RealtimeRegistration = {
@@ -178,7 +180,7 @@ export class RealtimeSessionRegistry {
     }
   }
 
-  /** A model API token was revoked: its sessions end at once (1008). */
+  /** An API key was revoked: its sessions end at once (1008). */
   terminateForToken(tokenId: string) {
     for (const entry of [...this.entries]) {
       if (entry.credential.kind === "token" && entry.credential.tokenId === tokenId) {
@@ -207,6 +209,21 @@ export class RealtimeSessionRegistry {
         code: "server_shutting_down",
         message: "The server is shutting down.",
       });
+    }
+  }
+
+  /**
+   * A person's access changed (a share was revoked): recheck their sessions now. A session
+   * mid-check is rechecked once more after it (that check may have read the old state).
+   */
+  async recheckForUser(userId: string): Promise<void> {
+    const mine = [...this.entries].filter((entry) => entry.userId === userId);
+    for (const entry of mine) if (entry.checking) entry.again = true;
+    const pending = mine.filter((entry) => !entry.checking);
+    for (let index = 0; index < pending.length; index += RECHECK_CONCURRENCY) {
+      await Promise.all(
+        pending.slice(index, index + RECHECK_CONCURRENCY).map((entry) => this.recheckOne(entry)),
+      );
     }
   }
 
@@ -241,8 +258,14 @@ export class RealtimeSessionRegistry {
     } finally {
       entry.checking = false;
     }
-    if (verdict.ok || !this.entries.has(entry)) return;
-    this.end(entry, verdict.reason);
+    if (!verdict.ok && this.entries.has(entry)) {
+      this.end(entry, verdict.reason);
+      return;
+    }
+    if (entry.again && this.entries.has(entry)) {
+      entry.again = false;
+      await this.recheckOne(entry);
+    }
   }
 }
 

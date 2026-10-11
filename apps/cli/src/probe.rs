@@ -6,12 +6,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use std::collections::BTreeMap;
-
 use crate::config::{
-    CapabilityConfidence, CapabilityOverrideMode, CapabilitySource, Config, EndpointConfig,
-    ModelConfig, OpenAiCompatibleCapabilities, ProbeSnapshot, ProbeStatus, ReasoningConfig,
-    SurfaceCapabilities, SurfaceInventory,
+    CapabilityConfidence, CapabilityOverrideMode, CapabilitySource, EndpointConfig,
+    OpenAiCompatibleCapabilities, ProbeStatus, ReasoningConfig, SurfaceCapabilities,
+    SurfaceInventory,
 };
 use crate::slug::slugify_seed;
 
@@ -27,9 +25,6 @@ pub struct ProbeReport {
     /// Engine detection result (online probes only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine: Option<crate::engine::DetectedEngine>,
-    /// Integer facts from a configured adapter (online probes only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub adapter: Option<crate::engine_adapter::AdapterCachedFacts>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,24 +109,8 @@ struct UpstreamModelSpec {
     capabilities: Option<UpstreamCapabilityFlags>,
 }
 
-pub fn probe_from_config(endpoint: &EndpointConfig, config: &Config) -> ProbeReport {
-    probe_endpoint(
-        endpoint,
-        config.allow_remote_engine_adapters,
-        &config.approved_remote_adapters,
-    )
-}
-
-pub fn probe_endpoint(
-    endpoint: &EndpointConfig,
-    allow_remote_engine_adapters: bool,
-    approved_remote_adapters: &BTreeMap<String, String>,
-) -> ProbeReport {
-    match try_probe_endpoint(
-        endpoint,
-        allow_remote_engine_adapters,
-        approved_remote_adapters,
-    ) {
+pub fn probe_endpoint(endpoint: &EndpointConfig) -> ProbeReport {
+    match try_probe_endpoint(endpoint) {
         Ok(mut report) => {
             report.endpoint_slug = endpoint.slug.clone();
             report
@@ -144,45 +123,21 @@ pub fn probe_endpoint(
             model_suggestions: Vec::new(),
             error: Some(error.to_string()),
             engine: None,
-            adapter: None,
         },
     }
 }
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn try_probe_endpoint(
-    endpoint: &EndpointConfig,
-    allow_remote_engine_adapters: bool,
-    approved_remote_adapters: &BTreeMap<String, String>,
-) -> Result<ProbeReport> {
+fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
     let url = models_url(&endpoint.base_url)?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(PROBE_TIMEOUT))
         .max_redirects(0)
         .build()
         .into();
-    let mut request = agent.get(url.as_str()).header("Accept", "application/json");
-    for header in &endpoint.headers {
-        let value = std::env::var(&header.env).with_context(|| {
-            format!(
-                "reading endpoint header `{}` from `{}`",
-                header.name, header.env
-            )
-        })?;
-        request = request.header(&header.name, &value);
-    }
-    if let Some(auth) = &endpoint.auth {
-        let value = std::env::var(&auth.env)
-            .with_context(|| format!("reading typed endpoint credential from `{}`", auth.env))?;
-        request = match auth.mode {
-            crate::config::EndpointAuthMode::ApiKey => request.header("x-api-key", &value),
-            crate::config::EndpointAuthMode::Bearer => {
-                request.header("authorization", &format!("Bearer {value}"))
-            }
-        };
-    }
-    let mut response = request
+    let request = agent.get(url.as_str()).header("Accept", "application/json");
+    let mut response = with_endpoint_auth(request, endpoint)?
         .call()
         .with_context(|| format!("probing endpoint `{}`", endpoint.slug))?;
     let models = response
@@ -207,25 +162,15 @@ fn try_probe_endpoint(
         .map(|row| (row.id.clone(), row.max_model_len))
         .collect::<Vec<_>>();
     let mut engine = crate::engine::detect_engine(endpoint, &model_limits);
-    let adapter_spec = endpoint.engine_adapter.clone().or_else(|| {
-        let remote = crate::engine_adapter::load_remote_adapters().ok()?;
-        crate::engine_adapter::effective_engine_adapter(
-            endpoint,
-            &remote,
-            allow_remote_engine_adapters,
-            approved_remote_adapters,
-        )
-    });
     let model = rows.first().map(|row| row.id.as_str());
+    // A definition's reader `countRoute` joins the probe with the runtime
+    // metrics reader (C4); until then only the built-in engine routes count.
     engine.count_context = Some(crate::count_context::probe_count_context(
         endpoint,
         engine.kind,
         model,
-        adapter_spec
-            .as_ref()
-            .and_then(|spec| spec.count_route.as_deref()),
+        None,
     ));
-    let adapter = crate::engine_adapter::probe_facts_with(endpoint, adapter_spec.as_ref());
     Ok(ProbeReport {
         endpoint_slug: endpoint.slug.clone(),
         status: ProbeStatus::Online,
@@ -234,85 +179,37 @@ fn try_probe_endpoint(
         model_suggestions,
         error: None,
         engine: Some(engine),
-        adapter,
     })
 }
 
-pub fn apply_probe_report(config: &mut Config, report: &ProbeReport, replace: bool) -> Result<()> {
-    let Some(endpoint) = config.endpoint_mut(&report.endpoint_slug) else {
-        anyhow::bail!("endpoint `{}` no longer exists", report.endpoint_slug);
-    };
-    // An offline probe keeps the engine facts the last online probe found,
-    // so a restarting upstream does not flap its facts. Adapter facts are
-    // kept the same way when this run produced none.
-    let previous_engine = endpoint
-        .last_probe
-        .as_ref()
-        .and_then(|probe| probe.engine.clone());
-    let previous_adapter = endpoint
-        .last_probe
-        .as_ref()
-        .and_then(|probe| probe.adapter.clone());
-    if report.status == ProbeStatus::Online {
-        endpoint.last_probe = Some(ProbeSnapshot {
-            status: ProbeStatus::Online,
-            models: report.discovered_model_ids.clone(),
-            suggested_capabilities: endpoint.default_capabilities.clone(),
-            engine: report.engine.clone(),
-            adapter: report.adapter.clone().or(previous_adapter),
-        });
-        let discovered: std::collections::HashSet<&str> = report
-            .discovered_model_ids
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let mut next_models: Vec<ModelConfig> = if replace {
-            endpoint
-                .models
-                .iter()
-                .filter(|model| {
-                    discovered.contains(model.upstream_model_id.as_str()) || model.pinned
-                })
-                .cloned()
-                .collect()
-        } else {
-            endpoint.models.clone()
-        };
-        for model_id in &report.discovered_model_ids {
-            if !next_models
-                .iter()
-                .any(|model| model.upstream_model_id == *model_id)
-            {
-                next_models.push(ModelConfig {
-                    slug: Some(slugify_seed(model_id, "model")),
-                    upstream_model_id: model_id.clone(),
-                    ..ModelConfig::default()
-                });
-            }
-        }
-        for suggestion in &report.model_suggestions {
-            if let Some(model) = next_models
-                .iter_mut()
-                .find(|model| model.upstream_model_id == suggestion.upstream_model_id)
-            {
-                model.slug = model.slug.clone().or_else(|| Some(suggestion.slug.clone()));
-                model.probe_suggestions = Some(suggestion.capabilities.clone());
-            }
-        }
-        endpoint.models = next_models;
-    } else {
-        endpoint.last_probe = Some(ProbeSnapshot {
-            status: ProbeStatus::Offline,
-            models: Vec::new(),
-            suggested_capabilities: endpoint.default_capabilities.clone(),
-            engine: previous_engine,
-            adapter: previous_adapter,
-        });
+/// `request` with the endpoint's header and auth credentials (node secrets).
+pub(crate) fn with_endpoint_auth(
+    mut request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+    endpoint: &EndpointConfig,
+) -> Result<ureq::RequestBuilder<ureq::typestate::WithoutBody>> {
+    for header in &endpoint.headers {
+        let value = crate::secrets::credential(&header.env).with_context(|| {
+            format!(
+                "reading endpoint header `{}` from `{}`",
+                header.name, header.env
+            )
+        })?;
+        request = request.header(&header.name, &value);
     }
-    Ok(())
+    if let Some(auth) = &endpoint.auth {
+        let value = crate::secrets::credential(&auth.env)
+            .with_context(|| format!("reading typed endpoint credential from `{}`", auth.env))?;
+        request = match auth.mode {
+            crate::config::EndpointAuthMode::ApiKey => request.header("x-api-key", &value),
+            crate::config::EndpointAuthMode::Bearer => {
+                request.header("authorization", &format!("Bearer {value}"))
+            }
+        };
+    }
+    Ok(request)
 }
 
-fn models_url(base_url: &str) -> Result<Url> {
+pub(crate) fn models_url(base_url: &str) -> Result<Url> {
     let mut base =
         Url::parse(base_url).with_context(|| format!("parsing endpoint URL `{base_url}`"))?;
     let path = base.path().trim_end_matches('/').to_string();
@@ -700,119 +597,5 @@ mod tests {
             .expect("reasoning surface");
         assert!(surface.reasoning_config.is_none());
         assert!(suggest_model_from_upstream(&rows[1]).is_none());
-    }
-
-    #[test]
-    fn successful_probe_accumulates_by_default_and_preserves_desired_caps() {
-        let mut config = Config {
-            endpoints: vec![EndpointConfig {
-                slug: "local".into(),
-                models: vec![ModelConfig {
-                    upstream_model_id: "gone".into(),
-                    capability_override_mode: CapabilityOverrideMode::Override,
-                    capabilities: Some(OpenAiCompatibleCapabilities::openai_defaults()),
-                    ..ModelConfig::default()
-                }],
-                ..EndpointConfig::default()
-            }],
-            ..Config::default()
-        };
-        apply_probe_report(
-            &mut config,
-            &ProbeReport {
-                endpoint_slug: "local".into(),
-                status: ProbeStatus::Online,
-                discovered_model_ids: vec!["new".into()],
-                suggested_default_capabilities: OpenAiCompatibleCapabilities::default(),
-                model_suggestions: vec![],
-                error: None,
-                engine: None,
-                adapter: None,
-            },
-            false,
-        )
-        .expect("apply");
-        let ids: Vec<&str> = config.endpoints[0]
-            .models
-            .iter()
-            .map(|model| model.upstream_model_id.as_str())
-            .collect();
-        assert_eq!(ids, ["gone", "new"]);
-    }
-
-    #[test]
-    fn successful_probe_replaces_unpinned_models_and_preserves_desired_caps() {
-        let mut config = Config {
-            endpoints: vec![EndpointConfig {
-                slug: "local".into(),
-                models: vec![
-                    ModelConfig {
-                        upstream_model_id: "gone".into(),
-                        capability_override_mode: CapabilityOverrideMode::Override,
-                        capabilities: Some(OpenAiCompatibleCapabilities::openai_defaults()),
-                        ..ModelConfig::default()
-                    },
-                    ModelConfig {
-                        upstream_model_id: "kept".into(),
-                        capability_override_mode: CapabilityOverrideMode::Override,
-                        capabilities: Some(
-                            OpenAiCompatibleCapabilities::openai_defaults().with_vision(),
-                        ),
-                        ..ModelConfig::default()
-                    },
-                    ModelConfig {
-                        upstream_model_id: "pinned-missing".into(),
-                        pinned: true,
-                        ..ModelConfig::default()
-                    },
-                ],
-                ..EndpointConfig::default()
-            }],
-            ..Config::default()
-        };
-        apply_probe_report(
-            &mut config,
-            &ProbeReport {
-                endpoint_slug: "local".into(),
-                status: ProbeStatus::Online,
-                discovered_model_ids: vec!["kept".into(), "new".into()],
-                suggested_default_capabilities: OpenAiCompatibleCapabilities::default(),
-                model_suggestions: vec![ModelSuggestion {
-                    upstream_model_id: "kept".into(),
-                    slug: "kept".into(),
-                    capability_override_mode: CapabilityOverrideMode::Override,
-                    capabilities: OpenAiCompatibleCapabilities::openai_defaults(),
-                }],
-                error: None,
-                engine: None,
-                adapter: None,
-            },
-            true,
-        )
-        .expect("apply");
-        let models = &config.endpoints[0].models;
-        let ids: Vec<&str> = models
-            .iter()
-            .map(|model| model.upstream_model_id.as_str())
-            .collect();
-        assert_eq!(ids, ["kept", "pinned-missing", "new"]);
-        let kept = models
-            .iter()
-            .find(|model| model.upstream_model_id == "kept")
-            .expect("kept");
-        assert_eq!(
-            kept.capability_override_mode,
-            CapabilityOverrideMode::Override
-        );
-        assert_eq!(
-            kept.capabilities
-                .as_ref()
-                .unwrap()
-                .chat_completions
-                .as_ref()
-                .unwrap()
-                .vision,
-            Some(true)
-        );
     }
 }

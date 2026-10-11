@@ -38,7 +38,7 @@ fn normalize(raw: Option<String>) -> Option<String> {
 /// Unicode general category `Cf` (format characters: bidi overrides,
 /// zero-width characters, and similar), as of Unicode 15. The server strips
 /// the same set (`\p{Cf}` in `normalizeReportedHostname`,
-/// packages/config/src/cli-device-name.ts); std has no category lookup, so the
+/// apps/server/src/relay/registration.ts); std has no category lookup, so the
 /// table is spelled out here. A character added to `Cf` later is still
 /// stripped by the server.
 fn is_format_char(ch: char) -> bool {

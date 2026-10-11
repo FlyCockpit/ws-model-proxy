@@ -1,0 +1,14 @@
+{
+  "card0": {
+    "Card Series": "AMD Radeon Graphics",
+    "Card Model": "0x1586",
+    "Card Vendor": "Advanced Micro Devices, Inc. [AMD/ATI]",
+    "Card SKU": "STRXLGEN",
+    "Subsystem ID": "0x000a",
+    "Device Rev": "0xc1",
+    "Node ID": "1",
+    "GUID": "45875",
+    "GFX Version": "gfx1151",
+    "PCI Bus": "0000:C5:00.0"
+  }
+}

@@ -1,81 +1,69 @@
+// ───────────────────────────── Accounts (Better Auth) ─────────────────────────────
+// Session, Account, Verification, TwoFactor, Oauth* (7), Jwks and AppSetting are copied
+// verbatim from the current auth.prisma (Better Auth owns their shape). DeviceCode is gone
+// with the deviceAuthorization plugin: nodes enroll with a browser-minted code only.
+
 model User {
-  DeploymentConfigs              DeploymentConfig[]
-  DeploymentPlans                DeploymentPlan[]
-  DeploymentInstances            DeploymentInstance[]
-  id                             String                  @id @default(cuid(2))
-  createdAt                      DateTime                @default(now())
-  updatedAt                      DateTime                @default(now()) @updatedAt
-  name                           String
-  email                          String
-  slug                           String                  @unique @default(cuid(2))
-  emailVerified                  Boolean                 @default(false)
-  image                          String?
-  // Better-Auth's admin plugin stores role as a string and supports arbitrary
-  // custom roles plus comma-separated multi-role values. Do not narrow this to
-  // a Prisma enum unless you also drop those Better-Auth capabilities.
-  role                           String                  @default("user")
-  // Preferred UI locale (BCP 47 tag). Synced into the i18n detection chain
-  // ahead of localStorage / navigator so a signed-in user's choice follows
-  // them across devices. Stored as String (not enum) because the supported-
-  // locale set evolves outside the schema; new locales are added in
-  // apps/web/src/i18n/config.ts without a Prisma migration.
-  locale                         String                  @default("en-US")
-  banned                         Boolean?
-  banReason                      String?
-  banExpires                     DateTime?
-  /// Durable intent of an accepted account deletion (users.remove or Better
-  /// Auth admin remove-user). Set, with a ban, before any history is drained;
-  /// the user-deletion sweeper finishes every marked user. See
-  /// packages/db/src/parent-deletion.ts.
-  deletionRequestedAt            DateTime?
-  /// Identity of the current deletion generation: set with
-  /// deletionRequestedAt, cleared with it. Every marker transition
-  /// (completion, abandon, sweep backoff) is predicated on the generation the
-  /// worker selected, so a stale worker cannot act on a newer deletion. A
-  /// random id, not a timestamp compare, so no column precision is involved.
-  deletionGeneration             String?
-  /// Transient sweeper failures of the current generation (exponential backoff).
-  deletionSweepAttempts          Int                     @default(0)
-  /// Last user-deletion sweeper attempt (fairness / backoff).
-  deletionSweepLastAttemptAt     DateTime?
-  /// Do not select for sweeping before this instant (transient failures).
-  deletionSweepNextAttemptAt     DateTime?
-  twoFactorEnabled               Boolean?
-  operationalAlerts              Boolean                 @default(true)
-  sessions                       Session[]
-  accounts                       Account[]
-  twoFactors                     TwoFactor[]
-  deviceCodes                    DeviceCode[]
-  // Better Auth 1.7 OAuth Provider back-relations (Phase 0b).
-  oauthClients                   OauthClient[]
-  oauthRefreshTokens             OauthRefreshToken[]
-  oauthAccessTokens              OauthAccessToken[]
-  oauthConsents                  OauthConsent[]
-  mcpGrants                      McpGrant[]
-  mcpPersonalTokens              McpPersonalToken[]      @relation("McpPersonalTokenOwner")
-  cliDevices                     CliDevice[]             @relation("CliDeviceOwner")
-  cliTokens                      CliToken[]              @relation("CliTokenOwner")
-  cliDeviceCredentials           CliDeviceCredential[]   @relation("CliDeviceCredentialOwner")
-  endpoints                      Endpoint[]              @relation("EndpointOwner")
-  discoveredModels               DiscoveredModel[]       @relation("DiscoveredModelOwner")
-  modelPools                     ModelPool[]             @relation("ModelPoolOwner")
-  ownedPoolGrants                PoolGrant[]             @relation("PoolGrantOwner")
-  receivedPoolGrants             PoolGrant[]             @relation("PoolGrantGrantee")
-  modelApiTokens                 ModelApiToken[]         @relation("ModelApiTokenOwner")
-  mediaAssets                    MediaAsset[]            @relation("MediaAssetOwner")
-  providerAccounts               ProviderAccount[]       @relation("ProviderAccountOwner")
-  providerModels                 ProviderModel[]         @relation("ProviderModelOwner")
-  providerCredentials            ProviderCredential[]    @relation("ProviderCredentialOwner")
-  providerBudgetPolicies         ProviderBudgetPolicy[]  @relation("ProviderBudgetPolicyOwner")
-  providerAuditEvents            ProviderAuditEvent[]    @relation("ProviderAuditEventOwner")
-  executionTargets               ExecutionTarget[]       @relation("ExecutionTargetOwner")
-  inferenceCapacities            InferenceCapacity[]     @relation("InferenceCapacityOwner")
-  capacityAuditEvents            CapacityAuditEvent[]    @relation("CapacityAuditEventOwner")
-  inferenceContributions         InferenceContribution[] @relation("InferenceContributor")
-  receivedInferenceContributions InferenceContribution[] @relation("InferencePoolOwner")
+  id                         String    @id @default(cuid(2))
+  createdAt                  DateTime  @default(now())
+  updatedAt                  DateTime  @default(now()) @updatedAt
+  name                       String
+  email                      String
+  slug                       String    @unique @default(cuid(2))
+  emailVerified              Boolean   @default(false)
+  /// The address the verify-email flow proved (ASCII lower-cased), set only there. Unlike
+  /// `emailVerified` (forced true without SMTP and for admin-created accounts so they can sign
+  /// in), it is proof of the mailbox: a direct share by e-mail needs it to equal `email`. Not a
+  /// Better Auth field, so no auth route can write it.
+  provedEmail                String?
+  image                      String?
+  /// Better Auth admin plugin role string ("admin" | "user" | custom). Not an enum on purpose.
+  role                       String    @default("user")
+  locale                     String    @default("en-US")
+  banned                     Boolean?
+  banReason                  String?
+  banExpires                 DateTime?
+  deletionRequestedAt        DateTime?
+  deletionGeneration         String?
+  deletionSweepAttempts      Int       @default(0)
+  deletionSweepLastAttemptAt DateTime?
+  deletionSweepNextAttemptAt DateTime?
+  twoFactorEnabled           Boolean?
+  operationalAlerts          Boolean   @default(true)
+  /// Set when the onboarding checklist was dismissed or completed.
+  onboardingDoneAt           DateTime?
+
+  sessions            Session[]
+  accounts            Account[]
+  twoFactors          TwoFactor[]
+  oauthClients        OauthClient[]
+  oauthRefreshTokens  OauthRefreshToken[]
+  oauthAccessTokens   OauthAccessToken[]
+  oauthConsents       OauthConsent[]
+  mcpGrants           McpGrant[]
+  agentTokens         AgentToken[]
+  nodes               Node[]
+  nodeCredentials     NodeCredential[]
+  nodeEnrollmentCodes NodeEnrollmentCode[]
+  fabrics             Fabric[]
+  runtimes            Runtime[]
+  runtimeSharesOut    RuntimeShare[]       @relation("RuntimeShareOwner")
+  runtimeSharesIn     RuntimeShare[]       @relation("RuntimeShareGrantee")
+  runtimeOperations   RuntimeOperation[]
+  profiles            Profile[]
+  pools               Pool[]
+  apiKeys             ApiKey[]
+  modelAliases        ModelAlias[]
+  sharesOut           Share[]              @relation("ShareOwner")
+  sharesIn            Share[]              @relation("ShareGrantee")
+  shareInvites        ShareInvite[]
+  providerAccounts    ProviderAccount[]
+  providerModels      ProviderModel[]
+  providerCredentials ProviderCredential[]
+  spendCaps           SpendCap[]
+  mediaAssets         MediaAsset[]
 
   @@unique([email])
-  @@index([slug])
   @@index([role])
   @@index([deletionRequestedAt])
   @@map("user")
@@ -378,61 +366,6 @@ model Jwks {
   @@map("jwks")
 }
 
-// Application-owned MCP grant generation record (Phase 0b). This is
-// NOT a Better Auth model: `clientId` is the verified OAuth client identifier
-// (string), deliberately without a relation to OauthClient so a client-row
-// deletion (e.g. deferred CIMD cleanup) can never cascade away a revocation
-// tombstone. Tombstones must outlive every authorization code, access JWT,
-// refresh token, cached refresh response, and in-flight issuance that
-// references them; rows are retained (never deleted on revoke — only
-// `revokedAt` is set) and cascade only on user deletion, matching how
-// Better Auth-owned rows (session/account) behave for this User relation.
-model McpGrant {
-  id          String    @id @default(cuid(2))
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @default(now()) @updatedAt
-  userId      String
-  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  clientId    String
-  referenceId String
-  revokedAt   DateTime?
-
-  personalToken McpPersonalToken?
-
-  @@unique([userId, clientId, referenceId])
-  @@index([userId, clientId])
-  @@map("mcp_grant")
-}
-
-// Human-minted MCP personal access token (hashed product credential). Each
-// token owns exactly one McpGrant generation so /mcp admission and Settings
-// revocation use the same tombstone path as OAuth grants. clientId on the
-// grant is the synthetic `pat:<tokenId>` identifier, not an OauthClient row.
-model McpPersonalToken {
-  id               String    @id
-  createdAt        DateTime  @default(now())
-  updatedAt        DateTime  @default(now()) @updatedAt
-  userId           String
-  name             String
-  lookupPrefix     String
-  secretDigest     String
-  scopes           String[]
-  allowCliCommands Boolean   @default(false)
-  allowCliFileRead Boolean   @default(false)
-  lastUsedAt       DateTime?
-  revokedAt        DateTime?
-  expiresAt        DateTime?
-  grantId          String    @unique
-  user             User      @relation("McpPersonalTokenOwner", fields: [userId], references: [id], onDelete: Cascade)
-  grant            McpGrant  @relation(fields: [grantId], references: [id], onDelete: Cascade)
-
-  @@unique([lookupPrefix])
-  @@unique([secretDigest])
-  @@index([userId, revokedAt])
-  @@index([expiresAt])
-  @@map("mcp_personal_token")
-}
-
 model AppSetting {
   // `key` is the natural primary key — every read/write looks rows up by it,
   // so a separate cuid `id` would be dead weight. Deliberately deviates from
@@ -443,24 +376,4 @@ model AppSetting {
   value     String
 
   @@map("app_setting")
-}
-
-model DeviceCode {
-  id              String    @id @default(cuid(2))
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @default(now()) @updatedAt
-  deviceCode      String    @unique
-  userCode        String    @unique
-  userId          String?
-  expiresAt       DateTime
-  status          String
-  lastPolledAt    DateTime?
-  pollingInterval Int?
-  clientId        String?
-  scope           String?
-  user            User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([userId])
-  @@index([expiresAt])
-  @@map("device_code")
 }

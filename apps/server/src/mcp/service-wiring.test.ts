@@ -6,13 +6,10 @@ import { describe, expect, it } from "vitest";
 // `services.onPoolRoutingRulesChanged`, which the relay implements. An
 // unwired service would silently leave stale verdicts, so pin the wiring.
 describe("context services wiring", () => {
-  it("connects onPoolRoutingRulesChanged and onRemoteMetricSourcesChanged to the relay", () => {
+  it("connects onPoolRoutingRulesChanged to the relay", () => {
     const app = readFileSync(new URL("../app.ts", import.meta.url), "utf8");
     expect(app).toMatch(
       /onPoolRoutingRulesChanged:\s*\(poolId: string\)\s*=>\s*relaySessionManager\.onPoolRoutingRulesChanged\(poolId\)/,
-    );
-    expect(app).toMatch(
-      /onRemoteMetricSourcesChanged:\s*\(cliDeviceId: string\)\s*=>\s*relaySessionManager\.onRemoteMetricSourcesChanged\(cliDeviceId\)/,
     );
   });
 });

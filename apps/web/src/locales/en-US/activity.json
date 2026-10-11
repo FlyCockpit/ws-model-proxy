@@ -1,0 +1,212 @@
+{
+  "requests": {
+    "status": "Status",
+    "source": "Source",
+    "all": "All",
+    "statusValue": {
+      "PENDING": "In progress",
+      "SUCCEEDED": "Succeeded",
+      "FAILED": "Failed",
+      "CANCELED": "Canceled"
+    },
+    "sourceValue": {
+      "API_KEY": "API key",
+      "TEST": "Test page",
+      "AGENT_TEST": "Agent test",
+      "SIDECAR": "Media step"
+    },
+    "routeValue": {
+      "local": "Local",
+      "cloud": "Cloud",
+      "own_key": "Own key"
+    },
+    "direct": "Served model (test)",
+    "queueWait": "Queue {{ms}} ms",
+    "ttft": "First token {{ms}} ms",
+    "duration": "{{ms}} ms",
+    "tokens": "{{prompt}} in / {{completion}} out",
+    "attempts_one": "{{count}} attempt",
+    "attempts_other": "{{count}} attempts",
+    "rejection": "Refused: {{reason}}",
+    "error": "Error: {{reason}}",
+    "upstreamError": "The runtime said: {{message}}",
+    "empty": "No requests match.",
+    "loadMore": "Load more",
+    "loadFailed": "Could not load the request log.",
+    "clear": "Clear my log",
+    "clearTitle": "Delete your request log?",
+    "clearDescription": "Every finished request you made to your own pools and models is deleted (requests still running stay). Requests you made to other people's pools stay in their owners' logs.",
+    "cleared_one": "{{count}} request deleted.",
+    "cleared_other": "{{count}} requests deleted.",
+    "reason": {
+      "capacity_wait_expired": "waited too long for a free slot",
+      "capacity_lease_lost": "lost its slot before it was sent",
+      "context_too_large": "the input is larger than the model's context",
+      "not_found": "the model was not found",
+      "unsupported_capability": "no member supports this kind of request",
+      "access_denied": "access was denied",
+      "disconnected": "the node disconnected before it was sent",
+      "other": "{{code}}"
+    },
+    "olderThan": "Older than",
+    "deleteOlder": "Delete older",
+    "deleteOlderTitle": "Delete requests older than {{range}}?",
+    "deleteOlderDescription": "Finished requests you made to your own pools and models from before then are deleted (requests still running stay). Requests you made to other people's pools stay in their owners' logs.",
+    "range": {
+      "1h": "1 hour",
+      "24h": "1 day",
+      "7d": "7 days",
+      "30d": "30 days"
+    },
+    "filter": {
+      "poolId": "Pool",
+      "runtimeId": "Runtime",
+      "versionId": "Version",
+      "nodeId": "Node",
+      "since": "Since",
+      "anyTime": "Any time",
+      "versionNumber": "Version {{version}}",
+      "reset": "Reset filters"
+    },
+    "sinceRange": {
+      "1h": "Last hour",
+      "24h": "Last day",
+      "7d": "Last 7 days",
+      "30d": "Last 30 days"
+    }
+  },
+  "commands": {
+    "title": "Commands",
+    "description": "Commands agents and people ran on your nodes. Output comes live from the node and is kept only there.",
+    "state": {
+      "RUNNING": "Running",
+      "SUCCEEDED": "Succeeded",
+      "FAILED": "Failed",
+      "CANCELLED": "Cancelled",
+      "TIMED_OUT": "Timed out",
+      "INTERRUPTED": "Interrupted",
+      "UNKNOWN": "Unknown"
+    },
+    "interruptedHint": "Stopped when the node was lowered to Relay only or its service restarted.",
+    "byAgent": "Agent {{name}}",
+    "byUnknownAgent": "An agent",
+    "byPerson": "You",
+    "bySystem": "System",
+    "exit": "Exit {{code}}",
+    "endsBy": "Stops by",
+    "output": "Output",
+    "showOutput": "Show output",
+    "refresh": "Refresh",
+    "cancel": "Cancel command",
+    "cancelled": "Cancel sent.",
+    "offline": "The node is offline, so no output is available.",
+    "truncated": "Only the end of the output is shown.",
+    "noOutput": "No output yet.",
+    "empty": "No commands yet.",
+    "loadFailed": "Could not load the command log.",
+    "loadMore": "Load more"
+  },
+  "metrics": {
+    "requestLog": "Request log",
+    "scope": "Scope",
+    "scopeValue": {
+      "pool": "Pool",
+      "runtime": "Runtime",
+      "version": "Version",
+      "node": "Node",
+      "instance": "Instance"
+    },
+    "runtimeOf": "Runtime",
+    "noTargets": {
+      "pool": "No pools yet.",
+      "runtime": "No runtimes yet.",
+      "version": "No runtimes yet.",
+      "node": "No nodes yet.",
+      "instance": "This runtime has no instances now."
+    },
+    "targetsFailed": "Couldn't load the choices.",
+    "metric": "Metric",
+    "family": {
+      "request": "Requests",
+      "load": "Engine load",
+      "node": "Node",
+      "custom": "Custom"
+    },
+    "metricValue": {
+      "requests": "Requests",
+      "errors": "Errors",
+      "rejections": "Refusals",
+      "rejections_capacity": "Refusals: no free slot",
+      "rejections_context": "Refusals: context too large",
+      "rejections_spend": "Refusals: spend cap",
+      "rejections_other": "Refusals: other",
+      "ttft_p50": "First token p50",
+      "ttft_p95": "First token p95",
+      "latency_p50": "Latency p50",
+      "latency_p95": "Latency p95",
+      "queue_wait_p50": "Queue wait p50",
+      "queue_wait_p95": "Queue wait p95",
+      "decode_tps": "Decode speed",
+      "prefill_tps": "Prefill speed",
+      "input_tokens": "Input tokens",
+      "output_tokens": "Output tokens",
+      "cache_hit_rate": "Prompt cache hit rate",
+      "cloud_share": "Cloud share",
+      "kv_usage_avg": "KV cache use (avg)",
+      "kv_usage_max": "KV cache use (max)",
+      "running_max": "Running requests (max)",
+      "waiting_max": "Waiting requests (max)",
+      "full_ratio": "Time full",
+      "cpu_pct": "CPU use",
+      "memory_available_gb": "Memory available",
+      "accelerator_free_gb": "Accelerator memory free",
+      "gpu_util_pct": "GPU use",
+      "gpu_temp_c": "GPU temperature"
+    },
+    "groupBy": "Split by",
+    "groupByNone": "Nothing",
+    "groupByValue": {
+      "runtime": "Runtime",
+      "version": "Version",
+      "node": "Node",
+      "instance": "Instance",
+      "model": "Model",
+      "member": "Pool member",
+      "source": "Source"
+    },
+    "range": "Range",
+    "rangeValue": {
+      "1h": "1 hour",
+      "24h": "24 hours",
+      "7d": "7 days",
+      "30d": "30 days"
+    },
+    "step": "Step",
+    "stepValue": {
+      "1m": "1 min",
+      "5m": "5 min",
+      "1h": "1 hour",
+      "1d": "1 day"
+    },
+    "compareVersions": "Compare versions",
+    "includeTests": "Include tests",
+    "sharedPool": "A pool shared with you: request metrics of your own requests, unsplit or by source.",
+    "loadFailed": "Couldn't load the metrics.",
+    "totals": "Totals",
+    "testsLeftOut_one": "{{count}} test request left out. Turn on “Include tests” to count it.",
+    "testsLeftOut_other": "{{count}} test requests left out. Turn on “Include tests” to count them.",
+    "view": "View",
+    "viewValue": {
+      "chart": "Chart",
+      "table": "Table"
+    },
+    "truncated": "Showing the largest groups only.",
+    "empty": "No data for this scope and range.",
+    "emptyHint": "Metrics appear once requests run. The request log lists each request.",
+    "noGroup": "(none)",
+    "chartLabel_one": "{{metric}} over time, {{count}} line. The table view lists the values.",
+    "chartLabel_other": "{{metric}} over time, {{count}} lines. The table view lists the values.",
+    "time": "Time",
+    "tokensPerSecond": "{{value}} tok/s"
+  }
+}

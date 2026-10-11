@@ -1,33 +1,23 @@
-//! `wsmp logout`.
+//! `wsmp logout`: forget this node's credential.
 
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::config::Config;
 use crate::output;
-use crate::state::remove_device_credential;
+use crate::state::remove_node_credential;
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Also forget the configured CLI token environment variable.
-    #[arg(long)]
-    token: bool,
     /// Emit JSON instead of human-readable text.
     #[arg(long)]
     json: bool,
 }
 
 pub fn run(args: &Args) -> Result<()> {
-    let removed_device_credential = remove_device_credential()?;
-    let mut removed_token_env = false;
-    if args.token {
-        removed_token_env = Config::update(false, |cfg| Ok(cfg.cli_token_env.take().is_some()))?;
-    }
+    crate::trust::refuse_in_job("wsmp logout")?;
+    let removed_credential = remove_node_credential()?;
     if args.json {
-        output::json(&LogoutOutput {
-            removed_device_credential,
-            removed_token_env,
-        })?;
+        output::json(&LogoutOutput { removed_credential })?;
     } else {
         output::line("logged out")?;
     }
@@ -37,6 +27,5 @@ pub fn run(args: &Args) -> Result<()> {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LogoutOutput {
-    removed_device_credential: bool,
-    removed_token_env: bool,
+    removed_credential: bool,
 }

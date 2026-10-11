@@ -374,7 +374,15 @@ describe("series flattening", () => {
         cpu: { usagePercent: 42.5, load1: 1 },
         memory: { totalMiB: 1000, availableMiB: 250 },
         disks: [{ mount: "/", freeMiB: 5000 }],
-        gpus: [{ index: 0, vramUsedMiB: 12_000, vramTotalMiB: 24_000, temperatureC: 71 }],
+        gpus: [
+          {
+            index: 0,
+            vramUsedMiB: 12_000,
+            vramTotalMiB: 24_000,
+            gttUsedMiB: 3_000,
+            temperatureC: 71,
+          },
+        ],
         custom: [
           // Sampled 5 s before the frame (CLI clock): 15 s old now.
           {
@@ -408,6 +416,10 @@ describe("series flattening", () => {
     expect(byName.get("node.disk.free_mib")?.value).toBe(5000);
     expect(byName.get("node.gpu.vram_used_percent")).toMatchObject({
       value: 50,
+      labels: { gpu: "0" },
+    });
+    expect(byName.get("node.gpu.gtt_used_mib")).toMatchObject({
+      value: 3_000,
       labels: { gpu: "0" },
     });
     expect(byName.get("fan_rpm")).toMatchObject({

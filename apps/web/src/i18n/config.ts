@@ -17,4 +17,7 @@ export const NAMESPACES = [
   "dashboard",
   "settings",
   "nav",
+  "access",
+  "activity",
+  "terminals",
 ] as const;

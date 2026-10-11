@@ -1,0 +1,25 @@
+[
+  {
+    "gpu": 0,
+    "asic": {
+      "market_name": "AMD Radeon 8060S Graphics",
+      "vendor_id": "0x1002",
+      "vendor_name": "Advanced Micro Devices Inc. [AMD/ATI]",
+      "subvendor_id": "0xf111",
+      "device_id": "0x1586",
+      "subsystem_id": "0x000a",
+      "rev_id": "0xc1",
+      "asic_serial": "N/A",
+      "oam_id": "N/A",
+      "num_compute_units": 40,
+      "target_graphics_version": "gfx1151"
+    },
+    "bus": {
+      "bdf": "0000:c5:00.0",
+      "max_pcie_width": "N/A",
+      "max_pcie_speed": "N/A",
+      "pcie_interface_version": "N/A",
+      "slot_type": "UNKNOWN"
+    }
+  }
+]

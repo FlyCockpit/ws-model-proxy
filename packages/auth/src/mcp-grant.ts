@@ -17,7 +17,9 @@ import prisma from "@ws-model-proxy/db";
  *   MUST fail when a reference should exist and cannot be derived.
  * - An OAuth access-token claims extension (the oauth-provider
  *   `extensions[].claims.accessToken` hook) creates the grant only when
- *   absent, reuses it only while active, and REJECTS an existing tombstone on
+ *   absent (at Read-only: an approval on the consent page has normally
+ *   created it already, at the person's level — mcp-consent-level.ts; the
+ *   exchange never sets or changes a level), reuses it only while active, and REJECTS an existing tombstone on
  *   authorization-code exchange. On refresh it requires the exact existing
  *   grant to remain active. The immutable grant ID is stamped as the private
  *   `mcp_grant_id` JWT claim.

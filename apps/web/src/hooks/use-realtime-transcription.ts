@@ -1,3 +1,4 @@
+import { env } from "@ws-model-proxy/env/web";
 import { useCallback, useEffect, useReducer, useRef } from "react";
 
 import {
@@ -33,12 +34,14 @@ export type RealtimeTranscription = {
   reset(): void;
 };
 
-/** The Chat Test realtime socket, reporting parsed events and its close. */
+/** The Test page realtime socket, reporting parsed events and its close. */
 function openSessionSocket(
   model: string,
   handlers: { onEvent(event: unknown): void; onClose(code: number): void },
 ): WebSocket {
-  const socket = new WebSocket(realtimeSocketUrl(model, window.location));
+  const socket = new WebSocket(
+    realtimeSocketUrl(model, new URL(env.VITE_SERVER_URL, window.location.href)),
+  );
   socket.onmessage = (message) => {
     if (typeof message.data !== "string") return;
     try {
@@ -68,8 +71,8 @@ function pipeWorkletToSocket(node: AudioWorkletNode, socket: WebSocket) {
 }
 
 /**
- * The Chat Test live transcription session: microphone capture through an
- * AudioWorklet (24 kHz PCM16 mono), the Chat Test realtime socket (the
+ * The Test page live transcription session: microphone capture through an
+ * AudioWorklet (24 kHz PCM16 mono), the Test page realtime socket (the
  * `/v1/realtime` protocol, signed in by the dashboard session cookie), and
  * teardown on stop, failure and unmount.
  */

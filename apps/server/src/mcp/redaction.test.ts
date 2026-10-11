@@ -1,223 +1,70 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { MCP_REDACTED_VALUE, redactSecrets } from "./redaction";
-import { toJsonSafe } from "./serialization";
+vi.mock("@ws-model-proxy/env/server", () => ({ env: { BETTER_AUTH_SECRET: "x".repeat(32) } }));
 
-// redaction.ts imports PRODUCT_CREDENTIAL_PREFIXES from
-// @ws-model-proxy/db/forwarder-security, which reads env at module scope.
-vi.mock("@ws-model-proxy/env/server", () => ({
-  env: {
-    BETTER_AUTH_SECRET: "test-better-auth-secret",
-    DATABASE_URL: "postgresql://redaction-test",
-    NODE_ENV: "test",
-  },
-}));
+const { MCP_REDACTED_VALUE, redactSecrets } = await import("./redaction");
+const { toJsonSafe } = await import("./serialization");
 
-vi.mock("@ws-model-proxy/env/shared", () => ({
-  env: {
-    BETTER_AUTH_SECRET: "test-better-auth-secret",
-    DATABASE_URL: "postgresql://redaction-test",
-    NODE_ENV: "test",
-  },
-}));
+const AGENT_TOKEN = `wsmp_agent_${"A".repeat(43)}`;
+const API_KEY = `wsmp_key_${"b".repeat(43)}`;
+const JWT = `eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ1c2VyLTEiLCJleHAiOjF9.c2lnbmF0dXJlLWJ5dGVz`;
 
-describe("redactSecrets — key-fragment matrix", () => {
-  it("redacts values under secret-bearing keys across spellings", () => {
+describe("MCP output redaction", () => {
+  it("keeps node secret names and other names that only mention a secret", () => {
+    const output = {
+      secretNames: ["WSMP_SECRET_HF_TOKEN", "WSMP_SECRET_DB"],
+      secrets: [{ name: "WSMP_SECRET_HF_TOKEN", updatedAt: "2026-10-06T00:00:00.000Z" }],
+      secretFile: true,
+      launch: { secrets: ["WSMP_SECRET_HF_TOKEN"] },
+      lookupPrefix: "wsmp_agent_AB",
+      credentialType: "api_key",
+    };
+    expect(redactSecrets(output)).toEqual(output);
+  });
+
+  it("redacts credential values under any key, and inside text", () => {
     expect(
       redactSecrets({
-        secret: "x",
-        client_secret: "x",
-        "auth-tag": "x",
-        secretDigest: "x",
-        refreshToken: "x",
-        passwordHint: "x",
-        api_key: "x",
-        authorizationHeader: "x",
-        bearerValue: "x",
-        privateKeyPem: "x",
-        jwk: "x",
-        tokenHash: "x",
+        note: `use ${API_KEY} for it`,
+        raw: AGENT_TOKEN,
+        header: `Bearer ${"t".repeat(40)}`,
+        jwt: JWT,
       }),
     ).toEqual({
-      secret: MCP_REDACTED_VALUE,
-      client_secret: MCP_REDACTED_VALUE,
-      "auth-tag": MCP_REDACTED_VALUE,
+      note: `use ${MCP_REDACTED_VALUE} for it`,
+      raw: MCP_REDACTED_VALUE,
+      header: MCP_REDACTED_VALUE,
+      jwt: MCP_REDACTED_VALUE,
+    });
+  });
+
+  it("redacts exact credential-value keys whatever they hold", () => {
+    expect(
+      redactSecrets({
+        secretDigest: "ab",
+        client_secret: "s",
+        accessToken: 1,
+        nested: [{ password: "p" }],
+      }),
+    ).toEqual({
       secretDigest: MCP_REDACTED_VALUE,
-      refreshToken: MCP_REDACTED_VALUE,
-      passwordHint: MCP_REDACTED_VALUE,
-      api_key: MCP_REDACTED_VALUE,
-      authorizationHeader: MCP_REDACTED_VALUE,
-      bearerValue: MCP_REDACTED_VALUE,
-      privateKeyPem: MCP_REDACTED_VALUE,
-      jwk: MCP_REDACTED_VALUE,
-      tokenHash: MCP_REDACTED_VALUE,
+      client_secret: MCP_REDACTED_VALUE,
+      accessToken: MCP_REDACTED_VALUE,
+      nested: [{ password: MCP_REDACTED_VALUE }],
     });
   });
 
-  it("redacts exact `token` and `credential` keys, but not descriptive metadata", () => {
-    expect(
-      redactSecrets({
-        token: "raw-token",
-        credential: "raw-credential",
-        // Metadata that DESCRIBES secrets stays visible:
-        credentialType: "BEARER",
-        displaySuffix: "…abcd",
-        keyVersion: "v1",
-        lookupPrefix: "wsmp_mod",
-        tokensTotal: 3,
-      }),
-    ).toEqual({
-      token: MCP_REDACTED_VALUE,
-      credential: MCP_REDACTED_VALUE,
-      credentialType: "BEARER",
-      displaySuffix: "…abcd",
-      keyVersion: "v1",
-      lookupPrefix: "wsmp_mod",
-      tokensTotal: 3,
-    });
+  it("passes dates and decimals through for the serializer and never mutates input", () => {
+    const at = new Date("2026-10-06T00:00:00.000Z");
+    const input = { at, list: [AGENT_TOKEN] };
+    const output = toJsonSafe(redactSecrets(input));
+    expect(output).toEqual({ at: at.toISOString(), list: [MCP_REDACTED_VALUE] });
+    expect(input.list[0]).toBe(AGENT_TOKEN);
   });
 
-  it("redacts a full product credential embedded inside other text", () => {
-    const token = `wsmp_cli_${"A".repeat(43)}`;
-    expect(
-      redactSecrets({
-        start: `WSMP_TOKEN=${token} wsmp connect`,
-        mention: "set WSMP_TOKEN to your wsmp_cli_ token",
-      }),
-    ).toEqual({
-      start: `WSMP_TOKEN=${MCP_REDACTED_VALUE} wsmp connect`,
-      mention: "set WSMP_TOKEN to your wsmp_cli_ token",
-    });
-  });
-
-  it("redacts product-credential VALUES under any key", () => {
-    expect(
-      redactSecrets({
-        name: "wsmp_model_AAAA.BBBB",
-        note: "wsmp_cli_CCCC",
-        other: "wsmp_device_DDDD",
-        pat: "wsmp_mcp_EEEE",
-        // The prefix must appear at the START of the value: a value that
-        // merely mentions it is not a credential.
-        harmless: "mentions-wsmp_model_midstring",
-        plain: "ordinary string",
-      }),
-    ).toEqual({
-      name: MCP_REDACTED_VALUE,
-      note: MCP_REDACTED_VALUE,
-      other: MCP_REDACTED_VALUE,
-      pat: MCP_REDACTED_VALUE,
-      harmless: "mentions-wsmp_model_midstring",
-      plain: "ordinary string",
-    });
-  });
-
-  it("recurses through nested rows and arrays; never mutates the input", () => {
-    const input = {
-      rows: [
-        { id: "a", accessToken: "leak" },
-        { id: "b", nested: [{ refreshToken: "leak" }] },
-      ],
-      skip: "keep",
-    };
-    const before = JSON.stringify(input);
-    const output = redactSecrets(input);
-    expect(output).toEqual({
-      rows: [
-        { id: "a", accessToken: MCP_REDACTED_VALUE },
-        { id: "b", nested: [{ refreshToken: MCP_REDACTED_VALUE }] },
-      ],
-      skip: "keep",
-    });
-    expect(JSON.stringify(input)).toBe(before);
-  });
-
-  it("passes Dates, Decimals, and byte containers through untouched for serialization", () => {
-    const when = new Date("2026-01-01T00:00:00Z");
-    const bytes = new Uint8Array([9, 9]);
-    // A class-instance-shaped Decimal (custom prototype): the redactor must
-    // pass the SAME reference through; only plain rows are rebuilt.
-    const decimal = Object.create({
-      toFixed: () => "1",
-      toSignificantDigits: () => ({ toString: () => "1" }),
-    }) as Record<string, unknown>;
-    decimal.d = [1];
-    decimal.e = 0;
-    decimal.s = 1;
-    const output = redactSecrets({ when, bytes, decimal }) as Record<string, unknown>;
-    expect(output.when).toBeInstanceOf(Date);
-    expect(output.bytes).toBe(bytes);
-    expect(output.decimal).toBe(decimal);
-  });
-
-  it("redacts secret-bearing fields on UNKNOWN CLASS INSTANCES the serializer would enumerate (G8b)", () => {
-    class CredentialRow {
-      id = "row-1";
-      secret = "CLASS_SECRET_SENTINEL";
-      ciphertext = "CLASS_CIPHERTEXT_SENTINEL";
-      label = "visible";
-    }
-    const output = redactSecrets({ rows: [new CredentialRow()] }) as {
-      rows: Record<string, unknown>[];
-    };
-    // The instance is rebuilt as a plain object with the SAME enumerable
-    // field set the serializer emits — secret-bearing values redacted.
-    expect(output.rows).toEqual([
-      {
-        id: "row-1",
-        secret: MCP_REDACTED_VALUE,
-        ciphertext: MCP_REDACTED_VALUE,
-        label: "visible",
-      },
-    ]);
-    // And the composed pipeline (redactor → serializer) never leaks it.
-    expect(JSON.stringify(toJsonSafe(output))).not.toContain("CLASS_SECRET_SENTINEL");
-    expect(JSON.stringify(toJsonSafe(output))).not.toContain("CLASS_CIPHERTEXT_SENTINEL");
-  });
-
-  it("keeps the boolean secretFile flag and redacts any NON-boolean value under it (M29)", () => {
-    // `secretFile` matches the `secret` fragment, so only a boolean may
-    // survive the redactor: a string or object under that key would otherwise
-    // carry a secret value into the transcript.
-    expect(
-      redactSecrets({
-        secretFile: true,
-        other: "keep",
-      }),
-    ).toEqual({ secretFile: true, other: "keep" });
-    expect(
-      redactSecrets({
-        secretFile: false,
-      }),
-    ).toEqual({ secretFile: false });
-    for (const value of [
-      "M29-SENTINEL-STRING",
-      { nested: "M29-SENTINEL" },
-      ["M29-SENTINEL"],
-      0,
-      null,
-      undefined,
-    ]) {
-      const output = redactSecrets({ secretFile: value, other: "keep" }) as Record<string, unknown>;
-      expect(output.secretFile).toBe(MCP_REDACTED_VALUE);
-      expect(output.other).toBe("keep");
-    }
-    // A different spelling of the key is not the flag, so it stays redacted.
-    expect(redactSecrets({ secret_file: true })).toEqual({ secret_file: MCP_REDACTED_VALUE });
-    expect(redactSecrets({ SECRETFILE: true })).toEqual({ SECRETFILE: true });
-  });
-
-  it("never throws on hostile shapes", () => {
-    expect(() => redactSecrets(undefined)).not.toThrow();
-    expect(redactSecrets(undefined)).toBeUndefined();
-    expect(redactSecrets(42n)).toBe(42n);
-    const deep: Record<string, unknown> = {};
-    let cursor: Record<string, unknown> = deep;
-    for (let i = 0; i < 100; i += 1) {
-      const next: Record<string, unknown> = {};
-      cursor.next = next;
-      cursor = next;
-    }
-    expect(() => redactSecrets(deep)).not.toThrow();
+  it("bounds depth", () => {
+    let deep: unknown = "x";
+    for (let index = 0; index < 40; index += 1) deep = { deep };
+    expect(JSON.stringify(redactSecrets(deep))).toContain(MCP_REDACTED_VALUE);
   });
 });

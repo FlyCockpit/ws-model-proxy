@@ -10,12 +10,10 @@
  * Table classes (pinned by the catalog test,
  * packages/api/src/lib/writer-classes.postgres.integration.test.ts):
  *
- * - Graph (configuration): `user`, `cli_device`, `endpoint`,
- *   `discovered_model`, `execution_target`, `inference_capacity`,
- *   `model_pool`, `pool_member`, `pool_grant`, `model_api_token`,
- *   `model_api_token_allowlist_entry`, `provider_account`, `provider_model`,
- *   `provider_credential`, `provider_budget_policy`, `provider_budget_rule`,
- *   `provider_pricing_version`, `pool_fallback_preference`, `pool_routing_rule`.
+ * - Graph (configuration): {@link GRAPH_TABLES}: `user`, `node`, `runtime`, its versions,
+ *   models, shares, instances, ranks, steps and operations, `execution_target`, profiles,
+ *   pools and their 1:1 children, members, routing rules, sidecars, `api_key`(+`_pool`),
+ *   `share`, `share_invite`, provider accounts, models, credentials, pricing and spend caps.
  * - Hot path, H-private ({@link HOT_PATH_TABLES}): admission and capacity
  *   runtime state, cache affinity, relay and provider history and accounting,
  *   response stickiness, usage rollups. They reference graph rows by plain id:
@@ -52,15 +50,11 @@
  *   userId is the pool principal; bucket userId is the physical target owner.
  *   This projection lock is not an ordered, waiting capacity-domain fence.
  *   One other
- *   documented exception: the relay disconnect
- *   (`disconnectCliDeviceAtGeneration`, packages/api/src/lib/model-pool-routing.ts)
- *   runs its per-member health statements (single-row, id order) inside a
- *   transaction that holds the `cli_device` row, because that row lock is the
- *   fence against a reconnect's registration. Every wait in it is bounded by a
- *   transaction-local `lock_timeout`, and it retries. A management cascade that
- *   takes the same device's members in a different order (a pool, endpoint or
- *   model delete) can deadlock with it; PostgreSQL aborts one side within
- *   about a second and both retry, so nothing is lost or left stuck.
+ *   documented exception: the relay disconnect (node-presence, lane A1) runs its
+ *   per-target health statements (single-row, id order) inside a transaction that holds
+ *   the `node` row, because that row lock is the fence against a reconnect's
+ *   registration. Every wait in it is bounded by a transaction-local `lock_timeout`, and
+ *   it retries.
  * - M (management): relay registration, dashboard and MCP writes, provider
  *   management, parent deletes, startup backfills and auto-capacity cleanup. It first takes the `owner`
  *   fence of every user whose graph rows it writes (sorted; cascades
@@ -86,15 +80,15 @@
  *
  *   00 owner:<user>                         M only
  *   01 admission-attempt:<attempt>          admission (first)
- *      provider-budget-attempt:<attempt>    provider budget admission/settlement
- *   02 execution-target:<identity>          target discovery/creation (M)
- *   03 provider-budget-account:<user>:<account>
- *      provider-budget-grant:<user>:<pool>:<grantee> per-grantee owner-paid spend cap
- *   04 provider-budget:<policy>
+ *      spend-attempt:<attempt>              spend reservation/settlement of one attempt
+ *   02 execution-target:<identity>          target creation (M)
+ *   04 spend-account:<account>              every cloud admission on the account (H), cap writers (M)
+ *      spend-cap:<cap>                      cap edits (M)
+ *      spend-share:<share>                  every owner-paid share admission (H), cap writers (M)
  *   05 provider-pricing:<user>:<model>
  *   06 capacity-policy:<target>             policy writers (M) and admission (H)
  *   07 concurrency:<scope>:<id>             admission-internal
- *   08 capacity:<capacity>                  admission (H), capacity policy writers (M)
+ *   08 capacity:<instance>                  admission (H), instance policy writers (M)
  *   09 cache-affinity:<owner>:<pool>        cache affinity identity + record/node retention
  *
  * Enforcement (structural, not an inventory):
@@ -111,7 +105,8 @@
  *    parties of a pool grant; the token owner and the referenced resource's
  *    owner of an allowlist entry), or a policy UPDATE runs without the
  *    `capacity-policy` / `capacity` fence of the rows whose admission view it
- *    changes. A row INSERTED by the same transaction (recorded by an AFTER
+ *    changes (spec §2.14: runtime current version, instance version, pool routing and
+ *    advanced limits, share class/permissions, member state and weight). A row INSERTED by the same transaction (recorded by an AFTER
  *    INSERT trigger; an earlier update of an existing row does not count)
  *    needs no policy fence (no other transaction can see it). A forgotten fence fails
  *    deterministically in tests instead of deadlocking in production.
@@ -146,32 +141,30 @@
  *   -> concurrency-scope fences -> capacity fences -> `admission_request` rows
  *   FOR UPDATE, the cross-capacity set first, sorted
  *   ({@link lockCrossCapacityAdmissionRequests}) -> the own request's waiters
- *   -> waiter, lease, request and `capacity_runtime` writes.
+ *   -> waiter, lease, request and `capacity_scheduler` writes.
  *
  * Release, reclaim, terminalization and the abandoned/orphan sweep take the
  * same fences (without the attempt fence) in the same order. The relay
  * admission-state projection (`relay_request.admissionTerminalState`) is a
  * separate single-row statement after the store transaction commits, so no
  * store transaction waits on a relay row. Lease heartbeat is a single-row
- * conditional UPDATE holding nothing else. `capacity_runtime` rows are
+ * conditional UPDATE holding nothing else. `capacity_scheduler` rows are
  * written only by a holder of their capacity fence, so they need no row lock.
  *
  * Provider order (M writers and H provider runtime):
  *
- *   provider-budget fences -> execution-target identity fence (creating a
- *   target or editing its policy) -> provider-pricing fence -> capacity
- *   policy / capacity fences -> `provider_account` row -> `provider_model`
- *   row -> `provider_pricing_version` rows -> `provider_credential` row ->
- *   child inserts.
+ *   spend fences -> execution-target identity fence (creating a target) ->
+ *   provider-pricing fence -> capacity policy / capacity fences ->
+ *   `provider_account` row -> `provider_model` row -> `provider_pricing_version` rows ->
+ *   `provider_credential` row -> child inserts.
  *
  * Every fence precedes the first row lock. Every transaction that locks both
  * a provider account and one of its models or credentials takes the account
  * first: M writers explicitly, H provider health and fencing transactions
- * (apps/server/src/model-api/provider-attempt-runtime.ts) explicitly, and the
- * E0 send claim below. Budget admission and accounting write only H tables
+ * (the attempt pipeline, lane B4) explicitly. Spend admission and accounting write only H tables
  * after their fences and read the account and model without a lock. A graph
  * INSERT that references an account or model (a pool's provider target,
- * pricing, a budget policy) runs after the account and model rows are held,
+ * pricing, a spend cap) runs after the account and model rows are held,
  * so its foreign-key checks re-enter held rows.
  *
  * Outside the capacity domain: the `session_refuse_deleting_user` trigger
@@ -196,134 +189,9 @@
  *   by the lower `lock_timeout`). It never waits on a fence or a graph row,
  *   so the user delete (fences, then this row FOR UPDATE) waiting on it
  *   closes no cycle.
- * - The CLI device-code exchange
- *   (packages/api/src/lib/cli-credential-access.ts) takes the owner fence
- *   first (it writes the device), then the device row, the user row and the
- *   device-code row. The user delete holds the same owner fence, so the two
- *   run one after the other.
- *
- * Terms in the E0 text below: "L1" is a `model_pool` row lock FOR NO KEY
- * UPDATE (the user delete takes it on every owned and granted pool, sorted,
- * after its fences and before the user row: {@link fenceParentDelete}), and
- * "L7" is that user row FOR UPDATE. Capacity admission takes no pool, grant,
- * token or provider row at all.
- *
- * The E0 send-claim transaction (external provider egress,
- * packages/api/src/lib/model-api-token-access.ts `lockExternalSendConsent`
- * then apps/server/src/model-api/public-overflow.ts
- * `claimPublicProviderCredentialForSend`) is also outside the capacity
- * domain. It starts holding nothing, and its first statement sets a
- * transaction-local `lock_timeout` (`EXTERNAL_SEND_CLAIM_LOCK_TIMEOUT_MS`,
- * 2 s; L1b, #64) that bounds every lock wait below. It then takes, in this
- * order:
- *
- *   C1  `model_pool` FOR SHARE (the pool being sent for);
- *   C2  `pool_grant` FOR SHARE (the requester's grant, grantees only);
- *   C3  `model_api_token` FOR SHARE (the requester's token, if any);
- *   C4  `model_api_token_allowlist_entry` FOR SHARE (that token's entry for
- *       the pool);
- *   C5  `provider_account` FOR UPDATE, then `provider_model` FOR SHARE (every
- *       path: pool fallback and own-key), then `provider_credential` FOR
- *       UPDATE (the order every provider lifecycle writer uses; writers of
- *       the model take the account first, so the model SHARE never waits
- *       while the claim holds the account).
- *
- *   C6  own-key only: `pool_fallback_preference` FOR SHARE. Preference writers
- *       take pool -> grant -> account -> model -> preference, and deletes
- *       cascade from grant/model into preference. No preference holder waits
- *       on any of those parents. Clear takes only the preference row.
- *       The preference composite FKs are key-shares on already held parents.
- *
- * Preference setter transaction (separate from the send claim): starts with
- * nothing held, then pool SHARE -> exact grant SHARE -> requester account
- * SHARE -> model SHARE -> preference upsert. The L1 pool SHARE is reviewed:
- * capacity admission's FK KEY SHARE is compatible; pool writers and ordered
- * user deletion serialize at the pool before reaching grants/provider rows.
- * Provider writers serialize at the account before reaching model/preference;
- * none waits on the granting owner's pool while holding those rows. Grant or
- * model deletion reaches preference only after its parent lock; clear holds
- * only preference. No holder of preference waits for a parent. The setter
- * neither holds nor later acquires a capacity lock, so adds no reverse edge.
- *
- * Bounded waits (L1b): the claim waits on the hot `provider_account` row
- * (C5; budget admission and settlement hold it, or KEY SHARE on it, while
- * they write attempt, reservation and ledger rows) while holding C1-C4 FOR
- * SHARE, which blocks the writers of those rows. `lock_timeout` caps each
- * wait, so each C1-C4 share hold lasts at most one bounded wait per level plus
- * the non-blocking remainder. A timed-out claim throws (55P03) before any
- * claim is written: the dispatcher settles the attempt as not sent
- * (`SEND_CLAIM_FAILED`, transient 503) and releases its budget reservation.
- * The per-request token `lastUsedAt` write never waits on the claim's C3
- * share lock: it is debounced and takes the token row FOR NO KEY UPDATE SKIP
- * LOCKED (packages/api/src/lib/model-api-token-access.ts,
- * `touchModelApiTokenLastUsedAt`), an autocommit statement holding nothing
- * else, so local traffic on a token never queues behind provider contention.
- * Consent editors (grant revoke, token external-access edits, pool flag
- * writes) still serialize behind a claim, which is the E0 guarantee, and wait
- * at most the claim's bounded duration. The whole claim is also capped by its
- * interactive-transaction timeout (10 s, public-overflow.ts): several waits
- * that each succeed just under 2 s end there (P2028, the same not-sent
- * settlement), so no claim holds C1-C4 longer than that ceiling plus the
- * rollback of a statement still in flight.
- *
- * After C6 (C5 for pool fallback; the last statement that can wait) it re-reads the requester's
- * token, the requester's `user` row and the pool owner's `user` row (#76)
- * WITHOUT a lock in one SQL statement that evaluates token expiry, ban and
- * deletion mark against statement_timestamp()
- * (`recheckExternalSendRequesterValidity`). An owner whose ban is active or
- * whose deletion is pending makes the pool unavailable to every requester
- * (`POOL_OWNER_INACTIVE`). The snapshot and its clock must be coherent:
- * comparing a returned ban expiry with a later JS clock could accept a
- * continuously renewed ban. Transaction now() predates the C5 wait. No `user`
- * lock is needed, for the requester or the owner: every statement after that
- * read is non-blocking (the credential row is already held) and none writes a
- * row the ban or deletion-mark writers read. A mark committing after the read
- * cannot affect the claim's decision (the send was already decided under the
- * earlier state); its commit may land before or after the claim commits, the
- * same send-level outcome a FOR SHARE would force, and the `user` rows stay
- * out of this order. The `lock_timeout` does not change this: every condition
- * is still re-read after the last lock wait, so E0 holds.
- *
- * Then, still after the last lock wait, it re-reads the target it was
- * admitted for (`recheckExternalSendTarget`, public-overflow.ts): the
- * provider model (held FOR SHARE at C5: enabled, not deleted, same account,
- * upstream model and execution target; its account, held FOR UPDATE, keeps
- * the listed endpoint identity and version) and, for pool fallback, the
- * `pool_member` row (same pool and target, PUBLIC_OVERFLOW, routing ACTIVE)
- * WITHOUT a lock. The member row stays out of this order for the same reason
- * as the `user` rows: nothing after the read waits and the claim writes no
- * row a member writer reads. A removal or disable committing after the read
- * cannot affect the claim's decision (the send was already decided under the
- * earlier state); its commit may land before or after the claim commits. A
- * changed target is availability (`PROVIDER_UNAVAILABLE`, or
- * `BOUND_TARGET_INVALID` for a stored-response binding or own-key), not a
- * consent denial: nothing is sent, and the dispatcher tries the next member
- * only for a retry-safe operation. The static guard
- * (apps/server/src/model-api/capacity/lock-order.test.ts)
- * checks this statement sequence, that neither post-wait re-read takes a
- * lock, and that no lock-taking or raw SQL statement follows them in the
- * claim.
- *
- * It takes no capacity lock and writes only the credential's `lastUsedAt`, so
- * no admitter ever waits on it (FOR SHARE does not conflict with the FOR KEY
- * SHARE of child inserts), and its C1 wait on an L1 holder closes no cycle.
- * Every transaction that holds a C-row in a conflicting mode and then waits
- * on a later C-level takes them in the same order: pool writers and deletes
- * (L1 first, then their grant/allowlist cascades), grant upserts (pool L1
- * first), grant setting updates (`updatePoolGrant`: owner fence, then pool L1,
- * then the grant), grant revokes (single statement), user deletes (L1 on every owned
- * and granted pool before the L7 cascade into grants, tokens, entries and
- * provider rows), `updateExternalAccess` (the caller's own token FOR NO KEY
- * UPDATE, scoped by `userId`, before its entries), token revoke (single
- * statement). Provider writers that hold C5
- * take no C1-C4 lock in a conflicting mode (their pool references are FK KEY
- * SHARE, which FOR SHARE admits).
- *
- * The user-row writers that wait while holding the row (the deletion mark
- * and archive, each then deleting session rows; the ordered delete's
- * cascade) never hold a row either transaction waits on first. The static
- * guard (apps/server/src/model-api/capacity/lock-order.test.ts) lists every
- * reviewed FOR SHARE site.
+ * - The node enrollment exchange (node-credential-access, lane A1) takes the owner fence
+ *   of the code's user first, then that user's row FOR SHARE: the same order as every
+ *   M writer.
  */
 import type { PrismaClient } from "../prisma/generated/client";
 import { Prisma } from "../prisma/generated/client";
@@ -337,17 +205,6 @@ import {
 type Tx = Prisma.TransactionClient;
 
 /**
- * Reserved discovery keys. schema-hardening.sql's inference_capacity_auto_label
- * trigger disambiguates labels for AUTO inserts with these keys under M's
- * owner fence (or D's exclusive table locks), without acquiring another lock.
- */
-export const AUTO_CAPACITY_RUNTIME_KEY_PREFIXES = [
-  "discovered-model:",
-  "execution-target:",
-  "engine-process:",
-] as const;
-
-/**
  * The hot-path (writer class H) tables. None has a foreign key to or from a
  * graph table; the catalog test checks it against `pg_constraint`.
  */
@@ -355,58 +212,63 @@ export const HOT_PATH_TABLES = [
   "admission_request",
   "capacity_waiter",
   "capacity_lease",
-  "capacity_runtime",
+  "capacity_scheduler",
+  "capacity_kv_eviction",
+  "routing_verdict",
   "cache_affinity_record",
   "cache_affinity_residency",
+  "cache_affinity_residency_cursor",
   "cache_affinity_node",
   "cache_affinity_scope",
   "cache_affinity_observer",
-  "relay_request",
-  "relay_execution_event",
-  "relay_execution_attempt",
   "response_stickiness_record",
+  "relay_request",
+  "attempt",
+  "attempt_event",
+  "spend_reservation",
+  "spend_settlement",
+  "usage_ledger",
   "usage_rollup_minute",
   "usage_rollup_hour",
-  "provider_attempt",
-  "public_provider_attempt_event",
-  "provider_budget_reservation",
-  "provider_budget_settlement",
-  "provider_usage_ledger",
-  "pool_member_routing_verdict",
-  "capacity_kv_eviction",
-  "engine_load_rollup_minute",
+  "runtime_load_minute",
   "node_metrics_minute",
 ] as const;
 
-/** The graph (configuration) tables: fence triggers guard their writes. */
+/**
+ * The graph (configuration) tables: fence triggers guard their writes (the install list of
+ * `enforce_graph_write_fence` in schema-hardening.sql).
+ */
 export const GRAPH_TABLES = [
   "user",
-  "cli_device",
-  "endpoint",
-  "discovered_model",
+  "node",
+  "runtime",
+  "runtime_version",
+  "runtime_model",
+  "runtime_share",
+  "runtime_instance",
+  "instance_rank",
+  "instance_step",
+  "runtime_operation",
   "execution_target",
-  "inference_capacity",
-  "model_pool",
+  "profile",
+  "profile_node",
+  "profile_item",
+  "pool",
+  "pool_routing",
+  "pool_fallback",
+  "pool_advanced",
+  "pool_sidecar",
   "pool_member",
-  "inference_contribution",
-  "deployment_config",
-  "deployment_config_revision",
-  "deployment_plan",
-  "deployment_run",
-  "deployment_instance",
-  "deployment_instance_node",
-  "deployment_step",
   "pool_routing_rule",
-  "pool_grant",
-  "model_api_token",
-  "model_api_token_allowlist_entry",
+  "api_key",
+  "api_key_pool",
+  "share",
+  "share_invite",
   "provider_account",
   "provider_model",
   "provider_credential",
-  "provider_budget_policy",
-  "provider_budget_rule",
   "provider_pricing_version",
-  "pool_fallback_preference",
+  "spend_cap",
 ] as const;
 
 const RETRYABLE_TRANSACTION_CODES = new Set(["P2034", "40001", "40P01", "FENCE_SET_CHANGED"]);
@@ -453,18 +315,19 @@ function fence(level: string, kind: string, id: string): Fence {
 export const fences = {
   owner: (userId: string) => fence("00", "owner", userId),
   admissionAttempt: (attemptId: string) => fence("01", "admission-attempt", attemptId),
-  budgetAttempt: (attemptId: string) => fence("01", "provider-budget-attempt", attemptId),
+  spendAttempt: (attemptId: string) => fence("01", "spend-attempt", attemptId),
   targetIdentity: (identity: string) => fence("02", "execution-target", identity),
-  budgetAccount: (userId: string, providerAccountId: string) =>
-    fence("03", "provider-budget-account", `${userId}:${providerAccountId}`),
-  budgetGrant: (userId: string, poolId: string, granteeUserId: string) =>
-    fence("03", "provider-budget-grant", `${userId}:${poolId}:${granteeUserId}`),
-  budgetPolicy: (policyId: string) => fence("04", "provider-budget", policyId),
+  spendCap: (capId: string) => fence("04", "spend-cap", capId),
+  /** Serializes cloud admissions on one provider account, capped or not (cap subject). */
+  spendAccount: (providerAccountId: string) => fence("04", "spend-account", providerAccountId),
+  /** Serializes owner-paid admissions through one share, capped or not (cap subject). */
+  spendShare: (shareId: string) => fence("04", "spend-share", shareId),
   pricing: (userId: string, providerModelId: string) =>
     fence("05", "provider-pricing", `${userId}:${providerModelId}`),
   capacityPolicy: (executionTargetId: string) => fence("06", "capacity-policy", executionTargetId),
   concurrencyScope: (scope: string, scopeId: string) =>
     fence("07", "concurrency", `${scope}:${scopeId}`),
+  /** capacityId = RuntimeInstance.id. */
   capacity: (capacityId: string) => fence("08", "capacity", capacityId),
   cacheAffinity: (ownerUserId: string, poolId: string) =>
     fence("09", "cache-affinity", `${ownerUserId}:${poolId}`),
@@ -531,6 +394,33 @@ export async function fenceOwners(tx: Tx, userIds: Iterable<string>): Promise<vo
     tx,
     [...new Set(userIds)].map((userId) => fences.owner(userId)),
   );
+}
+
+/** A check that rests on owner fences ran without one of them (a programming error). */
+export class MissingOwnerFenceError extends Error {
+  readonly code = "MISSING_OWNER_FENCE";
+  constructor(readonly userIds: readonly string[]) {
+    super("A check that needs owner fences ran without them.");
+    this.name = "MissingOwnerFenceError";
+  }
+}
+
+/**
+ * Throws unless this transaction holds the `owner` fence of every user in `userIds`. For a
+ * check-then-write whose exactness rests on the fence rather than on a write the fence trigger
+ * guards (the model-name namespace, packages/api/src/lib/model-names.ts): a forgotten fence
+ * fails at once instead of letting two writers race past the check. The test fixtures'
+ * wildcard counts as every fence.
+ */
+export async function requireOwnerFences(tx: Tx, userIds: Iterable<string>): Promise<void> {
+  const wanted = [...new Set(userIds)];
+  if (wanted.length === 0) return;
+  const rows = await tx.$queryRaw<Array<{ held: string | null }>>`
+    SELECT current_setting('wsmp.fences', true) AS held`;
+  const held = rows?.[0]?.held ?? "";
+  if (held.includes(",*,")) return;
+  const missing = wanted.filter((userId) => !held.includes(`,${fences.owner(userId)},`));
+  if (missing.length > 0) throw new MissingOwnerFenceError(missing);
 }
 
 // ---------------------------------------------------------------------------
@@ -631,26 +521,16 @@ export async function lockCrossCapacityAdmissionRequests(
 }
 
 /**
- * Deletes terminal `relay_request` rows without waiting on an admission or
- * relay row lock (sweepers and the user-deletion drain).
+ * Deletes terminal `relay_request` rows without waiting on a relay row lock (sweepers and the
+ * user-deletion drain): the rows are taken with SKIP LOCKED and `status` is re-checked under
+ * the lock; skipped rows stay for a later run. `admission_request.relayRequestId` is a plain
+ * id (no foreign key), so no admission row is rewritten.
  *
- * The DELETE's ON DELETE SET NULL rewrites the referencing `admission_request`
- * rows (an H-internal foreign key), while an admitter locks admission requests
- * in its own order. A relay delete that waited on either kind of row could
- * stall behind an admitter, so it takes both kinds with SKIP LOCKED: first the
- * referencing admission rows (sorted), then only the relay rows whose every
- * referencing admission row it now holds. Skipped rows stay for a later run.
- * `status` is re-checked under the lock; the other filters the caller applied
- * (owner, age, ids) are immutable. Returns the number of deleted rows.
- *
- * Not taken with SKIP LOCKED: the ON DELETE CASCADE children of a deleted
- * relay row (`relay_execution_event`, `relay_execution_attempt`). The DELETE
- * can wait on one of those rows while its writer holds it. Their writers
- * (the model-API routes' attempt start/finalization transactions and relay
- * telemetry recovery) write attempt, event and relay rows and take no fence,
- * so the wait does not close a cycle with an admitter. The parent-deletion
- * drain runs this in a batch with transaction-local `lock_timeout` and
- * `statement_timeout`, so there the wait is bounded in time.
+ * Not taken with SKIP LOCKED: the ON DELETE CASCADE children of a deleted relay row
+ * (`attempt`, and its `attempt_event` rows). The DELETE can wait on one of those rows while
+ * its writer holds it. Their writers (the attempt pipeline) take no fence, so the wait closes
+ * no cycle with an admitter; the drain bounds it with a transaction-local `lock_timeout`.
+ * Returns the number of deleted rows.
  */
 export async function deleteTerminalRelayRequestsWithoutWaiting(
   tx: Tx,
@@ -659,31 +539,13 @@ export async function deleteTerminalRelayRequestsWithoutWaiting(
   const ids = [...new Set(relayRequestIds)].sort();
   if (ids.length === 0) return 0;
   // One array parameter per statement: batches run to thousands of ids.
-  const locked = await tx.$queryRaw<Array<{ relayRequestId: string }>>`
-    SELECT "relayRequestId" FROM admission_request
-     WHERE "relayRequestId" = ANY(${ids}::text[])
-     ORDER BY id
-     FOR NO KEY UPDATE SKIP LOCKED`;
-  const referencing = await tx.$queryRaw<Array<{ relayRequestId: string; total: bigint }>>`
-    SELECT "relayRequestId", count(*) AS total FROM admission_request
-     WHERE "relayRequestId" = ANY(${ids}::text[])
-     GROUP BY "relayRequestId"`;
-  const lockedByRelay = new Map<string, number>();
-  for (const row of locked)
-    lockedByRelay.set(row.relayRequestId, (lockedByRelay.get(row.relayRequestId) ?? 0) + 1);
-  const busy = new Set(
-    referencing
-      .filter((row) => (lockedByRelay.get(row.relayRequestId) ?? 0) < Number(row.total))
-      .map((row) => row.relayRequestId),
-  );
-  const eligible = ids.filter((id) => !busy.has(id));
-  if (eligible.length === 0) return 0;
   return tx.$executeRaw`
     DELETE FROM relay_request
      WHERE id IN (
        SELECT id FROM relay_request
-        WHERE id = ANY(${eligible}::text[])
+        WHERE id = ANY(${ids}::text[])
           AND status IN ('SUCCEEDED', 'FAILED', 'CANCELED')
+        ORDER BY id
         FOR UPDATE SKIP LOCKED)`;
 }
 
@@ -715,18 +577,12 @@ export class UserDeletionGenerationChangedError extends Error {
   }
 }
 
-function sortedIds(values: Iterable<string | null | undefined>): string[] {
-  const ids = new Set<string>();
-  for (const value of values) if (value) ids.add(value);
-  return [...ids].sort();
-}
-
 /**
- * Every user whose graph rows the delete of `parents` writes, cascades
- * included: the owner, both parties of every pool grant it removes, the
- * owners of allowlist entries that reference a deleted pool, model or target,
- * and the owners of the resources that the deleted tokens' entries reference
- * (each allowlist write needs both owners' fences). Plain reads.
+ * Every user whose graph rows the delete of `parents` writes, cascades included: the owner,
+ * both parties of every share and runtime share it removes, the pool owners and contributors
+ * of the members it removes (a contributed member links two graphs), the API-key and pool
+ * owners of the key entries it removes, and the owners of sidecars that point at a deleted
+ * pool. Plain reads.
  */
 export async function resolveDeletionOwners(
   tx: Pick<Tx, "$queryRaw">,
@@ -734,45 +590,47 @@ export async function resolveDeletionOwners(
   parents: DeletedParents,
 ): Promise<string[]> {
   const owners = new Set([ownerUserId, ...parents.user]);
-  const grants = await tx.$queryRaw<Array<{ ownerUserId: string; granteeUserId: string }>>`
-    SELECT "ownerUserId", "granteeUserId" FROM pool_grant
-     WHERE id = ANY(${parents.pool_grant}::text[])
-        OR "poolId" = ANY(${parents.model_pool}::text[])
-        OR "ownerUserId" = ANY(${parents.user}::text[])
-        OR "granteeUserId" = ANY(${parents.user}::text[])`;
-  for (const grant of grants) {
-    owners.add(grant.ownerUserId);
-    owners.add(grant.granteeUserId);
-  }
-  const contributions = await tx.$queryRaw<
-    Array<{ contributorUserId: string; poolOwnerUserId: string }>
-  >`
-    SELECT DISTINCT contribution."contributorUserId", contribution."poolOwnerUserId"
-      FROM inference_contribution contribution
-      LEFT JOIN pool_member member ON member."inferenceContributionId" = contribution.id
-     WHERE contribution."poolId" = ANY(${parents.model_pool}::text[])
-        OR contribution."discoveredModelId" = ANY(${parents.discovered_model}::text[])
-        OR contribution."contributorUserId" = ANY(${parents.user}::text[])
-        OR contribution."poolOwnerUserId" = ANY(${parents.user}::text[])
-        OR member.id = ANY(${parents.pool_member}::text[])`;
-  for (const contribution of contributions) {
-    owners.add(contribution.contributorUserId);
-    owners.add(contribution.poolOwnerUserId);
-  }
-  const entryOwners = await tx.$queryRaw<Array<{ userId: string | null }>>`
-    SELECT token."userId" FROM model_api_token_allowlist_entry entry
-      JOIN model_api_token token ON token.id = entry."modelApiTokenId"
-     WHERE entry."modelPoolId" = ANY(${parents.model_pool}::text[])
-        OR entry."discoveredModelId" = ANY(${parents.discovered_model}::text[])
-        OR entry."executionTargetId" = ANY(${parents.execution_target}::text[])
-    UNION
-    SELECT COALESCE(pool."userId", model."userId", target."userId")
-      FROM model_api_token_allowlist_entry entry
-      LEFT JOIN model_pool pool ON pool.id = entry."modelPoolId"
-      LEFT JOIN discovered_model model ON model.id = entry."discoveredModelId"
-      LEFT JOIN execution_target target ON target.id = entry."executionTargetId"
-     WHERE entry."modelApiTokenId" = ANY(${parents.model_api_token}::text[])`;
-  for (const row of entryOwners) if (row.userId) owners.add(row.userId);
+  const add = (rows: ReadonlyArray<Record<string, string | null>>) => {
+    for (const row of rows) for (const value of Object.values(row)) if (value) owners.add(value);
+  };
+  add(
+    await tx.$queryRaw<Array<{ ownerUserId: string; granteeUserId: string }>>`
+      SELECT "ownerUserId", "granteeUserId" FROM share
+       WHERE id = ANY(${parents.share}::text[])
+          OR "poolId" = ANY(${parents.pool}::text[])
+          OR "ownerUserId" = ANY(${parents.user}::text[])
+          OR "granteeUserId" = ANY(${parents.user}::text[])`,
+  );
+  add(
+    await tx.$queryRaw<Array<{ ownerUserId: string; granteeUserId: string }>>`
+      SELECT "ownerUserId", "granteeUserId" FROM runtime_share
+       WHERE id = ANY(${parents.runtime_share}::text[])
+          OR "runtimeId" = ANY(${parents.runtime}::text[])
+          OR "ownerUserId" = ANY(${parents.user}::text[])
+          OR "granteeUserId" = ANY(${parents.user}::text[])`,
+  );
+  add(
+    await tx.$queryRaw<Array<{ poolOwner: string | null; modelOwner: string | null }>>`
+      SELECT pool."userId" AS "poolOwner", model."userId" AS "modelOwner"
+        FROM pool_member member
+        JOIN pool ON pool.id = member."poolId"
+        LEFT JOIN runtime_model model ON model.id = member."runtimeModelId"
+       WHERE member.id = ANY(${parents.pool_member}::text[])`,
+  );
+  add(
+    await tx.$queryRaw<Array<{ keyOwner: string; poolOwner: string }>>`
+      SELECT key."userId" AS "keyOwner", pool."userId" AS "poolOwner"
+        FROM api_key_pool entry
+        JOIN api_key key ON key.id = entry."apiKeyId"
+        JOIN pool ON pool.id = entry."poolId"
+       WHERE entry."apiKeyId" = ANY(${parents.api_key}::text[])
+          OR entry."poolId" = ANY(${parents.pool}::text[])`,
+  );
+  add(
+    await tx.$queryRaw<Array<{ userId: string }>>`
+      SELECT pool."userId" FROM pool_sidecar sidecar JOIN pool ON pool.id = sidecar."poolId"
+       WHERE sidecar."targetPoolId" = ANY(${parents.pool}::text[])`,
+  );
   return [...owners].sort();
 }
 
@@ -787,15 +645,19 @@ export async function resolveDeletionOwners(
  *    (a grant, an allowlist entry) needs a fence this transaction now holds,
  *    so the re-plan is final; a larger set throws
  *    {@link FenceSetChangedError} (retried) before any row is locked;
- * 4. for a whole-user delete: locks every pool the user owns or is granted,
- *    sorted, FOR NO KEY UPDATE (the E0 send claim's C1 order, see below),
- *    then the user row FOR UPDATE on the caller's deletion generation
- *    ({@link UserDeletionGenerationChangedError} when it changed).
+ * 4. for a whole-user delete: locks the user row FOR UPDATE on the caller's deletion
+ *    generation ({@link UserDeletionGenerationChangedError} when it changed); for any other
+ *    delete: takes the policy fences of the targets and the capacity fences of the
+ *    instances it removes. Returns those instance ids.
  *
  * The DELETE that follows is a plain delete: it cascades only into graph and
  * auxiliary rows (no H table has a foreign key), each guarded by a fence this
  * transaction holds. A parent with admission or lease history is deletable;
  * the history keeps plain ids and the sweepers terminalize live orphans.
+ *
+ * A whole-user delete runs in the fixed order of the hardening contract
+ * ({@link deleteUserUnderOwnerFences}): instances, profiles, runtimes (current version
+ * nulled first), nodes, pools, providers, then the user row.
  */
 export async function fenceParentDelete(tx: Tx, scope: CapacityDeleteScope): Promise<string[]> {
   if (scope.wholeUser && scope.userDeletionGeneration === undefined)
@@ -811,54 +673,18 @@ export async function fenceParentDelete(tx: Tx, scope: CapacityDeleteScope): Pro
   const held = new Set(planned);
   if (current.some((owner) => !held.has(owner))) throw new FenceSetChangedError();
   if (!scope.wholeUser) {
-    // Cleanup after the cascade may delete these graph rows. Fence them
-    // before the caller's first write; no H rows are locked or written.
-    const capacities = await tx.inferenceCapacity.findMany({
-      where: {
-        userId: scope.userId,
-        hardConcurrencyLimitSource: "AUTO",
-        OR: AUTO_CAPACITY_RUNTIME_KEY_PREFIXES.map((prefix) => ({
-          runtimeIdentityKey: { startsWith: prefix },
-        })),
-        ExecutionTargets: { some: { id: { in: parents.execution_target } } },
-      },
-      select: { id: true },
-    });
-    const ids = capacities.map((capacity) => capacity.id);
-    // Surviving shared members need policy fences for aggregate refresh
-    // after the cascade, before any graph row is locked or written.
-    const attached =
-      ids.length > 0
-        ? await tx.executionTarget.findMany({
-            where: { userId: scope.userId, inferenceCapacityId: { in: ids } },
-            select: { id: true },
-          })
-        : [];
+    // A delete that removes instances or changes a pool's targets changes admission views:
+    // take their policy and capacity fences before the first row lock or write.
     await acquireFences(tx, [
-      ...attached.map((target) => fences.capacityPolicy(target.id)),
-      ...ids.map((id) => fences.capacity(id)),
+      ...parents.execution_target.map((id) => fences.capacityPolicy(id)),
+      ...parents.runtime_instance.map((id) => fences.capacity(id)),
     ]);
-    return ids;
+    return parents.runtime_instance;
   }
-  // The whole-user cascade removes capacities; it needs no separate cleanup.
-  const pools = sortedIds([
-    ...parents.model_pool,
-    ...(
-      await tx.poolGrant.findMany({
-        where: { granteeUserId: scope.userId },
-        select: { poolId: true },
-      })
-    ).map((grant) => grant.poolId),
-  ]);
-  if (pools.length > 0)
-    await tx.$queryRaw`SELECT id FROM model_pool WHERE id IN (${Prisma.join(
-      pools,
-    )}) ORDER BY id FOR NO KEY UPDATE`;
-  // The generation predicate is evaluated under this lock: READ COMMITTED
-  // re-checks the WHERE on the newest row version after waiting, so an
-  // abandon, unarchive or new generation committed meanwhile yields no row.
-  // The writers that change the generation take no fence, so waiting on them
-  // here closes no cycle.
+  // The generation predicate is evaluated under this lock: READ COMMITTED re-checks the
+  // WHERE on the newest row version after waiting, so an abandon, unarchive or new
+  // generation committed meanwhile yields no row. The writers that change the generation
+  // take no fence, so waiting on them here closes no cycle.
   const locked = await tx.$queryRaw<Array<{ id: string }>>`
     SELECT id FROM "user"
      WHERE id = ${scope.userId} AND "deletionGeneration" = ${scope.userDeletionGeneration}
@@ -1005,6 +831,27 @@ export async function runCapacityOrderedTransaction<T>(
 }
 
 /**
+ * The user's graph in the hardening contract's order (docs/contracts/0.4.0-schema-hardening.md,
+ * "Delete rules"): the `NoAction` edges (instance → runtime/version, profile item → runtime,
+ * runtime → current version, pricing → model/account, credential rotation) must be gone
+ * before their parent, so the user cascade alone would fail at statement end.
+ */
+async function deleteUserGraphInOrder(tx: Tx, userId: string): Promise<void> {
+  await tx.runtimeInstance.deleteMany({ where: { userId } });
+  await tx.profile.deleteMany({ where: { userId } });
+  await tx.runtime.updateMany({ where: { userId }, data: { currentVersionId: null } });
+  await tx.runtime.deleteMany({ where: { userId } });
+  await tx.node.deleteMany({ where: { userId } });
+  await tx.pool.deleteMany({ where: { userId } });
+  await tx.providerPricingVersion.deleteMany({ where: { userId } });
+  // Rotated keys first: clearing replacedById on a REPLACED key would break its shape CHECK.
+  // One statement takes the whole chain (NoAction is checked at statement end, and only the
+  // ACTIVE head, which nothing deleted here references, remains for the account cascade).
+  await tx.providerCredential.deleteMany({ where: { userId, replacedById: { not: null } } });
+  await tx.providerAccount.deleteMany({ where: { userId } });
+}
+
+/**
  * Deletes a user and its graph under the owner fences of every affected user
  * ({@link fenceParentDelete}), and records the user in the purge queue
  * (`deleted_user_purge`) in the same transaction: the user's hot-path history
@@ -1038,6 +885,7 @@ export async function deleteUserUnderOwnerFences(
       await tx.$executeRaw`
         INSERT INTO deleted_user_purge ("userId") VALUES (${userId})
         ON CONFLICT ("userId") DO NOTHING`;
+      await deleteUserGraphInOrder(tx, userId);
       await tx.user.delete({ where: { id: userId }, select: { id: true } });
       return true;
     });

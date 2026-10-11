@@ -7,7 +7,7 @@ Edit `AGENTS.md`, then run `cargo xtask sync-docs`. CI fails if the mirrors drif
 
 ## What This Is
 
-The Rust command-line relay client for WS Model Proxy. The `wsmp` CLI authenticates with the web app, manages local endpoint configuration, probes OpenAI-compatible endpoints, and keeps the outbound websocket relay connected.
+The Rust command-line relay client for WS Model Proxy. The `wsmp` CLI enrolls a machine as a node of the web app, keeps the outbound websocket relay connected, relays requests to the model servers on the machine, and runs the runtimes, commands, file operations and terminals the server sends (as the node's trust allows).
 
 ## Orientation
 
@@ -17,10 +17,10 @@ The Rust command-line relay client for WS Model Proxy. The `wsmp` CLI authentica
 | `src/main.rs` | Entry point: parse arguments, initialize logging, dispatch, map errors to exit codes. |
 | `src/cli.rs` | Clap argument definitions. Keep CLI shape here and command logic elsewhere. |
 | `src/commands/` | One file per subcommand, each exposing `Args` and `run(&Args)`. |
-| `src/config.rs` | Local TOML config structs, load/save, endpoint inventory. |
-| `src/state.rs` | Stored device credentials and mutable local relay state. |
+| `src/config.rs` | Local JSON config (`config.json`): structs, load/save, validation. |
+| `src/state.rs` | The stored node credential and mutable local relay state. |
 | `src/daemon.rs` | Foreground websocket relay session. |
-| `src/probe.rs` | Endpoint/model capability probing. |
+| `src/probe.rs` | Model-list and capability probing of a runtime's endpoint. |
 | `src/paths.rs` | Cross-platform config/data directories via `dirs`. |
 | `src/logging.rs` | Tracing setup. Logs go to stderr. |
 | `src/exit.rs` | Stable process exit codes. |

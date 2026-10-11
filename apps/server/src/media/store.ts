@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, readdir, rename, rm, stat } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { type FileHandle, mkdir, open, readdir, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { type Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -186,13 +186,29 @@ export class LocalMediaStore implements MediaStore {
     };
   }
 
+  /**
+   * The object's bytes and size from ONE open file handle: once this resolves, an unlink (expiry,
+   * purge) cannot break the stream or make the size disagree with the bytes. Null when the
+   * object is missing or not a regular file.
+   */
   async getStream(id: string): Promise<MediaObjectStream | null> {
     const path = this.objectPath(id);
+    let handle: FileHandle;
     try {
-      const info = await stat(path);
-      if (!info.isFile()) return null;
-      return { stream: createReadStream(path), sizeBytes: info.size };
+      handle = await open(path, "r");
     } catch {
+      return null;
+    }
+    try {
+      const info = await handle.stat();
+      if (!info.isFile()) {
+        await handle.close();
+        return null;
+      }
+      // The stream owns the handle and closes it when it ends, errors or is destroyed.
+      return { stream: handle.createReadStream({ autoClose: true }), sizeBytes: info.size };
+    } catch {
+      await handle.close().catch(() => {});
       return null;
     }
   }

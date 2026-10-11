@@ -19,6 +19,29 @@ protocol, the fence levels and the proof are in `packages/db/src/capacity-lock-o
 Scheduler state and the fencing-token counter live in `capacity_runtime` (hot path), not in
 `inference_capacity`.
 
+## Limits model
+
+- **Priority classes.** Pools, direct targets and pool grants have one of three classes:
+  BACKGROUND, NORMAL (default) or HIGH. Hot-path rows (`effectivePriority`, `basePriority`,
+  lease `priority` / `reservationClass`) store the rank 0 / 1 / 2. The scheduler is a weighted
+  deficit round robin over the three classes with quanta 1 / 4 / 16 (`scheduler.ts`,
+  `SCHEDULER_VERSION = 2`): when all three keep waiting, freed slots split about 5% / 19% / 76%.
+  A `capacity_runtime` row of another version or shape restarts its fairness credit.
+- **Kept (reserved) slots are a guarantee.** A pool keeps `capacityReservedSlots` (a member may
+  override the count) on each runtime its PRIMARY members use; a direct target keeps
+  `directReservedSlots`. A waiter may take a slot another owner keeps only while no owner with
+  unmet kept slots has a grantable waiter (in its window, past `notBefore`, its scopes not full),
+  whatever the classes, and only when its own borrow switch (`capacityBorrowReserved` /
+  `directBorrowReserved`) is on.
+- **The pool-wide cap binds every member.** A member that inherits is limited by the POOL scope.
+  A member with its own scope (LIMITED, or UNLIMITED = no cap of its own) is limited by its MEMBER
+  scope AND the pool-wide cap (`CapacityWaiter.effectivePoolConcurrencyLimit`, fenced as the POOL
+  scope).
+- **Contributed members** (inference contributions) run as BACKGROUND, keep nothing and may
+  borrow on the contributor's machine.
+- Priority and borrowing are pool-level only; a member overrides only the hardware-bound limits
+  (concurrency, kept slots, wait budget, context ceiling).
+
 The CI-gated integration suite uses independent clients for advisory-lock, admission, fencing,
 restart, notification, and race proofs. Serialization (`40001`) and deadlock (`40P01`) retry logic is
 tested through the production transaction runner with injected rollback attempts. A live
@@ -55,7 +78,7 @@ and release/reclaim (fill mode: grant until nothing more fits).
 
 The transaction can be retried (`runCapacitySerializable`): nothing is carried across attempts;
 each attempt re-reads, re-plans and takes fencing tokens from the capacity row's counter. Cost per
-transaction is one snapshot, O(W log W) indexing, then at most 32 priority-class candidates
+transaction is one snapshot, O(W log W) indexing, then at most 3 priority-class candidates
 and owners with unmet reservations per grant, with lazy permanent skips amortized over the queue.
 Temporarily borrow-blocked entries may be examined again on later grants; that exceptional cost
 is proportional to the skipped entries. Snapshot relation hydration and lease inserts use batches of at most 500 rows within the same
@@ -107,8 +130,8 @@ false and retry on the next run. A shrinking set needs no retry; extra fences ar
 ## Per-grant queue priority (saturation S-C)
 
 - A pool attempt carries the requester's `accessGrantId` (grantees only). When the grant's
-  `queuePriority` is set, it replaces the pool/member `capacityPriority` as every candidate's
-  effective waiter priority (clamped to 0..31) and is recorded as the request's `basePriority`;
+  `queuePriorityClass` is set, its rank replaces the pool's `capacityPriorityClass` as every
+  candidate's effective waiter priority and is recorded as the request's `basePriority`;
   null, the owner (no grant) and a grant of another pool inherit. It is read once, when the
   attempt is created, with a plain `pool_grant` read after the L2 fences: no row lock, so no
   lock-order edge. The DRR scheduler is unchanged; the grant only moves the waiter's class.

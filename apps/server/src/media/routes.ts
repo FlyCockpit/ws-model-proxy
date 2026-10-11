@@ -254,6 +254,12 @@ export function createMediaGetHandler(deps: MediaHandlerDeps = {}) {
       "Cache-Control": "private, max-age=300",
       "Content-Disposition": "inline",
     });
+    // Hono answers HEAD with the GET handler and drops the body without cancelling it: close
+    // the object's file here instead of leaving it to garbage collection.
+    if (c.req.method === "HEAD") {
+      object.stream.destroy();
+      return new Response(null, { status: 200, headers });
+    }
     const webStream = Readable.toWeb(object.stream) as unknown as ReadableStream<Uint8Array>;
     return new Response(webStream, { status: 200, headers });
   };

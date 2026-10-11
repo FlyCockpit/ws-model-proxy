@@ -165,12 +165,12 @@ export const kvEvictionResetMs = resets.resetMs;
 export const noteKvEvictionReset = resets.note;
 
 async function resetKvEvictionCapacities(
-  where: Prisma.InferenceCapacityWhereInput,
+  where: Prisma.RuntimeInstanceWhereInput,
   now: Date,
-  db: Pick<typeof prisma, "inferenceCapacity" | "capacityKvEviction">,
+  db: Pick<typeof prisma, "runtimeInstance" | "capacityKvEviction">,
 ): Promise<void> {
   if (isDbShutdownFenceArmed()) return;
-  const rows = await db.inferenceCapacity.findMany({ where, select: { id: true } });
+  const rows = await db.runtimeInstance.findMany({ where, select: { id: true } });
   const ids = rows.map((row) => row.id);
   noteKvEvictionReset(ids, now);
   if (ids.length === 0) return;
@@ -178,20 +178,21 @@ async function resetKvEvictionCapacities(
   await db.capacityKvEviction.deleteMany({ where: { capacityId: { in: ids } } }).catch(() => {});
 }
 
-export async function resetKvEvictionForEndpoint(
-  cliDeviceId: string,
-  endpointSlug: string,
+/**
+ * The node reported an engine reset of the instance it names by `handle` (capacityId = the
+ * instance): its KV feedback and affinity generation start over.
+ */
+export async function resetKvEvictionForInstance(
+  nodeId: string,
+  handle: string,
   now: Date = new Date(),
-  db: Pick<typeof prisma, "inferenceCapacity" | "capacityKvEviction"> = prisma,
+  db: Pick<typeof prisma, "node" | "runtimeInstance" | "capacityKvEviction"> = prisma,
 ): Promise<void> {
-  if (!cliDeviceId || !endpointSlug || cliDeviceId.length > 128 || endpointSlug.length > 63) return;
+  if (!nodeId || !handle || nodeId.length > 128 || handle.length > 63) return;
   if (db === prisma) {
     const rows = await queryAffinityResidency<Array<{ id: string }>>(Prisma.sql`
-      SELECT DISTINCT t."inferenceCapacityId" AS id FROM endpoint e
-      JOIN discovered_model m ON m."endpointId" = e.id
-      JOIN execution_target t ON t."discoveredModelId" = m.id
-      WHERE e."cliDeviceId" = ${cliDeviceId} AND e.slug = ${endpointSlug}
-        AND t."inferenceCapacityId" IS NOT NULL`);
+      SELECT i.id FROM runtime_instance i JOIN node n ON n."userId" = i."userId"
+      WHERE n.id = ${nodeId} AND i.handle = ${handle}`);
     const ids = rows.map((row) => row.id);
     noteKvEvictionReset(ids, now);
     await resetAffinityForCapacities(ids);
@@ -199,15 +200,9 @@ export async function resetKvEvictionForEndpoint(
       WHERE "capacityId" = ANY(${ids}::text[]) RETURNING "capacityId"`).catch(() => {});
     return;
   }
-  await resetKvEvictionCapacities(
-    {
-      ExecutionTargets: {
-        some: { DiscoveredModel: { Endpoint: { cliDeviceId, slug: endpointSlug } } },
-      },
-    },
-    now,
-    db,
-  );
+  const node = await db.node.findUnique({ where: { id: nodeId }, select: { userId: true } });
+  if (!node) return;
+  await resetKvEvictionCapacities({ userId: node.userId, handle }, now, db);
 }
 
 export async function recordKvEvictionObservations(

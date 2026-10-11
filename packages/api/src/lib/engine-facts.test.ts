@@ -3,207 +3,92 @@ import {
   engineCountContextSupportsNative,
   engineDefaultConcurrency,
   enginePreset,
-  isHardLimitRefreshAdmissible,
   mergeEngineFacts,
-  sameStoredEngineFacts,
-  storedEngineFacts,
+  sameStoredInstanceFacts,
+  storedInstanceFacts,
 } from "./engine-facts";
 
 describe("engine facts", () => {
-  it("layers model facts over endpoint facts", () => {
+  it("layers model facts over runtime facts", () => {
     expect(
       mergeEngineFacts(
-        {
-          engine: { value: "vllm", source: "probe" },
-          maxModelLen: { value: 8_192, source: "probe" },
-        },
-        { maxModelLen: { value: 131_072, source: "probe" } },
+        { slots: { value: 4, source: "probe" }, maxModelLen: { value: 8192, source: "probe" } },
+        { slots: { value: 2, source: "config" } },
       ),
     ).toEqual({
-      engine: { value: "vllm", source: "probe" },
-      maxModelLen: { value: 131_072, source: "probe" },
+      slots: { value: 2, source: "config" },
+      maxModelLen: { value: 8192, source: "probe" },
     });
     expect(mergeEngineFacts(undefined, undefined)).toBeUndefined();
   });
 
-  it("maps facts to capacity columns with one combined source", () => {
+  it("maps facts to the instance columns", () => {
     expect(
-      storedEngineFacts({
-        engine: { value: "llama.cpp", source: "config" },
-        slots: { value: 4, source: "probe" },
-        ctxPerSlot: { value: 32_768, source: "probe" },
+      storedInstanceFacts({
+        engine: { value: "vllm", source: "probe" },
+        slots: { value: 8, source: "probe" },
+        kvTokens: { value: 120_000, source: "probe" },
+        maxModelLen: { value: 2 ** 40, source: "probe" },
+        countContext: { value: "vllm_tokenize", source: "probe" },
+        loadReader: {
+          value: { input: "route", signals: ["running", "waiting"] },
+          source: "config",
+        },
       }),
     ).toEqual({
-      engineKind: "LLAMA_CPP",
-      engineSlots: 4,
-      engineSlotsSource: "PROBE",
-      kvBudgetTokens: null,
-      kvBudgetTokensSource: null,
-      maxModelLen: null,
-      maxModelLenSource: null,
-      engineFactsSource: "MIXED",
-      engineLoadSource: null,
-      engineLoadSignals: [],
-      engineCountContext: null,
+      engineSlots: 8,
+      observedKvBudgetTokens: 120_000,
+      maxModelLen: 2 ** 31 - 1,
+      countContext: "VLLM_TOKENIZE",
+      loadSignals: ["running", "waiting"],
     });
-    expect(
-      storedEngineFacts({
-        engine: { value: "sglang", source: "probe" },
-        kvTokens: { value: 5_000_000_000, source: "probe" },
-      }),
-    ).toMatchObject({ kvBudgetTokens: 2 ** 31 - 1, engineFactsSource: "PROBE" });
-    expect(storedEngineFacts({ slots: { value: 2, source: "config" } })).toMatchObject({
-      engineKind: null,
-      engineSlots: 2,
-      engineSlotsSource: "CONFIG",
-      engineFactsSource: "CONFIG",
-    });
-    expect(storedEngineFacts({ kvTokens: { value: 262_144, source: "custom" } })).toMatchObject({
-      kvBudgetTokens: 262_144,
-      kvBudgetTokensSource: "CUSTOM",
-      engineFactsSource: "CUSTOM",
-    });
-    expect(
-      storedEngineFacts({
-        engine: { value: "generic", source: "config" },
-        kvTokens: { value: 262_144, source: "config" },
-        maxModelLen: { value: 8_192, source: "probe" },
-      }),
-    ).toMatchObject({
-      engineKind: "GENERIC",
-      kvBudgetTokens: 262_144,
-      kvBudgetTokensSource: "CONFIG",
-      maxModelLen: 8_192,
-      maxModelLenSource: "PROBE",
-      engineFactsSource: "MIXED",
-    });
-    // Aliases and per-slot context are not capacity columns.
-    expect(
-      storedEngineFacts({ servedModelAliases: { value: ["a", "b"], source: "probe" } }),
-    ).toBeNull();
-    expect(storedEngineFacts(undefined)).toBeNull();
-    expect(
-      storedEngineFacts({
-        countContext: { value: "llama_input_tokens", source: "probe" },
-      }),
-    ).toMatchObject({
-      engineCountContext: "LLAMA_INPUT_TOKENS",
-      engineFactsSource: "PROBE",
-    });
-    expect(
-      storedEngineFacts({
-        engine: { value: "ollama", source: "probe" },
-        countContext: { value: "unsupported", source: "probe" },
-      }),
-    ).toMatchObject({ engineKind: "OLLAMA", engineCountContext: "UNSUPPORTED" });
+  });
+
+  it("stores nothing when no instance column is reported", () => {
+    expect(storedInstanceFacts(undefined)).toBeNull();
+    expect(storedInstanceFacts({ engine: { value: "vllm", source: "probe" } })).toBeNull();
+    expect(storedInstanceFacts({ slots: { value: 0, source: "probe" } })).toBeNull();
   });
 
   it("gates native count on a probed tokenize method", () => {
-    expect(engineCountContextSupportsNative("LLAMA_INPUT_TOKENS")).toBe(true);
     expect(engineCountContextSupportsNative("VLLM_TOKENIZE")).toBe(true);
     expect(engineCountContextSupportsNative("UNSUPPORTED")).toBe(false);
     expect(engineCountContextSupportsNative(null)).toBe(false);
-    expect(engineCountContextSupportsNative(undefined)).toBe(false);
   });
 
   it("compares stored facts field by field", () => {
-    const facts = storedEngineFacts({ slots: { value: 2, source: "probe" } });
-    const other = storedEngineFacts({ slots: { value: 3, source: "probe" } });
-    if (!facts || !other) throw new Error("facts");
-    expect(sameStoredEngineFacts(facts, { ...facts })).toBe(true);
-    expect(sameStoredEngineFacts(facts, other)).toBe(false);
+    const facts = {
+      engineSlots: 4,
+      observedKvBudgetTokens: null,
+      maxModelLen: 4096,
+      countContext: null,
+      loadSignals: ["running" as const],
+    };
+    expect(sameStoredInstanceFacts(facts, { ...facts })).toBe(true);
+    expect(sameStoredInstanceFacts(facts, { ...facts, loadSignals: [] })).toBe(false);
+    expect(sameStoredInstanceFacts(facts, { ...facts, engineSlots: 5 })).toBe(false);
   });
 
   it("uses the Ollama and LM Studio defaults only for those engines", () => {
     expect(engineDefaultConcurrency("ollama")).toBe(1);
-    expect(engineDefaultConcurrency("lm-studio")).toBe(4);
+    expect(engineDefaultConcurrency("lm_studio")).toBe(4);
     expect(engineDefaultConcurrency("vllm")).toBeNull();
-    expect(engineDefaultConcurrency(undefined)).toBeNull();
+    expect(engineDefaultConcurrency(null)).toBeNull();
   });
 
-  it("admits a refreshed limit only when every policy on the capacity still fits", () => {
-    expect(isHardLimitRefreshAdmissible(4, [])).toBe(true);
-    expect(
-      isHardLimitRefreshAdmissible(4, [
-        { kind: "direct", concurrencyLimit: 4, reservedSlots: 1 },
-        {
-          kind: "member",
-          mode: "INHERIT",
-          limit: null,
-          reserved: null,
-          poolLimit: 3,
-          poolReserved: 2,
-        },
-      ]),
-    ).toBe(true);
-    expect(
-      isHardLimitRefreshAdmissible(4, [{ kind: "direct", concurrencyLimit: 5, reservedSlots: 0 }]),
-    ).toBe(false);
-    expect(
-      isHardLimitRefreshAdmissible(4, [
-        {
-          kind: "member",
-          mode: "LIMITED",
-          limit: 6,
-          reserved: 0,
-          poolLimit: null,
-          poolReserved: 0,
-        },
-      ]),
-    ).toBe(false);
-    expect(
-      isHardLimitRefreshAdmissible(2, [
-        {
-          kind: "member",
-          mode: "INHERIT",
-          limit: null,
-          reserved: null,
-          poolLimit: null,
-          poolReserved: 3,
-        },
-      ]),
-    ).toBe(false);
-    expect(isHardLimitRefreshAdmissible(0, [])).toBe(false);
-    expect(isHardLimitRefreshAdmissible(10_001, [])).toBe(false);
+  it("derives a display preset from the engine", () => {
+    expect(enginePreset("llama_cpp").preset).toBe("llama.cpp");
+    expect(enginePreset("sglang").fullWhen).toBe("user_cap_or_engine_load");
+    expect(enginePreset("lm_studio").fullWhen).toBe("active_at_user_parallel");
+    expect(enginePreset("other").preset).toBe("generic");
   });
 
-  it("derives a display preset from the engine kind", () => {
-    expect(enginePreset("LLAMA_CPP")).toEqual({
-      preset: "llama.cpp",
-      fullWhen: "active_at_slots",
-      protectionUnit: "slots",
-    });
-    expect(enginePreset("VLLM").protectionUnit).toBe("tokens");
-    expect(enginePreset("SGLANG").preset).toBe("vllm-sglang");
-    expect(enginePreset("OLLAMA").preset).toBe("ollama-lm-studio");
-    expect(enginePreset(null).preset).toBe("generic");
+  it("switches to token mode when the KV budget is known, except for llama.cpp", () => {
+    expect(enginePreset("other", { kvBudgetTokens: 1000 }).protectionUnit).toBe("tokens");
+    expect(enginePreset("llama_cpp", { kvBudgetTokens: 1000 }).protectionUnit).toBe("slots");
   });
 
-  it("switches GENERIC and Ollama to token mode when K is known", () => {
-    expect(enginePreset("GENERIC", { kvBudgetTokens: 262_144 }).protectionUnit).toBe("tokens");
-    expect(enginePreset("OLLAMA", { kvBudgetTokens: 32_768 }).protectionUnit).toBe("tokens");
-    expect(enginePreset("GENERIC").protectionUnit).toBe("slots");
-    expect(enginePreset("LLAMA_CPP", { kvBudgetTokens: 262_144 }).protectionUnit).toBe("slots");
-  });
-
-  it("stores custom loadAdapter as CUSTOM load source", () => {
-    expect(
-      storedEngineFacts({
-        loadAdapter: {
-          value: { input: "route", signals: ["running", "kvUsage"] },
-          source: "config",
-        },
-      }),
-    ).toMatchObject({
-      engineLoadSource: "CUSTOM",
-      engineLoadSignals: ["running", "kvUsage"],
-      engineFactsSource: "CONFIG",
-    });
-  });
-
-  it("shows engine load on a generic preset when an adapter supplies FULL", () => {
-    expect(enginePreset("GENERIC", { loadSource: "CUSTOM" }).fullWhen).toBe(
-      "user_cap_or_engine_load",
-    );
+  it("gates on engine load when the runtime has a metrics reader", () => {
+    expect(enginePreset("other", { hasReader: true }).fullWhen).toBe("user_cap_or_engine_load");
   });
 });

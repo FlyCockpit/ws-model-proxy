@@ -10,14 +10,14 @@
 
 pub mod completions;
 pub mod config;
-pub mod connect;
-pub mod daemon;
-pub mod endpoints;
+pub mod hardware;
 pub mod login;
 pub mod logout;
-pub mod metrics;
 pub mod recover;
-pub mod reload;
+pub mod run;
+pub mod runtime;
+pub mod secret;
 pub mod service;
+pub mod status;
 pub mod terminal;
-pub mod token;
+pub mod trust;

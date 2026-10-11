@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  CLI_COMMAND_SWEEP_INTERVAL_MS,
+  NODE_COMMAND_SWEEP_INTERVAL_MS,
   RELAY_STALE_SESSION_SWEEP_INTERVAL_MS,
   startRelayMaintenance,
   TERMINAL_SESSION_RECHECK_INTERVAL_MS,
@@ -23,7 +23,7 @@ describe("relay maintenance", () => {
         checkStaleSessions: vi.fn(async () => undefined),
         sweepExpiredPendingTerminals: vi.fn(),
       },
-      sweepExpiredTokenCommands: vi.fn(),
+      sweepExpiredNodeCommands: vi.fn(),
       terminalHub: { recheckSessions: vi.fn(async () => undefined) },
     };
   }
@@ -36,10 +36,10 @@ describe("relay maintenance", () => {
     expect(deps.relaySessions.checkStaleSessions).toHaveBeenCalledTimes(1);
     expect(deps.relaySessions.sweepExpiredPendingTerminals).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(
-      Math.max(CLI_COMMAND_SWEEP_INTERVAL_MS, TERMINAL_SESSION_RECHECK_INTERVAL_MS) -
+      Math.max(NODE_COMMAND_SWEEP_INTERVAL_MS, TERMINAL_SESSION_RECHECK_INTERVAL_MS) -
         RELAY_STALE_SESSION_SWEEP_INTERVAL_MS,
     );
-    expect(deps.sweepExpiredTokenCommands).toHaveBeenCalledTimes(1);
+    expect(deps.sweepExpiredNodeCommands).toHaveBeenCalledTimes(1);
     expect(deps.terminalHub.recheckSessions).toHaveBeenCalledTimes(1);
     await stop();
   });
@@ -55,9 +55,9 @@ describe("relay maintenance", () => {
   it("stop clears every timer", async () => {
     const deps = fakes();
     await startRelayMaintenance(deps)();
-    await vi.advanceTimersByTimeAsync(10 * CLI_COMMAND_SWEEP_INTERVAL_MS);
+    await vi.advanceTimersByTimeAsync(10 * NODE_COMMAND_SWEEP_INTERVAL_MS);
     expect(deps.relaySessions.checkStaleSessions).not.toHaveBeenCalled();
-    expect(deps.sweepExpiredTokenCommands).not.toHaveBeenCalled();
+    expect(deps.sweepExpiredNodeCommands).not.toHaveBeenCalled();
     expect(deps.terminalHub.recheckSessions).not.toHaveBeenCalled();
   });
 
@@ -65,7 +65,7 @@ describe("relay maintenance", () => {
     const order: string[] = [];
     const deps = {
       ...fakes(),
-      stopCliAgentAudit: vi.fn(async () => {
+      stopNodeAudit: vi.fn(async () => {
         order.push("audit");
       }),
     };
@@ -83,15 +83,15 @@ describe("relay maintenance", () => {
     await vi.advanceTimersByTimeAsync(TERMINAL_SESSION_RECHECK_INTERVAL_MS);
     const stopping = stop();
     await Promise.resolve();
-    expect(deps.stopCliAgentAudit).not.toHaveBeenCalled();
+    expect(deps.stopNodeAudit).not.toHaveBeenCalled();
     release();
     await stopping;
     expect(order).toEqual(["sweep", "audit"]);
 
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    deps.stopCliAgentAudit.mockRejectedValue(new TypeError("secret detail"));
+    deps.stopNodeAudit.mockRejectedValue(new TypeError("secret detail"));
     await startRelayMaintenance(deps)();
-    expect(errors).toHaveBeenCalledWith("[server] agent audit flush failed", "TypeError");
+    expect(errors).toHaveBeenCalledWith("[server] node audit flush failed", "TypeError");
     expect(JSON.stringify(errors.mock.calls)).not.toContain("secret detail");
   });
 
@@ -102,16 +102,16 @@ describe("relay maintenance", () => {
     deps.relaySessions.sweepExpiredPendingTerminals.mockImplementation(() => {
       throw new RangeError("secret detail");
     });
-    deps.sweepExpiredTokenCommands.mockImplementation(() => {
+    deps.sweepExpiredNodeCommands.mockImplementation(() => {
       throw new Error("secret detail");
     });
     const stop = startRelayMaintenance(deps);
-    await vi.advanceTimersByTimeAsync(2 * CLI_COMMAND_SWEEP_INTERVAL_MS);
+    await vi.advanceTimersByTimeAsync(2 * NODE_COMMAND_SWEEP_INTERVAL_MS);
     expect(deps.relaySessions.checkStaleSessions.mock.calls.length).toBeGreaterThan(1);
     expect(deps.terminalHub.recheckSessions).toHaveBeenCalledTimes(2);
     expect(errors).toHaveBeenCalledWith("[server] stale relay session sweep failed", "TypeError");
     expect(errors).toHaveBeenCalledWith("[server] pending terminal sweep failed", "RangeError");
-    expect(errors).toHaveBeenCalledWith("[server] CLI command sweep failed", "Error");
+    expect(errors).toHaveBeenCalledWith("[server] node command sweep failed", "Error");
     expect(JSON.stringify(errors.mock.calls)).not.toContain("secret detail");
     await stop();
   });
@@ -134,7 +134,7 @@ describe("relay maintenance", () => {
       stopped = true;
     });
     // Timers are cleared at once: no further sweep starts.
-    await vi.advanceTimersByTimeAsync(10 * CLI_COMMAND_SWEEP_INTERVAL_MS);
+    await vi.advanceTimersByTimeAsync(10 * NODE_COMMAND_SWEEP_INTERVAL_MS);
     expect(deps.terminalHub.recheckSessions).toHaveBeenCalledTimes(1);
     expect(stopped).toBe(false);
     // Settling the stale sweep alone leaves the pending recheck holding stop.

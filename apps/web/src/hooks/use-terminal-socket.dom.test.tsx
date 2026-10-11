@@ -211,13 +211,13 @@ describe("useTerminalSocket", () => {
     }
     expect(send({ type: "list" })).toBe("queued");
     expect(send({ type: "close", terminalId: "t-1", requestId: "close_1" })).toBe("queued");
-    expect(send({ type: "decline", terminalId: "t-2", requestId: "decline_1" })).toBe("queued");
+    expect(send({ type: "detach", terminalId: "t-2" })).toBe("queued");
     vi.advanceTimersByTime(TERMINAL_BROWSER_JSON_WINDOW_MS);
     expect(
       texts()
         .slice(TERMINAL_BROWSER_JSON_BUDGET)
         .map((entry) => entry.type),
-    ).toEqual(["close", "decline", "list"]);
+    ).toEqual(["close", "detach", "list"]);
     socket.close();
     expect(send({ type: "close", terminalId: "t-1", requestId: "close_2" })).toBe("closed");
     vi.useRealTimers();

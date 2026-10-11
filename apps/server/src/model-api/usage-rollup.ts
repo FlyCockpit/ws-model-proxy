@@ -20,21 +20,32 @@ import {
   latencyBucketIndex,
 } from "@ws-model-proxy/config/usage-metrics";
 import { Prisma } from "@ws-model-proxy/db";
+import {
+  USAGE_ROLLUP_COUNTERS,
+  USAGE_ROLLUP_DIMENSIONS,
+  USAGE_ROLLUP_HISTOGRAMS,
+} from "@ws-model-proxy/db/usage-rollup-requester-drain";
 
 export const relayRollupSelect = {
   id: true,
   userId: true,
-  fallbackRoute: true,
+  route: true,
+  external: true,
+  rejection: true,
   status: true,
   source: true,
   startedAt: true,
   completedAt: true,
   durationMs: true,
   firstClientByteAt: true,
-  requestedModelPoolId: true,
-  selectedPoolMemberId: true,
-  requestedExecutionTargetId: true,
-  selectedExecutionTargetId: true,
+  queueWaitMs: true,
+  poolId: true,
+  runtimeModelId: true,
+  selectedTargetId: true,
+  selectedInstanceId: true,
+  selectedVersionId: true,
+  selectedNodeId: true,
+  selectedProviderModelId: true,
   attemptCount: true,
   promptTokens: true,
   completionTokens: true,
@@ -44,6 +55,7 @@ export const relayRollupSelect = {
   affinityOutcome: true,
   operation: true,
   audioInputMs: true,
+  contextTokenCount: true,
   // Durable resource owner (database-derived at insert; survives pool deletion).
   resourceOwnerUserId: true,
 } satisfies Prisma.RelayRequestSelect;
@@ -75,37 +87,43 @@ export type UsageRollupKey = {
   bucketStart: Date;
   ownerUserId: string;
   requesterUserId: string;
+  /** '' sentinels for what a request did not touch (the rollup tables have a real PK). */
   poolId: string;
-  poolMemberId: string;
-  executionTargetId: string;
+  runtimeId: string;
+  versionId: string;
+  nodeId: string;
+  instanceId: string;
+  runtimeModelId: string;
+  providerModelId: string;
   source: RelayRequestSourceValue;
 };
 
-export type UsageRollupCounters = {
-  requests: number;
-  successes: number;
-  errors: number;
-  cancels: number;
-  retries: number;
-  usageKnownRequests: number;
-  inputTokens: bigint;
-  outputTokens: bigint;
-  cacheReadTokens: bigint;
-  cacheWriteTokens: bigint;
-  cacheKnownRequests: number;
-  cacheKnownInputTokens: bigint;
-  continuationRequests: number;
-  continuationInputTokens: bigint;
-  continuationCacheReadTokens: bigint;
-  durationCount: number;
-  durationSumMs: bigint;
-  latencyHistogram: number[];
-  ttftCount: number;
-  ttftSumMs: bigint;
-  ttftHistogram: number[];
-  /** Live transcription audio forwarded, in milliseconds (zero for other operations). */
-  audioInputMs: bigint;
-};
+/** Counters stored as BIGINT (token and millisecond sums); every other counter is INT. */
+export const BIG_ROLLUP_COUNTERS = [
+  "inputTokens",
+  "outputTokens",
+  "cacheReadTokens",
+  "cacheWriteTokens",
+  "cacheKnownInputTokens",
+  "continuationInputTokens",
+  "continuationCacheReadTokens",
+  "durationSumMs",
+  "ttftSumMs",
+  "queueWaitSumMs",
+  "generationTokens",
+  "generationMs",
+  "prefillTokens",
+  "prefillMs",
+  "audioInputMs",
+] as const satisfies readonly (typeof USAGE_ROLLUP_COUNTERS)[number][];
+type BigCounter = (typeof BIG_ROLLUP_COUNTERS)[number];
+type Counter = (typeof USAGE_ROLLUP_COUNTERS)[number];
+type Histogram = (typeof USAGE_ROLLUP_HISTOGRAMS)[number];
+
+/** Counters of one rollup row (spec B5 keys: instance, served model, prefill/decode, queue wait). */
+export type UsageRollupCounters = { [K in Exclude<Counter, BigCounter>]: number } & {
+  [K in BigCounter]: bigint;
+} & { [K in Histogram]: number[] };
 
 /** The operation of a live transcription session row (shared with the admin summary). */
 export { REALTIME_TRANSCRIPTION_OPERATION };
@@ -140,9 +158,8 @@ export function rollupIncrementForRequest(
   if (row.status !== "SUCCEEDED" && row.status !== "FAILED" && row.status !== "CANCELED")
     return null;
   const completedAt = row.completedAt ?? now;
-  // Only measured durations feed latency: crash repair and the abandoned
-  // reaper leave durationMs null because the real end time is unknown. A
-  // live transcription session's wall time (up to 30 min) is not request
+  // Only measured durations feed latency: crash repair and the abandoned reaper leave
+  // durationMs null. A live transcription session's wall time (up to 30 min) is not request
   // latency: it is kept on the row, and its audio is counted instead.
   const realtime = row.operation === REALTIME_TRANSCRIPTION_OPERATION;
   const durationMs = realtime ? null : row.durationMs;
@@ -154,24 +171,53 @@ export function rollupIncrementForRequest(
   if (durationMs !== null) latencyHistogram[latencyBucketIndex(durationMs)]! += 1;
   const ttftHistogram = emptyLatencyHistogram();
   if (ttftMs !== null) ttftHistogram[latencyBucketIndex(ttftMs)]! += 1;
+  const queueWaitHistogram = emptyLatencyHistogram();
+  if (row.queueWaitMs !== null) queueWaitHistogram[latencyBucketIndex(row.queueWaitMs)]! += 1;
   const cacheKnown = row.usageKnown && row.cacheReadTokens !== null;
   const continuation = cacheKnown && isMatchedAffinityOutcome(row.affinityOutcome);
+  const ownKey = row.route === "own_key";
+  const outputTokens = row.usageKnown ? (row.completionTokens ?? 0) : 0;
+  // Decode throughput: output tokens over first-byte → complete; prefill: context tokens
+  // over (TTFT − queue wait). Only when every term is known.
+  const generationMs =
+    !realtime && row.firstClientByteAt !== null && row.completedAt !== null
+      ? Math.max(0, row.completedAt.getTime() - row.firstClientByteAt.getTime())
+      : null;
+  const prefillMs =
+    ttftMs !== null && row.queueWaitMs !== null ? Math.max(0, ttftMs - row.queueWaitMs) : null;
+  const rejected = row.rejection ?? "";
   return {
     bucketStart: truncateToMinute(completedAt),
     ownerUserId: resourceOwnerUserId(row),
     requesterUserId: row.userId,
-    poolId: row.fallbackRoute === "own-key" ? "" : (row.requestedModelPoolId ?? ""),
-    poolMemberId: row.fallbackRoute === "own-key" ? "" : (row.selectedPoolMemberId ?? ""),
-    executionTargetId: row.selectedExecutionTargetId ?? row.requestedExecutionTargetId ?? "",
+    poolId: ownKey ? "" : (row.poolId ?? ""),
+    // B5 fills the runtime from the instance; the version carries it until then.
+    runtimeId: "",
+    versionId: row.selectedVersionId ?? "",
+    nodeId: row.selectedNodeId ?? "",
+    instanceId: row.selectedInstanceId ?? "",
+    runtimeModelId: row.runtimeModelId ?? "",
+    providerModelId: row.selectedProviderModelId ?? "",
     source: row.source,
     requests: 1,
     successes: row.status === "SUCCEEDED" ? 1 : 0,
     errors: row.status === "FAILED" ? 1 : 0,
     cancels: row.status === "CANCELED" ? 1 : 0,
     retries: Math.max(0, row.attemptCount - 1),
+    cloudRequests: row.external ? 1 : 0,
+    rejectedCapacity: rejected.startsWith("capacity") ? 1 : 0,
+    rejectedContext: rejected.startsWith("context") ? 1 : 0,
+    rejectedSpend: rejected.startsWith("spend") ? 1 : 0,
+    rejectedOther:
+      rejected !== "" &&
+      !rejected.startsWith("capacity") &&
+      !rejected.startsWith("context") &&
+      !rejected.startsWith("spend")
+        ? 1
+        : 0,
     usageKnownRequests: row.usageKnown ? 1 : 0,
     inputTokens: BigInt(row.usageKnown ? (row.promptTokens ?? 0) : 0),
-    outputTokens: BigInt(row.usageKnown ? (row.completionTokens ?? 0) : 0),
+    outputTokens: BigInt(outputTokens),
     cacheReadTokens: BigInt(cacheKnown ? (row.cacheReadTokens ?? 0) : 0),
     cacheWriteTokens: BigInt(row.usageKnown ? (row.cacheWriteTokens ?? 0) : 0),
     cacheKnownRequests: cacheKnown ? 1 : 0,
@@ -185,6 +231,13 @@ export function rollupIncrementForRequest(
     ttftCount: ttftMs === null ? 0 : 1,
     ttftSumMs: BigInt(ttftMs ?? 0),
     ttftHistogram,
+    queueWaitCount: row.queueWaitMs === null ? 0 : 1,
+    queueWaitSumMs: BigInt(row.queueWaitMs ?? 0),
+    queueWaitHistogram,
+    generationTokens: BigInt(generationMs === null ? 0 : outputTokens),
+    generationMs: BigInt(generationMs === null || outputTokens === 0 ? 0 : generationMs),
+    prefillTokens: BigInt(prefillMs === null ? 0 : (row.contextTokenCount ?? 0)),
+    prefillMs: BigInt(prefillMs === null || !row.contextTokenCount ? 0 : prefillMs),
     audioInputMs: BigInt(row.audioInputMs ?? 0),
   };
 }
@@ -195,7 +248,7 @@ export function rollupIncrementForRequest(
  * schema-hardening.sql derives it for every row), else the requester.
  */
 export function resourceOwnerUserId(row: RelayRollupRow): string {
-  if (row.fallbackRoute === "own-key") return row.userId;
+  if (row.route === "own_key") return row.userId;
   return row.resourceOwnerUserId ?? row.userId;
 }
 
@@ -204,9 +257,7 @@ export function rollupKeyString(key: UsageRollupKey): string {
     key.bucketStart.toISOString(),
     key.ownerUserId,
     key.requesterUserId,
-    key.poolId,
-    key.poolMemberId,
-    key.executionTargetId,
+    ...USAGE_ROLLUP_DIMENSIONS.map((dimension) => key[dimension]),
     key.source,
   ].join("\u0000");
 }
@@ -215,28 +266,16 @@ export function addRollupCounters<T extends UsageRollupCounters>(
   target: T,
   add: UsageRollupCounters,
 ): T {
-  target.requests += add.requests;
-  target.successes += add.successes;
-  target.errors += add.errors;
-  target.cancels += add.cancels;
-  target.retries += add.retries;
-  target.usageKnownRequests += add.usageKnownRequests;
-  target.inputTokens += add.inputTokens;
-  target.outputTokens += add.outputTokens;
-  target.cacheReadTokens += add.cacheReadTokens;
-  target.cacheWriteTokens += add.cacheWriteTokens;
-  target.cacheKnownRequests += add.cacheKnownRequests;
-  target.cacheKnownInputTokens += add.cacheKnownInputTokens;
-  target.continuationRequests += add.continuationRequests;
-  target.continuationInputTokens += add.continuationInputTokens;
-  target.continuationCacheReadTokens += add.continuationCacheReadTokens;
-  target.durationCount += add.durationCount;
-  target.durationSumMs += add.durationSumMs;
-  target.latencyHistogram = addHistograms(target.latencyHistogram, add.latencyHistogram);
-  target.ttftCount += add.ttftCount;
-  target.ttftSumMs += add.ttftSumMs;
-  target.ttftHistogram = addHistograms(target.ttftHistogram, add.ttftHistogram);
-  target.audioInputMs += add.audioInputMs;
+  for (const counter of USAGE_ROLLUP_COUNTERS) {
+    const current = target[counter];
+    const delta = add[counter];
+    if (typeof current === "bigint" && typeof delta === "bigint")
+      Object.assign(target, { [counter]: current + delta });
+    else if (typeof current === "number" && typeof delta === "number")
+      Object.assign(target, { [counter]: current + delta });
+  }
+  for (const histogram of USAGE_ROLLUP_HISTOGRAMS)
+    target[histogram] = addHistograms(target[histogram], add[histogram]);
   return target;
 }
 
@@ -258,6 +297,7 @@ export function mergeRollupIncrements(
         ...increment,
         latencyHistogram: [...increment.latencyHistogram],
         ttftHistogram: [...increment.ttftHistogram],
+        queueWaitHistogram: [...increment.queueWaitHistogram],
       });
   }
   return [...merged.values()];
@@ -278,29 +318,6 @@ function additive(table: UsageRollupTable, column: string): Prisma.Sql {
   return Prisma.raw(`"${column}" = ${table}."${column}" + EXCLUDED."${column}"`);
 }
 
-const ADDITIVE_COLUMNS = [
-  "requests",
-  "successes",
-  "errors",
-  "cancels",
-  "retries",
-  "usageKnownRequests",
-  "inputTokens",
-  "outputTokens",
-  "cacheReadTokens",
-  "cacheWriteTokens",
-  "cacheKnownRequests",
-  "cacheKnownInputTokens",
-  "continuationRequests",
-  "continuationInputTokens",
-  "continuationCacheReadTokens",
-  "durationCount",
-  "durationSumMs",
-  "ttftCount",
-  "ttftSumMs",
-  "audioInputMs",
-] as const;
-
 /** One idempotent-per-call additive upsert for a merged increment. */
 export function rollupUpsertSql(
   table: UsageRollupTable,
@@ -309,44 +326,53 @@ export function rollupUpsertSql(
   const tableSql = Prisma.raw(table);
   const updates = Prisma.join(
     [
-      ...ADDITIVE_COLUMNS.map((column) => additive(table, column)),
-      Prisma.sql`"latencyHistogram" = ${histogramMerge(table, "latencyHistogram")}`,
-      Prisma.sql`"ttftHistogram" = ${histogramMerge(table, "ttftHistogram")}`,
+      ...USAGE_ROLLUP_COUNTERS.map((column) => additive(table, column)),
+      ...USAGE_ROLLUP_HISTOGRAMS.map(
+        (column) => Prisma.sql`${Prisma.raw(`"${column}"`)} = ${histogramMerge(table, column)}`,
+      ),
       Prisma.raw(`"updatedAt" = now()`),
     ],
     ", ",
   );
+  const columns = Prisma.raw(
+    [
+      "bucketStart",
+      "ownerUserId",
+      "requesterUserId",
+      ...USAGE_ROLLUP_DIMENSIONS,
+      "source",
+      "updatedAt",
+      ...USAGE_ROLLUP_COUNTERS,
+      ...USAGE_ROLLUP_HISTOGRAMS,
+    ]
+      .map((column) => `"${column}"`)
+      .join(", "),
+  );
+  const values = Prisma.join(
+    [
+      Prisma.sql`${increment.bucketStart}`,
+      Prisma.sql`${increment.ownerUserId}`,
+      Prisma.sql`${increment.requesterUserId}`,
+      ...USAGE_ROLLUP_DIMENSIONS.map((dimension) => Prisma.sql`${increment[dimension]}`),
+      Prisma.sql`${increment.source}::"RequestSource"`,
+      Prisma.sql`now()`,
+      ...USAGE_ROLLUP_COUNTERS.map((counter) => Prisma.sql`${increment[counter]}`),
+      ...USAGE_ROLLUP_HISTOGRAMS.map((histogram) => Prisma.sql`${increment[histogram]}::integer[]`),
+    ],
+    ", ",
+  );
+  const conflict = Prisma.raw(
+    ["bucketStart", "ownerUserId", "requesterUserId", ...USAGE_ROLLUP_DIMENSIONS, "source"]
+      .map((column) => `"${column}"`)
+      .join(", "),
+  );
   return Prisma.sql`
-    INSERT INTO ${tableSql} (
-      "bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
-      "executionTargetId", "source", "updatedAt",
-      "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests",
-      "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens",
-      "cacheKnownRequests", "cacheKnownInputTokens",
-      "continuationRequests", "continuationInputTokens", "continuationCacheReadTokens",
-      "durationCount", "durationSumMs",
-      "latencyHistogram", "ttftCount", "ttftSumMs", "ttftHistogram", "audioInputMs"
-    )
-    SELECT
-      ${increment.bucketStart}, ${increment.ownerUserId}, ${increment.requesterUserId},
-      ${increment.poolId}, ${increment.poolMemberId},
-      ${increment.executionTargetId}, ${increment.source}::"RelayRequestSource", now(),
-      ${increment.requests}, ${increment.successes}, ${increment.errors}, ${increment.cancels},
-      ${increment.retries}, ${increment.usageKnownRequests},
-      ${increment.inputTokens}, ${increment.outputTokens}, ${increment.cacheReadTokens},
-      ${increment.cacheWriteTokens}, ${increment.cacheKnownRequests},
-      ${increment.cacheKnownInputTokens},
-      ${increment.continuationRequests}, ${increment.continuationInputTokens},
-      ${increment.continuationCacheReadTokens},
-      ${increment.durationCount}, ${increment.durationSumMs},
-      ${increment.latencyHistogram}::integer[], ${increment.ttftCount}, ${increment.ttftSumMs},
-      ${increment.ttftHistogram}::integer[], ${increment.audioInputMs}
-    -- The owner key is a durable plain id (relay_request.resourceOwnerUserId):
-    -- a deleted owner's history is gone, so its late increment is skipped
-    -- instead of failing the finalizer on the foreign key.
+    INSERT INTO ${tableSql} (${columns})
+    SELECT ${values}
+    -- The owner key is a durable plain id (relay_request.resourceOwnerUserId): a deleted
+    -- owner's history is gone, so its late increment is skipped.
     WHERE EXISTS (SELECT 1 FROM "user" WHERE id = ${increment.ownerUserId})
-    ON CONFLICT ("bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
-      "executionTargetId", "source")
+    ON CONFLICT (${conflict})
     DO UPDATE SET ${updates}`;
 }
 

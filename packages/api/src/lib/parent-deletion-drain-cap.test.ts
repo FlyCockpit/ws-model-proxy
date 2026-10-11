@@ -24,6 +24,7 @@ function scriptedDb(returned: number): { db: Db; scans: number[] } {
   const ids = Array.from({ length: returned }, (_, index) => `req-${index}`);
   const tx = {
     $executeRaw: async () => 0,
+    $queryRawUnsafe: async () => [{ deleted: 0n }],
     $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
       const sql = strings.join("?");
       // The drain batch's owner check (a whole-user drain names its deletion

@@ -1,7 +1,4 @@
-import {
-  hmacDigestForForwarderPurpose,
-  verifyForwarderHmacDigest,
-} from "@ws-model-proxy/db/forwarder-security";
+import { hmacDigestForPurpose, verifyHmacDigest } from "@ws-model-proxy/db/node-security";
 
 /**
  * Short-lived signature TTL for signed GET URLs. This is DELIBERATELY separate
@@ -45,7 +42,7 @@ export function buildSignedMediaUrl({
   ttlMs?: number;
 }): SignedMediaUrl {
   const expUnixSeconds = Math.floor((now + ttlMs) / 1000);
-  const sig = hmacDigestForForwarderPurpose({
+  const sig = hmacDigestForPurpose({
     purpose: "mediaSignedUrl",
     value: signedValue(id, expUnixSeconds),
   });
@@ -84,7 +81,7 @@ export function verifyMediaSignature({
   }
   // Timing-safe compare BEFORE the expiry check so a mismatched signature and
   // an expired-but-valid signature are indistinguishable by early-return.
-  const valid = verifyForwarderHmacDigest({
+  const valid = verifyHmacDigest({
     purpose: "mediaSignedUrl",
     value: signedValue(id, expUnixSeconds),
     digest: sig,

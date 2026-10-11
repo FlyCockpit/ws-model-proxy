@@ -1,0 +1,605 @@
+// ───────────────────────────── Runtimes ─────────────────────────────
+
+enum RuntimeKind {
+  /// An address only (an inference server that is just there). Lives on one node.
+  ALWAYS_ON
+  /// Has commands; started on one or more nodes as instances.
+  STARTABLE
+}
+
+/// Where the definition was authored. NODE = `wsmp runtime add` on the node; SERVER = web/MCP.
+enum RuntimeOrigin {
+  NODE
+  SERVER
+}
+
+enum RuntimeApi {
+  OPENAI
+  ANTHROPIC
+}
+
+/// The one engine vocabulary (spec, wire, DB, UI). `auto` exists only as a CLI detection input.
+enum Engine {
+  VLLM
+  SGLANG
+  LLAMA_CPP
+  OLLAMA
+  LM_STUDIO
+  OTHER
+}
+
+/// What a served model does. New types (image/video/audio generation, decision models) are
+/// added here in 0.5.0 together with their pool routing; nothing else in the schema changes.
+enum ModelType {
+  LLM
+  EMBEDDINGS
+  TRANSCRIPTION
+}
+
+enum ModelCapability {
+  TEXT_GENERATION
+  VISION_INPUT
+  VIDEO_INPUT
+  EMBEDDING
+  AUDIO_INPUT
+  AUDIO_OUTPUT
+  RESPONSES_API
+}
+
+enum CountStrategy {
+  TOKENIZER
+  TEMPLATE_AWARE
+  ENGINE_REPORTED
+  CONSERVATIVE_ESTIMATE
+  CALIBRATED_ESTIMATE
+}
+
+enum EngineCountContext {
+  UNSUPPORTED
+  VLLM_TOKENIZE
+  TGI_CHAT_TOKENIZE
+  LLAMA_APPLY_TEMPLATE
+  LLAMA_INPUT_TOKENS
+  READER_COUNT
+}
+
+/// How live engine load may mark a runtime FULL (merges member engineLoadMode +
+/// customEngineLoadMode; now per runtime).
+enum EngineLoadGate {
+  /// Built-in signals (vLLM/SGLang KV, llama.cpp slots) gate admission; custom reader signals observe.
+  AUTO
+  /// Built-in and custom reader signals both gate admission.
+  ENFORCE
+  /// Load is recorded but never gates admission.
+  OBSERVE
+}
+
+model Runtime {
+  id                  String        @id @default(cuid(2))
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @default(now()) @updatedAt
+  userId              String
+  slug                String
+  name                String
+  kind                RuntimeKind
+  origin              RuntimeOrigin
+  /// ALWAYS_ON: the node it lives on (required). STARTABLE: null.
+  nodeId              String?
+  /// The latest version. Instances may still run older ones until restarted.
+  currentVersionId    String?       @unique
+  /// Set when this runtime was created from a definition another user shared.
+  forkedFromVersionId String?
+
+  User            User                    @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Node            Node?                   @relation(fields: [nodeId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  CurrentVersion  RuntimeVersion?         @relation("RuntimeCurrentVersion", fields: [currentVersionId], references: [id], onDelete: NoAction, onUpdate: Cascade)
+  Versions        RuntimeVersion[]        @relation("RuntimeVersions")
+  Models          RuntimeModel[]
+  Instances       RuntimeInstance[]
+  Shares          RuntimeShare[]
+  ProfileItems    ProfileItem[]
+  RequestProfiles RuntimeRequestProfile[]
+  Invites         ShareInvite[]
+
+  @@unique([userId, slug])
+  @@unique([id, userId])
+  @@index([nodeId])
+  @@map("runtime")
+}
+
+/// Immutable. Every edit (definition or advanced field) makes a new version, so metrics can be
+/// compared per version. `spec` holds the launch/address definition (RuntimeSpec zod, §2.12);
+/// the columns hold what admission and routing read. Null limit columns mean "automatic":
+/// effective = override ?? instance-observed engine fact ?? built-in default.
+model RuntimeVersion {
+  id               String         @id @default(cuid(2))
+  createdAt        DateTime       @default(now())
+  runtimeId        String
+  version          Int
+  editor           Actor
+  editorUserId     String
+  agentTokenId     String?
+  /// The OAuth grant (`McpGrant.id`) when an OAuth client acted; at most one of the two is set.
+  mcpGrantId       String?
+  /// Server-only: sha256 of canonical { spec, limit columns, advanced }. Never sent to nodes.
+  contentHash      String
+  /// THE node-side identity: sha256(canonical(spec)). Used in runtime.define envelopes, the
+  /// node's held/frozen records and every runtime.job. Equal launchHash ⇒ running instances
+  /// adopt the new version live (§3.4) and nothing is re-pushed.
+  launchHash       String
+  /// One-line change note (agents should say what they are trying).
+  note             String?
+  spec             Json
+  /// Null exactly for a service (startable, no models, never proxied; owner decision round 3).
+  api              RuntimeApi?
+  engine           Engine?
+  modelType        ModelType?
+  // ── physical limits (per instance) ──
+  concurrencyLimit Int?
+  contextLimit     Int?
+  kvBudgetTokens   Int?
+  kvFullThreshold  Float?
+  // ── engine-load gate (read by admission) ──
+  engineLoadGate   EngineLoadGate @default(AUTO)
+  /// Other advanced settings, automatic unless set; validated by the runtime-defaults registry
+  /// and agent-editable: countStrategy, imageTokenAllowance, maxAttachmentBytes,
+  /// restartBudget (3), restartWindowMin (60), unhealthyRestartMs (120000),
+  /// unavailableStopMs (900000). Health thresholds live only in spec.launch.health.
+  advanced         Json           @default("{}")
+  /// Request compatibility (RequestCompat zod in @ws-model-proxy/api/lib/request-compat):
+  /// unknown-field policy, semantic-drop allowance, rewrite rules, header modes, proxy extras and
+  /// response shaping. Agent-editable; `{}` means automatic.
+  compat           Json           @default("{}")
+
+  Runtime         Runtime           @relation("RuntimeVersions", fields: [runtimeId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  CurrentOf       Runtime?          @relation("RuntimeCurrentVersion")
+  Instances       RuntimeInstance[] @relation("InstanceVersion")
+  LaunchInstances RuntimeInstance[] @relation("InstanceLaunchVersion")
+  ProfileItems    ProfileItem[]
+
+  @@unique([runtimeId, version])
+  @@index([contentHash])
+  @@map("runtime_version")
+}
+
+/// A model id a runtime serves. Declared in the spec (STARTABLE) or discovered from
+/// /v1/models (ALWAYS_ON). Pool members point here; routing expands to live instances.
+model RuntimeModel {
+  id                     String            @id @default(cuid(2))
+  createdAt              DateTime          @default(now())
+  updatedAt              DateTime          @default(now()) @updatedAt
+  userId                 String
+  runtimeId              String
+  upstreamModelId        String
+  type                   ModelType
+  /// Probe result from the node.
+  detectedCapabilities   ModelCapability[] @default([])
+  /// Owner override; used instead of detection when `capabilitiesOverridden`.
+  capabilities           ModelCapability[] @default([])
+  capabilitiesOverridden Boolean           @default(false)
+  embeddingContract      Json?
+  transcriptionProfile   Json?
+  lastSeenAt             DateTime?
+  /// No longer served by the current version / discovery; kept while pools reference it.
+  retired                Boolean           @default(false)
+
+  Runtime Runtime           @relation(fields: [runtimeId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Members PoolMember[]
+  Targets ExecutionTarget[]
+
+  @@unique([runtimeId, upstreamModelId])
+  @@unique([id, userId])
+  @@index([userId])
+  @@map("runtime_model")
+}
+
+/// Where a request profile's accepted fields came from.
+enum RequestProfileSource {
+  /// Only learned from the engine's 400s (no description).
+  LEARNED
+  /// The engine's own OpenAPI description (`GET /openapi.json` on loopback, through the node).
+  OPENAPI
+  /// A built-in engine-profile catalog entry.
+  CATALOG
+}
+
+/// What one runtime's engine accepts in a request, per launch (equal launch hashes run the same
+/// command line, so edits that keep it keep what was learned). `accepted` holds the fields per
+/// endpoint (AcceptedProfile), `learned` the fixes learned from the engine's 400s
+/// (LearnedProfile); neither ever holds request values. A changed engine fingerprint (another
+/// engine version answered) starts over.
+model RuntimeRequestProfile {
+  id                String               @id @default(cuid(2))
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @default(now()) @updatedAt
+  userId            String
+  runtimeId         String
+  launchHash        String
+  source            RequestProfileSource @default(LEARNED)
+  /// `info.title info.version` of the description plus its digest; null when none was read.
+  engineFingerprint String?
+  accepted          Json?
+  learned           Json                 @default("{}")
+  probedAt          DateTime?
+
+  Runtime Runtime @relation(fields: [runtimeId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([runtimeId, launchHash])
+  @@index([userId])
+  @@map("runtime_request_profile")
+}
+
+/// Read-only share of a runtime definition (all versions) with another user, who can fork it
+/// to run on their own node (and then contribute it). Human-only.
+model RuntimeShare {
+  id            String   @id @default(cuid(2))
+  createdAt     DateTime @default(now())
+  runtimeId     String
+  ownerUserId   String
+  granteeUserId String
+
+  Runtime Runtime       @relation(fields: [runtimeId, ownerUserId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Owner   User          @relation("RuntimeShareOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Grantee User          @relation("RuntimeShareGrantee", fields: [granteeUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Invites ShareInvite[]
+
+  @@unique([runtimeId, granteeUserId])
+  @@index([granteeUserId])
+  @@map("runtime_share")
+}
+
+enum DesiredState {
+  RUNNING
+  STOPPED
+}
+
+/// One derived-free lifecycle phase per instance (§3.4). No dead or terminal states.
+enum InstancePhase {
+  STARTING
+  READY
+  UNHEALTHY
+  /// Should serve but cannot be reached: its node is offline, or an always-on server is
+  /// unreachable. Never acted on without the node (the CLI never acts while disconnected).
+  UNAVAILABLE
+  STOPPING
+  STOPPED
+  /// Restart budget exhausted. Restartable by a person or an agent; claims are released.
+  FAILED
+}
+
+enum OperatorNeed {
+  /// An interactive step is AWAITING_OPERATOR or held.
+  STEP
+  /// An interactive start stopped; only a person's Restart brings it back.
+  RESTART
+  /// A stop cannot be proven (node offline past the grace period, or the node could not
+  /// confirm the stop): waits for the node or for a person to mark it stopped.
+  MARK_STOPPED
+}
+
+/// A running (or always-on) copy of a runtime. ALWAYS_ON runtimes have exactly one instance,
+/// created with the runtime, with `desiredState` null. This is the physical capacity identity
+/// used by admission (capacityId = instance id).
+model RuntimeInstance {
+  id                          String              @id @default(cuid(2))
+  createdAt                   DateTime            @default(now())
+  updatedAt                   DateTime            @default(now()) @updatedAt
+  userId                      String
+  runtimeId                   String
+  versionId                   String
+  /// The version the node actually launched (its launchHash is what every runtime.job names).
+  /// `versionId` is the admission view that live adoption moves; this one moves only on a
+  /// (re)start. At Relay only, starts use the node's frozen version of the runtime.
+  launchVersionId             String
+  /// The name the node routes by: the runtime slug (ALWAYS_ON) or `i-<id12>` (STARTABLE).
+  /// The node's head is rank 0 (STARTABLE) or Runtime.nodeId (ALWAYS_ON); the instance has no
+  /// node FK, so deleting a node can never cascade an instance away (§3.4).
+  handle                      String
+  operationId                 String?
+  startedBy                   Actor
+  desiredState                DesiredState?
+  phase                       InstancePhase
+  phaseChangedAt              DateTime            @default(now())
+  /// Stable machine code for the last phase change (startup_failed, readiness_timeout,
+  /// health_failed, node_offline, preempted, restart_budget_exhausted, …).
+  phaseReason                 String?
+  /// When the stop reconciler last took this STOPPING instance (null: never). A pass takes the
+  /// least recently taken first, so every stopping instance is reached however many there are.
+  lastStopReconcileAt         DateTime?
+  /// Windowed restart budget (non-interactive starts only).
+  restartWindowStartedAt      DateTime?
+  restartsInWindow            Int                 @default(0)
+  nextRestartAt               DateTime?
+  healthFailures              Int                 @default(0)
+  healthSuccesses             Int                 @default(0)
+  lastHealthAt                DateTime?
+  unhealthySince              DateTime?
+  /// Why the last health probe failed (`serving_unconfirmed`, `http_<code>`, `connect_refused`,
+  /// `timeout`, …), kept until the instance is READY again.
+  healthDetail                String?
+  /// Since when a rank's node has been offline (L2: after advanced.unavailableStopMs the online
+  /// ranks are gang-stopped and the offline rank waits for proof or Mark as stopped).
+  unavailableSince            DateTime?
+  needsOperator               OperatorNeed?
+  needsOperatorSince          DateTime?
+  operatorRestartRequestedAt  DateTime?
+  needsOperatorNotifiedAt     DateTime?
+  needsOperatorNotifyFailures Int                 @default(0)
+  /// Physical KV-cache incarnation; a restart changes it (cache-affinity generations key on it).
+  cacheGeneration             String              @default("")
+  // ── engine facts observed by the node (automatic limit sources) ──
+  engineSlots                 Int?
+  observedKvBudgetTokens      Int?
+  maxModelLen                 Int?
+  countContext                EngineCountContext?
+  loadSignals                 String[]            @default([])
+  factsAt                     DateTime?
+  loadCounterEpoch            Int?
+  /// The fabric a multi-node instance runs on (null for single-node). Cleared when it reaches
+  /// STOPPED or FAILED; while set the fabric cannot be deleted and its members on this
+  /// instance's nodes keep their IPs (`fabric_member_in_use`).
+  fabricId                    String?
+
+  Runtime       Runtime           @relation(fields: [runtimeId, userId], references: [id, userId], onDelete: NoAction, onUpdate: Cascade)
+  Version       RuntimeVersion    @relation("InstanceVersion", fields: [versionId], references: [id], onDelete: NoAction, onUpdate: Cascade)
+  LaunchVersion RuntimeVersion    @relation("InstanceLaunchVersion", fields: [launchVersionId], references: [id], onDelete: NoAction, onUpdate: Cascade)
+  Operation     RuntimeOperation? @relation(fields: [operationId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  Fabric        Fabric?           @relation(fields: [fabricId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Ranks         InstanceRank[]
+  Steps         InstanceStep[]
+  Targets       ExecutionTarget[]
+
+  @@unique([userId, handle])
+  @@unique([id, userId])
+  @@index([userId, desiredState, phase])
+  @@index([fabricId])
+  @@index([runtimeId])
+  @@index([versionId])
+  @@index([launchVersionId])
+  @@index([operationId])
+  @@map("runtime_instance")
+}
+
+enum ClaimState {
+  HELD
+  RELEASED
+  /// Released for bookkeeping without proof the service stopped (Mark as stopped, or an inactive
+  /// owner's cancelled interactive stop). Placement still counts its resources and port until
+  /// a status probe proves the service stopped (→ RELEASED) or a restart retakes it (→ HELD).
+  HELD_UNKNOWN
+}
+
+/// One rank of an instance on one node: its resource and port claim.
+model InstanceRank {
+  id                     String     @id @default(cuid(2))
+  instanceId             String
+  /// Null after the node was deleted (claim RELEASED by node_delete_release; the row keeps the
+  /// rank so the gang stop of the other ranks completes).
+  nodeId                 String?
+  /// Deterministic from (handle, rank): `wsmp-<handle>-r<rank>`; the held-unknown probe
+  /// needs no local record.
+  unitName               String
+  rank                   Int
+  resources              Json
+  port                   Int
+  distPort               Int?
+  portFixed              Boolean    @default(false)
+  claim                  ClaimState @default(HELD)
+  claimChangedAt         DateTime   @default(now())
+  /// New claims may queue behind this stopping instance, never dispatched before it releases.
+  blockedBy              String[]   @default([])
+  stoppedAt              DateTime?
+  markedStoppedAt        DateTime?
+  markedStoppedBy        String?
+  /// When the held-unknown probe pass last looked at this claim (null: never). The pass takes the
+  /// oldest first, so every claim marked stopped is reached however many there are.
+  lastStopCheckAt        DateTime?
+  /// A person released this claim without proof the service stopped ("I've checked, release
+  /// it"): when, who (user id) and the stop check's reason at that moment (`status_running`,
+  /// `port_in_use`, `node_offline`, ...). Cleared when a restart retakes the claim.
+  releasedUnprovenAt     DateTime?
+  releasedUnprovenBy     String?
+  releasedUnprovenReason String?
+
+  Instance        RuntimeInstance       @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Node            Node?                 @relation(fields: [nodeId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  ReleaseRequests ClaimReleaseRequest[]
+
+  @@unique([instanceId, rank])
+  @@index([nodeId, claim])
+  @@map("instance_rank")
+}
+
+enum ClaimReleaseRequestState {
+  PENDING
+  /// A person approved it: the claim was released without proof.
+  APPROVED
+  DECLINED
+  /// The requesting agent took it back.
+  WITHDRAWN
+  EXPIRED
+  /// The hold ended without this request: a stop proof released the claim, a restart retook
+  /// it, a person released it directly, or the agent's credential was revoked.
+  CLEARED
+}
+
+/// An agent's request that a person release a claim whose stop cannot be proven (a rank marked
+/// stopped, HELD_UNKNOWN), with what the agent found on the node. Only a person approves it
+/// (`runtimes.releaseRequests.approve`, the same release as `runtimes.instances.releaseUnproven`).
+/// The findings are the agent's words: untrusted data, shown as such.
+model ClaimReleaseRequest {
+  id            String                   @id @default(cuid(2))
+  createdAt     DateTime                 @default(now())
+  updatedAt     DateTime                 @default(now()) @updatedAt
+  userId        String
+  rankId        String
+  /// The rank id while PENDING, null once decided: at most one pending request per claim.
+  pendingRankId String?                  @unique
+  agentTokenId  String?
+  /// The agent's OAuth grant when an OAuth client asked; `agentTokenId` when an agent token did.
+  mcpGrantId    String?
+  /// ≤ 4,000 characters, cleaned like node command output (controls removed, credentials redacted).
+  findings      String
+  /// [{ command, output }] the agent ran, cleaned the same way; at most 8 entries.
+  evidence      Json?
+  state         ClaimReleaseRequestState @default(PENDING)
+  /// 24 h after creation.
+  expiresAt     DateTime
+  decidedAt     DateTime?
+  /// The person who approved or declined it.
+  decidedBy     String?
+
+  Rank InstanceRank @relation(fields: [rankId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([userId, state, expiresAt])
+  @@index([rankId])
+  @@index([state, expiresAt])
+  @@map("claim_release_request")
+}
+
+enum StepPhase {
+  PREPARE
+  START
+  AFTER_JOIN
+  READINESS
+  HEALTH
+  STOP
+  STATUS
+}
+
+enum StepState {
+  PENDING
+  RUNNING
+  AWAITING_OPERATOR
+  SUCCEEDED
+  FAILED
+  /// Never dispatched (attempts = 0) and no longer needed: proof the rank never ran this step.
+  CANCELLED
+}
+
+/// One job for one rank. Commands are never in the intent: the node renders them from the
+/// definition version it holds (the frozen-definition rule, §4.4).
+model InstanceStep {
+  id                 String    @id @default(cuid(2))
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @default(now()) @updatedAt
+  instanceId         String
+  nodeId             String
+  rank               Int
+  phase              StepPhase
+  /// Start generation * 100 + order; health probes >= 1_000_000.
+  sequence           Int
+  generation         Int
+  state              StepState @default(PENDING)
+  /// { launchVersionId, launchHash, rank, nnodes, port, distPort, headAddr, resources, placeholders }
+  intent             Json
+  intentHash         String
+  attempts           Int       @default(0)
+  ownerEpoch         String?
+  leaseExpiresAt     DateTime?
+  /// From the spec's per-command timeout (prepare up to 24 h for downloads; others ≤ 1 h).
+  deadline           DateTime?
+  notBefore          DateTime?
+  /// Node result code (instance_unknown, owned_launch_unconfirmed, launch_unconfirmed,
+  /// definition_missing, definition_frozen, pre-admission codes, …).
+  errorCode          String?
+  operatorTerminalId String?
+  operatorSince      DateTime?
+  operatorAcceptedAt DateTime?
+  operatorLastExit   Int?
+  operatorHold       String?
+
+  Instance RuntimeInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([instanceId, rank, phase, sequence])
+  @@index([state, notBefore, leaseExpiresAt])
+  @@index([nodeId, state])
+  @@map("instance_step")
+}
+
+enum OperationKind {
+  START
+  STOP
+  RESTART
+  PROFILE_APPLY
+  MARK_STOPPED
+}
+
+/// One start/stop/apply as confirmed (replaces DeploymentPlan + DeploymentRun). There is no
+/// stored pending plan: previews are recomputed and checked by fingerprint at apply.
+model RuntimeOperation {
+  id           String        @id @default(cuid(2))
+  createdAt    DateTime      @default(now())
+  userId       String
+  kind         OperationKind
+  actor        Actor
+  actorUserId  String
+  agentTokenId String?
+  /// The OAuth grant (`McpGrant.id`) when an OAuth client acted; at most one of the two is set.
+  mcpGrantId   String?
+  profileId    String?
+  /// The preview that was applied: starts, stops (incl. preemptions), kept, warnings.
+  summary      Json
+  fingerprint  String
+
+  User      User              @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Profile   Profile?          @relation(fields: [profileId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  Instances RuntimeInstance[]
+
+  @@index([userId, createdAt])
+  @@index([profileId])
+  @@map("runtime_operation")
+}
+
+enum TargetKind {
+  INSTANCE_MODEL
+  PROVIDER_MODEL
+}
+
+enum TargetHealth {
+  UNKNOWN
+  HEALTHY
+  DEGRADED
+  HALF_OPEN
+  UNHEALTHY
+}
+
+enum TargetFailureClass {
+  TRANSPORT
+  RELAY_TIMEOUT
+  WEBSOCKET_DISCONNECTED
+  STALE_SESSION
+  UPSTREAM_5XX
+}
+
+/// Internal routing identity (not user-facing): one model on one instance, or one provider
+/// model. Admission, cache affinity, stickiness and telemetry key on it. Health circuit columns
+/// are unfenced status columns (writer class H may update them one row per statement).
+model ExecutionTarget {
+  id                           String              @id @default(cuid(2))
+  createdAt                    DateTime            @default(now())
+  userId                       String
+  kind                         TargetKind
+  instanceId                   String?
+  runtimeModelId               String?
+  providerModelId              String?
+  health                       TargetHealth        @default(UNKNOWN)
+  lastFailureClass             TargetFailureClass?
+  consecutiveRetryableFailures Int                 @default(0)
+  lastFailureAt                DateTime?
+  nextRetryAt                  DateTime?
+  halfOpenTrialStartedAt       DateTime?
+  lastRoutedAt                 DateTime?
+
+  Instance      RuntimeInstance? @relation(fields: [instanceId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  RuntimeModel  RuntimeModel?    @relation(fields: [runtimeModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ProviderModel ProviderModel?   @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([instanceId, runtimeModelId])
+  @@unique([providerModelId, userId])
+  @@unique([id, userId])
+  @@index([userId, kind])
+  @@index([runtimeModelId])
+  @@index([health, nextRetryAt])
+  @@map("execution_target")
+}

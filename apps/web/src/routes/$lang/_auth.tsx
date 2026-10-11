@@ -41,10 +41,20 @@ export const Route = createFileRoute("/$lang/_auth")({
 
 function AuthLayout() {
   const { session } = Route.useRouteContext();
-  const appSettings = useQuery(orpc.settings.getAll.queryOptions());
+  const has2FA = session.user.twoFactorEnabled === true;
+  // With forced 2FA, every signed-in procedure refuses a person without a second factor
+  // (FORBIDDEN). One cheap read tells the layout whether to show the setup instead.
+  const probe = useQuery({
+    ...orpc.settings.get.queryOptions(),
+    enabled: !has2FA,
+    retry: false,
+    meta: { skipGlobalErrorToast: true },
+  });
   const { t } = useTranslation(["common", "dashboard"]);
 
-  if (appSettings.isPending) {
+  if (has2FA) return <Outlet />;
+
+  if (probe.isPending) {
     return (
       <div className="container mx-auto max-w-4xl px-4 py-8 space-y-4">
         <Skeleton className="h-8 w-48" />
@@ -57,26 +67,26 @@ function AuthLayout() {
     );
   }
 
-  if (appSettings.isError) {
+  if (probe.isError) {
+    if (isForbidden(probe.error)) return <TwoFactorSetupRequired />;
     return (
       <div className="container mx-auto max-w-4xl px-4">
         <InlineRetry
           className="py-12"
           message={t("dashboard:appSettingsLoadFailed")}
-          onRetry={() => appSettings.refetch()}
+          onRetry={() => probe.refetch()}
         />
       </div>
     );
   }
 
-  const force2FA = appSettings.data?.force2fa === "true";
-  const has2FA = session.user.twoFactorEnabled === true;
-
-  if (force2FA && !has2FA) {
-    return <TwoFactorSetupRequired />;
-  }
-
   return <Outlet />;
+}
+
+function isForbidden(error: unknown): boolean {
+  return (
+    typeof error === "object" && error !== null && "code" in error && error.code === "FORBIDDEN"
+  );
 }
 
 function TwoFactorSetupRequired() {

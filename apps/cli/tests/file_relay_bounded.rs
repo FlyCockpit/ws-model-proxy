@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
-use wsmp::config::McpCommandMode;
 use wsmp::file_ops::{EtagKey, FileOps, Policy, Step};
 use wsmp::file_relay::{FileFrame, FileRelay, FileRuntime, FileSink};
 
@@ -101,7 +100,7 @@ impl Loop {
 #[test]
 fn slow_file_ops_never_stall_the_relay_loop() {
     let dir = tempfile::tempdir().expect("dir");
-    let policy = Policy::from_environment(Vec::new(), false);
+    let policy = Policy::from_environment(vec![std::env::temp_dir()], false);
     let slow_paths: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let hook_counter = Arc::clone(&slow_paths);
     let ops = FileOps::new(policy, EtagKey::random()).with_step_hook(Arc::new(move |step| {
@@ -117,7 +116,7 @@ fn slow_file_ops_never_stall_the_relay_loop() {
     let sink: FileSink = Arc::new(move |id, frames| {
         let _ = tx.lock().expect("tx").send((id, frames));
     });
-    let mut relay = FileRelay::new(runtime, McpCommandMode::Unsupervised, false, sink);
+    let mut relay = FileRelay::new(runtime, true, sink);
 
     // A large file to hash for real: `stat` with `hash` reads all of it.
     let big = dir.path().join("big.bin");
@@ -133,10 +132,6 @@ fn slow_file_ops_never_stall_the_relay_loop() {
             "read",
             json!({ "path": path.display().to_string() }),
             None,
-            wsmp::file_relay::FilePermission {
-                mode: McpCommandMode::Unsupervised,
-                read_grant: false,
-            },
         );
         assert!(frames.is_empty());
         let (id, frames) = rx
@@ -164,16 +159,7 @@ fn slow_file_ops_never_stall_the_relay_loop() {
             "expectedEtag": etags[n],
         });
         let frames = timed(&mut spinner, &mut slowest_call, &mut || {
-            relay.handle_op(
-                &id,
-                "write",
-                args.clone(),
-                Some(3),
-                wsmp::file_relay::FilePermission {
-                    mode: McpCommandMode::Unsupervised,
-                    read_grant: false,
-                },
-            )
+            relay.handle_op(&id, "write", args.clone(), Some(3))
         });
         assert!(frames.is_empty());
         let frames = timed(&mut spinner, &mut slowest_call, &mut || {
@@ -188,10 +174,6 @@ fn slow_file_ops_never_stall_the_relay_loop() {
             "stat",
             json!({ "paths": [big.display().to_string()], "hash": true }),
             None,
-            wsmp::file_relay::FilePermission {
-                mode: McpCommandMode::Unsupervised,
-                read_grant: false,
-            },
         )
     });
     assert_eq!(control(&refused)["reason"], "limit");
@@ -212,10 +194,6 @@ fn slow_file_ops_never_stall_the_relay_loop() {
             "stat",
             json!({ "paths": [big.display().to_string()], "hash": true }),
             None,
-            wsmp::file_relay::FilePermission {
-                mode: McpCommandMode::Unsupervised,
-                read_grant: false,
-            },
         )
     });
     assert!(frames.is_empty());

@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { OpenAiCompatibleCapabilities } from "../relay/protocol.js";
 import {
+  externalModelListFlags,
   multimodalFlagsFromCapabilities,
   openAiModelListExtensions,
   openAiModelListExtensionsFromCapabilities,
+  poolModelListFlags,
   unionMultimodalFlags,
 } from "./model-list-modalities.js";
 
@@ -178,6 +180,58 @@ describe("unionMultimodalFlags", () => {
       audioOutput: false,
       audioTranscription: true,
       audioTranslation: true,
+    });
+  });
+});
+
+describe("poolModelListFlags", () => {
+  const row = (id: string, capabilities: string[], active = true) => ({
+    active,
+    model: { id, capabilities },
+  });
+
+  it("advertises a text-only wrap as text only", () => {
+    const flags = poolModelListFlags([row("glm", ["TEXT_GENERATION"])]);
+    expect(openAiModelListExtensions(flags)).toMatchObject({
+      supports_vision: false,
+      supports_video_input: false,
+      architecture: { input_modalities: ["text"] },
+    });
+  });
+
+  it("ignores a disabled member's capabilities, and unions the active ones", () => {
+    const disabledVision = row(
+      "qwen-vl",
+      ["TEXT_GENERATION", "VISION_INPUT", "VIDEO_INPUT"],
+      false,
+    );
+    expect(poolModelListFlags([row("glm", ["TEXT_GENERATION"]), disabledVision])).toMatchObject({
+      vision: false,
+      video: false,
+    });
+    expect(
+      poolModelListFlags([row("glm", ["TEXT_GENERATION"]), { ...disabledVision, active: true }]),
+    ).toMatchObject({ vision: true, video: true });
+  });
+
+  it("advertises speech-to-text, live included, from the runtime's transcription profile", () => {
+    const flags = poolModelListFlags([
+      {
+        model: {
+          id: "voxtral",
+          capabilities: [],
+          type: "TRANSCRIPTION",
+          transcriptionProfile: { realtime: { adapter: "segmented", maxItemSeconds: 30 } },
+        },
+      },
+    ]);
+    expect(openAiModelListExtensions(flags)).toMatchObject({
+      supports_audio_transcription: true,
+      supports_realtime_transcription: true,
+    });
+    expect(openAiModelListExtensions(externalModelListFlags(flags))).toMatchObject({
+      supports_audio_transcription: true,
+      supports_realtime_transcription: false,
     });
   });
 });

@@ -11,7 +11,7 @@ import { describe, expect, it, vi } from "vitest";
  * exists in the database. This test automates the schema-file half of that
  * check WITHOUT a live database: it boots the REAL production auth instance
  * from ./index.ts (the exact option set — admin, twoFactor,
- * deviceAuthorization, and the FULL flag-on MCP plugin list via
+ * and the FULL flag-on MCP plugin list via
  * resolveMcpPlugins — the deploy-time superset), derives the expected
  * tables/fields through better-auth's own `getAuthTables` (the same source
  * the CLI generator and the runtime schema diff consume), and asserts every
@@ -83,7 +83,7 @@ interface AuthTable {
 const tables = getAuthTables(auth.options) as Record<string, AuthTable>;
 
 describe("startup schema validation — real auth options vs the committed Prisma schema", () => {
-  it("the real instance resolves the deploy-time plugin set (flag ON: OAuth/JWKS/2FA/device tables present)", () => {
+  it("the real instance resolves the deploy-time plugin set (flag ON: OAuth/JWKS/2FA tables present)", () => {
     const keys = Object.keys(tables);
     for (const required of [
       "user",
@@ -95,7 +95,6 @@ describe("startup schema validation — real auth options vs the committed Prism
       "oauthClient",
       "oauthRefreshToken",
       "oauthConsent",
-      "deviceCode",
     ]) {
       expect(keys, `getAuthTables must declare ${required}`).toContain(required);
     }
@@ -130,14 +129,19 @@ describe("startup schema validation — real auth options vs the committed Prism
 });
 
 describe("auth instance plugin wiring (real production instance)", () => {
-  const ALWAYS_ON = ["admin", "two-factor", "device-authorization"];
+  const ALWAYS_ON = ["admin", "two-factor"];
   const idsOf = (options: { plugins?: { id: string }[] }) =>
     (options.plugins ?? []).map((plugin) => plugin.id);
 
-  it("installs the MCP plugins after the three always-on plugins while WMP_MCP_ENABLED is true", () => {
+  it("installs the MCP plugins after the two always-on plugins while WMP_MCP_ENABLED is true", () => {
     const ids = idsOf(auth.options);
     expect(ids.slice(0, ALWAYS_ON.length)).toEqual(ALWAYS_ON);
-    expect(ids.slice(ALWAYS_ON.length)).toEqual(["jwt", "oauth-provider", "cimd"]);
+    expect(ids.slice(ALWAYS_ON.length)).toEqual([
+      "jwt",
+      "oauth-provider",
+      "wsmp-mcp-consent-level",
+      "cimd",
+    ]);
   });
 
   it("installs only the always-on plugins when WMP_MCP_ENABLED is false", async () => {

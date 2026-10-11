@@ -147,24 +147,13 @@ function neutralDeletionConflictKey(
       return "errors:deletionConflict.deletePending";
     case "delete_contended":
       return "errors:deletionConflict.deleteContended";
-    case "still_attached":
-      return "errors:deletionConflict.stillAttached";
-    case "not_stale":
-      return "errors:deletionConflict.notStale";
     case "deletion_in_progress":
       return "errors:deletionConflict.deletionInProgress";
   }
 }
 
 /** What a delete mutation removes; picks the "do this instead" copy. */
-export type DeletionEntity =
-  | "user"
-  | "cliDevice"
-  | "endpoint"
-  | "discoveredModel"
-  | "pool"
-  | "poolMember"
-  | "capacity";
+export type DeletionEntity = "user";
 
 /**
  * i18n key (errors namespace) for a deletion-related CONFLICT on `entity`, or
@@ -184,26 +173,6 @@ export function isNotFound(error: unknown): boolean {
   const e = asErrorShape(error);
   if (!e) return false;
   return e.status === 404 || e.code === "NOT_FOUND";
-}
-
-/**
- * True if the error looks like a 403 / FORBIDDEN response from oRPC — e.g. a
- * policy that flipped server-side after the page loaded.
- */
-export function isForbidden(error: unknown): boolean {
-  const e = asErrorShape(error);
-  if (!e) return false;
-  return e.status === 403 || e.code === "FORBIDDEN";
-}
-
-/**
- * True if the error looks like a 400 / BAD_REQUEST response from oRPC — e.g.
- * a field-level schema rejection on the submitted input.
- */
-export function isBadRequest(error: unknown): boolean {
-  const e = asErrorShape(error);
-  if (!e) return false;
-  return e.status === 400 || e.code === "BAD_REQUEST";
 }
 
 type ErrorShape = {

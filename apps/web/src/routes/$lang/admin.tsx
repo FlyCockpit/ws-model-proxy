@@ -1,6 +1,6 @@
 import { createFileRoute, Link, notFound, Outlet } from "@tanstack/react-router";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { Activity, LayoutDashboard, Settings, Smartphone, Users } from "lucide-react";
+import { Activity, LayoutDashboard, Settings, Users } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { decideAdminRouteAccess } from "@/lib/route-session-access";
@@ -42,12 +42,6 @@ function AdminNav() {
       to: "/$lang/admin/users" as const,
       label: t("nav.users"),
       icon: Users,
-      exact: false,
-    },
-    {
-      to: "/$lang/admin/devices" as const,
-      label: t("nav.devices"),
-      icon: Smartphone,
       exact: false,
     },
     {

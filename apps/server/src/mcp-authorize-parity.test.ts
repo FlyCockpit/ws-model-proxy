@@ -18,10 +18,31 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  * the consent-enabled fixture at the bottom covers the FULL consent flow
  * (authorize → consent page → consent accept → code exchange → grant
  * minting) and the L17 referenceId continuity (consent row referenceId ===
- * grants.create referenceId).
+ * the grant's referenceId), and the consent page's Read-only/Full choice
+ * (mcp-consent-level.ts): only the person's `level` sets the grant level.
+ *
+ * The mocked mcpGrant table is a small in-memory store keyed like the real
+ * unique (userId, clientId, referenceId), so consent-time and exchange-time
+ * writes see each other.
  */
 
-const grants = vi.hoisted(() => ({ findUnique: vi.fn(), create: vi.fn() }));
+type GrantRow = {
+  id: string;
+  userId: string;
+  clientId: string;
+  referenceId: string;
+  level: "READ" | "FULL";
+  revokedAt: Date | null;
+};
+type GrantKey = { userId: string; clientId: string; referenceId: string };
+const store = vi.hoisted(() => ({ rows: [] as GrantRow[], audits: [] as unknown[] }));
+const grants = vi.hoisted(() => ({
+  findUnique: vi.fn(),
+  create: vi.fn(),
+  createMany: vi.fn(),
+  updateMany: vi.fn(),
+}));
+const audits = vi.hoisted(() => ({ create: vi.fn() }));
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     WMP_MCP_ENABLED: true,
@@ -30,10 +51,44 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     CORS_ORIGIN: undefined,
   },
 }));
-vi.mock("@ws-model-proxy/db", () => ({ default: { mcpGrant: grants } }));
+vi.mock("@ws-model-proxy/db", () => {
+  const tx = { mcpGrant: grants, auditEvent: audits };
+  return {
+    default: {
+      ...tx,
+      $transaction: (run: (client: typeof tx) => Promise<unknown>) => run(tx),
+    },
+  };
+});
 
+import {
+  type McpGrantLevelLoweredEvent,
+  onMcpGrantLevelLowered,
+} from "../../../packages/auth/src/mcp-grant-level";
 import { resolveMcpPlugins } from "../../../packages/auth/src/mcp-plugins";
 import { mcpAuthorizeScopeGuard } from "./mcp-authorize-scope-guard";
+
+function findRow(key: GrantKey): GrantRow | undefined {
+  return store.rows.find(
+    (row) =>
+      row.userId === key.userId &&
+      row.clientId === key.clientId &&
+      row.referenceId === key.referenceId,
+  );
+}
+
+function createRow(data: GrantKey & { level?: "READ" | "FULL" }): GrantRow {
+  const row: GrantRow = {
+    id: `parity-grant-${store.rows.length + 1}`,
+    userId: data.userId,
+    clientId: data.clientId,
+    referenceId: data.referenceId,
+    level: data.level ?? "READ",
+    revokedAt: null,
+  };
+  store.rows.push(row);
+  return row;
+}
 
 const BASE = "https://proxy.example.com";
 const CANONICAL = `${BASE}/mcp`;
@@ -54,22 +109,61 @@ const oauthParams = {
 };
 
 beforeEach(() => {
-  grants.findUnique.mockReset().mockResolvedValue(null);
+  store.rows = [];
+  store.audits = [];
+  grants.findUnique
+    .mockReset()
+    .mockImplementation(async (args: { where: { userId_clientId_referenceId: GrantKey } }) => {
+      const row = findRow(args.where.userId_clientId_referenceId);
+      return row ? { ...row } : null;
+    });
   grants.create
     .mockReset()
+    .mockImplementation(async (args: { data: GrantKey }) => ({ ...createRow(args.data) }));
+  // ON CONFLICT DO NOTHING, like `skipDuplicates`.
+  grants.createMany
+    .mockReset()
+    .mockImplementation(async (args: { data: Array<GrantKey & { level: "READ" | "FULL" }> }) => {
+      let count = 0;
+      for (const data of args.data) {
+        if (findRow(data)) continue;
+        createRow(data);
+        count += 1;
+      }
+      return { count };
+    });
+  grants.updateMany
+    .mockReset()
     .mockImplementation(
-      (args: { data: { userId: string; clientId: string; referenceId: string } }) =>
-        Promise.resolve({
-          id: "parity-grant-row",
-          userId: args.data.userId,
-          clientId: args.data.clientId,
-          referenceId: args.data.referenceId,
-          revokedAt: null,
-        }),
+      async (args: {
+        where: { id: string; userId: string; revokedAt: null; level: "READ" | "FULL" };
+        data: { level: "READ" | "FULL" };
+      }) => {
+        const row = store.rows.find(
+          (candidate) =>
+            candidate.id === args.where.id &&
+            candidate.userId === args.where.userId &&
+            candidate.revokedAt === null &&
+            candidate.level === args.where.level,
+        );
+        if (!row) return { count: 0 };
+        row.level = args.data.level;
+        return { count: 1 };
+      },
     );
+  audits.create.mockReset().mockImplementation(async (args: { data: unknown }) => {
+    store.audits.push(args.data);
+    return args.data;
+  });
 });
 
-function buildApp({ skipConsent = true }: { skipConsent?: boolean } = {}) {
+function buildApp({
+  skipConsent = true,
+  originCheck = false,
+}: {
+  skipConsent?: boolean;
+  originCheck?: boolean;
+} = {}) {
   const memory: Record<string, Record<string, unknown>[]> = {
     oauthAccessToken: [],
     oauthRefreshToken: [],
@@ -126,6 +220,9 @@ function buildApp({ skipConsent = true }: { skipConsent?: boolean } = {}) {
       },
     },
     logger: { disabled: true },
+    // Better Auth skips its origin (CSRF) check under test unless told otherwise; production
+    // runs it. The cross-site consent case turns it on.
+    ...(originCheck ? { advanced: { disableOriginCheck: false } } : {}),
     plugins: resolveMcpPlugins({ enabled: true, baseUrl: BASE }),
   });
   const app = new Hono();
@@ -373,7 +470,9 @@ describe("MCP authorize boundary parity with the installed handler", () => {
     const claims = JSON.parse(
       Buffer.from(segments[1] ?? "", "base64url").toString("utf8"),
     ) as Record<string, unknown>;
-    expect(claims.mcp_grant_id).toBe("parity-grant-row");
+    expect(claims.mcp_grant_id).toBe(store.rows[0]?.id);
+    // A skip-consent client never saw the page: its grant is Read-only.
+    expect(store.rows[0]?.level).toBe("READ");
   });
 
   it("FULL FLOW hazard closed: BOM-prefixed resource authorize is locally rejected — no guard-passing shape reaches token issuance without the hook", async () => {
@@ -503,9 +602,20 @@ describe("MCP authorize boundary parity with the installed handler", () => {
     const consentRow = (memory.oauthConsent ?? [])[0] as { referenceId?: unknown } | undefined;
     expect(consentRow?.referenceId).toMatch(/^[a-f0-9]{64}$/);
 
-    // 5. Exchange the code (authorization_code + PKCE verifier) → 200;
-    //    3-segment JWT carrying mcp_grant_id; grants.create called exactly
-    //    once with the CONSENT row's referenceId (L17 continuity).
+    // 5. The approval created the grant (at the default Read-only level)
+    //    under the CONSENT row's referenceId (L17 continuity), before the
+    //    code reached the browser.
+    expect(store.rows).toHaveLength(1);
+    expect(store.rows[0]).toMatchObject({
+      referenceId: consentRow?.referenceId,
+      clientId: CLIENT,
+      level: "READ",
+      revokedAt: null,
+    });
+
+    // 6. Exchange the code (authorization_code + PKCE verifier) → 200;
+    //    3-segment JWT carrying mcp_grant_id of that grant; the exchange
+    //    reuses it (no second create).
     const redirectUrl = new URL(consentJson.url, BASE);
     const code = redirectUrl.searchParams.get("code");
     expect(code).toBeTruthy();
@@ -522,17 +632,14 @@ describe("MCP authorize boundary parity with the installed handler", () => {
     });
     expect(token.status).toBe(200);
     const tokenJson = (await token.json()) as { access_token: string };
-    expect(grants.create).toHaveBeenCalledTimes(1);
-    const created = grants.create.mock.calls[0]?.[0] as {
-      data: { userId: string; clientId: string; referenceId: string };
-    };
-    expect(created.data.referenceId).toBe(consentRow?.referenceId);
+    expect(grants.create).not.toHaveBeenCalled();
+    expect(store.rows).toHaveLength(1);
     const segments = tokenJson.access_token.split(".");
     expect(segments).toHaveLength(3);
     const claims = JSON.parse(
       Buffer.from(segments[1] ?? "", "base64url").toString("utf8"),
     ) as Record<string, unknown>;
-    expect(claims.mcp_grant_id).toBe("parity-grant-row");
+    expect(claims.mcp_grant_id).toBe(store.rows[0]?.id);
   });
 
   // ------------------------------------------------------------------
@@ -699,6 +806,270 @@ describe("MCP authorize boundary parity with the installed handler", () => {
     expect(denialUrl.searchParams.get("code")).toBeNull();
     // No grant was minted and no consent was remembered.
     expect(grants.create).not.toHaveBeenCalled();
+    expect(grants.createMany).not.toHaveBeenCalled();
+    expect(store.rows).toHaveLength(0);
     expect(memory.oauthConsent ?? []).toHaveLength(0);
+  });
+
+  // ------------------------------------------------------------------
+  // The consent page's Read-only/Full choice (mcp-consent-level.ts): the
+  // level comes from the PERSON's consent body only, defaults to Read-only,
+  // and is recorded on the exact grant the code exchanges into.
+  // ------------------------------------------------------------------
+
+  describe("consent level", () => {
+    /** authorize → expect the consent page; returns its signed query. */
+    async function consentPage(
+      app: Hono,
+      cookie: string,
+      extra: Record<string, string>,
+    ): Promise<string> {
+      const authorize = await app.request(`${BASE}${AUTHORIZE}`, {
+        method: "POST",
+        headers: { "content-type": FORM, cookie, origin: BASE },
+        body: formBody({ resource: CANONICAL, ...extra }),
+      });
+      expect(authorize.status).toBe(302);
+      const location = new URL(authorize.headers.get("location")!, BASE);
+      expect(location.pathname).toContain("/mcp-consent");
+      return location.search.slice(1);
+    }
+
+    function postConsent(
+      app: Hono,
+      cookie: string,
+      body: Record<string, unknown>,
+      origin: string = BASE,
+    ) {
+      return app.request(`${BASE}/api/auth/oauth2/consent`, {
+        method: "POST",
+        headers: { "content-type": "application/json", cookie, origin },
+        body: JSON.stringify(body),
+      });
+    }
+
+    async function codeFrom(response: Response): Promise<string> {
+      expect(response.status).toBe(200);
+      const json = (await response.json()) as { redirect: boolean; url: string };
+      expect(json.redirect).toBe(true);
+      const code = new URL(json.url).searchParams.get("code");
+      expect(code).toBeTruthy();
+      return code ?? "";
+    }
+
+    async function exchange(app: Hono, code: string): Promise<Record<string, unknown>> {
+      const token = await app.request(`${BASE}/api/auth/oauth2/token`, {
+        method: "POST",
+        headers: { "content-type": FORM },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          client_id: CLIENT,
+          code,
+          code_verifier: VERIFIER,
+          redirect_uri: CALLBACK,
+        }),
+      });
+      expect(token.status).toBe(200);
+      const json = (await token.json()) as { access_token: string };
+      return JSON.parse(
+        Buffer.from(json.access_token.split(".")[1] ?? "", "base64url").toString("utf8"),
+      ) as Record<string, unknown>;
+    }
+
+    it("a person choosing Full records a Full grant (audited as the person) the code exchanges into", async () => {
+      const { app, auth } = buildApp({ skipConsent: false });
+      const cookie = await consentFixtureUser(app, auth, "full@example.test");
+      const query = await consentPage(app, cookie, { scope: "mcp:read mcp:write" });
+      const code = await codeFrom(
+        await postConsent(app, cookie, { accept: true, level: "FULL", oauth_query: query }),
+      );
+      expect(store.rows).toHaveLength(1);
+      expect(store.rows[0]?.level).toBe("FULL");
+      expect(store.audits).toEqual([
+        expect.objectContaining({
+          actor: "USER",
+          action: "mcp_grant.consent",
+          resourceType: "mcp_grant",
+          resourceId: store.rows[0]?.id,
+          after: { level: "FULL" },
+        }),
+      ]);
+      const claims = await exchange(app, code);
+      expect(claims.mcp_grant_id).toBe(store.rows[0]?.id);
+      expect(claims.scope).toBe("mcp:read mcp:write");
+    });
+
+    it("no level in the approval means Read-only, even when the client asked for mcp:write", async () => {
+      const { app, auth } = buildApp({ skipConsent: false });
+      const cookie = await consentFixtureUser(app, auth, "default@example.test");
+      const query = await consentPage(app, cookie, { scope: "mcp:read mcp:write" });
+      await codeFrom(await postConsent(app, cookie, { accept: true, oauth_query: query }));
+      expect(store.rows[0]?.level).toBe("READ");
+    });
+
+    it("a client cannot pick the level: a `level` it puts in the authorize request is never read", async () => {
+      const { app, auth } = buildApp({ skipConsent: false });
+      const cookie = await consentFixtureUser(app, auth, "client-level@example.test");
+      const query = await consentPage(app, cookie, {
+        scope: "mcp:read mcp:write",
+        level: "FULL",
+      });
+      // The client's parameter rides inside the signed query; the approval carries none.
+      expect(new URLSearchParams(query).get("level")).toBe("FULL");
+      await codeFrom(await postConsent(app, cookie, { accept: true, oauth_query: query }));
+      expect(store.rows[0]?.level).toBe("READ");
+    });
+
+    it("refuses Full when the approved scopes lack mcp:write, and an unknown level, before any code or grant", async () => {
+      const { app, auth, memory } = buildApp({ skipConsent: false });
+      const cookie = await consentFixtureUser(app, auth, "refused@example.test");
+      const readOnly = await consentPage(app, cookie, { scope: "mcp:read" });
+      const full = await postConsent(app, cookie, {
+        accept: true,
+        level: "FULL",
+        oauth_query: readOnly,
+      });
+      expect(full.status).toBe(400);
+      expect(await full.json()).toMatchObject({ error: "invalid_request" });
+      // Narrowing the approval to mcp:read takes write away too.
+      const both = await consentPage(app, cookie, { scope: "mcp:read mcp:write" });
+      const narrowed = await postConsent(app, cookie, {
+        accept: true,
+        level: "FULL",
+        scope: "mcp:read",
+        oauth_query: both,
+      });
+      expect(narrowed.status).toBe(400);
+      const unknown = await postConsent(app, cookie, {
+        accept: true,
+        level: "ADMIN",
+        oauth_query: both,
+      });
+      expect(unknown.status).toBe(400);
+      expect(store.rows).toHaveLength(0);
+      expect(memory.oauthConsent ?? []).toHaveLength(0);
+    });
+
+    it("a cross-site approval (another origin) is refused before any level is written", async () => {
+      const { app, auth } = buildApp({ skipConsent: false, originCheck: true });
+      const cookie = await consentFixtureUser(app, auth, "csrf@example.test");
+      const query = await consentPage(app, cookie, { scope: "mcp:read mcp:write" });
+      const forged = await postConsent(
+        app,
+        cookie,
+        { accept: true, level: "FULL", oauth_query: query },
+        "https://evil.example",
+      );
+      expect(forged.status).toBe(403);
+      expect(store.rows).toHaveLength(0);
+      // The same approval from the app's own origin goes through.
+      await codeFrom(
+        await postConsent(app, cookie, { accept: true, level: "FULL", oauth_query: query }),
+      );
+      expect(store.rows[0]?.level).toBe("FULL");
+    });
+
+    it("step-up: the person's choice on the re-prompt replaces the level; remembered consent never changes it", async () => {
+      const lowered: McpGrantLevelLoweredEvent[] = [];
+      const unsubscribe = onMcpGrantLevelLowered((event) => {
+        lowered.push(event);
+      });
+      try {
+        const { app, auth } = buildApp({ skipConsent: false });
+        const cookie = await consentFixtureUser(app, auth, "stepup-level@example.test");
+        // First approval: read only.
+        await codeFrom(
+          await postConsent(app, cookie, {
+            accept: true,
+            oauth_query: await consentPage(app, cookie, { scope: "mcp:read" }),
+          }),
+        );
+        expect(store.rows[0]?.level).toBe("READ");
+
+        // Step-up to mcp:write re-prompts; the person chooses Full.
+        await codeFrom(
+          await postConsent(app, cookie, {
+            accept: true,
+            level: "FULL",
+            oauth_query: await consentPage(app, cookie, { scope: "mcp:read mcp:write" }),
+          }),
+        );
+        expect(store.rows).toHaveLength(1);
+        expect(store.rows[0]?.level).toBe("FULL");
+
+        // The person lowers it elsewhere (Access → Agents); a remembered
+        // re-authorization (no page) issues a code but never raises it back.
+        const row = store.rows[0];
+        if (row) row.level = "READ";
+        const remembered = await app.request(`${BASE}${AUTHORIZE}`, {
+          method: "POST",
+          headers: { "content-type": FORM, cookie, origin: BASE },
+          body: formBody({ scope: "mcp:read mcp:write", resource: CANONICAL }),
+        });
+        expect(remembered.status).toBe(302);
+        const code = new URL(remembered.headers.get("location")!).searchParams.get("code");
+        expect(code).toBeTruthy();
+        await exchange(app, code ?? "");
+        expect(store.rows[0]?.level).toBe("READ");
+
+        // prompt=consent shows the page again: the person raises, then lowers.
+        await codeFrom(
+          await postConsent(app, cookie, {
+            accept: true,
+            level: "FULL",
+            oauth_query: await consentPage(app, cookie, {
+              scope: "mcp:read mcp:write",
+              prompt: "consent",
+            }),
+          }),
+        );
+        expect(store.rows[0]?.level).toBe("FULL");
+        expect(lowered).toEqual([]);
+        await codeFrom(
+          await postConsent(app, cookie, {
+            accept: true,
+            level: "READ",
+            oauth_query: await consentPage(app, cookie, {
+              scope: "mcp:read mcp:write",
+              prompt: "consent",
+            }),
+          }),
+        );
+        expect(store.rows[0]?.level).toBe("READ");
+        expect(lowered).toEqual([{ userId: store.rows[0]?.userId, grantId: store.rows[0]?.id }]);
+        expect(store.audits.map((entry) => (entry as { after: unknown }).after)).toEqual([
+          { level: "READ" },
+          { level: "FULL" },
+          { level: "FULL" },
+          { level: "READ" },
+        ]);
+      } finally {
+        unsubscribe();
+      }
+    });
+
+    it("withholds the code when the level cannot be recorded", async () => {
+      const { app, auth, memory } = buildApp({ skipConsent: false });
+      const cookie = await consentFixtureUser(app, auth, "storage@example.test");
+      const query = await consentPage(app, cookie, { scope: "mcp:read mcp:write" });
+      grants.createMany.mockRejectedValueOnce(new Error("db down"));
+      const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const response = await postConsent(app, cookie, {
+          accept: true,
+          level: "FULL",
+          oauth_query: query,
+        });
+        expect(response.status).toBe(500);
+        const text = await response.text();
+        expect(text).not.toContain("code=");
+        // The approval is forgotten: the next authorize asks the person again instead of
+        // issuing a code from a remembered consent.
+        expect(memory.oauthConsent ?? []).toHaveLength(0);
+        await consentPage(app, cookie, { scope: "mcp:read mcp:write" });
+      } finally {
+        errors.mockRestore();
+      }
+    });
   });
 });

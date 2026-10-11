@@ -1,6 +1,6 @@
 import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { parseRelayBinaryFrame } from "./protocol.js";
+import { serverToNodeBinaryMetadataSchema } from "./frames.js";
 import type { RelayFailure } from "./relay-failure.js";
 import { STT_AUDIO_FRAME_MAX_BYTES, sttServerControlSchema } from "./stt-protocol.js";
 import {
@@ -29,12 +29,21 @@ import {
   type SttSessionEvent,
 } from "./stt-relay.js";
 
-/** A CLI connection that records what the server sends. No network. */
+/** A server → node binary frame, as the node would read it. */
+function parseRelayBinaryFrame(frame: ArrayBuffer) {
+  const length = new DataView(frame).getUint32(0, false);
+  const metadata = serverToNodeBinaryMetadataSchema.parse(
+    JSON.parse(new TextDecoder().decode(new Uint8Array(frame, 4, length))),
+  );
+  return { metadata, body: new Uint8Array(frame, 4 + length) };
+}
+
+/** A node connection that records what the server sends. No network. */
 class FakeLink implements SttRelayLink {
   open = true;
   buffered = 0;
   sends: (string | ArrayBuffer)[] = [];
-  constructor(readonly cliDeviceId: string) {}
+  constructor(readonly nodeId: string) {}
   isOpen() {
     return this.open;
   }
@@ -99,13 +108,12 @@ function realtimeCaps(
 const SEGMENTED = realtimeCaps({ supported: true, adapter: "segmented", maxItemSeconds: 10 });
 const VLLM = realtimeCaps({ supported: true, adapter: "vllm" });
 
-function target(cliDeviceId: string, overrides: Partial<SttAttachTarget> = {}): SttAttachTarget {
+function target(nodeId: string, overrides: Partial<SttAttachTarget> = {}): SttAttachTarget {
   return {
-    cliDeviceId,
-    endpointSlug: "inst-0123456789abcdef",
+    nodeId,
+    handle: "inst-0123456789abcdef",
     upstreamModel: "whisper-large",
     capabilities: SEGMENTED,
-    deploymentManaged: true,
     ...overrides,
   };
 }
@@ -137,10 +145,10 @@ function setup() {
     onLinkIdle(link) {
       idle.push(link);
     },
-    resolveLink(cliDeviceId, endpointSlug): SttLinkResolution {
-      const link = links.get(cliDeviceId);
+    resolveLink(nodeId, handle): SttLinkResolution {
+      const link = links.get(nodeId);
       if (!link?.open) return { ok: false, reason: "offline" };
-      if (unavailable.has(endpointSlug)) return { ok: false, reason: "endpoint_unavailable" };
+      if (unavailable.has(handle)) return { ok: false, reason: "endpoint_unavailable" };
       return { ok: true, link };
     },
   });
@@ -168,7 +176,7 @@ async function openOn(
   session: SttRelaySession,
   overrides: Partial<SttAttachTarget> = {},
 ): Promise<{ sessionId: string; result: SttAttachResult }> {
-  const pending = session.attach(target(link.cliDeviceId, overrides));
+  const pending = session.attach(target(link.nodeId, overrides));
   const sessionId = session.relaySessionId;
   if (!sessionId) throw new Error(`not opening: ${JSON.stringify(await pending)}`);
   frame(link, hub, { type: "stt.opened", sessionId });
@@ -208,7 +216,7 @@ describe("opening a live session on a CLI", () => {
     expect(open).toEqual({
       type: "stt.open",
       sessionId: session.relaySessionId,
-      endpointSlug: "inst-0123456789abcdef",
+      handle: "inst-0123456789abcdef",
       upstreamModel: "whisper-large",
       adapter: "segmented",
       config: { language: "en", prompt: "names" },
@@ -235,12 +243,10 @@ describe("opening a live session on a CLI", () => {
     expect(result).toEqual({ status: "opened", adapter: "vllm", maxItemSeconds: 300 });
   });
 
-  it("refuses targets that are not recipe-managed live transcription endpoints", async () => {
+  it("refuses targets that are not live transcription models", async () => {
     const { link, create } = setup();
     const cli = link("cli-a");
     const refusals: [Partial<SttAttachTarget>, Record<string, unknown>][] = [
-      [{ deploymentManaged: false }, {}],
-      [{ endpointSlug: "local-whisper" }, {}],
       [{ capabilities: realtimeCaps(null) }, {}],
       [{ capabilities: realtimeCaps({ supported: false, adapter: "segmented" }) }, {}],
       // Only audio.transcriptions.realtime routes; a translations block never does.

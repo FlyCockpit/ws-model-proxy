@@ -14,6 +14,10 @@ import {
  * make in one `#admitOne` pass: eligibility (`notBefore`, deadlines with the
  * creating-request and last-chance exceptions, member/scope limits, physical
  * limit, reservation borrowing), then one weighted deficit round robin pick.
+ *
+ * Kept (reserved) slots are a guarantee: a waiter may take a slot another
+ * owner keeps only while no owner with unmet kept slots has a grantable
+ * waiter, whatever the classes, and only when its policy allows borrowing.
  * After each grant the in-memory state advances (active counts, per-owner and
  * per-scope counts, the winner's request leaves the queue, DRR state) and the
  * next step is planned. The store then persists every grant in bounded batched
@@ -36,11 +40,14 @@ export type PlannerWaiter = {
   requestDeadlineAt: Date | null;
   /** `member:<id>` or `direct:<targetId>`: the owner of reservation accounting. */
   ownerKey: string;
-  /** Member/scope concurrency ceiling (null/undefined = none). */
-  memberLimit: number | null | undefined;
-  /** `<scope>:<scopeId>` counted against `memberLimit`. */
-  scopeKey: string;
-  borrowPolicy: "NEVER" | "WHEN_IDLE";
+  /**
+   * Every concurrency ceiling the waiter is bound by, each counted against
+   * the ACTIVE leases of its `<scope>:<scopeId>` key: the member's own cap
+   * and the pool-wide cap, or the direct target's cap. Empty = none.
+   */
+  scopeLimits: readonly { key: string; limit: number }[];
+  /** May take a slot another owner keeps, while that owner has no waiter. */
+  borrowReserved: boolean;
   /** Scope keys whose ACTIVE lease count grows by one when this waiter is granted. */
   leaseScopeKeys: readonly string[];
 };
@@ -53,7 +60,7 @@ export type AdmissionSnapshot = {
   activeByOwner: ReadonlyMap<string, number>;
   /** Allocated reservation slots per owner (see allocateReservationSlots). */
   reservationsByOwner: ReadonlyMap<string, number>;
-  /** ACTIVE lease count per `<scope>:<scopeId>` of every waiter with a limit. */
+  /** ACTIVE lease count per `<scope>:<scopeId>` of every waiter scope limit. */
   scopeActive: ReadonlyMap<string, number>;
   /** WAITING waiters of WAITING requests, before any time filtering. */
   waiters: readonly PlannerWaiter[];
@@ -151,9 +158,7 @@ export function planGrants(
   const grants: PlannedGrant[] = [];
   const ownerActive = (owner: string) => activeByOwner.get(owner) ?? 0;
   const scopeHasRoom = (waiter: PlannerWaiter) =>
-    waiter.memberLimit === null ||
-    waiter.memberLimit === undefined ||
-    (scopeActive.get(waiter.scopeKey) ?? 0) < waiter.memberLimit;
+    waiter.scopeLimits.every(({ key, limit }) => (scopeActive.get(key) ?? 0) < limit);
 
   type Queue = { entries: Entry[]; head: number; next: number[] };
   const classes = new Map<number, Queue>();
@@ -185,8 +190,6 @@ export function planGrants(
     ownerQueue.entries.push(entry);
     ownerQueue.next.push(ownerQueue.entries.length);
   }
-  for (const queue of ownerQueues.values())
-    queue.entries.sort((a, b) => b.waiter.priority - a.waiter.priority);
   const dead = (entry: Entry) =>
     takenRequests.has(entry.waiter.admissionRequestId) || !scopeHasRoom(entry.waiter);
   const pruneHead = (queue: Queue) => {
@@ -194,7 +197,7 @@ export function planGrants(
       queue.head = queue.next[queue.head]!;
   };
 
-  // Sort/index once: O(W log W). Each step examines at most 32 class heads
+  // Sort/index once: O(W log W). Each step examines at most 3 class heads
   // and owners with unmet reservations; permanent skips amortize to O(W).
   // Borrow-blocked entries are temporary and may be scanned again per grant:
   // adversarial borrowing can still cost the number of such skips per step.
@@ -216,31 +219,24 @@ export function planGrants(
       break;
     }
 
-    // Only reservation owners can block a borrower. Their highest live
-    // priority suffices, including when the borrower is itself an owner.
-    let needy: { priority: number; owner: string; otherPriority: number } | null | undefined;
-    const needyFor = (ownerKey: string): number => {
-      if (needy === undefined) {
-        let best = -1;
-        let bestOwner = "";
-        let other = -1;
+    // Only reservation owners with unmet kept slots and a live waiter block
+    // a borrower (the guarantee), whatever their class. Two such owners
+    // suffice to answer for every borrower, including one that is itself an
+    // owner.
+    let needyOwners: string[] | undefined;
+    const ownerWaitingBesides = (ownerKey: string): boolean => {
+      if (needyOwners === undefined) {
+        needyOwners = [];
         for (const owner of remaining.keys()) {
           const queue = ownerQueues.get(owner);
           if (!queue) continue;
           pruneHead(queue);
-          const entry = queue.entries[queue.head];
-          if (!entry) continue;
-          const priority = entry.waiter.priority;
-          if (priority > best) {
-            other = best;
-            best = priority;
-            bestOwner = owner;
-          } else other = Math.max(other, priority);
+          if (!queue.entries[queue.head]) continue;
+          needyOwners.push(owner);
+          if (needyOwners.length === 2) break;
         }
-        needy = best === -1 ? null : { priority: best, owner: bestOwner, otherPriority: other };
       }
-      if (needy === null) return -1;
-      return needy.owner === ownerKey ? needy.otherPriority : needy.priority;
+      return needyOwners.some((owner) => owner !== ownerKey);
     };
 
     const eligible: Entry[] = [];
@@ -270,10 +266,7 @@ export function planGrants(
           ownerRemaining === 0 &&
           reservedForOthers > 0 &&
           limit - active <= reservedForOthers;
-        if (
-          borrowed &&
-          (needyFor(waiter.ownerKey) > waiter.priority || waiter.borrowPolicy === "NEVER")
-        ) {
+        if (borrowed && (!waiter.borrowReserved || ownerWaitingBesides(waiter.ownerKey))) {
           // Retain temporary blockers for a later step; only dead entries
           // can be unlinked from a class's FIFO list.
           previous = index;

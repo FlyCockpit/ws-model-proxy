@@ -16,7 +16,7 @@ import { createServerFn } from "@tanstack/react-start";
  * `beforeLoad` and throw `notFound()` BEFORE any session/client work when
  * disabled (invariant 13: flag-off MCP login/consent routes are real 404s).
  *
- * `allowNoExpiry` mirrors the mint-time WMP_MCP_PAT_ALLOW_NO_EXPIRY contract
+ * `allowNoExpiry` mirrors the mint-time WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY contract
  * (packages/api/src/routers/mcp-tokens.ts) for the settings token panel: the
  * create dialog lists "No expiry" only while the deployment allows it. The
  * selected default is 90 days either way. The procedure still re-validates
@@ -33,7 +33,7 @@ export const getMcpWebAvailability = createServerFn({ method: "GET" }).handler(
       const { env } = await import("@ws-model-proxy/env/server");
       return {
         enabled: env.WMP_MCP_ENABLED === true,
-        allowNoExpiry: env.WMP_MCP_PAT_ALLOW_NO_EXPIRY === true,
+        allowNoExpiry: env.WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY === true,
       };
     } catch {
       return { enabled: false, allowNoExpiry: false };

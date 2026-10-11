@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   initialRealtimeState,
-  liveModelOptions,
   micProblem,
   pcm16Base64,
   problemMessageKey,
@@ -12,9 +11,9 @@ import {
 } from "./realtime-transcription";
 
 describe("realtime transcription helpers", () => {
-  it("builds the same-origin Chat Test socket URL, with only the intent and model", () => {
+  it("builds the same-origin Test socket URL, with only the intent and model", () => {
     const url = realtimeSocketUrl("owner/asr pool", {
-      href: "https://proxy.example.com/en-US/dashboard/chat-test?x=1",
+      href: "https://proxy.example.com/en-US/test?x=1",
       protocol: "https:",
     });
     expect(url).toBe(
@@ -23,24 +22,6 @@ describe("realtime transcription helpers", () => {
     expect(realtimeSocketUrl("m", { href: "http://localhost:3001/x", protocol: "http:" })).toMatch(
       /^ws:\/\/localhost:3001\/api\/internal\/chat-test\/realtime\?/,
     );
-  });
-
-  it("offers only the models that advertise live transcription", () => {
-    const visible = {
-      directModels: [
-        { modelId: "me/asr", upstreamModelId: "whisper", realtimeTranscription: true },
-        { modelId: "me/chat", upstreamModelId: "llm", realtimeTranscription: false },
-      ],
-      modelPools: [
-        { modelId: "team/asr", name: "Team ASR", realtimeTranscription: true },
-        { modelId: "team/chat", name: "Team chat", realtimeTranscription: false },
-      ],
-    } as unknown as Parameters<typeof liveModelOptions>[0];
-    expect(liveModelOptions(visible)).toEqual([
-      { modelId: "me/asr", label: "whisper" },
-      { modelId: "team/asr", label: "Team ASR" },
-    ]);
-    expect(liveModelOptions(undefined)).toEqual([]);
   });
 
   it("base64-encodes PCM, including buffers larger than one chunk", () => {

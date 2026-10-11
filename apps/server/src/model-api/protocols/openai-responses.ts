@@ -52,7 +52,11 @@ export function parseOpenAiResponsesRequest(input: unknown): CanonicalRequest {
   }
   if (body.store !== undefined && typeof body.store !== "boolean")
     invalid("store", "must be a boolean");
-  if (body.store === true) unsupported("store", "persisted Responses state is native-only");
+  if (body.store === true)
+    unsupported(
+      "store",
+      'true needs a model that stores responses natively; a request reached by translation cannot be stored. Send "store": false (the response is then not stored and cannot be retrieved later)',
+    );
   if (body.truncation !== undefined && body.truncation !== "disabled") unsupported("truncation");
   const tools = parseTools(body.tools, "tools", "openai-responses");
   if (tools.length && body.parallel_tool_calls !== false)

@@ -25,11 +25,7 @@
  *   mint: sign-in, impersonation);
  * - MCP admission, CLI credentials, model API tokens, relay registration and
  *   CLI command admission: `userCredentialAccessBlocked` in
- *   `@ws-model-proxy/db/user-deletion-access`;
- * - the device-code exchange (it mints a `cli_device_credential`, not a
- *   session): the same rule, read FOR SHARE inside its transaction
- *   (`mintCliDeviceCredentialFromApprovedDeviceCode`), so a mark committed
- *   first refuses it and a later mark waits for it.
+ *   `@ws-model-proxy/db/user-deletion-access`.
  *
  * As defense in depth (not the proof: the check below and the route's write
  * are separate statements) the admin routes that would restore or reshape a

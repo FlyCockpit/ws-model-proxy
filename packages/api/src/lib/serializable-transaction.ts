@@ -7,6 +7,7 @@ import {
 } from "@ws-model-proxy/db/capacity-lock-order";
 import { ParentDeletionDrainPendingError } from "@ws-model-proxy/db/parent-deletion";
 import { deletionConflict } from "./deletion-conflict";
+import { RETRY_CONFLICT_MESSAGE } from "./refuse";
 
 const RETRYABLE_CODES = new Set(["P2034", "40001", "40P01"]);
 const TRANSACTION_WRITE_CONFLICT = "TransactionWriteConflict";
@@ -91,7 +92,7 @@ export async function runSerializableTransaction<T>(
     }
   }
   throw new ORPCError("CONFLICT", {
-    message: "Configuration changed concurrently. Retry the request.",
+    message: RETRY_CONFLICT_MESSAGE,
   });
 }
 
@@ -140,10 +141,7 @@ export function throwCapacityDeleteConflict(error: unknown): void {
     error instanceof CapacityOrderedTransactionTimeoutError ||
     isRetryableCapacityTransactionError(error)
   ) {
-    throw deletionConflict(
-      "delete_contended",
-      "Configuration changed concurrently. Retry the request.",
-    );
+    throw deletionConflict("delete_contended", RETRY_CONFLICT_MESSAGE);
   }
 }
 
