@@ -67,7 +67,7 @@ export function defaultCliReleaseBaseUrl(): string {
 export const CLI_RELEASE_BINARIES_BY_DEFAULT = false;
 
 /** The branch an unconfigured server builds before {@link CLI_RELEASE_BINARIES_BY_DEFAULT}. */
-export const CLI_PREVIEW_BRANCH = "redesign-0.4.0";
+export const CLI_PREVIEW_BRANCH = "master";
 
 /**
  * What `/install.sh` installs. `release`: the checksummed binary for the node's platform from

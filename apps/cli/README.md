@@ -40,7 +40,7 @@ Either way the binary lands in `~/.cargo/bin` (`$CARGO_HOME/bin` when set); add 
 if `wsmp` is not found.
 
 Until v0.4.0 is released, a server's script builds from source by default: the
-`redesign-0.4.0` branch, or the commit in `WMP_CLI_SOURCE_REV`. The server opts into release
+`master` branch, or the commit in `WMP_CLI_SOURCE_REV`. The server opts into release
 binaries with `WMP_CLI_RELEASE_BASE_URL`; from the release on, that is the default. To check a
 downloaded archive yourself:
 

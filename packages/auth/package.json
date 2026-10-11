@@ -52,6 +52,9 @@
     },
     "./proved-email": {
       "default": "./src/proved-email.ts"
+    },
+    "./password-reset-request": {
+      "default": "./src/password-reset-request.ts"
     }
   },
   "scripts": {

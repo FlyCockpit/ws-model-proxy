@@ -26,6 +26,7 @@ import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
+import { passwordResetOptions } from "./password-reset";
 import { recordProvedEmail } from "./proved-email";
 import {
   acceptClaimedShareInviteToken,
@@ -288,6 +289,11 @@ export const auth = betterAuth({
     // When SMTP is unset the app is fully usable without mail. When SMTP is
     // configured, require a verified address for email/password sign-in.
     requireEmailVerification: emailConfigured,
+    // Reset by email only with SMTP (no mail, no reset link); a reset signs
+    // the account out everywhere. apps/server answers /request-password-reset
+    // through ./password-reset-request.ts (behind the per-IP and per-recipient
+    // limiters): a uniform 200, with this endpoint run in the background.
+    ...passwordResetOptions(emailConfigured, env.CORS_ORIGIN),
   },
   emailVerification: {
     sendVerificationEmail: async ({ user, url }) => {

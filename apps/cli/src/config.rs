@@ -67,10 +67,8 @@ where
 
 pub const MAX_FILE_ROOTS: usize = 32;
 /// Aggregate JSON-serialized size of the whole roots set (control characters
-/// and quotes count as their escapes). The supervised confirm child receives
-/// the set through one environment variable (< 128 KiB per string on Linux), so
-/// a larger set is refused where it is accepted instead of leaving supervised
-/// writes unusable at runtime (fail closed).
+/// and quotes count as their escapes). A larger set is refused where it is
+/// accepted (fail closed).
 pub const MAX_FILE_ROOTS_SERIALIZED_BYTES: usize = 64 * 1024;
 
 fn deserialize_file_roots<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Error>
@@ -280,7 +278,7 @@ pub struct Config {
     pub require_terminal_approval: bool,
     /// Browser terminals this machine keeps open at once
     /// ([`MAX_TERMINALS_RANGE`]; unset means [`DEFAULT_MAX_TERMINALS`]).
-    /// Supervised and operator terminals have their own slots. Read once
+    /// Operator terminals have their own slots. Read once
     /// when the relay starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_terminals: Option<u32>,
@@ -2469,8 +2467,8 @@ mod tests {
     }
 
     /// The roots set is bounded in aggregate (serialized, control characters
-    /// counting as escapes) wherever roots are accepted, so the supervised
-    /// confirm child can always receive it; realistic sets stay accepted.
+    /// counting as escapes) wherever roots are accepted; realistic sets stay
+    /// accepted.
     #[cfg(unix)]
     #[test]
     fn file_roots_have_an_aggregate_serialized_bound() {
@@ -2504,16 +2502,11 @@ mod tests {
         );
     }
 
-    /// The bound must keep the serialized roots set deliverable through the
-    /// confirm child's one environment variable (`NAME=value\0` under the Linux
-    /// 131072-byte per-string exec limit), and sit exactly where it is documented.
+    /// The bound sits exactly where it is documented.
     #[cfg(unix)]
     #[test]
-    fn file_roots_bound_fits_the_child_transport_and_is_exact() {
+    fn file_roots_bound_is_exact() {
         assert_eq!(MAX_FILE_ROOTS_SERIALIZED_BYTES, 64 * 1024);
-        let name_and_nul = "WSMP_SUPERVISED_FILE_ROOTS=".len() + 1;
-        // The snapshot adds only a small fixed envelope around the roots.
-        assert!(MAX_FILE_ROOTS_SERIALIZED_BYTES + 1024 + name_and_nul < 131_072);
         // Exactly at the bound passes, one byte over fails. Each root counts its
         // JSON text plus one separator byte.
         let filler = |len: usize| PathBuf::from(format!("/{}", "a".repeat(len - 1)));

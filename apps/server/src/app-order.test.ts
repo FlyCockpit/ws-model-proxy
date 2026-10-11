@@ -57,7 +57,7 @@ const envMock = vi.hoisted(() => ({
   // is only meaningful if a misplaced alias would let CORS answer 204.
   CORS_ORIGIN: "https://app.example.com",
   WMP_RATE_LIMIT_SCALE: 1,
-  TRUST_PROXY_HOPS: undefined,
+  TRUST_PROXY_HOPS: 0,
   MEDIA_MAX_UPLOAD_BYTES: 5 * 1024 * 1024,
   MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES: 1024 * 1024,
   WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: false,
@@ -808,5 +808,44 @@ describe("createApp registration contract — human procedures need the CSRF hea
     });
     // Not refused for CSRF: the procedure's own access check answers (no caller).
     expect(res.status).toBe(401);
+  });
+});
+
+describe("Better Auth sees only the resolved client IP", () => {
+  async function seenForwardedFor(path: string, hops: number, xff: string) {
+    const seen: Array<string | null> = [];
+    envMock.TRUST_PROXY_HOPS = hops;
+    try {
+      const { app } = await createApp({
+        auth: {
+          handler: async (request: Request) => {
+            seen.push(request.headers.get("x-forwarded-for"));
+            return new Response(null, { status: 204 });
+          },
+        },
+      });
+      await app.request(`${BASE}${path}`, {
+        headers: { ...HOST, "x-forwarded-for": xff, "x-real-ip": "203.0.113.50" },
+      });
+    } finally {
+      envMock.TRUST_PROXY_HOPS = 0;
+    }
+    return seen;
+  }
+
+  it("rewrites X-Forwarded-For on /api/auth/* to the TRUST_PROXY_HOPS client IP", async () => {
+    // Better Auth trusts a single-entry X-Forwarded-For verbatim for its own
+    // rate limiter, so a direct client must not reach it with a header it chose.
+    expect(await seenForwardedFor("/api/auth/ok", 0, "203.0.113.1")).toEqual(["10.0.0.1"]);
+    expect(await seenForwardedFor("/api/auth/ok", 1, "203.0.113.1, 198.51.100.7")).toEqual([
+      "198.51.100.7",
+    ]);
+  });
+
+  it("gives the MCP discovery forwards the resolved client IP too", async () => {
+    envMock.WMP_MCP_ENABLED = true;
+    const alias = ROOT_ALIASES[0];
+    if (!alias) throw new Error("no root discovery alias");
+    expect(await seenForwardedFor(alias, 1, "203.0.113.1, 198.51.100.7")).toEqual(["198.51.100.7"]);
   });
 });

@@ -33,8 +33,7 @@
 //! S fail-if-exists. Link publication is link-first when the probe alias and the
 //! held source fd are the same object (stable inodes, including Linux NFS): link
 //! S onto `to`, then capture S. noino/sshfs present a different inode per name
-//! and keep vacate-first. Direct NR plain rename (including supervised macOS
-//! files) prepares R and a durable pending-effect fence. Directories use NR only, never overwrite, and resolved
+//! and keep vacate-first. Direct NR plain rename prepares R and a durable pending-effect fence. Directories use NR only, never overwrite, and resolved
 //! own-subtree requests refuse invalid_input. A direct Move that returns EINVAL
 //! while NR works inside R is a rejected destination name (`invalid_input`),
 //! not a missing capability, and captures nothing.

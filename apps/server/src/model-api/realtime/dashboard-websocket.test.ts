@@ -7,7 +7,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     BETTER_AUTH_URL: "https://proxy.example.test",
     WMP_RATE_LIMIT_SCALE: 1,
-    TRUST_PROXY_HOPS: undefined,
+    TRUST_PROXY_HOPS: 0,
   },
 }));
 

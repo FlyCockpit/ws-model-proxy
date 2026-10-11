@@ -10,6 +10,10 @@ interface SendEmailOptions {
 
 let transporter: Transporter | null = null;
 
+export const SMTP_CONNECTION_TIMEOUT_MS = 10_000;
+export const SMTP_GREETING_TIMEOUT_MS = 10_000;
+export const SMTP_SOCKET_TIMEOUT_MS = 20_000;
+
 function getTransporter(): Transporter {
   if (transporter) return transporter;
 
@@ -25,6 +29,11 @@ function getTransporter(): Transporter {
   transporter = nodemailer.createTransport({
     host: SMTP_HOST,
     port: SMTP_PORT ?? 587,
+    // Bounded waits so a hung SMTP server cannot hold a send (and its retries) open for
+    // minutes: nodemailer's defaults are 2 min to connect and 10 min of socket inactivity.
+    connectionTimeout: SMTP_CONNECTION_TIMEOUT_MS,
+    greetingTimeout: SMTP_GREETING_TIMEOUT_MS,
+    socketTimeout: SMTP_SOCKET_TIMEOUT_MS,
     ...(SMTP_USER && SMTP_PASS ? { auth: { user: SMTP_USER, pass: SMTP_PASS } } : {}),
   });
 
@@ -106,6 +115,11 @@ export {
   type RenderNeedsYouArgs,
   renderNeedsYou,
 } from "./templates/needs-you.js";
+export {
+  type RenderResetPasswordArgs,
+  type RenderResetPasswordResult,
+  renderResetPassword,
+} from "./templates/reset-password.js";
 export {
   type RenderShareInviteArgs,
   type RenderShareInviteResult,

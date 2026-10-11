@@ -23,7 +23,6 @@ mod misc;
 mod read_grant;
 mod read_tests;
 mod resolve_policy;
-mod supervised;
 mod tools;
 
 pub struct Fx {

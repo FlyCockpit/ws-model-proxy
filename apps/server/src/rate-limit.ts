@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isIP, SocketAddress } from "node:net";
 import type { Session } from "@ws-model-proxy/auth";
 import { env } from "@ws-model-proxy/env/server";
 import type { Context, Next } from "hono";
@@ -33,6 +34,11 @@ export const DEFAULTS = {
   signinFailure: { points: 10, duration: 15 * 60, blockDuration: 10 * 60 },
   signup: { points: 3, duration: 60 * 60, blockDuration: 60 * 60 },
   emailRecipient: { points: 3, duration: 60 * 60, blockDuration: 0 },
+  /**
+   * `/api/auth/request-password-reset` per client (IPv4 address, IPv6 /64), on top of Better
+   * Auth's own limit for this route (same budget, keyed by single address).
+   */
+  passwordResetRequest: { points: 3, duration: 60 },
   signupRecipient: { points: 6, duration: 60 * 60, blockDuration: 0 },
   mcp: { points: 120, duration: 60 },
   mcpConsent: { points: 30, duration: 60 },
@@ -275,6 +281,72 @@ export const emailRecipientLimiter = new RateLimiterMemory({
   duration: DEFAULTS.emailRecipient.duration,
   blockDuration: DEFAULTS.emailRecipient.blockDuration,
 });
+
+/**
+ * Password-reset requests per client, keyed by `clientNetworkKey` (IPv6 by /64, so rotating
+ * addresses inside one allocation share a budget). See `DEFAULTS.passwordResetRequest`.
+ */
+export const passwordResetRequestLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:pw-reset",
+  points: scaledPoints(DEFAULTS.passwordResetRequest.points),
+  duration: DEFAULTS.passwordResetRequest.duration,
+});
+
+/**
+ * A client IP as a rate-limit key: an IPv4 address as is; an IPv6 address by its /64 prefix
+ * (one subscriber allocation) in canonical form, so every spelling of one network shares a key;
+ * an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, any spelling) as its IPv4 address. A zone id
+ * (`%eth0`) is dropped. Anything that is not an IP (e.g. "unknown") is returned unchanged.
+ *
+ * Validation and canonicalization are Node's (`SocketAddress.parse`, inet_ntop form); only the
+ * canonical text is expanded here.
+ */
+export function clientNetworkKey(ip: string): string {
+  if (isIP(ip) === 4) return ip;
+  const bare = ip.split("%")[0] ?? "";
+  if (isIP(bare) !== 6) return ip;
+  const canonical = SocketAddress.parse(`[${bare}]:0`)?.address;
+  if (!canonical) return ip;
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(canonical);
+  if (mapped?.[1]) return mapped[1];
+  const groups = expandIpv6(canonical);
+  if (!groups) return ip;
+  return `${groups
+    .slice(0, 4)
+    .map((group) => group.toString(16))
+    .join(":")}::/64`;
+}
+
+/** The eight 16-bit groups of a valid IPv6 text; a dotted IPv4 tail counts as two groups. */
+function expandIpv6(text: string): number[] | null {
+  let rest = text;
+  const tail: number[] = [];
+  const dotted = /^(.*:)(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(rest);
+  if (dotted) {
+    const [a, b, c, d] = dotted.slice(2, 6).map(Number) as [number, number, number, number];
+    tail.push((a << 8) | b, (c << 8) | d);
+    rest = dotted[1] ?? "";
+    if (!rest.endsWith("::")) rest = rest.slice(0, -1);
+  }
+  const hex = (part: string) =>
+    part === "" ? [] : part.split(":").map((g) => Number.parseInt(g, 16));
+  const halves = rest.split("::");
+  let groups: number[];
+  if (halves.length === 1) {
+    groups = [...hex(rest), ...tail];
+  } else {
+    const head = hex(halves[0] ?? "");
+    const back = [...hex(halves[1] ?? ""), ...tail];
+    groups = [
+      ...head,
+      ...Array<number>(Math.max(0, 8 - head.length - back.length)).fill(0),
+      ...back,
+    ];
+  }
+  return groups.length === 8 && groups.every((g) => Number.isInteger(g) && g >= 0 && g <= 0xffff)
+    ? groups
+    : null;
+}
 
 /**
  * Same idea as `emailRecipientLimiter`, for `/api/auth/sign-up/email`.

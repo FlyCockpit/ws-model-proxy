@@ -302,6 +302,18 @@ export function SignInCard({ lang, mode, redirectTo, mcpDescription }: SignInCar
             onNeeds2FA={() => setNeeds2FA(true)}
             resolveOutcome={resolveOutcome}
           />
+          {/* Reset by email exists only when SMTP is configured (no mail, no link). */}
+          {emailEnabled && (
+            <div className="text-center">
+              <Link
+                to="/$lang/forgot-password"
+                params={{ lang }}
+                className={cn(buttonVariants({ variant: "link" }), "min-h-[44px]")}
+              >
+                {t("auth:login.forgotPassword")}
+              </Link>
+            </div>
+          )}
           {mode === "standard" && signupEnabled && (
             <div className="text-center">
               <Link

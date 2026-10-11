@@ -14,7 +14,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     BETTER_AUTH_SECRET: "parity-test-secret-at-least-thirty-two-characters",
     CORS_ORIGIN: undefined,
     WMP_RATE_LIMIT_SCALE: 1,
-    TRUST_PROXY_HOPS: undefined,
+    TRUST_PROXY_HOPS: 0,
   },
 }));
 

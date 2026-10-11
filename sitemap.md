@@ -17,9 +17,11 @@ and `/llms.txt` (the locale root); auth and MCP routes are intentionally exclude
 |------|-------------|
 | `/` | Redirects to `/{lang}`. |
 | `/{lang}/` | Landing. Signed-in people go to Overview (or Get started until onboarding is done). |
-| `/{lang}/login` | Sign in (email/password, optional two-factor). |
+| `/{lang}/login` | Sign in (email/password, optional two-factor; "Forgot password?" when SMTP is configured). |
 | `/{lang}/signup` | Sign up. The first account becomes admin; later accounts follow the sign-up setting. |
 | `/{lang}/verify-email` | Verify email (only when SMTP is configured). |
+| `/{lang}/forgot-password` | Request a password-reset link by email (signed-out only; reset needs SMTP, otherwise the page says so). Always answers "if an account exists, we sent a link". |
+| `/{lang}/reset-password` | Landing page for the emailed reset link (`?token=` or `?error=INVALID_TOKEN`): new password and confirmation, invalid/expired link offers a new one; success goes to sign in and signs the account out everywhere. |
 | `/{lang}/mcp-login` | Agent sign-in for OAuth (feature-gated by `WMP_MCP_ENABLED`; not in SEO). |
 | `/{lang}/mcp-consent` | Agent consent: Read-only (default) or Full (offered when the agent asks for `mcp:write`), what Full allows (commands and files on Full-control nodes), and the client's redirect host (feature-gated; not in SEO). |
 
@@ -91,7 +93,7 @@ Gated by the `admin` layout; non-admins see a 404.
 - Mobile: the existing `BottomNav` with Overview · Models · Pools · Runtimes · More (sheet with the
   rest, Needs-you badge on More).
 
-42 pages: 6 public (plus the `/` redirect), 32 signed-in, 4 admin.
+45 pages: 8 public (plus the `/` redirect), 33 signed-in (plus the `/access` redirect), 4 admin.
 
 
 ## Notes

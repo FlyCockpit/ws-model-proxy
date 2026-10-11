@@ -27,7 +27,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     BETTER_AUTH_SECRET: "parity-test-secret-at-least-thirty-two-characters",
     CORS_ORIGIN: undefined,
     WMP_RATE_LIMIT_SCALE: 1,
-    TRUST_PROXY_HOPS: undefined,
+    TRUST_PROXY_HOPS: 0,
   },
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: { mcpGrant: grants } }));
@@ -216,7 +216,7 @@ describe("key builders", () => {
     const app = new Hono();
     app.get("/", (c) => c.text(mcpOauthIpKey(c)));
     const res = await app.request(`${BASE}/`, { headers: { "x-forwarded-for": "203.0.113.9" } });
-    // Bare public socket peer: X-Forwarded-For is ignored, key is the peer.
+    // TRUST_PROXY_HOPS=0: X-Forwarded-For is ignored, key is the socket peer.
     expect(await res.text()).toBe("mcp:oauth:ip:198.51.100.7");
   });
 

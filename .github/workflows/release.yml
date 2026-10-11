@@ -59,6 +59,17 @@ jobs:
             exit 1
           fi
 
+          server_version="$(sed -n 's/^export const SERVER_VERSION = "\(.*\)";/\1/p' apps/server/src/version.ts)"
+          if [ "$server_version" != "$version" ]; then
+            echo "::error::SERVER_VERSION in apps/server/src/version.ts is $server_version, expected $version."
+            exit 1
+          fi
+
+          if ! grep -qx 'export const CLI_RELEASE_BINARIES_BY_DEFAULT = true;' apps/server/src/node-http.ts; then
+            echo "::error::Set CLI_RELEASE_BINARIES_BY_DEFAULT = true in apps/server/src/node-http.ts before releasing, or nodes keep building the preview branch (apps/cli/docs/releasing.md)."
+            exit 1
+          fi
+
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
 
           {

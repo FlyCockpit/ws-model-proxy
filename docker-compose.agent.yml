@@ -101,6 +101,8 @@ services:
       DATABASE_URL: postgresql://postgres:password@postgres:5432/ws-model-proxy
       BETTER_AUTH_URL: http://localhost:${WEB_PORT:-3001}
       SERVER_PORT: "3000"
+      # The browser reaches the container through the published port, no proxy.
+      TRUST_PROXY_HOPS: "0"
       APPLY_SCHEMA: safe
     ports:
       - "${BIND_ADDR:-127.0.0.1}:${WEB_PORT:-3001}:3000"

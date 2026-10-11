@@ -38,6 +38,25 @@ describe("request-log redaction (OAuth query stripping)", () => {
     expect(stripsOAuthQuery("/xx-XX/signup")).toBe(false);
   });
 
+  it("strips the reset-password page query (the reset link redirect carries its token) for every locale", () => {
+    expect(stripsOAuthQuery("/en-US/reset-password")).toBe(true);
+    expect(stripsOAuthQuery("/es-MX/reset-password")).toBe(true);
+    expect(stripsOAuthQuery("/en-US/reset-password/")).toBe(true);
+    expect(stripsOAuthQuery("/en-US/reset-passwordish")).toBe(false);
+  });
+
+  it("strips the reset-password page query for a missing or unsupported locale, any case", () => {
+    // These reach the logger before the locale guard redirects them, query kept.
+    expect(stripsOAuthQuery("/reset-password")).toBe(true);
+    expect(stripsOAuthQuery("/reset-password/")).toBe(true);
+    expect(stripsOAuthQuery("/fr-FR/reset-password")).toBe(true);
+    expect(stripsOAuthQuery("/xx-XX/reset-password")).toBe(true);
+    expect(stripsOAuthQuery("/EN-us/Reset-Password")).toBe(true);
+    expect(stripsOAuthQuery("/RESET-PASSWORD")).toBe(true);
+    expect(stripsOAuthQuery("/a/b/reset-password")).toBe(false);
+    expect(stripsOAuthQuery("/en-US/reset-password/x")).toBe(false);
+  });
+
   it("flags exactly the /api/auth/oauth2/ prefix family", () => {
     expect(stripsOAuthQuery("/api/auth/oauth2/authorize")).toBe(true);
     expect(stripsOAuthQuery("/api/auth/oauth2/token")).toBe(true);
@@ -116,6 +135,47 @@ describe("request-log redaction (OAuth query stripping)", () => {
       }
       logSpy.mockClear();
     }
+  });
+
+  it("logger wrapper: reset-password pages under any or no locale never log the token, even on the locale redirect", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const app = new Hono<{ Variables: { requestId: string } }>();
+    app.use("/*", async (c, next) => {
+      if (stripsOAuthQuery(c.req.path)) {
+        const start = Date.now();
+        await next();
+        console.log(
+          oauthRequestLogLine({
+            requestId: "ab12cd34",
+            method: c.req.method,
+            path: c.req.path,
+            status: c.res.status,
+            elapsedMs: Date.now() - start,
+          }),
+        );
+        return;
+      }
+      await next();
+      console.log(`stock ${c.req.url}`);
+    });
+    // The web locale guard redirects an unknown or missing locale, query kept.
+    app.get("*", (c) => c.redirect(`/en-US/reset-password?${new URL(c.req.url).search.slice(1)}`));
+    for (const page of [
+      "/reset-password",
+      "/fr-FR/reset-password",
+      "/en-US/reset-password",
+      "/EN-US/Reset-Password/",
+    ]) {
+      await app.request(`${page}?token=RSTSECRET123`);
+      const lines = logSpy.mock.calls.flat().map(String);
+      expect(lines.some((l) => l.includes(page))).toBe(true);
+      for (const line of lines) {
+        expect(line).not.toContain("RSTSECRET123");
+        expect(line).not.toContain("token=");
+      }
+      logSpy.mockClear();
+    }
+    logSpy.mockRestore();
   });
 
   it("strips the /mcp endpoint (L20 reopen, F2: exact + trailing-slash; near-misses keep stock)", () => {

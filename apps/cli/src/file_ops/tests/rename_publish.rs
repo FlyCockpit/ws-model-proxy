@@ -1,7 +1,6 @@
 //! #172 rename transaction tables. All races are actual saves at deterministic
 //! seams; Linux and macOS execute the same rows (FUSE evidence is Linux-only).
 use super::*;
-use crate::file_ops::mutate::RenameAtomicCapability;
 
 #[derive(Clone, Copy, Debug)]
 enum Shape {
@@ -112,22 +111,10 @@ fn setup(fx: &Fx, object: Object, overwrite: bool) -> Option<String> {
         None
     }
 }
-fn rename_run(fx: &Fx, overwrite: bool, etag: Option<&str>, supervised: bool) -> FileResult<Value> {
+fn rename_run(fx: &Fx, overwrite: bool, etag: Option<&str>) -> FileResult<Value> {
     let input =
         json!({"from":fx.p("src"), "to":fx.p("dst"), "overwrite":overwrite,"expectedEtag":etag});
-    if supervised {
-        let prepared = fx.ops.prepare_supervised(
-            "rename",
-            input,
-            None,
-            &crate::file_ops::EtagKey::from_bytes([19; 32]),
-            &fx.cancel,
-        )?;
-        assert!(prepared.child_input().blocked.is_none());
-        fx.ops.execute_supervised(prepared, &fx.cancel)
-    } else {
-        fx.ops.execute("rename", input, &fx.cancel)
-    }
+    fx.ops.execute("rename", input, &fx.cancel)
 }
 fn inventory(fx: &Fx, value: &Value) -> Vec<PathBuf> {
     let mut paths = vec![fx.root.join("src"), fx.root.join("dst")];
@@ -151,31 +138,28 @@ fn error_inventory(fx: &Fx, error: &FileError) -> Vec<PathBuf> {
 }
 
 #[test]
-fn rename_clean_shapes_kinds_supervision_and_third_links() {
+fn rename_clean_shapes_kinds_and_third_links() {
     for object in OBJECTS {
         for shape in [Shape::Exchange, Shape::Nr, Shape::Link, Shape::None] {
             for overwrite in [false, true] {
-                for supervised in [false, true] {
-                    let fx = Fx::new();
-                    let etag = setup(&fx, object, overwrite);
-                    let before = snapshot(&fx.root);
-                    let _scope = FaultScope::new(&shape.faults(overwrite));
-                    let result = rename_run(&fx, overwrite, etag.as_deref(), supervised);
-                    if matches!(shape, Shape::None) {
-                        assert_eq!(result.unwrap_err().code, ErrorCode::UnsafeFilesystem);
-                        assert_eq!(snapshot(&fx.root), before);
-                        assert_eq!(count(&FaultScope::calls(), Primitive::Capture), 0);
-                    } else {
-                        let value = result.unwrap_or_else(|e| {
-                            panic!("{shape:?}/{object:?}/{overwrite}/{supervised}: {e:?}")
-                        });
-                        assert!(value.get("recovered").is_none(), "{value}");
-                        assert_eq!(object.bytes(&fx.root.join("dst")).as_deref(), Some(SOURCE));
-                        assert!(std::fs::symlink_metadata(fx.root.join("src")).is_err());
-                        assert_eq!(value["etag"], object.tag(&fx, "dst"));
-                    }
-                    clean(&fx);
+                let fx = Fx::new();
+                let etag = setup(&fx, object, overwrite);
+                let before = snapshot(&fx.root);
+                let _scope = FaultScope::new(&shape.faults(overwrite));
+                let result = rename_run(&fx, overwrite, etag.as_deref());
+                if matches!(shape, Shape::None) {
+                    assert_eq!(result.unwrap_err().code, ErrorCode::UnsafeFilesystem);
+                    assert_eq!(snapshot(&fx.root), before);
+                    assert_eq!(count(&FaultScope::calls(), Primitive::Capture), 0);
+                } else {
+                    let value = result
+                        .unwrap_or_else(|e| panic!("{shape:?}/{object:?}/{overwrite}: {e:?}"));
+                    assert!(value.get("recovered").is_none(), "{value}");
+                    assert_eq!(object.bytes(&fx.root.join("dst")).as_deref(), Some(SOURCE));
+                    assert!(std::fs::symlink_metadata(fx.root.join("src")).is_err());
+                    assert_eq!(value["etag"], object.tag(&fx, "dst"));
                 }
+                clean(&fx);
             }
         }
     }
@@ -185,7 +169,7 @@ fn rename_clean_shapes_kinds_supervision_and_third_links() {
         std::fs::hard_link(fx.root.join("src"), fx.root.join("third")).unwrap();
         let _scope = FaultScope::new(&Shape::Link.faults(overwrite));
         assert!(
-            rename_run(&fx, overwrite, etag.as_deref(), false)
+            rename_run(&fx, overwrite, etag.as_deref())
                 .unwrap()
                 .get("recovered")
                 .is_none()
@@ -266,7 +250,7 @@ fn rename_preflight_errno_and_actual_object_table() {
                 faults.retain(|(p, n, _)| (*p, *n) != (primitive, nth));
                 faults.push((primitive, nth, errno));
                 let _scope = FaultScope::new(&faults);
-                let error = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap_err();
+                let error = rename_run(&fx, overwrite, etag.as_deref()).unwrap_err();
                 assert_eq!(
                     error.code, expected,
                     "{overwrite}/{object:?}/{primitive:?}/{nth}/{errno}"
@@ -297,7 +281,7 @@ fn rename_preflight_errno_and_actual_object_table() {
             Ok(())
         });
         let _scope = FaultScope::new(&Shape::Link.faults(true));
-        rename_run(&fx, true, etag.as_deref(), false).unwrap();
+        rename_run(&fx, true, etag.as_deref()).unwrap();
         assert_eq!(*probes.lock().unwrap(), [SOURCE, DESTINATION]);
         clean(&fx);
     }
@@ -314,9 +298,7 @@ fn rename_preflight_errno_and_actual_object_table() {
         let before = snapshot(&fx.root);
         let _scope = FaultScope::new(&[(Primitive::ProbeExchange, 1, errno)]);
         assert_eq!(
-            rename_run(&fx, true, etag.as_deref(), false)
-                .unwrap_err()
-                .code,
+            rename_run(&fx, true, etag.as_deref()).unwrap_err().code,
             ErrorCode::IoError
         );
         assert_eq!(snapshot(&fx.root), before);
@@ -342,7 +324,7 @@ fn rename_preflight_errno_and_actual_object_table() {
                 faults.retain(|(p, n, _)| (*p, *n) != (primitive, 1));
                 faults.push((primitive, 1, errno));
                 let _scope = FaultScope::new(&faults);
-                let result = rename_run(&fx, true, etag.as_deref(), false);
+                let result = rename_run(&fx, true, etag.as_deref());
                 if primitive == Primitive::ProbeLink {
                     assert_eq!(result.unwrap_err().code, ErrorCode::UnsafeFilesystem);
                     assert_eq!(snapshot(&fx.root), before);
@@ -392,7 +374,7 @@ fn rename_noncommit_paths_never_dispose_the_user_source() {
                     vec![]
                 };
                 let _scope = FaultScope::with_after_effects(&faults, &effects);
-                let error = rename_run(&fx, true, etag.as_deref(), false).unwrap_err();
+                let error = rename_run(&fx, true, etag.as_deref()).unwrap_err();
                 let paths = error_inventory(&fx, &error);
                 assert!(
                     object.kept(&paths, SOURCE),
@@ -689,7 +671,7 @@ fn rename_races_restore_origins_preserve_creates_and_do_not_chase_commits() {
                         }
                         let fx = race_hook(fx, object, overwrite, race, destabilize);
                         let _scope = FaultScope::new(&faults);
-                        let result = rename_run(&fx, overwrite, etag.as_deref(), false);
+                        let result = rename_run(&fx, overwrite, etag.as_deref());
                         assert_race(
                             &fx,
                             object,
@@ -765,7 +747,7 @@ fn rename_cancel_and_hook_errors_at_every_transaction_seam() {
                             faults.push((Primitive::Move, 1, Errno::ENOSYS));
                         }
                         let _scope = FaultScope::new(&faults);
-                        let result = rename_run(&fx, overwrite, etag.as_deref(), false);
+                        let result = rename_run(&fx, overwrite, etag.as_deref());
                         if matches!(seam, Step::Vacating | Step::LinkProbed) {
                             assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled);
                             assert_eq!(snapshot(&fx.root), before);
@@ -792,7 +774,7 @@ fn rename_reply_loss_nr_commits_link_keeps_and_restore_never_overwrites() {
             let etag = setup(&fx, Object::File, true);
             let _scope =
                 FaultScope::with_after_effects(&shape.faults(true), &[(shape.publish(), 1, errno)]);
-            let result = rename_run(&fx, true, etag.as_deref(), false);
+            let result = rename_run(&fx, true, etag.as_deref());
             // Lost publish reply: NR reconciles the transferred dentry, and a
             // stable-inode link commits when `to` presents the held source.
             let value = result.unwrap_or_else(|error| panic!("{shape:?} {errno:?}: {error:?}"));
@@ -822,7 +804,7 @@ fn rename_reply_loss_nr_commits_link_keeps_and_restore_never_overwrites() {
                 vec![]
             };
             let _scope = FaultScope::with_after_effects(&faults, &effects);
-            let e = rename_run(&fx, true, etag.as_deref(), false).unwrap_err();
+            let e = rename_run(&fx, true, etag.as_deref()).unwrap_err();
             let paths = error_inventory(&fx, &e);
             assert!(has_bytes(&paths, SOURCE));
             assert!(has_bytes(&paths, DESTINATION));
@@ -852,7 +834,7 @@ fn rename_plain_link_reply_loss_reports_the_published_name() {
                     &Shape::Link.faults(false),
                     &[(Shape::Link.publish(), 1, errno)],
                 );
-                let result = rename_run(&fx, false, etag.as_deref(), false);
+                let result = rename_run(&fx, false, etag.as_deref());
                 if destabilize {
                     let error = result.unwrap_err();
                     let paths = kept(&error);
@@ -899,7 +881,7 @@ fn rename_cleanup_failures_report_alias_and_destination_after_known_commit() {
                 Ok(())
             });
             let _scope = FaultScope::new(&shape.faults(true));
-            let value = rename_run(&fx, true, etag.as_deref(), false).unwrap();
+            let value = rename_run(&fx, true, etag.as_deref()).unwrap();
             assert!(has_bytes(&result_paths(&value), RACER));
             assert_eq!(fx.get("dst"), SOURCE);
         }
@@ -969,11 +951,9 @@ fn rename_directories_subtree_and_macos_direct_nr_inverse() {
     }
     let fx = Fx::new();
     let etag = setup(&fx, Object::File, false);
-    fx.ops
-        .set_rename_atomic_capability(RenameAtomicCapability::LinksAndExchange);
     let _scope = FaultScope::new(&[]);
     assert!(
-        rename_run(&fx, false, etag.as_deref(), true)
+        rename_run(&fx, false, etag.as_deref())
             .unwrap()
             .get("recovered")
             .is_none()
@@ -1007,7 +987,7 @@ fn rename_link_etag_rejects_a_later_save_and_exposure_keeps_last_alias() {
                 Ok(())
             });
             let _scope = FaultScope::new(&Shape::Link.faults(overwrite));
-            let value = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap();
+            let value = rename_run(&fx, overwrite, etag.as_deref()).unwrap();
             assert!(
                 value["etag"].is_null(),
                 "D3 must not hand out racer's edit authority"
@@ -1038,7 +1018,7 @@ pub(super) fn real_cached_rows(directory: &Path) {
         for overwrite in [false, true] {
             let fx = real_fixture(directory);
             let etag = setup(&fx, object, overwrite);
-            let value = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap();
+            let value = rename_run(&fx, overwrite, etag.as_deref()).unwrap();
             assert!(
                 value.get("recovered").is_none(),
                 "{object:?} overwrite={overwrite}: a clean rename must leave nothing: {value}"
@@ -1077,7 +1057,7 @@ pub(super) fn real_cached_rows(directory: &Path) {
             )
             .unwrap();
             let etag = object.tag(&fx, "dst");
-            let result = rename_run(&fx, true, Some(&etag), false);
+            let result = rename_run(&fx, true, Some(&etag));
             let expected = if matches!(object, Object::File) && save {
                 format!("{SOURCE}+WRITER")
             } else {
@@ -1109,7 +1089,7 @@ pub(super) fn real_rename_rows(directory: &Path, class: RealClass) {
             let fx = real_fixture(directory);
             let etag = setup(&fx, object, overwrite);
             let before = snapshot(&fx.root);
-            let result = rename_run(&fx, overwrite, etag.as_deref(), false);
+            let result = rename_run(&fx, overwrite, etag.as_deref());
             if !class.nr && !class.link {
                 assert_eq!(result.unwrap_err().code, ErrorCode::UnsafeFilesystem);
                 assert_eq!(snapshot(&fx.root), before);
@@ -1151,7 +1131,7 @@ pub(super) fn real_rename_rows(directory: &Path, class: RealClass) {
                     vec![]
                 };
                 let _scope = FaultScope::new(&faults);
-                let result = rename_run(&fx, overwrite, etag.as_deref(), false);
+                let result = rename_run(&fx, overwrite, etag.as_deref());
                 assert_race(
                     &fx,
                     object,
@@ -1203,7 +1183,7 @@ pub(super) fn real_rename_rows(directory: &Path, class: RealClass) {
         fx.put("src", SOURCE);
         std::fs::hard_link(fx.root.join("src"), fx.root.join("dst")).unwrap();
         let tag = fx.etag("dst");
-        let value = rename_run(&fx, true, Some(&tag), false).unwrap();
+        let value = rename_run(&fx, true, Some(&tag)).unwrap();
         assert_eq!(fx.get("dst"), SOURCE);
         assert!(value.get("recovered").is_none());
         clean(&fx);
@@ -1226,7 +1206,7 @@ pub(super) fn real_rename_rows(directory: &Path, class: RealClass) {
                 }
                 Ok(())
             });
-            let value = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap();
+            let value = rename_run(&fx, overwrite, etag.as_deref()).unwrap();
             assert!(value["etag"].is_null());
             assert_eq!(fx.get("dst"), RACER);
             if class.counts {
@@ -1256,7 +1236,7 @@ fn rename_double_observation_and_unheld_failures_keep_data() {
                     continue;
                 } // D does not exist
                 let _scope = FaultScope::new(&faults);
-                let error = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap_err();
+                let error = rename_run(&fx, overwrite, etag.as_deref()).unwrap_err();
                 assert_eq!(error.code, ErrorCode::IoError);
                 assert_eq!(error.message, "EMFILE");
                 assert_eq!(snapshot(&fx.root), before);
@@ -1289,7 +1269,7 @@ fn rename_double_observation_and_unheld_failures_keep_data() {
             Ok(())
         });
         let _outer = FaultScope::new(&Shape::Link.faults(true));
-        let error = rename_run(&fx, true, etag.as_deref(), false).unwrap_err();
+        let error = rename_run(&fx, true, etag.as_deref()).unwrap_err();
         assert!(once.load(Ordering::SeqCst));
         let paths = error_inventory(&fx, &error);
         assert!(has_bytes(&paths, SOURCE));
@@ -1412,7 +1392,7 @@ fn rename_failed_link_count_read_keeps_the_alias_and_reports_it() {
                 let fx = Fx::new();
                 let etag = setup(&fx, object, overwrite);
                 let _scope = FaultScope::new(&Shape::Link.faults(overwrite));
-                let value = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap();
+                let value = rename_run(&fx, overwrite, etag.as_deref()).unwrap();
                 assert!(value.get("recovered").is_none(), "{object:?}: {value}");
                 count(&FaultScope::calls(), Primitive::LinkCount)
             };
@@ -1426,7 +1406,7 @@ fn rename_failed_link_count_read_keeps_the_alias_and_reports_it() {
                 let mut faults = Shape::Link.faults(overwrite);
                 faults.push((Primitive::LinkCount, nth, Errno::EIO));
                 let _scope = FaultScope::new(&faults);
-                match rename_run(&fx, overwrite, etag.as_deref(), false) {
+                match rename_run(&fx, overwrite, etag.as_deref()) {
                     Ok(value) => {
                         // Success: the published name holds the source; any private
                         // alias the unknown count kept is reported, with its bytes.
@@ -1613,7 +1593,7 @@ fn rename_failed_destination_capture_releases_source_before_restore_alias_unlink
             } Ok(())
         });
         let _scope = FaultScope::new(&Shape::Link.faults(true));
-        let error = rename_run(&fx, true, etag.as_deref(), false).unwrap_err();
+        let error = rename_run(&fx, true, etag.as_deref()).unwrap_err();
         let paths = error_inventory(&fx, &error);
         assert!(has_bytes(&paths, SOURCE));
         assert!(has_bytes(&paths, DESTINATION));
@@ -1672,7 +1652,7 @@ fn rename_destination_mismatch_closes_source_proof_before_restore_unlink() {
         Ok(())
     });
     let _scope = FaultScope::new(&Shape::Link.faults(true));
-    let result = rename_run(&fx, true, etag.as_deref(), false);
+    let result = rename_run(&fx, true, etag.as_deref());
     let error = result.unwrap_err();
     // Nothing is lost: the source bytes are back at their origin or reported.
     assert!(
@@ -1700,8 +1680,6 @@ fn rename_shared_case_alias_origin_is_restored_as_gone() {
                     make_parents: None,
                     policy: &fx.ops.policy,
                     access: Access::Remove,
-                    preview_missing: false,
-                    pin: None,
                     cancel: None,
                 },
             )
@@ -1798,7 +1776,7 @@ fn rename_each_link_alias_disposal_keeps_a_last_name() {
                 Ok(())
             });
             let _scope = FaultScope::new(&Shape::Link.faults(true));
-            let result = rename_run(&fx, true, etag.as_deref(), false);
+            let result = rename_run(&fx, true, etag.as_deref());
             if site == "publish" {
                 let value = result.unwrap();
                 assert!(object.kept(&result_paths(&value), SOURCE));
@@ -1854,8 +1832,6 @@ fn rename_true_alias_pair_with_a_post_publication_save_keeps_the_object() {
                         make_parents: None,
                         policy: &fx.ops.policy,
                         access: Access::Remove,
-                        preview_missing: false,
-                        pin: None,
                         cancel: None,
                     },
                 )
@@ -1931,8 +1907,6 @@ fn rename_prepare_error_exit_closes_the_destination_proof_before_the_restore_unl
                 make_parents: None,
                 policy: &fx.ops.policy,
                 access: Access::Remove,
-                preview_missing: false,
-                pin: None,
                 cancel: None,
             },
         )
@@ -2025,8 +1999,6 @@ fn rename_true_alias_pair_closes_both_private_proofs_before_committed_unlinks() 
                         make_parents: None,
                         policy: &fx.ops.policy,
                         access: Access::Remove,
-                        preview_missing: false,
-                        pin: None,
                         cancel: None,
                     },
                 )
@@ -2117,7 +2089,7 @@ fn rename_link_order_follows_probe_inode_stability() {
                 Ok(())
             });
             let _scope = FaultScope::new(&Shape::Link.faults(overwrite));
-            let value = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap();
+            let value = rename_run(&fx, overwrite, etag.as_deref()).unwrap();
             assert!(value.get("recovered").is_none(), "{value}");
             let calls = FaultScope::calls();
             let publish_at = calls
@@ -2149,7 +2121,7 @@ fn rename_intent_remains_when_destination_capture_fails_before_publish() {
     let mut faults = Shape::Link.faults(true);
     faults.retain(|(primitive, _, _)| *primitive != Primitive::Capture);
     let _scope = FaultScope::with_after_effects(&faults, &[(Primitive::Capture, 1, Errno::EIO)]);
-    let error = rename_run(&fx, true, etag.as_deref(), false).unwrap_err();
+    let error = rename_run(&fx, true, etag.as_deref()).unwrap_err();
     assert_eq!(error.code, ErrorCode::UncertainOutcome);
     assert_eq!(count(&FaultScope::calls(), Primitive::PublishLink), 0);
     assert_eq!(fx.get("src"), SOURCE);
@@ -2207,7 +2179,7 @@ fn rename_link_first_source_capture_failure_after_publish_keeps_commit() {
         });
         faults.push((Primitive::Capture, capture_nth, Errno::EIO));
         let _scope = FaultScope::new(&faults);
-        let error = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap_err();
+        let error = rename_run(&fx, overwrite, etag.as_deref()).unwrap_err();
         assert_eq!(
             error.code,
             ErrorCode::UncertainOutcome,
@@ -2266,7 +2238,7 @@ fn rename_exchange_first_writes_versioned_intent() {
         }
         Ok(())
     });
-    let value = rename_run(&fx, true, etag.as_deref(), false).unwrap();
+    let value = rename_run(&fx, true, etag.as_deref()).unwrap();
     assert!(value.get("recovered").is_none(), "{value}");
     let intent = seen.lock().unwrap().clone().expect("INTENT at exchange");
     assert_eq!(intent["version"], 3);
@@ -2294,7 +2266,7 @@ fn rename_rejected_destination_name_is_invalid_input_before_capture() {
             faults.push((Primitive::ProbeExchange, 1, Errno::EINVAL));
         }
         let _scope = FaultScope::new(&faults);
-        let error = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap_err();
+        let error = rename_run(&fx, overwrite, etag.as_deref()).unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidInput, "{overwrite} {error:?}");
         assert_eq!(count(&FaultScope::calls(), Primitive::Capture), 0);
         assert_eq!(snapshot(&fx.root), before);

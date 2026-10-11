@@ -45,7 +45,7 @@ const envMock = vi.hoisted(() => ({
   BETTER_AUTH_SECRET: "contract-test-secret-at-least-thirty-two-characters",
   CORS_ORIGIN: "https://app.example.com",
   WMP_RATE_LIMIT_SCALE: 1,
-  TRUST_PROXY_HOPS: undefined,
+  TRUST_PROXY_HOPS: 0,
   MEDIA_MAX_UPLOAD_BYTES: 5 * 1024 * 1024,
   MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES: 1024 * 1024,
   WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: false,

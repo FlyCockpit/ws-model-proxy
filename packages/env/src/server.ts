@@ -15,6 +15,22 @@ import { originUrl } from "./url.js";
 // ./shared.ts — `extends` merges, it does not allow overriding.
 // ---------------------------------------------------------------------------
 
+const TRUST_PROXY_HOPS_REQUIRED_MESSAGE =
+  "TRUST_PROXY_HOPS is required in production: the number of reverse proxies in front of the app. " +
+  "Use 1 behind one reverse proxy (Dokploy/Traefik, Caddy, nginx, a platform load balancer), " +
+  "0 when clients connect to the app directly, or more for chained proxies " +
+  "(e.g. 2 for Cloudflare in front of your reverse proxy).";
+
+function trustProxyHops(production: boolean) {
+  const hops = z
+    .string({ error: TRUST_PROXY_HOPS_REQUIRED_MESSAGE })
+    .trim()
+    .regex(/^\d{1,2}$/, "TRUST_PROXY_HOPS must be a whole number of proxies (0, 1, 2, ...)")
+    .transform(Number);
+  // Unset reaches the schema as undefined (emptyStringAsUndefined covers "").
+  return production ? hops : hops.default(0);
+}
+
 export const env = createEnv({
   extends: [sharedEnv],
   server: {
@@ -37,20 +53,12 @@ export const env = createEnv({
     SSR_CACHE_TTL_SECONDS: z.coerce.number().int().min(0).default(60),
     /** Raw RelayRequest retention in days; the hourly retention sweep deletes older rows. */
     RELAY_REQUEST_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(14),
-    // Number of reverse-proxy hops in front of the app, for deriving the real
-    // client IP used as the anonymous rate-limit key.
-    //
-    // Leave UNSET (the default) for zero-config behaviour that is correct for
-    // every deploy target in our docs (reverse proxy, managed container hosts,
-    // Container Apps): the app trusts the client IP that a proxy on a
-    // private/loopback network forwarded, and otherwise (bare deployment, local
-    // dev) keys on the real socket peer. See apps/server/src/client-ip.ts.
-    //
-    // Set this only when a proxy in front of the app has a PUBLIC IP (e.g.
-    // Cloudflare, a public load balancer) or your topology is fixed: it is the
-    // exact number of proxies between the client and the app. 0 disables
-    // X-Forwarded-For entirely and always keys on the socket peer.
-    TRUST_PROXY_HOPS: z.coerce.number().int().min(0).optional(),
+    // Number of reverse proxies between the internet and the app; the client
+    // IP used as the anonymous rate-limit key is the X-Forwarded-For entry
+    // this many hops from the right (0: the socket peer, header ignored). See
+    // apps/server/src/client-ip.ts. Required in production, where guessing
+    // would let clients pick their own key; 0 in development and test.
+    TRUST_PROXY_HOPS: trustProxyHops(sharedEnv.NODE_ENV === "production"),
     // ---- Ephemeral media store (optional; Phase 1 multimodal asset plan).
     //
     // Upload is a DEPLOY CAPABILITY, not a soft UI toggle. It is only available

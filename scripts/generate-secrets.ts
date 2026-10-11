@@ -404,6 +404,10 @@ function describeShape(value: string): string {
 function formatError(v: EnvVar, value: string): string | null {
   if (!v.format || value === "") return null;
 
+  if (v.format === "count") {
+    return /^\d{1,2}$/.test(value) ? null : "must be a whole number: 0, 1, 2, ...";
+  }
+
   if (v.format === "origin") {
     let url: URL;
     try {
