@@ -39,9 +39,7 @@ with `cargo install`, which needs Rust 1.88 or newer (<https://rustup.rs>) and a
 Either way the binary lands in `~/.cargo/bin` (`$CARGO_HOME/bin` when set); add it to your `PATH`
 if `wsmp` is not found.
 
-Until v0.4.0 is released, a server's script builds from source by default: the
-`master` branch, or the commit in `WMP_CLI_SOURCE_REV`. The server opts into release
-binaries with `WMP_CLI_RELEASE_BASE_URL`; from the release on, that is the default. To check a
+`WMP_CLI_RELEASE_BASE_URL` points the script at a mirror of the release assets. To check a
 downloaded archive yourself:
 
 ```sh

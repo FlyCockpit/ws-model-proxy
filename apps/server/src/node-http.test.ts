@@ -86,7 +86,7 @@ describe("node bootstrap HTTP", () => {
     });
   });
 
-  it("serves the preview-branch source build until the release flip, unconfigured", async () => {
+  it("serves the default install source when unconfigured (release binaries after the flip)", async () => {
     const res = await app().hono.request("/install.sh");
     expect(res.headers.get("content-type")).toContain("shellscript");
     expect(res.headers.get("cache-control")).toBe("no-store");

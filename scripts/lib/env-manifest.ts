@@ -362,8 +362,8 @@ export const ENV_VARS: EnvVar[] = [
     example: "https://github.com/FlyCockpit/ws-model-proxy/releases/download/v0.4.0",
     comment: [
       "Optional. Where /install.sh downloads wsmp-<target>.tar.xz and sha256.sum (https only) and",
-      "installs the checksum-verified binary. Unset: released versions use their GitHub Release;",
-      "pre-release builds build the master branch from source. Ignored when WMP_CLI_SOURCE_REV is set.",
+      "installs the checksum-verified binary. Unset: the GitHub Release of the server's version.",
+      "Ignored when WMP_CLI_SOURCE_REV is set.",
     ],
   },
   {

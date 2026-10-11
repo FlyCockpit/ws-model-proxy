@@ -59,12 +59,12 @@ export function defaultCliReleaseBaseUrl(): string {
 
 /**
  * RELEASE FLIP: set to `true` in the release commit (apps/cli/docs/releasing.md, "Flip the CLI
- * install default"). Until then the v0.4.0 release does not exist, so an unconfigured server
+ * install default"). Before that, this version's release does not exist, so an unconfigured server
  * keeps building the preview branch from source and release binaries are opt-in through
  * `WMP_CLI_RELEASE_BASE_URL`. Once `true`, an unconfigured server installs the release binaries
  * of {@link SERVER_VERSION} from {@link defaultCliReleaseBaseUrl}.
  */
-export const CLI_RELEASE_BINARIES_BY_DEFAULT = false;
+export const CLI_RELEASE_BINARIES_BY_DEFAULT = true;
 
 /** The branch an unconfigured server builds before {@link CLI_RELEASE_BINARIES_BY_DEFAULT}. */
 export const CLI_PREVIEW_BRANCH = "master";
