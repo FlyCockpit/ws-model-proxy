@@ -49,6 +49,9 @@ ghcr.io/flycockpit/ws-model-proxy:latest   # only when publish_latest is true
 # 1. Bump apps/cli/Cargo.toml (e.g. 0.1.0 -> 0.1.1) and SERVER_VERSION in
 #    apps/server/src/version.ts to match (a server test checks they agree).
 # 2. Flip the CLI install default to release binaries (same commit; see below).
+#    Write the upgrade notes as docs/release-notes/X.Y.Z.md (same commit). The
+#    workflow refuses to release without that file and puts it at the top of
+#    the GitHub Release body, above cargo-dist's install section.
 # 3. Merge that change to master.
 git push origin master
 # 4. In GitHub Actions, run the root "Release" workflow from master with:
@@ -76,10 +79,10 @@ the generated Homebrew formula to the tap.
 
 ## Relay protocol changes
 
-The server accepts the listed relay protocol versions
-(`RELAY_PROTOCOL_VERSIONS`), oldest first; the minimum is
-`RELAY_MIN_PROTOCOL_VERSION`. A protocol bump ships the server and wsmp
-together when the minimum moves.
+The server accepts the relay protocol versions listed in
+`RELAY_PROTOCOL_VERSIONS` (apps/server/src/relay/protocol.ts), oldest first. A
+protocol bump ships the server and wsmp together when the oldest accepted
+version moves.
 
 A release bumps the protocol at most once. This release speaks relay protocol
 3.0 (v0.3.x spoke 2.4) and supports only that version. Release notes must

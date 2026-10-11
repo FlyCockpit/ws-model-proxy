@@ -127,7 +127,7 @@ Releases are created manually from the `master` branch with the root `Release` G
 
 Before the first release, create a protected `release` environment and add `HOMEBREW_TAP_TOKEN` as an environment secret. It must have `contents:write` access to `FlyCockpit/homebrew-tap` so the release workflow can update `Formula/wsmp.rb`.
 
-> **This server needs wsmp 0.4.0 or newer** (relay protocol 3.0). Until 0.4.0 is released, `releases/latest` and Homebrew still serve 0.3.x, which the server refuses at connect, and the server's `/install.sh` builds `wsmp` from source with cargo: the `master` branch, or the commit in `WMP_CLI_SOURCE_REV` (recommended: the commit the server runs). Setting `WMP_CLI_RELEASE_BASE_URL` opts into the release-binary install below. You can also build from this repository: `cargo install --path apps/cli --bin wsmp`.
+> **This server needs wsmp 0.4.0 or newer** (relay protocol 3.0). The server refuses 0.3.x CLIs at connect, so upgrade every node together with the server. You can also build from this repository: `cargo install --path apps/cli --bin wsmp`.
 
 The usual way to install the CLI on a node is the server's own installer, which the **Add a node** dialog runs for you:
 

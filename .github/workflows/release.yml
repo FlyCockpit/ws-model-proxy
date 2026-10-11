@@ -429,8 +429,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
           tag="${{ needs.plan-cli-release.outputs.tag }}"
+
+          # The release body is the version's upgrade notes, then cargo-dist's install section.
+          notes_file="docs/release-notes/${tag#v}.md"
+          if [ ! -f "$notes_file" ]; then
+            echo "::error::$notes_file is missing. Write the release notes before releasing (apps/cli/docs/releasing.md)."
+            exit 1
+          fi
+          {
+            cat "$notes_file"
+            printf '\n\n'
+            echo "$ANNOUNCEMENT_BODY"
+          } > "$RUNNER_TEMP/notes.txt"
 
           mapfile -t release_files < <(find apps/cli/artifacts -type f ! -name '*-dist-manifest.json' | sort)
           if [ "${#release_files[@]}" -eq 0 ]; then

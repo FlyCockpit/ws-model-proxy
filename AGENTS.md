@@ -54,6 +54,26 @@ packages/test-utils/ -> Shared test helpers
 - Do not create `.bak`, `.old`, `.backup`, or `.orig` files. Git is the backup mechanism.
 - Root `CLAUDE.md` and `.cursorrules` are generated from this file with `pnpm sync:agent-docs`.
 
+## Versions and Releases
+
+The owner decides versions when cutting a release. Unless the owner explicitly
+asks for it in the current task, do not change:
+
+- The app/CLI version: `apps/cli/Cargo.toml` (and its `Cargo.lock` entry) and
+  `SERVER_VERSION` in `apps/server/src/version.ts`.
+- The relay protocol version: `RELAY_PROTOCOL_VERSION`, `RELAY_SUBPROTOCOL`
+  and `RELAY_PROTOCOL_VERSIONS` in `apps/server/src/relay/`, and
+  `RELAY_PROTOCOL_VERSION` / `RELAY_SUBPROTOCOL` in `apps/cli/src/protocol/`.
+- The release switches in `apps/server/src/node-http.ts`
+  (`CLI_RELEASE_BINARIES_BY_DEFAULT`, `CLI_PREVIEW_BRANCH`).
+
+Between releases, a protocol change extends the current, unreleased protocol
+version in place: add new frames or fields to it and update fixtures, but do
+not bump the number, add a version negotiation step, or gate behaviour on
+intermediate versions. If a change seems to need a bump (for example, it breaks
+compatibility with the last released CLI), say so in your summary and let the
+owner decide. Release mechanics are in `apps/cli/docs/releasing.md`.
+
 ## Data and Schema
 
 - The Prisma schema lives in `packages/db/prisma/schema/`.

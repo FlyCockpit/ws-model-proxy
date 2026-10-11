@@ -733,7 +733,7 @@ stream error instead of a clean end, because it could not be continued.
 
 ## Upgrading from 0.3
 
-0.4.0 starts from a fresh database (see [`release-notes/next.md`](release-notes/next.md)).
+0.4.0 starts from a fresh database (see [`release-notes/0.4.0.md`](release-notes/0.4.0.md)).
 For cloud fallback: the pool's cloud mode replaces the owner's fallback and
 "also for people I share with" switches, API keys no longer carry a cloud
 switch or a per-key wait (the pool's max wait applies), and monthly caps on
