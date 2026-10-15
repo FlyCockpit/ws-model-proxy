@@ -226,7 +226,16 @@ function incompatibilities(features: SurfaceFeatures, request: SurfaceRequestReq
     "reasoning",
     "hostedTools",
   ] as const) {
-    if (request[key] && features[key] !== true) failures.push(`${key}_unavailable`);
+    const unknownCanPassThrough =
+      key === "tools" ||
+      key === "parallelTools" ||
+      key === "structuredOutput" ||
+      key === "reasoning";
+    if (
+      request[key] &&
+      (features[key] === false || (features[key] !== true && !unknownCanPassThrough))
+    )
+      failures.push(`${key}_unavailable`);
   }
   const versionInventory = request.protocolVersion
     ? features.protocolVersions?.find(({ version }) => version === request.protocolVersion)

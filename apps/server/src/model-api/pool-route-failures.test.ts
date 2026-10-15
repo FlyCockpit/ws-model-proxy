@@ -167,6 +167,8 @@ const RESPONSES_ONLY_ROUTE: PoolRoute = {
 
 type Handlers = import("../relay/session-manager.js").ActiveRelayResponseHandlers;
 let handlers: Handlers | undefined;
+type SentRelayRequest = { requestId: string; path: string; bodyChunks?: Uint8Array[] };
+let sentRelayRequests: SentRelayRequest[];
 /** What the fake node answers to every relayed request. */
 let nodeAnswer: (handlers: Handlers, requestId: string) => void = () => undefined;
 
@@ -179,7 +181,8 @@ function app() {
       registerRelayResponseHandlers: vi.fn((input: { handlers: Handlers }) => {
         handlers = input.handlers;
       }),
-      sendRelayRequest: vi.fn((input: { requestId: string }) => {
+      sendRelayRequest: vi.fn((input: SentRelayRequest) => {
+        sentRelayRequests.push(input);
         const current = handlers;
         if (current) queueMicrotask(() => nodeAnswer(current, input.requestId));
       }),
@@ -207,6 +210,8 @@ beforeEach(() => {
   });
   resolve.listCallableTargetsForApiKey.mockResolvedValue({ pools: [POOL], tests: [] });
   resolve.poolRoutes.mockResolvedValue([RESPONSES_ONLY_ROUTE] as never);
+  sentRelayRequests = [];
+  nodeAnswer = () => undefined;
   overflow.listPublicOverflowTargets.mockResolvedValue({
     enabled: false,
     ownerActive: true,
@@ -219,6 +224,227 @@ beforeEach(() => {
 });
 
 describe("API adaptation on a pool", () => {
+  it("relays function tools to a local TEXT_GENERATION member with unknown tool support", async () => {
+    resolve.poolRoutes.mockResolvedValue([
+      {
+        ...RESPONSES_ONLY_ROUTE,
+        model: { ...RESPONSES_ONLY_ROUTE.model, capabilities: ["TEXT_GENERATION"] },
+      },
+    ] as never);
+    // Return a valid native Chat completion from the fake node after WSMP dispatches.
+    nodeAnswer = (h, requestId) => {
+      h.onHeaders({
+        type: "relay.response.headers",
+        requestId,
+        status: 200,
+        headers: [["content-type", "application/json"]],
+      });
+      h.onBody(
+        new TextEncoder().encode(
+          JSON.stringify({
+            id: "chatcmpl-tools-1",
+            object: "chat.completion",
+            model: "local-model",
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call-1",
+                      type: "function",
+                      function: { name: "lookup", arguments: "{}" },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          }),
+        ),
+        { type: "relay.response.body", requestId, chunkId: "0" },
+      );
+      h.onComplete({ type: "relay.complete", requestId });
+    };
+
+    const response = await app().request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_key_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "owner/chat",
+        messages: [{ role: "user", content: "Look this up." }],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "lookup",
+              description: "Look up a value.",
+              parameters: { type: "object", properties: {} },
+            },
+          },
+        ],
+        parallel_tool_calls: false,
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      choices: [{ message: { tool_calls: [{ function: { name: "lookup" } }] } }],
+    });
+    expect(sentRelayRequests).toHaveLength(1);
+    expect(sentRelayRequests[0]?.path).toBe("/v1/chat/completions");
+    const relayedBody = new TextDecoder().decode(
+      new Uint8Array(sentRelayRequests[0]?.bodyChunks?.flatMap((chunk) => [...chunk]) ?? []),
+    );
+    expect(JSON.parse(relayedBody)).toMatchObject({
+      tools: [{ type: "function", function: { name: "lookup" } }],
+      parallel_tool_calls: false,
+    });
+  });
+
+  it("relays a tool result in the follow-up Chat request", async () => {
+    resolve.poolRoutes.mockResolvedValue([
+      {
+        ...RESPONSES_ONLY_ROUTE,
+        model: { ...RESPONSES_ONLY_ROUTE.model, capabilities: ["TEXT_GENERATION"] },
+      },
+    ] as never);
+    let upstreamCalls = 0;
+    nodeAnswer = (h, requestId) => {
+      upstreamCalls += 1;
+      const body =
+        upstreamCalls === 1
+          ? {
+              id: "chatcmpl-tools-1",
+              object: "chat.completion",
+              model: "local-model",
+              choices: [
+                {
+                  index: 0,
+                  message: {
+                    role: "assistant",
+                    content: null,
+                    tool_calls: [
+                      {
+                        id: "call-1",
+                        type: "function",
+                        function: { name: "lookup", arguments: "{}" },
+                      },
+                    ],
+                  },
+                  finish_reason: "tool_calls",
+                },
+              ],
+            }
+          : {
+              id: "chatcmpl-followup-1",
+              object: "chat.completion",
+              model: "local-model",
+              choices: [
+                {
+                  index: 0,
+                  message: { role: "assistant", content: "The value is 42." },
+                  finish_reason: "stop",
+                },
+              ],
+            };
+      h.onHeaders({
+        type: "relay.response.headers",
+        requestId,
+        status: 200,
+        headers: [["content-type", "application/json"]],
+      });
+      h.onBody(new TextEncoder().encode(JSON.stringify(body)), {
+        type: "relay.response.body",
+        requestId,
+        chunkId: "0",
+      });
+      h.onComplete({ type: "relay.complete", requestId });
+    };
+
+    const api = app();
+    const request = (messages: unknown[]) =>
+      api.request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_key_test", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "owner/chat",
+          messages,
+          tools: [
+            {
+              type: "function",
+              function: {
+                name: "lookup",
+                description: "Look up a value.",
+                parameters: { type: "object", properties: {} },
+              },
+            },
+          ],
+          parallel_tool_calls: false,
+        }),
+      });
+
+    const first = await request([{ role: "user", content: "Look this up." }]);
+    expect(first.status).toBe(200);
+    const firstBody = (await first.json()) as {
+      choices: Array<{
+        message: { tool_calls: Array<{ id: string; function: { name: string } }> };
+      }>;
+    };
+    expect(firstBody.choices[0]?.message.tool_calls[0]).toMatchObject({
+      id: "call-1",
+      function: { name: "lookup" },
+    });
+
+    const followUp = await request([
+      { role: "user", content: "Look this up." },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call-1",
+            type: "function",
+            function: { name: "lookup", arguments: "{}" },
+          },
+        ],
+      },
+      { role: "tool", tool_call_id: "call-1", content: "42" },
+    ]);
+    expect(followUp.status).toBe(200);
+    expect(await followUp.json()).toMatchObject({
+      choices: [{ message: { role: "assistant", content: "The value is 42." } }],
+    });
+    expect(upstreamCalls).toBe(2);
+    expect(sentRelayRequests).toHaveLength(2);
+    const relayedFollowUp = JSON.parse(
+      new TextDecoder().decode(
+        new Uint8Array(sentRelayRequests[1]?.bodyChunks?.flatMap((chunk) => [...chunk]) ?? []),
+      ),
+    ) as {
+      messages: Array<{
+        role: string;
+        tool_call_id?: string;
+        content?: string | null;
+        tool_calls?: Array<{ id: string }>;
+      }>;
+    };
+    expect(relayedFollowUp.messages).toContainEqual({
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        { id: "call-1", type: "function", function: { name: "lookup", arguments: "{}" } },
+      ],
+    });
+    expect(relayedFollowUp.messages).toContainEqual({
+      role: "tool",
+      tool_call_id: "call-1",
+      content: "42",
+    });
+  });
+
   it("refuses a Chat request only an adapted member could serve, naming the untranslatable feature", async () => {
     const response = await app().request("/chat/completions", {
       method: "POST",
