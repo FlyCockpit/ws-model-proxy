@@ -68,7 +68,7 @@ For local runtime pool members, WSMP now forwards a **native OpenAI Chat Complet
 
 This is a compatibility policy for missing legacy metadata. A longer-term path is to discover or declare per-model, per-surface capabilities, persist them through `RuntimeModel`, and use them for routing. That would allow WSMP to distinguish verified tool support from unknown support and explicit refusal. The policy here does not implement that metadata pipeline.
 
-The regression tests cover a normal `TEXT_GENERATION` runtime with an explicit single-tool request, a request that implies parallel tool calls, explicit unsupported metadata, and the boundary for adapted and non-Chat routes. They exercise profiling and resolution but are not an end-to-end live relay test.
+The resolver regression tests cover a normal `TEXT_GENERATION` runtime, a request that implies parallel tool calls, explicit unsupported metadata, and the boundary for adapted and non-Chat routes. The pool route test also sends a function-tool request through the real route and relay executor to a fake connected node, checks the forwarded JSON body, and returns a tool-call completion. It does not contact a deployed node or model server.
 
 ## Validation after deployment
 
