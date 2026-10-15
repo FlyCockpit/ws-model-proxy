@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import wireFixtures from "./fixtures/capabilities-v3-wire.json";
-import { parseOpenAiCompatibleCapabilities } from "./openai-compatible-capabilities";
+import {
+  openAiCapabilitiesFromCoarse,
+  parseOpenAiCompatibleCapabilities,
+} from "./openai-compatible-capabilities";
 import { resolveExecutionPath, surfaceAvailabilityMatrix } from "./surface-capabilities";
 
 const anthropic = parseOpenAiCompatibleCapabilities({
@@ -44,8 +47,89 @@ const anthropicV4 = parseOpenAiCompatibleCapabilities({
 });
 
 describe("surface capability resolution", () => {
-  it("keeps explicit tool refusals and adapted or non-Chat surfaces gated", () => {
-    const explicitNoTools = parseOpenAiCompatibleCapabilities({
+  it("passes unknown caller-executed features on every native surface", () => {
+    const cases = [
+      {
+        capabilities: openAiCapabilitiesFromCoarse(["TEXT_GENERATION"]),
+        requestedSurface: "OPENAI_CHAT_COMPLETIONS" as const,
+      },
+      {
+        capabilities: openAiCapabilitiesFromCoarse(["TEXT_GENERATION", "RESPONSES_API"]),
+        requestedSurface: "OPENAI_RESPONSES" as const,
+      },
+      {
+        capabilities: parseOpenAiCompatibleCapabilities({
+          version: 3,
+          protocol: "anthropic-compatible",
+          surfaces: {
+            anthropicMessages: {
+              source: "declared",
+              confidence: "unknown",
+              supported: true,
+            },
+          },
+        }),
+        requestedSurface: "ANTHROPIC_MESSAGES" as const,
+      },
+    ];
+    const requests = [
+      { tools: true },
+      { parallelTools: true },
+      { structuredOutput: true },
+      { reasoning: true },
+    ];
+    for (const { capabilities, requestedSurface } of cases)
+      for (const request of requests)
+        expect(
+          resolveExecutionPath({ capabilities, requestedSurface, request }).mode,
+          `${requestedSurface} with ${Object.keys(request)[0]}`,
+        ).toBe("native");
+  });
+
+  it("passes unknown function tools through adapted surfaces while keeping the strict subset", () => {
+    const capabilities = openAiCapabilitiesFromCoarse(["TEXT_GENERATION"]);
+    for (const requestedSurface of ["OPENAI_RESPONSES", "ANTHROPIC_MESSAGES"] as const) {
+      expect(
+        resolveExecutionPath({
+          capabilities,
+          requestedSurface,
+          request: { tools: true, parallelTools: false },
+          adaptationEnabled: true,
+        }),
+      ).toMatchObject({ mode: "adapted", nativeSurface: "OPENAI_CHAT_COMPLETIONS" });
+      for (const [request, limitation] of [
+        [{ reasoning: true }, "reasoning_not_adaptable"],
+        [{ structuredOutput: true }, "structuredOutput_not_adaptable"],
+      ] as const)
+        expect(
+          resolveExecutionPath({
+            capabilities,
+            requestedSurface,
+            request,
+            adaptationEnabled: true,
+          }).limitations,
+        ).toContain(limitation);
+    }
+  });
+
+  it("keeps explicit false values and non-pass-through feature gates strict", () => {
+    const coarseText = openAiCapabilitiesFromCoarse(["TEXT_GENERATION"]);
+    expect(
+      resolveExecutionPath({
+        capabilities: coarseText,
+        requestedSurface: "OPENAI_CHAT_COMPLETIONS",
+        request: { tools: true, hostedTools: true },
+      }).limitations,
+    ).toContain("hostedTools_unavailable");
+    expect(
+      resolveExecutionPath({
+        capabilities: coarseText,
+        requestedSurface: "OPENAI_CHAT_COMPLETIONS",
+        request: { inputImages: true },
+      }).limitations,
+    ).toContain("inputImages_unavailable");
+
+    const explicitFalse = parseOpenAiCompatibleCapabilities({
       version: 3,
       protocol: "openai-compatible",
       surfaces: {
@@ -54,32 +138,28 @@ describe("surface capability resolution", () => {
           confidence: "exact",
           supported: true,
           tools: false,
+          reasoning: false,
+          structuredOutput: false,
+          hostedTools: false,
+          inputImages: false,
         },
       },
     });
-    expect(
-      resolveExecutionPath({
-        capabilities: explicitNoTools,
-        requestedSurface: "OPENAI_CHAT_COMPLETIONS",
-        request: { tools: true },
-        allowUnknownNativeChatTools: true,
-      }).limitations,
-    ).toContain("tools_unavailable");
-
-    const legacy = parseOpenAiCompatibleCapabilities({
-      version: 1,
-      protocol: "openai-compatible",
-      chatCompletions: { supported: true },
-    });
-    expect(
-      resolveExecutionPath({
-        capabilities: legacy,
-        requestedSurface: "OPENAI_RESPONSES",
-        request: { tools: true },
-        adaptationEnabled: true,
-        allowUnknownNativeChatTools: true,
-      }).mode,
-    ).toBe("unavailable");
+    for (const request of [
+      { tools: true },
+      { reasoning: true },
+      { structuredOutput: true },
+      { hostedTools: true },
+      { inputImages: true },
+    ])
+      expect(
+        resolveExecutionPath({
+          capabilities: explicitFalse,
+          requestedSurface: "OPENAI_CHAT_COMPLETIONS",
+          request,
+        }).mode,
+        `explicit/strict ${Object.keys(request)[0]}`,
+      ).toBe("unavailable");
   });
 
   it("accepts and rejects the shared v3 wire fixtures", () => {
@@ -188,7 +268,7 @@ describe("surface capability resolution", () => {
     ).toBe("adapted");
   });
 
-  it("prefers native and rejects exact feature, version, beta, and context mismatches", () => {
+  it("prefers native, passes unknown reasoning, and rejects version, beta, and context mismatches", () => {
     expect(
       resolveExecutionPath({
         capabilities: anthropic,
@@ -196,8 +276,14 @@ describe("surface capability resolution", () => {
         adaptationEnabled: true,
       }).mode,
     ).toBe("native");
+    expect(
+      resolveExecutionPath({
+        capabilities: anthropic,
+        requestedSurface: "ANTHROPIC_MESSAGES",
+        request: { reasoning: true },
+      }).mode,
+    ).toBe("native");
     for (const request of [
-      { reasoning: true },
       { contextTokens: 200_001 },
       { protocolVersion: "2024-01-01" },
       { betaFeatures: ["unknown-beta"] },

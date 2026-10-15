@@ -26,13 +26,8 @@ describe("servedModelCapabilities", () => {
         capabilities,
         requestedSurface: "OPENAI_CHAT_COMPLETIONS",
         request,
-        allowUnknownNativeChatTools: true,
       }).mode,
     ).toBe("native");
-    expect(
-      resolveExecutionPath({ capabilities, requestedSurface: "OPENAI_CHAT_COMPLETIONS", request })
-        .limitations,
-    ).toContain("tools_unavailable");
   });
 
   it("passes implicit parallel tool requests to a native local Chat endpoint", () => {
@@ -46,7 +41,6 @@ describe("servedModelCapabilities", () => {
         capabilities,
         requestedSurface: "OPENAI_CHAT_COMPLETIONS",
         request,
-        allowUnknownNativeChatTools: true,
       }).mode,
     ).toBe("native");
   });

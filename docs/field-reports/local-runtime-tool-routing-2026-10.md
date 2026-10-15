@@ -62,13 +62,13 @@ The observed pre-fix response was HTTP 400 with `error.code` set to `unsupported
 
 Coarse capability overrides, a Full-control node trust level, and turning off protocol adaptation cannot supply a missing tool flag. The MCP server version suffix `+tools.185cd824a5d6` is a tool-manifest hash, not a Git commit or proof of a custom deployment.
 
-## Compatibility decision in this PR
+## Compatibility policy in this PR
 
-For local runtime pool members, WSMP now forwards a **native OpenAI Chat Completions** request when `tools` or `parallelTools` support is unknown in its legacy coarse inventory. The upstream endpoint can then accept it or return its own error. The change does not assert that every text-generation model supports tools. It does not override explicit `false` support in a richer inventory, make another API surface available, or allow an adapted route to bypass its feature checks. Hosted tools, media, reasoning, structured output, and other feature gates remain as they were.
+When surface metadata leaves `tools`, `parallelTools`, `structuredOutput`, or `reasoning` unknown, the resolver now lets native requests reach the upstream. An explicit `false` still rejects. The same policy lets function tools pass through adapted routes when `parallelTools` is not requested; hosted tools remain gated, and `adaptedSubsetFailures` still rejects reasoning, structured output, parallel tool calls, and other extensions outside the adapter's common subset. Media, streaming, context limits, protocol versions, and beta features remain strict.
 
-This is a compatibility policy for missing legacy metadata. A longer-term path is to discover or declare per-model, per-surface capabilities, persist them through `RuntimeModel`, and use them for routing. That would allow WSMP to distinguish verified tool support from unknown support and explicit refusal. The policy here does not implement that metadata pipeline.
+This applies to the surface resolver generally, including provider inventories and local runtimes; it is not specific to local runtime members. A longer-term path is to discover or declare per-model, per-surface capabilities and persist them through `RuntimeModel` so unknown support can become known over time.
 
-The resolver regression tests cover a normal `TEXT_GENERATION` runtime, a request that implies parallel tool calls, explicit unsupported metadata, and the boundary for adapted and non-Chat routes. The pool route tests send a function-tool request through the real route and relay executor to a fake connected node, check the forwarded JSON body, return a tool-call completion, and send a tool result in the follow-up request. They do not contact a deployed node or model server.
+Resolver tests cover unknown features on native Chat, Responses, and Anthropic surfaces; function tools through Chat adaptation; strict adapted-subset features; explicit `false`; and hosted-tool/media gates. Pool route tests send a function-tool request through the real route and relay executor to a fake connected node, check the forwarded JSON body, return a tool-call completion, and send a tool result in the follow-up request. They do not contact a deployed node or model server.
 
 ## Validation after deployment
 
@@ -78,27 +78,4 @@ The resolver regression tests cover a normal `TEXT_GENERATION` runtime, a reques
 4. Select the pool as OpenCode's primary model and complete a small real coding task that uses tools. A plain prompt or a tool-disabled agent only verifies text generation.
 5. Check that a model with explicit tool refusal remains ineligible and that native tool passthrough did not make adapted routes eligible.
 
-No live deployment or post-deployment OpenCode validation had been performed when this report was added.
-
-## OpenCode and MCP distinction from the same investigation
-
-The gist records two independent ways to use the PC's pool:
-
-| Path | Credential | What it proves |
-| --- | --- | --- |
-| Configure the pool as OpenCode's primary model through WSMP `/v1` | Model API key scoped to the pool | OpenCode can send Chat Completions, including tool schemas, through the pool. This was blocked by the routing issue above. |
-| Connect OpenCode to WSMP `/mcp` and call `model_test` | Agent token with Full access, or suitable OAuth access | An existing primary model can ask the PC pool for a short answer. It does not make that pool the primary model. |
-
-The Mac's OpenCode 2.0.25 MCP connection was verified: `wsmp` was connected, and `model_test` returned a short correct Python `add(a, b)` function from the PC Qwen pool in about 2.9 seconds. The tool returns an excerpt capped at 280 characters, so that success did not establish full-length code generation or autonomous coding through MCP. The observed MCP endpoint required protocol `2026-07-28`; an older `2025-03-26` initialization was rejected. A Model API key and an MCP agent token are separate credentials. The gist contains the fuller client setup and troubleshooting steps without token values.
-
-## GPU stability context, separate from proxy routing
-
-The original investigation also tracked Ubuntu input freezes and black screens while local inference used an AMD Radeon AI PRO R9700. These hardware and driver observations should not be treated as evidence for the WSMP HTTP 400: that error occurred before relay to the GPU server.
-
-- Windows OpenCL checks passed bounded memory-pattern tests at 8 GiB and 24 GiB, plus 120-second and 60-second compute checks, without observed mismatches or matching GPU/system events. These tests did not cover every GPU operation or sustained maximum load.
-- Ubuntu CPU-only llama.cpp checks passed. A matched small-model Vulkan workload on the R9700 passed, followed by 105 successful 1B requests across four sessions and a short 3B test. No matching GPU reset, OOM, or hardware error appeared in those test intervals. The historical freeze trigger remained unresolved.
-- For the 27B Qwen model, a bounded run with all 66 layers on Vulkan0 and KV/recurrent state in host RAM generated about 3.65 tokens/s. Moving KV and recurrent state to the GPU generated about 31.7 tokens/s. Ten repeated requests and a 4096-context request passed.
-- An initial sustained attempt stopped at a deliberate 4 GiB **host RAM** scope limit: saved prompt snapshots grew and the kernel recorded a memory-cgroup OOM kill. Disabling those snapshots with `--cache-ram 0` allowed a 10-minute retry: 73 requests, 18,688 output tokens, about 31.8 decode tokens/s, and no matching GPU or OOM errors in that interval. This was a scoped process OOM, not the earlier whole-PC freeze.
-- A remote kernel-log receiver helped preserve evidence, but silence in those logs does not prove that every subsystem was healthy. Larger and concurrent model allocations remained plausible variables, not proven causes.
-
-The [gist](https://gist.github.com/speedysebi/f2afba24688d8f4065aec65e8bb92bdc) contains the exact GPU launch commands, raw responses, kernel summaries, captured timings, and the longer Ubuntu/Windows handoff. Those machine-specific artifacts are intentionally kept out of this routing PR.
+No live deployment or post-deployment tool-call validation had been performed when this report was updated.
