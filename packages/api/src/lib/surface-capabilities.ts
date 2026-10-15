@@ -205,7 +205,11 @@ function adaptedSubsetFailures(request: SurfaceRequestRequirements): string[] {
   return failures;
 }
 
-function incompatibilities(features: SurfaceFeatures, request: SurfaceRequestRequirements) {
+function incompatibilities(
+  features: SurfaceFeatures,
+  request: SurfaceRequestRequirements,
+  allowUnknownNativeChatTools = false,
+) {
   const failures: string[] = [];
   if (request.stream && features.streaming !== true) failures.push("streaming_unavailable");
   if (
@@ -226,7 +230,16 @@ function incompatibilities(features: SurfaceFeatures, request: SurfaceRequestReq
     "reasoning",
     "hostedTools",
   ] as const) {
-    if (request[key] && features[key] !== true) failures.push(`${key}_unavailable`);
+    if (
+      request[key] &&
+      features[key] !== true &&
+      !(
+        allowUnknownNativeChatTools &&
+        (key === "tools" || key === "parallelTools") &&
+        features[key] === undefined
+      )
+    )
+      failures.push(`${key}_unavailable`);
   }
   const versionInventory = request.protocolVersion
     ? features.protocolVersions?.find(({ version }) => version === request.protocolVersion)
@@ -323,11 +336,14 @@ export function resolveExecutionPath({
   requestedSurface,
   request = {},
   adaptationEnabled = false,
+  allowUnknownNativeChatTools = false,
 }: {
   capabilities: OpenAiCompatibleCapabilities | null | undefined;
   requestedSurface: ModelApiSurface;
   request?: SurfaceRequestRequirements;
   adaptationEnabled?: boolean;
+  /** Local runtime inventories only record coarse modalities. Let native Chat handle unknown tool support. */
+  allowUnknownNativeChatTools?: boolean;
 }): SurfaceAvailability {
   const operation = operationFor(requestedSurface, request);
   const describe = (availability: SurfaceAvailability): SurfaceAvailability => ({
@@ -370,7 +386,14 @@ export function resolveExecutionPath({
         ? { ...request, protocolVersion: undefined, betaFeatures: undefined }
         : request;
     const failures = [
-      ...incompatibilities(features, normalizedRequest),
+      ...incompatibilities(
+        features,
+        normalizedRequest,
+        allowUnknownNativeChatTools &&
+          mode === "native" &&
+          requestedSurface === "OPENAI_CHAT_COMPLETIONS" &&
+          (capabilities.version === 1 || capabilities.version === 2),
+      ),
       ...(mode === "adapted" ? adaptedSubsetFailures(request) : []),
     ];
     if (failures.length) return { failures, features };

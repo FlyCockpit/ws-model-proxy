@@ -44,6 +44,44 @@ const anthropicV4 = parseOpenAiCompatibleCapabilities({
 });
 
 describe("surface capability resolution", () => {
+  it("keeps explicit tool refusals and adapted or non-Chat surfaces gated", () => {
+    const explicitNoTools = parseOpenAiCompatibleCapabilities({
+      version: 3,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiChatCompletions: {
+          source: "declared",
+          confidence: "exact",
+          supported: true,
+          tools: false,
+        },
+      },
+    });
+    expect(
+      resolveExecutionPath({
+        capabilities: explicitNoTools,
+        requestedSurface: "OPENAI_CHAT_COMPLETIONS",
+        request: { tools: true },
+        allowUnknownNativeChatTools: true,
+      }).limitations,
+    ).toContain("tools_unavailable");
+
+    const legacy = parseOpenAiCompatibleCapabilities({
+      version: 1,
+      protocol: "openai-compatible",
+      chatCompletions: { supported: true },
+    });
+    expect(
+      resolveExecutionPath({
+        capabilities: legacy,
+        requestedSurface: "OPENAI_RESPONSES",
+        request: { tools: true },
+        adaptationEnabled: true,
+        allowUnknownNativeChatTools: true,
+      }).mode,
+    ).toBe("unavailable");
+  });
+
   it("accepts and rejects the shared v3 wire fixtures", () => {
     for (const fixture of wireFixtures.valid)
       expect(parseOpenAiCompatibleCapabilities(fixture)).not.toBeNull();

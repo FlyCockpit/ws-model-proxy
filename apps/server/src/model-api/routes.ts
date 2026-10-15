@@ -2158,6 +2158,7 @@ function executionPathForPoolMember(
   return resolveExecutionPath({
     capabilities,
     requestedSurface: modelApiSurface(requestedSurface),
+    allowUnknownNativeChatTools: true,
     request: {
       stream: operation.stream,
       protocolVersion: operation.anthropicIngress?.version,
