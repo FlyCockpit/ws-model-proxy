@@ -1,0 +1,22 @@
+{
+  "capabilitiesHex": "10",
+  "chunk": {
+    "id": "000102030405060708090a0b0c0d0e0f",
+    "total": 8,
+    "offset": 0,
+    "format": 0,
+    "dataHex": "89504e470d0a1a0a",
+    "plaintextHex": "11000102030405060708090a0b0c0d0e0f00000008000000000089504e470d0a1a0a"
+  },
+  "paste": {
+    "id": "000102030405060708090a0b0c0d0e0f",
+    "text": "/tmp/image.png ",
+    "plaintextHex": "13000102030405060708090a0b0c0d0e0f2f746d702f696d6167652e706e6720"
+  },
+  "cancelHex": "14000102030405060708090a0b0c0d0e0f",
+  "reply": {
+    "id": "000102030405060708090a0b0c0d0e0f",
+    "received": 8,
+    "path": "/tmp/wsmp-terminal-example/image.png"
+  }
+}

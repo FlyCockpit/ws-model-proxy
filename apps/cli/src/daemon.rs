@@ -947,8 +947,11 @@ fn command_max(store: &Store) -> Duration {
 
 /// What outlives one relay connection: the worker channel and the node
 /// commands (a long command keeps running through a reconnect), plus the
-/// command results that ended while disconnected.
+/// command results that ended while disconnected and the image worker's
+/// storage quota and pending cleanup.
 struct NodeLink {
+    // One owner across reconnects: cleanup cannot reset or bypass the node quota.
+    images: Arc<crate::terminal_images::ImageWorker>,
     worker_tx: SyncSender<FromWorker>,
     worker_rx: Receiver<FromWorker>,
     execs: ExecRegistry,
@@ -974,6 +977,7 @@ impl NodeLink {
         }
         execs.set_command_max(command_max(store));
         Self {
+            images: Arc::new(crate::terminal_images::ImageWorker::new()),
             worker_tx,
             worker_rx,
             execs,
@@ -1062,7 +1066,7 @@ fn run_relay_session(
         worker_tx: worker_tx.clone(),
         workers: BTreeMap::new(),
         recent_finished: RecentlyFinished::new(),
-        terminals: TerminalRegistry::new(worker_tx.clone()),
+        terminals: TerminalRegistry::with_image_worker(worker_tx.clone(), Arc::clone(&link.images)),
         execs: &mut link.execs,
         deferred: &mut link.deferred,
         // Live speech-to-text sessions; dropping the registry ends them all.

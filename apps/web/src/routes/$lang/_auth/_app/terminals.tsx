@@ -146,6 +146,8 @@ function TerminalWorkspace({
                   active={tab.localId === activeLocalId}
                   follow={followSize(tab)}
                   sendInput={sessions.sendInput}
+                  uploadImage={sessions.uploadImage}
+                  pasteImage={sessions.pasteImage}
                   sendResize={sessions.sendResize}
                   subscribeOutput={sessions.subscribeOutput}
                 />

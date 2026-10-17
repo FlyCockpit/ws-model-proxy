@@ -186,6 +186,44 @@ fn type_keys(
 }
 
 #[test]
+fn operator_terminals_never_advertise_or_accept_image_uploads() {
+    let (tx, _rx) = channel();
+    let mut terminals = multi_registry(tx);
+    let startup = relay_startup();
+    let sudo = FakeSudo::new();
+    let (open, _events) = request(MULTI_TERMINAL, "step-image", ":", sudo.env());
+    reserve_and_open(&mut terminals, open);
+    let mut viewer = TestViewer::new(1);
+    let frames = attach_viewer(&mut terminals, &startup, &mut viewer);
+    assert!(
+        !viewer
+            .unicast_messages(MULTI_TERMINAL, &frames)
+            .contains(&TermPlaintextV2::ImageCapabilities)
+    );
+    let image = || {
+        TermPlaintextV2::ImageChunk(crate::terminal_images::ImageChunk {
+            id: [1; 16],
+            total: 8,
+            offset: 0,
+            format: 0,
+            data: b"\x89PNG\r\n\x1a\n".to_vec(),
+        })
+    };
+    for running in [false, true] {
+        if running {
+            type_keys(&mut terminals, &mut viewer, b"\r");
+        }
+        let label = viewer.id.clone();
+        let frames = send(&mut terminals, &mut viewer, &label, &image());
+        let messages = viewer.unicast_messages(MULTI_TERMINAL, &frames);
+        assert!(
+            matches!(&messages[..], [TermPlaintextV2::ImageReply(reply)] if reply.error.as_deref() == Some("unavailable"))
+        );
+        assert!(terminals.image_pending.is_empty());
+    }
+}
+
+#[test]
 fn a_relay_only_node_attaches_to_the_confirm_screen_and_reads_keys_itself() {
     let (tx, _rx) = channel();
     let mut terminals = multi_registry(tx);

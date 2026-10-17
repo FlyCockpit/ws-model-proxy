@@ -3,6 +3,7 @@ import { type RefCallback, useEffect } from "react";
 import { useLatestRef } from "@/hooks/use-latest-ref";
 import type { TerminalOutputEvent } from "@/hooks/use-terminal-sessions";
 import { useXterm } from "@/hooks/use-xterm";
+import type { TerminalImageAttachment } from "@/lib/terminal-images";
 import type { TerminalSize } from "@/lib/terminal-writer";
 
 type TerminalPaneHandlers = {
@@ -11,6 +12,9 @@ type TerminalPaneHandlers = {
   /** The PTY size to show while someone else is typing, or null to fit. */
   follow: TerminalSize | null;
   sendInput: (localId: string, data: string) => void;
+  onImage?: (file: File) => Promise<TerminalImageAttachment>;
+  pasteImage?: (localId: string, id: string, data: string) => Promise<boolean>;
+  onImageError?: (error: unknown) => void;
   sendResize: (localId: string, cols: number, rows: number) => void;
   subscribeOutput: (
     localId: string,
@@ -24,6 +28,15 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): RefCallback<HTM
   const xterm = useXterm({
     follow: handlers.follow,
     onData: (data) => handlersRef.current.sendInput(handlersRef.current.localId, data),
+    onImage: (file) => {
+      const upload = handlersRef.current.onImage;
+      if (!upload) return Promise.reject(new Error("unavailable"));
+      return upload(file);
+    },
+    onImageError: (error) => handlersRef.current.onImageError?.(error),
+    onImagePaste: (attachment, data) =>
+      handlersRef.current.pasteImage?.(handlersRef.current.localId, attachment.id, data) ??
+      Promise.resolve(false),
     onResize: (size) =>
       handlersRef.current.sendResize(handlersRef.current.localId, size.cols, size.rows),
   });
