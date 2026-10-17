@@ -49,6 +49,7 @@ pub mod telemetry;
 pub mod telemetry_bounds;
 pub mod terminal_crypto;
 pub mod terminal_identity;
+pub mod terminal_images;
 pub mod terminal_parse;
 pub mod tls;
 pub mod tokens;

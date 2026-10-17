@@ -562,6 +562,7 @@ fn aead_open(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8]) ->
 
 /// v2 plaintexts. `0x01`/`0x02` match v1; `0x03` carries `be32(epoch) ‖ outKey`
 /// and is only ever sent unicast. The v1 codec keeps rejecting `0x03`.
+/// `0x10`–`0x14` carry image transfers (see `terminal_images`).
 ///
 /// `0x04`–`0x06` belonged to the retired supervised-command output review and
 /// are refused, like every other unknown tag; the viewer that sent one is
@@ -571,10 +572,28 @@ pub enum TermPlaintextV2 {
     Data(Vec<u8>),
     Resize { cols: u16, rows: u16 },
     OutputKey { epoch: u32, key: [u8; 32] },
+    ImageCapabilities,
+    ImageChunk(crate::terminal_images::ImageChunk),
+    ImageReply(crate::terminal_images::ImageReply),
+    ImagePaste(crate::terminal_images::ImagePaste),
+    ImageCancel([u8; 16]),
 }
 
 pub fn encode_plaintext_v2(message: &TermPlaintextV2) -> Result<Vec<u8>> {
     match message {
+        TermPlaintextV2::ImageCapabilities => Ok(vec![crate::terminal_images::CAPABILITIES]),
+        TermPlaintextV2::ImageChunk(chunk) => chunk.encode(),
+        TermPlaintextV2::ImagePaste(paste) => paste.encode(),
+        TermPlaintextV2::ImageCancel(id) => {
+            let mut bytes = vec![crate::terminal_images::CANCEL];
+            bytes.extend(id);
+            Ok(bytes)
+        }
+        TermPlaintextV2::ImageReply(reply) => {
+            let mut bytes = vec![crate::terminal_images::REPLY];
+            bytes.extend(serde_json::to_vec(reply)?);
+            Ok(bytes)
+        }
         TermPlaintextV2::Data(bytes) => encode_plaintext(&TermPlaintext::Data(bytes.clone())),
         TermPlaintextV2::Resize { cols, rows } => encode_plaintext(&TermPlaintext::Resize {
             cols: *cols,
@@ -592,6 +611,27 @@ pub fn encode_plaintext_v2(message: &TermPlaintextV2) -> Result<Vec<u8>> {
 
 pub fn decode_plaintext_v2(bytes: &[u8]) -> Result<TermPlaintextV2> {
     match bytes.first().copied() {
+        Some(crate::terminal_images::PASTE) => {
+            return Ok(TermPlaintextV2::ImagePaste(
+                crate::terminal_images::ImagePaste::decode(bytes)?,
+            ));
+        }
+        Some(crate::terminal_images::CANCEL) if bytes.len() == 17 => {
+            return Ok(TermPlaintextV2::ImageCancel(bytes[1..].try_into()?));
+        }
+        Some(crate::terminal_images::CAPABILITIES) if bytes.len() == 1 => {
+            return Ok(TermPlaintextV2::ImageCapabilities);
+        }
+        Some(crate::terminal_images::CHUNK) => {
+            return Ok(TermPlaintextV2::ImageChunk(
+                crate::terminal_images::ImageChunk::decode(bytes)?,
+            ));
+        }
+        Some(crate::terminal_images::REPLY) if bytes.len() <= 8192 => {
+            return Ok(TermPlaintextV2::ImageReply(serde_json::from_slice(
+                &bytes[1..],
+            )?));
+        }
         Some(PLAINTEXT_OUTPUT_KEY) => {
             if bytes.len() != OUTPUT_KEY_PLAINTEXT_LEN {
                 anyhow::bail!("terminal payload is invalid");
@@ -865,6 +905,36 @@ mod tests {
         // The v1 codec never accepts them either.
         assert!(decode_plaintext(&[0x04, 1]).is_err());
         assert!(decode_plaintext(&[0x03]).is_err());
+    }
+
+    #[test]
+    fn malformed_image_extensions_are_refused() {
+        use crate::terminal_images::{CAPABILITIES, CHUNK, REPLY};
+        assert_eq!(
+            decode_plaintext_v2(&[CAPABILITIES]).expect("capability"),
+            TermPlaintextV2::ImageCapabilities
+        );
+        assert!(decode_plaintext_v2(&[CAPABILITIES, 0]).is_err());
+        let reply = crate::terminal_images::ImageReply {
+            id: "0".repeat(32),
+            received: 1,
+            path: Some(format!("/{}", "x".repeat(8192))),
+            error: None,
+        };
+        let bytes = encode_plaintext_v2(&TermPlaintextV2::ImageReply(reply)).expect("reply");
+        assert_eq!(bytes[0], REPLY);
+        assert!(decode_plaintext_v2(&bytes).is_err());
+        let mut chunk = vec![0; 27];
+        chunk[0] = CHUNK;
+        chunk[20] = 1; // total = 1
+        chunk[25] = 255; // unassigned format
+        assert!(decode_plaintext_v2(&chunk).is_err());
+        chunk[25] = 0;
+        assert!(decode_plaintext_v2(&chunk).is_ok());
+        chunk[17..21]
+            .copy_from_slice(&((crate::terminal_images::CHUNK_BYTES + 1) as u32).to_be_bytes());
+        chunk.resize(27 + crate::terminal_images::CHUNK_BYTES, 0);
+        assert!(decode_plaintext_v2(&chunk).is_err());
     }
 
     fn hex(value: &str) -> Vec<u8> {

@@ -45,7 +45,7 @@ const socket = vi.hoisted(() => ({
   handlers: null as TerminalSocketHandlers | null,
   /** What the socket did with the message; `sent` unless a test says otherwise. */
   send: vi.fn<(message: TerminalClientMessage) => TerminalSendResult>(() => "sent"),
-  sendFrame: vi.fn<(frame: ArrayBuffer) => void>(),
+  sendFrame: vi.fn<(frame: ArrayBuffer) => boolean>(() => true),
 }));
 
 const identity = vi.hoisted(() => ({
@@ -89,6 +89,7 @@ afterEach(() => {
   socket.send.mockReset();
   socket.send.mockImplementation(() => "sent");
   socket.sendFrame.mockReset();
+  socket.sendFrame.mockReturnValue(true);
 });
 
 function handlers(): TerminalSocketHandlers {
@@ -389,6 +390,29 @@ async function setupV2() {
 }
 
 describe("useTerminalSessions (multi-viewer)", () => {
+  it.each(["sent", "closed", "failed", "ending", "missing"])(
+    "reports whether an image paste reached the socket (%s)",
+    async (result) => {
+      const { view, localId } = await setup();
+      socket.sendFrame.mockImplementation(() => {
+        if (result === "failed") throw new Error("socket failed");
+        return result !== "closed";
+      });
+      if (result === "ending") act(() => view.result.current.endSession(localId));
+      let sent = false;
+      await act(async () => {
+        sent = await view.result.current.pasteImage(
+          result === "missing" ? "missing-tab" : localId,
+          "0".repeat(32),
+          "/tmp/image.png ",
+        );
+      });
+      expect(sent).toBe(result === "sent");
+      if (result === "ending" || result === "missing")
+        expect(socket.sendFrame).not.toHaveBeenCalled();
+    },
+  );
+
   it("decrypts broadcast frames after the unicast output key and PTY size", async () => {
     const { view, events, outKey } = await setupV2();
     await broadcast(outKey, 1, 1, "world");

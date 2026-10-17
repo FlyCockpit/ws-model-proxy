@@ -1,4 +1,16 @@
 {
+  "imagePaste": {
+    "uploading": "Uploading image… {{percent}}%",
+    "update": "Update wsmp on this node to paste images.",
+    "tooLarge": "Choose a non-empty image up to 8 MiB.",
+    "unsupported": "Choose a PNG, JPEG, or WebP image.",
+    "busy": "Wait for the current image upload to finish.",
+    "limit": "This terminal has reached its image storage limit. End the session to clear its images.",
+    "nodeLimit": "This node has reached its image storage limit. End unused terminal sessions to clear their images.",
+    "overloaded": "This node is busy receiving images. Try again shortly.",
+    "timeout": "The node did not confirm the image upload. Its path was not pasted. Try again.",
+    "failed": "The image could not be pasted. Check the terminal connection and try again."
+  },
   "nodesTitle": "Browser terminals",
   "nodesDescription": "Open a shell on a Full-control node. Relay-only nodes do not accept browser terminals.",
   "open": "Open terminal",

@@ -317,6 +317,7 @@ impl TerminalRegistry {
             terminal_id,
             TerminalSession {
                 viewers: std::collections::BTreeMap::new(),
+                images: self.image_worker.session(),
                 writer: None,
                 pty_size: (80, 24),
                 out: Some(out),

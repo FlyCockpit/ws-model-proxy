@@ -1,4 +1,16 @@
 {
+  "imagePaste": {
+    "uploading": "Subiendo imagen… {{percent}}%",
+    "update": "Actualiza wsmp en este nodo para pegar imágenes.",
+    "tooLarge": "Elige una imagen no vacía de hasta 8 MiB.",
+    "unsupported": "Elige una imagen PNG, JPEG o WebP.",
+    "busy": "Espera a que termine la subida actual.",
+    "limit": "Esta terminal alcanzó su límite de almacenamiento de imágenes. Termina la sesión para eliminarlas.",
+    "nodeLimit": "Este nodo alcanzó su límite de almacenamiento de imágenes. Termina las sesiones de terminal que no uses para eliminar sus imágenes.",
+    "overloaded": "Este nodo está ocupado recibiendo imágenes. Inténtalo de nuevo en un momento.",
+    "timeout": "El nodo no confirmó la subida. No se pegó la ruta de la imagen. Inténtalo de nuevo.",
+    "failed": "No se pudo pegar la imagen. Revisa la conexión de la terminal e inténtalo de nuevo."
+  },
   "nodesTitle": "Terminales del navegador",
   "nodesDescription": "Abre una shell en un nodo con control total. Los nodos en solo retransmisión no aceptan terminales del navegador.",
   "open": "Abrir terminal",

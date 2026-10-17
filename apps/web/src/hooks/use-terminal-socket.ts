@@ -215,7 +215,8 @@ export function useTerminalSocket(
    * its bound). See `TerminalSendResult`.
    */
   send: (message: TerminalClientMessage) => TerminalSendResult;
-  sendFrame: (frame: ArrayBuffer) => void;
+  /** True once an open socket accepts the frame; relay processing is not confirmed. */
+  sendFrame: (frame: ArrayBuffer) => boolean;
 } {
   const handlersRef = useLatestRef(handlers);
   const socketRef = useRef<WebSocket | null>(null);
@@ -232,9 +233,10 @@ export function useTerminalSocket(
 
   const sendFrame = useCallback((frame: ArrayBuffer) => {
     const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
     // Sealed frames have their own per-terminal budget on the relay.
     socket.send(frame);
+    return true;
   }, []);
 
   useEffect(() => {
