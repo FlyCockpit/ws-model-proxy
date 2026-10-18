@@ -84,9 +84,14 @@ The server accepts the relay protocol versions listed in
 protocol bump ships the server and wsmp together when the oldest accepted
 version moves.
 
-A release bumps the protocol at most once. This release speaks relay protocol
-3.0 (v0.3.x spoke 2.4) and supports only that version. Release notes must
-require upgrading the server and every CLI together. Older CLIs are
+A release bumps the protocol at most once. The 0.4.x releases speak relay protocol
+3.0 (v0.3.x spoke 2.4) and support only that version. Compatible optional
+extensions do not require a protocol bump: 0.4.1's encrypted terminal image
+uploads retain 3.0 and start only after the CLI advertises support. A 0.4.0 CLI
+remains usable with the 0.4.1 server, but must be upgraded to use image paste.
+
+When a release moves the oldest accepted protocol version, its release notes
+must require upgrading the server and every CLI together. Older CLIs are
 refused with an upgrade-CLI message; this CLI against an older server reports
 that the server needs upgrading. A genuine future-server upgrade-CLI reply
 still identifies the CLI as the component needing an upgrade. Historical

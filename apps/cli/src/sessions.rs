@@ -148,6 +148,9 @@ pub(crate) struct TermHandshake<'a> {
 
 enum Incoming {
     Write(Vec<u8>),
+    Image(crate::terminal_images::ImageChunk),
+    ImagePaste(crate::terminal_images::ImagePaste),
+    ImageCancel([u8; 16]),
     Resize {
         cols: u16,
         rows: u16,
@@ -1078,6 +1081,7 @@ fn wipe(bytes: &mut [u8]) {
 
 /// One browser tab.
 struct Viewer {
+    image_alive: Arc<AtomicBool>,
     keys: DirectionKeys,
     last_rx: u64,
     next_tx: u64,
@@ -1101,6 +1105,7 @@ impl Viewer {
         approved_identity: Option<[u8; 65]>,
     ) -> Self {
         Self {
+            image_alive: Arc::new(AtomicBool::new(true)),
             keys,
             last_rx: 0,
             next_tx: 1,
@@ -1113,6 +1118,7 @@ impl Viewer {
 
 impl Drop for Viewer {
     fn drop(&mut self) {
+        self.image_alive.store(false, Ordering::Release);
         wipe(&mut self.keys.browser_to_cli);
         wipe(&mut self.keys.cli_to_browser);
     }
@@ -1164,6 +1170,7 @@ impl Drop for OutputKey {
 
 struct TerminalSession {
     viewers: BTreeMap<String, Viewer>,
+    images: crate::terminal_images::ImageSession,
     /// The viewer that most recently typed.
     writer: Option<String>,
     pty_size: (u16, u16),
@@ -1275,11 +1282,20 @@ impl TerminalSession {
         frame
     }
 
-    /// Join order, all unicast: output key, PTY size, then scrollback. The
-    /// epoch does not change on a join.
+    /// Join order, all unicast: output key, human-shell capabilities, PTY
+    /// size, then scrollback. The epoch does not change on a join.
     fn join_frames(&mut self, terminal_id: &str, viewer_id: &str) -> Vec<OutboundFrame> {
         let mut frames = Vec::new();
         frames.extend(self.key_frame(terminal_id, viewer_id));
+        // A browser only uploads after this authenticated capability arrives.
+        // Older browsers ignore the unknown unicast tag; older CLIs never advertise it.
+        if self.operator.is_none() && self.images.supported() {
+            frames.extend(self.seal_unicast(
+                terminal_id,
+                viewer_id,
+                &TermPlaintextV2::ImageCapabilities,
+            ));
+        }
         let (cols, rows) = self.pty_size;
         frames.extend(self.seal_unicast(
             terminal_id,
@@ -1342,9 +1358,17 @@ impl TerminalSession {
         match terminal_crypto::decode_plaintext_v2(&plaintext) {
             Ok(TermPlaintextV2::Data(bytes)) => Incoming::Write(bytes),
             Ok(TermPlaintextV2::Resize { cols, rows }) => Incoming::Resize { cols, rows },
+            Ok(TermPlaintextV2::ImageChunk(chunk)) => Incoming::Image(chunk),
+            Ok(TermPlaintextV2::ImagePaste(paste)) => Incoming::ImagePaste(paste),
+            Ok(TermPlaintextV2::ImageCancel(id)) => Incoming::ImageCancel(id),
             // A browser never sends an output key. Retired and unknown tags
             // fail to decode.
-            Ok(TermPlaintextV2::OutputKey { .. }) | Err(_) => Incoming::DropViewer,
+            Ok(
+                TermPlaintextV2::OutputKey { .. }
+                | TermPlaintextV2::ImageCapabilities
+                | TermPlaintextV2::ImageReply(_),
+            )
+            | Err(_) => Incoming::DropViewer,
         }
     }
 }
@@ -1377,6 +1401,8 @@ fn wire_viewer(viewer_key: &str) -> Option<&str> {
 
 pub(crate) struct TerminalRegistry {
     sessions: BTreeMap<String, TerminalSession>,
+    image_pending: BTreeMap<(String, String), crate::terminal_images::ImagePending>,
+    image_worker: Arc<crate::terminal_images::ImageWorker>,
     pending: BTreeMap<PendingKey, PendingTerminal>,
     #[cfg(unix)]
     tx: SyncSender<FromWorker>,
@@ -1408,12 +1434,22 @@ fn term_exit(terminal_id: &str, status: (Option<i32>, Option<i32>)) -> OutboundF
 }
 
 impl TerminalRegistry {
+    #[cfg(test)]
     pub(crate) fn new(tx: SyncSender<FromWorker>) -> Self {
+        Self::with_image_worker(tx, Arc::new(crate::terminal_images::ImageWorker::new()))
+    }
+
+    pub(crate) fn with_image_worker(
+        tx: SyncSender<FromWorker>,
+        image_worker: Arc<crate::terminal_images::ImageWorker>,
+    ) -> Self {
         // Windows spawns no PTY, so no worker thread needs the channel.
         #[cfg(not(unix))]
         drop(tx);
         Self {
             sessions: BTreeMap::new(),
+            image_pending: BTreeMap::new(),
+            image_worker,
             pending: BTreeMap::new(),
             #[cfg(unix)]
             tx,
@@ -1601,6 +1637,7 @@ impl TerminalRegistry {
         );
         let mut session = TerminalSession {
             viewers,
+            images: self.image_worker.session(),
             // The opener is the first writer.
             writer: viewer_id.map(str::to_string),
             pty_size: (prepared.cols, prepared.rows),
@@ -1702,7 +1739,7 @@ impl TerminalRegistry {
                 .sessions
                 .get(terminal_id)
                 .is_some_and(|session| session.operator.is_some());
-        if !operator_join && !(startup.allow_human_terminal() && startup.full_control()) {
+        if !(operator_join || startup.allow_human_terminal() && startup.full_control()) {
             self.pending.remove(&key);
             return vec![term_rejected(terminal_id, viewer_id, REASON_DISABLED, None)];
         }
@@ -1928,6 +1965,8 @@ impl TerminalRegistry {
         if session.viewers.remove(viewer_id).is_none() {
             return Vec::new();
         }
+        self.image_pending
+            .remove(&(terminal_id.to_string(), viewer_id.to_string()));
         let mut frames = Vec::new();
         if let Some(reason) = notify {
             frames.push(term_rejected(terminal_id, Some(viewer_id), reason, None));
@@ -1954,6 +1993,7 @@ impl TerminalRegistry {
         let Some(mut session) = self.sessions.remove(terminal_id) else {
             return Vec::new();
         };
+        self.image_pending.retain(|(id, _), _| id != terminal_id);
         #[cfg(unix)]
         let (ran, status) = match session.pty.take() {
             Some(pty) => (true, shutdown_pty(pty)),
@@ -1976,6 +2016,54 @@ impl TerminalRegistry {
         seq: u64,
         body: &[u8],
     ) -> Vec<OutboundFrame> {
+        let mut frames = self.poll_image_replies(Instant::now());
+        frames.extend(self.handle_sealed_inner(terminal_id, viewer_id, seq, body));
+        frames
+    }
+
+    /// Poll only in-memory receivers; the image worker owns all filesystem I/O.
+    fn poll_image_replies(&mut self, now: Instant) -> Vec<OutboundFrame> {
+        let sessions = &self.sessions;
+        self.image_pending
+            .retain(|(terminal_id, viewer_id), pending| {
+                sessions.get(terminal_id).is_some_and(|session| {
+                    // Shell exit aborts the browser upload after output drains
+                    // (retireAfterDrain -> forgetSession); no reply is needed here.
+                    session.accepts_input()
+                        && session.viewers.get(viewer_id).is_some_and(|viewer| {
+                            pending.is_current(&session.images, &viewer.image_alive)
+                        })
+                })
+            });
+        let ready = self
+            .image_pending
+            .iter()
+            .filter_map(|(key, pending)| pending.poll(now).map(|reply| (key.clone(), reply)))
+            .collect::<Vec<_>>();
+        let mut frames = Vec::new();
+        for ((terminal_id, viewer_id), reply) in ready {
+            if reply.error.is_some() {
+                self.image_pending
+                    .remove(&(terminal_id.clone(), viewer_id.clone()));
+            }
+            if let Some(session) = self.sessions.get_mut(&terminal_id) {
+                frames.extend(session.seal_unicast(
+                    &terminal_id,
+                    &viewer_id,
+                    &TermPlaintextV2::ImageReply(reply),
+                ));
+            }
+        }
+        frames
+    }
+
+    fn handle_sealed_inner(
+        &mut self,
+        terminal_id: &str,
+        viewer_id: Option<&str>,
+        seq: u64,
+        body: &[u8],
+    ) -> Vec<OutboundFrame> {
         let Some(viewer_id) = viewer_id else {
             tracing::warn!(terminal_id, "ignoring a sealed frame without a viewer id");
             return Vec::new();
@@ -1992,6 +2080,104 @@ impl TerminalRegistry {
             session.decode_incoming(terminal_id, &viewer_key, seq, body)
         };
         match action {
+            Incoming::ImageCancel(id) => {
+                let key = (terminal_id.to_string(), viewer_key);
+                if self
+                    .image_pending
+                    .get(&key)
+                    .is_some_and(|pending| pending.matches(&id))
+                {
+                    self.image_pending.remove(&key);
+                }
+                Vec::new()
+            }
+            Incoming::ImagePaste(paste) => {
+                let key = (terminal_id.to_string(), viewer_key.clone());
+                let live = self
+                    .sessions
+                    .get(terminal_id)
+                    .is_some_and(|session| session.operator.is_none() && session.accepts_input());
+                if !live
+                    || !self
+                        .image_pending
+                        .get(&key)
+                        .is_some_and(|pending| pending.begin_paste(&paste))
+                {
+                    // This paste was never queued. Report dropped input without
+                    // changing the suppression state for actual queue overflow.
+                    tracing::warn!(
+                        terminal_id,
+                        "terminal image paste rejected: offer is unavailable, expired, or invalid"
+                    );
+                    return vec![OutboundFrame::Control(NodeFrame::TermInputDropped {
+                        terminal_id: terminal_id.to_string(),
+                        viewer_id: wire_viewer(&viewer_key).map(str::to_string),
+                    })];
+                }
+                let mut frames = match self.claim_writer(terminal_id, &viewer_key) {
+                    Ok(frames) => frames,
+                    Err(_) => {
+                        if let Some(pending) = self.image_pending.get(&key) {
+                            pending.finish_paste(false);
+                        }
+                        return self.close(terminal_id);
+                    }
+                };
+                let queued = self.enqueue_input(terminal_id, paste.data);
+                if let Some(pending) = self.image_pending.remove(&key) {
+                    pending.finish_paste(queued.as_ref().is_ok_and(|queued| *queued));
+                }
+                match queued {
+                    Ok(queued) => frames.extend(self.note_input(terminal_id, &viewer_key, queued)),
+                    Err(_) => frames.extend(self.close(terminal_id)),
+                }
+                frames
+            }
+            Incoming::Image(chunk) => {
+                let key = (terminal_id.to_string(), viewer_key.clone());
+                if self
+                    .image_pending
+                    .get(&key)
+                    .is_some_and(|pending| pending.accept_next(&chunk))
+                {
+                    self.image_pending.remove(&key);
+                }
+                let Some(session) = self.sessions.get_mut(terminal_id) else {
+                    return Vec::new();
+                };
+                // File writes are only for live human shells, never operator steps
+                // (which may be attached at Relay-only trust) or confirm screens.
+                let id = chunk.id;
+                let result = if session.operator.is_some() || !session.accepts_input() {
+                    Err("unavailable")
+                } else if self.image_pending.contains_key(&key) {
+                    Err("busy")
+                } else if let Some(viewer) = session.viewers.get(&viewer_key) {
+                    self.image_worker.submit(
+                        &session.images,
+                        &viewer_key,
+                        &viewer.image_alive,
+                        chunk,
+                    )
+                } else {
+                    Err("unavailable")
+                };
+                let reply = match result {
+                    Ok(pending) => {
+                        self.image_pending.insert(key, pending);
+                        return Vec::new();
+                    }
+                    Err(reason) => crate::terminal_images::ImageReply::rejected(&id, reason),
+                };
+                session
+                    .seal_unicast(
+                        terminal_id,
+                        &viewer_key,
+                        &TermPlaintextV2::ImageReply(reply),
+                    )
+                    .into_iter()
+                    .collect()
+            }
             Incoming::Write(bytes)
                 if self
                     .sessions
@@ -2157,6 +2343,7 @@ impl TerminalRegistry {
     #[cfg(unix)]
     pub(crate) fn poll(&mut self, now: Instant) -> Vec<OutboundFrame> {
         let mut frames = Vec::new();
+        frames.extend(self.poll_image_replies(now));
         let expired_pending = self
             .pending
             .iter()
@@ -4289,6 +4476,43 @@ mod tests {
             (self.tx_seq, body)
         }
 
+        fn unicast_messages(
+            &self,
+            terminal_id: &str,
+            frames: &[OutboundFrame],
+        ) -> Vec<TermPlaintextV2> {
+            frames
+                .iter()
+                .filter_map(|frame| {
+                    let OutboundFrame::Binary(
+                        NodeBinaryMetadata::TermSealed {
+                            seq,
+                            viewer_id: Some(viewer_id),
+                            epoch: None,
+                            ..
+                        },
+                        body,
+                    ) = frame
+                    else {
+                        return None;
+                    };
+                    if viewer_id != &self.id {
+                        return None;
+                    }
+                    let bytes = terminal_crypto::open_v2(
+                        &self.keys.as_ref().expect("bound").cli_to_browser,
+                        terminal_id,
+                        viewer_id,
+                        DIR_CLI_TO_BROWSER,
+                        *seq,
+                        body,
+                    )
+                    .expect("unicast");
+                    Some(terminal_crypto::decode_plaintext_v2(&bytes).expect("plaintext"))
+                })
+                .collect()
+        }
+
         /// Decode the frames the relay would deliver to this tab: unicast
         /// frames addressed to it, and every broadcast frame.
         fn receive(&mut self, terminal_id: &str, frames: &[OutboundFrame]) -> Vec<Seen> {
@@ -4350,6 +4574,11 @@ mod tests {
                         }
                         TermPlaintextV2::Resize { cols, rows } => Seen::Size(cols, rows),
                         TermPlaintextV2::Data(bytes) => Seen::Data(bytes),
+                        TermPlaintextV2::ImageCapabilities => continue,
+                        TermPlaintextV2::ImageChunk(_)
+                        | TermPlaintextV2::ImageReply(_)
+                        | TermPlaintextV2::ImagePaste(_)
+                        | TermPlaintextV2::ImageCancel(_) => continue,
                     },
                 );
             }
@@ -5602,6 +5831,9 @@ mod tests {
 
     #[cfg(unix)]
     mod operator_tests;
+
+    #[cfg(unix)]
+    mod image_tests;
 
     /// The `command operation` info lines as `(op, command_id, outcome)`.
     /// The default formatter writes the message last, then the fields in the

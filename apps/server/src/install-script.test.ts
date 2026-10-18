@@ -125,7 +125,7 @@ describe("install.sh rendering", () => {
     for (const target of CLI_RELEASE_TARGETS) expect(targets).toContain(`"${target}"`);
     expect(dist).not.toMatch(/unix-archive/); // the installer expects the default .tar.xz
     expect(defaultCliReleaseBaseUrl()).toBe(
-      "https://github.com/FlyCockpit/ws-model-proxy/releases/download/v0.4.0",
+      `${CLI_REPOSITORY}/releases/download/v${SERVER_VERSION}`,
     );
   });
 });

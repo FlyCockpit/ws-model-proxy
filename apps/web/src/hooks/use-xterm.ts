@@ -10,6 +10,8 @@ import {
   clipboardTypesIncludeImage,
   wireTerminalCopyOut,
 } from "@/lib/terminal-copy-out";
+import { clipboardPrefersText } from "@/lib/terminal-image-clipboard";
+import type { TerminalImageAttachment } from "@/lib/terminal-images";
 import { TERMINAL_FONT_FAMILY, TERMINAL_THEME } from "@/lib/terminal-theme";
 import {
   sameSize,
@@ -20,6 +22,9 @@ import {
 
 type XtermHandlers = {
   onData: (data: string) => void;
+  onImage?: (file: File) => Promise<TerminalImageAttachment>;
+  onImagePaste?: (attachment: TerminalImageAttachment, data: string) => Promise<boolean>;
+  onImageError?: (error: unknown) => void;
   /** This pane's own fitted size changed. A follower reports it without resizing xterm. */
   onResize: (size: TerminalSize) => void;
 };
@@ -114,13 +119,24 @@ export function useXterm(options: XtermOptions): {
     termRef.current = term;
     fitRef.current = fit;
     queuedSizesRef.current = 0;
+    type ImagePaste = {
+      attachment: TerminalImageAttachment;
+      sent: Promise<boolean> | null;
+    };
+    let imagePaste: ImagePaste | null = null;
     const disposeCopyOut = wireTerminalCopyOut(term, gate, (data) => {
       const forward = shouldForwardTerminalData({
         following: followRef.current !== null,
         userInput: inputGate.armed(performance.now()),
         data,
       });
-      if (forward) handlersRef.current.onData(data);
+      if (forward) {
+        if (imagePaste)
+          imagePaste.sent =
+            handlersRef.current.onImagePaste?.(imagePaste.attachment, data) ??
+            Promise.resolve(false);
+        else handlersRef.current.onData(data);
+      }
     });
     const resizeSub = term.onResize((size) => {
       if (suppressResizeRef.current || size.cols < 1 || size.rows < 1) return;
@@ -132,15 +148,99 @@ export function useXterm(options: XtermOptions): {
     const armClick = () => {
       if (term.modes.mouseTrackingMode !== "none") armInput();
     };
+    let disposed = false;
+    let uploading = false;
+    const pasteImages = async (files: File[], fallbackText = "") => {
+      if (uploading) {
+        handlersRef.current.onImageError?.(new Error("busy"));
+        return;
+      }
+      uploading = true;
+      let pastedImages = 0;
+      try {
+        for (const file of files) {
+          const upload = handlersRef.current.onImage;
+          if (!upload) throw new Error("unavailable");
+          const attachment = await upload(file);
+          const paste: ImagePaste = { attachment, sent: null };
+          let forwarded = false;
+          try {
+            if (disposed || termRef.current !== term) return;
+            // The transfer can outlive the user-input gate. Arm it again so a
+            // follower's deliberate path paste can claim the writer normally.
+            armInput();
+            imagePaste = paste;
+            term.paste(attachment.text);
+            // xterm emits onData synchronously. Clear the context before
+            // awaiting encryption, so subsequent keystrokes stay ordinary input.
+            imagePaste = null;
+            forwarded = (await paste.sent) ?? false;
+            if (!forwarded) throw new Error("unavailable");
+          } finally {
+            imagePaste = null;
+            if (!forwarded) attachment.cancel();
+          }
+          pastedImages += 1;
+        }
+      } catch (error) {
+        if (disposed || termRef.current !== term) return;
+        if (
+          pastedImages === 0 &&
+          fallbackText.length > 0 &&
+          error instanceof Error &&
+          (error.message === "update" || error.message === "unavailable")
+        ) {
+          armInput();
+          term.paste(fallbackText);
+        } else handlersRef.current.onImageError?.(error);
+      } finally {
+        uploading = false;
+      }
+    };
     const onPaste = (event: ClipboardEvent) => {
       gate.armFromUserGesture();
       armInput();
       const types = event.clipboardData ? Array.from(event.clipboardData.types) : [];
-      if (!clipboardTypesIncludeImage(types)) return;
+      const text = event.clipboardData?.getData("text/plain") ?? "";
+      // Browsers commonly report an image clipboard as just "Files".
+      const files = Array.from(event.clipboardData?.items ?? [])
+        .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+        .flatMap((item) => {
+          const file = item.getAsFile();
+          return file ? [file] : [];
+        });
+      if (files.length === 0 && !clipboardTypesIncludeImage(types)) return;
       event.preventDefault();
       event.stopImmediatePropagation();
-      const text = event.clipboardData?.getData("text/plain") ?? "";
+      // Office-style apps include a rendered image alongside copied cells or
+      // slides. Preserve the user's text when this is a rich-text clipboard.
+      if (clipboardPrefersText(types, text, event.clipboardData?.getData("text/html") ?? "")) {
+        term.paste(text);
+        return;
+      }
+      if (files.length > 0) {
+        void pasteImages(files, text);
+        return;
+      }
       if (text.length > 0) term.paste(text);
+      else handlersRef.current.onImageError?.(new Error("unsupported"));
+    };
+    const onDragOver = (event: DragEvent) => {
+      if (!Array.from(event.dataTransfer?.types ?? []).includes("Files")) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+    };
+    const onDrop = (event: DragEvent) => {
+      const files = Array.from(event.dataTransfer?.files ?? []);
+      if (files.length === 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (files.some((file) => !file.type.startsWith("image/"))) {
+        handlersRef.current.onImageError?.(new Error("unsupported"));
+        return;
+      }
+      term.focus();
+      void pasteImages(files);
     };
     container.addEventListener("keydown", armInput, true);
     container.addEventListener("compositionstart", armInput, true);
@@ -148,12 +248,15 @@ export function useXterm(options: XtermOptions): {
     container.addEventListener("compositionend", armInput, true);
     container.addEventListener("mousedown", armClick, true);
     term.textarea?.addEventListener("paste", onPaste, true);
+    container.addEventListener("dragover", onDragOver);
+    container.addEventListener("drop", onDrop);
     const observer = new ResizeObserver(() => {
       layout();
     });
     observer.observe(container);
     layout();
     return () => {
+      disposed = true;
       observer.disconnect();
       container.removeEventListener("keydown", armInput, true);
       container.removeEventListener("compositionstart", armInput, true);
@@ -161,6 +264,8 @@ export function useXterm(options: XtermOptions): {
       container.removeEventListener("compositionend", armInput, true);
       container.removeEventListener("mousedown", armClick, true);
       term.textarea?.removeEventListener("paste", onPaste, true);
+      container.removeEventListener("dragover", onDragOver);
+      container.removeEventListener("drop", onDrop);
       disposeCopyOut();
       resizeSub.dispose();
       term.dispose();

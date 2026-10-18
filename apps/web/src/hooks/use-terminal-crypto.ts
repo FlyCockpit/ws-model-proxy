@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { decodeTerminalImageMessage, type TerminalImageMessage } from "@/lib/terminal-images";
 
 export const DIRECTION_BROWSER_TO_CLI = 0x01;
 export const DIRECTION_CLI_TO_BROWSER = 0x02;
@@ -26,9 +27,10 @@ export type TerminalPlaintext =
   | { kind: "data"; data: Uint8Array }
   | { kind: "resize"; cols: number; rows: number };
 
-/** v2 plaintexts. `0x03` carries the shared output key and only arrives unicast. */
+/** v2 plaintexts. Output keys and image messages only arrive unicast. */
 export type TerminalPlaintextV2 =
   | TerminalPlaintext
+  | TerminalImageMessage
   | { kind: "outputKey"; epoch: number; key: Uint8Array };
 
 export type TerminalSessionKeys = {
@@ -448,6 +450,8 @@ export function encodeTerminalOutputKey(epoch: number, key: Uint8Array): Uint8Ar
 
 /** v2 decoder. The v1 `decodeTerminalPlaintext` keeps rejecting `0x03`. */
 export function decodeTerminalPlaintextV2(bytes: Uint8Array): TerminalPlaintextV2 {
+  const image = decodeTerminalImageMessage(bytes);
+  if (image) return image;
   if (bytes[0] !== PLAINTEXT_OUTPUT_KEY) return decodeTerminalPlaintext(bytes);
   if (bytes.byteLength !== OUTPUT_KEY_PLAINTEXT_LENGTH) {
     throw new Error("output key plaintext must be 37 bytes");

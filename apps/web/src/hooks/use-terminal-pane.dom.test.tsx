@@ -4,10 +4,18 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { TerminalOutputEvent } from "@/hooks/use-terminal-sessions";
+import type { TerminalImageAttachment } from "@/lib/terminal-images";
 
 type Written = string | { resize: [number, number] } | "reset";
 
-type FakeTerminal = { log: Written[]; focused: number; parse: () => void };
+type FakeTerminal = {
+  log: Written[];
+  focused: number;
+  parse: () => void;
+  textarea: HTMLTextAreaElement;
+  pasted: string[];
+  emit: ((data: string) => void) | null;
+};
 
 const xterm = vi.hoisted(() => ({ instances: [] as FakeTerminal[] }));
 
@@ -16,7 +24,9 @@ vi.mock("@xterm/xterm", () => ({
     cols = 80;
     rows = 24;
     modes = { mouseTrackingMode: "none" };
-    textarea = null;
+    textarea = document.createElement("textarea");
+    pasted: string[] = [];
+    emit: ((data: string) => void) | null = null;
     log: Written[] = [];
     focused = 0;
     /** Writes the parser has not reached yet, as xterm queues them. */
@@ -55,6 +65,10 @@ vi.mock("@xterm/xterm", () => ({
     focus() {
       this.focused += 1;
     }
+    paste(text: string) {
+      this.pasted.push(text);
+      this.emit?.(text);
+    }
     dispose() {}
   },
 }));
@@ -70,7 +84,15 @@ vi.mock("@xterm/addon-web-links", () => ({ WebLinksAddon: class {} }));
 vi.mock("@xterm/xterm/css/xterm.css", () => ({}));
 vi.mock("@/lib/terminal-copy-out", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/terminal-copy-out")>();
-  return { ...actual, wireTerminalCopyOut: () => () => undefined };
+  return {
+    ...actual,
+    wireTerminalCopyOut: (term: FakeTerminal, _gate: unknown, emit: (data: string) => void) => {
+      term.emit = emit;
+      return () => {
+        term.emit = null;
+      };
+    },
+  };
 });
 
 import { useTerminalPane } from "./use-terminal-pane";
@@ -113,7 +135,268 @@ const data = (text: string): TerminalOutputEvent => ({
   data: new TextEncoder().encode(text),
 });
 
+const attachment = (text: string): TerminalImageAttachment => ({
+  id: "0".repeat(32),
+  text,
+  cancel: vi.fn(),
+});
+
 describe("useTerminalPane", () => {
+  it.each(["text/html", "text/rtf", "application/rtf"])(
+    "pastes plain text from a %s clipboard without uploading its rendered image",
+    (richType) => {
+      const source = outputSource();
+      const upload = vi.fn<(_file: File) => Promise<TerminalImageAttachment>>();
+      const { result } = renderHook(() =>
+        useTerminalPane({
+          localId: "local_1",
+          active: true,
+          follow: null,
+          sendInput: () => undefined,
+          sendResize: () => undefined,
+          subscribeOutput: source.subscribeOutput,
+          onImage: upload,
+        }),
+      );
+      act(() => result.current(document.createElement("div")));
+      const term = xterm.instances[0];
+      if (!term) throw new Error("no terminal");
+      const file = new File(["png"], "cells.png", { type: "image/png" });
+      const event = new Event("paste", { cancelable: true });
+      Object.defineProperty(event, "clipboardData", {
+        value: {
+          types: ["Files", "text/plain", richType],
+          items: [{ kind: "file", type: "image/png", getAsFile: () => file }],
+          getData: () => "Name\tValue\nExample\t42",
+        },
+      });
+      act(() => {
+        term.textarea.dispatchEvent(event);
+      });
+      expect(event.defaultPrevented).toBe(true);
+      expect(upload).not.toHaveBeenCalled();
+      expect(term.pasted).toEqual(["Name\tValue\nExample\t42"]);
+    },
+  );
+
+  it.each(["update", "unavailable"])("falls back to clipboard text on %s", async (reason) => {
+    const source = outputSource();
+    const onImageError = vi.fn();
+    const { result } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow: null,
+        sendInput: () => undefined,
+        sendResize: () => undefined,
+        subscribeOutput: source.subscribeOutput,
+        onImage: async () => {
+          throw new Error(reason);
+        },
+        onImageError,
+      }),
+    );
+    act(() => result.current(document.createElement("div")));
+    const term = xterm.instances[0];
+    if (!term) throw new Error("no terminal");
+    const file = new File(["png"], "image.png", { type: "image/png" });
+    const event = new Event("paste", { cancelable: true });
+    Object.defineProperty(event, "clipboardData", {
+      value: {
+        types: ["Files", "text/plain"],
+        items: [{ kind: "file", type: "image/png", getAsFile: () => file }],
+        getData: () => "clipboard text",
+      },
+    });
+    await act(async () => {
+      term.textarea.dispatchEvent(event);
+    });
+    expect(term.pasted).toEqual(["clipboard text"]);
+    expect(onImageError).not.toHaveBeenCalled();
+  });
+
+  it("reports an image-only upload failure without pasting anything", async () => {
+    const source = outputSource();
+    const onImageError = vi.fn();
+    const { result } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow: null,
+        sendInput: () => undefined,
+        sendResize: () => undefined,
+        subscribeOutput: source.subscribeOutput,
+        onImage: async () => {
+          throw new Error("update");
+        },
+        onImageError,
+      }),
+    );
+    act(() => result.current(document.createElement("div")));
+    const term = xterm.instances[0];
+    if (!term) throw new Error("no terminal");
+    const file = new File(["png"], "image.png", { type: "image/png" });
+    const event = new Event("paste", { cancelable: true });
+    Object.defineProperty(event, "clipboardData", {
+      value: {
+        types: ["Files"],
+        items: [{ kind: "file", type: "image/png", getAsFile: () => file }],
+        getData: () => "",
+      },
+    });
+    await act(async () => {
+      term.textarea.dispatchEvent(event);
+    });
+    expect(term.pasted).toEqual([]);
+    expect(onImageError).toHaveBeenCalledWith(expect.objectContaining({ message: "update" }));
+  });
+
+  it("uploads a Files clipboard image before pseudopasting its path", async () => {
+    const source = outputSource();
+    const pasteImage = vi.fn(async () => true);
+    const sendInput = vi.fn();
+    let saved: ((value: TerminalImageAttachment) => void) | undefined;
+    const upload = vi.fn(
+      () =>
+        new Promise<TerminalImageAttachment>((resolve) => {
+          saved = resolve;
+        }),
+    );
+    const { result } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow: null,
+        sendInput,
+        pasteImage,
+        sendResize: () => undefined,
+        subscribeOutput: source.subscribeOutput,
+        onImage: upload,
+      }),
+    );
+    act(() => result.current(document.createElement("div")));
+    const term = xterm.instances[0];
+    if (!term) throw new Error("no terminal");
+    const file = new File(["png"], "screenshot.png", { type: "image/png" });
+    const event = new Event("paste", { cancelable: true });
+    Object.defineProperty(event, "clipboardData", {
+      value: {
+        types: ["Files"],
+        items: [{ kind: "file", type: "image/png", getAsFile: () => file }],
+        getData: () => "accompanying text",
+      },
+    });
+    act(() => {
+      term.textarea.dispatchEvent(event);
+    });
+    expect(event.defaultPrevented).toBe(true);
+    expect(upload).toHaveBeenCalledWith(file);
+    expect(term.pasted).toEqual([]);
+    const offered = attachment("/tmp/wsmp-terminal-example/image.png ");
+    await act(async () => {
+      saved?.(offered);
+    });
+    expect(term.pasted).toEqual(["/tmp/wsmp-terminal-example/image.png "]);
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(pasteImage).toHaveBeenCalledWith(
+      "local_1",
+      "0".repeat(32),
+      "/tmp/wsmp-terminal-example/image.png ",
+    );
+    expect(offered.cancel).not.toHaveBeenCalled();
+  });
+
+  it("does not paste a late upload result after its terminal unmounts", async () => {
+    const source = outputSource();
+    let saved: ((value: TerminalImageAttachment) => void) | undefined;
+    const { result, unmount } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow: null,
+        sendInput: () => undefined,
+        sendResize: () => undefined,
+        subscribeOutput: source.subscribeOutput,
+        onImage: () =>
+          new Promise<TerminalImageAttachment>((resolve) => {
+            saved = resolve;
+          }),
+      }),
+    );
+    act(() => result.current(document.createElement("div")));
+    const term = xterm.instances[0];
+    if (!term) throw new Error("no terminal");
+    const file = new File(["png"], "screenshot.png", { type: "image/png" });
+    const event = new Event("paste", { cancelable: true });
+    Object.defineProperty(event, "clipboardData", {
+      value: {
+        types: ["Files"],
+        items: [{ kind: "file", type: "image/png", getAsFile: () => file }],
+        getData: () => "",
+      },
+    });
+    act(() => {
+      term.textarea.dispatchEvent(event);
+    });
+    expect(saved).toBeTypeOf("function");
+    unmount();
+    const offered = attachment("/tmp/wsmp-terminal-example/image.png ");
+    await act(async () => {
+      saved?.(offered);
+    });
+    expect(term.pasted).toEqual([]);
+    expect(offered.cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each(["no data event", "forwarding blocked", "send declined", "send failed"])(
+    "cancels the offer when image paste produces %s",
+    async (failure) => {
+      const offered = attachment("/tmp/image.png ");
+      const pasteImage = vi.fn(async () => {
+        if (failure === "send failed") throw new Error("unavailable");
+        return false;
+      });
+      const onImageError = vi.fn();
+      const { result } = renderHook(() =>
+        useTerminalPane({
+          localId: "local_1",
+          active: true,
+          follow: { cols: 80, rows: 24 },
+          sendInput: () => undefined,
+          pasteImage,
+          sendResize: () => undefined,
+          subscribeOutput: outputSource().subscribeOutput,
+          onImage: async () => offered,
+          onImageError,
+        }),
+      );
+      act(() => result.current(document.createElement("div")));
+      const term = xterm.instances[0];
+      if (!term) throw new Error("no terminal");
+      if (failure === "no data event") term.emit = null;
+      if (failure === "forwarding blocked") {
+        const emit = term.emit;
+        term.emit = () => emit?.("\x1b[I");
+      }
+      const file = new File(["png"], "image.png", { type: "image/png" });
+      const event = new Event("paste", { cancelable: true });
+      Object.defineProperty(event, "clipboardData", {
+        value: {
+          types: ["Files"],
+          items: [{ kind: "file", type: "image/png", getAsFile: () => file }],
+          getData: () => "",
+        },
+      });
+      await act(async () => {
+        term.textarea.dispatchEvent(event);
+      });
+      expect(offered.cancel).toHaveBeenCalledOnce();
+      expect(onImageError).toHaveBeenCalledWith(
+        expect.objectContaining({ message: "unavailable" }),
+      );
+    },
+  );
+
   it("writes output that arrived before and during a delayed mount once xterm exists", () => {
     const source = outputSource();
     source.emit(data("before "));

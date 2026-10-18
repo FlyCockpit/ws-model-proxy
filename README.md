@@ -127,7 +127,7 @@ Releases are created manually from the `master` branch with the root `Release` G
 
 Before the first release, create a protected `release` environment and add `HOMEBREW_TAP_TOKEN` as an environment secret. It must have `contents:write` access to `FlyCockpit/homebrew-tap` so the release workflow can update `Formula/wsmp.rb`.
 
-> **This server needs wsmp 0.4.0 or newer** (relay protocol 3.0). The server refuses 0.3.x CLIs at connect, so upgrade every node together with the server. You can also build from this repository: `cargo install --path apps/cli --bin wsmp`.
+> **This server needs wsmp 0.4.0 or newer** (relay protocol 3.0). Image paste requires the web app and the node's CLI to be upgraded to 0.4.1. When upgrading from 0.3.x, upgrade every node together with the server; 0.3.x CLIs are refused at connect. You can also build from this repository: `cargo install --path apps/cli --bin wsmp`.
 
 The usual way to install the CLI on a node is the server's own installer, which the **Add a node** dialog runs for you:
 

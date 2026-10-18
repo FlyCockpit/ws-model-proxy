@@ -37,6 +37,12 @@ import {
   trustNewCliKey,
   trustRejectionReason,
 } from "@/lib/terminal-cli-identity";
+import {
+  encodeTerminalImageControl,
+  TERMINAL_IMAGE_PASTE,
+  type TerminalImageAttachment,
+  TerminalImageTransfer,
+} from "@/lib/terminal-images";
 import { takePendingByTerminalId } from "@/lib/terminal-pending";
 import {
   clampTerminalAxis,
@@ -174,6 +180,7 @@ type OutputKeyState = {
 };
 
 type LiveSession = {
+  images: TerminalImageTransfer;
   localId: string;
   terminalId: string;
   viewerId: string;
@@ -327,6 +334,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     reset?: () => void,
   ) => () => void;
   sendInput: (localId: string, data: string) => void;
+  uploadImage: (
+    localId: string,
+    file: File,
+    progress: (percent: number) => void,
+  ) => Promise<TerminalImageAttachment>;
+  pasteImage: (localId: string, id: string, data: string) => Promise<boolean>;
   sendResize: (localId: string, cols: number, rows: number) => void;
 } {
   const identity = useTerminalIdentity();
@@ -362,7 +375,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const buffersRef = useRef(new Map<string, TerminalOutputEvent[]>());
   const pendingResizeRef = useRef(new Map<string, TerminalSize>());
   const sendRef = useRef<(message: TerminalClientMessage) => TerminalSendResult>(() => "closed");
-  const frameRef = useRef<(frame: ArrayBuffer) => void>(() => undefined);
+  const frameRef = useRef<(frame: ArrayBuffer) => boolean>(() => false);
   /** `failOpening`, for the handshake code defined before it. */
   const failOpeningRef = useRef<(localId: string, reason: string) => void>(() => undefined);
   const signRef = useRef(identity.sign);
@@ -411,7 +424,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const closedOpensRef = useRef(new Set<string>());
   const resetBeforeOutputRef = useRef(new Set<string>());
   const earlySealedRef = useRef(new Map<string, SealedTerminalFrame[]>());
-  const sendChainRef = useRef(new Map<string, Promise<void>>());
+  const sendChainRef = useRef(new Map<string, Promise<boolean>>());
   const recvChainRef = useRef(new Map<string, Promise<void>>());
   const acceptSealedRef = useRef<(frame: SealedTerminalFrame) => void>(() => undefined);
   const inputRef = useRef(new Map<string, InputBatch>());
@@ -501,7 +514,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         // A close still owed for it goes on without the tab.
         const intent = closesRef.current.get(tab.terminalId);
         if (intent?.localId === localId) intent.localId = null;
-        sessionsRef.current.delete(tab.terminalId);
+        forgetSession(sessionsRef.current, tab.terminalId);
         pendingRef.current.delete(tab.terminalId);
         attachingRef.current.delete(tab.terminalId);
         earlySealedRef.current.delete(tab.terminalId);
@@ -650,12 +663,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     const tab = tabsRef.current.find((item) => item.localId === localId);
     const terminalId = tab?.terminalId;
     // An exited shell reads nothing; its session only lingers to drain output.
-    if (!terminalId || tab.phase === "exited") return;
+    if (!terminalId || tab.phase === "exited") return Promise.resolve(false);
     const session = sessionsRef.current.get(terminalId);
     if (!session) {
       const resize = decodeMaybeResize(plaintext);
       if (resize) pendingResizeRef.current.set(localId, resize);
-      return;
+      return Promise.resolve(false);
     }
     const seq = session.sendSeq + 1n;
     session.sendSeq = seq;
@@ -673,11 +686,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         });
         // A disconnect or re-attach replaces the session. Its keys are gone,
         // so the CLI would reject this frame.
-        if (sessionsRef.current.get(terminalId) !== session) return;
-        frameRef.current(encodeSealedFrame({ terminalId, seq: Number(seq), body }));
+        if (sessionsRef.current.get(terminalId) !== session) return false;
+        return frameRef.current(encodeSealedFrame({ terminalId, seq: Number(seq), body }));
       })
-      .catch(() => undefined);
+      .catch(() => false);
     sendChainRef.current.set(terminalId, run);
+    return run;
   }, []);
 
   const flushInput = useCallback(
@@ -761,7 +775,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     const run: Promise<void> = previous
       .catch(() => undefined)
       .then(() => {
-        if (sessionsRef.current.get(terminalId) === session) sessionsRef.current.delete(terminalId);
+        if (sessionsRef.current.get(terminalId) === session)
+          forgetSession(sessionsRef.current, terminalId);
         // Drop the keys and any broadcast that never got its epoch key.
         session.output = null;
         session.future = [];
@@ -839,6 +854,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         return;
       }
       const session: LiveSession = {
+        images: new TerminalImageTransfer(),
         localId: pending.localId,
         terminalId: message.terminalId,
         viewerId,
@@ -1057,7 +1073,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   /** A viewer left this tab (slow, stolen, or the socket dropped). */
   const dropSession = useCallback(
     (localId: string, terminalId: string) => {
-      sessionsRef.current.delete(terminalId);
+      forgetSession(sessionsRef.current, terminalId);
       attachingRef.current.delete(terminalId);
       establishingRef.current.delete(localId);
       takePendingByTerminalId(pendingRef.current, terminalId);
@@ -1323,7 +1339,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         attachingRef.current.delete(message.terminalId);
         establishingRef.current.delete(localId);
         // A 2.5 CLI can drop one viewer (bad frame) while the shell runs on.
-        sessionsRef.current.delete(message.terminalId);
+        forgetSession(sessionsRef.current, message.terminalId);
         patchTabNow(localId, {
           phase: "rejected",
           approvalCode: message.approvalCode,
@@ -1343,7 +1359,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         const session = sessionsRef.current.get(terminalId);
         const localId = tabByTerminal(terminalId)?.localId;
         if (!localId) {
-          sessionsRef.current.delete(terminalId);
+          forgetSession(sessionsRef.current, terminalId);
           earlySealedRef.current.delete(terminalId);
           return;
         }
@@ -1374,7 +1390,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (message.type === "detached") {
         const tab = tabByTerminal(message.terminalId);
         if (!tab) {
-          sessionsRef.current.delete(message.terminalId);
+          forgetSession(sessionsRef.current, message.terminalId);
           return;
         }
         // `self` answers this tab's own detach; the tab is already gone.
@@ -1523,6 +1539,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     reattachTimersRef.current.clear();
     lastSentSizeRef.current.clear();
     inputRef.current.clear();
+    for (const session of sessionsRef.current.values()) session.images.abort();
     sessionsRef.current.clear();
     pendingRef.current.clear();
     attachingRef.current.clear();
@@ -1625,8 +1642,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (session.output !== output || seq <= output.recvSeq) return;
       output.recvSeq = seq;
       const decoded = decodeTerminalPlaintextV2(plaintext);
-      // An output key only ever arrives unicast.
-      if (decoded.kind === "outputKey") return;
+      // Output keys and image messages only ever arrive unicast.
+      if (decoded.kind !== "data" && decoded.kind !== "resize") return;
       applyPlaintext(session, decoded);
     },
     [applyPlaintext],
@@ -1662,6 +1679,14 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (seq <= session.recvSeq) return;
       session.recvSeq = seq;
       const decoded = decodeTerminalPlaintextV2(plaintext);
+      if (decoded.kind === "imageCapabilities") {
+        session.images.supported = true;
+        return;
+      }
+      if (decoded.kind === "imageReply") {
+        session.images.receive(decoded.reply);
+        return;
+      }
       if (decoded.kind !== "outputKey") {
         applyPlaintext(session, decoded);
         return;
@@ -1851,6 +1876,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (batch?.timer) clearTimeout(batch.timer);
       inputRef.current.delete(localId);
       patchTabNow(localId, { ending: "pending" });
+      sessionsRef.current.get(tab.terminalId)?.images.abort();
       requestClose(tab.terminalId, localId);
     },
     [patchTabNow, removeTab, requestClose],
@@ -1872,12 +1898,13 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   );
 
   const sendInput = useCallback(
-    (localId: string, data: string) => {
+    (localId: string, data: string, imageId?: string) => {
       const tab = tabsRef.current.find((item) => item.localId === localId);
       // A session being ended takes no more keystrokes.
-      if (tab?.ending === "pending") return;
+      if (tab?.ending === "pending") return false;
       const live =
         tab?.terminalId && tab.phase !== "exited" ? sessionsRef.current.has(tab.terminalId) : false;
+      if (imageId && !live) return false;
       if (tab && live && needsTakeover(viewOf(localId))) {
         // Takeover: the CLI must see this tab's size before its first data
         // frame, so the PTY is resized before the keystroke lands. Both share
@@ -1890,6 +1917,13 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         flushInput(localId);
         sendPlaintext(localId, encodeTerminalResize(own.cols, own.rows));
       }
+      if (imageId) {
+        flushInput(localId);
+        return sendPlaintext(
+          localId,
+          encodeTerminalImageControl(TERMINAL_IMAGE_PASTE, imageId, data),
+        );
+      }
       let batch = inputRef.current.get(localId);
       if (!batch) {
         batch = { pending: "", lastSentAt: Number.NEGATIVE_INFINITY, timer: null };
@@ -1899,9 +1933,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       const wait = INPUT_FLUSH_INTERVAL_MS - (performance.now() - batch.lastSentAt);
       if (wait <= 0 || batch.pending.length >= INPUT_BATCH_MAX_CHARS) {
         flushInput(localId);
-        return;
+        return true;
       }
       batch.timer ??= setTimeout(() => flushInput(localId), wait);
+      return true;
     },
     [clearTimer, flushInput, sendPlaintext, setView, viewOf],
   );
@@ -1909,6 +1944,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   useLayoutEffect(() => {
     sendInputRef.current = sendInput;
   }, [sendInput]);
+
+  const pasteImage = useCallback(
+    async (localId: string, id: string, data: string) => sendInput(localId, data, id),
+    [sendInput],
+  );
 
   const sendResize = useCallback(
     (localId: string, cols: number, rows: number) => {
@@ -1927,6 +1967,40 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       );
     },
     [clearTimer, flushResize, viewOf],
+  );
+
+  const uploadImage = useCallback(
+    async (localId: string, file: File, progress: (percent: number) => void) => {
+      const tab = tabsRef.current.find((item) => item.localId === localId);
+      const session = tab?.terminalId ? sessionsRef.current.get(tab.terminalId) : undefined;
+      const isCurrent = () => {
+        const current = tabsRef.current.find((item) => item.localId === localId);
+        return (
+          !!session &&
+          current?.phase === "live" &&
+          current.terminalId === session.terminalId &&
+          !current.ending &&
+          !current.stepId &&
+          sessionsRef.current.get(session.terminalId) === session
+        );
+      };
+      if (!session || !isCurrent()) throw new Error("unavailable");
+      flushInput(localId);
+      return session.images.upload(
+        file,
+        (plaintext) => sendPlaintext(localId, plaintext),
+        isCurrent,
+        progress,
+      );
+    },
+    [flushInput, sendPlaintext],
+  );
+
+  useEffect(
+    () => () => {
+      for (const session of sessionsRef.current.values()) session.images.abort();
+    },
+    [],
   );
 
   const trustNewKey = useCallback(
@@ -1972,11 +2046,18 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     endSession,
     subscribeOutput,
     sendInput,
+    uploadImage,
+    pasteImage,
     sendResize,
   };
 }
 
 type SendRef = { readonly current: (message: TerminalClientMessage) => TerminalSendResult };
+
+function forgetSession(sessions: Map<string, LiveSession>, terminalId: string): void {
+  sessions.get(terminalId)?.images.abort();
+  sessions.delete(terminalId);
+}
 
 /**
  * Send a close intent's frame on the current socket. Not taken: a closed

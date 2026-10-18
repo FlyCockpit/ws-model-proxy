@@ -78,7 +78,7 @@ describe("node bootstrap HTTP", () => {
   it("serves the well-known document with the canonical origin and enroll path", async () => {
     const res = await app().hono.request("/.well-known/wsmp");
     expect(await res.json()).toEqual({
-      serverVersion: "0.4.0",
+      serverVersion: SERVER_VERSION,
       protocolVersion: "3.0",
       origin: "https://proxy.example.com",
       installScript: "/install.sh",
