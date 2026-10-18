@@ -12,15 +12,16 @@
   <a href="#license"><img alt="License" src="https://shieldcn.dev/github/license/FlyCockpit/ws-model-proxy.svg?variant=secondary&mode=light&size=sm"></a>
 </p>
 
-> The node client for WS Model Proxy 0.4.0.
+> The node client for WS Model Proxy 0.4.1.
 
 `wsmp` turns a computer into a **node** of your WS Model Proxy server. It keeps one outbound
 websocket to the server (no port forwarding), relays model requests to the runtimes on this
 node, and, when you allow it, runs the runtimes, commands, file operations and terminals the
 server asks for.
 
-0.4.0 speaks relay protocol 3.0 only.
-A 0.3 CLI cannot connect to a 0.4.0 server, and this CLI cannot connect to a 0.3 server.
+0.4.1 speaks relay protocol 3.0 and remains compatible with 0.4.0 servers and CLIs.
+Image paste requires both the web app and the node's CLI to be upgraded to 0.4.1.
+A 0.3 CLI cannot connect to a 0.4.x server, and this CLI cannot connect to a 0.3 server.
 
 ## Install
 
@@ -49,7 +50,7 @@ gh attestation verify wsmp-aarch64-unknown-linux-gnu.tar.xz --repo FlyCockpit/ws
 Or build a release tag with cargo directly:
 
 ```sh
-cargo install --git https://github.com/FlyCockpit/ws-model-proxy --tag v0.4.0 --locked wsmp
+cargo install --git https://github.com/FlyCockpit/ws-model-proxy --tag v0.4.1 --locked wsmp
 ```
 
 ## Log in
