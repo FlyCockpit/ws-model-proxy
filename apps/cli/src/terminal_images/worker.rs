@@ -4,7 +4,9 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -23,6 +25,24 @@ const REQUEST_OFFERED: u8 = 1;
 const REQUEST_COMMITTING: u8 = 2;
 const REQUEST_ACCEPTED: u8 = 3;
 const REQUEST_CANCELLED: u8 = 4;
+
+fn cancel_request(state: &AtomicU8) {
+    // Keep cancellation conditional: a paste that is committing or accepted
+    // must retain its files. Use CAS to support Rust 1.88 without fetch_update,
+    // which newer toolchains deprecate in favor of try_update (Rust 1.95).
+    let mut current = state.load(Ordering::Acquire);
+    while matches!(current, REQUEST_PENDING | REQUEST_OFFERED) {
+        match state.compare_exchange_weak(
+            current,
+            REQUEST_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 /// Owned by exactly one terminal. Jobs hold the flag, never this guard.
 pub(crate) struct ImageSession {
@@ -156,11 +176,7 @@ impl ImagePending {
 
 impl Drop for ImagePending {
     fn drop(&mut self) {
-        let _ = self
-            .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                matches!(state, REQUEST_PENDING | REQUEST_OFFERED).then_some(REQUEST_CANCELLED)
-            });
+        cancel_request(&self.state);
     }
 }
 
@@ -187,7 +203,9 @@ impl Job {
 pub(crate) struct ImageWorker {
     sender: Option<SyncSender<Job>>,
     stop: Arc<AtomicBool>,
+    #[cfg(unix)]
     running: Arc<AtomicBool>,
+    #[cfg(unix)]
     next_session: AtomicU64,
     thread: Option<JoinHandle<()>>,
 }
@@ -200,7 +218,9 @@ impl ImageWorker {
             Self {
                 sender: None,
                 stop: Arc::new(AtomicBool::new(true)),
+                #[cfg(unix)]
                 running: Arc::new(AtomicBool::new(false)),
+                #[cfg(unix)]
                 next_session: AtomicU64::new(1),
                 thread: None,
             }
@@ -239,11 +259,14 @@ impl ImageWorker {
             sender,
             thread,
             stop,
+            #[cfg(unix)]
             running,
+            #[cfg(unix)]
             next_session: AtomicU64::new(1),
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn session(&self) -> ImageSession {
         // NodeLink owns this worker across every registry/reconnect, so IDs
         // remain unique for as long as its filesystem store can refer to them.
@@ -334,13 +357,7 @@ impl Store {
         for session in self.sessions.values_mut() {
             session.deliveries.retain(|delivery| {
                 if now >= delivery.deadline {
-                    let _ =
-                        delivery
-                            .state
-                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                                matches!(state, REQUEST_PENDING | REQUEST_OFFERED)
-                                    .then_some(REQUEST_CANCELLED)
-                            });
+                    cancel_request(&delivery.state);
                 }
                 match delivery.state.load(Ordering::Acquire) {
                     REQUEST_PENDING | REQUEST_OFFERED | REQUEST_COMMITTING => true,
@@ -710,7 +727,10 @@ mod tests {
         viewer.store(false, Ordering::Release);
         store.expire(Instant::now());
         assert!(!path.exists());
-        assert_eq!(store.sessions[&1].files.reserved_bytes(), 0);
+        assert!(
+            store.sessions.is_empty(),
+            "empty session releases its quota"
+        );
     }
 
     #[test]

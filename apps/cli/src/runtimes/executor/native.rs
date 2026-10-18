@@ -568,11 +568,11 @@ impl Runtime for NativeRuntime {
                     self.cancel_flag(),
                     &[],
                 )?;
-                if !output
+                if output
                     .trim()
                     .strip_prefix("TasksCurrent=")
                     .and_then(|v| v.parse::<u64>().ok())
-                    .is_some_and(|tasks| tasks > 0)
+                    .is_none_or(|tasks| tasks == 0)
                 {
                     return Ok(None);
                 }

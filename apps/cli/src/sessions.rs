@@ -1739,7 +1739,7 @@ impl TerminalRegistry {
                 .sessions
                 .get(terminal_id)
                 .is_some_and(|session| session.operator.is_some());
-        if !operator_join && !(startup.allow_human_terminal() && startup.full_control()) {
+        if !(operator_join || startup.allow_human_terminal() && startup.full_control()) {
             self.pending.remove(&key);
             return vec![term_rejected(terminal_id, viewer_id, REASON_DISABLED, None)];
         }

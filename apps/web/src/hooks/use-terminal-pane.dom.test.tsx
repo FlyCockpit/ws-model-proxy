@@ -332,11 +332,13 @@ describe("useTerminalPane", () => {
       value: {
         types: ["Files"],
         items: [{ kind: "file", type: "image/png", getAsFile: () => file }],
+        getData: () => "",
       },
     });
     act(() => {
       term.textarea.dispatchEvent(event);
     });
+    expect(saved).toBeTypeOf("function");
     unmount();
     const offered = attachment("/tmp/wsmp-terminal-example/image.png ");
     await act(async () => {
