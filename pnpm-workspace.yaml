@@ -116,10 +116,10 @@ allowBuilds:
 # Catalog: single-version deps shared across workspace packages.
 # Bump shared dependency versions here, not in individual package.json files.
 catalog:
-  "@fastify/busboy": 3.2.2
-  dotenv: ^18.0.4
-  zod: ^4.6.5
-  "@types/node": ^26.6.3
+  "@fastify/busboy": 3.2.3
+  dotenv: ^18.0.7
+  zod: ^4.6.6
+  "@types/node": ^26.6.5
   "@types/ws": ^8.18.2
   # Types for pg (packages/db); keep on the pg 8.x line of packages/db.
   "@types/pg": ^8.23.1
@@ -127,22 +127,22 @@ catalog:
   # pg (and pg-pool) internals by source line (release guard, dispatch fence,
   # query_timeout normalization). Bump deliberately, re-check those lines,
   # and run the PostgreSQL suites that pg-internals.ts names.
-  pg: 8.23.0
-  hono: ^4.13.11
-  "@orpc/server": ^1.15.4
-  "@orpc/openapi": ^1.15.4
-  "@orpc/zod": ^1.15.4
+  pg: 8.23.1
+  hono: ^4.13.13
+  "@orpc/server": ^1.15.5
+  "@orpc/openapi": ^1.15.5
+  "@orpc/zod": ^1.15.5
   # Exact pins: the 1.7.x family must stay aligned so @better-auth/core and
   # plugin types resolve to a single copy. 1.7.6 is the newest release that
   # passes the 7-day minimumReleaseAge gate; bump the whole family together.
-  better-auth: 1.7.6
-  "@better-auth/oauth-provider": 1.7.6
-  "@better-auth/mcp": 1.7.6
-  "@better-auth/cimd": 1.7.6
+  better-auth: 1.7.7
+  "@better-auth/oauth-provider": 1.7.7
+  "@better-auth/mcp": 1.7.7
+  "@better-auth/cimd": 1.7.7
   # MCP SDK v2 (server transport). Exact pin: the handler/auth-adapter API
   # surface is versioned with the protocol; bump deliberately.
-  "@modelcontextprotocol/server": 2.2.0
-  lucide-react: ^1.48.0
+  "@modelcontextprotocol/server": 2.3.1
+  lucide-react: ^1.55.0
   next-themes: ^0.4.6
   react: ^19.3.0
   react-dom: ^19.3.0
@@ -156,37 +156,37 @@ catalog:
   remark-gfm: 4.0.1
   sileo: ^0.1.5
   "@prisma/client": ^7.10.0
-  "@orpc/client": ^1.15.4
+  "@orpc/client": ^1.15.5
   "@types/react": ^19.3.0
   "@types/react-dom": ^19.3.0
   "@testing-library/react": 16.3.3
   "@testing-library/user-event": 14.6.7
   tailwindcss: ^4.3.3
   typescript: ^7.0.2
-  vite: ^8.3.1
-  "@vitejs/plugin-react": ^6.1.1
-  postcss: ^8.5.28
+  vite: ^8.3.4
+  "@vitejs/plugin-react": ^6.1.2
+  postcss: ^8.5.29
   "@tanstack/react-form": ^1.33.5
-  "@tanstack/react-query": ^5.104.0
-  "@tanstack/react-query-devtools": ^5.104.0
-  "@tanstack/react-router": ^1.170.41
+  "@tanstack/react-query": ^5.104.1
+  "@tanstack/react-query-devtools": ^5.104.1
+  "@tanstack/react-router": ^1.170.42
   "@tanstack/react-router-devtools": ^1.167.2
   "@tanstack/react-router-ssr-query": ^1.167.3
-  "@tanstack/react-start": ^1.168.60
+  "@tanstack/react-start": ^1.168.61
   tsx: ^4.23.15
-  vitest: ^5.0.2
+  vitest: ^5.0.3
   vitest-mock-extended: ^5.1.1
   rate-limiter-flexible: ^11.2.1
   ws: ^8.22.0
-  nodemailer: ^10.0.12
+  nodemailer: ^10.1.0
   "@types/nodemailer": ^8.0.2
-  tsdown: ^0.23.0
-  i18next: ^26.4.2
-  jsdom: 30.1.1
-  react-i18next: ^17.0.15
+  tsdown: ^0.23.1
+  i18next: ^26.4.3
+  jsdom: 30.1.2
+  react-i18next: ^17.0.16
   i18next-browser-languagedetector: ^8.2.1
-  openai: ^7.23.0
-  "@anthropic-ai/sdk": ^0.129.0
+  openai: ^7.32.0
+  "@anthropic-ai/sdk": ^0.133.0
   "qrcode.react": ^4.2.0
   "@fontsource-variable/inter": ^5.3.0
   # xterm.js 6 plus the fit and web-links addons published for that line.
