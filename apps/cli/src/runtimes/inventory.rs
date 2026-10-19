@@ -54,6 +54,7 @@ fn probe_always_on(store: &Store) -> Vec<AlwaysOnInventory> {
                 &spec,
                 status,
                 &report.discovered_model_ids,
+                &report.discovered_capability_metadata,
             ))
         })
         .collect()
@@ -166,6 +167,7 @@ mod tests {
                 .map(|index| InventoryModel {
                     id: format!("{}-{index}", "m".repeat(200)),
                     capabilities: vec![ModelCapability::TextGeneration],
+                    capability_metadata: None,
                     embedding_contract: None,
                     transcription: None,
                     engine_facts: None,

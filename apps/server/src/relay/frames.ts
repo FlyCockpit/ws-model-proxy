@@ -16,6 +16,7 @@
  */
 
 import { embeddingContractSchema } from "@ws-model-proxy/api/lib/embedding-contract";
+import { openAiCompatibleCapabilitiesSchema } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import {
   ENGINES,
   fabricIpSchema,
@@ -222,6 +223,7 @@ export const inventoryModelSchema = z
     id: z.string().min(1).max(256),
     /** Probe result; the server stores it as `RuntimeModel.detectedCapabilities`. */
     capabilities: z.array(z.enum(MODEL_CAPABILITIES)).max(MODEL_CAPABILITIES.length),
+    capabilityMetadata: openAiCompatibleCapabilitiesSchema.optional(),
     embeddingContract: embeddingContractSchema.optional(),
     transcription: transcriptionProfileSchema.optional(),
     engineFacts: engineFactsSchema.optional(),

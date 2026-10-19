@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { ORPCError } from "@orpc/server";
 import { hasProvedEmail } from "@ws-model-proxy/auth/proved-email";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import { agentRulesApply } from "../contracts/auth-context";
 import { runtimesContract as c, runtimeSlugSchema } from "../contracts/runtimes";
@@ -236,6 +236,9 @@ type RuntimeModelRow = {
   >;
   capabilities: RuntimeModelRow["detectedCapabilities"];
   capabilitiesOverridden: boolean;
+  detectedCapabilityMetadata: unknown;
+  capabilityMetadata: unknown;
+  capabilityMetadataOverridden: boolean;
   retired: boolean;
   Members: Array<{
     poolId: string;
@@ -252,6 +255,11 @@ function runtimeModelView(model: RuntimeModelRow) {
     detectedCapabilities: model.detectedCapabilities,
     capabilities: model.capabilitiesOverridden ? model.capabilities : model.detectedCapabilities,
     capabilitiesOverridden: model.capabilitiesOverridden,
+    detectedCapabilityMetadata: model.detectedCapabilityMetadata,
+    capabilityMetadata: model.capabilityMetadataOverridden
+      ? model.capabilityMetadata
+      : model.detectedCapabilityMetadata,
+    capabilityMetadataOverridden: model.capabilityMetadataOverridden,
     retired: model.retired,
     pools: model.Members.map((member) => ({
       poolId: member.poolId,
@@ -937,6 +945,24 @@ export const runtimesRouter = {
   releaseRequests: runtimeReleaseRequests,
 
   models: {
+    setCapabilityMetadata: contractProcedure(c.models.setCapabilityMetadata).handler(
+      async ({ input, context }) => {
+        const userId = userIdOf(context);
+        callerActor(context.auth, userId);
+        const updated = await prisma.runtimeModel.updateMany({
+          where: { id: input.runtimeModelId, userId },
+          data:
+            input.capabilityMetadata === null
+              ? { capabilityMetadata: Prisma.DbNull, capabilityMetadataOverridden: false }
+              : {
+                  capabilityMetadata: input.capabilityMetadata,
+                  capabilityMetadataOverridden: true,
+                },
+        });
+        if (updated.count === 0) throw notFound("That served model does not exist.");
+        return ownedRuntimeModelView(userId, input.runtimeModelId);
+      },
+    ),
     setCapabilities: contractProcedure(c.models.setCapabilities).handler(
       async ({ input, context }) => {
         const userId = userIdOf(context);

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { NODE_LOCAL_PLACEHOLDERS } from "../lib/command-render";
+import { openAiCompatibleCapabilitiesSchema } from "../lib/openai-compatible-capabilities";
 import { COMPAT_ENDPOINTS, requestCompatSchema } from "../lib/request-compat";
 import {
   authoredRuntimeSpecSchema,
@@ -73,6 +74,9 @@ export const runtimeModelViewSchema = z
     detectedCapabilities: z.array(z.enum(MODEL_CAPABILITY)),
     capabilities: z.array(z.enum(MODEL_CAPABILITY)),
     capabilitiesOverridden: z.boolean(),
+    detectedCapabilityMetadata: openAiCompatibleCapabilitiesSchema.nullable(),
+    capabilityMetadata: openAiCompatibleCapabilitiesSchema.nullable(),
+    capabilityMetadataOverridden: z.boolean(),
     retired: z.boolean(),
     /** Pools using this served model (own and contributed). */
     pools: z.array(
@@ -747,6 +751,17 @@ export const runtimesContract = {
     ),
   },
   models: {
+    setCapabilityMetadata: mutation(
+      "human",
+      z
+        .object({
+          runtimeModelId: idSchema,
+          capabilityMetadata: openAiCompatibleCapabilitiesSchema.nullable(),
+        })
+        .strict(),
+      runtimeModelViewSchema,
+      "Override a served model's per-surface capability metadata.",
+    ),
     setCapabilities: mutation(
       "agent",
       z

@@ -177,6 +177,8 @@ pub struct InventoryModel {
     pub id: String,
     pub capabilities: Vec<ModelCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_metadata: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_contract: Option<EmbeddingContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcription: Option<TranscriptionProfile>,

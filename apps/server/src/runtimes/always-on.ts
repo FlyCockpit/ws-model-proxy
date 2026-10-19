@@ -88,6 +88,7 @@ export function nodeOriginSpec(
 export type DiscoveredModel = {
   upstreamModelId: string;
   detectedCapabilities: Array<(typeof CAPABILITY)[keyof typeof CAPABILITY]>;
+  detectedCapabilityMetadata: Prisma.InputJsonValue | undefined;
   embeddingContract: Prisma.InputJsonValue | undefined;
   transcriptionProfile: Prisma.InputJsonValue | undefined;
 };
@@ -109,6 +110,7 @@ export function discoveredModels(
     models.push({
       upstreamModelId: model.id,
       detectedCapabilities: model.capabilities.map((capability) => CAPABILITY[capability]),
+      detectedCapabilityMetadata: model.capabilityMetadata as Prisma.InputJsonValue | undefined,
       embeddingContract: model.embeddingContract as Prisma.InputJsonValue | undefined,
       transcriptionProfile: model.transcription as Prisma.InputJsonValue | undefined,
     });
@@ -178,6 +180,7 @@ async function syncDiscoveredModels(
       upstreamModelId: true,
       type: true,
       detectedCapabilities: true,
+      detectedCapabilityMetadata: true,
       embeddingContract: true,
       transcriptionProfile: true,
       retired: true,
@@ -194,6 +197,7 @@ async function syncDiscoveredModels(
           upstreamModelId: model.upstreamModelId,
           type: input.type,
           detectedCapabilities: model.detectedCapabilities,
+          detectedCapabilityMetadata: model.detectedCapabilityMetadata,
           embeddingContract: model.embeddingContract,
           transcriptionProfile: model.transcriptionProfile,
           lastSeenAt: input.now,
@@ -205,6 +209,9 @@ async function syncDiscoveredModels(
       row.type === input.type &&
       !row.retired &&
       sameCapabilities(row.detectedCapabilities, model.detectedCapabilities) &&
+      (model.detectedCapabilityMetadata === undefined ||
+        (row.detectedCapabilityMetadata !== null &&
+          sameJson(row.detectedCapabilityMetadata, model.detectedCapabilityMetadata))) &&
       (model.embeddingContract === undefined ||
         sameJson(row.embeddingContract, model.embeddingContract)) &&
       (model.transcriptionProfile === undefined ||
@@ -221,6 +228,9 @@ async function syncDiscoveredModels(
       data: {
         type: input.type,
         detectedCapabilities: model.detectedCapabilities,
+        ...(model.detectedCapabilityMetadata !== undefined
+          ? { detectedCapabilityMetadata: model.detectedCapabilityMetadata }
+          : {}),
         retired: false,
         ...(model.embeddingContract !== undefined
           ? { embeddingContract: model.embeddingContract }

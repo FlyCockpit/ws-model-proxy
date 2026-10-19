@@ -1,10 +1,12 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { openAiCompatibleCapabilitiesSchema } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { MODEL_CAPABILITIES, type ModelCapabilityWire } from "@ws-model-proxy/api/lib/runtime-spec";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
@@ -57,9 +59,91 @@ export function ServedModelCapabilities({ model }: { model: ServedModel }) {
         title={t("dashboard:runtime.capabilities.dialogTitle", { model: model.upstreamModelId })}
         description={t("dashboard:runtime.capabilities.dialogHint")}
       >
-        {open ? <CapabilityForm model={model} onDone={() => setOpen(false)} /> : null}
+        {open ? (
+          <div className="flex flex-col gap-6">
+            <CapabilityForm model={model} onDone={() => setOpen(false)} />
+            <CapabilityMetadataForm model={model} />
+          </div>
+        ) : null}
       </ResponsiveDialog>
     </div>
+  );
+}
+
+function CapabilityMetadataForm({ model }: { model: ServedModel }) {
+  const { t } = useTranslation(["dashboard", "common"]);
+  const queryClient = useQueryClient();
+  const metadata = useMutation({
+    ...orpc.runtimes.models.setCapabilityMetadata.mutationOptions(),
+    meta: { skipGlobalErrorToast: true },
+  });
+  const [value, setValue] = useState(() =>
+    JSON.stringify(model.capabilityMetadata ?? model.detectedCapabilityMetadata ?? {}, null, 2),
+  );
+  const save = async (capabilityMetadata: unknown | null) => {
+    try {
+      await metadata.mutateAsync({
+        runtimeModelId: model.id,
+        capabilityMetadata: capabilityMetadata as ServedModel["capabilityMetadata"],
+      });
+      await queryClient.invalidateQueries({ queryKey: orpc.runtimes.key() });
+      await queryClient.invalidateQueries({ queryKey: orpc.models.key() });
+      toast.success(t("dashboard:runtime.capabilities.saved"));
+    } catch (error) {
+      toast.error(refusalText(error));
+    }
+  };
+  return (
+    <form
+      className="flex min-w-0 flex-col gap-3 border-t pt-4"
+      onSubmit={(event) => {
+        event.preventDefault();
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(value);
+        } catch {
+          toast.error(t("dashboard:runtime.capabilities.metadataInvalid"));
+          return;
+        }
+        const result = openAiCompatibleCapabilitiesSchema.safeParse(parsed);
+        if (!result.success) {
+          toast.error(t("dashboard:runtime.capabilities.metadataInvalid"));
+          return;
+        }
+        void save(result.data);
+      }}
+    >
+      <label htmlFor={`capability-metadata-${model.id}`} className="text-sm font-medium">
+        {t("dashboard:runtime.capabilities.metadataTitle")}
+      </label>
+      <p className="text-sm text-muted-foreground">
+        {t("dashboard:runtime.capabilities.metadataHint")}
+      </p>
+      <Textarea
+        id={`capability-metadata-${model.id}`}
+        value={value}
+        onChange={(event) => setValue(event.target.value)}
+        rows={10}
+        spellCheck={false}
+        className="font-mono text-xs"
+      />
+      <div className="flex justify-end gap-2">
+        {model.capabilityMetadataOverridden ? (
+          <Button
+            type="button"
+            variant="outline"
+            size="touch"
+            disabled={metadata.isPending}
+            onClick={() => void save(null)}
+          >
+            {t("dashboard:runtime.capabilities.useDetectedMetadata")}
+          </Button>
+        ) : null}
+        <Button type="submit" size="touch" disabled={metadata.isPending}>
+          {t("common:actions.save")}
+        </Button>
+      </div>
+    </form>
   );
 }
 

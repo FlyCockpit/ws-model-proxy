@@ -191,6 +191,9 @@ export async function syncRuntimeModels(
         upstreamModelId: model.id,
         type,
         detectedCapabilities,
+        detectedCapabilityMetadata: (model.capabilityMetadata ?? undefined) as
+          | Prisma.InputJsonValue
+          | undefined,
         embeddingContract: (model.embeddingContract ?? undefined) as
           | Prisma.InputJsonValue
           | undefined,
@@ -202,6 +205,9 @@ export async function syncRuntimeModels(
       update: {
         type,
         detectedCapabilities,
+        detectedCapabilityMetadata: (model.capabilityMetadata ?? Prisma.DbNull) as
+          | Prisma.InputJsonValue
+          | typeof Prisma.DbNull,
         retired: false,
         embeddingContract: (model.embeddingContract ?? Prisma.DbNull) as
           | Prisma.InputJsonValue

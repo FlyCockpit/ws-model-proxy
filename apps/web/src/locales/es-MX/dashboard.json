@@ -1916,6 +1916,10 @@
       "detectedList": "Detectadas: {{list}}",
       "useDetected": "Usar las detectadas",
       "saved": "Capacidades guardadas.",
+      "metadataTitle": "Capacidades de API por superficie (JSON)",
+      "metadataHint": "Edita el inventario validado de capacidades. Se rechazan los campos desconocidos; borra la corrección para usar la detección del nodo.",
+      "metadataInvalid": "Ingresa JSON válido de metadatos de capacidades.",
+      "useDetectedMetadata": "Usar metadatos detectados",
       "values": {
         "text_generation": "Texto",
         "vision_input": "Imágenes de entrada",

@@ -1916,6 +1916,10 @@
       "detectedList": "Detected: {{list}}",
       "useDetected": "Use detected",
       "saved": "Capabilities saved.",
+      "metadataTitle": "Per-surface API capabilities (JSON)",
+      "metadataHint": "Edit the validated capability inventory. Unknown fields are rejected; clear the override to use node discovery.",
+      "metadataInvalid": "Enter valid capability metadata JSON.",
+      "useDetectedMetadata": "Use detected metadata",
       "values": {
         "text_generation": "Text",
         "vision_input": "Images in",
