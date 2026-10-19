@@ -66,7 +66,7 @@ sha2 = "0.11"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
 # Named directly only to install the process-wide `ring` crypto provider (see
 # `wsmp::tls`); default features would add aws-lc-rs back.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # `signal`: shutdown signals (SIGTERM/SIGINT/SIGHUP on Unix; console control
 # events on Windows) start the bounded relay shutdown (`wsmp::shutdown`). On
 # Unix a handler replaces blocking them for `sigwait`, so children never

@@ -16,7 +16,7 @@
     "@better-auth/oauth-provider": "catalog:",
     "@fontsource-variable/inter": "catalog:",
     "@orpc/client": "catalog:",
-    "@orpc/tanstack-query": "^1.15.4",
+    "@orpc/tanstack-query": "^1.15.5",
     "@prisma/client": "catalog:",
     "@tanstack/react-form": "catalog:",
     "@tanstack/react-query": "catalog:",

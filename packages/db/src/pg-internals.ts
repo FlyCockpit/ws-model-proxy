@@ -1,6 +1,6 @@
 // Local type extension for the node-postgres internals that @types/pg does
 // not declare and the statement-bounded client (./client-factory.ts) relies
-// on. Each member names the pg@8.23.0 / pg-pool@3.14.0 source it relies on;
+// on. Each member names the pg@8.23.1 / pg-pool@3.14.0 source it relies on;
 // check those lines again when bumping pg or pg-pool.
 //
 // The instance members are a module augmentation of "pg": it only adds
@@ -75,7 +75,7 @@ export type PgPoolRelease = (error?: Error | boolean) => void;
 
 /**
  * pg's `Query` constructor as it really is (lib/query.js line 9, via
- * lib/utils.js `normalizeQueryConfig`, lines 144-158): `values` may be the
+ * lib/utils.js `normalizeQueryConfig`, lines 154-169): `values` may be the
  * callback, and a `callback` argument wins over it. @types/pg's overloads
  * accept neither a callback in `values` nor a union of the two, so this is
  * the one cast of the pg internals.
