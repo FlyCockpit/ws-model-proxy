@@ -7,8 +7,8 @@ settings:
 catalogs:
   default:
     '@anthropic-ai/sdk':
-      specifier: ^0.129.0
-      version: 0.129.0
+      specifier: ^0.133.0
+      version: 0.133.0
     '@better-auth/cimd':
       specifier: 1.7.7
       version: 1.7.7
@@ -663,7 +663,7 @@ importers:
     dependencies:
       '@anthropic-ai/sdk':
         specifier: 'catalog:'
-        version: 0.129.0(zod@4.6.6)
+        version: 0.133.0(zod@4.6.6)
       '@ws-model-proxy/env':
         specifier: workspace:*
         version: link:../env
@@ -800,8 +800,8 @@ importers:
 
 packages:
 
-  '@anthropic-ai/sdk@0.129.0':
-    resolution: {integrity: sha512-MH7LB20kNpGLUpPTe2OG5XvL/KhX8HUO9XyBaFjgFk6TLS4Xjt0VPIuMKywe7POKKPslX+QxSlVok9e+8kG5Nw==}
+  '@anthropic-ai/sdk@0.133.0':
+    resolution: {integrity: sha512-jlqUN8p8ESTJj+GJnA4KjzbEfF1waEoGzRT8jwytlYGFFgv+/DUQOxlYGvYw10UzhD1kwLqYzxvA3FrTB2YWuQ==}
     hasBin: true
     peerDependencies:
       zod: ^3.25.0 || ^4.0.0
@@ -7501,7 +7501,7 @@ packages:
 
 snapshots:
 
-  '@anthropic-ai/sdk@0.129.0(zod@4.6.6)':
+  '@anthropic-ai/sdk@0.133.0(zod@4.6.6)':
     dependencies:
       json-schema-to-ts: 3.1.1
       standardwebhooks: 1.1.1
