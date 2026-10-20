@@ -6,6 +6,7 @@ import {
   isEditableFocusSnapshot,
   isEditableFocusTarget,
   isKeyboardSummoningInputType,
+  keyboardInsetPx,
   MOBILE_KEYBOARD_DISMISS_GROWTH_PX,
   MOBILE_KEYBOARD_HEIGHT_RATIO,
   visualViewportGrewPastDismissThreshold,
@@ -406,5 +407,13 @@ describe("isEditableFocusSnapshot", () => {
 describe("isEditableFocusTarget", () => {
   it("rejects null and non-element targets", () => {
     expect(isEditableFocusTarget(null)).toBe(false);
+  });
+});
+
+describe("keyboardInsetPx", () => {
+  it("is the covered height only while the keyboard is open", () => {
+    expect(keyboardInsetPx(true, 800, 480.4)).toBe(320);
+    expect(keyboardInsetPx(false, 800, 480)).toBe(0);
+    expect(keyboardInsetPx(true, 400, 480)).toBe(0);
   });
 });

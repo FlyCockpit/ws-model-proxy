@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   canSendResize,
   classifyBroadcastEpoch,
+  floorTerminalSize,
   followSize,
   isFollowing,
   needsTakeover,
@@ -99,5 +100,12 @@ describe("slow reattach", () => {
     expect(second.delayMs).toBe(1_000);
     const later = nextReattach(second.state, 1_000 + TERMINAL_REATTACH_RESET_MS);
     expect(later.state.attempt).toBe(0);
+  });
+});
+
+describe("floorTerminalSize", () => {
+  it("keeps a squeezed pane from shrinking the PTY below 20x5", () => {
+    expect(floorTerminalSize({ cols: 4, rows: 2 })).toEqual({ cols: 20, rows: 5 });
+    expect(floorTerminalSize({ cols: 120, rows: 40 })).toEqual({ cols: 120, rows: 40 });
   });
 });

@@ -25,6 +25,7 @@ const Toaster = ({ position = "bottom-center", ...props }: ToasterProps) => {
 };
 
 type ToastOptions = {
+  description?: string;
   duration?: number;
   action?: {
     label: string;
@@ -36,6 +37,7 @@ function createToastMethod(method: "success" | "error" | "info" | "warning") {
   return (message: string, options?: ToastOptions) => {
     return sileo[method]({
       title: message,
+      ...(options?.description != null ? { description: options.description } : {}),
       ...(options?.duration != null ? { duration: options.duration } : {}),
       ...(options?.action
         ? { button: { title: options.action.label, onClick: options.action.onClick } }

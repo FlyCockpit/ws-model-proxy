@@ -16,6 +16,22 @@ export const MOBILE_KEYBOARD_DISMISS_GROWTH_PX = 160;
 
 const PINCH_ZOOM_SCALE_EPSILON = 0.01;
 
+/**
+ * CSS variable on <html>: how much of the bottom of the viewport the software keyboard covers
+ * (0px while it is closed). Content that must stay above the keyboard (the terminal) subtracts it.
+ */
+export const KEYBOARD_INSET_VAR = "--keyboard-inset";
+
+/** The covered height while the keyboard is open, from the pre-keyboard baseline. */
+export function keyboardInsetPx(
+  isKeyboardOpen: boolean,
+  baselineHeight: number,
+  visualViewportHeight: number,
+): number {
+  if (!isKeyboardOpen) return 0;
+  return Math.max(0, Math.round(baselineHeight - visualViewportHeight));
+}
+
 /** Input types that typically summon a software keyboard on mobile. */
 const KEYBOARD_INPUT_TYPES = new Set([
   "",
@@ -216,6 +232,10 @@ export function useMobileKeyboard(): boolean {
         scale: geometry.scale,
         orientation: geometry.orientation,
       };
+      document.documentElement.style.setProperty(
+        KEYBOARD_INSET_VAR,
+        `${keyboardInsetPx(decision.isKeyboardOpen, decision.nextBaselineHeight, geometry.height)}px`,
+      );
       setKeyboardOpen(decision.isKeyboardOpen);
     };
 
@@ -247,6 +267,7 @@ export function useMobileKeyboard(): boolean {
       document.removeEventListener("focusin", evaluate);
       document.removeEventListener("focusout", onFocusOut);
       virtualKeyboard?.removeEventListener("geometrychange", evaluate);
+      document.documentElement.style.removeProperty(KEYBOARD_INSET_VAR);
     };
   }, []);
 

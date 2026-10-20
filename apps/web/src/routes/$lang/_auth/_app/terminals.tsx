@@ -9,9 +9,20 @@ import {
   CardHeader,
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@ws-model-proxy/ui/components/dropdown-menu";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { SquareTerminal, X } from "lucide-react";
+import { cn } from "@ws-model-proxy/ui/lib/utils";
+import { Maximize2, Minimize2, Settings2, SquareTerminal, TextSelect, X } from "lucide-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { CodeSnippet } from "@/components/code-snippet";
@@ -28,8 +39,15 @@ import {
 import { refusalText } from "@/lib/refusal-text";
 import type { CliTrust } from "@/lib/terminal-cli-identity";
 import { typableCommand } from "@/lib/terminal-protocol";
+import {
+  isTerminalCopyMode,
+  isTerminalShiftEnterMode,
+  TERMINAL_COPY_MODES,
+  TERMINAL_SHIFT_ENTER_MODES,
+} from "@/lib/terminal-settings";
 import { TERMINAL_CHROME_VARS } from "@/lib/terminal-theme";
 import { followSize, writerStatusKey } from "@/lib/terminal-writer";
+import { useUiPreferences } from "@/stores/ui-preferences";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/_app/terminals")({
@@ -71,10 +89,19 @@ function TerminalsPage() {
   // A ticket is used up by its open: take one only once the socket and identity are ready, so
   // the open goes out at once (and a queued command is never decided for nothing).
   const ready = sessions.status === "open" && sessions.identityReady;
+  // Maximize applies only while there is a terminal to show.
+  const maximized =
+    useUiPreferences((prefs) => prefs.terminalMaximized) && sessions.tabs.length > 0;
+  if (maximized)
+    return (
+      <div className={cn("flex min-w-0 flex-col", MAXIMIZED_PAGE_HEIGHT)}>
+        <TerminalWorkspace sessions={sessions} slugOf={slugOf} maximized />
+      </div>
+    );
   return (
     <div className="flex min-w-0 flex-col gap-6">
       <PageHeading page="terminals" />
-      <TerminalWorkspace sessions={sessions} slugOf={slugOf} />
+      <TerminalWorkspace sessions={sessions} slugOf={slugOf} maximized={false} />
       <WaitingSteps sessions={sessions} ready={ready} slugOf={slugOf} />
       <QueuedCommands ready={ready} openTerminal={sessions.openTicket} slugOf={slugOf} />
       <TerminalNodes ready={ready} openTerminal={sessions.openTicket} />
@@ -82,23 +109,43 @@ function TerminalsPage() {
   );
 }
 
+/**
+ * Maximized, the page is exactly the visible part of `main` (a size container): its height less
+ * the app frame's vertical padding (py-4, md:py-6) and whatever the software keyboard covers.
+ */
+const MAXIMIZED_PAGE_HEIGHT =
+  "h-[calc(100cqh-2rem-var(--keyboard-inset,0px))] md:h-[calc(100cqh-3rem-var(--keyboard-inset,0px))]";
+
+/**
+ * Not maximized, the terminal takes most of `main` with the page heading and the card's header
+ * and tabs above it, and stays above the software keyboard.
+ */
+const TERMINAL_BOX_HEIGHT = "h-[max(12rem,calc(100cqh-13rem-var(--keyboard-inset,0px)))]";
+
 function TerminalWorkspace({
   sessions,
   slugOf,
+  maximized,
 }: {
   sessions: Sessions;
   slugOf: (nodeId: string) => string | undefined;
+  maximized: boolean;
 }) {
   const { t } = useTranslation(["terminals", "dashboard"]);
   const { tabs, activeLocalId } = sessions;
   const active = tabs.find((tab) => tab.localId === activeLocalId) ?? null;
+  // Select text belongs to one tab: switching tabs or closing it ends the mode.
+  const [selectingLocalId, setSelectingLocalId] = useState<string | null>(null);
+  const selecting = active !== null && selectingLocalId === active.localId;
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base">{t("terminals:workspaceTitle")}</CardTitle>
-        <CardDescription>{t("terminals:workspaceDescription")}</CardDescription>
-      </CardHeader>
-      <CardContent className="flex min-w-0 flex-col gap-3">
+    <Card className={cn(maximized && "min-h-0 flex-1")}>
+      {maximized ? null : (
+        <CardHeader>
+          <CardTitle className="text-base">{t("terminals:workspaceTitle")}</CardTitle>
+          <CardDescription>{t("terminals:workspaceDescription")}</CardDescription>
+        </CardHeader>
+      )}
+      <CardContent className={cn("flex min-w-0 flex-col gap-3", maximized && "min-h-0 flex-1")}>
         {sessions.status !== "open" ? (
           <p className="text-sm text-muted-foreground" role="status">
             {t(`terminals:socket.${sessions.status}`)}
@@ -111,33 +158,46 @@ function TerminalWorkspace({
           </p>
         ) : (
           <>
-            <div
-              role="tablist"
-              aria-label={t("terminals:workspaceTitle")}
-              className="flex min-w-0 max-w-full gap-2 overflow-x-auto overflow-y-hidden overscroll-x-contain"
-            >
-              {tabs.map((tab) => (
-                <Button
-                  key={tab.localId}
-                  type="button"
-                  role="tab"
-                  aria-selected={tab.localId === activeLocalId}
-                  variant={tab.localId === activeLocalId ? "secondary" : "ghost"}
-                  size="touch"
-                  className="shrink-0 font-mono"
-                  onClick={() => sessions.selectTab(tab.localId)}
-                >
-                  <span>{slugOf(tab.cliDeviceId) ?? t("terminals:unknownNode")}</span>
-                  <span className="text-xs text-muted-foreground">
-                    {t(`terminals:phase.${tab.phase}`)}
-                  </span>
-                </Button>
-              ))}
+            <div className="flex min-w-0 items-center gap-2">
+              <div
+                role="tablist"
+                aria-label={t("terminals:workspaceTitle")}
+                className="flex min-w-0 max-w-full flex-1 gap-2 overflow-x-auto overflow-y-hidden overscroll-x-contain"
+              >
+                {tabs.map((tab) => (
+                  <Button
+                    key={tab.localId}
+                    type="button"
+                    role="tab"
+                    aria-selected={tab.localId === activeLocalId}
+                    variant={tab.localId === activeLocalId ? "secondary" : "ghost"}
+                    size="touch"
+                    className="shrink-0 font-mono"
+                    onClick={() => sessions.selectTab(tab.localId)}
+                  >
+                    <span>{slugOf(tab.cliDeviceId) ?? t("terminals:unknownNode")}</span>
+                    <span className="text-xs text-muted-foreground">
+                      {t(`terminals:phase.${tab.phase}`)}
+                    </span>
+                  </Button>
+                ))}
+              </div>
+              <TerminalToolbar
+                maximized={maximized}
+                selecting={selecting}
+                canSelect={active !== null}
+                onToggleSelecting={() =>
+                  setSelectingLocalId(selecting ? null : (active?.localId ?? null))
+                }
+              />
             </div>
             {active ? <TabStatus sessions={sessions} tab={active} /> : null}
             <div
               style={TERMINAL_CHROME_VARS}
-              className="relative h-[60svh] min-h-72 w-full min-w-0 overflow-hidden rounded-md bg-(--term-bg)"
+              className={cn(
+                "relative w-full min-w-0 overflow-hidden rounded-md bg-(--term-bg)",
+                maximized ? "min-h-0 flex-1" : TERMINAL_BOX_HEIGHT,
+              )}
             >
               {tabs.map((tab) => (
                 <TerminalPane
@@ -145,6 +205,8 @@ function TerminalWorkspace({
                   localId={tab.localId}
                   active={tab.localId === activeLocalId}
                   follow={followSize(tab)}
+                  selecting={selecting && tab.localId === activeLocalId}
+                  onDoneSelecting={() => setSelectingLocalId(null)}
                   sendInput={sessions.sendInput}
                   uploadImage={sessions.uploadImage}
                   pasteImage={sessions.pasteImage}
@@ -157,6 +219,124 @@ function TerminalWorkspace({
         )}
       </CardContent>
     </Card>
+  );
+}
+
+/** Maximize, Select text, and the terminal settings menu, beside the tabs. */
+function TerminalToolbar({
+  maximized,
+  selecting,
+  canSelect,
+  onToggleSelecting,
+}: {
+  maximized: boolean;
+  selecting: boolean;
+  canSelect: boolean;
+  onToggleSelecting: () => void;
+}) {
+  const { t } = useTranslation(["terminals"]);
+  const setMaximized = useUiPreferences((prefs) => prefs.setTerminalMaximized);
+  const maximizeLabel = maximized
+    ? t("terminals:toolbar.restore")
+    : t("terminals:toolbar.maximize");
+  return (
+    <div className="flex shrink-0 gap-1">
+      <Button
+        type="button"
+        variant={selecting ? "secondary" : "ghost"}
+        size="icon-touch"
+        aria-pressed={selecting}
+        aria-label={t("terminals:toolbar.selectText")}
+        title={t("terminals:toolbar.selectText")}
+        disabled={!canSelect}
+        onClick={onToggleSelecting}
+      >
+        <TextSelect aria-hidden="true" />
+      </Button>
+      <TerminalSettingsMenu />
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-touch"
+        aria-pressed={maximized}
+        aria-label={maximizeLabel}
+        title={maximizeLabel}
+        onClick={() => setMaximized(!maximized)}
+      >
+        {maximized ? <Minimize2 aria-hidden="true" /> : <Maximize2 aria-hidden="true" />}
+      </Button>
+    </div>
+  );
+}
+
+function TerminalSettingsMenu() {
+  const { t } = useTranslation(["terminals"]);
+  const copyMode = useUiPreferences((prefs) => prefs.terminalCopy);
+  const setCopyMode = useUiPreferences((prefs) => prefs.setTerminalCopy);
+  const shiftEnter = useUiPreferences((prefs) => prefs.terminalShiftEnter);
+  const setShiftEnter = useUiPreferences((prefs) => prefs.setTerminalShiftEnter);
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-touch"
+            aria-label={t("terminals:toolbar.settings")}
+            title={t("terminals:toolbar.settings")}
+          />
+        }
+      >
+        <Settings2 aria-hidden="true" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-80 max-w-[calc(100vw-2rem)]">
+        <DropdownMenuRadioGroup
+          value={copyMode}
+          onValueChange={(value) => {
+            if (isTerminalCopyMode(value)) setCopyMode(value);
+          }}
+        >
+          <DropdownMenuLabel>{t("terminals:settings.copy.label")}</DropdownMenuLabel>
+          {TERMINAL_COPY_MODES.map((mode) => (
+            <SettingsRadioItem
+              key={mode}
+              value={mode}
+              title={t(`terminals:settings.copy.${mode}.title`)}
+              help={t(`terminals:settings.copy.${mode}.help`)}
+            />
+          ))}
+        </DropdownMenuRadioGroup>
+        <DropdownMenuSeparator />
+        <DropdownMenuRadioGroup
+          value={shiftEnter}
+          onValueChange={(value) => {
+            if (isTerminalShiftEnterMode(value)) setShiftEnter(value);
+          }}
+        >
+          <DropdownMenuLabel>{t("terminals:settings.shiftEnter.label")}</DropdownMenuLabel>
+          {TERMINAL_SHIFT_ENTER_MODES.map((mode) => (
+            <SettingsRadioItem
+              key={mode}
+              value={mode}
+              title={t(`terminals:settings.shiftEnter.${mode}.title`)}
+              help={t(`terminals:settings.shiftEnter.${mode}.help`)}
+            />
+          ))}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+function SettingsRadioItem({ value, title, help }: { value: string; title: string; help: string }) {
+  return (
+    <DropdownMenuRadioItem value={value} closeOnClick={false} className="min-h-11 items-start py-2">
+      <span className="flex min-w-0 flex-col gap-0.5">
+        <span>{title}</span>
+        <span className="text-muted-foreground text-xs">{help}</span>
+      </span>
+    </DropdownMenuRadioItem>
   );
 }
 

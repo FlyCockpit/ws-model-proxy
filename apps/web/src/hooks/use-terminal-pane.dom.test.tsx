@@ -15,6 +15,7 @@ type FakeTerminal = {
   textarea: HTMLTextAreaElement;
   pasted: string[];
   emit: ((data: string) => void) | null;
+  keyHandler: ((event: KeyboardEvent) => boolean) | null;
 };
 
 const xterm = vi.hoisted(() => ({ instances: [] as FakeTerminal[] }));
@@ -64,6 +65,13 @@ vi.mock("@xterm/xterm", () => ({
     }
     focus() {
       this.focused += 1;
+    }
+    keyHandler: ((event: KeyboardEvent) => boolean) | null = null;
+    attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean) {
+      this.keyHandler = handler;
+    }
+    input(data: string) {
+      this.emit?.(data);
     }
     paste(text: string) {
       this.pasted.push(text);
@@ -158,7 +166,7 @@ describe("useTerminalPane", () => {
           onImage: upload,
         }),
       );
-      act(() => result.current(document.createElement("div")));
+      act(() => result.current.containerRef(document.createElement("div")));
       const term = xterm.instances[0];
       if (!term) throw new Error("no terminal");
       const file = new File(["png"], "cells.png", { type: "image/png" });
@@ -196,7 +204,7 @@ describe("useTerminalPane", () => {
         onImageError,
       }),
     );
-    act(() => result.current(document.createElement("div")));
+    act(() => result.current.containerRef(document.createElement("div")));
     const term = xterm.instances[0];
     if (!term) throw new Error("no terminal");
     const file = new File(["png"], "image.png", { type: "image/png" });
@@ -232,7 +240,7 @@ describe("useTerminalPane", () => {
         onImageError,
       }),
     );
-    act(() => result.current(document.createElement("div")));
+    act(() => result.current.containerRef(document.createElement("div")));
     const term = xterm.instances[0];
     if (!term) throw new Error("no terminal");
     const file = new File(["png"], "image.png", { type: "image/png" });
@@ -274,7 +282,7 @@ describe("useTerminalPane", () => {
         onImage: upload,
       }),
     );
-    act(() => result.current(document.createElement("div")));
+    act(() => result.current.containerRef(document.createElement("div")));
     const term = xterm.instances[0];
     if (!term) throw new Error("no terminal");
     const file = new File(["png"], "screenshot.png", { type: "image/png" });
@@ -323,7 +331,7 @@ describe("useTerminalPane", () => {
           }),
       }),
     );
-    act(() => result.current(document.createElement("div")));
+    act(() => result.current.containerRef(document.createElement("div")));
     const term = xterm.instances[0];
     if (!term) throw new Error("no terminal");
     const file = new File(["png"], "screenshot.png", { type: "image/png" });
@@ -370,7 +378,7 @@ describe("useTerminalPane", () => {
           onImageError,
         }),
       );
-      act(() => result.current(document.createElement("div")));
+      act(() => result.current.containerRef(document.createElement("div")));
       const term = xterm.instances[0];
       if (!term) throw new Error("no terminal");
       if (failure === "no data event") term.emit = null;
@@ -420,7 +428,7 @@ describe("useTerminalPane", () => {
     });
     expect(source.subscribeOutput).not.toHaveBeenCalled();
 
-    act(() => result.current(document.createElement("div")));
+    act(() => result.current.containerRef(document.createElement("div")));
     const [term] = xterm.instances;
     act(() => term?.parse());
     expect(term?.log.filter((entry) => entry !== "reset")).toEqual([
@@ -450,7 +458,7 @@ describe("useTerminalPane", () => {
         subscribeOutput: source.subscribeOutput,
       }),
     );
-    act(() => result.current(document.createElement("div")));
+    act(() => result.current.containerRef(document.createElement("div")));
     const [term] = xterm.instances;
     if (!term) throw new Error("no xterm");
     act(() => {
@@ -476,6 +484,40 @@ describe("useTerminalPane", () => {
     ]);
   });
 
+  it.each([
+    ["lf", "\n"],
+    ["esc-cr", "\u001b\r"],
+  ] as const)("sends Shift+Enter as a newline in %s mode", (shiftEnter, expected) => {
+    const sendInput = vi.fn();
+    const { result } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow: null,
+        shiftEnter,
+        sendInput,
+        sendResize: () => undefined,
+        subscribeOutput: outputSource().subscribeOutput,
+      }),
+    );
+    act(() => result.current.containerRef(document.createElement("div")));
+    const [term] = xterm.instances;
+    if (!term?.keyHandler) throw new Error("no key handler");
+    const keydown = new KeyboardEvent("keydown", {
+      key: "Enter",
+      shiftKey: true,
+      cancelable: true,
+    });
+    expect(term.keyHandler(keydown)).toBe(false);
+    expect(keydown.defaultPrevented).toBe(true);
+    // The keypress and keyup of the same key are swallowed without sending again.
+    expect(term.keyHandler(new KeyboardEvent("keypress", { key: "Enter", shiftKey: true }))).toBe(
+      false,
+    );
+    expect(term.keyHandler(new KeyboardEvent("keydown", { key: "Enter" }))).toBe(true);
+    expect(sendInput.mock.calls).toEqual([["local_1", expected]]);
+  });
+
   it("focuses an active pane once its xterm exists", () => {
     const source = outputSource();
     let active = false;
@@ -491,7 +533,7 @@ describe("useTerminalPane", () => {
     );
     active = true;
     rerender();
-    act(() => result.current(document.createElement("div")));
+    act(() => result.current.containerRef(document.createElement("div")));
     const [term] = xterm.instances;
     expect(term?.focused).toBe(1);
     active = false;
@@ -519,7 +561,7 @@ describe("useTerminalPane", () => {
       const container = document.createElement("div");
       workspace.appendChild(container);
       document.body.appendChild(workspace);
-      act(() => result.current(container));
+      act(() => result.current.containerRef(container));
       workspace.remove();
       return sendResize;
     };

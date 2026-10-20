@@ -46,6 +46,20 @@ export function followSize(
   return { cols: state.ptyCols, rows: state.ptyRows };
 }
 
+/**
+ * The smallest size a pane fits to. The writer's size is the PTY size for every viewer, so a
+ * squeezed box (a phone with the keyboard open) must not shrink the shell below this.
+ */
+export const TERMINAL_MIN_COLS = 20;
+export const TERMINAL_MIN_ROWS = 5;
+
+export function floorTerminalSize(size: TerminalSize): TerminalSize {
+  return {
+    cols: Math.max(TERMINAL_MIN_COLS, size.cols),
+    rows: Math.max(TERMINAL_MIN_ROWS, size.rows),
+  };
+}
+
 export function sameSize(a: TerminalSize | null | undefined, b: TerminalSize | null | undefined) {
   return !!a && !!b && a.cols === b.cols && a.rows === b.rows;
 }

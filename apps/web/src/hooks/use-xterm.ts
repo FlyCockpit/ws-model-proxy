@@ -8,12 +8,16 @@ import { useLatestRef } from "@/hooks/use-latest-ref";
 import {
   CopyOutGate,
   clipboardTypesIncludeImage,
+  type Osc52Copy,
   wireTerminalCopyOut,
 } from "@/lib/terminal-copy-out";
 import { clipboardPrefersText } from "@/lib/terminal-image-clipboard";
 import type { TerminalImageAttachment } from "@/lib/terminal-images";
+import { newlineSequence } from "@/lib/terminal-keys";
+import type { TerminalShiftEnterMode } from "@/lib/terminal-settings";
 import { TERMINAL_FONT_FAMILY, TERMINAL_THEME } from "@/lib/terminal-theme";
 import {
+  floorTerminalSize,
   sameSize,
   shouldForwardTerminalData,
   type TerminalSize,
@@ -27,11 +31,15 @@ type XtermHandlers = {
   onImageError?: (error: unknown) => void;
   /** This pane's own fitted size changed. A follower reports it without resizing xterm. */
   onResize: (size: TerminalSize) => void;
+  /** A program asked to copy text (OSC 52) while copy-out was allowed. */
+  onCopy?: (copy: Osc52Copy) => void;
 };
 
 type XtermOptions = XtermHandlers & {
   /** Render at this PTY size (someone else is typing), or null to fit the box. */
   follow: TerminalSize | null;
+  /** What Shift+Enter and Ctrl+Enter send. */
+  shiftEnter: TerminalShiftEnterMode;
 };
 
 export function useXterm(options: XtermOptions): {
@@ -50,9 +58,12 @@ export function useXterm(options: XtermOptions): {
    * written before it is parsed, and before the data written after it.
    */
   followResize: (size: TerminalSize) => void;
+  /** The scrollback and screen as plain text, for Select text mode. */
+  snapshot: () => string;
 } {
   const handlersRef = useLatestRef<XtermHandlers>(options);
   const followRef = useLatestRef(options.follow);
+  const shiftEnterRef = useLatestRef(options.shiftEnter);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const [gate] = useState(() => new CopyOutGate());
@@ -87,17 +98,21 @@ export function useXterm(options: XtermOptions): {
     // box then has no size, and fitting it would resize the PTY for everyone.
     if (termRef.current?.element?.closest("[hidden]")) return;
     const follow = followRef.current;
+    const proposed = fit.proposeDimensions();
+    // Never below the floor: a smaller box clips the terminal instead.
+    const own =
+      proposed && proposed.cols > 0 && proposed.rows > 0
+        ? floorTerminalSize({ cols: proposed.cols, rows: proposed.rows })
+        : null;
     if (!follow) {
-      fit.fit();
+      const term = termRef.current;
+      if (term && own && (term.cols !== own.cols || term.rows !== own.rows))
+        term.resize(own.cols, own.rows);
       return;
     }
-    const proposed = fit.proposeDimensions();
-    if (proposed && proposed.cols > 0 && proposed.rows > 0) {
-      const own = { cols: proposed.cols, rows: proposed.rows };
-      if (!sameSize(own, ownSizeRef.current)) {
-        ownSizeRef.current = own;
-        handlersRef.current.onResize(own);
-      }
+    if (own && !sameSize(own, ownSizeRef.current)) {
+      ownSizeRef.current = own;
+      handlersRef.current.onResize(own);
     }
     if (queuedSizesRef.current === 0) resizeQuietly(follow);
   }, [followRef, handlersRef, resizeQuietly]);
@@ -109,6 +124,8 @@ export function useXterm(options: XtermOptions): {
       fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: 13,
       lineHeight: 1.2,
+      // Option+drag selects text on a Mac even while tmux or an app has the mouse.
+      macOptionClickForcesSelection: true,
       scrollback: 5000,
       theme: TERMINAL_THEME,
     });
@@ -124,19 +141,35 @@ export function useXterm(options: XtermOptions): {
       sent: Promise<boolean> | null;
     };
     let imagePaste: ImagePaste | null = null;
-    const disposeCopyOut = wireTerminalCopyOut(term, gate, (data) => {
-      const forward = shouldForwardTerminalData({
-        following: followRef.current !== null,
-        userInput: inputGate.armed(performance.now()),
-        data,
-      });
-      if (forward) {
-        if (imagePaste)
-          imagePaste.sent =
-            handlersRef.current.onImagePaste?.(imagePaste.attachment, data) ??
-            Promise.resolve(false);
-        else handlersRef.current.onData(data);
+    const disposeCopyOut = wireTerminalCopyOut(
+      term,
+      gate,
+      (data) => {
+        const forward = shouldForwardTerminalData({
+          following: followRef.current !== null,
+          userInput: inputGate.armed(performance.now()),
+          data,
+        });
+        if (forward) {
+          if (imagePaste)
+            imagePaste.sent =
+              handlersRef.current.onImagePaste?.(imagePaste.attachment, data) ??
+              Promise.resolve(false);
+          else handlersRef.current.onData(data);
+        }
+      },
+      (copy) => handlersRef.current.onCopy?.(copy),
+    );
+    // Shift+Enter / Ctrl+Enter: send the newline sequence instead of xterm's CR. Handled on
+    // keydown (preventDefault also stops the keypress) and swallowed on keypress and keyup.
+    term.attachCustomKeyEventHandler((event) => {
+      const sequence = newlineSequence(shiftEnterRef.current, event);
+      if (sequence === null) return true;
+      if (event.type === "keydown") {
+        event.preventDefault();
+        term.input(sequence, true);
       }
+      return false;
     });
     const resizeSub = term.onResize((size) => {
       if (suppressResizeRef.current || size.cols < 1 || size.rows < 1) return;
@@ -148,6 +181,8 @@ export function useXterm(options: XtermOptions): {
     const armClick = () => {
       if (term.modes.mouseTrackingMode !== "none") armInput();
     };
+    // Any press in the pane opens the copy window: tmux and agents copy on mouse release.
+    const armCopy = () => gate.armFromUserGesture();
     let disposed = false;
     let uploading = false;
     const pasteImages = async (files: File[], fallbackText = "") => {
@@ -247,6 +282,8 @@ export function useXterm(options: XtermOptions): {
     container.addEventListener("compositionupdate", armInput, true);
     container.addEventListener("compositionend", armInput, true);
     container.addEventListener("mousedown", armClick, true);
+    container.addEventListener("pointerdown", armCopy, true);
+    container.addEventListener("pointerup", armCopy, true);
     term.textarea?.addEventListener("paste", onPaste, true);
     container.addEventListener("dragover", onDragOver);
     container.addEventListener("drop", onDrop);
@@ -263,6 +300,8 @@ export function useXterm(options: XtermOptions): {
       container.removeEventListener("compositionupdate", armInput, true);
       container.removeEventListener("compositionend", armInput, true);
       container.removeEventListener("mousedown", armClick, true);
+      container.removeEventListener("pointerdown", armCopy, true);
+      container.removeEventListener("pointerup", armCopy, true);
       term.textarea?.removeEventListener("paste", onPaste, true);
       container.removeEventListener("dragover", onDragOver);
       container.removeEventListener("drop", onDrop);
@@ -272,7 +311,7 @@ export function useXterm(options: XtermOptions): {
       if (termRef.current === term) termRef.current = null;
       if (fitRef.current === fit) fitRef.current = null;
     };
-  }, [container, followRef, gate, handlersRef, inputGate, layout]);
+  }, [container, followRef, gate, handlersRef, inputGate, layout, shiftEnterRef]);
 
   const followCols = options.follow?.cols ?? null;
   const followRows = options.follow?.rows ?? null;
@@ -287,8 +326,10 @@ export function useXterm(options: XtermOptions): {
     termRef.current?.write(data);
   }, []);
   const reset = useCallback(() => {
+    // A reset comes before a scrollback replay: an old copy in it must not fire again.
+    gate.disarm();
     termRef.current?.reset();
-  }, []);
+  }, [gate]);
   const focus = useCallback(() => {
     termRef.current?.focus();
   }, []);
@@ -308,5 +349,29 @@ export function useXterm(options: XtermOptions): {
     [followRef, resizeQuietly],
   );
 
-  return { containerRef: setContainer, host: container, write, reset, focus, followResize };
+  const snapshot = useCallback(() => {
+    const buffer = termRef.current?.buffer.active;
+    if (!buffer) return "";
+    const lines: string[] = [];
+    for (let index = 0; index < buffer.length; index += 1) {
+      const line = buffer.getLine(index);
+      if (!line) continue;
+      // A wrapped row continues the previous line: join it back into one.
+      const text = line.translateToString(true);
+      if (line.isWrapped && lines.length > 0) lines[lines.length - 1] += text;
+      else lines.push(text);
+    }
+    while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    return lines.join("\n");
+  }, []);
+
+  return {
+    containerRef: setContainer,
+    host: container,
+    write,
+    reset,
+    focus,
+    followResize,
+    snapshot,
+  };
 }

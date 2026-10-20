@@ -1,9 +1,14 @@
-import { type RefCallback, useEffect } from "react";
+import { type RefCallback, useEffect, useLayoutEffect, useState } from "react";
 
 import { useLatestRef } from "@/hooks/use-latest-ref";
 import type { TerminalOutputEvent } from "@/hooks/use-terminal-sessions";
 import { useXterm } from "@/hooks/use-xterm";
+import type { Osc52Copy } from "@/lib/terminal-copy-out";
 import type { TerminalImageAttachment } from "@/lib/terminal-images";
+import {
+  DEFAULT_TERMINAL_SHIFT_ENTER_MODE,
+  type TerminalShiftEnterMode,
+} from "@/lib/terminal-settings";
 import type { TerminalSize } from "@/lib/terminal-writer";
 
 type TerminalPaneHandlers = {
@@ -16,6 +21,10 @@ type TerminalPaneHandlers = {
   pasteImage?: (localId: string, id: string, data: string) => Promise<boolean>;
   onImageError?: (error: unknown) => void;
   sendResize: (localId: string, cols: number, rows: number) => void;
+  onCopy?: (copy: Osc52Copy) => void;
+  shiftEnter?: TerminalShiftEnterMode;
+  /** Select text mode: a frozen plain-text copy of the terminal covers it. */
+  selecting?: boolean;
   subscribeOutput: (
     localId: string,
     listener: (event: TerminalOutputEvent) => void,
@@ -23,10 +32,16 @@ type TerminalPaneHandlers = {
   ) => () => void;
 };
 
-export function useTerminalPane(handlers: TerminalPaneHandlers): RefCallback<HTMLDivElement> {
+export function useTerminalPane(handlers: TerminalPaneHandlers): {
+  containerRef: RefCallback<HTMLDivElement>;
+  /** The text shown while selecting, or null when not selecting. */
+  selectionText: string | null;
+} {
   const handlersRef = useLatestRef(handlers);
   const xterm = useXterm({
     follow: handlers.follow,
+    shiftEnter: handlers.shiftEnter ?? DEFAULT_TERMINAL_SHIFT_ENTER_MODE,
+    onCopy: (copy) => handlersRef.current.onCopy?.(copy),
     onData: (data) => handlersRef.current.sendInput(handlersRef.current.localId, data),
     onImage: (file) => {
       const upload = handlersRef.current.onImage;
@@ -42,6 +57,7 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): RefCallback<HTM
   });
   const xtermRef = useLatestRef(xterm);
   const { localId, active } = handlers;
+  const selecting = handlers.selecting ?? false;
   const { host } = xterm;
 
   // Subscribe only once xterm exists. Until then the session hook keeps the
@@ -59,11 +75,20 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): RefCallback<HTM
     );
   }, [localId, host, handlersRef, xtermRef]);
 
-  // Focus once the pane is active and xterm exists (a new host is a new xterm).
+  // Select text: freeze the text when the mode starts, before paint so the overlay never flashes
+  // empty. Output keeps reaching xterm underneath; leaving the mode shows it live again.
+  const [selectionText, setSelectionText] = useState<string | null>(null);
+  const { snapshot } = xterm;
+  useLayoutEffect(() => {
+    setSelectionText(selecting && host ? snapshot() : null);
+  }, [selecting, host, snapshot]);
+
+  // Focus once the pane is active and xterm exists (a new host is a new xterm), and again when
+  // Select text ends.
   const { focus } = xterm;
   useEffect(() => {
-    if (active && host) focus();
-  }, [active, host, focus]);
+    if (active && host && !selecting) focus();
+  }, [active, host, focus, selecting]);
 
-  return xterm.containerRef;
+  return { containerRef: xterm.containerRef, selectionText };
 }
