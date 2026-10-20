@@ -600,8 +600,15 @@ function validationIssues(error: z.ZodError, sensitive: boolean): ValidationIssu
     );
 }
 
+/**
+ * `Invalid input: nodeId (nodeId is only for ...); spec.launch (...).` Each issue's message is
+ * in the text too (agents often read only the text). A sensitive tool's issues carry a code,
+ * never a message, so its text names the path and code only (`issueOf`).
+ */
 function validationError(issues: ValidationIssue[]): ToolResult {
-  const fields = issues.map((issue) => issue.path).join(", ");
+  const fields = issues
+    .map((issue) => `${issue.path} (${"message" in issue ? issue.message : issue.code})`)
+    .join("; ");
   return toolError(`Invalid input: ${fields}.`, { error: { code: "invalid_input", issues } });
 }
 

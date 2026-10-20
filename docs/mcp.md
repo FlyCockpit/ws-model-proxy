@@ -173,6 +173,9 @@ it in full and refusals name the failing path). Start from
 `forkFrom`. The schema is `runtimeSpecSchema` in
 `packages/api/src/lib/runtime-spec.ts`, and the node validates the same rules.
 
+`nodeId` is only for always-on runtimes (which require it). To pin a startable
+runtime, use `spec.launch.labels`, `runtime_start` `nodeIds`, or a profile.
+
 A spec has exactly one of:
 
 - `address` (an **always-on** runtime: a server that is already running):
@@ -228,6 +231,28 @@ A spec has exactly one of:
     `{kind: "discrete", gpuCount, vramGb, ramGb?, vendor?}`), `labels` the node
     must carry, optional `port: {fixed}` (≥ 1024, single node only), and
     `fabric` (multi-node only).
+  - `reservations` (single node only, at most 8): memory the runtime holds on
+    other nodes while it runs, for a launcher that starts work there itself
+    (for example over SSH). Each is `{labels, resources}`: `labels` (at least
+    one) pick the node, `resources` is a `resources` entry. Every reservation
+    lands on its own node with all of its labels, never the runtime's node;
+    `runtime_start` `nodeIds` and profile pins move only the runtime's node.
+    Placement counts a reservation like a rank's claim, so nothing else is
+    placed into that memory, and a start that cannot place one is refused with
+    the reservation's labels and why (no other node with the labels, offline,
+    on hold, or not enough memory on the closest node). Nothing is ever sent to
+    a reserved node: health, readiness and stop proofs run on the runtime's own
+    node. A reservation holds exactly as long as the runtime's claim (a
+    stopping runtime keeps it until the stop is proven; marked stopped, it
+    stays counted). A reserved node that goes offline makes the instance
+    `UNAVAILABLE`, and it is stopped after `unavailableStopMs` unless the node
+    returns first; a deleted one stops it at once. Nodes never see
+    `reservations` (it is not part of the launch hash), so changing only the
+    reservations of a running instance needs a restart (`needsRestart`,
+    `launch_changed`) to place them again. The instance view lists
+    `reservations` (node, labels, `memoryGb`, `reserved`), the start preview
+    lists where each goes, and node views count them in `reservedNowMemoryGb`
+    and list them with `role: "reservation"`.
   - `commands` (one entry, or one per rank): `start` required; `stop`
     required for `service` and for an interactive stop, optional for `process`
     (the node's stop ends everything in the rank's slice and proves it, so a
@@ -418,8 +443,9 @@ A result is JSON in the text content and in `structuredContent.result`. Output
 is redacted (no secret WMP holds ever appears), made JSON-safe, and capped at
 256 KiB; a larger result fails with `OUTPUT_TOO_LARGE`. The `nodes_get` list
 rows (hostname, `fabrics` as name, ip and `peerCount`, `gpus` as vendor and
-name, `secretNames`, counts) leave out null fields and empty lists: a missing
-field is null or empty.
+name, `secretNames`, counts, `usableMemoryGb` and `reservedNowMemoryGb`: what
+instances hold there now, reservations included) leave out null fields and
+empty lists: a missing field is null or empty.
 
 A failed call returns `isError: true` with `structuredContent.error`:
 
@@ -428,8 +454,10 @@ A failed call returns `isError: true` with `structuredContent.error`:
   `node_secret_set` replaces even that message with the reason, so nothing a
   procedure says can carry a secret back.
 - **Invalid input** is `invalid_input` with up to 20 `issues`, each `path` and
-  `message` (sensitive tools get `path` and `code` only). A message may quote
-  part of your own input; a sensitive tool's input is never echoed.
+  `message` (sensitive tools get `path` and `code` only). The text repeats
+  them: `Invalid input: nodeId (nodeId is only for always-on runtimes ...).`
+  (sensitive tools: `path (code)`). A message may quote part of your own
+  input; a sensitive tool's input is never echoed.
 - `TOO_MANY_REQUESTS` (tool rate limit, with `retryAfterSeconds`) and
   `REQUEST_ABORTED` (the request or credential went away). `BAD_REQUEST`,
   `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `CONFLICT` and

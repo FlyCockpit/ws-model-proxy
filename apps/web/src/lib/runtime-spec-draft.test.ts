@@ -223,5 +223,60 @@ describe("runtime spec draft", () => {
     expect(draftPathOf(["launch", "readiness"])).toEqual(["readiness", "enabled"]);
     expect(draftPathOf(["address", "auth", "env"])).toBeNull();
     expect(draftPathOf([])).toBeNull();
+    expect(draftPathOf(["launch", "reservations"])).toEqual(["reservations"]);
+    expect(draftPathOf(["launch", "reservations", 0, "labels"])).toEqual([
+      "reservations",
+      0,
+      "labels",
+    ]);
+    expect(draftPathOf(["launch", "reservations", 1, "resources", "memoryGb"])).toEqual([
+      "reservations",
+      1,
+      "resource",
+      "memoryGb",
+    ]);
+  });
+
+  it("round-trips reservations, edits them, and points their issues at their inputs", () => {
+    const spec = {
+      launch: {
+        management: "service",
+        groupSize: 1,
+        resources: [{ kind: "unified", memoryGb: 100 }],
+        labels: ["ds-head"],
+        reservations: [
+          { labels: ["ds-worker"], resources: { kind: "unified", memoryGb: 100 } },
+          { labels: ["ds-worker", "rack-b"], resources: { kind: "cpu", ramGb: 8 } },
+        ],
+        commands: [{ start: "up", stop: "down", status: "check" }],
+        health: HEALTH,
+      },
+    };
+    expect(runtimeSpecSchema.safeParse(spec).success).toBe(true);
+    const draft = specToDraft(spec);
+    expect(draft.reservations.map((reservation) => reservation.labels)).toEqual([
+      "ds-worker",
+      "ds-worker, rack-b",
+    ]);
+    expect(draftToSpec(draft, spec, "STARTABLE")).toEqual(spec);
+    // Removing every reservation drops the field; an empty list as written stays.
+    expect(
+      (draftToSpec({ ...draft, reservations: [] }, spec, "STARTABLE").launch as object) ?? {},
+    ).not.toHaveProperty("reservations");
+    const empty = { launch: { ...spec.launch, reservations: [] } };
+    expect(draftToSpec(specToDraft(empty), empty, "STARTABLE")).toEqual(empty);
+    // A reservation without labels on a group: both issues land on their inputs.
+    const values = editorValues(spec);
+    values.draft = {
+      ...values.draft,
+      groupSize: "2",
+      reservations: [{ ...values.draft.reservations[0], labels: "" }] as typeof draft.reservations,
+    };
+    const reading = readSpecEditor(values, "STARTABLE", MESSAGES);
+    expect(reading.ok).toBe(false);
+    if (reading.ok) return;
+    const paths = reading.issues.map((issue) => issue.path.join("."));
+    expect(paths).toContain("draft.reservations");
+    expect(paths).toContain("draft.reservations.0.labels");
   });
 });

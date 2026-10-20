@@ -136,7 +136,11 @@ const runtimeCreateInput = z
     slug: z.string(),
     name: z.string(),
     kind: z.enum(["ALWAYS_ON", "STARTABLE"]).optional(),
-    nodeId: idSchema.optional(),
+    nodeId: idSchema
+      .optional()
+      .describe(
+        "Always-on only. Pin a startable one with spec.launch.labels, runtime_start nodeIds or a profile.",
+      ),
     preset: z.string().optional(),
     spec: z.record(z.string(), z.unknown()).optional(),
     limits: z.record(z.string(), z.unknown()).optional(),

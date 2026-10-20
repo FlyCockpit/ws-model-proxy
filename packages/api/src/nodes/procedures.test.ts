@@ -220,6 +220,7 @@ describe("nodes.deleteOffline (MCP node_delete)", () => {
     db.node.findFirst.mockResolvedValueOnce({ id: "node-1", slug: "box", connection } as never);
     db.profileItem.findFirst.mockResolvedValueOnce(null);
     db.instanceRank.findMany.mockResolvedValueOnce([{ instanceId: "inst-1" }] as never);
+    db.instanceReservation.findMany.mockResolvedValueOnce([] as never);
     db.fabricMember.findMany.mockResolvedValue([] as never);
   }
 
@@ -490,9 +491,11 @@ describe("delete", () => {
       { instanceId: "i-1" },
       { instanceId: "i-2" },
     ] as never);
+    // An instance holding a reservation here (launch.reservations) stops too.
+    db.instanceReservation.findMany.mockResolvedValueOnce([{ instanceId: "i-3" }] as never);
     db.fabricMember.findMany.mockResolvedValueOnce([] as never);
     const out = await client(PERSON, { disconnect }).delete({ nodeId: "node-1" });
-    expect(out).toEqual({ deleted: true, stoppedInstances: ["i-1", "i-2"] });
+    expect(out).toEqual({ deleted: true, stoppedInstances: ["i-1", "i-2", "i-3"] });
     expect(db.node.delete).toHaveBeenCalledWith({ where: { id: "node-1" } });
     expect(disconnect).toHaveBeenCalledWith("node-1", "node_deleted");
     // A parent delete: the node's whole fence set (fenceParentDelete) before any row.

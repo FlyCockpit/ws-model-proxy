@@ -32,6 +32,14 @@
  * otherwise other sets are tried (`head_not_in_frozen_fabric` / `no_free_ports`, or
  * `fabric_port_ranges_disjoint` when the ranges share no port, when none works).
  *
+ * Reservations (`launch.reservations`, single-node only): memory the instance holds on other
+ * nodes without running anything there. Each is placed in the same plan as the rank, by its
+ * labels (never by `nodeIds`: those pin the rank), on its own node other than the rank's, and
+ * takes memory and GPUs exactly like a rank (no port). A loaded reservation claim
+ * (`PlacementRank.reservation`) counts like any claim. When the best node for the rank leaves a
+ * reservation no room, the next node for the rank is tried; a refusal names the reservation's
+ * labels and why.
+ *
  * Preemption (only when nothing fits without it, only when the request allows it): the stop
  * set with the least disruption, compared as (contributed instances, instances, ranks, GiB
  * freed, ids). Only the caller's own running STARTABLE instances of another runtime are ever
@@ -42,6 +50,7 @@ import type { RefusalReason } from "../contracts/refusals";
 import { compareCodePoints } from "./canonical-json";
 import {
   type GpuVendor,
+  launchReservations,
   type RuntimeLaunch,
   type RuntimeResource,
   runtimeResourceSchema,
@@ -102,6 +111,11 @@ export type PlacementRank = {
   resources: unknown;
   /** HELD_UNKNOWN (marked stopped) claims stay counted: no stop releases them. */
   claim: "HELD" | "HELD_UNKNOWN";
+  /**
+   * A reservation (`InstanceReservation`): memory and GPUs only, no port (`port` and `distPort`
+   * are ignored). Its claim is its instance's rank claim.
+   */
+  reservation?: boolean;
 };
 
 export type PlacementInstance = {
@@ -145,7 +159,10 @@ export type PlacementContext = {
   stopping?: ReadonlySet<string>;
 };
 
-type LaunchShape = Pick<RuntimeLaunch, "groupSize" | "resources" | "labels" | "port" | "fabric">;
+type LaunchShape = Pick<
+  RuntimeLaunch,
+  "groupSize" | "resources" | "labels" | "port" | "fabric" | "reservations"
+>;
 
 export type PlacementRequest = {
   runtimeId: string;
@@ -153,10 +170,23 @@ export type PlacementRequest = {
   launch: LaunchShape;
   /** Exactly these nodes, in rank order (explicit node ids or a restart). */
   nodeIds?: readonly string[];
-  /** A restart: the instance's own claims do not count, and it keeps its own ports. */
-  restart?: { instanceId: string; ports: readonly number[]; distPort: number | null };
+  /**
+   * A restart: the instance's own claims do not count, and it keeps its own ports. Its
+   * reservations' nodes (by index) are preferred when they still fit.
+   */
+  restart?: {
+    instanceId: string;
+    ports: readonly number[];
+    distPort: number | null;
+    reservationNodeIds?: ReadonlyArray<string | null>;
+  };
   /** Nodes this request may use (a profile's placeable nodes). Absent: every node. */
   allowedNodeIds?: ReadonlySet<string>;
+  /**
+   * Nodes reservations may use (a profile's placeable nodes, whatever its item pins). Absent:
+   * every node. `nodeIds` and `allowedNodeIds` never limit reservations.
+   */
+  reservationNodeIds?: ReadonlySet<string>;
   /** Refuse a Relay-only node that does not hold this version (`definition_frozen`). */
   checkFrozen: boolean;
   /** May stop instances to make room. */
@@ -175,8 +205,22 @@ export type PlannedPlacement = {
   resources: Record<string, unknown>;
 };
 
+export type PlannedReservation = {
+  /** Position in `launch.reservations`. */
+  index: number;
+  nodeId: string;
+  nodeSlug: string;
+  labels: string[];
+  /** The reservation's resources, with the GPUs the planner picked (`gpus`). */
+  resources: Record<string, unknown>;
+  /** GiB of node memory it holds (GPU memory included). */
+  memoryGb: number;
+};
+
 export type PlannedStart = {
   placements: PlannedPlacement[];
+  /** One per `launch.reservations` entry, in order (empty without reservations). */
+  reservations: PlannedReservation[];
   fabric: { fabricId: string; name: string; headAddr: string } | null;
   distPort: number | null;
   /** Instances this plan stops that hold a claim on one of these nodes (start waits). */
@@ -374,6 +418,8 @@ function fit(
   budget: Budget,
   resources: unknown,
   fixedPort: number | undefined,
+  /** False for a reservation: it takes no port (`port` is 0). */
+  needsPort = true,
 ): Fit {
   const needs = resourceNeeds(resources);
   if (needs.memoryGb > budget.memoryGb + EPSILON) return { ok: false, reason: "not_enough_memory" };
@@ -388,6 +434,7 @@ function fit(
     .reduce((sum, gpu) => sum + gpu.freeGb, 0);
   if (dedicated > 0 && totalFree + EPSILON < dedicated * needs.vramGb)
     return { ok: false, reason: "not_enough_memory" };
+  if (!needsPort) return { ok: true, port: 0, gpuKeys, needs };
   const port = freePort(budget, node, fixedPort);
   if (port === null)
     return { ok: false, reason: fixedPort === undefined ? "no_free_ports" : "port_in_use" };
@@ -531,6 +578,8 @@ type RankChoice = {
 type InstanceChoice = {
   working: Working;
   ranks: RankChoice[];
+  /** One per `launch.reservations` entry, in order (no port). */
+  reservations: RankChoice[];
   fabric: PlacementFabric | null;
   cost: Cost;
   leftover: number;
@@ -554,6 +603,8 @@ export class PlacementPlanner {
   readonly #frozen: Map<string, readonly PlacementFrozenFabric[] | null>;
   /** Alternative node sets still allowed in this pass (`MAX_SET_TRIES`). */
   #setTries = MAX_SET_TRIES;
+  /** Why the last rank choice left a reservation no room (this `place()` call), or null. */
+  #reservationRefusal: PlacementRefusal | null = null;
   readonly #stops: PlannedStop[] = [];
 
   constructor(context: PlacementContext) {
@@ -607,8 +658,10 @@ export class PlacementPlanner {
           if ((recordedGpuKeys(rank.resources) !== null) !== recordedPass) return;
           const budget = this.#budgets.get(rank.nodeId);
           if (!budget) return;
-          budget.ports.add(rank.port);
-          if (rank.distPort !== null) budget.ports.add(rank.distPort);
+          if (!rank.reservation) {
+            budget.ports.add(rank.port);
+            if (rank.distPort !== null) budget.ports.add(rank.distPort);
+          }
           const needs = resourceNeeds(rank.resources);
           const gpuKeys = claimGpus(budget, needs, rank.resources);
           this.#gpuClaims.set(`${instance.id}|${index}`, gpuKeys);
@@ -623,6 +676,7 @@ export class PlacementPlanner {
 
   /** Places one instance; on success its claims (and any preemption) are committed. */
   place(request: PlacementRequest): PlacementResult {
+    this.#reservationRefusal = null;
     const working: Working = { budgets: this.#cloneBudgets(), victims: new Set() };
     if (request.restart) this.#freeInstance(working, request.restart.instanceId, "restart");
 
@@ -672,7 +726,9 @@ export class PlacementPlanner {
           detail: "A stopped instance has a stop step a person runs in a terminal.",
         });
     }
-    const nodeIds = new Set(ranks.map((rank) => rank.node.id));
+    const reserved = chosen.reservations;
+    // A reservation's node counts too: its memory is used once the rank runs.
+    const nodeIds = new Set([...ranks, ...reserved].map((rank) => rank.node.id));
     // Never its own id: a restart waiting for itself would never start.
     const blockedBy = [...this.#stopping]
       .filter(
@@ -685,7 +741,7 @@ export class PlacementPlanner {
       this.#stopping.delete(request.restart.instanceId);
       this.#draining.delete(request.restart.instanceId);
     }
-    for (const rank of ranks) {
+    for (const rank of [...ranks, ...reserved]) {
       const live = rank.node.liveFreeMemoryGb;
       const on = (nodeId: string) => nodeId === rank.node.id;
       // A node a stop frees reports its memory only after the stop.
@@ -729,6 +785,23 @@ export class PlacementPlanner {
             ...(rank.gpuKeys.length > 0 ? { gpus: [...rank.gpuKeys] } : {}),
           },
         })),
+        reservations: reserved.map((choice, index) => {
+          const reservation = launchReservations(request.launch)[index];
+          return {
+            index,
+            nodeId: choice.node.id,
+            nodeSlug: choice.node.slug,
+            labels: [...(reservation?.labels ?? [])],
+            resources: {
+              ...((reservation?.resources ?? { kind: "none" }) as Record<string, unknown>),
+              ...(choice.gpuKeys.length > 0 ? { gpus: [...choice.gpuKeys] } : {}),
+            },
+            memoryGb:
+              Math.round(
+                (choice.needs.memoryGb + choice.needs.gpuCount * choice.needs.vramGb) * 100,
+              ) / 100,
+          };
+        }),
         fabric:
           fabric && head
             ? { fabricId: fabric.id, name: fabric.name, headAddr: memberIp(head.node.id) ?? "" }
@@ -757,11 +830,12 @@ export class PlacementPlanner {
     let kept = new Set(chosen.working.victims);
     for (const victim of victims) {
       const without = new Set([...kept].filter((id) => id !== victim.id));
-      const replay = this.#replayRanks(base, request, chosen.ranks, without);
+      const replay = this.#replayRanks(base, request, chosen.ranks, without, chosen.reservations);
       if (!replay) continue;
       kept = without;
       chosen.working = replay.working;
       chosen.ranks = replay.ranks;
+      chosen.reservations = replay.reservations;
     }
     chosen.cost = this.#costOfWorking(chosen.working);
   }
@@ -772,7 +846,8 @@ export class PlacementPlanner {
     request: PlacementRequest,
     ranks: readonly RankChoice[],
     victims: ReadonlySet<string>,
-  ): { working: Working; ranks: RankChoice[] } | null {
+    reservations: readonly RankChoice[],
+  ): { working: Working; ranks: RankChoice[]; reservations: RankChoice[] } | null {
     const working: Working = {
       budgets: new Map([...base.budgets].map(([id, budget]) => [id, cloneBudget(budget)])),
       victims: new Set(base.victims),
@@ -792,7 +867,19 @@ export class PlacementPlanner {
       budget.ports.add(choice.port);
       replayed.push(choice);
     }
-    return { working, ranks: replayed };
+    // The reservations on the same nodes (no port), so the committed budgets keep them.
+    const replayedReservations: RankChoice[] = [];
+    for (const [index, reservation] of reservations.entries()) {
+      const budget = working.budgets.get(reservation.node.id);
+      const resources = launchReservations(request.launch)[index]?.resources;
+      if (!budget || !resources) return null;
+      const fitted = fit(reservation.node, budget, resources, undefined, false);
+      if (!fitted.ok) return null;
+      const choice = rankChoice(reservation.node, budget, fitted, [], reservation.waits);
+      apply(budget, choice.needs, choice.gpuKeys, 1);
+      replayedReservations.push(choice);
+    }
+    return { working, ranks: replayed, reservations: replayedReservations };
   }
 
   // ── Explicit nodes (nodeIds or a restart) ──
@@ -843,13 +930,29 @@ export class PlacementPlanner {
     for (const [index, node] of nodes.entries()) {
       // A fixed port of the (new) version wins; otherwise a restart keeps its own port.
       const fixedPort = launch.port?.fixed ?? request.restart?.ports[index];
-      const choice = this.#rankOn(working, request, node, index, fixedPort, request.preempt);
+      const choice = this.#rankOn(
+        working,
+        request,
+        node,
+        rankResources(launch, index),
+        fixedPort,
+        request.preempt,
+      );
       if ("reason" in choice)
         return { refusal: this.#fitRefusal(choice.reason, node, request, index, working) };
       this.#commitRank(working, choice);
       ranks.push(choice);
     }
-    return { working, ranks, fabric, cost: this.#costOfWorking(working), leftover: 0 };
+    const reserved = this.#placeReservations(working, request, ranks, request.preempt);
+    if ("refusal" in reserved) return reserved;
+    return {
+      working,
+      ranks,
+      reservations: reserved.reservations,
+      fabric,
+      cost: this.#costOfWorking(working),
+      leftover: 0,
+    };
   }
 
   // ── Automatic placement ──
@@ -898,7 +1001,10 @@ export class PlacementPlanner {
         this.#bestGroup(working, request, eligible, null, preempt, into, groups),
       );
       for (const reason of fitReasons) reasons.add(reason);
-      return choice ?? { refusal: this.#autoRefusal(reasons, request, eligible) };
+      if (choice) return choice;
+      // The rank fits somewhere, but no node for it leaves its reservations room.
+      if (this.#reservationRefusal) return { refusal: this.#reservationRefusal };
+      return { refusal: this.#autoRefusal(reasons, request, eligible) };
     }
 
     // Multi-node: one fabric. No fabric with enough members at all → no_shared_fabric.
@@ -1123,6 +1229,16 @@ export class PlacementPlanner {
       working.victims.add(seed.id);
       this.#freeInstance(working, seed.id, "stop");
     }
+    if (launchReservations(request.launch).length > 0 && request.launch.groupSize === 1)
+      return this.#greedyWithReservations(
+        working,
+        request,
+        candidates,
+        fabric,
+        preempt,
+        reasons,
+        head,
+      );
     const used = new Set<string>();
     const ranks: RankChoice[] = [];
     for (let index = 0; index < request.launch.groupSize; index++) {
@@ -1133,7 +1249,7 @@ export class PlacementPlanner {
           working,
           request,
           node,
-          index,
+          rankResources(request.launch, index),
           request.launch.port?.fixed,
           preempt,
         );
@@ -1148,13 +1264,151 @@ export class PlacementPlanner {
       used.add(best.node.id);
       ranks.push(best);
     }
+    // Reservations need groupSize 1 (the spec refuses others); placed here only defensively.
+    const reserved = this.#placeReservations(working, request, ranks, preempt);
+    if ("refusal" in reserved) {
+      this.#reservationRefusal = reserved.refusal;
+      return null;
+    }
     return {
       working,
       ranks,
+      reservations: reserved.reservations,
       fabric,
       cost: this.#costOfWorking(working),
       leftover: ranks.reduce((sum, rank) => sum + rank.leftover[0], 0),
     };
+  }
+
+  /**
+   * A single-node instance with reservations: the rank's nodes in best-fit order, the first
+   * whose reservations all fit too (so a rank never takes the only node a reservation could
+   * use while another node would do). Records the last reservation refusal.
+   */
+  #greedyWithReservations(
+    working: Working,
+    request: PlacementRequest,
+    candidates: readonly PlacementNode[],
+    fabric: PlacementFabric | null,
+    preempt: boolean,
+    reasons: Set<RefusalReason>,
+    head: string | null,
+  ): InstanceChoice | null {
+    const options: RankChoice[] = [];
+    for (const node of candidates) {
+      if (head !== null && node.id !== head) continue;
+      const choice = this.#rankOn(
+        working,
+        request,
+        node,
+        rankResources(request.launch, 0),
+        request.launch.port?.fixed,
+        preempt,
+      );
+      if ("reason" in choice) reasons.add(choice.reason);
+      else options.push(choice);
+    }
+    options.sort(compareRank);
+    for (const option of options) {
+      const trial = cloneWorking(working);
+      this.#commitRank(trial, option);
+      const reserved = this.#placeReservations(trial, request, [option], preempt);
+      if ("refusal" in reserved) {
+        this.#reservationRefusal = reserved.refusal;
+        continue;
+      }
+      return {
+        working: trial,
+        ranks: [option],
+        reservations: reserved.reservations,
+        fabric,
+        cost: this.#costOfWorking(trial),
+        leftover: option.leftover[0],
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Places every reservation of the request in `working` (committed there), each on its own
+   * node by its labels: not a node of `ranks`, not another reservation's, within
+   * `reservationNodeIds`, eligible like a rank's node (labels, agents' trust, holds, online;
+   * nothing is dispatched there, so frozen definitions do not matter), with room (after stops
+   * when `preempt`). Best fit, a restart's previous node first. A refusal names the labels.
+   */
+  #placeReservations(
+    working: Working,
+    request: PlacementRequest,
+    ranks: readonly RankChoice[],
+    preempt: boolean,
+  ): { reservations: RankChoice[] } | { refusal: PlacementRefusal } {
+    const reservations = launchReservations(request.launch);
+    const used = new Set(ranks.map((rank) => rank.node.id));
+    const placed: RankChoice[] = [];
+    for (const [index, reservation] of reservations.entries()) {
+      const reasons = new Map<RefusalReason, PlacementNode | null>();
+      const note = (reason: RefusalReason, node: PlacementNode | null) => {
+        if (!reasons.has(reason)) reasons.set(reason, node);
+      };
+      const previous = request.restart?.reservationNodeIds?.[index] ?? null;
+      let best: RankChoice | null = null;
+      let closest: { node: PlacementNode; freeGb: number } | null = null;
+      for (const node of [...this.#nodes.values()].sort((a, b) =>
+        compareCodePoints(a.slug, b.slug),
+      )) {
+        if (used.has(node.id)) continue;
+        if (request.reservationNodeIds && !request.reservationNodeIds.has(node.id)) continue;
+        const ineligible = this.#reservationIneligible(node, reservation.labels);
+        if (ineligible) {
+          note(ineligible, node);
+          continue;
+        }
+        const choice = this.#rankOn(
+          working,
+          request,
+          node,
+          reservation.resources,
+          undefined,
+          preempt,
+          false,
+        );
+        if ("reason" in choice) {
+          note(choice.reason, node);
+          const freeGb = working.budgets.get(node.id)?.memoryGb ?? 0;
+          if (!closest || freeGb > closest.freeGb) closest = { node, freeGb };
+          continue;
+        }
+        if (node.id === previous) {
+          best = choice;
+          break;
+        }
+        if (!best || compareRank(choice, best) < 0) best = choice;
+      }
+      if (!best)
+        return {
+          refusal: reservationRefusal(
+            index,
+            reservation.labels,
+            reservation.resources,
+            reasons,
+            closest,
+            preempt,
+          ),
+        };
+      this.#commitRank(working, best, false);
+      used.add(best.node.id);
+      placed.push(best);
+    }
+    return { reservations: placed };
+  }
+
+  /** Why a reservation with these labels cannot use `node` (see `#placeReservations`). */
+  #reservationIneligible(node: PlacementNode, labels: readonly string[]): RefusalReason | null {
+    if (!labels.every((label) => node.labels.includes(label))) return "label_mismatch";
+    if (this.#context.agent && node.trust !== "FULL") return "trust_relay";
+    if (node.held) return "node_held";
+    if (!node.online) return "node_offline";
+    return null;
   }
 
   /** How this rank fits on `node`: as is, or (with `preempt`) after the cheapest stops. */
@@ -1162,18 +1416,19 @@ export class PlacementPlanner {
     working: Working,
     request: PlacementRequest,
     node: PlacementNode,
-    rank: number,
+    resources: RuntimeResource,
     fixedPort: number | undefined,
     preempt: boolean,
+    /** False for a reservation (no port). */
+    needsPort = true,
   ): RankChoice | { reason: "not_enough_memory" | "port_in_use" | "no_free_ports" } {
     const budget = working.budgets.get(node.id);
     if (!budget) return { reason: "not_enough_memory" };
-    const resources = rankResources(request.launch, rank);
     const waits = [...this.#draining].some(
       (id) =>
         id !== request.restart?.instanceId && this.#heldOn(id, (nodeId) => nodeId === node.id),
     );
-    const plain = fit(node, budget, resources, fixedPort);
+    const plain = fit(node, budget, resources, fixedPort, needsPort);
     if (plain.ok) return rankChoice(node, budget, plain, [], waits);
     // Ports are not freed by a stop (the claim keeps them until released): no preemption helps.
     if (!preempt || plain.reason !== "not_enough_memory") return { reason: plain.reason };
@@ -1198,7 +1453,7 @@ export class PlacementPlanner {
       if (bestCost && compareCost(cost, bestCost) >= 0) continue;
       const trial = cloneBudget(budget);
       for (const victim of victims) this.#freeOnNode(trial, victim, node.id);
-      const fitted = fit(node, trial, resources, fixedPort);
+      const fitted = fit(node, trial, resources, fixedPort, needsPort);
       if (!fitted.ok) {
         if (fitted.reason !== "not_enough_memory") reason = fitted.reason;
         continue;
@@ -1209,8 +1464,8 @@ export class PlacementPlanner {
     return best ?? { reason };
   }
 
-  /** Frees the chosen victims everywhere, then takes the rank's claim. */
-  #commitRank(working: Working, choice: RankChoice): void {
+  /** Frees the chosen victims everywhere, then takes the rank's (or a reservation's) claim. */
+  #commitRank(working: Working, choice: RankChoice, withPort = true): void {
     for (const victim of choice.victims) {
       if (working.victims.has(victim.id)) continue;
       working.victims.add(victim.id);
@@ -1222,7 +1477,7 @@ export class PlacementPlanner {
     const gpuKeys = pickGpus(budget, choice.needs) ?? choice.gpuKeys;
     choice.gpuKeys = gpuKeys;
     apply(budget, choice.needs, gpuKeys, 1);
-    budget.ports.add(choice.port);
+    if (withPort) budget.ports.add(choice.port);
   }
 
   /**
@@ -1263,7 +1518,7 @@ export class PlacementPlanner {
 
   #freePorts(working: Working, instance: PlacementInstance): void {
     for (const rank of instance.ranks) {
-      if (!rank.nodeId) continue;
+      if (!rank.nodeId || rank.reservation) continue;
       const budget = working.budgets.get(rank.nodeId);
       if (!budget) continue;
       budget.ports.delete(rank.port);
@@ -1448,6 +1703,57 @@ export class PlacementPlanner {
   #cloneBudgets(): Map<string, Budget> {
     return new Map([...this.#budgets].map(([id, budget]) => [id, cloneBudget(budget)]));
   }
+}
+
+function cloneWorking(working: Working): Working {
+  return {
+    budgets: new Map([...working.budgets].map(([id, budget]) => [id, cloneBudget(budget)])),
+    victims: new Set(working.victims),
+  };
+}
+
+/**
+ * Why reservation `index` cannot be placed, naming its labels: the closest miss first (room on
+ * the node with the most free memory, then ports never apply, then offline, held, trust, and
+ * no other node with the labels).
+ */
+function reservationRefusal(
+  index: number,
+  labels: readonly string[],
+  resources: RuntimeResource,
+  reasons: ReadonlyMap<RefusalReason, PlacementNode | null>,
+  closest: { node: PlacementNode; freeGb: number } | null,
+  preempt: boolean,
+): PlacementRefusal {
+  const which = `Reservation ${index + 1} (labels ${labels.join(", ")})`;
+  if (reasons.has("not_enough_memory") && closest) {
+    const needs = resourceNeeds(resources);
+    return refusal(
+      "not_enough_memory",
+      closest.node.id,
+      `${which} does not fit: ${closest.node.slug} has the most memory free among the nodes with these labels, ${gib(Math.max(0, closest.freeGb))}, and it needs ${gib(needs.memoryGb)}${needs.gpuCount ? ` and ${needs.gpuCount} GPU(s) with ${gib(needs.vramGb)} each` : ""}${preempt ? ", even after stopping what may be stopped" : ""}.`,
+    );
+  }
+  for (const [reason, text] of [
+    ["node_offline", "every node with these labels (other than the runtime's) is offline"],
+    ["node_held", "every other node with these labels is on hold"],
+    [
+      "trust_relay",
+      "the other nodes with these labels are Relay only, and agents act only at Full control",
+    ],
+  ] as const) {
+    if (reasons.has(reason))
+      return refusal(
+        reason,
+        reasons.get(reason)?.id ?? null,
+        `${which} cannot be placed: ${text}.`,
+      );
+  }
+  return refusal(
+    "not_enough_nodes",
+    null,
+    `${which} cannot be placed: no other node has these labels. Each reservation needs its own node with all of its labels, other than the runtime's node and other reservations' nodes.`,
+  );
 }
 
 function rankResources(launch: LaunchShape, rank: number): RuntimeResource {

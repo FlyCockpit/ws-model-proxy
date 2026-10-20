@@ -14,6 +14,7 @@ import type {
   PlacementInstance,
   PlacementNode,
 } from "./placement";
+import { reservationClaim } from "./reservations";
 import { nodeFabricsHash } from "./runtime-launch-hash";
 import { nodeFabricSetsSchema, runtimeSpecSchema } from "./runtime-spec";
 import type { Tx } from "./runtime-store";
@@ -85,7 +86,10 @@ function frozenFabricsOf(row: PlacementNodeRow): PlacementFrozenFabric[] | "curr
   return lowerPending && inSync ? "current" : null;
 }
 
-/** A node row as the planner sees it: usable memory and per-GPU usable VRAM, before claims. */
+/**
+ * A node row as the planner sees it: usable memory and per-GPU usable VRAM, before claims
+ * (`heldClaims: []` on purpose: the planner replays every claim itself, `loadPlacementInstances`).
+ */
 export function placementNodeOf(row: PlacementNodeRow, now: Date): PlacementNode {
   const hardware = effectiveHardware({
     declaredResources: row.declaredResources,
@@ -124,14 +128,26 @@ function hasInteractiveStop(spec: unknown): boolean {
   return (parsed.data.launch?.commands ?? []).some((commands) => !!commands.interactive?.stop);
 }
 
-/** Instances holding a claim (not RELEASED) on one of these nodes, with all their claims. */
+/**
+ * Instances holding a claim (not RELEASED) on one of these nodes, with all their claims: their
+ * ranks' and, while a rank holds, their reservations' (`launch.reservations`, no port).
+ */
 export async function loadPlacementInstances(
   db: Tx,
   nodeIds: readonly string[],
 ): Promise<PlacementInstance[]> {
   if (nodeIds.length === 0) return [];
   const rows = await db.runtimeInstance.findMany({
-    where: { Ranks: { some: { nodeId: { in: [...nodeIds] }, claim: { not: "RELEASED" } } } },
+    where: {
+      OR: [
+        { Ranks: { some: { nodeId: { in: [...nodeIds] }, claim: { not: "RELEASED" } } } },
+        // A reservation there holds while one of the instance's ranks does.
+        {
+          Reservations: { some: { nodeId: { in: [...nodeIds] } } },
+          Ranks: { some: { claim: { not: "RELEASED" } } },
+        },
+      ],
+    },
     select: {
       id: true,
       userId: true,
@@ -154,6 +170,10 @@ export async function loadPlacementInstances(
         orderBy: { rank: "asc" },
         select: { nodeId: true, port: true, distPort: true, resources: true, claim: true },
       },
+      Reservations: {
+        orderBy: { index: "asc" },
+        select: { nodeId: true, resources: true },
+      },
     },
     orderBy: { id: "asc" },
   });
@@ -163,14 +183,31 @@ export async function loadPlacementInstances(
     ownerId: row.userId,
     startable: row.Runtime.kind === "STARTABLE",
     running: row.desiredState === "RUNNING",
-    ranks: row.Ranks.map((rank) => ({
-      nodeId: rank.nodeId,
-      port: rank.port,
-      distPort: rank.distPort,
-      resources: rank.resources,
-      // RELEASED claims are not loaded.
-      claim: rank.claim === "HELD_UNKNOWN" ? ("HELD_UNKNOWN" as const) : ("HELD" as const),
-    })),
+    ranks: [
+      ...row.Ranks.map((rank) => ({
+        nodeId: rank.nodeId,
+        port: rank.port,
+        distPort: rank.distPort,
+        resources: rank.resources,
+        // RELEASED claims are not loaded.
+        claim: rank.claim === "HELD_UNKNOWN" ? ("HELD_UNKNOWN" as const) : ("HELD" as const),
+      })),
+      // Only RELEASED-free ranks were loaded: without one, the reservations do not hold.
+      ...(row.Ranks.length === 0
+        ? []
+        : // Rows read without the select (older callers' fixtures) have none.
+          (row.Reservations ?? []).map((reservation) => {
+            const claim = reservationClaim(row.Ranks);
+            return {
+              nodeId: reservation.nodeId,
+              port: 0,
+              distPort: null,
+              resources: reservation.resources,
+              claim: claim === "HELD_UNKNOWN" ? ("HELD_UNKNOWN" as const) : ("HELD" as const),
+              reservation: true,
+            };
+          })),
+    ],
     contributed: row.Runtime.Models.length > 0,
     interactiveStop: hasInteractiveStop(row.LaunchVersion.spec),
   }));

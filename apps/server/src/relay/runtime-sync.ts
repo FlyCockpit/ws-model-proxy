@@ -22,6 +22,7 @@ import {
 import {
   type NodeMetricCommand,
   nodeMetricCommandsSchema,
+  nodeRuntimeSpec,
   RUNTIME_DEFINITIONS_MAX,
   runtimeSpecSchema,
 } from "@ws-model-proxy/api/lib/runtime-spec";
@@ -176,7 +177,8 @@ function envelopeOf(row: {
     launchHash: row.launchHash,
     kind: row.Runtime.kind === "ALWAYS_ON" ? "always_on" : "startable",
     slug: row.Runtime.slug,
-    spec: spec.data,
+    // The node's copy: without the server-only `launch.reservations` (the launch hash too).
+    spec: nodeRuntimeSpec(spec.data),
   };
 }
 

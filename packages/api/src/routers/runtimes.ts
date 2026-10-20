@@ -23,6 +23,7 @@ import {
 } from "../lib/refuse";
 import { jsonObject } from "../lib/registry-view";
 import { type RequestCompat, storedRequestCompat } from "../lib/request-compat";
+import { reservationsKey } from "../lib/reservations";
 import { RUNTIME_PRESET_LIST } from "../lib/runtime-presets";
 import {
   authoredRuntimeSpecSchema,
@@ -571,7 +572,11 @@ export const runtimesRouter = {
       };
     }
 
-    const launchChanged = hashes.launchHash !== current.launchHash;
+    // Reservations are server-only (not in the launch hash): another set needs a restart too.
+    const nextReservations = reservationsKey(spec);
+    const launchChanged =
+      hashes.launchHash !== current.launchHash ||
+      nextReservations !== reservationsKey(current.spec);
     // A node-origin runtime's definition lives in the node's runtimes.json and comes back with
     // every inventory; the server never pushes it, so only the node can change it.
     if (launchChanged && runtime.origin === "NODE")
@@ -622,7 +627,7 @@ export const runtimesRouter = {
           select: {
             id: true,
             desiredState: true,
-            LaunchVersion: { select: { launchHash: true } },
+            LaunchVersion: { select: { launchHash: true, spec: true } },
             Ranks: {
               select: {
                 claim: true,
@@ -635,13 +640,18 @@ export const runtimesRouter = {
           // Always-on: the address is the launch; nothing to restart. A started instance adopts
           // live only when what it launched has the new launch hash (an earlier launch change it
           // was never restarted for still needs a restart).
+          const sameReservations =
+            reservationsKey(instance.LaunchVersion.spec) === nextReservations;
           if (
             instance.desiredState === null ||
-            instance.LaunchVersion.launchHash === hashes.launchHash
+            (instance.LaunchVersion.launchHash === hashes.launchHash && sameReservations)
           )
             adoptedLive.push(instance.id);
           else if (
             !input.restartRunning ||
+            // The restart below keeps its claims where they are: other reservations are placed
+            // only by a start (runtime_start with the instance id).
+            !sameReservations ||
             // Released claims (failed, stopped ranks) are re-placed by a start, not here.
             instance.Ranks.some((rank) => rank.claim !== "HELD")
           )

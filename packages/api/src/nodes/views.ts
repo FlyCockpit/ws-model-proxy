@@ -13,6 +13,11 @@ import type {
   nodeSummarySchema,
   queuedCommandViewSchema,
 } from "../contracts/nodes";
+import {
+  HOLDING_RESERVATION_WHERE,
+  RESERVATION_CLAIM_SELECT,
+  reservationClaim,
+} from "../lib/reservations";
 import { nodeFabricsHash, nodeMetricCommandsHash } from "../lib/runtime-launch-hash";
 import {
   declaredHardwareSchema,
@@ -59,6 +64,8 @@ export const nodeSummarySelect = {
       Instance: { select: { id: true, phase: true, needsOperator: true } },
     },
   },
+  // Memory instances hold here without running (`launch.reservations`), while they hold.
+  Reservations: { where: HOLDING_RESERVATION_WHERE, select: { resources: true } },
   _count: {
     select: {
       Runtimes: { where: { kind: "ALWAYS_ON" } },
@@ -70,6 +77,15 @@ export const nodeSummarySelect = {
 export type NodeSummaryRow = Prisma.NodeGetPayload<{ select: typeof nodeSummarySelect }>;
 
 const NOT_RUNNING_PHASES = new Set(["STOPPED", "FAILED"]);
+
+/** `resources` of every claim that holds on the node: its ranks' and reservations'. */
+function heldClaimsOf(row: Pick<NodeSummaryRow, "Ranks" | "Reservations">): unknown[] {
+  return [
+    ...row.Ranks.map((rank) => rank.resources),
+    // Rows read without the select (older callers' fixtures) have none.
+    ...(row.Reservations ?? []).map((reservation) => reservation.resources),
+  ];
+}
 
 export function toNodeSummary(row: NodeSummaryRow, now: Date): NodeSummary {
   const running = new Set<string>();
@@ -84,7 +100,7 @@ export function toNodeSummary(row: NodeSummaryRow, now: Date): NodeSummary {
     nodeInfo: row.nodeInfo,
     nodeMetrics: row.nodeMetrics,
     nodeMetricsAt: row.nodeMetricsAt,
-    heldClaims: [],
+    heldClaims: heldClaimsOf(row),
     now,
   });
   return {
@@ -99,6 +115,8 @@ export function toNodeSummary(row: NodeSummaryRow, now: Date): NodeSummary {
     labels: row.labels,
     hardwareKind: hardware.kind.value,
     liveFreeMemoryGb: liveMetrics(row.nodeMetrics, row.nodeMetricsAt, now).freeMemoryGb,
+    usableMemoryGb: hardware.usableMemoryGb,
+    reservedNowMemoryGb: hardware.reservedNowMemoryGb,
     runningInstances: running.size,
     alwaysOnRuntimes: row._count.Runtimes,
     needsYou: needsYou.size + row._count.QueuedCommands,
@@ -129,7 +147,7 @@ export function toNodeListRow(row: NodeListSelected, now: Date): NodeListRow {
     nodeInfo: row.nodeInfo,
     nodeMetrics: row.nodeMetrics,
     nodeMetricsAt: row.nodeMetricsAt,
-    heldClaims: [],
+    heldClaims: heldClaimsOf(row),
     now,
   });
   const features = nodeFeaturesSchema.safeParse(row.features);
@@ -177,6 +195,28 @@ export const nodeDetailSelect = {
           needsOperator: true,
           Runtime: { select: { slug: true } },
           _count: { select: { Ranks: true } },
+        },
+      },
+    },
+  },
+  // Every reservation here that holds or whose instance has not stopped (shown as "reserved by").
+  Reservations: {
+    where: {
+      OR: [HOLDING_RESERVATION_WHERE, { Instance: { phase: { not: "STOPPED" } } }],
+    },
+    orderBy: { index: "asc" },
+    select: {
+      index: true,
+      resources: true,
+      Instance: {
+        select: {
+          id: true,
+          runtimeId: true,
+          phase: true,
+          needsOperator: true,
+          Runtime: { select: { slug: true } },
+          ...RESERVATION_CLAIM_SELECT.Instance.select,
+          _count: { select: { Reservations: true } },
         },
       },
     },
@@ -318,10 +358,16 @@ export function toNodeDetail(
   now: Date,
 ): NodeDetail {
   const heldRanks = row.Ranks.filter((rank) => rank.claim !== "RELEASED");
+  const reservations = (row.Reservations ?? []).map((reservation) => ({
+    ...reservation,
+    claim: reservationClaim(reservation.Instance.Ranks),
+  }));
+  const heldReservations = reservations.filter((reservation) => reservation.claim !== "RELEASED");
   const summary = toNodeSummary(
     {
       ...row,
       Ranks: heldRanks.map((rank) => ({ resources: rank.resources, Instance: rank.Instance })),
+      Reservations: heldReservations.map((reservation) => ({ resources: reservation.resources })),
     },
     now,
   );
@@ -349,7 +395,21 @@ export function toNodeDetail(
     phase: rank.Instance.phase,
     reserved: rank.claim,
     needsOperator: rank.Instance.needsOperator,
+    role: "rank" as const,
   }));
+  // Memory held here by an instance that runs elsewhere (`launch.reservations`).
+  for (const reservation of reservations)
+    instances.push({
+      instanceId: reservation.Instance.id,
+      runtimeId: reservation.Instance.runtimeId,
+      runtimeSlug: reservation.Instance.Runtime.slug,
+      nodeNumber: reservation.index + 1,
+      nodeCount: Math.max(1, reservation.Instance._count.Reservations),
+      phase: reservation.Instance.phase,
+      reserved: reservation.claim,
+      needsOperator: reservation.Instance.needsOperator,
+      role: "reservation",
+    });
 
   return {
     ...summary,
@@ -361,7 +421,10 @@ export function toNodeDetail(
       nodeInfo: row.nodeInfo,
       nodeMetrics: row.nodeMetrics,
       nodeMetricsAt: row.nodeMetricsAt,
-      heldClaims: heldRanks.map((rank) => rank.resources),
+      heldClaims: [
+        ...heldRanks.map((rank) => rank.resources),
+        ...heldReservations.map((reservation) => reservation.resources),
+      ],
       now,
     }),
     declaredHardware: declared.success ? declared.data : null,

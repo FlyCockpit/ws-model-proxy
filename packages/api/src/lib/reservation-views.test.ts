@@ -1,0 +1,237 @@
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("@ws-model-proxy/db", () => ({ default: {}, Prisma: { DbNull: null } }));
+
+import { type NodeDetailRow, toNodeDetail, toNodeSummary } from "../nodes/views";
+import { loadPlacementInstances } from "./placement-load";
+import { type PlannedStartWrite, type Tx, writePlannedStarts } from "./runtime-store";
+
+// Reservations (`launch.reservations`) as the placement loader and the node views read them:
+// they hold exactly while the instance's rank does.
+
+const NOW = new Date("2026-10-20T00:00:00Z");
+const GB100 = { kind: "unified", memoryGb: 100 };
+
+function instanceRow(rankClaim: "HELD" | "HELD_UNKNOWN" | null) {
+  return {
+    id: "inst-ds",
+    userId: "u1",
+    runtimeId: "rt-ds",
+    desiredState: "RUNNING",
+    Runtime: { kind: "STARTABLE", Models: [] },
+    LaunchVersion: { spec: {} },
+    // The loader reads only ranks that are not RELEASED.
+    Ranks:
+      rankClaim === null
+        ? []
+        : [{ nodeId: "head", port: 30000, distPort: null, resources: GB100, claim: rankClaim }],
+    Reservations: [{ nodeId: "w1", resources: GB100 }],
+  };
+}
+
+function loaderDb(rows: unknown[]) {
+  const findMany = vi.fn(async () => rows);
+  return { db: { runtimeInstance: { findMany } } as unknown as Tx, findMany };
+}
+
+describe("loadPlacementInstances", () => {
+  it("loads a holding instance's reservations as claims without a port", async () => {
+    const { db, findMany } = loaderDb([instanceRow("HELD")]);
+    const [instance] = await loadPlacementInstances(db, ["w1"]);
+    expect(instance?.ranks).toEqual([
+      { nodeId: "head", port: 30000, distPort: null, resources: GB100, claim: "HELD" },
+      { nodeId: "w1", port: 0, distPort: null, resources: GB100, claim: "HELD", reservation: true },
+    ]);
+    // Instances are found by a reservation on these nodes too, only while a rank holds.
+    const where = JSON.stringify(findMany.mock.calls[0]);
+    expect(where).toContain('"Reservations":{"some":{"nodeId":{"in":["w1"]}}}');
+    expect(where).toContain('"Ranks":{"some":{"claim":{"not":"RELEASED"}}}');
+  });
+
+  it("a marked-stopped rank keeps its reservations counted as HELD_UNKNOWN", async () => {
+    const { db } = loaderDb([instanceRow("HELD_UNKNOWN")]);
+    const [instance] = await loadPlacementInstances(db, ["w1"]);
+    expect(instance?.ranks.map((rank) => rank.claim)).toEqual(["HELD_UNKNOWN", "HELD_UNKNOWN"]);
+  });
+
+  it("drops reservations once the rank released its claim", async () => {
+    const { db } = loaderDb([instanceRow(null)]);
+    const [instance] = await loadPlacementInstances(db, ["w1"]);
+    expect(instance?.ranks).toEqual([]);
+  });
+});
+
+function nodeRow(reservationRanks: Array<{ claim: "HELD" | "RELEASED" | "HELD_UNKNOWN" }>) {
+  const row = {
+    id: "w1",
+    slug: "w1",
+    name: null,
+    connection: "ONLINE",
+    lastHeartbeatAt: NOW,
+    cliVersion: "0.4.0",
+    rejectedProtocolVersion: null,
+    trust: "FULL",
+    trustChangedAt: null,
+    trustLowerRequestedAt: null,
+    trustLowerRequestedBy: null,
+    userId: "u1",
+    User: { name: "Owner" },
+    labels: ["ds-worker"],
+    declaredResources: { kind: "unified", memoryGb: 128 },
+    declaredResourcesBy: "USER",
+    nodeInfo: null,
+    nodeMetrics: null,
+    nodeMetricsAt: null,
+    holdAt: null,
+    holdNote: null,
+    holdProfileId: null,
+    removeAfterOfflineMs: null,
+    Ranks: [],
+    Reservations: [
+      {
+        index: 0,
+        resources: GB100,
+        Instance: {
+          id: "inst-ds",
+          runtimeId: "rt-ds",
+          phase: "READY",
+          needsOperator: null,
+          Runtime: { slug: "ds41f-tp3" },
+          Ranks: reservationRanks,
+          _count: { Reservations: 2 },
+        },
+      },
+    ],
+    _count: { Runtimes: 0, QueuedCommands: 0 },
+    hostname: null,
+    features: null,
+    heldDefinitions: [],
+    portStart: 30000,
+    portEnd: 30009,
+    metricCommands: [],
+    metricCommandsHash: null,
+    heldMetricCommandsHash: null,
+    fabricsHash: null,
+    heldFabricsHash: null,
+    commandMaxMs: 60000,
+    detectedServers: null,
+    detectedServersAt: null,
+    FabricMembers: [],
+    QueuedCommands: [],
+  };
+  return row as unknown as NodeDetailRow;
+}
+
+const CONTEXT = {
+  currentVersionByRuntime: new Map(),
+  alwaysOnByBaseUrl: new Map(),
+  otherNodes: [],
+};
+
+describe("node views", () => {
+  it("the summary (and list) count held reservations as reserved memory", () => {
+    const row = nodeRow([{ claim: "HELD" }]);
+    const summary = toNodeSummary(
+      { ...row, Reservations: row.Reservations.map((r) => ({ resources: r.resources })) },
+      NOW,
+    );
+    expect(summary.reservedNowMemoryGb).toBe(100);
+    // A reservation is not an instance running here.
+    expect(summary.runningInstances).toBe(0);
+  });
+
+  it("the detail lists the reservation with its role and counts it while the rank holds", () => {
+    const detail = toNodeDetail(nodeRow([{ claim: "HELD" }]), CONTEXT, NOW);
+    expect(detail.instances).toEqual([
+      {
+        instanceId: "inst-ds",
+        runtimeId: "rt-ds",
+        runtimeSlug: "ds41f-tp3",
+        nodeNumber: 1,
+        nodeCount: 2,
+        phase: "READY",
+        reserved: "HELD",
+        needsOperator: null,
+        role: "reservation",
+      },
+    ]);
+    expect(detail.hardware.reservedNowMemoryGb).toBe(100);
+    expect(detail.reservedNowMemoryGb).toBe(100);
+  });
+
+  it("a released rank releases its reservations in the views", () => {
+    const detail = toNodeDetail(nodeRow([{ claim: "RELEASED" }]), CONTEXT, NOW);
+    expect(detail.instances[0]?.reserved).toBe("RELEASED");
+    expect(detail.hardware.reservedNowMemoryGb).toBe(0);
+  });
+});
+
+function writerDb() {
+  const calls: Array<{ model: string; method: string; args: unknown }> = [];
+  const model = (name: string) =>
+    new Proxy(
+      {},
+      {
+        get: (_target, method) =>
+          typeof method === "string"
+            ? async (args: unknown) => {
+                calls.push({ model: name, method, args });
+                return method.endsWith("Many") ? { count: 0 } : {};
+              }
+            : undefined,
+      },
+    );
+  const db = new Proxy({}, { get: (_target, name) => model(String(name)) }) as unknown as Tx;
+  return { db, calls };
+}
+
+const START: PlannedStartWrite = {
+  runtimeId: "rt-ds",
+  versionId: "v2",
+  instanceId: null,
+  placements: [{ nodeId: "head", nodeNumber: 1, port: 30000, resources: GB100 }],
+  reservations: [{ index: 0, nodeId: "w1", labels: ["ds-worker"], resources: GB100 }],
+  fabric: null,
+  distPort: null,
+};
+
+describe("writePlannedStarts", () => {
+  const input = { userId: "u1", operationId: "op", startedBy: "USER" as const, blockedBy: [[]] };
+
+  it("takes a new instance's reservations in the same write as its rank", async () => {
+    const { db, calls } = writerDb();
+    await writePlannedStarts(db, { ...input, starts: [START] });
+    const create = calls.find(
+      (call) => call.model === "runtimeInstance" && call.method === "create",
+    );
+    const data = (create?.args as { data: Record<string, { create: unknown }> } | undefined)?.data;
+    expect(data?.Ranks?.create).toHaveLength(1);
+    expect(data?.Reservations?.create).toEqual([
+      { nodeId: "w1", index: 0, labels: ["ds-worker"], resources: GB100 },
+    ]);
+  });
+
+  it("a restart replaces the old run's reservations with the plan's", async () => {
+    const { db, calls } = writerDb();
+    await writePlannedStarts(db, { ...input, starts: [{ ...START, instanceId: "inst-ds" }] });
+    const reservationCalls = calls.filter((call) => call.model === "instanceReservation");
+    expect(reservationCalls.map((call) => call.method)).toEqual(["deleteMany", "createMany"]);
+    expect(reservationCalls[0]?.args).toEqual({ where: { instanceId: "inst-ds" } });
+    expect(reservationCalls[1]?.args).toEqual({
+      data: [
+        { instanceId: "inst-ds", nodeId: "w1", index: 0, labels: ["ds-worker"], resources: GB100 },
+      ],
+    });
+  });
+
+  it("a restart to a version without reservations drops them", async () => {
+    const { db, calls } = writerDb();
+    await writePlannedStarts(db, {
+      ...input,
+      starts: [{ ...START, instanceId: "inst-ds", reservations: [] }],
+    });
+    expect(
+      calls.filter((call) => call.model === "instanceReservation").map((call) => call.method),
+    ).toEqual(["deleteMany"]);
+  });
+});

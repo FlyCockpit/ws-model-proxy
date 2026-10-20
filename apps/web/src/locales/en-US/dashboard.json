@@ -216,6 +216,8 @@
     "card": {
       "hardware": "Hardware",
       "freeMemory": "Free memory",
+      "reserved": "Held by runtimes",
+      "reservedValue": "{{held}} of {{usable}}",
       "running": "Running",
       "runningValue": "{{instances}} started, {{alwaysOn}} always on",
       "lastSeen": "Last seen",
@@ -475,6 +477,7 @@
       "empty": "Nothing started here.",
       "part_one": "part {{number}} of {{count}}",
       "part_other": "part {{number}} of {{count}}",
+      "reservation": "holds memory here, runs on another node",
       "needsYou": "Needs you",
       "held": "Definitions on the node",
       "heldEmpty": "None.",
@@ -597,7 +600,8 @@
         "preempted": "makes room",
         "profile_owned_node": "not in this profile"
       },
-      "startVersion": "version {{version}}"
+      "startVersion": "version {{version}}",
+      "reservation": "{{node}} (memory held, nothing runs there)"
     },
     "editor": {
       "back": "All profiles",
@@ -1477,6 +1481,8 @@
     "previewFirst": "Preview to see the placement.",
     "confirmStart": "Confirm",
     "placement": "Node {{number}}: {{node}}, port {{port}}",
+    "reservationPlacement": "Holds {{memory}} on {{node}} (reservation {{number}}, nothing runs there)",
+    "reservationHeld": "Holds {{memory}} on {{node}}",
     "startRequested": "Start requested.",
     "warnings": {
       "low_free_memory": "Little free memory on the node.",
@@ -1831,6 +1837,12 @@
       "fabricHint": "Optional: the network every node of an instance must share.",
       "resources": "Resources",
       "resourcesHint": "What each part reserves on its node while it runs.",
+      "reservations": "Reservations on other nodes",
+      "reservationsHint": "Single-node runtimes only. Memory this runtime holds on other nodes while it runs, when its launcher starts work there itself (for example over SSH). Each reservation goes to its own node with all of its labels; nothing is started there by wsmp.",
+      "reservation": "Reservation {{number}}",
+      "reservationLabelsHint": "The node it holds memory on has all of these labels.",
+      "addReservation": "Add a reservation",
+      "removeReservation": "Remove reservation {{number}}",
       "resourceKind": "Kind",
       "resourceKinds": {
         "discrete": "GPUs",

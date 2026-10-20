@@ -22,6 +22,7 @@ import {
   readLearnedProfile,
   storedRequestCompat,
 } from "./request-compat";
+import { reservationClaim, reservationMemoryGb } from "./reservations";
 import { type RuntimeSpec, runtimeSpecSchema } from "./runtime-spec";
 import { type StepIntent, stepIntentSchema, stepJobPlaceholders } from "./step-intent";
 import { nodeConnectionView, type StopCheck, stopCheckKey } from "./stop-evidence";
@@ -69,6 +70,21 @@ export const INSTANCE_INCLUDE = {
       },
     },
     orderBy: { rank: "asc" },
+  },
+  // Memory held on other nodes (`launch.reservations`); their claim is the ranks' claim.
+  Reservations: {
+    include: {
+      Node: {
+        select: {
+          slug: true,
+          connection: true,
+          lastConnectedAt: true,
+          lastDisconnectedAt: true,
+          lastHeartbeatAt: true,
+        },
+      },
+    },
+    orderBy: { index: "asc" },
   },
   Steps: {
     where: { state: { in: ["PENDING", "RUNNING", "AWAITING_OPERATOR"] } },
@@ -482,6 +498,16 @@ export function instanceView(
             }
           : null,
       releaseRequestId: pendingReleaseRequest(rank, now),
+    })),
+    // Rows read without the include (older callers' fixtures) have none.
+    reservations: (row.Reservations ?? []).map((reservation) => ({
+      index: reservation.index,
+      nodeId: reservation.nodeId,
+      nodeSlug: reservation.Node?.slug ?? null,
+      labels: reservation.labels,
+      memoryGb: reservationMemoryGb(reservation.resources),
+      reserved: reservationClaim(row.Ranks),
+      nodeConnection: nodeConnectionView(reservation.Node),
     })),
     openSteps: row.Steps.map((step) => stepView(step, context)),
     // Load from the relay's in-memory cache (null: unknown here); `at` is the reading's time,

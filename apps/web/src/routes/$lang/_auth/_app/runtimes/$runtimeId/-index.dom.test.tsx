@@ -47,6 +47,7 @@ function instance(id: string, overrides: Record<string, unknown>) {
     phaseChangedAt: "2026-10-07T10:00:00.000Z",
     needsOperator: null,
     ranks: [],
+    reservations: [],
     openSteps: [],
     live: { running: null, waiting: null, kvUsage: null, slots: null, at: null },
     ...overrides,

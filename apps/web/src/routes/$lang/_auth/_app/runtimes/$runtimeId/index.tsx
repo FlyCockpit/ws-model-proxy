@@ -21,6 +21,7 @@ import { AddToSharedPool } from "@/components/access/contribute";
 import { CopyableCode } from "@/components/copy-button";
 import { InlineRetry } from "@/components/inline-retry";
 import { NativeSelect } from "@/components/native-select";
+import { formatGb } from "@/components/nodes/node-badges";
 import { InstanceLoad } from "@/components/runtimes/instance-load";
 import {
   HeldUntilConfirmed,
@@ -373,6 +374,18 @@ function InstancesCard({ runtime }: { runtime: RuntimeDetail }) {
                     )}
                     {instance.phaseReason ? ` · ${instance.phaseReason}` : ""}
                   </p>
+                  {instance.reservations.length > 0 ? (
+                    <ul className="text-xs text-muted-foreground">
+                      {instance.reservations.map((reservation) => (
+                        <li key={reservation.index} className="break-all">
+                          {t("dashboard:runtime.reservationHeld", {
+                            memory: formatGb(reservation.memoryGb, lang),
+                            node: reservation.nodeSlug ?? t("dashboard:runtime.nodeGone"),
+                          })}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
                   <InstanceLoad live={instance.live} />
                   <InstanceReasonNote instance={instance} />
                 </div>
@@ -433,6 +446,7 @@ function StartDialog({
   instanceId?: string;
   onClose: () => void;
 }) {
+  const { lang } = Route.useParams();
   const { t } = useTranslation(["dashboard", "common"]);
   const invalidate = useRuntimeInvalidation();
   const nodes = useQuery({ ...orpc.nodes.list.queryOptions(), retry: false });
@@ -535,6 +549,17 @@ function StartDialog({
                     node: placement.nodeSlug,
                     port: placement.port,
                     number: placement.nodeNumber,
+                  })}
+                </p>
+              )),
+            )}
+            {preview.starts.flatMap((startEntry) =>
+              startEntry.reservations.map((reservation) => (
+                <p key={`reservation-${reservation.nodeId}-${reservation.index}`}>
+                  {t("dashboard:runtime.reservationPlacement", {
+                    node: reservation.nodeSlug,
+                    memory: formatGb(reservation.memoryGb, lang),
+                    number: reservation.index + 1,
                   })}
                 </p>
               )),

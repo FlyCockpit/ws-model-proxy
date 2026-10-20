@@ -317,6 +317,9 @@ export function profilePlan(input: PlanInput): ProfilePlan {
         versionId: item.versionId,
         launch,
         allowedNodeIds: allowed,
+        // Reservations go by their labels on any placeable node of the profile, whatever the
+        // item pins its rank to.
+        reservationNodeIds: placeable,
         // A person may start only what a Relay-only node holds frozen.
         checkFrozen: true,
         preempt: false,
@@ -330,6 +333,7 @@ export function profilePlan(input: PlanInput): ProfilePlan {
         versionId: item.versionId,
         instanceId: null,
         placements: placed.start.placements,
+        reservations: placed.start.reservations,
         fabric: placed.start.fabric,
         distPort: placed.start.distPort,
       });

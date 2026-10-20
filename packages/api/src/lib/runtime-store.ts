@@ -285,9 +285,29 @@ export type PlannedStartWrite = {
     port: number;
     resources: Record<string, unknown>;
   }>;
+  /** `launch.reservations` placed (memory held on other nodes; nothing runs there). */
+  reservations: ReadonlyArray<{
+    index: number;
+    nodeId: string;
+    labels: readonly string[];
+    resources: Record<string, unknown>;
+  }>;
   fabric: { fabricId: string } | null;
   distPort: number | null;
 };
+
+function reservationRow(
+  instanceId: string,
+  reservation: PlannedStartWrite["reservations"][number],
+) {
+  return {
+    instanceId,
+    nodeId: reservation.nodeId,
+    index: reservation.index,
+    labels: [...reservation.labels],
+    resources: reservation.resources as Prisma.InputJsonObject,
+  };
+}
 
 /**
  * The one write of planned starts (runtime start/restart and profile apply): instances STARTING
@@ -346,6 +366,14 @@ export async function writePlannedStarts(
             blockedBy,
           },
         });
+      // The reservations are placed again with the ranks: the new plan's replace the old run's.
+      await tx.instanceReservation.deleteMany({ where: { instanceId: start.instanceId } });
+      if (start.reservations.length > 0)
+        await tx.instanceReservation.createMany({
+          data: start.reservations.map((reservation) =>
+            reservationRow(start.instanceId ?? "", reservation),
+          ),
+        });
       // The claims are held by the new run: a request to release the old one has nothing left.
       await clearInstanceReleaseRequests(tx, start.instanceId, now);
       ids.push(start.instanceId);
@@ -377,6 +405,13 @@ export async function writePlannedStarts(
             resources: placement.resources as Prisma.InputJsonObject,
             blockedBy,
           })),
+        },
+        // Taken in the same write as the ranks (under the same fences as the plan).
+        Reservations: {
+          create: start.reservations.map((reservation) => {
+            const { instanceId: _instance, ...row } = reservationRow(id, reservation);
+            return row;
+          }),
         },
       },
     });

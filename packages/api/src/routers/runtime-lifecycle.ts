@@ -119,6 +119,7 @@ async function computeStart(
       versionId: version.id,
       instanceId,
       placements: result.start.placements,
+      reservations: result.start.reservations,
       fabric: result.start.fabric,
       distPort: result.start.distPort,
     });
@@ -137,9 +138,15 @@ async function computeStart(
           select: { nodeId: true, port: true, distPort: true },
           orderBy: { rank: "asc" },
         },
+        Reservations: { select: { index: true, nodeId: true }, orderBy: { index: "asc" } },
       },
     });
     if (!instance) throw notFound("That instance does not exist.");
+    // Its reservations prefer the nodes they hold now (by index), still placed by labels.
+    const reservationNodeIds: Array<string | null> = [];
+    // Rows read without the select (older callers' fixtures) have none.
+    for (const reservation of instance.Reservations ?? [])
+      reservationNodeIds[reservation.index] = reservation.nodeId;
     restart = { instanceId: instance.id };
     // The instance keeps its own nodes and ports; its own claims do not block it.
     record(
@@ -151,6 +158,7 @@ async function computeStart(
           instanceId: instance.id,
           ports: instance.Ranks.map((rank) => rank.port),
           distPort: instance.Ranks[0]?.distPort ?? null,
+          reservationNodeIds,
         },
       }),
     );

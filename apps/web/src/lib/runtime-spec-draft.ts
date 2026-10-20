@@ -45,6 +45,12 @@ export type ResourceDraft = {
   vramGb: string;
   vendor: "" | GpuVendor;
 };
+/** One `launch.reservations` entry: memory held on another node chosen by its labels. */
+export type ReservationDraft = {
+  /** Comma- or space-separated. */
+  labels: string;
+  resource: ResourceDraft;
+};
 export type CommandDraft = Record<CommandField, string> & {
   timeouts: Record<TimeoutField, string>;
   /** The base spec's command entry this one came from (its interactive steps), or -1. */
@@ -75,6 +81,8 @@ export type SpecDraft = {
   labels: string;
   fixedPort: string;
   fabric: string;
+  /** Single-node only (`launch.reservations`). */
+  reservations: ReservationDraft[];
   readiness: { enabled: boolean; path: string; expectedStatus: string; timeoutMs: string };
   health: { intervalMs: string; failureThreshold: string; successThreshold: string };
 };
@@ -175,6 +183,7 @@ type LooseSpec = Partial<{
     labels: string[];
     port: { fixed?: number };
     fabric: string;
+    reservations: Array<Partial<{ labels: string[]; resources: unknown }>>;
     commands: unknown[];
     readiness: Partial<{ path: string; expectedStatus: number; timeoutMs: number }>;
     health: Partial<{ intervalMs: number; failureThreshold: number; successThreshold: number }>;
@@ -221,6 +230,10 @@ export function specToDraft(input: unknown): SpecDraft {
     labels: (launch?.labels ?? []).join(", "),
     fixedPort: str(launch?.port?.fixed),
     fabric: launch?.fabric ?? "",
+    reservations: (launch?.reservations ?? []).map((reservation) => ({
+      labels: (reservation.labels ?? []).join(", "),
+      resource: resourceDraft(reservation.resources ?? { kind: "unified" }),
+    })),
     readiness: launch
       ? {
           enabled: launch.readiness !== undefined,
@@ -250,6 +263,15 @@ function compact<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(
     Object.entries(value).filter(([, member]) => member !== undefined),
   ) as T;
+}
+
+function splitLabels(value: string): string[] {
+  return value.split(/[\s,]+/).filter((label) => label !== "");
+}
+
+/** A new reservation in the form: 16 GiB of unified memory on a node with the given labels. */
+export function emptyReservationDraft(): ReservationDraft {
+  return { labels: "", resource: resourceDraft({ kind: "unified", memoryGb: 16 }) };
 }
 
 function optionalText(value: string): string | undefined {
@@ -317,7 +339,7 @@ export function draftToSpec(draft: SpecDraft, base: Record<string, unknown>, kin
   const baseAddress = asObject(base.address);
   const baseLaunch = asObject(base.launch);
   const baseCommands = Array.isArray(baseLaunch.commands) ? baseLaunch.commands.map(asObject) : [];
-  const labels = draft.labels.split(/[\s,]+/).filter((label) => label !== "");
+  const labels = splitLabels(draft.labels);
   const models =
     serves && (kind === "STARTABLE" || draft.models.length > 0)
       ? draft.models.map((model) =>
@@ -352,6 +374,16 @@ export function draftToSpec(draft: SpecDraft, base: Record<string, unknown>, kin
             port: draft.fixedPort.trim() === "" ? undefined : { fixed: num(draft.fixedPort) },
             // The form shows a fabric only for several nodes; a leftover one is dropped.
             fabric: draft.groupSize.trim() === "1" ? undefined : optionalText(draft.fabric),
+            reservations:
+              draft.reservations.length > 0
+                ? draft.reservations.map((reservation) => ({
+                    labels: splitLabels(reservation.labels),
+                    resources: resourceFromDraft(reservation.resource),
+                  }))
+                : // An empty list stays as written (round trips change nothing).
+                  Array.isArray(baseLaunch.reservations) && baseLaunch.reservations.length === 0
+                  ? []
+                  : undefined,
             commands: draft.commands.map((commands) =>
               commandsFromDraft(commands, baseCommands[commands.baseIndex] ?? {}),
             ),
@@ -419,6 +451,15 @@ export function draftPathOf(path: ReadonlyArray<PropertyKey>): Array<string | nu
     return typeof sub === "string" && sub !== "kind"
       ? ["resources", index, sub]
       : ["resources", index, "kind"];
+  }
+  if (field === "reservations") {
+    if (typeof index !== "number") return ["reservations"];
+    if (sub === "labels") return ["reservations", index, "labels"];
+    if (sub === "resources")
+      return typeof leaf === "string" && leaf !== "kind"
+        ? ["reservations", index, "resource", leaf]
+        : ["reservations", index, "resource", "kind"];
+    return ["reservations"];
   }
   if (field === "commands" && typeof index === "number") {
     if (sub === "timeoutsSec" && typeof leaf === "string")

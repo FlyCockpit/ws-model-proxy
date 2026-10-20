@@ -107,6 +107,7 @@ const REQUIRED_OBJECTS = [
   "claim_release_request_shape",
   "claim_release_request_transition",
   "instance_rank_node_owner",
+  "instance_reservation_node_owner",
   "instance_step_node_owner",
   "instance_step_shape",
   "instance_step_operator_shape",

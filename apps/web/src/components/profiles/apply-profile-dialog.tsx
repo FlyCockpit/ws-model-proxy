@@ -188,9 +188,15 @@ function PreviewSummary({
                 ) : null}
                 <span className="text-muted-foreground">
                   →{" "}
-                  {start.placements
-                    .map((placement) => `${placement.nodeSlug}:${placement.port}`)
-                    .join(", ")}
+                  {[
+                    ...start.placements.map(
+                      (placement) => `${placement.nodeSlug}:${placement.port}`,
+                    ),
+                    // Reservations: memory held there, nothing runs.
+                    ...start.reservations.map((reservation) =>
+                      t("dashboard:profiles.apply.reservation", { node: reservation.nodeSlug }),
+                    ),
+                  ].join(", ")}
                 </span>
               </li>
             ))}

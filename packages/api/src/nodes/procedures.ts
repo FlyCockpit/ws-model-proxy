@@ -526,6 +526,18 @@ async function deleteNode(
       },
       select: { instanceId: true },
     });
+    // A reservation here (`launch.reservations`) stops its instance too (node_delete_release).
+    const reserving = await tx.instanceReservation.findMany({
+      where: {
+        nodeId: node.id,
+        // Holding (a rank's claim is not RELEASED, as `HOLDING_RESERVATION_WHERE`) and running.
+        Instance: {
+          Ranks: { some: { claim: { not: "RELEASED" } } },
+          phase: { notIn: [...NOT_RUNNING] },
+        },
+      },
+      select: { instanceId: true },
+    });
     const fabricIds = (
       await tx.fabricMember.findMany({
         where: { userId, nodeId: node.id },
@@ -551,7 +563,7 @@ async function deleteNode(
       await tx.node.delete({ where: { id: node.id } });
     }
     await refreshFabricsHashes(tx, userId, peers);
-    const instanceIds = [...new Set(ranks.map((rank) => rank.instanceId))];
+    const instanceIds = [...new Set([...ranks, ...reserving].map((row) => row.instanceId))];
     if (agent) {
       const actor = callerActor(context.auth, userId);
       await tx.auditEvent.create({

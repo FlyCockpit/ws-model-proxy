@@ -434,6 +434,45 @@ describe("errors and output", () => {
       code: "invalid_input",
       issues: [{ path: "nodeIds.0", message: "Too small" }],
     });
+    // The text carries each issue's message too (agents often read only the text).
+    expect(result.content).toEqual([
+      { type: "text", text: "Invalid input: nodeIds.0 (Too small)." },
+    ]);
+  });
+
+  it("names why runtime_create refused nodeId in the text", async () => {
+    const message =
+      "nodeId is only for always-on runtimes (which require it); to pin a startable runtime use spec.launch.labels, runtime_start nodeIds, or a profile.";
+    const result = await runMcpTool(tool("runtime_create"), {
+      dispatch: testDispatch("FULL"),
+      args: { slug: "ds", name: "DS", nodeId: "n", spec: {} },
+      invoke: async () => {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Input validation failed",
+          cause: { issues: [{ path: [{ key: "nodeId" }], code: "custom", message }] },
+        });
+      },
+    });
+    expect(result.content).toEqual([{ type: "text", text: `Invalid input: nodeId (${message}).` }]);
+  });
+
+  it("a sensitive tool's validation text names paths and codes, never messages", async () => {
+    const result = await runMcpTool(tool("node_secret_set"), {
+      dispatch: testDispatch("FULL"),
+      args: { nodeId: "n", name: "WSMP_SECRET_HF", value: "hf_secret_value" },
+      invoke: async () => {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Input validation failed",
+          cause: {
+            issues: [
+              { path: [{ key: "value" }], code: "custom", message: "hf_secret_value is bad" },
+            ],
+          },
+        });
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("hf_secret_value");
+    expect(result.content).toEqual([{ type: "text", text: "Invalid input: value (custom)." }]);
   });
 
   it("a sensitive tool's errors carry no procedure message", async () => {

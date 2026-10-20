@@ -13,7 +13,7 @@ BEGIN;
 LOCK TABLE "user", session, node, node_credential, node_enrollment_code, node_enrollment_use,
   fabric, fabric_member, node_command, node_audit_event,
   queued_node_command, runtime, runtime_version, runtime_model, runtime_share, runtime_instance,
-  instance_rank, claim_release_request, instance_step, runtime_operation, execution_target, profile, profile_node,
+  instance_rank, instance_reservation, claim_release_request, instance_step, runtime_operation, execution_target, profile, profile_node,
   profile_item, pool, pool_routing, pool_fallback, pool_advanced, pool_sidecar, pool_member,
   pool_routing_rule, api_key, api_key_pool, agent_token, share, share_invite, provider_account,
   provider_model,
@@ -423,7 +423,10 @@ BEGIN
      SET "desiredState" = 'STOPPED', phase = 'STOPPING', "phaseReason" = 'node_deleted',
          "phaseChangedAt" = now(), "needsOperator" = NULL, "needsOperatorSince" = NULL
    WHERE i."desiredState" IS NOT NULL AND i.phase <> 'STOPPED'
-     AND EXISTS (SELECT 1 FROM instance_rank r WHERE r."instanceId" = i.id AND r."nodeId" = OLD.id);
+     AND (EXISTS (SELECT 1 FROM instance_rank r WHERE r."instanceId" = i.id AND r."nodeId" = OLD.id)
+          -- A reservation (launch.reservations) there: like a rank's node, the instance stops.
+          OR EXISTS (SELECT 1 FROM instance_reservation v
+                      WHERE v."instanceId" = i.id AND v."nodeId" = OLD.id));
   -- Agents' release requests for those claims have nothing left to release.
   UPDATE claim_release_request
      SET state = 'CLEARED', "pendingRankId" = NULL, "decidedAt" = now()
@@ -736,6 +739,9 @@ END;
 $instance_node_owner$;
 DROP TRIGGER IF EXISTS instance_rank_node_owner ON instance_rank;
 CREATE TRIGGER instance_rank_node_owner BEFORE INSERT OR UPDATE OF "nodeId", "instanceId" ON instance_rank
+FOR EACH ROW EXECUTE FUNCTION enforce_instance_node_owner();
+DROP TRIGGER IF EXISTS instance_reservation_node_owner ON instance_reservation;
+CREATE TRIGGER instance_reservation_node_owner BEFORE INSERT OR UPDATE OF "nodeId", "instanceId" ON instance_reservation
 FOR EACH ROW EXECUTE FUNCTION enforce_instance_node_owner();
 DROP TRIGGER IF EXISTS instance_step_node_owner ON instance_step;
 CREATE TRIGGER instance_step_node_owner BEFORE INSERT OR UPDATE OF "nodeId", "instanceId" ON instance_step
@@ -2471,6 +2477,7 @@ BEGIN
     WHEN 'user' THEN ARRAY[row_data ->> 'id']
     WHEN 'runtime_version' THEN ARRAY[(SELECT "userId" FROM runtime WHERE id = row_data ->> 'runtimeId')]
     WHEN 'instance_rank' THEN ARRAY[(SELECT "userId" FROM runtime_instance WHERE id = row_data ->> 'instanceId')]
+    WHEN 'instance_reservation' THEN ARRAY[(SELECT "userId" FROM runtime_instance WHERE id = row_data ->> 'instanceId')]
     WHEN 'instance_step' THEN ARRAY[(SELECT "userId" FROM runtime_instance WHERE id = row_data ->> 'instanceId')]
     WHEN 'profile_node' THEN ARRAY[(SELECT "userId" FROM profile WHERE id = row_data ->> 'profileId')]
     WHEN 'profile_item' THEN ARRAY[(SELECT "userId" FROM profile WHERE id = row_data ->> 'profileId')]
@@ -2605,6 +2612,7 @@ BEGIN
     ('runtime_share', 'id,runtimeId,ownerUserId,granteeUserId', ''),
     ('runtime_instance', 'id,userId,runtimeId,launchVersionId,handle,desiredState', 'versionId'),
     ('instance_rank', 'id,instanceId,nodeId,rank,claim', ''),
+    ('instance_reservation', 'id,instanceId,nodeId,index,resources', ''),
     ('instance_step', 'id,instanceId,nodeId,rank,phase,sequence,intent,intentHash,state', ''),
     ('runtime_operation', 'id,userId,profileId', ''),
     ('execution_target', 'id,userId,kind,instanceId,runtimeModelId,providerModelId', ''),

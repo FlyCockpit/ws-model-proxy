@@ -216,6 +216,8 @@
     "card": {
       "hardware": "Hardware",
       "freeMemory": "Memoria libre",
+      "reserved": "Ocupada por runtimes",
+      "reservedValue": "{{held}} de {{usable}}",
       "running": "En ejecución",
       "runningValue": "{{instances}} iniciados, {{alwaysOn}} siempre activos",
       "lastSeen": "Visto por última vez",
@@ -475,6 +477,7 @@
       "empty": "Nada iniciado aquí.",
       "part_one": "parte {{number}} de {{count}}",
       "part_other": "parte {{number}} de {{count}}",
+      "reservation": "ocupa memoria aquí, se ejecuta en otro nodo",
       "needsYou": "Te necesita",
       "held": "Definiciones en el nodo",
       "heldEmpty": "Ninguna.",
@@ -597,7 +600,8 @@
         "preempted": "libera espacio",
         "profile_owned_node": "no está en este perfil"
       },
-      "startVersion": "versión {{version}}"
+      "startVersion": "versión {{version}}",
+      "reservation": "{{node}} (memoria ocupada, ahí no se ejecuta nada)"
     },
     "editor": {
       "back": "Todos los perfiles",
@@ -1477,6 +1481,8 @@
     "previewFirst": "Genera la vista previa para ver la ubicación.",
     "confirmStart": "Confirmar",
     "placement": "Nodo {{number}}: {{node}}, puerto {{port}}",
+    "reservationPlacement": "Ocupa {{memory}} en {{node}} (reserva {{number}}, ahí no se ejecuta nada)",
+    "reservationHeld": "Ocupa {{memory}} en {{node}}",
     "startRequested": "Inicio solicitado.",
     "warnings": {
       "low_free_memory": "Poca memoria libre en el nodo.",
@@ -1831,6 +1837,12 @@
       "fabricHint": "Opcional: la red que deben compartir todos los nodos de una instancia.",
       "resources": "Recursos",
       "resourcesHint": "Lo que cada parte reserva en su nodo mientras se ejecuta.",
+      "reservations": "Reservas en otros nodos",
+      "reservationsHint": "Solo runtimes de un nodo. Memoria que este runtime ocupa en otros nodos mientras se ejecuta, cuando su lanzador inicia trabajo ahí por su cuenta (por ejemplo por SSH). Cada reserva va a su propio nodo con todas sus etiquetas; wsmp no inicia nada ahí.",
+      "reservation": "Reserva {{number}}",
+      "reservationLabelsHint": "El nodo donde ocupa memoria tiene todas estas etiquetas.",
+      "addReservation": "Agregar una reserva",
+      "removeReservation": "Quitar la reserva {{number}}",
       "resourceKind": "Tipo",
       "resourceKinds": {
         "discrete": "GPU",

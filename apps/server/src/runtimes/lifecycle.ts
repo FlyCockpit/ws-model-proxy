@@ -264,14 +264,27 @@ export type LifecycleOptions = {
 type InstanceRow = Prisma.RuntimeInstanceGetPayload<{
   include: {
     Ranks: true;
+    Reservations: { select: { nodeId: true } };
     LaunchVersion: { select: { spec: true; launchHash: true; advanced: true; editor: true } };
   };
 }>;
 
+/**
+ * `Reservations` (`launch.reservations`) are read only for their nodes: an offline or deleted
+ * reservation node makes the instance UNAVAILABLE like a rank's, and a queued start waits for
+ * what blockers hold there. Nothing is ever dispatched to them, and their claim is the ranks'
+ * (`lib/reservations.ts`), so no release path here writes them.
+ */
 const INSTANCE_INCLUDE = {
   Ranks: true,
+  Reservations: { select: { nodeId: true } },
   LaunchVersion: { select: { spec: true, launchHash: true, advanced: true, editor: true } },
 } as const;
+
+/** Rows read without the include (older callers' fixtures) have none. */
+function reservationsOf(instance: InstanceRow): InstanceRow["Reservations"] {
+  return instance.Reservations ?? [];
+}
 
 function launchOf(instance: InstanceRow): RuntimeLaunch | null {
   const spec = instance.LaunchVersion.spec;
@@ -1034,8 +1047,11 @@ export class RuntimeLifecycle {
 
   private async retake(tx: Tx, instance: InstanceRow) {
     const now = this.now();
-    if (instance.Ranks.some((rank) => rank.nodeId === null)) {
-      // A rank's node was deleted: nothing to restart on.
+    if (
+      instance.Ranks.some((rank) => rank.nodeId === null) ||
+      reservationsOf(instance).some((reservation) => reservation.nodeId === null)
+    ) {
+      // A rank's (or reservation's) node was deleted: nothing to restart on.
       await tx.runtimeInstance.update({
         where: { id: instance.id },
         data: {
@@ -1096,18 +1112,27 @@ export class RuntimeLifecycle {
   private async watchInstance(tx: Tx, instance: InstanceRow) {
     const now = this.now();
     const nodeIds = instance.Ranks.flatMap((rank) => (rank.nodeId ? [rank.nodeId] : []));
+    // A reservation's node (`launch.reservations`) is watched like a rank's: the instance's
+    // launcher uses it, so its loss makes the instance UNAVAILABLE and stops it like a group's.
+    const reservations = reservationsOf(instance);
+    const reservationNodeIds = reservations.flatMap((reservation) =>
+      reservation.nodeId ? [reservation.nodeId] : [],
+    );
+    const watched = [...new Set([...nodeIds, ...reservationNodeIds])];
+    const deleted =
+      nodeIds.length !== instance.Ranks.length || reservationNodeIds.length !== reservations.length;
     // The durable connection state (any replica's sessions), not this process's map. Right
     // after this process started, nodes are still reconnecting: nothing is marked yet.
     const rows = await tx.node.findMany({
-      where: { id: { in: nodeIds } },
+      where: { id: { in: watched } },
       select: { id: true, connection: true, lastDisconnectedAt: true, lastHeartbeatAt: true },
     });
     const onlineIds = new Set(
       rows.filter((node) => offlineSinceOf(node, now) === null).map((node) => node.id),
     );
-    const offline = nodeIds.filter((nodeId) => !onlineIds.has(nodeId));
+    const offline = watched.filter((nodeId) => !onlineIds.has(nodeId));
     if (offline.length > 0 && now.getTime() - this.startedAt < STARTUP_GRACE_MS) return;
-    if (offline.length > 0 || nodeIds.length !== instance.Ranks.length) {
+    if (offline.length > 0 || deleted) {
       if (instance.phase !== "UNAVAILABLE") {
         await tx.runtimeInstance.update({
           where: { id: instance.id },
@@ -1121,12 +1146,12 @@ export class RuntimeLifecycle {
         return;
       }
       const since = instance.unavailableSince ?? instance.phaseChangedAt;
-      // A rank whose node was deleted never comes back: stop now. Otherwise the online ranks
-      // of a multi-node instance stop after unavailableStopMs (their GPUs are freed).
-      if (nodeIds.length !== instance.Ranks.length)
-        await this.gangStop(tx, instance, "node_deleted");
+      // A rank's or reservation's node that was deleted never comes back: stop now. Otherwise
+      // the online ranks of a multi-node instance, or of one with reservations, stop after
+      // unavailableStopMs (their GPUs and reserved memory are freed).
+      if (deleted) await this.gangStop(tx, instance, "node_deleted");
       else if (
-        instance.Ranks.length > 1 &&
+        instance.Ranks.length + reservations.length > 1 &&
         now.getTime() - since.getTime() >= advancedInt(instance, "unavailableStopMs")
       )
         await this.gangStop(tx, instance, "node_offline");
@@ -1420,10 +1445,22 @@ export class RuntimeLifecycle {
       if (blockers.length > 0) {
         // Only the blockers' claims on the nodes this start uses: a blocker rank stuck on
         // another (offline) node frees nothing here and must not hold the start forever.
-        const startNodes = instance.Ranks.flatMap((rank) => (rank.nodeId ? [rank.nodeId] : []));
-        const holding = await tx.instanceRank.count({
-          where: { instanceId: { in: blockers }, claim: "HELD", nodeId: { in: startNodes } },
-        });
+        // Reservation nodes count too: what a blocker holds there is used once this runs, and
+        // a blocker's reservation holds while one of its ranks is HELD.
+        const startNodes = [...instance.Ranks, ...reservationsOf(instance)].flatMap((row) =>
+          row.nodeId ? [row.nodeId] : [],
+        );
+        const holding =
+          (await tx.instanceRank.count({
+            where: { instanceId: { in: blockers }, claim: "HELD", nodeId: { in: startNodes } },
+          })) +
+          (await tx.instanceReservation.count({
+            where: {
+              instanceId: { in: blockers },
+              nodeId: { in: startNodes },
+              Instance: { Ranks: { some: { claim: "HELD" } } },
+            },
+          }));
         if (holding > 0) return null;
         // Released: a later start of a blocker must not hold this instance back again.
         await tx.instanceRank.updateMany({

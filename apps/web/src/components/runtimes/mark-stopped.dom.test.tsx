@@ -276,6 +276,7 @@ describe("RunsHereCard", () => {
     phase: "STOPPING",
     reserved: "HELD",
     needsOperator: "MARK_STOPPED",
+    role: "rank",
   };
 
   it("offers Mark as stopped only while the instance needs it and this part is held", () => {

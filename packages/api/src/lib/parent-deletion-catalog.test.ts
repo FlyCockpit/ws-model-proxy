@@ -108,6 +108,7 @@ const GRAPH_TABLES: Record<string, string> = {
   runtime_request_profile: "one per runtime launch; field names only",
   runtime_instance: "running copies; released by the delete",
   instance_rank: "one per instance node",
+  instance_reservation: "at most 8 per instance (launch.reservations)",
   instance_step: "bounded lifecycle steps per instance",
   runtime_operation: "bounded operations",
   execution_target: "configuration",
@@ -144,7 +145,7 @@ const REACHED_DELETE_TRIGGERS: Record<string, string> = {
   "fabric_member_in_use:fabric_member":
     "one indexed instance/rank probe per membership; the user delete removes instances first, so it never refuses",
   "node_delete_release:node":
-    "releases the node's ranks, stops what had a part there, deletes its always-on instances; bounded by the node's instances",
+    "releases the node's ranks, stops what had a part or a reservation there, deletes its always-on instances; bounded by the node's instances",
   "pool_routing_rule_on_member_delete:pool_member":
     "rewrites at most 16 pool_routing_rule rows of the pool; configuration, not per-request",
   "share_delete_cleanup:share":
