@@ -72,7 +72,7 @@ fn user_manager_live(state: &str) -> bool {
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linger_enabled(output: &str) -> bool {
+pub(crate) fn linger_enabled(output: &str) -> bool {
     output.lines().any(|line| {
         line.trim()
             .split_once('=')
