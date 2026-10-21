@@ -230,7 +230,7 @@ async function releaseWithoutProof(input: {
         nodeConnectionView(rank.Node, now),
         checks.get(stopCheckKey(instance.id, rank.rank)),
       );
-      if (!(await releaseClaim(tx, rank.id, now, { by: input.userId, reason })))
+      if (!(await releaseClaim(tx, rank.id, now, { unproven: { by: input.userId, reason } })))
         throw notMarkedStopped("RELEASED");
       if (rank.Node)
         await tx.nodeAuditEvent.create({

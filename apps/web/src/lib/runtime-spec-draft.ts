@@ -152,6 +152,35 @@ function resourceDraft(resource: unknown): ResourceDraft {
   };
 }
 
+/** JSON text with object keys sorted (compares two plain JSON values). */
+function sortedJson(value: unknown): string {
+  return JSON.stringify(value, (_key, member: unknown) =>
+    member && typeof member === "object" && !Array.isArray(member)
+      ? Object.fromEntries(
+          Object.entries(member as Record<string, unknown>).sort(([a], [b]) =>
+            a < b ? -1 : a > b ? 1 : 0,
+          ),
+        )
+      : member,
+  );
+}
+
+/**
+ * A written resource entry as the form's fields. An entry the fields cannot hold exactly (not an
+ * object, a number written as text, a field its kind does not have, an unknown kind or field)
+ * throws, like any other shape the form cannot show: the editor keeps the JSON tab and its text
+ * with an error, and nothing is saved from a rewritten value (`{"kind":"none","memoryGb":100}`
+ * never becomes `{"kind":"none"}`, `"100"` never becomes 100).
+ */
+function authoredResourceDraft(resource: unknown, what: string): ResourceDraft {
+  if (typeof resource !== "object" || resource === null || Array.isArray(resource))
+    throw new TypeError(`${what} is not an object`);
+  const draft = resourceDraft(resource);
+  if (sortedJson(resourceFromDraft(draft)) !== sortedJson(resource))
+    throw new TypeError(`${what} holds a value the form would change`);
+  return draft;
+}
+
 function commandDraft(commands: unknown, baseIndex: number): CommandDraft {
   const value = (commands ?? {}) as Partial<Record<CommandField, string>> & {
     timeoutsSec?: Partial<Record<TimeoutField, number>>;
@@ -183,13 +212,53 @@ type LooseSpec = Partial<{
     labels: string[];
     port: { fixed?: number };
     fabric: string;
-    reservations: Array<Partial<{ labels: string[]; resources: unknown }>>;
+    /** Any shape (the JSON tab's): read with checks. */
+    reservations: unknown;
     commands: unknown[];
     readiness: Partial<{ path: string; expectedStatus: number; timeoutMs: number }>;
     health: Partial<{ intervalMs: number; failureThreshold: number; successThreshold: number }>;
   }>;
   expandMedia: boolean;
 }>;
+
+/**
+ * Labels as the form's text field (comma-separated). A label the field cannot hold as one label
+ * (empty, or with a comma or whitespace, which the field would split into several) throws, like
+ * any other shape the form cannot show: the editor keeps the JSON tab and its text with an error,
+ * and nothing is saved from a rewritten value (`["worker,other"]` never becomes two labels).
+ */
+function labelsDraft(value: unknown, what: string): string {
+  if (value === undefined) return "";
+  if (!Array.isArray(value) || !value.every((label) => typeof label === "string"))
+    throw new TypeError(`${what} are not a list of text`);
+  if (value.some((label: string) => label === "" || /[\s,]/.test(label)))
+    throw new TypeError(`${what} hold a label the form would split or drop`);
+  return value.join(", ");
+}
+
+/**
+ * `launch.reservations` as the form's rows. A shape the form cannot show without losing part
+ * of it (not a list, an entry that is not an object, labels that are not a list of text,
+ * resources the form's fields cannot hold exactly) throws: the editor then keeps the JSON tab and its text
+ * with an error (the switch's catch), instead of dropping what was written.
+ */
+function reservationDrafts(value: unknown): SpecDraft["reservations"] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new TypeError("launch.reservations is not a list");
+  return value.map((entry: unknown) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry))
+      throw new TypeError("a reservation is not an object");
+    const labels = labelsDraft(Reflect.get(entry, "labels"), "a reservation's labels");
+    const resources: unknown = Reflect.get(entry, "resources");
+    return {
+      labels,
+      resource:
+        resources === undefined
+          ? resourceDraft({ kind: "unified" })
+          : authoredResourceDraft(resources, "a reservation's resources"),
+    };
+  });
+}
 
 function asObject(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -222,18 +291,17 @@ export function specToDraft(input: unknown): SpecDraft {
     management: launch?.management ?? "process",
     groupSize: launch ? str(launch.groupSize) : "1",
     resources: launch
-      ? (launch.resources ?? []).map(resourceDraft)
+      ? (launch.resources ?? []).map((resource) =>
+          authoredResourceDraft(resource, "a launch.resources entry"),
+        )
       : [resourceDraft({ kind: "unified", memoryGb: 16 })],
     commands: launch
       ? (launch.commands ?? []).map((commands, index) => commandDraft(commands, index))
       : [emptyCommandDraft()],
-    labels: (launch?.labels ?? []).join(", "),
+    labels: labelsDraft(launch?.labels, "launch.labels"),
     fixedPort: str(launch?.port?.fixed),
     fabric: launch?.fabric ?? "",
-    reservations: (launch?.reservations ?? []).map((reservation) => ({
-      labels: (reservation.labels ?? []).join(", "),
-      resource: resourceDraft(reservation.resources ?? { kind: "unified" }),
-    })),
+    reservations: reservationDrafts(launch?.reservations),
     readiness: launch
       ? {
           enabled: launch.readiness !== undefined,
@@ -407,9 +475,43 @@ export function draftToSpec(draft: SpecDraft, base: Record<string, unknown>, kin
   });
 }
 
-/** Editor values for a spec (the JSON tab is pretty-printed). */
-export function editorValues(spec: unknown): SpecEditorValues {
+/**
+ * The form's draft of a spec only when the form keeps it exactly: the spec the draft describes
+ * (`draftToSpec` over the spec itself as the base) is the spec as written, canonically. Else
+ * null: something would be dropped or changed (an unknown key, a value written as text, a
+ * shape the fields cannot hold, a part missing that the form would fill in, the other kind),
+ * so the editor stays on the JSON tab and nothing is saved from a rewritten value. A value the
+ * conversion cannot handle at all (a number where a command or fabric goes) throws in either
+ * direction; that is "not representable" too, never an error out of the editor.
+ */
+export function losslessDraft(spec: unknown, kind: RuntimeKind): SpecDraft | null {
+  try {
+    const draft = specToDraft(spec);
+    return sameSpec(draftToSpec(draft, asObject(spec), kind), spec) ? draft : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Editor values for a spec (the JSON tab is pretty-printed). With `kind` (an existing
+ * definition), a spec the form cannot keep exactly (`losslessDraft`) opens on the JSON tab.
+ */
+export function editorValues(spec: unknown, kind?: RuntimeKind): SpecEditorValues {
   const json = JSON.stringify(spec, null, 2);
+  if (kind !== undefined) {
+    const draft = losslessDraft(spec, kind);
+    if (!draft) {
+      let fallback: SpecDraft;
+      try {
+        fallback = specToDraft(spec);
+      } catch {
+        fallback = specToDraft({});
+      }
+      return { tab: "json", draft: fallback, json, base: json, check: "" };
+    }
+    return { tab: "form", draft, json, base: json, check: "" };
+  }
   return { tab: "form", draft: specToDraft(spec), json, base: json, check: "" };
 }
 
@@ -546,7 +648,13 @@ export function switchEditorKind(values: SpecEditorValues, kind: RuntimeKind): S
     return values;
   }
   const base = asObject(parsed);
-  const draft = specToDraft(base);
+  // A shape the form cannot read (valid JSON, wrong types) stays as written, like bad JSON.
+  let draft: SpecDraft;
+  try {
+    draft = specToDraft(base);
+  } catch {
+    return values;
+  }
   return {
     ...values,
     draft,

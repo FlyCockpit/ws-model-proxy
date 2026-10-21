@@ -27,11 +27,11 @@ import {
   editorValues,
   emptyCommandDraft,
   emptyReservationDraft,
+  losslessDraft,
   parseBase,
   type ResourceKind,
   type RuntimeKind,
   type SpecEditorValues,
-  specToDraft,
   TIMEOUT_FIELDS,
 } from "@/lib/runtime-spec-draft";
 
@@ -180,9 +180,17 @@ export const RuntimeSpecFields = withFieldGroup({
         setSwitchError(true);
         return;
       }
+      // Converted before anything changes, and only when the form keeps the JSON exactly
+      // (`losslessDraft`): anything it would drop or change (an unknown key, a shape the form
+      // cannot show, a part it would fill in) keeps the JSON tab and its text, with an error.
+      const draft = losslessDraft(parsed, kind);
+      if (!draft) {
+        setSwitchError(true);
+        return;
+      }
       setSwitchError(false);
       group.setFieldValue("base", json);
-      group.setFieldValue("draft", specToDraft(parsed));
+      group.setFieldValue("draft", draft);
       group.setFieldValue("tab", "form");
     };
 

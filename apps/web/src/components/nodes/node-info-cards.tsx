@@ -277,7 +277,7 @@ export function RunsHereCard({ node, lang }: { node: NodeDetail; lang: string })
           <ul className="space-y-1">
             {node.instances.map((instance) => (
               <li
-                key={`${instance.instanceId}-${instance.nodeNumber}`}
+                key={`${instance.instanceId}-${instance.role}-${instance.nodeNumber}`}
                 className="flex flex-wrap items-center gap-2"
               >
                 <Link

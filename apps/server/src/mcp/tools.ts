@@ -46,6 +46,7 @@ import {
   MCP_READ_TOOLS,
   MCP_TOOLS,
   type McpToolContract,
+  refusalReservationSchema,
   SENSITIVE_INPUT_PROCEDURES,
 } from "@ws-model-proxy/api/contracts";
 import { appRouter } from "@ws-model-proxy/api/routers/index";
@@ -581,6 +582,21 @@ function sanitizeMessage(message: string): string {
   return out;
 }
 
+/**
+ * A refusal's `data.reservation` (contracts/refusals.ts) when it has that shape, each label and
+ * the node slug as one bounded line (at most 32 labels, the spec's label count).
+ */
+function reservationOf(value: unknown) {
+  const parsed = refusalReservationSchema.safeParse(value);
+  if (!parsed.success) return null;
+  return {
+    index: parsed.data.index,
+    labels: parsed.data.labels.slice(0, 32).map((label) => sanitizeMessage(label).slice(0, 64)),
+    nodeSlug:
+      parsed.data.nodeSlug === null ? null : sanitizeMessage(parsed.data.nodeSlug).slice(0, 64),
+  };
+}
+
 /** `{path, message}`; a sensitive tool gets `{path, code}` (a message could echo a value). */
 type ValidationIssue = { path: string; message: string } | { path: string; code: string };
 
@@ -654,7 +670,17 @@ function mapError(
           ? data.subjectId
           : null;
       const message = sensitive ? `Refused: ${reason}.` : sanitizeMessage(error.message);
-      return toolError(message, { error: { code: error.code, reason, subjectId, message } });
+      // A reservation that cannot be placed: which one, structured (the text is bounded).
+      const reservation = sensitive ? null : reservationOf(data.reservation);
+      return toolError(message, {
+        error: {
+          code: error.code,
+          reason,
+          subjectId,
+          message,
+          ...(reservation ? { reservation } : {}),
+        },
+      });
     }
     if (error.code === "BAD_REQUEST") {
       const issues = orpcValidationIssues(error, sensitive);

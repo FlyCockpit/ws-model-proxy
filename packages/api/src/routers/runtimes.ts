@@ -13,6 +13,7 @@ import {
   instanceCapacityFences,
   runtimeCapacityFences,
 } from "../lib/graph-write";
+import { beginRun, resolveRun } from "../lib/instance-run";
 import { readLiveLoad } from "../lib/live-load";
 import {
   isForeignKeyViolation,
@@ -23,7 +24,12 @@ import {
 } from "../lib/refuse";
 import { jsonObject } from "../lib/registry-view";
 import { type RequestCompat, storedRequestCompat } from "../lib/request-compat";
-import { reservationsKey } from "../lib/reservations";
+import {
+  CURRENT_RESERVATION_WHERE,
+  heldClaimsMatch,
+  launchIdentity,
+  reservationsKey,
+} from "../lib/reservations";
 import { RUNTIME_PRESET_LIST } from "../lib/runtime-presets";
 import {
   authoredRuntimeSpecSchema,
@@ -68,7 +74,7 @@ function userIdOf(context: SignedInContext): string {
   return context.session.user.id;
 }
 
-/** Previous launch hashes of each runtime's current version (for `launchChanged`). */
+/** The previous version's `launchIdentity` of each runtime's current version (`launchChanged`). */
 async function previousHashesOf(rows: RuntimeSummaryRow[]): Promise<Map<string, string | null>> {
   const wanted = rows.flatMap((row) =>
     row.CurrentVersion && row.CurrentVersion.version > 1
@@ -79,9 +85,9 @@ async function previousHashesOf(rows: RuntimeSummaryRow[]): Promise<Map<string, 
   if (wanted.length === 0) return result;
   const previous = await prisma.runtimeVersion.findMany({
     where: { OR: wanted },
-    select: { runtimeId: true, launchHash: true },
+    select: { runtimeId: true, launchHash: true, spec: true },
   });
-  for (const row of previous) result.set(row.runtimeId, row.launchHash);
+  for (const row of previous) result.set(row.runtimeId, launchIdentity(row));
   return result;
 }
 
@@ -284,9 +290,9 @@ async function previousLaunchHashOf(runtimeId: string, version: number): Promise
   if (version <= 1) return null;
   const previous = await prisma.runtimeVersion.findFirst({
     where: { runtimeId, version: version - 1 },
-    select: { launchHash: true },
+    select: { launchHash: true, spec: true },
   });
-  return previous?.launchHash ?? null;
+  return previous ? launchIdentity(previous) : null;
 }
 
 const ACTIVE_INSTANCE = {
@@ -630,9 +636,18 @@ export const runtimesRouter = {
             LaunchVersion: { select: { launchHash: true, spec: true } },
             Ranks: {
               select: {
+                rank: true,
                 claim: true,
+                resources: true,
                 Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } },
               },
+              orderBy: { rank: "asc" },
+            },
+            // What the instance holds now (not a replaced run's superseded rows).
+            Reservations: {
+              where: CURRENT_RESERVATION_WHERE,
+              select: { index: true, labels: true, resources: true },
+              orderBy: { index: "asc" },
             },
           },
         });
@@ -649,9 +664,11 @@ export const runtimesRouter = {
             adoptedLive.push(instance.id);
           else if (
             !input.restartRunning ||
-            // The restart below keeps its claims where they are: other reservations are placed
-            // only by a start (runtime_start with the instance id).
-            !sameReservations ||
+            // The restart below keeps its claims where they are and as they are: only when what
+            // the instance holds (its rank claims and reservation rows, not its version's spec)
+            // is what the new version claims. Other resources or reservations are placed, with
+            // the planner's capacity check, only by a start (runtime_start with the instance id).
+            !heldClaimsMatch(spec, instance.Ranks, instance.Reservations) ||
             // Released claims (failed, stopped ranks) are re-placed by a start, not here.
             instance.Ranks.some((rank) => rank.claim !== "HELD")
           )
@@ -716,6 +733,9 @@ export const runtimesRouter = {
             select: { id: true },
           });
           restartOperationId = operation.id;
+          // The runs being replaced, read before the restart is written (a row from before runs
+          // existed is bootstrapped from its steps now).
+          for (const instanceId of restarted) await resolveRun(tx, instanceId);
           await tx.runtimeInstance.updateMany({
             where: { id: { in: restarted } },
             data: {
@@ -733,6 +753,11 @@ export const runtimesRouter = {
               nextRestartAt: null,
             },
           });
+          // Each restart begins a new run in this commit (`instance-run.ts`): nothing of the
+          // old run is dispatched from now on, and its late answers (a stop of a crash that was
+          // being stopped, a readiness) change nothing; the new run's leading stop proves the
+          // old one ended. The capacity fences above cover every instance of the runtime.
+          for (const instanceId of restarted) await beginRun(tx, instanceId);
         }
         const row = await tx.runtimeVersion.findUniqueOrThrow({
           where: { id: created.id },
@@ -747,7 +772,7 @@ export const runtimesRouter = {
     const define =
       (await context.services?.pushRuntimeDefinitions?.({ userId, runtimeId: runtime.id })) ?? [];
     return {
-      version: versionSummary(version, current.launchHash),
+      version: versionSummary(version, launchIdentity(current)),
       adoptedLive,
       needsRestart,
       restarted,

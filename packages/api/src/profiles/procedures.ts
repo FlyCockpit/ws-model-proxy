@@ -19,7 +19,7 @@ import {
 } from "../lib/placement-load";
 import { planProfileHolds } from "../lib/profile-holds";
 import { planProfileSave } from "../lib/profile-save";
-import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
+import { isUniqueViolation, notFound, refusalOf, refuse, refuseAbout } from "../lib/refuse";
 import { runtimeSpecSchema } from "../lib/runtime-spec";
 import { markInstancesStopping, writePlannedStarts } from "../lib/runtime-store";
 import {
@@ -565,10 +565,7 @@ export const profileProcedures = {
         if (input.fingerprint !== undefined && input.fingerprint !== plan.preview.fingerprint)
           throw refuse("preview_stale", "Something changed since the preview. Preview again.");
         const [first] = plan.preview.refusals;
-        if (first)
-          throw first.subjectId
-            ? refuseAbout(first.reason, first.subjectId, first.message)
-            : refuse(first.reason, first.message);
+        if (first) throw refusalOf(first);
         const actor = callerActor(context.auth, userId);
         const created = await tx.runtimeOperation.create({
           data: {

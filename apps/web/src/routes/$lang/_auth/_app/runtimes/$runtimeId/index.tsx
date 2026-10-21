@@ -32,7 +32,12 @@ import { HeldPartsRelease } from "@/components/runtimes/release-unproven";
 import { RuntimeSharingCard } from "@/components/runtimes/runtime-sharing-card";
 import { ServedModelCapabilities } from "@/components/runtimes/served-model-capabilities";
 import { type PillTone, StatusPill } from "@/components/status-pill";
-import { refusalText } from "@/lib/refusal-text";
+import {
+  refusalReservationOf,
+  refusalText,
+  waitingToRestartText,
+  withReservation,
+} from "@/lib/refusal-text";
 import { slugify } from "@/lib/slugify";
 import { orpc } from "@/utils/orpc";
 
@@ -283,6 +288,13 @@ function ServedModelRow({ runtime, model }: { runtime: RuntimeDetail; model: Ser
   );
 }
 
+/** A reservation's line by its claim: held, held until the stop is confirmed, or not held. */
+const RESERVATION_COPY = {
+  HELD: "dashboard:runtime.reservationHeld",
+  HELD_UNKNOWN: "dashboard:runtime.reservationUnconfirmed",
+  RELEASED: "dashboard:runtime.reservationIdle",
+} as const;
+
 /** Why the instance is unhealthy or failed to start, when the node said. */
 function InstanceReasonNote({ instance }: { instance: Instance }) {
   const { t } = useTranslation();
@@ -295,6 +307,7 @@ function InstanceReasonNote({ instance }: { instance: Instance }) {
       : isHealthFailure(detail)
         ? t(`dashboard:runtime.healthReason.${detail}`)
         : detail;
+  const waiting = waitingToRestartText(t, instance);
   return (
     <>
       {reason ? (
@@ -307,6 +320,7 @@ function InstanceReasonNote({ instance }: { instance: Instance }) {
           {t("dashboard:runtime.processDetached")}
         </p>
       ) : null}
+      {waiting ? <p className="break-words text-xs text-muted-foreground">{waiting}</p> : null}
     </>
   );
 }
@@ -378,7 +392,7 @@ function InstancesCard({ runtime }: { runtime: RuntimeDetail }) {
                     <ul className="text-xs text-muted-foreground">
                       {instance.reservations.map((reservation) => (
                         <li key={reservation.index} className="break-all">
-                          {t("dashboard:runtime.reservationHeld", {
+                          {t(RESERVATION_COPY[reservation.reserved], {
                             memory: formatGb(reservation.memoryGb, lang),
                             node: reservation.nodeSlug ?? t("dashboard:runtime.nodeGone"),
                           })}
@@ -590,9 +604,13 @@ function StartDialog({
             ))}
             {preview.refusals.map((refusal) => (
               <p key={`${refusal.reason}-${refusal.subjectId ?? ""}`} className="text-destructive">
-                {t(`dashboard:runtime.refusals.${refusal.reason}`, {
-                  defaultValue: t("dashboard:runtime.refusals.other"),
-                })}
+                {withReservation(
+                  t,
+                  refusalReservationOf(refusal),
+                  t(`dashboard:runtime.refusals.${refusal.reason}`, {
+                    defaultValue: t("dashboard:runtime.refusals.other"),
+                  }),
+                )}
               </p>
             ))}
           </>

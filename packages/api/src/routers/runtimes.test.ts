@@ -536,6 +536,150 @@ describe("runtimes.update", () => {
     expect(db.runtimeVersion.create).not.toHaveBeenCalled();
   });
 
+  it("R4-C-2: a restart in place never keeps a smaller claim; other resources need a start", async () => {
+    // 16 → 48 GiB on the main rank: the claim (and the planner's count) stays at 16 GiB if the
+    // instance restarted in place, so it is reported for a start (runtime_start places it with
+    // the capacity check) instead, like a reservation change.
+    const base = SPEC.launch as NonNullable<RuntimeSpec["launch"]>;
+    const small: RuntimeSpec = {
+      ...SPEC,
+      launch: { ...base, resources: [{ kind: "unified", memoryGb: 16 }] },
+    };
+    const larger: RuntimeSpec = {
+      ...SPEC,
+      launch: { ...base, resources: [{ kind: "unified", memoryGb: 48 }] },
+    };
+    db.runtime.findFirst.mockResolvedValue(
+      updateRow({
+        CurrentVersion: versionRow({ spec: small, launchHash: runtimeLaunchHash(small) }),
+      }) as never,
+    );
+    db.runtimeVersion.findFirst.mockResolvedValue(null);
+    db.runtimeInstance.findMany.mockResolvedValue([
+      {
+        id: "inst-1",
+        desiredState: "RUNNING",
+        LaunchVersion: { launchHash: runtimeLaunchHash(small), spec: small },
+        Ranks: [
+          {
+            rank: 0,
+            claim: "HELD",
+            resources: { kind: "unified", memoryGb: 16 },
+            Node: { id: "node-1", trust: "FULL", trustLowerRequestedAt: null },
+          },
+        ],
+        Reservations: [],
+      },
+    ] as never);
+    db.runtimeVersion.create.mockResolvedValue({ id: "ver-2" } as never);
+    db.runtimeVersion.findUniqueOrThrow.mockResolvedValue(
+      versionRow({ id: "ver-2", version: 2 }) as never,
+    );
+    const result = await client().update({
+      runtimeId: "rt-1",
+      spec: larger,
+      restartRunning: true,
+    });
+    expect(result.restarted).toEqual([]);
+    expect(result.needsRestart).toEqual([{ instanceId: "inst-1", reason: "launch_changed" }]);
+    expect(db.runtimeOperation.create).not.toHaveBeenCalled();
+    expect(db.runtimeInstance.updateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ phase: "STARTING" }) }),
+    );
+  });
+
+  it.each([
+    // R5 (C5C-UPDATE): a version says 48 GiB but the claim (taken for an earlier version) holds
+    // 16: a command-only edit must not restart it in place on the smaller claim.
+    ["an inherited smaller claim", { kind: "unified", memoryGb: 16 }, [], "needsRestart"],
+    // The claim matches (the planner's recorded GPUs aside): restarts in place.
+    ["a matching claim", { kind: "unified", memoryGb: 48, gpus: ["gpu0"] }, [], "restarted"],
+    // A reservation row the version does not have (or another one): placed by a start.
+    [
+      "an extra reservation row",
+      { kind: "unified", memoryGb: 48 },
+      [{ index: 0, labels: ["w"], resources: { kind: "unified", memoryGb: 8 } }],
+      "needsRestart",
+    ],
+  ] as const)(
+    "R4-C-2: an update restart compares the new version with the claims held (%s)",
+    async (_name, held, reservations, outcome) => {
+      const base = SPEC.launch as NonNullable<RuntimeSpec["launch"]>;
+      const at48: RuntimeSpec = {
+        ...SPEC,
+        launch: { ...base, resources: [{ kind: "unified", memoryGb: 48 }] },
+      };
+      const commandOnly: RuntimeSpec = {
+        ...at48,
+        launch: {
+          ...(at48.launch as NonNullable<RuntimeSpec["launch"]>),
+          commands: [
+            { start: "vllm serve qwen --host 127.0.0.1 --port {{port}} --y", stop: "true" },
+          ],
+        },
+      };
+      db.runtime.findFirst.mockResolvedValue(
+        updateRow({
+          CurrentVersion: versionRow({ spec: at48, launchHash: runtimeLaunchHash(at48) }),
+        }) as never,
+      );
+      db.runtimeVersion.findFirst.mockResolvedValue(null);
+      db.runtimeInstance.findMany.mockResolvedValue([
+        {
+          id: "inst-1",
+          desiredState: "RUNNING",
+          LaunchVersion: { launchHash: runtimeLaunchHash(at48), spec: at48 },
+          Ranks: [
+            {
+              rank: 0,
+              claim: "HELD",
+              resources: held,
+              Node: { id: "node-1", trust: "FULL", trustLowerRequestedAt: null },
+            },
+          ],
+          Reservations: reservations,
+        },
+      ] as never);
+      db.runtimeInstance.findUnique.mockResolvedValue({
+        runGeneration: 4,
+        phase: "READY",
+        operationId: "op-0",
+      } as never);
+      db.runtimeVersion.create.mockResolvedValue({ id: "ver-2" } as never);
+      db.runtimeOperation.create.mockResolvedValue({ id: "op-1" } as never);
+      db.runtimeVersion.findUniqueOrThrow.mockResolvedValue(
+        versionRow({ id: "ver-2", version: 2 }) as never,
+      );
+      const result = await client().update({
+        runtimeId: "rt-1",
+        spec: commandOnly,
+        restartRunning: true,
+      });
+      // The rank claims and current reservation rows are read with the instances.
+      expect(db.runtimeInstance.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          select: expect.objectContaining({
+            Ranks: expect.objectContaining({
+              select: expect.objectContaining({ rank: true, resources: true }),
+            }),
+            Reservations: expect.objectContaining({ where: { supersededGeneration: null } }),
+          }),
+        }),
+      );
+      if (outcome === "restarted") {
+        expect(result.restarted).toEqual(["inst-1"]);
+        expect(result.needsRestart).toEqual([]);
+      } else {
+        expect(result.restarted).toEqual([]);
+        expect(result.needsRestart).toEqual([{ instanceId: "inst-1", reason: "launch_changed" }]);
+        expect(db.runtimeOperation.create).not.toHaveBeenCalled();
+        expect(db.runtimeInstance.updateMany).not.toHaveBeenCalledWith(
+          expect.objectContaining({ data: expect.objectContaining({ phase: "STARTING" }) }),
+        );
+      }
+    },
+  );
+
   it("restarts for a person but reports trust_relay for an agent on a Relay-only node", async () => {
     const changed: RuntimeSpec = {
       ...SPEC,
@@ -551,10 +695,16 @@ describe("runtimes.update", () => {
         {
           id: "inst-1",
           desiredState: "RUNNING",
-          LaunchVersion: { launchHash: runtimeLaunchHash(SPEC) },
+          LaunchVersion: { launchHash: runtimeLaunchHash(SPEC), spec: SPEC },
           Ranks: [
-            { claim: "HELD", Node: { id: "node-1", trust: "RELAY", trustLowerRequestedAt: null } },
+            {
+              rank: 0,
+              claim: "HELD",
+              resources: (SPEC.launch as NonNullable<RuntimeSpec["launch"]>).resources[0],
+              Node: { id: "node-1", trust: "RELAY", trustLowerRequestedAt: null },
+            },
           ],
+          Reservations: [],
         },
       ] as never);
       db.runtimeVersion.create.mockResolvedValue({ id: "ver-2" } as never);
@@ -577,6 +727,11 @@ describe("runtimes.update", () => {
     db.$transaction.mockImplementation(((work: (tx: PrismaClient) => unknown) =>
       work(db)) as never);
     setup();
+    db.runtimeInstance.findUnique.mockResolvedValue({
+      runGeneration: 4,
+      phase: "READY",
+      operationId: "op-0",
+    } as never);
     const person = await client().update({
       runtimeId: "rt-1",
       spec: changed,
@@ -584,6 +739,12 @@ describe("runtimes.update", () => {
     });
     expect(person.restarted).toEqual(["inst-1"]);
     expect(db.runtimeOperation.create).toHaveBeenCalled();
+    // The restart begins the instance's next run in the same commit (DP-1): the old run's late
+    // stop or readiness then changes nothing.
+    expect(db.runtimeInstance.update).toHaveBeenCalledWith({
+      where: { id: "inst-1" },
+      data: { runGeneration: 5 },
+    });
   });
 });
 
@@ -819,6 +980,10 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
       Ranks: [{ nodeId: "node-1", port: 30004, distPort: null }],
     } as never);
     db.instanceRank.update.mockResolvedValue({} as never);
+    // The running instance's claim (its reservations, if any, would be superseded).
+    db.instanceRank.findMany.mockResolvedValue([{ claim: "HELD" }] as never);
+    db.instanceReservation.findMany.mockResolvedValue([] as never);
+    db.instanceStep.aggregate.mockResolvedValue({ _max: { generation: null } } as never);
     await client(CALLERS.fullAgent()).start({ runtimeId: "rt-1", instanceId: "inst-1" });
     expect(fenceLog.held).toEqual([`00:owner:${OWNER}`, "08:capacity:inst-1"]);
     expect(db.instanceRank.update.mock.calls[0]?.[0]).toMatchObject({

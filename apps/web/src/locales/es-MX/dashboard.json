@@ -673,6 +673,7 @@
     "name_aliased": "Uno de tus alias de nombre de modelo ya usa ese ID invocable. Elimina el alias o elige otro nombre.",
     "always_on_runtime": "Un runtime siempre activo se ejecuta por su cuenta; no hay nada que iniciar.",
     "fabric_port_ranges_disjoint": "Los rangos de puertos de estos nodos no comparten ningún puerto; haz que se superpongan.",
+    "placement_too_complex": "Ubicar esto requirió demasiado trabajo. Fija los nodos o inicia menos a la vez.",
     "identity_mismatch": "El nodo presentó una clave de identidad distinta."
   },
   "models": {
@@ -1431,7 +1432,7 @@
     "markStopped": {
       "action": "Marcar como detenida…",
       "title": "¿Marcar como detenida?",
-      "description": "wsmp no pudo confirmar que este proceso se detuvo. Al marcar la instancia como detenida, wsmp deja de esperarla; no se ejecuta nada en el nodo para hacerlo. Su puerto, su memoria y sus GPU siguen reservados hasta que wsmp confirme que el proceso ya no existe o la instancia vuelva a iniciar (wsmp reinicia una instancia que debe seguir en ejecución). Hazlo solo si verificaste en el nodo que el proceso terminó.",
+      "description": "wsmp no pudo confirmar que este proceso se detuvo. Al marcar la instancia como detenida, wsmp deja de esperarla; no se ejecuta nada en el nodo para hacerlo. Su puerto, su memoria y sus GPU siguen reservados (los inicios que esperan ese espacio siguen esperando) hasta que wsmp confirme que el proceso ya no existe o la instancia vuelva a iniciar (wsmp reinicia una instancia que debe seguir en ejecución). Hazlo solo si verificaste en el nodo que el proceso terminó.",
       "confirm": "Marcar como detenida",
       "pending": "Marcando…",
       "done": "Marcada como detenida.",
@@ -1483,6 +1484,12 @@
     "placement": "Nodo {{number}}: {{node}}, puerto {{port}}",
     "reservationPlacement": "Ocupa {{memory}} en {{node}} (reserva {{number}}, ahí no se ejecuta nada)",
     "reservationHeld": "Ocupa {{memory}} en {{node}}",
+    "reservationUnconfirmed": "Ocupa {{memory}} en {{node}} hasta que se confirme que se detuvo",
+    "reservationIdle": "Reserva {{memory}} en {{node}} mientras se ejecuta (ahora no ocupa nada)",
+    "reservationRefusal": "Reserva {{number}} (etiquetas {{labels}}): {{reason}}",
+    "reservationRefusalNode": "Reserva {{number}} (etiquetas {{labels}}), {{node}}: {{reason}}",
+    "waitingToRestart": "Esperando para reiniciarse: {{reason}} Lo vuelve a intentar cada 30 segundos.",
+    "waitingToRestartNeutral": "Esperando para reiniciarse hasta que se pueda ubicar de nuevo. Lo vuelve a intentar cada 30 segundos.",
     "startRequested": "Inicio solicitado.",
     "warnings": {
       "low_free_memory": "Poca memoria libre en el nodo.",
@@ -1540,6 +1547,7 @@
       "invite_needs_link": "Esta invitación necesita su enlace para aceptarse.",
       "always_on_runtime": "Los runtimes siempre activos se ejecutan por su cuenta; no hay nada que iniciar.",
       "fabric_port_ranges_disjoint": "Los rangos de puertos de los nodos no comparten ningún puerto para el puerto dist.",
+      "placement_too_complex": "Ubicar este inicio requirió demasiado trabajo (muchos nodos, reservas o detenciones por probar). Fija los nodos o inicia menos a la vez.",
       "cap_currency_has_spend": "La moneda del tope debe ser la que este compartido ya gastó este mes.",
       "already_shared": "Este pool ya está compartido con esta persona. Cambia el compartido existente.",
       "invite_pending": "Este correo ya tiene una invitación pendiente. Reenvíala en su lugar.",
@@ -1783,7 +1791,7 @@
       "view": "Vista de la definición",
       "formTab": "Formulario",
       "jsonTab": "JSON",
-      "fixJsonFirst": "Corrige el JSON antes de volver al formulario.",
+      "fixJsonFirst": "Corrige el JSON antes de volver al formulario. El formulario solo muestra una definición completa que puede conservar tal como está escrita (sin campos desconocidos).",
       "servesLabel": "Qué ejecuta",
       "serves": "Sirve modelos",
       "service": "Servicio (sin modelos)",

@@ -121,9 +121,26 @@ export const REFUSAL_REASONS = [
   "already_released",
   /** A release request for this node part already waits for a person. */
   "release_request_pending",
+  // Placement work budget (packages/api/src/lib/placement.ts PLACEMENT_WORK_BUDGET).
+  /**
+   * Placing a start took more work than one plan may do (many nodes, reservations or stops to
+   * try): pin the nodes, or start fewer at once.
+   */
+  "placement_too_complex",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);
+
+/** The `launch.reservations` entry a placement refusal is about (`data.reservation` too). */
+export const refusalReservationSchema = z
+  .object({
+    /** 0-based position in `launch.reservations`. */
+    index: z.number().int().min(0),
+    labels: z.array(z.string()),
+    /** The node the reason names (`subjectId`), when there is one. */
+    nodeSlug: z.string().nullable(),
+  })
+  .strict();
 
 export const refusalSchema = z
   .object({
@@ -131,5 +148,7 @@ export const refusalSchema = z
     /** The node, instance or member it is about, when there is one. */
     subjectId: z.string().nullable(),
     message: z.string(),
+    /** A reservation that cannot be placed: which one (clients show it with the reason). */
+    reservation: refusalReservationSchema.optional(),
   })
   .strict();

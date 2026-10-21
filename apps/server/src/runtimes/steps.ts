@@ -11,10 +11,17 @@
  *   30 AFTER_JOIN  ranks whose commands have `afterJoin` (after every rank started)
  *   40 READINESS   rank 0 (the head) only
  * Gang stops add STOP steps with `sequence = generation * 100 + 50 + n`; health probes use
- * `HEALTH_SEQUENCE_BASE` and up.
+ * `HEALTH_SEQUENCE_BASE` and up. The generation is the instance's run (`instance-run.ts`), and
+ * order inside a run is the phase slot (`slotOf`), not the raw sequence.
+ *
+ * Stops and status probes (the leading stop included) name what physically runs on the rank:
+ * the intent of its latest launch (`Physical`), which may be of an earlier launch version, port
+ * or unit than the run's own. The node matches its record by that identity and uses the
+ * record's own stop command, so a restart onto a new version still stops the old process.
  */
 import { createHash } from "node:crypto";
 import { canonicalJson } from "@ws-model-proxy/api/lib/canonical-json";
+import { GENERATION_STRIDE } from "@ws-model-proxy/api/lib/instance-run";
 import {
   RUNTIME_TIMEOUTS_SEC,
   type RuntimeCommands,
@@ -31,7 +38,7 @@ import { type JobPlaceholders, type RuntimeJobFrame, runtimeUnitName } from "../
 export const HEALTH_SEQUENCE_BASE = 1_000_000;
 /** Status probes of ranks marked stopped (held-unknown): unbounded, like health probes. */
 export const STATUS_SEQUENCE_BASE = 2_000_000;
-export const GENERATION_STRIDE = 100;
+export { GENERATION_STRIDE };
 export const STOP_ORDER_BASE = 50;
 /** Health probes and status checks of the CLI are short. */
 export const HEALTH_TIMEOUT_MS = 60_000;
@@ -208,12 +215,29 @@ function intentFor(input: {
   };
 }
 
+/**
+ * What runs on a rank: the stored intent of its latest launch, and the launch (spec) of that
+ * intent's version (the stop's timeout and interactivity come from it).
+ */
+export type Physical = { intent: StepIntent; launch: RuntimeLaunch };
+
+function physicalIntent(input: Parameters<typeof intentFor>[0], physical: Physical): StepIntent {
+  const commands = commandsFor(physical.launch, input.rank.rank);
+  return {
+    ...physical.intent,
+    operationId: input.operationId,
+    timeoutMs: timeoutFor(input.phase, physical.launch, commands),
+    interactive: interactiveFor(input.phase, commands),
+  };
+}
+
 function step(
   input: Parameters<typeof intentFor>[0],
   sequence: number,
   generation: number,
+  physical?: Physical,
 ): NewStep {
-  const intent = intentFor(input);
+  const intent = physical ? physicalIntent(input, physical) : intentFor(input);
   return {
     rank: input.rank.rank,
     phase: input.phase,
@@ -224,13 +248,17 @@ function step(
   };
 }
 
-/** Every step of start generation `generation` (≥ 1). */
+/**
+ * Every step of start generation `generation` (≥ 1). `physical`: per rank, what runs there now
+ * (its leading stop names it).
+ */
 export function generationSteps(input: {
   instance: InstanceInput;
   ranks: readonly RankInput[];
   launch: RuntimeLaunch;
   generation: number;
   operationId: string | null;
+  physical?: ReadonlyMap<number, Physical>;
 }): NewStep[] {
   const ranks = [...input.ranks].sort((a, b) => a.rank - b.rank);
   const nnodes = ranks.length;
@@ -245,7 +273,14 @@ export function generationSteps(input: {
   for (const rank of ranks) {
     const commands = commandsFor(input.launch, rank.rank);
     if (input.generation > 1)
-      steps.push(step({ ...common, rank, phase: "STOP" }, base + ORDER.STOP, input.generation));
+      steps.push(
+        step(
+          { ...common, rank, phase: "STOP" },
+          base + ORDER.STOP,
+          input.generation,
+          input.physical?.get(rank.rank),
+        ),
+      );
     if (commands.prepare)
       steps.push(
         step({ ...common, rank, phase: "PREPARE" }, base + ORDER.PREPARE, input.generation),
@@ -274,6 +309,8 @@ export function stopStep(input: {
   attempt: number;
   operationId: string | null;
   phase?: "STOP" | "STATUS";
+  /** What runs on the rank (absent: the instance's own launch). */
+  physical?: Physical;
 }): NewStep {
   return step(
     {
@@ -288,6 +325,7 @@ export function stopStep(input: {
       ? STATUS_SEQUENCE_BASE + input.attempt
       : input.generation * GENERATION_STRIDE + STOP_ORDER_BASE + Math.min(input.attempt, 49),
     input.generation,
+    input.physical,
   );
 }
 

@@ -26,7 +26,8 @@ import { graphWrite, instanceCapacityFences } from "../lib/graph-write";
 import { PlacementPlanner } from "../lib/placement";
 import { loadPlacementContext } from "../lib/placement-load";
 import { previewFingerprint } from "../lib/preview-fingerprint";
-import { notFound, refuse, refuseAbout } from "../lib/refuse";
+import { notFound, refusalOf, refuse, refuseAbout } from "../lib/refuse";
+import { CURRENT_RESERVATION_WHERE } from "../lib/reservations";
 import { runtimeSpecWarnings } from "../lib/runtime-spec";
 import {
   effectiveTrust,
@@ -138,7 +139,11 @@ async function computeStart(
           select: { nodeId: true, port: true, distPort: true },
           orderBy: { rank: "asc" },
         },
-        Reservations: { select: { index: true, nodeId: true }, orderBy: { index: "asc" } },
+        Reservations: {
+          where: CURRENT_RESERVATION_WHERE,
+          select: { index: true, nodeId: true },
+          orderBy: { index: "asc" },
+        },
       },
     });
     if (!instance) throw notFound("That instance does not exist.");
@@ -246,7 +251,7 @@ async function operationView(operationId: string) {
 
 function throwFirstRefusal(refusals: readonly Refusal[]): void {
   const first = refusals[0];
-  if (first) throw refuseAbout(first.reason, first.subjectId, first.message);
+  if (first) throw refusalOf(first);
 }
 
 export const runtimeStart = contractProcedure(c.start).handler(async ({ input, context }) => {

@@ -402,6 +402,83 @@ describe("errors and output", () => {
     });
   });
 
+  it("keeps a reservation refusal's reason and node in bounded text, and which one structured", async () => {
+    // The real planner's refusal for a reservation with 8 schema-valid 63-character labels
+    // (over 500 characters of labels) whose only labelled node is offline.
+    const { PlacementPlanner } = await import("../../../../packages/api/src/lib/placement");
+    const { refusalOf } = await import("../../../../packages/api/src/lib/refuse");
+    const { runtimeReservationSchema } = await import("@ws-model-proxy/api/lib/runtime-spec");
+    const labels = Array.from({ length: 8 }, (_, index) => `w${index}-${"x".repeat(60)}`);
+    const reservation = runtimeReservationSchema.parse({
+      labels,
+      resources: { kind: "unified", memoryGb: 10 },
+    });
+    const node = (id: string, online: boolean, nodeLabels: string[]) => ({
+      id,
+      slug: id,
+      online,
+      labels: nodeLabels,
+      trust: "FULL" as const,
+      held: false,
+      portRange: [30000, 30009] as const,
+      heldVersionIds: new Set<string>(),
+      frozenFabrics: null,
+      memoryGb: 126,
+      gpus: [],
+      liveFreeMemoryGb: null,
+    });
+    const placed = new PlacementPlanner({
+      callerId: "u",
+      agent: false,
+      nodes: [node("head", true, ["head"]), node("worker-slug", false, labels)],
+      instances: [],
+      fabrics: [],
+    }).place({
+      runtimeId: "r",
+      versionId: "v",
+      nodeIds: ["head"],
+      preempt: false,
+      checkFrozen: false,
+      launch: {
+        groupSize: 1,
+        resources: [{ kind: "unified", memoryGb: 10 }],
+        labels: ["head"],
+        reservations: [reservation],
+      },
+    });
+    if (placed.ok) throw new Error("expected a reservation refusal");
+    expect(placed.refusal.message.length).toBeGreaterThan(500);
+    const result = await runMcpTool(tool("runtime_start"), {
+      dispatch: testDispatch("FULL"),
+      args: { runtimeId: "r" },
+      invoke: async () => {
+        throw refusalOf(placed.refusal);
+      },
+    });
+    const text = result.content.map((entry) => ("text" in entry ? entry.text : "")).join("");
+    expect(text.length).toBeLessThanOrEqual(500);
+    expect(text).toContain("Reservation 1 cannot be placed");
+    expect(text).toContain("worker-slug is offline");
+    expect(structured(result).error).toMatchObject({
+      reason: "node_offline",
+      reservation: { index: 0, labels, nodeSlug: "worker-slug" },
+    });
+  });
+
+  it("leaves out a reservation that does not have the refusal shape", async () => {
+    const result = await runMcpTool(tool("runtime_start"), {
+      dispatch: testDispatch("FULL"),
+      args: { runtimeId: "r" },
+      invoke: async () => {
+        throw new ORPCError("CONFLICT", {
+          message: "Reservation 1 cannot be placed.",
+          data: { reason: "node_offline", subjectId: null, reservation: { index: -1 } },
+        });
+      },
+    });
+    expect(structured(result).error).not.toHaveProperty("reservation");
+  });
+
   it("keeps a procedure's own message on a BAD_REQUEST without issues or reason", async () => {
     const result = await runMcpTool(tool("runtime_start"), {
       dispatch: testDispatch("FULL"),

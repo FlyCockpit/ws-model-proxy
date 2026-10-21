@@ -38,6 +38,15 @@
     "./lib/runtime-store": {
       "default": "./src/lib/runtime-store.ts"
     },
+    "./lib/reservations": {
+      "default": "./src/lib/reservations.ts"
+    },
+    "./lib/retake-plan": {
+      "default": "./src/lib/retake-plan.ts"
+    },
+    "./lib/instance-run": {
+      "default": "./src/lib/instance-run.ts"
+    },
     "./lib/needs-you-mail": {
       "default": "./src/lib/needs-you-mail.ts"
     },

@@ -127,7 +127,9 @@ markStopped: true, confirm: "MARK_STOPPED"}` (optionally `nodeNumber` for one
 node of a multi-node instance, and a `note`). It touches nothing on the node.
 Agents may do this only on Full-control nodes (`trust_relay` otherwise). The
 claim stays counted until a status probe proves the stop, but the instance
-settles STOPPED and later starts stop waiting for it (`waits_for_stop`). The
+settles STOPPED. A start queued behind it (`waits_for_stop`) keeps waiting
+until the claim is released (a proof or a person's release), like placement,
+which never counts a claim marked stopped as free. The
 probes go on after that, also on a STOPPED instance, and the first one that
 proves the stop releases the claim; `lastStopCheck` keeps showing why.
 `runtimes_get` keeps listing a STOPPED or FAILED instance while any of its
@@ -136,6 +138,63 @@ ranks is still reserved, with that `reserved` state and `lastStopCheck`
 null, e.g. no `nodeSlug` means the node was removed). Marking such a rank
 stopped again answers CONFLICT with the last automatic check's result. Each
 node marked stopped writes a `marked_stopped` row in the node's activity.
+
+An instance that crashed (any runtime, with or without reservations) restarts
+automatically after its backoff. Its claims were released meanwhile, so the
+restart first checks for room like a start does: its own nodes and ports, and
+its reservations again by labels. When that check refuses (not enough memory,
+a port in use, a node offline or on hold, no node with the labels), the
+instance stays `STOPPED` with `phaseReason` `waiting_<reason>` (for example
+`waiting_not_enough_memory`), retries every 30 seconds, and does not use its
+restart budget (`restartsInWindow`) while it waits. The runtime page shows the
+reason.
+
+Placement work is bounded: one start (or profile apply, or automatic restart)
+plans with at most a fixed amount of work (fits tried, nodes checked, stops
+considered). A plan that needs more, on a very large fleet with many stops to
+try, is refused `placement_too_complex`: pin the nodes (`nodeIds` or a
+profile), or start fewer at once.
+
+Every restart (automatic, `runtime_start` on an instance, a profile apply, or
+`runtime_update` with `restartRunning`) begins a new run of the instance in
+the same change that records it. From then on nothing of the earlier run is
+sent to the node, and its late answers change nothing: a stop or status
+probe answer, a readiness or start result, an operator screen, or a node
+inventory record about the earlier run releases nothing, does not make the
+new run READY and does not stop it. Inside a run, an inventory record proves a
+stop only when it was taken after the run's last launch. So the new run's
+port, memory, GPUs and reservations stay held until that run's own stop is
+proven (or a person releases them).
+
+The new run first stops what the earlier one left running: its leading stop
+names the process that actually runs (its launch version, port and unit, even
+when the restart changed the definition), and it waits until every launch of
+the earlier run that was sent has answered (bounded by that step's timeout).
+An earlier run's confirm screen nobody accepted is closed; a person's run that
+was already accepted keeps running, and the new run's stops wait for it. Once
+that accepted run is past its timeout, its person is asked to look at it
+(`needsOperator` `STEP`, listed in Needs you with that step, so its terminal
+can be opened again), as for a run of the current run. The step is never cut
+off, and its answer still changes nothing about the new run. If the server
+could not record that the person pressed Enter (a failed database write), the
+relay delivers it again (after 1, 2, 4 ... 32 seconds), and whenever the server
+next asks about the step and the node says the command runs, it records the
+acceptance then (its timeout counted from when the screen came up), so the
+run is never lost from Needs you.
+
+A node inventory that cannot be dated against the run's launch (a missing
+record, or a record from a node older than 0.4.0 without a step id) no longer
+counts as a crash by itself: it makes a health probe due now, and the health
+thresholds decide (`failureThreshold` failed probes make it UNHEALTHY, and
+`unhealthyRestartMs` later it is stopped and restarted). A probe nobody answers
+fails only when its 60-second timeout passes, so with no answers this takes up
+to about `failureThreshold` × 60 s + (`failureThreshold` − 1) × `intervalMs` +
+`unhealthyRestartMs`, plus scheduling. A record that names the current run's
+step and says stopped is still a crash at once. An inventory the server could
+not classify (a database error) is refused as a whole (`runtime.inventory.error`):
+the relay keeps serving what it served, and the node's next inventory is read
+again. Of two inventories of one node, an older one that finishes later never
+replaces what the newer one published.
 
 When the node can never prove the stop (a run launched with a status command
 that always says running, a node that is gone), only a person can free that
@@ -238,18 +297,35 @@ A spec has exactly one of:
     lands on its own node with all of its labels, never the runtime's node;
     `runtime_start` `nodeIds` and profile pins move only the runtime's node.
     Placement counts a reservation like a rank's claim, so nothing else is
-    placed into that memory, and a start that cannot place one is refused with
-    the reservation's labels and why (no other node with the labels, offline,
-    on hold, or not enough memory on the closest node). Nothing is ever sent to
+    placed into that memory. The reservations are placed together, so the
+    order of the entries never decides whether they fit. A start that cannot
+    place one is refused with the reservation's labels and, for each node with
+    the labels, why not (offline, on hold, not enough memory, or needed by
+    another reservation); the refusal (preview `refusals[]` and the error's
+    `data`; for an MCP tool error, `structuredContent.error`) carries
+    `reservation: {index, labels, nodeSlug}`, and the message names the reason
+    and nodes before the labels. A reservation no node can take at all (no
+    node with its labels, or fewer such nodes than reservations need) is
+    refused once, before any node is tried for the runtime. Nothing is ever sent to
     a reserved node: health, readiness and stop proofs run on the runtime's own
     node. A reservation holds exactly as long as the runtime's claim (a
     stopping runtime keeps it until the stop is proven; marked stopped, it
-    stays counted). A reserved node that goes offline makes the instance
+    stays counted). A restart that moves, shrinks or removes a reservation of
+    a run that may still be running keeps the old reservation counted until
+    the new run's leading stop proves the old run stopped. An automatic
+    restart after a crash (of any runtime) checks for room like a start (the runtime's own
+    nodes and ports, reservations again by labels, their previous nodes
+    first); when the planner refuses (not enough memory, a port in use, a node
+    offline or on hold, no node with the labels, ...) the instance stays
+    `STOPPED` with `phaseReason` `waiting_<reason>` (the refusal's reason, for
+    example `waiting_not_enough_memory` or `waiting_node_offline`) and tries
+    again every 30 seconds, without using its restart budget. A reserved node that goes offline makes the instance
     `UNAVAILABLE`, and it is stopped after `unavailableStopMs` unless the node
     returns first; a deleted one stops it at once. Nodes never see
     `reservations` (it is not part of the launch hash), so changing only the
     reservations of a running instance needs a restart (`needsRestart`,
-    `launch_changed`) to place them again. The instance view lists
+    `launch_changed`) to place them again, and the version's `launchChanged`
+    is true. The instance view lists
     `reservations` (node, labels, `memoryGb`, `reserved`), the start preview
     lists where each goes, and node views count them in `reservedNowMemoryGb`
     and list them with `role: "reservation"`.
@@ -288,7 +364,15 @@ a profile on a fresh node fetches weights by itself. A spec is at most 48 KiB as
 canonical JSON and one command at most 4 KiB. `limits` (null: automatic) and
 `advanced` settings are separate inputs; `runtimes_get` shows their keys and
 effective values. Limit edits apply live; a changed definition saves a new
-version and needs `restartRunning` to reach running instances.
+version and needs `restartRunning` to reach running instances. That restart
+keeps each instance's claims where they are and as they are, so it is only
+for a version that claims what the instance actually holds (one rank claim per
+rank with that rank's `resources`, and its current reservation rows with each
+entry's labels and resources; the version the instance runs is not enough,
+since a claim taken for an earlier version stays as it was taken): an instance
+whose claims differ is listed in `needsRestart` (`launch_changed`) and is
+restarted with `runtime_start` (its instance id), which places the new claims
+with the start's capacity check.
 
 ### Request compatibility
 

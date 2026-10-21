@@ -673,6 +673,7 @@
     "name_aliased": "One of your model-name aliases already uses that callable ID. Remove the alias or pick another name.",
     "always_on_runtime": "An always-on runtime runs on its own; there is nothing to start.",
     "fabric_port_ranges_disjoint": "These nodes' port ranges share no port; make them overlap.",
+    "placement_too_complex": "Placing this took too much work. Pin the nodes, or start fewer at once.",
     "identity_mismatch": "The node presented a different identity key."
   },
   "models": {
@@ -1431,7 +1432,7 @@
     "markStopped": {
       "action": "Mark as stopped…",
       "title": "Mark as stopped?",
-      "description": "wsmp couldn't confirm that this process stopped. Marking it stopped tells wsmp to stop waiting for it; nothing is run on the node to do it. Its port, memory and GPUs stay reserved until wsmp confirms the process is gone or the instance starts again (wsmp restarts an instance that should keep running). Do this only if you've checked on the node that the process is gone.",
+      "description": "wsmp couldn't confirm that this process stopped. Marking it stopped tells wsmp to stop waiting for it; nothing is run on the node to do it. Its port, memory and GPUs stay reserved (starts waiting for that room keep waiting) until wsmp confirms the process is gone or the instance starts again (wsmp restarts an instance that should keep running). Do this only if you've checked on the node that the process is gone.",
       "confirm": "Mark as stopped",
       "pending": "Marking…",
       "done": "Marked as stopped.",
@@ -1483,6 +1484,12 @@
     "placement": "Node {{number}}: {{node}}, port {{port}}",
     "reservationPlacement": "Holds {{memory}} on {{node}} (reservation {{number}}, nothing runs there)",
     "reservationHeld": "Holds {{memory}} on {{node}}",
+    "reservationUnconfirmed": "Holds {{memory}} on {{node}} until the stop is confirmed",
+    "reservationIdle": "Reserves {{memory}} on {{node}} while it runs (not held now)",
+    "reservationRefusal": "Reservation {{number}} (labels {{labels}}): {{reason}}",
+    "reservationRefusalNode": "Reservation {{number}} (labels {{labels}}), {{node}}: {{reason}}",
+    "waitingToRestart": "Waiting to restart: {{reason}} It tries again every 30 seconds.",
+    "waitingToRestartNeutral": "Waiting to restart until it can be placed again. It tries again every 30 seconds.",
     "startRequested": "Start requested.",
     "warnings": {
       "low_free_memory": "Little free memory on the node.",
@@ -1540,6 +1547,7 @@
       "invite_needs_link": "This invite needs its link to be accepted.",
       "always_on_runtime": "Always-on runtimes run on their own; there is nothing to start.",
       "fabric_port_ranges_disjoint": "The nodes' port ranges share no port for the dist port.",
+      "placement_too_complex": "Placing this start took too much work (many nodes, reservations or stops to try). Pin the nodes, or start fewer at once.",
       "cap_currency_has_spend": "The cap's currency must be the one this share has spent in this month.",
       "already_shared": "This pool is already shared with this person. Change the existing share.",
       "invite_pending": "This e-mail already has a pending invite. Resend it instead.",
@@ -1783,7 +1791,7 @@
       "view": "Definition view",
       "formTab": "Form",
       "jsonTab": "JSON",
-      "fixJsonFirst": "Fix the JSON before switching back to the form.",
+      "fixJsonFirst": "Fix the JSON before switching back to the form. The form shows only a complete definition it can keep exactly as written (no unknown fields).",
       "servesLabel": "What it runs",
       "serves": "Serves models",
       "service": "Service (no models)",

@@ -425,8 +425,10 @@ BEGIN
    WHERE i."desiredState" IS NOT NULL AND i.phase <> 'STOPPED'
      AND (EXISTS (SELECT 1 FROM instance_rank r WHERE r."instanceId" = i.id AND r."nodeId" = OLD.id)
           -- A reservation (launch.reservations) there: like a rank's node, the instance stops.
+          -- (The current plan's: a superseded one belongs to a run being replaced.)
           OR EXISTS (SELECT 1 FROM instance_reservation v
-                      WHERE v."instanceId" = i.id AND v."nodeId" = OLD.id));
+                      WHERE v."instanceId" = i.id AND v."nodeId" = OLD.id
+                        AND v."supersededGeneration" IS NULL));
   -- Agents' release requests for those claims have nothing left to release.
   UPDATE claim_release_request
      SET state = 'CLEARED', "pendingRankId" = NULL, "decidedAt" = now()
@@ -666,6 +668,10 @@ ALTER TABLE instance_rank ADD CONSTRAINT instance_rank_bounds CHECK (
 -- HELD and HELD_UNKNOWN keep their port reserved.
 CREATE UNIQUE INDEX IF NOT EXISTS instance_rank_reserved_port
   ON instance_rank ("nodeId", port) WHERE claim <> 'RELEASED';
+-- One current reservation per launch.reservations entry; a restart keeps the old run's rows
+-- (superseded) until the new run starts.
+CREATE UNIQUE INDEX IF NOT EXISTS instance_reservation_current_index
+  ON instance_reservation ("instanceId", index) WHERE "supersededGeneration" IS NULL;
 ALTER TABLE instance_rank DROP CONSTRAINT IF EXISTS instance_rank_claim_shape;
 ALTER TABLE instance_rank ADD CONSTRAINT instance_rank_claim_shape CHECK (
   (claim <> 'HELD_UNKNOWN' OR "markedStoppedAt" IS NOT NULL)
@@ -746,6 +752,41 @@ FOR EACH ROW EXECUTE FUNCTION enforce_instance_node_owner();
 DROP TRIGGER IF EXISTS instance_step_node_owner ON instance_step;
 CREATE TRIGGER instance_step_node_owner BEFORE INSERT OR UPDATE OF "nodeId", "instanceId" ON instance_step
 FOR EACH ROW EXECUTE FUNCTION enforce_instance_node_owner();
+-- Runs (packages/api/src/lib/instance-run.ts): an instance's runGeneration is its current run,
+-- begun in the transaction that commits a restart. It never goes back; every new step belongs
+-- to the instance's current run (a positive one: a legacy row with 0 is bootstrapped from its
+-- steps before anything new is written); a step's generation never changes. Rows written before
+-- runs existed are left as they are (only new inserts and updates are checked).
+CREATE OR REPLACE FUNCTION enforce_instance_run_order()
+RETURNS trigger LANGUAGE plpgsql AS $instance_run_order$
+DECLARE
+  run INTEGER;
+BEGIN
+  IF TG_TABLE_NAME = 'runtime_instance' THEN
+    IF NEW."runGeneration" < OLD."runGeneration" THEN
+      RAISE EXCEPTION 'an instance run never goes back' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF TG_OP = 'UPDATE' THEN
+    IF NEW.generation IS DISTINCT FROM OLD.generation THEN
+      RAISE EXCEPTION 'a step keeps its generation' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+  END IF;
+  SELECT "runGeneration" INTO run FROM runtime_instance WHERE id = NEW."instanceId";
+  IF run IS NULL OR run < 1 OR NEW.generation IS DISTINCT FROM run THEN
+    RAISE EXCEPTION 'a new step belongs to its instance''s current run' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$instance_run_order$;
+DROP TRIGGER IF EXISTS instance_run_order ON runtime_instance;
+CREATE TRIGGER instance_run_order BEFORE UPDATE OF "runGeneration" ON runtime_instance
+FOR EACH ROW EXECUTE FUNCTION enforce_instance_run_order();
+DROP TRIGGER IF EXISTS instance_step_run_order ON instance_step;
+CREATE TRIGGER instance_step_run_order BEFORE INSERT OR UPDATE OF generation ON instance_step
+FOR EACH ROW EXECUTE FUNCTION enforce_instance_run_order();
 
 ALTER TABLE instance_step DROP CONSTRAINT IF EXISTS instance_step_shape;
 ALTER TABLE instance_step ADD CONSTRAINT instance_step_shape CHECK (
@@ -2610,10 +2651,10 @@ BEGIN
     ('runtime_version', 'id,runtimeId,version', ''),
     ('runtime_model', 'id,userId,runtimeId,upstreamModelId,type', ''),
     ('runtime_share', 'id,runtimeId,ownerUserId,granteeUserId', ''),
-    ('runtime_instance', 'id,userId,runtimeId,launchVersionId,handle,desiredState', 'versionId'),
+    ('runtime_instance', 'id,userId,runtimeId,launchVersionId,handle,desiredState', 'versionId,runGeneration'),
     ('instance_rank', 'id,instanceId,nodeId,rank,claim', ''),
-    ('instance_reservation', 'id,instanceId,nodeId,index,resources', ''),
-    ('instance_step', 'id,instanceId,nodeId,rank,phase,sequence,intent,intentHash,state', ''),
+    ('instance_reservation', 'id,instanceId,nodeId,index,resources,supersededGeneration,plannedGeneration', ''),
+    ('instance_step', 'id,instanceId,nodeId,rank,phase,sequence,generation,intent,intentHash,state', ''),
     ('runtime_operation', 'id,userId,profileId', ''),
     ('execution_target', 'id,userId,kind,instanceId,runtimeModelId,providerModelId', ''),
     ('profile', 'id,userId,slug', ''),

@@ -530,6 +530,8 @@ async function deleteNode(
     const reserving = await tx.instanceReservation.findMany({
       where: {
         nodeId: node.id,
+        // The current plan's (as node_delete_release): a superseded one's run is being replaced.
+        supersededGeneration: null,
         // Holding (a rank's claim is not RELEASED, as `HOLDING_RESERVATION_WHERE`) and running.
         Instance: {
           Ranks: { some: { claim: { not: "RELEASED" } } },

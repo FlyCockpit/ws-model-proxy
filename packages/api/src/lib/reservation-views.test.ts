@@ -4,7 +4,9 @@ vi.mock("@ws-model-proxy/db", () => ({ default: {}, Prisma: { DbNull: null } }))
 
 import { type NodeDetailRow, toNodeDetail, toNodeSummary } from "../nodes/views";
 import { loadPlacementInstances } from "./placement-load";
+import { launchIdentity } from "./reservations";
 import { type PlannedStartWrite, type Tx, writePlannedStarts } from "./runtime-store";
+import { previousLaunchHashes, versionSummary } from "./runtime-views";
 
 // Reservations (`launch.reservations`) as the placement loader and the node views read them:
 // they hold exactly while the instance's rank does.
@@ -159,6 +161,22 @@ describe("node views", () => {
     expect(detail.reservedNowMemoryGb).toBe(100);
   });
 
+  it("a restart's superseded row beside the current one is one entry, and both are counted", () => {
+    const row = nodeRow([{ claim: "HELD" }]);
+    const [current] = row.Reservations;
+    if (!current) throw new Error("no reservation");
+    // A shrunk reservation on the same node: the old run's 100 GiB (superseded) and the new
+    // plan's 20 GiB, both rows of entry 0 of one instance.
+    row.Reservations = [
+      { ...current, supersededGeneration: 1 },
+      { ...current, resources: { kind: "unified", memoryGb: 20 }, supersededGeneration: null },
+    ];
+    const detail = toNodeDetail(row, CONTEXT, NOW);
+    expect(detail.instances).toHaveLength(1);
+    expect(detail.instances[0]).toMatchObject({ instanceId: "inst-ds", role: "reservation" });
+    expect(detail.hardware.reservedNowMemoryGb).toBe(120);
+  });
+
   it("a released rank releases its reservations in the views", () => {
     const detail = toNodeDetail(nodeRow([{ claim: "RELEASED" }]), CONTEXT, NOW);
     expect(detail.instances[0]?.reserved).toBe("RELEASED");
@@ -211,27 +229,56 @@ describe("writePlannedStarts", () => {
     ]);
   });
 
-  it("a restart replaces the old run's reservations with the plan's", async () => {
-    const { db, calls } = writerDb();
-    await writePlannedStarts(db, { ...input, starts: [{ ...START, instanceId: "inst-ds" }] });
-    const reservationCalls = calls.filter((call) => call.model === "instanceReservation");
-    expect(reservationCalls.map((call) => call.method)).toEqual(["deleteMany", "createMany"]);
-    expect(reservationCalls[0]?.args).toEqual({ where: { instanceId: "inst-ds" } });
-    expect(reservationCalls[1]?.args).toEqual({
-      data: [
-        { instanceId: "inst-ds", nodeId: "w1", index: 0, labels: ["ds-worker"], resources: GB100 },
-      ],
-    });
+  // A restart's reservation handoff (superseded rows held until the old run stopped):
+  // reservation-supersede.test.ts.
+});
+
+describe("a version's launchChanged counts reservations (server-only, not in the launch hash)", () => {
+  const HASH = "a".repeat(64);
+  // A service-managed launcher (the shape runtime-spec-reservations.test.ts parses).
+  const launchOf = (reservations?: unknown[]) => ({
+    launch: {
+      management: "service",
+      groupSize: 1,
+      resources: [GB100],
+      labels: ["ds-head"],
+      ...(reservations ? { reservations } : {}),
+      commands: [{ start: "launcher up", stop: "launcher down", status: "launcher status" }],
+      health: { intervalMs: 30000, failureThreshold: 3, successThreshold: 1 },
+    },
+  });
+  const version = (number: number, spec: unknown) =>
+    ({
+      id: `v${number}`,
+      version: number,
+      createdAt: NOW,
+      editor: "USER",
+      editorUserId: "u1",
+      agentTokenId: null,
+      note: null,
+      launchHash: HASH,
+      spec,
+    }) as unknown as Parameters<typeof versionSummary>[0];
+  const workers = [{ labels: ["ds-worker"], resources: GB100 }];
+
+  it("a reservation-only edit (same launch hash) does not apply live", () => {
+    const rows = [version(1, launchOf()), version(2, launchOf(workers))];
+    const previous = previousLaunchHashes(rows);
+    expect(versionSummary(rows[1] as never, previous.get(2) ?? null).launchChanged).toBe(true);
+    // And back: removing them needs a restart too.
+    const back = [...rows, version(3, launchOf())];
+    expect(
+      versionSummary(back[2] as never, previousLaunchHashes(back).get(3) ?? null).launchChanged,
+    ).toBe(true);
   });
 
-  it("a restart to a version without reservations drops them", async () => {
-    const { db, calls } = writerDb();
-    await writePlannedStarts(db, {
-      ...input,
-      starts: [{ ...START, instanceId: "inst-ds", reservations: [] }],
-    });
+  it("other edits with the same launch hash and reservations still apply live", () => {
+    const rows = [version(1, launchOf(workers)), version(2, launchOf(workers))];
     expect(
-      calls.filter((call) => call.model === "instanceReservation").map((call) => call.method),
-    ).toEqual(["deleteMany"]);
+      versionSummary(rows[1] as never, previousLaunchHashes(rows).get(2) ?? null).launchChanged,
+    ).toBe(false);
+    // Without reservations the identity is the launch hash itself (unchanged for old versions).
+    expect(launchIdentity({ launchHash: HASH, spec: launchOf() })).toBe(HASH);
+    expect(launchIdentity({ launchHash: HASH, spec: launchOf([]) })).toBe(HASH);
   });
 });

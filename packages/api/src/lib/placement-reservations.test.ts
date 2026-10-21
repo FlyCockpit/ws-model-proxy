@@ -250,8 +250,22 @@ describe("placement with reservations", () => {
       ),
     );
     expect(refusal.reason).toBe("not_enough_nodes");
-    expect(refusal.message).toContain("Reservation 3 (labels ds-worker)");
-    expect(refusal.message).toContain("no other node has these labels");
+    expect(refusal.message).toMatch(/^Reservation 3 cannot be placed/);
+    expect(refusal.message).toContain("(labels ds-worker)");
+    // Both labelled nodes fit it, but the other two reservations need them.
+    expect(refusal.message).toContain("w1, w2 have room but are needed by other reservations");
+    expect(refusal.reservation).toEqual({ index: 2, labels: ["ds-worker"], nodeSlug: null });
+  });
+
+  it("refuses with the no-node message when no node at all has the labels", () => {
+    const refusal = refused(
+      new PlacementPlanner(context()).place(
+        request({ labels: ["ds-head"], reservations: [{ labels: ["nowhere"], resources: GB100 }] }),
+      ),
+    );
+    expect(refusal.reason).toBe("not_enough_nodes");
+    expect(refusal.message).toContain("no other node has all of its labels");
+    expect(refusal.reservation).toEqual({ index: 0, labels: ["nowhere"], nodeSlug: null });
   });
 
   it("refuses naming the labels and the node when memory is short", () => {
@@ -270,8 +284,130 @@ describe("placement with reservations", () => {
       ),
     );
     expect(refusal).toMatchObject({ reason: "not_enough_memory", subjectId: "w2" });
-    expect(refusal.message).toContain("Reservation 1 (labels ds-worker)");
-    expect(refusal.message).toContain("w2 has the most memory free");
+    expect(refusal.message).toMatch(/^Reservation 1 cannot be placed/);
+    expect(refusal.message).toContain("(labels ds-worker)");
+    expect(refusal.message).toContain("not enough room on w1, w2 (the most is 80 GiB free on w2)");
+    expect(refusal.reservation).toEqual({ index: 0, labels: ["ds-worker"], nodeSlug: "w2" });
+  });
+
+  it("states each reason only for the nodes it applies to (one on hold, one offline)", () => {
+    const planner = new PlacementPlanner(
+      context({
+        nodes: [
+          node("head", { labels: ["ds-head"] }),
+          node("w1", { labels: ["ds-worker"], held: true }),
+          node("w2", { labels: ["ds-worker"], online: false }),
+        ],
+      }),
+    );
+    const refusal = refused(
+      planner.place(
+        request({ labels: ["ds-head"], reservations: [WORKERS[0] as RuntimeReservation] }),
+      ),
+    );
+    expect(refusal).toMatchObject({ reason: "node_offline", subjectId: "w2" });
+    expect(refusal.message).toContain("w2 is offline");
+    expect(refusal.message).toContain("w1 is on hold");
+    expect(refusal.message).not.toContain("every");
+    expect(refusal.reservation?.nodeSlug).toBe("w2");
+  });
+
+  it("a mixed full and offline set names the memory miss and the offline node", () => {
+    const planner = new PlacementPlanner(
+      context({
+        nodes: [
+          node("head", { labels: ["ds-head"] }),
+          node("w1", { labels: ["ds-worker"], memoryGb: 30 }),
+          node("w2", { labels: ["ds-worker"], online: false }),
+        ],
+      }),
+    );
+    const refusal = refused(
+      planner.place(
+        request({ labels: ["ds-head"], reservations: [WORKERS[0] as RuntimeReservation] }),
+      ),
+    );
+    expect(refusal).toMatchObject({ reason: "not_enough_memory", subjectId: "w1" });
+    expect(refusal.message).toContain("w1 has 30 GiB free, and it needs 100 GiB");
+    expect(refusal.message).toContain("w2 is offline");
+    expect(refusal.message).not.toContain("every");
+  });
+
+  describe("assigns reservations together, not first come first served", () => {
+    // The head is pinned; a-special has both labels, z-general only "worker". Taking a-special
+    // for the "worker" entry (best fit, then slug) would leave "special" nothing.
+    const nodes = () => [
+      node("head"),
+      node("a-special", { labels: ["worker", "special"] }),
+      node("z-general", { labels: ["worker"] }),
+    ];
+    const generic: RuntimeReservation = { labels: ["worker"], resources: GB100 };
+    const special: RuntimeReservation = { labels: ["special"], resources: GB100 };
+
+    it("places [worker, special] by moving worker to the other node", () => {
+      const result = ok(
+        new PlacementPlanner(context({ nodes: nodes() })).place(
+          request({ nodeIds: ["head"], reservations: [generic, special] }),
+        ),
+      );
+      expect(result.start.reservations.map((r) => [r.index, r.nodeId])).toEqual([
+        [0, "z-general"],
+        [1, "a-special"],
+      ]);
+    });
+
+    it("places the reversed order on the same nodes", () => {
+      const result = ok(
+        new PlacementPlanner(context({ nodes: nodes() })).place(
+          request({ nodeIds: ["head"], reservations: [special, generic] }),
+        ),
+      );
+      expect(result.start.reservations.map((r) => [r.index, r.nodeId])).toEqual([
+        [0, "a-special"],
+        [1, "z-general"],
+      ]);
+    });
+
+    it("by room too: the small entry moves off the only node the large one fits", () => {
+      const planner = new PlacementPlanner(
+        context({
+          nodes: [
+            node("head"),
+            node("a-big", { labels: ["worker"], memoryGb: 126 }),
+            node("z-small", { labels: ["worker"], memoryGb: 30, liveFreeMemoryGb: null }),
+          ],
+        }),
+      );
+      // Best fit would give the 20 GiB entry z-small anyway; make the large one second and
+      // the small one prefer a-big (a restart's previous node).
+      const result = ok(
+        planner.place(
+          request({
+            nodeIds: ["head"],
+            reservations: [
+              { labels: ["worker"], resources: { kind: "unified", memoryGb: 20 } },
+              generic,
+            ],
+            restart: {
+              instanceId: "inst-x",
+              ports: [30000],
+              distPort: null,
+              reservationNodeIds: ["a-big", null],
+            },
+          }),
+        ),
+      );
+      expect(result.start.reservations.map((r) => r.nodeId)).toEqual(["z-small", "a-big"]);
+    });
+
+    it("commits the assignment in the budgets: a later start cannot take either node", () => {
+      const planner = new PlacementPlanner(context({ nodes: nodes() }));
+      ok(planner.place(request({ nodeIds: ["head"], reservations: [generic, special] })));
+      const next = refused(
+        planner.place(request({ runtimeId: "rt-next", nodeIds: ["z-general"] })),
+      );
+      expect(next.reason).toBe("not_enough_memory");
+    });
   });
 
   it("refuses when every node with the labels is offline", () => {
@@ -320,7 +456,7 @@ describe("placement with reservations", () => {
         }),
       ),
     );
-    expect(refusal.message).toContain("no other node has these labels");
+    expect(refusal.message).toContain("no other node has all of its labels");
   });
 
   it("a restart frees its own reservations and prefers their nodes", () => {
@@ -394,5 +530,116 @@ describe("placement with reservations", () => {
     expect(result.start.placements[0]?.nodeId).toBe("head");
     expect(result.start.blockedBy).toEqual(["old"]);
     expect(result.warnings.map((warning) => warning.code)).toContain("waits_for_stop");
+  });
+});
+
+// R5-C-1: an impossible reservation never makes the planner redo the same work for every node
+// the rank could take, and every planner's work is bounded (`PLACEMENT_WORK_BUDGET`).
+describe("placement work bound", () => {
+  const N = 2_000;
+  const fleet = (labels: (index: number) => string[] = () => [], memoryGb = 126) =>
+    Array.from({ length: N }, (_, index) =>
+      node(`n${String(index).padStart(4, "0")}`, { labels: labels(index), memoryGb }),
+    );
+  /** A running instance of another runtime filling `nodeId` (preemptible). */
+  const filler = (nodeId: string): PlacementInstance => ({
+    id: `fill-${nodeId}`,
+    runtimeId: `rt-fill-${nodeId}`,
+    ownerId: "u-1",
+    startable: true,
+    running: true,
+    ranks: [
+      {
+        nodeId,
+        port: 30001,
+        distPort: null,
+        claim: "HELD",
+        resources: { kind: "unified", memoryGb: 120 },
+      },
+    ],
+    contributed: false,
+    interactiveStop: false,
+  });
+
+  it.each([false, true])(
+    "refuses a reservation no node has the labels for once, not per head (preempt %s)",
+    (preempt) => {
+      const planner = new PlacementPlanner(context({ nodes: fleet() }));
+      const started = performance.now();
+      const refusal = refused(
+        planner.place(
+          request({ preempt, reservations: [{ labels: ["missing"], resources: GB100 }] }),
+        ),
+      );
+      const elapsed = performance.now() - started;
+      expect(refusal.reason).toBe("not_enough_nodes");
+      expect(refusal.message).toContain("no other node has all of its labels");
+      expect(refusal.reservation).toEqual({ index: 0, labels: ["missing"], nodeSlug: null });
+      // Linear: the labels are read once per node, never once per (head, node).
+      expect(planner.work).toBeLessThan(10 * N);
+      expect(elapsed).toBeLessThan(2_000);
+    },
+  );
+
+  it.each([false, true])(
+    "refuses a reservation no labelled node has room for in linear work (preempt %s)",
+    (preempt) => {
+      // Every node has the label, none has room for it (nor for it after any stop).
+      const planner = new PlacementPlanner(context({ nodes: fleet(() => ["worker"]) }));
+      const refusal = refused(
+        planner.place(
+          request({
+            preempt,
+            resources: [{ kind: "unified", memoryGb: 10 }],
+            reservations: [{ labels: ["worker"], resources: { kind: "unified", memoryGb: 500 } }],
+          }),
+        ),
+      );
+      expect(refusal.reason).toBe("not_enough_memory");
+      expect(refusal.reservation?.labels).toEqual(["worker"]);
+      expect(planner.work).toBeLessThan(20 * N);
+    },
+  );
+
+  it("places a feasible reservation on a large fleet in linear work", () => {
+    const planner = new PlacementPlanner(
+      context({ nodes: fleet((index) => (index === N - 1 ? ["worker"] : [])) }),
+    );
+    const result = ok(
+      planner.place(request({ reservations: [{ labels: ["worker"], resources: GB100 }] })),
+    );
+    expect(result.start.reservations.map((r) => r.nodeId)).toEqual([`n${N - 1}`]);
+    expect(result.start.placements[0]?.nodeId).not.toBe(`n${N - 1}`);
+    expect(planner.work).toBeLessThan(20 * N);
+  });
+
+  it("with stops to try for every head, stays inside the budget and says so when spent", () => {
+    // Every node is full (a preemptible filler on each), so every head needs a stop and the
+    // reservation's room changes per head: the bounded case is the budget.
+    const nodes = fleet(() => ["worker"]);
+    const planner = new PlacementPlanner(
+      context({ nodes, instances: nodes.map((n) => filler(n.id)), workBudget: 50_000 }),
+    );
+    const started = performance.now();
+    const result = planner.place(
+      request({
+        preempt: true,
+        resources: [{ kind: "unified", memoryGb: 100 }],
+        // Fits nowhere, even after a stop: every head is tried.
+        reservations: [{ labels: ["worker"], resources: { kind: "unified", memoryGb: 500 } }],
+      }),
+    );
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(refused(result).reason).toBe("placement_too_complex");
+    expect(planner.work).toBeLessThanOrEqual(50_000 + N + 2);
+    // A spent planner refuses every later plan at once, and committed nothing.
+    expect(refused(planner.place(request())).reason).toBe("placement_too_complex");
+    expect(planner.stops).toEqual([]);
+  });
+
+  it("the default budget fits 64 ordinary starts on 2,000 nodes", () => {
+    const planner = new PlacementPlanner(context({ nodes: fleet(() => [], 2_000) }));
+    for (let index = 0; index < 64; index++)
+      ok(planner.place(request({ resources: [{ kind: "unified", memoryGb: 1 }] })));
   });
 });

@@ -14,6 +14,7 @@ import type {
   queuedCommandViewSchema,
 } from "../contracts/nodes";
 import {
+  CURRENT_RESERVATION_WHERE,
   HOLDING_RESERVATION_WHERE,
   RESERVATION_CLAIM_SELECT,
   reservationClaim,
@@ -208,6 +209,7 @@ export const nodeDetailSelect = {
     select: {
       index: true,
       resources: true,
+      supersededGeneration: true,
       Instance: {
         select: {
           id: true,
@@ -216,7 +218,7 @@ export const nodeDetailSelect = {
           needsOperator: true,
           Runtime: { select: { slug: true } },
           ...RESERVATION_CLAIM_SELECT.Instance.select,
-          _count: { select: { Reservations: true } },
+          _count: { select: { Reservations: { where: CURRENT_RESERVATION_WHERE } } },
         },
       },
     },
@@ -397,8 +399,17 @@ export function toNodeDetail(
     needsOperator: rank.Instance.needsOperator,
     role: "rank" as const,
   }));
-  // Memory held here by an instance that runs elsewhere (`launch.reservations`).
-  for (const reservation of reservations)
+  // Memory held here by an instance that runs elsewhere (`launch.reservations`): one entry per
+  // instance, its current reservation's when it has one here. A restart's superseded row (the
+  // old run's, still counted in `hardware` above) beside the new one is the same instance's hold,
+  // not another entry.
+  const reservationEntries = new Map<string, (typeof reservations)[number]>();
+  for (const reservation of reservations) {
+    const seen = reservationEntries.get(reservation.Instance.id);
+    if (!seen || (seen.supersededGeneration !== null && reservation.supersededGeneration === null))
+      reservationEntries.set(reservation.Instance.id, reservation);
+  }
+  for (const reservation of reservationEntries.values())
     instances.push({
       instanceId: reservation.Instance.id,
       runtimeId: reservation.Instance.runtimeId,

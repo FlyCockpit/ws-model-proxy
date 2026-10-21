@@ -22,7 +22,12 @@ import {
   readLearnedProfile,
   storedRequestCompat,
 } from "./request-compat";
-import { reservationClaim, reservationMemoryGb } from "./reservations";
+import {
+  CURRENT_RESERVATION_WHERE,
+  launchIdentity,
+  reservationClaim,
+  reservationMemoryGb,
+} from "./reservations";
 import { type RuntimeSpec, runtimeSpecSchema } from "./runtime-spec";
 import { type StepIntent, stepIntentSchema, stepJobPlaceholders } from "./step-intent";
 import { nodeConnectionView, type StopCheck, stopCheckKey } from "./stop-evidence";
@@ -71,8 +76,10 @@ export const INSTANCE_INCLUDE = {
     },
     orderBy: { rank: "asc" },
   },
-  // Memory held on other nodes (`launch.reservations`); their claim is the ranks' claim.
+  // Memory held on other nodes (`launch.reservations`, the current plan's); their claim is the
+  // ranks' claim. Rows a restart superseded still count on their nodes (node views), not here.
   Reservations: {
+    where: CURRENT_RESERVATION_WHERE,
     include: {
       Node: {
         select: {
@@ -146,7 +153,12 @@ export function actorRef(row: {
   };
 }
 
-export function versionSummary(row: VersionRow, previousLaunchHash: string | null): VersionSummary {
+/**
+ * `previousLaunch`: the previous version's `launchIdentity` (null: the first version).
+ * `launchChanged` says whether running instances must restart for this version: another launch
+ * hash, or other reservations (server-only, so not in the hash).
+ */
+export function versionSummary(row: VersionRow, previousLaunch: string | null): VersionSummary {
   return {
     id: row.id,
     version: row.version,
@@ -154,7 +166,7 @@ export function versionSummary(row: VersionRow, previousLaunchHash: string | nul
     editor: actorRef(row),
     note: row.note,
     launchHash: row.launchHash,
-    launchChanged: previousLaunchHash === null || previousLaunchHash !== row.launchHash,
+    launchChanged: previousLaunch === null || previousLaunch !== launchIdentity(row),
   };
 }
 
@@ -198,11 +210,11 @@ export function advancedView(advanced: unknown): z.infer<typeof runtimeAdvancedV
 
 export function versionDetail(
   row: VersionRow,
-  previousLaunchHash: string | null,
+  previousLaunch: string | null,
   facts: EngineFacts | null = null,
 ): z.infer<typeof runtimeVersionDetailSchema> {
   return {
-    ...versionSummary(row, previousLaunchHash),
+    ...versionSummary(row, previousLaunch),
     runtimeId: row.runtimeId,
     contentHash: row.contentHash,
     spec: storedSpec(row.spec),
@@ -261,7 +273,7 @@ function runtimeNodes(row: RuntimeSummaryRow): Array<{ id: string; slug: string 
 
 export function runtimeSummary(
   row: RuntimeSummaryRow,
-  previousLaunchHash: string | null,
+  previousLaunch: string | null,
 ): z.infer<typeof runtimeSummarySchema> {
   const current = row.CurrentVersion;
   if (!current) throw new Error(`runtime ${row.id} has no current version`);
@@ -281,7 +293,7 @@ export function runtimeSummary(
     nodeId: row.nodeId,
     modelType: current.modelType,
     service: current.modelType === null,
-    currentVersion: versionSummary(current, previousLaunchHash),
+    currentVersion: versionSummary(current, previousLaunch),
     models: row.Models.map((model) => model.upstreamModelId),
     instances: counts,
     nodes: runtimeNodes(row),
@@ -522,16 +534,16 @@ export function instanceView(
   };
 }
 
-/** The previous version's launch hash for each version number (for `launchChanged`). */
+/** The previous version's `launchIdentity` for each version number (for `launchChanged`). */
 export function previousLaunchHashes(
-  versions: ReadonlyArray<{ version: number; launchHash: string }>,
+  versions: ReadonlyArray<{ version: number; launchHash: string; spec: unknown }>,
 ): Map<number, string | null> {
   const sorted = [...versions].sort((a, b) => a.version - b.version);
   const result = new Map<number, string | null>();
   let previous: string | null = null;
   for (const version of sorted) {
     result.set(version.version, previous);
-    previous = version.launchHash;
+    previous = launchIdentity(version);
   }
   return result;
 }

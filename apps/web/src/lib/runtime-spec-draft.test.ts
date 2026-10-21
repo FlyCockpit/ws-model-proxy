@@ -6,10 +6,12 @@ import {
   draftPathOf,
   draftToSpec,
   editorValues,
+  losslessDraft,
   parseBase,
   readSpecEditor,
   sameSpec,
   specToDraft,
+  switchEditorKind,
 } from "./runtime-spec-draft";
 
 const HEALTH = { intervalMs: 15_000, failureThreshold: 3, successThreshold: 1 };
@@ -278,5 +280,148 @@ describe("runtime spec draft", () => {
     const paths = reading.issues.map((issue) => issue.path.join("."));
     expect(paths).toContain("draft.reservations");
     expect(paths).toContain("draft.reservations.0.labels");
+  });
+});
+
+describe("JSON the form cannot read", () => {
+  it("refuses reservations the form cannot show instead of dropping them", () => {
+    for (const reservations of [
+      {},
+      { labels: ["worker"], resources: { kind: "unified", memoryGb: 100 } },
+      "x",
+      null,
+      [null],
+      [{ labels: "worker" }],
+      [{ labels: [1] }],
+      [{ labels: ["worker"], resources: "big" }],
+    ])
+      expect(() => specToDraft({ launch: { groupSize: 1, reservations } })).toThrow(TypeError);
+    // Readable shapes still convert (missing labels show empty; validation names them).
+    expect(specToDraft({ launch: { groupSize: 1 } }).reservations).toEqual([]);
+    expect(specToDraft({ launch: { groupSize: 1, reservations: [{}] } }).reservations).toEqual([
+      expect.objectContaining({ labels: "" }),
+    ]);
+    expect(
+      specToDraft({
+        launch: {
+          groupSize: 1,
+          reservations: [{ labels: ["a", "b"], resources: { kind: "unified", memoryGb: 8 } }],
+        },
+      }).reservations,
+    ).toEqual([expect.objectContaining({ labels: "a, b" })]);
+  });
+
+  it("refuses labels the form would split or drop instead of rewriting them (F10)", () => {
+    for (const labels of [["worker,other"], ["worker other"], ["worker\tother"], [""]]) {
+      expect(() => specToDraft({ launch: { groupSize: 1, reservations: [{ labels }] } })).toThrow(
+        TypeError,
+      );
+      expect(() => specToDraft({ launch: { groupSize: 1, labels } })).toThrow(TypeError);
+    }
+    // The JSON tab keeps exactly what was written.
+    const json = JSON.stringify({
+      launch: { groupSize: 1, reservations: [{ labels: ["worker,other"] }] },
+    });
+    const values = { tab: "json" as const, draft: specToDraft({}), json, base: json, check: "" };
+    expect(switchEditorKind(values, "STARTABLE")).toBe(values);
+    // Control: ordinary labels still convert, one label each.
+    expect(specToDraft({ launch: { groupSize: 1, labels: ["gpu", "big-mem"] } }).labels).toBe(
+      "gpu, big-mem",
+    );
+  });
+
+  it("keeps the JSON tab when switching kind with unreadable reservations", () => {
+    const json = JSON.stringify({ launch: { groupSize: 1, reservations: { labels: ["w"] } } });
+    const values = { tab: "json" as const, draft: specToDraft({}), json, base: json, check: "" };
+    expect(switchEditorKind(values, "ALWAYS_ON")).toBe(values);
+  });
+
+  it("keeps the JSON tab as written when switching kind with an unreadable shape", () => {
+    const json = JSON.stringify({ models: {}, launch: { groupSize: 1 } });
+    const values = { tab: "json" as const, draft: specToDraft({}), json, base: json, check: "" };
+    expect(switchEditorKind(values, "ALWAYS_ON")).toBe(values);
+  });
+});
+
+describe("lossless form conversion (F10 class)", () => {
+  it.each(Object.entries(SPECS))("converts %s to the form exactly", (name, spec) => {
+    const kind = name === "alwaysOn" ? "ALWAYS_ON" : "STARTABLE";
+    expect(losslessDraft(spec, kind)).not.toBeNull();
+    expect(editorValues(spec, kind).tab).toBe("form");
+  });
+
+  it.each(RUNTIME_PRESET_LIST.map((preset) => [preset.id, preset] as const))(
+    "converts the %s preset to the form exactly",
+    (_id, preset) => {
+      expect(losslessDraft(preset.spec, preset.kind)).not.toBeNull();
+    },
+  );
+
+  const launch = SPECS.vllm.launch;
+  it.each([
+    [
+      "an unknown key in a reservation entry",
+      {
+        ...SPECS.vllm,
+        launch: {
+          ...launch,
+          reservations: [{ labels: ["w"], resources: { kind: "none" }, memoryGb: 100 }],
+        },
+      },
+    ],
+    ["an unknown launch key", { ...SPECS.vllm, launch: { ...launch, replicas: 2 } }],
+    ["an unknown top-level key", { ...SPECS.vllm, note: "x" }],
+    ["an unknown model key", { ...SPECS.vllm, models: [{ id: "m", weight: 2 }] }],
+    [
+      "an unknown command key",
+      { ...SPECS.vllm, launch: { ...launch, commands: [{ start: "s", stop: "t", restart: "r" }] } },
+    ],
+    ["a number written as text", { ...SPECS.vllm, launch: { ...launch, groupSize: "1" } }],
+    ["a part the form fills in", { ...SPECS.vllm, launch: { ...launch, labels: undefined } }],
+    ["the other kind", SPECS.alwaysOn],
+  ])("keeps the JSON tab for %s (nothing dropped or changed)", (_name, spec) => {
+    expect(losslessDraft(JSON.parse(JSON.stringify(spec)), "STARTABLE")).toBeNull();
+    const values = editorValues(JSON.parse(JSON.stringify(spec)), "STARTABLE");
+    expect(values.tab).toBe("json");
+    expect(JSON.parse(values.json)).toEqual(JSON.parse(JSON.stringify(spec)));
+  });
+});
+
+describe("JSON the conversion cannot handle at all (R6-B-1)", () => {
+  const vllm = SPECS.vllm.launch;
+  const multi = SPECS.multiNode.launch;
+  it.each([
+    [
+      "a numeric stop",
+      { ...SPECS.vllm, launch: { ...vllm, commands: [{ start: "run", stop: 7 }] } },
+    ],
+    [
+      "a numeric prepare",
+      { ...SPECS.vllm, launch: { ...vllm, commands: [{ start: "run", prepare: 7 }] } },
+    ],
+    [
+      "a numeric stop of a service",
+      {
+        ...SPECS.service,
+        launch: { ...SPECS.service.launch, commands: [{ start: "up", stop: 7, status: "s" }] },
+      },
+    ],
+    ["a numeric fabric", { ...SPECS.multiNode, launch: { ...multi, fabric: 7 } }],
+    ["an object fabric", { ...SPECS.multiNode, launch: { ...multi, fabric: { name: "ib" } } }],
+  ])("keeps the JSON tab without throwing for %s", (_name, spec) => {
+    const raw = JSON.parse(JSON.stringify(spec));
+    expect(() => losslessDraft(raw, "STARTABLE")).not.toThrow();
+    expect(losslessDraft(raw, "STARTABLE")).toBeNull();
+    const values = editorValues(raw, "STARTABLE");
+    expect(values.tab).toBe("json");
+    expect(JSON.parse(values.json)).toEqual(raw);
+  });
+
+  it("still converts the well-typed neighbours to the form", () => {
+    for (const spec of [
+      { ...SPECS.vllm, launch: { ...vllm, commands: [{ start: "run", stop: "7" }] } },
+      { ...SPECS.multiNode, launch: { ...multi, fabric: "ib1" } },
+    ])
+      expect(losslessDraft(JSON.parse(JSON.stringify(spec)), "STARTABLE")).not.toBeNull();
   });
 });

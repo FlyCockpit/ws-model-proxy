@@ -423,6 +423,12 @@ describe("lifecycle dispatch", () => {
     db.instanceStep.aggregate.mockResolvedValue({ _max: { generation: 1 } } as never);
     db.instanceStep.count.mockResolvedValue(0 as never);
     db.instanceStep.updateMany.mockResolvedValue({ count: 1 } as never);
+    // The step is of the instance's current run (instance-run.ts).
+    db.runtimeInstance.findUnique.mockResolvedValue({
+      runGeneration: 1,
+      phase: "STARTING",
+      operationId: "op-1",
+    } as never);
     // The owner is active (not banned or deleting): the engine checks before any start.
     db.user.findUnique.mockResolvedValue({
       deletionRequestedAt: null,

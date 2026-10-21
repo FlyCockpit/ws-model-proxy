@@ -1,3 +1,6 @@
+import { PrismaPg } from "@prisma/adapter-pg";
+import { Client } from "pg";
+import { PrismaClient } from "../prisma/generated/client";
 import { createPrismaClient } from "./client-factory";
 
 /**
@@ -17,4 +20,23 @@ export function createFixturePrismaClient(databaseUrl: string) {
   // URLSearchParams writes spaces as "+"; spell them %20 (see push-schema.mjs).
   url.search = url.searchParams.toString().replace(/\+/g, "%20");
   return createPrismaClient(url.toString());
+}
+
+/**
+ * Test fixtures only. An ordinary Prisma client (no fence setting) that counts every SQL
+ * statement its connections send, for asserting that a read is batched: the count must not
+ * grow with the number of rows it reads (no query per row).
+ */
+export function createStatementCountingPrismaClient(databaseUrl: string) {
+  const counter = { statements: 0 };
+  const query = Client.prototype.query;
+  class CountingClient extends Client {}
+  CountingClient.prototype.query = function countedQuery(this: Client, ...args: unknown[]) {
+    counter.statements += 1;
+    return Reflect.apply(query, this, args);
+  } as unknown as Client["query"];
+  const client = new PrismaClient({
+    adapter: new PrismaPg({ connectionString: databaseUrl, Client: CountingClient }),
+  });
+  return { client, counter };
 }

@@ -282,7 +282,10 @@ export const runtimeVersionSummarySchema = z
     editor: actorRefSchema,
     note: z.string().nullable(),
     launchHash: sha256Schema,
-    /** Edits that keep the launch hash apply to running instances live. */
+    /**
+     * Running instances must restart for this version: another launch hash, or other
+     * `launch.reservations` (server-only, not in the hash). False: it applies live.
+     */
     launchChanged: z.boolean(),
   })
   .strict();

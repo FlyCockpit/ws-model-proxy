@@ -1,13 +1,16 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import type { ComponentType, ReactNode } from "react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 /** Runtime overview: an instance whose stop is not confirmed offers Mark as stopped. */
 
-const state = vi.hoisted(() => ({ kind: "STARTABLE" as "STARTABLE" | "ALWAYS_ON" }));
+const state = vi.hoisted(() => ({
+  kind: "STARTABLE" as "STARTABLE" | "ALWAYS_ON",
+  extra: [] as Array<Record<string, unknown>>,
+}));
 
 vi.mock("@tanstack/react-router", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@tanstack/react-router")>();
@@ -23,7 +26,17 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
 });
 
 vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en-US" } }),
+  // Reservation copy shows the values it interpolates; everything else its key.
+  useTranslation: () => ({
+    t: (key: string, values?: Record<string, unknown>) =>
+      key.startsWith("dashboard:runtime.reservation") ||
+      key === "dashboard:runtime.waitingToRestart"
+        ? `${key} ${JSON.stringify(values)}`
+        : key.startsWith("dashboard:runtime.refusals.")
+          ? `${key} (copy)`
+          : key,
+    i18n: { language: "en-US" },
+  }),
 }));
 
 vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
@@ -32,7 +45,13 @@ vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
 
 // Dialogs are not under test here (they need matchMedia and portals).
 vi.mock("@ws-model-proxy/ui/components/responsive-dialog", () => ({
-  ResponsiveDialog: () => null,
+  // Mounted only while open (the page renders it for an open start): its content and footer.
+  ResponsiveDialog: ({ children, footer }: { children: ReactNode; footer?: ReactNode }) => (
+    <div>
+      {children}
+      {footer}
+    </div>
+  ),
 }));
 vi.mock("@/components/access/confirm-action", () => ({ ConfirmAction: () => null }));
 
@@ -69,13 +88,39 @@ vi.mock("@/utils/orpc", () => ({
             service: false,
             origin: "SERVER",
             currentVersion: { id: "v-1", version: 1 },
+            current: { spec: { launch: { groupSize: 1 } } },
             servedModels: [],
             shares: [],
             instanceList: [
               instance("stuck", { needsOperator: "MARK_STOPPED" }),
               instance("stopping", {}),
               instance("ready", { phase: "READY", desiredState: "RUNNING" }),
+              ...state.extra,
             ],
+          }),
+        }),
+      },
+      // A preview refused for a reservation (contracts/refusals.ts `reservation`).
+      start: {
+        mutationOptions: () => ({
+          mutationFn: async () => ({
+            mode: "preview",
+            preview: {
+              fingerprint: "fp",
+              starts: [],
+              stops: [],
+              kept: [],
+              holds: [],
+              warnings: [],
+              refusals: [
+                {
+                  reason: "not_enough_memory",
+                  subjectId: "node-w2",
+                  message: "Reservation 1 (labels ds-worker) cannot be placed: …",
+                  reservation: { index: 0, labels: ["ds-worker"], nodeSlug: "w2" },
+                },
+              ],
+            },
           }),
         }),
       },
@@ -89,7 +134,12 @@ vi.mock("@/utils/orpc", () => ({
         markStopped: { mutationOptions: () => ({ mutationFn: async () => ({}) }) },
       },
     },
-    nodes: { key: () => ["nodes"] },
+    nodes: {
+      key: () => ["nodes"],
+      list: {
+        queryOptions: () => ({ queryKey: ["nodes", "list"], queryFn: async () => ({ nodes: [] }) }),
+      },
+    },
     pools: { key: () => ["pools"] },
     models: { key: () => ["models"] },
     activity: { needsYou: { key: () => ["activity", "needsYou"] } },
@@ -110,6 +160,7 @@ afterEach(() => {
   cleanup();
   // Reset here, not at the end of a test: a failed test must not leak its kind.
   state.kind = "STARTABLE";
+  state.extra = [];
 });
 
 function mount() {
@@ -157,5 +208,92 @@ describe("runtime overview instances", () => {
       screen.getAllByRole("button", { name: "dashboard:runtime.markStopped.action" }),
     ).toHaveLength(1);
     expect(screen.queryAllByText("dashboard:runtime.needsOperator.MARK_STOPPED")).toHaveLength(1);
+  });
+});
+
+describe("runtime overview reservations", () => {
+  it("says which reservation a start preview refusal is about", async () => {
+    mount();
+    fireEvent.click(await screen.findByRole("button", { name: "dashboard:runtime.start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "dashboard:runtime.preview" }));
+    const line = await screen.findByText(/dashboard:runtime\.reservationRefusalNode/);
+    expect(line.textContent).toContain('"labels":"ds-worker"');
+    expect(line.textContent).toContain('"node":"w2"');
+    expect(line.textContent).toContain('"number":1');
+    expect(line.textContent).toContain("dashboard:runtime.refusals.not_enough_memory");
+  });
+
+  it("describes a reservation by its claim: held, held until confirmed, or not held", async () => {
+    const reservation = (reserved: string) => ({
+      index: 0,
+      nodeId: "node-w1",
+      nodeSlug: "w1",
+      labels: ["ds-worker"],
+      memoryGb: 100,
+      reserved,
+      nodeConnection: null,
+    });
+    state.extra = [
+      instance("held", {
+        phase: "READY",
+        desiredState: "RUNNING",
+        reservations: [reservation("HELD")],
+      }),
+      instance("unknown", { phase: "STOPPED", reservations: [reservation("HELD_UNKNOWN")] }),
+      instance("failed", {
+        phase: "FAILED",
+        desiredState: "RUNNING",
+        reservations: [reservation("RELEASED")],
+      }),
+    ];
+    mount();
+    const row = async (handle: string) => {
+      const found = (await screen.findByText(handle)).closest("li");
+      if (!found) throw new Error(`no row ${handle}`);
+      return found;
+    };
+    expect(
+      within(await row("i-held")).getByText(/dashboard:runtime\.reservationHeld /),
+    ).toBeTruthy();
+    expect(
+      within(await row("i-unknown")).getByText(/dashboard:runtime\.reservationUnconfirmed /),
+    ).toBeTruthy();
+    const failed = await row("i-failed");
+    expect(within(failed).getByText(/dashboard:runtime\.reservationIdle /)).toBeTruthy();
+    expect(within(failed).queryByText(/dashboard:runtime\.reservationHeld /)).toBeNull();
+  });
+
+  it("explains an automatic restart that waits, with the planner's actual reason", async () => {
+    state.extra = [
+      instance("waiting", {
+        phase: "STOPPED",
+        desiredState: "RUNNING",
+        phaseReason: "waiting_node_offline",
+      }),
+    ];
+    mount();
+    const row = (await screen.findByText("i-waiting")).closest("li");
+    if (!row) throw new Error("no row");
+    // The specific copy names the refusal's own reason (a node offline here), never memory.
+    expect(
+      within(row).getByText(
+        'dashboard:runtime.waitingToRestart {"reason":"dashboard:runtime.refusals.node_offline (copy)"}',
+      ),
+    ).toBeTruthy();
+    expect(within(row).queryByText(/not_enough_memory/)).toBeNull();
+  });
+
+  it("explains a wait without copy for its reason neutrally, and nothing once it runs", async () => {
+    state.extra = [
+      instance("odd", { phase: "STOPPED", desiredState: "RUNNING", phaseReason: "waiting_9" }),
+      instance("going", { phase: "STARTING", phaseReason: "waiting_node_offline" }),
+    ];
+    mount();
+    const odd = (await screen.findByText("i-odd")).closest("li");
+    if (!odd) throw new Error("no row");
+    expect(within(odd).getByText("dashboard:runtime.waitingToRestartNeutral")).toBeTruthy();
+    const going = (await screen.findByText("i-going")).closest("li");
+    if (!going) throw new Error("no row");
+    expect(within(going).queryByText(/waitingToRestart/)).toBeNull();
   });
 });

@@ -287,12 +287,18 @@ describe("runtimes.instances.releaseUnproven", () => {
 
 describe("releaseClaim: a late proof after a person released the claim", () => {
   it("changes nothing: the release only takes a claim still held or marked stopped", async () => {
-    db.instanceRank.updateMany.mockResolvedValue({ count: 0 });
-    expect(await releaseClaim(db as never, "rank-0", new Date())).toBe(false);
-    expect(db.instanceRank.updateMany).toHaveBeenCalledWith({
-      where: { id: "rank-0", claim: { in: ["HELD", "HELD_UNKNOWN"] } },
-      data: expect.not.objectContaining({ releasedUnprovenAt: expect.anything() }),
-    });
+    // The person released it: a proof finds no held claim and writes nothing.
+    db.instanceRank.findUnique.mockResolvedValue({
+      id: "rank-0",
+      instanceId: "inst-1",
+      nodeId: "node-1",
+      rank: 0,
+      claim: "RELEASED",
+    } as never);
+    expect(
+      await releaseClaim(db as never, "rank-0", new Date(), { result: { stepId: "step-1" } }),
+    ).toBe(false);
+    expect(db.instanceRank.updateMany).not.toHaveBeenCalled();
     // Nothing else is touched: no request is cleared, the person's record stays.
     expect(db.claimReleaseRequest.updateMany).not.toHaveBeenCalled();
   });
@@ -300,7 +306,9 @@ describe("releaseClaim: a late proof after a person released the claim", () => {
   it("a person's release takes only a claim marked stopped", async () => {
     db.instanceRank.updateMany.mockResolvedValue({ count: 0 });
     expect(
-      await releaseClaim(db as never, "rank-0", new Date(), { by: OWNER, reason: "no_check" }),
+      await releaseClaim(db as never, "rank-0", new Date(), {
+        unproven: { by: OWNER, reason: "no_check" },
+      }),
     ).toBe(false);
     expect(db.instanceRank.updateMany.mock.calls[0]?.[0]?.where).toEqual({
       id: "rank-0",
