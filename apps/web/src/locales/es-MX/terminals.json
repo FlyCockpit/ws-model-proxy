@@ -5,6 +5,8 @@
     "tooLarge": "Elige una imagen no vacía de hasta 8 MiB.",
     "unsupported": "Elige una imagen PNG, JPEG o WebP.",
     "busy": "Espera a que termine la subida actual.",
+    "selecting": "La imagen no se pegó porque Seleccionar texto está activado. Cierra Seleccionar texto y vuelve a pegar.",
+    "hidden": "La imagen no se pegó porque cambiaste de pestaña mientras se subía. Vuelve a pegarla.",
     "limit": "Esta terminal alcanzó su límite de almacenamiento de imágenes. Termina la sesión para eliminarlas.",
     "nodeLimit": "Este nodo alcanzó su límite de almacenamiento de imágenes. Termina las sesiones de terminal que no uses para eliminar sus imágenes.",
     "overloaded": "Este nodo está ocupado recibiendo imágenes. Inténtalo de nuevo en un momento.",
@@ -142,5 +144,59 @@
     "unavailableHint": "La terminal en el nodo muestra el comando exacto antes de ejecutarlo.",
     "template": "Comando tal como se escribió",
     "refusedButOpen": "El servidor esperaba que el nodo rechazara este paso (valor no válido: {{field}}), pero su terminal se abrió, así que el comando no se puede confirmar aquí."
+  },
+  "toolbar": {
+    "maximize": "Maximizar terminal",
+    "restore": "Restaurar terminal",
+    "selectText": "Seleccionar texto",
+    "settings": "Ajustes de la terminal"
+  },
+  "settings": {
+    "copy": {
+      "label": "Cuando un programa copia texto",
+      "prompt": {
+        "title": "Preguntarme primero",
+        "help": "Muestra un botón Copiar. Nada llega a tu portapapeles hasta que lo presionas."
+      },
+      "auto": {
+        "title": "Copiar automáticamente",
+        "help": "Copia de inmediato. Si tu navegador lo bloquea, muestra un botón Copiar."
+      },
+      "off": {
+        "title": "Nunca copiar",
+        "help": "Ignora las solicitudes de copia de los programas en la terminal."
+      }
+    },
+    "shiftEnter": {
+      "label": "Shift+Enter",
+      "lf": {
+        "title": "Nueva línea (recomendado)",
+        "help": "Agrega un salto de línea en agentes de código como Claude Code y Codex en lugar de enviar tu mensaje."
+      },
+      "esc-cr": {
+        "title": "Nueva línea (alternativa)",
+        "help": "Úsala si un programa no agrega un salto de línea con la opción recomendada."
+      },
+      "off": {
+        "title": "Igual que Enter",
+        "help": "Shift+Enter envía tu mensaje, igual que Enter."
+      }
+    }
+  },
+  "copyOut": {
+    "promptTitle": "La terminal copió texto",
+    "promptBody": "Presiona Copiar para ponerlo en tu portapapeles.",
+    "promptAction": "Copiar",
+    "dismiss": "Descartar",
+    "copied": "Copiado a tu portapapeles",
+    "tooLarge": "La terminal intentó copiar demasiado texto, así que se omitió.",
+    "blocked": "Tu navegador bloqueó la copia. Prueba con Seleccionar texto."
+  },
+  "selectText": {
+    "paused": "Terminal en pausa. Selecciona texto y cópialo como siempre.",
+    "tmuxNote": "Solo se muestra lo que está en pantalla y en el historial de esta terminal. No se incluye el historial anterior de tmux.",
+    "done": "Listo",
+    "label": "Texto de la terminal",
+    "wideLabel": "Líneas largas del texto de la terminal"
   }
 }

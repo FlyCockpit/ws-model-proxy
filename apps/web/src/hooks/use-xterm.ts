@@ -8,31 +8,65 @@ import { useLatestRef } from "@/hooks/use-latest-ref";
 import {
   CopyOutGate,
   clipboardTypesIncludeImage,
+  createReplayAwareWriter,
+  type Osc52Copy,
   wireTerminalCopyOut,
 } from "@/lib/terminal-copy-out";
 import { clipboardPrefersText } from "@/lib/terminal-image-clipboard";
 import type { TerminalImageAttachment } from "@/lib/terminal-images";
+import { newlineSequence } from "@/lib/terminal-keys";
+import type { TerminalShiftEnterMode } from "@/lib/terminal-settings";
 import { TERMINAL_FONT_FAMILY, TERMINAL_THEME } from "@/lib/terminal-theme";
 import {
+  floorTerminalSize,
   sameSize,
-  shouldForwardTerminalData,
+  type TerminalInputOrigin,
   type TerminalSize,
   TerminalUserInputGate,
+  terminalDataOrigin,
 } from "@/lib/terminal-writer";
 
 type XtermHandlers = {
-  onData: (data: string) => void;
+  /**
+   * Input for the PTY: text (UTF-8), or raw bytes for xterm's binary mouse reports. `origin`
+   * tells the session hook's send-time gateway what it is (a reply never claims the writer).
+   */
+  onData: (data: string | Uint8Array, origin: Exclude<TerminalInputOrigin, "typed">) => void;
   onImage?: (file: File) => Promise<TerminalImageAttachment>;
   onImagePaste?: (attachment: TerminalImageAttachment, data: string) => Promise<boolean>;
   onImageError?: (error: unknown) => void;
   /** This pane's own fitted size changed. A follower reports it without resizing xterm. */
   onResize: (size: TerminalSize) => void;
+  /** The box has no measurable size (hidden or zero-size): a size from before must not be sent. */
+  onSizeUnavailable?: () => void;
+  /** A program asked to copy text (OSC 52) while copy-out was allowed. */
+  onCopy?: (copy: Osc52Copy) => void;
+  /**
+   * The session input goes to now (any value compared by identity), or null when none. An image
+   * paste only pastes into the session it started in: a reattach meanwhile cancels it.
+   */
+  currentSession?: () => unknown;
 };
 
 type XtermOptions = XtermHandlers & {
   /** Render at this PTY size (someone else is typing), or null to fit the box. */
   follow: TerminalSize | null;
+  /** What Shift+Enter and Ctrl+Enter send. */
+  shiftEnter: TerminalShiftEnterMode;
+  /** Select text mode: input is paused, including image pastes that finish uploading meanwhile. */
+  selecting: boolean;
+  /**
+   * The pane is the visible tab. A hidden pane never fits or reports a size, and it drops any
+   * gesture authorization it had.
+   */
+  active: boolean;
 };
+
+/** Option+click selects text on a Mac even in a mouse-reporting app (no report is sent). */
+const MAC_PLATFORM = /Mac|iPhone|iPad|iPod/;
+
+/** A key that only modifies others: pressing it alone is not input. */
+const MODIFIER_KEYS = new Set(["Shift", "Control", "Alt", "Meta", "AltGraph", "CapsLock"]);
 
 export function useXterm(options: XtermOptions): {
   containerRef: RefCallback<HTMLDivElement>;
@@ -42,22 +76,45 @@ export function useXterm(options: XtermOptions): {
    * new value means a new xterm instance.
    */
   host: HTMLDivElement | null;
-  write: (data: Uint8Array) => void;
+  /** Write output. `replay` marks scrollback replay, whose OSC 52 copies are never honored. */
+  write: (data: Uint8Array, replay?: boolean) => void;
   reset: () => void;
+  /**
+   * The session ended: drop gesture authorization and keep copy-out closed for anything it still
+   * sends. The screen stays until the next attach resets it.
+   */
+  retire: () => void;
+  /** A newer attach's output arrived: copy-out may open again after a fresh gesture. */
+  attached: () => void;
   focus: () => void;
   /**
    * Apply a PTY size change in output order, while following: after the data
    * written before it is parsed, and before the data written after it.
    */
   followResize: (size: TerminalSize) => void;
+  /** The scrollback and screen as plain text, for Select text mode. */
+  snapshot: () => string;
 } {
   const handlersRef = useLatestRef<XtermHandlers>(options);
   const followRef = useLatestRef(options.follow);
+  const shiftEnterRef = useLatestRef(options.shiftEnter);
+  const selectingRef = useLatestRef(options.selecting);
+  const activeRef = useLatestRef(options.active);
   const termRef = useRef<Terminal | null>(null);
+  const writerRef = useRef<ReturnType<typeof createReplayAwareWriter> | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const [gate] = useState(() => new CopyOutGate());
   const [inputGate] = useState(() => new TerminalUserInputGate());
   const ownSizeRef = useRef<TerminalSize | null>(null);
+  /** The size the box last measured (whatever xterm shows while queued output catches up). */
+  const measuredRef = useRef<TerminalSize | null>(null);
+  /**
+   * No size reported since this xterm opened, or the box was reported unmeasurable: the next
+   * measured size is reported even if xterm already has it (a writer fitted at xterm's default
+   * size would otherwise never tell the session hook it is measurable, and could not take over
+   * again later).
+   */
+  const sizeUnavailableRef = useRef(true);
   /** Set while this hook resizes xterm itself, so onResize does not echo it. */
   const suppressResizeRef = useRef(false);
   /**
@@ -66,6 +123,21 @@ export function useXterm(options: XtermOptions): {
    * written before a size change still renders at the old size.
    */
   const queuedSizesRef = useRef(0);
+  /**
+   * A takeover's fit waits for the output queued before it to be parsed; until it runs, no other
+   * layout (a ResizeObserver tick) may refit xterm, since that output must render at the size it
+   * was written for. Each takeover's fit has its own number, so an older barrier's callback can
+   * neither run nor cancel a newer one. `fitDueRef`: the barrier passed while PTY sizes were still
+   * queued; the last of those runs the fit.
+   */
+  const pendingFitRef = useRef<number | null>(null);
+  const fitDueRef = useRef<number | null>(null);
+  const fitCountRef = useRef(0);
+  /**
+   * A writer's layout (a ResizeObserver tick) found PTY sizes still queued and left xterm's size
+   * to them: the last of them lays out again, so xterm ends at the size its box was measured at.
+   */
+  const layoutDueRef = useRef(false);
   const [container, setContainer] = useState<HTMLDivElement | null>(null);
 
   const resizeQuietly = useCallback((size: TerminalSize) => {
@@ -79,28 +151,66 @@ export function useXterm(options: XtermOptions): {
     }
   }, []);
 
-  /** Fit own box, or record own size and show the PTY size while following. */
-  const layout = useCallback(() => {
+  /**
+   * Fit own box, or record own size and show the PTY size while following. Returns whether the
+   * box could be measured: only then is a size reported.
+   */
+  const layout = useCallback((): boolean => {
     const fit = fitRef.current;
-    if (!fit) return;
-    // The dashboard hides the workspace (display: none) on other pages. Its
-    // box then has no size, and fitting it would resize the PTY for everyone.
-    if (termRef.current?.element?.closest("[hidden]")) return;
+    if (!fit) return false;
     const follow = followRef.current;
-    if (!follow) {
-      fit.fit();
-      return;
+    // A hidden tab, or a workspace hidden on other pages, has no real box: measuring it would
+    // resize the PTY for everyone, and FitAddon would turn a zero-size box into 2x1. It still
+    // shows a follower's output at the PTY size, so text written while hidden wraps correctly.
+    const element = termRef.current?.element;
+    const box = element?.parentElement;
+    const measurable =
+      activeRef.current &&
+      !!element &&
+      !!box &&
+      !element.closest("[hidden]") &&
+      box.clientWidth > 0 &&
+      box.clientHeight > 0;
+    if (!measurable) {
+      sizeUnavailableRef.current = true;
+      handlersRef.current.onSizeUnavailable?.();
+      if (follow && queuedSizesRef.current === 0) resizeQuietly(follow);
+      return false;
     }
     const proposed = fit.proposeDimensions();
-    if (proposed && proposed.cols > 0 && proposed.rows > 0) {
-      const own = { cols: proposed.cols, rows: proposed.rows };
-      if (!sameSize(own, ownSizeRef.current)) {
-        ownSizeRef.current = own;
-        handlersRef.current.onResize(own);
+    // Never below the floor: a smaller box clips the terminal instead.
+    const own =
+      proposed && proposed.cols > 0 && proposed.rows > 0
+        ? floorTerminalSize({ cols: proposed.cols, rows: proposed.rows })
+        : null;
+    if (own) measuredRef.current = own;
+    const wasUnavailable = sizeUnavailableRef.current && own !== null;
+    if (wasUnavailable) sizeUnavailableRef.current = false;
+    if (!follow) {
+      const term = termRef.current;
+      // Output queued at an earlier size is still being parsed: report the fitted size (the PTY
+      // may follow it now) but leave xterm's size to the queued events and the deferred fit.
+      if (pendingFitRef.current !== null || queuedSizesRef.current > 0) {
+        // A takeover's fit lays out once its barrier passes; otherwise the last queued size does.
+        if (pendingFitRef.current === null) layoutDueRef.current = true;
+        if (own && (wasUnavailable || !sameSize(own, ownSizeRef.current))) {
+          ownSizeRef.current = own;
+          handlersRef.current.onResize(own);
+        }
+        return own !== null;
       }
+      if (term && own && (term.cols !== own.cols || term.rows !== own.rows))
+        term.resize(own.cols, own.rows);
+      else if (term && own && wasUnavailable) handlersRef.current.onResize(own);
+      return own !== null;
+    }
+    if (own && (wasUnavailable || !sameSize(own, ownSizeRef.current))) {
+      ownSizeRef.current = own;
+      handlersRef.current.onResize(own);
     }
     if (queuedSizesRef.current === 0) resizeQuietly(follow);
-  }, [followRef, handlersRef, resizeQuietly]);
+    return own !== null;
+  }, [activeRef, followRef, handlersRef, resizeQuietly]);
 
   useEffect(() => {
     if (!container) return;
@@ -109,6 +219,8 @@ export function useXterm(options: XtermOptions): {
       fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: 13,
       lineHeight: 1.2,
+      // Option+drag selects text on a Mac even while tmux or an app has the mouse.
+      macOptionClickForcesSelection: true,
       scrollback: 5000,
       theme: TERMINAL_THEME,
     });
@@ -119,24 +231,67 @@ export function useXterm(options: XtermOptions): {
     termRef.current = term;
     fitRef.current = fit;
     queuedSizesRef.current = 0;
+    pendingFitRef.current = null;
+    fitDueRef.current = null;
+    layoutDueRef.current = false;
+    sizeUnavailableRef.current = true;
+    // A new xterm starts with no authorization: gestures made in the old one do not carry over.
+    gate.clearReplay();
+    gate.disarm();
+    inputGate.disarm();
+    const writer = createReplayAwareWriter(term, gate);
+    writerRef.current = writer;
     type ImagePaste = {
       attachment: TerminalImageAttachment;
       sent: Promise<boolean> | null;
     };
     let imagePaste: ImagePaste | null = null;
-    const disposeCopyOut = wireTerminalCopyOut(term, gate, (data) => {
-      const forward = shouldForwardTerminalData({
-        following: followRef.current !== null,
-        userInput: inputGate.armed(performance.now()),
-        data,
-      });
-      if (forward) {
-        if (imagePaste)
-          imagePaste.sent =
-            handlersRef.current.onImagePaste?.(imagePaste.attachment, data) ??
-            Promise.resolve(false);
-        else handlersRef.current.onData(data);
+    /**
+     * Set while a modified F3 keydown is being handled: xterm emits the key's data synchronously
+     * in that dispatch, and its `ESC [ 1 ; m R` is then the key, not a cursor report.
+     */
+    let modifiedF3 = false;
+    let modifiedF3Timer: ReturnType<typeof setTimeout> | null = null;
+    /**
+     * Everything xterm emits goes out through here with its origin. A follower sends only real
+     * input (never a reply, and only right after a real gesture); the session hook's gateway
+     * applies the rest at send time.
+     */
+    const forward = (data: string | Uint8Array, text: string) => {
+      const origin = terminalDataOrigin(text, modifiedF3);
+      if (origin === "user") modifiedF3 = false;
+      if (followRef.current !== null) {
+        if (origin === "reply" || !inputGate.armed(performance.now())) return;
       }
+      if (imagePaste && typeof data === "string")
+        imagePaste.sent =
+          handlersRef.current.onImagePaste?.(imagePaste.attachment, data) ?? Promise.resolve(false);
+      else handlersRef.current.onData(data, origin);
+    };
+    const disposeCopyOut = wireTerminalCopyOut(
+      term,
+      gate,
+      (data) => forward(data, data),
+      (copy) => handlersRef.current.onCopy?.(copy),
+    );
+    // Mouse reports in the X10/normal encodings (no SGR) arrive as a binary string: one byte per
+    // character, sent as those bytes rather than UTF-8.
+    const binarySub = term.onBinary((data) => {
+      forward(
+        Uint8Array.from(data, (char) => char.charCodeAt(0) & 0xff),
+        data,
+      );
+    });
+    // Shift+Enter / Ctrl+Enter: send the newline sequence instead of xterm's CR. Handled on
+    // keydown (preventDefault also stops the keypress) and swallowed on keypress and keyup.
+    term.attachCustomKeyEventHandler((event) => {
+      const sequence = newlineSequence(shiftEnterRef.current, event);
+      if (sequence === null) return true;
+      if (event.type === "keydown") {
+        event.preventDefault();
+        term.input(sequence, true);
+      }
+      return false;
     });
     const resizeSub = term.onResize((size) => {
       if (suppressResizeRef.current || size.cols < 1 || size.rows < 1) return;
@@ -144,10 +299,38 @@ export function useXterm(options: XtermOptions): {
       handlersRef.current.onResize(size);
     });
     const armInput = () => inputGate.arm(performance.now());
-    // A click claims the writer only in a mouse-reporting app. The wheel never does.
-    const armClick = () => {
-      if (term.modes.mouseTrackingMode !== "none") armInput();
+    // A modifier pressed alone sends nothing, so it must not let other data through.
+    const armKey = (event: KeyboardEvent) => {
+      if (MODIFIER_KEYS.has(event.key)) return;
+      armInput();
+      if (
+        event.key === "F3" &&
+        (event.shiftKey || event.ctrlKey || event.altKey || event.metaKey)
+      ) {
+        modifiedF3 = true;
+        // Only for this keydown's own data.
+        if (modifiedF3Timer) clearTimeout(modifiedF3Timer);
+        modifiedF3Timer = setTimeout(() => {
+          modifiedF3Timer = null;
+          modifiedF3 = false;
+        }, 0);
+      }
     };
+    // Text from an input event alone (some mobile keyboards and dictation send no keydown or
+    // composition) is still typing.
+    const armTextInput = () => {
+      armInput();
+      gate.armFromUserGesture();
+    };
+    // A click claims the writer only in a mouse-reporting app. The wheel never does, and neither
+    // does a Mac Option+click, which selects text instead of sending a report.
+    const armClick = (event: MouseEvent) => {
+      if (term.modes.mouseTrackingMode === "none") return;
+      if (event.altKey && MAC_PLATFORM.test(navigator.platform)) return;
+      armInput();
+    };
+    // Any press in the pane opens the copy window: tmux and agents copy on mouse release.
+    const armCopy = () => gate.armFromUserGesture();
     let disposed = false;
     let uploading = false;
     const pasteImages = async (files: File[], fallbackText = "") => {
@@ -157,6 +340,10 @@ export function useXterm(options: XtermOptions): {
       }
       uploading = true;
       let pastedImages = 0;
+      // The session this paste belongs to. A reattach meanwhile is another session: nothing from
+      // this paste (its path or the clipboard-text fallback) goes into it.
+      const session = handlersRef.current.currentSession?.() ?? null;
+      const sameSession = () => (handlersRef.current.currentSession?.() ?? null) === session;
       try {
         for (const file of files) {
           const upload = handlersRef.current.onImage;
@@ -166,6 +353,12 @@ export function useXterm(options: XtermOptions): {
           let forwarded = false;
           try {
             if (disposed || termRef.current !== term) return;
+            // Select text started while this uploaded: `inert` pauses only new input, so drop
+            // the paste here rather than type a path behind the frozen copy.
+            if (selectingRef.current) throw new Error("selecting");
+            if (!sameSession()) throw new Error("failed");
+            // The person moved to another tab while this uploaded: a hidden pane types nothing.
+            if (!activeRef.current) throw new Error("hidden");
             // The transfer can outlive the user-input gate. Arm it again so a
             // follower's deliberate path paste can claim the writer normally.
             armInput();
@@ -187,6 +380,9 @@ export function useXterm(options: XtermOptions): {
         if (
           pastedImages === 0 &&
           fallbackText.length > 0 &&
+          !selectingRef.current &&
+          sameSession() &&
+          activeRef.current &&
           error instanceof Error &&
           (error.message === "update" || error.message === "unavailable")
         ) {
@@ -242,11 +438,15 @@ export function useXterm(options: XtermOptions): {
       term.focus();
       void pasteImages(files);
     };
-    container.addEventListener("keydown", armInput, true);
+    container.addEventListener("keydown", armKey, true);
     container.addEventListener("compositionstart", armInput, true);
     container.addEventListener("compositionupdate", armInput, true);
     container.addEventListener("compositionend", armInput, true);
+    container.addEventListener("beforeinput", armTextInput, true);
+    container.addEventListener("input", armTextInput, true);
     container.addEventListener("mousedown", armClick, true);
+    container.addEventListener("pointerdown", armCopy, true);
+    container.addEventListener("pointerup", armCopy, true);
     term.textarea?.addEventListener("paste", onPaste, true);
     container.addEventListener("dragover", onDragOver);
     container.addEventListener("drop", onDrop);
@@ -258,37 +458,115 @@ export function useXterm(options: XtermOptions): {
     return () => {
       disposed = true;
       observer.disconnect();
-      container.removeEventListener("keydown", armInput, true);
+      container.removeEventListener("keydown", armKey, true);
       container.removeEventListener("compositionstart", armInput, true);
       container.removeEventListener("compositionupdate", armInput, true);
       container.removeEventListener("compositionend", armInput, true);
+      container.removeEventListener("beforeinput", armTextInput, true);
+      container.removeEventListener("input", armTextInput, true);
       container.removeEventListener("mousedown", armClick, true);
+      container.removeEventListener("pointerdown", armCopy, true);
+      container.removeEventListener("pointerup", armCopy, true);
       term.textarea?.removeEventListener("paste", onPaste, true);
       container.removeEventListener("dragover", onDragOver);
       container.removeEventListener("drop", onDrop);
+      if (modifiedF3Timer) clearTimeout(modifiedF3Timer);
       disposeCopyOut();
+      binarySub.dispose();
+      writer.dispose();
+      if (writerRef.current === writer) writerRef.current = null;
       resizeSub.dispose();
       term.dispose();
       if (termRef.current === term) termRef.current = null;
       if (fitRef.current === fit) fitRef.current = null;
     };
-  }, [container, followRef, gate, handlersRef, inputGate, layout]);
+  }, [
+    activeRef,
+    container,
+    followRef,
+    gate,
+    handlersRef,
+    inputGate,
+    layout,
+    selectingRef,
+    shiftEnterRef,
+  ]);
+
+  // Becoming the visible tab lays out again (its box may have changed while hidden); hiding drops
+  // any gesture authorization, so nothing typed or clicked before counts later.
+  const { active } = options;
+  useEffect(() => {
+    if (!container) return;
+    if (active) {
+      // The writer reports its size again: a resize skipped while hidden must still reach the
+      // PTY (the session hook sends it only if it differs from the last one sent). Only a
+      // measured box has a size to report, and it is the measured one: xterm may still show an
+      // earlier size while queued output catches up.
+      if (layout() && !followRef.current) {
+        // Read after layout(): it measured the box as it is now.
+        const measured = measuredRef.current;
+        if (measured) handlersRef.current.onResize(measured);
+      }
+    } else {
+      gate.disarm();
+      inputGate.disarm();
+      // Hidden, it has no box: the session hook takes no size from it, and when it is shown
+      // again it reports its size (even an unchanged one), which resumes input waiting for it.
+      sizeUnavailableRef.current = true;
+      handlersRef.current.onSizeUnavailable?.();
+    }
+  }, [active, container, followRef, gate, handlersRef, inputGate, layout]);
 
   const followCols = options.follow?.cols ?? null;
   const followRows = options.follow?.rows ?? null;
-  // Entering or leaving follow mode, or a new PTY size: lay out again. Leaving
-  // follow mode fits the box; the fitted size then goes to the CLI.
+  // Entering or leaving follow mode, or a new PTY size: lay out again. Leaving follow mode
+  // (taking over) fits the box only once the output already queued is parsed: that output was
+  // written at the PTY size it follows, and fitting first would draw it at the new size.
   useEffect(() => {
     if (!container || (followCols === null) !== (followRows === null)) return;
+    const term = termRef.current;
+    if (followCols === null && term) {
+      fitCountRef.current += 1;
+      const fit = fitCountRef.current;
+      pendingFitRef.current = fit;
+      fitDueRef.current = null;
+      term.write("", () => {
+        if (termRef.current !== term || pendingFitRef.current !== fit) return;
+        // PTY sizes queued before the barrier still apply first; the last one runs the fit.
+        if (queuedSizesRef.current > 0) {
+          fitDueRef.current = fit;
+          return;
+        }
+        pendingFitRef.current = null;
+        layout();
+      });
+      return;
+    }
+    // Following again: a writer fit still waiting no longer applies.
+    pendingFitRef.current = null;
+    fitDueRef.current = null;
+    layoutDueRef.current = false;
     layout();
   }, [container, followCols, followRows, layout]);
 
-  const write = useCallback((data: Uint8Array) => {
-    termRef.current?.write(data);
+  const write = useCallback((data: Uint8Array, replay = false) => {
+    writerRef.current?.write(data, replay);
   }, []);
   const reset = useCallback(() => {
-    termRef.current?.reset();
-  }, []);
+    // A reset comes before a scrollback replay (a new attach): no gesture from before it counts,
+    // and the screen resets in output order (see createReplayAwareWriter).
+    gate.disarm();
+    inputGate.disarm();
+    writerRef.current?.reset();
+  }, [gate, inputGate]);
+  const retire = useCallback(() => {
+    gate.disarm();
+    inputGate.disarm();
+    writerRef.current?.retire();
+  }, [gate, inputGate]);
+  const attached = useCallback(() => {
+    gate.attached();
+  }, [gate]);
   const focus = useCallback(() => {
     termRef.current?.focus();
   }, []);
@@ -297,16 +575,60 @@ export function useXterm(options: XtermOptions): {
       const term = termRef.current;
       if (!term) return;
       // xterm parses writes asynchronously. Resize once everything written so
-      // far is parsed, and before anything written after this is.
+      // far is parsed, and before anything written after this is. A size that arrived while
+      // following still applies after a takeover: the output around it was written at it.
+      const followedWhenQueued = followRef.current !== null;
       queuedSizesRef.current += 1;
       term.write("", () => {
         if (termRef.current !== term) return;
         queuedSizesRef.current -= 1;
-        if (followRef.current) resizeQuietly(size);
+        if (followedWhenQueued || followRef.current) resizeQuietly(size);
+        // The last queued size before a takeover fit whose barrier already passed runs that fit.
+        if (queuedSizesRef.current > 0) return;
+        const due = fitDueRef.current;
+        if (due !== null && due === pendingFitRef.current) {
+          pendingFitRef.current = null;
+          fitDueRef.current = null;
+          layoutDueRef.current = false;
+          if (!followRef.current) layout();
+          return;
+        }
+        // A writer's layout these sizes held back runs now (a takeover's fit still waiting for
+        // its barrier runs then instead).
+        if (layoutDueRef.current && pendingFitRef.current === null) {
+          layoutDueRef.current = false;
+          if (!followRef.current) layout();
+        }
       });
     },
-    [followRef, resizeQuietly],
+    [followRef, layout, resizeQuietly],
   );
 
-  return { containerRef: setContainer, host: container, write, reset, focus, followResize };
+  const snapshot = useCallback(() => {
+    const buffer = termRef.current?.buffer.active;
+    if (!buffer) return "";
+    const lines: string[] = [];
+    for (let index = 0; index < buffer.length; index += 1) {
+      const line = buffer.getLine(index);
+      if (!line) continue;
+      // A wrapped row continues the previous line: join it back into one.
+      const text = line.translateToString(true);
+      if (line.isWrapped && lines.length > 0) lines[lines.length - 1] += text;
+      else lines.push(text);
+    }
+    while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    return lines.join("\n");
+  }, []);
+
+  return {
+    containerRef: setContainer,
+    host: container,
+    write,
+    reset,
+    retire,
+    attached,
+    focus,
+    followResize,
+    snapshot,
+  };
 }

@@ -6,6 +6,7 @@ import {
   isEditableFocusSnapshot,
   isEditableFocusTarget,
   isKeyboardSummoningInputType,
+  keyboardInsetPx,
   MOBILE_KEYBOARD_DISMISS_GROWTH_PX,
   MOBILE_KEYBOARD_HEIGHT_RATIO,
   visualViewportGrewPastDismissThreshold,
@@ -406,5 +407,33 @@ describe("isEditableFocusSnapshot", () => {
 describe("isEditableFocusTarget", () => {
   it("rejects null and non-element targets", () => {
     expect(isEditableFocusTarget(null)).toBe(false);
+  });
+});
+
+describe("keyboardInsetPx", () => {
+  it("is the covered height from current geometry", () => {
+    expect(keyboardInsetPx(800, 480.4, 0)).toBe(320);
+    expect(keyboardInsetPx(800, 800, 0)).toBe(0);
+    // A browser that shrinks the layout viewport for the keyboard covers nothing.
+    expect(keyboardInsetPx(480, 480, 0)).toBe(0);
+    // A visual viewport scrolled down within the layout viewport covers less.
+    expect(keyboardInsetPx(800, 480, 100)).toBe(220);
+  });
+
+  it("measures the keyboard while pinch-zoomed, wherever the zoomed view is scrolled", () => {
+    // 800px layout, keyboard covering 320px, zoomed 2x: the visual viewport is 240 CSS px tall.
+    expect(keyboardInsetPx(800, 240, 0, 2)).toBe(320);
+    expect(keyboardInsetPx(800, 240, 300, 2)).toBe(320);
+    // The keyboard grows to 340px while zoomed.
+    expect(keyboardInsetPx(800, 230, 300, 2)).toBe(340);
+    // No keyboard, zoomed: nothing covered.
+    expect(keyboardInsetPx(800, 400, 120, 2)).toBe(0);
+  });
+
+  it("uses current geometry after rotating with the keyboard open", () => {
+    // Portrait 375x667 rotated to landscape (layout height 375) with a 180px visual viewport:
+    // the old portrait baseline would give 487px, more than the whole landscape viewport.
+    expect(keyboardInsetPx(375, 180, 0)).toBe(195);
+    expect(keyboardInsetPx(375, 0, 0)).toBe(375);
   });
 });

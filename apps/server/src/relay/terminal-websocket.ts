@@ -3,6 +3,8 @@ import { upgradeWebSocket, type WebSocketLike } from "@hono/node-server";
 import type { Session } from "@ws-model-proxy/auth";
 import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
 import {
+  TERMINAL_BROWSER_BINARY_LIMIT,
+  TERMINAL_BROWSER_BINARY_WINDOW_MS,
   TERMINAL_BROWSER_JSON_LIMIT,
   TERMINAL_BROWSER_JSON_WINDOW_MS,
   TERMINAL_BROWSER_TEXT_PENDING_LIMIT,
@@ -68,10 +70,10 @@ const BROWSER_JSON_WINDOW_MS = TERMINAL_BROWSER_JSON_WINDOW_MS;
  */
 const BROWSER_TEXT_QUEUE_LIMIT = TERMINAL_BROWSER_TEXT_PENDING_LIMIT;
 /** Per terminal tab. Key repeat runs at about 30 frames per second. */
-const BROWSER_BINARY_LIMIT = 300;
+const BROWSER_BINARY_LIMIT = TERMINAL_BROWSER_BINARY_LIMIT;
 /** Per terminal, across every viewer, so many tabs cannot multiply the CLI's input load. */
 const TERMINAL_BINARY_LIMIT = 600;
-const BROWSER_BINARY_WINDOW_MS = 10_000;
+const BROWSER_BINARY_WINDOW_MS = TERMINAL_BROWSER_BINARY_WINDOW_MS;
 /** Limiter bucket for frames that do not name a terminal. */
 const INVALID_BINARY_KEY = "";
 /**

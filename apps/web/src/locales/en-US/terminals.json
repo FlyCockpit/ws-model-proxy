@@ -5,6 +5,8 @@
     "tooLarge": "Choose a non-empty image up to 8 MiB.",
     "unsupported": "Choose a PNG, JPEG, or WebP image.",
     "busy": "Wait for the current image upload to finish.",
+    "selecting": "The image was not pasted because Select text is on. Close Select text and paste again.",
+    "hidden": "The image was not pasted because you switched tabs while it uploaded. Paste it again.",
     "limit": "This terminal has reached its image storage limit. End the session to clear its images.",
     "nodeLimit": "This node has reached its image storage limit. End unused terminal sessions to clear their images.",
     "overloaded": "This node is busy receiving images. Try again shortly.",
@@ -142,5 +144,59 @@
     "unavailableHint": "The terminal on the node shows the exact command before it runs.",
     "template": "Command as written",
     "refusedButOpen": "The server expected the node to refuse this step (bad value: {{field}}), yet its terminal opened, so the command cannot be confirmed here."
+  },
+  "toolbar": {
+    "maximize": "Maximize terminal",
+    "restore": "Restore terminal",
+    "selectText": "Select text",
+    "settings": "Terminal settings"
+  },
+  "settings": {
+    "copy": {
+      "label": "When a program copies text",
+      "prompt": {
+        "title": "Ask me first",
+        "help": "Show a Copy button. Nothing reaches your clipboard until you click it."
+      },
+      "auto": {
+        "title": "Copy automatically",
+        "help": "Copy right away. If your browser blocks it, show a Copy button instead."
+      },
+      "off": {
+        "title": "Never copy",
+        "help": "Ignore copy requests from programs in the terminal."
+      }
+    },
+    "shiftEnter": {
+      "label": "Shift+Enter",
+      "lf": {
+        "title": "New line (recommended)",
+        "help": "Adds a line break in coding agents like Claude Code and Codex instead of sending your message."
+      },
+      "esc-cr": {
+        "title": "New line (alternate)",
+        "help": "Use this if a program doesn't add a line break with the recommended option."
+      },
+      "off": {
+        "title": "Same as Enter",
+        "help": "Shift+Enter sends your message, just like Enter."
+      }
+    }
+  },
+  "copyOut": {
+    "promptTitle": "The terminal copied some text",
+    "promptBody": "Click Copy to put it on your clipboard.",
+    "promptAction": "Copy",
+    "dismiss": "Dismiss",
+    "copied": "Copied to your clipboard",
+    "tooLarge": "The terminal tried to copy too much text, so it was skipped.",
+    "blocked": "Your browser blocked the copy. Try Select text instead."
+  },
+  "selectText": {
+    "paused": "Terminal paused. Select text and copy it the usual way.",
+    "tmuxNote": "Only what's on screen and in this terminal's history is shown. Older tmux history isn't included.",
+    "done": "Done",
+    "label": "Terminal text",
+    "wideLabel": "Long lines of terminal text"
   }
 }
