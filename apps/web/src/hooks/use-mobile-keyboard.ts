@@ -37,7 +37,9 @@ export function keyboardInsetPx(
 ): number {
   // Pinch-zoomed, the visual viewport is a magnified part of the page: its height times the
   // scale is the screen height it fills, so the rest of the layout height is what the keyboard
-  // covers (its scroll position within the page says nothing about the keyboard).
+  // covers. Deliberately the keyboard's height, not the part of the layout below the zoomed view:
+  // the page keeps its unzoomed layout while zoomed (fitting it to a panned, magnified view would
+  // resize the terminal, and its PTY, on every pan), so where the view is panned does not count.
   const covered = isPinchZoomed(visualViewportScale)
     ? layoutViewportHeight - visualViewportHeight * visualViewportScale
     : layoutViewportHeight - visualViewportHeight - visualViewportOffsetTop;

@@ -80,10 +80,12 @@ export function useXterm(options: XtermOptions): {
   write: (data: Uint8Array, replay?: boolean) => void;
   reset: () => void;
   /**
-   * The session ended: drop gesture authorization and keep copy-out closed until the output
-   * already queued for it is parsed. The screen stays until the next attach resets it.
+   * The session ended: drop gesture authorization and keep copy-out closed for anything it still
+   * sends. The screen stays until the next attach resets it.
    */
   retire: () => void;
+  /** A newer attach's output arrived: copy-out may open again after a fresh gesture. */
+  attached: () => void;
   focus: () => void;
   /**
    * Apply a PTY size change in output order, while following: after the data
@@ -120,11 +122,15 @@ export function useXterm(options: XtermOptions): {
    */
   const queuedSizesRef = useRef(0);
   /**
-   * A takeover's fit is waiting for the output queued before it to be parsed. Until it runs, no
-   * other layout (a ResizeObserver tick) may refit xterm: that output must render at the size it
-   * was written for.
+   * A takeover's fit waits for the output queued before it to be parsed; until it runs, no other
+   * layout (a ResizeObserver tick) may refit xterm, since that output must render at the size it
+   * was written for. Each takeover's fit has its own number, so an older barrier's callback can
+   * neither run nor cancel a newer one. `fitDueRef`: the barrier passed while PTY sizes were still
+   * queued; the last of those runs the fit.
    */
-  const deferredFitRef = useRef(false);
+  const pendingFitRef = useRef<number | null>(null);
+  const fitDueRef = useRef<number | null>(null);
+  const fitCountRef = useRef(0);
   const [container, setContainer] = useState<HTMLDivElement | null>(null);
 
   const resizeQuietly = useCallback((size: TerminalSize) => {
@@ -176,7 +182,7 @@ export function useXterm(options: XtermOptions): {
       const term = termRef.current;
       // Output queued at an earlier size is still being parsed: report the fitted size (the PTY
       // may follow it now) but leave xterm's size to the queued events and the deferred fit.
-      if (deferredFitRef.current || queuedSizesRef.current > 0) {
+      if (pendingFitRef.current !== null || queuedSizesRef.current > 0) {
         if (own && (wasUnavailable || !sameSize(own, ownSizeRef.current))) {
           ownSizeRef.current = own;
           handlersRef.current.onResize(own);
@@ -215,7 +221,8 @@ export function useXterm(options: XtermOptions): {
     termRef.current = term;
     fitRef.current = fit;
     queuedSizesRef.current = 0;
-    deferredFitRef.current = false;
+    pendingFitRef.current = null;
+    fitDueRef.current = null;
     sizeUnavailableRef.current = true;
     // A new xterm starts with no authorization: gestures made in the old one do not carry over.
     gate.clearReplay();
@@ -489,6 +496,10 @@ export function useXterm(options: XtermOptions): {
     } else {
       gate.disarm();
       inputGate.disarm();
+      // Hidden, it has no box: the session hook takes no size from it, and when it is shown
+      // again it reports its size (even an unchanged one), which resumes input waiting for it.
+      sizeUnavailableRef.current = true;
+      handlersRef.current.onSizeUnavailable?.();
     }
   }, [active, container, followRef, gate, handlersRef, inputGate, layout]);
 
@@ -501,14 +512,25 @@ export function useXterm(options: XtermOptions): {
     if (!container || (followCols === null) !== (followRows === null)) return;
     const term = termRef.current;
     if (followCols === null && term) {
-      deferredFitRef.current = true;
+      fitCountRef.current += 1;
+      const fit = fitCountRef.current;
+      pendingFitRef.current = fit;
+      fitDueRef.current = null;
       term.write("", () => {
-        if (termRef.current !== term) return;
-        deferredFitRef.current = false;
+        if (termRef.current !== term || pendingFitRef.current !== fit) return;
+        // PTY sizes queued before the barrier still apply first; the last one runs the fit.
+        if (queuedSizesRef.current > 0) {
+          fitDueRef.current = fit;
+          return;
+        }
+        pendingFitRef.current = null;
         layout();
       });
       return;
     }
+    // Following again: a writer fit still waiting no longer applies.
+    pendingFitRef.current = null;
+    fitDueRef.current = null;
     layout();
   }, [container, followCols, followRows, layout]);
 
@@ -527,6 +549,9 @@ export function useXterm(options: XtermOptions): {
     inputGate.disarm();
     writerRef.current?.retire();
   }, [gate, inputGate]);
+  const attached = useCallback(() => {
+    gate.attached();
+  }, [gate]);
   const focus = useCallback(() => {
     termRef.current?.focus();
   }, []);
@@ -543,9 +568,16 @@ export function useXterm(options: XtermOptions): {
         if (termRef.current !== term) return;
         queuedSizesRef.current -= 1;
         if (followedWhenQueued || followRef.current) resizeQuietly(size);
+        // The last queued size before a takeover fit whose barrier already passed runs that fit.
+        const due = fitDueRef.current;
+        if (queuedSizesRef.current === 0 && due !== null && due === pendingFitRef.current) {
+          pendingFitRef.current = null;
+          fitDueRef.current = null;
+          if (!followRef.current) layout();
+        }
       });
     },
-    [followRef, resizeQuietly],
+    [followRef, layout, resizeQuietly],
   );
 
   const snapshot = useCallback(() => {
@@ -570,6 +602,7 @@ export function useXterm(options: XtermOptions): {
     write,
     reset,
     retire,
+    attached,
     focus,
     followResize,
     snapshot,

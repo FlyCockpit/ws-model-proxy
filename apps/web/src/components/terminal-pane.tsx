@@ -45,7 +45,7 @@ export function TerminalPane(props: TerminalPaneProps) {
   const [uploadPercent, setUploadPercent] = useState<number | null>(null);
   const shiftEnter = useUiPreferences((prefs) => prefs.terminalShiftEnter);
   const copy = useTerminalCopy();
-  const { containerRef, selectionText } = useTerminalPane({
+  const { containerRef, selectionText, focusTerminal } = useTerminalPane({
     ...props,
     shiftEnter,
     onCopy: copy.onCopy,
@@ -129,7 +129,17 @@ export function TerminalPane(props: TerminalPaneProps) {
         <SelectTextOverlay text={selectionText} onDone={props.onDoneSelecting} />
       ) : null}
       {copy.pending && selectionText === null ? (
-        <CopyBar onCopy={copy.copyPending} onDismiss={copy.clear} />
+        // Closing the bar removes the focused button: focus goes back to the terminal.
+        <CopyBar
+          onCopy={() => {
+            copy.copyPending();
+            focusTerminal();
+          }}
+          onDismiss={() => {
+            copy.clear();
+            focusTerminal();
+          }}
+        />
       ) : null}
       {uploadPercent !== null ? (
         <div

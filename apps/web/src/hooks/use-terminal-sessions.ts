@@ -102,8 +102,17 @@ const BROWSER_IDENTITY_REQUIRED = "approval_required";
  */
 export const TERMINAL_GONE = "gone";
 
-/** `text`: a ticket's typed command, kept so it can be typed again if it cannot go out now. */
-type InputItem = { bytes: Uint8Array; origin: TerminalInputOrigin; text?: string };
+/**
+ * One piece of queued input. `text`: a ticket's typed command, kept so it can be typed again if
+ * it cannot go out now. `image`: an image's path, sent as its own image-paste frame; `done`
+ * reports whether it reached the socket.
+ */
+type InputItem = {
+  bytes: Uint8Array;
+  origin: TerminalInputOrigin;
+  text?: string;
+  image?: { id: string; data: string; done: (sent: boolean) => void };
+};
 
 type InputBatch = {
   items: InputItem[];
@@ -112,6 +121,8 @@ type InputBatch = {
    * encrypted), in the order it was made. It goes out ahead of `items`.
    */
   returned: InputItem[];
+  /** A gateway step for this batch is queued on the send chain; it takes the batch when it runs. */
+  draining: boolean;
   /** Bytes in `items`. */
   size: number;
   lastSentAt: number;
@@ -161,11 +172,12 @@ export type TerminalTab = {
 
 /**
  * Output for a pane, in CLI order: bytes, and PTY size changes. `replay` marks scrollback the CLI
- * sent this viewer alone on join (unicast data); live output is broadcast.
+ * sent this viewer alone on join (unicast data); live output is broadcast. `attach` is the attach
+ * it arrived on: a pane drops output from an attach older than one it has already seen.
  */
 export type TerminalOutputEvent =
-  | { kind: "data"; data: Uint8Array; replay: boolean }
-  | { kind: "size"; cols: number; rows: number };
+  | { kind: "data"; data: Uint8Array; replay: boolean; attach: number }
+  | { kind: "size"; cols: number; rows: number; attach: number };
 
 type PendingHandshake = {
   localId: string;
@@ -197,6 +209,8 @@ type OutputKeyState = {
 };
 
 type LiveSession = {
+  /** Which attach this is (increasing per page): output carries it, so a pane can drop stale output. */
+  attach: number;
   images: TerminalImageTransfer;
   localId: string;
   terminalId: string;
@@ -422,6 +436,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       activeRef.current = localId;
       setActiveLocalIdState(localId);
       if (selectingRef.current !== null && selectingRef.current !== localId) changeSelecting(null);
+      // Input or a ticket's command waiting for this tab to be shown can go now.
+      if (localId !== null) resumeInputRef.current(localId);
     },
     [changeSelecting],
   );
@@ -440,6 +456,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const resettersRef = useRef(new Map<string, () => void>());
   /** Per pane: its session just ended (detach, disconnect), before any replacement attaches. */
   const retireRef = useRef(new Map<string, () => void>());
+  /** The last attach number given out (see LiveSession.attach). */
+  const attachCounterRef = useRef(0);
   const buffersRef = useRef(new Map<string, TerminalOutputEvent[]>());
   const pendingResizeRef = useRef(new Map<string, TerminalSize>());
   const sendRef = useRef<(message: TerminalClientMessage) => TerminalSendResult>(() => "closed");
@@ -741,10 +759,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   );
 
   const applyPtySize = useCallback(
-    (localId: string, cols: number, rows: number) => {
+    (localId: string, cols: number, rows: number, attach: number) => {
       if (cols < 1 || rows < 1) return;
       setTabs((current) => patchTab(current, localId, { ptyCols: cols, ptyRows: rows }));
-      emitOutput(localId, { kind: "size", cols, rows });
+      emitOutput(localId, { kind: "size", cols, rows, attach });
     },
     [emitOutput],
   );
@@ -802,30 +820,19 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     [],
   );
 
-  /**
-   * Become the writer: the CLI must see this tab's size before its first data frame, so the PTY
-   * is resized before the input lands. Both share the per-terminal send chain, so the order
-   * holds. Only the visible tab, with a measured box, can take over: a hidden or unmeasurable
-   * pane has no size to give the PTY.
-   */
-  const takeOver = useCallback(
-    (localId: string): boolean => {
-      if (activeRef.current !== localId || !measurableRef.current.has(localId)) return false;
-      const own = ownSizeRef.current.get(localId);
-      if (!own) return false;
-      clearTimer(resizeTimersRef.current, localId);
-      setView(localId, { writer: "you" });
-      lastSentSizeRef.current.set(localId, own);
-      sendPlaintext(localId, encodeTerminalResize(own.cols, own.rows));
-      return true;
-    },
-    [clearTimer, sendPlaintext, setView],
-  );
-
-  /** Whether this tab may send input as the writer right now (checked again after sealing). */
+  /** Whether this tab may send input as the writer right now. */
   const mayWrite = useCallback(
     (localId: string) => selectingRef.current !== localId && !needsTakeover(viewOf(localId)),
     [viewOf],
+  );
+
+  /** The visible tab with a measured box: the only one that can give the PTY its size. */
+  const canTakeOver = useCallback(
+    (localId: string) =>
+      activeRef.current === localId &&
+      measurableRef.current.has(localId) &&
+      ownSizeRef.current.has(localId),
+    [],
   );
 
   /**
@@ -843,81 +850,204 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     }
   }, []);
 
+  /** Items that could not go out: typed commands wait again, image pastes report failure. */
+  const settleUnsent = useCallback(
+    (localId: string, items: readonly InputItem[]) => {
+      keepTypedCommand(localId, items);
+      for (const item of items) item.image?.done(false);
+    },
+    [keepTypedCommand],
+  );
+
   /**
-   * The input gateway: every byte of a tab's input leaves through here, and its rules are
-   * checked when it is sent, not when it was made: once here, and again right before the socket
-   * send (a batch waits up to INPUT_FLUSH_INTERVAL_MS, and sealing is asynchronous).
-   * - Select text: user and typed input waits (it goes out when the mode ends); a reply is
-   *   dropped, since it answers output that has moved on.
-   * - A reply goes out only while this tab is the writer: it never claims the writer. Replies go
-   *   in their own frames, so each kind is checked by its own rule.
-   * - User input from a follower takes over first, which needs the visible, measured tab;
-   *   without that it is dropped. A typed command waits for the tab instead.
-   * - Input in a frame refused after sealing returns to the front of the batch, in order.
+   * One step of the input gateway, run on the tab's send chain when its turn comes. It takes the
+   * batch then (so nothing later can be sealed ahead of it), decides by the tab's rules at that
+   * moment, seals, checks the rules again, and only then sends. Taking over is part of the step:
+   * the writer becomes "you" only once its resize and first input actually went out.
+   * - Select text: input waits; replies are dropped (they answer output that has moved on).
+   * - Replies go out only from the writer, in their own frames: they never claim the writer.
+   * - Input from a follower takes over first, only from the visible, measured tab; otherwise user
+   *   input is dropped and a typed command waits for the tab.
+   * - Refused after sealing: the items go back to the front of the batch, in order. The CLI
+   *   accepts any later sequence number, so the sealed frames are simply never sent.
    */
+  const drainInput = useCallback(
+    async (localId: string, session: LiveSession) => {
+      const batch = inputRef.current.get(localId);
+      if (!batch) return;
+      batch.draining = false;
+      const items = [...batch.returned, ...batch.items];
+      batch.returned = [];
+      batch.items = [];
+      batch.size = 0;
+      if (items.length === 0) return;
+      const current = () => sessionsRef.current.get(session.terminalId) === session;
+      if (!current()) {
+        settleUnsent(localId, items);
+        return;
+      }
+      // Input waits in order; an image paste does not wait (Select text drops it, as before).
+      const hold = (held: InputItem[]) => {
+        const live = inputRef.current.get(localId);
+        const waiting = held.filter((item) => !item.image);
+        settleUnsent(
+          localId,
+          held.filter((item) => item.image),
+        );
+        if (!live) {
+          settleUnsent(localId, waiting);
+          return;
+        }
+        live.returned.push(...waiting);
+      };
+      if (selectingRef.current === localId) {
+        hold(items.filter((item) => item.origin !== "reply"));
+        return;
+      }
+      batch.lastSentAt = performance.now();
+      const writer = !needsTakeover(viewOf(localId));
+      const takeOver =
+        !writer && items.some((item) => item.origin !== "reply") && canTakeOver(localId);
+      const own = ownSizeRef.current.get(localId);
+      // What goes out: replies only as the writer; input as the writer or by taking over.
+      const sending = items.filter((item) =>
+        item.origin === "reply" ? writer : writer || takeOver,
+      );
+      const going = new Set(sending);
+      settleUnsent(
+        localId,
+        items.filter((item) => !going.has(item) && item.origin !== "reply"),
+      );
+      if (sending.length === 0) return;
+      // Frames in order: the takeover resize, then runs of input and replies, an image paste
+      // always on its own.
+      const plaintexts: { plaintext: Uint8Array; items: InputItem[] }[] = [];
+      if (takeOver && own)
+        plaintexts.push({ plaintext: encodeTerminalResize(own.cols, own.rows), items: [] });
+      let run: InputItem[] = [];
+      const endRun = () => {
+        if (run.length === 0) return;
+        plaintexts.push({
+          plaintext: encodeTerminalData(concatBytes(run.map((item) => item.bytes))),
+          items: run,
+        });
+        run = [];
+      };
+      for (const item of sending) {
+        if (item.image) {
+          endRun();
+          plaintexts.push({
+            plaintext: encodeTerminalImageControl(
+              TERMINAL_IMAGE_PASTE,
+              item.image.id,
+              item.image.data,
+            ),
+            items: [item],
+          });
+          continue;
+        }
+        const previous = run[run.length - 1];
+        if (previous && (previous.origin === "reply") !== (item.origin === "reply")) endRun();
+        run.push(item);
+      }
+      endRun();
+      // Sequence numbers are taken in frame order now; the seals then run together.
+      const numbered = plaintexts.map(({ plaintext }) => {
+        const seq = session.sendSeq + 1n;
+        session.sendSeq = seq;
+        return { plaintext, seq };
+      });
+      let sealed: { frame: ArrayBuffer; seq: bigint }[];
+      try {
+        sealed = await Promise.all(
+          numbered.map(async ({ plaintext, seq }) => {
+            const body = await sealTerminalBytesV2({
+              key: session.browserToCli,
+              terminalId: session.terminalId,
+              viewerId: session.viewerId,
+              direction: DIRECTION_BROWSER_TO_CLI,
+              seq,
+              plaintext,
+            });
+            return {
+              frame: encodeSealedFrame({ terminalId: session.terminalId, seq: Number(seq), body }),
+              seq,
+            };
+          }),
+        );
+      } catch {
+        // Sealing failed: nothing here was sent (typed commands wait, image pastes fail).
+        settleUnsent(localId, sending);
+        return;
+      }
+      // The rules again, now that sealing is done.
+      const allowed =
+        current() &&
+        selectingRef.current !== localId &&
+        (takeOver ? canTakeOver(localId) && needsTakeover(viewOf(localId)) : mayWrite(localId));
+      if (!allowed) {
+        if (!current()) settleUnsent(localId, sending);
+        else hold(sending.filter((item) => item.origin !== "reply"));
+        const live = inputRef.current.get(localId);
+        if (live && selectingRef.current !== localId && current())
+          live.timer ??= setTimeout(() => flushInputRef.current(localId), 0);
+        return;
+      }
+      if (takeOver && own) {
+        clearTimer(resizeTimersRef.current, localId);
+        setView(localId, { writer: "you" });
+        lastSentSizeRef.current.set(localId, own);
+      }
+      plaintexts.forEach(({ items: frameItems }, index) => {
+        const entry = sealed[index];
+        let sent = false;
+        try {
+          sent = entry ? frameRef.current(entry.frame) : false;
+        } catch {
+          sent = false;
+        }
+        for (const item of frameItems) item.image?.done(sent);
+      });
+    },
+    [canTakeOver, clearTimer, mayWrite, settleUnsent, setView, viewOf],
+  );
+
+  /** Queue a gateway step for the tab's batch on its send chain (one at a time). */
   const flushInput = useCallback(
     (localId: string) => {
       const batch = inputRef.current.get(localId);
       if (!batch) return;
       if (batch.timer) clearTimeout(batch.timer);
       batch.timer = null;
-      if (batch.returned.length > 0) {
-        batch.items = [...batch.returned, ...batch.items];
+      if (batch.draining || (batch.items.length === 0 && batch.returned.length === 0)) return;
+      const tab = tabsRef.current.find((item) => item.localId === localId);
+      const terminalId = tab?.terminalId;
+      const session =
+        terminalId && tab.phase !== "exited" ? sessionsRef.current.get(terminalId) : undefined;
+      if (!terminalId || !session) {
+        // No live session: this input has nowhere to go (a typed command waits for one).
+        const items = [...batch.returned, ...batch.items];
         batch.returned = [];
-        batch.size = batch.items.reduce((total, item) => total + item.bytes.length, 0);
-      }
-      if (batch.items.length === 0) return;
-      if (selectingRef.current === localId) {
-        batch.items = batch.items.filter((item) => item.origin !== "reply");
-        batch.size = batch.items.reduce((total, item) => total + item.bytes.length, 0);
+        batch.items = [];
+        batch.size = 0;
+        settleUnsent(localId, items);
         return;
       }
-      const items = batch.items;
-      batch.items = [];
-      batch.size = 0;
-      batch.lastSentAt = performance.now();
-      let writer = !needsTakeover(viewOf(localId));
-      // Consecutive items of one kind share a frame: replies, or input (user and typed).
-      const segments: { reply: boolean; items: InputItem[] }[] = [];
-      const add = (item: InputItem, reply: boolean) => {
-        const last = segments[segments.length - 1];
-        if (last && last.reply === reply) last.items.push(item);
-        else segments.push({ reply, items: [item] });
-      };
-      for (const item of items) {
-        if (item.origin === "reply") {
-          if (writer) add(item, true);
-          continue;
-        }
-        if (!writer) writer = takeOver(localId);
-        if (writer) add(item, false);
-        else if (item.origin === "typed") keepTypedCommand(localId, [item]);
-      }
-      for (const segment of segments) {
-        const bytes = encodeTerminalData(concatBytes(segment.items.map((item) => item.bytes)));
-        if (segment.reply) {
-          sendPlaintext(localId, bytes, () => mayWrite(localId));
-          continue;
-        }
-        sendPlaintext(
-          localId,
-          bytes,
-          () => mayWrite(localId),
-          () => {
-            // Refused after sealing: back to the batch, ahead of anything typed since, and
-            // through the gateway again (which takes over or holds it as the rules now say).
-            const current = inputRef.current.get(localId);
-            if (!current) {
-              keepTypedCommand(localId, segment.items);
-              return;
-            }
-            current.returned.push(...segment.items);
-            current.timer ??= setTimeout(() => flushInputRef.current(localId), 0);
-          },
-        );
-      }
+      batch.draining = true;
+      const previous = sendChainRef.current.get(terminalId) ?? Promise.resolve();
+      const step = previous
+        .catch(() => undefined)
+        .then(() => drainInput(localId, session))
+        // Sealing failed: nothing in this step was sent. An image paste that has not reported
+        // yet reports failure (its `done` ignores a second call).
+        .catch(() => {
+          const live = inputRef.current.get(localId);
+          if (live) live.draining = false;
+        })
+        .then(() => true);
+      sendChainRef.current.set(terminalId, step);
     },
-    [keepTypedCommand, mayWrite, sendPlaintext, takeOver, viewOf],
+    [drainInput, settleUnsent],
   );
   useLayoutEffect(() => {
     flushInputRef.current = flushInput;
@@ -1082,7 +1212,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         earlySealedRef.current.delete(message.terminalId);
         return;
       }
+      attachCounterRef.current += 1;
       const session: LiveSession = {
+        attach: attachCounterRef.current,
         images: new TerminalImageTransfer(),
         localId: pending.localId,
         terminalId: message.terminalId,
@@ -1311,12 +1443,15 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       const batch = inputRef.current.get(localId);
       if (batch) {
         if (batch.timer) clearTimeout(batch.timer);
-        keepTypedCommand(localId, [...batch.returned, ...batch.items]);
+        settleUnsent(localId, [...batch.returned, ...batch.items]);
         inputRef.current.delete(localId);
       }
+      // Output buffered for a pane not yet subscribed belongs to the ended attach: the next
+      // attach's replay redraws the screen, and none of it may reach the pane (or copy) later.
+      buffersRef.current.delete(localId);
       retireRef.current.get(localId)?.();
     },
-    [keepTypedCommand],
+    [settleUnsent],
   );
 
   const dropSession = useCallback(
@@ -1612,6 +1747,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         }
         clearTimer(reattachTimersRef.current, localId);
         clearTimer(resizeTimersRef.current, localId);
+        // Copy requests belong to a live attach: the pane retires its copy bar and copy-out now.
+        retireRef.current.get(localId)?.();
         // Mark it exited now; frames that arrive from here on are dropped.
         patchTabNow(localId, {
           phase: "exited",
@@ -1867,8 +2004,13 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const applyPlaintext = useCallback(
     (session: LiveSession, decoded: TerminalPlaintext, replay: boolean) => {
       if (decoded.kind === "data")
-        emitOutput(session.localId, { kind: "data", data: decoded.data, replay });
-      else applyPtySize(session.localId, decoded.cols, decoded.rows);
+        emitOutput(session.localId, {
+          kind: "data",
+          data: decoded.data,
+          replay,
+          attach: session.attach,
+        });
+      else applyPtySize(session.localId, decoded.cols, decoded.rows, session.attach);
     },
     [applyPtySize, emitOutput],
   );
@@ -2166,6 +2308,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       const tab = tabsRef.current.find((item) => item.localId === localId);
       // A session being ended takes no more keystrokes.
       if (!tab || tab.ending === "pending") return;
+      // Input made while Select text is on is dropped: the terminal is inert then, so only
+      // asynchronous paths can produce it. (Input queued before the mode started waits instead,
+      // and a ticket's typed command is held by its own timer.)
+      if (selectingRef.current === localId && origin !== "typed") return;
       const bytes = typeof data === "string" ? textEncoder.encode(data) : data;
       if (bytes.length === 0) return;
       let batch = inputRef.current.get(localId);
@@ -2173,6 +2319,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         batch = {
           items: [],
           returned: [],
+          draining: false,
           size: 0,
           lastSentAt: Number.NEGATIVE_INFINITY,
           timer: null,
@@ -2200,27 +2347,48 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   }, [sendInput]);
 
   /**
-   * An image's path, pasted as its own frame through the same rules as typed input: not while
-   * Select text is on, and from a follower only by taking over from the visible, measured tab.
+   * An image's path, pasted as its own frame through the same gateway as typed input, in order
+   * behind anything typed before it: not while Select text is on, and from a follower only by
+   * taking over from the visible, measured tab. Resolves with whether it reached the socket.
    */
   const pasteImage = useCallback(
-    async (localId: string, id: string, data: string) => {
+    (localId: string, id: string, data: string) => {
       const tab = tabsRef.current.find((item) => item.localId === localId);
-      if (!tab || tab.ending === "pending") return false;
+      if (!tab || tab.ending === "pending") return Promise.resolve(false);
       const live =
         tab.terminalId && tab.phase !== "exited" ? sessionsRef.current.has(tab.terminalId) : false;
-      if (!live || selectingRef.current === localId) return false;
-      // Earlier input first, in the order it was made.
-      flushInput(localId);
-      if (needsTakeover(viewOf(localId)) && !takeOver(localId)) return false;
-      // Checked again after sealing: still not selecting, still the visible writer.
-      return sendPlaintext(
-        localId,
-        encodeTerminalImageControl(TERMINAL_IMAGE_PASTE, id, data),
-        () => mayWrite(localId) && activeRef.current === localId,
-      );
+      if (!live || selectingRef.current === localId) return Promise.resolve(false);
+      return new Promise<boolean>((resolve) => {
+        let batch = inputRef.current.get(localId);
+        if (!batch) {
+          batch = {
+            items: [],
+            returned: [],
+            draining: false,
+            size: 0,
+            lastSentAt: Number.NEGATIVE_INFINITY,
+            timer: null,
+          };
+          inputRef.current.set(localId, batch);
+        }
+        let settled = false;
+        batch.items.push({
+          bytes: new Uint8Array(0),
+          origin: "user",
+          image: {
+            id,
+            data,
+            done: (sent) => {
+              if (settled) return;
+              settled = true;
+              resolve(sent);
+            },
+          },
+        });
+        flushInput(localId);
+      });
     },
-    [flushInput, mayWrite, sendPlaintext, takeOver, viewOf],
+    [flushInput],
   );
 
   const sendResize = useCallback(

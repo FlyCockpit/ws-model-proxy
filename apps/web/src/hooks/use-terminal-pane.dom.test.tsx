@@ -181,10 +181,11 @@ function outputSource() {
   return { subscribeOutput, emit, retireSession };
 }
 
-const data = (text: string, replay = false): TerminalOutputEvent => ({
+const data = (text: string, replay = false, attach = 1): TerminalOutputEvent => ({
   kind: "data",
   data: new TextEncoder().encode(text),
   replay,
+  attach,
 });
 
 const attachment = (text: string): TerminalImageAttachment => ({
@@ -591,7 +592,7 @@ describe("useTerminalPane", () => {
     expect(source.subscribeOutput).not.toHaveBeenCalled();
     act(() => {
       source.emit(data("during "));
-      source.emit({ kind: "size", cols: 120, rows: 40 });
+      source.emit({ kind: "size", cols: 120, rows: 40, attach: 1 });
       source.emit(data("mount"));
     });
     expect(source.subscribeOutput).not.toHaveBeenCalled();
@@ -631,9 +632,9 @@ describe("useTerminalPane", () => {
     if (!term) throw new Error("no xterm");
     act(() => {
       source.emit(data("old "));
-      source.emit({ kind: "size", cols: 120, rows: 40 });
+      source.emit({ kind: "size", cols: 120, rows: 40, attach: 1 });
       source.emit(data("new "));
-      source.emit({ kind: "size", cols: 90, rows: 20 });
+      source.emit({ kind: "size", cols: 90, rows: 20, attach: 1 });
       source.emit(data("last"));
     });
     // The session state follows the newest size before the parser gets there.
@@ -969,7 +970,7 @@ describe("useTerminalPane", () => {
     term.log.length = 0;
     act(() => {
       source.emit(data("a"));
-      source.emit({ kind: "size", cols: 120, rows: 40 });
+      source.emit({ kind: "size", cols: 120, rows: 40, attach: 1 });
       source.emit(data("b"));
     });
     follow = null;
@@ -1033,5 +1034,81 @@ describe("useTerminalPane", () => {
     // Still closed once xterm caught up: the gesture belonged to the ended session.
     act(() => term.parse());
     expect(gate.allowed(true)).toBe(false);
+  });
+
+  /** A pane whose follow size the test changes, with output it emits. */
+  function switchable() {
+    const source = outputSource();
+    const state: { follow: { cols: number; rows: number } | null } = {
+      follow: { cols: 100, rows: 30 },
+    };
+    const container = document.createElement("div");
+    const { result, rerender } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow: state.follow,
+        sendInput: () => undefined,
+        sendResize: () => undefined,
+        subscribeOutput: source.subscribeOutput,
+      }),
+    );
+    act(() => result.current.containerRef(container));
+    const term = xterm.instances[0];
+    if (!term) throw new Error("no terminal");
+    act(() => term.parse());
+    term.log.length = 0;
+    const follow = (next: { cols: number; rows: number } | null) => {
+      state.follow = next;
+      rerender();
+    };
+    return { term, source, follow, container };
+  }
+
+  it("still fits after a takeover when a size event is queued behind its barrier", () => {
+    const { term, source, follow } = switchable();
+    act(() => source.emit(data("a")));
+    follow(null);
+    // The CLI's echo of the new size arrives before xterm parsed anything.
+    act(() => source.emit({ kind: "size", cols: 80, rows: 24, attach: 1 }));
+    act(() => term.parse());
+    expect(term.log).toEqual(["a@100x30", { resize: [80, 24] }]);
+  });
+
+  it("never lets an older takeover's fit run ahead of a newer follow period's output", () => {
+    const { term, source, follow } = switchable();
+    act(() => source.emit(data("a")));
+    follow(null);
+    follow({ cols: 100, rows: 30 });
+    act(() => source.emit(data("b")));
+    follow(null);
+    act(() => term.parse());
+    expect(term.log).toEqual(["a@100x30", "b@100x30", { resize: [80, 24] }]);
+  });
+
+  it("drops output from an attach older than one it has shown", () => {
+    const { term, source } = switchable();
+    act(() => source.emit(data("new", false, 2)));
+    act(() => source.emit(data("stale", false, 1)));
+    act(() => term.parse());
+    expect(term.log).toEqual(["new@100x30"]);
+  });
+
+  it("keeps copy-out closed after its session ended until a newer attach's output arrives", () => {
+    const { term, source, container } = switchable();
+    const gate = term.gate;
+    if (!gate) throw new Error("no gate");
+    act(() => source.emit(data("live", false, 1)));
+    act(() => term.parse());
+    act(() => source.retireSession());
+    // Output of the ended attach still arriving (a decryption that was in flight).
+    act(() => source.emit(data("late", false, 1)));
+    act(() => term.parse());
+    container.dispatchEvent(new Event("pointerdown"));
+    expect(gate.allowed(true)).toBe(false);
+    act(() => source.emit(data("replay", true, 2)));
+    act(() => term.parse());
+    container.dispatchEvent(new Event("pointerdown"));
+    expect(gate.allowed(true)).toBe(true);
   });
 });

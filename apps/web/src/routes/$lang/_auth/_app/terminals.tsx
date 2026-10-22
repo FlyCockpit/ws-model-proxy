@@ -206,10 +206,19 @@ function TerminalWorkspace({
                     variant={tab.localId === activeLocalId ? "secondary" : "ghost"}
                     size="touch"
                     className="shrink-0 font-mono"
-                    // A click switches tabs and leaves focus for the terminal; the keyboard path
-                    // keeps focus on the tab list.
+                    // A click switches tabs and hands focus to the terminal; the keyboard path
+                    // keeps focus on the tab list. A pointer click (detail > 0) leaves the tab
+                    // list first, so a tab focused earlier by keyboard does not keep focus.
                     onMouseDown={(event) => event.preventDefault()}
-                    onClick={() => sessions.selectTab(tab.localId)}
+                    onClick={(event) => {
+                      if (
+                        event.detail > 0 &&
+                        document.activeElement instanceof HTMLElement &&
+                        document.activeElement.closest('[role="tablist"]')
+                      )
+                        document.activeElement.blur();
+                      sessions.selectTab(tab.localId);
+                    }}
                     onKeyDown={(event) => onTabKeyDown(event, index)}
                   >
                     <span>{slugOf(tab.cliDeviceId) ?? t("terminals:unknownNode")}</span>

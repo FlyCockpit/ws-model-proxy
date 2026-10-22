@@ -43,6 +43,8 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): {
   containerRef: RefCallback<HTMLDivElement>;
   /** The text shown while selecting, or null when not selecting. */
   selectionText: string | null;
+  /** Put keyboard focus in the terminal (after a bar over it closes). */
+  focusTerminal: () => void;
 } {
   const handlersRef = useLatestRef(handlers);
   const xterm = useXterm({
@@ -77,9 +79,18 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): {
   // useXterm's own effects run first, so xterm is open when this one runs.
   useEffect(() => {
     if (!host) return;
+    // The newest attach whose output this pane has shown. Output from an older one (buffered
+    // before a reattach, or decrypted after its session ended) is stale: the new attach's replay
+    // already holds the screen, and none of it may copy.
+    let latestAttach: number | null = null;
     return handlersRef.current.subscribeOutput(
       localId,
       (event) => {
+        if (latestAttach !== null && event.attach < latestAttach) return;
+        if (latestAttach !== event.attach) {
+          latestAttach = event.attach;
+          xtermRef.current.attached();
+        }
         if (event.kind === "data") xtermRef.current.write(event.data, event.replay);
         else xtermRef.current.followResize({ cols: event.cols, rows: event.rows });
       },
@@ -113,5 +124,5 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): {
     focus();
   }, [active, host, focus, selecting]);
 
-  return { containerRef: xterm.containerRef, selectionText };
+  return { containerRef: xterm.containerRef, selectionText, focusTerminal: focus };
 }

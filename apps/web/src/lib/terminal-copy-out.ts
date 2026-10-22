@@ -60,6 +60,11 @@ export class CopyOutGate {
   lastInputAtMs = 0;
   /** Replay chunks written to xterm and not yet parsed. Copy-out stays closed while any is. */
   private replayChunks = 0;
+  /**
+   * The session ended: copy-out stays closed for anything still arriving from it (a decryption
+   * in flight, output buffered for the pane) until a newer attach's output arrives.
+   */
+  private retired = false;
 
   armFromUserGesture(nowMs = Date.now()): void {
     this.lastInputAtMs = nowMs;
@@ -90,8 +95,18 @@ export class CopyOutGate {
   /** Remote output, including cursor-position replies, must not arm copy-out. */
   noteRemoteData(_data: string): void {}
 
+  retire(): void {
+    this.retired = true;
+    this.lastInputAtMs = 0;
+  }
+
+  /** A newer attach's output arrived: its own copies may fire again (after a fresh gesture). */
+  attached(): void {
+    this.retired = false;
+  }
+
   allowed(hasFocus: boolean, nowMs = Date.now()): boolean {
-    if (this.replayChunks > 0) return false;
+    if (this.retired || this.replayChunks > 0) return false;
     return terminalCopyOutAllowed(hasFocus, this.lastInputAtMs, nowMs);
   }
 }
@@ -317,14 +332,14 @@ export function createReplayAwareWriter(term: ReplayWriteTerminal, gate: CopyOut
       writeClosed(ABORT_SEQUENCE, () => term.reset());
     },
     /**
-     * The session ended: copy-out stays closed until everything queued for it is parsed, so
-     * nothing it sent can copy in the gap before the next attach. Output is left as it is.
+     * The session ended: copy-out stays closed for anything it still sends, until a newer
+     * attach's output arrives (see CopyOutGate.retire). Output is left as it is.
      */
     retire(): void {
       afterReplay = false;
       finishingReplayCopy = false;
       tracker.clear();
-      writeClosed(new Uint8Array(0));
+      gate.retire();
     },
     dispose(): void {
       disposed = true;
