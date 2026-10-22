@@ -2,7 +2,11 @@
 
 import { webcrypto } from "node:crypto";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
-import { TERMINAL_BROWSER_JSON_WINDOW_MS } from "@ws-model-proxy/config/terminal-socket-policy";
+import {
+  TERMINAL_BROWSER_BINARY_BUDGET,
+  TERMINAL_BROWSER_BINARY_WINDOW_MS,
+  TERMINAL_BROWSER_JSON_WINDOW_MS,
+} from "@ws-model-proxy/config/terminal-socket-policy";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -824,6 +828,29 @@ describe("useTerminalSessions End session until the relay confirms", () => {
     expect(closes()).toHaveLength(1);
     message({ type: "closed", terminalId: TERMINAL_ID, requestId: closes()[0]?.requestId ?? null });
     expect(view.result.current.tabs).toEqual([]);
+  });
+
+  it("attaches again when the relay refuses End session, so the running shell takes keys", async () => {
+    const { view, localId } = await setupV2();
+    act(() => view.result.current.endSession(localId));
+    const attaches = sentOfType("attach").length;
+    message({
+      type: "error",
+      terminalId: TERMINAL_ID,
+      requestId: closes()[0]?.requestId,
+      code: "invalid",
+      message: "",
+    });
+    expect(view.result.current.tabs[0]).toMatchObject({ localId, ending: "failed" });
+    // The ended attach stays ended; a fresh one takes its place.
+    await waitFor(() => expect(sentOfType("attach")).toHaveLength(attaches + 1));
+    const cli = await attachAsCli(VIEWER_ID, attaches);
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    socket.sendFrame.mockClear();
+    act(() => view.result.current.sendInput(localId, "ls\r"));
+    await waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(1));
+    expect(await browserFrames(cli)).toEqual([{ seq: 1, data: "ls\r" }]);
   });
 
   it("sends a close lost with its socket again when the next list still has the terminal", async () => {
@@ -1810,6 +1837,39 @@ describe("useTerminalSessions terminal tickets", () => {
     expect(await browserFrames(cli)).toEqual([{ seq: 1, data: "nvidia-smi -L" }]);
   });
 
+  it("waits for the shell's first output however long it takes, even when the tab is shown and measured", async () => {
+    const view = await openWith("nvidia-smi -L");
+    const cli = await openAsCli();
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    const localId = view.result.current.tabs[0]?.localId ?? "";
+    // Showing and measuring the tab resumes a command already waiting for quiet, nothing more.
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    await act(async () => new Promise((resolve) => realSetTimeout(resolve, 600)));
+    expect((await browserFrames(cli)).filter((frame) => "data" in frame)).toEqual([]);
+    await unicast(cli, text("$ "));
+    await waitFor(async () =>
+      expect((await browserFrames(cli)).filter((frame) => "data" in frame)).toEqual([
+        expect.objectContaining({ data: "nvidia-smi -L" }),
+      ]),
+    );
+  });
+
+  it("neither types nor retries a pending command once the page unmounts", async () => {
+    const view = await openWith("nvidia-smi -L");
+    const cli = await openAsCli();
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    useFakeClock();
+    await unicast(cli, text("$ "));
+    await settle();
+    // The command waits for quiet when the page goes away.
+    view.unmount();
+    socket.sendFrame.mockReturnValue(false);
+    await advanceClock(1_000);
+    await advanceClock(1_000);
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("holds the queued command while Select text is on and types it after", async () => {
     const view = await openWith("nvidia-smi -L");
     const cli = await openAsCli();
@@ -2000,4 +2060,82 @@ describe("useTerminalSessions operator-terminal tabs (runtimes.steps.attach)", (
     expect(sentOfType("detach")).toEqual([{ type: "detach", terminalId: TERMINAL_ID }]);
     expect(view.result.current.tabs).toEqual([]);
   });
+});
+
+describe("useTerminalSessions frame budget", () => {
+  /**
+   * Advance the fake clock until no more frames go out. A step waiting for budget sets its timer
+   * only after a real-time seal, so one large advance can leave later steps still waiting.
+   */
+  async function drainBudget(sentAt: readonly number[]) {
+    for (let idle = 0; idle < 3; ) {
+      const before = sentAt.length;
+      await advanceClock(TERMINAL_BROWSER_BINARY_WINDOW_MS / 4);
+      idle = sentAt.length === before ? idle + 1 : 0;
+    }
+  }
+
+  it("keeps the sealed frames of input and replies within the relay's per-terminal budget", async () => {
+    const { view, localId, cli } = await setup();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    useFakeClock();
+    const sentAt: number[] = [];
+    socket.sendFrame.mockImplementation(() => {
+      sentAt.push(performance.now());
+      return true;
+    });
+    // A key and an automatic reply every 50 ms: two frames per drain.
+    const keys = 150;
+    for (let index = 0; index < keys; index += 1) {
+      act(() => {
+        view.result.current.sendInput(localId, "x", "user");
+        view.result.current.sendInput(localId, "\x1b[0n", "reply");
+      });
+      await advanceClock(50);
+    }
+    await drainBudget(sentAt);
+    for (const start of sentAt) {
+      const inWindow = sentAt.filter(
+        (at) => at >= start && at < start + TERMINAL_BROWSER_BINARY_WINDOW_MS,
+      );
+      expect(inWindow.length).toBeLessThanOrEqual(TERMINAL_BROWSER_BINARY_BUDGET);
+    }
+    // Nothing was lost: the frames that waited went out later, in order.
+    const typed = (await browserFrames(cli))
+      .flatMap((frame) => ("data" in frame ? [frame.data] : []))
+      .join("")
+      .replaceAll("\x1b[0n", "");
+    expect(typed).toBe("x".repeat(keys));
+  }, 60_000);
+
+  it("splits input that piled up into more frames than the budget across later steps", async () => {
+    const { view, localId, cli } = await setup();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    useFakeClock();
+    const sentAt: number[] = [];
+    socket.sendFrame.mockImplementation(() => {
+      sentAt.push(performance.now());
+      return true;
+    });
+    // Alternating keys and replies made at once: one frame per run, far past the budget.
+    const keys = 200;
+    act(() => {
+      for (let index = 0; index < keys; index += 1) {
+        view.result.current.sendInput(localId, "x", "user");
+        view.result.current.sendInput(localId, "\x1b[0n", "reply");
+      }
+    });
+    await drainBudget(sentAt);
+    for (const start of sentAt) {
+      const inWindow = sentAt.filter(
+        (at) => at >= start && at < start + TERMINAL_BROWSER_BINARY_WINDOW_MS,
+      );
+      expect(inWindow.length).toBeLessThanOrEqual(TERMINAL_BROWSER_BINARY_BUDGET);
+    }
+    const typed = (await browserFrames(cli))
+      .flatMap((frame) => ("data" in frame ? [frame.data] : []))
+      .join("")
+      .replaceAll("\x1b[0n", "");
+    expect(typed).toBe("x".repeat(keys));
+  }, 60_000);
 });

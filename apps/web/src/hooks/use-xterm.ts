@@ -133,6 +133,11 @@ export function useXterm(options: XtermOptions): {
   const pendingFitRef = useRef<number | null>(null);
   const fitDueRef = useRef<number | null>(null);
   const fitCountRef = useRef(0);
+  /**
+   * A writer's layout (a ResizeObserver tick) found PTY sizes still queued and left xterm's size
+   * to them: the last of them lays out again, so xterm ends at the size its box was measured at.
+   */
+  const layoutDueRef = useRef(false);
   const [container, setContainer] = useState<HTMLDivElement | null>(null);
 
   const resizeQuietly = useCallback((size: TerminalSize) => {
@@ -186,6 +191,8 @@ export function useXterm(options: XtermOptions): {
       // Output queued at an earlier size is still being parsed: report the fitted size (the PTY
       // may follow it now) but leave xterm's size to the queued events and the deferred fit.
       if (pendingFitRef.current !== null || queuedSizesRef.current > 0) {
+        // A takeover's fit lays out once its barrier passes; otherwise the last queued size does.
+        if (pendingFitRef.current === null) layoutDueRef.current = true;
         if (own && (wasUnavailable || !sameSize(own, ownSizeRef.current))) {
           ownSizeRef.current = own;
           handlersRef.current.onResize(own);
@@ -226,6 +233,7 @@ export function useXterm(options: XtermOptions): {
     queuedSizesRef.current = 0;
     pendingFitRef.current = null;
     fitDueRef.current = null;
+    layoutDueRef.current = false;
     sizeUnavailableRef.current = true;
     // A new xterm starts with no authorization: gestures made in the old one do not carry over.
     gate.clearReplay();
@@ -494,8 +502,11 @@ export function useXterm(options: XtermOptions): {
       // PTY (the session hook sends it only if it differs from the last one sent). Only a
       // measured box has a size to report, and it is the measured one: xterm may still show an
       // earlier size while queued output catches up.
-      const measured = measuredRef.current;
-      if (layout() && measured && !followRef.current) handlersRef.current.onResize(measured);
+      if (layout() && !followRef.current) {
+        // Read after layout(): it measured the box as it is now.
+        const measured = measuredRef.current;
+        if (measured) handlersRef.current.onResize(measured);
+      }
     } else {
       gate.disarm();
       inputGate.disarm();
@@ -534,6 +545,7 @@ export function useXterm(options: XtermOptions): {
     // Following again: a writer fit still waiting no longer applies.
     pendingFitRef.current = null;
     fitDueRef.current = null;
+    layoutDueRef.current = false;
     layout();
   }, [container, followCols, followRows, layout]);
 
@@ -572,10 +584,19 @@ export function useXterm(options: XtermOptions): {
         queuedSizesRef.current -= 1;
         if (followedWhenQueued || followRef.current) resizeQuietly(size);
         // The last queued size before a takeover fit whose barrier already passed runs that fit.
+        if (queuedSizesRef.current > 0) return;
         const due = fitDueRef.current;
-        if (queuedSizesRef.current === 0 && due !== null && due === pendingFitRef.current) {
+        if (due !== null && due === pendingFitRef.current) {
           pendingFitRef.current = null;
           fitDueRef.current = null;
+          layoutDueRef.current = false;
+          if (!followRef.current) layout();
+          return;
+        }
+        // A writer's layout these sizes held back runs now (a takeover's fit still waiting for
+        // its barrier runs then instead).
+        if (layoutDueRef.current && pendingFitRef.current === null) {
+          layoutDueRef.current = false;
           if (!followRef.current) layout();
         }
       });

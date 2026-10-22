@@ -30,3 +30,19 @@ export const TERMINAL_BROWSER_JSON_BUDGET = 16;
  * to a fixed bound per socket), so a viewer is never left attached.
  */
 export const TERMINAL_BROWSER_TEXT_PENDING_LIMIT = 20;
+
+/**
+ * Sealed (binary) frames the relay accepts from one browser socket for one
+ * terminal per sliding window. A frame past the limit is dropped, and the
+ * browser is told `input_dropped`.
+ */
+export const TERMINAL_BROWSER_BINARY_LIMIT = 300;
+export const TERMINAL_BROWSER_BINARY_WINDOW_MS = 10_000;
+
+/**
+ * What the browser sends per terminal per window (by its own clock): every
+ * sealed frame counts, whatever it carries (input, a reply, a resize, an
+ * image control). Lower than the relay's limit for the same reason as
+ * {@link TERMINAL_BROWSER_JSON_BUDGET}.
+ */
+export const TERMINAL_BROWSER_BINARY_BUDGET = 270;

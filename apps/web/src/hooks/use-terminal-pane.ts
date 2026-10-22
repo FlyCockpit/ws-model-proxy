@@ -88,13 +88,21 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): {
     // before a reattach, or decrypted after its session ended) is stale: the new attach's replay
     // already holds the screen, and none of it may copy.
     let latestAttach: number | null = null;
+    // Whether the pane has retired the latest attach (its output arrived marked `retired`).
+    let latestRetired = false;
     return handlersRef.current.subscribeOutput(
       localId,
       (event) => {
         if (latestAttach !== null && event.attach < latestAttach) return;
         if (latestAttach !== event.attach) {
           latestAttach = event.attach;
-          xtermRef.current.attached();
+          latestRetired = false;
+          // An ended attach's output never reopens copy-out.
+          if (!event.retired) xtermRef.current.attached();
+        }
+        if (event.retired && !latestRetired) {
+          latestRetired = true;
+          xtermRef.current.retire();
         }
         if (event.kind === "data") xtermRef.current.write(event.data, event.replay);
         else xtermRef.current.followResize({ cols: event.cols, rows: event.rows });

@@ -95,8 +95,9 @@ vi.mock("@xterm/xterm", () => ({
 vi.mock("@xterm/addon-fit", () => ({
   FitAddon: class {
     fit() {}
+    /** 10x25 px cells: the default 800x600 box is 80x24. */
     proposeDimensions() {
-      return { cols: 80, rows: 24 };
+      return { cols: Math.floor(box.width / 10), rows: Math.floor(box.height / 25) };
     }
   },
 }));
@@ -1110,5 +1111,99 @@ describe("useTerminalPane", () => {
     act(() => term.parse());
     container.dispatchEvent(new Event("pointerdown"));
     expect(gate.allowed(true)).toBe(true);
+  });
+
+  it("never reopens copy-out for output delivered as retired, even to a pane that subscribes late", () => {
+    const source = outputSource();
+    // The attach ended before the pane subscribed: its buffered output arrives marked retired.
+    source.emit({ ...data("late", false, 1), retired: true });
+    const container = document.createElement("div");
+    const { result } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow: null,
+        sendInput: () => {},
+        sendResize: () => {},
+        subscribeOutput: source.subscribeOutput,
+      }),
+    );
+    act(() => result.current.containerRef(container));
+    const term = xterm.instances[0];
+    if (!term?.gate) throw new Error("no xterm");
+    const gate = term.gate;
+    act(() => term.parse());
+    expect(term.log).toEqual(["late@80x24"]);
+    container.dispatchEvent(new Event("pointerdown"));
+    expect(gate.allowed(true)).toBe(false);
+  });
+
+  it("retires copy-out when live output of the shown attach starts arriving retired", () => {
+    const { term, source, container } = switchable();
+    const gate = term.gate;
+    if (!gate) throw new Error("no gate");
+    act(() => source.emit(data("live", false, 1)));
+    act(() => term.parse());
+    container.dispatchEvent(new Event("pointerdown"));
+    expect(gate.allowed(true)).toBe(true);
+    act(() => source.emit({ ...data("late", false, 1), retired: true }));
+    act(() => term.parse());
+    container.dispatchEvent(new Event("pointerdown"));
+    expect(gate.allowed(true)).toBe(false);
+  });
+});
+
+describe("useTerminalPane sizing", () => {
+  it("reports the size it measured on activation, not the one from before it was hidden", () => {
+    const source = outputSource();
+    const sendResize = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ active }: { active: boolean }) =>
+        useTerminalPane({
+          localId: "local_1",
+          active,
+          follow: null,
+          sendInput: () => {},
+          sendResize,
+          subscribeOutput: source.subscribeOutput,
+        }),
+      { initialProps: { active: true } },
+    );
+    act(() => result.current.containerRef(document.createElement("div")));
+    expect(sendResize).toHaveBeenLastCalledWith("local_1", 80, 24);
+    rerender({ active: false });
+    // The box changed while the tab was hidden.
+    box.width = 1200;
+    sendResize.mockClear();
+    rerender({ active: true });
+    expect(sendResize).toHaveBeenCalled();
+    expect(sendResize).toHaveBeenLastCalledWith("local_1", 120, 24);
+  });
+
+  it("fits a writer to its box once the PTY sizes queued ahead of a resize tick are parsed", () => {
+    const source = outputSource();
+    const { result } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow: null,
+        sendInput: () => {},
+        sendResize: () => {},
+        subscribeOutput: source.subscribeOutput,
+      }),
+    );
+    act(() => result.current.containerRef(document.createElement("div")));
+    const term = xterm.instances[0];
+    if (!term) throw new Error("no xterm");
+    act(() => term.parse());
+    // A PTY size is queued (not parsed yet) when the box grows: the tick leaves xterm's size to it.
+    act(() => source.emit({ kind: "size", cols: 80, rows: 24, attach: 1 }));
+    box.width = 1200;
+    act(() => {
+      for (const tick of resizeObservers) tick();
+    });
+    expect(term.log).toEqual([]);
+    act(() => term.parse());
+    expect(term.log).toEqual([{ resize: [120, 24] }]);
   });
 });

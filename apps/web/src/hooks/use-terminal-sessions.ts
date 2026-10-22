@@ -38,6 +38,7 @@ import {
   trustNewCliKey,
   trustRejectionReason,
 } from "@/lib/terminal-cli-identity";
+import { TerminalFrameBudget } from "@/lib/terminal-frame-budget";
 import {
   encodeTerminalImageControl,
   TERMINAL_IMAGE_PASTE,
@@ -79,6 +80,11 @@ const textEncoder = new TextEncoder();
  */
 const INPUT_FLUSH_INTERVAL_MS = 50;
 const INPUT_BATCH_MAX_CHARS = 16 * 1024;
+/**
+ * Frames one gateway step sends at most, far below the frame budget so a step always fits it.
+ * Input past it (many alternating runs of keys and replies) goes back to the batch for the next.
+ */
+const INPUT_FRAMES_PER_STEP = 16;
 const INPUT_DROPPED_NOTICE_MS = 5_000;
 /** Frames that arrive before the handshake finishes. Covers a full scrollback replay. */
 const EARLY_FRAME_QUEUE = 64;
@@ -236,6 +242,10 @@ type LiveSession = {
   batch: InputBatch;
   /** The size last sent on this attach (a new attach sends its size again). */
   lastSentSize: TerminalSize | null;
+  /** The tab's frame budget (shared by its attaches): a queue step waits for room in it. */
+  budget: TerminalFrameBudget;
+  /** Ends a queue step's wait for budget at once (the attach ended). */
+  wake: (() => void) | null;
   images: TerminalImageTransfer;
   localId: string;
   terminalId: string;
@@ -486,6 +496,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const endAttachmentRef = useRef<(terminalId: string, dropOutput?: boolean) => void>(
     () => undefined,
   );
+  /** Per tab: its sealed-frame budget (see TerminalFrameBudget). */
+  const frameBudgetsRef = useRef(new Map<string, TerminalFrameBudget>());
   /** The last attach number given out (see LiveSession.attach). */
   const attachCounterRef = useRef(0);
   const buffersRef = useRef(new Map<string, TerminalOutputEvent[]>());
@@ -513,6 +525,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
    * started on an earlier connection must not write session state.
    */
   const generationRef = useRef(0);
+  /**
+   * The hook unmounted: every attach is retired and every timer cleared. A continuation still in
+   * flight (a seal, a decryption) may finish, but it can neither send nor schedule anything.
+   */
+  const disposedRef = useRef(false);
   /** Tabs whose handshake waits for the browser identity to load. */
   const awaitingIdentityRef = useRef(new Set<string>());
   /**
@@ -522,6 +539,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const ticketsRef = useRef(new Map<string, string>());
   /** localId -> a command to type (no newline) once the tab's shell shows output. */
   const typedCommandsRef = useRef(new Map<string, string>());
+  /**
+   * Tabs whose shell has shown output. A command waits for that first, then for the output to go
+   * quiet: showing, measuring or resuming a tab only restarts the quiet wait of one already here.
+   */
+  const typedReadyRef = useRef(new Set<string>());
   /** localId -> the quiet-period timer before its command is typed. */
   const typedTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   /** `sendInput`, for the output path defined before it. */
@@ -629,6 +651,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       establishingRef.current.delete(localId);
       ticketsRef.current.delete(localId);
       typedCommandsRef.current.delete(localId);
+      typedReadyRef.current.delete(localId);
       clearTimer(typedTimersRef.current, localId);
       if (tab.terminalId) {
         // A close still owed for it goes on without the tab.
@@ -648,6 +671,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       resettersRef.current.delete(localId);
       retireRef.current.delete(localId);
       retiredThroughRef.current.delete(localId);
+      frameBudgetsRef.current.delete(localId);
       clearTimer(droppedNoticeRef.current, localId);
       clearTimer(resizeTimersRef.current, localId);
       clearTimer(reattachTimersRef.current, localId);
@@ -716,19 +740,28 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
    * The relay refused the close for good. Show it: on the tab that asked, or
    * on the tab still naming the terminal; with none, a fresh list brings the
    * still-running terminal back as a tab instead of leaving it unseen.
+   * Returns the tab whose attach End session ended: the terminal runs on, so it needs a fresh
+   * attach (the ended one stays ended, so nothing it queued can go out).
    */
   const failClose = useCallback(
-    (terminalId: string) => {
+    (terminalId: string): TerminalTab | null => {
       const intent = closesRef.current.get(terminalId);
-      if (!intent) return;
+      if (!intent) return null;
       if (intent.retry) clearTimeout(intent.retry);
       closesRef.current.delete(terminalId);
       const tab =
         (intent.localId
           ? tabsRef.current.find((item) => item.localId === intent.localId)
           : undefined) ?? tabByTerminal(terminalId);
-      if (tab) patchTabNow(tab.localId, { ending: "failed" });
-      else requestList();
+      if (!tab) {
+        requestList();
+        return null;
+      }
+      patchTabNow(tab.localId, { ending: "failed" });
+      const session = sessionsRef.current.get(terminalId);
+      if (!session?.ended) return null;
+      sessionsRef.current.delete(terminalId);
+      return tabsRef.current.find((item) => item.localId === tab.localId) ?? null;
     },
     [patchTabNow, requestList, tabByTerminal],
   );
@@ -750,7 +783,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
 
   const scheduleTypedCommand = useCallback(
     (localId: string) => {
-      if (!typedCommandsRef.current.has(localId)) return;
+      if (disposedRef.current) return;
+      if (!typedCommandsRef.current.has(localId) || !typedReadyRef.current.has(localId)) return;
       const timers = typedTimersRef.current;
       const previous = timers.get(localId);
       if (previous) clearTimeout(previous);
@@ -789,7 +823,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     (localId: string, event: TerminalOutputEvent) => {
       // A frame that was mid-decryption when its tab closed has nowhere to go.
       if (!tabsRef.current.some((tab) => tab.localId === localId)) return;
-      if (event.kind === "data") scheduleTypedCommand(localId);
+      if (event.kind === "data") {
+        typedReadyRef.current.add(localId);
+        scheduleTypedCommand(localId);
+      }
       const listener = listenersRef.current.get(localId);
       if (listener) {
         if (resetBeforeOutputRef.current.delete(localId)) resettersRef.current.get(localId)?.();
@@ -828,11 +865,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   );
 
   /**
-   * Number, seal and send frames from inside a queue step. Numbers are taken here, in queue
-   * order, so they reach the socket in increasing order. `stillAllowed` is checked after sealing,
-   * right before the send; refused (or the attach ended meanwhile), nothing is sent and the result
-   * is null. The CLI accepts any later sequence number, so a skipped one is never reused.
-   * Otherwise each frame's socket result (a send that throws counts as not sent).
+   * Number, seal and send frames from inside a queue step. The step first waits until the frames
+   * fit the tab's budget (holding the queue, so nothing overtakes it). Numbers are taken here, in
+   * queue order, so they reach the socket in increasing order. `stillAllowed` is checked after
+   * sealing, right before the send; refused (or the attach ended meanwhile), nothing is sent and
+   * the result is null. The CLI accepts any later sequence number, so a skipped one is never
+   * reused. Otherwise each frame's socket result (a send that throws counts as not sent).
    */
   const sealAndSend = useCallback(
     async (
@@ -840,6 +878,22 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       plaintexts: readonly Uint8Array[],
       stillAllowed: () => boolean,
     ): Promise<boolean[] | null> => {
+      for (;;) {
+        if (session.ended) return null;
+        const delay = session.budget.waitFor(plaintexts.length, performance.now());
+        if (delay === 0) break;
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            session.wake = null;
+            resolve();
+          }, delay);
+          session.wake = () => {
+            clearTimeout(timer);
+            session.wake = null;
+            resolve();
+          };
+        });
+      }
       const numbered = plaintexts.map((plaintext) => {
         session.sendSeq += 1n;
         return { plaintext, seq: session.sendSeq };
@@ -860,11 +914,14 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (session.ended || sessionsRef.current.get(session.terminalId) !== session) return null;
       if (!stillAllowed()) return null;
       return frames.map((frame) => {
+        let sent = false;
         try {
-          return frameRef.current(frame);
+          sent = frameRef.current(frame);
         } catch {
-          return false;
+          sent = false;
         }
+        if (sent) session.budget.record(performance.now());
+        return sent;
       });
     },
     [],
@@ -915,6 +972,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         if (
           item.origin === "typed" &&
           item.text !== undefined &&
+          !disposedRef.current &&
           tab &&
           tab.ending !== "pending" &&
           !typedCommandsRef.current.has(localId)
@@ -949,6 +1007,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       batch.size = 0;
       settleUnsent(localId, unsent);
       session.images.abort();
+      session.wake?.();
       clearTimer(resizeTimersRef.current, localId);
       const through = retiredThroughRef.current.get(localId) ?? 0;
       if (session.attach > through) retiredThroughRef.current.set(localId, session.attach);
@@ -1000,7 +1059,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           localId,
           held.filter((item) => item.image),
         );
-        batch.returned.push(...held.filter((item) => !item.image && item.origin !== "reply"));
+        // Ahead of anything already back in the batch: it was made after these.
+        batch.returned.unshift(...held.filter((item) => !item.image && item.origin !== "reply"));
       };
       if (selectingRef.current === localId) {
         hold(items);
@@ -1052,6 +1112,13 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         run.push(item);
       }
       endRun();
+      // Past the step's frame cap, input waits at the front of the batch for the next step.
+      const later = frames.splice(INPUT_FRAMES_PER_STEP).flatMap((frame) => frame.items);
+      if (later.length > 0) {
+        batch.returned.unshift(...later);
+        batch.timer ??= setTimeout(() => flushInputRef.current(localId), 0);
+      }
+      const stepItems = frames.flatMap((frame) => frame.items);
       let results: boolean[] | null;
       try {
         results = await sealAndSend(
@@ -1070,15 +1137,15 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           },
         );
       } catch {
-        settleUnsent(localId, sending);
+        settleUnsent(localId, stepItems);
         return;
       }
       if (!results) {
         if (session.ended) {
-          settleUnsent(localId, sending);
+          settleUnsent(localId, stepItems);
           return;
         }
-        hold(sending);
+        hold(stepItems);
         // Back through the gateway, which decides again as the rules now say (Select text
         // resumes held input itself when it ends).
         if (selectingRef.current !== localId && batch.returned.length > 0)
@@ -1296,6 +1363,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       attachCounterRef.current += 1;
       // A previous attach of this terminal still registered ends here, through the one path.
       endAttachment(message.terminalId);
+      const budget = frameBudgetsRef.current.get(pending.localId) ?? new TerminalFrameBudget();
+      frameBudgetsRef.current.set(pending.localId, budget);
       const session: LiveSession = {
         attach: attachCounterRef.current,
         ended: false,
@@ -1309,6 +1378,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           timer: null,
         },
         lastSentSize: null,
+        budget,
+        wake: null,
         images: new TerminalImageTransfer(),
         localId: pending.localId,
         terminalId: message.terminalId,
@@ -1885,7 +1956,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           // Refused unread: it runs on; send the close again after a window.
           else if (message.code === "rate_limited") {
             scheduleCloseRetry(closesRef.current, sendRef, terminalId);
-          } else failClose(terminalId);
+          } else {
+            const recovering = failClose(terminalId);
+            if (recovering) retryTab(recovering);
+          }
           return;
         }
         // A refused `open`: it made no terminal, so no `opening` follows.
@@ -1970,6 +2044,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       requestClose,
       requestList,
       retireAfterDrain,
+      retryTab,
       sendClose,
       setView,
       tabByTerminal,
@@ -2291,7 +2366,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (!readyRef.current) return;
       // The relay does not push CLI changes. A CLI that came online after the
       // last list is missing from it, and its handshake would fail as offline.
-      void refreshClis().then(() => startOpen(input));
+      void refreshClis().then(() => {
+        if (!disposedRef.current) startOpen(input);
+      });
     },
     [refreshClis, startOpen],
   );
@@ -2499,12 +2576,33 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     [flushInput, sendOnQueue],
   );
 
-  useEffect(
-    () => () => {
-      for (const session of sessionsRef.current.values()) session.images.abort();
-    },
-    [],
-  );
+  // Unmounting ends every attach through the one path (input settled, uploads aborted), then
+  // clears every timer, so nothing is retried or sent for a page that is gone.
+  useEffect(() => {
+    disposedRef.current = false;
+    return () => {
+      disposedRef.current = true;
+      // Handshakes and other continuations of this connection see it as gone.
+      generationRef.current += 1;
+      for (const resolve of listWaitersRef.current.splice(0)) resolve();
+      for (const session of sessionsRef.current.values()) retireAttachment(session, true);
+      sessionsRef.current.clear();
+      typedCommandsRef.current.clear();
+      for (const timers of [
+        typedTimersRef.current,
+        resizeTimersRef.current,
+        reattachTimersRef.current,
+        droppedNoticeRef.current,
+      ]) {
+        for (const timer of timers.values()) clearTimeout(timer);
+        timers.clear();
+      }
+      for (const intent of closesRef.current.values()) {
+        if (intent.retry) clearTimeout(intent.retry);
+        intent.retry = null;
+      }
+    };
+  }, [retireAttachment]);
 
   const trustNewKey = useCallback(
     async (cliDeviceId: string, expected: ChangedCliTrust): Promise<boolean> => {
