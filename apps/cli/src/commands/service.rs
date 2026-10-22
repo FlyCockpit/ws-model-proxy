@@ -11,7 +11,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
@@ -410,13 +410,7 @@ pub fn install(to_stderr: bool) -> Result<()> {
 
     let domain = launchd_domain()?;
     // Upgrade/reinstall: boot out any previous registration, then bootstrap.
-    let _ = Command::new("launchctl")
-        .args(["bootout", &domain, &file.display().to_string()])
-        .status();
-    // Older macOS used unload; bootout is preferred on modern versions.
-    let _ = Command::new("launchctl")
-        .args(["unload", &file.display().to_string()])
-        .status();
+    bootout_if_loaded(&domain, &file);
     run_command(
         "launchctl",
         &["bootstrap", &domain, &file.display().to_string()],
@@ -458,12 +452,7 @@ fn uninstall() -> Result<()> {
 fn uninstall() -> Result<()> {
     let file = service_file()?;
     let domain = launchd_domain()?;
-    let _ = Command::new("launchctl")
-        .args(["bootout", &domain, &file.display().to_string()])
-        .status();
-    let _ = Command::new("launchctl")
-        .args(["unload", &file.display().to_string()])
-        .status();
+    bootout_if_loaded(&domain, &file);
     if file.exists() {
         fs::remove_file(&file).with_context(|| format!("removing `{}`", file.display()))?;
     }
@@ -597,11 +586,37 @@ fn print_install_notes(pinned: &[(&str, String)], to_stderr: bool) -> Result<()>
         "node secrets are read from `secrets.env` (`wsmp secret`); the service needs no environment file",
     )?;
     #[cfg(target_os = "linux")]
-    say(
-        to_stderr,
-        "tip: for a user service that survives logout, run `loginctl enable-linger \"$USER\"`",
-    )?;
+    match linger_on() {
+        Some(true) => {}
+        Some(false) => say(
+            to_stderr,
+            "warning: lingering is off, so this node cannot start runtimes and the service \
+             stops when you log out; enable it once with `loginctl enable-linger \"$USER\"`",
+        )?,
+        None => say(
+            to_stderr,
+            "tip: for a user service that survives logout and can start runtimes, run \
+             `loginctl enable-linger \"$USER\"`",
+        )?,
+    }
     Ok(())
+}
+
+/// Whether logind keeps this user's manager running without a session;
+/// `None` when `loginctl` cannot say.
+#[cfg(target_os = "linux")]
+fn linger_on() -> Option<bool> {
+    let uid = nix::unistd::Uid::effective().as_raw().to_string();
+    let output = Command::new("loginctl")
+        .args(["show-user", &uid, "-p", "Linger"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Some(crate::runtimes::executor::native::linger_enabled(&text))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -691,6 +706,26 @@ fn run_command(program: &str, args: &[&str]) -> Result<()> {
         Ok(())
     } else {
         anyhow::bail!("`{program}` failed with {status}")
+    }
+}
+
+/// Boot out the agent when launchd has it loaded. Best effort and quiet:
+/// launchctl prints alarming errors (`Boot-out failed: 5`) for an agent
+/// that is not loaded, which is every first install.
+#[cfg(target_os = "macos")]
+fn bootout_if_loaded(domain: &str, file: &Path) {
+    let loaded = Command::new("launchctl")
+        .args(["print", &format!("{domain}/{MACOS_LABEL}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if loaded {
+        let _ = Command::new("launchctl")
+            .args(["bootout", domain, &file.display().to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 

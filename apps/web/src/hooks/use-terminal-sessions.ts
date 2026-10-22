@@ -145,9 +145,12 @@ export type TerminalTab = {
   ending: "pending" | "failed" | null;
 };
 
-/** Output for a pane, in CLI order: bytes, and PTY size changes. */
+/**
+ * Output for a pane, in CLI order: bytes, and PTY size changes. `replay` marks scrollback the CLI
+ * sent this viewer alone on join (unicast data); live output is broadcast.
+ */
 export type TerminalOutputEvent =
-  | { kind: "data"; data: Uint8Array }
+  | { kind: "data"; data: Uint8Array; replay: boolean }
   | { kind: "size"; cols: number; rows: number };
 
 type PendingHandshake = {
@@ -1612,9 +1615,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   }, [noteListRequest, retryTab]);
 
   const applyPlaintext = useCallback(
-    (session: LiveSession, decoded: TerminalPlaintext) => {
+    (session: LiveSession, decoded: TerminalPlaintext, replay: boolean) => {
       if (decoded.kind === "data")
-        emitOutput(session.localId, { kind: "data", data: decoded.data });
+        emitOutput(session.localId, { kind: "data", data: decoded.data, replay });
       else applyPtySize(session.localId, decoded.cols, decoded.rows);
     },
     [applyPtySize, emitOutput],
@@ -1644,7 +1647,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       const decoded = decodeTerminalPlaintextV2(plaintext);
       // Output keys and image messages only ever arrive unicast.
       if (decoded.kind !== "data" && decoded.kind !== "resize") return;
-      applyPlaintext(session, decoded);
+      applyPlaintext(session, decoded, false);
     },
     [applyPlaintext],
   );
@@ -1688,7 +1691,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         return;
       }
       if (decoded.kind !== "outputKey") {
-        applyPlaintext(session, decoded);
+        // Unicast data is only ever the join's scrollback replay.
+        applyPlaintext(session, decoded, true);
         return;
       }
       // A new key drops the old epoch. A stale or repeated key is ignored.

@@ -65,6 +65,9 @@ export function TerminalPane(props: TerminalPaneProps) {
         case "busy":
           toast.error(t("imagePaste.busy"));
           break;
+        case "selecting":
+          toast.error(t("imagePaste.selecting"));
+          break;
         case "limit":
           toast.error(t("imagePaste.limit"));
           break;

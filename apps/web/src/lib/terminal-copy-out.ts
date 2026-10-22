@@ -58,6 +58,8 @@ export function clipboardTypesIncludeImage(types: readonly string[]): boolean {
  */
 export class CopyOutGate {
   lastInputAtMs = 0;
+  /** Replay chunks written to xterm and not yet parsed. Copy-out stays closed while any is. */
+  private replayChunks = 0;
 
   armFromUserGesture(nowMs = Date.now()): void {
     this.lastInputAtMs = nowMs;
@@ -68,10 +70,28 @@ export class CopyOutGate {
     this.lastInputAtMs = 0;
   }
 
+  /**
+   * A scrollback replay chunk was written; `endReplayChunk` runs once xterm has parsed it. A
+   * gesture during the replay must not let an old copy in it through.
+   */
+  beginReplayChunk(): void {
+    this.replayChunks += 1;
+  }
+
+  endReplayChunk(): void {
+    this.replayChunks = Math.max(0, this.replayChunks - 1);
+  }
+
+  /** A new xterm has none of the old one's replay queued. */
+  clearReplay(): void {
+    this.replayChunks = 0;
+  }
+
   /** Remote output, including cursor-position replies, must not arm copy-out. */
   noteRemoteData(_data: string): void {}
 
   allowed(hasFocus: boolean, nowMs = Date.now()): boolean {
+    if (this.replayChunks > 0) return false;
     return terminalCopyOutAllowed(hasFocus, this.lastInputAtMs, nowMs);
   }
 }

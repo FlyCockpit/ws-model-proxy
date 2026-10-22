@@ -92,19 +92,19 @@ function TerminalsPage() {
   // Maximize applies only while there is a terminal to show.
   const maximized =
     useUiPreferences((prefs) => prefs.terminalMaximized) && sessions.tabs.length > 0;
-  if (maximized)
-    return (
-      <div className={cn("flex min-w-0 flex-col", MAXIMIZED_PAGE_HEIGHT)}>
-        <TerminalWorkspace sessions={sessions} slugOf={slugOf} maximized />
-      </div>
-    );
+  // One tree for both layouts: the workspace keeps its element position, so toggling maximize
+  // never remounts the xterms (a new xterm starts empty; output already shown is not replayed).
   return (
-    <div className="flex min-w-0 flex-col gap-6">
-      <PageHeading page="terminals" />
-      <TerminalWorkspace sessions={sessions} slugOf={slugOf} maximized={false} />
-      <WaitingSteps sessions={sessions} ready={ready} slugOf={slugOf} />
-      <QueuedCommands ready={ready} openTerminal={sessions.openTicket} slugOf={slugOf} />
-      <TerminalNodes ready={ready} openTerminal={sessions.openTicket} />
+    <div className={cn("flex min-w-0 flex-col", maximized ? MAXIMIZED_PAGE_HEIGHT : "gap-6")}>
+      {maximized ? null : <PageHeading page="terminals" />}
+      <TerminalWorkspace sessions={sessions} slugOf={slugOf} maximized={maximized} />
+      {maximized ? null : (
+        <>
+          <WaitingSteps sessions={sessions} ready={ready} slugOf={slugOf} />
+          <QueuedCommands ready={ready} openTerminal={sessions.openTicket} slugOf={slugOf} />
+          <TerminalNodes ready={ready} openTerminal={sessions.openTicket} />
+        </>
+      )}
     </div>
   );
 }

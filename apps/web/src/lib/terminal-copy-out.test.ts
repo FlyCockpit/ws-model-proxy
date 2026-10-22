@@ -70,6 +70,21 @@ describe("terminal copy-out", () => {
     }
   });
 
+  it("stays closed while replay chunks are unparsed, whatever the gestures", () => {
+    const gate = new CopyOutGate();
+    gate.beginReplayChunk();
+    gate.beginReplayChunk();
+    gate.armFromUserGesture();
+    expect(gate.allowed(true)).toBe(false);
+    gate.endReplayChunk();
+    expect(gate.allowed(true)).toBe(false);
+    gate.endReplayChunk();
+    expect(gate.allowed(true)).toBe(true);
+    gate.beginReplayChunk();
+    gate.clearReplay();
+    expect(gate.allowed(true)).toBe(true);
+  });
+
   it("decodes UTF-8 text with or without padding", () => {
     expect(decodeOsc52Text(`c;${encode("héllo ✓")}`)).toEqual({ kind: "text", text: "héllo ✓" });
     expect(decodeOsc52Text(`;${encode("ab").replace(/=+$/, "")}`)).toEqual({

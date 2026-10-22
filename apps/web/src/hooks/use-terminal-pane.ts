@@ -41,6 +41,7 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): {
   const xterm = useXterm({
     follow: handlers.follow,
     shiftEnter: handlers.shiftEnter ?? DEFAULT_TERMINAL_SHIFT_ENTER_MODE,
+    selecting: handlers.selecting ?? false,
     onCopy: (copy) => handlersRef.current.onCopy?.(copy),
     onData: (data) => handlersRef.current.sendInput(handlersRef.current.localId, data),
     onImage: (file) => {
@@ -68,7 +69,7 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): {
     return handlersRef.current.subscribeOutput(
       localId,
       (event) => {
-        if (event.kind === "data") xtermRef.current.write(event.data);
+        if (event.kind === "data") xtermRef.current.write(event.data, event.replay);
         else xtermRef.current.followResize({ cols: event.cols, rows: event.rows });
       },
       () => xtermRef.current.reset(),

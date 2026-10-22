@@ -40,6 +40,8 @@ type XtermOptions = XtermHandlers & {
   follow: TerminalSize | null;
   /** What Shift+Enter and Ctrl+Enter send. */
   shiftEnter: TerminalShiftEnterMode;
+  /** Select text mode: input is paused, including image pastes that finish uploading meanwhile. */
+  selecting: boolean;
 };
 
 export function useXterm(options: XtermOptions): {
@@ -50,7 +52,8 @@ export function useXterm(options: XtermOptions): {
    * new value means a new xterm instance.
    */
   host: HTMLDivElement | null;
-  write: (data: Uint8Array) => void;
+  /** Write output. `replay` marks scrollback replay, whose OSC 52 copies are never honored. */
+  write: (data: Uint8Array, replay?: boolean) => void;
   reset: () => void;
   focus: () => void;
   /**
@@ -64,6 +67,7 @@ export function useXterm(options: XtermOptions): {
   const handlersRef = useLatestRef<XtermHandlers>(options);
   const followRef = useLatestRef(options.follow);
   const shiftEnterRef = useLatestRef(options.shiftEnter);
+  const selectingRef = useLatestRef(options.selecting);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const [gate] = useState(() => new CopyOutGate());
@@ -136,6 +140,7 @@ export function useXterm(options: XtermOptions): {
     termRef.current = term;
     fitRef.current = fit;
     queuedSizesRef.current = 0;
+    gate.clearReplay();
     type ImagePaste = {
       attachment: TerminalImageAttachment;
       sent: Promise<boolean> | null;
@@ -201,6 +206,9 @@ export function useXterm(options: XtermOptions): {
           let forwarded = false;
           try {
             if (disposed || termRef.current !== term) return;
+            // Select text started while this uploaded: `inert` pauses only new input, so drop
+            // the paste here rather than type a path behind the frozen copy.
+            if (selectingRef.current) throw new Error("selecting");
             // The transfer can outlive the user-input gate. Arm it again so a
             // follower's deliberate path paste can claim the writer normally.
             armInput();
@@ -222,6 +230,7 @@ export function useXterm(options: XtermOptions): {
         if (
           pastedImages === 0 &&
           fallbackText.length > 0 &&
+          !selectingRef.current &&
           error instanceof Error &&
           (error.message === "update" || error.message === "unavailable")
         ) {
@@ -311,7 +320,7 @@ export function useXterm(options: XtermOptions): {
       if (termRef.current === term) termRef.current = null;
       if (fitRef.current === fit) fitRef.current = null;
     };
-  }, [container, followRef, gate, handlersRef, inputGate, layout, shiftEnterRef]);
+  }, [container, followRef, gate, handlersRef, inputGate, layout, selectingRef, shiftEnterRef]);
 
   const followCols = options.follow?.cols ?? null;
   const followRows = options.follow?.rows ?? null;
@@ -322,9 +331,23 @@ export function useXterm(options: XtermOptions): {
     layout();
   }, [container, followCols, followRows, layout]);
 
-  const write = useCallback((data: Uint8Array) => {
-    termRef.current?.write(data);
-  }, []);
+  const write = useCallback(
+    (data: Uint8Array, replay = false) => {
+      const term = termRef.current;
+      if (!term) return;
+      if (!replay) {
+        term.write(data);
+        return;
+      }
+      // xterm parses writes in order and calls back right after this chunk, so the gate is
+      // closed for exactly the replayed bytes.
+      gate.beginReplayChunk();
+      term.write(data, () => {
+        if (termRef.current === term) gate.endReplayChunk();
+      });
+    },
+    [gate],
+  );
   const reset = useCallback(() => {
     // A reset comes before a scrollback replay: an old copy in it must not fire again.
     gate.disarm();

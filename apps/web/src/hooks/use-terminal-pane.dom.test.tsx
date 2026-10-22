@@ -4,6 +4,7 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { TerminalOutputEvent } from "@/hooks/use-terminal-sessions";
+import type { CopyOutGate } from "@/lib/terminal-copy-out";
 import type { TerminalImageAttachment } from "@/lib/terminal-images";
 
 type Written = string | { resize: [number, number] } | "reset";
@@ -16,6 +17,7 @@ type FakeTerminal = {
   pasted: string[];
   emit: ((data: string) => void) | null;
   keyHandler: ((event: KeyboardEvent) => boolean) | null;
+  gate: CopyOutGate | null;
 };
 
 const xterm = vi.hoisted(() => ({ instances: [] as FakeTerminal[] }));
@@ -28,6 +30,9 @@ vi.mock("@xterm/xterm", () => ({
     textarea = document.createElement("textarea");
     pasted: string[] = [];
     emit: ((data: string) => void) | null = null;
+    gate: CopyOutGate | null = null;
+    /** Empty scrollback, for the Select text snapshot. */
+    buffer = { active: { length: 0, getLine: () => undefined } };
     log: Written[] = [];
     focused = 0;
     /** Writes the parser has not reached yet, as xterm queues them. */
@@ -94,8 +99,9 @@ vi.mock("@/lib/terminal-copy-out", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/terminal-copy-out")>();
   return {
     ...actual,
-    wireTerminalCopyOut: (term: FakeTerminal, _gate: unknown, emit: (data: string) => void) => {
+    wireTerminalCopyOut: (term: FakeTerminal, gate: CopyOutGate, emit: (data: string) => void) => {
       term.emit = emit;
+      term.gate = gate;
       return () => {
         term.emit = null;
       };
@@ -138,9 +144,10 @@ function outputSource() {
   return { subscribeOutput, emit };
 }
 
-const data = (text: string): TerminalOutputEvent => ({
+const data = (text: string, replay = false): TerminalOutputEvent => ({
   kind: "data",
   data: new TextEncoder().encode(text),
+  replay,
 });
 
 const attachment = (text: string): TerminalImageAttachment => ({
@@ -150,6 +157,83 @@ const attachment = (text: string): TerminalImageAttachment => ({
 });
 
 describe("useTerminalPane", () => {
+  it("keeps copy-out closed until replayed output is parsed, even after a gesture", () => {
+    const source = outputSource();
+    const container = document.createElement("div");
+    const { result } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow: null,
+        sendInput: () => undefined,
+        sendResize: () => undefined,
+        subscribeOutput: source.subscribeOutput,
+      }),
+    );
+    act(() => result.current.containerRef(container));
+    const term = xterm.instances[0];
+    const gate = term?.gate;
+    if (!term || !gate) throw new Error("no terminal");
+    act(() => source.emit(data("old screen with an OSC 52 copy", true)));
+    container.dispatchEvent(new Event("pointerdown"));
+    expect(gate.allowed(true)).toBe(false);
+    act(() => term.parse());
+    expect(gate.allowed(true)).toBe(true);
+    // Live output never closes the gate.
+    act(() => source.emit(data("live")));
+    expect(gate.allowed(true)).toBe(true);
+  });
+
+  it("drops an image paste that finishes uploading during Select text", async () => {
+    const source = outputSource();
+    const onImageError = vi.fn();
+    const pasteImage = vi.fn(async () => true);
+    let saved: ((value: TerminalImageAttachment) => void) | undefined;
+    const { result, rerender } = renderHook(
+      ({ selecting }: { selecting: boolean }) =>
+        useTerminalPane({
+          localId: "local_1",
+          active: true,
+          follow: null,
+          selecting,
+          sendInput: () => undefined,
+          pasteImage,
+          sendResize: () => undefined,
+          subscribeOutput: source.subscribeOutput,
+          onImage: () =>
+            new Promise<TerminalImageAttachment>((resolve) => {
+              saved = resolve;
+            }),
+          onImageError,
+        }),
+      { initialProps: { selecting: false } },
+    );
+    act(() => result.current.containerRef(document.createElement("div")));
+    const term = xterm.instances[0];
+    if (!term) throw new Error("no terminal");
+    const file = new File(["png"], "screenshot.png", { type: "image/png" });
+    const event = new Event("paste", { cancelable: true });
+    Object.defineProperty(event, "clipboardData", {
+      value: {
+        types: ["Files", "text/plain"],
+        items: [{ kind: "file", type: "image/png", getAsFile: () => file }],
+        getData: () => "accompanying text",
+      },
+    });
+    act(() => {
+      term.textarea.dispatchEvent(event);
+    });
+    rerender({ selecting: true });
+    const offered = attachment("/tmp/wsmp-terminal-example/image.png ");
+    await act(async () => {
+      saved?.(offered);
+    });
+    expect(term.pasted).toEqual([]);
+    expect(pasteImage).not.toHaveBeenCalled();
+    expect(offered.cancel).toHaveBeenCalled();
+    expect(onImageError).toHaveBeenCalledWith(expect.objectContaining({ message: "selecting" }));
+  });
+
   it.each(["text/html", "text/rtf", "application/rtf"])(
     "pastes plain text from a %s clipboard without uploading its rendered image",
     (richType) => {
