@@ -265,6 +265,8 @@ export function useMobileKeyboard(): boolean {
 
     const visualViewport = window.visualViewport;
     visualViewport?.addEventListener("resize", evaluate);
+    // The inset also reads offsetTop, which changes on visual viewport scroll alone.
+    visualViewport?.addEventListener("scroll", evaluate);
     window.addEventListener("resize", evaluate);
     window.addEventListener("orientationchange", evaluate);
     document.addEventListener("focusin", evaluate);
@@ -274,6 +276,7 @@ export function useMobileKeyboard(): boolean {
 
     return () => {
       visualViewport?.removeEventListener("resize", evaluate);
+      visualViewport?.removeEventListener("scroll", evaluate);
       window.removeEventListener("resize", evaluate);
       window.removeEventListener("orientationchange", evaluate);
       document.removeEventListener("focusin", evaluate);

@@ -63,6 +63,49 @@ describe("replay-aware writes with the real xterm parser", () => {
     term.dispose();
   });
 
+  it.each([
+    ["after ESC", "\x1b", `]52;c;${encode("secret")}\x07`],
+    ["inside the OSC number", "\x1b]5", `2;c;${encode("secret")}\x07`],
+    ["after the OSC number", "\x1b]52", `;c;${encode("secret")}\x07`],
+    ["inside the payload", `\x1b]52;c;${encode("sec")}`, `${encode("ret")}\x07`],
+    ["with leading zeros", "\x1b]0052;c;", `${encode("secret")}\x07`],
+    ["after a UTF-8 C1 lead byte", "\xc2", `\x9d52;c;${encode("secret")}\x07`],
+    ["after a C1 OSC", "\xc2\x9d52", `;c;${encode("secret")}\x07`],
+  ])("blocks a copy cut %s at the end of the replay", async (_cut, replayed, live) => {
+    const { term, gate, copies, writer } = setup();
+    const latin1 = (text: string) => Uint8Array.from(text, (char) => char.charCodeAt(0));
+    writer.write(latin1(`old output${replayed}`), true);
+    await parsed(term);
+    gate.armFromUserGesture();
+    writer.write(latin1(live));
+    await parsed(term);
+    expect(copies).toEqual([]);
+    term.dispose();
+  });
+
+  it("keeps a color sequence split across the replay and live output", async () => {
+    const { term, writer } = setup();
+    writer.write(bytes("\x1b[31"), true);
+    await parsed(term);
+    writer.write(bytes("mred"));
+    await parsed(term);
+    const line = term.buffer.active.getLine(0);
+    expect(line?.translateToString(true)).toBe("red");
+    expect(line?.getCell(0)?.isFgPalette()).toBe(true);
+    expect(line?.getCell(0)?.getFgColor()).toBe(1);
+    term.dispose();
+  });
+
+  it("keeps an OSC 8 link split across the replay and live output", async () => {
+    const { term, writer } = setup();
+    writer.write(bytes("\x1b]8;;https://exa"), true);
+    await parsed(term);
+    writer.write(bytes("mple.com\x07link\x1b]8;;\x07"));
+    await parsed(term);
+    expect(term.buffer.active.getLine(0)?.translateToString(true)).toBe("link");
+    term.dispose();
+  });
+
   it("lets live output complete a copy split across live writes", async () => {
     const { term, gate, copies, writer } = setup();
     gate.armFromUserGesture();

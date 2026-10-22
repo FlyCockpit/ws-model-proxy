@@ -131,25 +131,121 @@ export function wireTerminalCopyOut(
   };
 }
 
-/** CAN: aborts any escape sequence in progress (VT parsers, xterm included, return to ground). */
-const ABORT_SEQUENCE = "\x18";
+/**
+ * CAN: aborts any escape sequence in progress (VT parsers, xterm included, return to ground).
+ * Written as bytes, not a string: xterm decodes byte writes with their own UTF-8 decoder, and
+ * only a byte write breaks a C1 lead byte (0xC2) the replay left in it.
+ */
+const ABORT_SEQUENCE = Uint8Array.of(0x18);
+
+const ESC = 0x1b;
+const BEL = 0x07;
+const CAN = 0x18;
+const SUB = 0x1a;
+const OSC_INTRODUCER = 0x5d; // "]" after ESC
+const C1_OSC = 0x9d; // U+009D, UTF-8 C2 9D
+const UTF8_C1_LEAD = 0xc2;
+const SEMICOLON = 0x3b;
+const ZERO = 0x30;
+const NINE = 0x39;
+
+/**
+ * Follows replayed bytes far enough to tell whether the replay ends where live output could
+ * still complete an OSC 52 copy: inside an OSC whose number is, or may still become, 52, or
+ * right after an ESC or a UTF-8 C1 lead byte that live output could turn into one. It errs
+ * towards "maybe": a false maybe only aborts one sequence split exactly at the replay's end.
+ * Every other sequence (colors, OSC 8 links, titles) passes the boundary untouched.
+ */
+export class ReplayCopyTracker {
+  private state: "ground" | "escape" | "osc" = "ground";
+  /** The OSC number's digits so far, without leading zeros, while it can still be 52. */
+  private oscNumber: string | null = null;
+  /** The number ended (at ";" or any non-digit): only 52 is a copy. */
+  private oscNumberDone = false;
+  private lastByte = 0;
+
+  feed(bytes: Uint8Array): void {
+    for (const byte of bytes) {
+      this.step(byte);
+      this.lastByte = byte;
+    }
+  }
+
+  /** Could live output that follows complete an OSC 52 copy begun in the bytes fed so far? */
+  copyMayBeOpen(): boolean {
+    if (this.state === "escape" || this.lastByte === UTF8_C1_LEAD) return true;
+    if (this.state !== "osc") return false;
+    if (this.oscNumberDone) return this.oscNumber === "52";
+    return this.oscNumber !== null;
+  }
+
+  clear(): void {
+    this.state = "ground";
+    this.oscNumber = null;
+    this.oscNumberDone = false;
+    this.lastByte = 0;
+  }
+
+  private startOsc(): void {
+    this.state = "osc";
+    this.oscNumber = "";
+    this.oscNumberDone = false;
+  }
+
+  private step(byte: number): void {
+    if (byte === CAN || byte === SUB) {
+      this.state = "ground";
+      return;
+    }
+    if (byte === ESC) {
+      // ESC ends any sequence, an OSC included, and may start the next one.
+      this.state = "escape";
+      return;
+    }
+    if (this.state === "escape") {
+      if (byte === OSC_INTRODUCER) this.startOsc();
+      else this.state = "ground";
+      return;
+    }
+    if (this.state === "osc") {
+      if (byte === BEL) {
+        this.state = "ground";
+        return;
+      }
+      if (this.oscNumberDone || this.oscNumber === null) return;
+      if (byte >= ZERO && byte <= NINE) {
+        const digits = `${this.oscNumber}${String.fromCharCode(byte)}`.replace(/^0+/, "");
+        this.oscNumber = "52".startsWith(digits) ? digits : null;
+        return;
+      }
+      // ";" ends the number; any other byte makes the OSC one xterm ignores.
+      this.oscNumberDone = true;
+      if (byte !== SEMICOLON) this.oscNumber = null;
+      return;
+    }
+    if (byte === C1_OSC && this.lastByte === UTF8_C1_LEAD) this.startOsc();
+  }
+}
 
 type ReplayWriteTerminal = {
   write: (data: string | Uint8Array, callback?: () => void) => void;
 };
 
 /**
- * Writes output to xterm with replay protection. Replayed scrollback keeps copy-out closed until
- * xterm has parsed it; the first live write after a replay first aborts any escape sequence the
- * replay left open, so live output cannot complete an OSC 52 copy that started in the replay.
+ * Writes output to xterm with replay protection: an OSC 52 copy is honored only when every byte
+ * of it arrived as live output. Replayed scrollback keeps copy-out closed until xterm has parsed
+ * it, which covers copies that end inside the replay. A copy the replay leaves open is aborted
+ * (CAN) before the first live write, so live output cannot complete it.
  */
 export function createReplayAwareWriter(term: ReplayWriteTerminal, gate: CopyOutGate) {
+  const tracker = new ReplayCopyTracker();
   let afterReplay = false;
   let disposed = false;
   return {
     write(data: Uint8Array, replay = false): void {
       if (replay) {
         afterReplay = true;
+        tracker.feed(data);
         // xterm parses writes in order and calls back right after this chunk, so the gate is
         // closed for exactly the replayed bytes.
         gate.beginReplayChunk();
@@ -160,13 +256,15 @@ export function createReplayAwareWriter(term: ReplayWriteTerminal, gate: CopyOut
       }
       if (afterReplay) {
         afterReplay = false;
-        term.write(ABORT_SEQUENCE);
+        if (tracker.copyMayBeOpen()) term.write(ABORT_SEQUENCE);
+        tracker.clear();
       }
       term.write(data);
     },
     /** A reset grounds the parser itself. */
     reset(): void {
       afterReplay = false;
+      tracker.clear();
     },
     dispose(): void {
       disposed = true;

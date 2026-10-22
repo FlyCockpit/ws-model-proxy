@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   CopyOutGate,
   decodeOsc52Text,
+  ReplayCopyTracker,
   TERMINAL_COPY_OUT_MAX_BYTES,
   wireTerminalCopyOut,
 } from "./terminal-copy-out";
@@ -83,6 +84,26 @@ describe("terminal copy-out", () => {
     gate.beginReplayChunk();
     gate.clearReplay();
     expect(gate.allowed(true)).toBe(true);
+  });
+
+  it.each([
+    ["plain text", "done", false],
+    ["a finished copy", "\x1b]52;c;QQ==\x07", false],
+    ["an open copy", "\x1b]52;c;QQ", true],
+    ["an open OSC number that may become 52", "\x1b]5", true],
+    ["an empty OSC number", "\x1b]", true],
+    ["an open OSC 8 link", "\x1b]8;;https://example.com", false],
+    ["an OSC number that can no longer be 52", "\x1b]53", false],
+    ["an OSC 52 aborted by CAN", "\x1b]52;c;QQ\x18", false],
+    ["an OSC 52 ended by ESC", "\x1b]52;c;QQ\x1b\\", false],
+    ["an open color sequence", "\x1b[31", false],
+    ["a lone ESC", "\x1b", true],
+    ["a UTF-8 C1 lead byte", "\xc2", true],
+    ["an open C1 OSC 52", "\xc2\x9d52;c;", true],
+  ])("tells whether replay ending in %s may leave a copy open", (_label, text, open) => {
+    const tracker = new ReplayCopyTracker();
+    tracker.feed(Uint8Array.from(text, (char) => char.charCodeAt(0)));
+    expect(tracker.copyMayBeOpen()).toBe(open);
   });
 
   it("decodes UTF-8 text with or without padding", () => {
