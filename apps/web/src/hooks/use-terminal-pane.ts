@@ -9,18 +9,20 @@ import {
   DEFAULT_TERMINAL_SHIFT_ENTER_MODE,
   type TerminalShiftEnterMode,
 } from "@/lib/terminal-settings";
-import type { TerminalSize } from "@/lib/terminal-writer";
+import type { TerminalInputOrigin, TerminalSize } from "@/lib/terminal-writer";
 
 type TerminalPaneHandlers = {
   localId: string;
   active: boolean;
   /** The PTY size to show while someone else is typing, or null to fit. */
   follow: TerminalSize | null;
-  sendInput: (localId: string, data: string) => void;
+  sendInput: (localId: string, data: string | Uint8Array, origin?: TerminalInputOrigin) => void;
   onImage?: (file: File) => Promise<TerminalImageAttachment>;
   pasteImage?: (localId: string, id: string, data: string) => Promise<boolean>;
   onImageError?: (error: unknown) => void;
   sendResize: (localId: string, cols: number, rows: number) => void;
+  /** The box has no measurable size now (see the session hook's `sizeUnavailable`). */
+  sizeUnavailable?: (localId: string) => void;
   onCopy?: (copy: Osc52Copy) => void;
   shiftEnter?: TerminalShiftEnterMode;
   /** Select text mode: a frozen plain-text copy of the terminal covers it. */
@@ -49,7 +51,8 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): {
     active: handlers.active,
     onCopy: (copy) => handlersRef.current.onCopy?.(copy),
     currentSession: () => handlersRef.current.currentSession?.(handlersRef.current.localId) ?? null,
-    onData: (data) => handlersRef.current.sendInput(handlersRef.current.localId, data),
+    onData: (data, origin) =>
+      handlersRef.current.sendInput(handlersRef.current.localId, data, origin),
     onImage: (file) => {
       const upload = handlersRef.current.onImage;
       if (!upload) return Promise.reject(new Error("unavailable"));
@@ -61,6 +64,7 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): {
       Promise.resolve(false),
     onResize: (size) =>
       handlersRef.current.sendResize(handlersRef.current.localId, size.cols, size.rows),
+    onSizeUnavailable: () => handlersRef.current.sizeUnavailable?.(handlersRef.current.localId),
   });
   const xtermRef = useLatestRef(xterm);
   const { localId, active } = handlers;

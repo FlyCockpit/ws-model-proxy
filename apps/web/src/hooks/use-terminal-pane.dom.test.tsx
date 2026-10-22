@@ -18,6 +18,7 @@ type FakeTerminal = {
   emit: ((data: string) => void) | null;
   keyHandler: ((event: KeyboardEvent) => boolean) | null;
   gate: CopyOutGate | null;
+  binary: ((data: string) => void) | null;
 };
 
 const xterm = vi.hoisted(() => ({ instances: [] as FakeTerminal[] }));
@@ -47,6 +48,12 @@ vi.mock("@xterm/xterm", () => ({
       container.appendChild(this.element);
     }
     onResize() {
+      return { dispose() {} };
+    }
+    /** xterm's binary channel (X10/normal mouse reports). */
+    binary: ((data: string) => void) | null = null;
+    onBinary(callback: (data: string) => void) {
+      this.binary = callback;
       return { dispose() {} };
     }
     write(data: string | Uint8Array, callback?: () => void) {
@@ -659,7 +666,7 @@ describe("useTerminalPane", () => {
       false,
     );
     expect(term.keyHandler(new KeyboardEvent("keydown", { key: "Enter" }))).toBe(true);
-    expect(sendInput.mock.calls).toEqual([["local_1", expected]]);
+    expect(sendInput.mock.calls).toEqual([["local_1", expected, "user"]]);
   });
 
   it("focuses an active pane once its xterm exists", () => {
@@ -748,6 +755,180 @@ describe("useTerminalPane", () => {
     act(() => result.current.containerRef(document.createElement("div")));
     expect(sendResize).not.toHaveBeenCalled();
     rerender({ active: true });
+    expect(sendResize).toHaveBeenCalledWith("local_1", 80, 24);
+  });
+
+  /** A follower pane (someone else is the writer) mounted in a measurable box. */
+  function follower(sendInput = vi.fn()) {
+    const container = document.createElement("div");
+    const { result } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow: { cols: 100, rows: 30 },
+        sendInput,
+        sendResize: () => undefined,
+        subscribeOutput: outputSource().subscribeOutput,
+      }),
+    );
+    act(() => result.current.containerRef(container));
+    const term = xterm.instances[0];
+    if (!term) throw new Error("no terminal");
+    return { term, container, sendInput };
+  }
+
+  it("forwards binary mouse reports as raw bytes", () => {
+    const { term, container, sendInput } = follower();
+    container.dispatchEvent(new Event("keydown"));
+    // X10 mouse report: ESC [ M, then three bytes above 0x7f.
+    act(() => term.binary?.("\x1b[M\x80\xa1\xb2"));
+    expect(sendInput).toHaveBeenCalledWith(
+      "local_1",
+      Uint8Array.of(0x1b, 0x5b, 0x4d, 0x80, 0xa1, 0xb2),
+      "user",
+    );
+  });
+
+  it("takes a follower's modified F3 as a key, and a cursor report as a reply", () => {
+    const { term, container, sendInput } = follower();
+    container.dispatchEvent(new KeyboardEvent("keydown", { key: "F3", shiftKey: true }));
+    act(() => term.emit?.("\x1b[1;2R"));
+    expect(sendInput).toHaveBeenCalledWith("local_1", "\x1b[1;2R", "user");
+    sendInput.mockClear();
+    // A plain key, then the same bytes as a cursor report: never input.
+    container.dispatchEvent(new KeyboardEvent("keydown", { key: "a" }));
+    act(() => term.emit?.("\x1b[1;2R"));
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it("takes text from an input event alone as typing", () => {
+    const { term, container, sendInput } = follower();
+    act(() => term.emit?.("x"));
+    expect(sendInput).not.toHaveBeenCalled();
+    container.dispatchEvent(new Event("input"));
+    act(() => term.emit?.("x"));
+    expect(sendInput).toHaveBeenCalledWith("local_1", "x", "user");
+  });
+
+  it("does not take a modifier pressed alone as input", () => {
+    const { term, container, sendInput } = follower();
+    container.dispatchEvent(new KeyboardEvent("keydown", { key: "Shift" }));
+    act(() => term.emit?.("\x1b[<0;1;1M"));
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it("fits a taken-over pane only after the output queued at the old size is drawn", () => {
+    const source = outputSource();
+    let follow: { cols: number; rows: number } | null = { cols: 100, rows: 30 };
+    const { result, rerender } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow,
+        sendInput: () => undefined,
+        sendResize: () => undefined,
+        subscribeOutput: source.subscribeOutput,
+      }),
+    );
+    act(() => result.current.containerRef(document.createElement("div")));
+    const term = xterm.instances[0];
+    if (!term) throw new Error("no terminal");
+    act(() => term.parse());
+    term.log.length = 0;
+    act(() => source.emit(data("queued")));
+    // This viewer takes over before xterm parsed the queued output.
+    follow = null;
+    rerender();
+    expect(term.log).toEqual([]);
+    act(() => term.parse());
+    expect(term.log).toEqual(["queued@100x30", { resize: [80, 24] }]);
+  });
+
+  it("reports no size, and says so, for a writer whose box became zero-size", () => {
+    const sendResize = vi.fn();
+    const sizeUnavailable = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ active }: { active: boolean }) =>
+        useTerminalPane({
+          localId: "local_1",
+          active,
+          follow: null,
+          sendInput: () => undefined,
+          sendResize,
+          sizeUnavailable,
+          subscribeOutput: outputSource().subscribeOutput,
+        }),
+      { initialProps: { active: false } },
+    );
+    act(() => result.current.containerRef(document.createElement("div")));
+    box.height = 0;
+    rerender({ active: true });
+    expect(sendResize).not.toHaveBeenCalled();
+    expect(sizeUnavailable).toHaveBeenCalledWith("local_1");
+  });
+
+  it("drops an image paste that finishes uploading after its tab was hidden", async () => {
+    const onImageError = vi.fn();
+    const pasteImage = vi.fn(async () => true);
+    let saved: ((value: TerminalImageAttachment) => void) | undefined;
+    const { result, rerender } = renderHook(
+      ({ active }: { active: boolean }) =>
+        useTerminalPane({
+          localId: "local_1",
+          active,
+          follow: null,
+          sendInput: () => undefined,
+          pasteImage,
+          sendResize: () => undefined,
+          subscribeOutput: outputSource().subscribeOutput,
+          onImage: () =>
+            new Promise<TerminalImageAttachment>((resolve) => {
+              saved = resolve;
+            }),
+          onImageError,
+        }),
+      { initialProps: { active: true } },
+    );
+    act(() => result.current.containerRef(document.createElement("div")));
+    const term = xterm.instances[0];
+    if (!term) throw new Error("no terminal");
+    const file = new File(["png"], "screenshot.png", { type: "image/png" });
+    const event = new Event("paste", { cancelable: true });
+    Object.defineProperty(event, "clipboardData", {
+      value: {
+        types: ["Files", "text/plain"],
+        items: [{ kind: "file", type: "image/png", getAsFile: () => file }],
+        getData: () => "accompanying text",
+      },
+    });
+    act(() => {
+      term.textarea.dispatchEvent(event);
+    });
+    rerender({ active: false });
+    const offered = attachment("/tmp/wsmp-terminal-example/image.png ");
+    await act(async () => {
+      saved?.(offered);
+    });
+    expect(term.pasted).toEqual([]);
+    expect(pasteImage).not.toHaveBeenCalled();
+    expect(offered.cancel).toHaveBeenCalled();
+    expect(onImageError).toHaveBeenCalledWith(expect.objectContaining({ message: "hidden" }));
+  });
+
+  it("reports a writer's first size even when xterm already has it", () => {
+    const sendResize = vi.fn();
+    const { result } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow: null,
+        sendInput: () => undefined,
+        sendResize,
+        subscribeOutput: outputSource().subscribeOutput,
+      }),
+    );
+    // The fake FitAddon proposes 80x24, xterm's own default: no resize event would fire.
+    act(() => result.current.containerRef(document.createElement("div")));
     expect(sendResize).toHaveBeenCalledWith("local_1", 80, 24);
   });
 });

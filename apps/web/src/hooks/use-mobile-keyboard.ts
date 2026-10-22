@@ -33,8 +33,14 @@ export function keyboardInsetPx(
   layoutViewportHeight: number,
   visualViewportHeight: number,
   visualViewportOffsetTop: number,
+  visualViewportScale = 1,
 ): number {
-  const covered = layoutViewportHeight - visualViewportHeight - visualViewportOffsetTop;
+  // Pinch-zoomed, the visual viewport is a magnified part of the page: its height times the
+  // scale is the screen height it fills, so the rest of the layout height is what the keyboard
+  // covers (its scroll position within the page says nothing about the keyboard).
+  const covered = isPinchZoomed(visualViewportScale)
+    ? layoutViewportHeight - visualViewportHeight * visualViewportScale
+    : layoutViewportHeight - visualViewportHeight - visualViewportOffsetTop;
   return Math.min(layoutViewportHeight, Math.max(0, Math.round(covered)));
 }
 
@@ -197,8 +203,6 @@ export function useMobileKeyboard(): boolean {
   const keyboardOpenRef = useRef(false);
   const previousVisualViewportHeightRef = useRef(0);
   const geometryRef = useRef({ width: 0, scale: 1, orientation: "" });
-  /** The last inset measured unzoomed. */
-  const insetRef = useRef(0);
 
   useEffect(() => {
     const readGeometry = () => {
@@ -240,16 +244,14 @@ export function useMobileKeyboard(): boolean {
         scale: geometry.scale,
         orientation: geometry.orientation,
       };
-      // Pinch zoom shrinks the visual viewport without any keyboard, so the covered height
-      // cannot be measured then: keep the last unzoomed one until the zoom ends.
-      if (!isPinchZoomed(geometry.scale)) {
-        insetRef.current = keyboardInsetPx(
-          window.innerHeight,
-          geometry.height,
-          window.visualViewport?.offsetTop ?? 0,
-        );
-      }
-      document.documentElement.style.setProperty(KEYBOARD_INSET_VAR, `${insetRef.current}px`);
+      // From current geometry on every event, zoomed or not (see keyboardInsetPx).
+      const inset = keyboardInsetPx(
+        window.innerHeight,
+        geometry.height,
+        window.visualViewport?.offsetTop ?? 0,
+        geometry.scale,
+      );
+      document.documentElement.style.setProperty(KEYBOARD_INSET_VAR, `${inset}px`);
       setKeyboardOpen(decision.isKeyboardOpen);
     };
 

@@ -72,19 +72,43 @@ export function isFocusReport(data: string): boolean {
 }
 
 /**
+ * Where a piece of input came from. The session hook's gateway decides at send time, not when
+ * the input was made, whether it may go out: `user` input (keys, pastes, mouse) and a ticket's
+ * `typed` command wait while Select text is on and take over the writer when needed; a `reply`
+ * (xterm's automatic answer to output) only ever goes out from the writer.
+ */
+export type TerminalInputOrigin = "user" | "typed" | "reply";
+
+/**
  * The replies xterm writes on its own when output asks (one reply per onData call): cursor and
  * status reports (CPR, DSR), device attributes (DA1/DA2), mode reports (DECRPM), window reports
  * (XTWINOPS), DCS answers (DECRQSS, XTVERSION) and OSC answers (color queries). Keys and mouse
  * reports never take these forms, with one exception: a modified F3 is `ESC [ 1 ; m R`, the same
- * bytes as a cursor report, so a follower's modified F3 is not taken as input.
+ * bytes as a cursor report. Only its key event tells them apart (`modifiedF3`).
  */
 const AUTOMATIC_REPLY =
   // biome-ignore lint/suspicious/noControlCharactersInRegex: ESC and BEL sequences are exactly what this matches.
   /^(?:\x1b\[[?>]?[\d;]*[Rnc]|\x1b\[\??[\d;]*\$y|\x1b\[[\d;]*t|\x1bP[\s\S]*\x1b\\|\x1b\][\s\S]*(?:\x07|\x1b\\))$/;
 
+const MODIFIED_F3 =
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: ESC is the sequence's first byte.
+  /^\x1b\[1;\d+R$/;
+
 /** Data xterm generated itself in answer to output, never typed or clicked. */
 export function isAutomaticReply(data: string): boolean {
   return isFocusReport(data) || AUTOMATIC_REPLY.test(data);
+}
+
+/**
+ * The origin of data xterm emits. `modifiedF3`: a modified F3 keydown is being handled right
+ * now, so the cursor-report shape it shares is that key, not a reply.
+ */
+export function terminalDataOrigin(
+  data: string,
+  modifiedF3 = false,
+): Exclude<TerminalInputOrigin, "typed"> {
+  if (modifiedF3 && MODIFIED_F3.test(data)) return "user";
+  return isAutomaticReply(data) ? "reply" : "user";
 }
 
 /**
@@ -98,9 +122,10 @@ export function shouldForwardTerminalData(input: {
   following: boolean;
   userInput: boolean;
   data: string;
+  modifiedF3?: boolean;
 }): boolean {
   if (!input.following) return true;
-  if (isAutomaticReply(input.data)) return false;
+  if (terminalDataOrigin(input.data, input.modifiedF3) === "reply") return false;
   return input.userInput;
 }
 

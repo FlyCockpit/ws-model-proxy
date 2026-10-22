@@ -20,7 +20,6 @@ import {
 } from "@ws-model-proxy/ui/components/dropdown-menu";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { Maximize2, Minimize2, Settings2, SquareTerminal, TextSelect, X } from "lucide-react";
 import type { KeyboardEvent } from "react";
 import { useTranslation } from "react-i18next";
@@ -100,12 +99,9 @@ function TerminalsPage() {
   // Restored, the sections below follow it and the page scrolls; maximized, it is the page.
   return (
     <div className="flex min-w-0 flex-col gap-6">
-      <div
-        className={cn(
-          "flex h-(--app-page-height) min-w-0 flex-col gap-6",
-          !maximized && "min-h-[24rem]",
-        )}
-      >
+      {/* No minimum height: when the keyboard leaves little room the terminal shrinks with it
+          (the 20x5 terminal floor still applies) instead of reaching below the visible area. */}
+      <div className="flex h-(--app-page-height) min-w-0 flex-col gap-6">
         {maximized ? null : <PageHeading page="terminals" />}
         <TerminalWorkspace sessions={sessions} slugOf={slugOf} maximized={maximized} />
       </div>
@@ -225,7 +221,7 @@ function TerminalWorkspace({
             {active ? <TabStatus sessions={sessions} tab={active} /> : null}
             <div
               style={TERMINAL_CHROME_VARS}
-              className="relative min-h-48 w-full min-w-0 flex-1 overflow-hidden rounded-md bg-(--term-bg)"
+              className="relative min-h-0 w-full min-w-0 flex-1 overflow-hidden rounded-md bg-(--term-bg)"
             >
               {tabs.map((tab) => (
                 <TerminalPane
@@ -241,6 +237,7 @@ function TerminalWorkspace({
                   uploadImage={sessions.uploadImage}
                   pasteImage={sessions.pasteImage}
                   sendResize={sessions.sendResize}
+                  sizeUnavailable={sessions.sizeUnavailable}
                   currentSession={sessions.currentSession}
                   subscribeOutput={sessions.subscribeOutput}
                 />

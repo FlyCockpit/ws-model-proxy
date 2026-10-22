@@ -6,6 +6,7 @@
     "unsupported": "Elige una imagen PNG, JPEG o WebP.",
     "busy": "Espera a que termine la subida actual.",
     "selecting": "La imagen no se pegó porque Seleccionar texto está activado. Cierra Seleccionar texto y vuelve a pegar.",
+    "hidden": "La imagen no se pegó porque cambiaste de pestaña mientras se subía. Vuelve a pegarla.",
     "limit": "Esta terminal alcanzó su límite de almacenamiento de imágenes. Termina la sesión para eliminarlas.",
     "nodeLimit": "Este nodo alcanzó su límite de almacenamiento de imágenes. Termina las sesiones de terminal que no uses para eliminar sus imágenes.",
     "overloaded": "Este nodo está ocupado recibiendo imágenes. Inténtalo de nuevo en un momento.",

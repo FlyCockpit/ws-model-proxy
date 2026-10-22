@@ -71,8 +71,16 @@ describe("useMobileKeyboard inset", () => {
       viewport.dispatchEvent(new Event("resize"));
     });
     expect(inset()).toBe("320px");
+    // The keyboard changes height while zoomed: the inset follows it.
+    act(() => {
+      viewport.height = 250;
+      viewport.offsetTop = 200;
+      viewport.dispatchEvent(new Event("scroll"));
+    });
+    expect(inset()).toBe("300px");
     act(() => {
       viewport.scale = 1;
+      viewport.offsetTop = 0;
       viewport.height = 480;
       viewport.dispatchEvent(new Event("resize"));
     });

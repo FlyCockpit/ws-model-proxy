@@ -60,6 +60,43 @@ describe("useTerminalCopy", () => {
     expect(writeText).not.toHaveBeenCalled();
   });
 
+  it("retires a pending copy when copying is turned off, so turning it back on shows nothing", async () => {
+    const { result } = renderHook(() => useTerminalCopy());
+    act(() => result.current.onCopy({ kind: "text", text: "hello" }));
+    await flush();
+    act(() => useUiPreferences.getState().setTerminalCopy("off"));
+    act(() => useUiPreferences.getState().setTerminalCopy("prompt"));
+    expect(result.current.pending).toBeNull();
+  });
+
+  it("ignores a click on a request a new attach already retired", async () => {
+    const { result } = renderHook(() => useTerminalCopy());
+    act(() => result.current.onCopy({ kind: "text", text: "old attach" }));
+    await flush();
+    // The click handler still holds the old request; the reset retires it first.
+    const click = result.current.copyPending;
+    act(() => result.current.clear());
+    act(() => click());
+    await flush();
+    expect(writeText).not.toHaveBeenCalled();
+  });
+
+  it("reports nothing for an automatic copy that finishes after its pane closed", async () => {
+    act(() => useUiPreferences.getState().setTerminalCopy("auto"));
+    let finish: () => void = () => undefined;
+    writeText.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const { result, unmount } = renderHook(() => useTerminalCopy());
+    act(() => result.current.onCopy({ kind: "text", text: "hello" }));
+    unmount();
+    await act(async () => finish());
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
   it("drops a pending copy when cleared (dismiss or a new attach)", async () => {
     const { result } = renderHook(() => useTerminalCopy());
     act(() => result.current.onCopy({ kind: "text", text: "hello" }));

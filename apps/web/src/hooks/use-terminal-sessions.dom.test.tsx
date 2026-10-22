@@ -399,6 +399,8 @@ describe("useTerminalSessions (multi-viewer)", () => {
         return result !== "closed";
       });
       if (result === "ending") act(() => view.result.current.endSession(localId));
+      // The visible pane has measured its box (taking over needs a size).
+      act(() => view.result.current.sendResize(localId, 100, 30));
       let sent = false;
       await act(async () => {
         sent = await view.result.current.pasteImage(
@@ -451,11 +453,77 @@ describe("useTerminalSessions (multi-viewer)", () => {
     await settle();
     expect(socket.sendFrame).not.toHaveBeenCalled();
     act(() => view.result.current.setSelecting(null));
+    act(() => view.result.current.sendResize(localId, 100, 30));
     act(() => view.result.current.sendInput(localId, "ls"));
     // A takeover resize comes first when this viewer was not the writer.
     await vi.waitFor(() => expect(socket.sendFrame).toHaveBeenCalled());
     const frames = await browserFrames(cli);
     expect(frames.filter((frame) => "data" in frame)).toEqual([{ seq: frames.length, data: "ls" }]);
+  });
+
+  it("holds input queued just before Select text and sends it when the mode ends", async () => {
+    const { view, cli, localId } = await setupV2();
+    useFakeClock();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    await advanceClock(200);
+    socket.sendFrame.mockClear();
+    act(() => view.result.current.sendInput(localId, "a"));
+    // settle() waits on the real clock: the batching window (fake clock) stays open.
+    await settle();
+    expect(socket.sendFrame).toHaveBeenCalledTimes(1);
+    // Within the batching window: queued, not sent yet.
+    act(() => view.result.current.sendInput(localId, "b"));
+    act(() => view.result.current.setSelecting(localId));
+    await advanceClock(200);
+    expect(socket.sendFrame).toHaveBeenCalledTimes(1);
+    act(() => view.result.current.setSelecting(null));
+    await vi.waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(2));
+    const frames = await browserFrames(cli);
+    expect(frames.filter((frame) => "data" in frame).map((frame) => frame.data)).toEqual([
+      "a",
+      "b",
+    ]);
+  });
+
+  it("drops a queued reply when the writer moved on before it was sent", async () => {
+    const { view, cli, localId } = await setupV2();
+    useFakeClock();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "you" });
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    await advanceClock(200);
+    socket.sendFrame.mockClear();
+    act(() => view.result.current.sendInput(localId, "x"));
+    // settle() waits on the real clock: the batching window (fake clock) stays open.
+    await settle();
+    expect(socket.sendFrame).toHaveBeenCalledTimes(1);
+    act(() => view.result.current.sendInput(localId, "\x1b[5;1R", "reply"));
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+    await advanceClock(200);
+    expect(socket.sendFrame).toHaveBeenCalledTimes(1);
+    const frames = await browserFrames(cli);
+    expect(frames.filter((frame) => "data" in frame).map((frame) => frame.data)).toEqual(["x"]);
+  });
+
+  it("never takes over from a hidden or unmeasured tab", async () => {
+    const { view, localId } = await setupV2();
+    useFakeClock();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+    // Never measured: no size to give the PTY.
+    act(() => view.result.current.sendInput(localId, "a"));
+    await advanceClock(200);
+    // Measured, then its box went away (hidden behind an ancestor, or zero-size).
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    act(() => view.result.current.sizeUnavailable(localId));
+    act(() => view.result.current.sendInput(localId, "b"));
+    let pasted = true;
+    await act(async () => {
+      pasted = await view.result.current.pasteImage(localId, "0".repeat(32), "/tmp/a.png ");
+    });
+    await advanceClock(200);
+    expect(pasted).toBe(false);
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+    expect(view.result.current.tabs[0]?.writer).toBe("other");
   });
 
   it("updates the writer and viewer count from a viewers message", async () => {

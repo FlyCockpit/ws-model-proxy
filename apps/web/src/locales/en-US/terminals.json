@@ -6,6 +6,7 @@
     "unsupported": "Choose a PNG, JPEG, or WebP image.",
     "busy": "Wait for the current image upload to finish.",
     "selecting": "The image was not pasted because Select text is on. Close Select text and paste again.",
+    "hidden": "The image was not pasted because you switched tabs while it uploaded. Paste it again.",
     "limit": "This terminal has reached its image storage limit. End the session to clear its images.",
     "nodeLimit": "This node has reached its image storage limit. End unused terminal sessions to clear their images.",
     "overloaded": "This node is busy receiving images. Try again shortly.",

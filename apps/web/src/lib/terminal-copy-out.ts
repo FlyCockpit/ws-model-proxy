@@ -133,8 +133,9 @@ export function wireTerminalCopyOut(
 
 /**
  * CAN: aborts any escape sequence in progress (VT parsers, xterm included, return to ground).
- * Written as bytes, not a string: xterm decodes byte writes with their own UTF-8 decoder, and
- * only a byte write reaches the state the replay's bytes left in it.
+ * Used only for the in-band reset before a replay, where the screen is reset anyway. Written as
+ * bytes, not a string: xterm decodes byte writes with their own UTF-8 decoder, and only a byte
+ * write reaches the state earlier byte writes left in it.
  */
 const ABORT_SEQUENCE = Uint8Array.of(0x18);
 
@@ -156,8 +157,9 @@ const NINE = 0x39;
  * anything with live output after the person's next gesture, so bytes crafted to confuse this
  * tracker (an ignored control inside an OSC number, a sequence split at an unusual point) gain
  * it nothing it does not already have. The tracker therefore follows only the plain forms of an
- * OSC 52 introducer (ESC ] or C1 OSC, the number 52 with optional leading zeros) and stays out
- * of the way of everything else, so no other sequence is altered at the replay boundary.
+ * OSC 52 introducer (ESC ] or C1 OSC, the number 52 with optional leading zeros). It never
+ * changes the output: it only tells the writer which live bytes complete a copy the replay left
+ * open, so that copy alone is suppressed while every other sequence renders as sent.
  */
 export class ReplayCopyTracker {
   private state: "ground" | "escape" | "osc" = "ground";
@@ -179,6 +181,21 @@ export class ReplayCopyTracker {
     if (this.state !== "osc") return false;
     if (this.oscNumberDone) return this.oscNumber === "52";
     return this.oscNumber !== null;
+  }
+
+  /**
+   * Follows live bytes while a sequence the replay left open is still open. Returns how many
+   * leading bytes reach the end of it (the byte that ends it included), or -1 when it is still
+   * open after all of them.
+   */
+  endOfOpenSequence(bytes: Uint8Array): number {
+    for (let index = 0; index < bytes.length; index += 1) {
+      const byte = bytes[index] ?? 0;
+      this.step(byte);
+      this.lastByte = byte;
+      if (this.state !== "osc") return index + 1;
+    }
+    return -1;
   }
 
   clear(): void {
@@ -236,13 +253,17 @@ type ReplayWriteTerminal = {
 
 /**
  * Writes output to xterm with replay protection: a copy a program sent before this viewer's
- * replay never fires again. Copy-out stays closed while replayed bytes (and anything queued
- * before a reset) are parsed, which covers copies that end inside the replay. A copy the replay
- * leaves open is aborted (CAN) before the first live write, so live output cannot complete it.
+ * replay never fires again, and no output is changed. Copy-out stays closed while replayed bytes
+ * (and anything queued before a reset) are parsed, which covers copies that end inside the
+ * replay. When the replay ends inside a copy, the live bytes up to the end of that sequence are
+ * written as their own chunk, also with copy-out closed: nothing else can complete inside an
+ * open sequence, so exactly that copy is suppressed.
  */
 export function createReplayAwareWriter(term: ReplayWriteTerminal, gate: CopyOutGate) {
   const tracker = new ReplayCopyTracker();
   let afterReplay = false;
+  /** Live bytes are still inside a copy the replay left open. */
+  let finishingReplayCopy = false;
   let disposed = false;
   /** Close the gate until xterm has parsed everything written so far, this chunk included. */
   const writeClosed = (data: Uint8Array, then?: () => void) => {
@@ -264,8 +285,20 @@ export function createReplayAwareWriter(term: ReplayWriteTerminal, gate: CopyOut
       }
       if (afterReplay) {
         afterReplay = false;
-        if (tracker.copyMayBeOpen()) term.write(ABORT_SEQUENCE);
+        finishingReplayCopy = tracker.copyMayBeOpen();
+        if (!finishingReplayCopy) tracker.clear();
+      }
+      if (finishingReplayCopy) {
+        const end = tracker.endOfOpenSequence(data);
+        if (end === -1) {
+          writeClosed(data);
+          return;
+        }
+        finishingReplayCopy = false;
         tracker.clear();
+        writeClosed(data.subarray(0, end));
+        if (end < data.length) term.write(data.subarray(end));
+        return;
       }
       term.write(data);
     },
@@ -278,6 +311,7 @@ export function createReplayAwareWriter(term: ReplayWriteTerminal, gate: CopyOut
      */
     reset(): void {
       afterReplay = false;
+      finishingReplayCopy = false;
       tracker.clear();
       writeClosed(ABORT_SEQUENCE, () => term.reset());
     },

@@ -130,6 +130,43 @@ describe("replay-aware writes with the real xterm parser", () => {
     term.dispose();
   });
 
+  it.each([
+    ["a title", "0;normal title\x07hello", "hello"],
+    ["an OSC 8 link", "8;;https://example.com\x07link\x1b]8;;\x07", "link"],
+  ])("renders %s split right after its ESC ] unchanged", async (_label, live, shown) => {
+    const { term, writer } = setup();
+    writer.write(bytes("\x1b]"), true);
+    await parsed(term);
+    writer.write(bytes(live));
+    await parsed(term);
+    expect(term.buffer.active.getLine(0)?.translateToString(true)).toBe(shown);
+    term.dispose();
+  });
+
+  it("suppresses only the replay's open copy, not a fresh one in the same live write", async () => {
+    const { term, gate, copies, writer } = setup();
+    writer.write(bytes(`\x1b]52;c;${encode("sec")}`), true);
+    await parsed(term);
+    gate.armFromUserGesture();
+    writer.write(bytes(`${encode("ret")}\x07\x1b]52;c;${encode("fresh")}\x07`));
+    await parsed(term);
+    expect(copies).toEqual([{ kind: "text", text: "fresh" }]);
+    term.dispose();
+  });
+
+  it("follows a replay's open copy across several live writes", async () => {
+    const { term, gate, copies, writer } = setup();
+    writer.write(bytes(`\x1b]52;c;${encode("a")}`), true);
+    await parsed(term);
+    gate.armFromUserGesture();
+    writer.write(bytes("QUFB"));
+    writer.write(bytes("QUFB\x07after"));
+    await parsed(term);
+    expect(copies).toEqual([]);
+    expect(term.buffer.active.getLine(0)?.translateToString(true)).toBe("after");
+    term.dispose();
+  });
+
   it("keeps an OSC 8 link split across the replay and live output", async () => {
     const { term, writer } = setup();
     writer.write(bytes("\x1b]8;;https://exa"), true);

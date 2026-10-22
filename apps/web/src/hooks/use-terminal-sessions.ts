@@ -4,6 +4,7 @@ import { useLatestRef } from "@/hooks/use-latest-ref";
 import {
   base64UrlToBytes,
   bytesToBase64Url,
+  concatBytes,
   DIRECTION_BROWSER_TO_CLI,
   DIRECTION_CLI_TO_BROWSER,
   decodeTerminalPlaintextV2,
@@ -63,9 +64,12 @@ import {
   sameSize,
   TERMINAL_FUTURE_EPOCH_QUEUE,
   TERMINAL_RESIZE_DEBOUNCE_MS,
+  type TerminalInputOrigin,
   type TerminalSize,
   type TerminalWriterState,
 } from "@/lib/terminal-writer";
+
+export type { TerminalInputOrigin };
 
 const textEncoder = new TextEncoder();
 /**
@@ -98,8 +102,12 @@ const BROWSER_IDENTITY_REQUIRED = "approval_required";
  */
 export const TERMINAL_GONE = "gone";
 
+type InputItem = { bytes: Uint8Array; origin: TerminalInputOrigin };
+
 type InputBatch = {
-  pending: string;
+  items: InputItem[];
+  /** Bytes in `items`. */
+  size: number;
   lastSentAt: number;
   timer: ReturnType<typeof setTimeout> | null;
 };
@@ -345,7 +353,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     listener: (event: TerminalOutputEvent) => void,
     reset?: () => void,
   ) => () => void;
-  sendInput: (localId: string, data: string) => void;
+  /**
+   * Queue input for a tab: a string is UTF-8, bytes are sent as they are (xterm's binary mouse
+   * reports). The origin decides what the send-time gateway allows; it defaults to `user`.
+   */
+  sendInput: (localId: string, data: string | Uint8Array, origin?: TerminalInputOrigin) => void;
   uploadImage: (
     localId: string,
     file: File,
@@ -353,6 +365,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   ) => Promise<TerminalImageAttachment>;
   pasteImage: (localId: string, id: string, data: string) => Promise<boolean>;
   sendResize: (localId: string, cols: number, rows: number) => void;
+  /**
+   * The tab's box has no measurable size now (hidden, or zero-size): drop any resize scheduled
+   * from an earlier size, and take no size from it until it reports one again.
+   */
+  sizeUnavailable: (localId: string) => void;
 } {
   const identity = useTerminalIdentity();
   const pinStore = options.pinStore ?? indexedDbCliPinStore;
@@ -375,14 +392,28 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const tabsRef = useRef(tabs);
   const activeRef = useRef(activeLocalId);
   /** A new active tab (or none) always ends Select text, wherever the switch came from. */
-  const setActiveLocalId = useCallback((localId: string | null) => {
-    activeRef.current = localId;
-    setActiveLocalIdState(localId);
-    if (selectingRef.current !== null && selectingRef.current !== localId) {
-      selectingRef.current = null;
-      setSelectingLocalIdState(null);
-    }
+  /** Resumes a tab's held input once its Select text ends (set once the handlers exist). */
+  const resumeInputRef = useRef<(localId: string) => void>(() => undefined);
+  /**
+   * The one Select text transition. Every way the mode ends (Done, the toolbar, switching or
+   * closing tabs) goes through here, so held input always resumes.
+   */
+  const changeSelecting = useCallback((next: string | null) => {
+    const previous = selectingRef.current;
+    if (previous === next) return;
+    selectingRef.current = next;
+    setSelectingLocalIdState(next);
+    if (previous !== null) resumeInputRef.current(previous);
   }, []);
+  /** A new active tab (or none) always ends Select text, wherever the switch came from. */
+  const setActiveLocalId = useCallback(
+    (localId: string | null) => {
+      activeRef.current = localId;
+      setActiveLocalIdState(localId);
+      if (selectingRef.current !== null && selectingRef.current !== localId) changeSelecting(null);
+    },
+    [changeSelecting],
+  );
   const cliKeysRef = useRef(new Map<string, string | null>());
   /** Writer state per tab, updated synchronously ahead of the render. */
   const viewRef = useRef(new Map<string, TerminalWriterState>());
@@ -433,7 +464,13 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   /** localId -> the quiet-period timer before its command is typed. */
   const typedTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   /** `sendInput`, for the output path defined before it. */
-  const sendInputRef = useRef<(localId: string, data: string) => void>(() => undefined);
+  const sendInputRef = useRef<
+    (localId: string, data: string | Uint8Array, origin?: TerminalInputOrigin) => void
+  >(() => undefined);
+  /** `flushInput`, for the Select text transition defined before it. */
+  const flushInputRef = useRef<(localId: string) => void>(() => undefined);
+  /** Tabs whose box last reported a measurable size (see `sizeUnavailable`). */
+  const measurableRef = useRef(new Set<string>());
   /** `open` frames not yet answered by `opening`, in the order sent. */
   const inflightOpensRef = useRef<{ localId: string; requestId: string }[]>([]);
   /**
@@ -564,12 +601,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (activeRef.current === localId) {
         setActiveLocalId(remaining[remaining.length - 1]?.localId ?? null);
       }
-      if (selectingRef.current === localId) {
-        selectingRef.current = null;
-        setSelectingLocalIdState(null);
-      }
+      measurableRef.current.delete(localId);
+      if (selectingRef.current === localId) changeSelecting(null);
     },
-    [clearTimer, setActiveLocalId],
+    [changeSelecting, clearTimer, setActiveLocalId],
   );
 
   /** Send a close intent's frame on the current socket (see `sendCloseIntent`). */
@@ -662,7 +697,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         // Select text pauses input: the command waits until the mode ends.
         if (selectingRef.current === localId) return;
         typedCommandsRef.current.delete(localId);
-        sendInputRef.current(localId, typed);
+        sendInputRef.current(localId, typed, "typed");
       }, TYPED_COMMAND_QUIET_MS),
     );
   }, []);
@@ -730,28 +765,78 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     return run;
   }, []);
 
+  /**
+   * Become the writer: the CLI must see this tab's size before its first data frame, so the PTY
+   * is resized before the input lands. Both share the per-terminal send chain, so the order
+   * holds. Only the visible tab, with a measured box, can take over: a hidden or unmeasurable
+   * pane has no size to give the PTY.
+   */
+  const takeOver = useCallback(
+    (localId: string): boolean => {
+      if (activeRef.current !== localId || !measurableRef.current.has(localId)) return false;
+      const own = ownSizeRef.current.get(localId);
+      if (!own) return false;
+      clearTimer(resizeTimersRef.current, localId);
+      setView(localId, { writer: "you" });
+      lastSentSizeRef.current.set(localId, own);
+      sendPlaintext(localId, encodeTerminalResize(own.cols, own.rows));
+      return true;
+    },
+    [clearTimer, sendPlaintext, setView],
+  );
+
+  /**
+   * The input gateway: every byte of a tab's input leaves through here, and its rules are
+   * checked now, at send time, not when the input was made (a batch waits up to
+   * INPUT_FLUSH_INTERVAL_MS, during which Select text may start or the writer may change).
+   * - Select text: user and typed input waits (it goes out when the mode ends); a reply is
+   *   dropped, since it answers output that has moved on.
+   * - A reply goes out only while this tab is the writer: it never claims the writer.
+   * - User or typed input from a follower takes over first, which needs the visible, measured
+   *   tab; without that it is dropped.
+   */
   const flushInput = useCallback(
     (localId: string) => {
       const batch = inputRef.current.get(localId);
       if (!batch) return;
       if (batch.timer) clearTimeout(batch.timer);
       batch.timer = null;
-      if (!batch.pending) return;
-      const data = batch.pending;
-      batch.pending = "";
+      if (batch.items.length === 0) return;
+      if (selectingRef.current === localId) {
+        batch.items = batch.items.filter((item) => item.origin !== "reply");
+        batch.size = batch.items.reduce((total, item) => total + item.bytes.length, 0);
+        return;
+      }
+      const items = batch.items;
+      batch.items = [];
+      batch.size = 0;
       batch.lastSentAt = performance.now();
-      sendPlaintext(localId, encodeTerminalData(textEncoder.encode(data)));
+      let writer = !needsTakeover(viewOf(localId));
+      const out: Uint8Array[] = [];
+      for (const item of items) {
+        if (item.origin === "reply") {
+          if (writer) out.push(item.bytes);
+          continue;
+        }
+        if (!writer) writer = takeOver(localId);
+        if (writer) out.push(item.bytes);
+      }
+      if (out.length === 0) return;
+      sendPlaintext(localId, encodeTerminalData(concatBytes(out)));
     },
-    [sendPlaintext],
+    [sendPlaintext, takeOver, viewOf],
   );
+  useLayoutEffect(() => {
+    flushInputRef.current = flushInput;
+  }, [flushInput]);
 
   /** Send this tab's own size now, if it is allowed to and it changed. */
   const flushResize = useCallback(
     (localId: string) => {
       clearTimer(resizeTimersRef.current, localId);
-      // A tab hidden since the resize was scheduled no longer has that box. It reports its size
-      // again when it is shown.
-      if (activeRef.current !== localId) return;
+      // A tab hidden, or whose box lost its size, since the resize was scheduled no longer has
+      // that box. It reports its size again when it is shown or measurable.
+      if (activeRef.current !== localId || !measurableRef.current.has(localId)) return;
       const own = ownSizeRef.current.get(localId);
       if (!own || !canSendResize(viewOf(localId))) return;
       if (sameSize(own, lastSentSizeRef.current.get(localId))) return;
@@ -1941,58 +2026,50 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   );
 
   const sendInput = useCallback(
-    (localId: string, data: string, imageId?: string) => {
+    (localId: string, data: string | Uint8Array, origin: TerminalInputOrigin = "user") => {
       const tab = tabsRef.current.find((item) => item.localId === localId);
       // A session being ended takes no more keystrokes.
-      if (tab?.ending === "pending") return false;
-      // Select text pauses this tab's input, whatever produced it.
-      if (selectingRef.current === localId) return false;
-      const live =
-        tab?.terminalId && tab.phase !== "exited" ? sessionsRef.current.has(tab.terminalId) : false;
-      if (imageId && !live) return false;
-      if (tab && live && needsTakeover(viewOf(localId))) {
-        // Takeover: the CLI must see this tab's size before its first data
-        // frame, so the PTY is resized before the keystroke lands. Both share
-        // the per-terminal send chain, so the order holds.
-        const own = ownSizeRef.current.get(localId) ?? { cols: tab.cols, rows: tab.rows };
-        ownSizeRef.current.set(localId, own);
-        clearTimer(resizeTimersRef.current, localId);
-        setView(localId, { writer: "you" });
-        lastSentSizeRef.current.set(localId, own);
-        flushInput(localId);
-        sendPlaintext(localId, encodeTerminalResize(own.cols, own.rows));
-      }
-      if (imageId) {
-        flushInput(localId);
-        return sendPlaintext(
-          localId,
-          encodeTerminalImageControl(TERMINAL_IMAGE_PASTE, imageId, data),
-        );
-      }
+      if (!tab || tab.ending === "pending") return;
+      const bytes = typeof data === "string" ? textEncoder.encode(data) : data;
+      if (bytes.length === 0) return;
       let batch = inputRef.current.get(localId);
       if (!batch) {
-        batch = { pending: "", lastSentAt: Number.NEGATIVE_INFINITY, timer: null };
+        batch = { items: [], size: 0, lastSentAt: Number.NEGATIVE_INFINITY, timer: null };
         inputRef.current.set(localId, batch);
       }
-      batch.pending += data;
+      batch.items.push({ bytes, origin });
+      batch.size += bytes.length;
       const wait = INPUT_FLUSH_INTERVAL_MS - (performance.now() - batch.lastSentAt);
-      if (wait <= 0 || batch.pending.length >= INPUT_BATCH_MAX_CHARS) {
+      if (wait <= 0 || batch.size >= INPUT_BATCH_MAX_CHARS) {
         flushInput(localId);
-        return true;
+        return;
       }
       batch.timer ??= setTimeout(() => flushInput(localId), wait);
-      return true;
     },
-    [clearTimer, flushInput, sendPlaintext, setView, viewOf],
+    [flushInput],
   );
   // `emitOutput` types a ticket's command through it; it is defined before `sendInput`.
   useLayoutEffect(() => {
     sendInputRef.current = sendInput;
   }, [sendInput]);
 
+  /**
+   * An image's path, pasted as its own frame through the same rules as typed input: not while
+   * Select text is on, and from a follower only by taking over from the visible, measured tab.
+   */
   const pasteImage = useCallback(
-    async (localId: string, id: string, data: string) => sendInput(localId, data, id),
-    [sendInput],
+    async (localId: string, id: string, data: string) => {
+      const tab = tabsRef.current.find((item) => item.localId === localId);
+      if (!tab || tab.ending === "pending") return false;
+      const live =
+        tab.terminalId && tab.phase !== "exited" ? sessionsRef.current.has(tab.terminalId) : false;
+      if (!live || selectingRef.current === localId) return false;
+      // Earlier input first, in the order it was made.
+      flushInput(localId);
+      if (needsTakeover(viewOf(localId)) && !takeOver(localId)) return false;
+      return sendPlaintext(localId, encodeTerminalImageControl(TERMINAL_IMAGE_PASTE, id, data));
+    },
+    [flushInput, sendPlaintext, takeOver, viewOf],
   );
 
   const sendResize = useCallback(
@@ -2002,6 +2079,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (clampedCols === null || clampedRows === null) return;
       const own = { cols: clampedCols, rows: clampedRows };
       ownSizeRef.current.set(localId, own);
+      measurableRef.current.add(localId);
       setTabs((current) => patchTab(current, localId, own));
       // A follower only records its size. It sends it when it takes over.
       if (!canSendResize(viewOf(localId))) return;
@@ -2012,6 +2090,14 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       );
     },
     [clearTimer, flushResize, viewOf],
+  );
+
+  const sizeUnavailable = useCallback(
+    (localId: string) => {
+      measurableRef.current.delete(localId);
+      clearTimer(resizeTimersRef.current, localId);
+    },
+    [clearTimer],
   );
 
   const uploadImage = useCallback(
@@ -2079,16 +2165,18 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const setSelecting = useCallback(
     (localId: string | null) => {
       // Only the active tab can be selecting.
-      const next = localId !== null && localId === activeRef.current ? localId : null;
-      const previous = selectingRef.current;
-      if (previous === next) return;
-      selectingRef.current = next;
-      setSelectingLocalIdState(next);
-      // A ticket's command held while selecting is typed once the output settles again.
-      if (previous !== null) scheduleTypedCommand(previous);
+      changeSelecting(localId !== null && localId === activeRef.current ? localId : null);
     },
-    [scheduleTypedCommand],
+    [changeSelecting],
   );
+  // Held input resumes when Select text ends: a ticket's command is typed once the output
+  // settles again, and keys queued just before the mode started go out.
+  useLayoutEffect(() => {
+    resumeInputRef.current = (localId: string) => {
+      scheduleTypedCommand(localId);
+      flushInputRef.current(localId);
+    };
+  }, [scheduleTypedCommand]);
 
   const currentSession = useCallback((localId: string): unknown => {
     const tab = tabsRef.current.find((item) => item.localId === localId);
@@ -2116,6 +2204,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     uploadImage,
     pasteImage,
     sendResize,
+    sizeUnavailable,
   };
 }
 

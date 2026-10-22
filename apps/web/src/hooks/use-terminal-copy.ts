@@ -1,5 +1,5 @@
 import { toast } from "@ws-model-proxy/ui/components/sileo";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { deliverTerminalCopy } from "@/lib/terminal-clipboard";
@@ -21,8 +21,9 @@ function writeClipboard(text: string): Promise<void> {
 /**
  * One pane's copy requests (OSC 52), delivered per the person's "When a program copies text"
  * setting. A request that needs a click waits in the pane's copy bar, not a toast: it belongs to
- * this tab, so closing the tab, a new attach (`clear`) or turning copying off drops it. Only the
- * newest request counts: an older one finishing late never replaces it.
+ * this tab, so closing the tab, a new attach (`clear`) or turning copying off drops it (turning it
+ * back on does not bring it back). Only the newest live request counts: an older one, or one from
+ * a closed pane, finishing late does nothing.
  */
 export function useTerminalCopy(): {
   onCopy: (copy: Osc52Copy) => void;
@@ -36,7 +37,26 @@ export function useTerminalCopy(): {
   const { t } = useTranslation("terminals");
   const mode = useUiPreferences((prefs) => prefs.terminalCopy);
   const [pending, setPending] = useState<PendingTerminalCopy | null>(null);
+  /** The current request's generation; anything that retires requests advances it. */
   const latestRef = useRef(0);
+
+  const clear = useCallback(() => {
+    latestRef.current += 1;
+    setPending(null);
+  }, []);
+
+  // Turning copying off retires what is pending, rather than hiding it until it is turned back on.
+  useEffect(() => {
+    if (mode === "off") clear();
+  }, [mode, clear]);
+
+  // A closed pane's requests are retired: a write still in flight reports nothing.
+  useEffect(
+    () => () => {
+      latestRef.current += 1;
+    },
+    [],
+  );
 
   const onCopy = useCallback(
     (copy: Osc52Copy) => {
@@ -50,9 +70,14 @@ export function useTerminalCopy(): {
           setPending(null);
           toast.success(t("copyOut.copied"));
         },
-        tooLarge: () => toast.warning(t("copyOut.tooLarge")),
+        tooLarge: () => {
+          if (isLatest()) toast.warning(t("copyOut.tooLarge"));
+        },
         prompt: (text) => {
-          if (isLatest()) setPending({ id, text });
+          // An automatic copy the browser refused falls back to the bar, unless copying was
+          // turned off meanwhile.
+          if (isLatest() && useUiPreferences.getState().terminalCopy !== "off")
+            setPending({ id, text });
         },
       });
     },
@@ -62,18 +87,15 @@ export function useTerminalCopy(): {
   const copyPending = useCallback(() => {
     const current = pending;
     setPending(null);
-    // The setting may have changed since the request: it is checked again at the click.
-    if (!current || useUiPreferences.getState().terminalCopy === "off") return;
+    // The click may land before a retirement (a new attach, the setting) re-renders the bar:
+    // the request must still be the current one, and copying still allowed.
+    if (!current || current.id !== latestRef.current) return;
+    if (useUiPreferences.getState().terminalCopy === "off") return;
     writeClipboard(current.text).then(
       () => toast.success(t("copyOut.copied")),
       () => toast.error(t("copyOut.blocked")),
     );
   }, [pending, t]);
-
-  const clear = useCallback(() => {
-    latestRef.current += 1;
-    setPending(null);
-  }, []);
 
   return { onCopy, pending: mode === "off" ? null : pending, copyPending, clear };
 }

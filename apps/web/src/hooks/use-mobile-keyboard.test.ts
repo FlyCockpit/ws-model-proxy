@@ -420,6 +420,16 @@ describe("keyboardInsetPx", () => {
     expect(keyboardInsetPx(800, 480, 100)).toBe(220);
   });
 
+  it("measures the keyboard while pinch-zoomed, wherever the zoomed view is scrolled", () => {
+    // 800px layout, keyboard covering 320px, zoomed 2x: the visual viewport is 240 CSS px tall.
+    expect(keyboardInsetPx(800, 240, 0, 2)).toBe(320);
+    expect(keyboardInsetPx(800, 240, 300, 2)).toBe(320);
+    // The keyboard grows to 340px while zoomed.
+    expect(keyboardInsetPx(800, 230, 300, 2)).toBe(340);
+    // No keyboard, zoomed: nothing covered.
+    expect(keyboardInsetPx(800, 400, 120, 2)).toBe(0);
+  });
+
   it("uses current geometry after rotating with the keyboard open", () => {
     // Portrait 375x667 rotated to landscape (layout height 375) with a 180px visual viewport:
     // the old portrait baseline would give 487px, more than the whole landscape viewport.
