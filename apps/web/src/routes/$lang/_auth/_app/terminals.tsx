@@ -20,6 +20,7 @@ import {
 } from "@ws-model-proxy/ui/components/dropdown-menu";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { Maximize2, Minimize2, Settings2, SquareTerminal, TextSelect, X } from "lucide-react";
 import { type KeyboardEvent, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -31,6 +32,7 @@ import { OperatorStepItem } from "@/components/runtimes/operator-step-item";
 import { TerminalPane } from "@/components/terminal-pane";
 import { TimeAgo } from "@/components/time-ago";
 import { WideContent } from "@/components/wide-content";
+import { useHideAppChrome } from "@/hooks/use-hide-app-chrome";
 import {
   type OpenTicketInput,
   type TerminalTab,
@@ -92,6 +94,9 @@ function TerminalsPage() {
   // Maximize applies only while there is a terminal to show.
   const maximized =
     useUiPreferences((prefs) => prefs.terminalMaximized) && sessions.tabs.length > 0;
+  // Maximized, the terminal takes the whole viewport: the app's header, navigation and sidebar
+  // step aside (the tabs and toolbar stay, so tabs switch and maximize turns off from here).
+  useHideAppChrome(maximized);
   // One tree for both layouts: the workspace keeps its element position, so toggling maximize
   // never remounts the xterms (a new xterm starts empty; output already shown is not replayed).
   // The first section is the visible page height the app frame provides (--app-page-height):
@@ -169,14 +174,16 @@ function TerminalWorkspace({
     document.getElementById(tabIdOf(tab.localId))?.focus();
   };
   return (
-    <Card className="min-h-0 flex-1">
+    <Card className={cn("min-h-0 flex-1", maximized && "rounded-none py-2 ring-0")}>
       {maximized ? null : (
         <CardHeader className={SHORT_SECTION_HIDDEN}>
           <CardTitle className="text-base">{t("terminals:workspaceTitle")}</CardTitle>
           <CardDescription>{t("terminals:workspaceDescription")}</CardDescription>
         </CardHeader>
       )}
-      <CardContent className="flex min-h-0 min-w-0 flex-1 flex-col gap-3">
+      <CardContent
+        className={cn("flex min-h-0 min-w-0 flex-1 flex-col gap-3", maximized && "gap-2 px-2")}
+      >
         {sessions.status !== "open" ? (
           <p className="text-sm text-muted-foreground" role="status">
             {t(`terminals:socket.${sessions.status}`)}

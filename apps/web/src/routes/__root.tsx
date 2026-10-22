@@ -35,6 +35,7 @@ import i18n from "@/i18n";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
 import { I18nReady } from "@/i18n/I18nReady";
 import { MAIN_SCROLLER_ID } from "@/lib/main-scroller";
+import { useAppChrome } from "@/stores/app-chrome";
 import { orpc } from "@/utils/orpc";
 
 import "../index.css";
@@ -143,6 +144,9 @@ function RootComponent() {
   useHashTargetScroll();
   useUserLocaleSync();
   const mobileKeyboardOpen = useMobileKeyboard();
+  // A page that took the whole viewport (the maximized terminal) hides the chrome; safe areas and
+  // the keyboard inset still apply.
+  const chromeHidden = useAppChrome((state) => state.hidden);
 
   return (
     <I18nextProvider i18n={i18n}>
@@ -156,8 +160,14 @@ function RootComponent() {
         >
           <div
             className={cn(
-              "grid h-svh min-w-0 grid-rows-[auto_1fr_auto] md:grid-rows-[auto_1fr] md:pb-0",
-              !mobileKeyboardOpen && "pb-[calc(3.5rem_+_var(--safe-area-bottom))]",
+              "grid h-svh min-w-0",
+              chromeHidden
+                ? // The keyboard covers the bottom safe area: the two overlap, never add up.
+                  "grid-rows-[1fr] pb-[max(0px,calc(var(--safe-area-bottom)-var(--keyboard-inset,0px)))]"
+                : [
+                    "grid-rows-[auto_1fr_auto] md:grid-rows-[auto_1fr] md:pb-0",
+                    !mobileKeyboardOpen && "pb-[calc(3.5rem_+_var(--safe-area-bottom))]",
+                  ],
             )}
             style={{
               paddingTop: "var(--safe-area-top)",
@@ -165,7 +175,7 @@ function RootComponent() {
               paddingRight: "var(--safe-area-right)",
             }}
           >
-            <Header />
+            {chromeHidden ? null : <Header />}
             {/* The only page scroller. [container-type:size] lets the sidebar use 100cqh; fixed
                 descendants must be portaled. `relative` makes main the containing block of
                 absolutely positioned page content (sr-only labels and live regions), so it scrolls
@@ -178,7 +188,7 @@ function RootComponent() {
             >
               <Outlet />
             </main>
-            <BottomNav hidden={mobileKeyboardOpen} />
+            <BottomNav hidden={mobileKeyboardOpen || chromeHidden} />
           </div>
           <ThemeColorSync />
           <Toaster />

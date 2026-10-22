@@ -109,6 +109,10 @@ Never run:
 - Do not hide Header or BottomNav from `visualViewport` height (or similar
   resize heuristics) alone. Header is stable chrome. BottomNav may hide only
   when a mobile software keyboard is actually open.
+  Exception: a maximized browser terminal takes the whole viewport. While it is
+  maximized, the Terminals page hides Header, BottomNav, the sidebar and the page
+  padding through `useHideAppChrome` (a user's choice, never a heuristic). The root
+  shell still applies safe areas and the keyboard inset.
 - Never set `overflow-y: auto` / `overflow-y-auto` without an explicit
   `overflow-x`. An omitted `overflow-x: visible` computes to `auto` and
   turns the page into a horizontal scroller.
