@@ -212,6 +212,7 @@ export function useXterm(options: XtermOptions): {
      * in that dispatch, and its `ESC [ 1 ; m R` is then the key, not a cursor report.
      */
     let modifiedF3 = false;
+    let modifiedF3Timer: ReturnType<typeof setTimeout> | null = null;
     /**
      * Everything xterm emits goes out through here with its origin. A follower sends only real
      * input (never a reply, and only right after a real gesture); the session hook's gateway
@@ -269,7 +270,9 @@ export function useXterm(options: XtermOptions): {
       ) {
         modifiedF3 = true;
         // Only for this keydown's own data.
-        setTimeout(() => {
+        if (modifiedF3Timer) clearTimeout(modifiedF3Timer);
+        modifiedF3Timer = setTimeout(() => {
+          modifiedF3Timer = null;
           modifiedF3 = false;
         }, 0);
       }
@@ -428,6 +431,7 @@ export function useXterm(options: XtermOptions): {
       term.textarea?.removeEventListener("paste", onPaste, true);
       container.removeEventListener("dragover", onDragOver);
       container.removeEventListener("drop", onDrop);
+      if (modifiedF3Timer) clearTimeout(modifiedF3Timer);
       disposeCopyOut();
       binarySub.dispose();
       writer.dispose();
@@ -437,7 +441,17 @@ export function useXterm(options: XtermOptions): {
       if (termRef.current === term) termRef.current = null;
       if (fitRef.current === fit) fitRef.current = null;
     };
-  }, [container, followRef, gate, handlersRef, inputGate, layout, selectingRef, shiftEnterRef]);
+  }, [
+    activeRef,
+    container,
+    followRef,
+    gate,
+    handlersRef,
+    inputGate,
+    layout,
+    selectingRef,
+    shiftEnterRef,
+  ]);
 
   // Becoming the visible tab lays out again (its box may have changed while hidden); hiding drops
   // any gesture authorization, so nothing typed or clicked before counts later.
