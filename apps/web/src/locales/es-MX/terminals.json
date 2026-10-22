@@ -45,7 +45,6 @@
   "noNodes": "Todavía no tienes nodos.",
   "workspaceTitle": "Terminales abiertas",
   "workspaceDescription": "La entrada y salida de la terminal se cifran entre este navegador y el nodo. El servidor no puede leerlas ni escribir en ellas.",
-  "workspaceEmpty": "Abre una terminal en un nodo, o ejecuta un comando en espera, y aparecerá aquí.",
   "socket": {
     "connecting": "Conectando con el servidor…",
     "closed": "Sin conexión con el servidor. Reconectando…",

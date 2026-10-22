@@ -45,7 +45,6 @@
   "noNodes": "You have no nodes yet.",
   "workspaceTitle": "Open terminals",
   "workspaceDescription": "Terminal input and output are encrypted between this browser and the node. The server cannot read them or type into them.",
-  "workspaceEmpty": "Open a terminal on a node, or run a queued command, and it appears here.",
   "socket": {
     "connecting": "Connecting to the server…",
     "closed": "Not connected to the server. Reconnecting…",

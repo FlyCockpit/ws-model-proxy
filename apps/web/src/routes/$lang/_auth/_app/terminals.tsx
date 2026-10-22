@@ -21,7 +21,7 @@ import {
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { Maximize2, Minimize2, Settings2, SquareTerminal, TextSelect, X } from "lucide-react";
+import { Maximize2, Minimize2, Settings2, TextSelect, X } from "lucide-react";
 import { type KeyboardEvent, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -85,15 +85,16 @@ type Sessions = ReturnType<typeof useTerminalSessions>;
 type OpenTerminal = (input: OpenTicketInput) => void;
 
 function TerminalsPage() {
+  const { t } = useTranslation(["terminals"]);
   const sessions = useTerminalSessions();
   const nodes = useQuery(orpc.nodes.list.queryOptions());
   const slugOf = (nodeId: string) => nodes.data?.nodes.find((node) => node.id === nodeId)?.slug;
   // A ticket is used up by its open: take one only once the socket and identity are ready, so
   // the open goes out at once (and a queued command is never decided for nothing).
   const ready = sessions.status === "open" && sessions.identityReady;
+  const hasTabs = sessions.tabs.length > 0;
   // Maximize applies only while there is a terminal to show.
-  const maximized =
-    useUiPreferences((prefs) => prefs.terminalMaximized) && sessions.tabs.length > 0;
+  const maximized = useUiPreferences((prefs) => prefs.terminalMaximized) && hasTabs;
   // Maximized, the terminal takes the whole viewport: the app's header, navigation and sidebar
   // step aside (the tabs and toolbar stay, so tabs switch and maximize turns off from here).
   useHideAppChrome(maximized);
@@ -102,6 +103,8 @@ function TerminalsPage() {
   // The first section is the visible page height the app frame provides (--app-page-height):
   // flex gives the terminal whatever the heading and card chrome leave, however tall they wrap.
   // Restored, the sections below follow it and the page scrolls; maximized, it is the page.
+  // With no terminal open there is no workspace: the heading alone, and the sections below
+  // follow it directly.
   return (
     <div className="flex min-w-0 flex-col gap-6">
       {/* No minimum height: when the keyboard leaves little room the terminal shrinks with it
@@ -109,13 +112,24 @@ function TerminalsPage() {
           The section is a size container: when it is short (a phone with the keyboard open, a
           landscape phone), the heading and the card's description give their space to the
           terminal. Tabs, status and controls always stay. */}
-      <div className="flex h-(--app-page-height) min-w-0 flex-col gap-6 [container-type:size]">
+      <div
+        className={cn(
+          "flex min-w-0 flex-col gap-6",
+          hasTabs && "h-(--app-page-height) [container-type:size]",
+        )}
+      >
         {maximized ? null : (
-          <div className={SHORT_SECTION_HIDDEN}>
+          <div className={cn(hasTabs && SHORT_SECTION_HIDDEN)}>
             <PageHeading page="terminals" />
           </div>
         )}
-        <TerminalWorkspace sessions={sessions} slugOf={slugOf} maximized={maximized} />
+        {hasTabs ? (
+          <TerminalWorkspace sessions={sessions} slugOf={slugOf} maximized={maximized} />
+        ) : sessions.status !== "open" ? (
+          <p className="text-sm text-muted-foreground" role="status">
+            {t(`terminals:socket.${sessions.status}`)}
+          </p>
+        ) : null}
       </div>
       {maximized ? null : (
         <>
@@ -189,12 +203,7 @@ function TerminalWorkspace({
             {t(`terminals:socket.${sessions.status}`)}
           </p>
         ) : null}
-        {tabs.length === 0 ? (
-          <p className="flex min-w-0 items-start gap-2 text-sm text-muted-foreground">
-            <SquareTerminal aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
-            <span className="min-w-0">{t("terminals:workspaceEmpty")}</span>
-          </p>
-        ) : (
+        {tabs.length === 0 ? null : (
           <>
             <div className="flex min-w-0 items-center gap-2">
               <WideContent
