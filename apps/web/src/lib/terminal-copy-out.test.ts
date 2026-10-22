@@ -96,6 +96,7 @@ describe("terminal copy-out", () => {
     ["an OSC number that can no longer be 52", "\x1b]53", false],
     ["an OSC 52 aborted by CAN", "\x1b]52;c;QQ\x18", false],
     ["an OSC 52 ended by ESC", "\x1b]52;c;QQ\x1b\\", false],
+    ["an OSC 52 ended by a UTF-8 C1 string terminator", "\x1b]52;c;QQ\xc2\x9c", false],
     ["an open color sequence", "\x1b[31", false],
     // Not yet any sequence: treating them as copies would break colors and characters split
     // there. A copy whose introducer arrives live is a copy made now, not a stale one.

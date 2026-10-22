@@ -36,6 +36,7 @@ type TerminalPaneProps = {
     localId: string,
     listener: (event: TerminalOutputEvent) => void,
     reset?: () => void,
+    retire?: () => void,
   ) => () => void;
 };
 
@@ -198,7 +199,8 @@ function SelectTextOverlay({ text, onDone }: { text: string; onDone: () => void 
         aria-label={t("selectText.label")}
         className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain"
       >
-        <WideContent>
+        {/* Its own tab stop: the sideways scroller is a separate box from the vertical one. */}
+        <WideContent tabIndex={0} role="region" aria-label={t("selectText.wideLabel")}>
           <pre
             style={{ fontFamily: TERMINAL_FONT_FAMILY }}
             className="w-fit select-text whitespace-pre py-2 ps-3 pe-1 text-(--term-fg) text-[13px] leading-[1.2]"

@@ -196,6 +196,7 @@
     "paused": "Terminal en pausa. Selecciona texto y cópialo como siempre.",
     "tmuxNote": "Solo se muestra lo que está en pantalla y en el historial de esta terminal. No se incluye el historial anterior de tmux.",
     "done": "Listo",
-    "label": "Texto de la terminal"
+    "label": "Texto de la terminal",
+    "wideLabel": "Líneas largas del texto de la terminal"
   }
 }

@@ -102,10 +102,16 @@ const BROWSER_IDENTITY_REQUIRED = "approval_required";
  */
 export const TERMINAL_GONE = "gone";
 
-type InputItem = { bytes: Uint8Array; origin: TerminalInputOrigin };
+/** `text`: a ticket's typed command, kept so it can be typed again if it cannot go out now. */
+type InputItem = { bytes: Uint8Array; origin: TerminalInputOrigin; text?: string };
 
 type InputBatch = {
   items: InputItem[];
+  /**
+   * Input from frames sealed but then not sent (the tab's rules changed while it was being
+   * encrypted), in the order it was made. It goes out ahead of `items`.
+   */
+  returned: InputItem[];
   /** Bytes in `items`. */
   size: number;
   lastSentAt: number;
@@ -348,10 +354,15 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   detachTab: (localId: string) => void;
   /** End session: close the shell for everyone. */
   endSession: (localId: string) => void;
+  /**
+   * Receive a tab's output. `reset` runs before a new attach's replay; `retire` runs as soon as
+   * the tab's session ends (detach, disconnect), before any replacement attaches.
+   */
   subscribeOutput: (
     localId: string,
     listener: (event: TerminalOutputEvent) => void,
     reset?: () => void,
+    retire?: () => void,
   ) => () => void;
   /**
    * Queue input for a tab: a string is UTF-8, bytes are sent as they are (xterm's binary mouse
@@ -427,6 +438,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const attachingRef = useRef(new Set<string>());
   const listenersRef = useRef(new Map<string, (event: TerminalOutputEvent) => void>());
   const resettersRef = useRef(new Map<string, () => void>());
+  /** Per pane: its session just ended (detach, disconnect), before any replacement attaches. */
+  const retireRef = useRef(new Map<string, () => void>());
   const buffersRef = useRef(new Map<string, TerminalOutputEvent[]>());
   const pendingResizeRef = useRef(new Map<string, TerminalSize>());
   const sendRef = useRef<(message: TerminalClientMessage) => TerminalSendResult>(() => "closed");
@@ -584,6 +597,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       buffersRef.current.delete(localId);
       listenersRef.current.delete(localId);
       resettersRef.current.delete(localId);
+      retireRef.current.delete(localId);
       const batch = inputRef.current.get(localId);
       if (batch?.timer) clearTimeout(batch.timer);
       inputRef.current.delete(localId);
@@ -696,6 +710,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           return;
         // Select text pauses input: the command waits until the mode ends.
         if (selectingRef.current === localId) return;
+        // Typing it as a follower takes over, which needs the visible, measured tab: it waits
+        // until the tab is shown and measured (sendResize schedules it again).
+        const following = needsTakeover(viewRef.current.get(localId) ?? { writer: "you" });
+        if (following && !(activeRef.current === localId && measurableRef.current.has(localId)))
+          return;
         typedCommandsRef.current.delete(localId);
         sendInputRef.current(localId, typed, "typed");
       }, TYPED_COMMAND_QUIET_MS),
@@ -730,40 +749,58 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     [emitOutput],
   );
 
-  const sendPlaintext = useCallback((localId: string, plaintext: Uint8Array) => {
-    const tab = tabsRef.current.find((item) => item.localId === localId);
-    const terminalId = tab?.terminalId;
-    // An exited shell reads nothing; its session only lingers to drain output.
-    if (!terminalId || tab.phase === "exited") return Promise.resolve(false);
-    const session = sessionsRef.current.get(terminalId);
-    if (!session) {
-      const resize = decodeMaybeResize(plaintext);
-      if (resize) pendingResizeRef.current.set(localId, resize);
-      return Promise.resolve(false);
-    }
-    const seq = session.sendSeq + 1n;
-    session.sendSeq = seq;
-    const previous = sendChainRef.current.get(terminalId) ?? Promise.resolve();
-    const run = previous
-      .catch(() => undefined)
-      .then(async () => {
-        const body = await sealTerminalBytesV2({
-          key: session.browserToCli,
-          terminalId,
-          viewerId: session.viewerId,
-          direction: DIRECTION_BROWSER_TO_CLI,
-          seq,
-          plaintext,
-        });
-        // A disconnect or re-attach replaces the session. Its keys are gone,
-        // so the CLI would reject this frame.
-        if (sessionsRef.current.get(terminalId) !== session) return false;
-        return frameRef.current(encodeSealedFrame({ terminalId, seq: Number(seq), body }));
-      })
-      .catch(() => false);
-    sendChainRef.current.set(terminalId, run);
-    return run;
-  }, []);
+  /**
+   * Seal and send one frame on the tab's send chain. `stillAllowed` is checked again right before
+   * the socket send, after encryption: the tab's rules can change while a frame is sealed (Select
+   * text, the writer, the box). A frame it refuses is not sent and `onRefused` runs; the CLI
+   * accepts any later sequence number, so the skipped one is never reused.
+   */
+  const sendPlaintext = useCallback(
+    (
+      localId: string,
+      plaintext: Uint8Array,
+      stillAllowed?: () => boolean,
+      onRefused?: () => void,
+    ) => {
+      const tab = tabsRef.current.find((item) => item.localId === localId);
+      const terminalId = tab?.terminalId;
+      // An exited shell reads nothing; its session only lingers to drain output.
+      if (!terminalId || tab.phase === "exited") return Promise.resolve(false);
+      const session = sessionsRef.current.get(terminalId);
+      if (!session) {
+        const resize = decodeMaybeResize(plaintext);
+        if (resize) pendingResizeRef.current.set(localId, resize);
+        return Promise.resolve(false);
+      }
+      const seq = session.sendSeq + 1n;
+      session.sendSeq = seq;
+      const previous = sendChainRef.current.get(terminalId) ?? Promise.resolve();
+      const run = previous
+        .catch(() => undefined)
+        .then(async () => {
+          const body = await sealTerminalBytesV2({
+            key: session.browserToCli,
+            terminalId,
+            viewerId: session.viewerId,
+            direction: DIRECTION_BROWSER_TO_CLI,
+            seq,
+            plaintext,
+          });
+          // A disconnect or re-attach replaces the session. Its keys are gone,
+          // so the CLI would reject this frame.
+          if (sessionsRef.current.get(terminalId) !== session) return false;
+          if (stillAllowed && !stillAllowed()) {
+            onRefused?.();
+            return false;
+          }
+          return frameRef.current(encodeSealedFrame({ terminalId, seq: Number(seq), body }));
+        })
+        .catch(() => false);
+      sendChainRef.current.set(terminalId, run);
+      return run;
+    },
+    [],
+  );
 
   /**
    * Become the writer: the CLI must see this tab's size before its first data frame, so the PTY
@@ -785,15 +822,38 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     [clearTimer, sendPlaintext, setView],
   );
 
+  /** Whether this tab may send input as the writer right now (checked again after sealing). */
+  const mayWrite = useCallback(
+    (localId: string) => selectingRef.current !== localId && !needsTakeover(viewOf(localId)),
+    [viewOf],
+  );
+
+  /**
+   * A ticket's typed command that could not go out goes back to waiting for its tab: it is typed
+   * once the output settles again, or the tab is shown and measured.
+   */
+  const keepTypedCommand = useCallback((localId: string, items: readonly InputItem[]) => {
+    for (const item of items) {
+      if (
+        item.origin === "typed" &&
+        item.text !== undefined &&
+        !typedCommandsRef.current.has(localId)
+      )
+        typedCommandsRef.current.set(localId, item.text);
+    }
+  }, []);
+
   /**
    * The input gateway: every byte of a tab's input leaves through here, and its rules are
-   * checked now, at send time, not when the input was made (a batch waits up to
-   * INPUT_FLUSH_INTERVAL_MS, during which Select text may start or the writer may change).
+   * checked when it is sent, not when it was made: once here, and again right before the socket
+   * send (a batch waits up to INPUT_FLUSH_INTERVAL_MS, and sealing is asynchronous).
    * - Select text: user and typed input waits (it goes out when the mode ends); a reply is
    *   dropped, since it answers output that has moved on.
-   * - A reply goes out only while this tab is the writer: it never claims the writer.
-   * - User or typed input from a follower takes over first, which needs the visible, measured
-   *   tab; without that it is dropped.
+   * - A reply goes out only while this tab is the writer: it never claims the writer. Replies go
+   *   in their own frames, so each kind is checked by its own rule.
+   * - User input from a follower takes over first, which needs the visible, measured tab;
+   *   without that it is dropped. A typed command waits for the tab instead.
+   * - Input in a frame refused after sealing returns to the front of the batch, in order.
    */
   const flushInput = useCallback(
     (localId: string) => {
@@ -801,6 +861,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (!batch) return;
       if (batch.timer) clearTimeout(batch.timer);
       batch.timer = null;
+      if (batch.returned.length > 0) {
+        batch.items = [...batch.returned, ...batch.items];
+        batch.returned = [];
+        batch.size = batch.items.reduce((total, item) => total + item.bytes.length, 0);
+      }
       if (batch.items.length === 0) return;
       if (selectingRef.current === localId) {
         batch.items = batch.items.filter((item) => item.origin !== "reply");
@@ -812,19 +877,47 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       batch.size = 0;
       batch.lastSentAt = performance.now();
       let writer = !needsTakeover(viewOf(localId));
-      const out: Uint8Array[] = [];
+      // Consecutive items of one kind share a frame: replies, or input (user and typed).
+      const segments: { reply: boolean; items: InputItem[] }[] = [];
+      const add = (item: InputItem, reply: boolean) => {
+        const last = segments[segments.length - 1];
+        if (last && last.reply === reply) last.items.push(item);
+        else segments.push({ reply, items: [item] });
+      };
       for (const item of items) {
         if (item.origin === "reply") {
-          if (writer) out.push(item.bytes);
+          if (writer) add(item, true);
           continue;
         }
         if (!writer) writer = takeOver(localId);
-        if (writer) out.push(item.bytes);
+        if (writer) add(item, false);
+        else if (item.origin === "typed") keepTypedCommand(localId, [item]);
       }
-      if (out.length === 0) return;
-      sendPlaintext(localId, encodeTerminalData(concatBytes(out)));
+      for (const segment of segments) {
+        const bytes = encodeTerminalData(concatBytes(segment.items.map((item) => item.bytes)));
+        if (segment.reply) {
+          sendPlaintext(localId, bytes, () => mayWrite(localId));
+          continue;
+        }
+        sendPlaintext(
+          localId,
+          bytes,
+          () => mayWrite(localId),
+          () => {
+            // Refused after sealing: back to the batch, ahead of anything typed since, and
+            // through the gateway again (which takes over or holds it as the rules now say).
+            const current = inputRef.current.get(localId);
+            if (!current) {
+              keepTypedCommand(localId, segment.items);
+              return;
+            }
+            current.returned.push(...segment.items);
+            current.timer ??= setTimeout(() => flushInputRef.current(localId), 0);
+          },
+        );
+      }
     },
-    [sendPlaintext, takeOver, viewOf],
+    [keepTypedCommand, mayWrite, sendPlaintext, takeOver, viewOf],
   );
   useLayoutEffect(() => {
     flushInputRef.current = flushInput;
@@ -843,7 +936,19 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       lastSentSizeRef.current.set(localId, own);
       // Keep typed input ahead of the resize, in the order the user made them.
       flushInput(localId);
-      sendPlaintext(localId, encodeTerminalResize(own.cols, own.rows));
+      sendPlaintext(
+        localId,
+        encodeTerminalResize(own.cols, own.rows),
+        // Still the visible, measured writer when it is sent; if not, it is sent again later.
+        () =>
+          activeRef.current === localId &&
+          measurableRef.current.has(localId) &&
+          canSendResize(viewOf(localId)),
+        () => {
+          if (sameSize(lastSentSizeRef.current.get(localId), own))
+            lastSentSizeRef.current.delete(localId);
+        },
+      );
     },
     [clearTimer, flushInput, sendPlaintext, viewOf],
   );
@@ -1195,8 +1300,28 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   );
 
   /** A viewer left this tab (slow, stolen, or the socket dropped). */
+  /**
+   * A tab's session ended: its queued input belonged to it and is dropped (a replacement attach
+   * must never receive it), except a ticket's typed command, which waits for the next attach.
+   * The pane is told at once, before any replacement attaches, so it retires what it holds for
+   * the old session (a pending copy, gesture authorization).
+   */
+  const retireSessionState = useCallback(
+    (localId: string) => {
+      const batch = inputRef.current.get(localId);
+      if (batch) {
+        if (batch.timer) clearTimeout(batch.timer);
+        keepTypedCommand(localId, [...batch.returned, ...batch.items]);
+        inputRef.current.delete(localId);
+      }
+      retireRef.current.get(localId)?.();
+    },
+    [keepTypedCommand],
+  );
+
   const dropSession = useCallback(
     (localId: string, terminalId: string) => {
+      retireSessionState(localId);
       forgetSession(sessionsRef.current, terminalId);
       attachingRef.current.delete(terminalId);
       establishingRef.current.delete(localId);
@@ -1205,7 +1330,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       lastSentSizeRef.current.delete(localId);
       clearTimer(resizeTimersRef.current, localId);
     },
-    [clearTimer],
+    [clearTimer, retireSessionState],
   );
 
   /**
@@ -1217,9 +1342,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       clearTimer(reattachTimersRef.current, localId);
       clearTimer(resizeTimersRef.current, localId);
       reattachRef.current.delete(localId);
-      const batch = inputRef.current.get(localId);
-      if (batch?.timer) clearTimeout(batch.timer);
-      inputRef.current.delete(localId);
+      retireSessionState(localId);
       pendingResizeRef.current.delete(localId);
       lastSentSizeRef.current.delete(localId);
       awaitingIdentityRef.current.delete(localId);
@@ -1233,7 +1356,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       else earlySealedRef.current.delete(terminalId);
       patchTabNow(localId, { phase: "exited", approvalCode: null, error: TERMINAL_GONE });
     },
-    [clearTimer, patchTabNow, retireAfterDrain],
+    [retireSessionState, clearTimer, patchTabNow, retireAfterDrain],
   );
 
   /**
@@ -1654,8 +1777,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const onDisconnect = useCallback(() => {
     generationRef.current += 1;
     for (const resolve of listWaitersRef.current.splice(0)) resolve();
-    for (const batch of inputRef.current.values()) {
-      if (batch.timer) clearTimeout(batch.timer);
+    // Every session ended with the socket: retire their input and tell their panes.
+    for (const localId of [...inputRef.current.keys(), ...retireRef.current.keys()]) {
+      retireSessionState(localId);
     }
     for (const timer of resizeTimersRef.current.values()) clearTimeout(timer);
     for (const timer of reattachTimersRef.current.values()) clearTimeout(timer);
@@ -1714,7 +1838,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       });
     tabsRef.current = settle(tabsRef.current);
     setTabs(settle);
-  }, []);
+    // Settling removes opening tabs: the active tab (and Select text with it) must still name a
+    // tab that exists, through the same transition as any other switch.
+    const remaining = tabsRef.current;
+    if (activeRef.current !== null && !remaining.some((tab) => tab.localId === activeRef.current))
+      setActiveLocalId(remaining[remaining.length - 1]?.localId ?? null);
+  }, [retireSessionState, setActiveLocalId]);
 
   /**
    * A new socket: nothing sent before it opened reached the relay. Drop those
@@ -2011,15 +2140,22 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   );
 
   const subscribeOutput = useCallback(
-    (localId: string, listener: (event: TerminalOutputEvent) => void, reset?: () => void) => {
+    (
+      localId: string,
+      listener: (event: TerminalOutputEvent) => void,
+      reset?: () => void,
+      retire?: () => void,
+    ) => {
       listenersRef.current.set(localId, listener);
       if (reset) resettersRef.current.set(localId, reset);
+      if (retire) retireRef.current.set(localId, retire);
       if (resetBeforeOutputRef.current.delete(localId)) reset?.();
       const queued = buffersRef.current.get(localId) ?? [];
       buffersRef.current.delete(localId);
       for (const event of queued) listener(event);
       return () => {
         if (listenersRef.current.get(localId) === listener) listenersRef.current.delete(localId);
+        if (retire && retireRef.current.get(localId) === retire) retireRef.current.delete(localId);
       };
     },
     [],
@@ -2034,10 +2170,20 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (bytes.length === 0) return;
       let batch = inputRef.current.get(localId);
       if (!batch) {
-        batch = { items: [], size: 0, lastSentAt: Number.NEGATIVE_INFINITY, timer: null };
+        batch = {
+          items: [],
+          returned: [],
+          size: 0,
+          lastSentAt: Number.NEGATIVE_INFINITY,
+          timer: null,
+        };
         inputRef.current.set(localId, batch);
       }
-      batch.items.push({ bytes, origin });
+      batch.items.push(
+        origin === "typed" && typeof data === "string"
+          ? { bytes, origin, text: data }
+          : { bytes, origin },
+      );
       batch.size += bytes.length;
       const wait = INPUT_FLUSH_INTERVAL_MS - (performance.now() - batch.lastSentAt);
       if (wait <= 0 || batch.size >= INPUT_BATCH_MAX_CHARS) {
@@ -2067,9 +2213,14 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       // Earlier input first, in the order it was made.
       flushInput(localId);
       if (needsTakeover(viewOf(localId)) && !takeOver(localId)) return false;
-      return sendPlaintext(localId, encodeTerminalImageControl(TERMINAL_IMAGE_PASTE, id, data));
+      // Checked again after sealing: still not selecting, still the visible writer.
+      return sendPlaintext(
+        localId,
+        encodeTerminalImageControl(TERMINAL_IMAGE_PASTE, id, data),
+        () => mayWrite(localId) && activeRef.current === localId,
+      );
     },
-    [flushInput, sendPlaintext, takeOver, viewOf],
+    [flushInput, mayWrite, sendPlaintext, takeOver, viewOf],
   );
 
   const sendResize = useCallback(
@@ -2079,8 +2230,15 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (clampedCols === null || clampedRows === null) return;
       const own = { cols: clampedCols, rows: clampedRows };
       ownSizeRef.current.set(localId, own);
+      const wasMeasurable = measurableRef.current.has(localId);
       measurableRef.current.add(localId);
       setTabs((current) => patchTab(current, localId, own));
+      // Measured again (shown, or its box came back): input and a ticket's command waiting for a
+      // measured tab can go now.
+      if (!wasMeasurable) {
+        if ((inputRef.current.get(localId)?.items.length ?? 0) > 0) flushInput(localId);
+        scheduleTypedCommand(localId);
+      }
       // A follower only records its size. It sends it when it takes over.
       if (!canSendResize(viewOf(localId))) return;
       clearTimer(resizeTimersRef.current, localId);
@@ -2089,7 +2247,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         setTimeout(() => flushResize(localId), TERMINAL_RESIZE_DEBOUNCE_MS),
       );
     },
-    [clearTimer, flushResize, viewOf],
+    [clearTimer, flushInput, flushResize, scheduleTypedCommand, viewOf],
   );
 
   const sizeUnavailable = useCallback(

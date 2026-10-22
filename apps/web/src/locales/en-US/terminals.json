@@ -196,6 +196,7 @@
     "paused": "Terminal paused. Select text and copy it the usual way.",
     "tmuxNote": "Only what's on screen and in this terminal's history is shown. Older tmux history isn't included.",
     "done": "Done",
-    "label": "Terminal text"
+    "label": "Terminal text",
+    "wideLabel": "Long lines of terminal text"
   }
 }

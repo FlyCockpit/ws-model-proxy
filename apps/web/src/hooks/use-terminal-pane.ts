@@ -35,6 +35,7 @@ type TerminalPaneHandlers = {
     localId: string,
     listener: (event: TerminalOutputEvent) => void,
     reset?: () => void,
+    retire?: () => void,
   ) => () => void;
 };
 
@@ -85,6 +86,11 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): {
       () => {
         handlersRef.current.onReset?.();
         xtermRef.current.reset();
+      },
+      // The session ended: what the pane holds for it is retired now, not at the next output.
+      () => {
+        handlersRef.current.onReset?.();
+        xtermRef.current.retire();
       },
     );
   }, [localId, host, handlersRef, xtermRef]);

@@ -486,6 +486,55 @@ describe("useTerminalSessions (multi-viewer)", () => {
     ]);
   });
 
+  it("re-checks Select text after sealing: a frame refused then is held and sent later", async () => {
+    const { view, cli, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    act(() => view.result.current.sendResize(localId, 120, 40));
+    // Sent at once (no batching wait), then Select text starts while it is being sealed.
+    act(() => {
+      view.result.current.sendInput(localId, "typed just before");
+      view.result.current.setSelecting(localId);
+    });
+    await settle();
+    const before = await browserFrames(cli);
+    expect(before.filter((frame) => "data" in frame)).toEqual([]);
+    act(() => view.result.current.setSelecting(null));
+    await settle();
+    const after = await browserFrames(cli);
+    expect(after.filter((frame) => "data" in frame).map((frame) => frame.data)).toEqual([
+      "typed just before",
+    ]);
+  });
+
+  it("does not send a sealed reply once the writer changed", async () => {
+    const { view, cli, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "you" });
+    act(() => {
+      view.result.current.sendInput(localId, "\x1b[5;1R", "reply");
+      handlers().onMessage({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+    });
+    await settle();
+    expect((await browserFrames(cli)).filter((frame) => "data" in frame)).toEqual([]);
+  });
+
+  it("never sends input held for one attach to the next", async () => {
+    const { view, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    act(() => view.result.current.setSelecting(localId));
+    act(() => view.result.current.sendInput(localId, "held for the old attach"));
+    message({ type: "detached", terminalId: TERMINAL_ID, reason: "slow" });
+    await waitFor(() => expect(sentOfType("attach")).toHaveLength(2), { timeout: 3_000 });
+    const next = await attachAsCli(VIEWER_ID, 1);
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    // The new attach's writer, with a measured box: only retirement can stop the old input.
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    act(() => view.result.current.setSelecting(localId));
+    act(() => view.result.current.setSelecting(null));
+    await settle();
+    expect((await browserFrames(next)).filter((frame) => "data" in frame)).toEqual([]);
+  });
+
   it("drops a queued reply when the writer moved on before it was sent", async () => {
     const { view, cli, localId } = await setupV2();
     useFakeClock();
@@ -1655,6 +1704,37 @@ describe("useTerminalSessions terminal tickets", () => {
     await advanceClock(1_000);
     await vi.waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(1));
     expect(await browserFrames(cli)).toEqual([{ seq: 1, data: "nvidia-smi -L" }]);
+  });
+
+  it("keeps a follower's queued command until its tab is measured, then types it", async () => {
+    const view = await openWith("nvidia-smi -L");
+    const cli = await openAsCli();
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    const localId = view.result.current.tabs[0]?.localId ?? "";
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+    useFakeClock();
+    await unicast(cli, text("$ "));
+    await settle();
+    await advanceClock(1_000);
+    // No measured box: taking over is impossible, and the command must not be lost.
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    await advanceClock(1_000);
+    await vi.waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(2));
+    expect(await browserFrames(cli)).toEqual([
+      { seq: 1, resize: [100, 30] },
+      { seq: 2, data: "nvidia-smi -L" },
+    ]);
+  });
+
+  it("makes a listed tab active after a disconnect removed the active opening tab", async () => {
+    const view = await openWith();
+    await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
+    const opening = view.result.current.tabs[0]?.localId;
+    expect(view.result.current.activeLocalId).toBe(opening);
+    act(() => handlers().onDisconnect?.());
+    expect(view.result.current.tabs).toEqual([]);
+    expect(view.result.current.activeLocalId).toBeNull();
   });
 
   it("types only once the shell's output has been quiet for a moment", async () => {

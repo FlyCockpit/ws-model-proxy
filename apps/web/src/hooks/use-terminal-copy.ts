@@ -63,6 +63,8 @@ export function useTerminalCopy(): {
       latestRef.current += 1;
       const id = latestRef.current;
       const isLatest = () => latestRef.current === id;
+      // A newer request supersedes the bar at once, whatever becomes of it.
+      setPending(null);
       void deliverTerminalCopy(useUiPreferences.getState().terminalCopy, copy, {
         writeText: writeClipboard,
         copied: () => {
@@ -91,9 +93,18 @@ export function useTerminalCopy(): {
     // the request must still be the current one, and copying still allowed.
     if (!current || current.id !== latestRef.current) return;
     if (useUiPreferences.getState().terminalCopy === "off") return;
+    // The click retires the request; its result is reported only while nothing newer (or a
+    // closed pane) has retired it in turn.
+    latestRef.current += 1;
+    const id = latestRef.current;
+    const isLatest = () => latestRef.current === id;
     writeClipboard(current.text).then(
-      () => toast.success(t("copyOut.copied")),
-      () => toast.error(t("copyOut.blocked")),
+      () => {
+        if (isLatest()) toast.success(t("copyOut.copied"));
+      },
+      () => {
+        if (isLatest()) toast.error(t("copyOut.blocked"));
+      },
     );
   }, [pending, t]);
 

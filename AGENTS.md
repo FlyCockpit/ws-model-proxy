@@ -116,6 +116,8 @@ Never run:
   `max-w-full`) so min-content width cannot inflate the page.
 - Intentional horizontal scroll belongs in `WideContent` (`apps/web/src/components/wide-content.tsx`),
   not on the page shell. Pair it with `overscroll-x-contain`.
+  Exception: the browser terminal's follow-mode box in `terminal-pane.tsx` scrolls on both axes
+  itself, because xterm opens directly in it and FitAddon measures it as the pane's size.
 - Prefer axis-specific overscroll: horizontal scrollers use
   `overflow-x-auto overscroll-x-contain`; bounded vertical panes/dialogs can
   use `overscroll-contain`.

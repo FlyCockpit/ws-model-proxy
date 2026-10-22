@@ -154,6 +154,20 @@ describe("replay-aware writes with the real xterm parser", () => {
     term.dispose();
   });
 
+  it("ends suppression at a C1 string terminator, so a later fresh copy still works", async () => {
+    const { term, gate, copies, writer } = setup();
+    writer.write(bytes(`\x1b]52;c;${encode("sec")}`), true);
+    await parsed(term);
+    gate.armFromUserGesture();
+    const latin1 = (text: string) => Uint8Array.from(text, (char) => char.charCodeAt(0));
+    writer.write(latin1(`${encode("ret")}\xc2\x9c`));
+    // A fresh copy introduced by C1 OSC, with no ESC that would end tracking anyway.
+    writer.write(latin1(`\xc2\x9d52;c;${encode("fresh")}\x07`));
+    await parsed(term);
+    expect(copies).toEqual([{ kind: "text", text: "fresh" }]);
+    term.dispose();
+  });
+
   it("follows a replay's open copy across several live writes", async () => {
     const { term, gate, copies, writer } = setup();
     writer.write(bytes(`\x1b]52;c;${encode("a")}`), true);

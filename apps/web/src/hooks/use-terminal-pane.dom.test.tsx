@@ -120,6 +120,8 @@ import { useTerminalPane } from "./use-terminal-pane";
 
 /** The pane box's size: jsdom lays nothing out, so tests set it (0 is a hidden or empty box). */
 const box = { width: 800, height: 600 };
+/** ResizeObserver callbacks, so a test can fire a resize tick. */
+const resizeObservers: (() => void)[] = [];
 
 beforeAll(() => {
   Object.defineProperty(HTMLElement.prototype, "clientWidth", {
@@ -133,6 +135,9 @@ beforeAll(() => {
   vi.stubGlobal(
     "ResizeObserver",
     class {
+      constructor(callback: () => void) {
+        resizeObservers.push(callback);
+      }
       observe() {}
       disconnect() {}
     },
@@ -144,24 +149,36 @@ afterEach(() => {
   xterm.instances.length = 0;
   box.width = 800;
   box.height = 600;
+  resizeObservers.length = 0;
 });
 
 /** Output for one tab, held until a listener subscribes (as the session hook does). */
 function outputSource() {
   let listener: ((event: TerminalOutputEvent) => void) | null = null;
   const queued: TerminalOutputEvent[] = [];
-  const subscribeOutput = vi.fn((_localId: string, next: (event: TerminalOutputEvent) => void) => {
-    listener = next;
-    for (const event of queued.splice(0)) next(event);
-    return () => {
-      if (listener === next) listener = null;
-    };
-  });
+  let retire: (() => void) | undefined;
+  const subscribeOutput = vi.fn(
+    (
+      _localId: string,
+      next: (event: TerminalOutputEvent) => void,
+      _reset?: () => void,
+      onRetire?: () => void,
+    ) => {
+      listener = next;
+      retire = onRetire;
+      for (const event of queued.splice(0)) next(event);
+      return () => {
+        if (listener === next) listener = null;
+      };
+    },
+  );
   const emit = (event: TerminalOutputEvent) => {
     if (listener) listener(event);
     else queued.push(event);
   };
-  return { subscribeOutput, emit };
+  /** The session hook ending this tab's session (detach, disconnect). */
+  const retireSession = () => retire?.();
+  return { subscribeOutput, emit, retireSession };
 }
 
 const data = (text: string, replay = false): TerminalOutputEvent => ({
@@ -930,5 +947,91 @@ describe("useTerminalPane", () => {
     // The fake FitAddon proposes 80x24, xterm's own default: no resize event would fire.
     act(() => result.current.containerRef(document.createElement("div")));
     expect(sendResize).toHaveBeenCalledWith("local_1", 80, 24);
+  });
+
+  it("keeps applying PTY sizes queued while following after a takeover", () => {
+    const source = outputSource();
+    let follow: { cols: number; rows: number } | null = { cols: 100, rows: 30 };
+    const { result, rerender } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow,
+        sendInput: () => undefined,
+        sendResize: () => undefined,
+        subscribeOutput: source.subscribeOutput,
+      }),
+    );
+    act(() => result.current.containerRef(document.createElement("div")));
+    const term = xterm.instances[0];
+    if (!term) throw new Error("no terminal");
+    act(() => term.parse());
+    term.log.length = 0;
+    act(() => {
+      source.emit(data("a"));
+      source.emit({ kind: "size", cols: 120, rows: 40 });
+      source.emit(data("b"));
+    });
+    follow = null;
+    rerender();
+    act(() => term.parse());
+    expect(term.log).toEqual(["a@100x30", { resize: [120, 40] }, "b@120x40", { resize: [80, 24] }]);
+  });
+
+  it("does not refit on a resize tick while a takeover waits for queued output", () => {
+    const source = outputSource();
+    let follow: { cols: number; rows: number } | null = { cols: 100, rows: 30 };
+    const { result, rerender } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow,
+        sendInput: () => undefined,
+        sendResize: () => undefined,
+        subscribeOutput: source.subscribeOutput,
+      }),
+    );
+    act(() => result.current.containerRef(document.createElement("div")));
+    const term = xterm.instances[0];
+    if (!term) throw new Error("no terminal");
+    act(() => term.parse());
+    term.log.length = 0;
+    act(() => source.emit(data("queued")));
+    follow = null;
+    rerender();
+    // The box changes size before xterm parsed the queued output.
+    act(() => {
+      for (const tick of resizeObservers) tick();
+    });
+    expect(term.log).toEqual([]);
+    act(() => term.parse());
+    expect(term.log).toEqual(["queued@100x30", { resize: [80, 24] }]);
+  });
+
+  it("retires gesture authorization as soon as its session ends", () => {
+    const source = outputSource();
+    const container = document.createElement("div");
+    const { result } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow: null,
+        sendInput: () => undefined,
+        sendResize: () => undefined,
+        subscribeOutput: source.subscribeOutput,
+      }),
+    );
+    act(() => result.current.containerRef(container));
+    const term = xterm.instances[0];
+    const gate = term?.gate;
+    if (!term || !gate) throw new Error("no terminal");
+    act(() => term.parse());
+    container.dispatchEvent(new Event("pointerdown"));
+    expect(gate.allowed(true)).toBe(true);
+    act(() => source.retireSession());
+    expect(gate.allowed(true)).toBe(false);
+    // Still closed once xterm caught up: the gesture belonged to the ended session.
+    act(() => term.parse());
+    expect(gate.allowed(true)).toBe(false);
   });
 });

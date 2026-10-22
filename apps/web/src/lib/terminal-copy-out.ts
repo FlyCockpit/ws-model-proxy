@@ -145,6 +145,7 @@ const CAN = 0x18;
 const SUB = 0x1a;
 const OSC_INTRODUCER = 0x5d; // "]" after ESC
 const C1_OSC = 0x9d; // U+009D, UTF-8 C2 9D
+const C1_ST = 0x9c; // U+009C, UTF-8 C2 9C: ends an OSC like BEL
 const UTF8_C1_LEAD = 0xc2;
 const SEMICOLON = 0x3b;
 const ZERO = 0x30;
@@ -227,7 +228,7 @@ export class ReplayCopyTracker {
       return;
     }
     if (this.state === "osc") {
-      if (byte === BEL) {
+      if (byte === BEL || (byte === C1_ST && this.lastByte === UTF8_C1_LEAD)) {
         this.state = "ground";
         return;
       }
@@ -314,6 +315,16 @@ export function createReplayAwareWriter(term: ReplayWriteTerminal, gate: CopyOut
       finishingReplayCopy = false;
       tracker.clear();
       writeClosed(ABORT_SEQUENCE, () => term.reset());
+    },
+    /**
+     * The session ended: copy-out stays closed until everything queued for it is parsed, so
+     * nothing it sent can copy in the gap before the next attach. Output is left as it is.
+     */
+    retire(): void {
+      afterReplay = false;
+      finishingReplayCopy = false;
+      tracker.clear();
+      writeClosed(new Uint8Array(0));
     },
     dispose(): void {
       disposed = true;

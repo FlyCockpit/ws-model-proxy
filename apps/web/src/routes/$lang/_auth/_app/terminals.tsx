@@ -100,9 +100,16 @@ function TerminalsPage() {
   return (
     <div className="flex min-w-0 flex-col gap-6">
       {/* No minimum height: when the keyboard leaves little room the terminal shrinks with it
-          (the 20x5 terminal floor still applies) instead of reaching below the visible area. */}
-      <div className="flex h-(--app-page-height) min-w-0 flex-col gap-6">
-        {maximized ? null : <PageHeading page="terminals" />}
+          (the 20x5 terminal floor still applies) instead of reaching below the visible area.
+          The section is a size container: when it is short (a phone with the keyboard open, a
+          landscape phone), the heading and the card's description give their space to the
+          terminal. Tabs, status and controls always stay. */}
+      <div className="flex h-(--app-page-height) min-w-0 flex-col gap-6 [container-type:size]">
+        {maximized ? null : (
+          <div className={SHORT_SECTION_HIDDEN}>
+            <PageHeading page="terminals" />
+          </div>
+        )}
         <TerminalWorkspace sessions={sessions} slugOf={slugOf} maximized={maximized} />
       </div>
       {maximized ? null : (
@@ -115,6 +122,9 @@ function TerminalsPage() {
     </div>
   );
 }
+
+/** Hidden when the terminal section is short (see the section's container). */
+const SHORT_SECTION_HIDDEN = "[@container(max-height:32rem)]:hidden";
 
 const tabIdOf = (localId: string) => `terminal-tab-${localId}`;
 const panelIdOf = (localId: string) => `terminal-panel-${localId}`;
@@ -160,7 +170,7 @@ function TerminalWorkspace({
   return (
     <Card className="min-h-0 flex-1">
       {maximized ? null : (
-        <CardHeader>
+        <CardHeader className={SHORT_SECTION_HIDDEN}>
           <CardTitle className="text-base">{t("terminals:workspaceTitle")}</CardTitle>
           <CardDescription>{t("terminals:workspaceDescription")}</CardDescription>
         </CardHeader>

@@ -97,6 +97,33 @@ describe("useTerminalCopy", () => {
     expect(toast.success).not.toHaveBeenCalled();
   });
 
+  it("clears the bar when a newer request supersedes it, even one that is too large", async () => {
+    const { result } = renderHook(() => useTerminalCopy());
+    act(() => result.current.onCopy({ kind: "text", text: "hello" }));
+    await flush();
+    act(() => result.current.onCopy({ kind: "too_large" }));
+    await flush();
+    expect(result.current.pending).toBeNull();
+    expect(toast.warning).toHaveBeenCalledWith("copyOut.tooLarge");
+  });
+
+  it("reports nothing for a clicked copy that finishes after its pane closed", async () => {
+    let finish: () => void = () => undefined;
+    writeText.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const { result, unmount } = renderHook(() => useTerminalCopy());
+    act(() => result.current.onCopy({ kind: "text", text: "hello" }));
+    await flush();
+    act(() => result.current.copyPending());
+    unmount();
+    await act(async () => finish());
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
   it("drops a pending copy when cleared (dismiss or a new attach)", async () => {
     const { result } = renderHook(() => useTerminalCopy());
     act(() => result.current.onCopy({ kind: "text", text: "hello" }));

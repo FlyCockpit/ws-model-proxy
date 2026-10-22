@@ -79,6 +79,11 @@ export function useXterm(options: XtermOptions): {
   /** Write output. `replay` marks scrollback replay, whose OSC 52 copies are never honored. */
   write: (data: Uint8Array, replay?: boolean) => void;
   reset: () => void;
+  /**
+   * The session ended: drop gesture authorization and keep copy-out closed until the output
+   * already queued for it is parsed. The screen stays until the next attach resets it.
+   */
+  retire: () => void;
   focus: () => void;
   /**
    * Apply a PTY size change in output order, while following: after the data
@@ -114,6 +119,12 @@ export function useXterm(options: XtermOptions): {
    * written before a size change still renders at the old size.
    */
   const queuedSizesRef = useRef(0);
+  /**
+   * A takeover's fit is waiting for the output queued before it to be parsed. Until it runs, no
+   * other layout (a ResizeObserver tick) may refit xterm: that output must render at the size it
+   * was written for.
+   */
+  const deferredFitRef = useRef(false);
   const [container, setContainer] = useState<HTMLDivElement | null>(null);
 
   const resizeQuietly = useCallback((size: TerminalSize) => {
@@ -163,6 +174,15 @@ export function useXterm(options: XtermOptions): {
     if (wasUnavailable) sizeUnavailableRef.current = false;
     if (!follow) {
       const term = termRef.current;
+      // Output queued at an earlier size is still being parsed: report the fitted size (the PTY
+      // may follow it now) but leave xterm's size to the queued events and the deferred fit.
+      if (deferredFitRef.current || queuedSizesRef.current > 0) {
+        if (own && (wasUnavailable || !sameSize(own, ownSizeRef.current))) {
+          ownSizeRef.current = own;
+          handlersRef.current.onResize(own);
+        }
+        return own !== null;
+      }
       if (term && own && (term.cols !== own.cols || term.rows !== own.rows))
         term.resize(own.cols, own.rows);
       else if (term && own && wasUnavailable) handlersRef.current.onResize(own);
@@ -195,6 +215,7 @@ export function useXterm(options: XtermOptions): {
     termRef.current = term;
     fitRef.current = fit;
     queuedSizesRef.current = 0;
+    deferredFitRef.current = false;
     sizeUnavailableRef.current = true;
     // A new xterm starts with no authorization: gestures made in the old one do not carry over.
     gate.clearReplay();
@@ -480,8 +501,11 @@ export function useXterm(options: XtermOptions): {
     if (!container || (followCols === null) !== (followRows === null)) return;
     const term = termRef.current;
     if (followCols === null && term) {
+      deferredFitRef.current = true;
       term.write("", () => {
-        if (termRef.current === term) layout();
+        if (termRef.current !== term) return;
+        deferredFitRef.current = false;
+        layout();
       });
       return;
     }
@@ -498,6 +522,11 @@ export function useXterm(options: XtermOptions): {
     inputGate.disarm();
     writerRef.current?.reset();
   }, [gate, inputGate]);
+  const retire = useCallback(() => {
+    gate.disarm();
+    inputGate.disarm();
+    writerRef.current?.retire();
+  }, [gate, inputGate]);
   const focus = useCallback(() => {
     termRef.current?.focus();
   }, []);
@@ -506,12 +535,14 @@ export function useXterm(options: XtermOptions): {
       const term = termRef.current;
       if (!term) return;
       // xterm parses writes asynchronously. Resize once everything written so
-      // far is parsed, and before anything written after this is.
+      // far is parsed, and before anything written after this is. A size that arrived while
+      // following still applies after a takeover: the output around it was written at it.
+      const followedWhenQueued = followRef.current !== null;
       queuedSizesRef.current += 1;
       term.write("", () => {
         if (termRef.current !== term) return;
         queuedSizesRef.current -= 1;
-        if (followRef.current) resizeQuietly(size);
+        if (followedWhenQueued || followRef.current) resizeQuietly(size);
       });
     },
     [followRef, resizeQuietly],
@@ -538,6 +569,7 @@ export function useXterm(options: XtermOptions): {
     host: container,
     write,
     reset,
+    retire,
     focus,
     followResize,
     snapshot,
