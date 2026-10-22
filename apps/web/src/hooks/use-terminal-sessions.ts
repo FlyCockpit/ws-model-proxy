@@ -320,6 +320,15 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   activeLocalId: string | null;
   selectTab: (localId: string) => void;
   /**
+   * The tab in Select text mode, or null. Only the active tab can be; switching or closing tabs
+   * ends the mode. Its input is paused where all input passes: keys, pastes, image pastes,
+   * mouse reports, xterm's replies and a ticket's typed command all wait or are dropped.
+   */
+  selectingLocalId: string | null;
+  setSelecting: (localId: string | null) => void;
+  /** The live session a tab's input goes to (compared by identity), or null. */
+  currentSession: (localId: string) => unknown;
+  /**
    * Open a terminal from a ticket (`nodes.terminals.openTicket` / `nodes.queued.run`). Refreshes
    * the CLI list first, so a node that just came online can open. `typedCommand` is typed into
    * the shell once it shows output, without a newline: the person presses Enter.
@@ -355,13 +364,25 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const trustRef = useRef(new Map<string, { key: string; promise: Promise<CliTrust> }>());
   const [listReady] = useState<Deferred>(deferred);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
-  const [activeLocalId, setActiveLocalId] = useState<string | null>(null);
+  const [activeLocalId, setActiveLocalIdState] = useState<string | null>(null);
+  const [selectingLocalId, setSelectingLocalIdState] = useState<string | null>(null);
+  /** Select text's tab, updated synchronously: input checks it before the render. */
+  const selectingRef = useRef<string | null>(null);
   /**
    * Tabs as of the last commit. Handlers that add or remove tabs also write it
    * at once, so later messages in the same tick see the change.
    */
   const tabsRef = useRef(tabs);
   const activeRef = useRef(activeLocalId);
+  /** A new active tab (or none) always ends Select text, wherever the switch came from. */
+  const setActiveLocalId = useCallback((localId: string | null) => {
+    activeRef.current = localId;
+    setActiveLocalIdState(localId);
+    if (selectingRef.current !== null && selectingRef.current !== localId) {
+      selectingRef.current = null;
+      setSelectingLocalIdState(null);
+    }
+  }, []);
   const cliKeysRef = useRef(new Map<string, string | null>());
   /** Writer state per tab, updated synchronously ahead of the render. */
   const viewRef = useRef(new Map<string, TerminalWriterState>());
@@ -543,8 +564,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (activeRef.current === localId) {
         setActiveLocalId(remaining[remaining.length - 1]?.localId ?? null);
       }
+      if (selectingRef.current === localId) {
+        selectingRef.current = null;
+        setSelectingLocalIdState(null);
+      }
     },
-    [clearTimer],
+    [clearTimer, setActiveLocalId],
   );
 
   /** Send a close intent's frame on the current socket (see `sendCloseIntent`). */
@@ -619,39 +644,47 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     }
   }, []);
 
-  const emitOutput = useCallback((localId: string, event: TerminalOutputEvent) => {
-    // A frame that was mid-decryption when its tab closed has nowhere to go.
-    if (!tabsRef.current.some((tab) => tab.localId === localId)) return;
-    if (event.kind === "data" && typedCommandsRef.current.has(localId)) {
-      // The shell is starting: type the command once its output settles (the prompt).
-      const timers = typedTimersRef.current;
-      const previous = timers.get(localId);
-      if (previous) clearTimeout(previous);
-      timers.set(
-        localId,
-        setTimeout(() => {
-          timers.delete(localId);
-          const typed = typedCommandsRef.current.get(localId);
-          const tab = tabsRef.current.find((item) => item.localId === localId);
-          // Not live now (the socket dropped): wait for output after the reattach.
-          if (typed === undefined || !tab?.terminalId || !sessionsRef.current.has(tab.terminalId))
-            return;
-          typedCommandsRef.current.delete(localId);
-          sendInputRef.current(localId, typed);
-        }, TYPED_COMMAND_QUIET_MS),
-      );
-    }
-    const listener = listenersRef.current.get(localId);
-    if (listener) {
-      if (resetBeforeOutputRef.current.delete(localId)) resettersRef.current.get(localId)?.();
-      listener(event);
-      return;
-    }
-    const queued = buffersRef.current.get(localId) ?? [];
-    queued.push(event);
-    if (queued.length > OUTPUT_BUFFER_EVENTS) queued.shift();
-    buffersRef.current.set(localId, queued);
+  /** Type a ticket's command once the shell's output settles (the prompt). */
+  const scheduleTypedCommand = useCallback((localId: string) => {
+    if (!typedCommandsRef.current.has(localId)) return;
+    const timers = typedTimersRef.current;
+    const previous = timers.get(localId);
+    if (previous) clearTimeout(previous);
+    timers.set(
+      localId,
+      setTimeout(() => {
+        timers.delete(localId);
+        const typed = typedCommandsRef.current.get(localId);
+        const tab = tabsRef.current.find((item) => item.localId === localId);
+        // Not live now (the socket dropped): wait for output after the reattach.
+        if (typed === undefined || !tab?.terminalId || !sessionsRef.current.has(tab.terminalId))
+          return;
+        // Select text pauses input: the command waits until the mode ends.
+        if (selectingRef.current === localId) return;
+        typedCommandsRef.current.delete(localId);
+        sendInputRef.current(localId, typed);
+      }, TYPED_COMMAND_QUIET_MS),
+    );
   }, []);
+
+  const emitOutput = useCallback(
+    (localId: string, event: TerminalOutputEvent) => {
+      // A frame that was mid-decryption when its tab closed has nowhere to go.
+      if (!tabsRef.current.some((tab) => tab.localId === localId)) return;
+      if (event.kind === "data") scheduleTypedCommand(localId);
+      const listener = listenersRef.current.get(localId);
+      if (listener) {
+        if (resetBeforeOutputRef.current.delete(localId)) resettersRef.current.get(localId)?.();
+        listener(event);
+        return;
+      }
+      const queued = buffersRef.current.get(localId) ?? [];
+      queued.push(event);
+      if (queued.length > OUTPUT_BUFFER_EVENTS) queued.shift();
+      buffersRef.current.set(localId, queued);
+    },
+    [scheduleTypedCommand],
+  );
 
   const applyPtySize = useCallback(
     (localId: string, cols: number, rows: number) => {
@@ -716,6 +749,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const flushResize = useCallback(
     (localId: string) => {
       clearTimer(resizeTimersRef.current, localId);
+      // A tab hidden since the resize was scheduled no longer has that box. It reports its size
+      // again when it is shown.
+      if (activeRef.current !== localId) return;
       const own = ownSizeRef.current.get(localId);
       if (!own || !canSendResize(viewOf(localId))) return;
       if (sameSize(own, lastSentSizeRef.current.get(localId))) return;
@@ -1641,7 +1677,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       } catch {
         return;
       }
-      // Advance only after authentication, and only on the epoch still held.
+      // Advance only after authentication, only on the epoch still held, and only while this is
+      // still the tab's session (a detach or reattach during decryption retires it).
+      if (sessionsRef.current.get(session.terminalId) !== session) return;
       if (session.output !== output || seq <= output.recvSeq) return;
       output.recvSeq = seq;
       const decoded = decodeTerminalPlaintextV2(plaintext);
@@ -1679,6 +1717,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       } catch {
         return;
       }
+      // A detach or reattach during decryption retired this session.
+      if (sessionsRef.current.get(session.terminalId) !== session) return;
       if (seq <= session.recvSeq) return;
       session.recvSeq = seq;
       const decoded = decodeTerminalPlaintextV2(plaintext);
@@ -1697,12 +1737,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       }
       // A new key drops the old epoch. A stale or repeated key is ignored.
       if (session.output && decoded.epoch <= session.output.epoch) return;
-      session.output = {
-        epoch: decoded.epoch,
-        key: await importTerminalOutputKey(decoded.key),
-        recvSeq: 0n,
-      };
+      const key = await importTerminalOutputKey(decoded.key);
       decoded.key.fill(0);
+      if (sessionsRef.current.get(session.terminalId) !== session) return;
+      if (session.output && decoded.epoch <= session.output.epoch) return;
+      session.output = { epoch: decoded.epoch, key, recvSeq: 0n };
       const queued = session.future;
       session.future = [];
       for (const pending of queued) {
@@ -1906,6 +1945,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       const tab = tabsRef.current.find((item) => item.localId === localId);
       // A session being ended takes no more keystrokes.
       if (tab?.ending === "pending") return false;
+      // Select text pauses this tab's input, whatever produced it.
+      if (selectingRef.current === localId) return false;
       const live =
         tab?.terminalId && tab.phase !== "exited" ? sessionsRef.current.has(tab.terminalId) : false;
       if (imageId && !live) return false;
@@ -2035,6 +2076,25 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     [publishTrust, retryTab],
   );
 
+  const setSelecting = useCallback(
+    (localId: string | null) => {
+      // Only the active tab can be selecting.
+      const next = localId !== null && localId === activeRef.current ? localId : null;
+      const previous = selectingRef.current;
+      if (previous === next) return;
+      selectingRef.current = next;
+      setSelectingLocalIdState(next);
+      // A ticket's command held while selecting is typed once the output settles again.
+      if (previous !== null) scheduleTypedCommand(previous);
+    },
+    [scheduleTypedCommand],
+  );
+
+  const currentSession = useCallback((localId: string): unknown => {
+    const tab = tabsRef.current.find((item) => item.localId === localId);
+    return (tab?.terminalId && sessionsRef.current.get(tab.terminalId)) || null;
+  }, []);
+
   return {
     status: socket.status,
     identityReady: identity.ready,
@@ -2044,6 +2104,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     tabs,
     activeLocalId,
     selectTab,
+    selectingLocalId,
+    setSelecting,
+    currentSession,
     openTicket,
     refreshClis,
     detachTab,

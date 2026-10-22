@@ -134,7 +134,7 @@ export function wireTerminalCopyOut(
 /**
  * CAN: aborts any escape sequence in progress (VT parsers, xterm included, return to ground).
  * Written as bytes, not a string: xterm decodes byte writes with their own UTF-8 decoder, and
- * only a byte write breaks a C1 lead byte (0xC2) the replay left in it.
+ * only a byte write reaches the state the replay's bytes left in it.
  */
 const ABORT_SEQUENCE = Uint8Array.of(0x18);
 
@@ -150,11 +150,14 @@ const ZERO = 0x30;
 const NINE = 0x39;
 
 /**
- * Follows replayed bytes far enough to tell whether the replay ends where live output could
- * still complete an OSC 52 copy: inside an OSC whose number is, or may still become, 52, or
- * right after an ESC or a UTF-8 C1 lead byte that live output could turn into one. It errs
- * towards "maybe": a false maybe only aborts one sequence split exactly at the replay's end.
- * Every other sequence (colors, OSC 8 links, titles) passes the boundary untouched.
+ * Replay protection's scope: an OSC 52 copy that a program sent earlier must not fire again when
+ * its scrollback is replayed to a joining or reattaching viewer. That is a guard against stale,
+ * accidental copies, not against a hostile program: a program in the terminal can already copy
+ * anything with live output after the person's next gesture, so bytes crafted to confuse this
+ * tracker (an ignored control inside an OSC number, a sequence split at an unusual point) gain
+ * it nothing it does not already have. The tracker therefore follows only the plain forms of an
+ * OSC 52 introducer (ESC ] or C1 OSC, the number 52 with optional leading zeros) and stays out
+ * of the way of everything else, so no other sequence is altered at the replay boundary.
  */
 export class ReplayCopyTracker {
   private state: "ground" | "escape" | "osc" = "ground";
@@ -171,9 +174,8 @@ export class ReplayCopyTracker {
     }
   }
 
-  /** Could live output that follows complete an OSC 52 copy begun in the bytes fed so far? */
+  /** Does the replay end inside an OSC that is, or may still become, an OSC 52 copy? */
   copyMayBeOpen(): boolean {
-    if (this.state === "escape" || this.lastByte === UTF8_C1_LEAD) return true;
     if (this.state !== "osc") return false;
     if (this.oscNumberDone) return this.oscNumber === "52";
     return this.oscNumber !== null;
@@ -229,29 +231,35 @@ export class ReplayCopyTracker {
 
 type ReplayWriteTerminal = {
   write: (data: string | Uint8Array, callback?: () => void) => void;
+  reset: () => void;
 };
 
 /**
- * Writes output to xterm with replay protection: an OSC 52 copy is honored only when every byte
- * of it arrived as live output. Replayed scrollback keeps copy-out closed until xterm has parsed
- * it, which covers copies that end inside the replay. A copy the replay leaves open is aborted
- * (CAN) before the first live write, so live output cannot complete it.
+ * Writes output to xterm with replay protection: a copy a program sent before this viewer's
+ * replay never fires again. Copy-out stays closed while replayed bytes (and anything queued
+ * before a reset) are parsed, which covers copies that end inside the replay. A copy the replay
+ * leaves open is aborted (CAN) before the first live write, so live output cannot complete it.
  */
 export function createReplayAwareWriter(term: ReplayWriteTerminal, gate: CopyOutGate) {
   const tracker = new ReplayCopyTracker();
   let afterReplay = false;
   let disposed = false;
+  /** Close the gate until xterm has parsed everything written so far, this chunk included. */
+  const writeClosed = (data: Uint8Array, then?: () => void) => {
+    gate.beginReplayChunk();
+    term.write(data, () => {
+      if (disposed) return;
+      then?.();
+      gate.endReplayChunk();
+    });
+  };
   return {
     write(data: Uint8Array, replay = false): void {
       if (replay) {
         afterReplay = true;
         tracker.feed(data);
-        // xterm parses writes in order and calls back right after this chunk, so the gate is
-        // closed for exactly the replayed bytes.
-        gate.beginReplayChunk();
-        term.write(data, () => {
-          if (!disposed) gate.endReplayChunk();
-        });
+        // xterm parses writes in order and calls back right after this chunk.
+        writeClosed(data);
         return;
       }
       if (afterReplay) {
@@ -261,10 +269,17 @@ export function createReplayAwareWriter(term: ReplayWriteTerminal, gate: CopyOut
       }
       term.write(data);
     },
-    /** A reset grounds the parser itself. */
+    /**
+     * Before a replay: reset the screen in output order. xterm's own reset() runs at once, keeps
+     * the parser's state and leaves earlier writes queued, so output from the previous attach
+     * would still parse (and could complete a sequence) after it. Instead, abort any open
+     * sequence and reset once everything queued before it has been parsed, with copy-out closed
+     * throughout.
+     */
     reset(): void {
       afterReplay = false;
       tracker.clear();
+      writeClosed(ABORT_SEQUENCE, () => term.reset());
     },
     dispose(): void {
       disposed = true;

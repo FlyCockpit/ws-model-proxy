@@ -57,6 +57,66 @@ describe("useMobileKeyboard inset", () => {
     expect(inset()).toBe("320px");
   });
 
+  it("keeps the inset through a pinch zoom and back", () => {
+    renderHook(() => useMobileKeyboard());
+    act(() => {
+      viewport.height = 480;
+      viewport.dispatchEvent(new Event("resize"));
+    });
+    expect(inset()).toBe("320px");
+    // Zoomed in, the visual viewport shrinks without any keyboard change.
+    act(() => {
+      viewport.scale = 2;
+      viewport.height = 240;
+      viewport.dispatchEvent(new Event("resize"));
+    });
+    expect(inset()).toBe("320px");
+    act(() => {
+      viewport.scale = 1;
+      viewport.height = 480;
+      viewport.dispatchEvent(new Event("resize"));
+    });
+    expect(inset()).toBe("320px");
+  });
+
+  it("keeps covering the keyboard after rotating past the mobile breakpoint", () => {
+    const width = vi.spyOn(window, "innerWidth", "get");
+    const height = vi.spyOn(window, "innerHeight", "get");
+    const { result } = renderHook(() => useMobileKeyboard());
+    act(() => {
+      viewport.height = 480;
+      viewport.dispatchEvent(new Event("resize"));
+    });
+    // Landscape on a large phone: wider than the breakpoint, the keyboard still open.
+    act(() => {
+      width.mockReturnValue(900);
+      height.mockReturnValue(400);
+      viewport.height = 200;
+      window.dispatchEvent(new Event("resize"));
+    });
+    expect(result.current).toBe(false);
+    expect(inset()).toBe("200px");
+  });
+
+  it("follows the keyboard's geometry, not focus, while it closes", () => {
+    renderHook(() => useMobileKeyboard());
+    act(() => {
+      viewport.height = 480;
+      viewport.dispatchEvent(new Event("resize"));
+    });
+    // Blur fires before the keyboard has moved: it still covers 320px.
+    act(() => {
+      input.blur();
+      viewport.dispatchEvent(new Event("resize"));
+    });
+    expect(inset()).toBe("320px");
+    act(() => {
+      viewport.height = 800;
+      viewport.dispatchEvent(new Event("resize"));
+    });
+    expect(inset()).toBe("0px");
+  });
+
   it("clears the inset on unmount", () => {
     const { unmount } = renderHook(() => useMobileKeyboard());
     unmount();

@@ -23,18 +23,17 @@ const PINCH_ZOOM_SCALE_EPSILON = 0.01;
 export const KEYBOARD_INSET_VAR = "--keyboard-inset";
 
 /**
- * The covered height while the keyboard is open: the part of the layout viewport below the
- * visual viewport, from current geometry only. The detector's baseline can be from before a
- * rotation, so it must not be used here. A browser that shrinks the layout viewport for the
- * keyboard leaves nothing covered, and the inset is 0.
+ * The height the software keyboard covers: the part of the layout viewport below the visual
+ * viewport, from current geometry only. It is not the open/closed decision that hides the
+ * BottomNav (that one is deliberately conservative: mobile widths, an editable focus): a keyboard
+ * still covers the page after a rotation past the mobile breakpoint or while focus moves. A
+ * browser that shrinks the layout viewport for the keyboard leaves nothing covered (0).
  */
 export function keyboardInsetPx(
-  isKeyboardOpen: boolean,
   layoutViewportHeight: number,
   visualViewportHeight: number,
   visualViewportOffsetTop: number,
 ): number {
-  if (!isKeyboardOpen) return 0;
   const covered = layoutViewportHeight - visualViewportHeight - visualViewportOffsetTop;
   return Math.min(layoutViewportHeight, Math.max(0, Math.round(covered)));
 }
@@ -198,6 +197,8 @@ export function useMobileKeyboard(): boolean {
   const keyboardOpenRef = useRef(false);
   const previousVisualViewportHeightRef = useRef(0);
   const geometryRef = useRef({ width: 0, scale: 1, orientation: "" });
+  /** The last inset measured unzoomed. */
+  const insetRef = useRef(0);
 
   useEffect(() => {
     const readGeometry = () => {
@@ -239,15 +240,16 @@ export function useMobileKeyboard(): boolean {
         scale: geometry.scale,
         orientation: geometry.orientation,
       };
-      document.documentElement.style.setProperty(
-        KEYBOARD_INSET_VAR,
-        `${keyboardInsetPx(
-          decision.isKeyboardOpen,
+      // Pinch zoom shrinks the visual viewport without any keyboard, so the covered height
+      // cannot be measured then: keep the last unzoomed one until the zoom ends.
+      if (!isPinchZoomed(geometry.scale)) {
+        insetRef.current = keyboardInsetPx(
           window.innerHeight,
           geometry.height,
           window.visualViewport?.offsetTop ?? 0,
-        )}px`,
-      );
+        );
+      }
+      document.documentElement.style.setProperty(KEYBOARD_INSET_VAR, `${insetRef.current}px`);
       setKeyboardOpen(decision.isKeyboardOpen);
     };
 

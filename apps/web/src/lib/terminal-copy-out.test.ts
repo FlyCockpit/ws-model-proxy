@@ -97,8 +97,10 @@ describe("terminal copy-out", () => {
     ["an OSC 52 aborted by CAN", "\x1b]52;c;QQ\x18", false],
     ["an OSC 52 ended by ESC", "\x1b]52;c;QQ\x1b\\", false],
     ["an open color sequence", "\x1b[31", false],
-    ["a lone ESC", "\x1b", true],
-    ["a UTF-8 C1 lead byte", "\xc2", true],
+    // Not yet any sequence: treating them as copies would break colors and characters split
+    // there. A copy whose introducer arrives live is a copy made now, not a stale one.
+    ["a lone ESC", "\x1b", false],
+    ["a UTF-8 C1 lead byte", "\xc2", false],
     ["an open C1 OSC 52", "\xc2\x9d52;c;", true],
   ])("tells whether replay ending in %s may leave a copy open", (_label, text, open) => {
     const tracker = new ReplayCopyTracker();

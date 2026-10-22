@@ -111,7 +111,18 @@ vi.mock("@/lib/terminal-copy-out", async (importOriginal) => {
 
 import { useTerminalPane } from "./use-terminal-pane";
 
+/** The pane box's size: jsdom lays nothing out, so tests set it (0 is a hidden or empty box). */
+const box = { width: 800, height: 600 };
+
 beforeAll(() => {
+  Object.defineProperty(HTMLElement.prototype, "clientWidth", {
+    configurable: true,
+    get: () => box.width,
+  });
+  Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+    configurable: true,
+    get: () => box.height,
+  });
   vi.stubGlobal(
     "ResizeObserver",
     class {
@@ -124,6 +135,8 @@ beforeAll(() => {
 afterEach(() => {
   cleanup();
   xterm.instances.length = 0;
+  box.width = 800;
+  box.height = 600;
 });
 
 /** Output for one tab, held until a listener subscribes (as the session hook does). */
@@ -182,6 +195,53 @@ describe("useTerminalPane", () => {
     // Live output never closes the gate.
     act(() => source.emit(data("live")));
     expect(gate.allowed(true)).toBe(true);
+  });
+
+  it("pastes nothing, not even the fallback text, into a session that replaced the upload's", async () => {
+    const source = outputSource();
+    const onImageError = vi.fn();
+    const sendInput = vi.fn();
+    let session = { id: "first" };
+    let fail: ((error: Error) => void) | undefined;
+    const { result } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow: null,
+        sendInput,
+        sendResize: () => undefined,
+        subscribeOutput: source.subscribeOutput,
+        currentSession: () => session,
+        onImage: () =>
+          new Promise<TerminalImageAttachment>((_resolve, reject) => {
+            fail = reject;
+          }),
+        onImageError,
+      }),
+    );
+    act(() => result.current.containerRef(document.createElement("div")));
+    const term = xterm.instances[0];
+    if (!term) throw new Error("no terminal");
+    const file = new File(["png"], "image.png", { type: "image/png" });
+    const event = new Event("paste", { cancelable: true });
+    Object.defineProperty(event, "clipboardData", {
+      value: {
+        types: ["Files", "text/plain"],
+        items: [{ kind: "file", type: "image/png", getAsFile: () => file }],
+        getData: () => "clipboard text",
+      },
+    });
+    act(() => {
+      term.textarea.dispatchEvent(event);
+    });
+    // A reattach replaced the session while the upload ran; the upload then fails.
+    session = { id: "second" };
+    await act(async () => {
+      fail?.(new Error("unavailable"));
+    });
+    expect(term.pasted).toEqual([]);
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(onImageError).toHaveBeenCalled();
   });
 
   it("drops an image paste that finishes uploading during Select text", async () => {
@@ -652,5 +712,42 @@ describe("useTerminalPane", () => {
     // Hidden (another dashboard page shows): a 0x0 box must not resize the PTY.
     expect(render(true)).not.toHaveBeenCalled();
     expect(render(false)).toHaveBeenCalledWith("local_1", 80, 24);
+  });
+
+  it("never reports a size for a zero-size box (FitAddon would make it 2x1)", () => {
+    box.height = 0;
+    const sendResize = vi.fn();
+    const { result } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: true,
+        follow: { cols: 100, rows: 30 },
+        sendInput: () => undefined,
+        sendResize,
+        subscribeOutput: outputSource().subscribeOutput,
+      }),
+    );
+    act(() => result.current.containerRef(document.createElement("div")));
+    expect(sendResize).not.toHaveBeenCalled();
+  });
+
+  it("reports its size when its tab is shown again, not while hidden", () => {
+    const sendResize = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ active }: { active: boolean }) =>
+        useTerminalPane({
+          localId: "local_1",
+          active,
+          follow: null,
+          sendInput: () => undefined,
+          sendResize,
+          subscribeOutput: outputSource().subscribeOutput,
+        }),
+      { initialProps: { active: false } },
+    );
+    act(() => result.current.containerRef(document.createElement("div")));
+    expect(sendResize).not.toHaveBeenCalled();
+    rerender({ active: true });
+    expect(sendResize).toHaveBeenCalledWith("local_1", 80, 24);
   });
 });

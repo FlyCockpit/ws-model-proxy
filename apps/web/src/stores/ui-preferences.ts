@@ -34,7 +34,10 @@ export const useUiPreferences = create<UiPreferencesState>()(
       storage: createJSONStorage(() => localStorage),
       // Stored values are untrusted (older builds, hand edits): unknown ones fall back.
       merge: (persisted, current) => {
-        const stored = typeof persisted === "object" && persisted !== null ? persisted : {};
+        const stored =
+          typeof persisted === "object" && persisted !== null && !Array.isArray(persisted)
+            ? persisted
+            : {};
         const sidebarCollapsed =
           "sidebarCollapsed" in stored && typeof stored.sidebarCollapsed === "boolean"
             ? stored.sidebarCollapsed

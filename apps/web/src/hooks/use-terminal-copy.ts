@@ -1,50 +1,79 @@
 import { toast } from "@ws-model-proxy/ui/components/sileo";
-import { useCallback, useRef } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { deliverTerminalCopy } from "@/lib/terminal-clipboard";
 import type { Osc52Copy } from "@/lib/terminal-copy-out";
 import { useUiPreferences } from "@/stores/ui-preferences";
 
-/** How long the "Copy" prompt stays up. */
-const COPY_PROMPT_MS = 15_000;
+/** A copy waiting for the person's click, shown in its own pane. */
+export type PendingTerminalCopy = { id: number; text: string };
+
+/** Write to the clipboard, turning a synchronous failure (no Clipboard API) into a rejection. */
+function writeClipboard(text: string): Promise<void> {
+  try {
+    return navigator.clipboard.writeText(text);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
 
 /**
- * Deliver a program's copy request (OSC 52) per the person's "When a program copies text"
- * setting. Only the latest prompt is shown: a newer copy replaces it.
+ * One pane's copy requests (OSC 52), delivered per the person's "When a program copies text"
+ * setting. A request that needs a click waits in the pane's copy bar, not a toast: it belongs to
+ * this tab, so closing the tab, a new attach (`clear`) or turning copying off drops it. Only the
+ * newest request counts: an older one finishing late never replaces it.
  */
-export function useTerminalCopy(): (copy: Osc52Copy) => void {
+export function useTerminalCopy(): {
+  onCopy: (copy: Osc52Copy) => void;
+  /** The copy waiting for a click, or null. Hidden while copying is off. */
+  pending: PendingTerminalCopy | null;
+  /** The Copy button: a fresh gesture, so the write works in every browser. */
+  copyPending: () => void;
+  /** Dismiss the bar, or drop a pending copy at a session boundary. */
+  clear: () => void;
+} {
   const { t } = useTranslation("terminals");
-  const promptIdRef = useRef<string | null>(null);
+  const mode = useUiPreferences((prefs) => prefs.terminalCopy);
+  const [pending, setPending] = useState<PendingTerminalCopy | null>(null);
+  const latestRef = useRef(0);
 
-  return useCallback(
+  const onCopy = useCallback(
     (copy: Osc52Copy) => {
-      const writeText = (text: string) => navigator.clipboard.writeText(text);
-      const copied = () => toast.success(t("copyOut.copied"));
-      const blocked = () => toast.error(t("copyOut.blocked"));
+      latestRef.current += 1;
+      const id = latestRef.current;
+      const isLatest = () => latestRef.current === id;
       void deliverTerminalCopy(useUiPreferences.getState().terminalCopy, copy, {
-        writeText,
-        copied,
+        writeText: writeClipboard,
+        copied: () => {
+          if (!isLatest()) return;
+          setPending(null);
+          toast.success(t("copyOut.copied"));
+        },
         tooLarge: () => toast.warning(t("copyOut.tooLarge")),
         prompt: (text) => {
-          if (promptIdRef.current) toast.dismiss(promptIdRef.current);
-          const id = toast.info(t("copyOut.promptTitle"), {
-            description: t("copyOut.promptBody"),
-            duration: COPY_PROMPT_MS,
-            action: {
-              label: t("copyOut.promptAction"),
-              // The click is a fresh user gesture, so the write works in every browser.
-              onClick: () => {
-                toast.dismiss(id);
-                if (promptIdRef.current === id) promptIdRef.current = null;
-                writeText(text).then(copied, blocked);
-              },
-            },
-          });
-          promptIdRef.current = id;
+          if (isLatest()) setPending({ id, text });
         },
       });
     },
     [t],
   );
+
+  const copyPending = useCallback(() => {
+    const current = pending;
+    setPending(null);
+    // The setting may have changed since the request: it is checked again at the click.
+    if (!current || useUiPreferences.getState().terminalCopy === "off") return;
+    writeClipboard(current.text).then(
+      () => toast.success(t("copyOut.copied")),
+      () => toast.error(t("copyOut.blocked")),
+    );
+  }, [pending, t]);
+
+  const clear = useCallback(() => {
+    latestRef.current += 1;
+    setPending(null);
+  }, []);
+
+  return { onCopy, pending: mode === "off" ? null : pending, copyPending, clear };
 }

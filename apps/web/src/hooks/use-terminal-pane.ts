@@ -25,6 +25,10 @@ type TerminalPaneHandlers = {
   shiftEnter?: TerminalShiftEnterMode;
   /** Select text mode: a frozen plain-text copy of the terminal covers it. */
   selecting?: boolean;
+  /** The session this tab's input goes to now (see useXterm `currentSession`). */
+  currentSession?: (localId: string) => unknown;
+  /** A new attach is about to replay the screen: anything tied to the old one is dropped. */
+  onReset?: () => void;
   subscribeOutput: (
     localId: string,
     listener: (event: TerminalOutputEvent) => void,
@@ -42,7 +46,9 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): {
     follow: handlers.follow,
     shiftEnter: handlers.shiftEnter ?? DEFAULT_TERMINAL_SHIFT_ENTER_MODE,
     selecting: handlers.selecting ?? false,
+    active: handlers.active,
     onCopy: (copy) => handlersRef.current.onCopy?.(copy),
+    currentSession: () => handlersRef.current.currentSession?.(handlersRef.current.localId) ?? null,
     onData: (data) => handlersRef.current.sendInput(handlersRef.current.localId, data),
     onImage: (file) => {
       const upload = handlersRef.current.onImage;
@@ -72,7 +78,10 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): {
         if (event.kind === "data") xtermRef.current.write(event.data, event.replay);
         else xtermRef.current.followResize({ cols: event.cols, rows: event.rows });
       },
-      () => xtermRef.current.reset(),
+      () => {
+        handlersRef.current.onReset?.();
+        xtermRef.current.reset();
+      },
     );
   }, [localId, host, handlersRef, xtermRef]);
 
@@ -85,10 +94,13 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): {
   }, [selecting, host, snapshot]);
 
   // Focus once the pane is active and xterm exists (a new host is a new xterm), and again when
-  // Select text ends.
+  // Select text ends. Not while the person is moving through the tabs with the keyboard: focus
+  // stays on the tab list there.
   const { focus } = xterm;
   useEffect(() => {
-    if (active && host && !selecting) focus();
+    if (!active || !host || selecting) return;
+    if (document.activeElement?.closest('[role="tablist"]')) return;
+    focus();
   }, [active, host, focus, selecting]);
 
   return { containerRef: xterm.containerRef, selectionText };

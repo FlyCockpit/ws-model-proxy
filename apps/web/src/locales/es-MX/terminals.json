@@ -186,6 +186,7 @@
     "promptTitle": "La terminal copió texto",
     "promptBody": "Presiona Copiar para ponerlo en tu portapapeles.",
     "promptAction": "Copiar",
+    "dismiss": "Descartar",
     "copied": "Copiado a tu portapapeles",
     "tooLarge": "La terminal intentó copiar demasiado texto, así que se omitió.",
     "blocked": "Tu navegador bloqueó la copia. Prueba con Seleccionar texto."

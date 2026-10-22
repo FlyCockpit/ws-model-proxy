@@ -1,7 +1,7 @@
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useTerminalCopy } from "@/hooks/use-terminal-copy";
 import { useTerminalPane } from "@/hooks/use-terminal-pane";
@@ -14,6 +14,9 @@ import { useUiPreferences } from "@/stores/ui-preferences";
 type TerminalPaneProps = {
   localId: string;
   active: boolean;
+  /** The id of this pane's tab, for its tabpanel's label. */
+  tabId: string;
+  panelId: string;
   follow: TerminalSize | null;
   /** Select text mode is on for this pane. */
   selecting: boolean;
@@ -26,6 +29,7 @@ type TerminalPaneProps = {
   ) => Promise<TerminalImageAttachment>;
   pasteImage: (localId: string, id: string, data: string) => Promise<boolean>;
   sendResize: (localId: string, cols: number, rows: number) => void;
+  currentSession: (localId: string) => unknown;
   subscribeOutput: (
     localId: string,
     listener: (event: TerminalOutputEvent) => void,
@@ -37,11 +41,13 @@ export function TerminalPane(props: TerminalPaneProps) {
   const { t } = useTranslation("terminals");
   const [uploadPercent, setUploadPercent] = useState<number | null>(null);
   const shiftEnter = useUiPreferences((prefs) => prefs.terminalShiftEnter);
-  const onCopy = useTerminalCopy();
+  const copy = useTerminalCopy();
   const { containerRef, selectionText } = useTerminalPane({
     ...props,
     shiftEnter,
-    onCopy,
+    onCopy: copy.onCopy,
+    // A copy prompted before a new attach belongs to the old one.
+    onReset: copy.clear,
     onImage: async (file) => {
       setUploadPercent(0);
       try {
@@ -87,6 +93,9 @@ export function TerminalPane(props: TerminalPaneProps) {
   });
   return (
     <div
+      id={props.panelId}
+      role="tabpanel"
+      aria-labelledby={props.tabId}
       className={cn(
         // Padding sits here, not on the xterm box: FitAddon measures that box's
         // border-box height, so padding there would overflow by a row.
@@ -111,6 +120,9 @@ export function TerminalPane(props: TerminalPaneProps) {
       {selectionText !== null ? (
         <SelectTextOverlay text={selectionText} onDone={props.onDoneSelecting} />
       ) : null}
+      {copy.pending && selectionText === null ? (
+        <CopyBar onCopy={copy.copyPending} onDismiss={copy.clear} />
+      ) : null}
       {uploadPercent !== null ? (
         <div
           role="status"
@@ -123,9 +135,41 @@ export function TerminalPane(props: TerminalPaneProps) {
   );
 }
 
+/**
+ * A program's copy waiting for a click. It sits over the bottom of the pane rather than taking
+ * layout space, so showing it never refits the terminal (which would resize the PTY).
+ */
+function CopyBar({ onCopy, onDismiss }: { onCopy: () => void; onDismiss: () => void }) {
+  const { t } = useTranslation("terminals");
+  return (
+    <section
+      aria-label={t("copyOut.promptTitle")}
+      className="absolute inset-x-0 bottom-0 flex min-w-0 flex-wrap items-center justify-between gap-2 border-(--term-border) border-t bg-(--term-chrome) px-3 py-1.5 text-(--term-fg) text-sm"
+    >
+      <div className="min-w-0" role="status">
+        <p>{t("copyOut.promptTitle")}</p>
+        <p className="text-(--term-muted) text-xs">{t("copyOut.promptBody")}</p>
+      </div>
+      <div className="flex shrink-0 gap-2">
+        <Button type="button" size="touch" variant="ghost" onClick={onDismiss}>
+          {t("copyOut.dismiss")}
+        </Button>
+        <Button type="button" size="touch" variant="secondary" onClick={onCopy}>
+          {t("copyOut.promptAction")}
+        </Button>
+      </div>
+    </section>
+  );
+}
+
 /** Select text: a frozen plain-text copy of the terminal that selects and copies natively. */
 function SelectTextOverlay({ text, onDone }: { text: string; onDone: () => void }) {
   const { t } = useTranslation("terminals");
+  // Open at the bottom, where the newest output is, once per opening: a stable callback, so a
+  // re-render never scrolls the person away from history they are selecting.
+  const scrollToNewest = useCallback((node: HTMLPreElement | null) => {
+    if (node) node.scrollTop = node.scrollHeight;
+  }, []);
   return (
     <div className="absolute inset-0 flex min-h-0 min-w-0 flex-col bg-(--term-bg)">
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 border-(--term-border) border-b bg-(--term-chrome) px-3 py-1.5 text-(--term-fg) text-sm">
@@ -138,10 +182,7 @@ function SelectTextOverlay({ text, onDone }: { text: string; onDone: () => void 
         </Button>
       </div>
       <pre
-        // Open at the bottom, where the newest output is.
-        ref={(node) => {
-          if (node) node.scrollTop = node.scrollHeight;
-        }}
+        ref={scrollToNewest}
         tabIndex={0}
         aria-label={t("selectText.label")}
         style={{ fontFamily: TERMINAL_FONT_FAMILY }}

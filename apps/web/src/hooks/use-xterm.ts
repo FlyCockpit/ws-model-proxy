@@ -34,6 +34,11 @@ type XtermHandlers = {
   onResize: (size: TerminalSize) => void;
   /** A program asked to copy text (OSC 52) while copy-out was allowed. */
   onCopy?: (copy: Osc52Copy) => void;
+  /**
+   * The session input goes to now (any value compared by identity), or null when none. An image
+   * paste only pastes into the session it started in: a reattach meanwhile cancels it.
+   */
+  currentSession?: () => unknown;
 };
 
 type XtermOptions = XtermHandlers & {
@@ -43,7 +48,18 @@ type XtermOptions = XtermHandlers & {
   shiftEnter: TerminalShiftEnterMode;
   /** Select text mode: input is paused, including image pastes that finish uploading meanwhile. */
   selecting: boolean;
+  /**
+   * The pane is the visible tab. A hidden pane never fits or reports a size, and it drops any
+   * gesture authorization it had.
+   */
+  active: boolean;
 };
+
+/** Option+click selects text on a Mac even in a mouse-reporting app (no report is sent). */
+const MAC_PLATFORM = /Mac|iPhone|iPad|iPod/;
+
+/** A key that only modifies others: pressing it alone is not input. */
+const MODIFIER_KEYS = new Set(["Shift", "Control", "Alt", "Meta", "AltGraph", "CapsLock"]);
 
 export function useXterm(options: XtermOptions): {
   containerRef: RefCallback<HTMLDivElement>;
@@ -69,6 +85,7 @@ export function useXterm(options: XtermOptions): {
   const followRef = useLatestRef(options.follow);
   const shiftEnterRef = useLatestRef(options.shiftEnter);
   const selectingRef = useLatestRef(options.selecting);
+  const activeRef = useLatestRef(options.active);
   const termRef = useRef<Terminal | null>(null);
   const writerRef = useRef<ReturnType<typeof createReplayAwareWriter> | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -100,10 +117,23 @@ export function useXterm(options: XtermOptions): {
   const layout = useCallback(() => {
     const fit = fitRef.current;
     if (!fit) return;
-    // The dashboard hides the workspace (display: none) on other pages. Its
-    // box then has no size, and fitting it would resize the PTY for everyone.
-    if (termRef.current?.element?.closest("[hidden]")) return;
     const follow = followRef.current;
+    // A hidden tab, or a workspace hidden on other pages, has no real box: measuring it would
+    // resize the PTY for everyone, and FitAddon would turn a zero-size box into 2x1. It still
+    // shows a follower's output at the PTY size, so text written while hidden wraps correctly.
+    const element = termRef.current?.element;
+    const box = element?.parentElement;
+    const measurable =
+      activeRef.current &&
+      !!element &&
+      !!box &&
+      !element.closest("[hidden]") &&
+      box.clientWidth > 0 &&
+      box.clientHeight > 0;
+    if (!measurable) {
+      if (follow && queuedSizesRef.current === 0) resizeQuietly(follow);
+      return;
+    }
     const proposed = fit.proposeDimensions();
     // Never below the floor: a smaller box clips the terminal instead.
     const own =
@@ -121,7 +151,7 @@ export function useXterm(options: XtermOptions): {
       handlersRef.current.onResize(own);
     }
     if (queuedSizesRef.current === 0) resizeQuietly(follow);
-  }, [followRef, handlersRef, resizeQuietly]);
+  }, [activeRef, followRef, handlersRef, resizeQuietly]);
 
   useEffect(() => {
     if (!container) return;
@@ -142,7 +172,10 @@ export function useXterm(options: XtermOptions): {
     termRef.current = term;
     fitRef.current = fit;
     queuedSizesRef.current = 0;
+    // A new xterm starts with no authorization: gestures made in the old one do not carry over.
     gate.clearReplay();
+    gate.disarm();
+    inputGate.disarm();
     const writer = createReplayAwareWriter(term, gate);
     writerRef.current = writer;
     type ImagePaste = {
@@ -186,9 +219,16 @@ export function useXterm(options: XtermOptions): {
       handlersRef.current.onResize(size);
     });
     const armInput = () => inputGate.arm(performance.now());
-    // A click claims the writer only in a mouse-reporting app. The wheel never does.
-    const armClick = () => {
-      if (term.modes.mouseTrackingMode !== "none") armInput();
+    // A modifier pressed alone sends nothing, so it must not let other data through.
+    const armKey = (event: KeyboardEvent) => {
+      if (!MODIFIER_KEYS.has(event.key)) armInput();
+    };
+    // A click claims the writer only in a mouse-reporting app. The wheel never does, and neither
+    // does a Mac Option+click, which selects text instead of sending a report.
+    const armClick = (event: MouseEvent) => {
+      if (term.modes.mouseTrackingMode === "none") return;
+      if (event.altKey && MAC_PLATFORM.test(navigator.platform)) return;
+      armInput();
     };
     // Any press in the pane opens the copy window: tmux and agents copy on mouse release.
     const armCopy = () => gate.armFromUserGesture();
@@ -201,6 +241,10 @@ export function useXterm(options: XtermOptions): {
       }
       uploading = true;
       let pastedImages = 0;
+      // The session this paste belongs to. A reattach meanwhile is another session: nothing from
+      // this paste (its path or the clipboard-text fallback) goes into it.
+      const session = handlersRef.current.currentSession?.() ?? null;
+      const sameSession = () => (handlersRef.current.currentSession?.() ?? null) === session;
       try {
         for (const file of files) {
           const upload = handlersRef.current.onImage;
@@ -213,6 +257,7 @@ export function useXterm(options: XtermOptions): {
             // Select text started while this uploaded: `inert` pauses only new input, so drop
             // the paste here rather than type a path behind the frozen copy.
             if (selectingRef.current) throw new Error("selecting");
+            if (!sameSession()) throw new Error("failed");
             // The transfer can outlive the user-input gate. Arm it again so a
             // follower's deliberate path paste can claim the writer normally.
             armInput();
@@ -235,6 +280,7 @@ export function useXterm(options: XtermOptions): {
           pastedImages === 0 &&
           fallbackText.length > 0 &&
           !selectingRef.current &&
+          sameSession() &&
           error instanceof Error &&
           (error.message === "update" || error.message === "unavailable")
         ) {
@@ -290,7 +336,7 @@ export function useXterm(options: XtermOptions): {
       term.focus();
       void pasteImages(files);
     };
-    container.addEventListener("keydown", armInput, true);
+    container.addEventListener("keydown", armKey, true);
     container.addEventListener("compositionstart", armInput, true);
     container.addEventListener("compositionupdate", armInput, true);
     container.addEventListener("compositionend", armInput, true);
@@ -308,7 +354,7 @@ export function useXterm(options: XtermOptions): {
     return () => {
       disposed = true;
       observer.disconnect();
-      container.removeEventListener("keydown", armInput, true);
+      container.removeEventListener("keydown", armKey, true);
       container.removeEventListener("compositionstart", armInput, true);
       container.removeEventListener("compositionupdate", armInput, true);
       container.removeEventListener("compositionend", armInput, true);
@@ -328,6 +374,24 @@ export function useXterm(options: XtermOptions): {
     };
   }, [container, followRef, gate, handlersRef, inputGate, layout, selectingRef, shiftEnterRef]);
 
+  // Becoming the visible tab lays out again (its box may have changed while hidden); hiding drops
+  // any gesture authorization, so nothing typed or clicked before counts later.
+  const { active } = options;
+  useEffect(() => {
+    if (!container) return;
+    if (active) {
+      layout();
+      // The writer reports its size again: a resize skipped while hidden must still reach the
+      // PTY (the session hook sends it only if it differs from the last one sent).
+      const term = termRef.current;
+      if (term && !followRef.current)
+        handlersRef.current.onResize({ cols: term.cols, rows: term.rows });
+    } else {
+      gate.disarm();
+      inputGate.disarm();
+    }
+  }, [active, container, followRef, gate, handlersRef, inputGate, layout]);
+
   const followCols = options.follow?.cols ?? null;
   const followRows = options.follow?.rows ?? null;
   // Entering or leaving follow mode, or a new PTY size: lay out again. Leaving
@@ -341,11 +405,12 @@ export function useXterm(options: XtermOptions): {
     writerRef.current?.write(data, replay);
   }, []);
   const reset = useCallback(() => {
-    // A reset comes before a scrollback replay: an old copy in it must not fire again.
+    // A reset comes before a scrollback replay (a new attach): no gesture from before it counts,
+    // and the screen resets in output order (see createReplayAwareWriter).
     gate.disarm();
+    inputGate.disarm();
     writerRef.current?.reset();
-    termRef.current?.reset();
-  }, [gate]);
+  }, [gate, inputGate]);
   const focus = useCallback(() => {
     termRef.current?.focus();
   }, []);

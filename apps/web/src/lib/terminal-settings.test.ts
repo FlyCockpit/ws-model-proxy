@@ -24,4 +24,10 @@ describe("parseTerminalSettings", () => {
       }),
     ).toEqual({ ...DEFAULT_TERMINAL_SETTINGS, terminalShiftEnter: "lf" });
   });
+
+  it("gives the defaults for stored values of the wrong shape, without throwing", () => {
+    for (const stored of [[], ["auto"], "auto", 42, null]) {
+      expect(parseTerminalSettings(stored)).toEqual(DEFAULT_TERMINAL_SETTINGS);
+    }
+  });
 });

@@ -186,6 +186,7 @@
     "promptTitle": "The terminal copied some text",
     "promptBody": "Click Copy to put it on your clipboard.",
     "promptAction": "Copy",
+    "dismiss": "Dismiss",
     "copied": "Copied to your clipboard",
     "tooLarge": "The terminal tried to copy too much text, so it was skipped.",
     "blocked": "Your browser blocked the copy. Try Select text instead."

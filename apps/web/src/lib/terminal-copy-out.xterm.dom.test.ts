@@ -64,12 +64,10 @@ describe("replay-aware writes with the real xterm parser", () => {
   });
 
   it.each([
-    ["after ESC", "\x1b", `]52;c;${encode("secret")}\x07`],
     ["inside the OSC number", "\x1b]5", `2;c;${encode("secret")}\x07`],
     ["after the OSC number", "\x1b]52", `;c;${encode("secret")}\x07`],
     ["inside the payload", `\x1b]52;c;${encode("sec")}`, `${encode("ret")}\x07`],
     ["with leading zeros", "\x1b]0052;c;", `${encode("secret")}\x07`],
-    ["after a UTF-8 C1 lead byte", "\xc2", `\x9d52;c;${encode("secret")}\x07`],
     ["after a C1 OSC", "\xc2\x9d52", `;c;${encode("secret")}\x07`],
   ])("blocks a copy cut %s at the end of the replay", async (_cut, replayed, live) => {
     const { term, gate, copies, writer } = setup();
@@ -93,6 +91,42 @@ describe("replay-aware writes with the real xterm parser", () => {
     expect(line?.translateToString(true)).toBe("red");
     expect(line?.getCell(0)?.isFgPalette()).toBe(true);
     expect(line?.getCell(0)?.getFgColor()).toBe(1);
+    term.dispose();
+  });
+
+  it("keeps a color sequence split right after its ESC", async () => {
+    const { term, writer } = setup();
+    writer.write(bytes("\x1b"), true);
+    await parsed(term);
+    writer.write(bytes("[31mred"));
+    await parsed(term);
+    const line = term.buffer.active.getLine(0);
+    expect(line?.translateToString(true)).toBe("red");
+    expect(line?.getCell(0)?.getFgColor()).toBe(1);
+    term.dispose();
+  });
+
+  it("keeps a UTF-8 character split across the replay and live output", async () => {
+    const { term, writer } = setup();
+    writer.write(Uint8Array.of(0xc2), true);
+    await parsed(term);
+    writer.write(Uint8Array.of(0xa3));
+    await parsed(term);
+    expect(term.buffer.active.getLine(0)?.translateToString(true)).toBe("£");
+    term.dispose();
+  });
+
+  it("drops output queued before a reset, and its open copy, with the screen", async () => {
+    const { term, gate, copies, writer } = setup();
+    // The previous attach left an open copy and more output queued, unparsed.
+    writer.write(bytes(`old\x1b]52;c;${encode("sec")}`));
+    writer.reset();
+    writer.write(bytes(`${encode("ret")}`), true);
+    gate.armFromUserGesture();
+    writer.write(bytes("\x07live"));
+    await parsed(term);
+    expect(copies).toEqual([]);
+    expect(term.buffer.active.getLine(0)?.translateToString(true)).not.toContain("old");
     term.dispose();
   });
 

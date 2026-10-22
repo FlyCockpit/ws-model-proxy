@@ -423,6 +423,41 @@ describe("useTerminalSessions (multi-viewer)", () => {
     });
   });
 
+  it("drops output that finishes decrypting after a detach retired its session", async () => {
+    const { events, outKey } = await setupV2();
+    await waitFor(() => expect(outputText(events)).toBe("hello "));
+    const frame = await sealBroadcast(outKey, 1, 1, "stale");
+    // Decryption starts (the receive chain checks the session first, a few microtasks in), then
+    // the relay detaches this viewer while WebCrypto is still working.
+    act(() => handlers().onSealed(frame));
+    for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+    message({ type: "detached", terminalId: TERMINAL_ID, reason: "slow" });
+    await settle();
+    expect(outputText(events)).toBe("hello ");
+  });
+
+  it("pauses all of a tab's input while Select text is on, and only for the active tab", async () => {
+    const { view, cli, localId } = await setupV2();
+    act(() => view.result.current.setSelecting("another-tab"));
+    expect(view.result.current.selectingLocalId).toBeNull();
+    act(() => view.result.current.setSelecting(localId));
+    expect(view.result.current.selectingLocalId).toBe(localId);
+    act(() => view.result.current.sendInput(localId, "typed while selecting"));
+    let pasted = true;
+    await act(async () => {
+      pasted = await view.result.current.pasteImage(localId, "0".repeat(32), "/tmp/a.png ");
+    });
+    expect(pasted).toBe(false);
+    await settle();
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+    act(() => view.result.current.setSelecting(null));
+    act(() => view.result.current.sendInput(localId, "ls"));
+    // A takeover resize comes first when this viewer was not the writer.
+    await vi.waitFor(() => expect(socket.sendFrame).toHaveBeenCalled());
+    const frames = await browserFrames(cli);
+    expect(frames.filter((frame) => "data" in frame)).toEqual([{ seq: frames.length, data: "ls" }]);
+  });
+
   it("updates the writer and viewer count from a viewers message", async () => {
     const { view } = await setupV2();
     message({ type: "viewers", terminalId: TERMINAL_ID, count: 3, writer: "other" });
@@ -1534,6 +1569,23 @@ describe("useTerminalSessions terminal tickets", () => {
     await waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(1));
     await unicast(cli, text("more output"));
     await settle();
+    expect(await browserFrames(cli)).toEqual([{ seq: 1, data: "nvidia-smi -L" }]);
+  });
+
+  it("holds the queued command while Select text is on and types it after", async () => {
+    const view = await openWith("nvidia-smi -L");
+    const cli = await openAsCli();
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    const localId = view.result.current.tabs[0]?.localId ?? "";
+    act(() => view.result.current.setSelecting(localId));
+    useFakeClock();
+    await unicast(cli, text("$ "));
+    await settle();
+    await advanceClock(1_000);
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+    act(() => view.result.current.setSelecting(null));
+    await advanceClock(1_000);
+    await vi.waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(1));
     expect(await browserFrames(cli)).toEqual([{ seq: 1, data: "nvidia-smi -L" }]);
   });
 

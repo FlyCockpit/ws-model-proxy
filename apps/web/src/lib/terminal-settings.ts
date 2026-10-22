@@ -31,10 +31,15 @@ const terminalSettingsSchema = z.object({
   terminalMaximized: z.boolean().catch(false),
 });
 
-/** Stored settings from localStorage: each missing or unknown value falls back to its default. */
+/**
+ * Stored settings from localStorage: each missing or unknown value falls back to its default, and
+ * a stored value of the wrong shape altogether (an array, a string) gives the defaults. Never
+ * throws: hydration must not fail on old or hand-edited storage.
+ */
 export function parseTerminalSettings(value: unknown): TerminalSettings {
-  const record = typeof value === "object" && value !== null ? value : {};
-  return terminalSettingsSchema.parse(record);
+  const record = typeof value === "object" && value !== null && !Array.isArray(value) ? value : {};
+  const parsed = terminalSettingsSchema.safeParse(record);
+  return parsed.success ? parsed.data : DEFAULT_TERMINAL_SETTINGS;
 }
 
 export function isTerminalCopyMode(value: unknown): value is TerminalCopyMode {

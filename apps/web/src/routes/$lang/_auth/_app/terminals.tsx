@@ -22,7 +22,7 @@ import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { Maximize2, Minimize2, Settings2, SquareTerminal, TextSelect, X } from "lucide-react";
-import { useState } from "react";
+import type { KeyboardEvent } from "react";
 import { useTranslation } from "react-i18next";
 
 import { CodeSnippet } from "@/components/code-snippet";
@@ -31,6 +31,7 @@ import { PageHeading } from "@/components/page-stub";
 import { OperatorStepItem } from "@/components/runtimes/operator-step-item";
 import { TerminalPane } from "@/components/terminal-pane";
 import { TimeAgo } from "@/components/time-ago";
+import { WideContent } from "@/components/wide-content";
 import {
   type OpenTicketInput,
   type TerminalTab,
@@ -94,10 +95,20 @@ function TerminalsPage() {
     useUiPreferences((prefs) => prefs.terminalMaximized) && sessions.tabs.length > 0;
   // One tree for both layouts: the workspace keeps its element position, so toggling maximize
   // never remounts the xterms (a new xterm starts empty; output already shown is not replayed).
+  // The first section is the visible page height the app frame provides (--app-page-height):
+  // flex gives the terminal whatever the heading and card chrome leave, however tall they wrap.
+  // Restored, the sections below follow it and the page scrolls; maximized, it is the page.
   return (
-    <div className={cn("flex min-w-0 flex-col", maximized ? MAXIMIZED_PAGE_HEIGHT : "gap-6")}>
-      {maximized ? null : <PageHeading page="terminals" />}
-      <TerminalWorkspace sessions={sessions} slugOf={slugOf} maximized={maximized} />
+    <div className="flex min-w-0 flex-col gap-6">
+      <div
+        className={cn(
+          "flex h-(--app-page-height) min-w-0 flex-col gap-6",
+          !maximized && "min-h-[24rem]",
+        )}
+      >
+        {maximized ? null : <PageHeading page="terminals" />}
+        <TerminalWorkspace sessions={sessions} slugOf={slugOf} maximized={maximized} />
+      </div>
       {maximized ? null : (
         <>
           <WaitingSteps sessions={sessions} ready={ready} slugOf={slugOf} />
@@ -109,18 +120,8 @@ function TerminalsPage() {
   );
 }
 
-/**
- * Maximized, the page is exactly the visible part of `main` (a size container): its height less
- * the app frame's vertical padding (py-4, md:py-6) and whatever the software keyboard covers.
- */
-const MAXIMIZED_PAGE_HEIGHT =
-  "h-[calc(100cqh-2rem-var(--keyboard-inset,0px))] md:h-[calc(100cqh-3rem-var(--keyboard-inset,0px))]";
-
-/**
- * Not maximized, the terminal takes most of `main` with the page heading and the card's header
- * and tabs above it, and stays above the software keyboard.
- */
-const TERMINAL_BOX_HEIGHT = "h-[max(12rem,calc(100cqh-13rem-var(--keyboard-inset,0px)))]";
+const tabIdOf = (localId: string) => `terminal-tab-${localId}`;
+const panelIdOf = (localId: string) => `terminal-panel-${localId}`;
 
 function TerminalWorkspace({
   sessions,
@@ -134,24 +135,41 @@ function TerminalWorkspace({
   const { t } = useTranslation(["terminals", "dashboard"]);
   const { tabs, activeLocalId } = sessions;
   const active = tabs.find((tab) => tab.localId === activeLocalId) ?? null;
-  // Select text belongs to one tab: switching tabs or closing it ends the mode, so coming back
-  // to the tab does not reopen it. Reset during render when the active tab changes.
-  const [selectingLocalId, setSelectingLocalId] = useState<string | null>(null);
-  const [selectionTabId, setSelectionTabId] = useState(activeLocalId);
-  if (selectionTabId !== activeLocalId) {
-    setSelectionTabId(activeLocalId);
-    setSelectingLocalId(null);
-  }
-  const selecting = active !== null && selectingLocalId === active.localId;
+  // Select text is the session hook's: it pauses that tab's input, and switching or closing tabs
+  // ends it there.
+  const selecting = active !== null && sessions.selectingLocalId === active.localId;
+  // Arrow keys, Home and End move between tabs (the tabs pattern); focus stays on the tab list.
+  const onTabKeyDown = (event: KeyboardEvent, index: number) => {
+    const last = tabs.length - 1;
+    const next =
+      event.key === "ArrowRight"
+        ? index === last
+          ? 0
+          : index + 1
+        : event.key === "ArrowLeft"
+          ? index === 0
+            ? last
+            : index - 1
+          : event.key === "Home"
+            ? 0
+            : event.key === "End"
+              ? last
+              : null;
+    const tab = next === null ? undefined : tabs[next];
+    if (!tab) return;
+    event.preventDefault();
+    sessions.selectTab(tab.localId);
+    document.getElementById(tabIdOf(tab.localId))?.focus();
+  };
   return (
-    <Card className={cn(maximized && "min-h-0 flex-1")}>
+    <Card className="min-h-0 flex-1">
       {maximized ? null : (
         <CardHeader>
           <CardTitle className="text-base">{t("terminals:workspaceTitle")}</CardTitle>
           <CardDescription>{t("terminals:workspaceDescription")}</CardDescription>
         </CardHeader>
       )}
-      <CardContent className={cn("flex min-w-0 flex-col gap-3", maximized && "min-h-0 flex-1")}>
+      <CardContent className="flex min-h-0 min-w-0 flex-1 flex-col gap-3">
         {sessions.status !== "open" ? (
           <p className="text-sm text-muted-foreground" role="status">
             {t(`terminals:socket.${sessions.status}`)}
@@ -165,21 +183,28 @@ function TerminalWorkspace({
         ) : (
           <>
             <div className="flex min-w-0 items-center gap-2">
-              <div
+              <WideContent
                 role="tablist"
                 aria-label={t("terminals:workspaceTitle")}
-                className="flex min-w-0 max-w-full flex-1 gap-2 overflow-x-auto overflow-y-hidden overscroll-x-contain"
+                className="flex flex-1 gap-2"
               >
-                {tabs.map((tab) => (
+                {tabs.map((tab, index) => (
                   <Button
                     key={tab.localId}
+                    id={tabIdOf(tab.localId)}
                     type="button"
                     role="tab"
                     aria-selected={tab.localId === activeLocalId}
+                    aria-controls={panelIdOf(tab.localId)}
+                    tabIndex={tab.localId === activeLocalId ? 0 : -1}
                     variant={tab.localId === activeLocalId ? "secondary" : "ghost"}
                     size="touch"
                     className="shrink-0 font-mono"
+                    // A click switches tabs and leaves focus for the terminal; the keyboard path
+                    // keeps focus on the tab list.
+                    onMouseDown={(event) => event.preventDefault()}
                     onClick={() => sessions.selectTab(tab.localId)}
+                    onKeyDown={(event) => onTabKeyDown(event, index)}
                   >
                     <span>{slugOf(tab.cliDeviceId) ?? t("terminals:unknownNode")}</span>
                     <span className="text-xs text-muted-foreground">
@@ -187,36 +212,36 @@ function TerminalWorkspace({
                     </span>
                   </Button>
                 ))}
-              </div>
+              </WideContent>
               <TerminalToolbar
                 maximized={maximized}
                 selecting={selecting}
                 canSelect={active !== null}
                 onToggleSelecting={() =>
-                  setSelectingLocalId(selecting ? null : (active?.localId ?? null))
+                  sessions.setSelecting(selecting ? null : (active?.localId ?? null))
                 }
               />
             </div>
             {active ? <TabStatus sessions={sessions} tab={active} /> : null}
             <div
               style={TERMINAL_CHROME_VARS}
-              className={cn(
-                "relative w-full min-w-0 overflow-hidden rounded-md bg-(--term-bg)",
-                maximized ? "min-h-0 flex-1" : TERMINAL_BOX_HEIGHT,
-              )}
+              className="relative min-h-48 w-full min-w-0 flex-1 overflow-hidden rounded-md bg-(--term-bg)"
             >
               {tabs.map((tab) => (
                 <TerminalPane
                   key={tab.localId}
                   localId={tab.localId}
+                  tabId={tabIdOf(tab.localId)}
+                  panelId={panelIdOf(tab.localId)}
                   active={tab.localId === activeLocalId}
                   follow={followSize(tab)}
                   selecting={selecting && tab.localId === activeLocalId}
-                  onDoneSelecting={() => setSelectingLocalId(null)}
+                  onDoneSelecting={() => sessions.setSelecting(null)}
                   sendInput={sessions.sendInput}
                   uploadImage={sessions.uploadImage}
                   pasteImage={sessions.pasteImage}
                   sendResize={sessions.sendResize}
+                  currentSession={sessions.currentSession}
                   subscribeOutput={sessions.subscribeOutput}
                 />
               ))}
