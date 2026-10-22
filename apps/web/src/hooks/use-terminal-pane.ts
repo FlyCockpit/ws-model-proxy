@@ -1,4 +1,4 @@
-import { type RefCallback, useEffect, useLayoutEffect, useState } from "react";
+import { type RefCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { useLatestRef } from "@/hooks/use-latest-ref";
 import type { TerminalOutputEvent } from "@/hooks/use-terminal-sessions";
@@ -31,6 +31,11 @@ type TerminalPaneHandlers = {
   currentSession?: (localId: string) => unknown;
   /** A new attach is about to replay the screen: anything tied to the old one is dropped. */
   onReset?: () => void;
+  /**
+   * Bumped when the person points at a tab (even the active one): the active pane takes focus,
+   * wherever focus was. Keyboard tab navigation does not bump it, so focus stays on the tabs.
+   */
+  focusRequest?: number;
   subscribeOutput: (
     localId: string,
     listener: (event: TerminalOutputEvent) => void,
@@ -123,6 +128,14 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): {
     if (document.activeElement?.closest('[role="tablist"]')) return;
     focus();
   }, [active, host, focus, selecting]);
+  // A pointer activation asks for focus explicitly: the request is handled once.
+  const focusRequest = handlers.focusRequest ?? 0;
+  const handledFocusRef = useRef(focusRequest);
+  useEffect(() => {
+    if (focusRequest === handledFocusRef.current) return;
+    handledFocusRef.current = focusRequest;
+    if (active && host && !selecting) focus();
+  }, [active, focus, focusRequest, host, selecting]);
 
   return { containerRef: xterm.containerRef, selectionText, focusTerminal: focus };
 }

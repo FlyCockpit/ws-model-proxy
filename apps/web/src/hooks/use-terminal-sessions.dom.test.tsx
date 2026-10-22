@@ -538,6 +538,94 @@ describe("useTerminalSessions (multi-viewer)", () => {
     expect(view.result.current.tabs[0]?.writer).toBe("other");
   });
 
+  it("sends every frame with a higher sequence number than the one before", async () => {
+    const { view, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    await settle();
+    socket.sendFrame.mockClear();
+    useFakeClock();
+    // The resize timer (100 ms) fires while "b" waits in its batching window (50 ms after "a"):
+    // it flushes "b" and sends the resize behind it.
+    act(() => view.result.current.sendResize(localId, 110, 35));
+    await advanceClock(60);
+    act(() => view.result.current.sendInput(localId, "a"));
+    act(() => view.result.current.sendInput(localId, "b"));
+    await advanceClock(200);
+    await settle();
+    const seqs = socket.sendFrame.mock.calls.map(([frame]) => decodeSealedFrame(frame).seq);
+    expect(seqs.length).toBeGreaterThanOrEqual(2);
+    expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+    expect(new Set(seqs).size).toBe(seqs.length);
+  });
+
+  it("sends nothing more once End session is pressed, even input being sealed", async () => {
+    const { view, cli, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    act(() => view.result.current.sendInput(localId, "being sealed"));
+    // The send step has taken the input and is sealing it when End session is pressed.
+    for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+    act(() => view.result.current.endSession(localId));
+    await settle();
+    expect((await browserFrames(cli)).filter((frame) => "data" in frame)).toEqual([]);
+  });
+
+  it("settles a queued image paste as not sent when its attach ends", async () => {
+    const { view, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    let pasted: Promise<boolean> = Promise.resolve(true);
+    act(() => {
+      pasted = view.result.current.pasteImage(localId, "0".repeat(32), "/tmp/a.png ");
+      view.result.current.endSession(localId);
+    });
+    await expect(pasted).resolves.toBe(false);
+  });
+
+  it("does not become the writer when its takeover frames do not reach the socket", async () => {
+    const { view, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    socket.sendFrame.mockReturnValue(false);
+    act(() => view.result.current.sendInput(localId, "ls"));
+    await settle();
+    expect(socket.sendFrame).toHaveBeenCalled();
+    expect(view.result.current.tabs[0]?.writer).toBe("other");
+  });
+
+  it("retires the pane when the CLI rejects this viewer", async () => {
+    const { view, localId } = await setupV2();
+    const retire = vi.fn();
+    act(() => {
+      view.result.current.subscribeOutput(localId, () => undefined, undefined, retire);
+    });
+    message({ type: "rejected", terminalId: TERMINAL_ID, reason: "bad_frame", approvalCode: null });
+    expect(retire).toHaveBeenCalled();
+  });
+
+  it("delivers output from an ended attach marked retired, however late the pane subscribes", async () => {
+    currentCli = await fakeCli();
+    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+    message({
+      type: "terminals",
+      clis: [await listedCli(currentCli)],
+      terminals: [listedTerminal(true)],
+    });
+    const cli = await attachAsCli(VIEWER_ID);
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    const localId = view.result.current.tabs[0]?.localId ?? "";
+    // Output buffered with no pane subscribed yet; then the shell exits.
+    await unicast(cli, text("before exit"));
+    await settle();
+    message({ type: "exit", terminalId: TERMINAL_ID, exitCode: 0, signal: null });
+    await settle();
+    const events: TerminalOutputEvent[] = [];
+    act(() => {
+      view.result.current.subscribeOutput(localId, (event) => events.push(event));
+    });
+    expect(events.length).toBeGreaterThan(0);
+    expect(events.every((event) => event.retired === true)).toBe(true);
+  });
+
   it("does not send a sealed reply once the writer changed", async () => {
     const { view, cli, localId } = await setupV2();
     message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "you" });

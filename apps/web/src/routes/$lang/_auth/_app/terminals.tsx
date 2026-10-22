@@ -21,7 +21,7 @@ import {
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Maximize2, Minimize2, Settings2, SquareTerminal, TextSelect, X } from "lucide-react";
-import type { KeyboardEvent } from "react";
+import { type KeyboardEvent, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { CodeSnippet } from "@/components/code-snippet";
@@ -144,6 +144,7 @@ function TerminalWorkspace({
   // Select text is the session hook's: it pauses that tab's input, and switching or closing tabs
   // ends it there.
   const selecting = active !== null && sessions.selectingLocalId === active.localId;
+  const [focusRequest, setFocusRequest] = useState(0);
   // Arrow keys, Home and End move between tabs (the tabs pattern); focus stays on the tab list.
   const onTabKeyDown = (event: KeyboardEvent, index: number) => {
     const last = tabs.length - 1;
@@ -206,18 +207,13 @@ function TerminalWorkspace({
                     variant={tab.localId === activeLocalId ? "secondary" : "ghost"}
                     size="touch"
                     className="shrink-0 font-mono"
-                    // A click switches tabs and hands focus to the terminal; the keyboard path
-                    // keeps focus on the tab list. A pointer click (detail > 0) leaves the tab
-                    // list first, so a tab focused earlier by keyboard does not keep focus.
+                    // Mouse down does not move focus to the tab; the click decides where it goes.
                     onMouseDown={(event) => event.preventDefault()}
                     onClick={(event) => {
-                      if (
-                        event.detail > 0 &&
-                        document.activeElement instanceof HTMLElement &&
-                        document.activeElement.closest('[role="tablist"]')
-                      )
-                        document.activeElement.blur();
                       sessions.selectTab(tab.localId);
+                      // A pointer click (detail > 0) hands focus to the terminal, even on the
+                      // tab that is already active; keyboard activation keeps it on the tabs.
+                      if (event.detail > 0) setFocusRequest((count) => count + 1);
                     }}
                     onKeyDown={(event) => onTabKeyDown(event, index)}
                   >
@@ -257,6 +253,7 @@ function TerminalWorkspace({
                   pasteImage={sessions.pasteImage}
                   sendResize={sessions.sendResize}
                   sizeUnavailable={sessions.sizeUnavailable}
+                  focusRequest={focusRequest}
                   currentSession={sessions.currentSession}
                   subscribeOutput={sessions.subscribeOutput}
                 />

@@ -106,6 +106,8 @@ export function useXterm(options: XtermOptions): {
   const [gate] = useState(() => new CopyOutGate());
   const [inputGate] = useState(() => new TerminalUserInputGate());
   const ownSizeRef = useRef<TerminalSize | null>(null);
+  /** The size the box last measured (whatever xterm shows while queued output catches up). */
+  const measuredRef = useRef<TerminalSize | null>(null);
   /**
    * No size reported since this xterm opened, or the box was reported unmeasurable: the next
    * measured size is reported even if xterm already has it (a writer fitted at xterm's default
@@ -176,6 +178,7 @@ export function useXterm(options: XtermOptions): {
       proposed && proposed.cols > 0 && proposed.rows > 0
         ? floorTerminalSize({ cols: proposed.cols, rows: proposed.rows })
         : null;
+    if (own) measuredRef.current = own;
     const wasUnavailable = sizeUnavailableRef.current && own !== null;
     if (wasUnavailable) sizeUnavailableRef.current = false;
     if (!follow) {
@@ -489,10 +492,10 @@ export function useXterm(options: XtermOptions): {
     if (active) {
       // The writer reports its size again: a resize skipped while hidden must still reach the
       // PTY (the session hook sends it only if it differs from the last one sent). Only a
-      // measured box has a size to report.
-      const term = termRef.current;
-      if (layout() && term && !followRef.current)
-        handlersRef.current.onResize({ cols: term.cols, rows: term.rows });
+      // measured box has a size to report, and it is the measured one: xterm may still show an
+      // earlier size while queued output catches up.
+      const measured = measuredRef.current;
+      if (layout() && measured && !followRef.current) handlersRef.current.onResize(measured);
     } else {
       gate.disarm();
       inputGate.disarm();

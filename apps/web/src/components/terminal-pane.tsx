@@ -31,6 +31,8 @@ type TerminalPaneProps = {
   pasteImage: (localId: string, id: string, data: string) => Promise<boolean>;
   sendResize: (localId: string, cols: number, rows: number) => void;
   sizeUnavailable: (localId: string) => void;
+  /** See useTerminalPane `focusRequest`. */
+  focusRequest: number;
   currentSession: (localId: string) => unknown;
   subscribeOutput: (
     localId: string,
