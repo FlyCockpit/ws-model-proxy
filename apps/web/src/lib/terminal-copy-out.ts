@@ -130,3 +130,46 @@ export function wireTerminalCopyOut(
     dataSub.dispose();
   };
 }
+
+/** CAN: aborts any escape sequence in progress (VT parsers, xterm included, return to ground). */
+const ABORT_SEQUENCE = "\x18";
+
+type ReplayWriteTerminal = {
+  write: (data: string | Uint8Array, callback?: () => void) => void;
+};
+
+/**
+ * Writes output to xterm with replay protection. Replayed scrollback keeps copy-out closed until
+ * xterm has parsed it; the first live write after a replay first aborts any escape sequence the
+ * replay left open, so live output cannot complete an OSC 52 copy that started in the replay.
+ */
+export function createReplayAwareWriter(term: ReplayWriteTerminal, gate: CopyOutGate) {
+  let afterReplay = false;
+  let disposed = false;
+  return {
+    write(data: Uint8Array, replay = false): void {
+      if (replay) {
+        afterReplay = true;
+        // xterm parses writes in order and calls back right after this chunk, so the gate is
+        // closed for exactly the replayed bytes.
+        gate.beginReplayChunk();
+        term.write(data, () => {
+          if (!disposed) gate.endReplayChunk();
+        });
+        return;
+      }
+      if (afterReplay) {
+        afterReplay = false;
+        term.write(ABORT_SEQUENCE);
+      }
+      term.write(data);
+    },
+    /** A reset grounds the parser itself. */
+    reset(): void {
+      afterReplay = false;
+    },
+    dispose(): void {
+      disposed = true;
+    },
+  };
+}

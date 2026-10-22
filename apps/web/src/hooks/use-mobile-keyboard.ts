@@ -22,14 +22,21 @@ const PINCH_ZOOM_SCALE_EPSILON = 0.01;
  */
 export const KEYBOARD_INSET_VAR = "--keyboard-inset";
 
-/** The covered height while the keyboard is open, from the pre-keyboard baseline. */
+/**
+ * The covered height while the keyboard is open: the part of the layout viewport below the
+ * visual viewport, from current geometry only. The detector's baseline can be from before a
+ * rotation, so it must not be used here. A browser that shrinks the layout viewport for the
+ * keyboard leaves nothing covered, and the inset is 0.
+ */
 export function keyboardInsetPx(
   isKeyboardOpen: boolean,
-  baselineHeight: number,
+  layoutViewportHeight: number,
   visualViewportHeight: number,
+  visualViewportOffsetTop: number,
 ): number {
   if (!isKeyboardOpen) return 0;
-  return Math.max(0, Math.round(baselineHeight - visualViewportHeight));
+  const covered = layoutViewportHeight - visualViewportHeight - visualViewportOffsetTop;
+  return Math.min(layoutViewportHeight, Math.max(0, Math.round(covered)));
 }
 
 /** Input types that typically summon a software keyboard on mobile. */
@@ -234,7 +241,12 @@ export function useMobileKeyboard(): boolean {
       };
       document.documentElement.style.setProperty(
         KEYBOARD_INSET_VAR,
-        `${keyboardInsetPx(decision.isKeyboardOpen, decision.nextBaselineHeight, geometry.height)}px`,
+        `${keyboardInsetPx(
+          decision.isKeyboardOpen,
+          window.innerHeight,
+          geometry.height,
+          window.visualViewport?.offsetTop ?? 0,
+        )}px`,
       );
       setKeyboardOpen(decision.isKeyboardOpen);
     };

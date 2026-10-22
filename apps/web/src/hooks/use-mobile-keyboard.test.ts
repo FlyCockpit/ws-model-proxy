@@ -412,8 +412,18 @@ describe("isEditableFocusTarget", () => {
 
 describe("keyboardInsetPx", () => {
   it("is the covered height only while the keyboard is open", () => {
-    expect(keyboardInsetPx(true, 800, 480.4)).toBe(320);
-    expect(keyboardInsetPx(false, 800, 480)).toBe(0);
-    expect(keyboardInsetPx(true, 400, 480)).toBe(0);
+    expect(keyboardInsetPx(true, 800, 480.4, 0)).toBe(320);
+    expect(keyboardInsetPx(false, 800, 480, 0)).toBe(0);
+    // A browser that shrinks the layout viewport for the keyboard covers nothing.
+    expect(keyboardInsetPx(true, 480, 480, 0)).toBe(0);
+    // A visual viewport scrolled down within the layout viewport covers less.
+    expect(keyboardInsetPx(true, 800, 480, 100)).toBe(220);
+  });
+
+  it("uses current geometry after rotating with the keyboard open", () => {
+    // Portrait 375x667 rotated to landscape (layout height 375) with a 180px visual viewport:
+    // the old portrait baseline would give 487px, more than the whole landscape viewport.
+    expect(keyboardInsetPx(true, 375, 180, 0)).toBe(195);
+    expect(keyboardInsetPx(true, 375, 0, 0)).toBe(375);
   });
 });

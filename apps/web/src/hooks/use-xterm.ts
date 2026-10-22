@@ -8,6 +8,7 @@ import { useLatestRef } from "@/hooks/use-latest-ref";
 import {
   CopyOutGate,
   clipboardTypesIncludeImage,
+  createReplayAwareWriter,
   type Osc52Copy,
   wireTerminalCopyOut,
 } from "@/lib/terminal-copy-out";
@@ -69,6 +70,7 @@ export function useXterm(options: XtermOptions): {
   const shiftEnterRef = useLatestRef(options.shiftEnter);
   const selectingRef = useLatestRef(options.selecting);
   const termRef = useRef<Terminal | null>(null);
+  const writerRef = useRef<ReturnType<typeof createReplayAwareWriter> | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const [gate] = useState(() => new CopyOutGate());
   const [inputGate] = useState(() => new TerminalUserInputGate());
@@ -141,6 +143,8 @@ export function useXterm(options: XtermOptions): {
     fitRef.current = fit;
     queuedSizesRef.current = 0;
     gate.clearReplay();
+    const writer = createReplayAwareWriter(term, gate);
+    writerRef.current = writer;
     type ImagePaste = {
       attachment: TerminalImageAttachment;
       sent: Promise<boolean> | null;
@@ -315,6 +319,8 @@ export function useXterm(options: XtermOptions): {
       container.removeEventListener("dragover", onDragOver);
       container.removeEventListener("drop", onDrop);
       disposeCopyOut();
+      writer.dispose();
+      if (writerRef.current === writer) writerRef.current = null;
       resizeSub.dispose();
       term.dispose();
       if (termRef.current === term) termRef.current = null;
@@ -331,26 +337,13 @@ export function useXterm(options: XtermOptions): {
     layout();
   }, [container, followCols, followRows, layout]);
 
-  const write = useCallback(
-    (data: Uint8Array, replay = false) => {
-      const term = termRef.current;
-      if (!term) return;
-      if (!replay) {
-        term.write(data);
-        return;
-      }
-      // xterm parses writes in order and calls back right after this chunk, so the gate is
-      // closed for exactly the replayed bytes.
-      gate.beginReplayChunk();
-      term.write(data, () => {
-        if (termRef.current === term) gate.endReplayChunk();
-      });
-    },
-    [gate],
-  );
+  const write = useCallback((data: Uint8Array, replay = false) => {
+    writerRef.current?.write(data, replay);
+  }, []);
   const reset = useCallback(() => {
     // A reset comes before a scrollback replay: an old copy in it must not fire again.
     gate.disarm();
+    writerRef.current?.reset();
     termRef.current?.reset();
   }, [gate]);
   const focus = useCallback(() => {

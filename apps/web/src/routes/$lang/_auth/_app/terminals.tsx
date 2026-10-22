@@ -134,8 +134,14 @@ function TerminalWorkspace({
   const { t } = useTranslation(["terminals", "dashboard"]);
   const { tabs, activeLocalId } = sessions;
   const active = tabs.find((tab) => tab.localId === activeLocalId) ?? null;
-  // Select text belongs to one tab: switching tabs or closing it ends the mode.
+  // Select text belongs to one tab: switching tabs or closing it ends the mode, so coming back
+  // to the tab does not reopen it. Reset during render when the active tab changes.
   const [selectingLocalId, setSelectingLocalId] = useState<string | null>(null);
+  const [selectionTabId, setSelectionTabId] = useState(activeLocalId);
+  if (selectionTabId !== activeLocalId) {
+    setSelectionTabId(activeLocalId);
+    setSelectingLocalId(null);
+  }
   const selecting = active !== null && selectingLocalId === active.localId;
   return (
     <Card className={cn(maximized && "min-h-0 flex-1")}>
