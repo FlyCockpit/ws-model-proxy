@@ -81,6 +81,23 @@ export const runtimeModelViewSchema = z
   })
   .strict();
 
+export const instanceReservationViewSchema = z
+  .object({
+    /** 0-based position in `launch.reservations`. */
+    index: z.number().int().min(0),
+    nodeId: idSchema.nullable(),
+    nodeSlug: z.string().nullable(),
+    labels: z.array(z.string()),
+    /** What it holds there (GiB of node memory, GPU memory included). */
+    memoryGb: z.number(),
+    reserved: z.enum(CLAIM_STATE),
+    nodeConnection: z
+      .object({ state: z.enum(NODE_CONNECTION), since: isoDateSchema.nullable() })
+      .strict()
+      .nullable(),
+  })
+  .strict();
+
 export const instanceRankViewSchema = z
   .object({
     /** 1-based ("node 2 of 3"). */
@@ -114,6 +131,21 @@ export const instanceRankViewSchema = z
     releasedUnproven: z.object({ at: isoDateSchema, reason: z.string() }).strict().nullable(),
     /** An agent's pending request that a person release this claim (marked stopped). */
     releaseRequestId: idSchema.nullable(),
+    /**
+     * The claim of the run a restart replaced, while that run may still use it (`prev*`): it
+     * keeps holding on this node beside the current claim (its port stays taken, its memory
+     * overlaps) until the new run's start proves the old one stopped, or the claim is released
+     * (a release ends it with the current claim). Null when none.
+     */
+    previousClaim: z
+      .object({
+        port: z.number().int(),
+        distPort: z.number().int().nullable(),
+        /** GiB of node memory it holds (GPU memory included). */
+        memoryGb: z.number(),
+      })
+      .strict()
+      .nullable(),
   })
   .strict();
 
@@ -239,6 +271,17 @@ export const instanceViewSchema = z
       })
       .strict(),
     ranks: z.array(instanceRankViewSchema),
+    /**
+     * Memory this instance holds on other nodes (`launch.reservations`): nothing runs there.
+     * `reserved` is the instance's rank claim (a reservation holds exactly while it does).
+     */
+    reservations: z.array(instanceReservationViewSchema),
+    /**
+     * Reservations of a run a restart replaced, while that run may still use them: they keep
+     * holding (`reserved`, like the current ones) until the new run's start proves the old one
+     * stopped. Releasing the instance's claims releases them too.
+     */
+    supersededReservations: z.array(instanceReservationViewSchema),
     openSteps: z.array(instanceStepViewSchema),
     live: z
       .object({
@@ -260,7 +303,10 @@ export const runtimeVersionSummarySchema = z
     editor: actorRefSchema,
     note: z.string().nullable(),
     launchHash: sha256Schema,
-    /** Edits that keep the launch hash apply to running instances live. */
+    /**
+     * Running instances must restart for this version: another launch hash, or other
+     * `launch.reservations` (server-only, not in the hash). False: it applies live.
+     */
     launchChanged: z.boolean(),
   })
   .strict();
@@ -356,6 +402,20 @@ export const placementSchema = z
   })
   .strict();
 
+/** Where a start places one `launch.reservations` entry (memory held there, nothing runs). */
+export const reservationPlacementSchema = z
+  .object({
+    /** 0-based position in `launch.reservations`. */
+    index: z.number().int().min(0),
+    nodeId: idSchema,
+    nodeSlug: z.string(),
+    labels: z.array(z.string()),
+    resources: z.record(z.string(), z.unknown()),
+    /** GiB of node memory it holds (GPU memory included). */
+    memoryGb: z.number(),
+  })
+  .strict();
+
 export const previewWarningSchema = z
   .object({
     code: z.enum([
@@ -401,6 +461,8 @@ export const startPreviewSchema = z
           versionId: idSchema,
           instanceId: idSchema.nullable(),
           placements: z.array(placementSchema),
+          /** Memory held on other nodes (`launch.reservations`); nothing is sent there. */
+          reservations: z.array(reservationPlacementSchema),
           /** Multi-node: the one fabric every rank shares, with the head's IP (`head_addr`). */
           fabric: z
             .object({ fabricId: idSchema, name: z.string(), headAddr: z.string() })
@@ -546,7 +608,8 @@ export const runtimesContract = {
       })
       .strict()
       .refine((input) => (input.kind === "ALWAYS_ON") === (input.nodeId !== undefined), {
-        message: "nodeId exactly for always-on runtimes.",
+        message:
+          "nodeId is only for always-on runtimes (which require it); to pin a startable runtime use spec.launch.labels, runtime_start nodeIds, or a profile.",
         path: ["nodeId"],
       })
       .refine((input) => (input.kind === "STARTABLE") === (input.spec.launch !== undefined), {
@@ -586,6 +649,7 @@ export const runtimesContract = {
                 "launch_changed",
                 "trust_relay",
                 "interactive_needs_person",
+                "definition_slots_full",
               ]),
             })
             .strict(),

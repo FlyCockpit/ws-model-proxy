@@ -1,6 +1,7 @@
 import {
   ENGINES,
   GPU_VENDORS,
+  type GpuVendor,
   MODEL_CAPABILITIES,
   MODEL_TYPES,
   type ModelCapabilityWire,
@@ -26,11 +27,12 @@ import {
   draftToSpec,
   editorValues,
   emptyCommandDraft,
+  emptyReservationDraft,
+  losslessDraft,
   parseBase,
   type ResourceKind,
   type RuntimeKind,
   type SpecEditorValues,
-  specToDraft,
   TIMEOUT_FIELDS,
 } from "@/lib/runtime-spec-draft";
 
@@ -118,6 +120,42 @@ function TextInput({
   );
 }
 
+type VendorFieldApi = {
+  state: { value: "" | GpuVendor; meta: { errors: ErrorList } };
+  handleChange: (value: "" | GpuVendor) => void;
+  handleBlur: () => void;
+};
+
+function isGpuVendor(value: string): value is GpuVendor {
+  return (GPU_VENDORS as readonly string[]).includes(value);
+}
+
+/** A discrete block's GPU vendor (empty: any vendor), for rank resources and reservations. */
+function GpuVendorField({ id, field }: { id: string; field: VendorFieldApi }) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <div className="min-w-0 space-y-1.5">
+      <Label htmlFor={id}>{t("dashboard:runtime.specForm.vendor")}</Label>
+      <NativeSelect
+        id={id}
+        value={field.state.value}
+        onBlur={field.handleBlur}
+        onChange={(event) =>
+          field.handleChange(isGpuVendor(event.target.value) ? event.target.value : "")
+        }
+      >
+        <option value="">{t("dashboard:runtime.specForm.anyVendor")}</option>
+        {GPU_VENDORS.map((vendor) => (
+          <option key={vendor} value={vendor}>
+            {t(`dashboard:runtime.specForm.vendors.${vendor}`)}
+          </option>
+        ))}
+      </NativeSelect>
+      <FieldErrors field={field} />
+    </div>
+  );
+}
+
 function Section({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
   return (
     <fieldset className="flex min-w-0 flex-col gap-3 rounded-xl border p-4">
@@ -179,9 +217,17 @@ export const RuntimeSpecFields = withFieldGroup({
         setSwitchError(true);
         return;
       }
+      // Converted before anything changes, and only when the form keeps the JSON exactly
+      // (`losslessDraft`): anything it would drop or change (an unknown key, a shape the form
+      // cannot show, a part it would fill in) keeps the JSON tab and its text, with an error.
+      const draft = losslessDraft(parsed, kind);
+      if (!draft) {
+        setSwitchError(true);
+        return;
+      }
       setSwitchError(false);
       group.setFieldValue("base", json);
-      group.setFieldValue("draft", specToDraft(parsed));
+      group.setFieldValue("draft", draft);
       group.setFieldValue("tab", "form");
     };
 
@@ -589,6 +635,7 @@ function LaunchSections({ group, id }: { group: Group; id: (name: string) => str
         </div>
       </Section>
       <ResourcesSection group={group} id={id} />
+      <ReservationsSection group={group} id={id} />
       <CommandsSection group={group} id={id} />
       <Section title={t("dashboard:runtime.specForm.readiness")}>
         <group.Field name="draft.readiness.enabled">
@@ -781,27 +828,7 @@ function ResourcesSection({ group, id }: { group: Group; id: (name: string) => s
                       </group.Field>
                       <group.Field name={`draft.resources[${index}].vendor`}>
                         {(field) => (
-                          <div className="min-w-0 space-y-1.5">
-                            <Label htmlFor={id(`resource-${index}-vendor`)}>
-                              {t("dashboard:runtime.specForm.vendor")}
-                            </Label>
-                            <NativeSelect
-                              id={id(`resource-${index}-vendor`)}
-                              value={field.state.value}
-                              onChange={(event) =>
-                                field.handleChange(
-                                  event.target.value as "" | (typeof GPU_VENDORS)[number],
-                                )
-                              }
-                            >
-                              <option value="">{t("dashboard:runtime.specForm.anyVendor")}</option>
-                              {GPU_VENDORS.map((vendor) => (
-                                <option key={vendor} value={vendor}>
-                                  {t(`dashboard:runtime.specForm.vendors.${vendor}`)}
-                                </option>
-                              ))}
-                            </NativeSelect>
-                          </div>
+                          <GpuVendorField id={id(`resource-${index}-vendor`)} field={field} />
                         )}
                       </group.Field>
                     </>
@@ -840,6 +867,154 @@ function ResourcesSection({ group, id }: { group: Group; id: (name: string) => s
               )}
             </group.Subscribe>
             <FieldErrors field={resources} />
+          </>
+        )}
+      </group.Field>
+    </Section>
+  );
+}
+
+/**
+ * `launch.reservations`: memory a single-node runtime holds on other nodes (its launcher starts
+ * work there itself). Each names labels and what it holds; nothing runs there from wsmp.
+ */
+function ReservationsSection({ group, id }: { group: Group; id: (name: string) => string }) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <Section
+      title={t("dashboard:runtime.specForm.reservations")}
+      hint={t("dashboard:runtime.specForm.reservationsHint")}
+    >
+      <group.Field name="draft.reservations" mode="array">
+        {(reservations) => (
+          <>
+            {reservations.state.value.map((reservation, index) => (
+              <div key={index} className="flex min-w-0 flex-col gap-3 rounded-lg border p-3">
+                <div className="flex min-w-0 items-center justify-between gap-2">
+                  <p className="text-sm font-medium">
+                    {t("dashboard:runtime.specForm.reservation", { number: index + 1 })}
+                  </p>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="touch"
+                    aria-label={t("dashboard:runtime.specForm.removeReservation", {
+                      number: index + 1,
+                    })}
+                    onClick={() => reservations.removeValue(index)}
+                  >
+                    <Trash2 aria-hidden="true" className="size-4" />
+                  </Button>
+                </div>
+                <div className="grid min-w-0 gap-3 sm:grid-cols-2">
+                  <group.Field name={`draft.reservations[${index}].labels`}>
+                    {(field) => (
+                      <TextInput
+                        id={id(`reservation-${index}-labels`)}
+                        label={t("dashboard:runtime.specForm.labels")}
+                        hint={t("dashboard:runtime.specForm.reservationLabelsHint")}
+                        field={field}
+                        mono
+                      />
+                    )}
+                  </group.Field>
+                  <group.Field name={`draft.reservations[${index}].resource.kind`}>
+                    {(field) => (
+                      <div className="min-w-0 space-y-1.5">
+                        <Label htmlFor={id(`reservation-${index}-kind`)}>
+                          {t("dashboard:runtime.specForm.resourceKind")}
+                        </Label>
+                        <NativeSelect
+                          id={id(`reservation-${index}-kind`)}
+                          value={field.state.value}
+                          onChange={(event) =>
+                            field.handleChange(event.target.value as ResourceKind)
+                          }
+                        >
+                          {RESOURCE_KINDS.map((kind) => (
+                            <option key={kind} value={kind}>
+                              {t(`dashboard:runtime.specForm.resourceKinds.${kind}`)}
+                            </option>
+                          ))}
+                        </NativeSelect>
+                        <FieldErrors field={field} />
+                      </div>
+                    )}
+                  </group.Field>
+                  {reservation.resource.kind === "unified" ? (
+                    <group.Field name={`draft.reservations[${index}].resource.memoryGb`}>
+                      {(field) => (
+                        <TextInput
+                          id={id(`reservation-${index}-memory`)}
+                          label={t("dashboard:runtime.specForm.memoryGb")}
+                          field={field}
+                          inputMode="decimal"
+                        />
+                      )}
+                    </group.Field>
+                  ) : null}
+                  {reservation.resource.kind === "discrete" ? (
+                    <>
+                      <group.Field name={`draft.reservations[${index}].resource.gpuCount`}>
+                        {(field) => (
+                          <TextInput
+                            id={id(`reservation-${index}-gpus`)}
+                            label={t("dashboard:runtime.specForm.gpuCount")}
+                            field={field}
+                            inputMode="numeric"
+                          />
+                        )}
+                      </group.Field>
+                      <group.Field name={`draft.reservations[${index}].resource.vramGb`}>
+                        {(field) => (
+                          <TextInput
+                            id={id(`reservation-${index}-vram`)}
+                            label={t("dashboard:runtime.specForm.vramGb")}
+                            field={field}
+                            inputMode="decimal"
+                          />
+                        )}
+                      </group.Field>
+                      <group.Field name={`draft.reservations[${index}].resource.vendor`}>
+                        {(field) => (
+                          <GpuVendorField id={id(`reservation-${index}-vendor`)} field={field} />
+                        )}
+                      </group.Field>
+                    </>
+                  ) : null}
+                  {reservation.resource.kind === "cpu" ||
+                  reservation.resource.kind === "discrete" ? (
+                    <group.Field name={`draft.reservations[${index}].resource.ramGb`}>
+                      {(field) => (
+                        <TextInput
+                          id={id(`reservation-${index}-ram`)}
+                          label={t("dashboard:runtime.specForm.ramGb")}
+                          hint={
+                            reservation.resource.kind === "discrete"
+                              ? t("dashboard:runtime.specForm.optional")
+                              : undefined
+                          }
+                          field={field}
+                          inputMode="decimal"
+                        />
+                      )}
+                    </group.Field>
+                  ) : null}
+                </div>
+              </div>
+            ))}
+            <div>
+              <Button
+                type="button"
+                variant="outline"
+                size="touch"
+                onClick={() => reservations.pushValue(emptyReservationDraft())}
+              >
+                <Plus aria-hidden="true" className="size-4" />
+                {t("dashboard:runtime.specForm.addReservation")}
+              </Button>
+            </div>
+            <FieldErrors field={reservations} />
           </>
         )}
       </group.Field>

@@ -13,7 +13,7 @@ BEGIN;
 LOCK TABLE "user", session, node, node_credential, node_enrollment_code, node_enrollment_use,
   fabric, fabric_member, node_command, node_audit_event,
   queued_node_command, runtime, runtime_version, runtime_model, runtime_share, runtime_instance,
-  instance_rank, claim_release_request, instance_step, runtime_operation, execution_target, profile, profile_node,
+  instance_rank, instance_reservation, claim_release_request, instance_step, runtime_operation, execution_target, profile, profile_node,
   profile_item, pool, pool_routing, pool_fallback, pool_advanced, pool_sidecar, pool_member,
   pool_routing_rule, api_key, api_key_pool, agent_token, share, share_invite, provider_account,
   provider_model,
@@ -399,8 +399,9 @@ CREATE TRIGGER node_enrollment_use_shape BEFORE INSERT OR UPDATE ON node_enrollm
 FOR EACH ROW EXECUTE FUNCTION enforce_node_enrollment_use_shape();
 
 -- Deleting a node (spec §3.4/§3.5, item 20): refused with a clear reason while a profile pins
--- one of its always-on runtimes; otherwise every reservation there is released (proof is
--- impossible without the node), its open steps end, instances with a part there are stopped
+-- one of its always-on runtimes; otherwise every claim there is released (proof is impossible
+-- without the node) except one whose instance holds reservations on surviving nodes, its open
+-- steps end, instances with a part there are stopped
 -- (the reconciler stops the surviving parts and deletes the instance once all are released),
 -- and its always-on runtimes go (instance first: the instance → runtime FK is NoAction).
 CREATE OR REPLACE FUNCTION node_delete_release()
@@ -423,15 +424,34 @@ BEGIN
      SET "desiredState" = 'STOPPED', phase = 'STOPPING', "phaseReason" = 'node_deleted',
          "phaseChangedAt" = now(), "needsOperator" = NULL, "needsOperatorSince" = NULL
    WHERE i."desiredState" IS NOT NULL AND i.phase <> 'STOPPED'
-     AND EXISTS (SELECT 1 FROM instance_rank r WHERE r."instanceId" = i.id AND r."nodeId" = OLD.id);
-  -- Agents' release requests for those claims have nothing left to release.
+     AND (EXISTS (SELECT 1 FROM instance_rank r WHERE r."instanceId" = i.id AND r."nodeId" = OLD.id)
+          -- A reservation (launch.reservations) there: like a rank's node, the instance stops.
+          -- (The current plan's: a superseded one belongs to a run being replaced.)
+          OR EXISTS (SELECT 1 FROM instance_reservation v
+                      WHERE v."instanceId" = i.id AND v."nodeId" = OLD.id
+                        AND v."supersededGeneration" IS NULL));
+  -- A claim there whose instance also holds a reservation on another node (launch.reservations:
+  -- what the rank's process started may use that node, and nothing can prove its stop now) is
+  -- not released: it stays held with no node (the foreign key clears it), so the reservations
+  -- elsewhere keep holding until a person marks it stopped and releases it. Every other claim
+  -- there is released, a replaced run's claim (prev*) with it.
+  -- Agents' release requests for the released claims have nothing left to release.
   UPDATE claim_release_request
      SET state = 'CLEARED', "pendingRankId" = NULL, "decidedAt" = now()
    WHERE state = 'PENDING'
-     AND "rankId" IN (SELECT id FROM instance_rank WHERE "nodeId" = OLD.id AND claim <> 'RELEASED');
-  UPDATE instance_rank
-     SET claim = 'RELEASED', "claimChangedAt" = now(), "stoppedAt" = COALESCE("stoppedAt", now())
-   WHERE "nodeId" = OLD.id AND claim <> 'RELEASED';
+     AND "rankId" IN (
+       SELECT k.id FROM instance_rank k
+        WHERE k."nodeId" = OLD.id AND k.claim <> 'RELEASED'
+          AND NOT EXISTS (SELECT 1 FROM instance_reservation v
+                           WHERE v."instanceId" = k."instanceId"
+                             AND v."nodeId" IS NOT NULL AND v."nodeId" <> OLD.id));
+  UPDATE instance_rank k
+     SET claim = 'RELEASED', "claimChangedAt" = now(), "stoppedAt" = COALESCE("stoppedAt", now()),
+         "prevResources" = NULL, "prevPort" = NULL, "prevDistPort" = NULL, "prevGeneration" = NULL
+   WHERE k."nodeId" = OLD.id AND k.claim <> 'RELEASED'
+     AND NOT EXISTS (SELECT 1 FROM instance_reservation v
+                      WHERE v."instanceId" = k."instanceId"
+                        AND v."nodeId" IS NOT NULL AND v."nodeId" <> OLD.id);
   DELETE FROM runtime_instance -- policy: bounded-delete
    WHERE "runtimeId" IN (SELECT id FROM runtime WHERE "nodeId" = OLD.id);
   RETURN OLD;
@@ -659,10 +679,22 @@ ALTER TABLE instance_rank ADD CONSTRAINT instance_rank_bounds CHECK (
   AND "unitName" ~ '^wsmp-[a-z0-9-]{1,41}-r[0-9]{1,2}$'
   AND "unitName" LIKE '%-r' || rank::text
   AND jsonb_typeof(resources) = 'object'
+  AND "plannedGeneration" >= 0
+  -- A replaced run's claim (lib/reservations.ts retakeInstanceClaims): all of it, or none.
+  AND num_nonnulls("prevResources", "prevPort", "prevGeneration") IN (0, 3)
+  AND ("prevDistPort" IS NULL OR "prevPort" IS NOT NULL)
+  AND ("prevResources" IS NULL OR jsonb_typeof("prevResources") = 'object')
+  AND ("prevPort" IS NULL OR "prevPort" BETWEEN 1024 AND 65535)
+  AND ("prevDistPort" IS NULL OR "prevDistPort" BETWEEN 1024 AND 65535)
+  AND ("prevGeneration" IS NULL OR "prevGeneration" >= 0)
 );
 -- HELD and HELD_UNKNOWN keep their port reserved.
 CREATE UNIQUE INDEX IF NOT EXISTS instance_rank_reserved_port
   ON instance_rank ("nodeId", port) WHERE claim <> 'RELEASED';
+-- One current reservation per launch.reservations entry; a restart keeps the old run's rows
+-- (superseded) until the new run starts.
+CREATE UNIQUE INDEX IF NOT EXISTS instance_reservation_current_index
+  ON instance_reservation ("instanceId", index) WHERE "supersededGeneration" IS NULL;
 ALTER TABLE instance_rank DROP CONSTRAINT IF EXISTS instance_rank_claim_shape;
 ALTER TABLE instance_rank ADD CONSTRAINT instance_rank_claim_shape CHECK (
   (claim <> 'HELD_UNKNOWN' OR "markedStoppedAt" IS NOT NULL)
@@ -671,6 +703,8 @@ ALTER TABLE instance_rank ADD CONSTRAINT instance_rank_claim_shape CHECK (
   -- Released without proof by a person: who and when together, and only on a released claim.
   AND ("releasedUnprovenAt" IS NULL) = ("releasedUnprovenBy" IS NULL)
   AND ("releasedUnprovenAt" IS NULL OR claim = 'RELEASED')
+  -- A released claim holds nothing, a replaced run's claim included.
+  AND (claim <> 'RELEASED' OR "prevPort" IS NULL)
 );
 -- The held-unknown probe sweep takes these rows least recently checked first.
 DROP INDEX IF EXISTS instance_rank_held_unknown_id;
@@ -737,9 +771,47 @@ $instance_node_owner$;
 DROP TRIGGER IF EXISTS instance_rank_node_owner ON instance_rank;
 CREATE TRIGGER instance_rank_node_owner BEFORE INSERT OR UPDATE OF "nodeId", "instanceId" ON instance_rank
 FOR EACH ROW EXECUTE FUNCTION enforce_instance_node_owner();
+DROP TRIGGER IF EXISTS instance_reservation_node_owner ON instance_reservation;
+CREATE TRIGGER instance_reservation_node_owner BEFORE INSERT OR UPDATE OF "nodeId", "instanceId" ON instance_reservation
+FOR EACH ROW EXECUTE FUNCTION enforce_instance_node_owner();
 DROP TRIGGER IF EXISTS instance_step_node_owner ON instance_step;
 CREATE TRIGGER instance_step_node_owner BEFORE INSERT OR UPDATE OF "nodeId", "instanceId" ON instance_step
 FOR EACH ROW EXECUTE FUNCTION enforce_instance_node_owner();
+-- Runs (packages/api/src/lib/instance-run.ts): an instance's runGeneration is its current run,
+-- begun in the transaction that commits a restart. It never goes back; every new step belongs
+-- to the instance's current run (a positive one: a legacy row with 0 is bootstrapped from its
+-- steps before anything new is written); a step's generation never changes. Rows written before
+-- runs existed are left as they are (only new inserts and updates are checked).
+CREATE OR REPLACE FUNCTION enforce_instance_run_order()
+RETURNS trigger LANGUAGE plpgsql AS $instance_run_order$
+DECLARE
+  run INTEGER;
+BEGIN
+  IF TG_TABLE_NAME = 'runtime_instance' THEN
+    IF NEW."runGeneration" < OLD."runGeneration" THEN
+      RAISE EXCEPTION 'an instance run never goes back' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF TG_OP = 'UPDATE' THEN
+    IF NEW.generation IS DISTINCT FROM OLD.generation THEN
+      RAISE EXCEPTION 'a step keeps its generation' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+  END IF;
+  SELECT "runGeneration" INTO run FROM runtime_instance WHERE id = NEW."instanceId";
+  IF run IS NULL OR run < 1 OR NEW.generation IS DISTINCT FROM run THEN
+    RAISE EXCEPTION 'a new step belongs to its instance''s current run' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$instance_run_order$;
+DROP TRIGGER IF EXISTS instance_run_order ON runtime_instance;
+CREATE TRIGGER instance_run_order BEFORE UPDATE OF "runGeneration" ON runtime_instance
+FOR EACH ROW EXECUTE FUNCTION enforce_instance_run_order();
+DROP TRIGGER IF EXISTS instance_step_run_order ON instance_step;
+CREATE TRIGGER instance_step_run_order BEFORE INSERT OR UPDATE OF generation ON instance_step
+FOR EACH ROW EXECUTE FUNCTION enforce_instance_run_order();
 
 ALTER TABLE instance_step DROP CONSTRAINT IF EXISTS instance_step_shape;
 ALTER TABLE instance_step ADD CONSTRAINT instance_step_shape CHECK (
@@ -749,7 +821,24 @@ ALTER TABLE instance_step ADD CONSTRAINT instance_step_shape CHECK (
   AND jsonb_typeof(intent) = 'object'
   AND (state <> 'CANCELLED' OR attempts = 0)
   AND ("errorCode" IS NULL OR "errorCode" ~ '^[a-z0-9_]{1,64}$')
+  AND ("headAddr" IS NULL OR char_length("headAddr") BETWEEN 1 AND 64)
+  -- An attempt that may have run was counted (lib/instance-run.ts MAY_HAVE_RUN).
+  AND (NOT "mayHaveRun" OR attempts > 0)
 );
+-- Once a dispatch of a step may have run, nothing erases it: a later attempt's refusal before
+-- admission proves only that attempt never ran (lib/claim-release.ts neverRan).
+CREATE OR REPLACE FUNCTION enforce_instance_step_may_have_run()
+RETURNS trigger LANGUAGE plpgsql AS $instance_step_may_have_run$
+BEGIN
+  IF OLD."mayHaveRun" AND NOT NEW."mayHaveRun" THEN
+    RAISE EXCEPTION 'a step that may have run stays so' USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END;
+$instance_step_may_have_run$;
+DROP TRIGGER IF EXISTS instance_step_may_have_run ON instance_step;
+CREATE TRIGGER instance_step_may_have_run BEFORE UPDATE OF "mayHaveRun" ON instance_step
+FOR EACH ROW EXECUTE FUNCTION enforce_instance_step_may_have_run();
 -- Operator terminals of interactive steps: only on prepare/start/after_join/stop; a terminal id
 -- only while AWAITING_OPERATOR or RUNNING; AWAITING_OPERATOR has an open time and no deadline;
 -- PENDING carries no operator state.
@@ -2471,6 +2560,7 @@ BEGIN
     WHEN 'user' THEN ARRAY[row_data ->> 'id']
     WHEN 'runtime_version' THEN ARRAY[(SELECT "userId" FROM runtime WHERE id = row_data ->> 'runtimeId')]
     WHEN 'instance_rank' THEN ARRAY[(SELECT "userId" FROM runtime_instance WHERE id = row_data ->> 'instanceId')]
+    WHEN 'instance_reservation' THEN ARRAY[(SELECT "userId" FROM runtime_instance WHERE id = row_data ->> 'instanceId')]
     WHEN 'instance_step' THEN ARRAY[(SELECT "userId" FROM runtime_instance WHERE id = row_data ->> 'instanceId')]
     WHEN 'profile_node' THEN ARRAY[(SELECT "userId" FROM profile WHERE id = row_data ->> 'profileId')]
     WHEN 'profile_item' THEN ARRAY[(SELECT "userId" FROM profile WHERE id = row_data ->> 'profileId')]
@@ -2603,9 +2693,10 @@ BEGIN
     ('runtime_version', 'id,runtimeId,version', ''),
     ('runtime_model', 'id,userId,runtimeId,upstreamModelId,type', ''),
     ('runtime_share', 'id,runtimeId,ownerUserId,granteeUserId', ''),
-    ('runtime_instance', 'id,userId,runtimeId,launchVersionId,handle,desiredState', 'versionId'),
-    ('instance_rank', 'id,instanceId,nodeId,rank,claim', ''),
-    ('instance_step', 'id,instanceId,nodeId,rank,phase,sequence,intent,intentHash,state', ''),
+    ('runtime_instance', 'id,userId,runtimeId,launchVersionId,handle,desiredState', 'versionId,runGeneration'),
+    ('instance_rank', 'id,instanceId,nodeId,rank,claim,plannedGeneration,prevResources,prevPort,prevDistPort,prevGeneration', ''),
+    ('instance_reservation', 'id,instanceId,nodeId,index,resources,supersededGeneration,plannedGeneration', ''),
+    ('instance_step', 'id,instanceId,nodeId,rank,phase,sequence,generation,intent,intentHash,state,headAddr,mayHaveRun', ''),
     ('runtime_operation', 'id,userId,profileId', ''),
     ('execution_target', 'id,userId,kind,instanceId,runtimeModelId,providerModelId', ''),
     ('profile', 'id,userId,slug', ''),

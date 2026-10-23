@@ -23,19 +23,24 @@ import {
 import { callerActor } from "../lib/caller-actor";
 import { canonicalJson } from "../lib/canonical-json";
 import { graphWrite, instanceCapacityFences } from "../lib/graph-write";
+import {
+  agentBlockedNode,
+  currentReservations,
+  OCCUPANCY_SELECT,
+  placedOnNodesWhere,
+} from "../lib/instance-occupancy";
 import { PlacementPlanner } from "../lib/placement";
 import { loadPlacementContext } from "../lib/placement-load";
 import { previewFingerprint } from "../lib/preview-fingerprint";
-import { notFound, refuse, refuseAbout } from "../lib/refuse";
+import { notFound, refusalOf, refuse, refuseAbout } from "../lib/refuse";
 import { runtimeSpecWarnings } from "../lib/runtime-spec";
 import {
-  effectiveTrust,
   markInstancesStopping,
   specIsInteractive,
   type Tx,
   writePlannedStarts,
 } from "../lib/runtime-store";
-import { INSTANCE_INCLUDE, instanceView, storedSpec } from "../lib/runtime-views";
+import { INSTANCE_INCLUDE, instanceView, loadStepVersions, storedSpec } from "../lib/runtime-views";
 
 type StartInput = z.infer<typeof c.start.input>;
 type StartPreview = z.infer<typeof startPreviewSchema>;
@@ -67,7 +72,7 @@ async function computeStart(
   const agent = agentRulesApply(context.auth);
   const runtime = await db.runtime.findFirst({
     where: { id: input.runtimeId, userId },
-    select: { id: true, kind: true, currentVersionId: true },
+    select: { id: true, kind: true, currentVersionId: true, origin: true },
   });
   if (!runtime) throw notFound("That runtime does not exist.");
   if (runtime.kind !== "STARTABLE")
@@ -106,6 +111,8 @@ async function computeStart(
     launch,
     // A person may start any version on a Relay-only node (the node runs its frozen copy).
     checkFrozen: false,
+    // A node-origin runtime's version takes no definition slot.
+    nodeOrigin: runtime.origin === "NODE",
     // "May stop others to make room": people see the stops in the preview they confirm.
     preempt: true,
   };
@@ -119,6 +126,7 @@ async function computeStart(
       versionId: version.id,
       instanceId,
       placements: result.start.placements,
+      reservations: result.start.reservations,
       fabric: result.start.fabric,
       distPort: result.start.distPort,
     });
@@ -133,27 +141,49 @@ async function computeStart(
       where: { id: input.instanceId, runtimeId: runtime.id, userId },
       select: {
         id: true,
+        // Every node the instance occupies (`OCCUPANCY_SELECT`): its ranks (with their ports)
+        // and every reservation row, a replaced run's too.
         Ranks: {
-          select: { nodeId: true, port: true, distPort: true },
-          orderBy: { rank: "asc" },
+          ...OCCUPANCY_SELECT.Ranks,
+          select: { ...OCCUPANCY_SELECT.Ranks.select, port: true, distPort: true },
         },
+        Reservations: OCCUPANCY_SELECT.Reservations,
       },
     });
     if (!instance) throw notFound("That instance does not exist.");
     restart = { instanceId: instance.id };
-    // The instance keeps its own nodes and ports; its own claims do not block it.
-    record(
-      instance.id,
-      planner.place({
-        ...base,
-        nodeIds: instance.Ranks.map((rank) => rank.nodeId ?? ""),
-        restart: {
-          instanceId: instance.id,
-          ports: instance.Ranks.map((rank) => rank.port),
-          distPort: instance.Ranks[0]?.distPort ?? null,
-        },
-      }),
-    );
+    // An agent's restart reaches every node the instance holds now (the leading stop acts on the
+    // old launch, its ranks and reservations, a replaced run's included) besides the new plan's:
+    // each must be at Full control (a pending lowering counts as Relay only, a deleted node as
+    // not Full), as a stop's (`runtimeStop`).
+    const blocked = agentRulesApply(context.auth) ? agentBlockedNode(instance) : null;
+    if (blocked) {
+      refusals.push({
+        reason: "trust_relay",
+        subjectId: blocked.nodeId ?? instance.id,
+        message: TRUST_RELAY_MESSAGE,
+      });
+    } else {
+      // Its reservations prefer the nodes they hold now (by index), still placed by labels.
+      const reservationNodeIds: Array<string | null> = [];
+      // Rows read without the select (older callers' fixtures) have none.
+      for (const reservation of currentReservations(instance.Reservations ?? []))
+        reservationNodeIds[reservation.index] = reservation.nodeId;
+      // The instance keeps its own nodes and ports; its own claims do not block it.
+      record(
+        instance.id,
+        planner.place({
+          ...base,
+          nodeIds: instance.Ranks.map((rank) => rank.nodeId ?? ""),
+          restart: {
+            instanceId: instance.id,
+            ports: instance.Ranks.map((rank) => rank.port),
+            distPort: instance.Ranks[0]?.distPort ?? null,
+            reservationNodeIds,
+          },
+        }),
+      );
+    }
   } else if (input.nodeIds) {
     record(null, planner.place({ ...base, nodeIds: input.nodeIds }));
   } else {
@@ -224,21 +254,25 @@ async function operationView(operationId: string) {
       actor: true,
       actorUserId: true,
       agentTokenId: true,
+      userId: true,
       Instances: { include: INSTANCE_INCLUDE, orderBy: { createdAt: "asc" } },
     },
   });
+  const stepVersions = await loadStepVersions(prisma, operation.userId, operation.Instances);
   return {
     id: operation.id,
     kind: operation.kind,
     createdAt: operation.createdAt.toISOString(),
     actor: actorRefOf(operation),
-    instances: operation.Instances.map((row) => instanceView(row)),
+    instances: operation.Instances.map((row) =>
+      instanceView(row, undefined, undefined, stepVersions),
+    ),
   };
 }
 
 function throwFirstRefusal(refusals: readonly Refusal[]): void {
   const first = refusals[0];
-  if (first) throw refuseAbout(first.reason, first.subjectId, first.message);
+  if (first) throw refusalOf(first);
 }
 
 export const runtimeStart = contractProcedure(c.start).handler(async ({ input, context }) => {
@@ -314,7 +348,8 @@ export const runtimeStop = contractProcedure(c.stop).handler(async ({ input, con
           runtimeId: input.runtimeId,
           userId,
           desiredState: "RUNNING" as const,
-          ...(input.nodeId ? { Ranks: { some: { nodeId: input.nodeId } } } : {}),
+          // On that node: a rank there, or a reservation of its current plan there.
+          ...(input.nodeId ? placedOnNodesWhere([input.nodeId]) : {}),
         };
   // Read, check and write under the owner fence, so a trust lowering (an owner write) cannot
   // land in between and let an agent's stop through; then the capacity fences of the stops.
@@ -343,20 +378,17 @@ export const runtimeStop = contractProcedure(c.stop).handler(async ({ input, con
     async (tx) => {
       const instances = await tx.runtimeInstance.findMany({
         where,
-        select: {
-          id: true,
-          Ranks: {
-            select: { Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } } },
-          },
-        },
+        select: { id: true, ...OCCUPANCY_SELECT },
         orderBy: { id: "asc" },
       });
       if (instances.length === 0) throw notFound("Nothing of this runtime is running there.");
+      // Every node the stop reaches: the ranks' and the reservations' that still hold.
       if (agentRulesApply(context.auth))
-        for (const instance of instances)
-          for (const rank of instance.Ranks)
-            if (!rank.Node || effectiveTrust(rank.Node) !== "FULL")
-              throw refuseAbout("trust_relay", rank.Node?.id ?? instance.id, TRUST_RELAY_MESSAGE);
+        for (const instance of instances) {
+          const blocked = agentBlockedNode(instance);
+          if (blocked)
+            throw refuseAbout("trust_relay", blocked.nodeId ?? instance.id, TRUST_RELAY_MESSAGE);
+        }
       ids = instances.map((instance) => instance.id);
       return instanceCapacityFences(ids);
     },

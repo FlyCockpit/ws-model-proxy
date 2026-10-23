@@ -16,6 +16,7 @@ const { NODE_A, NODE_B, START } = vi.hoisted(() => {
     versionId: "v-1",
     instanceId: null,
     placements: [{ nodeId: "node-b", nodeSlug: "spark-2", port: 30001 }],
+    reservations: [],
     fabric: null,
     distPort: null,
   };

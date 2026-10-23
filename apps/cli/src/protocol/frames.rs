@@ -922,6 +922,26 @@ pub struct JobOperator {
     pub command_author: CommandAuthor,
 }
 
+/// Most reservations one single-node job names.
+pub const JOB_RESERVATIONS_MAX: usize = 8;
+
+/// One reservation of a single-node instance and the worker node it was
+/// assigned to. Commands see it as `WSMP_RESERVATION_<index>_NODE` (the slug),
+/// `WSMP_RESERVATION_<index>_NODE_ID` and, when placement gave it GPUs,
+/// `WSMP_RESERVATION_<index>_GPUS` (the worker's GPU indices, like the rank's
+/// own `gpu_ids`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobReservation {
+    pub index: u8,
+    pub node_id: String,
+    pub node: String,
+    /// The worker GPUs placement accounted to this reservation (`0,3`), in the
+    /// format of `placeholders.gpu_ids`. Absent: none recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_ids: Option<String>,
+}
+
 /// No command text: the node renders from the held/frozen definition whose
 /// `launchHash` matches (§4.4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -949,6 +969,11 @@ pub struct RuntimeJob {
     pub intent_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator: Option<JobOperator>,
+    /// Single-node only: the worker nodes the instance's reservations were
+    /// assigned to (a stop or status job carries those of the launch it
+    /// checks). Absent when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reservations: Vec<JobReservation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1746,8 +1771,73 @@ impl RuntimeJob {
         rule(
             self.unit_name == runtime_unit_name(&self.handle, self.rank),
             "unitName must be wsmp-<handle>-r<rank>",
-        )
+        )?;
+        rule(
+            self.reservations.is_empty() || self.nnodes == 1,
+            "reservations only on single-node jobs",
+        )?;
+        rule(
+            self.reservations.len() <= JOB_RESERVATIONS_MAX,
+            "at most 8 reservations",
+        )?;
+        let mut seen = [false; JOB_RESERVATIONS_MAX];
+        for reservation in &self.reservations {
+            let slot = seen.get_mut(usize::from(reservation.index));
+            rule(slot.is_some(), "reservation index is 0 to 7")?;
+            if let Some(slot) = slot {
+                rule(!*slot, "reservation indices are unique")?;
+                *slot = true;
+            }
+            rule(
+                is_row_id(&reservation.node_id),
+                "reservation nodeId is a row id",
+            )?;
+            rule(
+                is_node_slug(&reservation.node),
+                "reservation node is a node slug",
+            )?;
+            rule(
+                reservation.gpu_ids.as_deref().is_none_or(is_gpu_ids),
+                "reservation gpuIds is a list of GPU indices",
+            )?;
+        }
+        Ok(())
     }
+}
+
+/// A comma list of GPU indices (0–255), unique, at most 64: a rank's
+/// `placeholders.gpu_ids` and a reservation's `gpuIds`.
+pub fn is_gpu_ids(value: &str) -> bool {
+    let parts: Vec<&str> = value.split(',').collect();
+    let mut seen = std::collections::BTreeSet::new();
+    !value.is_empty()
+        && parts.len() <= 64
+        && parts.iter().all(|part| {
+            (part == &"0" || (!part.starts_with('0') && !part.is_empty()))
+                && part.len() <= 3
+                && part.bytes().all(|b| b.is_ascii_digit())
+                && part.parse::<u16>().is_ok_and(|n| n <= 255)
+                && seen.insert(*part)
+        })
+}
+
+/// `^[A-Za-z0-9_-]{1,64}$` (the server's `rowIdSchema`).
+pub fn is_row_id(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+/// `^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){2,62}$` (the server's node slug).
+pub fn is_node_slug(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let plain = |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    (3..=63).contains(&bytes.len())
+        && bytes.first().is_some_and(plain)
+        && bytes.last().is_some_and(plain)
+        && bytes.iter().all(|byte| plain(byte) || *byte == b'-')
+        && !value.contains("--")
 }
 
 /// `http://(127.0.0.1|[::1]|localhost):<1-5 digits>` with an optional `/v1`
@@ -2213,6 +2303,86 @@ mod tests {
                 assert!(job.rank < job.nnodes, "{name}");
             }
         }
+    }
+
+    #[test]
+    fn job_reservations_follow_the_rules() {
+        let frames = round_trip::<ServerFrame>("frames/server-to-node");
+        let Some(ServerFrame::RuntimeJob(job)) = frames
+            .into_iter()
+            .find(|(name, _)| name == "runtime.job-reservations.json")
+            .map(|(_, frame)| frame)
+        else {
+            panic!("runtime.job-reservations fixture");
+        };
+        let job = *job;
+        assert_eq!(job.reservations.len(), 2);
+        assert!(job.validate().is_ok());
+        let broken = |change: &dyn Fn(&mut RuntimeJob)| {
+            let mut copy = job.clone();
+            change(&mut copy);
+            copy.validate().is_err()
+        };
+        let entry = |index: u8| JobReservation {
+            index,
+            node_id: format!("nd{index}"),
+            node: format!("worker-{index}"),
+            gpu_ids: None,
+        };
+        assert!(broken(&|job| job.reservations[1].index = 0));
+        assert!(broken(&|job| job.reservations[1].index = 8));
+        assert!(broken(
+            &|job| job.reservations = (0..9).map(|_| entry(0)).collect()
+        ));
+        assert!(broken(&|job| job.reservations[0].node_id = String::new()));
+        assert!(broken(&|job| job.reservations[0].node_id = "a".repeat(65)));
+        assert!(broken(&|job| job.reservations[0].node_id = "nd 1".into()));
+        assert!(broken(&|job| job.reservations[0].node = "Worker-a".into()));
+        assert!(broken(&|job| job.reservations[0].node = "worker--a".into()));
+        assert!(broken(&|job| job.reservations[0].node = "-worker".into()));
+        assert!(broken(&|job| job.reservations[0].node = "worker-".into()));
+        assert!(broken(&|job| job.reservations[0].node = "ab".into()));
+        assert!(broken(&|job| job.reservations[0].node = "a".repeat(64)));
+        assert!(!broken(
+            &|job| job.reservations = (0..8).map(entry).collect()
+        ));
+        assert!(!broken(&|job| job.reservations[0].node = "a".repeat(63)));
+        assert!(!broken(&|job| job.reservations[0].node = "a1b".into()));
+        // Worker GPUs: indices like the rank's `gpu_ids`, never keys or repeats.
+        assert_eq!(job.reservations[0].gpu_ids.as_deref(), Some("1"));
+        assert!(!broken(
+            &|job| job.reservations[0].gpu_ids = Some("0,3".into())
+        ));
+        assert!(!broken(&|job| job.reservations[0].gpu_ids = None));
+        assert!(broken(
+            &|job| job.reservations[0].gpu_ids = Some(String::new())
+        ));
+        assert!(broken(
+            &|job| job.reservations[0].gpu_ids = Some("nvidia:1".into())
+        ));
+        assert!(broken(
+            &|job| job.reservations[0].gpu_ids = Some("01".into())
+        ));
+        assert!(broken(
+            &|job| job.reservations[0].gpu_ids = Some("1,1".into())
+        ));
+        assert!(broken(
+            &|job| job.reservations[0].gpu_ids = Some("256".into())
+        ));
+        assert!(!broken(&|job| job.reservations.clear()));
+        // Multi-node jobs carry none.
+        assert!(broken(&|job| {
+            job.nnodes = 2;
+            job.fabric_id = Some("fab_qsfp1".into());
+            job.placeholders.head_addr = Some("10.0.0.5".into());
+        }));
+        // An empty list is never sent.
+        let wire = serde_json::to_value(RuntimeJob {
+            reservations: Vec::new(),
+            ..job
+        })
+        .expect("serializes");
+        assert!(wire.get("reservations").is_none());
     }
 
     #[test]

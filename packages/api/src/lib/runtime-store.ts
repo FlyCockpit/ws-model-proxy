@@ -9,10 +9,11 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import type { z } from "zod";
 import type { runtimeAdvancedPatchSchema, runtimeLimitsPatchSchema } from "../contracts/advanced";
 import { type CallerActor } from "./caller-actor";
-import { clearInstanceReleaseRequests, retakenClaim } from "./claim-release";
+import { resolveRun } from "./instance-run";
 import { refuseAbout } from "./refuse";
 import { applyJsonPatch } from "./registry-view";
 import type { RequestCompat } from "./request-compat";
+import { retakeInstanceClaims } from "./reservations";
 import { runtimeContentHash, runtimeLaunchHash } from "./runtime-launch-hash";
 import type { RuntimeSpec } from "./runtime-spec";
 
@@ -103,14 +104,6 @@ export function versionHashes(
     launchHash: runtimeLaunchHash(spec),
     contentHash: runtimeContentHash({ spec, limits, advanced, compat }),
   };
-}
-
-/** The trust the server acts on: a requested lowering counts as Relay only at once. */
-export function effectiveTrust(node: {
-  trust: "RELAY" | "FULL" | null;
-  trustLowerRequestedAt: Date | null;
-}): "RELAY" | "FULL" | null {
-  return node.trustLowerRequestedAt ? "RELAY" : node.trust;
 }
 
 export function specIsInteractive(spec: RuntimeSpec): boolean {
@@ -250,6 +243,10 @@ export async function markInstancesStopping(
   reason: StopReason,
 ): Promise<number> {
   if (instanceIds.length === 0) return 0;
+  // The runs being stopped, persisted before the operation changes: a legacy row's committed,
+  // unprepared restart is read from its operation (`resolveRun`), which this write replaces.
+  // (The ids are the owner's: every caller reads them under the owner's fence.)
+  for (const instanceId of instanceIds) await resolveRun(tx, instanceId);
   const result = await tx.runtimeInstance.updateMany({
     where: { id: { in: [...instanceIds] }, userId, desiredState: "RUNNING" },
     data: {
@@ -285,6 +282,13 @@ export type PlannedStartWrite = {
     port: number;
     resources: Record<string, unknown>;
   }>;
+  /** `launch.reservations` placed (memory held on other nodes; nothing runs there). */
+  reservations: ReadonlyArray<{
+    index: number;
+    nodeId: string;
+    labels: readonly string[];
+    resources: Record<string, unknown>;
+  }>;
   fabric: { fabricId: string } | null;
   distPort: number | null;
 };
@@ -311,6 +315,9 @@ export async function writePlannedStarts(
   for (const [index, start] of input.starts.entries()) {
     const blockedBy = [...(input.blockedBy[index] ?? [])];
     if (start.instanceId) {
+      // The run being replaced, read before this restart is written (a row from before runs
+      // existed is bootstrapped from its steps now, not from the restart below).
+      await resolveRun(tx, start.instanceId);
       await tx.runtimeInstance.update({
         where: { id: start.instanceId },
         data: {
@@ -330,24 +337,29 @@ export async function writePlannedStarts(
           fabricId: start.fabric?.fabricId ?? null,
         },
       });
-      // Each rank takes the new version's resources (and the GPUs the plan picked).
-      for (const placement of start.placements)
-        await tx.instanceRank.update({
-          where: {
-            instanceId_rank: { instanceId: start.instanceId, rank: placement.nodeNumber - 1 },
-          },
-          // The same retake as the engine's automatic restart: the old run's mark as
-          // stopped and release record go with it.
-          data: {
-            ...retakenClaim(now),
-            port: placement.port,
-            distPort: start.distPort,
-            resources: placement.resources as Prisma.InputJsonObject,
-            blockedBy,
-          },
-        });
-      // The claims are held by the new run: a request to release the old one has nothing left.
-      await clearInstanceReleaseRequests(tx, start.instanceId, now);
+      // Each rank takes the new version's resources (and the GPUs the plan picked), with the
+      // same retake as the engine's automatic restart (the old run's mark as stopped and
+      // release record go with it); the reservations are placed again with the ranks: the new
+      // plan's become current, the old run's keep holding until its stop is proven.
+      const instanceId = start.instanceId;
+      await retakeInstanceClaims(tx, {
+        instanceId,
+        now,
+        reservations: start.reservations,
+        writeRanks: async (claim) => {
+          for (const placement of start.placements)
+            await tx.instanceRank.update({
+              where: { instanceId_rank: { instanceId, rank: placement.nodeNumber - 1 } },
+              data: {
+                ...claim,
+                port: placement.port,
+                distPort: start.distPort,
+                resources: placement.resources as Prisma.InputJsonObject,
+                blockedBy,
+              },
+            });
+        },
+      });
       ids.push(start.instanceId);
       continue;
     }
@@ -365,6 +377,8 @@ export async function writePlannedStarts(
         startedBy: input.startedBy,
         desiredState: "RUNNING",
         phase: "STARTING",
+        // Its first run (`instance-run.ts`): the engine prepares generation 1.
+        runGeneration: 1,
         fabricId: start.fabric?.fabricId ?? null,
         Ranks: {
           create: start.placements.map((placement) => ({
@@ -376,6 +390,15 @@ export async function writePlannedStarts(
             portFixed: false,
             resources: placement.resources as Prisma.InputJsonObject,
             blockedBy,
+          })),
+        },
+        // Taken in the same write as the ranks (under the same fences as the plan).
+        Reservations: {
+          create: start.reservations.map((reservation) => ({
+            nodeId: reservation.nodeId,
+            index: reservation.index,
+            labels: [...reservation.labels],
+            resources: reservation.resources as Prisma.InputJsonObject,
           })),
         },
       },

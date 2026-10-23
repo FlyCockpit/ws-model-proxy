@@ -68,6 +68,8 @@
     "perNodeEntries": "Da una entrada por cada nodo del runtime, o exactamente una para todos.",
     "fabricSingleNode": "Solo un runtime de varios nodos indica un fabric.",
     "fixedPortGroup": "Un puerto fijo requiere groupSize 1.",
+    "reservationsGroup": "Las reservas requieren groupSize 1; un runtime de varios nodos coloca un rango en cada nodo.",
+    "reservationLabels": "Una reserva indica al menos una etiqueta para elegir su nodo.",
     "secretTwice": "Nombra cada secreto una sola vez.",
     "serviceStop": "Los runtimes de servicio necesitan un comando de detención.",
     "serviceStatus": "Los runtimes de servicio necesitan un comando de estado (sale con 0 si está activo, 3 si está detenido).",

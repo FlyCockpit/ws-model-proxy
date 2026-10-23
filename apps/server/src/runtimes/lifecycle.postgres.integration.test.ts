@@ -47,6 +47,8 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     supported: true,
     room: true,
     closeAnswer: "closed" as "closed" | "running" | "absent",
+    /** Per step: what closing it answers instead of `closeAnswer`. */
+    closeAnswers: new Map<string, "closed" | "running" | "absent">(),
     closed: [] as string[],
     closedTerminals: [] as string[],
   };
@@ -299,7 +301,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       operatorRoom: () => operatorRelay.room,
       closeOperatorStep: (stepId) => {
         operatorRelay.closed.push(stepId);
-        return operatorRelay.closeAnswer;
+        return operatorRelay.closeAnswers.get(stepId) ?? operatorRelay.closeAnswer;
       },
       closeOperatorTerminal: (_node, terminalId) => {
         operatorRelay.closedTerminals.push(terminalId);
@@ -496,6 +498,257 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     // The budget (1) is used up.
     expect(row.phase).toBe("FAILED");
     expect(row.phaseReason).toBe("restart_budget_exhausted");
+  });
+
+  it("a late stop of the run before a manual restart releases nothing; the new run's stop does", async () => {
+    const lc = await engine();
+    const id = await startInstance(30_231);
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "start"), "failed", { error: "command_failed" });
+    await lc.runOnce();
+    // Generation 1's gang stop is out, made in the instance's first run.
+    const oldStop = lastJob(id, "stop");
+    expect(oldStop.generation).toBe(1);
+    expect(await instance(id)).toMatchObject({ runGeneration: 1 });
+    expect((await instance(id)).Ranks[0]).toMatchObject({ claim: "HELD" });
+
+    // A person restarts it (runtime_start on the instance): the one restart write, under the
+    // owner and capacity fences, retakes the claim and begins run 2 before its steps exist.
+    const [store, graph] = await Promise.all([
+      import("@ws-model-proxy/api/lib/runtime-store"),
+      import("@ws-model-proxy/api/lib/graph-write"),
+    ]);
+    const operation = await m.fixture.runtimeOperation.create({
+      data: {
+        userId,
+        kind: "START",
+        actor: "USER",
+        actorUserId: userId,
+        summary: {},
+        fingerprint: hex(`op-restart-${id}`),
+      },
+    });
+    await graph.graphWrite(
+      [userId],
+      (tx) =>
+        store.writePlannedStarts(tx, {
+          userId,
+          operationId: operation.id,
+          startedBy: "USER",
+          blockedBy: [[]],
+          starts: [
+            {
+              runtimeId,
+              versionId,
+              instanceId: id,
+              placements: [{ nodeNumber: 1, nodeId, port: 30_231, resources: { kind: "none" } }],
+              reservations: [],
+              fabric: null,
+              distPort: null,
+            },
+          ],
+        }),
+      async () => graph.instanceCapacityFences([id]),
+    );
+    let row = await instance(id);
+    expect(row.phase).toBe("STARTING");
+    expect(row).toMatchObject({ runGeneration: 2 });
+    expect(row.Ranks[0]).toMatchObject({ claim: "HELD" });
+
+    // The old run's stop answers now (no step of run 2 exists yet): nothing released.
+    await answer(lc, oldStop, "succeeded", { stopped: true });
+    row = await instance(id);
+    expect(row.Ranks[0]?.claim).toBe("HELD");
+    expect(row.phase).toBe("STARTING");
+    expect(
+      await m.fixture.instanceStep.findUniqueOrThrow({
+        where: { id: oldStop.stepId },
+        select: { state: true, generation: true },
+      }),
+    ).toEqual({ state: "SUCCEEDED", generation: 1 });
+
+    // Control: generation 2 is run 2, and its own stop releases the claim.
+    await lc.runOnce();
+    const leading = lastJob(id, "stop");
+    expect(leading.generation).toBe(2);
+    await answer(lc, leading, "succeeded", { stopped: true });
+    expect((await instance(id)).Ranks[0]?.claim).toBe("HELD");
+    await lc.runOnce();
+    await answer(lc, lastJob(id, "start"), "failed", { error: "command_failed" });
+    await lc.runOnce();
+    const newStop = lastJob(id, "stop");
+    expect(newStop.stepId).not.toBe(leading.stepId);
+    await answer(lc, newStop, "succeeded", { stopped: true });
+    row = await instance(id);
+    expect(row.Ranks[0]?.claim).toBe("RELEASED");
+  });
+
+  it("PG2: a restart committed between prepare and dispatch never sends the old START; its unsent reservation row goes", async () => {
+    const lc = await engine({ scoped: true });
+    const id = await startInstance(30_241);
+    // A second node of the owner holds the instance's reservation (planned for run 1).
+    const reservedNode = `${nodeId}r`;
+    await m.fixture.node.create({
+      data: { id: reservedNode, userId, slug: `lcr-${suffix}`, trust: "FULL" },
+    });
+    await m.fixture.instanceReservation.create({
+      data: {
+        instanceId: id,
+        nodeId: reservedNode,
+        index: 0,
+        labels: ["worker"],
+        resources: { kind: "unified", memoryGb: 40 },
+      },
+    });
+    // Run 1 is prepared while the node is away: nothing is dispatched.
+    session.online = false;
+    try {
+      await lc.runOnce();
+    } finally {
+      session.online = true;
+    }
+    const oldStart = await m.fixture.instanceStep.findFirstOrThrow({
+      where: { instanceId: id, phase: "START", generation: 1 },
+    });
+    expect(oldStart).toMatchObject({ state: "PENDING", attempts: 0 });
+    // A person restarts it with a smaller reservation: run 2 begins at this commit.
+    const [store, graph] = await Promise.all([
+      import("@ws-model-proxy/api/lib/runtime-store"),
+      import("@ws-model-proxy/api/lib/graph-write"),
+    ]);
+    const operation = await m.fixture.runtimeOperation.create({
+      data: {
+        userId,
+        kind: "START",
+        actor: "USER",
+        actorUserId: userId,
+        summary: {},
+        fingerprint: hex(`op-pg2-${id}`),
+      },
+    });
+    await graph.graphWrite(
+      [userId],
+      (tx) =>
+        store.writePlannedStarts(tx, {
+          userId,
+          operationId: operation.id,
+          startedBy: "USER",
+          blockedBy: [[]],
+          starts: [
+            {
+              runtimeId,
+              versionId,
+              instanceId: id,
+              placements: [{ nodeNumber: 1, nodeId, port: 30_241, resources: { kind: "none" } }],
+              reservations: [
+                {
+                  index: 0,
+                  nodeId: reservedNode,
+                  labels: ["worker"],
+                  resources: { kind: "unified", memoryGb: 20 },
+                },
+              ],
+              fabric: null,
+              distPort: null,
+            },
+          ],
+        }),
+      async () => graph.instanceCapacityFences([id]),
+    );
+    expect(await instance(id)).toMatchObject({ runGeneration: 2, phase: "STARTING" });
+    // The old plan never dispatched: its row is gone, only the new one holds (never both).
+    const rows = await m.fixture.instanceReservation.findMany({
+      where: { instanceId: id },
+      select: { resources: true, supersededGeneration: true },
+    });
+    expect(rows).toEqual([
+      { resources: { kind: "unified", memoryGb: 20 }, supersededGeneration: null },
+    ]);
+    sent.length = 0;
+    await lc.runOnce();
+    expect(sent.filter((job) => job.instanceId === id && job.generation === 1)).toEqual([]);
+    expect(
+      await m.fixture.instanceStep.findUniqueOrThrow({
+        where: { id: oldStart.id },
+        select: { state: true },
+      }),
+    ).toEqual({ state: "CANCELLED" });
+    expect(lastJob(id, "stop").generation).toBe(2);
+  });
+
+  it("G1 crash replay: a new server process re-queues the old run's START; a restart committed meanwhile keeps it from going out", async () => {
+    const before = await engine({ scoped: true });
+    const id = await startInstance(30_243);
+    await before.runOnce();
+    const oldStart = lastJob(id, "start");
+    expect(oldStart.generation).toBe(1);
+    // The server process ends with the START unanswered; a person restarts the instance.
+    await before.stop();
+    const [store, graph] = await Promise.all([
+      import("@ws-model-proxy/api/lib/runtime-store"),
+      import("@ws-model-proxy/api/lib/graph-write"),
+    ]);
+    const operation = await m.fixture.runtimeOperation.create({
+      data: {
+        userId,
+        kind: "START",
+        actor: "USER",
+        actorUserId: userId,
+        summary: {},
+        fingerprint: hex(`op-crash-${id}`),
+      },
+    });
+    await graph.graphWrite(
+      [userId],
+      (tx) =>
+        store.writePlannedStarts(tx, {
+          userId,
+          operationId: operation.id,
+          startedBy: "USER",
+          blockedBy: [[]],
+          starts: [
+            {
+              runtimeId,
+              versionId,
+              instanceId: id,
+              placements: [{ nodeNumber: 1, nodeId, port: 30_243, resources: { kind: "none" } }],
+              reservations: [],
+              fabric: null,
+              distPort: null,
+            },
+          ],
+        }),
+      async () => graph.instanceCapacityFences([id]),
+    );
+    // A new process: the node reconnects, its unanswered steps go back to PENDING.
+    const after = await engine({ scoped: true });
+    await after.requeueStale(ref());
+    expect(
+      await m.fixture.instanceStep.findUniqueOrThrow({
+        where: { id: oldStart.stepId },
+        select: { state: true, attempts: true },
+      }),
+    ).toEqual({ state: "PENDING", attempts: 1 });
+    sent.length = 0;
+    await after.runOnce();
+    // Never sent again: it may have run, so it ends FAILED (not CANCELLED), and run 2's
+    // leading stop proves whatever it started is gone.
+    expect(sent.filter((job) => job.instanceId === id && job.generation === 1)).toEqual([]);
+    expect(
+      await m.fixture.instanceStep.findUniqueOrThrow({
+        where: { id: oldStart.stepId },
+        select: { state: true, errorCode: true },
+      }),
+    ).toEqual({ state: "FAILED", errorCode: "superseded" });
+    const leading = lastJob(id, "stop");
+    expect(leading.generation).toBe(2);
+    // The old process's late answer is from another epoch: dropped.
+    await answer(after, oldStart, "succeeded");
+    expect((await instance(id)).phase).toBe("STARTING");
+    await answer(after, leading, "succeeded", { stopped: true });
+    await after.runOnce();
+    expect(lastJob(id, "start").generation).toBe(2);
+    expect((await instance(id)).Ranks[0]?.claim).toBe("HELD");
   });
 
   it("fails a start that handed its server off, without restarting it", async () => {
@@ -976,14 +1229,46 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     expect((await instance(id)).phase).toBe("READY");
   });
 
-  it("gang-stops a ready instance whose rank the node no longer runs", async () => {
+  it("gang-stops a ready instance whose rank the node reports stopped after this run's launch", async () => {
     const lc = await engine();
     const id = await ready(lc, 30_107);
-    await lc.runtimeInventory(ref(), { snapshotId: "s1", alwaysOn: [], instances: [] });
-    const row = await instance(id);
+    // A missing record cannot be dated against this run's launch: a health probe answers.
+    await lc.runtimeInventory(ref(), { snapshotId: "s0", alwaysOn: [], instances: [] });
+    let row = await instance(id);
+    expect(row.phase).toBe("READY");
+    expect(row.lastHealthAt).toBeNull();
+    // A record naming this run's readiness, stopped: the run crashed.
+    await lc.runtimeInventory(ref(), {
+      snapshotId: "s1",
+      alwaysOn: [],
+      instances: [await stoppedRecord(id, 30_107)],
+    });
+    row = await instance(id);
     expect(row.phase).toBe("STOPPING");
     expect(row.phaseReason).toBe("crashed");
   });
+
+  /** The node's record of this run's head rank, stopped, naming the run's readiness step. */
+  async function stoppedRecord(id: string, port: number) {
+    const row = await instance(id);
+    const readiness = await m.fixture.instanceStep.findFirstOrThrow({
+      where: { instanceId: id, phase: "READINESS" },
+      orderBy: { createdAt: "desc" },
+    });
+    return {
+      instanceId: id,
+      launchVersionId: row.launchVersionId,
+      launchHash: hex(`launch-${suffix}`),
+      rank: 0,
+      intentHash: hex("intent"),
+      stepId: readiness.id,
+      phase: "stopped" as const,
+      unitName: `wsmp-${row.handle}-r0`,
+      port,
+      handle: row.handle,
+      models: ["m"],
+    };
+  }
 
   // ── Interactive steps (operator terminals) ──
 
@@ -1076,6 +1361,54 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     await lc.runOnce();
     await answer(lc, lastJob(id, "readiness"), "succeeded");
     expect((await instance(id)).phase).toBe("READY");
+  });
+
+  it("an accepted run whose awaiting_operator write was lost is recorded within the operator CHECK", async () => {
+    const lc = await engine();
+    // Run 1: the screen came up and the person pressed Enter, but `awaiting_operator` was never
+    // written; the relay reports the run (`operator_running`).
+    const first = await startInstance(30_251, "USER", "operator");
+    // Run 2: nothing of the screen was written, and the deadline sweep finds the relay running it.
+    const second = await startInstance(30_252, "USER", "operator");
+    await lc.runOnce();
+    const job = lastJob(first, "start");
+    let row = await step(first, "START");
+    expect(row).toMatchObject({ state: "RUNNING", operatorSince: null });
+    await progress(lc, job, "operator_running");
+    row = await step(first, "START");
+    expect(row.state).toBe("RUNNING");
+    expect(row.operatorAcceptedAt).not.toBeNull();
+    expect(row.operatorSince).not.toBeNull();
+
+    const other = await step(second, "START");
+    expect(other).toMatchObject({ state: "RUNNING", operatorSince: null });
+    await m.fixture.instanceStep.update({
+      where: { id: other.id },
+      data: {
+        deadline: new Date(Date.now() - 1_000),
+        leaseExpiresAt: new Date(Date.now() - 1_000),
+      },
+    });
+    operatorRelay.closeAnswer = "running";
+    try {
+      await lc.runOnce();
+    } finally {
+      operatorRelay.closeAnswer = "closed";
+    }
+    const accepted = await step(second, "START");
+    expect(accepted.state).toBe("RUNNING");
+    expect(accepted.operatorAcceptedAt).not.toBeNull();
+    expect(accepted.operatorSince).not.toBeNull();
+
+    // Both runs end and both instances stop (the node's terminals are free for the next test).
+    await progress(lc, job, "succeeded");
+    await progress(lc, lastJob(second, "start"), "succeeded");
+    for (const id of [first, second]) {
+      await stopInstance(id);
+      await lc.runOnce();
+      await answer(lc, lastJob(id, "stop"), "succeeded", { stopped: true });
+      expect((await instance(id)).phase).toBe("STOPPED");
+    }
   });
 
   it("a decline gives its attempt back; reopen uses a fresh terminal; cancel gives up", async () => {
@@ -1363,7 +1696,11 @@ integration("runtime lifecycle (PostgreSQL)", () => {
         where: { instanceId: id, phase: "HEALTH", state: "PENDING" },
         data: { state: "CANCELLED" },
       });
-      await lc.runtimeInventory(ref(), { snapshotId: "s-ban", alwaysOn: [], instances: [] });
+      await lc.runtimeInventory(ref(), {
+        snapshotId: "s-ban",
+        alwaysOn: [],
+        instances: [await stoppedRecord(id, 30_218)],
+      });
       await lc.runOnce();
       await answer(lc, lastJob(id, "stop"), "succeeded", { stopped: true });
       let inst = await instance(id);
@@ -1397,15 +1734,23 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     await lc.runOnce();
     const run = lastJob(running, "start");
     await progress(lc, run, "awaiting_operator");
-    // The person pressed Enter; the node's report has not arrived yet.
-    operatorRelay.closeAnswer = "running";
+    // The person pressed Enter: the relay saw it, this database has not recorded it yet. The
+    // other terminal's screen never came up, and the ban fence already cancelled it ("absent").
+    // (The relay answering "running" for it too would be a person's run there, recorded as
+    // accepted: the operator CHECK holds since `closeOperatorKeepingRun` writes its screen time.)
+    operatorRelay.closeAnswers.set(run.stepId, "running");
+    operatorRelay.closeAnswer = "absent";
     await ban(null);
     try {
       await lc.runOnce();
-      expect((await step(running, "START")).state).toBe("AWAITING_OPERATOR");
-      // The other terminal's screen never came up, and the ban fence already cancelled it
-      // ("absent"): it may have run, so the attempt counts and the rank needs a proven stop.
-      operatorRelay.closeAnswer = "absent";
+      // Left alone (never cut off), and its acceptance is recorded from the relay's answer
+      // (R5-B-1), so it is a person's accepted run from now on.
+      const accepted = await step(running, "START");
+      expect(accepted.state).toBe("RUNNING");
+      expect(accepted.operatorAcceptedAt).not.toBeNull();
+      expect(accepted.errorCode).toBeNull();
+      // The other terminal: it may have run, so the attempt counts and the rank needs a
+      // proven stop.
       await lc.runOnce();
       const row = await step(spawning, "START");
       expect(row.state).toBe("FAILED");
@@ -1414,8 +1759,11 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       expect((await instance(spawning)).phase).toBe("STOPPING");
     } finally {
       operatorRelay.closeAnswer = "closed";
+      operatorRelay.closeAnswers.clear();
       await unban();
     }
+    // The person's accepted run answers (its terminal closes), then both stop.
+    await progress(lc, run, "succeeded");
     for (const id of [running, spawning]) {
       await stopInstance(id);
       await lc.runOnce();
@@ -1840,6 +2188,12 @@ integration("runtime lifecycle (PostgreSQL)", () => {
           launchHash: hex(`launch-${suffix}`),
           rank: 0,
           intentHash: hex("intent"),
+          // The run's own step: a record without one (before 0.4.0) cannot be dated.
+          stepId: (
+            await m.fixture.instanceStep.findFirstOrThrow({
+              where: { instanceId: id, phase: "READINESS" },
+            })
+          ).id,
           phase: "ready",
           unitName: `wsmp-${row.handle}-r0`,
           port: 30_301,

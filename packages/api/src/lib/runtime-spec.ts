@@ -98,6 +98,8 @@ export const RUNTIME_GROUP_SIZE_MAX = 64;
 export const RUNTIME_MODELS_MAX = 64;
 export const RUNTIME_LABELS_MAX = 32;
 export const RUNTIME_LABEL_PATTERN = /^[a-z][a-z0-9-]{0,62}$/;
+/** `launch.reservations` entries (single-node runtimes only). */
+export const RUNTIME_RESERVATIONS_MAX = 8;
 export const RUNTIME_SLUG_PATTERN = /^[a-z](?:[a-z0-9]|-(?=[a-z0-9])){0,40}$/;
 /**
  * Node-local named secrets (owner decision round 3): one namespace, set only on the node
@@ -364,6 +366,24 @@ export const runtimeResourceSchema = z.discriminatedUnion("kind", [
 ]);
 export type RuntimeResource = z.infer<typeof runtimeResourceSchema>;
 
+/**
+ * Memory a single-node runtime holds on another node while it runs, without running anything
+ * there (its launcher starts work on that node itself, e.g. over SSH). Placed by labels on a node
+ * other than the runtime's and other reservations', counted like a rank's claim, released with
+ * the runtime's claim. Server-only: `nodeRuntimeSpec` strips `launch.reservations` before the
+ * launch hash and the node's copy, so nodes never see it.
+ */
+export const runtimeReservationSchema = z
+  .object({
+    labels: runtimeLabelsSchema.refine(
+      (labels) => labels.length > 0,
+      specIssue("reservationLabels"),
+    ),
+    resources: runtimeResourceSchema,
+  })
+  .strict();
+export type RuntimeReservation = z.infer<typeof runtimeReservationSchema>;
+
 const interactiveSchema = z
   .object({
     start: z.literal(true).optional(),
@@ -419,6 +439,8 @@ export const runtimeLaunchSchema = z
      */
     fabric: z.string().regex(FABRIC_NAME_PATTERN).optional(),
     commands: z.array(runtimeCommandsSchema).min(1).max(RUNTIME_GROUP_SIZE_MAX),
+    /** Single-node only: memory held on other nodes while this runs (`runtimeReservationSchema`). */
+    reservations: z.array(runtimeReservationSchema).max(RUNTIME_RESERVATIONS_MAX).optional(),
     /** Node secrets exported (by name) to every command of this runtime. */
     secrets: z.array(nodeSecretNameSchema).max(NODE_SECRETS_MAX).optional(),
     /**
@@ -461,6 +483,12 @@ export const runtimeLaunchSchema = z
         code: "custom",
         path: ["port"],
         ...specIssue("fixedPortGroup"),
+      });
+    if (launch.reservations && launch.reservations.length > 0 && launch.groupSize !== 1)
+      ctx.addIssue({
+        code: "custom",
+        path: ["reservations"],
+        ...specIssue("reservationsGroup"),
       });
     // The node refuses a definition that names a secret twice.
     launch.secrets?.forEach((name, index) => {
@@ -651,6 +679,24 @@ export const runtimeSpecSchema = z
       });
   });
 export type RuntimeSpec = z.infer<typeof runtimeSpecSchema>;
+
+/**
+ * The spec as a node sees it: `launch.reservations` (server-only placement data) removed. The
+ * launch hash and every `runtime.define` envelope use this, so a spec without reservations
+ * hashes exactly as before and nodes (whose launch schema denies unknown fields) never see it.
+ */
+export function nodeRuntimeSpec(spec: RuntimeSpec): RuntimeSpec {
+  if (!spec.launch || spec.launch.reservations === undefined) return spec;
+  const { reservations: _serverOnly, ...launch } = spec.launch;
+  return { ...spec, launch };
+}
+
+/** A launch's reservations (none when absent). */
+export function launchReservations(
+  launch: Pick<RuntimeLaunch, "reservations"> | null | undefined,
+): RuntimeReservation[] {
+  return launch?.reservations ?? [];
+}
 
 const NEVER_STOPPED_STATUS = new Set(["", "true", ":", "exit 0", "/bin/true", "/usr/bin/true"]);
 
@@ -900,6 +946,12 @@ export const nodeFeaturesSchema = z
       .max(64),
     mediaExpand: z.boolean(),
     liveStt: z.boolean(),
+    /**
+     * The node reads a job's `reservations` (relay 3.0, added after 0.4.2). Absent on older
+     * CLIs, which refuse a job carrying them: a start that needs them is refused with
+     * `cli_upgrade_required` instead.
+     */
+    jobReservations: z.boolean().optional(),
     /** The node's secrets: names and when they were last set (never values). */
     secrets: z
       .array(z.object({ name: nodeSecretNameSchema, updatedAt: z.iso.datetime() }).strict())

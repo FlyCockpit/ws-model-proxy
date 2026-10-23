@@ -423,6 +423,12 @@ describe("lifecycle dispatch", () => {
     db.instanceStep.aggregate.mockResolvedValue({ _max: { generation: 1 } } as never);
     db.instanceStep.count.mockResolvedValue(0 as never);
     db.instanceStep.updateMany.mockResolvedValue({ count: 1 } as never);
+    // The step is of the instance's current run (instance-run.ts).
+    db.runtimeInstance.findUnique.mockResolvedValue({
+      runGeneration: 1,
+      phase: "STARTING",
+      operationId: "op-1",
+    } as never);
     // The owner is active (not banned or deleting): the engine checks before any start.
     db.user.findUnique.mockResolvedValue({
       deletionRequestedAt: null,
@@ -519,11 +525,30 @@ describe("definition sync", () => {
       FabricMembers: [],
     } as never);
     db.runtimeVersion.findMany.mockResolvedValue([] as never);
+    db.instanceStep.findMany.mockResolvedValue([] as never);
+    // One live-claimed rank, so its physical launch is read too.
+    db.instanceRank.findMany.mockResolvedValue([
+      { nodeId: "node-a", Instance: { launchVersionId: "ver-a" } },
+    ] as never);
+    db.$queryRaw.mockResolvedValue([] as never);
     const state = await loadNodeDefinitionState("node-a");
     expect(state?.userId).toBe(VICTIM);
     const calls = db.runtimeVersion.findMany.mock.calls;
-    // Running instances, always-on, profile pins and startable runtimes.
-    expect(calls).toHaveLength(4);
+    // Which named versions are the owner's server-origin ones, then the required versions,
+    // always-on, profile pins and startable runtimes.
+    expect(calls).toHaveLength(5);
+    // The steps and ranks that name versions are the owner's too.
+    const named = [db.instanceStep.findMany.mock.calls, db.instanceRank.findMany.mock.calls];
+    for (const queries of named) {
+      expect(queries).toHaveLength(1);
+      for (const [args] of queries) expect(namesOwner(args?.where, VICTIM)).toBe(true);
+    }
+    // The batched physical launches: one query, bound to the owner.
+    expect(db.$queryRaw).toHaveBeenCalledTimes(1);
+    const [sql, ...values] = db.$queryRaw.mock.calls[0] ?? [];
+    expect(String(sql)).toContain(`i."userId" =`);
+    expect(values).toContain(VICTIM);
+    expect(values).not.toContain(ATTACKER);
     for (const [args] of calls) {
       expect(namesOwner(args?.where, VICTIM)).toBe(true);
       expect(namesOwner(args?.where, ATTACKER)).toBe(false);

@@ -196,7 +196,10 @@ integration("releasing a claim whose stop cannot be proven, on PostgreSQL", () =
     // A real proof arriving late: the proven-stop release finds nothing to release.
     const late = await modules.graph.graphWrite(
       [USER],
-      (tx) => modules.release.releaseClaim(tx, held.id, new Date()),
+      async (tx) =>
+        modules.release.releaseClaim(tx, held.id, new Date(), {
+          neverRan: true,
+        }),
       async () => modules.graph.instanceCapacityFences([old.instanceId]),
     );
     expect(late).toBe(false);

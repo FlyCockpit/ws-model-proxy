@@ -247,6 +247,7 @@ export const GRAPH_TABLES = [
   "runtime_share",
   "runtime_instance",
   "instance_rank",
+  "instance_reservation",
   "instance_step",
   "runtime_operation",
   "execution_target",

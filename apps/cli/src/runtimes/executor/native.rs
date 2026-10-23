@@ -998,6 +998,7 @@ mod tests {
             gpu_ids: None,
             dist_port: None,
             host: "127.0.0.1".into(),
+            reservations: Vec::new(),
             spec: serde_json::json!({
                 "api": "openai", "engine": "other", "modelType": "llm",
                 "models": [{ "id": "m" }],
@@ -1079,6 +1080,7 @@ mod tests {
             gpu_ids: None,
             dist_port: None,
             host: "127.0.0.1".into(),
+            reservations: Vec::new(),
             spec: serde_json::json!({
                 "api": "openai", "engine": "other", "modelType": "llm",
                 "models": [{ "id": "m" }],
@@ -1160,6 +1162,7 @@ mod tests {
             dist_port: Some(dist),
             gpu_ids: None,
             host: "127.0.0.1".into(),
+            reservations: Vec::new(),
             spec: serde_json::json!({
                 "api": "openai", "engine": "other", "modelType": "llm",
                 "models": [{ "id": "m" }],

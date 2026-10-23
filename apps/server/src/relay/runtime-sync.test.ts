@@ -4,13 +4,31 @@ const db = vi.hoisted(() => ({
   node: { findUnique: vi.fn(), findMany: vi.fn(), updateMany: vi.fn(async () => ({ count: 1 })) },
   runtime: { findFirst: vi.fn() },
   runtimeVersion: { findMany: vi.fn() },
+  instanceStep: {
+    findMany: vi.fn(async (): Promise<{ nodeId: string; intent: unknown }[]> => []),
+    findFirst: vi.fn(async (): Promise<{ intent: unknown } | null> => null),
+  },
+  instanceRank: {
+    findMany: vi.fn(
+      async (): Promise<{ nodeId: string; Instance: { launchVersionId: string } }[]> => [],
+    ),
+  },
+  /** The batched physical launches of live-claimed ranks (`physicalLaunchIntents`). */
+  $queryRaw: vi.fn(
+    async (): Promise<
+      { instanceId: string; rank: number; nodeId: string; intent: unknown }[]
+    > => [],
+  ),
 }));
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
 
-const { buildCompleteOperation, capDesired, createRuntimeSync } = await import("./runtime-sync.js");
+const { buildCompleteOperation, capDesired, createRuntimeSync, loadNodeDefinitionState } =
+  await import("./runtime-sync.js");
 const { CHUNK_BUDGET_BYTES, runtimeDefineFrameSchema } = await import("./frames.js");
 const { runtimeLaunchHash } = await import("@ws-model-proxy/api/lib/runtime-launch-hash");
-const { runtimeSpecSchema } = await import("@ws-model-proxy/api/lib/runtime-spec");
+const { RUNTIME_DEFINITIONS_MAX, runtimeSpecSchema } = await import(
+  "@ws-model-proxy/api/lib/runtime-spec"
+);
 
 import type { DefinitionEnvelope, ServerToNodeControlFrame } from "./frames.js";
 import type { NodeSessionRef } from "./session-manager.js";
@@ -498,5 +516,153 @@ describe("createRuntimeSync sessions", () => {
     await new Promise((resolve) => setTimeout(resolve, 10));
     // Only the new session's operation was sent.
     expect(sent).toHaveLength(1);
+  });
+});
+
+describe("loadNodeDefinitionState", () => {
+  function versionRow(id: string, createdAt = new Date(0)) {
+    const spec = serviceSpec(id);
+    return {
+      id,
+      createdAt,
+      launchHash: runtimeLaunchHash(spec),
+      spec,
+      Runtime: { id: `rt-${id}`, slug: `rt-${id}`, kind: "STARTABLE" as const },
+    };
+  }
+
+  function intentFor(launchVersionId: string) {
+    return {
+      operationId: null,
+      runtimeId: "rt-1",
+      launchVersionId,
+      launchHash: "hash",
+      rank: 0,
+      nnodes: 1,
+      handle: "handle",
+      unitName: "ws-unit",
+      port: 30000,
+      distPort: null,
+      fabricId: null,
+      placeholders: {},
+      timeoutMs: 60_000,
+      interactive: false,
+    };
+  }
+
+  /** Answers each version query: a restart moved the instance to v2 while its rank runs v1. */
+  function mockRestartedInstance(
+    startable: ReturnType<typeof versionRow>[],
+    more: ReturnType<typeof versionRow>[] = [],
+  ) {
+    const rows = new Map([
+      ["v1", versionRow("v1")],
+      ["v2", versionRow("v2")],
+      ...more.map((row) => [row.id, row] as const),
+    ]);
+    // The instance's live claim on the node: its launch version is v2 now.
+    db.instanceRank.findMany.mockResolvedValueOnce([
+      { nodeId: "node-1", Instance: { launchVersionId: "v2" } },
+    ]);
+    db.runtimeVersion.findMany.mockImplementation(
+      async (query: { where: Record<string, unknown> }) => {
+        const where = query.where;
+        if ("id" in where) {
+          const ids = (where.id as { in: string[] }).in;
+          return ids.flatMap((id) => (rows.has(id) ? [rows.get(id)] : []));
+        }
+        if ("CurrentOf" in where) {
+          const current = where.CurrentOf as { kind: string };
+          return current.kind === "STARTABLE" ? startable : [];
+        }
+        return [];
+      },
+    );
+  }
+
+  it("keeps the version a restart's pending stop names, even when newer versions fill the cap", async () => {
+    mockNode();
+    const startable = Array.from({ length: RUNTIME_DEFINITIONS_MAX }, (_, index) =>
+      versionRow(`s${index}`, new Date(1_000 + index)),
+    );
+    mockRestartedInstance(startable);
+    // The leading STOP of the restart still names v1, the version the rank runs.
+    db.instanceStep.findMany.mockResolvedValueOnce([{ nodeId: "node-1", intent: intentFor("v1") }]);
+    const state = await loadNodeDefinitionState("node-1");
+    const ids = state?.desired.map((entry) => entry.versionId) ?? [];
+    expect(ids).toContain("v1");
+    expect(ids).toContain("v2");
+    expect(ids).toHaveLength(RUNTIME_DEFINITIONS_MAX);
+  });
+
+  it("keeps what a live-claimed rank physically runs until its stop is proven", async () => {
+    mockNode();
+    mockRestartedInstance([]);
+    // No step names v1 any more, but the rank's latest admitted launch ran it.
+    db.$queryRaw.mockResolvedValueOnce([
+      { instanceId: "inst-1", rank: 0, nodeId: "node-1", intent: intentFor("v1") },
+    ]);
+    const state = await loadNodeDefinitionState("node-1");
+    expect(state?.desired.map((entry) => entry.versionId).sort()).toEqual(["v1", "v2"]);
+  });
+
+  it("reads every live rank's physical launch in one query, however many ranks", async () => {
+    mockNode();
+    mockRestartedInstance([]);
+    db.$queryRaw.mockClear();
+    db.instanceStep.findFirst.mockClear();
+    db.instanceRank.findMany.mockReset();
+    db.instanceRank.findMany.mockResolvedValueOnce(
+      Array.from({ length: 200 }, () => ({
+        nodeId: "node-1",
+        Instance: { launchVersionId: "v2" },
+      })),
+    );
+    db.$queryRaw.mockResolvedValueOnce(
+      Array.from({ length: 200 }, (_, rank) => ({
+        instanceId: "inst-1",
+        rank,
+        nodeId: "node-1",
+        intent: intentFor("v1"),
+      })),
+    );
+    const state = await loadNodeDefinitionState("node-1");
+    expect(state?.desired.map((entry) => entry.versionId).sort()).toEqual(["v1", "v2"]);
+    expect(db.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(db.instanceStep.findFirst).not.toHaveBeenCalled();
+  });
+
+  it("sends the required versions first and logs when they exceed the cap", async () => {
+    mockNode();
+    const extra = Array.from({ length: RUNTIME_DEFINITIONS_MAX + 1 }, (_, index) =>
+      versionRow(`r${index}`, new Date(1_000 + index)),
+    );
+    const startable = Array.from({ length: 5 }, (_, index) =>
+      versionRow(`s${index}`, new Date(9_000 + index)),
+    );
+    mockRestartedInstance(startable, extra);
+    // Unfinished steps on the node name 129 more versions (a bug admission refuses).
+    db.instanceStep.findMany.mockResolvedValueOnce(
+      extra.map((row) => ({ nodeId: "node-1", intent: intentFor(row.id) })),
+    );
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const state = await loadNodeDefinitionState("node-1");
+    const ids = state?.desired.map((entry) => entry.versionId) ?? [];
+    expect(ids).toHaveLength(RUNTIME_DEFINITIONS_MAX);
+    // Only required versions are sent; no optional one took a slot.
+    expect(ids.some((id) => id.startsWith("s"))).toBe(false);
+    expect(errors).toHaveBeenCalledWith(
+      expect.stringContaining("requires more definitions"),
+      "node-1",
+      RUNTIME_DEFINITIONS_MAX + 2,
+    );
+    errors.mockRestore();
+  });
+
+  it("drops the earlier version once nothing on the node names it", async () => {
+    mockNode();
+    mockRestartedInstance([]);
+    const state = await loadNodeDefinitionState("node-1");
+    expect(state?.desired.map((entry) => entry.versionId)).toEqual(["v2"]);
   });
 });

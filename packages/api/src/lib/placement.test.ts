@@ -27,6 +27,7 @@ function node(id: string, overrides: Partial<PlacementNode> = {}): PlacementNode
     labels: [],
     portRange: [30000, 30009],
     heldVersionIds: new Set(),
+    requiredVersionIds: new Set(),
     frozenFabrics: null,
     memoryGb: 126,
     gpus: [],
@@ -500,7 +501,7 @@ describe("explicit nodes and restarts", () => {
     if (!unknown.ok) expect(unknown.refusal.reason).toBe("unknown_node");
   });
 
-  it("a restart does not count its own claim and keeps its ports", () => {
+  it("a restart fits over its own claim (it overlaps the new one) and keeps its ports", () => {
     const self = running("self", ["h1"], 120, {
       ranks: [
         {
@@ -545,6 +546,177 @@ describe("explicit nodes and restarts", () => {
     expect(result.ok).toBe(false);
     if (!result.ok)
       expect(result.refusal).toMatchObject({ reason: "port_in_use", subjectId: "h1" });
+  });
+});
+
+describe("a restart's old and new claims overlap", () => {
+  const box = () => [node("h1", { labels: ["strix"] })];
+  const unified = (memoryGb: number): RuntimeResource => ({ kind: "unified", memoryGb });
+  const restartOf = (id: string, resources: RuntimeResource[], port = 30000) =>
+    request({
+      resources,
+      nodeIds: ["h1"],
+      restart: { instanceId: id, ports: [port], distPort: null },
+    });
+  const fits = (planner: PlacementPlanner, memoryGb: number) =>
+    planner.place(request({ labels: ["strix"], resources: [unified(memoryGb)] })).ok;
+
+  it("restarting one of two models side by side costs its growth, never old + new", () => {
+    // A (60) and B (50) on one 126 GiB node; A restarts with 70 while its old run still runs.
+    const a = running("a", ["h1"], 60);
+    const b = running("b", ["h1"], 50, {
+      ranks: [{ nodeId: "h1", port: 30001, distPort: null, claim: "HELD", resources: unified(50) }],
+    });
+    const planner = new PlacementPlanner(context({ nodes: box(), instances: [a, b] }));
+    ok(planner.place(restartOf("a", [unified(70)])));
+    // A holds max(60, 70) next to B: 6 GiB are left.
+    expect(fits(planner, 7)).toBe(false);
+    expect(fits(planner, 6)).toBe(true);
+  });
+
+  it("a shrinking restart keeps the old run's room held until it stopped", () => {
+    // 126 GiB node, the instance runs with 100 and restarts with 20.
+    const planner = new PlacementPlanner(
+      context({ nodes: box(), instances: [running("a", ["h1"], 100)] }),
+    );
+    ok(planner.place(restartOf("a", [unified(20)])));
+    expect(fits(planner, 100)).toBe(false);
+    expect(fits(planner, 26)).toBe(true);
+  });
+
+  it("an instance's loaded old and new claims on a node count once (the larger)", () => {
+    const a = running("a", ["h1"], 20, {
+      ranks: [
+        { nodeId: "h1", port: 30000, distPort: null, claim: "HELD", resources: unified(20) },
+        {
+          nodeId: "h1",
+          port: 30005,
+          distPort: null,
+          claim: "HELD",
+          resources: unified(100),
+          previous: true,
+        },
+      ],
+    });
+    const planner = new PlacementPlanner(context({ nodes: box(), instances: [a] }));
+    // max(20, 100) = 100: 26 free (a sum would leave 6). Both ports stay taken.
+    expect(fits(planner, 27)).toBe(false);
+    const placed = ok(planner.place(request({ labels: ["strix"], resources: [unified(26)] })));
+    expect(placed.start.placements[0]?.port).toBe(30001);
+    expect(
+      new PlacementPlanner(context({ nodes: box(), instances: [a] })).place(
+        request({ labels: ["strix"], resources: [unified(1)], port: { fixed: 30005 } }),
+      ),
+    ).toMatchObject({ ok: false, refusal: { reason: "port_in_use" } });
+  });
+
+  it("a port-changing restart keeps its old port taken for later plans", () => {
+    const planner = new PlacementPlanner(
+      context({ nodes: box(), instances: [running("a", ["h1"], 10)] }),
+    );
+    const moved = ok(
+      planner.place({
+        ...restartOf("a", [unified(10)]),
+        launch: { ...restartOf("a", [unified(10)]).launch, port: { fixed: 30005 } },
+      }),
+    );
+    expect(moved.start.placements[0]?.port).toBe(30005);
+    expect(
+      planner.place(
+        request({ labels: ["strix"], resources: [unified(1)], port: { fixed: 30000 } }),
+      ),
+    ).toMatchObject({ ok: false, refusal: { reason: "port_in_use" } });
+  });
+
+  it("prefers the GPUs it held and keeps both held when it moves to another", () => {
+    const gpus = () => [
+      node("g", {
+        labels: ["rtx"],
+        memoryGb: 64,
+        gpus: [
+          { key: "nvidia:0", vendor: "nvidia", vramGb: 24 },
+          { key: "nvidia:1", vendor: "nvidia", vramGb: 24 },
+        ],
+      }),
+    ];
+    const discrete = (vramGb: number, keys?: string[]) => ({
+      kind: "discrete" as const,
+      gpuCount: 1,
+      vramGb,
+      ...(keys ? { gpus: keys } : {}),
+    });
+    const held = (other: boolean) => [
+      running("a", ["g"], 0, {
+        ranks: [
+          {
+            nodeId: "g",
+            port: 30000,
+            distPort: null,
+            claim: "HELD_UNKNOWN",
+            resources: discrete(20, ["nvidia:1"]),
+          },
+        ],
+      }),
+      ...(other
+        ? [
+            running("o", ["g"], 0, {
+              ranks: [
+                {
+                  nodeId: "g",
+                  port: 30001,
+                  distPort: null,
+                  claim: "HELD",
+                  resources: discrete(4, ["nvidia:1"]),
+                },
+              ],
+            }),
+          ]
+        : []),
+    ];
+    const restartOnG = (vramGb: number) =>
+      request({
+        resources: [discrete(vramGb)],
+        nodeIds: ["g"],
+        restart: { instanceId: "a", ports: [30000], distPort: null },
+        retake: true,
+      });
+    // The GPU it held fits the change: it stays there (an unchanged retake keeps its GPUs).
+    const same = ok(
+      new PlacementPlanner(context({ nodes: gpus(), instances: held(false) })).place(
+        restartOnG(22),
+      ),
+    );
+    expect(same.start.placements[0]?.resources.gpus).toEqual(["nvidia:1"]);
+    // Another claim leaves its GPU 0 GiB free beyond its own: it moves to nvidia:0, and the old
+    // run's 20 GiB on nvidia:1 stay held until its stop is proven.
+    const planner = new PlacementPlanner(context({ nodes: gpus(), instances: held(true) }));
+    const moved = ok(planner.place(restartOnG(22)));
+    expect(moved.start.placements[0]?.resources.gpus).toEqual(["nvidia:0"]);
+    expect(planner.place(request({ labels: ["rtx"], resources: [discrete(20)] }))).toMatchObject({
+      ok: false,
+      refusal: { reason: "not_enough_memory" },
+    });
+  });
+
+  it("a restart that only fits once the old run's claims are gone is refused with that reason", () => {
+    // The instance is stopping (100 GiB) and another start (100 GiB) already queued behind its
+    // stop. A restart with 20 GiB would fit once the old run's 100 are released, not before.
+    const a = running("a", ["h1"], 100, { running: false });
+    const b = running("b", ["h1"], 100, {
+      ranks: [
+        { nodeId: "h1", port: 30001, distPort: null, claim: "HELD", resources: unified(100) },
+      ],
+    });
+    const planner = new PlacementPlanner(context({ nodes: box(), instances: [a, b] }));
+    expect(planner.place(restartOf("a", [unified(20)]))).toMatchObject({
+      ok: false,
+      refusal: { reason: "restart_overlap_no_room", subjectId: "h1" },
+    });
+    // One that does not fit even then is plain not_enough_memory.
+    expect(planner.place(restartOf("a", [unified(100)]))).toMatchObject({
+      ok: false,
+      refusal: { reason: "not_enough_memory" },
+    });
   });
 });
 
@@ -972,15 +1144,16 @@ describe("Relay-only nodes and their frozen fabrics", () => {
     ];
     const now = new Date();
     expect(
-      placementNodeOf(nodeRow({ trust: "RELAY", frozenFabrics: frozen }), now).frozenFabrics,
+      placementNodeOf(nodeRow({ trust: "RELAY", frozenFabrics: frozen }), now, new Set())
+        .frozenFabrics,
     ).toEqual([{ fabricId: "f-net", name: "net", memberIps: ["10.0.0.1", "10.0.0.2"] }]);
     // Unreadable: nothing frozen, so the node refuses any head (as it would).
     expect(
-      placementNodeOf(nodeRow({ trust: "RELAY", frozenFabrics: [{ bad: true }] }), now)
+      placementNodeOf(nodeRow({ trust: "RELAY", frozenFabrics: [{ bad: true }] }), now, new Set())
         .frozenFabrics,
     ).toEqual([]);
-    expect(placementNodeOf(nodeRow({ trust: "RELAY" }), now).frozenFabrics).toEqual([]);
-    expect(placementNodeOf(nodeRow(), now).frozenFabrics).toBeNull();
+    expect(placementNodeOf(nodeRow({ trust: "RELAY" }), now, new Set()).frozenFabrics).toEqual([]);
+    expect(placementNodeOf(nodeRow(), now, new Set()).frozenFabrics).toBeNull();
   });
 
   it("a pending lower in sync is checked against its current memberships", () => {
@@ -989,6 +1162,7 @@ describe("Relay-only nodes and their frozen fabrics", () => {
       placementNodeOf(
         nodeRow({ trustLowerRequestedAt: new Date(0), fabricsHash: "h1", heldFabricsHash: held }),
         now,
+        new Set(),
       );
     expect(pending("h1").trust).toBe("RELAY");
     expect(pending("h1").frozenFabrics).toBe("current");
@@ -1324,6 +1498,7 @@ describe("unified GPUs (GB10, APUs)", () => {
         },
       }),
       new Date(),
+      new Set(),
     );
     // 128 GiB − 10 reserved − 2 headroom.
     expect(placement.memoryGb).toBe(116);
@@ -1361,6 +1536,7 @@ describe("unified GPUs (GB10, APUs)", () => {
         },
       }),
       new Date(),
+      new Set(),
     );
     expect(strix.memoryGb).toBe(126);
     expect(strix.gpus).toEqual([{ key: "amd:0", vendor: "amd", vramGb: 0, unified: true }]);
@@ -1425,6 +1601,7 @@ describe("unified GPUs (GB10, APUs)", () => {
         },
       }),
       new Date(),
+      new Set(),
     );
     // 128 GiB − 6 reserved on the GPU − 2 headroom.
     expect(placement.memoryGb).toBe(120);
@@ -1456,5 +1633,121 @@ describe("unified GPUs (GB10, APUs)", () => {
     expect(planner.place(request({ resources: [{ kind: "unified", memoryGb: 26 }] })).ok).toBe(
       true,
     );
+  });
+});
+
+describe("definition slots (RUNTIME_DEFINITIONS_MAX)", () => {
+  const GB20: RuntimeResource = { kind: "unified", memoryGb: 20 };
+  /** `count` version ids a node already requires (`v-0` ...), plus `extra`. */
+  const required = (count: number, ...extra: string[]) =>
+    new Set([...Array.from({ length: count }, (_, index) => `v-${index}`), ...extra]);
+  const withRequired = (ids: ReadonlySet<string>, id = "h1") =>
+    lab().map((entry) => (entry.id === id ? { ...entry, requiredVersionIds: ids } : entry));
+
+  it("refuses a new version on a Full-control node that already requires 128, allows one it requires", () => {
+    const planner = new PlacementPlanner(context({ nodes: withRequired(required(128)) }));
+    const refused = planner.place(request({ nodeIds: ["h1"] }));
+    expect(refused).toMatchObject({
+      ok: false,
+      refusal: { reason: "definition_slots_full", subjectId: "h1" },
+    });
+    expect(refused.ok ? "" : refused.refusal.message).toContain("128");
+    // A version the node already requires takes no new slot.
+    ok(planner.place(request({ nodeIds: ["h1"], versionId: "v-7" })));
+    // A node-origin runtime's version lives on the node: no slot either.
+    ok(planner.place(request({ nodeIds: ["h1"], nodeOrigin: true })));
+  });
+
+  it("an unpinned start goes to another node", () => {
+    const result = ok(
+      new PlacementPlanner(context({ nodes: withRequired(required(128)) })).place(
+        request({ labels: ["strix"] }),
+      ),
+    );
+    expect(result.start.placements[0]?.nodeId).toBe("h2");
+    // Every node full: the refusal says why.
+    const full = lab().map((entry) => ({ ...entry, requiredVersionIds: required(128) }));
+    expect(new PlacementPlanner(context({ nodes: full })).place(request())).toMatchObject({
+      ok: false,
+      refusal: { reason: "definition_slots_full", subjectId: null },
+    });
+  });
+
+  it("counts several place() calls of one planner", () => {
+    const planner = new PlacementPlanner(context({ nodes: withRequired(required(127)) }));
+    ok(planner.place(request({ nodeIds: ["h1"], versionId: "v-a", runtimeId: "rt-a" })));
+    // The same version again needs no new slot; another one would be the 129th.
+    ok(planner.place(request({ nodeIds: ["h1"], versionId: "v-a", runtimeId: "rt-a" })));
+    expect(
+      planner.place(request({ nodeIds: ["h1"], versionId: "v-b", runtimeId: "rt-b" })),
+    ).toMatchObject({ ok: false, refusal: { reason: "definition_slots_full" } });
+  });
+
+  it("a restart counts the old and the new version until the old run's stop is proven", () => {
+    const self = running("self", ["h1"], 20, {
+      ranks: [
+        {
+          nodeId: "h1",
+          port: 30005,
+          distPort: null,
+          claim: "HELD",
+          resources: { kind: "unified", memoryGb: 20 },
+        },
+      ],
+    });
+    const restart = { instanceId: "self", ports: [30005], distPort: null };
+    // The instance's own old version is one of the 127 the node requires: the new one fits.
+    const room = new PlacementPlanner(
+      context({ nodes: withRequired(required(126, "v-old")), instances: [self] }),
+    );
+    ok(room.place(request({ nodeIds: ["h1"], restart, resources: [GB20] })));
+    // Its old version stays required beside the new one: nothing else fits after it.
+    expect(
+      room.place(request({ nodeIds: ["h1"], versionId: "v-other", runtimeId: "rt-other" })),
+    ).toMatchObject({ ok: false, refusal: { reason: "definition_slots_full" } });
+    // At 128 with its old version, the new one would be the 129th.
+    const full = new PlacementPlanner(
+      context({ nodes: withRequired(required(127, "v-old")), instances: [self] }),
+    );
+    expect(full.place(request({ nodeIds: ["h1"], restart, resources: [GB20] }))).toMatchObject({
+      ok: false,
+      refusal: { reason: "definition_slots_full", subjectId: "h1" },
+    });
+    // Restarting onto the version it runs needs no slot.
+    ok(
+      new PlacementPlanner(
+        context({ nodes: withRequired(required(127, "v-old")), instances: [self] }),
+      ).place(request({ nodeIds: ["h1"], restart, resources: [GB20], versionId: "v-old" })),
+    );
+  });
+
+  it("preemption cannot free a slot (a stop frees none until it is proven)", () => {
+    const victim = running("victim", ["h1"], 100);
+    const result = new PlacementPlanner(
+      context({ nodes: withRequired(required(128)), instances: [victim] }),
+    ).place(request({ nodeIds: ["h1"], preempt: true }));
+    expect(result).toMatchObject({ ok: false, refusal: { reason: "definition_slots_full" } });
+  });
+
+  it("a reservation takes no slot, and a Relay-only node is not counted", () => {
+    const base = request({ labels: ["rtx"], resources: [{ kind: "unified", memoryGb: 8 }] });
+    const withReservation: PlacementRequest = {
+      ...base,
+      launch: {
+        ...base.launch,
+        reservations: [{ labels: ["strix"], resources: { kind: "unified", memoryGb: 10 } }],
+      },
+    };
+    const full = lab().map((entry) =>
+      entry.labels.includes("strix") ? { ...entry, requiredVersionIds: required(128) } : entry,
+    );
+    const placed = ok(new PlacementPlanner(context({ nodes: full })).place(withReservation));
+    expect(placed.start.placements[0]?.nodeId).toBe("g1");
+    expect(placed.start.reservations[0]?.nodeId).toMatch(/^h[12]$/);
+    // A Relay-only node runs only versions it holds (definition_frozen decides there).
+    const relay = withRequired(required(128)).map((entry) =>
+      entry.id === "h1" ? { ...entry, trust: "RELAY" as const } : entry,
+    );
+    ok(new PlacementPlanner(context({ nodes: relay })).place(request({ nodeIds: ["h1"] })));
   });
 });

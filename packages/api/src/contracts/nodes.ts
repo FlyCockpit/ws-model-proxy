@@ -152,6 +152,11 @@ export const nodeSummarySchema = z
     labels: z.array(z.string()),
     hardwareKind: z.enum(["cpu", "discrete", "unified"]).nullable(),
     liveFreeMemoryGb: z.number().nullable(),
+    /** Usable memory before claims (`effectiveHardware().usableMemoryGb`). */
+    usableMemoryGb: z.number(),
+    /** What instances hold here now (HELD + HELD_UNKNOWN), reservations included. */
+    reservedNowMemoryGb: z.number(),
+    /** Instances with a rank here that are not stopped or failed (reservations not counted). */
     runningInstances: z.number().int(),
     alwaysOnRuntimes: z.number().int(),
     needsYou: z.number().int(),
@@ -199,9 +204,14 @@ export const nodeInstanceRefSchema = z
     instanceId: idSchema,
     runtimeId: idSchema,
     runtimeSlug: z.string(),
-    /** "node 2 of 3" in the UI; 1-based here. */
+    /**
+     * "node 2 of 3" in the UI; 1-based here. For a reservation: which reservation of how many
+     * (`launch.reservations`).
+     */
     nodeNumber: z.number().int().min(1),
     nodeCount: z.number().int().min(1),
+    /** `rank`: runs here; `reservation`: runs elsewhere and holds memory here. */
+    role: z.enum(["rank", "reservation"]),
     phase: z.enum(INSTANCE_PHASE),
     reserved: z.enum(CLAIM_STATE),
     needsOperator: z.enum(OPERATOR_NEED).nullable(),

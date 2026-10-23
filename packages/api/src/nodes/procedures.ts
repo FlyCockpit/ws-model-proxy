@@ -12,6 +12,12 @@ import { loadAgentNames } from "../lib/agent-names";
 import { assertMayWrite, callerActor } from "../lib/caller-actor";
 import { graphDelete, graphWrite } from "../lib/graph-write";
 import {
+  agentBlockedNode,
+  OCCUPANCY_SELECT,
+  occupiesNodesWhere,
+  placedOnNodesWhere,
+} from "../lib/instance-occupancy";
+import {
   isForeignKeyViolation,
   isUniqueViolation,
   notFound,
@@ -518,11 +524,52 @@ async function deleteNode(
         pinned.Profile.id,
         "A profile pins a runtime on this node. Remove it from the profile first.",
       );
+    // An agent's deletion stops every started instance with a part here and releases what they
+    // hold here (`node_delete_release`): it reaches every node each of them occupies, so each
+    // must be at Full control, as an agent's stop (`runtimeStop`, the shared occupancy check: a
+    // replaced run's reservations, a pending lowering and a deleted node count). People may.
+    if (agent) {
+      const affected = await tx.runtimeInstance.findMany({
+        where: {
+          userId,
+          desiredState: { not: null },
+          OR: [
+            occupiesNodesWhere([node.id]),
+            { AND: [placedOnNodesWhere([node.id]), { phase: { notIn: [...NOT_RUNNING] } }] },
+          ],
+        },
+        select: { id: true, ...OCCUPANCY_SELECT },
+        orderBy: { id: "asc" },
+      });
+      for (const instance of affected) {
+        const blocked = agentBlockedNode(instance);
+        if (blocked)
+          throw refuseAbout(
+            "trust_relay",
+            blocked.nodeId ?? instance.id,
+            "Deleting this node stops a runtime that also runs on a Relay-only node: agents cannot stop runtimes there. A person can delete the node in the browser.",
+          );
+      }
+    }
     const ranks = await tx.instanceRank.findMany({
       where: {
         nodeId: node.id,
         claim: { not: "RELEASED" },
         Instance: { phase: { notIn: [...NOT_RUNNING] } },
+      },
+      select: { instanceId: true },
+    });
+    // A reservation here (`launch.reservations`) stops its instance too (node_delete_release).
+    const reserving = await tx.instanceReservation.findMany({
+      where: {
+        nodeId: node.id,
+        // The current plan's (as node_delete_release): a superseded one's run is being replaced.
+        supersededGeneration: null,
+        // Holding (a rank's claim is not RELEASED, as `HOLDING_RESERVATION_WHERE`) and running.
+        Instance: {
+          Ranks: { some: { claim: { not: "RELEASED" } } },
+          phase: { notIn: [...NOT_RUNNING] },
+        },
       },
       select: { instanceId: true },
     });
@@ -551,7 +598,7 @@ async function deleteNode(
       await tx.node.delete({ where: { id: node.id } });
     }
     await refreshFabricsHashes(tx, userId, peers);
-    const instanceIds = [...new Set(ranks.map((rank) => rank.instanceId))];
+    const instanceIds = [...new Set([...ranks, ...reserving].map((row) => row.instanceId))];
     if (agent) {
       const actor = callerActor(context.auth, userId);
       await tx.auditEvent.create({

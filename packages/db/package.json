@@ -40,6 +40,9 @@
     },
     "./spend": {
       "default": "./src/spend.ts"
+    },
+    "./json-null": {
+      "default": "./src/json-null.ts"
     }
   },
   "scripts": {

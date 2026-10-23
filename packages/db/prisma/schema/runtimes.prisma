@@ -303,6 +303,12 @@ model RuntimeInstance {
   /// Stable machine code for the last phase change (startup_failed, readiness_timeout,
   /// health_failed, node_offline, preempted, restart_budget_exhausted, …).
   phaseReason                 String?
+  /// The instance's current run (`packages/api/src/lib/instance-run.ts`): the step generation
+  /// that owns its claims. Every restart begins a new run in the transaction that commits it, so
+  /// steps of an earlier run are never dispatched and their answers change nothing. 0: a row
+  /// written before runs existed; it is bootstrapped from its steps on first touch. Monotonic,
+  /// and every new step's generation equals it (`instance_run_order`).
+  runGeneration               Int                 @default(0)
   /// When the stop reconciler last took this STOPPING instance (null: never). A pass takes the
   /// least recently taken first, so every stopping instance is reached however many there are.
   lastStopReconcileAt         DateTime?
@@ -340,12 +346,13 @@ model RuntimeInstance {
   /// instance's nodes keep their IPs (`fabric_member_in_use`).
   fabricId                    String?
 
-  Runtime       Runtime           @relation(fields: [runtimeId, userId], references: [id, userId], onDelete: NoAction, onUpdate: Cascade)
-  Version       RuntimeVersion    @relation("InstanceVersion", fields: [versionId], references: [id], onDelete: NoAction, onUpdate: Cascade)
-  LaunchVersion RuntimeVersion    @relation("InstanceLaunchVersion", fields: [launchVersionId], references: [id], onDelete: NoAction, onUpdate: Cascade)
-  Operation     RuntimeOperation? @relation(fields: [operationId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  Fabric        Fabric?           @relation(fields: [fabricId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Runtime       Runtime               @relation(fields: [runtimeId, userId], references: [id, userId], onDelete: NoAction, onUpdate: Cascade)
+  Version       RuntimeVersion        @relation("InstanceVersion", fields: [versionId], references: [id], onDelete: NoAction, onUpdate: Cascade)
+  LaunchVersion RuntimeVersion        @relation("InstanceLaunchVersion", fields: [launchVersionId], references: [id], onDelete: NoAction, onUpdate: Cascade)
+  Operation     RuntimeOperation?     @relation(fields: [operationId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  Fabric        Fabric?               @relation(fields: [fabricId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
   Ranks         InstanceRank[]
+  Reservations  InstanceReservation[]
   Steps         InstanceStep[]
   Targets       ExecutionTarget[]
 
@@ -374,7 +381,9 @@ model InstanceRank {
   id                     String     @id @default(cuid(2))
   instanceId             String
   /// Null after the node was deleted (claim RELEASED by node_delete_release; the row keeps the
-  /// rank so the gang stop of the other ranks completes).
+  /// rank so the gang stop of the other ranks completes). A rank whose instance holds a
+  /// reservation on another surviving node stays held instead: a person marks it stopped and
+  /// releases it, since nothing can prove the stop now.
   nodeId                 String?
   /// Deterministic from (handle, rank): `wsmp-<handle>-r<rank>`; the held-unknown probe
   /// needs no local record.
@@ -400,6 +409,19 @@ model InstanceRank {
   releasedUnprovenAt     DateTime?
   releasedUnprovenBy     String?
   releasedUnprovenReason String?
+  /// The run before the one this claim (resources, port, dist port) was planned for
+  /// (`runGeneration - 1`, like `InstanceReservation.plannedGeneration`): the claim may be in use
+  /// only once a start step of this rank of a later generation was dispatched.
+  plannedGeneration      Int        @default(0)
+  /// The claim of a run a restart replaced while that run could still use it (all four set
+  /// together, or none): it keeps holding beside the current claim (memory and GPUs overlap,
+  /// `lib/claim-overlap.ts`; its ports stay taken) until a START of a later generation than
+  /// `prevGeneration` is claimed (the new run's leading STOP proved it stopped), or the claim is
+  /// RELEASED. Restarts never move a rank to another node, so it is on `nodeId` too.
+  prevResources          Json?
+  prevPort               Int?
+  prevDistPort           Int?
+  prevGeneration         Int?
 
   Instance        RuntimeInstance       @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Node            Node?                 @relation(fields: [nodeId], references: [id], onDelete: SetNull, onUpdate: Cascade)
@@ -408,6 +430,44 @@ model InstanceRank {
   @@unique([instanceId, rank])
   @@index([nodeId, claim])
   @@map("instance_rank")
+}
+
+/// Memory a single-node instance holds on another node (`launch.reservations`): nothing runs or
+/// is dispatched there. It has no claim state of its own: it holds exactly while one of the
+/// instance's ranks holds its claim (HELD, or HELD_UNKNOWN while a stop is unproven), so every
+/// path that releases or retakes the rank's claim releases or retakes the reservation with it.
+/// A start or restart (re)writes the instance's reservations from its plan. A restart of a run
+/// that may still be running keeps the old rows (`supersededGeneration`): they hold until the
+/// new run's START is claimed (its leading STOP proved the old run stopped), so the old
+/// launcher's memory is never freed early.
+model InstanceReservation {
+  id                   String   @id @default(cuid(2))
+  createdAt            DateTime @default(now())
+  instanceId           String
+  /// Null after the node was deleted (the instance then stops, like a rank's).
+  nodeId               String?
+  /// Position in `launch.reservations` (0-based).
+  index                Int
+  /// The labels it was placed by (copied from the launch version).
+  labels               String[]
+  /// The reservation's `resources` (`runtimeResourceSchema`, plus `gpus` the planner picked).
+  resources            Json
+  /// Null: the current plan's. Otherwise the run before the restart that replaced it while that
+  /// run (or an earlier one) could still use it: it still holds (like the current rows,
+  /// while a rank holds) and goes when a START of a later generation is claimed.
+  /// At most one current row per (instanceId, index): `instance_reservation_current_index`.
+  supersededGeneration Int?
+  /// The run before the one this row was planned for (`runGeneration - 1`): the row may be in
+  /// use only once a start step of a later generation was dispatched. A replacement deletes a changed row that was never in use (its plan never ran)
+  /// instead of keeping it superseded, so at most the last dispatched run's rows are kept.
+  plannedGeneration    Int      @default(0)
+
+  Instance RuntimeInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Node     Node?           @relation(fields: [nodeId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([instanceId, index])
+  @@index([nodeId])
+  @@map("instance_reservation")
 }
 
 enum ClaimReleaseRequestState {
@@ -508,6 +568,17 @@ model InstanceStep {
   operatorAcceptedAt DateTime?
   operatorLastExit   Int?
   operatorHold       String?
+  /// The head's fabric address a multi-node step was dispatched with (start phases, at their
+  /// claim), or, on a STOP or STATUS step, the one of the launch it names (`Physical`): a stop of
+  /// a gang whose head node was deleted still reaches the surviving ranks. Null: single-node, or
+  /// resolved from the head's fabric membership at dispatch.
+  headAddr           String?
+  /// A dispatch of this step may have reached its node and its outcome is unknown (its session
+  /// was lost or it expired without an answer, and it was queued again, or sent again): set
+  /// once, never cleared (`instance_step_may_have_run`). A later attempt's refusal before
+  /// admission proves only that attempt never ran, so the rank still needs a stop
+  /// (`lib/instance-run.ts` `MAY_HAVE_RUN`).
+  mayHaveRun         Boolean   @default(false)
 
   Instance RuntimeInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 

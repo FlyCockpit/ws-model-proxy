@@ -66,6 +66,7 @@ const rank = (nodeNumber: number, overrides: Record<string, unknown> = {}) => ({
   lastStopCheck: { at: "2026-10-07T10:05:00.000Z", proven: false, errorCode: "status_running" },
   releasedUnproven: null,
   releaseRequestId: null,
+  previousClaim: null,
   ...overrides,
 });
 
@@ -83,6 +84,21 @@ const RUNTIME = {
           releaseRequestId: "req-1",
         }),
       ],
+      reservations: [],
+      supersededReservations: [],
+    },
+    {
+      // A single-node instance a restart moved: its old worker and old port still hold.
+      id: "inst-2",
+      phase: "STOPPED",
+      needsOperator: null,
+      ranks: [rank(1, { previousClaim: { port: 30009, distPort: null, memoryGb: 64 } })],
+      reservations: [
+        { index: 0, nodeId: "w-new", nodeSlug: "w-new", labels: [], memoryGb: 20 },
+      ].map((row) => ({ ...row, reserved: "HELD_UNKNOWN", nodeConnection: null })),
+      supersededReservations: [
+        { index: 0, nodeId: "w-old", nodeSlug: "w-old", labels: [], memoryGb: 100 },
+      ].map((row) => ({ ...row, reserved: "HELD_UNKNOWN", nodeConnection: null })),
     },
   ],
 };
@@ -211,6 +227,26 @@ describe("ReleaseUnprovenAction", () => {
         ["activity", "needsYou"],
       ]),
     );
+  });
+
+  it("lists everything the release frees: the replaced run's port and workers too", async () => {
+    mount(<ReleaseUnprovenAction runtimeId="rt-1" instanceId="inst-2" nodeNumber={1} />);
+    fireEvent.click(screen.getByRole("button", { name: ACTION }));
+    const dialog = screen.getByRole("dialog", { name: "dashboard:runtime.releaseUnproven.title" });
+    expect(
+      await within(dialog).findByText("dashboard:runtime.releaseUnproven.alsoFreed"),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText("dashboard:runtime.heldFootprint.previousClaim:30009|64 GB|box"),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText("dashboard:runtime.heldFootprint.reservation:20 GB|w-new"),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        "dashboard:runtime.heldFootprint.supersededReservation:100 GB|w-old",
+      ),
+    ).toBeTruthy();
   });
 
   it("names an offline node as the reason", async () => {

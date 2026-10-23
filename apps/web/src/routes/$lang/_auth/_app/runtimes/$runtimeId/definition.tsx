@@ -122,7 +122,7 @@ function DefinitionForm({ runtime }: { runtime: RuntimeDetail }) {
     });
   const form = useAppForm({
     defaultValues: {
-      spec: editorValues(runtime.current.spec),
+      spec: editorValues(runtime.current.spec, kind),
       note: "",
       restartRunning: false,
     },

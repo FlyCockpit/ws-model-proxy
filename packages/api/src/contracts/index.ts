@@ -75,5 +75,5 @@ export {
   type McpToolContract,
 } from "./mcp-tools";
 export * from "./procedure";
-export { REFUSAL_REASONS, type RefusalReason } from "./refusals";
+export { REFUSAL_REASONS, type RefusalReason, refusalReservationSchema } from "./refusals";
 export * from "./tool-names";

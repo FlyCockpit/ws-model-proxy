@@ -44,7 +44,7 @@ vi.mock("./runtime-load-rollup.js", () => ({ observeRuntimeLoadRollup: vi.fn() }
 vi.mock("./node-metrics-rollup.js", () => ({ observeNodeMetricsRollup: vi.fn() }));
 
 const { default: prisma } = await import("@ws-model-proxy/db");
-const { RelaySessionManager } = await import("./session-manager.js");
+const { RelaySessionManager, OPERATOR_ACCEPT_RETRIES } = await import("./session-manager.js");
 const { observeRuntimeLoadRollup } = await import("./runtime-load-rollup.js");
 const { observeNodeMetricsRollup } = await import("./node-metrics-rollup.js");
 
@@ -100,7 +100,12 @@ function challenge(socket: FakeSocket): string {
 
 function hello(
   socket: FakeSocket,
-  overrides: { trust?: "full" | "relay"; signature?: string; operatorTerminals?: boolean } = {},
+  overrides: {
+    trust?: "full" | "relay";
+    signature?: string;
+    operatorTerminals?: boolean;
+    jobReservations?: boolean;
+  } = {},
 ) {
   const trust = overrides.trust ?? "full";
   return JSON.stringify({
@@ -122,6 +127,9 @@ function hello(
       runtimeHosts: [],
       mediaExpand: false,
       liveStt: false,
+      ...(overrides.jobReservations === undefined
+        ? {}
+        : { jobReservations: overrides.jobReservations }),
       secrets: [],
     },
     definitions: [],
@@ -342,6 +350,215 @@ describe("RelaySessionManager (relay 3.0)", () => {
     ).toThrow("disconnected");
   });
 
+  it("keeps a handle served when the lifecycle finds its record stale (T6, DCR-P4)", async () => {
+    const socket = await connect();
+    // The lifecycle reports the stopped record as about an earlier run (or from before this
+    // run's launch): what the session served for that handle stays as it was.
+    const stale: string[] = [];
+    const handler = vi.fn(async () => ({ ok: true as const, stale: [...stale] }));
+    manager.setNodeFrameHandlers({ runtimeInventory: handler });
+    const record = {
+      instanceId: "inst-1",
+      launchVersionId: "ver-1",
+      launchHash: "b".repeat(64),
+      rank: 0,
+      intentHash: "c".repeat(64),
+      phase: "ready",
+      unitName: "wsmp-i-0123456789ab-r0",
+      port: 8000,
+      handle: "i-0123456789ab",
+      models: ["m"],
+      stepId: "current-readiness",
+    };
+    const frame = (snapshotId: string, instances: unknown[]) =>
+      JSON.stringify({
+        type: "runtime.inventory",
+        snapshotId,
+        chunkIndex: 0,
+        final: true,
+        alwaysOn: [],
+        instances,
+      });
+    await manager.handleTextFrame(socket, frame("a".repeat(32), [record]));
+    expect(manager.getLiveNodeState("node-1")?.servedHandles).toContain(record.handle);
+    stale.push(record.handle);
+    await manager.handleTextFrame(
+      socket,
+      frame("d".repeat(32), [{ ...record, phase: "stopped", stepId: "old-leading-stop" }]),
+    );
+    expect(handler).toHaveBeenCalledTimes(2);
+    expect(manager.getLiveNodeState("node-1")?.servedHandles).toContain(record.handle);
+    // A stale ready record does not start serving a handle that was not served.
+    stale.push("i-ffffffffffff");
+    await manager.handleTextFrame(
+      socket,
+      frame("e".repeat(32), [
+        { ...record, phase: "stopped", stepId: "old-leading-stop" },
+        { ...record, handle: "i-ffffffffffff", unitName: "wsmp-i-ffffffffffff-r0" },
+      ]),
+    );
+    expect(manager.getLiveNodeState("node-1")?.servedHandles).toContain(record.handle);
+    expect(manager.getLiveNodeState("node-1")?.servedHandles).not.toContain("i-ffffffffffff");
+    // Control: the same stopped record, not stale, withdraws the handle.
+    stale.length = 0;
+    await manager.handleTextFrame(
+      socket,
+      frame("f".repeat(32), [{ ...record, phase: "stopped", stepId: "current-stop" }]),
+    );
+    expect(manager.getLiveNodeState("node-1")?.servedHandles).not.toContain(record.handle);
+  });
+
+  it("R4-B-1: an older inventory that finishes after a newer one changes nothing served (publication order)", async () => {
+    const socket = await connect();
+    const aEntered = Promise.withResolvers<void>();
+    const aResume = Promise.withResolvers<void>();
+    manager.setNodeFrameHandlers({
+      runtimeInventory: async (_ref, snapshot) => {
+        if (snapshot.snapshotId === "a".repeat(32)) {
+          // A's stopped record was owned/fresh when checked; B's newer run has not committed yet.
+          aEntered.resolve();
+          // Real handler work can still await another rank or applyAlwaysOnInventory after that check.
+          await aResume.promise;
+        }
+        return { ok: true as const, stale: [] };
+      },
+    });
+    const handle = "i-0123456789ab";
+    const record = {
+      instanceId: "inst-1",
+      launchVersionId: "ver-1",
+      launchHash: "b".repeat(64),
+      rank: 0,
+      intentHash: "c".repeat(64),
+      phase: "ready",
+      unitName: "wsmp-i-0123456789ab-r0",
+      port: 8000,
+      handle,
+      models: ["m"],
+      stepId: "new-readiness",
+    };
+    const frame = (snapshotId: string, phase: string, stepId: string) =>
+      JSON.stringify({
+        type: "runtime.inventory",
+        snapshotId,
+        chunkIndex: 0,
+        final: true,
+        alwaysOn: [],
+        instances: [{ ...record, phase, stepId }],
+      });
+    const older = manager.handleTextFrame(socket, frame("a".repeat(32), "stopped", "old-stop"));
+    await aEntered.promise;
+    await manager.handleTextFrame(socket, frame("d".repeat(32), "ready", "new-readiness"));
+    expect(manager.getLiveNodeState("node-1")?.servedHandles).toContain(handle);
+    db.runtimeInstance.findFirst.mockResolvedValue({
+      id: "inst-1",
+      runtimeId: "rt-1",
+      versionId: "ver-1",
+    });
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({
+        type: "runtime.load",
+        handle,
+        running: 2,
+        waiting: 0,
+        counterEpoch: 0,
+        source: "builtin",
+        ts: new Date().toISOString(),
+      }),
+    );
+    expect(manager.getLiveNodeTelemetry(["node-1"]).get("node-1")?.runtimeLoad).toHaveLength(1);
+    const consumer = { onEvent: vi.fn(), onDrain: vi.fn(), onEnd: vi.fn() };
+    const created = manager.createSttSession({ consumer });
+    if (!created.ok) throw new Error(created.reason);
+    const target = {
+      nodeId: "node-1",
+      handle,
+      upstreamModel: "whisper",
+      capabilities: {
+        version: 2 as const,
+        protocol: "openai-compatible" as const,
+        audio: {
+          transcriptions: {
+            supported: true as const,
+            realtime: {
+              supported: true as const,
+              adapter: "segmented" as const,
+              maxItemSeconds: 10,
+            },
+          },
+        },
+      },
+    };
+    const opening = created.session.attach(target);
+    const sessionId = created.session.relaySessionId;
+    expect(sessionId).toBeTruthy();
+    await manager.handleTextFrame(socket, JSON.stringify({ type: "stt.opened", sessionId }));
+    await expect(opening).resolves.toMatchObject({ status: "opened" });
+    expect(consumer.onEnd).not.toHaveBeenCalled();
+    aResume.resolve();
+    await older;
+    // Finishing the older snapshot A does not roll the newer B back: the handle stays served,
+    // its load reading and its STT session stay, and affinity keeps the handle.
+    expect(manager.getLiveNodeState("node-1")?.servedHandles).toContain(handle);
+    expect(manager.getLiveNodeTelemetry(["node-1"]).get("node-1")?.runtimeLoad).toHaveLength(1);
+    expect(consumer.onEnd).not.toHaveBeenCalled();
+    const { registerAffinityObservers } = await import("../model-api/cache-affinity-observers.js");
+    expect(registerAffinityObservers).toHaveBeenLastCalledWith(
+      expect.objectContaining({ handles: [handle] }),
+    );
+  });
+
+  it("R4-B-1: a refused newer inventory keeps what was served, and an older one finishing later cannot replace it", async () => {
+    const socket = await connect();
+    const aEntered = Promise.withResolvers<void>();
+    const aResume = Promise.withResolvers<void>();
+    manager.setNodeFrameHandlers({
+      runtimeInventory: async (_ref, snapshot) => {
+        if (snapshot.snapshotId === "a".repeat(32)) {
+          aEntered.resolve();
+          await aResume.promise;
+          return { ok: true as const, stale: [] };
+        }
+        if (snapshot.snapshotId === "d".repeat(32))
+          return { ok: false as const, message: "could not classify" };
+        return { ok: true as const, stale: [] };
+      },
+    });
+    const handle = "i-0123456789ab";
+    const record = {
+      instanceId: "inst-1",
+      launchVersionId: "ver-1",
+      launchHash: "b".repeat(64),
+      rank: 0,
+      intentHash: "c".repeat(64),
+      phase: "ready",
+      unitName: "wsmp-i-0123456789ab-r0",
+      port: 8000,
+      handle,
+      models: ["m"],
+      stepId: "readiness",
+    };
+    const frame = (snapshotId: string, phase: string) =>
+      JSON.stringify({
+        type: "runtime.inventory",
+        snapshotId,
+        chunkIndex: 0,
+        final: true,
+        alwaysOn: [],
+        instances: [{ ...record, phase }],
+      });
+    await manager.handleTextFrame(socket, frame("e".repeat(32), "ready"));
+    expect(manager.getLiveNodeState("node-1")?.servedHandles).toContain(handle);
+    const older = manager.handleTextFrame(socket, frame("a".repeat(32), "stopped"));
+    await aEntered.promise;
+    await manager.handleTextFrame(socket, frame("d".repeat(32), "stopped"));
+    expect(manager.getLiveNodeState("node-1")?.servedHandles).toContain(handle);
+    aResume.resolve();
+    await older;
+    expect(manager.getLiveNodeState("node-1")?.servedHandles).toContain(handle);
+  });
+
   it("assembles chunked inventory, hands it to its handler and acknowledges it", async () => {
     const socket = await connect();
     const runtimeInventory = vi.fn(async () => ({ ok: true as const }));
@@ -411,6 +628,8 @@ describe("RelaySessionManager (relay 3.0)", () => {
       connectionGeneration: generation,
       trust: "full",
       operatorTerminals: false,
+      // A hello without the flag (a CLI from before it): job reservations are not sent.
+      jobReservations: false,
     });
     const frame = { type: "runtime.detect" as const, id: "d2" };
     expect(manager.sendToNode("node-1", frame, { connectionGeneration: generation + 1 })).toBe(
@@ -425,6 +644,63 @@ describe("RelaySessionManager (relay 3.0)", () => {
     manager.requestTrustLower("node-1", new Date());
     expect(manager.sendToNode("node-1", frame, { requireFullTrust: true })).toBe(false);
     expect(manager.nodeSession("node-1")?.trust).toBe("relay");
+  });
+
+  it("says when the node's CLI reads job reservations", async () => {
+    await connect({ jobReservations: true });
+    expect(manager.nodeSession("node-1")?.jobReservations).toBe(true);
+  });
+
+  it("never delivers a stop, status or health job of a run older than a start it sent", async () => {
+    const socket = await connect();
+    const job = (
+      phase: "start" | "stop" | "status" | "health" | "readiness",
+      generation: number,
+    ) => ({
+      type: "runtime.job" as const,
+      stepId: `step-${phase}-${generation}`,
+      instanceId: "inst-1",
+      runtimeId: "rt-1",
+      launchVersionId: "v-1",
+      launchHash: "b".repeat(64),
+      generation,
+      rank: 0,
+      nnodes: 1,
+      phase,
+      handle: "i-abcdefabcdef",
+      unitName: "wsmp-i-abcdefabcdef-r0",
+      placeholders: { port: 30_000 },
+      timeoutMs: 60_000,
+      ownerEpoch: "e1:1",
+      intentHash: "a".repeat(64),
+    });
+    // Run 1 starts; its health and stop go out while it is the latest started run.
+    expect(manager.sendToNode("node-1", job("start", 1))).toBe(true);
+    expect(manager.sendToNode("node-1", job("health", 1))).toBe(true);
+    // Run 2's leading stop (same run number) and start go out.
+    expect(manager.sendToNode("node-1", job("stop", 2))).toBe(true);
+    expect(manager.sendToNode("node-1", job("start", 2))).toBe(true);
+    const sent = socket.json().filter((frame) => frame.type === "runtime.job").length;
+    // A stop, status probe or health probe of run 1 claimed before run 2 began is not sent now.
+    for (const phase of ["stop", "status", "health"] as const)
+      expect(manager.sendToNode("node-1", job(phase, 1))).toBe(false);
+    expect(socket.json().filter((frame) => frame.type === "runtime.job")).toHaveLength(sent);
+    // Run 2's own jobs, and another rank's or instance's, still go.
+    expect(manager.sendToNode("node-1", job("stop", 2))).toBe(true);
+    expect(
+      manager.sendToNode("node-1", {
+        ...job("stop", 1),
+        rank: 1,
+        unitName: "wsmp-i-abcdefabcdef-r1",
+        nnodes: 2,
+        fabricId: "fab_1",
+        placeholders: { port: 30_000, head_addr: "10.0.0.1" },
+      }),
+    ).toBe(true);
+    expect(manager.sendToNode("node-1", { ...job("stop", 1), instanceId: "inst-2" })).toBe(true);
+    // A new session (reconnect) starts fresh: the lifecycle's run gate covers it.
+    await connect();
+    expect(manager.sendToNode("node-1", job("stop", 1))).toBe(true);
   });
 
   it("sends nothing pinned to another owner, and logs the class only", async () => {
@@ -890,6 +1166,548 @@ describe("RelaySessionManager (relay 3.0)", () => {
       expect(handler).toHaveBeenCalledTimes(3);
       expect(manager.operatorStepTerminal("step-1", "user-1")).toBeNull();
       expect(manager.hasTerminal(terminalId)).toBe(false);
+    });
+
+    it("R5-B-1: delivers a failed operator_running again until the engine records it", async () => {
+      const socket = await connect({ operatorTerminals: true });
+      let failures = 2;
+      const handler = vi.fn(async (_ref: unknown, frame: { status: string }) => {
+        if (frame.status === "operator_running" && failures-- > 0)
+          throw new Error("one failed persistence write");
+      });
+      manager.setNodeFrameHandlers({ "runtime.job.result": handler });
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      vi.useFakeTimers();
+      try {
+        expect(manager.sendToNode("node-1", job())).toBe(true);
+        await manager.handleTextFrame(socket, result("awaiting_operator"));
+        await manager.handleTextFrame(socket, result("operator_running"));
+        expect(error).toHaveBeenCalledWith(
+          "[relay] node frame handler failed",
+          "runtime.job.result",
+          "Error",
+        );
+        // The node's run goes on: never cut off, still attachable.
+        expect(manager.closeOperatorStep("step-1", { keepRunning: true })).toBe("running");
+        expect(manager.hasTerminal(terminalId)).toBe(true);
+        expect(handler).toHaveBeenCalledTimes(2);
+        // Delivered again after 1 s (fails), then after 2 s (recorded): no further retry.
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(handler).toHaveBeenCalledTimes(3);
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect(handler).toHaveBeenCalledTimes(4);
+        expect(handler.mock.calls.at(-1)?.[1]).toMatchObject({
+          status: "operator_running",
+          stepId: "step-1",
+          terminalId,
+        });
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(handler).toHaveBeenCalledTimes(4);
+      } finally {
+        vi.useRealTimers();
+        error.mockRestore();
+      }
+    });
+
+    it("R5-B-1: stops delivering an acceptance once its run is no longer tracked, and after the retries", async () => {
+      const socket = await connect({ operatorTerminals: true });
+      const handler = vi.fn(async (_ref: unknown, frame: { status: string }) => {
+        if (frame.status === "operator_running") throw new Error("database down");
+      });
+      manager.setNodeFrameHandlers({ "runtime.job.result": handler });
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      vi.useFakeTimers();
+      try {
+        expect(manager.sendToNode("node-1", job())).toBe(true);
+        await manager.handleTextFrame(socket, result("awaiting_operator"));
+        await manager.handleTextFrame(socket, result("operator_running"));
+        // Every retry fails: six more deliveries (1 + 2 + ... + 32 s), then a class-only log.
+        await vi.advanceTimersByTimeAsync(63_000);
+        expect(handler).toHaveBeenCalledTimes(2 + OPERATOR_ACCEPT_RETRIES);
+        expect(error).toHaveBeenCalledWith(
+          "[relay] operator acceptance not recorded after retries",
+        );
+        await vi.advanceTimersByTimeAsync(600_000);
+        expect(handler).toHaveBeenCalledTimes(2 + OPERATOR_ACCEPT_RETRIES);
+
+        // A run that ended (operator_closed) before its retry is not delivered again.
+        handler.mockClear();
+        expect(manager.sendToNode("node-1", job())).toBe(true);
+        await manager.handleTextFrame(socket, result("awaiting_operator"));
+        await manager.handleTextFrame(socket, result("operator_running"));
+        await manager.handleTextFrame(socket, result("operator_closed", { exitCode: 0 }));
+        const calls = handler.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(63_000);
+        expect(handler).toHaveBeenCalledTimes(calls);
+      } finally {
+        vi.useRealTimers();
+        error.mockRestore();
+      }
+    });
+
+    it("R6-C-1: repeated failed acceptances share one retry chain, cancelled on session close", async () => {
+      const socket = await connect({ operatorTerminals: true });
+      const handler = vi.fn(async (_ref: unknown, frame: { status: string }) => {
+        if (frame.status === "operator_running") throw new Error("database down");
+      });
+      manager.setNodeFrameHandlers({ "runtime.job.result": handler });
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      vi.useFakeTimers();
+      try {
+        expect(manager.sendToNode("node-1", job())).toBe(true);
+        await manager.handleTextFrame(socket, result("awaiting_operator"));
+        const base = vi.getTimerCount();
+        for (let i = 0; i < 128; i++)
+          await manager.handleTextFrame(socket, result("operator_running"));
+        // 128 failed duplicates: one pending retry timer, not 128.
+        expect(vi.getTimerCount() - base).toBe(1);
+        expect(handler).toHaveBeenCalledTimes(129);
+        await manager.removeSession(socket);
+        // The session's retry timer is gone with it; nothing is delivered later.
+        expect(vi.getTimerCount()).toBeLessThanOrEqual(base);
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(handler).toHaveBeenCalledTimes(129);
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+        error.mockRestore();
+      }
+    });
+
+    it("R6-C-1: a genuine failure still retries once per step and reconciles; duplicates join it", async () => {
+      const socket = await connect({ operatorTerminals: true });
+      let failures = 3;
+      const handler = vi.fn(async (_ref: unknown, frame: { status: string }) => {
+        if (frame.status === "operator_running" && failures-- > 0)
+          throw new Error("one failed persistence write");
+      });
+      manager.setNodeFrameHandlers({ "runtime.job.result": handler });
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      vi.useFakeTimers();
+      try {
+        expect(manager.sendToNode("node-1", job())).toBe(true);
+        await manager.handleTextFrame(socket, result("awaiting_operator"));
+        await manager.handleTextFrame(socket, result("operator_running"));
+        await manager.handleTextFrame(socket, result("operator_running"));
+        // Two failed deliveries, one chain: its first retry (after 1 s) fails, the next
+        // (after 2 s) is recorded, and nothing follows.
+        expect(handler).toHaveBeenCalledTimes(3);
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(handler).toHaveBeenCalledTimes(4);
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect(handler).toHaveBeenCalledTimes(5);
+        expect(handler.mock.calls.at(-1)?.[1]).toMatchObject({
+          status: "operator_running",
+          terminalId,
+        });
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(handler).toHaveBeenCalledTimes(5);
+
+        // A repeat the engine records ends a pending chain at once.
+        handler.mockClear();
+        failures = 1;
+        expect(manager.sendToNode("node-1", job())).toBe(true);
+        await manager.handleTextFrame(socket, result("operator_running"));
+        await manager.handleTextFrame(socket, result("operator_running"));
+        expect(handler).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(handler).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+        error.mockRestore();
+      }
+    });
+
+    it("R6-C-1: dispose cancels pending acceptance retries", async () => {
+      const socket = await connect({ operatorTerminals: true });
+      const handler = vi.fn(async (_ref: unknown, frame: { status: string }) => {
+        if (frame.status === "operator_running") throw new Error("database down");
+      });
+      manager.setNodeFrameHandlers({ "runtime.job.result": handler });
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      vi.useFakeTimers();
+      try {
+        expect(manager.sendToNode("node-1", job())).toBe(true);
+        await manager.handleTextFrame(socket, result("awaiting_operator"));
+        await manager.handleTextFrame(socket, result("operator_running"));
+        const calls = handler.mock.calls.length;
+        manager.dispose();
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(handler).toHaveBeenCalledTimes(calls);
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+        error.mockRestore();
+      }
+    });
+
+    /** The session's acceptance retry chains and step trackers (white-box resource counts). */
+    const retryState = (socket: FakeSocket) => {
+      const sessions = Reflect.get(manager, "sessionsBySocket") as Map<
+        FakeSocket,
+        { acceptanceRetries: Map<string, unknown>; operatorSteps: Map<string, unknown> }
+      >;
+      const state = sessions.get(socket);
+      if (state === undefined) throw new Error("no session for this socket");
+      return state;
+    };
+
+    /**
+     * Counts acceptance retry timers armed from now on (by their caller), so the audit flush and
+     * the fake clock's own timers cannot blur the count.
+     */
+    const countRetrySchedules = () => {
+      const armTimer = globalThis.setTimeout;
+      let armed = 0;
+      const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+        ...args: Parameters<typeof setTimeout>
+      ) => {
+        if (new Error().stack?.includes("scheduleOperatorAcceptance")) armed++;
+        return armTimer(...args);
+      }) as typeof setTimeout);
+      return { count: () => armed, restore: () => spy.mockRestore() };
+    };
+
+    /**
+     * The acceptance retry timers armed from now on (attributed by their caller), each live
+     * until it fires or is cleared. Other module timers (the audit flush) are not counted.
+     */
+    const trackAcceptanceTimers = () => {
+      const armTimer = globalThis.setTimeout;
+      const disarmTimer = globalThis.clearTimeout;
+      const live = new Set<unknown>();
+      let armed = 0;
+      const arm = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+        ...args: Parameters<typeof setTimeout>
+      ) => {
+        if (!new Error().stack?.includes("scheduleOperatorAcceptance")) return armTimer(...args);
+        armed++;
+        const [callback, delay, ...rest] = args;
+        const handle = armTimer(
+          (...callbackArgs: unknown[]) => {
+            live.delete(handle);
+            (callback as (...callbackArgs: unknown[]) => void)(...callbackArgs);
+          },
+          delay,
+          ...rest,
+        );
+        live.add(handle);
+        return handle;
+      }) as typeof setTimeout);
+      const disarm = vi.spyOn(globalThis, "clearTimeout").mockImplementation(((
+        handle?: Parameters<typeof clearTimeout>[0],
+      ) => {
+        live.delete(handle);
+        disarmTimer(handle);
+      }) as typeof clearTimeout);
+      return {
+        armed: () => armed,
+        live: () => live.size,
+        restore: () => {
+          arm.mockRestore();
+          disarm.mockRestore();
+        },
+      };
+    };
+
+    /** A real child process whose stdout read stays pending until `release`. */
+    const pendingRead = async () => {
+      const { spawn } = await import("node:child_process");
+      const { once } = await import("node:events");
+      const child = spawn("/bin/cat", [], { stdio: ["pipe", "pipe", "pipe"] });
+      const exited = once(child, "exit");
+      await once(child, "spawn");
+      const read = once(child.stdout, "data");
+      return {
+        read,
+        pending: () => child.exitCode === null,
+        release: async () => {
+          child.stdin.end("release\n");
+          await read;
+        },
+        stop: async () => {
+          child.stdin.end();
+          if (child.exitCode === null) child.kill();
+          await exited;
+        },
+      };
+    };
+
+    it.each([
+      "operator_closed",
+      "succeeded",
+      "failed",
+      "replace",
+      "closeStep",
+      "closeTerminal",
+      "cancelUser",
+    ] as const)(
+      "R6-C-1: ending the run (%s) releases its acceptance retry at once",
+      async (exit) => {
+        const socket = await connect({ operatorTerminals: true });
+        const handler = vi.fn(async (_ref: unknown, frame: { status: string }) => {
+          if (frame.status === "operator_running") throw new Error("database down");
+        });
+        manager.setNodeFrameHandlers({ "runtime.job.result": handler });
+        const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+        vi.useFakeTimers();
+        try {
+          expect(manager.sendToNode("node-1", job())).toBe(true);
+          await manager.handleTextFrame(socket, result("awaiting_operator"));
+          const base = vi.getTimerCount();
+          await manager.handleTextFrame(socket, result("operator_running"));
+          const state = retryState(socket);
+          expect(state.acceptanceRetries.size).toBe(1);
+          expect(vi.getTimerCount() - base).toBe(1);
+          if (exit === "replace")
+            expect(
+              manager.sendToNode("node-1", job(Buffer.alloc(16, 43).toString("base64url"))),
+            ).toBe(true);
+          else if (exit === "closeStep") expect(manager.closeOperatorStep("step-1")).toBe("closed");
+          else if (exit === "closeTerminal") manager.closeOperatorTerminal("node-1", terminalId);
+          else if (exit === "cancelUser") manager.cancelOperatorTerminalsForUser("user-1");
+          else if (exit === "failed")
+            await manager.handleTextFrame(
+              socket,
+              result("succeeded", { status: "failed", error: "command_failed" }),
+            );
+          else await manager.handleTextFrame(socket, result(exit));
+          expect(socket.last("protocol.error")).toBeUndefined();
+          // Released now, not when the next timer would notice.
+          expect(state.acceptanceRetries.size).toBe(0);
+          expect(vi.getTimerCount() - base).toBe(0);
+          const calls = handler.mock.calls.length;
+          await vi.advanceTimersByTimeAsync(120_000);
+          expect(handler).toHaveBeenCalledTimes(calls);
+        } finally {
+          vi.clearAllTimers();
+          vi.useRealTimers();
+          error.mockRestore();
+        }
+      },
+    );
+
+    it("R6-C-1: finished dispatches cannot pile up retries beyond the live trackers", async () => {
+      const socket = await connect({ operatorTerminals: true });
+      const handler = vi.fn(async (_ref: unknown, frame: { status: string }) => {
+        if (frame.status === "operator_running") throw new Error("database down");
+      });
+      manager.setNodeFrameHandlers({ "runtime.job.result": handler });
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      vi.useFakeTimers();
+      // After the fake clock: it replaces the globals this wraps.
+      const timers = trackAcceptanceTimers();
+      try {
+        const state = retryState(socket);
+        for (let i = 0; i < 128; i++) {
+          const id = Buffer.alloc(16);
+          id.writeUInt32LE(i);
+          const ids = { stepId: `churn-step-${i}`, terminalId: id.toString("base64url") };
+          expect(manager.sendToNode("node-1", { ...job(ids.terminalId), stepId: ids.stepId })).toBe(
+            true,
+          );
+          await manager.handleTextFrame(socket, result("awaiting_operator", ids));
+          await manager.handleTextFrame(socket, result("operator_running", ids));
+          // Each failed acceptance armed exactly its own retry timer...
+          expect(timers.armed()).toBe(i + 1);
+          expect(timers.live()).toBe(1);
+          expect(state.acceptanceRetries.size).toBe(1);
+          await manager.handleTextFrame(socket, result("succeeded", ids));
+          // ...which its final clears at once, with the chain.
+          expect(timers.live()).toBe(0);
+          expect(state.acceptanceRetries.size).toBe(0);
+        }
+        expect(socket.last("protocol.error")).toBeUndefined();
+        expect(state.operatorSteps.size).toBe(0);
+        expect(state.acceptanceRetries.size).toBe(0);
+        expect(timers.armed()).toBe(128);
+        expect(timers.live()).toBe(0);
+        expect(manager.operatorRoom("node-1")).toBe(true);
+        const calls = handler.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(handler).toHaveBeenCalledTimes(calls);
+        expect(timers.armed()).toBe(128);
+      } finally {
+        timers.restore();
+        vi.clearAllTimers();
+        vi.useRealTimers();
+        error.mockRestore();
+      }
+    });
+
+    it("R6-C-1: a final releases the retry while its redelivery still awaits real I/O; the late failure does not reschedule", async () => {
+      const io = await pendingRead();
+      let retrySchedules: ReturnType<typeof countRetrySchedules> | undefined;
+      const socket = await connect({ operatorTerminals: true });
+      let calls = 0;
+      const handler = vi.fn(async (_ref: unknown, frame: { status: string }) => {
+        if (frame.status !== "operator_running") return;
+        calls++;
+        if (calls === 1) throw new Error("initial failure");
+        await io.read;
+        throw new Error("late retry failure");
+      });
+      manager.setNodeFrameHandlers({ "runtime.job.result": handler });
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      vi.useFakeTimers();
+      try {
+        expect(manager.sendToNode("node-1", job())).toBe(true);
+        await manager.handleTextFrame(socket, result("awaiting_operator"));
+        retrySchedules = countRetrySchedules();
+        await manager.handleTextFrame(socket, result("operator_running"));
+        expect(retrySchedules.count()).toBe(1);
+        await vi.advanceTimersByTimeAsync(1_000);
+        // The retry is in flight (no timer), blocked on the pending read.
+        expect(calls).toBe(2);
+        expect(io.pending()).toBe(true);
+        const state = retryState(socket);
+        expect(state.acceptanceRetries.size).toBe(1);
+        await manager.handleTextFrame(socket, result("succeeded"));
+        expect(state.operatorSteps.size).toBe(0);
+        expect(state.acceptanceRetries.size).toBe(0);
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(io.pending()).toBe(true);
+        await io.release();
+        await vi.advanceTimersByTimeAsync(0);
+        // The late failure finds its chain gone: no new entry, no new retry timer.
+        expect(state.acceptanceRetries.size).toBe(0);
+        expect(retrySchedules.count()).toBe(1);
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(calls).toBe(2);
+      } finally {
+        // No late callback of this manager may outlive the test.
+        manager.dispose();
+        retrySchedules?.restore();
+        vi.clearAllTimers();
+        vi.useRealTimers();
+        error.mockRestore();
+        await io.stop();
+      }
+    }, 10_000);
+
+    it("R6-C-1: an initial delivery that fails after its run ended starts no retry", async () => {
+      const io = await pendingRead();
+      let retrySchedules: ReturnType<typeof countRetrySchedules> | undefined;
+      const socket = await connect({ operatorTerminals: true });
+      const handler = vi.fn(async (_ref: unknown, frame: { status: string }) => {
+        if (frame.status !== "operator_running") return;
+        await io.read;
+        throw new Error("late initial failure");
+      });
+      manager.setNodeFrameHandlers({ "runtime.job.result": handler });
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      vi.useFakeTimers();
+      try {
+        expect(manager.sendToNode("node-1", job())).toBe(true);
+        await manager.handleTextFrame(socket, result("awaiting_operator"));
+        retrySchedules = countRetrySchedules();
+        const initial = manager.handleTextFrame(socket, result("operator_running"));
+        await manager.handleTextFrame(socket, result("succeeded"));
+        const state = retryState(socket);
+        expect(state.operatorSteps.size).toBe(0);
+        await io.release();
+        await initial;
+        expect(state.acceptanceRetries.size).toBe(0);
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(retrySchedules.count()).toBe(0);
+        expect(handler).toHaveBeenCalledTimes(3);
+      } finally {
+        // No late callback of this manager may outlive the test.
+        manager.dispose();
+        retrySchedules?.restore();
+        vi.clearAllTimers();
+        vi.useRealTimers();
+        error.mockRestore();
+        await io.stop();
+      }
+    }, 10_000);
+
+    it("R8-I1: through the composed handlers, a failed acceptance is still redelivered and later parts still run", async () => {
+      const { composeNodeFrameHandlers } = await import("./node-frame-handlers.js");
+      const socket = await connect({ operatorTerminals: true });
+      let failures = 1;
+      const failing = vi.fn(async (_ref: unknown, frame: { status: string }) => {
+        if (frame.status === "operator_running" && failures-- > 0)
+          throw new Error("injected persistence failure");
+      });
+      const later = vi.fn();
+      manager.setNodeFrameHandlers(
+        composeNodeFrameHandlers(
+          { "runtime.job.result": failing },
+          { "runtime.job.result": later },
+        ),
+      );
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      vi.useFakeTimers();
+      const running = (mock: typeof failing | typeof later) =>
+        mock.mock.calls.filter(
+          ([, frame]) => (frame as { status: string }).status === "operator_running",
+        );
+      try {
+        expect(manager.sendToNode("node-1", job())).toBe(true);
+        await manager.handleTextFrame(socket, result("awaiting_operator"));
+        await manager.handleTextFrame(socket, result("operator_running"));
+        expect(socket.last("protocol.error")).toBeUndefined();
+        // The failing part did not starve the next one.
+        expect(running(later)).toHaveLength(1);
+        const state = retryState(socket);
+        expect(state.operatorSteps.size).toBe(1);
+        expect(state.acceptanceRetries.size).toBe(1);
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(running(failing)).toHaveLength(2);
+        expect(running(later)).toHaveLength(2);
+        expect(state.acceptanceRetries.size).toBe(0);
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(running(failing)).toHaveLength(2);
+      } finally {
+        manager.dispose();
+        vi.clearAllTimers();
+        vi.useRealTimers();
+        error.mockRestore();
+      }
+    });
+
+    it("R8-I1: the installed node wiring redelivers an acceptance the lifecycle failed to record", async () => {
+      const wiring = await import("./node-wiring.js");
+      const { relaySessionManager } = await import("./session-manager.js");
+      // The handlers production installs, handed to this test's manager.
+      const install = vi
+        .spyOn(relaySessionManager, "setNodeFrameHandlers")
+        .mockImplementation((handlers) => manager.setNodeFrameHandlers(handlers));
+      let failures = 1;
+      const record = vi
+        .spyOn(wiring.runtimeLifecycle, "handleJobResult")
+        .mockImplementation(async (_ref, frame) => {
+          if (frame.status === "operator_running" && failures-- > 0)
+            throw new Error("injected persistence failure");
+        });
+      const socket = await connect({ operatorTerminals: true });
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      vi.useFakeTimers();
+      const running = () =>
+        record.mock.calls.filter(([, frame]) => frame.status === "operator_running");
+      try {
+        wiring.installNodeFrameHandlers();
+        expect(install).toHaveBeenCalledTimes(1);
+        expect(manager.sendToNode("node-1", job())).toBe(true);
+        await manager.handleTextFrame(socket, result("awaiting_operator"));
+        await manager.handleTextFrame(socket, result("operator_running"));
+        expect(socket.last("protocol.error")).toBeUndefined();
+        const state = retryState(socket);
+        expect(state.acceptanceRetries.size).toBe(1);
+        expect(running()).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(running()).toHaveLength(2);
+        expect(state.acceptanceRetries.size).toBe(0);
+      } finally {
+        manager.dispose();
+        vi.clearAllTimers();
+        vi.useRealTimers();
+        error.mockRestore();
+        record.mockRestore();
+        install.mockRestore();
+      }
     });
 
     it("drops progress for a terminal it did not send, and closes it on the node", async () => {

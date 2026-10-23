@@ -2040,6 +2040,12 @@ fn from_record(
             detail: Some("operator".into()),
         });
     }
+    // The job's reservations, else those of the launch it checks or stops.
+    let reservations = if job.reservations.is_empty() {
+        known.reservations.clone()
+    } else {
+        job.reservations.clone()
+    };
     Ok(Job {
         step_id: job.step_id.clone(),
         action: job.phase,
@@ -2047,6 +2053,7 @@ fn from_record(
         owner_epoch: job.owner_epoch.clone(),
         timeout_ms: job.timeout_ms.clamp(1, 3_600_000),
         command: String::new(),
+        reservations,
         ..known
     })
 }
@@ -5951,6 +5958,7 @@ mod tests {
                 terminal_id: "AAAAAAAAAAAAAAAAAAAAAA".into(),
                 command_author: crate::protocol::frames::CommandAuthor::User,
             }),
+            reservations: Vec::new(),
         }
     }
 
@@ -5984,6 +5992,7 @@ mod tests {
             gpu_ids: None,
             dist_port: None,
             host: "127.0.0.1".into(),
+            reservations: Vec::new(),
             spec: serde_json::json!({
                 "api": "openai", "engine": "vllm", "modelType": "llm",
                 "launch": {
@@ -6010,6 +6019,26 @@ mod tests {
             assert_eq!(job.step_id, "step1");
             assert_eq!(job.stop_command, "sudo systemctl stop x");
         }
+    }
+
+    #[test]
+    fn a_recorded_stop_uses_the_jobs_reservations_else_the_launchs() {
+        let reservation = |index: u8, node: &str| crate::protocol::frames::JobReservation {
+            index,
+            node_id: format!("nd{index}"),
+            node: node.into(),
+            gpu_ids: None,
+        };
+        let mut launched = recorded(false);
+        launched.reservations = vec![reservation(0, "worker-a")];
+        // A stop that names none sees the worker the launch was started with.
+        let job = from_record(&stop_job(false), launched.clone()).expect("admitted");
+        assert_eq!(job.reservations, vec![reservation(0, "worker-a")]);
+        // A stop that names its own uses them.
+        let mut naming = stop_job(false);
+        naming.reservations = vec![reservation(1, "worker-b")];
+        let job = from_record(&naming, launched).expect("admitted");
+        assert_eq!(job.reservations, vec![reservation(1, "worker-b")]);
     }
 
     #[cfg(unix)]

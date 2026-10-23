@@ -14,6 +14,7 @@ import { ConfirmAction } from "@/components/access/confirm-action";
 import { Help } from "@/components/help";
 import { InlineRetry } from "@/components/inline-retry";
 import { FieldError } from "@/components/nodes/field-error";
+import { HeldFootprint } from "@/components/runtimes/held-footprint";
 import { StatusPill } from "@/components/status-pill";
 import { TimeAgo } from "@/components/time-ago";
 import { refusalText } from "@/lib/refusal-text";
@@ -235,6 +236,13 @@ function StopEvidence({
       {ranks.map((rank) => (
         <RankEvidence key={rank.nodeNumber} rank={rank} />
       ))}
+      {/* What else stays held with these claims: a replaced run's claims and the memory held
+          on other nodes (also when the runtime's own node was removed). */}
+      <HeldFootprint
+        instance={instance}
+        nodeNumber={nodeNumber}
+        heading={t("dashboard:runtime.markStopped.evidence.alsoHeld")}
+      />
     </section>
   );
 }

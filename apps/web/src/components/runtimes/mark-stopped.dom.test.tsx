@@ -95,6 +95,8 @@ const RUNTIME = {
           lastStopCheck: null,
         },
       ],
+      reservations: [] as Array<Record<string, unknown>>,
+      supersededReservations: [] as Array<Record<string, unknown>>,
     },
   ],
 };
@@ -223,6 +225,63 @@ describe("MarkStoppedAction", () => {
       expect(bundle.runtime.markStopped.evidence.reason.port_held_outside_runtime).toMatch(/\S/);
   });
 
+  it("names the other nodes whose reserved memory stays held with this claim", async () => {
+    const instance = RUNTIME.instanceList[0];
+    if (!instance) throw new Error("no instance");
+    // The runtime's own node was removed; its reservation on w1 still holds (and one released).
+    instance.reservations = [
+      { index: 0, nodeId: "w1", nodeSlug: "w1", labels: [], memoryGb: 100, reserved: "HELD" },
+      { index: 1, nodeId: "w2", nodeSlug: "w2", labels: [], memoryGb: 8, reserved: "RELEASED" },
+    ];
+    try {
+      mount(<MarkStoppedAction runtimeId="rt-1" instanceId="inst-1" />);
+      fireEvent.click(screen.getByRole("button", { name: ACTION }));
+      const dialog = screen.getByRole("dialog", { name: "dashboard:runtime.markStopped.title" });
+      await within(dialog).findByText("dashboard:runtime.markStopped.evidence.alsoHeld");
+      expect(
+        within(dialog).getByText("dashboard:runtime.heldFootprint.reservation:100 GB|w1"),
+      ).toBeTruthy();
+      expect(within(dialog).queryByText(/heldFootprint\.reservation:.*\|w2/)).toBeNull();
+    } finally {
+      instance.reservations = [];
+    }
+  });
+
+  it("names a replaced run's workers and previous port that still hold", async () => {
+    const instance = RUNTIME.instanceList[0];
+    const first = instance?.ranks[0];
+    if (!instance || !first) throw new Error("no instance");
+    // After a restart moved the worker: the old one (w-old) and the old port still hold.
+    instance.reservations = [
+      { index: 0, nodeId: "w-new", nodeSlug: "w-new", labels: [], memoryGb: 20, reserved: "HELD" },
+    ];
+    instance.supersededReservations = [
+      { index: 0, nodeId: "w-old", nodeSlug: "w-old", labels: [], memoryGb: 100, reserved: "HELD" },
+    ];
+    Object.assign(first, { previousClaim: { port: 30005, distPort: null, memoryGb: 64 } });
+    try {
+      mount(<MarkStoppedAction runtimeId="rt-1" instanceId="inst-1" />);
+      fireEvent.click(screen.getByRole("button", { name: ACTION }));
+      const dialog = screen.getByRole("dialog", { name: "dashboard:runtime.markStopped.title" });
+      await within(dialog).findByText("dashboard:runtime.markStopped.evidence.alsoHeld");
+      expect(
+        within(dialog).getByText(
+          "dashboard:runtime.heldFootprint.supersededReservation:100 GB|w-old",
+        ),
+      ).toBeTruthy();
+      expect(
+        within(dialog).getByText("dashboard:runtime.heldFootprint.reservation:20 GB|w-new"),
+      ).toBeTruthy();
+      expect(
+        within(dialog).getByText("dashboard:runtime.heldFootprint.previousClaim:30005|64 GB|box"),
+      ).toBeTruthy();
+    } finally {
+      instance.reservations = [];
+      instance.supersededReservations = [];
+      Object.assign(first, { previousClaim: null });
+    }
+  });
+
   it("leaves an empty note out and sends a node number for one node's part", async () => {
     mount(<MarkStoppedAction runtimeId="rt-1" instanceId="inst-1" nodeNumber={2} />);
     fireEvent.click(screen.getByRole("button", { name: ACTION }));
@@ -276,6 +335,7 @@ describe("RunsHereCard", () => {
     phase: "STOPPING",
     reserved: "HELD",
     needsOperator: "MARK_STOPPED",
+    role: "rank",
   };
 
   it("offers Mark as stopped only while the instance needs it and this part is held", () => {

@@ -27,6 +27,7 @@ fn job(action: JobPhase) -> Job {
         gpu_ids: None,
         dist_port: None,
         host: "127.0.0.1".into(),
+        reservations: Vec::new(),
         spec: serde_json::json!({
             "api": "openai", "engine": "vllm", "modelType": "llm",
             "models": [{ "id": "m" }],
@@ -660,6 +661,82 @@ fn commands_see_only_the_ranks_gpus() {
     stored.as_object_mut().expect("object").remove("gpuIds");
     let loaded: Job = serde_json::from_value(stored).expect("old record");
     assert_eq!(loaded.gpu_ids, None);
+}
+
+#[test]
+fn commands_see_the_reservations_worker_nodes() {
+    let mut placed = job(JobPhase::Start);
+    assert!(command_env(&placed).expect("env").is_empty());
+    placed.reservations = vec![
+        JobReservation {
+            index: 0,
+            node_id: "nd7f3k9q2w8e4r6t1y5u0i3o".into(),
+            node: "worker-a".into(),
+            gpu_ids: Some("1".into()),
+        },
+        JobReservation {
+            index: 3,
+            node_id: "nd2b6n8m4v1c9x7z3l5k0j8h".into(),
+            node: "worker-b".into(),
+            gpu_ids: None,
+        },
+    ];
+    let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+    assert_eq!(
+        command_env(&placed).expect("env"),
+        vec![
+            pair("WSMP_RESERVATION_COUNT", "2"),
+            pair("WSMP_RESERVATION_0_NODE", "worker-a"),
+            pair("WSMP_RESERVATION_0_NODE_ID", "nd7f3k9q2w8e4r6t1y5u0i3o"),
+            pair("WSMP_RESERVATION_0_GPUS", "1"),
+            pair("WSMP_RESERVATION_3_NODE", "worker-b"),
+            pair("WSMP_RESERVATION_3_NODE_ID", "nd2b6n8m4v1c9x7z3l5k0j8h"),
+        ]
+    );
+    // Persisted records written before the field still load, and an empty list is not stored.
+    let stored = serde_json::to_value(job(JobPhase::Start)).expect("json");
+    assert!(stored.get("reservations").is_none());
+    let loaded: Job = serde_json::from_value(stored).expect("old record");
+    assert!(loaded.reservations.is_empty());
+}
+
+#[test]
+fn a_new_start_replaces_the_recorded_reservations() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("in1-r0.json");
+    let runtime = Fake::new(path.clone());
+    let mut first = job(JobPhase::Start);
+    first.reservations = vec![JobReservation {
+        index: 0,
+        node_id: "nd1".into(),
+        node: "worker-a".into(),
+        gpu_ids: Some("0,3".into()),
+    }];
+    let mut executor = Executor::load(path.clone()).expect("load");
+    let outcome = executor.execute(first, &runtime, deadline());
+    assert_eq!(outcome.status, JobStatus::Succeeded, "{outcome:?}");
+    let recorded = Executor::load(path.clone())
+        .expect("reload")
+        .recorded_job("in1", 0)
+        .expect("record");
+    assert_eq!(recorded.reservations.len(), 1);
+    // The worker GPUs are recorded with the launch: a later stop still exports them.
+    assert_eq!(recorded.reservations[0].gpu_ids.as_deref(), Some("0,3"));
+    let mut stop = job(JobPhase::Stop);
+    stop.step_id = "stop-1".into();
+    let outcome = executor.execute(stop, &runtime, deadline());
+    assert!(outcome.stopped, "{outcome:?}");
+    // The next launch names no reservations: the record forgets the old ones.
+    let mut second = job(JobPhase::Start);
+    second.step_id = "start-2".into();
+    second.intent_hash = "b".repeat(64);
+    let outcome = executor.execute(second, &runtime, deadline());
+    assert_eq!(outcome.status, JobStatus::Succeeded, "{outcome:?}");
+    let recorded = Executor::load(path)
+        .expect("reload")
+        .recorded_job("in1", 0)
+        .expect("record");
+    assert!(recorded.reservations.is_empty());
 }
 
 /// A Runtime whose status/health can fail with an error (unknown).

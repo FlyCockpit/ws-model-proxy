@@ -87,6 +87,9 @@ describe("nodes_get list rows", () => {
           version: "0.4.0",
           trust: expect.any(Object),
           hardwareKind: "unified",
+          // What instances (reservations included) hold, out of the usable memory.
+          usableMemoryGb: 126,
+          reservedNowMemoryGb: 0,
           runningInstances: 0,
           alwaysOnRuntimes: 1,
           needsYou: 0,

@@ -277,7 +277,7 @@ export function RunsHereCard({ node, lang }: { node: NodeDetail; lang: string })
           <ul className="space-y-1">
             {node.instances.map((instance) => (
               <li
-                key={`${instance.instanceId}-${instance.nodeNumber}`}
+                key={`${instance.instanceId}-${instance.role}-${instance.nodeNumber}`}
                 className="flex flex-wrap items-center gap-2"
               >
                 <Link
@@ -290,7 +290,12 @@ export function RunsHereCard({ node, lang }: { node: NodeDetail; lang: string })
                 <StatusPill tone={PHASE_TONE[instance.phase]}>
                   {t(`dashboard:nodes.phase.${instance.phase}`)}
                 </StatusPill>
-                {instance.nodeCount > 1 ? (
+                {instance.role === "reservation" ? (
+                  // Memory held here by a runtime that runs elsewhere: nothing to stop here.
+                  <span className="text-xs text-muted-foreground">
+                    {t("dashboard:nodes.runs.reservation")}
+                  </span>
+                ) : instance.nodeCount > 1 ? (
                   <span className="text-xs text-muted-foreground">
                     {t("dashboard:nodes.runs.part", {
                       number: instance.nodeNumber,
@@ -298,7 +303,8 @@ export function RunsHereCard({ node, lang }: { node: NodeDetail; lang: string })
                     })}
                   </span>
                 ) : null}
-                {instance.needsOperator === "MARK_STOPPED" ? (
+                {instance.role === "reservation" ? null : instance.needsOperator ===
+                  "MARK_STOPPED" ? (
                   <>
                     <StatusPill tone="warning">
                       {t("dashboard:runtime.needsOperator.MARK_STOPPED")}
@@ -317,7 +323,7 @@ export function RunsHereCard({ node, lang }: { node: NodeDetail; lang: string })
                   <StatusPill tone="warning">{t("dashboard:nodes.runs.needsYou")}</StatusPill>
                 ) : null}
                 {/* Marked stopped, its stop still not proven: a person may release it. */}
-                {instance.reserved === "HELD_UNKNOWN" ? (
+                {instance.role === "rank" && instance.reserved === "HELD_UNKNOWN" ? (
                   <ReleaseUnprovenAction
                     runtimeId={instance.runtimeId}
                     instanceId={instance.instanceId}

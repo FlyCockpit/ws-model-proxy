@@ -17,6 +17,9 @@
     "./lib/step-intent": {
       "default": "./src/lib/step-intent.ts"
     },
+    "./lib/command-render": {
+      "default": "./src/lib/command-render.ts"
+    },
     "./lib/runtime-launch-hash": {
       "default": "./src/lib/runtime-launch-hash.ts"
     },
@@ -38,8 +41,23 @@
     "./lib/runtime-store": {
       "default": "./src/lib/runtime-store.ts"
     },
+    "./lib/reservations": {
+      "default": "./src/lib/reservations.ts"
+    },
+    "./lib/retake-plan": {
+      "default": "./src/lib/retake-plan.ts"
+    },
+    "./lib/instance-run": {
+      "default": "./src/lib/instance-run.ts"
+    },
+    "./lib/node-definitions": {
+      "default": "./src/lib/node-definitions.ts"
+    },
     "./lib/needs-you-mail": {
       "default": "./src/lib/needs-you-mail.ts"
+    },
+    "./nodes/trust": {
+      "default": "./src/nodes/trust.ts"
     },
     "./nodes/fabrics": {
       "default": "./src/nodes/fabrics.ts"
