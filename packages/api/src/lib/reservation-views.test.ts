@@ -6,7 +6,13 @@ import { type NodeDetailRow, toNodeDetail, toNodeSummary } from "../nodes/views"
 import { loadPlacementInstances } from "./placement-load";
 import { launchIdentity } from "./reservations";
 import { type PlannedStartWrite, type Tx, writePlannedStarts } from "./runtime-store";
-import { previousLaunchHashes, versionSummary } from "./runtime-views";
+import {
+  INSTANCE_INCLUDE,
+  type InstanceRow,
+  instanceView,
+  previousLaunchHashes,
+  versionSummary,
+} from "./runtime-views";
 
 // Reservations (`launch.reservations`) as the placement loader and the node views read them:
 // they hold exactly while the instance's rank does.
@@ -92,7 +98,9 @@ function nodeRow(reservationRanks: Array<{ claim: "HELD" | "RELEASED" | "HELD_UN
     Reservations: [
       {
         index: 0,
+        instanceId: "inst-ds",
         resources: GB100,
+        supersededGeneration: null,
         Instance: {
           id: "inst-ds",
           runtimeId: "rt-ds",
@@ -161,7 +169,7 @@ describe("node views", () => {
     expect(detail.reservedNowMemoryGb).toBe(100);
   });
 
-  it("a restart's superseded row beside the current one is one entry, and both are counted", () => {
+  it("a restart's superseded row beside the current one is one entry, counted once (the larger)", () => {
     const row = nodeRow([{ claim: "HELD" }]);
     const [current] = row.Reservations;
     if (!current) throw new Error("no reservation");
@@ -174,7 +182,33 @@ describe("node views", () => {
     const detail = toNodeDetail(row, CONTEXT, NOW);
     expect(detail.instances).toHaveLength(1);
     expect(detail.instances[0]).toMatchObject({ instanceId: "inst-ds", role: "reservation" });
-    expect(detail.hardware.reservedNowMemoryGb).toBe(120);
+    // The old run's 100 GiB and the new plan's 20 overlap (they never run at once): max, not sum.
+    expect(detail.hardware.reservedNowMemoryGb).toBe(100);
+    expect(detail.reservedNowMemoryGb).toBe(100);
+  });
+
+  it("a restarted rank's old claim (prev*) and its new one count once (the larger)", () => {
+    const row = nodeRow([{ claim: "HELD" }]);
+    const rank = (claim: "HELD" | "RELEASED") => ({
+      rank: 0,
+      claim,
+      resources: { kind: "unified", memoryGb: 20 },
+      prevResources: claim === "HELD" ? { kind: "unified", memoryGb: 60 } : null,
+      prevPort: claim === "HELD" ? 30000 : null,
+      Instance: {
+        id: "inst-rank",
+        runtimeId: "rt-rank",
+        phase: "STARTING",
+        needsOperator: null,
+        Runtime: { slug: "qwen" },
+        _count: { Ranks: 1 },
+      },
+    });
+    row.Ranks = [rank("HELD")];
+    // The reservation's 100 GiB (another instance) adds; the rank holds max(20, 60).
+    expect(toNodeDetail(row, CONTEXT, NOW).hardware.reservedNowMemoryGb).toBe(160);
+    row.Ranks = [rank("RELEASED")];
+    expect(toNodeDetail(row, CONTEXT, NOW).hardware.reservedNowMemoryGb).toBe(100);
   });
 
   it("a released rank releases its reservations in the views", () => {
@@ -280,5 +314,93 @@ describe("a version's launchChanged counts reservations (server-only, not in the
     // Without reservations the identity is the launch hash itself (unchanged for old versions).
     expect(launchIdentity({ launchHash: HASH, spec: launchOf() })).toBe(HASH);
     expect(launchIdentity({ launchHash: HASH, spec: launchOf([]) })).toBe(HASH);
+  });
+});
+
+describe("the instance view shows everything a recovery releases", () => {
+  // After a restart moved the reservation (100 GiB on old-worker → 20 GiB on new-worker) and
+  // changed the rank's port, the replaced run's worker and port keep holding until its stop is
+  // proven: a person marking stopped or releasing must see them too.
+  const rows = [
+    {
+      index: 0,
+      nodeId: "old-worker",
+      Node: null,
+      labels: ["worker"],
+      resources: { kind: "unified", memoryGb: 100 },
+      supersededGeneration: 1,
+    },
+    {
+      index: 0,
+      nodeId: "new-worker",
+      Node: null,
+      labels: ["worker"],
+      resources: { kind: "unified", memoryGb: 20 },
+      supersededGeneration: null,
+    },
+  ];
+  function view(claim: "HELD" | "HELD_UNKNOWN" | "RELEASED") {
+    // Apply the exported include's row filter, as Prisma does for runtimes.get.
+    const where: unknown = Reflect.get(INSTANCE_INCLUDE.Reservations, "where");
+    const selected = rows.filter(
+      (row) =>
+        typeof where !== "object" ||
+        where === null ||
+        Object.entries(where).every(([key, value]) => Reflect.get(row, key) === value),
+    );
+    const row = {
+      id: "inst",
+      runtimeId: "rt",
+      handle: "i-abcdefabcdef",
+      versionId: "v2",
+      launchVersionId: "v2",
+      desiredState: "STOPPED",
+      phase: "STOPPING",
+      phaseReason: null,
+      phaseChangedAt: NOW,
+      healthDetail: null,
+      needsOperator: "MARK_STOPPED",
+      startedBy: "USER",
+      restartsInWindow: 0,
+      nextRestartAt: null,
+      engineSlots: null,
+      factsAt: null,
+      Version: { advanced: {}, version: 2 },
+      LaunchVersion: { spec: {}, launchHash: "a".repeat(64), editor: "USER" },
+      Fabric: null,
+      Ranks: [
+        {
+          rank: 0,
+          nodeId: "head",
+          Node: null,
+          claim,
+          port: 30005,
+          unitName: "wsmp-i-abcdefabcdef-r0",
+          prevPort: claim === "RELEASED" ? null : 30000,
+          prevDistPort: null,
+          prevResources: claim === "RELEASED" ? null : { kind: "unified", memoryGb: 64 },
+          releasedUnprovenAt: null,
+          ReleaseRequests: [],
+        },
+      ],
+      Reservations: selected,
+      Steps: [],
+    };
+    return instanceView(row as unknown as InstanceRow);
+  }
+
+  it("lists a replaced run's worker beside the current one, and the rank's previous claim", () => {
+    const shown = view("HELD_UNKNOWN");
+    expect(shown.reservations.map((row) => row.nodeId)).toEqual(["new-worker"]);
+    expect(shown.supersededReservations).toEqual([
+      expect.objectContaining({ nodeId: "old-worker", memoryGb: 100, reserved: "HELD_UNKNOWN" }),
+    ]);
+    expect(shown.ranks[0]?.previousClaim).toEqual({ port: 30000, distPort: null, memoryGb: 64 });
+  });
+
+  it("a released claim holds nothing of the replaced run", () => {
+    const shown = view("RELEASED");
+    expect(shown.supersededReservations).toEqual([]);
+    expect(shown.ranks[0]?.previousClaim).toBeNull();
   });
 });

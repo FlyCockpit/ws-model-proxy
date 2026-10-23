@@ -21,6 +21,7 @@ function node(id: string, overrides: Partial<PlacementNode> = {}): PlacementNode
     labels: [],
     portRange: [30000, 30009],
     heldVersionIds: new Set(),
+    requiredVersionIds: new Set(),
     frozenFabrics: null,
     memoryGb: 126,
     gpus: [],
@@ -641,5 +642,26 @@ describe("placement work bound", () => {
     const planner = new PlacementPlanner(context({ nodes: fleet(() => [], 2_000) }));
     for (let index = 0; index < 64; index++)
       ok(planner.place(request({ resources: [{ kind: "unified", memoryGb: 1 }] })));
+  });
+});
+
+describe("preemption counts a replaced run's holds", () => {
+  it("a pinned start may stop the owner of a node held only by a superseded reservation", () => {
+    // The old run's reservation on w1 still holds (its stop not proven); the current one is on
+    // w2. Stopping that instance frees w1, as the budgets count it.
+    const inst = withReservations("old", "head", ["w2"]);
+    inst.ranks.push({
+      nodeId: "w1",
+      port: 0,
+      distPort: null,
+      claim: "HELD",
+      resources: GB100,
+      reservation: true,
+      previous: true,
+    });
+    const planner = new PlacementPlanner(context({ instances: [inst] }));
+    const result = planner.place(request({ nodeIds: ["w1"], preempt: true }));
+    expect(result.ok).toBe(true);
+    expect(planner.stops.map((stop) => stop.instanceId)).toEqual(["old"]);
   });
 });

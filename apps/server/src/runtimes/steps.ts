@@ -28,10 +28,13 @@ import {
   type RuntimeLaunch,
 } from "@ws-model-proxy/api/lib/runtime-spec";
 import {
+  claimGpuIds,
   type StepIntent,
+  type StepReservation,
   stepIntentSchema,
   stepJobFabricId,
   stepJobPlaceholders,
+  stepJobReservations,
 } from "@ws-model-proxy/api/lib/step-intent";
 import { type JobPlaceholders, type RuntimeJobFrame, runtimeUnitName } from "../relay/frames.js";
 
@@ -74,7 +77,7 @@ const WIRE_PHASE = {
 } as const satisfies Record<StepPhase, RuntimeJobFrame["phase"]>;
 
 /** What a step carries (stored as `InstanceStep.intent`, hashed into `intentHash`). */
-export { type StepIntent, stepIntentSchema };
+export { type StepIntent, type StepReservation, stepIntentSchema };
 
 export function intentHash(intent: StepIntent): string {
   return createHash("sha256").update(canonicalJson(intent), "utf8").digest("hex");
@@ -103,6 +106,11 @@ export type NewStep = {
   generation: number;
   intent: StepIntent;
   intentHash: string;
+  /**
+   * A stop or status probe of a recorded launch (`Physical`): the head address it was
+   * dispatched with (`InstanceStep.headAddr`). Absent: resolved at dispatch.
+   */
+  headAddr?: string | null;
 };
 
 function commandsFor(launch: RuntimeLaunch, rank: number): RuntimeCommands {
@@ -155,13 +163,8 @@ export function canonicalDecimal(value: number): string | null {
 export function rankPlaceholders(resources: unknown): Record<string, string> {
   const out: Record<string, string> = {};
   if (!resources || typeof resources !== "object") return out;
-  const gpus = Reflect.get(resources, "gpus");
-  if (Array.isArray(gpus)) {
-    const ids = gpus
-      .map((key) => (typeof key === "string" ? /^[a-z]+:([0-9]{1,3})$/.exec(key)?.[1] : undefined))
-      .filter((id): id is string => id !== undefined);
-    if (ids.length > 0 && ids.length === gpus.length) out.gpu_ids = ids.join(",");
-  }
+  const gpuIds = claimGpuIds(resources);
+  if (gpuIds) out.gpu_ids = gpuIds;
   const kind = Reflect.get(resources, "kind");
   const number = (key: string) => {
     const value = Reflect.get(resources, key);
@@ -189,6 +192,8 @@ function intentFor(input: {
   phase: StepPhase;
   launch: RuntimeLaunch;
   operationId: string | null;
+  /** The run's reservation nodes (single-node instances only). */
+  reservations?: readonly StepReservation[];
 }): StepIntent {
   const commands = commandsFor(input.launch, input.rank.rank);
   const placeholders: Record<string, string | number> = {
@@ -212,14 +217,18 @@ function intentFor(input: {
     placeholders,
     timeoutMs: timeoutFor(input.phase, input.launch, commands),
     interactive: interactiveFor(input.phase, commands),
+    ...(input.nnodes === 1 && input.reservations && input.reservations.length > 0
+      ? { reservations: [...input.reservations].sort((a, b) => a.index - b.index) }
+      : {}),
   };
 }
 
 /**
- * What runs on a rank: the stored intent of its latest launch, and the launch (spec) of that
- * intent's version (the stop's timeout and interactivity come from it).
+ * What runs on a rank: the stored intent of its latest launch, the launch (spec) of that
+ * intent's version (the stop's timeout and interactivity come from it), and the head address the
+ * launch was dispatched with (multi-node; null when not recorded).
  */
-export type Physical = { intent: StepIntent; launch: RuntimeLaunch };
+export type Physical = { intent: StepIntent; launch: RuntimeLaunch; headAddr: string | null };
 
 function physicalIntent(input: Parameters<typeof intentFor>[0], physical: Physical): StepIntent {
   const commands = commandsFor(physical.launch, input.rank.rank);
@@ -245,6 +254,7 @@ function step(
     generation,
     intent,
     intentHash: intentHash(intent),
+    ...(physical?.headAddr ? { headAddr: physical.headAddr } : {}),
   };
 }
 
@@ -259,6 +269,8 @@ export function generationSteps(input: {
   generation: number;
   operationId: string | null;
   physical?: ReadonlyMap<number, Physical>;
+  /** The run's reservation nodes (single-node instances only). */
+  reservations?: readonly StepReservation[];
 }): NewStep[] {
   const ranks = [...input.ranks].sort((a, b) => a.rank - b.rank);
   const nnodes = ranks.length;
@@ -269,6 +281,7 @@ export function generationSteps(input: {
     nnodes,
     launch: input.launch,
     operationId: input.operationId,
+    ...(input.reservations ? { reservations: input.reservations } : {}),
   };
   for (const rank of ranks) {
     const commands = commandsFor(input.launch, rank.rank);
@@ -311,6 +324,8 @@ export function stopStep(input: {
   phase?: "STOP" | "STATUS";
   /** What runs on the rank (absent: the instance's own launch). */
   physical?: Physical;
+  /** The run's reservation nodes, without `physical` (with it, the launch's own). */
+  reservations?: readonly StepReservation[];
 }): NewStep {
   return step(
     {
@@ -320,6 +335,7 @@ export function stopStep(input: {
       phase: input.phase ?? "STOP",
       launch: input.launch,
       operationId: input.operationId,
+      ...(input.reservations ? { reservations: input.reservations } : {}),
     },
     input.phase === "STATUS"
       ? STATUS_SEQUENCE_BASE + input.attempt
@@ -337,6 +353,7 @@ export function healthStep(input: {
   launch: RuntimeLaunch;
   generation: number;
   sequence: number;
+  reservations?: readonly StepReservation[];
 }): NewStep {
   return step(
     {
@@ -346,6 +363,7 @@ export function healthStep(input: {
       phase: "HEALTH",
       launch: input.launch,
       operationId: null,
+      ...(input.reservations ? { reservations: input.reservations } : {}),
     },
     Math.max(HEALTH_SEQUENCE_BASE, input.sequence),
     input.generation,
@@ -363,8 +381,15 @@ export function jobFrame(input: {
   ownerEpoch: string;
   headAddr: string | null;
   operator?: RuntimeJobFrame["operator"];
+  /**
+   * The node's CLI reads `reservations` (hello `features.jobReservations`). A released CLI
+   * refuses a job with unknown fields: without it they are left out (a start that needs them
+   * is refused before it is sent, `cli_upgrade_required`).
+   */
+  jobReservations?: boolean;
 }): RuntimeJobFrame {
   const { intent } = input;
+  const reservations = input.jobReservations ? stepJobReservations(intent) : null;
   // The same values the step views render the shown command from (`step-intent.ts`).
   const placeholders: JobPlaceholders = stepJobPlaceholders(intent, input.headAddr);
   const fabricId = stepJobFabricId(intent);
@@ -387,5 +412,6 @@ export function jobFrame(input: {
     ownerEpoch: input.ownerEpoch,
     intentHash: input.intentHash,
     ...(input.operator ? { operator: input.operator } : {}),
+    ...(reservations ? { reservations } : {}),
   };
 }

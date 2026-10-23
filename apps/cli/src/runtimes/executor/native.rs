@@ -72,7 +72,7 @@ fn user_manager_live(state: &str) -> bool {
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linger_enabled(output: &str) -> bool {
+pub(crate) fn linger_enabled(output: &str) -> bool {
     output.lines().any(|line| {
         line.trim()
             .split_once('=')
@@ -998,6 +998,7 @@ mod tests {
             gpu_ids: None,
             dist_port: None,
             host: "127.0.0.1".into(),
+            reservations: Vec::new(),
             spec: serde_json::json!({
                 "api": "openai", "engine": "other", "modelType": "llm",
                 "models": [{ "id": "m" }],
@@ -1079,6 +1080,7 @@ mod tests {
             gpu_ids: None,
             dist_port: None,
             host: "127.0.0.1".into(),
+            reservations: Vec::new(),
             spec: serde_json::json!({
                 "api": "openai", "engine": "other", "modelType": "llm",
                 "models": [{ "id": "m" }],
@@ -1160,6 +1162,7 @@ mod tests {
             dist_port: Some(dist),
             gpu_ids: None,
             host: "127.0.0.1".into(),
+            reservations: Vec::new(),
             spec: serde_json::json!({
                 "api": "openai", "engine": "other", "modelType": "llm",
                 "models": [{ "id": "m" }],

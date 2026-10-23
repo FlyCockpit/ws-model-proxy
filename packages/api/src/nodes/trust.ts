@@ -21,7 +21,9 @@ export type NodeTrustViewColumns = NodeTrustColumns & {
  * is Relay only, and a person's lower request makes it Relay only at once (before the node
  * confirms).
  */
-export function effectiveTrust(node: NodeTrustColumns): "RELAY" | "FULL" {
+export function effectiveTrust(
+  node: Pick<NodeTrustColumns, "trust" | "trustLowerRequestedAt">,
+): "RELAY" | "FULL" {
   const lowerPending = node.trustLowerRequestedAt !== null && node.trust !== "RELAY";
   return node.trust === "FULL" && !lowerPending ? "FULL" : "RELAY";
 }
@@ -50,6 +52,8 @@ export function nodeTrustView(node: NodeTrustViewColumns): NodeTrustView {
   };
 }
 
-export function isFullControl(node: NodeTrustColumns): boolean {
+export function isFullControl(
+  node: Pick<NodeTrustColumns, "trust" | "trustLowerRequestedAt">,
+): boolean {
   return effectiveTrust(node) === "FULL";
 }

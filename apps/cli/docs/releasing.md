@@ -51,7 +51,9 @@ ghcr.io/flycockpit/ws-model-proxy:latest   # only when publish_latest is true
 # 2. Flip the CLI install default to release binaries (same commit; see below).
 #    Write the upgrade notes as docs/release-notes/X.Y.Z.md (same commit). The
 #    workflow refuses to release without that file and puts it at the top of
-#    the GitHub Release body, above cargo-dist's install section.
+#    the GitHub Release body, above cargo-dist's install section. Fold in
+#    docs/release-notes/unreleased.md (notes collected since the last release)
+#    and delete it.
 # 3. Merge that change to master.
 git push origin master
 # 4. In GitHub Actions, run the root "Release" workflow from master with:

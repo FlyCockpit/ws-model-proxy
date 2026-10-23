@@ -51,6 +51,10 @@ const store = vi.hoisted(() => ({
   skipPrepare: false,
   /** Fenced writes of these owners fail (a transient database error, C4C / sweep tests). */
   failOwners: new Set<string>(),
+  /** Fabric member addresses by node id (`fabricMember.findFirst`). */
+  fabricIps: new Map<string, string>(),
+  /** Runs after a fenced write that claimed a job, before its frame is sent (dispatch race). */
+  afterClaim: null as null | (() => Promise<void>),
   nextId: 1,
 }));
 
@@ -185,8 +189,18 @@ const db = vi.hoisted(() => {
       return method === "count" ? rows.length : method === "findMany" ? rows : (rows[0] ?? null);
     }
     if (model === "user") return { banned: false, banExpires: null, deletionRequestedAt: null };
+    if (model === "fabricMember") {
+      const ip = store.fabricIps.get(String(where.nodeId));
+      return ip ? { ip } : null;
+    }
     if (model === "runtimeVersion") {
-      const hit = store.versions.filter((row) => matches(row, where));
+      // An owner-scoped read (`Runtime: { userId }`) never sees another owner's version.
+      const owner = (where.Runtime as { userId?: string } | undefined)?.userId;
+      const hit = store.versions.filter(
+        (row) =>
+          matches(row, where) &&
+          (owner === undefined || row.ownerId === undefined || row.ownerId === owner),
+      );
       return method === "findMany" ? hit : (hit[0] ?? null);
     }
     if (model === "runtimeInstance") {
@@ -279,6 +293,10 @@ const db = vi.hoisted(() => {
       if (method === "updateMany" || method === "update") {
         for (const row of hit) {
           if ("generation" in (args.data as Row)) throw new Error("a step keeps its generation");
+          // The CHECK `instance_step_operator_shape`: an acceptance needs its screen's time.
+          const next = { ...row, ...(args.data as Row) };
+          if (next.operatorAcceptedAt != null && next.operatorSince == null)
+            throw new Error("instance_step_operator_shape: an acceptance needs operatorSince");
           patch(row, args.data as Row);
         }
         return method === "update" ? hit[0] : { count: hit.length };
@@ -360,7 +378,18 @@ vi.mock("@ws-model-proxy/api/lib/graph-write", () => ({
     const instances = structuredClone(store.instances);
     const steps = structuredClone(store.steps);
     try {
-      return await work(db);
+      const value = await work(db);
+      const hook = store.afterClaim;
+      if (
+        hook &&
+        value &&
+        typeof value === "object" &&
+        Reflect.get(value, "type") === "runtime.job"
+      ) {
+        store.afterClaim = null;
+        await hook();
+      }
+      return value;
     } catch (error) {
       store.instances = instances;
       store.steps = steps;
@@ -372,6 +401,7 @@ vi.mock("@ws-model-proxy/api/lib/graph-write", () => ({
 
 const { RuntimeLifecycle } = await import("./lifecycle.js");
 const { writePlannedStarts } = await import("@ws-model-proxy/api/lib/runtime-store");
+const { DbNull } = await import("@ws-model-proxy/db/json-null");
 const { releaseClaim } = await import("@ws-model-proxy/api/lib/claim-release");
 const { beginRun, resolveRun, slotOf, owned } = await import(
   "@ws-model-proxy/api/lib/instance-run"
@@ -407,6 +437,8 @@ let now = new Date(Date.now() + 3_600_000);
 const sent: Array<{ nodeId: string; frame: Row }> = [];
 const closed: string[] = [];
 let closeAnswer: "closed" | "running" | "absent" = "closed";
+/** Per node, instance and rank: the highest run whose start-phase job was sent (the relay's). */
+const startedRuns = new Map<string, number>();
 let errors: unknown[][] = [];
 
 function setNow(date: Date) {
@@ -423,7 +455,18 @@ function engine() {
           ? { userId: "u1", connectionGeneration: 1, trust: "full", operatorTerminals: true }
           : null,
       sendToNode: (nodeId: string, frame: unknown) => {
-        sent.push({ nodeId, frame: frame as Row });
+        const job = frame as Row;
+        // The session's last check (`staleRunJob`): no stop, status or health job of a run
+        // older than a start already sent for the rank.
+        const key = `${nodeId}:${job.instanceId}:${job.rank}`;
+        const generation = Number(job.generation);
+        const startPhase = ["prepare", "start", "after_join", "readiness"].includes(
+          String(job.phase),
+        );
+        if (!startPhase && generation < (startedRuns.get(key) ?? -1)) return false;
+        if (startPhase && generation > (startedRuns.get(key) ?? -1))
+          startedRuns.set(key, generation);
+        sent.push({ nodeId, frame: job });
         return true;
       },
       operatorRoom: () => true,
@@ -486,6 +529,11 @@ function instance(id: string, overrides: Partial<Instance> = {}): Instance {
         lastStopCheckAt: now,
         stoppedAt: null,
         markedStoppedAt: null,
+        plannedGeneration: 0,
+        prevResources: null,
+        prevPort: null,
+        prevDistPort: null,
+        prevGeneration: null,
       },
     ],
     Reservations: [
@@ -698,6 +746,7 @@ beforeEach(() => {
   store.steps = [];
   store.skipPrepare = false;
   store.failOwners = new Set();
+  store.fabricIps = new Map();
   store.nextId = 1;
   store.nodes = [
     { id: "head", online: true, labels: [], memoryGb: 512 },
@@ -725,6 +774,8 @@ beforeEach(() => {
     },
   ];
   sent.length = 0;
+  startedRuns.clear();
+  store.afterClaim = null;
   closed.length = 0;
   closeAnswer = "closed";
   errors = [];
@@ -1005,6 +1056,36 @@ describe("the definition update's restart begins a run (DP-1, T4, T12)", () => {
     expect(stepById(leading.stepId).intent).toMatchObject({ launchVersionId: "v1", port: 30000 });
   });
 
+  it("an interactive stop of an earlier launch names that version's author, never the successor's", async () => {
+    // v1 (an agent wrote it) stops in an operator terminal; v2 is a person's.
+    store.versions[0] = {
+      ...(store.versions[0] as Row),
+      editor: "AGENT",
+      spec: {
+        launch: launchOf({
+          commands: [
+            {
+              start: "vendor up",
+              stop: "vendor down",
+              status: "vendor status",
+              interactive: { stop: true },
+            },
+          ],
+        }),
+      },
+    };
+    store.instances = [instance("inst", { phase: "READY" })];
+    addGeneration("inst", 1, { START: { state: "SUCCEEDED" }, READINESS: { state: "SUCCEEDED" } });
+    await restart("inst", { versionId: "v2" });
+    Object.assign(main(), { launchVersionId: "v2", versionId: "v2" });
+    const lc = engine();
+    await lc.runOnce();
+    await lc.stop();
+    const leading = lastFrame("stop");
+    expect(leading).toMatchObject({ generation: 2, launchVersionId: "v1" });
+    expect(leading.operator).toMatchObject({ commandAuthor: "agent" });
+  });
+
   it("T12 control: a never-launched rank's leading stop uses the run's own identity", async () => {
     store.instances = [instance("inst")];
     await restart("inst", { versionId: "v2" });
@@ -1182,9 +1263,7 @@ describe("stop proofs are of the current run, after its launches (F5, R3-B-1, C3
       await releaseClaim(tx, rank().id, now, { result: { stepId: g2.STOP?.id as string } }),
     ).toBe(false);
     // The START ran: never-ran is false.
-    expect(
-      await releaseClaim(tx, rank().id, now, { neverRan: { preAdmissionErrors: new Set() } }),
-    ).toBe(false);
+    expect(await releaseClaim(tx, rank().id, now, { neverRan: true })).toBe(false);
     // A person's release still takes only a claim marked stopped.
     expect(
       await releaseClaim(tx, rank().id, now, { unproven: { by: "u1", reason: "checked" } }),
@@ -1220,7 +1299,7 @@ describe("stop proofs are of the current run, after its launches (F5, R3-B-1, C3
     });
     expect(
       await releaseClaim(tx, rank("never").id, now, {
-        neverRan: { preAdmissionErrors: new Set() },
+        neverRan: true,
       }),
     ).toBe(true);
   });
@@ -1968,5 +2047,289 @@ describe("inventory classification fails closed (R4-B-3)", () => {
     // Control: classified, the same stale record is reported stale and acknowledged.
     const classified = await inventory([inventoryRecord("inst", "stopped", "inst-g1-READINESS")]);
     expect(classified).toEqual({ ok: true, stale: [main().handle] });
+  });
+});
+
+// ── A gang whose head node was deleted (finding 6): its stops name the launch's head address ──
+
+describe("a gang's stops after its head node was deleted", () => {
+  const gang = launchOf({ groupSize: 2, reservations: [] });
+  const RANK1 = { ...RANK0, rank: 1 };
+
+  /** A 2-rank instance stopping after its head's node was deleted; run 1 launched both ranks. */
+  function headless(headAddr: string | null) {
+    store.versions = [{ ...(store.versions[0] as Row), spec: { launch: gang } }];
+    const item = instance("inst", {
+      phase: "STOPPING",
+      desiredState: "STOPPED",
+      fabricId: "fabric-1",
+      Reservations: [],
+    });
+    const head = { ...(item.Ranks[0] as Rank), nodeId: null, claim: "RELEASED", stoppedAt: now };
+    const worker = { ...head, id: "rank-worker", rank: 1, nodeId: "w1", claim: "HELD" };
+    item.Ranks = [head, worker];
+    store.instances = [item];
+    for (const step of generationSteps({
+      instance: { ...INPUT("inst"), fabricId: "fabric-1" },
+      ranks: [RANK0, RANK1],
+      launch: gang,
+      generation: 1,
+      operationId: "op-inst",
+    }))
+      store.steps.push({
+        ...step,
+        id: `old-${step.phase}-${step.rank}`,
+        instanceId: "inst",
+        nodeId: step.rank === 0 ? "head" : "w1",
+        state: "SUCCEEDED",
+        attempts: 1,
+        errorCode: null,
+        // What dispatch records on a multi-node launch (null: dispatched before it did).
+        headAddr: step.phase === "READINESS" ? null : headAddr,
+        createdAt: now,
+        updatedAt: now,
+        operatorTerminalId: null,
+        operatorSince: null,
+        operatorAcceptedAt: null,
+        operatorHold: null,
+      });
+  }
+
+  it("stops the surviving worker with the head address its launch was sent with", async () => {
+    headless("10.0.0.1");
+    const lc = engine();
+    await lc.runOnce();
+    await lc.stop();
+    const stops = framesTo("stop").filter((entry) => entry.nodeId === "w1");
+    expect(stops).toHaveLength(1);
+    expect(stops[0]?.frame).toMatchObject({
+      placeholders: expect.objectContaining({ head_addr: "10.0.0.1" }),
+    });
+    const stored = store.steps.find((step) => step.phase === "STOP" && step.state !== "SUCCEEDED");
+    expect(stored).toMatchObject({ rank: 1, headAddr: "10.0.0.1", state: "RUNNING" });
+  });
+
+  it("a launch recorded without its head address cannot be stopped: a person marks it stopped", async () => {
+    headless(null);
+    const lc = engine();
+    // Every stop and status probe fails locally (no head address): retried, then given up on.
+    for (let tick = 0; tick < 12; tick++) {
+      await lc.runOnce();
+      setNow(new Date(now.getTime() + 10 * 60_000));
+    }
+    await lc.stop();
+    expect(framesTo("stop")).toEqual([]);
+    expect(
+      store.steps.filter((step) => step.phase === "STOP" && step.errorCode === "bad_job").length,
+    ).toBeGreaterThan(0);
+    expect(main("inst").needsOperator).toBe("MARK_STOPPED");
+  });
+
+  it("a multi-node START records the head address it is dispatched with", async () => {
+    store.fabricIps.set("head", "10.0.0.1");
+    store.versions = [{ ...(store.versions[0] as Row), spec: { launch: gang } }];
+    const item = instance("inst", { fabricId: "fabric-1", Reservations: [] });
+    item.Ranks = [
+      item.Ranks[0] as Rank,
+      { ...(item.Ranks[0] as Rank), id: "rank-worker", rank: 1, nodeId: "w1", port: 30001 },
+    ];
+    store.instances = [item];
+    const lc = engine();
+    await lc.runOnce();
+    await lc.stop();
+    const starts = store.steps.filter((step) => step.phase === "START" && step.attempts === 1);
+    expect(starts.map((step) => [step.rank, step.headAddr])).toEqual([
+      [0, "10.0.0.1"],
+      [1, "10.0.0.1"],
+    ]);
+  });
+});
+
+// ── A restart's old rank claim holds until the new run's START is claimed (finding 1) ──
+
+describe("a restart keeps the old run's rank claim until its stop is proven", () => {
+  it("keeps the replaced port and resources as prev* until the new run's START is claimed", async () => {
+    store.instances = [instance("inst", { phase: "READY" })];
+    addGeneration("inst", 1, { START: { state: "SUCCEEDED" }, READINESS: { state: "SUCCEEDED" } });
+    await restart("inst", { port: 30005 });
+    expect(rank()).toMatchObject({
+      port: 30005,
+      prevPort: 30000,
+      prevResources: GB100,
+      prevGeneration: 1,
+      plannedGeneration: 1,
+    });
+    const lc = engine();
+    await lc.runOnce();
+    // The leading stop goes out; nothing of the old claim is dropped before it succeeded.
+    expect(rank().prevPort).toBe(30000);
+    await lc.handleJobResult(REF, ok(lastFrame("stop")));
+    await lc.runOnce();
+    await lc.stop();
+    expect(lastFrame("start")).toMatchObject({ generation: 2 });
+    expect(rank()).toMatchObject({ prevPort: null, prevGeneration: null, prevDistPort: null });
+    expect(rank().prevResources).toBe(DbNull);
+  });
+});
+
+describe("Group C: operator recovery and delivery order", () => {
+  it("an already-claimed stop of an earlier run is not delivered after the successor's START, and releases nothing", async () => {
+    store.instances = [instance("inst", { phase: "STOPPING", desiredState: "STOPPED" })];
+    addGeneration("inst", 1, { START: { state: "SUCCEEDED" }, READINESS: { state: "SUCCEEDED" } });
+    const a = engine();
+    store.afterClaim = async () => {
+      await restart();
+      const b = engine();
+      await b.runOnce();
+      const leading = lastFrame("stop");
+      expect(leading.generation).toBe(2);
+      await b.handleJobResult(REF, ok(leading));
+      await b.runOnce();
+      await b.stop();
+      expect(lastFrame("start").generation).toBe(2);
+    };
+    await a.runOnce();
+    await a.stop();
+    const startIndex = sent.findIndex(
+      (entry) => entry.frame.phase === "start" && entry.frame.generation === 2,
+    );
+    expect(startIndex).toBeGreaterThanOrEqual(0);
+    expect(sent.slice(startIndex + 1).filter((entry) => entry.frame.generation === 1)).toEqual([]);
+    // The undelivered stop went back and its run gate ended it: the successor's claim holds.
+    const c = engine();
+    await c.runOnce();
+    await c.stop();
+    expect(rank().claim).toBe("HELD");
+    expect(
+      stepsOf().filter(
+        (step) => step.generation === 1 && step.phase === "STOP" && step.state === "RUNNING",
+      ),
+    ).toEqual([]);
+  });
+
+  it("a lost awaiting_operator write does not lose the person's accepted run", async () => {
+    store.versions[0] = { ...(store.versions[0] as Row), spec: { launch: interactiveLaunch } };
+    store.instances = [instance("inst")];
+    const lc = engine();
+    await lc.runOnce();
+    const start = lastFrame("start");
+    const terminalId = (start.operator as { terminalId: string }).terminalId;
+    store.failOwners.add("u1");
+    await expect(
+      lc.handleJobResult(REF, result(start, { status: "awaiting_operator", terminalId })),
+    ).rejects.toThrow();
+    store.failOwners.clear();
+    await lc.handleJobResult(REF, result(start, { status: "operator_running", terminalId }));
+    // Recorded as accepted, with the screen's time (the CHECK holds).
+    expect(stepById(start.stepId)).toMatchObject({ state: "RUNNING" });
+    expect(stepById(start.stepId).operatorAcceptedAt).not.toBeNull();
+    expect(stepById(start.stepId).operatorSince).not.toBeNull();
+    closeAnswer = "running";
+    setNow(new Date(now.getTime() + 86_400_000));
+    await lc.runOnce();
+    await lc.stop();
+    expect(errors).toEqual([]);
+    expect(main().needsOperator).toBe("STEP");
+  });
+
+  it("the deadline sweep records a run the relay saw accepted after a lost screen write", async () => {
+    store.versions[0] = { ...(store.versions[0] as Row), spec: { launch: interactiveLaunch } };
+    store.instances = [instance("inst")];
+    const lc = engine();
+    await lc.runOnce();
+    const start = lastFrame("start");
+    const terminalId = (start.operator as { terminalId: string }).terminalId;
+    store.failOwners.add("u1");
+    await expect(
+      lc.handleJobResult(REF, result(start, { status: "awaiting_operator", terminalId })),
+    ).rejects.toThrow();
+    store.failOwners.clear();
+    // operator_running never arrives here; the relay holds the person's run.
+    closeAnswer = "running";
+    setNow(new Date(now.getTime() + 3_600_000));
+    await lc.runOnce();
+    expect(errors).toEqual([]);
+    const step = stepById(start.stepId);
+    expect(step.state).toBe("RUNNING");
+    expect(step.operatorAcceptedAt).not.toBeNull();
+    expect(step.operatorSince).not.toBeNull();
+    // Past its timeout the person is asked to look at it.
+    setNow(new Date(now.getTime() + 86_400_000));
+    await lc.runOnce();
+    await lc.stop();
+    expect(errors).toEqual([]);
+    expect(main().needsOperator).toBe("STEP");
+  });
+
+  it("a stop of a recorded launch reads that launch's version only from the instance's owner", async () => {
+    // A recorded intent naming a version of another owner (never written by the server, but
+    // the lookup must not trust it): its interactive stop is not used.
+    store.versions[1] = {
+      ...(store.versions[1] as Row),
+      ownerId: "u2",
+      spec: {
+        launch: launchOf({
+          commands: [
+            {
+              start: "other up",
+              stop: "other down",
+              status: "other status",
+              interactive: { stop: true },
+            },
+          ],
+        }),
+      },
+    };
+    store.instances = [instance("inst", { phase: "READY" })];
+    addGeneration(
+      "inst",
+      1,
+      { START: { state: "SUCCEEDED" }, READINESS: { state: "SUCCEEDED" } },
+      "v2",
+    );
+    await restart();
+    const lc = engine();
+    await lc.runOnce();
+    await lc.stop();
+    const stop = lastFrame("stop");
+    expect(stop.generation).toBe(2);
+    expect(stop.operator).toBeUndefined();
+  });
+});
+
+describe("an attempt that may have run is never erased by a later refusal", () => {
+  it("a replay refused before admission keeps the claim and stops what the lost dispatch started", async () => {
+    store.instances = [instance("inst")];
+    const lc = engine();
+    await lc.runOnce();
+    const first = lastFrame("start");
+    expect(stepById(first.stepId).attempts).toBe(1);
+    // The first dispatch may have launched a persistent service before its session was lost.
+    await lc.nodeDisconnected(REF);
+    expect(stepById(first.stepId)).toMatchObject({
+      state: "PENDING",
+      attempts: 1,
+      mayHaveRun: true,
+    });
+    await lc.runOnce();
+    const replay = lastFrame("start");
+    expect(replay.stepId).toBe(first.stepId);
+    expect(stepById(replay.stepId).attempts).toBe(2);
+    // The node refuses the replay before admission (a port-range edit makes it a bad job): that
+    // proves only the replay never ran.
+    await lc.handleJobResult(REF, result(replay, { status: "failed", error: "bad_job" }));
+    expect(stepById(replay.stepId)).toMatchObject({
+      state: "FAILED",
+      errorCode: "bad_job",
+      mayHaveRun: true,
+    });
+    await lc.runOnce();
+    await lc.runOnce();
+    await lc.stop();
+    // Held (its reservations with it: they hold while a rank does).
+    expect(main().Ranks.map((row) => row.claim)).toEqual(["HELD"]);
+    // The gang stop goes out, naming the launch the lost dispatch may have started.
+    const stop = lastFrame("stop");
+    expect(stop).toMatchObject({ instanceId: "inst", rank: 0 });
   });
 });

@@ -198,7 +198,7 @@ integration("releasing a claim whose stop cannot be proven, on PostgreSQL", () =
       [USER],
       async (tx) =>
         modules.release.releaseClaim(tx, held.id, new Date(), {
-          neverRan: { preAdmissionErrors: new Set() },
+          neverRan: true,
         }),
       async () => modules.graph.instanceCapacityFences([old.instanceId]),
     );

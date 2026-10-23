@@ -674,6 +674,8 @@
     "always_on_runtime": "An always-on runtime runs on its own; there is nothing to start.",
     "fabric_port_ranges_disjoint": "These nodes' port ranges share no port; make them overlap.",
     "placement_too_complex": "Placing this took too much work. Pin the nodes, or start fewer at once.",
+    "restart_overlap_no_room": "The running instance keeps its memory until its stop is confirmed, and there isn't room for the restart beside it. Stop it first, then start it.",
+    "definition_slots_full": "This node already needs the most definitions it can hold (128). Stop something there first.",
     "identity_mismatch": "The node presented a different identity key."
   },
   "models": {
@@ -1424,6 +1426,7 @@
       "status_not_running": "the status command did not say running"
     },
     "processDetached": "The start command handed its server off (for example `docker compose up -d`), so the node cannot watch or stop it. Use management \"service\" with stop and status commands, and stop what is still running by hand.",
+    "cliUpgradeRequired": "This runtime reserves memory on other nodes, and wsmp on its node is too old to be told which ones. Upgrade wsmp on the node and restart it, then start the runtime again.",
     "needsOperator": {
       "STEP": "A step waits for you",
       "RESTART": "Restart needed",
@@ -1463,7 +1466,8 @@
           "port_held_outside_runtime": "The port is still in use, though nothing is left in the service's units: usually something it started (a container or a daemon) runs outside them",
           "unowned_service": "The service runs outside the node's control and has no status command",
           "not_stopped": "The node couldn't confirm it (update the node if this keeps happening)"
-        }
+        },
+        "alsoHeld": "Also held until the stop is confirmed or you release it"
       },
       "held": {
         "pill": "Resources held until the stop is confirmed",
@@ -1548,6 +1552,8 @@
       "always_on_runtime": "Always-on runtimes run on their own; there is nothing to start.",
       "fabric_port_ranges_disjoint": "The nodes' port ranges share no port for the dist port.",
       "placement_too_complex": "Placing this start took too much work (many nodes, reservations or stops to try). Pin the nodes, or start fewer at once.",
+      "restart_overlap_no_room": "The running instance keeps its memory, GPUs and ports until its stop is confirmed, and the node has no room for the restart beside them. Stop it first and start it once the stop is confirmed, free room on the node, or restart with resources that fit.",
+      "definition_slots_full": "The node already needs 128 runtime definitions for what runs or is stopping there. Stop an instance on it, or wait for restarts to finish.",
       "cap_currency_has_spend": "The cap's currency must be the one this share has spent in this month.",
       "already_shared": "This pool is already shared with this person. Change the existing share.",
       "invite_pending": "This e-mail already has a pending invite. Resend it instead.",
@@ -2057,7 +2063,13 @@
         "untrustedNamed": "Written by the agent {{agent}}. wsmp did not check any of it.",
         "command": "Command it ran",
         "loadFailed": "Couldn't load the agent's request. It may have been withdrawn or have expired."
-      }
+      },
+      "alsoFreed": "Releasing also frees"
+    },
+    "heldFootprint": {
+      "previousClaim": "Port {{port}} and {{memory}} on {{node}}, kept for the run a restart replaced",
+      "reservation": "{{memory}} on {{node}}",
+      "supersededReservation": "{{memory}} on {{node}}, kept for the run a restart replaced"
     }
   },
   "overview": {

@@ -30,11 +30,11 @@ import { loadAgentNames } from "../lib/agent-names";
 import { type CallerActor, callerActor } from "../lib/caller-actor";
 import { RELEASE_REQUEST_TTL_MS, releaseClaim } from "../lib/claim-release";
 import { graphWrite, instanceCapacityFences } from "../lib/graph-write";
+import { agentBlockedNode, OCCUPANCY_SELECT } from "../lib/instance-occupancy";
 import { readLiveLoad } from "../lib/live-load";
 import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
 import { isHiddenCodePoint } from "../lib/runtime-spec";
-import { effectiveTrust } from "../lib/runtime-store";
-import { INSTANCE_INCLUDE, instanceView } from "../lib/runtime-views";
+import { INSTANCE_INCLUDE, instanceView, loadStepVersions } from "../lib/runtime-views";
 import {
   latestStopChecks,
   nodeConnectionView,
@@ -137,6 +137,7 @@ function evidenceOf(value: Prisma.JsonValue | null): Evidence[] {
 const RANK_SELECT = {
   id: true,
   rank: true,
+  nodeId: true,
   claim: true,
   markedStoppedAt: true,
   Node: {
@@ -161,6 +162,8 @@ async function ownedRank(tx: Tx, userId: string, instanceId: string, nodeNumber:
       phase: true,
       phaseChangedAt: true,
       Ranks: { where: { rank: nodeNumber - 1 }, select: RANK_SELECT },
+      // The memory the rank's claim keeps on other nodes (agents' trust checks).
+      Reservations: OCCUPANCY_SELECT.Reservations,
     },
   });
   if (!instance) throw notFound("That instance does not exist.");
@@ -267,6 +270,7 @@ async function instanceResult(context: SignedInContext, userId: string, instance
     row,
     await latestStopChecks(prisma, [row]),
     readLiveLoad(context.services?.liveLoad, [row.id]),
+    await loadStepVersions(prisma, userId, [row]),
   );
 }
 
@@ -365,7 +369,12 @@ export const runtimeReleaseRequests = {
       return await graphWrite(
         [userId],
         async (tx) => {
-          const { rank } = await ownedRank(tx, userId, input.instanceId, input.nodeNumber);
+          const { instance, rank } = await ownedRank(
+            tx,
+            userId,
+            input.instanceId,
+            input.nodeNumber,
+          );
           if (rank.claim !== "HELD_UNKNOWN") {
             if (rank.claim === "HELD")
               throw refuse(
@@ -376,11 +385,12 @@ export const runtimeReleaseRequests = {
             throw notMarkedStopped(rank.claim);
           }
           // Agents act on Full-control nodes only, as with marking it stopped (a removed node
-          // counts as not Full).
-          if (!rank.Node || effectiveTrust(rank.Node) !== "FULL")
+          // counts as not Full): the rank's and the reservations' it keeps memory on.
+          const blocked = agentBlockedNode({ Ranks: [rank], Reservations: instance.Reservations });
+          if (blocked)
             throw refuseAbout(
               "trust_relay",
-              rank.Node?.id ?? input.instanceId,
+              blocked.nodeId ?? input.instanceId,
               "Agents may only ask about parts on nodes at Full control. A person can release it in the browser.",
             );
           // A pending request past its expiry gives its slot back now.

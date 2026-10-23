@@ -13,6 +13,7 @@ function node(id: string, overrides: Partial<PlanNode> = {}): PlanNode {
     hold: { holdAt: null, holdProfileId: null },
     portRange: [30000, 30002],
     heldVersionIds: new Set(),
+    requiredVersionIds: new Set(),
     memoryGb: 64,
     gpus: [],
     liveFreeMemoryGb: null,
@@ -152,6 +153,108 @@ describe("profilePlan", () => {
     expect(plan.preview.starts).toEqual([]);
   });
 
+  it("stops a matching instance whose reservation is on a hold-line node", () => {
+    const old = claimant("existing", "a", 30000, { kind: "unified", memoryGb: 40 });
+    old.runtimeId = "rt-1";
+    old.ranks = [
+      ...old.ranks,
+      {
+        nodeId: "b",
+        port: 0,
+        distPort: null,
+        resources: { kind: "unified", memoryGb: 40 },
+        claim: "HELD",
+        reservation: true,
+      },
+    ];
+    const plan = profilePlan(
+      input({
+        owned: [
+          { nodeId: "a", hold: false, holdNote: null },
+          { nodeId: "b", hold: true, holdNote: null },
+        ],
+        instances: [
+          {
+            id: old.id,
+            runtimeId: "rt-1",
+            launchVersionId: "v-1",
+            desiredRunning: true,
+            rankNodeIds: ["a"],
+            reservationNodeIds: ["b"],
+          },
+        ],
+        claimants: [old],
+      }),
+    );
+    expect(plan.preview.refusals).toEqual([]);
+    expect(plan.preview.kept).not.toContain(old.id);
+    expect(plan.preview.stops).toEqual([
+      { instanceId: old.id, runtimeId: "rt-1", reason: "profile_owned_node" },
+    ]);
+  });
+
+  it("keeps a matching instance whose reservation is on another owned node, whatever the item pins", () => {
+    const plan = profilePlan(
+      input({
+        items: [
+          {
+            id: "it-1",
+            position: 0,
+            runtimeId: "rt-1",
+            versionId: "v-1",
+            count: 1,
+            nodeIds: ["a"],
+          },
+        ],
+        instances: [
+          {
+            id: "i-keep",
+            runtimeId: "rt-1",
+            launchVersionId: "v-1",
+            desiredRunning: true,
+            rankNodeIds: ["a"],
+            reservationNodeIds: ["b"],
+          },
+        ],
+      }),
+    );
+    expect(plan.preview.kept).toEqual(["i-keep"]);
+    expect(plan.preview.stops).toEqual([]);
+  });
+
+  it("stops an instance from outside the profile that reserves an owned node; an agent only when its head is Full", () => {
+    const outside = {
+      id: "i-outside",
+      runtimeId: "rt-1",
+      launchVersionId: "v-1",
+      desiredRunning: true,
+      rankNodeIds: ["elsewhere"],
+      reservationNodeIds: ["a"],
+    };
+    const plan = profilePlan(input({ instances: [outside] }));
+    expect(plan.preview.kept).toEqual([]);
+    expect(plan.preview.stops.map((stop) => stop.instanceId)).toEqual(["i-outside"]);
+    expect(plan.preview.refusals).toEqual([]);
+    const agent = profilePlan(
+      input({ agentRules: true, instances: [{ ...outside, agentBlockedNodeId: "elsewhere" }] }),
+    );
+    expect(agent.preview.refusals).toEqual([
+      expect.objectContaining({ reason: "trust_relay", subjectId: "elsewhere" }),
+    ]);
+    // An owned Relay-only node is refused once, by the owned-node rule.
+    const owned = profilePlan(
+      input({
+        agentRules: true,
+        nodes: new Map([
+          ["a", { ...node("a"), trust: "RELAY" as const }],
+          ["b", node("b")],
+        ]),
+        instances: [{ ...outside, agentBlockedNodeId: "a" }],
+      }),
+    );
+    expect(owned.preview.refusals.filter((r) => r.reason === "trust_relay")).toHaveLength(1);
+  });
+
   it("frees memory of stopped instances but keeps their ports taken", () => {
     const plan = profilePlan(
       input({
@@ -182,6 +285,31 @@ describe("profilePlan", () => {
       }),
     );
     expect(plan.preview.refusals[0]?.reason).toBe("not_enough_memory");
+  });
+
+  it("refuses definition_slots_full when every node already requires 128 definitions", () => {
+    const full = new Set(Array.from({ length: 128 }, (_, index) => `v-other-${index}`));
+    const plan = profilePlan(
+      input({
+        nodes: new Map([
+          ["a", node("a", { requiredVersionIds: full })],
+          ["b", node("b", { requiredVersionIds: full })],
+        ]),
+      }),
+    );
+    expect(plan.preview.starts).toEqual([]);
+    expect(plan.preview.refusals[0]?.reason).toBe("definition_slots_full");
+    // One node with a free slot takes it.
+    const one = profilePlan(
+      input({
+        nodes: new Map([
+          ["a", node("a", { requiredVersionIds: full })],
+          ["b", node("b")],
+        ]),
+      }),
+    );
+    expect(one.preview.refusals).toEqual([]);
+    expect(one.preview.starts[0]?.placements[0]?.nodeId).toBe("b");
   });
 
   it("holds hold-line nodes, stops what runs there and never places there", () => {

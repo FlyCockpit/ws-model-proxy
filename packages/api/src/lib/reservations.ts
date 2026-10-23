@@ -11,11 +11,14 @@
  * A restart that places reservations elsewhere (or shrinks or removes them) while the old run
  * may still be running keeps the old rows as superseded (`supersededGeneration`): they hold
  * (with the rank) until a START of the new run is claimed, which happens only after the new
- * run's leading STOP proved the old run stopped. Readers that count memory read every row;
- * readers that describe the current plan (the watch for offline nodes, the instance view,
- * restart preferences) read `CURRENT_RESERVATION_WHERE` rows only.
+ * run's leading STOP proved the old run stopped. A rank's own claim is kept the same way, on the
+ * rank (`prev*`, `retakeInstanceClaims`). Readers that count memory read every row and overlap
+ * an instance's old and new claims on a node (`claim-overlap.ts`); readers that describe the
+ * current plan (the watch for offline nodes, the instance view, restart preferences) read
+ * `CURRENT_RESERVATION_WHERE` rows only.
  */
 import type { Prisma } from "@ws-model-proxy/db";
+import { DbNull } from "@ws-model-proxy/db/json-null";
 import { canonicalJson } from "./canonical-json";
 import { clearInstanceReleaseRequests } from "./claim-release";
 import { beginRun, RUN_START_PHASES } from "./instance-run";
@@ -70,19 +73,33 @@ function declared(resources: unknown): string {
   return canonicalJson(rest);
 }
 
+/** What `heldClaimsMatch` reads of a held rank claim: what it holds, and where. */
+export type HeldRankClaim = {
+  rank: number;
+  resources: unknown;
+  port: number;
+  distPort: number | null;
+  /** The rank's node (labels the launch's labels must be among); null once deleted. */
+  Node: { labels: readonly string[] } | null;
+};
+
 /**
- * Whether an instance's held claims are exactly what a spec claims: one rank claim per rank
- * with that rank's resource declaration, and the current reservation rows with each entry's
- * labels and resources. A restart that keeps the instance's claims where they are and as they
- * are (a definition update's "restart running") is only for a version claiming the same as
- * what the instance HOLDS, which an older version spec does not prove (a claim taken for an
- * earlier version stays as it was taken). Anything else is placed, with the planner's capacity
- * check, by a start (runtime_start with the instance id). An unreadable spec matches nothing.
+ * Whether an instance's held claims are exactly what a spec claims, and where they are satisfies
+ * everything else the spec asks of a placement: one rank claim per rank with that rank's
+ * resource declaration, on a node with the launch's labels, on the launch's fixed port when it
+ * fixes one, with a dist port when it is multi-node, in the fabric it names (by name: `fabric`,
+ * the instance's fabric); and the current reservation rows with each entry's labels and
+ * resources. A restart that keeps the instance's claims where they are and as they are (a
+ * definition update's "restart running") is only for a version claiming the same as what the
+ * instance HOLDS, which an older version spec does not prove (a claim taken for an earlier
+ * version stays as it was taken). Anything else is placed, with the planner's checks, by a start
+ * (runtime_start with the instance id). An unreadable spec matches nothing.
  */
 export function heldClaimsMatch(
   spec: unknown,
-  ranks: ReadonlyArray<{ rank: number; resources: unknown }>,
+  ranks: ReadonlyArray<HeldRankClaim>,
   reservations: ReadonlyArray<{ index: number; labels: unknown; resources: unknown }>,
+  fabric: { name: string } | null,
 ): boolean {
   const parsed = runtimeSpecSchema.safeParse(spec);
   const launch = parsed.success ? parsed.data.launch : undefined;
@@ -93,6 +110,16 @@ export function heldClaimsMatch(
     const want = launch.resources[launch.resources.length === 1 ? 0 : index];
     if (rank.rank !== index || !want || declared(rank.resources) !== canonicalJson(want))
       return false;
+    // Placement-affecting parts of the launch, against where the claim is.
+    if (launch.port && rank.port !== launch.port.fixed) return false;
+    if (!rank.Node || !launch.labels.every((label) => rank.Node?.labels.includes(label)))
+      return false;
+    if (launch.groupSize > 1 && rank.distPort === null) return false;
+  }
+  if (launch.groupSize > 1) {
+    // One fabric, the named one when the launch names it.
+    if (!fabric || (launch.fabric !== undefined && fabric.name !== launch.fabric)) return false;
+    if (new Set(byRank.map((rank) => rank.distPort)).size !== 1) return false;
   }
   const entries = launchReservations(launch);
   if (reservations.length !== entries.length) return false;
@@ -276,16 +303,136 @@ function retakenClaim(now: Date) {
   } as const satisfies Prisma.InstanceRankUpdateManyMutationInput;
 }
 
+/** A rank's claim as `retakeInstanceClaims` reads it before and after the retake. */
+const RANK_CLAIM_SELECT = {
+  id: true,
+  rank: true,
+  claim: true,
+  resources: true,
+  port: true,
+  distPort: true,
+  plannedGeneration: true,
+  prevResources: true,
+  prevPort: true,
+  prevDistPort: true,
+  prevGeneration: true,
+} as const satisfies Prisma.InstanceRankSelect;
+
+type RankClaimRow = Prisma.InstanceRankGetPayload<{ select: typeof RANK_CLAIM_SELECT }>;
+
+/** What a rank's claim holds: its resources (with the GPUs the planner picked) and ports. */
+function rankClaimKey(claim: {
+  resources: unknown;
+  port: number | null;
+  distPort: number | null;
+}): string {
+  return canonicalJson([claim.resources ?? null, claim.port ?? null, claim.distPort ?? null]);
+}
+
+/**
+ * Keeps each rank's claim of a run that may still be running (`prev*`), next to the claim the
+ * new run `run` just wrote over it (`before`: the ranks as they were). Per rank:
+ * - its claim was RELEASED (proven stopped, or released by a person): nothing of an earlier run
+ *   holds anything there, so no previous claim is kept;
+ * - its current claim may be in use (a start step of the rank of a later generation than the
+ *   one the claim was planned at was dispatched) and the new claim differs: the current claim
+ *   becomes the previous one, at `run - 1` (it holds until a START of generation `run` or later
+ *   is claimed, `dropSupersededHolds`);
+ * - otherwise the previous claim stays as it was (a current claim that never ran replaces
+ *   nothing that runs).
+ * A changed claim is planned at `run - 1`, and so is one retaken after it was RELEASED; an
+ * unchanged held one keeps its plan (it may still be in use by the run it was taken for). At most one previous claim per rank: it goes when the first start
+ * step of a later run is claimed, and only a claim dispatched after that can become previous
+ * again. Both being needed at once would break that order, so it throws rather than drop a hold.
+ */
+async function keepPreviousRankClaims(
+  tx: Prisma.TransactionClient,
+  instanceId: string,
+  before: readonly RankClaimRow[],
+  run: number,
+): Promise<void> {
+  const latest = run - 1;
+  const after = new Map(
+    (
+      await tx.instanceRank.findMany({
+        where: { instanceId },
+        select: { id: true, resources: true, port: true, distPort: true },
+      })
+    ).map((rank) => [rank.id, rank]),
+  );
+  for (const old of before) {
+    const now = after.get(old.id);
+    if (!now) continue;
+    const changed = rankClaimKey(old) !== rankClaimKey(now);
+    const kept =
+      old.prevPort === null || old.prevGeneration === null
+        ? null
+        : {
+            resources: old.prevResources,
+            port: old.prevPort,
+            distPort: old.prevDistPort,
+            generation: old.prevGeneration,
+          };
+    let previous = kept;
+    const released = old.claim === "RELEASED";
+    if (released) previous = null;
+    else if (changed) {
+      const dispatched =
+        (
+          await tx.instanceStep.aggregate({
+            where: {
+              instanceId,
+              rank: old.rank,
+              phase: { in: [...RUN_START_PHASES] },
+              attempts: { gt: 0 },
+            },
+            _max: { generation: true },
+          })
+        )._max.generation ?? 0;
+      if (dispatched > old.plannedGeneration) {
+        if (kept)
+          throw new Error(
+            "A rank's previous claim is still held while its current claim was dispatched.",
+          );
+        previous = {
+          resources: old.resources,
+          port: old.port,
+          distPort: old.distPort,
+          generation: latest,
+        };
+      }
+    }
+    // A claim retaken after it was RELEASED is planned for this run whether or not it changed:
+    // what an earlier dispatch used of it stopped (proven or released by a person), so no
+    // earlier dispatch may make it a previous claim again.
+    const planned = changed || released ? latest : old.plannedGeneration;
+    if (!changed && previous === kept && planned === old.plannedGeneration) continue;
+    await tx.instanceRank.update({
+      where: { id: old.id },
+      data: {
+        prevResources: previous ? ((previous.resources ?? {}) as Prisma.InputJsonValue) : DbNull,
+        prevPort: previous?.port ?? null,
+        prevDistPort: previous?.distPort ?? null,
+        prevGeneration: previous?.generation ?? null,
+        plannedGeneration: planned,
+      },
+    });
+  }
+}
+
 /**
  * The one retake of an existing instance's claims by a new run: the engine's automatic restart
  * and a person's or agent's restart (`writePlannedStarts`). The new run begins first
  * (`beginRun`, returned): from this commit on, nothing of an earlier run is dispatched and its
  * answers release nothing. `writeRanks` writes the ranks with
- * `claim` (plus what the run changes: ports, resources, the instances it waits for); then the
- * instance's reservations become `reservations` (`replaceInstanceReservations`: whether the old
- * run had stopped is read before the ranks are retaken, so a run proven stopped leaves no row,
- * superseded ones included, that the retaken claim would hold again); then the old run's
- * pending release requests end. Callers hold the owner fence and the instance's capacity fence.
+ * `claim` (plus what the run changes: ports, resources, the instances it waits for); then each
+ * rank keeps the claim it replaced while that may still be in use (`keepPreviousRankClaims`),
+ * and the instance's reservations become `reservations` (`replaceInstanceReservations`): what
+ * the old run held stays held until its stop is proven, overlapping the new claims. Whether the
+ * old run had stopped is read before the ranks are retaken, so a run proven stopped leaves no
+ * row or previous claim, superseded ones included, that the retaken claim would hold again.
+ * Then the old run's pending release requests end. Callers hold the owner fence and the
+ * instance's capacity fence.
  */
 export async function retakeInstanceClaims(
   tx: Prisma.TransactionClient,
@@ -297,13 +444,13 @@ export async function retakeInstanceClaims(
   },
 ): Promise<number> {
   const run = await beginRun(tx, input.instanceId);
-  const oldRunStopped = (
-    await tx.instanceRank.findMany({
-      where: { instanceId: input.instanceId },
-      select: { claim: true },
-    })
-  ).every((rank) => rank.claim === "RELEASED");
+  const before = await tx.instanceRank.findMany({
+    where: { instanceId: input.instanceId },
+    select: RANK_CLAIM_SELECT,
+  });
+  const oldRunStopped = before.every((rank) => rank.claim === "RELEASED");
   await input.writeRanks(retakenClaim(input.now));
+  await keepPreviousRankClaims(tx, input.instanceId, before, run);
   await replaceInstanceReservations(tx, input.instanceId, input.reservations, oldRunStopped, run);
   // The claims are held by the new run: a request to release the old one has nothing left.
   await clearInstanceReleaseRequests(tx, input.instanceId, input.now);
@@ -312,15 +459,19 @@ export async function retakeInstanceClaims(
 
 /**
  * A START of run `generation` is being claimed: its leading STOP succeeded (after every earlier
- * launch of the rank was answered), so the runs that superseded reservations belonged to have
- * stopped and those rows go.
+ * launch of the rank was answered), so the runs whose holds a restart kept have stopped: their
+ * superseded reservation rows go, and so do the ranks' previous claims (`prev*`) kept for them.
  */
-export async function dropSupersededReservations(
+export async function dropSupersededHolds(
   tx: Prisma.TransactionClient,
   instanceId: string,
   generation: number,
 ): Promise<void> {
   await tx.instanceReservation.deleteMany({
     where: { instanceId, supersededGeneration: { lt: generation } },
+  });
+  await tx.instanceRank.updateMany({
+    where: { instanceId, prevGeneration: { lt: generation } },
+    data: { prevResources: DbNull, prevPort: null, prevDistPort: null, prevGeneration: null },
   });
 }

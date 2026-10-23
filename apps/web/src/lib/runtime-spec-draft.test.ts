@@ -237,6 +237,49 @@ describe("runtime spec draft", () => {
       "resource",
       "memoryGb",
     ]);
+    expect(draftPathOf(["launch", "reservations", 0, "resources", "vendor"])).toEqual([
+      "reservations",
+      0,
+      "resource",
+      "vendor",
+    ]);
+  });
+
+  it("round-trips a discrete reservation's GPU vendor", () => {
+    const spec = {
+      launch: {
+        management: "service",
+        groupSize: 1,
+        resources: [{ kind: "unified", memoryGb: 100 }],
+        labels: ["ds-head"],
+        reservations: [
+          {
+            labels: ["ds-worker"],
+            resources: { kind: "discrete", gpuCount: 2, vramGb: 80, vendor: "nvidia" },
+          },
+        ],
+        commands: [{ start: "up", stop: "down", status: "check" }],
+        health: HEALTH,
+      },
+    };
+    expect(runtimeSpecSchema.safeParse(spec).success).toBe(true);
+    const draft = losslessDraft(spec, "STARTABLE");
+    expect(draft?.reservations[0]?.resource.vendor).toBe("nvidia");
+    if (!draft) return;
+    expect(draftToSpec(draft, spec, "STARTABLE")).toEqual(spec);
+    // Back to "any vendor": the key is dropped, not written empty.
+    const [reservation] = draft.reservations;
+    const anyVendor = draftToSpec(
+      {
+        ...draft,
+        reservations: [{ ...reservation, resource: { ...reservation.resource, vendor: "" } }],
+      },
+      spec,
+      "STARTABLE",
+    );
+    expect(anyVendor.launch?.reservations).toEqual([
+      { labels: ["ds-worker"], resources: { kind: "discrete", gpuCount: 2, vramGb: 80 } },
+    ]);
   });
 
   it("round-trips reservations, edits them, and points their issues at their inputs", () => {

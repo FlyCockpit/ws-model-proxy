@@ -16,6 +16,36 @@ export const MOBILE_KEYBOARD_DISMISS_GROWTH_PX = 160;
 
 const PINCH_ZOOM_SCALE_EPSILON = 0.01;
 
+/**
+ * CSS variable on <html>: how much of the bottom of the viewport the software keyboard covers
+ * (0px while it is closed). Content that must stay above the keyboard (the terminal) subtracts it.
+ */
+export const KEYBOARD_INSET_VAR = "--keyboard-inset";
+
+/**
+ * The height the software keyboard covers: the part of the layout viewport below the visual
+ * viewport, from current geometry only. It is not the open/closed decision that hides the
+ * BottomNav (that one is deliberately conservative: mobile widths, an editable focus): a keyboard
+ * still covers the page after a rotation past the mobile breakpoint or while focus moves. A
+ * browser that shrinks the layout viewport for the keyboard leaves nothing covered (0).
+ */
+export function keyboardInsetPx(
+  layoutViewportHeight: number,
+  visualViewportHeight: number,
+  visualViewportOffsetTop: number,
+  visualViewportScale = 1,
+): number {
+  // Pinch-zoomed, the visual viewport is a magnified part of the page: its height times the
+  // scale is the screen height it fills, so the rest of the layout height is what the keyboard
+  // covers. Deliberately the keyboard's height, not the part of the layout below the zoomed view:
+  // the page keeps its unzoomed layout while zoomed (fitting it to a panned, magnified view would
+  // resize the terminal, and its PTY, on every pan), so where the view is panned does not count.
+  const covered = isPinchZoomed(visualViewportScale)
+    ? layoutViewportHeight - visualViewportHeight * visualViewportScale
+    : layoutViewportHeight - visualViewportHeight - visualViewportOffsetTop;
+  return Math.min(layoutViewportHeight, Math.max(0, Math.round(covered)));
+}
+
 /** Input types that typically summon a software keyboard on mobile. */
 const KEYBOARD_INPUT_TYPES = new Set([
   "",
@@ -216,6 +246,14 @@ export function useMobileKeyboard(): boolean {
         scale: geometry.scale,
         orientation: geometry.orientation,
       };
+      // From current geometry on every event, zoomed or not (see keyboardInsetPx).
+      const inset = keyboardInsetPx(
+        window.innerHeight,
+        geometry.height,
+        window.visualViewport?.offsetTop ?? 0,
+        geometry.scale,
+      );
+      document.documentElement.style.setProperty(KEYBOARD_INSET_VAR, `${inset}px`);
       setKeyboardOpen(decision.isKeyboardOpen);
     };
 
@@ -233,6 +271,8 @@ export function useMobileKeyboard(): boolean {
 
     const visualViewport = window.visualViewport;
     visualViewport?.addEventListener("resize", evaluate);
+    // The inset also reads offsetTop, which changes on visual viewport scroll alone.
+    visualViewport?.addEventListener("scroll", evaluate);
     window.addEventListener("resize", evaluate);
     window.addEventListener("orientationchange", evaluate);
     document.addEventListener("focusin", evaluate);
@@ -242,11 +282,13 @@ export function useMobileKeyboard(): boolean {
 
     return () => {
       visualViewport?.removeEventListener("resize", evaluate);
+      visualViewport?.removeEventListener("scroll", evaluate);
       window.removeEventListener("resize", evaluate);
       window.removeEventListener("orientationchange", evaluate);
       document.removeEventListener("focusin", evaluate);
       document.removeEventListener("focusout", onFocusOut);
       virtualKeyboard?.removeEventListener("geometrychange", evaluate);
+      document.documentElement.style.removeProperty(KEYBOARD_INSET_VAR);
     };
   }, []);
 

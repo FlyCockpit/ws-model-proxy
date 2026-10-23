@@ -13,8 +13,10 @@ import {
   instanceCapacityFences,
   runtimeCapacityFences,
 } from "../lib/graph-write";
+import { agentBlockedNode, currentReservations, OCCUPANCY_SELECT } from "../lib/instance-occupancy";
 import { beginRun, resolveRun } from "../lib/instance-run";
 import { readLiveLoad } from "../lib/live-load";
+import { requiredDefinitionsByNode } from "../lib/node-definitions";
 import {
   isForeignKeyViolation,
   isUniqueViolation,
@@ -24,15 +26,11 @@ import {
 } from "../lib/refuse";
 import { jsonObject } from "../lib/registry-view";
 import { type RequestCompat, storedRequestCompat } from "../lib/request-compat";
-import {
-  CURRENT_RESERVATION_WHERE,
-  heldClaimsMatch,
-  launchIdentity,
-  reservationsKey,
-} from "../lib/reservations";
+import { heldClaimsMatch, launchIdentity, reservationsKey } from "../lib/reservations";
 import { RUNTIME_PRESET_LIST } from "../lib/runtime-presets";
 import {
   authoredRuntimeSpecSchema,
+  RUNTIME_DEFINITIONS_MAX,
   type RuntimeSpec,
   runtimeSpecSchema,
   runtimeSpecWarnings,
@@ -43,7 +41,6 @@ import {
   applyLimitsPatch,
   createVersion,
   derivedColumns,
-  effectiveTrust,
   type LimitColumns,
   ownedNode,
   specIsInteractive,
@@ -53,6 +50,7 @@ import {
 import {
   INSTANCE_INCLUDE,
   instanceView,
+  loadStepVersions,
   previousLaunchHashes,
   RUNTIME_SUMMARY_INCLUDE,
   type RuntimeSummaryRow,
@@ -65,6 +63,7 @@ import {
 } from "../lib/runtime-views";
 import { deliverInvite, writeInvite } from "../lib/share-invite-write";
 import { latestStopChecks, stopCheckKey } from "../lib/stop-evidence";
+import { effectiveTrust } from "../nodes/trust";
 import { normalizeBaseUrl, parseDetectedServers } from "../nodes/views";
 import { runtimeStart, runtimeStop } from "./runtime-lifecycle";
 import { runtimeReleaseRequests, runtimeReleaseUnproven } from "./runtime-release";
@@ -410,6 +409,7 @@ export const runtimesRouter = {
       }),
     ]);
     const stopChecks = await latestStopChecks(prisma, instances);
+    const stepVersions = await loadStepVersions(prisma, userId, instances);
     const liveLoad = readLiveLoad(
       context.services?.liveLoad,
       instances.map((row) => row.id),
@@ -434,7 +434,7 @@ export const runtimesRouter = {
       current: versionDetail(current, previous, factsFrom),
       requestProfile: profile ? requestProfileView(profile) : null,
       servedModels: models.map(runtimeModelView),
-      instanceList: instances.map((row) => instanceView(row, stopChecks, liveLoad)),
+      instanceList: instances.map((row) => instanceView(row, stopChecks, liveLoad, stepVersions)),
       shares: shares.map((share) => ({ id: share.id, email: share.Grantee.email })),
       contributions: models.flatMap((model) =>
         model.Members.filter((member) => member.shareId !== null).map((member) => ({
@@ -619,7 +619,11 @@ export const runtimesRouter = {
     const restarted: string[] = [];
     const needsRestart: Array<{
       instanceId: string;
-      reason: "launch_changed" | "trust_relay" | "interactive_needs_person";
+      reason:
+        | "launch_changed"
+        | "trust_relay"
+        | "interactive_needs_person"
+        | "definition_slots_full";
     }> = [];
     const { version, operationId } = await graphWrite(
       [userId],
@@ -636,21 +640,46 @@ export const runtimesRouter = {
             LaunchVersion: { select: { launchHash: true, spec: true } },
             Ranks: {
               select: {
-                rank: true,
-                claim: true,
+                ...OCCUPANCY_SELECT.Ranks.select,
+                // Where the claim is, for `heldClaimsMatch`: its port, dist port, node labels.
+                Node: { select: { ...OCCUPANCY_SELECT.Ranks.select.Node.select, labels: true } },
                 resources: true,
-                Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } },
+                port: true,
+                distPort: true,
               },
               orderBy: { rank: "asc" },
             },
-            // What the instance holds now (not a replaced run's superseded rows).
+            Fabric: { select: { name: true } },
+            // Every row (superseded ones still hold for agents' trust checks); what the
+            // instance claims now is the current rows (`currentReservations`).
             Reservations: {
-              where: CURRENT_RESERVATION_WHERE,
-              select: { index: true, labels: true, resources: true },
+              select: { ...OCCUPANCY_SELECT.Reservations.select, labels: true, resources: true },
               orderBy: { index: "asc" },
             },
           },
         });
+        // A restart makes each of its Full-control nodes require the new version beside the old
+        // one (still running until its stop is proven): it must fit among the definitions each
+        // node already requires (`RUNTIME_DEFINITIONS_MAX`). Counted once per node.
+        const required =
+          input.restartRunning && runtime.origin === "SERVER"
+            ? await requiredDefinitionsByNode(tx, {
+                userId,
+                nodeIds: instances.flatMap((instance) =>
+                  instance.Ranks.flatMap((rank) => (rank.Node ? [rank.Node.id] : [])),
+                ),
+              })
+            : null;
+        const withNewVersion = new Set<string>();
+        const definitionSlotsFull = (ranks: (typeof instances)[number]["Ranks"]) =>
+          required !== null &&
+          ranks.some(
+            (rank) =>
+              rank.Node !== null &&
+              effectiveTrust(rank.Node) === "FULL" &&
+              !withNewVersion.has(rank.Node.id) &&
+              (required.get(rank.Node.id)?.size ?? 0) >= RUNTIME_DEFINITIONS_MAX,
+          );
         for (const instance of instances) {
           // Always-on: the address is the launch; nothing to restart. A started instance adopts
           // live only when what it launched has the new launch hash (an earlier launch change it
@@ -666,21 +695,34 @@ export const runtimesRouter = {
             !input.restartRunning ||
             // The restart below keeps its claims where they are and as they are: only when what
             // the instance holds (its rank claims and reservation rows, not its version's spec)
-            // is what the new version claims. Other resources or reservations are placed, with
-            // the planner's capacity check, only by a start (runtime_start with the instance id).
-            !heldClaimsMatch(spec, instance.Ranks, instance.Reservations) ||
+            // is what the new version claims, and where they are (ports, node labels, fabric)
+            // satisfies it. Other resources, reservations, a changed fixed port or fabric are
+            // placed, with the planner's checks, only by a start (runtime_start with the
+            // instance id).
+            !heldClaimsMatch(
+              spec,
+              instance.Ranks,
+              currentReservations(instance.Reservations),
+              instance.Fabric,
+            ) ||
             // Released claims (failed, stopped ranks) are re-placed by a start, not here.
             instance.Ranks.some((rank) => rank.claim !== "HELD")
           )
             needsRestart.push({ instanceId: instance.id, reason: "launch_changed" });
-          else if (
-            agent &&
-            instance.Ranks.some((rank) => !rank.Node || effectiveTrust(rank.Node) !== "FULL")
-          )
+          // Every node the restart reaches: the ranks' and the reservations' (a worker lowered
+          // to Relay only after placement, a replaced run's worker still holding).
+          else if (agent && agentBlockedNode(instance))
             needsRestart.push({ instanceId: instance.id, reason: "trust_relay" });
           else if (agent && specIsInteractive(spec))
             needsRestart.push({ instanceId: instance.id, reason: "interactive_needs_person" });
-          else restarted.push(instance.id);
+          else if (definitionSlotsFull(instance.Ranks))
+            needsRestart.push({ instanceId: instance.id, reason: "definition_slots_full" });
+          else {
+            restarted.push(instance.id);
+            for (const rank of instance.Ranks)
+              if (rank.Node && effectiveTrust(rank.Node) === "FULL")
+                withNewVersion.add(rank.Node.id);
+          }
         }
 
         const created = await createVersion(tx, {
@@ -865,14 +907,9 @@ export const runtimesRouter = {
               phase: true,
               phaseChangedAt: true,
               Ranks: {
-                select: {
-                  id: true,
-                  rank: true,
-                  claim: true,
-                  markedStoppedAt: true,
-                  Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } },
-                },
+                select: { ...OCCUPANCY_SELECT.Ranks.select, id: true, markedStoppedAt: true },
               },
+              Reservations: OCCUPANCY_SELECT.Reservations,
             },
           });
           if (!instance) throw notFound("That instance does not exist.");
@@ -885,15 +922,15 @@ export const runtimesRouter = {
             throw new ORPCError("CONFLICT", {
               message: await markStoppedConflict(tx, instance, input.nodeNumber),
             });
-          // Agents mark stopped only on Full-control nodes (a node that left counts as not Full).
-          if (agent)
-            for (const rank of ranks)
-              if (!rank.Node || effectiveTrust(rank.Node) !== "FULL")
-                throw refuseAbout(
-                  "trust_relay",
-                  rank.Node?.id ?? instance.id,
-                  "Agents may only mark instances stopped on nodes at Full control. A person can do this in the browser.",
-                );
+          // Agents mark stopped only on Full-control nodes (a node that left counts as not Full):
+          // the marked ranks' and the reservations' they hold memory on.
+          const blocked = agent ? agentBlockedNode({ ...instance, Ranks: ranks }) : null;
+          if (blocked)
+            throw refuseAbout(
+              "trust_relay",
+              blocked.nodeId ?? instance.id,
+              "Agents may only mark instances stopped on nodes at Full control. A person can do this in the browser.",
+            );
           const marked = ranks.map((rank) => rank.rank);
           const operation = await tx.runtimeOperation.create({
             data: {
@@ -965,6 +1002,7 @@ export const runtimesRouter = {
         row,
         await latestStopChecks(prisma, [row]),
         readLiveLoad(context.services?.liveLoad, [row.id]),
+        await loadStepVersions(prisma, userId, [row]),
       );
     }),
     releaseUnproven: runtimeReleaseUnproven,

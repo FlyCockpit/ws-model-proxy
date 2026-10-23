@@ -302,7 +302,7 @@ integration("reservations on PostgreSQL", () => {
     expect(await reservedNowGb(node.w2 ?? "")).toBe(40);
     // The new run's START is claimed (its leading stop proved the old run stopped).
     await modules.graph.graphWrite([USER], (tx) =>
-      modules.reservations.dropSupersededReservations(tx, reservingInstance, 2),
+      modules.reservations.dropSupersededHolds(tx, reservingInstance, 2),
     );
     expect(await reservationRows(reservingInstance)).toEqual([
       { nodeId: node.w2, index: 0, labels: ["r-w2"], supersededGeneration: null },
@@ -712,7 +712,7 @@ integration("reservations on PostgreSQL", () => {
     ).toBe("HELD");
     // Its run's START (after the leading stop) drops the old row.
     await modules.graph.graphWrite([USER], (tx) =>
-      modules.reservations.dropSupersededReservations(tx, instanceId, 2),
+      modules.reservations.dropSupersededHolds(tx, instanceId, 2),
     );
     expect((await reservationRows(instanceId)).map((row) => row.nodeId)).toEqual([newNode]);
     // Control: deleting the current plan's node stops it.
@@ -723,6 +723,149 @@ integration("reservations on PostgreSQL", () => {
         select: { desiredState: true, phase: true },
       }),
     ).toEqual({ desiredState: "STOPPED", phase: "STOPPING" });
+  });
+
+  it("a restart keeps the running rank's claim (prev*) until the new run starts; the CHECKs hold", async () => {
+    const runtimeId = await createRuntime(`${RUN}-prev`, spec("prev", 10, null));
+    const started = await client().start({ runtimeId });
+    if (started.mode !== "applied") throw new Error("expected an applied start");
+    const instanceId = started.operation.instances[0]?.id ?? "";
+    const rankOf = () =>
+      modules.prisma.instanceRank.findFirstOrThrow({
+        where: { instanceId },
+        select: {
+          id: true,
+          resources: true,
+          port: true,
+          plannedGeneration: true,
+          prevResources: true,
+          prevPort: true,
+          prevGeneration: true,
+        },
+      });
+    const before = await rankOf();
+    // Run 1 was dispatched (it may be running), then the runtime grows and restarts.
+    await modules.graph.graphWrite([USER], (tx) =>
+      tx.instanceStep.create({
+        data: {
+          instanceId,
+          nodeId: node.head ?? "",
+          rank: 0,
+          phase: "START",
+          sequence: 120,
+          generation: 1,
+          state: "SUCCEEDED",
+          attempts: 1,
+          intent: {},
+          intentHash: "0".repeat(64),
+        },
+      }),
+    );
+    await client(CALLERS.person(USER)).update({ runtimeId, spec: spec("prev", 20, null) });
+    const headBefore = await reservedNowGb(node.head ?? "");
+    const restarted = await client().start({ runtimeId, instanceId });
+    expect(restarted.mode).toBe("applied");
+    expect(await rankOf()).toMatchObject({
+      resources: { kind: "unified", memoryGb: 20 },
+      plannedGeneration: 1,
+      prevResources: { kind: "unified", memoryGb: 10 },
+      prevPort: before.port,
+      prevGeneration: 1,
+    });
+    // The old run's claim overlaps the new one: the head counts max(10, 20), not 30.
+    expect(await reservedNowGb(node.head ?? "")).toBeCloseTo(headBefore + 10);
+    // A replaced run's claim is all or nothing, and a released claim holds none.
+    await expect(
+      modules.graph.graphWrite([USER], (tx) =>
+        tx.instanceRank.update({ where: { id: before.id }, data: { prevGeneration: null } }),
+      ),
+    ).rejects.toThrow(/instance_rank_bounds/);
+    await expect(
+      modules.graph.graphWrite([USER], (tx) =>
+        tx.instanceRank.update({
+          where: { id: before.id },
+          data: { claim: "RELEASED", stoppedAt: new Date() },
+        }),
+      ),
+    ).rejects.toThrow(/instance_rank_claim_shape/);
+    // Run 2's START (after its leading stop proved run 1 stopped) drops it.
+    await modules.graph.graphWrite([USER], (tx) =>
+      modules.reservations.dropSupersededHolds(tx, instanceId, 2),
+    );
+    expect(await rankOf()).toMatchObject({
+      prevResources: null,
+      prevPort: null,
+      prevGeneration: null,
+    });
+  });
+
+  it("deleting the runtime's own node keeps its claim while it holds reservations on other nodes", async () => {
+    const created: Record<string, string> = {};
+    await modules.graph.graphWrite([USER], async (tx) => {
+      for (const [slug, labels] of [
+        ["hd-head", ["r-hd-head"]],
+        ["hd-worker", ["r-hd-worker"]],
+      ] as const) {
+        const row = await tx.node.create({
+          data: {
+            userId: USER,
+            slug: `${RUN}-${slug}`,
+            connection: "ONLINE",
+            trust: "FULL",
+            labels: [...labels],
+            declaredResources: { kind: "unified", memoryGb: 66 },
+            portStart: 31000,
+            portEnd: 31010,
+          },
+          select: { id: true },
+        });
+        created[slug] = row.id;
+      }
+    });
+    const base = spec("hd", 10, ["r-hd-worker"]);
+    if (!base.launch) throw new Error("no launch");
+    const runtimeId = await createRuntime(`${RUN}-hd`, {
+      ...base,
+      launch: { ...base.launch, labels: ["r-hd-head"] },
+    });
+    const started = await client().start({ runtimeId });
+    if (started.mode !== "applied") throw new Error("expected an applied start");
+    const instanceId = started.operation.instances[0]?.id ?? "";
+    const worker = created["hd-worker"] ?? "";
+    expect(await reservedNowGb(worker)).toBe(10);
+    await modules.graph.graphWrite([USER], (tx) =>
+      tx.node.delete({ where: { id: created["hd-head"] ?? "" } }),
+    );
+    // Nothing can prove the head's process (and what it started on the worker) stopped: the
+    // claim stays held with no node, so the worker's reserved memory stays counted.
+    expect(
+      await modules.prisma.instanceRank.findFirstOrThrow({
+        where: { instanceId },
+        select: { claim: true, nodeId: true },
+      }),
+    ).toEqual({ claim: "HELD", nodeId: null });
+    expect(
+      await modules.prisma.runtimeInstance.findUniqueOrThrow({
+        where: { id: instanceId },
+        select: { desiredState: true, phase: true, phaseReason: true },
+      }),
+    ).toEqual({ desiredState: "STOPPED", phase: "STOPPING", phaseReason: "node_deleted" });
+    expect(await reservedNowGb(worker)).toBe(10);
+    // Control: a runtime without reservations elsewhere is released with its node.
+    const solo = await createRuntime(`${RUN}-hd-solo`, {
+      ...base,
+      launch: { ...base.launch, labels: ["r-hd-worker"], reservations: [] },
+    });
+    const soloStarted = await client().start({ runtimeId: solo });
+    if (soloStarted.mode !== "applied") throw new Error("expected an applied start");
+    const soloInstance = soloStarted.operation.instances[0]?.id ?? "";
+    await modules.graph.graphWrite([USER], (tx) => tx.node.delete({ where: { id: worker } }));
+    expect(
+      await modules.prisma.instanceRank.findFirstOrThrow({
+        where: { instanceId: soloInstance },
+        select: { claim: true, nodeId: true },
+      }),
+    ).toEqual({ claim: "RELEASED", nodeId: null });
   });
 
   it("the node list loads every node's held claims in a fixed number of statements", async () => {

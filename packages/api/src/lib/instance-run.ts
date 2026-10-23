@@ -171,28 +171,145 @@ export async function fresh(
 }
 
 /**
- * The stored intent of the latest step of this rank that could have started a process: a
- * start-phase step of any run that was dispatched (attempts > 0) and not refused before the
- * node admitted it. What a stop or status probe must name to reach the process that actually
- * runs (its launch version, port, unit). Null when nothing was ever launched.
+ * Pre-admission codes prove the rank never ran this step, so the server may auto-release its
+ * claim (§3.5). Other codes are stored as `InstanceStep.errorCode`. (The relay protocol's list,
+ * `apps/server/src/relay/frames.ts` re-exports it.)
  */
-export async function physicalLaunchIntent(
+export const RUNTIME_JOB_PRE_ADMISSION_ERRORS = [
+  "execution_mechanism_unavailable",
+  "bad_job",
+  "interactive_unsupported",
+  "operator_terminals_disabled",
+  "trust_relay",
+  "definition_missing",
+  "definition_frozen",
+  "local_config_unavailable",
+  "session_disconnected",
+] as const;
+
+/** Rank claims that still hold their node (a stop not proven yet keeps HELD_UNKNOWN). */
+export const LIVE_CLAIMS = ["HELD", "HELD_UNKNOWN"] as const;
+
+const PRE_ADMISSION_SET: ReadonlySet<string> = new Set(RUNTIME_JOB_PRE_ADMISSION_ERRORS);
+
+/**
+ * What a step's answer proves about whether it ran, as every reader decides it (`neverRan` in
+ * `claim-release.ts`, `physicalLaunch`, `physicalLaunchIntents`): a pre-admission code
+ * (`RUNTIME_JOB_PRE_ADMISSION_ERRORS`) proves the attempt it answers never ran, and nothing
+ * about an earlier dispatch of the same step that may have reached the node with no answer (its
+ * session lost, its lease expired) before it was sent again. That one is recorded on the step
+ * (`InstanceStep.mayHaveRun`, set when such an attempt is queued or sent again, never cleared:
+ * CHECKed and trigger-fenced in SQL), so a later refusal never erases it.
+ *
+ * The Prisma filter of steps whose answer does not prove they never ran (an `OR`: callers put it
+ * where no other `OR` is).
+ */
+export function notRefusedBeforeAdmissionWhere(): Prisma.InstanceStepWhereInput {
+  return {
+    OR: [
+      { mayHaveRun: true },
+      { errorCode: null },
+      { errorCode: { notIn: [...RUNTIME_JOB_PRE_ADMISSION_ERRORS] } },
+    ],
+  };
+}
+
+/**
+ * The step's answer proves it never ran: refused before admission, and no earlier dispatch of it
+ * may have run (`notRefusedBeforeAdmissionWhere`). Rows read without the flag (older fixtures) count as not set.
+ */
+export function refusedBeforeAdmission(step: {
+  errorCode: string | null;
+  mayHaveRun?: boolean;
+}): boolean {
+  return step.mayHaveRun !== true && PRE_ADMISSION_SET.has(step.errorCode ?? "");
+}
+
+/**
+ * `InstanceStep.mayHaveRun` for a step going back to PENDING (or sent again) with `attempts`
+ * counted dispatches: set when one was counted (it may have reached the node, and no answer says
+ * it did not), else left as it is (undefined writes nothing; the flag is never cleared).
+ */
+export function mayHaveRunAfterRequeue(attempts: number): true | undefined {
+  return attempts > 0 ? true : undefined;
+}
+
+/**
+ * What makes a step a physical launch (`physicalLaunch`, `physicalLaunchIntents`): a start-phase
+ * step of any run that was dispatched (attempts > 0) and whose answer does not prove it never ran
+ * (`notRefusedBeforeAdmissionWhere`). Both lookups read these, so they cannot drift apart.
+ */
+const PHYSICAL_LAUNCH = {
+  phases: RUN_START_PHASES,
+  /** Dispatched at least once. */
+  minAttempts: 1,
+} as const;
+
+/**
+ * The stored intent of the latest step of this rank that could have started a process (a
+ * physical launch, `PHYSICAL_LAUNCH`), with the head's fabric address that launch was dispatched
+ * with (a multi-node launch; null otherwise, or for a launch dispatched before steps recorded
+ * it). What a stop or status probe must name to reach the process that actually runs (its
+ * launch version, port, unit, head), even once the head's node is gone. Null when nothing was
+ * ever launched.
+ */
+export async function physicalLaunch(
   db: Db,
   instanceId: string,
   rank: number,
-  preAdmissionErrors: ReadonlySet<string>,
-): Promise<Prisma.JsonValue | null> {
+): Promise<{ intent: Prisma.JsonValue; headAddr: string | null } | null> {
   // One row, newest first (bounded however long the rank's history is).
   const latest = await db.instanceStep.findFirst({
     where: {
       instanceId,
       rank,
-      phase: { in: [...RUN_START_PHASES] },
-      attempts: { gt: 0 },
-      OR: [{ errorCode: null }, { errorCode: { notIn: [...preAdmissionErrors] } }],
+      phase: { in: [...PHYSICAL_LAUNCH.phases] },
+      attempts: { gte: PHYSICAL_LAUNCH.minAttempts },
+      ...notRefusedBeforeAdmissionWhere(),
     },
-    select: { intent: true },
+    select: { intent: true, headAddr: true },
     orderBy: [{ generation: "desc" }, { sequence: "desc" }],
   });
-  return latest?.intent ?? null;
+  // Rows read without the select (older callers' fixtures) have no address.
+  return latest ? { intent: latest.intent, headAddr: latest.headAddr ?? null } : null;
+}
+
+/** One live-claimed rank's physical launch (`physicalLaunchIntents`). */
+export type RankPhysicalLaunch = {
+  instanceId: string;
+  rank: number;
+  nodeId: string;
+  intent: Prisma.JsonValue;
+};
+
+/**
+ * `physicalLaunch` of every rank of `userId`'s instances with a live claim (`LIVE_CLAIMS`) on
+ * one of these nodes, in one query whatever the number of ranks: the latest physical launch per
+ * (instance, rank), served by the `(instanceId, rank, phase, sequence)` index. Ranks that never
+ * launched are absent. Only the owner's instances (`runtime_instance."userId"`).
+ */
+export async function physicalLaunchIntents(
+  db: Db,
+  input: { userId: string; nodeIds: readonly string[] },
+): Promise<RankPhysicalLaunch[]> {
+  if (input.nodeIds.length === 0) return [];
+  const nodeIds = [...input.nodeIds];
+  const claims = [...LIVE_CLAIMS];
+  const phases = [...PHYSICAL_LAUNCH.phases];
+  const preAdmission = [...RUNTIME_JOB_PRE_ADMISSION_ERRORS];
+  // `notRefusedBeforeAdmissionWhere` in SQL.
+  return db.$queryRaw<RankPhysicalLaunch[]>`
+    SELECT DISTINCT ON (s."instanceId", s.rank)
+      s."instanceId" AS "instanceId", s.rank AS rank, r."nodeId" AS "nodeId", s.intent AS intent
+    FROM instance_step s
+    JOIN instance_rank r ON r."instanceId" = s."instanceId" AND r.rank = s.rank
+    JOIN runtime_instance i ON i.id = s."instanceId"
+    WHERE i."userId" = ${input.userId}
+      AND r."nodeId" = ANY(${nodeIds}::text[])
+      AND r.claim::text = ANY(${claims}::text[])
+      AND s.phase::text = ANY(${phases}::text[])
+      AND s.attempts >= ${PHYSICAL_LAUNCH.minAttempts}
+      AND (s."mayHaveRun" OR s."errorCode" IS NULL
+        OR NOT (s."errorCode" = ANY(${preAdmission}::text[])))
+    ORDER BY s."instanceId", s.rank, s.generation DESC, s.sequence DESC`;
 }

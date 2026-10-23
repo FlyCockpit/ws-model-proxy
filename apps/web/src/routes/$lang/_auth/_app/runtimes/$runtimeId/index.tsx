@@ -320,6 +320,11 @@ function InstanceReasonNote({ instance }: { instance: Instance }) {
           {t("dashboard:runtime.processDetached")}
         </p>
       ) : null}
+      {instance.phaseReason === "cli_upgrade_required" ? (
+        <p className="break-words text-sm text-destructive">
+          {t("dashboard:runtime.cliUpgradeRequired")}
+        </p>
+      ) : null}
       {waiting ? <p className="break-words text-xs text-muted-foreground">{waiting}</p> : null}
     </>
   );

@@ -500,6 +500,38 @@ export type SendGuard = {
   ownerCheck?: NodeOwnerCheck;
 };
 
+const RUN_START_JOB_PHASES: ReadonlySet<string> = new Set([
+  "prepare",
+  "start",
+  "after_join",
+  "readiness",
+]);
+
+/**
+ * A stop, status or health job of a run older than one whose start-phase job this session
+ * already sent for the same rank: the later run owns the rank (its leading stop proved the old
+ * launch ended), so the old job must not reach the node now. The lifecycle claims a job before
+ * sending it, outside its write; this is the last check, at the socket. Refused (not sent), the
+ * lifecycle returns the step to PENDING and its run gate ends it.
+ */
+function staleRunJob(
+  startedRuns: ReadonlyMap<string, number>,
+  frame: { instanceId: string; rank: number; generation: number; phase: string },
+): boolean {
+  if (RUN_START_JOB_PHASES.has(frame.phase)) return false;
+  const started = startedRuns.get(`${frame.instanceId}:${frame.rank}`);
+  return started !== undefined && frame.generation < started;
+}
+
+function recordStartedRun(
+  startedRuns: Map<string, number>,
+  frame: { instanceId: string; rank: number; generation: number; phase: string },
+): void {
+  if (!RUN_START_JOB_PHASES.has(frame.phase)) return;
+  const key = `${frame.instanceId}:${frame.rank}`;
+  if ((startedRuns.get(key) ?? -1) < frame.generation) startedRuns.set(key, frame.generation);
+}
+
 /** How recovery probes reach a node (injected: model-api's relay attempt). */
 export type RelayAttemptStarter = (input: {
   manager: RelaySessionManager;
@@ -554,6 +586,12 @@ type SessionState = {
   terminalsById: Map<string, TerminalRecord>;
   /** Interactive steps sent with an operator terminal, by step id. */
   operatorSteps: Map<string, OperatorStepTracker>;
+  /**
+   * Per `instanceId:rank`, the highest run (generation) whose start-phase job this session
+   * sent. A stop, status or health job of an earlier run is not delivered after it
+   * (`staleRunJob`): that run no longer owns the rank.
+   */
+  startedRuns: Map<string, number>;
   /**
    * The one retry chain of a failed `operator_running` write, by step id
    * (`retryOperatorAcceptance`). Cancelled with the session's interactive work and by `dispose`.
@@ -833,6 +871,7 @@ export class RelaySessionManager {
       )
     )
       return false;
+    if (frame.type === "runtime.job" && staleRunJob(session.startedRuns, frame)) return false;
     let encoded: string;
     try {
       encoded = encodeRelayServerControlMessage(frame);
@@ -840,14 +879,18 @@ export class RelaySessionManager {
       console.error("[relay] refused to send a frame", frame.type, errorName(error));
       return false;
     }
-    if (frame.type === "runtime.job" && frame.operator)
-      return this.sendOperatorJob(session, frame, encoded);
+    if (frame.type === "runtime.job" && frame.operator) {
+      const sent = this.sendOperatorJob(session, frame, encoded);
+      if (sent) recordStartedRun(session.startedRuns, frame);
+      return sent;
+    }
     try {
       session.socket.send(encoded);
-      return true;
     } catch {
       return false;
     }
+    if (frame.type === "runtime.job") recordStartedRun(session.startedRuns, frame);
+    return true;
   }
 
   /**
@@ -859,6 +902,7 @@ export class RelaySessionManager {
     connectionGeneration: number;
     trust: NodeTrustWire;
     operatorTerminals: boolean;
+    jobReservations: boolean;
   } | null {
     const session = this.sessionsByNodeId.get(nodeId);
     if (!session?.registered || !session.helloAcked || session.connectionGeneration === null)
@@ -868,6 +912,7 @@ export class RelaySessionManager {
       connectionGeneration: session.connectionGeneration,
       trust: session.trust,
       operatorTerminals: this.operatorTerminalsAllowed(session),
+      jobReservations: session.features?.jobReservations === true,
     };
   }
 
@@ -1277,6 +1322,7 @@ export class RelaySessionManager {
       inventoryPublished: 0,
       terminalsById: new Map(),
       operatorSteps: new Map(),
+      startedRuns: new Map(),
       acceptanceRetries: new Map(),
       filesById: new Map(),
       unauthenticatedTimer,

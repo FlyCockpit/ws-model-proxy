@@ -5,6 +5,7 @@
  */
 import { z } from "zod";
 import type { effectiveHardwareSchema } from "../contracts/nodes";
+import { overlapMemoryGb } from "../lib/claim-overlap";
 import { isFabricIp } from "../lib/ip-literal";
 import {
   type DeclaredHardware,
@@ -138,6 +139,9 @@ export function claimMemoryGb(
   return ram + shared * vramGb;
 }
 
+/** One instance's claims on a node (`HardwareInput.heldClaims`). */
+export type HeldClaimGroup = { current: readonly unknown[]; previous: readonly unknown[] };
+
 export type HardwareInput = {
   declaredResources: unknown;
   /** Who declared `declaredResources` (`Node.declaredResourcesBy`); null or absent: a person. */
@@ -145,8 +149,12 @@ export type HardwareInput = {
   nodeInfo: unknown;
   nodeMetrics: unknown;
   nodeMetricsAt: Date | null;
-  /** `resources` of every HELD / HELD_UNKNOWN claim on the node. */
-  heldClaims: readonly unknown[];
+  /**
+   * `resources` of every HELD / HELD_UNKNOWN claim on the node, one group per instance: its
+   * current claims and the replaced run's that still hold (a rank's `prev*`, superseded
+   * reservations), which overlap instead of adding (`lib/claim-overlap.ts`).
+   */
+  heldClaims: readonly HeldClaimGroup[];
   now: Date;
 };
 
@@ -255,10 +263,13 @@ export function effectiveHardware(input: HardwareInput): EffectiveHardware {
       (memoryGb.value ?? 0) - (reservedMemoryGb.value ?? 0) - reservedSharedGb - headroom,
     ),
   );
+  const memoryOf = (resources: unknown) => claimMemoryGb(resources, unifiedKeys, allUnified);
   const reservedNowMemoryGb = round(
-    input.heldClaims.reduce<number>(
-      (sum, resources) => sum + claimMemoryGb(resources, unifiedKeys, allUnified),
-      0,
+    overlapMemoryGb(
+      input.heldClaims.map((group) => ({
+        current: group.current.map(memoryOf),
+        previous: group.previous.map(memoryOf),
+      })),
     ),
   );
   const live = liveMetrics(input.nodeMetrics, input.nodeMetricsAt, input.now);

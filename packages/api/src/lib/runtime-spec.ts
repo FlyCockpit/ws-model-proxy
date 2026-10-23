@@ -946,6 +946,12 @@ export const nodeFeaturesSchema = z
       .max(64),
     mediaExpand: z.boolean(),
     liveStt: z.boolean(),
+    /**
+     * The node reads a job's `reservations` (relay 3.0, added after 0.4.2). Absent on older
+     * CLIs, which refuse a job carrying them: a start that needs them is refused with
+     * `cli_upgrade_required` instead.
+     */
+    jobReservations: z.boolean().optional(),
     /** The node's secrets: names and when they were last set (never values). */
     secrets: z
       .array(z.object({ name: nodeSecretNameSchema, updatedAt: z.iso.datetime() }).strict())

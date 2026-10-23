@@ -1,6 +1,7 @@
 import {
   ENGINES,
   GPU_VENDORS,
+  type GpuVendor,
   MODEL_CAPABILITIES,
   MODEL_TYPES,
   type ModelCapabilityWire,
@@ -114,6 +115,42 @@ function TextInput({
         />
       )}
       {hint ? <p className="text-xs text-muted-foreground">{hint}</p> : null}
+      <FieldErrors field={field} />
+    </div>
+  );
+}
+
+type VendorFieldApi = {
+  state: { value: "" | GpuVendor; meta: { errors: ErrorList } };
+  handleChange: (value: "" | GpuVendor) => void;
+  handleBlur: () => void;
+};
+
+function isGpuVendor(value: string): value is GpuVendor {
+  return (GPU_VENDORS as readonly string[]).includes(value);
+}
+
+/** A discrete block's GPU vendor (empty: any vendor), for rank resources and reservations. */
+function GpuVendorField({ id, field }: { id: string; field: VendorFieldApi }) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <div className="min-w-0 space-y-1.5">
+      <Label htmlFor={id}>{t("dashboard:runtime.specForm.vendor")}</Label>
+      <NativeSelect
+        id={id}
+        value={field.state.value}
+        onBlur={field.handleBlur}
+        onChange={(event) =>
+          field.handleChange(isGpuVendor(event.target.value) ? event.target.value : "")
+        }
+      >
+        <option value="">{t("dashboard:runtime.specForm.anyVendor")}</option>
+        {GPU_VENDORS.map((vendor) => (
+          <option key={vendor} value={vendor}>
+            {t(`dashboard:runtime.specForm.vendors.${vendor}`)}
+          </option>
+        ))}
+      </NativeSelect>
       <FieldErrors field={field} />
     </div>
   );
@@ -791,27 +828,7 @@ function ResourcesSection({ group, id }: { group: Group; id: (name: string) => s
                       </group.Field>
                       <group.Field name={`draft.resources[${index}].vendor`}>
                         {(field) => (
-                          <div className="min-w-0 space-y-1.5">
-                            <Label htmlFor={id(`resource-${index}-vendor`)}>
-                              {t("dashboard:runtime.specForm.vendor")}
-                            </Label>
-                            <NativeSelect
-                              id={id(`resource-${index}-vendor`)}
-                              value={field.state.value}
-                              onChange={(event) =>
-                                field.handleChange(
-                                  event.target.value as "" | (typeof GPU_VENDORS)[number],
-                                )
-                              }
-                            >
-                              <option value="">{t("dashboard:runtime.specForm.anyVendor")}</option>
-                              {GPU_VENDORS.map((vendor) => (
-                                <option key={vendor} value={vendor}>
-                                  {t(`dashboard:runtime.specForm.vendors.${vendor}`)}
-                                </option>
-                              ))}
-                            </NativeSelect>
-                          </div>
+                          <GpuVendorField id={id(`resource-${index}-vendor`)} field={field} />
                         )}
                       </group.Field>
                     </>
@@ -956,6 +973,11 @@ function ReservationsSection({ group, id }: { group: Group; id: (name: string) =
                             field={field}
                             inputMode="decimal"
                           />
+                        )}
+                      </group.Field>
+                      <group.Field name={`draft.reservations[${index}].resource.vendor`}>
+                        {(field) => (
+                          <GpuVendorField id={id(`reservation-${index}-vendor`)} field={field} />
                         )}
                       </group.Field>
                     </>

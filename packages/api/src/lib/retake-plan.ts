@@ -41,6 +41,11 @@ export async function planRetake(
       now,
     }),
   );
+  // A node-origin runtime's version takes no definition slot on its node.
+  const runtime = await tx.runtime.findFirst({
+    where: { id: instance.runtimeId, userId: instance.userId },
+    select: { origin: true },
+  });
   const ranks = [...instance.ranks].sort((a, b) => a.rank - b.rank);
   const reservationNodeIds: Array<string | null> = [];
   for (const reservation of instance.reservations)
@@ -58,6 +63,7 @@ export async function planRetake(
     },
     retake: true,
     checkFrozen: false,
+    nodeOrigin: runtime?.origin === "NODE",
     // An automatic restart never stops another instance.
     preempt: false,
   });

@@ -25,7 +25,7 @@ import {
   nodeFeaturesSchema,
   nodeMetricCommandsSchema,
 } from "../lib/runtime-spec";
-import { effectiveHardware, fabricSuggestions, liveMetrics } from "./hardware";
+import { effectiveHardware, fabricSuggestions, type HeldClaimGroup, liveMetrics } from "./hardware";
 import { nodeTrustView } from "./trust";
 
 type NodeSummary = z.infer<typeof nodeSummarySchema>;
@@ -62,11 +62,17 @@ export const nodeSummarySelect = {
     where: { claim: { in: [...HELD_CLAIMS] } },
     select: {
       resources: true,
+      // A replaced run's claim that still holds (it overlaps the current one).
+      prevResources: true,
+      prevPort: true,
       Instance: { select: { id: true, phase: true, needsOperator: true } },
     },
   },
   // Memory instances hold here without running (`launch.reservations`), while they hold.
-  Reservations: { where: HOLDING_RESERVATION_WHERE, select: { resources: true } },
+  Reservations: {
+    where: HOLDING_RESERVATION_WHERE,
+    select: { instanceId: true, resources: true, supersededGeneration: true },
+  },
   _count: {
     select: {
       Runtimes: { where: { kind: "ALWAYS_ON" } },
@@ -79,13 +85,32 @@ export type NodeSummaryRow = Prisma.NodeGetPayload<{ select: typeof nodeSummaryS
 
 const NOT_RUNNING_PHASES = new Set(["STOPPED", "FAILED"]);
 
-/** `resources` of every claim that holds on the node: its ranks' and reservations'. */
-function heldClaimsOf(row: Pick<NodeSummaryRow, "Ranks" | "Reservations">): unknown[] {
-  return [
-    ...row.Ranks.map((rank) => rank.resources),
+/**
+ * `resources` of every claim that holds on the node (its ranks' and reservations'), one group
+ * per instance: a replaced run's claims that still hold (a rank's `prev*`, superseded
+ * reservations) overlap the current ones (`effectiveHardware`).
+ */
+function heldClaimsOf(row: Pick<NodeSummaryRow, "Ranks" | "Reservations">): HeldClaimGroup[] {
+  const groups = new Map<string, { current: unknown[]; previous: unknown[] }>();
+  const groupOf = (instanceId: string) => {
+    const group = groups.get(instanceId) ?? { current: [], previous: [] };
+    groups.set(instanceId, group);
+    return group;
+  };
+  for (const rank of row.Ranks) {
+    const group = groupOf(rank.Instance.id);
+    group.current.push(rank.resources);
     // Rows read without the select (older callers' fixtures) have none.
-    ...(row.Reservations ?? []).map((reservation) => reservation.resources),
-  ];
+    if (rank.prevPort !== null && rank.prevPort !== undefined)
+      group.previous.push(rank.prevResources);
+  }
+  for (const reservation of row.Reservations ?? []) {
+    const group = groupOf(reservation.instanceId);
+    if (reservation.supersededGeneration === null || reservation.supersededGeneration === undefined)
+      group.current.push(reservation.resources);
+    else group.previous.push(reservation.resources);
+  }
+  return [...groups.values()];
 }
 
 export function toNodeSummary(row: NodeSummaryRow, now: Date): NodeSummary {
@@ -188,6 +213,8 @@ export const nodeDetailSelect = {
       rank: true,
       claim: true,
       resources: true,
+      prevResources: true,
+      prevPort: true,
       Instance: {
         select: {
           id: true,
@@ -208,6 +235,7 @@ export const nodeDetailSelect = {
     orderBy: { index: "asc" },
     select: {
       index: true,
+      instanceId: true,
       resources: true,
       supersededGeneration: true,
       Instance: {
@@ -365,14 +393,20 @@ export function toNodeDetail(
     claim: reservationClaim(reservation.Instance.Ranks),
   }));
   const heldReservations = reservations.filter((reservation) => reservation.claim !== "RELEASED");
-  const summary = toNodeSummary(
-    {
-      ...row,
-      Ranks: heldRanks.map((rank) => ({ resources: rank.resources, Instance: rank.Instance })),
-      Reservations: heldReservations.map((reservation) => ({ resources: reservation.resources })),
-    },
-    now,
-  );
+  const held = {
+    Ranks: heldRanks.map((rank) => ({
+      resources: rank.resources,
+      prevResources: rank.prevResources,
+      prevPort: rank.prevPort,
+      Instance: rank.Instance,
+    })),
+    Reservations: heldReservations.map((reservation) => ({
+      instanceId: reservation.instanceId,
+      resources: reservation.resources,
+      supersededGeneration: reservation.supersededGeneration,
+    })),
+  };
+  const summary = toNodeSummary({ ...row, ...held }, now);
   const features = nodeFeaturesSchema.safeParse(row.features);
   const declared = declaredHardwareSchema.safeParse(row.declaredResources);
   const metricCommands = nodeMetricCommandsSchema.safeParse(row.metricCommands);
@@ -432,10 +466,7 @@ export function toNodeDetail(
       nodeInfo: row.nodeInfo,
       nodeMetrics: row.nodeMetrics,
       nodeMetricsAt: row.nodeMetricsAt,
-      heldClaims: [
-        ...heldRanks.map((rank) => rank.resources),
-        ...heldReservations.map((reservation) => reservation.resources),
-      ],
+      heldClaims: heldClaimsOf(held),
       now,
     }),
     declaredHardware: declared.success ? declared.data : null,

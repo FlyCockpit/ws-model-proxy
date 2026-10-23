@@ -100,7 +100,12 @@ function challenge(socket: FakeSocket): string {
 
 function hello(
   socket: FakeSocket,
-  overrides: { trust?: "full" | "relay"; signature?: string; operatorTerminals?: boolean } = {},
+  overrides: {
+    trust?: "full" | "relay";
+    signature?: string;
+    operatorTerminals?: boolean;
+    jobReservations?: boolean;
+  } = {},
 ) {
   const trust = overrides.trust ?? "full";
   return JSON.stringify({
@@ -122,6 +127,9 @@ function hello(
       runtimeHosts: [],
       mediaExpand: false,
       liveStt: false,
+      ...(overrides.jobReservations === undefined
+        ? {}
+        : { jobReservations: overrides.jobReservations }),
       secrets: [],
     },
     definitions: [],
@@ -620,6 +628,8 @@ describe("RelaySessionManager (relay 3.0)", () => {
       connectionGeneration: generation,
       trust: "full",
       operatorTerminals: false,
+      // A hello without the flag (a CLI from before it): job reservations are not sent.
+      jobReservations: false,
     });
     const frame = { type: "runtime.detect" as const, id: "d2" };
     expect(manager.sendToNode("node-1", frame, { connectionGeneration: generation + 1 })).toBe(
@@ -634,6 +644,63 @@ describe("RelaySessionManager (relay 3.0)", () => {
     manager.requestTrustLower("node-1", new Date());
     expect(manager.sendToNode("node-1", frame, { requireFullTrust: true })).toBe(false);
     expect(manager.nodeSession("node-1")?.trust).toBe("relay");
+  });
+
+  it("says when the node's CLI reads job reservations", async () => {
+    await connect({ jobReservations: true });
+    expect(manager.nodeSession("node-1")?.jobReservations).toBe(true);
+  });
+
+  it("never delivers a stop, status or health job of a run older than a start it sent", async () => {
+    const socket = await connect();
+    const job = (
+      phase: "start" | "stop" | "status" | "health" | "readiness",
+      generation: number,
+    ) => ({
+      type: "runtime.job" as const,
+      stepId: `step-${phase}-${generation}`,
+      instanceId: "inst-1",
+      runtimeId: "rt-1",
+      launchVersionId: "v-1",
+      launchHash: "b".repeat(64),
+      generation,
+      rank: 0,
+      nnodes: 1,
+      phase,
+      handle: "i-abcdefabcdef",
+      unitName: "wsmp-i-abcdefabcdef-r0",
+      placeholders: { port: 30_000 },
+      timeoutMs: 60_000,
+      ownerEpoch: "e1:1",
+      intentHash: "a".repeat(64),
+    });
+    // Run 1 starts; its health and stop go out while it is the latest started run.
+    expect(manager.sendToNode("node-1", job("start", 1))).toBe(true);
+    expect(manager.sendToNode("node-1", job("health", 1))).toBe(true);
+    // Run 2's leading stop (same run number) and start go out.
+    expect(manager.sendToNode("node-1", job("stop", 2))).toBe(true);
+    expect(manager.sendToNode("node-1", job("start", 2))).toBe(true);
+    const sent = socket.json().filter((frame) => frame.type === "runtime.job").length;
+    // A stop, status probe or health probe of run 1 claimed before run 2 began is not sent now.
+    for (const phase of ["stop", "status", "health"] as const)
+      expect(manager.sendToNode("node-1", job(phase, 1))).toBe(false);
+    expect(socket.json().filter((frame) => frame.type === "runtime.job")).toHaveLength(sent);
+    // Run 2's own jobs, and another rank's or instance's, still go.
+    expect(manager.sendToNode("node-1", job("stop", 2))).toBe(true);
+    expect(
+      manager.sendToNode("node-1", {
+        ...job("stop", 1),
+        rank: 1,
+        unitName: "wsmp-i-abcdefabcdef-r1",
+        nnodes: 2,
+        fabricId: "fab_1",
+        placeholders: { port: 30_000, head_addr: "10.0.0.1" },
+      }),
+    ).toBe(true);
+    expect(manager.sendToNode("node-1", { ...job("stop", 1), instanceId: "inst-2" })).toBe(true);
+    // A new session (reconnect) starts fresh: the lifecycle's run gate covers it.
+    await connect();
+    expect(manager.sendToNode("node-1", job("stop", 1))).toBe(true);
   });
 
   it("sends nothing pinned to another owner, and logs the class only", async () => {

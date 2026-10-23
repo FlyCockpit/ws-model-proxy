@@ -12,6 +12,14 @@ import { profilesContract as c, type profileViewSchema } from "../contracts/prof
 import { assertMayWrite, callerActor } from "../lib/caller-actor";
 import { graphDelete, graphWrite, instanceCapacityFences } from "../lib/graph-write";
 import {
+  agentBlockedNode,
+  OCCUPANCY_SELECT,
+  occupiedNodeIds,
+  occupiedNodes,
+  occupiesNodesWhere,
+} from "../lib/instance-occupancy";
+import { requiredDefinitionsByNode } from "../lib/node-definitions";
+import {
   loadPlacementFabrics,
   loadPlacementInstances,
   PLACEMENT_NODE_SELECT,
@@ -93,7 +101,10 @@ type ProfileRow = {
 
 const ACTIVE_PHASES = ["STARTING", "READY", "UNHEALTHY", "UNAVAILABLE"] as const;
 
-/** STARTABLE instances that should run, with a rank on one of these nodes. */
+/**
+ * STARTABLE instances occupying one of these nodes (a rank claim there, or a reservation there
+ * while the instance holds: `occupiesNodesWhere`), with every node they occupy.
+ */
 async function runningInstancesOn(
   userId: string,
   nodeIds: readonly string[],
@@ -104,7 +115,7 @@ async function runningInstancesOn(
     where: {
       userId,
       Runtime: { kind: "STARTABLE" },
-      Ranks: { some: { nodeId: { in: [...nodeIds] }, claim: { not: "RELEASED" } } },
+      ...occupiesNodesWhere(nodeIds),
     },
     select: {
       id: true,
@@ -112,12 +123,30 @@ async function runningInstancesOn(
       launchVersionId: true,
       desiredState: true,
       phase: true,
-      Ranks: { orderBy: { rank: "asc" }, select: { nodeId: true, claim: true } },
+      ...OCCUPANCY_SELECT,
     },
   });
 }
 
 type RunningInstance = Awaited<ReturnType<typeof runningInstancesOn>>[number];
+
+/** Where an instance runs, as the plan matches it against items: its ranks' and its current reservations' nodes. */
+function planInstanceNodes(instance: RunningInstance) {
+  return {
+    runtimeId: instance.runtimeId,
+    launchVersionId: instance.launchVersionId,
+    rankNodeIds: instance.Ranks.flatMap((rank) => (rank.nodeId ? [rank.nodeId] : [])),
+    reservationNodeIds: occupiedNodes(instance, "current").flatMap((entry) =>
+      entry.role === "reservation" && entry.nodeId ? [entry.nodeId] : [],
+    ),
+  };
+}
+
+/** The node an agent's stop of this instance would reach that is not at Full control, if any. */
+function agentBlockedNodeId(instance: RunningInstance): string | null {
+  const blocked = agentBlockedNode(instance);
+  return blocked ? (blocked.nodeId ?? instance.id) : null;
+}
 
 export function toProfileView(row: ProfileRow, instances: readonly RunningInstance[]): ProfileView {
   const ownedIds = row.Nodes.map((node) => node.nodeId);
@@ -127,23 +156,14 @@ export function toProfileView(row: ProfileRow, instances: readonly RunningInstan
     (instance) =>
       instance.desiredState === "RUNNING" &&
       (ACTIVE_PHASES as readonly string[]).includes(instance.phase) &&
-      instance.Ranks.some((rank) => rank.nodeId !== null && owned.has(rank.nodeId)),
+      occupiedNodeIds(instance, "current").some((nodeId) => owned.has(nodeId)),
   );
   const matched = new Set<string>();
   const items = row.Items.map((item) => {
     const matches = running.filter(
       (instance) =>
         !matched.has(instance.id) &&
-        instanceServesItem(
-          {
-            runtimeId: instance.runtimeId,
-            launchVersionId: instance.launchVersionId,
-            rankNodeIds: instance.Ranks.flatMap((rank) => (rank.nodeId ? [rank.nodeId] : [])),
-          },
-          item,
-          ownedIds,
-          holdLines,
-        ),
+        instanceServesItem(planInstanceNodes(instance), item, ownedIds, holdLines),
     );
     const counted = matches.slice(0, item.count);
     for (const instance of counted) matched.add(instance.id);
@@ -240,7 +260,7 @@ async function loadPlanInput(
   if (!profile) throw notFound("That profile does not exist.");
   const ownedIds = profile.Nodes.map((node) => node.nodeId);
   const now = new Date();
-  const [nodes, versions, instances, claimants, fabrics] = await Promise.all([
+  const [nodes, versions, instances, claimants, fabrics, required] = await Promise.all([
     db.node.findMany({
       where: { userId, id: { in: ownedIds } },
       select: { ...PLACEMENT_NODE_SELECT, holdProfileId: true },
@@ -254,17 +274,18 @@ async function loadPlanInput(
         id: true,
         runtimeId: true,
         spec: true,
-        Runtime: { select: { slug: true, currentVersionId: true } },
+        Runtime: { select: { slug: true, currentVersionId: true, origin: true } },
       },
     }),
     runningInstancesOn(userId, ownedIds, db),
     loadPlacementInstances(db, ownedIds),
     loadPlacementFabrics(db, userId),
+    requiredDefinitionsByNode(db, { userId, nodeIds: ownedIds }),
   ]);
 
   const planNodes = new Map<string, PlanNode>();
   for (const node of nodes) {
-    const placement = placementNodeOf(node, now);
+    const placement = placementNodeOf(node, now, required.get(node.id) ?? new Set());
     planNodes.set(node.id, {
       id: node.id,
       slug: node.slug,
@@ -274,6 +295,7 @@ async function loadPlanInput(
       hold: { holdAt: node.holdAt, holdProfileId: node.holdProfileId },
       portRange: placement.portRange,
       heldVersionIds: placement.heldVersionIds,
+      requiredVersionIds: placement.requiredVersionIds,
       memoryGb: placement.memoryGb,
       gpus: placement.gpus,
       liveFreeMemoryGb: placement.liveFreeMemoryGb,
@@ -291,16 +313,16 @@ async function loadPlanInput(
           runtimeSlug: version.Runtime.slug,
           currentVersionId: version.Runtime.currentVersionId,
           spec: spec.success ? spec.data : null,
+          nodeOrigin: version.Runtime.origin === "NODE",
         },
       ];
     }),
   );
   const planInstances: PlanInstance[] = instances.map((instance) => ({
     id: instance.id,
-    runtimeId: instance.runtimeId,
-    launchVersionId: instance.launchVersionId,
     desiredRunning: instance.desiredState === "RUNNING",
-    rankNodeIds: instance.Ranks.flatMap((rank) => (rank.nodeId ? [rank.nodeId] : [])),
+    ...planInstanceNodes(instance),
+    agentBlockedNodeId: agentBlockedNodeId(instance),
   }));
   const items: PlanItem[] = profile.Items;
   return {

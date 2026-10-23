@@ -422,6 +422,7 @@ describe("errors and output", () => {
       held: false,
       portRange: [30000, 30009] as const,
       heldVersionIds: new Set<string>(),
+      requiredVersionIds: new Set<string>(),
       frozenFabrics: null,
       memoryGb: 126,
       gpus: [],

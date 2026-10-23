@@ -12,14 +12,14 @@
   <a href="#license"><img alt="License" src="https://shieldcn.dev/github/license/FlyCockpit/ws-model-proxy.svg?variant=secondary&mode=light&size=sm"></a>
 </p>
 
-> The node client for WS Model Proxy 0.4.1.
+> The node client for WS Model Proxy 0.4.2.
 
 `wsmp` turns a computer into a **node** of your WS Model Proxy server. It keeps one outbound
 websocket to the server (no port forwarding), relays model requests to the runtimes on this
 node, and, when you allow it, runs the runtimes, commands, file operations and terminals the
 server asks for.
 
-0.4.1 speaks relay protocol 3.0 and remains compatible with 0.4.0 servers and CLIs.
+0.4.2 speaks relay protocol 3.0 and remains compatible with 0.4.0 and 0.4.1 servers and CLIs.
 Image paste requires both the web app and the node's CLI to be upgraded to 0.4.1.
 A 0.3 CLI cannot connect to a 0.4.x server, and this CLI cannot connect to a 0.3 server.
 
@@ -50,7 +50,7 @@ gh attestation verify wsmp-aarch64-unknown-linux-gnu.tar.xz --repo FlyCockpit/ws
 Or build a release tag with cargo directly:
 
 ```sh
-cargo install --git https://github.com/FlyCockpit/ws-model-proxy --tag v0.4.1 --locked wsmp
+cargo install --git https://github.com/FlyCockpit/ws-model-proxy --tag v0.4.2 --locked wsmp
 ```
 
 ## Log in
@@ -230,6 +230,16 @@ The server asks a node to do two different kinds of work:
   node's activity, and stop when trust is lowered. An agent can also queue a command for you
   (one that needs a password, for example); it runs only when you choose Run on the Terminals
   page.
+
+Every runtime command gets, on top of a scrubbed environment, the secrets its definition names,
+the GPUs placement gave its rank (`CUDA_VISIBLE_DEVICES` and `HIP_VISIBLE_DEVICES`, with
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`) and, for a single-node runtime with reservations, the worker
+nodes they were assigned to: `WSMP_RESERVATION_COUNT`, then per reservation
+`WSMP_RESERVATION_<index>_NODE` (the node's slug), `WSMP_RESERVATION_<index>_NODE_ID` and, when
+placement gave it GPUs on that worker, `WSMP_RESERVATION_<index>_GPUS` (their indices, in the
+`CUDA_VISIBLE_DEVICES` format the rank's own GPUs use, e.g. `0,3`). A stop
+or status check sees the reservations of the launch it checks. These are environment variables,
+not placeholders, so they do not change the definition's launch hash.
 
 To see what this node holds and runs, read from its own files (the frozen copy at Relay only;
 both commands are read only and work at either trust level):

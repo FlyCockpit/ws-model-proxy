@@ -18,12 +18,14 @@
  * now (they checked the node).
  */
 import type { Prisma } from "@ws-model-proxy/db";
+import { DbNull } from "@ws-model-proxy/db/json-null";
 import {
   fresh,
   isLeadingStop,
   isRunStartPhase,
   owned,
   RUN_START_PHASES,
+  refusedBeforeAdmission,
   resolveRun,
 } from "./instance-run";
 
@@ -42,13 +44,14 @@ export type UnprovenRelease = { by: string; reason: string };
  * - `observation`: an inventory record naming the last step the node ran for this rank's unit,
  *   which the node reports stopped;
  * - `neverRan`: the instance's own steps show this rank never ran since the last proven stop
- *   (evaluated here; `preAdmissionErrors` are the node's codes that prove a step never ran);
+ *   (evaluated here: a refusal before admission proves only the attempt it answers never ran,
+ *   `refusedBeforeAdmission` in `instance-run.ts`);
  * - `unproven`: a person's release without proof of a claim marked stopped.
  */
 export type ClaimRelease =
   | { result: { stepId: string } }
   | { observation: { stepId: string } }
-  | { neverRan: { preAdmissionErrors: ReadonlySet<string> } }
+  | { neverRan: true }
   | { unproven: UnprovenRelease };
 
 type RankRow = {
@@ -123,15 +126,11 @@ async function proofHolds(
 
 /**
  * The rank never ran since the last proven stop: every start-phase step of the latest
- * generation that has any never ran (never sent, cancelled, or refused before admission), and
- * that generation is the first or its leading stop succeeded. (A run begun later without steps
- * launched nothing.)
+ * generation that has any never ran (never sent, cancelled, or refused before admission with no
+ * earlier dispatch that may have run: `refusedBeforeAdmission`), and that generation is the first
+ * or its leading stop succeeded. (A run begun later without steps launched nothing.)
  */
-async function neverRan(
-  tx: Tx,
-  rank: RankRow,
-  preAdmissionErrors: ReadonlySet<string>,
-): Promise<boolean> {
+async function neverRan(tx: Tx, rank: RankRow): Promise<boolean> {
   const latest =
     (
       await tx.instanceStep.aggregate({
@@ -148,6 +147,7 @@ async function neverRan(
       generation: true,
       attempts: true,
       errorCode: true,
+      mayHaveRun: true,
     },
   });
   // Attempts count only dispatches that may have run something (a declined operator terminal,
@@ -160,7 +160,8 @@ async function neverRan(
         step.state === "CANCELLED" ||
         (step.state === "PENDING" && step.attempts === 0) ||
         (step.state === "FAILED" &&
-          (step.attempts === 0 || preAdmissionErrors.has(step.errorCode ?? ""))),
+          !step.mayHaveRun &&
+          (step.attempts === 0 || refusedBeforeAdmission(step))),
     );
   const leading = steps.find((step) => isLeadingStop(step));
   return allNever && (latest <= 1 || leading?.state === "SUCCEEDED");
@@ -192,7 +193,7 @@ export async function releaseClaim(
         : "observation" in release
           ? await proofHolds(tx, rank, release.observation.stepId, "observation")
           : "neverRan" in release
-            ? await neverRan(tx, rank, release.neverRan.preAdmissionErrors)
+            ? await neverRan(tx, rank)
             : false;
     if (!proven) return false;
   }
@@ -204,6 +205,11 @@ export async function releaseClaim(
       claim: "RELEASED",
       claimChangedAt: now,
       stoppedAt: now,
+      // A released claim holds nothing, a replaced run's claim (`retakeInstanceClaims`) included.
+      prevResources: DbNull,
+      prevPort: null,
+      prevDistPort: null,
+      prevGeneration: null,
       ...(unproven
         ? {
             releasedUnprovenAt: now,

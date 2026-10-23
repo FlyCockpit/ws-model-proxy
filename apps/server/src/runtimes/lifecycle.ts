@@ -31,19 +31,26 @@ import { graphWrite, instanceCapacityFences } from "@ws-model-proxy/api/lib/grap
 import {
   fresh,
   isLeadingStop,
+  mayHaveRunAfterRequeue,
   owned,
   peekRun,
-  physicalLaunchIntent,
+  physicalLaunch,
   resolveRun,
 } from "@ws-model-proxy/api/lib/instance-run";
 import {
   CURRENT_RESERVATION_WHERE,
-  dropSupersededReservations,
+  dropSupersededHolds,
   HOLDING_RESERVATION_WHERE,
   retakeInstanceClaims,
 } from "@ws-model-proxy/api/lib/reservations";
 import { planRetake } from "@ws-model-proxy/api/lib/retake-plan";
 import { type RuntimeLaunch, runtimeLaunchSchema } from "@ws-model-proxy/api/lib/runtime-spec";
+import {
+  claimGpuIds,
+  type StepReservation,
+  stepJobReservations,
+} from "@ws-model-proxy/api/lib/step-intent";
+import { effectiveTrust } from "@ws-model-proxy/api/nodes/trust";
 import { healthFailureDetail } from "@ws-model-proxy/config/health-reasons";
 import { RUNTIME_ADVANCED } from "@ws-model-proxy/config/runtime-defaults";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
@@ -52,7 +59,6 @@ import {
   type InstanceRecord,
   type NodeToServerControlFrame,
   type NodeTrustWire,
-  RUNTIME_JOB_PRE_ADMISSION_ERRORS,
   type ServerToNodeControlFrame,
   STOP_PROOF_FAILURES,
 } from "../relay/frames.js";
@@ -150,6 +156,13 @@ function activeOwner(now: Date): Prisma.UserWhereInput {
   };
 }
 
+/**
+ * A start whose run has reservations, on a node whose CLI cannot read them (from before
+ * `features.jobReservations`): refused before it is sent, the instance FAILS until the CLI is
+ * upgraded (`TERMINAL_START_ERRORS`).
+ */
+export const CLI_UPGRADE_REQUIRED = "cli_upgrade_required";
+
 /** Codes that prove a stop cannot be proven by the node: a person decides (Mark as stopped). */
 const UNPROVABLE_STOP = new Set([
   // A person gave up on an interactive stop: they decide (Mark as stopped), nothing is retried.
@@ -160,7 +173,6 @@ const UNPROVABLE_STOP = new Set([
   "owned_launch_unconfirmed",
   "launch_unconfirmed",
 ]);
-const PRE_ADMISSION: ReadonlySet<string> = new Set(RUNTIME_JOB_PRE_ADMISSION_ERRORS);
 
 export type LifecycleRelay = {
   sendToNode(nodeId: string, frame: ServerToNodeControlFrame, guard?: SendGuard): boolean;
@@ -171,6 +183,8 @@ export type LifecycleRelay = {
     trust: NodeTrustWire;
     /** The node can hold operator terminals (feature and terminal key). */
     operatorTerminals?: boolean;
+    /** The node's CLI reads a job's `reservations` (hello `features.jobReservations`). */
+    jobReservations?: boolean;
   } | null;
   /** Nodes with a live session here (dispatch looks at their steps only). */
   onlineNodeIds?(): string[];
@@ -278,6 +292,8 @@ const TERMINAL_START_ERRORS: ReadonlySet<string> = new Set([
   "operator_terminals_disabled",
   // A `process` start that hands its server off does so every time: it needs a `service` spec.
   "process_detached",
+  // The node's CLI cannot read the job's reservations until it is upgraded.
+  CLI_UPGRADE_REQUIRED,
 ]);
 
 export type LifecycleOptions = {
@@ -289,7 +305,15 @@ export type LifecycleOptions = {
 type InstanceRow = Prisma.RuntimeInstanceGetPayload<{
   include: {
     Ranks: true;
-    Reservations: { where: { supersededGeneration: null }; select: { index: true; nodeId: true } };
+    Reservations: {
+      where: { supersededGeneration: null };
+      select: {
+        index: true;
+        nodeId: true;
+        resources: true;
+        Node: { select: { id: true; slug: true; trust: true; trustLowerRequestedAt: true } };
+      };
+    };
     LaunchVersion: { select: { spec: true; launchHash: true; advanced: true; editor: true } };
   };
 }>;
@@ -300,17 +324,44 @@ type InstanceRow = Prisma.RuntimeInstanceGetPayload<{
  * start waits for what blockers hold there, and an automatic restart places them again. Nothing
  * is ever dispatched to them, and their claim is the ranks' (`lib/reservations.ts`), so no
  * release path here writes them. Rows a restart superseded go once a START of a later
- * generation is claimed (`dropSupersededReservations`).
+ * generation is claimed (`dropSupersededHolds`).
  */
 const INSTANCE_INCLUDE = {
   Ranks: true,
-  Reservations: { where: CURRENT_RESERVATION_WHERE, select: { index: true, nodeId: true } },
+  Reservations: {
+    where: CURRENT_RESERVATION_WHERE,
+    // Their node's slug goes into the run's steps (`stepReservations`); its trust is checked
+    // before an agent's start (`claimStep`).
+    select: {
+      index: true,
+      nodeId: true,
+      // The worker GPUs placement recorded (`resources.gpus`) go to the launcher too.
+      resources: true,
+      Node: { select: { id: true, slug: true, trust: true, trustLowerRequestedAt: true } },
+    },
+  },
   LaunchVersion: { select: { spec: true, launchHash: true, advanced: true, editor: true } },
 } as const;
 
 /** Rows read without the include (older callers' fixtures) have none. */
 function reservationsOf(instance: InstanceRow): InstanceRow["Reservations"] {
   return instance.Reservations ?? [];
+}
+
+/**
+ * The run's reservation nodes (and the worker GPUs each was given) as its steps carry them
+ * (single-node instances only; a row whose node was deleted is left out: the instance is stopping or waits to be placed again).
+ */
+function stepReservations(instance: InstanceRow): StepReservation[] {
+  if (instance.Ranks.length !== 1) return [];
+  return reservationsOf(instance).flatMap((row) => {
+    if (!row.nodeId || !row.Node) return [];
+    // The GPUs placement accounted to it on the worker (absent: none recorded).
+    const gpuIds = claimGpuIds(row.resources);
+    return [
+      { index: row.index, nodeId: row.nodeId, node: row.Node.slug, ...(gpuIds ? { gpuIds } : {}) },
+    ];
+  });
 }
 
 /**
@@ -576,6 +627,7 @@ export class RuntimeLifecycle {
       generation: run,
       operationId,
       physical,
+      reservations: stepReservations(instance),
     });
     await this.insertSteps(tx, instance, run, steps);
     // Earlier probes belong to the previous run.
@@ -605,13 +657,14 @@ export class RuntimeLifecycle {
     instance: InstanceRow,
     rank: number,
   ): Promise<Physical | undefined> {
-    const stored = await physicalLaunchIntent(tx, instance.id, rank, PRE_ADMISSION);
-    const intent = stepIntentSchema.safeParse(stored);
+    const stored = await physicalLaunch(tx, instance.id, rank);
+    const intent = stepIntentSchema.safeParse(stored?.intent ?? null);
     if (!intent.success) return undefined;
     let launch = launchOf(instance);
     if (intent.data.launchVersionId !== instance.launchVersionId) {
-      const version = await tx.runtimeVersion.findUnique({
-        where: { id: intent.data.launchVersionId },
+      // Owner-scoped, like the command author's lookup (`stepCommandAuthor`).
+      const version = await tx.runtimeVersion.findFirst({
+        where: { id: intent.data.launchVersionId, Runtime: { userId: instance.userId } },
         select: { spec: true },
       });
       const spec = version?.spec;
@@ -620,7 +673,7 @@ export class RuntimeLifecycle {
       );
       if (parsed.success) launch = parsed.data;
     }
-    return launch ? { intent: intent.data, launch } : undefined;
+    return launch ? { intent: intent.data, launch, headAddr: stored?.headAddr ?? null } : undefined;
   }
 
   /**
@@ -644,6 +697,7 @@ export class RuntimeLifecycle {
           generation: step.generation,
           intent: step.intent,
           intentHash: step.intentHash,
+          headAddr: step.headAddr ?? null,
         },
       });
     }
@@ -780,12 +834,7 @@ export class RuntimeLifecycle {
     for (const rank of current) {
       if (rank.claim !== "HELD") continue;
       // Provably never ran since the last proven stop (evaluated by the release itself).
-      if (
-        await releaseClaim(tx, rank.id, now, {
-          neverRan: { preAdmissionErrors: PRE_ADMISSION },
-        })
-      )
-        continue;
+      if (await releaseClaim(tx, rank.id, now, { neverRan: true })) continue;
       const stops = stopSteps.filter((step) => step.rank === rank.rank);
       // Offline too long: the stop cannot be proven until the node returns (a person may
       // mark it stopped), whether or not a stop is still queued for it.
@@ -1179,6 +1228,10 @@ export class RuntimeLifecycle {
         phaseChangedAt: now,
         nextRestartAt: null,
         restartsInWindow: { increment: 1 },
+        // The fabric the plan chose (a multi-node instance; `settleStopped` cleared the old
+        // one), as a start's (`writePlannedStarts`): its steps resolve the head address on it.
+        // No fabric fits: the planner refused above and the restart waits.
+        fabricId: plan?.start.fabric?.fabricId ?? null,
       },
     });
     const fresh = await tx.runtimeInstance.findUniqueOrThrow({
@@ -1325,6 +1378,7 @@ export class RuntimeLifecycle {
         launch,
         generation: run,
         sequence: (latest._max.sequence ?? HEALTH_SEQUENCE_BASE - 1) + 1,
+        reservations: stepReservations(instance),
       }),
     ]);
   }
@@ -1487,7 +1541,12 @@ export class RuntimeLifecycle {
   private async claimStep(
     tx: Tx,
     stepId: string,
-    session: { connectionGeneration: number; trust: NodeTrustWire; operatorTerminals?: boolean },
+    session: {
+      connectionGeneration: number;
+      trust: NodeTrustWire;
+      operatorTerminals?: boolean;
+      jobReservations?: boolean;
+    },
   ) {
     const now = this.now();
     const step = await tx.instanceStep.findUnique({
@@ -1584,10 +1643,27 @@ export class RuntimeLifecycle {
     if (node.connectionGeneration !== session.connectionGeneration) return null;
     const fullControl =
       node.trust === "FULL" && node.trustLowerRequestedAt === null && session.trust === "full";
-    // Agents cannot start anything on a Relay-only node, on any path (owner decision).
-    if (startPhase && !fullControl && instance.startedBy === "AGENT") {
+    // Agents cannot start anything on a Relay-only node, on any path (owner decision): nor
+    // reserve memory on one (a reservation node lowered after placement; a deleted one counts
+    // as not Full, as for ranks).
+    if (
+      startPhase &&
+      instance.startedBy === "AGENT" &&
+      (!fullControl ||
+        reservationsOf(instance).some(
+          (row) => row.Node === null || effectiveTrust(row.Node) !== "FULL",
+        ))
+    ) {
       await this.failStep(tx, step.id, "trust_relay");
       await this.afterStep(tx, step, false, "trust_relay");
+      return null;
+    }
+    // A run with reservations tells its commands which nodes they got (the job's
+    // `reservations`). A CLI from before them refuses such a job outright, so the start fails
+    // here, saying to upgrade; its stops and probes go without them.
+    if (startPhase && stepJobReservations(intent.data) && session.jobReservations !== true) {
+      await this.failStep(tx, step.id, CLI_UPGRADE_REQUIRED);
+      await this.afterStep(tx, step, false, CLI_UPGRADE_REQUIRED);
       return null;
     }
     if (startPhase) {
@@ -1602,9 +1678,10 @@ export class RuntimeLifecycle {
         },
       });
       if (lower > 0) return null;
-      // This run's leading stop (generation > 1) succeeded: the runs whose reservations a
-      // restart superseded have stopped, so those rows stop holding now.
-      await dropSupersededReservations(tx, instance.id, step.generation);
+      // This run's leading stop (generation > 1) succeeded: the runs whose claims a restart
+      // kept (superseded reservations, the ranks' previous claims) have stopped, so those stop
+      // holding now.
+      await dropSupersededHolds(tx, instance.id, step.generation);
       // Queued behind instances this operation stops: wait until they released.
       const blockers = [...new Set(instance.Ranks.flatMap((rank) => rank.blockedBy))];
       if (blockers.length > 0) {
@@ -1665,8 +1742,14 @@ export class RuntimeLifecycle {
         return null;
       }
     }
-    let headAddr: string | null = null;
-    if (intent.data.nnodes > 1) {
+    // A stop or status probe names the head address its launch was dispatched with (recorded on
+    // the step), so it still reaches a surviving rank after the head's node was deleted; every
+    // other step (and one recorded before steps kept it) resolves the head's fabric address now.
+    let headAddr: string | null =
+      intent.data.nnodes > 1 && (step.phase === "STOP" || step.phase === "STATUS")
+        ? (step.headAddr ?? null)
+        : null;
+    if (intent.data.nnodes > 1 && !headAddr) {
       const head = instance.Ranks.find((rank) => rank.rank === 0);
       if (intent.data.fabricId && head?.nodeId) {
         const member = await tx.fabricMember.findFirst({
@@ -1682,11 +1765,13 @@ export class RuntimeLifecycle {
       }
     }
     const ownerEpoch = this.ownerEpoch(session.connectionGeneration);
-    // A fresh terminal per dispatch (ids are never reused), with who wrote the command.
+    // A fresh terminal per dispatch (ids are never reused), with who wrote the command: the
+    // author of the version the job names (a stop of a restart's earlier launch names that
+    // launch's version, never the successor's).
     const operator = interactive
       ? {
           terminalId: randomBytes(16).toString("base64url"),
-          commandAuthor: commandAuthor(instance.LaunchVersion.editor),
+          commandAuthor: await this.stepCommandAuthor(tx, instance, intent.data.launchVersionId),
         }
       : undefined;
     // An interactive job's deadline here bounds only its terminal coming up; the person's run
@@ -1703,10 +1788,15 @@ export class RuntimeLifecycle {
         state: "RUNNING",
         ownerEpoch,
         attempts: { increment: 1 },
+        // Sent again after a counted dispatch: that one may have run (it is never forgotten,
+        // whatever this attempt answers).
+        mayHaveRun: mayHaveRunAfterRequeue(step.attempts),
         deadline,
         leaseExpiresAt: deadline,
         notBefore: null,
         operatorHold: null,
+        // What it is sent with: a later stop of this launch names the same head.
+        ...(headAddr ? { headAddr } : {}),
         ...(operator ? { operatorTerminalId: operator.terminalId } : {}),
         ...(step.errorCode && OPERATOR_HOLD_CODES.has(step.errorCode) ? { errorCode: null } : {}),
       },
@@ -1724,6 +1814,7 @@ export class RuntimeLifecycle {
       ownerEpoch,
       headAddr,
       ...(operator ? { operator } : {}),
+      jobReservations: session.jobReservations === true,
     });
   }
 
@@ -1926,7 +2017,15 @@ export class RuntimeLifecycle {
         ownerEpoch: step.ownerEpoch,
         operatorAcceptedAt: null,
       },
-      data: { state: "RUNNING", deadline, leaseExpiresAt: deadline, operatorAcceptedAt: now },
+      // Acceptance implies the screen came up (CHECK `instance_step_operator_shape`): a lost
+      // `awaiting_operator` write left `operatorSince` null, so it is recorded now too.
+      data: {
+        state: "RUNNING",
+        deadline,
+        leaseExpiresAt: deadline,
+        operatorSince: since,
+        operatorAcceptedAt: now,
+      },
     });
     if (changed.count > 0) await this.syncNeedsOperator(tx, step.instanceId);
     return answer;
@@ -1988,6 +2087,7 @@ export class RuntimeLifecycle {
    */
   private async reissueOperatorStep(tx: Tx, step: StepRow): Promise<boolean> {
     if ((await this.closeOperatorKeepingRun(tx, step)) === "running") return false;
+    const attempts = attemptsAfterServerClose(step);
     const changed = await tx.instanceStep.updateMany({
       where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
       data: {
@@ -1996,7 +2096,9 @@ export class RuntimeLifecycle {
         deadline: null,
         leaseExpiresAt: null,
         ...NO_OPERATOR,
-        attempts: attemptsAfterServerClose(step),
+        attempts,
+        // A dispatch that keeps its attempt (its screen was up) may have run.
+        mayHaveRun: attempts === step.attempts ? mayHaveRunAfterRequeue(attempts) : undefined,
       },
     });
     if (changed.count === 0) return false;
@@ -2070,13 +2172,27 @@ export class RuntimeLifecycle {
       if (changed.count > 0) await this.syncNeedsOperator(tx, step.instanceId);
       return;
     }
-    // operator_running: a repeat, or a run reported before its screen, changes nothing.
-    if (step.state !== "AWAITING_OPERATOR") return;
+    // operator_running: a repeat changes nothing. One socket delivers a dispatch's progress in
+    // order, so a RUNNING dispatch with its terminal and no acceptance that reports a run lost
+    // its `awaiting_operator` write (the screen was up): the acceptance is recorded all the
+    // same, with the screen's time (CHECK `instance_step_operator_shape`).
+    const lostScreen =
+      step.state === "RUNNING" &&
+      step.operatorAcceptedAt === null &&
+      step.operatorTerminalId !== null &&
+      interactiveIntent(step.intent);
+    if (step.state !== "AWAITING_OPERATOR" && !lostScreen) return;
     const intent = stepIntentSchema.parse(step.intent);
     const deadline = new Date(now.getTime() + intent.timeoutMs);
     const changed = await tx.instanceStep.updateMany({
-      where,
-      data: { state: "RUNNING", deadline, leaseExpiresAt: deadline, operatorAcceptedAt: now },
+      where: { ...where, operatorAcceptedAt: null },
+      data: {
+        state: "RUNNING",
+        deadline,
+        leaseExpiresAt: deadline,
+        operatorSince: step.operatorSince ?? now,
+        operatorAcceptedAt: now,
+      },
     });
     if (changed.count > 0) await this.syncNeedsOperator(tx, step.instanceId);
   }
@@ -2191,6 +2307,8 @@ export class RuntimeLifecycle {
           deadline: null,
           leaseExpiresAt: null,
           notBefore: null,
+          // Reopened after a counted dispatch (its screen was up): that one may have run.
+          mayHaveRun: mayHaveRunAfterRequeue(step.attempts),
           ...NO_OPERATOR,
           ...(step.errorCode === "operator_terminals_disabled" ? { errorCode: null } : {}),
         },
@@ -2244,6 +2362,25 @@ export class RuntimeLifecycle {
       await this.afterStep(tx, step, false, OPERATOR_CANCELLED);
     });
     this.wake();
+  }
+
+  /**
+   * Who wrote the command of the version a job names: the instance's launch version, or (a stop
+   * or status probe of an earlier launch) that version, read under the instance's owner. A
+   * version not found is "unknown": never the successor's author.
+   */
+  private async stepCommandAuthor(
+    tx: Tx,
+    instance: InstanceRow,
+    launchVersionId: string,
+  ): Promise<"user" | "agent" | "unknown"> {
+    if (launchVersionId === instance.launchVersionId)
+      return commandAuthor(instance.LaunchVersion.editor);
+    const version = await tx.runtimeVersion.findFirst({
+      where: { id: launchVersionId, Runtime: { userId: instance.userId } },
+      select: { editor: true },
+    });
+    return version ? commandAuthor(version.editor) : "unknown";
   }
 
   // ── Inactive (banned or deleting) owners ──
@@ -2910,7 +3047,15 @@ export class RuntimeLifecycle {
         if (step.state !== "RUNNING") return;
         await tx.instanceStep.updateMany({
           where: { id: step.id, state: "RUNNING", ownerEpoch: step.ownerEpoch },
-          data: { state: "PENDING", ownerEpoch: null, deadline: null, leaseExpiresAt: null },
+          data: {
+            state: "PENDING",
+            ownerEpoch: null,
+            deadline: null,
+            leaseExpiresAt: null,
+            // The lost dispatch may have reached the node: a later attempt's refusal does not
+            // prove it never ran.
+            mayHaveRun: mayHaveRunAfterRequeue(step.attempts),
+          },
         });
       }).catch((error: unknown) => console.error(`[lifecycle] ${what} failed`, errorName(error)));
     this.wake();

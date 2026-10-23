@@ -46,6 +46,20 @@ export function followSize(
   return { cols: state.ptyCols, rows: state.ptyRows };
 }
 
+/**
+ * The smallest size a pane fits to. The writer's size is the PTY size for every viewer, so a
+ * squeezed box (a phone with the keyboard open) must not shrink the shell below this.
+ */
+export const TERMINAL_MIN_COLS = 20;
+export const TERMINAL_MIN_ROWS = 5;
+
+export function floorTerminalSize(size: TerminalSize): TerminalSize {
+  return {
+    cols: Math.max(TERMINAL_MIN_COLS, size.cols),
+    rows: Math.max(TERMINAL_MIN_ROWS, size.rows),
+  };
+}
+
 export function sameSize(a: TerminalSize | null | undefined, b: TerminalSize | null | undefined) {
   return !!a && !!b && a.cols === b.cols && a.rows === b.rows;
 }
@@ -58,17 +72,60 @@ export function isFocusReport(data: string): boolean {
 }
 
 /**
- * xterm answers some output on its own (DSR/CPR, DA, focus reports). A follower
- * forwards data only right after real user input, so those replies cannot
- * steal the writer.
+ * Where a piece of input came from. The session hook's gateway decides at send time, not when
+ * the input was made, whether it may go out: `user` input (keys, pastes, mouse) and a ticket's
+ * `typed` command wait while Select text is on and take over the writer when needed; a `reply`
+ * (xterm's automatic answer to output) only ever goes out from the writer.
+ */
+export type TerminalInputOrigin = "user" | "typed" | "reply";
+
+/**
+ * The replies xterm writes on its own when output asks (one reply per onData call): cursor and
+ * status reports (CPR, DSR), device attributes (DA1/DA2), mode reports (DECRPM), window reports
+ * (XTWINOPS), DCS answers (DECRQSS, XTVERSION) and OSC answers (color queries). Keys and mouse
+ * reports never take these forms, with one exception: a modified F3 is `ESC [ 1 ; m R`, the same
+ * bytes as a cursor report. Only its key event tells them apart (`modifiedF3`).
+ */
+const AUTOMATIC_REPLY =
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: ESC and BEL sequences are exactly what this matches.
+  /^(?:\x1b\[[?>]?[\d;]*[Rnc]|\x1b\[\??[\d;]*\$y|\x1b\[[\d;]*t|\x1bP[\s\S]*\x1b\\|\x1b\][\s\S]*(?:\x07|\x1b\\))$/;
+
+const MODIFIED_F3 =
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: ESC is the sequence's first byte.
+  /^\x1b\[1;\d+R$/;
+
+/** Data xterm generated itself in answer to output, never typed or clicked. */
+export function isAutomaticReply(data: string): boolean {
+  return isFocusReport(data) || AUTOMATIC_REPLY.test(data);
+}
+
+/**
+ * The origin of data xterm emits. `modifiedF3`: a modified F3 keydown is being handled right
+ * now, so the cursor-report shape it shares is that key, not a reply.
+ */
+export function terminalDataOrigin(
+  data: string,
+  modifiedF3 = false,
+): Exclude<TerminalInputOrigin, "typed"> {
+  if (modifiedF3 && MODIFIED_F3.test(data)) return "user";
+  return isAutomaticReply(data) ? "reply" : "user";
+}
+
+/**
+ * xterm answers some output on its own (focus reports and the replies above). A follower forwards
+ * only real input: data that is not a reply, right after a real keydown, paste, composition or
+ * click. Timing alone cannot tell a reply that arrives just after a keypress from the key itself,
+ * so a reply is never input, whenever it arrives. The writer forwards everything: the program
+ * that asked needs its answer.
  */
 export function shouldForwardTerminalData(input: {
   following: boolean;
   userInput: boolean;
   data: string;
+  modifiedF3?: boolean;
 }): boolean {
   if (!input.following) return true;
-  if (isFocusReport(input.data)) return false;
+  if (terminalDataOrigin(input.data, input.modifiedF3) === "reply") return false;
   return input.userInput;
 }
 
@@ -85,6 +142,11 @@ export class TerminalUserInputGate {
   armed(nowMs: number): boolean {
     const elapsed = nowMs - this.lastAt;
     return elapsed >= 0 && elapsed <= this.windowMs;
+  }
+
+  /** Forget earlier input: a new xterm, a new attach, or a hidden pane starts unarmed. */
+  disarm(): void {
+    this.lastAt = Number.NEGATIVE_INFINITY;
   }
 }
 

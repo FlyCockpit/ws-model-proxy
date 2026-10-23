@@ -2,7 +2,11 @@
 
 import { webcrypto } from "node:crypto";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
-import { TERMINAL_BROWSER_JSON_WINDOW_MS } from "@ws-model-proxy/config/terminal-socket-policy";
+import {
+  TERMINAL_BROWSER_BINARY_BUDGET,
+  TERMINAL_BROWSER_BINARY_WINDOW_MS,
+  TERMINAL_BROWSER_JSON_WINDOW_MS,
+} from "@ws-model-proxy/config/terminal-socket-policy";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -399,6 +403,8 @@ describe("useTerminalSessions (multi-viewer)", () => {
         return result !== "closed";
       });
       if (result === "ending") act(() => view.result.current.endSession(localId));
+      // The visible pane has measured its box (taking over needs a size).
+      act(() => view.result.current.sendResize(localId, 100, 30));
       let sent = false;
       await act(async () => {
         sent = await view.result.current.pasteImage(
@@ -417,10 +423,280 @@ describe("useTerminalSessions (multi-viewer)", () => {
     const { view, events, outKey } = await setupV2();
     await broadcast(outKey, 1, 1, "world");
     await waitFor(() => expect(outputText(events)).toBe("hello world"));
-    expect(events).toContainEqual({ kind: "size", cols: 120, rows: 40 });
+    expect(events).toContainEqual(expect.objectContaining({ kind: "size", cols: 120, rows: 40 }));
     await waitFor(() => {
       expect(view.result.current.tabs[0]).toMatchObject({ ptyCols: 120, ptyRows: 40 });
     });
+  });
+
+  it("drops output that finishes decrypting after a detach retired its session", async () => {
+    const { events, outKey } = await setupV2();
+    await waitFor(() => expect(outputText(events)).toBe("hello "));
+    const frame = await sealBroadcast(outKey, 1, 1, "stale");
+    // Decryption starts (the receive chain checks the session first, a few microtasks in), then
+    // the relay detaches this viewer while WebCrypto is still working.
+    act(() => handlers().onSealed(frame));
+    for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+    message({ type: "detached", terminalId: TERMINAL_ID, reason: "slow" });
+    await settle();
+    expect(outputText(events)).toBe("hello ");
+  });
+
+  it("pauses all of a tab's input while Select text is on, and only for the active tab", async () => {
+    const { view, cli, localId } = await setupV2();
+    act(() => view.result.current.setSelecting("another-tab"));
+    expect(view.result.current.selectingLocalId).toBeNull();
+    act(() => view.result.current.setSelecting(localId));
+    expect(view.result.current.selectingLocalId).toBe(localId);
+    act(() => view.result.current.sendInput(localId, "typed while selecting"));
+    let pasted = true;
+    await act(async () => {
+      pasted = await view.result.current.pasteImage(localId, "0".repeat(32), "/tmp/a.png ");
+    });
+    expect(pasted).toBe(false);
+    await settle();
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+    act(() => view.result.current.setSelecting(null));
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    act(() => view.result.current.sendInput(localId, "ls"));
+    // A takeover resize comes first when this viewer was not the writer.
+    await vi.waitFor(() => expect(socket.sendFrame).toHaveBeenCalled());
+    const frames = await browserFrames(cli);
+    expect(frames.filter((frame) => "data" in frame).map((frame) => frame.data)).toEqual(["ls"]);
+  });
+
+  it("holds input queued just before Select text and sends it when the mode ends", async () => {
+    const { view, cli, localId } = await setupV2();
+    useFakeClock();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    await advanceClock(200);
+    socket.sendFrame.mockClear();
+    act(() => view.result.current.sendInput(localId, "a"));
+    // settle() waits on the real clock: the batching window (fake clock) stays open.
+    await settle();
+    expect(socket.sendFrame).toHaveBeenCalledTimes(1);
+    // Within the batching window: queued, not sent yet.
+    act(() => view.result.current.sendInput(localId, "b"));
+    act(() => view.result.current.setSelecting(localId));
+    await advanceClock(200);
+    expect(socket.sendFrame).toHaveBeenCalledTimes(1);
+    act(() => view.result.current.setSelecting(null));
+    await vi.waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(2));
+    const frames = await browserFrames(cli);
+    expect(frames.filter((frame) => "data" in frame).map((frame) => frame.data)).toEqual([
+      "a",
+      "b",
+    ]);
+  });
+
+  it("re-checks Select text after sealing: a frame refused then is held and sent later", async () => {
+    const { view, cli, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    act(() => view.result.current.sendResize(localId, 120, 40));
+    // Sent at once (no batching wait), then Select text starts while it is being sealed.
+    act(() => {
+      view.result.current.sendInput(localId, "typed just before");
+      view.result.current.setSelecting(localId);
+    });
+    await settle();
+    const before = await browserFrames(cli);
+    expect(before.filter((frame) => "data" in frame)).toEqual([]);
+    act(() => view.result.current.setSelecting(null));
+    await settle();
+    const after = await browserFrames(cli);
+    expect(after.filter((frame) => "data" in frame).map((frame) => frame.data)).toEqual([
+      "typed just before",
+    ]);
+  });
+
+  it("keeps input in order when an earlier frame is refused after sealing", async () => {
+    const { view, cli, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    act(() => view.result.current.sendResize(localId, 120, 40));
+    act(() => {
+      view.result.current.sendInput(localId, "first");
+      view.result.current.setSelecting(localId);
+    });
+    await settle();
+    act(() => view.result.current.setSelecting(null));
+    act(() => view.result.current.sendInput(localId, "second"));
+    await settle();
+    const data = (await browserFrames(cli))
+      .filter((frame) => "data" in frame)
+      .map((frame) => frame.data)
+      .join("");
+    expect(data).toBe("firstsecond");
+  });
+
+  it("does not take over when the tab is hidden while its takeover is sealed", async () => {
+    const { view, cli, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    act(() => {
+      view.result.current.sendInput(localId, "ls");
+      view.result.current.sizeUnavailable(localId);
+    });
+    await settle();
+    expect(await browserFrames(cli)).toEqual([]);
+    expect(view.result.current.tabs[0]?.writer).toBe("other");
+  });
+
+  it("sends every frame with a higher sequence number than the one before", async () => {
+    const { view, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    await settle();
+    socket.sendFrame.mockClear();
+    useFakeClock();
+    // The resize timer (100 ms) fires while "b" waits in its batching window (50 ms after "a"):
+    // it flushes "b" and sends the resize behind it.
+    act(() => view.result.current.sendResize(localId, 110, 35));
+    await advanceClock(60);
+    act(() => view.result.current.sendInput(localId, "a"));
+    act(() => view.result.current.sendInput(localId, "b"));
+    await advanceClock(200);
+    await settle();
+    const seqs = socket.sendFrame.mock.calls.map(([frame]) => decodeSealedFrame(frame).seq);
+    expect(seqs.length).toBeGreaterThanOrEqual(2);
+    expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+    expect(new Set(seqs).size).toBe(seqs.length);
+  });
+
+  it("sends nothing more once End session is pressed, even input being sealed", async () => {
+    const { view, cli, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    act(() => view.result.current.sendInput(localId, "being sealed"));
+    // The send step has taken the input and is sealing it when End session is pressed.
+    for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+    act(() => view.result.current.endSession(localId));
+    await settle();
+    expect((await browserFrames(cli)).filter((frame) => "data" in frame)).toEqual([]);
+  });
+
+  it("settles a queued image paste as not sent when its attach ends", async () => {
+    const { view, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    let pasted: Promise<boolean> = Promise.resolve(true);
+    act(() => {
+      pasted = view.result.current.pasteImage(localId, "0".repeat(32), "/tmp/a.png ");
+      view.result.current.endSession(localId);
+    });
+    await expect(pasted).resolves.toBe(false);
+  });
+
+  it("does not become the writer when its takeover frames do not reach the socket", async () => {
+    const { view, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    socket.sendFrame.mockReturnValue(false);
+    act(() => view.result.current.sendInput(localId, "ls"));
+    await settle();
+    expect(socket.sendFrame).toHaveBeenCalled();
+    expect(view.result.current.tabs[0]?.writer).toBe("other");
+  });
+
+  it("retires the pane when the CLI rejects this viewer", async () => {
+    const { view, localId } = await setupV2();
+    const retire = vi.fn();
+    act(() => {
+      view.result.current.subscribeOutput(localId, () => undefined, undefined, retire);
+    });
+    message({ type: "rejected", terminalId: TERMINAL_ID, reason: "bad_frame", approvalCode: null });
+    expect(retire).toHaveBeenCalled();
+  });
+
+  it("delivers output from an ended attach marked retired, however late the pane subscribes", async () => {
+    currentCli = await fakeCli();
+    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+    message({
+      type: "terminals",
+      clis: [await listedCli(currentCli)],
+      terminals: [listedTerminal(true)],
+    });
+    const cli = await attachAsCli(VIEWER_ID);
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    const localId = view.result.current.tabs[0]?.localId ?? "";
+    // Output buffered with no pane subscribed yet; then the shell exits.
+    await unicast(cli, text("before exit"));
+    await settle();
+    message({ type: "exit", terminalId: TERMINAL_ID, exitCode: 0, signal: null });
+    await settle();
+    const events: TerminalOutputEvent[] = [];
+    act(() => {
+      view.result.current.subscribeOutput(localId, (event) => events.push(event));
+    });
+    expect(events.length).toBeGreaterThan(0);
+    expect(events.every((event) => event.retired === true)).toBe(true);
+  });
+
+  it("does not send a sealed reply once the writer changed", async () => {
+    const { view, cli, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "you" });
+    act(() => {
+      view.result.current.sendInput(localId, "\x1b[5;1R", "reply");
+      handlers().onMessage({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+    });
+    await settle();
+    expect((await browserFrames(cli)).filter((frame) => "data" in frame)).toEqual([]);
+  });
+
+  it("never sends input held for one attach to the next", async () => {
+    const { view, localId } = await setupV2();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    act(() => view.result.current.setSelecting(localId));
+    act(() => view.result.current.sendInput(localId, "held for the old attach"));
+    message({ type: "detached", terminalId: TERMINAL_ID, reason: "slow" });
+    await waitFor(() => expect(sentOfType("attach")).toHaveLength(2), { timeout: 3_000 });
+    const next = await attachAsCli(VIEWER_ID, 1);
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    // The new attach's writer, with a measured box: only retirement can stop the old input.
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    act(() => view.result.current.setSelecting(localId));
+    act(() => view.result.current.setSelecting(null));
+    await settle();
+    expect((await browserFrames(next)).filter((frame) => "data" in frame)).toEqual([]);
+  });
+
+  it("drops a queued reply when the writer moved on before it was sent", async () => {
+    const { view, cli, localId } = await setupV2();
+    useFakeClock();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "you" });
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    await advanceClock(200);
+    socket.sendFrame.mockClear();
+    act(() => view.result.current.sendInput(localId, "x"));
+    // settle() waits on the real clock: the batching window (fake clock) stays open.
+    await settle();
+    expect(socket.sendFrame).toHaveBeenCalledTimes(1);
+    act(() => view.result.current.sendInput(localId, "\x1b[5;1R", "reply"));
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+    await advanceClock(200);
+    expect(socket.sendFrame).toHaveBeenCalledTimes(1);
+    const frames = await browserFrames(cli);
+    expect(frames.filter((frame) => "data" in frame).map((frame) => frame.data)).toEqual(["x"]);
+  });
+
+  it("never takes over from a hidden or unmeasured tab", async () => {
+    const { view, localId } = await setupV2();
+    useFakeClock();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+    // Never measured: no size to give the PTY.
+    act(() => view.result.current.sendInput(localId, "a"));
+    await advanceClock(200);
+    // Measured, then its box went away (hidden behind an ancestor, or zero-size).
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    act(() => view.result.current.sizeUnavailable(localId));
+    act(() => view.result.current.sendInput(localId, "b"));
+    let pasted = true;
+    await act(async () => {
+      pasted = await view.result.current.pasteImage(localId, "0".repeat(32), "/tmp/a.png ");
+    });
+    await advanceClock(200);
+    expect(pasted).toBe(false);
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+    expect(view.result.current.tabs[0]?.writer).toBe("other");
   });
 
   it("updates the writer and viewer count from a viewers message", async () => {
@@ -447,8 +723,9 @@ describe("useTerminalSessions (multi-viewer)", () => {
     message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
     act(() => view.result.current.sendResize(localId, 100, 30));
     act(() => view.result.current.sendInput(localId, "ls"));
-    expect(view.result.current.tabs[0]?.writer).toBe("you");
+    // The writer becomes "you" once the takeover frames actually went out, not before.
     await vi.waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(view.result.current.tabs[0]?.writer).toBe("you"));
     const frames = await browserFrames(cli);
     expect(frames).toEqual([
       { seq: 1, resize: [100, 30] },
@@ -551,6 +828,29 @@ describe("useTerminalSessions End session until the relay confirms", () => {
     expect(closes()).toHaveLength(1);
     message({ type: "closed", terminalId: TERMINAL_ID, requestId: closes()[0]?.requestId ?? null });
     expect(view.result.current.tabs).toEqual([]);
+  });
+
+  it("attaches again when the relay refuses End session, so the running shell takes keys", async () => {
+    const { view, localId } = await setupV2();
+    act(() => view.result.current.endSession(localId));
+    const attaches = sentOfType("attach").length;
+    message({
+      type: "error",
+      terminalId: TERMINAL_ID,
+      requestId: closes()[0]?.requestId,
+      code: "invalid",
+      message: "",
+    });
+    expect(view.result.current.tabs[0]).toMatchObject({ localId, ending: "failed" });
+    // The ended attach stays ended; a fresh one takes its place.
+    await waitFor(() => expect(sentOfType("attach")).toHaveLength(attaches + 1));
+    const cli = await attachAsCli(VIEWER_ID, attaches);
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    socket.sendFrame.mockClear();
+    act(() => view.result.current.sendInput(localId, "ls\r"));
+    await waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(1));
+    expect(await browserFrames(cli)).toEqual([{ seq: 1, data: "ls\r" }]);
   });
 
   it("sends a close lost with its socket again when the next list still has the terminal", async () => {
@@ -1537,6 +1837,120 @@ describe("useTerminalSessions terminal tickets", () => {
     expect(await browserFrames(cli)).toEqual([{ seq: 1, data: "nvidia-smi -L" }]);
   });
 
+  it("waits for the shell's first output however long it takes, even when the tab is shown and measured", async () => {
+    const view = await openWith("nvidia-smi -L");
+    const cli = await openAsCli();
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    const localId = view.result.current.tabs[0]?.localId ?? "";
+    // Showing and measuring the tab resumes a command already waiting for quiet, nothing more.
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    await act(async () => new Promise((resolve) => realSetTimeout(resolve, 600)));
+    expect((await browserFrames(cli)).filter((frame) => "data" in frame)).toEqual([]);
+    await unicast(cli, text("$ "));
+    await waitFor(async () =>
+      expect((await browserFrames(cli)).filter((frame) => "data" in frame)).toEqual([
+        expect.objectContaining({ data: "nvidia-smi -L" }),
+      ]),
+    );
+  });
+
+  it("neither types nor retries a pending command once the page unmounts", async () => {
+    const view = await openWith("nvidia-smi -L");
+    const cli = await openAsCli();
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    useFakeClock();
+    await unicast(cli, text("$ "));
+    await settle();
+    // The command waits for quiet when the page goes away.
+    view.unmount();
+    socket.sendFrame.mockReturnValue(false);
+    await advanceClock(1_000);
+    await advanceClock(1_000);
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("holds the queued command while Select text is on and types it after", async () => {
+    const view = await openWith("nvidia-smi -L");
+    const cli = await openAsCli();
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    const localId = view.result.current.tabs[0]?.localId ?? "";
+    act(() => view.result.current.setSelecting(localId));
+    useFakeClock();
+    await unicast(cli, text("$ "));
+    await settle();
+    await advanceClock(1_000);
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+    act(() => view.result.current.setSelecting(null));
+    await advanceClock(1_000);
+    await vi.waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(1));
+    expect(await browserFrames(cli)).toEqual([{ seq: 1, data: "nvidia-smi -L" }]);
+  });
+
+  it("keeps a follower's queued command until its tab is measured, then types it", async () => {
+    const view = await openWith("nvidia-smi -L");
+    const cli = await openAsCli();
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    const localId = view.result.current.tabs[0]?.localId ?? "";
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 2, writer: "other" });
+    useFakeClock();
+    await unicast(cli, text("$ "));
+    await settle();
+    await advanceClock(1_000);
+    // No measured box: taking over is impossible, and the command must not be lost.
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    await advanceClock(1_000);
+    await vi.waitFor(() => expect(socket.sendFrame).toHaveBeenCalledTimes(2));
+    expect(await browserFrames(cli)).toEqual([
+      { seq: 1, resize: [100, 30] },
+      { seq: 2, data: "nvidia-smi -L" },
+    ]);
+  });
+
+  it("keeps a typed command whose frame was being sealed when the session detached", async () => {
+    const view = await openWith("nvidia-smi -L");
+    const cli = await openAsCli();
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    const localId = view.result.current.tabs[0]?.localId ?? "";
+    act(() => view.result.current.sendResize(localId, 100, 30));
+    useFakeClock();
+    await unicast(cli, text("$ "));
+    await settle();
+    // The quiet timer fires and the command is sealed; the relay detaches meanwhile.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(400);
+      handlers().onMessage({ type: "detached", terminalId: TERMINAL_ID, reason: "slow" });
+    });
+    await settle();
+    expect((await browserFrames(cli)).filter((frame) => "data" in frame)).toEqual([]);
+    // Still waiting for the next attach: it is typed there. (The reattach backoff runs on the
+    // fake clock.)
+    await advanceClock(2_000);
+    vi.useRealTimers();
+    await waitFor(() => expect(sentOfType("attach")).toHaveLength(1), { timeout: 3_000 });
+    const next = await attachAsCli(VIEWER_ID, 0);
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    await unicast(next, text("$ "));
+    await waitFor(
+      async () =>
+        expect(
+          (await browserFrames(next)).filter((frame) => "data" in frame).map((f) => f.data),
+        ).toEqual(["nvidia-smi -L"]),
+      { timeout: 3_000 },
+    );
+  });
+
+  it("makes a listed tab active after a disconnect removed the active opening tab", async () => {
+    const view = await openWith();
+    await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
+    const opening = view.result.current.tabs[0]?.localId;
+    expect(view.result.current.activeLocalId).toBe(opening);
+    act(() => handlers().onDisconnect?.());
+    expect(view.result.current.tabs).toEqual([]);
+    expect(view.result.current.activeLocalId).toBeNull();
+  });
+
   it("types only once the shell's output has been quiet for a moment", async () => {
     const view = await openWith("nvidia-smi -L");
     const cli = await openAsCli();
@@ -1646,4 +2060,82 @@ describe("useTerminalSessions operator-terminal tabs (runtimes.steps.attach)", (
     expect(sentOfType("detach")).toEqual([{ type: "detach", terminalId: TERMINAL_ID }]);
     expect(view.result.current.tabs).toEqual([]);
   });
+});
+
+describe("useTerminalSessions frame budget", () => {
+  /**
+   * Advance the fake clock until no more frames go out. A step waiting for budget sets its timer
+   * only after a real-time seal, so one large advance can leave later steps still waiting.
+   */
+  async function drainBudget(sentAt: readonly number[]) {
+    for (let idle = 0; idle < 3; ) {
+      const before = sentAt.length;
+      await advanceClock(TERMINAL_BROWSER_BINARY_WINDOW_MS / 4);
+      idle = sentAt.length === before ? idle + 1 : 0;
+    }
+  }
+
+  it("keeps the sealed frames of input and replies within the relay's per-terminal budget", async () => {
+    const { view, localId, cli } = await setup();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    useFakeClock();
+    const sentAt: number[] = [];
+    socket.sendFrame.mockImplementation(() => {
+      sentAt.push(performance.now());
+      return true;
+    });
+    // A key and an automatic reply every 50 ms: two frames per drain.
+    const keys = 150;
+    for (let index = 0; index < keys; index += 1) {
+      act(() => {
+        view.result.current.sendInput(localId, "x", "user");
+        view.result.current.sendInput(localId, "\x1b[0n", "reply");
+      });
+      await advanceClock(50);
+    }
+    await drainBudget(sentAt);
+    for (const start of sentAt) {
+      const inWindow = sentAt.filter(
+        (at) => at >= start && at < start + TERMINAL_BROWSER_BINARY_WINDOW_MS,
+      );
+      expect(inWindow.length).toBeLessThanOrEqual(TERMINAL_BROWSER_BINARY_BUDGET);
+    }
+    // Nothing was lost: the frames that waited went out later, in order.
+    const typed = (await browserFrames(cli))
+      .flatMap((frame) => ("data" in frame ? [frame.data] : []))
+      .join("")
+      .replaceAll("\x1b[0n", "");
+    expect(typed).toBe("x".repeat(keys));
+  }, 60_000);
+
+  it("splits input that piled up into more frames than the budget across later steps", async () => {
+    const { view, localId, cli } = await setup();
+    message({ type: "viewers", terminalId: TERMINAL_ID, count: 1, writer: "you" });
+    useFakeClock();
+    const sentAt: number[] = [];
+    socket.sendFrame.mockImplementation(() => {
+      sentAt.push(performance.now());
+      return true;
+    });
+    // Alternating keys and replies made at once: one frame per run, far past the budget.
+    const keys = 200;
+    act(() => {
+      for (let index = 0; index < keys; index += 1) {
+        view.result.current.sendInput(localId, "x", "user");
+        view.result.current.sendInput(localId, "\x1b[0n", "reply");
+      }
+    });
+    await drainBudget(sentAt);
+    for (const start of sentAt) {
+      const inWindow = sentAt.filter(
+        (at) => at >= start && at < start + TERMINAL_BROWSER_BINARY_WINDOW_MS,
+      );
+      expect(inWindow.length).toBeLessThanOrEqual(TERMINAL_BROWSER_BINARY_BUDGET);
+    }
+    const typed = (await browserFrames(cli))
+      .flatMap((frame) => ("data" in frame ? [frame.data] : []))
+      .join("")
+      .replaceAll("\x1b[0n", "");
+    expect(typed).toBe("x".repeat(keys));
+  }, 60_000);
 });

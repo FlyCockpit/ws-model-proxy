@@ -708,6 +708,10 @@ const CENSUS: Record<string, [number, string]> = {
     1,
     "The only increment of a run.",
   ],
+  "packages/api/src/lib/instance-run.ts | physicalLaunchIntents | $queryRaw | raw": [
+    1,
+    "Read-only batched physical launches of live-claimed ranks (SELECT only, owner-scoped).",
+  ],
   "packages/api/src/lib/instance-run.ts | resolveRun | runtimeInstance.updateMany | runGeneration":
     [1, "A legacy row's one-time bootstrap (WHERE runGeneration = 0)."],
   "packages/api/src/lib/metrics-query.ts | bucketExpr | Prisma.raw | opaque": [
@@ -736,9 +740,17 @@ const CENSUS: Record<string, [number, string]> = {
     3,
     "Histogram columns from fixed lists (read-only overview).",
   ],
-  [`${RS} | dropSupersededReservations | instanceReservation.deleteMany | delete`]: [
+  [`${RS} | dropSupersededHolds | instanceRank.updateMany | other`]: [
+    1,
+    "Clears the ranks' previous claims (prev*) once a later START was claimed (after the leading STOP proved the old run ended).",
+  ],
+  [`${RS} | dropSupersededHolds | instanceReservation.deleteMany | delete`]: [
     1,
     "Superseded rows once a later START was claimed (after the leading STOP proved the old run ended).",
+  ],
+  [`${RS} | keepPreviousRankClaims | instanceRank.update | other`]: [
+    1,
+    "A rank's previous claim (prev*) and plan generation, for the run retakeInstanceClaims just began (claim untouched).",
   ],
   [`${RS} | replaceInstanceReservations | instanceReservation.createMany | opaque`]: [
     2,

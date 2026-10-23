@@ -149,6 +149,17 @@ instance stays `STOPPED` with `phaseReason` `waiting_<reason>` (for example
 restart budget (`restartsInWindow`) while it waits. The runtime page shows the
 reason.
 
+A restart of an instance that may still be running (`runtime_start` with its
+`instanceId`, or an automatic restart of a rank marked stopped) keeps what the
+old run holds counted until the new run's leading stop proves it stopped: its
+memory, GPUs and ports, beside the new claims. On one node the old and new
+claims of the instance overlap instead of adding (memory is the larger of the
+two, GPUs and ports the union), so restarting one of two models that share a
+node costs only that model's growth. A restart that would fit only once the
+old run's claims are released is refused `restart_overlap_no_room` (stop the
+instance first and start it once the stop is confirmed); an automatic restart
+waits with `waiting_restart_overlap_no_room`.
+
 Placement work is bounded: one start (or profile apply, or automatic restart)
 plans with at most a fixed amount of work (fits tried, nodes checked, stops
 considered). A plan that needs more, on a very large fleet with many stops to
@@ -164,7 +175,9 @@ inventory record about the earlier run releases nothing, does not make the
 new run READY and does not stop it. Inside a run, an inventory record proves a
 stop only when it was taken after the run's last launch. So the new run's
 port, memory, GPUs and reservations stay held until that run's own stop is
-proven (or a person releases them).
+proven (or a person releases them). `runtimes_get` lists what still holds for
+it: each rank's `previousClaim` (port, dist port, memory) and the instance's
+`supersededReservations`, beside the current claims and `reservations`.
 
 The new run first stops what the earlier one left running: its leading stop
 names the process that actually runs (its launch version, port and unit, even
@@ -312,7 +325,11 @@ A spec has exactly one of:
     stopping runtime keeps it until the stop is proven; marked stopped, it
     stays counted). A restart that moves, shrinks or removes a reservation of
     a run that may still be running keeps the old reservation counted until
-    the new run's leading stop proves the old run stopped. An automatic
+    the new run's leading stop proves the old run stopped (on the same node,
+    the old and new reservation overlap: the larger one counts). Deleting the
+    runtime's own node does not release the claim while it holds reservations
+    on other nodes: nothing can prove the stop then, so a person marks it
+    stopped and releases it. An automatic
     restart after a crash (of any runtime) checks for room like a start (the runtime's own
     nodes and ports, reservations again by labels, their previous nodes
     first); when the planner refuses (not enough memory, a port in use, a node
@@ -328,7 +345,22 @@ A spec has exactly one of:
     is true. The instance view lists
     `reservations` (node, labels, `memoryGb`, `reserved`), the start preview
     lists where each goes, and node views count them in `reservedNowMemoryGb`
-    and list them with `role: "reservation"`.
+    and list them with `role: "reservation"`. The runtime's commands are told
+    which nodes the run got: `WSMP_RESERVATION_COUNT`, and per reservation
+    `WSMP_RESERVATION_<index>_NODE` (the node's slug),
+    `WSMP_RESERVATION_<index>_NODE_ID` and, when placement gave it GPUs there,
+    `WSMP_RESERVATION_<index>_GPUS` (indices such as `0,3`, the format the
+    rank's own `CUDA_VISIBLE_DEVICES` gets); a stop of an earlier run gets the
+    nodes (and GPUs) that run got. A runtime with reservations needs a current `wsmp` on its
+    node: an older one cannot be told, so the start fails with `phaseReason`
+    `cli_upgrade_required` (upgrade `wsmp` there and start again). Agents may
+    restart, stop, mark stopped or ask to release a runtime only while every
+    node it holds, reservations included, is at Full control (`trust_relay`
+    otherwise), and an agent's start fails `trust_relay` when a reservation's
+    node was lowered after placement. A profile counts an instance as running
+    on every node it reserves: an instance whose reservation is on a hold-line
+    node, or that reserves a profile node from outside the profile, is stopped
+    by the apply.
   - `commands` (one entry, or one per rank): `start` required; `stop`
     required for `service` and for an interactive stop, optional for `process`
     (the node's stop ends everything in the rank's slice and proves it, so a
@@ -373,6 +405,20 @@ since a claim taken for an earlier version stays as it was taken): an instance
 whose claims differ is listed in `needsRestart` (`launch_changed`) and is
 restarted with `runtime_start` (its instance id), which places the new claims
 with the start's capacity check.
+
+A Full-control node holds at most 128 server-origin runtime definitions it
+needs: the version of everything that runs or is stopping there (a restart
+counts both its old and its new version until the old run's stop is proven),
+and the version every unfinished step there names. These are always sent to
+the node; only other versions (current versions to start next, profile pins)
+are left out when the node is full. A start, restart or profile apply that
+would make a Full-control node need a 129th definition is refused
+`definition_slots_full` (the subject is the node; an unpinned start goes to
+another node). `runtime_update` with `restartRunning` lists such an instance
+in `needsRestart` with `definition_slots_full` (the new version is still
+saved), and an automatic restart waits with `waiting_definition_slots_full`
+without using its restart budget. Stop an instance on that node, or wait for
+restarts to finish. Relay-only nodes start only versions they hold.
 
 ### Request compatibility
 

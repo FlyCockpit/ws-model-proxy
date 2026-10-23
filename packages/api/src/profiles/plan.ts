@@ -47,6 +47,8 @@ export type PlanNode = {
   portRange: readonly [number, number];
   /** Version ids the node holds (frozen at Relay only). */
   heldVersionIds: ReadonlySet<string>;
+  /** Server-origin version ids the node requires now (`PlacementNode.requiredVersionIds`). */
+  requiredVersionIds: ReadonlySet<string>;
   /**
    * The fabrics the node froze at Relay only (`placementNodeOf(...).frozenFabrics`). Absent or
    * null: not checked (the node refuses a head outside them at dispatch).
@@ -67,6 +69,13 @@ export type PlanInstance = {
   desiredRunning: boolean;
   /** Node of each rank (rank order). */
   rankNodeIds: readonly string[];
+  /** Nodes of the current plan's reservations (memory it holds there). Absent: none. */
+  reservationNodeIds?: readonly string[];
+  /**
+   * A node an agent's stop would reach that is not at Full control (`agentBlockedNode`: ranks'
+   * and reservations', possibly outside the profile). Absent or null: none.
+   */
+  agentBlockedNodeId?: string | null;
 };
 
 export type PlanItem = {
@@ -84,6 +93,8 @@ export type PlanVersion = {
   runtimeSlug: string;
   currentVersionId: string | null;
   spec: RuntimeSpec | null;
+  /** A node-origin runtime's version (takes no definition slot). Absent: server-origin. */
+  nodeOrigin?: boolean;
 };
 
 export type PlanInput = {
@@ -123,11 +134,18 @@ function refusal(reason: Refusal["reason"], subjectId: string | null, message: s
 
 /**
  * Whether a running instance counts toward a pinned item: same runtime and launched version,
- * and every rank on the item's nodes (or the profile's nodes) without a hold line. The view's
- * `runningNow` and the plan's "kept" use this one rule.
+ * every rank on the item's nodes (or the profile's nodes) without a hold line, and every
+ * reservation on a profile node without a hold line (reservations go by their labels on any
+ * placeable node of the profile, whatever the item pins its ranks to, as starts place them).
+ * The view's `runningNow` and the plan's "kept" use this one rule.
  */
 export function instanceServesItem(
-  instance: { runtimeId: string; launchVersionId: string; rankNodeIds: readonly string[] },
+  instance: {
+    runtimeId: string;
+    launchVersionId: string;
+    rankNodeIds: readonly string[];
+    reservationNodeIds?: readonly string[];
+  },
   item: { runtimeId: string; versionId: string; nodeIds: readonly string[] },
   ownedIds: readonly string[],
   holdLines: ReadonlySet<string>,
@@ -138,7 +156,9 @@ export function instanceServesItem(
   const allowed = new Set(
     (item.nodeIds.length > 0 ? item.nodeIds : ownedIds).filter((id) => !holdLines.has(id)),
   );
-  return instance.rankNodeIds.every((nodeId) => allowed.has(nodeId));
+  if (!instance.rankNodeIds.every((nodeId) => allowed.has(nodeId))) return false;
+  const reservable = new Set(ownedIds.filter((id) => !holdLines.has(id)));
+  return (instance.reservationNodeIds ?? []).every((nodeId) => reservable.has(nodeId));
 }
 
 /** The hold changes this apply makes, from the nodes' current holds. */
@@ -248,6 +268,22 @@ export function profilePlan(input: PlanInput): ProfilePlan {
         reason: "profile_owned_node",
       });
       stopping.add(instance.id);
+      // An agent stops only what runs on Full-control nodes: an instance reserving memory on
+      // an owned node may run on a node outside the profile (the owned-node check above never
+      // sees it).
+      // (An owned Relay-only node is refused above already.)
+      if (
+        input.agentRules &&
+        instance.agentBlockedNodeId &&
+        !ownedIds.includes(instance.agentBlockedNodeId)
+      )
+        refusals.push(
+          refusal(
+            "trust_relay",
+            instance.agentBlockedNodeId,
+            `Stopping ${instance.id} reaches a node that is Relay only; agents cannot apply this profile.`,
+          ),
+        );
     }
   }
 
@@ -265,6 +301,7 @@ export function profilePlan(input: PlanInput): ProfilePlan {
       labels: node.labels,
       portRange: node.portRange,
       heldVersionIds: node.heldVersionIds,
+      requiredVersionIds: node.requiredVersionIds,
       frozenFabrics: node.frozenFabrics ?? null,
       memoryGb: node.memoryGb,
       gpus: node.gpus,
@@ -322,6 +359,7 @@ export function profilePlan(input: PlanInput): ProfilePlan {
         reservationNodeIds: placeable,
         // A person may start only what a Relay-only node holds frozen.
         checkFrozen: true,
+        nodeOrigin: version.nodeOrigin === true,
         preempt: false,
       });
       if (!placed.ok) {

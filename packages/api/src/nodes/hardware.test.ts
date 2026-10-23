@@ -52,14 +52,41 @@ describe("effectiveHardware: unified GPUs", () => {
       nodeMetrics: null,
       nodeMetricsAt: null,
       heldClaims: [
-        { kind: "discrete", gpuCount: 1, vramGb: 40, ramGb: 4, gpus: ["nvidia:0"] },
+        {
+          current: [{ kind: "discrete", gpuCount: 1, vramGb: 40, ramGb: 4, gpus: ["nvidia:0"] }],
+          previous: [],
+        },
         // Written before claims recorded their GPUs: every GPU here is unified.
-        { kind: "discrete", gpuCount: 1, vramGb: 10 },
-        { kind: "unified", memoryGb: 20 },
+        { current: [{ kind: "discrete", gpuCount: 1, vramGb: 10 }], previous: [] },
+        { current: [{ kind: "unified", memoryGb: 20 }], previous: [] },
       ],
       now: NOW,
     });
     expect(hardware.reservedNowMemoryGb).toBe(74);
+  });
+
+  it("counts a restart's old and new claims of one instance once (the larger), instances adding", () => {
+    const hardware = effectiveHardware({
+      declaredResources: null,
+      nodeInfo: GB10_INFO,
+      nodeMetrics: null,
+      nodeMetricsAt: null,
+      heldClaims: [
+        // Restarted from 100 to 20 while the old run may still run: max(20, 100).
+        {
+          current: [{ kind: "unified", memoryGb: 20 }],
+          previous: [{ kind: "unified", memoryGb: 100 }],
+        },
+        // Restarted from 10 to 30: max(30, 10).
+        {
+          current: [{ kind: "unified", memoryGb: 30 }],
+          previous: [{ kind: "unified", memoryGb: 10 }],
+        },
+        { current: [{ kind: "unified", memoryGb: 5 }], previous: [] },
+      ],
+      now: NOW,
+    });
+    expect(hardware.reservedNowMemoryGb).toBe(135);
   });
 
   it("treats a GPU without VRAM of its own on a unified node as shared, even without apu", () => {
@@ -133,7 +160,9 @@ describe("declared unified GPUs", () => {
       nodeInfo: null,
       nodeMetrics: null,
       nodeMetricsAt: null,
-      heldClaims: [{ kind: "discrete", gpuCount: 1, vramGb: 60, ramGb: 2 }],
+      heldClaims: [
+        { current: [{ kind: "discrete", gpuCount: 1, vramGb: 60, ramGb: 2 }], previous: [] },
+      ],
       now: NOW,
     });
     expect(declared.gpus).toEqual([
@@ -160,7 +189,9 @@ describe("declared unified GPUs", () => {
       },
       nodeMetrics: null,
       nodeMetricsAt: null,
-      heldClaims: [{ kind: "discrete", gpuCount: 1, vramGb: 60, ramGb: 2 }],
+      heldClaims: [
+        { current: [{ kind: "discrete", gpuCount: 1, vramGb: 60, ramGb: 2 }], previous: [] },
+      ],
       now: NOW,
     });
     expect(detected.gpus.map(({ source: _source, ...gpu }) => gpu)).toEqual(

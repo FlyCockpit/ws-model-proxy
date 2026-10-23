@@ -6,7 +6,10 @@
  * and `Node.heldDefinitions` / held hashes are replaced from that answer.
  *
  * Which versions a node holds (cap `RUNTIME_DEFINITIONS_MAX`, in this priority):
- *   1. the launch version of every instance with a live claim on the node (never dropped);
+ *   1. every version a process or step on the node may still name (never dropped): the launch
+ *      version of every instance with a live claim on the node, what each live-claimed rank
+ *      physically runs (a restart's earlier version, until its stop is proven), and the version
+ *      of every unfinished step on the node;
  *   2. the current version of each server-origin ALWAYS_ON runtime on the node;
  *   3. versions pinned by profiles that own the node;
  *   4. the current version of every server-origin STARTABLE runtime of the owner (newest first).
@@ -15,6 +18,7 @@
  * One operation per node is in flight; a sync asked for meanwhile runs after its final answer.
  */
 import { randomBytes } from "node:crypto";
+import { requiredDefinitionsByNode } from "@ws-model-proxy/api/lib/node-definitions";
 import {
   nodeFabricsHash,
   nodeMetricCommandsHash,
@@ -54,8 +58,6 @@ export const DEFINE_ANSWER_WAIT_MS = 5_000;
 export const DEFINE_TIMEOUT_RETRIES = 3;
 export const DEFINE_RETRY_BASE_MS = 5_000;
 
-const LIVE_CLAIMS = ["HELD", "HELD_UNKNOWN"] as const;
-
 // ── What the node should hold (pure) ──
 
 export type DesiredVersion = {
@@ -66,13 +68,27 @@ export type DesiredVersion = {
   createdAt: Date;
 };
 
-/** Orders and caps the desired versions; launch versions of live instances always stay. */
-export function capDesired(versions: readonly DesiredVersion[]): DefinitionEnvelope[] {
+/**
+ * Orders and caps the desired versions; the required ones (priority 1) always come first.
+ * Admission keeps them within the cap (`definition_slots_full`); more than the cap of them is a
+ * bug, logged, and the released CLI's limit still applies (the cap is never raised here).
+ */
+export function capDesired(
+  versions: readonly DesiredVersion[],
+  nodeId: string | null = null,
+): DefinitionEnvelope[] {
   const byId = new Map<string, DesiredVersion>();
   for (const version of versions) {
     const seen = byId.get(version.envelope.versionId);
     if (!seen || version.priority < seen.priority) byId.set(version.envelope.versionId, version);
   }
+  const required = [...byId.values()].filter((version) => version.priority === 1).length;
+  if (required > RUNTIME_DEFINITIONS_MAX)
+    console.error(
+      "[runtime-sync] a node requires more definitions than it can hold; some are not sent",
+      nodeId ?? "",
+      required,
+    );
   return (
     [...byId.values()]
       .sort(
@@ -81,7 +97,7 @@ export function capDesired(versions: readonly DesiredVersion[]): DefinitionEnvel
           b.createdAt.getTime() - a.createdAt.getTime() ||
           (a.envelope.versionId < b.envelope.versionId ? -1 : 1),
       )
-      // Live instances' launch versions sort first, so the cap drops only optional versions.
+      // Required versions sort first, so the cap drops only optional versions.
       .slice(0, RUNTIME_DEFINITIONS_MAX)
       .map((version) => version.envelope)
   );
@@ -236,14 +252,13 @@ export async function loadNodeDefinitionState(nodeId: string): Promise<NodeDefin
   };
 
   const userId = node.userId;
-  const [running, alwaysOn, pinned, startable] = await Promise.all([
+  // Every version a process or step on the node may still name (`node-definitions.ts`).
+  const required =
+    (await requiredDefinitionsByNode(prisma, { userId, nodeIds: [nodeId] })).get(nodeId) ??
+    new Set<string>();
+  const [needed, alwaysOn, pinned, startable] = await Promise.all([
     prisma.runtimeVersion.findMany({
-      where: {
-        LaunchInstances: {
-          some: { userId, Ranks: { some: { nodeId, claim: { in: [...LIVE_CLAIMS] } } } },
-        },
-        Runtime: { origin: "SERVER" },
-      },
+      where: { id: { in: [...required] }, Runtime: { userId, origin: "SERVER" } },
       select: VERSION_SELECT,
     }),
     prisma.runtimeVersion.findMany({
@@ -271,17 +286,17 @@ export async function loadNodeDefinitionState(nodeId: string): Promise<NodeDefin
     }),
   ]);
   const desired: DesiredVersion[] = [];
-  const add = (rows: typeof running, priority: DesiredVersion["priority"]) => {
+  const add = (rows: typeof needed, priority: DesiredVersion["priority"]) => {
     for (const row of rows) {
       const envelope = envelopeOf(row);
       if (envelope) desired.push({ envelope, priority, createdAt: row.createdAt });
     }
   };
-  add(running, 1);
+  add(needed, 1);
   add(alwaysOn, 2);
   add(pinned, 3);
   add(startable, 4);
-  state.desired = capDesired(desired);
+  state.desired = capDesired(desired, nodeId);
   return state;
 }
 

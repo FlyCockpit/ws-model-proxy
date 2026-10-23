@@ -131,6 +131,21 @@ export const instanceRankViewSchema = z
     releasedUnproven: z.object({ at: isoDateSchema, reason: z.string() }).strict().nullable(),
     /** An agent's pending request that a person release this claim (marked stopped). */
     releaseRequestId: idSchema.nullable(),
+    /**
+     * The claim of the run a restart replaced, while that run may still use it (`prev*`): it
+     * keeps holding on this node beside the current claim (its port stays taken, its memory
+     * overlaps) until the new run's start proves the old one stopped, or the claim is released
+     * (a release ends it with the current claim). Null when none.
+     */
+    previousClaim: z
+      .object({
+        port: z.number().int(),
+        distPort: z.number().int().nullable(),
+        /** GiB of node memory it holds (GPU memory included). */
+        memoryGb: z.number(),
+      })
+      .strict()
+      .nullable(),
   })
   .strict();
 
@@ -261,6 +276,12 @@ export const instanceViewSchema = z
      * `reserved` is the instance's rank claim (a reservation holds exactly while it does).
      */
     reservations: z.array(instanceReservationViewSchema),
+    /**
+     * Reservations of a run a restart replaced, while that run may still use them: they keep
+     * holding (`reserved`, like the current ones) until the new run's start proves the old one
+     * stopped. Releasing the instance's claims releases them too.
+     */
+    supersededReservations: z.array(instanceReservationViewSchema),
     openSteps: z.array(instanceStepViewSchema),
     live: z
       .object({
@@ -628,6 +649,7 @@ export const runtimesContract = {
                 "launch_changed",
                 "trust_relay",
                 "interactive_needs_person",
+                "definition_slots_full",
               ]),
             })
             .strict(),

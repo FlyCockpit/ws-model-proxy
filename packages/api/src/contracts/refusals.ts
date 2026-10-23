@@ -127,6 +127,19 @@ export const REFUSAL_REASONS = [
    * try): pin the nodes, or start fewer at once.
    */
   "placement_too_complex",
+  // Restart holds (a replaced run's claims stay held until its stop is proven).
+  /**
+   * A restart needs more room beside the running instance's claims (which stay held until its
+   * stop is proven) than the node has; it would fit once they are released: stop it first.
+   */
+  "restart_overlap_no_room",
+  // Definition slots on a node (RUNTIME_DEFINITIONS_MAX, which the node enforces).
+  /**
+   * A Full-control node already requires as many runtime definitions as it can hold (what runs
+   * or is stopping there): a start or restart of another version would push one out. Stop an
+   * instance there, or wait for a restart to finish.
+   */
+  "definition_slots_full",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

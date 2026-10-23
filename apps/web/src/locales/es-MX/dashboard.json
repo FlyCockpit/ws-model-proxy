@@ -674,6 +674,8 @@
     "always_on_runtime": "Un runtime siempre activo se ejecuta por su cuenta; no hay nada que iniciar.",
     "fabric_port_ranges_disjoint": "Los rangos de puertos de estos nodos no comparten ningún puerto; haz que se superpongan.",
     "placement_too_complex": "Ubicar esto requirió demasiado trabajo. Fija los nodos o inicia menos a la vez.",
+    "restart_overlap_no_room": "La instancia en ejecución conserva su memoria hasta que se confirme que se detuvo, y no hay espacio para el reinicio junto a ella. Detenla primero y luego iníciala.",
+    "definition_slots_full": "Este nodo ya necesita el máximo de definiciones que puede tener (128). Detén algo ahí primero.",
     "identity_mismatch": "El nodo presentó una clave de identidad distinta."
   },
   "models": {
@@ -1424,6 +1426,7 @@
       "status_not_running": "el comando de estado no dijo que corre"
     },
     "processDetached": "El comando de inicio entregó su servidor a otro proceso (por ejemplo `docker compose up -d`), así que el nodo no puede vigilarlo ni detenerlo. Usa management \"service\" con comandos de stop y status, y detén a mano lo que siga corriendo.",
+    "cliUpgradeRequired": "Este runtime reserva memoria en otros nodos, y wsmp en su nodo es demasiado antiguo para saber en cuáles. Actualiza wsmp en el nodo y reinícialo; luego vuelve a iniciar el runtime.",
     "needsOperator": {
       "STEP": "Un paso te espera",
       "RESTART": "Requiere reinicio",
@@ -1463,7 +1466,8 @@
           "port_held_outside_runtime": "El puerto sigue en uso, aunque ya no queda nada en las unidades del servicio: por lo general, algo que inició (un contenedor o un daemon) se ejecuta fuera de ellas",
           "unowned_service": "El servicio se ejecuta fuera del control del nodo y no tiene comando de estado",
           "not_stopped": "El nodo no pudo confirmarlo (actualiza el nodo si esto continúa)"
-        }
+        },
+        "alsoHeld": "También reservado hasta que se confirme la detención o lo liberes"
       },
       "held": {
         "pill": "Recursos reservados hasta confirmar la detención",
@@ -1548,6 +1552,8 @@
       "always_on_runtime": "Los runtimes siempre activos se ejecutan por su cuenta; no hay nada que iniciar.",
       "fabric_port_ranges_disjoint": "Los rangos de puertos de los nodos no comparten ningún puerto para el puerto dist.",
       "placement_too_complex": "Ubicar este inicio requirió demasiado trabajo (muchos nodos, reservas o detenciones por probar). Fija los nodos o inicia menos a la vez.",
+      "restart_overlap_no_room": "La instancia en ejecución conserva su memoria, GPU y puertos hasta que se confirme que se detuvo, y el nodo no tiene espacio para el reinicio junto a ellos. Detenla primero e iníciala cuando se confirme la detención, libera espacio en el nodo o reinicia con recursos que quepan.",
+      "definition_slots_full": "El nodo ya necesita 128 definiciones para lo que corre o se está deteniendo ahí. Detén una instancia en él o espera a que terminen los reinicios.",
       "cap_currency_has_spend": "La moneda del tope debe ser la que este compartido ya gastó este mes.",
       "already_shared": "Este pool ya está compartido con esta persona. Cambia el compartido existente.",
       "invite_pending": "Este correo ya tiene una invitación pendiente. Reenvíala en su lugar.",
@@ -2057,7 +2063,13 @@
         "untrustedNamed": "Escrito por el agente {{agent}}. wsmp no verificó nada de esto.",
         "command": "Comando que ejecutó",
         "loadFailed": "No se pudo cargar la solicitud del agente. Quizá se retiró o expiró."
-      }
+      },
+      "alsoFreed": "Liberar también libera"
+    },
+    "heldFootprint": {
+      "previousClaim": "Puerto {{port}} y {{memory}} en {{node}}, reservados para la ejecución que reemplazó un reinicio",
+      "reservation": "{{memory}} en {{node}}",
+      "supersededReservation": "{{memory}} en {{node}}, reservados para la ejecución que reemplazó un reinicio"
     }
   },
   "overview": {

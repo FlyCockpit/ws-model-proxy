@@ -85,6 +85,7 @@ function instanceWith(
       {
         id: "rank-0",
         rank: 0,
+        nodeId: "node-1",
         claim,
         markedStoppedAt: new Date(NOW - 1_800_000),
         Node: {
@@ -98,6 +99,17 @@ function instanceWith(
         },
       },
     ],
+    Reservations: [] as Array<{
+      index: number;
+      nodeId: string | null;
+      supersededGeneration: number | null;
+      Node: {
+        id: string;
+        slug: string;
+        trust: "FULL" | "RELAY";
+        trustLowerRequestedAt: Date | null;
+      } | null;
+    }>,
   };
 }
 
@@ -465,6 +477,34 @@ describe("runtimes.releaseRequests: what an agent's text and node may be", () =>
         }),
       ),
     ).toBe("trust_relay");
+    expect(db.claimReleaseRequest.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses an agent when the part's reservation is on a Relay-only node or a lowering is pending", async () => {
+    for (const node of [
+      { trust: "RELAY" as const, trustLowerRequestedAt: null },
+      { trust: "FULL" as const, trustLowerRequestedAt: new Date(NOW - 60_000) },
+    ]) {
+      const held = instanceWith("HELD_UNKNOWN");
+      held.Reservations = [
+        {
+          index: 0,
+          nodeId: "worker",
+          // A replaced run's row still holds while the rank does.
+          supersededGeneration: 1,
+          Node: { id: "worker", slug: "worker", ...node },
+        },
+      ];
+      db.runtimeInstance.findFirst.mockResolvedValueOnce(held as never);
+      expect(
+        await reasonOf(
+          client(CALLERS.fullAgent()).releaseRequests.create({
+            instanceId: "inst-1",
+            findings: "checked",
+          }),
+        ),
+      ).toBe("trust_relay");
+    }
     expect(db.claimReleaseRequest.create).not.toHaveBeenCalled();
   });
 

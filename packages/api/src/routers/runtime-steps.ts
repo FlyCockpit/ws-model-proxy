@@ -14,7 +14,12 @@ import type { Context, RuntimeStepRefusal, RuntimeStepServices } from "../contex
 import { contractProcedure } from "../contract-procedure";
 import { runtimesContract as c } from "../contracts/runtimes";
 import { notFound, refuse } from "../lib/refuse";
-import { INSTANCE_INCLUDE, stepView, stepViewContext } from "../lib/runtime-views";
+import {
+  INSTANCE_INCLUDE,
+  loadStepVersions,
+  stepView,
+  stepViewContext,
+} from "../lib/runtime-views";
 
 function services(context: Context): RuntimeStepServices {
   const steps = context.services?.runtimeSteps;
@@ -50,6 +55,7 @@ async function ownedStepView(userId: string, stepId: string) {
     include: {
       Instance: {
         select: {
+          launchVersionId: true,
           LaunchVersion: INSTANCE_INCLUDE.LaunchVersion,
           Fabric: INSTANCE_INCLUDE.Fabric,
           Ranks: { where: { rank: 0 }, select: { rank: true, nodeId: true } },
@@ -58,7 +64,10 @@ async function ownedStepView(userId: string, stepId: string) {
     },
   });
   if (!step) throw notFound("That step does not exist.");
-  return stepView(step, stepViewContext(step.Instance));
+  const versions = await loadStepVersions(prisma, userId, [
+    { launchVersionId: step.Instance.launchVersionId, Steps: [step] },
+  ]);
+  return stepView(step, stepViewContext(step.Instance, versions));
 }
 
 export const runtimeSteps = {

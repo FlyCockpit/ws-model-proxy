@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   canSendResize,
   classifyBroadcastEpoch,
+  floorTerminalSize,
   followSize,
+  isAutomaticReply,
   isFollowing,
   needsTakeover,
   nextReattach,
@@ -58,6 +60,52 @@ describe("automatic replies", () => {
     }
   });
 
+  it("never takes a follower's automatic reply as input, even right after a keypress", () => {
+    const replies = [
+      "\x1b[12;1R", // CPR
+      "\x1b[?12;1R", // DECXCPR
+      "\x1b[0n", // DSR status
+      "\x1b[?1;2c", // DA1
+      "\x1b[>0;276;0c", // DA2
+      "\x1b[?2004;2$y", // DECRPM
+      "\x1b[8;24;80t", // XTWINOPS size report
+      "\x1bP1$r0m\x1b\\", // DECRQSS
+      "\x1bP>|xterm.js(5.5.0)\x1b\\", // XTVERSION
+      "\x1b]11;rgb:0000/0000/0000\x1b\\", // OSC 11 color reply
+      "\x1b]10;rgb:ffff/ffff/ffff\x07",
+    ];
+    for (const data of replies) {
+      expect(isAutomaticReply(data)).toBe(true);
+      expect(shouldForwardTerminalData({ following: true, userInput: true, data })).toBe(false);
+    }
+  });
+
+  it("does not mistake keys or mouse reports for replies", () => {
+    const input = [
+      "a",
+      "\r",
+      "\x1b[A", // Up
+      "\x1b[1;5C", // Ctrl+Right
+      "\x1b[3~", // Delete
+      "\x1bOP", // F1
+      "\x1b[15;2~", // Shift+F5
+      "\x1b[<0;10;5M", // SGR mouse press
+      "\x1b[<0;10;5m", // SGR mouse release
+      "\x1b[200~pasted\x1b[201~", // bracketed paste
+    ];
+    for (const data of input) {
+      expect(isAutomaticReply(data)).toBe(false);
+      expect(shouldForwardTerminalData({ following: true, userInput: true, data })).toBe(true);
+    }
+  });
+
+  it("forgets earlier input when disarmed", () => {
+    const gate = new TerminalUserInputGate(500);
+    gate.arm(1_000);
+    gate.disarm();
+    expect(gate.armed(1_100)).toBe(false);
+  });
+
   it("forwards a follower's typed data, but never a bare focus report", () => {
     expect(shouldForwardTerminalData({ following: true, userInput: true, data: "a" })).toBe(true);
     expect(shouldForwardTerminalData({ following: true, userInput: true, data: "\x1b[O" })).toBe(
@@ -99,5 +147,12 @@ describe("slow reattach", () => {
     expect(second.delayMs).toBe(1_000);
     const later = nextReattach(second.state, 1_000 + TERMINAL_REATTACH_RESET_MS);
     expect(later.state.attempt).toBe(0);
+  });
+});
+
+describe("floorTerminalSize", () => {
+  it("keeps a squeezed pane from shrinking the PTY below 20x5", () => {
+    expect(floorTerminalSize({ cols: 4, rows: 2 })).toEqual({ cols: 20, rows: 5 });
+    expect(floorTerminalSize({ cols: 120, rows: 40 })).toEqual({ cols: 120, rows: 40 });
   });
 });

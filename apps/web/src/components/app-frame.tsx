@@ -85,7 +85,11 @@ export function AppFrame({ lang }: { lang: string }) {
       </aside>
 
       <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
-        <div className="container mx-auto flex min-h-0 min-w-0 max-w-6xl flex-col px-4 py-4 md:py-6">
+        {/* The frame owns the page's geometry. --app-page-height is the height a page sees at
+            once: main (a size container) less this padding and whatever the software keyboard
+            covers. A page that must fit the screen (Terminals) sizes to it and lets flex divide
+            it, rather than copying these numbers. */}
+        <div className="container mx-auto flex min-h-0 min-w-0 max-w-6xl flex-col px-4 py-(--app-page-pad-y) [--app-page-height:calc(100cqh-2*var(--app-page-pad-y)-var(--keyboard-inset,0px))] [--app-page-pad-y:1rem] md:[--app-page-pad-y:1.5rem]">
           <Outlet />
         </div>
       </div>

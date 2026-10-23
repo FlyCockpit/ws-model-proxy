@@ -115,6 +115,7 @@ const REQUIRED_OBJECTS = [
   "instance_step_shape",
   "instance_step_operator_shape",
   "instance_step_operator_hold",
+  "instance_step_may_have_run",
   "execution_target_kind_source_xor_check",
   "execution_target_identity_immutable",
   // profiles
@@ -902,6 +903,39 @@ try {
     "instance_rank_claim_shape",
     `UPDATE instance_rank SET claim = 'HELD_UNKNOWN' WHERE id = 'rank-w0'`,
     "23514",
+  );
+  await expectFailure(
+    "instance_rank_bounds a replaced run's claim without all of its parts",
+    `UPDATE instance_rank SET "prevPort" = 30005 WHERE id = 'rank-w0'`,
+    "23514",
+  );
+  await expectFailure(
+    "instance_rank_bounds a replaced run's port out of range",
+    `UPDATE instance_rank SET "prevResources" = '{}', "prevPort" = 80, "prevGeneration" = 0
+      WHERE id = 'rank-w0'`,
+    "23514",
+  );
+  await expectFailure(
+    "instance_step_shape head address",
+    `UPDATE instance_step SET "headAddr" = '' WHERE id = 'step-m1'`,
+    "23514",
+  );
+  await expectFailure(
+    "instance_step_shape may have run without an attempt",
+    `UPDATE instance_step SET "mayHaveRun" = true WHERE id = 'step-m1'`,
+    "23514",
+  );
+  // A counted dispatch may have run; then it stays so.
+  await client.query(`
+    INSERT INTO instance_step (id, "instanceId", "nodeId", rank, phase, sequence, generation, intent,
+      "intentHash", state, attempts, "mayHaveRun", "errorCode") VALUES
+      ('step-w0', 'inst-w', 'node-a3', 0, 'START', 120, 1, '{}', ${HEX("c")}, 'FAILED', 2, true,
+       'bad_job')`);
+  await expectFailure(
+    "instance_step_may_have_run cleared",
+    `UPDATE instance_step SET "mayHaveRun" = false WHERE id = 'step-w0'`,
+    "55000",
+    /a step that may have run stays so/,
   );
   await expectFailure(
     "instance_rank_claim_shape released without proof on a held claim",

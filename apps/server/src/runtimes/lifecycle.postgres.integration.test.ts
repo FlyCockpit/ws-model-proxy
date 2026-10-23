@@ -47,6 +47,8 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     supported: true,
     room: true,
     closeAnswer: "closed" as "closed" | "running" | "absent",
+    /** Per step: what closing it answers instead of `closeAnswer`. */
+    closeAnswers: new Map<string, "closed" | "running" | "absent">(),
     closed: [] as string[],
     closedTerminals: [] as string[],
   };
@@ -299,7 +301,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       operatorRoom: () => operatorRelay.room,
       closeOperatorStep: (stepId) => {
         operatorRelay.closed.push(stepId);
-        return operatorRelay.closeAnswer;
+        return operatorRelay.closeAnswers.get(stepId) ?? operatorRelay.closeAnswer;
       },
       closeOperatorTerminal: (_node, terminalId) => {
         operatorRelay.closedTerminals.push(terminalId);
@@ -1361,6 +1363,54 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     expect((await instance(id)).phase).toBe("READY");
   });
 
+  it("an accepted run whose awaiting_operator write was lost is recorded within the operator CHECK", async () => {
+    const lc = await engine();
+    // Run 1: the screen came up and the person pressed Enter, but `awaiting_operator` was never
+    // written; the relay reports the run (`operator_running`).
+    const first = await startInstance(30_251, "USER", "operator");
+    // Run 2: nothing of the screen was written, and the deadline sweep finds the relay running it.
+    const second = await startInstance(30_252, "USER", "operator");
+    await lc.runOnce();
+    const job = lastJob(first, "start");
+    let row = await step(first, "START");
+    expect(row).toMatchObject({ state: "RUNNING", operatorSince: null });
+    await progress(lc, job, "operator_running");
+    row = await step(first, "START");
+    expect(row.state).toBe("RUNNING");
+    expect(row.operatorAcceptedAt).not.toBeNull();
+    expect(row.operatorSince).not.toBeNull();
+
+    const other = await step(second, "START");
+    expect(other).toMatchObject({ state: "RUNNING", operatorSince: null });
+    await m.fixture.instanceStep.update({
+      where: { id: other.id },
+      data: {
+        deadline: new Date(Date.now() - 1_000),
+        leaseExpiresAt: new Date(Date.now() - 1_000),
+      },
+    });
+    operatorRelay.closeAnswer = "running";
+    try {
+      await lc.runOnce();
+    } finally {
+      operatorRelay.closeAnswer = "closed";
+    }
+    const accepted = await step(second, "START");
+    expect(accepted.state).toBe("RUNNING");
+    expect(accepted.operatorAcceptedAt).not.toBeNull();
+    expect(accepted.operatorSince).not.toBeNull();
+
+    // Both runs end and both instances stop (the node's terminals are free for the next test).
+    await progress(lc, job, "succeeded");
+    await progress(lc, lastJob(second, "start"), "succeeded");
+    for (const id of [first, second]) {
+      await stopInstance(id);
+      await lc.runOnce();
+      await answer(lc, lastJob(id, "stop"), "succeeded", { stopped: true });
+      expect((await instance(id)).phase).toBe("STOPPED");
+    }
+  });
+
   it("a decline gives its attempt back; reopen uses a fresh terminal; cancel gives up", async () => {
     const lc = await engine();
     const id = await startInstance(30_202, "USER", "operator");
@@ -1684,8 +1734,12 @@ integration("runtime lifecycle (PostgreSQL)", () => {
     await lc.runOnce();
     const run = lastJob(running, "start");
     await progress(lc, run, "awaiting_operator");
-    // The person pressed Enter: the relay saw it, this database has not recorded it yet.
-    operatorRelay.closeAnswer = "running";
+    // The person pressed Enter: the relay saw it, this database has not recorded it yet. The
+    // other terminal's screen never came up, and the ban fence already cancelled it ("absent").
+    // (The relay answering "running" for it too would be a person's run there, recorded as
+    // accepted: the operator CHECK holds since `closeOperatorKeepingRun` writes its screen time.)
+    operatorRelay.closeAnswers.set(run.stepId, "running");
+    operatorRelay.closeAnswer = "absent";
     await ban(null);
     try {
       await lc.runOnce();
@@ -1695,9 +1749,8 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       expect(accepted.state).toBe("RUNNING");
       expect(accepted.operatorAcceptedAt).not.toBeNull();
       expect(accepted.errorCode).toBeNull();
-      // The other terminal's screen never came up, and the ban fence already cancelled it
-      // ("absent"): it may have run, so the attempt counts and the rank needs a proven stop.
-      operatorRelay.closeAnswer = "absent";
+      // The other terminal: it may have run, so the attempt counts and the rank needs a
+      // proven stop.
       await lc.runOnce();
       const row = await step(spawning, "START");
       expect(row.state).toBe("FAILED");
@@ -1706,6 +1759,7 @@ integration("runtime lifecycle (PostgreSQL)", () => {
       expect((await instance(spawning)).phase).toBe("STOPPING");
     } finally {
       operatorRelay.closeAnswer = "closed";
+      operatorRelay.closeAnswers.clear();
       await unban();
     }
     // The person's accepted run answers (its terminal closes), then both stop.

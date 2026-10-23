@@ -81,6 +81,7 @@ fn job(hash: &str, rank: u8, nnodes: u8) -> RuntimeJob {
         owner_epoch: "0b0c3a5e-1111:7".into(),
         intent_hash: "a".repeat(64),
         operator: None,
+        reservations: Vec::new(),
     }
 }
 
@@ -91,6 +92,25 @@ fn facts(iface: &str) -> NodeFacts {
         addresses,
         sys: std::path::PathBuf::from("/nonexistent-sys"),
     }
+}
+
+#[test]
+fn the_rendered_job_keeps_the_reservations_out_of_the_commands() {
+    let (store, hash) = store_with(spec("vllm serve m --port {{port}}", 1));
+    let mut sent = job(&hash, 0, 1);
+    sent.reservations = vec![crate::protocol::frames::JobReservation {
+        index: 0,
+        node_id: "nd7f3k9q2w8e4r6t1y5u0i3o".into(),
+        node: "worker-a".into(),
+        gpu_ids: Some("1".into()),
+    }];
+    let rendered = render(&sent, TrustValue::Full, &store, &facts("eth0")).expect("rendered");
+    assert_eq!(rendered.reservations, sent.reservations);
+    // Environment only: the rendered commands are those of a job without them.
+    let plain =
+        render(&job(&hash, 0, 1), TrustValue::Full, &store, &facts("eth0")).expect("rendered");
+    assert_eq!(rendered.command, plain.command);
+    assert_eq!(rendered.launch_hash, plain.launch_hash);
 }
 
 #[test]
@@ -425,7 +445,7 @@ fn shared_render_vectors() {
     }
     type Check = fn(&str) -> bool;
     let checks: [(&str, Check); 3] = [
-        ("gpuIds", gpu_ids),
+        ("gpuIds", crate::protocol::frames::is_gpu_ids),
         ("positiveDecimal", positive_decimal),
         ("fraction", fraction),
     ];

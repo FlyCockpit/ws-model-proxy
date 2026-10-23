@@ -41,7 +41,14 @@ type Instance = Row & {
   Ranks: Rank[];
   Reservations: Reservation[];
 };
-type NodeRow = { id: string; online: boolean; labels: string[]; memoryGb: number };
+type NodeRow = {
+  id: string;
+  online: boolean;
+  labels: string[];
+  memoryGb: number;
+  trust?: "FULL" | "RELAY";
+  lowerPending?: boolean;
+};
 
 const store = vi.hoisted(() => ({
   instances: [] as Instance[],
@@ -50,6 +57,14 @@ const store = vi.hoisted(() => ({
   /** Runs once, inside the next fenced write before its work (another writer got there first). */
   beforeNextWrite: null as (() => void) | null,
   nextId: 1,
+  /** Server-origin runtime versions of the owner (what a node's definitions count). */
+  serverVersions: new Set<string>(),
+  /** The owner's fabrics (`fabric.findMany`) and their members' addresses. */
+  fabrics: [] as Array<{
+    id: string;
+    name: string;
+    Members: Array<{ nodeId: string; ip: string }>;
+  }>,
 }));
 
 const db = vi.hoisted(() => {
@@ -115,7 +130,12 @@ const db = vi.hoisted(() => {
         ? rows.filter((child) => matches({ ...child, instanceId: instance.id }, where))
         : rows;
     };
-    return { ...instance, Ranks: filtered("Ranks"), Reservations: filtered("Reservations") };
+    // A reservation's node as the include selects it (null once deleted).
+    const reservations = filtered("Reservations").map((row) => {
+      const node = store.nodes.find((entry) => entry.id === row.nodeId);
+      return { ...row, Node: node ? nodeRow(node) : null };
+    });
+    return { ...instance, Ranks: filtered("Ranks"), Reservations: reservations };
   };
   const relationsOf = (args: Row) => (args.include ?? args.select ?? {}) as Row;
   const nodeRow = (node: NodeRow) => ({
@@ -125,9 +145,9 @@ const db = vi.hoisted(() => {
     connection: node.online ? "ONLINE" : "OFFLINE",
     lastDisconnectedAt: node.online ? null : new Date(0),
     lastHeartbeatAt: node.online ? new Date(8e12) : null,
-    trust: "FULL",
+    trust: node.trust ?? "FULL",
     trustChangedAt: null,
-    trustLowerRequestedAt: null,
+    trustLowerRequestedAt: node.lowerPending ? new Date(0) : null,
     holdAt: null,
     portStart: 30000,
     portEnd: 30009,
@@ -143,6 +163,12 @@ const db = vi.hoisted(() => {
   });
   const answer = (model: string, method: string, args: Row = {}): unknown => {
     const where = (args.where ?? {}) as Row;
+    if (model === "fabric" && method === "findMany") return store.fabrics;
+    if (model === "fabricMember" && method === "findFirst") {
+      const fabric = store.fabrics.find((row) => row.id === where.fabricId);
+      const member = fabric?.Members.find((row) => row.nodeId === where.nodeId);
+      return member ? { ip: member.ip } : null;
+    }
     if (model === "node") {
       const rows = store.nodes
         .map(nodeRow)
@@ -150,6 +176,11 @@ const db = vi.hoisted(() => {
       return method === "findMany" ? rows : (rows[0] ?? null);
     }
     if (model === "user") return { banned: false, banExpires: null, deletionRequestedAt: null };
+    // Which named versions are the owner's server-origin ones (`requiredDefinitionsByNode`).
+    if (model === "runtimeVersion" && method === "findMany") {
+      const ids = (where.id as { in?: string[] } | undefined)?.in ?? [];
+      return ids.filter((id) => store.serverVersions.has(id)).map((id) => ({ id }));
+    }
     if (model === "runtimeInstance") {
       const hit = store.instances.filter((item) => matches(item, where));
       if (method === "update" || method === "updateMany") {
@@ -258,6 +289,9 @@ const db = vi.hoisted(() => {
     {
       get: (_target, key) => {
         if (typeof key !== "string") return undefined;
+        // The batched physical launches (`physicalLaunchIntents`, the definitions a node
+        // requires): none recorded here, every node has free definition slots.
+        if (key === "$queryRaw") return async () => [];
         if (!models.has(key))
           models.set(
             key,
@@ -323,11 +357,11 @@ let clock = new Date(Date.now() + 3_600_000);
 const sent: Array<{ nodeId: string; frame: Row }> = [];
 let errors: unknown[][] = [];
 
-function engine() {
+function engine(session: { jobReservations?: boolean } = { jobReservations: true }) {
   return new RuntimeLifecycle(
     {
       onlineNodeIds: () => store.nodes.filter((node) => node.online).map((node) => node.id),
-      nodeSession: () => ({ userId: "u1", connectionGeneration: 1, trust: "full" }),
+      nodeSession: () => ({ userId: "u1", connectionGeneration: 1, trust: "full", ...session }),
       sendToNode: (nodeId: string, frame: unknown) => {
         sent.push({ nodeId, frame: frame as Row });
         return true;
@@ -388,6 +422,11 @@ function instance(id: string, overrides: Partial<Instance> = {}): Instance {
         lastStopCheckAt: clock,
         stoppedAt: null,
         markedStoppedAt: null,
+        plannedGeneration: 0,
+        prevResources: null,
+        prevPort: null,
+        prevDistPort: null,
+        prevGeneration: null,
       },
     ],
     Reservations: [
@@ -466,6 +505,8 @@ beforeEach(() => {
   store.steps = [];
   store.beforeNextWrite = null;
   store.nextId = 1;
+  store.serverVersions = new Set();
+  store.fabrics = [];
   store.nodes = [
     { id: "head", online: true, labels: [], memoryGb: 128 },
     { id: "w1", online: true, labels: ["worker"], memoryGb: 128 },
@@ -654,12 +695,154 @@ describe("the automatic restart checks for room like a start", () => {
     expect(holds(main())).toBe(false);
   });
 
+  it("waits (waiting_definition_slots_full, budget kept) while its node requires 128 other definitions", async () => {
+    // `count` other runtimes' instances live on the head, each of its own version (no memory).
+    const others = (count: number) =>
+      Array.from({ length: count }, (_, index) => {
+        const item = instance(`def-${index}`, {
+          Reservations: [],
+          versionId: `x-${index}`,
+          launchVersionId: `x-${index}`,
+        });
+        Object.assign(item.Ranks[0] as object, {
+          port: 40_000 + index,
+          resources: { kind: "none" },
+        });
+        store.serverVersions.add(`x-${index}`);
+        return item;
+      });
+    store.serverVersions.add("v1");
+    store.instances = [backedOff("inst", { Reservations: [] }), ...others(128)];
+    ranGeneration1("inst");
+    await engine().runOnce();
+    expect(main()).toMatchObject({
+      phase: "STOPPED",
+      phaseReason: "waiting_definition_slots_full",
+      restartsInWindow: 1,
+    });
+    expect((main().nextRestartAt as Date).getTime()).toBeGreaterThan(clock.getTime());
+    expect(holds(main())).toBe(false);
+    expect(
+      store.steps.filter((step) => step.instanceId === "inst" && step.generation === 2),
+    ).toEqual([]);
+    // One slot left (127 others): it restarts.
+    store.instances = [backedOff("inst", { Reservations: [] }), ...others(127)];
+    await engine().runOnce();
+    expect(main()).toMatchObject({ phase: "STARTING", phaseReason: "restarting" });
+  });
+
+  it("an automatically restarted gang takes a fabric again for its new run's steps", async () => {
+    // `settleStopped` cleared the fabric while it backed off; the plan picks one again.
+    store.fabrics = [
+      {
+        id: "fabric-1",
+        name: "qsfp",
+        Members: [
+          { nodeId: "head", ip: "10.0.0.1" },
+          { nodeId: "w1", ip: "10.0.0.2" },
+        ],
+      },
+    ];
+    const gang = { ...launch, groupSize: 2, reservations: [] };
+    const item = backedOff("inst", {
+      Reservations: [],
+      LaunchVersion: {
+        spec: { launch: gang },
+        launchHash: "a".repeat(64),
+        editor: "USER",
+        advanced: {},
+      },
+    });
+    const head = item.Ranks[0];
+    if (!head) throw new Error("no head rank");
+    head.distPort = 30009;
+    item.Ranks.push({ ...head, id: "rank-worker", rank: 1, nodeId: "w1" });
+    store.instances = [item];
+    ranGeneration1("inst");
+    const lc = engine();
+    await lc.runOnce();
+    await lc.stop();
+    expect(main()).toMatchObject({ phase: "STARTING", fabricId: "fabric-1" });
+    const starts = store.steps.filter((step) => step.phase === "START" && step.generation === 2);
+    expect(starts).toHaveLength(2);
+    expect(starts.map((step) => (step.intent as Row).fabricId)).toEqual(["fabric-1", "fabric-1"]);
+  });
+
+  it("an automatically restarted gang whose nodes share no fabric any more waits", async () => {
+    const gang = { ...launch, groupSize: 2, reservations: [] };
+    const item = backedOff("inst", {
+      Reservations: [],
+      LaunchVersion: {
+        spec: { launch: gang },
+        launchHash: "a".repeat(64),
+        editor: "USER",
+        advanced: {},
+      },
+    });
+    const head = item.Ranks[0];
+    if (!head) throw new Error("no head rank");
+    head.distPort = 30009;
+    item.Ranks.push({ ...head, id: "rank-worker", rank: 1, nodeId: "w1" });
+    store.instances = [item];
+    ranGeneration1("inst");
+    const lc = engine();
+    await lc.runOnce();
+    await lc.stop();
+    expect(main()).toMatchObject({
+      phase: "STOPPED",
+      phaseReason: "waiting_no_shared_fabric",
+      fabricId: null,
+    });
+    expect(store.steps.filter((step) => step.generation === 2)).toEqual([]);
+  });
+
   it("restarts a runtime without reservations whose node is free (unchanged)", async () => {
     store.instances = [backedOff("inst", { Reservations: [] })];
     ranGeneration1("inst");
     await engine().runOnce();
     expect(main()).toMatchObject({ phase: "STARTING", phaseReason: "restarting" });
     expect(holds(main())).toBe(true);
+  });
+
+  it("a marked-stopped run's retake keeps its old claim held and waits when both do not fit", async () => {
+    // Marked stopped (it may still run) with 100 GiB, its version now declaring 20; another
+    // runtime's 100 GiB took the head meanwhile. Beside the old run's 100 the restart has no
+    // room; once the old run's claim is released it would: it waits for that, by that reason.
+    const twenty = { kind: "unified" as const, memoryGb: 20 };
+    const item = backedOff("inst", {
+      Reservations: [],
+      LaunchVersion: {
+        spec: { launch: { ...launch, resources: [twenty], reservations: [] } },
+        launchHash: "a".repeat(64),
+        editor: "USER",
+        advanced: {},
+      },
+    });
+    for (const rank of item.Ranks)
+      Object.assign(rank, { claim: "HELD_UNKNOWN", stoppedAt: null, markedStoppedAt: clock });
+    const other = occupant("head");
+    Object.assign(other.Ranks[0] as object, { port: 30001 });
+    store.instances = [item, other];
+    ranGeneration1("inst");
+    await engine().runOnce();
+    expect(main()).toMatchObject({
+      phase: "STOPPED",
+      phaseReason: "waiting_restart_overlap_no_room",
+    });
+    expect(main().Ranks[0]).toMatchObject({ claim: "HELD_UNKNOWN", resources: GB100 });
+    // Room once the other runtime is gone: retaken, the old run's 100 GiB kept as its previous
+    // claim until the new run's START is claimed.
+    store.instances = [main()];
+    Object.assign(main(), { nextRestartAt: new Date(clock.getTime() - 1_000) });
+    await engine().runOnce();
+    expect(main()).toMatchObject({ phase: "STARTING", phaseReason: "restarting" });
+    expect(main().Ranks[0]).toMatchObject({
+      claim: "HELD",
+      resources: twenty,
+      prevResources: GB100,
+      prevPort: 30000,
+      prevGeneration: 1,
+    });
   });
 
   it("fails at once when a reservation's node was deleted", async () => {
@@ -973,5 +1156,164 @@ describe("superseded reservations never outlive the run they protect", () => {
     const w2 = await reservedOn("w2", "inst");
     expect(w1.length).toBe(1);
     expect(w2.length).toBeLessThanOrEqual(1);
+  });
+});
+
+describe("a run's jobs name the nodes its reservations got", () => {
+  /** A full stored intent of generation 1's START, which got `worker`. */
+  function launchedOn(id: string, worker: string) {
+    store.steps.push({
+      id: `${id}-START`,
+      instanceId: id,
+      nodeId: "head",
+      rank: 0,
+      phase: "START",
+      generation: 1,
+      sequence: 120,
+      state: "SUCCEEDED",
+      attempts: 1,
+      errorCode: null,
+      intent: {
+        operationId: `op-${id}`,
+        runtimeId: `rt-${id}`,
+        launchVersionId: "v1",
+        launchHash: "a".repeat(64),
+        rank: 0,
+        nnodes: 1,
+        handle: `i-${id}`,
+        unitName: `wsmp-i-${id}-r0`,
+        port: 30000,
+        distPort: null,
+        fabricId: null,
+        placeholders: { port: 30000 },
+        timeoutMs: 60_000,
+        interactive: false,
+        reservations: [{ index: 0, nodeId: worker, node: worker }],
+      },
+    });
+  }
+
+  it("a start sends its run's reservation nodes", async () => {
+    store.instances = [instance("inst", { phase: "STARTING" })];
+    const lc = engine();
+    await lc.runOnce();
+    await lc.stop();
+    const [start] = framesTo("start");
+    expect(start?.frame.reservations).toEqual([{ index: 0, nodeId: "w1", node: "w1" }]);
+    // Stored with the step: a later stop of this launch names the same worker.
+    expect(store.steps.find((step) => step.phase === "START")?.intent).toMatchObject({
+      reservations: [{ index: 0, nodeId: "w1", node: "w1" }],
+    });
+  });
+
+  it("a start sends the worker GPUs placement gave each reservation", async () => {
+    // Placement picked GPU 1 on the worker (GPU 0 was taken): the launcher must get that one.
+    const placed = instance("inst", { phase: "STARTING" });
+    for (const reservation of placed.Reservations)
+      reservation.resources = { kind: "discrete", gpuCount: 1, vramGb: 40, gpus: ["nvidia:1"] };
+    store.instances = [placed];
+    const lc = engine();
+    await lc.runOnce();
+    await lc.stop();
+    const [start] = framesTo("start");
+    expect(start?.frame.reservations).toEqual([
+      { index: 0, nodeId: "w1", node: "w1", gpuIds: "1" },
+    ]);
+    // Stored with the step: a later stop of this launch names the same GPUs.
+    expect(store.steps.find((step) => step.phase === "START")?.intent).toMatchObject({
+      reservations: [{ index: 0, nodeId: "w1", node: "w1", gpuIds: "1" }],
+    });
+  });
+
+  it("a node whose CLI cannot read them fails the start, saying to upgrade it", async () => {
+    store.instances = [instance("inst", { phase: "STARTING" })];
+    const lc = engine({});
+    await lc.runOnce();
+    await lc.stop();
+    expect(framesTo("start")).toEqual([]);
+    expect(store.steps.find((step) => step.phase === "START")).toMatchObject({
+      state: "FAILED",
+      errorCode: "cli_upgrade_required",
+    });
+    expect(main().phaseReason).toBe("cli_upgrade_required");
+  });
+
+  it("an agent's start fails trust_relay when its reservation node was lowered to Relay only", async () => {
+    for (const worker of [
+      { trust: "RELAY" as const },
+      { trust: "FULL" as const, lowerPending: true },
+    ]) {
+      store.steps = [];
+      sent.length = 0;
+      store.nodes = [
+        { id: "head", online: true, labels: [], memoryGb: 128 },
+        { id: "w1", online: true, labels: ["worker"], memoryGb: 128, ...worker },
+      ];
+      store.instances = [instance("inst", { phase: "STARTING", startedBy: "AGENT" })];
+      const lc = engine();
+      await lc.runOnce();
+      await lc.stop();
+      expect(framesTo("start")).toEqual([]);
+      expect(store.steps.find((step) => step.phase === "START")).toMatchObject({
+        state: "FAILED",
+        errorCode: "trust_relay",
+      });
+    }
+    // A person's start there goes.
+    store.steps = [];
+    store.instances = [instance("inst", { phase: "STARTING" })];
+    const lc = engine();
+    await lc.runOnce();
+    await lc.stop();
+    expect(framesTo("start")).toHaveLength(1);
+  });
+
+  it("a restart that moved the reservation stops the old launch naming its old worker, and starts on the new one", async () => {
+    store.nodes.push({ id: "w2", online: true, labels: ["worker"], memoryGb: 128 });
+    const item = instance("inst", {
+      phase: "STARTING",
+      phaseReason: "restart_requested",
+      operationId: "op-restart",
+    });
+    const [old] = item.Reservations;
+    if (!old) throw new Error("no reservation");
+    item.Reservations = [
+      { ...old, supersededGeneration: 1 },
+      {
+        id: "res-new",
+        instanceId: "inst",
+        nodeId: "w2",
+        index: 0,
+        labels: ["worker"],
+        resources: GB100,
+        supersededGeneration: null,
+      },
+    ];
+    store.instances = [item];
+    launchedOn("inst", "w1");
+    const lc = engine();
+    await lc.runOnce();
+    const [stop] = framesTo("stop");
+    if (!stop) throw new Error("no leading stop");
+    expect(stop.frame.generation).toBe(2);
+    expect(stop.frame.reservations).toEqual([{ index: 0, nodeId: "w1", node: "w1" }]);
+    await lc.handleJobResult(ref(), result(stop.frame, { status: "succeeded", stopped: true }));
+    await lc.runOnce();
+    await lc.stop();
+    const [start] = framesTo("start");
+    expect(start?.frame.reservations).toEqual([{ index: 0, nodeId: "w2", node: "w2" }]);
+  });
+
+  it("a stop to a CLI that cannot read them goes without them", async () => {
+    store.instances = [
+      instance("inst", { phase: "STOPPING", desiredState: "STOPPED", runGeneration: 1 }),
+    ];
+    launchedOn("inst", "w1");
+    const lc = engine({});
+    await lc.runOnce();
+    await lc.stop();
+    const [stop] = framesTo("stop");
+    expect(stop).toBeDefined();
+    expect(stop?.frame.reservations).toBeUndefined();
   });
 });

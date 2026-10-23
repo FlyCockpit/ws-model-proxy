@@ -7,6 +7,8 @@
 import { effectiveHardware, liveMetrics } from "../nodes/hardware";
 import { effectiveTrust } from "../nodes/trust";
 import { parseHeldDefinitions } from "../nodes/views";
+import { occupiesNodesWhere } from "./instance-occupancy";
+import { requiredDefinitionsByNode } from "./node-definitions";
 import type {
   PlacementContext,
   PlacementFabric,
@@ -88,9 +90,14 @@ function frozenFabricsOf(row: PlacementNodeRow): PlacementFrozenFabric[] | "curr
 
 /**
  * A node row as the planner sees it: usable memory and per-GPU usable VRAM, before claims
- * (`heldClaims: []` on purpose: the planner replays every claim itself, `loadPlacementInstances`).
+ * (`heldClaims: []` on purpose: the planner replays every claim itself, `loadPlacementInstances`),
+ * and the definitions it requires now (`requiredDefinitionsByNode`, read under the owner fence).
  */
-export function placementNodeOf(row: PlacementNodeRow, now: Date): PlacementNode {
+export function placementNodeOf(
+  row: PlacementNodeRow,
+  now: Date,
+  requiredVersionIds: ReadonlySet<string>,
+): PlacementNode {
   const hardware = effectiveHardware({
     declaredResources: row.declaredResources,
     nodeInfo: row.nodeInfo,
@@ -108,6 +115,7 @@ export function placementNodeOf(row: PlacementNodeRow, now: Date): PlacementNode
     labels: row.labels,
     portRange: [row.portStart, row.portEnd],
     heldVersionIds: new Set(parseHeldDefinitions(row.heldDefinitions).map((d) => d.versionId)),
+    requiredVersionIds,
     frozenFabrics: frozenFabricsOf(row),
     memoryGb: hardware.usableMemoryGb,
     // A unified GPU's VRAM is the node's usable memory (system memory minus reserved).
@@ -130,7 +138,10 @@ function hasInteractiveStop(spec: unknown): boolean {
 
 /**
  * Instances holding a claim (not RELEASED) on one of these nodes, with all their claims: their
- * ranks' and, while a rank holds, their reservations' (`launch.reservations`, no port).
+ * ranks' and, while a rank holds, their reservations' (`launch.reservations`, no port). A
+ * replaced run's claims that still hold (a rank's `prev*`, a superseded reservation row) come
+ * as `previous` claims: the planner overlaps them with the instance's current claims on the
+ * same node (`claim-overlap.ts`).
  */
 export async function loadPlacementInstances(
   db: Tx,
@@ -138,16 +149,8 @@ export async function loadPlacementInstances(
 ): Promise<PlacementInstance[]> {
   if (nodeIds.length === 0) return [];
   const rows = await db.runtimeInstance.findMany({
-    where: {
-      OR: [
-        { Ranks: { some: { nodeId: { in: [...nodeIds] }, claim: { not: "RELEASED" } } } },
-        // A reservation there holds while one of the instance's ranks does.
-        {
-          Reservations: { some: { nodeId: { in: [...nodeIds] } } },
-          Ranks: { some: { claim: { not: "RELEASED" } } },
-        },
-      ],
-    },
+    // A rank claim there, or a reservation there while one of the instance's ranks holds.
+    where: occupiesNodesWhere(nodeIds),
     select: {
       id: true,
       userId: true,
@@ -168,11 +171,20 @@ export async function loadPlacementInstances(
       Ranks: {
         where: { claim: { not: "RELEASED" } },
         orderBy: { rank: "asc" },
-        select: { nodeId: true, port: true, distPort: true, resources: true, claim: true },
+        select: {
+          nodeId: true,
+          port: true,
+          distPort: true,
+          resources: true,
+          claim: true,
+          prevResources: true,
+          prevPort: true,
+          prevDistPort: true,
+        },
       },
       Reservations: {
         orderBy: { index: "asc" },
-        select: { nodeId: true, resources: true },
+        select: { nodeId: true, resources: true, supersededGeneration: true },
       },
     },
     orderBy: { id: "asc" },
@@ -184,14 +196,30 @@ export async function loadPlacementInstances(
     startable: row.Runtime.kind === "STARTABLE",
     running: row.desiredState === "RUNNING",
     ranks: [
-      ...row.Ranks.map((rank) => ({
-        nodeId: rank.nodeId,
-        port: rank.port,
-        distPort: rank.distPort,
-        resources: rank.resources,
+      ...row.Ranks.flatMap((rank) => {
         // RELEASED claims are not loaded.
-        claim: rank.claim === "HELD_UNKNOWN" ? ("HELD_UNKNOWN" as const) : ("HELD" as const),
-      })),
+        const claim = rank.claim === "HELD_UNKNOWN" ? ("HELD_UNKNOWN" as const) : ("HELD" as const);
+        const current = {
+          nodeId: rank.nodeId,
+          port: rank.port,
+          distPort: rank.distPort,
+          resources: rank.resources,
+          claim,
+        };
+        // Rows read without the select (older callers' fixtures) have no previous claim.
+        if (rank.prevPort === null || rank.prevPort === undefined) return [current];
+        return [
+          current,
+          {
+            nodeId: rank.nodeId,
+            port: rank.prevPort,
+            distPort: rank.prevDistPort ?? null,
+            resources: rank.prevResources,
+            claim,
+            previous: true,
+          },
+        ];
+      }),
       // Only RELEASED-free ranks were loaded: without one, the reservations do not hold.
       ...(row.Ranks.length === 0
         ? []
@@ -205,6 +233,10 @@ export async function loadPlacementInstances(
               resources: reservation.resources,
               claim: claim === "HELD_UNKNOWN" ? ("HELD_UNKNOWN" as const) : ("HELD" as const),
               reservation: true,
+              ...(reservation.supersededGeneration === null ||
+              reservation.supersededGeneration === undefined
+                ? {}
+                : { previous: true }),
             };
           })),
     ],
@@ -233,17 +265,16 @@ export async function loadPlacementContext(
     select: PLACEMENT_NODE_SELECT,
     orderBy: { slug: "asc" },
   });
-  const [instances, fabrics] = await Promise.all([
-    loadPlacementInstances(
-      db,
-      nodes.map((row) => row.id),
-    ),
+  const nodeIds = nodes.map((row) => row.id);
+  const [instances, fabrics, required] = await Promise.all([
+    loadPlacementInstances(db, nodeIds),
     loadPlacementFabrics(db, input.userId),
+    requiredDefinitionsByNode(db, { userId: input.userId, nodeIds }),
   ]);
   return {
     callerId: input.userId,
     agent: input.agent,
-    nodes: nodes.map((row) => placementNodeOf(row, now)),
+    nodes: nodes.map((row) => placementNodeOf(row, now, required.get(row.id) ?? new Set())),
     instances,
     fabrics,
   };

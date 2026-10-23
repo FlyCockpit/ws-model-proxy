@@ -106,14 +106,6 @@ export function versionHashes(
   };
 }
 
-/** The trust the server acts on: a requested lowering counts as Relay only at once. */
-export function effectiveTrust(node: {
-  trust: "RELAY" | "FULL" | null;
-  trustLowerRequestedAt: Date | null;
-}): "RELAY" | "FULL" | null {
-  return node.trustLowerRequestedAt ? "RELAY" : node.trust;
-}
-
 export function specIsInteractive(spec: RuntimeSpec): boolean {
   return (spec.launch?.commands ?? []).some(
     (commands) => !!commands.interactive && Object.values(commands.interactive).some(Boolean),

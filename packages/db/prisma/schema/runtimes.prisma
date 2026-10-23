@@ -381,7 +381,9 @@ model InstanceRank {
   id                     String     @id @default(cuid(2))
   instanceId             String
   /// Null after the node was deleted (claim RELEASED by node_delete_release; the row keeps the
-  /// rank so the gang stop of the other ranks completes).
+  /// rank so the gang stop of the other ranks completes). A rank whose instance holds a
+  /// reservation on another surviving node stays held instead: a person marks it stopped and
+  /// releases it, since nothing can prove the stop now.
   nodeId                 String?
   /// Deterministic from (handle, rank): `wsmp-<handle>-r<rank>`; the held-unknown probe
   /// needs no local record.
@@ -407,6 +409,19 @@ model InstanceRank {
   releasedUnprovenAt     DateTime?
   releasedUnprovenBy     String?
   releasedUnprovenReason String?
+  /// The run before the one this claim (resources, port, dist port) was planned for
+  /// (`runGeneration - 1`, like `InstanceReservation.plannedGeneration`): the claim may be in use
+  /// only once a start step of this rank of a later generation was dispatched.
+  plannedGeneration      Int        @default(0)
+  /// The claim of a run a restart replaced while that run could still use it (all four set
+  /// together, or none): it keeps holding beside the current claim (memory and GPUs overlap,
+  /// `lib/claim-overlap.ts`; its ports stay taken) until a START of a later generation than
+  /// `prevGeneration` is claimed (the new run's leading STOP proved it stopped), or the claim is
+  /// RELEASED. Restarts never move a rank to another node, so it is on `nodeId` too.
+  prevResources          Json?
+  prevPort               Int?
+  prevDistPort           Int?
+  prevGeneration         Int?
 
   Instance        RuntimeInstance       @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Node            Node?                 @relation(fields: [nodeId], references: [id], onDelete: SetNull, onUpdate: Cascade)
@@ -553,6 +568,17 @@ model InstanceStep {
   operatorAcceptedAt DateTime?
   operatorLastExit   Int?
   operatorHold       String?
+  /// The head's fabric address a multi-node step was dispatched with (start phases, at their
+  /// claim), or, on a STOP or STATUS step, the one of the launch it names (`Physical`): a stop of
+  /// a gang whose head node was deleted still reaches the surviving ranks. Null: single-node, or
+  /// resolved from the head's fabric membership at dispatch.
+  headAddr           String?
+  /// A dispatch of this step may have reached its node and its outcome is unknown (its session
+  /// was lost or it expired without an answer, and it was queued again, or sent again): set
+  /// once, never cleared (`instance_step_may_have_run`). A later attempt's refusal before
+  /// admission proves only that attempt never ran, so the rank still needs a stop
+  /// (`lib/instance-run.ts` `MAY_HAVE_RUN`).
+  mayHaveRun         Boolean   @default(false)
 
   Instance RuntimeInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
