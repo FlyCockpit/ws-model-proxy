@@ -1,9 +1,10 @@
 //! OpenAI-compatible endpoint probing.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use url::Url;
 
 use crate::config::{
@@ -19,6 +20,8 @@ pub struct ProbeReport {
     pub endpoint_slug: String,
     pub status: ProbeStatus,
     pub discovered_model_ids: Vec<String>,
+    #[serde(default)]
+    pub discovered_capability_metadata: BTreeMap<String, serde_json::Value>,
     pub suggested_default_capabilities: OpenAiCompatibleCapabilities,
     pub model_suggestions: Vec<ModelSuggestion>,
     pub error: Option<String>,
@@ -119,6 +122,7 @@ pub fn probe_endpoint(endpoint: &EndpointConfig) -> ProbeReport {
             endpoint_slug: endpoint.slug.clone(),
             status: ProbeStatus::Offline,
             discovered_model_ids: Vec::new(),
+            discovered_capability_metadata: BTreeMap::new(),
             suggested_default_capabilities: endpoint.default_capabilities.clone(),
             model_suggestions: Vec::new(),
             error: Some(error.to_string()),
@@ -162,6 +166,26 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
         .map(|row| (row.id.clone(), row.max_model_len))
         .collect::<Vec<_>>();
     let mut engine = crate::engine::detect_engine(endpoint, &model_limits);
+    let discovered_capability_metadata = if engine.kind == Some(crate::engine::EngineKind::Ollama) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut metadata = BTreeMap::new();
+        for row in rows.iter().take(64) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if let Some(capability_metadata) = probe_ollama_capability_metadata(
+                endpoint,
+                &row.id,
+                remaining.min(crate::engine::DETECT_TIMEOUT),
+            ) {
+                metadata.insert(row.id.clone(), capability_metadata);
+            }
+        }
+        metadata
+    } else {
+        BTreeMap::new()
+    };
     let model = rows.first().map(|row| row.id.as_str());
     // A definition's reader `countRoute` joins the probe with the runtime
     // metrics reader (C4); until then only the built-in engine routes count.
@@ -175,6 +199,7 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
         endpoint_slug: endpoint.slug.clone(),
         status: ProbeStatus::Online,
         discovered_model_ids,
+        discovered_capability_metadata,
         suggested_default_capabilities: endpoint.default_capabilities.clone(),
         model_suggestions,
         error: None,
@@ -182,11 +207,63 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
     })
 }
 
-/// `request` with the endpoint's header and auth credentials (node secrets).
-pub(crate) fn with_endpoint_auth(
-    mut request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+#[derive(Debug, Deserialize)]
+struct OllamaShowResponse {
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+/// Ollama exposes model-level tools/thinking support through `/api/show`, not `/v1/models`.
+/// Record only advertised positive capabilities; absence remains unknown.
+fn probe_ollama_capability_metadata(
     endpoint: &EndpointConfig,
-) -> Result<ureq::RequestBuilder<ureq::typestate::WithoutBody>> {
+    model: &str,
+    timeout: Duration,
+) -> Option<serde_json::Value> {
+    let root = crate::engine::engine_root_url(&endpoint.base_url).ok()?;
+    let url = root.join("api/show").ok()?;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .max_redirects(0)
+        .build()
+        .into();
+    let request = agent
+        .post(url.as_str())
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json");
+    let mut response = with_endpoint_auth(request, endpoint)
+        .ok()?
+        .send_json(serde_json::json!({ "model": model }))
+        .ok()?;
+    let show = response.body_mut().read_json::<OllamaShowResponse>().ok()?;
+    let has = |capability: &str| show.capabilities.iter().any(|value| value == capability);
+    let mut features = serde_json::Map::new();
+    if has("tools") {
+        features.insert("tools".into(), serde_json::Value::Bool(true));
+    }
+    if has("thinking") {
+        features.insert("reasoning".into(), serde_json::Value::Bool(true));
+    }
+    if features.is_empty() {
+        return None;
+    }
+    features.insert("source".into(), serde_json::json!("probe"));
+    features.insert("confidence".into(), serde_json::json!("high"));
+    features.insert("operations".into(), serde_json::json!(["create"]));
+    Some(serde_json::json!({
+        "version": 4,
+        "protocol": "openai-compatible",
+        "source": "probe",
+        "confidence": "high",
+        "surfaces": { "openaiChatCompletions": features }
+    }))
+}
+
+/// `request` with the endpoint's header and auth credentials (node secrets).
+pub(crate) fn with_endpoint_auth<State>(
+    mut request: ureq::RequestBuilder<State>,
+    endpoint: &EndpointConfig,
+) -> Result<ureq::RequestBuilder<State>> {
     for header in &endpoint.headers {
         let value = crate::secrets::credential(&header.env).with_context(|| {
             format!(

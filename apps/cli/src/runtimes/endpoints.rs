@@ -184,13 +184,18 @@ pub fn model_capabilities(
 
 /// Inventory models from the spec, or from what a probe discovered when the
 /// spec pins none.
-pub fn inventory_models(spec: &RuntimeSpec, discovered: &[String]) -> Vec<InventoryModel> {
+pub fn inventory_models(
+    spec: &RuntimeSpec,
+    discovered: &[String],
+    discovered_metadata: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Vec<InventoryModel> {
     match &spec.models {
         Some(models) => models
             .iter()
             .map(|model| InventoryModel {
                 id: model.id.clone(),
                 capabilities: model_capabilities(spec, model.capabilities.as_deref()),
+                capability_metadata: model.capability_metadata.clone(),
                 embedding_contract: model.embedding_contract.clone(),
                 transcription: model.transcription.clone(),
                 engine_facts: None,
@@ -202,6 +207,7 @@ pub fn inventory_models(spec: &RuntimeSpec, discovered: &[String]) -> Vec<Invent
             .map(|id| InventoryModel {
                 id: id.clone(),
                 capabilities: model_capabilities(spec, None),
+                capability_metadata: discovered_metadata.get(id).cloned(),
                 embedding_contract: None,
                 transcription: None,
                 engine_facts: None,
@@ -216,6 +222,7 @@ pub fn always_on_entry(
     spec: &RuntimeSpec,
     status: AlwaysOnStatus,
     discovered: &[String],
+    discovered_metadata: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> AlwaysOnInventory {
     AlwaysOnInventory {
         slug: held.slug.clone(),
@@ -225,7 +232,7 @@ pub fn always_on_entry(
         launch_hash: held.launch_hash.clone(),
         spec: None,
         status,
-        models: inventory_models(spec, discovered),
+        models: inventory_models(spec, discovered, discovered_metadata),
         engine_facts: None,
         truncated: None,
     }

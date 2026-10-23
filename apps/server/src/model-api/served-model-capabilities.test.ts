@@ -14,6 +14,62 @@ const french: TranscriptionRequestProfile = {
 };
 
 describe("servedModelCapabilities", () => {
+  it("uses detected per-surface metadata ahead of coarse flags", () => {
+    const capabilities = servedModelCapabilities({
+      capabilities: ["TEXT_GENERATION"],
+      detectedCapabilityMetadata: {
+        version: 4,
+        protocol: "openai-compatible",
+        source: "probe",
+        confidence: "high",
+        surfaces: {
+          openaiChatCompletions: {
+            source: "probe",
+            confidence: "high",
+            operations: ["create"],
+            tools: true,
+          },
+        },
+      },
+    });
+    expect(capabilities.version).toBe(4);
+    if (capabilities.version !== 4) throw new Error("expected a v4 inventory");
+    expect(capabilities.surfaces.openaiChatCompletions?.tools).toBe(true);
+  });
+
+  it("uses an owner metadata override instead of detected metadata", () => {
+    const capabilities = servedModelCapabilities({
+      capabilities: ["TEXT_GENERATION"],
+      detectedCapabilityMetadata: {
+        version: 4,
+        protocol: "openai-compatible",
+        surfaces: {
+          openaiChatCompletions: {
+            source: "probe",
+            confidence: "high",
+            operations: ["create"],
+            tools: true,
+          },
+        },
+      },
+      capabilityMetadataOverridden: true,
+      capabilityMetadata: {
+        version: 4,
+        protocol: "openai-compatible",
+        surfaces: {
+          openaiChatCompletions: {
+            source: "dashboard",
+            confidence: "exact",
+            operations: ["create"],
+            tools: false,
+          },
+        },
+      },
+    });
+    if (capabilities.version !== 4) throw new Error("expected a v4 inventory");
+    expect(capabilities.surfaces.openaiChatCompletions?.tools).toBe(false);
+  });
+
   it("passes function tools to a native local Chat endpoint with unknown tool support", () => {
     const capabilities = servedModelCapabilities({ capabilities: ["TEXT_GENERATION"] });
     const request = profileSurfaceRequest({

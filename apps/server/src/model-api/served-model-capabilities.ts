@@ -2,6 +2,7 @@ import { parseEmbeddingContract } from "@ws-model-proxy/api/lib/embedding-contra
 import {
   type OpenAiCompatibleCapabilities,
   openAiCapabilitiesFromCoarse,
+  parseOpenAiCompatibleCapabilities,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { transcriptionProfileSchema } from "@ws-model-proxy/api/lib/transcription-profile";
 
@@ -17,11 +18,19 @@ import { transcriptionProfileSchema } from "@ws-model-proxy/api/lib/transcriptio
  */
 export function servedModelCapabilities(model: {
   capabilities: readonly string[];
+  detectedCapabilityMetadata?: unknown;
+  capabilityMetadata?: unknown;
+  capabilityMetadataOverridden?: boolean;
   /** RuntimeModel.type: only a TRANSCRIPTION model's profile counts. */
   type?: string;
   embeddingContract?: unknown;
   transcriptionProfile?: unknown;
 }): OpenAiCompatibleCapabilities {
+  const metadata = model.capabilityMetadataOverridden
+    ? model.capabilityMetadata
+    : model.detectedCapabilityMetadata;
+  const parsed = parseOpenAiCompatibleCapabilities(metadata);
+  if (parsed) return parsed;
   let capabilities = openAiCapabilitiesFromCoarse(model.capabilities);
   const contract = parseEmbeddingContract(model.embeddingContract);
   if (capabilities.version === 1 && capabilities.embeddings && contract)

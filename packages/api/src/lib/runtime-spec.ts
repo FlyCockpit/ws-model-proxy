@@ -15,6 +15,7 @@
 import { z } from "zod";
 import { canonicalJson } from "./canonical-json";
 import { isFabricIp, isUrlIpHost } from "./ip-literal";
+import { openAiCompatibleCapabilitiesSchema } from "./openai-compatible-capabilities";
 import { specIssue, specIssueMessage } from "./spec-issues";
 import { transcriptionProfileSchema } from "./transcription-profile";
 
@@ -262,6 +263,7 @@ export const runtimeSpecModelSchema = z
   .object({
     id: servedModelIdSchema,
     capabilities: z.array(z.enum(MODEL_CAPABILITIES)).max(MODEL_CAPABILITIES.length).optional(),
+    capabilityMetadata: openAiCompatibleCapabilitiesSchema.optional(),
     embeddingContract: specEmbeddingContractSchema.optional(),
     transcription: transcriptionProfileSchema.optional(),
   })

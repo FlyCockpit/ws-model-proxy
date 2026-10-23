@@ -165,23 +165,28 @@ model RuntimeVersion {
 /// A model id a runtime serves. Declared in the spec (STARTABLE) or discovered from
 /// /v1/models (ALWAYS_ON). Pool members point here; routing expands to live instances.
 model RuntimeModel {
-  id                     String            @id @default(cuid(2))
-  createdAt              DateTime          @default(now())
-  updatedAt              DateTime          @default(now()) @updatedAt
-  userId                 String
-  runtimeId              String
-  upstreamModelId        String
-  type                   ModelType
+  id                           String            @id @default(cuid(2))
+  createdAt                    DateTime          @default(now())
+  updatedAt                    DateTime          @default(now()) @updatedAt
+  userId                       String
+  runtimeId                    String
+  upstreamModelId              String
+  type                         ModelType
   /// Probe result from the node.
-  detectedCapabilities   ModelCapability[] @default([])
+  detectedCapabilities         ModelCapability[] @default([])
   /// Owner override; used instead of detection when `capabilitiesOverridden`.
-  capabilities           ModelCapability[] @default([])
-  capabilitiesOverridden Boolean           @default(false)
-  embeddingContract      Json?
-  transcriptionProfile   Json?
-  lastSeenAt             DateTime?
+  capabilities                 ModelCapability[] @default([])
+  capabilitiesOverridden       Boolean           @default(false)
+  /// Per-surface API inventory reported by node discovery or declared in the runtime spec.
+  detectedCapabilityMetadata   Json?
+  /// Owner's per-surface dashboard override.
+  capabilityMetadata           Json?
+  capabilityMetadataOverridden Boolean           @default(false)
+  embeddingContract            Json?
+  transcriptionProfile         Json?
+  lastSeenAt                   DateTime?
   /// No longer served by the current version / discovery; kept while pools reference it.
-  retired                Boolean           @default(false)
+  retired                      Boolean           @default(false)
 
   Runtime Runtime           @relation(fields: [runtimeId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
   Members PoolMember[]
