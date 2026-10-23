@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, render, renderHook } from "@testing-library/react";
-import type { ReactNode } from "react";
+import { act, cleanup, render, renderHook, waitFor } from "@testing-library/react";
+import { type ReactNode, Suspense, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 /** A page taking the whole viewport (the maximized terminal) hides the frame's chrome. */
@@ -89,5 +89,52 @@ describe("useHideAppChrome", () => {
     rerender({ active: true });
     unmount();
     expect(useAppChrome.getState().hidden).toBe(false);
+  });
+
+  it("shows the chrome while a Suspense fallback hides the page, and hides it again after", async () => {
+    // A pending navigation: the page stays mounted but hidden behind the fallback.
+    let resolve = () => {};
+    let pending: Promise<void> | null = null;
+    function Pending() {
+      if (pending) throw pending;
+      return null;
+    }
+    function Maximized() {
+      useHideAppChrome(true);
+      return null;
+    }
+    let setLoading = (_loading: boolean) => {};
+    function Harness() {
+      const [loading, set] = useState(false);
+      setLoading = set;
+      return (
+        <Suspense fallback={<p>loading</p>}>
+          <Maximized />
+          {loading ? <Pending /> : null}
+        </Suspense>
+      );
+    }
+    render(<Harness />);
+    expect(useAppChrome.getState().hidden).toBe(true);
+
+    pending = new Promise<void>((done) => {
+      resolve = done;
+    });
+    act(() => setLoading(true));
+    expect(useAppChrome.getState().hidden).toBe(false);
+
+    // The navigation completes: the page shows again and takes the viewport back.
+    pending = null;
+    await act(async () => resolve());
+    await waitFor(() => expect(useAppChrome.getState().hidden).toBe(true));
+
+    // Cancelled instead: leaving the pending state shows the page as well.
+    act(() => setLoading(false));
+    pending = new Promise<void>(() => {});
+    act(() => setLoading(true));
+    expect(useAppChrome.getState().hidden).toBe(false);
+    pending = null;
+    act(() => setLoading(false));
+    await waitFor(() => expect(useAppChrome.getState().hidden).toBe(true));
   });
 });
