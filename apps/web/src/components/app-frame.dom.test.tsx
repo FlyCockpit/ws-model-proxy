@@ -2,7 +2,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, render, renderHook } from "@testing-library/react";
-import { type ReactNode, useEffect } from "react";
+import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 /** A page taking the whole viewport (the maximized terminal) hides the frame's chrome. */
@@ -11,12 +11,13 @@ const page = vi.hoisted(() => ({ mounts: 0 }));
 
 vi.mock("@tanstack/react-router", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@tanstack/react-router")>();
-  // The page: counts its mounts, so a remount (an xterm losing its screen) would show.
+  // The page: counts its mounts, so a remount (an xterm losing its screen) would show. A stable
+  // ref callback runs once per mounted element.
+  const countMount = (element: HTMLDivElement | null) => {
+    if (element) page.mounts += 1;
+  };
   function Page() {
-    useEffect(() => {
-      page.mounts += 1;
-    }, []);
-    return <div data-testid="page" />;
+    return <div ref={countMount} data-testid="page" />;
   }
   return {
     ...actual,
