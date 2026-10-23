@@ -8,6 +8,7 @@ import { NeedsYouBadge } from "@/components/needs-you-badge";
 import { useAuthSession } from "@/hooks/use-auth-session";
 import { useNeedsYouCount } from "@/hooks/use-needs-you-count";
 import { type AppNavItem, getNavItems, toLangRoute } from "@/lib/nav-items";
+import { useAppChrome } from "@/stores/app-chrome";
 import { useUiPreferences } from "@/stores/ui-preferences";
 
 /**
@@ -21,6 +22,8 @@ export function AppFrame({ lang }: { lang: string }) {
   const { state } = useAuthSession();
   const sidebarCollapsed = useUiPreferences((prefs) => prefs.sidebarCollapsed);
   const toggleSidebar = useUiPreferences((prefs) => prefs.toggleSidebar);
+  // A page that took the whole viewport (the maximized terminal): no sidebar and no page padding.
+  const chromeHidden = useAppChrome((state) => state.hidden);
   const needsYou = useNeedsYouCount(Boolean(state.session));
   const items = getNavItems({
     placement: "sidebar",
@@ -42,7 +45,8 @@ export function AppFrame({ lang }: { lang: string }) {
         data-app-nav="sidebar"
         data-collapsed={sidebarCollapsed ? "true" : "false"}
         className={cn(
-          "hidden overflow-x-hidden overflow-y-auto overscroll-contain border-sidebar-border bg-sidebar md:sticky md:top-0 md:flex md:h-[100cqh] md:max-h-[100cqh] md:shrink-0 md:flex-col md:self-start md:border-e",
+          "hidden overflow-x-hidden overflow-y-auto overscroll-contain border-sidebar-border bg-sidebar md:sticky md:top-0 md:h-[100cqh] md:max-h-[100cqh] md:shrink-0 md:flex-col md:self-start md:border-e",
+          !chromeHidden && "md:flex",
           sidebarCollapsed ? "w-16" : "w-60",
         )}
       >
@@ -89,7 +93,14 @@ export function AppFrame({ lang }: { lang: string }) {
             once: main (a size container) less this padding and whatever the software keyboard
             covers. A page that must fit the screen (Terminals) sizes to it and lets flex divide
             it, rather than copying these numbers. */}
-        <div className="container mx-auto flex min-h-0 min-w-0 max-w-6xl flex-col px-4 py-(--app-page-pad-y) [--app-page-height:calc(100cqh-2*var(--app-page-pad-y)-var(--keyboard-inset,0px))] [--app-page-pad-y:1rem] md:[--app-page-pad-y:1.5rem]">
+        <div
+          className={cn(
+            "flex min-h-0 min-w-0 flex-col py-(--app-page-pad-y) [--app-page-height:calc(100cqh-2*var(--app-page-pad-y)-var(--keyboard-inset,0px))]",
+            chromeHidden
+              ? "w-full px-0 [--app-page-pad-y:0px]"
+              : "container mx-auto max-w-6xl px-4 [--app-page-pad-y:1rem] md:[--app-page-pad-y:1.5rem]",
+          )}
+        >
           <Outlet />
         </div>
       </div>
