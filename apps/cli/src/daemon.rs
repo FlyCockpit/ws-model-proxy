@@ -36,7 +36,6 @@ use url::Url;
 use crate::auth::{join, resolve_credential};
 use crate::config::{Config, ConfigLock, EndpointAuthMode};
 use crate::control::ControlServer;
-#[cfg(unix)]
 use crate::control::{self, ControlCommand, ControlResponse};
 use crate::media::{
     FetchedMedia, MEDIA_EXPAND_MAX_ASSET_BYTES, MEDIA_EXPAND_MAX_BODY_BYTES, MediaExpandError,
@@ -191,7 +190,7 @@ const RECENT_FINISHED_CAPACITY: usize = 256;
 /// cancelled, or rejected). Late `relay.request.body` chunks for these ids are
 /// expected and dropped silently; only ids that were *never* seen still earn the
 /// genuine "before request metadata" protocol error. Oldest ids are evicted once
-/// the ring is full — a client streaming body that far behind a finished
+/// the ring is full â€” a client streaming body that far behind a finished
 /// response is misbehaving and can take the protocol error.
 struct RecentlyFinished {
     order: VecDeque<String>,
@@ -462,6 +461,9 @@ pub fn connect_foreground() -> Result<()> {
     // Orphans of commands re-parent to the relay (Linux), so `trust` still
     // finds it above them; see `subreaper`.
     crate::subreaper::start();
+    // Windows: before anything is started, so all of it is in the job that
+    // `trust::started_by_wsmp` asks.
+    crate::trust::join_relay_job();
     let mut config = Config::load_required()?;
     config.validate()?;
     let mut control = ControlServer::bind()?;
@@ -659,7 +661,6 @@ impl ConfigWatch {
 
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-#[cfg(unix)]
 fn status_response<'a>(
     startup: &TerminalStartup,
     node_slug: &'a str,
@@ -675,7 +676,6 @@ fn status_response<'a>(
     }
 }
 
-#[cfg(unix)]
 fn simple_response(ok: bool, state: &str, message: Option<&str>) -> ControlResponse<'static> {
     let state: &'static str = match state {
         "changed" => "changed",
@@ -688,6 +688,7 @@ fn simple_response(ok: bool, state: &str, message: Option<&str>) -> ControlRespo
         message: message.map(|text| -> &'static str {
             match text {
                 "raise" => "a process wsmp started cannot raise trust",
+                "caller" => "the caller is a process wsmp started",
                 _ => "the relay could not apply the change; see its log",
             }
         }),
@@ -698,7 +699,6 @@ fn simple_response(ok: bool, state: &str, message: Option<&str>) -> ControlRespo
 }
 
 /// Answer local control requests; returns what changed for the session.
-#[cfg(unix)]
 fn answer_control_requests(
     control: &mut ControlServer,
     startup: &TerminalStartup,
@@ -743,6 +743,17 @@ fn answer_control_requests(
                 };
                 let _ = control::respond(pending, &response);
             }
+            ControlCommand::CheckCaller => {
+                // No peer pid: refused, as for a raise.
+                let response = match pending
+                    .peer_pid
+                    .map(|pid| crate::trust::started_by_wsmp(pid, std::process::id()))
+                {
+                    Some(Ok(())) => simple_response(true, "unchanged", None),
+                    _ => simple_response(false, "refused", Some("caller")),
+                };
+                let _ = control::respond(pending, &response);
+            }
             ControlCommand::TrustFull => {
                 // No peer pid, no raise.
                 let allowed = pending.peer_pid.is_some_and(|pid| {
@@ -772,16 +783,6 @@ fn answer_control_requests(
         }
     }
     Ok(changes)
-}
-
-#[cfg(not(unix))]
-fn answer_control_requests(
-    _control: &mut ControlServer,
-    _startup: &TerminalStartup,
-    _node_slug: &str,
-    _connection: &str,
-) -> Result<Vec<NodeChange>> {
-    Ok(Vec::new())
 }
 
 fn wait_for_reconnect(
@@ -1565,7 +1566,7 @@ where
         ServerFrame::RelayCancel { request_id, reason } => {
             tracing::warn!(request_id, ?reason, "relay request cancelled");
             // Cancelled request: any body chunks still in flight are late, not
-            // premature — drop them silently rather than faulting them.
+            // premature â€” drop them silently rather than faulting them.
             session.recent_finished.record(&request_id);
             if let Some(worker) = session.workers.remove(&request_id) {
                 worker.cancellation.cancel();
@@ -2281,7 +2282,7 @@ where
         )?;
         return Ok(());
     };
-    // §4.8: only the routes this runtime's API, model type and definition
+    // Â§4.8: only the routes this runtime's API, model type and definition
     // name, checked on the path as sent, before any connection is opened.
     if !crate::runtimes::allowlist::allowed(&target.spec, &method, &path)
         && !crate::runtimes::allowlist::engine_description_allowed(
@@ -4124,7 +4125,7 @@ fn websocket_url(server_url: &str) -> Result<Url> {
     Ok(url)
 }
 
-/// The upstream URL for `request_path` on a runtime at `base_url` (§4.8):
+/// The upstream URL for `request_path` on a runtime at `base_url` (Â§4.8):
 /// API paths (`/v1/...`) join onto the base URL, whose API prefix replaces the
 /// leading `/v1`; engine routes (readiness, metrics reader, count route) join
 /// onto the origin. The result must stay on the base URL's origin.
@@ -4878,7 +4879,7 @@ mod tests {
     #[test]
     fn recently_finished_request_id_is_rejected_without_spawning() {
         // FIX 4: the server never reuses request ids, so a `relay.request` whose id
-        // sits in the recently-finished ring is a protocol violation — reject it
+        // sits in the recently-finished ring is a protocol violation â€” reject it
         // rather than spawning a fresh worker.
         let mut socket = sink_socket();
         let config = Config::default();

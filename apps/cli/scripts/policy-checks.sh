@@ -11,7 +11,7 @@ set -euo pipefail
 fail=0
 
 # Where to look. We scan tracked source/config, not build output or git internals.
-SCAN_DIRS=(src xtask/src tests scripts .github docs)
+SCAN_DIRS=(src xtask/src wsmp-windows tests scripts .github docs)
 
 # The only place fake secret-shaped text may live (owner decision 2026-09-29);
 # every secret scanner excludes it, including the root private-key grep in

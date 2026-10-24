@@ -3019,6 +3019,15 @@ dependencies = [
  "tungstenite",
  "ureq",
  "url",
+ "wsmp-windows",
+]
+
+[[package]]
+name = "wsmp-windows"
+version = "0.0.0"
+dependencies = [
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
