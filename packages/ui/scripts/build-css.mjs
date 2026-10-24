@@ -1,0 +1,45 @@
+// Compiles src/styles/globals.css with Tailwind into dist/globals.css.
+// A file, not an inline `node -e '...'` script: cmd.exe (pnpm's script shell
+// on Windows) does not treat single quotes as quotes.
+import fs from "node:fs/promises";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const cwd = process.cwd();
+
+const pickExport = (entry) => {
+  if (typeof entry === "string") return entry;
+  if (entry && typeof entry === "object")
+    return entry.style ?? entry.default ?? entry.import ?? entry.require ?? null;
+  return null;
+};
+
+const resolveStylesheet = async (id, base) => {
+  if (id.startsWith(".") || id.startsWith("/")) return path.resolve(base, id);
+  const parts = id.split("/");
+  const packageName = id.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
+  const subpath = id.startsWith("@") ? parts.slice(2).join("/") : parts.slice(1).join("/");
+  const packageDir = path.join(cwd, "node_modules", packageName);
+  const pkg = JSON.parse(await fs.readFile(path.join(packageDir, "package.json"), "utf8"));
+  const exportKey = subpath ? "./" + subpath : ".";
+  const exported = pickExport(pkg.exports?.[exportKey]);
+  const fallback = subpath ? "./" + subpath : (pkg.main ?? "index.css");
+  return path.resolve(packageDir, exported ?? fallback);
+};
+
+const entry = path.join(cwd, "src/styles/globals.css");
+const input = await fs.readFile(entry, "utf8");
+const tailwind = await import(
+  pathToFileURL(path.join(cwd, "node_modules", "tailwindcss", "dist", "lib.mjs")).href
+);
+const compiled = await tailwind.compile(input, {
+  base: path.dirname(entry),
+  from: entry,
+  loadStylesheet: async (id, base) => {
+    const file = await resolveStylesheet(id, base);
+    return { path: file, base: path.dirname(file), content: await fs.readFile(file, "utf8") };
+  },
+});
+const css = compiled.build([]);
+await fs.mkdir(path.join(cwd, "dist"), { recursive: true });
+await fs.writeFile(path.join(cwd, "dist/globals.css"), css);

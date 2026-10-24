@@ -639,7 +639,6 @@ fn lowering_with(
 /// Why this login may not clear an earlier lowering now: a relay running
 /// here keeps its Relay-only latch and writes `relay` back; and a process
 /// wsmp started may not raise trust (the check of `wsmp trust full`).
-#[cfg(unix)]
 fn leftover_clear_refusal() -> Option<&'static str> {
     if let Some(reason) = crate::trust::self_started_by_wsmp() {
         return Some(reason);
@@ -650,12 +649,6 @@ fn leftover_clear_refusal() -> Option<&'static str> {
             Some("a relay is running here (stop it, then raise with `wsmp trust full`)")
         }
     }
-}
-
-/// No control socket to find a running relay by: never cleared here.
-#[cfg(not(unix))]
-fn leftover_clear_refusal() -> Option<&'static str> {
-    Some("this system cannot tell whether a relay is running")
 }
 
 fn not_clearing(reason: &str) -> Result<()> {

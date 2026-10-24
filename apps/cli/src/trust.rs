@@ -144,6 +144,11 @@ pub fn refuse_marked(command: &str) -> Result<()> {
 
 /// Why this process counts as started by wsmp, if it does: its own
 /// `WSMP_JOB`, then `started_by_wsmp` on itself (no relay pid known).
+///
+/// Windows has no `/proc` to walk: a running relay answers instead, from its
+/// job ([`join_relay_job`]). A relay that runs but cannot answer refuses
+/// (fail closed). With no relay running, the marker is all there is: the
+/// relay's commands and terminals died with it (kill-on-close jobs).
 pub fn self_started_by_wsmp() -> Option<&'static str> {
     if std::env::var_os(JOB_MARKER_ENV).is_some() {
         return Some(STARTED);
@@ -152,13 +157,49 @@ pub fn self_started_by_wsmp() -> Option<&'static str> {
     {
         started_by_wsmp(i32::try_from(std::process::id()).unwrap_or(0), 0).err()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use crate::control::{ControlCommand, request_if_running};
+        match request_if_running(ControlCommand::CheckCaller) {
+            Ok(None) => None,
+            Ok(Some(answer)) if answer.get("ok") == Some(&serde_json::Value::Bool(true)) => None,
+            Ok(Some(_)) => Some(STARTED),
+            Err(_) => Some(UNVERIFIED),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         None
     }
 }
 
 const STARTED: &str = "it or a parent process belongs to wsmp";
+#[cfg(windows)]
+const UNVERIFIED: &str = "a relay runs here but did not confirm this process is not one of its own";
+#[cfg(windows)]
+const NO_RELAY_JOB: &str = "the relay could not set up the job it tells its own processes by";
+
+/// The relay's job (Windows): everything the relay starts is in it. Set once
+/// by [`join_relay_job`], at relay startup.
+#[cfg(windows)]
+static RELAY_JOB: std::sync::OnceLock<wsmp_windows::RelayJob> = std::sync::OnceLock::new();
+
+/// Puts the relay in its job before it starts anything (Windows). If that
+/// fails the relay still runs, but refuses every trust raise and every
+/// [`ControlCommand::CheckCaller`](crate::control::ControlCommand) (fail
+/// closed). Other platforms need no job: they walk `/proc` or `ps`.
+pub fn join_relay_job() {
+    #[cfg(windows)]
+    match wsmp_windows::RelayJob::create_and_join() {
+        Ok(job) => {
+            let _ = RELAY_JOB.set(job);
+        }
+        Err(error) => tracing::error!(
+            error = %error,
+            "joining the relay job failed; `wsmp trust full` and other local changes are refused while this relay runs"
+        ),
+    }
+}
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const USER_SERVICE: &str =
     "it runs in a service of your systemd user manager; run it from a terminal or an SSH session";
@@ -394,6 +435,65 @@ pub fn started_by_wsmp(pid: i32, daemon_pid: u32) -> Result<(), &'static str> {
             .map_err(|_| STARTED)?;
     }
     Err(STARTED)
+}
+
+/// Windows: refuse the relay itself and every member of the relay's job
+/// ([`join_relay_job`]), which holds everything the relay started and what
+/// those started, whether or not they kept `WSMP_JOB`. A process that cannot
+/// be judged is refused, and so is every caller when the relay has no job.
+///
+/// Not covered, unlike Linux: a member can have a process outside the job
+/// start something for it (Task Scheduler, WMI, Explorer). Terminals are
+/// therefore Full control only on Windows, where this check guards nothing
+/// the server could not already do.
+#[cfg(windows)]
+pub fn started_by_wsmp(pid: i32, daemon_pid: u32) -> Result<(), &'static str> {
+    let pid = u32::try_from(pid).map_err(|_| "unknown caller")?;
+    if pid == 0 || pid == daemon_pid {
+        return Err(STARTED);
+    }
+    let job = RELAY_JOB.get().ok_or(NO_RELAY_JOB)?;
+    match job.contains(pid) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(STARTED),
+        Err(_) => Err("unknown caller"),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn the_relay_job_refuses_what_the_relay_started() {
+        let spawn = || {
+            std::process::Command::new("cmd")
+                .args(["/C", "ping -n 30 127.0.0.1 >nul"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn")
+        };
+        // Started before the relay joined its job: a person's own process.
+        let mut outside = spawn();
+        join_relay_job();
+        assert!(RELAY_JOB.get().is_some(), "joined");
+        // Through the same job tree as a command (its own kill-on-close job,
+        // nested in the relay's), with the marker removed.
+        let mut command = std::process::Command::new("cmd");
+        command
+            .args(["/C", "ping -n 30 127.0.0.1 >nul"])
+            .env_remove(JOB_MARKER_ENV);
+        let inside = crate::job_tree::spawn(command).expect("job spawn");
+        let as_pid = |pid: u32| i32::try_from(pid).expect("pid");
+        let me = std::process::id();
+        assert_eq!(started_by_wsmp(as_pid(outside.id()), me), Ok(()));
+        assert_eq!(started_by_wsmp(as_pid(inside.id()), me), Err(STARTED));
+        assert_eq!(started_by_wsmp(as_pid(me), me), Err(STARTED));
+        assert!(started_by_wsmp(0, me).is_err());
+        drop(inside);
+        let _ = outside.kill();
+        let _ = outside.wait();
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
