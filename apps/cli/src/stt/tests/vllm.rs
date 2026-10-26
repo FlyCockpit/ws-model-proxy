@@ -1,4 +1,4 @@
-//! The `vllm` adapter against a fake vLLM realtime engine on loopback. The
+﻿//! The `vllm` adapter against a fake vLLM realtime engine on loopback. The
 //! fake follows `vllm/entrypoints/speech_to_text/realtime/connection.py`:
 //! silent `session.update`, `unknown_event` errors, one generation per
 //! start commit, deltas while audio arrives, `done` after the final commit
@@ -834,7 +834,7 @@ fn a_refused_or_failed_stop_lets_the_endpoint_take_sessions_again() {
 fn a_trace_level_session_logs_no_transcript_or_credential() {
     const CHILD: &str = "WSMP_TEST_STT_TRACE_CHILD";
     if std::env::var_os(CHILD).is_some() {
-        crate::logging::init(crate::cli::LogFormat::Text, 2, false);
+        crate::logging::init(crate::cli::LogFormat::Text, 2, false, None);
         tracing::trace!("trace logging is on");
         let engine = FakeVllm::start(Script {
             delta: "TRANSCRIPTMARKER ".into(),

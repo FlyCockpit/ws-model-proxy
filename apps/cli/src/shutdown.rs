@@ -78,13 +78,13 @@ pub fn terminate_by_signal(signal: i32) -> ! {
 }
 
 #[cfg(any(unix, windows))]
-pub use tracked::{ExitCleanup, register_exit_cleanup, requested};
+pub use tracked::{ExitCleanup, register_exit_cleanup, request_stop, requested};
 
 #[cfg(unix)]
 pub use unix::install;
 
 #[cfg(windows)]
-pub use windows::install;
+pub use windows::{install, stop_when_console_host_goes};
 
 #[cfg(not(any(unix, windows)))]
 pub use fallback::{ExitCleanup, install, register_exit_cleanup, requested};
@@ -115,6 +115,16 @@ mod tracked {
             signal => Some(signal),
         }
     }
+
+    /// Stop the relay the way SIGTERM does, without a signal: `wsmp service
+    /// restart|uninstall` through the control channel (Windows, where
+    /// `schtasks /End` would end only the task's console host), or a service
+    /// relay whose console host went away.
+    pub fn request_stop(reason: &str) {
+        receive(SIGTERM_NUMBER, reason);
+    }
+
+    const SIGTERM_NUMBER: i32 = 15;
 
     /// A shutdown request arrived. The first starts graceful cleanup under
     /// [`SHUTDOWN_DEADLINE`]; a second one exits at once.
@@ -452,6 +462,29 @@ mod windows {
             .context("starting the shutdown signal thread")?;
         let _ = INSTALLED.set(());
         Ok(())
+    }
+
+    /// A service relay (`wsmp run --service`) runs under `conhost --headless`,
+    /// the scheduled task's own process. Ending the task (`schtasks /End`, the
+    /// Task Scheduler window) kills only that console host, not the relay.
+    /// So: once stderr, a console at start, stops being one, the host is gone
+    /// and the relay stops as on SIGTERM.
+    pub fn stop_when_console_host_goes() {
+        use std::io::IsTerminal;
+        if !std::io::stderr().is_terminal() {
+            return;
+        }
+        let _ = thread::Builder::new()
+            .name("wsmp-console-watch".to_string())
+            .spawn(|| {
+                loop {
+                    thread::sleep(std::time::Duration::from_secs(1));
+                    if !std::io::stderr().is_terminal() {
+                        super::tracked::request_stop("console host gone");
+                        return;
+                    }
+                }
+            });
     }
 
     /// A listener that failed to register never fires.

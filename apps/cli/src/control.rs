@@ -62,15 +62,20 @@ pub enum ControlCommand {
     /// on its peer. Windows asks this where Unix reads `/proc` or `ps` itself
     /// (`trust::self_started_by_wsmp`); changes nothing.
     CheckCaller,
+    /// Stop the relay as SIGTERM would (graceful, bounded). `wsmp service
+    /// restart|uninstall` on Windows, where `schtasks /End` ends only the
+    /// task's console host. Lowers nothing it could not already end.
+    Stop,
 }
 
 /// How long a client waits for the relay's answer.
 #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn answer_timeout(command: &ControlCommand) -> Duration {
     match command {
-        ControlCommand::Status | ControlCommand::Reload | ControlCommand::CheckCaller => {
-            Duration::from_secs(5)
-        }
+        ControlCommand::Status
+        | ControlCommand::Reload
+        | ControlCommand::CheckCaller
+        | ControlCommand::Stop => Duration::from_secs(5),
         // Lowering kills commands and writes files before it answers.
         ControlCommand::TrustRelay | ControlCommand::TrustFull => Duration::from_secs(30),
     }

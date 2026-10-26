@@ -16,6 +16,6 @@ mod imp;
 
 #[cfg(windows)]
 pub use imp::{
-    RelayJob, create_control_pipe, pipe_client_is_current_user, pipe_client_pid,
+    RelayJob, create_control_pipe, current_user_sid, pipe_client_is_current_user, pipe_client_pid,
     pipe_owner_is_current_user,
 };

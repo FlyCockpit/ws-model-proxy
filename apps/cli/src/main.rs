@@ -17,7 +17,11 @@ use wsmp::{commands, exit, logging, output, shutdown, tls};
 fn main() {
     let cli = Cli::parse();
     tls::install_crypto_provider();
-    logging::init(cli.log_format, cli.verbose, cli.quiet);
+    let log_file = match &cli.command {
+        Command::Run(args) => args.log_file.as_deref(),
+        _ => None,
+    };
+    logging::init(cli.log_format, cli.verbose, cli.quiet, log_file);
     // End metric-source runs before reporting a panic, including builds that
     // override the normal unwind strategy with abort (no `main` epilogue).
     let previous_hook = std::panic::take_hook();
@@ -45,7 +49,13 @@ fn main() {
             }
             // Identifiers in error messages are wrapped in `backticks`, never
             // 'single quotes' — see AGENTS.md.
-            let _ = output::diagnostic(format!("error: {}", exit::message_for(&err)));
+            let message = exit::message_for(&err);
+            // A service relay's stderr may go nowhere (a headless Windows
+            // task): its log file gets why it stopped too.
+            if log_file.is_some() {
+                tracing::error!(error = %message, "the relay stopped");
+            }
+            let _ = output::diagnostic(format!("error: {message}"));
             exit::code_for(&err)
         }
     };

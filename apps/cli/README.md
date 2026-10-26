@@ -130,6 +130,14 @@ journal is not persistent, user units may log only to the system journal, which 
 `~/Library/Logs/ws-model-proxy/relay.*.log` on macOS. Upgrading from 0.3: run `wsmp service
 install` again so the unit stops loading `service.env`, then delete that file.
 
+**Windows.** The service is a Task Scheduler task of yours, `wsmp-relay-<username>`. It starts
+when you log on, runs as you with no extra privileges and no console window, and stops when you
+log off. It needs no password and no administrator rights. A relay that exits is started again
+within 5 minutes while you are logged on. A task cannot set environment variables, so the task
+passes the config and state paths to `wsmp run` itself. It also passes a log file,
+`%LOCALAPPDATA%\ws-model-proxy\logs\relay.log`, which rolls over at 10 MiB and keeps 4 older files.
+`wsmp service logs` reads that file. Node state is in `%LOCALAPPDATA%\ws-model-proxy` on Windows.
+
 **Linux: enable lingering.** A user service stops when you log out, and runtimes are started as
 transient user units, which need a user manager that outlives your sessions. Enable it once:
 

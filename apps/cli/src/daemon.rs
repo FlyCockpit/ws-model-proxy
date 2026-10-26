@@ -743,6 +743,13 @@ fn answer_control_requests(
                 };
                 let _ = control::respond(pending, &response);
             }
+            ControlCommand::Stop => {
+                // Answer first: the client waits for it, and the relay then
+                // unwinds through its normal shutdown on the next turn.
+                let _ = control::respond(pending, &simple_response(true, "changed", None));
+                tracing::info!("stopping at the request of a local `wsmp` command");
+                crate::shutdown::request_stop("wsmp service");
+            }
             ControlCommand::CheckCaller => {
                 // No peer pid: refused, as for a raise.
                 let response = match pending
@@ -3863,9 +3870,23 @@ pub const STOP_ON_REJECTED_CREDENTIAL_ENV: &str = "WSMP_STOP_ON_REJECTED_CREDENT
 /// daemon, exiting would only restart or lose the relay, so it keeps retrying
 /// and picks up a new `wsmp login` by itself.
 fn stop_on_unusable_credential() -> bool {
-    use std::io::IsTerminal;
     std::env::var_os(STOP_ON_REJECTED_CREDENTIAL_ENV).is_some_and(|value| value == "1")
-        || std::io::stderr().is_terminal()
+        || person_watching()
+}
+
+/// Set by `wsmp run --service`: a service manager started this relay. The
+/// Windows task runs it under `conhost --headless`, whose console stderr is
+/// a terminal that nobody sees.
+static AS_SERVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn run_as_service() {
+    AS_SERVICE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether a person sees this relay's stderr: a terminal, and not a service.
+fn person_watching() -> bool {
+    use std::io::IsTerminal;
+    !AS_SERVICE.load(std::sync::atomic::Ordering::SeqCst) && std::io::stderr().is_terminal()
 }
 
 /// Set by a systemd unit that also lists exit 5 in `RestartPreventExitStatus=`
@@ -3884,12 +3905,11 @@ struct StopOn {
 
 impl StopOn {
     fn here() -> Self {
-        use std::io::IsTerminal;
         Self {
             credential: stop_on_unusable_credential(),
             protocol: std::env::var_os(STOP_ON_PROTOCOL_MISMATCH_ENV)
                 .is_some_and(|value| value == "1")
-                || std::io::stderr().is_terminal(),
+                || person_watching(),
         }
     }
 

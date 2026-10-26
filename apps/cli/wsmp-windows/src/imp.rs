@@ -147,6 +147,12 @@ impl UserSid {
     }
 }
 
+/// This process's user SID in its `S-1-5-21-…` string form (what a Task
+/// Scheduler principal names).
+pub fn current_user_sid() -> io::Result<String> {
+    UserSid::current()?.to_sddl()
+}
+
 /// Creates one instance of the relay's control pipe at `name`, inside a
 /// tokio runtime.
 ///
