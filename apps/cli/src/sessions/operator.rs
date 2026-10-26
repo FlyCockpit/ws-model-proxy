@@ -32,6 +32,9 @@ pub(super) struct OperatorState {
     /// The shell the command was rendered for (Windows runs it there).
     #[cfg_attr(unix, allow(dead_code))]
     shell: CommandShell,
+    /// The arguments the command was rendered from, when it was an argv.
+    #[cfg_attr(unix, allow(dead_code))]
+    argv: Option<Vec<String>>,
     events: SyncSender<OperatorEvent>,
     /// A person accepted and the command's PTY was spawned.
     running: bool,
@@ -322,6 +325,7 @@ impl TerminalRegistry {
                     screen: open.screen,
                     env: open.env,
                     shell: open.shell,
+                    argv: open.argv,
                     events: open.events,
                     running: false,
                 }),
@@ -482,8 +486,9 @@ fn spawn_operator(
     )
 }
 
-/// Windows: the step's script in the shell it was rendered for, where a person can answer a
-/// prompt or finish a sign-in, exiting with the script's status. The console host's kill-on-close
+/// Windows: the step's script in the shell it was rendered for (or its `.exe`, started directly,
+/// for an argv), where a person can answer a prompt or finish a sign-in, exiting with the
+/// command's status. The console host's kill-on-close
 /// job keeps it from outliving the daemon. There is no cached `sudo` credential to reset.
 #[cfg(windows)]
 fn spawn_operator(
@@ -493,9 +498,15 @@ fn spawn_operator(
     tx: &SyncSender<FromWorker>,
     terminal_id: &str,
 ) -> anyhow::Result<super::PtyRuntime> {
-    use crate::runtimes::executor::windows::{ShellLine, interactive_shell_line, shell_program};
-    let program = shell_program(state.shell)?;
-    match interactive_shell_line(state.shell, &state.screen.command)? {
+    use crate::runtimes::executor::windows::{Invocation, ShellLine, invocation};
+    let Invocation { program, line } = invocation(
+        state.shell,
+        &state.screen.command,
+        state.argv.as_deref(),
+        &state.env,
+        true,
+    )?;
+    match line {
         ShellLine::List(args) => super::spawn_pty(
             program.as_os_str(),
             &args,

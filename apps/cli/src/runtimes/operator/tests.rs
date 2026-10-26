@@ -146,6 +146,7 @@ fn the_environment_drops_askpass_and_startup_files() {
         screen: screen("x", CommandAuthor::User),
         env,
         shell: crate::protocol::runtime_spec::CommandShell::Sh,
+        argv: None,
         events: std::sync::mpsc::sync_channel(1).0,
     };
     assert!(!format!("{open:?}").contains("secret"));
@@ -374,6 +375,7 @@ fn job(action: JobPhase) -> Job {
         stop_command: "sudo systemctl stop x".into(),
         status_command: Some("systemctl is-active x".into()),
         health_command: None,
+        argvs: Vec::new(),
         shell: crate::protocol::runtime_spec::CommandShell::Sh,
         secrets: Vec::new(),
         timeout_ms: 2_000,

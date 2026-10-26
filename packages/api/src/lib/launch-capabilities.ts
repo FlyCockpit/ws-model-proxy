@@ -1,8 +1,9 @@
 /**
- * Whether a node can run a runtime's launch: its platform, the management modes it supports
- * and the shells its text commands need. Placement leaves out a node that cannot
- * (`unsupported_platform`), so a spec is never placed where its commands would only fail on the
- * node. Pure: contracts are also bundled for the browser.
+ * Whether a node can run a runtime's launch: the management modes it supports and the shells its
+ * text commands need. Placement leaves out a node that cannot (`unsupported_platform`). The node's
+ * platform is reported but not matched: a launch does not say which operating system its commands
+ * are for, so an `sh` command that only Linux can run (`systemctl`) may still be placed on macOS,
+ * where it fails on the node. Pure: contracts are also bundled for the browser.
  */
 import { z } from "zod";
 import {

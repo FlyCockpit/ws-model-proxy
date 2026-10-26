@@ -19,6 +19,7 @@ fn job(action: JobPhase) -> Job {
         stop_command: "true".into(),
         status_command: None,
         health_command: None,
+        argvs: Vec::new(),
         shell: crate::protocol::runtime_spec::CommandShell::Sh,
         secrets: Vec::new(),
         timeout_ms: 1_000,

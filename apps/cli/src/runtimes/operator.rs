@@ -325,6 +325,9 @@ pub struct OperatorOpen {
     pub env: Vec<(String, String)>,
     /// The shell the command was rendered for (the job's).
     pub shell: crate::protocol::runtime_spec::CommandShell,
+    /// The arguments the command was rendered from, when it was an argv (Windows starts an
+    /// `.exe` directly).
+    pub argv: Option<Vec<String>>,
     pub events: SyncSender<OperatorEvent>,
 }
 

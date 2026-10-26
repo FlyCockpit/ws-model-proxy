@@ -138,28 +138,22 @@ fn powershell_word(arg: &str) -> String {
     out
 }
 
-/// An argument Windows PowerShell 5.1 hands a program intact: it rebuilds the command line
-/// itself and loses an empty argument, a quote inside one, and a trailing backslash before the
-/// quote it adds around one with a space.
-fn powershell51_passes(arg: &str) -> bool {
-    !arg.is_empty() && !arg.contains('"') && !(arg.ends_with('\\') && arg.contains([' ', '\t']))
-}
-
-/// An argv as a script for `shell`: the program runs in place of the shell (`exec`) in `sh`,
-/// and PowerShell exits with the program's status. `None` for `cmd`, which cannot quote an
-/// argument safely, and for an argument Windows PowerShell 5.1 would change.
+/// An argv as a script for `shell`: the program runs in place of the shell (`exec`) in `sh`.
+/// PowerShell runs it as its last command, so the status check every Windows script ends with
+/// (`windows::powershell_script`) exits with the program's status, or 1 when it could not start.
+/// `None` for `cmd`, which cannot quote an argument safely.
+///
+/// On Windows the script is how the command is shown, and how it runs when its program is not an
+/// `.exe`: one that is starts directly (`windows::invocation`).
 pub fn argv_script(shell: CommandShell, argv: &[String]) -> Option<String> {
     let words = |word: fn(&str) -> String| argv.iter().map(|arg| word(arg)).collect::<Vec<_>>();
     match shell {
         CommandShell::Sh => Some(format!("exec {}", words(sh_word).join(" "))),
         CommandShell::Pwsh => Some(format!(
-            "$PSNativeCommandArgumentPassing = 'Standard'; & {}; exit $LASTEXITCODE",
+            "$PSNativeCommandArgumentPassing = 'Standard'; & {}",
             words(powershell_word).join(" ")
         )),
-        CommandShell::Powershell => argv
-            .iter()
-            .all(|arg| powershell51_passes(arg))
-            .then(|| format!("& {}; exit $LASTEXITCODE", words(powershell_word).join(" "))),
+        CommandShell::Powershell => Some(format!("& {}", words(powershell_word).join(" "))),
         CommandShell::Cmd => None,
     }
 }
@@ -257,6 +251,8 @@ pub fn render(
         substitute(text, &values)
             .map_err(|name| refuse(JobError::BadJob, format!("placeholders.{name}")))
     };
+    // The argv commands' arguments, kept where a program may start without the shell (Windows).
+    let argvs = std::cell::RefCell::new(Vec::new());
     // Sizes are checked before quoting: an argv is as long as its arguments joined with spaces.
     let render_one = |command: &CommandLine, field: &str| -> Result<String, Refusal> {
         let refused = || refuse(JobError::BadJob, field.to_string());
@@ -278,7 +274,11 @@ pub fn render(
                 if joined > RUNTIME_COMMAND_MAX_BYTES {
                     return Err(refused());
                 }
-                argv_script(shell, &rendered).ok_or_else(refused)
+                let script = argv_script(shell, &rendered).ok_or_else(refused)?;
+                if shell != CommandShell::Sh {
+                    argvs.borrow_mut().push(rendered);
+                }
+                Ok(script)
             }
         }
     };
@@ -333,6 +333,7 @@ pub fn render(
         status_command,
         health_command,
         shell,
+        argvs: argvs.into_inner(),
         secrets: launch.secrets.clone().unwrap_or_default(),
         timeout_ms: capped_timeout(job.phase, job.timeout_ms),
         unit_name: job.unit_name.clone(),

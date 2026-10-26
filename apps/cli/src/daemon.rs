@@ -5979,6 +5979,7 @@ mod tests {
             stop_command: "sudo systemctl stop x".into(),
             status_command: Some("systemctl is-active x".into()),
             health_command: None,
+            argvs: Vec::new(),
             shell: crate::protocol::runtime_spec::CommandShell::Sh,
             secrets: Vec::new(),
             timeout_ms: 60_000,

@@ -13,6 +13,7 @@ use wsmp::runtimes::executor::windows::{
     HostLaunch, exited_cleanly, identity, read_record, running, start, stop, stop_slice,
     tasks_alive,
 };
+use wsmp::runtimes::render::argv_script;
 
 const OWNER: &str = "abcdefghijklmnopqrstuvwx";
 const EXE: &str = env!("CARGO_BIN_EXE_wsmp");
@@ -27,6 +28,7 @@ fn launch(dir: &Path, unit: &str, script: &str) -> String {
             slice: "wsmp_test_r0.slice",
             shell: CommandShell::Powershell,
             script,
+            argv: None,
             env: &[("WSMP_TEST_VALUE".to_string(), "from-env".to_string())],
         },
     )
@@ -220,6 +222,7 @@ fn a_running_unit_is_launched_once() {
             slice: "wsmp_test_r0.slice",
             shell: CommandShell::Powershell,
             script: "exit 0",
+            argv: None,
             env: &[],
         },
     );
@@ -330,4 +333,73 @@ fn a_runtime_cannot_raise_trust_without_a_relay() {
         Duration::ZERO,
         Deadline::new(Duration::from_secs(10)),
     );
+}
+
+/// Starts an argv command the way a job does: its script, and the arguments it was rendered from.
+fn launch_argv(dir: &Path, unit: &str, argv: &[String], env: &[(String, String)]) -> String {
+    let script = argv_script(CommandShell::Powershell, argv).expect("a script");
+    start(
+        dir,
+        &HostLaunch {
+            exe: Path::new(EXE),
+            owner: OWNER,
+            unit,
+            slice: "wsmp_test_r0.slice",
+            shell: CommandShell::Powershell,
+            script: &script,
+            argv: Some(argv),
+            env,
+        },
+    )
+    .expect("the host starts")
+}
+
+/// An argv whose program is an `.exe` starts directly: every argument arrives as it was, those
+/// Windows PowerShell 5.1 would change included. The program is this test binary, which writes
+/// what it was given when `WSMP_ARGV_ECHO` names a file.
+#[test]
+fn an_exe_argv_gets_its_arguments_intact() {
+    if let Some(out) = std::env::var_os("WSMP_ARGV_ECHO") {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        std::fs::write(out, serde_json::to_string(&args).expect("json")).expect("echo");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("dir");
+    let out = dir.path().join("argv.json");
+    let me = std::env::current_exe().expect("test binary");
+    let argv: Vec<String> = vec![
+        me.to_string_lossy().into_owned(),
+        "--exact".into(),
+        "an_exe_argv_gets_its_arguments_intact".into(),
+        String::new(),
+        "say \"hi\"".into(),
+        r"C:\my dir\".into(),
+        "it's".into(),
+    ];
+    let env = [(
+        "WSMP_ARGV_ECHO".to_string(),
+        out.to_string_lossy().into_owned(),
+    )];
+    launch_argv(dir.path(), "wsmp-test-r7", &argv, &env);
+    wait_for("the clean exit", Duration::from_secs(60), || {
+        exited_cleanly(dir.path(), "wsmp-test-r7").expect("record")
+    });
+    let seen: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(&out).expect("echoed")).expect("json");
+    assert_eq!(seen, argv[1..]);
+}
+
+/// A program that is not there fails the unit: through PowerShell (a name it cannot find), and
+/// at once where Windows PowerShell 5.1 could not hand its arguments on anyway.
+#[test]
+fn a_missing_program_fails_its_unit() {
+    let dir = tempfile::tempdir().expect("dir");
+    for (unit, extra) in [("wsmp-test-r8", "x"), ("wsmp-test-r9", "")] {
+        let argv = vec!["wsmp-no-such-program".to_string(), extra.to_string()];
+        launch_argv(dir.path(), unit, &argv, &[]);
+        wait_for("the failed unit to go", Duration::from_secs(30), || {
+            read_record(dir.path(), unit).expect("record").is_none()
+        });
+        assert!(!exited_cleanly(dir.path(), unit).expect("record"), "{unit}");
+    }
 }

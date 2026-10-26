@@ -132,6 +132,7 @@ fn request_in(
             },
             env,
             shell,
+            argv: None,
             events,
         },
         rx,

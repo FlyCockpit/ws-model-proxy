@@ -426,6 +426,9 @@ impl OperatorLink for RunnerLink<'_> {
             screen: self.ticket.screen.clone(),
             env: super::operator::operator_env(&self.ticket.base_env, &extra),
             shell: job.shell,
+            argv: job
+                .argv_for(&self.ticket.screen.command)
+                .map(<[String]>::to_vec),
             events,
         };
         self.tx

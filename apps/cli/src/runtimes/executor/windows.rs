@@ -310,6 +310,8 @@ pub struct HostLaunch<'a> {
     pub slice: &'a str,
     pub shell: CommandShell,
     pub script: &'a str,
+    /// The arguments `script` was rendered from, when it was an argv ([`invocation`]).
+    pub argv: Option<&'a [String]>,
     /// On top of the scrubbed parent environment (node secrets): never logged.
     pub env: &'a [(String, String)],
 }
@@ -341,8 +343,13 @@ pub fn start(dir: &Path, launch: &HostLaunch<'_>) -> Result<String> {
         created: unix_now(),
     };
     write_json(&path(dir, launch.unit, "unit"), &record, "unit record")?;
-    let spawned = std::process::Command::new(launch.exe)
-        .arg(SUBCOMMAND)
+    let mut host = std::process::Command::new(launch.exe);
+    host.arg(SUBCOMMAND);
+    if let Some(argv) = launch.argv {
+        host.arg("--argv-json")
+            .arg(serde_json::to_string(argv).context("encoding the command's arguments")?);
+    }
+    let spawned = host
         .arg("--dir")
         .arg(dir)
         .args([
@@ -508,17 +515,119 @@ fn line_for(shell: CommandShell, script: &str, interactive: bool) -> Result<Shel
     }
 }
 
-/// Runs a script to completion in the job's shell (bounded, in a job of its
-/// own): its output is read and dropped, never logged.
+/// An argument Windows PowerShell 5.1 hands a program intact: it rebuilds the command line
+/// itself and loses an empty argument, a quote inside one, and a trailing backslash before the
+/// quote it adds around one with a space.
+fn powershell51_passes(arg: &str) -> bool {
+    !arg.is_empty() && !arg.contains('"') && !(arg.ends_with('\\') && arg.contains([' ', '\t']))
+}
+
+/// How a command starts: its program, and the arguments it is given.
+pub struct Invocation {
+    pub program: PathBuf,
+    pub line: ShellLine,
+}
+
+/// How one of a job's commands starts. An argv (`argv`, the arguments `script` was rendered
+/// from) whose program is an `.exe` or `.com` on the command's `PATH` starts directly, its
+/// arguments quoted as the C runtime reads them: it gets each one exactly, and the command's
+/// status is its own. Anything else runs as `script` in `shell`: a text command, and an argv
+/// naming a `.cmd` or `.bat` shim (which cannot be handed arguments safely), a PowerShell command,
+/// or a program not found (the shell's status check exits 1). `env` is the command's whole
+/// environment.
+pub fn invocation(
+    shell: CommandShell,
+    script: &str,
+    argv: Option<&[String]>,
+    env: &[(String, String)],
+    interactive: bool,
+) -> Result<Invocation> {
+    if let Some(argv) = argv {
+        if let Some((program, args)) = argv.split_first()
+            && let Some(exe) = find_exe(program, env)
+        {
+            return Ok(Invocation {
+                program: exe,
+                line: ShellLine::List(args.to_vec()),
+            });
+        }
+        anyhow::ensure!(
+            shell != CommandShell::Powershell || argv.iter().all(|arg| powershell51_passes(arg)),
+            "the program is not an `.exe`, and Windows PowerShell 5.1 would change one of its \
+             arguments (an empty one, a `\"` in one, or a trailing `\\` in one with a space)"
+        );
+    }
+    Ok(Invocation {
+        program: shell_program(shell)?,
+        line: line_for(shell, script, interactive)?,
+    })
+}
+
+/// `name` as PowerShell would find it, when that is an `.exe` or `.com`: an absolute path as it
+/// is, a bare name in each absolute `PATH` directory in turn; either with each `PATHEXT`
+/// extension unless it already ends in one. A relative path is left to the shell.
+fn find_exe(name: &str, env: &[(String, String)]) -> Option<PathBuf> {
+    let var = |key: &str| {
+        env.iter()
+            .rev()
+            .find(|(found, _)| found.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.as_str())
+    };
+    let extensions: Vec<String> = var("PATHEXT")
+        .unwrap_or(".COM;.EXE;.BAT;.CMD")
+        .split(';')
+        .filter(|ext| ext.len() > 1 && ext.starts_with('.'))
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let path = Path::new(name);
+    let has_extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| extensions.contains(&format!(".{}", ext.to_ascii_lowercase())));
+    let candidates = |base: &Path| -> Vec<PathBuf> {
+        if has_extension {
+            return vec![base.to_path_buf()];
+        }
+        extensions
+            .iter()
+            .map(|ext| {
+                let mut with = base.as_os_str().to_owned();
+                with.push(ext);
+                PathBuf::from(with)
+            })
+            .collect()
+    };
+    let found = if name.contains(['\\', '/', ':']) {
+        if !path.is_absolute() {
+            return None;
+        }
+        candidates(path)
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+    } else {
+        std::env::split_paths(var("PATH")?)
+            .filter(|dir| dir.is_absolute())
+            .flat_map(|dir| candidates(&dir.join(name)))
+            .find(|candidate| candidate.is_file())
+    }?;
+    let extension = found.extension()?.to_str()?.to_ascii_lowercase();
+    matches!(extension.as_str(), "exe" | "com").then_some(found)
+}
+
+/// Runs one of a job's commands to completion (bounded, in a job of its own): its output is
+/// read and dropped, never logged. `argv`: see [`invocation`].
 pub fn run_script(
     shell: CommandShell,
     script: &str,
+    argv: Option<&[String]>,
     deadline: Deadline,
     cancel: Option<&AtomicBool>,
     env: &[(String, String)],
 ) -> Result<(), crate::bounded_run::RunError> {
-    let line = shell_line(shell, script).map_err(|_| crate::bounded_run::RunError::Spawn)?;
-    let program = shell_program(shell).map_err(|_| crate::bounded_run::RunError::Spawn)?;
+    let mut whole = crate::child_env::scrub_parent_env(&[]);
+    whole.extend_from_slice(env);
+    let Invocation { program, line } = invocation(shell, script, argv, &whole, false)
+        .map_err(|_| crate::bounded_run::RunError::Spawn)?;
     let program = program.to_string_lossy();
     match line {
         ShellLine::List(args) => crate::bounded_run::run_until_env(
@@ -548,6 +657,8 @@ pub struct HostArgs<'a> {
     pub invocation: &'a str,
     pub shell: &'a str,
     pub script: &'a str,
+    /// The arguments `script` was rendered from (JSON), when it was an argv.
+    pub argv_json: Option<&'a str>,
 }
 
 /// The runtime host: holds the unit's lock and job, runs the script, records
@@ -560,6 +671,11 @@ pub fn host(args: &HostArgs<'_>) -> Result<()> {
         "bad unit"
     );
     let shell = parse_shell(args.shell).context("unknown shell")?;
+    let argv: Option<Vec<String>> = args
+        .argv_json
+        .map(serde_json::from_str)
+        .transpose()
+        .context("reading the command's arguments")?;
     let until = Instant::now() + LOCK_WAIT;
     let _lock = loop {
         match open_lock(args.dir, args.unit) {
@@ -582,10 +698,21 @@ pub fn host(args: &HostArgs<'_>) -> Result<()> {
     if stop_grace(args.dir, args.unit, args.invocation).is_some() {
         return Ok(());
     }
+    // This host's environment is the command's.
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let Invocation { program, line } =
+        match invocation(shell, args.script, argv.as_deref(), &env, false) {
+            Ok(found) => found,
+            Err(error) => {
+                // Nothing started: the unit goes, and the launch fails.
+                let _ = remove(&record_path);
+                return Err(error);
+            }
+        };
     record.state = UnitState::Running;
     write_json(&record_path, &record, "unit record")?;
-    let mut command = std::process::Command::new(shell_program(shell)?);
-    match shell_line(shell, args.script)? {
+    let mut command = std::process::Command::new(program);
+    match line {
         ShellLine::List(list) => {
             command.args(list);
         }
@@ -695,6 +822,116 @@ mod tests {
         assert_eq!(code("Write-Output 'it''s \"quoted\"'"), Some(0));
         assert_eq!(code("Get-Item C:\\wsmp-no-such-path"), Some(1));
         assert_eq!(code("cmd /c exit 5; Write-Output ok"), Some(0));
+    }
+
+    #[test]
+    fn an_argv_exits_with_its_program_status_or_1_when_it_cannot_start() {
+        use crate::bounded_run::RunError;
+        let deadline = || Deadline::new(Duration::from_secs(60));
+        for shell in [CommandShell::Powershell, CommandShell::Pwsh] {
+            if shell_program(shell).is_err() {
+                continue;
+            }
+            let run = |argv: &[&str], direct: bool| {
+                let argv: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
+                let script = crate::runtimes::render::argv_script(shell, &argv).expect("script");
+                let argv = direct.then_some(argv.as_slice());
+                match run_script(shell, &script, argv, deadline(), None, &[]) {
+                    Ok(()) => Some(0),
+                    Err(RunError::ExitStatus(code)) => code,
+                    Err(other) => panic!("{other:?}"),
+                }
+            };
+            for direct in [false, true] {
+                assert_eq!(run(&["cmd", "/d", "/c", "exit 7"], direct), Some(7));
+                assert_eq!(run(&["cmd", "/d", "/c", "exit 0"], direct), Some(0));
+                // Not found: PowerShell runs it, and it fails.
+                assert_eq!(run(&["wsmp-no-such-program", "x"], direct), Some(1));
+            }
+            // A script whose last command is a program that is not there fails too.
+            assert_eq!(
+                run_script(
+                    shell,
+                    "& 'wsmp-no-such-program'",
+                    None,
+                    deadline(),
+                    None,
+                    &[]
+                )
+                .map_err(|error| matches!(error, RunError::ExitStatus(Some(1)))),
+                Err(true)
+            );
+        }
+    }
+
+    #[test]
+    fn an_exe_is_found_and_anything_else_is_left_to_the_shell() {
+        let dir = tempfile::tempdir().expect("dir");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).expect("bin");
+        std::fs::write(bin.join("tool.cmd"), "@exit /b 0").expect("shim");
+        std::fs::write(bin.join("both.cmd"), "@exit /b 0").expect("shim");
+        std::fs::write(bin.join("both.exe"), "").expect("exe");
+        let env = vec![
+            ("Path".to_string(), bin.to_string_lossy().into_owned()),
+            ("PATHEXT".to_string(), ".COM;.EXE;.BAT;.CMD".to_string()),
+        ];
+        // The first `PATHEXT` extension wins in a directory.
+        assert_eq!(find_exe("both", &env), Some(bin.join("both.exe")));
+        assert_eq!(find_exe("BOTH.EXE", &env), Some(bin.join("BOTH.EXE")));
+        // A shim runs in the shell.
+        assert_eq!(find_exe("tool", &env), None);
+        assert_eq!(find_exe("both.cmd", &env), None);
+        assert_eq!(find_exe("missing", &env), None);
+        // A path is taken as it is; a relative one is the shell's.
+        let exe = bin.join("both.exe");
+        assert_eq!(find_exe(&exe.to_string_lossy(), &[]), Some(exe));
+        assert_eq!(find_exe(r".\bin\both.exe", &env), None);
+        // Without `PATH`, nothing is found.
+        assert_eq!(find_exe("both", &[]), None);
+    }
+
+    #[test]
+    fn a_5_1_argument_is_refused_only_without_an_exe() {
+        let env = crate::child_env::scrub_parent_env(&[]);
+        let argv = |program: &str| vec![program.to_string(), String::new()];
+        let shim = invocation(
+            CommandShell::Powershell,
+            "",
+            Some(&argv("wsmp-no-such-program")),
+            &env,
+            false,
+        );
+        assert!(shim.is_err());
+        let direct = invocation(
+            CommandShell::Powershell,
+            "",
+            Some(&argv("cmd")),
+            &env,
+            false,
+        )
+        .expect("cmd.exe starts directly");
+        assert!(
+            direct
+                .program
+                .to_string_lossy()
+                .to_lowercase()
+                .ends_with("cmd.exe")
+        );
+        assert!(matches!(direct.line, ShellLine::List(args) if args == [String::new()]));
+        // PowerShell 7 hands any argument on.
+        if shell_program(CommandShell::Pwsh).is_ok() {
+            assert!(
+                invocation(
+                    CommandShell::Pwsh,
+                    "",
+                    Some(&argv("wsmp-no-such-program")),
+                    &env,
+                    false
+                )
+                .is_ok()
+            );
+        }
     }
 
     #[test]

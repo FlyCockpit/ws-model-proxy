@@ -1,5 +1,5 @@
 //! `wsmp __runtime-host --dir <dir> --unit <unit> --invocation <id> --shell <shell> --script
-//! <script>` — internal: the relay starts one per Windows runtime unit
+//! <script> [--argv-json <args>]` — internal: the relay starts one per Windows runtime unit
 //! ([`crate::runtimes::executor::windows`]).
 
 use std::path::PathBuf;
@@ -23,6 +23,10 @@ pub struct Args {
     /// The command, for the shell.
     #[arg(long, allow_hyphen_values = true)]
     script: String,
+    /// The arguments the script was rendered from (a JSON array), when it was an argv: an
+    /// `.exe` starts directly.
+    #[arg(long, allow_hyphen_values = true)]
+    argv_json: Option<String>,
 }
 
 pub fn run(args: &Args) -> Result<()> {
@@ -32,5 +36,6 @@ pub fn run(args: &Args) -> Result<()> {
         invocation: &args.invocation,
         shell: &args.shell,
         script: &args.script,
+        argv_json: args.argv_json.as_deref(),
     })
 }

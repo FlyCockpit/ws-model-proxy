@@ -517,8 +517,30 @@ fn an_argv_is_filled_per_argument_and_quoted_for_the_shell() {
     assert_eq!(rendered.shell, CommandShell::Pwsh);
     assert_eq!(
         rendered.command,
-        "$PSNativeCommandArgumentPassing = 'Standard'; & 'llama-server' '-m' 'it''s 30001' '--alias' 'a b'; exit $LASTEXITCODE"
+        "$PSNativeCommandArgumentPassing = 'Standard'; & 'llama-server' '-m' 'it''s 30001' '--alias' 'a b'"
     );
+    // The arguments are kept, for a program that starts directly.
+    assert_eq!(
+        rendered.argvs,
+        vec![
+            vec![
+                "llama-server".to_string(),
+                "-m".into(),
+                "it's 30001".into(),
+                "--alias".into(),
+                "a b".into()
+            ],
+            vec!["probe".to_string(), "30001".into()],
+        ]
+    );
+    assert_eq!(
+        rendered.argv_for(&rendered.command),
+        Some(&rendered.argvs[0][..])
+    );
+    // Not on Unix, where `sh` runs every command.
+    let rendered =
+        render(&job(&hash, 0, 1), TrustValue::Full, &store, &facts("eth0")).expect("rendered");
+    assert!(rendered.argvs.is_empty());
 }
 
 #[test]
@@ -526,16 +548,11 @@ fn powershell_words_double_every_quote_it_reads() {
     assert_eq!(powershell_word("a\u{2019}b'c"), "'a\u{2019}\u{2019}b''c'");
     assert_eq!(
         argv_script(CommandShell::Powershell, &["x".into(), r"C:\dir\".into()]).as_deref(),
-        Some(r"& 'x' 'C:\dir\'; exit $LASTEXITCODE")
+        Some(r"& 'x' 'C:\dir\'")
     );
-    // What Windows PowerShell 5.1 would hand on changed is refused.
-    for arg in ["", "say \"hi\"", r"C:\my dir\"] {
-        assert_eq!(
-            argv_script(CommandShell::Powershell, &["x".into(), arg.into()]),
-            None,
-            "{arg:?}"
-        );
-    }
+    // What Windows PowerShell 5.1 would change is rendered too: the node refuses it only when the
+    // program is not an `.exe` that starts directly.
+    assert!(argv_script(CommandShell::Powershell, &["x".into(), String::new()]).is_some());
     assert!(argv_script(CommandShell::Pwsh, &["x".into(), String::new()]).is_some());
     assert_eq!(argv_script(CommandShell::Cmd, &["x".into()]), None);
 }

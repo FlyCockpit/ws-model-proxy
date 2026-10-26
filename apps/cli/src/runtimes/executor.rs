@@ -64,6 +64,10 @@ pub struct Job {
     /// written before it existed ran `sh`.
     #[serde(default = "sh", skip_serializing_if = "is_sh")]
     pub shell: CommandShell,
+    /// The arguments of the argv commands above, on Windows: one whose program is an `.exe`
+    /// starts directly, not through `shell` ([`Job::argv_for`]). Empty where `sh` runs them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub argvs: Vec<Vec<String>>,
     /// Node secret names exported to every command (values never stored).
     pub secrets: Vec<String>,
     pub timeout_ms: u64,
@@ -92,6 +96,14 @@ pub struct Job {
 impl Job {
     fn key(&self) -> String {
         format!("{}:{}", self.instance_id, self.rank)
+    }
+
+    /// The arguments `script` (one of this job's commands) was rendered from, when it was an argv.
+    pub fn argv_for(&self, script: &str) -> Option<&[String]> {
+        self.argvs
+            .iter()
+            .find(|argv| super::render::argv_script(self.shell, argv).as_deref() == Some(script))
+            .map(Vec::as_slice)
     }
 
     pub fn parsed_spec(&self) -> Option<RuntimeSpec> {

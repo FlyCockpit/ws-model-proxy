@@ -506,6 +506,7 @@ impl Runtime for NativeRuntime {
                         slice: &super::rank_slice(job),
                         shell: job.shell,
                         script: &job.command,
+                        argv: job.argv_for(&job.command),
                         env: &env,
                     },
                 )?;
@@ -706,6 +707,7 @@ impl Runtime for NativeRuntime {
         super::windows::run_script(
             job.shell,
             command,
+            job.argv_for(command),
             deadline,
             self.cancel_flag(),
             &command_env(job)?,
@@ -723,6 +725,7 @@ impl Runtime for NativeRuntime {
             match super::windows::run_script(
                 job.shell,
                 command,
+                job.argv_for(command),
                 deadline,
                 self.cancel_flag(),
                 &command_env(job)?,
@@ -1159,6 +1162,7 @@ mod tests {
             stop_command: "true".into(),
             status_command: None,
             health_command: None,
+            argvs: Vec::new(),
             shell: crate::protocol::runtime_spec::CommandShell::Sh,
             secrets: Vec::new(),
             timeout_ms: 20_000,
@@ -1242,6 +1246,7 @@ mod tests {
             stop_command: String::new(),
             status_command: None,
             health_command: None,
+            argvs: Vec::new(),
             shell: crate::protocol::runtime_spec::CommandShell::Sh,
             secrets: Vec::new(),
             timeout_ms: 20_000,
@@ -1325,6 +1330,7 @@ mod tests {
             stop_command: stop.into(),
             status_command: Some("true".into()),
             health_command: Some("true".into()),
+            argvs: Vec::new(),
             shell: crate::protocol::runtime_spec::CommandShell::Sh,
             secrets: Vec::new(),
             timeout_ms: 20_000,

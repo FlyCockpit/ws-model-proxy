@@ -301,8 +301,9 @@ the relay does; it writes nothing and runs no definition command. Runtimes are d
 **Shells.** A runtime's text commands run in the shell its launch names (`launch.shell`: `sh`, the
 default, or `pwsh`, `powershell` or `cmd`). An argv command
 (`["llama-server", "-m", "{{model}}", "--port", "{{port}}"]`) runs on every node, which quotes it
-for its own shell (`cmd` cannot take one). The server places a launch only on nodes whose platform,
-management mode and shells can run it.
+for its own shell (`cmd` cannot take one). The server places a launch only on nodes whose
+management mode and shells can run it. It does not match the node's operating system: a launch
+whose `sh` commands only Linux can run (`systemctl`) may still be placed on macOS.
 
 **Windows runtimes.**
 - A launch (prepare, start, after-join) runs in a runtime host (`wsmp __runtime-host`) with a hidden
@@ -311,8 +312,12 @@ management mode and shells can run it.
 - A stop sends Ctrl+Break to the command, then ends the whole job after 10 seconds (at most half
   the step's time).
 - Status, stop and health commands run to completion in a job of their own.
+- An argv command whose program is an `.exe` on the command's `PATH` (or an absolute path to
+  one) starts directly, without a shell: it gets every argument exactly, and its exit status is the
+  command's. Any other program (a `.cmd` or `.bat` shim such as `npx`, a PowerShell command) runs
+  through the shell.
 - PowerShell commands exit with their last command's status, as `sh` does, so a status command
-  says stopped by exiting 3.
+  says stopped by exiting 3. A program that cannot be found fails the command (exit 1).
 - An interactive step (one that needs its person: a prompt to answer, a sign-in to finish) opens
   an operator terminal as on Linux. Enter runs the step's script in its shell on a pseudoconsole,
   inside a job that ends with the relay. There is no `sudo -k` around it: Windows caches no sudo
@@ -333,8 +338,9 @@ supported.
 - the read file tools: read, stat, list and search.
 
 Install PowerShell 7 (`pwsh`) for runtimes. Windows PowerShell 5.1 works, but it changes some
-arguments it passes to a program (an empty one, or one with a quote in it), so the node refuses an
-argv command with such an argument there.
+arguments it passes to a program (an empty one, or one with a quote in it). An argv whose program
+is an `.exe` does not go through it; one that would (a `.cmd` shim, say) fails with such an
+argument there.
 
 **File tools on Windows.**
 - **Paths** are written and shown in a POSIX view: `C:\Users\ada\notes.txt` is
