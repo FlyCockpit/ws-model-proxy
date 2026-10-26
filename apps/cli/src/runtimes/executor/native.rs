@@ -1,6 +1,7 @@
 //! The machine side of the executor: systemd user units on Linux (the node
-//! owns `wsmp-<handle>-r<rank>[-prepare|-after-join]`), shell commands with
-//! the definition's node secrets, HTTP readiness on the instance port.
+//! owns `wsmp-<handle>-r<rank>[-prepare|-after-join]`), runtime hosts on
+//! Windows ([`super::windows`]), shell commands with the definition's node
+//! secrets, HTTP readiness on the instance port.
 //!
 //! Secrets reach a unit through `systemd-run --setenv=NAME` (value taken from
 //! systemd-run's own environment), never on a command line.
@@ -124,7 +125,12 @@ pub fn mechanism_until(deadline: Deadline, cancel: Option<&AtomicBool>) -> &'sta
         let _ = (deadline, cancel);
         "macos"
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        let _ = (deadline, cancel);
+        "windows"
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = (deadline, cancel);
         "unsupported"
@@ -132,7 +138,8 @@ pub fn mechanism_until(deadline: Deadline, cancel: Option<&AtomicBool>) -> &'sta
 }
 
 /// Launching steps need a user manager that outlives logins (linger); the
-/// node on macOS only wraps services it can prove with `status`. On Linux every
+/// node on macOS only wraps services it can prove with `status`; Windows runs
+/// them in runtime hosts. On Linux every
 /// other step runs its commands in the rank's slice, so it needs a user manager
 /// that answers now.
 pub fn activation_supported(action: JobPhase, mechanism: &str) -> bool {
@@ -140,7 +147,7 @@ pub fn activation_supported(action: JobPhase, mechanism: &str) -> bool {
         action,
         JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin
     ) {
-        return matches!(mechanism, "systemd+linger" | "macos");
+        return matches!(mechanism, "systemd+linger" | "macos" | "windows");
     }
     !cfg!(target_os = "linux") || mechanism != "unsupported"
 }
@@ -148,8 +155,9 @@ pub fn activation_supported(action: JobPhase, mechanism: &str) -> bool {
 /// What a node without a reachable systemd user manager is told.
 pub const USER_MANAGER_NEEDED: &str = "runtimes need the systemd user manager: enable lingering (`loginctl enable-linger`) or run wsmp as the installed wsmp.service";
 
-/// How long a stop gives the rank's leftovers after SIGTERM before SIGKILL.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// How long a stop gives the rank's leftovers after SIGTERM (Ctrl+Break on Windows) before
+/// SIGKILL (ending the job).
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 const SLICE_STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// `wsmp-runtime:<owner>:<unit without phase suffix>`.
@@ -255,6 +263,7 @@ fn cgroup_populated(group: &str) -> Option<bool> {
 /// proof looks. The exit status is the script's (`systemd-run --scope` runs it in place). Like
 /// every runtime command it runs under the launch guard ([`crate::launch_guard`]), so it never
 /// outlives the daemon.
+#[cfg(unix)]
 fn run_in_rank_slice(
     job: &Job,
     script: String,
@@ -326,7 +335,12 @@ fn address_missing(error: &std::io::Error) -> bool {
     {
         error.raw_os_error() == Some(nix::libc::EAFNOSUPPORT)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // WSAEAFNOSUPPORT: no IPv6 here.
+        error.raw_os_error() == Some(10047)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         false
     }
@@ -336,12 +350,68 @@ impl NativeRuntime {
     fn cancel_flag(&self) -> Option<&AtomicBool> {
         self.cancel.as_deref()
     }
+
+    /// Waits until a unit just started has launched (its identity), failing early when it is
+    /// gone or handed its server off.
+    #[cfg(any(target_os = "linux", windows))]
+    fn await_launch(
+        &self,
+        job: &Job,
+        owner: &str,
+        unit: &str,
+        deadline: Deadline,
+    ) -> Result<String> {
+        // A unit that is gone after it started failed (`--collect`
+        // removes a failed one): fail now, not at the deadline.
+        let mut gone_since: Option<std::time::Instant> = None;
+        loop {
+            if let Some(identity) = self.launch_completed(job, owner, deadline)? {
+                return Ok(identity);
+            }
+            anyhow::ensure!(!self.cancelled(), "launch incomplete");
+            let current = self.identity(unit, owner, deadline)?;
+            // A `process` start whose command exited 0 (the unit stays active with
+            // no task) while its port answers handed its server off (`docker
+            // compose up -d`): nothing of it runs where wsmp can watch or stop it.
+            if current.is_some()
+                && job.action == JobPhase::Start
+                && job.management() == Management::Process
+                && self.exited_cleanly(unit, deadline)?
+                && !self.tasks_alive(unit, deadline)?
+                && self.port_answers(&job.host, job.port)
+            {
+                return Err(super::fail(
+                    crate::protocol::frames::JobError::ProcessDetached,
+                ))
+                .context("the start handed its server off out of wsmp's units");
+            }
+            if current.is_none() {
+                let since = *gone_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= Duration::from_secs(5) {
+                    return Err(super::fail(
+                        crate::protocol::frames::JobError::CommandFailed,
+                    ))
+                    .context("the command exited without success");
+                }
+            } else {
+                gone_since = None;
+            }
+            deadline.sleep(Duration::from_millis(200))?;
+        }
+    }
+}
+
+/// How long a unit's stop waits after Ctrl+Break before it ends the whole job (Windows).
+#[cfg(windows)]
+fn stop_grace(deadline: Deadline) -> Result<Duration> {
+    Ok(SLICE_STOP_GRACE.min(deadline.remaining()? / 2))
 }
 
 impl Runtime for NativeRuntime {
-    /// Only Linux runs a rank's commands in systemd units and a slice the node can watch.
+    /// Linux runs a rank's commands in systemd units and a slice the node can watch, Windows in
+    /// runtime hosts' jobs (and every other command in a job that ends with it).
     fn contains_ranks(&self) -> bool {
-        cfg!(target_os = "linux")
+        cfg!(any(target_os = "linux", windows))
     }
     fn cancelled(&self) -> bool {
         self.cancel
@@ -395,43 +465,7 @@ impl Runtime for NativeRuntime {
             ]);
             let outcome = (|| {
                 manager_until("systemd-run", &args, deadline, self.cancel_flag(), &env)?;
-                // A unit that is gone after it started failed (`--collect`
-                // removes a failed one): fail now, not at the deadline.
-                let mut gone_since: Option<std::time::Instant> = None;
-                loop {
-                    if let Some(identity) = self.launch_completed(job, owner, deadline)? {
-                        return Ok(identity);
-                    }
-                    anyhow::ensure!(!self.cancelled(), "launch incomplete");
-                    let current = self.identity(unit, owner, deadline)?;
-                    // A `process` start whose command exited 0 (the unit stays active with
-                    // no task) while its port answers handed its server off (`docker
-                    // compose up -d`): nothing of it runs where wsmp can watch or stop it.
-                    if current.is_some()
-                        && job.action == JobPhase::Start
-                        && job.management() == Management::Process
-                        && self.exited_cleanly(unit, deadline)?
-                        && !self.tasks_alive(unit, deadline)?
-                        && self.port_answers(&job.host, job.port)
-                    {
-                        return Err(super::fail(
-                            crate::protocol::frames::JobError::ProcessDetached,
-                        ))
-                        .context("the start handed its server off out of wsmp's units");
-                    }
-                    if current.is_none() {
-                        let since = *gone_since.get_or_insert_with(std::time::Instant::now);
-                        if since.elapsed() >= Duration::from_secs(5) {
-                            return Err(super::fail(
-                                crate::protocol::frames::JobError::CommandFailed,
-                            ))
-                            .context("the command exited without success");
-                        }
-                    } else {
-                        gone_since = None;
-                    }
-                    deadline.sleep(Duration::from_millis(200))?;
-                }
+                self.await_launch(job, owner, unit, deadline)
             })();
             if outcome.is_err() && self.cancelled() && deadline.remaining().is_ok() {
                 // Clean up within the original budget; a cancellation must not
@@ -458,7 +492,34 @@ impl Runtime for NativeRuntime {
             }
             outcome
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            let dir = super::windows::hosts_dir()?;
+            let outcome = (|| {
+                let exe = std::env::current_exe().context("finding the wsmp executable")?;
+                super::windows::start(
+                    &dir,
+                    &super::windows::HostLaunch {
+                        exe: &exe,
+                        owner,
+                        unit,
+                        slice: &super::rank_slice(job),
+                        shell: job.shell,
+                        script: &job.command,
+                        env: &env,
+                    },
+                )?;
+                self.await_launch(job, owner, unit, deadline)
+            })();
+            if outcome.is_err() && self.cancelled() && deadline.remaining().is_ok() {
+                // Clean up within the original budget, as on Linux.
+                if let Ok(Some(invocation)) = super::windows::identity(&dir, unit, owner) {
+                    let _ = super::windows::stop(&dir, unit, &invocation, Duration::ZERO, deadline);
+                }
+            }
+            outcome
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = (owner, unit, env);
             anyhow::ensure!(
@@ -520,7 +581,11 @@ impl Runtime for NativeRuntime {
                 .context("the unit has no invocation id")?;
             Ok(Some((*invocation).to_string()))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            super::windows::identity(&super::windows::hosts_dir()?, unit, owner)
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = (unit, owner);
             Ok(None)
@@ -534,7 +599,27 @@ impl Runtime for NativeRuntime {
         deadline: Deadline,
     ) -> Result<Option<String>> {
         deadline.remaining()?;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            let dir = super::windows::hosts_dir()?;
+            let unit = super::phase_unit(job);
+            let Some(identity) = super::windows::identity(&dir, &unit, owner)? else {
+                return Ok(None);
+            };
+            let launched = if matches!(job.action, JobPhase::Prepare | JobPhase::AfterJoin) {
+                super::windows::exited_cleanly(&dir, &unit)?
+            } else if job.management() == Management::Process {
+                super::windows::running(&dir, &unit)?
+            } else {
+                let status = job
+                    .status_command
+                    .as_deref()
+                    .context("a service needs a status command")?;
+                self.status_until(job, status, deadline)?
+            };
+            Ok(launched.then_some(identity))
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = owner;
             let status = job.status_command.as_deref().context("status required")?;
@@ -609,6 +694,7 @@ impl Runtime for NativeRuntime {
         deadline.remaining()?;
         anyhow::ensure!(!self.cancelled(), "session disconnected");
         // Output goes nowhere: no backend output reaches a pipe or a log.
+        #[cfg(unix)]
         run_in_rank_slice(
             job,
             format!("exec >/dev/null 2>&1; {command}"),
@@ -616,21 +702,48 @@ impl Runtime for NativeRuntime {
             0,
             self.cancel_flag(),
         )?;
+        #[cfg(windows)]
+        super::windows::run_script(
+            job.shell,
+            command,
+            deadline,
+            self.cancel_flag(),
+            &command_env(job)?,
+        )
+        .map_err(|_| anyhow::anyhow!("the command did not succeed"))?;
         Ok(())
     }
 
     fn status_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<bool> {
         deadline.remaining()?;
         anyhow::ensure!(!self.cancelled(), "session disconnected");
-        let script = format!(
-            "( {command}\n) >/dev/null 2>&1; rc=$?; if [ \"$rc\" -eq 0 ]; then printf alive; elif [ \"$rc\" -eq 3 ]; then printf stopped; else printf unknown; fi"
-        );
-        let output = run_in_rank_slice(job, script, deadline, 16, self.cancel_flag())
-            .map_err(|_| anyhow::anyhow!("status unconfirmed"))?;
-        match output.as_slice() {
-            b"alive" => Ok(true),
-            b"stopped" => Ok(false),
-            _ => anyhow::bail!("status unconfirmed"),
+        #[cfg(windows)]
+        {
+            // Exit 0 alive, 3 stopped, anything else unknown.
+            match super::windows::run_script(
+                job.shell,
+                command,
+                deadline,
+                self.cancel_flag(),
+                &command_env(job)?,
+            ) {
+                Ok(()) => Ok(true),
+                Err(crate::bounded_run::RunError::ExitStatus(Some(3))) => Ok(false),
+                Err(_) => anyhow::bail!("status unconfirmed"),
+            }
+        }
+        #[cfg(unix)]
+        {
+            let script = format!(
+                "( {command}\n) >/dev/null 2>&1; rc=$?; if [ \"$rc\" -eq 0 ]; then printf alive; elif [ \"$rc\" -eq 3 ]; then printf stopped; else printf unknown; fi"
+            );
+            let output = run_in_rank_slice(job, script, deadline, 16, self.cancel_flag())
+                .map_err(|_| anyhow::anyhow!("status unconfirmed"))?;
+            match output.as_slice() {
+                b"alive" => Ok(true),
+                b"stopped" => Ok(false),
+                _ => anyhow::bail!("status unconfirmed"),
+            }
         }
     }
 
@@ -653,7 +766,19 @@ impl Runtime for NativeRuntime {
                 "the unit is still alive"
             );
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            let dir = super::windows::hosts_dir()?;
+            if let Some(current) = super::windows::identity(&dir, unit, owner)? {
+                anyhow::ensure!(current == invocation, "the unit was relaunched");
+                super::windows::stop(&dir, unit, invocation, stop_grace(deadline)?, deadline)?;
+            }
+            anyhow::ensure!(
+                super::windows::identity(&dir, unit, owner)?.is_none(),
+                "the unit is still alive"
+            );
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = (unit, owner, invocation);
         }
@@ -679,7 +804,11 @@ impl Runtime for NativeRuntime {
             )?;
             Ok(unit_tasks_alive(&output, cgroup_populated))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            super::windows::tasks_alive(&super::windows::hosts_dir()?, unit)
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             // No units here: a service is proven by its status command.
             let _ = unit;
@@ -709,7 +838,11 @@ impl Runtime for NativeRuntime {
             )?;
             Ok(main_exited_cleanly(&output))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            super::windows::exited_cleanly(&super::windows::hosts_dir()?, unit)
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = unit;
             Ok(false)
@@ -773,7 +906,16 @@ impl Runtime for NativeRuntime {
             );
             Ok(())
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            super::windows::stop_slice(
+                &super::windows::hosts_dir()?,
+                slice,
+                stop_grace(deadline)?,
+                deadline,
+            )
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = (slice, deadline);
             Ok(())

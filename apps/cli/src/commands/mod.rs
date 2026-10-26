@@ -19,6 +19,8 @@ pub mod logout;
 pub mod recover;
 pub mod run;
 pub mod runtime;
+#[cfg(windows)]
+pub mod runtime_host;
 pub mod secret;
 pub mod service;
 pub mod status;

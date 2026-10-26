@@ -865,7 +865,6 @@ impl NodeRuntimes {
         self.retarget();
     }
 
-    #[cfg(unix)]
     fn set_instances(&mut self, instances: Vec<(Job, InstanceRecord)>) {
         self.instances = instances;
         self.retarget();
@@ -938,12 +937,10 @@ struct Session<'a> {
     defines: Defines,
     runtimes: NodeRuntimes,
     /// The daemon's runner (`NodeLink::runner`), shared by every connection.
-    #[cfg(unix)]
     runner: Option<&'a crate::runtimes::runner::Runner>,
     /// The daemon's inventory worker (`NodeLink::inventories`), shared by every connection.
     inventories: Arc<crate::runtimes::inventory::Inventories>,
     /// The newest instance observation applied.
-    #[cfg(unix)]
     observed_generation: u64,
     /// The metric commands hash the telemetry thread runs.
     metric_commands_applied: Option<String>,
@@ -971,7 +968,6 @@ struct NodeLink {
     /// connection still runs, and a stop under a later one cancels it
     /// (`admit_step`), and a stop's or status probe's answer says whether
     /// any step that may launch is still in flight there (`rank_idle`).
-    #[cfg(unix)]
     runner: Option<crate::runtimes::runner::Runner>,
     /// The one inventory worker, across reconnects (`runtimes::inventory::Inventories`): it
     /// sends snapshots in capture order, so an older one never reaches the server after a newer
@@ -1005,7 +1001,6 @@ impl NodeLink {
             worker_rx,
             execs,
             deferred,
-            #[cfg(unix)]
             runner: crate::runtimes::runner::Runner::start()
                 .inspect_err(|error| {
                     tracing::warn!(
@@ -1041,7 +1036,6 @@ impl NodeLink {
         // each connection had its own runner): the next connection observes
         // afresh. Drained so the runner's threads never block on a full
         // channel while offline.
-        #[cfg(unix)]
         if let Some(runner) = self.runner.as_ref() {
             while runner.try_update().is_some() {}
         }
@@ -1130,10 +1124,8 @@ fn run_relay_session(
         telemetry: None,
         defines: Defines::default(),
         runtimes: NodeRuntimes::load(startup.trust_value(), &startup.runtime_hosts()),
-        #[cfg(unix)]
         runner: link.runner.as_ref().inspect(|runner| runner.observe()),
         inventories: Arc::clone(&link.inventories),
-        #[cfg(unix)]
         observed_generation: 0,
         metric_commands_applied: None,
     };
@@ -1960,7 +1952,6 @@ where
             .store
             .find(&job.launch_version_id, &job.launch_hash)
             .is_some();
-        #[cfg(unix)]
         let recorded =
             crate::runtimes::runner::recorded_job(&job.instance_id, job.rank).filter(|known| {
                 known.version_id == job.launch_version_id
@@ -1969,8 +1960,6 @@ where
                     && known.handle == job.handle
                     && known.runtime_id == job.runtime_id
             });
-        #[cfg(not(unix))]
-        let recorded: Option<Job> = None;
         // A stop, and a status probe proving one, also work after the server dropped it.
         if !held && job.phase != JobPhase::Stop && job.phase != JobPhase::Status {
             Err(refused_with(missing, "launchVersionId"))
@@ -2007,10 +1996,23 @@ where
             .close_confirming_for_rank(&job.instance_id, job.rank);
         send_outbound_frames(socket, closed)?;
     }
-    #[cfg(unix)]
     {
-        let ticket = match &job.operator {
+        let ticket: Option<crate::runtimes::runner::OperatorTicket> = match &job.operator {
             None => None,
+            // An operator step runs its command in a terminal under `sudo` bookkeeping that
+            // Windows does not have yet.
+            #[cfg(windows)]
+            Some(_) => {
+                return send_control(
+                    socket,
+                    &refusal(
+                        JobError::InteractiveUnsupported,
+                        Some("interactive steps do not run on Windows yet".into()),
+                    ),
+                    "refusing an operator step",
+                );
+            }
+            #[cfg(unix)]
             Some(operator) => {
                 // Taken now, before the runner thread exists: a re-delivery
                 // or a newer dispatch of the step sees it (see `reserve_operator`).
@@ -2031,11 +2033,18 @@ where
             }
         };
         let submitted = match (session.runner.as_ref(), ticket) {
+            #[cfg(unix)]
             (Some(runner), Some(ticket)) => runner.submit_operator(rendered, ticket),
+            // Refused above: Windows admits no operator step.
+            #[cfg(windows)]
+            (Some(_), Some(_)) => Err(anyhow::anyhow!(
+                "interactive steps do not run on Windows yet"
+            )),
             (Some(runner), None) => runner.submit(rendered),
             (None, _) => Err(anyhow::anyhow!("runtime steps are unavailable")),
         };
         if let Err(error) = submitted {
+            #[cfg(unix)]
             if let Some(terminal_id) = &terminal_id {
                 session.terminals.release_operator(terminal_id);
             }
@@ -2047,15 +2056,6 @@ where
             );
         }
         Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = rendered;
-        send_control(
-            socket,
-            &refusal(JobError::ExecutionMechanismUnavailable, None),
-            "refusing a runtime job",
-        )
     }
 }
 
@@ -2143,12 +2143,12 @@ fn drain_runner<S>(
 where
     S: std::io::Read + std::io::Write,
 {
-    #[cfg(unix)]
     while let Some(update) = session
         .runner
         .as_ref()
         .and_then(|runner| runner.try_update())
     {
+        #[cfg(unix)]
         if let Some(request) = update.operator {
             use crate::runtimes::runner::OperatorRequest;
             let frames = match request {
@@ -2167,6 +2167,7 @@ where
             session.runtimes.set_instances(update.instances);
         }
         // An operator step's runner thread is done with its terminal id.
+        #[cfg(unix)]
         if let Some(NodeFrame::RuntimeJobResult {
             terminal_id: Some(terminal_id),
             ..
@@ -2182,8 +2183,6 @@ where
         }
         send_inventory(session);
     }
-    #[cfg(not(unix))]
-    let _ = (socket, session);
     Ok(())
 }
 

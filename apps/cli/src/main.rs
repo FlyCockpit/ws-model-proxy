@@ -86,6 +86,8 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Command::LaunchGuard(args) => commands::launch_guard::run(args),
         #[cfg(windows)]
         Command::ConptyHost(args) => commands::conpty_host::run(args),
+        #[cfg(windows)]
+        Command::RuntimeHost(args) => commands::runtime_host::run(args),
         Command::LaunchGuardExec(args) => commands::launch_guard::exec(args),
     }
 }

@@ -206,15 +206,16 @@ impl TerminalStartup {
         }
     }
 
-    /// What runtime launches can run here. Linux runs processes in systemd units and wraps
-    /// services; macOS only wraps services (their status commands prove them). Unix text
-    /// commands run in `sh`; Windows in the shells it found (never a WSL distribution).
+    /// What runtime launches can run here. Linux runs processes in systemd units and Windows in
+    /// runtime hosts, and both wrap services; macOS only wraps services (their status commands
+    /// prove them). Unix text commands run in `sh`; Windows in the shells it found (never a WSL
+    /// distribution).
     fn launch_features(&self) -> Option<LaunchFeatures> {
         let platform = NodePlatform::current()?;
         let management = match platform {
             NodePlatform::Linux => vec![Management::Process, Management::Service],
             NodePlatform::Macos => vec![Management::Service],
-            NodePlatform::Windows => Vec::new(),
+            NodePlatform::Windows => vec![Management::Process, Management::Service],
         };
         let shells = if cfg!(windows) {
             self.shells

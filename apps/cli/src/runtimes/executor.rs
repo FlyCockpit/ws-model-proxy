@@ -425,7 +425,8 @@ fn unix_now() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
-/// What the executor needs from the machine. `NativeRuntime` is systemd.
+/// What the executor needs from the machine. `NativeRuntime` is systemd (Linux) or runtime
+/// hosts (Windows).
 pub trait Runtime {
     fn cancelled(&self) -> bool {
         false
@@ -1730,11 +1731,12 @@ pub fn command_env(job: &Job) -> Result<Vec<(String, String)>> {
     Ok(found)
 }
 
-#[cfg(unix)]
 pub use native::NativeRuntime;
 
-#[cfg(unix)]
 pub(crate) mod native;
+
+#[cfg(windows)]
+pub mod windows;
 
 #[cfg(test)]
 mod tests;

@@ -248,7 +248,7 @@ pub fn run_command(
             }
             RunError::Timeout => MetricCommandError::Timeout,
             RunError::OutputTooLarge => MetricCommandError::OutputTooLarge,
-            RunError::ExitStatus => MetricCommandError::ExitStatus,
+            RunError::ExitStatus(_) => MetricCommandError::ExitStatus,
         },
     )
 }

@@ -9,5 +9,4 @@ pub mod inventory;
 pub mod local;
 pub mod operator;
 pub mod render;
-#[cfg(unix)]
 pub mod runner;

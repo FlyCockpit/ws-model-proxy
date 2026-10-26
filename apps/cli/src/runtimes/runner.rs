@@ -607,6 +607,48 @@ fn lock_with(
         .map_err(|(_, error)| anyhow::anyhow!("locking instance state: {error}"))
 }
 
+/// Windows has no `flock`: the lock file opened unshared is the lock (released when the handle
+/// closes, the process's end included), retried until it is free.
+#[cfg(windows)]
+fn file_lock(dir: &Path, key: &str) -> Result<std::fs::File> {
+    loop {
+        match lock_now(dir, key)? {
+            Some(file) => return Ok(file),
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+/// The lock when it is free right now; never waits.
+#[cfg(windows)]
+fn file_lock_now(dir: &Path, key: &str) -> Result<std::fs::File> {
+    lock_now(dir, key)?.context("instance state is locked")
+}
+
+/// `None` while someone else holds it.
+#[cfg(windows)]
+fn lock_now(dir: &Path, key: &str) -> Result<Option<std::fs::File>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::create_dir_all(dir).context("creating the instance state directory")?;
+    anyhow::ensure!(
+        std::fs::symlink_metadata(dir)?.is_dir(),
+        "unsafe instance state directory"
+    );
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(dir.join(format!("{key}.lock")))
+    {
+        Ok(file) => Ok(Some(file)),
+        // ERROR_SHARING_VIOLATION
+        Err(error) if error.raw_os_error() == Some(32) => Ok(None),
+        Err(error) => Err(error).context("opening the instance lock"),
+    }
+}
+
 /// The instance record files, in name order.
 fn instance_paths(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
