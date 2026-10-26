@@ -739,9 +739,11 @@ fn engine_reads_poll_on_the_socket_they_go_through() {
     let tungstenite::stream::MaybeTlsStream::Plain(tcp) = socket.get_ref() else {
         panic!("a plain loopback connection");
     };
-    assert_eq!(
-        tcp.read_timeout().expect("read timeout"),
-        Some(crate::stt::vllm::READ_POLL)
+    // Linux keeps the timeout in clock ticks, so it reads back rounded to one.
+    let timeout = tcp.read_timeout().expect("read timeout").expect("a timeout");
+    assert!(
+        timeout.abs_diff(crate::stt::vllm::READ_POLL) < Duration::from_millis(15),
+        "{timeout:?}"
     );
     // `session.created`, then a read with nothing pending returns promptly.
     assert!(matches!(socket.read(), Ok(Message::Text(_))));
