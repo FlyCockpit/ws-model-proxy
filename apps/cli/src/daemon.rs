@@ -2055,11 +2055,7 @@ fn operator_ticket(
     operator: &crate::protocol::frames::JobOperator,
     rendered: &Job,
 ) -> crate::runtimes::runner::OperatorTicket {
-    let command = if rendered.action == JobPhase::Stop {
-        rendered.stop_command.clone()
-    } else {
-        rendered.command.clone()
-    };
+    let command = rendered.operator_cmd().script.to_string();
     crate::runtimes::runner::OperatorTicket {
         ids: operator_ids(job, &operator.terminal_id),
         screen: crate::runtimes::operator::OperatorScreen {
@@ -5979,7 +5975,10 @@ mod tests {
             stop_command: "sudo systemctl stop x".into(),
             status_command: Some("systemctl is-active x".into()),
             health_command: None,
-            argvs: Vec::new(),
+            command_argv: None,
+            stop_argv: None,
+            status_argv: None,
+            health_argv: None,
             shell: crate::protocol::runtime_spec::CommandShell::Sh,
             secrets: Vec::new(),
             timeout_ms: 60_000,

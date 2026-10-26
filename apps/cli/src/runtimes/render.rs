@@ -251,59 +251,57 @@ pub fn render(
         substitute(text, &values)
             .map_err(|name| refuse(JobError::BadJob, format!("placeholders.{name}")))
     };
-    // The argv commands' arguments, kept where a program may start without the shell (Windows).
-    let argvs = std::cell::RefCell::new(Vec::new());
-    // Sizes are checked before quoting: an argv is as long as its arguments joined with spaces.
-    let render_one = |command: &CommandLine, field: &str| -> Result<String, Refusal> {
-        let refused = || refuse(JobError::BadJob, field.to_string());
-        match command {
-            CommandLine::Text(text) => {
-                let rendered = fill(text)?;
-                if rendered.len() > RUNTIME_COMMAND_MAX_BYTES {
-                    return Err(refused());
+    // A command's script, and an argv's arguments where a program may start without the shell
+    // (Windows). Sizes are checked before quoting: an argv is as long as its arguments joined with
+    // spaces.
+    let render_one =
+        |command: &CommandLine, field: &str| -> Result<(String, Option<Vec<String>>), Refusal> {
+            let refused = || refuse(JobError::BadJob, field.to_string());
+            match command {
+                CommandLine::Text(text) => {
+                    let rendered = fill(text)?;
+                    if rendered.len() > RUNTIME_COMMAND_MAX_BYTES {
+                        return Err(refused());
+                    }
+                    Ok((rendered, None))
                 }
-                Ok(rendered)
+                CommandLine::Argv(argv) => {
+                    let rendered = argv
+                        .iter()
+                        .map(|arg| fill(arg))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let joined = rendered.iter().map(String::len).sum::<usize>()
+                        + rendered.len().saturating_sub(1);
+                    if joined > RUNTIME_COMMAND_MAX_BYTES {
+                        return Err(refused());
+                    }
+                    let script = argv_script(shell, &rendered).ok_or_else(refused)?;
+                    Ok((script, (shell != CommandShell::Sh).then_some(rendered)))
+                }
             }
-            CommandLine::Argv(argv) => {
-                let rendered = argv
-                    .iter()
-                    .map(|arg| fill(arg))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let joined = rendered.iter().map(String::len).sum::<usize>()
-                    + rendered.len().saturating_sub(1);
-                if joined > RUNTIME_COMMAND_MAX_BYTES {
-                    return Err(refused());
-                }
-                let script = argv_script(shell, &rendered).ok_or_else(refused)?;
-                if shell != CommandShell::Sh {
-                    argvs.borrow_mut().push(rendered);
-                }
-                Ok(script)
-            }
-        }
-    };
-    let command = match phase_command(commands, job.phase) {
+        };
+    let (command, command_argv) = match phase_command(commands, job.phase) {
         Some(command) => render_one(command, "command")?,
-        None => String::new(),
+        None => (String::new(), None),
     };
     // No stop command (a `process` runtime may leave it out): the stop is the
     // slice kill and the proof alone.
-    let stop_command = commands
+    let (stop_command, stop_argv) = commands
         .stop
         .as_ref()
         .map(|command| render_one(command, "stop"))
         .transpose()?
         .unwrap_or_default();
-    let status_command = commands
-        .status
-        .as_ref()
-        .map(|command| render_one(command, "status"))
-        .transpose()?;
-    let health_command = commands
-        .health
-        .as_ref()
-        .map(|command| render_one(command, "health"))
-        .transpose()?;
+    let optional = |command: Option<&CommandLine>, field: &str| {
+        Ok::<_, Refusal>(
+            command
+                .map(|command| render_one(command, field))
+                .transpose()?
+                .map_or((None, None), |(script, argv)| (Some(script), argv)),
+        )
+    };
+    let (status_command, status_argv) = optional(commands.status.as_ref(), "status")?;
+    let (health_command, health_argv) = optional(commands.health.as_ref(), "health")?;
     // Where the engine listens: its fabric address when the start command
     // binds `{{fabric_ip}}`, else loopback.
     let host = if commands
@@ -333,7 +331,10 @@ pub fn render(
         status_command,
         health_command,
         shell,
-        argvs: argvs.into_inner(),
+        command_argv,
+        stop_argv,
+        status_argv,
+        health_argv,
         secrets: launch.secrets.clone().unwrap_or_default(),
         timeout_ms: capped_timeout(job.phase, job.timeout_ms),
         unit_name: job.unit_name.clone(),

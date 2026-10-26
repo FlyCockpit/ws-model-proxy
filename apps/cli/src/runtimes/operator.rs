@@ -375,8 +375,7 @@ pub fn run_operator<R: Runtime>(
     }
     let probe = Deadline::new(STATUS_FIRST_LIMIT.min(budget));
     let status = job
-        .status_command
-        .as_deref()
+        .status_cmd()
         .map(|status| checking.status_until(&job, status, probe));
     match (job.action, status) {
         (JobPhase::Start | JobPhase::AfterJoin, Some(Ok(true))) => {

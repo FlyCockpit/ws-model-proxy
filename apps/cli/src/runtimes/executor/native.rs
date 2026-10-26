@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use super::{Deadline, HealthMiss, Job, Runtime, command_env};
+use super::{Deadline, HealthMiss, Job, JobCommand, Runtime, command_env};
 use crate::protocol::frames::JobPhase;
 use crate::protocol::runtime_spec::Management;
 
@@ -506,7 +506,7 @@ impl Runtime for NativeRuntime {
                         slice: &super::rank_slice(job),
                         shell: job.shell,
                         script: &job.command,
-                        argv: job.argv_for(&job.command),
+                        argv: job.command_argv.as_deref(),
                         env: &env,
                     },
                 )?;
@@ -531,7 +531,7 @@ impl Runtime for NativeRuntime {
                 job.management() == Management::Service,
                 "this platform runs services only"
             );
-            self.shell_until(job, &job.command, deadline)?;
+            self.shell_until(job, job.step_cmd(), deadline)?;
             Ok("self-detached".into())
         }
     }
@@ -613,8 +613,7 @@ impl Runtime for NativeRuntime {
                 super::windows::running(&dir, &unit)?
             } else {
                 let status = job
-                    .status_command
-                    .as_deref()
+                    .status_cmd()
                     .context("a service needs a status command")?;
                 self.status_until(job, status, deadline)?
             };
@@ -623,7 +622,7 @@ impl Runtime for NativeRuntime {
         #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = owner;
-            let status = job.status_command.as_deref().context("status required")?;
+            let status = job.status_cmd().context("status required")?;
             Ok(self
                 .status_until(job, status, deadline)?
                 .then(|| "self-detached".into()))
@@ -680,8 +679,7 @@ impl Runtime for NativeRuntime {
                 }
             } else {
                 let status = job
-                    .status_command
-                    .as_deref()
+                    .status_cmd()
                     .context("a service needs a status command")?;
                 if !self.status_until(job, status, deadline)? {
                     return Ok(None);
@@ -691,14 +689,14 @@ impl Runtime for NativeRuntime {
         }
     }
 
-    fn shell_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<()> {
+    fn shell_until(&self, job: &Job, command: JobCommand<'_>, deadline: Deadline) -> Result<()> {
         deadline.remaining()?;
         anyhow::ensure!(!self.cancelled(), "session disconnected");
         // Output goes nowhere: no backend output reaches a pipe or a log.
         #[cfg(unix)]
         run_in_rank_slice(
             job,
-            format!("exec >/dev/null 2>&1; {command}"),
+            format!("exec >/dev/null 2>&1; {}", command.script),
             deadline,
             0,
             self.cancel_flag(),
@@ -706,8 +704,8 @@ impl Runtime for NativeRuntime {
         #[cfg(windows)]
         super::windows::run_script(
             job.shell,
-            command,
-            job.argv_for(command),
+            command.script,
+            command.argv,
             deadline,
             self.cancel_flag(),
             &command_env(job)?,
@@ -716,7 +714,7 @@ impl Runtime for NativeRuntime {
         Ok(())
     }
 
-    fn status_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<bool> {
+    fn status_until(&self, job: &Job, command: JobCommand<'_>, deadline: Deadline) -> Result<bool> {
         deadline.remaining()?;
         anyhow::ensure!(!self.cancelled(), "session disconnected");
         #[cfg(windows)]
@@ -724,8 +722,8 @@ impl Runtime for NativeRuntime {
             // Exit 0 alive, 3 stopped, anything else unknown.
             match super::windows::run_script(
                 job.shell,
-                command,
-                job.argv_for(command),
+                command.script,
+                command.argv,
                 deadline,
                 self.cancel_flag(),
                 &command_env(job)?,
@@ -738,7 +736,8 @@ impl Runtime for NativeRuntime {
         #[cfg(unix)]
         {
             let script = format!(
-                "( {command}\n) >/dev/null 2>&1; rc=$?; if [ \"$rc\" -eq 0 ]; then printf alive; elif [ \"$rc\" -eq 3 ]; then printf stopped; else printf unknown; fi"
+                "( {}\n) >/dev/null 2>&1; rc=$?; if [ \"$rc\" -eq 0 ]; then printf alive; elif [ \"$rc\" -eq 3 ]; then printf stopped; else printf unknown; fi",
+                command.script
             );
             let output = run_in_rank_slice(job, script, deadline, 16, self.cancel_flag())
                 .map_err(|_| anyhow::anyhow!("status unconfirmed"))?;
@@ -1162,7 +1161,10 @@ mod tests {
             stop_command: "true".into(),
             status_command: None,
             health_command: None,
-            argvs: Vec::new(),
+            command_argv: None,
+            stop_argv: None,
+            status_argv: None,
+            health_argv: None,
             shell: crate::protocol::runtime_spec::CommandShell::Sh,
             secrets: Vec::new(),
             timeout_ms: 20_000,
@@ -1246,7 +1248,10 @@ mod tests {
             stop_command: String::new(),
             status_command: None,
             health_command: None,
-            argvs: Vec::new(),
+            command_argv: None,
+            stop_argv: None,
+            status_argv: None,
+            health_argv: None,
             shell: crate::protocol::runtime_spec::CommandShell::Sh,
             secrets: Vec::new(),
             timeout_ms: 20_000,
@@ -1330,7 +1335,10 @@ mod tests {
             stop_command: stop.into(),
             status_command: Some("true".into()),
             health_command: Some("true".into()),
-            argvs: Vec::new(),
+            command_argv: None,
+            stop_argv: None,
+            status_argv: None,
+            health_argv: None,
             shell: crate::protocol::runtime_spec::CommandShell::Sh,
             secrets: Vec::new(),
             timeout_ms: 20_000,

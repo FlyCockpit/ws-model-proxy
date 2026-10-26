@@ -19,7 +19,10 @@ fn job(action: JobPhase) -> Job {
         stop_command: "true".into(),
         status_command: None,
         health_command: None,
-        argvs: Vec::new(),
+        command_argv: None,
+        stop_argv: None,
+        status_argv: None,
+        health_argv: None,
         shell: crate::protocol::runtime_spec::CommandShell::Sh,
         secrets: Vec::new(),
         timeout_ms: 1_000,
@@ -120,10 +123,10 @@ impl Runtime for Fake {
     fn identity(&self, unit: &str, _: &str, _: Deadline) -> Result<Option<String>> {
         Ok(self.units.borrow().get(unit).cloned())
     }
-    fn shell_until(&self, _: &Job, _: &str, _: Deadline) -> Result<()> {
+    fn shell_until(&self, _: &Job, _: JobCommand<'_>, _: Deadline) -> Result<()> {
         Ok(())
     }
-    fn status_until(&self, _: &Job, _: &str, _: Deadline) -> Result<bool> {
+    fn status_until(&self, _: &Job, _: JobCommand<'_>, _: Deadline) -> Result<bool> {
         self.status_alive.get().context("unknown")
     }
     fn stop(&self, unit: &str, _: &str, invocation: &str, _: Deadline) -> Result<()> {
@@ -446,10 +449,10 @@ impl Runtime for Stalling {
     fn identity(&self, unit: &str, owner: &str, deadline: Deadline) -> Result<Option<String>> {
         self.inner.identity(unit, owner, deadline)
     }
-    fn shell_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<()> {
+    fn shell_until(&self, job: &Job, command: JobCommand<'_>, deadline: Deadline) -> Result<()> {
         self.inner.shell_until(job, command, deadline)
     }
-    fn status_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<bool> {
+    fn status_until(&self, job: &Job, command: JobCommand<'_>, deadline: Deadline) -> Result<bool> {
         self.inner.status_until(job, command, deadline)
     }
     fn stop(&self, unit: &str, owner: &str, invocation: &str, deadline: Deadline) -> Result<()> {
@@ -756,10 +759,10 @@ impl Runtime for Flaky {
         anyhow::ensure!(!self.erroring.get(), "manager timed out");
         self.inner.identity(unit, owner, deadline)
     }
-    fn shell_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<()> {
+    fn shell_until(&self, job: &Job, command: JobCommand<'_>, deadline: Deadline) -> Result<()> {
         self.inner.shell_until(job, command, deadline)
     }
-    fn status_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<bool> {
+    fn status_until(&self, job: &Job, command: JobCommand<'_>, deadline: Deadline) -> Result<bool> {
         self.inner.status_until(job, command, deadline)
     }
     fn stop(&self, unit: &str, owner: &str, invocation: &str, deadline: Deadline) -> Result<()> {

@@ -519,28 +519,44 @@ fn an_argv_is_filled_per_argument_and_quoted_for_the_shell() {
         rendered.command,
         "$PSNativeCommandArgumentPassing = 'Standard'; & 'llama-server' '-m' 'it''s 30001' '--alias' 'a b'"
     );
-    // The arguments are kept, for a program that starts directly.
+    // Each command keeps its own arguments beside its script, for a program that starts directly.
+    let start: Vec<String> = ["llama-server", "-m", "it's 30001", "--alias", "a b"]
+        .map(String::from)
+        .to_vec();
+    assert_eq!(rendered.command_argv.as_ref(), Some(&start));
     assert_eq!(
-        rendered.argvs,
-        vec![
-            vec![
-                "llama-server".to_string(),
-                "-m".into(),
-                "it's 30001".into(),
-                "--alias".into(),
-                "a b".into()
-            ],
-            vec!["probe".to_string(), "30001".into()],
-        ]
+        rendered.status_cmd().and_then(|status| status.argv),
+        Some(&["probe".to_string(), "30001".to_string()][..])
     );
-    assert_eq!(
-        rendered.argv_for(&rendered.command),
-        Some(&rendered.argvs[0][..])
-    );
+    assert_eq!(rendered.stop_argv, None);
+    assert_eq!(rendered.health_argv, None);
     // Not on Unix, where `sh` runs every command.
     let rendered =
         render(&job(&hash, 0, 1), TrustValue::Full, &store, &facts("eth0")).expect("rendered");
-    assert!(rendered.argvs.is_empty());
+    assert_eq!(rendered.command_argv, None);
+    assert_eq!(rendered.status_argv, None);
+}
+
+#[test]
+fn each_command_keeps_its_own_argv() {
+    // A text start in the launch's shell, with an argv stop beside it.
+    let mut pwsh = spec("Start-Service ollama", 1);
+    pwsh["launch"]["shell"] = json!("pwsh");
+    pwsh["launch"]["commands"][0]["stop"] = json!(["sc.exe", "stop", "{{port}}"]);
+    let (store, hash) = store_with(pwsh);
+    let windows = shells_facts(&[CommandShell::Pwsh]);
+    let rendered = render(&job(&hash, 0, 1), TrustValue::Full, &store, &windows).expect("rendered");
+    assert_eq!(rendered.step_cmd().argv, None);
+    assert_eq!(rendered.step_cmd().script, "Start-Service ollama");
+    let stop = rendered.stop_cmd();
+    assert_eq!(
+        stop.argv,
+        Some(&["sc.exe".to_string(), "stop".into(), "30001".into()][..])
+    );
+    assert_eq!(
+        stop.script,
+        "$PSNativeCommandArgumentPassing = 'Standard'; & 'sc.exe' 'stop' '30001'"
+    );
 }
 
 #[test]
