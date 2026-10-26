@@ -9,7 +9,9 @@
 //!
 //! A pid names a process only while it lives: once it is gone, the kernel can hand the same pid
 //! to an unrelated process. So every listed process carries its start time too ([`Process`]),
-//! and a signal goes to a pid only while that start time still matches.
+//! and signals check that start time when it was captured. An unreadable start time still
+//! falls back to the pid alone, and `lstart` has only second precision; these remaining
+//! identity gaps are tracked in issue #244, along with the check-to-signal race.
 
 use std::time::Duration;
 
@@ -23,7 +25,7 @@ const SESSION_KILL_ROUNDS: usize = 20;
 
 /// When a process started. On Linux, the clock ticks since boot (field 22 of
 /// `/proc/<pid>/stat`). Elsewhere, a digest of `ps`'s `lstart`, which has whole seconds only.
-/// With its pid it names one process lifetime: a reused pid starts later.
+/// With its pid it distinguishes process lifetimes to the clock's precision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Started(u64);
 
@@ -218,12 +220,23 @@ struct PsSlot;
 impl PsSlot {
     fn take() -> std::io::Result<Self> {
         use std::sync::atomic::Ordering;
-        PS_OUTSTANDING
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                (held < PS_MAX_OUTSTANDING).then_some(held + 1)
-            })
-            .map(|_| Self)
-            .map_err(|_| std::io::Error::other("too many `ps` still running"))
+        // `fetch_update` is deprecated on current Rust; its replacement requires a newer
+        // compiler than our MSRV. Keep the bounded increment on Rust 1.88 with a CAS loop.
+        let mut held = PS_OUTSTANDING.load(Ordering::Acquire);
+        loop {
+            if held >= PS_MAX_OUTSTANDING {
+                return Err(std::io::Error::other("too many `ps` still running"));
+            }
+            match PS_OUTSTANDING.compare_exchange_weak(
+                held,
+                held + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(Self),
+                Err(current) => held = current,
+            }
+        }
     }
 }
 

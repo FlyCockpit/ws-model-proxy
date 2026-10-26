@@ -32,7 +32,8 @@
 //!   retrying, a session someone else's kill of the guard left behind) is [`lingering`] until it
 //!   has: meanwhile no rank of this node is proven idle (`runner`), since what the guard has not
 //!   ended yet may still launch. A process is named by its pid and its start time
-//!   (`process_list::Process`), so a pid reused while cleanup waits is never taken for it.
+//!   (`process_list::Process`) when that time can be read. Unknown or coarse start times can
+//!   still alias a reused pid; issue #244 tracks these remaining identity gaps.
 //!
 //! What a command moves out with `setsid` is not the guard's. On Linux the rank's slice still
 //! holds it for the stop proof; on macOS only the service's status command proves anything.
@@ -108,8 +109,8 @@ pub(crate) fn end_killed_session(guard: crate::process_list::Process) {
 
 /// SIGTERM to launch guards that may have been reaped already: each ends its session itself,
 /// holding its lock until it has. One that has not blocked the signal yet has started nothing,
-/// and the signal ends it. Nothing is sent to a pid that names another process now, and one
-/// listing checks them all (on macOS, one `ps`, not one per guard).
+/// and the signal ends it. A captured start time must still match; an unknown one falls back to
+/// the pid alone. One listing checks them all (on macOS, one `ps`, not one per guard).
 #[cfg(unix)]
 pub(crate) fn terminate_all(guards: &[crate::process_list::Process]) {
     crate::process_list::signal_current(guards, nix::sys::signal::Signal::SIGTERM);
