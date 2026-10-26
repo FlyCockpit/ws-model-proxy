@@ -153,7 +153,7 @@ pub(crate) fn live() -> std::io::Result<Vec<Process>> {
 }
 
 /// `lstart` as `ps` prints it (`Mon Oct 26 10:00:00 2026`), digested. `ps` runs with a cleared
-/// environment, so every call prints it in the same time zone and locale.
+/// environment and `TZ=UTC0`, so every call prints it in the same time zone and locale.
 #[cfg(not(target_os = "linux"))]
 fn lstart<'a>(fields: impl Iterator<Item = &'a str>) -> Option<Started> {
     use std::hash::{DefaultHasher, Hash, Hasher};
@@ -171,6 +171,9 @@ fn ps(args: &[&str]) -> std::io::Result<std::process::Output> {
     std::process::Command::new("/bin/ps")
         .args(args)
         .env_clear()
+        // Without `TZ`, `ps` prints local time in the system time zone, which can change while
+        // a process runs (and with it the digest of its `lstart`).
+        .env("TZ", "UTC0")
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
@@ -226,44 +229,56 @@ pub(crate) fn session_members(sid: Pid) -> std::io::Result<Vec<Process>> {
 /// else's session, and ours has ended (the kernel does not hand out a pid that is still some
 /// session's id while members remain).
 ///
-/// The leader goes last, once a scan found no other member. When no round proved that, the
-/// leader gets SIGTERM and SIGHUP instead (a shell exits on the hangup), and this returns
-/// `false`: the caller must not kill the leader or its group by force either. `true` otherwise
-/// (also when `leader` leads no session).
+/// The leader goes last, once a scan found no other member. When no round proved that (or the
+/// leader could not be killed), the leader gets SIGTERM and SIGHUP instead (a shell exits on the hangup), and this returns
+/// [`SessionKill::Unproven`]. See [`SessionKill`] for what each outcome lets the caller do.
 ///
 /// Only processes whose `getsid` matches are signalled, each only while its start time still
 /// matches, and never session 1 or the CLI's own session. A process that calls `setsid()`
 /// itself starts a new session and escapes this kill; that is a documented limit.
-pub(crate) fn kill_session(leader: Process) -> bool {
+pub(crate) fn kill_session(leader: Process) -> SessionKill {
     let sid = leader.pid;
     if !signallable(sid) {
-        return true;
+        return SessionKill::Reused;
     }
     // Either the leader is our unreaped child, or it was reaped and its session id stays
     // reserved while members remain. A zombie or reaped leader can fail `getsid`; its session
     // members are still confirmed one by one below.
     if leader.is_current() && nix::unistd::getsid(Some(sid)).is_ok_and(|actual| actual != sid) {
-        return true;
+        return SessionKill::Ended;
     }
     if nix::unistd::getsid(None).is_ok_and(|own| own == sid) {
-        return true;
+        return SessionKill::Reused;
     }
     let own_pid = nix::unistd::getpid();
     for round in 0..SESSION_KILL_ROUNDS {
         if let Ok(members) = session_members(sid) {
-            let listed = members.iter().find(|member| member.pid == sid).copied();
-            if listed.is_some_and(|now| reused(leader, now)) {
-                return true;
+            // Read by pid, not from the scan: a later leader that is a zombie now is not listed,
+            // and the members of its session are not ours either.
+            if pid_reused(leader) {
+                return SessionKill::Reused;
             }
+            let listed = members.iter().any(|member| member.pid == sid);
             let others = members
                 .into_iter()
                 .filter(|member| member.pid != sid && member.pid != own_pid)
                 .collect::<Vec<_>>();
             if others.is_empty() {
-                if listed.is_some() {
-                    let _ = leader.signal(Signal::SIGKILL);
+                // A leader that is still there but could not be killed (a privileged program
+                // it became) leaves the session unproven.
+                if listed
+                    && let Err(error) = leader.signal(Signal::SIGKILL)
+                    && error != Errno::ESRCH
+                {
+                    break;
                 }
-                return true;
+                // The pid may name a later process now, outside the session: its group is not
+                // ours either.
+                return if pid_reused(leader) {
+                    SessionKill::Reused
+                } else {
+                    SessionKill::Ended
+                };
             }
             for member in others {
                 let _ = member.signal(Signal::SIGKILL);
@@ -281,7 +296,55 @@ pub(crate) fn kill_session(leader: Process) -> bool {
         let _ = leader.signal(Signal::SIGTERM);
         let _ = leader.signal(Signal::SIGHUP);
     }
-    false
+    SessionKill::Unproven
+}
+
+/// How [`kill_session`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionKill {
+    /// No member is left (or the leader leads no session): what remains of the leader's process
+    /// group, if anything, is still ours, and the caller may kill the group.
+    Ended,
+    /// The leader's pid names another process now (or never named one of ours): our session
+    /// ended earlier. Nothing named by that pid, as a process or as a process group, is ours to
+    /// signal.
+    Reused,
+    /// No round proved the session empty: the caller must not kill the leader or its group by
+    /// force either.
+    Unproven,
+}
+
+impl SessionKill {
+    /// Whether nothing of the session can still run (a lingering cleanup is done).
+    pub(crate) fn settled(self) -> bool {
+        self != Self::Unproven
+    }
+}
+
+#[cfg(test)]
+impl Process {
+    /// This pid as a process that started at another time (one whose pid came round again).
+    pub(crate) fn another_lifetime(self) -> Self {
+        let Started(at) = self.started.unwrap_or(Started(0));
+        Self {
+            started: Some(Started(at.wrapping_add(1))),
+            ..self
+        }
+    }
+}
+
+/// Whether `leader`'s pid names a later process now (a zombie included). Unknown start times
+/// prove nothing.
+fn pid_reused(leader: Process) -> bool {
+    started(leader.pid).is_some_and(|now| {
+        reused(
+            leader,
+            Process {
+                pid: leader.pid,
+                started: Some(now),
+            },
+        )
+    })
 }
 
 /// Whether `now` (listed with `leader`'s pid) is a later process than `leader`. Unknown start
@@ -331,6 +394,24 @@ mod tests {
         assert!(listed.contains(&process), "{process:?} is not listed");
         // Reaped: the pid names no process of that lifetime now, so nothing is signalled.
         assert_eq!(process.signal(Signal::SIGKILL), Err(Errno::ESRCH));
+    }
+
+    #[test]
+    fn a_pid_that_names_another_process_is_reused_and_left_alone() {
+        use std::os::unix::process::CommandExt;
+        // A group leader, as the process that got the pid back can be.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let stale = Process::of(child.id()).another_lifetime();
+        let outcome = kill_session(stale);
+        let alive = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(outcome, SessionKill::Reused);
+        assert!(alive);
     }
 
     #[test]

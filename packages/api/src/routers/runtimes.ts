@@ -568,13 +568,14 @@ export const runtimesRouter = {
     const previousOfCurrent = await previousLaunchHashOf(runtime.id, current.version);
 
     // Forgetting is no version change: the engine is unchanged, only what was learned goes
-    // (servers drop their cached copy within seconds). Done once the update is known valid.
-    const forgetLearned = async () => {
+    // (servers drop their cached copy within seconds). Done once the update is known valid: in
+    // the write itself, so a refused update forgets nothing.
+    const forgetLearned = async (db: Tx) => {
       if (input.relearn)
-        await prisma.runtimeRequestProfile.deleteMany({ where: { runtimeId: runtime.id, userId } });
+        await db.runtimeRequestProfile.deleteMany({ where: { runtimeId: runtime.id, userId } });
     };
     if (hashes.contentHash === current.contentHash) {
-      await forgetLearned();
+      await forgetLearned(prisma);
       if (input.name !== undefined)
         await prisma.runtime.update({ where: { id: runtime.id }, data: { name: input.name } });
       return {
@@ -614,9 +615,9 @@ export const runtimesRouter = {
           "This node is Relay only, so its always-on definition is frozen. Change it on the node, or raise trust with `wsmp trust full`.",
         );
     };
-    // A served model that moves to another type would break the pools it is in. Checked here so
-    // a refused update forgets nothing, and again under the owner fence, which every pool member
-    // insert of this runtime's models also takes: a member added meanwhile is seen there.
+    // A served model that moves to another type would break the pools it is in. Checked here to
+    // refuse early, and again under the owner fence, which every pool member insert of this
+    // runtime's models also takes: a member added meanwhile is seen there.
     const nextType = derivedColumns(spec).modelType;
     const assertPoolsKeepType = async (db: Tx) => {
       if (nextType === current.modelType) return;
@@ -634,7 +635,6 @@ export const runtimesRouter = {
     };
     await assertPoolsKeepType(prisma);
 
-    await forgetLearned();
     const agent = agentRulesApply(context.auth);
     const adoptedLive: string[] = [];
     const restarted: string[] = [];
@@ -644,6 +644,7 @@ export const runtimesRouter = {
       async (tx) => {
         await assertDefinitionUnfrozen(tx);
         await assertPoolsKeepType(tx);
+        await forgetLearned(tx);
         // Read and classify under the owner fence (a trust change waits for it).
         adoptedLive.length = 0;
         restarted.length = 0;

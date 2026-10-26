@@ -864,7 +864,7 @@ fn hand_off_to_reaper(mut child: Child, permit: Permit, guard: Option<Process>) 
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
                 }
             }
-            crate::process_list::kill_session(guard)
+            crate::process_list::kill_session(guard).settled()
         });
     }
     let spawned = thread::Builder::new()

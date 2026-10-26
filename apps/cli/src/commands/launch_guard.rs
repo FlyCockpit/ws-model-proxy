@@ -26,3 +26,19 @@ pub fn run(args: &Args) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no command"))?;
     crate::launch_guard::guard(args.parent, &args.lock, program, rest)
 }
+
+/// `wsmp __launch-guard-exec -- <program> [args]` — internal: how a guard starts its command.
+#[derive(Debug, clap::Args)]
+pub struct ExecArgs {
+    /// The program and its arguments.
+    #[arg(last = true, required = true)]
+    command: Vec<OsString>,
+}
+
+pub fn exec(args: &ExecArgs) -> Result<()> {
+    let (program, rest) = args
+        .command
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("no command"))?;
+    crate::launch_guard::exec(program, rest)
+}

@@ -31,8 +31,8 @@
 //! - A guard the daemon stops waiting for while it is still ending its session (a kill it keeps
 //!   retrying, a session someone else's kill of the guard left behind) is [`lingering`] until it
 //!   has: meanwhile no rank of this node is proven idle (`runner`), since what the guard has not
-//!   ended yet may still launch. Process ids name these processes; that a pid can be reused
-//!   while cleanup waits is a documented limit.
+//!   ended yet may still launch. A process is named by its pid and its start time
+//!   (`process_list::Process`), so a pid reused while cleanup waits is never taken for it.
 //!
 //! What a command moves out with `setsid` is not the guard's. On Linux the rank's slice still
 //! holds it for the stop proof; on macOS only the service's status command proves anything.
@@ -45,6 +45,9 @@ use anyhow::{Context, Result};
 
 /// The hidden subcommand.
 pub const SUBCOMMAND: &str = "__launch-guard";
+/// The hidden subcommand the guard starts its command through: it clears the signal mask it
+/// inherited from the guard, then becomes the command ([`exec`]).
+pub const EXEC_SUBCOMMAND: &str = "__launch-guard-exec";
 /// How often a guard checks on its command and its parent.
 pub const POLL: Duration = Duration::from_millis(25);
 /// How long a starting daemon waits for an earlier daemon's guards to end.
@@ -98,8 +101,8 @@ pub(crate) fn lingering_serial() -> std::sync::MutexGuard<'static, ()> {
 /// was reaped.
 #[cfg(unix)]
 pub(crate) fn end_killed_session(guard: crate::process_list::Process) {
-    if !crate::process_list::kill_session(guard) {
-        linger(move || crate::process_list::kill_session(guard));
+    if !crate::process_list::kill_session(guard).settled() {
+        linger(move || crate::process_list::kill_session(guard).settled());
     }
 }
 
@@ -245,7 +248,8 @@ pub fn guard(parent: u32, lock: &Path, program: &OsString, args: &[OsString]) ->
     }
     // A terminal's Ctrl-C or hangup is the command's to take, not the guard's, and SIGTERM is
     // taken by the ender thread below: all blocked here and in the threads (started below, they
-    // inherit the mask). A spawned child starts with an empty mask.
+    // inherit the mask). A spawned child inherits the mask too, and most programs (macOS's `sh`
+    // among them) never clear it: the command starts through [`EXEC_SUBCOMMAND`], which does.
     let mut blocked = SigSet::empty();
     for signal in [
         Signal::SIGINT,
@@ -304,7 +308,12 @@ pub fn guard(parent: u32, lock: &Path, program: &OsString, args: &[OsString]) ->
         let _starting = STARTING
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Command::new(program).args(args).spawn()
+        Command::new(own_exe()?)
+            .arg(EXEC_SUBCOMMAND)
+            .arg("--")
+            .arg(program)
+            .args(args)
+            .spawn()
     };
     let mut child = spawned.with_context(|| format!("starting `{}`", program.to_string_lossy()))?;
     let status = child.wait();
@@ -360,6 +369,34 @@ fn kill_scope() {
             std::thread::sleep(POLL);
         }
     }
+}
+
+/// This executable, for [`EXEC_SUBCOMMAND`]. On Linux the running image itself, so an upgrade
+/// that replaced the file since does not change what runs.
+#[cfg(unix)]
+fn own_exe() -> Result<PathBuf> {
+    if cfg!(target_os = "linux") {
+        return Ok(PathBuf::from("/proc/self/exe"));
+    }
+    std::env::current_exe().context("finding the wsmp executable")
+}
+
+/// [`EXEC_SUBCOMMAND`]: clear the signal mask the guard handed down (it blocks SIGINT, SIGQUIT,
+/// SIGHUP and SIGTERM for itself), then become `program`. A signal sent meanwhile was held
+/// pending, and takes effect here. Returns only when `program` could not be started.
+#[cfg(unix)]
+pub fn exec(program: &OsString, args: &[OsString]) -> Result<()> {
+    use nix::sys::signal::{SigSet, SigmaskHow, pthread_sigmask};
+    use std::os::unix::process::CommandExt;
+    pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)
+        .context("clearing the signal mask")?;
+    let error = std::process::Command::new(program).args(args).exec();
+    Err(error).with_context(|| format!("starting `{}`", program.to_string_lossy()))
+}
+
+#[cfg(not(unix))]
+pub fn exec(_program: &OsString, _args: &[OsString]) -> Result<()> {
+    anyhow::bail!("the launch guard runs on Unix only")
 }
 
 #[cfg(not(unix))]

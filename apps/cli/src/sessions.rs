@@ -623,6 +623,17 @@ fn kill_process_group(pid: u32, fallback_to_pid: bool) {
     }
 }
 
+/// Kill a PTY shell's session, then what is left of its process group (`killpg` reaches jobs left
+/// in the group). An unproven session keeps its leader, and a shell whose pid names another
+/// process now has no group of ours left to kill. `fallback_to_pid`: see [`kill_process_group`]
+/// (only for a shell not reaped yet).
+#[cfg(unix)]
+fn end_shell_session(shell: crate::process_list::Process, fallback_to_pid: bool) {
+    if crate::process_list::kill_session(shell) == crate::process_list::SessionKill::Ended {
+        kill_process_group(shell.id(), fallback_to_pid);
+    }
+}
+
 #[cfg(unix)]
 fn reap_pid(pid: Option<u32>) -> (Option<i32>, Option<i32>) {
     let Some(pid) = pid else {
@@ -746,12 +757,7 @@ fn kill_live_children(select: impl Fn(&LiveChild) -> bool) {
             #[cfg(unix)]
             LiveChild::ExecGroup(pid) => kill_process_group(pid, false),
             #[cfg(unix)]
-            LiveChild::PtySession(shell) => {
-                // An unproven session keeps its leader.
-                if crate::process_list::kill_session(shell) {
-                    kill_process_group(shell.id(), false);
-                }
-            }
+            LiveChild::PtySession(shell) => end_shell_session(shell, false),
             #[cfg(unix)]
             LiveChild::GuardSession(guard) => crate::launch_guard::terminate(guard),
         }
@@ -966,12 +972,8 @@ fn shutdown_pty(mut runtime: PtyRuntime) -> (Option<i32>, Option<i32>) {
         return shutdown_guard_pty(runtime, exited);
     }
     if let Some(shell) = runtime.leader {
-        // A shell that `poll` already reaped is not signalled by pid again;
-        // `killpg` still reaches jobs left in its process group. An unproven
-        // session keeps its leader.
-        if crate::process_list::kill_session(shell) {
-            kill_process_group(shell.id(), exited.is_none());
-        }
+        // A shell that `poll` already reaped is not signalled by pid again.
+        end_shell_session(shell, exited.is_none());
     }
     // The reader and writer notice `stop` within their poll timeout. Joining
     // either would block: the reader while a background job still holds the
@@ -1023,7 +1025,7 @@ fn shutdown_guard_pty(
                         GuardReap::Killed => reaped = true,
                     }
                 }
-                crate::process_list::kill_session(guard)
+                crate::process_list::kill_session(guard).settled()
             });
         }
         (_, Some(_)) => {
@@ -3086,7 +3088,12 @@ impl ExecRegistry {
                 let timed_out = now >= session.deadline;
                 if timed_out && !session.timed_out {
                     session.timed_out = true;
-                    kill_exec(session.pid, session.child.as_mut(), true);
+                    // A reaped child's pid may name another process now.
+                    kill_exec(
+                        session.pid,
+                        session.child.as_mut(),
+                        session.reaped.is_none(),
+                    );
                     let status = reap_child(session.child.as_mut());
                     if status.0.is_some() || status.1.is_some() {
                         session.reaped = Some((status.0, status.1, now));
@@ -3138,7 +3145,11 @@ impl ExecRegistry {
             return Vec::new();
         }
         session.stop.store(true, Ordering::SeqCst);
-        kill_exec(session.pid, session.child.as_mut(), true);
+        kill_exec(
+            session.pid,
+            session.child.as_mut(),
+            session.reaped.is_none(),
+        );
         let status = reap_child(session.child.as_mut());
         let cause = if session.timed_out {
             EndCause::TimedOut
@@ -5954,5 +5965,25 @@ mod tests {
                 ))
             })
             .collect()
+    }
+
+    /// A shell whose pid came round to another process: neither that process nor the process
+    /// group it leads is killed (the group kill used to follow any session kill that returned).
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_whose_pid_names_another_process_spares_it_and_its_group() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("sleep");
+        let stale = crate::process_list::Process::of(child.id()).another_lifetime();
+        end_shell_session(stale, true);
+        std::thread::sleep(Duration::from_millis(50));
+        let alive = child.try_wait().expect("try_wait").is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(alive, "the process that got the pid back was killed");
     }
 }

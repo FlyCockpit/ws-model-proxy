@@ -41,7 +41,7 @@ import {
   moneyString,
   spendFor,
 } from "../lib/provider-views";
-import { isUniqueViolation, notFound, refuse } from "../lib/refuse";
+import { isUniqueViolation, notFound, RETRY_CONFLICT_MESSAGE, refuse } from "../lib/refuse";
 import type { Tx } from "../lib/runtime-store";
 
 function userIdOf(context: SignedInContext): string {
@@ -77,6 +77,33 @@ async function ownedAccount(userId: string, accountId: string) {
   });
   if (!account) throw notFound("That provider account does not exist.");
   return account;
+}
+
+// The checks before a write's fence only refuse early. A write beneath an account (or one of its
+// models, keys or prices) decides under the owner fence, which an account delete takes too: one
+// deleted meanwhile is not found there.
+async function assertAccountLive(tx: Tx, userId: string, accountId: string) {
+  const live = await tx.providerAccount.count({
+    where: { id: accountId, userId, deletedAt: null },
+  });
+  if (live === 0) throw notFound("That provider account does not exist.");
+}
+
+/** An account delete deletes its models too. */
+async function assertModelLive(tx: Tx, userId: string, modelId: string) {
+  const live = await tx.providerModel.count({ where: { id: modelId, userId, deletedAt: null } });
+  if (live === 0) throw notFound("That provider model does not exist.");
+}
+
+/** A price activated, retired or deleted meanwhile is not the one the request named. */
+async function assertPriceIn(
+  tx: Tx,
+  userId: string,
+  versionId: string,
+  status: "DRAFT" | "ACTIVE",
+) {
+  const still = await tx.providerPricingVersion.count({ where: { id: versionId, userId, status } });
+  if (still === 0) throw new ORPCError("CONFLICT", { message: RETRY_CONFLICT_MESSAGE });
 }
 
 async function accountViewOf(userId: string, accountId: string) {
@@ -235,6 +262,7 @@ export const providersRouter = {
       const baseUrl = input.baseUrl === undefined ? undefined : normalizedBaseUrl(input.baseUrl);
       try {
         await graphWrite([userId], async (tx) => {
+          await assertAccountLive(tx, userId, account.id);
           // Read under the owner fence: the endpoint version must be the latest one.
           const current = await tx.providerAccount.findUniqueOrThrow({
             where: { id: account.id },
@@ -279,6 +307,7 @@ export const providersRouter = {
       await graphWrite(
         [userId],
         async (tx) => {
+          await assertAccountLive(tx, userId, account.id);
           await dropCloudMembers(tx, modelIds);
           await tx.providerModel.updateMany({
             where: { providerAccountId: account.id, userId },
@@ -315,6 +344,7 @@ export const providersRouter = {
       const userId = userIdOf(context);
       const account = await ownedAccount(userId, input.accountId);
       await graphWrite([userId], async (tx) => {
+        await assertAccountLive(tx, userId, account.id);
         const current = await tx.providerAccount.findUniqueOrThrow({
           where: { id: account.id },
           select: { currentCredentialId: true },
@@ -340,6 +370,7 @@ export const providersRouter = {
         const userId = userIdOf(context);
         const account = await ownedAccount(userId, input.accountId);
         await graphWrite([userId], async (tx) => {
+          await assertAccountLive(tx, userId, account.id);
           await tx.providerAccount.update({
             where: { id: account.id },
             data: { allowDataCollection: input.allow },
@@ -365,6 +396,7 @@ export const providersRouter = {
       if (!account) throw notFound("That provider account does not exist.");
       const sealed = sealCredential(userId, account, input.secret);
       await graphWrite([userId], async (tx) => {
+        await assertAccountLive(tx, userId, account.id);
         // One ACTIVE key per account: retire the old one first, then point at the new one.
         // Read under the owner fence so a concurrent replace is seen.
         const { currentCredentialId: previous } = await tx.providerAccount.findUniqueOrThrow({
@@ -404,6 +436,12 @@ export const providersRouter = {
       if (!credential) throw notFound("That key does not exist.");
       if (credential.status === "ACTIVE")
         await graphWrite([userId], async (tx) => {
+          // Still the active key under the owner fence: one replaced or revoked meanwhile keeps
+          // its status.
+          const active = await tx.providerCredential.count({
+            where: { id: credential.id, userId, status: "ACTIVE" },
+          });
+          if (active === 0) return;
           // The account stops working (and is turned off) until a new key is added.
           await tx.providerAccount.updateMany({
             where: { id: credential.providerAccountId, userId, currentCredentialId: credential.id },
@@ -574,6 +612,7 @@ export const providersRouter = {
       let modelId: string;
       try {
         modelId = await graphWrite([userId], async (tx) => {
+          await assertAccountLive(tx, userId, input.accountId);
           // Every live model has its execution target (the identity routes and attempts name),
           // created with it under the same owner fence. A restored model may still have one.
           const withTarget = async (providerModelId: string) => {
@@ -651,6 +690,7 @@ export const providersRouter = {
       await graphWrite(
         [userId],
         async (tx) => {
+          await assertModelLive(tx, userId, model.id);
           await tx.providerModel.update({
             where: { id: model.id },
             data: {
@@ -692,6 +732,7 @@ export const providersRouter = {
       await graphWrite(
         [userId],
         async (tx) => {
+          await assertModelLive(tx, userId, model.id);
           await dropCloudMembers(tx, [model.id]);
           await tx.providerModel.update({
             where: { id: model.id },
@@ -731,6 +772,7 @@ export const providersRouter = {
       });
       if (!model) throw notFound("That provider model does not exist.");
       const row = await graphWrite([userId], async (tx) => {
+        await assertModelLive(tx, userId, model.id);
         const existing = await tx.providerPricingVersion.findMany({
           where: { providerModelId: model.id },
           select: { version: true },
@@ -770,6 +812,8 @@ export const providersRouter = {
       const row = await graphWrite(
         [userId],
         async (tx) => {
+          await assertModelLive(tx, userId, draft.providerModelId);
+          await assertPriceIn(tx, userId, draft.id, "DRAFT");
           const now = new Date();
           // One active price per model: the previous one retires when this one starts, so a
           // future draft leaves no gap without a price.
@@ -804,11 +848,13 @@ export const providersRouter = {
         throw new ORPCError("BAD_REQUEST", { message: "A price retires after it took effect." });
       const row = await graphWrite(
         [userId],
-        (tx) =>
-          tx.providerPricingVersion.update({
+        async (tx) => {
+          await assertPriceIn(tx, userId, active.id, "ACTIVE");
+          return tx.providerPricingVersion.update({
             where: { id: active.id },
             data: { status: "RETIRED", retiredAt: now },
-          }),
+          });
+        },
         async () => [fences.pricing(userId, active.providerModelId)],
       );
       return pricingView(row);
@@ -820,9 +866,10 @@ export const providersRouter = {
         select: { id: true },
       });
       if (!draft) throw notFound("That draft price does not exist.");
-      await graphWrite([userId], (tx) =>
-        tx.providerPricingVersion.delete({ where: { id: draft.id } }),
-      );
+      await graphWrite([userId], async (tx) => {
+        await assertPriceIn(tx, userId, draft.id, "DRAFT");
+        await tx.providerPricingVersion.delete({ where: { id: draft.id } });
+      });
       return { ok: true as const };
     }),
   },
@@ -924,6 +971,7 @@ export const providersRouter = {
       await graphWrite(
         [userId],
         async (tx) => {
+          await assertAccountLive(tx, userId, account.id);
           // Decide under the fences: another tab may have set or cleared it meanwhile.
           const cap = await tx.spendCap.findUnique({
             where: { providerAccountId: account.id },
@@ -983,7 +1031,9 @@ export const providersRouter = {
         await graphWrite(
           [userId],
           async (tx) => {
-            await tx.spendCap.delete({ where: { id: cap.id } });
+            await assertAccountLive(tx, userId, account.id);
+            // Cleared by another tab meanwhile: nothing left to clear.
+            await tx.spendCap.deleteMany({ where: { id: cap.id } });
             await audit(tx, context, { accountId: account.id, action: "spend_cap.clear" });
           },
           async () => [fences.spendAccount(account.id), fences.spendCap(cap.id)],

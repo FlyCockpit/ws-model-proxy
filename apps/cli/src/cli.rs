@@ -89,4 +89,8 @@ pub enum Command {
     /// Internal: run a runtime command so it cannot outlive the relay that started it.
     #[command(name = "__launch-guard", hide = true)]
     LaunchGuard(crate::commands::launch_guard::Args),
+
+    /// Internal: how a launch guard starts its command (with the signals it blocked unblocked).
+    #[command(name = "__launch-guard-exec", hide = true)]
+    LaunchGuardExec(crate::commands::launch_guard::ExecArgs),
 }

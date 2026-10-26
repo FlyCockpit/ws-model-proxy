@@ -74,5 +74,6 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Command::Terminal(args) => commands::terminal::run(args),
         Command::Recover(args) => commands::recover::run(args),
         Command::LaunchGuard(args) => commands::launch_guard::run(args),
+        Command::LaunchGuardExec(args) => commands::launch_guard::exec(args),
     }
 }
