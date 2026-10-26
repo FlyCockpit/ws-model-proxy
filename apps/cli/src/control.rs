@@ -474,19 +474,33 @@ mod windows {
     /// trust commands' 30 s plus the daemon loop's own turn.
     const ANSWER_DEADLINE: Duration = Duration::from_secs(45);
 
+    /// `ERROR_SHARING_VIOLATION`: another process holds the daemon lock.
+    const SHARING_VIOLATION: i32 = 32;
+
+    /// The daemon locks this process took ([`ControlServer::bind`]): never released before the
+    /// process exits, as on Unix.
+    static DAEMON_LOCKS: std::sync::Mutex<Vec<std::fs::File>> = std::sync::Mutex::new(Vec::new());
+
     /// One pipe per state dir, so two state dirs (`WSMP_STATE_DIR`) never share
     /// a relay. The name is a digest; the path itself stays private.
     fn pipe_name() -> Result<OsString> {
-        let state_dir = crate::paths::state_dir()?;
-        let key = state_dir.to_string_lossy().to_lowercase();
+        Ok(pipe_name_for(&crate::paths::state_dir()?))
+    }
+
+    /// The pipe of the directory itself, not of its spelling: a relative path, a trailing
+    /// separator, a short (8.3) name or a junction all name the same pipe once the directory
+    /// exists. One that does not exist yet has no relay, and keeps its absolute spelling.
+    fn pipe_name_for(state_dir: &std::path::Path) -> OsString {
+        let identity = std::fs::canonicalize(state_dir)
+            .or_else(|_| std::path::absolute(state_dir))
+            .unwrap_or_else(|_| state_dir.to_path_buf());
+        let key = identity.to_string_lossy().to_lowercase();
         let digest = Sha256::digest(key.as_bytes());
         let hex: String = digest[..8]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        Ok(OsString::from(format!(
-            r"\\.\pipe\wsmp-relay-control-{hex}"
-        )))
+        OsString::from(format!(r"\\.\pipe\wsmp-relay-control-{hex}"))
     }
 
     pub struct PendingRequest {
@@ -506,7 +520,41 @@ mod windows {
 
     impl ControlServer {
         pub fn bind() -> Result<Self> {
-            Self::bind_at(pipe_name()?)
+            Self::bind_in(&crate::paths::state_dir()?)
+        }
+
+        /// One daemon per state directory, as on Unix: its lock (`relay-daemon.lock`, held
+        /// open unshared until the process exits, `DAEMON_LOCKS`) is taken before the pipe, so
+        /// two daemons never share a state directory, whatever spelling each was given.
+        fn bind_in(state_dir: &std::path::Path) -> Result<Self> {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            std::fs::create_dir_all(state_dir).with_context(|| {
+                format!("creating the state directory `{}`", state_dir.display())
+            })?;
+            let lock_path = state_dir.join("relay-daemon.lock");
+            let lock = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(0)
+                .open(&lock_path)
+            {
+                Ok(lock) => lock,
+                Err(error) if error.raw_os_error() == Some(SHARING_VIOLATION) => anyhow::bail!(
+                    "a relay daemon already runs (it holds `{}`)",
+                    lock_path.display()
+                ),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("opening daemon lock `{}`", lock_path.display()));
+                }
+            };
+            DAEMON_LOCKS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(lock);
+            Self::bind_at(pipe_name_for(state_dir))
         }
 
         fn bind_at(name: OsString) -> Result<Self> {
@@ -926,6 +974,57 @@ mod windows {
             let name = name.to_string_lossy();
             assert!(name.starts_with(r"\\.\pipe\wsmp-relay-control-"), "{name}");
             assert_eq!(name.len(), r"\\.\pipe\wsmp-relay-control-".len() + 16);
+        }
+
+        #[test]
+        fn every_spelling_of_a_state_dir_names_one_pipe() {
+            let dir = tempfile::tempdir().expect("dir");
+            let state = dir.path().join("State");
+            std::fs::create_dir(&state).expect("state");
+            let name = pipe_name_for(&state);
+            let mut trailing = state.clone().into_os_string();
+            trailing.push(r"\");
+            let dotted = dir.path().join("x").join("..").join("STATE");
+            for spelling in [
+                std::path::PathBuf::from(trailing),
+                dotted,
+                std::fs::canonicalize(&state).expect("canonical"),
+            ] {
+                assert_eq!(pipe_name_for(&spelling), name, "{}", spelling.display());
+            }
+            let junction = dir.path().join("door");
+            let made = std::process::Command::new("cmd")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(&junction)
+                .arg(&state)
+                .output()
+                .expect("mklink");
+            assert!(made.status.success(), "{made:?}");
+            assert_eq!(pipe_name_for(&junction), name);
+            assert_ne!(pipe_name_for(dir.path()), name);
+        }
+
+        #[test]
+        fn a_second_daemon_on_one_state_dir_is_refused_by_its_lock() {
+            let dir = tempfile::tempdir().expect("dir");
+            let first = ControlServer::bind_in(dir.path()).expect("the first daemon binds");
+            let junction = dir.path().with_extension("alias");
+            let made = std::process::Command::new("cmd")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(&junction)
+                .arg(dir.path())
+                .output()
+                .expect("mklink");
+            assert!(made.status.success(), "{made:?}");
+            let refused = ControlServer::bind_in(&junction)
+                .err()
+                .expect("a second daemon is refused");
+            assert!(
+                format!("{refused:#}").contains("already runs"),
+                "{refused:#}"
+            );
+            drop(first);
+            let _ = std::fs::remove_dir(&junction);
         }
     }
 }
