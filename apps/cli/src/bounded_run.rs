@@ -934,12 +934,13 @@ fn kill_group(pid: u32) {
 /// widens the accepted G1-2 window (a recycled pid, in the microseconds
 /// between the reap and `unregister`) from the group kill to this one.
 /// A launch guard (`guard`) is sent SIGTERM: it ends its session itself before its launcher
-/// lock goes, and the signal is all that happens here (shutdown calls this under the registry
-/// lock).
+/// lock goes, and the signal is all that happens here. Registered, so unreaped (the same G1-2
+/// window aside): no start time is read first, so shutdown, the panic hook and `register` never
+/// wait for a `ps` under the registry lock.
 #[cfg(unix)]
 fn kill_run(pid: u32, guard: Option<Process>) {
     if let Some(guard) = guard {
-        crate::launch_guard::terminate(guard);
+        crate::launch_guard::terminate_unreaped(guard);
         return;
     }
     kill_group(pid);

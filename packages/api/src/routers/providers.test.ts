@@ -104,6 +104,7 @@ beforeEach(() => {
     currentCredentialId: "cred-1",
     baseUrl: "https://openrouter.ai/api/v1",
     endpointVersion: 1,
+    label: "OpenRouter",
   } as never);
   db.spendCap.findUnique.mockResolvedValue(null);
   // Live and unchanged under the owner fence.
@@ -390,9 +391,14 @@ describe("provider review follow-ups", () => {
       return [{ id: "pm-1" }, { id: "pm-new" }];
     }) as never);
     db.executionTarget.findMany.mockResolvedValue([{ id: "t-new" }] as never);
+    // Renamed meanwhile: the deleted label is built from the label under the fence.
+    db.providerAccount.findUniqueOrThrow.mockResolvedValue({ label: "Renamed" } as never);
     await client().accounts.delete({ accountId: "acc-1" });
     expect(db.poolMember.deleteMany).toHaveBeenCalledWith({
       where: { providerModelId: { in: ["pm-1", "pm-new"] } },
+    });
+    expect(db.providerAccount.update.mock.calls[0]?.[0]?.data).toMatchObject({
+      label: "Renamed (deleted acc-1)",
     });
     expect(fenceLog.held).toEqual(["00:owner:owner-1", "06:capacity-policy:t-new"]);
   });

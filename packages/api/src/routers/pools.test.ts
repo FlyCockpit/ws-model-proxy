@@ -748,13 +748,33 @@ describe("graph-write fences and review follow-ups", () => {
     expect(db.poolSidecar.upsert).toHaveBeenCalled();
   });
 
+  it("a sidecar target the owner may not name takes no fence of its owner", async () => {
+    db.pool.findFirst.mockResolvedValueOnce(owned as never);
+    // Someone else's private pool: not among the pools the owner may name.
+    db.pool.findMany.mockResolvedValue([]);
+    expect(
+      await reasonOf(
+        client().update({
+          poolId: "pool-1",
+          sidecars: [{ input: "IMAGE", targetPoolId: "pool-x" }],
+        }),
+      ),
+    ).toBe("NOT_FOUND");
+    expect(db.pool.findMany.mock.calls[0]?.[0]?.where).toMatchObject({
+      id: { in: ["pool-x"] },
+      OR: [{ userId: OWNER }, { Shares: { some: { granteeUserId: OWNER, canUse: true } } }],
+    });
+    expect(fenceLog.held).toEqual([]);
+    expect(db.poolSidecar.upsert).not.toHaveBeenCalled();
+  });
+
   it("a sidecar target whose owner was not fenced is a conflict, not a write", async () => {
     db.pool.findFirst.mockResolvedValueOnce(owned as never);
-    // Not found before the fences (created since), found under them.
-    db.pool.findMany.mockResolvedValue([]);
+    // Owned by bob before the fences; under them, by an owner that was not fenced.
+    db.pool.findMany.mockResolvedValue([{ userId: "bob" }] as never);
     db.pool.findFirst.mockResolvedValueOnce({
       id: "pool-b",
-      userId: "bob",
+      userId: "carol",
       modelType: "LLM",
       Sidecars: [],
     } as never);

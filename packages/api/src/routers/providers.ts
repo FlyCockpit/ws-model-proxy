@@ -312,6 +312,11 @@ export const providersRouter = {
         [userId],
         async (tx) => {
           await assertAccountLive(tx, userId, account.id);
+          // The label as it is now (a rename may have landed meanwhile).
+          const { label } = await tx.providerAccount.findUniqueOrThrow({
+            where: { id: account.id },
+            select: { label: true },
+          });
           await dropCloudMembers(tx, modelIds);
           await tx.providerModel.updateMany({
             where: { providerAccountId: account.id, userId },
@@ -324,7 +329,7 @@ export const providersRouter = {
               enabled: false,
               currentCredentialId: null,
               deletedAt: new Date(),
-              label: `${account.label.slice(0, 80)} (deleted ${account.id.slice(-8)})`,
+              label: `${label.slice(0, 80)} (deleted ${account.id.slice(-8)})`,
             },
           });
           await tx.providerCredential.updateMany({

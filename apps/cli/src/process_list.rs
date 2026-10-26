@@ -79,6 +79,26 @@ impl Process {
     }
 }
 
+/// `signal` to each of `processes` whose pid still names it, checked against one listing (on
+/// macOS one `ps` for all, not one per process). A listing that cannot be read signals none. A
+/// zombie is not listed: it is already dead.
+pub(crate) fn signal_current(processes: &[Process], signal: Signal) {
+    if processes.is_empty() {
+        return;
+    }
+    let Ok(listed) = live() else {
+        return;
+    };
+    for process in processes {
+        let current = listed.iter().any(|now| {
+            now.pid == process.pid && process.started.is_none_or(|at| now.started == Some(at))
+        });
+        if current && signallable(process.pid) {
+            let _ = nix::sys::signal::kill(process.pid, signal);
+        }
+    }
+}
+
 /// Not 0 or below (a process group, or every process) and not init.
 fn signallable(pid: Pid) -> bool {
     pid.as_raw() > 1
@@ -176,16 +196,49 @@ fn lstart<'a>(fields: impl Iterator<Item = &'a str>) -> Option<Started> {
     any.then(|| Started(hasher.finish()))
 }
 
-/// How long `ps` may take. Cleanup runs it under registry locks and on shutdown, so a `ps` that
-/// hangs must not hang them: past this, the listing is an error (nothing proven, nothing
-/// signalled), never a wait.
+/// How long `ps` may take. Cleanup runs it on shutdown, so a `ps` that hangs must not hang it:
+/// past this, the listing is an error (nothing proven, nothing signalled), never a wait.
 #[cfg(not(target_os = "linux"))]
 const PS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How many `ps` may be running (or given up and not reaped yet) at once. A `ps` stuck in the
+/// kernel keeps its slot until it is reaped, so retries cannot pile up threads and processes:
+/// past this, a listing is an error at once.
+#[cfg(not(target_os = "linux"))]
+const PS_MAX_OUTSTANDING: usize = 4;
+
+#[cfg(not(target_os = "linux"))]
+static PS_OUTSTANDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One of [`PS_MAX_OUTSTANDING`], held until its `ps` is reaped.
+#[cfg(not(target_os = "linux"))]
+struct PsSlot;
+
+#[cfg(not(target_os = "linux"))]
+impl PsSlot {
+    fn take() -> std::io::Result<Self> {
+        use std::sync::atomic::Ordering;
+        PS_OUTSTANDING
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held < PS_MAX_OUTSTANDING).then_some(held + 1)
+            })
+            .map(|_| Self)
+            .map_err(|_| std::io::Error::other("too many `ps` still running"))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Drop for PsSlot {
+    fn drop(&mut self) {
+        PS_OUTSTANDING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 /// `ps`'s standard output, once it exited (within [`PS_TIMEOUT`]).
 #[cfg(not(target_os = "linux"))]
 fn ps(args: &[&str]) -> std::io::Result<std::process::Output> {
     use std::io::Read;
+    let slot = PsSlot::take()?;
     let mut child = std::process::Command::new("/bin/ps")
         .args(args)
         .env_clear()
@@ -208,7 +261,7 @@ fn ps(args: &[&str]) -> std::io::Result<std::process::Output> {
     }) {
         Ok(reader) => reader,
         Err(error) => {
-            give_up(child);
+            give_up(child, slot);
             return Err(error);
         }
     };
@@ -229,14 +282,14 @@ fn ps(args: &[&str]) -> std::io::Result<std::process::Output> {
                 std::thread::sleep(Duration::from_millis(2));
             }
             Ok(None) => {
-                give_up(child);
+                give_up(child, slot);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "`ps` did not answer in time",
                 ));
             }
             Err(error) => {
-                give_up(child);
+                give_up(child, slot);
                 return Err(error);
             }
         }
@@ -244,17 +297,23 @@ fn ps(args: &[&str]) -> std::io::Result<std::process::Output> {
 }
 
 /// Kill a `ps` this listing no longer waits for, and reap it off this thread: one stuck in the
-/// kernel may not die at once, and the caller may hold a registry lock. With no thread to spare
-/// it is left unreaped (a zombie until the CLI exits).
+/// kernel may not die at once. Its slot goes once it is reaped. With no thread to spare it is
+/// left unreaped (a zombie until the CLI exits) and keeps its slot.
 #[cfg(not(target_os = "linux"))]
-fn give_up(mut child: std::process::Child) {
+fn give_up(mut child: std::process::Child, slot: PsSlot) {
     let _ = child.kill();
     if let Ok(Some(_)) = child.try_wait() {
         return;
     }
-    let _ = std::thread::Builder::new().spawn(move || {
+    let reaper = std::thread::Builder::new().spawn(move || {
         let _ = child.wait();
+        drop(slot);
     });
+    if let Err(error) = reaper {
+        // The closure (and the slot in it) is dropped with the error: keep the slot held.
+        drop(error);
+        PS_OUTSTANDING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -490,6 +549,30 @@ mod tests {
         let _ = child.wait();
         assert_eq!(outcome, SessionKill::Reused);
         assert!(alive);
+    }
+
+    #[test]
+    fn one_listing_signals_only_the_processes_still_themselves() {
+        let mut ours = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let current = Process::of(ours.id());
+        let stale = Process::of(other.id()).another_lifetime();
+        signal_current(&[current, stale], Signal::SIGKILL);
+        let ours_status = ours.wait().unwrap();
+        let other_alive = other.try_wait().unwrap().is_none();
+        let _ = other.kill();
+        let _ = other.wait();
+        assert!(!ours_status.success(), "{ours_status:?}");
+        assert!(
+            other_alive,
+            "a pid that names another process was signalled"
+        );
     }
 
     #[test]

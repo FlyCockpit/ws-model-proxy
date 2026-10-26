@@ -752,6 +752,8 @@ fn kill_live_children(select: impl Fn(&LiveChild) -> bool) {
         .copied()
         .filter(|child| select(child))
         .collect::<Vec<_>>();
+    // A guard PTY may be reaped and still tracked: its pid is checked, in one listing for all.
+    let mut guards = Vec::new();
     for child in children {
         match child {
             #[cfg(unix)]
@@ -759,9 +761,10 @@ fn kill_live_children(select: impl Fn(&LiveChild) -> bool) {
             #[cfg(unix)]
             LiveChild::PtySession(shell) => end_shell_session(shell, false),
             #[cfg(unix)]
-            LiveChild::GuardSession(guard) => crate::launch_guard::terminate(guard),
+            LiveChild::GuardSession(guard) => guards.push(guard),
         }
     }
+    crate::launch_guard::terminate_all(&guards);
 }
 
 /// Ownership: the session owns the child; this list owns a job handle clone.

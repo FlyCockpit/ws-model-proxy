@@ -219,15 +219,28 @@ const SIDECAR_TARGET_TYPE = { IMAGE: "LLM", VIDEO: "LLM", AUDIO: "TRANSCRIPTION"
  * each one's no-chain check sees the other. Read before the fences; {@link applySidecars}
  * checks under them that every target's owner is among them.
  */
-async function sidecarTargetOwners(sidecars: SidecarPatch[]): Promise<string[]> {
-  const targetIds = sidecars.flatMap((sidecar) =>
-    sidecar.targetPoolId === null ? [] : [sidecar.targetPoolId],
-  );
+/** A pool `ownerId` may name as a sidecar: its own, or one shared with it for use. */
+const sidecarTargetOf = (ownerId: string) => ({
+  OR: [{ userId: ownerId }, { Shares: { some: { granteeUserId: ownerId, canUse: true } } }],
+});
+
+/**
+ * The owners of the sidecar targets `ownerId`'s pool names, to fence them too. Only pools it may
+ * name: one it cannot is refused here, so no request takes a fence of an owner it has no access
+ * to. Checked again under the fences (`applySidecars`).
+ */
+async function sidecarTargetOwners(ownerId: string, sidecars: SidecarPatch[]): Promise<string[]> {
+  const targetIds = [
+    ...new Set(
+      sidecars.flatMap((sidecar) => (sidecar.targetPoolId === null ? [] : [sidecar.targetPoolId])),
+    ),
+  ];
   if (targetIds.length === 0) return [];
   const targets = await prisma.pool.findMany({
-    where: { id: { in: targetIds } },
+    where: { id: { in: targetIds }, ...sidecarTargetOf(ownerId) },
     select: { userId: true },
   });
+  if (targets.length < targetIds.length) throw notFound("That sidecar pool does not exist.");
   return targets.map((target) => target.userId);
 }
 
@@ -245,13 +258,7 @@ async function applySidecars(
     if (sidecar.targetPoolId === pool.id)
       throw refuseAbout("sidecar_chain", pool.id, "A pool cannot be its own sidecar.");
     const target = await db.pool.findFirst({
-      where: {
-        id: sidecar.targetPoolId,
-        OR: [
-          { userId: pool.userId },
-          { Shares: { some: { granteeUserId: pool.userId, canUse: true } } },
-        ],
-      },
+      where: { id: sidecar.targetPoolId, ...sidecarTargetOf(pool.userId) },
       select: {
         id: true,
         userId: true,
@@ -691,7 +698,7 @@ export const poolsRouter = {
   create: contractProcedure(c.create).handler(async ({ input, context }) => {
     const userId = userIdOf(context);
     const actor = callerActor(context.auth, userId);
-    const owners = [userId, ...(await sidecarTargetOwners(input.sidecars ?? []))];
+    const owners = [userId, ...(await sidecarTargetOwners(userId, input.sidecars ?? []))];
     let poolId: string;
     try {
       poolId = await graphWrite(
@@ -756,7 +763,7 @@ export const poolsRouter = {
     const owners = [
       userId,
       ...touched.flatMap((member) => (member.RuntimeModel ? [member.RuntimeModel.userId] : [])),
-      ...(await sidecarTargetOwners(input.sidecars ?? [])),
+      ...(await sidecarTargetOwners(userId, input.sidecars ?? [])),
     ];
     try {
       await graphWrite(

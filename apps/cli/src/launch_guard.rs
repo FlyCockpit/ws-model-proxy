@@ -106,15 +106,16 @@ pub(crate) fn end_killed_session(guard: crate::process_list::Process) {
     }
 }
 
-/// SIGTERM to a launch guard: it ends its session itself, holding its lock until it has. One
-/// that has not blocked the signal yet has started nothing, and the signal ends it. Nothing is
-/// sent once `guard`'s pid names another process.
+/// SIGTERM to launch guards that may have been reaped already: each ends its session itself,
+/// holding its lock until it has. One that has not blocked the signal yet has started nothing,
+/// and the signal ends it. Nothing is sent to a pid that names another process now, and one
+/// listing checks them all (on macOS, one `ps`, not one per guard).
 #[cfg(unix)]
-pub(crate) fn terminate(guard: crate::process_list::Process) {
-    let _ = guard.signal(nix::sys::signal::Signal::SIGTERM);
+pub(crate) fn terminate_all(guards: &[crate::process_list::Process]) {
+    crate::process_list::signal_current(guards, nix::sys::signal::Signal::SIGTERM);
 }
 
-/// [`terminate`] for the caller's own guard child that is not reaped yet: its pid is still the
+/// SIGTERM to the caller's own guard child that is not reaped yet: its pid is still the
 /// guard's, so nothing is checked (and nothing can fail to be checked) first.
 #[cfg(unix)]
 pub(crate) fn terminate_unreaped(guard: crate::process_list::Process) {

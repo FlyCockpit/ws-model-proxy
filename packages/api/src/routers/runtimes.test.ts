@@ -1836,16 +1836,43 @@ describe("graph-write fences", () => {
       expect(fenceLog.held).toContain("00:owner:owner-1");
       return 0;
     }) as never);
-    // A version change, and a rename with relearn (no version change): neither writes.
     expect(
       await reasonOf(client().update({ runtimeId: "rt-1", limits: { concurrencyLimit: 4 } })),
-    ).toBe("CONFLICT");
-    expect(
-      await reasonOf(client().update({ runtimeId: "rt-1", name: "Renamed", relearn: true })),
     ).toBe("CONFLICT");
     expect(db.runtime.count).toHaveBeenCalledWith({
       where: { id: "rt-1", userId: OWNER, currentVersionId: "ver-1" },
     });
+    expect(db.runtimeVersion.create).not.toHaveBeenCalled();
+    expect(db.runtime.update).not.toHaveBeenCalled();
+  });
+
+  it("a rename with relearn (no version change) of a replaced version is a conflict too", async () => {
+    const { runtimeContentHash } = await import("../lib/runtime-launch-hash");
+    const limits = {
+      concurrencyLimit: null,
+      contextLimit: null,
+      kvBudgetTokens: null,
+      kvFullThreshold: null,
+      engineLoadGate: "AUTO" as const,
+    };
+    // The content hash the request computes: the no-version-change path.
+    const contentHash = runtimeContentHash({ spec: SPEC, limits, advanced: {} });
+    db.runtime.findFirst.mockResolvedValue({
+      id: "rt-1",
+      kind: "STARTABLE",
+      origin: "SERVER",
+      Node: null,
+      CurrentVersion: versionRow({ contentHash, compat: {} }),
+    } as never);
+    db.runtimeVersion.findFirst.mockResolvedValue(null);
+    db.runtime.count.mockImplementation((async () => {
+      expect(fenceLog.held).toContain("00:owner:owner-1");
+      return 0;
+    }) as never);
+    expect(
+      await reasonOf(client().update({ runtimeId: "rt-1", name: "Renamed", relearn: true })),
+    ).toBe("CONFLICT");
+    expect(db.runtime.count).toHaveBeenCalledTimes(1);
     expect(db.runtimeVersion.create).not.toHaveBeenCalled();
     expect(db.runtime.update).not.toHaveBeenCalled();
     expect(db.runtimeRequestProfile.deleteMany).not.toHaveBeenCalled();
