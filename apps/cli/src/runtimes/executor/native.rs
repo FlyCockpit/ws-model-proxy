@@ -496,7 +496,7 @@ impl Runtime for NativeRuntime {
         {
             let dir = super::windows::hosts_dir()?;
             let outcome = (|| {
-                let exe = std::env::current_exe().context("finding the wsmp executable")?;
+                let exe = super::windows::host_exe()?;
                 super::windows::start(
                     &dir,
                     &super::windows::HostLaunch {

@@ -99,6 +99,22 @@ struct StopRequest {
     grace_ms: u64,
 }
 
+/// The `wsmp` executable a runtime host runs as: this one. The library's own tests run as a test
+/// binary, so they use the `wsmp` Cargo built beside it.
+pub fn host_exe() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("finding the wsmp executable")?;
+    #[cfg(test)]
+    if let Some(built) = exe
+        .parent()
+        .and_then(Path::parent)
+        .map(|dir| dir.join("wsmp.exe"))
+        .filter(|built| built.is_file())
+    {
+        return Ok(built);
+    }
+    Ok(exe)
+}
+
 /// Where the unit records live.
 pub fn hosts_dir() -> Result<PathBuf> {
     Ok(super::instances_dir()?.join(HOSTS_DIR))
