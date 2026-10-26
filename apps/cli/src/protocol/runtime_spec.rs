@@ -615,12 +615,17 @@ pub struct SecretEntry {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TerminalFeatures {
     pub supported: bool,
     pub max: u8,
     pub approval_required: bool,
+    /// The shells a `term.open` may name (`crate::shells`), the node's
+    /// default first. Empty, and left out, where terminals run the login
+    /// shell (Unix).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shells: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -29,6 +29,7 @@ import { CodeSnippet } from "@/components/code-snippet";
 import { InlineRetry } from "@/components/inline-retry";
 import { PageHeading } from "@/components/page-stub";
 import { OperatorStepItem } from "@/components/runtimes/operator-step-item";
+import { TerminalNodeRow } from "@/components/terminal-node-row";
 import { TerminalPane } from "@/components/terminal-pane";
 import { TimeAgo } from "@/components/time-ago";
 import { WideContent } from "@/components/wide-content";
@@ -523,36 +524,22 @@ function TerminalNodes({ ready, openTerminal }: { ready: boolean; openTerminal: 
             {eligible.length === 0 ? (
               <p className="pb-2 text-sm text-muted-foreground">{t("terminals:noFullNodes")}</p>
             ) : null}
-            {list.map((node) => {
-              const full = node.trust.effective === "FULL" && !node.trust.lowerPending;
-              const online = node.connection === "ONLINE";
-              return (
-                <div
-                  key={node.id}
-                  className="flex min-w-0 flex-wrap items-center justify-between gap-2 py-2 first:pt-0 last:pb-0"
-                >
-                  <div className="min-w-0">
-                    <p className="truncate font-mono text-sm">{node.name ?? node.slug}</p>
-                    {!full || !online ? (
-                      <p className="text-xs text-muted-foreground">
-                        {!full ? t("terminals:relayOnly") : t("terminals:offline")}
-                      </p>
-                    ) : null}
-                  </div>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="touch"
-                    disabled={!ready || !full || !online || openTicket.isPending}
-                    onClick={() => openTicket.mutate({ nodeId: node.id, ...INITIAL_SIZE })}
-                  >
-                    {openTicket.isPending && openTicket.variables?.nodeId === node.id
-                      ? t("terminals:opening")
-                      : t("terminals:open")}
-                  </Button>
-                </div>
-              );
-            })}
+            {list.map((node) => (
+              <TerminalNodeRow
+                key={node.id}
+                node={node}
+                ready={ready}
+                busy={openTicket.isPending}
+                opening={openTicket.isPending && openTicket.variables?.nodeId === node.id}
+                onOpen={(shell) =>
+                  openTicket.mutate({
+                    nodeId: node.id,
+                    ...INITIAL_SIZE,
+                    ...(shell ? { shell } : {}),
+                  })
+                }
+              />
+            ))}
           </>
         )}
       </CardContent>

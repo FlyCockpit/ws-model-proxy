@@ -16,7 +16,7 @@ use super::valid_id;
 use super::{OutboundFrame, TerminalRegistry, TerminalSession};
 use crate::protocol::frames::JobStatus;
 #[cfg(unix)]
-use crate::protocol::{frames::JobError, terminal_supported};
+use crate::protocol::{frames::JobError, operator_terminals_supported};
 use crate::runtimes::operator::{
     self as op, ConfirmKey, OperatorEvent, OperatorIds, OperatorScreen,
 };
@@ -237,7 +237,7 @@ impl TerminalRegistry {
             pending_step == step_id && pending_id != terminal_id
         });
         if self.shut_down
-            || !terminal_supported()
+            || !operator_terminals_supported()
             || self.operator_count() + self.operators.live() >= MAX_OPERATOR_TERMINALS
         {
             return Err(JobError::OperatorTerminalsDisabled);

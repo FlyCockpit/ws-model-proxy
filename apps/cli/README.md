@@ -138,6 +138,14 @@ passes the config and state paths to `wsmp run` itself. It also passes a log fil
 `%LOCALAPPDATA%\ws-model-proxy\logs\relay.log`, which rolls over at 10 MiB and keeps 4 older files.
 `wsmp service logs` reads that file. Node state is in `%LOCALAPPDATA%\ws-model-proxy` on Windows.
 
+**Windows terminals.** Browser terminals run on a Windows pseudoconsole (ConPTY, Windows 10 1809 or
+later), at Full control only. The browser picks the shell: PowerShell 7 (`pwsh`), Windows
+PowerShell, Command Prompt, or a WSL distribution, defaulting to the node's choice, which is pwsh,
+then Windows PowerShell, then Command Prompt (`wsmp config set-terminal-shell <id>` changes it). The
+shells are found when the relay starts. Each terminal runs in a job of its own, so closing it ends
+everything its shell started. Not on Windows yet: pasting images, and operator terminals for
+interactive runtime steps.
+
 **Linux: enable lingering.** A user service stops when you log out, and runtimes are started as
 transient user units, which need a user manager that outlives your sessions. Enable it once:
 
@@ -272,6 +280,7 @@ the relay does; it writes nothing and runs no definition command. Runtimes are d
 | `wsmp config set-human-terminal on\|off` | Allow browser terminals (the same setting `wsmp login` asks about). |
 | `wsmp config set-terminal-approval on\|off` | Require approval before a browser opens a terminal. |
 | `wsmp config set-max-terminals <1-32>` | Cap browser terminals open at once. |
+| `wsmp config set-terminal-shell <id>\|default` | Windows: the shell a browser terminal starts by default (`pwsh`, `powershell`, `cmd`, `wsl:<distro>`). |
 | `wsmp config set-file-tools-as-root on\|off` | Allow the file tools when wsmp runs as root. |
 | `wsmp terminal fingerprint` | This node's terminal identity, as browsers show it. |
 | `wsmp terminal approve <code>` / `approvals list\|revoke` | Manage approved browser identities. |

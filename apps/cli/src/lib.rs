@@ -38,6 +38,7 @@ pub mod runtime_store;
 pub mod runtimes;
 pub mod secrets;
 pub mod sessions;
+pub mod shells;
 pub mod shutdown;
 pub mod slug;
 pub mod startup;

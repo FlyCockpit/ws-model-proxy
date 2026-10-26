@@ -121,6 +121,9 @@ export const REFUSAL_REASONS = [
   "already_released",
   /** A release request for this node part already waits for a person. */
   "release_request_pending",
+  // Windows terminals.
+  /** A browser terminal named a shell the node did not advertise (or no longer does). */
+  "shell_unavailable",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

@@ -12,7 +12,7 @@
 //! std Child::kill; dropping the job closes its handles without waiting.
 
 use std::io;
-use std::process::{ChildStderr, ChildStdout, Command, ExitStatus};
+use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -80,6 +80,7 @@ impl JobTree {
 
 pub(crate) struct Child {
     job: JobTree,
+    pub(crate) stdin: Option<ChildStdin>,
     pub(crate) stdout: Option<ChildStdout>,
     pub(crate) stderr: Option<ChildStderr>,
     // Set before attempting the kill; a cleanup owner must retry even when
@@ -192,6 +193,11 @@ fn spawn_with(
     // Windows spawn/stdio only wrap std handles. Convert before any async I/O
     // can start so all reads stay synchronous and require no Tokio runtime.
     // On conversion errors the wrapper drops, closing the kill-on-close job.
+    let stdin = wrapped
+        .stdin()
+        .take()
+        .map(|pipe| pipe.into_owned_handle().map(ChildStdin::from))
+        .transpose()?;
     let stdout = wrapped
         .stdout()
         .take()
@@ -207,6 +213,7 @@ fn spawn_with(
             child: Arc::new(Mutex::new(wrapped)),
             pid,
         },
+        stdin,
         stdout,
         stderr,
         terminate_pending: false,

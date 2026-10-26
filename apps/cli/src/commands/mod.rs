@@ -10,6 +10,8 @@
 
 pub mod completions;
 pub mod config;
+#[cfg(windows)]
+pub mod conpty_host;
 pub mod hardware;
 pub mod login;
 pub mod logout;

@@ -213,6 +213,7 @@ function node(overrides: Record<string, unknown> = {}) {
     fabrics: [],
     gpus: [{ vendor: "nvidia", name: "GB10" }],
     secretNames: [],
+    terminalShells: [],
     ...overrides,
   };
 }

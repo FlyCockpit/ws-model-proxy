@@ -32,8 +32,25 @@ describe("terminal tickets", () => {
       kind: "open",
       nodeId: "node-1",
       terminalId: minted.terminalId,
+      shell: null,
     });
     expect(tickets.redeem({ ...owner, ticket: minted.ticket })).toBeNull();
+  });
+
+  it("carries an open ticket's shell, and never an attach ticket's", () => {
+    const { tickets } = store();
+    const minted = tickets.mint({ ...owner, nodeId: "node-1", shell: "wsl:Ubuntu" });
+    expect(tickets.redeem({ ...owner, ticket: minted.ticket })).toMatchObject({
+      kind: "open",
+      shell: "wsl:Ubuntu",
+    });
+    const attach = tickets.mint({
+      ...owner,
+      nodeId: "node-1",
+      shell: "cmd",
+      attach: { stepId: "step-1", terminalId: Buffer.alloc(16, 7).toString("base64url") },
+    });
+    expect(tickets.redeem({ ...owner, ticket: attach.ticket })).not.toHaveProperty("shell");
   });
 
   it("binds an attach ticket to its step and that step's operator terminal", () => {

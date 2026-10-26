@@ -1510,6 +1510,7 @@
       "command_too_large": "A command is too long after placeholders.",
       "not_enough_nodes": "Not enough eligible nodes are online.",
       "node_offline": "The node is offline.",
+      "shell_unavailable": "That shell is not available on the node any more. Pick another.",
       "upgrade_wsmp": "Upgrade wsmp on the node first.",
       "operator_terminals_unavailable": "The node cannot open operator terminals.",
       "not_enough_memory": "Not enough free memory on the node.",

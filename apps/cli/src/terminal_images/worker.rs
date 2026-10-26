@@ -277,6 +277,17 @@ impl ImageWorker {
         }
     }
 
+    /// Windows has no image worker yet (pasted paths are POSIX-quoted), so a
+    /// terminal reports images unsupported and the browser offers none.
+    #[cfg(not(unix))]
+    pub(crate) fn session(&self) -> ImageSession {
+        ImageSession {
+            id: 0,
+            alive: Arc::new(AtomicBool::new(true)),
+            worker_running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     pub(crate) fn submit(
         &self,
         session: &ImageSession,

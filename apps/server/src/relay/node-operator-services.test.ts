@@ -59,11 +59,13 @@ function relay() {
     userId: string;
     connectionGeneration: number;
     trust: "full" | "relay";
+    terminalShells: string[];
   } = {
     online: true,
     userId: "user-1",
     connectionGeneration: 3,
     trust: "full",
+    terminalShells: [],
   };
   const port = {
     sendToNode: vi.fn((nodeId: string, frame: ServerToNodeControlFrame, guard?: SendGuard) => {
@@ -86,6 +88,7 @@ function relay() {
             userId: session.userId,
             connectionGeneration: session.connectionGeneration,
             trust: session.trust,
+            terminalShells: session.terminalShells,
           }
         : null,
     ),
@@ -513,7 +516,7 @@ describe("node operator services: terminal tickets", () => {
     });
     expect(
       s.tickets.redeem({ userId: "user-1", sessionId: "session-1", ticket: ticket.ticket }),
-    ).toEqual({ kind: "open", nodeId: "node-1", terminalId: ticket.terminalId });
+    ).toEqual({ kind: "open", nodeId: "node-1", terminalId: ticket.terminalId, shell: null });
     s.session.trust = "relay";
     await expect(
       s.services.openTerminalTicket({
@@ -536,6 +539,29 @@ describe("node operator services: terminal tickets", () => {
     ).rejects.toMatchObject({ data: { reason: "node_offline" } });
     // Nothing about a terminal ticket goes to the node.
     expect(s.sent).toHaveLength(0);
+  });
+
+  it("binds only a shell the node advertised", async () => {
+    const s = setup();
+    const open = (shell: string) =>
+      s.services.openTerminalTicket({
+        userId: "user-1",
+        sessionId: "session-1",
+        nodeId: "node-1",
+        cols: 80,
+        rows: 24,
+        shell,
+      });
+    // A Unix node advertises none: no shell can be named.
+    await expect(open("cmd")).rejects.toMatchObject({ data: { reason: "shell_unavailable" } });
+    s.session.terminalShells = ["pwsh", "cmd", "wsl:Ubuntu"];
+    await expect(open("powershell")).rejects.toMatchObject({
+      data: { reason: "shell_unavailable" },
+    });
+    const ticket = await open("wsl:Ubuntu");
+    expect(
+      s.tickets.redeem({ userId: "user-1", sessionId: "session-1", ticket: ticket.ticket }),
+    ).toMatchObject({ kind: "open", shell: "wsl:Ubuntu" });
   });
 });
 

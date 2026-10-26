@@ -190,7 +190,7 @@ const RECENT_FINISHED_CAPACITY: usize = 256;
 /// cancelled, or rejected). Late `relay.request.body` chunks for these ids are
 /// expected and dropped silently; only ids that were *never* seen still earn the
 /// genuine "before request metadata" protocol error. Oldest ids are evicted once
-/// the ring is full â€” a client streaming body that far behind a finished
+/// the ring is full — a client streaming body that far behind a finished
 /// response is misbehaving and can take the protocol error.
 struct RecentlyFinished {
     order: VecDeque<String>,
@@ -1166,7 +1166,6 @@ fn run_relay_session(
             break Err(error);
         }
         let now = Instant::now();
-        #[cfg(unix)]
         if let Err(error) = send_outbound_frames(&mut socket, session.terminals.poll(now)) {
             break Err(error);
         }
@@ -1376,15 +1375,12 @@ where
                     let _ = worker.join.join();
                 }
             }
-            #[cfg(unix)]
             Ok(FromWorker::TerminalBytes { terminal_id, bytes }) => {
                 send_outbound_frames(socket, session.terminals.on_bytes(&terminal_id, &bytes))?;
             }
-            #[cfg(unix)]
             Ok(FromWorker::TerminalEof { terminal_id }) => {
                 send_outbound_frames(socket, session.terminals.on_eof(&terminal_id))?;
             }
-            #[cfg(unix)]
             Ok(FromWorker::TerminalWriteFailed { terminal_id }) => {
                 tracing::warn!(
                     terminal_id,
@@ -1573,7 +1569,7 @@ where
         ServerFrame::RelayCancel { request_id, reason } => {
             tracing::warn!(request_id, ?reason, "relay request cancelled");
             // Cancelled request: any body chunks still in flight are late, not
-            // premature â€” drop them silently rather than faulting them.
+            // premature — drop them silently rather than faulting them.
             session.recent_finished.record(&request_id);
             if let Some(worker) = session.workers.remove(&request_id) {
                 worker.cancellation.cancel();
@@ -1633,6 +1629,7 @@ where
             browser_public_key,
             browser_nonce,
             identity,
+            shell,
         } => {
             send_outbound_frames(
                 socket,
@@ -1647,6 +1644,7 @@ where
                         browser_public_key: &browser_public_key,
                         browser_nonce: &browser_nonce,
                         identity: identity.as_ref(),
+                        shell: shell.as_deref(),
                     },
                 ),
             )?;
@@ -1671,6 +1669,7 @@ where
                         browser_public_key: &browser_public_key,
                         browser_nonce: &browser_nonce,
                         identity: identity.as_ref(),
+                        shell: None,
                     },
                 ),
             )?;
@@ -2289,7 +2288,7 @@ where
         )?;
         return Ok(());
     };
-    // Â§4.8: only the routes this runtime's API, model type and definition
+    // §4.8: only the routes this runtime's API, model type and definition
     // name, checked on the path as sent, before any connection is opened.
     if !crate::runtimes::allowlist::allowed(&target.spec, &method, &path)
         && !crate::runtimes::allowlist::engine_description_allowed(
@@ -4145,7 +4144,7 @@ fn websocket_url(server_url: &str) -> Result<Url> {
     Ok(url)
 }
 
-/// The upstream URL for `request_path` on a runtime at `base_url` (Â§4.8):
+/// The upstream URL for `request_path` on a runtime at `base_url` (§4.8):
 /// API paths (`/v1/...`) join onto the base URL, whose API prefix replaces the
 /// leading `/v1`; engine routes (readiness, metrics reader, count route) join
 /// onto the origin. The result must stay on the base URL's origin.
@@ -4899,7 +4898,7 @@ mod tests {
     #[test]
     fn recently_finished_request_id_is_rejected_without_spawning() {
         // FIX 4: the server never reuses request ids, so a `relay.request` whose id
-        // sits in the recently-finished ring is a protocol violation â€” reject it
+        // sits in the recently-finished ring is a protocol violation — reject it
         // rather than spawning a fresh worker.
         let mut socket = sink_socket();
         let config = Config::default();

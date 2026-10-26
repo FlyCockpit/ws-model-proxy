@@ -1511,6 +1511,11 @@ pub enum ServerFrame {
         browser_nonce: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         identity: Option<TerminalIdentity>,
+        /// One of the `features.terminals.shells` ids this node advertised.
+        /// Unset: the node's default. Sent only to a node that advertised
+        /// shells.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shell: Option<String>,
     },
     #[serde(rename = "term.attach")]
     TermAttach {
@@ -1770,7 +1775,22 @@ impl NodeFrame {
     /// Cross-field rules serde cannot express.
     pub fn validate(&self) -> Result<(), FrameRuleError> {
         match self {
-            Self::Hello { trust, .. } | Self::NodeState { trust, .. } => trust.validate(),
+            Self::Hello {
+                trust, features, ..
+            }
+            | Self::NodeState { trust, features } => {
+                trust.validate()?;
+                let shells = &features.terminals.shells;
+                rule(
+                    shells.len() <= crate::shells::MAX_SHELLS
+                        && shells.iter().all(|id| crate::shells::valid_id(id))
+                        && shells
+                            .iter()
+                            .enumerate()
+                            .all(|(index, id)| !shells[..index].contains(id)),
+                    "terminal shells are at most 16 distinct pwsh, powershell, cmd or wsl:<name> ids",
+                )
+            }
             Self::ExecStatus(status) => status.validate(),
             Self::SecretResult {
                 name,
@@ -1873,6 +1893,12 @@ impl ServerFrame {
         match self {
             Self::RuntimeJob(job) => job.validate(),
             Self::SecretSet(secret) => secret.validate(),
+            Self::TermOpen {
+                shell: Some(shell), ..
+            } => rule(
+                crate::shells::valid_id(shell),
+                "a terminal shell is pwsh, powershell, cmd or wsl:<name>",
+            ),
             // `relayIdSchema`: the answer echoes it, so it must stay small.
             Self::RuntimeDetect { id } => rule(
                 !id.trim().is_empty() && id.encode_utf16().count() <= 128,

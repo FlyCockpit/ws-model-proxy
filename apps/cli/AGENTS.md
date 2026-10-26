@@ -26,7 +26,7 @@ The Rust command-line relay client for WS Model Proxy. The `wsmp` CLI enrolls a 
 | `src/exit.rs` | Stable process exit codes. |
 | `tests/cli.rs` | Black-box tests that run the built binary. |
 | `xtask/` | CLI workspace automation: `sync-docs`. |
-| `wsmp-windows/` | The audited Windows FFI (control-pipe DACL and peer checks, the relay job). The only place `unsafe` is allowed. |
+| `wsmp-windows/` | The audited Windows FFI (control-pipe DACL and peer checks, the relay job, the terminal pseudoconsole). The only place `unsafe` is allowed. |
 | `docs/` | CLI-specific error handling and release notes. |
 | `tap/` | Notes for publishing the generated Homebrew formula. |
 

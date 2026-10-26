@@ -7,12 +7,18 @@
 //!   connected client's process id and user, and the pipe's owner as a
 //!   client sees it;
 //! - the relay job: a job object the relay joins so that it can tell whether
-//!   a process descends from it.
+//!   a process descends from it;
+//! - browser terminals: a pseudoconsole (ConPTY) and a program started on it.
 //!
 //! On other platforms the crate is empty.
 
 #[cfg(windows)]
+mod conpty;
+#[cfg(windows)]
 mod imp;
+
+#[cfg(windows)]
+pub use conpty::{ConPty, ConsoleChild, PseudoConsole};
 
 #[cfg(windows)]
 pub use imp::{

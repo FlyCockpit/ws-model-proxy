@@ -27,7 +27,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::core::BOOL;
 
-fn check(ok: BOOL) -> io::Result<()> {
+pub(crate) fn check(ok: BOOL) -> io::Result<()> {
     if ok == 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -35,7 +35,7 @@ fn check(ok: BOOL) -> io::Result<()> {
     }
 }
 
-fn raw(handle: BorrowedHandle<'_>) -> HANDLE {
+pub(crate) fn raw(handle: BorrowedHandle<'_>) -> HANDLE {
     handle.as_raw_handle()
 }
 
@@ -52,7 +52,7 @@ fn current_thread() -> HANDLE {
 }
 
 /// Takes ownership of a handle a Win32 call just returned (null on failure).
-fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
+pub(crate) fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
     if handle.is_null() {
         return Err(io::Error::last_os_error());
     }
@@ -126,7 +126,7 @@ impl UserSid {
         unsafe { EqualSid(self.sid(), other) != 0 }
     }
 
-    /// The `S-1-5-21-â€¦` form, for a security descriptor string.
+    /// The `S-1-5-21-…` form, for a security descriptor string.
     fn to_sddl(&self) -> io::Result<String> {
         let mut text: *mut u16 = null_mut();
         // SAFETY: a valid SID; `text` is a valid out pointer that receives a

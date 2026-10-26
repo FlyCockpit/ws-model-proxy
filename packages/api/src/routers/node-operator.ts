@@ -432,6 +432,7 @@ const terminals = {
       nodeId: node.id,
       cols: input.cols,
       rows: input.rows,
+      ...(input.shell ? { shell: input.shell } : {}),
     });
     // Audited as `opened` when the terminal socket redeems the ticket and the node is asked to
     // open it (apps/server relay/terminal-websocket.ts), not here: a ticket may go unused.

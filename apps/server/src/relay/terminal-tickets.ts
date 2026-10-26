@@ -27,11 +27,13 @@ type TicketEntry = {
   terminalId: string;
   /** Set for an attach ticket: the interactive step whose operator terminal it names. */
   stepId: string | null;
+  /** An open ticket's shell (a Windows node's shell id, checked at mint); null: the default. */
+  shell: string | null;
   expiresAt: number;
 };
 
 export type RedeemedTerminalTicket =
-  | { kind: "open"; nodeId: string; terminalId: string }
+  | { kind: "open"; nodeId: string; terminalId: string; shell: string | null }
   | { kind: "attach"; nodeId: string; terminalId: string; stepId: string };
 
 export type MintedTerminalTicket = { ticket: string; terminalId: string; expiresAt: Date };
@@ -56,6 +58,8 @@ export class TerminalTicketStore {
     nodeId: string;
     /** An attach ticket: the step and its operator terminal (otherwise a new id is minted). */
     attach?: { stepId: string; terminalId: string };
+    /** An open ticket's shell, already checked against the node's advertised shells. */
+    shell?: string | null;
   }): MintedTerminalTicket {
     const now = this.now();
     this.prune(now);
@@ -73,6 +77,7 @@ export class TerminalTicketStore {
       nodeId: input.nodeId,
       terminalId,
       stepId: input.attach?.stepId ?? null,
+      shell: input.attach ? null : (input.shell ?? null),
       expiresAt,
     });
     return { ticket, terminalId, expiresAt: new Date(expiresAt) };
@@ -95,7 +100,7 @@ export class TerminalTicketStore {
     if (entry.expiresAt <= this.now()) return null;
     if (entry.userId !== input.userId || entry.sessionId !== input.sessionId) return null;
     return entry.stepId === null
-      ? { kind: "open", nodeId: entry.nodeId, terminalId: entry.terminalId }
+      ? { kind: "open", nodeId: entry.nodeId, terminalId: entry.terminalId, shell: entry.shell }
       : {
           kind: "attach",
           nodeId: entry.nodeId,

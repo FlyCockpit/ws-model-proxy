@@ -85,4 +85,10 @@ pub enum Command {
 
     /// List or apply crash-safe file recovery from abandoned `.wsmp-recover-*` directories.
     Recover(crate::commands::recover::Args),
+
+    /// Internal: hosts one Windows browser terminal's console (started by
+    /// the relay).
+    #[cfg(windows)]
+    #[command(name = "__conpty-host", hide = true)]
+    ConptyHost(crate::commands::conpty_host::Args),
 }

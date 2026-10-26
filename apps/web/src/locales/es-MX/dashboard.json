@@ -1510,6 +1510,7 @@
       "command_too_large": "Un comando es demasiado largo tras los marcadores.",
       "not_enough_nodes": "No hay suficientes nodos elegibles en línea.",
       "node_offline": "El nodo está desconectado.",
+      "shell_unavailable": "Esa shell ya no está disponible en el nodo. Elige otra.",
       "upgrade_wsmp": "Primero actualiza wsmp en el nodo.",
       "operator_terminals_unavailable": "El nodo no puede abrir terminales de operador.",
       "not_enough_memory": "No hay suficiente memoria libre en el nodo.",

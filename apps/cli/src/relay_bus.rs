@@ -14,18 +14,15 @@ pub(crate) enum FromWorker {
         frame: WsFrame,
     },
     Finished(String),
-    #[cfg(unix)]
     TerminalBytes {
         terminal_id: String,
         bytes: Vec<u8>,
     },
-    #[cfg(unix)]
     TerminalEof {
         terminal_id: String,
     },
     /// A terminal's input writer thread hit a write error. The main loop
     /// closes the terminal.
-    #[cfg(unix)]
     TerminalWriteFailed {
         terminal_id: String,
     },

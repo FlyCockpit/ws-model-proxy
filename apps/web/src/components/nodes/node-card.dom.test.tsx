@@ -51,6 +51,7 @@ function node(overrides: Partial<NodeSummary> = {}): NodeSummary {
     fabrics: [],
     gpus: [],
     secretNames: [],
+    terminalShells: [],
     ...overrides,
   };
 }

@@ -872,6 +872,16 @@ export type NodeDeclaredHardware = z.infer<typeof nodeDeclaredHardwareSchema>;
 
 // ── Node features (hello / node.state; evidence only, never a setting) ──
 
+/**
+ * A shell a Windows node's browser terminal can start: PowerShell 7, Windows PowerShell,
+ * Command Prompt, or a WSL distribution. The node maps the id to a program it found; no path
+ * ever crosses the relay.
+ */
+export const terminalShellIdSchema = z
+  .string()
+  .regex(/^(?:pwsh|powershell|cmd|wsl:[A-Za-z0-9._-]{1,64})$/);
+export const TERMINAL_SHELLS_MAX = 16;
+
 export const nodeFeaturesSchema = z
   .object({
     terminals: z
@@ -879,6 +889,12 @@ export const nodeFeaturesSchema = z
         supported: z.boolean(),
         max: z.number().int().min(0).max(64),
         approvalRequired: z.boolean(),
+        /** The shells a `term.open` may name, the node's default first. Absent on Unix nodes. */
+        shells: z
+          .array(terminalShellIdSchema)
+          .max(TERMINAL_SHELLS_MAX)
+          .refine((ids) => new Set(ids).size === ids.length, "terminal shells are distinct")
+          .optional(),
       })
       .strict(),
     operatorTerminals: z.boolean(),

@@ -81,6 +81,11 @@ enum Sub {
     /// Let the MCP node file tools run when wsmp itself runs as root (they
     /// refuse `unsupported` by default). Takes effect the next time wsmp starts.
     SetFileToolsAsRoot { state: Switch },
+    /// Windows: the shell a browser terminal starts unless the browser picks
+    /// another (`pwsh`, `powershell`, `cmd` or `wsl:<distribution>`).
+    /// `default` goes back to pwsh, then powershell, then cmd. Takes effect
+    /// the next time wsmp starts.
+    SetTerminalShell { shell: String },
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -111,6 +116,7 @@ impl Sub {
             Self::SetTerminalApproval { .. } => "wsmp config set-terminal-approval",
             Self::SetMaxTerminals { .. } => "wsmp config set-max-terminals",
             Self::SetFileToolsAsRoot { .. } => "wsmp config set-file-tools-as-root",
+            Self::SetTerminalShell { .. } => "wsmp config set-terminal-shell",
         })
     }
 }
@@ -149,6 +155,14 @@ pub fn run(args: &Args) -> Result<()> {
             shown["fileRoots"] = serde_json::to_value(&roots)?;
             shown["fileRootsSource"] = serde_json::to_value(source)?;
             shown["maxTerminals"] = cfg.effective_max_terminals().into();
+            if cfg!(windows) {
+                // What a browser can pick now, the default first.
+                shown["terminalShells"] = crate::shells::discover(cfg.terminal_shell.as_deref())
+                    .into_iter()
+                    .map(|shell| shell.id)
+                    .collect::<Vec<_>>()
+                    .into();
+            }
             // The origin the relay hello signs (pinned, else the server URL's).
             if cfg.server_url.is_some() || cfg.public_origin.is_some() {
                 shown["helloOrigin"] = match cfg.hello_origin() {
@@ -312,6 +326,40 @@ pub fn run(args: &Args) -> Result<()> {
             set_flag(args.json, "allowFileToolsAsRoot", state.enabled(), |cfg| {
                 cfg.allow_file_tools_as_root = state.enabled();
             })?;
+        }
+        Sub::SetTerminalShell { shell } => {
+            if !cfg!(windows) {
+                anyhow::bail!("terminals run the login shell (`$SHELL`) on this system");
+            }
+            let value = (shell != "default").then(|| shell.clone());
+            if let Some(id) = &value {
+                if !crate::shells::valid_id(id) {
+                    anyhow::bail!(
+                        "`{id}` is not a shell; use `pwsh`, `powershell`, `cmd`, `wsl:<distribution>` or `default`"
+                    );
+                }
+                if !crate::shells::discover(None)
+                    .iter()
+                    .any(|found| &found.id == id)
+                {
+                    output::diagnostic(format!(
+                        "warning: `{id}` is not installed now; terminals use the default until it is"
+                    ))?;
+                }
+            }
+            Config::update(false, |cfg| {
+                cfg.terminal_shell = value.clone();
+                Ok(())
+            })?;
+            if args.json {
+                output::json(&serde_json::json!({"key": "terminalShell", "value": value}))?;
+            } else {
+                match &value {
+                    Some(id) => output::line(format!("set `terminalShell` to `{id}`"))?,
+                    None => output::line("cleared `terminalShell`")?,
+                }
+                output::line("Restart wsmp to apply.")?;
+            }
         }
     }
     Ok(())

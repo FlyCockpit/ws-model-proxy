@@ -13,6 +13,7 @@ import {
   nodeSecretNameSchema,
   portRangeSchema,
   runtimeLabelsSchema,
+  terminalShellIdSchema,
 } from "../lib/runtime-spec";
 import {
   ACTOR,
@@ -181,6 +182,11 @@ export const nodeListRowSchema = nodeSummarySchema
         .strict(),
     ),
     secretNames: z.array(z.string()),
+    /**
+     * The shells a browser terminal on this node can start, its default first (Windows nodes;
+     * empty on Unix nodes, which run the login shell). From the node's last hello.
+     */
+    terminalShells: z.array(z.string()),
   })
   .strict();
 
@@ -725,6 +731,8 @@ export const nodesContract = {
           nodeId: idSchema,
           cols: z.number().int().min(1).max(1_000),
           rows: z.number().int().min(1).max(1_000),
+          /** One of the node's `terminalShells`; omitted for the node's default. */
+          shell: terminalShellIdSchema.optional(),
         })
         .strict(),
       z.object({ ticket: z.string(), terminalId: z.string(), expiresAt: isoDateSchema }).strict(),

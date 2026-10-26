@@ -21,6 +21,14 @@
   "nodesUnavailable": "No se pudieron cargar tus nodos.",
   "offline": "Desconectado",
   "relayOnly": "Solo retransmisión",
+  "shell": {
+    "label": "Shell para {{node}}",
+    "default": "{{shell}} (predeterminada)",
+    "pwsh": "PowerShell 7",
+    "powershell": "Windows PowerShell",
+    "cmd": "Símbolo del sistema",
+    "wsl": "WSL: {{distro}}"
+  },
   "queuedTitle": "Comandos en espera para ti",
   "queuedDescription": "Un agente te pidió ejecutarlos. Ejecutar abre una terminal con el comando escrito; tú presionas Enter.",
   "queuedEmpty": "Nada te está esperando.",

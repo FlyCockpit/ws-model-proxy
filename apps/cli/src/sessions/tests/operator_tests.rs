@@ -646,6 +646,7 @@ fn queue_shell_approval(terminals: &mut TerminalRegistry, dir: &Path) {
             browser_public_key: browser.public_b64url(),
             browser_nonce: &nonce,
             identity: Some(&identity),
+            shell: None,
         },
     );
     assert!(matches!(

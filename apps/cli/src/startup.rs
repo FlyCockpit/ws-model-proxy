@@ -31,6 +31,9 @@ pub struct TerminalStartup {
     file_roots_source: crate::config::FileRootsSource,
     /// `config.json` `runtimeHosts`, re-read on hot reload.
     runtime_hosts: std::sync::Mutex<Vec<String>>,
+    /// The shells a browser terminal may start, the default first (none on
+    /// Unix: the login shell). Found once, as the relay starts.
+    shells: Vec<crate::shells::Shell>,
 }
 
 impl TerminalStartup {
@@ -71,6 +74,7 @@ impl TerminalStartup {
             file_roots,
             file_roots_source,
             runtime_hosts: std::sync::Mutex::new(config.runtime_hosts.clone()),
+            shells: crate::shells::discover(config.terminal_shell.as_deref()),
         }
     }
 
@@ -142,6 +146,16 @@ impl TerminalStartup {
         self.require_terminal_approval
     }
 
+    /// The shell a browser terminal starts: `id`, or the default when `None`.
+    /// `None` for an id this node did not advertise, and on Unix, where
+    /// terminals run the login shell.
+    pub fn shell(&self, id: Option<&str>) -> Option<&crate::shells::Shell> {
+        match id {
+            Some(id) => self.shells.iter().find(|shell| shell.id == id),
+            None => self.shells.first(),
+        }
+    }
+
     /// Browser terminals this machine keeps open at once (`maxTerminals`).
     pub fn max_terminals(&self) -> usize {
         self.max_terminals
@@ -163,10 +177,12 @@ impl TerminalStartup {
                 supported: crate::protocol::terminal_supported() && self.allow_human_terminal,
                 max: u8::try_from(self.max_terminals).unwrap_or(u8::MAX),
                 approval_required: self.require_terminal_approval,
+                shells: self.shells.iter().map(|shell| shell.id.clone()).collect(),
             },
             // Interactive runtime steps run in operator terminals wherever a
-            // PTY can be offered, at every trust level (spec §4.7).
-            operator_terminals: crate::protocol::terminal_supported(),
+            // PTY can be offered, at every trust level (spec §4.7). Windows
+            // has none yet: their `sudo -k` guard has no Windows equivalent.
+            operator_terminals: crate::protocol::operator_terminals_supported(),
             files: FileFeatures {
                 roots: self.file_roots_configured.then(|| {
                     self.file_roots
@@ -239,7 +255,16 @@ mod tests {
         config.trust = Some(TrustValue::Relay);
         config.file_roots.clear();
         let features = startup.features();
-        assert_eq!(features.terminals.supported, cfg!(unix));
+        assert!(features.terminals.supported);
+        // Windows names its shells, the default first; Unix runs the login
+        // shell and names none.
+        assert_eq!(features.terminals.shells.is_empty(), cfg!(unix));
+        if cfg!(windows) {
+            let default = startup.shell(None).expect("a default shell");
+            assert_eq!(features.terminals.shells[0], default.id);
+            assert!(startup.shell(Some("cmd")).is_some());
+        }
+        assert!(startup.shell(Some("not-a-shell")).is_none());
         assert!(features.terminals.approval_required);
         assert_eq!(features.terminals.max, 4);
         assert_eq!(

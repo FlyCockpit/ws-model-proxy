@@ -38,14 +38,12 @@
 use crate::job_tree::Child as ExecChild;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Read;
-#[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 /// Registered with the subreaper, so its scan never reaps the command.
 type ExecChild = crate::subreaper::Owned<std::process::Child>;
 use std::sync::Arc;
-#[cfg(unix)]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
@@ -74,26 +72,23 @@ pub(crate) use operator::operator_base_env;
 /// Attached viewers plus pending approvals, per terminal (protocol 2.5).
 const MAX_VIEWERS: usize = 8;
 const MAX_EXECS: usize = 8;
-#[cfg(unix)]
 const SCROLLBACK_LIMIT: usize = 256 * 1024;
 const READ_CHUNK: usize = 8 * 1024;
 const SEAL_CHUNK: usize = 16 * 1024;
-#[cfg(unix)]
 const DEFAULT_IDLE: Duration = Duration::from_secs(15 * 60);
 /// A node command's longest lifetime until the node definition says otherwise.
 pub(crate) const DEFAULT_COMMAND_MAX: Duration = Duration::from_millis(NODE_COMMAND_MAX_MS);
-#[cfg(unix)]
 const PENDING_TTL: Duration = Duration::from_secs(2 * 60);
 /// How often attached 2.5 viewers are re-checked against the approvals file.
-#[cfg(unix)]
 const APPROVAL_RECHECK: Duration = Duration::from_secs(5);
 const SEND_WAIT: Duration = Duration::from_millis(200);
-#[cfg(unix)]
 const READ_POLL: Duration = Duration::from_millis(200);
 /// Pending (queued plus in-flight) input bytes per terminal. Input beyond this
 /// is dropped rather than blocking the relay loop.
-#[cfg(unix)]
 const INPUT_QUEUE_LIMIT: usize = 256 * 1024;
+/// Room past [`INPUT_QUEUE_LIMIT`] for Windows resize frames.
+#[cfg(windows)]
+const CONTROL_SLACK: usize = 4 * 1024;
 /// Kill rounds on terminal close. Session members can fork while they are
 /// being killed, so the session is re-scanned until it is empty.
 #[cfg(unix)]
@@ -105,7 +100,6 @@ const EXEC_OUTPUT_DRAIN: Duration = Duration::from_millis(500);
 /// After the shell exits, keep the terminal until the PTY reports EOF, or this
 /// long, whichever comes first. A background or disowned job that still holds
 /// the PTY must not keep a dead terminal in its slot.
-#[cfg(unix)]
 const TERMINAL_OUTPUT_DRAIN: Duration = Duration::from_millis(500);
 /// Map key for a handshake that names no viewer. Never a valid wire viewer id.
 /// Every accepted handshake carries a valid id, so this is only a fallback.
@@ -126,7 +120,6 @@ const REASON_ALREADY_OPEN: &str = "already_open";
 const REASON_SPAWN_FAILED: &str = "spawn_failed";
 const REASON_BAD_HANDSHAKE: &str = "bad_handshake";
 const REASON_BAD_FRAME: &str = "bad_frame";
-#[cfg(unix)]
 const REASON_EXPIRED: &str = "expired";
 #[allow(clippy::large_enum_variant)] // `NodeFrame` carries the telemetry shapes.
 pub(crate) enum OutboundFrame {
@@ -144,6 +137,8 @@ pub(crate) struct TermHandshake<'a> {
     pub browser_public_key: &'a str,
     pub browser_nonce: &'a str,
     pub identity: Option<&'a TerminalIdentity>,
+    /// A shell id from `features.terminals.shells`; `None` for the default.
+    pub shell: Option<&'a str>,
 }
 
 enum Incoming {
@@ -181,7 +176,6 @@ fn terminal_block_reason(
     None
 }
 
-#[cfg(unix)]
 fn push_scrollback(buf: &mut VecDeque<u8>, bytes: &[u8]) {
     buf.extend(bytes);
     let overflow = buf.len().saturating_sub(SCROLLBACK_LIMIT);
@@ -387,7 +381,6 @@ fn approval_code_for_identity(state_dir: Option<&Path>, identity_raw: &[u8; 65])
 
 /// `false` only when the approvals file positively no longer maps this
 /// identity's code to it. A read error keeps the viewer.
-#[cfg(unix)]
 fn identity_still_approved(state_dir: &Path, identity_raw: &[u8; 65]) -> bool {
     let code = terminal_crypto::approval_code(identity_raw);
     match approved_public_key(state_dir, &code) {
@@ -443,6 +436,7 @@ struct PreparedHandshake {
     rows: u16,
     browser_public: [u8; 65],
     browser_nonce: [u8; 16],
+    shell: Option<String>,
 }
 
 fn handshake_rejected(handshake: &TermHandshake<'_>, reason: &str) -> Box<OutboundFrame> {
@@ -491,6 +485,7 @@ fn decode_browser_handshake(
         rows,
         browser_public,
         browser_nonce,
+        shell: handshake.shell.map(str::to_string),
     })
 }
 
@@ -513,6 +508,11 @@ fn prepare_handshake(
         startup.max_terminals(),
     ) {
         return Err(handshake_rejected(handshake, reason));
+    }
+    // Only a shell this node advertised; a node that advertised none (Unix)
+    // takes none.
+    if handshake.shell.is_some() && startup.shell(handshake.shell).is_none() {
+        return Err(handshake_rejected(handshake, REASON_BAD_HANDSHAKE));
     }
     decode_browser_handshake(handshake)
 }
@@ -879,13 +879,11 @@ fn kill_live_children(select: impl Fn(&LiveChild) -> bool) {
 }
 
 /// Browser input waiting for a terminal's writer thread.
-#[cfg(unix)]
 struct InputQueue {
     state: Mutex<InputState>,
     ready: Condvar,
 }
 
-#[cfg(unix)]
 #[derive(Default)]
 struct InputState {
     chunks: VecDeque<Vec<u8>>,
@@ -895,7 +893,6 @@ struct InputState {
     failed: bool,
 }
 
-#[cfg(unix)]
 impl InputQueue {
     fn new() -> Self {
         Self {
@@ -944,6 +941,25 @@ impl InputQueue {
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
+    }
+
+    /// A resize for the Windows helper. Never dropped while input fits,
+    /// since a lost resize leaves the console the wrong size; a writer stuck
+    /// far behind drops it rather than queue without bound.
+    #[cfg(windows)]
+    fn push_control(&self, bytes: Vec<u8>) -> std::io::Result<()> {
+        let mut state = self.lock();
+        if state.failed || state.closed {
+            return Err(std::io::Error::other("terminal input is closed"));
+        }
+        if state.pending > INPUT_QUEUE_LIMIT + CONTROL_SLACK {
+            return Ok(());
+        }
+        state.pending += bytes.len();
+        state.chunks.push_back(bytes);
+        drop(state);
+        self.ready.notify_one();
+        Ok(())
     }
 
     fn written(&self, count: usize) {
@@ -1072,6 +1088,114 @@ fn shutdown_pty(mut runtime: PtyRuntime) -> (Option<i32>, Option<i32>) {
     status
 }
 
+#[cfg(unix)]
+impl PtyRuntime {
+    /// The shell's exit status once it has exited (reaping it).
+    fn reap(&mut self) -> Option<(Option<i32>, Option<i32>)> {
+        let (code, signal) = reap_pid(self.pid);
+        (code.is_some() || signal.is_some()).then_some((code, signal))
+    }
+
+    /// Queues input for the writer thread. `Ok(false)`: the queue is full.
+    fn push_input(&self, bytes: Vec<u8>) -> std::io::Result<bool> {
+        self.input.push(bytes)
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+        self.master
+            .resize(portable_pty::PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    }
+}
+
+/// A Windows terminal: the `wsmp __conpty-host` helper, which owns the
+/// pseudoconsole and the shell, in a kill-on-close job of its own.
+#[cfg(windows)]
+struct PtyRuntime {
+    /// Ending its job ends the helper, the shell and all they started.
+    child: crate::job_tree::Child,
+    input: Arc<InputQueue>,
+    writer: Option<JoinHandle<()>>,
+    reader: Option<JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+    /// As on Unix: the shell's status and when `poll` saw it exit.
+    exited: Option<(Option<i32>, Option<i32>, Instant)>,
+    /// Lets a forced shutdown end the job from another thread.
+    _tracked: LiveChildGuard,
+}
+
+#[cfg(windows)]
+impl PtyRuntime {
+    /// The shell's exit code once it has exited: the helper exits with it.
+    fn reap(&mut self) -> Option<(Option<i32>, Option<i32>)> {
+        self.child.try_wait().ok().flatten().map(status_parts)
+    }
+
+    /// Queues input for the helper, framed. `Ok(false)`: the queue is full.
+    fn push_input(&self, bytes: Vec<u8>) -> std::io::Result<bool> {
+        // An empty write has nothing to frame.
+        if bytes.is_empty() {
+            return Ok(true);
+        }
+        self.input
+            .push(crate::commands::conpty_host::input_frame(&bytes))
+    }
+
+    /// The helper resizes its console between input frames, in order.
+    fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+        self.input
+            .push_control(crate::commands::conpty_host::resize_frame(cols, rows))
+    }
+}
+
+#[cfg(windows)]
+fn shutdown_pty(mut runtime: PtyRuntime) -> (Option<i32>, Option<i32>) {
+    runtime.stop.store(true, Ordering::SeqCst);
+    runtime.input.close();
+    let exited = runtime.exited.map(|(code, signal, _)| (code, signal));
+    // Ending the job breaks both pipes, so neither thread stays blocked.
+    // A failure here leaves the kill to the child's drop, which retries.
+    let _ = runtime
+        .child
+        .ensure_terminated(Instant::now() + Duration::from_millis(200));
+    drop(runtime.writer.take());
+    drop(runtime.reader.take());
+    exited.unwrap_or((None, None))
+}
+
+/// The per-terminal writer thread on Windows: input and resize frames reach
+/// the helper's stdin in order. A write blocks while the shell is not
+/// reading; closing the terminal ends the job, which breaks the pipe.
+#[cfg(windows)]
+fn pump_input(
+    mut writer: std::process::ChildStdin,
+    input: Arc<InputQueue>,
+    tx: SyncSender<FromWorker>,
+    stop: Arc<AtomicBool>,
+    terminal_id: String,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        while let Some(chunk) = input.next(&stop) {
+            let result = writer.write_all(&chunk).and_then(|()| writer.flush());
+            input.written(chunk.len());
+            if let Err(error) = result {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                tracing::debug!(error = %error, terminal_id, "terminal input write failed");
+                input.fail();
+                send_note(&tx, FromWorker::TerminalWriteFailed { terminal_id }, &stop);
+                return;
+            }
+        }
+    })
+}
+
 /// Best-effort wipe of key material. No `unsafe` and no extra crates, so this
 /// is an overwrite the optimizer is discouraged (not forbidden) from removing.
 fn wipe(bytes: &mut [u8]) {
@@ -1178,7 +1302,6 @@ struct TerminalSession {
     /// Set when the viewer set becomes empty; drives the idle close.
     detached_at: Option<Instant>,
     scrollback: VecDeque<u8>,
-    #[cfg(unix)]
     pty: Option<PtyRuntime>,
     /// Set iff this is the operator terminal of an interactive runtime step
     /// (`operator`): no PTY until a person accepts on the confirm screen.
@@ -1189,10 +1312,7 @@ impl TerminalSession {
     /// Whether viewer keystrokes may reach the PTY now: not once the shell
     /// has exited.
     fn accepts_input(&self) -> bool {
-        #[cfg(unix)]
-        return self.pty.as_ref().is_some_and(|pty| pty.exited.is_none());
-        #[cfg(not(unix))]
-        false
+        self.pty.as_ref().is_some_and(|pty| pty.exited.is_none())
     }
 
     /// One v2 frame under a viewer's pairwise CLI->browser key.
@@ -1258,7 +1378,6 @@ impl TerminalSession {
         }
     }
 
-    #[cfg(unix)]
     fn broadcast_data(&mut self, terminal_id: &str, data: &[u8]) -> Vec<OutboundFrame> {
         data.chunks(SEAL_CHUNK)
             .filter(|chunk| !chunk.is_empty())
@@ -1380,9 +1499,9 @@ struct PendingTerminal {
     browser_nonce: [u8; 16],
     cli_nonce: [u8; 16],
     identity: [u8; 65],
-    #[cfg(unix)]
     created: Instant,
     attach: bool,
+    shell: Option<String>,
 }
 
 /// `(terminalId, viewerId)`.
@@ -1404,16 +1523,13 @@ pub(crate) struct TerminalRegistry {
     image_pending: BTreeMap<(String, String), crate::terminal_images::ImagePending>,
     image_worker: Arc<crate::terminal_images::ImageWorker>,
     pending: BTreeMap<PendingKey, PendingTerminal>,
-    #[cfg(unix)]
     tx: SyncSender<FromWorker>,
-    #[cfg(unix)]
     idle_limit: Duration,
     /// The state dir from the last successful `term.auth`, for approval re-checks.
     state_dir: Option<PathBuf>,
-    #[cfg(unix)]
     next_approval_check: Option<Instant>,
     shut_down: bool,
-    #[cfg(unix)]
+    /// A test's shell in place of the login shell or the node's default.
     shell: Option<(String, Vec<String>)>,
     /// Operator terminals submitted to a runner thread and not yet opened, and
     /// every operator terminal id this session took (ids are never reused).
@@ -1443,23 +1559,16 @@ impl TerminalRegistry {
         tx: SyncSender<FromWorker>,
         image_worker: Arc<crate::terminal_images::ImageWorker>,
     ) -> Self {
-        // Windows spawns no PTY, so no worker thread needs the channel.
-        #[cfg(not(unix))]
-        drop(tx);
         Self {
             sessions: BTreeMap::new(),
             image_pending: BTreeMap::new(),
             image_worker,
             pending: BTreeMap::new(),
-            #[cfg(unix)]
             tx,
-            #[cfg(unix)]
             idle_limit: DEFAULT_IDLE,
             state_dir: None,
-            #[cfg(unix)]
             next_approval_check: None,
             shut_down: false,
-            #[cfg(unix)]
             shell: None,
             operators: operator::OperatorBook::default(),
         }
@@ -1474,7 +1583,7 @@ impl TerminalRegistry {
     }
 
     /// A registry with a test shell.
-    #[cfg(all(unix, test))]
+    #[cfg(test)]
     fn with_shell(
         tx: SyncSender<FromWorker>,
         idle_limit: Duration,
@@ -1539,23 +1648,14 @@ impl TerminalRegistry {
         if startup.require_terminal_approval() {
             return self.queue_pending(state_dir, &handshake, prepared, false);
         }
-        #[cfg(not(unix))]
-        {
-            let _ = prepared;
-            vec![*handshake_rejected(&handshake, REASON_UNSUPPORTED)]
-        }
-        #[cfg(unix)]
-        {
-            let cli_nonce = match fresh_nonce(&handshake) {
-                Ok(nonce) => nonce,
-                Err(frame) => return vec![*frame],
-            };
-            self.open_unix(startup, &handshake, prepared, cli_nonce, None)
-        }
+        let cli_nonce = match fresh_nonce(&handshake) {
+            Ok(nonce) => nonce,
+            Err(frame) => return vec![*frame],
+        };
+        self.open_shell(startup, &handshake, prepared, cli_nonce, None)
     }
 
-    #[cfg(unix)]
-    fn open_unix(
+    fn open_shell(
         &mut self,
         startup: &TerminalStartup,
         handshake: &TermHandshake<'_>,
@@ -1608,7 +1708,9 @@ impl TerminalRegistry {
             }
         };
         let env = terminal_env();
-        let (program, args) = self.shell.clone().unwrap_or_else(child_env::login_shell);
+        let Some((program, args)) = self.shell_command(startup, prepared.shell.as_deref()) else {
+            return vec![*handshake_rejected(handshake, REASON_BAD_HANDSHAKE)];
+        };
         let pty = match spawn_pty(
             &program,
             &args,
@@ -1658,6 +1760,22 @@ impl TerminalRegistry {
         }
         self.sessions.insert(terminal_id.to_string(), session);
         frames
+    }
+
+    /// The program and arguments a browser terminal starts: `shell` (an id
+    /// this node advertised), or a test's shell, or the default: the login
+    /// shell on Unix, the node's default shell on Windows.
+    fn shell_command(
+        &self,
+        startup: &TerminalStartup,
+        shell: Option<&str>,
+    ) -> Option<(std::ffi::OsString, Vec<String>)> {
+        if shell.is_none()
+            && let Some((program, args)) = self.shell.clone()
+        {
+            return Some((program.into(), args));
+        }
+        platform_shell(startup, shell)
     }
 
     pub(crate) fn attach(
@@ -1787,6 +1905,7 @@ impl TerminalRegistry {
             rows: pending.rows,
             browser_public: pending.browser_public,
             browser_nonce: pending.browser_nonce,
+            shell: pending.shell,
         };
         let handshake = TermHandshake {
             terminal_id,
@@ -1796,6 +1915,7 @@ impl TerminalRegistry {
             browser_public_key: "",
             browser_nonce: "",
             identity: None,
+            shell: None,
         };
         if pending.attach {
             if !self.sessions.contains_key(terminal_id) {
@@ -1809,20 +1929,13 @@ impl TerminalRegistry {
                 Some(pending.identity),
             );
         }
-        #[cfg(not(unix))]
-        {
-            vec![*handshake_rejected(&handshake, REASON_UNSUPPORTED)]
-        }
-        #[cfg(unix)]
-        {
-            self.open_unix(
-                startup,
-                &handshake,
-                prepared,
-                pending.cli_nonce,
-                Some(pending.identity),
-            )
-        }
+        self.open_shell(
+            startup,
+            &handshake,
+            prepared,
+            pending.cli_nonce,
+            Some(pending.identity),
+        )
     }
 
     fn queue_pending(
@@ -1850,9 +1963,9 @@ impl TerminalRegistry {
                 browser_nonce: prepared.browser_nonce,
                 cli_nonce,
                 identity,
-                #[cfg(unix)]
                 created: Instant::now(),
                 attach,
+                shell: prepared.shell,
             },
         );
         vec![term_pending(
@@ -1994,13 +2107,10 @@ impl TerminalRegistry {
             return Vec::new();
         };
         self.image_pending.retain(|(id, _), _| id != terminal_id);
-        #[cfg(unix)]
         let (ran, status) = match session.pty.take() {
             Some(pty) => (true, shutdown_pty(pty)),
             None => (false, (None, None)),
         };
-        #[cfg(not(unix))]
-        let (ran, status) = (false, (None, None));
         let mut frames = vec![term_exit(terminal_id, status)];
         // An operator terminal answers for its step after its exit.
         if let Some(state) = session.operator.take() {
@@ -2322,7 +2432,6 @@ impl TerminalRegistry {
     }
 
     /// PTY output: recorded in the scrollback, sealed for the viewers.
-    #[cfg(unix)]
     pub(crate) fn on_bytes(&mut self, terminal_id: &str, bytes: &[u8]) -> Vec<OutboundFrame> {
         let Some(session) = self.sessions.get_mut(terminal_id) else {
             return Vec::new();
@@ -2333,14 +2442,34 @@ impl TerminalRegistry {
     }
 
     /// PTY EOF.
-    #[cfg(unix)]
     pub(crate) fn on_eof(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
+        // Windows: the helper's output ends only as it exits, with the
+        // shell's exit code. Read it before the close ends the job; the
+        // process may take a moment to be marked exited.
+        #[cfg(windows)]
+        if let Some(pty) = self
+            .sessions
+            .get_mut(terminal_id)
+            .and_then(|session| session.pty.as_mut())
+            && pty.exited.is_none()
+        {
+            let until = Instant::now() + Duration::from_millis(250);
+            loop {
+                if let Some((code, signal)) = pty.reap() {
+                    pty.exited = Some((code, signal, Instant::now()));
+                    break;
+                }
+                if Instant::now() >= until {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         self.close(terminal_id)
     }
 
     /// Expire pending approvals, re-check approvals, close exited shells and
     /// idle detached terminals.
-    #[cfg(unix)]
     pub(crate) fn poll(&mut self, now: Instant) -> Vec<OutboundFrame> {
         let mut frames = Vec::new();
         frames.extend(self.poll_image_replies(now));
@@ -2360,7 +2489,6 @@ impl TerminalRegistry {
             ));
         }
         frames.extend(self.recheck_approvals(now));
-        #[cfg(unix)]
         frames.extend(self.close_exited_shells(now));
         // Pending viewers do not keep a terminal alive.
         let expired = self
@@ -2387,18 +2515,16 @@ impl TerminalRegistry {
     /// disowned job (`sleep 30 & disown; exit`) keeps the PTY open after the
     /// shell is gone. The close kills every process left in the shell's
     /// session and reports the shell's own exit status.
-    #[cfg(unix)]
     fn close_exited_shells(&mut self, now: Instant) -> Vec<OutboundFrame> {
         let mut drained = Vec::new();
         for (terminal_id, session) in &mut self.sessions {
             let Some(pty) = session.pty.as_mut() else {
                 continue;
             };
-            if pty.exited.is_none() {
-                let (code, signal) = reap_pid(pty.pid);
-                if code.is_some() || signal.is_some() {
-                    pty.exited = Some((code, signal, now));
-                }
+            if pty.exited.is_none()
+                && let Some((code, signal)) = pty.reap()
+            {
+                pty.exited = Some((code, signal, now));
             }
             if pty.exited.is_some_and(|(_, _, at)| {
                 now.saturating_duration_since(at) >= TERMINAL_OUTPUT_DRAIN
@@ -2414,7 +2540,6 @@ impl TerminalRegistry {
     }
 
     /// 2.5: a viewer whose approval was revoked leaves (and the key rotates).
-    #[cfg(unix)]
     fn recheck_approvals(&mut self, now: Instant) -> Vec<OutboundFrame> {
         if self.next_approval_check.is_some_and(|next| now < next) {
             return Vec::new();
@@ -2451,7 +2576,6 @@ impl TerminalRegistry {
 
     /// Hand input to the terminal's writer thread without blocking.
     /// `Ok(false)`: the input queue is full and the bytes were dropped.
-    #[cfg(unix)]
     fn enqueue_input(&mut self, terminal_id: &str, bytes: Vec<u8>) -> std::io::Result<bool> {
         let Some(session) = self.sessions.get(terminal_id) else {
             return Err(std::io::Error::other("terminal is closed"));
@@ -2459,15 +2583,9 @@ impl TerminalRegistry {
         let Some(pty) = session.pty.as_ref() else {
             return Err(std::io::Error::other("terminal is closed"));
         };
-        pty.input.push(bytes)
+        pty.push_input(bytes)
     }
 
-    #[cfg(not(unix))]
-    fn enqueue_input(&mut self, _terminal_id: &str, _bytes: Vec<u8>) -> std::io::Result<bool> {
-        Err(std::io::Error::other("terminals are unsupported"))
-    }
-
-    #[cfg(unix)]
     fn resize_terminal(&mut self, terminal_id: &str, cols: u16, rows: u16) -> std::io::Result<()> {
         let Some(session) = self.sessions.get_mut(terminal_id) else {
             return Err(std::io::Error::other("terminal is closed"));
@@ -2480,26 +2598,9 @@ impl TerminalRegistry {
         let Some(pty) = session.pty.as_mut() else {
             return Err(std::io::Error::other("terminal is closed"));
         };
-        pty.master
-            .resize(portable_pty::PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        pty.resize(cols, rows)?;
         session.pty_size = (cols, rows);
         Ok(())
-    }
-
-    #[cfg(not(unix))]
-    fn resize_terminal(
-        &mut self,
-        _terminal_id: &str,
-        _cols: u16,
-        _rows: u16,
-    ) -> std::io::Result<()> {
-        Err(std::io::Error::other("terminals are unsupported"))
     }
 }
 
@@ -2509,11 +2610,34 @@ impl Drop for TerminalRegistry {
     }
 }
 
+/// Unix: the login shell; a node that advertised no shells takes no id.
 #[cfg(unix)]
+fn platform_shell(
+    _startup: &TerminalStartup,
+    shell: Option<&str>,
+) -> Option<(std::ffi::OsString, Vec<String>)> {
+    let (program, args) = child_env::login_shell();
+    shell.is_none().then(|| (program.into(), args))
+}
+
+/// Windows: `shell`, or the node's default, from the shells found at startup.
+#[cfg(windows)]
+fn platform_shell(
+    startup: &TerminalStartup,
+    shell: Option<&str>,
+) -> Option<(std::ffi::OsString, Vec<String>)> {
+    startup
+        .shell(shell)
+        .map(|found| (found.program.clone().into_os_string(), found.args.clone()))
+}
+
 fn terminal_env() -> Vec<(String, String)> {
     let mut env = scrub_parent_env(&[]);
-    env.retain(|(name, _)| name != "TERM");
-    env.push(("TERM".to_string(), "xterm-256color".to_string()));
+    // A Windows console has no TERM; programs ask the console instead.
+    if cfg!(unix) {
+        env.retain(|(name, _)| name != "TERM");
+        env.push(("TERM".to_string(), "xterm-256color".to_string()));
+    }
     env
 }
 
@@ -2532,7 +2656,7 @@ impl std::os::fd::AsRawFd for RawFdHandle {
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn spawn_pty(
-    program: &str,
+    program: &std::ffi::OsStr,
     args: &[String],
     cwd: &Path,
     env: &[(String, String)],
@@ -2616,6 +2740,71 @@ fn spawn_pty(
         reader: Some(thread),
         stop,
         pid,
+        exited: None,
+        _tracked: tracked,
+    })
+}
+
+/// Starts the `wsmp __conpty-host` helper for one terminal, in a
+/// kill-on-close job, with the shell's environment and working directory.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn spawn_pty(
+    program: &std::ffi::OsStr,
+    args: &[String],
+    cwd: &Path,
+    env: &[(String, String)],
+    cols: u16,
+    rows: u16,
+    tx: &SyncSender<FromWorker>,
+    terminal_id: &str,
+) -> anyhow::Result<PtyRuntime> {
+    use anyhow::Context;
+
+    let mut command = crate::commands::conpty_host::command(program, args, cols, rows, cwd, env)?;
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = crate::job_tree::spawn(command).context("starting the console host")?;
+    let tracked = LiveChildGuard::track(LiveChild::ExecJob(child.job()));
+    let writer = child
+        .stdin
+        .take()
+        .context("the console host has no stdin")?;
+    let reader = child
+        .stdout
+        .take()
+        .context("the console host has no stdout")?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let input = Arc::new(InputQueue::new());
+    let writer_thread = pump_input(
+        writer,
+        Arc::clone(&input),
+        tx.clone(),
+        Arc::clone(&stop),
+        terminal_id.to_string(),
+    );
+    let terminal_id = terminal_id.to_string();
+    let eof_id = terminal_id.clone();
+    let reader_thread = pump_reader(
+        reader,
+        tx.clone(),
+        Arc::clone(&stop),
+        move |bytes| FromWorker::TerminalBytes {
+            terminal_id: terminal_id.clone(),
+            bytes,
+        },
+        move || FromWorker::TerminalEof {
+            terminal_id: eof_id.clone(),
+        },
+    );
+    Ok(PtyRuntime {
+        child,
+        input,
+        writer: Some(writer_thread),
+        reader: Some(reader_thread),
+        stop,
         exited: None,
         _tracked: tracked,
     })
@@ -3406,6 +3595,21 @@ mod tests {
         TerminalStartup::from_key(CliTerminalKey::generate().expect("key"), &config)
     }
 
+    /// A registry whose terminals run a shell that waits `seconds` and
+    /// reads nothing.
+    fn sleeping_registry(
+        tx: SyncSender<FromWorker>,
+        idle_limit: Duration,
+        seconds: u32,
+    ) -> TerminalRegistry {
+        #[cfg(unix)]
+        let (program, script) = ("/bin/sh", format!("sleep {seconds}"));
+        #[cfg(windows)]
+        let (program, script) = ("cmd.exe", format!("ping -n {seconds} 127.0.0.1 >nul"));
+        let flag = if cfg!(unix) { "-c" } else { "/C" };
+        TerminalRegistry::with_shell(tx, idle_limit, program, &[flag, &script])
+    }
+
     fn slow_command() -> &'static str {
         if child_env::exec_shell().0 == "sh" {
             "sleep 30"
@@ -3479,7 +3683,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn scrollback_keeps_the_newest_256_kib() {
         let mut buf = VecDeque::new();
@@ -3506,7 +3709,7 @@ mod tests {
         assert_eq!(terminal_block_reason(true, true, 3, 4), None);
         assert_eq!(terminal_block_reason(true, true, 1, 1), Some(REASON_LIMIT));
         assert_eq!(terminal_block_reason(true, true, 31, 32), None);
-        assert_eq!(terminal_supported(), cfg!(unix));
+        assert!(terminal_supported());
     }
 
     #[derive(Clone, Default)]
@@ -3856,8 +4059,8 @@ mod tests {
         drop(rx);
     }
 
-    #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn killing_an_exec_kills_its_process_group() {
         let dir = tempfile::tempdir().expect("tempdir");
         let pidfile = dir.path().join("grand.pid");
@@ -3905,8 +4108,8 @@ mod tests {
         drop(rx);
     }
 
-    #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn pty_spawn_reads_output_and_close_reaps_it() {
         let (tx, rx) = channel();
         let mut terminals = TerminalRegistry::with_shell(
@@ -3929,6 +4132,7 @@ mod tests {
                 browser_public_key: browser.public_b64url(),
                 browser_nonce: &nonce,
                 identity: None,
+                shell: None,
             },
         );
         assert!(matches!(
@@ -3961,15 +4165,9 @@ mod tests {
     }
 
     /// Opens browser terminals until one is refused; returns how many opened.
-    #[cfg(unix)]
     fn open_until_refused(startup: &TerminalStartup) -> usize {
         let (tx, rx) = channel();
-        let mut terminals = TerminalRegistry::with_shell(
-            tx,
-            Duration::from_secs(60),
-            "/bin/sh",
-            &["-c", "sleep 30"],
-        );
+        let mut terminals = sleeping_registry(tx, Duration::from_secs(60), 30);
         let browser = CliTerminalKey::generate().expect("browser");
         let nonce = terminal_crypto::encode_b64url(&[1_u8; 16]);
         let mut opened = 0;
@@ -3986,6 +4184,7 @@ mod tests {
                     browser_public_key: browser.public_b64url(),
                     browser_nonce: &nonce,
                     identity: None,
+                    shell: None,
                 },
             );
             match &frames[0] {
@@ -4003,7 +4202,6 @@ mod tests {
         opened
     }
 
-    #[cfg(unix)]
     #[test]
     fn terminal_concurrency_cap_is_four_by_default_and_configurable() {
         assert_eq!(open_until_refused(&enabled_startup(false)), 4);
@@ -4017,16 +4215,10 @@ mod tests {
         assert_eq!(open_until_refused(&startup), 1);
     }
 
-    #[cfg(unix)]
     #[test]
     fn detached_terminal_closes_after_the_injected_idle_timeout() {
         let (tx, _rx) = channel();
-        let mut terminals = TerminalRegistry::with_shell(
-            tx,
-            Duration::from_secs(60),
-            "/bin/sh",
-            &["-c", "sleep 30"],
-        );
+        let mut terminals = sleeping_registry(tx, Duration::from_secs(60), 30);
         let startup = enabled_startup(false);
         let browser = CliTerminalKey::generate().expect("browser");
         let nonce = terminal_crypto::encode_b64url(&[3_u8; 16]);
@@ -4041,6 +4233,7 @@ mod tests {
                 browser_public_key: browser.public_b64url(),
                 browser_nonce: &nonce,
                 identity: None,
+                shell: None,
             },
         );
         terminals.detach("idle", Some("viewer-a"));
@@ -4114,17 +4307,11 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn approval_does_not_spawn_until_the_cli_nonce_is_signed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (tx, rx) = channel();
-        let mut terminals = TerminalRegistry::with_shell(
-            tx,
-            Duration::from_secs(60),
-            "/bin/sh",
-            &["-c", "sleep 30"],
-        );
+        let mut terminals = sleeping_registry(tx, Duration::from_secs(60), 30);
         let startup = enabled_startup(true);
         let browser = CliTerminalKey::generate().expect("browser");
         use p256::elliptic_curve::Generate;
@@ -4151,6 +4338,7 @@ mod tests {
                 browser_public_key: browser.public_b64url(),
                 browser_nonce: &nonce,
                 identity: Some(&identity_message),
+                shell: None,
             },
         );
         let (cli_nonce, code) = match &frames[0] {
@@ -4251,8 +4439,8 @@ mod tests {
         drop(rx);
     }
 
-    #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn a_finished_command_kills_grandchildren_in_its_process_group() {
         let dir = tempfile::tempdir().expect("tempdir");
         let pidfile = dir.path().join("grand.pid");
@@ -4305,16 +4493,11 @@ mod tests {
         drop(rx);
     }
 
-    #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn pty_close_returns_while_the_slave_is_held() {
         let (tx, rx) = channel();
-        let mut terminals = TerminalRegistry::with_shell(
-            tx,
-            Duration::from_secs(60),
-            "/bin/sh",
-            &["-c", "sleep 120"],
-        );
+        let mut terminals = sleeping_registry(tx, Duration::from_secs(60), 120);
         let startup = enabled_startup(false);
         let browser = CliTerminalKey::generate().expect("browser");
         let nonce = terminal_crypto::encode_b64url(&[9_u8; 16]);
@@ -4329,6 +4512,7 @@ mod tests {
                 browser_public_key: browser.public_b64url(),
                 browser_nonce: &nonce,
                 identity: None,
+                shell: None,
             },
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -4347,8 +4531,8 @@ mod tests {
         drop(rx);
     }
 
-    #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn reader_stop_does_not_require_the_fd_to_close() {
         let (reader, _writer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
         reader.set_nonblocking(false).expect("blocking");
@@ -4380,10 +4564,8 @@ mod tests {
 
     // Protocol 2.5 (multi-viewer) tests. `TestViewer` plays one browser tab.
 
-    #[cfg(unix)]
     const MULTI_TERMINAL: &str = "term-multi";
 
-    #[cfg(unix)]
     #[derive(Debug, PartialEq)]
     enum Seen {
         Key(u32),
@@ -4392,7 +4574,6 @@ mod tests {
         Opaque,
     }
 
-    #[cfg(unix)]
     struct TestViewer {
         id: String,
         browser: CliTerminalKey,
@@ -4403,7 +4584,6 @@ mod tests {
         out: Option<(u32, [u8; 32])>,
     }
 
-    #[cfg(unix)]
     impl TestViewer {
         fn new(tag: u8) -> Self {
             let nonce = [tag; 16];
@@ -4432,6 +4612,7 @@ mod tests {
                 browser_public_key: self.browser.public_b64url(),
                 browser_nonce: &self.nonce_b64,
                 identity: None,
+                shell: None,
             }
         }
 
@@ -4476,6 +4657,7 @@ mod tests {
             (self.tx_seq, body)
         }
 
+        #[cfg(unix)]
         fn unicast_messages(
             &self,
             terminal_id: &str,
@@ -4586,12 +4768,10 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn multi_registry(tx: SyncSender<FromWorker>) -> TerminalRegistry {
-        TerminalRegistry::with_shell(tx, Duration::from_secs(60), "/bin/sh", &["-c", "sleep 30"])
+        sleeping_registry(tx, Duration::from_secs(60), 30)
     }
 
-    #[cfg(unix)]
     fn cli_nonce_of(frames: &[OutboundFrame]) -> String {
         frames
             .iter()
@@ -4606,7 +4786,6 @@ mod tests {
             .expect("a handshake reply")
     }
 
-    #[cfg(unix)]
     fn controls(frames: &[OutboundFrame]) -> Vec<&NodeFrame> {
         frames
             .iter()
@@ -4617,7 +4796,6 @@ mod tests {
             .collect()
     }
 
-    #[cfg(unix)]
     fn writer_changes(frames: &[OutboundFrame]) -> Vec<Option<String>> {
         controls(frames)
             .into_iter()
@@ -4628,7 +4806,6 @@ mod tests {
             .collect()
     }
 
-    #[cfg(unix)]
     fn rejection(frames: &[OutboundFrame]) -> Option<(Option<String>, String)> {
         controls(frames)
             .into_iter()
@@ -4640,7 +4817,6 @@ mod tests {
             })
     }
 
-    #[cfg(unix)]
     fn open_viewer(
         terminals: &mut TerminalRegistry,
         startup: &TerminalStartup,
@@ -4651,7 +4827,6 @@ mod tests {
         frames
     }
 
-    #[cfg(unix)]
     fn attach_viewer(
         terminals: &mut TerminalRegistry,
         startup: &TerminalStartup,
@@ -4662,7 +4837,6 @@ mod tests {
         frames
     }
 
-    #[cfg(unix)]
     fn send(
         terminals: &mut TerminalRegistry,
         viewer: &mut TestViewer,
@@ -4671,6 +4845,14 @@ mod tests {
     ) -> Vec<OutboundFrame> {
         let (seq, body) = viewer.seal(MULTI_TERMINAL, message);
         terminals.handle_sealed(MULTI_TERMINAL, Some(label), seq, &body)
+    }
+
+    #[cfg(windows)]
+    fn pty_size(terminals: &TerminalRegistry) -> (u16, u16) {
+        // The helper owns the console; the registry's record is what it sent.
+        let session = terminals.sessions.get(MULTI_TERMINAL).expect("session");
+        assert!(session.pty.is_some(), "pty");
+        session.pty_size
     }
 
     #[cfg(unix)]
@@ -4687,7 +4869,6 @@ mod tests {
         (size.cols, size.rows)
     }
 
-    #[cfg(unix)]
     fn writer(terminals: &TerminalRegistry) -> Option<String> {
         terminals
             .sessions
@@ -4697,7 +4878,6 @@ mod tests {
             .clone()
     }
 
-    #[cfg(unix)]
     #[test]
     fn opener_gets_the_key_and_size_and_is_the_first_writer() {
         let (tx, _rx) = channel();
@@ -4717,7 +4897,6 @@ mod tests {
         assert_eq!(writer(&terminals), Some(a.id.clone()));
     }
 
-    #[cfg(unix)]
     #[test]
     fn retired_review_and_unknown_tags_drop_only_the_sender() {
         let (tx, _rx) = channel();
@@ -4752,7 +4931,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn two_viewers_decrypt_the_same_broadcast() {
         let (tx, _rx) = channel();
@@ -4799,7 +4977,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn input_from_b_makes_b_the_writer_and_applies_b_size_first() {
         let (tx, _rx) = channel();
@@ -4890,7 +5067,6 @@ mod tests {
         assert!(frames.is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_frame_from_a_labelled_b_is_ignored() {
         let (tx, _rx) = channel();
@@ -4940,7 +5116,6 @@ mod tests {
         assert_eq!(writer(&terminals), Some(b.id.clone()));
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_leave_rotates_the_epoch_and_the_leaver_cannot_open_new_frames() {
         let (tx, _rx) = channel();
@@ -5059,13 +5234,11 @@ mod tests {
         assert!(terminals.on_bytes(MULTI_TERMINAL, b"quiet").is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn viewer_cap_duplicates_and_idle_close() {
         const IDLE_LIMIT: Duration = Duration::from_secs(60);
         let (tx, _rx) = channel();
-        let mut terminals =
-            TerminalRegistry::with_shell(tx, IDLE_LIMIT, "/bin/sh", &["-c", "sleep 30"]);
+        let mut terminals = sleeping_registry(tx, IDLE_LIMIT, 30);
         let startup = enabled_startup(false);
         let mut viewers = (1..=MAX_VIEWERS as u8)
             .map(TestViewer::new)
@@ -5117,7 +5290,6 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn two_pending_approvals_both_complete() {
         use p256::elliptic_curve::Generate;
@@ -5159,6 +5331,7 @@ mod tests {
             Some(dir.path()),
             TermHandshake {
                 identity: Some(&identity_message),
+                shell: None,
                 ..a.handshake(MULTI_TERMINAL, 80, 24)
             },
         );
@@ -5194,6 +5367,7 @@ mod tests {
                 Some(dir.path()),
                 TermHandshake {
                     identity: Some(&identity_message),
+                    shell: None,
                     ..viewer.handshake(MULTI_TERMINAL, 0, 0)
                 },
             );
@@ -5223,6 +5397,7 @@ mod tests {
             Some(dir.path()),
             TermHandshake {
                 identity: Some(&identity_message),
+                shell: None,
                 ..c.handshake(MULTI_TERMINAL, 0, 0)
             },
         );
@@ -5318,8 +5493,8 @@ mod tests {
             .collect()
     }
 
-    #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn a_large_paste_into_a_non_reading_pty_never_blocks_and_overflow_is_signalled() {
         let (tx, rx) = channel();
         // Raw mode without echo: the program never reads, so the PTY input
@@ -5429,7 +5604,6 @@ mod tests {
         drop(rx);
     }
 
-    #[cfg(unix)]
     #[test]
     fn input_queue_drops_past_the_limit_and_accepts_again_once_written() {
         let queue = InputQueue::new();
@@ -5446,8 +5620,8 @@ mod tests {
         assert!(queue.next(&stop).is_none());
     }
 
-    #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn a_writer_error_asks_the_relay_loop_to_close_the_terminal() {
         let pipe = filedescriptor::Pipe::new().expect("pipe");
         drop(pipe.read);
@@ -5514,6 +5688,7 @@ mod tests {
                 browser_public_key: browser.public_b64url(),
                 browser_nonce: &nonce,
                 identity: None,
+                shell: None,
             },
         );
         let shell = terminals
@@ -5600,8 +5775,8 @@ mod tests {
     /// that exited but was not reaped still satisfies `kill(pid, 0)`, so a bare
     /// existence check cannot tell it apart from a live one. Only a state
     /// check can, and this pins that `process_dead` does so without reaping.
-    #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn an_unreaped_exited_child_reads_as_dead_but_still_exists() {
         let dir = tempfile::tempdir().expect("tempdir");
         let marker = dir.path().join("ran");
@@ -5625,8 +5800,8 @@ mod tests {
         let _ = child.wait();
     }
 
-    #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn a_shell_exit_closes_the_terminal_while_a_disowned_job_holds_the_pty() {
         let dir = tempfile::tempdir().expect("tempdir");
         let job_file = dir.path().join("job.pid");
@@ -5655,6 +5830,7 @@ mod tests {
                 browser_public_key: browser.public_b64url(),
                 browser_nonce: &nonce,
                 identity: None,
+                shell: None,
             },
         );
         assert!(matches!(
@@ -5757,6 +5933,7 @@ mod tests {
                 browser_public_key: browser.public_b64url(),
                 browser_nonce: &nonce,
                 identity: None,
+                shell: None,
             },
         );
         let shell = terminals
@@ -5826,7 +6003,150 @@ mod tests {
         drop(rx);
     }
 
-    #[cfg(unix)]
+    /// Feeds worker notes and polls until `terminal_id` exits or `limit`
+    /// passes, collecting what viewer `a` reads. Returns the exit code
+    /// (`None` inside: no code was reported) and the output.
+    #[cfg(windows)]
+    fn run_until_exit(
+        terminals: &mut TerminalRegistry,
+        rx: &mpsc::Receiver<FromWorker>,
+        viewer: &mut TestViewer,
+        limit: Duration,
+        mut on_output: impl FnMut(&mut TerminalRegistry, &mut TestViewer, &str),
+    ) -> (Option<Option<u8>>, String) {
+        let deadline = Instant::now() + limit;
+        let mut output = Vec::new();
+        while Instant::now() < deadline {
+            let mut frames = Vec::new();
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(FromWorker::TerminalBytes { terminal_id, bytes }) => {
+                    frames.extend(terminals.on_bytes(&terminal_id, &bytes));
+                }
+                Ok(FromWorker::TerminalEof { terminal_id }) => {
+                    frames.extend(terminals.on_eof(&terminal_id));
+                }
+                _ => {}
+            }
+            frames.extend(terminals.poll(Instant::now()));
+            for seen in viewer.receive(MULTI_TERMINAL, &frames) {
+                if let Seen::Data(bytes) = seen {
+                    output.extend(bytes);
+                }
+            }
+            let text = String::from_utf8_lossy(&output).into_owned();
+            for frame in controls(&frames) {
+                if let NodeFrame::TermExit { exit_code, .. } = frame {
+                    return (Some(*exit_code), text);
+                }
+            }
+            on_output(terminals, viewer, &text);
+        }
+        (None, String::from_utf8_lossy(&output).into_owned())
+    }
+
+    /// A Windows terminal end to end: the shell runs on a real pseudoconsole
+    /// through the `__conpty-host` helper, typed input and resizes reach it,
+    /// and its exit code is reported when it exits.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_terminal_runs_the_shell_and_reports_its_exit_code() {
+        let (tx, rx) = channel();
+        let mut terminals = TerminalRegistry::with_shell(
+            tx,
+            Duration::from_secs(60),
+            "cmd.exe",
+            &["/D", "/Q", "/K"],
+        );
+        let startup = enabled_startup(false);
+        let mut a = TestViewer::new(1);
+        let opened = open_viewer(&mut terminals, &startup, &mut a);
+        a.receive(MULTI_TERMINAL, &opened);
+        let label = a.id.clone();
+        send(
+            &mut terminals,
+            &mut a,
+            &label,
+            &TermPlaintextV2::Resize {
+                cols: 100,
+                rows: 30,
+            },
+        );
+        assert_eq!(pty_size(&terminals), (100, 30));
+        // `%OS%` comes from the scrubbed environment; the echoed command
+        // line itself does not contain the expanded text.
+        send(
+            &mut terminals,
+            &mut a,
+            &label,
+            &TermPlaintextV2::Data(b"echo wsmp-%OS%-ok\r".to_vec()),
+        );
+        let mut typed_exit = false;
+        let (exit, output) = run_until_exit(
+            &mut terminals,
+            &rx,
+            &mut a,
+            Duration::from_secs(30),
+            |terminals, viewer, text| {
+                if !typed_exit && text.contains("wsmp-Windows_NT-ok") {
+                    typed_exit = true;
+                    send(
+                        terminals,
+                        viewer,
+                        &label,
+                        &TermPlaintextV2::Data(b"exit 7\r".to_vec()),
+                    );
+                }
+            },
+        );
+        assert!(typed_exit, "the shell never ran the input: {output:?}");
+        assert_eq!(exit, Some(Some(7)), "{output:?}");
+        assert!(terminals.sessions.is_empty());
+    }
+
+    /// Closing a Windows terminal, or its shell exiting, ends everything the
+    /// shell started, even a detached process that left the console.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_terminal_ends_what_its_shell_started() {
+        use crate::windows_test_tree::{Tree, assert_dead};
+        // `detach-exit`: the shell exits after starting a detached process,
+        // which closing the console alone would not end.
+        for mode in ["detach", "detach-exit"] {
+            let tree = Tree::new();
+            let (tx, rx) = channel();
+            let args = tree.command(mode);
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let mut terminals =
+                TerminalRegistry::with_shell(tx, Duration::from_secs(60), "cmd.exe", &args);
+            let startup = enabled_startup(false);
+            let mut a = TestViewer::new(1);
+            let opened = open_viewer(&mut terminals, &startup, &mut a);
+            a.receive(MULTI_TERMINAL, &opened);
+            let grandchild = tree.read_marker().parse().expect("grandchild PID");
+            assert!(process_exists(grandchild), "{mode}: grandchild not running");
+            if mode == "detach" {
+                // The shell is still running: a close from the browser.
+                let frames = terminals.close(MULTI_TERMINAL);
+                assert!(
+                    controls(&frames)
+                        .iter()
+                        .any(|frame| matches!(frame, NodeFrame::TermExit { .. }))
+                );
+            } else {
+                // The shell exited on its own; the terminal closes itself.
+                let (exit, output) = run_until_exit(
+                    &mut terminals,
+                    &rx,
+                    &mut a,
+                    Duration::from_secs(30),
+                    |_, _, _| {},
+                );
+                assert_eq!(exit, Some(Some(0)), "{output:?}");
+            }
+            assert_dead(grandchild);
+        }
+    }
+
     mod output_mask_tests;
 
     #[cfg(unix)]
