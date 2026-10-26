@@ -284,3 +284,50 @@ fn a_unit_outlives_its_launcher() {
     )
     .expect("the stop");
 }
+
+/// What a runtime runs counts as started by wsmp even with no relay running
+/// (runtimes outlive it) and without `WSMP_JOB`: it cannot raise trust.
+#[test]
+fn a_runtime_cannot_raise_trust_without_a_relay() {
+    let dir = tempfile::tempdir().expect("dir");
+    let err = dir.path().join("trust.err");
+    let code = dir.path().join("trust.code");
+    let script = format!(
+        "Remove-Item Env:WSMP_JOB -ErrorAction SilentlyContinue\n\
+         $said = & '{EXE}' trust full 2>&1 | Out-String\n\
+         $code = $LASTEXITCODE\n\
+         $said | Set-Content -Encoding UTF8 -LiteralPath '{}'\n\
+         $code | Set-Content -LiteralPath '{}'",
+        err.display(),
+        code.display()
+    );
+    let invocation = launch(dir.path(), "wsmp-test-r6", &script);
+    wait_for("the attempt", Duration::from_secs(30), || {
+        read_text(&code).is_some_and(|code| !code.is_empty())
+    });
+    let refusal = read_text(&err).expect("stderr");
+    assert!(
+        refusal.contains("wsmp started"),
+        "refused as started by wsmp: {refusal}"
+    );
+    assert_ne!(read_text(&code).as_deref(), Some("0"));
+    // The same command from outside a runtime is not refused for that (it
+    // needs a person at a terminal instead).
+    let outside = std::process::Command::new(EXE)
+        .args(["trust", "full"])
+        .env_remove("WSMP_JOB")
+        .env("WSMP_CONFIG", dir.path().join("config.json"))
+        .env("WSMP_STATE_DIR", dir.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("wsmp runs");
+    let said = String::from_utf8_lossy(&outside.stderr);
+    assert!(!said.contains("wsmp started"), "{said}");
+    let _ = stop(
+        dir.path(),
+        "wsmp-test-r6",
+        &invocation,
+        Duration::ZERO,
+        Deadline::new(Duration::from_secs(10)),
+    );
+}

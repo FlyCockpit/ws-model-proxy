@@ -145,10 +145,12 @@ pub fn refuse_marked(command: &str) -> Result<()> {
 /// Why this process counts as started by wsmp, if it does: its own
 /// `WSMP_JOB`, then `started_by_wsmp` on itself (no relay pid known).
 ///
-/// Windows has no `/proc` to walk: a running relay answers instead, from its
-/// job ([`join_relay_job`]). A relay that runs but cannot answer refuses
-/// (fail closed). With no relay running, the marker is all there is: the
-/// relay's commands and terminals died with it (kill-on-close jobs).
+/// Windows has no `/proc` to walk. A process in a runtime host's job is
+/// refused first, relay or not: runtimes outlive the relay that started them
+/// ([`wsmp_windows::in_host_job`]). Then a running relay answers, from its job
+/// ([`join_relay_job`]); a relay that runs but cannot answer refuses (fail
+/// closed). With no relay running, that is all there is: the relay's commands
+/// and terminals died with it (kill-on-close jobs).
 pub fn self_started_by_wsmp() -> Option<&'static str> {
     if std::env::var_os(JOB_MARKER_ENV).is_some() {
         return Some(STARTED);
@@ -160,6 +162,11 @@ pub fn self_started_by_wsmp() -> Option<&'static str> {
     #[cfg(windows)]
     {
         use crate::control::{ControlCommand, request_if_running};
+        match wsmp_windows::in_host_job(std::process::id()) {
+            Ok(false) => {}
+            Ok(true) => return Some(STARTED),
+            Err(_) => return Some(UNCHECKED_RUNTIMES),
+        }
         match request_if_running(ControlCommand::CheckCaller) {
             Ok(None) => None,
             Ok(Some(answer)) if answer.get("ok") == Some(&serde_json::Value::Bool(true)) => None,
@@ -176,6 +183,8 @@ pub fn self_started_by_wsmp() -> Option<&'static str> {
 const STARTED: &str = "it or a parent process belongs to wsmp";
 #[cfg(windows)]
 const UNVERIFIED: &str = "a relay runs here but did not confirm this process is not one of its own";
+#[cfg(windows)]
+const UNCHECKED_RUNTIMES: &str = "it could not be checked against the runtimes wsmp runs";
 #[cfg(windows)]
 const NO_RELAY_JOB: &str = "the relay could not set up the job it tells its own processes by";
 
@@ -437,10 +446,12 @@ pub fn started_by_wsmp(pid: i32, daemon_pid: u32) -> Result<(), &'static str> {
     Err(STARTED)
 }
 
-/// Windows: refuse the relay itself and every member of the relay's job
+/// Windows: refuse the relay itself, every member of the relay's job
 /// ([`join_relay_job`]), which holds everything the relay started and what
-/// those started, whether or not they kept `WSMP_JOB`. A process that cannot
-/// be judged is refused, and so is every caller when the relay has no job.
+/// those started, whether or not they kept `WSMP_JOB`, and every member of a
+/// runtime host's job, which an earlier relay may have started
+/// ([`wsmp_windows::in_host_job`]). A process that cannot be judged is
+/// refused, and so is every caller when the relay has no job.
 ///
 /// Not covered, unlike Linux: a member can have a process outside the job
 /// start something for it (Task Scheduler, WMI, Explorer). Terminals are
@@ -454,6 +465,11 @@ pub fn started_by_wsmp(pid: i32, daemon_pid: u32) -> Result<(), &'static str> {
     }
     let job = RELAY_JOB.get().ok_or(NO_RELAY_JOB)?;
     match job.contains(pid) {
+        Ok(false) => {}
+        Ok(true) => return Err(STARTED),
+        Err(_) => return Err("unknown caller"),
+    }
+    match wsmp_windows::in_host_job(pid) {
         Ok(false) => Ok(()),
         Ok(true) => Err(STARTED),
         Err(_) => Err("unknown caller"),

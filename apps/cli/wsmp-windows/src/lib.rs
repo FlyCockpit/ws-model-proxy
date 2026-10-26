@@ -24,7 +24,7 @@ mod imp;
 #[cfg(windows)]
 pub use conpty::{ConPty, ConsoleChild, PseudoConsole};
 #[cfg(windows)]
-pub use host_job::{HostJob, send_ctrl_break};
+pub use host_job::{HOST_JOB_SLOTS, HostJob, in_host_job, send_ctrl_break};
 
 #[cfg(windows)]
 pub use imp::{
