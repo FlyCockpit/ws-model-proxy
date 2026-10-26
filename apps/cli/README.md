@@ -154,7 +154,8 @@ later), at Full control only. The browser picks the shell: PowerShell 7 (`pwsh`)
 PowerShell, Command Prompt, or a WSL distribution, defaulting to the node's choice, which is pwsh,
 then Windows PowerShell, then Command Prompt (`wsmp config set-terminal-shell <id>` changes it). The
 shells are found when the relay starts. Each terminal runs in a job of its own, so closing it ends
-everything its shell started. Not on Windows yet: pasting images, and operator terminals for
+everything its shell started. A pasted image's path is quoted for the terminal's shell
+(PowerShell, Command Prompt, or `/mnt/c/...` in WSL). Not on Windows yet: operator terminals for
 interactive runtime steps.
 
 **Linux: enable lingering.** A user service stops when you log out, and runtimes are started as
@@ -332,7 +333,6 @@ argv command with such an argument there.
 
 **Not on Windows (yet).**
 - The node file tools: the server's file operations are refused.
-- Pasting images into a browser terminal.
 - Interactive runtime steps.
 - Engines that need Linux, such as vLLM and SGLang. llama.cpp's `llama-server`, Ollama and LM
   Studio run natively.

@@ -918,6 +918,7 @@ mod tests {
         let reply = crate::terminal_images::ImageReply {
             id: "0".repeat(32),
             received: 1,
+            paste: None,
             path: Some(format!("/{}", "x".repeat(8192))),
             error: None,
         };

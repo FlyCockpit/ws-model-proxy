@@ -4,14 +4,12 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-#[cfg(unix)]
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use super::{ImageChunk, ImageReply, TerminalImages};
+use super::{ImageChunk, ImageReply, PasteQuoting, TerminalImages};
 
 const QUEUE_CAPACITY: usize = 16;
 const NODE_MAX_BYTES: usize = 128 * 1024 * 1024;
@@ -49,11 +47,13 @@ pub(crate) struct ImageSession {
     id: u64,
     alive: Arc<AtomicBool>,
     worker_running: Arc<AtomicBool>,
+    /// `None`: this terminal's shell takes no image paths, so it offers none.
+    quoting: Option<PasteQuoting>,
 }
 
 impl ImageSession {
     pub(crate) fn supported(&self) -> bool {
-        self.worker_running.load(Ordering::Acquire)
+        self.quoting.is_some() && self.worker_running.load(Ordering::Acquire)
     }
 }
 
@@ -146,7 +146,11 @@ impl ImagePending {
         let Some(path) = offered.as_ref().and_then(|reply| reply.path.as_deref()) else {
             return false;
         };
-        let text = super::paste_text(path);
+        // The reply's own text where the node quoted it for the shell (Windows).
+        let text = offered
+            .as_ref()
+            .and_then(|reply| reply.paste.clone())
+            .unwrap_or_else(|| super::paste_text(path));
         let bracketed = format!("\x1b[200~{text}\x1b[201~");
         self.id == paste.id
             && (paste.data.as_slice() == text.as_bytes()
@@ -182,6 +186,7 @@ impl Drop for ImagePending {
 
 struct Job {
     session_id: u64,
+    quoting: PasteQuoting,
     session: Arc<AtomicBool>,
     viewer_id: String,
     viewer: Arc<AtomicBool>,
@@ -203,28 +208,14 @@ impl Job {
 pub(crate) struct ImageWorker {
     sender: Option<SyncSender<Job>>,
     stop: Arc<AtomicBool>,
-    #[cfg(unix)]
     running: Arc<AtomicBool>,
-    #[cfg(unix)]
     next_session: AtomicU64,
     thread: Option<JoinHandle<()>>,
 }
 
 impl ImageWorker {
     pub(crate) fn new() -> Self {
-        if cfg!(unix) {
-            Self::start(run)
-        } else {
-            Self {
-                sender: None,
-                stop: Arc::new(AtomicBool::new(true)),
-                #[cfg(unix)]
-                running: Arc::new(AtomicBool::new(false)),
-                #[cfg(unix)]
-                next_session: AtomicU64::new(1),
-                thread: None,
-            }
-        }
+        Self::start(run)
     }
 
     fn start(work: impl FnOnce(Receiver<Job>, Arc<AtomicBool>) + Send + 'static) -> Self {
@@ -259,32 +250,21 @@ impl ImageWorker {
             sender,
             thread,
             stop,
-            #[cfg(unix)]
             running,
-            #[cfg(unix)]
             next_session: AtomicU64::new(1),
         }
     }
 
-    #[cfg(unix)]
-    pub(crate) fn session(&self) -> ImageSession {
+    /// A terminal's image session; `quoting` is how its shell takes a pasted path (`None`: it
+    /// takes none, and the terminal offers no image uploads).
+    pub(crate) fn session(&self, quoting: Option<PasteQuoting>) -> ImageSession {
         // NodeLink owns this worker across every registry/reconnect, so IDs
         // remain unique for as long as its filesystem store can refer to them.
         ImageSession {
             id: self.next_session.fetch_add(1, Ordering::Relaxed),
             alive: Arc::new(AtomicBool::new(true)),
             worker_running: Arc::clone(&self.running),
-        }
-    }
-
-    /// Windows has no image worker yet (pasted paths are POSIX-quoted), so a
-    /// terminal reports images unsupported and the browser offers none.
-    #[cfg(not(unix))]
-    pub(crate) fn session(&self) -> ImageSession {
-        ImageSession {
-            id: 0,
-            alive: Arc::new(AtomicBool::new(true)),
-            worker_running: Arc::new(AtomicBool::new(false)),
+            quoting,
         }
     }
 
@@ -310,6 +290,7 @@ impl ImageWorker {
         };
         let job = Job {
             session_id: session.id,
+            quoting: session.quoting.clone().ok_or("unavailable")?,
             session: Arc::clone(&session.alive),
             viewer_id: viewer_id.to_string(),
             viewer: Arc::clone(viewer),
@@ -404,7 +385,7 @@ impl Store {
             .or_insert_with(|| SessionFiles {
                 alive: Arc::clone(&job.session),
                 viewers: BTreeMap::new(),
-                files: TerminalImages::default(),
+                files: TerminalImages::with_quoting(job.quoting.clone()),
                 deliveries: Vec::new(),
             });
         if session
@@ -512,9 +493,18 @@ fn run(receiver: Receiver<Job>, stop: Arc<AtomicBool>) {
     // Dropping Store removes all retained files before the thread joins.
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The quoting of this platform's default terminal shell.
+    fn quoting() -> PasteQuoting {
+        if cfg!(windows) {
+            PasteQuoting::PowerShell
+        } else {
+            PasteQuoting::Posix
+        }
+    }
 
     /// Release a paused test worker even if an assertion unwinds, so its
     /// shutdown join cannot wait forever for the test's gate.
@@ -559,9 +549,13 @@ mod tests {
             .expect("submit");
         let reply = wait(&pending);
         if let Some(path) = &reply.path {
+            let text = reply
+                .paste
+                .clone()
+                .unwrap_or_else(|| super::super::paste_text(path));
             assert!(pending.begin_paste(&super::super::ImagePaste {
                 id: [1; 16],
-                data: super::super::paste_text(path).into_bytes()
+                data: text.into_bytes()
             }));
             pending.finish_paste(true);
         } else if reply.error.is_none() {
@@ -576,7 +570,9 @@ mod tests {
     fn node_quota_counts_reservations_across_sessions_and_reclaims_closed_sessions() {
         let worker = ImageWorker::new();
         let viewer = Arc::new(AtomicBool::new(true));
-        let mut sessions = (0..4).map(|_| worker.session()).collect::<Vec<_>>();
+        let mut sessions = (0..4)
+            .map(|_| worker.session(Some(quoting())))
+            .collect::<Vec<_>>();
         for session in &sessions {
             for index in 0..4 {
                 let reply = upload(
@@ -590,7 +586,7 @@ mod tests {
                 assert!(reply.error.is_none());
             }
         }
-        let next = worker.session();
+        let next = worker.session(Some(quoting()));
         assert_eq!(
             upload(&worker, &next, "new", &viewer, 8).error.as_deref(),
             Some("node_limit")
@@ -606,7 +602,9 @@ mod tests {
     fn node_file_limit_also_bounds_many_small_images() {
         let worker = ImageWorker::new();
         let viewer = Arc::new(AtomicBool::new(true));
-        let sessions = (0..4).map(|_| worker.session()).collect::<Vec<_>>();
+        let sessions = (0..4)
+            .map(|_| worker.session(Some(quoting())))
+            .collect::<Vec<_>>();
         for session in &sessions {
             for _ in 0..super::super::SESSION_MAX_FILES {
                 assert!(
@@ -616,7 +614,7 @@ mod tests {
                 );
             }
         }
-        let extra = worker.session();
+        let extra = worker.session(Some(quoting()));
         assert_eq!(
             upload(&worker, &extra, "viewer", &viewer, 8)
                 .error
@@ -628,13 +626,13 @@ mod tests {
     #[test]
     fn worker_owns_completed_files_until_session_close_and_cleans_up_on_shutdown() {
         let worker = ImageWorker::new();
-        let session = worker.session();
+        let session = worker.session(Some(quoting()));
         let viewer = Arc::new(AtomicBool::new(true));
         let reply = upload(&worker, &session, "alice", &viewer, 8);
         let path = std::path::PathBuf::from(reply.path.expect("saved path"));
         let directory = path.parent().expect("directory").to_path_buf();
         viewer.store(false, Ordering::Release);
-        let other = worker.session();
+        let other = worker.session(Some(quoting()));
         let live = Arc::new(AtomicBool::new(true));
         let barrier = upload(&worker, &other, "barrier", &live, 8);
         assert!(barrier.error.is_none());
@@ -659,7 +657,7 @@ mod tests {
             run(receiver, stop);
         });
         let release = ReleaseOnDrop(release_tx);
-        let session = worker.session();
+        let session = worker.session(Some(quoting()));
         let viewer = Arc::new(AtomicBool::new(true));
         let pending = (0..QUEUE_CAPACITY)
             .map(|index| {
@@ -682,7 +680,7 @@ mod tests {
             run(receiver, stop);
         });
         let release = ReleaseOnDrop(release_tx);
-        let session = worker.session();
+        let session = worker.session(Some(quoting()));
         let viewer = Arc::new(AtomicBool::new(true));
         let pending = worker
             .submit(&session, "alice", &viewer, chunk(8))
@@ -700,7 +698,7 @@ mod tests {
             run(receiver, stop);
         });
         let _release = ReleaseOnDrop(release_tx);
-        let session = worker.session();
+        let session = worker.session(Some(quoting()));
         let viewer = Arc::new(AtomicBool::new(true));
         let pending = worker
             .submit(&session, "alice", &viewer, chunk(8))
@@ -719,6 +717,7 @@ mod tests {
         let viewer = Arc::new(AtomicBool::new(true));
         let (reply, _receiver) = mpsc::sync_channel(1);
         let mut job = Job {
+            quoting: quoting(),
             session_id: 1,
             session: Arc::clone(&session),
             viewer_id: "alice".into(),
@@ -749,6 +748,7 @@ mod tests {
         let mut store = Store::default();
         let (reply, _receiver) = mpsc::sync_channel(1);
         let mut job = Job {
+            quoting: quoting(),
             session_id: 1,
             session: Arc::new(AtomicBool::new(true)),
             viewer_id: "alice".into(),
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn completion_abandoned_before_relay_acceptance_is_deleted_by_the_worker() {
         let worker = ImageWorker::new();
-        let session = worker.session();
+        let session = worker.session(Some(quoting()));
         let viewer = Arc::new(AtomicBool::new(true));
         let pending = worker
             .submit(&session, "alice", &viewer, chunk(8))
@@ -787,7 +787,7 @@ mod tests {
         let path = std::path::PathBuf::from(reply.path.expect("new file"));
         assert!(path.exists());
         drop(pending);
-        let barrier = worker.session();
+        let barrier = worker.session(Some(quoting()));
         assert!(
             upload(&worker, &barrier, "barrier", &viewer, 8)
                 .error
@@ -802,7 +802,7 @@ mod tests {
     #[test]
     fn late_browser_reply_is_not_retained_until_session_end() {
         let worker = ImageWorker::new();
-        let session = worker.session();
+        let session = worker.session(Some(quoting()));
         let viewer = Arc::new(AtomicBool::new(true));
         let pending = worker
             .submit(&session, "alice", &viewer, chunk(8))
@@ -810,7 +810,7 @@ mod tests {
         let reply = wait(&pending); // The relay forwarded the path, but the browser timed out.
         let path = std::path::PathBuf::from(reply.path.expect("offered path"));
         drop(pending); // Encrypted browser cancellation retires this request.
-        let barrier = worker.session();
+        let barrier = worker.session(Some(quoting()));
         assert!(
             upload(&worker, &barrier, "barrier", &viewer, 8)
                 .error

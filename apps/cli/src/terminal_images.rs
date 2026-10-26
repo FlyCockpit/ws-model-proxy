@@ -124,6 +124,10 @@ pub struct ImageReply {
     pub received: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// With `path`, for a shell the browser does not quote for itself (Windows): the exact text
+    /// to paste, quoted for the terminal's shell, with a trailing space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paste: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -134,9 +138,143 @@ impl ImageReply {
             id: id_text(id),
             received: 0,
             path: None,
+            paste: None,
             error: Some(error.to_string()),
         }
     }
+}
+
+/// How a terminal's shell takes a pasted image path.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) enum PasteQuoting {
+    /// A POSIX shell (Unix terminals): `sh` quoting, which the browser applies itself.
+    #[default]
+    Posix,
+    /// PowerShell: single quotes, in which nothing expands.
+    PowerShell,
+    /// Command Prompt: double quotes. A path with `%` is refused: cmd expands it even there.
+    Cmd,
+    /// A WSL distribution: the Windows path under the distribution's drive mount, `sh` quoted.
+    Wsl { distro: String },
+}
+
+impl PasteQuoting {
+    /// The quoting for a Windows terminal shell id (`crate::shells`).
+    pub(crate) fn for_shell(id: &str) -> Option<Self> {
+        match id {
+            "pwsh" | "powershell" => Some(Self::PowerShell),
+            "cmd" => Some(Self::Cmd),
+            _ => id.strip_prefix("wsl:").map(|distro| Self::Wsl {
+                distro: distro.to_string(),
+            }),
+        }
+    }
+
+    /// Whether the browser gets the text to paste in the reply: it quotes only POSIX paths.
+    fn sends_text(&self) -> bool {
+        *self != Self::Posix
+    }
+}
+
+/// Characters no shell here reads specially in a word.
+fn plain_word(path: &str) -> bool {
+    path.bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"_./\\:-".contains(&byte))
+}
+
+/// The text a PowerShell prompt takes `path` as (a trailing space).
+fn powershell_paste(path: &str) -> String {
+    if plain_word(path) {
+        format!("{path} ")
+    } else {
+        format!("'{}' ", path.replace('\'', "''"))
+    }
+}
+
+/// The text a Command Prompt takes `path` as; `None` for a path with `%` (or a quote, which a
+/// Windows path cannot have).
+fn cmd_paste(path: &str) -> Option<String> {
+    if path.contains(['%', '"']) {
+        None
+    } else if plain_word(path) {
+        Some(format!("{path} "))
+    } else {
+        Some(format!("\"{path}\" "))
+    }
+}
+
+/// `C:\dir\image.png` under a WSL drive mount `root` (`/mnt/`): `/mnt/c/dir/image.png`.
+fn wsl_path(root: &str, path: &str) -> Option<String> {
+    let mut chars = path.chars();
+    let drive = chars.next().filter(char::is_ascii_alphabetic)?;
+    let rest = chars.as_str().strip_prefix(":\\")?;
+    Some(format!(
+        "{root}{}/{}",
+        drive.to_ascii_lowercase(),
+        rest.replace('\\', "/")
+    ))
+}
+
+/// The drive mount root `[automount] root` sets in a WSL distribution's `/etc/wsl.conf`,
+/// with a trailing `/`; `/mnt/` when it sets none (or nothing usable).
+pub(crate) fn wsl_mount_root(conf: &str) -> String {
+    let mut section = String::new();
+    for line in conf.lines() {
+        let line = line.trim();
+        if let Some(name) = line
+            .strip_prefix('[')
+            .and_then(|line| line.strip_suffix(']'))
+        {
+            section = name.trim().to_ascii_lowercase();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if section != "automount" || !key.trim().eq_ignore_ascii_case("root") {
+            continue;
+        }
+        let value = value
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"');
+        if value.starts_with('/')
+            && value.len() <= 256
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_./-".contains(&byte))
+        {
+            return if value.ends_with('/') {
+                value.to_string()
+            } else {
+                format!("{value}/")
+            };
+        }
+    }
+    "/mnt/".to_string()
+}
+
+/// A WSL distribution's drive mount root, read from Windows through its file share. The
+/// share starts the distribution if it is not running; that happens on the image worker.
+#[cfg(windows)]
+fn read_wsl_mount_root(distro: &str) -> String {
+    use std::io::Read;
+    let conf = std::fs::File::open(format!(r"\\wsl.localhost\{distro}\etc\wsl.conf"))
+        .ok()
+        .and_then(|file| {
+            let mut text = String::new();
+            file.take(64 * 1024).read_to_string(&mut text).ok()?;
+            Some(text)
+        })
+        .unwrap_or_default();
+    wsl_mount_root(&conf)
+}
+
+#[cfg(not(windows))]
+fn read_wsl_mount_root(_distro: &str) -> String {
+    "/mnt/".to_string()
 }
 
 fn id_text(id: &[u8; 16]) -> String {
@@ -167,9 +305,34 @@ pub(crate) struct TerminalImages {
     saved: Vec<(NamedTempFile, usize)>,
     directory: Option<TempDir>,
     saved_bytes: usize,
+    quoting: PasteQuoting,
+    /// A WSL terminal's drive mount root, read on the first upload.
+    wsl_root: Option<String>,
 }
 
 impl TerminalImages {
+    pub(crate) fn with_quoting(quoting: PasteQuoting) -> Self {
+        Self {
+            quoting,
+            ..Self::default()
+        }
+    }
+
+    /// The text the terminal's shell takes `path` as; `None` when it cannot take it.
+    fn paste_for(&mut self, path: &str) -> Option<String> {
+        match &self.quoting {
+            PasteQuoting::Posix => Some(paste_text(path)),
+            PasteQuoting::PowerShell => Some(powershell_paste(path)),
+            PasteQuoting::Cmd => cmd_paste(path),
+            PasteQuoting::Wsl { distro } => {
+                let root = self
+                    .wsl_root
+                    .get_or_insert_with(|| read_wsl_mount_root(distro));
+                wsl_path(root, path).map(|path| paste_text(&path))
+            }
+        }
+    }
+
     pub(crate) fn detach(&mut self, viewer: &str) {
         self.pending.remove(viewer);
     }
@@ -242,9 +405,18 @@ impl TerminalImages {
                 .map_err(|_| "io")?;
             // Reject paths that could inject terminal controls or locale-dependent bytes.
             let path = file.path().to_str().ok_or("path")?;
-            if !path.starts_with('/')
+            let absolute = if cfg!(windows) {
+                let bytes = path.as_bytes();
+                bytes.len() > 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":\\"
+            } else {
+                path.starts_with('/')
+            };
+            if !absolute
                 || path.len() > 4000
                 || !path.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+                || self
+                    .paste_for(path)
+                    .is_none_or(|text| text.len() > PASTE_MAX_BYTES - 12)
             {
                 return Err("path");
             }
@@ -276,11 +448,16 @@ impl TerminalImages {
             id: id_text(&chunk.id),
             received,
             path: None,
+            paste: None,
             error: None,
         };
         if received == chunk.total {
             let upload = self.pending.remove(viewer).ok_or("invalid")?;
-            reply.path = Some(upload.file.path().to_str().ok_or("path")?.to_string());
+            let path = upload.file.path().to_str().ok_or("path")?.to_string();
+            if self.quoting.sends_text() {
+                reply.paste = Some(self.paste_for(&path).ok_or("path")?);
+            }
+            reply.path = Some(path);
             self.saved_bytes += chunk.total as usize;
             self.saved.push((upload.file, chunk.total as usize));
         }
@@ -365,6 +542,134 @@ mod tests {
             )),
             Ok(crate::terminal_crypto::TermPlaintextV2::ImageCancel(_))
         ));
+        // A Windows node sends the text to paste, quoted for the terminal's shell.
+        let windows: ImageReply =
+            serde_json::from_value(fixture["windowsReply"].clone()).expect("windows reply");
+        assert_eq!(
+            serde_json::to_value(&windows).expect("serialize"),
+            fixture["windowsReply"]
+        );
+        assert_eq!(
+            windows.paste.as_deref(),
+            Some(powershell_paste(windows.path.as_deref().expect("path")).as_str())
+        );
+    }
+
+    #[test]
+    fn each_windows_shell_takes_the_path_quoted_its_own_way() {
+        let plain = r"C:\Users\ada\AppData\Local\Temp\wsmp-terminal-a\image-b.png";
+        let spaced = r"C:\Users\Ada Lovelace\Temp\it's $HOME %PATH%.png";
+        assert_eq!(powershell_paste(plain), format!("{plain} "));
+        assert_eq!(
+            powershell_paste(spaced),
+            r"'C:\Users\Ada Lovelace\Temp\it''s $HOME %PATH%.png' "
+        );
+        assert_eq!(cmd_paste(plain), Some(format!("{plain} ")));
+        assert_eq!(
+            cmd_paste(r"C:\Users\Ada Lovelace\image.png").as_deref(),
+            Some(r#""C:\Users\Ada Lovelace\image.png" "#)
+        );
+        // cmd expands `%` even inside quotes: no such path is pasted there.
+        assert_eq!(cmd_paste(spaced), None);
+        assert_eq!(
+            wsl_path("/mnt/", r"D:\Temp\a b\image.png").as_deref(),
+            Some("/mnt/d/Temp/a b/image.png")
+        );
+        assert_eq!(wsl_path("/mnt/", "/tmp/image.png"), None);
+        assert_eq!(
+            PasteQuoting::for_shell("wsl:Ubuntu"),
+            Some(PasteQuoting::Wsl {
+                distro: "Ubuntu".into()
+            })
+        );
+        assert_eq!(PasteQuoting::for_shell("nushell"), None);
+    }
+
+    #[test]
+    fn a_wsl_distribution_mounts_drives_where_its_wsl_conf_says() {
+        assert_eq!(wsl_mount_root(""), "/mnt/");
+        assert_eq!(
+            wsl_mount_root("[boot]\nsystemd=true\n[automount]\nroot = /drives # mine\n"),
+            "/drives/"
+        );
+        assert_eq!(wsl_mount_root("[Automount]\nRoot=\"/\"\n"), "/");
+        // Only the automount section, and only a plain absolute path.
+        assert_eq!(wsl_mount_root("[network]\nroot = /x/\n"), "/mnt/");
+        assert_eq!(wsl_mount_root("[automount]\nroot = $(evil)\n"), "/mnt/");
+    }
+
+    /// The pasted text, typed at each shell's prompt, names the file: checked by the real shells.
+    #[cfg(windows)]
+    #[test]
+    fn powershell_and_cmd_read_the_pasted_text_as_the_file() {
+        use std::os::windows::process::CommandExt;
+        let root = tempfile::tempdir().expect("dir");
+        for name in ["plain", "with space", "it's $HOME"] {
+            let dir = root.path().join(name);
+            std::fs::create_dir(&dir).expect("dir");
+            let file = dir.join("image.png");
+            std::fs::write(&file, b"png").expect("file");
+            let path = file.to_str().expect("path");
+            for program in ["powershell", "pwsh"] {
+                let Ok(status) = std::process::Command::new(program)
+                    .args(["-NoProfile", "-NonInteractive", "-Command"])
+                    .arg(format!(
+                        "if (Test-Path -LiteralPath {}) {{ exit 0 }} else {{ exit 1 }}",
+                        powershell_paste(path)
+                    ))
+                    .status()
+                else {
+                    continue;
+                };
+                assert!(status.success(), "{program}: {path}");
+            }
+            if let Some(text) = cmd_paste(path) {
+                let status = std::process::Command::new("cmd")
+                    .raw_arg(format!(
+                        "/d /s /c \"if exist {text}(exit 0) else (exit 1)\""
+                    ))
+                    .status()
+                    .expect("cmd");
+                assert!(status.success(), "cmd: {path}");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_upload_returns_the_text_its_shell_pastes() {
+        for quoting in [
+            PasteQuoting::PowerShell,
+            PasteQuoting::Cmd,
+            PasteQuoting::Wsl {
+                distro: "wsmp-no-such-distribution".into(),
+            },
+        ] {
+            let mut images = TerminalImages::with_quoting(quoting.clone());
+            // Not read from `\\wsl.localhost`: a machine without WSL may take long to say so.
+            images.wsl_root = Some("/mnt/".into());
+            let reply = images.receive(
+                "alice",
+                ImageChunk {
+                    id: [1; 16],
+                    offset: 0,
+                    total: 8,
+                    format: 0,
+                    data: b"\x89PNG\r\n\x1a\n".to_vec(),
+                },
+            );
+            assert!(reply.error.is_none(), "{quoting:?}: {reply:?}");
+            let path = reply.path.clone().expect("path");
+            assert_eq!(std::fs::read(&path).expect("image"), b"\x89PNG\r\n\x1a\n");
+            let expected = match &quoting {
+                PasteQuoting::PowerShell => Some(powershell_paste(&path)),
+                PasteQuoting::Cmd => cmd_paste(&path),
+                _ => wsl_path("/mnt/", &path).map(|path| paste_text(&path)),
+            };
+            assert_eq!(reply.paste, expected, "{quoting:?}");
+            drop(images);
+            assert!(!std::path::Path::new(&path).exists());
+        }
     }
 
     #[cfg(unix)]

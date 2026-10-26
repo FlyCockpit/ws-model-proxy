@@ -317,7 +317,8 @@ impl TerminalRegistry {
             terminal_id,
             TerminalSession {
                 viewers: std::collections::BTreeMap::new(),
-                images: self.image_worker.session(),
+                // An operator terminal never takes image uploads.
+                images: self.image_worker.session(None),
                 writer: None,
                 pty_size: (80, 24),
                 out: Some(out),

@@ -1733,7 +1733,9 @@ impl TerminalRegistry {
         );
         let mut session = TerminalSession {
             viewers,
-            images: self.image_worker.session(),
+            images: self
+                .image_worker
+                .session(paste_quoting(startup, prepared.shell.as_deref())),
             // The opener is the first writer.
             writer: viewer_id.map(str::to_string),
             pty_size: (prepared.cols, prepared.rows),
@@ -2623,6 +2625,21 @@ fn platform_shell(
     startup
         .shell(shell)
         .map(|found| (found.program.clone().into_os_string(), found.args.clone()))
+}
+
+/// How the terminal's shell takes a pasted image path: `sh` on Unix; on Windows PowerShell,
+/// Command Prompt or a WSL distribution (`None`: an unknown shell, which takes no images).
+fn paste_quoting(
+    startup: &TerminalStartup,
+    shell: Option<&str>,
+) -> Option<crate::terminal_images::PasteQuoting> {
+    if cfg!(windows) {
+        startup
+            .shell(shell)
+            .and_then(|found| crate::terminal_images::PasteQuoting::for_shell(&found.id))
+    } else {
+        Some(crate::terminal_images::PasteQuoting::Posix)
+    }
 }
 
 fn terminal_env() -> Vec<(String, String)> {
@@ -4670,7 +4687,6 @@ mod tests {
             (self.tx_seq, body)
         }
 
-        #[cfg(unix)]
         fn unicast_messages(
             &self,
             terminal_id: &str,
@@ -6259,7 +6275,6 @@ mod tests {
     #[cfg(unix)]
     mod operator_tests;
 
-    #[cfg(unix)]
     mod image_tests;
 
     /// The `command operation` info lines as `(op, command_id, outcome)`.
