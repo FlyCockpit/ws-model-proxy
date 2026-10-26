@@ -68,6 +68,8 @@
 
 #[cfg(windows)]
 use crate::job_tree::{Child, JobTree};
+#[cfg(unix)]
+use crate::process_list::Process;
 use std::collections::BTreeMap;
 /// Registered with the subreaper, so its scan never reaps the run's child.
 #[cfg(not(windows))]
@@ -151,9 +153,10 @@ impl Drop for Permit {
 
 #[cfg(windows)]
 type Groups = BTreeMap<u64, JobTree>;
-/// Each run's pid, and whether it is a launch guard leading its session.
+/// Each run's pid, and the launch guard (named by its lifetime) when it is one leading its
+/// session.
 #[cfg(not(windows))]
-type Groups = BTreeMap<u32, bool>;
+type Groups = BTreeMap<u32, Option<Process>>;
 
 #[derive(Default)]
 struct Registry {
@@ -207,20 +210,20 @@ fn spawn_failed() {
 /// [`begin_spawn`]: the group is killed here (under the lock on Unix, so
 /// `kill_all_active` never returns before it), and the caller gives up.
 #[cfg(unix)]
-fn register(pid: u32, session: bool) -> bool {
-    register_in(&ACTIVE, pid, session)
+fn register(pid: u32, guard: Option<Process>) -> bool {
+    register_in(&ACTIVE, pid, guard)
 }
 
 #[cfg(unix)]
-fn register_in(shared: &'static Mutex<Registry>, pid: u32, session: bool) -> bool {
+fn register_in(shared: &'static Mutex<Registry>, pid: u32, guard: Option<Process>) -> bool {
     let mut registry = lock_registry(shared);
     registry.spawning = registry.spawning.saturating_sub(1);
     if registry.closed {
         #[cfg(unix)]
-        kill_run(pid, session);
+        kill_run(pid, guard);
         return false;
     }
-    registry.groups.insert(pid, session);
+    registry.groups.insert(pid, guard);
     true
 }
 
@@ -345,8 +348,8 @@ fn kill_all_for_panic_in(shared: &'static Mutex<Registry>) {
     registry.closed = true;
     let groups = std::mem::take(&mut registry.groups);
     #[cfg(unix)]
-    for (pid, session) in groups {
-        kill_run(pid, session);
+    for (pid, guard) in groups {
+        kill_run(pid, guard);
     }
 }
 
@@ -360,8 +363,8 @@ fn kill_all_in(shared: &'static Mutex<Registry>) {
         // (under this lock) before it reaps, so no signalled id can have been
         // reaped and recycled.
         #[cfg(unix)]
-        for (pid, session) in groups {
-            kill_run(pid, session);
+        for (pid, guard) in groups {
+            kill_run(pid, guard);
         }
     }
     // A run past its shutdown check but not yet registered is killed by its
@@ -531,8 +534,12 @@ fn run_inner(
     };
     #[cfg(not(windows))]
     let pid = child.id();
+    // The guard as it is while unreaped, so no later signal or session kill can reach a process
+    // that got its pid back.
     #[cfg(not(windows))]
-    let registered = register(pid, session);
+    let guard = session.then(|| Process::of(pid));
+    #[cfg(not(windows))]
+    let registered = register(pid, guard);
     #[cfg(windows)]
     let registration = register_job_in(&ACTIVE, child.job());
     #[cfg(windows)]
@@ -543,7 +550,7 @@ fn run_inner(
     };
     #[cfg(not(windows))]
     let finish = |child, until, permit, cancelled: &dyn Fn() -> bool| {
-        finish_until(child, until, permit, cancelled, settlement, session)
+        finish_until(child, until, permit, cancelled, settlement, guard)
     };
     if !registered {
         finish(child, Instant::now(), permit, &|| true);
@@ -739,15 +746,14 @@ fn finish_until(
     permit: Permit,
     cancelled: &dyn Fn() -> bool,
     settlement: Option<Instant>,
-    session: bool,
+    guard: Option<Process>,
 ) -> Finished {
     let exited = wait_for_exit(&mut child, until, cancelled);
     let pid = child.id();
-    if session {
+    if let Some(guard) = guard {
         // A launch guard ends its session itself, holding its launcher lock until it has.
-        // Still unreaped while it runs, so the pid is its own.
         if !exited {
-            crate::launch_guard::terminate(pid);
+            crate::launch_guard::terminate(guard);
         }
     } else {
         kill_group_or_child(&mut child);
@@ -765,11 +771,13 @@ fn finish_until(
     // someone else killed left it to this. A reaped leader's id is not reused while its session
     // has members. One that is still ending (a kill it keeps retrying) keeps its lock and goes
     // to the reaper, lingering until it has ended.
-    if session && status.is_some_and(|status| status.code().is_none()) {
-        crate::launch_guard::end_killed_session(pid);
+    if let Some(guard) = guard
+        && status.is_some_and(|status| status.code().is_none())
+    {
+        crate::launch_guard::end_killed_session(guard);
     }
     if status.is_none() {
-        hand_off_to_reaper(child, permit, session);
+        hand_off_to_reaper(child, permit, guard);
     }
     Finished { exited, status }
 }
@@ -836,15 +844,14 @@ fn reap_within(child: &mut Child, until: Instant) -> Option<ExitStatus> {
 /// child finally dies; until then the run's permit stays held and the child
 /// counts as stuck.
 ///
-/// A launch guard (`session`) still ending its session is [`crate::launch_guard::lingering`]
+/// A launch guard (`guard`) still ending its session is [`crate::launch_guard::lingering`]
 /// until it is reaped, and its session after that when someone else killed it.
 #[cfg(not(windows))]
-fn hand_off_to_reaper(mut child: Child, permit: Permit, session: bool) {
+fn hand_off_to_reaper(mut child: Child, permit: Permit, guard: Option<Process>) {
     lock(permit.0).stuck += 1;
     let shared = permit.0;
     let (ended_tx, ended_rx) = std::sync::mpsc::channel::<bool>();
-    if session {
-        let pid = child.id();
+    if let Some(guard) = guard {
         let mut reaped = false;
         crate::launch_guard::linger(move || {
             if !reaped {
@@ -857,7 +864,7 @@ fn hand_off_to_reaper(mut child: Child, permit: Permit, session: bool) {
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
                 }
             }
-            crate::process_list::kill_session(pid)
+            crate::process_list::kill_session(guard)
         });
     }
     let spawned = thread::Builder::new()
@@ -925,13 +932,13 @@ fn kill_group(pid: u32) {
 /// pid cannot have been recycled. Other Unix targets reap first, so this
 /// widens the accepted G1-2 window (a recycled pid, in the microseconds
 /// between the reap and `unregister`) from the group kill to this one.
-/// A launch guard (`session`) is sent SIGTERM: it ends its session itself before its launcher
+/// A launch guard (`guard`) is sent SIGTERM: it ends its session itself before its launcher
 /// lock goes, and the signal is all that happens here (shutdown calls this under the registry
 /// lock).
 #[cfg(unix)]
-fn kill_run(pid: u32, session: bool) {
-    if session {
-        crate::launch_guard::terminate(pid);
+fn kill_run(pid: u32, guard: Option<Process>) {
+    if let Some(guard) = guard {
+        crate::launch_guard::terminate(guard);
         return;
     }
     kill_group(pid);
@@ -1507,7 +1514,7 @@ mod tests {
         thread::sleep(Duration::from_millis(300));
         assert!(child.try_wait().expect("try_wait").is_none());
         assert!(
-            !register_in(shared, pid, false),
+            !register_in(shared, pid, None),
             "registration after the exit began must be refused"
         );
         let waited = exiting.join().expect("shutdown thread");
@@ -1534,7 +1541,7 @@ mod tests {
         assert!(begin_spawn_in(shared));
         // No `process_group(0)`: the child shares this test's group.
         let mut child = Command::new("sleep").arg("30").spawn().expect("sleep");
-        assert!(register_in(shared, child.id(), false));
+        assert!(register_in(shared, child.id(), None));
         kill_all_in(shared);
         let deadline = Instant::now() + Duration::from_secs(3);
         while child.try_wait().expect("try_wait").is_none() {
@@ -1551,7 +1558,7 @@ mod tests {
         let shared = fresh_registry();
         assert!(begin_spawn_in(shared));
         let mut child = own_group_sleeper();
-        assert!(register_in(shared, child.id(), false));
+        assert!(register_in(shared, child.id(), None));
         kill_all_for_panic_in(shared);
         let deadline = Instant::now() + Duration::from_secs(3);
         while child.try_wait().expect("try_wait").is_none() {

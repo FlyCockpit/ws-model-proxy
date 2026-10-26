@@ -688,13 +688,14 @@ enum LiveChild {
     /// A shared job handle, retained even after the root exits.
     #[cfg(windows)]
     ExecJob(crate::job_tree::JobTree),
-    /// A PTY shell: the leader of its own session.
+    /// A PTY shell: the leader of its own session, named by its lifetime (the shell may have
+    /// been reaped and its pid reused by the time a forced shutdown gets to it).
     #[cfg(unix)]
-    PtySession(u32),
+    PtySession(crate::process_list::Process),
     /// An operator terminal's launch guard, the leader of its PTY's session. Ended by SIGTERM
     /// only ([`crate::launch_guard::terminate`]).
     #[cfg(unix)]
-    GuardSession(u32),
+    GuardSession(crate::process_list::Process),
 }
 
 static LIVE_CHILDREN: Mutex<BTreeMap<u64, LiveChild>> = Mutex::new(BTreeMap::new());
@@ -745,14 +746,14 @@ fn kill_live_children(select: impl Fn(&LiveChild) -> bool) {
             #[cfg(unix)]
             LiveChild::ExecGroup(pid) => kill_process_group(pid, false),
             #[cfg(unix)]
-            LiveChild::PtySession(pid) => {
+            LiveChild::PtySession(shell) => {
                 // An unproven session keeps its leader.
-                if crate::process_list::kill_session(pid) {
-                    kill_process_group(pid, false);
+                if crate::process_list::kill_session(shell) {
+                    kill_process_group(shell.id(), false);
                 }
             }
             #[cfg(unix)]
-            LiveChild::GuardSession(pid) => crate::launch_guard::terminate(pid),
+            LiveChild::GuardSession(guard) => crate::launch_guard::terminate(guard),
         }
     }
 }
@@ -943,6 +944,9 @@ struct PtyRuntime {
     reader: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     pid: Option<u32>,
+    /// The shell (or guard) as it was when it was spawned, so no signal or session kill after it
+    /// was reaped reaches a process that got its pid back.
+    leader: Option<crate::process_list::Process>,
     /// It runs a launch guard (an operator command): close sends it SIGTERM and never kills its
     /// session, so its lock outlasts what the command started.
     guarded: bool,
@@ -961,12 +965,12 @@ fn shutdown_pty(mut runtime: PtyRuntime) -> (Option<i32>, Option<i32>) {
     if runtime.guarded {
         return shutdown_guard_pty(runtime, exited);
     }
-    if let Some(pid) = runtime.pid {
+    if let Some(shell) = runtime.leader {
         // A shell that `poll` already reaped is not signalled by pid again;
         // `killpg` still reaches jobs left in its process group. An unproven
         // session keeps its leader.
-        if crate::process_list::kill_session(pid) {
-            kill_process_group(pid, exited.is_none());
+        if crate::process_list::kill_session(shell) {
+            kill_process_group(shell.id(), exited.is_none());
         }
     }
     // The reader and writer notice `stop` within their poll timeout. Joining
@@ -993,14 +997,14 @@ fn shutdown_guard_pty(
 ) -> (Option<i32>, Option<i32>) {
     drop(runtime.writer.take());
     drop(runtime.reader.take());
-    let Some(pid) = runtime.pid else {
+    let (Some(pid), Some(guard)) = (runtime.pid, runtime.leader) else {
         drop(runtime.child);
         drop(runtime.master);
         return exited.unwrap_or((None, None));
     };
     if exited.is_none() {
         // Unreaped, so the pid is still the guard's.
-        crate::launch_guard::terminate(pid);
+        crate::launch_guard::terminate(guard);
     }
     let status = exited.unwrap_or_else(|| reap_after_signal(Some(pid)));
     drop(runtime.master);
@@ -1019,12 +1023,12 @@ fn shutdown_guard_pty(
                         GuardReap::Killed => reaped = true,
                     }
                 }
-                crate::process_list::kill_session(pid)
+                crate::process_list::kill_session(guard)
             });
         }
         (_, Some(_)) => {
             drop(runtime.child);
-            crate::launch_guard::end_killed_session(pid);
+            crate::launch_guard::end_killed_session(guard);
         }
         (Some(_), None) => drop(runtime.child),
     }
@@ -2569,14 +2573,16 @@ fn spawn_pty(
         |child| child.process_id(),
     )?;
     let pid = child.process_id();
+    // Not reaped yet: the pid is the shell's own.
+    let leader = pid.map(crate::process_list::Process::of);
     let guarded = args
         .first()
         .is_some_and(|arg| arg == crate::launch_guard::SUBCOMMAND);
-    let tracked = pid.map(|pid| {
+    let tracked = leader.map(|leader| {
         LiveChildGuard::track(if guarded {
-            LiveChild::GuardSession(pid)
+            LiveChild::GuardSession(leader)
         } else {
-            LiveChild::PtySession(pid)
+            LiveChild::PtySession(leader)
         })
     });
     let stop = Arc::new(AtomicBool::new(false));
@@ -2610,6 +2616,7 @@ fn spawn_pty(
         reader: Some(thread),
         stop,
         pid,
+        leader,
         guarded,
         exited: None,
         _tracked: tracked,
@@ -2726,10 +2733,7 @@ struct RunningCommand {
 
 #[cfg(target_os = "linux")]
 fn process_start_ticks(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = &stat[stat.rfind(')')? + 1..];
-    // Field 22 overall; the 20th after `pid (comm)`.
-    rest.split_whitespace().nth(19)?.parse().ok()
+    crate::process_list::start_ticks(pid)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2755,13 +2759,13 @@ fn group_outlived_leader(pgid: u32, leader_ticks: u64) -> bool {
         else {
             return false;
         };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat")) else {
             return false;
         };
-        let Some(rest) = stat.rfind(')').map(|at| &stat[at + 1..]) else {
+        let Some(fields) = crate::process_list::stat_fields(&stat) else {
             return false;
         };
-        let fields: Vec<&str> = rest.split_whitespace().collect();
+        let fields: Vec<&str> = fields.collect();
         // After `pid (comm)`: state ppid pgrp ... starttime is the 20th.
         fields.get(2).and_then(|pgrp| pgrp.parse::<u32>().ok()) == Some(pgid)
             && fields
@@ -5874,7 +5878,10 @@ mod tests {
         };
         let bg = read_pid(&bg_file);
         let exec_grandchild = read_pid(&exec_file);
-        let ours = [LiveChild::PtySession(shell), LiveChild::ExecGroup(exec)];
+        let ours = [
+            LiveChild::PtySession(crate::process_list::Process::of(shell)),
+            LiveChild::ExecGroup(exec),
+        ];
         {
             let live = LIVE_CHILDREN.lock().expect("live children");
             assert!(ours.iter().all(|child| live.values().any(|v| v == child)));

@@ -25,7 +25,13 @@ import {
   poolView,
   type Traffic,
 } from "../lib/pool-views";
-import { isUniqueViolation, notFound, refuse, refuseAbout } from "../lib/refuse";
+import {
+  isUniqueViolation,
+  notFound,
+  RETRY_CONFLICT_MESSAGE,
+  refuse,
+  refuseAbout,
+} from "../lib/refuse";
 import { applyJsonPatch, jsonObject } from "../lib/registry-view";
 import type { Tx } from "../lib/runtime-store";
 import { modelAliasesRouter } from "./aliases";
@@ -207,10 +213,29 @@ async function addOwnMembers(
 
 const SIDECAR_TARGET_TYPE = { IMAGE: "LLM", VIDEO: "LLM", AUDIO: "TRANSCRIPTION" } as const;
 
+/**
+ * Owners of the pools these sidecars point to. A sidecar edit takes its target's owner fence as
+ * well as its pool's: two edits that would chain (A→B and B→C) then share B's owner fence, so
+ * each one's no-chain check sees the other. Read before the fences; {@link applySidecars}
+ * checks under them that every target's owner is among them.
+ */
+async function sidecarTargetOwners(sidecars: SidecarPatch[]): Promise<string[]> {
+  const targetIds = sidecars.flatMap((sidecar) =>
+    sidecar.targetPoolId === null ? [] : [sidecar.targetPoolId],
+  );
+  if (targetIds.length === 0) return [];
+  const targets = await prisma.pool.findMany({
+    where: { id: { in: targetIds } },
+    select: { userId: true },
+  });
+  return targets.map((target) => target.userId);
+}
+
 async function applySidecars(
   db: Tx,
   pool: { id: string; userId: string },
   sidecars: SidecarPatch[],
+  fencedOwners: readonly string[],
 ) {
   for (const sidecar of sidecars) {
     if (sidecar.targetPoolId === null) {
@@ -229,11 +254,15 @@ async function applySidecars(
       },
       select: {
         id: true,
+        userId: true,
         modelType: true,
         Sidecars: { where: { input: sidecar.input }, select: { id: true } },
       },
     });
     if (!target) throw notFound("That sidecar pool does not exist.");
+    // Created since the owners were read: its edits are not serialized with this one.
+    if (!fencedOwners.includes(target.userId))
+      throw new ORPCError("CONFLICT", { message: RETRY_CONFLICT_MESSAGE });
     if (target.modelType !== SIDECAR_TARGET_TYPE[sidecar.input])
       throw refuseAbout(
         "model_type_mismatch",
@@ -651,10 +680,11 @@ export const poolsRouter = {
   create: contractProcedure(c.create).handler(async ({ input, context }) => {
     const userId = userIdOf(context);
     const actor = callerActor(context.auth, userId);
+    const owners = [userId, ...(await sidecarTargetOwners(input.sidecars ?? []))];
     let poolId: string;
     try {
       poolId = await graphWrite(
-        [userId],
+        owners,
         async (tx) => {
           await claimPoolCallableId(tx, userId, input.slug);
           const pool = await tx.pool.create({
@@ -670,7 +700,7 @@ export const poolsRouter = {
           await addOwnMembers(tx, pool, input.members ?? []);
           await applyRouting(tx, pool.id, input.routing);
           await applyAdvanced(tx, pool.id, input.advanced);
-          await applySidecars(tx, pool, input.sidecars ?? []);
+          await applySidecars(tx, pool, input.sidecars ?? [], owners);
           await audit(tx, {
             ownerId: userId,
             actor,
@@ -710,6 +740,7 @@ export const poolsRouter = {
     const owners = [
       userId,
       ...removed.flatMap((member) => (member.RuntimeModel ? [member.RuntimeModel.userId] : [])),
+      ...(await sidecarTargetOwners(input.sidecars ?? [])),
     ];
     try {
       await graphWrite(
@@ -763,7 +794,7 @@ export const poolsRouter = {
           }
           if (input.advanced) await applyAdvanced(tx, pool.id, advancedPatch);
           if (rules) await replaceRules(tx, pool.id, rules);
-          await applySidecars(tx, pool, input.sidecars ?? []);
+          await applySidecars(tx, pool, input.sidecars ?? [], owners);
           const { poolId: _poolId, ...after } = input;
           await audit(tx, {
             ownerId: userId,
@@ -883,43 +914,52 @@ export const poolsRouter = {
     addContributed: contractProcedure(c.members.addContributed).handler(
       async ({ input, context }) => {
         const userId = userIdOf(context);
-        const share = await prisma.share.findFirst({
-          where: { poolId: input.poolId, granteeUserId: userId },
-          select: {
-            id: true,
-            canContribute: true,
-            ownerUserId: true,
-            Pool: { select: { modelType: true, Routing: { select: { ownHardwareOnly: true } } } },
-          },
-        });
-        if (!share) throw notFound("That pool is not shared with you.");
-        if (!share.canContribute)
-          throw refuseAbout(
-            "contribute_not_allowed",
-            input.poolId,
-            "This share does not allow contributing.",
-          );
-        if (share.Pool.Routing?.ownHardwareOnly)
-          throw refuseAbout(
-            "own_hardware_only",
-            input.poolId,
-            "The owner routes this pool to their own hardware only.",
-          );
-        const model = await prisma.runtimeModel.findFirst({
-          where: { id: input.runtimeModelId, userId },
-          select: { id: true, type: true, retired: true },
-        });
-        if (!model)
-          throw refuseAbout(
-            "not_your_runtime",
-            input.runtimeModelId,
-            "You can contribute only your own served models.",
-          );
-        assertType(share.Pool.modelType, model.type, model.id);
-        if (model.retired)
-          throw new ORPCError("BAD_REQUEST", {
-            message: "This model is no longer served by its runtime.",
+        // The share and the model, as they are now. Read once to find the owner to fence, and
+        // again under both owners' fences, which decides: a share change or a retirement by
+        // discovery since is seen there.
+        const eligible = async (db: Tx) => {
+          const share = await db.share.findFirst({
+            where: { poolId: input.poolId, granteeUserId: userId },
+            select: {
+              id: true,
+              canContribute: true,
+              ownerUserId: true,
+              Pool: {
+                select: { modelType: true, Routing: { select: { ownHardwareOnly: true } } },
+              },
+            },
           });
+          if (!share) throw notFound("That pool is not shared with you.");
+          if (!share.canContribute)
+            throw refuseAbout(
+              "contribute_not_allowed",
+              input.poolId,
+              "This share does not allow contributing.",
+            );
+          if (share.Pool.Routing?.ownHardwareOnly)
+            throw refuseAbout(
+              "own_hardware_only",
+              input.poolId,
+              "The owner routes this pool to their own hardware only.",
+            );
+          const model = await db.runtimeModel.findFirst({
+            where: { id: input.runtimeModelId, userId },
+            select: { id: true, type: true, retired: true },
+          });
+          if (!model)
+            throw refuseAbout(
+              "not_your_runtime",
+              input.runtimeModelId,
+              "You can contribute only your own served models.",
+            );
+          assertType(share.Pool.modelType, model.type, model.id);
+          if (model.retired)
+            throw new ORPCError("BAD_REQUEST", {
+              message: "This model is no longer served by its runtime.",
+            });
+          return { share, model };
+        };
+        const { share, model } = await eligible(prisma);
         const actor = callerActor(context.auth, userId);
         let memberId: string;
         try {
@@ -927,12 +967,15 @@ export const poolsRouter = {
             // A contributed member links the owner's and the contributor's graphs.
             [share.ownerUserId, userId],
             async (tx) => {
+              const now = await eligible(tx);
+              if (now.share.ownerUserId !== share.ownerUserId)
+                throw new ORPCError("CONFLICT", { message: RETRY_CONFLICT_MESSAGE });
               const member = await tx.poolMember.create({
                 data: {
                   poolId: input.poolId,
                   kind: "LOCAL",
                   runtimeModelId: model.id,
-                  shareId: share.id,
+                  shareId: now.share.id,
                 },
                 select: { id: true },
               });

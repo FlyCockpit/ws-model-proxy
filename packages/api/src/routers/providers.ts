@@ -272,11 +272,9 @@ export const providersRouter = {
     delete: contractProcedure(c.accounts.delete).handler(async ({ input, context }) => {
       const userId = userIdOf(context);
       const account = await ownedAccount(userId, input.accountId);
-      const models = await prisma.providerModel.findMany({
-        where: { providerAccountId: account.id, userId },
-        select: { id: true },
-      });
-      const modelIds = models.map((model) => model.id);
+      // Read under the owner fence (in the fence step, which runs first): a model added and put
+      // in a pool meanwhile has its member dropped and its target fenced too.
+      let modelIds: string[] = [];
       // Soft delete: usage and pricing history keep pointing at it.
       await graphWrite(
         [userId],
@@ -302,7 +300,14 @@ export const providersRouter = {
           });
           await audit(tx, context, { accountId: account.id, action: "provider.account.delete" });
         },
-        (tx) => modelTargetFences(tx, { providerModelIds: modelIds }),
+        async (tx) => {
+          const models = await tx.providerModel.findMany({
+            where: { providerAccountId: account.id, userId },
+            select: { id: true },
+          });
+          modelIds = models.map((model) => model.id);
+          return modelTargetFences(tx, { providerModelIds: modelIds });
+        },
       );
       return { ok: true as const };
     }),

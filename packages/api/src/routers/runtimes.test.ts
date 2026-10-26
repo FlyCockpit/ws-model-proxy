@@ -1793,6 +1793,29 @@ describe("graph-write fences", () => {
     expect(fenceLog.held).toEqual(["00:owner:owner-1", "08:capacity:inst-1"]);
   });
 
+  it("a type change counts conflicting pool members again under the owner fence", async () => {
+    db.runtime.findFirst.mockResolvedValue({
+      id: "rt-1",
+      kind: "STARTABLE",
+      origin: "SERVER",
+      Node: null,
+      CurrentVersion: versionRow(),
+    } as never);
+    db.runtimeVersion.findFirst.mockResolvedValue(null);
+    db.runtimeInstance.findMany.mockResolvedValue([]);
+    // None before the fence; a member added to an LLM pool meanwhile is counted under it.
+    db.poolMember.count.mockResolvedValueOnce(0).mockImplementationOnce((async () => {
+      expect(fenceLog.held).toEqual(["00:owner:owner-1"]);
+      return 1;
+    }) as never);
+    const changed: RuntimeSpec = { ...SPEC, modelType: "embeddings" };
+    expect(await reasonOf(client().update({ runtimeId: "rt-1", spec: changed }))).toBe(
+      "model_type_mismatch",
+    );
+    expect(db.poolMember.count).toHaveBeenCalledTimes(2);
+    expect(db.runtimeVersion.create).not.toHaveBeenCalled();
+  });
+
   it("deleting a runtime goes through the parent-delete fences", async () => {
     db.runtime.findFirst.mockResolvedValue({ id: "rt-1" } as never);
     db.runtimeInstance.count.mockResolvedValue(0);

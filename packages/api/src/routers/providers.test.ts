@@ -371,6 +371,21 @@ describe("providers (a person)", () => {
 });
 
 describe("provider review follow-ups", () => {
+  it("deleting an account reads its models under the owner fence", async () => {
+    db.providerAccount.findFirst.mockResolvedValue(accountRow() as never);
+    // A model added (and put in a pool) after the request began is in the fenced read.
+    db.providerModel.findMany.mockImplementation((async () => {
+      expect(fenceLog.held).toEqual(["00:owner:owner-1"]);
+      return [{ id: "pm-1" }, { id: "pm-new" }];
+    }) as never);
+    db.executionTarget.findMany.mockResolvedValue([{ id: "t-new" }] as never);
+    await client().accounts.delete({ accountId: "acc-1" });
+    expect(db.poolMember.deleteMany).toHaveBeenCalledWith({
+      where: { providerModelId: { in: ["pm-1", "pm-new"] } },
+    });
+    expect(fenceLog.held).toEqual(["00:owner:owner-1", "06:capacity-policy:t-new"]);
+  });
+
   it("refuses a negative cap and negative prices", async () => {
     expect(await codeOf(client().spendCaps.set({ accountId: "acc-1", monthlyLimit: "-1" }))).toBe(
       "BAD_REQUEST",

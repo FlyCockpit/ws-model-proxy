@@ -338,8 +338,10 @@ describe("pools.update (agent-editable)", () => {
       userId: OWNER,
       modelType: "LLM",
     } as never);
+    db.pool.findMany.mockResolvedValue([{ userId: OWNER }] as never);
     db.pool.findFirst.mockResolvedValueOnce({
       id: "pool-2",
+      userId: OWNER,
       modelType: "LLM",
       Sidecars: [{ id: "sc-1" }],
     } as never);
@@ -725,6 +727,69 @@ describe("graph-write fences and review follow-ups", () => {
     expect(fenceLog.held).toEqual(["00:owner:bob", "00:owner:owner-1", "06:capacity-policy:t-1"]);
   });
 
+  it("a sidecar edit fences its target's owner: edits that would chain share that fence", async () => {
+    db.pool.findFirst.mockResolvedValueOnce(owned as never);
+    db.pool.findMany.mockResolvedValue([{ userId: "bob" }] as never);
+    db.pool.findFirst.mockResolvedValueOnce({
+      id: "pool-b",
+      userId: "bob",
+      modelType: "LLM",
+      Sidecars: [],
+    } as never);
+    db.pool.findFirst.mockResolvedValue(poolRow() as never);
+    db.poolSidecar.count.mockResolvedValue(0);
+    await client().update({
+      poolId: "pool-1",
+      sidecars: [{ input: "IMAGE", targetPoolId: "pool-b" }],
+    });
+    expect(fenceLog.held).toEqual(expect.arrayContaining(["00:owner:owner-1", "00:owner:bob"]));
+    expect(db.poolSidecar.upsert).toHaveBeenCalled();
+  });
+
+  it("a sidecar target whose owner was not fenced is a conflict, not a write", async () => {
+    db.pool.findFirst.mockResolvedValueOnce(owned as never);
+    // Not found before the fences (created since), found under them.
+    db.pool.findMany.mockResolvedValue([]);
+    db.pool.findFirst.mockResolvedValueOnce({
+      id: "pool-b",
+      userId: "bob",
+      modelType: "LLM",
+      Sidecars: [],
+    } as never);
+    db.poolSidecar.count.mockResolvedValue(0);
+    expect(
+      await reasonOf(
+        client().update({
+          poolId: "pool-1",
+          sidecars: [{ input: "IMAGE", targetPoolId: "pool-b" }],
+        }),
+      ),
+    ).toBe("CONFLICT");
+    expect(db.poolSidecar.upsert).not.toHaveBeenCalled();
+  });
+
+  it("a contribution decides on the model as it is under the fences", async () => {
+    db.share.findFirst.mockResolvedValue({
+      id: "share-1",
+      canContribute: true,
+      ownerUserId: "bob",
+      Pool: { modelType: "LLM", Routing: { ownHardwareOnly: false } },
+    } as never);
+    // Discovery retires the model between the first read and the fenced one.
+    db.runtimeModel.findFirst
+      .mockResolvedValueOnce({ id: "rm-1", type: "LLM", retired: false } as never)
+      .mockImplementationOnce((async () => {
+        expect(fenceLog.held).toEqual(expect.arrayContaining(["00:owner:bob"]));
+        return { id: "rm-1", type: "LLM", retired: true };
+      }) as never);
+    expect(
+      await reasonOf(
+        client(CALLERS.fullAgent()).members.addContributed({ poolId: "p", runtimeModelId: "rm-1" }),
+      ),
+    ).toBe("BAD_REQUEST");
+    expect(db.poolMember.create).not.toHaveBeenCalled();
+  });
+
   it("removing a contributed member through update fences the contributor too", async () => {
     db.pool.findFirst.mockResolvedValueOnce(owned as never);
     db.pool.findFirst.mockResolvedValue(poolRow() as never);
@@ -787,8 +852,10 @@ describe("graph-write fences and review follow-ups", () => {
 
   it("keeps a sidecar's prompt and limits when only the target is re-sent", async () => {
     db.pool.findFirst.mockResolvedValueOnce(owned as never);
+    db.pool.findMany.mockResolvedValue([{ userId: OWNER }] as never);
     db.pool.findFirst.mockResolvedValueOnce({
       id: "pool-2",
+      userId: OWNER,
       modelType: "LLM",
       Sidecars: [],
     } as never);

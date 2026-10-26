@@ -139,18 +139,34 @@ fn guard_ends_what_the_command_left_behind_before_its_lock_goes() {
     assert!(!marker.exists(), "a helper outlived the guard");
 }
 
-/// Whether this process started with SIGINT ignored (a shell's background job: `cmd &`). The
-/// command would inherit that, and a shell cannot undo it.
+/// Whether this process started with SIGINT ignored (a shell's background job: `cmd &`, or a CI
+/// runner's step). The command would inherit that, and a shell cannot undo it.
 fn interrupts_ignored() -> bool {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| {
-            let mask = status
-                .lines()
-                .find_map(|line| line.strip_prefix("SigIgn:"))?;
-            u64::from_str_radix(mask.trim(), 16).ok()
-        })
-        .is_some_and(|mask| mask & (1 << (nix::libc::SIGINT - 1)) != 0)
+    ignored_signals().is_some_and(|mask| mask & (1 << (nix::libc::SIGINT - 1)) != 0)
+}
+
+/// The mask of ignored signals, as hex: Linux has it in `/proc`, macOS and the BSDs only through
+/// `ps`.
+#[cfg(target_os = "linux")]
+fn ignored_signals() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let mask = status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigIgn:"))?;
+    u64::from_str_radix(mask.trim(), 16).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ignored_signals() -> Option<u64> {
+    let output = Command::new("/bin/ps")
+        .args(["-o", "sigignore=", "-p", &std::process::id().to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let mask = String::from_utf8(output.stdout).ok()?;
+    let mask = mask.trim();
+    u64::from_str_radix(mask.strip_prefix("0x").unwrap_or(mask), 16).ok()
 }
 
 #[test]

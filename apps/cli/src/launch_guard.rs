@@ -94,28 +94,21 @@ pub(crate) fn lingering_serial() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// The session of a guard someone else killed (it could not end its session itself): killed
-/// here, and [`linger`]ing until a scan proves it empty.
+/// here, and [`linger`]ing until a scan proves it empty. `guard` is the guard as it was before it
+/// was reaped.
 #[cfg(unix)]
-pub(crate) fn end_killed_session(guard: u32) {
+pub(crate) fn end_killed_session(guard: crate::process_list::Process) {
     if !crate::process_list::kill_session(guard) {
         linger(move || crate::process_list::kill_session(guard));
     }
 }
 
 /// SIGTERM to a launch guard: it ends its session itself, holding its lock until it has. One
-/// that has not blocked the signal yet has started nothing, and the signal ends it. The caller
-/// must not have reaped `guard`.
+/// that has not blocked the signal yet has started nothing, and the signal ends it. Nothing is
+/// sent once `guard`'s pid names another process.
 #[cfg(unix)]
-pub(crate) fn terminate(guard: u32) {
-    let Ok(raw) = i32::try_from(guard) else {
-        return;
-    };
-    if raw > 1 {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(raw),
-            nix::sys::signal::Signal::SIGTERM,
-        );
-    }
+pub(crate) fn terminate(guard: crate::process_list::Process) {
+    let _ = guard.signal(nix::sys::signal::Signal::SIGTERM);
 }
 
 pub fn lock_path(state_dir: &Path) -> PathBuf {
@@ -331,7 +324,8 @@ pub fn guard(parent: u32, lock: &Path, program: &OsString, args: &[OsString]) ->
 
 /// SIGKILL every process of this guard's session but itself, until a scan finds none it has not
 /// killed: a killed process runs nothing more, and what forked meanwhile is found by the next
-/// scan (process ids are handed out in sequence, so a fork does not get a just-freed id back).
+/// scan. What it killed is remembered by pid and start time, so a process that got a killed
+/// one's pid back (a long run of failed kills can see pids come round) is not taken for it.
 /// A scan that fails is repeated, and so is a kill that failed (`EPERM`): it never returns
 /// before a scan succeeded and found nothing it has not killed.
 #[cfg(unix)]
@@ -345,18 +339,19 @@ fn kill_scope() {
         };
         let fresh = members
             .into_iter()
-            .filter(|pid| *pid != me && !signalled.contains(pid))
+            .filter(|member| member.pid != me && !signalled.contains(member))
             .collect::<Vec<_>>();
         if fresh.is_empty() {
             return;
         }
         let mut refused = false;
-        for pid in fresh {
-            match nix::sys::signal::kill(pid, nix::sys::signal::SIGKILL) {
+        for member in fresh {
+            match member.signal(nix::sys::signal::SIGKILL) {
                 Ok(()) => {
-                    signalled.insert(pid);
+                    signalled.insert(member);
                 }
-                // Gone since the scan.
+                // Gone since the scan (its pid may name a later process: the next scan finds
+                // that one).
                 Err(nix::errno::Errno::ESRCH) => {}
                 Err(_) => refused = true,
             }

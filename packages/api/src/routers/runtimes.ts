@@ -614,10 +614,13 @@ export const runtimesRouter = {
           "This node is Relay only, so its always-on definition is frozen. Change it on the node, or raise trust with `wsmp trust full`.",
         );
     };
-    // A served model that moves to another type would break the pools it is in.
+    // A served model that moves to another type would break the pools it is in. Checked here so
+    // a refused update forgets nothing, and again under the owner fence, which every pool member
+    // insert of this runtime's models also takes: a member added meanwhile is seen there.
     const nextType = derivedColumns(spec).modelType;
-    if (nextType !== current.modelType) {
-      const conflicting = await prisma.poolMember.count({
+    const assertPoolsKeepType = async (db: Tx) => {
+      if (nextType === current.modelType) return;
+      const conflicting = await db.poolMember.count({
         where: {
           RuntimeModel: { runtimeId: runtime.id },
           ...(nextType ? { Pool: { NOT: { modelType: nextType } } } : {}),
@@ -628,7 +631,8 @@ export const runtimesRouter = {
           "model_type_mismatch",
           "This runtime's models are in pools of another type. Remove them from those pools first.",
         );
-    }
+    };
+    await assertPoolsKeepType(prisma);
 
     await forgetLearned();
     const agent = agentRulesApply(context.auth);
@@ -639,6 +643,7 @@ export const runtimesRouter = {
       [userId],
       async (tx) => {
         await assertDefinitionUnfrozen(tx);
+        await assertPoolsKeepType(tx);
         // Read and classify under the owner fence (a trust change waits for it).
         adoptedLive.length = 0;
         restarted.length = 0;

@@ -6,18 +6,119 @@
 //!
 //! A list that could not be read is an error, never an empty list: an empty list is the proof
 //! that a session is gone.
+//!
+//! A pid names a process only while it lives: once it is gone, the kernel can hand the same pid
+//! to an unrelated process. So every listed process carries its start time too ([`Process`]),
+//! and a signal goes to a pid only while that start time still matches.
 
 use std::time::Duration;
 
+use nix::errno::Errno;
+use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 
 /// Kill rounds of [`kill_session`]. Session members can fork while they are being killed, so
 /// the session is re-scanned until it is empty.
 const SESSION_KILL_ROUNDS: usize = 20;
 
+/// When a process started. On Linux, the clock ticks since boot (field 22 of
+/// `/proc/<pid>/stat`). Elsewhere, a digest of `ps`'s `lstart`, which has whole seconds only.
+/// With its pid it names one process lifetime: a reused pid starts later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct Started(u64);
+
+/// One process lifetime: a pid and when its process started. `started` is `None` when it could
+/// not be read; such a process is named by its pid alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct Process {
+    pub(crate) pid: Pid,
+    pub(crate) started: Option<Started>,
+}
+
+impl Process {
+    /// The process `pid` names now. The caller makes sure that is the one it means (its own
+    /// unreaped child, say). A pid out of range, 0 or 1 is never signalled.
+    pub(crate) fn of(pid: u32) -> Self {
+        let pid = Pid::from_raw(i32::try_from(pid).unwrap_or(0));
+        Self {
+            pid,
+            started: if signallable(pid) { started(pid) } else { None },
+        }
+    }
+
+    /// The pid as `std::process` and the relay name it (0 for one out of range).
+    pub(crate) fn id(&self) -> u32 {
+        u32::try_from(self.pid.as_raw()).unwrap_or(0)
+    }
+
+    /// Whether the pid still names this process. One whose start time was not known matches
+    /// whatever has the pid now.
+    fn is_current(&self) -> bool {
+        self.started
+            .is_none_or(|started_at| started(self.pid) == Some(started_at))
+    }
+
+    /// `signal` to this process. `ESRCH` when its pid names another process now (or none). The
+    /// check and the signal are two steps, so a pid reused in between is still hit: that needs
+    /// the process to exit and its pid to come round again in that instant.
+    pub(crate) fn signal(&self, signal: Signal) -> nix::Result<()> {
+        if !signallable(self.pid) || !self.is_current() {
+            return Err(Errno::ESRCH);
+        }
+        nix::sys::signal::kill(self.pid, signal)
+    }
+}
+
+/// Not 0 or below (a process group, or every process) and not init.
+fn signallable(pid: Pid) -> bool {
+    pid.as_raw() > 1
+}
+
+/// The fields of a `/proc/<pid>/stat` after `pid (comm)`, starting with the state. The command
+/// is bytes, not text (Linux can cut a name inside a multibyte character), and may itself hold
+/// `)`: the fields follow the last one.
 #[cfg(target_os = "linux")]
-pub(crate) fn live() -> std::io::Result<Vec<Pid>> {
-    let mut pids = Vec::new();
+pub(crate) fn stat_fields(stat: &[u8]) -> Option<std::str::SplitAsciiWhitespace<'_>> {
+    let end = stat.iter().rposition(|byte| *byte == b')')?;
+    Some(
+        std::str::from_utf8(&stat[end + 1..])
+            .ok()?
+            .split_ascii_whitespace(),
+    )
+}
+
+/// Field 22 of a `/proc/<pid>/stat`: the start time, in clock ticks since boot.
+#[cfg(target_os = "linux")]
+fn stat_started(stat: &[u8]) -> Option<Started> {
+    // The 20th field after `pid (comm)`.
+    stat_fields(stat)?.nth(19)?.parse().ok().map(Started)
+}
+
+/// A `stat` whose state cannot be parsed counts as live.
+#[cfg(target_os = "linux")]
+fn stat_is_zombie(stat: &[u8]) -> bool {
+    stat_fields(stat)
+        .and_then(|mut fields| fields.next())
+        .is_some_and(|state| state == "Z")
+}
+
+/// The start time of `pid` in clock ticks since boot, which outlives this process (a
+/// restarted daemon compares it). `None` when it is gone.
+#[cfg(target_os = "linux")]
+pub(crate) fn start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    stat_started(&stat).map(|Started(ticks)| ticks)
+}
+
+#[cfg(target_os = "linux")]
+fn started(pid: Pid) -> Option<Started> {
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    stat_started(&stat)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn live() -> std::io::Result<Vec<Process>> {
+    let mut processes = Vec::new();
     for entry in std::fs::read_dir("/proc")? {
         let entry = entry?;
         let Some(raw) = entry
@@ -42,35 +143,51 @@ pub(crate) fn live() -> std::io::Result<Vec<Pid>> {
             Err(error) => return Err(error),
         };
         if !stat_is_zombie(&stat) {
-            pids.push(Pid::from_raw(raw));
+            processes.push(Process {
+                pid: Pid::from_raw(raw),
+                started: stat_started(&stat),
+            });
         }
     }
-    Ok(pids)
+    Ok(processes)
 }
 
-/// Field 3 of `/proc/<pid>/stat`, after the parenthesised command, is the state. The command
-/// is bytes, not text (Linux can cut a name inside a multibyte character), and may itself hold
-/// `)`: the state follows the last one. A `stat` that cannot be parsed counts as live.
-#[cfg(target_os = "linux")]
-fn stat_is_zombie(stat: &[u8]) -> bool {
-    stat.iter()
-        .rposition(|byte| *byte == b')')
-        .and_then(|end| {
-            stat[end + 1..]
-                .split(u8::is_ascii_whitespace)
-                .find(|field| !field.is_empty())
-        })
-        .is_some_and(|state| state == b"Z")
+/// `lstart` as `ps` prints it (`Mon Oct 26 10:00:00 2026`), digested. `ps` runs with a cleared
+/// environment, so every call prints it in the same time zone and locale.
+#[cfg(not(target_os = "linux"))]
+fn lstart<'a>(fields: impl Iterator<Item = &'a str>) -> Option<Started> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    let mut any = false;
+    for field in fields {
+        field.hash(&mut hasher);
+        any = true;
+    }
+    any.then(|| Started(hasher.finish()))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn live() -> std::io::Result<Vec<Pid>> {
-    let output = std::process::Command::new("/bin/ps")
-        .args(["-axo", "pid=,stat="])
+fn ps(args: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("/bin/ps")
+        .args(args)
         .env_clear()
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .output()?;
+        .output()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn started(pid: Pid) -> Option<Started> {
+    let output = ps(&["-o", "lstart=", "-p", &pid.to_string()]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    lstart(String::from_utf8_lossy(&output.stdout).split_whitespace())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn live() -> std::io::Result<Vec<Process>> {
+    let output = ps(&["-axo", "pid=,stat=,lstart="])?;
     if !output.status.success() {
         return Err(std::io::Error::other("`ps` could not list processes"));
     }
@@ -80,16 +197,19 @@ pub(crate) fn live() -> std::io::Result<Vec<Pid>> {
             let mut fields = line.split_whitespace();
             let raw = fields.next()?.parse::<i32>().ok()?;
             let zombie = fields.next().is_some_and(|state| state.starts_with('Z'));
-            (raw > 1 && !zombie).then(|| Pid::from_raw(raw))
+            (raw > 1 && !zombie).then(|| Process {
+                pid: Pid::from_raw(raw),
+                started: lstart(fields),
+            })
         })
         .collect())
 }
 
 /// Every live process whose session id is confirmed to be `sid`.
-pub(crate) fn session_members(sid: Pid) -> std::io::Result<Vec<Pid>> {
+pub(crate) fn session_members(sid: Pid) -> std::io::Result<Vec<Process>> {
     Ok(live()?
         .into_iter()
-        .filter(|pid| nix::unistd::getsid(Some(*pid)) == Ok(sid))
+        .filter(|process| nix::unistd::getsid(Some(process.pid)) == Ok(sid))
         .collect())
 }
 
@@ -101,27 +221,28 @@ pub(crate) fn session_members(sid: Pid) -> std::io::Result<Vec<Pid>> {
 /// scan can be stale by the time its kill lands, so it gets SIGTERM and ends its session itself
 /// (`launch_guard::terminate`).
 ///
+/// `leader` is the leader as it was while it was still unreaped, so a retry after it was reaped
+/// still knows it: a pid that leads a session again, but started at another time, is someone
+/// else's session, and ours has ended (the kernel does not hand out a pid that is still some
+/// session's id while members remain).
+///
 /// The leader goes last, once a scan found no other member. When no round proved that, the
 /// leader gets SIGTERM and SIGHUP instead (a shell exits on the hangup), and this returns
 /// `false`: the caller must not kill the leader or its group by force either. `true` otherwise
 /// (also when `leader` leads no session).
 ///
-/// Only pids whose `getsid` matches are signalled, and never session 1 or the CLI's own session.
-/// A process that calls `setsid()` itself starts a new session and escapes this kill; that is a
-/// documented limit.
-pub(crate) fn kill_session(leader: u32) -> bool {
-    let Ok(raw) = i32::try_from(leader) else {
-        return true;
-    };
-    if raw <= 1 {
+/// Only processes whose `getsid` matches are signalled, each only while its start time still
+/// matches, and never session 1 or the CLI's own session. A process that calls `setsid()`
+/// itself starts a new session and escapes this kill; that is a documented limit.
+pub(crate) fn kill_session(leader: Process) -> bool {
+    let sid = leader.pid;
+    if !signallable(sid) {
         return true;
     }
-    // The leader's session id is its pid. Either it is our unreaped child, or it was reaped just
-    // now and the kernel does not hand out a pid that is still some session's id while members
-    // remain; either way the pid cannot name an unrelated session. A zombie or reaped leader can
-    // fail `getsid`; its session members are still confirmed one by one below.
-    let sid = Pid::from_raw(raw);
-    if nix::unistd::getsid(Some(sid)).is_ok_and(|actual| actual != sid) {
+    // Either the leader is our unreaped child, or it was reaped and its session id stays
+    // reserved while members remain. A zombie or reaped leader can fail `getsid`; its session
+    // members are still confirmed one by one below.
+    if leader.is_current() && nix::unistd::getsid(Some(sid)).is_ok_and(|actual| actual != sid) {
         return true;
     }
     if nix::unistd::getsid(None).is_ok_and(|own| own == sid) {
@@ -130,20 +251,22 @@ pub(crate) fn kill_session(leader: u32) -> bool {
     let own_pid = nix::unistd::getpid();
     for round in 0..SESSION_KILL_ROUNDS {
         if let Ok(members) = session_members(sid) {
-            // Listed, so confirmed to be the leader still (not a reused pid).
-            let leader_live = members.contains(&sid);
+            let listed = members.iter().find(|member| member.pid == sid).copied();
+            if listed.is_some_and(|now| reused(leader, now)) {
+                return true;
+            }
             let others = members
                 .into_iter()
-                .filter(|pid| *pid != sid && *pid != own_pid)
+                .filter(|member| member.pid != sid && member.pid != own_pid)
                 .collect::<Vec<_>>();
             if others.is_empty() {
-                if leader_live {
-                    let _ = nix::sys::signal::kill(sid, nix::sys::signal::Signal::SIGKILL);
+                if listed.is_some() {
+                    let _ = leader.signal(Signal::SIGKILL);
                 }
                 return true;
             }
-            for pid in others {
-                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            for member in others {
+                let _ = member.signal(Signal::SIGKILL);
             }
         }
         // SIGKILL is asynchronous. Back off a little so a killed process can become a zombie
@@ -155,24 +278,77 @@ pub(crate) fn kill_session(leader: u32) -> bool {
         }
     }
     if nix::unistd::getsid(Some(sid)) == Ok(sid) {
-        let _ = nix::sys::signal::kill(sid, nix::sys::signal::Signal::SIGTERM);
-        let _ = nix::sys::signal::kill(sid, nix::sys::signal::Signal::SIGHUP);
+        let _ = leader.signal(Signal::SIGTERM);
+        let _ = leader.signal(Signal::SIGHUP);
     }
     false
 }
 
+/// Whether `now` (listed with `leader`'s pid) is a later process than `leader`. Unknown start
+/// times prove nothing.
+fn reused(leader: Process, now: Process) -> bool {
+    leader
+        .started
+        .zip(now.started)
+        .is_some_and(|(then, now)| then != now)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_stat_is_read_as_bytes_up_to_the_last_parenthesis() {
-        use super::stat_is_zombie;
         assert!(stat_is_zombie(b"42 (sleep) Z 1 42 42"));
         assert!(!stat_is_zombie(b"42 (sleep) S 1 42 42"));
         // A name cut inside a multibyte character, and one holding `) Z `.
         assert!(stat_is_zombie(b"42 (\xe2\x82) Z 1 42 42"));
         assert!(!stat_is_zombie(b"42 (a) Z (b) R 1 42 42"));
         assert!(!stat_is_zombie(b"garbage"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stat_names_its_start_time_after_a_name_that_is_not_utf8() {
+        let stat =
+            b"42 (\xe2\x82) S 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 10";
+        assert_eq!(stat_started(stat), Some(Started(987654)));
+        assert_eq!(stat_started(b"42 (sleep) S 1"), None);
+    }
+
+    #[test]
+    fn a_process_is_named_by_its_pid_and_start_time() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let process = Process::of(child.id());
+        let listed = live().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(process.started.is_some(), "no start time for {process:?}");
+        assert!(listed.contains(&process), "{process:?} is not listed");
+        // Reaped: the pid names no process of that lifetime now, so nothing is signalled.
+        assert_eq!(process.signal(Signal::SIGKILL), Err(Errno::ESRCH));
+    }
+
+    #[test]
+    fn a_session_led_by_a_later_process_is_someone_elses() {
+        let pid = Pid::from_raw(4242);
+        let then = Process {
+            pid,
+            started: Some(Started(1)),
+        };
+        assert!(reused(
+            then,
+            Process {
+                pid,
+                started: Some(Started(2))
+            }
+        ));
+        assert!(!reused(then, then));
+        assert!(!reused(then, Process { pid, started: None }));
     }
 
     #[cfg(target_os = "linux")]
@@ -195,6 +371,7 @@ mod tests {
         let comm = std::fs::read(format!("/proc/{pid}/comm")).unwrap();
         let listed = super::live();
         let running = child.try_wait().unwrap().is_none();
+        let ticks = start_ticks(child.id());
         let _ = child.kill();
         let _ = child.wait();
         assert!(
@@ -202,6 +379,7 @@ mod tests {
             "the test needs a name that is not UTF-8: {comm:?}"
         );
         assert!(running, "the test process exited before the scan");
-        assert!(listed.unwrap().contains(&pid));
+        assert!(ticks.is_some(), "no start time read past the name");
+        assert!(listed.unwrap().iter().any(|process| process.pid == pid));
     }
 }
