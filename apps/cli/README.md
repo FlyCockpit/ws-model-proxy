@@ -157,8 +157,7 @@ PowerShell, Command Prompt, or a WSL distribution, defaulting to the node's choi
 then Windows PowerShell, then Command Prompt (`wsmp config set-terminal-shell <id>` changes it). The
 shells are found when the relay starts. Each terminal runs in a job of its own, so closing it ends
 everything its shell started. A pasted image's path is quoted for the terminal's shell
-(PowerShell, Command Prompt, or `/mnt/c/...` in WSL). Not on Windows yet: operator terminals for
-interactive runtime steps.
+(PowerShell, Command Prompt, or `/mnt/c/...` in WSL).
 
 **Linux: enable lingering.** A user service stops when you log out, and runtimes are started as
 transient user units, which need a user manager that outlives your sessions. Enable it once:
@@ -314,7 +313,10 @@ management mode and shells can run it.
 - Status, stop and health commands run to completion in a job of their own.
 - PowerShell commands exit with their last command's status, as `sh` does, so a status command
   says stopped by exiting 3.
-- Interactive steps (operator terminals) do not run on Windows yet.
+- An interactive step (one that needs its person: a prompt to answer, a sign-in to finish) opens
+  an operator terminal as on Linux. Enter runs the step's script in its shell on a pseudoconsole,
+  inside a job that ends with the relay. There is no `sudo -k` around it: Windows caches no sudo
+  credential.
 
 ## Windows
 
@@ -335,7 +337,6 @@ argv command with such an argument there.
 
 **Not on Windows (yet).**
 - The node file tools: the server's file operations are refused.
-- Interactive runtime steps.
 - Engines that need Linux, such as vLLM and SGLang. llama.cpp's `llama-server`, Ollama and LM
   Studio run natively.
 
