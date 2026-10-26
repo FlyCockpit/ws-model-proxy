@@ -53,6 +53,10 @@ const LOCK_WAIT: Duration = Duration::from_secs(5);
 /// How often a host looks at its command, its job and its stop request.
 const HOST_POLL: Duration = Duration::from_millis(200);
 
+/// A stop repeats Ctrl+Break this often while the command is younger than [`BREAK_YOUNG`].
+const BREAK_REPEAT: Duration = Duration::from_secs(1);
+const BREAK_YOUNG: Duration = Duration::from_secs(10);
+
 /// How much of a status or stop command's output is read (and dropped).
 const OUTPUT_LIMIT: usize = 256 * 1024;
 
@@ -591,12 +595,23 @@ pub fn host(args: &HostArgs<'_>) -> Result<()> {
         }
     };
     let group = child.id();
+    let spawned = Instant::now();
     let mut exited = false;
     loop {
         if let Some(grace) = stop_grace(args.dir, args.unit, args.invocation) {
-            let _ = wsmp_windows::send_ctrl_break(group);
             let until = Instant::now() + grace;
+            let mut last_break: Option<Instant> = None;
             while job.active_processes().unwrap_or(2) > 1 && Instant::now() < until {
+                // A break that reaches a program still starting up can be lost, so a young
+                // command gets it again every second; one that ran a while gets it once (some
+                // programs take a second interrupt as "quit at once").
+                let due = last_break.is_none_or(|at| {
+                    at.elapsed() >= BREAK_REPEAT && at.duration_since(spawned) < BREAK_YOUNG
+                });
+                if due {
+                    let _ = wsmp_windows::send_ctrl_break(group);
+                    last_break = Some(Instant::now());
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
             // Ends what ignored the break, and this host with it.
