@@ -65,15 +65,12 @@ overrides:
   "mysql2@<3.22.0": 3.24.4
   "prisma@7.10.0>mysql2": 3.24.4
   "better-auth@1.7.7>mysql2": 3.24.4
-  # CVE-2026-13697; GHSA-rfgv-xxqx-mfg5 (DoS) / GHSA-w293-vg96-wgc3 (TLS
-  # validation bypass) below 7.29.1, and GHSA-xjj6-f33q-929c (DoS via
-  # excessive content-encodings) below 7.30.1 / 8.12.2. 8.x arrives through
-  # jsdom; 7.x through openai.
+  # CVE-2026-13697; GHSA-rfgv-xxqx-mfg5 (DoS) / GHSA-w293-vg96-wgc3 (TLS validation
+  # bypass) below 7.29.1, and GHSA-xjj6-f33q-929c (high) below 7.30.1 / 8.12.2.
   "undici@>=7 <7.30.1": 7.30.1
   "undici@>=8 <8.12.2": 8.12.2
-  # GHSA-mrhx-c7xc-m3w5 / CVE-2023-54404 (DoS via unbounded array validation).
-  # The catalog already asks for ^4.6.6; @better-auth/core's own range kept
-  # 4.6.5 in the lock.
+  # GHSA-mrhx-c7xc-m3w5 (high, DoS via unbounded array validation). The catalog
+  # already asks for ^4.6.6; @better-auth/core resolved its own 4.6.5 copy.
   "zod@>=4 <4.6.6": 4.6.6
   # CVE-2026-44635 (JSON-path injection) is patched in 0.28.17. Pinned EXACT
   # (not just `>=0.28.17`) to dedupe to a single installed copy: better-auth

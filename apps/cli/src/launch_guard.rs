@@ -31,8 +31,9 @@
 //! - A guard the daemon stops waiting for while it is still ending its session (a kill it keeps
 //!   retrying, a session someone else's kill of the guard left behind) is [`lingering`] until it
 //!   has: meanwhile no rank of this node is proven idle (`runner`), since what the guard has not
-//!   ended yet may still launch. Process ids name these processes; that a pid can be reused
-//!   while cleanup waits is a documented limit.
+//!   ended yet may still launch. A process is named by its pid and its start time
+//!   (`process_list::Process`) when that time can be read. Unknown or coarse start times can
+//!   still alias a reused pid; issue #244 tracks these remaining identity gaps.
 //!
 //! What a command moves out with `setsid` is not the guard's. On Linux the rank's slice still
 //! holds it for the stop proof; on macOS only the service's status command proves anything.
@@ -40,13 +41,14 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-#[cfg(any(unix, test))]
-use std::time::Instant;
 
 use anyhow::{Context, Result};
 
 /// The hidden subcommand.
 pub const SUBCOMMAND: &str = "__launch-guard";
+/// The hidden subcommand the guard starts its command through: it clears the signal mask it
+/// inherited from the guard, then becomes the command ([`exec`]).
+pub const EXEC_SUBCOMMAND: &str = "__launch-guard-exec";
 /// How often a guard checks on its command and its parent.
 pub const POLL: Duration = Duration::from_millis(25);
 /// How long a starting daemon waits for an earlier daemon's guards to end.
@@ -96,28 +98,29 @@ pub(crate) fn lingering_serial() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// The session of a guard someone else killed (it could not end its session itself): killed
-/// here, and [`linger`]ing until a scan proves it empty.
+/// here, and [`linger`]ing until a scan proves it empty. `guard` is the guard as it was before it
+/// was reaped.
 #[cfg(unix)]
-pub(crate) fn end_killed_session(guard: u32) {
-    if !crate::process_list::kill_session(guard) {
-        linger(move || crate::process_list::kill_session(guard));
+pub(crate) fn end_killed_session(guard: crate::process_list::Process) {
+    if !crate::process_list::kill_session(guard).settled() {
+        linger(move || crate::process_list::kill_session(guard).settled());
     }
 }
 
-/// SIGTERM to a launch guard: it ends its session itself, holding its lock until it has. One
-/// that has not blocked the signal yet has started nothing, and the signal ends it. The caller
-/// must not have reaped `guard`.
+/// SIGTERM to launch guards that may have been reaped already: each ends its session itself,
+/// holding its lock until it has. One that has not blocked the signal yet has started nothing,
+/// and the signal ends it. A captured start time must still match; an unknown one falls back to
+/// the pid alone. One listing checks them all (on macOS, one `ps`, not one per guard).
 #[cfg(unix)]
-pub(crate) fn terminate(guard: u32) {
-    let Ok(raw) = i32::try_from(guard) else {
-        return;
-    };
-    if raw > 1 {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(raw),
-            nix::sys::signal::Signal::SIGTERM,
-        );
-    }
+pub(crate) fn terminate_all(guards: &[crate::process_list::Process]) {
+    crate::process_list::signal_current(guards, nix::sys::signal::Signal::SIGTERM);
+}
+
+/// SIGTERM to the caller's own guard child that is not reaped yet: its pid is still the
+/// guard's, so nothing is checked (and nothing can fail to be checked) first.
+#[cfg(unix)]
+pub(crate) fn terminate_unreaped(guard: crate::process_list::Process) {
+    let _ = guard.signal_unreaped_child(nix::sys::signal::Signal::SIGTERM);
 }
 
 pub fn lock_path(state_dir: &Path) -> PathBuf {
@@ -213,6 +216,7 @@ fn open_lock(path: &Path) -> Result<std::fs::File> {
 #[cfg(unix)]
 pub fn settle(state_dir: &Path, wait: Duration) -> Result<()> {
     use nix::fcntl::{Flock, FlockArg};
+    use std::time::Instant;
     let path = absolute_lock(state_dir)?;
     let mut file = open_lock(&path)?;
     let until = Instant::now() + wait;
@@ -253,7 +257,8 @@ pub fn guard(parent: u32, lock: &Path, program: &OsString, args: &[OsString]) ->
     }
     // A terminal's Ctrl-C or hangup is the command's to take, not the guard's, and SIGTERM is
     // taken by the ender thread below: all blocked here and in the threads (started below, they
-    // inherit the mask). A spawned child starts with an empty mask.
+    // inherit the mask). A spawned child inherits the mask too, and most programs (macOS's `sh`
+    // among them) never clear it: the command starts through [`EXEC_SUBCOMMAND`], which does.
     let mut blocked = SigSet::empty();
     for signal in [
         Signal::SIGINT,
@@ -312,7 +317,12 @@ pub fn guard(parent: u32, lock: &Path, program: &OsString, args: &[OsString]) ->
         let _starting = STARTING
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Command::new(program).args(args).spawn()
+        Command::new(own_exe()?)
+            .arg(EXEC_SUBCOMMAND)
+            .arg("--")
+            .arg(program)
+            .args(args)
+            .spawn()
     };
     let mut child = spawned.with_context(|| format!("starting `{}`", program.to_string_lossy()))?;
     let status = child.wait();
@@ -332,7 +342,8 @@ pub fn guard(parent: u32, lock: &Path, program: &OsString, args: &[OsString]) ->
 
 /// SIGKILL every process of this guard's session but itself, until a scan finds none it has not
 /// killed: a killed process runs nothing more, and what forked meanwhile is found by the next
-/// scan (process ids are handed out in sequence, so a fork does not get a just-freed id back).
+/// scan. What it killed is remembered by pid and start time, so a process that got a killed
+/// one's pid back (a long run of failed kills can see pids come round) is not taken for it.
 /// A scan that fails is repeated, and so is a kill that failed (`EPERM`): it never returns
 /// before a scan succeeded and found nothing it has not killed.
 #[cfg(unix)]
@@ -346,18 +357,19 @@ fn kill_scope() {
         };
         let fresh = members
             .into_iter()
-            .filter(|pid| *pid != me && !signalled.contains(pid))
+            .filter(|member| member.pid != me && !signalled.contains(member))
             .collect::<Vec<_>>();
         if fresh.is_empty() {
             return;
         }
         let mut refused = false;
-        for pid in fresh {
-            match nix::sys::signal::kill(pid, nix::sys::signal::SIGKILL) {
+        for member in fresh {
+            match member.signal(nix::sys::signal::SIGKILL) {
                 Ok(()) => {
-                    signalled.insert(pid);
+                    signalled.insert(member);
                 }
-                // Gone since the scan.
+                // Gone since the scan (its pid may name a later process: the next scan finds
+                // that one).
                 Err(nix::errno::Errno::ESRCH) => {}
                 Err(_) => refused = true,
             }
@@ -366,6 +378,34 @@ fn kill_scope() {
             std::thread::sleep(POLL);
         }
     }
+}
+
+/// This executable, for [`EXEC_SUBCOMMAND`]. On Linux the running image itself, so an upgrade
+/// that replaced the file since does not change what runs.
+#[cfg(unix)]
+fn own_exe() -> Result<PathBuf> {
+    if cfg!(target_os = "linux") {
+        return Ok(PathBuf::from("/proc/self/exe"));
+    }
+    std::env::current_exe().context("finding the wsmp executable")
+}
+
+/// [`EXEC_SUBCOMMAND`]: clear the signal mask the guard handed down (it blocks SIGINT, SIGQUIT,
+/// SIGHUP and SIGTERM for itself), then become `program`. A signal sent meanwhile was held
+/// pending, and takes effect here. Returns only when `program` could not be started.
+#[cfg(unix)]
+pub fn exec(program: &OsString, args: &[OsString]) -> Result<()> {
+    use nix::sys::signal::{SigSet, SigmaskHow, pthread_sigmask};
+    use std::os::unix::process::CommandExt;
+    pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)
+        .context("clearing the signal mask")?;
+    let error = std::process::Command::new(program).args(args).exec();
+    Err(error).with_context(|| format!("starting `{}`", program.to_string_lossy()))
+}
+
+#[cfg(not(unix))]
+pub fn exec(_program: &OsString, _args: &[OsString]) -> Result<()> {
+    anyhow::bail!("the launch guard runs on Unix only")
 }
 
 #[cfg(not(unix))]
@@ -381,6 +421,7 @@ pub fn guard(_parent: u32, _lock: &Path, _program: &OsString, _args: &[OsString]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn wrap_puts_the_command_after_the_guard_arguments() {

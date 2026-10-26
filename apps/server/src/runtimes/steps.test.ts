@@ -160,7 +160,6 @@ describe("stops of a recorded launch", () => {
 
 describe("reservation nodes in a run's steps", () => {
   const single = runtimeLaunchSchema.parse({
-    // Reservations need management service (its status command reports the reserved nodes).
     management: "service",
     groupSize: 1,
     resources: [{ kind: "unified", memoryGb: 8 }],

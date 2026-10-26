@@ -11,6 +11,10 @@ const HELPER_ENV: &str = "WSMP_LAUNCH_GUARD_TEST_PARENT";
 const LEAVER_ENV: &str = "WSMP_LAUNCH_GUARD_TEST_LEAVER";
 
 fn guard(parent: u32, lock: &Path, script: &str) -> Command {
+    guard_program(parent, lock, "/bin/sh", &["-c", script])
+}
+
+fn guard_program(parent: u32, lock: &Path, program: &str, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_wsmp"));
     command
         .arg("__launch-guard")
@@ -19,11 +23,18 @@ fn guard(parent: u32, lock: &Path, script: &str) -> Command {
         .arg("--lock")
         .arg(lock)
         .arg("--")
-        .args(["/bin/sh", "-c", script])
+        .arg(program)
+        .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::null());
     command
 }
+
+/// Perl: restore SIGINT's default, mark itself running at the path it is given, then become
+/// `sleep`. The interrupt tests need `perl` on `PATH` (macOS and the CI images ship it); without
+/// it they fail with "the command never started".
+const MARK_THEN_SLEEP: &str =
+    r#"$SIG{INT} = "DEFAULT"; open(F, ">", shift) or die; close F; exec "sleep", "5""#;
 
 fn lock_held(lock: &Path) -> bool {
     let file = std::fs::OpenOptions::new()
@@ -139,46 +150,44 @@ fn guard_ends_what_the_command_left_behind_before_its_lock_goes() {
     assert!(!marker.exists(), "a helper outlived the guard");
 }
 
-/// Whether this process started with SIGINT ignored (a shell's background job: `cmd &`). The
-/// command would inherit that, and a shell cannot undo it. Linux reads `/proc`; macOS has none,
-/// so `ps` reports the mask there. A mask that cannot be read counts as ignored: the test then
-/// has nothing it can rely on.
-fn interrupts_ignored() -> bool {
-    let mask = match std::fs::read_to_string("/proc/self/status") {
-        Ok(status) => status
-            .lines()
-            .find_map(|line| line.strip_prefix("SigIgn:"))
-            .map(|mask| mask.trim().to_owned()),
-        Err(_) => Command::new("/bin/ps")
-            .args(["-o", "sigignore=", "-p", &std::process::id().to_string()])
-            .stderr(Stdio::null())
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned()),
-    };
-    mask.and_then(|mask| u64::from_str_radix(&mask, 16).ok())
-        .is_none_or(|mask| mask & (1 << (nix::libc::SIGINT - 1)) != 0)
-}
-
 #[test]
 fn a_terminal_interrupt_ends_the_command_not_the_guard() {
-    // Nothing to test when the command could not take an interrupt anyway.
-    if interrupts_ignored() {
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
-    let lock = wsmp::launch_guard::lock_path(dir.path());
     let running = dir.path().join("running");
-    let mut child = guard(
-        std::process::id(),
-        &lock,
-        &format!("touch '{}'; sleep 5", running.display()),
-    )
-    .stdout(Stdio::null())
-    .spawn()
-    .unwrap();
-    let group = nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap());
+    // The command may inherit SIGINT ignored (a shell's background job: `cmd &`; CI runners
+    // start tests that way), and a shell cannot undo that. Perl can: it restores the default,
+    // so the interrupt is the command's to take.
+    let script = format!(
+        r#"exec perl -e '{MARK_THEN_SLEEP}' "{}""#,
+        running.display()
+    );
+    interrupt_ends_command(dir.path(), &running, "/bin/sh", &["-c", &script]);
+}
+
+/// No shell in between: Linux's `sh` clears the signal mask it inherits (the guard blocks
+/// SIGINT), so only a program started directly shows whether the guard handed its mask down.
+#[test]
+fn a_terminal_interrupt_reaches_a_program_started_without_a_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    let running = dir.path().join("running");
+    let running_arg = running.to_string_lossy().into_owned();
+    interrupt_ends_command(
+        dir.path(),
+        &running,
+        "perl",
+        &["-e", MARK_THEN_SLEEP, &running_arg],
+    );
+}
+
+/// Starts `program` under a guard, waits until it marks itself `running`, then interrupts the
+/// guard's group as a terminal does: the command takes it, and the guard passes its status on.
+fn interrupt_ends_command(dir: &Path, running: &Path, program: &str, args: &[&str]) {
+    let lock = wsmp::launch_guard::lock_path(dir);
+    let mut child = guard_program(std::process::id(), &lock, program, args)
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("guard starts");
+    let group = nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("pid fits"));
     let until = Instant::now() + Duration::from_secs(10);
     while !running.exists() {
         assert!(Instant::now() < until, "the command never started");
@@ -187,8 +196,8 @@ fn a_terminal_interrupt_ends_the_command_not_the_guard() {
     // What a terminal's Ctrl-C does: SIGINT to the whole foreground group (the guard's own, in
     // the session it started).
     std::thread::sleep(Duration::from_millis(50));
-    nix::sys::signal::killpg(group, nix::sys::signal::SIGINT).unwrap();
-    let status = child.wait().unwrap();
+    nix::sys::signal::killpg(group, nix::sys::signal::SIGINT).expect("interrupt sent");
+    let status = child.wait().expect("guard exits");
     assert_eq!(status.code(), Some(128 + 2), "{status:?}");
 }
 

@@ -599,19 +599,17 @@ describe("placement work bound", () => {
     "refuses a reservation no node has the labels for once, not per head (preempt %s)",
     (preempt) => {
       const planner = new PlacementPlanner(context({ nodes: fleet() }));
-      const started = performance.now();
       const refusal = refused(
         planner.place(
           request({ preempt, reservations: [{ labels: ["missing"], resources: GB100 }] }),
         ),
       );
-      const elapsed = performance.now() - started;
       expect(refusal.reason).toBe("not_enough_nodes");
       expect(refusal.message).toContain("no other node has all of its labels");
       expect(refusal.reservation).toEqual({ index: 0, labels: ["missing"], nodeSlug: null });
-      // Linear: the labels are read once per node, never once per (head, node).
+      // Linear: the labels are read once per node, never once per (head, node). The work count
+      // is the bound, not wall time (a busy CI runner made a time limit flaky).
       expect(planner.work).toBeLessThan(10 * N);
-      expect(elapsed).toBeLessThan(2_000);
     },
   );
 
@@ -654,7 +652,6 @@ describe("placement work bound", () => {
     const planner = new PlacementPlanner(
       context({ nodes, instances: nodes.map((n) => filler(n.id)), workBudget: 50_000 }),
     );
-    const started = performance.now();
     const result = planner.place(
       request({
         preempt: true,
@@ -663,7 +660,7 @@ describe("placement work bound", () => {
         reservations: [{ labels: ["worker"], resources: { kind: "unified", memoryGb: 500 } }],
       }),
     );
-    expect(performance.now() - started).toBeLessThan(2_000);
+    // The bound is the work count, not wall time (a busy CI runner made a time limit flaky).
     expect(refused(result).reason).toBe("placement_too_complex");
     expect(planner.work).toBeLessThanOrEqual(50_000 + N + 2);
     // A spent planner refuses every later plan at once, and committed nothing.

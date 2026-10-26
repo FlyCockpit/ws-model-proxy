@@ -94,4 +94,8 @@ pub enum Command {
     #[cfg(windows)]
     #[command(name = "__conpty-host", hide = true)]
     ConptyHost(crate::commands::conpty_host::Args),
+
+    /// Internal: how a launch guard starts its command (with the signals it blocked unblocked).
+    #[command(name = "__launch-guard-exec", hide = true)]
+    LaunchGuardExec(crate::commands::launch_guard::ExecArgs),
 }
