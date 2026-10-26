@@ -986,4 +986,62 @@ mod tests {
         assert!(parse_runtime_host("example.com").is_none());
         assert!(parse_runtime_host("10.0.0.5:x").is_none());
     }
+
+    fn with_launch(
+        mut value: serde_json::Value,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> RuntimeSpec {
+        edit(&mut value["launch"]);
+        spec(value)
+    }
+
+    #[test]
+    fn argv_commands_are_checked_per_argument() {
+        let argv = |start: serde_json::Value| {
+            with_launch(startable("x"), |launch| {
+                launch["commands"][0]["start"] = start;
+            })
+        };
+        let ok = argv(serde_json::json!([
+            "vllm", "serve", "--port", "{{port}}", ""
+        ]));
+        assert_eq!(validate_spec(&ok, &[]), Ok(()));
+        let start = || Err(SpecIssue::Invalid("launch.commands[0].start".into()));
+        for bad in [
+            serde_json::json!([]),
+            serde_json::json!([" ", "serve"]),
+            serde_json::json!(["vllm", "{{nope}}"]),
+            serde_json::json!(["vllm", "a\u{202e}b"]),
+            serde_json::json!(vec!["a"; RUNTIME_ARGV_MAX + 1]),
+            serde_json::json!(["a".repeat(2048), "b".repeat(2048)]),
+        ] {
+            assert_eq!(validate_spec(&argv(bad.clone()), &[]), start(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn cmd_launches_and_interactive_steps_take_text_only() {
+        let cmd = with_launch(startable("x"), |launch| {
+            launch["shell"] = "cmd".into();
+            launch["commands"][0]["start"] = serde_json::json!(["agent.exe"]);
+        });
+        assert_eq!(
+            validate_spec(&cmd, &[]),
+            Err(SpecIssue::Invalid("launch.shell".into()))
+        );
+        let text = with_launch(startable("agent.exe"), |launch| {
+            launch["shell"] = "cmd".into();
+        });
+        assert_eq!(validate_spec(&text, &[]), Ok(()));
+        let interactive = with_launch(startable("x"), |launch| {
+            launch["management"] = "service".into();
+            launch["commands"][0]["status"] = "systemctl is-active x".into();
+            launch["commands"][0]["prepare"] = serde_json::json!(["setup", "--once"]);
+            launch["commands"][0]["interactive"] = serde_json::json!({ "prepare": true });
+        });
+        assert_eq!(
+            validate_spec(&interactive, &[]),
+            Err(SpecIssue::Invalid("launch.commands[0].prepare".into()))
+        );
+    }
 }

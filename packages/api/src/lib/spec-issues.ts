@@ -41,6 +41,8 @@ export const RUNTIME_SPEC_ISSUES = {
     'A status command exits 0 while running and 3 once stopped; this one never says stopped, so a stop could never be proven. For example: systemctl is-active --quiet <unit>, or out=$(docker compose ps --status running -q) || exit 1; [ -n "$out" ] || exit 3.',
   interactiveService: "An interactive start or afterJoin needs management service.",
   interactiveCommand: "An interactive {field} needs a {field} command.",
+  interactiveArgv: "An interactive command is text a person runs in a shell, not an argv.",
+  cmdArgv: "Command Prompt cannot quote an argument: a cmd launch has text commands only.",
   labelsMax16: "At most 16 labels.",
   specTooLarge: "A runtime definition is at most {maxBytes} bytes as canonical JSON.",
   addressOrLaunch: "A runtime has exactly one of address (always-on) or launch (startable).",

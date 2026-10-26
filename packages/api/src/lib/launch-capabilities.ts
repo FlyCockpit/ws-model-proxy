@@ -6,6 +6,7 @@
  */
 import { z } from "zod";
 import {
+  COMMAND_FIELDS,
   type NodePlatform,
   nodeFeaturesSchema,
   type RuntimeLaunch,
@@ -54,25 +55,31 @@ export function launchCapabilities(
 }
 
 /** The parts of a launch that say what it needs; a launch shape without them needs nothing. */
-export type LaunchNeeds = Partial<Pick<RuntimeLaunch, "management" | "commands">>;
+export type LaunchNeeds = Partial<Pick<RuntimeLaunch, "management" | "commands" | "shell">>;
 
-/** Every text command of the launch's command sets (argv commands need no shell). */
+/** Whether any command of the launch's command sets is text (argv commands need no shell). */
 function usesShell(commands: LaunchNeeds["commands"]): boolean {
   return (commands ?? []).some((set) =>
-    [set.start, set.stop, set.prepare, set.afterJoin, set.status, set.health].some(
-      (command) => typeof command === "string",
-    ),
+    COMMAND_FIELDS.some((field) => typeof set[field] === "string"),
   );
 }
 
-/** The shell the launch's text commands run in, or null when it has none. */
+/**
+ * The shell the launch's text commands run in (`launch.shell`, `sh` when absent), or null when
+ * it has none.
+ */
 export function launchShell(launch: LaunchNeeds): RuntimeShell | null {
-  return usesShell(launch.commands) ? "sh" : null;
+  return usesShell(launch.commands) ? (launch.shell ?? "sh") : null;
 }
 
-/** Whether a node with `capabilities` can run `launch`. */
+/**
+ * Whether a node with `capabilities` can run `launch`: its management mode, and the launch's
+ * shell, or for argv commands alone any shell but `cmd` (the node quotes an argv for it).
+ */
 export function launchRunsOn(launch: LaunchNeeds, capabilities: LaunchCapabilities): boolean {
   if (launch.management && !capabilities.management.has(launch.management)) return false;
   const shell = launchShell(launch);
-  return shell === null || capabilities.shells.has(shell);
+  if (shell !== null) return capabilities.shells.has(shell);
+  if (!launch.commands || launch.commands.length === 0) return true;
+  return [...capabilities.shells].some((available) => available !== "cmd");
 }

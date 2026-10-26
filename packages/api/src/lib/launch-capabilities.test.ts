@@ -71,5 +71,20 @@ describe("launchRunsOn", () => {
     expect(launchRunsOn(launch, windows)).toBe(false);
     // A shape without commands or management needs nothing.
     expect(launchRunsOn({}, windows)).toBe(true);
+    // The launch names its shell.
+    expect(launchShell({ ...launch, shell: "pwsh" })).toBe("pwsh");
+    expect(launchRunsOn({ ...launch, shell: "pwsh" }, windows)).toBe(true);
+  });
+
+  it("runs argv commands from any shell but cmd", () => {
+    const argv = { management: "process" as const, commands: [{ start: ["serve", "--port"] }] };
+    expect(launchShell(argv)).toBeNull();
+    expect(launchRunsOn(argv, linux)).toBe(true);
+    const cmdOnly = {
+      platform: "windows" as const,
+      management: new Set(["process"] as const),
+      shells: new Set(["cmd"] as const),
+    };
+    expect(launchRunsOn(argv, cmdOnly)).toBe(false);
   });
 });

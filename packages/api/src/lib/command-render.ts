@@ -12,10 +12,19 @@
  * range, its frozen fabric set) are left to the node: a job they refuse runs nothing. Secrets
  * reach the command as environment variables and are never substituted.
  *
+ * An argv command is rendered argument by argument and shown with `sh`-style quotes where an
+ * argument needs them; the node quotes it for the shell it runs it from (`argv_script`), which
+ * the server does not know, and may refuse an argument that shell cannot pass.
+ *
  * Pure: contracts are also bundled for the browser.
  */
 import { isFabricIp } from "./ip-literal";
-import { RUNTIME_COMMAND_MAX_BYTES, type RuntimeCommands, type RuntimeSpec } from "./runtime-spec";
+import {
+  RUNTIME_COMMAND_MAX_BYTES,
+  type RuntimeCommandLine,
+  type RuntimeCommands,
+  type RuntimeSpec,
+} from "./runtime-spec";
 import type { StepIntent, StepJobPlaceholders } from "./step-intent";
 
 /** Values the node derives itself on a multi-node job (never sent by the server). */
@@ -133,7 +142,10 @@ function phaseInteractive(commands: RuntimeCommands, phase: StepCommandPhase): b
   return false;
 }
 
-function phaseCommand(commands: RuntimeCommands, phase: StepCommandPhase): string | undefined {
+function phaseCommand(
+  commands: RuntimeCommands,
+  phase: StepCommandPhase,
+): RuntimeCommandLine | undefined {
   switch (phase) {
     case "PREPARE":
       return commands.prepare;
@@ -163,6 +175,16 @@ export type RenderedStepCommand =
 
 function utf8Bytes(text: string): number {
   return new TextEncoder().encode(text).length;
+}
+
+/** One argv argument as a person reads it: bare when plain, else in `sh` single quotes. */
+export function displayArg(arg: string): string {
+  return /^[A-Za-z0-9_@%+=:,./{}-]+$/.test(arg) ? arg : `'${arg.replaceAll("'", `'\\''`)}'`;
+}
+
+/** A saved command as a person reads it: text as written, an argv by `displayArg`. */
+export function displayCommand(command: RuntimeCommandLine): string {
+  return typeof command === "string" ? command : command.map(displayArg).join(" ");
 }
 
 /**
@@ -232,28 +254,41 @@ export function renderStepCommand(input: {
   }
 
   // render: the phase's command, then stop, status and health (each must render).
+  // An argv's size is its arguments joined with spaces, checked before the node quotes them.
   const renderOne = (
-    text: string,
+    command: RuntimeCommandLine,
     field: string,
   ):
     | { ok: true; text: string; fills: NodeLocalPlaceholder[]; ambiguous: boolean }
     | RenderedStepCommand => {
-    const result = substitute(text, values, nodeLocal);
-    if (!result.ok) return refused(`placeholders.${result.missing}`);
-    // Smallest size the node's text can have: each kept node-local value at its shortest.
-    let bytes = utf8Bytes(result.text);
-    for (const name of result.kept) bytes -= utf8Bytes(`{{${name}}}`) - NODE_LOCAL_MIN_BYTES[name];
+    const parts = typeof command === "string" ? [command] : command;
+    const rendered: string[] = [];
+    const fills = new Set<NodeLocalPlaceholder>();
+    let bytes = parts.length - 1;
+    let ambiguous = false;
+    for (const part of parts) {
+      const result = substitute(part, values, nodeLocal);
+      if (!result.ok) return refused(`placeholders.${result.missing}`);
+      // Smallest size the node's text can have: each kept node-local value at its shortest.
+      bytes += utf8Bytes(result.text);
+      for (const name of result.kept)
+        bytes -= utf8Bytes(`{{${name}}}`) - NODE_LOCAL_MIN_BYTES[name];
+      // Shown with values the node fills, a `{{fabric_*}}` it leaves alone (literal text) would
+      // look like one more: any such name with more occurrences than were kept.
+      ambiguous ||=
+        result.kept.length > 0 &&
+        NODE_LOCAL_PLACEHOLDERS.some(
+          (name) =>
+            result.text.split(`{{${name}}}`).length - 1 !==
+            result.kept.filter((kept) => kept === name).length,
+        );
+      for (const name of result.nodeFills) fills.add(name);
+      rendered.push(result.text);
+    }
     if (bytes > RUNTIME_COMMAND_MAX_BYTES) return refused(field);
-    // Shown with values the node fills, a `{{fabric_*}}` it leaves alone (literal text) would
-    // look like one more: any such name with more occurrences than were kept.
-    const ambiguous =
-      result.kept.length > 0 &&
-      NODE_LOCAL_PLACEHOLDERS.some(
-        (name) =>
-          result.text.split(`{{${name}}}`).length - 1 !==
-          result.kept.filter((kept) => kept === name).length,
-      );
-    return { ok: true, text: result.text, fills: result.nodeFills, ambiguous };
+    const text =
+      typeof command === "string" ? (rendered[0] ?? "") : rendered.map(displayArg).join(" ");
+    return { ok: true, text, fills: [...fills], ambiguous };
   };
   const text = phaseCommand(commands, input.phase);
   const command =

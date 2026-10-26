@@ -1,0 +1,46 @@
+{
+  "type": "runtime.define",
+  "opId": "def-5",
+  "chunkIndex": 0,
+  "final": true,
+  "put": [
+    {
+      "runtimeId": "rt5w8i7n6d5o4w3s2a1b0c9d8",
+      "versionId": "vr5w8i7n6d5o4w3s2a1b0c9d8",
+      "launchHash": "255f07d352ef43b5abe3ea01ff5c737129ebae7cb54239cc0527ff205adc2118",
+      "kind": "startable",
+      "slug": "windows-agent",
+      "spec": {
+        "launch": {
+          "management": "process",
+          "shell": "pwsh",
+          "groupSize": 1,
+          "resources": [
+            {
+              "kind": "none"
+            }
+          ],
+          "labels": [],
+          "commands": [
+            {
+              "start": [
+                "C:\\Tools\\agent\\agent.exe",
+                "serve",
+                "--port",
+                "{{port}}",
+                "--name",
+                "it's mine"
+              ],
+              "status": "if (Get-Process agent -ErrorAction SilentlyContinue) { exit 0 } else { exit 3 }"
+            }
+          ],
+          "health": {
+            "intervalMs": 30000,
+            "failureThreshold": 3,
+            "successThreshold": 1
+          }
+        }
+      }
+    }
+  ]
+}

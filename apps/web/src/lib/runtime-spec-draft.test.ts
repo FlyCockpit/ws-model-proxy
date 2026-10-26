@@ -110,6 +110,14 @@ describe("runtime spec draft", () => {
     expect(sameSpec(back, spec)).toBe(true);
   });
 
+  it("keeps a launch's shell through the form", () => {
+    const spec = {
+      ...SPECS.vllm,
+      launch: { ...(SPECS.vllm.launch as Record<string, unknown>), shell: "pwsh" },
+    };
+    expect(losslessDraft(spec, "STARTABLE")).not.toBeNull();
+  });
+
   it.each(RUNTIME_PRESET_LIST.map((preset) => [preset.id, preset] as const))(
     "creates the %s preset unchanged from the form",
     (_id, preset) => {
@@ -418,6 +426,10 @@ describe("lossless form conversion (F10 class)", () => {
     [
       "an unknown command key",
       { ...SPECS.vllm, launch: { ...launch, commands: [{ start: "s", stop: "t", restart: "r" }] } },
+    ],
+    [
+      "an argv command",
+      { ...SPECS.vllm, launch: { ...launch, commands: [{ start: ["vllm", "serve"], stop: "t" }] } },
     ],
     ["a number written as text", { ...SPECS.vllm, launch: { ...launch, groupSize: "1" } }],
     ["a part the form fills in", { ...SPECS.vllm, launch: { ...launch, labels: undefined } }],

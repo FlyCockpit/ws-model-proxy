@@ -185,6 +185,10 @@ function commandDraft(commands: unknown, baseIndex: number): CommandDraft {
   const value = (commands ?? {}) as Partial<Record<CommandField, string>> & {
     timeoutsSec?: Partial<Record<TimeoutField, number>>;
   };
+  // An argv command has no text field: the form cannot show it (the editor keeps the JSON tab).
+  for (const field of COMMAND_FIELDS)
+    if (value[field] !== undefined && typeof value[field] !== "string")
+      throw new TypeError(`commands.${field} is not text`);
   const timeouts = emptyTimeouts();
   for (const field of TIMEOUT_FIELDS) timeouts[field] = str(value.timeoutsSec?.[field]);
   return {
@@ -455,6 +459,8 @@ export function draftToSpec(draft: SpecDraft, base: Record<string, unknown>, kin
             commands: draft.commands.map((commands) =>
               commandsFromDraft(commands, baseCommands[commands.baseIndex] ?? {}),
             ),
+            // The form has no shell field: the written one is kept.
+            shell: baseLaunch.shell,
             secrets: baseLaunch.secrets,
             readiness: draft.readiness.enabled
               ? {

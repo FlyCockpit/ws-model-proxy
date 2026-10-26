@@ -87,6 +87,8 @@ export type RuntimePlaceholder = (typeof RUNTIME_PLACEHOLDERS)[number];
 
 /** UTF-8 bytes of one command, saved and after placeholder substitution. */
 export const RUNTIME_COMMAND_MAX_BYTES = 4096;
+/** Arguments of one argv command, its program included. */
+export const RUNTIME_ARGV_MAX = 64;
 /**
  * UTF-8 bytes of one canonical spec. Below the 64 KiB control-frame cap so one define envelope
  * always fits in one `runtime.define` chunk.
@@ -227,16 +229,42 @@ export const NODE_PLATFORMS = ["linux", "macos", "windows"] as const;
 export type NodePlatform = (typeof NODE_PLATFORMS)[number];
 
 const PLACEHOLDER = /\{\{([a-z_]+)\}\}/g;
+function checkPlaceholders(value: string, ctx: z.RefinementCtx) {
+  for (const [, key] of value.matchAll(PLACEHOLDER))
+    if (!(RUNTIME_PLACEHOLDERS as readonly string[]).includes(key ?? ""))
+      ctx.addIssue({
+        code: "custom",
+        ...specIssue("unknownPlaceholder", { placeholder: `{{${key}}}` }),
+      });
+}
 export const runtimeCommandSchema = runtimeTextSchema(RUNTIME_COMMAND_MAX_BYTES)
   .refine((value) => value.trim().length > 0, specIssue("commandBlank"))
-  .superRefine((value, ctx) => {
-    for (const [, key] of value.matchAll(PLACEHOLDER))
-      if (!(RUNTIME_PLACEHOLDERS as readonly string[]).includes(key ?? ""))
-        ctx.addIssue({
-          code: "custom",
-          ...specIssue("unknownPlaceholder", { placeholder: `{{${key}}}` }),
-        });
-  });
+  .superRefine(checkPlaceholders);
+
+/**
+ * A runtime command: text the launch's shell runs (`launch.shell`), or an argv the node runs
+ * without a shell's parsing, quoting every argument for the shell it starts it from. An argv
+ * holds 1 to `RUNTIME_ARGV_MAX` arguments, its program not blank, and joined with spaces is no
+ * longer than a text command. The node's twin is `command_line_ok`
+ * (`apps/cli/src/runtime_store/validate.rs`).
+ */
+export const runtimeCommandLineSchema = z.union([
+  runtimeCommandSchema,
+  z
+    .array(runtimeTextSchema(RUNTIME_COMMAND_MAX_BYTES).superRefine(checkPlaceholders))
+    .min(1)
+    .max(RUNTIME_ARGV_MAX)
+    .refine((argv) => (argv[0] ?? "").trim().length > 0, specIssue("commandBlank"))
+    .refine((argv) => utf8Bytes(argv.join(" ")) <= RUNTIME_COMMAND_MAX_BYTES, {
+      ...specIssue("textTooLong", { maxBytes: RUNTIME_COMMAND_MAX_BYTES }),
+    }),
+]);
+export type RuntimeCommandLine = z.infer<typeof runtimeCommandLineSchema>;
+
+/** A command as one line of text: an argv joined with spaces (for display and checks). */
+export function commandLineText(command: RuntimeCommandLine): string {
+  return typeof command === "string" ? command : command.join(" ");
+}
 
 /** A served model id exactly as the relay normalizes it: trimmed, single line, ≤ 256 bytes. */
 export const servedModelIdSchema = runtimeTextSchema(256)
@@ -415,26 +443,40 @@ const timeoutsSchema = z
 
 export const runtimeCommandsSchema = z
   .object({
-    start: runtimeCommandSchema,
+    start: runtimeCommandLineSchema,
     /**
      * Optional for `management: "process"` (the node's stop ends the rank's slice and proves
      * it); a `service` runtime must have one.
      */
-    stop: runtimeCommandSchema.optional(),
-    prepare: runtimeCommandSchema.optional(),
-    afterJoin: runtimeCommandSchema.optional(),
-    status: runtimeCommandSchema.optional(),
-    health: runtimeCommandSchema.optional(),
+    stop: runtimeCommandLineSchema.optional(),
+    prepare: runtimeCommandLineSchema.optional(),
+    afterJoin: runtimeCommandLineSchema.optional(),
+    status: runtimeCommandLineSchema.optional(),
+    health: runtimeCommandLineSchema.optional(),
     interactive: interactiveSchema.optional(),
     timeoutsSec: timeoutsSchema.optional(),
   })
   .strict();
 export type RuntimeCommands = z.infer<typeof runtimeCommandsSchema>;
+/** The command fields of one rank, `start` first. */
+export const COMMAND_FIELDS = [
+  "start",
+  "stop",
+  "prepare",
+  "afterJoin",
+  "status",
+  "health",
+] as const satisfies readonly (keyof RuntimeCommands)[];
 
 export const runtimeLaunchSchema = z
   .object({
     /** `process`: the node owns the unit (was ownedProcess); `service`: stop/status prove it. */
     management: z.enum(RUNTIME_MANAGEMENTS),
+    /**
+     * The interpreter of the text commands (`sh` when absent). Argv commands need no shell of
+     * the launch's; `cmd` cannot quote an argument, so a `cmd` launch has text commands only.
+     */
+    shell: z.enum(RUNTIME_SHELLS).optional(),
     groupSize: z.number().int().min(1).max(RUNTIME_GROUP_SIZE_MAX),
     resources: z.array(runtimeResourceSchema).min(1).max(RUNTIME_GROUP_SIZE_MAX),
     labels: runtimeLabelsSchema,
@@ -522,19 +564,25 @@ export const runtimeLaunchSchema = z
       const path = ["commands", index];
       const interactive = commands.interactive;
       const anyInteractive = !!interactive && Object.values(interactive).some(Boolean);
-      if (launch.management === "service" && !commands.stop?.trim())
+      if (launch.shell === "cmd" && COMMAND_FIELDS.some((field) => Array.isArray(commands[field])))
+        ctx.addIssue({
+          code: "custom",
+          path: ["shell"],
+          ...specIssue("cmdArgv"),
+        });
+      if (launch.management === "service" && !commands.stop)
         ctx.addIssue({
           code: "custom",
           path: [...path, "stop"],
           ...specIssue("serviceStop"),
         });
-      if (launch.management === "service" && !commands.status?.trim())
+      if (launch.management === "service" && !commands.status)
         ctx.addIssue({
           code: "custom",
           path: [...path, "status"],
           ...specIssue("serviceStatus"),
         });
-      if (anyInteractive && !commands.status?.trim())
+      if (anyInteractive && !commands.status)
         ctx.addIssue({
           code: "custom",
           path: [...path, "status"],
@@ -552,6 +600,14 @@ export const runtimeLaunchSchema = z
             code: "custom",
             path: [...path, "interactive", field],
             ...specIssue("interactiveCommand", { field }),
+          });
+      // A person runs an interactive step in an operator terminal's shell: it is text.
+      for (const field of ["start", "stop", "prepare", "afterJoin"] as const)
+        if (interactive?.[field] && Array.isArray(commands[field]))
+          ctx.addIssue({
+            code: "custom",
+            path: [...path, field],
+            ...specIssue("interactiveArgv"),
           });
     });
   });
@@ -742,7 +798,7 @@ export function statusCanReportStopped(command: string): boolean {
  */
 export const authoredRuntimeSpecSchema = runtimeSpecSchema.superRefine((spec, ctx) => {
   spec.launch?.commands.forEach((commands, index) => {
-    if (commands.status !== undefined && !statusCanReportStopped(commands.status))
+    if (commands.status !== undefined && !statusCanReportStopped(commandLineText(commands.status)))
       ctx.addIssue({
         code: "custom",
         path: ["launch", "commands", index, "status"],
@@ -863,7 +919,10 @@ export function runtimeSpecWarnings(spec: RuntimeSpec): RuntimeSpecWarning[] {
   const texts: string[] = [];
   if (spec.address) texts.push(spec.address.baseUrl);
   for (const commands of spec.launch?.commands ?? [])
-    for (const value of Object.values(commands)) if (typeof value === "string") texts.push(value);
+    for (const field of COMMAND_FIELDS) {
+      const command = commands[field];
+      if (command !== undefined) texts.push(commandLineText(command));
+    }
   return texts.some((text) => ALL_INTERFACES.test(text) || VLLM_SERVE_WITHOUT_HOST.test(text))
     ? ["binds_all_interfaces"]
     : [];
