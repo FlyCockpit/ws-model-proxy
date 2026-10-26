@@ -53,6 +53,17 @@ Or build a release tag with cargo directly:
 cargo install --git https://github.com/FlyCockpit/ws-model-proxy --tag v0.4.2 --locked wsmp
 ```
 
+**Windows.** `install.sh` does not run on Windows. Use the PowerShell installer of the release that
+matches your server's version (`vX.Y.Z` below). It puts `wsmp.exe` in `%USERPROFILE%\.cargo\bin`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/FlyCockpit/ws-model-proxy/releases/download/vX.Y.Z/wsmp-installer.ps1 | iex"
+```
+
+Or download `wsmp-x86_64-pc-windows-msvc.zip` from that release, check it against `sha256.sum`
+(`gh attestation verify` works for it too), and put `wsmp.exe` on your `PATH`. Windows 11 on x86_64
+is supported. See [Windows](#windows) for what runs there and what does not.
+
 ## Log in
 
 On the server's **Nodes** page, create an enrollment code, then on this computer run:
@@ -208,6 +219,13 @@ service's cgroup still holds them. On macOS only the relay's descendants are ref
 walk), so a detached process escapes. If you do not trust the code on this account, Relay only does
 not make it safe.
 
+On Windows there is no `/proc` to walk. The relay puts itself in a job object when it starts, so
+everything it starts, and everything those start, is a member, and a running relay answers
+whether a caller is one of its own. Runtimes run in jobs of their own that outlive the relay, so
+their members are refused whether or not a relay runs. What Windows does not cover: a member can
+ask a process outside wsmp's jobs to start something for it (Task Scheduler, WMI, Explorer), and
+that is then not a member. This is why browser terminals on Windows need Full control.
+
 Lowering only stops new agent access through wsmp. It does not undo or contain software an agent
 already left on the node while it had Full control, such as a systemd user service: that software
 runs as the same user and can even raise trust again locally. If you distrust what an agent did,
@@ -236,7 +254,8 @@ The server asks a node to do two different kinds of work:
 - **Runtimes** are definitions the server stores and versions: an always-on inference server
   already running here, or a startable one (or a service) with start, readiness and health
   commands, and a stop command where it needs one (a `process` runtime may leave it out: the
-  node's stop ends everything in that part's systemd slice and proves it). The server sends the
+  node's stop ends everything in that part's systemd slice, or its runtime hosts' jobs on
+  Windows, and proves it). The server sends the
   definitions to the node, then starts and stops instances by
   version; the node renders each command from the definition it holds, so a start never runs
   text it was not given in a definition. At Relay only, the held definitions are frozen and can
@@ -276,6 +295,66 @@ escaped them (containers from `docker compose up -d`, a daemon that re-parents).
 runtime the inventory runs no status command and checks no unit first, so it names a held port
 `port_in_use`. To check the ports it binds each one for an instant, as
 the relay does; it writes nothing and runs no definition command. Runtimes are defined in the web app or through MCP.
+
+**Shells.** A runtime's text commands run in the shell its launch names (`launch.shell`: `sh`, the
+default, or `pwsh`, `powershell` or `cmd`). An argv command
+(`["llama-server", "-m", "{{model}}", "--port", "{{port}}"]`) runs on every node, which quotes it
+for its own shell (`cmd` cannot take one). The server places a launch only on nodes whose platform,
+management mode and shells can run it.
+
+**Windows runtimes.**
+- A launch (prepare, start, after-join) runs in a runtime host (`wsmp __runtime-host`) with a hidden
+  console. Everything its command starts stays in the host's job.
+- The runtime keeps running while the relay restarts.
+- A stop sends Ctrl+Break to the command, then ends the whole job after 10 seconds (at most half
+  the step's time).
+- Status, stop and health commands run to completion in a job of their own.
+- PowerShell commands exit with their last command's status, as `sh` does, so a status command
+  says stopped by exiting 3.
+- Interactive steps (operator terminals) do not run on Windows yet.
+
+## Windows
+
+`wsmp` runs natively on Windows 11 (x86_64). Windows 10 1809 or later may work, but it is not
+supported.
+
+**What runs.**
+- the relay and `wsmp service` (a Task Scheduler task);
+- trust and the local control commands;
+- browser terminals (ConPTY, with PowerShell 7, Windows PowerShell, Command Prompt or a WSL
+  distribution);
+- node commands;
+- runtimes in PowerShell or `cmd`.
+
+Install PowerShell 7 (`pwsh`) for runtimes. Windows PowerShell 5.1 works, but it changes some
+arguments it passes to a program (an empty one, or one with a quote in it), so the node refuses an
+argv command with such an argument there.
+
+**Not on Windows (yet).**
+- The node file tools: the server's file operations are refused.
+- Pasting images into a browser terminal.
+- Interactive runtime steps.
+- Engines that need Linux, such as vLLM and SGLang. llama.cpp's `llama-server`, Ollama and LM
+  Studio run natively.
+
+**Limits to know.**
+- The service runs while you are logged on. At log off, Windows ends it and the runtimes it
+  started.
+- The trust check has the gap described under [Trust](#trust).
+- A runtime host keeps the relay's own stdout and stderr open when they are pipes, as with
+  `wsmp run | Tee-Object relay.log`, until the runtime stops. The service and a relay run in a
+  terminal have console handles instead, so they are not affected.
+
+**WSL2 instead.** The Linux `wsmp` in a WSL2 distribution has every Linux feature: the file tools,
+and vLLM with CUDA on WSL.
+1. Enable systemd in the distribution (`/etc/wsl.conf`: `[boot]` then `systemd=true`), then run
+   `wsl --shutdown`.
+2. Install `wsmp` with `install.sh` inside the distribution.
+3. Run `loginctl enable-linger $USER` and `wsmp service install` as on any Linux.
+
+Agents then see Linux, not Windows, and files under `/mnt/c` are slow. WSL can stop a distribution
+that nothing is using: after you close your terminals, check that the node stays connected, and
+start the distribution at log on if it does not.
 
 ## Other commands
 
