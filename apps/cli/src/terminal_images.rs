@@ -217,7 +217,8 @@ fn wsl_path(root: &str, path: &str) -> Option<String> {
 
 /// The drive mount root `[automount] root` sets in a WSL distribution's `/etc/wsl.conf`,
 /// with a trailing `/`; `/mnt/` when it sets none (or nothing usable).
-pub(crate) fn wsl_mount_root(conf: &str) -> String {
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wsl_mount_root(conf: &str) -> String {
     let mut section = String::new();
     for line in conf.lines() {
         let line = line.trim();
