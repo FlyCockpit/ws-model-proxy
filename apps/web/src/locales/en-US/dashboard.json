@@ -253,8 +253,12 @@
       "creating": "Creating…",
       "failed": "The command could not be created.",
       "commandLabel": "Install command",
+      "platformLabel": "The computer's system",
+      "platformUnix": "Linux / macOS",
+      "platformWindows": "Windows",
       "secretOnce": "This code is shown only once.",
       "installsWhere": "It installs wsmp into ~/.cargo/bin ($CARGO_HOME/bin when set). When the server offers release builds, Linux (x86_64 or ARM64, glibc 2.34 or newer) and macOS get a checksummed binary; otherwise it builds wsmp from source, which needs Rust 1.88 or newer.",
+      "installsWhereWindows": "Paste it into PowerShell. It installs wsmp.exe into %USERPROFILE%\\.cargo\\bin (%CARGO_HOME%\\bin when set). When the server offers release builds, Windows 11 gets a checksummed x86_64 binary (it also runs on ARM64); otherwise it builds wsmp from source, which needs Rust 1.88 or newer and the Visual Studio C++ build tools.",
       "terminalsAsked": "With Full control, `wsmp login` then asks whether to allow browser terminals on that node (yes by default). Only the node can change it later, with `wsmp config set-human-terminal on|off`.",
       "waiting": "Waiting for the node to connect…",
       "joined": "{{slug}} joined",
@@ -265,7 +269,7 @@
       "newCode": "New code",
       "onMachine": "What happens on the computer",
       "machineSteps": {
-        "install": "The script installs wsmp (where and how is below).",
+        "install": "The script installs wsmp (where and how is under the command).",
         "login": "`wsmp login` uses the code: the computer joins your account as a node, with no other approval.",
         "trust": "It asks how much control this server gets: Full control (the default) or Relay only, where agents cannot change anything on the node.",
         "service": "It offers to install a per-user service, so the node starts at boot."

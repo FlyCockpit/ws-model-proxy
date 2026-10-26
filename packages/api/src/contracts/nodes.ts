@@ -694,6 +694,8 @@ export const nodesContract = {
           /** `wsmp_enr_` + 26 base32 characters; shown once. */
           secret: z.string().regex(/^wsmp_enr_[A-Z2-7]{26}$/),
           installCommand: z.string(),
+          /** The same for Windows, to paste into PowerShell. */
+          windowsInstallCommand: z.string(),
         })
         .strict(),
       "Mint an enrollment code (single-use by default, up to 50 nodes; minting is the approval).",

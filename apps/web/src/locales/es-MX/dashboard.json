@@ -253,8 +253,12 @@
       "creating": "Creando…",
       "failed": "No se pudo crear el comando.",
       "commandLabel": "Comando de instalación",
+      "platformLabel": "El sistema de la computadora",
+      "platformUnix": "Linux / macOS",
+      "platformWindows": "Windows",
       "secretOnce": "Este código se muestra una sola vez.",
       "installsWhere": "Instala wsmp en ~/.cargo/bin ($CARGO_HOME/bin si está definido). Cuando el servidor ofrece compilaciones publicadas, Linux (x86_64 o ARM64, glibc 2.34 o posterior) y macOS reciben un binario verificado con suma de verificación; si no, compila wsmp desde el código fuente, lo que requiere Rust 1.88 o posterior.",
+      "installsWhereWindows": "Pégalo en PowerShell. Instala wsmp.exe en %USERPROFILE%\\.cargo\\bin (%CARGO_HOME%\\bin si está definido). Cuando el servidor ofrece compilaciones publicadas, Windows 11 recibe un binario x86_64 verificado con suma de verificación (también funciona en ARM64); si no, compila wsmp desde el código fuente, lo que requiere Rust 1.88 o posterior y las herramientas de compilación de C++ de Visual Studio.",
       "terminalsAsked": "Con control total, `wsmp login` luego pregunta si se permiten terminales del navegador en ese nodo (sí, de forma predeterminada). Solo el nodo puede cambiarlo más adelante, con `wsmp config set-human-terminal on|off`.",
       "waiting": "Esperando a que el nodo se conecte…",
       "joined": "{{slug}} se unió",
@@ -265,7 +269,7 @@
       "newCode": "Código nuevo",
       "onMachine": "Qué pasa en la computadora",
       "machineSteps": {
-        "install": "El script instala wsmp (dónde y cómo, abajo).",
+        "install": "El script instala wsmp (dónde y cómo, debajo del comando).",
         "login": "`wsmp login` usa el código: la computadora se une a tu cuenta como nodo, sin otra aprobación.",
         "trust": "Pregunta cuánto control tiene este servidor: control total (el predeterminado) o solo retransmisión, donde los agentes no pueden cambiar nada en el nodo.",
         "service": "Ofrece instalar un servicio de usuario para que el nodo arranque al iniciar el sistema."

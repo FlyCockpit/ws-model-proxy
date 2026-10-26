@@ -53,15 +53,17 @@ Or build a release tag with cargo directly:
 cargo install --git https://github.com/FlyCockpit/ws-model-proxy --tag v0.4.2 --locked wsmp
 ```
 
-**Windows.** `install.sh` does not run on Windows. Use the PowerShell installer of the release that
-matches your server's version (`vX.Y.Z` below). It puts `wsmp.exe` in `%USERPROFILE%\.cargo\bin`:
+**Windows.** In PowerShell (Windows PowerShell 5.1 or PowerShell 7), from your server:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/FlyCockpit/ws-model-proxy/releases/download/vX.Y.Z/wsmp-installer.ps1 | iex"
+irm https://wsmp.example.com/install.ps1 | iex
 ```
 
-Or download `wsmp-x86_64-pc-windows-msvc.zip` from that release, check it against `sha256.sum`
-(`gh attestation verify` works for it too), and put `wsmp.exe` on your `PATH`. Windows 11 on x86_64
+It installs the server's version like `install.sh` does: the release's
+`wsmp-x86_64-pc-windows-msvc.zip`, checked against `sha256.sum` (it refuses to install on a
+mismatch or a missing checksum), into `%USERPROFILE%\.cargo\bin` (`%CARGO_HOME%\bin` when set),
+else a source build with cargo. Windows 11 on ARM64 runs the x86_64 binary. The Nodes page's
+**Add a node** has a Windows tab with this command and the login after it. Windows 11 on x86_64
 is supported. See [Windows](#windows) for what runs there and what does not.
 
 ## Log in

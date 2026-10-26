@@ -91,6 +91,9 @@ describe("nodes.enrollmentCodes.create", () => {
     expect(out.installCommand).toBe(
       `curl -fsSL https://proxy.example.com/install.sh | sh && ~/.cargo/bin/wsmp login https://proxy.example.com --code ${out.secret}`,
     );
+    expect(out.windowsInstallCommand).toBe(
+      `irm https://proxy.example.com/install.ps1 | iex; & "$env:USERPROFILE\\.cargo\\bin\\wsmp.exe" login https://proxy.example.com --code ${out.secret}`,
+    );
     expect(out.code.enrolled).toEqual([
       { nodeId: "node-1", slug: "box", usedAt: "2026-10-06T10:05:00.000Z" },
     ]);

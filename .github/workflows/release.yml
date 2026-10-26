@@ -468,8 +468,9 @@ jobs:
       - name: Cleanup
         run: rm -f apps/cli/artifacts/*-dist-manifest.json
 
-      # /install.sh downloads these archives and verifies them against sha256.sum (fail closed).
-      # Refuse to publish a release that lacks either, so a node never meets a half-published one.
+      # /install.sh and /install.ps1 download these archives and verify them against sha256.sum
+      # (fail closed). Refuse to publish a release that lacks either, so a node never meets a
+      # half-published one.
       - name: Check CLI archives and checksums
         shell: bash
         run: |
@@ -478,8 +479,7 @@ jobs:
           # cargo-dist ends sha256.sum with a blank line, which `sha256sum --strict` refuses as
           # improperly formatted. Drop blank lines so the published file passes a strict check.
           sed -i '/^[[:space:]]*$/d' sha256.sum
-          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
-            archive="wsmp-$target.tar.xz"
+          for archive in wsmp-x86_64-unknown-linux-gnu.tar.xz wsmp-aarch64-unknown-linux-gnu.tar.xz wsmp-aarch64-apple-darwin.tar.xz wsmp-x86_64-apple-darwin.tar.xz wsmp-x86_64-pc-windows-msvc.zip; do
             if [ ! -f "$archive" ]; then
               echo "::error::$archive is missing from the release artifacts."
               exit 1

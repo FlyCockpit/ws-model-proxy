@@ -122,7 +122,7 @@ pnpm policy:auth-session
 Releases are created manually from the `master` branch with the root `Release` GitHub Actions workflow. A release publishes:
 
 - The app container to GHCR.
-- Cross-platform `wsmp` CLI archives to the GitHub Release, with a `sha256.sum` checksum file and signed build-provenance attestations (`gh attestation verify <archive> --repo FlyCockpit/ws-model-proxy`). The workflow refuses to publish when a Linux or macOS archive or its checksum is missing.
+- Cross-platform `wsmp` CLI archives to the GitHub Release, with a `sha256.sum` checksum file and signed build-provenance attestations (`gh attestation verify <archive> --repo FlyCockpit/ws-model-proxy`). The workflow refuses to publish when a Linux, macOS or Windows archive or its checksum is missing.
 - The generated Homebrew formula to `FlyCockpit/homebrew-tap`.
 
 Before the first release, create a protected `release` environment and add `HOMEBREW_TAP_TOKEN` as an environment secret. It must have `contents:write` access to `FlyCockpit/homebrew-tap` so the release workflow can update `Formula/wsmp.rb`.

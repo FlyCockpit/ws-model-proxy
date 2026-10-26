@@ -15,6 +15,7 @@ import { isConstraintViolation, notFound, refuse } from "../lib/refuse";
 import {
   enrollmentCodePrefix,
   enrollmentInstallCommand,
+  enrollmentWindowsInstallCommand,
   generateEnrollmentCode,
 } from "./enrollment-code";
 
@@ -176,6 +177,7 @@ export const enrollmentProcedures = {
       code: toEnrollmentCodeView(row),
       secret,
       installCommand: enrollmentInstallCommand(env.BETTER_AUTH_URL, secret),
+      windowsInstallCommand: enrollmentWindowsInstallCommand(env.BETTER_AUTH_URL, secret),
     };
   }),
 
