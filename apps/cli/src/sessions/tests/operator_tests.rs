@@ -425,11 +425,29 @@ fn a_stop_closes_confirm_screens_but_never_a_running_command() {
     assert!(terminals.on_trust_lowered().is_empty());
     assert!(terminals.sessions.contains_key(MULTI_TERMINAL));
     assert!(events.try_recv().is_err());
+    let pid = terminals.sessions[MULTI_TERMINAL]
+        .pty
+        .as_ref()
+        .and_then(|pty| pty.pid)
+        .expect("running command pid");
+    assert!(!process_dead(pid), "the stop must leave the command alive");
     let frames = terminals.close(MULTI_TERMINAL);
     let closed = results(&frames);
     assert_eq!(closed.len(), 1);
     assert_eq!(closed[0].0, JobStatus::OperatorClosed);
-    assert_eq!(closed[0].1, Some(128 + 9), "killed");
+    // Close only polls for an exit briefly: a busy macOS runner can return before SIGKILL
+    // takes effect. Still require the actual SIGKILL status, reaping it here if close could
+    // not; accepting a closed tab alone would hide a command that survived the close.
+    let mut exit_code = closed[0].1;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while exit_code.is_none() && Instant::now() < deadline {
+        let (code, signal) = reap_pid(Some(pid));
+        exit_code = wire_exit_code(code.or_else(|| signal.map(|signal| 128 + signal)));
+        if exit_code.is_none() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    assert_eq!(exit_code, Some(128 + 9), "the command must be killed");
     assert_eq!(events.try_recv(), Ok(OperatorEvent::Closed));
 }
 
