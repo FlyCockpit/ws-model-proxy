@@ -51,8 +51,29 @@ pub struct Policy {
     allow_root: bool,
 }
 
-/// Trees that are not regular-file storage.
+/// Trees that are not regular-file storage. Windows resolves to drive paths only
+/// (`resolve_windows`), so no device namespace is reachable there.
+#[cfg(unix)]
 const SPECIAL_TREES: [&str; 3] = ["/proc", "/sys", "/dev"];
+#[cfg(not(unix))]
+const SPECIAL_TREES: [&str; 0] = [];
+
+/// The effective user id; on Windows 0 when the process is elevated (an
+/// administrator's full token), the stand-in for root, and also when that
+/// cannot be told (fail closed).
+fn effective_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        nix::unistd::geteuid().as_raw()
+    }
+    #[cfg(windows)]
+    {
+        match wsmp_windows::process_is_elevated() {
+            Ok(false) => 1,
+            _ => 0,
+        }
+    }
+}
 
 impl Policy {
     /// Crate-private on purpose: a policy built outside
@@ -68,7 +89,7 @@ impl Policy {
             roots_required,
             roots_usable,
             protected: with_physical_aliases(protected),
-            euid: nix::unistd::geteuid().as_raw(),
+            euid: effective_uid(),
             allow_root,
         }
     }
@@ -189,6 +210,14 @@ impl Policy {
     /// platform. Linux adds a kernel second guard via safe openat2.
     /// ENOSYS alone falls back to the existing physical-fd policy. Missing
     /// leaves are allowed here so creation can use the held, checked parent.
+    #[cfg(not(unix))]
+    fn check_beneath(&self, _full: &Path) -> FileResult<()> {
+        // Windows has no fd-relative resolution: `resolve_windows` checks the
+        // final path of the object it opened instead.
+        Ok(())
+    }
+
+    #[cfg(unix)]
     fn check_beneath(&self, full: &Path) -> FileResult<()> {
         if self.roots_required {
             use nix::fcntl::{OFlag, open};
@@ -248,9 +277,8 @@ impl Policy {
             if !blocked {
                 continue;
             }
-            match std::fs::metadata(&entry.path) {
-                Ok(meta) => {
-                    let protected = Stat::from_metadata(&meta);
+            match Stat::of_path(&entry.path) {
+                Ok(protected) => {
                     if protected.dev == stat.dev && protected.ino == stat.ino {
                         return Err(FileError::denied("path is protected by wsmp"));
                     }
@@ -449,6 +477,7 @@ fn default_protected() -> Vec<Protected> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn private_state_subtree_is_protected_at_actual_policy_boundary() {
         if let Some(root) = std::env::var_os("WSMP_PRIVATE_STATE_FIXTURE") {
@@ -577,6 +606,8 @@ mod tests {
         assert_eq!(physical(&up), cwd.parent().unwrap().join("wsmp-x.json"));
     }
 
+    // Unix paths: special trees, and a service unit outside the state directory.
+    #[cfg(unix)]
     #[test]
     fn protected_table() {
         let p = policy(
@@ -698,6 +729,8 @@ mod tests {
 
     /// What starts wsmp is write-protected: the service unit and its drop-ins
     /// and the running binary.
+    // Unix paths: special trees, and a service unit outside the state directory.
+    #[cfg(unix)]
     #[test]
     fn service_unit_and_binary_are_write_protected() {
         let p = Policy::from_environment(Vec::new(), false);
@@ -823,6 +856,7 @@ mod tests {
         assert!(user.check_process().is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn non_utf8_path_is_invalid_input() {
         use std::os::unix::ffi::OsStrExt;

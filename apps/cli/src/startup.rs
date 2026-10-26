@@ -183,14 +183,15 @@ impl TerminalStartup {
                 shells: self.shells.iter().map(|shell| shell.id.clone()).collect(),
             },
             // Interactive runtime steps run in operator terminals wherever a
-            // PTY can be offered, at every trust level (spec §4.7). Windows
-            // has none yet: their `sudo -k` guard has no Windows equivalent.
+            // PTY can be offered, at every trust level (spec §4.7).
             operator_terminals: crate::protocol::operator_terminals_supported(),
             files: FileFeatures {
+                // As the tools take and show paths (Windows: `/c/...`), so the
+                // server's own root check matches what the node resolves.
                 roots: self.file_roots_configured.then(|| {
                     self.file_roots
                         .iter()
-                        .map(|root| root.display().to_string())
+                        .filter_map(|root| crate::file_ops::display_path(root))
                         .collect()
                 }),
                 as_root: self.allow_file_tools_as_root,
@@ -306,11 +307,13 @@ mod tests {
         assert_eq!(features.terminals.max, 4);
         assert_eq!(
             features.files.roots,
-            Some(vec![dir.path().display().to_string()])
+            Some(vec![
+                crate::file_ops::display_path(dir.path()).expect("shown")
+            ])
         );
         assert!(features.files.as_root);
-        // Operator terminals need only a PTY: no switch, any trust level.
-        assert_eq!(features.operator_terminals, cfg!(unix));
+        // Operator terminals need only a PTY (ConPTY on Windows): no switch, any trust level.
+        assert!(features.operator_terminals);
         assert!(features.job_reservations);
         assert!(features.rank_idle);
         assert!(startup.full_control());
@@ -366,7 +369,13 @@ mod tests {
             TerminalStartup::from_key_with_home(key(), &Config::default(), Some(home.path()));
         let files = startup.features().files;
         assert_eq!(files.source, FileRootsSource::Default);
-        assert_eq!(files.roots, Some(vec![physical.display().to_string()]));
+        // As the file tools show paths: as is on Unix, `/c/...` on Windows.
+        assert_eq!(
+            files.roots,
+            Some(vec![
+                crate::file_ops::display_path(&physical).expect("shown")
+            ])
+        );
         assert_eq!(startup.file_roots(), [physical]);
 
         let configured_dir = tempfile::tempdir().expect("configured");

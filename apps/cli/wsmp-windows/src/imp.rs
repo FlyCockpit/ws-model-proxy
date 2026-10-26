@@ -40,7 +40,7 @@ pub(crate) fn raw(handle: BorrowedHandle<'_>) -> HANDLE {
 }
 
 /// The current-process pseudo handle (never closed, always valid).
-fn current_process() -> HANDLE {
+pub(crate) fn current_process() -> HANDLE {
     // SAFETY: no preconditions.
     unsafe { GetCurrentProcess() }
 }

@@ -1,10 +1,7 @@
 //! `forwarder_cli_dir_list`: compact sorted listing, one entry per line.
 
-use std::os::fd::AsFd;
-
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use nix::fcntl::readlinkat;
 use serde::{Deserialize, Serialize};
 
 use super::error::{FileError, FileResult};
@@ -130,10 +127,8 @@ pub(crate) fn list(ops: &FileOps, args: &ListArgs, cancel: &Cancel) -> FileResul
                 fmt::date_only(entry.stat.mtime())
             ),
             Kind::Symlink => {
-                let target = readlinkat(entry.parent.as_fd(), entry.name)
-                    .ok()
-                    .and_then(|t| t.into_string().ok())
-                    .unwrap_or_default();
+                let target =
+                    super::resolve::read_link_at(entry.parent, entry.name).unwrap_or_default();
                 format!("l {shown} -> {}", name_for_display(&target))
             }
             Kind::Other => format!("o {shown}"),

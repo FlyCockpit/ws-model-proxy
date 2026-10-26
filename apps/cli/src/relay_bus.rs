@@ -40,7 +40,6 @@ pub(crate) enum FromWorker {
     Telemetry(String),
     /// 2.8: a node file op settled on a pool worker. The loop sends the frames
     /// only while the session still has the op pending.
-    #[cfg(unix)]
     FileFrames {
         op_id: String,
         frames: Vec<crate::file_relay::FileFrame>,

@@ -1,10 +1,7 @@
 //! `forwarder_cli_file_stat`: metadata for up to 50 paths, without following a
 //! final symlink.
 
-use nix::fcntl::readlinkat;
-use nix::unistd::{Uid, User};
 use serde::{Deserialize, Serialize};
-use std::os::fd::AsFd;
 
 use super::error::{ErrorCode, FileError, FileResult};
 use super::etag::STRONG_ETAG_MAX_BYTES;
@@ -64,10 +61,20 @@ pub(crate) fn kind_name(kind: Kind) -> &'static str {
     }
 }
 
-pub(crate) fn owner_name(uid: u32) -> String {
-    match User::from_uid(Uid::from_raw(uid)) {
-        Ok(Some(user)) => user.name,
-        _ => uid.to_string(),
+/// The owner's user name (Unix); Windows reports none.
+pub(crate) fn owner_name(uid: u32) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use nix::unistd::{Uid, User};
+        Some(match User::from_uid(Uid::from_raw(uid)) {
+            Ok(Some(user)) => user.name,
+            _ => uid.to_string(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = uid;
+        None
     }
 }
 
@@ -105,7 +112,7 @@ fn stat_one(ops: &FileOps, path: &str, hash: bool, cancel: &Cancel) -> FileResul
     };
     let resolved = resolve(path, &opts(false))?;
     if resolved.is_self() {
-        let st = Stat::from_metadata(&std::fs::File::from(resolved.open_dir()?).metadata()?);
+        let st = resolved.dir_stat()?;
         return Ok(entry_from(path, &st, resolved.echo(path)));
     }
     let st = resolved
@@ -125,9 +132,7 @@ fn stat_one(ops: &FileOps, path: &str, hash: bool, cancel: &Cancel) -> FileResul
         }
         Kind::Symlink => {
             entry.etag = Some(ops.key.weak_stat(&st));
-            entry.target = readlinkat(resolved.dir.as_fd(), resolved.name.as_os_str())
-                .ok()
-                .and_then(|target| target.into_string().ok());
+            entry.target = resolved.read_link();
             entry.target_type = Some(match resolve(path, &opts(true)) {
                 Ok(target) => match target.is_self() {
                     true => "dir",
@@ -152,7 +157,7 @@ fn entry_from(path: &str, st: &Stat, resolved_path: Option<String>) -> StatEntry
         size: (st.kind() == Kind::File).then_some(st.size),
         mtime: Some(fmt::rfc3339(st.mtime())),
         mode: Some(fmt::mode_string(st.mode)),
-        owner: Some(owner_name(st.uid)),
+        owner: owner_name(st.uid),
         resolved_path,
         ..StatEntry::default()
     }

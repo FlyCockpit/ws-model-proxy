@@ -10,12 +10,16 @@
 //!   a process descends from it;
 //! - browser terminals: a pseudoconsole (ConPTY) and a program started on it;
 //! - runtime hosts: the kill-on-close job a host holds its runtime in, and
-//!   Ctrl+Break to the runtime's console process group.
+//!   Ctrl+Break to the runtime's console process group;
+//! - the read-only node file tools: a file's identity and final path from its
+//!   handle, and whether the process is elevated.
 //!
 //! On other platforms the crate is empty.
 
 #[cfg(windows)]
 mod conpty;
+#[cfg(windows)]
+mod file_info;
 #[cfg(windows)]
 mod host_job;
 #[cfg(windows)]
@@ -23,6 +27,8 @@ mod imp;
 
 #[cfg(windows)]
 pub use conpty::{ConPty, ConsoleChild, PseudoConsole};
+#[cfg(windows)]
+pub use file_info::{FileIdentity, file_identity, final_path, process_is_elevated};
 #[cfg(windows)]
 pub use host_job::{HOST_JOB_SLOTS, HostJob, in_host_job, send_ctrl_break};
 

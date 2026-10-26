@@ -5,7 +5,10 @@
 //! every class but the whole-line ones, so a value or key block opened there masks
 //! the window; reading a plain file costs one cheap trigger-word check per line.
 
+#[cfg(windows)]
+use positional::FileExt;
 use std::io::{BufRead, BufReader, Read};
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
 use serde::{Deserialize, Serialize};
@@ -147,6 +150,7 @@ pub(crate) fn load_all(
 }
 
 /// The current etag of an open regular file: strong up to 64 MiB, weak above.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn current_etag(
     ops: &FileOps,
     file: &mut std::fs::File,
@@ -444,6 +448,41 @@ fn read_line_bounded(
     Ok(n)
 }
 
+/// Windows: Unix `FileExt`'s positional reads. `seek_read` moves the cursor, so it is
+/// put back: a sequential read after a positional one starts where it would on Unix.
+#[cfg(windows)]
+mod positional {
+    use std::io::{Seek, SeekFrom};
+
+    pub trait FileExt {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize>;
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()>;
+    }
+
+    impl FileExt for std::fs::File {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+            let mut cursor = self;
+            let at = cursor.stream_position()?;
+            let read = std::os::windows::fs::FileExt::seek_read(self, buf, offset);
+            cursor.seek(SeekFrom::Start(at))?;
+            read
+        }
+
+        fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+            while !buf.is_empty() {
+                match self.read_at(buf, offset)? {
+                    0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                    read => {
+                        buf = &mut buf[read..];
+                        offset += read as u64;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Files over 64 MiB: weak etag, no line count, no whole-file scan.
 #[allow(clippy::too_many_arguments)]
 fn read_large(
@@ -460,7 +499,8 @@ fn read_large(
     cancel: &Cancel,
 ) -> FileResult<ReadOutcome> {
     cancel.check()?;
-    let etag = ops.key.weak(&file.metadata()?);
+    // From the opened file's stat, which on Windows carries its identity too.
+    let etag = ops.key.weak_stat(stat);
     if args.if_none_match.as_deref() == Some(etag.as_str()) {
         return Ok(ReadOutcome::Unchanged {
             unchanged: true,

@@ -30,14 +30,7 @@
 //! Capture totals and `output_bytes` count these masked bytes, before head/tail
 //! retention. Plain command output never uses the dotenv `KEY=⟦redacted:N⟧` view.
 
-#[cfg(unix)]
 use crate::file_ops::redact::{FileClass, LineMasker, SameLineCarry};
-#[cfg(not(unix))]
-#[allow(dead_code)]
-#[path = "file_ops/redact.rs"]
-mod redact;
-#[cfg(not(unix))]
-use redact::{FileClass, LineMasker, SameLineCarry};
 
 use crate::terminal_parse::TerminalByteState;
 

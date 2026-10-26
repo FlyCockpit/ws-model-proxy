@@ -329,14 +329,28 @@ supported.
 - browser terminals (ConPTY, with PowerShell 7, Windows PowerShell, Command Prompt or a WSL
   distribution);
 - node commands;
-- runtimes in PowerShell or `cmd`.
+- runtimes in PowerShell or `cmd`, including interactive steps;
+- the read file tools: read, stat, list and search.
 
 Install PowerShell 7 (`pwsh`) for runtimes. Windows PowerShell 5.1 works, but it changes some
 arguments it passes to a program (an empty one, or one with a quote in it), so the node refuses an
 argv command with such an argument there.
 
+**File tools on Windows.**
+- **Paths** are written and shown in a POSIX view: `C:\Users\ada\notes.txt` is
+  `/c/Users/ada/notes.txt`, with the drive letter in lower case. The node advertises its file
+  roots in the same form.
+- **Refused names:** anything that could reach a different object than it spells. That covers
+  `.` and `..`, `\`, `:` (alternate data streams), wildcards, trailing dots or spaces, and device
+  names such as `NUL`.
+- **Links and junctions** are resolved by Windows, and the policy is checked against the file
+  actually opened. So a link out of the file roots, or to a protected file, is refused, and list
+  and search never walk into one.
+- **Elevated `wsmp`** counts as running as root (see `set-file-tools-as-root`).
+
 **Not on Windows (yet).**
-- The node file tools: the server's file operations are refused.
+- The file tools that change files (edit, write, rename, mkdir and delete) are refused with
+  `unsupported`. They need the Unix side's atomic replace and recovery journal.
 - Engines that need Linux, such as vLLM and SGLang. llama.cpp's `llama-server`, Ollama and LM
   Studio run natively.
 
@@ -348,8 +362,8 @@ argv command with such an argument there.
   `wsmp run | Tee-Object relay.log`, until the runtime stops. The service and a relay run in a
   terminal have console handles instead, so they are not affected.
 
-**WSL2 instead.** The Linux `wsmp` in a WSL2 distribution has every Linux feature: the file tools,
-and vLLM with CUDA on WSL.
+**WSL2 instead.** The Linux `wsmp` in a WSL2 distribution has every Linux feature: the file tools
+that change files, and vLLM with CUDA on WSL.
 1. Enable systemd in the distribution (`/etc/wsl.conf`: `[boot]` then `systemd=true`), then run
    `wsl --shutdown`.
 2. Install `wsmp` with `install.sh` inside the distribution.

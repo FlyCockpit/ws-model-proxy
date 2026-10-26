@@ -930,7 +930,6 @@ struct Session<'a> {
     /// Command statuses held until this connection is registered.
     deferred: &'a mut Vec<OutboundFrame>,
     stt: crate::stt::SttRegistry,
-    #[cfg(unix)]
     files: crate::file_relay::FileRelay,
     registered: bool,
     telemetry: Option<crate::telemetry::Telemetry>,
@@ -1108,7 +1107,6 @@ fn run_relay_session(
         stt: crate::stt::SttRegistry::new(worker_tx.clone()),
         // Node file ops run on the daemon's file pool, never on this loop;
         // the relay keeps only the ops it has pending.
-        #[cfg(unix)]
         files: {
             let runtime = crate::file_relay::shared_runtime(
                 startup.allow_file_tools_as_root(),
@@ -1202,7 +1200,6 @@ fn run_relay_session(
         if let Err(error) = send_stt_frames(&mut socket, &mut session.stt, stt_frames) {
             break Err(error);
         }
-        #[cfg(unix)]
         if let Err(error) = send_file_frames(&mut socket, session.files.expire_stale(now)) {
             break Err(error);
         }
@@ -1290,7 +1287,6 @@ fn run_relay_session(
         let _ = send_outbound_frames(&mut socket, session.execs.kill_all());
     }
     // In-flight file ops are cancelled; their results are dropped.
-    #[cfg(unix)]
     session.files.cancel_all();
     // The server fails these sessions itself when the relay drops.
     session.stt.abort_all();
@@ -1431,7 +1427,6 @@ where
                     .send(Message::Text(text.into()))
                     .map_err(|error| websocket_session_error(error, "sending telemetry", true))?;
             }
-            #[cfg(unix)]
             Ok(FromWorker::FileFrames { op_id, frames }) => {
                 // Cancelled or torn-down ops are no longer pending: drop them.
                 if session.files.complete(&op_id) {
@@ -1754,7 +1749,6 @@ where
             args,
             body_bytes,
         } => {
-            #[cfg(unix)]
             send_file_frames(
                 socket,
                 session.files.handle_op(
@@ -1764,25 +1758,9 @@ where
                     body_bytes.and_then(|bytes| usize::try_from(bytes).ok()),
                 ),
             )?;
-            #[cfg(not(unix))]
-            {
-                let _ = (op, args, body_bytes);
-                send_control(
-                    socket,
-                    &NodeFrame::FileRejected {
-                        op_id,
-                        reason: "unsupported".to_string(),
-                        detail: None,
-                    },
-                    "sending a file op rejection",
-                )?;
-            }
         }
         ServerFrame::FileCancel { op_id } => {
-            #[cfg(unix)]
             session.files.handle_cancel(&op_id);
-            #[cfg(not(unix))]
-            let _ = op_id;
         }
         // Speech frames were handled above.
         ServerFrame::SttOpen { .. }
@@ -1834,7 +1812,6 @@ where
         return Ok(());
     }
     if changes.contains(&NodeChange::Lowered) {
-        #[cfg(unix)]
         session.files.lower_trust();
         let interrupted = session.execs.interrupt_all();
         // Operator terminals are allowed at Relay only: they stay.
@@ -1847,7 +1824,6 @@ where
         }
     }
     if changes.contains(&NodeChange::Raised) {
-        #[cfg(unix)]
         session.files.raise_trust();
     }
     // Trust changes switch the held set; host changes re-check addresses.
@@ -2595,10 +2571,7 @@ where
             );
         }
         ServerBinaryMetadata::FileBody { op_id } => {
-            #[cfg(unix)]
             send_file_frames(socket, session.files.handle_body(&op_id, body))?;
-            #[cfg(not(unix))]
-            let _ = (&op_id, &body);
             return Ok(());
         }
         ServerBinaryMetadata::SttAudio { session_id, seq } => {
@@ -3575,7 +3548,6 @@ where
     Ok(())
 }
 
-#[cfg(unix)]
 fn send_file_frames<S>(
     socket: &mut tungstenite::WebSocket<S>,
     frames: Vec<crate::file_relay::FileFrame>,

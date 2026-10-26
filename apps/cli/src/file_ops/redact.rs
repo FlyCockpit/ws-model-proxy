@@ -100,15 +100,28 @@ pub(crate) fn fold(name: &str) -> String {
                 out
             });
     // vfat and SMB shares resolve `prod.env.` and `prod.env ` to `prod.env`: drop
-    // trailing dots and spaces from every component (`.` and `..` stay).
-    lowered
-        .split('/')
-        .map(|part| match part {
-            "." | ".." => part,
-            _ => part.trim_end_matches(['.', ' ']),
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+    // trailing dots and spaces from every component (`.` and `..` stay). Windows
+    // paths separate components with `\` too.
+    let separator = |ch: char| ch == '/' || (cfg!(windows) && ch == '\\');
+    let mut out = String::with_capacity(lowered.len());
+    let mut part = String::new();
+    let flush = |part: &mut String, out: &mut String| {
+        match part.as_str() {
+            "." | ".." => out.push_str(part),
+            _ => out.push_str(part.trim_end_matches(['.', ' '])),
+        }
+        part.clear();
+    };
+    for ch in lowered.chars() {
+        if separator(ch) {
+            flush(&mut part, &mut out);
+            out.push(ch);
+        } else {
+            part.push(ch);
+        }
+    }
+    flush(&mut part, &mut out);
+    out
 }
 
 /// Classify by the physical path of the file. Names are compared folded

@@ -134,16 +134,15 @@ pub(crate) fn search(
 
     let scan_file = |state: &mut State, entry: &Entry<'_>, shown: &str| -> FileResult<()> {
         cancel.check()?;
-        let opened = super::resolve::Resolved {
-            dir: entry.parent.try_clone()?,
-            dir_path: entry
+        let opened = super::resolve::Resolved::at(
+            entry.parent,
+            entry
                 .full
                 .parent()
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_default(),
-            name: entry.name.into(),
-            created: Vec::new(),
-        };
+            entry.name.into(),
+        )?;
         let Ok((mut file, stat)) = opened.open_regular(&ops.policy, Access::Read) else {
             return Ok(());
         };

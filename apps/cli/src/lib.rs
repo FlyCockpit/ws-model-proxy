@@ -17,9 +17,7 @@ pub mod daemon;
 pub mod display_escape;
 pub mod engine;
 pub mod exit;
-#[cfg(unix)]
 pub mod file_ops;
-#[cfg(unix)]
 pub mod file_relay;
 pub mod hardware;
 pub mod hostname;
