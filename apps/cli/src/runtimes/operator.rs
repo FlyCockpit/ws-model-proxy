@@ -323,6 +323,8 @@ pub struct OperatorOpen {
     /// The environment the command runs with (node secrets included: never
     /// printed, see the `Debug` impl).
     pub env: Vec<(String, String)>,
+    /// The shell the command was rendered for (the job's).
+    pub shell: crate::protocol::runtime_spec::CommandShell,
     pub events: SyncSender<OperatorEvent>,
 }
 

@@ -39,6 +39,10 @@ pub struct Args {
     /// Console height in cells.
     #[arg(long)]
     pub rows: u16,
+    /// The one argument after the shell is the rest of its command line, passed as is
+    /// (`cmd.exe`'s `/d /s /c "..."`, which does not split arguments the way they are quoted).
+    #[arg(long)]
+    pub raw: bool,
     /// The shell program, then its arguments.
     #[arg(required = true, num_args = 1.., last = true)]
     pub command: Vec<OsString>,
@@ -55,6 +59,7 @@ const TEST_ARGS: &str = "WSMP_TEST_CONPTY_HOST_ARGS";
 pub(crate) fn command(
     program: &OsStr,
     args: &[String],
+    raw: bool,
     cols: u16,
     rows: u16,
     cwd: &Path,
@@ -66,9 +71,12 @@ pub(crate) fn command(
         cols.to_string().into(),
         "--rows".into(),
         rows.to_string().into(),
-        "--".into(),
-        program.to_os_string(),
     ];
+    if raw {
+        anyhow::ensure!(args.len() == 1, "a raw command line is one argument");
+        helper_args.push("--raw".into());
+    }
+    helper_args.extend(["--".into(), program.to_os_string()]);
     helper_args.extend(args.iter().map(OsString::from));
     let mut command = std::process::Command::new(exe);
     command.current_dir(cwd).env_clear();
@@ -171,6 +179,17 @@ pub(crate) fn command_line(program: &OsString, args: &[OsString]) -> OsString {
     line
 }
 
+/// `program`, then the one argument after it as is.
+fn raw_command_line(program: &OsString, rest: &[OsString]) -> Result<OsString> {
+    let [tail] = rest else {
+        anyhow::bail!("a raw command line is one argument");
+    };
+    let mut line = OsString::from(quote(&program.to_string_lossy()));
+    line.push(" ");
+    line.push(tail);
+    Ok(line)
+}
+
 fn quote(arg: &str) -> String {
     if !arg.is_empty() && !arg.contains([' ', '\t', '\n', '\u{b}', '"']) {
         return arg.to_string();
@@ -215,7 +234,11 @@ pub fn run(args: &Args) -> Result<()> {
         .unwrap_or_else(PoisonError::into_inner)
         .as_ref()
         .context("the pseudoconsole is closed")?
-        .spawn(&command_line(program, rest))
+        .spawn(&if args.raw {
+            raw_command_line(program, rest)?
+        } else {
+            command_line(program, rest)
+        })
         .with_context(|| format!("starting `{}`", PathBuf::from(program).display()))?;
 
     let pump = std::thread::spawn(move || {

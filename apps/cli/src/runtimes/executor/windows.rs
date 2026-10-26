@@ -451,7 +451,7 @@ fn parse_shell(name: &str) -> Option<CommandShell> {
 }
 
 /// The program of a Windows shell this node found.
-fn shell_program(shell: CommandShell) -> Result<PathBuf> {
+pub fn shell_program(shell: CommandShell) -> Result<PathBuf> {
     let id = shell_name(shell);
     crate::shells::command_shells()
         .into_iter()
@@ -483,14 +483,26 @@ pub enum ShellLine {
 }
 
 pub fn shell_line(shell: CommandShell, script: &str) -> Result<ShellLine> {
+    line_for(shell, script, false)
+}
+
+/// [`shell_line`] for a person at a terminal (an operator step: a prompt to answer, a sign-in to
+/// finish): PowerShell may ask for input.
+pub fn interactive_shell_line(shell: CommandShell, script: &str) -> Result<ShellLine> {
+    line_for(shell, script, true)
+}
+
+fn line_for(shell: CommandShell, script: &str, interactive: bool) -> Result<ShellLine> {
     match shell {
-        CommandShell::Pwsh | CommandShell::Powershell => Ok(ShellLine::List(vec![
-            "-NoLogo".into(),
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-EncodedCommand".into(),
-            encoded(&powershell_script(script)),
-        ])),
+        CommandShell::Pwsh | CommandShell::Powershell => {
+            let mut args = vec!["-NoLogo".to_string(), "-NoProfile".to_string()];
+            if !interactive {
+                args.push("-NonInteractive".into());
+            }
+            args.push("-EncodedCommand".into());
+            args.push(encoded(&powershell_script(script)));
+            Ok(ShellLine::List(args))
+        }
         CommandShell::Cmd => Ok(ShellLine::Raw(format!("/d /s /c \"{script}\""))),
         CommandShell::Sh => anyhow::bail!("`sh` commands do not run on Windows"),
     }

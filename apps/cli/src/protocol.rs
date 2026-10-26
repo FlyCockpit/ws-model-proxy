@@ -52,7 +52,7 @@ pub fn terminal_supported() -> bool {
 /// Operator terminals (interactive runtime steps) wrap the step in a
 /// `sudo -k` guard that has no Windows equivalent yet.
 pub fn operator_terminals_supported() -> bool {
-    cfg!(unix)
+    cfg!(any(unix, windows))
 }
 
 /// The fatal error for a `protocol.error` (or an older server's reply) that

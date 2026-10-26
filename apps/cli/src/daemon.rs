@@ -1997,22 +1997,8 @@ where
         send_outbound_frames(socket, closed)?;
     }
     {
-        let ticket: Option<crate::runtimes::runner::OperatorTicket> = match &job.operator {
+        let ticket = match &job.operator {
             None => None,
-            // An operator step runs its command in a terminal under `sudo` bookkeeping that
-            // Windows does not have yet.
-            #[cfg(windows)]
-            Some(_) => {
-                return send_control(
-                    socket,
-                    &refusal(
-                        JobError::InteractiveUnsupported,
-                        Some("interactive steps do not run on Windows yet".into()),
-                    ),
-                    "refusing an operator step",
-                );
-            }
-            #[cfg(unix)]
             Some(operator) => {
                 // Taken now, before the runner thread exists: a re-delivery
                 // or a newer dispatch of the step sees it (see `reserve_operator`).
@@ -2033,18 +2019,11 @@ where
             }
         };
         let submitted = match (session.runner.as_ref(), ticket) {
-            #[cfg(unix)]
             (Some(runner), Some(ticket)) => runner.submit_operator(rendered, ticket),
-            // Refused above: Windows admits no operator step.
-            #[cfg(windows)]
-            (Some(_), Some(_)) => Err(anyhow::anyhow!(
-                "interactive steps do not run on Windows yet"
-            )),
             (Some(runner), None) => runner.submit(rendered),
             (None, _) => Err(anyhow::anyhow!("runtime steps are unavailable")),
         };
         if let Err(error) = submitted {
-            #[cfg(unix)]
             if let Some(terminal_id) = &terminal_id {
                 session.terminals.release_operator(terminal_id);
             }
@@ -2095,7 +2074,6 @@ fn from_record(
 
 /// The operator ticket of an admitted interactive job. The screen shows
 /// what the node itself rendered (or recorded), never server-supplied text.
-#[cfg(unix)]
 fn operator_ticket(
     job: &crate::protocol::frames::RuntimeJob,
     operator: &crate::protocol::frames::JobOperator,
@@ -2148,7 +2126,6 @@ where
         .as_ref()
         .and_then(|runner| runner.try_update())
     {
-        #[cfg(unix)]
         if let Some(request) = update.operator {
             use crate::runtimes::runner::OperatorRequest;
             let frames = match request {
@@ -2167,7 +2144,6 @@ where
             session.runtimes.set_instances(update.instances);
         }
         // An operator step's runner thread is done with its terminal id.
-        #[cfg(unix)]
         if let Some(NodeFrame::RuntimeJobResult {
             terminal_id: Some(terminal_id),
             ..
@@ -6089,7 +6065,6 @@ mod tests {
         assert_eq!(job.reservations, vec![reservation(1, "worker-b")]);
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_operator_screen_shows_what_the_node_rendered_not_the_server_handle() {
         let mut job = stop_job(true);

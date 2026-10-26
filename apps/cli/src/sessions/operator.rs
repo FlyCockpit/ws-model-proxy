@@ -5,23 +5,22 @@
 //! `term.attach` handshake (at every trust level) and see the confirm screen
 //! the daemon draws; the writer's keys are read here and never reach a
 //! process. Enter spawns a fresh PTY running only the step's command (in
-//! the `sudo -k` wrapper); from then on the terminal is an ordinary PTY
+//! the `sudo -k` wrapper on Unix; on Windows in its shell, interactive, on a
+//! pseudoconsole); from then on the terminal is an ordinary PTY
 //! terminal whose input reaches that command until it exits. The terminal
 //! then ends: no prompt, nothing more to type into.
 
+use std::path::Path;
 use std::sync::mpsc::SyncSender;
 
-#[cfg(unix)]
-use super::valid_id;
-use super::{OutboundFrame, TerminalRegistry, TerminalSession};
+use super::{FromWorker, OutboundFrame, TerminalRegistry, TerminalSession, valid_id};
 use crate::protocol::frames::JobStatus;
-#[cfg(unix)]
+use crate::protocol::runtime_spec::CommandShell;
 use crate::protocol::{frames::JobError, operator_terminals_supported};
 use crate::runtimes::operator::{
-    self as op, ConfirmKey, OperatorEvent, OperatorIds, OperatorScreen,
+    self as op, ConfirmKey, MAX_OPERATOR_TERMINALS, OperatorEvent, OperatorIds, OperatorOpen,
+    OperatorScreen,
 };
-#[cfg(unix)]
-use crate::runtimes::operator::{MAX_OPERATOR_TERMINALS, OperatorOpen};
 use crate::terminal_crypto::TermPlaintextV2;
 
 /// The step behind an operator terminal.
@@ -29,8 +28,10 @@ pub(super) struct OperatorState {
     ids: OperatorIds,
     screen: OperatorScreen,
     /// Node secrets included: never logged.
-    #[cfg(unix)]
     env: Vec<(String, String)>,
+    /// The shell the command was rendered for (Windows runs it there).
+    #[cfg_attr(unix, allow(dead_code))]
+    shell: CommandShell,
     events: SyncSender<OperatorEvent>,
     /// A person accepted and the command's PTY was spawned.
     running: bool,
@@ -68,17 +69,14 @@ pub(crate) struct OperatorBook {
     /// Terminal id → (step id, cancelled before it opened).
     pending: std::collections::BTreeMap<String, (String, bool)>,
     used: std::collections::HashSet<String>,
-    #[cfg(unix)]
     used_order: std::collections::VecDeque<String>,
 }
 
 /// Ids remembered as used (oldest forgotten first; the server never
 /// re-sends one that old).
-#[cfg(unix)]
 const USED_IDS_MAX: usize = 4096;
 
 impl OperatorBook {
-    #[cfg(unix)]
     fn take(&mut self, terminal_id: &str, step_id: &str) {
         self.pending
             .insert(terminal_id.to_string(), (step_id.to_string(), false));
@@ -92,7 +90,6 @@ impl OperatorBook {
         }
     }
 
-    #[cfg(unix)]
     fn live(&self) -> usize {
         self.pending
             .values()
@@ -122,8 +119,7 @@ pub(crate) enum OperatorDelivery {
 }
 
 /// The scrubbed environment an operator command starts from (the browser
-/// terminal environment: denied names removed, `TERM`, `WSMP_JOB=1`).
-#[cfg(unix)]
+/// terminal environment: denied names removed, `TERM` on Unix, `WSMP_JOB=1`).
 pub(crate) fn operator_base_env() -> Vec<(String, String)> {
     super::terminal_env()
 }
@@ -173,7 +169,6 @@ impl TerminalSession {
 
 impl TerminalRegistry {
     /// Live operator terminals.
-    #[cfg(unix)]
     pub(crate) fn operator_count(&self) -> usize {
         self.sessions
             .values()
@@ -221,7 +216,6 @@ impl TerminalRegistry {
     /// still on the confirm screen closes, and one not opened yet never
     /// opens, so the older thread lets go of the rank. Refused when no PTY
     /// can be offered, at the cap, or while shutting down.
-    #[cfg(unix)]
     pub(crate) fn reserve_operator(
         &mut self,
         step_id: &str,
@@ -247,7 +241,6 @@ impl TerminalRegistry {
     }
 
     /// The step's runner thread is done with `terminal_id` (or never got it).
-    #[cfg(unix)]
     pub(crate) fn release_operator(&mut self, terminal_id: &str) {
         self.operators.pending.remove(terminal_id);
     }
@@ -276,7 +269,6 @@ impl TerminalRegistry {
     /// `awaiting_operator`. Only a reserved, uncancelled id opens; anything
     /// else answers `operator_closed` (nothing ran) and the runner thread
     /// hears `Closed`.
-    #[cfg(unix)]
     pub(crate) fn open_operator(&mut self, open: OperatorOpen) -> Vec<OutboundFrame> {
         let terminal_id = open.ids.terminal_id.clone();
         let reserved = self
@@ -324,12 +316,12 @@ impl TerminalRegistry {
                 out: Some(out),
                 detached_at: None,
                 scrollback: std::collections::VecDeque::new(),
-                #[cfg(unix)]
                 pty: None,
                 operator: Some(OperatorState {
                     ids: open.ids,
                     screen: open.screen,
                     env: open.env,
+                    shell: open.shell,
                     events: open.events,
                     running: false,
                 }),
@@ -357,7 +349,6 @@ impl TerminalRegistry {
 
     /// The step's runner thread was cancelled (a stop): close its terminal
     /// unless a person's run already started.
-    #[cfg(unix)]
     pub(crate) fn close_operator_if_confirming(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
         self.close_confirming(|state| state.ids.terminal_id == terminal_id)
     }
@@ -424,7 +415,6 @@ impl TerminalRegistry {
 
     /// Enter: spawn a fresh PTY that runs only the step's command, then
     /// answer `operator_running`. A spawn failure closes the terminal.
-    #[cfg(unix)]
     fn accept_operator(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
         let Some(session) = self.sessions.get(terminal_id) else {
             return Vec::new();
@@ -433,28 +423,11 @@ impl TerminalRegistry {
             return Vec::new();
         };
         let (cols, rows) = session.pty_size;
-        let (program, args) = op::wrapper_argv(&state.screen.command);
-        // Under the launch guard like every runtime command: it never outlives the daemon.
-        let spawned = crate::launch_guard::command(&program, &args)
-            .and_then(|guarded| {
-                super::user_home()
-                    .ok()
-                    .and_then(|home| crate::child_env::resolve_cwd(None, &home).ok())
-                    .ok_or_else(|| anyhow::anyhow!("no home directory"))
-                    .map(|cwd| (guarded, cwd))
-            })
-            .and_then(|((program, args), cwd)| {
-                super::spawn_pty(
-                    std::ffi::OsStr::new(&program),
-                    &args,
-                    &cwd,
-                    &state.env,
-                    cols,
-                    rows,
-                    &self.tx,
-                    terminal_id,
-                )
-            });
+        let spawned = super::user_home()
+            .ok()
+            .and_then(|home| crate::child_env::resolve_cwd(None, &home).ok())
+            .ok_or_else(|| anyhow::anyhow!("no home directory"))
+            .and_then(|cwd| spawn_operator(state, &cwd, (cols, rows), &self.tx, terminal_id));
         let pty = match spawned {
             Ok(pty) => pty,
             Err(error) => {
@@ -483,9 +456,65 @@ impl TerminalRegistry {
         frames.push(OutboundFrame::Control(running));
         frames
     }
+}
 
-    #[cfg(not(unix))]
-    fn accept_operator(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
-        self.close(terminal_id)
+/// Unix: the command in the `sudo -k` wrapper ([`op::WRAPPER`]), under the launch guard like
+/// every runtime command, so it never outlives the daemon.
+#[cfg(unix)]
+fn spawn_operator(
+    state: &OperatorState,
+    cwd: &Path,
+    (cols, rows): (u16, u16),
+    tx: &SyncSender<FromWorker>,
+    terminal_id: &str,
+) -> anyhow::Result<super::PtyRuntime> {
+    let (program, args) = op::wrapper_argv(&state.screen.command);
+    let (program, args) = crate::launch_guard::command(&program, &args)?;
+    super::spawn_pty(
+        std::ffi::OsStr::new(&program),
+        &args,
+        cwd,
+        &state.env,
+        cols,
+        rows,
+        tx,
+        terminal_id,
+    )
+}
+
+/// Windows: the step's script in the shell it was rendered for, where a person can answer a
+/// prompt or finish a sign-in, exiting with the script's status. The console host's kill-on-close
+/// job keeps it from outliving the daemon. There is no cached `sudo` credential to reset.
+#[cfg(windows)]
+fn spawn_operator(
+    state: &OperatorState,
+    cwd: &Path,
+    (cols, rows): (u16, u16),
+    tx: &SyncSender<FromWorker>,
+    terminal_id: &str,
+) -> anyhow::Result<super::PtyRuntime> {
+    use crate::runtimes::executor::windows::{ShellLine, interactive_shell_line, shell_program};
+    let program = shell_program(state.shell)?;
+    match interactive_shell_line(state.shell, &state.screen.command)? {
+        ShellLine::List(args) => super::spawn_pty(
+            program.as_os_str(),
+            &args,
+            cwd,
+            &state.env,
+            cols,
+            rows,
+            tx,
+            terminal_id,
+        ),
+        ShellLine::Raw(tail) => super::spawn_pty_raw(
+            program.as_os_str(),
+            &tail,
+            cwd,
+            &state.env,
+            cols,
+            rows,
+            tx,
+            terminal_id,
+        ),
     }
 }

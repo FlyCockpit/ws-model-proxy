@@ -66,7 +66,6 @@ use crate::terminal_crypto::{
 
 mod operator;
 pub(crate) use operator::OperatorDelivery;
-#[cfg(unix)]
 pub(crate) use operator::operator_base_env;
 
 /// Attached viewers plus pending approvals, per terminal (protocol 2.5).
@@ -2783,9 +2782,60 @@ fn spawn_pty(
     tx: &SyncSender<FromWorker>,
     terminal_id: &str,
 ) -> anyhow::Result<PtyRuntime> {
+    spawn_conpty(
+        program,
+        args,
+        false,
+        cwd,
+        env,
+        (cols, rows),
+        tx,
+        terminal_id,
+    )
+}
+
+/// [`spawn_pty`] for `program` with `tail` as the rest of its command line, as is
+/// (`cmd.exe /d /s /c "..."`).
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn spawn_pty_raw(
+    program: &std::ffi::OsStr,
+    tail: &str,
+    cwd: &Path,
+    env: &[(String, String)],
+    cols: u16,
+    rows: u16,
+    tx: &SyncSender<FromWorker>,
+    terminal_id: &str,
+) -> anyhow::Result<PtyRuntime> {
+    spawn_conpty(
+        program,
+        &[tail.to_string()],
+        true,
+        cwd,
+        env,
+        (cols, rows),
+        tx,
+        terminal_id,
+    )
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn spawn_conpty(
+    program: &std::ffi::OsStr,
+    args: &[String],
+    raw: bool,
+    cwd: &Path,
+    env: &[(String, String)],
+    (cols, rows): (u16, u16),
+    tx: &SyncSender<FromWorker>,
+    terminal_id: &str,
+) -> anyhow::Result<PtyRuntime> {
     use anyhow::Context;
 
-    let mut command = crate::commands::conpty_host::command(program, args, cols, rows, cwd, env)?;
+    let mut command =
+        crate::commands::conpty_host::command(program, args, raw, cols, rows, cwd, env)?;
     command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -6272,7 +6322,6 @@ mod tests {
 
     mod output_mask_tests;
 
-    #[cfg(unix)]
     mod operator_tests;
 
     mod image_tests;
