@@ -38,12 +38,17 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: false,
     WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: false,
-    WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: `v1:${Buffer.alloc(32, 7).toString("base64")}`,
+    // v1 is active; v0 is a retired key that stored keys may still be sealed with.
+    WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: `v1:${Buffer.alloc(32, 7).toString("base64")},v0:${Buffer.alloc(32, 3).toString("base64")}`,
   },
 }));
 
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import type { CallerAuth } from "../contracts/auth-context";
+import {
+  encryptProviderCredential,
+  parseProviderCredentialKeyring,
+} from "../lib/provider-credential-crypto";
 import { CALLERS, contextFor, OWNER } from "./lane-c-test-helpers";
 import { providersRouter } from "./providers";
 
@@ -330,6 +335,7 @@ describe("providers (a person)", () => {
     db.providerAccount.findFirst.mockResolvedValue(
       accountRow({ SpendCap: { id: "cap-1", monthlyLimit: "10", currency: "USD" } }) as never,
     );
+    db.spendCap.deleteMany.mockResolvedValue({ count: 1 });
     await client().spendCaps.clear({ accountId: "acc-1" });
     expect(db.spendCap.deleteMany).toHaveBeenCalledWith({ where: { id: "cap-1" } });
     expect(fenceLog.held).toEqual([
@@ -668,5 +674,54 @@ describe("writes decide under the owner fence (#241)", () => {
     });
     expect(db.providerCredential.update).not.toHaveBeenCalled();
     expect(db.providerAccount.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("re-encrypting rewrites a key only as it was read", async () => {
+    const identity = {
+      userId: OWNER,
+      providerAccountId: "acc-1",
+      credentialId: "cred-1",
+      credentialType: "BEARER" as const,
+      aadVersion: 1,
+    };
+    const old = encryptProviderCredential(
+      SECRET,
+      identity,
+      parseProviderCredentialKeyring(`v0:${Buffer.alloc(32, 3).toString("base64")}`),
+    );
+    db.providerCredential.findMany.mockResolvedValue([
+      {
+        id: "cred-1",
+        providerAccountId: "acc-1",
+        credentialType: "BEARER",
+        aadVersion: 1,
+        keyVersion: old.keyVersion,
+        ciphertext: old.ciphertext,
+        nonce: old.nonce,
+        authTag: old.authTag,
+      },
+    ] as never);
+    // Revoked (or rotated by another request) while this one waited for the fence.
+    db.providerCredential.updateMany.mockImplementation((async () => {
+      expect(fenceLog.held).toContain("00:owner:owner-1");
+      return { count: 0 };
+    }) as never);
+    expect(await client().credentials.reencrypt({})).toEqual({ reencrypted: 0 });
+    expect(db.providerCredential.updateMany.mock.calls[0]?.[0]?.where).toEqual({
+      id: "cred-1",
+      status: { not: "REVOKED" },
+      keyVersion: "v0",
+      nonce: old.nonce,
+    });
+    expect(db.providerCredential.update).not.toHaveBeenCalled();
+  });
+
+  it("clearing a cap another request cleared meanwhile audits nothing", async () => {
+    db.providerAccount.findFirst.mockResolvedValue(
+      accountRow({ SpendCap: { id: "cap-1", monthlyLimit: "10", currency: "USD" } }) as never,
+    );
+    db.spendCap.deleteMany.mockResolvedValue({ count: 0 });
+    await client().spendCaps.clear({ accountId: "acc-1" });
+    expect(db.auditEvent.create).not.toHaveBeenCalled();
   });
 });

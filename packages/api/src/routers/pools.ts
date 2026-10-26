@@ -730,23 +730,31 @@ export const poolsRouter = {
     });
     if (!pool) throw notFound("That pool does not exist.");
     const { rules, ...advancedPatch } = input.advanced ?? {};
-    // Removing a contributed member writes the contributor's graph too (owner fence).
-    const removed = input.members?.remove?.length
+    // Removing a contributed member, or changing its weight or state, writes the contributor's
+    // graph too (owner fence). A member's model never changes, so neither does its contributor.
+    const touchedIds = [
+      ...(input.members?.remove ?? []),
+      ...(input.members?.set ?? []).map((set) => set.memberId),
+    ];
+    const touched = touchedIds.length
       ? await prisma.poolMember.findMany({
-          where: { id: { in: input.members.remove }, poolId: pool.id },
+          where: { id: { in: touchedIds }, poolId: pool.id },
           select: { RuntimeModel: { select: { userId: true } } },
         })
       : [];
     const owners = [
       userId,
-      ...removed.flatMap((member) => (member.RuntimeModel ? [member.RuntimeModel.userId] : [])),
+      ...touched.flatMap((member) => (member.RuntimeModel ? [member.RuntimeModel.userId] : [])),
       ...(await sidecarTargetOwners(input.sidecars ?? [])),
     ];
     try {
       await graphWrite(
         owners,
-        // Whether the slug changes is decided under the fences (a rename may have landed since).
+        // Whether the pool is still there, and whether the slug changes, is decided under the
+        // fences (a delete or a rename may have landed since).
         async (tx) => {
+          if ((await tx.pool.count({ where: { id: pool.id, userId } })) === 0)
+            throw notFound("That pool does not exist.");
           const current =
             input.slug === undefined
               ? null
@@ -836,7 +844,9 @@ export const poolsRouter = {
     if (!pool) throw notFound("That pool does not exist.");
     // Shares, contributed members, key entries and other owners' sidecars go with it.
     await graphDelete({ userId, poolIds: [pool.id] }, async (tx) => {
-      await tx.pool.deleteMany({ where: { id: pool.id, userId } });
+      const deleted = await tx.pool.deleteMany({ where: { id: pool.id, userId } });
+      // Deleted by another request meanwhile: that one audited it.
+      if (deleted.count === 0) return;
       await audit(tx, {
         ownerId: userId,
         actor,

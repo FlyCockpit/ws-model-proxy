@@ -166,17 +166,57 @@ fn lstart<'a>(fields: impl Iterator<Item = &'a str>) -> Option<Started> {
     any.then(|| Started(hasher.finish()))
 }
 
+/// How long `ps` may take. Cleanup runs it under registry locks and on shutdown, so a `ps` that
+/// hangs must not hang them: past this, the listing is an error (nothing proven, nothing
+/// signalled), never a wait.
+#[cfg(not(target_os = "linux"))]
+const PS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `ps`'s standard output, once it exited (within [`PS_TIMEOUT`]).
 #[cfg(not(target_os = "linux"))]
 fn ps(args: &[&str]) -> std::io::Result<std::process::Output> {
-    std::process::Command::new("/bin/ps")
+    use std::io::Read;
+    let mut child = std::process::Command::new("/bin/ps")
         .args(args)
         .env_clear()
         // Without `TZ`, `ps` prints local time in the system time zone, which can change while
         // a process runs (and with it the digest of its `lstart`).
         .env("TZ", "UTC0")
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()?;
+    // Read on a thread: a full listing can outgrow the pipe, and `ps` waits until it is read.
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("`ps` has no output"))?;
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        stdout.read_to_end(&mut out).map(|_| out)
+    });
+    let until = std::time::Instant::now() + PS_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let stdout = reader
+                .join()
+                .map_err(|_| std::io::Error::other("reading `ps` failed"))??;
+            return Ok(std::process::Output {
+                status,
+                stdout,
+                stderr: Vec::new(),
+            });
+        }
+        if std::time::Instant::now() >= until {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "`ps` did not answer in time",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

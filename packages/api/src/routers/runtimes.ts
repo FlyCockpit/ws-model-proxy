@@ -26,6 +26,7 @@ import {
   isForeignKeyViolation,
   isUniqueViolation,
   notFound,
+  RETRY_CONFLICT_MESSAGE,
   refuse,
   refuseAbout,
 } from "../lib/refuse";
@@ -148,8 +149,11 @@ type CreateInput = {
   forkedFromVersionId?: string;
 };
 
+/** What a fork copies from: its owner is fenced too, and `stillShared` runs under the fences. */
+type ForkSource = { ownerUserId: string; stillShared: (tx: Tx) => Promise<void> };
+
 /** Creates a runtime with version 1, its served models, and an always-on runtime's instance. */
-async function createRuntime(context: SignedInContext, input: CreateInput) {
+async function createRuntime(context: SignedInContext, input: CreateInput, source?: ForkSource) {
   const userId = userIdOf(context);
   const actor = callerActor(context.auth, userId);
   assertKindMatchesSpec(input.kind, input.spec);
@@ -159,7 +163,8 @@ async function createRuntime(context: SignedInContext, input: CreateInput) {
     });
   let created: { runtimeId: string };
   try {
-    created = await graphWrite([userId], async (tx) => {
+    created = await graphWrite([userId, ...(source ? [source.ownerUserId] : [])], async (tx) => {
+      await source?.stillShared(tx);
       // Under the owner fence: a trust change (a person's lowering, the node's report) waits
       // for it, so the node is not lowered between this check and the write.
       if (input.nodeId) assertAgentMayUseNode(context, await ownedNode(userId, input.nodeId, tx));
@@ -574,10 +579,21 @@ export const runtimesRouter = {
       if (input.relearn)
         await db.runtimeRequestProfile.deleteMany({ where: { runtimeId: runtime.id, userId } });
     };
+    // Everything below is derived from `current`, read before the fence: under it, `current`
+    // must still be the runtime's version (another update may have landed meanwhile).
+    const assertStillCurrent = async (tx: Tx) => {
+      const still = await tx.runtime.count({
+        where: { id: runtime.id, userId, currentVersionId: current.id },
+      });
+      if (still === 0) throw new ORPCError("CONFLICT", { message: RETRY_CONFLICT_MESSAGE });
+    };
     if (hashes.contentHash === current.contentHash) {
-      await forgetLearned(prisma);
-      if (input.name !== undefined)
-        await prisma.runtime.update({ where: { id: runtime.id }, data: { name: input.name } });
+      await graphWrite([userId], async (tx) => {
+        await assertStillCurrent(tx);
+        await forgetLearned(tx);
+        if (input.name !== undefined)
+          await tx.runtime.update({ where: { id: runtime.id }, data: { name: input.name } });
+      });
       return {
         version: versionSummary(current, previousOfCurrent),
         adoptedLive: [],
@@ -642,6 +658,7 @@ export const runtimesRouter = {
     const { version, operationId } = await graphWrite(
       [userId],
       async (tx) => {
+        await assertStillCurrent(tx);
         await assertDefinitionUnfrozen(tx);
         await assertPoolsKeepType(tx);
         await forgetLearned(tx);
@@ -1218,6 +1235,7 @@ export const runtimesRouter = {
     const share = await prisma.runtimeShare.findFirst({
       where: { runtimeId: input.runtimeId, granteeUserId: userId },
       select: {
+        ownerUserId: true,
         Runtime: {
           select: {
             id: true,
@@ -1244,28 +1262,46 @@ export const runtimesRouter = {
           .map((issue) => `${["spec", ...issue.path].join(".")}: ${issue.message}`)
           .join(" "),
       });
-    const result = await createRuntime(context, {
-      slug: input.slug,
-      name: input.name,
-      kind: share.Runtime.kind,
-      nodeId: input.nodeId,
-      spec: authored.data,
-      limits: applyLimitsPatch(
-        {
-          concurrencyLimit: version.concurrencyLimit,
-          contextLimit: version.contextLimit,
-          kvBudgetTokens: version.kvBudgetTokens,
-          kvFullThreshold: version.kvFullThreshold,
-          engineLoadGate: version.engineLoadGate,
+    const result = await createRuntime(
+      context,
+      {
+        slug: input.slug,
+        name: input.name,
+        kind: share.Runtime.kind,
+        nodeId: input.nodeId,
+        spec: authored.data,
+        limits: applyLimitsPatch(
+          {
+            concurrencyLimit: version.concurrencyLimit,
+            contextLimit: version.contextLimit,
+            kvBudgetTokens: version.kvBudgetTokens,
+            kvFullThreshold: version.kvFullThreshold,
+            engineLoadGate: version.engineLoadGate,
+          },
+          input.limits,
+        ),
+        advanced: applyAdvancedPatch(jsonObject(version.advanced), input.advanced),
+        compat:
+          input.compat === undefined ? storedRequestCompat(version.compat) : (input.compat ?? {}),
+        note: input.note ?? null,
+        forkedFromVersionId: version.id,
+      },
+      {
+        ownerUserId: share.ownerUserId,
+        // Under the owner's fence too (a share revoke or the source's delete takes it): one
+        // revoked or deleted meanwhile is not copied.
+        stillShared: async (tx) => {
+          const shared = await tx.runtimeShare.count({
+            where: { runtimeId: share.Runtime.id, granteeUserId: userId },
+          });
+          const kept = await tx.runtimeVersion.count({
+            where: { id: version.id, runtimeId: share.Runtime.id },
+          });
+          if (shared === 0 || kept === 0)
+            throw notFound("No runtime with that id is shared with you.");
         },
-        input.limits,
-      ),
-      advanced: applyAdvancedPatch(jsonObject(version.advanced), input.advanced),
-      compat:
-        input.compat === undefined ? storedRequestCompat(version.compat) : (input.compat ?? {}),
-      note: input.note ?? null,
-      forkedFromVersionId: version.id,
-    });
+      },
+    );
     return { ...result, version: result.runtime.currentVersion };
   }),
 };

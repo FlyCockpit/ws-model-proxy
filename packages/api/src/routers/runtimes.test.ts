@@ -209,6 +209,11 @@ beforeEach(() => {
   // The batched physical launches (`physicalLaunchIntents`: an agent's placement reads the nodes
   // they name): none unless a test says so.
   db.$queryRaw.mockResolvedValue([] as never);
+  // An update's version is still the runtime's current one under the owner fence.
+  db.runtime.count.mockResolvedValue(1);
+  // A fork's source is still shared under the fences.
+  db.runtimeShare.count.mockResolvedValue(1);
+  db.runtimeVersion.count.mockResolvedValue(1);
 });
 
 describe("runtimes.presets", () => {
@@ -1817,6 +1822,35 @@ describe("graph-write fences", () => {
     expect(db.runtimeRequestProfile.deleteMany).not.toHaveBeenCalled();
   });
 
+  it("an update derived from a version another update replaced meanwhile is a conflict", async () => {
+    db.runtime.findFirst.mockResolvedValue({
+      id: "rt-1",
+      kind: "STARTABLE",
+      origin: "SERVER",
+      Node: null,
+      CurrentVersion: versionRow(),
+    } as never);
+    db.runtimeVersion.findFirst.mockResolvedValue(null);
+    db.runtimeInstance.findMany.mockResolvedValue([]);
+    db.runtime.count.mockImplementation((async () => {
+      expect(fenceLog.held).toContain("00:owner:owner-1");
+      return 0;
+    }) as never);
+    // A version change, and a rename with relearn (no version change): neither writes.
+    expect(
+      await reasonOf(client().update({ runtimeId: "rt-1", limits: { concurrencyLimit: 4 } })),
+    ).toBe("CONFLICT");
+    expect(
+      await reasonOf(client().update({ runtimeId: "rt-1", name: "Renamed", relearn: true })),
+    ).toBe("CONFLICT");
+    expect(db.runtime.count).toHaveBeenCalledWith({
+      where: { id: "rt-1", userId: OWNER, currentVersionId: "ver-1" },
+    });
+    expect(db.runtimeVersion.create).not.toHaveBeenCalled();
+    expect(db.runtime.update).not.toHaveBeenCalled();
+    expect(db.runtimeRequestProfile.deleteMany).not.toHaveBeenCalled();
+  });
+
   it("deleting a runtime goes through the parent-delete fences", async () => {
     db.runtime.findFirst.mockResolvedValue({ id: "rt-1" } as never);
     db.runtimeInstance.count.mockResolvedValue(0);
@@ -1891,6 +1925,7 @@ describe("runtimes.fork (create-shaped output)", () => {
 
   it("copies a shared version, applies the given limits and answers like create", async () => {
     db.runtimeShare.findFirst.mockResolvedValue({
+      ownerUserId: "bob",
       Runtime: { id: "rt-9", kind: "STARTABLE", currentVersionId: "ver-9" },
     } as never);
     db.runtimeVersion.findFirst.mockResolvedValue(
@@ -1916,6 +1951,26 @@ describe("runtimes.fork (create-shaped output)", () => {
     });
     expect(result.version.version).toBe(1);
     expect(result.runtime.forkedFromVersionId).toBe("ver-9");
+    expect(fenceLog.held).toEqual(expect.arrayContaining(["00:owner:bob", "00:owner:owner-1"]));
+  });
+
+  it("does not copy a version whose share was revoked meanwhile", async () => {
+    db.runtimeShare.findFirst.mockResolvedValue({
+      ownerUserId: "bob",
+      Runtime: { id: "rt-9", kind: "STARTABLE", currentVersionId: "ver-9" },
+    } as never);
+    db.runtimeVersion.findFirst.mockResolvedValue(versionRow({ id: "ver-9" }) as never);
+    db.runtimeShare.count.mockImplementation((async () => {
+      expect(fenceLog.held).toContain("00:owner:bob");
+      return 0;
+    }) as never);
+    expect(await reasonOf(client().fork({ runtimeId: "rt-9", slug: "mine", name: "Mine" }))).toBe(
+      "NOT_FOUND",
+    );
+    expect(db.runtimeShare.count).toHaveBeenCalledWith({
+      where: { runtimeId: "rt-9", granteeUserId: OWNER },
+    });
+    expect(db.runtime.create).not.toHaveBeenCalled();
   });
 });
 

@@ -31,7 +31,8 @@ fn guard_program(parent: u32, lock: &Path, program: &str, args: &[&str]) -> Comm
 }
 
 /// Perl: restore SIGINT's default, mark itself running at the path it is given, then become
-/// `sleep`.
+/// `sleep`. The interrupt tests need `perl` on `PATH` (macOS and the CI images ship it); without
+/// it they fail with "the command never started".
 const MARK_THEN_SLEEP: &str =
     r#"$SIG{INT} = "DEFAULT"; open(F, ">", shift) or die; close F; exec "sleep", "5""#;
 

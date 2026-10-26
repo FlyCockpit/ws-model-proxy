@@ -95,7 +95,11 @@ async function assertModelLive(tx: Tx, userId: string, modelId: string) {
   if (live === 0) throw notFound("That provider model does not exist.");
 }
 
-/** A price activated, retired or deleted meanwhile is not the one the request named. */
+/**
+ * A price activated, retired or deleted meanwhile is not the one the request named. Retiring or
+ * deleting a price needs no live model: it only takes pricing away, so it is allowed beneath a
+ * deleted model or account (creating or activating one is not).
+ */
 async function assertPriceIn(
   tx: Tx,
   userId: string,
@@ -576,9 +580,15 @@ export const providersRouter = {
           ring,
         );
         const sealed = encryptProviderCredential(plain, identity, ring);
-        await graphWrite([userId], (tx) =>
-          tx.providerCredential.update({
-            where: { id: credential.id },
+        // Only the row as it was read: one revoked or rotated meanwhile is left as it is now.
+        const { count } = await graphWrite([userId], (tx) =>
+          tx.providerCredential.updateMany({
+            where: {
+              id: credential.id,
+              status: { not: "REVOKED" },
+              keyVersion: credential.keyVersion,
+              nonce: credential.nonce,
+            },
             data: {
               keyVersion: sealed.keyVersion,
               ciphertext: sealed.ciphertext,
@@ -587,7 +597,7 @@ export const providersRouter = {
             },
           }),
         );
-        reencrypted += 1;
+        reencrypted += count;
       }
       return { reencrypted };
     }),
@@ -1032,8 +1042,10 @@ export const providersRouter = {
           [userId],
           async (tx) => {
             await assertAccountLive(tx, userId, account.id);
-            // Cleared by another tab meanwhile: nothing left to clear.
-            await tx.spendCap.deleteMany({ where: { id: cap.id } });
+            // Cleared by another tab meanwhile (and maybe set again: a new cap): nothing of
+            // this cap is left to clear, and that request audited it.
+            const cleared = await tx.spendCap.deleteMany({ where: { id: cap.id } });
+            if (cleared.count === 0) return;
             await audit(tx, context, { accountId: account.id, action: "spend_cap.clear" });
           },
           async () => [fences.spendAccount(account.id), fences.spendCap(cap.id)],

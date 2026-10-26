@@ -138,6 +138,8 @@ beforeEach(() => {
   db.executionTarget.findMany.mockResolvedValue([]);
   db.runtimeModel.findMany.mockResolvedValue([]);
   db.modelAlias.findMany.mockResolvedValue([]);
+  // A pool being updated is still there under the owner fence.
+  db.pool.count.mockResolvedValue(1);
 });
 
 describe("callable ids", () => {
@@ -801,12 +803,45 @@ describe("graph-write fences and review follow-ups", () => {
     );
   });
 
+  it("changing a contributed member's weight or state fences the contributor too", async () => {
+    db.pool.findFirst.mockResolvedValueOnce(owned as never);
+    db.pool.findFirst.mockResolvedValue(poolRow() as never);
+    db.poolMember.findMany.mockResolvedValue([{ RuntimeModel: { userId: "carol" } }] as never);
+    db.poolMember.updateMany.mockImplementation((async () => {
+      expect(fenceLog.held).toContain("00:owner:carol");
+      return { count: 1 };
+    }) as never);
+    await client().update({
+      poolId: "pool-1",
+      members: { set: [{ memberId: "mem-c", weight: 3 }] },
+    });
+    expect(db.poolMember.findMany.mock.calls[0]?.[0]?.where).toEqual({
+      id: { in: ["mem-c"] },
+      poolId: "pool-1",
+    });
+    expect(db.poolMember.updateMany).toHaveBeenCalled();
+  });
+
   it("deleting a pool goes through the parent-delete fences", async () => {
     db.pool.findFirst.mockResolvedValue({ id: "pool-1", slug: "chat" } as never);
+    db.pool.deleteMany.mockResolvedValue({ count: 1 });
     await client().delete({ poolId: "pool-1" });
     expect(fenceLog.deletes).toEqual([{ userId: OWNER, poolIds: ["pool-1"] }]);
     expect(db.pool.deleteMany).toHaveBeenCalledWith({ where: { id: "pool-1", userId: OWNER } });
     expect(db.auditEvent.create.mock.calls[0]?.[0]?.data).toMatchObject({ action: "pool.delete" });
+  });
+
+  it("a pool deleted meanwhile is neither updated nor audited twice", async () => {
+    db.pool.findFirst.mockResolvedValueOnce({ id: "pool-1", slug: "chat" } as never);
+    db.pool.deleteMany.mockResolvedValue({ count: 0 });
+    await client().delete({ poolId: "pool-1" });
+    db.pool.findFirst.mockResolvedValueOnce(owned as never);
+    db.pool.count.mockResolvedValue(0);
+    expect(await reasonOf(client().update({ poolId: "pool-1", name: "Renamed" }))).toBe(
+      "NOT_FOUND",
+    );
+    expect(db.pool.update).not.toHaveBeenCalled();
+    expect(db.auditEvent.create).not.toHaveBeenCalled();
   });
 
   it("refuses a context margin at or above the ceiling", async () => {
