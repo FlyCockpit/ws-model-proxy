@@ -235,6 +235,7 @@ function context(instances: PlacementContext["instances"]): PlacementContext {
       memoryGb: 126,
       gpus: [],
       liveFreeMemoryGb: null,
+      launch: null,
     })),
   };
 }

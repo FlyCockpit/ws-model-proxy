@@ -32,6 +32,7 @@ function node(id: string, overrides: Partial<PlacementNode> = {}): PlacementNode
     memoryGb: 126,
     gpus: [],
     liveFreeMemoryGb: null,
+    launch: null,
     ...overrides,
   };
 }
@@ -742,6 +743,36 @@ describe("trust, labels and frozen definitions", () => {
     expect(none.ok).toBe(false);
     if (!none.ok) expect(none.refusal.reason).toBe("label_mismatch");
   });
+
+  it("leaves out a node whose platform cannot run the launch", () => {
+    const mac = {
+      platform: "macos",
+      management: new Set(["service"]),
+      shells: new Set(["sh"]),
+    } as const;
+    const windows = {
+      platform: "windows",
+      management: new Set(["process", "service"]),
+      shells: new Set(["pwsh"]),
+    } as const;
+    const nodes = [node("mac", { launch: mac }), node("win", { launch: windows })];
+    const planner = new PlacementPlanner(context({ nodes }));
+    const launch = { management: "process" as const, commands: [{ start: "llama-server" }] };
+    const refused = planner.place({ ...request(), launch: { ...request().launch, ...launch } });
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.refusal.reason).toBe("unsupported_platform");
+    // A service runs on the Mac; a node that does not say is not checked.
+    const service = {
+      management: "service" as const,
+      commands: [{ start: "brew services start x" }],
+    };
+    const placed = ok(planner.place({ ...request(), launch: { ...request().launch, ...service } }));
+    expect(placed.start.placements[0]?.nodeId).toBe("mac");
+    const unknown = new PlacementPlanner(context({ nodes: [node("old")] }));
+    expect(ok(unknown.place({ ...request(), launch: { ...request().launch, ...launch } })).ok).toBe(
+      true,
+    );
+  });
 });
 
 describe("explicit nodes and restarts", () => {
@@ -1440,6 +1471,7 @@ function nodeRow(overrides: Partial<PlacementNodeRow> = {}): PlacementNodeRow {
     heldFabricsHash: null,
     declaredResources: { memoryGb: 128 },
     nodeInfo: null,
+    features: null,
     nodeMetrics: null,
     nodeMetricsAt: null,
     ...overrides,

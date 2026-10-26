@@ -244,6 +244,7 @@ function plannerOf(c: Case, legacy: readonly boolean[] = [], admittedAs: readonl
     memoryGb: c.memoryGb,
     gpus: c.gpus.map((gpu) => ({ ...gpu })),
     liveFreeMemoryGb: null,
+    launch: null,
   };
   const instances: PlacementInstance[] = c.claims.map((claim, index) => ({
     id: index === 0 && c.restart ? "target" : `c${index}`,

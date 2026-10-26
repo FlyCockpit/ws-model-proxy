@@ -11,7 +11,10 @@ use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::protocol::frames::{HelloNode, NodeTerminalIdentity, TrustState, TrustValue};
-use crate::protocol::runtime_spec::{FileFeatures, NodeFeatures, TerminalFeatures};
+use crate::protocol::runtime_spec::{
+    CommandShell, FileFeatures, LaunchFeatures, Management, NodeFeatures, NodePlatform,
+    TerminalFeatures,
+};
 use crate::terminal_crypto::CliTerminalKey;
 use crate::terminal_identity::{self, CliIdentity};
 
@@ -198,8 +201,39 @@ impl TerminalStartup {
             live_stt: true,
             job_reservations: true,
             rank_idle: true,
+            launch: self.launch_features(),
             secrets: crate::secrets::entries(),
         }
+    }
+
+    /// What runtime launches can run here. Linux runs processes in systemd units and wraps
+    /// services; macOS only wraps services (their status commands prove them). Unix text
+    /// commands run in `sh`; Windows in the shells it found (never a WSL distribution).
+    fn launch_features(&self) -> Option<LaunchFeatures> {
+        let platform = NodePlatform::current()?;
+        let management = match platform {
+            NodePlatform::Linux => vec![Management::Process, Management::Service],
+            NodePlatform::Macos => vec![Management::Service],
+            NodePlatform::Windows => Vec::new(),
+        };
+        let shells = if cfg!(windows) {
+            self.shells
+                .iter()
+                .filter_map(|shell| match shell.id.as_str() {
+                    "pwsh" => Some(CommandShell::Pwsh),
+                    "powershell" => Some(CommandShell::Powershell),
+                    "cmd" => Some(CommandShell::Cmd),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            vec![CommandShell::Sh]
+        };
+        Some(LaunchFeatures {
+            platform,
+            management,
+            shells,
+        })
     }
 
     /// The hello `node`: `identity_signature` signs the challenge, and the

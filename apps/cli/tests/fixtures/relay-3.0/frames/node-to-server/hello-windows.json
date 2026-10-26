@@ -36,6 +36,7 @@
     "liveStt": true,
     "jobReservations": true,
     "rankIdle": true,
+    "launch": { "platform": "windows", "management": [], "shells": ["pwsh", "powershell", "cmd"] },
     "secrets": [
       {
         "name": "WSMP_SECRET_LLAMA_KEY",

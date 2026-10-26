@@ -216,6 +216,16 @@ export const canonicalNumberSchema = z
   .number()
   .refine(isCanonicalNumber, specIssue("numberNotCanonical"));
 
+/** How a node manages a launch: `process` (the node owns it) or `service` (commands prove it). */
+export const RUNTIME_MANAGEMENTS = ["process", "service"] as const;
+export type RuntimeManagement = (typeof RUNTIME_MANAGEMENTS)[number];
+/** Interpreters of a launch's text commands (`launch.shell`; `sh` when absent). */
+export const RUNTIME_SHELLS = ["sh", "pwsh", "powershell", "cmd"] as const;
+export type RuntimeShell = (typeof RUNTIME_SHELLS)[number];
+/** The operating systems a node reports for runtime launches (`features.launch.platform`). */
+export const NODE_PLATFORMS = ["linux", "macos", "windows"] as const;
+export type NodePlatform = (typeof NODE_PLATFORMS)[number];
+
 const PLACEHOLDER = /\{\{([a-z_]+)\}\}/g;
 export const runtimeCommandSchema = runtimeTextSchema(RUNTIME_COMMAND_MAX_BYTES)
   .refine((value) => value.trim().length > 0, specIssue("commandBlank"))
@@ -424,7 +434,7 @@ export type RuntimeCommands = z.infer<typeof runtimeCommandsSchema>;
 export const runtimeLaunchSchema = z
   .object({
     /** `process`: the node owns the unit (was ownedProcess); `service`: stop/status prove it. */
-    management: z.enum(["process", "service"]),
+    management: z.enum(RUNTIME_MANAGEMENTS),
     groupSize: z.number().int().min(1).max(RUNTIME_GROUP_SIZE_MAX),
     resources: z.array(runtimeResourceSchema).min(1).max(RUNTIME_GROUP_SIZE_MAX),
     labels: runtimeLabelsSchema,
@@ -984,6 +994,25 @@ export const nodeFeaturesSchema = z
      * sends runtime jobs only to a node with it; an older CLI is told to upgrade.
      */
     rankIdle: z.boolean().optional(),
+    /**
+     * What runtime launches the node can run (placement leaves out a node that cannot run a
+     * runtime's launch: `unsupported_platform`). Absent on older CLIs: placement then reads the
+     * node's `executionMechanism` (`launchCapabilities`).
+     */
+    launch: z
+      .object({
+        platform: z.enum(NODE_PLATFORMS),
+        management: z
+          .array(z.enum(RUNTIME_MANAGEMENTS))
+          .max(RUNTIME_MANAGEMENTS.length)
+          .refine((values) => new Set(values).size === values.length, "management is distinct"),
+        shells: z
+          .array(z.enum(RUNTIME_SHELLS))
+          .max(RUNTIME_SHELLS.length)
+          .refine((values) => new Set(values).size === values.length, "shells are distinct"),
+      })
+      .strict()
+      .optional(),
     /** The node's secrets: names and when they were last set (never values). */
     secrets: z
       .array(z.object({ name: nodeSecretNameSchema, updatedAt: z.iso.datetime() }).strict())

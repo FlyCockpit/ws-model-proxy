@@ -9,6 +9,7 @@ import { effectiveTrust } from "../nodes/trust";
 import { parseHeldDefinitions } from "../nodes/views";
 import { occupiesNodesWhere } from "./instance-occupancy";
 import { physicalLaunchIntents } from "./instance-run";
+import { launchCapabilities } from "./launch-capabilities";
 import { requiredDefinitionsByNode } from "./node-definitions";
 import type {
   PlacementContext,
@@ -40,6 +41,7 @@ export const PLACEMENT_NODE_SELECT = {
   heldFabricsHash: true,
   declaredResources: true,
   nodeInfo: true,
+  features: true,
   nodeMetrics: true,
   nodeMetricsAt: true,
 } as const;
@@ -61,6 +63,7 @@ export type PlacementNodeRow = {
   heldFabricsHash: string | null;
   declaredResources: unknown;
   nodeInfo: unknown;
+  features: unknown;
   nodeMetrics: unknown;
   nodeMetricsAt: Date | null;
 };
@@ -128,6 +131,7 @@ export function placementNodeOf(
       unified: gpu.unified,
     })),
     liveFreeMemoryGb: liveMetrics(row.nodeMetrics, row.nodeMetricsAt, now).freeMemoryGb,
+    launch: launchCapabilities(row.features, row.nodeInfo),
   };
 }
 

@@ -143,6 +143,12 @@ export const REFUSAL_REASONS = [
   // Windows terminals.
   /** A browser terminal named a shell the node did not advertise (or no longer does). */
   "shell_unavailable",
+  // Runtimes on every platform.
+  /**
+   * The node cannot run the runtime's launch: its platform lacks the management mode, or the
+   * shell the launch's text commands need (`features.launch`).
+   */
+  "unsupported_platform",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 export const refusalReasonSchema = z.enum(REFUSAL_REASONS);

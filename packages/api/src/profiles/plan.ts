@@ -14,6 +14,7 @@ import type { z } from "zod";
 import type { refusalSchema } from "../contracts/refusals";
 import type { previewWarningSchema, startPreviewSchema } from "../contracts/runtimes";
 import { compareCodePoints } from "../lib/canonical-json";
+import type { LaunchCapabilities } from "../lib/launch-capabilities";
 import {
   type PlacementFabric,
   type PlacementFrozenFabric,
@@ -59,6 +60,8 @@ export type PlanNode = {
   /** Usable VRAM per GPU (reserved taken off), before any claim. */
   gpus: readonly PlacementGpu[];
   liveFreeMemoryGb: number | null;
+  /** What runtime launches the node can run (`launchCapabilities`), or null when unknown. */
+  launch: LaunchCapabilities | null;
 };
 
 export type PlanInstance = {
@@ -306,6 +309,7 @@ export function profilePlan(input: PlanInput): ProfilePlan {
       memoryGb: node.memoryGb,
       gpus: node.gpus,
       liveFreeMemoryGb: node.liveFreeMemoryGb,
+      launch: node.launch,
     })),
     instances: input.claimants,
     fabrics: input.fabrics,

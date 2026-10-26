@@ -614,8 +614,56 @@ pub struct NodeFeatures {
     /// sends runtime jobs only to a node with it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub rank_idle: bool,
+    /// What runtime launches this node can run. Absent on older CLIs: the
+    /// server then reads the node's `executionMechanism`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<LaunchFeatures>,
     /// The node's secrets: names and when they were last set (never values).
     pub secrets: Vec<SecretEntry>,
+}
+
+/// The operating system a node runs, as runtime launches see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodePlatform {
+    Linux,
+    Macos,
+    Windows,
+}
+
+impl NodePlatform {
+    /// This build's platform; `None` where runtimes never run.
+    pub fn current() -> Option<Self> {
+        if cfg!(target_os = "linux") {
+            Some(Self::Linux)
+        } else if cfg!(target_os = "macos") {
+            Some(Self::Macos)
+        } else if cfg!(windows) {
+            Some(Self::Windows)
+        } else {
+            None
+        }
+    }
+}
+
+/// The interpreter of a launch's text commands (`launch.shell`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandShell {
+    Sh,
+    Pwsh,
+    Powershell,
+    Cmd,
+}
+
+/// What a node can launch: placement leaves out a node whose platform,
+/// management modes or shells cannot run a runtime's launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LaunchFeatures {
+    pub platform: NodePlatform,
+    pub management: Vec<Management>,
+    pub shells: Vec<CommandShell>,
 }
 
 fn is_false(value: &bool) -> bool {

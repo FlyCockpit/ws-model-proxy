@@ -85,6 +85,7 @@ import {
   subtractUsage,
   sumUsage,
 } from "./claim-overlap";
+import { type LaunchCapabilities, type LaunchNeeds, launchRunsOn } from "./launch-capabilities";
 import {
   type GpuVendor,
   launchReservations,
@@ -144,6 +145,11 @@ export type PlacementNode = {
   gpus: readonly PlacementGpu[];
   /** Free memory from a live `node.metrics` sample, or null. Warnings only. */
   liveFreeMemoryGb: number | null;
+  /**
+   * What runtime launches the node can run (`launchCapabilities`); null when it does not say
+   * (not checked: the node refuses what it cannot run).
+   */
+  launch: LaunchCapabilities | null;
 };
 
 export type PlacementRank = {
@@ -221,7 +227,8 @@ export type PlacementContext = {
 type LaunchShape = Pick<
   RuntimeLaunch,
   "groupSize" | "resources" | "labels" | "port" | "fabric" | "reservations"
->;
+> &
+  LaunchNeeds;
 
 export type PlacementRequest = {
   runtimeId: string;
@@ -829,6 +836,7 @@ const REASON_ORDER: readonly RefusalReason[] = [
   "node_held",
   "definition_frozen",
   "trust_relay",
+  "unsupported_platform",
   "label_mismatch",
   "not_enough_nodes",
 ];
@@ -840,6 +848,8 @@ const MESSAGES: Partial<Record<RefusalReason, string>> = {
   node_held:
     "A person or a profile put this node on hold; nothing is placed there until it is released.",
   label_mismatch: "This node lacks a label the runtime requires.",
+  unsupported_platform:
+    "This node cannot run the runtime's launch: its platform lacks the management mode or the shell the commands need.",
   definition_frozen:
     "This node is Relay only and does not hold this version; a person can start only what it holds.",
   no_free_ports: "This node has no free port in its range.",
@@ -2339,6 +2349,7 @@ export class PlacementPlanner {
   #ineligible(node: PlacementNode, request: PlacementRequest): RefusalReason | null {
     if (!request.launch.labels.every((label) => node.labels.includes(label)))
       return "label_mismatch";
+    if (node.launch && !launchRunsOn(request.launch, node.launch)) return "unsupported_platform";
     if (this.#context.agent && node.trust !== "FULL") return "trust_relay";
     if (
       request.checkFrozen &&
